@@ -1,0 +1,24 @@
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.whoscored_match_incidents_current
+  description: |
+    Source-honest WhoScored schedule incident summaries. The manifest-backed
+    view publishes only the latest successful scope batch. Grain is one source
+    array element per game; these rows are not promoted to Opta events because
+    the schedule feed supplies no stable event identifier.
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.None
+columns:
+  - name: game_id
+    description: Numeric WhoScored match identifier.
+  - name: source_ordinal
+    description: Zero-based incident position in the source schedule array.
+  - name: source_path
+    description: Exact source array path used as the incident identity.
+  - name: incident_type
+    description: Incident type exactly as displayed by WhoScored.
+  - name: match_is_opta
+    description: Whether WhoScored marks the match as backed by an Opta feed.
+  - name: _scope_batch_id
+    description: Identifier of the atomically published scope batch.

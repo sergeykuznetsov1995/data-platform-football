@@ -1,0 +1,14 @@
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.gold.transfermarkt_team_season_market_value_v2
+  description: |
+    Shadow team-season market value. Uses end-of-edition membership assignment
+    and the latest global valuation point on or before the source edition end
+    date. Single-year editions fall back to 31 December only when the source
+    end date is absent. Ambiguous multi-club players are excluded and counted
+    explicitly.
+  tags: [Tier.Gold, Domain.Football, PII.None]
+columns:
+  - name: squad_market_value_eur
+    description: Sum of eligible latest-on-edition-end player values in EUR.
+  - name: ambiguous_players_excluded
+    description: Player-seasons excluded because club assignment was ambiguous.

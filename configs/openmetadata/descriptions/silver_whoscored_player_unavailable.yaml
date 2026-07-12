@@ -7,7 +7,7 @@ table:
     Недоступные игроки по матчам из WhoScored (травмы/дисквалификации) — один row
     на (match_id, team_name, ws_player_id). Источник:
     bronze.whoscored_missing_players_current (последний успешно committed preview batch)
-    LEFT JOIN bronze.whoscored_schedule (за match_date). Фильтры: только status='Out'
+    LEFT JOIN bronze.whoscored_schedule_current (за match_date). Фильтры: только status='Out'
     (слухи 'Doubtful' исключены), reason без 'international duty' (вызовы в сборную —
     не сигнал формы). Сырой ws_player_id и team_name (xref резолвится на Gold,
     мост через season-slug делает gold/fct_player_unavailable.sql). player_name —
@@ -20,7 +20,7 @@ columns:
   - name: match_id
     description: ID матча (сырой WhoScored game_id); xref_match резолвится на Gold.
   - name: match_date
-    description: Дата матча (TRY_CAST из bronze.whoscored_schedule.date); для контекстной фильтрации.
+    description: Дата матча (TRY_CAST из bronze.whoscored_schedule_current.date); для контекстной фильтрации.
   - name: league
     description: Лига slug (например 'APL'), partition key.
   - name: season

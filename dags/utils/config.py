@@ -41,23 +41,9 @@ NON_INTERNATIONAL_LEAGUES: List[str] = [
     league for league in LEAGUES if not league.startswith('INT-')
 ]
 
-# WhoScored multi-league scope (#708). Deliberately independent of the global
-# LEAGUES — flipping LEAGUES switches EVERY source at once (see OOM note
-# above), while WhoScored scales safely per league: dag_ingest_whoscored fans
-# out one sequential task per league and events skip-existing keeps the
-# steady-state cost at "new matches only". First run per new league is heavy
-# (~380 matches/season × 5 seasons through FlareSolverr) but resumable.
-WHOSCORED_LEAGUES: List[str] = [
-    'ENG-Premier League',
-    'ESP-La Liga',
-    'GER-Bundesliga',
-    'ITA-Serie A',
-    'FRA-Ligue 1',
-    'INT-World Cup',  # #913 Phase 1 (5th source; may be blocked by FlareSolverr 512M)
-]
-
 # Understat multi-league scope. Independent of the global LEAGUES for the same
-# reason as WHOSCORED_LEAGUES (flipping LEAGUES switches every source at once).
+# reason as other source-owned registries (flipping LEAGUES switches every
+# source at once).
 # Extending is a deliberate step: first run per new league backfills ~380
 # match JSONs (~5 KB wire each ≈ 2 MB) + the league JSON — direct traffic, no
 # proxy; steady-state is "new matches only" (persistent soccerdata_cache).
@@ -68,7 +54,7 @@ UNDERSTAT_LEAGUES: List[str] = [
 ]
 
 # MatchHistory (football-data.co.uk) multi-league scope. Independent of the
-# global LEAGUES for the same reason as WHOSCORED_LEAGUES. Cheapest source on
+# global LEAGUES for the same source-isolation reason. Cheapest source on
 # the platform: one season CSV ≈ 200 KB per league, fetched directly (no
 # proxy), and the scraper sends conditional requests (ETag/If-Modified-Since)
 # so an unchanged CSV costs a 0-byte 304. No OOM risk. Backfilling a past
@@ -196,8 +182,6 @@ def get_min_row_threshold(threshold_key: str, league: str) -> int:
 # the wipe-floors that stay whole-table by design:
 #   - whoscored_events: append-only over nonuniform history (10-season EPL vs
 #     5-season others) — a per-season basis is meaningless;
-#   - whoscored_player_profile: absent from the bronze schema snapshot,
-#     per-league coverage unverified — revisit after #708;
 #   - espn_lineup / espn_matchsheet: accumulating per-match tables sized to
 #     ONE season (~28 lineup / 2 matchsheet rows per match x 340 - margin);
 #     a per-league floor would false-fail early tournament days, while the
@@ -206,12 +190,11 @@ def get_min_row_threshold(threshold_key: str, league: str) -> int:
 MIN_ROW_THRESHOLDS: Dict[str, int] = {
     # WhoScored (issue #106): hidden-enabler thresholds. Without these keys,
     # validate_table() falls back to 0 and silently passes an empty schedule
-    # scrape (root cause of #102). schedule scales with WHOSCORED_LEAGUES
-    # (every league is scraped each run, replace semantics).
-    'whoscored_schedule':
-        PER_LEAGUE_FLOOR_BASES['whoscored_schedule'][1] * len(WHOSCORED_LEAGUES),
+    # scrape (root cause of #102). The source DAG now validates every dynamic
+    # catalog scope independently; this old whole-table guard is only a
+    # one-scope non-empty floor and must not encode a static league list.
+    'whoscored_schedule': PER_LEAGUE_FLOOR_BASES['whoscored_schedule'][1],
     'whoscored_events': 20_000_000,  # #895: top-5×10-season backfill landed (27.9M rows, append-only); wipe-floor ~72% of live
-    'whoscored_player_profile': 300,  # ~531 players/season/league (#37); raise after #708 backfill
     # ESPN / Understat / SoFIFA (issue #466): same silent-fail class as #102 —
     # read_* swallowed errors and runners exited 0. Floors calibrated against
     # live Bronze counts on 2026-06-11.

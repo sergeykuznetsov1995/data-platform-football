@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Dict, Iterable, List, Set, Tuple
+from typing import Dict, Iterable, List, Set
 
 import pytest
 
@@ -462,6 +462,56 @@ class TestAliasYaml:
         assert conf == 'name_team_alias'
         assert score == 100.0
 
+    @pytest.mark.parametrize(
+        'source_id, season',
+        [
+            ('1000135', '2324'),
+            ('1000626', '2324'),
+            ('364405', '1920'),
+            ('707271', '2223'),
+        ],
+    )
+    def test_dob_negative_override_forces_orphan_before_exact_and_fuzzy(
+        self, source_id, season,
+    ):
+        """Verified DOB conflicts must not be re-linked by any auto tier."""
+        spine = _spine([
+            _fb_row(source_id, 'Same Name', 'Arsenal', season=season),
+        ])
+        cand = _candidate(
+            'transfermarkt', source_id, 'Same Name', 'Arsenal', season=season,
+        )
+
+        cid, conf, score = xpr.cascade_resolve(cand, spine)
+
+        assert (cid, conf, score) == (f'tm_{source_id}', 'orphan', None)
+
+    def test_dob_negative_override_is_season_scoped(self):
+        spine = _spine([
+            _fb_row('target', 'Same Name', 'Arsenal', season='2425'),
+        ])
+        cand = _candidate(
+            'transfermarkt', '1000135', 'Same Name', 'Arsenal', season='2425',
+        )
+
+        cid, conf, score = xpr.cascade_resolve(cand, spine)
+
+        assert cid == 'fb_target'
+        assert conf == 'name_team'
+        assert score == 100.0
+
+    def test_dob_positive_override_maps_globally(self):
+        spine = _spine([])
+        cand = _candidate(
+            'transfermarkt', '277118', 'Unrelated Name', 'Arsenal', season='1920',
+        )
+
+        cid, conf, score = xpr.cascade_resolve(cand, spine)
+
+        assert (cid, conf, score) == (
+            'fb_6ed1a2a2', 'name_team_alias', 100.0,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Orphan terminal + uniqueness
@@ -527,6 +577,44 @@ class TestBackwardCompat:
         assert isinstance(rows, list)
         assert isinstance(review, list)
         assert isinstance(stats, dict)
+
+
+class TestNativeTransfermarktReaders:
+    def test_player_anchors_read_squad_membership_grain(self, monkeypatch):
+        captured = {}
+
+        def fake_execute(_conn, sql, fetch=False):
+            captured['sql'] = sql
+            assert fetch is True
+            return [('42', 'Player', 'Arsenal', 'ENG-Premier League', '2526')]
+
+        monkeypatch.setattr(xpr, '_execute', fake_execute)
+
+        rows = xpr._fetch_transfermarkt_players(
+            object(), 'ENG-Premier League', ['2526'],
+        )
+
+        assert len(rows) == 1
+        assert rows[0]['source_id'] == '42'
+        assert 'iceberg.bronze.transfermarkt_squad_memberships' in captured['sql']
+        assert 'iceberg.bronze.transfermarkt_players' not in captured['sql']
+
+    def test_dob_map_reads_native_attribute_observations(self, monkeypatch):
+        projections = {}
+
+        def fake_fetch(_conn, sql, source):
+            projections[source] = sql
+            return {}
+
+        monkeypatch.setattr(xpr, '_fetch_dob_map', fake_fetch)
+
+        xpr._fetch_dob_maps(object(), 'ENG-Premier League', ['2526'])
+
+        sql = projections['transfermarkt']
+        assert (
+            'iceberg.bronze.transfermarkt_player_attribute_observations' in sql
+        )
+        assert 'iceberg.bronze.transfermarkt_players' not in sql
 
 
 # ---------------------------------------------------------------------------

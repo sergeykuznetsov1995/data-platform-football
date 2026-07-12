@@ -1,0 +1,20 @@
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.gold.fct_transfer_v2
+  description: |
+    Native-v2 global transfer fact keyed by stable transfer_id. Retains undated
+    upcoming events. event_season belongs to the event; scrape league/season
+    are deliberately absent. This physical relation is promoted only through
+    the cycle-pinned canonical reader cutover and retained beside the legacy
+    adapter for rollback.
+  tags: [Tier.Gold, Domain.Football, PII.None]
+columns:
+  - name: transfer_id
+    description: Stable global event primary key.
+  - name: player_id
+    description: Canonical player id or deterministic tm_ source orphan.
+  - name: event_season
+    description: Season of the event, not the scrape window.
+relationships:
+  - from: player_id
+    to: trino_iceberg.iceberg.gold.dim_player.player_id
+    type: FOREIGN_KEY

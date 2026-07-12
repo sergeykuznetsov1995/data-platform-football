@@ -1,0 +1,20 @@
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.transfermarkt_squad_memberships
+  description: |
+    Native Transfermarkt membership observations. Grain is
+    (league, season, club_id, player_id); a multi-club player intentionally has
+    more than one row. Season-bound and partitioned by league/season.
+  tags: [Tier.Bronze, Domain.Football, PII.Low]
+columns:
+  - name: club_id
+    description: Transfermarkt club id; natural-key component.
+  - name: club_slug
+    description: Transfermarkt club URL slug reused by coach crawling.
+  - name: player_id
+    description: Global Transfermarkt player id; natural-key component.
+  - name: observed_at
+    description: Timestamp at which the squad page was observed.
+  - name: league
+    description: League scope and partition key.
+  - name: season
+    description: Normalized season slug and partition key (for example 2526).

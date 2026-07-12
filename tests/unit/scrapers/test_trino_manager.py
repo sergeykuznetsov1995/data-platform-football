@@ -461,17 +461,18 @@ class TestTrinoTableManagerInsertDataFrameAtomic:
 
             # Batches are staged on the throwaway table, not the target.
             mock_insert.assert_called_once()
-            assert mock_insert.call_args[0][1] == 'test_table__stg'
+            stage = mock_insert.call_args[0][1]
+            assert stage.startswith('test_table__stg_')
 
             # Stage is dropped before (crash leftovers) and after (cleanup).
             assert mock_drop.call_count == 2
             for call in mock_drop.call_args_list:
-                assert call[0][1] == 'test_table__stg'
+                assert call[0][1] == stage
 
             executed = [c[0][0] for c in mock_execute.call_args_list]
             # Empty-schema copy of the target.
             assert any(
-                'CREATE TABLE iceberg.bronze.test_table__stg AS SELECT * FROM '
+                f'CREATE TABLE iceberg.bronze.{stage} AS SELECT * FROM '
                 'iceberg.bronze.test_table WHERE false' in sql for sql in executed
             )
             # Exactly ONE INSERT into the target — the merge from stage.
@@ -481,7 +482,7 @@ class TestTrinoTableManagerInsertDataFrameAtomic:
             ]
             assert len(target_inserts) == 1
             assert 'SELECT' in target_inserts[0]
-            assert 'FROM iceberg.bronze.test_table__stg' in target_inserts[0]
+            assert f'FROM iceberg.bronze.{stage}' in target_inserts[0]
             # Plain append → no DELETE issued.
             assert not any('DELETE FROM' in sql for sql in executed)
 
@@ -522,7 +523,7 @@ class TestTrinoTableManagerInsertDataFrameAtomic:
             executed = [c[0][0] for c in mock_execute.call_args_list]
 
             # Staging happens before any DELETE: insert_dataframe targets the stage.
-            assert mock_insert.call_args[0][1] == 'test_table__stg'
+            assert mock_insert.call_args[0][1].startswith('test_table__stg_')
 
             delete_idx = next(i for i, s in enumerate(executed) if 'DELETE FROM iceberg.bronze.test_table ' in s)
             insert_idx = next(i for i, s in enumerate(executed) if 'INSERT INTO iceberg.bronze.test_table ' in s)

@@ -1,0 +1,23 @@
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.whoscored_events_current
+  description: |
+    Канонический событийный поток WhoScored parser v7. Представление публикует
+    события только для последнего успешного match manifest по game_id. Grain —
+    одно событие матча; пустой или недоступный dataset фиксируется в manifest.
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: game_id
+    description: Числовой идентификатор матча WhoScored.
+  - name: source_event_id
+    description: Глобальный Opta `id` события в matchCentreData.
+  - name: team_event_id
+    description: Team-local Opta `eventId`; не уникален без team_id.
+  - name: related_team_event_id
+    description: Team-local source `relatedEventId`; не FK к source_event_id.
+  - name: player_id
+    description: Числовой идентификатор игрока WhoScored.
+  - name: _game_batch_id
+    description: Идентификатор успешно опубликованного match batch.

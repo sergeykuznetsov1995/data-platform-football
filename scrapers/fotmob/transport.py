@@ -407,7 +407,30 @@ class FotMobTransport:
         terminal: bool = False,
         record: Optional[RawJsonRecord] = None,
         error: Optional[str] = None,
+        expects_json: bool = True,
     ) -> FetchResult:
+        # FotMob answers HTTP 200 with a literal JSON ``null`` body for dead
+        # catalog entries (placeholder/promo competitions).  A null payload
+        # carries no data for any parser, so every data-bearing outcome —
+        # fresh 200, 304 replay or stale replay — degrades to the same
+        # terminal NOT_AVAILABLE state as a 204/404 instead of crashing a
+        # downstream parser into a false schema_drift.
+        if (
+            expects_json
+            and json_data is None
+            and outcome
+            in {
+                FetchOutcome.SUCCESS,
+                FetchOutcome.NOT_MODIFIED,
+                FetchOutcome.STALE_REPLAY,
+            }
+        ):
+            outcome = FetchOutcome.NOT_AVAILABLE
+            body = None
+            cache_hit = False
+            stale = False
+            terminal = True
+            error = error or "FotMob returned a null JSON body"
         fields = self._cache_fields(record)
         return FetchResult(
             outcome=outcome,
@@ -633,6 +656,7 @@ class FotMobTransport:
                             http_status=last_status,
                             body=None,
                             json_data=None,
+                            expects_json=False,
                             attempts=attempts,
                             network_bytes=network_bytes,
                             terminal=True,
@@ -658,6 +682,7 @@ class FotMobTransport:
                             http_status=last_status,
                             body=None,
                             json_data=None,
+                            expects_json=False,
                             attempts=attempts,
                             network_bytes=network_bytes,
                             error=last_error,
@@ -671,6 +696,7 @@ class FotMobTransport:
                             http_status=last_status,
                             body=None,
                             json_data=None,
+                            expects_json=False,
                             attempts=attempts,
                             network_bytes=network_bytes,
                             terminal=True,
@@ -689,6 +715,7 @@ class FotMobTransport:
                             http_status=last_status,
                             body=None,
                             json_data=None,
+                            expects_json=False,
                             attempts=attempts,
                             network_bytes=network_bytes,
                             terminal=True,
@@ -704,6 +731,7 @@ class FotMobTransport:
                         http_status=last_status,
                         body=body,
                         json_data=None,
+                        expects_json=False,
                         attempts=attempts,
                         network_bytes=network_bytes,
                     )
@@ -721,6 +749,7 @@ class FotMobTransport:
                         http_status=last_status,
                         body=None,
                         json_data=None,
+                        expects_json=False,
                         attempts=attempts,
                         network_bytes=network_bytes,
                         error=last_error,

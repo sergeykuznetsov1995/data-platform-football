@@ -355,7 +355,7 @@ class TestXrefTeamRendered:
             "iceberg.bronze.matchhistory_results",
             "iceberg.bronze.clubelo_ratings",
             "iceberg.bronze.clubelo_ratings_historical",  # #589: relegated APL teams
-            "iceberg.bronze.transfermarkt_players",
+            "iceberg.bronze.transfermarkt_squad_memberships",
             "iceberg.bronze.capology_player_salaries",
         ]:
             assert tbl in rendered_lower, (

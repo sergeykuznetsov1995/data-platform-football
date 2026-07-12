@@ -22,9 +22,11 @@ residential creds). With no --blocklist it is a pure observe/counting proxy.
 import argparse
 import asyncio
 import base64
+import ipaddress
 import json
 import logging
 import os
+import re
 import secrets
 import signal
 import sys
@@ -33,7 +35,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 sys.path.insert(0, "/opt/airflow")
 
@@ -57,9 +59,163 @@ BLOCKLIST: set[str] = set()
 DEFAULT_LEASE_BYTES = 8 * 1024 * 1024
 MAX_LEASE_BYTES = 24 * 1024 * 1024
 DEFAULT_LEASE_TTL_SECONDS = 60
-MAX_LEASE_TTL_SECONDS = 300
+MAX_LEASE_TTL_SECONDS = 3600
 DAILY_BUDGET_BYTES = 100 * 1024 * 1024
+DAGRUN_BUDGET_BYTES = 8_000_000
+TRANSFERMARKT_DAGRUN_BUDGET_BYTES = 15_728_640
+TRANSFERMARKT_DAG_IDS = frozenset(
+    {
+        "dag_ingest_transfermarkt",
+        "dag_discover_transfermarkt_registry",
+    }
+)
+URL_BUDGET_BYTES = 2_000_000
+MAX_ACTIVE_LEASES = 1
 LEASE_PROXY_URL = "http://proxy_filter:8900"
+LEDGER_PATH = "/opt/airflow/logs/proxy_filter/paid_requests.jsonl"
+MAX_LEDGER_EVENT_BYTES = 256 * 1024
+PROXY_POOL_ENV = "PROXY_POOL_JSON"
+MAX_PROXY_POOL_JSON_BYTES = 1024 * 1024
+MAX_PROXY_POOL_ENTRIES = 1000
+_PROXY_POOL_FIELDS = frozenset({"host", "port", "username", "password"})
+_DNS_LABEL = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
+
+
+class ProxyPoolConfigurationError(ValueError):
+    """A redaction-safe proxy-pool configuration error."""
+
+
+class _DuplicateJsonField(ValueError):
+    """Internal marker for duplicate JSON object fields."""
+
+
+def _json_object_without_duplicate_fields(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise _DuplicateJsonField
+        result[key] = value
+    return result
+
+
+def _pool_error(index: int | None, field: str, reason: str) -> ProxyPoolConfigurationError:
+    location = "proxy pool" if index is None else f"proxy pool entry {index}"
+    return ProxyPoolConfigurationError(f"{location}: invalid {field} ({reason})")
+
+
+def _contains_control_character(value: str) -> bool:
+    return any(ord(character) < 32 or ord(character) == 127 for character in value)
+
+
+def _normalise_proxy_host(value: Any, *, index: int) -> str:
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise _pool_error(index, "host", "must be a non-empty trimmed string")
+    if _contains_control_character(value) or len(value) > 253:
+        raise _pool_error(index, "host", "contains unsupported characters")
+    try:
+        return ipaddress.ip_address(value).compressed
+    except ValueError:
+        pass
+    try:
+        ascii_host = value.encode("idna").decode("ascii").lower()
+    except UnicodeError as exc:
+        raise _pool_error(index, "host", "is not a valid hostname") from exc
+    labels = ascii_host.rstrip(".").split(".")
+    if (
+        ascii_host.endswith(".")
+        or len(ascii_host) > 253
+        or not labels
+        or any(not _DNS_LABEL.fullmatch(label) for label in labels)
+    ):
+        raise _pool_error(index, "host", "is not a valid hostname")
+    return ascii_host
+
+
+def _normalise_proxy_credential(
+    value: Any,
+    *,
+    index: int,
+    field: str,
+    max_length: int,
+) -> str:
+    if not isinstance(value, str) or not value:
+        raise _pool_error(index, field, "must be a non-empty string")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise _pool_error(index, field, "contains unsupported characters") from exc
+    if len(value) > max_length or _contains_control_character(value):
+        raise _pool_error(index, field, "contains unsupported characters")
+    if field == "username" and ":" in value:
+        raise _pool_error(index, field, "must not contain ':'")
+    return value
+
+
+def _parse_proxy_pool_json(raw: str) -> tuple[dict[str, Any], ...]:
+    """Parse a bounded, strict pool while keeping credential values out of errors."""
+    if not isinstance(raw, str) or not raw.strip():
+        raise _pool_error(None, PROXY_POOL_ENV, "is required and must not be blank")
+    try:
+        encoded_size = len(raw.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise _pool_error(None, PROXY_POOL_ENV, "is not valid UTF-8") from exc
+    if encoded_size > MAX_PROXY_POOL_JSON_BYTES:
+        raise _pool_error(None, PROXY_POOL_ENV, "exceeds the size limit")
+    try:
+        payload = json.loads(raw, object_pairs_hook=_json_object_without_duplicate_fields)
+    except _DuplicateJsonField as exc:
+        raise _pool_error(None, PROXY_POOL_ENV, "contains a duplicate object field") from exc
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise _pool_error(None, PROXY_POOL_ENV, "is not valid JSON") from exc
+    if not isinstance(payload, list) or not payload:
+        raise _pool_error(None, PROXY_POOL_ENV, "must be a non-empty JSON array")
+    if len(payload) > MAX_PROXY_POOL_ENTRIES:
+        raise _pool_error(None, PROXY_POOL_ENV, "contains too many entries")
+
+    records: list[dict[str, Any]] = []
+    identities: set[tuple[str, int, str]] = set()
+    for index, item in enumerate(payload):
+        if not isinstance(item, dict):
+            raise _pool_error(index, "entry", "must be a JSON object")
+        keys = frozenset(item)
+        if keys != _PROXY_POOL_FIELDS:
+            raise _pool_error(
+                index,
+                "fields",
+                "must contain exactly host, port, username and password",
+            )
+        host = _normalise_proxy_host(item["host"], index=index)
+        port = item["port"]
+        if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+            raise _pool_error(index, "port", "must be an integer in 1..65535")
+        username = _normalise_proxy_credential(
+            item["username"], index=index, field="username", max_length=1024
+        )
+        password = _normalise_proxy_credential(
+            item["password"], index=index, field="password", max_length=4096
+        )
+        identity = (host, port, username)
+        if identity in identities:
+            raise _pool_error(index, "entry", "duplicates an earlier endpoint identity")
+        identities.add(identity)
+        records.append(
+            {
+                "host": host,
+                "port": port,
+                "username": username,
+                "password": password,
+            }
+        )
+    return tuple(records)
+
+
+def _dagrun_budget_bytes(dag_id: str) -> int:
+    """Return the source-specific hard cap without weakening WhoScored."""
+    if dag_id in TRANSFERMARKT_DAG_IDS:
+        return TRANSFERMARKT_DAGRUN_BUDGET_BYTES
+    return DAGRUN_BUDGET_BYTES
 
 
 @dataclass
@@ -70,6 +226,14 @@ class Lease:
     created_at: float
     expires_at: float
     max_bytes: int
+    dag_id: str = ""
+    run_id: str = ""
+    task_id: str = ""
+    map_index: int = -1
+    try_number: int = 0
+    scope: str = ""
+    entity: str = ""
+    canonical_url: str = ""
     up_bytes: int = 0
     down_bytes: int = 0
     reserved_bytes: int = 0
@@ -105,7 +269,27 @@ class Lease:
             "expired": self.expired,
             "budget_exceeded": self.budget_exceeded,
             "hosts": self.hosts,
+            "dag_id": self.dag_id,
+            "run_id": self.run_id,
+            "task_id": self.task_id,
+            "map_index": self.map_index,
+            "try_number": self.try_number,
+            "scope": self.scope,
+            "entity": self.entity,
+            "canonical_url": self.canonical_url,
+            "dagrun_total_bytes": _run_total_bytes(self.dagrun_key),
+            "dagrun_budget_bytes": _dagrun_budget_bytes(self.dag_id),
+            "url_total_bytes": _url_total_bytes(self.dagrun_key, self.canonical_url),
+            "url_budget_bytes": URL_BUDGET_BYTES,
         }
+
+    @property
+    def dagrun_key(self) -> str:
+        if self.dag_id and self.run_id:
+            return f"{self.dag_id}/{self.run_id}"
+        # Non-Airflow compatibility callers still receive an isolated hard
+        # budget rather than accidentally sharing an anonymous global bucket.
+        return f"standalone/{self.lease_id}"
 
 
 LEASES: dict[str, Lease] = {}
@@ -114,6 +298,12 @@ _daily_day = ""
 _daily_up_bytes = 0
 _daily_down_bytes = 0
 _daily_reserved_bytes = 0
+_run_up_bytes: dict[str, int] = defaultdict(int)
+_run_down_bytes: dict[str, int] = defaultdict(int)
+_run_reserved_bytes: dict[str, int] = defaultdict(int)
+_url_up_bytes: dict[tuple[str, str], int] = defaultdict(int)
+_url_down_bytes: dict[tuple[str, str], int] = defaultdict(int)
+_url_reserved_bytes: dict[tuple[str, str], int] = defaultdict(int)
 
 # Idle-refresh rotation state (#652). The residential exit is refreshed only when
 # no tunnel is currently open (``_active == 0``), so one exit IP serves a whole
@@ -142,26 +332,56 @@ def _is_blocked(host: str) -> bool:
     return any(h == b or h.endswith("." + b) for b in BLOCKLIST)
 
 
-def _residential_manager(proxy_file: str):
-    """A ProxyManager loaded from the custom-format pool file (host:port:user:pass).
+def _residential_manager(
+    *,
+    proxy_pool_json: str | None,
+    proxy_file: str,
+    allow_file_fallback: bool,
+):
+    """Load the paid pool from the environment, or an explicitly enabled file.
 
     The upstream is refreshed per FlareSolverr session (idle-refresh, see
     ``_acquire_upstream``) so each session lands on a different residential exit —
     keeping IP diversity that a pin-one-proxy startup would have thrown away, while
     holding one exit per CF session so the page and its Turnstile challenge stay on
-    a single IP (#652)."""
-    from scrapers.utils.proxy_manager import ProxyManager
+    a single IP (#652). Credential values are never included in errors or logs.
+    """
+    from scrapers.utils.proxy_manager import ProxyManager, ProxyType
 
     mgr = ProxyManager(rotation_strategy="random")
-    n = mgr.load_from_file_custom_format(proxy_file)
+    if proxy_pool_json is not None and proxy_pool_json.strip():
+        records = _parse_proxy_pool_json(proxy_pool_json)
+        for record in records:
+            mgr.add_proxy(
+                host=record["host"],
+                port=record["port"],
+                proxy_type=ProxyType.HTTP,
+                username=record["username"],
+                password=record["password"],
+            )
+        n = len(records)
+        source = PROXY_POOL_ENV
+    elif allow_file_fallback:
+        n = mgr.load_from_file_custom_format(proxy_file)
+        source = "explicit file fallback"
+    else:
+        raise ProxyPoolConfigurationError(
+            f"{PROXY_POOL_ENV} is required; file fallback is disabled"
+        )
     if n <= 0:
-        raise SystemExit(f"no proxies in {proxy_file}")
-    return mgr
+        raise ProxyPoolConfigurationError("proxy pool contains no usable entries")
+    return mgr, source
 
 
 def _pick_upstream(mgr):
     """(host, port, user, pass) of one residential proxy from the pool."""
-    u = urlsplit(mgr.get_proxy().url)  # http://user:pass@host:port
+    selected = mgr.get_proxy()
+    if all(
+        hasattr(selected, field)
+        for field in ("host", "port", "username", "password")
+    ):
+        return selected.host, selected.port, selected.username, selected.password
+    u = urlsplit(selected.url)  # Compatibility with the minimal unit-test fake.
     return u.hostname, u.port, u.username, u.password
 
 
@@ -182,6 +402,137 @@ def _refresh_daily_counter() -> None:
 def _daily_total_bytes() -> int:
     _refresh_daily_counter()
     return _daily_up_bytes + _daily_down_bytes
+
+
+def _run_total_bytes(run_key: str) -> int:
+    return _run_up_bytes[run_key] + _run_down_bytes[run_key]
+
+
+def _url_total_bytes(run_key: str, canonical_url: str) -> int:
+    key = (run_key, canonical_url)
+    return _url_up_bytes[key] + _url_down_bytes[key]
+
+
+def _canonical_url(value: Any) -> str:
+    raw = str(value or "").strip()
+    parts = urlsplit(raw)
+    if parts.scheme and parts.netloc:
+        query = urlencode(sorted(parse_qsl(parts.query, keep_blank_values=True)))
+        return urlunsplit(
+            (
+                parts.scheme.lower(),
+                parts.netloc.lower(),
+                parts.path or "/",
+                query,
+                "",
+            )
+        )
+    return raw.split("#", 1)[0]
+
+
+def _append_budget_event(event_type: str, lease: Lease, **values: Any) -> None:
+    """Append and fsync exact paid accounting before another lease is served."""
+    if not LEDGER_PATH:
+        raise RuntimeError("paid request ledger path is not configured")
+    event = {
+        "event_version": "whoscored-paid-proxy-v1",
+        "event_id": uuid_hex(24),
+        "occurred_at": datetime.now(timezone.utc).isoformat(),
+        "event_type": event_type,
+        "lease_id": lease.lease_id,
+        "route": "paid_proxy",
+        "dag_id": lease.dag_id,
+        "run_id": lease.run_id,
+        "task_id": lease.task_id,
+        "map_index": lease.map_index,
+        "try_number": lease.try_number,
+        "scope": lease.scope,
+        "entity": lease.entity,
+        "canonical_url": lease.canonical_url,
+        **values,
+    }
+    os.makedirs(os.path.dirname(LEDGER_PATH) or ".", exist_ok=True)
+    payload = (json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n").encode(
+        "utf-8"
+    )
+    if len(payload) > MAX_LEDGER_EVENT_BYTES:
+        raise RuntimeError(
+            f"paid byte event exceeds {MAX_LEDGER_EVENT_BYTES} bytes"
+        )
+    descriptor = os.open(
+        LEDGER_PATH,
+        os.O_APPEND | os.O_CREAT | os.O_WRONLY,
+        0o600,
+    )
+    try:
+        os.fchmod(descriptor, 0o600)
+        pending = memoryview(payload)
+        while pending:
+            written = os.write(descriptor, pending)
+            if written <= 0:
+                raise OSError("paid byte ledger write made no progress")
+            pending = pending[written:]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _restore_budget_ledger(path: str, *, restore_daily: bool = True) -> int:
+    """Restore run/URL/daily counters from durable byte-delta events."""
+    global _daily_day, _daily_up_bytes, _daily_down_bytes
+    restored = 0
+    try:
+        stream = open(path, "rb")
+    except (FileNotFoundError, OSError):
+        return 0
+    today = _utc_day()
+    with stream:
+        line_number = 0
+        while True:
+            raw = stream.readline(MAX_LEDGER_EVENT_BYTES + 1)
+            if not raw:
+                break
+            line_number += 1
+            try:
+                if len(raw) > MAX_LEDGER_EVENT_BYTES:
+                    raise ValueError("paid byte event exceeds bounded line limit")
+                event = json.loads(raw.decode("utf-8"))
+                if not isinstance(event, dict):
+                    raise ValueError("paid byte event must be a JSON object")
+                if event.get("event_type") != "bytes":
+                    continue
+                count = max(0, int(event.get("bytes", 0)))
+                direction = event.get("direction")
+                if direction not in ("up", "down") or count <= 0:
+                    raise ValueError("invalid paid byte event")
+                dag_id = str(event.get("dag_id") or "")
+                run_id = str(event.get("run_id") or "")
+                lease_id = str(event.get("lease_id") or "")
+                run_key = (
+                    f"{dag_id}/{run_id}"
+                    if dag_id and run_id
+                    else f"standalone/{lease_id}"
+                )
+                canonical = _canonical_url(event.get("canonical_url"))
+                if direction == "up":
+                    _run_up_bytes[run_key] += count
+                    _url_up_bytes[(run_key, canonical)] += count
+                else:
+                    _run_down_bytes[run_key] += count
+                    _url_down_bytes[(run_key, canonical)] += count
+                occurred = str(event.get("occurred_at") or "")
+                if restore_daily and occurred[:10] == today:
+                    _daily_day = today
+                    if direction == "up":
+                        _daily_up_bytes += count
+                    else:
+                        _daily_down_bytes += count
+                restored += 1
+            except (json.JSONDecodeError, UnicodeDecodeError, TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"corrupt paid byte ledger at line {line_number}"
+                ) from exc
+    return restored
 
 
 def _restore_daily_counter(out_path: str) -> None:
@@ -209,7 +560,14 @@ def _restore_daily_counter(out_path: str) -> None:
     _daily_reserved_bytes = 0
 
 
-def _create_lease(mgr, *, max_bytes: int, ttl_seconds: int) -> Lease:
+def _create_lease(
+    mgr,
+    *,
+    max_bytes: int,
+    ttl_seconds: int,
+    metadata: dict[str, Any] | None = None,
+    require_context: bool = False,
+) -> Lease:
     """Create one explicit, byte-bounded sticky residential lease."""
     _refresh_daily_counter()
     if max_bytes <= 0 or max_bytes > MAX_LEASE_BYTES:
@@ -218,6 +576,21 @@ def _create_lease(mgr, *, max_bytes: int, ttl_seconds: int) -> Lease:
         raise ValueError(f"ttl_seconds must be in 1..{MAX_LEASE_TTL_SECONDS}")
     if _daily_total_bytes() >= DAILY_BUDGET_BYTES:
         raise RuntimeError("daily paid-proxy budget exhausted")
+    active = sum(
+        1
+        for item in LEASES.values()
+        if not item.closed and (item.active_tunnels > 0 or not item.expired)
+    )
+    if active >= MAX_ACTIVE_LEASES:
+        raise RuntimeError("paid-proxy concurrency limit reached")
+    metadata = metadata or {}
+    if require_context and not all(
+        str(metadata.get(field) or "").strip()
+        for field in ("dag_id", "run_id", "task_id", "canonical_url")
+    ):
+        raise ValueError(
+            "dag_id, run_id, task_id and canonical_url are required for paid leases"
+        )
     now = time.time()
     lease = Lease(
         lease_id=uuid_hex(12),
@@ -225,15 +598,36 @@ def _create_lease(mgr, *, max_bytes: int, ttl_seconds: int) -> Lease:
         upstream=_pick_upstream(mgr),
         created_at=now,
         expires_at=now + ttl_seconds,
-        max_bytes=min(max_bytes, DAILY_BUDGET_BYTES - _daily_total_bytes()),
+        max_bytes=max_bytes,
+        dag_id=str(metadata.get("dag_id") or ""),
+        run_id=str(metadata.get("run_id") or ""),
+        task_id=str(metadata.get("task_id") or ""),
+        map_index=int(metadata.get("map_index", -1)),
+        try_number=int(metadata.get("try_number", 0)),
+        scope=str(metadata.get("scope") or ""),
+        entity=str(metadata.get("entity") or ""),
+        canonical_url=_canonical_url(metadata.get("canonical_url")),
     )
+    available = min(
+        DAILY_BUDGET_BYTES - _daily_total_bytes(),
+        _dagrun_budget_bytes(lease.dag_id) - _run_total_bytes(lease.dagrun_key),
+        URL_BUDGET_BYTES
+        - _url_total_bytes(lease.dagrun_key, lease.canonical_url),
+    )
+    if available <= 0:
+        raise RuntimeError("paid-proxy DagRun or URL budget exhausted")
+    lease.max_bytes = min(max_bytes, available)
     LEASES[lease.lease_id] = lease
     LEASE_TOKENS[lease.token] = lease.lease_id
+    try:
+        _append_budget_event("lease_created", lease, max_bytes=lease.max_bytes)
+    except Exception:
+        LEASES.pop(lease.lease_id, None)
+        LEASE_TOKENS.pop(lease.token, None)
+        raise
     log.info(
-        "lease %s created: upstream=%s:%s max_bytes=%d ttl=%ds",
+        "lease %s created: max_bytes=%d ttl=%ds",
         lease.lease_id,
-        lease.upstream[0],
-        lease.upstream[1],
         lease.max_bytes,
         ttl_seconds,
     )
@@ -273,9 +667,25 @@ def _lease_remaining(lease: Lease) -> int:
     daily_remaining = max(
         0, DAILY_BUDGET_BYTES - _daily_total_bytes() - _daily_reserved_bytes
     )
+    run_key = lease.dagrun_key
+    url_key = (run_key, lease.canonical_url)
+    run_remaining = max(
+        0,
+        _dagrun_budget_bytes(lease.dag_id)
+        - _run_total_bytes(run_key)
+        - _run_reserved_bytes[run_key],
+    )
+    url_remaining = max(
+        0,
+        URL_BUDGET_BYTES
+        - _url_total_bytes(run_key, lease.canonical_url)
+        - _url_reserved_bytes[url_key],
+    )
     return min(
         max(0, lease.max_bytes - lease.total_bytes - lease.reserved_bytes),
         daily_remaining,
+        run_remaining,
+        url_remaining,
     )
 
 
@@ -285,6 +695,8 @@ def _reserve_lease_bytes(lease: Lease, wanted: int) -> int:
     count = min(max(0, wanted), _lease_remaining(lease))
     lease.reserved_bytes += count
     _daily_reserved_bytes += count
+    _run_reserved_bytes[lease.dagrun_key] += count
+    _url_reserved_bytes[(lease.dagrun_key, lease.canonical_url)] += count
     return count
 
 
@@ -292,6 +704,10 @@ def _release_lease_reservation(lease: Lease, count: int) -> None:
     global _daily_reserved_bytes
     lease.reserved_bytes = max(0, lease.reserved_bytes - count)
     _daily_reserved_bytes = max(0, _daily_reserved_bytes - count)
+    run_key = lease.dagrun_key
+    url_key = (run_key, lease.canonical_url)
+    _run_reserved_bytes[run_key] = max(0, _run_reserved_bytes[run_key] - count)
+    _url_reserved_bytes[url_key] = max(0, _url_reserved_bytes[url_key] - count)
 
 
 def _account_lease_bytes(lease: Lease, host: str, direction: str, count: int) -> None:
@@ -304,14 +720,39 @@ def _account_lease_bytes(lease: Lease, host: str, direction: str, count: int) ->
     if direction == "up":
         lease.up_bytes += count
         _daily_up_bytes += count
+        _run_up_bytes[lease.dagrun_key] += count
+        _url_up_bytes[(lease.dagrun_key, lease.canonical_url)] += count
         host_stats["up_bytes"] += count
         up_bytes[host] += count
     else:
         lease.down_bytes += count
         _daily_down_bytes += count
+        _run_down_bytes[lease.dagrun_key] += count
+        _url_down_bytes[(lease.dagrun_key, lease.canonical_url)] += count
         host_stats["down_bytes"] += count
         down_bytes[host] += count
-    if lease.total_bytes >= lease.max_bytes or _daily_total_bytes() >= DAILY_BUDGET_BYTES:
+    try:
+        _append_budget_event(
+            "bytes",
+            lease,
+            host=host,
+            direction=direction,
+            bytes=count,
+            lease_total_bytes=lease.total_bytes,
+            dagrun_total_bytes=_run_total_bytes(lease.dagrun_key),
+            url_total_bytes=_url_total_bytes(lease.dagrun_key, lease.canonical_url),
+        )
+    except Exception:
+        log.exception("paid byte ledger append failed; closing lease %s", lease.lease_id)
+        lease.budget_exceeded = True
+    if (
+        lease.total_bytes >= lease.max_bytes
+        or _daily_total_bytes() >= DAILY_BUDGET_BYTES
+        or _run_total_bytes(lease.dagrun_key)
+        >= _dagrun_budget_bytes(lease.dag_id)
+        or _url_total_bytes(lease.dagrun_key, lease.canonical_url)
+        >= URL_BUDGET_BYTES
+    ):
         lease.budget_exceeded = True
 
 
@@ -424,6 +865,7 @@ async def _send_json(
 
 async def _close_lease(lease: Lease) -> dict[str, Any]:
     """Stop all tunnels and wait until byte counters are final."""
+    was_closed = lease.closed
     lease.closed = True
     for tunnel_writer in tuple(lease.tunnel_writers):
         try:
@@ -433,6 +875,13 @@ async def _close_lease(lease: Lease) -> dict[str, Any]:
     deadline = time.monotonic() + 2.0
     while lease.active_tunnels and time.monotonic() < deadline:
         await asyncio.sleep(0.01)
+    if not was_closed:
+        try:
+            _append_budget_event(
+                "lease_closed", lease, total_bytes=lease.total_bytes
+            )
+        except Exception:
+            log.exception("could not persist close for lease %s", lease.lease_id)
     return lease.report()
 
 
@@ -470,12 +919,20 @@ async def _handle_control(
                 ttl_seconds=int(
                     request.get("ttl_seconds", DEFAULT_LEASE_TTL_SECONDS)
                 ),
+                metadata=request,
+                require_context=True,
             )
         except (ValueError, TypeError, json.JSONDecodeError) as exc:
             await _send_json(writer, 400, {"error": str(exc)})
             return True
         except RuntimeError as exc:
-            await _send_json(writer, 429, {"error": str(exc)})
+            message = str(exc)
+            code = (
+                "concurrency_limited"
+                if "concurrency" in message
+                else "budget_exceeded"
+            )
+            await _send_json(writer, 429, {"code": code, "error": message})
             return True
         await _send_json(
             writer,
@@ -744,6 +1201,16 @@ def _dump(out_path: str, quiet: bool = False) -> None:
             "budget_bytes": DAILY_BUDGET_BYTES,
         },
         "leases": [lease.report() for lease in LEASES.values()],
+        "dagruns": [
+            {
+                "key": key,
+                "up_bytes": _run_up_bytes[key],
+                "down_bytes": _run_down_bytes[key],
+                "total_bytes": _run_total_bytes(key),
+                "budget_bytes": _dagrun_budget_bytes(key.split("/", 1)[0]),
+            }
+            for key in sorted(set(_run_up_bytes) | set(_run_down_bytes))
+        ],
         "allowed_hosts": rows,
         "blocked_hosts": sorted(
             ({"host": h, "attempts": c} for h, c in blocked_count.items()),
@@ -773,6 +1240,10 @@ async def _periodic_dump(out_path: str, interval: float = 2.0) -> None:
 
 async def main() -> None:
     global BLOCKLIST, DAILY_BUDGET_BYTES, MAX_LEASE_BYTES, LEASE_PROXY_URL
+    global MAX_LEASE_TTL_SECONDS, DAGRUN_BUDGET_BYTES
+    global TRANSFERMARKT_DAGRUN_BUDGET_BYTES
+    global URL_BUDGET_BYTES, MAX_ACTIVE_LEASES, LEDGER_PATH
+    global _daily_day, _daily_up_bytes, _daily_down_bytes
     ap = argparse.ArgumentParser()
     ap.add_argument("--listen", default="0.0.0.0:8899")
     ap.add_argument(
@@ -786,19 +1257,89 @@ async def main() -> None:
         help="lease proxy URL returned by POST /v1/leases",
     )
     ap.add_argument("--proxy-file", default="/opt/airflow/proxys.txt")
+    ap.add_argument(
+        "--allow-proxy-file-fallback",
+        action="store_true",
+        help=(
+            "explicitly allow --proxy-file only when PROXY_POOL_JSON is blank; "
+            "disabled by default"
+        ),
+    )
     ap.add_argument("--blocklist", default=None, help="domain blocklist file (omit = observe only)")
     ap.add_argument("--out", default="/tmp/filter_bytes.json")
     ap.add_argument("--pidfile", default="/tmp/filter_proxy.pid")
     ap.add_argument("--daily-budget-mb", type=float, default=100.0)
     ap.add_argument("--max-lease-mb", type=float, default=24.0)
+    ap.add_argument(
+        "--max-lease-ttl-seconds",
+        type=int,
+        default=MAX_LEASE_TTL_SECONDS,
+    )
+    ap.add_argument("--dagrun-budget-bytes", type=int, default=8_000_000)
+    ap.add_argument(
+        "--transfermarkt-dagrun-budget-bytes",
+        type=int,
+        default=TRANSFERMARKT_DAGRUN_BUDGET_BYTES,
+    )
+    ap.add_argument("--url-budget-bytes", type=int, default=2_000_000)
+    ap.add_argument("--max-active-leases", type=int, default=1)
+    ap.add_argument(
+        "--ledger",
+        default=os.environ.get(
+            "PROXY_FILTER_LEDGER_PATH",
+            "/opt/airflow/logs/proxy_filter/paid_requests.jsonl",
+        ),
+        help="durable append-only paid byte ledger",
+    )
     args = ap.parse_args()
 
-    if args.daily_budget_mb <= 0 or args.max_lease_mb <= 0:
+    if (
+        args.daily_budget_mb <= 0
+        or args.max_lease_mb <= 0
+        or args.max_lease_ttl_seconds <= 0
+        or args.dagrun_budget_bytes <= 0
+        or args.transfermarkt_dagrun_budget_bytes <= 0
+        or args.url_budget_bytes <= 0
+        or args.max_active_leases != 1
+    ):
         raise SystemExit("proxy byte budgets must be positive")
+    env_file_fallback = os.environ.get("PROXY_FILTER_ALLOW_FILE_FALLBACK", "false")
+    if env_file_fallback.lower() not in {"true", "false"}:
+        raise SystemExit("PROXY_FILTER_ALLOW_FILE_FALLBACK must be true or false")
+    allow_file_fallback = (
+        args.allow_proxy_file_fallback or env_file_fallback.lower() == "true"
+    )
+    try:
+        mgr, pool_source = _residential_manager(
+            proxy_pool_json=os.environ.get(PROXY_POOL_ENV),
+            proxy_file=args.proxy_file,
+            allow_file_fallback=allow_file_fallback,
+        )
+    except (OSError, ProxyPoolConfigurationError) as exc:
+        raise SystemExit(f"proxy pool configuration error: {exc}") from None
+
     DAILY_BUDGET_BYTES = int(args.daily_budget_mb * 1024 * 1024)
     MAX_LEASE_BYTES = int(args.max_lease_mb * 1024 * 1024)
+    MAX_LEASE_TTL_SECONDS = args.max_lease_ttl_seconds
+    DAGRUN_BUDGET_BYTES = args.dagrun_budget_bytes
+    TRANSFERMARKT_DAGRUN_BUDGET_BYTES = (
+        args.transfermarkt_dagrun_budget_bytes
+    )
+    URL_BUDGET_BYTES = args.url_budget_bytes
+    MAX_ACTIVE_LEASES = args.max_active_leases
+    LEDGER_PATH = args.ledger
     LEASE_PROXY_URL = args.lease_proxy_url.rstrip("/")
     _restore_daily_counter(args.out)
+    report_daily = (_daily_up_bytes, _daily_down_bytes)
+    _daily_day = ""
+    _daily_up_bytes = _daily_down_bytes = 0
+    restored_events = _restore_budget_ledger(LEDGER_PATH, restore_daily=True)
+    if sum(report_daily) > _daily_total_bytes():
+        # Conservative compatibility for bytes recorded before the WAL was
+        # deployed. Never add report+WAL, which would double count.
+        _daily_day = _utc_day()
+        _daily_up_bytes, _daily_down_bytes = report_daily
+    log.info("restored %d durable paid byte events", restored_events)
 
     with open(args.pidfile, "w") as fh:
         fh.write(str(os.getpid()))
@@ -806,10 +1347,11 @@ async def main() -> None:
     BLOCKLIST = _load_blocklist(args.blocklist)
     log.info("blocklist: %d domains from %s", len(BLOCKLIST), args.blocklist or "(none — observe mode)")
 
-    mgr = _residential_manager(args.proxy_file)
     log.info(
-        "residential pool = %d proxies (explicit sticky leases; legacy idle-refresh enabled)",
+        "residential pool = %d proxies from %s "
+        "(explicit sticky leases; legacy idle-refresh enabled)",
         mgr.total_count,
+        pool_source,
     )
     host, port = args.listen.rsplit(":", 1)
     lease_host, lease_port = args.lease_listen.rsplit(":", 1)

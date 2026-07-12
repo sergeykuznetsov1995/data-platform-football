@@ -56,7 +56,7 @@ sch_dedup AS (
             PARTITION BY league, season, game
             ORDER BY _ingested_at DESC
         ) AS rn
-    FROM iceberg.bronze.whoscored_schedule
+    FROM iceberg.bronze.whoscored_schedule_current
 )
 
 SELECT

@@ -9,6 +9,7 @@
 --
 -- Sources:
 --   iceberg.silver.whoscored_events_spadl   (input — frozen E3.1 deliverable)
+--   iceberg.bronze.whoscored_schedule_current (Opta team id -> full source name)
 --   iceberg.silver.xref_team                (team_id resolution)
 --   iceberg.silver.xref_player              (player_id resolution)
 --
@@ -72,13 +73,17 @@
 -- now ENABLED in `dags/utils/e3_dq.py::_build_fct_event_checks` because
 -- every WhoScored game_id has a row in xref_match (bridged or orphan).
 --
--- ADR-2: team name is carried by Silver
--- -------------------------------------
+-- ADR-2: numeric team id bridges event short names to schedule full names
+-- -----------------------------------------------------------------------
 -- silver.whoscored_events_spadl carries both the raw Opta team id and the raw
--- team name from the manifest-filtered Bronze current view. xref_team is
--- name-based, so Gold joins directly on `e.team_name_raw`. The former extra
--- scan/GROUP BY over the append-only Bronze event table was both expensive and
--- able to re-introduce rows from incomplete batches.
+-- event team name. Event names are often abbreviations (`Man City`, `PSG`,
+-- `Bayern`, `RBL`), while xref_team's WhoScored universe is built from schedule
+-- full names. The manifest-filtered schedule current view supplies the stable
+-- numeric-id -> full-name bridge without scanning append-only event history.
+-- Duplicate observations of the same name collapse to one row. Conflicting
+-- names for one (league, season, team_id) deliberately produce NULL rather
+-- than an arbitrary identity; a missing schedule mapping alone may fall back
+-- to the raw event name.
 --
 -- ADR-3: player_id orphan-tolerant LEFT JOIN
 -- ------------------------------------------
@@ -110,6 +115,39 @@
 --
 -- =============================================================================
 
+WITH ws_team_name_observations AS (
+    SELECT
+        league,
+        season,
+        CAST(home_team_id AS varchar) AS ws_team_id,
+        home_team AS ws_team_name
+    FROM iceberg.bronze.whoscored_schedule_current
+    WHERE home_team_id IS NOT NULL
+      AND home_team IS NOT NULL
+      AND TRIM(home_team) <> ''
+
+    UNION ALL
+
+    SELECT
+        league,
+        season,
+        CAST(away_team_id AS varchar) AS ws_team_id,
+        away_team AS ws_team_name
+    FROM iceberg.bronze.whoscored_schedule_current
+    WHERE away_team_id IS NOT NULL
+      AND away_team IS NOT NULL
+      AND TRIM(away_team) <> ''
+),
+ws_team_id_to_name AS (
+    SELECT
+        league,
+        season,
+        ws_team_id,
+        MIN(ws_team_name) AS ws_team_name,
+        COUNT(DISTINCT ws_team_name) AS team_name_count
+    FROM ws_team_name_observations
+    GROUP BY league, season, ws_team_id
+)
 SELECT
     -- ============================================================
     -- match identity (R0.4 canonical / source / version triplet)
@@ -194,13 +232,22 @@ SELECT
 
 FROM iceberg.silver.whoscored_events_spadl e
 
--- ---- team xref (whoscored team-name -> canonical) ----
+-- ---- numeric WhoScored team id -> schedule full name ----
+LEFT JOIN ws_team_id_to_name wsn
+    ON wsn.ws_team_id = e.team_id_raw
+   AND wsn.league     = e.league
+   AND wsn.season     = e.season
+
+-- ---- team xref (schedule full name -> canonical) ----
 -- #506: exclude confidence='orphan' rows — they carry a non-NULL source-
 -- prefixed canonical ('ws_<slug>') that would leak through as a resolved id.
 -- xref_team.sql.j2 contract: orphans are excluded from every cross-source JOIN.
 LEFT JOIN iceberg.silver.xref_team xt
     ON xt.source    = 'whoscored'
-   AND xt.source_id = e.team_name_raw
+   AND xt.source_id = CASE
+       WHEN wsn.team_name_count = 1 THEN wsn.ws_team_name
+       WHEN wsn.team_name_count IS NULL THEN e.team_name_raw
+   END
    AND xt.league    = e.league
    AND xt.season    = e.season
    AND xt.confidence <> 'orphan'

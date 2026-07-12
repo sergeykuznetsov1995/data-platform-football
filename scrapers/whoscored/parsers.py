@@ -8,6 +8,7 @@ instead of being converted to an empty successful run.
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import re
 from dataclasses import dataclass
@@ -17,10 +18,22 @@ from typing import Any, Mapping, Optional, Sequence
 
 from bs4 import BeautifulSoup
 
-from .domain import SeasonFormat, WhoScoredScope, canonical_season_id
+from .catalog import (
+    DEFAULT_TOURNAMENT_OVERRIDES,
+    TournamentOverride,
+    classify_tournament,
+)
+from .domain import (
+    SeasonFormat,
+    WhoScoredScope,
+    base_season_id,
+    canonical_season_id,
+    disambiguated_season_id,
+    source_season_id_hint,
+)
 
 
-PARSER_VERSION = "whoscored-parser-v2"
+PARSER_VERSION = "whoscored-parser-v7"
 
 
 class WhoScoredParseError(ValueError):
@@ -60,12 +73,77 @@ class MatchParseResult:
     parser_version: str
     parsed_at: str
     game_id: int
+    matches: ParsedDataset
     events: ParsedDataset
     lineups: ParsedDataset
+    substitutions: ParsedDataset
+    formations: ParsedDataset
+    team_match_stats: ParsedDataset
+    player_match_stats: ParsedDataset
 
     @property
     def datasets(self) -> Mapping[str, ParsedDataset]:
-        return {"events": self.events, "lineups": self.lineups}
+        return {
+            "matches": self.matches,
+            "events": self.events,
+            "lineups": self.lineups,
+            "substitutions": self.substitutions,
+            "formations": self.formations,
+            "team_match_stats": self.team_match_stats,
+            "player_match_stats": self.player_match_stats,
+        }
+
+
+@dataclass(frozen=True)
+class SeasonParseResult:
+    parser_version: str
+    stages: ParsedDataset
+    standings: ParsedDataset
+    forms: ParsedDataset
+    streaks: ParsedDataset
+    performance: ParsedDataset
+
+    @property
+    def datasets(self) -> Mapping[str, ParsedDataset]:
+        return {
+            "stages": self.stages,
+            "standings": self.standings,
+            "forms": self.forms,
+            "streaks": self.streaks,
+            "performance": self.performance,
+        }
+
+
+@dataclass(frozen=True)
+class PreviewParseResult:
+    parser_version: str
+    game_id: int
+    missing_players: ParsedDataset
+    preview_lineups: ParsedDataset
+    preview_sections: ParsedDataset
+
+    @property
+    def datasets(self) -> Mapping[str, ParsedDataset]:
+        return {
+            "missing_players": self.missing_players,
+            "preview_lineups": self.preview_lineups,
+            "preview_sections": self.preview_sections,
+        }
+
+
+@dataclass(frozen=True)
+class ProfileParseResult:
+    parser_version: str
+    player_id: int
+    profiles: ParsedDataset
+    participations: ParsedDataset
+
+    @property
+    def datasets(self) -> Mapping[str, ParsedDataset]:
+        return {
+            "player_profile_versions": self.profiles,
+            "player_stage_participations": self.participations,
+        }
 
 
 @dataclass(frozen=True, order=True)
@@ -104,6 +182,54 @@ def canonical_json(value: Any) -> str:
         )
     except (TypeError, ValueError) as exc:
         raise WhoScoredParseError(f"Value is not canonical JSON: {exc}") from exc
+
+
+def _schema_shape(value: Any) -> Any:
+    """Return a deterministic structural signature without source values."""
+
+    if isinstance(value, Mapping):
+        return {
+            str(key): _schema_shape(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, list):
+        shapes = [_schema_shape(item) for item in value]
+        if not shapes:
+            return {"array": "empty"}
+        encoded = [canonical_json(shape) for shape in shapes]
+        if len(set(encoded)) == 1:
+            return {"array": shapes[0]}
+        if all(isinstance(item, (Mapping, list)) for item in value):
+            variants = {token: shape for token, shape in zip(encoded, shapes)}
+            return {"array_variants": [variants[key] for key in sorted(variants)]}
+        # Heterogeneous primitive arrays are positional source contracts (for
+        # example standings rows), so field order and arity must affect drift.
+        return {"tuple": shapes}
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    return f"unsupported:{type(value).__name__}"
+
+
+def schema_fingerprint(value: Any) -> str:
+    """SHA-256 of the complete source field/type shape."""
+
+    encoded = canonical_json(_schema_shape(value)).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _source_metadata(value: Any) -> dict[str, str]:
+    return {
+        "source_raw_json": canonical_json(value),
+        "source_schema_fingerprint": schema_fingerprint(value),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -303,6 +429,16 @@ class _Json5Parser:
         if self._consume("]"):
             return result
         while True:
+            # WhoScored historical table arrays occasionally contain a real
+            # JavaScript elision (`,,`).  Preserve its positional meaning as
+            # JSON null; do not execute or rewrite any other expression.
+            self._space()
+            if self._consume(","):
+                result.append(None)
+                self._space()
+                if self._consume("]"):
+                    return result
+                continue
             result.append(self._value())
             self._space()
             if self._consume("]"):
@@ -341,7 +477,11 @@ class _Json5Parser:
             escaped = self.text[self.pos]
             self.pos += 1
             if escaped in "\r\n":
-                if escaped == "\r" and self.pos < len(self.text) and self.text[self.pos] == "\n":
+                if (
+                    escaped == "\r"
+                    and self.pos < len(self.text)
+                    and self.text[self.pos] == "\n"
+                ):
                     self.pos += 1
                 continue
             if escaped == "x":
@@ -460,6 +600,77 @@ def extract_js_assignment(
     )
 
 
+def extract_js_call_arguments(source: str, call_name: str) -> tuple[Any, ...]:
+    """Safely extract object/array literals passed to repeated JS calls.
+
+    WhoScored builds season tables with ``tables.push({...})`` rather than one
+    final assignment.  This scanner parses only literal arguments and never
+    evaluates JavaScript.
+    """
+
+    if not re.fullmatch(
+        r"[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*", call_name
+    ):
+        raise ValueError(f"Unsafe JavaScript call name {call_name!r}")
+    pattern = re.compile(rf"(?<![A-Za-z0-9_$]){re.escape(call_name)}\s*\(\s*")
+    values: list[Any] = []
+    for match in pattern.finditer(source):
+        start = match.end()
+        if start >= len(source) or source[start] not in "[{":
+            raise JavaScriptLiteralError(
+                f"{call_name} argument must be an object or array literal"
+            )
+        literal, _ = _scan_balanced(source, start)
+        values.append(parse_js_literal(literal))
+    return tuple(values)
+
+
+def _scan_js_string(source: str, start: int) -> tuple[str, int]:
+    if start >= len(source) or source[start] not in "'\"":
+        raise JavaScriptLiteralError("Expected a JavaScript string literal")
+    quote = source[start]
+    escaped = False
+    index = start + 1
+    while index < len(source):
+        char = source[index]
+        if escaped:
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char == quote:
+            return source[start : index + 1], index + 1
+        index += 1
+    raise JavaScriptLiteralError("Embedded JavaScript string is unterminated")
+
+
+def extract_json_parse_property(source: str, property_name: str) -> Any:
+    """Decode the exact ``property: JSON.parse('<json>')`` source idiom."""
+
+    if not _IDENTIFIER_RE.fullmatch(property_name):
+        raise ValueError(f"Unsafe JavaScript property name {property_name!r}")
+    pattern = re.compile(
+        rf"(?:(?:['\"]{re.escape(property_name)}['\"])|"
+        rf"(?:\b{re.escape(property_name)}\b))\s*:\s*JSON\.parse\(\s*"
+    )
+    match = pattern.search(source)
+    if match is None:
+        raise JavaScriptLiteralError(
+            f"JSON.parse property {property_name!r} was not found"
+        )
+    literal, _ = _scan_js_string(source, match.end())
+    decoded_string = parse_js_literal(literal)
+    if not isinstance(decoded_string, str):
+        raise JavaScriptLiteralError(
+            f"JSON.parse property {property_name!r} does not contain a string"
+        )
+    try:
+        return json.loads(decoded_string)
+    except json.JSONDecodeError as exc:
+        raise JavaScriptLiteralError(
+            f"JSON.parse property {property_name!r} contains invalid JSON: {exc.msg}"
+        ) from exc
+
+
 def extract_matchcentre_data(html: str) -> dict[str, Any]:
     """Extract the inline ``matchCentreData`` object from a match page."""
 
@@ -479,8 +690,6 @@ def extract_matchcentre_data(html: str) -> dict[str, Any]:
         value = extract_js_assignment(html, "matchCentreData")
     if not isinstance(value, dict):
         raise WhoScoredParseError("matchCentreData must be an object")
-    if "events" not in value:
-        raise WhoScoredParseError("matchCentreData has no events field")
     return value
 
 
@@ -493,8 +702,8 @@ _SNAKE_2 = re.compile(r"([a-z0-9])([A-Z])")
 
 
 def _snake(name: str) -> str:
-    return _SNAKE_2.sub(r"\1_\2", _SNAKE_1.sub(r"\1_\2", name)).lower().replace(
-        "-", "_"
+    return (
+        _SNAKE_2.sub(r"\1_\2", _SNAKE_1.sub(r"\1_\2", name)).lower().replace("-", "_")
     )
 
 
@@ -525,6 +734,35 @@ def _required_int(value: Any, field: str) -> int:
     return parsed
 
 
+def _required_source_bigint(value: Any, field: str) -> int:
+    """Parse an Opta identity without silently rounding a JSON float."""
+
+    if isinstance(value, bool) or value is None or value == "":
+        raise WhoScoredParseError(f"{field} is required")
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, str):
+        token = value.strip()
+        if re.fullmatch(r"[+]?[0-9]+", token) is None:
+            raise WhoScoredParseError(f"{field} is not an integer: {value!r}")
+        parsed = int(token)
+    elif isinstance(value, float):
+        if (
+            not math.isfinite(value)
+            or not value.is_integer()
+            or abs(value) > 9_007_199_254_740_991
+        ):
+            raise WhoScoredParseError(
+                f"{field} is not an exactly representable integer: {value!r}"
+            )
+        parsed = int(value)
+    else:
+        raise WhoScoredParseError(f"{field} is not numeric: {value!r}")
+    if parsed <= 0 or parsed > 9_223_372_036_854_775_807:
+        raise WhoScoredParseError(f"{field} must be a positive BIGINT")
+    return parsed
+
+
 def _optional_float(value: Any, field: str) -> Optional[float]:
     if value is None or value == "":
         return None
@@ -537,6 +775,32 @@ def _optional_float(value: Any, field: str) -> Optional[float]:
     if not math.isfinite(result):
         raise WhoScoredParseError(f"{field} must be finite")
     return result
+
+
+def _optional_preview_rating(value: Any) -> Optional[float]:
+    """Parse the preview UI's exact not-yet-rated placeholder."""
+
+    if isinstance(value, str) and value.strip().casefold() == "n/a":
+        return None
+    return _optional_float(value, "preview.rating")
+
+
+def _optional_bool(value: Any, field: str) -> Optional[bool]:
+    """Parse source booleans without Python's ``bool('false')`` trap."""
+
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return value
+    if value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        token = value.strip().casefold()
+        if token in {"true", "1"}:
+            return True
+        if token in {"false", "0"}:
+            return False
+    raise WhoScoredParseError(f"{field} is not a boolean: {value!r}")
 
 
 def _identity_fields(
@@ -554,6 +818,7 @@ def _identity_fields(
 
 EVENT_FIELDS = (
     "source_event_id",
+    "team_event_id",
     "game_id",
     "period",
     "minute",
@@ -578,11 +843,14 @@ EVENT_FIELDS = (
     "is_shot",
     "is_goal",
     "card_type",
-    "related_event_id",
+    "related_team_event_id",
     "related_player_id",
+    "satisfied_events_types",
     "league",
     "season",
     "game",
+    "source_raw_json",
+    "source_schema_fingerprint",
 )
 
 
@@ -593,6 +861,12 @@ def parse_events(
     game_id: int,
     game: Optional[str] = None,
 ) -> ParsedDataset:
+    if "events" not in data or data.get("events") is None:
+        return ParsedDataset(
+            "events",
+            DatasetStatus.NOT_AVAILABLE,
+            reason="source_events_absent",
+        )
     raw_events = data.get("events")
     if not isinstance(raw_events, list):
         raise WhoScoredParseError("matchCentreData.events must be a list")
@@ -617,22 +891,41 @@ def parse_events(
             team_names[team_id] = team_name
 
     rows: list[dict[str, Any]] = []
-    seen_ids: set[int] = set()
+    seen_source_ids: set[int] = set()
+    seen_team_event_ids: set[tuple[Optional[int], int]] = set()
     identity = _identity_fields(scope, _required_int(game_id, "game_id"), game)
     for index, event in enumerate(raw_events):
         if not isinstance(event, Mapping):
             raise WhoScoredParseError(f"events[{index}] must be an object")
-        source_event_id = _required_int(
-            event.get("eventId", event.get("id")),
-            f"events[{index}].eventId",
+        # ``id`` is the stable, match-unique Opta record identity.  The
+        # similarly named ``eventId`` restarts independently for both teams
+        # and is therefore only a team-local sequence (verified against live
+        # World Cup payloads where hundreds of eventId values occur twice).
+        # Never fall back from id to eventId: doing so silently merges real
+        # actions from opposite teams.
+        source_event_id = _required_source_bigint(
+            event.get("id"), f"events[{index}].id"
         )
-        if source_event_id in seen_ids:
+        if source_event_id in seen_source_ids:
             raise WhoScoredParseError(
-                f"Duplicate source event id {source_event_id} in game {game_id}"
+                f"Duplicate global source event id {source_event_id} in game {game_id}"
             )
-        seen_ids.add(source_event_id)
+        seen_source_ids.add(source_event_id)
+
+        team_event_id = _required_int(event.get("eventId"), f"events[{index}].eventId")
+        if team_event_id <= 0:
+            raise WhoScoredParseError(
+                f"events[{index}].eventId must be a positive integer"
+            )
 
         team_id = _optional_int(event.get("teamId"), f"events[{index}].teamId")
+        team_event_key = (team_id, team_event_id)
+        if team_event_key in seen_team_event_ids:
+            raise WhoScoredParseError(
+                "Duplicate team-local event identity "
+                f"{team_event_key!r} in game {game_id}"
+            )
+        seen_team_event_ids.add(team_event_key)
         player_id = _optional_int(event.get("playerId"), f"events[{index}].playerId")
         qualifiers = event.get("qualifiers")
         if qualifiers is None:
@@ -643,6 +936,7 @@ def parse_events(
         row = {
             **identity,
             "source_event_id": source_event_id,
+            "team_event_id": team_event_id,
             "period": _display(event.get("period")),
             "minute": _optional_int(event.get("minute"), f"events[{index}].minute"),
             "second": _optional_int(event.get("second"), f"events[{index}].second"),
@@ -672,16 +966,26 @@ def parse_events(
                 event.get("blockedY"), f"events[{index}].blockedY"
             ),
             "qualifiers": canonical_json(qualifiers),
-            "is_touch": bool(event.get("isTouch", False)),
-            "is_shot": bool(event.get("isShot", False)),
-            "is_goal": bool(event.get("isGoal", False)),
+            "is_touch": _optional_bool(
+                event.get("isTouch", False), f"events[{index}].isTouch"
+            ),
+            "is_shot": _optional_bool(
+                event.get("isShot", False), f"events[{index}].isShot"
+            ),
+            "is_goal": _optional_bool(
+                event.get("isGoal", False), f"events[{index}].isGoal"
+            ),
             "card_type": _display(event.get("cardType")),
-            "related_event_id": _optional_int(
+            "related_team_event_id": _optional_int(
                 event.get("relatedEventId"), f"events[{index}].relatedEventId"
             ),
             "related_player_id": _optional_int(
                 event.get("relatedPlayerId"), f"events[{index}].relatedPlayerId"
             ),
+            "satisfied_events_types": canonical_json(
+                event.get("satisfiedEventsTypes") or []
+            ),
+            **_source_metadata(event),
         }
         rows.append({field: row.get(field) for field in EVENT_FIELDS})
     return _dataset("events", rows)
@@ -744,7 +1048,9 @@ def parse_lineups(
         if not isinstance(players, list):
             raise WhoScoredParseError(f"{side}.players must be a list")
         team_id = _optional_int(side_value.get("teamId"), f"{side}.teamId")
-        team = side_value.get("name") if isinstance(side_value.get("name"), str) else None
+        team = (
+            side_value.get("name") if isinstance(side_value.get("name"), str) else None
+        )
 
         red_minutes: dict[int, int] = {}
         incidents = side_value.get("incidentEvents") or []
@@ -752,7 +1058,9 @@ def parse_lineups(
             raise WhoScoredParseError(f"{side}.incidentEvents must be a list")
         for index, incident in enumerate(incidents):
             if not isinstance(incident, Mapping):
-                raise WhoScoredParseError(f"{side}.incidentEvents[{index}] must be an object")
+                raise WhoScoredParseError(
+                    f"{side}.incidentEvents[{index}] must be an object"
+                )
             if _display(incident.get("cardType")) not in {"Red", "SecondYellow"}:
                 continue
             player_id = _optional_int(
@@ -777,7 +1085,12 @@ def parse_lineups(
                     f"Duplicate lineup player {player_id} for team {team_id}"
                 )
             seen.add(key)
-            is_starter = bool(player.get("isFirstEleven", False))
+            is_starter = bool(
+                _optional_bool(
+                    player.get("isFirstEleven", False),
+                    f"{side}.players[{index}].isFirstEleven",
+                )
+            )
             sub_in = _optional_int(
                 player.get("subbedInExpandedMinute"),
                 f"{side}.players[{index}].subbedInExpandedMinute",
@@ -786,7 +1099,9 @@ def parse_lineups(
                 player.get("subbedOutExpandedMinute"),
                 f"{side}.players[{index}].subbedOutExpandedMinute",
             )
-            effective_end = sub_out if sub_out is not None else red_minutes.get(player_id)
+            effective_end = (
+                sub_out if sub_out is not None else red_minutes.get(player_id)
+            )
             position = player.get("position")
             if isinstance(position, Mapping):
                 position = _display(position)
@@ -797,13 +1112,20 @@ def parse_lineups(
                     "team": team,
                     "side": side,
                     "player_id": player_id,
-                    "player": player.get("name") if isinstance(player.get("name"), str) else None,
+                    "player": player.get("name")
+                    if isinstance(player.get("name"), str)
+                    else None,
                     "shirt_no": _optional_int(
                         player.get("shirtNo"), f"{side}.players[{index}].shirtNo"
                     ),
                     "position": position if isinstance(position, str) else None,
                     "is_starter": is_starter,
-                    "is_man_of_the_match": bool(player.get("isManOfTheMatch", False)),
+                    "is_man_of_the_match": bool(
+                        _optional_bool(
+                            player.get("isManOfTheMatch", False),
+                            f"{side}.players[{index}].isManOfTheMatch",
+                        )
+                    ),
                     "subbed_in_expanded_minute": sub_in,
                     "subbed_out_expanded_minute": sub_out,
                     "minutes_played": _minutes_played(
@@ -821,6 +1143,7 @@ def parse_lineups(
                     "age": _optional_float(
                         player.get("age"), f"{side}.players[{index}].age"
                     ),
+                    **_source_metadata(player),
                 }
             )
 
@@ -831,6 +1154,371 @@ def parse_lineups(
             reason="source_player_blocks_absent",
         )
     return _dataset("lineups", rows, empty_reason="source_player_blocks_empty")
+
+
+def _mapping_text(value: Any, *keys: str) -> Optional[str]:
+    if isinstance(value, str):
+        return value or None
+    if isinstance(value, Mapping):
+        for key in keys:
+            candidate = value.get(key)
+            if isinstance(candidate, str) and candidate:
+                return candidate
+    return None
+
+
+def parse_match_record(
+    data: Mapping[str, Any],
+    *,
+    scope: WhoScoredScope,
+    game_id: int,
+    game: Optional[str] = None,
+) -> ParsedDataset:
+    """Project the match header while retaining the complete source object."""
+
+    identity = _identity_fields(scope, _required_int(game_id, "game_id"), game)
+    home = data.get("home") or {}
+    away = data.get("away") or {}
+    if not isinstance(home, Mapping) or not isinstance(away, Mapping):
+        raise WhoScoredParseError("matchCentreData home/away must be objects")
+    referee = data.get("referee") or data.get("matchOfficial") or {}
+    if referee is not None and not isinstance(referee, (Mapping, str)):
+        raise WhoScoredParseError("matchCentreData.referee must be an object or string")
+    home_scores = home.get("scores") or {}
+    away_scores = away.get("scores") or {}
+    if not isinstance(home_scores, Mapping):
+        home_scores = {}
+    if not isinstance(away_scores, Mapping):
+        away_scores = {}
+    row = {
+        **identity,
+        "home_team_id": _optional_int(home.get("teamId"), "home.teamId"),
+        "home_team": _mapping_text(home.get("name"), "name", "displayName")
+        or (home.get("name") if isinstance(home.get("name"), str) else None),
+        "away_team_id": _optional_int(away.get("teamId"), "away.teamId"),
+        "away_team": _mapping_text(away.get("name"), "name", "displayName")
+        or (away.get("name") if isinstance(away.get("name"), str) else None),
+        "home_score": _optional_int(
+            data.get("homeScore", home_scores.get("fulltime")), "homeScore"
+        ),
+        "away_score": _optional_int(
+            data.get("awayScore", away_scores.get("fulltime")), "awayScore"
+        ),
+        "status": _display(data.get("status"))
+        or (data.get("status") if isinstance(data.get("status"), str) else None),
+        "period": _display(data.get("period")),
+        "expanded_max_minute": _optional_int(
+            data.get("expandedMaxMinute"), "expandedMaxMinute"
+        ),
+        "attendance": _optional_int(data.get("attendance"), "attendance"),
+        "venue_name": _mapping_text(
+            data.get("venueName", data.get("venue")), "name", "displayName"
+        ),
+        "referee_id": _optional_int(
+            referee.get("officialId", referee.get("id"))
+            if isinstance(referee, Mapping)
+            else None,
+            "referee.officialId",
+        ),
+        "referee_name": _mapping_text(referee, "name", "displayName"),
+        "weather": canonical_json(data.get("weather"))
+        if data.get("weather") is not None
+        else None,
+        "start_time": data.get("startTime")
+        if isinstance(data.get("startTime"), str)
+        else None,
+        "home_manager": _mapping_text(home.get("manager"), "name", "displayName"),
+        "away_manager": _mapping_text(away.get("manager"), "name", "displayName"),
+        **_source_metadata(data),
+    }
+    if row["home_team_id"] is None and row["home_team"] is None:
+        raise WhoScoredParseError("matchCentreData.home has no team identity")
+    if row["away_team_id"] is None and row["away_team"] is None:
+        raise WhoScoredParseError("matchCentreData.away has no team identity")
+    return _dataset("matches", [row])
+
+
+def _stat_leaf_rows(
+    value: Any,
+    path: tuple[str, ...] = (),
+    path_kinds: tuple[str, ...] = (),
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            rows.extend(_stat_leaf_rows(child, (*path, str(key)), (*path_kinds, "key")))
+        return rows
+    if isinstance(value, list):
+        for index, child in enumerate(value):
+            rows.extend(
+                _stat_leaf_rows(child, (*path, str(index)), (*path_kinds, "index"))
+            )
+        return rows
+    numeric_value: Optional[float] = None
+    text_value: Optional[str] = None
+    boolean_value: Optional[bool] = None
+    if isinstance(value, bool):
+        boolean_value = value
+    elif isinstance(value, (int, float)):
+        numeric_value = _optional_float(value, ".".join(path) or "stat")
+    elif isinstance(value, str):
+        text_value = value
+    rows.append(
+        {
+            "category": path[0] if path else None,
+            "subcategory": path[1] if len(path) > 2 else None,
+            "stat": path[-1] if path else None,
+            "filter": ".".join(path[1:-1]) or None,
+            "minute": next(
+                (
+                    int(part)
+                    for part, kind in reversed(tuple(zip(path, path_kinds)))
+                    if kind == "key" and part.isdecimal()
+                ),
+                None,
+            ),
+            "numeric_value": numeric_value,
+            "text_value": text_value,
+            "boolean_value": boolean_value,
+            "value_json": canonical_json(value),
+            "source_path": ".".join(path),
+        }
+    )
+    return rows
+
+
+def _parse_match_stats(
+    data: Mapping[str, Any],
+    *,
+    scope: WhoScoredScope,
+    game_id: int,
+    game: Optional[str],
+    players: bool,
+) -> ParsedDataset:
+    name = "player_match_stats" if players else "team_match_stats"
+    identity = _identity_fields(scope, _required_int(game_id, "game_id"), game)
+    rows: list[dict[str, Any]] = []
+    blocks_present = False
+    for side in ("home", "away"):
+        team = data.get(side) or {}
+        if not isinstance(team, Mapping):
+            raise WhoScoredParseError(f"matchCentreData.{side} must be an object")
+        team_id = _optional_int(team.get("teamId"), f"{side}.teamId")
+        team_name = team.get("name") if isinstance(team.get("name"), str) else None
+        entities: Sequence[Any]
+        if players:
+            raw_players = team.get("players")
+            if raw_players is None:
+                entities = ()
+            elif isinstance(raw_players, list):
+                entities = raw_players
+            else:
+                raise WhoScoredParseError(f"{side}.players must be a list")
+        else:
+            entities = (team,)
+        for entity_index, entity in enumerate(entities):
+            if not isinstance(entity, Mapping):
+                raise WhoScoredParseError(f"{name} source entity must be an object")
+            block_names = ("stats",) if players else ("stats", "shotZones")
+            present_blocks = [block for block in block_names if block in entity]
+            if not present_blocks:
+                continue
+            blocks_present = True
+            player_id = (
+                _required_int(
+                    entity.get("playerId"), f"players[{entity_index}].playerId"
+                )
+                if players
+                else None
+            )
+            player_name = (
+                entity.get("name")
+                if players and isinstance(entity.get("name"), str)
+                else None
+            )
+            for block_name in present_blocks:
+                stats = entity.get(block_name)
+                if stats is None:
+                    stats = {}
+                if not isinstance(stats, (Mapping, list)):
+                    raise WhoScoredParseError(
+                        f"{name}.{block_name} must be an object or array"
+                    )
+                initial_path = () if block_name == "stats" else (block_name,)
+                initial_kinds = () if block_name == "stats" else ("key",)
+                for leaf in _stat_leaf_rows(
+                    stats, path=initial_path, path_kinds=initial_kinds
+                ):
+                    rows.append(
+                        {
+                            **identity,
+                            "side": side,
+                            "team_id": team_id,
+                            "team": team_name,
+                            "player_id": player_id,
+                            "player": player_name,
+                            **leaf,
+                            # The entity object is shared by every flattened
+                            # stat leaf. Keep its shape for drift detection;
+                            # the complete document remains in raw storage.
+                            "source_schema_fingerprint": schema_fingerprint(entity),
+                        }
+                    )
+    if not rows and not blocks_present:
+        return ParsedDataset(
+            name, DatasetStatus.NOT_AVAILABLE, reason="source_stats_absent"
+        )
+    return _dataset(name, rows, empty_reason="source_stats_empty")
+
+
+def parse_substitutions(
+    data: Mapping[str, Any],
+    *,
+    scope: WhoScoredScope,
+    game_id: int,
+    game: Optional[str] = None,
+) -> ParsedDataset:
+    identity = _identity_fields(scope, _required_int(game_id, "game_id"), game)
+    rows: list[dict[str, Any]] = []
+    blocks_present = False
+    seen: set[tuple[str, int, str, int]] = set()
+    for side in ("home", "away"):
+        team = data.get(side) or {}
+        if not isinstance(team, Mapping):
+            raise WhoScoredParseError(f"matchCentreData.{side} must be an object")
+        raw_players = team.get("players")
+        if raw_players is None:
+            continue
+        blocks_present = True
+        if not isinstance(raw_players, list):
+            raise WhoScoredParseError(f"{side}.players must be a list")
+        for index, player in enumerate(raw_players):
+            if not isinstance(player, Mapping):
+                raise WhoScoredParseError(f"{side}.players[{index}] must be an object")
+            player_id = _required_int(
+                player.get("playerId"), f"{side}.players[{index}].playerId"
+            )
+            for action, source_key in (
+                ("on", "subbedInExpandedMinute"),
+                ("off", "subbedOutExpandedMinute"),
+            ):
+                minute = _optional_int(
+                    player.get(source_key), f"{side}.players[{index}].{source_key}"
+                )
+                if minute is None:
+                    continue
+                key = (side, player_id, action, minute)
+                if key in seen:
+                    continue
+                seen.add(key)
+                rows.append(
+                    {
+                        **identity,
+                        "side": side,
+                        "team_id": _optional_int(team.get("teamId"), f"{side}.teamId"),
+                        "team": team.get("name")
+                        if isinstance(team.get("name"), str)
+                        else None,
+                        "player_id": player_id,
+                        "player": player.get("name")
+                        if isinstance(player.get("name"), str)
+                        else None,
+                        "action": action,
+                        "expanded_minute": minute,
+                        "related_player_id": None,
+                        **_source_metadata(player),
+                    }
+                )
+    if not rows and not blocks_present:
+        return ParsedDataset(
+            "substitutions",
+            DatasetStatus.NOT_AVAILABLE,
+            reason="source_player_blocks_absent",
+        )
+    return _dataset("substitutions", rows, empty_reason="source_lists_no_substitutions")
+
+
+def parse_formations(
+    data: Mapping[str, Any],
+    *,
+    scope: WhoScoredScope,
+    game_id: int,
+    game: Optional[str] = None,
+) -> ParsedDataset:
+    identity = _identity_fields(scope, _required_int(game_id, "game_id"), game)
+    rows: list[dict[str, Any]] = []
+    blocks_present = False
+    for side in ("home", "away"):
+        team = data.get(side) or {}
+        if not isinstance(team, Mapping):
+            raise WhoScoredParseError(f"matchCentreData.{side} must be an object")
+        formations = team.get("formations")
+        if formations is None:
+            continue
+        blocks_present = True
+        if not isinstance(formations, list):
+            raise WhoScoredParseError(f"{side}.formations must be a list")
+        for index, formation in enumerate(formations):
+            if not isinstance(formation, Mapping):
+                raise WhoScoredParseError(
+                    f"{side}.formations[{index}] must be an object"
+                )
+            rows.append(
+                {
+                    **identity,
+                    "side": side,
+                    "team_id": _optional_int(team.get("teamId"), f"{side}.teamId"),
+                    "team": team.get("name")
+                    if isinstance(team.get("name"), str)
+                    else None,
+                    "formation_index": index,
+                    "formation_id": _optional_int(
+                        formation.get("formationId", formation.get("id")),
+                        f"{side}.formations[{index}].formationId",
+                    ),
+                    "formation_name": _mapping_text(
+                        formation.get("formationName", formation.get("name")),
+                        "name",
+                        "displayName",
+                    ),
+                    "start_expanded_minute": _optional_int(
+                        formation.get(
+                            "startMinuteExpanded", formation.get("startExpandedMinute")
+                        ),
+                        f"{side}.formations[{index}].startMinuteExpanded",
+                    ),
+                    "end_expanded_minute": _optional_int(
+                        formation.get(
+                            "endMinuteExpanded", formation.get("endExpandedMinute")
+                        ),
+                        f"{side}.formations[{index}].endMinuteExpanded",
+                    ),
+                    "captain_player_id": _optional_int(
+                        formation.get("captainPlayerId"),
+                        f"{side}.formations[{index}].captainPlayerId",
+                    ),
+                    "player_ids": canonical_json(formation.get("playerIds"))
+                    if formation.get("playerIds") is not None
+                    else None,
+                    "formation_slots": canonical_json(formation.get("formationSlots"))
+                    if formation.get("formationSlots") is not None
+                    else None,
+                    "formation_positions": canonical_json(
+                        formation.get("formationPositions")
+                    )
+                    if formation.get("formationPositions") is not None
+                    else None,
+                    "jersey_numbers": canonical_json(formation.get("jerseyNumbers"))
+                    if formation.get("jerseyNumbers") is not None
+                    else None,
+                    **_source_metadata(formation),
+                }
+            )
+    if not rows and not blocks_present:
+        return ParsedDataset(
+            "formations", DatasetStatus.NOT_AVAILABLE, reason="source_formations_absent"
+        )
+    return _dataset("formations", rows, empty_reason="source_formations_empty")
 
 
 def parse_matchcentre_data(
@@ -847,8 +1535,19 @@ def parse_matchcentre_data(
         parser_version=parser_version,
         parsed_at=datetime.now(timezone.utc).isoformat(),
         game_id=_required_int(game_id, "game_id"),
+        matches=parse_match_record(data, scope=scope, game_id=game_id, game=game),
         events=parse_events(data, scope=scope, game_id=game_id, game=game),
         lineups=parse_lineups(data, scope=scope, game_id=game_id, game=game),
+        substitutions=parse_substitutions(
+            data, scope=scope, game_id=game_id, game=game
+        ),
+        formations=parse_formations(data, scope=scope, game_id=game_id, game=game),
+        team_match_stats=_parse_match_stats(
+            data, scope=scope, game_id=game_id, game=game, players=False
+        ),
+        player_match_stats=_parse_match_stats(
+            data, scope=scope, game_id=game_id, game=game, players=True
+        ),
     )
 
 
@@ -894,7 +1593,7 @@ def _leading_int(value: str) -> Optional[int]:
     return int(match.group(1)) if match else None
 
 
-def parse_profile_html(html: str, *, player_id: int | str) -> ParsedDataset:
+def _parse_profile_core(html: str, *, player_id: int | str) -> ParsedDataset:
     if not isinstance(html, str) or not html:
         raise WhoScoredParseError("Player profile HTML is empty")
     soup = BeautifulSoup(html, "html.parser")
@@ -956,12 +1655,296 @@ def parse_profile_html(html: str, *, player_id: int | str) -> ParsedDataset:
     if "positions" in fields:
         positions = re.sub(r"\s+", " ", _text_after_label(fields["positions"])).strip()
         row["positions"] = positions or None
+    row.update(
+        _source_metadata(
+            {
+                key: {
+                    "text": _text_after_label(parent),
+                    "links": [
+                        {
+                            "href": anchor.get("href"),
+                            "text": anchor.get_text(" ", strip=True),
+                        }
+                        for anchor in parent.find_all("a", href=True)
+                    ],
+                }
+                for key, parent in fields.items()
+            }
+        )
+    )
     soup.decompose()
     return _dataset("profiles", [row])
 
 
-def parse_preview_html(
+_PROFILE_ASSIGNMENTS = (
+    "currentParticipations",
+    "playerParticipations",
+    "playerStatistics",
+    "latestMatches",
+)
+_PROFILE_REQUIRE_ARGS_PATTERN = re.compile(
+    r"require\s*\.\s*config\s*\.\s*params\s*"
+    r"\[\s*['\"]args['\"]\s*\]\s*=\s*"
+)
+
+
+def _mapping_value_casefold(value: Mapping[str, Any], *candidate_names: str) -> Any:
+    """Read one source field while accepting its observed casing only.
+
+    Profile-page ``require.config.params['args']`` records use PascalCase,
+    while older embedded assignments used camelCase.  Normalising lookup is
+    safer than duplicating every projection and the complete source object is
+    still retained alongside the projected fields.
+    """
+
+    names = {name.casefold() for name in candidate_names}
+    for key, child in value.items():
+        if str(key).casefold() in names:
+            return child
+    return None
+
+
+def _walk_profile_records(
+    value: Any, path: tuple[str, ...] = ()
+) -> list[tuple[tuple[str, ...], Mapping[str, Any]]]:
+    found: list[tuple[tuple[str, ...], Mapping[str, Any]]] = []
+    if isinstance(value, Mapping):
+        source_keys = {str(key).casefold() for key in value}
+        if source_keys & {
+            "stageid",
+            "seasonid",
+            "tournamentid",
+            "matchid",
+            "gameid",
+        }:
+            found.append((path, value))
+        for key, child in value.items():
+            found.extend(_walk_profile_records(child, (*path, str(key))))
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            found.extend(_walk_profile_records(child, (*path, str(index))))
+    return found
+
+
+def parse_profile_bundle(
     html: str,
+    *,
+    player_id: int | str,
+    parser_version: str = PARSER_VERSION,
+) -> ProfileParseResult:
+    """Parse global identity plus stage participations/latest-match records."""
+
+    source_player_id = _required_int(player_id, "player_id")
+    profile = _parse_profile_core(html, player_id=source_player_id)
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    structured_present = False
+    structured_sources: list[tuple[str, Any]] = []
+    for variable in _PROFILE_ASSIGNMENTS:
+        try:
+            value = extract_js_assignment(html, variable)
+        except JavaScriptLiteralError:
+            continue
+        structured_present = True
+        structured_sources.append((variable, value))
+
+    try:
+        profile_args = _extract_after_pattern(
+            html,
+            _PROFILE_REQUIRE_ARGS_PATTERN,
+            label="require.config.params['args'] profile assignment",
+            allow_date_expressions=False,
+        )
+    except JavaScriptLiteralError:
+        profile_args = None
+    else:
+        if not isinstance(profile_args, Mapping):
+            raise WhoScoredParseError("Profile require args must be an object")
+        tournaments = _mapping_value_casefold(profile_args, "tournaments")
+        if tournaments is not None:
+            if not isinstance(tournaments, list):
+                raise WhoScoredParseError(
+                    "Profile require args tournaments must be an array"
+                )
+            structured_present = True
+            structured_sources.append(("profileArgs.tournaments", tournaments))
+
+    for variable, value in structured_sources:
+        for path, record in _walk_profile_records(value, (variable,)):
+            raw = canonical_json(record)
+            if raw in seen:
+                continue
+            seen.add(raw)
+            path_text = ".".join(path)
+            rows.append(
+                {
+                    "player_id": source_player_id,
+                    "record_type": "latest_match"
+                    if "match" in path_text.casefold()
+                    else "participation",
+                    "region_id": _optional_int(
+                        _mapping_value_casefold(record, "regionId"), "regionId"
+                    ),
+                    "tournament_id": _optional_int(
+                        _mapping_value_casefold(record, "tournamentId"),
+                        "tournamentId",
+                    ),
+                    "source_season_id": _optional_int(
+                        _mapping_value_casefold(record, "seasonId"), "seasonId"
+                    ),
+                    "stage_id": _optional_int(
+                        _mapping_value_casefold(record, "stageId"), "stageId"
+                    ),
+                    "game_id": _optional_int(
+                        _mapping_value_casefold(record, "matchId", "gameId"),
+                        "gameId",
+                    ),
+                    "tournament": _mapping_value_casefold(record, "tournamentName")
+                    if isinstance(
+                        _mapping_value_casefold(record, "tournamentName"), str
+                    )
+                    else None,
+                    "season": _mapping_value_casefold(record, "seasonName")
+                    if isinstance(_mapping_value_casefold(record, "seasonName"), str)
+                    else None,
+                    "stage": _mapping_value_casefold(record, "stageName")
+                    if isinstance(_mapping_value_casefold(record, "stageName"), str)
+                    else None,
+                    "team_id": _optional_int(
+                        _mapping_value_casefold(record, "teamId"), "teamId"
+                    ),
+                    "team": _mapping_value_casefold(record, "teamName")
+                    if isinstance(_mapping_value_casefold(record, "teamName"), str)
+                    else None,
+                    "position": _display(
+                        _mapping_value_casefold(
+                            record,
+                            "position",
+                            "positionText",
+                            "positionShort",
+                            "positionLong",
+                            "playedPositionsRaw",
+                        )
+                    )
+                    or (
+                        _mapping_value_casefold(
+                            record,
+                            "position",
+                            "positionText",
+                            "positionShort",
+                            "positionLong",
+                            "playedPositionsRaw",
+                        )
+                        if isinstance(
+                            _mapping_value_casefold(
+                                record,
+                                "position",
+                                "positionText",
+                                "positionShort",
+                                "positionLong",
+                                "playedPositionsRaw",
+                            ),
+                            str,
+                        )
+                        else None
+                    ),
+                    "source_path": path_text,
+                    **_source_metadata(record),
+                }
+            )
+
+    soup = BeautifulSoup(html, "html.parser")
+    container_pattern = re.compile(
+        r"participation|latest.?match|current.?team|tournament", re.IGNORECASE
+    )
+    containers = soup.find_all(id=container_pattern)
+    for container_index, container in enumerate(containers):
+        label = str(container.get("id") or "")
+        record_type = "latest_match" if "match" in label.casefold() else "participation"
+        candidates = container.select("tr") or [container]
+        for row_index, element in enumerate(candidates):
+            anchors = element.find_all("a", href=True)
+            # Only a stage/match URL is evidence of a participation. Generic
+            # tournament tab anchors (``#player-tournament-stats-summary``)
+            # are UI navigation, not source records.
+            source_url = next(
+                (
+                    anchor.get("href", "")
+                    for anchor in anchors
+                    if re.search(
+                        r"/(?:Stages|Matches)/\d+(?:/|$)",
+                        anchor.get("href", ""),
+                        re.IGNORECASE,
+                    )
+                ),
+                "",
+            )
+            if not source_url:
+                continue
+            structured_present = True
+            try:
+                ids = _source_url_ids(source_url)
+            except WhoScoredParseError:
+                ids = {key: None for key in _SOURCE_URL_SEGMENTS}
+            game_match = re.search(r"/Matches/(\d+)(?:/|$)", source_url, re.IGNORECASE)
+            raw_record = {
+                "container": label,
+                "text": element.get_text(" ", strip=True),
+                "links": [
+                    {
+                        "href": anchor.get("href"),
+                        "text": anchor.get_text(" ", strip=True),
+                    }
+                    for anchor in anchors
+                ],
+            }
+            encoded = canonical_json(raw_record)
+            if encoded in seen:
+                continue
+            seen.add(encoded)
+            rows.append(
+                {
+                    "player_id": source_player_id,
+                    "record_type": record_type,
+                    "region_id": ids.get("region_id"),
+                    "tournament_id": ids.get("tournament_id"),
+                    "source_season_id": ids.get("source_season_id"),
+                    "stage_id": ids.get("stage_id"),
+                    "game_id": int(game_match.group(1)) if game_match else None,
+                    "tournament": None,
+                    "season": None,
+                    "stage": None,
+                    "team_id": None,
+                    "team": None,
+                    "position": None,
+                    "source_path": f"dom.{label}[{container_index}].row[{row_index}]",
+                    **_source_metadata(raw_record),
+                }
+            )
+    soup.decompose()
+    participations = (
+        _dataset(
+            "player_stage_participations",
+            rows,
+            empty_reason="source_participation_sections_empty",
+        )
+        if structured_present
+        else ParsedDataset(
+            "player_stage_participations",
+            DatasetStatus.NOT_AVAILABLE,
+            reason="source_participation_sections_absent",
+        )
+    )
+    return ProfileParseResult(
+        parser_version=parser_version,
+        player_id=source_player_id,
+        profiles=profile,
+        participations=participations,
+    )
+
+
+def _parse_missing_players_soup(
+    soup: BeautifulSoup,
     *,
     scope: WhoScoredScope,
     game_id: int,
@@ -969,21 +1952,18 @@ def parse_preview_html(
     home_team: Optional[str],
     away_team: Optional[str],
 ) -> ParsedDataset:
-    if not isinstance(html, str) or not html:
-        raise WhoScoredParseError("Preview HTML is empty")
-    soup = BeautifulSoup(html, "html.parser")
     container = soup.find(id="missing-players")
     if container is None:
-        soup.decompose()
         return ParsedDataset(
             "missing_players",
-            DatasetStatus.EMPTY,
-            reason="source_has_no_missing_players_section",
+            DatasetStatus.NOT_AVAILABLE,
+            reason="source_missing_players_section_absent",
         )
     tables = container.find_all("table")
     if len(tables) > 2:
-        soup.decompose()
-        raise WhoScoredParseError("Missing-player section contains more than two tables")
+        raise WhoScoredParseError(
+            "Missing-player section contains more than two tables"
+        )
     teams = (home_team, away_team)
     rows: list[dict[str, Any]] = []
     for table_index, table in enumerate(tables):
@@ -991,13 +1971,11 @@ def parse_preview_html(
             player_cell = table_row.select_one("td.pn")
             anchor = player_cell.find("a", href=True) if player_cell else None
             if anchor is None:
-                soup.decompose()
                 raise WhoScoredParseError(
                     f"Missing-player row {table_index}:{row_index} has no player link"
                 )
             match = _PLAYER_URL_RE.search(anchor.get("href", ""))
             if match is None:
-                soup.decompose()
                 raise WhoScoredParseError(
                     f"Missing-player row {table_index}:{row_index} has an invalid player URL"
                 )
@@ -1019,10 +1997,328 @@ def parse_preview_html(
                         if status_cell is not None
                         else None
                     ),
+                    **_source_metadata(
+                        {
+                            "player_href": anchor.get("href", ""),
+                            "player": anchor.get_text(" ", strip=True),
+                            "reason": reason,
+                            "status": status_cell.get_text(" ", strip=True)
+                            if status_cell is not None
+                            else None,
+                        }
+                    ),
+                }
+            )
+    return _dataset(
+        "missing_players", rows, empty_reason="source_lists_no_missing_players"
+    )
+
+
+_PREVIEW_ASSIGNMENTS = (
+    "matchHeaderJson",
+    "previewData",
+    "predictedLineup",
+    "predictedLineups",
+    "teamComparisonData",
+    "headToHeadData",
+    "topPlayersData",
+)
+
+
+def _walk_preview_players(
+    value: Any, path: tuple[str, ...] = ()
+) -> list[tuple[tuple[str, ...], Mapping[str, Any]]]:
+    found: list[tuple[tuple[str, ...], Mapping[str, Any]]] = []
+    if isinstance(value, Mapping):
+        context = ".".join(path).casefold()
+        if (
+            "lineup" in context or "predicted" in context or "formation" in context
+        ) and any(key in value for key in ("playerId", "player_id")):
+            found.append((path, value))
+        for key, child in value.items():
+            found.extend(_walk_preview_players(child, (*path, str(key))))
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            found.extend(_walk_preview_players(child, (*path, str(index))))
+    return found
+
+
+def _has_preview_lineup_structure(value: Any, path: tuple[str, ...] = ()) -> bool:
+    """Return whether a decoded preview object declares a lineup container.
+
+    Empty predicted-lineup arrays are authoritative empties, but only when the
+    source actually exposes that structure.  Merely finding a match header or
+    another preview section must not turn an absent lineup feed into EMPTY.
+    """
+
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            child_path = (*path, str(key))
+            token = ".".join(child_path).casefold()
+            if any(marker in token for marker in ("predicted", "lineup", "formation")):
+                if isinstance(child, (Mapping, list)):
+                    return True
+            if _has_preview_lineup_structure(child, child_path):
+                return True
+    elif isinstance(value, list):
+        return any(
+            _has_preview_lineup_structure(child, (*path, str(index)))
+            for index, child in enumerate(value)
+        )
+    return False
+
+
+def parse_preview_bundle(
+    html: str,
+    *,
+    scope: WhoScoredScope,
+    game_id: int,
+    game: Optional[str],
+    home_team: Optional[str],
+    away_team: Optional[str],
+    parser_version: str = PARSER_VERSION,
+) -> PreviewParseResult:
+    """Parse missing players, predicted XI and all structured preview sections."""
+
+    if not isinstance(html, str) or not html:
+        raise WhoScoredParseError("Preview HTML is empty")
+    soup = BeautifulSoup(html, "html.parser")
+    missing = _parse_missing_players_soup(
+        soup,
+        scope=scope,
+        game_id=game_id,
+        game=game,
+        home_team=home_team,
+        away_team=away_team,
+    )
+    identity = _identity_fields(scope, _required_int(game_id, "game_id"), game)
+    sections: list[dict[str, Any]] = []
+    lineup_rows: list[dict[str, Any]] = []
+    seen_lineups: set[tuple[Optional[str], int]] = set()
+    preview_structure_present = soup.find(id="missing-players") is not None
+    lineup_structure_present = False
+
+    for variable in _PREVIEW_ASSIGNMENTS:
+        try:
+            value = extract_js_assignment(html, variable)
+        except JavaScriptLiteralError:
+            try:
+                value = extract_json_parse_property(html, variable)
+            except JavaScriptLiteralError:
+                continue
+        preview_structure_present = True
+        if variable.casefold().startswith("predicted") or _has_preview_lineup_structure(
+            value, (variable,)
+        ):
+            lineup_structure_present = True
+        sections.append(
+            {
+                **identity,
+                "section_type": variable,
+                "source": "embedded_javascript",
+                "heading": None,
+                "text": None,
+                **_source_metadata(value),
+            }
+        )
+        for path, player in _walk_preview_players(value, (variable,)):
+            player_id = _required_int(
+                player.get("playerId", player.get("player_id")),
+                f"{variable}.{'.'.join(path)}.playerId",
+            )
+            path_text = ".".join(path).casefold()
+            side = (
+                "home"
+                if "home" in path_text
+                else "away"
+                if "away" in path_text
+                else None
+            )
+            key = (side, player_id)
+            if key in seen_lineups:
+                continue
+            seen_lineups.add(key)
+            position = player.get("position")
+            lineup_rows.append(
+                {
+                    **identity,
+                    "side": side,
+                    "team": home_team
+                    if side == "home"
+                    else away_team
+                    if side == "away"
+                    else None,
+                    "player_id": player_id,
+                    "player": player.get("playerName", player.get("name"))
+                    if isinstance(player.get("playerName", player.get("name")), str)
+                    else None,
+                    "position": _display(position)
+                    or (position if isinstance(position, str) else None),
+                    "formation": player.get("formation")
+                    if isinstance(player.get("formation"), str)
+                    else None,
+                    "rating": _optional_preview_rating(player.get("rating")),
+                    "source_path": ".".join(path),
+                    **_source_metadata(player),
+                }
+            )
+
+    section_pattern = re.compile(
+        r"preview|team.?news|comparison|head.?to.?head|predicted|top.?player|missing",
+        re.IGNORECASE,
+    )
+    dom_sections = soup.find_all(id=section_pattern)
+    preview_structure_present = preview_structure_present or bool(dom_sections)
+    for index, element in enumerate(dom_sections):
+        section_type = str(element.get("id") or f"dom_section_{index}")
+        if any(row["section_type"] == section_type for row in sections):
+            continue
+        structured = {
+            "id": element.get("id"),
+            "heading": (
+                element.find(re.compile(r"^h[1-6]$")).get_text(" ", strip=True)
+                if element.find(re.compile(r"^h[1-6]$")) is not None
+                else None
+            ),
+            "rows": [
+                [
+                    cell.get_text(" ", strip=True)
+                    for cell in table_row.find_all(["th", "td"])
+                ]
+                for table_row in element.select("tr")
+            ],
+            "text": element.get_text(" ", strip=True),
+        }
+        sections.append(
+            {
+                **identity,
+                "section_type": section_type,
+                "source": "dom",
+                "heading": structured["heading"],
+                "text": structured["text"] or None,
+                **_source_metadata(structured),
+            }
+        )
+
+    # DOM fallback for pages whose predicted XI is not duplicated in JS.
+    lineup_containers = soup.select(
+        "[id*='predicted' i], [class*='predicted' i], [id*='lineup' i]"
+    )
+    lineup_structure_present = lineup_structure_present or bool(lineup_containers)
+    preview_structure_present = preview_structure_present or bool(lineup_containers)
+    for container_index, container in enumerate(lineup_containers):
+        formation_by_side: dict[str, Optional[str]] = {}
+        team_by_side: dict[str, Optional[str]] = {}
+        for side_name in ("home", "away"):
+            header = container.select_one(f".pitch-formation-header .{side_name}")
+            formation_marker = header.select_one(".formation-label") if header else None
+            team_marker = header.select_one(".team-link") if header else None
+            formation_by_side[side_name] = (
+                formation_marker.get_text(" ", strip=True) if formation_marker else None
+            )
+            team_by_side[side_name] = (
+                team_marker.get_text(" ", strip=True) if team_marker else None
+            )
+        for anchor in container.find_all("a", href=True):
+            match = _PLAYER_URL_RE.search(anchor.get("href", ""))
+            if match is None:
+                continue
+            player_node = anchor.find_parent(attrs={"data-playerid": True})
+            player_id = int(match.group(1))
+            if player_node is not None:
+                player_id = _required_int(
+                    player_node.get("data-playerid"), "preview.data-playerid"
+                )
+            side = None
+            parent = anchor.parent
+            while parent is not None and parent is not container:
+                classes = set(parent.get("class") or ())
+                if "home" in classes:
+                    side = "home"
+                    break
+                if "away" in classes:
+                    side = "away"
+                    break
+                parent = parent.parent
+            key = (side, player_id)
+            if key in seen_lineups:
+                continue
+            seen_lineups.add(key)
+            title = player_node.get("title") if player_node is not None else None
+            position_match = re.search(r"\(([^()]*)\)\s*$", title or "")
+            rating_marker = (
+                player_node.select_one(".player-rating")
+                if player_node is not None
+                else None
+            )
+            raw = {
+                "href": anchor.get("href", ""),
+                "text": anchor.get_text(" ", strip=True),
+                "title": title or anchor.get("title"),
+                "data_player_id": player_node.get("data-playerid")
+                if player_node is not None
+                else None,
+                "rating": rating_marker.get_text(" ", strip=True)
+                if rating_marker is not None
+                else None,
+            }
+            lineup_rows.append(
+                {
+                    **identity,
+                    "side": side,
+                    "team": (
+                        home_team or team_by_side.get("home")
+                        if side == "home"
+                        else away_team or team_by_side.get("away")
+                        if side == "away"
+                        else None
+                    ),
+                    "player_id": player_id,
+                    "player": anchor.get_text(" ", strip=True) or None,
+                    "position": anchor.get("data-position")
+                    or (position_match.group(1) if position_match else None),
+                    "formation": formation_by_side.get(side) if side else None,
+                    "rating": _optional_preview_rating(
+                        rating_marker.get_text(" ", strip=True)
+                        if rating_marker is not None
+                        else None
+                    ),
+                    "source_path": f"dom.predicted[{container_index}]",
+                    **_source_metadata(raw),
                 }
             )
     soup.decompose()
-    return _dataset("missing_players", rows, empty_reason="source_lists_no_missing_players")
+    return PreviewParseResult(
+        parser_version=parser_version,
+        game_id=int(game_id),
+        missing_players=missing,
+        preview_lineups=(
+            _dataset(
+                "preview_lineups",
+                lineup_rows,
+                empty_reason="source_lists_no_predicted_lineup",
+            )
+            if lineup_structure_present
+            else ParsedDataset(
+                "preview_lineups",
+                DatasetStatus.NOT_AVAILABLE,
+                reason="source_predicted_lineup_structure_absent",
+            )
+        ),
+        preview_sections=(
+            _dataset(
+                "preview_sections",
+                sections,
+                empty_reason="source_lists_no_structured_preview_sections",
+            )
+            if preview_structure_present
+            else ParsedDataset(
+                "preview_sections",
+                DatasetStatus.NOT_AVAILABLE,
+                reason="source_preview_structure_absent",
+            )
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1037,10 +2333,309 @@ _SOURCE_URL_SEGMENTS = {
 }
 
 
+def _decode_discovery_document(
+    payload: str | bytes | Mapping[str, Any] | Sequence[Any],
+    *,
+    variable_names: Sequence[str] = ("allRegions", "allRegionsData"),
+) -> Any:
+    if isinstance(payload, Mapping) or (
+        isinstance(payload, Sequence)
+        and not isinstance(payload, (str, bytes, bytearray))
+    ):
+        return payload
+    if isinstance(payload, bytes):
+        try:
+            payload = payload.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise WhoScoredParseError("Discovery payload is not UTF-8") from exc
+    if not isinstance(payload, str) or not payload.strip():
+        raise WhoScoredParseError("Discovery payload is empty")
+    stripped = payload.strip()
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        pass
+    for variable_name in variable_names:
+        try:
+            return extract_js_assignment(stripped, variable_name)
+        except JavaScriptLiteralError:
+            continue
+    if stripped.startswith("<"):
+        soup = BeautifulSoup(stripped, "html.parser")
+        pre = soup.find("pre")
+        container = pre or soup.body
+        text = container.get_text("", strip=True) if container is not None else ""
+        soup.decompose()
+        if text:
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError as exc:
+                # FlareSolverr sometimes renders an application/json response
+                # as a bare text node under <body>, without Chromium's usual
+                # <pre>.  Once either container starts like structured JSON,
+                # treat malformed content as parser drift rather than silently
+                # falling through to "container absent".
+                if pre is not None or text.lstrip().startswith(("{", "[")):
+                    raise WhoScoredParseError(
+                        f"Discovery JSON is invalid: {exc.msg}"
+                    ) from exc
+    raise WhoScoredParseError("Could not find a structured discovery payload")
+
+
+def parse_all_regions(
+    payload: str | bytes | Mapping[str, Any] | Sequence[Any],
+    *,
+    overrides: Sequence[TournamentOverride] = DEFAULT_TOURNAMENT_OVERRIDES,
+    competition_aliases: Optional[Mapping[tuple[int, int], str]] = None,
+) -> ParsedDataset:
+    """Parse every source tournament and attach an explicit disposition.
+
+    The all-regions document normally lacks authoritative sex metadata.  Such
+    adult-looking rows are retained as ``quarantined`` and are expected to be
+    reclassified after schedule metadata is observed; discovery must still
+    fan out through them.
+    """
+
+    decoded = _decode_discovery_document(payload)
+    if isinstance(decoded, Mapping):
+        regions = decoded.get("regions", decoded.get("allRegions", decoded.get("data")))
+    else:
+        regions = decoded
+    if not isinstance(regions, list):
+        raise WhoScoredParseError("allRegions must be an array")
+    rows: list[dict[str, Any]] = []
+    seen: dict[tuple[int, int], str] = {}
+    override_aliases = {
+        int(item.tournament_id): item.canonical_competition_id
+        for item in overrides
+        if item.canonical_competition_id
+    }
+    source_aliases = {
+        (int(region_id), int(tournament_id)): str(competition_id).strip()
+        for (region_id, tournament_id), competition_id in (
+            competition_aliases or {}
+        ).items()
+        if str(competition_id).strip()
+    }
+    for region_index, region in enumerate(regions):
+        if not isinstance(region, Mapping):
+            raise WhoScoredParseError(f"allRegions[{region_index}] must be an object")
+        region_id = _required_int(
+            region.get("id", region.get("regionId")),
+            f"allRegions[{region_index}].id",
+        )
+        region_name = region.get("name", region.get("regionName"))
+        if not isinstance(region_name, str) or not region_name.strip():
+            raise WhoScoredParseError(
+                f"allRegions[{region_index}].name must be a non-empty string"
+            )
+        tournaments = region.get("tournaments")
+        if tournaments is None:
+            tournaments = []
+        if not isinstance(tournaments, list):
+            raise WhoScoredParseError(
+                f"allRegions[{region_index}].tournaments must be an array"
+            )
+        for tournament_index, tournament in enumerate(tournaments):
+            if not isinstance(tournament, Mapping):
+                raise WhoScoredParseError(
+                    f"allRegions[{region_index}].tournaments[{tournament_index}] "
+                    "must be an object"
+                )
+            tournament_id = _required_int(
+                tournament.get("id", tournament.get("tournamentId")),
+                f"tournaments[{tournament_index}].id",
+            )
+            tournament_name = tournament.get("name", tournament.get("tournamentName"))
+            if not isinstance(tournament_name, str) or not tournament_name.strip():
+                raise WhoScoredParseError(
+                    f"tournaments[{tournament_index}].name must be a non-empty string"
+                )
+            classification = classify_tournament(
+                tournament_id=tournament_id,
+                tournament_name=tournament_name,
+                region_name=region_name,
+                source_sex=tournament.get("sex", region.get("sex")),
+                overrides=overrides,
+            )
+            source_sex = classification.source_sex
+            combined_raw = {
+                "region": {
+                    key: value for key, value in region.items() if key != "tournaments"
+                },
+                "tournament": dict(tournament),
+            }
+            competition_id = (
+                source_aliases.get((region_id, tournament_id))
+                or override_aliases.get(tournament_id)
+                or f"WS-{region_id}-{tournament_id}"
+            )
+            row = {
+                "competition_id": competition_id,
+                "region_id": region_id,
+                "region_name": region_name.strip(),
+                "region_code": region.get("code", region.get("regionCode")),
+                "region_flag": region.get("flg", region.get("flag")),
+                "tournament_id": tournament_id,
+                "tournament_name": tournament_name.strip(),
+                "tournament_url": tournament.get("url"),
+                "sort_order": _optional_int(
+                    tournament.get("sortOrder"),
+                    f"tournaments[{tournament_index}].sortOrder",
+                ),
+                "source_sex": source_sex,
+                "eligibility": classification.eligibility.value,
+                "classification_reason": classification.reason,
+                "classifier_version": classification.classifier_version,
+                "override_version": classification.override_version,
+                **_source_metadata(combined_raw),
+            }
+            key = (region_id, tournament_id)
+            encoded = canonical_json(row)
+            if key in seen and seen[key] != encoded:
+                raise WhoScoredParseError(
+                    f"allRegions contains conflicting tournament {tournament_id} in region {region_id}"
+                )
+            if key not in seen:
+                rows.append(row)
+                seen[key] = encoded
+    if not rows:
+        raise WhoScoredParseError("allRegions contains no tournaments")
+    return _dataset("competitions", rows)
+
+
+def _infer_source_season(label: str) -> tuple[Optional[str], Optional[SeasonFormat]]:
+    compact = re.sub(r"\s+", "", label)
+    if re.fullmatch(
+        r"[0-9]{4}(?:spring|summer|fall|autumn|winter)?",
+        compact,
+        re.IGNORECASE,
+    ):
+        try:
+            return _season_label_to_id(
+                label, SeasonFormat.SINGLE_YEAR
+            ), SeasonFormat.SINGLE_YEAR
+        except ValueError:
+            return None, None
+    if re.fullmatch(r"[0-9]{4}[-/][0-9]{2,4}", compact):
+        for season_format in (SeasonFormat.SPLIT_YEAR, SeasonFormat.MULTI_YEAR):
+            try:
+                return _season_label_to_id(compact, season_format), season_format
+            except (WhoScoredParseError, ValueError):
+                continue
+        return None, None
+    return None, None
+
+
+def parse_tournament_seasons(
+    html: str,
+    *,
+    competition_row: Mapping[str, Any],
+) -> ParsedDataset:
+    """Return every source season option, including quarantined labels."""
+
+    if not isinstance(html, str) or not html:
+        raise WhoScoredParseError("Tournament HTML is empty")
+    competition_id = str(competition_row.get("competition_id") or "").strip()
+    if not competition_id:
+        raise WhoScoredParseError("competition_row.competition_id is required")
+    region_id = _required_int(competition_row.get("region_id"), "region_id")
+    tournament_id = _required_int(competition_row.get("tournament_id"), "tournament_id")
+    inherited_eligibility = str(competition_row.get("eligibility") or "quarantined")
+    inherited_reason = str(
+        competition_row.get("classification_reason") or "tournament_unclassified"
+    )
+    soup = BeautifulSoup(html, "html.parser")
+    options = soup.select("select[id*='seasons' i] option[value]")
+    any_selected = any(option.has_attr("selected") for option in options)
+    rows: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for index, option in enumerate(options):
+        label = option.get_text(" ", strip=True)
+        url = option.get("value", "")
+        try:
+            ids = _source_url_ids(url)
+        except WhoScoredParseError:
+            # UI placeholders are not source seasons.  Non-placeholder labels
+            # with a URL-like value are retained below as quarantined rows.
+            if not url or url in {"#", "0", "-1"}:
+                continue
+            ids = {"source_season_id": None}
+        source_season_id = ids.get("source_season_id")
+        canonical, fmt = _infer_source_season(label)
+        eligibility = inherited_eligibility
+        reason = inherited_reason
+        if source_season_id is None:
+            eligibility = "quarantined"
+            reason = "season_url_has_no_source_season_id"
+            # A stable negative surrogate is forbidden; keep the actual null.
+        elif canonical is None or fmt is None:
+            eligibility = "quarantined"
+            reason = "unrecognized_source_season_label"
+        if source_season_id is not None:
+            if source_season_id in seen:
+                soup.decompose()
+                raise WhoScoredParseError(
+                    f"Tournament page repeats source season id {source_season_id}"
+                )
+            seen.add(source_season_id)
+        raw = {
+            "label": label,
+            "value": url,
+            "attributes": {key: value for key, value in option.attrs.items()},
+        }
+        rows.append(
+            {
+                "competition_id": competition_id,
+                "region_id": region_id,
+                "tournament_id": tournament_id,
+                "season_id": canonical,
+                "source_season_id": source_season_id,
+                "source_label": label or None,
+                "season_format": fmt.value if fmt else None,
+                "source_url": url or None,
+                "start": None,
+                "end": None,
+                # ``selected`` is only the website's default dropdown value;
+                # it is not evidence that fixtures are currently active.
+                "source_selected": option.has_attr("selected")
+                if any_selected
+                else False,
+                "is_active": None,
+                "eligibility": eligibility,
+                "classification_reason": reason,
+                **_source_metadata(raw),
+            }
+        )
+    canonical_groups: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        canonical = row.get("season_id")
+        if (
+            canonical
+            and row.get("source_season_id") is not None
+            and row.get("season_format")
+        ):
+            canonical_groups.setdefault(str(canonical), []).append(row)
+    for colliding in canonical_groups.values():
+        if len(colliding) < 2:
+            continue
+        for row in colliding:
+            row["season_id"] = disambiguated_season_id(
+                str(row["season_id"]),
+                str(row["season_format"]),
+                int(row["source_season_id"]),
+            )
+    soup.decompose()
+    if not rows:
+        raise WhoScoredParseError(
+            f"Tournament page contains no source seasons for {competition_id}"
+        )
+    return _dataset("seasons", rows)
+
+
 def _source_url_ids(url: str) -> dict[str, Optional[int]]:
     matches = {
-        key: pattern.search(url or "")
-        for key, pattern in _SOURCE_URL_SEGMENTS.items()
+        key: pattern.search(url or "") for key, pattern in _SOURCE_URL_SEGMENTS.items()
     }
     if not any(matches.values()):
         raise WhoScoredParseError(f"Could not parse WhoScored source URL {url!r}")
@@ -1053,9 +2648,14 @@ def _source_url_ids(url: str) -> dict[str, Optional[int]]:
 def _season_label_to_id(label: str, season_format: SeasonFormat) -> str:
     text = re.sub(r"\s+", "", label)
     if season_format is SeasonFormat.SINGLE_YEAR:
-        if not re.fullmatch(r"[0-9]{4}", text):
+        match = re.fullmatch(
+            r"([0-9]{4})(?:spring|summer|fall|autumn|winter)?",
+            text,
+            re.IGNORECASE,
+        )
+        if match is None:
             raise WhoScoredParseError(f"Invalid single-year source label {label!r}")
-        return canonical_season_id(text, season_format)
+        return canonical_season_id(match.group(1), season_format)
     match = re.fullmatch(r"([0-9]{4})[-/]([0-9]{2}|[0-9]{4})", text)
     if match is None:
         raise WhoScoredParseError(f"Invalid split-year source label {label!r}")
@@ -1069,6 +2669,8 @@ def find_source_season_id(html: str, scope: WhoScoredScope) -> int:
 
     soup = BeautifulSoup(html, "html.parser")
     matches: list[int] = []
+    expected_base = base_season_id(scope.season_id)
+    expected_source_id = source_season_id_hint(scope.season_id)
     for option in soup.select("select[id*='seasons' i] option[value]"):
         try:
             season_id = _season_label_to_id(
@@ -1076,11 +2678,16 @@ def find_source_season_id(html: str, scope: WhoScoredScope) -> int:
             )
         except WhoScoredParseError:
             continue
-        if season_id != scope.season_id:
+        if season_id != expected_base:
             continue
         parsed = _source_url_ids(option.get("value", ""))
         if parsed["source_season_id"] is None:
             raise WhoScoredParseError("Matching season option has no source season id")
+        if (
+            expected_source_id is not None
+            and parsed["source_season_id"] != expected_source_id
+        ):
+            continue
         matches.append(parsed["source_season_id"])
     soup.decompose()
     if len(set(matches)) != 1:
@@ -1101,17 +2708,24 @@ def parse_season_stages(
     soup = BeautifulSoup(html, "html.parser")
     by_id: dict[int, dict[str, Any]] = {}
     base = {
+        "competition_id": scope.competition_id,
         "league": scope.competition_id,
         "season": scope.season_id,
         "region_id": _required_int(region_id, "region_id"),
+        "tournament_id": _required_int(tournament_id, "tournament_id"),
         "league_id": _required_int(tournament_id, "tournament_id"),
+        "source_season_id": _required_int(source_season_id, "source_season_id"),
         "season_id": _required_int(source_season_id, "source_season_id"),
+        "eligibility": "included",
+        "classification_reason": "valid_stage_for_configured_scope",
     }
 
     fixtures = soup.find(
         "a",
         href=True,
-        string=lambda value: isinstance(value, str) and value.strip().lower() == "fixtures",
+        string=lambda value: (
+            isinstance(value, str) and value.strip().lower() == "fixtures"
+        ),
     )
     if fixtures is not None:
         parsed = _source_url_ids(fixtures.get("href", ""))
@@ -1120,6 +2734,13 @@ def parse_season_stages(
                 **base,
                 "stage_id": parsed["stage_id"],
                 "stage": None,
+                "source_url": fixtures.get("href", "") or None,
+                **_source_metadata(
+                    {
+                        "label": fixtures.get_text(" ", strip=True),
+                        "href": fixtures.get("href", ""),
+                    }
+                ),
             }
 
     for option in soup.select("select[id*='stages' i] option[value]"):
@@ -1130,11 +2751,312 @@ def parse_season_stages(
             **base,
             "stage_id": parsed["stage_id"],
             "stage": option.get_text(" ", strip=True) or None,
+            "source_url": option.get("value", "") or None,
+            **_source_metadata(
+                {
+                    "label": option.get_text(" ", strip=True),
+                    "value": option.get("value", ""),
+                    "attributes": dict(option.attrs),
+                }
+            ),
         }
     soup.decompose()
     if not by_id:
         raise WhoScoredParseError(f"Season page contains no stages for {scope.spec}")
     return _dataset("season_stages", [by_id[key] for key in sorted(by_id)])
+
+
+def _table_kind(value: Mapping[str, Any]) -> str:
+    hint = " ".join(
+        str(value.get(key) or "")
+        for key in ("type", "name", "title", "tableType", "statType", "key")
+    ).casefold()
+    keys = " ".join(str(key).casefold() for key in value)
+    combined = f"{hint} {keys}"
+    if "streak" in combined:
+        return "streaks"
+    if "performance" in combined:
+        return "performance"
+    if "form" in combined:
+        return "forms"
+    return "standings"
+
+
+def _season_table_blocks(
+    value: Mapping[str, Any],
+) -> list[tuple[str, Mapping[str, Any]]]:
+    """Split a composite table object without discarding any source field."""
+
+    special: list[tuple[str, Mapping[str, Any]]] = []
+    ordinary: dict[str, Any] = {}
+    context = {
+        key: value.get(key)
+        for key in (
+            "stageId",
+            "stageName",
+            "name",
+            "title",
+            "type",
+            "standingsGroupIdx",
+            "rankColorings",
+            "startDate",
+            "endDate",
+        )
+        if key in value
+    }
+    for key, child in value.items():
+        token = str(key).casefold()
+        if "streak" in token:
+            special.append(("streaks", {**context, str(key): child}))
+        elif "performance" in token:
+            special.append(("performance", {**context, str(key): child}))
+        elif "form" in token:
+            special.append(("forms", {**context, str(key): child}))
+        else:
+            ordinary[str(key)] = child
+    if ordinary and set(ordinary) - set(context):
+        special.insert(0, (_table_kind(ordinary), ordinary))
+    if not special:
+        special.append((_table_kind(value), value))
+    return special
+
+
+def _record_arrays(
+    value: Any, path: tuple[str, ...] = ()
+) -> list[tuple[str, list[Any]]]:
+    found: list[tuple[str, list[Any]]] = []
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            child_path = (*path, str(key))
+            if (
+                isinstance(child, list)
+                and child
+                and all(isinstance(item, (Mapping, list, tuple)) for item in child)
+            ):
+                found.append((".".join(child_path), child))
+            elif isinstance(child, Mapping):
+                found.extend(_record_arrays(child, child_path))
+    return found
+
+
+def _is_season_table_record(value: Any) -> bool:
+    """Distinguish team rows from layout metadata nested beside the table.
+
+    Current season pages place arrays such as ``rankColorings`` in the same
+    object as standings rows.  Their first value can be a DOM id (for example
+    ``standing-zone-top-1``), so treating every nested array as a positional
+    team row both invents data and turns a harmless layout change into an
+    invalid ``stageId``.  Source team rows have an explicit team identity;
+    positional rows use the stable ``stage id, team id, team name`` prefix.
+    """
+
+    if isinstance(value, Mapping):
+        team = value.get("team")
+        team_id = value.get("teamId")
+        if team_id is None and isinstance(team, Mapping):
+            team_id = team.get("id", team.get("teamId"))
+        try:
+            return not isinstance(team_id, bool) and int(team_id) > 0
+        except (TypeError, ValueError):
+            return False
+    if not isinstance(value, (list, tuple)) or len(value) < 3:
+        return False
+    try:
+        stage_id = int(value[0])
+        team_id = int(value[1])
+    except (TypeError, ValueError):
+        return False
+    return (
+        not isinstance(value[0], bool)
+        and not isinstance(value[1], bool)
+        and stage_id > 0
+        and team_id > 0
+        and isinstance(value[2], str)
+        and bool(value[2].strip())
+    )
+
+
+def _common_table_fields(record: Any, *, kind: str) -> dict[str, Any]:
+    if isinstance(record, (list, tuple)):
+        # WhoScored's live season tables are positional arrays.  Only the
+        # stable identity prefix and the well-established standings/form
+        # columns are named here; the complete array remains in raw_json.
+        team_id = record[1] if len(record) > 1 else None
+        team_name = record[2] if len(record) > 2 else None
+        rank = record[3] if len(record) > 3 else None
+        played = (
+            record[4] if kind in {"standings", "forms"} and len(record) > 4 else None
+        )
+        points = (
+            record[11] if kind in {"standings", "forms"} and len(record) > 11 else None
+        )
+        return {
+            "team_id": _optional_int(team_id, "season_table[1]"),
+            "team": team_name if isinstance(team_name, str) else None,
+            "rank": _optional_int(rank, "season_table[3]"),
+            "played": _optional_int(played, "season_table[4]"),
+            "points": _optional_int(points, "season_table[11]"),
+            "group_name": None,
+            "source_values_json": canonical_json(record),
+        }
+    if not isinstance(record, Mapping):
+        raise WhoScoredParseError("Season table row must be an object or array")
+    team = record.get("team")
+    team_id = record.get("teamId")
+    team_name = record.get("teamName")
+    if isinstance(team, Mapping):
+        team_id = team_id if team_id is not None else team.get("id", team.get("teamId"))
+        team_name = team_name or team.get("name", team.get("teamName"))
+    elif isinstance(team, str):
+        team_name = team_name or team
+    return {
+        "team_id": _optional_int(team_id, "season_table.teamId"),
+        "team": team_name if isinstance(team_name, str) else None,
+        "rank": _optional_int(
+            record.get("rank", record.get("position")), "season_table.rank"
+        ),
+        "played": _optional_int(
+            record.get("played", record.get("gamesPlayed")), "season_table.played"
+        ),
+        "points": _optional_int(record.get("points"), "season_table.points"),
+        "group_name": record.get("groupName")
+        if isinstance(record.get("groupName"), str)
+        else None,
+        "source_values_json": None,
+    }
+
+
+def parse_season_tables(
+    html: str,
+    *,
+    scope: WhoScoredScope,
+    source_season_id: int,
+) -> Mapping[str, ParsedDataset]:
+    """Parse initial ``tables`` plus every ``tables.push`` mutation."""
+
+    payloads: list[Any] = []
+    source_present = False
+    try:
+        initial = extract_js_assignment(html, "tables")
+    except JavaScriptLiteralError:
+        initial = []
+    else:
+        source_present = True
+    if isinstance(initial, list):
+        payloads.extend(initial)
+    elif isinstance(initial, Mapping):
+        payloads.append(initial)
+    else:
+        raise WhoScoredParseError("Season tables assignment must be an object or array")
+    pushed = extract_js_call_arguments(html, "tables.push")
+    source_present = source_present or bool(pushed)
+    payloads.extend(pushed)
+
+    if not source_present:
+        return {
+            kind: ParsedDataset(
+                kind,
+                DatasetStatus.NOT_AVAILABLE,
+                reason=f"source_has_no_{kind}_container",
+            )
+            for kind in ("standings", "forms", "streaks", "performance")
+        }
+
+    rows_by_kind: dict[str, list[dict[str, Any]]] = {
+        "standings": [],
+        "forms": [],
+        "streaks": [],
+        "performance": [],
+    }
+    for table_index, payload in enumerate(payloads):
+        if not isinstance(payload, Mapping):
+            # Array pushes are legal; preserve each mapping member separately.
+            if isinstance(payload, list) and all(
+                isinstance(item, Mapping) for item in payload
+            ):
+                blocks: Sequence[Mapping[str, Any]] = payload
+            else:
+                raise WhoScoredParseError(
+                    f"Season table payload {table_index} is not structured"
+                )
+        else:
+            blocks = (payload,)
+        split_blocks = [
+            (kind, split)
+            for source_block in blocks
+            for kind, split in _season_table_blocks(source_block)
+        ]
+        for block_index, (kind, block) in enumerate(split_blocks):
+            arrays = _record_arrays(block)
+            records: list[tuple[str, Any]] = []
+            for path, array in arrays:
+                records.extend(
+                    (path, item) for item in array if _is_season_table_record(item)
+                )
+            if not records and _is_season_table_record(block):
+                records = [("", block)]
+            for row_index, (source_path, record) in enumerate(records):
+                rows_by_kind[kind].append(
+                    {
+                        "league": scope.competition_id,
+                        "season": scope.season_id,
+                        "source_season_id": _required_int(
+                            source_season_id, "source_season_id"
+                        ),
+                        "table_index": table_index,
+                        "block_index": block_index,
+                        "row_index": row_index,
+                        "table_type": kind,
+                        "source_path": source_path or None,
+                        "stage_id": _optional_int(
+                            (
+                                record.get("stageId", block.get("stageId"))
+                                if isinstance(record, Mapping)
+                                else record[0]
+                                if record
+                                else block.get("stageId")
+                            ),
+                            "season_table.stageId",
+                        ),
+                        "start_date": block.get("startDate"),
+                        "end_date": block.get("endDate"),
+                        **_common_table_fields(record, kind=kind),
+                        **_source_metadata(record),
+                        "table_raw_json": canonical_json(block),
+                        "table_schema_fingerprint": schema_fingerprint(block),
+                    }
+                )
+    return {
+        kind: _dataset(kind, rows, empty_reason=f"source_has_no_{kind}")
+        for kind, rows in rows_by_kind.items()
+    }
+
+
+def parse_season_page(
+    html: str,
+    *,
+    scope: WhoScoredScope,
+    region_id: int,
+    tournament_id: int,
+    source_season_id: int,
+    parser_version: str = PARSER_VERSION,
+) -> SeasonParseResult:
+    stages = parse_season_stages(
+        html,
+        scope=scope,
+        region_id=region_id,
+        tournament_id=tournament_id,
+        source_season_id=source_season_id,
+    )
+    tables = parse_season_tables(html, scope=scope, source_season_id=source_season_id)
+    return SeasonParseResult(
+        parser_version=parser_version,
+        stages=stages,
+        standings=tables["standings"],
+        forms=tables["forms"],
+        streaks=tables["streaks"],
+        performance=tables["performance"],
+    )
 
 
 def parse_calendar_months(html: str) -> tuple[CalendarMonth, ...]:
@@ -1143,7 +3065,9 @@ def parse_calendar_months(html: str) -> tuple[CalendarMonth, ...]:
         "wsCalendar",
         allow_date_expressions=True,
     )
-    if not isinstance(calendar, Mapping) or not isinstance(calendar.get("mask"), Mapping):
+    if not isinstance(calendar, Mapping) or not isinstance(
+        calendar.get("mask"), Mapping
+    ):
         raise WhoScoredParseError("wsCalendar.mask must be an object")
     months: set[CalendarMonth] = set()
     for raw_year, raw_months in calendar["mask"].items():
@@ -1165,6 +3089,14 @@ def parse_calendar_months(html: str) -> tuple[CalendarMonth, ...]:
 SCHEDULE_FIELDS = (
     "league",
     "season",
+    "region_id",
+    "region_code",
+    "region_name",
+    "tournament_id",
+    "tournament_name",
+    "source_season_id",
+    "source_season_name",
+    "source_sex",
     "game",
     "game_id",
     "date",
@@ -1209,6 +3141,8 @@ SCHEDULE_FIELDS = (
     "start_time",
     "started_at_utc",
     "winner_field",
+    "source_raw_json",
+    "source_schema_fingerprint",
 )
 _SCHEDULE_NESTED_FIELDS = {
     "aggregate_winner_field",
@@ -1218,7 +3152,9 @@ _SCHEDULE_NESTED_FIELDS = {
 }
 
 
-def _decode_json_document(payload: str | bytes | Mapping[str, Any]) -> Mapping[str, Any]:
+def _decode_json_document(
+    payload: str | bytes | Mapping[str, Any],
+) -> Mapping[str, Any]:
     if isinstance(payload, Mapping):
         return payload
     if isinstance(payload, bytes):
@@ -1261,12 +3197,43 @@ def parse_schedule_json(
     by_id: dict[int, dict[str, Any]] = {}
     for tournament_index, tournament in enumerate(tournaments):
         if not isinstance(tournament, Mapping):
-            raise WhoScoredParseError(f"tournaments[{tournament_index}] must be an object")
+            raise WhoScoredParseError(
+                f"tournaments[{tournament_index}] must be an object"
+            )
         matches = tournament.get("matches")
         if not isinstance(matches, list):
             raise WhoScoredParseError(
                 f"tournaments[{tournament_index}].matches must be an array"
             )
+        tournament_metadata = {
+            "region_id": _optional_int(
+                tournament.get("regionId"),
+                f"tournaments[{tournament_index}].regionId",
+            ),
+            "region_code": tournament.get("regionCode")
+            if isinstance(tournament.get("regionCode"), str)
+            else None,
+            "region_name": tournament.get("regionName")
+            if isinstance(tournament.get("regionName"), str)
+            else None,
+            "tournament_id": _optional_int(
+                tournament.get("tournamentId"),
+                f"tournaments[{tournament_index}].tournamentId",
+            ),
+            "tournament_name": tournament.get("tournamentName")
+            if isinstance(tournament.get("tournamentName"), str)
+            else None,
+            "source_season_id": _optional_int(
+                tournament.get("seasonId"),
+                f"tournaments[{tournament_index}].seasonId",
+            ),
+            "source_season_name": tournament.get("seasonName")
+            if isinstance(tournament.get("seasonName"), str)
+            else None,
+            "source_sex": _optional_int(
+                tournament.get("sex"), f"tournaments[{tournament_index}].sex"
+            ),
+        }
         for match_index, raw_match in enumerate(matches):
             if not isinstance(raw_match, Mapping):
                 raise WhoScoredParseError(
@@ -1281,13 +3248,29 @@ def parse_schedule_json(
             home_team = normalized.get("home_team_name", normalized.get("home_team"))
             away_team = normalized.get("away_team_name", normalized.get("away_team"))
             if home_team is not None and not isinstance(home_team, str):
-                raise WhoScoredParseError(f"matches[{match_index}].homeTeamName is invalid")
+                raise WhoScoredParseError(
+                    f"matches[{match_index}].homeTeamName is invalid"
+                )
             if away_team is not None and not isinstance(away_team, str):
-                raise WhoScoredParseError(f"matches[{match_index}].awayTeamName is invalid")
+                raise WhoScoredParseError(
+                    f"matches[{match_index}].awayTeamName is invalid"
+                )
             date_value = normalized.get("start_time_utc", normalized.get("date"))
             if date_value is not None and not isinstance(date_value, str):
-                raise WhoScoredParseError(f"matches[{match_index}].startTimeUtc is invalid")
+                raise WhoScoredParseError(
+                    f"matches[{match_index}].startTimeUtc is invalid"
+                )
             date_token = date_value[:10] if date_value else None
+            kickoff = None
+            if date_value:
+                try:
+                    kickoff = datetime.fromisoformat(date_value.replace("Z", "+00:00"))
+                except ValueError as exc:
+                    raise WhoScoredParseError(
+                        f"matches[{match_index}].startTimeUtc is invalid"
+                    ) from exc
+                if kickoff.tzinfo is not None:
+                    kickoff = kickoff.astimezone(timezone.utc).replace(tzinfo=None)
             game = (
                 f"{date_token} {home_team}-{away_team}"
                 if date_token
@@ -1300,14 +3283,24 @@ def parse_schedule_json(
                 {
                     "league": scope.competition_id,
                     "season": scope.season_id,
+                    **tournament_metadata,
                     "game": game,
                     "game_id": game_id,
-                    "date": date_value,
+                    "date": kickoff,
                     "home_team": home_team,
                     "away_team": away_team,
                     "status": normalized.get("status", normalized.get("status_code")),
                     "stage_id": _required_int(stage_id, "stage_id"),
                     "stage": stage,
+                    "match_is_opta": _optional_bool(
+                        normalized.get("match_is_opta"),
+                        f"matches[{match_index}].matchIsOpta",
+                    ),
+                    "has_preview": _optional_bool(
+                        normalized.get("has_preview"),
+                        f"matches[{match_index}].hasPreview",
+                    ),
+                    **_source_metadata(raw_match),
                 }
             )
             for field in _SCHEDULE_NESTED_FIELDS:
@@ -1316,9 +3309,695 @@ def parse_schedule_json(
                     row[field] = canonical_json(value)
             projected = {field: row.get(field) for field in SCHEDULE_FIELDS}
             previous = by_id.get(game_id)
-            if previous is not None and canonical_json(previous) != canonical_json(projected):
+            if previous is not None and canonical_json(previous) != canonical_json(
+                projected
+            ):
                 raise WhoScoredParseError(
                     f"Schedule contains conflicting rows for game id {game_id}"
                 )
             by_id[game_id] = projected
     return _dataset("schedule", [by_id[key] for key in sorted(by_id)])
+
+
+def parse_schedule_incidents(schedule: ParsedDataset) -> ParsedDataset:
+    """Normalize source incident summaries without pretending they are Opta events.
+
+    The schedule feed is the only structured incident source for many non-Opta
+    matches.  It provides no stable event id, so source array order/path is the
+    honest identity and the complete incident object remains attached.
+    """
+
+    if schedule.name != "schedule":
+        raise ValueError("schedule incident parser requires the schedule dataset")
+    if schedule.status is DatasetStatus.NOT_AVAILABLE:
+        return ParsedDataset(
+            "match_incidents",
+            DatasetStatus.NOT_AVAILABLE,
+            reason="source_schedule_unavailable",
+        )
+
+    rows: list[dict[str, Any]] = []
+    for schedule_row in schedule.rows:
+        raw_incidents = schedule_row.get("incidents")
+        if raw_incidents in (None, ""):
+            if schedule_row.get("has_incidents_summary") is True:
+                raise WhoScoredParseError(
+                    f"game {schedule_row.get('game_id')} declares an incident "
+                    "summary but incidents are absent"
+                )
+            continue
+        if isinstance(raw_incidents, str):
+            try:
+                decoded = json.loads(raw_incidents)
+            except json.JSONDecodeError as exc:
+                raise WhoScoredParseError(
+                    f"game {schedule_row.get('game_id')} incidents JSON is invalid"
+                ) from exc
+        else:
+            decoded = raw_incidents
+        if not isinstance(decoded, list):
+            raise WhoScoredParseError(
+                f"game {schedule_row.get('game_id')} incidents must be an array"
+            )
+
+        game_id = _required_int(schedule_row.get("game_id"), "game_id")
+        for ordinal, incident in enumerate(decoded):
+            if not isinstance(incident, Mapping):
+                raise WhoScoredParseError(
+                    f"game {game_id} incidents[{ordinal}] must be an object"
+                )
+            normalized = {_snake(str(key)): value for key, value in incident.items()}
+            player = normalized.get("player")
+            participating = normalized.get("participating_player")
+            if player is not None and not isinstance(player, (str, Mapping)):
+                raise WhoScoredParseError(
+                    f"game {game_id} incidents[{ordinal}].player is invalid"
+                )
+            if participating is not None and not isinstance(
+                participating, (str, Mapping)
+            ):
+                raise WhoScoredParseError(
+                    f"game {game_id} incidents[{ordinal}].participatingPlayer is invalid"
+                )
+            source_path = f"incidents[{ordinal}]"
+            rows.append(
+                {
+                    "league": schedule_row.get("league"),
+                    "season": schedule_row.get("season"),
+                    "game_id": game_id,
+                    "game": schedule_row.get("game"),
+                    "stage_id": schedule_row.get("stage_id"),
+                    "stage": schedule_row.get("stage"),
+                    "match_is_opta": schedule_row.get("match_is_opta"),
+                    "entity_key": f"{game_id}:{source_path}",
+                    "source_ordinal": ordinal,
+                    "source_path": source_path,
+                    "source_incident_id": (
+                        str(normalized.get("id"))
+                        if normalized.get("id") is not None
+                        else None
+                    ),
+                    "incident_type": _display(normalized.get("type")),
+                    "incident_subtype": _display(normalized.get("sub_type")),
+                    "minute": _optional_int(normalized.get("minute"), "minute"),
+                    "expanded_minute": _optional_int(
+                        normalized.get("expanded_minute"), "expandedMinute"
+                    ),
+                    "period": _display(normalized.get("period")),
+                    "field": _display(normalized.get("field")),
+                    "team_id": _optional_int(normalized.get("team_id"), "teamId"),
+                    "team": _mapping_text(normalized.get("team"), "name", "displayName")
+                    or _display(normalized.get("team_name")),
+                    "player_id": _optional_int(
+                        normalized.get("player_id")
+                        or (
+                            player.get("playerId", player.get("id"))
+                            if isinstance(player, Mapping)
+                            else None
+                        ),
+                        "playerId",
+                    ),
+                    "player": (
+                        player
+                        if isinstance(player, str)
+                        else _mapping_text(player, "name", "displayName")
+                    )
+                    or _display(normalized.get("player_name")),
+                    "participating_player_id": _optional_int(
+                        normalized.get("participating_player_id")
+                        or (
+                            participating.get("playerId", participating.get("id"))
+                            if isinstance(participating, Mapping)
+                            else None
+                        ),
+                        "participatingPlayerId",
+                    ),
+                    "participating_player": (
+                        participating
+                        if isinstance(participating, str)
+                        else _mapping_text(participating, "name", "displayName")
+                    )
+                    or _display(normalized.get("participating_player_name")),
+                    **_source_metadata(incident),
+                }
+            )
+    return _dataset(
+        "match_incidents",
+        rows,
+        empty_reason="source_schedule_contains_no_incident_rows",
+    )
+
+
+def parse_schedule_bets(schedule: ParsedDataset) -> ParsedDataset:
+    """Normalize the source's 1X2 bookmaker offers at match-offer grain.
+
+    The schedule response embeds three markets (home/draw/away), each with a
+    stable source bet id and one offer per provider.  Array order is retained
+    for provenance, but logical identity uses source ids so a harmless provider
+    reordering cannot create duplicate Bronze rows.  Click-out URLs are stored
+    as source data only; the scraper never requests them.
+    """
+
+    if schedule.name != "schedule":
+        raise ValueError("schedule bet parser requires the schedule dataset")
+    if schedule.status is DatasetStatus.NOT_AVAILABLE:
+        return ParsedDataset(
+            "match_bets",
+            DatasetStatus.NOT_AVAILABLE,
+            reason="source_schedule_unavailable",
+        )
+
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for schedule_row in schedule.rows:
+        raw_bets = schedule_row.get("bets")
+        if raw_bets in (None, ""):
+            continue
+        if isinstance(raw_bets, str):
+            try:
+                decoded = json.loads(raw_bets)
+            except json.JSONDecodeError as exc:
+                raise WhoScoredParseError(
+                    f"game {schedule_row.get('game_id')} bets JSON is invalid"
+                ) from exc
+        else:
+            decoded = raw_bets
+        if not isinstance(decoded, Mapping):
+            raise WhoScoredParseError(
+                f"game {schedule_row.get('game_id')} bets must be an object"
+            )
+
+        game_id = _required_int(schedule_row.get("game_id"), "game_id")
+        for source_outcome, market in decoded.items():
+            if not isinstance(source_outcome, str) or not source_outcome.strip():
+                raise WhoScoredParseError(
+                    f"game {game_id} bets contains an invalid outcome key"
+                )
+            if not isinstance(market, Mapping):
+                raise WhoScoredParseError(
+                    f"game {game_id} bets.{source_outcome} must be an object"
+                )
+            source_bet_id = market.get("betId")
+            if source_bet_id in (None, ""):
+                raise WhoScoredParseError(
+                    f"game {game_id} bets.{source_outcome}.betId is required"
+                )
+            source_bet_id = str(source_bet_id)
+            bet_name = market.get("betName")
+            if bet_name is not None and not isinstance(bet_name, str):
+                raise WhoScoredParseError(
+                    f"game {game_id} bets.{source_outcome}.betName must be text"
+                )
+            offers = market.get("offers")
+            if not isinstance(offers, list):
+                raise WhoScoredParseError(
+                    f"game {game_id} bets.{source_outcome}.offers must be an array"
+                )
+            for offer_ordinal, offer in enumerate(offers):
+                if not isinstance(offer, Mapping):
+                    raise WhoScoredParseError(
+                        f"game {game_id} bets.{source_outcome}.offers"
+                        f"[{offer_ordinal}] must be an object"
+                    )
+                provider_id = _required_int(
+                    offer.get("providerId"),
+                    f"bets.{source_outcome}.offers[{offer_ordinal}].providerId",
+                )
+                provider = offer.get("bettingProvider")
+                if not isinstance(provider, str) or not provider.strip():
+                    raise WhoScoredParseError(
+                        f"game {game_id} bets.{source_outcome}.offers"
+                        f"[{offer_ordinal}].bettingProvider is required"
+                    )
+                entity_key = f"{game_id}:{source_outcome}:{source_bet_id}:{provider_id}"
+                if entity_key in seen:
+                    raise WhoScoredParseError(
+                        f"game {game_id} contains duplicate bet offer {entity_key}"
+                    )
+                seen.add(entity_key)
+                clickout_url = offer.get("clickOutUrl")
+                if clickout_url is not None and not isinstance(clickout_url, str):
+                    raise WhoScoredParseError(
+                        f"game {game_id} bets.{source_outcome}.offers"
+                        f"[{offer_ordinal}].clickOutUrl must be text"
+                    )
+                source_path = f"bets.{source_outcome}.offers[{offer_ordinal}]"
+                source_record = {
+                    "source_outcome": source_outcome,
+                    "bet_id": source_bet_id,
+                    "bet_name": bet_name,
+                    "offer": dict(offer),
+                }
+                rows.append(
+                    {
+                        "league": schedule_row.get("league"),
+                        "season": schedule_row.get("season"),
+                        "game_id": game_id,
+                        "game": schedule_row.get("game"),
+                        "stage_id": schedule_row.get("stage_id"),
+                        "stage": schedule_row.get("stage"),
+                        "entity_key": entity_key,
+                        "source_outcome": source_outcome,
+                        "source_bet_id": source_bet_id,
+                        "bet_name": bet_name,
+                        "source_offer_ordinal": offer_ordinal,
+                        "provider_id": provider_id,
+                        "betting_provider": provider,
+                        "odds_decimal": _optional_float(
+                            offer.get("oddsDecimal"),
+                            f"bets.{source_outcome}.offers[{offer_ordinal}]"
+                            ".oddsDecimal",
+                        ),
+                        "odds_fractional": (
+                            str(offer["oddsFractional"])
+                            if offer.get("oddsFractional") is not None
+                            else None
+                        ),
+                        "odds_us": (
+                            str(offer["oddsUS"])
+                            if offer.get("oddsUS") is not None
+                            else None
+                        ),
+                        "clickout_url": clickout_url,
+                        "source_path": source_path,
+                        **_source_metadata(source_record),
+                    }
+                )
+    return _dataset(
+        "match_bets",
+        rows,
+        empty_reason="source_schedule_contains_no_bet_offers",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Stage statistics feeds
+# ---------------------------------------------------------------------------
+
+_STAGE_STAT_LIST_KEYS = {
+    "team": {"teamtablestats", "teams", "teamstats", "data"},
+    "player": {"playertablestats", "players", "playerstats", "data"},
+    "referee": {"refereetablestats", "referees", "refereestats", "data"},
+}
+
+
+def _find_named_record_lists(
+    value: Any, names: set[str]
+) -> list[list[Mapping[str, Any]]]:
+    matches: list[list[Mapping[str, Any]]] = []
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            if (
+                str(key).replace("_", "").casefold() in names
+                and isinstance(child, list)
+                and all(isinstance(item, Mapping) for item in child)
+            ):
+                matches.append(child)
+            elif isinstance(child, Mapping):
+                matches.extend(_find_named_record_lists(child, names))
+    return matches
+
+
+_PAGING_CONTAINER_KEYS = {"paging", "pagination"}
+_PAGING_TOTAL_KEYS = {"total", "totalresults", "totalrecords"}
+_PAGING_POSITION_KEYS = {
+    "page",
+    "currentpage",
+    "pagenumber",
+    "pageindex",
+    "pagesize",
+    "resultsperpage",
+    "recordsperpage",
+    "firstrecordindex",
+    "lastrecordindex",
+    "startindex",
+    "endindex",
+}
+
+
+def _stage_stats_paging_contract(
+    value: Any,
+) -> tuple[Optional[int], Optional[int], bool]:
+    """Return the declared total rows/pages and reject ambiguous metadata."""
+
+    total_results: set[int] = set()
+    total_pages: set[int] = set()
+    paging_values: dict[str, set[int]] = {}
+
+    def visit(node: Any) -> None:
+        if not isinstance(node, Mapping):
+            return
+        for raw_key, child in node.items():
+            key = str(raw_key).replace("_", "").casefold()
+            if key in _PAGING_CONTAINER_KEYS:
+                if not isinstance(child, Mapping):
+                    raise WhoScoredParseError(
+                        f"statistics {raw_key} metadata must be an object"
+                    )
+                for paging_key, paging_value in child.items():
+                    normalized = str(paging_key).replace("_", "").casefold()
+                    if normalized in _PAGING_TOTAL_KEYS:
+                        parsed = _required_int(paging_value, f"{raw_key}.{paging_key}")
+                        total_results.add(parsed)
+                        paging_values.setdefault(normalized, set()).add(parsed)
+                    elif normalized == "totalpages":
+                        parsed = _required_int(paging_value, f"{raw_key}.{paging_key}")
+                        total_pages.add(parsed)
+                        paging_values.setdefault(normalized, set()).add(parsed)
+                    elif normalized in _PAGING_POSITION_KEYS:
+                        parsed = _required_int(paging_value, f"{raw_key}.{paging_key}")
+                        paging_values.setdefault(normalized, set()).add(parsed)
+                continue
+            visit(child)
+
+    visit(value)
+    if len(total_results) > 1:
+        raise WhoScoredParseError(
+            f"statistics paging declares conflicting totals {sorted(total_results)}"
+        )
+    if len(total_pages) > 1:
+        raise WhoScoredParseError(
+            f"statistics paging declares conflicting page counts {sorted(total_pages)}"
+        )
+    conflicting_positions = {
+        key: sorted(values) for key, values in paging_values.items() if len(values) > 1
+    }
+    if conflicting_positions:
+        raise WhoScoredParseError(
+            f"statistics paging declares conflicting positions {conflicting_positions}"
+        )
+    # Team feeds are intentionally unpaginated despite zero totals. Most tabs
+    # report currentPage=0; the official xG tab reports currentPage=1 while all
+    # actual size/index fields remain zero. Keep this source exception exact.
+    unpaginated_team_sentinel = (
+        total_results == {0}
+        and total_pages == {0}
+        and bool(paging_values)
+        and all(
+            next(iter(values)) in ({0, 1} if key == "currentpage" else {0})
+            for key, values in paging_values.items()
+        )
+    )
+    return (
+        next(iter(total_results), None),
+        next(iter(total_pages), None),
+        unpaginated_team_sentinel,
+    )
+
+
+def _stage_stat_record_identity(record: Mapping[str, Any]) -> str:
+    """Stable identity for one exact source record.
+
+    A stage feed is not guaranteed to contain one row per entity.  The live
+    World Cup 2026 team feed, for example, returns the same ``teamId`` more
+    than once with different ``apps``/ranking/statistics.  Those are distinct
+    source observations and must be preserved.  Only byte-semantically equal
+    records indicate a duplicated list/page and can mask truncation.
+    """
+
+    return canonical_json(record)
+
+
+def parse_stage_statistics(
+    payload: str | bytes | Mapping[str, Any] | Sequence[Any],
+    *,
+    scope: WhoScoredScope,
+    stage_id: int,
+    entity: str,
+    source_season_id: Optional[int] = None,
+    source_category: Optional[str] = None,
+    source_subcategory: Optional[str] = None,
+) -> ParsedDataset:
+    """Parse team/player/referee feeds into a source-preserving long form."""
+
+    kind = str(entity).strip().casefold()
+    if kind not in _STAGE_STAT_LIST_KEYS:
+        raise ValueError("entity must be one of: team, player, referee")
+    decoded = _decode_discovery_document(payload, variable_names=())
+    if isinstance(decoded, list):
+        if not all(isinstance(item, Mapping) for item in decoded):
+            raise WhoScoredParseError(f"{kind} statistics array contains non-objects")
+        records: list[Mapping[str, Any]] = list(decoded)
+    elif isinstance(decoded, Mapping):
+        lists = _find_named_record_lists(decoded, _STAGE_STAT_LIST_KEYS[kind])
+        records = [record for records_list in lists for record in records_list]
+        if not records and any(
+            key in decoded for key in ("playerId", "teamId", "refereeId", "officialId")
+        ):
+            records = [decoded]
+        elif not lists:
+            return ParsedDataset(
+                f"{kind}_stage_stats",
+                DatasetStatus.NOT_AVAILABLE,
+                reason=f"source_{kind}_statistics_container_absent",
+            )
+    else:
+        raise WhoScoredParseError(f"{kind} statistics root must be an object or array")
+    if isinstance(decoded, Mapping):
+        declared_total, declared_pages, unpaginated_team_paging = (
+            _stage_stats_paging_contract(decoded)
+        )
+        distinct_records = {_stage_stat_record_identity(record) for record in records}
+        if len(distinct_records) != len(records):
+            raise WhoScoredParseError(
+                f"{kind} statistics contains duplicate source records: "
+                f"{len(distinct_records)} distinct of {len(records)} returned"
+            )
+        # The official team endpoint returns all rows in one response while
+        # emitting zero totals/size/index (currentPage is 0 or 1). It is a
+        # sentinel, not a claim that the response contains zero teams. Keep
+        # this exception narrow: player/referee and real paging remain strict.
+        team_unpaginated_sentinel = (
+            kind == "team" and bool(records) and unpaginated_team_paging
+        )
+        if (
+            not team_unpaginated_sentinel
+            and declared_pages is not None
+            and declared_pages > 1
+        ):
+            raise WhoScoredParseError(
+                f"{kind} statistics response is paginated across "
+                f"{declared_pages} pages; refusing a partial first page"
+            )
+        if (
+            not team_unpaginated_sentinel
+            and declared_total is not None
+            and len(distinct_records) != declared_total
+        ):
+            raise WhoScoredParseError(
+                f"{kind} statistics response is incomplete: returned "
+                f"{len(distinct_records)} distinct records, source declares "
+                f"{declared_total}"
+            )
+    dataset_name = f"{kind}_stage_stats"
+    rows: list[dict[str, Any]] = []
+    identity_keys = {
+        "playerId",
+        "playerName",
+        "teamId",
+        "teamName",
+        "refereeId",
+        "refereeName",
+        "officialId",
+        "name",
+        "rank",
+        "positionText",
+    }
+    document_fingerprint = schema_fingerprint(decoded)
+    for index, record in enumerate(records):
+        metrics = {
+            key: value for key, value in record.items() if key not in identity_keys
+        }
+        leaves = (
+            _stat_leaf_rows(metrics)
+            if metrics
+            else [
+                {
+                    "category": None,
+                    "subcategory": None,
+                    "stat": None,
+                    "filter": None,
+                    "minute": None,
+                    "numeric_value": None,
+                    "text_value": None,
+                    "boolean_value": None,
+                    "value_json": None,
+                    "source_path": None,
+                }
+            ]
+        )
+        for leaf in leaves:
+            rows.append(
+                {
+                    "league": scope.competition_id,
+                    "season": scope.season_id,
+                    "source_season_id": source_season_id,
+                    "stage_id": _required_int(stage_id, "stage_id"),
+                    "row_index": index,
+                    "entity_type": kind,
+                    "source_category": source_category,
+                    "source_subcategory": source_subcategory,
+                    "team_id": _optional_int(record.get("teamId"), "teamId"),
+                    "team": record.get("teamName")
+                    if isinstance(record.get("teamName"), str)
+                    else None,
+                    "player_id": _optional_int(record.get("playerId"), "playerId"),
+                    "player": record.get("playerName")
+                    if isinstance(record.get("playerName"), str)
+                    else None,
+                    "referee_id": _optional_int(
+                        record.get("refereeId", record.get("officialId")),
+                        "refereeId",
+                    ),
+                    "referee": record.get("refereeName", record.get("name"))
+                    if isinstance(record.get("refereeName", record.get("name")), str)
+                    else None,
+                    "rank": _optional_int(record.get("rank"), "rank"),
+                    **leaf,
+                    "record_schema_fingerprint": schema_fingerprint(record),
+                    "document_schema_fingerprint": document_fingerprint,
+                }
+            )
+    return _dataset(dataset_name, rows, empty_reason=f"source_{kind}_statistics_empty")
+
+
+def parse_team_stage_statistics(
+    payload: str | bytes | Mapping[str, Any] | Sequence[Any],
+    *,
+    scope: WhoScoredScope,
+    stage_id: int,
+    source_season_id: Optional[int] = None,
+    source_category: Optional[str] = None,
+    source_subcategory: Optional[str] = None,
+) -> ParsedDataset:
+    return parse_stage_statistics(
+        payload,
+        scope=scope,
+        stage_id=stage_id,
+        entity="team",
+        source_season_id=source_season_id,
+        source_category=source_category,
+        source_subcategory=source_subcategory,
+    )
+
+
+def parse_player_stage_statistics(
+    payload: str | bytes | Mapping[str, Any] | Sequence[Any],
+    *,
+    scope: WhoScoredScope,
+    stage_id: int,
+    source_season_id: Optional[int] = None,
+    source_category: Optional[str] = None,
+    source_subcategory: Optional[str] = None,
+) -> ParsedDataset:
+    return parse_stage_statistics(
+        payload,
+        scope=scope,
+        stage_id=stage_id,
+        entity="player",
+        source_season_id=source_season_id,
+        source_category=source_category,
+        source_subcategory=source_subcategory,
+    )
+
+
+def parse_referee_stage_statistics(
+    payload: str | bytes | Mapping[str, Any] | Sequence[Any],
+    *,
+    scope: WhoScoredScope,
+    stage_id: int,
+    source_season_id: Optional[int] = None,
+    source_category: Optional[str] = None,
+    source_subcategory: Optional[str] = None,
+) -> ParsedDataset:
+    return parse_stage_statistics(
+        payload,
+        scope=scope,
+        stage_id=stage_id,
+        entity="referee",
+        source_season_id=source_season_id,
+        source_category=source_category,
+        source_subcategory=source_subcategory,
+    )
+
+
+def parse_referee_stage_statistics_html(
+    html: str,
+    *,
+    scope: WhoScoredScope,
+    stage_id: int,
+    source_season_id: Optional[int] = None,
+) -> ParsedDataset:
+    """Parse the source-rendered referee tables when no JSON feed is exposed."""
+    soup = BeautifulSoup(html, "html.parser")
+    records: list[dict[str, Any]] = []
+    for table in soup.select("table"):
+        marker = " ".join(
+            str(value)
+            for value in (
+                table.get("id"),
+                " ".join(table.get("class") or ()),
+                getattr(table.parent, "get", lambda *_: None)("id"),
+            )
+            if value
+        ).casefold()
+        headers = table.select("thead th")
+        header_names: list[str] = []
+        for index, header in enumerate(headers):
+            raw_name = (
+                header.get("data-property")
+                or header.get("data-stat-name")
+                or header.get_text(" ", strip=True)
+                or f"column_{index}"
+            )
+            header_names.append(_snake(str(raw_name)))
+        for row_index, table_row in enumerate(table.select("tbody tr")):
+            cells = table_row.find_all("td", recursive=False)
+            if not cells:
+                continue
+            anchor = table_row.find("a", href=True)
+            href = anchor.get("href", "") if anchor is not None else ""
+            referee_match = re.search(r"/(?:Referees|Officials)/(\d+)", href, re.I)
+            if "referee" not in marker and referee_match is None:
+                continue
+            record: dict[str, Any] = {
+                "refereeId": int(referee_match.group(1)) if referee_match else None,
+                "refereeName": (
+                    anchor.get_text(" ", strip=True) if anchor is not None else None
+                ),
+            }
+            for index, cell in enumerate(cells):
+                key = (
+                    header_names[index]
+                    if index < len(header_names)
+                    else next(
+                        (
+                            _snake(value)
+                            for value in cell.get("class") or ()
+                            if value not in {"sorted", "grid-abs"}
+                        ),
+                        f"column_{index}",
+                    )
+                )
+                text = cell.get_text(" ", strip=True)
+                if not text or key in {"referee", "referee_name", "name"}:
+                    continue
+                numeric = text.replace(",", "")
+                try:
+                    value: Any = float(numeric)
+                    if value.is_integer():
+                        value = int(value)
+                except ValueError:
+                    value = text
+                record[key] = value
+            record["sourceRowIndex"] = row_index
+            records.append(record)
+    soup.decompose()
+    return parse_referee_stage_statistics(
+        records,
+        scope=scope,
+        stage_id=stage_id,
+        source_season_id=source_season_id,
+        source_category="referee",
+        source_subcategory="all",
+    )

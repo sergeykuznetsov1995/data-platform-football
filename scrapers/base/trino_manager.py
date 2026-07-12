@@ -12,6 +12,7 @@ Storage Pipeline:
 import logging
 import os
 import time
+import uuid
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 
@@ -549,10 +550,14 @@ WITH (
             pending_rows = []
             pending_bytes = len(header)
 
-        for _, row in df.iterrows():
+        # ``iterrows`` boxes every scalar into a Series and can silently
+        # coerce integer identifiers to float.  Tuple iteration preserves the
+        # DataFrame's column order/types and is substantially faster for the
+        # wide, long-form WhoScored stat batches. SQL is still flushed in
+        # bounded multi-row VALUES chunks; there is never one query per row.
+        for source_values in df.itertuples(index=False, name=None):
             values = []
-            for col in df.columns:
-                val = row[col]
+            for col, val in zip(df.columns, source_values):
                 target_type = table_col_types.get(col.lower(), '')
                 values.append(self._format_sql_value(val, target_type))
             row_sql = f"({', '.join(values)})"
@@ -619,7 +624,10 @@ WITH (
             logger.warning(f"Empty DataFrame, skipping insert to {schema}.{table}")
             return 0
 
-        stage = f"{table}__stg"  # matches _IDENTIFIER_RE
+        # A deterministic ``{table}__stg`` races as soon as two mapped Airflow
+        # tasks write the same target: one task can drop or populate the
+        # other's stage.  Every writer owns a distinct recovery table.
+        stage = f"{table}__stg_{uuid.uuid4().hex[:12]}"
         qualified_target = validate_catalog_qualified_name(self.catalog, schema, table)
         qualified_stage = validate_catalog_qualified_name(self.catalog, schema, stage)
 

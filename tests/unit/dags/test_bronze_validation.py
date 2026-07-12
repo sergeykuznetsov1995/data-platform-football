@@ -30,7 +30,7 @@ class TestValidateTableFailClosed:
     def test_known_key_passes_when_rows_above_threshold(self, monkeypatch):
         mod = _load_module()
         # Derive the passing row count from the configured threshold so the
-        # test survives threshold re-scaling (e.g. × len(WHOSCORED_LEAGUES)).
+        # test survives threshold re-scaling by the source-owned DQ contract.
         threshold = mod.MIN_ROW_THRESHOLDS["whoscored_schedule"]
         rows = threshold + 60
         monkeypatch.setattr(mod, "bronze_count", lambda _t: rows)

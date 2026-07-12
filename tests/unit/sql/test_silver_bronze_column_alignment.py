@@ -129,6 +129,22 @@ def test_extractor_smoke_detects_unknown_column(bronze_columns):
 
 
 @pytest.mark.unit
+def test_whoscored_serving_views_are_explicit_in_snapshot(bronze_columns):
+    """Do not alias ``*_current`` to legacy physical tables in this test.
+
+    The views are the atomic publication boundary and can diverge from their
+    append-only storage schema during a migration.
+    """
+
+    assert {
+        "bronze.whoscored_schedule_current",
+        "bronze.whoscored_events_current",
+        "bronze.whoscored_lineups_current",
+        "bronze.whoscored_missing_players_current",
+    } <= set(bronze_columns)
+
+
+@pytest.mark.unit
 def test_extractor_skips_window_function_aliases():
     """``ROW_NUMBER() OVER (...) AS rn`` introduced inside an inner SELECT
     must not be reported as a Bronze column reference even when the outer

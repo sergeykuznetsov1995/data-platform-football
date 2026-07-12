@@ -1,0 +1,11 @@
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.gold.dim_manager_v2
+  description: |
+    Native-v2 manager dimension enriched by conflict-safe global Transfermarkt
+    profiles. Coach stints are intentionally excluded: match-derived manager
+    tenure remains in fct_manager_stint. Promotion is cycle-pinned and
+    reversible through the canonical reader state.
+  tags: [Tier.Gold, Domain.Football, PII.Low]
+columns:
+  - name: manager_id
+    description: Canonical manager primary key.

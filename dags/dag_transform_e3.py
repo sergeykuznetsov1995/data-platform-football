@@ -470,11 +470,9 @@ def _run_gold_e3(sql_file: str, table_name: str, **context) -> Dict[str, Any]:
 def _validate_e3(**context) -> Dict[str, Any]:
     """Run E3-scoped DQ checks and post a Telegram summary.
 
-    DQ list comes from :func:`utils.e3_dq.build_all_e3_checks` (E3.8) — 39
-    standard checks across silver.whoscored_events_spadl, silver.espn_lineup,
-    gold.fct_event/fct_shot/fct_lineup. The standalone
-    :func:`utils.e3_dq.parity_check_event_counts` adds a Bronze->Silver->Gold
-    row-count parity gate (ERROR severity, runs after standard checks).
+    DQ list comes from :func:`utils.e3_dq.build_all_e3_checks` (E3.8). Custom
+    fail-closed checks add scale-aware WhoScored SPADL unknown coverage,
+    Bronze->Silver->Gold parity and schedule->events completeness.
 
     Severity model — ERROR-severity failures raise ``AirflowException``
     after the Telegram summary is posted. WARNING-severity failures are
@@ -488,6 +486,7 @@ def _validate_e3(**context) -> Dict[str, Any]:
         build_all_e3_checks,
         completeness_check_events,
         parity_check_event_counts,
+        spadl_unknown_coverage_check,
     )
 
     all_checks = build_all_e3_checks()
@@ -496,6 +495,12 @@ def _validate_e3(**context) -> Dict[str, Any]:
     # Standard CHECK.* primitives. raise_on_error=False so Telegram fires
     # before we re-raise on ERROR-severity failures.
     report = run_checks(all_checks, raise_on_error=False)
+
+    # Whole-table SPADL unknown coverage needs a combined absolute+ratio cap,
+    # which is not expressible via the standard CHECK registry. Any execution
+    # error is returned as an ERROR CheckResult by the helper itself.
+    unknown_coverage_result = spadl_unknown_coverage_check()
+    report.results.append(unknown_coverage_result)
 
     # Bronze->Silver->Gold parity gate (custom — not expressible via
     # standard CHECK.* registry). Append result to the same report so the

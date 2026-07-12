@@ -54,6 +54,7 @@ EVENT_TYPE_DICT = {
 _ICEBERG_TO_LOCAL = {
     "iceberg.silver.fbref_match_events":     "silver_fbref_match_events",
     "iceberg.silver.whoscored_events_spadl": "silver_whoscored_events_spadl",
+    "iceberg.bronze.whoscored_schedule_current": "bronze_whoscored_schedule",
     "iceberg.bronze.whoscored_schedule":     "bronze_whoscored_schedule",
     "iceberg.silver.fbref_match_enriched":   "silver_fbref_match_enriched",
     "iceberg.silver.xref_match":             "silver_xref_match",

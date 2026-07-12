@@ -1033,7 +1033,7 @@ class FotMobRepository:
                 ORDER BY observed_at DESC
                 LIMIT {int(limit)}
             )
-            SELECT c.discovery_run_id, c.competition_id
+            SELECT discovery_run_id, c.competition_id
             FROM {self.catalog}.{self.schema}.fotmob_competitions c
             INNER JOIN runs r USING (discovery_run_id)
             WHERE COALESCE(c.is_tombstoned, FALSE) = FALSE

@@ -248,6 +248,58 @@ def test_terminal_not_available_never_replays_old_cache(tmp_path, status):
     assert len(session.calls) == 1
 
 
+def test_null_json_body_is_terminal_not_available(tmp_path):
+    # FotMob answers 200 with a literal ``null`` body for dead catalog
+    # entries (e.g. placeholder/promo competitions). That carries no data
+    # for any parser and must degrade like a 204/404, not crash downstream
+    # into a false schema_drift.
+    transport, session = _transport(
+        [FakeResponse(200, b"null")],
+        raw_store=_store(tmp_path),
+    )
+
+    result = transport.fetch_json("leagues", {"id": 285})
+
+    assert result.outcome == FetchOutcome.NOT_AVAILABLE
+    assert result.terminal and not result.ok
+    assert result.json_data is None and result.body is None
+    assert "null JSON body" in result.error
+    assert len(session.calls) == 1
+
+
+def test_revalidated_null_cache_stays_not_available(tmp_path):
+    store = _store(tmp_path)
+    target = canonicalize_target("leagues", {"id": 285})
+    store.store(target, b"null", etag='"dead-v1"')
+    transport, _session = _transport(
+        [FakeResponse(304, b"", {"ETag": '"dead-v1"'})],
+        raw_store=store,
+    )
+
+    result = transport.fetch_json("leagues", {"id": 285})
+
+    assert result.outcome == FetchOutcome.NOT_AVAILABLE
+    assert result.terminal and not result.ok and not result.cache_hit
+    assert result.json_data is None and result.body is None
+
+
+def test_stale_replay_of_null_cache_stays_not_available(tmp_path):
+    store = _store(tmp_path)
+    target = canonicalize_target("leagues", {"id": 285})
+    store.store(target, b"null", etag='"dead-v1"')
+    transport, _session = _transport(
+        [FakeResponse(503, b"down"), FakeResponse(503, b"still down")],
+        raw_store=store,
+        max_attempts=2,
+    )
+
+    result = transport.fetch_json("leagues", {"id": 285})
+
+    assert result.outcome == FetchOutcome.NOT_AVAILABLE
+    assert result.terminal and not result.ok and not result.stale
+    assert result.json_data is None and result.body is None
+
+
 def test_terminal_status_is_not_retried_and_retryable_can_disable_stale(tmp_path):
     store = _store(tmp_path)
     target = canonicalize_target("leagues", {"id": 289})

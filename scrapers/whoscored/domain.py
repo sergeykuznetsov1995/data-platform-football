@@ -12,9 +12,18 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 import re
+from typing import Optional
 
 
-_SEASON_ID_RE = re.compile(r"^[0-9]{4}$")
+_SEASON_ID_RE = re.compile(
+    r"^(?P<base>[0-9]{4})"
+    r"(?:-(?P<qualifier>single|split|multi)-ws(?P<source_id>[1-9][0-9]*))?$"
+)
+_SEASON_FORMAT_QUALIFIER = {
+    "single_year": "single",
+    "split_year": "split",
+    "multi_year": "multi",
+}
 
 
 class SeasonFormat(str, Enum):
@@ -22,6 +31,10 @@ class SeasonFormat(str, Enum):
 
     SPLIT_YEAR = "split_year"
     SINGLE_YEAR = "single_year"
+    # Some international editions span a non-consecutive range after a
+    # postponement (for example ``2019/2021``).  Preserve that source identity
+    # explicitly instead of misclassifying or dropping the season.
+    MULTI_YEAR = "multi_year"
 
     @classmethod
     def coerce(cls, value: "SeasonFormat | str") -> "SeasonFormat":
@@ -34,6 +47,48 @@ class SeasonFormat(str, Enum):
             raise ValueError(
                 f"Unsupported season format {value!r}; expected one of: {allowed}"
             ) from exc
+
+
+class TournamentEligibility(str, Enum):
+    """Explicit catalog disposition for every tournament seen at the source.
+
+    ``QUARANTINED`` is deliberately a first-class state.  Discovery may fan out
+    through quarantined tournaments to obtain authoritative ``sex`` metadata,
+    but a production ingestion scope must never treat one as eligible.
+    """
+
+    INCLUDED = "included"
+    EXCLUDED_WOMEN = "excluded_women"
+    EXCLUDED_YOUTH = "excluded_youth"
+    SOURCE_UNAVAILABLE = "source_unavailable"
+    QUARANTINED = "quarantined"
+
+    @classmethod
+    def coerce(cls, value: "TournamentEligibility | str") -> "TournamentEligibility":
+        if isinstance(value, cls):
+            return value
+        try:
+            return cls(str(value).strip())
+        except ValueError as exc:
+            allowed = ", ".join(item.value for item in cls)
+            raise ValueError(
+                f"Unsupported tournament eligibility {value!r}; expected: {allowed}"
+            ) from exc
+
+
+@dataclass(frozen=True)
+class TournamentClassification:
+    """Auditable inclusion decision, including the classifier version."""
+
+    eligibility: TournamentEligibility
+    reason: str
+    classifier_version: str
+    source_sex: Optional[int] = None
+    override_version: Optional[str] = None
+
+    @property
+    def is_eligible(self) -> bool:
+        return self.eligibility is TournamentEligibility.INCLUDED
 
 
 def canonical_season_id(
@@ -49,25 +104,85 @@ def canonical_season_id(
 
     token = str(value).strip()
     fmt = SeasonFormat.coerce(season_format)
-    if not _SEASON_ID_RE.fullmatch(token):
+    match = _SEASON_ID_RE.fullmatch(token)
+    if match is None:
         raise ValueError(
-            f"Season id must be exactly four decimal digits, got {value!r}"
+            "Season id must be four decimal digits or a strict disambiguated "
+            f"source identity, got {value!r}"
+        )
+    base = match.group("base")
+    qualifier = match.group("qualifier")
+    expected_qualifier = _SEASON_FORMAT_QUALIFIER[fmt.value]
+    if qualifier is not None and qualifier != expected_qualifier:
+        raise ValueError(
+            f"Season id {token!r} encodes {qualifier!r}, expected "
+            f"{expected_qualifier!r} for {fmt.value}"
         )
 
-    if fmt is SeasonFormat.SPLIT_YEAR:
-        first = int(token[:2])
-        second = int(token[2:])
-        if second != (first + 1) % 100:
+    if fmt in {SeasonFormat.SPLIT_YEAR, SeasonFormat.MULTI_YEAR}:
+        first = int(base[:2])
+        second = int(base[2:])
+        consecutive = second == (first + 1) % 100
+        if fmt is SeasonFormat.SPLIT_YEAR and not consecutive:
             raise ValueError(
                 f"Split-year season {token!r} must contain consecutive YY values"
             )
+        if fmt is SeasonFormat.MULTI_YEAR and consecutive:
+            raise ValueError(
+                f"Multi-year season {token!r} must not be an adjacent split year"
+            )
     else:
-        year = int(token)
+        year = int(base)
         if not 1800 <= year <= 2199:
             raise ValueError(
                 f"Single-year season {token!r} must be a four-digit calendar year"
             )
     return token
+
+
+def base_season_id(value: str | int) -> str:
+    """Return the four-digit base of a canonical or disambiguated identity."""
+
+    token = str(value).strip()
+    match = _SEASON_ID_RE.fullmatch(token)
+    if match is None:
+        raise ValueError(f"Invalid canonical season identity {value!r}")
+    return match.group("base")
+
+
+def source_season_id_hint(value: str | int) -> Optional[int]:
+    """Return the immutable WhoScored source id encoded by a collision key."""
+
+    token = str(value).strip()
+    match = _SEASON_ID_RE.fullmatch(token)
+    if match is None:
+        raise ValueError(f"Invalid canonical season identity {value!r}")
+    source_id = match.group("source_id")
+    return int(source_id) if source_id is not None else None
+
+
+def disambiguated_season_id(
+    value: str | int,
+    season_format: SeasonFormat | str,
+    source_season_id: str | int,
+) -> str:
+    """Build a stable lossless identity for a real canonical collision.
+
+    The ordinary cross-source id remains four digits.  A suffix is introduced
+    only when one competition exposes multiple distinct source seasons with
+    that same base; the immutable source id prevents a later third edition
+    from renaming the already discovered pair.
+    """
+
+    fmt = SeasonFormat.coerce(season_format)
+    base = base_season_id(canonical_season_id(value, fmt))
+    source_token = str(source_season_id).strip()
+    if re.fullmatch(r"[1-9][0-9]*", source_token) is None:
+        raise ValueError(
+            f"source_season_id must be a positive integer, got {source_season_id!r}"
+        )
+    token = f"{base}-{_SEASON_FORMAT_QUALIFIER[fmt.value]}-ws{source_token}"
+    return canonical_season_id(token, fmt)
 
 
 @dataclass(frozen=True, order=True)

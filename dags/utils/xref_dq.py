@@ -887,10 +887,11 @@ def report_orphan_teams(
 # Cross-source DOB conflicts (companion to the resolver's name_team_dob tier)
 # ---------------------------------------------------------------------------
 
-#: Source DOB projections: (source, SQL yielding (source_id, dob)). Most read
-#: Bronze; WhoScored uses its manifest-backed Silver current view, which has no
-#: xref dependency and therefore does not introduce a resolver cycle. Trino
-#: dialect; tests inject DuckDB-compatible projections instead.
+#: Source DOB projections: (source, SQL yielding (source_id, dob)). Raw Bronze
+#: is used where it is the stable contract. WhoScored uses its manifest-backed
+#: current view; Transfermarkt uses its state-selected canonical reader. Neither
+#: reader depends on xref_player, so these projections introduce no cycle.
+#: Trino dialect; tests inject DuckDB-compatible projections instead.
 DEFAULT_PLAYER_DOB_PROJECTIONS = (
     ('fotmob',
      "SELECT CAST(player_id AS varchar) AS source_id, "
@@ -904,8 +905,9 @@ DEFAULT_PLAYER_DOB_PROJECTIONS = (
      "GROUP BY CAST(player_id AS varchar)"),
     ('transfermarkt',
      "SELECT CAST(player_id AS varchar) AS source_id, "
-     "max_by(dob, _ingested_at) AS dob "
-     "FROM iceberg.bronze.transfermarkt_players WHERE player_id IS NOT NULL "
+     "max_by(dob, _bronze_ingested_at) AS dob "
+     "FROM iceberg.silver.transfermarkt_players "
+     "WHERE player_id IS NOT NULL "
      "GROUP BY CAST(player_id AS varchar)"),
     ('sofifa',
      "SELECT CAST(player_id AS varchar) AS source_id, "
@@ -1016,9 +1018,10 @@ def evaluate_manager_dob_collisions(
     the reviewer sees which tier produced the link). Candidates for a
     ``manager_aliases.yaml`` correction.
 
-    Reads the two profile silver tables (not Bronze): unlike the player DOB
-    maps this is NOT circular — fotmob_manager_profile / transfermarkt_coaches
-    do not consume xref_manager.
+    Reads stable canonical Silver readers, never a physical ``_v2`` table.
+    The state-selected Transfermarkt v2 compatibility adapter retains the
+    legacy-shaped (coach_id, league, season) contract required by this scoped
+    comparison. Neither profile reader consumes xref_manager.
 
     Returns ``{'collisions': N, 'rows': [...≤limit], 'truncated': bool,
     'verdict': 'OK'|'WARNING'}`` — never escalates to ERROR.

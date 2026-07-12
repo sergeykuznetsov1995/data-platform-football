@@ -6,6 +6,40 @@ parsing — the runtime imports nodriver / BeautifulSoup lazily inside
 ``TransfermarktScraper.read_*`` methods.
 """
 
-from scrapers.transfermarkt.scraper import TransfermarktScraper
+from scrapers.transfermarkt.models import (
+    FetchOutcome,
+    FetchStatus,
+    ProxyRequiredError,
+    TrafficBudgetExceeded,
+)
+from scrapers.transfermarkt.scraper import (
+    TransfermarktScraper,
+    materialize_legacy_coaches,
+    materialize_legacy_market_value_history,
+    materialize_legacy_players,
+    materialize_legacy_transfers,
+)
+from scrapers.transfermarkt.registry import (
+    CompetitionRecord,
+    CrawlScope,
+    EditionRecord,
+    RegistrySnapshot,
+    SeasonFormat,
+)
 
-__all__ = ['TransfermarktScraper']
+__all__ = [
+    'FetchOutcome',
+    'FetchStatus',
+    'ProxyRequiredError',
+    'TrafficBudgetExceeded',
+    'CompetitionRecord',
+    'CrawlScope',
+    'EditionRecord',
+    'RegistrySnapshot',
+    'SeasonFormat',
+    'TransfermarktScraper',
+    'materialize_legacy_coaches',
+    'materialize_legacy_market_value_history',
+    'materialize_legacy_players',
+    'materialize_legacy_transfers',
+]

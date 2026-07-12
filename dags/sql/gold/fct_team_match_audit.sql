@@ -199,7 +199,7 @@ ws_team_name_bridge AS (
         home_team                                     AS ws_team_name,
         league,
         season
-    FROM iceberg.bronze.whoscored_schedule
+    FROM iceberg.bronze.whoscored_schedule_current
     WHERE home_team_id IS NOT NULL
 
     UNION
@@ -209,7 +209,7 @@ ws_team_name_bridge AS (
         away_team,
         league,
         season
-    FROM iceberg.bronze.whoscored_schedule
+    FROM iceberg.bronze.whoscored_schedule_current
     WHERE away_team_id IS NOT NULL
 )
 

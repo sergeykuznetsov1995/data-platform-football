@@ -46,14 +46,13 @@ NOTE: As of 2025-2026, FBref uses Cloudflare Turnstile CAPTCHA.
       Only nodriver with cf-verify plugin can bypass this automatically.
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from airflow import DAG
 from airflow.models.param import Param
 from airflow.operators.python import PythonOperator, ShortCircuitOperator
 from airflow.utils.task_group import TaskGroup
 from airflow.operators.empty import EmptyOperator
-from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 
 from utils.config import LEAGUES, CURRENT_SEASON, SCHEDULES, DAG_TAGS
 from utils.default_args import SELENIUM_ARGS
@@ -561,17 +560,19 @@ with DAG(
     )
 
     # =========================================================================
-    # Trigger Silver DAG after ingestion completes
+    # Terminal fail-closed gate. report_proxy_traffic intentionally uses
+    # all_done so it can observe failed runs; without this all_success leaf,
+    # that observer could make a failed producer/validation path look green.
+    # Silver/Gold publication is owned exclusively by dag_master_pipeline.
     # =========================================================================
-    trigger_silver = TriggerDagRunOperator(
-        task_id='trigger_silver_transform',
-        trigger_dag_id='dag_transform_fbref_silver',
-        wait_for_completion=False,
-        reset_dag_run=True,
+    ingest_complete = EmptyOperator(
+        task_id='ingest_complete',
+        trigger_rule='all_success',
     )
 
     # =========================================================================
-    # Dependencies: Start -> Gate -> Season Stats -> Match Data -> Validate -> Report -> Trigger Silver
+    # Dependencies: Start -> Gate -> Season Stats -> Match Data -> Validate
+    # -> Report -> fail-closed terminal gate.
     # Sequential execution to prevent OOM
     # =========================================================================
     start >> gate_scrape >> season_stats_task
@@ -584,4 +585,4 @@ with DAG(
         [_match_task_t, _traffic_guard_t] >> validate_task
 
     validate_task >> report_traffic
-    [validate_task, report_traffic] >> trigger_silver
+    [validate_task, report_traffic] >> ingest_complete

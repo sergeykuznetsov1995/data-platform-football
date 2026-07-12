@@ -22,8 +22,10 @@
 -- =============================================================================
 --   event_id              varchar     source-backed stable id for v2 rows;
 --                                     legacy fallback = game_id || '_' || seq
---   source_event_id_raw   varchar     original WhoScored/Opta event id
---   related_event_id_raw  varchar     original related Opta event id
+--   source_event_id_raw   varchar     global Opta `id` from matchCentreData
+--   team_event_id_raw     varchar     team-local Opta `eventId` sequence
+--   related_team_event_id_raw varchar  raw team-local `relatedEventId`; this is
+--                                     not a FK to source_event_id_raw
 --   match_id              varchar     CAST(game_id AS varchar)
 --   team_id_raw           varchar     bronze team_id (NOT resolved via xref —
 --                                     that is a Gold-job concern)
@@ -192,7 +194,8 @@
 --   * Bronze current view exposes only successful logical commits. The V2
 --     migration already collapsed legacy re-scrape duplicates on the complete
 --     event natural key before seeding one successful manifest batch per game;
---     new V2 commits reject duplicate source_event_id values before writing.
+--     new V2 commits require source_event_id = raw Opta `id`, reject duplicate
+--     global IDs and retain the distinct team-local `eventId` separately.
 --     Silver therefore preserves that strict-current row set one-for-one.
 --     Repeating the dedup here used a 20-column ROW_NUMBER partition key
 --     (including qualifiers JSON) and exhausted Trino's 8.3 GB heap at 28M
@@ -203,8 +206,8 @@
 -- =============================================================================
 -- Verification status
 -- =============================================================================
---   * Bronze schema verified via DESCRIBE on 2026-05-08 (33 cols, type list
---     above matches).
+--   * Legacy Bronze schema verified via DESCRIBE on 2026-07-12; V2 adds the
+--     explicit global/team-local event identity fields described above.
 --   * 39 distinct `type` values verified; all 39 covered in CASE tree.
 --   * v2 event_id = 'ws:' || game_id || ':' || source_event_id. Historical
 --     rows with source_event_id=NULL retain the established game-local
@@ -223,6 +226,7 @@ WITH seq AS (
     SELECT
         game_id,
         source_event_id,
+        team_event_id,
         period,
         minute,
         second,
@@ -236,7 +240,7 @@ WITH seq AS (
         end_x,
         end_y,
         qualifiers,
-        related_event_id,
+        related_team_event_id,
         related_player_id,
         team,
         league,
@@ -274,7 +278,7 @@ WITH seq AS (
                                     period, minute, second, expanded_minute,
                                     type, outcome_type, team_id, player_id,
                                     x, y, end_x, end_y, qualifiers,
-                                    related_event_id, related_player_id, team
+                                    related_team_event_id, related_player_id, team
                                 ) AS JSON
                             )
                         )
@@ -298,7 +302,8 @@ SELECT
     -- Keep the source relationship explicit instead of forcing consumers to
     -- parse the canonical event_id string.
     CAST(source_event_id AS varchar)                          AS source_event_id_raw,
-    CAST(related_event_id AS varchar)                         AS related_event_id_raw,
+    CAST(team_event_id AS varchar)                            AS team_event_id_raw,
+    CAST(related_team_event_id AS varchar)                    AS related_team_event_id_raw,
 
     -- ========= Raw entity references (resolved in Gold via xref) =========
     -- bronze stores team_id / player_id as DOUBLE; direct CAST to varchar

@@ -1,0 +1,16 @@
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.transfermarkt_transfer_events
+  description: |
+    Global Transfermarkt career transfer events. Grain is
+    (player_id, transfer_id). event_season belongs to the event, not the scrape
+    window; upcoming rows without transfer_date remain valid facts.
+  tags: [Tier.Bronze, Domain.Football, PII.Low]
+columns:
+  - name: transfer_id
+    description: Upstream id or stable payload hash; global Gold event key.
+  - name: player_id
+    description: Global Transfermarkt player id.
+  - name: transfer_date
+    description: Event date; nullable for an undated upcoming transfer.
+  - name: event_season
+    description: Normalized event-season slug such as 2526.

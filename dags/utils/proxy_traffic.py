@@ -14,13 +14,16 @@ scrapers adds ~1.5 GB to the task).
 from __future__ import annotations
 
 import glob
+import importlib
 import json
 import logging
 from collections import defaultdict
-from typing import Any, Dict, List
+from decimal import Decimal, InvalidOperation
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
+MIB = 1024 * 1024
 
 
 def _host_of(url: str) -> str:
@@ -88,19 +91,72 @@ def summarize_fbref_traffic(
     }
 
 
-def summarize_result_traffic(source: str, traffic: Dict[str, Any]) -> Dict[str, Any]:
+def _first_present(mapping: Dict[str, Any], keys: List[str]) -> Any:
+    """Return the first explicitly present, non-None value (zero is valid)."""
+    for key in keys:
+        if key in mapping and mapping[key] is not None:
+            return mapping[key]
+    return None
+
+
+def summarize_result_traffic(
+    source: str,
+    traffic: Dict[str, Any],
+    entity: str = None,
+    run_key: str = None,
+) -> Dict[str, Any]:
     """Normalize a scraper's ``traffic`` dict into a run-level summary.
 
-    Used by the FlareSolverr (``get_traffic_stats`` → ``fs_response_mb``) and
-    tls_requests (``proxy_response_mb``) scrapers, which ship one ``traffic``
-    dict in their run-result JSON. Tolerates either MB key; merges
-    ``top_traffic_urls`` by host when present.
+    Raw decoded-body bytes are authoritative when supplied.  Older scrapers
+    that only expose an MB counter remain reportable, but are explicitly
+    labelled non-authoritative so paid-traffic guards can fail closed instead
+    of comparing rounded values.
     """
     traffic = traffic or {}
-    total_mb = float(
-        traffic.get("proxy_response_mb")
-        or traffic.get("fs_response_mb")
-        or 0.0
+    decoded_bytes_raw = _first_present(
+        traffic,
+        [
+            "decoded_response_body_bytes",
+            "proxy_response_bytes",  # tls_requests compatibility alias
+            "fs_response_bytes",     # FlareSolverr compatibility alias
+        ],
+    )
+    decoded_mb_raw = _first_present(
+        traffic,
+        [
+            "decoded_response_body_mb",
+            "proxy_response_mb",
+            "fs_response_mb",
+        ],
+    )
+    decoded_bytes: Optional[int] = None
+    decoded_bytes_authoritative = False
+    if decoded_bytes_raw is not None:
+        try:
+            decoded_bytes = int(decoded_bytes_raw)
+        except (TypeError, ValueError, OverflowError):
+            decoded_bytes = None
+        else:
+            if decoded_bytes < 0:
+                decoded_bytes = None
+            else:
+                decoded_bytes_authoritative = True
+    elif decoded_mb_raw is not None:
+        try:
+            decoded_bytes = int(Decimal(str(decoded_mb_raw)) * MIB)
+        except (InvalidOperation, TypeError, ValueError, OverflowError):
+            decoded_bytes = None
+
+    telemetry_available = bool(
+        traffic.get("telemetry_available", decoded_bytes is not None)
+    ) and decoded_bytes is not None
+    total_mb = decoded_bytes / MIB if telemetry_available else None
+    wire_raw = _first_present(
+        traffic,
+        [
+            "estimated_wire_response_mb", "wire_mb", "proxy_wire_mb",
+            "real_proxy_mb",
+        ],
     )
     domain_mb: Dict[str, float] = defaultdict(float)
     for row in traffic.get("top_traffic_urls") or []:
@@ -111,7 +167,31 @@ def summarize_result_traffic(source: str, traffic: Dict[str, Any]) -> Dict[str, 
             domain_mb[host] += _row_mb(row)
     return {
         "source": source,
-        "total_mb": round(total_mb, 2),
+        "entity": entity or str(traffic.get("entity") or ""),
+        "run_key": run_key or str(traffic.get("run_key") or ""),
+        "total_mb": round(total_mb, 4) if total_mb is not None else None,
+        "decoded_response_body_bytes": (
+            decoded_bytes if telemetry_available else None
+        ),
+        "decoded_response_body_mb": (
+            total_mb if total_mb is not None else None
+        ),
+        "decoded_bytes_authoritative": decoded_bytes_authoritative,
+        "wire_mb": round(float(wire_raw), 4) if wire_raw is not None else None,
+        "estimated_wire_response_mb": (
+            round(float(wire_raw), 4) if wire_raw is not None else None
+        ),
+        "requests": int(
+            _first_present(traffic, ["network_fetches", "requests"]) or 0
+        ),
+        "retries": int(traffic.get("retries") or 0),
+        "failures": int(
+            _first_present(traffic, ["failures", "failed_attempts"]) or 0
+        ),
+        "failed_attempts": int(
+            _first_present(traffic, ["failed_attempts", "failures"]) or 0
+        ),
+        "telemetry_available": telemetry_available,
         "top_domains": top_domains(domain_mb),
         "files_read": 1,
     }
@@ -122,8 +202,9 @@ def check_result_traffic_guard(
     threshold_variable: str = "tm_proxy_mb_threshold",
     default_thresholds: Dict[str, float] = None,
     default_threshold_mb: float = 50.0,
+    cycle_budget_bytes: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Per-entity residential-MB kill-switch over run-result JSONs.
+    """Exact decoded-byte kill-switch over run-result JSONs.
 
     Mirrors the FBref guard (``utils.fbref_callbacks.check_traffic_guard``)
     for scrapers that ship one ``traffic`` dict in their run-result JSON
@@ -132,11 +213,9 @@ def check_result_traffic_guard(
     Variable ``<threshold_variable>`` → ``default_thresholds[entity]`` →
     ``default_threshold_mb``.
 
-    A missing/unreadable result file is a warning, not a failure — the
-    scrape task itself is red in that case. A breach raises
-    AirflowException: the pool bills ~$4/GB, so crossing the budget must
-    be loud (an exhausted/burned proxy pool retrying 403 pages is exactly
-    the failure mode this catches).
+    Missing/corrupt result files, absent counters, and legacy rounded-only
+    counters fail closed.  ``cycle_budget_bytes`` optionally adds a shared cap
+    across all entity subprocesses without weakening their individual caps.
     """
     from airflow.exceptions import AirflowException
     from airflow.models import Variable
@@ -144,38 +223,116 @@ def check_result_traffic_guard(
     default_thresholds = default_thresholds or {}
     checked: Dict[str, Any] = {}
     breaches: List[str] = []
+    telemetry_errors: List[str] = []
+    cycle_decoded_bytes = 0
+    cycle_accounted_samples: List[int] = []
     for entity, path in entity_paths.items():
         try:
             with open(path) as fh:
                 result = json.load(fh)
         except (OSError, json.JSONDecodeError) as exc:
-            logger.warning(
-                "traffic guard: skipping %s — unreadable %s: %s",
-                entity, path, exc,
-            )
+            logger.error("traffic guard: %s unreadable %s: %s", entity, path, exc)
+            telemetry_errors.append(f"{entity}: result telemetry unreadable")
             continue
-        traffic = (result or {}).get("traffic") or {}
-        mb = float(
-            traffic.get("proxy_response_mb")
-            or traffic.get("fs_response_mb")
-            or 0.0
+        if not isinstance(result, dict) or not isinstance(result.get("traffic"), dict):
+            telemetry_errors.append(f"{entity}: traffic block missing")
+            continue
+        traffic = result["traffic"]
+        summary = summarize_result_traffic(
+            "transfermarkt", traffic, entity=entity,
+            run_key=str(result.get("run_key") or ""),
         )
+        if not summary["telemetry_available"]:
+            telemetry_errors.append(f"{entity}: decoded-byte telemetry missing")
+            continue
+        if not summary["decoded_bytes_authoritative"]:
+            telemetry_errors.append(f"{entity}: raw decoded-byte telemetry missing")
+            continue
+        decoded_bytes = int(summary["decoded_response_body_bytes"])
+        cycle_decoded_bytes += decoded_bytes
+        cycle_evidence = result.get('cycle_budget')
+        if isinstance(cycle_evidence, dict):
+            raw_accounted = cycle_evidence.get('accounted_after_bytes')
+            raw_limit = cycle_evidence.get('limit_bytes')
+            try:
+                accounted = int(raw_accounted)
+                evidence_limit = int(raw_limit)
+            except (TypeError, ValueError, OverflowError):
+                telemetry_errors.append(
+                    f"{entity}: cumulative cycle ledger evidence invalid"
+                )
+            else:
+                if accounted < 0:
+                    telemetry_errors.append(
+                        f"{entity}: cumulative cycle ledger evidence invalid"
+                    )
+                elif (
+                    cycle_budget_bytes is not None
+                    and evidence_limit != int(cycle_budget_bytes)
+                ):
+                    telemetry_errors.append(
+                        f"{entity}: cycle ledger limit mismatch"
+                    )
+                else:
+                    cycle_accounted_samples.append(accounted)
+        mb = decoded_bytes / MIB
         raw = Variable.get(f"{threshold_variable}_{entity}", default_var=None)
         if raw is None:
             raw = Variable.get(threshold_variable, default_var=None)
-        if raw is not None:
-            threshold = float(raw)
-        else:
-            threshold = float(
-                default_thresholds.get(entity, default_threshold_mb)
-            )
+        try:
+            if raw is not None:
+                threshold_decimal = Decimal(str(raw))
+            else:
+                threshold_decimal = Decimal(
+                    str(default_thresholds.get(entity, default_threshold_mb))
+                )
+        except (InvalidOperation, TypeError, ValueError):
+            telemetry_errors.append(f"{entity}: invalid byte threshold")
+            continue
+        if not threshold_decimal.is_finite() or threshold_decimal < 0:
+            telemetry_errors.append(f"{entity}: invalid byte threshold")
+            continue
+        threshold_bytes = int(threshold_decimal * MIB)
+        threshold = float(threshold_decimal)
         checked[entity] = {"mb": round(mb, 2), "threshold_mb": threshold}
         logger.info(
-            "traffic guard: %s spent %.2f MB (threshold %.0f MB)",
-            entity, mb, threshold,
+            "traffic guard: %s spent %d bytes (%.4f MiB; threshold %d bytes)",
+            entity, decoded_bytes, mb, threshold_bytes,
         )
-        if mb > threshold:
-            breaches.append(f"{entity}: {mb:.2f} MB > {threshold:.0f} MB")
+        if decoded_bytes > threshold_bytes:
+            breaches.append(
+                f"{entity}: {mb:.2f} MB ({decoded_bytes} bytes) > "
+                f"{threshold:g} MB ({threshold_bytes} bytes)"
+            )
+    if cycle_budget_bytes is not None:
+        try:
+            cycle_cap = int(cycle_budget_bytes)
+        except (TypeError, ValueError, OverflowError):
+            telemetry_errors.append("cycle: invalid decoded-byte threshold")
+        else:
+            if cycle_cap < 0:
+                telemetry_errors.append("cycle: invalid decoded-byte threshold")
+            else:
+                # Result paths are overwritten on a manual rerun. The
+                # reservation ledger is cumulative and survives retries, so
+                # its largest settled/accounted observation is authoritative
+                # whenever present; raw per-file summing remains a fallback
+                # for older producers.
+                effective_cycle_bytes = max(
+                    [cycle_decoded_bytes, *cycle_accounted_samples]
+                )
+            if cycle_cap >= 0 and effective_cycle_bytes > cycle_cap:
+                breaches.append(
+                    "cycle: "
+                    f"{effective_cycle_bytes / MIB:.4f} MiB "
+                    f"({effective_cycle_bytes} bytes) > "
+                    f"{cycle_cap / MIB:.4f} MiB ({cycle_cap} bytes)"
+                )
+    if telemetry_errors:
+        raise AirflowException(
+            "residential proxy telemetry unavailable — "
+            + "; ".join(telemetry_errors)
+        )
     if breaches:
         raise AirflowException(
             "residential proxy budget exceeded — " + "; ".join(breaches)
@@ -190,7 +347,11 @@ def log_traffic_summary(summary: Dict[str, Any]) -> None:
     ``grep`` away in the Airflow logs.
     """
     source = summary.get("source", "unknown")
-    total_mb = float(summary.get("total_mb") or 0.0)
+    total_raw = summary.get("total_mb")
+    if total_raw is None:
+        logger.error("PROXY_TRAFFIC source=%s total=UNKNOWN", source)
+        return
+    total_mb = float(total_raw)
     top = summary.get("top_domains") or []
     top_str = ", ".join(f"{d['host']} {d['mb']} MB" for d in top) or "—"
     logger.info(
@@ -215,6 +376,14 @@ OPS_SCHEMA = "iceberg.ops"
 OPS_TABLE = "iceberg.ops.proxy_traffic_runs"
 
 
+def _silver_tasks_module():
+    """Resolve imports in Airflow and standalone/package execution modes."""
+    try:
+        return importlib.import_module("utils.silver_tasks")
+    except ImportError:
+        return importlib.import_module("dags.utils.silver_tasks")
+
+
 def _sql_str(value: Any) -> str:
     """Quote a value as a Trino string literal, escaping embedded single quotes."""
     return "'" + str(value if value is not None else "").replace("'", "''") + "'"
@@ -232,7 +401,7 @@ def ensure_ops_table(conn) -> None:
     ``feedback_gold_permissions``. That one-time container step is in the PR
     test plan; the SQL below is the runtime half.
     """
-    from utils.silver_tasks import _execute
+    _execute = _silver_tasks_module()._execute
 
     _execute(conn, f"CREATE SCHEMA IF NOT EXISTS {OPS_SCHEMA}")
     _execute(
@@ -243,9 +412,38 @@ def ensure_ops_table(conn) -> None:
         "source varchar, "
         "dag_run_id varchar, "
         "total_mb double, "
-        "top_domains varchar"
+        "top_domains varchar, "
+        "entity varchar, "
+        "run_key varchar, "
+        "request_count bigint, "
+        "retry_count bigint, "
+        "failure_count bigint, "
+        "failed_attempt_count bigint, "
+        "decoded_response_body_bytes bigint, "
+        "decoded_response_body_mb double, "
+        "wire_mb double, "
+        "estimated_wire_response_mb double"
         ") WITH (partitioning = ARRAY['run_date'])",
     )
+    # Existing deployments predate the detailed counters. Iceberg/Trino DDL is
+    # additive and idempotent, so rolling out the runner does not require a
+    # destructive migration or table rewrite.
+    for column, sql_type in (
+        ("entity", "varchar"),
+        ("run_key", "varchar"),
+        ("request_count", "bigint"),
+        ("retry_count", "bigint"),
+        ("failure_count", "bigint"),
+        ("failed_attempt_count", "bigint"),
+        ("decoded_response_body_bytes", "bigint"),
+        ("decoded_response_body_mb", "double"),
+        ("wire_mb", "double"),
+        ("estimated_wire_response_mb", "double"),
+    ):
+        _execute(
+            conn,
+            f"ALTER TABLE {OPS_TABLE} ADD COLUMN IF NOT EXISTS {column} {sql_type}",
+        )
 
 
 def record_traffic_run(
@@ -266,7 +464,9 @@ def record_traffic_run(
 
     own_conn = False
     try:
-        from utils.silver_tasks import _execute, _get_trino_connection
+        silver_tasks = _silver_tasks_module()
+        _execute = silver_tasks._execute
+        _get_trino_connection = silver_tasks._get_trino_connection
 
         if conn is None:
             conn = _get_trino_connection()
@@ -275,7 +475,19 @@ def record_traffic_run(
         ensure_ops_table(conn)
 
         source = str(summary.get("source") or "unknown")
-        total_mb = float(summary.get("total_mb") or 0.0)
+        if not summary.get("telemetry_available", summary.get("total_mb") is not None):
+            raise ValueError("decoded proxy traffic telemetry is unavailable")
+        total_mb = float(summary["total_mb"])
+        decoded_bytes = summary.get("decoded_response_body_bytes")
+        decoded_mb = summary.get("decoded_response_body_mb")
+        wire_mb = summary.get("wire_mb")
+        estimated_wire_mb = summary.get("estimated_wire_response_mb")
+        entity = str(summary.get("entity") or "")
+        run_key = str(summary.get("run_key") or "")
+        requests = int(summary.get("requests") or 0)
+        retries = int(summary.get("retries") or 0)
+        failures = int(summary.get("failures") or 0)
+        failed_attempts = int(summary.get("failed_attempts") or failures)
         top = summary.get("top_domains") or []
         top_str = ", ".join(
             f"{d.get('host')}={d.get('mb')}" for d in top if d.get("host")
@@ -287,10 +499,20 @@ def record_traffic_run(
         _execute(
             conn,
             f"INSERT INTO {OPS_TABLE} "
-            "(run_ts, run_date, source, dag_run_id, total_mb, top_domains) VALUES ("
+            "(run_ts, run_date, source, dag_run_id, total_mb, top_domains, "
+            "entity, run_key, request_count, retry_count, failure_count, "
+            "failed_attempt_count, decoded_response_body_bytes, "
+            "decoded_response_body_mb, wire_mb, "
+            "estimated_wire_response_mb) VALUES ("
             f"TIMESTAMP '{run_ts}', DATE '{run_date}', "
             f"{_sql_str(source)}, {_sql_str(dag_run_id)}, "
-            f"{total_mb}, {_sql_str(top_str)})",
+            f"{total_mb}, {_sql_str(top_str)}, {_sql_str(entity)}, "
+            f"{_sql_str(run_key)}, {requests}, {retries}, {failures}, "
+            f"{failed_attempts}, "
+            f"{int(decoded_bytes) if decoded_bytes is not None else 'NULL'}, "
+            f"{float(decoded_mb) if decoded_mb is not None else 'NULL'}, "
+            f"{float(wire_mb) if wire_mb is not None else 'NULL'}, "
+            f"{float(estimated_wire_mb) if estimated_wire_mb is not None else 'NULL'})",
         )
         logger.info(
             "PROXY_TRAFFIC persisted source=%s total=%.2f MB run=%s",
@@ -319,13 +541,15 @@ def daily_rollup(conn) -> Dict[str, Any]:
     ``{total_mb, total_gb, by_source: [{source, mb, gb, runs}], report}`` where
     ``report`` is the human line the daily DAG logs.
     """
-    from utils.silver_tasks import _execute
+    _execute = _silver_tasks_module()._execute
 
     ensure_ops_table(conn)
     rows = (
         _execute(
             conn,
-            "SELECT source, sum(total_mb) AS mb, count(*) AS runs "
+            "SELECT source, sum(COALESCE("
+            f"CAST(decoded_response_body_bytes AS double) / {MIB}.0, "
+            "total_mb)) AS mb, count(*) AS runs "
             f"FROM {OPS_TABLE} "
             "WHERE run_date = current_date - INTERVAL '1' DAY "
             "GROUP BY source ORDER BY mb DESC",
@@ -336,13 +560,13 @@ def daily_rollup(conn) -> Dict[str, Any]:
     by_source = [
         {
             "source": r[0],
-            "mb": round(float(r[1] or 0.0), 2),
+            "mb": round(float(r[1] or 0.0), 4),
             "gb": round(float(r[1] or 0.0) / 1024, 3),
             "runs": int(r[2] or 0),
         }
         for r in rows
     ]
-    total_mb = round(sum(s["mb"] for s in by_source), 2)
+    total_mb = round(sum(float(r[1] or 0.0) for r in rows), 4)
     parts = ", ".join(f"{s['source']} {s['gb']} GB" for s in by_source) or "—"
     report = f"вчера прокси съели {round(total_mb / 1024, 3)} GB ({total_mb} MB): {parts}"
     return {

@@ -1,0 +1,12 @@
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.transfermarkt_coach_profiles
+  description: Global immutable Transfermarkt coach profiles, one row per coach_id.
+  tags: [Tier.Bronze, Domain.Football, PII.Low]
+columns:
+  - name: coach_id
+    description: Global Transfermarkt coach id; natural key.
+  - name: dob
+    description: Coach date of birth.
+    tags: [PII.Low]
+  - name: nationality
+    description: Coach nationality.

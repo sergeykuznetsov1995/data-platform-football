@@ -284,3 +284,73 @@ class TestOpenMetadataIngestionYaml:
         assert any("bronze" in s for s in schema_inc)
         assert any("silver" in s for s in schema_inc)
         assert any("gold" in s for s in schema_inc)
+
+
+# ---------------------------------------------------------------------------
+# 5. OpenMetadata auth env — break-glass defaults (#866)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestOpenMetadataAuthEnv:
+    """SSO включается только через .env; пустой .env обязан давать basic-режим.
+
+    Дефолты ${VAR:-…} в anchor'е — это break-glass: закомментировал OM_AUTH_*
+    в .env → OM вернулся к basic-логину, бот-JWT продолжает валидироваться.
+    """
+
+    OM_SERVICES = ("openmetadata-migrate", "openmetadata-server")
+
+    @staticmethod
+    def _services() -> dict:
+        with COMPOSE_FILE.open("r", encoding="utf-8") as fh:
+            return yaml.safe_load(fh)["services"]
+
+    def test_break_glass_defaults_are_basic_mode(self):
+        # (env-ключ, дефолт при пустом .env) — дефолты = сегодняшний basic-режим
+        expected = {
+            "AUTHENTICATION_PROVIDER": "${OM_AUTH_PROVIDER:-basic}",
+            "AUTHENTICATION_CLIENT_TYPE": "${OM_AUTH_CLIENT_TYPE:-public}",
+            "OIDC_CLIENT_SECRET": "${OPENMETADATA_OIDC_CLIENT_SECRET:-}",
+            "AUTHORIZER_ADMIN_PRINCIPALS": "${OM_ADMIN_PRINCIPALS:-[admin]}",
+        }
+        services = self._services()
+        for name in self.OM_SERVICES:
+            env = services[name]["environment"]
+            for key, raw in expected.items():
+                assert env[key] == raw, f"{name}.{key}: {env.get(key)!r}"
+
+    def test_public_keys_default_keeps_om_own_jwks(self):
+        # Иначе break-glass/дефолтный запуск ломает валидацию бот-JWT.
+        services = self._services()
+        for name in self.OM_SERVICES:
+            keys = services[name]["environment"]["AUTHENTICATION_PUBLIC_KEYS"]
+            assert "api/v1/system/config/jwks" in keys, f"{name}: {keys!r}"
+
+    def test_jwt_key_paths_default_to_image_bundled_keys(self):
+        # Пустой .env = ключи образа (dev-стек поднимается без подготовки);
+        # прод обязан переопределить OM_RSA_* (см. gen_om_jwt_keys.sh).
+        services = self._services()
+        for name in self.OM_SERVICES:
+            env = services[name]["environment"]
+            assert env["RSA_PUBLIC_KEY_FILE_PATH"] == (
+                "${OM_RSA_PUBLIC_KEY_FILE_PATH:-./conf/public_key.der}"
+            )
+            assert env["RSA_PRIVATE_KEY_FILE_PATH"] == (
+                "${OM_RSA_PRIVATE_KEY_FILE_PATH:-./conf/private_key.der}"
+            )
+
+    def test_jwtkeys_volume_mounted_read_only_in_both_services(self):
+        # migrate парсит тот же openmetadata.yaml → ключи нужны обоим.
+        services = self._services()
+        for name in self.OM_SERVICES:
+            assert (
+                "./configs/openmetadata/jwtkeys:/etc/openmetadata/jwtkeys:ro"
+                in services[name].get("volumes", [])
+            ), f"{name}: jwtkeys volume missing"
+
+    def test_ingestion_bot_principal_untouched(self):
+        services = self._services()
+        for name in self.OM_SERVICES:
+            env = services[name]["environment"]
+            assert env["AUTHORIZER_INGESTION_PRINCIPALS"] == "[ingestion-bot]"
