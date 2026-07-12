@@ -356,12 +356,12 @@ class SofaScoreCatalog:
                 year = _required_string(
                     raw_season.get("year"), f"{season_prefix}.year"
                 )
-                previous = seen_years.get(year)
-                if previous is not None and previous != season_id:
-                    raise CatalogError(
-                        f"{prefix} has ambiguous year {year!r}"
-                    )
-                seen_years[year] = season_id
+                # Parallel divisions share one year label (tournament 65 ships
+                # "2nd Division East 14/15" and "... West 14/15"). Both are real
+                # source seasons, so loading the registry must not reject them.
+                # resolve_source_season still fails closed when a token cannot
+                # name exactly one season.
+                seen_years.setdefault(year, season_id)
                 season_format = _required_string(
                     raw_season.get("season_format"),
                     f"{season_prefix}.season_format",
