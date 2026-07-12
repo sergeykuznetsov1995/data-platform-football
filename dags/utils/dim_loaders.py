@@ -256,16 +256,35 @@ def render_dim_match_sql(template_path: str, out_path: str) -> str:
     Fills ``{{ venue_aliases_values_sql }}`` with the SAME tuples as
     ``render_dim_venue_sql`` so the inline venue_id resolution in dim_match
     is byte-identical to dim_venue's PK (a JOIN on gold.dim_venue is not an
-    option: the slim dim no longer carries raw alias spellings).
+    option: the slim dim no longer carries raw alias spellings). It also fills
+    ``{{ in_scope_competition_seasons_values_sql }}`` from the exact
+    ``in_scope=true`` competition/season pairs. FBref Silver may contain every
+    discovered men's competition, while the existing Gold star remains a
+    backward-compatible configured subset.
     """
     from utils.medallion_config import (
+        _escape_sql_string,
         get_venue_alias_sql_values,
+        load_competitions,
         render_sql_template,
     )
+
+    scope_rows = [
+        "(" + ", ".join((
+            f"'{_escape_sql_string(competition['id'])}'",
+            f"'{int(season['id']):04d}'",
+        )) + ")"
+        for competition in load_competitions()['competitions']
+        if competition.get('in_scope')
+        for season in (competition.get('seasons') or [])
+    ]
+    if not scope_rows:
+        raise ValueError("dim_match requires at least one in-scope season")
 
     rendered = render_sql_template(
         Path(template_path),
         venue_aliases_values_sql=get_venue_alias_sql_values(),
+        in_scope_competition_seasons_values_sql=',\n        '.join(scope_rows),
     )
     Path(out_path).write_text(rendered)
     return out_path

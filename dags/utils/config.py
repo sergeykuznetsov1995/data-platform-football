@@ -97,7 +97,7 @@ SOFIFA_VERSIONS: str = 'latest'
 
 # DAG schedule configuration (cron format, UTC)
 SCHEDULES: Dict[str, Optional[str]] = {
-    'dag_ingest_fbref': '0 6 * * 1',         # 6:00 UTC Monday (weekly)
+    'dag_ingest_fbref': '0 6 * * *',         # 6:00 UTC daily
     'dag_ingest_fotmob': '0 7 * * *',        # 7:00 UTC daily
     'dag_ingest_matchhistory': '0 8 * * *',  # 8:00 UTC daily
     'dag_ingest_understat': '0 9 * * *',     # 9:00 UTC daily

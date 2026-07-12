@@ -25,46 +25,132 @@
 --   * All numeric columns use TRY_CAST to enforce proper types in Silver.
 -- =============================================================================
 
-WITH s AS (
+WITH s_identified AS (
+    SELECT b.*, i.player_id AS resolved_player_id,
+           i.id_resolution AS identity_resolution,
+           i.is_synthetic AS identity_is_synthetic,
+           i.id_evidence_datasets AS identity_evidence_datasets
+    FROM iceberg.bronze.fbref_player_stats b
+    INNER JOIN iceberg.silver.fbref_player_identity i
+        ON  i.league = b.league
+        AND i.season = CASE
+            WHEN REGEXP_LIKE(COALESCE(b.source_season_id, ''), '^\d{4}$')
+                THEN b.source_season_id
+            WHEN REGEXP_LIKE(COALESCE(b.source_season_id, ''), '^\d{4}-\d{4}$')
+                THEN SUBSTR(b.source_season_id, 3, 2)
+                     || SUBSTR(b.source_season_id, 8, 2)
+            WHEN NULLIF(TRIM(b.source_season_id), '') IS NOT NULL
+                THEN TRIM(b.source_season_id)
+            WHEN b.league = 'INT-World Cup'
+                THEN LPAD(CAST(b.season AS varchar), 4, '0')
+            ELSE LPAD(CAST(MOD(b.season, 100) AS varchar), 2, '0')
+                 || LPAD(CAST(MOD(b.season + 1, 100) AS varchar), 2, '0')
+        END
+        AND regexp_replace(regexp_replace(normalize(lower(TRIM(i.player_name)), NFD), '\p{Mn}+', ''), '[^a-z0-9]+', '')
+            = regexp_replace(regexp_replace(normalize(lower(TRIM(b.player)), NFD), '\p{Mn}+', ''), '[^a-z0-9]+', '')
+        AND regexp_replace(regexp_replace(normalize(lower(TRIM(COALESCE(i.team_name, ''))), NFD), '\p{Mn}+', ''), '[^a-z0-9]+', '')
+            = regexp_replace(regexp_replace(normalize(lower(TRIM(COALESCE(b.squad, ''))), NFD), '\p{Mn}+', ''), '[^a-z0-9]+', '')
+        AND ((NULLIF(TRIM(b.player_id), '') IS NOT NULL AND i.player_id = NULLIF(TRIM(b.player_id), ''))
+          OR (NULLIF(TRIM(b.player_id), '') IS NULL AND i.id_resolution <> 'source_native'))
+),
+
+s AS (
     SELECT *,
            ROW_NUMBER() OVER (
-               PARTITION BY player_id, squad, league, season
+               PARTITION BY resolved_player_id, squad, league, season
                ORDER BY _ingested_at DESC, _batch_id DESC
            ) AS rn
-    FROM iceberg.bronze.fbref_player_stats
+    FROM s_identified
+),
+
+sh_identified AS (
+    SELECT b.*, i.player_id AS resolved_player_id
+    FROM iceberg.bronze.fbref_player_shooting b
+    INNER JOIN iceberg.silver.fbref_player_identity i
+        ON  i.league = b.league
+        AND i.season = CASE
+            WHEN REGEXP_LIKE(COALESCE(b.source_season_id, ''), '^\d{4}$') THEN b.source_season_id
+            WHEN REGEXP_LIKE(COALESCE(b.source_season_id, ''), '^\d{4}-\d{4}$') THEN SUBSTR(b.source_season_id, 3, 2) || SUBSTR(b.source_season_id, 8, 2)
+            WHEN NULLIF(TRIM(b.source_season_id), '') IS NOT NULL
+                THEN TRIM(b.source_season_id)
+            WHEN b.league = 'INT-World Cup' THEN LPAD(CAST(b.season AS varchar), 4, '0')
+            ELSE LPAD(CAST(MOD(b.season, 100) AS varchar), 2, '0') || LPAD(CAST(MOD(b.season + 1, 100) AS varchar), 2, '0')
+        END
+        AND regexp_replace(regexp_replace(normalize(lower(TRIM(i.player_name)), NFD), '\p{Mn}+', ''), '[^a-z0-9]+', '') = regexp_replace(regexp_replace(normalize(lower(TRIM(b.player)), NFD), '\p{Mn}+', ''), '[^a-z0-9]+', '')
+        AND regexp_replace(regexp_replace(normalize(lower(TRIM(COALESCE(i.team_name, ''))), NFD), '\p{Mn}+', ''), '[^a-z0-9]+', '') = regexp_replace(regexp_replace(normalize(lower(TRIM(COALESCE(b.squad, ''))), NFD), '\p{Mn}+', ''), '[^a-z0-9]+', '')
+        AND ((NULLIF(TRIM(b.player_id), '') IS NOT NULL AND i.player_id = NULLIF(TRIM(b.player_id), '')) OR (NULLIF(TRIM(b.player_id), '') IS NULL AND i.id_resolution <> 'source_native'))
 ),
 
 sh AS (
     SELECT *,
            ROW_NUMBER() OVER (
-               PARTITION BY player_id, squad, league, season
+               PARTITION BY resolved_player_id, squad, league, season
                ORDER BY _ingested_at DESC, _batch_id DESC
            ) AS rn
-    FROM iceberg.bronze.fbref_player_shooting
+    FROM sh_identified
+),
+
+pl_identified AS (
+    SELECT b.*, i.player_id AS resolved_player_id
+    FROM iceberg.bronze.fbref_player_playingtime b
+    INNER JOIN iceberg.silver.fbref_player_identity i
+        ON  i.league = b.league
+        AND i.season = CASE
+            WHEN REGEXP_LIKE(COALESCE(b.source_season_id, ''), '^\d{4}$') THEN b.source_season_id
+            WHEN REGEXP_LIKE(COALESCE(b.source_season_id, ''), '^\d{4}-\d{4}$') THEN SUBSTR(b.source_season_id, 3, 2) || SUBSTR(b.source_season_id, 8, 2)
+            WHEN NULLIF(TRIM(b.source_season_id), '') IS NOT NULL
+                THEN TRIM(b.source_season_id)
+            WHEN b.league = 'INT-World Cup' THEN LPAD(CAST(b.season AS varchar), 4, '0')
+            ELSE LPAD(CAST(MOD(b.season, 100) AS varchar), 2, '0') || LPAD(CAST(MOD(b.season + 1, 100) AS varchar), 2, '0')
+        END
+        AND regexp_replace(regexp_replace(normalize(lower(TRIM(i.player_name)), NFD), '\p{Mn}+', ''), '[^a-z0-9]+', '') = regexp_replace(regexp_replace(normalize(lower(TRIM(b.player)), NFD), '\p{Mn}+', ''), '[^a-z0-9]+', '')
+        AND regexp_replace(regexp_replace(normalize(lower(TRIM(COALESCE(i.team_name, ''))), NFD), '\p{Mn}+', ''), '[^a-z0-9]+', '') = regexp_replace(regexp_replace(normalize(lower(TRIM(COALESCE(b.squad, ''))), NFD), '\p{Mn}+', ''), '[^a-z0-9]+', '')
+        AND ((NULLIF(TRIM(b.player_id), '') IS NOT NULL AND i.player_id = NULLIF(TRIM(b.player_id), '')) OR (NULLIF(TRIM(b.player_id), '') IS NULL AND i.id_resolution <> 'source_native'))
 ),
 
 pl AS (
     SELECT *,
            ROW_NUMBER() OVER (
-               PARTITION BY player_id, squad, league, season
+               PARTITION BY resolved_player_id, squad, league, season
                ORDER BY _ingested_at DESC, _batch_id DESC
            ) AS rn
-    FROM iceberg.bronze.fbref_player_playingtime
+    FROM pl_identified
+),
+
+mi_identified AS (
+    SELECT b.*, i.player_id AS resolved_player_id
+    FROM iceberg.bronze.fbref_player_misc b
+    INNER JOIN iceberg.silver.fbref_player_identity i
+        ON  i.league = b.league
+        AND i.season = CASE
+            WHEN REGEXP_LIKE(COALESCE(b.source_season_id, ''), '^\d{4}$') THEN b.source_season_id
+            WHEN REGEXP_LIKE(COALESCE(b.source_season_id, ''), '^\d{4}-\d{4}$') THEN SUBSTR(b.source_season_id, 3, 2) || SUBSTR(b.source_season_id, 8, 2)
+            WHEN NULLIF(TRIM(b.source_season_id), '') IS NOT NULL
+                THEN TRIM(b.source_season_id)
+            WHEN b.league = 'INT-World Cup' THEN LPAD(CAST(b.season AS varchar), 4, '0')
+            ELSE LPAD(CAST(MOD(b.season, 100) AS varchar), 2, '0') || LPAD(CAST(MOD(b.season + 1, 100) AS varchar), 2, '0')
+        END
+        AND regexp_replace(regexp_replace(normalize(lower(TRIM(i.player_name)), NFD), '\p{Mn}+', ''), '[^a-z0-9]+', '') = regexp_replace(regexp_replace(normalize(lower(TRIM(b.player)), NFD), '\p{Mn}+', ''), '[^a-z0-9]+', '')
+        AND regexp_replace(regexp_replace(normalize(lower(TRIM(COALESCE(i.team_name, ''))), NFD), '\p{Mn}+', ''), '[^a-z0-9]+', '') = regexp_replace(regexp_replace(normalize(lower(TRIM(COALESCE(b.squad, ''))), NFD), '\p{Mn}+', ''), '[^a-z0-9]+', '')
+        AND ((NULLIF(TRIM(b.player_id), '') IS NOT NULL AND i.player_id = NULLIF(TRIM(b.player_id), '')) OR (NULLIF(TRIM(b.player_id), '') IS NULL AND i.id_resolution <> 'source_native'))
 ),
 
 mi AS (
     SELECT *,
            ROW_NUMBER() OVER (
-               PARTITION BY player_id, squad, league, season
+               PARTITION BY resolved_player_id, squad, league, season
                ORDER BY _ingested_at DESC, _batch_id DESC
            ) AS rn
-    FROM iceberg.bronze.fbref_player_misc
+    FROM mi_identified
 )
 
 SELECT
     -- ========= Identification (VARCHAR) =========
     s.player,
-    s.player_id,
+    s.resolved_player_id                            AS player_id,
+    s.identity_resolution                           AS player_id_resolution,
+    s.identity_is_synthetic                         AS player_id_is_synthetic,
+    s.identity_evidence_datasets                    AS player_id_evidence_datasets,
     s.nation,
     s.pos,
     s.squad,
@@ -136,35 +222,37 @@ SELECT
     -- JOINs above stay on the native year-start (all intra-FBref), convert once here.
     s.league,
     -- #913 Phase 2
-    CASE WHEN s.league = 'INT-World Cup'
-         THEN LPAD(CAST(s.season AS varchar), 4, '0')
+    CASE
+         WHEN REGEXP_LIKE(COALESCE(s.source_season_id, ''), '^\d{4}$')
+             THEN s.source_season_id
+         WHEN REGEXP_LIKE(COALESCE(s.source_season_id, ''), '^\d{4}-\d{4}$')
+             THEN SUBSTR(s.source_season_id, 3, 2)
+                  || SUBSTR(s.source_season_id, 8, 2)
+         WHEN NULLIF(TRIM(s.source_season_id), '') IS NOT NULL
+             THEN TRIM(s.source_season_id)
+         WHEN s.league = 'INT-World Cup'
+             THEN LPAD(CAST(s.season AS varchar), 4, '0')
          ELSE LPAD(CAST(MOD(s.season, 100) AS varchar), 2, '0')
               || LPAD(CAST(MOD(s.season + 1, 100) AS varchar), 2, '0')
     END AS season
 
 FROM s
 LEFT JOIN sh
-    ON  s.player_id = sh.player_id
+    ON  s.resolved_player_id = sh.resolved_player_id
     AND s.squad     = sh.squad
     AND s.league    = sh.league
     AND s.season    = sh.season
     AND sh.rn       = 1
 LEFT JOIN pl
-    ON  s.player_id = pl.player_id
+    ON  s.resolved_player_id = pl.resolved_player_id
     AND s.squad     = pl.squad
     AND s.league    = pl.league
     AND s.season    = pl.season
     AND pl.rn       = 1
 LEFT JOIN mi
-    ON  s.player_id = mi.player_id
+    ON  s.resolved_player_id = mi.resolved_player_id
     AND s.squad     = mi.squad
     AND s.league    = mi.league
     AND s.season    = mi.season
     AND mi.rn       = 1
 WHERE s.rn = 1
-  -- A handful of bronze rows carry an EMPTY player_id (player row without an
-  -- FBref profile link, e.g. Serie A 16/17 youth one-appearance players).
-  -- The Silver PK is (player_id, squad, league, season) and downstream xref
-  -- joins on player_id — a blank key row is unusable and trips the no_nulls
-  -- DQ gate. Same convention as the other silver player tables.
-  AND NULLIF(s.player_id, '') IS NOT NULL

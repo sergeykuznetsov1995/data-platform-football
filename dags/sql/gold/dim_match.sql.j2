@@ -12,6 +12,13 @@
 --      home_manager_id / away_manager_id -> dim_manager (via xref_manager)
 --      league -> dim_competition; season -> dim_season
 --
+-- Scope:
+--   FBref Silver is source-discovered and intentionally contains every male
+--   competition. Existing Gold dimensions remain config-scoped, so this
+--   template admits only the exact (league, season) pairs rendered from
+--   competitions.yaml with in_scope=true. Out-of-scope Silver remains safely
+--   available for later Gold expansion without breaking today's FKs.
+--
 -- Sources:
 --   iceberg.silver.fbref_match_enriched  (spine: date, score, venue, referee,
 --                                         attendance — slug season after #404)
@@ -37,7 +44,14 @@
 -- Partitioning: NONE (star design: dims unpartitioned; ~1.9k rows for APL×5).
 -- =============================================================================
 
-WITH venue_aliases AS (
+WITH gold_scope AS (
+    SELECT league, season
+    FROM (VALUES
+        {{ in_scope_competition_seasons_values_sql }}
+    ) AS configured(league, season)
+),
+
+venue_aliases AS (
     -- GROUP BY (norm, league): two alias spellings may fold to the SAME
     -- normalised key ("St James' Park" / "St. James Park" -> 'stjamespark').
     -- dim_venue survives that via its final GROUP BY venue_id, but here a
@@ -68,9 +82,15 @@ managers_dedup AS (
         side,
         manager_name,
         league,
-        -- year-start bigint -> slug ('2425'), #404 idiom.
-        -- #913 Phase 2: single_year support (INT-World Cup bronze season is the slug year)
-        CASE WHEN league = 'INT-World Cup'
+        -- Prefer the source-native season. Single-year cups such as EURO
+        -- must stay '2024'; only split seasons become a '2425' slug.
+        CASE WHEN REGEXP_LIKE(COALESCE(source_season_id, ''), '^[0-9]{4}$')
+             THEN source_season_id
+             WHEN REGEXP_LIKE(COALESCE(source_season_id, ''), '^[0-9]{4}-[0-9]{4}$')
+             THEN SUBSTR(source_season_id, 3, 2) || SUBSTR(source_season_id, 8, 2)
+             WHEN NULLIF(TRIM(source_season_id), '') IS NOT NULL
+                 THEN TRIM(source_season_id)
+             WHEN league = 'INT-World Cup'
              THEN LPAD(CAST(season AS varchar), 4, '0')
              ELSE LPAD(CAST(MOD(season, 100) AS varchar), 2, '0')
                   || LPAD(CAST(MOD(season + 1, 100) AS varchar), 2, '0')
@@ -130,22 +150,42 @@ SELECT
         ELSE false
     END AS is_knockout,
     m.attendance,
+    -- Backward compatibility: legacy home_score/away_score remain the score
+    -- published by FBref.  Consumers that need competition results must use
+    -- official_* (result_1x2 already does).
     m.home_score,
     m.away_score,
+    m.source_score_raw,
+    m.source_home_score,
+    m.source_away_score,
+    m.on_field_home_score,
+    m.on_field_away_score,
+    m.official_home_score,
+    m.official_away_score,
+    m.official_score_provenance,
+    m.official_score_authority,
+    m.official_score_reference,
+    m.is_awarded,
+    m.result_status,
     m.home_penalty,  -- #913 Phase 3
     m.away_penalty,
+    m.home_shootout_score,
+    m.away_shootout_score,
     CASE
         -- Penalty shoot-out decides the winner (goals may be tied)
-        WHEN m.home_penalty IS NOT NULL AND m.away_penalty IS NOT NULL THEN
-            CASE WHEN m.home_penalty > m.away_penalty THEN 'H'
-                 WHEN m.home_penalty < m.away_penalty THEN 'A'
+        WHEN m.home_shootout_score IS NOT NULL AND m.away_shootout_score IS NOT NULL THEN
+            CASE WHEN m.home_shootout_score > m.away_shootout_score THEN 'H'
+                 WHEN m.home_shootout_score < m.away_shootout_score THEN 'A'
                  ELSE 'D' END
-        WHEN m.home_score > m.away_score THEN 'H'
-        WHEN m.home_score < m.away_score THEN 'A'
-        WHEN m.home_score = m.away_score THEN 'D'
+        WHEN m.official_home_score > m.official_away_score THEN 'H'
+        WHEN m.official_home_score < m.official_away_score THEN 'A'
+        WHEN m.official_home_score = m.official_away_score THEN 'D'
     END                  AS result_1x2,
-    (m.home_score IS NOT NULL AND m.away_score IS NOT NULL) AS is_completed
+    (m.official_home_score IS NOT NULL AND m.official_away_score IS NOT NULL) AS is_completed
 FROM iceberg.silver.fbref_match_enriched m
+INNER JOIN gold_scope scope
+    ON  scope.league = m.league
+    AND scope.season = m.season
 LEFT JOIN iceberg.silver.xref_team home_x
     ON  home_x.source    = 'fbref'
     AND home_x.source_id = m.home

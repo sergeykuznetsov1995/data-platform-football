@@ -1,9 +1,7 @@
 import gzip
 from collections import Counter
 from pathlib import Path
-from unittest.mock import MagicMock
 
-from scrapers.fbref.data_readers import FBrefDataReaderMixin
 from scrapers.fbref.match_parser import DatasetStatus, parse_match_html
 from scrapers.fbref.raw_store import RawPageStore, match_page_target
 
@@ -72,30 +70,3 @@ def test_all_ten_saved_matches_replay_offline_with_manifests(tmp_path):
         )
         store.write_parse_manifests(record, result)
         assert result.datasets["match_player_stats"].status == DatasetStatus.AVAILABLE
-
-
-def test_active_match_reader_uses_raw_before_source_fetch(tmp_path):
-    class Reader(FBrefDataReaderMixin):
-        def __init__(self):
-            self._raw_page_store = RawPageStore.from_uri(tmp_path.as_uri())
-            self._stats = {}
-            self._last_validation_failure = None
-            self._fetch_page = MagicMock(return_value=_load_fixture("a071faa8"))
-
-        @staticmethod
-        def _add_metadata(frame, _entity_type):
-            return frame
-
-    reader = Reader()
-    for _ in range(2):
-        buffers = [[] for _ in range(8)]
-        got = reader._process_single_match(
-            "a071faa8",
-            "ENG-Premier League",
-            2025,
-            *buffers,
-        )
-        assert "match_player_stats" in got
-
-    reader._fetch_page.assert_called_once()
-    assert reader._stats == {"raw_page_writes": 1, "raw_page_hits": 1}

@@ -373,7 +373,7 @@ class ProxyManager:
                     except (ValueError, TypeError) as e:
                         logger.warning(f"Failed to parse proxy line: {parts[0]}:{parts[1]}: {e}")
                 else:
-                    logger.warning(f"Invalid proxy format (unexpected field count)")
+                    logger.warning("Invalid proxy format (unexpected field count)")
 
         logger.info(f"Loaded {count} proxies from {filepath} (custom format)")
         return count
@@ -617,42 +617,6 @@ class ProxyManager:
             if proxy.username and proxy.password:
                 return f"http://{proxy.username}:{proxy.password}@{proxy.host}:{proxy.port}"
             return f"http://{proxy.host}:{proxy.port}"
-        return None
-
-    def get_nodriver_proxy_string(self) -> Optional[str]:
-        """
-        Get proxy string in nodriver format: host:port:user:pass
-
-        This format is used by NodriverBypass._parse_proxy() method.
-
-        Returns:
-            Proxy string in format host:port:user:pass or host:port if no auth
-        """
-        proxy = self.get_proxy()
-        if proxy:
-            if proxy.username and proxy.password:
-                return f"{proxy.host}:{proxy.port}:{proxy.username}:{proxy.password}"
-            return f"{proxy.host}:{proxy.port}"
-        return None
-
-    def get_nodriver_proxy_dict(self) -> Optional[Dict[str, Any]]:
-        """
-        Get proxy as dictionary for nodriver.
-
-        Returns:
-            Dict with keys: host, port, username, password (optional)
-            Returns None if no proxies available
-        """
-        proxy = self.get_proxy()
-        if proxy:
-            result = {
-                'host': proxy.host,
-                'port': proxy.port,
-            }
-            if proxy.username and proxy.password:
-                result['username'] = proxy.username
-                result['password'] = proxy.password
-            return result
         return None
 
     def get_current_proxy(self) -> Optional[Proxy]:
