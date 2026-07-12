@@ -104,7 +104,13 @@ def _run_parser(
             status=DatasetStatus.AVAILABLE,
             frame=frame,
         )
-    if required:
+    # A required dataset fails the contract when the source published rows the
+    # parser could not read, or published no container at all.  It must not
+    # fail when the source published the container with no rows in it: FBref
+    # ships empty player tables for matches it has no player data for (older
+    # relegation play-offs), and calling that a parser failure would reject a
+    # page whose events, team stats and officials are perfectly parseable.
+    if required and (not source_present or source_has_rows):
         return DatasetParseResult(
             dataset=dataset,
             status=DatasetStatus.ERROR,
@@ -163,6 +169,19 @@ def _table_has_rows(table) -> bool:
     )
 
 
+def _event_div_has_content(div) -> bool:
+    """True when an ``event`` div carries a real event, not an empty column.
+
+    Every FBref match page ships two empty ``div.event`` side containers
+    (``id="a"`` / ``id="b"``) even when the source publishes no events at all,
+    so their mere presence must not be read as unparsed event rows: that turns
+    a genuine source gap into a false schema-drift error.
+    """
+    if div.find("a", href=lambda href: href and "/players/" in href):
+        return True
+    return bool(div.get_text(" ", strip=True))
+
+
 def _match_source_evidence(soup, comment_tables) -> Dict[str, tuple[bool, bool]]:
     """Inventory source containers before any parser may collapse them.
 
@@ -186,11 +205,12 @@ def _match_source_evidence(soup, comment_tables) -> Dict[str, tuple[bool, bool]]
     keeper_tables = matching(r"keeper_stats_[a-f0-9]{8}")
 
     events_wrap = soup.find("div", id="events_wrap")
-    legacy_events = soup.find(
+    event_divs = (events_wrap or soup).find_all(
         "div",
         class_=lambda value: value
         and "event" in str(value).casefold().split(),
     )
+    legacy_events = event_divs[0] if event_divs else None
     lineup_divs = soup.find_all(
         "div",
         class_=lambda value: value and "lineup" in str(value).casefold(),
@@ -225,10 +245,7 @@ def _match_source_evidence(soup, comment_tables) -> Dict[str, tuple[bool, bool]]
         ),
         "match_events": (
             bool(events_wrap or legacy_events),
-            bool(
-                (events_wrap and events_wrap.find("div", class_="event"))
-                or legacy_events
-            ),
+            any(_event_div_has_content(div) for div in event_divs),
         ),
         "lineups": (
             bool(lineup_divs),
@@ -366,6 +383,8 @@ def parse_match_html(
             "match_player_stats",
             lambda: parsers["match_player_stats"](soup, comment_tables),
             required=require_player_contract,
+            # Empty published tables are a source gap, not a parse failure.
+            allow_empty_source=True,
         ),
         "match_managers": run(
             "match_managers",
