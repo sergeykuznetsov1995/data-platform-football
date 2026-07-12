@@ -1,16 +1,23 @@
 #!/usr/bin/env python3
-"""
-E2E Test: Match Parser Verification
-====================================
+"""E2E test for the raw-first FBref match parser path.
 
-Ad-hoc script to verify BUG 4-7 fixes on real FBref match pages.
-Fetches 1-3 match pages via nodriver, runs all parsers, and prints
-a structured PASS/FAIL report.
+Online mode reuses one standalone ``FBrefFetcher`` clearance lease, commits
+each exact response to Raw v2, and only then parses the committed bytes.
+``--offline`` reads the latest committed target and never constructs a
+transport. Optional Iceberg persistence uses ``FBrefTypedBronzeAdapter`` and
+its fail-closed completion-marker ordering; no legacy scraper private APIs are
+called.
 
 Usage (inside Docker container):
     python /opt/airflow/scripts/test_match_parser.py \
         --match-id 643d26fd \
         --proxy-file /opt/airflow/proxys.txt
+
+    # Pure replay from previously committed Raw v2:
+    python /opt/airflow/scripts/test_match_parser.py \
+        --match-id 643d26fd \
+        --raw-store-uri file:///tmp/fbref-match-parser-raw \
+        --offline
 
     # Multiple matches:
     python /opt/airflow/scripts/test_match_parser.py \
@@ -27,25 +34,31 @@ Usage (inside Docker container):
     python /opt/airflow/scripts/test_match_parser.py \
         --match-id 643d26fd \
         --proxy-file /opt/airflow/proxys.txt \
+        --source-competition-id 9 \
+        --source-season-id 2025-2026 \
         --save-to-iceberg
 """
 
 import argparse
 import logging
-import sys
 import os
+import sys
+import uuid
+from pathlib import Path
+from typing import Optional
 
 import pandas as pd
 from bs4 import BeautifulSoup
 
-# Ensure scrapers are importable
-sys.path.insert(0, '/opt/airflow/scrapers')
-sys.path.insert(0, '/opt/airflow/dags')
-sys.path.insert(0, '/opt/airflow')
+# Keep the tool runnable both from the repository and from /opt/airflow.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
 
-from scrapers.fbref.constants import BASE_URL
-from scrapers.fbref.parsers.table_parser import extract_tables_from_comments
-from scrapers.fbref.parsers.finders import (
+from scrapers.fbref.constants import BASE_URL  # noqa: E402
+from scrapers.fbref.parsers.table_parser import (  # noqa: E402
+    extract_tables_from_comments,
+)
+from scrapers.fbref.parsers.finders import (  # noqa: E402
     parse_events_from_scorebox,
     parse_lineup_table,
     parse_shots_table,
@@ -58,6 +71,7 @@ logging.basicConfig(
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
 )
 logger = logging.getLogger('test_match_parser')
+MAX_MATCHES_PER_RUN = 3
 
 # ──────────────────────────────────────────────────────────────────
 # Colours for terminal output
@@ -87,33 +101,52 @@ def INFO(msg: str) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────
-# Fetch page via FBrefScraper (nodriver)
+# Fetch and commit exact raw bytes before parsing
 # ──────────────────────────────────────────────────────────────────
 
-def fetch_match_html(match_id: str, proxy_file: str) -> str:
-    """Fetch match page HTML using FBrefScraper's nodriver stack."""
-    from scrapers.fbref.scraper import FBrefScraper
+def fetch_and_commit_match(
+    fetcher,
+    raw_store,
+    match_id: str,
+    *,
+    run_id: str,
+) -> bytes:
+    """Fetch one match, commit its exact response, then reload parser input."""
+    from scrapers.fbref.fetcher import FETCHER_VERSION
+    from scrapers.fbref.raw_store import match_page_target
 
-    url = f"{BASE_URL}/en/matches/{match_id}"
-    logger.info(f"Fetching: {url}")
-
-    scraper = FBrefScraper(
-        leagues=['ENG-Premier League'],
-        seasons=[2025],
-        headless=True,
-        use_xvfb=True,
-        use_nodriver=True,
-        proxy_file=proxy_file,
+    target = match_page_target(match_id)
+    logger.info("Fetching: %s", target.canonical_url)
+    response = fetcher.fetch(target.canonical_url, page_kind="match")
+    logical_refresh_id = f"{run_id}:match:{match_id}"
+    raw_store.commit_fetch(
+        target,
+        response.body,
+        logical_refresh_id=logical_refresh_id,
+        http_status=response.status_code,
+        headers=response.headers,
+        wire_bytes=response.http_wire_bytes,
+        provider_billed_bytes=response.provider_billed_bytes,
+        latency_ms=response.latency_ms,
+        http_requests=response.http_requests,
+        http_status_history=response.http_status_history,
+        browser_bootstrap_attempts=response.browser_bootstrap_attempts,
+        browser_unobserved_bytes=response.browser_unobserved_bytes,
+        fetcher_version=FETCHER_VERSION,
+        transport_version=FETCHER_VERSION,
     )
+    committed, _ = raw_store.load_fetch(logical_refresh_id)
+    return committed
 
-    try:
-        html = scraper._fetch_page(url, use_cache=False, page_type='match')
-        if not html:
-            logger.error(f"Failed to fetch match {match_id}")
-            sys.exit(1)
-        return html
-    finally:
-        scraper.close()
+
+def load_committed_match(raw_store, match_id: str) -> bytes:
+    """Load the latest Raw v2 content for an offline parser replay."""
+    from scrapers.fbref.raw_store import match_page_target
+
+    committed, _ = raw_store.load_latest_response(
+        match_page_target(match_id)
+    )
+    return committed
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -207,8 +240,8 @@ def validate_lineups(df: pd.DataFrame) -> list:
     results.append(INFO(f"Lineups shape: {df.shape}"))
 
     total = len(df)
-    starters = df[df['is_starter'] == True]
-    bench = df[df['is_starter'] == False]
+    starters = df[df['is_starter'].eq(True)]
+    bench = df[df['is_starter'].eq(False)]
 
     results.append(INFO(f"Starters: {len(starters)}, Bench: {len(bench)}"))
 
@@ -248,7 +281,9 @@ def validate_lineups(df: pd.DataFrame) -> list:
 
     # Check: is_starter correctness (should be ~11 per team)
     for team_name in df['team'].unique():
-        team_starters = df[(df['team'] == team_name) & (df['is_starter'] == True)]
+        team_starters = df[
+            (df['team'] == team_name) & df['is_starter'].eq(True)
+        ]
         if len(team_starters) == 11:
             results.append(PASS(f"{team_name}: 11 starters"))
         else:
@@ -530,137 +565,179 @@ def print_summary(all_reports: dict):
     return total_fail
 
 
-def main():
-    parser = argparse.ArgumentParser(description='E2E test for FBref match parsers')
-    parser.add_argument(
-        '--match-id', nargs='+', required=True,
-        help='FBref match ID(s) (8-char hex, e.g. 643d26fd)',
+def save_to_iceberg(
+    match_ids: list[str],
+    raw_pages: dict[str, bytes],
+    *,
+    source_competition_id: str,
+    source_season_id: str,
+    competition_name: Optional[str],
+    compatibility_season: Optional[int],
+    run_id: str,
+    adapter=None,
+) -> dict[str, dict[str, int]]:
+    """Persist committed bytes through the production typed adapter.
+
+    The adapter reparses the stored response and writes every available typed
+    match dataset with ``match_player_stats`` last as the completion marker.
+    Any parser or persistence failure propagates, so this utility cannot report
+    a successful partial write.
+    """
+    from scrapers.fbref.typed_bronze import (
+        FBrefTypedBronzeAdapter,
+        TypedSourceContext,
+    )
+
+    typed_adapter = adapter or FBrefTypedBronzeAdapter()
+    context = TypedSourceContext(
+        source_competition_id=source_competition_id,
+        source_season_id=source_season_id,
+        competition_name=competition_name,
+        compatibility_season=compatibility_season,
+    )
+    persisted: dict[str, dict[str, int]] = {}
+    for match_id in match_ids:
+        body = raw_pages[match_id]
+        try:
+            _, counts = typed_adapter.ingest_match_html(
+                body,
+                match_id=match_id,
+                context=context,
+                run_id=run_id,
+                target_identity=f"manual-match:{match_id}",
+            )
+        except Exception as exc:
+            print(FAIL(f"Typed Bronze write failed for {match_id}: {exc}"))
+            raise
+        persisted[match_id] = counts
+        rendered = ", ".join(
+            f"{dataset}={count}" for dataset, count in counts.items()
+        )
+        print(PASS(f"{match_id}: typed Bronze committed ({rendered})"))
+    return persisted
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Raw-first E2E test for FBref match parsers"
     )
     parser.add_argument(
-        '--proxy-file', default='/opt/airflow/proxys.txt',
-        help='Path to proxy file',
+        "--match-id",
+        nargs="+",
+        required=True,
+        help="FBref match ID(s) (8-char hex, e.g. 643d26fd)",
     )
     parser.add_argument(
-        '--save-html', action='store_true',
-        help='Save raw HTML to /tmp/ for debugging',
+        "--proxy-file",
+        default="/opt/airflow/proxys.txt",
+        help="Proxy file for online mode; pass an empty value for no proxy",
     )
     parser.add_argument(
-        '--save-to-iceberg', action='store_true',
-        help='Write parsed data to Iceberg tables',
+        "--raw-store-uri",
+        default=os.environ.get(
+            "FBREF_MATCH_PARSER_RAW_URI",
+            "file:///tmp/fbref-match-parser-raw",
+        ),
+        help="Raw v2 store used before parsing",
     )
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="Load latest committed Raw v2 pages; never construct a fetcher",
+    )
+    parser.add_argument(
+        "--run-id",
+        help="Stable logical run id; default is a fresh manual UUID",
+    )
+    parser.add_argument(
+        "--source-competition-id",
+        help="Source-native competition id for typed compatibility columns",
+    )
+    parser.add_argument(
+        "--source-season-id",
+        help="Source-native season id for typed compatibility columns",
+    )
+    parser.add_argument("--competition-name")
+    parser.add_argument("--compatibility-season", type=int)
+    parser.add_argument(
+        "--save-html",
+        action="store_true",
+        help="Also save decoded committed HTML to /tmp for debugging",
+    )
+    parser.add_argument(
+        "--save-to-iceberg",
+        action="store_true",
+        help="Persist committed bytes through FBrefTypedBronzeAdapter",
+    )
+    return parser
+
+
+def main() -> None:
+    from scrapers.fbref.raw_store import RawPageStore
+
+    parser = _build_parser()
     args = parser.parse_args()
+    if len(args.match_id) > MAX_MATCHES_PER_RUN:
+        parser.error(
+            f"at most {MAX_MATCHES_PER_RUN} match ids are allowed per run"
+        )
+    if args.save_to_iceberg and (
+        not args.source_competition_id or not args.source_season_id
+    ):
+        parser.error(
+            "--save-to-iceberg requires --source-competition-id and "
+            "--source-season-id"
+        )
+    run_id = args.run_id or f"manual-match-parser-{uuid.uuid4().hex}"
+    raw_store = RawPageStore.from_uri(args.raw_store_uri)
 
     print(f"\n{BOLD}FBref Match Parser E2E Test{RESET}")
     print(f"Match IDs: {args.match_id}")
-    print(f"Proxy file: {args.proxy_file}")
+    print(f"Raw store: {args.raw_store_uri}")
+    print(f"Offline: {args.offline}")
+    print(f"Run ID: {run_id}")
     print(f"Save HTML: {args.save_html}")
     print(f"Save to Iceberg: {args.save_to_iceberg}")
 
+    raw_pages: dict[str, bytes] = {}
+    if args.offline:
+        for match_id in args.match_id:
+            raw_pages[match_id] = load_committed_match(raw_store, match_id)
+    else:
+        from scrapers.fbref.fetcher import FBrefFetcher
+
+        with FBrefFetcher(proxy_file=args.proxy_file or None) as fetcher:
+            for match_id in args.match_id:
+                raw_pages[match_id] = fetch_and_commit_match(
+                    fetcher,
+                    raw_store,
+                    match_id,
+                    run_id=run_id,
+                )
+
     all_reports = {}
+    for match_id, body in raw_pages.items():
+        html = body.decode("utf-8")
+        all_reports[match_id] = process_match(
+            match_id,
+            html,
+            save_html=args.save_html,
+        )
 
-    for match_id in args.match_id:
-        # Fetch page via nodriver
-        html = fetch_match_html(match_id, args.proxy_file)
-
-        # Parse and validate
-        result = process_match(match_id, html, save_html=args.save_html)
-        all_reports[match_id] = result
-
-    # Optionally save to Iceberg
     if args.save_to_iceberg:
-        print(f"\n{BOLD}--- SAVING TO ICEBERG ---{RESET}")
-        save_to_iceberg(args.match_id, all_reports)
+        print(f"\n{BOLD}--- SAVING TO TYPED BRONZE ---{RESET}")
+        save_to_iceberg(
+            args.match_id,
+            raw_pages,
+            source_competition_id=args.source_competition_id,
+            source_season_id=args.source_season_id,
+            competition_name=args.competition_name,
+            compatibility_season=args.compatibility_season,
+            run_id=run_id,
+        )
 
-    # Summary
     fail_count = print_summary(all_reports)
-    sys.exit(1 if fail_count > 0 else 0)
-
-
-def save_to_iceberg(match_ids: list, all_reports: dict):
-    """Write parsed DataFrames to Iceberg via FBrefScraper._write_to_iceberg."""
-    from scrapers.fbref.scraper import FBrefScraper
-
-    scraper = FBrefScraper(
-        leagues=['ENG-Premier League'],
-        seasons=[2025],
-        headless=True,
-        use_xvfb=False,
-        use_nodriver=False,
-    )
-
-    league = 'ENG-Premier League'
-    season = 2025
-
-    try:
-        for match_id in match_ids:
-            data = all_reports.get(match_id, {})
-
-            # Events
-            events_df = data.get('events_df')
-            if events_df is not None and not events_df.empty:
-                events_df = events_df.copy()
-                events_df['match_id'] = match_id
-                events_df['league'] = league
-                events_df['season'] = season
-                try:
-                    table = scraper.save_to_iceberg(events_df, 'fbref_match_events')
-                    print(PASS(f"Events written to {table} ({len(events_df)} rows)"))
-                except Exception as e:
-                    print(FAIL(f"Events write failed: {e}"))
-
-            # Lineups
-            lineup_df = data.get('lineup_df')
-            if lineup_df is not None and not lineup_df.empty:
-                lineup_df = lineup_df.copy()
-                lineup_df['match_id'] = match_id
-                lineup_df['league'] = league
-                lineup_df['season'] = season
-                try:
-                    table = scraper.save_to_iceberg(lineup_df, 'fbref_lineups')
-                    print(PASS(f"Lineups written to {table} ({len(lineup_df)} rows)"))
-                except Exception as e:
-                    print(FAIL(f"Lineups write failed: {e}"))
-
-            # Shots
-            shots_df = data.get('shots_df')
-            if shots_df is not None and not shots_df.empty:
-                shots_df = shots_df.copy()
-                shots_df['match_id'] = match_id
-                shots_df['league'] = league
-                shots_df['season'] = season
-                try:
-                    table = scraper.save_to_iceberg(shots_df, 'fbref_shot_events')
-                    print(PASS(f"Shots written to {table} ({len(shots_df)} rows)"))
-                except Exception as e:
-                    print(FAIL(f"Shots write failed: {e}"))
-
-            # Team match stats
-            team_stats_df = data.get('team_stats_df')
-            if team_stats_df is not None and not team_stats_df.empty:
-                team_stats_df = team_stats_df.copy()
-                team_stats_df['match_id'] = match_id
-                team_stats_df['league'] = league
-                team_stats_df['season'] = season
-                try:
-                    table = scraper.save_to_iceberg(team_stats_df, 'fbref_match_team_stats')
-                    print(PASS(f"Team stats written to {table} ({len(team_stats_df)} rows)"))
-                except Exception as e:
-                    print(FAIL(f"Team stats write failed: {e}"))
-
-            # Player match stats
-            player_match_df = data.get('player_match_df')
-            if player_match_df is not None and not player_match_df.empty:
-                player_match_df = player_match_df.copy()
-                player_match_df['match_id'] = match_id
-                player_match_df['league'] = league
-                player_match_df['season'] = season
-                try:
-                    table = scraper.save_to_iceberg(player_match_df, 'fbref_match_player_stats')
-                    print(PASS(f"Player match stats written to {table} ({len(player_match_df)} rows)"))
-                except Exception as e:
-                    print(FAIL(f"Player match stats write failed: {e}"))
-    finally:
-        scraper.close()
+    raise SystemExit(1 if fail_count > 0 else 0)
 
 
 if __name__ == '__main__':

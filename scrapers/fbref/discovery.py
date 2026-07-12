@@ -8,14 +8,17 @@ hard-coded competition registry.
 from __future__ import annotations
 
 import re
+import hashlib
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup, Comment, Tag
 
+from scrapers.fbref.constants import UNAVAILABLE_SEASON_STAT_ROUTES
 from scrapers.fbref.match_parser import DatasetStatus
 from scrapers.fbref.raw_store import (
     canonicalize_fbref_url,
@@ -25,6 +28,33 @@ from scrapers.fbref.raw_store import (
 
 DISCOVERY_PARSER_VERSION = "fbref-discovery-parser-v1"
 
+_PAGE_SOURCE_ID_KEYS = {
+    "competition": ("competition_id",),
+    "season": ("competition_id", "season_id"),
+    "season_stats": ("competition_id", "season_id", "stat_route"),
+    "schedule": ("competition_id", "season_id"),
+    "standings": ("competition_id", "season_id"),
+    "squad": ("squad_id", "squad_discriminator"),
+    "player": ("player_id",),
+    "matchlog": (
+        "player_id", "matchlog_season_id", "matchlog_discriminator"
+    ),
+    "match": ("competition_id", "season_id", "match_id"),
+}
+
+
+def normalize_page_source_ids(
+    page_kind: str, source_ids: Mapping[str, object]
+) -> Dict[str, str]:
+    """Keep only source IDs that belong to this page identity."""
+
+    allowed = _PAGE_SOURCE_ID_KEYS.get(str(page_kind), ())
+    return {
+        key: str(source_ids[key])
+        for key in allowed
+        if source_ids.get(key) is not None and str(source_ids[key]).strip()
+    }
+
 _HISTORY_PATH_RE = re.compile(
     r"^/en/comps/(?P<comp_id>[^/]+)/history(?:/|$)", re.IGNORECASE
 )
@@ -33,6 +63,13 @@ _MATCH_PATH_RE = re.compile(
 )
 _SPLIT_YEAR_RE = re.compile(r"^\d{4}-\d{4}$")
 _SINGLE_YEAR_RE = re.compile(r"^\d{4}$")
+_SEASON_STAT_ROUTES = {
+    "standard",
+    "shooting",
+    "playingtime",
+    "misc",
+    "keepers",
+}
 
 
 class CompetitionFormat(str, Enum):
@@ -53,10 +90,19 @@ class CompetitionGender(str, Enum):
     UNKNOWN = "unknown"
 
 
+class CompetitionEligibility(str, Enum):
+    """Decision made before any competition child target is created."""
+
+    ELIGIBLE = "eligible"
+    SKIPPED_FEMALE = "skipped_female"
+    QUARANTINED_UNKNOWN = "quarantined_unknown_gender"
+
+
 class CalendarType(str, Enum):
     SPLIT_YEAR = "split_year"
     SINGLE_YEAR = "single_year"
     TOURNAMENT = "tournament"
+    OPAQUE = "opaque"
 
 
 # Short aliases are convenient for callers and keep the public vocabulary
@@ -124,6 +170,82 @@ class MatchRef:
     @property
     def competition_id(self) -> str:
         return self.comp_id
+
+
+@dataclass(frozen=True)
+class DiscoveredPageLink:
+    """One canonical, source-advertised link found during offline parsing."""
+
+    page_kind: str
+    canonical_url: str
+    source_ids: Mapping[str, str]
+
+
+def competition_eligibility(
+    competition: CompetitionRef,
+) -> CompetitionEligibility:
+    """Classify scope without following a female or unknown-gender URL."""
+
+    if competition.gender == CompetitionGender.MALE:
+        return CompetitionEligibility.ELIGIBLE
+    if competition.gender == CompetitionGender.FEMALE:
+        return CompetitionEligibility.SKIPPED_FEMALE
+    return CompetitionEligibility.QUARANTINED_UNKNOWN
+
+
+def partition_competitions(
+    competitions: Iterable[CompetitionRef],
+) -> Dict[CompetitionEligibility, List[CompetitionRef]]:
+    output = {status: [] for status in CompetitionEligibility}
+    for competition in competitions:
+        output[competition_eligibility(competition)].append(competition)
+    return output
+
+
+def _normalized_name(value: str) -> str:
+    decomposed = unicodedata.normalize("NFKD", value or "")
+    ascii_text = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+    return re.sub(r"[^a-z0-9]+", " ", ascii_text.casefold()).strip()
+
+
+def sentinel_coverage(
+    competitions: Iterable[CompetitionRef],
+    sentinel_names: Iterable[str],
+) -> Dict[str, dict]:
+    """Report sentinels found in source data; never use them to seed scope."""
+
+    materialized = list(competitions)
+    by_name = {_normalized_name(item.name): item for item in materialized}
+    report: Dict[str, dict] = {}
+    for requested in sentinel_names:
+        normalized_requested = _normalized_name(requested)
+        found = by_name.get(normalized_requested)
+        if found is None:
+            requested_tokens = set(normalized_requested.split())
+            candidates = [
+                item
+                for item in materialized
+                if requested_tokens.issubset(
+                    set(_normalized_name(item.name).split())
+                )
+            ]
+            if candidates:
+                found = min(
+                    candidates,
+                    key=lambda item: (
+                        len(_normalized_name(item.name).split()),
+                        _normalized_name(item.name),
+                    ),
+                )
+        report[str(requested)] = {
+            "published": found is not None,
+            "competition_id": found.competition_id if found else None,
+            "gender": found.gender.value if found else None,
+            "eligibility": (
+                competition_eligibility(found).value if found else None
+            ),
+        }
+    return report
 
 
 @dataclass
@@ -209,7 +331,7 @@ def _document_soups(html: str) -> List[BeautifulSoup]:
     documents = [root]
     for comment in root.find_all(string=lambda value: isinstance(value, Comment)):
         text = str(comment)
-        if "<table" in text or "/en/comps/" in text:
+        if "<table" in text or "href=" in text or "/en/" in text:
             documents.append(BeautifulSoup(text, "html.parser"))
     return documents
 
@@ -442,7 +564,9 @@ def _calendar_type(
         return CalendarType.SPLIT_YEAR
     if _SINGLE_YEAR_RE.fullmatch(label):
         return CalendarType.SINGLE_YEAR
-    raise ValueError(f"Unsupported season label {label!r}")
+    # The source URL/ID is authoritative.  An unfamiliar display label must
+    # never make discovery invent a year pair or discard the season.
+    return CalendarType.OPAQUE
 
 
 def parse_competition_html(
@@ -742,14 +866,129 @@ def parse_schedule_html(
     )
 
 
+def discover_page_links(
+    html: str,
+    *,
+    parent_source_ids: Optional[Mapping[str, str]] = None,
+) -> List[DiscoveredPageLink]:
+    """Inventory supported FBref page links without constructing any URL.
+
+    The result is deliberately broader than the typed discovery graph: it is
+    used by the durable frontier to enqueue squad/profile/standings pages while
+    the existing typed parsers continue to expose their compatibility records.
+    """
+
+    inherited = dict(parent_source_ids or {})
+    found: Dict[tuple[str, str], DiscoveredPageLink] = {}
+    for document in _document_soups(html):
+        for anchor in document.find_all("a", href=True):
+            href = str(anchor.get("href") or "").strip()
+            if not href:
+                continue
+            try:
+                canonical = canonicalize_fbref_url(href)
+            except ValueError:
+                continue
+            parts = [part for part in urlparse(canonical).path.split("/") if part]
+            if not parts or parts[0] != "en":
+                continue
+            route = parts[1:]
+            source_ids = dict(inherited)
+            page_kind: Optional[str] = None
+
+            if len(route) >= 2 and route[0] == "matches":
+                try:
+                    target = match_page_target(canonical)
+                except ValueError:
+                    continue
+                page_kind = "match"
+                canonical = target.canonical_url
+                source_ids = dict(target.source_ids)
+            elif len(route) >= 2 and route[0] == "squads":
+                page_kind = "squad"
+                source_ids["squad_id"] = route[1]
+                source_ids["squad_discriminator"] = hashlib.sha256(
+                    canonical.encode("utf-8")
+                ).hexdigest()[:20]
+            elif len(route) >= 2 and route[0] == "players":
+                source_ids["player_id"] = route[1]
+                if "matchlogs" in route:
+                    matchlogs_index = route.index("matchlogs")
+                    suffix = route[matchlogs_index + 1 :]
+                    # A navigation root such as ``.../matchlogs/`` is not a
+                    # paid page identity.  Require source route components
+                    # plus a display slug, then collapse duplicate/nav links
+                    # onto the source-owned structural discriminator.
+                    if len(suffix) < 3:
+                        continue
+                    discriminator = "/".join(suffix[:-1]).strip("/")
+                    if not discriminator:
+                        continue
+                    source_ids = {
+                        "player_id": route[1],
+                        "matchlog_season_id": suffix[0],
+                        "matchlog_discriminator": discriminator,
+                    }
+                    page_kind = "matchlog"
+                else:
+                    page_kind = "player"
+            elif len(route) >= 2 and route[0] == "comps":
+                source_ids["competition_id"] = route[1]
+                if "history" in route:
+                    page_kind = "competition"
+                elif len(route) >= 3:
+                    source_ids["season_id"] = route[2]
+                    if "schedule" in route:
+                        page_kind = "schedule"
+                    elif "standings" in route:
+                        page_kind = "standings"
+                    elif (
+                        len(route) >= 4
+                        and route[3].casefold()
+                        in UNAVAILABLE_SEASON_STAT_ROUTES
+                    ):
+                        # These links are still advertised by FBref, but live
+                        # availability audits found only restricted/empty
+                        # statistical cells.  Skipping before frontier fan-out
+                        # avoids a paid request and, importantly, prevents the
+                        # route from falling through as a season overview.
+                        continue
+                    elif (
+                        len(route) >= 4
+                        and route[3].casefold() in _SEASON_STAT_ROUTES
+                    ):
+                        # Stats subpages share a competition/season identity
+                        # but are distinct canonical pages.  Keeping the route
+                        # discriminator prevents them from colliding with the
+                        # season overview in the durable frontier.
+                        page_kind = "season_stats"
+                        source_ids["stat_route"] = route[3]
+                    else:
+                        page_kind = "season"
+            if page_kind is None:
+                continue
+            source_ids = normalize_page_source_ids(page_kind, source_ids)
+            found.setdefault(
+                (page_kind, canonical),
+                DiscoveredPageLink(
+                    page_kind=page_kind,
+                    canonical_url=canonical,
+                    source_ids=source_ids,
+                ),
+            )
+    return list(found.values())
+
+
 __all__ = [
     "DISCOVERY_PARSER_VERSION",
     "CalendarType",
     "CompetitionFormat",
     "CompetitionGender",
+    "CompetitionEligibility",
     "CompetitionRef",
     "DiscoveryDatasetResult",
     "DiscoveryPageResult",
+    "DiscoveredPageLink",
     "Gender",
     "MatchRef",
     "ParticipantType",
@@ -760,4 +999,9 @@ __all__ = [
     "parse_competition_index_html",
     "parse_schedule_html",
     "parse_season_html",
+    "competition_eligibility",
+    "discover_page_links",
+    "partition_competitions",
+    "normalize_page_source_ids",
+    "sentinel_coverage",
 ]

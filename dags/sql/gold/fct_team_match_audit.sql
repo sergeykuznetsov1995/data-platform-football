@@ -60,6 +60,8 @@ fb_home AS (
         m.home_red_cards                      AS red_cards,
         m.home_saves                          AS saves
     FROM iceberg.silver.fbref_match_enriched m
+    INNER JOIN iceberg.gold.dim_match match_scope
+        ON match_scope.match_id = m.match_id
 ),
 fb_away AS (
     SELECT
@@ -77,6 +79,8 @@ fb_away AS (
         m.away_red_cards                      AS red_cards,
         m.away_saves                          AS saves
     FROM iceberg.silver.fbref_match_enriched m
+    INNER JOIN iceberg.gold.dim_match match_scope
+        ON match_scope.match_id = m.match_id
 ),
 fb_team AS (
     SELECT *,

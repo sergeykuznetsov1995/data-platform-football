@@ -112,14 +112,26 @@ WITH aliases AS (
 raw_teams AS (
     -- ===== fbref (home/away from schedule) =====
     SELECT 'fbref' AS source, home AS source_id, league, -- #913 Phase 2: single_year support
-CASE WHEN league = 'INT-World Cup'
+CASE WHEN REGEXP_LIKE(COALESCE(source_season_id, ''), '^\d{4}$')
+     THEN source_season_id
+     WHEN REGEXP_LIKE(COALESCE(source_season_id, ''), '^\d{4}-\d{4}$')
+     THEN SUBSTR(source_season_id, 3, 2) || SUBSTR(source_season_id, 8, 2)
+     WHEN NULLIF(TRIM(source_season_id), '') IS NOT NULL
+     THEN TRIM(source_season_id)
+     WHEN league = 'INT-World Cup'
      THEN LPAD(CAST(season AS varchar), 4, '0')
      ELSE LPAD(CAST(MOD(season, 100) AS varchar), 2, '0') || LPAD(CAST(MOD(season + 1, 100) AS varchar), 2, '0')
 END AS season  -- year-start / WC direct → slug (#404 + #913)
       FROM iceberg.bronze.fbref_schedule WHERE home IS NOT NULL
     UNION
     SELECT 'fbref' AS source, away AS source_id, league, -- #913 Phase 2: single_year support
-CASE WHEN league = 'INT-World Cup'
+CASE WHEN REGEXP_LIKE(COALESCE(source_season_id, ''), '^\d{4}$')
+     THEN source_season_id
+     WHEN REGEXP_LIKE(COALESCE(source_season_id, ''), '^\d{4}-\d{4}$')
+     THEN SUBSTR(source_season_id, 3, 2) || SUBSTR(source_season_id, 8, 2)
+     WHEN NULLIF(TRIM(source_season_id), '') IS NOT NULL
+     THEN TRIM(source_season_id)
+     WHEN league = 'INT-World Cup'
      THEN LPAD(CAST(season AS varchar), 4, '0')
      ELSE LPAD(CAST(MOD(season, 100) AS varchar), 2, '0') || LPAD(CAST(MOD(season + 1, 100) AS varchar), 2, '0')
 END AS season  -- year-start / WC direct → slug (#404 + #913)
@@ -135,14 +147,26 @@ END AS season  -- year-start / WC direct → slug (#404 + #913)
     -- canonical→fbref-name bridges must aggregate (see the GROUP BY guards in
     -- fct_match_timeline.ws_match_bridge / fct_lineup.espn_match_bridge).
     SELECT 'fbref' AS source, team AS source_id, league, -- #913 Phase 2: single_year support
-CASE WHEN league = 'INT-World Cup'
+CASE WHEN REGEXP_LIKE(COALESCE(source_season_id, ''), '^\d{4}$')
+     THEN source_season_id
+     WHEN REGEXP_LIKE(COALESCE(source_season_id, ''), '^\d{4}-\d{4}$')
+     THEN SUBSTR(source_season_id, 3, 2) || SUBSTR(source_season_id, 8, 2)
+     WHEN NULLIF(TRIM(source_season_id), '') IS NOT NULL
+     THEN TRIM(source_season_id)
+     WHEN league = 'INT-World Cup'
      THEN LPAD(CAST(season AS varchar), 4, '0')
      ELSE LPAD(CAST(MOD(season, 100) AS varchar), 2, '0') || LPAD(CAST(MOD(season + 1, 100) AS varchar), 2, '0')
 END AS season  -- year-start / WC direct → slug (#404 + #913)
       FROM iceberg.bronze.fbref_match_player_stats WHERE team IS NOT NULL
     UNION
     SELECT 'fbref' AS source, team AS source_id, league, -- #913 Phase 2: single_year support
-CASE WHEN league = 'INT-World Cup'
+CASE WHEN REGEXP_LIKE(COALESCE(source_season_id, ''), '^\d{4}$')
+     THEN source_season_id
+     WHEN REGEXP_LIKE(COALESCE(source_season_id, ''), '^\d{4}-\d{4}$')
+     THEN SUBSTR(source_season_id, 3, 2) || SUBSTR(source_season_id, 8, 2)
+     WHEN NULLIF(TRIM(source_season_id), '') IS NOT NULL
+     THEN TRIM(source_season_id)
+     WHEN league = 'INT-World Cup'
      THEN LPAD(CAST(season AS varchar), 4, '0')
      ELSE LPAD(CAST(MOD(season, 100) AS varchar), 2, '0') || LPAD(CAST(MOD(season + 1, 100) AS varchar), 2, '0')
 END AS season  -- year-start / WC direct → slug (#404 + #913)

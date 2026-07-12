@@ -51,12 +51,17 @@ _ICEBERG_TO_LOCAL = {
     "iceberg.bronze.fbref_player_playingtime": "bronze_fbref_player_playingtime",
     "iceberg.bronze.fbref_player_misc":        "bronze_fbref_player_misc",
     "iceberg.bronze.fbref_keeper_keeper":      "bronze_fbref_keeper_keeper",
+    "iceberg.silver.fbref_player_identity":    "silver_fbref_player_identity",
 }
 
 
 def _translate(sql: str) -> str:
     for k, v in _ICEBERG_TO_LOCAL.items():
         sql = sql.replace(k, v)
+    # Trino normalize(..., NFD) -> DuckDB strip_accents(...) for ASCII/diacritic
+    # identity predicates exercised here.
+    sql = sql.replace(", NFD)", ")").replace("normalize(", "strip_accents(")
+    sql = sql.replace("REGEXP_LIKE(", "REGEXP_MATCHES(")
     return sql
 
 
@@ -76,7 +81,7 @@ def _strip_comments(sql: str) -> str:
 # ---------------------------------------------------------------------------
 
 _COMMON = ["player", "player_id", "nation", "pos", "squad", "age", "born",
-           "league", "season", "_ingested_at", "_batch_id"]
+           "league", "season", "source_season_id", "_ingested_at", "_batch_id"]
 
 _STATS_COLS = _COMMON + [
     "mp", "starts", "min", "90s", "gls", "ast", "g+a", "g-pk", "pk", "pkatt",
@@ -123,6 +128,15 @@ def duck_conn():
     con = duckdb.connect()
     for table, cols in _TABLES.items():
         con.execute(_ddl(table, cols))
+    con.execute(
+        """
+        CREATE TABLE silver_fbref_player_identity (
+            player_id VARCHAR, player_name VARCHAR, team_name VARCHAR,
+            league VARCHAR, season VARCHAR, is_synthetic BOOLEAN,
+            id_resolution VARCHAR, id_evidence_datasets VARCHAR[]
+        )
+        """
+    )
     yield con
     con.close()
 
@@ -144,6 +158,36 @@ T2 = "2026-02-01 00:00:00"
 
 
 def _run_profile(con, sql_path: Path):
+    # Seed the materialised identity dependency in the same shape as the
+    # production transform: preserve native IDs and give residual blank IDs a
+    # deterministic noid_ identity.
+    con.execute("DELETE FROM silver_fbref_player_identity")
+    con.execute(
+        """
+        INSERT INTO silver_fbref_player_identity
+        SELECT DISTINCT
+               CASE
+                   WHEN NULLIF(TRIM(player_id), '') IS NOT NULL
+                       THEN TRIM(player_id)
+                   ELSE 'noid_' || md5(
+                       league || '|' || CAST(season AS VARCHAR) || '|'
+                       || lower(TRIM(player)) || '|' || lower(TRIM(squad))
+                   )
+               END,
+               player, squad, league,
+               lpad(CAST(season % 100 AS VARCHAR), 2, '0')
+                 || lpad(CAST((season + 1) % 100 AS VARCHAR), 2, '0'),
+               NULLIF(TRIM(player_id), '') IS NULL,
+               CASE
+                   WHEN NULLIF(TRIM(player_id), '') IS NULL
+                       THEN 'synthetic_residual'
+                   ELSE 'source_native'
+               END,
+               ['player_stats']
+        FROM bronze_fbref_player_stats
+        WHERE NULLIF(TRIM(player), '') IS NOT NULL
+        """
+    )
     sql = _translate(_read(sql_path))
     return con.execute(
         f"SELECT * FROM ({sql}) ORDER BY squad"
@@ -259,6 +303,32 @@ class TestKeeperProfileDedup:
         assert by_squad["Aston Villa"]["saves"] == 40
         assert by_squad["West Ham United"]["saves"] == 15
 
+    def test_blank_keeper_id_uses_materialised_identity(self, duck_conn):
+        gk = dict(
+            _INGS,
+            player="Missing Id Keeper",
+            player_id="",
+            pos="GK",
+            squad="Identity FC",
+            _ingested_at=T1,
+            _batch_id="batch-blank",
+        )
+        _insert(duck_conn, "bronze_fbref_player_stats", **gk)
+        _insert(
+            duck_conn,
+            "bronze_fbref_keeper_keeper",
+            **gk,
+            saves="7",
+        )
+
+        df = _run_profile(duck_conn, KEEPER_PROFILE_SQL)
+
+        assert len(df) == 1
+        assert df.iloc[0]["player_id"].startswith("noid_")
+        assert df.iloc[0]["player_id_resolution"] == "synthetic_residual"
+        assert bool(df.iloc[0]["player_id_is_synthetic"]) is True
+        assert df.iloc[0]["saves"] == 7
+
 
 # ---------------------------------------------------------------------------
 # Regex sanity — dedup keys of all five FBref silver files
@@ -302,11 +372,20 @@ class TestDedupKeys:
                    if "player" in c.lower()]
         assert clauses, f"no player dedup window found in {path.name}"
         for clause in clauses:
-            assert re.search(r"COALESCE\s*\(\s*player_id\s*,\s*player\s*\)",
-                             clause, re.IGNORECASE), (
-                f"{path.name}: player key must be NULL-safe — "
-                f"COALESCE(player_id, player) (#463): {clause!r}"
-            )
+            if path == MATCH_LINEUPS_SQL:
+                assert "resolved_player_id" in clause, (
+                    f"{path.name}: identity must resolve blank IDs before "
+                    f"deduplication: {clause!r}"
+                )
+            else:
+                assert re.search(
+                    r"COALESCE\s*\(\s*player_id\s*,\s*player\s*\)",
+                    clause,
+                    re.IGNORECASE,
+                ), (
+                    f"{path.name}: player key must be NULL-safe — "
+                    f"COALESCE(player_id, player) (#463): {clause!r}"
+                )
 
     def test_enriched_dedup_keys_mirror_detail_tables(self):
         """fbref_match_enriched re-implements the events/lineups dedup CTEs —

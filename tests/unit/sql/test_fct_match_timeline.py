@@ -63,6 +63,10 @@ _ICEBERG_TO_LOCAL = {
 
 
 def _translate(sql: str) -> str:
+    sql = sql.replace(
+        "iceberg.gold.dim_match",
+        "(SELECT DISTINCT match_id FROM silver_fbref_match_enriched)",
+    )
     for k, v in _ICEBERG_TO_LOCAL.items():
         sql = sql.replace(k, v)
     sql = re.sub(r"\bregexp_like\s*\(", "regexp_matches(", sql, flags=re.IGNORECASE)
@@ -104,6 +108,16 @@ def _reset_schemas(duck_conn):
             team_side           VARCHAR,
             secondary_player    VARCHAR,
             secondary_player_id VARCHAR,
+            event_phase         VARCHAR GENERATED ALWAYS AS (
+                CASE
+                    WHEN event_type IN ('penalty', 'penalty_missed')
+                     AND COALESCE(TRIM(minute), '') = '' THEN 'shootout'
+                    WHEN TRY_CAST(split_part(minute, '+', 1) AS INTEGER) > 90
+                        THEN 'extra_time'
+                    WHEN COALESCE(TRIM(minute), '') <> '' THEN 'regulation'
+                    ELSE 'unknown'
+                END
+            ),
             _bronze_ingested_at TIMESTAMP,
             league              VARCHAR,
             season              VARCHAR
@@ -512,6 +526,10 @@ class TestFctMatchTimeline:
                NULL, NULL, {_TS}, '{_LG}', '2425')
             """
         )
+        duck_conn.execute(
+            f"""INSERT INTO silver_fbref_match_enriched VALUES
+                ('M7', '{_LG}', 'Liverpool', 'Arsenal', DATE '2024-08-17')"""
+        )
         out = _run_gold(duck_conn)
         m7 = _match_rows(out, "M7")
         assert [r["event_type"] for r in m7] == ["goal", "penalty_missed"], m7
@@ -520,6 +538,31 @@ class TestFctMatchTimeline:
         assert (goal_row["score_home_after"], goal_row["score_away_after"]) == (1, 0)
         # the miss carries the score forward unchanged — NOT 2:0
         assert (miss_row["score_home_after"], miss_row["score_away_after"]) == (1, 0)
+
+    def test_fbref_shootout_is_separate_period_and_never_increments_score(self, duck_conn):
+        """#901: empty-minute FBref shootout kicks belong to SO, not the
+        regulation score. Raw FBref lacks success/miss outcome, so the public
+        event type is the honest neutral attempt value."""
+        _seed_corpus(duck_conn)
+        duck_conn.execute(
+            f"""
+            INSERT INTO silver_fbref_match_events VALUES
+              ('MSO', '30', 'goal', 'Scorer', 'fb_s', 'Liverpool', 'home',
+               NULL, NULL, {_TS}, '{_LG}', '2425'),
+              ('MSO', '', 'penalty', 'Kicker', 'fb_k', 'Liverpool', 'home',
+               NULL, NULL, {_TS}, '{_LG}', '2425')
+            """
+        )
+        duck_conn.execute(
+            f"""INSERT INTO silver_fbref_match_enriched VALUES
+                ('MSO', '{_LG}', 'Liverpool', 'Arsenal', DATE '2024-08-18')"""
+        )
+        rows = _match_rows(_run_gold(duck_conn), "MSO")
+        assert [(row["period"], row["event_type"]) for row in rows] == [
+            ("1H", "goal"),
+            ("SO", "penalty_shootout_attempt"),
+        ]
+        assert (rows[-1]["score_home_after"], rows[-1]["score_away_after"]) == (1, 0)
 
     def test_goal_assist_related(self, duck_conn):
         _seed_corpus(duck_conn)

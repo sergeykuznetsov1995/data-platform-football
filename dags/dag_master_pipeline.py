@@ -3,13 +3,14 @@ Master Pipeline DAG
 ===================
 
 Airflow DAG for orchestrating all data ingestion DAGs.
-Uses TriggerDagRunOperator to run child DAGs in sequence.
+Uses TriggerDagRunOperator for child DAGs and a fail-closed sensor for the
+independently scheduled 06:00 FBref run.
 
 Schedules daily at 2 PM UTC (after all individual DAGs).
 
 This DAG:
-1. Triggers all ingestion DAGs in sequence
-2. Waits for each to complete before proceeding
+1. Triggers non-FBref ingestion DAGs in sequence
+2. Waits for each plus the scheduled FBref chain to complete before proceeding
 3. Validates overall pipeline success
 4. Logs completion summary
 """
@@ -20,15 +21,15 @@ from typing import Any, Dict
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
+from airflow.sensors.external_task import ExternalTaskSensor
 from airflow.utils.task_group import TaskGroup
 
 from utils.config import SCHEDULES, DAG_TAGS
 from utils.default_args import DEFAULT_ARGS
 
 
-# List of ingestion DAGs in execution order
-INGESTION_DAGS = [
-    'dag_ingest_fbref',
+# Bronze DAGs actively triggered by this master run.
+TRIGGERED_INGESTION_DAGS = [
     'dag_ingest_fotmob',
     'dag_ingest_matchhistory',
     'dag_ingest_understat',
@@ -37,6 +38,14 @@ INGESTION_DAGS = [
     'dag_ingest_espn',
     'dag_ingest_clubelo',
 ]
+
+# FBref owns its 06:00 schedule and its daily request/byte budget.  Master only
+# waits for that run; triggering it again at 14:00 would create a second
+# control run and could double paid proxy traffic.
+SCHEDULED_INGESTION_DAGS = ['dag_ingest_fbref']
+
+# Complete reporting scope (both master-triggered and externally scheduled).
+INGESTION_DAGS = [*TRIGGERED_INGESTION_DAGS, *SCHEDULED_INGESTION_DAGS]
 
 # Extended default args for master pipeline
 MASTER_ARGS = {
@@ -159,26 +168,23 @@ with DAG(
 
     ### Execution Order
 
-    1. **FBref** (6:00 UTC) - Selenium-based scraper
-    2. **FotMob** (7:00 UTC) - Selenium-based scraper
-    3. **MatchHistory** (8:00 UTC) - Direct HTTP scraper
-    4. **Understat** (9:00 UTC) - soccerdata library
-    5. **WhoScored** (10:00 UTC) - Selenium with SPADL conversion
-    6. **SofaScore** (11:00 UTC) - soccerdata library
-    7. **ESPN** (12:00 UTC) - soccerdata library
-    8. **ClubElo** (13:00 UTC) - ELO ratings
+    1. Other Bronze ingestion DAGs run in sequence.
+    2. Master waits for the successful scheduled **FBref 06:00** run; it does
+       not launch a second crawl or consume a second traffic budget.
+    3. E3/E4 and auxiliary Silver transforms run on the validated xref spine.
+    4. A single final FBref Gold run consumes all successful prerequisites.
 
     ### E1: Silver xref step
 
-    After all 8 ingestion DAGs finish, `dag_transform_xref` materialises the
-    five Silver cross-reference tables (`xref_team`, `xref_match`,
-    `xref_referee`, `xref_manager`, `xref_player`). It is fast (~1-2 min)
-    and blocks before the daily summary so the T6 dual-run parity validator
-    runs on fresh xref data.
+    The scheduled FBref ingestion waits for `dag_transform_fbref_silver`;
+    FBref Silver in turn waits for `dag_transform_xref` and its DQ gate. The
+    master uses a fail-closed external-DAG sensor for that completed chain,
+    so `xref_player` cannot race `silver.fbref_player_identity` and FBref is
+    never crawled twice for one daily promotion.
 
     ### E3: Core event facts (Silver + Gold)
 
-    After `dag_transform_xref` finishes, `dag_transform_e3` runs the E3
+    After the sensed FBref Silver/xref chain finishes, `dag_transform_e3` runs the E3
     medallion-redesign chain: Silver `whoscored_events_spadl` +
     `espn_lineup` → Gold `fct_event` / `fct_shot` / `fct_lineup` →
     `validate_e3`. It depends on `silver.xref_match`, `silver.xref_team`,
@@ -209,9 +215,8 @@ with DAG(
     own weekly Monday cron (`dag_ingest_transfermarkt` 04:00 UTC,
     `dag_ingest_capology` 05:00 UTC); the daily Silver refresh here picks up
     fresh `silver.xref_player` rows from E1 so canonical_id coverage stays
-    aligned even when xref grows mid-week. Same `failed_states=[]` /
-    `trigger_rule='all_done'` policy as E1-E4 to keep the daily summary
-    resilient.
+    aligned even when xref grows mid-week. These prerequisite triggers must
+    succeed before Gold becomes eligible.
 
     ### FBref Gold layer (issue #39)
 
@@ -230,15 +235,15 @@ with DAG(
         (`squad_market_value_eur` / `total_wage_bill_gbp`), which is why it runs
         AFTER the TM/Capology Silver block rather than in parallel with it.
     The Gold DAG runs sequentially (`max_active_tasks=1`) for OOM safety on the
-    dev Trino (3.5 GB heap). Same `wait_for_completion=True` /
-    `failed_states=[]` / `trigger_rule='all_done'` policy as E1-E4 keeps the
-    daily summary resilient if a Gold CTAS degrades.
+    dev Trino (3.5 GB heap). The handoff is fail-closed: a failed prerequisite
+    or Gold CTAS cannot be hidden by the reporting tasks.
 
     ### Notes
 
-    - Each DAG is triggered with `wait_for_completion=True`
-    - Pipeline continues even if some DAGs fail
-    - Final report summarizes all DAG statuses
+    - Triggered children use `wait_for_completion=True`
+    - Scheduled FBref is sensed at the matching 06:00 logical date
+    - FBref Silver, xref, Gold, and direct Gold prerequisites are fail-closed
+    - Final report is generated only after successful promotion
     - SoFIFA runs weekly (Sunday) and is not included here
     - Transfermarkt/Capology Bronze run weekly (Monday); master only re-
       materialises their Silver tables daily (idempotent CTAS, no re-scrape)
@@ -251,14 +256,14 @@ with DAG(
     with TaskGroup(group_id='ingestion_triggers') as triggers_group:
         prev_task = None
 
-        for dag_id in INGESTION_DAGS:
+        for dag_id in TRIGGERED_INGESTION_DAGS:
             trigger_task = TriggerDagRunOperator(
                 task_id=f'trigger_{dag_id.replace("dag_ingest_", "")}',
                 trigger_dag_id=dag_id,
                 wait_for_completion=True,
                 poke_interval=60,  # Check every minute
-                allowed_states=['success', 'failed'],  # Continue on failure
-                failed_states=[],  # Don't fail master if child fails
+                allowed_states=['success', 'failed'],
+                failed_states=[],
                 reset_dag_run=True,  # Reset if already running
                 execution_date='{{ ds }}',  # Airflow 2.x uses execution_date
                 conf=(
@@ -274,30 +279,22 @@ with DAG(
             prev_task = trigger_task
             trigger_tasks.append(trigger_task)
 
-    # =========================================================================
-    # E1 medallion-redesign: Silver xref tables
-    # =========================================================================
-    # Runs AFTER all Bronze ingestion (xref_team/match/referee/manager/player
-    # read from iceberg.bronze.*) and BEFORE the FBref Silver DAG (so any
-    # downstream that begins to depend on silver.xref_* gets fresh data).
-    #
-    # `wait_for_completion=True` — the xref DAG is fast (~1-2 min) and
-    # blocking lets the T6 dual-run parity validator run on freshly
-    # written xref tables.
-    #
-    # `failed_states=[]` keeps master pipeline parity: a transient xref
-    # failure should not abort the rest of the daily run; an alert from
-    # `validate_xref` (Telegram on_failure_callback) surfaces the issue.
-    trigger_xref_task = TriggerDagRunOperator(
-        task_id='trigger_silver_xref',
-        trigger_dag_id='dag_transform_xref',
-        wait_for_completion=True,
-        poke_interval=30,
-        allowed_states=['success', 'failed'],
-        failed_states=[],
-        reset_dag_run=True,
-        execution_date='{{ ds }}',
-        trigger_rule='all_done',  # Run even if some ingestion DAGs failed
+    # FBref runs once per day on its own 06:00 schedule.  The master DAG's
+    # 14:00 logical date is eight hours later, so execution_delta maps to the
+    # exact same daily data interval without launching another paid crawl.
+    # Waiting for the whole external DAG is intentional: dag_ingest_fbref
+    # cannot succeed until its blocking Silver -> xref -> DQ chain succeeds.
+    wait_for_scheduled_fbref = ExternalTaskSensor(
+        task_id='wait_for_scheduled_fbref',
+        external_dag_id='dag_ingest_fbref',
+        external_task_id=None,
+        allowed_states=['success'],
+        failed_states=['failed'],
+        execution_delta=timedelta(hours=8),
+        mode='reschedule',
+        poke_interval=60,
+        timeout=timedelta(hours=6).total_seconds(),
+        check_existence=True,
     )
 
     # =========================================================================
@@ -309,20 +306,17 @@ with DAG(
     # `silver.xref_match` / `silver.xref_team` / `silver.xref_player` rows.
     #
     # The E3 DAG itself runs sequentially (`max_active_tasks=1`) for OOM
-    # safety; here we simply trigger it with the same wait/parity policy as
-    # the xref step. `failed_states=[]` keeps master pipeline resilient: an
-    # E3 failure surfaces via `validate_e3`'s on_failure_callback (Telegram)
-    # but does not block the daily summary.
+    # safety. Its validation is a hard prerequisite for final Gold.
     trigger_e3_transforms = TriggerDagRunOperator(
         task_id='trigger_e3_transforms',
         trigger_dag_id='dag_transform_e3',
         wait_for_completion=True,
         poke_interval=30,
-        allowed_states=['success', 'failed'],
-        failed_states=[],
+        allowed_states=['success'],
+        failed_states=['failed'],
         reset_dag_run=True,
         execution_date='{{ ds }}',
-        trigger_rule='all_done',  # Run even if xref step degraded
+        trigger_rule='all_success',
     )
 
     # =========================================================================
@@ -333,20 +327,17 @@ with DAG(
     # (produced by xref step).
     #
     # The E4 DAG itself runs sequentially (`max_active_tasks=1`) for OOM
-    # safety; here we simply trigger it with the same wait/parity policy as
-    # the xref / E3 steps. `failed_states=[]` keeps master pipeline
-    # resilient: an E4 failure surfaces via `validate_e4`'s
-    # on_failure_callback (Telegram) but does not block the daily summary.
+    # safety. Its validation is a hard prerequisite for final Gold.
     trigger_e4_transforms = TriggerDagRunOperator(
         task_id='trigger_e4_transforms',
         trigger_dag_id='dag_transform_e4',
         wait_for_completion=True,
         poke_interval=30,
-        allowed_states=['success', 'failed'],
-        failed_states=[],
+        allowed_states=['success'],
+        failed_states=['failed'],
         reset_dag_run=True,
         execution_date='{{ ds }}',
-        trigger_rule='all_done',  # Run even if E3 step degraded
+        trigger_rule='all_success',
     )
 
     # =========================================================================
@@ -366,11 +357,11 @@ with DAG(
         trigger_dag_id='dag_transform_transfermarkt_silver',
         wait_for_completion=True,
         poke_interval=30,
-        allowed_states=['success', 'failed'],
-        failed_states=[],
+        allowed_states=['success'],
+        failed_states=['failed'],
         reset_dag_run=True,
         execution_date='{{ ds }}',
-        trigger_rule='all_done',
+        trigger_rule='all_success',
     )
 
     trigger_silver_capology = TriggerDagRunOperator(
@@ -378,11 +369,11 @@ with DAG(
         trigger_dag_id='dag_transform_capology_silver',
         wait_for_completion=True,
         poke_interval=30,
-        allowed_states=['success', 'failed'],
-        failed_states=[],
+        allowed_states=['success'],
+        failed_states=['failed'],
         reset_dag_run=True,
         execution_date='{{ ds }}',
-        trigger_rule='all_done',
+        trigger_rule='all_success',
     )
 
     # SoFIFA Silver (issue #42) — same dependency profile as TM/Capology:
@@ -395,11 +386,11 @@ with DAG(
         trigger_dag_id='dag_transform_sofifa_silver',
         wait_for_completion=True,
         poke_interval=30,
-        allowed_states=['success', 'failed'],
-        failed_states=[],
+        allowed_states=['success'],
+        failed_states=['failed'],
         reset_dag_run=True,
         execution_date='{{ ds }}',
-        trigger_rule='all_done',
+        trigger_rule='all_success',
     )
 
     # =========================================================================
@@ -414,19 +405,20 @@ with DAG(
     #     -> gold.fct_team_season_stats (squad_market_value_eur /
     #        total_wage_bill_gbp)
     #
-    # The Gold DAG itself runs sequentially (max_active_tasks=1) for OOM safety;
-    # same wait/parity policy (failed_states=[], trigger_rule='all_done') as
-    # E1-E4 keeps the daily summary resilient if a Gold CTAS degrades.
+    # The Gold DAG itself runs sequentially (max_active_tasks=1) for OOM safety.
+    # Child failure propagates so reporting cannot turn a failed promotion green.
     trigger_fbref_gold = TriggerDagRunOperator(
         task_id='trigger_fbref_gold',
         trigger_dag_id='dag_transform_fbref_gold',
         wait_for_completion=True,
         poke_interval=30,
-        allowed_states=['success', 'failed'],
-        failed_states=[],
+        allowed_states=['success'],
+        failed_states=['failed'],
         reset_dag_run=True,
         execution_date='{{ ds }}',
-        trigger_rule='all_done',  # Run even if TM/Cap/SoFIFA Silver degraded
+        execution_timeout=timedelta(hours=12),
+        retries=0,
+        trigger_rule='all_success',
     )
 
     # Check overall pipeline success
@@ -434,7 +426,7 @@ with DAG(
         task_id='check_pipeline_success',
         python_callable=check_pipeline_success,
 
-        trigger_rule='all_done',
+        trigger_rule='all_success',
     )
 
     # Generate summary report
@@ -445,7 +437,10 @@ with DAG(
     )
 
     # Dependencies
-    triggers_group >> trigger_xref_task >> trigger_e3_transforms >> trigger_e4_transforms
+    # The sensor waits for the scheduled FBref run, whose child DAG does not
+    # complete until Silver DQ and xref DQ have both passed.
+    triggers_group >> wait_for_scheduled_fbref >> trigger_e3_transforms
+    trigger_e3_transforms >> trigger_e4_transforms
     trigger_e4_transforms >> [
         trigger_silver_transfermarkt,
         trigger_silver_capology,

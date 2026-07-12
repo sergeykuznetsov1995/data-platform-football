@@ -33,8 +33,11 @@
 --   iceberg.silver.xref_match/team/player — canonical resolvers
 --
 -- ADRs folded into this file:
---   * event_type dictionary (8 values): goal, own_goal, penalty_goal,
+--   * event_type dictionary: goal, own_goal, penalty_goal,
 --     penalty_missed, yellow_card, second_yellow, red_card, substitution.
+--     Shoot-out rows use penalty_shootout_attempt because current FBref raw
+--     markup does not preserve conversion/miss outcome; they never increment
+--     the regulation/extra-time running score (#901).
 --     FBref bronze 'penalty' → 'penalty_goal' (scored penalty). Since #447 the
 --     scraper splits the FBref penalty_miss / yellow_red_card sprites into
 --     their own bronze values, so 'penalty_missed' and 'second_yellow' are now
@@ -62,8 +65,8 @@
 --     0–59, SecondHalf 45–105) → normalised +1 to FBref's 1-based convention
 --     (#521), THEN clamped: FirstHalf >45 ⇒ 45+(m−45), SecondHalf >90 ⇒
 --     90+(m−90). period: '1H' | '2H' | 'ET' (FBref base >90 ⇒ ET; league
---     corpus has no ET in practice). WhoScored non-half periods
---     (PreMatch/PostGame/shootout) are dropped.
+--     corpus has no ET in practice). FBref shoot-out penalties have period SO;
+--     WhoScored non-half periods remain unavailable in the fallback.
 --   * event_seq: ROW_NUMBER per match ordered by (period, minute, added,
 --     second, event-priority, player) — dense, 1-based, deterministic. True
 --     intra-minute order is unknowable from FBref granularity, so the
@@ -114,7 +117,10 @@ fb_raw AS (
         fe.match_id                                          AS src_match_id,
         TRY_CAST(split_part(fe.minute, '+', 1) AS integer)   AS minute,
         TRY_CAST(split_part(fe.minute, '+', 2) AS integer)   AS minute_added,
-        CASE fe.event_type
+        CASE
+            WHEN fe.event_phase = 'shootout'
+                THEN 'penalty_shootout_attempt'
+            ELSE CASE fe.event_type
             WHEN 'goal'                THEN 'goal'
             WHEN 'penalty'             THEN 'penalty_goal'
             WHEN 'penalty_missed'      THEN 'penalty_missed'
@@ -123,7 +129,9 @@ fb_raw AS (
             WHEN 'second_yellow_card'  THEN 'second_yellow'
             WHEN 'red_card'            THEN 'red_card'
             WHEN 'substitution'        THEN 'substitution'
+            END
         END                                                  AS event_type,
+        fe.event_phase                                       AS event_phase,
         -- main actor; FBref sub convention is inverted (player_id = ON) —
         -- swap so the actor is the player going OFF
         CASE WHEN fe.event_type = 'substitution'
@@ -146,6 +154,8 @@ fb_raw AS (
         fe.season                                            AS season,
         fe._bronze_ingested_at                               AS _ingested_at
     FROM iceberg.silver.fbref_match_events fe
+    INNER JOIN iceberg.gold.dim_match match_scope
+        ON match_scope.match_id = fe.match_id
     WHERE fe.event_type IN ('goal', 'penalty', 'penalty_missed', 'own_goal',
                             'yellow_card', 'second_yellow_card', 'red_card',
                             'substitution')
@@ -155,6 +165,7 @@ fb_resolved AS (
     SELECT
         COALESCE(xm.canonical_id, fb.src_match_id)           AS match_id,
         CASE
+            WHEN fb.event_phase = 'shootout' THEN 4
             WHEN fb.minute <= 45 THEN 1
             WHEN fb.minute <= 90 THEN 2
             ELSE 3
@@ -192,7 +203,7 @@ fb_resolved AS (
        AND xp_rel.source_id = fb.related_raw
        AND xp_rel.league    = fb.league
        AND xp_rel.season    = fb.season
-    WHERE fb.minute IS NOT NULL
+    WHERE (fb.minute IS NOT NULL OR fb.event_phase = 'shootout')
       AND fb.event_type IS NOT NULL
 ),
 
@@ -281,7 +292,10 @@ ws_match_bridge AS (
         s.away_team                              AS away_team_name,
         xt_home_ws.canonical_id                  AS home_team_id,
         xt_away_ws.canonical_id                  AS away_team_id,
-        MAX(fme.match_id)                        AS fbref_match_id  -- #445
+        MAX(
+            CASE WHEN match_scope.match_id IS NOT NULL
+                 THEN fme.match_id END
+        )                                        AS fbref_match_id  -- #445
     FROM ws_schedule_dedup s
     LEFT JOIN xref_team_canonical xt_home_ws
         ON xt_home_ws.source    = 'whoscored'
@@ -308,6 +322,8 @@ ws_match_bridge AS (
        AND fme.home   = xt_home_fb.source_id
        AND fme.away   = xt_away_fb.source_id
        AND fme.date   = CAST(s.date AS date)
+    LEFT JOIN iceberg.gold.dim_match match_scope
+        ON match_scope.match_id = fme.match_id
     WHERE s.rn = 1
     -- #445: ordinals, NOT select aliases — Trino raises COLUMN_NOT_FOUND on
     -- same-level aliases in GROUP BY (DuckDB-based tests mask this).
@@ -524,6 +540,7 @@ enriched AS (
             WHEN 'own_goal'       THEN 1
             WHEN 'penalty_goal'   THEN 1
             WHEN 'penalty_missed' THEN 2
+            WHEN 'penalty_shootout_attempt' THEN 2
             WHEN 'yellow_card'    THEN 3
             WHEN 'second_yellow'  THEN 4
             WHEN 'red_card'       THEN 5
@@ -562,7 +579,8 @@ SELECT
     CASE s.period_num
         WHEN 1 THEN '1H'
         WHEN 2 THEN '2H'
-        ELSE 'ET'
+        WHEN 3 THEN 'ET'
+        ELSE 'SO'
     END                                                      AS period,
     s.minute                                                 AS minute,
     s.minute_added                                           AS minute_added,

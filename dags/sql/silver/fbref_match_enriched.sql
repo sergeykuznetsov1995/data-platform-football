@@ -21,7 +21,8 @@
 --   * lineups has no team_side — determined via JOIN with schedule (team = home/away).
 --   * event_type values are lowercase: goal, penalty, own_goal, yellow_card, second_yellow_card, red_card, substitution.
 --   * All numeric columns use TRY_CAST to enforce proper types in Silver.
---   * Score is the OFFICIAL result — see the home_score/away_score comment below (#898).
+--   * score/home_score/away_score preserve the value published by FBref.
+--     Official and on-field results are separate additive contracts (#901/#902).
 --   * Partitioning by (league, season) is applied externally by Python CTAS.
 -- =============================================================================
 
@@ -45,7 +46,21 @@ WITH sch_raw AS (
                    || '|' || COALESCE(CAST(home AS VARCHAR), '')
                    || '|' || COALESCE(CAST(away AS VARCHAR), '')
                ))))
-           ) AS match_id
+           ) AS match_id,
+           CASE
+               WHEN REGEXP_LIKE(COALESCE(source_season_id, ''), '^\d{4}$')
+                   THEN source_season_id
+               WHEN REGEXP_LIKE(
+                   COALESCE(source_season_id, ''), '^\d{4}-\d{4}$'
+               ) THEN SUBSTR(source_season_id, 3, 2)
+                      || SUBSTR(source_season_id, 8, 2)
+               WHEN NULLIF(TRIM(source_season_id), '') IS NOT NULL
+                   THEN TRIM(source_season_id)
+               WHEN league = 'INT-World Cup'
+                   THEN LPAD(CAST(season AS varchar), 4, '0')
+               ELSE LPAD(CAST(MOD(season, 100) AS varchar), 2, '0')
+                    || LPAD(CAST(MOD(season + 1, 100) AS varchar), 2, '0')
+           END AS normalized_season
     FROM iceberg.bronze.fbref_schedule
 ),
 
@@ -56,6 +71,23 @@ sch AS (
                ORDER BY _ingested_at DESC, _batch_id DESC
            ) AS rn
     FROM sch_raw
+),
+
+-- Rendered from configs/medallion/match_result_overrides.yaml by the Airflow
+-- task.  The typed NULL row keeps this file valid as a standalone SELECT for
+-- SQL/static tests; production rendering replaces it and rejects incomplete or
+-- duplicate evidence before Trino runs.
+official_overrides AS (
+    SELECT match_id, league, season, official_home_score, official_away_score,
+           authority, reference, reason
+    FROM (VALUES
+        -- __MATCH_RESULT_OVERRIDES_VALUES__
+        (CAST(NULL AS varchar), CAST(NULL AS varchar), CAST(NULL AS varchar),
+         CAST(NULL AS integer), CAST(NULL AS integer), CAST(NULL AS varchar),
+         CAST(NULL AS varchar), CAST(NULL AS varchar))
+    ) AS t(match_id, league, season, official_home_score, official_away_score,
+           authority, reference, reason)
+    WHERE match_id IS NOT NULL
 ),
 
 ts AS (
@@ -78,13 +110,41 @@ events_dedup AS (
     FROM iceberg.bronze.fbref_match_events
 ),
 
+events_classified AS (
+    SELECT
+        e.*,
+        -- Current FBref scoreboxes encode shoot-out kicks as penalty events
+        -- with an empty minute.  Requiring a parenthesised schedule score keeps
+        -- a malformed ordinary penalty from being silently reclassified.
+        (e.event_type IN ('penalty', 'penalty_missed')
+         AND NULLIF(TRIM(e.minute), '') IS NULL
+         AND REGEXP_LIKE(s.score, '\(\d+\).*\(\d+\)')) AS is_shootout
+    FROM events_dedup e
+    INNER JOIN sch s
+        ON  s.match_id = e.match_id
+        AND s.rn = 1
+    WHERE e.rn = 1
+),
+
 events_agg AS (
     SELECT
         match_id,
+        COUNT(*)                                                                      AS event_row_count,
+        -- Legacy counters intentionally preserve their pre-#901 definition.
         COUNT(*) FILTER (WHERE event_type IN ('goal', 'penalty') AND team_side = 'home')  AS home_goals_events,
         COUNT(*) FILTER (WHERE event_type IN ('goal', 'penalty') AND team_side = 'away')  AS away_goals_events,
         COUNT(*) FILTER (WHERE event_type = 'own_goal' AND team_side = 'home')             AS home_own_goals,
         COUNT(*) FILTER (WHERE event_type = 'own_goal' AND team_side = 'away')             AS away_own_goals,
+        COUNT(*) FILTER (
+            WHERE NOT is_shootout
+              AND event_type IN ('goal', 'penalty', 'own_goal')
+              AND team_side = 'home'
+        ) AS on_field_home_score,
+        COUNT(*) FILTER (
+            WHERE NOT is_shootout
+              AND event_type IN ('goal', 'penalty', 'own_goal')
+              AND team_side = 'away'
+        ) AS on_field_away_score,
         COUNT(*) FILTER (WHERE event_type = 'yellow_card' AND team_side = 'home')          AS home_yellows,
         COUNT(*) FILTER (WHERE event_type = 'yellow_card' AND team_side = 'away')          AS away_yellows,
         COUNT(*) FILTER (WHERE event_type = 'second_yellow_card' AND team_side = 'home')    AS home_second_yellows,
@@ -92,9 +152,25 @@ events_agg AS (
         COUNT(*) FILTER (WHERE event_type = 'red_card' AND team_side = 'home')             AS home_reds,
         COUNT(*) FILTER (WHERE event_type = 'red_card' AND team_side = 'away')             AS away_reds,
         COUNT(*) FILTER (WHERE event_type = 'substitution')                                AS total_subs
-    FROM events_dedup
-    WHERE rn = 1
+    FROM events_classified
     GROUP BY match_id
+),
+
+event_availability AS (
+    SELECT match_id, availability, reason
+    FROM (
+        SELECT
+            match_id,
+            availability,
+            reason,
+            ROW_NUMBER() OVER (
+                PARTITION BY match_id, dataset
+                ORDER BY _ingested_at DESC, _batch_id DESC
+            ) AS rn
+        FROM iceberg.bronze.fbref_dataset_availability
+        WHERE dataset = 'match_events'
+    )
+    WHERE rn = 1
 ),
 
 -- Deduplicate lineups before aggregation (#463) — key MUST stay in sync with
@@ -133,20 +209,55 @@ SELECT
     sch.home,
     sch.away,
     sch.score,
-    -- score holds the OFFICIAL result, separator is EN DASH (U+2013):
-    --   * awarded matches carry the forfeit score ('0–3'), explained by `notes` (#898);
-    --     the on-pitch result stays available as home_goals_events/away_goals_events.
+    -- Legacy score fields preserve FBref's source-published value, separator
+    -- EN DASH (U+2013).  FBref is inconsistent for awarded matches, so these
+    -- columns must never be relabelled as official (#902).
     --   * a shoot-out renders as '(4) 1–1 (5)' — strip the penalty counts first, else the
     --     leading '(5)' of '(5) 0–3 (6)' is read as the home score (Düsseldorf 5–0 Bochum).
     -- Same normalisation as scripts/crossvalidate_fbref_scores.py.
     TRY_CAST(TRIM(SPLIT_PART(REGEXP_REPLACE(sch.score, '\(\d+\)\s*', ''), CHR(8211), 1)) AS INTEGER) AS home_score,
     TRY_CAST(TRIM(SPLIT_PART(REGEXP_REPLACE(sch.score, '\(\d+\)\s*', ''), CHR(8211), 2)) AS INTEGER) AS away_score,
+    sch.score AS source_score_raw,
+    TRY_CAST(TRIM(SPLIT_PART(REGEXP_REPLACE(sch.score, '\(\d+\)\s*', ''), CHR(8211), 1)) AS INTEGER) AS source_home_score,
+    TRY_CAST(TRIM(SPLIT_PART(REGEXP_REPLACE(sch.score, '\(\d+\)\s*', ''), CHR(8211), 2)) AS INTEGER) AS source_away_score,
     -- #913 Phase 3 (WC knockout): extract penalty shoot-out scores when present in score string.
     -- NULL when regular time or extra time decided the match. Used by dim_match + fct_team_match.points.
-    TRY_CAST(REGEXP_EXTRACT(sch.score, '\((\d+)\)[^0-9]*\((\d+)\)', 1) AS INTEGER) AS home_penalty,
-    TRY_CAST(REGEXP_EXTRACT(sch.score, '\((\d+)\)[^0-9]*\((\d+)\)', 2) AS INTEGER) AS away_penalty,
+    TRY_CAST(REGEXP_EXTRACT(sch.score, '^\s*\((\d+)\)', 1) AS INTEGER) AS home_penalty,
+    TRY_CAST(REGEXP_EXTRACT(sch.score, '\((\d+)\)\s*$', 1) AS INTEGER) AS away_penalty,
+    TRY_CAST(REGEXP_EXTRACT(sch.score, '^\s*\((\d+)\)', 1) AS INTEGER) AS home_shootout_score,
+    TRY_CAST(REGEXP_EXTRACT(sch.score, '\((\d+)\)\s*$', 1) AS INTEGER) AS away_shootout_score,
     sch.notes,
     LOWER(COALESCE(sch.notes, '')) LIKE 'match awarded to%'            AS is_awarded,
+    CASE
+        WHEN LOWER(COALESCE(sch.notes, '')) LIKE 'match awarded to%'
+            THEN ov.official_home_score
+        ELSE TRY_CAST(TRIM(SPLIT_PART(REGEXP_REPLACE(sch.score, '\(\d+\)\s*', ''), CHR(8211), 1)) AS INTEGER)
+    END AS official_home_score,
+    CASE
+        WHEN LOWER(COALESCE(sch.notes, '')) LIKE 'match awarded to%'
+            THEN ov.official_away_score
+        ELSE TRY_CAST(TRIM(SPLIT_PART(REGEXP_REPLACE(sch.score, '\(\d+\)\s*', ''), CHR(8211), 2)) AS INTEGER)
+    END AS official_away_score,
+    CASE
+        WHEN LOWER(COALESCE(sch.notes, '')) LIKE 'match awarded to%'
+            THEN CASE WHEN ov.match_id IS NULL THEN 'missing_override' ELSE 'medallion_override' END
+        ELSE 'fbref_schedule'
+    END AS official_score_provenance,
+    CASE
+        WHEN LOWER(COALESCE(sch.notes, '')) LIKE 'match awarded to%' THEN ov.authority
+        ELSE 'FBref'
+    END AS official_score_authority,
+    CASE
+        WHEN LOWER(COALESCE(sch.notes, '')) LIKE 'match awarded to%' THEN ov.reference
+        WHEN NULLIF(sch.match_url, '') IS NOT NULL THEN 'https://fbref.com' || sch.match_url
+    END AS official_score_reference,
+    CASE
+        WHEN LOWER(COALESCE(sch.notes, '')) LIKE 'match awarded to%' THEN 'awarded'
+        WHEN LOWER(COALESCE(sch.notes, '')) LIKE 'match cancelled%' THEN 'cancelled'
+        WHEN LOWER(COALESCE(sch.notes, '')) LIKE 'match suspended%' THEN 'suspended'
+        WHEN NULLIF(TRIM(sch.score), '') IS NOT NULL THEN 'played'
+        ELSE 'scheduled'
+    END AS result_status,
     TRY_CAST(TRY_CAST(sch.attendance AS DOUBLE) AS INTEGER) AS attendance,  -- float-strings ('34977.0') from the pandas-parsed bronze schedule
     sch.venue,
     sch.referee,
@@ -171,6 +282,11 @@ SELECT
     ea.away_goals_events,
     ea.home_own_goals,
     ea.away_own_goals,
+    ea.event_row_count,
+    av.availability AS event_availability,
+    av.reason AS event_availability_reason,
+    TRY_CAST(ea.on_field_home_score AS INTEGER) AS on_field_home_score,
+    TRY_CAST(ea.on_field_away_score AS INTEGER) AS on_field_away_score,
     ea.home_yellows,
     ea.away_yellows,
     ea.home_second_yellows,
@@ -192,12 +308,7 @@ SELECT
     -- season → slug ('2425'); FBref bronze stores year-start bigint (2024).
     -- The match_id hash above keeps the native year-start input → ids unchanged.
     sch.league,
-    -- #913 Phase 2: single_year (WC stores 2026 directly)
-    CASE WHEN sch.league = 'INT-World Cup'
-         THEN LPAD(CAST(sch.season AS varchar), 4, '0')
-         ELSE LPAD(CAST(MOD(sch.season, 100) AS varchar), 2, '0')
-              || LPAD(CAST(MOD(sch.season + 1, 100) AS varchar), 2, '0')
-    END AS season
+    sch.normalized_season AS season
 
 FROM sch
 LEFT JOIN ts
@@ -205,8 +316,14 @@ LEFT JOIN ts
     AND ts.rn        = 1
 LEFT JOIN events_agg ea
     ON  sch.match_id = ea.match_id
+LEFT JOIN event_availability av
+    ON  sch.match_id = av.match_id
 LEFT JOIN lineups_agg la
     ON  sch.match_id = la.match_id
+LEFT JOIN official_overrides ov
+    ON  ov.match_id = sch.match_id
+    AND ov.league  = sch.league
+    AND ov.season  = sch.normalized_season
 WHERE sch.rn = 1
   -- match_id is now ALWAYS non-NULL thanks to the COALESCE in sch_raw (real id or 'fut_<xxhash>').
   -- We still filter out rows missing the date (junk) and the literal header row that the FBref

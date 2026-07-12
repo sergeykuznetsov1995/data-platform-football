@@ -1,0 +1,23 @@
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.fbref_player_identity
+  description: |
+    Exact deterministic FBref identity universe across season stats, keeper,
+    match-player, lineup and match-keeper datasets. Native ids are preserved;
+    missing ids recover only from a unique normalized name (then exact team),
+    otherwise receive a stable noid_<xxhash64>. No fuzzy identity merge.
+    Grain: (player_id, team_name, league, season).
+  tags: [Tier.Silver, Domain.Football, PII.Low]
+columns:
+  - name: player_id
+    description: Native/recovered FBref id or deterministic noid_ synthetic id.
+  - name: player_name
+    description: Latest source display name.
+  - name: team_name
+    description: Latest source team spell for this identity-season.
+  - name: is_synthetic
+    description: True only for unresolved residual identities.
+  - name: id_resolution
+    description: source_native | recovered_unique_native | synthetic_residual.
+  - name: id_evidence_datasets
+    description: Sorted set of FBref datasets supporting the identity.
+relationships: []

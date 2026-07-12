@@ -18,6 +18,8 @@ template text (no Trino engine).
 from __future__ import annotations
 
 import re
+import sys
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -71,9 +73,26 @@ class TestDimMatchStarStructure:
             "bronze season bigint -> slug conversion (LPAD/MOD idiom) missing"
         )
 
+    def test_manager_season_prefers_source_native_shape(self):
+        sql = _strip_comments(_read_sql())
+        assert "source_season_id" in sql
+        assert "^[0-9]{4}$" in sql
+        assert "^[0-9]{4}-[0-9]{4}$" in sql
+
     def test_venue_alias_placeholder_present(self):
         """venue_id resolves via the SAME alias VALUES as dim_venue."""
         assert "{{ venue_aliases_values_sql }}" in _read_sql()
+
+    def test_config_scope_is_an_inner_join_on_league_and_season(self):
+        sql = _strip_comments(_read_sql())
+        assert "{{ in_scope_competition_seasons_values_sql }}" in _read_sql()
+        assert re.search(
+            r"INNER\s+JOIN\s+gold_scope\s+scope\s+"
+            r"ON\s+scope\.league\s*=\s*m\.league\s+"
+            r"AND\s+scope\.season\s*=\s*m\.season",
+            sql,
+            re.IGNORECASE,
+        ), "all-male Silver must be bounded to configured Gold league/seasons"
 
     def test_every_xref_join_has_league_and_season_predicate(self):
         """All 4 xref JOIN blocks carry league AND season equality —
@@ -130,3 +149,54 @@ class TestDimMatchStarStructure:
         sql = _strip_comments(_read_sql())
         assert "CREATE TABLE" not in sql.upper()
         assert "INSERT INTO" not in sql.upper()
+
+
+def test_dim_match_renderer_excludes_out_of_scope_silver_pairs(
+    monkeypatch, tmp_path
+):
+    yaml = pytest.importorskip("yaml")
+    config = textwrap.dedent("""\
+        competitions:
+          - id: "ENG-Premier League"
+            name: "Premier League"
+            country: "England"
+            tier: 1
+            in_scope: true
+            seasons:
+              - id: 2526
+                format: "league_round_robin"
+                team_count: 20
+                start: "2025-08-15"
+                end: "2026-05-24"
+            sources: {primary: [fbref], fallback: []}
+          - id: "OUT-Discovered Cup"
+            name: "Discovered Cup"
+            country: "Elsewhere"
+            tier: 1
+            competition_format: "group_knockout"
+            in_scope: false
+            seasons:
+              - id: 2026
+                format: "group_knockout"
+                team_count: 8
+                match_count: 15
+                start: "2026-01-01"
+                end: "2026-02-01"
+            sources: {primary: [fbref], fallback: []}
+        """)
+    dags_dir = PROJECT_ROOT / "dags"
+    if str(dags_dir) not in sys.path:
+        sys.path.insert(0, str(dags_dir))
+    from utils import dim_loaders, medallion_config
+
+    monkeypatch.setattr(
+        medallion_config,
+        "load_competitions",
+        lambda: yaml.safe_load(config),
+    )
+    out = tmp_path / "dim_match.sql"
+    dim_loaders.render_dim_match_sql(str(SQL_PATH), str(out))
+    rendered = out.read_text()
+
+    assert "('ENG-Premier League', '2526')" in rendered
+    assert "OUT-Discovered Cup" not in rendered

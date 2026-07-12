@@ -95,8 +95,7 @@ _ALLOW_URL_SUBSTRINGS = (
     "turnstile.cloudflare.com",
     "/cdn-cgi/challenge-platform/",
 )
-# Analytics / tracking hosts to abort regardless of type (ported from
-# nodriver_bypass.BLOCKED_URL_PATTERNS, globs -> substrings). Do NOT add
+# Analytics / tracking hosts to abort regardless of type. Do NOT add
 # challenges/turnstile.cloudflare.com here — they are required for the bypass.
 _BLOCK_URL_SUBSTRINGS = (
     "google-analytics.com", "googletagmanager.com", "doubleclick.net",
