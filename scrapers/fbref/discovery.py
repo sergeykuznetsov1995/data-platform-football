@@ -70,6 +70,14 @@ _SEASON_STAT_ROUTES = {
     "misc",
     "keepers",
 }
+_COMPETITION_ID_RE = re.compile(r"^\d+$")
+# Route segments FBref places directly under a competition; a segment in this
+# position is therefore a sub-page, never a season id.
+_COMP_SUBPAGE_ROUTES = (
+    {"history", "schedule", "standings"}
+    | _SEASON_STAT_ROUTES
+    | set(UNAVAILABLE_SEASON_STAT_ROUTES)
+)
 
 
 class CompetitionFormat(str, Enum):
@@ -866,10 +874,39 @@ def parse_schedule_html(
     )
 
 
+def _has_season_component(route: Sequence[str]) -> bool:
+    """True when a comps route carries an explicit season segment.
+
+    The season segment is source-owned and may be opaque (``edition-42``), so
+    it is recognised structurally rather than by shape: it sits at ``route[2]``
+    ahead of the page slug, and a known sub-page route in that position means
+    the URL addresses the current season instead.
+    """
+    return len(route) >= 4 and route[2].casefold() not in _COMP_SUBPAGE_ROUTES
+
+
+def _current_season_competition(url: Optional[str]) -> Optional[str]:
+    """Return the competition whose current season this page *is*, if any.
+
+    FBref addresses a competition's current season without a season component
+    (``/en/comps/9/Premier-League-Stats``), so only such a page may lend its
+    season identity to the equally season-less links it carries.
+    """
+    if not url:
+        return None
+    route = [part for part in urlparse(str(url)).path.split("/") if part][1:]
+    if len(route) < 3 or route[0] != "comps":
+        return None
+    if not _COMPETITION_ID_RE.fullmatch(route[1]) or "history" in route:
+        return None
+    return None if _has_season_component(route) else route[1]
+
+
 def discover_page_links(
     html: str,
     *,
     parent_source_ids: Optional[Mapping[str, str]] = None,
+    parent_url: Optional[str] = None,
 ) -> List[DiscoveredPageLink]:
     """Inventory supported FBref page links without constructing any URL.
 
@@ -879,6 +916,7 @@ def discover_page_links(
     """
 
     inherited = dict(parent_source_ids or {})
+    current_season_parent = _current_season_competition(parent_url)
     found: Dict[tuple[str, str], DiscoveredPageLink] = {}
     for document in _document_soups(html):
         for anchor in document.find_all("a", href=True):
@@ -933,36 +971,50 @@ def discover_page_links(
                 else:
                     page_kind = "player"
             elif len(route) >= 2 and route[0] == "comps":
+                if not _COMPETITION_ID_RE.fullmatch(route[1]):
+                    # e.g. the /en/comps/season/<year> navigation index, which
+                    # is not a competition page at all.
+                    continue
                 source_ids["competition_id"] = route[1]
                 if "history" in route:
                     page_kind = "competition"
                 elif len(route) >= 3:
-                    source_ids["season_id"] = route[2]
-                    if "schedule" in route:
+                    if _has_season_component(route):
+                        season_id = route[2]
+                        sub_route = route[3] if len(route) >= 4 else None
+                    else:
+                        # A season-less comps link addresses the competition's
+                        # current season, whose id no page states.  Only a
+                        # current-season page of the same competition may lend
+                        # it: inheriting a historical parent's season would
+                        # mint a target whose canonical URL already belongs to
+                        # the registry-seeded current-season target.
+                        if current_season_parent != route[1]:
+                            continue
+                        season_id = str(inherited.get("season_id") or "").strip()
+                        if not season_id:
+                            continue
+                        sub_route = route[2]
+                    source_ids["season_id"] = season_id
+                    sub_route = (sub_route or "").casefold()
+                    if sub_route == "schedule":
                         page_kind = "schedule"
-                    elif "standings" in route:
+                    elif sub_route == "standings":
                         page_kind = "standings"
-                    elif (
-                        len(route) >= 4
-                        and route[3].casefold()
-                        in UNAVAILABLE_SEASON_STAT_ROUTES
-                    ):
+                    elif sub_route in UNAVAILABLE_SEASON_STAT_ROUTES:
                         # These links are still advertised by FBref, but live
                         # availability audits found only restricted/empty
                         # statistical cells.  Skipping before frontier fan-out
                         # avoids a paid request and, importantly, prevents the
                         # route from falling through as a season overview.
                         continue
-                    elif (
-                        len(route) >= 4
-                        and route[3].casefold() in _SEASON_STAT_ROUTES
-                    ):
+                    elif sub_route in _SEASON_STAT_ROUTES:
                         # Stats subpages share a competition/season identity
                         # but are distinct canonical pages.  Keeping the route
                         # discriminator prevents them from colliding with the
                         # season overview in the durable frontier.
                         page_kind = "season_stats"
-                        source_ids["stat_route"] = route[3]
+                        source_ids["stat_route"] = sub_route
                     else:
                         page_kind = "season"
             if page_kind is None:
