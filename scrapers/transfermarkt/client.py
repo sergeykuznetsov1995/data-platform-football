@@ -64,7 +64,7 @@ _CHALLENGE_MARKERS = (
 # Deep catalogue pagination draws sporadic upstream 502/504s; each retry rotates
 # to a fresh exit, so a required page needs more than a couple of exits before a
 # whole cycle is abandoned.  The run-wide retry ledger is the real bound.
-_MAX_FETCH_ATTEMPTS = 6
+_MAX_FETCH_ATTEMPTS = 8
 
 _URL_CREDENTIALS_RE = re.compile(
     r"(?P<scheme>(?:https?|socks[45])://)(?P<credentials>[^/@\s]+)@",
