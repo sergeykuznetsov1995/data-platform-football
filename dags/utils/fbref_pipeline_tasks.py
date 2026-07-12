@@ -27,6 +27,9 @@ logger = logging.getLogger(__name__)
 DEFAULT_PROXY_FILE = "/opt/airflow/proxys.txt"
 FETCH_WAVE_RUNNER = "/opt/airflow/dags/scripts/run_fbref_fetch_wave.py"
 FETCH_WAVE_RESULT_PREFIX = "FBREF_FETCH_WAVE_RESULT:"
+# A full 25-page wave sleeps 3s per page and needs one clearance bootstrap, so
+# it finishes in minutes.  Anything past this is a hung browser, not slow work.
+FETCH_WAVE_TIMEOUT_SECONDS = 30 * 60
 
 
 def _pipeline():
@@ -215,12 +218,22 @@ def fetch_fbref_wave(
     if proxy_file:
         command += ["--proxy-file", proxy_file]
 
-    completed = subprocess.run(
-        command,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=FETCH_WAVE_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        # A hung clearance keeps the browser inside Playwright's event loop and
+        # never returns, holding this wave's fenced leases until they expire.
+        # Fail closed so the DAG's failure callback releases them now.
+        raise RuntimeError(
+            "FBref fetch wave subprocess exceeded "
+            f"{FETCH_WAVE_TIMEOUT_SECONDS}s and was killed"
+        ) from exc
     if completed.stderr:
         logger.info("FBref fetch wave stderr:\n%s", completed.stderr.strip())
     if completed.returncode != 0:
