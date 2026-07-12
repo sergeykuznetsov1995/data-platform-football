@@ -12,6 +12,7 @@ Storage Pipeline:
 import logging
 import os
 import time
+import uuid
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 
@@ -440,8 +441,25 @@ WITH (
                 return f"DATE '{safe}'"
 
             if 'TIMESTAMP' in tt:
+                timestamp = None
                 if isinstance(val, (datetime, pd.Timestamp)):
-                    ts_str = val.strftime('%Y-%m-%d %H:%M:%S.%f')
+                    timestamp = pd.Timestamp(val)
+                elif isinstance(val, str):
+                    try:
+                        timestamp = pd.Timestamp(val)
+                    except (TypeError, ValueError):
+                        pass
+                if timestamp is not None and not pd.isna(timestamp):
+                    if 'WITH TIME ZONE' in tt:
+                        if timestamp.tzinfo is None:
+                            timestamp = timestamp.tz_localize('UTC')
+                        else:
+                            timestamp = timestamp.tz_convert('UTC')
+                        ts_str = timestamp.strftime('%Y-%m-%d %H:%M:%S.%f')
+                        return f"TIMESTAMP '{ts_str} UTC'"
+                    if timestamp.tzinfo is not None:
+                        timestamp = timestamp.tz_convert('UTC').tz_localize(None)
+                    ts_str = timestamp.strftime('%Y-%m-%d %H:%M:%S.%f')
                     return f"TIMESTAMP '{ts_str}'"
                 safe = str(val).replace("'", "''")
                 return f"TIMESTAMP '{safe}'"
@@ -532,10 +550,14 @@ WITH (
             pending_rows = []
             pending_bytes = len(header)
 
-        for _, row in df.iterrows():
+        # ``iterrows`` boxes every scalar into a Series and can silently
+        # coerce integer identifiers to float.  Tuple iteration preserves the
+        # DataFrame's column order/types and is substantially faster for the
+        # wide, long-form WhoScored stat batches. SQL is still flushed in
+        # bounded multi-row VALUES chunks; there is never one query per row.
+        for source_values in df.itertuples(index=False, name=None):
             values = []
-            for col in df.columns:
-                val = row[col]
+            for col, val in zip(df.columns, source_values):
                 target_type = table_col_types.get(col.lower(), '')
                 values.append(self._format_sql_value(val, target_type))
             row_sql = f"({', '.join(values)})"
@@ -622,13 +644,15 @@ WITH (
             return 0
 
         # Parallel ingestion shards must never share a predictable staging
-        # table. Existing callers retain the historical name; distributed
-        # callers pass a run/task/map/try/UUID-qualified token.
+        # table. Distributed callers pass a run/task/map/try/UUID-qualified
+        # token; everyone else gets a random suffix — a deterministic
+        # ``{table}__stg`` races as soon as two mapped Airflow tasks write the
+        # same target: one task can drop or populate the other's stage.
         if staging_id:
             validate_identifier(staging_id, "staging id")
             stage = f"{table}__stg_{staging_id}"
         else:
-            stage = f"{table}__stg"  # compatibility for existing callers
+            stage = f"{table}__stg_{uuid.uuid4().hex[:12]}"
         qualified_target = validate_catalog_qualified_name(self.catalog, schema, table)
         qualified_stage = validate_catalog_qualified_name(self.catalog, schema, stage)
 

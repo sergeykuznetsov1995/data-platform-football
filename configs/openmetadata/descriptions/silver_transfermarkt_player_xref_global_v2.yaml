@@ -1,0 +1,18 @@
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.transfermarkt_player_xref_global_v2
+  description: |
+    Shadow global player bridge. A canonical id is exposed only for a unique
+    Transfermarkt-id to canonical-id mapping in both directions across all
+    league/seasons. Conflicts retain NULL canonical_id and block cutover.
+  tags: [Tier.Silver, Domain.Football, PII.Low]
+columns:
+  - name: player_id
+    description: Transfermarkt player id; table natural key.
+  - name: canonical_id
+    description: Canonical player id, present only for resolved rows.
+  - name: resolution_status
+    description: resolved, orphan, source_conflict, or canonical_conflict.
+relationships:
+  - from: canonical_id
+    to: trino_iceberg.iceberg.silver.xref_player.canonical_id
+    type: FOREIGN_KEY

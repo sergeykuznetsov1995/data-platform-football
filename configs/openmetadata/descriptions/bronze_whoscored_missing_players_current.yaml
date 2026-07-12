@@ -1,0 +1,19 @@
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.whoscored_missing_players_current
+  description: |
+    Канонический список отсутствующих игроков WhoScored parser v7. Представление
+    выбирает последний успешный preview manifest по game_id; успешный пустой
+    batch корректно скрывает устаревший список. Grain — игрок команды в матче.
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: game_id
+    description: Числовой идентификатор матча WhoScored.
+  - name: player_id
+    description: Числовой идентификатор игрока WhoScored.
+  - name: reason
+    description: Причина отсутствия из источника.
+  - name: _preview_batch_id
+    description: Идентификатор успешно опубликованного preview batch.

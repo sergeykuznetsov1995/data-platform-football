@@ -25,6 +25,8 @@
 #                       (число матчей не выводится из team_count; #920 Phase 2)
 #   sources.primary   — sources с >80% coverage (R0.1 verdict)
 #   sources.fallback  — sources с partial coverage / per-metric fallback
+#   sources.whoscored — immutable region_id/tournament_id used by the source-owned
+#                       WhoScored discovery catalog (no soccerdata global registry)
 #   in_scope          — true = currently materialized in Gold; false = stub
 #   notes             — rationale, deferral target
 # =============================================================================
@@ -90,6 +92,9 @@ competitions:
         end: "2026-05-24"
     sources:
       primary: ["fbref", "understat"]
+      whoscored:
+        region_id: 252
+        tournament_id: 2
       fallback:
         - "whoscored"
         - "sofascore"
@@ -168,6 +173,9 @@ competitions:
         end: "2026-05-24"
     sources:
       primary: ["fbref", "understat"]
+      whoscored:
+        region_id: 206
+        tournament_id: 4
       fallback:
         - "whoscored"
         - "sofascore"
@@ -234,6 +242,9 @@ competitions:
         end: "2026-05-24"
     sources:
       primary: ["fbref", "understat"]
+      whoscored:
+        region_id: 108
+        tournament_id: 5
       fallback:
         - "whoscored"
         - "sofascore"
@@ -301,6 +312,9 @@ competitions:
         end: "2026-05-25"
     sources:
       primary: ["fbref", "understat"]
+      whoscored:
+        region_id: 81
+        tournament_id: 3
       fallback:
         - "whoscored"
         - "sofascore"
@@ -369,6 +383,9 @@ competitions:
         end: "2026-05-29"
     sources:
       primary: ["fbref", "understat"]
+      whoscored:
+        region_id: 74
+        tournament_id: 22
       fallback:
         - "whoscored"
         - "sofascore"
@@ -419,6 +436,9 @@ competitions:
         end: "2026-07-19"
     sources:
       primary: ["fbref", "fotmob", "sofascore", "espn", "whoscored"]
+      whoscored:
+        region_id: 247
+        tournament_id: 36
       fallback: []
     in_scope: true
     notes: "ЧМ-2026 (issue #913 Phase 1). 5 источников. single-year сезон. Bronze ingest до финала 19 июля."

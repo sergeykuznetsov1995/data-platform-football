@@ -1,0 +1,16 @@
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.transfermarkt_coach_stints
+  description: |
+    Global Transfermarkt-declared coach employment intervals. Grain is
+    (club_id, coach_id, appointed_date, left_date), with nullable bounds.
+    Missing bounds never imply membership in every scraped season.
+  tags: [Tier.Bronze, Domain.Football, PII.Low]
+columns:
+  - name: club_id
+    description: Global Transfermarkt club id.
+  - name: coach_id
+    description: Global Transfermarkt coach id.
+  - name: appointed_date
+    description: Inclusive start date when published; nullable.
+  - name: left_date
+    description: Published end date when available; nullable.

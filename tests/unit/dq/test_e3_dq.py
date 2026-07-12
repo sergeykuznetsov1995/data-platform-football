@@ -45,9 +45,10 @@ class TestCheckCounts:
     """Per-table check counts must match the contract documented in e3_dq.py."""
 
     def test_silver_e3_total_check_count(self):
-        """Silver builders compose 8 sub-builders = 40 checks total.
+        """Silver builders compose 8 sub-builders = 39 standard checks.
 
-        whoscored_events_spadl (9) + whoscored_team_match (T6.3) +
+        whoscored_events_spadl (8 standard + one custom ratio check in DAG) +
+        whoscored_team_match (T6.3) +
         understat_team_match (T6.2) + espn_lineup (4) + sofascore_player_profile +
         sofascore_league_table (6, #702) + sofascore_team_match (T6.4) +
         sofascore_shots (3, #602). The 3 *_team_season rollups migrated to Gold
@@ -56,23 +57,21 @@ class TestCheckCounts:
         ``build_silver_e3_checks``.
         """
         checks = e3_dq.build_silver_e3_checks()
-        assert len(checks) == 40, (
-            f"Silver E3 expected 40 checks, got {len(checks)}: "
+        assert len(checks) == 39, (
+            f"Silver E3 expected 39 checks, got {len(checks)}: "
             f"{[c.name for c in checks]}"
         )
 
     def test_silver_whoscored_events_spadl_count(self):
-        """whoscored_events_spadl has 9 checks. Some have custom names
-        (``spadl_coverage_unknown_rate``, ``spadl_action_enum_violation``,
-        ``schema_version_literal_drift``) so we count by the params['table']
-        attribute rather than by name substring.
+        """whoscored_events_spadl has 8 registry checks; its scale-aware
+        unknown coverage is a custom CheckResult appended by the DAG.
         """
         checks = e3_dq.build_silver_e3_checks()
         spadl = [
             c for c in checks
             if c.params.get("table") == "iceberg.silver.whoscored_events_spadl"
         ]
-        assert len(spadl) == 9
+        assert len(spadl) == 8
 
     def test_silver_espn_lineup_count(self):
         """espn_lineup has 4 checks (PK + nulls + row_count + freshness)."""
@@ -142,13 +141,13 @@ class TestCheckCounts:
         assert len(fct_lineup) == 14  # +lineup_starter_orphan_zero ERROR (#839)
 
     def test_build_all_e3_checks_total(self):
-        """40 silver + 36 gold = 76 total E3 standard DQ checks.
+        """39 silver + 36 gold = 75 total E3 standard DQ checks.
 
         Bump when either ``build_silver_e3_checks`` (40) or
         ``build_gold_e3_checks`` (36) gains a builder.
         """
         all_checks = e3_dq.build_all_e3_checks()
-        assert len(all_checks) == 76
+        assert len(all_checks) == 75
 
 
 # ===========================================================================
@@ -554,15 +553,11 @@ class TestOrphanAndCoverageGuards:
         assert "lineup_source = 'fbref'" in ln.params["where"]
         assert ln.params["max_rows"] == int(0.03 * 145_000)
 
-    def test_spadl_unknown_rate_capped(self):
-        """spadl_coverage_unknown_rate is a table-wide absolute cap: ~40K
-        (≈5.75% of a ~700K league-season) × 12 league-season headroom
-        (9 EPL + WC-2026 live, #913). Per-season drift is guarded by
-        spadl_unknown_rate[season=...]."""
+    def test_spadl_unknown_coverage_is_custom_not_absolute_registry_check(self):
         checks = e3_dq.build_silver_e3_checks()
-        unk = next(c for c in checks if c.name == "spadl_coverage_unknown_rate")
-        assert unk.severity == "ERROR"
-        assert unk.params["max_rows"] == 480_000
+        assert not any(c.name == "spadl_coverage_unknown_rate" for c in checks)
+        assert e3_dq.SPADL_UNKNOWN_ABSOLUTE_CAP == 480_000
+        assert e3_dq.SPADL_UNKNOWN_RATIO_CAP == 0.05
 
 
 # ===========================================================================
@@ -622,8 +617,82 @@ class TestSofaScoreShotsAndAudit:
 
 
 # ===========================================================================
-# Parity check
+# Scale-aware SPADL unknown coverage + parity checks
 # ===========================================================================
+
+
+def _conn_returning_spadl_counts(eligible_rows, unknown_rows):
+    from unittest.mock import MagicMock
+
+    cursor = MagicMock()
+    cursor.fetchone.return_value = (eligible_rows, unknown_rows)
+    conn = MagicMock()
+    conn.cursor.return_value = cursor
+    conn.close.return_value = None
+    return conn
+
+
+class TestSpadlUnknownCoverageCheck:
+    def test_live_scale_passes_on_healthy_ratio_above_legacy_absolute_cap(self):
+        from unittest.mock import patch
+
+        conn = _conn_returning_spadl_counts(28_074_491, 1_091_127)
+        with patch.object(e3_dq, '_get_conn', return_value=conn):
+            result = e3_dq.spadl_unknown_coverage_check()
+
+        assert result.passed is True
+        assert result.severity == 'ERROR'
+        assert result.value['unknown_rows'] == 1_091_127
+        assert result.value['eligible_rows'] == 28_074_491
+        assert result.value['unknown_ratio'] == pytest.approx(0.038865, abs=1e-6)
+        assert result.value['effective_cap'] == pytest.approx(1_403_724.55)
+        assert 'unknown_rows=1091127' in result.details
+        assert 'unknown_ratio=3.8865%' in result.details
+
+    def test_fails_when_unknown_exceeds_both_absolute_and_ratio_caps(self):
+        from unittest.mock import patch
+
+        conn = _conn_returning_spadl_counts(20_000_000, 1_000_001)
+        with patch.object(e3_dq, '_get_conn', return_value=conn):
+            result = e3_dq.spadl_unknown_coverage_check()
+
+        assert result.passed is False
+        assert result.value['effective_cap'] == 1_000_000
+        assert result.value['unknown_ratio'] > e3_dq.SPADL_UNKNOWN_RATIO_CAP
+
+    def test_legacy_absolute_cap_remains_the_small_corpus_floor(self):
+        from unittest.mock import patch
+
+        conn = _conn_returning_spadl_counts(1_000_000, 480_000)
+        with patch.object(e3_dq, '_get_conn', return_value=conn):
+            result = e3_dq.spadl_unknown_coverage_check()
+
+        assert result.passed is True
+        assert result.value['effective_cap'] == 480_000
+
+    def test_zero_denominator_fails_closed(self):
+        from unittest.mock import patch
+
+        conn = _conn_returning_spadl_counts(0, 0)
+        with patch.object(e3_dq, '_get_conn', return_value=conn):
+            result = e3_dq.spadl_unknown_coverage_check()
+
+        assert result.passed is False
+        assert result.severity == 'ERROR'
+        assert result.value['unknown_ratio'] is None
+        assert 'denominator must be positive' in result.details
+
+    def test_query_error_fails_closed(self):
+        from unittest.mock import patch
+
+        with patch.object(
+            e3_dq, '_get_conn', side_effect=RuntimeError('trino unavailable')
+        ):
+            result = e3_dq.spadl_unknown_coverage_check()
+
+        assert result.passed is False
+        assert result.severity == 'ERROR'
+        assert result.error == 'trino unavailable'
 
 
 class TestParityCheckExportedAndShape:
@@ -641,6 +710,7 @@ class TestParityCheckExportedAndShape:
         assert "build_gold_e3_checks" in e3_dq.__all__
         assert "build_all_e3_checks" in e3_dq.__all__
         assert "parity_check_event_counts" in e3_dq.__all__
+        assert "spadl_unknown_coverage_check" in e3_dq.__all__
         assert "SPADL_ACTION_ENUM" in e3_dq.__all__
         assert "SPADL_ACTION_SOURCE" in e3_dq.__all__
         assert "SPADL_ACTION_VERSION" in e3_dq.__all__

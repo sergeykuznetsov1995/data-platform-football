@@ -4,9 +4,11 @@
 table:
   fullyQualifiedName: trino_iceberg.iceberg.gold.fct_transfer
   description: |
-    Event-grain трансферов игроков (issue #429). Одна строка = один трансфер.
-    Чистая проекция silver.transfermarkt_transfers БЕЗ JOIN — gold row count
-    в точности равен silver row count (по DoD строки никогда не выбрасываются).
+    Глобальный event-grain трансферов игроков. Одна строка = одно source event,
+    PK = стабильный transfer_id. После native-v2 cutover canonical relation
+    маршрутизируется на gold.fct_transfer_v2; rollback возвращает legacy adapter
+    с тем же контрактом. event_season — сезон события, а не league/season окна,
+    в котором career history была скачана. Upcoming events без даты сохраняются.
 
     Orphan-ID стратегия: canonical id отсутствует у ≈18% игроков (U21 / loan-out
     / новички вне FBref-spine) и у большинства клубов (TM-имена резолвятся только
@@ -19,27 +21,32 @@ table:
     Резолвнутые клубы совпадают с dim_team.team_id точно; orphan'ы узнаются по
     'tm_'-префиксу. Soft-FK к dim_player / dim_team — WARNING-severity.
 
-    PK = (player_id, transfer_date, from_team_id, to_team_id). Партиционирования
-    нет (маленькая таблица, ~750 строк для APL '2526').
+    Лига не является атрибутом глобального события. Потребители, которым нужен
+    league scope, выводят его из membership/standings принимающего клуба в
+    event_season. Партиционирования нет.
   tags:
     - Tier.Gold
     - Domain.Football
     - PII.None
 columns:
   # ─── PK ───
+  - name: transfer_id
+    description: Стабильный глобальный идентификатор source event (PK).
   - name: player_id
     description: |
-      ID игрока (PK part) — COALESCE(canonical_id, 'tm_' || raw TM id).
+      ID игрока — COALESCE(canonical_id, 'tm_' || raw TM id).
       Soft FK → dim_player.player_id ('tm_'-orphan'ы вне dim).
   - name: transfer_date
-    description: Дата трансфера (PK part).
+    description: Дата трансфера; может быть NULL для undated upcoming event.
+  - name: event_season
+    description: Сезон сделки short-form '2526'; никогда не scrape season.
   - name: from_team_id
     description: |
-      ID клуба-отдающего (PK part) — COALESCE(canonical slug, 'tm_' || slug(name)).
+      ID клуба-отдающего — COALESCE(canonical slug, 'tm_' || slug(name)).
       Soft FK → dim_team.team_id.
   - name: to_team_id
     description: |
-      ID клуба-принимающего (PK part) — COALESCE(canonical slug, 'tm_' || slug(name)).
+      ID клуба-принимающего — COALESCE(canonical slug, 'tm_' || slug(name)).
       Soft FK → dim_team.team_id.
   # ─── Атрибуты трансфера ───
   - name: from_club_name
@@ -59,12 +66,6 @@ columns:
   # ─── Lineage ───
   - name: _bronze_ingested_at
     description: Timestamp ingest'а Bronze (source lineage, прокинут из silver).
-  - name: league
-    description: Лига (scope текущего ingest'а).
-  - name: season
-    description: Сезон short-form '2526' (scope текущего ingest-окна).
-  - name: _silver_created_at
-    description: Технический timestamp материализации строки CTAS-раннером.
 relationships:
   - from: player_id
     to: trino_iceberg.iceberg.gold.dim_player.player_id

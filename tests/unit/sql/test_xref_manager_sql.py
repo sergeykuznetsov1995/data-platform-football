@@ -15,7 +15,7 @@ Documented invariants we exercise:
   * confidence ∈ {'name_alias', 'name_normalize', 'name_initial', 'orphan'}
     with the cascade precedence alias > exact > initial > orphan.
   * Reads bronze.fbref_match_managers (spine), bronze.fotmob_player_details
-    (is_coach rows) and bronze.transfermarkt_coaches (coach_id bridge).
+    (is_coach rows) and native Transfermarkt coach stints/profiles.
   * name_initial ambiguity guards on both sides (HAVING unique spine key +
     TM-side initial_key_dup window).
   * NULL/empty manager/coach name is filtered out.
@@ -86,13 +86,26 @@ class TestXrefManagerStructure:
             "bronze.fotmob_player_details (is_coach rows)"
         )
 
-    def test_reads_bronze_transfermarkt_coaches(self):
-        """TM bridge reads from iceberg.bronze.transfermarkt_coaches."""
+    def test_reads_native_transfermarkt_coach_contract(self):
+        """TM bridge scopes global stints through native club memberships."""
         sql_lower = _read_sql().lower()
-        assert "iceberg.bronze.transfermarkt_coaches" in sql_lower, (
-            "xref_manager must read TM coaches from bronze.transfermarkt_coaches "
-            "(coach_id + dob/nationality carrier)"
-        )
+        for relation in (
+            "iceberg.bronze.transfermarkt_coach_stints",
+            "iceberg.bronze.transfermarkt_coach_profiles",
+            "iceberg.bronze.transfermarkt_squad_memberships",
+        ):
+            assert relation in sql_lower
+        assert "iceberg.bronze.transfermarkt_coaches" not in sql_lower
+
+    def test_tm_global_stints_are_scoped_to_tenure_overlap(self):
+        """A club's historical coaches must not fan out to every season."""
+        sql = _read_sql().lower()
+
+        assert "as season_start" in sql
+        assert "as season_end" in sql
+        assert "s.appointed_date is not null or s.left_date is not null" in sql
+        assert "try_cast(s.appointed_date as date) <= m.season_end" in sql
+        assert "try_cast(s.left_date as date) >= m.season_start" in sql
 
     def test_fotmob_filters_is_coach(self):
         """FotMob block keeps only coaches (is_coach = true)."""
@@ -114,7 +127,7 @@ class TestXrefManagerStructure:
         """TM source_id is the stable coach_id (cast to varchar in tm_coach)."""
         sql = _read_sql()
         assert re.search(
-            r"CAST\s*\(\s*coach_id\s+AS\s+varchar\s*\)",
+            r"CAST\s*\(\s*(?:s\.)?coach_id\s+AS\s+varchar\s*\)",
             sql, re.IGNORECASE,
         ), "expected CAST(coach_id AS varchar) for the TM source_id"
 

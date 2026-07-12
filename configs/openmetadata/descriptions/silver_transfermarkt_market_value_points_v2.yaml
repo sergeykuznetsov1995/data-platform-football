@@ -1,0 +1,11 @@
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.transfermarkt_market_value_points_v2
+  description: Typed unpartitioned global market-value points at (player_id, mv_date) grain.
+  tags: [Tier.Silver, Domain.Football, PII.Low]
+columns:
+  - name: player_id
+    description: Transfermarkt player id.
+  - name: canonical_id
+    description: Conflict-safe global canonical id; nullable for orphans.
+  - name: mv_date
+    description: Valuation date.

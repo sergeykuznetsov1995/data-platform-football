@@ -571,21 +571,29 @@ def _alias_lookup(
     source: str,
     source_id: str,
     season: Optional[str],
-) -> Optional[str]:
-    """Tier-3 fallback: hand-curated ``player_aliases.yaml`` override.
+) -> Tuple[Optional[str], Optional[str]]:
+    """Return ``(action, fbref_id)`` from ``player_aliases.yaml``.
 
-    Returns the FBref player_id (without ``fb_`` prefix) or None when no
-    entry covers ``(source, source_id, season)``. Lazy-imports
-    :mod:`utils.medallion_config` so DAG-parse cost stays cheap.
+    Positive mappings retain the legacy API. A negative ``orphan`` rule is
+    authoritative and protects verified DOB conflicts from automatic tiers.
 
     A missing YAML or empty list is the common case at E1 — the tier
     simply no-ops.
     """
     if not source or not source_id:
-        return None
-    from utils.medallion_config import get_player_alias  # lazy
+        return None, None
+    from utils.medallion_config import (  # lazy
+        get_player_alias,
+        get_player_alias_rule,
+    )
 
-    return get_player_alias(source, str(source_id), str(season or ''))
+    player_id = get_player_alias(source, str(source_id), str(season or ''))
+    if player_id:
+        return 'map', player_id
+    rule = get_player_alias_rule(source, str(source_id), str(season or ''))
+    if rule is not None and rule['action'] == 'orphan':
+        return 'orphan', None
+    return None, None
 
 
 def cascade_resolve(
@@ -641,6 +649,10 @@ def cascade_resolve(
     team = candidate.get('canonical_team')
     season = candidate.get('season')
 
+    alias_action, alias_pid = _alias_lookup(src, sid, season)
+    if alias_action == 'orphan':
+        return f'{_orphan_prefix(src)}_{sid}', 'orphan', None
+
     # Tier-1: exact FBref-id match.
     fid = spine.find_by_id(sid)
     if fid:
@@ -653,8 +665,7 @@ def cascade_resolve(
     # placed any later is unreachable for exactly the cases it is meant to fix
     # (#738: 'Bobby Reid' surname-collides into 'Harrison Reed'; 'Gabriel'
     # token_set_band is ambiguous across three real Gabriels).
-    alias_pid = _alias_lookup(src, sid, season)
-    if alias_pid:
+    if alias_action == 'map' and alias_pid:
         return f'fb_{alias_pid}', 'name_team_alias', 100.0
 
     # Tier-2: legacy token_sort_ratio ≥ NAME_THRESHOLD.
@@ -894,7 +905,7 @@ def _execute(conn, sql: str, fetch: bool = False):
 # 2024-25 (see docs/research/R2_player_resolver.md). Bronze schemas:
 #   * fbref_player_stats     -> player_id, player, squad, season(int), league
 #   * understat_players      -> player_id, player, team, season(varchar), league
-#   * whoscored_events       -> player_id, player, team, season(varchar), league
+#   * whoscored_events_current -> player_id, player, team, season(varchar), league
 # (squad/team naming difference is REAL — FBref calls it "squad").
 # Re-discovered column names would be a regression so they are pinned here.
 
@@ -1027,7 +1038,7 @@ def _fetch_whoscored_players(
 ) -> List[Dict[str, Any]]:
     # COUNT(DISTINCT game_id) is the games-played proxy used as the dedup
     # tiebreaker in _dedup_canonical_per_season (issue #70). WhoScored is
-    # event-grain; no native minutes column on bronze.whoscored_events.
+    # event-grain; no native minutes column on the Bronze current view.
     sql = f"""
         SELECT CAST(CAST(player_id AS bigint) AS varchar) AS pid,
                MAX(player) AS player,
@@ -1035,7 +1046,7 @@ def _fetch_whoscored_players(
                league,
                season,
                CAST(COUNT(DISTINCT CAST(game_id AS bigint)) AS DOUBLE) AS bronze_signal
-        FROM iceberg.bronze.whoscored_events
+        FROM iceberg.bronze.whoscored_events_current
         WHERE league = '{_sql_escape(league)}'
           AND season IN ({_seasons_in_clause(source_seasons)})
           AND player_id IS NOT NULL
@@ -1250,27 +1261,27 @@ def _fetch_transfermarkt_players(
 ) -> List[Dict[str, Any]]:
     """Read Transfermarkt player anchor rows for the resolver cascade.
 
-    Bronze ``transfermarkt_players`` is a per-season snapshot (one row per
-    (player_id, league, season)) with rich attributes — for the resolver
-    we only need name + current_club_name + season; the rest is consumed
-    by the downstream Silver CTAS (#60).
+    Native Bronze ``transfermarkt_squad_memberships`` has the real
+    (player, club, league, season) grain. For identity resolution we only need
+    its player name and club context; global careers and mutable attributes are
+    deliberately not reconstructed into the legacy player snapshot.
 
     Season is stored as the 4-digit slug ('2526') matching Understat /
     WhoScored / SofaScore conventions, so no slug conversion is needed.
     """
     sql = f"""
         SELECT
-            player_id,
-            name,
-            current_club_name,
+            CAST(player_id AS varchar),
+            player_name,
+            club_name,
             league,
             season
-        FROM iceberg.bronze.transfermarkt_players
+        FROM iceberg.bronze.transfermarkt_squad_memberships
         WHERE league = '{_sql_escape(league)}'
           AND season IN ({_seasons_in_clause(source_seasons)})
           AND player_id IS NOT NULL
-          AND name IS NOT NULL
-        GROUP BY player_id, name, current_club_name, league, season
+          AND player_name IS NOT NULL
+        GROUP BY CAST(player_id AS varchar), player_name, club_name, league, season
     """
     rows = _execute(conn, sql, fetch=True) or []
     out: List[Dict[str, Any]] = []
@@ -1544,7 +1555,7 @@ def _fetch_dob_maps(
         """,
         'transfermarkt': f"""
             SELECT CAST(player_id AS varchar), max_by(dob, _ingested_at)
-            FROM iceberg.bronze.transfermarkt_players
+            FROM iceberg.bronze.transfermarkt_player_attribute_observations
             WHERE league = '{lg}' AND season IN ({seasons})
               AND player_id IS NOT NULL
             GROUP BY CAST(player_id AS varchar)
@@ -1561,15 +1572,14 @@ def _fetch_dob_maps(
             WHERE player_id IS NOT NULL AND dob IS NOT NULL
             GROUP BY CAST(player_id AS varchar)
         """,
-        # whoscored_player_profile.date_of_birth is normalised to ISO by the
-        # scraper. player_id cast mirrors _fetch_whoscored_players so map
-        # keys line up with anchor source_ids.
+        # WhoScored V2 profiles are global/versioned; the current view exposes
+        # only the latest successfully manifested version per source player.
         'whoscored': """
-            SELECT CAST(CAST(player_id AS bigint) AS varchar),
-                   max_by(TRY_CAST(date_of_birth AS DATE), _ingested_at)
-            FROM iceberg.bronze.whoscored_player_profile
+            SELECT CAST(player_id AS varchar),
+                   max_by(date_of_birth, fetched_at)
+            FROM iceberg.silver.whoscored_player_profile_current
             WHERE player_id IS NOT NULL
-            GROUP BY CAST(CAST(player_id AS bigint) AS varchar)
+            GROUP BY CAST(player_id AS varchar)
         """,
     }
     maps = {src: _fetch_dob_map(conn, sql, src) for src, sql in queries.items()}

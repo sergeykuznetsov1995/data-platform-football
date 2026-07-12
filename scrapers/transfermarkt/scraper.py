@@ -19,26 +19,48 @@ with the JSON endpoints that the live site now exposes:
   - /ceapi/marketValueDevelopment/graph/{player_id}  →  MV history
   - /ceapi/transferHistory/list/{player_id}          →  transfer events
 
-See ``memory/feedback_transfermarkt_antibot_probe.md`` and
-``scripts/probe_transfermarkt.py`` for the probe that validated this setup.
+See ``scripts/research/bench_transfermarkt_fetch.py`` for the bounded live
+benchmark that validates the production transport and parser contracts.
 
 Source: https://www.transfermarkt.us
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import math
+import os
 import re
-import time
 from collections import defaultdict
-from datetime import date, datetime
-from typing import Dict, List, Optional, Tuple
-from urllib.parse import urlsplit
+from datetime import date, datetime, timezone
+from decimal import Decimal, InvalidOperation
+from typing import Dict, List, Mapping, Optional, Tuple
+from urllib.parse import urlsplit, urlunsplit
 
 import pandas as pd
 
 from scrapers.base.base_scraper import BaseScraper
+from scrapers.transfermarkt.client import (
+    ProxyFilterLeaseProvider,
+    TransfermarktHttpClient,
+)
+from scrapers.transfermarkt.models import (
+    FetchOutcome,
+    FetchRecord,
+    FetchStatus,
+    TransfermarktError,
+)
+from scrapers.transfermarkt.registry import (
+    CompetitionRecord,
+    SeasonFormat,
+    canonical_season,
+    deterministic_scope_id,
+    resolve_competition,
+)
+from scrapers.utils.proxy_manager import ProxyManager
+from scrapers.utils.rate_limiter import RateLimiter
 
 logger = logging.getLogger(__name__)
 
@@ -50,10 +72,6 @@ logger = logging.getLogger(__name__)
 # .us mirror is the most stable English-language host; same content as .com.
 _TM_BASE = "https://www.transfermarkt.us"
 
-# {league_slug}/startseite/wettbewerb/{comp_id}/plus/?saison_id={year}
-_LEAGUE_LISTING_PATH = (
-    "/{league_slug}/startseite/wettbewerb/{comp_id}/plus/?saison_id={year}"
-)
 # {club_slug}/kader/verein/{club_id}/saison_id/{year}/plus/1  (the /plus/1
 # variant exposes the wider, detailed squad table — same selector contract
 # as the default page but with extra metadata columns visible.)
@@ -68,24 +86,16 @@ _COACH_PROFILE_PATH = "/{coach_slug}/profil/trainer/{coach_id}"
 # matches). This page lists EVERY manager the club has had, with appointed /
 # end-of-tenure dates and a role; we keep the rows whose tenure overlaps the
 # requested season. No saison_id — the page is full history, filtered in
-# _parse_coach_history. NB: exact selectors must be confirmed via
-# scripts/probe_transfermarkt_coaches.py before the first prod run.
+# _parse_coach_history.  The production-client fixture/live validation is in
+# scripts/research/bench_transfermarkt_fetch.py.
 _CLUB_COACH_HISTORY_PATH = (
     "/{club_slug}/mitarbeiterhistorie/verein/{club_id}/plus/1"
 )
 
-# Canonical league-slug + competition-id mapping. Top-5 European leagues.
-# The {comp_id} (wettbewerb/GB1…) is the load-bearing key; the {league_slug}
-# is cosmetic in the URL. Codes are the long-stable Transfermarkt comp ids.
-TM_LEAGUE_MAP: Dict[str, Tuple[str, str]] = {
-    'ENG-Premier League': ('premier-league', 'GB1'),
-    'ESP-La Liga': ('laliga', 'ES1'),
-    'GER-Bundesliga': ('bundesliga', 'L1'),
-    'ITA-Serie A': ('serie-a', 'IT1'),
-    'FRA-Ligue 1': ('ligue-1', 'FR1'),
-}
-
 R0_2B_FALLBACK_MARKER = 'TM_FALLBACK'
+
+PARSER_REVISION = os.environ.get('TM_PARSER_VERSION', 'registry-v1')
+SCHEMA_REVISION = os.environ.get('TM_SCHEMA_VERSION', '3')
 
 # Per-player loops abort after this many fetch failures in a row (burned
 # proxies, CF lockout). Module-level so tests can monkeypatch it.
@@ -119,24 +129,42 @@ class PartialScrapeError(RuntimeError):
 # Pure helpers
 # ---------------------------------------------------------------------------
 
-def _season_short(season: int) -> str:
-    """``2025`` → ``'2526'`` (matches Bronze/Silver partition convention)."""
-    s = str(int(season))
-    if len(s) == 4 and s.isdigit():
-        return f"{s[2:4]}{(int(s[2:4]) + 1) % 100:02d}"
-    return s
+def _season_window(
+    season: int | str,
+    season_format: SeasonFormat | str,
+) -> Tuple[date, date]:
+    """Return explicit split-year or single-year bounds for coach histories."""
 
-
-def _season_window(season: int) -> Tuple[date, date]:
-    """Year-start ``season`` → the (start, end) dates of the football season.
-
-    APL seasons run roughly Jul 1 → Jun 30 the following year. Used by
-    _parse_coach_history to keep only the managers whose tenure overlaps the
-    requested season (issue #619). Generous bounds (Jul→Jun) tolerate pre-season
-    appointments and post-season departures without dropping a real stint.
-    """
     y = int(season)
-    return date(y, 7, 1), date(y + 1, 6, 30)
+    fmt = SeasonFormat(str(
+        season_format.value
+        if isinstance(season_format, SeasonFormat) else season_format
+    ))
+    if fmt is SeasonFormat.SPLIT_YEAR:
+        return date(y, 7, 1), date(y + 1, 6, 30)
+    if fmt is SeasonFormat.SINGLE_YEAR:
+        return date(y, 1, 1), date(y, 12, 31)
+    raise TransfermarktError('unknown season_format blocks coach-history crawl')
+
+
+def _competition_listing_url(
+    competition: CompetitionRecord,
+    edition_id: str | int,
+) -> str:
+    """Build a listing URL from the discovered source URL, preserving route type."""
+
+    parsed = urlsplit(competition.source_url)
+    path = parsed.path.rstrip('/')
+    if not path:
+        raise TransfermarktError(
+            f'{competition.competition_id}: source_url has no path'
+        )
+    # The .us mirror is the scraper's stable English host; source_url remains
+    # the exact .com lineage value in Bronze.
+    return urlunsplit((
+        'https', 'www.transfermarkt.us', f'{path}/plus/',
+        f'saison_id={edition_id}', '',
+    ))
 
 
 def _stint_overlaps_season(
@@ -144,10 +172,14 @@ def _stint_overlaps_season(
 ) -> bool:
     """True if a manager-stint's [appointed, left] interval overlaps the season
     window (issue #619). A missing ``left`` means the incumbent (open-ended);
-    a missing ``appointed`` means unbounded-left. Both missing → kept (rare
-    malformed row; a spurious bio fetch is cheaper than a missed caretaker)."""
+    a missing ``appointed`` means unbounded-left. A row with BOTH dates missing
+    is rejected: treating malformed rows as all-season stints causes needless
+    paid profile requests and false manager memberships.
+    """
     appointed = stint.get('appointed_date')
     left = stint.get('left_date')
+    if appointed is None and left is None:
+        return False
     return (appointed is None or appointed <= win_end) and \
            (left is None or left >= win_start)
 
@@ -173,7 +205,38 @@ def _coerce_int(raw) -> Optional[int]:
         return None
 
 
-_TM_MV_RE = re.compile(r'€\s*([\d.,]+)\s*(k|m|bn|b)?', re.IGNORECASE)
+_TM_MV_RE = re.compile(r'€\s*([\d.,]+)\s*(bn|k|m|b)?', re.IGNORECASE)
+
+
+def _normalise_decimal_number(raw: str) -> Optional[Decimal]:
+    """Parse either TM's dot-decimal or comma-decimal representation exactly."""
+
+    value = raw.strip().replace(' ', '')
+    if not value:
+        return None
+    if ',' in value and '.' in value:
+        # The right-most separator is decimal; the other is grouping.
+        decimal_sep = ',' if value.rfind(',') > value.rfind('.') else '.'
+        grouping_sep = '.' if decimal_sep == ',' else ','
+        value = value.replace(grouping_sep, '').replace(decimal_sep, '.')
+    elif ',' in value or '.' in value:
+        sep = ',' if ',' in value else '.'
+        parts = value.split(sep)
+        if len(parts) > 2:
+            # Repeated separators are grouping except for a final 1-2 digit
+            # decimal component (e.g. ``1.234.567,89`` handled above).
+            value = ''.join(parts)
+        elif len(parts) == 2:
+            whole, fraction = parts
+            value = (
+                whole + fraction
+                if len(fraction) == 3
+                else f"{whole}.{fraction}"
+            )
+    try:
+        return Decimal(value)
+    except InvalidOperation:
+        return None
 
 
 def _parse_tm_money_eur(raw) -> Optional[int]:
@@ -185,8 +248,8 @@ def _parse_tm_money_eur(raw) -> Optional[int]:
         '€1.20bn'     → 1_200_000_000
         '?' / '-' / '' → None
 
-    Decimal separator is the period (US/UK convention TM uses on .us); the
-    grouping comma is ignored.
+    Both ``€80.00m`` and ``€80,00m`` are accepted.  ``Decimal`` is used so
+    large values never pass through binary floating point.
     """
     if raw is None:
         return None
@@ -194,10 +257,8 @@ def _parse_tm_money_eur(raw) -> Optional[int]:
     m = _TM_MV_RE.search(s)
     if not m:
         return None
-    num_str = m.group(1).replace(',', '')
-    try:
-        num = float(num_str)
-    except ValueError:
+    num = _normalise_decimal_number(m.group(1))
+    if num is None:
         return None
     unit = (m.group(2) or '').lower()
     multiplier = {
@@ -207,7 +268,7 @@ def _parse_tm_money_eur(raw) -> Optional[int]:
         'b': 1_000_000_000,
         'bn': 1_000_000_000,
     }.get(unit, 1)
-    return int(num * multiplier)
+    return int(num * Decimal(multiplier))
 
 
 _HEIGHT_RE = re.compile(r'(\d+[,.]\d+)\s*m')
@@ -256,7 +317,7 @@ _COACH_HREF_RE = re.compile(r'^/(?P<slug>[^/]+)/profil/trainer/(?P<id>\d+)')
 def _parse_club_listing(html: str) -> List[Dict]:
     """Extract club rows from the league `startseite` page.
 
-    Selectors (verified by ``scripts/probe_transfermarkt.py`` 2026-05-23):
+    Selectors validated by ``scripts/research/bench_transfermarkt_fetch.py``:
         table.items > td.hauptlink.no-border-links > a[href]
     """
     from bs4 import BeautifulSoup
@@ -431,8 +492,8 @@ def _parse_squad_page(html: str, club_id: str) -> List[Dict]:
 def _parse_coach_profile(html: str, coach_id: str) -> Optional[Dict]:
     """Extract dob + nationality from a coach (`trainer`) profile page.
 
-    Same ``data-header`` itemprop selectors as the player profile (verified by
-    probe 2026-06-16): h1 headline, span[itemprop=birthDate|nationality].
+    Same ``data-header`` itemprop selectors as the player profile; the bounded
+    production-client benchmark validates the headline/bio structure.
     """
     from bs4 import BeautifulSoup
 
@@ -494,6 +555,29 @@ def _parse_coach_history(html: str, club_id: str) -> List[Dict]:
         return []
     body = table.find('tbody') or table
 
+    # Fail closed on layout drift.  Dates are meaningful only when their
+    # columns are identified by header; scanning arbitrary cells previously
+    # mistook DOB/time-in-post values for stint boundaries.
+    thead = table.find('thead')
+    if thead is None:
+        return []
+    headers = [
+        re.sub(r'\s+', ' ', th.get_text(' ', strip=True)).strip().lower()
+        for th in thead.find_all('th')
+    ]
+
+    def _header_index(*names: str) -> Optional[int]:
+        wanted = {name.lower() for name in names}
+        return next((i for i, header in enumerate(headers) if header in wanted), None)
+
+    appointed_idx = _header_index('appointed', 'appointed on', 'start date')
+    left_idx = _header_index(
+        'end of time in post', 'left', 'left on', 'end date', 'until'
+    )
+    if appointed_idx is None or left_idx is None:
+        return []
+    role_idx = _header_index('function', 'role', 'position')
+
     out: List[Dict] = []
     seen_stints: set = set()
     # Top-level rows only: each row embeds an inline-table whose nested <tr>/<td>
@@ -510,17 +594,22 @@ def _parse_coach_history(html: str, club_id: str) -> List[Dict]:
         coach_id = m.group('id')
         name = link.get_text(strip=True)
 
-        # Appointed + end dates live in the row's own columns. Read DIRECT <td>
-        # cells only and skip the first (the Name/Date-of-birth cell — its DOB
-        # would be mistaken for the appointed date). First parseable = appointed,
-        # second = end; a blank / '-' end → None = incumbent (open-ended).
-        dates: List[date] = []
-        for td in tr.find_all('td', recursive=False)[1:]:
-            d = _parse_tm_date(td.get_text(' ', strip=True))
-            if d is not None:
-                dates.append(d)
-        appointed = dates[0] if dates else None
-        left = dates[1] if len(dates) > 1 else None
+        cells = tr.find_all('td', recursive=False)
+        if len(cells) != len(headers):
+            continue
+        appointed = _parse_tm_date(
+            cells[appointed_idx].get_text(' ', strip=True)
+        )
+        left = _parse_tm_date(cells[left_idx].get_text(' ', strip=True))
+        # Both missing means the row cannot be scoped to any season and must
+        # not trigger a coach-profile request.
+        if appointed is None and left is None:
+            continue
+        role = 'Manager'
+        if role_idx is not None:
+            parsed_role = cells[role_idx].get_text(' ', strip=True)
+            if parsed_role and parsed_role != '-':
+                role = parsed_role
 
         # De-dupe identical stint rows (a manager can appear once per spell).
         stint_key = (coach_id, appointed, left)
@@ -532,7 +621,7 @@ def _parse_coach_history(html: str, club_id: str) -> List[Dict]:
             'coach_id': coach_id,
             'coach_slug': m.group('slug'),
             'name': name,
-            'role': 'Manager',
+            'role': role,
             'appointed_date': appointed,
             'left_date': left,
             'club_id': str(club_id),
@@ -580,6 +669,7 @@ def _parse_mv_history(payload: dict, player_id: str) -> List[Dict]:
 
 
 _CEAPI_CLUB_HREF_RE = re.compile(r'/verein/(\d+)')
+_EVENT_SEASON_RE = re.compile(r'^(?P<start>\d{2}|\d{4})\s*[/_-]\s*(?P<end>\d{2}|\d{4})$')
 
 
 def _extract_club_id_from_href(href) -> Optional[str]:
@@ -587,6 +677,79 @@ def _extract_club_id_from_href(href) -> Optional[str]:
         return None
     m = _CEAPI_CLUB_HREF_RE.search(str(href))
     return m.group(1) if m else None
+
+
+def _normalise_event_season(raw, transfer_date: Optional[date]) -> Optional[str]:
+    """Normalise a source event season to the Bronze ``2526`` convention."""
+
+    if raw is not None:
+        value = str(raw).strip()
+        match = _EVENT_SEASON_RE.match(value)
+        if match:
+            start = match.group('start')[-2:]
+            end = match.group('end')[-2:]
+            return f"{start}{end}"
+        if value.isdigit() and len(value) == 4:
+            # A four-digit year is a season start; an already-short ``2526``
+            # is distinguishable because its halves are consecutive.
+            first, second = int(value[:2]), int(value[2:])
+            if second == (first + 1) % 100:
+                return value
+            return canonical_season(value, SeasonFormat.SPLIT_YEAR)
+    if transfer_date is None:
+        return None
+    start_year = (
+        transfer_date.year if transfer_date.month >= 7 else transfer_date.year - 1
+    )
+    return canonical_season(start_year, SeasonFormat.SPLIT_YEAR)
+
+
+def _stable_transfer_id(
+    entry: Dict,
+    player_id: str,
+    occurrence: int = 0,
+) -> str:
+    """Return source ID or a deterministic identity hash.
+
+    Mutable display fields (fee, market value, upcoming flag) are excluded so
+    an event keeps its ID as the source enriches it.  ``occurrence`` only
+    distinguishes truly identical source rows when no source ID is exposed.
+    """
+
+    source_id = None
+    for key in ('transferId', 'transfer_id', 'id'):
+        source_id = entry.get(key)
+        if source_id is not None and str(source_id).strip():
+            source_id = str(source_id).strip()
+            break
+    else:
+        source_id = None
+
+    from_d = entry.get('from') if isinstance(entry.get('from'), dict) else {}
+    to_d = entry.get('to') if isinstance(entry.get('to'), dict) else {}
+    identity = {
+        # Namespace even source IDs by player: the CEAPI does not document
+        # global uniqueness and Gold uses transfer_id as a standalone PK.
+        'player_id': str(player_id),
+        'source_id': source_id,
+    }
+    if source_id is None:
+        from_id = _extract_club_id_from_href(from_d.get('href'))
+        to_id = _extract_club_id_from_href(to_d.get('href'))
+        parsed_date = _parse_tm_date(entry.get('date'))
+        identity.update({
+            'event_season': _normalise_event_season(
+                entry.get('season'), parsed_date,
+            ),
+            'transfer_date': parsed_date.isoformat() if parsed_date else None,
+            'from_club': from_id or from_d.get('clubName'),
+            'to_club': to_id or to_d.get('clubName'),
+            'occurrence': occurrence,
+        })
+    canonical = json.dumps(
+        identity, sort_keys=True, separators=(',', ':'), ensure_ascii=False,
+    ).encode('utf-8')
+    return hashlib.sha256(canonical).hexdigest()
 
 
 def _parse_transfers(payload: dict, player_id: str) -> List[Dict]:
@@ -604,21 +767,42 @@ def _parse_transfers(payload: dict, player_id: str) -> List[Dict]:
     if not isinstance(payload, dict):
         return []
     rows: List[Dict] = []
+    identity_occurrences: Dict[str, int] = defaultdict(int)
     for entry in payload.get('transfers') or []:
         if not isinstance(entry, dict):
             continue
         transfer_date = _parse_tm_date(entry.get('date'))
-        season_short = entry.get('season')  # TM ships '25/26' style — kept raw
-        from_d = entry.get('from') or {}
-        to_d = entry.get('to') or {}
+        event_season = _normalise_event_season(entry.get('season'), transfer_date)
+        from_d = entry.get('from') if isinstance(entry.get('from'), dict) else {}
+        to_d = entry.get('to') if isinstance(entry.get('to'), dict) else {}
         fee_text = entry.get('fee')
+
+        identity_base = json.dumps({
+            'event_season': event_season,
+            'transfer_date': transfer_date.isoformat() if transfer_date else None,
+            'from': {
+                'id': _extract_club_id_from_href(from_d.get('href')),
+                'name': from_d.get('clubName'),
+            },
+            'to': {
+                'id': _extract_club_id_from_href(to_d.get('href')),
+                'name': to_d.get('clubName'),
+            },
+        }, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
+        occurrence = identity_occurrences[identity_base]
+        identity_occurrences[identity_base] += 1
 
         # ``upcoming=True`` events have neither real fee nor finalised date —
         # we still record them so downstream features see pending moves.
         rows.append({
+            'transfer_id': _stable_transfer_id(entry, str(player_id), occurrence),
             'player_id': str(player_id),
             'transfer_date': transfer_date,
-            'season': season_short,
+            'event_season': event_season,
+            # Parser-level compatibility only.  Native frames select
+            # ``event_season``; the legacy projection sets its partition
+            # season from the requested scrape and never overwrites native.
+            'season': entry.get('season'),
             'from_club_id': _extract_club_id_from_href(from_d.get('href')),
             'from_club_name': from_d.get('clubName'),
             'to_club_id': _extract_club_id_from_href(to_d.get('href')),
@@ -631,9 +815,411 @@ def _parse_transfers(payload: dict, player_id: str) -> List[Dict]:
     return rows
 
 
+def _source_row_semantic_error(label: str, entry: Dict) -> Optional[str]:
+    """Validate facts required to materialise a native career natural key."""
+
+    if label in {'mv_history', 'market_value_points'}:
+        mv_date = _parse_tm_date(entry.get('datum_mw'))
+        if mv_date is None:
+            x_ms = entry.get('x')
+            if (
+                isinstance(x_ms, bool)
+                or not isinstance(x_ms, (int, float))
+                or not math.isfinite(float(x_ms))
+            ):
+                return 'market-value row has no valid date or epoch x'
+            try:
+                datetime.utcfromtimestamp(float(x_ms) / 1000.0)
+            except (OSError, OverflowError, ValueError):
+                return 'market-value row epoch x is outside the valid range'
+
+        raw_value = entry.get('y')
+        if isinstance(raw_value, bool) or raw_value is None:
+            return 'market-value row y is not numeric'
+        try:
+            numeric_value = Decimal(str(raw_value).replace(',', '').strip())
+        except InvalidOperation:
+            return 'market-value row y is not numeric'
+        if (
+            not numeric_value.is_finite()
+            or numeric_value < 0
+            or numeric_value != numeric_value.to_integral_value()
+        ):
+            return 'market-value row y must be a non-negative integer value'
+        return None
+
+    if label in {'transfers', 'transfer_events'}:
+        upcoming = entry.get('upcoming', False)
+        if not isinstance(upcoming, bool):
+            return 'transfer upcoming flag is not boolean'
+        transfer_date = _parse_tm_date(entry.get('date'))
+        event_season = _normalise_event_season(
+            entry.get('season'), transfer_date,
+        )
+        if event_season is None:
+            return 'transfer has no valid event season/date'
+        if transfer_date is None and not upcoming:
+            return 'non-upcoming transfer has no valid transfer date'
+
+        def _meaningful_club(side: str) -> bool:
+            club = entry.get(side)
+            if not isinstance(club, dict):
+                return False
+            if _extract_club_id_from_href(club.get('href')) is not None:
+                return True
+            name = str(club.get('clubName') or '').strip()
+            return name not in {'', '-', '?'}
+
+        if not (_meaningful_club('from') or _meaningful_club('to')):
+            return 'transfer has no meaningful from/to club facts'
+        return None
+
+    return f'no semantic validator registered for endpoint {label!r}'
+
+
+def _career_collection_error(
+    label: str,
+    player_id: str,
+    source_rows,
+    parsed_rows,
+) -> Optional[str]:
+    """Prove a career payload can be safely used for exact-key replacement.
+
+    A partially understood payload is not a partial success.  Every source row
+    must produce exactly one parsed row, belong to the requested player, and
+    have a unique native natural key.  Otherwise replacing that player's
+    existing history could silently delete facts.
+    """
+
+    if not isinstance(source_rows, list):
+        return 'source collection is not a list'
+    if not isinstance(parsed_rows, list):
+        return 'parser result is not a list'
+    for index, entry in enumerate(source_rows):
+        if not isinstance(entry, dict):
+            return f'source row {index} is not an object'
+        if problem := _source_row_semantic_error(label, entry):
+            return f'source row {index}: {problem}'
+    if len(parsed_rows) != len(source_rows):
+        return (
+            f'{len(source_rows)} source rows produced {len(parsed_rows)} '
+            'parsed rows'
+        )
+
+    key_fields = (
+        ('player_id', 'mv_date')
+        if label in {'mv_history', 'market_value_points'}
+        else ('transfer_id',)
+    )
+    seen = set()
+    for index, row in enumerate(parsed_rows):
+        if not isinstance(row, dict):
+            return f'parsed row {index} is not an object'
+        if str(row.get('player_id')) != str(player_id):
+            return f'parsed row {index} has a different player_id'
+        key = tuple(row.get(field) for field in key_fields)
+        if any(value is None for value in key):
+            return f'parsed row {index} has null natural key {key_fields}'
+        if key in seen:
+            return f'duplicate parsed natural key {key!r}'
+        seen.add(key)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Scraper
 # ---------------------------------------------------------------------------
+
+_METADATA_COLUMNS = ['_source', '_entity_type', '_ingested_at', '_batch_id']
+_SCOPE_LINEAGE_COLUMNS = [
+    'source_competition_id', 'source_edition_id', 'source_url',
+    'source_body_hash', 'fetched_at', 'parser_revision', 'schema_revision',
+    'cycle_id', 'scope_id',
+]
+
+_DEFAULT_DECODED_BUDGET_MB = {
+    'players': 10.0,
+    'market_value_history': 4.0,
+    'transfers': 8.0,
+    'coaches': 6.0,
+}
+_DEFAULT_REQUEST_ATTEMPT_BUDGET = {
+    'players': 26,
+    'market_value_history': 120,
+    'transfers': 120,
+    'coaches': 50,
+}
+
+SQUAD_MEMBERSHIP_COLUMNS = [
+    'competition_id', 'edition_id', 'league', 'season', 'club_id', 'club_slug',
+    'club_name', 'player_id', 'player_slug', 'player_name', 'observed_at',
+    *_SCOPE_LINEAGE_COLUMNS,
+]
+PLAYER_ATTRIBUTE_OBSERVATION_COLUMNS = [
+    'player_id', 'player_slug', 'name', 'position', 'dob', 'age', 'height_cm',
+    'foot', 'nationality', 'contract_until', 'market_value_eur', 'league',
+    'season', 'competition_id', 'edition_id', 'club_id', 'club_name',
+    'observed_at', *_SCOPE_LINEAGE_COLUMNS,
+]
+PLAYER_CONTRACT_OBSERVATION_COLUMNS = [
+    'competition_id', 'edition_id', 'team_id', 'team_name', 'player_id',
+    'contract_until', 'observed_at', 'applicability_status', 'source_url',
+    'source_body_hash', 'fetched_at', 'parser_revision', 'schema_revision',
+    'cycle_id', 'scope_id',
+]
+MARKET_VALUE_POINT_COLUMNS = [
+    'player_id', 'mv_date', 'value_eur', 'club_name', 'age', 'mv_raw',
+    *_SCOPE_LINEAGE_COLUMNS,
+]
+TRANSFER_EVENT_COLUMNS = [
+    'transfer_id', 'player_id', 'transfer_date', 'event_season',
+    'from_club_id', 'from_club_name', 'to_club_id', 'to_club_name',
+    'fee_text', 'fee_eur', 'market_value_eur', 'is_upcoming',
+    *_SCOPE_LINEAGE_COLUMNS,
+]
+COACH_PROFILE_COLUMNS = [
+    'coach_id', 'coach_slug', 'name', 'dob', 'nationality',
+    *_SCOPE_LINEAGE_COLUMNS,
+]
+COACH_STINT_COLUMNS = [
+    'club_id', 'club_name', 'coach_id', 'coach_slug', 'name', 'role',
+    'appointed_date', 'left_date', *_SCOPE_LINEAGE_COLUMNS,
+]
+
+LEGACY_PLAYER_COLUMNS = [
+    'player_id', 'player_slug', 'name', 'position', 'dob', 'age', 'height_cm',
+    'foot', 'nationality', 'contract_until', 'market_value_eur',
+    'market_value_last_update', 'current_club_id', 'current_club_name',
+    'league', 'season',
+]
+LEGACY_MV_COLUMNS = [
+    'player_id', 'mv_date', 'value_eur', 'club_name', 'age', 'mv_raw',
+    'league', 'season',
+]
+LEGACY_TRANSFER_COLUMNS = [
+    'player_id', 'transfer_date', 'season', 'from_club_id', 'from_club_name',
+    'to_club_id', 'to_club_name', 'fee_text', 'fee_eur', 'market_value_eur',
+    'is_upcoming', 'league',
+]
+LEGACY_COACH_COLUMNS = [
+    'coach_id', 'coach_slug', 'name', 'role', 'dob', 'nationality',
+    'current_club_id', 'current_club_name', 'league', 'season',
+]
+
+_NULLABLE_INTEGER_COLUMNS = {
+    'age', 'height_cm', 'market_value_eur', 'value_eur', 'fee_eur',
+}
+_NULLABLE_BOOLEAN_COLUMNS = {'is_upcoming'}
+
+
+def _apply_nullable_dtypes(frame: pd.DataFrame) -> pd.DataFrame:
+    """Keep null integer/boolean values out of pandas' float coercion."""
+
+    for column in _NULLABLE_INTEGER_COLUMNS.intersection(frame.columns):
+        frame[column] = pd.to_numeric(frame[column], errors='coerce').astype('Int64')
+    for column in _NULLABLE_BOOLEAN_COLUMNS.intersection(frame.columns):
+        frame[column] = frame[column].astype('boolean')
+    return frame
+
+
+def _with_metadata(
+    rows: List[Dict],
+    columns: List[str],
+    *,
+    entity_type: str,
+    batch_id: str,
+    ingested_at: Optional[datetime] = None,
+) -> pd.DataFrame:
+    """Build a schema-stable DataFrame, including typed empty results."""
+
+    frame = pd.DataFrame(rows).reindex(columns=columns)
+    for column in _METADATA_COLUMNS:
+        if column not in frame.columns:
+            frame[column] = pd.Series(dtype='object') if frame.empty else None
+    if not frame.empty:
+        now = ingested_at or datetime.utcnow()
+        frame['_source'] = 'transfermarkt'
+        frame['_entity_type'] = entity_type
+        frame['_ingested_at'] = now
+        frame['_batch_id'] = batch_id
+    return _apply_nullable_dtypes(
+        frame.reindex(columns=columns + _METADATA_COLUMNS)
+    )
+
+
+def _normalise_requested_season(
+    season,
+    season_format: SeasonFormat | str,
+) -> str:
+    value = str(season)
+    if (
+        len(value) == 4
+        and value.isdigit()
+        and int(value[2:]) == (int(value[:2]) + 1) % 100
+    ):
+        return value
+    return canonical_season(value, season_format)
+
+
+def _ensure_metadata(frame: pd.DataFrame, entity_type: str) -> pd.DataFrame:
+    """Preserve native ingest metadata while changing the entity projection."""
+
+    out = frame.copy()
+    for column in _METADATA_COLUMNS:
+        if column not in out.columns:
+            out[column] = None
+    if not out.empty:
+        out['_source'] = out['_source'].fillna('transfermarkt')
+        out['_entity_type'] = entity_type
+        out['_ingested_at'] = out['_ingested_at'].fillna(datetime.utcnow())
+    return out
+
+
+def materialize_legacy_players(
+    memberships: pd.DataFrame,
+    attribute_observations: pd.DataFrame,
+) -> pd.DataFrame:
+    """Pure dual-write adapter to legacy ``transfermarkt_players``.
+
+    Native memberships retain every multi-club relationship.  The transitional
+    legacy projection preserves the historical club-player surface for
+    rollback/parity; it never collapses a multi-club player globally.
+    """
+
+    if attribute_observations is None or attribute_observations.empty:
+        return pd.DataFrame(columns=LEGACY_PLAYER_COLUMNS + _METADATA_COLUMNS)
+    observations = attribute_observations.copy()
+    membership_keys = ['league', 'season', 'club_id', 'player_id']
+    if memberships is not None and not memberships.empty:
+        valid_memberships = memberships.reindex(
+            columns=membership_keys,
+        ).drop_duplicates()
+        observations = observations.merge(
+            valid_memberships,
+            on=membership_keys,
+            how='inner',
+        )
+    for column in ['observed_at', 'club_id']:
+        if column not in observations.columns:
+            observations[column] = None
+    observations['_club_sort'] = observations['club_id'].astype(str)
+    observations = observations.sort_values(
+        ['league', 'season', 'player_id', '_club_sort', 'observed_at'],
+        ascending=[True, True, True, True, False],
+        na_position='last',
+        kind='mergesort',
+    ).drop_duplicates(
+        ['league', 'season', 'player_id', 'club_id'], keep='first',
+    )
+
+    today = datetime.utcnow().date()
+    calculated_age = []
+    for _, row in observations.iterrows():
+        dob = row.get('dob')
+        if isinstance(dob, date):
+            calculated_age.append(
+                today.year - dob.year
+                - ((today.month, today.day) < (dob.month, dob.day))
+            )
+        else:
+            calculated_age.append(row.get('age'))
+    observations['age'] = calculated_age
+    observations['market_value_last_update'] = None
+    observations['current_club_id'] = observations['club_id']
+    observations['current_club_name'] = observations['club_name']
+    observations = _ensure_metadata(observations, 'players')
+    return _apply_nullable_dtypes(
+        observations.reindex(columns=LEGACY_PLAYER_COLUMNS + _METADATA_COLUMNS)
+    )
+
+
+def materialize_legacy_market_value_history(
+    points: pd.DataFrame,
+    league: str,
+    season,
+    season_format: SeasonFormat | str = SeasonFormat.SPLIT_YEAR,
+) -> pd.DataFrame:
+    """Pure global-point → legacy scrape-partition projection."""
+
+    if points is None or points.empty:
+        return pd.DataFrame(columns=LEGACY_MV_COLUMNS + _METADATA_COLUMNS)
+    out = points.copy()
+    out['league'] = league
+    out['season'] = _normalise_requested_season(season, season_format)
+    out = _ensure_metadata(out, 'market_value_history')
+    return _apply_nullable_dtypes(
+        out.reindex(columns=LEGACY_MV_COLUMNS + _METADATA_COLUMNS)
+    )
+
+
+def materialize_legacy_transfers(
+    events: pd.DataFrame,
+    league: str,
+    season,
+    season_format: SeasonFormat | str = SeasonFormat.SPLIT_YEAR,
+) -> pd.DataFrame:
+    """Pure global-event → legacy scrape-partition projection.
+
+    The requested partition season is written only to this copy.  Native
+    ``event_season`` remains the season supplied by the transfer payload.
+    """
+
+    if events is None or events.empty:
+        return pd.DataFrame(columns=LEGACY_TRANSFER_COLUMNS + _METADATA_COLUMNS)
+    out = events.copy()
+    out['league'] = league
+    out['season'] = _normalise_requested_season(season, season_format)
+    out = _ensure_metadata(out, 'transfers')
+    return _apply_nullable_dtypes(
+        out.reindex(columns=LEGACY_TRANSFER_COLUMNS + _METADATA_COLUMNS)
+    )
+
+
+def materialize_legacy_coaches(
+    profiles: pd.DataFrame,
+    stints: pd.DataFrame,
+    league: str,
+    season,
+    season_format: SeasonFormat | str = SeasonFormat.SPLIT_YEAR,
+) -> pd.DataFrame:
+    """Pure global profile/stint → legacy league-season coach projection."""
+
+    if stints is None or stints.empty:
+        return pd.DataFrame(columns=LEGACY_COACH_COLUMNS + _METADATA_COLUMNS)
+    win_start, win_end = _season_window(int(season), season_format)
+    scoped = stints[
+        stints.apply(
+            lambda row: _stint_overlaps_season(row.to_dict(), win_start, win_end),
+            axis=1,
+        )
+    ].copy()
+    if scoped.empty:
+        return pd.DataFrame(columns=LEGACY_COACH_COLUMNS + _METADATA_COLUMNS)
+
+    profile_cols = ['coach_id', 'name', 'dob', 'nationality']
+    available_profiles = (
+        profiles.reindex(columns=profile_cols).drop_duplicates('coach_id')
+        if profiles is not None else pd.DataFrame(columns=profile_cols)
+    )
+    out = scoped.merge(
+        available_profiles,
+        on='coach_id',
+        how='left',
+        suffixes=('_stint', '_profile'),
+    )
+    out['name'] = out['name_profile'].combine_first(out['name_stint'])
+    out['current_club_id'] = out['club_id']
+    out['current_club_name'] = out['club_name']
+    out['league'] = league
+    out['season'] = _normalise_requested_season(season, season_format)
+    out = out.sort_values(
+        ['club_id', 'coach_id', 'appointed_date'],
+        ascending=[True, True, False],
+        na_position='last',
+        kind='mergesort',
+    ).drop_duplicates(['club_id', 'coach_id'], keep='first')
+    out = _ensure_metadata(out, 'coaches')
+    return out.reindex(columns=LEGACY_COACH_COLUMNS + _METADATA_COLUMNS)
 
 class TransfermarktScraper(BaseScraper):
     """Bronze ingest for Transfermarkt.
@@ -648,9 +1234,17 @@ class TransfermarktScraper(BaseScraper):
     """
 
     SOURCE_NAME = 'transfermarkt'
-    # Cloudflare-protected; per probe 2026-05-23 the residential proxy
-    # tolerates ~12 req/min comfortably (latency stays <1.5s).
+    # Cloudflare-protected; the bounded production benchmark validates the
+    # conservative 12 req/min policy.
     DEFAULT_RATE_LIMIT = 12
+
+    # Public pure projections used by the consolidated dual-write runner.
+    materialize_legacy_players = staticmethod(materialize_legacy_players)
+    materialize_legacy_coaches = staticmethod(materialize_legacy_coaches)
+    materialize_legacy_market_value_history = staticmethod(
+        materialize_legacy_market_value_history
+    )
+    materialize_legacy_transfers = staticmethod(materialize_legacy_transfers)
 
     def __init__(
         self,
@@ -658,13 +1252,205 @@ class TransfermarktScraper(BaseScraper):
         seasons: Optional[List[int]] = None,
         **kwargs,
     ):
-        super().__init__(leagues=leagues, seasons=seasons, **kwargs)
-        self._last_endpoint_error: Optional[Dict] = None
-        # Residential-proxy traffic audit (#789). Passive: bytes of every HTTP
-        # response received through the proxy, keyed by host. Counts ALL statuses
-        # (a 403 CF block page is billed too). Surfaced via get_traffic_stats().
-        self._proxy_bytes: int = 0
-        self._proxy_bytes_by_host: Dict[str, int] = defaultdict(int)
+        # BaseScraper validates every proxy eagerly when a file holds >10
+        # entries.  Production has ~999 residential endpoints, so doing that
+        # for every short-lived entity run wastes hundreds of TCP probes.  Load
+        # the pool here without validation; the real request outcome is the
+        # authoritative health check.
+        proxy_file = kwargs.pop('proxy_file', None)
+        proxy = kwargs.pop('proxy', None)
+        proxy_control_url = kwargs.pop(
+            'proxy_control_url', os.environ.get('TM_PROXY_CONTROL_URL'),
+        )
+        competition_records = kwargs.pop('competition_records', None)
+        traffic_ledger = kwargs.pop('traffic_ledger', None)
+        retry_budget_raw = kwargs.pop(
+            'retry_budget', os.environ.get('TM_RETRY_BUDGET'),
+        )
+        retry_budget = (
+            None if retry_budget_raw is None else int(retry_budget_raw)
+        )
+        if retry_budget is not None and retry_budget < 0:
+            raise ValueError('retry_budget must be non-negative')
+        lease_metadata = kwargs.pop('lease_metadata', None)
+        lease_ttl_seconds = int(kwargs.pop(
+            'lease_ttl_seconds', os.environ.get('TM_PROXY_LEASE_TTL_SECONDS', '3600'),
+        ))
+        requested_rate = kwargs.pop('rate_limit', None)
+        super().__init__(
+            leagues=leagues,
+            seasons=seasons,
+            proxy=proxy,
+            proxy_file=None,
+            rate_limit=None,
+            **kwargs,
+        )
+        require_metered = os.environ.get(
+            'TM_REQUIRE_METERED_PROXY', 'false',
+        ).strip().lower() in {'1', 'true', 'yes', 'on'}
+        if require_metered and not proxy_control_url:
+            raise TransfermarktError(
+                'TM_REQUIRE_METERED_PROXY requires TM_PROXY_CONTROL_URL; '
+                'direct/unmetered fallback is forbidden'
+            )
+        if proxy_control_url and proxy:
+            raise TransfermarktError(
+                'proxy lease mode is exclusive with an explicit upstream proxy'
+            )
+        self.proxy_file = None if proxy_control_url else proxy_file
+        if competition_records is None:
+            raw_registry = os.environ.get('TM_COMPETITION_RECORDS_JSON', '').strip()
+            if raw_registry:
+                decoded_registry = json.loads(raw_registry)
+                if not isinstance(decoded_registry, list):
+                    raise TransfermarktError(
+                        'TM_COMPETITION_RECORDS_JSON must be a JSON list'
+                    )
+                competition_records = tuple(
+                    CompetitionRecord.from_mapping(item)
+                    for item in decoded_registry
+                )
+        self._competition_records = (
+            tuple(competition_records) if competition_records is not None else None
+        )
+        if self.proxy_file and os.path.exists(self.proxy_file):
+            # Each entity is a short-lived process.  A round-robin pool would
+            # restart at proxy 0 every time and repeatedly pay for the same
+            # burned prefix; random initial selection distributes runs while
+            # the HTTP client remains sticky after success.
+            manager = ProxyManager(rotation_strategy='random')
+            count = manager.load_from_file_custom_format(self.proxy_file)
+            self._proxy_manager = manager
+            logger.info(
+                "Loaded %d Transfermarkt proxies without eager pre-validation",
+                count,
+            )
+
+        # Base's unknown-source preset is 10/min with burst=10, and passing a
+        # custom rate creates burst=N.  TM must never burst: one initial token,
+        # then a steady maximum of 12 requests/minute.
+        if requested_rate is None:
+            effective_rate = self.DEFAULT_RATE_LIMIT
+        else:
+            try:
+                effective_rate = max(
+                    1, min(self.DEFAULT_RATE_LIMIT, int(requested_rate)),
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError('rate_limit must be an integer') from exc
+        self._rate_limiter = RateLimiter(
+            max_requests=effective_rate,
+            window_seconds=60,
+            burst_size=1,
+        )
+
+        lease_provider = (
+            ProxyFilterLeaseProvider(proxy_control_url)
+            if proxy_control_url else None
+        )
+        if lease_metadata is None:
+            lease_metadata = {
+                'dag_id': os.environ.get('TM_DAG_ID', ''),
+                'run_id': os.environ.get('TM_RUN_ID', ''),
+                'task_id': os.environ.get('TM_TASK_ID', ''),
+                'scope': os.environ.get('TM_SCOPE_ID', ''),
+            }
+        self._http_client = TransfermarktHttpClient(
+            proxy_manager=(None if lease_provider else self._proxy_manager),
+            proxy=(None if lease_provider else self.proxy),
+            lease_provider=lease_provider,
+            traffic_ledger=traffic_ledger,
+            retry_budget=retry_budget,
+            lease_metadata=lease_metadata,
+            lease_ttl_seconds=lease_ttl_seconds,
+            rate_limiter=self._rate_limiter,
+            timeout_seconds=12,
+            circuit_failures=5,
+        )
+        self._last_outcome: Optional[FetchOutcome] = None
+        self._fetch_records: Dict[str, Dict[str, FetchRecord]] = defaultdict(dict)
+        self._scope_capture: Optional[Dict] = None
+        self._materialization_failure_streak = 0
+        self._materialization_circuit_open = False
+        self._environment_decoded_budget_started = False
+        self._environment_request_budget_started = False
+
+    @property
+    def _last_endpoint_error(self) -> Optional[Dict]:
+        """Legacy read-only projection of the most recent typed failure."""
+
+        outcome = self._last_outcome
+        if outcome is None or outcome.is_success:
+            return None
+        return {
+            'label': outcome.label,
+            'status': outcome.status_code,
+            'outcome': outcome.status.value,
+            'kind': outcome.status.value,
+            'error': outcome.error,
+            **dict(outcome.context),
+        }
+
+    def _resolve_scope(self, competition: str, edition_id: int | str) -> Dict:
+        """Resolve one exact source scope from the central registry."""
+
+        record = resolve_competition(
+            competition,
+            records=self._competition_records,
+        )
+        if not record.crawl_eligible:
+            raise TransfermarktError(
+                f'{record.competition_id}: classification blocks crawl: '
+                f'{record.crawl_block_reason}'
+            )
+        edition = str(edition_id).strip()
+        if not edition:
+            raise TransfermarktError('edition_id is required')
+        canonical = canonical_season(edition, record.season_format)
+        return {
+            'record': record,
+            'competition_id': record.competition_id,
+            'competition_slug': record.slug,
+            'edition_id': edition,
+            'season_format': record.season_format,
+            'canonical_season': canonical,
+            'compatibility_league': (
+                record.canonical_competition_id
+                or f'TM-{record.competition_id}'
+            ),
+            'scope_id': deterministic_scope_id(record.competition_id, edition),
+        }
+
+    def _begin_operation_budget(self, operation: str) -> None:
+        decoded_env = os.environ.get('TM_DECODED_BODY_BUDGET_MB')
+        request_env = os.environ.get('TM_REQUEST_BUDGET')
+
+        if decoded_env is not None:
+            # Explicit decoded budget is aggregate across every method called
+            # on this scraper (the live benchmark sets 15 MiB once).
+            if not self._environment_decoded_budget_started:
+                self._http_client.set_decoded_body_budget(
+                    int(float(decoded_env) * 1024 * 1024)
+                )
+                self._environment_decoded_budget_started = True
+        else:
+            self._http_client.set_decoded_body_budget(
+                int(_DEFAULT_DECODED_BUDGET_MB[operation] * 1024 * 1024)
+            )
+
+        if request_env is not None:
+            # Explicit request budget is likewise aggregate.  If only the byte
+            # env is set, request limits remain per-operation instead of being
+            # accidentally frozen to the first method's default.
+            if not self._environment_request_budget_started:
+                self._http_client.begin_request_scope(
+                    request_attempt_budget=int(request_env),
+                )
+                self._environment_request_budget_started = True
+        else:
+            self._http_client.begin_request_scope(
+                request_attempt_budget=_DEFAULT_REQUEST_ATTEMPT_BUDGET[operation],
+            )
 
     def get_traffic_stats(self) -> Dict:
         """Residential-proxy bytes seen this run (#789).
@@ -675,57 +1461,250 @@ class TransfermarktScraper(BaseScraper):
         ``FlareSolverrClient.get_traffic_stats`` so ``utils.proxy_traffic`` can
         consume either uniformly.
         """
-        by_host = sorted(
-            self._proxy_bytes_by_host.items(), key=lambda kv: -kv[1]
-        )
-        return {
-            'proxy_response_bytes': self._proxy_bytes,
-            'proxy_response_mb': round(self._proxy_bytes / 1024 / 1024, 4),
-            'requests': int(self._stats.get('requests', 0)),
-            'top_traffic_urls': [
-                {
-                    'url': host,
-                    'bytes': nbytes,
-                    'mb': round(nbytes / 1024 / 1024, 4),
-                }
-                for host, nbytes in by_host[:10]
-            ],
+        stats = self._http_client.get_traffic_stats()
+        stats['endpoint_outcome_counts'] = {
+            status.value: sum(
+                1
+                for by_source in self._fetch_records.values()
+                for record in by_source.values()
+                if record.status == status
+            )
+            for status in FetchStatus
         }
+        if self._materialization_circuit_open:
+            stats['circuit_state'] = 'open'
+            stats['circuit_breaker_state'] = 'open'
+        self._stats['requests'] = stats['request_attempts']
+        self._stats['successes'] = stats['successful_attempts']
+        self._stats['failures'] = stats['failed_attempts']
+        return stats
+
+    def get_fetch_outcomes(self) -> Dict[str, Dict[str, Dict]]:
+        """Checkpoint records keyed by endpoint then stable source ID."""
+
+        return {
+            endpoint: {
+                source_id: record.as_dict()
+                for source_id, record in sorted(records.items())
+            }
+            for endpoint, records in sorted(self._fetch_records.items())
+        }
+
+    def get_fetch_outcomes_envelope(self) -> Dict:
+        return {
+            'schema_version': os.environ.get('TM_SCHEMA_VERSION', '2'),
+            'outcomes': self.get_fetch_outcomes(),
+        }
+
+    def get_scope_capture(self) -> Optional[Dict]:
+        """Return listing/squad participant evidence for the exact scope."""
+
+        if self._scope_capture is None:
+            return None
+        return json.loads(json.dumps(self._scope_capture, sort_keys=True))
 
     # -- HTTP plumbing (mirrors scrapers/sofascore/scraper.py:279 contract) --
 
-    def _record_proxy_bytes(self, url: str, resp) -> None:
-        """Accumulate response-body bytes for the residential-proxy audit (#789).
+    @staticmethod
+    def _source_id(context: Optional[Dict]) -> str:
+        context = context or {}
+        for key in ('player_id', 'coach_id', 'club_id'):
+            if context.get(key) is not None:
+                return str(context[key])
+        if context.get('league') is not None:
+            return f"{context['league']}:{context.get('season', '')}"
+        return 'global'
 
-        Never raises — a passive traffic counter must not break a scrape.
-        """
-        try:
-            nbytes = len(resp.content or b"")
-        except Exception:  # noqa: BLE001 — counter must never break the fetch
-            return
-        self._proxy_bytes += nbytes
-        self._proxy_bytes_by_host[urlsplit(url).netloc or url] += nbytes
-
-    def _build_tls_session(self):
-        """Create a ``tls_requests.Client`` bound to the next residential
-        proxy. Cloudflare blocks direct egress (probe: no-proxy = 403).
-        """
-        import tls_requests
-
-        proxy_url = None
-        proxy_obj = None
-        if self._proxy_manager is not None and self._proxy_manager.total_count > 0:
-            proxy_obj = self._proxy_manager.get_proxy()
-            if proxy_obj is not None:
-                proxy_url = proxy_obj.url
-        elif self.proxy:
-            proxy_url = self.proxy
-
-        client = (
-            tls_requests.Client(proxy=proxy_url)
-            if proxy_url else tls_requests.Client()
+    def _store_fetch_outcome(
+        self,
+        outcome: FetchOutcome,
+        *,
+        row_count: int = 0,
+    ) -> None:
+        self._last_outcome = outcome
+        source_id = self._source_id(dict(outcome.context))
+        self._fetch_records[outcome.label][source_id] = FetchRecord(
+            status=outcome.status,
+            row_count=int(row_count),
+            payload_hash=outcome.payload_hash,
+            error=outcome.error,
+            status_code=outcome.status_code,
+            attempts=outcome.attempts,
         )
-        return client, proxy_obj
+
+    def _record_materialized_rows(
+        self,
+        label: str,
+        context: Dict,
+        row_count: int,
+    ) -> None:
+        source_id = self._source_id(context)
+        record = self._fetch_records.get(label, {}).get(source_id)
+        if record is not None:
+            self._fetch_records[label][source_id] = FetchRecord(
+                status=record.status,
+                row_count=int(row_count),
+                payload_hash=record.payload_hash,
+                error=record.error,
+                status_code=record.status_code,
+                attempts=record.attempts,
+            )
+            if record.status in (FetchStatus.OK, FetchStatus.VALID_EMPTY):
+                self._materialization_failure_streak = 0
+
+    def _mark_authoritative_empty(self, label: str, context: Dict) -> None:
+        """Mark a schema-valid source collection that is itself empty."""
+
+        source_id = self._source_id(context)
+        record = self._fetch_records.get(label, {}).get(source_id)
+        if record is not None:
+            self._fetch_records[label][source_id] = FetchRecord(
+                status=FetchStatus.VALID_EMPTY,
+                row_count=0,
+                payload_hash=record.payload_hash,
+                error=None,
+                status_code=record.status_code,
+                attempts=record.attempts,
+            )
+        self._materialization_failure_streak = 0
+
+    def _mark_schema_error(
+        self,
+        label: str,
+        context: Dict,
+        error: str,
+    ) -> None:
+        """Convert structurally valid HTTP into an authoritative parse failure."""
+
+        source_id = self._source_id(context)
+        record = self._fetch_records.get(label, {}).get(source_id)
+        if record is None:
+            record = FetchRecord(
+                status=FetchStatus.SCHEMA_ERROR,
+                row_count=0,
+                payload_hash=None,
+                error=error,
+                status_code=200,
+                attempts=0,
+            )
+        else:
+            record = FetchRecord(
+                status=FetchStatus.SCHEMA_ERROR,
+                row_count=0,
+                payload_hash=record.payload_hash,
+                error=error,
+                status_code=record.status_code,
+                attempts=record.attempts,
+            )
+        self._fetch_records[label][source_id] = record
+        self._materialization_failure_streak += 1
+        if self._materialization_failure_streak >= 5:
+            self._materialization_circuit_open = True
+            self._http_client.close()
+        last = self._last_outcome
+        if (
+            last is not None
+            and last.label == label
+            and self._source_id(dict(last.context)) == source_id
+        ):
+            self._last_outcome = last.with_status(
+                FetchStatus.SCHEMA_ERROR,
+                error=error,
+            )
+        else:
+            self._last_outcome = FetchOutcome(
+                status=FetchStatus.SCHEMA_ERROR,
+                status_code=record.status_code,
+                error=error,
+                attempts=record.attempts,
+                label=label,
+                context=context,
+                payload_hash=record.payload_hash,
+            )
+
+    @staticmethod
+    def _endpoint_validator(label: str, as_json: bool):
+        if as_json:
+            required = {
+                'mv_history': 'list',
+                'market_value_points': 'list',
+                'transfers': 'transfers',
+                'transfer_events': 'transfers',
+            }.get(label)
+            if required is None:
+                return None
+
+            def _validate_json(payload):
+                value = payload.get(required) if isinstance(payload, dict) else None
+                if not isinstance(value, list):
+                    return f"expected list field {required!r}"
+                for index, entry in enumerate(value):
+                    if not isinstance(entry, dict):
+                        return f"{required}[{index}] is not an object"
+                    if required == 'transfers':
+                        for club_side in ('from', 'to'):
+                            club = entry.get(club_side)
+                            if club is not None and not isinstance(club, dict):
+                                return (
+                                    f"transfers[{index}].{club_side} is not an object"
+                                )
+                    if problem := _source_row_semantic_error(label, entry):
+                        return f'{required}[{index}]: {problem}'
+                return None
+
+            return _validate_json
+
+        if label not in {'listing', 'squad', 'coach_history', 'coach_profile'}:
+            return None
+
+        def _validate_html(html):
+            from bs4 import BeautifulSoup
+
+            soup = BeautifulSoup(html, 'html.parser')
+            if label == 'coach_profile':
+                if soup.find('h1', {'class': 'data-header__headline-wrapper'}) is None:
+                    return 'missing coach profile headline'
+            elif soup.find('table', {'class': 'items'}) is None:
+                return 'missing table.items'
+            elif label == 'listing' and soup.find('a', href=_CLUB_HREF_RE) is None:
+                return 'listing has no club links'
+            elif label == 'squad' and soup.find('a', href=_PLAYER_HREF_RE) is None:
+                return 'squad has no player links'
+            elif label == 'coach_history' and not _parse_coach_history(
+                html, club_id='validator',
+            ):
+                return 'coach history has no header-mapped dated trainer rows'
+            return None
+
+        return _validate_html
+
+    def _fetch_endpoint_outcome(
+        self,
+        url: str,
+        as_json: bool,
+        max_attempts: int = 3,
+        label: str = 'endpoint',
+        context: Optional[Dict] = None,
+    ) -> FetchOutcome:
+        if self._materialization_circuit_open:
+            outcome = FetchOutcome(
+                status=FetchStatus.RETRY_EXHAUSTED,
+                error='in-run parser circuit is open after five schema failures',
+                label=label,
+                context=context or {},
+            )
+            self._store_fetch_outcome(outcome)
+            return outcome
+        outcome = self._http_client.fetch(
+            url,
+            as_json=as_json,
+            max_attempts=max_attempts,
+            label=label,
+            context=context,
+            validator=self._endpoint_validator(label, as_json),
+        )
+        self._store_fetch_outcome(outcome)
+        return outcome
 
     def _fetch_endpoint(
         self,
@@ -735,90 +1714,26 @@ class TransfermarktScraper(BaseScraper):
         label: str = 'endpoint',
         context: Optional[Dict] = None,
     ):
-        """Generic GET with proxy rotation + rate-limit + retry.
+        """Legacy payload/``None`` adapter over the typed fetch contract."""
 
-        Returns the decoded JSON dict (``as_json=True``) or the raw HTML
-        string (``as_json=False``). Returns ``None`` on persistent failure
-        or legitimate 404; the last failure reason is parked on
-        ``self._last_endpoint_error`` for the runner's fallback classifier.
-        """
-        import tls_requests
-        from scrapers.utils.proxy_manager import ErrorType
-
-        last_status = None
-        last_error = None
-        for attempt in range(1, max_attempts + 1):
-            self._rate_limiter.acquire()
-            self._stats['requests'] += 1
-
-            client, proxy_obj = self._build_tls_session()
-            try:
-                resp = client.get(url, timeout=(5.0, 12.0))
-                self._record_proxy_bytes(url, resp)
-                last_status = resp.status_code
-                if resp.status_code == 200:
-                    if proxy_obj is not None:
-                        proxy_obj.record_success()
-                    self._stats['successes'] += 1
-                    if as_json:
-                        try:
-                            return resp.json()
-                        except Exception as e:
-                            last_error = f"json_decode: {e}"
-                            break
-                    return resp.text
-                if resp.status_code == 403:
-                    if proxy_obj is not None:
-                        proxy_obj.record_failure(ErrorType.FORBIDDEN.value)
-                    last_error = "HTTP 403 (CF block / proxy IP burned)"
-                elif resp.status_code == 429:
-                    if proxy_obj is not None:
-                        proxy_obj.record_failure(ErrorType.RATE_LIMIT.value)
-                    last_error = "HTTP 429 rate-limited"
-                    time.sleep(2 ** attempt)
-                elif resp.status_code == 404:
-                    logger.info(
-                        "%s not exposed (%s) — 404", label, context or url,
-                    )
-                    self._stats['successes'] += 1
-                    return None
-                else:
-                    if proxy_obj is not None:
-                        proxy_obj.record_failure(ErrorType.UNKNOWN.value)
-                    last_error = f"HTTP {resp.status_code}"
-            except tls_requests.exceptions.RequestException as e:  # type: ignore[attr-defined]
-                if proxy_obj is not None:
-                    proxy_obj.record_failure(ErrorType.CONNECTION.value)
-                last_error = f"transport: {type(e).__name__}: {e}"
-            except Exception as e:
-                if proxy_obj is not None:
-                    proxy_obj.record_failure(ErrorType.UNKNOWN.value)
-                last_error = f"{type(e).__name__}: {e}"
-            finally:
-                try:
-                    client.close()
-                except Exception:
-                    pass
-
-            logger.warning(
-                "%s attempt %d/%d failed (%s): %s",
-                label, attempt, max_attempts, context or url, last_error,
-            )
-
-        self._stats['failures'] += 1
-        self._last_endpoint_error = {
-            'label': label,
-            'status': last_status,
-            'error': last_error,
-            **(context or {}),
-        }
-        return None
+        outcome = self._fetch_endpoint_outcome(
+            url,
+            as_json=as_json,
+            max_attempts=max_attempts,
+            label=label,
+            context=context,
+        )
+        return outcome.value if outcome.status == FetchStatus.OK else None
 
     def _fetch_html(self, url: str, label: str = 'html', context=None) -> Optional[str]:
         return self._fetch_endpoint(url, as_json=False, label=label, context=context)
 
     def _fetch_json(self, url: str, label: str = 'json', context=None) -> Optional[dict]:
         return self._fetch_endpoint(url, as_json=True, label=label, context=context)
+
+    def close(self) -> None:
+        self._http_client.close()
+        super().close()
 
     # ---------------------- bronze resolver ----------------------------------
 
@@ -856,7 +1771,7 @@ class TransfermarktScraper(BaseScraper):
         limit: Optional[int] = None,
         window_offset: int = 0,
     ) -> List[str]:
-        """DISTINCT player_id from ``bronze.transfermarkt_players``.
+        """DISTINCT player_id from native memberships, with rollout fallback.
 
         Mirrors ``scrapers/sofascore/scraper.py:_resolve_player_ids_from_bronze``
         — the dependent entities (``transfers``, ``mv_history``) need a fresh
@@ -872,22 +1787,43 @@ class TransfermarktScraper(BaseScraper):
         around, so the whole roster is covered over ``ceil(n/limit)`` runs and
         mv_history + transfers sample the SAME window.
         """
-        try:
+        native_sql = (
+            "SELECT DISTINCT player_id "
+            "FROM iceberg.bronze.transfermarkt_squad_memberships "
+            "WHERE league = ? AND season = ?"
+        )
+        legacy_sql = (
+            "SELECT DISTINCT player_id "
+            "FROM iceberg.bronze.transfermarkt_players "
+            "WHERE league = ? AND season = ?"
+        )
+
+        def _query(sql: str):
             conn = self._bronze_connection()
             cur = conn.cursor()
-            sql = (
-                "SELECT DISTINCT player_id "
-                "FROM iceberg.bronze.transfermarkt_players "
-                "WHERE league = ? AND season = ?"
-            )
             cur.execute(sql, (league, season_short))
-            rows = cur.fetchall()
-            roster = [str(r[0]) for r in rows if r and r[0]]
-        except Exception as e:
-            logger.warning(
-                "Could not resolve transfermarkt player_ids from bronze: %s", e,
-            )
-            return []
+            return cur.fetchall()
+
+        try:
+            rows = _query(native_sql)
+        except Exception as exc:
+            rendered = str(exc).upper()
+            if not (
+                'TABLE_NOT_FOUND' in rendered
+                or 'DOES NOT EXIST' in rendered
+                or 'NOT FOUND' in rendered
+            ):
+                raise TransfermarktError(
+                    "native Transfermarkt roster lookup failed; refusing "
+                    f"legacy fallback: {exc}"
+                ) from exc
+            try:
+                rows = _query(legacy_sql)
+            except Exception as legacy_exc:
+                raise TransfermarktError(
+                    f"legacy Transfermarkt roster lookup failed: {legacy_exc}"
+                ) from legacy_exc
+        roster = [str(row[0]) for row in rows if row and row[0]]
 
         # Numeric order (non-numeric ids — none expected — sort last, stably).
         roster.sort(key=lambda p: (0, int(p)) if p.isdigit() else (1, p))
@@ -902,117 +1838,195 @@ class TransfermarktScraper(BaseScraper):
 
         Coach bios are immutable, so a profile materialised by ANY earlier
         run can be reused instead of re-fetching ~20-40 profile pages every
-        weekly run. Rows with neither dob nor nationality are excluded —
-        they carry no enrichment, so a live fetch is still worth attempting.
-        Empty dict on any error — reuse is best-effort.
+        weekly run.  Native profile cache is queried first.  Only an explicit
+        TABLE_NOT_FOUND falls back to the transitional legacy table; other
+        database failures abort rather than triggering a costly mass refetch.
         """
-        try:
+        def _rows(sql: str):
             conn = self._bronze_connection()
             cur = conn.cursor()
-            cur.execute(
-                "SELECT coach_id, max(name), max(dob), max(nationality) "
-                "FROM iceberg.bronze.transfermarkt_coaches "
-                "WHERE dob IS NOT NULL OR nationality IS NOT NULL "
-                "GROUP BY coach_id"
-            )
-            return {
-                str(r[0]): {'name': r[1], 'dob': r[2], 'nationality': r[3]}
-                for r in cur.fetchall()
-                if r and r[0]
-            }
-        except Exception as e:
-            logger.warning(
-                "Could not resolve coach bios from bronze: %s", e,
-            )
-            return {}
+            cur.execute(sql)
+            return cur.fetchall()
 
-    def _resolve_contracts_from_bronze(
-        self,
-        league: str,
-        season_short: str,
-    ) -> Dict[str, date]:
-        """``player_id → contract_until`` from the existing bronze partition.
-
-        Feeds the July carry-forward in ``read_players``: when TM's squad
-        page stops rendering the Contract column (TM flips to the new season
-        weeks before our CURRENT_SEASON does), the partition replace must not
-        wipe the contract dates scraped in previous runs. Empty dict on any
-        error — carry-forward is best-effort.
-        """
+        native_sql = (
+            "SELECT coach_id, max(name), max(dob), max(nationality) "
+            "FROM iceberg.bronze.transfermarkt_coach_profiles "
+            "WHERE dob IS NOT NULL OR nationality IS NOT NULL "
+            "GROUP BY coach_id"
+        )
+        legacy_sql = (
+            "SELECT coach_id, max(name), max(dob), max(nationality) "
+            "FROM iceberg.bronze.transfermarkt_coaches "
+            "WHERE dob IS NOT NULL OR nationality IS NOT NULL "
+            "GROUP BY coach_id"
+        )
         try:
-            conn = self._bronze_connection()
-            cur = conn.cursor()
-            cur.execute(
-                "SELECT player_id, max(contract_until) "
-                "FROM iceberg.bronze.transfermarkt_players "
-                "WHERE league = ? AND season = ? "
-                "AND contract_until IS NOT NULL "
-                "GROUP BY player_id",
-                (league, season_short),
+            rows = _rows(native_sql)
+        except Exception as exc:
+            rendered = str(exc).upper()
+            missing = (
+                'TABLE_NOT_FOUND' in rendered
+                or 'DOES NOT EXIST' in rendered
+                or 'NOT FOUND' in rendered
             )
-            return {
-                str(r[0]): r[1]
-                for r in cur.fetchall()
-                if r and r[0] and r[1] is not None
+            if not missing:
+                raise TransfermarktError(
+                    f"native coach-profile cache lookup failed: {exc}"
+                ) from exc
+            logger.info("Native coach profile table absent; trying legacy cache")
+            try:
+                rows = _rows(legacy_sql)
+            except Exception as legacy_exc:
+                legacy_rendered = str(legacy_exc).upper()
+                if (
+                    'TABLE_NOT_FOUND' in legacy_rendered
+                    or 'DOES NOT EXIST' in legacy_rendered
+                    or 'NOT FOUND' in legacy_rendered
+                ):
+                    return {}
+                raise TransfermarktError(
+                    f"legacy coach-profile cache lookup failed: {legacy_exc}"
+                ) from legacy_exc
+        return {
+            str(row[0]): {
+                'name': row[1], 'dob': row[2], 'nationality': row[3],
             }
-        except Exception as e:
-            logger.warning(
-                "Could not resolve contract_until from bronze: %s", e,
-            )
-            return {}
+            for row in rows
+            if row and row[0]
+        }
 
     # ---------------------- read_* entry points ------------------------------
 
-    def read_players(
+    def read_squad_data(
         self,
         league: str,
         season: int,
         limit: Optional[int] = None,
-    ) -> pd.DataFrame:
-        """Listing → detailed squad pages (2 HTTP hops, no profile fetches).
+    ) -> Dict[str, pd.DataFrame]:
+        """Fetch one league-season squad once and return native + legacy views.
 
-        Returns one row per (league, season, player_id). ``limit`` caps the
-        total number of players the scraper materialises (useful for smoke
-        runs); ``None`` means full season.
+        Native natural keys are ``(league, season, club_id, player_id)`` for
+        ``memberships`` and ``(league, season, club_id, player_id,
+        observed_at)`` for ``attribute_observations``.  Multi-club players keep
+        every membership.  ``legacy_players`` is a pure transitional
+        projection, so dual-write never repeats HTTP.
         """
-        anchor_cols = [
-            'player_id', 'player_slug', 'name', 'position', 'dob', 'age',
-            'height_cm', 'foot', 'nationality', 'contract_until',
-            'market_value_eur', 'market_value_last_update',
-            'current_club_id', 'current_club_name',
-            'league', 'season',
-        ]
-
-        if league not in TM_LEAGUE_MAP:
-            logger.warning(
-                "%s: league %s not in TM_LEAGUE_MAP — skipping.",
-                R0_2B_FALLBACK_MARKER, league,
-            )
-            return pd.DataFrame(columns=anchor_cols + ['_ingested_at'])
-
-        league_slug, comp_id = TM_LEAGUE_MAP[league]
-        season_short = _season_short(season)
-
-        # Step 1 — league listing → clubs.
-        listing_url = (
-            f"{_TM_BASE}"
-            + _LEAGUE_LISTING_PATH.format(
-                league_slug=league_slug, comp_id=comp_id, year=int(season),
-            )
+        scope = self._resolve_scope(league, season)
+        competition = scope['record']
+        league = scope['compatibility_league']
+        season_short = scope['canonical_season']
+        self._begin_operation_budget('players')
+        listing_url = _competition_listing_url(
+            competition, scope['edition_id'],
         )
+        self._scope_capture = {
+            'schema_version': 1,
+            'scope_id': scope['scope_id'],
+            'competition_id': scope['competition_id'],
+            'edition_id': scope['edition_id'],
+            'competition_type': competition.competition_type.value,
+            'gender': competition.gender.value,
+            'team_type': competition.team_type.value,
+            'age_category': competition.age_category.value,
+            'listing_status': 'pending',
+            'listing_source_url': listing_url,
+            'listing_source_body_hash': None,
+            'expected_team_ids': [],
+            'observed_team_ids': [],
+            'endpoint_status_by_team': {},
+            'fetched_at': datetime.now(timezone.utc).isoformat(),
+        }
+
+        def _empty_bundle() -> Dict[str, pd.DataFrame]:
+            memberships = _with_metadata(
+                [], SQUAD_MEMBERSHIP_COLUMNS,
+                entity_type='squad_memberships', batch_id=self._batch_id,
+            )
+            observations = _with_metadata(
+                [], PLAYER_ATTRIBUTE_OBSERVATION_COLUMNS,
+                entity_type='player_attribute_observations',
+                batch_id=self._batch_id,
+            )
+            contracts = _with_metadata(
+                [], PLAYER_CONTRACT_OBSERVATION_COLUMNS,
+                entity_type='player_contract_observations',
+                batch_id=self._batch_id,
+            )
+            contracts.attrs['fetch_status'] = (
+                'not_applicable'
+                if competition.team_type.value == 'national_team'
+                else 'retry_exhausted'
+            )
+            return {
+                'memberships': memberships,
+                'attribute_observations': observations,
+                'contract_observations': contracts,
+                'legacy_players': materialize_legacy_players(
+                    memberships, observations,
+                ),
+            }
+
+        # Step 1 — exact discovered competition/edition listing → teams.
         listing_html = self._fetch_html(
             listing_url,
             label='listing',
-            context={'league': league, 'season': season},
+            context={
+                'league': league,
+                'season': season,
+                'competition_id': scope['competition_id'],
+                'edition_id': scope['edition_id'],
+                'scope': scope['scope_id'],
+            },
         )
         if listing_html is None:
+            listing_record = self._fetch_records.get('listing', {}).get(
+                f'{league}:{season}',
+            )
+            self._scope_capture['listing_status'] = (
+                listing_record.status.value
+                if listing_record is not None else 'retry_exhausted'
+            )
+            self._scope_capture['fetched_at'] = (
+                datetime.now(timezone.utc).isoformat()
+            )
             logger.error(
                 "%s: league listing fetch failed for %s/%s.",
                 R0_2B_FALLBACK_MARKER, league, season,
             )
-            return pd.DataFrame(columns=anchor_cols + ['_ingested_at'])
+            return _empty_bundle()
 
         clubs = _parse_club_listing(listing_html)
+        self._scope_capture['listing_source_body_hash'] = (
+            self._last_outcome.payload_hash
+            if self._last_outcome is not None
+            else competition.source_body_hash
+        )
+        self._record_materialized_rows(
+            'listing', {'league': league, 'season': season}, len(clubs),
+        )
+        if not clubs:
+            self._scope_capture['listing_status'] = 'schema_error'
+            self._scope_capture['fetched_at'] = (
+                datetime.now(timezone.utc).isoformat()
+            )
+            self._mark_schema_error(
+                'listing',
+                {'league': league, 'season': season},
+                'listing table produced zero clubs; selector/layout drift',
+            )
+            logger.error(
+                "%s: listing parsed zero clubs for %s/%s",
+                R0_2B_FALLBACK_MARKER, league, season,
+            )
+            return _empty_bundle()
+        expected_team_ids = [str(club['club_id']) for club in clubs]
+        self._scope_capture.update({
+            'listing_status': 'ok',
+            'expected_team_ids': expected_team_ids,
+            'endpoint_status_by_team': {
+                team_id: 'not_attempted' for team_id in expected_team_ids
+            },
+        })
         logger.info(
             "TM listing: %d clubs for league=%s season=%s",
             len(clubs), league, season,
@@ -1024,40 +2038,89 @@ class TransfermarktScraper(BaseScraper):
         # residential proxy per weekly run) is gone.
         squad_players: List[Dict] = []
         squad_successes = 0
+        clubs_attempted = 0
         for club in clubs:
+            clubs_attempted += 1
             squad_url = (
                 f"{_TM_BASE}"
                 + _CLUB_SQUAD_PATH.format(
                     club_slug=club['club_slug'],
                     club_id=club['club_id'],
-                    year=int(season),
+                    year=scope['edition_id'],
                 )
             )
             html = self._fetch_html(
                 squad_url,
                 label='squad',
-                context={'club_id': club['club_id']},
+                context={
+                    'club_id': club['club_id'],
+                    'competition_id': scope['competition_id'],
+                    'edition_id': scope['edition_id'],
+                    'scope': scope['scope_id'],
+                },
             )
             if html is None:
+                record = self._fetch_records.get('squad', {}).get(
+                    str(club['club_id']),
+                )
+                self._scope_capture['endpoint_status_by_team'][
+                    str(club['club_id'])
+                ] = (
+                    record.status.value
+                    if record is not None else 'retry_exhausted'
+                )
+                continue
+            parsed_players = _parse_squad_page(html, club_id=club['club_id'])
+            self._record_materialized_rows(
+                'squad', {'club_id': club['club_id']}, len(parsed_players),
+            )
+            if not parsed_players:
+                self._scope_capture['endpoint_status_by_team'][
+                    str(club['club_id'])
+                ] = 'schema_error'
+                self._mark_schema_error(
+                    'squad', {'club_id': club['club_id']},
+                    'squad table produced zero players; selector/layout drift',
+                )
                 continue
             squad_successes += 1
-            for p in _parse_squad_page(html, club_id=club['club_id']):
+            self._scope_capture['endpoint_status_by_team'][
+                str(club['club_id'])
+            ] = 'ok'
+            payload_hash = (
+                self._last_outcome.payload_hash
+                if self._last_outcome is not None else None
+            )
+            for p in parsed_players:
                 p['current_club_name'] = club['club_name']
+                p['club_slug'] = club['club_slug']
+                p['_source_url'] = squad_url
+                p['_source_body_hash'] = payload_hash
                 squad_players.append(p)
+            # Smoke/dry-run limits must stop paid traversal as soon as enough
+            # rows exist, rather than downloading every remaining club page.
+            if limit and len(squad_players) >= int(limit):
+                break
+
+        self._scope_capture['observed_team_ids'] = [
+            team_id for team_id in expected_team_ids
+            if self._scope_capture['endpoint_status_by_team'][team_id] == 'ok'
+        ]
+        self._scope_capture['fetched_at'] = datetime.now(timezone.utc).isoformat()
 
         if not squad_players:
             logger.warning(
                 "%s: zero players harvested across %d clubs.",
                 R0_2B_FALLBACK_MARKER, len(clubs),
             )
-            return pd.DataFrame(columns=anchor_cols + ['_ingested_at'])
+            return _empty_bundle()
 
         # A partial squad sweep would be saved with replace_partitions and
         # shrink the bronze partition — abort instead (#484 semantics, moved
         # from the former profile loop to the squad loop).
-        if squad_successes < _MIN_SUCCESS_RATIO * len(clubs):
+        if squad_successes < _MIN_SUCCESS_RATIO * clubs_attempted:
             raise PartialScrapeError(
-                f"only {squad_successes}/{len(clubs)} squad pages fetched "
+                f"only {squad_successes}/{clubs_attempted} squad pages fetched "
                 f"(< {_MIN_SUCCESS_RATIO:.0%}) — aborting to protect "
                 f"existing partition"
             )
@@ -1067,113 +2130,251 @@ class TransfermarktScraper(BaseScraper):
 
         logger.info("TM squad pages → %d players", len(squad_players))
 
-        today = datetime.utcnow().date()
-        rows: List[Dict] = []
+        observed_at = datetime.utcnow()
+        membership_rows: List[Dict] = []
+        observation_rows: List[Dict] = []
+        contract_rows: List[Dict] = []
         for sp in squad_players:
-            dob = sp.get('dob')
-            rows.append({
+            lineage = {
+                'source_competition_id': scope['competition_id'],
+                'source_edition_id': scope['edition_id'],
+                'source_url': sp.get('_source_url') or competition.source_url,
+                'source_body_hash': (
+                    sp.get('_source_body_hash') or competition.source_body_hash
+                ),
+                'fetched_at': observed_at,
+                'parser_revision': PARSER_REVISION,
+                'schema_revision': SCHEMA_REVISION,
+                'cycle_id': os.environ.get('TM_RUN_ID', self._batch_id),
+                'scope_id': scope['scope_id'],
+            }
+            membership_rows.append({
+                'competition_id': scope['competition_id'],
+                'edition_id': scope['edition_id'],
+                'league': league,
+                'season': season_short,
+                'club_id': str(sp['club_id']),
+                'club_slug': sp.get('club_slug'),
+                'club_name': sp.get('current_club_name'),
+                'player_id': str(sp['player_id']),
+                'player_slug': sp.get('player_slug'),
+                'player_name': sp.get('name'),
+                'observed_at': observed_at,
+                **lineage,
+            })
+            observation_rows.append({
                 'player_id': sp['player_id'],
                 'player_slug': sp['player_slug'],
                 'name': sp['name'],
                 'position': sp.get('position'),
-                'dob': dob,
-                'age': (
-                    (today.year - dob.year
-                     - ((today.month, today.day) < (dob.month, dob.day)))
-                    if dob else sp.get('age')
-                ),
+                'dob': sp.get('dob'),
+                'age': sp.get('age'),
                 'height_cm': sp.get('height_cm'),
                 'foot': sp.get('foot'),
                 'nationality': sp.get('nationality'),
                 'contract_until': sp.get('contract_until'),
                 'market_value_eur': sp.get('market_value_eur'),
-                # Profile-only field, no longer scraped; Silver derives
-                # mv_last_update from bronze.transfermarkt_market_value_history.
-                'market_value_last_update': None,
-                'current_club_id': sp['club_id'],
-                'current_club_name': sp.get('current_club_name'),
+                'league': league,
+                'season': season_short,
+                'competition_id': scope['competition_id'],
+                'edition_id': scope['edition_id'],
+                'club_id': str(sp['club_id']),
+                'club_name': sp.get('current_club_name'),
+                'observed_at': observed_at,
+                **lineage,
             })
-
-        # TM renders the Contract column only for the season IT considers
-        # current, and it flips to the new season in early July while our
-        # CURRENT_SEASON flips in August. In that window the squad page has
-        # no contract data and a plain partition replace would wipe last
-        # week's values — carry the existing bronze ones forward.
-        if any(r['contract_until'] is None for r in rows):
-            known = self._resolve_contracts_from_bronze(league, season_short)
-            filled = 0
-            for r in rows:
-                if r['contract_until'] is None:
-                    carried = known.get(r['player_id'])
-                    if carried is not None:
-                        r['contract_until'] = carried
-                        filled += 1
-            if filled:
-                logger.info(
-                    "contract_until carry-forward from bronze: %d rows", filled,
-                )
-
-        df = pd.DataFrame(rows)
-        df['league'] = league
-        df['season'] = season_short
-        df['_source'] = self.SOURCE_NAME
-        df['_entity_type'] = 'players'
-        df['_ingested_at'] = datetime.utcnow()
-        df['_batch_id'] = self._batch_id
+            if competition.team_type.value == 'club':
+                contract_rows.append({
+                    'competition_id': scope['competition_id'],
+                    'edition_id': scope['edition_id'],
+                    'team_id': str(sp['club_id']),
+                    'team_name': sp.get('current_club_name'),
+                    'player_id': str(sp['player_id']),
+                    'contract_until': sp.get('contract_until'),
+                    'observed_at': observed_at,
+                    'applicability_status': 'ok',
+                    'source_url': lineage['source_url'],
+                    'source_body_hash': lineage['source_body_hash'],
+                    'fetched_at': observed_at,
+                    'parser_revision': PARSER_REVISION,
+                    'schema_revision': SCHEMA_REVISION,
+                    'cycle_id': lineage['cycle_id'],
+                    'scope_id': scope['scope_id'],
+                })
+        memberships = _with_metadata(
+            membership_rows, SQUAD_MEMBERSHIP_COLUMNS,
+            entity_type='squad_memberships', batch_id=self._batch_id,
+            ingested_at=observed_at,
+        ).drop_duplicates([
+            'competition_id', 'edition_id', 'club_id', 'player_id',
+        ])
+        observations = _with_metadata(
+            observation_rows, PLAYER_ATTRIBUTE_OBSERVATION_COLUMNS,
+            entity_type='player_attribute_observations', batch_id=self._batch_id,
+            ingested_at=observed_at,
+        ).drop_duplicates(
+            [
+                'competition_id', 'edition_id', 'club_id', 'player_id',
+                'observed_at',
+            ]
+        )
+        contracts = _with_metadata(
+            contract_rows, PLAYER_CONTRACT_OBSERVATION_COLUMNS,
+            entity_type='player_contract_observations', batch_id=self._batch_id,
+            ingested_at=observed_at,
+        ).drop_duplicates([
+            'competition_id', 'edition_id', 'team_id', 'player_id',
+            'observed_at',
+        ])
+        contracts.attrs['fetch_status'] = (
+            'ok' if competition.team_type.value == 'club' else 'not_applicable'
+        )
+        legacy = materialize_legacy_players(memberships, observations)
 
         logger.info(
             "Materialised %d transfermarkt players (league=%s season=%s)",
-            len(df), league, season,
+            len(memberships), league, season,
         )
-        return df
+        return {
+            'memberships': memberships,
+            'attribute_observations': observations,
+            'contract_observations': contracts,
+            'legacy_players': legacy,
+        }
 
-    def read_coaches(
+    def read_squad_memberships(
+        self,
+        league: str,
+        season: int,
+        limit: Optional[int] = None,
+        squad_data: Optional[Dict[str, pd.DataFrame]] = None,
+    ) -> pd.DataFrame:
+        """Return native membership grain without a second fetch when bundled."""
+
+        data = squad_data or self.read_squad_data(league, season, limit)
+        return data['memberships']
+
+    def read_player_attribute_observations(
+        self,
+        league: str,
+        season: int,
+        limit: Optional[int] = None,
+        squad_data: Optional[Dict[str, pd.DataFrame]] = None,
+    ) -> pd.DataFrame:
+        data = squad_data or self.read_squad_data(league, season, limit)
+        return data['attribute_observations']
+
+    def read_player_contract_observations(
+        self,
+        league: str,
+        season: int,
+        limit: Optional[int] = None,
+        squad_data: Optional[Dict[str, pd.DataFrame]] = None,
+    ) -> pd.DataFrame:
+        """Return contract facts from the same paid squad responses."""
+
+        data = squad_data or self.read_squad_data(league, season, limit)
+        return data['contract_observations']
+
+    def read_players(
         self,
         league: str,
         season: int,
         limit: Optional[int] = None,
     ) -> pd.DataFrame:
-        """Listing → club staff pages → head-coach profile pages (issue #434).
+        """Legacy adapter; one squad fetch, then a pure one-player projection."""
 
-        Returns one row per (league, season, coach_id) for the head coach
-        (role == "Manager") of every club in the league-season. Feeds
-        bronze.transfermarkt_coaches → silver → gold.dim_manager nationality/dob
-        enrichment. ``limit`` caps clubs visited (smoke runs).
+        return self.read_squad_data(league, season, limit)['legacy_players']
+
+    def read_coach_data(
+        self,
+        league: str,
+        season: int,
+        limit: Optional[int] = None,
+        *,
+        clubs: Optional[List[Dict]] = None,
+        memberships: Optional[pd.DataFrame] = None,
+        coach_profile_cache: Optional[Mapping[str, Mapping]] = None,
+    ) -> Dict[str, pd.DataFrame]:
+        """Return global coach profiles/stints plus one legacy projection.
+
+        Natural keys are ``coach_id`` for profiles and
+        ``(club_id, coach_id, appointed_date, left_date)`` for stints.  Passing
+        the native squad ``memberships`` reuses club ids/slugs and eliminates a
+        duplicate league-listing request.  ``coach_profile_cache`` is an
+        optional public injection point: ``None`` resolves persisted Bronze,
+        while an explicit mapping (including ``{}`` for a cold-cache GET-only
+        benchmark) performs no Trino cache lookup.
         """
-        anchor_cols = [
-            'coach_id', 'coach_slug', 'name', 'role', 'dob', 'nationality',
-            'current_club_id', 'current_club_name', 'league', 'season',
-        ]
+        scope = self._resolve_scope(league, season)
+        competition = scope['record']
+        league = scope['compatibility_league']
+        self._begin_operation_budget('coaches')
 
-        if league not in TM_LEAGUE_MAP:
-            logger.warning(
-                "%s: league %s not in TM_LEAGUE_MAP — skipping coaches.",
-                R0_2B_FALLBACK_MARKER, league,
+        def _empty_bundle() -> Dict[str, pd.DataFrame]:
+            profiles = _with_metadata(
+                [], COACH_PROFILE_COLUMNS,
+                entity_type='coach_profiles', batch_id=self._batch_id,
             )
-            return pd.DataFrame(columns=anchor_cols + ['_ingested_at'])
-
-        league_slug, comp_id = TM_LEAGUE_MAP[league]
-        season_short = _season_short(season)
-
-        # Step 1 — league listing → clubs.
-        listing_url = (
-            f"{_TM_BASE}"
-            + _LEAGUE_LISTING_PATH.format(
-                league_slug=league_slug, comp_id=comp_id, year=int(season),
+            stints = _with_metadata(
+                [], COACH_STINT_COLUMNS,
+                entity_type='coach_stints', batch_id=self._batch_id,
             )
-        )
-        listing_html = self._fetch_html(
-            listing_url, label='listing',
-            context={'league': league, 'season': season},
-        )
-        if listing_html is None:
-            logger.error(
-                "%s: league listing fetch failed for coaches %s/%s.",
-                R0_2B_FALLBACK_MARKER, league, season,
-            )
-            return pd.DataFrame(columns=anchor_cols + ['_ingested_at'])
+            return {
+                'profiles': profiles,
+                'stints': stints,
+                'legacy_coaches': materialize_legacy_coaches(
+                    profiles, stints, league, season,
+                    scope['season_format'],
+                ),
+            }
 
-        clubs = _parse_club_listing(listing_html)
+        # Step 1 — use the already-fetched squad membership dimension when
+        # available.  Only the standalone legacy call needs a league listing.
+        if clubs is None and memberships is not None and not memberships.empty:
+            club_columns = ['club_id', 'club_slug', 'club_name']
+            reusable = memberships.reindex(columns=club_columns).drop_duplicates('club_id')
+            clubs = [
+                {
+                    'club_id': str(row['club_id']),
+                    'club_slug': row['club_slug'],
+                    'club_name': row['club_name'],
+                }
+                for _, row in reusable.iterrows()
+                if pd.notna(row['club_id']) and pd.notna(row['club_slug'])
+            ]
+        if clubs is None:
+            listing_url = _competition_listing_url(
+                competition, scope['edition_id'],
+            )
+            listing_html = self._fetch_html(
+                listing_url, label='listing',
+                context={
+                    'league': league,
+                    'season': season,
+                    'competition_id': scope['competition_id'],
+                    'edition_id': scope['edition_id'],
+                    'scope': scope['scope_id'],
+                },
+            )
+            if listing_html is None:
+                logger.error(
+                    "%s: league listing fetch failed for coaches %s/%s.",
+                    R0_2B_FALLBACK_MARKER, league, season,
+                )
+                return _empty_bundle()
+            clubs = _parse_club_listing(listing_html)
+            self._record_materialized_rows(
+                'listing', {'league': league, 'season': season}, len(clubs),
+            )
+            if not clubs:
+                self._mark_schema_error(
+                    'listing', {'league': league, 'season': season},
+                    'listing table produced zero clubs; selector/layout drift',
+                )
+                return _empty_bundle()
+        else:
+            clubs = list(clubs)
         if limit:
             clubs = clubs[: int(limit)]
         logger.info("TM coaches: %d clubs for %s/%s", len(clubs), league, season)
@@ -1183,8 +2384,12 @@ class TransfermarktScraper(BaseScraper):
         # end-of-season head coach, missing mid-season replacements and
         # caretakers; the history page lists them all with appointed/left dates.
         # Dedup coach_id per club so Step 3 fetches each bio once.
-        win_start, win_end = _season_window(season)
+        win_start, win_end = _season_window(
+            season, scope['season_format'],
+        )
         managers: List[Dict] = []
+        stint_rows: List[Dict] = []
+        history_successes = 0
         for club in clubs:
             history_url = (
                 f"{_TM_BASE}"
@@ -1199,8 +2404,37 @@ class TransfermarktScraper(BaseScraper):
             )
             if html is None:
                 continue
+            parsed_stints = _parse_coach_history(html, club_id=club['club_id'])
+            history_hash = (
+                self._last_outcome.payload_hash
+                if self._last_outcome is not None else None
+            )
+            history_fetched_at = datetime.utcnow()
+            self._record_materialized_rows(
+                'coach_history', {'club_id': club['club_id']}, len(parsed_stints),
+            )
+            if not parsed_stints:
+                self._mark_schema_error(
+                    'coach_history', {'club_id': club['club_id']},
+                    'coach-history table produced zero dated stints',
+                )
+                continue
+            history_successes += 1
             seen_coach: set = set()
-            for stint in _parse_coach_history(html, club_id=club['club_id']):
+            for stint in parsed_stints:
+                stint_rows.append({
+                    **stint,
+                    'club_name': club.get('club_name'),
+                    'source_competition_id': scope['competition_id'],
+                    'source_edition_id': scope['edition_id'],
+                    'source_url': history_url,
+                    'source_body_hash': history_hash,
+                    'fetched_at': history_fetched_at,
+                    'parser_revision': PARSER_REVISION,
+                    'schema_revision': SCHEMA_REVISION,
+                    'cycle_id': os.environ.get('TM_RUN_ID', self._batch_id),
+                    'scope_id': scope['scope_id'],
+                })
                 if not _stint_overlaps_season(stint, win_start, win_end):
                     continue
                 if stint['coach_id'] in seen_coach:
@@ -1220,7 +2454,16 @@ class TransfermarktScraper(BaseScraper):
                 "%s: zero coaches harvested across %d clubs.",
                 R0_2B_FALLBACK_MARKER, len(clubs),
             )
-            return pd.DataFrame(columns=anchor_cols + ['_ingested_at'])
+            # A valid page can have no season-overlapping coach while still
+            # yielding authoritative historical stints.
+            if not stint_rows:
+                return _empty_bundle()
+
+        if clubs and history_successes < _MIN_SUCCESS_RATIO * len(clubs):
+            raise PartialScrapeError(
+                f"only {history_successes}/{len(clubs)} coach-history pages "
+                f"fetched (< {_MIN_SUCCESS_RATIO:.0%})"
+            )
 
         logger.info(
             "TM trainer-history → %d in-season coaches to enrich", len(managers)
@@ -1230,14 +2473,24 @@ class TransfermarktScraper(BaseScraper):
         # are immutable, so profiles already materialised in bronze (any
         # season) are reused instead of re-fetched — a typical weekly run
         # downloads only genuinely new appointments (proxy-traffic fix).
-        known_bios = self._resolve_coach_bios_from_bronze()
-        rows: List[Dict] = []
+        if coach_profile_cache is None:
+            known_bios = self._resolve_coach_bios_from_bronze()
+        else:
+            known_bios = {
+                str(coach_id): dict(profile)
+                for coach_id, profile in coach_profile_cache.items()
+            }
+        resolved_bios: Dict[str, Dict] = dict(known_bios)
+        unique_managers = list({
+            str(manager['coach_id']): manager for manager in managers
+        }.values())
+        profile_rows: List[Dict] = []
         consecutive_failures = 0
         successes = 0
         attempted = 0
         reused = 0
-        for idx, mgr in enumerate(managers, start=1):
-            bio = known_bios.get(mgr['coach_id'])
+        for idx, mgr in enumerate(unique_managers, start=1):
+            bio = resolved_bios.get(mgr['coach_id'])
             if bio is not None:
                 reused += 1
             else:
@@ -1257,35 +2510,56 @@ class TransfermarktScraper(BaseScraper):
                     if consecutive_failures >= _MAX_CONSECUTIVE_FAILURES:
                         raise ConsecutiveFailureError(
                             f"{consecutive_failures} consecutive coach-profile "
-                            f"failures at {idx}/{len(managers)} — aborting to "
+                            f"failures at {idx}/{len(unique_managers)} — aborting to "
                             f"protect existing partition"
                         )
                     continue
-                consecutive_failures = 0
-                successes += 1
-                bio = _parse_coach_profile(payload, mgr['coach_id']) or {}
-            rows.append({
+                else:
+                    consecutive_failures = 0
+                    successes += 1
+                    bio = _parse_coach_profile(payload, mgr['coach_id']) or {}
+                    mgr['_source_url'] = profile_url
+                    mgr['_source_body_hash'] = (
+                        self._last_outcome.payload_hash
+                        if self._last_outcome is not None else None
+                    )
+                    self._record_materialized_rows(
+                        'coach_profile', {'coach_id': mgr['coach_id']},
+                        1 if bio else 0,
+                    )
+                resolved_bios[mgr['coach_id']] = bio
+            profile_rows.append({
                 'coach_id': mgr['coach_id'],
                 'coach_slug': mgr['coach_slug'],
                 'name': bio.get('name') or mgr['name'],
-                'role': mgr['role'],
                 'dob': bio.get('dob'),
                 'nationality': bio.get('nationality'),
-                'current_club_id': mgr['club_id'],
-                'current_club_name': mgr.get('current_club_name'),
+                'source_competition_id': scope['competition_id'],
+                'source_edition_id': scope['edition_id'],
+                'source_url': (
+                    mgr.get('_source_url') or competition.source_url
+                ),
+                'source_body_hash': (
+                    mgr.get('_source_body_hash') or competition.source_body_hash
+                ),
+                'fetched_at': datetime.utcnow(),
+                'parser_revision': PARSER_REVISION,
+                'schema_revision': SCHEMA_REVISION,
+                'cycle_id': os.environ.get('TM_RUN_ID', self._batch_id),
+                'scope_id': scope['scope_id'],
             })
 
         if reused:
             logger.info(
-                "coach bios reused from bronze: %d/%d", reused, len(managers),
+                "coach bios reused from bronze: %d/%d", reused, len(unique_managers),
             )
 
-        if not rows:
+        if not profile_rows and not stint_rows:
             logger.warning(
                 "%s: zero coach_profile rows materialised.",
                 R0_2B_FALLBACK_MARKER,
             )
-            return pd.DataFrame(columns=anchor_cols + ['_ingested_at'])
+            return _empty_bundle()
 
         if attempted and successes < _MIN_SUCCESS_RATIO * attempted:
             raise PartialScrapeError(
@@ -1293,17 +2567,248 @@ class TransfermarktScraper(BaseScraper):
                 f"(< {_MIN_SUCCESS_RATIO:.0%}) — aborting to protect partition"
             )
 
-        df = pd.DataFrame(rows)
-        df['league'] = league
-        df['season'] = season_short
-        df['_source'] = self.SOURCE_NAME
-        df['_entity_type'] = 'coaches'
-        df['_ingested_at'] = datetime.utcnow()
-        df['_batch_id'] = self._batch_id
+        ingested_at = datetime.utcnow()
+        profiles = _with_metadata(
+            profile_rows, COACH_PROFILE_COLUMNS,
+            entity_type='coach_profiles', batch_id=self._batch_id,
+            ingested_at=ingested_at,
+        ).sort_values('coach_id', kind='mergesort').drop_duplicates(
+            'coach_id', keep='first',
+        )
+        stints = _with_metadata(
+            stint_rows, COACH_STINT_COLUMNS,
+            entity_type='coach_stints', batch_id=self._batch_id,
+            ingested_at=ingested_at,
+        ).drop_duplicates(
+            ['club_id', 'coach_id', 'appointed_date', 'left_date']
+        )
+        legacy = materialize_legacy_coaches(
+            profiles, stints, league, season, scope['season_format'],
+        )
 
         logger.info(
             "Materialised %d transfermarkt coaches (league=%s season=%s)",
-            len(df), league, season,
+            len(legacy), league, season,
+        )
+        return {
+            'profiles': profiles,
+            'stints': stints,
+            'legacy_coaches': legacy,
+        }
+
+    def read_coach_profiles(
+        self,
+        league: str,
+        season: int,
+        limit: Optional[int] = None,
+        coach_data: Optional[Dict[str, pd.DataFrame]] = None,
+        **kwargs,
+    ) -> pd.DataFrame:
+        data = coach_data or self.read_coach_data(
+            league, season, limit, **kwargs,
+        )
+        return data['profiles']
+
+    def read_coach_stints(
+        self,
+        league: str,
+        season: int,
+        limit: Optional[int] = None,
+        coach_data: Optional[Dict[str, pd.DataFrame]] = None,
+        **kwargs,
+    ) -> pd.DataFrame:
+        data = coach_data or self.read_coach_data(
+            league, season, limit, **kwargs,
+        )
+        return data['stints']
+
+    def read_coaches(
+        self,
+        league: str,
+        season: int,
+        limit: Optional[int] = None,
+    ) -> pd.DataFrame:
+        """Legacy adapter over one native coach bundle fetch."""
+
+        return self.read_coach_data(league, season, limit)['legacy_coaches']
+
+    def _read_player_endpoint_rows(
+        self,
+        *,
+        league: str,
+        season: int,
+        player_ids: Optional[List[str]],
+        limit: Optional[int],
+        window_offset: int,
+        label: str,
+        path_template: str,
+        parser,
+        columns: List[str],
+        entity_type: str,
+    ) -> pd.DataFrame:
+        """Shared per-player fan-out with completeness and early-stop guards."""
+
+        scope = self._resolve_scope(league, season)
+        league = scope['compatibility_league']
+        season_short = scope['canonical_season']
+        if player_ids is None:
+            player_ids = self._resolve_player_ids_from_bronze(
+                league, season_short, limit=limit, window_offset=window_offset,
+            )
+        if not player_ids:
+            logger.warning(
+                "%s: no player_ids resolved for %s (%s/%s).",
+                R0_2B_FALLBACK_MARKER, label, league, season_short,
+            )
+            return _with_metadata(
+                [], columns, entity_type=entity_type, batch_id=self._batch_id,
+            )
+        selected_ids = list(dict.fromkeys(str(pid) for pid in player_ids))
+        if limit:
+            selected_ids = selected_ids[: int(limit)]
+
+        rows: List[Dict] = []
+        consecutive_failures = 0
+        successes = 0
+        required_successes = int(math.ceil(_MIN_SUCCESS_RATIO * len(selected_ids)))
+        for idx, pid in enumerate(selected_ids, start=1):
+            url = f"{_TM_BASE}" + path_template.format(player_id=pid)
+            payload = self._fetch_json(
+                url, label=label, context={
+                    'player_id': pid,
+                    'competition_id': scope['competition_id'],
+                    'edition_id': scope['edition_id'],
+                    'scope': scope['scope_id'],
+                },
+            )
+            if payload is None:
+                consecutive_failures += 1
+                if consecutive_failures >= _MAX_CONSECUTIVE_FAILURES:
+                    raise ConsecutiveFailureError(
+                        f"{consecutive_failures} consecutive {label} "
+                        f"failures at {idx}/{len(selected_ids)} — aborting "
+                        f"to protect existing partition"
+                    )
+            else:
+                source_field = (
+                    'list'
+                    if label in {'mv_history', 'market_value_points'}
+                    else 'transfers'
+                )
+                source_rows = payload.get(source_field)
+                try:
+                    parsed_rows = parser(payload, pid)
+                except Exception as exc:  # parser failures are typed schema drift
+                    parsed_rows = []
+                    collection_error = (
+                        f'parser raised {type(exc).__name__}: {exc}'
+                    )
+                else:
+                    collection_error = _career_collection_error(
+                        label, pid, source_rows, parsed_rows,
+                    )
+
+                if collection_error is not None:
+                    consecutive_failures += 1
+                    self._mark_schema_error(
+                        label, {'player_id': pid}, collection_error,
+                    )
+                    if consecutive_failures >= _MAX_CONSECUTIVE_FAILURES:
+                        raise ConsecutiveFailureError(
+                            f"{consecutive_failures} consecutive {label} parser "
+                            f"failures at {idx}/{len(selected_ids)}"
+                        )
+                elif source_rows == []:
+                    consecutive_failures = 0
+                    successes += 1
+                    self._mark_authoritative_empty(
+                        label, {'player_id': pid},
+                    )
+                else:
+                    consecutive_failures = 0
+                    successes += 1
+                    fetched_at = datetime.utcnow()
+                    payload_hash = (
+                        self._last_outcome.payload_hash
+                        if self._last_outcome is not None else None
+                    )
+                    for row in parsed_rows:
+                        row.update({
+                            'source_competition_id': scope['competition_id'],
+                            'source_edition_id': scope['edition_id'],
+                            'source_url': url,
+                            'source_body_hash': payload_hash,
+                            'fetched_at': fetched_at,
+                            'parser_revision': PARSER_REVISION,
+                            'schema_revision': SCHEMA_REVISION,
+                            'cycle_id': os.environ.get(
+                                'TM_RUN_ID', self._batch_id,
+                            ),
+                            'scope_id': scope['scope_id'],
+                        })
+                    rows.extend(parsed_rows)
+                    self._record_materialized_rows(
+                        label, {'player_id': pid}, len(parsed_rows),
+                    )
+
+            remaining = len(selected_ids) - idx
+            if successes + remaining < required_successes:
+                # The 90% target is mathematically unreachable.  Do not spend
+                # paid traffic on requests that cannot make the run writable.
+                if successes:
+                    raise PartialScrapeError(
+                        f"only {successes}/{idx} {label} payloads fetched and "
+                        f"{remaining} remain; {_MIN_SUCCESS_RATIO:.0%} target "
+                        "is unreachable"
+                    )
+                break
+            if idx % 50 == 0:
+                logger.info("%s progress: %d/%d", label, idx, len(selected_ids))
+
+        if successes and successes < required_successes:
+            raise PartialScrapeError(
+                f"only {successes}/{len(selected_ids)} {label} payloads "
+                f"fetched (< {_MIN_SUCCESS_RATIO:.0%}) — aborting to protect "
+                "existing partition"
+            )
+        frame = _with_metadata(
+            rows, columns, entity_type=entity_type, batch_id=self._batch_id,
+        )
+        return frame
+
+    def read_market_value_points(
+        self,
+        league: str,
+        season: int,
+        player_ids: Optional[List[str]] = None,
+        limit: Optional[int] = None,
+        window_offset: int = 0,
+    ) -> pd.DataFrame:
+        """Return global market-value facts keyed by ``(player_id, mv_date)``.
+
+        ``league``/``season`` select the roster only and are intentionally not
+        copied into the global output.
+        """
+        self._begin_operation_budget('market_value_history')
+        df = self._read_player_endpoint_rows(
+            league=league,
+            season=season,
+            player_ids=player_ids,
+            limit=limit,
+            window_offset=window_offset,
+            label='market_value_points',
+            path_template=_PLAYER_MV_HISTORY_PATH,
+            parser=_parse_mv_history,
+            columns=MARKET_VALUE_POINT_COLUMNS,
+            entity_type='market_value_points',
+        )
+        if not df.empty:
+            df = df.sort_values(
+                ['player_id', 'mv_date'], kind='mergesort',
+            ).drop_duplicates(['player_id', 'mv_date'], keep='last')
+        logger.info(
+            "Materialised %d mv_history rows for %d players",
+            len(df), df['player_id'].nunique() if not df.empty else 0,
         )
         return df
 
@@ -1315,76 +2820,50 @@ class TransfermarktScraper(BaseScraper):
         limit: Optional[int] = None,
         window_offset: int = 0,
     ) -> pd.DataFrame:
-        """Per-player MV timeline via ``/ceapi/marketValueDevelopment/graph``.
+        """Legacy adapter over global market-value points."""
 
-        ``player_ids`` defaults to the rotating roster window from
-        ``bronze.transfermarkt_players`` for the requested (league, season) —
-        see :meth:`_resolve_player_ids_from_bronze` (``window_offset`` advances
-        the window per run, #620). Empty roster → empty DF (runner emits
-        ``TM_FALLBACK`` exit code 2).
+        points = self.read_market_value_points(
+            league, season, player_ids, limit, window_offset,
+        )
+        scope = self._resolve_scope(league, season)
+        return materialize_legacy_market_value_history(
+            points, scope['compatibility_league'], season,
+            scope['season_format'],
+        )
+
+    def read_transfer_events(
+        self,
+        league: str,
+        season: int,
+        player_ids: Optional[List[str]] = None,
+        limit: Optional[int] = None,
+        window_offset: int = 0,
+    ) -> pd.DataFrame:
+        """Return global transfer facts keyed by globally unique transfer_id.
+
+        ``event_season`` is derived only from the payload/date and is never
+        overwritten by the requested roster season.
         """
-        anchor_cols = [
-            'player_id', 'mv_date', 'value_eur', 'club_name', 'age', 'mv_raw',
-            'league', 'season',
-        ]
-        season_short = _season_short(season)
-
-        if player_ids is None:
-            player_ids = self._resolve_player_ids_from_bronze(
-                league, season_short, limit=limit, window_offset=window_offset,
-            )
-        if not player_ids:
-            logger.warning(
-                "%s: no player_ids resolved for mv_history (%s/%s).",
-                R0_2B_FALLBACK_MARKER, league, season_short,
-            )
-            return pd.DataFrame(columns=anchor_cols + ['_ingested_at'])
-        if limit:
-            player_ids = list(player_ids)[: int(limit)]
-
-        rows: List[Dict] = []
-        consecutive_failures = 0
-        successes = 0
-        for idx, pid in enumerate(player_ids, start=1):
-            url = f"{_TM_BASE}" + _PLAYER_MV_HISTORY_PATH.format(player_id=pid)
-            payload = self._fetch_json(
-                url, label='mv_history', context={'player_id': pid},
-            )
-            if payload is None:
-                consecutive_failures += 1
-                if consecutive_failures >= _MAX_CONSECUTIVE_FAILURES:
-                    raise ConsecutiveFailureError(
-                        f"{consecutive_failures} consecutive mv_history "
-                        f"failures at {idx}/{len(player_ids)} — aborting to "
-                        f"protect existing partition"
-                    )
-                continue
-            consecutive_failures = 0
-            successes += 1
-            rows.extend(_parse_mv_history(payload, pid))
-            if idx % 50 == 0:
-                logger.info("mv_history progress: %d/%d", idx, len(player_ids))
-
-        if not rows:
-            return pd.DataFrame(columns=anchor_cols + ['_ingested_at'])
-
-        if successes < _MIN_SUCCESS_RATIO * len(player_ids):
-            raise PartialScrapeError(
-                f"only {successes}/{len(player_ids)} mv_history payloads "
-                f"fetched (< {_MIN_SUCCESS_RATIO:.0%}) — aborting to protect "
-                f"existing partition"
-            )
-
-        df = pd.DataFrame(rows)
-        df['league'] = league
-        df['season'] = season_short
-        df['_source'] = self.SOURCE_NAME
-        df['_entity_type'] = 'market_value_history'
-        df['_ingested_at'] = datetime.utcnow()
-        df['_batch_id'] = self._batch_id
+        self._begin_operation_budget('transfers')
+        df = self._read_player_endpoint_rows(
+            league=league,
+            season=season,
+            player_ids=player_ids,
+            limit=limit,
+            window_offset=window_offset,
+            label='transfer_events',
+            path_template=_PLAYER_TRANSFERS_PATH,
+            parser=_parse_transfers,
+            columns=TRANSFER_EVENT_COLUMNS,
+            entity_type='transfer_events',
+        )
+        if not df.empty:
+            df = df.sort_values(
+                ['transfer_id', 'player_id'], kind='mergesort',
+            ).drop_duplicates('transfer_id', keep='last')
         logger.info(
-            "Materialised %d mv_history rows for %d players",
-            len(df), df['player_id'].nunique(),
+            "Materialised %d transfer rows for %d players",
+            len(df), df['player_id'].nunique() if not df.empty else 0,
         )
         return df
 
@@ -1396,77 +2875,16 @@ class TransfermarktScraper(BaseScraper):
         limit: Optional[int] = None,
         window_offset: int = 0,
     ) -> pd.DataFrame:
-        """Per-player transfer events via ``/ceapi/transferHistory/list``.
+        """Legacy adapter over global transfer events."""
 
-        Same roster-resolution semantics as ``read_market_value_history``
-        (rotating window via ``window_offset``, #620).
-        """
-        anchor_cols = [
-            'player_id', 'transfer_date', 'season',
-            'from_club_id', 'from_club_name',
-            'to_club_id', 'to_club_name',
-            'fee_text', 'fee_eur', 'market_value_eur', 'is_upcoming',
-        ]
-        season_short = _season_short(season)
-
-        if player_ids is None:
-            player_ids = self._resolve_player_ids_from_bronze(
-                league, season_short, limit=limit, window_offset=window_offset,
-            )
-        if not player_ids:
-            logger.warning(
-                "%s: no player_ids resolved for transfers (%s/%s).",
-                R0_2B_FALLBACK_MARKER, league, season_short,
-            )
-            return pd.DataFrame(columns=anchor_cols + ['league', 'season', '_ingested_at'])
-        if limit:
-            player_ids = list(player_ids)[: int(limit)]
-
-        rows: List[Dict] = []
-        consecutive_failures = 0
-        successes = 0
-        for idx, pid in enumerate(player_ids, start=1):
-            url = f"{_TM_BASE}" + _PLAYER_TRANSFERS_PATH.format(player_id=pid)
-            payload = self._fetch_json(
-                url, label='transfers', context={'player_id': pid},
-            )
-            if payload is None:
-                consecutive_failures += 1
-                if consecutive_failures >= _MAX_CONSECUTIVE_FAILURES:
-                    raise ConsecutiveFailureError(
-                        f"{consecutive_failures} consecutive transfers "
-                        f"failures at {idx}/{len(player_ids)} — aborting to "
-                        f"protect existing partition"
-                    )
-                continue
-            consecutive_failures = 0
-            successes += 1
-            rows.extend(_parse_transfers(payload, pid))
-            if idx % 50 == 0:
-                logger.info("transfers progress: %d/%d", idx, len(player_ids))
-
-        if not rows:
-            return pd.DataFrame(columns=anchor_cols + ['league', 'season', '_ingested_at'])
-
-        if successes < _MIN_SUCCESS_RATIO * len(player_ids):
-            raise PartialScrapeError(
-                f"only {successes}/{len(player_ids)} transfers payloads "
-                f"fetched (< {_MIN_SUCCESS_RATIO:.0%}) — aborting to protect "
-                f"existing partition"
-            )
-
-        df = pd.DataFrame(rows)
-        df['league'] = league
-        df['season'] = season_short
-        df['_source'] = self.SOURCE_NAME
-        df['_entity_type'] = 'transfers'
-        df['_ingested_at'] = datetime.utcnow()
-        df['_batch_id'] = self._batch_id
-        logger.info(
-            "Materialised %d transfer rows for %d players",
-            len(df), df['player_id'].nunique(),
+        events = self.read_transfer_events(
+            league, season, player_ids, limit, window_offset,
         )
-        return df
+        scope = self._resolve_scope(league, season)
+        return materialize_legacy_transfers(
+            events, scope['compatibility_league'], season,
+            scope['season_format'],
+        )
 
     # ---------------------- BaseScraper contract -----------------------------
 

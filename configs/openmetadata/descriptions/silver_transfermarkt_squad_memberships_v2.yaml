@@ -1,0 +1,13 @@
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.transfermarkt_squad_memberships_v2
+  description: Typed/deduplicated native memberships at honest club grain.
+  tags: [Tier.Silver, Domain.Football, PII.Low]
+columns:
+  - name: player_id
+    description: Transfermarkt player id.
+  - name: club_id
+    description: Transfermarkt club id.
+  - name: club_slug
+    description: Transfermarkt club URL slug reused by coach crawling.
+  - name: observed_at
+    description: Source observation timestamp.

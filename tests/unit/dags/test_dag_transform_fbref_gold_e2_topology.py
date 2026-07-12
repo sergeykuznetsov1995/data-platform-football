@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import importlib
 import sys
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -113,6 +115,43 @@ class TestDagLoad:
         assert mod.dag._dag_kwargs.get("max_active_tasks") == 1, (
             "max_active_tasks must remain 1 for predictable RAM"
         )
+
+    def test_active_multi_scope_reader_uses_scope_set_readiness(
+        self, monkeypatch,
+    ):
+        mod = _reload_gold_dag()
+        state = mod.tm_v2.ReaderState(
+            exists=True,
+            active_version='v2',
+            active_slot='a',
+            revision=8,
+            approved_cycle_id='tm-parent',
+            approved_league='ENG-Premier League',
+            approved_season=2025,
+            approved_model_revision=7,
+            approved_scope_set_id='a' * 64,
+        )
+        cursor = MagicMock()
+        connection = MagicMock()
+        connection.cursor.return_value = cursor
+        readiness = MagicMock(return_value={'ready': True})
+        monkeypatch.setattr(mod.tm_v2, 'connect', lambda: connection)
+        monkeypatch.setattr(mod.tm_v2, 'read_reader_state', lambda *a, **kw: state)
+        monkeypatch.setattr(mod.tm_v2, 'readiness', readiness)
+        monkeypatch.setattr(
+            mod.tm_v2, 'verify_reader_views', lambda *a, **kw: {'passed': True},
+        )
+
+        result = mod._tm_reader_precondition(
+            dag_run=SimpleNamespace(conf={}),
+        )
+
+        assert result['readiness_scope_set_id'] == 'a' * 64
+        kwargs = readiness.call_args.kwargs
+        assert kwargs['scope_set_id'] == 'a' * 64
+        assert kwargs['parent_cycle_id'] == 'tm-parent'
+        assert kwargs['candidate_slot_override'] == 'a'
+        assert 'league' not in kwargs
 
 
 @pytest.mark.unit

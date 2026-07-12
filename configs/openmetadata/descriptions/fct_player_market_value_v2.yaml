@@ -1,0 +1,15 @@
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.gold.fct_player_market_value_v2
+  description: |
+    Native two-source global value timeline. Transfermarkt points are consumed
+    once at career grain; no scrape-season reconstruction or cross-season
+    deduplication remains. Promotion happens only via the cycle-pinned reader
+    cutover and this physical table remains rollback-safe.
+  tags: [Tier.Gold, Domain.Football, PII.None]
+columns:
+  - name: player_id
+    description: Canonical player id or stable `fm_`/`tm_` orphan id (#871); soft-FK and primary-key component.
+  - name: valuation_date
+    description: Global valuation date; primary-key component.
+  - name: source
+    description: fotmob or transfermarkt; primary-key component.

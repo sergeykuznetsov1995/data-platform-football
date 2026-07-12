@@ -148,7 +148,11 @@ def _install_airflow_stubs() -> None:
     class _AirflowException(Exception):
         pass
 
+    class _AirflowSkipException(_AirflowException):
+        pass
+
     exceptions_mod.AirflowException = _AirflowException
+    exceptions_mod.AirflowSkipException = _AirflowSkipException
 
     # ---- airflow.operators.python.PythonOperator (for completeness) -----
     class _PythonOperator:
@@ -158,10 +162,20 @@ def _install_airflow_stubs() -> None:
         # (or ``BashOperator._instances.clear()``) before re-importing the DAG.
         _instances: list = []
 
+        @classmethod
+        def partial(cls, **kw):
+            return _MappedPartial(cls, kw)
+
         def __init__(self, *a, **kw):
             self.task_id = kw.get("task_id", "stub")
             self.python_callable = kw.get("python_callable")
             self.op_kwargs = kw.get("op_kwargs", {})
+            self._init_kwargs = dict(kw)
+            self._expand_kwargs = {}
+            self.is_mapped = False
+            # Airflow exposes ``operator.output`` as an XComArg.  DAG parse
+            # tests only need an opaque object which preserves its producer.
+            self.output = _StubXComArg(self)
             # Per-instance bookkeeping for upstream/downstream tracking via
             # >>/<<. These start empty and get populated by __rshift__ /
             # __lshift__ so DAG-topology tests can verify ``X >> Y >> Z``
@@ -235,10 +249,33 @@ def _install_airflow_stubs() -> None:
     # Records every ctor kwarg so tests can assert on `append_env`,
     # `bash_command`, `env`, etc. exactly the same way a real BashOperator
     # would expose them.
+    class _StubXComArg:
+        def __init__(self, operator, key=None):
+            self.operator = operator
+            self.key = key
+
+        def __getitem__(self, key):
+            return _StubXComArg(self.operator, key=key)
+
+    class _MappedPartial:
+        def __init__(self, operator_class, kwargs):
+            self.operator_class = operator_class
+            self.kwargs = dict(kwargs)
+
+        def expand(self, **mapped_kwargs):
+            operator = self.operator_class(**self.kwargs)
+            operator._expand_kwargs = dict(mapped_kwargs)
+            operator.is_mapped = True
+            return operator
+
     class _BashOperator:
         # Class-level registry — every instance appends itself so DAG-load
         # tests can inspect the operators that were created.
         _instances: list = []
+
+        @classmethod
+        def partial(cls, **kw):
+            return _MappedPartial(cls, kw)
 
         def __init__(self, *a, **kw):
             self.task_id = kw.get("task_id", "stub")
@@ -246,6 +283,8 @@ def _install_airflow_stubs() -> None:
             self.env = kw.get("env")
             self.append_env = kw.get("append_env", False)
             self._init_kwargs = dict(kw)
+            self._expand_kwargs = {}
+            self.is_mapped = False
             _BashOperator._instances.append(self)
 
         def __rshift__(self, other):

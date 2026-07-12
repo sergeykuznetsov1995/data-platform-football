@@ -50,7 +50,9 @@ source:
         excludes:
           - "^_.*"
       includeTables: true
-      includeViews: false
+      # Canonical WhoScored manifest-backed readers and Transfermarkt
+      # state-selected readers are views; omitting them hides the serving boundary.
+      includeViews: true
       # Soft-delete tables that disappeared from Trino on the next run.
       markDeletedTables: true
       # We use bronze/silver/gold across catalogs in the future — keep filters per schema.

@@ -1,0 +1,40 @@
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.whoscored_match_bets_current
+  description: |
+    Source-honest WhoScored pre-match betting offers. The manifest-backed view
+    publishes only the latest successful scope batch. Grain is one provider
+    offer for a game, outcome and source market; odds and click-out URLs are
+    stored exactly as supplied by WhoScored and are not interpreted as results.
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.None
+columns:
+  - name: game_id
+    description: Numeric WhoScored match identifier.
+  - name: entity_key
+    description: Stable game, outcome, market and provider composite identity.
+  - name: source_outcome
+    description: Source outcome bucket, limited by the payload to home, draw or away.
+  - name: source_bet_id
+    description: Source betting-market identifier from betId.
+  - name: bet_name
+    description: Source betting-market label from betName.
+  - name: source_offer_ordinal
+    description: Zero-based offer position inside the source market offers array.
+  - name: provider_id
+    description: Stable provider identifier supplied by WhoScored.
+  - name: betting_provider
+    description: Betting provider label exactly as supplied by WhoScored.
+  - name: odds_decimal
+    description: Decimal odds parsed from the source without implied-probability conversion.
+  - name: odds_fractional
+    description: Fractional odds representation when WhoScored supplies it.
+  - name: odds_us
+    description: US odds representation when WhoScored supplies it.
+  - name: clickout_url
+    description: Source clickOut target retained as provenance, not requested by ingestion.
+  - name: source_path
+    description: Exact source object path used to identify the offer.
+  - name: _scope_batch_id
+    description: Identifier of the atomically published scope batch.
