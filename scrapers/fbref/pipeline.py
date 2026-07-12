@@ -1268,7 +1268,9 @@ class FBrefPipeline:
                 directly_seeded += seeded
                 directly_skipped += skipped
         discovered = discover_page_links(
-            html, parent_source_ids=record.source_ids
+            html,
+            parent_source_ids=record.source_ids,
+            parent_url=record.canonical_url,
         )
         # A match inherits competition/season identity only from a parsed
         # schedule row.  Generic navigation links on player or other pages are

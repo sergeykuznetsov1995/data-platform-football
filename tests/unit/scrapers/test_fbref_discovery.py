@@ -437,6 +437,74 @@ def test_stat_links_stay_distinct_and_known_empty_routes_are_skipped():
     )
 
 
+SEASON_LESS_NAV_HTML = """
+<a href="/en/comps/8/Champions-League-Stats">Champions League</a>
+<a href="/en/comps/20/Bundesliga-Stats">Bundesliga</a>
+<a href="/en/comps/9/schedule/Premier-League-Scores-and-Fixtures">Fixtures</a>
+<a href="/en/comps/9/keepers/Premier-League-Stats">Keepers</a>
+<a href="/en/comps/season/2027">2027 seasons</a>
+"""
+
+
+def test_season_less_comps_links_on_a_match_page_are_not_season_targets():
+    # FBref's navigation addresses every competition's *current* season without
+    # a season segment; a 2016-2017 match page must not mint targets that claim
+    # its own season for them.
+    links = discover_page_links(
+        SEASON_LESS_NAV_HTML,
+        parent_source_ids={
+            "competition_id": "20",
+            "season_id": "2016-2017",
+            "match_id": "5492b4b4",
+        },
+        parent_url="https://fbref.com/en/matches/5492b4b4",
+    )
+
+    assert links == []
+
+
+def test_current_season_page_lends_its_season_to_its_own_subpages_only():
+    links = discover_page_links(
+        SEASON_LESS_NAV_HTML,
+        parent_source_ids={"competition_id": "9", "season_id": "2026"},
+        parent_url="https://fbref.com/en/comps/9/Premier-League-Stats",
+    )
+    by_kind = {link.page_kind: link for link in links}
+
+    assert set(by_kind) == {"schedule", "season_stats"}
+    assert by_kind["schedule"].source_ids == {
+        "competition_id": "9",
+        "season_id": "2026",
+    }
+    assert by_kind["season_stats"].source_ids == {
+        "competition_id": "9",
+        "season_id": "2026",
+        "stat_route": "keepers",
+    }
+    assert not any(
+        link.source_ids.get("competition_id") in {"8", "20", "season"}
+        for link in links
+    )
+
+
+def test_historical_season_page_does_not_lend_its_season_to_current_links():
+    links = discover_page_links(
+        """
+        <a href="/en/comps/9/Premier-League-Stats">Premier League</a>
+        <a href="/en/comps/9/2016-2017/keepers/2016-2017-Premier-League-Stats">
+          Keepers
+        </a>
+        """,
+        parent_source_ids={"competition_id": "9", "season_id": "2016-2017"},
+        parent_url=(
+            "https://fbref.com/en/comps/9/2016-2017/2016-2017-Premier-League-Stats"
+        ),
+    )
+
+    assert [link.page_kind for link in links] == ["season_stats"]
+    assert links[0].source_ids["season_id"] == "2016-2017"
+
+
 def test_sentinel_coverage_observes_but_does_not_filter_arbitrary_male_rows():
     premier = CompetitionRef(
         **{**_competition(comp_id="9").__dict__, "name": "Premier League"}
