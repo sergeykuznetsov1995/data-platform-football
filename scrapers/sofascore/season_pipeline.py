@@ -91,10 +91,11 @@ class SeasonPartitionPlan:
     schedule_event_ids: tuple[str, ...]
     team_ids: tuple[str, ...]
     referee_ids: tuple[str, ...]
+    player_universe_evidence_gaps: tuple[str, ...] = ()
 
     @property
     def complete(self) -> bool:
-        return not self.pending_keys
+        return not self.pending_keys and not self.player_universe_evidence_gaps
 
 
 @dataclass(frozen=True)
@@ -264,6 +265,12 @@ def build_schedule_page_spec(
             )
         },
         paid_proxy=paid_proxy,
+        # The seed page has no predecessor. SofaScore returns 404 when that
+        # direction has no events (for example ``next/0`` after a season has
+        # ended), which is a legitimate empty direction. Later pages are only
+        # planned after a preceding ``hasNextPage=true`` and therefore keep a
+        # 404 resumable/failing.
+        legitimate_empty_http_statuses=(204, 404) if page == 0 else (204,),
         # A page explicitly promised by the preceding ``hasNextPage`` is
         # required. A transient 404 must remain resumable, not become a cached
         # ``not_supported`` hole in the schedule chain.
@@ -733,7 +740,9 @@ def plan_season_partition(
     pending: list[ManifestKey] = []
     missing_raw: list[ManifestKey] = []
     event_ids: list[str] = []
+    scheduled_team_ids: set[str] = set()
     embedded_referee_ids: set[str] = set()
+    player_universe_evidence_gaps: list[str] = []
 
     def append_key_once(keys: list[ManifestKey], key: ManifestKey) -> None:
         if key not in keys:
@@ -762,20 +771,32 @@ def plan_season_partition(
         )
         if required_schedule_page:
             # Schedule pages, including a page promised by its predecessor,
-            # are never optional. Only validated JSON plus a matching terminal
-            # success/empty record proves terminality.
+            # are never optional. A seed page may nevertheless be a body-less
+            # terminal empty (204/404) when that whole direction has no events.
+            # Promised later pages do not accept 404 in their endpoint policy.
+            accepted_schedule_empty = bool(
+                manifest
+                and manifest.status == ManifestStatus.LEGITIMATE_EMPTY
+                and stored.raw is not None
+                and stored.raw.http_status in spec.legitimate_empty_http_statuses
+            )
             satisfied = bool(
-                stored.has_valid_json
-                and manifest
-                and manifest.status
-                in {
-                    ManifestStatus.SUCCESS,
-                    ManifestStatus.LEGITIMATE_EMPTY,
-                }
+                manifest
+                and (
+                    (
+                        stored.has_valid_json
+                        and manifest.status
+                        in {
+                            ManifestStatus.SUCCESS,
+                            ManifestStatus.LEGITIMATE_EMPTY,
+                        }
+                    )
+                    or accepted_schedule_empty
+                )
             )
             if not satisfied:
                 append_key_once(pending, spec.key)
-            if not stored.has_valid_json:
+            if not stored.has_valid_json and not accepted_schedule_empty:
                 append_key_once(missing_raw, spec.key)
         else:
             if not terminal:
@@ -802,6 +823,15 @@ def plan_season_partition(
                 event_id = _positive_id(event["id"], "event_id")
                 if event_id not in event_ids:
                     event_ids.append(event_id)
+                for side in ("homeTeam", "awayTeam"):
+                    try:
+                        scheduled_team_ids.add(
+                            _positive_id(event[side]["id"], f"{side}_id")
+                        )
+                    except (KeyError, TypeError, ValueError) as exc:
+                        raise SeasonPlanningError(
+                            f"schedule event {event_id} has invalid {side} evidence"
+                        ) from exc
                 referee = event.get("referee")
                 if referee is not None:
                     if not isinstance(referee, Mapping) or referee.get("id") is None:
@@ -836,7 +866,7 @@ def plan_season_partition(
         if spec.key.endpoint == "participants" and stored.has_valid_json:
             participants_payload = stored.payload
 
-    team_ids: set[str] = set()
+    participant_team_ids: set[str] = set()
     if participants_payload is not None:
         for index, team in enumerate(participants_payload["teams"]):
             if not isinstance(team, Mapping) or team.get("id") is None:
@@ -844,16 +874,57 @@ def plan_season_partition(
                     f"participants team at index {index} has no source id"
                 )
             try:
-                team_ids.add(_positive_id(team["id"], "team_id"))
+                participant_team_ids.add(_positive_id(team["id"], "team_id"))
             except ValueError as exc:
                 raise SeasonPlanningError(
                     f"participants team at index {index} has invalid source id"
                 ) from exc
 
+        missing_participants = scheduled_team_ids - participant_team_ids
+        if not participant_team_ids:
+            player_universe_evidence_gaps.append(
+                "participants returned no teams; squad universe is unproven"
+            )
+            append_key_once(pending, participants.key)
+        elif missing_participants:
+            missing_tokens = ",".join(sorted(missing_participants, key=int))
+            player_universe_evidence_gaps.append(
+                "participants omitted scheduled team ids: " + missing_tokens
+            )
+            append_key_once(pending, participants.key)
+
+    # Schedule evidence is authoritative for teams that actually played, while
+    # participants can add registered teams that do not appear in the captured
+    # page window.  Planning the union prevents a partial participants payload
+    # from silently shrinking the squad/profile universe.
+    team_ids = scheduled_team_ids | participant_team_ids
+
     for team_id in sorted(team_ids, key=int):
         spec = build_squad_spec(team_id=team_id, **common)
         specs.append(spec)
-        inspect(spec)
+        stored = inspect(spec)
+        squad_manifest = manifest_store.get(spec.key)
+        squad_not_supported = bool(
+            squad_manifest
+            and squad_manifest.status == ManifestStatus.NOT_SUPPORTED
+            and stored.raw is not None
+            and stored.raw.http_status in spec.not_supported_http_statuses
+        )
+        if stored.has_valid_json and not stored.payload["players"]:
+            player_universe_evidence_gaps.append(
+                f"scheduled/participating team {team_id} has an empty squad"
+            )
+            append_key_once(pending, spec.key)
+        elif (
+            not stored.has_valid_json
+            and squad_manifest is not None
+            and squad_manifest.is_terminal
+            and not squad_not_supported
+        ):
+            player_universe_evidence_gaps.append(
+                f"scheduled/participating team {team_id} has no usable squad evidence"
+            )
+            append_key_once(pending, spec.key)
 
     referee_ids = set(embedded_referee_ids)
     for event_id in event_ids:
@@ -885,6 +956,7 @@ def plan_season_partition(
         schedule_event_ids=tuple(event_ids),
         team_ids=tuple(sorted(team_ids, key=int)),
         referee_ids=tuple(sorted(referee_ids, key=int)),
+        player_universe_evidence_gaps=tuple(player_universe_evidence_gaps),
     )
 
 
@@ -1033,6 +1105,11 @@ def materialize_season_partition(
 
     league = _canonical_token(canonical_league, "canonical_league")
     season = _canonical_token(canonical_season, "canonical_season")
+    if plan.player_universe_evidence_gaps:
+        raise SeasonMaterializationError(
+            "player universe evidence is incomplete: "
+            + "; ".join(plan.player_universe_evidence_gaps)
+        )
     expected_keys = [spec.key for spec in plan.specs]
     result_keys = [result.manifest.key for result in results]
     if len(result_keys) != len(set(result_keys)):
@@ -1228,16 +1305,32 @@ def squad_player_ids(
 ) -> tuple[str, ...]:
     """Resolve registered players from exact planned squad raw, without I/O.
 
-    Squad payloads stay raw-only because no stable published squad grain is
-    needed yet. Their IDs still belong to the profile universe. Missing or
-    malformed planned raw is fatal so appearances/ratings cannot silently
-    substitute for registration evidence.
+    A source-supported season squad contributes registered players. SofaScore
+    currently returns 404 for the season-scoped squad route; that explicit
+    terminal ``not_supported`` state contributes no IDs and is not confused
+    with missing/malformed evidence. The current-only ``/team/{id}/players``
+    route is deliberately not used for historical season attribution.
     """
+    if plan.player_universe_evidence_gaps:
+        raise SeasonPlanningError(
+            "player universe evidence is incomplete: "
+            + "; ".join(plan.player_universe_evidence_gaps)
+        )
+    if not plan.team_ids:
+        raise SeasonPlanningError("season plan has no team evidence")
+
     player_ids: set[str] = set()
+    squad_team_ids: set[str] = set()
     for spec in plan.specs:
         if spec.key.endpoint != "squads":
             continue
+        squad_team_ids.add(str(spec.key.target_id))
         stored = _load_stored_payload(raw_store, spec)
+        if (
+            stored.raw is not None
+            and stored.raw.http_status in spec.not_supported_http_statuses
+        ):
+            continue
         if not stored.has_valid_json:
             raise SeasonPlanningError(
                 f"planned squad {spec.key.target_id} has no valid raw payload"
@@ -1258,6 +1351,12 @@ def squad_player_ids(
                 raise SeasonPlanningError(
                     f"squad {spec.key.target_id} entry {index} has invalid player id"
                 ) from exc
+    missing_squads = set(plan.team_ids) - squad_team_ids
+    if missing_squads:
+        raise SeasonPlanningError(
+            "season plan omitted squad endpoints for team ids: "
+            + ",".join(sorted(missing_squads, key=int))
+        )
     return tuple(sorted(player_ids, key=int))
 
 

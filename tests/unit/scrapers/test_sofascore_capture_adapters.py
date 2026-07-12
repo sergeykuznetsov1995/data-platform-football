@@ -111,7 +111,19 @@ def test_trino_get_uses_bound_six_field_key_and_rehydrates_exact_state():
     assert fetch is True
     assert params == record.key.as_tuple()
     assert sql.count(" = ?") == 6
-    assert "LIMIT 1" in sql
+    assert "LIMIT 1" not in sql
+
+
+def test_trino_get_fails_closed_when_ops_manifest_key_is_duplicated():
+    manager = FakeManager()
+    store = TrinoManifestStore(manager, ensure_table=False)
+    record = _record()
+    row = manifest_to_row(record)
+    encoded = tuple(row[column] for column in MANIFEST_COLUMNS)
+    manager.rows = [encoded, encoded]
+
+    with pytest.raises(RuntimeError, match="natural key is duplicated"):
+        store.get(record.key)
 
 
 def test_trino_list_rejects_unknown_persisted_status():
@@ -168,6 +180,7 @@ def _budget(tmp_path):
         "browser_sessions": 1,
         "navigations": 1,
         "request_count": 1,
+        "source_request_count": 1,
         "completed_matches": 25,
         "completed_players": 50,
         "matches_per_second": 1.0,
@@ -213,12 +226,16 @@ def _budget(tmp_path):
                 "schema_version": 1,
                 "source": "sofascore",
                 "meter": "proxy_filter_provider_path_v2",
+                "budget_derivation": "max_measured_total_and_per_run_endpoint_max_v1",
                 "verified": True,
                 "samples": samples,
             }
         )
     )
-    return SharedBudgetLedger(tmp_path / "ledger.json", load_verified_policy(artifact))
+    return SharedBudgetLedger(
+        tmp_path / "ledger.json",
+        load_verified_policy(artifact, allow_legacy_v1=True),
+    )
 
 
 def _paid_spec():

@@ -70,6 +70,21 @@ class _ScalarCursor:
             self.value = self.connection.values.popleft()
         elif "CASE WHEN COUNT(*) = 0" in sql:
             self.value = self.connection.coverage
+        elif (
+            "SELECT COUNT(DISTINCT player_id)" in sql
+            or (
+                "SELECT COUNT(*) FROM "
+                "iceberg.silver.sofascore_player_match_aggregate WHERE league ="
+                in sql
+                and "minutes_played > 0" in sql
+            )
+            or (
+                "SELECT COUNT(*) FROM "
+                "iceberg.silver.sofascore_player_match_aggregate ss WHERE ss.league ="
+                in sql
+            )
+        ):
+            self.value = 1
         else:
             self.value = 0
 
@@ -367,6 +382,38 @@ def test_profile_rating_and_attach_all_gate_at_95_percent():
     }
 
 
+def test_player_coverage_zero_denominators_fail_closed():
+    report = validate_player_coverage(
+        squad_player_ids=(),
+        lineup_player_ids=(),
+        statistics_player_ids=(),
+        incident_player_ids=(),
+        profile_player_ids=(),
+        rated_player_event_ids=(),
+        appeared_player_event_ids=(),
+        silver_player_event_ids=(),
+        gold_player_event_ids=(),
+    )
+
+    assert report.metrics == {
+        "player_profile.coverage": 0.0,
+        "player_profile.expected": 0,
+        "player_profile.covered": 0,
+        "player_rating.coverage": 0.0,
+        "player_rating.expected": 0,
+        "player_rating.covered": 0,
+        "silver_gold_attach.coverage": 0.0,
+        "silver_gold_attach.expected": 0,
+        "silver_gold_attach.covered": 0,
+        "player_universe.size": 0,
+    }
+    assert {finding.code for finding in report.findings} == {
+        "player_profile_coverage",
+        "player_rating_coverage",
+        "silver_gold_attach_coverage",
+    }
+
+
 def test_saved_json_fixtures_preserve_arrays_and_exact_cardinality():
     lineups = _fixture("sofascore_event_14023925_lineups.json")
     assert validate_raw_payload("lineups", lineups, normalized_row_count=4).passed
@@ -450,16 +497,47 @@ def test_partition_sql_contract_contains_all_hard_gates_and_is_injection_safe():
     assert "skeleton_schedule_rows" in names
     assert "schedule_season_mismatches" in names
     assert "event_season_mismatches" in names
+    assert {
+        "player_ratings_season_mismatches",
+        "event_player_stats_season_mismatches",
+        "match_stats_season_mismatches",
+        "event_shotmap_season_mismatches",
+    } <= names
     assert "required_endpoint_completeness" in names
     assert "player_profile_coverage" in names
     assert "player_rating_coverage" in names
     assert "silver_gold_attach_rate" in names
+    assert "player_profile_expected_universe_nonempty" in names
+    assert "player_rating_expected_appearances_nonempty" in names
+    assert "silver_gold_expected_candidates_nonempty" in names
     assert any(name.startswith("duplicate_natural_key[") for name in names)
     assert any(name.startswith("null_natural_key[") for name in names)
+    ops_manifest = next(
+        query
+        for query in queries
+        if query.name
+        == "duplicate_natural_key[ops.sofascore_capture_manifest]"
+    )
+    assert ops_manifest.expected_value == 0
+    assert "FROM iceberg.ops.sofascore_capture_manifest" in ops_manifest.sql
+    assert "freshness_key" in ops_manifest.sql
+    assert "HAVING COUNT(*) > 1" in ops_manifest.sql
     profile_query = next(
         query for query in queries if query.name == "player_profile_coverage"
     )
     assert "bronze.sofascore_player_universe" in profile_query.sql
+    schedule_season_query = next(
+        query for query in queries if query.name == "schedule_season_mismatches"
+    )
+    event_season_query = next(
+        query for query in queries if query.name == "event_season_mismatches"
+    )
+    assert "TRY_CAST(season_id AS double)" in schedule_season_query.sql
+    assert "CAST(76986 AS double)" in schedule_season_query.sql
+    assert "CAST(season_id AS varchar)" not in schedule_season_query.sql
+    assert "TRY_CAST(source_season_id AS double)" in event_season_query.sql
+    assert "CAST(source_season_id AS varchar)" not in event_season_query.sql
+    assert "TRY_CAST(season_id AS double)" in event_season_query.sql
     assert {
         query.name: query.expected_value
         for query in queries
@@ -474,8 +552,89 @@ def test_partition_sql_contract_contains_all_hard_gates_and_is_injection_safe():
         "player_rating_coverage": 0.95,
         "silver_gold_attach_rate": 0.95,
     }
+    assert {
+        query.name: (query.expected_value, query.comparator)
+        for query in queries
+        if query.name.endswith("_nonempty")
+    } == {
+        "player_profile_expected_universe_nonempty": (1, "gte"),
+        "player_rating_expected_appearances_nonempty": (1, "gte"),
+        "silver_gold_expected_candidates_nonempty": (1, "gte"),
+    }
+    assert all(
+        "THEN 0e0" in query.sql
+        for query in queries
+        if query.name
+        in {
+            "player_profile_coverage",
+            "player_rating_coverage",
+            "silver_gold_attach_rate",
+        }
+    )
     with pytest.raises(ValueError):
         build_partition_dq_queries("ENG'; DROP TABLE x; --", "2526", 17, 76986)
+
+
+def test_schedule_skeleton_sql_supports_new_and_legacy_columns():
+    query = next(
+        query
+        for query in build_partition_dq_queries(
+            "ENG-Premier League", "2526", 17, 76986
+        )
+        if query.name == "skeleton_schedule_rows"
+    )
+
+    assert (
+        "COALESCE(NULLIF(TRIM(CAST(home_team_name AS varchar)), ''), "
+        "NULLIF(TRIM(CAST(home_team AS varchar)), '')) IS NULL"
+    ) in query.sql
+    assert (
+        "COALESCE(NULLIF(TRIM(CAST(away_team_name AS varchar)), ''), "
+        "NULLIF(TRIM(CAST(away_team AS varchar)), '')) IS NULL"
+    ) in query.sql
+    assert "(start_timestamp IS NULL AND date IS NULL)" in query.sql
+    assert "start_timestamp IS NULL OR date IS NULL" not in query.sql
+    assert (
+        "NULLIF(TRIM(CAST(home_team AS varchar)), '')) = COALESCE("
+    ) in query.sql
+
+
+@pytest.mark.parametrize(
+    ("check_name", "table_name"),
+    (
+        ("player_ratings_season_mismatches", "sofascore_player_ratings"),
+        ("event_player_stats_season_mismatches", "sofascore_event_player_stats"),
+        ("match_stats_season_mismatches", "sofascore_match_stats"),
+        ("event_shotmap_season_mismatches", "sofascore_event_shotmap"),
+    ),
+)
+def test_match_child_season_sql_uses_schedule_spine_without_hiding_mismatch(
+    check_name, table_name
+):
+    query = next(
+        query
+        for query in build_partition_dq_queries(
+            "ENG-Premier League", "2526", 17, 76986
+        )
+        if query.name == check_name
+    )
+
+    assert f"FROM iceberg.bronze.{table_name} c" in query.sql
+    assert "LEFT JOIN iceberg.bronze.sofascore_schedule s" in query.sql
+    assert (
+        "CAST(s.game_id AS varchar) = CAST(c.match_id AS varchar)"
+    ) in query.sql
+    assert "c.league = 'ENG-Premier League' AND c.season = '2526'" in query.sql
+    assert "s.game_id IS NULL" in query.sql
+    assert "CAST(s.season AS varchar) IS DISTINCT FROM CAST(c.season AS varchar)" in query.sql
+    assert "s.league IS DISTINCT FROM c.league" in query.sql
+    # Joining on the partition fields would hide the very mismatch this query
+    # exists to detect.
+    join_clause = query.sql.split(" WHERE ", 1)[0]
+    assert "s.league = c.league" not in join_clause
+    assert "s.season = c.season" not in join_clause
+    assert "c.source_season_id" not in query.sql
+    assert "c.season_id" not in query.sql
 
 
 def test_partition_sql_references_only_materialized_contract_tables():
@@ -566,8 +725,8 @@ def test_active_registry_partitions_are_capture_allowed_and_sorted(monkeypatch):
         (17, "2526"): active_seasons[0],
         (16, "2026"): catalog.tournaments[1].seasons[0],
     }
-    catalog.resolve_source_season = (
-        lambda tournament_id, token: season_by_key.get((tournament_id, token))
+    catalog.resolve_source_season = lambda tournament_id, token: season_by_key.get(
+        (tournament_id, token)
     )
     monkeypatch.setattr(SofaScoreCatalog, "load", lambda path=None: catalog)
     monkeypatch.setattr(
@@ -616,6 +775,22 @@ def test_committed_partition_dq_enforces_rating_threshold():
         )
 
 
+def test_committed_partition_dq_rejects_empty_expected_universe():
+    connection = _ScalarConnection(
+        overrides={
+            "SELECT COUNT(DISTINCT player_id)": 0,
+            "SELECT COUNT(*) FROM iceberg.silver.sofascore_player_match_aggregate WHERE": 0,
+            "SELECT COUNT(*) FROM iceberg.silver.sofascore_player_match_aggregate ss WHERE": 0,
+        }
+    )
+
+    with pytest.raises(SofaScoreDQViolation, match="expected_.*_nonempty"):
+        run_committed_partition_dq(
+            ActiveRegistryPartition("ENG-Premier League", "2526", 17, 76986),
+            connection,
+        )
+
+
 def test_committed_partition_dq_fails_closed_on_query_error():
     connection = _ScalarConnection(fail_on="sofascore_schedule")
     with pytest.raises(SofaScoreDQViolation, match="query failed"):
@@ -623,7 +798,11 @@ def test_committed_partition_dq_fails_closed_on_query_error():
             ActiveRegistryPartition("ENG-Premier League", "2526", 17, 76986),
             connection,
         )
-    assert connection.closed_cursors == 1
+    queries = build_partition_dq_queries("ENG-Premier League", "2526", 17, 76986)
+    failing_index = next(
+        index for index, query in enumerate(queries) if "sofascore_schedule" in query.sql
+    )
+    assert connection.closed_cursors == failing_index + 1
 
 
 def test_active_registry_dq_runs_every_partition_without_closing_injected_conn(

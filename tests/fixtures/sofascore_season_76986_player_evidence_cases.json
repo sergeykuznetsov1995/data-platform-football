@@ -1,0 +1,27 @@
+{
+  "empty_participants": {
+    "teams": []
+  },
+  "partial_participants": {
+    "teams": [
+      {"id": 42, "name": "Arsenal", "gender": "M"}
+    ]
+  },
+  "full_participants": {
+    "teams": [
+      {"id": 17, "name": "Manchester City", "gender": "M"},
+      {"id": 33, "name": "Chelsea", "gender": "M"},
+      {"id": 42, "name": "Arsenal", "gender": "M"},
+      {"id": 44, "name": "Liverpool", "gender": "M"}
+    ]
+  },
+  "nonempty_squad": {
+    "players": [
+      {"player": {"id": 1001, "name": "Player One"}},
+      {"player": {"id": 1002, "name": "Player Two"}}
+    ]
+  },
+  "empty_squad": {
+    "players": []
+  }
+}

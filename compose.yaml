@@ -40,7 +40,12 @@ x-airflow-common: &airflow-common
     SOFASCORE_RAW_STORE_URI: s3://${ICEBERG_WAREHOUSE}/raw/sofascore
     SOFASCORE_MANIFEST_BACKEND: trino
     SOFASCORE_PROXY_BUDGET_ARTIFACT: /opt/airflow/configs/sofascore/proxy_budget_canary.json
-    SOFASCORE_PROXY_BUDGET_LEDGER: /tmp/sofascore-proxy-budget-ledger.json
+    SOFASCORE_PROXY_BUDGET_LEDGER: /opt/airflow/logs/sofascore/proxy-budget-ledger.json
+    SOFASCORE_WORKLOAD_PLAN_DIR: /opt/airflow/logs/sofascore/workload-plans
+    SOFASCORE_PROXY_CONTROL_URL: ${SOFASCORE_PROXY_CONTROL_URL:-http://proxy_filter:8899}
+    SOFASCORE_PROXY_CONTROL_TOKEN: ${SOFASCORE_PROXY_CONTROL_TOKEN:-}
+    SOFASCORE_PROXY_LEASE_TTL_SECONDS: ${SOFASCORE_PROXY_LEASE_TTL_SECONDS:-3600}
+    PROXY_FILTER_SOFASCORE_CANARY_HARD_CAP_BYTES: ${PROXY_FILTER_SOFASCORE_CANARY_HARD_CAP_BYTES:-0}
     FBREF_RAW_S3_ENDPOINT: seaweedfs:8333
     FBREF_RAW_S3_SCHEME: http
     # Versioned SofaScore discovery registry. Discovery runs outside Airflow;
@@ -902,10 +907,9 @@ services:
   # proxy_filter - ad-tech filtering proxy between FlareSolverr and the
   # residential pool (#652). Cuts billable residential traffic by refusing
   # ad-tech CONNECT hosts (no MITM — preserves Chrome's TLS fingerprint).
-  # Holds the residential creds and rotates the upstream per FlareSolverr session
-  # (idle-refresh: a fresh exit is drawn only when no tunnel is open, so a page and
-  # its CF challenge share one IP). Scrapers route here when the global
-  # PROXY_FILTER_URL=http://proxy_filter:8899 toggle is set.
+  # Port 8899 keeps the compatible lease control API and legacy FlareSolverr
+  # route. Port 8900 accepts proxy traffic only with a short-lived lease token;
+  # each lease pins one upstream and is charged before every provider read.
   # ===========================================================================
   proxy_filter:
     build:
@@ -919,20 +923,57 @@ services:
       - ALL
     environment:
       PYTHONPATH: /opt/airflow
+      PROXY_FILTER_CONTROL_TOKEN: ${SOFASCORE_PROXY_CONTROL_TOKEN:-}
     command:
       - python
       - /opt/airflow/scripts/proxy_filter/filter_proxy.py
       - --listen
       - 0.0.0.0:8899
+      - --lease-listen
+      - 0.0.0.0:8900
+      - --lease-proxy-url
+      - http://proxy_filter:8900
       - --blocklist
       - /opt/airflow/configs/proxy_filter/blocklist.txt
       - --out
-      - /tmp/filter_bytes.json
+      - /opt/airflow/logs/proxy_filter/bytes.json
+      - --daily-budget-mb
+      - ${PROXY_FILTER_DAILY_BUDGET_MB:-100}
+      - --max-lease-mb
+      - ${PROXY_FILTER_MAX_LEASE_MB:-24}
+      - --max-lease-ttl-seconds
+      - ${PROXY_FILTER_MAX_LEASE_TTL_SECONDS:-3600}
+      - --dagrun-budget-bytes
+      - ${PROXY_FILTER_DAGRUN_BUDGET_BYTES:-8000000}
+      - --transfermarkt-dagrun-budget-bytes
+      - ${PROXY_FILTER_TRANSFERMARKT_DAGRUN_BUDGET_BYTES:-15728640}
+      - --url-budget-bytes
+      - ${PROXY_FILTER_URL_BUDGET_BYTES:-2000000}
+      - --max-active-leases
+      - ${PROXY_FILTER_MAX_ACTIVE_LEASES:-4}
+      - --sofascore-budget-artifact
+      - /opt/airflow/configs/sofascore/proxy_budget_canary.json
+      - --sofascore-canary-hard-cap-bytes
+      - ${PROXY_FILTER_SOFASCORE_CANARY_HARD_CAP_BYTES:-0}
+      - --ledger
+      - /opt/airflow/logs/proxy_filter/paid_requests.jsonl
     volumes:
+      # Paid-canary runtime fingerprint inputs.  The proxy control plane
+      # independently recomputes the same digest as the Airflow producer.
+      - ./dags:/opt/airflow/dags:ro
       - ./scripts:/opt/airflow/scripts
       - ./scrapers:/opt/airflow/scrapers
       - ./proxys.txt:/opt/airflow/proxys.txt:ro
+      - ./configs/medallion:/opt/airflow/configs/medallion:ro
       - ./configs/proxy_filter:/opt/airflow/configs/proxy_filter:ro
+      - ./configs/sofascore:/opt/airflow/configs/sofascore:ro
+      - ./logs:/opt/airflow/logs
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://localhost:8899/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
     deploy:
       resources:
         limits:

@@ -135,6 +135,52 @@ def test_source_negative_evidence_overrides_a_stale_approved_review():
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    ("field", "value", "reason"),
+    [
+        ("age_group", "youth", "source age_group is youth"),
+        ("team_level", "reserve", "source team_level is reserve"),
+    ],
+)
+def test_source_youth_or_reserve_cannot_be_hidden_by_empty_exclusions(
+    field, value, reason
+):
+    """The normalized source field is a gate, not merely an explanation."""
+
+    source = CASES["positive"][0]
+    classification = classify_tournament_source(
+        source,
+        name=source["name"],
+        sport_slug="football",
+        endpoint="fixture",
+    )
+    classification[field] = value
+    classification["status"] = "review_required"
+    classification["exclusion_reasons"] = []
+    record = _record(source, classification)
+    record["canonical_id"] = "TEST-NEGATIVE"
+    record["review"] = {
+        "status": "approved",
+        "confirmed": {
+            "sport": "football",
+            "gender": "male",
+            "age_group": "adult",
+            "team_level": "first_team",
+        },
+        "reviewed_by": "stale",
+        "reviewed_at": "2026-07-11",
+        "evidence": [{"type": "official_rules", "reference": "fixture"}],
+        "notes": None,
+    }
+
+    eligibility = activation_eligibility(record)
+    assert eligibility.allowed is False
+    assert reason in eligibility.reasons
+    with pytest.raises(ActivationError, match=reason):
+        set_activation(record, enabled=True)
+
+
+@pytest.mark.unit
 def test_season_v2_split_calendar_named_dates_and_explicit_euro_alias():
     payload = {"seasons": [
         {
@@ -192,6 +238,124 @@ def test_merge_preserves_all_operator_fields_and_is_idempotent():
     assert "2025/2026" in refreshed["seasons"][0]["aliases"]
     assert twice == once
     assert counts["updated_tournaments"] == 0
+
+
+@pytest.mark.unit
+def test_merge_does_not_erase_prior_source_gender_when_refresh_omits_it():
+    existing = json.loads(
+        Path("configs/sofascore/tournaments.json").read_text(encoding="utf-8")
+    )
+    prior = next(
+        item for item in existing["tournaments"]
+        if item["unique_tournament_id"] == 17
+    )
+    discovered = deepcopy(prior)
+    discovered["classification"] = classify_tournament_source(
+        {},
+        name=discovered["name"],
+        sport_slug="football",
+        endpoint="/unique-tournament/17",
+    )
+
+    merged, _ = merge_registry(existing, [discovered])
+    refreshed = next(
+        item for item in merged["tournaments"]
+        if item["unique_tournament_id"] == 17
+    )
+
+    assert refreshed["classification"]["gender"] == "male"
+    assert refreshed["classification"]["status"] == "review_required"
+    assert SofaScoreCatalog.from_mapping(merged).tournament(17).capture_allowed
+
+
+@pytest.mark.unit
+def test_merge_explicit_negative_source_evidence_overrides_prior_male():
+    existing = json.loads(
+        Path("configs/sofascore/tournaments.json").read_text(encoding="utf-8")
+    )
+    prior = next(
+        item for item in existing["tournaments"]
+        if item["unique_tournament_id"] == 17
+    )
+    discovered = deepcopy(prior)
+    discovered["name"] = "Women's Premier League"
+    discovered["classification"] = classify_tournament_source(
+        {"gender": "F"},
+        name=discovered["name"],
+        sport_slug="football",
+        endpoint="/unique-tournament/17",
+    )
+
+    merged, _ = merge_registry(existing, [discovered])
+    refreshed = next(
+        item for item in merged["tournaments"]
+        if item["unique_tournament_id"] == 17
+    )
+
+    assert refreshed["classification"]["gender"] == "female"
+    assert refreshed["classification"]["status"] == "excluded"
+    assert not SofaScoreCatalog.from_mapping(merged).tournament(17).capture_allowed
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("old_name", "source_fields", "expected_field", "expected_value"),
+    [
+        ("Premier League U21", {"gender": "male", "isYouth": True},
+         "age_group", "youth"),
+        ("Premier League Reserves", {"gender": "male", "isReserve": True},
+         "team_level", "reserve"),
+        ("Premier League Futsal", {"gender": "male"}, "sport", "football"),
+    ],
+)
+def test_merge_rename_keeps_source_exclusions_and_operator_fields(
+    old_name, source_fields, expected_field, expected_value
+):
+    existing = json.loads(
+        Path("configs/sofascore/tournaments.json").read_text(encoding="utf-8")
+    )
+    prior = next(
+        item for item in existing["tournaments"]
+        if item["unique_tournament_id"] == 17
+    )
+    prior["name"] = old_name
+    prior["classification"] = classify_tournament_source(
+        source_fields,
+        name=old_name,
+        sport_slug="football",
+        endpoint="/unique-tournament/17/old",
+    )
+    prior["operator_ticket"] = "OPS-NEGATIVE-EVIDENCE"
+    prior_review = deepcopy(prior["review"])
+    prior_enabled = prior["enabled"]
+
+    discovered = deepcopy(prior)
+    discovered["name"] = "Renamed Premier League"
+    discovered["canonical_id"] = None
+    discovered["enabled"] = False
+    discovered["review"] = pending_review()
+    discovered.pop("operator_ticket")
+    discovered["classification"] = classify_tournament_source(
+        {"gender": "male"},
+        name=discovered["name"],
+        sport_slug="football",
+        endpoint="/unique-tournament/17/new",
+    )
+
+    merged, _ = merge_registry(existing, [discovered])
+    refreshed = next(
+        item for item in merged["tournaments"]
+        if item["unique_tournament_id"] == 17
+    )
+
+    assert refreshed["canonical_id"] == "ENG-Premier League"
+    assert refreshed["enabled"] is prior_enabled
+    assert refreshed["review"] == prior_review
+    assert refreshed["operator_ticket"] == "OPS-NEGATIVE-EVIDENCE"
+    assert refreshed["classification"][expected_field] == expected_value
+    assert refreshed["classification"]["exclusion_reasons"]
+    assert refreshed["classification"]["status"] == "excluded"
+    assert not SofaScoreCatalog.from_mapping(merged).tournament(17).capture_allowed
 
 
 @pytest.mark.unit

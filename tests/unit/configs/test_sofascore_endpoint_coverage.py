@@ -66,10 +66,9 @@ def test_exact_endpoint_outcomes_match_current_capture_wiring(coverage):
         "rounds",
         "cup_trees",
         "participants",
-        "squads",
         "referee_profile",
     }
-    unsupported = {"stages"}
+    unsupported = {"stages", "squads"}
     excluded = {
         "player_event_statistics",
         "event_graph",
@@ -96,8 +95,8 @@ def test_exact_endpoint_outcomes_match_current_capture_wiring(coverage):
     }
     assert coverage["coverage_summary"] == {
         "normalized": 14,
-        "raw-only": 5,
-        "unsupported": 1,
+        "raw-only": 4,
+        "unsupported": 2,
         "intentionally-excluded": 8,
     }
     assert Counter(
@@ -175,12 +174,17 @@ def test_raw_only_and_excluded_payloads_have_reason(coverage):
         assert spec["reason"]
         assert spec["destination"] == []
         assert spec["preserved_arrays"] == []
-    for endpoint in ("rounds", "cup_trees", "participants", "squads"):
+    for endpoint in ("rounds", "cup_trees", "participants"):
         spec = coverage["endpoints"][endpoint]
         assert spec["status"] == "raw-only"
         assert spec["reason"]
         assert spec["destination"] == []
         assert spec["preserved_arrays"]
+    squads = coverage["endpoints"]["squads"]
+    assert squads["status"] == "unsupported"
+    assert squads["reason"]
+    assert squads["destination"] == []
+    assert squads["preserved_arrays"] == []
     referee = coverage["endpoints"]["referee_profile"]
     assert referee["status"] == "raw-only"
     assert referee["reason"]
@@ -260,6 +264,19 @@ def test_claimed_physical_tables_are_the_exact_current_sofascore_set(coverage):
     assert {name for name in claimed if name.startswith("gold.")} == {
         "gold.fct_sofascore_team_match_post_shot_xg"
     }
+
+
+def test_every_normalized_table_has_a_stage_appropriate_duplicate_gate(coverage):
+    committed = set(coverage["committed_state_dq"]["duplicate_tables"])
+    later = set(
+        coverage["committed_state_dq"]["later_stage_duplicate_tables"]
+    )
+    assert not committed & later
+    assert committed | later == set(coverage["tables"])
+    assert later == {"silver.sofascore_player_ratings"}
+    e4_dq = (ROOT / "dags/utils/e4_dq.py").read_text(encoding="utf-8")
+    assert "iceberg.silver.sofascore_player_ratings" in e4_dq
+    assert "CHECK.no_duplicates" in e4_dq
 
 
 def test_normalized_match_endpoints_are_exactly_pipeline_event_paths(coverage):

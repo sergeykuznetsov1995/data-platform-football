@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -33,6 +34,7 @@ from scrapers.sofascore.pipeline import (
     finalize_materialized_results,
     ingest_prefetched_records,
     materialize_player_datasets,
+    promote_repaired_results,
     replay_event_specs,
     replay_player_specs,
 )
@@ -174,7 +176,7 @@ def test_runtime_reads_verified_budget_configuration_without_blocking_replay(
     )
 
     assert runtime.engine.budget is None
-    assert "not verified" in runtime.budget_error
+    assert "explicit workload_class" in runtime.budget_error
 
 
 def test_runtime_wires_a_reviewed_policy_and_shared_ledger(
@@ -192,7 +194,10 @@ def test_runtime_wires_a_reviewed_policy_and_shared_ledger(
     )
 
     with (
-        patch("scrapers.sofascore.pipeline.load_verified_policy", return_value=policy),
+        patch(
+            "scrapers.sofascore.pipeline.load_verified_policy",
+            return_value=policy,
+        ) as load_policy,
         patch("scrapers.sofascore.pipeline.SharedBudgetLedger", return_value=ledger),
     ):
         runtime = build_capture_runtime(
@@ -200,10 +205,14 @@ def test_runtime_wires_a_reviewed_policy_and_shared_ledger(
             task_id="match-capture",
             raw_store_uri=f"file://{tmp_path / 'raw'}",
             manifest_backend="json",
+            workload_class="match_batch_25",
         )
 
     assert runtime.engine.budget is ledger
     assert runtime.budget_error is None
+    load_policy.assert_called_once_with(
+        "/canary.json", workload_class="match_batch_25"
+    )
 
 
 class MetadataScraper:
@@ -239,6 +248,7 @@ def test_fixture_endpoint_specs_validate_and_parse_every_branch(endpoint, datase
     )
     assert spec.schema_validator(payload) is True
     assert spec.empty_predicate(payload) is False
+    assert spec.not_supported_http_statuses == ()
     assert set(spec.parsers) == datasets
     parsed = {name: parser(payload) for name, parser in spec.parsers.items()}
     assert all(isinstance(rows, list) and rows for rows in parsed.values())
@@ -320,6 +330,32 @@ def test_lineups_missing_players_array_persists_raw_schema_error(tmp_path):
     assert raw.content_hash == hashlib.sha256(body).hexdigest()
 
 
+def test_lineups_raw_to_normalized_cardinality_loss_is_schema_error(tmp_path):
+    runtime, transport = _runtime(tmp_path)
+    spec = _spec("lineups")
+    payload = json.loads(FIXTURES["lineups"].read_text(encoding="utf-8"))
+    payload["home"]["players"].append("schema-drift-not-a-player-object")
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+
+    result = runtime.engine.ingest_prefetched(
+        spec,
+        HttpPayload(
+            200,
+            body,
+            headers={"content-type": "application/json"},
+            provider_bytes=0,
+        ),
+        authorization=None,
+    )
+
+    assert transport.calls == 0
+    assert result.manifest.status == ManifestStatus.SCHEMA_ERROR
+    assert result.manifest.error_type == "SchemaValidationError"
+    assert "normalized_cardinality_drift" in result.manifest.error_message
+    stored, _ = runtime.raw_store.load_bytes(spec.raw_target)
+    assert stored == body
+
+
 @pytest.mark.parametrize(
     ("endpoint", "dataset", "target_type"),
     [
@@ -360,6 +396,9 @@ def test_player_fixture_specs_use_exact_urls_and_existing_flatteners(
     )
     assert spec.schema_validator(payload) is True
     assert spec.empty_predicate(payload) is False
+    assert spec.not_supported_http_statuses == (
+        () if endpoint == "player_profile" else (404,)
+    )
     assert set(spec.parsers) == {dataset}
     rows = spec.parsers[dataset](payload)
     assert len(rows) == 1
@@ -391,6 +430,44 @@ def test_player_specs_fail_closed_on_wrong_identity_and_schema_drift():
             freshness_key="final",
             paid_proxy=False,
         )
+
+
+@pytest.mark.parametrize(
+    ("spec", "expected_status", "resume_expected"),
+    [
+        (_spec("event"), ManifestStatus.RETRYABLE_FAILURE, True),
+        (_spec("lineups"), ManifestStatus.RETRYABLE_FAILURE, True),
+        (_player_spec("player_profile"), ManifestStatus.RETRYABLE_FAILURE, True),
+        (
+            _player_spec("player_season_statistics"),
+            ManifestStatus.NOT_SUPPORTED,
+            False,
+        ),
+    ],
+)
+def test_required_404_stays_resumable_but_optional_player_stats_is_terminal(
+    tmp_path,
+    spec,
+    expected_status,
+    resume_expected,
+):
+    runtime, transport = _runtime(tmp_path)
+
+    result = runtime.engine.ingest_prefetched(
+        spec,
+        HttpPayload(
+            404,
+            b'{"error":"not found"}',
+            headers={"content-type": "application/json"},
+            provider_bytes=0,
+        ),
+        authorization=None,
+    )
+
+    assert transport.calls == 0
+    assert result.manifest.status == expected_status
+    pending = endpoint_resume_plan(runtime.manifest_store, [spec])
+    assert (spec.key.target_id in pending) is resume_expected
 
 
 @pytest.mark.parametrize(
@@ -495,6 +572,68 @@ def test_player_fixtures_are_raw_first_materializable_and_offline_replayable(
     assert runtime.engine.metrics.snapshot()["request_count"] == requests_before
 
 
+def test_repair_promotes_terminal_lineage_to_final_after_materialization(tmp_path):
+    runtime, transport = _runtime(tmp_path)
+    final_spec = _spec("event")
+    repair_spec = _spec("event", freshness_key="repair-run-1")
+    original = FIXTURES["event"].read_bytes()
+    repaired_payload = json.loads(original)
+    repaired_payload["event"]["repairMarker"] = "new-source-snapshot"
+    repaired_body = json.dumps(
+        repaired_payload, separators=(",", ":")
+    ).encode("utf-8")
+
+    old = runtime.engine.ingest_prefetched(
+        final_spec,
+        HttpPayload(200, original, provider_bytes=0),
+        authorization=None,
+    )
+    finalize_materialized_results(runtime, [old])
+    old_final = runtime.manifest_store.get(final_spec.key)
+    repair = runtime.engine.ingest_prefetched(
+        repair_spec,
+        HttpPayload(200, repaired_body, provider_bytes=0),
+        authorization=None,
+    )
+
+    # A failed/not-yet-run Bronze MERGE leaves the old canonical row untouched
+    # and promotion itself refuses the deferred repair state.
+    with pytest.raises(ValueError, match="committed terminal repair manifest"):
+        promote_repaired_results(runtime, [repair])
+    assert runtime.manifest_store.get(final_spec.key) == old_final
+
+    finalize_materialized_results(runtime, [repair])
+    promoted = promote_repaired_results(runtime, [repair])
+
+    assert transport.calls == 0
+    assert len(promoted) == 1
+    canonical = runtime.manifest_store.get(final_spec.key)
+    repaired = runtime.manifest_store.get(repair_spec.key)
+    assert canonical.status == ManifestStatus.SUCCESS
+    assert canonical.key.freshness_key == "final"
+    assert canonical.raw_content_hash == repaired.raw_content_hash
+    assert canonical.raw_content_hash != old_final.raw_content_hash
+    assert canonical.attempts == repaired.attempts
+    assert canonical.run_id == repaired.run_id
+    canonical_body, canonical_raw = runtime.raw_store.load_bytes(
+        final_spec.raw_target
+    )
+    assert canonical_body == repaired_body
+    assert canonical_raw.content_hash == canonical.raw_content_hash
+
+    # Retrying the same post-MERGE promotion is an exact lineage no-op.
+    assert promote_repaired_results(runtime, [repair]) == promoted
+    assert runtime.manifest_store.get(final_spec.key) == canonical
+
+    weekly = promote_repaired_results(
+        runtime,
+        [repair],
+        canonical_freshness_key="week-2026-W28",
+    )
+    assert weekly[0].key.freshness_key == "week-2026-W28"
+    assert weekly[0].raw_content_hash == repaired.raw_content_hash
+
+
 def test_player_materialization_rejects_target_mismatch(tmp_path):
     runtime, _ = _runtime(tmp_path)
     spec = _player_spec("player_profile")
@@ -595,6 +734,7 @@ def test_player_runner_offline_replay_writes_both_tables_without_network(
             limit=None,
             output_path=str(output),
             capture_runtime=runtime,
+            workload_plan=None,
             offline_replay=True,
         )
 
@@ -614,7 +754,6 @@ def test_player_runner_offline_replay_writes_both_tables_without_network(
     assert result["traffic"]["request_count"] == 0
     assert result["profile_players"] == 1
     assert result["season_stats_players"] == 1
-    scraper.read_player_capture.assert_not_called()
 
 
 def test_player_runner_manifest_noop_is_exact_zero_traffic_before_browser(
@@ -655,13 +794,19 @@ def test_player_runner_manifest_noop_is_exact_zero_traffic_before_browser(
             limit=None,
             output_path=str(output),
             capture_runtime=runtime,
+            workload_plan=None,
             offline_replay=False,
         )
 
     assert rc == 0
     assert transport.calls == 0
-    scraper.read_player_capture.assert_not_called()
-    scraper.save_to_iceberg.assert_not_called()
+    # The complete universe is an idempotent local MERGE performed before any
+    # player batch; no profile/stat write or paid lease is opened on this no-op.
+    assert scraper.save_to_iceberg.call_count == 1
+    assert (
+        scraper.save_to_iceberg.call_args.kwargs["table_name"]
+        == "sofascore_player_universe"
+    )
     result = json.loads(output.read_text(encoding="utf-8"))
     assert result["traffic"] == {
         "paid_proxy_bytes": 0,
@@ -700,6 +845,7 @@ def test_match_runner_long_manifest_noop_is_exact_zero_before_browser(
             limit=None,
             output_path=str(output),
             capture_runtime=runtime,
+            workload_plan=None,
             offline_replay=False,
         )
 
@@ -716,6 +862,108 @@ def test_match_runner_long_manifest_noop_is_exact_zero_before_browser(
         "cache_hit_rate": 1.0,
         "endpoint_completeness": 1.0,
     }
+
+
+def test_compatibility_status_failure_keeps_long_manifest_replayable_without_network(
+    tmp_path,
+    monkeypatch,
+):
+    from dags.scripts import run_sofascore_scraper as runner
+
+    runtime, transport = _runtime(tmp_path)
+    specs = {(EVENT_ID, endpoint): _spec(endpoint) for endpoint in EVENT_PATHS}
+    ingest_prefetched_records(
+        runtime,
+        specs=specs,
+        records={endpoint: _record(endpoint) for endpoint in EVENT_PATHS},
+    )
+    monkeypatch.setattr(
+        runner,
+        "_resolve_match_ids_from_bronze",
+        lambda *args, **kwargs: [EVENT_ID],
+    )
+    monkeypatch.setattr(runner, "_source_context", lambda *args: (17, 76986))
+    monkeypatch.setattr(
+        runner,
+        "_tournament_canonical_url",
+        lambda *args: "https://www.sofascore.com/tournament/premier-league/17",
+    )
+    from dags.utils import sofascore_dq
+
+    passed = SimpleNamespace(require=lambda: None)
+    for validator in (
+        "validate_table_rows",
+        "validate_lineup_semantics",
+        "validate_event_participants",
+        "validate_season_alignment",
+    ):
+        monkeypatch.setattr(sofascore_dq, validator, lambda *args, **kwargs: passed)
+
+    def make_scraper(*, fail_status):
+        scraper = MagicMock()
+        scraper.__enter__.return_value = scraper
+        scraper.__exit__.return_value = False
+        scraper._add_metadata.side_effect = MetadataScraper._add_metadata
+
+        def save(**kwargs):
+            if (
+                fail_status
+                and kwargs["table_name"] == "sofascore_match_capture_status"
+            ):
+                raise RuntimeError("compatibility status write failed")
+            return "iceberg.bronze." + kwargs["table_name"]
+
+        scraper.save_to_iceberg.side_effect = save
+        return scraper
+
+    first_scraper = make_scraper(fail_status=True)
+    first_output = tmp_path / "status-failed.json"
+    with patch("scrapers.sofascore.SofaScoreScraper", return_value=first_scraper):
+        first_rc = runner._run_match_capture(
+            leagues=["ENG-Premier League"],
+            season=2025,
+            limit=None,
+            output_path=str(first_output),
+            capture_runtime=runtime,
+            workload_plan=None,
+            offline_replay=True,
+        )
+
+    assert first_rc == 1
+    assert "compatibility status write failed" in json.loads(
+        first_output.read_text(encoding="utf-8")
+    )["errors"][0]
+    assert all(
+        not runtime.manifest_store.get(spec.key).is_terminal
+        for spec in specs.values()
+    )
+    assert transport.calls == 0
+    requests_before_retry = runtime.engine.metrics.snapshot()["request_count"]
+
+    retry_scraper = make_scraper(fail_status=False)
+    retry_output = tmp_path / "status-repaired.json"
+    with patch("scrapers.sofascore.SofaScoreScraper", return_value=retry_scraper):
+        retry_rc = runner._run_match_capture(
+            leagues=["ENG-Premier League"],
+            season=2025,
+            limit=None,
+            output_path=str(retry_output),
+            capture_runtime=runtime,
+            workload_plan=None,
+            offline_replay=True,
+        )
+
+    assert retry_rc == 0
+    assert all(
+        runtime.manifest_store.get(spec.key).is_terminal
+        for spec in specs.values()
+    )
+    assert transport.calls == 0
+    repaired = json.loads(retry_output.read_text(encoding="utf-8"))
+    assert repaired["capture_status_rows"] == 1
+    assert repaired["traffic"]["request_count"] == requests_before_retry
+    assert repaired["traffic"]["paid_proxy_bytes"] == 0
+    assert repaired["traffic"]["browser_sessions"] == 0
 
 
 def test_endpoint_resume_keeps_only_missing_or_nonterminal_endpoints(tmp_path):
@@ -871,6 +1119,7 @@ def test_empty_bronze_schedule_fails_before_any_browser_or_source_fallback(
             limit=None,
             output_path=str(output),
             capture_runtime=MagicMock(),
+            workload_plan=None,
             offline_replay=offline_replay,
         )
 

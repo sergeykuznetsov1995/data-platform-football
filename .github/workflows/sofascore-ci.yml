@@ -6,6 +6,7 @@ on:
       - ".github/workflows/sofascore-*.yml"
       - "configs/sofascore/**"
       - "dags/dag_ingest_sofascore.py"
+      - "dags/dag_canary_sofascore_proxy.py"
       - "dags/dag_transform_e3.py"
       - "dags/scripts/*sofascore*"
       - "dags/sql/**/*sofascore*"
@@ -52,15 +53,19 @@ jobs:
         run: |
           ruff check \
             scrapers/sofascore \
+            dags/dag_ingest_sofascore.py \
+            dags/dag_canary_sofascore_proxy.py \
             dags/scripts/run_sofascore_scraper.py \
             dags/scripts/prepare_sofascore_workload.py \
             dags/scripts/run_sofascore_discovery.py \
             dags/utils/sofascore_dq.py \
             scripts/migrate_sofascore_production.py \
+            scripts/backfill_sofascore.py \
             scripts/proxy_filter \
             scripts/research/bench_sofascore_paid_canary.py
           python -m compileall -q \
             scrapers/sofascore dags/scripts dags/utils scripts/proxy_filter \
+            dags/dag_ingest_sofascore.py dags/dag_canary_sofascore_proxy.py \
             scripts/migrate_sofascore_production.py \
             scripts/research/bench_sofascore_paid_canary.py
 
@@ -72,6 +77,7 @@ jobs:
             tests/unit/configs/test_sofascore_endpoint_coverage.py \
             tests/unit/configs/test_sofascore_proxy_canary_cohort.py \
             tests/unit/dags/test_dag_ingest_sofascore.py \
+            tests/unit/dags/test_dag_canary_sofascore_proxy.py \
             tests/unit/dags/test_dag_transform_e3_sofascore_dq.py \
             tests/unit/dq/test_sofascore_dq.py \
             tests/unit/scrapers/test_run_sofascore_discovery.py \
@@ -84,14 +90,16 @@ jobs:
             tests/unit/scrapers/test_sofascore_lease_client.py \
             tests/unit/scrapers/test_sofascore_live_capture.py \
             tests/unit/scrapers/test_sofascore_pipeline.py \
+            tests/unit/scrapers/test_sofascore_runtime_fingerprint.py \
             tests/unit/scrapers/test_sofascore_workload_plan.py \
             tests/unit/scrapers/test_sofascore_workload_runtime.py \
             tests/unit/scrapers/test_sofascore_raw_store.py \
             tests/unit/scrapers/test_sofascore_registry_v2.py \
+            tests/unit/scrapers/test_scrapers_lazy_import.py \
             tests/unit/scrapers/test_sofascore_scraper.py \
             tests/unit/scrapers/test_sofascore_season_pipeline.py \
-            tests/unit/scrapers/test_sofascore_traffic.py \
             tests/unit/scripts/test_backfill_sofascore.py \
+            tests/unit/scripts/test_bench_sofascore_paid_canary.py \
             tests/unit/scripts/test_bench_sofascore_offline_replay.py \
             tests/unit/scripts/test_filter_proxy.py \
             tests/unit/scripts/test_migrate_sofascore_production.py \
