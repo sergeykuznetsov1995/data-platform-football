@@ -33,10 +33,11 @@ Topology
 
 Trigger model
 -------------
-``schedule=None`` — the DAG is triggered after Bronze ingestion finishes
-(see ``dag_master_pipeline`` integration). xref tables are intentionally
-INDEPENDENT of FBref Silver: re-running this DAG does not require the
-existing fbref Silver to be fresh.
+``schedule=None`` — the DAG is triggered synchronously by
+``dag_transform_fbref_silver`` after its transforms and DQ gates pass.
+``xref_player`` deliberately consumes the freshly materialised
+``silver.fbref_player_identity`` universe; the Silver trigger waits for this
+entire DAG, including ``validate_xref``, before it can succeed.
 
 Notes for maintainers
 ---------------------
@@ -592,9 +593,9 @@ with DAG(
     default_args=SILVER_ARGS,
     description=(
         'Materialise Silver xref_* tables (team/match/referee/manager/player) '
-        'from Bronze. E1 medallion redesign — runs before fbref Silver.'
+        'from Bronze and FBref Silver identity. Runs after fbref Silver DQ.'
     ),
-    schedule=None,           # Triggered (see master pipeline integration)
+    schedule=None,           # Triggered synchronously by FBref Silver
     start_date=datetime(2026, 5, 1),
     catchup=False,
     tags=['silver', 'xref', 'medallion-e1', 'transform'],

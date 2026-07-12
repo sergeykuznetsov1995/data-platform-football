@@ -77,7 +77,13 @@ WITH derived AS (
         league,
         -- season → slug ('2425'); the match_id hash above keeps year-start (ids stable).
         -- #913 Phase 2
-        CASE WHEN league = 'INT-World Cup'
+        CASE WHEN REGEXP_LIKE(COALESCE(source_season_id, ''), '^\d{4}$')
+             THEN source_season_id
+             WHEN REGEXP_LIKE(COALESCE(source_season_id, ''), '^\d{4}-\d{4}$')
+             THEN SUBSTR(source_season_id, 3, 2) || SUBSTR(source_season_id, 8, 2)
+             WHEN NULLIF(TRIM(source_season_id), '') IS NOT NULL
+             THEN TRIM(source_season_id)
+             WHEN league = 'INT-World Cup'
              THEN LPAD(CAST(season AS varchar), 4, '0')
              ELSE LPAD(CAST(MOD(season, 100) AS varchar), 2, '0')
                   || LPAD(CAST(MOD(season + 1, 100) AS varchar), 2, '0')

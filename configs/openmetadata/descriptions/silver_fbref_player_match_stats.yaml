@@ -5,11 +5,11 @@ table:
   fullyQualifiedName: trino_iceberg.iceberg.silver.fbref_player_match_stats
   description: |
     Индивидуальная статистика игрока за матч — один row на
-    (match_id, player, team). Источник: bronze.fbref_match_player_stats
-    (без JOIN'ов). Дедупликация: ROW_NUMBER PARTITION BY
-    (match_id, COALESCE(player_id, player), team) ORDER BY _ingested_at DESC.
-    player_id извлекается из HTML-ссылок (с апр-2026); для старых Bronze-строк
-    fallback на имя игрока. Числовые поля уже BIGINT/DOUBLE в Bronze —
+    (match_id, resolved player_id, team). Источник:
+    bronze.fbref_match_player_stats; пустые source ID сначала разрешаются через
+    silver.fbref_player_identity. Дедупликация: ROW_NUMBER PARTITION BY
+    (match_id, resolved_player_id, team) ORDER BY _ingested_at DESC.
+    Числовые поля уже BIGINT/DOUBLE в Bronze —
     минимальный TRY_CAST. match_id — сырой FBref-идентификатор
     (FK → silver.fbref_match_enriched).
   tags:
@@ -20,7 +20,13 @@ columns:
   - name: match_id
     description: ID матча (FK → silver.fbref_match_enriched.match_id).
   - name: player_id
-    description: Сырой FBref player_id (из HTML-ссылки; NULL для старых Bronze-строк).
+    description: Непустой resolved ID; native, recovered native или residual noid_*.
+  - name: player_id_resolution
+    description: source_native | recovered_unique_native | synthetic_residual.
+  - name: player_id_is_synthetic
+    description: true только для residual noid_* без однозначного native ID.
+  - name: player_id_evidence_datasets
+    description: FBref datasets, использованные общим identity resolver.
   - name: player
     description: Имя игрока.
     tags:
@@ -78,7 +84,7 @@ columns:
   - name: league
     description: Лига (partition key).
   - name: season
-    description: Сезон short-form '2526' (partition key).
+    description: Source-native key; split-year как '2526', single/opaque без выдуманного года.
   - name: _silver_created_at
     description: Технический timestamp создания строки в Silver-слое (добавляется CTAS-раннером).
 relationships:

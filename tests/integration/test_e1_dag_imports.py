@@ -2,7 +2,8 @@
 Smoke integration tests for E1 (xref refactor) DAG wiring.
 
 Goal: verify ``dag_transform_xref`` parses, exposes the expected task ids,
-and is wired into ``dag_master_pipeline`` after the ingestion TaskGroup.
+and is reached synchronously from validated FBref Silver.  The master pipeline
+must not launch a second racing xref run.
 
 We re-use the project-level DAG folder layout — no Airflow DB is needed,
 DagBag parses the .py files directly. The fixture is local so the test
@@ -106,27 +107,32 @@ class TestE1DagImports:
             f"max_active_tasks={dag.max_active_tasks}"
         )
 
-    def test_master_pipeline_triggers_xref(self, dag_bag):
-        """``dag_master_pipeline`` must contain a trigger for the xref DAG."""
-        dag_id = "dag_master_pipeline"
-        assert dag_id in dag_bag.dags
-        dag = dag_bag.dags[dag_id]
-        task_ids = {t.task_id for t in dag.tasks}
-        assert "trigger_silver_xref" in task_ids, (
-            f"Master pipeline missing 'trigger_silver_xref' task. "
-            f"Tasks: {sorted(task_ids)}"
-        )
-
-        # Verify it triggers the right child DAG
-        trigger = dag.get_task("trigger_silver_xref")
+    def test_fbref_silver_triggers_xref_synchronously(self, dag_bag):
+        """Validated FBref identity is the sole production xref handoff."""
+        dag = dag_bag.dags["dag_transform_fbref_silver"]
+        trigger = dag.get_task("trigger_xref_transform")
         assert getattr(trigger, "trigger_dag_id", None) == "dag_transform_xref"
+        assert trigger.wait_for_completion is True
+        assert trigger.allowed_states == ["success"]
+        assert trigger.failed_states == ["failed"]
+
+        upstream = {task.task_id for task in trigger.upstream_list}
+        assert "validate_silver_quality" in upstream
+
+    def test_master_pipeline_does_not_duplicate_xref(self, dag_bag):
+        master = dag_bag.dags["dag_master_pipeline"]
+        targets = {
+            getattr(task, "trigger_dag_id", None)
+            for task in master.tasks
+        }
+        assert "dag_transform_xref" not in targets
+        assert "dag_ingest_fbref" not in targets
 
     def test_xref_dag_no_import_errors(self, dag_bag):
         """No DAG-import errors at all (not just for xref-related modules).
 
-        T4 added ``dag_transform_xref`` plus a ``trigger_silver_xref`` task in
-        ``dag_master_pipeline``. A lazy ``import scrapers.*`` at module level
-        in either file would silently increase Airflow scheduler RAM by
+        A lazy ``import scrapers.*`` at module level in the xref, Silver, or
+        master file would silently increase Airflow scheduler RAM by
         ~1.5GB; we surface those as import errors here.
         """
         # Only xref-touching modules are our responsibility for E1; other
@@ -134,10 +140,10 @@ class TestE1DagImports:
         # to fix. Filter to just the modules T4 touched.
         relevant = {
             k: v for k, v in dag_bag.import_errors.items()
-            if "xref" in k or "master_pipeline" in k
+            if "xref" in k or "fbref_silver" in k or "master_pipeline" in k
         }
         assert relevant == {}, (
-            f"E1 DAG import errors: "
+            "E1 DAG import errors: "
             + "; ".join(f"{k}: {v}" for k, v in relevant.items())
         )
 
@@ -196,22 +202,14 @@ class TestE1DagImports:
             f"upstream={sorted(upstream_ids)}"
         )
 
-    def test_master_pipeline_xref_trigger_after_ingestion(self, dag_bag):
-        """``trigger_silver_xref`` must run after Bronze ingestion finishes.
-
-        Topology: any ingestion trigger task must be upstream of the xref
-        trigger so master_pipeline cannot fire xref against stale Bronze.
-        """
+    def test_master_fbref_handoff_finishes_before_e3(self, dag_bag):
+        """The sensed FBref->Silver->xref chain finishes before E3."""
         master = dag_bag.dags["dag_master_pipeline"]
-        trigger = master.get_task("trigger_silver_xref")
-        upstream_ids = {t.task_id for t in trigger.upstream_list}
-        # We don't pin the exact upstream task id (it changes as ingestion
-        # tasks shift) — we just demand SOME upstream exists so xref
-        # cannot be the literal first thing in the pipeline.
-        assert upstream_ids, (
-            "trigger_silver_xref must have at least one upstream task "
-            "(should depend on Bronze ingestion completion)"
-        )
+        fbref = master.get_task("wait_for_scheduled_fbref")
+        e3 = master.get_task("trigger_e3_transforms")
+        assert fbref in e3.upstream_list
+        assert fbref.external_dag_id == "dag_ingest_fbref"
+        assert fbref.execution_delta.total_seconds() == 8 * 60 * 60
 
 
 # ---------------------------------------------------------------------------
@@ -327,18 +325,18 @@ class TestE2DimManagerWiring:
     """
 
     PROJ_ROOT = Path(__file__).resolve().parents[2]
-    SILVER_SQL = PROJ_ROOT / "dags" / "sql" / "silver" / "xref_manager.sql"
+    SILVER_SQL = PROJ_ROOT / "dags" / "sql" / "silver" / "xref_manager.sql.j2"
     GOLD_SQL = PROJ_ROOT / "dags" / "sql" / "gold" / "dim_manager.sql"
     GOLD_DAG = PROJ_ROOT / "dags" / "dag_transform_fbref_gold.py"
     XREF_DQ = PROJ_ROOT / "dags" / "utils" / "xref_dq.py"
     GOLD_TASKS = PROJ_ROOT / "dags" / "utils" / "gold_tasks.py"
 
     def test_xref_manager_sql_reads_bronze_table(self):
-        """xref_manager.sql must read bronze.fbref_match_managers — the new
+        """xref_manager.sql.j2 must read bronze.fbref_match_managers — the new
         Phase 1.5 Bronze landing table."""
         text = self.SILVER_SQL.read_text(encoding="utf-8")
         assert "iceberg.bronze.fbref_match_managers" in text, (
-            "xref_manager.sql must source from bronze.fbref_match_managers "
+            "xref_manager.sql.j2 must source from bronze.fbref_match_managers "
             "(populated by parsers/finders.py::parse_match_managers)"
         )
 

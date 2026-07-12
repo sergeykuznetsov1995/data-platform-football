@@ -9,9 +9,9 @@ per-source rollup line so the residential-proxy spend (``pool.proxys.io``,
     PROXY_TRAFFIC_DAILY вчера прокси съели 1.234 GB (1263.6 MB):
         fbref 0.900 GB, transfermarkt 0.300 GB, capology 0.034 GB
 
-The per-run rows are written passively by each ingest run (FBref via
-``utils.fbref_callbacks.report_proxy_traffic``; Transfermarkt / Capology /
-SofaScore via their run-script ``_write_results`` → ``record_traffic_run``).
+The per-run rows are written passively by each ingest run (FBref after durable
+control validation in ``utils.fbref_pipeline_tasks``; Transfermarkt / Capology
+/ SofaScore via their run-script ``_write_results`` → ``record_traffic_run``).
 This DAG only aggregates — it never scrapes and touches no bronze.
 
 No Telegram / Superset at this stage (#789 acceptance) — log only.

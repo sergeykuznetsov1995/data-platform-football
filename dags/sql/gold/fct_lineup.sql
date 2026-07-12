@@ -241,6 +241,8 @@ fbref_resolved AS (
         1                                              AS source_priority,
         fl.player_id                                   AS _raw_player_id_for_dedup
     FROM iceberg.silver.fbref_match_lineups fl
+    INNER JOIN iceberg.gold.dim_match match_scope
+        ON match_scope.match_id = fl.match_id
     LEFT JOIN iceberg.silver.xref_match xm
         ON xm.source    = 'fbref'
        AND xm.source_id = fl.match_id

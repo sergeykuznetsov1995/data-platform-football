@@ -26,6 +26,9 @@ Architecture:
         |
         v
     validate_silver_quality  — data quality checks (null rate, ref integrity, ranges)
+        |
+        v
+    trigger_xref  — blocking, fail-closed identity handoff
 
 Silver Tables Created:
     iceberg.silver.fbref_player_season_profile  — player stats + shooting + playingtime + misc
@@ -53,6 +56,11 @@ from utils.default_args import SILVER_ARGS
 # Each entry: (task_id, sql_file relative to /opt/airflow/, target table name)
 SILVER_TRANSFORMS = [
     (
+        'player_identity',
+        'dags/sql/silver/fbref_player_identity.sql',
+        'fbref_player_identity',
+    ),
+    (
         'player_season_profile',
         'dags/sql/silver/fbref_player_season_profile.sql',
         'fbref_player_season_profile',
@@ -71,6 +79,11 @@ SILVER_TRANSFORMS = [
         'player_match_stats',
         'dags/sql/silver/fbref_player_match_stats.sql',
         'fbref_player_match_stats',
+    ),
+    (
+        'keeper_match_stats',
+        'dags/sql/silver/fbref_keeper_match_stats.sql',
+        'fbref_keeper_match_stats',
     ),
     (
         'match_events',
@@ -111,10 +124,12 @@ SILVER_TRANSFORMS = [
 
 # Expected minimum row counts per Silver table (for validation)
 SILVER_MIN_ROWS = {
+    'fbref_player_identity': 100,
     'fbref_player_season_profile': 100,
     'fbref_keeper_profile': 10,
     'fbref_match_enriched': 50,
     'fbref_player_match_stats': 100,
+    'fbref_keeper_match_stats': 20,
     'fbref_match_events': 50,
     'fbref_match_lineups': 100,
     'fbref_shot_events': 50,
@@ -155,6 +170,13 @@ def _run_transform(sql_file: str, table_name: str, **context) -> Dict[str, Any]:
     Imports are inside the function to avoid import errors at DAG parse time
     (scrapers/ may not be importable on the scheduler).
     """
+    import os
+    import re
+    import tempfile
+    from pathlib import Path
+
+    import yaml
+
     from utils.silver_tasks import check_bronze_table_exists, run_silver_transform
 
     bronze_table = OPTIONAL_BRONZE_TABLES.get(table_name)
@@ -173,12 +195,145 @@ def _run_transform(sql_file: str, table_name: str, **context) -> Dict[str, Any]:
                 'error': f'Bronze table {bronze_table} not found',
             }
 
-    result = run_silver_transform(
-        sql_file=sql_file,
-        table_name=table_name,
-        schema='silver',
+    rendered_path = None
+    if table_name == 'fbref_match_enriched':
+        sql_path = Path('/opt/airflow') / sql_file
+        config_dir = Path(os.environ.get(
+            'MEDALLION_CONFIG_DIR', '/opt/airflow/configs/medallion',
+        ))
+        config_path = config_dir / 'match_result_overrides.yaml'
+        if not sql_path.exists():
+            raise FileNotFoundError(f'FBref match SQL not found: {sql_path}')
+        if not config_path.exists():
+            raise FileNotFoundError(
+                f'Official-result override registry not found: {config_path}'
+            )
+
+        payload = yaml.safe_load(config_path.read_text(encoding='utf-8')) or {}
+        if payload.get('version') != 1:
+            raise ValueError('match_result_overrides.yaml version must be 1')
+        overrides = payload.get('overrides')
+        if not isinstance(overrides, list) or not overrides:
+            raise ValueError('match_result_overrides.yaml overrides must be non-empty')
+
+        required = {
+            'match_id', 'league', 'season', 'official_home_score',
+            'official_away_score', 'authority', 'reference', 'reason',
+        }
+        seen = set()
+        rows = []
+
+        def quote(value: object) -> str:
+            return "'" + str(value).replace("'", "''") + "'"
+
+        for index, item in enumerate(overrides):
+            if not isinstance(item, dict):
+                raise ValueError(f'override #{index} must be a mapping')
+            missing = sorted(k for k in required if item.get(k) in (None, ''))
+            if missing:
+                raise ValueError(
+                    f'override #{index} is missing required evidence: {missing}'
+                )
+            match_id = str(item['match_id'])
+            if not re.fullmatch(r'[a-f0-9]{8}', match_id):
+                raise ValueError(f'override #{index} has invalid match_id {match_id!r}')
+            if match_id in seen:
+                raise ValueError(f'duplicate official-result override: {match_id}')
+            seen.add(match_id)
+            home = item['official_home_score']
+            away = item['official_away_score']
+            if (not isinstance(home, int) or isinstance(home, bool) or home < 0
+                    or not isinstance(away, int) or isinstance(away, bool) or away < 0):
+                raise ValueError(
+                    f'override {match_id} official scores must be non-negative integers'
+                )
+            rows.append(
+                '(' + ', '.join([
+                    quote(match_id), quote(item['league']), quote(item['season']),
+                    str(home), str(away), quote(item['authority']),
+                    quote(item['reference']), quote(item['reason']),
+                ]) + ')'
+            )
+
+        source_sql = sql_path.read_text(encoding='utf-8')
+        typed_empty_row = (
+            "(CAST(NULL AS varchar), CAST(NULL AS varchar), CAST(NULL AS varchar),\n"
+            "         CAST(NULL AS integer), CAST(NULL AS integer), CAST(NULL AS varchar),\n"
+            "         CAST(NULL AS varchar), CAST(NULL AS varchar))"
+        )
+        if source_sql.count(typed_empty_row) != 1:
+            raise ValueError(
+                'fbref_match_enriched override render anchor missing or duplicated'
+            )
+        rendered_sql = source_sql.replace(typed_empty_row, ',\n        '.join(rows))
+        with tempfile.NamedTemporaryFile(
+            mode='w', suffix='_fbref_match_enriched.sql', delete=False,
+            encoding='utf-8',
+        ) as tmp:
+            tmp.write(rendered_sql)
+            rendered_path = tmp.name
+        sql_file = rendered_path
+
+    try:
+        return run_silver_transform(
+            sql_file=sql_file,
+            table_name=table_name,
+            schema='silver',
+        )
+    finally:
+        if rendered_path:
+            Path(rendered_path).unlink(missing_ok=True)
+
+
+def _ensure_fbref_source_identity_columns() -> Dict[str, Any]:
+    """Add nullable source-native identity columns before Silver reads them."""
+
+    from scrapers.base.trino_manager import TrinoTableManager
+    from scrapers.fbref.typed_bronze import (
+        MATCH_AVAILABILITY_TABLE,
+        MATCH_DATASET_TABLES,
+        SEASON_DATASET_TABLES,
     )
-    return result
+
+    manager = TrinoTableManager()
+    if not manager.table_exists("bronze", MATCH_AVAILABILITY_TABLE):
+        manager.create_iceberg_table(
+            "bronze",
+            MATCH_AVAILABILITY_TABLE,
+            {
+                "match_id": "VARCHAR",
+                "dataset": "VARCHAR",
+                "availability": "VARCHAR",
+                "reason": "VARCHAR",
+                "league": "VARCHAR",
+                "season": "BIGINT",
+                "source_competition_id": "VARCHAR",
+                "source_season_id": "VARCHAR",
+                "_source": "VARCHAR",
+                "_entity_type": "VARCHAR",
+                "_ingested_at": "TIMESTAMP(6)",
+                "_batch_id": "VARCHAR",
+            },
+            partition_columns=["league", "season"],
+        )
+    tables = sorted({
+        "fbref_schedule",
+        *MATCH_DATASET_TABLES.values(),
+        *SEASON_DATASET_TABLES.values(),
+    })
+    added = []
+    for table in tables:
+        if not manager.table_exists("bronze", table):
+            continue
+        existing = {
+            str(column).casefold()
+            for column in manager.get_table_columns("bronze", table)
+        }
+        for column in ("source_competition_id", "source_season_id"):
+            if column not in existing:
+                manager.add_column("bronze", table, column, "VARCHAR")
+                added.append(f"{table}.{column}")
+    return {"tables_checked": len(tables), "columns_added": added}
 
 
 def _validate_silver(**context) -> Dict[str, Any]:
@@ -247,16 +402,28 @@ def _validate_silver_quality(**context) -> Dict[str, Any]:
     checks = [
         # Primary-key nulls — ERROR (joins/dedup logic break otherwise)
         CHECK.no_nulls('silver.fbref_match_enriched', cols=['match_id', 'date']),
+        CHECK.no_nulls(
+            'silver.fbref_player_identity',
+            cols=['player_id', 'player_name', 'team_name', 'league', 'season'],
+        ),
         # #463: squad — компонент PK профилей (per-(player, squad) grain).
         CHECK.no_nulls('silver.fbref_player_season_profile', cols=['player_id', 'squad', 'league', 'season']),
         CHECK.no_nulls('silver.fbref_keeper_profile', cols=['player_id', 'squad', 'league', 'season']),
         CHECK.no_nulls('silver.fbref_player_match_stats', cols=['match_id']),
+        CHECK.no_nulls(
+            'silver.fbref_keeper_match_stats',
+            cols=['match_id', 'player_id', 'team_side', 'league', 'season'],
+        ),
         CHECK.no_nulls('silver.fbref_match_events', cols=['match_id']),
         CHECK.no_nulls('silver.fbref_match_lineups', cols=['match_id', 'player_id']),
         CHECK.no_nulls('silver.fbref_team_season_profile', cols=['team', 'league', 'season']),
 
         # PK uniqueness — ERROR (duplicates would explode downstream joins / facts)
         CHECK.no_duplicates('silver.fbref_match_enriched', pk=['match_id']),
+        CHECK.no_duplicates(
+            'silver.fbref_player_identity',
+            pk=['player_id', 'team_name', 'league', 'season'],
+        ),
         # #463: профили per-(player, squad, league, season) — зимний трансфер
         # внутри лиги даёт 2 строки на игрока-сезон (по одной на клуб).
         CHECK.no_duplicates('silver.fbref_player_season_profile', pk=['player_id', 'squad', 'league', 'season']),
@@ -275,6 +442,10 @@ def _validate_silver_quality(**context) -> Dict[str, Any]:
             'silver.fbref_player_match_stats',
             pk=['match_id', 'player_id', 'team'],
             where='player_id IS NOT NULL',
+        ),
+        CHECK.no_duplicates(
+            'silver.fbref_keeper_match_stats',
+            pk=['match_id', 'player_id', 'team_side'],
         ),
         CHECK.no_duplicates(
             'silver.fbref_match_events',
@@ -297,6 +468,71 @@ def _validate_silver_quality(**context) -> Dict[str, Any]:
             name='score_roundtrip[silver.fbref_match_enriched]',
         ),
 
+        # #901: compare source score to the correctly credited on-field event
+        # score only where that comparison is meaningful.  Awarded matches and
+        # shootouts have separate contracts below.
+        CHECK.row_count(
+            'silver.fbref_match_enriched',
+            min_rows=0, max_rows=0,
+            where=(
+                "source_home_score IS NOT NULL AND source_away_score IS NOT NULL "
+                "AND NOT is_awarded AND home_shootout_score IS NULL "
+                "AND COALESCE(event_row_count, 0) > 0 AND ("
+                "source_home_score IS DISTINCT FROM on_field_home_score OR "
+                "source_away_score IS DISTINCT FROM on_field_away_score)"
+            ),
+            severity='ERROR',
+            name='score_event_mismatch[silver.fbref_match_enriched]',
+        ),
+        CHECK.row_count(
+            'silver.fbref_match_enriched',
+            min_rows=0, max_rows=0,
+            where=(
+                "source_home_score IS NOT NULL AND source_away_score IS NOT NULL "
+                "AND COALESCE(event_row_count, 0) = 0 "
+                "AND COALESCE(event_availability, 'unknown') "
+                "NOT IN ('restricted', 'not_applicable')"
+            ),
+            severity='ERROR',
+            name='scored_match_without_events[silver.fbref_match_enriched]',
+        ),
+        CHECK.row_count(
+            'silver.fbref_match_enriched',
+            min_rows=0, max_rows=0,
+            where=(
+                "source_home_score IS NOT NULL AND source_away_score IS NOT NULL "
+                "AND COALESCE(event_row_count, 0) = 0 "
+                "AND event_availability IN ('restricted', 'not_applicable')"
+            ),
+            severity='WARNING',
+            name='restricted_match_events[silver.fbref_match_enriched]',
+        ),
+        # #902: awarded results are evidence-backed finite decisions.  A new
+        # awarded match blocks promotion until its authority/reference is
+        # registered; it never silently inherits FBref's inconsistent score.
+        CHECK.row_count(
+            'silver.fbref_match_enriched',
+            min_rows=0, max_rows=0,
+            where=(
+                "is_awarded AND (official_home_score IS NULL OR "
+                "official_away_score IS NULL OR official_score_authority IS NULL OR "
+                "official_score_reference IS NULL OR "
+                "official_score_provenance <> 'medallion_override')"
+            ),
+            severity='ERROR',
+            name='awarded_result_override_missing[silver.fbref_match_enriched]',
+        ),
+        CHECK.row_count(
+            'silver.fbref_match_enriched',
+            min_rows=0, max_rows=0,
+            where=(
+                "REGEXP_LIKE(source_score_raw, '\\(\\d+\\).*\\(\\d+\\)') "
+                "AND (home_shootout_score IS NULL OR away_shootout_score IS NULL)"
+            ),
+            severity='ERROR',
+            name='shootout_score_parse[silver.fbref_match_enriched]',
+        ),
+
         # Referential integrity — ERROR (#258, restored from WARNING #240). The
         # orphan match_ids were duplicate alternate-hex scrapes, not lost matches:
         # bronze.fbref_schedule used to emit the SAME fixture as two rows with
@@ -308,6 +544,7 @@ def _validate_silver_quality(**context) -> Dict[str, Any]:
         # (2026-06-03, APL 2025/26). Restored to ERROR so dirty data again blocks
         # the DAG.
         CHECK.ref_integrity('silver.fbref_player_match_stats', 'silver.fbref_match_enriched', 'match_id', severity='ERROR'),
+        CHECK.ref_integrity('silver.fbref_keeper_match_stats', 'silver.fbref_match_enriched', 'match_id', severity='ERROR'),
         CHECK.ref_integrity('silver.fbref_match_events', 'silver.fbref_match_enriched', 'match_id', severity='ERROR'),
         CHECK.ref_integrity('silver.fbref_match_lineups', 'silver.fbref_match_enriched', 'match_id', severity='ERROR'),
 
@@ -319,6 +556,8 @@ def _validate_silver_quality(**context) -> Dict[str, Any]:
         CHECK.freshness('silver.fbref_keeper_profile', ts_col='_bronze_ingested_at',
                         max_age_hours=FRESH_HOURS, severity='WARNING'),
         CHECK.freshness('silver.fbref_player_match_stats', ts_col='_bronze_ingested_at',
+                        max_age_hours=FRESH_HOURS, severity='WARNING'),
+        CHECK.freshness('silver.fbref_keeper_match_stats', ts_col='_bronze_ingested_at',
                         max_age_hours=FRESH_HOURS, severity='WARNING'),
         CHECK.freshness('silver.fbref_match_events', ts_col='_bronze_ingested_at',
                         max_age_hours=FRESH_HOURS, severity='WARNING'),
@@ -332,6 +571,8 @@ def _validate_silver_quality(**context) -> Dict[str, Any]:
         CHECK.value_range('silver.fbref_player_season_profile', 'minutes',
                           min_val=0, max_val=5000, severity='WARNING'),
         CHECK.value_range('silver.fbref_keeper_profile', 'save_pct',
+                          min_val=0, max_val=100, severity='WARNING'),
+        CHECK.value_range('silver.fbref_keeper_match_stats', 'save_pct',
                           min_val=0, max_val=100, severity='WARNING'),
         CHECK.value_range('silver.fbref_team_season_profile', 'possession',
                           min_val=0, max_val=100, severity='WARNING'),
@@ -438,7 +679,7 @@ with DAG(
     # issue #530: cap run wall-clock so a stuck/abandoned run auto-fails instead
     # of lingering forever (orphaned up_for_retry TIs accrued under runs that
     # never reached a terminal state). ~10 sequential CTAS @ 30m timeout each.
-    dagrun_timeout=timedelta(hours=2),
+    dagrun_timeout=timedelta(hours=8),
     doc_md="""
     ## FBref Silver Transformation
 
@@ -447,7 +688,9 @@ with DAG(
     ### Trigger
 
     This DAG has **no schedule** — it is triggered after `dag_ingest_fbref`
-    completes via `TriggerDagRunOperator` or manual trigger.
+    completes via `TriggerDagRunOperator` or manual trigger.  A successful run
+    includes a successful, fully validated `dag_transform_xref` run; the xref
+    player resolver reads `silver.fbref_player_identity` produced here.
 
     ### Silver Tables
 
@@ -487,12 +730,18 @@ with DAG(
     """,
 ) as dag:
 
+    ensure_source_identity_columns = PythonOperator(
+        task_id='ensure_source_identity_columns',
+        python_callable=_ensure_fbref_source_identity_columns,
+    )
+
     # =========================================================================
     # TaskGroup: Silver Transforms (SEQUENTIAL — max_active_tasks=1 to prevent OOM)
     # =========================================================================
     with TaskGroup(group_id='silver_transforms') as transforms_group:
+        transform_tasks = {}
         for task_id, sql_file, table_name in SILVER_TRANSFORMS:
-            PythonOperator(
+            transform_tasks[table_name] = PythonOperator(
                 task_id=task_id,
                 python_callable=_run_transform,
                 op_kwargs={
@@ -501,13 +750,23 @@ with DAG(
                 },
             )
 
+        # Profiles resolve missing source ids through the shared identity
+        # universe.  max_active_tasks=1 limits concurrency but does not define
+        # execution order, so the dependency must be explicit.
+        transform_tasks['fbref_player_identity'] >> [
+            transform_tasks['fbref_player_season_profile'],
+            transform_tasks['fbref_keeper_profile'],
+            transform_tasks['fbref_player_match_stats'],
+            transform_tasks['fbref_match_lineups'],
+            transform_tasks['fbref_keeper_match_stats'],
+        ]
+
     # =========================================================================
     # Validation: check row counts in Silver tables
     # =========================================================================
     validate_silver = PythonOperator(
         task_id='validate_silver',
         python_callable=_validate_silver,
-        trigger_rule='all_done',  # Run even if some transforms fail
     )
 
     # =========================================================================
@@ -516,20 +775,33 @@ with DAG(
     validate_quality = PythonOperator(
         task_id='validate_silver_quality',
         python_callable=_validate_silver_quality,
-        trigger_rule='all_done',  # Run even if validation fails
     )
 
     # =========================================================================
-    # Trigger Gold layer after Silver DQ passes
+    # Trigger the identity layer after Silver DQ passes.  This handoff must be
+    # synchronous: xref_player reads silver.fbref_player_identity, and the
+    # master pipeline must not promote stale xref tables to Gold.
     # =========================================================================
-    trigger_gold = TriggerDagRunOperator(
-        task_id='trigger_gold',
-        trigger_dag_id='dag_transform_fbref_gold',
-        wait_for_completion=False,
-        reset_dag_run=True,
+    trigger_xref = TriggerDagRunOperator(
+        task_id='trigger_xref_transform',
+        trigger_dag_id='dag_transform_xref',
+        trigger_run_id='fbref_xref__{{ dag.dag_id }}__{{ run_id }}',
+        logical_date='{{ ti.start_date }}',
+        wait_for_completion=True,
+        poke_interval=30,
+        allowed_states=['success'],
+        failed_states=['failed'],
+        reset_dag_run=False,
+        # SILVER_ARGS is tuned for individual CTAS tasks (30 minutes, two
+        # retries).  A blocking child-DAG handoff needs its own wall clock and
+        # must never retry by resetting an already-running xref DAG.
+        execution_timeout=timedelta(hours=4),
+        retries=0,
+        trigger_rule='all_success',
     )
 
     # =========================================================================
     # Dependencies
     # =========================================================================
-    transforms_group >> validate_silver >> validate_quality >> trigger_gold
+    ensure_source_identity_columns >> transforms_group
+    transforms_group >> validate_silver >> validate_quality >> trigger_xref

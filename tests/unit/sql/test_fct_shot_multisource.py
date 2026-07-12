@@ -47,7 +47,14 @@ def _strip_comments(sql: str) -> str:
 
 
 def _translate_trino_to_duckdb(sql: str) -> str:
-    return sql.replace("iceberg.bronze.", "bronze_").replace("iceberg.silver.", "silver_")
+    sql = sql.replace(
+        "iceberg.gold.dim_match",
+        "(SELECT match_id FROM silver_fbref_match_enriched "
+        "UNION SELECT match_id FROM silver_sofascore_shots)",
+    )
+    return sql.replace("iceberg.bronze.", "bronze_").replace(
+        "iceberg.silver.", "silver_"
+    )
 
 
 # ---------------------------------------------------------------------------
