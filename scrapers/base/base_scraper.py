@@ -13,7 +13,7 @@ import uuid
 from abc import ABC, abstractmethod
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Union
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import yaml
@@ -275,6 +275,7 @@ class BaseScraper(ABC):
         replace_partitions: Optional[List[str]] = None,
         min_replace_ratio: Optional[float] = None,
         replace_guard_key: Optional[str] = None,
+        natural_keys: Optional[List[str]] = None,
     ) -> str:
         """
         Save DataFrame to Iceberg table in Bronze layer.
@@ -305,6 +306,8 @@ class BaseScraper(ABC):
                 Transfermarkt mv_history/transfers carry variable per-player
                 timeline lengths → count distinct ``player_id``). ``None`` →
                 ``COUNT(*)``.
+            natural_keys: Optional natural key for an incremental Iceberg
+                ``MERGE``. Mutually exclusive with ``replace_partitions``.
 
         Returns:
             Full table identifier
@@ -312,6 +315,11 @@ class BaseScraper(ABC):
         if df.empty:
             logger.warning(f"Empty DataFrame, skipping save to {table_name}")
             return f"iceberg.{database}.{table_name}"
+
+        if natural_keys and replace_partitions:
+            raise ValueError(
+                "natural_keys and replace_partitions are mutually exclusive"
+            )
 
         # Convert partition cols to spec format
         partition_spec = None
@@ -336,6 +344,7 @@ class BaseScraper(ABC):
             partition_spec=partition_spec,
             source=self.SOURCE_NAME,
             delete_filter=delete_filter,
+            merge_keys=natural_keys,
         )
 
         self._stats['tables_written'].append(table_path)

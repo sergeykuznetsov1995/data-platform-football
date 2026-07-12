@@ -78,6 +78,15 @@ ENV PYTHONPATH="/opt/airflow/dags:/opt/airflow/scrapers:/opt/airflow:${PYTHONPAT
 # Switch to airflow user for pip installs
 USER airflow
 
+# Immutable inputs for SofaScore paid-canary provenance.  Application source
+# and configs are bind-mounted in production, but build/dependency inputs are
+# not; bake exact readable copies so the runtime loader can reject a stale
+# image whose installed browser stack no longer matches the checked-in pins.
+COPY --chown=airflow:root Dockerfile /opt/airflow/runtime-contract/docker/images/airflow/Dockerfile
+COPY --chown=airflow:root requirements-airflow.txt /opt/airflow/runtime-contract/docker/images/airflow/requirements-airflow.txt
+COPY --chown=airflow:root requirements-scraping.txt /opt/airflow/runtime-contract/docker/images/airflow/requirements-scraping.txt
+COPY --chown=airflow:root requirements.txt /opt/airflow/runtime-contract/docker/images/airflow/requirements.txt
+
 # ===== СТАДИЯ 1: Airflow 2.7.x (уже включен в базовый образ) =====
 # Базовый образ apache/airflow:2.7.3-python3.11 уже содержит Airflow
 # Дополнительная установка Airflow не требуется

@@ -19,14 +19,13 @@ import logging
 import os
 import uuid
 from datetime import datetime
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import pandas as pd
 import pyarrow as pa
 
 from scrapers.base.sql_validator import (
     validate_catalog_qualified_name,
-    validate_identifier,
     sanitize_filter_expr,
     validate_snapshot_id,
 )
@@ -263,6 +262,7 @@ class IcebergWriter:
         add_metadata: bool = True,
         source: Optional[str] = None,
         delete_filter: Optional[str] = None,
+        merge_keys: Optional[Sequence[str]] = None,
     ) -> str:
         """
         Write DataFrame to Iceberg table via Trino INSERT.
@@ -279,6 +279,7 @@ class IcebergWriter:
                 ``DELETE FROM ... WHERE <delete_filter>`` BEFORE INSERT.
                 Use for partition-replace semantics, e.g.
                 ``"league='ENG-Premier League' AND season=2025"``.
+            merge_keys: Optional natural key for an incremental Iceberg MERGE.
 
         Returns:
             Full table identifier (e.g., 'iceberg.bronze.fbref_schedule')
@@ -294,7 +295,7 @@ class IcebergWriter:
         try:
             return self._write_to_iceberg(
                 df, database, table, partition_spec, mode=mode,
-                delete_filter=delete_filter,
+                delete_filter=delete_filter, merge_keys=merge_keys,
             )
         except Exception as e:
             logger.error(f"Error writing to {database}.{table}: {e}")
@@ -308,6 +309,7 @@ class IcebergWriter:
         partition_spec: Optional[List[Tuple[str, str]]],
         mode: str = 'append',
         delete_filter: Optional[str] = None,
+        merge_keys: Optional[Sequence[str]] = None,
     ) -> str:
         """
         Write DataFrame directly to Iceberg via Trino INSERT.
@@ -327,7 +329,7 @@ class IcebergWriter:
         Returns:
             Full table identifier (e.g., 'iceberg.bronze.clubelo_ratings')
         """
-        from scrapers.base.trino_manager import TrinoTableManager, TrinoError, _is_iceberg_invalid_metadata
+        from scrapers.base.trino_manager import TrinoError, _is_iceberg_invalid_metadata
 
         trino = self._get_trino_manager()
         full_table = f"{self.catalog}.{database}.{table}"
@@ -380,7 +382,11 @@ class IcebergWriter:
         # back-to-back with the merge INSERT — a failed INSERT can no longer
         # leave the table empty behind a committed DELETE (#314 / #283).
         rows_inserted = trino.insert_dataframe_atomic(
-            database, table, df, delete_filter=delete_filter,
+            database,
+            table,
+            df,
+            delete_filter=delete_filter,
+            merge_keys=merge_keys,
         )
         logger.info(f"Inserted {rows_inserted} rows into {full_table}")
 

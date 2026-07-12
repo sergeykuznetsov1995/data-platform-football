@@ -1,0 +1,28 @@
+{
+  "player": {
+    "id": 11111,
+    "name": "John Doe",
+    "shortName": "J. Doe",
+    "slug": "john-doe",
+    "position": "F",
+    "jerseyNumber": "9",
+    "shirtNumber": 9,
+    "height": 182,
+    "preferredFoot": "Right",
+    "dateOfBirthTimestamp": 631152000,
+    "nationality": "England",
+    "country": {
+      "name": "England",
+      "alpha2": "EN",
+      "alpha3": "ENG"
+    },
+    "team": {
+      "id": 30,
+      "name": "Brighton & Hove Albion",
+      "slug": "brighton-and-hove-albion",
+      "gender": "M"
+    },
+    "retired": false,
+    "userCount": 1234
+  }
+}

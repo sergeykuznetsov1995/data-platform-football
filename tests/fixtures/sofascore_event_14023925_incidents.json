@@ -1,0 +1,38 @@
+{
+  "incidents": [
+    {
+      "id": 9001,
+      "incidentType": "goal",
+      "time": 12,
+      "isHome": true,
+      "player": {"id": 11111, "name": "Starter One"},
+      "assist1": {"id": 11113, "name": "Assistant"},
+      "homeScore": 1,
+      "awayScore": 0
+    },
+    {
+      "id": 9002,
+      "incidentType": "card",
+      "incidentClass": "yellow",
+      "time": 38,
+      "isHome": false,
+      "player": {"id": 22224, "name": "Booked Away"},
+      "reason": "Foul"
+    },
+    {
+      "incidentType": "substitution",
+      "time": 66,
+      "isHome": false,
+      "playerIn": {"id": 22222, "name": "Used Away"},
+      "playerOut": {"id": 22223, "name": "Starter Replaced"}
+    },
+    {
+      "id": 9004,
+      "incidentType": "varDecision",
+      "incidentClass": "goalOverturned",
+      "time": 82,
+      "isHome": true,
+      "player": {"id": 11114, "name": "VAR Subject"}
+    }
+  ]
+}

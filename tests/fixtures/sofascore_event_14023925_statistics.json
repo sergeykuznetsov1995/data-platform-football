@@ -1,0 +1,34 @@
+{
+  "statistics": [
+    {
+      "period": "ALL",
+      "groups": [
+        {
+          "groupName": "Match overview",
+          "statisticsItems": [
+            {
+              "name": "Ball possession",
+              "key": "ballPossession",
+              "home": "55%",
+              "away": "45%",
+              "homeValue": 55,
+              "awayValue": 45,
+              "compareCode": 1,
+              "valueType": "team"
+            },
+            {
+              "name": "Expected goals",
+              "key": "expectedGoals",
+              "home": "1.42",
+              "away": "0.77",
+              "homeValue": 1.42,
+              "awayValue": 0.77,
+              "compareCode": 1,
+              "valueType": "team"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
