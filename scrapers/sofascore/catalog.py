@@ -339,7 +339,7 @@ class SofaScoreCatalog:
             seasons: list[CatalogSeason] = []
             seen_season_ids: set[int] = set()
             seen_years: dict[str, int] = {}
-            seen_canonical_seasons: dict[str, int] = {}
+            seen_canonical_seasons: dict[str, tuple[int, str, str]] = {}
             seen_resolution_tokens: dict[str, int] = {}
             for season_index, raw_season in enumerate(raw_seasons):
                 season_prefix = f"{prefix}.seasons[{season_index}]"
@@ -421,18 +421,28 @@ class SofaScoreCatalog:
                         f"{season_prefix} unknown format cannot be activatable"
                     )
                 if canonical_season is not None:
+                    # Two labels of the *same* season format collapsing into one
+                    # canonical season is corruption and stays fail-closed. A
+                    # league that migrated formats owns both "20/21" and "2021"
+                    # (tournament 278), and parallel divisions share one year
+                    # (tournament 65) — both are real, and an ambiguous token
+                    # fails closed in resolve_source_season instead.
                     previous_canonical = seen_canonical_seasons.get(
                         canonical_season
                     )
                     if (
                         previous_canonical is not None
-                        and previous_canonical != season_id
+                        and previous_canonical[0] != season_id
+                        and previous_canonical[1] == season_kind
+                        and previous_canonical[2] != year
                     ):
                         raise CatalogError(
                             f"{prefix} has ambiguous canonical_season "
                             f"{canonical_season!r}"
                         )
-                    seen_canonical_seasons[canonical_season] = season_id
+                    seen_canonical_seasons.setdefault(
+                        canonical_season, (season_id, season_kind, year)
+                    )
 
                 if schema_version == SCHEMA_VERSION:
                     source_name = _required_string(
