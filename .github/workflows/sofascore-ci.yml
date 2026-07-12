@@ -41,9 +41,10 @@ jobs:
       - name: Install test runtime
         shell: bash
         run: |
-          python -m pip install --disable-pip-version-check \
-            --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-2.7.3/constraints-3.11.txt" \
-            "apache-airflow==2.7.3"
+          # Airflow is deliberately absent: tests/unit/dags/conftest.py installs
+          # its operator stubs only when the real package is missing, and the DAG
+          # topology tests assert against those stubs. Installing Airflow here
+          # would silently disable them.
           python -m pip install --disable-pip-version-check \
             pytest ruff pandas numpy pyarrow trino requests PyYAML jinja2 \
             jsonschema "tls-client-python==1.15.1" python-dotenv tenacity pybreaker \
