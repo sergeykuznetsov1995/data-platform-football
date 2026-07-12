@@ -450,6 +450,42 @@ class CamoufoxFbrefTransport:
         except Exception:  # noqa: BLE001 — fail closed in _on_response
             return {}
 
+    def _reserve_redirect_hop(self, req) -> Optional[int]:
+        """Reserve fixed overhead for a server-redirect hop, or return None.
+
+        Only requests that Playwright links to a tracked chain via
+        ``redirected_from`` qualify; the hop consumes a request slot and the
+        standard fixed overhead against the same caps as a routed request.
+        A hop that would cross either cap aborts the whole session, because
+        unlike ``route()`` there is no way to refuse it before transport.
+        """
+        try:
+            redirected_from = getattr(req, "redirected_from", None)
+        except Exception:  # noqa: BLE001 — fail closed on detached requests
+            return None
+        if redirected_from is None:
+            return None
+        if (
+            self._max_network_requests is not None
+            and self._network_requests_started >= self._max_network_requests
+        ):
+            self._abort_session_for_byte_budget("redirect_hop_over_request_cap")
+            return None
+        reservation = BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
+        projected = (
+            self._bytes_total
+            + self._unobserved_reserved_bytes
+            + self._inflight_reserved_bytes
+            + reservation
+        )
+        if projected > self._max_network_bytes:
+            self._abort_session_for_byte_budget("redirect_hop_over_byte_cap")
+            return None
+        self._network_requests_started += 1
+        self._inflight_byte_reservations[id(req)] = reservation
+        self._inflight_reserved_bytes += reservation
+        return reservation
+
     def _on_response(self, response) -> None:
         """Reserve the declared body before any response can cross the cap."""
 
@@ -462,8 +498,17 @@ class CamoufoxFbrefTransport:
         reservation_key = id(req)
         fixed = self._inflight_byte_reservations.get(reservation_key)
         if fixed is None:
-            self._abort_session_for_byte_budget("untracked_response")
-            return
+            # Playwright does not re-run ``route()`` for server redirects: the
+            # follow-up hop arrives as a new request object with no
+            # reservation.  The hop is still real proxy traffic, so it must
+            # pass the same request/byte caps and reserve the same fixed
+            # overhead as a routed request; anything that is not a genuine
+            # redirect continuation stays fail-closed below.
+            fixed = self._reserve_redirect_hop(req)
+            if fixed is None:
+                if not self._byte_budget_exhausted:
+                    self._abort_session_for_byte_budget("untracked_response")
+                return
 
         headers = self._response_headers(response)
         transfer_encoding = headers.get("transfer-encoding", "")
