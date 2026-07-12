@@ -1,10 +1,5 @@
 # FlareSolverr Proxy Traffic Audit — WhoScored + SoFIFA
 
-> Historical pre-V2 audit. The WhoScored scraper/benchmark paths described
-> below were removed in July 2026 because they bypassed raw-first storage and
-> bounded proxy leases. Do not use the old commands operationally; current
-> traffic accounting lives in `scrapers/whoscored/transport.py`.
-
 > **Issue:** [#616](https://github.com/sergeykuznetsov1995/data-platform-football/issues/616) · branch `feature/issue-616-cut-browser-proxy-traffic`
 >
 > **Question:** «Сколько дорогого residential-proxy трафика (~$4/ГБ) тратят два

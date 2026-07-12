@@ -241,7 +241,7 @@ ws_schedule_dedup AS (
             PARTITION BY game_id
             ORDER BY _ingested_at DESC
         ) AS rn
-    FROM iceberg.bronze.whoscored_schedule
+    FROM iceberg.bronze.whoscored_schedule_current
 ),
 
 -- #459: xref_team is season-grained (PK = source, source_id, league, season;

@@ -14,8 +14,8 @@ What we cover (the safety-critical, pure logic):
 from __future__ import annotations
 
 import importlib.util
-import json
 import base64
+import json
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -25,6 +25,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[3]
 _SCRIPT_PATH = REPO_ROOT / "scripts" / "proxy_filter" / "filter_proxy.py"
 _BLOCKLIST_PATH = REPO_ROOT / "configs" / "proxy_filter" / "blocklist.txt"
+_COMPOSE_PATH = REPO_ROOT / "compose.yaml"
 
 
 def _load_module():
@@ -36,8 +37,10 @@ def _load_module():
 
 
 @pytest.fixture()
-def mod():
-    return _load_module()
+def mod(tmp_path):
+    loaded = _load_module()
+    loaded.LEDGER_PATH = str(tmp_path / "paid_requests.jsonl")
+    return loaded
 
 
 # --- _is_blocked --------------------------------------------------------------
@@ -110,6 +113,149 @@ def test_load_blocklist_strips_comments_blanks_and_lowercases(mod, tmp_path):
     assert result == {"doubleclick.net", "adnxs.com"}
 
 
+# --- production proxy-pool secret --------------------------------------------
+
+def _pool_json(**overrides):
+    entry = {
+        "host": "Pool.Example.COM",
+        "port": 10000,
+        "username": "account-zone-production",
+        "password": "test-only:p@ssword",
+    }
+    entry.update(overrides)
+    return json.dumps([entry])
+
+
+def test_proxy_pool_json_is_strictly_parsed_and_normalised(mod):
+    records = mod._parse_proxy_pool_json(_pool_json())
+
+    assert records == (
+        {
+            "host": "pool.example.com",
+            "port": 10000,
+            "username": "account-zone-production",
+            "password": "test-only:p@ssword",
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    "payload, expected_field",
+    [
+        ("", "PROXY_POOL_JSON"),
+        ("not-json", "PROXY_POOL_JSON"),
+        ("{}", "PROXY_POOL_JSON"),
+        ("[]", "PROXY_POOL_JSON"),
+        (json.dumps(["not-an-object"]), "entry"),
+        (json.dumps([{"host": "pool.example"}]), "fields"),
+        (_pool_json(extra="not-allowed"), "fields"),
+        (_pool_json(host=" bad.example"), "host"),
+        (_pool_json(host="bad_host.example"), "host"),
+        (_pool_json(port=True), "port"),
+        (_pool_json(port=0), "port"),
+        (_pool_json(username="bad:name"), "username"),
+        (_pool_json(password="bad\npassword"), "password"),
+        (_pool_json(password="\ud800"), "password"),
+    ],
+)
+def test_proxy_pool_json_rejects_invalid_shapes_without_echoing_values(
+    mod, payload, expected_field
+):
+    with pytest.raises(mod.ProxyPoolConfigurationError) as caught:
+        mod._parse_proxy_pool_json(payload)
+
+    message = str(caught.value)
+    assert expected_field in message
+    assert "not-allowed" not in message
+    assert "bad:name" not in message
+    assert "bad password" not in message
+
+
+def test_proxy_pool_json_rejects_duplicate_json_fields_without_echoing_secret(mod):
+    payload = (
+        '[{"host":"pool.example","port":10000,"username":"user",'
+        '"password":"test-secret-one","password":"test-secret-two"}]'
+    )
+
+    with pytest.raises(mod.ProxyPoolConfigurationError) as caught:
+        mod._parse_proxy_pool_json(payload)
+
+    assert "duplicate object field" in str(caught.value)
+    assert "test-secret" not in str(caught.value)
+
+
+def test_proxy_pool_json_rejects_duplicate_endpoint_identity(mod):
+    first = json.loads(_pool_json())[0]
+    payload = json.dumps([first, {**first, "password": "different-test-password"}])
+
+    with pytest.raises(mod.ProxyPoolConfigurationError, match="duplicates"):
+        mod._parse_proxy_pool_json(payload)
+
+
+def test_residential_manager_loads_env_secret_without_file_access(mod, tmp_path):
+    mgr, source = mod._residential_manager(
+        proxy_pool_json=_pool_json(),
+        proxy_file=str(tmp_path / "does-not-exist"),
+        allow_file_fallback=True,
+    )
+
+    assert source == "PROXY_POOL_JSON"
+    assert mgr.total_count == 1
+    assert mod._pick_upstream(mgr) == (
+        "pool.example.com",
+        10000,
+        "account-zone-production",
+        "test-only:p@ssword",
+    )
+
+
+def test_residential_manager_fails_closed_when_env_is_missing(mod, tmp_path):
+    fallback = tmp_path / "proxys.txt"
+    fallback.write_text("pool.example:10000:user:test-only-password\n")
+
+    with pytest.raises(mod.ProxyPoolConfigurationError, match="fallback is disabled"):
+        mod._residential_manager(
+            proxy_pool_json=None,
+            proxy_file=str(fallback),
+            allow_file_fallback=False,
+        )
+
+
+def test_residential_manager_uses_file_only_with_explicit_opt_in(mod, tmp_path):
+    fallback = tmp_path / "proxys.txt"
+    fallback.write_text("pool.example:10000:user:test-only-password\n")
+
+    mgr, source = mod._residential_manager(
+        proxy_pool_json=None,
+        proxy_file=str(fallback),
+        allow_file_fallback=True,
+    )
+
+    assert source == "explicit file fallback"
+    assert mgr.total_count == 1
+
+
+def test_malformed_env_never_silently_falls_back_to_file(mod, tmp_path):
+    fallback = tmp_path / "proxys.txt"
+    fallback.write_text("pool.example:10000:user:test-only-password\n")
+
+    with pytest.raises(mod.ProxyPoolConfigurationError, match="valid JSON"):
+        mod._residential_manager(
+            proxy_pool_json="malformed-test-secret",
+            proxy_file=str(fallback),
+            allow_file_fallback=True,
+        )
+
+
+def test_proxy_filter_compose_is_env_only_by_default():
+    compose = _COMPOSE_PATH.read_text()
+    service = compose.split("  proxy_filter:\n", 1)[1].split("\n  caddy:\n", 1)[0]
+
+    assert "PROXY_POOL_JSON: ${PROXY_POOL_JSON:-}" in service
+    assert "PROXY_FILTER_ALLOW_FILE_FALLBACK" in service
+    assert "proxys.txt:/opt/airflow/proxys.txt" not in service
+
+
 # --- _dump --------------------------------------------------------------------
 
 def test_dump_writes_expected_report_shape(mod, tmp_path):
@@ -124,7 +270,12 @@ def test_dump_writes_expected_report_shape(mod, tmp_path):
     # Assert
     report = json.loads(out.read_text())
     assert set(report) == {
-        "total_mb", "daily", "leases", "allowed_hosts", "blocked_hosts"
+        "total_mb",
+        "daily",
+        "leases",
+        "dagruns",
+        "allowed_hosts",
+        "blocked_hosts",
     }
     assert report["allowed_hosts"][0]["host"] == "sofifa.com"
     assert report["allowed_hosts"][0]["down_mb"] == pytest.approx(1.0, abs=0.01)
@@ -293,6 +444,158 @@ def test_closed_or_expired_lease_cannot_open_another_tunnel(mod):
     lease.closed = False
     lease.expires_at = time.time() - 1
     assert lease.usable is False
+
+
+def test_only_one_paid_lease_can_be_active(mod):
+    mgr = _FakeManager(
+        ["http://u:p@pool.proxys.io:10000", "http://u:p@pool.proxys.io:10001"]
+    )
+    first = mod._create_lease(mgr, max_bytes=1000, ttl_seconds=30)
+
+    with pytest.raises(RuntimeError, match="concurrency"):
+        mod._create_lease(mgr, max_bytes=1000, ttl_seconds=30)
+
+    first.closed = True
+    second = mod._create_lease(mgr, max_bytes=1000, ttl_seconds=30)
+    assert second.upstream[1] == 10001
+
+
+def test_control_plane_paid_lease_requires_airflow_identity(mod):
+    mgr = _FakeManager(["http://u:p@pool.proxys.io:10000"])
+
+    with pytest.raises(ValueError, match="dag_id, run_id, task_id"):
+        mod._create_lease(
+            mgr,
+            max_bytes=1000,
+            ttl_seconds=30,
+            metadata={"canonical_url": "https://www.whoscored.com/x"},
+            require_context=True,
+        )
+
+
+def test_canonical_paid_url_keeps_and_sorts_full_query(mod):
+    assert mod._canonical_url(
+        "HTTPS://WWW.WHOSCORED.COM/Matches/1/Live?z=2&a=&a=1#ignored"
+    ) == "https://www.whoscored.com/Matches/1/Live?a=&a=1&z=2"
+
+
+def test_dagrun_and_canonical_url_budgets_are_shared_across_leases(mod):
+    mgr = _FakeManager(["http://u:p@pool.proxys.io:10000"])
+    mod.DAGRUN_BUDGET_BYTES = 1000
+    mod.URL_BUDGET_BYTES = 600
+    metadata = {
+        "dag_id": "dag",
+        "run_id": "run",
+        "task_id": "task-a",
+        "canonical_url": "https://www.whoscored.com/Matches/1/Live?x=1",
+    }
+    first = mod._create_lease(
+        mgr, max_bytes=1000, ttl_seconds=30, metadata=metadata
+    )
+    assert first.max_bytes == 600
+    mod._account_lease_bytes(first, "www.whoscored.com", "down", 600)
+    first.closed = True
+
+    with pytest.raises(RuntimeError, match="budget exhausted"):
+        mod._create_lease(
+            mgr, max_bytes=1000, ttl_seconds=30, metadata=metadata
+        )
+
+    second = mod._create_lease(
+        mgr,
+        max_bytes=1000,
+        ttl_seconds=30,
+        metadata={
+            **metadata,
+            "task_id": "task-b",
+            "canonical_url": "https://www.whoscored.com/Matches/2/Live",
+        },
+    )
+    assert second.max_bytes == 400
+
+
+@pytest.mark.parametrize(
+    "dag_id",
+    [
+        "dag_ingest_transfermarkt",
+        "dag_discover_transfermarkt_registry",
+    ],
+)
+def test_transfermarkt_dagruns_have_a_separate_15_mib_cap(mod, dag_id):
+    mgr = _FakeManager(["http://u:p@pool.proxys.io:10000"])
+    mod.URL_BUDGET_BYTES = 24 * 1024 * 1024
+    metadata = {
+        "dag_id": dag_id,
+        "run_id": "run",
+        "task_id": "task",
+        "canonical_url": "https://www.transfermarkt.com/x",
+    }
+
+    lease = mod._create_lease(
+        mgr,
+        max_bytes=15_728_640,
+        ttl_seconds=3600,
+        metadata=metadata,
+    )
+
+    assert mod.DAGRUN_BUDGET_BYTES == 8_000_000
+    assert mod._dagrun_budget_bytes("dag_ingest_whoscored") == 8_000_000
+    assert mod._dagrun_budget_bytes(dag_id) == 15_728_640
+    assert lease.max_bytes == 15_728_640
+    assert lease.report()["dagrun_budget_bytes"] == 15_728_640
+
+
+def test_paid_lease_rejects_ttl_above_configured_hour(mod):
+    mgr = _FakeManager(["http://u:p@pool.proxys.io:10000"])
+
+    lease = mod._create_lease(mgr, max_bytes=1000, ttl_seconds=3600)
+    assert lease.expires_at > time.time() + 3500
+    lease.closed = True
+
+    with pytest.raises(ValueError, match="ttl_seconds must be in 1..3600"):
+        mod._create_lease(mgr, max_bytes=1000, ttl_seconds=3601)
+
+
+def test_durable_byte_ledger_restores_shared_run_and_url_usage(mod):
+    mgr = _FakeManager(["http://u:p@pool.proxys.io:10000"])
+    metadata = {
+        "dag_id": "dag",
+        "run_id": "run",
+        "task_id": "task",
+        "canonical_url": "https://www.whoscored.com/Matches/1/Live",
+    }
+    lease = mod._create_lease(
+        mgr, max_bytes=1000, ttl_seconds=30, metadata=metadata
+    )
+    mod._account_lease_bytes(lease, "www.whoscored.com", "up", 125)
+    mod._account_lease_bytes(lease, "www.whoscored.com", "down", 375)
+
+    mod._run_up_bytes.clear()
+    mod._run_down_bytes.clear()
+    mod._url_up_bytes.clear()
+    mod._url_down_bytes.clear()
+    restored = mod._restore_budget_ledger(mod.LEDGER_PATH, restore_daily=False)
+
+    assert restored == 2
+    assert mod._run_total_bytes("dag/run") == 500
+    assert mod._url_total_bytes(
+        "dag/run", "https://www.whoscored.com/Matches/1/Live"
+    ) == 500
+
+
+def test_corrupt_paid_byte_ledger_fails_closed_on_restore(mod):
+    Path(mod.LEDGER_PATH).write_text("{broken\n")
+
+    with pytest.raises(RuntimeError, match="line 1"):
+        mod._restore_budget_ledger(mod.LEDGER_PATH, restore_daily=False)
+
+
+def test_oversized_paid_byte_ledger_event_fails_closed_on_restore(mod):
+    mod.MAX_LEDGER_EVENT_BYTES = 32
+    Path(mod.LEDGER_PATH).write_bytes(b'{"value":"' + b"x" * 80)
+
+    with pytest.raises(RuntimeError, match="line 1"):
+        mod._restore_budget_ledger(mod.LEDGER_PATH, restore_daily=False)
 
 
 # --- shipped blocklist safety -------------------------------------------------

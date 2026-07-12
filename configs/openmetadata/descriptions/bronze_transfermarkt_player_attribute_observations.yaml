@@ -1,0 +1,16 @@
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.transfermarkt_player_attribute_observations
+  description: |
+    Lossless squad-page player bio/contract/value observations. Grain is
+    (league, season, club_id, player_id, observed_at). NULL in the newest
+    contract observation is authoritative and must not be carried forward.
+  tags: [Tier.Bronze, Domain.Football, PII.Low]
+columns:
+  - name: player_id
+    description: Global Transfermarkt player id.
+  - name: observed_at
+    description: Observation timestamp; natural-key component.
+  - name: contract_until
+    description: Contract end shown in this exact observation; nullable.
+  - name: market_value_eur
+    description: Squad-page market value at observation time, EUR.

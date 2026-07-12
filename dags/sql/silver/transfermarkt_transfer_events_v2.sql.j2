@@ -1,0 +1,90 @@
+-- =============================================================================
+-- Shadow Silver v2: global Transfermarkt transfer events
+-- =============================================================================
+-- Natural key: (player_id, transfer_id); transfer_id is the upstream id when
+-- available, otherwise a stable hash produced by the parser.  event_season is
+-- the season of the event, never the season in which it was scraped.  Upcoming
+-- events without a date are preserved.
+
+WITH aliases AS (
+    SELECT raw_name, MAX(canonical_name) AS canonical_name
+    FROM (VALUES
+        {{ team_aliases_values_sql }}
+    ) AS t(raw_name, canonical_name)
+    GROUP BY raw_name
+),
+
+dedup AS (
+    SELECT *
+    FROM (
+        SELECT
+            b.*,
+            ROW_NUMBER() OVER (
+                PARTITION BY player_id, transfer_id
+                ORDER BY _ingested_at DESC, _batch_id DESC,
+                         source_body_hash DESC
+            ) AS rn
+        FROM iceberg.bronze.transfermarkt_transfer_events b
+        WHERE player_id IS NOT NULL
+          AND transfer_id IS NOT NULL
+    )
+    WHERE rn = 1
+)
+
+SELECT
+    CAST(b.transfer_id AS varchar)                        AS transfer_id,
+    CAST(b.player_id AS varchar)                          AS player_id,
+    x.canonical_id,
+    TRY_CAST(b.transfer_date AS date)                     AS transfer_date,
+    CASE
+        WHEN REGEXP_LIKE(b.event_season, '^[0-9]{4}$')
+            THEN b.event_season
+        WHEN REGEXP_LIKE(b.event_season, '^[0-9]{2}/[0-9]{2}$')
+            THEN REPLACE(b.event_season, '/', '')
+        WHEN REGEXP_LIKE(b.event_season, '^[0-9]{4}/[0-9]{2}$')
+            THEN SUBSTR(b.event_season, 3, 2) || SUBSTR(b.event_season, 6, 2)
+        WHEN b.transfer_date IS NOT NULL
+            THEN SUBSTR(CAST(
+                    IF(MONTH(TRY_CAST(b.transfer_date AS date)) >= 7,
+                       YEAR(TRY_CAST(b.transfer_date AS date)),
+                       YEAR(TRY_CAST(b.transfer_date AS date)) - 1)
+                 AS varchar), 3, 2)
+              || SUBSTR(CAST(
+                    IF(MONTH(TRY_CAST(b.transfer_date AS date)) >= 7,
+                       YEAR(TRY_CAST(b.transfer_date AS date)),
+                       YEAR(TRY_CAST(b.transfer_date AS date)) - 1) + 1
+                 AS varchar), 3, 2)
+        ELSE NULL
+    END                                                   AS event_season,
+    CAST(b.from_club_id AS varchar)                       AS from_club_id,
+    CASE WHEN af.canonical_name IS NOT NULL
+         THEN LOWER(REGEXP_REPLACE(af.canonical_name, '[^a-zA-Z0-9]+', '_'))
+    END                                                   AS from_club_id_canonical,
+    b.from_club_name,
+    CAST(b.to_club_id AS varchar)                         AS to_club_id,
+    CASE WHEN at.canonical_name IS NOT NULL
+         THEN LOWER(REGEXP_REPLACE(at.canonical_name, '[^a-zA-Z0-9]+', '_'))
+    END                                                   AS to_club_id_canonical,
+    b.to_club_name,
+    b.fee_text,
+    TRY_CAST(b.fee_eur AS bigint)                         AS fee_eur,
+    TRY_CAST(b.market_value_eur AS bigint)                AS market_value_eur,
+    CAST(b.is_upcoming AS boolean)                        AS is_upcoming,
+    COALESCE(LOWER(b.fee_text) LIKE '%loan%', false)      AS is_loan,
+    CAST(b._ingested_at AS timestamp(6))                  AS _bronze_ingested_at,
+    b._batch_id,
+    b.source_competition_id,
+    b.source_edition_id,
+    b.source_url,
+    b.source_body_hash,
+    CAST(b.fetched_at AS timestamp(6))                    AS fetched_at,
+    b.parser_revision,
+    b.schema_revision,
+    b.cycle_id,
+    b.scope_id
+FROM dedup b
+LEFT JOIN iceberg.silver.transfermarkt_player_xref_global_v2 x
+  ON x.player_id = b.player_id
+ AND x.resolution_status = 'resolved'
+LEFT JOIN aliases af ON af.raw_name = b.from_club_name
+LEFT JOIN aliases at ON at.raw_name = b.to_club_name

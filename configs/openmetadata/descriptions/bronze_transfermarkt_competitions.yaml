@@ -1,0 +1,56 @@
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.transfermarkt_competitions
+  description: |
+    Authoritative Transfermarkt competition-registry snapshots discovered by
+    dag_discover_transfermarkt_competitions. Grain and natural key are
+    (competition_id); lineage is the Transfermarkt competition index and the
+    source_url/source_body_hash evidence stored on every row. Completeness for a
+    publishable snapshot requires all index pages to succeed and every active
+    competition has a known classification. Active discovery freshness is 24h;
+    unknown/conflicting classification is retained here but blocks paid crawl.
+  tags: [Tier.Bronze, Domain.Football, PII.None]
+columns:
+  - name: competition_id
+    description: Stable Transfermarkt competition code; natural key.
+  - name: slug
+    description: Competition URL slug observed at discovery time.
+  - name: name
+    description: Source competition name.
+  - name: country
+    description: Source-backed country, nullable for confederation competitions.
+  - name: confederation
+    description: Source-backed football confederation.
+  - name: competition_type
+    description: domestic_league, domestic_cup, continental_club, national_team_tournament, or unknown.
+  - name: gender
+    description: Source-classified men, women, or unknown; never inferred from name alone.
+  - name: team_type
+    description: Source-classified club, national_team, reserve, mixed, or unknown.
+  - name: age_category
+    description: Source-classified senior, youth/Uxx, or unknown.
+  - name: season_format
+    description: split_year, single_year, or unknown.
+  - name: active
+    description: Whether the competition is active in the discovered catalog.
+  - name: source_url
+    description: Transfermarkt page used as classification lineage evidence.
+  - name: discovered_at
+    description: UTC discovery timestamp; active-row freshness must be at most 24h.
+  - name: classification_status
+    description: classified, review_required, or conflict; only classified records are crawl-eligible.
+  - name: classification_evidence
+    description: Serialized structured evidence used by the classifier.
+  - name: registry_snapshot_id
+    description: Complete immutable discovery-snapshot identifier.
+  - name: source_body_hash
+    description: SHA-256 of the source response used for lineage and replay.
+  - name: fetched_at
+    description: UTC response fetch timestamp retained for source lineage.
+  - name: cycle_id
+    description: Parent discovery-cycle identifier.
+  - name: scope_id
+    description: Registry snapshot id used as the discovery scope.
+  - name: _ingested_at
+    description: Bronze commit timestamp.
+  - name: _batch_id
+    description: Discovery batch identifier.

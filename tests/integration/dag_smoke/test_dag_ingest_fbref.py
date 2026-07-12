@@ -175,7 +175,7 @@ class TestFBrefTaskDependencies:
         trino_second = fbref_dag.task_dict[
             'match_data.check_trino_before_match'
         ]
-        trigger = fbref_dag.task_dict['trigger_silver_transform']
+        terminal = fbref_dag.task_dict['ingest_complete']
 
         assert {t.task_id for t in trino_first.upstream_list} == {
             'season_stats_all', 'traffic_guard_season_stats',
@@ -184,7 +184,7 @@ class TestFBrefTaskDependencies:
             'match_data.match_schedule',
             'match_data.traffic_guard_match_schedule',
         }
-        assert {t.task_id for t in trigger.upstream_list} == {
+        assert {t.task_id for t in terminal.upstream_list} == {
             'validate_all_data', 'report_proxy_traffic',
         }
 
@@ -224,8 +224,6 @@ class TestFBrefTaskConfiguration:
 
     def test_runtime_scope_params_are_rendered(self, fbref_dag):
         """League and chunk params must affect commands, not be dead UI."""
-        season = fbref_dag.task_dict['season_stats_all'].bash_command
-        schedule = fbref_dag.task_dict['match_data.match_schedule'].bash_command
         matches = fbref_dag.task_dict['match_data.match_all_data'].bash_command
 
         assert 'params.leagues' in fbref_dag.task_dict[
@@ -269,13 +267,13 @@ class TestFBrefTaskCount:
 
     def test_total_task_count(self, fbref_dag):
         """Total = season_stats_all + guard + 6 match_data + start +
-        validate_all_data + report_proxy_traffic + trigger_silver_transform."""
+        validate_all_data + report_proxy_traffic + ingest_complete."""
         total_tasks = len(fbref_dag.task_dict)
 
         expected_min = (
             2   # season_stats_all + traffic_guard_season_stats
             + 6  # match_data group
-            + 4  # start + validate + report_proxy_traffic + trigger_silver
+            + 4  # start + validate + report_proxy_traffic + ingest_complete
         )
 
         assert total_tasks >= expected_min, \

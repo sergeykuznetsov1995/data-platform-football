@@ -127,6 +127,12 @@ def _create_bronze_tables(con: duckdb.DuckDBPyConnection) -> None:
         )
         """
     )
+    con.execute(
+        """
+        CREATE VIEW iceberg.bronze.whoscored_schedule_current AS
+        SELECT * FROM iceberg.bronze.whoscored_schedule
+        """
+    )
 
 
 def _create_silver_table(con: duckdb.DuckDBPyConnection) -> None:

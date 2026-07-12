@@ -158,21 +158,26 @@ def test_understat_contract_lists_all_five_tables(table):
 
 
 # --- WhoScored contract presence guard (#278) ------------------------------
-# Regression guard: discovery plus v2 payload/manifest tables must stay in the contract so
-# the --source whoscored audit keeps verifying full coverage. whoscored_season_stages
-# is gated by EXPECTED_ABSENT (top-5 leagues have no cup stages) but stays in the
-# contract for completeness.
-@pytest.mark.parametrize('table', [
-    'whoscored_schedule',
-    'whoscored_events',
-    'whoscored_lineups',
-    'whoscored_match_ingest_manifest',
-    'whoscored_missing_players',
-    'whoscored_preview_ingest_manifest',
-    'whoscored_season_stages',
-])
-def test_whoscored_contract_lists_all_required_tables(table):
-    assert table in mod.EXPECTED_TABLES['whoscored']
+# The audit consumes the same dependency-free inventory as migration/cleanup:
+# 25 source datasets and five logical-commit manifests.  Deprecated parser-v2
+# tables must not remain as an "expected absent" escape hatch.
+def test_whoscored_contract_lists_complete_v2_inventory():
+    expected = set(mod.WHOSCORED_CONTRACT.BUSINESS_TABLES) | set(
+        mod.WHOSCORED_CONTRACT.MANIFEST_TABLES
+    )
+
+    assert set(mod.EXPECTED_TABLES['whoscored']) == expected
+    assert len(mod.WHOSCORED_CONTRACT.BUSINESS_TABLES) == 25
+    assert 'whoscored_season_stages' not in expected
+    assert 'whoscored_player_profile' not in expected
+
+
+def test_whoscored_contract_requires_logical_commit_column_for_every_dataset():
+    contract = mod.EXPECTED_TABLES['whoscored']
+
+    for table, batch_column in mod.WHOSCORED_CONTRACT.BATCH_COLUMN_BY_TABLE.items():
+        assert batch_column in contract[table]
+        assert mod.META_COLS <= contract[table]
 
 
 # --- ESPN contract presence guard (#279, #298) ------------------------------
@@ -288,20 +293,25 @@ def test_sofifa_contract_lists_all_six_tables(table):
     assert table in mod.EXPECTED_TABLES['sofifa']
 
 
-# --- Transfermarkt contract presence guard (#285) --------------------------
-# Regression guard: all 3 Transfermarkt bronze tables must stay in the contract
-# so the --source transfermarkt audit keeps verifying full coverage. MVP scope =
-# ENG-Premier League only (TM_LEAGUE_MAP). All 3 materialise + non-empty live
-# (verified 2026-06-05, #285): players 555, market_value_history 2121,
-# transfers 750 rows on ('ENG-Premier League','2526'). 0 all-NULL columns ->
-# no EXPECTED_NULL entry. Sparse-by-design (NOT drift): transfers.fee_eur 176/750
-# (free transfers), transfers.market_value_eur 435/750.
+# --- Transfermarkt native-v2 + transition contract presence guard ----------
+# Four legacy tables stay audited for the dual-write rollback window; six
+# native tables encode honest season/global grains.
 @pytest.mark.parametrize('table', [
     'transfermarkt_players',
     'transfermarkt_market_value_history',
     'transfermarkt_transfers',
+    'transfermarkt_coaches',
+    'transfermarkt_squad_memberships',
+    'transfermarkt_player_attribute_observations',
+    'transfermarkt_player_contract_observations',
+    'transfermarkt_market_value_points',
+    'transfermarkt_transfer_events',
+    'transfermarkt_coach_profiles',
+    'transfermarkt_coach_stints',
+    'transfermarkt_competitions',
+    'transfermarkt_competition_editions',
 ])
-def test_transfermarkt_contract_lists_all_three_tables(table):
+def test_transfermarkt_contract_lists_transition_and_native_tables(table):
     assert table in mod.EXPECTED_TABLES['transfermarkt']
 
 

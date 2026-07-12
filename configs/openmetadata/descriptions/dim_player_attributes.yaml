@@ -9,9 +9,9 @@ table:
     без winning-value logic — потребитель выбирает источник. FBref-spine:
     WHERE source='fbref' AND confidence != 'orphan'. SofaScore-side читает
     silver.sofascore_player_profile (canonical_id уже подтянут в Silver).
-    Transfermarkt-side читает silver.transfermarkt_players (canonical_id
-    также подтянут в Silver) — primary источник для height_cm и
-    current_market_value_eur (EUR, не USD-конверсия). НЕ заменяет
+    Transfermarkt-side после native-v2 cutover читает conflict-safe
+    silver.transfermarkt_player_attributes_v2 — primary источник для height_cm
+    и current_market_value_eur (EUR, не USD-конверсия). НЕ заменяет
     gold.dim_player (per-season, FBref-only). См. docs/research/
     RX_cross_source_player_profile.md для полного rationale (D1-D4 решений).
 

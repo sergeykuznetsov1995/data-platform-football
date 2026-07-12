@@ -9,7 +9,7 @@ match_outcomes, per-source *_team_season rollups) was dropped in #478.
 Architecture
 ------------
 
-    Triggered by dag_transform_fbref_silver (or manual trigger)
+    Triggered by dag_master_pipeline after xref/E3 (or manually)
         |
         v
     dim_competition, dim_season, dim_venue   (config-driven, no dependencies)
@@ -70,6 +70,7 @@ from airflow.operators.python import PythonOperator
 from airflow.utils.task_group import TaskGroup
 
 from utils.default_args import SILVER_ARGS
+from utils import transfermarkt_native_v2 as tm_v2
 
 # ---------------------------------------------------------------------------
 # Transform definitions
@@ -100,7 +101,10 @@ STAGE_2A_CONFIG_DIMS_INLINE = [
 STAGE_2B_XREF_DIMS_SQL = [
     # (task_id, sql_file, table_name, partition_cols)
     ('dim_referee', 'dags/sql/gold/dim_referee.sql', 'dim_referee', None),
-    ('dim_manager', 'dags/sql/gold/dim_manager.sql', 'dim_manager', None),
+    (
+        'dim_manager', 'dags/sql/gold/dim_manager.sql',
+        'dim_manager_legacy', None,
+    ),
 ]
 STAGE_2B_XREF_DIMS_INLINE = [
     # dim_team: xref_team spine + country/short_name from team_aliases.yaml.
@@ -180,7 +184,7 @@ STAGE_3_FACTS = [
     # transfermarkt, source in PK). Pointwise off-field fact — a career-long
     # timeline with no season key → unpartitioned (None), like fct_team_elo.
     ('fct_player_market_value', 'dags/sql/gold/fct_player_market_value.sql',
-     'fct_player_market_value', None),
+     'fct_player_market_value_legacy', None),
     # issue #427: unified per-event match chronicle (goals/cards/subs in ONE
     # timeline, PK (match_id, event_seq)). silver.fbref_match_events primary
     # + silver.whoscored_events_spadl per-match fallback. Runs in s3 — after g2c,
@@ -200,7 +204,7 @@ STAGE_3_FACTS = [
     # silver.transfermarkt_transfers with 'tm_'-prefixed orphan ids (≈18%
     # players, most clubs unresolved). Unpartitioned: ~750 rows APL '2526'.
     ('fct_transfer', 'dags/sql/gold/fct_transfer.sql',
-     'fct_transfer', None),
+     'fct_transfer_legacy_source', None),
     # issue #431: external team-strength ELO from ClubElo. One row per team
     # per date (PK team_id, elo_date). Reads bronze.clubelo_ratings ∪
     # clubelo_ratings_historical + silver.xref_team — no silver ClubElo layer
@@ -279,6 +283,21 @@ def _run_transform(
 ) -> Dict[str, Any]:
     from utils.gold_tasks import run_gold_transform
 
+    if table_name in {
+        'dim_manager_legacy', 'fct_player_market_value_legacy',
+        'fct_transfer_legacy_source',
+    }:
+        ti = _ctx.get('ti')
+        state = (
+            ti.xcom_pull(task_ids='transfermarkt_reader_precondition')
+            if ti is not None else None
+        ) or {}
+        if state.get('legacy_writers_disabled_at') is not None:
+            return {
+                'status': 'legacy_writer_disabled', 'table': table_name,
+                'state_revision': state.get('revision'),
+            }
+
     return run_gold_transform(
         sql_file=sql_file,
         table_name=table_name,
@@ -301,6 +320,166 @@ def _quality(**_ctx) -> Dict[str, Any]:
     return validate_gold_quality()
 
 
+def _tm_reader_precondition(**context) -> Dict[str, Any]:
+    """Gate direct Gold triggers when canonical Transfermarkt readers are v2."""
+    from airflow.exceptions import AirflowException
+
+    conn = tm_v2.connect()
+    cur = conn.cursor()
+    try:
+        state = tm_v2.read_reader_state(cur, allow_missing=True)
+        result = state.to_dict()
+        if state.active_version == 'v2':
+            dag_run = context.get('dag_run')
+            conf = getattr(dag_run, 'conf', None) or {}
+            cycle_id = state.approved_cycle_id
+            model_revision = conf.get('transfermarkt_model_revision')
+            approved_model_revision = state.approved_model_revision
+            if not all((
+                cycle_id,
+                approved_model_revision is not None,
+                state.active_slot,
+            )):
+                raise AirflowException(
+                    'TM v2 state has no complete approved cycle/slot/revision'
+                )
+            if (
+                model_revision is not None
+                and int(model_revision) != approved_model_revision
+            ):
+                raise AirflowException(
+                    'explicit TM model revision differs from approved revision'
+                )
+            model_revision = approved_model_revision
+            explicit_cycle = (
+                conf.get('transfermarkt_parent_cycle_id')
+                or conf.get('transfermarkt_cycle_id')
+            )
+            if explicit_cycle is not None and str(explicit_cycle) != cycle_id:
+                raise AirflowException(
+                    'explicit TM Gold cycle differs from ops-approved cycle'
+                )
+            explicit_slot = conf.get('transfermarkt_active_slot')
+            if explicit_slot is not None and explicit_slot != state.active_slot:
+                raise AirflowException(
+                    'explicit TM active slot differs from ops-approved slot'
+                )
+            if state.approved_scope_set_id:
+                explicit_scope_set = conf.get('transfermarkt_scope_set_id')
+                if (
+                    explicit_scope_set is not None
+                    and str(explicit_scope_set) != state.approved_scope_set_id
+                ):
+                    raise AirflowException(
+                        'explicit TM Gold scope set differs from ops-approved set'
+                    )
+                report = tm_v2.readiness(
+                    cur,
+                    cycle_id,
+                    expected_revision=int(model_revision),
+                    scope_set_id=state.approved_scope_set_id,
+                    parent_cycle_id=cycle_id,
+                    candidate_slot_override=state.active_slot,
+                    require_fresh=False,
+                    require_current_snapshots=False,
+                )
+                result['readiness_scope_set_id'] = state.approved_scope_set_id
+            else:
+                league = state.approved_league
+                season = state.approved_season
+                if not all((league, season is not None)):
+                    raise AirflowException(
+                        'TM v2 state has neither scope-set nor legacy scope evidence'
+                    )
+                report = tm_v2.readiness(
+                    cur,
+                    cycle_id,
+                    league=league,
+                    season=int(season),
+                    expected_revision=int(model_revision),
+                    require_fresh=False,
+                    require_current_snapshots=False,
+                )
+            views = tm_v2.verify_reader_views(
+                cur,
+                expected_version='v2',
+                expected_revision=state.revision,
+                expected_slot=state.active_slot,
+                allow_static_slot=state.cleanup_completed_at is not None,
+            )
+            if not report['ready'] or not views['passed']:
+                raise AirflowException(
+                    f'TM v2 direct Gold precondition failed: '
+                    f'readiness={report} views={views}'
+                )
+            result['readiness_cycle_id'] = cycle_id
+            result['model_revision'] = int(model_revision)
+            result['approved_slot'] = state.active_slot
+        return result
+    finally:
+        cur.close()
+        conn.close()
+
+
+def _tm_reader_postcondition(**context) -> Dict[str, Any]:
+    """Reject a reader revision change during the long sequential Gold run."""
+    ti = context.get('ti')
+    captured = (
+        ti.xcom_pull(task_ids='transfermarkt_reader_precondition')
+        if ti is not None else None
+    )
+    if not captured:
+        raise RuntimeError('Transfermarkt reader precondition XCom is missing')
+    conn = tm_v2.connect()
+    cur = conn.cursor()
+    try:
+        state = tm_v2.assert_reader_revision(cur, int(captured['revision']))
+        if (
+            state.active_version != captured['active_version']
+            or state.active_slot != captured.get('active_slot')
+        ):
+            raise tm_v2.RevisionConflict(
+                'Transfermarkt reader version changed without revision change'
+            )
+        return state.to_dict()
+    finally:
+        cur.close()
+        conn.close()
+
+
+def _tm_legacy_physical_dq(**context) -> Dict[str, Any]:
+    """Keep the physical rollback branch green throughout retention."""
+    ti = context.get('ti')
+    captured = (
+        ti.xcom_pull(task_ids='transfermarkt_reader_precondition')
+        if ti is not None else None
+    ) or {}
+    if captured.get('legacy_writers_disabled_at') is not None:
+        return {'status': 'persistently_disabled', 'passed': True}
+    if not all((
+        captured.get('approved_league'),
+        captured.get('approved_season') is not None,
+    )):
+        return {'status': 'pre_cutover_not_required', 'passed': True}
+    conn = tm_v2.connect()
+    cur = conn.cursor()
+    try:
+        report = tm_v2._rollback_dq_report(
+            cur, league=captured['approved_league'],
+            season=int(captured['approved_season']),
+        )
+    finally:
+        cur.close()
+        conn.close()
+    if not report['passed']:
+        from airflow.exceptions import AirflowException
+        raise AirflowException(
+            f'physical Transfermarkt legacy retention DQ failed: {report}'
+        )
+    report['status'] = 'physical_legacy_ready'
+    return report
+
+
 # ---------------------------------------------------------------------------
 # DAG
 # ---------------------------------------------------------------------------
@@ -309,7 +488,7 @@ with DAG(
     dag_id='dag_transform_fbref_gold',
     default_args=SILVER_ARGS,
     description='Build Gold star schema (dims + narrow facts) from Silver tables',
-    schedule=None,  # Trigger-only (called after Silver)
+    schedule=None,  # Trigger-only (master-owned after Silver/xref/E3)
     start_date=datetime(2026, 4, 1),
     catchup=False,
     tags=['transform', 'fbref', 'gold', 'football', 'trino', 'star-schema'],
@@ -317,6 +496,11 @@ with DAG(
     max_active_tasks=1,  # Sequential — predictable RAM on dev Trino
     doc_md=__doc__,
 ) as dag:
+
+    transfermarkt_reader_precondition = PythonOperator(
+        task_id='transfermarkt_reader_precondition',
+        python_callable=_tm_reader_precondition,
+    )
 
     # Inline-rendered dims: import the renderer registry inside the DAG body
     # (NOT at module top) so DAG parse stays cheap for unrelated DAGs in the
@@ -412,5 +596,17 @@ with DAG(
         python_callable=_quality,
     )
 
-    (g2a >> g2b >> g2c >> g2d >> g3
-     >> validate_row_counts >> validate_quality)
+    transfermarkt_reader_postcondition = PythonOperator(
+        task_id='transfermarkt_reader_postcondition',
+        python_callable=_tm_reader_postcondition,
+    )
+
+    transfermarkt_legacy_physical_dq = PythonOperator(
+        task_id='transfermarkt_legacy_physical_dq',
+        python_callable=_tm_legacy_physical_dq,
+    )
+
+    (transfermarkt_reader_precondition >> g2a >> g2b >> g2c >> g2d >> g3
+     >> validate_row_counts >> validate_quality
+     >> transfermarkt_legacy_physical_dq
+     >> transfermarkt_reader_postcondition)

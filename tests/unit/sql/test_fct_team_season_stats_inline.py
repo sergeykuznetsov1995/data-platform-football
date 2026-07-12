@@ -345,32 +345,23 @@ class TestAuditDiffCoverage:
 
 
 @pytest.mark.unit
-class TestXrefTmDedup:
-    """#814: canonical-keyed мост xref_tm обязан схлопываться до 1 строки на
-    (canonical_id, league, season). silver.xref_team несёт 2 transfermarkt-
-    алиаса на canonical в сезоне (напр. 'Liverpool'/'Liverpool FC',
-    'Sheff Utd'/'Sheffield United') → SELECT DISTINCT по source_id оставляет оба,
-    и LEFT JOIN xref_tm двоит грейн (team_id,league,season) ×2 (18 дублей,
-    всплывших при пересборке #712). GROUP BY — структурный guard от регресса."""
+class TestTransfermarktTeamSeasonReader:
+    """TM finance must use the routed as-of team-season contract directly."""
 
-    def test_xref_tm_grouped_one_row_per_canonical_season(self):
-        tree = sqlglot.parse_one(_main_body(), read="trino")
-        cte = next((c for c in tree.find_all(sqlglot.exp.CTE)
-                    if c.alias_or_name == "xref_tm"), None)
-        assert cte is not None, "xref_tm CTE отсутствует в fct_team_season_stats"
-        group = cte.this.args.get("group")
-        assert group is not None, (
-            "xref_tm без GROUP BY → 2 TM-алиаса на canonical двоят грейн "
-            "fct_team_season_stats (#814). Сворачивай через MAX+GROUP BY."
+    def test_reads_state_selected_canonical_team_season_relation(self):
+        body = _main_body()
+        tree = sqlglot.parse_one(body, read="trino")
+        assert any(
+            table.sql(dialect="trino").lower()
+            == "iceberg.gold.transfermarkt_team_season_market_value"
+            for table in tree.find_all(sqlglot.exp.Table)
         )
-        group_cols = {e.sql(dialect="trino") for e in group.expressions}
-        assert {"canonical_id", "league", "season"} <= group_cols, (
-            f"xref_tm GROUP BY должен включать (canonical_id, league, season), "
-            f"получено {sorted(group_cols)}"
+        assert not any(
+            cte.alias_or_name == "xref_tm"
+            for cte in tree.find_all(sqlglot.exp.CTE)
         )
-        # tm_club_name берётся агрегатом (MAX), а не сырым source_id.
-        tm_expr = _cte_proj_map(_main_body(), "xref_tm")["tm_club_name"]
-        assert "MAX(" in tm_expr.upper(), (
-            f"tm_club_name должен агрегироваться (MAX) для дедупа, получено "
-            f"{tm_expr!r}"
-        )
+        normalised = " ".join(body.lower().split())
+        assert "tmf.team_id = xf.canonical_id" in normalised
+        assert "tmf.league = xf.league" in normalised
+        assert "tmf.season_slug = xf.season_slug" in normalised
+        assert "sum(current_market_value_eur)" not in normalised

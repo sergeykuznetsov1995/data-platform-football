@@ -9,8 +9,11 @@ table:
     История работы («кто когда тренировал какую команду») здесь НЕ хранится —
     она уезжает в gold.fct_manager_stint (#429); прежняя SCD-2 версия этой
     таблицы доступна в git-истории dim_manager.sql. nationality/dob обогащаются
-    из FotMob (текущий сезон) и Transfermarkt (история), приоритет FotMob > TM
-    (#434); тренер, не покрытый ни одним источником, остаётся NULL.
+    из FotMob (текущий сезон) и native global
+    silver.transfermarkt_coach_profiles_v2, приоритет FotMob > TM (#434).
+    Transfermarkt stints остаются отдельным фактом и не смешиваются с
+    match-derived fct_manager_stint; конфликтный source bridge не обогащает
+    canonical manager. Тренер без покрытия остаётся NULL.
   tags:
     - Tier.Gold
     - Domain.Football

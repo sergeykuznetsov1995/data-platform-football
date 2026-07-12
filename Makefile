@@ -306,6 +306,17 @@ om-bootstrap:
 om-cleanup-lineage:
 	@docker compose exec openmetadata-ingestion python /opt/configs/cleanup_lineage.py
 
+# RSA-ключи подписи бот-JWT OpenMetadata (вместо публично известного дефолта
+# образа) — обязательны до публикации meta (#866). См. configs/openmetadata/README.md.
+gen-om-jwt-keys:
+	@bash scripts/gen_om_jwt_keys.sh
+
+# Применить auth-конфиг OM на ЖИВОМ сервере (#866): env недостаточно — OM 1.13
+# хранит конфиг в БД. Значения (OM_AUTH_*, OM_ADMIN_PASSWORD) скрипт читает из
+# .env сам. Сначала прогони с --dry-run (см. configs/openmetadata/README.md).
+om-apply-security-config:
+	@python3 scripts/om_apply_security_config.py
+
 # Tail Superset web logs
 logs-superset:
 	@docker compose logs -f --tail=100 superset
@@ -345,19 +356,3 @@ build-jupyter:
 # Tail JupyterHub logs
 logs-jupyterhub:
 	@docker compose logs -f --tail=100 jupyterhub
-
-# Рендер конфига Headscale из шаблона (PLATFORM_DOMAIN и секрет из .env)
-render-headscale-config:
-	@PLATFORM_DOMAIN=$$(grep '^PLATFORM_DOMAIN=' .env | cut -d= -f2-); \
-	SECRET=$$(grep '^HEADSCALE_OIDC_CLIENT_SECRET=' .env | cut -d= -f2-); \
-	if [ -z "$$PLATFORM_DOMAIN" ] || [ -z "$$SECRET" ]; then \
-		echo "ERROR: PLATFORM_DOMAIN / HEADSCALE_OIDC_CLIENT_SECRET не заданы в .env" >&2; exit 1; \
-	fi; \
-	sed -e "s|__PLATFORM_DOMAIN__|$$PLATFORM_DOMAIN|g" \
-	    -e "s|__HEADSCALE_OIDC_CLIENT_SECRET__|$$SECRET|g" \
-	    configs/headscale/config.yaml.example > configs/headscale/config.yaml && \
-	echo "OK: configs/headscale/config.yaml"
-
-# Tail Headscale logs
-logs-headscale:
-	@docker compose logs -f --tail=100 headscale

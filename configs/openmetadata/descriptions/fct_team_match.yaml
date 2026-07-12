@@ -84,14 +84,12 @@ columns:
     description: Владение мячом, % (FBref).
   - name: passes
     description: |
-      Всего пасов команды. COALESCE(SofaScore → WhoScored). WS-аггрегат NULL
-      для current seasons (#120).
+      Всего пасов команды. COALESCE(SofaScore → WhoScored).
   - name: pass_accuracy_pct
     description: Точность пасов, %. COALESCE(SofaScore → WhoScored).
   - name: touches_in_box
     description: |
-      Касания мяча в штрафной соперника. COALESCE(WhoScored, FotMob) —
-      WS NULL для current seasons (#120), поэтому FotMob закрывает пробел.
+      Касания мяча в штрафной соперника. COALESCE(WhoScored, FotMob).
   - name: deep_completions
     description: |
       Кол-во точных пасов / передач в зону <20м от ворот соперника
@@ -101,13 +99,13 @@ columns:
     description: Passes Per Defensive Action (Understat). Метрика прессинга —
       низкое значение = более интенсивный прессинг (типично 5-15 для топ-команд).
   - name: tackles
-    description: Попытки отбора. COALESCE(SofaScore → WhoScored). WS NULL для current seasons (#120).
+    description: Попытки отбора. COALESCE(SofaScore → WhoScored).
   - name: interceptions
     description: Перехваты. COALESCE(SofaScore → WhoScored).
   - name: clearances
     description: Выносы (FotMob).
   - name: ball_recoveries
-    description: Подборы мяча (WhoScored). NULL для current seasons (#120).
+    description: Подборы мяча (WhoScored); NULL при отсутствии source-метрики.
   # ===== Duels (SofaScore) — доли, % =====
   - name: ground_duels_won_pct
     description: Доля выигранных единоборств на земле, % (SofaScore).
@@ -128,11 +126,11 @@ columns:
   - name: offsides
     description: Офсайды (SofaScore).
   - name: key_passes
-    description: Ключевые пасы (WhoScored). NULL для current seasons (#120).
+    description: Ключевые пасы (WhoScored); NULL при отсутствии source-метрики.
   - name: takeon_att
-    description: Попытки обводки 1v1 (WhoScored). NULL для current seasons (#120).
+    description: Попытки обводки 1v1 (WhoScored); NULL при отсутствии source-метрики.
   - name: takeon_won
-    description: Успешные обводки (WhoScored). NULL для current seasons (#120).
+    description: Успешные обводки (WhoScored); NULL при отсутствии source-метрики.
   - name: big_chances_missed
     description: Big chances missed (FotMob).
   - name: shots_outside_box

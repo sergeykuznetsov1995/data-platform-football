@@ -1,0 +1,12 @@
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.transfermarkt_player_team_season_assignment_v2
+  description: |
+    Deterministic end-of-season club assignment for finance aggregation.
+    Multi-club players resolve via the latest transfer on/before season end;
+    unresolved cases are retained with assignment_status=ambiguous.
+  tags: [Tier.Silver, Domain.Football, PII.Low]
+columns:
+  - name: assignment_status
+    description: single_membership, latest_transfer, or ambiguous.
+  - name: membership_count
+    description: Number of honest club memberships for player-season.

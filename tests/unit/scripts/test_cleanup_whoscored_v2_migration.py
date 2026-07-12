@@ -24,62 +24,85 @@ class _Trino:
         self,
         *,
         artifacts=(),
-        metrics=None,
-        event_mismatch=0,
-        lineup_mismatch=0,
-        preview_mismatch=0,
-        include_deprecated=True,
+        deprecated=(),
+        missing=(),
+        missing_manifest_columns=None,
+        visible_legacy_table=None,
+        manifest_mismatch_table=None,
+        catalog_quarantined=0,
         backup_metrics=None,
+        backup_shortfalls=None,
     ):
         self.objects = {
             cleanup.BRONZE: set(cleanup.REQUIRED_BRONZE_OBJECTS) | set(artifacts),
             cleanup.SILVER: set(cleanup.REQUIRED_SILVER_OBJECTS),
         }
-        if include_deprecated:
-            self.objects[cleanup.BRONZE].add(cleanup.DEPRECATED_ACTIVE_TABLE)
-        self.metrics = metrics or (
-            10,
-            10,
-            100,
-            100,
-            20,
-            20,
-            0,
-            0,
-            0,
-            6,
-            12,
-            12,
-            8,
-            8,
-        )
-        self.event_mismatch = event_mismatch
-        self.lineup_mismatch = lineup_mismatch
-        self.preview_mismatch = preview_mismatch
+        self.objects[cleanup.BRONZE].update(deprecated)
+        for qualified in missing:
+            schema, table = qualified.split(".", 1)
+            self.objects[schema].discard(table)
+        self.columns = {
+            table: set(required)
+            for table, required in {
+                **cleanup.BUSINESS_REQUIRED_COLUMNS,
+                **cleanup.MANIFEST_REQUIRED_COLUMNS,
+            }.items()
+        }
+        for table, columns in (missing_manifest_columns or {}).items():
+            self.columns[table] -= set(columns)
+        self.visible_legacy_table = visible_legacy_table
+        self.manifest_mismatch_table = manifest_mismatch_table
+        self.catalog_quarantined = catalog_quarantined
         self.backup_metrics = backup_metrics or {}
+        self.backup_shortfalls = backup_shortfalls or {}
         self.executed: list[str] = []
-        self.query_count = 0
-        self.last_queries: list[str] = []
+        self.queries: list[str] = []
 
     def table_exists(self, schema, table):
         return table in self.objects.get(schema, set())
 
+    def get_table_columns(self, schema, table):
+        return self.columns.get(table, set())
+
     def execute_query(self, sql):
         compact = " ".join(sql.split())
-        self.last_queries.append(compact)
+        self.queries.append(compact)
+        if "iceberg.information_schema.tables" in compact:
+            return [
+                (table,)
+                for table in sorted(self.objects[cleanup.BRONZE])
+                if "_legacy_" in table and cleanup._LEGACY_BACKUP_RE.fullmatch(table)
+            ]
         for backup, metrics in self.backup_metrics.items():
-            if backup in compact:
+            if f"iceberg.bronze.{backup}" in compact:
+                if "COALESCE(a.row_count, 0) < b.row_count" in compact:
+                    return [(self.backup_shortfalls.get(backup, 0),)]
                 return [metrics]
-        self.query_count += 1
-        if self.query_count == 1:
-            return [self.metrics]
-        if self.query_count == 2:
-            return [(self.event_mismatch,)]
-        if self.query_count == 3:
-            return [(self.lineup_mismatch,)]
-        if self.query_count == 4:
-            return [(self.preview_mismatch,)]
-        raise AssertionError(f"unexpected query: {sql}")
+        if "m.competitions_count" in compact:
+            return [(10, 10, 20, 20, 30, 30, self.catalog_quarantined)]
+        if "SUM(latest.participations_count)" in compact:
+            return [(40, 40, 0)]
+        if "SELECT (SELECT COUNT(*) FROM" in compact:
+            return [(10, 10, 100, 100, 20, 20, 0, 0, 0, 6, 12, 12, 8, 8)]
+        if "COALESCE(e.row_count, 0) <> m.events_count" in compact:
+            return [(0,)]
+        if "COALESCE(l.row_count, 0) <> m.lineups_count" in compact:
+            return [(0,)]
+        if "COALESCE(p.row_count, 0) <> m.missing_players_count" in compact:
+            return [(0,)]
+        if "json_extract_scalar" in compact:
+            mismatch = int(
+                self.manifest_mismatch_table is not None
+                and f"iceberg.bronze.{self.manifest_mismatch_table}_current" in compact
+            )
+            return [(mismatch,)]
+        if compact.startswith("SELECT COUNT(*) FROM"):
+            legacy = int(
+                self.visible_legacy_table is not None
+                and f"iceberg.bronze.{self.visible_legacy_table}_current" in compact
+            )
+            return [(legacy,)]
+        raise AssertionError(f"unexpected query: {compact}")
 
     def _execute(self, sql):
         compact = " ".join(sql.split())
@@ -90,260 +113,144 @@ class _Trino:
 
 
 @pytest.mark.unit
-def test_suffix_and_confirmation_are_exactly_allowlisted():
-    assert cleanup.confirmation_token("20260710v2") == (
-        "drop-whoscored-migration-artifacts:20260710v2"
+def test_suffix_is_dynamic_but_strictly_identifier_safe():
+    assert cleanup.confirmation_token("20260711run3") == (
+        "drop-whoscored-migration-artifacts:20260711run3"
     )
-    assert cleanup.confirmation_token("20260710v2r2") == (
-        "drop-whoscored-migration-artifacts:20260710v2r2"
-    )
-    for unsafe in (
-        "20260710",
-        "20260710r2",
-        "20260710v2_extra",
-        "20260710v2;DROP",
-    ):
-        with pytest.raises(ValueError, match="not allowlisted"):
+    for unsafe in ("", "run-3", "run/3", "run3;DROP", "run3 space"):
+        with pytest.raises(ValueError, match="unsafe cleanup suffix"):
             cleanup.artifact_names(unsafe)
 
 
 @pytest.mark.unit
-def test_artifact_allowlist_contains_only_exact_migration_names():
-    names = cleanup.artifact_names("20260710v2")
+def test_artifact_names_cover_legacy_and_every_rollback_state_table():
+    names = cleanup.artifact_names("run3")
 
-    assert len(names) == 22
-    assert len(set(names)) == len(names)
-    assert "whoscored_events_legacy_20260710v2" in names
-    assert "whoscored_events_v2_20260710v2" in names
-    assert "whoscored_events_v2_failed_20260710v2" in names
-    assert "whoscored_match_ingest_manifest_v2_failed_20260710v2" in names
-    assert "whoscored_preview_ingest_manifest_v2_failed_20260710v2" in names
+    assert len(names) == 3 * len(cleanup.MIGRATED_TABLES) + len(cleanup.V2_STATE_TABLES)
+    assert len(names) == len(set(names))
+    assert "whoscored_events_legacy_run3" in names
+    assert "whoscored_catalog_manifest_v2_failed_run3" in names
+    assert "whoscored_scope_ingest_manifest_v2_failed_run3" in names
+    assert "whoscored_player_stage_participations_v2_failed_run3" in names
     assert not (set(names) & cleanup.REQUIRED_BRONZE_OBJECTS)
 
 
 @pytest.mark.unit
-def test_default_mode_is_a_non_mutating_dry_run(capsys):
-    artifact = "whoscored_events_legacy_20260710v2"
-    trino = _Trino(artifacts={artifact})
+def test_complete_25_table_object_and_data_contract_passes():
+    trino = _Trino()
 
-    assert cleanup.main(["--suffix", "20260710v2"], trino=trino) == 0
+    result = cleanup.inspect_current_state(trino)
+
+    assert result["passed"] is True
+    assert result["business_table_count"] == 25
+    assert len(result["datasets"]) == 25
+    assert not result["errors"]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "missing",
+    [
+        "bronze.whoscored_catalog_manifest",
+        "bronze.whoscored_scope_ingest_latest_success",
+        "bronze.whoscored_team_match_stats_current",
+        "bronze.whoscored_preview_sections_current",
+        "silver.whoscored_player_profile_current",
+    ],
+)
+def test_any_missing_contract_object_blocks_cleanup(missing):
+    result = cleanup.inspect_current_state(_Trino(missing={missing}))
+
+    assert result["passed"] is False
+    assert missing in result["missing_objects"]
+
+
+@pytest.mark.unit
+def test_missing_manifest_provenance_column_blocks_cleanup():
+    trino = _Trino(
+        missing_manifest_columns={
+            "whoscored_scope_ingest_manifest": {"dataset_states_json"}
+        }
+    )
+
+    result = cleanup.inspect_current_state(trino)
+
+    assert result["passed"] is False
+    assert result["missing_commit_columns"] == {
+        "whoscored_scope_ingest_manifest": ["dataset_states_json"]
+    }
+
+
+@pytest.mark.unit
+def test_visible_scope_legacy_bridge_blocks_cutover():
+    result = cleanup.inspect_current_state(
+        _Trino(visible_legacy_table="whoscored_schedule")
+    )
+
+    assert result["passed"] is False
+    assert (
+        "whoscored_schedule_current still exposes legacy fallback rows"
+        in result["errors"]
+    )
+
+
+@pytest.mark.unit
+def test_any_of_the_19_dataset_manifest_mismatches_blocks_cutover():
+    result = cleanup.inspect_current_state(
+        _Trino(manifest_mismatch_table="whoscored_team_match_stats")
+    )
+
+    assert result["passed"] is False
+    assert (
+        "whoscored_team_match_stats_current counts differ from its manifest"
+        in result["errors"]
+    )
+
+
+@pytest.mark.unit
+def test_catalog_quarantine_blocks_cutover():
+    result = cleanup.inspect_current_state(_Trino(catalog_quarantined=2))
+
+    assert result["passed"] is False
+    assert "catalog contains quarantined discoveries" in result["errors"]
+
+
+@pytest.mark.unit
+def test_default_mode_is_non_mutating_dry_run(capsys):
+    trino = _Trino()
+
+    assert cleanup.main(["--suffix", "run3"], trino=trino) == 0
 
     assert trino.executed == []
     output = capsys.readouterr().out
     assert '"mode": "dry-run"' in output
     assert '"status": "ready"' in output
-    assert artifact in output
 
 
 @pytest.mark.unit
-def test_apply_requires_the_suffix_bound_confirmation_before_connecting():
-    with pytest.raises(SystemExit, match="drop-whoscored-migration-artifacts"):
+def test_apply_requires_suffix_bound_confirmation_before_connecting():
+    with pytest.raises(SystemExit, match="drop-whoscored-migration-artifacts:run3"):
         cleanup.main(
-            ["--suffix", "20260710v2", "--apply", "--confirm", "wrong"],
+            ["--suffix", "run3", "--apply", "--confirm", "wrong"],
             trino=MagicMock(),
         )
 
 
 @pytest.mark.unit
-def test_missing_current_view_blocks_cleanup_without_drop(capsys):
-    artifact = "whoscored_events_legacy_20260710v2"
-    trino = _Trino(artifacts={artifact})
-    trino.objects[cleanup.BRONZE].remove("whoscored_events_current")
-
-    result = cleanup.main(
-        [
-            "--suffix",
-            "20260710v2",
-            "--apply",
-            "--confirm",
-            cleanup.confirmation_token("20260710v2"),
-        ],
-        trino=trino,
-    )
-
-    assert result == 2
-    assert trino.executed == []
-    assert '"status": "blocked"' in capsys.readouterr().out
-
-
-@pytest.mark.unit
-@pytest.mark.parametrize(
-    "missing_object",
-    [
-        "whoscored_preview_ingest_manifest",
-        "whoscored_preview_ingest_latest",
-        "whoscored_preview_ingest_latest_success",
-        "whoscored_missing_players_current",
-    ],
-)
-def test_strict_preview_objects_are_required(missing_object, capsys):
-    trino = _Trino()
-    trino.objects[cleanup.BRONZE].remove(missing_object)
-
-    assert cleanup.main(["--suffix", "20260710v2"], trino=trino) == 2
-
-    assert trino.executed == []
-    assert missing_object in capsys.readouterr().out
-
-
-@pytest.mark.unit
-def test_manifest_current_count_mismatch_blocks_cleanup(capsys):
-    artifact = "whoscored_events_legacy_20260710v2"
+def test_apply_drops_only_exact_artifacts_then_deprecated_active_tables(capsys):
+    artifact = "whoscored_events_v2_failed_run3"
     trino = _Trino(
         artifacts={artifact},
-        metrics=(10, 10, 101, 100, 20, 20, 0, 0, 0, 6, 12, 12, 8, 8),
+        deprecated=set(cleanup.DEPRECATED_ACTIVE_TABLES),
     )
 
     result = cleanup.main(
         [
             "--suffix",
-            "20260710v2",
+            "run3",
             "--apply",
             "--confirm",
-            cleanup.confirmation_token("20260710v2"),
-        ],
-        trino=trino,
-    )
-
-    assert result == 2
-    assert trino.executed == []
-    assert "manifest/current event row counts differ" in capsys.readouterr().out
-
-
-@pytest.mark.unit
-@pytest.mark.parametrize(
-    ("metric_index", "expected_error"),
-    [
-        (6, "physical events still contain rows without a V2 batch id"),
-        (7, "physical lineups still contain rows without a V2 batch id"),
-        (8, "physical previews still contain rows without a preview batch id"),
-    ],
-)
-def test_physical_null_batch_rows_block_cleanup(metric_index, expected_error, capsys):
-    metrics = [10, 10, 100, 100, 20, 20, 0, 0, 0, 6, 12, 12, 8, 8]
-    metrics[metric_index] = 1
-    trino = _Trino(metrics=tuple(metrics))
-
-    result = cleanup.main(["--suffix", "20260710v2"], trino=trino)
-
-    assert result == 2
-    assert trino.executed == []
-    assert expected_error in capsys.readouterr().out
-
-
-@pytest.mark.unit
-def test_null_batch_guard_scans_physical_tables_not_current_views(capsys):
-    trino = _Trino()
-
-    assert cleanup.main(["--suffix", "20260710v2"], trino=trino) == 0
-
-    count_sql = trino.last_queries[0]
-    assert (
-        "FROM iceberg.bronze.whoscored_events WHERE _game_batch_id IS NULL" in count_sql
-    )
-    assert (
-        "FROM iceberg.bronze.whoscored_lineups WHERE _game_batch_id IS NULL"
-        in count_sql
-    )
-    assert (
-        "FROM iceberg.bronze.whoscored_missing_players WHERE _preview_batch_id IS NULL"
-    ) in count_sql
-    assert (
-        "FROM iceberg.bronze.whoscored_events_current WHERE _game_batch_id IS NULL"
-    ) not in count_sql
-    capsys.readouterr()
-
-
-@pytest.mark.unit
-def test_preview_manifest_sum_must_match_current_rows(capsys):
-    trino = _Trino(metrics=(10, 10, 100, 100, 20, 20, 0, 0, 0, 6, 13, 12, 8, 8))
-
-    assert cleanup.main(["--suffix", "20260710v2"], trino=trino) == 2
-
-    assert trino.executed == []
-    assert "manifest/current preview row counts differ" in capsys.readouterr().out
-
-
-@pytest.mark.unit
-def test_per_game_preview_guard_includes_zero_row_snapshots(capsys):
-    trino = _Trino(preview_mismatch=1)
-
-    assert cleanup.main(["--suffix", "20260710v2"], trino=trino) == 2
-
-    preview_sql = trino.last_queries[3]
-    assert "LEFT JOIN" in preview_sql
-    assert "COALESCE(p.row_count, 0) <> m.missing_players_count" in preview_sql
-    assert "per-game preview counts differ from the manifest" in capsys.readouterr().out
-
-
-@pytest.mark.unit
-def test_apply_drops_only_discovered_exact_names(capsys):
-    artifacts = {
-        "whoscored_events_legacy_20260710v2",
-        "whoscored_lineups_v2_failed_20260710v2",
-    }
-    trino = _Trino(artifacts=artifacts)
-
-    result = cleanup.main(
-        [
-            "--suffix",
-            "20260710v2",
-            "--apply",
-            "--confirm",
-            cleanup.confirmation_token("20260710v2"),
-        ],
-        trino=trino,
-    )
-
-    assert result == 0
-    assert set(trino.executed) == {
-        f"DROP TABLE iceberg.bronze.{table}" for table in artifacts
-    }
-    assert not (artifacts & trino.objects[cleanup.BRONZE])
-    assert cleanup.DEPRECATED_ACTIVE_TABLE in trino.objects[cleanup.BRONZE]
-    assert '"status": "success"' in capsys.readouterr().out
-
-
-@pytest.mark.unit
-def test_drop_api_rejects_active_or_unknown_table_names():
-    trino = _Trino()
-
-    with pytest.raises(ValueError, match="non-artifact"):
-        cleanup.drop_artifacts(
-            trino,
-            "20260710v2",
-            ["whoscored_events"],
-        )
-
-    assert trino.executed == []
-
-
-@pytest.mark.unit
-def test_qualified_names_are_bound_to_the_exact_schema():
-    assert (
-        cleanup._qualified(cleanup.SILVER, "whoscored_player_profile_current")
-        == "iceberg.silver.whoscored_player_profile_current"
-    )
-
-    with pytest.raises(ValueError, match="bronze.whoscored_player_profile_current"):
-        cleanup._qualified(
-            cleanup.BRONZE,
-            "whoscored_player_profile_current",
-        )
-
-
-@pytest.mark.unit
-def test_final_r2_apply_drops_deprecated_active_profile_after_artifacts(capsys):
-    artifact = "whoscored_player_profile_legacy_20260710v2r2"
-    trino = _Trino(artifacts={artifact})
-
-    result = cleanup.main(
-        [
-            "--suffix",
-            "20260710v2r2",
-            "--apply",
-            "--confirm",
-            cleanup.confirmation_token("20260710v2r2"),
+            cleanup.confirmation_token("run3"),
         ],
         trino=trino,
     )
@@ -351,303 +258,122 @@ def test_final_r2_apply_drops_deprecated_active_profile_after_artifacts(capsys):
     assert result == 0
     assert trino.executed == [
         f"DROP TABLE iceberg.bronze.{artifact}",
+        "DROP TABLE iceberg.bronze.whoscored_season_stages",
         "DROP TABLE iceberg.bronze.whoscored_player_profile",
+        "DROP TABLE iceberg.bronze.whoscored_player_assist_pairs",
     ]
-    output = capsys.readouterr().out
-    assert '"dropped_deprecated_active": [' in output
-    assert '"whoscored_player_profile"' in output
+    assert '"status": "success"' in capsys.readouterr().out
 
 
 @pytest.mark.unit
-def test_final_r2_active_profile_cleanup_is_idempotent(capsys):
-    trino = _Trino(include_deprecated=False)
+def test_authoritative_backup_requires_key_subset_of_manifest_current():
+    backup = "whoscored_schedule_legacy_run3"
+    trino = _Trino(artifacts={backup}, backup_metrics={backup: (0, 0, 2, 1)})
 
-    result = cleanup.main(
-        [
-            "--suffix",
-            "20260710v2r2",
-            "--apply",
-            "--confirm",
-            cleanup.confirmation_token("20260710v2r2"),
-        ],
-        trino=trino,
+    result = cleanup.inspect_authoritative_backup_keys(trino, "run3", [backup])
+
+    assert result["passed"] is False
+    assert "backup contains keys missing from active" in result["errors"][0]
+    query = next(query for query in trino.queries if backup in query)
+    assert "iceberg.bronze.whoscored_schedule_current" in query
+    assert "EXCEPT" in query
+
+
+@pytest.mark.unit
+def test_event_backup_row_count_shortfall_blocks_cleanup():
+    backup = "whoscored_events_legacy_run3"
+    trino = _Trino(
+        artifacts={backup},
+        backup_metrics={backup: (0, 0, 0, 0)},
+        backup_shortfalls={backup: 2},
     )
 
-    assert result == 0
-    assert trino.executed == []
-    assert '"dropped_deprecated_active": []' in capsys.readouterr().out
+    result = cleanup.inspect_authoritative_backup_keys(trino, "run3", [backup])
+
+    assert result["passed"] is False
+    assert result["checked"][backup]["row_count_shortfalls"] == 2
+    assert "current rows are fewer than legacy rows" in result["errors"][0]
 
 
 @pytest.mark.unit
-def test_blocked_final_r2_never_drops_deprecated_active_profile(capsys):
-    trino = _Trino(preview_mismatch=1)
+def test_authoritative_backup_active_growth_is_allowed_and_dropped():
+    backup = "whoscored_schedule_legacy_run3"
+    trino = _Trino(artifacts={backup}, backup_metrics={backup: (0, 0, 2, 0)})
 
-    result = cleanup.main(
-        [
-            "--suffix",
-            "20260710v2r2",
-            "--apply",
-            "--confirm",
-            cleanup.confirmation_token("20260710v2r2"),
-        ],
-        trino=trino,
+    assert cleanup.drop_artifacts(trino, "run3", [backup]) == [backup]
+    assert backup not in trino.objects[cleanup.BRONZE]
+
+
+@pytest.mark.unit
+def test_direct_drop_api_rejects_partial_present_backup_set():
+    first = "whoscored_events_legacy_run3"
+    second = "whoscored_schedule_legacy_run3"
+    trino = _Trino(
+        artifacts={first, second},
+        backup_metrics={first: (0, 0, 0, 0), second: (0, 0, 0, 0)},
     )
 
-    assert result == 2
+    with pytest.raises(RuntimeError, match="all present authoritative backups"):
+        cleanup.drop_artifacts(trino, "run3", [first])
+
     assert trino.executed == []
-    assert cleanup.DEPRECATED_ACTIVE_TABLE in trino.objects[cleanup.BRONZE]
-    assert '"status": "blocked"' in capsys.readouterr().out
 
 
 @pytest.mark.unit
-def test_first_suffix_cannot_drop_deprecated_active_via_direct_api():
+def test_drop_api_rejects_active_unknown_or_duplicate_names():
     trino = _Trino()
 
-    with pytest.raises(ValueError, match="non-deprecated active"):
-        cleanup.drop_deprecated_active(
+    with pytest.raises(ValueError, match="non-artifact"):
+        cleanup.drop_artifacts(trino, "run3", ["whoscored_events"])
+    with pytest.raises(ValueError, match="duplicate"):
+        cleanup.drop_artifacts(
             trino,
-            "20260710v2",
-            [cleanup.DEPRECATED_ACTIVE_TABLE],
+            "run3",
+            ["whoscored_events_v2_run3", "whoscored_events_v2_run3"],
         )
-
     assert trino.executed == []
 
 
 @pytest.mark.unit
-def test_deprecated_active_direct_api_cannot_bypass_r2_backup_pair():
-    backups = set(cleanup.AUTHORITATIVE_R2_BACKUPS)
-    trino = _Trino(artifacts=backups)
+def test_deprecated_active_drop_cannot_bypass_remaining_backup():
+    backup = "whoscored_player_profile_legacy_run3"
+    trino = _Trino(artifacts={backup}, deprecated={"whoscored_player_profile"})
 
-    with pytest.raises(RuntimeError, match="authoritative backup guard failed"):
-        cleanup.drop_deprecated_active(
-            trino,
-            "20260710v2r2",
-            [cleanup.DEPRECATED_ACTIVE_TABLE],
-        )
-
+    with pytest.raises(RuntimeError, match="backups must be removed"):
+        cleanup.drop_deprecated_active(trino, "run3", ["whoscored_player_profile"])
     assert trino.executed == []
-    assert cleanup.DEPRECATED_ACTIVE_TABLE in trino.objects[cleanup.BRONZE]
 
 
 @pytest.mark.unit
-def test_r2_authoritative_backups_require_backup_subset_of_active(capsys):
-    schedule_backup = "whoscored_schedule_legacy_20260710v2r2"
-    stages_backup = "whoscored_season_stages_legacy_20260710v2r2"
-    trino = _Trino(
-        artifacts={schedule_backup, stages_backup},
-        backup_metrics={
-            schedule_backup: (0, 0, 0, 0),
-            stages_backup: (0, 0, 0, 0),
-        },
-    )
+def test_wrong_suffix_cannot_bypass_backup_bound_to_another_run(capsys):
+    backup = "whoscored_player_profile_legacy_run3"
+    trino = _Trino(artifacts={backup}, deprecated={"whoscored_player_profile"})
 
-    result = cleanup.main(
-        [
-            "--suffix",
-            "20260710v2r2",
-            "--apply",
-            "--confirm",
-            cleanup.confirmation_token("20260710v2r2"),
-        ],
-        trino=trino,
-    )
-
-    assert result == 0
-    assert trino.executed == [
-        f"DROP TABLE iceberg.bronze.{schedule_backup}",
-        f"DROP TABLE iceberg.bronze.{stages_backup}",
-        "DROP TABLE iceberg.bronze.whoscored_player_profile",
-    ]
-    schedule_sql = next(sql for sql in trino.last_queries if schedule_backup in sql)
-    stages_sql = next(sql for sql in trino.last_queries if stages_backup in sql)
-    assert schedule_sql.count(" EXCEPT ") == 2
-    assert "TRY_CAST(game_id AS BIGINT) AS game_id" in schedule_sql
-    assert stages_sql.count(" EXCEPT ") == 2
-    assert "TRY_CAST(stage_id AS BIGINT) AS stage_id" in stages_sql
-    assert '"status": "success"' in capsys.readouterr().out
-
-
-@pytest.mark.unit
-def test_r2_authoritative_backups_allow_normal_active_growth(capsys):
-    schedule_backup = "whoscored_schedule_legacy_20260710v2r2"
-    stages_backup = "whoscored_season_stages_legacy_20260710v2r2"
-    trino = _Trino(
-        artifacts={schedule_backup, stages_backup},
-        backup_metrics={
-            schedule_backup: (0, 0, 1, 0),
-            stages_backup: (0, 0, 0, 0),
-        },
-    )
-
-    result = cleanup.main(
-        [
-            "--suffix",
-            "20260710v2r2",
-            "--apply",
-            "--confirm",
-            cleanup.confirmation_token("20260710v2r2"),
-        ],
-        trino=trino,
-    )
-
-    assert result == 0
-    assert trino.executed == [
-        f"DROP TABLE iceberg.bronze.{schedule_backup}",
-        f"DROP TABLE iceberg.bronze.{stages_backup}",
-        "DROP TABLE iceberg.bronze.whoscored_player_profile",
-    ]
-    assert '"active_only_keys": 1' in capsys.readouterr().out
-
-
-@pytest.mark.unit
-@pytest.mark.parametrize(
-    "remaining_backup",
-    [
-        "whoscored_schedule_legacy_20260710v2r2",
-        "whoscored_season_stages_legacy_20260710v2r2",
-    ],
-)
-def test_partial_r2_authoritative_backup_set_blocks_every_drop(
-    remaining_backup, capsys
-):
-    trino = _Trino(
-        artifacts={remaining_backup},
-        backup_metrics={remaining_backup: (0, 0, 0, 0)},
-    )
-
-    result = cleanup.main(
-        [
-            "--suffix",
-            "20260710v2r2",
-            "--apply",
-            "--confirm",
-            cleanup.confirmation_token("20260710v2r2"),
-        ],
-        trino=trino,
-    )
+    result = cleanup.main(["--suffix", "run4"], trino=trino)
 
     assert result == 2
     assert trino.executed == []
-    assert remaining_backup in trino.objects[cleanup.BRONZE]
-    assert cleanup.DEPRECATED_ACTIVE_TABLE in trino.objects[cleanup.BRONZE]
-    assert not any(remaining_backup in sql for sql in trino.last_queries)
-    output = capsys.readouterr().out
-    assert '"status": "blocked"' in output
-    assert "authoritative r2 backups are only partially present" in output
+    assert "another migration suffix" in capsys.readouterr().out
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize(
-    ("backup", "metrics", "expected_error"),
-    [
-        (
-            "whoscored_schedule_legacy_20260710v2r2",
-            (1, 0, 0, 0),
-            "null/invalid keys",
-        ),
-        (
-            "whoscored_schedule_legacy_20260710v2r2",
-            (0, 1, 0, 0),
-            "null/invalid keys",
-        ),
-        (
-            "whoscored_season_stages_legacy_20260710v2r2",
-            (0, 0, 0, 2),
-            "backup contains keys missing from active",
-        ),
-    ],
-)
-def test_r2_authoritative_backup_key_gap_blocks_every_drop(
-    backup, metrics, expected_error, capsys
-):
-    backups = set(cleanup.AUTHORITATIVE_R2_BACKUPS)
-    safe_metrics = {name: (0, 0, 0, 0) for name in backups}
-    safe_metrics[backup] = metrics
-    trino = _Trino(artifacts=backups, backup_metrics=safe_metrics)
-
-    result = cleanup.main(
-        [
-            "--suffix",
-            "20260710v2r2",
-            "--apply",
-            "--confirm",
-            cleanup.confirmation_token("20260710v2r2"),
-        ],
-        trino=trino,
+def test_qualified_names_are_schema_and_suffix_bound():
+    assert (
+        cleanup._qualified(cleanup.SILVER, "whoscored_player_profile_current")
+        == "iceberg.silver.whoscored_player_profile_current"
+    )
+    assert (
+        cleanup._qualified(
+            cleanup.BRONZE,
+            "whoscored_events_legacy_run3",
+            artifact_suffix="run3",
+        )
+        == "iceberg.bronze.whoscored_events_legacy_run3"
     )
 
-    assert result == 2
-    assert trino.executed == []
-    assert backup in trino.objects[cleanup.BRONZE]
-    assert cleanup.DEPRECATED_ACTIVE_TABLE in trino.objects[cleanup.BRONZE]
-    assert expected_error in capsys.readouterr().out
-
-
-@pytest.mark.unit
-def test_drop_api_rechecks_r2_authoritative_backup_immediately_before_ddl():
-    backup = "whoscored_schedule_legacy_20260710v2r2"
-    other_backup = "whoscored_season_stages_legacy_20260710v2r2"
-    trino = _Trino(
-        artifacts={backup, other_backup},
-        backup_metrics={
-            backup: (0, 0, 0, 1),
-            other_backup: (0, 0, 0, 0),
-        },
-    )
-
-    with pytest.raises(RuntimeError, match="authoritative backup guard failed"):
-        cleanup.drop_artifacts(trino, "20260710v2r2", [backup, other_backup])
-
-    assert trino.executed == []
-    assert backup in trino.objects[cleanup.BRONZE]
-
-
-@pytest.mark.unit
-def test_drop_api_rejects_authoritative_backup_subset_before_key_queries():
-    backups = set(cleanup.AUTHORITATIVE_R2_BACKUPS)
-    requested = "whoscored_schedule_legacy_20260710v2r2"
-    trino = _Trino(
-        artifacts=backups,
-        backup_metrics={name: (0, 0, 0, 0) for name in backups},
-    )
-
-    with pytest.raises(RuntimeError, match="must be requested together"):
-        cleanup.drop_artifacts(trino, "20260710v2r2", [requested])
-
-    assert trino.executed == []
-    assert not any(requested in sql for sql in trino.last_queries)
-
-
-@pytest.mark.unit
-def test_idempotent_r2_without_artifacts_skips_authoritative_key_queries(capsys):
-    trino = _Trino(include_deprecated=False)
-
-    assert cleanup.main(["--suffix", "20260710v2r2"], trino=trino) == 0
-
-    assert len(trino.last_queries) == 4
-    assert not any("_legacy_20260710v2r2" in sql for sql in trino.last_queries)
-    assert '"checked": {}' in capsys.readouterr().out
-
-
-@pytest.mark.unit
-def test_v2_cleanup_never_deletes_authoritative_r2_backup(capsys):
-    v2_artifact = "whoscored_events_v2_failed_20260710v2"
-    r2_backup = "whoscored_schedule_legacy_20260710v2r2"
-    trino = _Trino(artifacts={v2_artifact, r2_backup})
-
-    result = cleanup.main(
-        [
-            "--suffix",
-            "20260710v2",
-            "--apply",
-            "--confirm",
-            cleanup.confirmation_token("20260710v2"),
-        ],
-        trino=trino,
-    )
-
-    assert result == 0
-    assert trino.executed == [f"DROP TABLE iceberg.bronze.{v2_artifact}"]
-    assert r2_backup in trino.objects[cleanup.BRONZE]
-    assert cleanup.DEPRECATED_ACTIVE_TABLE in trino.objects[cleanup.BRONZE]
-    assert '"status": "success"' in capsys.readouterr().out
+    with pytest.raises(ValueError, match="outside"):
+        cleanup._qualified(
+            cleanup.BRONZE,
+            "whoscored_events_legacy_other",
+            artifact_suffix="run3",
+        )

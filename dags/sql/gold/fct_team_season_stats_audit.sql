@@ -96,13 +96,13 @@ ws_name_to_id AS (
     SELECT DISTINCT CAST(CAST(home_team_id AS BIGINT) AS varchar) AS ws_team_id,
                     home_team                                     AS ws_team_name,
                     league, season
-    FROM iceberg.bronze.whoscored_schedule
+    FROM iceberg.bronze.whoscored_schedule_current
     WHERE home_team_id IS NOT NULL
     UNION
     SELECT DISTINCT CAST(CAST(away_team_id AS BIGINT) AS varchar) AS ws_team_id,
                     away_team                                     AS ws_team_name,
                     league, season
-    FROM iceberg.bronze.whoscored_schedule
+    FROM iceberg.bronze.whoscored_schedule_current
     WHERE away_team_id IS NOT NULL
 ),
 

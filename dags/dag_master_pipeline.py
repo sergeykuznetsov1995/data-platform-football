@@ -25,6 +25,7 @@ from airflow.utils.task_group import TaskGroup
 
 from utils.config import SCHEDULES, DAG_TAGS
 from utils.default_args import DEFAULT_ARGS
+from utils import transfermarkt_native_v2 as tm_v2
 
 
 # List of ingestion DAGs in execution order
@@ -39,12 +40,109 @@ INGESTION_DAGS = [
     'dag_ingest_clubelo',
 ]
 
+# A failed optional source may still be reported as degraded without blocking
+# the historical master pipeline. WhoScored feeds xref/E3 event facts, while
+# FotMob publishes a strict source-native completeness manifest. Publishing
+# downstream from a failed or partial required source would mix generations.
+REQUIRED_SOURCE_TASKS = {
+    'dag_ingest_fotmob': 'ingestion_triggers.trigger_fotmob',
+    'dag_ingest_whoscored': 'ingestion_triggers.trigger_whoscored',
+}
+
+# Publication children whose failure must make the current master DagRun fail.
+# These form the Bronze -> source Silver -> xref/E3 -> Gold path; accepting a
+# failed child as a successful trigger would publish a mixed generation and let
+# the terminal report turn green despite failed DQ.
+REQUIRED_PUBLICATION_TASKS = {
+    'dag_transform_fbref_silver': 'trigger_fbref_silver',
+    'dag_transform_xref': 'trigger_silver_xref',
+    'dag_transform_e3': 'trigger_e3_transforms',
+    'dag_transform_fbref_gold': 'trigger_fbref_gold',
+}
+
 # Extended default args for master pipeline
 MASTER_ARGS = {
     **DEFAULT_ARGS,
     'execution_timeout': timedelta(hours=12),  # Long timeout for full pipeline
     'retries': 1,
 }
+
+
+def enforce_required_source_success(**context) -> Dict[str, str]:
+    """Fail unless every required source trigger completed successfully.
+
+    The check deliberately reads task instances from *this* master DagRun.
+    Looking up the latest child DagRun is racy because a separately scheduled
+    child run can finish while the master is still executing. The
+    TriggerDagRunOperator is configured to fail when its WhoScored child fails,
+    so its task-instance state is the exact publication evidence we need.
+    """
+    from airflow.exceptions import AirflowException
+
+    dag_run = context.get('dag_run')
+    if dag_run is None:
+        raise AirflowException('required-source gate has no current DagRun')
+
+    task_states = {}
+    for task_instance in dag_run.get_task_instances():
+        state = getattr(task_instance.state, 'value', task_instance.state)
+        task_states[task_instance.task_id] = (
+            str(state or 'none').lower().split('.')[-1]
+        )
+
+    required_states = {
+        dag_id: task_states.get(task_id, 'missing')
+        for dag_id, task_id in REQUIRED_SOURCE_TASKS.items()
+    }
+    invalid = {
+        dag_id: state
+        for dag_id, state in required_states.items()
+        if state != 'success'
+    }
+    if invalid:
+        details = ', '.join(
+            f'{dag_id}={state}' for dag_id, state in sorted(invalid.items())
+        )
+        raise AirflowException(
+            'Required ingestion source did not publish a complete successful '
+            f'run; downstream transforms are blocked: {details}'
+        )
+    return required_states
+
+
+def enforce_required_publication_success(**context) -> Dict[str, str]:
+    """Fail unless the current master's required transform triggers succeeded."""
+    from airflow.exceptions import AirflowException
+
+    dag_run = context.get('dag_run')
+    if dag_run is None:
+        raise AirflowException('required-publication gate has no current DagRun')
+
+    task_states = {}
+    for task_instance in dag_run.get_task_instances():
+        state = getattr(task_instance.state, 'value', task_instance.state)
+        task_states[task_instance.task_id] = (
+            str(state or 'none').lower().split('.')[-1]
+        )
+
+    required_states = {
+        dag_id: task_states.get(task_id, 'missing')
+        for dag_id, task_id in REQUIRED_PUBLICATION_TASKS.items()
+    }
+    invalid = {
+        dag_id: state
+        for dag_id, state in required_states.items()
+        if state != 'success'
+    }
+    if invalid:
+        details = ', '.join(
+            f'{dag_id}={state}' for dag_id, state in sorted(invalid.items())
+        )
+        raise AirflowException(
+            'Required publication transform did not complete successfully; '
+            f'the master cannot report a published generation: {details}'
+        )
+    return required_states
 
 
 def check_pipeline_success(**context) -> Dict[str, Any]:
@@ -55,6 +153,13 @@ def check_pipeline_success(**context) -> Dict[str, Any]:
         Pipeline status summary
     """
     import logging
+
+    # This second check is intentional. The pre-transform gate prevents
+    # publication, while the terminal check prevents an ``all_done`` summary
+    # task from turning the master DagRun green after that gate failed.
+    required_source_states = enforce_required_source_success(**context)
+    required_publication_states = enforce_required_publication_success(**context)
+
     from airflow.models import DagRun
     from airflow.utils.state import State
 
@@ -62,6 +167,8 @@ def check_pipeline_success(**context) -> Dict[str, Any]:
 
     results = {
         'status': 'success',
+        'required_source_states': required_source_states,
+        'required_publication_states': required_publication_states,
         'dag_statuses': {},
         'failed_dags': [],
         'successful_dags': [],
@@ -100,6 +207,70 @@ def check_pipeline_success(**context) -> Dict[str, Any]:
         logger.warning(f"Failed DAGs: {results['failed_dags']}")
 
     return results
+
+
+def _transfermarkt_gold_gate(**context) -> Dict[str, Any]:
+    """Block Gold when the currently routed native scope set is no longer ready."""
+    from airflow.exceptions import AirflowException
+
+    conn = tm_v2.connect()
+    cur = conn.cursor()
+    try:
+        state = tm_v2.read_reader_state(cur, allow_missing=True)
+        result = state.to_dict()
+        if state.active_version != 'v2':
+            result['status'] = 'legacy_soft_gate'
+            return result
+        if not all((
+            state.approved_cycle_id,
+            state.approved_scope_set_id,
+            state.approved_model_revision is not None,
+            state.active_slot,
+        )):
+            raise AirflowException(
+                'active TM v2 reader has incomplete scope-set evidence'
+            )
+        marker = tm_v2.readiness(
+            cur,
+            str(state.approved_cycle_id),
+            expected_revision=int(state.approved_model_revision),
+            scope_set_id=str(state.approved_scope_set_id),
+            parent_cycle_id=str(state.approved_cycle_id),
+            candidate_slot_override=str(state.active_slot),
+            require_fresh=False,
+            require_current_snapshots=False,
+        )
+        if (
+            marker.get('scope_set_id') != state.approved_scope_set_id
+            or marker.get('candidate_slot') != state.active_slot
+            or int(marker.get('expected_state_revision', -1))
+            != int(state.approved_model_revision)
+            or not marker.get('ready')
+        ):
+            raise AirflowException(
+                'active TM v2 scope-set readiness does not match the approved '
+                f'cycle/slot/revision: {marker}'
+            )
+        views = tm_v2.verify_reader_views(
+            cur,
+            expected_version='v2',
+            expected_revision=state.revision,
+            expected_slot=state.active_slot,
+            allow_static_slot=state.cleanup_completed_at is not None,
+        )
+        if not views['passed']:
+            raise AirflowException(
+                f'active TM v2 canonical reader verification failed: {views}'
+            )
+        result.update(
+            status='v2_scope_set_and_views_ready',
+            readiness=marker,
+            reader_views=views,
+        )
+        return result
+    finally:
+        cur.close()
+        conn.close()
 
 
 def generate_pipeline_report(**context) -> Dict[str, Any]:
@@ -203,16 +374,10 @@ with DAG(
 
     ### Transfermarkt + Capology Silver (issue #64)
 
-    After E4, the master pipeline kicks off `dag_transform_transfermarkt_silver`
-    and `dag_transform_capology_silver` in parallel. Both are trigger-only
-    (`schedule=None`) and re-materialise Silver tables from already-fetched
-    Bronze rows — they do NOT re-scrape upstream. Bronze ingest runs on its
-    own weekly Monday cron (`dag_ingest_transfermarkt` 04:00 UTC,
-    `dag_ingest_capology` 05:00 UTC); the daily Silver refresh here picks up
-    fresh `silver.xref_player` rows from E1 so canonical_id coverage stays
-    aligned even when xref grows mid-week. Same `failed_states=[]` /
-    `trigger_rule='all_done'` policy as E1-E4 to keep the daily summary
-    resilient.
+    Transfermarkt native-v2 writes are owned by its exact registry-driven
+    ingest/transform cycle. The daily master performs one read-only route gate;
+    legacy remains a soft dependency, while an active-v2 readiness failure
+    blocks downstream Gold. Capology remains a normal trigger-only transform.
 
     ### FBref Gold layer (issue #39)
 
@@ -231,14 +396,14 @@ with DAG(
         (`squad_market_value_eur` / `total_wage_bill_gbp`), which is why it runs
         AFTER the TM/Capology Silver block rather than in parallel with it.
     The Gold DAG runs sequentially (`max_active_tasks=1`) for OOM safety on the
-    dev Trino (3.5 GB heap). Same `wait_for_completion=True` /
-    `failed_states=[]` / `trigger_rule='all_done'` policy as E1-E4 keeps the
-    daily summary resilient if a Gold CTAS degrades.
+    dev Trino (3.5 GB heap). Capology/SoFIFA remain soft inputs; the dedicated
+    Transfermarkt state gate is blocking only while canonical readers use v2.
 
     ### Notes
 
     - Each DAG is triggered with `wait_for_completion=True`
-    - Pipeline continues even if some DAGs fail
+    - Optional source failures are reported as degraded; a failed/partial
+      WhoScored child blocks all downstream publication and fails the master
     - Final report summarizes all DAG statuses
     - SoFIFA runs weekly (Sunday) and is not included here
     - Transfermarkt/Capology Bronze run weekly (Monday); master only re-
@@ -253,29 +418,24 @@ with DAG(
         prev_task = None
 
         for dag_id in INGESTION_DAGS:
-            strict_child_state = dag_id == 'dag_ingest_fotmob'
+            required_source = dag_id in REQUIRED_SOURCE_TASKS
             trigger_task = TriggerDagRunOperator(
                 task_id=f'trigger_{dag_id.replace("dag_ingest_", "")}',
                 trigger_dag_id=dag_id,
                 wait_for_completion=True,
                 poke_interval=60,  # Check every minute
-                # FotMob emits a strict completeness manifest, so its child
-                # failure must make the master red. Legacy children retain
-                # the existing alert-only policy until they do the same.
-                allowed_states=(
-                    ['success'] if strict_child_state else ['success', 'failed']
-                ),
-                failed_states=(['failed'] if strict_child_state else []),
+                allowed_states=(['success'] if required_source else ['success', 'failed']),
+                failed_states=(['failed'] if required_source else []),
                 reset_dag_run=True,  # Reset if already running
                 execution_date='{{ ds }}',  # Airflow 2.x uses execution_date
+                # Keep independent later sources running after a required
+                # source failure. The explicit gate below blocks transforms.
+                trigger_rule=('all_done' if prev_task else 'all_success'),
                 conf=(
                     {"master_data_interval_end": "{{ data_interval_end }}"}
                     if dag_id == "dag_ingest_sofascore"
                     else {}
                 ),
-                # Continue independent source ingests even when strict FotMob
-                # fails; the failed trigger task still makes this DAG run red.
-                trigger_rule='all_done',
             )
 
             if prev_task:
@@ -284,30 +444,57 @@ with DAG(
             prev_task = trigger_task
             trigger_tasks.append(trigger_task)
 
+    required_sources_gate = PythonOperator(
+        task_id='validate_required_sources',
+        python_callable=enforce_required_source_success,
+        # It must execute (and raise) when a required trigger failed.
+        trigger_rule='all_done',
+    )
+    trigger_tasks >> required_sources_gate
+
+    # =========================================================================
+    # FBref source Silver publication
+    # =========================================================================
+    # This master-owned blocking trigger is the only automatic owner of the
+    # FBref Silver generation. The ingest DAG publishes Bronze only, and the
+    # Silver DAG never launches Gold. Keeping this step before xref/E3 prevents
+    # the old nested asynchronous Silver/Gold path from racing the ordered
+    # master publication chain.
+    trigger_fbref_silver = TriggerDagRunOperator(
+        task_id='trigger_fbref_silver',
+        trigger_dag_id='dag_transform_fbref_silver',
+        wait_for_completion=True,
+        poke_interval=30,
+        allowed_states=['success'],
+        failed_states=['failed'],
+        reset_dag_run=True,
+        execution_date='{{ ds }}',
+        trigger_rule='all_success',
+    )
+
     # =========================================================================
     # E1 medallion-redesign: Silver xref tables
     # =========================================================================
-    # Runs AFTER all Bronze ingestion (xref_team/match/referee/manager/player
-    # read from iceberg.bronze.*) and BEFORE the FBref Silver DAG (so any
-    # downstream that begins to depend on silver.xref_* gets fresh data).
+    # Runs AFTER all Bronze ingestion and the blocking FBref Silver generation.
+    # xref_team/match/referee/manager/player read from iceberg.bronze.*; E3 then
+    # consumes both fresh xref and source-Silver tables.
     #
     # `wait_for_completion=True` — the xref DAG is fast (~1-2 min) and
     # blocking lets the T6 dual-run parity validator run on freshly
     # written xref tables.
     #
-    # `failed_states=[]` keeps master pipeline parity: a transient xref
-    # failure should not abort the rest of the daily run; an alert from
-    # `validate_xref` (Telegram on_failure_callback) surfaces the issue.
+    # The required-source gate is blocking. A failed WhoScored run must not
+    # reach xref/E3/Gold with a mixed or stale Bronze snapshot.
     trigger_xref_task = TriggerDagRunOperator(
         task_id='trigger_silver_xref',
         trigger_dag_id='dag_transform_xref',
         wait_for_completion=True,
         poke_interval=30,
-        allowed_states=['success', 'failed'],
-        failed_states=[],
+        allowed_states=['success'],
+        failed_states=['failed'],
         reset_dag_run=True,
         execution_date='{{ ds }}',
-        trigger_rule='all_done',  # Run even if some ingestion DAGs failed
+        trigger_rule='all_success',
     )
 
     # =========================================================================
@@ -319,20 +506,18 @@ with DAG(
     # `silver.xref_match` / `silver.xref_team` / `silver.xref_player` rows.
     #
     # The E3 DAG itself runs sequentially (`max_active_tasks=1`) for OOM
-    # safety; here we simply trigger it with the same wait/parity policy as
-    # the xref step. `failed_states=[]` keeps master pipeline resilient: an
-    # E3 failure surfaces via `validate_e3`'s on_failure_callback (Telegram)
-    # but does not block the daily summary.
+    # safety; here we trigger it with the same fail-closed policy as the xref
+    # step. A failed E3 DQ task blocks downstream Gold publication.
     trigger_e3_transforms = TriggerDagRunOperator(
         task_id='trigger_e3_transforms',
         trigger_dag_id='dag_transform_e3',
         wait_for_completion=True,
         poke_interval=30,
-        allowed_states=['success', 'failed'],
-        failed_states=[],
+        allowed_states=['success'],
+        failed_states=['failed'],
         reset_dag_run=True,
         execution_date='{{ ds }}',
-        trigger_rule='all_done',  # Run even if xref step degraded
+        trigger_rule='all_success',
     )
 
     # =========================================================================
@@ -356,7 +541,7 @@ with DAG(
         failed_states=[],
         reset_dag_run=True,
         execution_date='{{ ds }}',
-        trigger_rule='all_done',  # Run even if E3 step degraded
+        trigger_rule='all_success',
     )
 
     # =========================================================================
@@ -371,16 +556,10 @@ with DAG(
     # Triggered in parallel after E4 (TM/Capology Silver does not depend on
     # gold.fct_* outputs from E3/E4) but kept downstream of E1 because both
     # DAGs LEFT JOIN `silver.xref_player` for canonical_id.
-    trigger_silver_transfermarkt = TriggerDagRunOperator(
+    trigger_silver_transfermarkt = PythonOperator(
         task_id='trigger_silver_transfermarkt',
-        trigger_dag_id='dag_transform_transfermarkt_silver',
-        wait_for_completion=True,
-        poke_interval=30,
-        allowed_states=['success', 'failed'],
-        failed_states=[],
-        reset_dag_run=True,
-        execution_date='{{ ds }}',
-        trigger_rule='all_done',
+        python_callable=_transfermarkt_gold_gate,
+        trigger_rule='all_success',
     )
 
     trigger_silver_capology = TriggerDagRunOperator(
@@ -392,7 +571,7 @@ with DAG(
         failed_states=[],
         reset_dag_run=True,
         execution_date='{{ ds }}',
-        trigger_rule='all_done',
+        trigger_rule='all_success',
     )
 
     # SoFIFA Silver (issue #42) — same dependency profile as TM/Capology:
@@ -409,7 +588,7 @@ with DAG(
         failed_states=[],
         reset_dag_run=True,
         execution_date='{{ ds }}',
-        trigger_rule='all_done',
+        trigger_rule='all_success',
     )
 
     # =========================================================================
@@ -425,18 +604,18 @@ with DAG(
     #        total_wage_bill_gbp)
     #
     # The Gold DAG itself runs sequentially (max_active_tasks=1) for OOM safety;
-    # same wait/parity policy (failed_states=[], trigger_rule='all_done') as
-    # E1-E4 keeps the daily summary resilient if a Gold CTAS degrades.
+    # Capology/SoFIFA remain soft. An active-v2 Transfermarkt readiness failure
+    # is blocking because the canonical readers would otherwise be unsafe.
     trigger_fbref_gold = TriggerDagRunOperator(
         task_id='trigger_fbref_gold',
         trigger_dag_id='dag_transform_fbref_gold',
         wait_for_completion=True,
         poke_interval=30,
-        allowed_states=['success', 'failed'],
-        failed_states=[],
+        allowed_states=['success'],
+        failed_states=['failed'],
         reset_dag_run=True,
         execution_date='{{ ds }}',
-        trigger_rule='all_done',  # Run even if TM/Cap/SoFIFA Silver degraded
+        trigger_rule='none_failed_min_one_success',
     )
 
     # Check overall pipeline success
@@ -455,7 +634,8 @@ with DAG(
     )
 
     # Dependencies
-    triggers_group >> trigger_xref_task >> trigger_e3_transforms >> trigger_e4_transforms
+    (required_sources_gate >> trigger_fbref_silver >> trigger_xref_task
+     >> trigger_e3_transforms >> trigger_e4_transforms)
     trigger_e4_transforms >> [
         trigger_silver_transfermarkt,
         trigger_silver_capology,

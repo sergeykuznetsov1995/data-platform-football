@@ -4,12 +4,12 @@ FBref Silver Layer Transformation DAG
 
 Transforms Bronze FBref data into Silver layer Iceberg tables.
 
-Runs after dag_ingest_fbref completes (trigger-only, no schedule).
+Runs from dag_master_pipeline after ingestion completes (trigger-only, no schedule).
 Uses CTAS (CREATE TABLE AS SELECT) via Trino to deduplicate Bronze data,
 join multiple tables, cast types, and produce clean analytical tables.
 
 Architecture:
-    Triggered by dag_ingest_fbref via TriggerDagRunOperator (or manual trigger)
+    Triggered by dag_master_pipeline (or manual trigger)
         |
         v
     TaskGroup: silver_transforms (7 SEQUENTIAL tasks, max_active_tasks=1)
@@ -27,6 +27,10 @@ Architecture:
         v
     validate_silver_quality  — data quality checks (null rate, ref integrity, ranges)
 
+Gold publication is deliberately not triggered from this DAG.  The master
+pipeline is the single owner of the final Gold run because it first publishes
+fresh xref and E3 tables; a nested trigger here could race that ordered path.
+
 Silver Tables Created:
     iceberg.silver.fbref_player_season_profile  — player stats + shooting + playingtime + misc
     iceberg.silver.fbref_keeper_profile         — goalkeeper stats + keeper + shooting + misc
@@ -42,7 +46,6 @@ from typing import Any, Dict
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator
-from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 from airflow.utils.task_group import TaskGroup
 
 from utils.default_args import SILVER_ARGS
@@ -430,7 +433,7 @@ with DAG(
     dag_id='dag_transform_fbref_silver',
     default_args=SILVER_ARGS,
     description='Transform Bronze FBref data into Silver Iceberg tables via Trino CTAS',
-    schedule=None,  # Trigger-only (called after ingestion)
+    schedule=None,  # Trigger-only (master-owned after ingestion)
     start_date=datetime(2026, 3, 1),
     catchup=False,
     tags=['transform', 'fbref', 'silver', 'football', 'trino'],
@@ -447,8 +450,9 @@ with DAG(
 
     ### Trigger
 
-    This DAG has **no schedule** — it is triggered after `dag_ingest_fbref`
-    completes via `TriggerDagRunOperator` or manual trigger.
+    This DAG has **no schedule** — `dag_master_pipeline` triggers it after
+    ingestion and waits for its terminal DQ result. Manual triggering remains
+    available for repair/backfill work.
 
     ### Silver Tables
 
@@ -480,6 +484,9 @@ with DAG(
     - **Freshness** (WARNING): `_bronze_ingested_at` within 48h of Monday ingest
     - **Value ranges** (WARNING): outliers for monitoring, do not block
 
+    Both validation tasks are fail-closed. Gold is published separately by
+    `dag_master_pipeline`, after xref and E3 have completed successfully.
+
     ### Manual Trigger
 
     ```bash
@@ -508,7 +515,9 @@ with DAG(
     validate_silver = PythonOperator(
         task_id='validate_silver',
         python_callable=_validate_silver,
-        trigger_rule='all_done',  # Run even if some transforms fail
+        # Old Silver tables can still satisfy row-count floors after a CTAS
+        # task fails. Do not validate/publish that mixed generation.
+        trigger_rule='all_success',
     )
 
     # =========================================================================
@@ -517,20 +526,11 @@ with DAG(
     validate_quality = PythonOperator(
         task_id='validate_silver_quality',
         python_callable=_validate_silver_quality,
-        trigger_rule='all_done',  # Run even if validation fails
-    )
-
-    # =========================================================================
-    # Trigger Gold layer after Silver DQ passes
-    # =========================================================================
-    trigger_gold = TriggerDagRunOperator(
-        task_id='trigger_gold',
-        trigger_dag_id='dag_transform_fbref_gold',
-        wait_for_completion=False,
-        reset_dag_run=True,
+        # A successful quality query must not hide a failed row-count gate.
+        trigger_rule='all_success',
     )
 
     # =========================================================================
     # Dependencies
     # =========================================================================
-    transforms_group >> validate_silver >> validate_quality >> trigger_gold
+    transforms_group >> validate_silver >> validate_quality

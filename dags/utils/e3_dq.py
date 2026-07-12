@@ -57,20 +57,42 @@ logger = logging.getLogger(__name__)
 # through.
 
 SPADL_ACTION_ENUM: List[str] = [
-    'pass', 'cross', 'throw_in',
-    'freekick_crossed', 'freekick_short',
-    'corner_crossed', 'corner_short',
-    'take_on', 'foul', 'tackle', 'interception',
-    'shot', 'shot_penalty', 'shot_freekick',
-    'keeper_save', 'keeper_claim', 'keeper_punch', 'keeper_pick_up',
-    'clearance', 'bad_touch', 'dribble', 'goalkick', 'ball_recovery',
-    'own_goal',
-    'unknown',
+    "pass",
+    "cross",
+    "throw_in",
+    "freekick_crossed",
+    "freekick_short",
+    "corner_crossed",
+    "corner_short",
+    "take_on",
+    "foul",
+    "tackle",
+    "interception",
+    "shot",
+    "shot_penalty",
+    "shot_freekick",
+    "keeper_save",
+    "keeper_claim",
+    "keeper_punch",
+    "keeper_pick_up",
+    "clearance",
+    "bad_touch",
+    "dribble",
+    "goalkick",
+    "ball_recovery",
+    "own_goal",
+    "unknown",
 ]
 
 # Schema-version literals (R0.4 schema-versioning contract).
-SPADL_ACTION_SOURCE = 'whoscored_spadl_proprietary_v1'
-SPADL_ACTION_VERSION = 'v1'
+SPADL_ACTION_SOURCE = "whoscored_spadl_proprietary_v1"
+SPADL_ACTION_VERSION = "v1"
+
+# Whole-table unknown coverage uses both a legacy absolute safety floor and a
+# scale-aware ratio. Historical backfill grows the denominator, so a fixed
+# count alone eventually rejects a healthy 3.8-4.1% taxonomy floor.
+SPADL_UNKNOWN_ABSOLUTE_CAP = 480_000
+SPADL_UNKNOWN_RATIO_CAP = 0.05
 
 
 # ---------------------------------------------------------------------------
@@ -88,45 +110,45 @@ SPADL_ACTION_VERSION = 'v1'
 # `dags/sql/silver/whoscored_events_spadl.sql` would let an unknown type
 # slip through to `action_canonical='unknown'` undetected.
 WHOSCORED_KNOWN_TYPES_39: List[str] = [
-    'Aerial',
-    'BallRecovery',
-    'BallTouch',
-    'BlockedPass',
-    'Card',
-    'Challenge',
-    'ChanceMissed',
-    'Claim',
-    'Clearance',
-    'CornerAwarded',
-    'CrossNotClaimed',
-    'Dispossessed',
-    'End',
-    'Error',
-    'FormationChange',
-    'FormationSet',
-    'Foul',
-    'Goal',
-    'GoodSkill',
-    'Interception',
-    'KeeperPickup',
-    'KeeperSweeper',
-    'MissedShots',
-    'OffsideGiven',
-    'OffsidePass',
-    'OffsideProvoked',
-    'Pass',
-    'PenaltyFaced',
-    'Punch',
-    'Save',
-    'SavedShot',
-    'ShieldBallOpp',
-    'ShotOnPost',
-    'Smother',
-    'Start',
-    'SubstitutionOff',
-    'SubstitutionOn',
-    'TakeOn',
-    'Tackle',
+    "Aerial",
+    "BallRecovery",
+    "BallTouch",
+    "BlockedPass",
+    "Card",
+    "Challenge",
+    "ChanceMissed",
+    "Claim",
+    "Clearance",
+    "CornerAwarded",
+    "CrossNotClaimed",
+    "Dispossessed",
+    "End",
+    "Error",
+    "FormationChange",
+    "FormationSet",
+    "Foul",
+    "Goal",
+    "GoodSkill",
+    "Interception",
+    "KeeperPickup",
+    "KeeperSweeper",
+    "MissedShots",
+    "OffsideGiven",
+    "OffsidePass",
+    "OffsideProvoked",
+    "Pass",
+    "PenaltyFaced",
+    "Punch",
+    "Save",
+    "SavedShot",
+    "ShieldBallOpp",
+    "ShotOnPost",
+    "Smother",
+    "Start",
+    "SubstitutionOff",
+    "SubstitutionOn",
+    "TakeOn",
+    "Tackle",
 ]
 
 assert len(WHOSCORED_KNOWN_TYPES_39) == 39, (
@@ -155,24 +177,62 @@ assert len(WHOSCORED_KNOWN_TYPES_39) == 39, (
 # The completeness gate (:func:`completeness_check_events`) treats these as
 # expected: any scheduled game_id absent from events but NOT in this set is a
 # real gap → ERROR. Source of truth = the decision record; keep both in sync.
-WHOSCORED_KNOWN_MISSING_GAME_IDS: frozenset = frozenset({
-    # FRA-Ligue 1 1920 — COVID cancellation (21)
-    1376707, 1376716, 1376717, 1376718, 1376719, 1376720, 1376721, 1376722,
-    1376723, 1376724, 1376725, 1376726, 1376727, 1376728, 1376729, 1376730,
-    1376731, 1376732, 1376733, 1376734, 1376735,
-    # FRA-Ligue 1 1617 — abandoned (2)
-    1076372, 1351262,
-    # Played fixtures with no matchCentreData from WhoScored (26)
-    1376255,                                               # ENG 1920 (1)
-    1549586, 1549627, 1549733,                             # ENG 2122 (3)
-    1559829,                                               # ESP 2122 (1)
-    1558343, 1558457, 1558484, 1558514, 1558548,          # FRA 2122 (5)
-    1643925,                                               # FRA 2223 (1)
-    1741059,                                               # FRA 2324 (1)
-    1643097, 1643214,                                      # GER 2223 (2)
-    1575817, 1575876, 1575881, 1575889, 1575891, 1575896, # ITA 2122 (6)
-    1651493, 1651573, 1651673, 1651695, 1651772, 1651789, # ITA 2223 (6)
-})
+WHOSCORED_KNOWN_MISSING_GAME_IDS: frozenset = frozenset(
+    {
+        # FRA-Ligue 1 1920 — COVID cancellation (21)
+        1376707,
+        1376716,
+        1376717,
+        1376718,
+        1376719,
+        1376720,
+        1376721,
+        1376722,
+        1376723,
+        1376724,
+        1376725,
+        1376726,
+        1376727,
+        1376728,
+        1376729,
+        1376730,
+        1376731,
+        1376732,
+        1376733,
+        1376734,
+        1376735,
+        # FRA-Ligue 1 1617 — abandoned (2)
+        1076372,
+        1351262,
+        # Played fixtures with no matchCentreData from WhoScored (26)
+        1376255,  # ENG 1920 (1)
+        1549586,
+        1549627,
+        1549733,  # ENG 2122 (3)
+        1559829,  # ESP 2122 (1)
+        1558343,
+        1558457,
+        1558484,
+        1558514,
+        1558548,  # FRA 2122 (5)
+        1643925,  # FRA 2223 (1)
+        1741059,  # FRA 2324 (1)
+        1643097,
+        1643214,  # GER 2223 (2)
+        1575817,
+        1575876,
+        1575881,
+        1575889,
+        1575891,
+        1575896,  # ITA 2122 (6)
+        1651493,
+        1651573,
+        1651673,
+        1651695,
+        1651772,
+        1651789,  # ITA 2223 (6)
+    }
+)
 
 assert len(WHOSCORED_KNOWN_MISSING_GAME_IDS) == 49, (
     "WHOSCORED_KNOWN_MISSING_GAME_IDS must have exactly 49 entries — "
@@ -184,6 +244,7 @@ assert len(WHOSCORED_KNOWN_MISSING_GAME_IDS) == 49, (
 # Per-season DQ helpers (E3.5 backfill)
 # ---------------------------------------------------------------------------
 
+
 def _safe_predicate_value(value: str) -> str:
     """Single-quote-escape a value for a Trino predicate.
 
@@ -194,16 +255,16 @@ def _safe_predicate_value(value: str) -> str:
     """
     if not isinstance(value, str) or not value:
         raise ValueError(f"predicate value must be non-empty str, got {value!r}")
-    if any(ch in value for ch in ('\x00', '\n', '\r', ';')):
+    if any(ch in value for ch in ("\x00", "\n", "\r", ";")):
         raise ValueError(f"predicate value contains forbidden chars: {value!r}")
-    if '--' in value or '/*' in value or '*/' in value:
+    if "--" in value or "/*" in value or "*/" in value:
         raise ValueError(f"predicate value contains SQL comment marker: {value!r}")
     return value.replace("'", "''")
 
 
 def taxonomy_diff_check(
     season: str,
-    league: str = 'ENG-Premier League',
+    league: str = "ENG-Premier League",
 ) -> CheckResult:
     """Verify ``bronze.whoscored_events_current`` types ⊆ 39-mapping for one season.
 
@@ -240,8 +301,8 @@ def taxonomy_diff_check(
         if not observed:
             return CheckResult(
                 name=name,
-                kind='taxonomy_diff',
-                severity='ERROR',
+                kind="taxonomy_diff",
+                severity="ERROR",
                 passed=False,
                 details=(
                     f"bronze.whoscored_events_current has 0 rows for "
@@ -253,8 +314,8 @@ def taxonomy_diff_check(
         if unknown_types:
             return CheckResult(
                 name=name,
-                kind='taxonomy_diff',
-                severity='ERROR',
+                kind="taxonomy_diff",
+                severity="ERROR",
                 passed=False,
                 details=(
                     f"{len(unknown_types)} unmapped WhoScored type(s): "
@@ -267,20 +328,18 @@ def taxonomy_diff_check(
             )
         return CheckResult(
             name=name,
-            kind='taxonomy_diff',
-            severity='ERROR',
+            kind="taxonomy_diff",
+            severity="ERROR",
             passed=True,
-            details=(
-                f"{len(observed)} distinct types observed; all in 39-mapping"
-            ),
+            details=(f"{len(observed)} distinct types observed; all in 39-mapping"),
             value=sorted(observed),
         )
     except Exception as e:
         logger.exception("taxonomy_diff_check raised")
         return CheckResult(
             name=name,
-            kind='taxonomy_diff',
-            severity='ERROR',
+            kind="taxonomy_diff",
+            severity="ERROR",
             passed=False,
             error=str(e),
         )
@@ -290,7 +349,7 @@ def taxonomy_diff_check(
 
 def parity_check_event_counts_per_season(
     season: str,
-    league: str = 'ENG-Premier League',
+    league: str = "ENG-Premier League",
 ) -> CheckResult:
     """Per-season Bronze→Silver→Gold parity for ``whoscored_events``.
 
@@ -302,18 +361,14 @@ def parity_check_event_counts_per_season(
     Same severity model as the global parity check (ERROR).
     """
     name = (
-        "parity[bronze→silver→gold whoscored_events "
-        f"season={season} league={league}]"
+        f"parity[bronze→silver→gold whoscored_events season={season} league={league}]"
     )
     safe_season = _safe_predicate_value(season)
     safe_league = _safe_predicate_value(league)
-    where = (
-        f"WHERE season = '{safe_season}' "
-        f"AND league = '{safe_league}'"
-    )
+    where = f"WHERE season = '{safe_season}' AND league = '{safe_league}'"
     sql = (
         "SELECT "
-        "  (SELECT COUNT(*) FROM (SELECT DISTINCT game_id, source_event_id, period, minute, second, expanded_minute, type, outcome_type, team_id, player_id, x, y, end_x, end_y, qualifiers, related_event_id, related_player_id, team "
+        "  (SELECT COUNT(*) FROM (SELECT DISTINCT game_id, source_event_id, team_event_id, period, minute, second, expanded_minute, type, outcome_type, team_id, player_id, x, y, end_x, end_y, qualifiers, related_team_event_id, related_player_id, team "
         f"   FROM iceberg.bronze.whoscored_events_current {where})) AS bronze_cnt, "
         f"  (SELECT COUNT(*) FROM iceberg.silver.whoscored_events_spadl {where}) AS silver_cnt, "
         f"  (SELECT COUNT(*) FROM iceberg.gold.fct_event {where}) AS gold_cnt"
@@ -334,8 +389,8 @@ def parity_check_event_counts_per_season(
         if bronze_cnt == 0:
             return CheckResult(
                 name=name,
-                kind='parity',
-                severity='ERROR',
+                kind="parity",
+                severity="ERROR",
                 passed=False,
                 details=(
                     f"bronze empty for season={season!r}, league={league!r} "
@@ -369,26 +424,26 @@ def parity_check_event_counts_per_season(
 
         return CheckResult(
             name=name,
-            kind='parity',
-            severity='ERROR',
+            kind="parity",
+            severity="ERROR",
             passed=passed,
             details=details,
             value={
-                'season': season,
-                'league': league,
-                'bronze': bronze_cnt,
-                'silver': silver_cnt,
-                'gold': gold_cnt,
-                'silver_over_bronze': round(sb_ratio, 4),
-                'gold_over_silver': round(gs_ratio, 4),
+                "season": season,
+                "league": league,
+                "bronze": bronze_cnt,
+                "silver": silver_cnt,
+                "gold": gold_cnt,
+                "silver_over_bronze": round(sb_ratio, 4),
+                "gold_over_silver": round(gs_ratio, 4),
             },
         )
     except Exception as e:
         logger.exception("parity_check_event_counts_per_season raised")
         return CheckResult(
             name=name,
-            kind='parity',
-            severity='ERROR',
+            kind="parity",
+            severity="ERROR",
             passed=False,
             error=str(e),
         )
@@ -398,7 +453,7 @@ def parity_check_event_counts_per_season(
 
 def build_per_season_e3_checks(
     season: str,
-    league: str = 'ENG-Premier League',
+    league: str = "ENG-Premier League",
 ) -> List[Check]:
     """E3.5 backfill DQ — checks scoped to one (season, league) tuple.
 
@@ -413,34 +468,28 @@ def build_per_season_e3_checks(
     """
     safe_season = _safe_predicate_value(season)
     safe_league = _safe_predicate_value(league)
-    season_filter = (
-        f"season = '{safe_season}' AND league = '{safe_league}'"
-    )
+    season_filter = f"season = '{safe_season}' AND league = '{safe_league}'"
 
     return [
         # ===== PK uniqueness scoped to season =====
         CHECK.no_duplicates(
-            'iceberg.silver.whoscored_events_spadl',
-            pk=['match_id', 'event_id'],
+            "iceberg.silver.whoscored_events_spadl",
+            pk=["match_id", "event_id"],
             where=season_filter,
-            name=(
-                'no_duplicates[silver.whoscored_events_spadl '
-                f"season={season}]"
-            ),
+            name=(f"no_duplicates[silver.whoscored_events_spadl season={season}]"),
         ),
         CHECK.no_duplicates(
-            'iceberg.gold.fct_event',
-            pk=['match_id', 'event_id'],
+            "iceberg.gold.fct_event",
+            pk=["match_id", "event_id"],
             where=season_filter,
             name=f"no_duplicates[gold.fct_event season={season}]",
         ),
         CHECK.no_duplicates(
-            'iceberg.gold.fct_shot',
-            pk=['match_id', 'shot_id'],
+            "iceberg.gold.fct_shot",
+            pk=["match_id", "shot_id"],
             where=season_filter,
             name=f"no_duplicates[gold.fct_shot season={season}]",
         ),
-
         # ===== SPADL unknown_rate per-season — must stay below 5% =====
         # APL 2425/2526 baseline: 4.22-4.44%. Threshold 5% (R3 spec) catches
         # historical seasons where the taxonomy might shift slightly.
@@ -449,19 +498,16 @@ def build_per_season_e3_checks(
         # bound the absolute count and let the value-range serve as a
         # secondary signal (size depends on season — empirical 700K x 5% ≈ 35K).
         CHECK.row_count(
-            table='iceberg.silver.whoscored_events_spadl',
+            table="iceberg.silver.whoscored_events_spadl",
             min_rows=0,
             max_rows=40_000,
-            where=(
-                f"{season_filter} AND action_canonical = 'unknown'"
-            ),
-            severity='ERROR',
+            where=(f"{season_filter} AND action_canonical = 'unknown'"),
+            severity="ERROR",
             name=f"spadl_unknown_rate[season={season}]",
         ),
-
         # ===== Schema-version drift per-season =====
         CHECK.row_count(
-            table='iceberg.silver.whoscored_events_spadl',
+            table="iceberg.silver.whoscored_events_spadl",
             min_rows=0,
             max_rows=0,
             where=(
@@ -469,18 +515,15 @@ def build_per_season_e3_checks(
                 f"AND (action_source != '{SPADL_ACTION_SOURCE}' "
                 f"OR action_version != '{SPADL_ACTION_VERSION}')"
             ),
-            severity='ERROR',
+            severity="ERROR",
             name=f"schema_version_drift[silver season={season}]",
         ),
         CHECK.row_count(
-            table='iceberg.gold.fct_event',
+            table="iceberg.gold.fct_event",
             min_rows=0,
             max_rows=0,
-            where=(
-                f"{season_filter} "
-                f"AND action_source != '{SPADL_ACTION_SOURCE}'"
-            ),
-            severity='ERROR',
+            where=(f"{season_filter} AND action_source != '{SPADL_ACTION_SOURCE}'"),
+            severity="ERROR",
             name=f"schema_version_drift[gold.fct_event season={season}]",
         ),
     ]
@@ -495,7 +538,7 @@ def _enum_violation_where(column: str, allowed: List[str]) -> str:
     """
     safe: List[str] = []
     for v in allowed:
-        if not isinstance(v, str) or "'" in v or ';' in v or '--' in v:
+        if not isinstance(v, str) or "'" in v or ";" in v or "--" in v:
             raise ValueError(f"Unsafe enum value: {v!r}")
         safe.append(f"'{v}'")
     return f"{column} NOT IN ({', '.join(safe)})"
@@ -504,6 +547,7 @@ def _enum_violation_where(column: str, allowed: List[str]) -> str:
 # ---------------------------------------------------------------------------
 # Silver — whoscored_events_spadl
 # ---------------------------------------------------------------------------
+
 
 def _build_whoscored_events_spadl_checks() -> List[Check]:
     """DQ for ``iceberg.silver.whoscored_events_spadl`` (E3.1).
@@ -517,43 +561,27 @@ def _build_whoscored_events_spadl_checks() -> List[Check]:
       * Pitch coords x/y in [0, 100] (Opta normalised) — WARNING only because
         WhoScored occasionally emits 100.1 / -0.1 from rounding.
     """
-    table = 'iceberg.silver.whoscored_events_spadl'
+    table = "iceberg.silver.whoscored_events_spadl"
     return [
         # PK + NULL guards (ERROR)
         CHECK.no_duplicates(
             table,
-            pk=['match_id', 'event_id'],
+            pk=["match_id", "event_id"],
         ),
         CHECK.no_nulls(
             table,
-            cols=['match_id', 'event_id', 'action_canonical',
-                  'action_source', 'action_version'],
+            cols=[
+                "match_id",
+                "event_id",
+                "action_canonical",
+                "action_source",
+                "action_version",
+            ],
         ),
-
         # Volume guard — APL multi-season post-backfill (~700K rows/season,
         # E3.1 smoke-test verified ~1.4M for 2425+2526). Lower bound 600K
         # gives slack for partial backfill scenarios.
         CHECK.row_count(table, min_rows=600_000),
-
-        # SPADL coverage drift guard. R3 verdict: ~2.88% unknown baseline on
-        # 2425+2526 corpus; after multi-season backfill the healthy rate is
-        # ~3.8-4.1% per league-season — meta-event types Card/Substitution etc.
-        # map to 'unknown' by design (Goal moved to the shot family in #462).
-        # The registry has no `ratio` primitive, so this is an absolute cap
-        # over the WHOLE table: sized as ~40K (≈5.75% of ~700K rows) per
-        # league-season × 12 league-seasons headroom (9 EPL + WC-2026 live
-        # now, #913 measured 230,935 = 3.76% total). Per-season drift is the
-        # job of spadl_unknown_rate[season=...] in build_per_season_e3_checks;
-        # this table-wide cap only catches a wholesale taxonomy break.
-        CHECK.row_count(
-            table=table,
-            min_rows=0,
-            max_rows=480_000,
-            where="action_canonical = 'unknown'",
-            severity='ERROR',
-            name='spadl_coverage_unknown_rate',
-        ),
-
         # Enum compliance — every action_canonical must be one of the 25
         # values. Implemented as row_count with NOT IN predicate. Zero
         # tolerance because adding a value requires SQL + this list update.
@@ -561,11 +589,10 @@ def _build_whoscored_events_spadl_checks() -> List[Check]:
             table=table,
             min_rows=0,
             max_rows=0,
-            where=_enum_violation_where('action_canonical', SPADL_ACTION_ENUM),
-            severity='ERROR',
-            name='spadl_action_enum_violation',
+            where=_enum_violation_where("action_canonical", SPADL_ACTION_ENUM),
+            severity="ERROR",
+            name="spadl_action_enum_violation",
         ),
-
         # Schema-version literal pin (R0.4). Catch SQL drift where someone
         # bumps the literal in the file without updating downstream consumers.
         CHECK.row_count(
@@ -576,35 +603,33 @@ def _build_whoscored_events_spadl_checks() -> List[Check]:
                 f"action_source != '{SPADL_ACTION_SOURCE}' "
                 f"OR action_version != '{SPADL_ACTION_VERSION}'"
             ),
-            severity='ERROR',
-            name='schema_version_literal_drift',
+            severity="ERROR",
+            name="schema_version_literal_drift",
         ),
-
         # Pitch-coordinate bounds — Opta normalises to [0, 100]. WARNING-
         # severity because boundary values (100.1 etc.) are a known minor
         # WhoScored quirk that doesn't break downstream features.
         CHECK.value_range(
             table=table,
-            column='x',
+            column="x",
             min_val=0,
             max_val=100,
-            severity='WARNING',
+            severity="WARNING",
         ),
         CHECK.value_range(
             table=table,
-            column='y',
+            column="y",
             min_val=0,
             max_val=100,
-            severity='WARNING',
+            severity="WARNING",
         ),
-
         # Freshness — Silver is rebuilt by master_pipeline daily; 48h tolerates
         # a single missed run before alerting.
         CHECK.freshness(
             table=table,
-            ts_col='_silver_created_at',
+            ts_col="_silver_created_at",
             max_age_hours=48,
-            severity='WARNING',
+            severity="WARNING",
         ),
     ]
 
@@ -612,6 +637,7 @@ def _build_whoscored_events_spadl_checks() -> List[Check]:
 # ---------------------------------------------------------------------------
 # Silver — whoscored_team_match (T6.3, #92). Season rollup migrated to Gold (#370).
 # ---------------------------------------------------------------------------
+
 
 def _build_whoscored_team_match_checks() -> List[Check]:
     """DQ for ``iceberg.silver.whoscored_team_match`` (T6.3 / #92).
@@ -623,22 +649,22 @@ def _build_whoscored_team_match_checks() -> List[Check]:
     Volume floor: 380 APL matches × 2 teams = 760 rows/season; multi-season
     backfill ~3K-5K. Min 600 (WARNING) covers partial-backfill scenarios.
     """
-    table = 'iceberg.silver.whoscored_team_match'
+    table = "iceberg.silver.whoscored_team_match"
     return [
         CHECK.no_duplicates(
             table,
-            pk=['match_id', 'team_id', 'league', 'season'],
+            pk=["match_id", "team_id", "league", "season"],
         ),
         CHECK.no_nulls(
             table,
-            cols=['match_id', 'team_id', 'league', 'season'],
+            cols=["match_id", "team_id", "league", "season"],
         ),
-        CHECK.row_count(table, min_rows=600, severity='WARNING'),
+        CHECK.row_count(table, min_rows=600, severity="WARNING"),
         CHECK.freshness(
             table=table,
-            ts_col='_silver_created_at',
+            ts_col="_silver_created_at",
             max_age_hours=48,
-            severity='WARNING',
+            severity="WARNING",
         ),
     ]
 
@@ -646,6 +672,7 @@ def _build_whoscored_team_match_checks() -> List[Check]:
 # ---------------------------------------------------------------------------
 # Silver — espn_lineup
 # ---------------------------------------------------------------------------
+
 
 def _build_espn_lineup_checks() -> List[Check]:
     """DQ for ``iceberg.silver.espn_lineup`` (E3.2).
@@ -655,27 +682,25 @@ def _build_espn_lineup_checks() -> List[Check]:
     of FBref). PK is composite (match_id, team, player) because ESPN
     has no native player_id — name-based dedup is good-enough at Silver.
     """
-    table = 'iceberg.silver.espn_lineup'
+    table = "iceberg.silver.espn_lineup"
     return [
         CHECK.no_duplicates(
             table,
-            pk=['match_id', 'team', 'player'],
+            pk=["match_id", "team", "player"],
         ),
         CHECK.no_nulls(
             table,
-            cols=['match_id', 'team', 'player', 'is_starter'],
+            cols=["match_id", "team", "player", "is_starter"],
         ),
-
         # Volume — ~22 (starters + subs) per (match, team), ~380 matches/season
         # × 2 teams ≈ 16,720 rows/season at full coverage. ESPN has partial
         # coverage in our sample → lower bound 10K with WARNING severity.
-        CHECK.row_count(table, min_rows=10_000, severity='WARNING'),
-
+        CHECK.row_count(table, min_rows=10_000, severity="WARNING"),
         CHECK.freshness(
             table=table,
-            ts_col='_silver_created_at',
+            ts_col="_silver_created_at",
             max_age_hours=48,
-            severity='WARNING',
+            severity="WARNING",
         ),
     ]
 
@@ -683,6 +708,7 @@ def _build_espn_lineup_checks() -> List[Check]:
 # ---------------------------------------------------------------------------
 # Gold — fct_event
 # ---------------------------------------------------------------------------
+
 
 def _build_fct_event_checks() -> List[Check]:
     """DQ for ``iceberg.gold.fct_event`` (E3.3 / Task 2.1).
@@ -703,19 +729,17 @@ def _build_fct_event_checks() -> List[Check]:
         non-meta events (Card/Goal/Sub may legitimately have NULL player
         in bronze, so we exclude unmappable rows from the orphan count).
     """
-    table = 'iceberg.gold.fct_event'
+    table = "iceberg.gold.fct_event"
     return [
         # PK + NULL guards (ERROR)
         CHECK.no_duplicates(
             table,
-            pk=['match_id', 'event_id'],
+            pk=["match_id", "event_id"],
         ),
         CHECK.no_nulls(
             table,
-            cols=['match_id', 'event_id', 'action',
-                  'action_source', 'action_version'],
+            cols=["match_id", "event_id", "action", "action_source", "action_version"],
         ),
-
         # Phase B bridging COMPLETE (#40): every WhoScored game in
         # gold.fct_event resolves to a silver.xref_match.canonical_id row.
         # The whoscored_schedule backfill-from-events (#128/#126/#106,
@@ -724,18 +748,16 @@ def _build_fct_event_checks() -> List[Check]:
         # Re-enabled at ERROR — the check is now the guard against a
         # regression in the schedule⊇events invariant.
         CHECK.ref_integrity(
-            child='gold.fct_event',
-            parent='silver.xref_match',
-            key='match_id',
-            parent_key='canonical_id',
-            severity='ERROR',
+            child="gold.fct_event",
+            parent="silver.xref_match",
+            key="match_id",
+            parent_key="canonical_id",
+            severity="ERROR",
         ),
-
         # Volume — Bronze→Silver→Gold passthrough, expect ~Silver count.
         # WARNING severity: a deeper parity check is implemented as a
         # custom CheckResult by ``parity_check_event_counts`` (see below).
-        CHECK.row_count(table, min_rows=500_000, severity='WARNING'),
-
+        CHECK.row_count(table, min_rows=500_000, severity="WARNING"),
         # team_id orphan guard. Non-zero count is normal during alias-YAML
         # rollout; high count signals drift. Threshold 10K ≈ 1.4% of 700K.
         CHECK.row_count(
@@ -743,10 +765,9 @@ def _build_fct_event_checks() -> List[Check]:
             min_rows=0,
             max_rows=10_000,
             where="team_id IS NULL",
-            severity='WARNING',
-            name='orphan_team_rate',
+            severity="WARNING",
+            name="orphan_team_rate",
         ),
-
         # Player orphan rate (non-meta only). E1 verdict: WhoScored player
         # rejection 4.89% on the corpus → ~34K orphans expected on 700K
         # rows. Threshold 50K accommodates that with slack. We exclude
@@ -757,34 +778,36 @@ def _build_fct_event_checks() -> List[Check]:
             min_rows=0,
             max_rows=50_000,
             where="player_id IS NULL AND _action_confidence != 'unmappable'",
-            severity='WARNING',
-            name='orphan_player_rate_non_meta',
+            severity="WARNING",
+            name="orphan_player_rate_non_meta",
         ),
-
         # Pitch coords — WARNING (boundary quirks pass through from Silver).
-        CHECK.value_range(table, column='x', min_val=0, max_val=100, severity='WARNING'),
-        CHECK.value_range(table, column='y', min_val=0, max_val=100, severity='WARNING'),
-
+        CHECK.value_range(
+            table, column="x", min_val=0, max_val=100, severity="WARNING"
+        ),
+        CHECK.value_range(
+            table, column="y", min_val=0, max_val=100, severity="WARNING"
+        ),
         # Minute bounds — APL has 90' regulation + ET, allow up to 130 for
         # second-half stoppage in extra time. WARNING because Opta minute
         # for ET goals can spike to 120+5.
-        CHECK.value_range(table, column='minute', min_val=0, max_val=130, severity='WARNING'),
-
+        CHECK.value_range(
+            table, column="minute", min_val=0, max_val=130, severity="WARNING"
+        ),
         # Schema-version literal pin (mirrors silver guard).
         CHECK.row_count(
             table=table,
             min_rows=0,
             max_rows=0,
             where=f"action_source != '{SPADL_ACTION_SOURCE}'",
-            severity='ERROR',
-            name='schema_version_literal_drift[fct_event]',
+            severity="ERROR",
+            name="schema_version_literal_drift[fct_event]",
         ),
-
         CHECK.freshness(
             table=table,
-            ts_col='_silver_created_at',
+            ts_col="_silver_created_at",
             max_age_hours=48,
-            severity='WARNING',
+            severity="WARNING",
         ),
     ]
 
@@ -792,6 +815,7 @@ def _build_fct_event_checks() -> List[Check]:
 # ---------------------------------------------------------------------------
 # Gold — fct_shot
 # ---------------------------------------------------------------------------
+
 
 def _build_fct_shot_checks() -> List[Check]:
     """DQ for ``iceberg.gold.fct_shot`` (E3.4).
@@ -817,7 +841,7 @@ def _build_fct_shot_checks() -> List[Check]:
     ~0 and any min-floor would false-alarm. The "exactly one source per
     match" invariant is covered by unit tests (test_fct_shot_multisource).
     """
-    table = 'iceberg.gold.fct_shot'
+    table = "iceberg.gold.fct_shot"
 
     # Player orphan threshold: E1 verdict — Understat player rejection
     # 6.94%. Smoke-test row count 47,105 → ~3,300 orphans expected.
@@ -827,50 +851,50 @@ def _build_fct_shot_checks() -> List[Check]:
     return [
         CHECK.no_duplicates(
             table,
-            pk=['match_id', 'shot_id'],
+            pk=["match_id", "shot_id"],
         ),
         CHECK.no_nulls(
             table,
-            cols=['match_id', 'shot_id', 'xg'],
+            cols=["match_id", "shot_id", "xg"],
         ),
-
         # Strict ref_integrity — E3.4 uses INNER JOIN bridge so any survivor
         # MUST be in xref_match. Leakage = upstream regression.
         # parent_key='canonical_id' because silver.xref_match has the column
         # 'canonical_id' (not 'match_id'); see DESCRIBE 2026-05-08.
         CHECK.ref_integrity(
-            child='gold.fct_shot',
-            parent='silver.xref_match',
-            key='match_id',
-            parent_key='canonical_id',
+            child="gold.fct_shot",
+            parent="silver.xref_match",
+            key="match_id",
+            parent_key="canonical_id",
         ),
-
         # xG bounded probability. ERROR-severity: violations indicate a model
         # output regression (Understat upstream issue) and would poison
         # downstream features. xa is not materialized in fct_shot — assist
         # tracking lives in the assist_player_id column only.
-        CHECK.value_range(table, column='xg', min_val=0, max_val=1),
-
+        CHECK.value_range(table, column="xg", min_val=0, max_val=1),
         # Volume — APL multi-season ≈ 47K shots smoke-tested. Min 20K
         # WARNING for partial-backfill grace.
         # #913 Phase 4: scope out INT-World Cup (no Understat coverage).
-        CHECK.row_count(table, min_rows=20_000, where="league <> 'INT-World Cup'", severity='WARNING'),
-
+        CHECK.row_count(
+            table,
+            min_rows=20_000,
+            where="league <> 'INT-World Cup'",
+            severity="WARNING",
+        ),
         # Player orphan rate guard — see threshold derivation above.
         CHECK.row_count(
             table=table,
             min_rows=0,
             max_rows=shot_orphan_max,
             where="player_id IS NULL AND league <> 'INT-World Cup'",
-            severity='WARNING',
-            name='shot_orphan_player_rate',
+            severity="WARNING",
+            name="shot_orphan_player_rate",
         ),
-
         CHECK.freshness(
             table=table,
-            ts_col='_silver_created_at',
+            ts_col="_silver_created_at",
             max_age_hours=48,
-            severity='WARNING',
+            severity="WARNING",
         ),
     ]
 
@@ -878,6 +902,7 @@ def _build_fct_shot_checks() -> List[Check]:
 # ---------------------------------------------------------------------------
 # Gold — fct_lineup
 # ---------------------------------------------------------------------------
+
 
 def _build_fct_lineup_checks() -> List[Check]:
     """DQ for ``iceberg.gold.fct_lineup`` (E3.5; SofaScore source added #693).
@@ -901,7 +926,7 @@ def _build_fct_lineup_checks() -> List[Check]:
       * whoscored ≥ 10 (WARNING, #693 — inferred lineup; ~99.8% dedup under
         FBref, so only ~32 net rows survive live 2026-06-20. Low dead-branch floor.)
     """
-    table = 'iceberg.gold.fct_lineup'
+    table = "iceberg.gold.fct_lineup"
 
     # Orphan rate measured on FBref rows ONLY (#519). Scoping to FBref keeps
     # this guard meaningful even after #692 wired the ESPN player resolver:
@@ -936,14 +961,13 @@ def _build_fct_lineup_checks() -> List[Check]:
         # contract is verified in E3.9 unit tests.
         CHECK.no_duplicates(
             table,
-            pk=['match_id', 'team_id', 'player_id'],
-            where='player_id IS NOT NULL',
+            pk=["match_id", "team_id", "player_id"],
+            where="player_id IS NOT NULL",
         ),
         CHECK.no_nulls(
             table,
-            cols=['match_id', 'team_id', 'lineup_source'],
+            cols=["match_id", "team_id", "lineup_source"],
         ),
-
         # ref_integrity fct_lineup → xref_match — WARNING (not ERROR).
         # #867: the ESPN bridge now reads xref_match itself, so a bridge MISS is
         # no longer possible — but rows for games outside the FBref spine keep
@@ -951,13 +975,12 @@ def _build_fct_lineup_checks() -> List[Check]:
         # an xref_match.canonical_id. They stay orphans here by design (273K rows
         # live 2026-07-08, mostly ESPN APL 2000/01-2015/16), hence WARNING.
         CHECK.ref_integrity(
-            child='gold.fct_lineup',
-            parent='silver.xref_match',
-            key='match_id',
-            parent_key='canonical_id',
-            severity='WARNING',
+            child="gold.fct_lineup",
+            parent="silver.xref_match",
+            key="match_id",
+            parent_key="canonical_id",
+            severity="WARNING",
         ),
-
         # issue #242: alt-hex FBref-дубли НЕ ловятся guard'ом выше — parent
         # silver.xref_match сам несёт alt-hex (строится из fbref_schedule без
         # date-фильтра, в отличие от fbref_match_enriched). dim_match — canon-
@@ -968,22 +991,21 @@ def _build_fct_lineup_checks() -> List[Check]:
         # гейт «clean re-ingest» подтвердил orphan=0 live (2026-06-03) →
         # severity ERROR.
         CHECK.ref_integrity(
-            child='gold.fct_lineup',
-            parent='gold.dim_match',
-            key='match_id',
-            parent_key='match_id',
+            child="gold.fct_lineup",
+            parent="gold.dim_match",
+            key="match_id",
+            parent_key="match_id",
             where="lineup_source = 'fbref'",
-            severity='ERROR',
-            name='ref_integrity[fct_lineup.fbref->dim_match]',
+            severity="ERROR",
+            name="ref_integrity[fct_lineup.fbref->dim_match]",
         ),
-
         # Lineup-source distribution. FBref must dominate (canonical source).
         CHECK.row_count(
             table=table,
             min_rows=100_000,
             where="lineup_source = 'fbref'",
-            severity='ERROR',
-            name='fbref_coverage_dominant',
+            severity="ERROR",
+            name="fbref_coverage_dominant",
         ),
         # ESPN coverage — WARNING only. Post-#692 resolved ESPN rows dedup into
         # their FBref twin, so surviving lineup_source='espn' rows are the tail
@@ -994,8 +1016,8 @@ def _build_fct_lineup_checks() -> List[Check]:
             table=table,
             min_rows=3_000,
             where="lineup_source = 'espn'",
-            severity='WARNING',
-            name='espn_coverage_present',
+            severity="WARNING",
+            name="espn_coverage_present",
         ),
         # SofaScore as a full source (#693). Only rows that WIN dedup carry
         # lineup_source='sofascore' (FBref-gap matches/players); the rest dedup
@@ -1005,8 +1027,8 @@ def _build_fct_lineup_checks() -> List[Check]:
             table=table,
             min_rows=500,
             where="lineup_source = 'sofascore'",
-            severity='WARNING',
-            name='sofascore_coverage_present',
+            severity="WARNING",
+            name="sofascore_coverage_present",
         ),
         # FotMob as a full source (#693). Net contribution = FBref-gap rows that
         # survive dedup. Live 2026-06-20: 2,378 survived (1,372 with a resolved
@@ -1015,8 +1037,8 @@ def _build_fct_lineup_checks() -> List[Check]:
             table=table,
             min_rows=1_000,
             where="lineup_source = 'fotmob'",
-            severity='WARNING',
-            name='fotmob_coverage_present',
+            severity="WARNING",
+            name="fotmob_coverage_present",
         ),
         # WhoScored as a full source (#693). Lineup is INFERRED from events
         # (appeared & not subbed-on); its players resolve to FBref canonicals so
@@ -1026,15 +1048,13 @@ def _build_fct_lineup_checks() -> List[Check]:
             table=table,
             min_rows=10,
             where="lineup_source = 'whoscored'",
-            severity='WARNING',
-            name='whoscored_coverage_present',
+            severity="WARNING",
+            name="whoscored_coverage_present",
         ),
-
         # Total volume — 380 APL matches/season × 22 lineup rows / (match × team)
         # × 2 teams = ~16,720 rows / season (FBref alone). Min 380*22 = 8,360
         # is a single-season floor; we enforce as ERROR.
-        CHECK.row_count(table, min_rows=380 * 22, severity='ERROR'),
-
+        CHECK.row_count(table, min_rows=380 * 22, severity="ERROR"),
         # FBref player orphan guard — see threshold derivation above. Scoped to
         # lineup_source='fbref'; ESPN rows are expected-NULL (#519) and excluded.
         CHECK.row_count(
@@ -1042,10 +1062,9 @@ def _build_fct_lineup_checks() -> List[Check]:
             min_rows=0,
             max_rows=lineup_fbref_orphan_max,
             where="player_id IS NULL AND lineup_source = 'fbref'",
-            severity='WARNING',
-            name='lineup_orphan_player_rate',
+            severity="WARNING",
+            name="lineup_orphan_player_rate",
         ),
-
         # #839: every FBref STARTER must resolve to a canonical player. Unused
         # substitutes without a senior appearance are an accepted NULL floor
         # (see lineup_orphan_player_rate above), but a starter with a NULL
@@ -1056,12 +1075,10 @@ def _build_fct_lineup_checks() -> List[Check]:
             table=table,
             min_rows=0,
             max_rows=0,
-            where="is_starter = true AND player_id IS NULL "
-                  "AND lineup_source = 'fbref'",
-            severity='ERROR',
-            name='lineup_starter_orphan_zero',
+            where="is_starter = true AND player_id IS NULL AND lineup_source = 'fbref'",
+            severity="ERROR",
+            name="lineup_starter_orphan_zero",
         ),
-
         # is_captain coverage (#439) — SofaScore /lineups enrich the FBref
         # canonical (match, player) via xref_match + xref_player. WARNING-only:
         # coverage is partial by design (SofaScore /lineups ⊂ FBref lineups).
@@ -1072,15 +1089,14 @@ def _build_fct_lineup_checks() -> List[Check]:
             table=table,
             min_rows=5_000,
             where="is_captain IS NOT NULL",
-            severity='WARNING',
-            name='is_captain_coverage_present',
+            severity="WARNING",
+            name="is_captain_coverage_present",
         ),
-
         CHECK.freshness(
             table=table,
-            ts_col='_silver_created_at',
+            ts_col="_silver_created_at",
             max_age_hours=48,
-            severity='WARNING',
+            severity="WARNING",
         ),
     ]
 
@@ -1089,6 +1105,7 @@ def _build_fct_lineup_checks() -> List[Check]:
 # Public builder API
 # ---------------------------------------------------------------------------
 
+
 def _build_sofascore_player_profile_checks() -> List[Check]:
     """DQ for ``iceberg.silver.sofascore_player_profile``.
 
@@ -1096,21 +1113,24 @@ def _build_sofascore_player_profile_checks() -> List[Check]:
     bridge через silver.xref_player. Coverage thresholds отражают APL
     2025/26 (526 rows, 95% canonical match при первой материализации).
     """
-    table = 'iceberg.silver.sofascore_player_profile'
+    table = "iceberg.silver.sofascore_player_profile"
     return [
         CHECK.no_duplicates(
             table,
-            pk=['player_id', 'league', 'season'],
+            pk=["player_id", "league", "season"],
         ),
         CHECK.no_nulls(
             table,
-            cols=['player_id', 'league', 'season'],
+            cols=["player_id", "league", "season"],
         ),
-        CHECK.row_count(table, min_rows=400, severity='WARNING'),
+        CHECK.row_count(table, min_rows=400, severity="WARNING"),
         # Physical attribute bounds — high outliers flag ingest regression.
         CHECK.value_range(
-            table, 'height_cm',
-            min_val=140, max_val=220, severity='WARNING',
+            table,
+            "height_cm",
+            min_val=140,
+            max_val=220,
+            severity="WARNING",
         ),
     ]
 
@@ -1123,33 +1143,39 @@ def _build_sofascore_league_table_checks() -> List[Check]:
     canonical resolve отложен в Gold (gold.fct_standings джойнит silver.xref_team).
     Floor 18 = минимальный размер одной (league, season) таблицы (18 команд).
     """
-    table = 'iceberg.silver.sofascore_league_table'
+    table = "iceberg.silver.sofascore_league_table"
     return [
         CHECK.no_duplicates(
             table,
-            pk=['league', 'season', 'team_name'],
-            severity='ERROR',
+            pk=["league", "season", "team_name"],
+            severity="ERROR",
         ),
         CHECK.no_nulls(
             table,
-            cols=['league', 'season', 'team_name', 'points', 'played'],
-            severity='ERROR',
+            cols=["league", "season", "team_name", "points", "played"],
+            severity="ERROR",
         ),
-        CHECK.row_count(table, min_rows=18, severity='WARNING'),
+        CHECK.row_count(table, min_rows=18, severity="WARNING"),
         # Sanity bounds: 38 matches × 3 pts = 114 (→120 slack); ≤46 matchdays.
         CHECK.value_range(
-            table, 'points',
-            min_val=0, max_val=120, severity='WARNING',
+            table,
+            "points",
+            min_val=0,
+            max_val=120,
+            severity="WARNING",
         ),
         CHECK.value_range(
-            table, 'played',
-            min_val=0, max_val=46, severity='WARNING',
+            table,
+            "played",
+            min_val=0,
+            max_val=46,
+            severity="WARNING",
         ),
         CHECK.freshness(
             table,
-            ts_col='_bronze_ingested_at',
+            ts_col="_bronze_ingested_at",
             max_age_hours=72,
-            severity='WARNING',
+            severity="WARNING",
         ),
     ]
 
@@ -1168,36 +1194,36 @@ def _build_sofascore_team_match_checks() -> List[Check]:
     PK is ``(match_id, team_id)`` — native SofaScore IDs; Gold (#95) bridges
     via ``silver.xref_team(source='sofascore')``.
     """
-    table = 'iceberg.silver.sofascore_team_match'
+    table = "iceberg.silver.sofascore_team_match"
     return [
         CHECK.no_duplicates(
             table,
-            pk=['match_id', 'team_id'],
-            severity='ERROR',
+            pk=["match_id", "team_id"],
+            severity="ERROR",
         ),
         CHECK.no_nulls(
             table,
-            cols=['match_id', 'team_id', 'opponent_id', 'league', 'season'],
-            severity='ERROR',
+            cols=["match_id", "team_id", "opponent_id", "league", "season"],
+            severity="ERROR",
         ),
         # APL floor: 380 matches × 2 sides = 760 (allow slack for partial backfills).
         CHECK.row_count(
             table,
             min_rows=700,
             where="league = 'ENG-Premier League' AND season = '2526'",
-            severity='ERROR',
+            severity="ERROR",
         ),
         # Core SofaScore metrics should be present for almost every match.
         CHECK.no_nulls(
             table,
-            cols=['expected_goals', 'total_passes', 'corner_kicks'],
-            severity='WARNING',
+            cols=["expected_goals", "total_passes", "corner_kicks"],
+            severity="WARNING",
         ),
         CHECK.freshness(
             table,
-            ts_col='_bronze_ingested_at',
+            ts_col="_bronze_ingested_at",
             max_age_hours=72,
-            severity='WARNING',
+            severity="WARNING",
         ),
     ]
 
@@ -1210,34 +1236,34 @@ def _build_understat_team_match_checks() -> List[Check]:
     380 matches × 2 sides = 760 rows. 2025/26 is intentionally looser
     (promotee orphans, ≤5% — see MEMORY.md «silver.xref_team 78.5%»).
     """
-    table = 'iceberg.silver.understat_team_match'
+    table = "iceberg.silver.understat_team_match"
     return [
         CHECK.no_duplicates(
             table,
-            pk=['match_id', 'team_id_canonical'],
-            severity='ERROR',
+            pk=["match_id", "team_id_canonical"],
+            severity="ERROR",
         ),
         CHECK.no_nulls(
             table,
-            cols=['match_id', 'team_id_canonical', 'team_id', 'league', 'season'],
-            severity='ERROR',
+            cols=["match_id", "team_id_canonical", "team_id", "league", "season"],
+            severity="ERROR",
         ),
         CHECK.no_nulls(
             table,
-            cols=['xg', 'xg_against'],
-            severity='ERROR',
+            cols=["xg", "xg_against"],
+            severity="ERROR",
         ),
         CHECK.row_count(
             table,
             min_rows=760,
             where="league = 'ENG-Premier League' AND season = '2425'",
-            severity='ERROR',
+            severity="ERROR",
         ),
         CHECK.freshness(
             table,
-            ts_col='_bronze_ingested_at',
+            ts_col="_bronze_ingested_at",
             max_age_hours=48,
-            severity='ERROR',
+            severity="ERROR",
         ),
     ]
 
@@ -1250,11 +1276,11 @@ def _build_sofascore_shots_checks() -> List[Check]:
     uniqueness + a row-count floor catch that. APL 2526 ≈ 9.5K shots smoke-
     tested; 5K WARNING floor allows partial scrape.
     """
-    table = 'iceberg.silver.sofascore_shots'
+    table = "iceberg.silver.sofascore_shots"
     return [
-        CHECK.no_duplicates(table, pk=['match_id', 'shot_id']),
-        CHECK.no_nulls(table, cols=['match_id', 'shot_id']),
-        CHECK.row_count(table, min_rows=5_000, severity='WARNING'),
+        CHECK.no_duplicates(table, pk=["match_id", "shot_id"]),
+        CHECK.no_nulls(table, cols=["match_id", "shot_id"]),
+        CHECK.row_count(table, min_rows=5_000, severity="WARNING"),
     ]
 
 
@@ -1265,22 +1291,20 @@ def _build_fct_shot_audit_checks() -> List[Check]:
     integrity is ERROR; coverage is WARNING (audit is a DQ table, not a gate).
     The |xg_diff| divergence threshold is added after live calibration.
     """
-    table = 'iceberg.gold.fct_shot_audit'
+    table = "iceberg.gold.fct_shot_audit"
     return [
         # Structural — ERROR.
-        CHECK.no_duplicates(table, pk=['match_id', 'team_id']),
-        CHECK.no_nulls(table, cols=['match_id', 'team_id']),
-
+        CHECK.no_duplicates(table, pk=["match_id", "team_id"]),
+        CHECK.no_nulls(table, cols=["match_id", "team_id"]),
         # SofaScore overlap must materialise — a broken xref/schedule bridge
         # would zero this out. 2526 ≈ 760 team-matches; floor 600 WARNING.
         CHECK.row_count(
             table=table,
             min_rows=600,
             where="has_sofascore = true",
-            severity='WARNING',
-            name='fct_shot_audit_sofascore_coverage',
+            severity="WARNING",
+            name="fct_shot_audit_sofascore_coverage",
         ),
-
         # xG model agreement — a gross |xg_diff| > 2.0 over a single team-match
         # signals a normalisation/mapping regression, not normal model variance
         # (live calibration 2026-06-16: max |xg_diff| 1.65, zero rows > 2.0).
@@ -1289,8 +1313,8 @@ def _build_fct_shot_audit_checks() -> List[Check]:
             min_rows=0,
             max_rows=20,
             where="has_sofascore = true AND ABS(xg_diff) > 2.0",
-            severity='WARNING',
-            name='fct_shot_audit_xg_divergence',
+            severity="WARNING",
+            name="fct_shot_audit_xg_divergence",
         ),
     ]
 
@@ -1339,14 +1363,105 @@ def build_all_e3_checks() -> List[Check]:
 
 
 # ---------------------------------------------------------------------------
-# Custom Bronze→Silver→Gold parity check (CheckResult, runs as side-task)
+# Custom WhoScored coverage/parity checks (CheckResult side tasks)
 # ---------------------------------------------------------------------------
+
+
+def spadl_unknown_coverage_check() -> CheckResult:
+    """Fail closed when whole-table SPADL ``unknown`` coverage drifts.
+
+    The effective count ceiling is exactly::
+
+        max(SPADL_UNKNOWN_ABSOLUTE_CAP,
+            eligible_rows * SPADL_UNKNOWN_RATIO_CAP)
+
+    ``eligible_rows`` must be positive. Both numerator and denominator are
+    returned in the result so a growing historical corpus cannot hide behind
+    an opaque absolute count.
+    """
+    name = "spadl_coverage_unknown_rate"
+    sql = (
+        "SELECT COUNT(*) AS eligible_rows, "
+        "COUNT_IF(action_canonical = 'unknown') AS unknown_rows "
+        "FROM iceberg.silver.whoscored_events_spadl"
+    )
+    conn = None
+    try:
+        conn = _get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(sql)
+            row = cur.fetchone()
+        finally:
+            cur.close()
+
+        eligible_rows = int(row[0]) if row and row[0] is not None else 0
+        unknown_rows = int(row[1]) if row and row[1] is not None else 0
+        if eligible_rows <= 0:
+            return CheckResult(
+                name=name,
+                kind="coverage_ratio",
+                severity="ERROR",
+                passed=False,
+                details=(
+                    "eligible_rows=0; SPADL unknown coverage denominator must "
+                    "be positive"
+                ),
+                value={
+                    "eligible_rows": eligible_rows,
+                    "unknown_rows": unknown_rows,
+                    "unknown_ratio": None,
+                    "effective_cap": SPADL_UNKNOWN_ABSOLUTE_CAP,
+                },
+            )
+
+        unknown_ratio = unknown_rows / eligible_rows
+        effective_cap = max(
+            float(SPADL_UNKNOWN_ABSOLUTE_CAP),
+            eligible_rows * SPADL_UNKNOWN_RATIO_CAP,
+        )
+        passed = unknown_rows <= effective_cap
+        details = (
+            f"unknown_rows={unknown_rows}, eligible_rows={eligible_rows}, "
+            f"unknown_ratio={unknown_ratio:.4%}, "
+            f"ratio_cap={SPADL_UNKNOWN_RATIO_CAP:.2%}, "
+            f"absolute_cap={SPADL_UNKNOWN_ABSOLUTE_CAP}, "
+            f"effective_cap={effective_cap:.0f}"
+        )
+        return CheckResult(
+            name=name,
+            kind="coverage_ratio",
+            severity="ERROR",
+            passed=passed,
+            details=details,
+            value={
+                "eligible_rows": eligible_rows,
+                "unknown_rows": unknown_rows,
+                "unknown_ratio": unknown_ratio,
+                "ratio_cap": SPADL_UNKNOWN_RATIO_CAP,
+                "absolute_cap": SPADL_UNKNOWN_ABSOLUTE_CAP,
+                "effective_cap": effective_cap,
+            },
+        )
+    except Exception as exc:
+        logger.exception("spadl_unknown_coverage_check raised")
+        return CheckResult(
+            name=name,
+            kind="coverage_ratio",
+            severity="ERROR",
+            passed=False,
+            error=str(exc),
+        )
+    finally:
+        if conn is not None:
+            conn.close()
+
 
 # Acceptable ratios for the parity gate. Values intentionally close to 1.0
 # because R3 D5 contract: NO row drops in Silver/Gold, including action_canonical='unknown'.
-_PARITY_SILVER_BRONZE_MIN = 0.99   # 1% slack for Silver de-dup edge cases.
-_PARITY_GOLD_SILVER_MIN = 0.95     # 5% slack for orphan-match filter
-                                   # (E3 v1 passthrough: should be 100%).
+_PARITY_SILVER_BRONZE_MIN = 0.99  # 1% slack for Silver de-dup edge cases.
+_PARITY_GOLD_SILVER_MIN = 0.95  # 5% slack for orphan-match filter
+# (E3 v1 passthrough: should be 100%).
 
 
 def parity_check_event_counts() -> CheckResult:
@@ -1367,10 +1482,10 @@ def parity_check_event_counts() -> CheckResult:
       2. A regression here would silently shrink the SPADL corpus and
          poison every downstream feature.
     """
-    name = 'parity[bronze→silver→gold event counts]'
+    name = "parity[bronze→silver→gold event counts]"
     sql = (
         "SELECT "
-        "  (SELECT COUNT(*) FROM (SELECT DISTINCT game_id, source_event_id, period, minute, second, expanded_minute, type, outcome_type, team_id, player_id, x, y, end_x, end_y, qualifiers, related_event_id, related_player_id, team "
+        "  (SELECT COUNT(*) FROM (SELECT DISTINCT game_id, source_event_id, team_event_id, period, minute, second, expanded_minute, type, outcome_type, team_id, player_id, x, y, end_x, end_y, qualifiers, related_team_event_id, related_player_id, team "
         "   FROM iceberg.bronze.whoscored_events_current)) AS bronze_cnt, "
         "  (SELECT COUNT(*) FROM iceberg.silver.whoscored_events_spadl) AS silver_cnt, "
         "  (SELECT COUNT(*) FROM iceberg.gold.fct_event) AS gold_cnt"
@@ -1394,8 +1509,8 @@ def parity_check_event_counts() -> CheckResult:
         if bronze_cnt == 0:
             return CheckResult(
                 name=name,
-                kind='parity',
-                severity='ERROR',
+                kind="parity",
+                severity="ERROR",
                 passed=False,
                 details=(
                     "bronze.whoscored_events_current is empty — cannot compute parity "
@@ -1423,31 +1538,35 @@ def parity_check_event_counts() -> CheckResult:
         if not passed:
             offenders = []
             if not sb_ok:
-                offenders.append(f"silver/bronze={sb_ratio:.4f} < {_PARITY_SILVER_BRONZE_MIN}")
+                offenders.append(
+                    f"silver/bronze={sb_ratio:.4f} < {_PARITY_SILVER_BRONZE_MIN}"
+                )
             if not gs_ok:
-                offenders.append(f"gold/silver={gs_ratio:.4f} < {_PARITY_GOLD_SILVER_MIN}")
+                offenders.append(
+                    f"gold/silver={gs_ratio:.4f} < {_PARITY_GOLD_SILVER_MIN}"
+                )
             details += " — VIOLATIONS: " + "; ".join(offenders)
 
         return CheckResult(
             name=name,
-            kind='parity',
-            severity='ERROR',
+            kind="parity",
+            severity="ERROR",
             passed=passed,
             details=details,
             value={
-                'bronze': bronze_cnt,
-                'silver': silver_cnt,
-                'gold': gold_cnt,
-                'silver_over_bronze': round(sb_ratio, 4),
-                'gold_over_silver': round(gs_ratio, 4),
+                "bronze": bronze_cnt,
+                "silver": silver_cnt,
+                "gold": gold_cnt,
+                "silver_over_bronze": round(sb_ratio, 4),
+                "gold_over_silver": round(gs_ratio, 4),
             },
         )
     except Exception as e:
         logger.exception("parity_check_event_counts raised")
         return CheckResult(
             name=name,
-            kind='parity',
-            severity='ERROR',
+            kind="parity",
+            severity="ERROR",
             passed=False,
             error=str(e),
         )
@@ -1473,6 +1592,7 @@ def append_parity_check_to_report(report: Any) -> None:
 # ---------------------------------------------------------------------------
 # Custom schedule→events completeness check (CheckResult, runs as side-task)
 # ---------------------------------------------------------------------------
+
 
 def _run_completeness(name: str, sql: str) -> CheckResult:
     """Execute a schedule→events completeness query and diff vs the floor.
@@ -1503,7 +1623,9 @@ def _run_completeness(name: str, sql: str) -> CheckResult:
         )
         if unsanctioned:
             preview = ", ".join(str(g) for g in unsanctioned[:20])
-            more = "" if len(unsanctioned) <= 20 else f" (+{len(unsanctioned) - 20} more)"
+            more = (
+                "" if len(unsanctioned) <= 20 else f" (+{len(unsanctioned) - 20} more)"
+            )
             details += (
                 f" — UNSANCTIONED missing game_id(s): {preview}{more}. "
                 "Re-scrape the fixture(s); if legitimately unavailable, add to "
@@ -1512,23 +1634,23 @@ def _run_completeness(name: str, sql: str) -> CheckResult:
             )
         return CheckResult(
             name=name,
-            kind='completeness',
-            severity='ERROR',
+            kind="completeness",
+            severity="ERROR",
             passed=passed,
             details=details,
             value={
-                'missing_total': len(missing),
-                'sanctioned': len(sanctioned),
-                'unsanctioned': len(unsanctioned),
-                'unsanctioned_ids': unsanctioned[:50],
+                "missing_total": len(missing),
+                "sanctioned": len(sanctioned),
+                "unsanctioned": len(unsanctioned),
+                "unsanctioned_ids": unsanctioned[:50],
             },
         )
     except Exception as e:
         logger.exception("completeness check raised")
         return CheckResult(
             name=name,
-            kind='completeness',
-            severity='ERROR',
+            kind="completeness",
+            severity="ERROR",
             passed=False,
             error=str(e),
         )
@@ -1548,20 +1670,31 @@ def completeness_check_events() -> CheckResult:
     silently dropped a match before Silver/Gold. Mirrors
     :func:`parity_check_event_counts` (custom CheckResult, not a CHECK.*).
     """
-    name = 'completeness[bronze.whoscored_schedule→events]'
+    name = "completeness[bronze.whoscored_schedule→events]"
     sql = (
         "SELECT s.game_id "
-        "FROM iceberg.bronze.whoscored_schedule s "
-        "LEFT JOIN (SELECT DISTINCT game_id FROM iceberg.bronze.whoscored_events) e "
-        "  ON e.game_id = s.game_id "
-        "WHERE e.game_id IS NULL AND s.game_id IS NOT NULL"
+        "FROM iceberg.bronze.whoscored_schedule_current s "
+        "LEFT JOIN (SELECT DISTINCT league, season, game_id "
+        "           FROM iceberg.bronze.whoscored_events_current) e "
+        "  ON e.league = s.league AND e.season = s.season "
+        " AND e.game_id = s.game_id "
+        "WHERE e.game_id IS NULL AND s.game_id IS NOT NULL "
+        "AND (s.status = 6 OR (s.status = 1 "
+        " AND s.home_score IS NOT NULL AND s.away_score IS NOT NULL "
+        " AND s.date <= CAST(CURRENT_TIMESTAMP - INTERVAL '3' HOUR AS TIMESTAMP))) "
+        "AND NOT EXISTS (SELECT 1 FROM iceberg.bronze.whoscored_match_ingest_manifest m "
+        " WHERE m.league = s.league AND m.season = s.season "
+        " AND m.game_id = CAST(s.game_id AS BIGINT) AND m.state = 'success' "
+        " AND m.batch_id LIKE 'ws2-%' "
+        " AND json_extract_scalar(json_parse(m.dataset_statuses_json), '$.events') "
+        "     IN ('empty', 'not_available'))"
     )
     return _run_completeness(name, sql)
 
 
 def completeness_check_events_per_season(
     season: str,
-    league: str = 'ENG-Premier League',
+    league: str = "ENG-Premier League",
 ) -> CheckResult:
     """Per-season variant of :func:`completeness_check_events`.
 
@@ -1577,10 +1710,21 @@ def completeness_check_events_per_season(
     safe_league = _safe_predicate_value(league)
     sql = (
         "SELECT s.game_id "
-        "FROM iceberg.bronze.whoscored_schedule s "
-        "LEFT JOIN (SELECT DISTINCT game_id FROM iceberg.bronze.whoscored_events) e "
-        "  ON e.game_id = s.game_id "
+        "FROM iceberg.bronze.whoscored_schedule_current s "
+        "LEFT JOIN (SELECT DISTINCT league, season, game_id "
+        "           FROM iceberg.bronze.whoscored_events_current) e "
+        "  ON e.league = s.league AND e.season = s.season "
+        " AND e.game_id = s.game_id "
         "WHERE e.game_id IS NULL AND s.game_id IS NOT NULL "
+        "AND (s.status = 6 OR (s.status = 1 "
+        " AND s.home_score IS NOT NULL AND s.away_score IS NOT NULL "
+        " AND s.date <= CAST(CURRENT_TIMESTAMP - INTERVAL '3' HOUR AS TIMESTAMP))) "
+        "AND NOT EXISTS (SELECT 1 FROM iceberg.bronze.whoscored_match_ingest_manifest m "
+        " WHERE m.league = s.league AND m.season = s.season "
+        " AND m.game_id = CAST(s.game_id AS BIGINT) AND m.state = 'success' "
+        " AND m.batch_id LIKE 'ws2-%' "
+        " AND json_extract_scalar(json_parse(m.dataset_statuses_json), '$.events') "
+        "     IN ('empty', 'not_available')) "
         f"AND s.season = '{safe_season}' AND s.league = '{safe_league}'"
     )
     return _run_completeness(name, sql)
@@ -1600,20 +1744,23 @@ def append_completeness_check_to_report(report: Any) -> None:
 
 
 __all__ = [
-    'SPADL_ACTION_ENUM',
-    'SPADL_ACTION_SOURCE',
-    'SPADL_ACTION_VERSION',
-    'WHOSCORED_KNOWN_TYPES_39',
-    'WHOSCORED_KNOWN_MISSING_GAME_IDS',
-    'build_silver_e3_checks',
-    'build_gold_e3_checks',
-    'build_all_e3_checks',
-    'build_per_season_e3_checks',
-    'parity_check_event_counts',
-    'parity_check_event_counts_per_season',
-    'taxonomy_diff_check',
-    'completeness_check_events',
-    'completeness_check_events_per_season',
-    'append_parity_check_to_report',
-    'append_completeness_check_to_report',
+    "SPADL_ACTION_ENUM",
+    "SPADL_ACTION_SOURCE",
+    "SPADL_ACTION_VERSION",
+    "SPADL_UNKNOWN_ABSOLUTE_CAP",
+    "SPADL_UNKNOWN_RATIO_CAP",
+    "WHOSCORED_KNOWN_TYPES_39",
+    "WHOSCORED_KNOWN_MISSING_GAME_IDS",
+    "build_silver_e3_checks",
+    "build_gold_e3_checks",
+    "build_all_e3_checks",
+    "build_per_season_e3_checks",
+    "spadl_unknown_coverage_check",
+    "parity_check_event_counts",
+    "parity_check_event_counts_per_season",
+    "taxonomy_diff_check",
+    "completeness_check_events",
+    "completeness_check_events_per_season",
+    "append_parity_check_to_report",
+    "append_completeness_check_to_report",
 ]

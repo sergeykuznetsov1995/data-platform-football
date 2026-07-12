@@ -4,7 +4,7 @@
 table:
   fullyQualifiedName: trino_iceberg.iceberg.bronze.whoscored_missing_players
   description: |
-    Append-only предматчевые сводки parser v2: один row на (game, team, player)
+    Append-only предматчевые сводки parser v7: один row на (game, team, player)
     для травм, дисквалификаций и вызовов в сборную. Raw HTML фиксируется до
     разбора, а downstream читает whoscored_missing_players_current — batch из
     последнего успешного preview manifest. Успешный zero-row commit скрывает
@@ -17,7 +17,7 @@ columns:
   - name: league
     description: Лига (e.g. 'ENG-Premier League'); partition key.
   - name: season
-    description: Сезон в формате WhoScored 'YYZZ' (e.g. '2425'); partition key.
+    description: Канонический scope season ('2526', '2026'; при source-коллизии '2021-single-ws8534'); partition key.
   - name: game
     description: Строковый идентификатор матча WhoScored (slug).
   - name: team

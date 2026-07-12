@@ -335,3 +335,7 @@ def test_catalog_absence_logic_ignores_uncommitted_physical_snapshots():
     assert "target_type = 'all_leagues'" in sql
     assert "status IN ('success', 'not_modified')" in sql
     assert "m.batch_id = c._target_batch_id" in sql
+    # Trino forbids table-qualified references to a JOIN..USING column: the
+    # coalesced column exists only unqualified (COLUMN_NOT_FOUND otherwise).
+    assert "c.discovery_run_id" not in sql
+    assert "USING (discovery_run_id)" in sql

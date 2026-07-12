@@ -7,6 +7,8 @@ scrapers (e.g. WhoScored events) to fetch HTML through a long-lived browser sess
 that holds CF state inside the FlareSolverr container.
 """
 
+import base64
+import binascii
 import logging
 import uuid
 from collections import Counter
@@ -19,19 +21,30 @@ from urllib3.util.retry import Retry
 
 logger = logging.getLogger(__name__)
 
+MAX_XHR_BATCH_URLS = 8
+
 
 class FlareSolverrError(Exception):
     """Generic FlareSolverr operation error."""
+
     pass
 
 
 class FlareSolverrTimeout(FlareSolverrError):
     """Raised when the FlareSolverr endpoint times out or is unreachable."""
+
+    pass
+
+
+class FlareSolverrResponseTooLarge(FlareSolverrError):
+    """Raised when the fixed browser endpoint enforces a response byte cap."""
+
     pass
 
 
 class FlareSolverrCFChallengeFailed(FlareSolverrError):
     """Raised when FlareSolverr cannot solve a Cloudflare/Turnstile challenge."""
+
     pass
 
 
@@ -43,6 +56,7 @@ class FlareSolverrTabCrashed(FlareSolverrError):
     the Chromium 142 tab unpredictably during long iteration — callers rotate
     the session on this error (see ``FlareSolverrSoFIFAReader._fs_get_with_recovery``).
     """
+
     pass
 
 
@@ -54,6 +68,7 @@ class FlareSolverrErrorPage(FlareSolverrError):
     it, or soccerdata's ``read_*(max_age=…)`` would reuse the poisoned cache
     for days (#655).
     """
+
     pass
 
 
@@ -97,7 +112,9 @@ def _proxy_payload(proxy_url: str) -> dict:
     netloc = parts.hostname or ""
     if parts.port:
         netloc = f"{netloc}:{parts.port}"
-    clean_url = urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+    clean_url = urlunsplit(
+        (parts.scheme, netloc, parts.path, parts.query, parts.fragment)
+    )
     return {
         "url": clean_url,
         # ``ProxyFilterClient`` percent-encodes its short-lived lease token in
@@ -148,6 +165,7 @@ class FlareSolverrClient:
 
     #: Number of top per-URL consumers surfaced by get_traffic_stats().
     _TOP_URLS_N = 25
+    _MAX_XHR_BATCH_URLS = MAX_XHR_BATCH_URLS
 
     def __init__(
         self,
@@ -186,6 +204,10 @@ class FlareSolverrClient:
         """
         if self._session is None:
             session = requests.Session()
+            # An operation labelled as direct FlareSolverr must not inherit a
+            # worker-wide HTTP(S)_PROXY.  Paid browser sessions receive their
+            # proxy explicitly in ``sessions.create``.
+            session.trust_env = False
             retry = Retry(
                 total=2,
                 backoff_factor=1.5,
@@ -207,9 +229,15 @@ class FlareSolverrClient:
     def session(self) -> None:
         self._session = None
 
-    def _post(self, payload: dict, timeout: Optional[float] = None) -> dict:
-        """POST to /v1 and translate transport/protocol errors to typed exceptions."""
-        endpoint = f"{self.url}/v1"
+    def _post(
+        self,
+        payload: dict,
+        timeout: Optional[float] = None,
+        *,
+        endpoint_path: str = "/v1",
+    ) -> dict:
+        """POST to one fixed API endpoint and translate protocol errors."""
+        endpoint = f"{self.url}{endpoint_path}"
         cmd = payload.get("cmd", "?")
         logger.debug(f"FlareSolverr POST {endpoint} cmd={cmd}")
 
@@ -231,20 +259,24 @@ class FlareSolverrClient:
             logger.warning(
                 f"FlareSolverr HTTP {response.status_code} (cmd={cmd}): {body}"
             )
+            if response.status_code == 413:
+                raise FlareSolverrResponseTooLarge(
+                    f"FlareSolverr HTTP 413: {body}"
+                )
             lower = body.lower()
             if "challenge" in lower or "cloudflare" in lower or "turnstile" in lower:
                 self._cf_challenge_failures += 1
                 raise FlareSolverrCFChallengeFailed(
                     f"FlareSolverr HTTP {response.status_code}: {body}"
                 )
-            raise FlareSolverrError(
-                f"FlareSolverr HTTP {response.status_code}: {body}"
-            )
+            raise FlareSolverrError(f"FlareSolverr HTTP {response.status_code}: {body}")
 
         try:
             data = response.json()
         except ValueError as e:
             raise FlareSolverrError(f"FlareSolverr returned non-JSON: {e}") from e
+        if not isinstance(data, dict):
+            raise FlareSolverrError("FlareSolverr returned a non-object JSON response")
 
         if data.get("status") == "error":
             message = str(data.get("message", "unknown error"))
@@ -254,7 +286,9 @@ class FlareSolverrClient:
                 raise FlareSolverrTabCrashed(message)
             if any(marker in lowered for marker in _CF_MARKERS):
                 self._cf_challenge_failures += 1
-                logger.warning(f"FlareSolverr CF challenge failed (cmd={cmd}): {message}")
+                logger.warning(
+                    f"FlareSolverr CF challenge failed (cmd={cmd}): {message}"
+                )
                 raise FlareSolverrCFChallengeFailed(message)
             logger.warning(f"FlareSolverr error (cmd={cmd}): {message}")
             raise FlareSolverrError(message)
@@ -328,16 +362,14 @@ class FlareSolverrClient:
             # scripts required to solve Cloudflare challenges.
             payload["disableMedia"] = True
 
-        timeout = (max_timeout_ms / 1000.0 + 30.0) if max_timeout_ms else self.default_timeout
+        timeout = (
+            (max_timeout_ms / 1000.0 + 30.0) if max_timeout_ms else self.default_timeout
+        )
         data = self._post(payload, timeout=timeout)
         # Per-URL traffic attribution (issue #616). Only successful fetches
         # reach here (_post raises on CF / error), so a failed page is never
         # booked as a request.
-        self._requests += 1
-        url_key = _normalise_url_key(url)
-        if url_key:
-            self._bytes_by_url[url_key] += self._last_post_bytes
-            self._requests_by_url[url_key] += 1
+        self._record_url_request(url, self._last_post_bytes)
         solution = data.get("solution") or {}
         return {
             "html": solution.get("response", ""),
@@ -345,6 +377,182 @@ class FlareSolverrClient:
             "userAgent": solution.get("userAgent", ""),
             "status": solution.get("status", 0),
         }
+
+    def xhr_get(
+        self,
+        url: str,
+        session_id: str,
+        max_timeout_ms: Optional[int] = None,
+    ) -> dict:
+        """Run the restricted WhoScored same-origin XHR extension.
+
+        The extension accepts no arbitrary JavaScript, headers or HTTP method;
+        it only performs a fixed credentialed GET for allow-listed structured
+        feeds inside an existing ``ws-*`` browser session.
+        """
+
+        timeout_ms = max_timeout_ms or self.default_max_timeout_ms
+        data = self._post(
+            {
+                "url": url,
+                "session": session_id,
+                "maxTimeout": timeout_ms,
+            },
+            timeout=timeout_ms / 1000.0 + 30.0,
+            endpoint_path="/v1/xhr",
+        )
+        solution = data.get("solution") or {}
+        decoded = self._decode_xhr_solution(solution, expected_url=url)
+        self._record_url_request(url, self._last_post_bytes)
+        return decoded
+
+    def xhr_get_many(
+        self,
+        urls: list[str],
+        session_id: str,
+        max_timeout_ms: Optional[int] = None,
+    ) -> list[dict]:
+        """Run one restricted, bounded same-origin WhoScored XHR batch.
+
+        The server fixes concurrency and response limits.  This client accepts
+        no headers, method, JavaScript, proxy or cookie controls and verifies
+        that every response is present and remains in request order.
+        """
+
+        if not 1 <= len(urls) <= self._MAX_XHR_BATCH_URLS:
+            raise ValueError(
+                f"xhr_get_many requires 1 to {self._MAX_XHR_BATCH_URLS} URLs"
+            )
+        if len(set(urls)) != len(urls):
+            raise ValueError("xhr_get_many URLs must be unique")
+        timeout_ms = max_timeout_ms or self.default_max_timeout_ms
+        data = self._post(
+            {
+                "urls": list(urls),
+                "session": session_id,
+                "maxTimeout": timeout_ms,
+            },
+            timeout=timeout_ms / 1000.0 + 30.0,
+            endpoint_path="/v1/xhr/batch",
+        )
+        solution = data.get("solution") or {}
+        raw_responses = solution.get("responses")
+        if not isinstance(raw_responses, list) or len(raw_responses) != len(urls):
+            raise FlareSolverrError("FlareSolverr XHR batch is incomplete")
+
+        responses: list[dict] = []
+        total_source_bytes = 0
+        for expected_url, raw_response in zip(urls, raw_responses):
+            if not isinstance(raw_response, dict):
+                raise FlareSolverrError("FlareSolverr XHR batch item is invalid")
+            if raw_response.get("requestedUrl") != expected_url:
+                raise FlareSolverrError("FlareSolverr XHR batch order is invalid")
+            if raw_response.get("ok") is False:
+                kind = raw_response.get("kind")
+                if kind not in {
+                    "response_too_large",
+                    "timeout",
+                    "source_redirect_rejected",
+                    "fetch_failed",
+                }:
+                    raise FlareSolverrError(
+                        "FlareSolverr XHR batch item error is invalid"
+                    )
+                decoded = {"ok": False, "kind": str(kind), "responseBytes": 0}
+                responses.append(decoded)
+                continue
+            if raw_response.get("ok") is not True:
+                raise FlareSolverrError("FlareSolverr XHR batch item status is invalid")
+            decoded = {
+                "ok": True,
+                **self._decode_xhr_solution(raw_response, expected_url=expected_url),
+            }
+            responses.append(decoded)
+            total_source_bytes += int(decoded["responseBytes"])
+
+        declared_total = solution.get("responseBytes")
+        if (
+            isinstance(declared_total, bool)
+            or not isinstance(declared_total, int)
+            or declared_total != total_source_bytes
+        ):
+            raise FlareSolverrError(
+                "FlareSolverr XHR batch byte count does not match its bodies"
+            )
+
+        # ``_post`` observes one envelope. Attribute all of its bytes across
+        # logical source URLs deterministically, while keeping one request per
+        # URL in the existing traffic report.
+        remaining = self._last_post_bytes
+        denominator = sum(max(1, item["responseBytes"]) for item in responses)
+        for index, (url, item) in enumerate(zip(urls, responses)):
+            if index == len(responses) - 1:
+                attributed = remaining
+            else:
+                attributed = (
+                    self._last_post_bytes * max(1, item["responseBytes"]) // denominator
+                )
+                remaining -= attributed
+            self._record_url_request(url, attributed)
+        return responses
+
+    @staticmethod
+    def _decode_xhr_solution(solution: dict, *, expected_url: str) -> dict:
+        if not isinstance(solution, dict):
+            raise FlareSolverrError("FlareSolverr XHR solution is invalid")
+        encoded = solution.get("responseBase64")
+        if not isinstance(encoded, str):
+            raise FlareSolverrError("FlareSolverr XHR response has no base64 body")
+        try:
+            body = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise FlareSolverrError(
+                "FlareSolverr XHR response body is not valid base64"
+            ) from exc
+        declared_size = solution.get("responseBytes")
+        if (
+            isinstance(declared_size, bool)
+            or not isinstance(declared_size, int)
+            or declared_size < 0
+        ):
+            raise FlareSolverrError(
+                "FlareSolverr XHR response has invalid responseBytes"
+            )
+        size = declared_size
+        if size != len(body):
+            raise FlareSolverrError(
+                "FlareSolverr XHR response byte count does not match its body"
+            )
+        headers = solution.get("headers") or {}
+        if not isinstance(headers, dict):
+            raise FlareSolverrError("FlareSolverr XHR response headers are invalid")
+        status = solution.get("status")
+        if (
+            isinstance(status, bool)
+            or not isinstance(status, int)
+            or not 100 <= status <= 599
+        ):
+            raise FlareSolverrError("FlareSolverr XHR response status is invalid")
+        final_url = solution.get("finalUrl")
+        if not isinstance(final_url, str) or final_url != expected_url:
+            raise FlareSolverrError(
+                "FlareSolverr XHR response final URL does not match its request"
+            )
+
+        return {
+            "content": body,
+            "headers": {str(key): str(value) for key, value in headers.items()},
+            "finalUrl": final_url,
+            "status": status,
+            "responseBytes": size,
+        }
+
+    def _record_url_request(self, url: str, response_bytes: int) -> None:
+        self._requests += 1
+        url_key = _normalise_url_key(url)
+        if url_key:
+            self._bytes_by_url[url_key] += max(0, int(response_bytes))
+            self._requests_by_url[url_key] += 1
 
     def get_traffic_stats(self) -> dict:
         """Per-scrape proxy-traffic audit summary (issue #616).
@@ -356,9 +564,9 @@ class FlareSolverrClient:
         ``docs/research/flaresolverr-proxy-traffic-audit.md``. ``sessions_created``
         ≈ CF cold-starts, the dominant traffic driver.
         """
-        top = sorted(
-            self._bytes_by_url.items(), key=lambda kv: kv[1], reverse=True
-        )[: self._TOP_URLS_N]
+        top = sorted(self._bytes_by_url.items(), key=lambda kv: kv[1], reverse=True)[
+            : self._TOP_URLS_N
+        ]
         return {
             "fs_response_bytes": self._fs_response_bytes,
             "fs_response_mb": round(self._fs_response_bytes / 1024 / 1024, 4),
@@ -376,9 +584,42 @@ class FlareSolverrClient:
             ],
         }
 
+    def close(self) -> None:
+        """Release this client's HTTP connection pool.
+
+        Browser sessions are owned by callers and should normally be destroyed
+        explicitly before this method is called.  The context-manager session
+        is the sole session owned by this client, so clean it up defensively.
+        """
+
+        if self._auto_session_id is not None:
+            try:
+                self.destroy_session(self._auto_session_id)
+            except Exception:
+                logger.debug(
+                    "Could not destroy FlareSolverr context session %s",
+                    self._auto_session_id,
+                    exc_info=True,
+                )
+            finally:
+                self._auto_session_id = None
+        session = self._session
+        self._session = None
+        if session is not None:
+            session.close()
+
     def __enter__(self) -> Tuple["FlareSolverrClient", str]:
         session_id = f"fs-{uuid.uuid4().hex[:8]}"
-        self.create_session(session_id)
+        try:
+            self.create_session(session_id)
+        except Exception:
+            # A lost create response may still have created the server-side
+            # browser. The deterministic id makes best-effort cleanup safe.
+            try:
+                self.destroy_session(session_id)
+            finally:
+                self.close()
+            raise
         self._auto_session_id = session_id
         return self, session_id
 
@@ -393,4 +634,5 @@ class FlareSolverrClient:
                 )
             finally:
                 self._auto_session_id = None
+        self.close()
         return False
