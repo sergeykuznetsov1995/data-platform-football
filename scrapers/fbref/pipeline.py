@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import time
 import uuid
 from contextlib import ExitStack
@@ -105,6 +106,8 @@ SENTINEL_COMPETITIONS = (
 # fence and renew all outstanding sequential leases before every target.
 FETCH_LEASE_SECONDS = 60 * 60
 PROCESSING_LEASE_SECONDS = 60 * 60
+
+logger = logging.getLogger(__name__)
 
 
 class PipelineError(RuntimeError):
@@ -484,6 +487,16 @@ class FBrefPipeline:
         settings: PipelineSettings,
     ) -> str:
         self.control.migrate()
+        # A worker that dies mid-wave (OOM, kill, hung browser) leaves fenced
+        # leases behind.  claim_targets only reaps its own run's leases, so
+        # without a global reap here those targets stay 'leased' forever: they
+        # drop out of the crawl and keep promotion_pending_match_count above
+        # zero, which fails every later run's validation.
+        reaped = self.control.reap_expired_leases()
+        if reaped:
+            logger.warning(
+                "Reaped %d expired FBref lease(s) left by earlier runs", reaped
+            )
         run_id = make_control_run_id(airflow_run_id, dag_id=dag_id)
         self.control.create_run(
             settings.run_type,

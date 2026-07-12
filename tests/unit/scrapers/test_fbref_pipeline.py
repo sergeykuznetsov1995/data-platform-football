@@ -1971,3 +1971,43 @@ def test_empty_typed_schedule_is_persisted_as_zero_row_replacement(
     assert manifest["validation_status"] == (
         "failed" if typed_fails else "succeeded"
     )
+
+
+@pytest.mark.unit
+def test_initialize_run_reaps_leases_left_by_dead_workers(tmp_path):
+    """A killed worker's fenced leases must not strand its targets forever:
+    claim_targets only reaps the current run's leases, so the run start is the
+    single place a global reap can happen."""
+
+    class LeaseReapingControl(FakeControl):
+        def __init__(self, raw_store):
+            super().__init__(raw_store)
+            self.reaped = 0
+
+        def migrate(self):
+            self.events.append("migrate")
+
+        def reap_expired_leases(self):
+            self.events.append("reap")
+            self.reaped += 1
+            return 3
+
+        def create_run(self, run_type, **kwargs):
+            self.events.append("create_run")
+
+        def start_run(self, run_id):
+            self.events.append("start_run")
+
+    raw = _raw_store(tmp_path)
+    control = LeaseReapingControl(raw)
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    run_id = pipeline.initialize_run(
+        airflow_run_id="scheduled__2026-07-12T06:00:00+00:00",
+        dag_id="dag_ingest_fbref",
+        settings=_settings(),
+    )
+
+    assert control.reaped == 1
+    assert control.events.index("reap") < control.events.index("create_run")
+    assert uuid.UUID(run_id)
