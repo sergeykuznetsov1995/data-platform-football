@@ -46,6 +46,7 @@ def _install_airflow_stubs() -> None:
         from airflow.decorators import dag as _real_dag  # noqa: F401
         from airflow.models import Variable as _real_var  # noqa: F401
         from airflow.operators.bash import BashOperator as _real_bash  # noqa: F401
+
         return
     except Exception:
         pass
@@ -183,7 +184,9 @@ def _install_airflow_stubs() -> None:
 
         def _add_downstream(self, other):
             """Record ``self >> other`` for both PythonOperators and TaskGroups."""
-            if isinstance(other, _PythonOperator):
+            if isinstance(other, _PythonOperator) or (
+                hasattr(other, "task_id") and hasattr(other, "upstream_task_ids")
+            ):
                 self.downstream_task_ids.add(other.task_id)
                 other.upstream_task_ids.add(self.task_id)
             elif isinstance(other, _TaskGroup):
@@ -246,12 +249,20 @@ def _install_airflow_stubs() -> None:
             self.env = kw.get("env")
             self.append_env = kw.get("append_env", False)
             self._init_kwargs = dict(kw)
+            self.upstream_task_ids: set = set()
+            self.downstream_task_ids: set = set()
             _BashOperator._instances.append(self)
 
         def __rshift__(self, other):
+            if hasattr(other, "upstream_task_ids"):
+                self.downstream_task_ids.add(other.task_id)
+                other.upstream_task_ids.add(self.task_id)
             return other
 
         def __lshift__(self, other):
+            if hasattr(other, "downstream_task_ids"):
+                other.downstream_task_ids.add(self.task_id)
+                self.upstream_task_ids.add(other.task_id)
             return other
 
     operators_bash_mod.BashOperator = _BashOperator
@@ -305,7 +316,9 @@ def _install_airflow_stubs() -> None:
             elif isinstance(other, _TaskGroup):
                 for left in self.children:
                     for right in other.children:
-                        if isinstance(left, _PythonOperator) and isinstance(right, _PythonOperator):
+                        if isinstance(left, _PythonOperator) and isinstance(
+                            right, _PythonOperator
+                        ):
                             left.downstream_task_ids.add(right.task_id)
                             right.upstream_task_ids.add(left.task_id)
 
@@ -322,7 +335,9 @@ def _install_airflow_stubs() -> None:
             elif isinstance(other, _TaskGroup):
                 for left in other.children:
                     for right in self.children:
-                        if isinstance(left, _PythonOperator) and isinstance(right, _PythonOperator):
+                        if isinstance(left, _PythonOperator) and isinstance(
+                            right, _PythonOperator
+                        ):
                             left.downstream_task_ids.add(right.task_id)
                             right.upstream_task_ids.add(left.task_id)
             return other

@@ -312,6 +312,25 @@ def validate_coverage_contract(doc: Any) -> None:
             "committed-state DQ references unknown tables: "
             + ", ".join(sorted(unknown_dq_tables))
         )
+    later_dq_tables = _require_string_list(
+        committed_dq.get("later_stage_duplicate_tables"),
+        "committed_state_dq.later_stage_duplicate_tables",
+        allow_empty=True,
+    )
+    if len(later_dq_tables) != len(set(later_dq_tables)):
+        raise SofaScoreContractError(
+            "committed_state_dq.later_stage_duplicate_tables contains duplicates"
+        )
+    if set(dq_tables) & set(later_dq_tables):
+        raise SofaScoreContractError(
+            "committed-state and later-stage duplicate tables overlap"
+        )
+    unknown_later_tables = set(later_dq_tables) - set(tables)
+    if unknown_later_tables:
+        raise SofaScoreContractError(
+            "later-stage DQ references unknown tables: "
+            + ", ".join(sorted(unknown_later_tables))
+        )
     required_event_endpoints = _require_string_list(
         committed_dq.get("required_event_endpoints"),
         "committed_state_dq.required_event_endpoints",
@@ -848,9 +867,24 @@ def validate_minimum_coverage(
         raise ValueError("threshold must be in (0, 1]")
     universe = {value for value in universe_ids if value is not None}
     covered = {value for value in covered_ids if value is not None} & universe
-    ratio = 1.0 if not universe else len(covered) / len(universe)
+    # An empty denominator is missing evidence, not perfect coverage.  The
+    # only defensible floor is semantic: at least one expected entity must
+    # exist.  Competition-size guesses would make small valid tournaments fail.
+    ratio = 0.0 if not universe else len(covered) / len(universe)
     missing = sorted(universe - covered, key=repr)
-    report = DQReport(metrics={f"{label}.coverage": ratio})
+    report = DQReport(
+        metrics={
+            f"{label}.coverage": ratio,
+            f"{label}.expected": len(universe),
+            f"{label}.covered": len(covered),
+        }
+    )
+    if not universe:
+        report.add(
+            f"{label}_coverage",
+            f"{label} expected universe is empty; coverage is unproven",
+        )
+        return report
     if ratio < threshold:
         report.add(
             f"{label}_coverage",
@@ -1191,11 +1225,7 @@ def active_registry_partitions(
             tournament.unique_tournament_id,
             canonical,
         )
-        if (
-            season is None
-            or not season.activatable
-            or season.canonical_season is None
-        ):
+        if season is None or not season.activatable or season.canonical_season is None:
             raise SofaScoreContractError(
                 f"active {tournament.canonical_id} season {canonical!r} "
                 "has no activatable SofaScore metadata"
@@ -1229,6 +1259,33 @@ def _sql_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+def _numeric_source_id_mismatch(column: str, expected: str | int) -> str:
+    """Render a type-stable source-ID mismatch predicate.
+
+    Historical Bronze tables inferred SofaScore IDs as ``DOUBLE``. Casting
+    those values directly to varchar produces scientific notation in Trino
+    (for example ``76986`` becomes ``7.6986E4``), which made every otherwise
+    correct season fail DQ. Numeric comparison accepts bigint/varchar/double
+    storage while still treating null, non-numeric and fractional IDs as a
+    mismatch.
+    """
+
+    if not re.fullmatch(
+        r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?", column
+    ):
+        raise ValueError(f"unsafe source-ID column: {column!r}")
+    if isinstance(expected, bool):
+        raise ValueError("expected source ID must be a positive integer")
+    try:
+        expected_id = int(expected)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("expected source ID must be a positive integer") from exc
+    if expected_id <= 0 or str(expected).strip() != str(expected_id):
+        raise ValueError("expected source ID must be a positive integer")
+    numeric = f"TRY_CAST({column} AS double)"
+    return f"{numeric} IS NULL OR {numeric} <> CAST({expected_id} AS double)"
+
+
 def build_partition_dq_queries(
     league: str,
     season: str,
@@ -1249,10 +1306,35 @@ def build_partition_dq_queries(
     season_sql = _sql_literal(str(season))
     source_tournament_sql = _sql_literal(str(source_tournament_id))
     source_season_sql = _sql_literal(str(source_season_id))
+    schedule_season_mismatch = _numeric_source_id_mismatch(
+        "season_id", source_season_id
+    )
+    event_lineage_season_mismatch = _numeric_source_id_mismatch(
+        "source_season_id", source_season_id
+    )
+    event_payload_season_mismatch = _numeric_source_id_mismatch(
+        "season_id", source_season_id
+    )
     scope = f"league = {league_sql} AND season = {season_sql}"
     ss_scope = f"ss.league = {league_sql} AND ss.season = {season_sql}"
     schedule_scope = f"s.league = {league_sql} AND s.season = {season_sql}"
     queries: list[DQQuery] = []
+
+    manifest_key_sql = ", ".join(
+        f'"{column}"' for column in doc["manifest"]["natural_key"]
+    )
+    queries.append(
+        DQQuery(
+            name="duplicate_natural_key[ops.sofascore_capture_manifest]",
+            sql=(
+                "SELECT COUNT(*) FROM ("
+                f"SELECT {manifest_key_sql}, COUNT(*) AS n "
+                f"FROM {doc['manifest']['table']} "
+                f"GROUP BY {manifest_key_sql} HAVING COUNT(*) > 1)"
+            ),
+            expected_value=0,
+        )
+    )
 
     for table_name in doc["committed_state_dq"]["duplicate_tables"]:
         spec = doc["tables"][table_name]
@@ -1261,9 +1343,7 @@ def build_partition_dq_queries(
                 "committed-state duplicate table is not league/season "
                 f"partitioned: {table_name}"
             )
-        key_sql = ", ".join(
-            f'"{column}"' for column in spec["natural_key"]
-        )
+        key_sql = ", ".join(f'"{column}"' for column in spec["natural_key"])
         queries.append(
             DQQuery(
                 name=f"duplicate_natural_key[{table_name}]",
@@ -1296,9 +1376,16 @@ def build_partition_dq_queries(
                 name="skeleton_schedule_rows",
                 sql=(
                     "SELECT COUNT(*) FROM iceberg.bronze.sofascore_schedule "
-                    f"WHERE {scope} AND (game_id IS NULL OR home_team_name IS NULL "
-                    "OR away_team_name IS NULL OR start_timestamp IS NULL "
-                    "OR home_team_name = away_team_name)"
+                    f"WHERE {scope} AND (game_id IS NULL OR "
+                    "COALESCE(NULLIF(TRIM(CAST(home_team_name AS varchar)), ''), "
+                    "NULLIF(TRIM(CAST(home_team AS varchar)), '')) IS NULL OR "
+                    "COALESCE(NULLIF(TRIM(CAST(away_team_name AS varchar)), ''), "
+                    "NULLIF(TRIM(CAST(away_team AS varchar)), '')) IS NULL OR "
+                    "(start_timestamp IS NULL AND date IS NULL) OR "
+                    "COALESCE(NULLIF(TRIM(CAST(home_team_name AS varchar)), ''), "
+                    "NULLIF(TRIM(CAST(home_team AS varchar)), '')) = "
+                    "COALESCE(NULLIF(TRIM(CAST(away_team_name AS varchar)), ''), "
+                    "NULLIF(TRIM(CAST(away_team AS varchar)), '')))"
                 ),
                 expected_value=0,
             ),
@@ -1306,8 +1393,7 @@ def build_partition_dq_queries(
                 name="schedule_season_mismatches",
                 sql=(
                     "SELECT COUNT(*) FROM iceberg.bronze.sofascore_schedule "
-                    f"WHERE {scope} AND (season_id IS NULL OR "
-                    f"CAST(season_id AS varchar) <> {source_season_sql})"
+                    f"WHERE {scope} AND ({schedule_season_mismatch})"
                 ),
                 expected_value=0,
             ),
@@ -1315,10 +1401,42 @@ def build_partition_dq_queries(
                 name="event_season_mismatches",
                 sql=(
                     "SELECT COUNT(*) FROM iceberg.bronze.sofascore_events "
-                    f"WHERE {scope} AND (source_season_id IS NULL OR "
-                    f"CAST(source_season_id AS varchar) <> {source_season_sql})"
+                    f"WHERE {scope} AND (({event_lineage_season_mismatch}) OR "
+                    f"({event_payload_season_mismatch}))"
                 ),
                 expected_value=0,
+            ),
+            *[
+                DQQuery(
+                    name=f"{check_name}_season_mismatches",
+                    sql=(
+                        f"SELECT COUNT(*) FROM iceberg.bronze.{table_name} c "
+                        "LEFT JOIN iceberg.bronze.sofascore_schedule s ON "
+                        "CAST(s.game_id AS varchar) = CAST(c.match_id AS varchar) "
+                        f"WHERE c.league = {league_sql} AND "
+                        f"c.season = {season_sql} AND (s.game_id IS NULL OR "
+                        "CAST(s.season AS varchar) IS DISTINCT FROM "
+                        "CAST(c.season AS varchar) OR "
+                        "s.league IS DISTINCT FROM c.league)"
+                    ),
+                    expected_value=0,
+                )
+                for check_name, table_name in (
+                    ("player_ratings", "sofascore_player_ratings"),
+                    ("event_player_stats", "sofascore_event_player_stats"),
+                    ("match_stats", "sofascore_match_stats"),
+                    ("event_shotmap", "sofascore_event_shotmap"),
+                )
+            ],
+            DQQuery(
+                name="player_profile_expected_universe_nonempty",
+                sql=(
+                    "SELECT COUNT(DISTINCT player_id) FROM "
+                    "iceberg.bronze.sofascore_player_universe "
+                    f"WHERE {scope} AND player_id IS NOT NULL"
+                ),
+                expected_value=1,
+                comparator="gte",
             ),
             DQQuery(
                 name="player_profile_coverage",
@@ -1329,7 +1447,7 @@ def build_partition_dq_queries(
                     f"WHERE {scope} AND player_id IS NOT NULL), "
                     "profiles AS (SELECT DISTINCT player_id FROM "
                     f"iceberg.silver.sofascore_player_profile WHERE {scope}) "
-                    "SELECT CASE WHEN COUNT(*) = 0 THEN 1e0 ELSE "
+                    "SELECT CASE WHEN COUNT(*) = 0 THEN 0e0 ELSE "
                     "CAST(COUNT_IF(p.player_id IS NOT NULL) AS double) / COUNT(*) END "
                     "FROM universe u LEFT JOIN profiles p ON p.player_id = u.player_id"
                 ),
@@ -1337,14 +1455,34 @@ def build_partition_dq_queries(
                 comparator="gte",
             ),
             DQQuery(
+                name="player_rating_expected_appearances_nonempty",
+                sql=(
+                    "SELECT COUNT(*) FROM "
+                    "iceberg.silver.sofascore_player_match_aggregate "
+                    f"WHERE {scope} AND minutes_played > 0"
+                ),
+                expected_value=1,
+                comparator="gte",
+            ),
+            DQQuery(
                 name="player_rating_coverage",
                 sql=(
-                    "SELECT CASE WHEN COUNT(*) = 0 THEN 1e0 ELSE "
+                    "SELECT CASE WHEN COUNT(*) = 0 THEN 0e0 ELSE "
                     "CAST(COUNT_IF(rating IS NOT NULL AND rating > 0) AS double) / "
                     "COUNT(*) END FROM iceberg.silver.sofascore_player_match_aggregate "
                     f"WHERE {scope} AND minutes_played > 0"
                 ),
                 expected_value=float(doc["quality_gates"]["player_rating_coverage"]),
+                comparator="gte",
+            ),
+            DQQuery(
+                name="silver_gold_expected_candidates_nonempty",
+                sql=(
+                    "SELECT COUNT(*) FROM "
+                    "iceberg.silver.sofascore_player_match_aggregate ss "
+                    f"WHERE {ss_scope}"
+                ),
+                expected_value=1,
                 comparator="gte",
             ),
             DQQuery(
@@ -1364,7 +1502,7 @@ def build_partition_dq_queries(
                     "g.match_id AS gold_match_id FROM candidates c LEFT JOIN "
                     "iceberg.gold.fct_lineup g ON g.match_id = c.match_id "
                     "AND g.player_id = c.player_id) SELECT CASE WHEN COUNT(*) = 0 "
-                    "THEN 1e0 ELSE CAST(COUNT_IF(gold_match_id IS NOT NULL) AS double) "
+                    "THEN 0e0 ELSE CAST(COUNT_IF(gold_match_id IS NOT NULL) AS double) "
                     "/ COUNT(*) END FROM attached"
                 ),
                 expected_value=float(doc["quality_gates"]["silver_gold_attach_rate"]),

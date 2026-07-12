@@ -63,12 +63,16 @@ class TransportError(RuntimeError):
         retryable: bool = True,
         browser_sessions: int = 0,
         navigations: int = 0,
+        source_requests: int = 1,
     ) -> None:
         super().__init__(message)
         self.provider_bytes = provider_bytes
         self.retryable = retryable
         self.browser_sessions = browser_sessions
         self.navigations = navigations
+        self.source_requests = source_requests
+        if browser_sessions < 0 or navigations < 0 or source_requests < 0:
+            raise ValueError("transport metrics must be non-negative")
 
 
 @dataclass(frozen=True)
@@ -87,14 +91,19 @@ class HttpPayload:
     provider_bytes: Optional[int] = None
     browser_sessions: int = 0
     navigations: int = 0
+    source_requests: int = 1
 
     def __post_init__(self) -> None:
         if not isinstance(self.body, bytes):
             raise TypeError("HTTP body must be exact bytes")
         if self.provider_bytes is not None and self.provider_bytes < 0:
             raise ValueError("provider_bytes must be non-negative")
-        if self.browser_sessions < 0 or self.navigations < 0:
-            raise ValueError("browser metrics must be non-negative")
+        if (
+            self.browser_sessions < 0
+            or self.navigations < 0
+            or self.source_requests < 0
+        ):
+            raise ValueError("transport metrics must be non-negative")
 
 
 class CaptureTransport(Protocol):
@@ -248,7 +257,10 @@ class CaptureMetrics:
         self._started_at = monotonic()
         self.endpoints = 0
         self.network_requests = 0
+        self.source_requests = 0
         self.provider_bytes = 0
+        self.endpoint_provider_bytes: dict[str, int] = {}
+        self.endpoint_request_provider_bytes: dict[str, list[int]] = {}
         self.browser_sessions = 0
         self.navigations = 0
         self.cache_hits = 0
@@ -264,17 +276,34 @@ class CaptureMetrics:
         with self._lock:
             self.endpoints += 1
 
-    def response(self, payload: HttpPayload) -> None:
+    def _provider_observation(
+        self,
+        endpoint: str,
+        provider_bytes: Optional[int],
+    ) -> None:
+        if provider_bytes is None:
+            return
+        amount = int(provider_bytes)
+        self.endpoint_provider_bytes[endpoint] = (
+            self.endpoint_provider_bytes.get(endpoint, 0) + amount
+        )
+        self.endpoint_request_provider_bytes.setdefault(endpoint, []).append(amount)
+
+    def response(self, endpoint: str, payload: HttpPayload) -> None:
         with self._lock:
             self.network_requests += 1
+            self.source_requests += payload.source_requests
             self.provider_bytes += int(payload.provider_bytes or 0)
+            self._provider_observation(endpoint, payload.provider_bytes)
             self.browser_sessions += payload.browser_sessions
             self.navigations += payload.navigations
 
-    def transport_error(self, error: TransportError) -> None:
+    def transport_error(self, endpoint: str, error: TransportError) -> None:
         with self._lock:
             self.network_requests += 1
+            self.source_requests += error.source_requests
             self.provider_bytes += int(error.provider_bytes or 0)
+            self._provider_observation(endpoint, error.provider_bytes)
             self.browser_sessions += error.browser_sessions
             self.navigations += error.navigations
 
@@ -305,8 +334,15 @@ class CaptureMetrics:
             return {
                 "endpoints": self.endpoints,
                 "request_count": self.network_requests,
+                "endpoint_request_count": self.network_requests,
+                "source_request_count": self.source_requests,
                 "paid_proxy_bytes": self.provider_bytes,
                 "paid_proxy_mb": self.provider_bytes / 1_048_576,
+                "endpoint_provider_bytes": dict(self.endpoint_provider_bytes),
+                "endpoint_request_provider_bytes": {
+                    endpoint: list(values)
+                    for endpoint, values in self.endpoint_request_provider_bytes.items()
+                },
                 "browser_sessions": self.browser_sessions,
                 "navigations": self.navigations,
                 "cache_hits": self.cache_hits,
@@ -395,6 +431,19 @@ class SofaScoreCaptureEngine:
         provider_bytes: int = 0,
         parsed: bool = False,
     ) -> EndpointManifest:
+        previous = self.manifest_store.get(spec.key)
+        # Offline/raw replay must not erase the provider traffic provenance of
+        # the network capture that produced the immutable blob. Metrics still
+        # count replay as zero traffic; only the persisted endpoint observation
+        # retains its original provider bytes.
+        persisted_provider_bytes = max(0, provider_bytes)
+        if (
+            response is None
+            and persisted_provider_bytes == 0
+            and previous is not None
+            and previous.provider_bytes > 0
+        ):
+            persisted_provider_bytes = previous.provider_bytes
         record = EndpointManifest(
             key=spec.key,
             status=status,
@@ -409,7 +458,7 @@ class SofaScoreCaptureEngine:
             error_type=type(error).__name__ if error else None,
             error_message=str(error)[:4000] if error else None,
             duration_ms=max(0, duration_ms),
-            provider_bytes=max(0, provider_bytes),
+            provider_bytes=persisted_provider_bytes,
             fetched_at=raw.fetched_at if raw else None,
             parsed_at=utc_now_iso() if parsed else None,
         )
@@ -442,10 +491,19 @@ class SofaScoreCaptureEngine:
                     "paid SofaScore capture requires a verified shared proxy budget"
                 )
             token, maximum = self.budget.reserve(self.run_id, spec.key.endpoint)
-        if not self.rate_limiter.acquire():
+        # A browser transport sees navigation and passive/exact XHRs that the
+        # endpoint engine cannot enumerate. It owns pacing for those real HTTP
+        # requests; applying this logical limiter too would double-throttle each
+        # exact JSON endpoint after it had already reserved its budget token.
+        transport_paces = bool(getattr(self.transport, "paces_requests", False))
+        if not transport_paces and not self.rate_limiter.acquire():
             if spec.paid_proxy and token is not None:
                 self.budget.cancel(self.run_id, token)
-            raise TransportError("SofaScore rate limiter refused a request", provider_bytes=0)
+            raise TransportError(
+                "SofaScore rate limiter refused a request",
+                provider_bytes=0,
+                source_requests=0,
+            )
         if not spec.paid_proxy:
             return None
         return ProviderBudgetToken(
@@ -495,7 +553,7 @@ class SofaScoreCaptureEngine:
         try:
             response = self.transport.request(spec.url, provider_budget=transport_budget)
         except TransportError as exc:
-            self.metrics.transport_error(exc)
+            self.metrics.transport_error(spec.key.endpoint, exc)
             if spec.paid_proxy:
                 if exc.provider_bytes is None:
                     # Unknown paid traffic cannot be retried safely: the shared
@@ -518,7 +576,7 @@ class SofaScoreCaptureEngine:
         self._finish_authorized_response(
             spec, transport_budget, response.provider_bytes
         )
-        self.metrics.response(response)
+        self.metrics.response(spec.key.endpoint, response)
         return response
 
     @staticmethod
@@ -688,6 +746,50 @@ class SofaScoreCaptureEngine:
             return self._finish_result(
                 CaptureResult(manifest=existing, cache_hit=True), started
             )
+        if existing and existing.is_terminal and force_replay:
+            replay_without_json = (
+                existing.status == ManifestStatus.NOT_SUPPORTED
+                or (
+                    existing.status == ManifestStatus.LEGITIMATE_EMPTY
+                    and existing.http_status in spec.legitimate_empty_http_statuses
+                )
+            )
+            if replay_without_json:
+                raw = None
+                try:
+                    _, raw = self.raw_store.load_bytes(spec.raw_target)
+                except RawPayloadNotFound:
+                    if existing.raw_content_hash or existing.raw_blob_key:
+                        raise OfflineReplayMiss(
+                            "terminal endpoint raw lineage is missing for "
+                            f"{spec.key.stable_id()}"
+                        ) from None
+                if raw is not None:
+                    if (
+                        raw.http_status != existing.http_status
+                        or raw.content_hash != existing.raw_content_hash
+                        or raw.blob_key != existing.raw_blob_key
+                    ):
+                        raise RawPayloadSchemaError(
+                            "terminal endpoint manifest/raw lineage mismatch for "
+                            f"{spec.key.stable_id()}"
+                        )
+                if existing.status == ManifestStatus.NOT_SUPPORTED:
+                    if spec.supported and (
+                        existing.http_status not in spec.not_supported_http_statuses
+                    ):
+                        raise RawPayloadSchemaError(
+                            "saved not-supported HTTP status is not valid for "
+                            f"{spec.key.stable_id()}"
+                        )
+                return self._finish_result(
+                    CaptureResult(
+                        manifest=existing,
+                        raw=raw,
+                        replay_hit=True,
+                    ),
+                    started,
+                )
         if not spec.supported:
             manifest = self._record(
                 spec,
@@ -701,6 +803,30 @@ class SofaScoreCaptureEngine:
             body, raw = self.raw_store.load_bytes(spec.raw_target)
         except RawPayloadNotFound:
             body = raw = None
+        if raw is not None and raw.http_status in spec.not_supported_http_statuses:
+            manifest = self._record(
+                spec,
+                status=ManifestStatus.NOT_SUPPORTED,
+                attempts=attempts_before,
+                raw=raw,
+                provider_bytes=0,
+            )
+            return self._finish_result(
+                CaptureResult(manifest=manifest, raw=raw, replay_hit=True),
+                started,
+            )
+        if raw is not None and raw.http_status in spec.legitimate_empty_http_statuses:
+            manifest = self._record(
+                spec,
+                status=ManifestStatus.LEGITIMATE_EMPTY,
+                attempts=attempts_before,
+                raw=raw,
+                provider_bytes=0,
+            )
+            return self._finish_result(
+                CaptureResult(manifest=manifest, raw=raw, replay_hit=True),
+                started,
+            )
         if raw is not None and 200 <= raw.http_status < 300:
             result = self._materialize(
                 spec,
@@ -857,7 +983,7 @@ class SofaScoreCaptureEngine:
         charged = self._finish_authorized_response(
             spec, authorization, response.provider_bytes
         )
-        self.metrics.response(response)
+        self.metrics.response(spec.key.endpoint, response)
         raw = self.raw_store.store_bytes(
             spec.raw_target,
             response.body,

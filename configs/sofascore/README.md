@@ -30,7 +30,11 @@ make sofascore-discovery
 The scheduled GitHub workflow performs an `active-reviewed` direct refresh on
 Monday through Saturday and a complete category scan on Sunday. It opens or
 updates a review PR when metadata changes. Both scopes use the public JSON API
-only. `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, lower-case variants, and the
+only. The trusted discovery job requires a Linux self-hosted runner labelled
+`sofascore-direct`; pull requests stay on GitHub-hosted runners and execute
+only the network-free poison-proxy contracts. Hosted Ubuntu, macOS and Windows
+egress currently receives the same source-side HTTP 403 and must not be used as
+a proxy/browser fallback. `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, lower-case variants, and the
 repository proxy file are disabled at the libcurl transport layer; the report
 always records zero paid-proxy bytes, browser sessions, and navigations. A 403,
 missing category fan-out, missing season response, or schema error aborts before
@@ -57,3 +61,79 @@ python dags/scripts/manage_sofascore_registry.py 7 enable
 `enable` re-evaluates the full source-plus-review evidence and refuses unknown,
 women, mixed, youth, reserve, futsal, or seasonless records. Airflow mounts this
 registry read-only; discovery and operator commands are the only writers.
+
+## Production table bootstrap
+
+Before the first raw-first deployment, render and inspect the idempotent Iceberg
+DDL, run a read-only preflight, then apply it from the Airflow runtime:
+
+```bash
+python scripts/migrate_sofascore_production.py --dry-run
+python scripts/migrate_sofascore_production.py --preflight
+python scripts/migrate_sofascore_production.py --apply
+```
+
+The bootstrap creates the long `ops.sofascore_capture_manifest` contract and
+empty normalized Bronze table contracts needed for query planning. Before the
+new MERGE writers run, it also evolves legacy `sofascore_match_stats` with a
+deterministic `statistic_key`, normalizes standings `group` to `__total__`, and
+atomically deduplicates both natural keys when needed. Preflight requires every
+natural-key component to be non-null and duplicate-free. It never inserts
+source rows or synthetic success states. Therefore bootstrap removes rollout
+schema failures but committed-state DQ still fails until real raw-backed
+endpoint captures are complete.
+
+## Paid-proxy canary
+
+`dag_canary_sofascore_proxy` is paused and manual-only. Trigger it with an
+explicit positive `experimental_cap_bytes` matching proxy-filter's isolated
+`sofascore_canary` cap. It resumes each v2 workload class toward at least 20
+accepted cold runs: a full 25-match batch and 50-player batch for each enabled
+source tournament, plus the enabled EPL and World Cup season shapes. Every cold class run
+gets a fresh raw store, manifest, browser and lease. If a class has fewer than
+five distinct anonymized exits after 20 runs, raise `target_cold_runs` explicitly
+and collect more evidence.
+
+The DAG atomically appends only to a private candidate under
+`/opt/airflow/logs/sofascore-canary/runs/<dag-run-sha256>/`. Retries resume that
+same candidate; another DagRun cannot see it. An `all_done` DQ task requires a
+successful producer plus a current-run manifest whose artifact and runtime
+fingerprint hashes still match. The checked-in production artifact is mounted
+read-only, and the DAG has no verification or promotion task. To run the same
+collector locally and then perform the separate review gate:
+
+```bash
+python scripts/research/bench_sofascore_paid_canary.py bootstrap \
+  --experimental-cap-bytes <configured-cap>
+python scripts/research/bench_sofascore_paid_canary.py collect \
+  --experimental-cap-bytes <configured-cap> --target-cold-runs 20
+python scripts/research/bench_sofascore_paid_canary.py verify
+```
+
+Match and player classes are source-tournament scoped (`..._t16`, `..._t17`).
+The World Cup match fixture has 25 source-evidenced finished events. Its player
+fixture stays empty with an explicit blocker until 50 players can be derived
+from World Cup squads or match payloads. An EPL class cannot authorize World
+Cup traffic. Collection reports that blocked class and continues gathering
+independent EPL, World Cup match and season evidence; verification still fails
+closed until the blocker is removed by source evidence.
+
+`verify` changes only `verified` and does so atomically after validating every
+class's exact request map, raw-once evidence, class-specific full-batch/season
+shape, all benchmark modes, at least 20 cold runs and five exit hashes per
+class. `no_op` and offline replay must each show zero allocation, zero lease and
+zero network requests. Artifacts contain no raw exit, token, proxy URL or
+response payload.
+
+Production uses three immutable signed snapshots under one Airflow run:
+bounded season expansion (`<run_id>::season`), match-only batches after its raw
+commit (`<run_id>::targets`), and player-only batches (`<run_id>::players`).
+The player plan is created only after every match task and the weekly/manual
+gate; it rereads squads plus current Bronze lineups, incidents, event-player
+stats and ratings, so newly seen players cannot be silently dropped. The
+filtering proxy persists one parent envelope/manifest for the base run. Its cap
+is exactly the sum of unique signed allocations in all registered phases;
+retries reuse the same balance, and a different plan for any phase is rejected.
+A raw/manifest no-op creates no allocation and never opens a lease. The DAG is
+serialized (`max_active_tasks=1`) because production permits one SofaScore
+lease at a time.

@@ -1,10 +1,4 @@
-"""Unit tests for the SofaScore Camoufox capture transport pure helpers (#757).
-
-The browser orchestration (``SofascoreCamoufoxCapture.capture_event``) is live
-integration — represented by saved ``tests/fixtures/sofascore_*`` JSON. Here we
-test the pure response-classification / selection logic that decides what counts
-as real data, which has no browser dependency.
-"""
+"""Unit tests for the production exact-JSON Camoufox transport."""
 import json
 from unittest.mock import MagicMock
 
@@ -12,57 +6,15 @@ import pytest
 
 from scrapers.sofascore.camoufox_capture import (
     SofascoreCamoufoxCapture,
-    event_url,
-    extract_events,
-    extract_player_from_next_data,
-    fetch_names_for_tabs,
-    finished_event_ids,
     is_challenge,
     is_data_api_url,
     merge_capture,
     normalize_event,
-    parse_proxy_line,
-    player_url,
     response_path,
-    select_event_endpoints,
     should_block_request,
 )
 
 pytestmark = pytest.mark.unit
-
-
-def test_explicit_camoufox_requests_are_rate_limited_individually():
-    calls = []
-    cap = SofascoreCamoufoxCapture(
-        request_limiter=lambda: calls.append("request") or True,
-        settle_ms=0,
-    )
-    cap._page = MagicMock()
-    cap._page.evaluate.side_effect = [
-        {"status": 200, "body": '{"event":{"id":7}}', "headers": {}},
-        {
-            "status": 200,
-            "body": '{"home":{"players":[]},"away":{"players":[]}}',
-            "headers": {},
-        },
-        {"status": 200, "body": '{"statistics":[]}', "headers": {}},
-    ]
-
-    cap.fetch_event(7, names=("event", "lineups"))
-    cap.fetch_api_json("/api/v1/event/7/statistics")
-    for endpoint in ("event/7", "event/7/lineups", "event/7/statistics"):
-        cap._maybe_block(
-            _FakeRoute(
-                "xhr",
-                f"https://www.sofascore.com/api/v1/{endpoint}",
-            )
-        )
-    cap._navigate("https://www.sofascore.com/event/7")
-
-    # Two endpoint fetches + one arbitrary API fetch + one navigation.
-    assert calls == ["request"] * 4
-    assert cap._api_fetch_count == 3
-    assert cap._navigation_count == 1
 
 
 # --------------------------------------------------------------------------- #
@@ -126,107 +78,6 @@ def test_is_challenge_false_for_non_dict():
     assert is_challenge("nope") is False
 
 
-# --------------------------------------------------------------------------- #
-#  event_url                                                                  #
-# --------------------------------------------------------------------------- #
-def test_event_url_builds_www_event_path():
-    assert event_url(15186878) == "https://www.sofascore.com/event/15186878"
-
-
-# --------------------------------------------------------------------------- #
-#  select_event_endpoints                                                     #
-# --------------------------------------------------------------------------- #
-def test_select_event_endpoints_returns_only_real_json():
-    # Arrange — a mixed buffer like a real capture: lineups real, statistics
-    # challenge-403, shotmap missing, event real, incidents non-200.
-    eid = 999
-    buffer = {
-        f"/api/v1/event/{eid}": {"status": 200, "json": {"event": {"id": eid}}, "challenge": False},
-        f"/api/v1/event/{eid}/lineups": {"status": 200, "json": {"home": {}, "away": {}}, "challenge": False},
-        f"/api/v1/event/{eid}/statistics": {"status": 403, "json": {"error": {"reason": "challenge"}}, "challenge": True},
-        f"/api/v1/event/{eid}/incidents": {"status": 304, "json": None, "challenge": None},
-        # shotmap absent from buffer entirely
-    }
-    # Act
-    out = select_event_endpoints(buffer, eid)
-    # Assert — only the two real endpoints, keyed by entity name
-    assert set(out) == {"event", "lineups"}
-    assert out["lineups"] == {"home": {}, "away": {}}
-    assert out["event"] == {"event": {"id": eid}}
-
-
-def test_select_event_endpoints_empty_when_all_challenged():
-    eid = 1
-    buffer = {
-        f"/api/v1/event/{eid}/lineups": {"status": 403, "json": {"error": {"reason": "challenge"}}, "challenge": True},
-    }
-    assert select_event_endpoints(buffer, eid) == {}
-
-
-# --------------------------------------------------------------------------- #
-#  parse_proxy_line                                                           #
-# --------------------------------------------------------------------------- #
-def test_parse_proxy_line_valid():
-    assert parse_proxy_line("1.2.3.4:10000:user:pass") == {
-        "server": "http://1.2.3.4:10000", "username": "user", "password": "pass",
-    }
-
-
-def test_parse_proxy_line_password_with_colons():
-    out = parse_proxy_line("host:8080:u:p:a:s:s")
-    assert out["password"] == "p:a:s:s"
-    assert out["server"] == "http://host:8080"
-
-
-@pytest.mark.parametrize("line", ["", "   ", "# comment", "host:port:only-three"])
-def test_parse_proxy_line_rejects_bad_lines(line):
-    assert parse_proxy_line(line) is None
-
-
-# --------------------------------------------------------------------------- #
-#  events parsing (schedule + event-id resolution)                           #
-# --------------------------------------------------------------------------- #
-def _events_buffer():
-    """A capture buffer with one events/last page (finished + scheduled) plus a
-    challenged page and an unrelated entry — mirrors a real capture."""
-    return {
-        "/api/v1/unique-tournament/17/season/76986/events/last/0": {
-            "status": 200, "challenge": False, "json": {"events": [
-                {"id": 1, "status": {"type": "finished"},
-                 "homeTeam": {"name": "A"}, "awayTeam": {"name": "B"},
-                 "homeScore": {"current": 2}, "awayScore": {"current": 1},
-                 "startTimestamp": 1719000000},
-                {"id": 2, "status": {"type": "notstarted"},
-                 "homeTeam": {"name": "C"}, "awayTeam": {"name": "D"}},
-            ]},
-        },
-        # duplicate id 1 from the next page — must dedupe
-        "/api/v1/unique-tournament/17/season/76986/events/next/0": {
-            "status": 200, "challenge": False, "json": {"events": [
-                {"id": 1, "status": {"type": "finished"}, "homeTeam": {"name": "A"}},
-                {"id": 3, "status": {"type": "inprogress"}},
-            ]},
-        },
-        # challenged events page — must be ignored
-        "/api/v1/unique-tournament/99/season/1/events/last/0": {
-            "status": 403, "challenge": True, "json": {"error": {"reason": "challenge"}},
-        },
-        # unrelated entry
-        "/api/v1/event/1/lineups": {"status": 200, "challenge": False, "json": {"home": {}}},
-    }
-
-
-def test_extract_events_dedupes_across_pages_and_skips_challenged():
-    events = extract_events(_events_buffer())
-    ids = sorted(e["id"] for e in events)
-    assert ids == [1, 2, 3]  # deduped, challenged page skipped
-
-
-def test_finished_event_ids_only_finished():
-    events = extract_events(_events_buffer())
-    assert finished_event_ids(events) == ["1"]
-
-
 def test_normalize_event_flattens_row():
     # #840: auto-passthrough — source-key names, nested objects flatten with a
     # path prefix (homeTeam.name -> home_team_name). Silver renames/derives.
@@ -281,140 +132,6 @@ def test_normalize_event_missing_round_and_scores():
 
 
 # --------------------------------------------------------------------------- #
-#  extract_tournament_events (ut_id-filtered schedule capture — #757 B1)      #
-# --------------------------------------------------------------------------- #
-def _tournament_buffer():
-    """A league-page capture buffer mirroring the #757 B0 spike: the target
-    ut=17 schedule arrives via /events/{round,last}, AND a FEATURED other
-    tournament (ut=16) fires its own /events/last|next that must be ignored."""
-    return {
-        "/api/v1/unique-tournament/17/season/96668/events/round/1": {
-            "status": 200, "challenge": False, "json": {"events": [
-                {"id": 101, "status": {"type": "finished"}},
-                {"id": 102, "status": {"type": "notstarted"}},
-            ]}},
-        # last page (finished) — id 101 overlaps round/1 and must dedupe.
-        "/api/v1/unique-tournament/17/season/96668/events/last/0": {
-            "status": 200, "challenge": False, "json": {"events": [
-                {"id": 101, "status": {"type": "finished"}},
-                {"id": 103, "status": {"type": "finished"}},
-            ]}},
-        # FEATURED other tournament — MUST be excluded (the B0 wrong-ut bug).
-        "/api/v1/unique-tournament/16/season/58210/events/last/0": {
-            "status": 200, "challenge": False, "json": {"events": [
-                {"id": 901, "status": {"type": "finished"}},
-            ]}},
-        # challenged target path — ignored.
-        "/api/v1/unique-tournament/17/season/96668/events/next/0": {
-            "status": 403, "challenge": True, "json": {"error": {"reason": "challenge"}}},
-    }
-
-
-def test_extract_tournament_events_filters_by_ut_id_and_dedupes():
-    from scrapers.sofascore.camoufox_capture import extract_tournament_events
-    events = extract_tournament_events(_tournament_buffer(), 17)
-    ids = sorted(e["id"] for e in events)
-    # 101 deduped across round+last; 901 (ut=16 featured) excluded; challenged out.
-    assert ids == [101, 102, 103]
-
-
-def test_extract_tournament_events_feeds_finished_event_ids():
-    from scrapers.sofascore.camoufox_capture import extract_tournament_events
-    events = extract_tournament_events(_tournament_buffer(), 17)
-    assert finished_event_ids(events) == ["101", "103"]
-
-
-def test_extract_tournament_events_empty_for_absent_ut():
-    from scrapers.sofascore.camoufox_capture import extract_tournament_events
-    assert extract_tournament_events(_tournament_buffer(), 8) == []
-
-
-# --------------------------------------------------------------------------- #
-#  capture_event retry (lineups reliability — #757)                           #
-# --------------------------------------------------------------------------- #
-class TestCaptureEventRetry:
-    """capture_event re-navigates when a required endpoint (default lineups)
-    is missing — the live runner saw ~1/2 lineup misses without retry (a tab
-    XHR or its body-read races). We patch _navigate so no browser
-    is needed and drive the buffer state per attempt.
-    """
-
-    def _cap(self):
-        from unittest.mock import MagicMock
-        from scrapers.sofascore.camoufox_capture import SofascoreCamoufoxCapture
-        cap = SofascoreCamoufoxCapture(proxy=None)
-        cap._page = MagicMock()  # only wait_for_timeout is touched
-        return cap
-
-    def test_retries_until_lineups_present(self):
-        # Arrange — attempt 1 captures only the event; attempt 2 adds lineups.
-        cap = self._cap()
-        eid = 555
-        states = [
-            {f"/api/v1/event/{eid}": {"status": 200, "json": {"event": 1}, "challenge": False}},
-            {f"/api/v1/event/{eid}": {"status": 200, "json": {"event": 1}, "challenge": False},
-             f"/api/v1/event/{eid}/lineups": {"status": 200, "json": {"home": {}, "away": {}}, "challenge": False}},
-        ]
-        calls = {"n": 0}
-
-        def fake_navigate(url, extra_settle_ms=0):
-            cap._buffer = states[calls["n"]]
-            calls["n"] += 1
-
-        cap._navigate = fake_navigate
-
-        # Act
-        result = cap.capture_event(eid, required=("lineups",), max_attempts=3)
-
-        # Assert — retried exactly once, lineups recovered.
-        assert calls["n"] == 2
-        assert "lineups" in result
-        assert "event" in result
-
-    def test_stops_after_max_attempts_when_lineups_never_arrive(self):
-        # Arrange — lineups never show up; event always does.
-        cap = self._cap()
-        eid = 777
-        calls = {"n": 0}
-
-        def fake_navigate(url, extra_settle_ms=0):
-            cap._buffer = {
-                f"/api/v1/event/{eid}": {"status": 200, "json": {"e": 1}, "challenge": False},
-            }
-            calls["n"] += 1
-
-        cap._navigate = fake_navigate
-
-        # Act
-        result = cap.capture_event(eid, required=("lineups",), max_attempts=3)
-
-        # Assert — exhausted attempts, returns whatever was captured (no raise).
-        assert calls["n"] == 3
-        assert "lineups" not in result
-        assert "event" in result
-
-    def test_no_retry_when_required_empty(self):
-        # Arrange — required=() means "take one pass, don't retry".
-        cap = self._cap()
-        eid = 999
-        calls = {"n": 0}
-
-        def fake_navigate(url, extra_settle_ms=0):
-            cap._buffer = {
-                f"/api/v1/event/{eid}": {"status": 200, "json": {"e": 1}, "challenge": False},
-            }
-            calls["n"] += 1
-
-        cap._navigate = fake_navigate
-
-        # Act
-        cap.capture_event(eid, required=(), max_attempts=3)
-
-        # Assert — single navigation, no retry loop.
-        assert calls["n"] == 1
-
-
-# --------------------------------------------------------------------------- #
 #  merge_capture — 304/no-body must not clobber a good capture (#751 PR2)      #
 # --------------------------------------------------------------------------- #
 def test_merge_capture_takes_new_when_no_existing():
@@ -462,41 +179,8 @@ def test_merge_capture_keeps_terminal_404_over_later_transport_error():
     assert merge_capture(terminal, retryable) is terminal
 
 
-def test_event_endpoint_states_distinguish_terminal_404_from_retryable_503():
-    from scrapers.sofascore.camoufox_capture import SofascoreCamoufoxCapture
-
-    cap = SofascoreCamoufoxCapture(proxy=None)
-    cap._buffer = {
-        "/api/v1/event/7": {
-            "status": 200,
-            "json": {"event": {"id": 7}},
-            "challenge": False,
-        },
-        "/api/v1/event/7/lineups": {
-            "status": 404,
-            "json": None,
-            "challenge": False,
-        },
-        "/api/v1/event/7/statistics": {
-            "status": 503,
-            "json": None,
-            "challenge": False,
-        },
-    }
-
-    assert cap.event_endpoint_states(
-        7,
-        names=("event", "lineups", "statistics", "shotmap"),
-    ) == {
-        "event": "success",
-        "lineups": "not_available",
-        "statistics": "server_error",
-        "shotmap": "missing",
-    }
-
-
 # --------------------------------------------------------------------------- #
-#  _on_response wiring + capture_event accumulation across retries (#751 PR2)  #
+#  _on_response wiring                                                       #
 # --------------------------------------------------------------------------- #
 class _FakeResp:
     """Minimal Playwright Response stand-in: _on_response touches url/status/json."""
@@ -533,325 +217,11 @@ def test_on_response_does_not_clobber_good_capture_with_304():
     assert rec["status"] == 200
 
 
-def test_capture_event_accumulates_statistics_across_retry():
-    """The retry that recovers a missing `lineups` must NOT lose a `statistics`
-    captured on an earlier pass (re-nav serves it as a 304/no-body). Pre-PR2
-    this regressed because the buffer was reset per attempt — RED then."""
-    from unittest.mock import MagicMock
-    cap = _cap_no_browser()
-    cap._page = MagicMock()  # only wait_for_timeout is touched
-    eid = 42
-    stats_url = f"https://www.sofascore.com/api/v1/event/{eid}/statistics"
-    lineups_url = f"https://www.sofascore.com/api/v1/event/{eid}/lineups"
-    calls = {"n": 0}
-
-    def fake_navigate(url, extra_settle_ms=0):
-        # Attempt 1: statistics arrives, lineups does NOT.
-        # Attempt 2: lineups arrives; statistics re-served as a 304/no-body.
-        if calls["n"] == 0:
-            cap._on_response(_FakeResp(stats_url, 200, {"statistics": [{"period": "ALL"}]}))
-        else:
-            cap._on_response(_FakeResp(lineups_url, 200, {"home": {}, "away": {}}))
-            cap._on_response(_FakeResp(stats_url, 304, None, raise_json=True))
-        calls["n"] += 1
-
-    cap._navigate = fake_navigate
-
-    # Act — require lineups so attempt 1 (no lineups) forces a retry.
-    result = cap.capture_event(eid, required=("lineups",), max_attempts=3)
-
-    # Assert — retried once, BOTH endpoints present (statistics survived).
-    assert calls["n"] == 2
-    assert "lineups" in result
-    assert "statistics" in result
-    assert result["statistics"] == {"statistics": [{"period": "ALL"}]}
-
-
-# --------------------------------------------------------------------------- #
-#  In-page fetch (#842) — fetch_names_for_tabs + fetch_event                   #
-# --------------------------------------------------------------------------- #
-def test_fetch_names_for_tabs_all_event_tabs():
-    names = fetch_names_for_tabs(("Lineups", "Statistics", "Shotmap"))
-    assert names == ("event", "lineups", "statistics", "shotmap")
-
-
-def test_fetch_names_for_tabs_lineups_only_and_unknown():
-    # event + lineups always ride along; unknown tab labels are ignored.
-    assert fetch_names_for_tabs(("Lineups",)) == ("event", "lineups")
-    assert fetch_names_for_tabs(("Season",)) == ("event", "lineups")
-    assert fetch_names_for_tabs(()) == ("event", "lineups")
-
-
-class TestFetchEvent:
-    """fetch_event (#842): same-origin in-page fetch of the per-event JSON
-    endpoints on the already-navigated page — no re-navigation. Bodies are
-    parsed in Python (no settle-window race) and selected via
-    select_event_endpoints; a challenged/failed endpoint stays missing so the
-    caller can fall back to a full capture_event navigation."""
-
-    def _cap_with_page(self, responder):
-        from unittest.mock import MagicMock
-        cap = _cap_no_browser()
-        cap._page = MagicMock()
-        cap._page.evaluate.side_effect = lambda js, path=None: responder(path)
-        return cap
-
-    def test_fetches_named_endpoints_and_selects_json(self):
-        eid = 42
-        bodies = {
-            f"/api/v1/event/{eid}": {"event": {"id": eid}},
-            f"/api/v1/event/{eid}/lineups": {"home": {}, "away": {}},
-            f"/api/v1/event/{eid}/statistics": {"statistics": []},
-            f"/api/v1/event/{eid}/shotmap": {"shotmap": []},
-        }
-        cap = self._cap_with_page(
-            lambda path: {"status": 200, "body": json.dumps(bodies[path])})
-
-        result = cap.fetch_event(
-            eid, names=("event", "lineups", "statistics", "shotmap"),
-            fetch_wait_ms=0,
-        )
-
-        assert set(result) == {"event", "lineups", "statistics", "shotmap"}
-        assert result["lineups"] == {"home": {}, "away": {}}
-        # No navigation happened — only in-page evaluate calls.
-        cap._page.goto.assert_not_called()
-
-    def test_challenged_endpoint_stays_missing(self):
-        # Clearance expired mid-session: the API starts answering 403 challenge.
-        eid = 7
-
-        def responder(path):
-            if path.endswith("/lineups"):
-                return {"status": 403,
-                        "body": json.dumps({"error": {"reason": "challenge"}})}
-            return {"status": 200, "body": json.dumps({"ok": 1})}
-
-        cap = self._cap_with_page(responder)
-        result = cap.fetch_event(eid, names=("event", "lineups"), fetch_wait_ms=0)
-
-        assert "lineups" not in result   # caller will fall back to a full nav
-        assert "event" in result
-
-    def test_evaluate_error_yields_missing_not_raise(self):
-        def responder(path):
-            raise RuntimeError("page gone")
-
-        cap = self._cap_with_page(responder)
-        result = cap.fetch_event(9, names=("event", "lineups"), fetch_wait_ms=0)
-        assert result == {}
-
-    def test_non_json_body_stays_missing(self):
-        cap = self._cap_with_page(
-            lambda path: {"status": 200, "body": "<html>cf challenge</html>"})
-        result = cap.fetch_event(5, names=("lineups",), fetch_wait_ms=0)
-        assert result == {}
-
-
-class TestFetchPlayer:
-    """fetch_player (#842): in-page fetch of the player bio + season stats —
-    no navigation. /api/v1/player/{id} SSRs the identical `player` object into
-    __NEXT_DATA__ (live-probed 2026-07-02), and the target (ut, season_id) is
-    resolved from /statistics/seasons in Python instead of the picker."""
-
-    _PID = "924378"
-    _PLAYER = {"id": 924378, "name": "Sepp van den Berg", "height": 192}
-    _SEASONS = {"uniqueTournamentSeasons": [{
-        "uniqueTournament": {"id": 17},
-        "seasons": [{"year": "25/26", "id": 76986},
-                    {"year": "24/25", "id": 61627}],
-    }]}
-    _OVERALL = {"statistics": {"rating": 7.1, "appearances": 30}}
-
-    def _cap_with_page(self, responder):
-        from unittest.mock import MagicMock
-        cap = _cap_no_browser()
-        cap._page = MagicMock()
-        cap._page.evaluate.side_effect = lambda js, path=None: responder(path)
-        return cap
-
-    def _responder(self, path):
-        bodies = {
-            f"/api/v1/player/{self._PID}": {"player": self._PLAYER},
-            f"/api/v1/player/{self._PID}/statistics/seasons": self._SEASONS,
-            (f"/api/v1/player/{self._PID}/unique-tournament/17"
-             f"/season/76986/statistics/overall"): self._OVERALL,
-        }
-        return {"status": 200, "body": json.dumps(bodies[path])}
-
-    def test_profile_and_season_stats_fetched(self):
-        cap = self._cap_with_page(self._responder)
-        out = cap.fetch_player(self._PID, target_ut=17, target_year="25/26",
-                               fetch_wait_ms=0)
-        assert out["profile"] == self._PLAYER
-        # seasons list + the EXACT (ut=17, sid=76986) overall — resolved in
-        # Python, no Season-tab picker involved.
-        assert set(out["season_buffer"]) == {
-            f"/api/v1/player/{self._PID}/statistics/seasons",
-            (f"/api/v1/player/{self._PID}/unique-tournament/17"
-             f"/season/76986/statistics/overall"),
-        }
-        # The overall record carries real JSON, ready for
-        # select_player_season_stats downstream.
-        overall = out["season_buffer"][
-            (f"/api/v1/player/{self._PID}/unique-tournament/17"
-             f"/season/76986/statistics/overall")]
-        assert overall["json"] == self._OVERALL
-
-    def test_challenged_bio_returns_profile_none(self):
-        cap = self._cap_with_page(lambda path: {
-            "status": 403,
-            "body": json.dumps({"error": {"reason": "challenge"}}),
-        })
-        out = cap.fetch_player(self._PID, target_ut=17, target_year="25/26",
-                               fetch_wait_ms=0)
-        assert out["profile"] is None       # caller falls back to a full nav
-        assert out["season_buffer"] == {}
-
-    def test_no_target_ut_fetches_bio_only(self):
-        cap = self._cap_with_page(self._responder)
-        out = cap.fetch_player(self._PID, fetch_wait_ms=0)
-        assert out["profile"] == self._PLAYER
-        assert out["season_buffer"] == {}
-        assert cap._page.evaluate.call_count == 1
-
-    def test_unresolved_season_skips_overall_fetch(self):
-        # The player never played the target competition/season — the seasons
-        # list has no (ut, year) match, so no overall fetch fires.
-        cap = self._cap_with_page(self._responder)
-        out = cap.fetch_player(self._PID, target_ut=17, target_year="19/20",
-                               fetch_wait_ms=0)
-        assert out["profile"] == self._PLAYER
-        assert set(out["season_buffer"]) == {
-            f"/api/v1/player/{self._PID}/statistics/seasons"}
-        assert cap._page.evaluate.call_count == 2
-
-
-# --------------------------------------------------------------------------- #
-#  Per-player helpers (#751 PR3) — profile snapshot                           #
-#  Shapes mirror the checked-in live SofaScore JSON fixtures.                  #
-# --------------------------------------------------------------------------- #
-def test_player_url_uses_dummy_slug():
-    assert player_url(1416535) == "https://www.sofascore.com/player/x/1416535"
-
-
-def _next_data(pid=1416535):
-    # bio at props.pageProps.player with the fields _flatten_player_profile reads.
-    return {
-        "props": {"pageProps": {"player": {
-            "id": pid, "name": "Charalampos Kostoulas",
-            "slug": "kostoulas-charalampos", "position": "F",
-            "height": 185, "preferredFoot": "Right",
-            "dateOfBirthTimestamp": 1180483200,
-            "team": {"id": 30, "name": "Brighton & Hove Albion"},
-        }}}
-    }
-
-
-def test_extract_player_from_next_data_digs_pageprops_player():
-    player = extract_player_from_next_data(_next_data(1416535), 1416535)
-    assert player is not None
-    assert player["name"] == "Charalampos Kostoulas"
-    assert player["height"] == 185
-
-
-def test_extract_player_from_next_data_matches_str_or_int_id():
-    assert extract_player_from_next_data(_next_data(1416535), "1416535") is not None
-
-
-def test_extract_player_from_next_data_none_on_id_mismatch():
-    # A wrong-page SSR (different player) must not yield a mismatched row.
-    assert extract_player_from_next_data(_next_data(999), 1416535) is None
-
-
-@pytest.mark.parametrize("nd", [None, {}, {"props": {}}, {"props": {"pageProps": {}}}])
-def test_extract_player_from_next_data_none_on_missing(nd):
-    assert extract_player_from_next_data(nd, 1416535) is None
-
-
-# --------------------------------------------------------------------------- #
-#  Per-player SEASON STATS helpers (#751 PR3b) — season-tab picker selection   #
-#  Shapes mirror the checked-in live SofaScore JSON fixtures,                  #
-#  FACT 2/4b): the player page captures /statistics/seasons (year→id map) plus #
-#  one /unique-tournament/{ut}/season/{sid}/statistics/overall per tab/picker. #
-# --------------------------------------------------------------------------- #
-def test_season_short_to_label_maps_four_digit():
-    from scrapers.sofascore.camoufox_capture import season_short_to_label
-    assert season_short_to_label("2526") == "25/26"
-    assert season_short_to_label("2122") == "21/22"
-
-
-def test_season_short_to_label_passthrough_non_four_digit():
-    from scrapers.sofascore.camoufox_capture import season_short_to_label
-    # already a label / unknown token — returned unchanged
-    assert season_short_to_label("25/26") == "25/26"
-    assert season_short_to_label("2026") == "20/26"  # 4-digit is always split
-
-
-def _seasons_payload():
-    """/statistics/seasons shape (probe FACT 2): per-unique-tournament year→id."""
-    return {
-        "uniqueTournamentSeasons": [
-            {"uniqueTournament": {"id": 17, "name": "Premier League"},
-             "seasons": [{"year": "25/26", "id": 76986},
-                         {"year": "24/25", "id": 61627}]},
-            {"uniqueTournament": {"id": 16, "name": "World Cup"},
-             "seasons": [{"year": "2026", "id": 58210}]},
-        ]
-    }
-
-
-def _player_season_buffer(pid=839981):
-    """A transferred player's season-tab capture: the default tab fired the
-    World Cup (ut=16) overall, then the picker selected EPL (ut=17) overall.
-    Plus the /statistics/seasons map and a challenged stray to be ignored."""
-    return {
-        f"/api/v1/player/{pid}/statistics/seasons": {
-            "status": 200, "challenge": False, "json": _seasons_payload()},
-        f"/api/v1/player/{pid}/unique-tournament/16/season/58210/statistics/overall": {
-            "status": 200, "challenge": False,
-            "json": {"team": {"id": 9, "name": "Brazil"},
-                     "statistics": {"rating": 7.1, "totalGoals": 1}}},
-        f"/api/v1/player/{pid}/unique-tournament/17/season/76986/statistics/overall": {
-            "status": 200, "challenge": False,
-            "json": {"team": {"id": 30, "name": "West Ham"},
-                     "statistics": {"rating": 6.8, "totalGoals": 4}}},
-        # challenged stray for ANOTHER player — must never be selected.
-        "/api/v1/player/111/unique-tournament/17/season/76986/statistics/overall": {
-            "status": 403, "challenge": True, "json": {"error": {"reason": "challenge"}}},
-    }
-
-
-def test_extract_player_seasons_map_builds_ut_year_to_id():
-    from scrapers.sofascore.camoufox_capture import extract_player_seasons_map
-    m = extract_player_seasons_map(_player_season_buffer(839981), 839981)
-    assert m[17]["25/26"] == 76986
-    assert m[17]["24/25"] == 61627
-    assert m[16]["2026"] == 58210
-
-
-def test_extract_player_seasons_map_empty_when_not_captured():
-    from scrapers.sofascore.camoufox_capture import extract_player_seasons_map
-    assert extract_player_seasons_map({}, 839981) == {}
-
-
 # --------------------------------------------------------------------------- #
 #  league standings parsers — live-proven shapes (EPL 24/25, #779)            #
 #  Fixtures mirror the REAL capture taken 2026-06-23 (sid 61627): the         #
-#  /standings/total 'total' block + the /unique-tournament/{ut}/seasons map.  #
+#  /standings/total 'total' block.                                            #
 # --------------------------------------------------------------------------- #
-def _tournament_seasons_payload():
-    """Real /unique-tournament/17/seasons response (trimmed, #779). NOTE: this
-    endpoint does not reliably fire on the standings landing, so the scraper
-    requests it explicitly when the passive buffer lacks it."""
-    return {"seasons": [
-        {"year": "26/27", "id": 96668},
-        {"year": "25/26", "id": 76986},
-        {"year": "24/25", "id": 61627},
-        {"year": "23/24", "id": 52186},
-    ]}
-
-
 def _standings_buffer(sid=61627):
     """Real EPL 24/25 standings/total capture (#779), trimmed to champion,
     runner-up, bottom. The 'home' block is challenged → must be skipped."""
@@ -874,21 +244,6 @@ def _standings_buffer(sid=61627):
             "status": 403, "challenge": True,
             "json": {"error": {"reason": "challenge"}}},
     }
-
-
-def test_extract_tournament_seasons_map_real_epl_payload():
-    from scrapers.sofascore.camoufox_capture import extract_tournament_seasons_map
-    buf = {"/api/v1/unique-tournament/17/seasons": {
-        "status": 200, "challenge": False, "json": _tournament_seasons_payload()}}
-    m = extract_tournament_seasons_map(buf, 17)
-    assert m["24/25"] == 61627
-    assert m["25/26"] == 76986
-
-
-def test_extract_tournament_seasons_map_empty_when_absent():
-    from scrapers.sofascore.camoufox_capture import extract_tournament_seasons_map
-    # live FACT (#779): /seasons does not fire on the standings landing.
-    assert extract_tournament_seasons_map({}, 17) == {}
 
 
 def test_extract_tournament_standings_returns_total_block_rows():
@@ -973,227 +328,6 @@ def test_normalize_standing_gd_none_when_scores_missing():
     assert out["gd"] is None and out["gf"] is None
 
 
-def test_extract_player_seasons_map_empty_on_challenge():
-    from scrapers.sofascore.camoufox_capture import extract_player_seasons_map
-    buf = {"/api/v1/player/5/statistics/seasons": {
-        "status": 403, "challenge": True, "json": {"error": {"reason": "challenge"}}}}
-    assert extract_player_seasons_map(buf, 5) == {}
-
-
-def test_select_player_season_stats_picks_target_ut_with_season_guard():
-    from scrapers.sofascore.camoufox_capture import select_player_season_stats
-    # target = EPL (ut=17), season 76986 — must NOT return the default World Cup tab.
-    sel = select_player_season_stats(
-        _player_season_buffer(839981), 839981, target_ut=17, target_season_id=76986)
-    assert sel is not None
-    ut, sid, payload = sel
-    assert (ut, sid) == (17, 76986)
-    assert payload["team"]["name"] == "West Ham"
-
-
-def test_select_player_season_stats_none_when_target_ut_absent():
-    from scrapers.sofascore.camoufox_capture import select_player_season_stats
-    # La Liga (ut=8) was never captured (picker missed) → None, not a wrong-comp row.
-    assert select_player_season_stats(
-        _player_season_buffer(839981), 839981, target_ut=8, target_season_id=99) is None
-
-
-def test_select_player_season_stats_season_guard_rejects_other_season():
-    from scrapers.sofascore.camoufox_capture import select_player_season_stats
-    # ut=17 present but only season 76986 — guarding on a different sid → None.
-    assert select_player_season_stats(
-        _player_season_buffer(839981), 839981, target_ut=17, target_season_id=61627) is None
-
-
-def test_select_player_season_stats_takes_latest_without_guard():
-    from scrapers.sofascore.camoufox_capture import select_player_season_stats
-    pid = 5
-    buf = {
-        f"/api/v1/player/{pid}/unique-tournament/17/season/61627/statistics/overall": {
-            "status": 200, "challenge": False, "json": {"statistics": {"rating": 1}}},
-        f"/api/v1/player/{pid}/unique-tournament/17/season/76986/statistics/overall": {
-            "status": 200, "challenge": False, "json": {"statistics": {"rating": 2}}},
-    }
-    # No season-guard → deterministic: the most recent season_id (76986).
-    ut, sid, _ = select_player_season_stats(buf, pid, target_ut=17)
-    assert (ut, sid) == (17, 76986)
-
-
-def test_select_player_season_stats_ignores_other_players_and_challenges():
-    from scrapers.sofascore.camoufox_capture import select_player_season_stats
-    # Only the challenged stray for player 111 matches ut/season; must be skipped.
-    buf = {
-        "/api/v1/player/111/unique-tournament/17/season/76986/statistics/overall": {
-            "status": 403, "challenge": True, "json": {"error": {"reason": "challenge"}}},
-    }
-    assert select_player_season_stats(buf, 839981, target_ut=17) is None
-
-
-# --------------------------------------------------------------------------- #
-#  capture_player — one warm navigation + exact season API fetch                #
-# --------------------------------------------------------------------------- #
-class TestCapturePlayerSeasonBuffer:
-    def _cap(self):
-        from unittest.mock import MagicMock
-        from scrapers.sofascore.camoufox_capture import SofascoreCamoufoxCapture
-        cap = SofascoreCamoufoxCapture(proxy=None)
-        cap._page = MagicMock()  # only wait_for_timeout is touched
-        return cap
-
-    def test_returns_profile_and_season_buffer_subset(self):
-        cap = self._cap()
-        pid = 839981
-        cap._navigate = lambda *a, **k: None
-        cap._extract_player_next_data = lambda p: {"id": int(p), "name": "Paqueta"}
-        expected = {
-            "profile": {"id": pid, "name": "Paqueta"},
-            "season_buffer": {"exact": True},
-        }
-        cap.fetch_player = MagicMock(return_value=expected)
-
-        out = cap.capture_player(pid, target_ut=17, target_year="25/26")
-
-        assert out["profile"]["name"] == "Paqueta"
-        assert out["season_buffer"] == {"exact": True}
-        cap.fetch_player.assert_called_once_with(
-            pid,
-            target_ut=17,
-            target_year="25/26",
-            profile={"id": pid, "name": "Paqueta"},
-        )
-
-    def test_profile_only_when_no_target(self):
-        cap = self._cap()
-        cap._navigate = lambda *a, **k: None
-        cap._extract_player_next_data = lambda p: {"id": int(p)}
-        cap.fetch_player = MagicMock(
-            return_value={
-                "profile": {"id": 7},
-                "season_buffer": {},
-            }
-        )
-        out = cap.capture_player(7)
-        assert out["season_buffer"] == {}
-        assert out["profile"] == {"id": 7}
-
-
-# --------------------------------------------------------------------------- #
-#  paginate_tournament_season (#824)                                          #
-# --------------------------------------------------------------------------- #
-class TestPaginateTournamentSeason:
-    """paginate_tournament_season drives an in-page fetch of a SPECIFIC season's
-    ``/events/last/{page}`` so a historical-season backfill is not empty (#824).
-    We fake ``_page`` so no browser is needed and assert the URL sequence + the
-    loop-termination logic (no-next / empty page / max_pages)."""
-
-    class _RecordingPage:
-        def __init__(self, results):
-            self._results = list(results)
-            self.paths = []
-
-        def evaluate(self, js, arg=None):
-            self.paths.append(arg)
-            return self._results.pop(0) if self._results else {
-                "ok": False, "count": 0, "more": False}
-
-        def wait_for_timeout(self, ms):
-            pass
-
-    def _cap(self, results):
-        from scrapers.sofascore.camoufox_capture import SofascoreCamoufoxCapture
-        cap = SofascoreCamoufoxCapture(proxy=None)
-        cap._page = self._RecordingPage([])
-        cap._buffer = {"sentinel": 1}
-        pending = list(results)
-
-        def fetch(path):
-            cap._page.paths.append(path)
-            result = (
-                pending.pop(0)
-                if pending
-                else {
-                    "ok": False,
-                    "count": 0,
-                    "more": False,
-                }
-            )
-            if not result["ok"]:
-                return {"status": 503, "json": None, "challenge": None}
-            rec = {
-                "status": 200,
-                "json": {
-                    "events": [{} for _ in range(result["count"])],
-                    "hasNextPage": result["more"],
-                },
-                "challenge": False,
-            }
-            cap._buffer[path] = rec
-            return rec
-
-        cap.fetch_api_json = fetch
-        return cap
-
-    def test_pages_until_no_next_then_stops(self):
-        cap = self._cap([
-            {"ok": True, "count": 10, "more": True},
-            {"ok": True, "count": 10, "more": True},
-            {"ok": True, "count": 5, "more": False},   # last page
-        ])
-        out = cap.paginate_tournament_season(17, 12345)
-        # Exactly 3 fetches, paged 0..2 with the season-scoped path.
-        assert cap._page.paths == [
-            "/api/v1/unique-tournament/17/season/12345/events/last/0",
-            "/api/v1/unique-tournament/17/season/12345/events/last/1",
-            "/api/v1/unique-tournament/17/season/12345/events/last/2",
-        ]
-        assert out["sentinel"] == 1
-        assert len(out) == 4
-
-    def test_stops_on_empty_events_page(self):
-        cap = self._cap([
-            {"ok": True, "count": 10, "more": True},
-            {"ok": True, "count": 0, "more": True},    # empty → stop even if more
-        ])
-        cap.paginate_tournament_season(17, 12345)
-        assert len(cap._page.paths) == 2
-
-    def test_stops_on_failed_page(self):
-        cap = self._cap([
-            {"ok": True, "count": 10, "more": True},
-            {"ok": False, "count": 0, "more": False},  # fetch !ok → stop
-        ])
-        cap.paginate_tournament_season(17, 12345)
-        assert len(cap._page.paths) == 2
-
-    def test_respects_max_pages_cap(self):
-        # Every page says there is more — the cap is the only stop.
-        cap = self._cap([{"ok": True, "count": 10, "more": True}] * 10)
-        cap.paginate_tournament_season(17, 12345, max_pages=3)
-        assert len(cap._page.paths) == 3
-
-    def test_evaluate_exception_breaks_gracefully(self):
-        from scrapers.sofascore.camoufox_capture import SofascoreCamoufoxCapture
-
-        class _BoomPage:
-            def __init__(self):
-                self.paths = []
-
-            def evaluate(self, js, arg=None):
-                self.paths.append(arg)
-                raise RuntimeError("page closed")
-
-            def wait_for_timeout(self, ms):
-                pass
-
-        cap = SofascoreCamoufoxCapture(proxy=None)
-        cap._page = _BoomPage()
-        cap._buffer = {"x": 1}
-        # Must not raise; returns whatever buffer was captured.
-        out = cap.paginate_tournament_season(17, 999)
-        assert out == {"x": 1}
-        assert len(cap._page.paths) == 1
-
-
 # --------------------------------------------------------------------------- #
 #  should_block_request (#842 — cut proxy bytes via route-abort)              #
 # --------------------------------------------------------------------------- #
@@ -1212,6 +346,16 @@ def test_should_block_request_blocks_static_resource_types(resource_type):
 ])
 def test_should_block_request_blocks_analytics_hosts(url):
     # resource_type=script, but a tracking host — block by URL substring.
+    assert should_block_request("script", url) is True
+
+
+@pytest.mark.parametrize("url", [
+    "https://ublockorigin.github.io/uAssets/filters/filters.txt",
+    "https://cdn.jsdelivr.net/gh/uBlockOrigin/uAssets/filters/privacy.txt",
+    "https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters.txt",
+    "https://publicsuffix.org/list/public_suffix_list.dat",
+])
+def test_should_block_browser_extension_updates_before_rate_limiting(url):
     assert should_block_request("script", url) is True
 
 
@@ -1310,12 +454,106 @@ class TestMaybeBlock:
         assert route.aborted is False
         assert cap._blocked_count == 0
 
-    def test_abort_error_falls_back_to_continue(self):
-        # A routing error must never stall the navigation.
+    def test_abort_error_never_falls_open_to_continue(self):
         cap = _cap()
         route = _FakeRoute("image", "https://www.sofascore.com/static/x.png", abort_raises=True)
         cap._maybe_block(route)  # must not raise
+        assert route.continued is False
+        assert cap._blocked_count == 1
+
+    def test_paces_document_script_and_challenge_asset_once_each(self):
+        calls = []
+        cap = SofascoreCamoufoxCapture(
+            request_limiter=lambda: calls.append("paced") or True
+        )
+        routes = [
+            _FakeRoute("document", "https://www.sofascore.com/event/1"),
+            _FakeRoute("script", "https://www.sofascore.com/app.js"),
+            _FakeRoute(
+                "script",
+                "https://challenges.cloudflare.com/turnstile/v0/api.js",
+            ),
+        ]
+
+        for route in routes:
+            cap._maybe_block(route)
+
+        assert calls == ["paced"] * 3
+        assert all(route.continued for route in routes)
+        assert cap._source_request_count == 3
+
+    def test_limiter_error_aborts_instead_of_continuing(self):
+        cap = SofascoreCamoufoxCapture(
+            request_limiter=lambda: (_ for _ in ()).throw(RuntimeError("stop"))
+        )
+        route = _FakeRoute("script", "https://www.sofascore.com/app.js")
+
+        cap._maybe_block(route)
+
+        assert route.aborted is True
+        assert route.continued is False
+        assert cap._source_request_count == 0
+
+    def test_route_validation_exception_aborts_instead_of_continuing(
+        self, monkeypatch
+    ):
+        import scrapers.sofascore.camoufox_capture as module
+
+        cap = _cap()
+        monkeypatch.setattr(
+            module,
+            "should_block_request",
+            lambda *_args: (_ for _ in ()).throw(RuntimeError("invalid route")),
+        )
+        route = _FakeRoute("script", "https://www.sofascore.com/app.js")
+
+        cap._maybe_block(route)
+
+        assert route.aborted is True
+        assert route.continued is False
+
+    def test_exact_mode_allows_only_current_authorized_api_path(self):
+        cap = _cap()
+        cap._exact_only = True
+        cap._allowed_api_path = "/api/v1/event/1/lineups"
+        allowed = _FakeRoute(
+            "xhr", "https://www.sofascore.com/api/v1/event/1/lineups"
+        )
+        unrelated = _FakeRoute(
+            "xhr", "https://www.sofascore.com/api/v1/event/2/lineups"
+        )
+
+        cap._maybe_block(allowed)
+        cap._maybe_block(unrelated)
+
+        assert allowed.continued is True
+        assert unrelated.aborted is True
+
+    def test_exact_mode_allows_required_cloudflare_challenge_asset(self):
+        cap = _cap()
+        cap._exact_only = True
+        route = _FakeRoute(
+            "script",
+            "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/x.js",
+        )
+
+        cap._maybe_block(route)
+
         assert route.continued is True
+        assert route.aborted is False
+
+    def test_exit_probe_url_is_open_only_during_explicit_probe(self):
+        cap = _cap()
+        cap._exact_only = True
+        url = "https://api.ipify.org/?format=json"
+        blocked = _FakeRoute("xhr", url)
+        cap._maybe_block(blocked)
+        assert blocked.aborted is True
+
+        cap._allowed_external_url = url
+        allowed = _FakeRoute("xhr", url)
+        cap._maybe_block(allowed)
+        assert allowed.continued is True
 
 
 class TestOnRequestFinished:
@@ -1406,46 +644,301 @@ class TestFetchApiJson:
     buffer; None only on a transport failure — callers use that distinction to
     separate 'legitimately empty' from 'worth retrying' (#879)."""
 
-    def _cap_with_page(self, evaluate_result=None, evaluate_raises=None):
+    def _cap_with_page(
+        self,
+        *,
+        status=200,
+        body=b"{}",
+        headers=None,
+        request_raises=None,
+    ):
         from unittest.mock import MagicMock
 
         cap = _cap()
         cap._page = MagicMock()
-        if evaluate_raises is not None:
-            cap._page.evaluate.side_effect = evaluate_raises
+        response = MagicMock()
+        response.status = status
+        response.body.return_value = body
+        response.headers = headers or {"content-type": "application/json"}
+        if request_raises is not None:
+            cap._page.goto.side_effect = request_raises
         else:
-            cap._page.evaluate.return_value = evaluate_result
+            cap._page.goto.return_value = response
         return cap
 
     def test_returns_rec_and_merges_into_buffer(self):
         path = "/api/v1/unique-tournament/8/seasons"
         body = json.dumps({"seasons": [{"year": "24/25", "id": 61643}]})
-        cap = self._cap_with_page({"status": 200, "body": body})
+        cap = self._cap_with_page(body=body.encode())
 
         rec = cap.fetch_api_json(path)
 
+        cap._page.goto.assert_called_once_with(
+            f"https://www.sofascore.com{path}",
+            wait_until="commit",
+            timeout=cap._nav_timeout_ms,
+        )
+        assert cap._navigation_count == 1
         assert rec["status"] == 200
         assert rec["challenge"] is False
         assert rec["json"]["seasons"][0]["id"] == 61643
         assert cap._buffer[path]["json"] == rec["json"]
 
-    def test_returns_none_when_evaluate_raises(self):
-        cap = self._cap_with_page(evaluate_raises=RuntimeError("page gone"))
+    def test_returns_none_when_request_raises(self):
+        cap = self._cap_with_page(request_raises=RuntimeError("page gone"))
 
         assert cap.fetch_api_json("/api/v1/unique-tournament/8/seasons") is None
 
+    def test_request_failure_does_not_add_endpoint_navigation(self):
+        path = "/api/v1/event/7"
+        cap = self._cap_with_page(request_raises=RuntimeError("network error"))
+        cap._exact_only = True
+
+        rec = cap.fetch_api_json(path)
+
+        assert rec is None
+        cap._page.goto.assert_called_once()
+        assert cap._navigation_count == 1
+        assert cap._allowed_api_path is None
+
     def test_non_json_body_keeps_json_none(self):
-        cap = self._cap_with_page({"status": 403, "body": "<html>blocked</html>"})
+        raw = b"<html>blocked</html>"
+        cap = self._cap_with_page(status=403, body=raw)
 
         rec = cap.fetch_api_json("/api/v1/unique-tournament/8/seasons")
 
         assert rec["status"] == 403
         assert rec["json"] is None
+        assert rec["body"] == raw
 
     def test_challenge_body_is_flagged(self):
         body = json.dumps({"error": {"code": 403, "reason": "challenge"}})
-        cap = self._cap_with_page({"status": 200, "body": body})
+        cap = self._cap_with_page(body=body.encode())
 
         rec = cap.fetch_api_json("/api/v1/unique-tournament/8/seasons")
 
         assert rec["challenge"] is True
+
+    def test_preserves_exact_non_text_response_bytes(self):
+        raw = b"\x00\xff\r\nnot-json"
+        cap = self._cap_with_page(body=raw)
+
+        rec = cap.fetch_api_json("/api/v1/event/7")
+
+        assert rec["body"] == raw
+        assert rec["json"] is None
+
+
+class TestExactWarmAndCanaryExitProbe:
+    def test_warm_stops_background_work_then_enables_lockdown(self):
+        cap = _cap()
+        cap._page = MagicMock()
+        navigations = []
+        cap._navigate_exact_origin = navigations.append
+
+        cap.warm_exact_json("https://www.sofascore.com/event/1")
+
+        assert navigations == ["https://www.sofascore.com/"]
+        assert cap._exact_only is True
+        assert cap._allowed_api_path is None
+        assert cap._allowed_external_url is None
+
+    def test_warm_blocks_all_passive_api_but_allows_document(self):
+        cap = _cap()
+        cap._page = MagicMock()
+        passive = _FakeRoute(
+            "xhr", "https://www.sofascore.com/api/v1/event/999"
+        )
+        document = _FakeRoute(
+            "document", "https://www.sofascore.com/"
+        )
+
+        def navigate(_url):
+            cap._maybe_block(passive)
+            cap._maybe_block(document)
+
+        cap._navigate_exact_origin = navigate
+        cap.warm_exact_json("https://www.sofascore.com/event/1")
+
+        assert passive.aborted is True
+        assert passive.continued is False
+        assert document.continued is True
+        assert cap._source_request_count == 1
+        assert cap._exact_only is True
+
+    def test_exact_warm_uses_one_proven_html_anchor(self):
+        cap = _cap()
+        cap._page = MagicMock()
+        response = MagicMock()
+        response.url = "https://www.sofascore.com/"
+        response.status = 200
+        cap._page.goto.side_effect = lambda *args, **kwargs: (
+            setattr(
+                cap,
+                "_source_request_count",
+                cap._source_request_count + 1,
+            )
+            or response
+        )
+        cap._page.evaluate.return_value = "https://www.sofascore.com"
+
+        cap.warm_exact_json("https://www.sofascore.com/event/1")
+
+        cap._page.goto.assert_called_once_with(
+            "https://www.sofascore.com/",
+            wait_until="domcontentloaded",
+            timeout=cap._nav_timeout_ms,
+        )
+        cap._page.evaluate.assert_called_once_with("() => location.origin")
+        assert cap._navigation_count == 1
+        assert cap._source_request_count == 1
+
+    @pytest.mark.parametrize(
+        "response_url",
+        [
+            "https://api.sofascore.com/",
+            "https://other.example/",
+            "https://www.sofascore.com/?redirected=1",
+            "https://www.sofascore.com/#fragment",
+            "https://www.sofascore.com/football",
+        ],
+    )
+    def test_exact_warm_rejects_cross_origin_query_or_fragment(self, response_url):
+        cap = _cap()
+        cap._page = MagicMock()
+        response = MagicMock(status=200, url=response_url)
+
+        def navigate(*_args, **_kwargs):
+            cap._source_request_count += 1
+            return response
+
+        cap._page.goto.side_effect = navigate
+        cap._page.evaluate.return_value = "https://www.sofascore.com"
+
+        with pytest.raises(RuntimeError, match="anchor_url_ok=False"):
+            cap.warm_exact_json("https://www.sofascore.com/event/1")
+
+        assert cap._navigation_count == 1
+
+    def test_exact_warm_rejects_redirect_or_asset_extra_request(self):
+        cap = _cap()
+        cap._page = MagicMock()
+        response = MagicMock(
+            status=200,
+            url="https://www.sofascore.com/",
+        )
+
+        def navigate(*_args, **_kwargs):
+            # A redirect or an allowed challenge asset would both cross the
+            # route-level source gate and make this delta greater than one.
+            cap._source_request_count += 2
+            return response
+
+        cap._page.goto.side_effect = navigate
+        cap._page.evaluate.return_value = "https://www.sofascore.com"
+
+        with pytest.raises(RuntimeError, match="source_request_delta=2"):
+            cap.warm_exact_json("https://www.sofascore.com/event/1")
+
+        assert cap._navigation_count == 1
+
+    @pytest.mark.parametrize(
+        "anchor_url",
+        [
+            "https://api.sofascore.com/",
+            "https://other.example/",
+            "https://www.sofascore.com/?query=1",
+            "https://www.sofascore.com/football",
+        ],
+    )
+    def test_exact_navigation_rejects_invalid_requested_anchor(self, anchor_url):
+        cap = _cap()
+        cap._page = MagicMock()
+
+        with pytest.raises(ValueError, match="canonical official HTTPS"):
+            cap._navigate_exact_origin(anchor_url)
+
+        cap._page.goto.assert_not_called()
+        assert cap._navigation_count == 0
+        assert cap._source_request_count == 0
+
+    def test_exact_warm_error_exposes_only_safe_final_url_shape(self):
+        cap = _cap()
+        cap._page = MagicMock()
+        response = MagicMock(
+            status=200,
+            url=(
+                "https://credential-alice:credential-password@"
+                "WWW.SOFASCORE.COM:444/football"
+                "?token=query-secret#fragment-secret"
+            ),
+        )
+
+        def navigate(*_args, **_kwargs):
+            cap._source_request_count += 1
+            return response
+
+        cap._page.goto.side_effect = navigate
+        cap._page.evaluate.return_value = "https://www.sofascore.com"
+
+        with pytest.raises(RuntimeError) as captured:
+            cap.warm_exact_json("https://www.sofascore.com/event/1")
+
+        message = str(captured.value)
+        assert '"type":"str"' in message
+        assert '"scheme":"https"' in message
+        assert '"hostname":"www.sofascore.com"' in message
+        assert '"port":444' in message
+        assert '"path":"/football"' in message
+        assert '"query_present":true' in message
+        assert '"fragment_present":true' in message
+        assert '"userinfo_present":true' in message
+        for secret in (
+            "credential-alice",
+            "credential-password",
+            "query-secret",
+            "fragment-secret",
+        ):
+            assert secret not in message
+
+    def test_probe_accepts_direct_valid_ip_and_retains_no_probe_url(self):
+        cap = _cap()
+        cap._page = MagicMock()
+        cap._page.evaluate.return_value = {
+            "status": 200,
+            "body": '{"ip":"2001:db8::1"}',
+            "url": "https://api.ipify.org/?format=json",
+            "redirected": False,
+        }
+
+        assert cap.probe_proxy_exit() == "2001:db8::1"
+        assert cap._allowed_external_url is None
+
+    @pytest.mark.parametrize(
+        "response",
+        [
+            {
+                "status": 200,
+                "body": '{"ip":"203.0.113.7"}',
+                "url": "https://redirect.invalid/",
+                "redirected": True,
+            },
+            {
+                "status": 200,
+                "body": '{"ip":"credential lease-secret"}',
+                "url": "https://api.ipify.org/?format=json",
+                "redirected": False,
+            },
+        ],
+    )
+    def test_probe_rejects_redirect_or_non_ip_without_echoing_body(self, response):
+        cap = _cap()
+        cap._page = MagicMock()
+        cap._page.evaluate.return_value = response
+
+        with pytest.raises(RuntimeError) as captured:
+            cap.probe_proxy_exit()
+
+        assert "lease-secret" not in str(captured.value)
+        assert "203.0.113.7" not in str(captured.value)
+        assert cap._allowed_external_url is None

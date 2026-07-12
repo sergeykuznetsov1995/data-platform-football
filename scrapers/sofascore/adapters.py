@@ -193,12 +193,17 @@ class TrinoManifestStore(ManifestStore):
         where = " AND ".join(f'"{column}" = ?' for column in MANIFEST_KEY_COLUMNS)
         rows = self.manager._execute(
             f"SELECT {self._select_columns()} FROM {self.qualified} "
-            f"WHERE {where} LIMIT 1",
+            f"WHERE {where}",
             fetch=True,
             params=key.as_tuple(),
         )
         if not rows:
             return None
+        if len(rows) != 1:
+            raise RuntimeError(
+                "SofaScore ops manifest natural key is duplicated: "
+                + key.stable_id()
+            )
         return manifest_from_row(rows[0])
 
     def upsert(self, record: EndpointManifest) -> None:

@@ -16,16 +16,18 @@ from scrapers.sofascore.capture_engine import (
     CaptureResult,
     EndpointSpec,
     HttpPayload,
+    SchemaValidationError,
     SofaScoreCaptureEngine,
 )
 from scrapers.sofascore.manifest import (
+    EndpointManifest,
     JsonFileManifestStore,
     ManifestKey,
     ManifestStatus,
     ManifestStore,
     utc_now_iso,
 )
-from scrapers.sofascore.raw_store import RawPayloadStore
+from scrapers.sofascore.raw_store import PayloadTarget, RawPayloadStore
 from scripts.proxy_filter.budget import (
     ProductionBudgetUnavailable,
     SharedBudgetLedger,
@@ -80,6 +82,7 @@ def build_capture_runtime(
     task_id: str,
     raw_store_uri: Optional[str] = None,
     manifest_backend: Optional[str] = None,
+    workload_class: Optional[str] = None,
 ) -> CaptureRuntime:
     """Build the shared CLI/DAG/backfill raw+manifest runtime.
 
@@ -122,7 +125,10 @@ def build_capture_runtime(
         try:
             budget = SharedBudgetLedger(
                 ledger_path,
-                load_verified_policy(artifact_path),
+                load_verified_policy(
+                    artifact_path,
+                    workload_class=workload_class,
+                ),
             )
         except ProductionBudgetUnavailable as exc:
             # A bad/unreviewed canary must not disable raw replay or exact
@@ -205,6 +211,27 @@ def _empty_predicate(endpoint: str):
     return empty
 
 
+def _validated_normalized_rows(endpoint: str, payload, rows):
+    """Require the declared raw collection to survive normalization exactly."""
+
+    materialized = list(rows)
+    from dags.utils.sofascore_dq import validate_raw_payload
+
+    report = validate_raw_payload(
+        endpoint,
+        payload,
+        normalized_row_count=len(materialized),
+    )
+    if not report.passed:
+        findings = "; ".join(
+            f"{finding.code}: {finding.message}" for finding in report.findings
+        )
+        raise SchemaValidationError(
+            f"{endpoint} raw-to-normalized cardinality failed: {findings}"
+        )
+    return materialized
+
+
 def _parsers(endpoint: str, target_id: str):
     # Lazy import avoids importing pandas/soccerdata for manifest-only checks.
     from scrapers.sofascore.scraper import SofaScoreScraper
@@ -231,12 +258,16 @@ def _parsers(endpoint: str, target_id: str):
                 )
             ]
 
-        return {
-            'player_ratings': ratings,
-            'lineups': lambda payload: [
+        def lineups(payload):
+            rows = [
                 {key: value for key, value in row.items() if key != 'rating'}
                 for row in ratings(payload)
-            ],
+            ]
+            return _validated_normalized_rows('lineups', payload, rows)
+
+        return {
+            'player_ratings': ratings,
+            'lineups': lineups,
             'event_player_stats': lambda payload: (
                 SofaScoreScraper._flatten_event_player_stats_from_lineups(
                     target_id, payload
@@ -246,18 +277,30 @@ def _parsers(endpoint: str, target_id: str):
     if endpoint == 'statistics':
         return {
             'match_stats': lambda payload: (
-                SofaScoreScraper._flatten_match_stats(target_id, payload)
+                _validated_normalized_rows(
+                    'statistics',
+                    payload,
+                    SofaScoreScraper._flatten_match_stats(target_id, payload),
+                )
             )
         }
     if endpoint == 'shotmap':
         return {
             'event_shotmap': lambda payload: (
-                SofaScoreScraper._flatten_shotmap(target_id, payload)
+                _validated_normalized_rows(
+                    'shotmap',
+                    payload,
+                    SofaScoreScraper._flatten_shotmap(target_id, payload),
+                )
             )
         }
     return {
         'incidents': lambda payload: (
-            SofaScoreScraper._flatten_incidents(target_id, payload)
+            _validated_normalized_rows(
+                'incidents',
+                payload,
+                SofaScoreScraper._flatten_incidents(target_id, payload),
+            )
         )
     }
 
@@ -353,6 +396,10 @@ def build_event_spec(
         empty_predicate=_empty_predicate(endpoint),
         parsers=_parsers(endpoint, target),
         paid_proxy=paid_proxy,
+        # Every event endpoint in the coverage contract is required for a
+        # scheduled event. A 404 is therefore a retryable failure, never a
+        # terminal "unsupported" cache entry that endpoint resume would skip.
+        not_supported_http_statuses=(),
     )
 
 
@@ -412,6 +459,12 @@ def build_player_spec(
             numeric_season,
         ),
         paid_proxy=paid_proxy,
+        # Profiles are required for the signed player universe. Season
+        # aggregates are optional and may genuinely be unavailable for a
+        # player/competition pair.
+        not_supported_http_statuses=(
+            () if endpoint == 'player_profile' else (404,)
+        ),
     )
 
 
@@ -581,31 +634,106 @@ def materialize_player_datasets(
     return frames
 
 
+def materialized_terminal_manifest(record):
+    """Return the terminal record a successful normalized commit may publish."""
+
+    if not (
+        record.status == ManifestStatus.RETRYABLE_FAILURE
+        and record.error_type == 'DeferredMaterialization'
+        and record.raw_content_hash
+        and record.raw_blob_key
+        and record.row_count > 0
+    ):
+        return record
+    return replace(
+        record,
+        status=ManifestStatus.SUCCESS,
+        error_type=None,
+        error_message=None,
+        parsed_at=record.parsed_at or utc_now_iso(),
+        updated_at=utc_now_iso(),
+    )
+
+
 def finalize_materialized_results(
     runtime: CaptureRuntime,
     results: Iterable[CaptureResult],
 ) -> None:
     """Commit success only after every related Bronze MERGE has succeeded."""
     for result in results:
-        record = result.manifest
-        if not (
-            record.status == ManifestStatus.RETRYABLE_FAILURE
-            and record.error_type == 'DeferredMaterialization'
-            and record.raw_content_hash
-            and record.raw_blob_key
-            and record.row_count > 0
-        ):
+        record = materialized_terminal_manifest(result.manifest)
+        if record is result.manifest:
             continue
-        runtime.manifest_store.upsert(
-            replace(
-                record,
-                status=ManifestStatus.SUCCESS,
-                error_type=None,
-                error_message=None,
-                parsed_at=record.parsed_at or utc_now_iso(),
-                updated_at=utc_now_iso(),
+        runtime.manifest_store.upsert(record)
+
+
+def promote_repaired_results(
+    runtime: CaptureRuntime,
+    results: Iterable[CaptureResult],
+    *,
+    canonical_freshness_key: str = 'final',
+) -> tuple[EndpointManifest, ...]:
+    """Publish successful ``repair-*`` lineage at the canonical manifest key.
+
+    Repair capture deliberately uses a unique freshness key so an existing
+    terminal canonical row cannot suppress the new request.  Callers invoke
+    this only after every related Bronze MERGE has succeeded.  The immutable
+    blob is reused, while a canonical target pointer is written before the
+    manifest's atomic natural-key MERGE so offline replay keeps working.
+    Repeating the promotion writes the same lineage and is idempotent.
+    """
+
+    canonical = str(canonical_freshness_key).strip()
+    if not canonical or canonical.startswith('repair-'):
+        raise ValueError('canonical freshness key must be non-repair and non-empty')
+    promoted: list[EndpointManifest] = []
+    for result in results:
+        repaired = runtime.manifest_store.get(result.manifest.key)
+        if repaired is None or not repaired.is_terminal:
+            raise ValueError(
+                'repair promotion requires a committed terminal repair manifest: '
+                + result.manifest.key.stable_id()
             )
+        if (
+            repaired.raw_content_hash != result.manifest.raw_content_hash
+            or repaired.raw_blob_key != result.manifest.raw_blob_key
+        ):
+            raise ValueError('committed repair lineage differs from capture result')
+        if not repaired.key.freshness_key.startswith('repair-'):
+            continue
+        canonical_key = replace(repaired.key, freshness_key=canonical)
+        raw = result.raw
+        if repaired.raw_content_hash or repaired.raw_blob_key:
+            if raw is None:
+                _body, raw = runtime.raw_store.load_bytes(
+                    PayloadTarget(**repaired.key.__dict__)
+                )
+            else:
+                _body = runtime.raw_store.load_record(raw)
+            canonical_raw = runtime.raw_store.store_bytes(
+                PayloadTarget(**canonical_key.__dict__),
+                _body,
+                request_url=raw.request_url,
+                http_status=raw.http_status,
+                response_headers=raw.response_headers,
+                fetched_at=raw.fetched_at,
+                fetcher_version=raw.fetcher_version,
+            )
+            if (
+                canonical_raw.content_hash != repaired.raw_content_hash
+                or canonical_raw.blob_key != repaired.raw_blob_key
+            ):
+                raise ValueError('repair raw lineage changed during promotion')
+        promoted_record = replace(
+            repaired,
+            key=canonical_key,
+            # Keep the repair observation timestamp. Re-promoting the same
+            # successful result must not create a logically newer record.
+            updated_at=repaired.updated_at,
         )
+        runtime.manifest_store.upsert(promoted_record)
+        promoted.append(promoted_record)
+    return tuple(promoted)
 
 
 __all__ = [
@@ -619,7 +747,9 @@ __all__ = [
     'endpoint_resume_plan',
     'finalize_materialized_results',
     'ingest_prefetched_records',
+    'materialized_terminal_manifest',
     'materialize_player_datasets',
+    'promote_repaired_results',
     'replay_event_specs',
     'replay_player_specs',
 ]

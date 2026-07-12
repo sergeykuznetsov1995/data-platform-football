@@ -18,8 +18,8 @@ coverage_statuses:
 
 coverage_summary:
   normalized: 14
-  raw-only: 5
-  unsupported: 1
+  raw-only: 4
+  unsupported: 2
   intentionally-excluded: 8
 
 manifest:
@@ -78,12 +78,13 @@ quality_gates:
   required_field_loss: 0
 
 # Tables available by the end of dag_transform_e3 and relevant to committed
-# match/profile state. Deliberately excludes the unsupported tournament/player-
-# season paths and silver.sofascore_player_ratings (built later by E4).
+# season/match/profile state. silver.sofascore_player_ratings is checked later
+# by the existing E4 no-duplicates gate.
 committed_state_dq:
   required_event_endpoints: [event, lineups, statistics, shotmap, incidents]
   duplicate_tables:
     - bronze.sofascore_schedule
+    - bronze.sofascore_league_table
     - bronze.sofascore_events
     - bronze.sofascore_event_participants
     - bronze.sofascore_lineups
@@ -96,12 +97,19 @@ committed_state_dq:
     - bronze.sofascore_match_capture_status
     - bronze.sofascore_player_universe
     - bronze.sofascore_player_profile
+    - bronze.sofascore_player_season_stats
+    - silver.sofascore_league_table
     - silver.sofascore_player_match_aggregate
     - silver.sofascore_team_match
     - silver.sofascore_shots
     - silver.sofascore_venue
     - silver.sofascore_player_profile
+    - silver.sofascore_player_season_aggregate
     - gold.fct_sofascore_team_match_post_shot_xg
+  # Materialized by E4 after this E3 gate. dags/utils/e4_dq.py owns its
+  # equivalent no_duplicates check on the same declared natural key.
+  later_stage_duplicate_tables:
+    - silver.sofascore_player_ratings
 
 # Static Silver SQL references both legacy and source-key Bronze columns. The
 # writers create this nullable superset so a fresh Iceberg catalog plans the
@@ -183,7 +191,7 @@ tables:
     partition_columns: [league, season]
     materialized_by: dags/scripts/run_sofascore_scraper.py#_run_match_capture
     production_write_status: replay/no-op wired; paid live capture fails closed pending verified budget
-    downstream: []
+    downstream: [committed-state season/schema DQ, direct match/referee metadata analysis]
 
   bronze.sofascore_event_participants:
     grain: one home or away team in one event
@@ -253,7 +261,7 @@ tables:
     partition_columns: [league, season]
     materialized_by: dags/scripts/run_sofascore_scraper.py#_run_match_capture
     production_write_status: replay/no-op wired; paid live capture fails closed pending verified budget
-    downstream: []
+    downstream: [bronze.sofascore_player_universe, discipline/substitution/VAR analysis]
 
   bronze.sofascore_player_ratings:
     grain: one listed player rating in one event
@@ -782,17 +790,17 @@ endpoints:
   squads:
     path: /team/{team_id}/unique-tournament/{tournament_id}/season/{season_id}/players
     target_type: season_team
-    status: raw-only
+    status: unsupported
     required: false
     raw_collection: players
-    preserved_arrays: [/players]
-    required_json_paths: [/players]
+    preserved_arrays: []
+    required_json_paths: []
     destination: []
     grain: one registered player per team season
     natural_key: [source_season_id, team_id, player_id]
     empty_semantics: a schema-valid empty players array is legitimate
-    reason: exact registered-player objects expand the player universe; normalized profiles remain player-grain
-    dq: [team target identity, exact raw lineage]
+    reason: live source evidence returns HTTP 404 for the season-scoped route; /team/{team_id}/players is current-only and intentionally excluded from historical season attribution
+    dq: [terminal not_supported with exact raw lineage; never substitute a current roster for a historical season]
 
   player_profile:
     path: /player/{player_id}

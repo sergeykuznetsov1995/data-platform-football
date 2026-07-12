@@ -814,14 +814,27 @@ def _merge_classification_record(
     """
 
     current = deepcopy(dict(discovered))
-    if current.get("status") == "excluded" or current.get("exclusion_reasons"):
-        return current
-
     prior = dict(previous or {})
     unknown_tokens = {None, "", "unknown"}
     for field in ("sport", "gender", "age_group", "team_level"):
         if current.get(field) in unknown_tokens and prior.get(field) not in unknown_tokens:
             current[field] = deepcopy(prior[field])
+
+    # Source negatives are monotonic evidence.  A later sparse payload or a
+    # source rename is not proof that a competition stopped being youth,
+    # reserve, women/mixed or futsal.  Preserve the reasons themselves as well
+    # as the normalized fields; activation also checks the fields directly as
+    # defence in depth.
+    current["exclusion_reasons"] = sorted(
+        {
+            str(reason).strip()
+            for reason in [
+                *(prior.get("exclusion_reasons") or []),
+                *(current.get("exclusion_reasons") or []),
+            ]
+            if str(reason).strip()
+        }
+    )
 
     evidence_by_value = {
         json.dumps(item, sort_keys=True, ensure_ascii=False): deepcopy(item)
@@ -835,7 +848,9 @@ def _merge_classification_record(
         evidence_by_value[key] for key in sorted(evidence_by_value)
     ]
 
-    if current.get("sport") != "football" or current.get("gender") != "male":
+    if current["exclusion_reasons"]:
+        current["status"] = "excluded"
+    elif current.get("sport") != "football" or current.get("gender") != "male":
         current["status"] = "unknown"
     elif (
         current.get("age_group") == "adult"

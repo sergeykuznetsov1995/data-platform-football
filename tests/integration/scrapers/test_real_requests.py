@@ -147,28 +147,27 @@ class TestClubEloIntegration:
 
 
 # =============================================================================
-# SofaScore Tests (Requires Tor)
+# FBref Tests (Requires Tor)
 # =============================================================================
 
 @pytest.mark.integration
 @pytest.mark.tor
-@pytest.mark.flaky
-class TestSofaScoreIntegration:
-    """Integration tests for SofaScore scraper.
+@pytest.mark.slow
+class TestFBrefIntegration:
+    """Integration tests for FBref scraper.
 
-    SofaScore has blocking, requires Tor proxy.
-    Marked as flaky due to potential blocking.
+    FBref has Cloudflare protection, requires Tor proxy.
     """
 
-    def test_read_schedule(self, sofascore_scraper_with_tor, skip_if_no_network, integration_delay):
-        """Test reading SofaScore schedule with Tor proxy."""
-        df = sofascore_scraper_with_tor.read_schedule()
+    def test_read_schedule(self, fbref_scraper_with_tor, skip_if_no_network, integration_delay):
+        """Test reading FBref schedule with Tor proxy."""
+        df = fbref_scraper_with_tor.read_schedule()
 
         assert df is not None, "DataFrame should not be None"
         assert isinstance(df, pd.DataFrame), "Result should be a DataFrame"
-        # May fail due to blocking even with Tor
-        if len(df) > 0:
-            assert '_source' in df.columns, "Should have metadata column"
+        assert len(df) > 0, "DataFrame should not be empty"
+        assert '_source' in df.columns, "Should have metadata column"
+        assert df['_source'].iloc[0] == 'fbref', "Source should be 'fbref'"
 
 
 # =============================================================================

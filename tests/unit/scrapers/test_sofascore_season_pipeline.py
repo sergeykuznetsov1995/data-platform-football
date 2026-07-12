@@ -5,6 +5,7 @@ import json
 import threading
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -61,6 +62,7 @@ FIXTURE_PATHS = {
     "squads": FIXTURES / "sofascore_team_42_season_76986_squad.json",
     "referee_profile": FIXTURES / "sofascore_referee_900_profile.json",
 }
+PLAYER_EVIDENCE_CASES = FIXTURES / "sofascore_season_76986_player_evidence_cases.json"
 
 
 class UnlimitedLimiter:
@@ -200,6 +202,7 @@ def _seed_full_event_referee(
 
 
 def _seed_complete_partition_roots(store: RawPayloadStore) -> None:
+    evidence = _payload(PLAYER_EVIDENCE_CASES)
     roots = [
         (
             build_schedule_page_spec(direction="last", page=0, **_common()),
@@ -220,7 +223,7 @@ def _seed_complete_partition_roots(store: RawPayloadStore) -> None:
         ),
         (
             build_participants_spec(**_common()),
-            {"teams": [{"id": 42, "name": "Arsenal", "gender": "M"}]},
+            evidence["full_participants"],
         ),
     ]
     for spec, payload in roots:
@@ -495,6 +498,57 @@ def test_network_free_planner_follows_every_stored_schedule_page(tmp_path):
 
 
 @pytest.mark.unit
+def test_seed_schedule_404_is_legitimate_empty_but_promised_page_is_not():
+    seed = build_schedule_page_spec(direction="next", page=0, **_common())
+    promised = build_schedule_page_spec(direction="next", page=1, **_common())
+
+    assert 404 in seed.legitimate_empty_http_statuses
+    assert 404 not in promised.legitimate_empty_http_statuses
+    assert seed.not_supported_http_statuses == ()
+    assert promised.not_supported_http_statuses == ()
+
+
+@pytest.mark.unit
+def test_seed_schedule_terminal_404_closes_direction_without_json(tmp_path):
+    raw_store = _raw_store(tmp_path)
+    manifest = InMemoryManifestStore()
+    seed = build_schedule_page_spec(direction="next", page=0, **_common())
+    raw = raw_store.store_bytes(
+        seed.raw_target,
+        b'{"error":"not found"}',
+        request_url=seed.url,
+        http_status=404,
+        response_headers={"content-type": "application/json"},
+    )
+    manifest.upsert(
+        EndpointManifest(
+            key=seed.key,
+            status=ManifestStatus.LEGITIMATE_EMPTY,
+            run_id="season-empty-direction",
+            task_id="season",
+            attempts=1,
+            row_count=0,
+            http_status=404,
+            raw_content_hash=raw.content_hash,
+            raw_blob_key=raw.blob_key,
+            request_url=seed.url,
+        )
+    )
+
+    plan = plan_season_partition(raw_store, manifest, **_common())
+
+    assert seed.key not in plan.pending_keys
+    assert seed.key not in plan.missing_raw_keys
+    assert all(
+        not (
+            spec.key.endpoint == "schedule_next"
+            and spec.key.target_id != "next:0"
+        )
+        for spec in plan.specs
+    )
+
+
+@pytest.mark.unit
 def test_missing_promised_schedule_page_stays_planned_and_nonterminal(tmp_path):
     raw_store = _raw_store(tmp_path)
     manifest = InMemoryManifestStore()
@@ -577,6 +631,194 @@ def test_planner_expands_squads_and_referees_from_stored_evidence(tmp_path):
         for spec in plan.specs
         if spec.key.endpoint == "referee_profile"
     ] == ["900"]
+
+
+@pytest.mark.unit
+def test_empty_participants_cannot_prove_player_universe(tmp_path):
+    raw_store = _raw_store(tmp_path)
+    manifest = InMemoryManifestStore()
+    evidence = _payload(PLAYER_EVIDENCE_CASES)
+    _seed_json(
+        raw_store,
+        build_schedule_page_spec(direction="last", page=0, **_common()),
+        _schedule_payload([14000001], has_next=False),
+    )
+    _seed_json(
+        raw_store,
+        build_schedule_page_spec(direction="next", page=0, **_common()),
+        _schedule_payload([], has_next=False),
+    )
+    participants = build_participants_spec(**_common())
+    _seed_json(raw_store, participants, evidence["empty_participants"])
+
+    plan = plan_season_partition(raw_store, manifest, **_common())
+
+    assert plan.team_ids == ("42", "44")
+    assert participants.key in plan.pending_keys
+    assert {
+        spec.key.target_id for spec in plan.specs if spec.key.endpoint == "squads"
+    } == {
+        "42",
+        "44",
+    }
+    assert plan.player_universe_evidence_gaps == (
+        "participants returned no teams; squad universe is unproven",
+    )
+    assert plan.complete is False
+    with pytest.raises(SeasonPlanningError, match="evidence is incomplete"):
+        squad_player_ids(raw_store, plan)
+
+
+@pytest.mark.unit
+def test_partial_participants_and_missing_squad_stay_incomplete(tmp_path):
+    raw_store = _raw_store(tmp_path)
+    manifest = InMemoryManifestStore()
+    evidence = _payload(PLAYER_EVIDENCE_CASES)
+    _seed_json(
+        raw_store,
+        build_schedule_page_spec(direction="last", page=0, **_common()),
+        _schedule_payload([14000001], has_next=False),
+    )
+    _seed_json(
+        raw_store,
+        build_schedule_page_spec(direction="next", page=0, **_common()),
+        _schedule_payload([], has_next=False),
+    )
+    participants = build_participants_spec(**_common())
+    _seed_json(raw_store, participants, evidence["partial_participants"])
+    _seed_json(
+        raw_store,
+        build_squad_spec(team_id=42, **_common()),
+        evidence["nonempty_squad"],
+    )
+
+    plan = plan_season_partition(raw_store, manifest, **_common())
+    missing_squad = build_squad_spec(team_id=44, **_common()).key
+
+    assert plan.team_ids == ("42", "44")
+    assert participants.key in plan.pending_keys
+    assert missing_squad in plan.pending_keys
+    assert missing_squad in plan.missing_raw_keys
+    assert plan.player_universe_evidence_gaps == (
+        "participants omitted scheduled team ids: 44",
+    )
+    assert plan.complete is False
+
+
+@pytest.mark.unit
+def test_empty_squad_is_not_terminal_player_universe_success(tmp_path):
+    raw_store = _raw_store(tmp_path)
+    manifest = InMemoryManifestStore()
+    evidence = _payload(PLAYER_EVIDENCE_CASES)
+    _seed_json(
+        raw_store,
+        build_schedule_page_spec(direction="last", page=0, **_common()),
+        _schedule_payload([14000001], has_next=False),
+    )
+    _seed_json(
+        raw_store,
+        build_schedule_page_spec(direction="next", page=0, **_common()),
+        _schedule_payload([], has_next=False),
+    )
+    _seed_json(
+        raw_store,
+        build_participants_spec(**_common()),
+        {
+            "teams": [
+                {"id": 42, "name": "Arsenal"},
+                {"id": 44, "name": "Liverpool"},
+            ]
+        },
+    )
+    _seed_json(
+        raw_store,
+        build_squad_spec(team_id=42, **_common()),
+        evidence["nonempty_squad"],
+    )
+    empty_squad = build_squad_spec(team_id=44, **_common())
+    _seed_json(raw_store, empty_squad, evidence["empty_squad"])
+
+    plan = plan_season_partition(raw_store, manifest, **_common())
+
+    assert empty_squad.key in plan.pending_keys
+    assert empty_squad.key not in plan.missing_raw_keys
+    assert plan.player_universe_evidence_gaps == (
+        "scheduled/participating team 44 has an empty squad",
+    )
+    with pytest.raises(SeasonMaterializationError, match="empty squad"):
+        materialize_season_partition(
+            plan,
+            [],
+            canonical_league="ENG-Premier League",
+            canonical_season="2025/26",
+        )
+
+
+@pytest.mark.unit
+def test_source_unsupported_season_squads_do_not_fake_historical_rosters(tmp_path):
+    raw_store = _raw_store(tmp_path)
+    manifest = InMemoryManifestStore()
+    _seed_complete_partition_roots(raw_store)
+    preliminary = plan_season_partition(raw_store, manifest, **_common())
+    squad_specs = [
+        spec for spec in preliminary.specs if spec.key.endpoint == "squads"
+    ]
+    assert squad_specs
+
+    for spec in squad_specs:
+        raw = raw_store.store_bytes(
+            spec.raw_target,
+            b'{"error":"not found"}',
+            request_url=spec.url,
+            http_status=404,
+            response_headers={"content-type": "application/json"},
+        )
+        manifest.upsert(
+            EndpointManifest(
+                key=spec.key,
+                status=ManifestStatus.NOT_SUPPORTED,
+                run_id="season-squad-unsupported",
+                task_id="season",
+                attempts=1,
+                row_count=0,
+                http_status=404,
+                raw_content_hash=raw.content_hash,
+                raw_blob_key=raw.blob_key,
+                request_url=spec.url,
+            )
+        )
+
+    plan = plan_season_partition(raw_store, manifest, **_common())
+
+    assert plan.player_universe_evidence_gaps == ()
+    assert squad_player_ids(raw_store, plan) == ()
+
+
+@pytest.mark.unit
+def test_full_team_and_squad_evidence_builds_nonempty_universe(tmp_path):
+    raw_store = _raw_store(tmp_path)
+    manifest = InMemoryManifestStore()
+    evidence = _payload(PLAYER_EVIDENCE_CASES)
+    _seed_complete_partition_roots(raw_store)
+    initial = plan_season_partition(raw_store, manifest, **_common())
+    for spec in initial.specs:
+        if spec.key.endpoint == "squads":
+            _seed_json(raw_store, spec, evidence["nonempty_squad"])
+        elif spec.key.endpoint == "referee_profile":
+            _seed_raw(raw_store, spec, FIXTURE_PATHS["referee_profile"].read_bytes())
+    engine, _ = _engine(
+        tmp_path,
+        raw_store=raw_store,
+        manifest_store=manifest,
+    )
+    replay_season_specs(engine, initial.specs)
+
+    committed = plan_season_partition(raw_store, manifest, **_common())
+
+    assert committed.complete is True
+    assert committed.player_universe_evidence_gaps == ()
+    assert committed.team_ids == ("17", "33", "42", "44")
+    assert squad_player_ids(raw_store, committed) == ("1001", "1002")
 
 
 @pytest.mark.unit
@@ -668,12 +910,22 @@ def test_optional_standings_not_supported_does_not_break_partition_replay(
         ),
         (build_rounds_spec(**common), {"rounds": []}),
         (build_cup_trees_spec(**common), {"cupTrees": []}),
-        (build_participants_spec(**common), {"teams": []}),
+        (
+            build_participants_spec(**common),
+            _payload(PLAYER_EVIDENCE_CASES)["full_participants"],
+        ),
     ]
     for spec, payload in seeded:
         _seed_json(raw_store, spec, payload)
 
     plan = plan_season_partition(raw_store, manifest, **common)
+    for spec in plan.specs:
+        if spec.key.endpoint == "squads":
+            _seed_json(
+                raw_store,
+                spec,
+                _payload(PLAYER_EVIDENCE_CASES)["nonempty_squad"],
+            )
     assert standings.key not in plan.pending_keys
     assert standings.key not in plan.missing_raw_keys
     engine, transport = _engine(
@@ -817,14 +1069,14 @@ def test_runner_offline_season_replay_merges_then_noops_without_browser(
             season=2025,
             output_path=str(output),
             capture_runtime=runtime,
+            workload_plan=None,
             offline_replay=True,
         )
 
     assert rc == 0
     assert transport.calls == 0
     assert [
-        call.kwargs["table_name"]
-        for call in scraper.save_to_iceberg.call_args_list
+        call.kwargs["table_name"] for call in scraper.save_to_iceberg.call_args_list
     ] == ["sofascore_schedule", "sofascore_league_table"]
     committed_plan = plan_season_partition(
         raw_store,
@@ -835,9 +1087,7 @@ def test_runner_offline_season_replay_merges_then_noops_without_browser(
         event_freshness_key="final",
         paid_proxy=True,
     )
-    assert all(
-        manifest.get(spec.key).is_terminal for spec in committed_plan.specs
-    )
+    assert all(manifest.get(spec.key).is_terminal for spec in committed_plan.specs)
     payload = json.loads(output.read_text(encoding="utf-8"))
     assert payload["schedule_rows"] == 2
     assert payload["league_table_rows"] == 4
@@ -859,6 +1109,7 @@ def test_runner_offline_season_replay_merges_then_noops_without_browser(
             season=2025,
             output_path=str(no_op_output),
             capture_runtime=no_op_runtime,
+            workload_plan=None,
             offline_replay=False,
         )
 
@@ -875,6 +1126,308 @@ def test_runner_offline_season_replay_merges_then_noops_without_browser(
         "cache_hit_rate": 1.0,
         "endpoint_completeness": 1.0,
     }
+
+
+@pytest.mark.unit
+def test_runner_live_season_uses_proven_slug_url_and_committed_completeness(
+    tmp_path,
+    monkeypatch,
+):
+    from dags.scripts import run_sofascore_scraper as runner
+
+    key = SimpleNamespace(stable_id=lambda: "season-key")
+    spec = SimpleNamespace(key=key)
+
+    def plan(*, complete, missing, pending):
+        return SimpleNamespace(
+            complete=complete,
+            specs=(spec,),
+            missing_raw_keys=(key,) if missing else (),
+            pending_keys=(key,) if pending else (),
+            schedule_event_ids=(),
+            team_ids=(),
+            referee_ids=(),
+        )
+
+    initial = plan(complete=False, missing=True, pending=True)
+    expanded = plan(complete=False, missing=False, pending=True)
+    committed = plan(complete=True, missing=False, pending=False)
+    engine = SimpleNamespace(
+        budget=object(),
+        run_id="run-1",
+        metrics=SimpleNamespace(
+            snapshot=lambda: {
+                "paid_proxy_bytes": 321,
+                "paid_proxy_mb": 321 / 1_048_576,
+                "browser_sessions": 1,
+                "navigations": 1,
+                "request_count": 1,
+                "endpoint_completeness": 0.0,
+            }
+        ),
+    )
+    runtime = CaptureRuntime(engine, object(), object())
+    output = tmp_path / "season-live.json"
+    captured = {}
+
+    def fake_live(runtime_arg, planner, **kwargs):
+        captured.update(kwargs)
+        return (
+            [],
+            expanded,
+            {
+                "provider_total_bytes": 321,
+                "provider_budget_bytes": 1000,
+                "provider_budget_exceeded": False,
+                "browser_navigations": 1,
+                "proxy_exit_hash": None,
+            },
+        )
+
+    materialized = SimpleNamespace(
+        endpoint_completeness=1.0,
+        schedule_rows=(),
+        standings_rows=(),
+    )
+    scraper = MagicMock()
+    scraper.__enter__.return_value = scraper
+    scraper.__exit__.return_value = False
+    monkeypatch.setenv("SOFASCORE_SEASON_FRESHNESS_KEY", FRESHNESS)
+    monkeypatch.setattr(
+        runner, "_source_context", lambda *args: (TOURNAMENT_ID, SEASON_ID)
+    )
+
+    with (
+        patch(
+            "scrapers.sofascore.season_pipeline.plan_season_partition",
+            side_effect=[initial, committed],
+        ),
+        patch(
+            "scrapers.sofascore.season_pipeline.replay_season_specs",
+            return_value=[],
+        ),
+        patch(
+            "scrapers.sofascore.season_pipeline.materialize_season_partition",
+            return_value=materialized,
+        ),
+        patch("scrapers.sofascore.pipeline.finalize_materialized_results"),
+        patch(
+            "scrapers.sofascore.live_capture.capture_live_dynamic_specs",
+            side_effect=fake_live,
+        ),
+        patch(
+            "dags.scripts.run_sofascore_scraper._tournament_canonical_url",
+            return_value=(
+                "https://www.sofascore.com/tournament/premier-league/17"
+            ),
+        ),
+        patch(
+            "scrapers.sofascore.SofaScoreScraper",
+            return_value=scraper,
+            create=True,
+        ),
+    ):
+        rc = runner._run_legacy(
+            leagues=["ENG-Premier League"],
+            season=2025,
+            output_path=str(output),
+            capture_runtime=runtime,
+            workload_plan=None,
+            offline_replay=False,
+        )
+
+    assert rc == 0
+    assert captured["canonical_url"] == (
+        "https://www.sofascore.com/tournament/premier-league/17"
+    )
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["endpoint_completeness"] == 1.0
+    assert payload["traffic"]["endpoint_completeness"] == 1.0
+
+
+@pytest.mark.unit
+def test_runner_live_player_reports_committed_not_deferred_completeness(
+    tmp_path,
+    monkeypatch,
+):
+    import pandas as pd
+
+    from dags.scripts import run_sofascore_scraper as runner
+    from scrapers.sofascore.pipeline import PLAYER_PATHS
+
+    engine = SimpleNamespace(
+        budget=object(),
+        run_id="run-1",
+        metrics=SimpleNamespace(
+            snapshot=lambda: {
+                "paid_proxy_bytes": 200,
+                "paid_proxy_mb": 200 / 1_048_576,
+                "browser_sessions": 1,
+                "navigations": 1,
+                "request_count": 2,
+                # Both raw replays were DeferredMaterialization before the
+                # mocked final manifest commit.
+                "endpoint_completeness": 0.0,
+            }
+        ),
+    )
+    runtime = CaptureRuntime(engine, object(), object())
+    pending = {"10": set(PLAYER_PATHS)}
+    season_plan = SimpleNamespace(complete=True)
+    scraper = MagicMock()
+    scraper.__enter__.return_value = scraper
+    scraper.__exit__.return_value = False
+    scraper._resolve_player_ids_from_bronze.return_value = []
+    scraper._add_metadata.side_effect = lambda frame, _entity: frame
+    scraper.save_to_iceberg.side_effect = lambda **kwargs: (
+        "iceberg.bronze." + kwargs["table_name"]
+    )
+    output = tmp_path / "player-live.json"
+
+    def materialize(_scraper, _results, *, league, season):
+        return {
+            "player_profile": pd.DataFrame(
+                [
+                    {
+                        "player_id": "10",
+                        "source_season_id": str(SEASON_ID),
+                        "league": league,
+                        "season": season,
+                    }
+                ]
+            ),
+            "player_season_stats": pd.DataFrame(),
+        }
+
+    monkeypatch.setattr(
+        runner, "_source_context", lambda *args: (TOURNAMENT_ID, SEASON_ID)
+    )
+    with (
+        patch(
+            "scrapers.sofascore.season_pipeline.plan_season_partition",
+            return_value=season_plan,
+        ),
+        patch(
+            "scrapers.sofascore.season_pipeline.squad_player_ids",
+            return_value=("10",),
+        ),
+        patch(
+            "scrapers.sofascore.pipeline.endpoint_resume_plan",
+            side_effect=[pending, {}],
+        ),
+        patch(
+            "scrapers.sofascore.live_capture.capture_live_specs",
+            return_value=(
+                [],
+                {
+                    "provider_total_bytes": 200,
+                    "provider_budget_bytes": 1000,
+                    "provider_budget_exceeded": False,
+                    "proxy_exit_hash": None,
+                },
+            ),
+        ),
+        patch(
+            "scrapers.sofascore.pipeline.replay_player_specs",
+            return_value=[SimpleNamespace()],
+        ),
+            patch(
+                "scrapers.sofascore.pipeline.materialize_player_datasets",
+                side_effect=materialize,
+            ),
+            patch("scrapers.sofascore.pipeline.finalize_materialized_results"),
+            patch("scrapers.sofascore.pipeline.promote_repaired_results"),
+            patch("scrapers.sofascore.SofaScoreScraper", return_value=scraper),
+        ):
+        rc = runner._run_player_capture(
+            leagues=["ENG-Premier League"],
+            season=2025,
+            limit=None,
+            output_path=str(output),
+            capture_runtime=runtime,
+            workload_plan=None,
+            offline_replay=False,
+        )
+
+    assert rc == 0
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["endpoint_completeness"] == 1.0
+    assert payload["traffic"]["endpoint_completeness"] == 1.0
+
+
+@pytest.mark.unit
+def test_runner_refuses_new_local_player_outside_signed_post_match_plan(
+    tmp_path,
+    monkeypatch,
+):
+    from dags.scripts import run_sofascore_scraper as runner
+    from scrapers.sofascore.workload_plan import qualify_work_unit
+    from scrapers.sofascore.workload_runtime import partition_key
+
+    engine = SimpleNamespace(
+        run_id="scheduled-1::players",
+        metrics=SimpleNamespace(snapshot=lambda: {"paid_proxy_bytes": 0}),
+    )
+    runtime = SimpleNamespace(
+        engine=engine,
+        raw_store=MagicMock(),
+        manifest_store=MagicMock(),
+    )
+    scraper = MagicMock()
+    scraper.__enter__.return_value = scraper
+    scraper.__exit__.return_value = False
+    scraper._resolve_player_ids_from_bronze.return_value = []
+    signed = SimpleNamespace(
+        player_universe_ids=(
+            qualify_work_unit(
+                partition_key("ENG-Premier League", "2526"),
+                "10",
+            ),
+        ),
+        freshness_key=lambda scope: {
+            "season": FRESHNESS,
+            "match": "final",
+            "player": "fixture-week",
+        }[scope],
+    )
+    output = tmp_path / "player-universe-race.json"
+    monkeypatch.setattr(
+        runner,
+        "_source_context",
+        lambda *args: (TOURNAMENT_ID, SEASON_ID),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_tournament_canonical_url",
+        lambda *args: "https://www.sofascore.com/tournament/premier-league/17",
+    )
+
+    with (
+        patch(
+            "scrapers.sofascore.season_pipeline.plan_season_partition",
+            return_value=SimpleNamespace(complete=True),
+        ),
+        patch(
+            "scrapers.sofascore.season_pipeline.squad_player_ids",
+            return_value=("10", "11"),
+        ),
+        patch("scrapers.sofascore.SofaScoreScraper", return_value=scraper),
+    ):
+        rc = runner._run_player_capture(
+            leagues=["ENG-Premier League"],
+            season=2025,
+            limit=None,
+            output_path=str(output),
+            capture_runtime=runtime,
+            workload_plan=signed,
+            workload_allocations=(),
+            offline_replay=False,
+        )
+
+    assert rc == 1
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert "outside the signed player plan" in payload["errors"][0]
+    scraper.save_to_iceberg.assert_not_called()
 
 
 def _replayed_complete_partition(tmp_path):

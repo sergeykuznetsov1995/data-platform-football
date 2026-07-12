@@ -295,6 +295,111 @@ def test_legitimate_empty_not_supported_and_schema_drift_are_distinct(tmp_path):
     assert invalid_json.manifest.status == ManifestStatus.SCHEMA_ERROR
 
 
+@pytest.mark.parametrize(
+    ("status_code", "expected_status"),
+    [
+        (204, ManifestStatus.LEGITIMATE_EMPTY),
+        (404, ManifestStatus.NOT_SUPPORTED),
+    ],
+)
+def test_offline_force_replay_preserves_terminal_response_without_json(
+    tmp_path,
+    status_code,
+    expected_status,
+):
+    raw_store = _raw_store(tmp_path)
+    manifests = InMemoryManifestStore()
+    first = _engine(
+        tmp_path,
+        FakeTransport([HttpPayload(status_code, b"", provider_bytes=0)]),
+        raw_store=raw_store,
+        manifests=manifests,
+    ).capture(_spec())
+    assert first.manifest.status == expected_status
+
+    no_network = FakeTransport()
+    replay = _engine(
+        tmp_path,
+        no_network,
+        raw_store=raw_store,
+        manifests=manifests,
+    ).capture(_spec(), offline=True, force_replay=True)
+
+    assert replay.manifest == first.manifest
+    assert replay.raw is not None
+    assert replay.raw.http_status == status_code
+    assert replay.replay_hit is True
+    assert replay.network_used is False
+    assert manifests.get(_key()).status == expected_status
+    assert no_network.calls == []
+
+
+@pytest.mark.parametrize(
+    ("status_code", "expected_status"),
+    [
+        (204, ManifestStatus.LEGITIMATE_EMPTY),
+        (404, ManifestStatus.NOT_SUPPORTED),
+    ],
+)
+def test_offline_raw_replay_reconstructs_terminal_http_state_without_manifest(
+    tmp_path,
+    status_code,
+    expected_status,
+):
+    raw_store = _raw_store(tmp_path)
+    raw_store.store_bytes(
+        _spec().raw_target,
+        b"",
+        request_url=_spec().url,
+        http_status=status_code,
+    )
+    manifests = InMemoryManifestStore()
+    no_network = FakeTransport()
+
+    replay = _engine(
+        tmp_path,
+        no_network,
+        raw_store=raw_store,
+        manifests=manifests,
+    ).capture(_spec(), offline=True, force_replay=True)
+
+    assert replay.manifest.status == expected_status
+    assert replay.raw is not None
+    assert replay.raw.http_status == status_code
+    assert replay.replay_hit is True
+    assert replay.network_used is False
+    assert manifests.get(_key()).status == expected_status
+    assert no_network.calls == []
+
+
+def test_offline_force_replay_still_validates_terminal_200_json(tmp_path):
+    raw_store = _raw_store(tmp_path)
+    manifests = InMemoryManifestStore()
+    first = _engine(
+        tmp_path,
+        FakeTransport([HttpPayload(200, b'{"events":[]}', provider_bytes=0)]),
+        raw_store=raw_store,
+        manifests=manifests,
+    ).capture(_spec())
+    assert first.manifest.status == ManifestStatus.LEGITIMATE_EMPTY
+
+    raw_store.store_bytes(
+        _spec().raw_target,
+        b"not-json",
+        request_url=_spec().url,
+        http_status=200,
+    )
+    replay = _engine(
+        tmp_path,
+        FakeTransport(),
+        raw_store=raw_store,
+        manifests=manifests,
+    ).capture(_spec(), offline=True, force_replay=True)
+
+    assert replay.manifest.status == ManifestStatus.SCHEMA_ERROR
+    assert replay.manifest.error_type == "RawPayloadSchemaError"
+
+
 def test_schema_error_replays_after_parser_fix_without_source_access(tmp_path):
     raw_store = _raw_store(tmp_path)
     manifests = InMemoryManifestStore()
@@ -359,6 +464,7 @@ def _verified_budget(tmp_path):
         "browser_sessions": 1,
         "navigations": 1,
         "request_count": 1,
+        "source_request_count": 1,
         "completed_matches": 25,
         "completed_players": 50,
         "matches_per_second": 1.0,
@@ -405,13 +511,15 @@ def _verified_budget(tmp_path):
                 "schema_version": 1,
                 "source": "sofascore",
                 "meter": "proxy_filter_provider_path_v2",
+                "budget_derivation": "max_measured_total_and_per_run_endpoint_max_v1",
                 "verified": True,
                 "samples": samples,
             }
         )
     )
     return SharedBudgetLedger(
-        tmp_path / "ledger.json", load_verified_policy(artifact)
+        tmp_path / "ledger.json",
+        load_verified_policy(artifact, allow_legacy_v1=True),
     )
 
 
@@ -444,6 +552,40 @@ def test_paid_response_uses_provider_reservation_and_real_meter(tmp_path):
     assert result.manifest.provider_bytes == 73
     assert budget.snapshot("dag-run")["spent_provider_bytes"] == 73
     assert engine.metrics.snapshot()["paid_proxy_bytes"] == 73
+
+
+def test_offline_replay_preserves_original_provider_byte_provenance(tmp_path):
+    raw_store = _raw_store(tmp_path)
+    manifests = InMemoryManifestStore()
+    first = _engine(
+        tmp_path,
+        FakeTransport(
+            [
+                HttpPayload(
+                    200,
+                    b'{"events":[{"id":1}]}',
+                    provider_bytes=73,
+                )
+            ]
+        ),
+        raw_store=raw_store,
+        manifests=manifests,
+        sink=RecordingSink(raw_store, fail_times=1),
+        budget=_verified_budget(tmp_path),
+    )
+    failed = first.capture(_spec(paid=True))
+    assert failed.manifest.provider_bytes == 73
+
+    replay = _engine(
+        tmp_path,
+        FakeTransport(),
+        raw_store=raw_store,
+        manifests=manifests,
+        sink=RecordingSink(raw_store, fail_times=1),
+    ).capture(_spec(paid=True), offline=True, force_replay=True)
+
+    assert replay.network_used is False
+    assert replay.manifest.provider_bytes == 73
 
 
 def test_bounded_concurrency_never_exceeds_configured_workers(tmp_path):

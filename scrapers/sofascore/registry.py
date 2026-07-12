@@ -241,6 +241,15 @@ def activation_eligibility(tournament: Mapping[str, Any]) -> ActivationEligibili
         reasons.append("source sport is not confirmed football")
     if classification.get("gender") != "male":
         reasons.append("source gender is not confirmed male")
+    # An operator may resolve source fields that are genuinely unknown, but
+    # explicit negative source evidence is never overridable.  Keep these
+    # checks independent from ``exclusion_reasons`` so a stale/hand-edited
+    # classification cannot turn a youth or reserve competition into an adult
+    # first-team capture merely by clearing the explanatory list.
+    if classification.get("age_group") == "youth":
+        reasons.append("source age_group is youth")
+    if classification.get("team_level") == "reserve":
+        reasons.append("source team_level is reserve")
     exclusions = classification.get("exclusion_reasons")
     if isinstance(exclusions, list) and exclusions:
         reasons.extend(f"source exclusion: {value}" for value in exclusions)
