@@ -144,13 +144,13 @@ rate-limited. The candidate remains `verified=false`: these are the first cold
 observations, not a production budget.
 
 The current runtime fingerprint is
-`cae55b41f0ab4892c06f65b67a81ac6d49c9a120c9a5ec91681f72ad516137c1`.
+`960283608cb8d5b6602e7d82236c862ade96f30591dd8497704bc32d388498f1`.
 Its first accepted EPL season-shape sample captured 38/38 planned payloads in
-one browser session and 39 navigations, using 460,575 provider bytes
-(0.439 MiB). It recorded 13 schedule pages, standings, rounds and participants
+one browser session and 39 navigations, using 463,018 provider bytes
+(0.442 MiB). It recorded 13 schedule pages, standings, rounds and participants
 as success; the empty future schedule as `legitimate_empty`; and cup tree plus
 20 season-scoped squad routes as `not_supported`. Endpoint completeness was
-100%, p50 duration 188 ms and p95 5.348 s. No-op, offline replay and one-endpoint
+100%, p50 duration 260 ms and p95 3.145 s. No-op, offline replay and one-endpoint
 resume were also saved. One sample is far below the policy requirement of 20
 cold samples and five distinct exits, so the shipped artifact remains
 `verified=false`.

@@ -26,7 +26,6 @@ import pyarrow as pa
 
 from scrapers.base.sql_validator import (
     validate_catalog_qualified_name,
-    validate_identifier,
     sanitize_filter_expr,
     validate_snapshot_id,
 )
@@ -330,7 +329,7 @@ class IcebergWriter:
         Returns:
             Full table identifier (e.g., 'iceberg.bronze.clubelo_ratings')
         """
-        from scrapers.base.trino_manager import TrinoTableManager, TrinoError, _is_iceberg_invalid_metadata
+        from scrapers.base.trino_manager import TrinoError, _is_iceberg_invalid_metadata
 
         trino = self._get_trino_manager()
         full_table = f"{self.catalog}.{database}.{table}"
