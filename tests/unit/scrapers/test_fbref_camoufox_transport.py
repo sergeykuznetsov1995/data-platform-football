@@ -6,6 +6,7 @@ import pytest
 
 from scrapers.fbref.camoufox_fetch import (
     BROWSER_REQUEST_FIXED_OVERHEAD_BYTES,
+    BROWSER_UNDECLARED_BODY_RESERVATION_BYTES,
     CamoufoxFbrefTransport,
     is_cloudflare_blocked,
     should_block_request,
@@ -132,17 +133,14 @@ def test_continue_exception_keeps_unknown_reservation_charged():
 
 @pytest.mark.unit
 @pytest.mark.parametrize(
-    ("headers", "reason"),
+    "headers",
     [
-        ({}, "missing_or_invalid_content_length"),
-        ({"content-length": "not-a-number"}, "missing_or_invalid_content_length"),
-        (
-            {"content-length": "10", "transfer-encoding": "chunked"},
-            "chunked_content_length",
-        ),
+        {},
+        {"content-length": "not-a-number"},
+        {"content-length": "10", "transfer-encoding": "chunked"},
     ],
 )
-def test_browser_aborts_whole_session_on_unbounded_response(headers, reason):
+def test_browser_aborts_whole_session_when_undeclared_body_cannot_fit(headers):
     cap = BROWSER_REQUEST_FIXED_OVERHEAD_BYTES + 100
     transport = CamoufoxFbrefTransport(max_network_bytes=cap)
     route = _Route()
@@ -153,12 +151,81 @@ def test_browser_aborts_whole_session_on_unbounded_response(headers, reason):
     stats = transport.traffic_stats()
     assert route.continued == 1
     assert stats["byte_budget_exhausted"] is True
-    assert stats["byte_budget_failure"] == reason
+    assert stats["byte_budget_failure"] == (
+        f"undeclared_body_exceeds_cap:{BROWSER_UNDECLARED_BODY_RESERVATION_BYTES}"
+    )
     assert stats["inflight_reserved_bytes"] == 0
     assert stats["budget_unobserved_bytes"] == (
         BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
     )
     assert stats["budget_blocked_count"] == 1
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {},
+        {"content-length": "not-a-number"},
+        {"content-length": "10", "transfer-encoding": "chunked"},
+    ],
+)
+def test_undeclared_body_reserves_the_ceiling_and_settles_to_observed(headers):
+    """Cloudflare/HTTP-2 responses carry no usable Content-Length; the guard
+    must reserve a ceiling instead of killing the clearance session."""
+    overhead = BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
+    ceiling = BROWSER_UNDECLARED_BODY_RESERVATION_BYTES
+    transport = CamoufoxFbrefTransport(
+        max_network_bytes=overhead + ceiling + 1_000
+    )
+    route = _Route()
+    transport._maybe_block(route)
+
+    transport._on_response(_Response(route.request, headers))
+
+    stats = transport.traffic_stats()
+    assert stats["byte_budget_exhausted"] is False
+    assert stats["inflight_reserved_bytes"] == overhead + ceiling
+
+    route.request.sizes.return_value = {
+        "responseBodySize": 40_000,
+        "responseHeadersSize": 1_000,
+        "requestBodySize": 0,
+        "requestHeadersSize": 500,
+    }
+    transport._on_request_finished(route.request)
+
+    stats = transport.traffic_stats()
+    assert stats["byte_budget_exhausted"] is False
+    assert stats["inflight_reserved_bytes"] == 0
+    assert stats["real_bytes_downloaded"] == 41_500
+
+
+@pytest.mark.unit
+def test_undeclared_body_that_outgrows_its_reservation_aborts_at_completion():
+    overhead = BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
+    ceiling = BROWSER_UNDECLARED_BODY_RESERVATION_BYTES
+    transport = CamoufoxFbrefTransport(
+        max_network_bytes=overhead + ceiling + 1_000
+    )
+    route = _Route()
+    transport._maybe_block(route)
+    transport._on_response(_Response(route.request, {}))
+
+    oversized = overhead + ceiling + 1
+    route.request.sizes.return_value = {
+        "responseBodySize": oversized,
+        "responseHeadersSize": 0,
+        "requestBodySize": 0,
+        "requestHeadersSize": 0,
+    }
+    transport._on_request_finished(route.request)
+
+    stats = transport.traffic_stats()
+    assert stats["byte_budget_exhausted"] is True
+    assert stats["byte_budget_failure"].startswith(
+        "completed_size_exceeded_reservation:"
+    )
 
 
 @pytest.mark.unit

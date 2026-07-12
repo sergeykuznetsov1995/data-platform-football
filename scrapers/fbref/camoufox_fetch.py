@@ -80,6 +80,14 @@ _CF_MARKERS = (
 # in-flight request and is released when that request finishes or fails.
 BROWSER_REQUEST_FIXED_OVERHEAD_BYTES = 64 * 1024
 
+# Cloudflare answers over HTTP/2, and chunked HTTP/1.1 responses carry no
+# Content-Length at all, so an undeclared body is the norm on the clearance
+# path rather than an attack.  Such a response reserves this ceiling before the
+# browser may read it and settles to the observed size on completion; a body
+# that outgrows the reservation still aborts the session at completion, and a
+# reservation that does not fit the remaining budget aborts it before transport.
+BROWSER_UNDECLARED_BODY_RESERVATION_BYTES = 512 * 1024
+
 
 def should_block_request(
     resource_type: str, url: str, block_scripts: bool = False
@@ -566,31 +574,40 @@ class CamoufoxFbrefTransport:
 
         headers = self._response_headers(response)
         transfer_encoding = headers.get("transfer-encoding", "")
-        if "chunked" in {
+        chunked = "chunked" in {
             token.strip().casefold()
             for token in transfer_encoding.split(",")
-        }:
-            self._abort_session_for_byte_budget("chunked_content_length")
-            return
+        }
         raw_length = headers.get("content-length", "").strip()
-        if not raw_length or not raw_length.isascii() or not raw_length.isdigit():
-            self._abort_session_for_byte_budget("missing_or_invalid_content_length")
-            return
-        content_length = int(raw_length)
+        declared = (
+            not chunked
+            and raw_length
+            and raw_length.isascii()
+            and raw_length.isdigit()
+        )
+        body_reservation = (
+            int(raw_length)
+            if declared
+            else BROWSER_UNDECLARED_BODY_RESERVATION_BYTES
+        )
         projected = (
             self._bytes_total
             + self._unobserved_reserved_bytes
             + self._inflight_reserved_bytes
-            + content_length
+            + body_reservation
         )
         if projected > self._max_network_bytes:
             self._abort_session_for_byte_budget(
-                f"declared_content_length_exceeds_cap:{content_length}"
+                f"declared_content_length_exceeds_cap:{body_reservation}"
+                if declared
+                else f"undeclared_body_exceeds_cap:{body_reservation}"
             )
             return
 
-        self._inflight_byte_reservations[reservation_key] = fixed + content_length
-        self._inflight_reserved_bytes += content_length
+        self._inflight_byte_reservations[reservation_key] = (
+            fixed + body_reservation
+        )
+        self._inflight_reserved_bytes += body_reservation
 
     def _on_request_finished(self, req) -> None:
         reserved = self._release_byte_reservation(req)
