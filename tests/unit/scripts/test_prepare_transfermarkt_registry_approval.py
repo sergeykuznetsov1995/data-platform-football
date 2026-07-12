@@ -51,7 +51,7 @@ def test_plan_is_deterministic_and_side_effect_free(tmp_path):
     }
     assert first["packets"]["paid"].byte_cap_bytes == 15_728_640
     assert first["packets"]["paid"].request_limit == 1024
-    assert first["packets"]["paid"].retry_limit == 12
+    assert first["packets"]["paid"].retry_limit == 96
     assert first["packets"]["paid"].concurrency == 1
 
 
