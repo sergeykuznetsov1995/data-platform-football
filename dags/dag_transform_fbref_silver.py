@@ -49,6 +49,7 @@ from typing import Any, Dict
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 from airflow.utils.task_group import TaskGroup
 
 from utils.default_args import SILVER_ARGS
