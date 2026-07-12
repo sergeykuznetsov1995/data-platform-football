@@ -6,10 +6,10 @@
 -- (that is a feature decision, floor 2):
 --
 --   fotmob        — silver.fotmob_player_market_value_history (canonical_id is
---                   NOT resolved in Silver → bridge via silver.xref_player here,
---                   INNER JOIN non-orphan = canonical-only, same as before).
+--                   resolved when xref has one unambiguous match; otherwise a
+--                   stable fm_<source_id> is retained).
 --   transfermarkt — silver.transfermarkt_market_value_history (canonical_id IS
---                   resolved in Silver → read it directly, no xref hop).
+--                   resolved in Silver; unresolved rows retain tm_<source_id>).
 --
 -- Pointwise off-field fact (design §6 rule 5): market value is a career-long
 -- timeline, NOT season-bound — so NO league/season columns and NO partitioning
@@ -21,10 +21,9 @@
 -- of Silver. ROW_NUMBER over the design PK keeps one row (freshest ingest) —
 -- without it the dropped (league, season) grain would leave cross-season dups.
 --
--- Canonical-only: the FotMob half has always been canonical-only (INNER JOIN
--- xref non-orphan); the Transfermarkt half matches that contract
--- (WHERE canonical_id IS NOT NULL) so player_id is always a real
--- 'fb_' canonical and the dim_player FK stays low-orphan.
+-- Lossless orphan policy (#871): a missing or ambiguous xref must not delete a
+-- valuation.  Source-prefixed ids are stable, collision-safe across sources,
+-- and remain visible to the soft dim_player FK DQ until xref resolves them.
 --
 -- ⚠️ xref JOIN MUST include (league, season) predicate (CLAUDE.md footgun):
 --   silver.xref_player has per-(source, source_id, season) rows; without the
@@ -37,43 +36,55 @@
 -- =============================================================================
 
 WITH xref_fotmob AS (
-    SELECT DISTINCT
-        canonical_id,
+    SELECT
         source_id    AS fotmob_player_id,
         league,
-        season       AS season_year
+        season       AS season_year,
+        CASE
+            WHEN COUNT(DISTINCT canonical_id) = 1 THEN MIN(canonical_id)
+            ELSE NULL
+        END AS canonical_id
     FROM iceberg.silver.xref_player
     WHERE source = 'fotmob'
       AND confidence <> 'orphan'
+      AND canonical_id IS NOT NULL
+    GROUP BY source_id, league, season
 ),
 
 fotmob AS (
     SELECT
-        xfm.canonical_id                                  AS player_id,
+        COALESCE(
+            xfm.canonical_id,
+            CONCAT('fm_', CAST(mv.player_id AS varchar))
+        )                                                 AS player_id,
         mv.value_date                                     AS valuation_date,
         mv.market_value_eur                               AS market_value_eur,
         mv.currency                                       AS currency,
         CAST('fotmob' AS varchar)                         AS source,
         CAST(mv._bronze_ingested_at AS timestamp(6))      AS _bronze_ingested_at
     FROM iceberg.silver.fotmob_player_market_value_history mv
-    INNER JOIN xref_fotmob xfm
+    LEFT JOIN xref_fotmob xfm
         ON  xfm.fotmob_player_id = mv.player_id
         AND xfm.league           = mv.league
         AND xfm.season_year      = mv.season
-    WHERE mv.value_date IS NOT NULL
+    WHERE mv.player_id IS NOT NULL
+      AND mv.value_date IS NOT NULL
 ),
 
 transfermarkt AS (
     SELECT
-        tm.canonical_id                                   AS player_id,
+        COALESCE(
+            tm.canonical_id,
+            CONCAT('tm_', CAST(tm.player_id AS varchar))
+        )                                                 AS player_id,
         tm.mv_date                                        AS valuation_date,
         tm.value_eur                                      AS market_value_eur,
         CAST('EUR' AS varchar)                            AS currency,
         CAST('transfermarkt' AS varchar)                  AS source,
         CAST(tm._bronze_ingested_at AS timestamp(6))      AS _bronze_ingested_at
     FROM iceberg.silver.transfermarkt_market_value_history tm
-    WHERE tm.mv_date      IS NOT NULL
-      AND tm.canonical_id IS NOT NULL
+    WHERE tm.player_id IS NOT NULL
+      AND tm.mv_date IS NOT NULL
 ),
 
 unioned AS (

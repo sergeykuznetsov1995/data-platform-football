@@ -1,0 +1,11 @@
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.transfermarkt_coach_stints_v2
+  description: |
+    Typed global Transfermarkt coach stints. Kept separate from the canonical
+    FBref match-derived gold.fct_manager_stint.
+  tags: [Tier.Silver, Domain.Football, PII.Low]
+columns:
+  - name: manager_id
+    description: Best-effort unique canonical manager id.
+  - name: team_id
+    description: Best-effort canonical team id.

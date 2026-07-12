@@ -9,7 +9,7 @@ table:
     event_seq, без UNION fct_goal/fct_card/fct_substitution (те три узких факта
     дропнуты в #448, это их замена). Зерно: (match_id, event_seq).
     Партиционирование: (league, season). Источники: silver.fbref_match_events
-    (PRIMARY) ∪ bronze.whoscored_events (per-match fallback с двуногим
+    (PRIMARY) ∪ silver.whoscored_events_spadl (per-match fallback с двуногим
     identity-gate #459 против задвоения голов).
   tags:
     - Tier.Gold

@@ -1,0 +1,19 @@
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.whoscored_schedule_current
+  description: |
+    Каноническое расписание WhoScored parser v7. Представление выбирает
+    последний успешный scope batch для каждой пары (league, season), поэтому
+    частично записанный batch не виден downstream. Grain — один матч.
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.None
+columns:
+  - name: game_id
+    description: Числовой идентификатор матча WhoScored.
+  - name: stage_id
+    description: Идентификатор стадии WhoScored.
+  - name: date
+    description: Дата и время начала матча.
+  - name: _scope_batch_id
+    description: Идентификатор успешно опубликованного scope batch.

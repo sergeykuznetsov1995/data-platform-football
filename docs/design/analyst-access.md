@@ -238,8 +238,14 @@ security.refresh-period=30s
 
 ### 4.7 Что осознанно отложено
 
-- **OpenMetadata → OIDC**: смена `AUTHENTICATION_PROVIDER` инвазивна (bot-JWT, migrate,
-  admin-principals). Оставляем basic auth; редким желающим — ручные аккаунты.
+- **OpenMetadata → OIDC**: ~~смена `AUTHENTICATION_PROVIDER` инвазивна (bot-JWT, migrate,
+  admin-principals). Оставляем basic auth; редким желающим — ручные аккаунты.~~
+  **Сделано в #866**: `custom-oidc` (confidential client `openmetadata` в realm),
+  meta публикуется за Caddy; бот-JWT жив — в `AUTHENTICATION_PUBLIC_KEYS` остаётся
+  собственный JWKS OM, ключи подписи заменены на свои (`make gen-om-jwt-keys`).
+  Ограничение OM OSS: групп→роли маппинга нет — админы перечисляются в
+  `OM_ADMIN_PRINCIPALS`, остальных заводит админ (self-signup выключен).
+  Break-glass — дефолты compose = basic (см. `configs/openmetadata/README.md`).
 - **Lakekeeper**: работает с `security=NONE` → любой сетевой доступ = неаутентифицированный
   write мимо Trino-ACL. Поэтому pyiceberg в образе есть, но Lakekeeper к сети `dp-analyst`
   **не подключён**. Включение OIDC в Lakekeeper (+ `iceberg.rest-catalog.security=OAUTH2`

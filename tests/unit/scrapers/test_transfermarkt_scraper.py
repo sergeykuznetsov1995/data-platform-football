@@ -1,20 +1,25 @@
 """Unit tests for scrapers.transfermarkt.
 
-Covers pure parsers and helpers. End-to-end HTTP / Iceberg paths are
-exercised by ``scripts/probe_transfermarkt.py`` (live) and the DAG smoke
-runs in a container — not pytest.
+Covers pure parsers, native contracts, and transport adapters.  The bounded
+live path is exercised by ``scripts/research/bench_transfermarkt_fetch.py``.
 """
 
 from datetime import date
+from unittest.mock import MagicMock
 
+import pandas as pd
 import pytest
 
-from scrapers.transfermarkt import TransfermarktScraper
+from scrapers.transfermarkt import (
+    TransfermarktScraper,
+    materialize_legacy_market_value_history,
+    materialize_legacy_transfers,
+)
 from scrapers.transfermarkt.scraper import (
     ConsecutiveFailureError,
     PartialScrapeError,
     R0_2B_FALLBACK_MARKER,
-    TM_LEAGUE_MAP,
+    TransfermarktError,
     _coerce_int,
     _extract_club_id_from_href,
     _parse_club_listing,
@@ -26,9 +31,13 @@ from scrapers.transfermarkt.scraper import (
     _parse_tm_date,
     _parse_tm_money_eur,
     _parse_transfers,
-    _season_short,
     _season_window,
     _stint_overlaps_season,
+)
+from scrapers.transfermarkt.registry import (
+    SeasonFormat,
+    canonical_season,
+    resolve_competition,
 )
 
 
@@ -36,19 +45,17 @@ from scrapers.transfermarkt.scraper import (
 # Helpers
 # ---------------------------------------------------------------------------
 
-class TestSeasonShort:
+class TestSeasonSemantics:
     @pytest.mark.parametrize("year,expected", [
         (2024, '2425'),
         (2025, '2526'),
         (2099, '9900'),  # wrap
     ])
     def test_four_digit_year(self, year, expected):
-        assert _season_short(year) == expected
+        assert canonical_season(year, SeasonFormat.SPLIT_YEAR) == expected
 
-    def test_str_input_treated_as_year(self):
-        # `_season_short` always shortens — '2526' is treated as the (invalid
-        # but defensible) year 2526 → '2627'. Callers should pass an int year.
-        assert _season_short('2526') == '2627'
+    def test_single_year_is_not_changed(self):
+        assert canonical_season('2026', SeasonFormat.SINGLE_YEAR) == '2026'
 
 
 class TestParseMoneyEur:
@@ -58,8 +65,8 @@ class TestParseMoneyEur:
         ('€500k', 500_000),
         ('€ 1.20bn', 1_200_000_000),
         ('€1.20b', 1_200_000_000),
-        # Note: TM .us uses period as decimal separator. European-format
-        # comma-decimal (`€80,00m`) is not supported — would parse as 8B.
+        ('€80,00m', 80_000_000),
+        ('€1.234,50m', 1_234_500_000),
         ('?', None),
         ('-', None),
         ('', None),
@@ -426,6 +433,8 @@ class TestParseTransfers:
         assert row['player_id'] == '315858'
         assert row['transfer_date'] == date(2025, 9, 1)
         assert row['season'] == '25/26'
+        assert row['event_season'] == '2526'
+        assert len(row['transfer_id']) == 64
         assert row['from_club_id'] == '583'
         assert row['from_club_name'] == 'PSG'
         assert row['to_club_id'] == '281'
@@ -461,7 +470,10 @@ class TestParseTransfers:
 
 class TestConstants:
     def test_tm_league_map_apl(self):
-        assert TM_LEAGUE_MAP['ENG-Premier League'] == ('premier-league', 'GB1')
+        competition = resolve_competition('ENG-Premier League')
+        assert (competition.slug, competition.competition_id) == (
+            'premier-league', 'GB1',
+        )
 
     def test_fallback_marker(self):
         assert R0_2B_FALLBACK_MARKER == 'TM_FALLBACK'
@@ -481,6 +493,8 @@ class TestTransfermarktInit:
         assert scr.leagues == ['ENG-Premier League']
         assert scr.seasons == [2025]
         assert scr._last_endpoint_error is None
+        assert scr._rate_limiter.config.burst_size == 1
+        assert scr._rate_limiter.config.max_requests == 12
 
 
 # ---------------------------------------------------------------------------
@@ -503,12 +517,14 @@ class TestConsecutiveFailureRaise:
     ):
         import scrapers.transfermarkt.scraper as tm
         monkeypatch.setattr(tm, '_MAX_CONSECUTIVE_FAILURES', 3)
+        monkeypatch.setattr(tm, '_MIN_SUCCESS_RATIO', 0)
         monkeypatch.setattr(
             scraper, '_fetch_json',
             lambda url, label='json', context=None: None,
         )
         with pytest.raises(
-            ConsecutiveFailureError, match='consecutive mv_history failures',
+            ConsecutiveFailureError,
+            match='consecutive market_value_points failures',
         ):
             scraper.read_market_value_history(
                 league='ENG-Premier League', season=2025,
@@ -520,12 +536,13 @@ class TestConsecutiveFailureRaise:
     ):
         import scrapers.transfermarkt.scraper as tm
         monkeypatch.setattr(tm, '_MAX_CONSECUTIVE_FAILURES', 3)
+        monkeypatch.setattr(tm, '_MIN_SUCCESS_RATIO', 0)
         monkeypatch.setattr(
             scraper, '_fetch_json',
             lambda url, label='json', context=None: None,
         )
         with pytest.raises(
-            ConsecutiveFailureError, match='consecutive transfers failures',
+            ConsecutiveFailureError, match='consecutive transfer_events failures',
         ):
             scraper.read_transfers(
                 league='ENG-Premier League', season=2025,
@@ -541,13 +558,17 @@ class TestConsecutiveFailureRaise:
         import scrapers.transfermarkt.scraper as tm
         monkeypatch.setattr(tm, '_MAX_CONSECUTIVE_FAILURES', 3)
         monkeypatch.setattr(tm, '_MIN_SUCCESS_RATIO', 0)
-        responses = iter([None, None, {'list': []}] * 3)
+        responses = iter([None, None, {'list': [{'x': 1, 'y': 100}]}] * 3)
         monkeypatch.setattr(
             scraper, '_fetch_json',
             lambda url, label='json', context=None: next(responses),
         )
         monkeypatch.setattr(tm, '_parse_mv_history', lambda payload, player_id: [
-            {'player_id': player_id, 'value_eur': 100},
+            {
+                'player_id': player_id,
+                'mv_date': date(2025, 1, 1),
+                'value_eur': 100,
+            },
         ])
         df = scraper.read_market_value_history(
             league='ENG-Premier League', season=2025,
@@ -592,10 +613,6 @@ class TestPartialScrapeRatio:
             lambda url, label='html', context=None:
                 next(responses) if label == 'squad' else '<html/>',
         )
-        monkeypatch.setattr(
-            scraper, '_resolve_contracts_from_bronze',
-            lambda league, season_short: {},
-        )
 
     def test_read_players_raises_on_low_squad_success_ratio(
         self, scraper, monkeypatch,
@@ -621,15 +638,19 @@ class TestPartialScrapeRatio:
         self, scraper, monkeypatch,
     ):
         import scrapers.transfermarkt.scraper as tm
-        responses = iter([None, {'list': []}] * 5)
+        responses = iter([None, {'list': [{'x': 1, 'y': 100}]}] * 5)
         monkeypatch.setattr(
             scraper, '_fetch_json',
             lambda url, label='json', context=None: next(responses),
         )
         monkeypatch.setattr(tm, '_parse_mv_history', lambda payload, player_id: [
-            {'player_id': player_id, 'value_eur': 100},
+            {
+                'player_id': player_id,
+                'mv_date': date(2025, 1, 1),
+                'value_eur': 100,
+            },
         ])
-        with pytest.raises(PartialScrapeError, match='mv_history'):
+        with pytest.raises(PartialScrapeError, match='market_value_points'):
             scraper.read_market_value_history(
                 league='ENG-Premier League', season=2025,
                 player_ids=[str(i) for i in range(10)],
@@ -639,15 +660,25 @@ class TestPartialScrapeRatio:
         self, scraper, monkeypatch,
     ):
         import scrapers.transfermarkt.scraper as tm
-        responses = iter([None, {'transfers': []}] * 5)
+        responses = iter([None, {'transfers': [{
+            'id': 'x',
+            'date': 'Jul 1, 2025',
+            'season': '25/26',
+            'from': {'clubName': 'A'},
+            'to': {'clubName': 'B'},
+        }]}] * 5)
         monkeypatch.setattr(
             scraper, '_fetch_json',
             lambda url, label='json', context=None: next(responses),
         )
         monkeypatch.setattr(tm, '_parse_transfers', lambda payload, player_id: [
-            {'player_id': player_id, 'fee_eur': 100},
+            {
+                'transfer_id': f't-{player_id}',
+                'player_id': player_id,
+                'fee_eur': 100,
+            },
         ])
-        with pytest.raises(PartialScrapeError, match='transfers'):
+        with pytest.raises(PartialScrapeError, match='transfer_events'):
             scraper.read_transfers(
                 league='ENG-Premier League', season=2025,
                 player_ids=[str(i) for i in range(10)],
@@ -701,10 +732,6 @@ class TestReadPlayersCurrentClub:
             scraper, '_fetch_html',
             lambda url, label='html', context=None: '<html/>',
         )
-        monkeypatch.setattr(
-            scraper, '_resolve_contracts_from_bronze',
-            lambda league, season_short: {},
-        )
 
         df = scraper.read_players(league='ENG-Premier League', season=2018)
 
@@ -716,16 +743,13 @@ class TestReadPlayersCurrentClub:
 
 
 # ---------------------------------------------------------------------------
-# contract_until carry-forward (July gap)
+# Contract observations are source-faithful
 #
-# TM renders the Contract column only for the season IT considers current and
-# flips to the new season in early July, while CURRENT_SEASON flips in August.
-# A July run therefore scrapes contract_until=None for every player — the
-# partition replace must fill those from the existing bronze partition, not
-# wipe last week's values.
+# Carry-forward belongs in a deterministic Silver model, not in the scraper:
+# a missing current observation must not be silently rewritten from old Bronze.
 # ---------------------------------------------------------------------------
 
-class TestReadPlayersContractCarryForward:
+class TestReadPlayersContractObservations:
     @pytest.fixture
     def scraper(self):
         return TransfermarktScraper(
@@ -745,7 +769,7 @@ class TestReadPlayersContractCarryForward:
             lambda url, label='html', context=None: '<html/>',
         )
 
-    def test_missing_contracts_filled_from_bronze(self, scraper, monkeypatch):
+    def test_missing_contract_stays_missing(self, scraper, monkeypatch):
         self._patch_pipeline(monkeypatch, scraper, [
             {'player_id': '1', 'player_slug': 'a', 'name': 'A',
              'club_id': '11', 'market_value_eur': None,
@@ -754,44 +778,22 @@ class TestReadPlayersContractCarryForward:
              'club_id': '11', 'market_value_eur': None,
              'contract_until': None},
         ])
-        monkeypatch.setattr(
-            scraper, '_resolve_contracts_from_bronze',
-            lambda league, season_short: {'1': date(2028, 6, 30)},
-        )
         df = scraper.read_players(league='ENG-Premier League', season=2025)
         by_id = df.set_index('player_id')
-        assert by_id.loc['1', 'contract_until'] == date(2028, 6, 30)
+        assert by_id.loc['1', 'contract_until'] is None
         assert by_id.loc['2', 'contract_until'] is None
 
-    def test_scraped_contract_wins_over_bronze(self, scraper, monkeypatch):
+    def test_scraped_contract_is_preserved(self, scraper, monkeypatch):
         self._patch_pipeline(monkeypatch, scraper, [
             {'player_id': '1', 'player_slug': 'a', 'name': 'A',
              'club_id': '11', 'market_value_eur': None,
              'contract_until': date(2030, 6, 30)},
         ])
-        called = []
-        monkeypatch.setattr(
-            scraper, '_resolve_contracts_from_bronze',
-            lambda league, season_short: called.append(1) or {},
-        )
         df = scraper.read_players(league='ENG-Premier League', season=2025)
         assert df.iloc[0]['contract_until'] == date(2030, 6, 30)
-        # All contracts present → bronze lookup skipped entirely.
-        assert called == []
 
-    def test_resolver_reads_bronze_via_trino(self, scraper):
-        from unittest.mock import patch
-        import sys
-
-        cursor = _StubCursor([('1', date(2028, 6, 30)), ('2', None)])
-        with patch.dict(sys.modules, _stub_trino_modules(cursor)):
-            out = scraper._resolve_contracts_from_bronze(
-                'ENG-Premier League', '2526',
-            )
-        assert out == {'1': date(2028, 6, 30)}
-        sql, params = cursor.executed[0]
-        assert 'contract_until IS NOT NULL' in sql
-        assert params == ('ENG-Premier League', '2526')
+    def test_scraper_has_no_contract_cache_resolver(self, scraper):
+        assert not hasattr(scraper, '_resolve_contracts_from_bronze')
 
 
 # ---------------------------------------------------------------------------
@@ -875,8 +877,6 @@ class _StubCursor:
 
 def _stub_trino_modules(cursor):
     """sys.modules stubs for the lazy ``import trino`` inside the scraper."""
-    from unittest.mock import MagicMock
-
     conn = MagicMock()
     conn.cursor.return_value = cursor
     stub_trino = MagicMock()
@@ -909,6 +909,7 @@ class TestResolverDeterministicLimit:
             )
         assert ids == ['2', '3']  # numeric order [2,3,10,100], window [0:2]
         sql, _ = cursor.executed[0]
+        assert 'transfermarkt_squad_memberships' in sql
         assert 'ORDER BY' not in sql
         assert 'LIMIT' not in sql
 
@@ -958,6 +959,40 @@ class TestResolverDeterministicLimit:
                 'ENG-Premier League', '2526', limit=100, window_offset=3,
             )
         assert ids == [str(i) for i in range(1, 51)]
+
+    def test_native_missing_table_falls_back_to_legacy(self, scraper, monkeypatch):
+        class Cursor(_StubCursor):
+            def execute(self, sql, params=None):
+                self.executed.append((sql, params))
+                if 'squad_memberships' in sql:
+                    raise RuntimeError('TABLE_NOT_FOUND')
+
+        cursor = Cursor([('2',), ('1',)])
+        connection = MagicMock()
+        connection.cursor.return_value = cursor
+        monkeypatch.setattr(scraper, '_bronze_connection', lambda: connection)
+
+        ids = scraper._resolve_player_ids_from_bronze(
+            'ENG-Premier League', '2526',
+        )
+
+        assert ids == ['1', '2']
+        assert 'squad_memberships' in cursor.executed[0][0]
+        assert 'transfermarkt_players' in cursor.executed[1][0]
+
+    def test_non_missing_native_error_raises_instead_of_false_empty(
+        self, scraper, monkeypatch,
+    ):
+        connection = MagicMock()
+        connection.cursor.return_value.execute.side_effect = RuntimeError(
+            'Trino unavailable',
+        )
+        monkeypatch.setattr(scraper, '_bronze_connection', lambda: connection)
+
+        with pytest.raises(TransfermarktError, match='roster lookup failed'):
+            scraper._resolve_player_ids_from_bronze(
+                'ENG-Premier League', '2526',
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1132,14 +1167,16 @@ class TestSeasonWindow:
     def test_apl_season_bounds(self):
         import datetime
 
-        start, end = _season_window(2025)
+        start, end = _season_window(2025, SeasonFormat.SPLIT_YEAR)
         assert start == datetime.date(2025, 7, 1)
         assert end == datetime.date(2026, 6, 30)
 
 
 class TestStintOverlapsSeason:
     def _win(self):
-        return _season_window(2025)  # (2025-07-01, 2026-06-30)
+        return _season_window(
+            2025, SeasonFormat.SPLIT_YEAR,
+        )  # (2025-07-01, 2026-06-30)
 
     def test_incumbent_appointed_before_window_kept(self):
         import datetime
@@ -1171,8 +1208,343 @@ class TestStintOverlapsSeason:
         stint = {'appointed_date': datetime.date(2027, 1, 1), 'left_date': None}
         assert _stint_overlaps_season(stint, s, e) is False
 
-    def test_undated_stint_kept(self):
+    def test_fully_undated_stint_fails_closed(self):
         s, e = self._win()
         assert _stint_overlaps_season(
             {'appointed_date': None, 'left_date': None}, s, e
-        ) is True
+        ) is False
+
+
+# ---------------------------------------------------------------------------
+# Native Bronze contracts and pure dual-write projections
+# ---------------------------------------------------------------------------
+
+class TestNativeSquadContracts:
+    def test_multi_club_player_keeps_both_memberships_and_legacy_rows(
+        self, monkeypatch,
+    ):
+        import scrapers.transfermarkt.scraper as tm
+
+        scraper = TransfermarktScraper()
+        clubs = [
+            {'club_id': '11', 'club_slug': 'arsenal', 'club_name': 'Arsenal'},
+            {'club_id': '281', 'club_slug': 'man-city', 'club_name': 'Man City'},
+        ]
+        monkeypatch.setattr(tm, '_parse_club_listing', lambda html: clubs)
+        monkeypatch.setattr(tm, '_parse_squad_page', lambda html, club_id: [{
+            'player_id': '7', 'player_slug': 'same-player', 'name': 'Same Player',
+            'club_id': club_id, 'position': 'Midfield', 'market_value_eur': 10,
+        }])
+        monkeypatch.setattr(
+            scraper, '_fetch_html',
+            lambda url, label='html', context=None: '<html/>',
+        )
+
+        bundle = scraper.read_squad_data('ENG-Premier League', 2025)
+
+        assert set(bundle) == {
+            'memberships', 'attribute_observations',
+            'contract_observations', 'legacy_players',
+        }
+        memberships = bundle['memberships']
+        assert len(memberships) == 2
+        assert set(memberships['club_id']) == {'11', '281'}
+        assert set(memberships['club_slug']) == {'arsenal', 'man-city'}
+        assert not memberships.duplicated(
+            ['league', 'season', 'club_id', 'player_id']
+        ).any()
+        assert len(bundle['attribute_observations']) == 2
+        assert len(bundle['legacy_players']) == 2
+
+    def test_limit_stops_squad_traversal_immediately(self, monkeypatch):
+        import scrapers.transfermarkt.scraper as tm
+
+        scraper = TransfermarktScraper()
+        monkeypatch.setattr(tm, '_parse_club_listing', lambda html: [
+            {'club_id': str(idx), 'club_slug': f'club-{idx}', 'club_name': f'C{idx}'}
+            for idx in range(5)
+        ])
+        monkeypatch.setattr(tm, '_parse_squad_page', lambda html, club_id: [{
+            'player_id': club_id, 'player_slug': f'p-{club_id}',
+            'name': f'P{club_id}', 'club_id': club_id,
+        }])
+        labels = []
+
+        def _fetch(url, label='html', context=None):
+            labels.append(label)
+            return '<html/>'
+
+        monkeypatch.setattr(scraper, '_fetch_html', _fetch)
+
+        bundle = scraper.read_squad_data('ENG-Premier League', 2025, limit=1)
+
+        assert labels == ['listing', 'squad']
+        assert len(bundle['memberships']) == 1
+
+    def test_zero_parsed_listing_is_typed_schema_error(self, monkeypatch):
+        import scrapers.transfermarkt.scraper as tm
+
+        scraper = TransfermarktScraper()
+        monkeypatch.setattr(scraper, '_fetch_html', lambda *args, **kwargs: '<html/>')
+        monkeypatch.setattr(tm, '_parse_club_listing', lambda html: [])
+
+        bundle = scraper.read_squad_data('ENG-Premier League', 2025)
+
+        assert bundle['memberships'].empty
+        record = scraper.get_fetch_outcomes()['listing']['ENG-Premier League:2025']
+        assert record['status'] == 'schema_error'
+
+
+class TestNativeCareerFacts:
+    def test_market_value_points_are_global_and_legacy_is_partitioned(
+        self, monkeypatch,
+    ):
+        scraper = TransfermarktScraper()
+        monkeypatch.setattr(scraper, '_fetch_json', lambda *args, **kwargs: {
+            'list': [{
+                'datum_mw': 'Jan 1, 2025', 'y': 1_000_000,
+                'verein': 'Club', 'age': '20', 'mw': '€1m',
+            }],
+        })
+
+        points = scraper.read_market_value_points(
+            'ENG-Premier League', 2025, player_ids=['9'],
+        )
+        legacy = materialize_legacy_market_value_history(
+            points, 'ENG-Premier League', 2025,
+        )
+
+        assert len(points) == 1
+        assert 'league' not in points.columns
+        assert 'season' not in points.columns
+        assert legacy.iloc[0]['league'] == 'ENG-Premier League'
+        assert legacy.iloc[0]['season'] == '2526'
+
+    def test_transfer_event_season_survives_requested_season_projection(
+        self, monkeypatch,
+    ):
+        scraper = TransfermarktScraper()
+        monkeypatch.setattr(scraper, '_fetch_json', lambda *args, **kwargs: {
+            'transfers': [{
+                'id': 'source-1', 'date': 'Jul 1, 2020', 'season': '20/21',
+                'from': {'clubName': 'A', 'href': '/verein/1/'},
+                'to': {'clubName': 'B', 'href': '/verein/2/'},
+                'fee': '€1.00m', 'marketValue': '€2.00m',
+                'upcoming': False,
+            }],
+        })
+
+        events = scraper.read_transfer_events(
+            'ENG-Premier League', 2025, player_ids=['9'],
+        )
+        legacy = materialize_legacy_transfers(
+            events, 'ENG-Premier League', 2025,
+        )
+
+        assert events.iloc[0]['event_season'] == '2021'
+        assert 'season' not in events.columns
+        assert 'league' not in events.columns
+        assert legacy.iloc[0]['season'] == '2526'
+
+    def test_transfer_ids_are_global_across_players(self):
+        payload = {'transfers': [{
+            'id': 'same-upstream-id', 'date': 'Jul 1, 2020', 'season': '20/21',
+            'from': {'clubName': 'A', 'href': '/verein/1/'},
+            'to': {'clubName': 'B', 'href': '/verein/2/'},
+        }]}
+
+        first = _parse_transfers(payload, '1')[0]['transfer_id']
+        second = _parse_transfers(payload, '2')[0]['transfer_id']
+
+        assert first != second
+        assert first == _parse_transfers(payload, '1')[0]['transfer_id']
+
+    def test_duplicate_player_ids_are_fetched_once(self, monkeypatch):
+        scraper = TransfermarktScraper()
+        calls = []
+
+        def _fetch(url, label='json', context=None):
+            calls.append(context['player_id'])
+            return {'list': []}
+
+        monkeypatch.setattr(scraper, '_fetch_json', _fetch)
+
+        scraper.read_market_value_points(
+            'ENG-Premier League', 2025, player_ids=['2', '1', '2', '1'],
+        )
+
+        assert calls == ['2', '1']
+
+    def test_nonempty_source_that_parses_zero_is_schema_error(self, monkeypatch):
+        import scrapers.transfermarkt.scraper as tm
+
+        scraper = TransfermarktScraper()
+        monkeypatch.setattr(scraper, '_fetch_json', lambda *args, **kwargs: {
+            'list': [{'datum_mw': 'not-a-date'}],
+        })
+        # Keep the threshold from masking the typed record in this one-key run.
+        monkeypatch.setattr(tm, '_MIN_SUCCESS_RATIO', 0)
+
+        frame = scraper.read_market_value_points(
+            'ENG-Premier League', 2025, player_ids=['3'],
+        )
+
+        assert frame.empty
+        record = scraper.get_fetch_outcomes()['market_value_points']['3']
+        assert record['status'] == 'schema_error'
+
+    @pytest.mark.parametrize('entry,expected_error', [
+        (
+            {'datum_mw': 'not-a-date', 'x': 'not-an-epoch', 'y': 100},
+            'no valid date',
+        ),
+        (
+            {'datum_mw': 'Jan 1, 2025', 'y': 'unknown'},
+            'y is not numeric',
+        ),
+    ])
+    def test_mv_semantic_required_fields_fail_closed(
+        self, monkeypatch, entry, expected_error,
+    ):
+        scraper = TransfermarktScraper()
+        monkeypatch.setattr(
+            scraper, '_fetch_json',
+            lambda *args, **kwargs: {'list': [entry]},
+        )
+
+        frame = scraper.read_market_value_points(
+            'ENG-Premier League', 2025, player_ids=['semantic-mv'],
+        )
+
+        assert frame.empty
+        outcome = scraper.get_fetch_outcomes()[
+            'market_value_points'
+        ]['semantic-mv']
+        assert outcome['status'] == 'schema_error'
+        assert expected_error in outcome['error']
+
+    def test_empty_transfer_object_is_schema_error(self, monkeypatch):
+        scraper = TransfermarktScraper()
+        monkeypatch.setattr(
+            scraper, '_fetch_json',
+            lambda *args, **kwargs: {'transfers': [{}]},
+        )
+
+        frame = scraper.read_transfer_events(
+            'ENG-Premier League', 2025, player_ids=['semantic-transfer'],
+        )
+
+        assert frame.empty
+        outcome = scraper.get_fetch_outcomes()[
+            'transfer_events'
+        ]['semantic-transfer']
+        assert outcome['status'] == 'schema_error'
+        assert 'event season/date' in outcome['error']
+
+    def test_mv_partial_parser_20_source_to_1_is_schema_error(
+        self, monkeypatch,
+    ):
+        import scrapers.transfermarkt.scraper as tm
+
+        scraper = TransfermarktScraper()
+        source = [
+            {'datum_mw': f'Jan {day}, 2025', 'y': day}
+            for day in range(1, 21)
+        ]
+        monkeypatch.setattr(
+            scraper, '_fetch_json', lambda *args, **kwargs: {'list': source},
+        )
+        monkeypatch.setattr(tm, '_parse_mv_history', lambda payload, player_id: [{
+            'player_id': player_id,
+            'mv_date': date(2025, 1, 1),
+            'value_eur': 1,
+        }])
+
+        frame = scraper.read_market_value_points(
+            'ENG-Premier League', 2025, player_ids=['8'],
+        )
+
+        assert frame.empty
+        outcome = scraper.get_fetch_outcomes()['market_value_points']['8']
+        assert outcome['status'] == 'schema_error'
+        assert '20 source rows produced 1 parsed rows' in outcome['error']
+
+    def test_transfer_partial_parser_20_source_to_1_is_schema_error(
+        self, monkeypatch,
+    ):
+        import scrapers.transfermarkt.scraper as tm
+
+        scraper = TransfermarktScraper()
+        source = [
+            {
+                'id': str(index),
+                'date': 'Jul 1, 2025',
+                'season': '25/26',
+                'from': {'clubName': 'A'},
+                'to': {'clubName': 'B'},
+            }
+            for index in range(20)
+        ]
+        monkeypatch.setattr(
+            scraper, '_fetch_json',
+            lambda *args, **kwargs: {'transfers': source},
+        )
+        monkeypatch.setattr(tm, '_parse_transfers', lambda payload, player_id: [{
+            'transfer_id': 'one',
+            'player_id': player_id,
+            'event_season': '2526',
+        }])
+
+        frame = scraper.read_transfer_events(
+            'ENG-Premier League', 2025, player_ids=['8'],
+        )
+
+        assert frame.empty
+        outcome = scraper.get_fetch_outcomes()['transfer_events']['8']
+        assert outcome['status'] == 'schema_error'
+        assert '20 source rows produced 1 parsed rows' in outcome['error']
+
+
+class TestNativeCoachContracts:
+    def test_memberships_skip_listing_and_profile_is_fetched_once_per_coach(
+        self, monkeypatch,
+    ):
+        import scrapers.transfermarkt.scraper as tm
+
+        scraper = TransfermarktScraper()
+        memberships = pd.DataFrame([
+            {'club_id': '1', 'club_slug': 'a', 'club_name': 'A'},
+            {'club_id': '2', 'club_slug': 'b', 'club_name': 'B'},
+        ])
+        monkeypatch.setattr(tm, '_parse_coach_history', lambda html, club_id: [{
+            'coach_id': '10', 'coach_slug': 'same-coach', 'name': 'Coach',
+            'role': 'Manager', 'club_id': club_id,
+            'appointed_date': date(2025, 7, 1), 'left_date': None,
+        }])
+        monkeypatch.setattr(tm, '_parse_coach_profile', lambda html, coach_id: {
+            'coach_id': coach_id, 'name': 'Coach Full',
+            'dob': date(1970, 1, 1), 'nationality': 'Spain',
+        })
+        resolver = MagicMock(side_effect=AssertionError('must not query Trino'))
+        monkeypatch.setattr(scraper, '_resolve_coach_bios_from_bronze', resolver)
+        labels = []
+
+        def _fetch(url, label='html', context=None):
+            labels.append(label)
+            return '<html/>'
+
+        monkeypatch.setattr(scraper, '_fetch_html', _fetch)
+
+        bundle = scraper.read_coach_data(
+            'ENG-Premier League', 2025,
+            memberships=memberships,
+            coach_profile_cache={},
+        )
+
+        assert labels.count('listing') == 0
+        assert labels.count('coach_history') == 2
+        assert labels.count('coach_profile') == 1
+        assert len(bundle['profiles']) == 1
+        assert len(bundle['stints']) == 2
+        assert len(bundle['legacy_coaches']) == 2
+        resolver.assert_not_called()

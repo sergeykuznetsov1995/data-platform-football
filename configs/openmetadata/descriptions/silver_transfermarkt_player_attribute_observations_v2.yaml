@@ -1,0 +1,9 @@
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.transfermarkt_player_attribute_observations_v2
+  description: Typed, lossless player attribute observation history used by the v2 selector.
+  tags: [Tier.Silver, Domain.Football, PII.Low]
+columns:
+  - name: observed_at
+    description: Authoritative observation timestamp.
+  - name: contract_until
+    description: Exact observed contract value; no carry-forward.

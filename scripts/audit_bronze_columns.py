@@ -12,9 +12,11 @@ Usage (inside airflow-webserver container):
 
 Uses the lightweight Silver Trino helper and never imports scraper runtimes.
 """
+
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import re
 import sys
 from collections import defaultdict
@@ -22,50 +24,88 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-sys.path.insert(0, '/opt/airflow/dags')
+sys.path.insert(0, "/opt/airflow/dags")
 from utils.silver_tasks import _get_trino_connection
+
+
+def _load_whoscored_contract():
+    """Load the lightweight V2 inventory without importing ``scrapers``.
+
+    Importing ``scrapers.whoscored.repository`` here would also import browser
+    dependencies in the Airflow image.  The migration/audit contract is a
+    dependency-free sibling module and is the single source of truth for the
+    25 business datasets and five commit manifests.
+    """
+
+    path = Path(__file__).with_name("whoscored_v2_object_contract.py")
+    spec = importlib.util.spec_from_file_location(
+        "_audit_whoscored_v2_object_contract",
+        path,
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load WhoScored object contract: {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+WHOSCORED_CONTRACT = _load_whoscored_contract()
 
 # ---- Allowlist (verbatim from feedback_bronze_expected_null_columns.md) ----
 
 EXPECTED_NULL: dict[str, set[str]] = {
     # fbref_keeper_keeper_adv removed in #606 — scrape stopped, table dropped.
-    'fbref_team_misc': {'pkwon', 'pkcon'},
-    'fbref_player_misc': {'pkwon', 'pkcon'},
-    'fbref_match_player_stats': {'pkwon', 'pkcon'},
-    'fbref_schedule': {
+    "fbref_team_misc": {"pkwon", "pkcon"},
+    "fbref_player_misc": {"pkwon", "pkcon"},
+    "fbref_match_player_stats": {"pkwon", "pkcon"},
+    "fbref_schedule": {
         # FBref schedule "Notes" column is upstream-sparse — only filled for rare
         # match states ("Match Awarded", "Abandoned", ...). 100% NULL across all
         # currently-ingested rows; not a parser drop (column maps straight from the
         # raw HTML table). Verified 2026-06-03 (#276).
-        'notes',
+        "notes",
     },
     # matchhistory_games removed (#307: legacy table dropped). matchhistory_results
     # has 0 all-NULL columns (verified 2026-06-04, #282) → no allowlist needed.
-    'espn_matchsheet': {'capacity'},
+    "espn_matchsheet": {"capacity"},
     # sofifa_team_ratings: the 15 dead FC-26 columns are no longer scraped
     # (flaresolverr_reader.read_team_ratings trimmed to 8 live cols) and were
     # physically dropped from Bronze via drop_sofifa_team_ratings_dead_columns.py
     # (#601). No all-NULL columns remain, so no allowlist entry is needed.
-    'whoscored_schedule': {
-        'aggregate_winner_field', 'extra_result_field',
-        'home_extratime_score', 'away_extratime_score',
-        'home_penalty_score', 'away_penalty_score',
-        'stage',
+    "whoscored_schedule": {
+        "aggregate_winner_field",
+        "extra_result_field",
+        "home_extratime_score",
+        "away_extratime_score",
+        "home_penalty_score",
+        "away_penalty_score",
+        "stage",
         # serialized nested betting-odds column — soccerdata's WhoScored
         # read_schedule never populates `bets` for in-scope leagues (100% NULL
         # across all 2280 rows, verified 2026-06-04 #278). Not a parser drop;
         # the sibling `incidents` nested column does carry data.
-        'bets',
+        "bets",
     },
-    'whoscored_season_stages': {'stage'},
-    'whoscored_events': {
+    "whoscored_events": {
         # event-conditional cols (≥97% NULL by design)
-        'goal_mouth_y', 'goal_mouth_z', 'blocked_x', 'blocked_y',
-        'is_shot', 'is_goal', 'card_type',
-        'related_event_id', 'related_player_id',
-        'end_x', 'end_y',
+        "goal_mouth_y",
+        "goal_mouth_z",
+        "blocked_x",
+        "blocked_y",
+        "is_shot",
+        "is_goal",
+        "card_type",
+        # Legacy rows predate raw-backed V2 identity and intentionally retain
+        # NULL global/team-local IDs until a match-level atomic replay wins the
+        # current view. The related sequence itself is event-conditional.
+        "source_event_id",
+        "team_event_id",
+        "related_team_event_id",
+        "related_player_id",
+        "end_x",
+        "end_y",
     },
-    'sofascore_event_player_stats': {
+    "sofascore_event_player_stats": {
         # is_home/captain/substitute/position_specific are now populated
         # from /lineups — forward-filled for new matches (#301) and
         # back-filled for the historical 15189 rows (#337) — so they are
@@ -73,18 +113,20 @@ EXPECTED_NULL: dict[str, set[str]] = {
         # auto-flatten artifacts: `ratingVersions` is a nested
         # {original, alternative} object _coerce_scalar cannot reduce to a
         # scalar; `statisticsType` is an always-empty key. Both 100% NULL.
-        'rating_versions', 'statistics_type',
+        "rating_versions",
+        "statistics_type",
     },
-    'sofascore_event_shotmap': {
+    "sofascore_event_shotmap": {
         # Per-shot payload omits teamId/team.id and reversedPeriodCount/period
         # for in-scope leagues — 100% NULL across all 9543 rows (verified
         # 2026-06-04 #280). Shot side is still recoverable via `is_home`;
         # period is simply not surfaced per shot by SofaScore's shotmap block.
-        'team_id', 'period',
+        "team_id",
+        "period",
     },
-    'sofascore_player_season_stats': {
+    "sofascore_player_season_stats": {
         # auto-flatten always-empty `statisticsType` key (100% NULL, 533 rows).
-        'statistics_type',
+        "statistics_type",
     },
     # --- FotMob (#281) -------------------------------------------------------
     # Originally 14 columns were 100% NULL live (verified 2026-06-04) in two
@@ -94,28 +136,28 @@ EXPECTED_NULL: dict[str, set[str]] = {
     # The 10 dead-legacy columns were physically dropped via CTAS-rebuild (#304,
     # scripts/drop_fotmob_dead_columns.py), so only the (a) upstream-missing
     # entries remain allowlisted below.
-    'fotmob_team_stats': {
+    "fotmob_team_stats": {
         # (a) upstream-missing: read_team_season_stats writes team.get('form'),
         # but FotMob's league table omits `form` for in-scope leagues.
-        'form',
+        "form",
     },
-    'fotmob_team_leaderboards': {
+    "fotmob_team_leaderboards": {
         # (a) upstream-shape: read_team_leaderboards maps item.get('TeamName')
         # (scraper.py:716), but team-leaderboard items carry the team name in
         # `ParticipantName` (-> participant_name) instead, so team_name is NULL.
-        'team_name',
+        "team_name",
     },
-    'fotmob_transfers': {
+    "fotmob_transfers": {
         # (a) upstream-missing: read_transfers derives fee_text from
         # fee.fallback/fee.text (scraper.py:775); FotMob supplies only the
         # numeric `fee_value` for in-scope transfers, so fee_text is NULL.
-        'fee_text',
+        "fee_text",
     },
-    'fotmob_player_details': {
+    "fotmob_player_details": {
         # (a) upstream-missing: read_player_details maps d.get('nextMatch')
         # (scraper.py:988); the player __NEXT_DATA__ payload omits `nextMatch`
         # for every squad player, so the column is 100% NULL.
-        'next_match_json',
+        "next_match_json",
     },
     # NB: no 'capology_player_salaries' entry — #320 allowlisted adjusted_total_*
     # while only the in-progress season was materialised, but #321 backfilled
@@ -129,27 +171,302 @@ EXPECTED_NULL: dict[str, set[str]] = {
 # (link text), `pos` (always 'GK' in keeper tables) are constants for the same
 # reason.
 EXPECTED_CONSTANT: dict[str, set[str]] = {
-    'fbref_player_stats': {'stat_type', 'matches'},
-    'fbref_player_shooting': {'stat_type', 'matches'},
-    'fbref_player_playingtime': {'stat_type', 'matches'},
-    'fbref_player_misc': {'stat_type', 'matches'},
-    'fbref_team_stats': {'stat_type'},
-    'fbref_team_shooting': {'stat_type'},
+    "fbref_player_stats": {"stat_type", "matches"},
+    "fbref_player_shooting": {"stat_type", "matches"},
+    "fbref_player_playingtime": {"stat_type", "matches"},
+    "fbref_player_misc": {"stat_type", "matches"},
+    "fbref_team_stats": {"stat_type"},
+    "fbref_team_shooting": {"stat_type"},
     # min% and mn/mp are denormalised aggregates FBref renders as a column header
     # but populates with the team season constant (1 distinct value across all rows).
-    'fbref_team_playingtime': {'stat_type', 'min%', 'mn/mp'},
-    'fbref_team_misc': {'stat_type'},
-    'fbref_keeper_keeper': {'stat_type', 'pos', 'matches'},
+    "fbref_team_playingtime": {"stat_type", "min%", "mn/mp"},
+    "fbref_team_misc": {"stat_type"},
+    "fbref_keeper_keeper": {"stat_type", "pos", "matches"},
     # notes is sparse-by-design (HIGH_NULL) but the few populated rows happen to
     # share the same text ("Award Decided on Pens"), triggering CONSTANT too.
-    'fbref_schedule': {'notes'},
+    "fbref_schedule": {"notes"},
     # div = football-data division code (E0); CONSTANT т.к. в scope только EPL (#309).
-    'matchhistory_results': {'div'},
+    "matchhistory_results": {"div"},
 }
 
 # Internal metadata cols — we skip them from CONSTANT-checks (they are constant
 # by design — _source='fbref' for all rows), but still NULL-check them.
-META_COLS = {'_source', '_entity_type', '_ingested_at', '_batch_id'}
+META_COLS = {"_source", "_entity_type", "_ingested_at", "_batch_id"}
+TM_LINEAGE_COLS = {
+    "source_url",
+    "source_body_hash",
+    "fetched_at",
+    "parser_revision",
+    "schema_revision",
+    "cycle_id",
+    "scope_id",
+}
+TM_SOURCE_SCOPE_COLS = {"source_competition_id", "source_edition_id"}
+
+
+# Payload schemas evolve additively, but every WhoScored physical dataset has
+# stable identity and logical-commit columns.  Keep only those stable columns
+# in this audit: all 25 table names and their batch columns come from the same
+# object contract used by migration/cleanup, while this map adds the minimum
+# source-specific identity needed to catch a parser wiring regression.
+WHOSCORED_IDENTITY_COLUMNS: dict[str, set[str]] = {
+    "whoscored_competitions": {
+        "competition_id",
+        "region_id",
+        "tournament_id",
+        "tournament_name",
+        "eligibility",
+    },
+    "whoscored_seasons": {
+        "competition_id",
+        "season_id",
+        "source_season_id",
+        "source_label",
+        "is_active",
+        "eligibility",
+    },
+    "whoscored_stages": {
+        "competition_id",
+        "league",
+        "season",
+        "source_season_id",
+        "stage_id",
+        "stage",
+    },
+    "whoscored_schedule": {
+        "league",
+        "season",
+        "game",
+        "game_id",
+        "date",
+        "home_team",
+        "away_team",
+        "home_team_id",
+        "away_team_id",
+        "home_score",
+        "away_score",
+        "stage_id",
+    },
+    "whoscored_match_incidents": {
+        "league",
+        "season",
+        "game_id",
+        "game",
+        "stage_id",
+        "match_is_opta",
+        "source_ordinal",
+        "source_path",
+        "incident_type",
+        "minute",
+        "source_raw_json",
+        "source_schema_fingerprint",
+    },
+    **{
+        table: {
+            "league",
+            "season",
+            "source_season_id",
+            "stage_id",
+            "table_index",
+            "row_index",
+            "table_type",
+            "source_values_json",
+        }
+        for table in (
+            "whoscored_stage_standings",
+            "whoscored_stage_forms",
+            "whoscored_stage_streaks",
+            "whoscored_stage_performance",
+        )
+    },
+    "whoscored_matches": {
+        "league",
+        "season",
+        "game",
+        "game_id",
+        "home_team_id",
+        "home_team",
+        "away_team_id",
+        "away_team",
+        "referee_id",
+        "venue_name",
+    },
+    "whoscored_events": {
+        "league",
+        "season",
+        "game",
+        "game_id",
+        "source_event_id",
+        "team_event_id",
+        "minute",
+        "period",
+        "type",
+        "outcome_type",
+        "team_id",
+        "player_id",
+        "x",
+        "y",
+    },
+    "whoscored_lineups": {
+        "league",
+        "season",
+        "game",
+        "game_id",
+        "team_id",
+        "team",
+        "player_id",
+        "player",
+        "is_starter",
+        "position",
+    },
+    "whoscored_substitutions": {
+        "league",
+        "season",
+        "game",
+        "game_id",
+        "team_id",
+        "player_id",
+        "action",
+        "expanded_minute",
+    },
+    "whoscored_formations": {
+        "league",
+        "season",
+        "game",
+        "game_id",
+        "team_id",
+        "formation_index",
+        "formation_name",
+        "start_expanded_minute",
+    },
+    "whoscored_match_bets": {
+        "league",
+        "season",
+        "game",
+        "game_id",
+        "stage_id",
+        "stage",
+        "entity_key",
+        "source_outcome",
+        "source_bet_id",
+        "bet_name",
+        "source_offer_ordinal",
+        "provider_id",
+        "betting_provider",
+        "odds_decimal",
+        "odds_fractional",
+        "odds_us",
+        "clickout_url",
+        "source_path",
+        "source_raw_json",
+        "source_schema_fingerprint",
+    },
+    **{
+        table: {
+            "league",
+            "season",
+            "game",
+            "game_id",
+            "team_id",
+            "player_id",
+            "category",
+            "stat",
+            "numeric_value",
+            "text_value",
+            "source_path",
+        }
+        for table in (
+            "whoscored_team_match_stats",
+            "whoscored_player_match_stats",
+        )
+    },
+    **{
+        table: {
+            "league",
+            "season",
+            "source_season_id",
+            "stage_id",
+            "entity_type",
+            "stat",
+            "numeric_value",
+            "text_value",
+            "source_path",
+        }
+        for table in (
+            "whoscored_team_stage_stats",
+            "whoscored_player_stage_stats",
+            "whoscored_referee_stage_stats",
+        )
+    },
+    "whoscored_preview_lineups": {
+        "league",
+        "season",
+        "game",
+        "game_id",
+        "team",
+        "player_id",
+        "player",
+        "position",
+        "formation",
+        "source_path",
+    },
+    "whoscored_missing_players": {
+        "league",
+        "season",
+        "game",
+        "game_id",
+        "team",
+        "player_id",
+        "player",
+        "reason",
+        "status",
+    },
+    "whoscored_preview_sections": {
+        "league",
+        "season",
+        "game",
+        "game_id",
+        "section_type",
+        "heading",
+        "text",
+    },
+    "whoscored_player_profile_versions": {
+        "player_id",
+        "name",
+        "payload_sha256",
+        "raw_uri",
+        "parser_version",
+        "fetched_at",
+    },
+    "whoscored_player_stage_participations": {
+        "player_id",
+        "record_type",
+        "source_season_id",
+        "stage_id",
+        "game_id",
+        "team_id",
+        "source_path",
+    },
+}
+
+
+def _whoscored_expected_tables() -> dict[str, set[str]]:
+    business = {
+        table: set(WHOSCORED_CONTRACT.BUSINESS_REQUIRED_COLUMNS[table])
+        | WHOSCORED_IDENTITY_COLUMNS[table]
+        for table in WHOSCORED_CONTRACT.BUSINESS_TABLES
+    }
+    manifests = {
+        table: set(columns) | META_COLS
+        for table, columns in WHOSCORED_CONTRACT.MANIFEST_REQUIRED_COLUMNS.items()
+    }
+    return {**business, **manifests}
+
+
+if set(WHOSCORED_IDENTITY_COLUMNS) != set(WHOSCORED_CONTRACT.BUSINESS_TABLES):
+    raise RuntimeError(
+        "WhoScored audit identity contract does not cover all 25 datasets"
+    )
 
 # Per-source parser "contract": minimal REQUIRED tables + columns each source's
 # scraper is expected to emit into bronze. Authored by reading the scraper class
@@ -158,22 +475,35 @@ META_COLS = {'_source', '_entity_type', '_ingested_at', '_batch_id'}
 # live columns are NOT errors. Used by the `--source` contract-diff mode.
 # #274 seeds espn only; other sources filled in #276-#286.
 EXPECTED_TABLES: dict[str, dict[str, set[str]]] = {
-    'espn': {
+    "espn": {
         # Reliably-produced set (verified vs live bronze 2026-06-03). The
         # _standardize_schedule renames (home_score->home_goals, venue, attendance)
         # are conditional on raw soccerdata columns that ESPN never supplies, so
         # those targets never materialise — contract lists what actually lands.
-        'espn_schedule': {
-            'league', 'season', 'game', 'match_date', 'home_team', 'away_team',
-            'game_id', 'league_id',
+        "espn_schedule": {
+            "league",
+            "season",
+            "game",
+            "match_date",
+            "home_team",
+            "away_team",
+            "game_id",
+            "league_id",
             *META_COLS,
         },
         # Producer: ESPNScraper.read_lineup (dags/scripts/run_espn_scraper.py
         # lineup branch). Extra stat columns also land, but only these are
         # required.
-        'espn_lineup': {
-            'league', 'season', 'game', 'team', 'player', 'position',
-            'formation_place', 'sub_in', 'sub_out',
+        "espn_lineup": {
+            "league",
+            "season",
+            "game",
+            "team",
+            "player",
+            "position",
+            "formation_place",
+            "sub_in",
+            "sub_out",
             *META_COLS,
         },
         # Producer: ESPNScraper.read_matchsheet (run_espn_scraper.py matchsheet
@@ -181,8 +511,14 @@ EXPECTED_TABLES: dict[str, dict[str, set[str]]] = {
         # venue + ~35 team stat columns; only identity + venue are required
         # (extra stat columns are NOT errors; `capacity` is 100%-NULL and lives
         # in EXPECTED_NULL, so it is not listed here).
-        'espn_matchsheet': {
-            'league', 'season', 'game', 'team', 'is_home', 'venue', 'attendance',
+        "espn_matchsheet": {
+            "league",
+            "season",
+            "game",
+            "team",
+            "is_home",
+            "venue",
+            "attendance",
             *META_COLS,
         },
         # NOTE: espn_standings is NOT in the contract — soccerdata's ESPN reader
@@ -190,70 +526,176 @@ EXPECTED_TABLES: dict[str, dict[str, set[str]]] = {
         # scrape path was removed in #354. Listing it here would be a permanent
         # false-positive.
     },
-    'fbref': {
+    "fbref": {
         # Minimal required set per table — identity keys + a few core metrics
         # (FBref schemas are wide & volatile; extra live columns are NOT errors,
         # and per-column non-NULL coverage is enforced separately by audit_table).
         # Verified vs live bronze 2026-06-03. fbref_shot_events is intentionally
         # absent (see EXPECTED_ABSENT) — FBref Feb-2026 shot-data restriction.
         # --- match-level ---
-        'fbref_schedule': {
-            'league', 'season', 'date', 'home', 'away', 'score', *META_COLS,
-        },
-        'fbref_shot_events': {  # listed for completeness; gated by EXPECTED_ABSENT
-            'league', 'season', 'match_id', 'minute', 'player', 'squad', *META_COLS,
-        },
-        'fbref_match_events': {
-            'league', 'season', 'match_id', 'minute', 'event_type', 'player', 'team',
+        "fbref_schedule": {
+            "league",
+            "season",
+            "date",
+            "home",
+            "away",
+            "score",
             *META_COLS,
         },
-        'fbref_lineups': {
-            'league', 'season', 'match_id', 'team', 'player', 'is_starter', 'position',
+        "fbref_shot_events": {  # listed for completeness; gated by EXPECTED_ABSENT
+            "league",
+            "season",
+            "match_id",
+            "minute",
+            "player",
+            "squad",
             *META_COLS,
         },
-        'fbref_match_team_stats': {
-            'league', 'season', 'match_id', 'home_team', 'away_team', 'home_shots',
-            'away_shots', *META_COLS,
+        "fbref_match_events": {
+            "league",
+            "season",
+            "match_id",
+            "minute",
+            "event_type",
+            "player",
+            "team",
+            *META_COLS,
         },
-        'fbref_match_player_stats': {
-            'league', 'season', 'match_id', 'player', 'team', 'min', 'gls', *META_COLS,
+        "fbref_lineups": {
+            "league",
+            "season",
+            "match_id",
+            "team",
+            "player",
+            "is_starter",
+            "position",
+            *META_COLS,
         },
-        'fbref_match_managers': {
-            'league', 'season', 'match_id', 'side', 'team', 'manager_name', *META_COLS,
+        "fbref_match_team_stats": {
+            "league",
+            "season",
+            "match_id",
+            "home_team",
+            "away_team",
+            "home_shots",
+            "away_shots",
+            *META_COLS,
+        },
+        "fbref_match_player_stats": {
+            "league",
+            "season",
+            "match_id",
+            "player",
+            "team",
+            "min",
+            "gls",
+            *META_COLS,
+        },
+        "fbref_match_managers": {
+            "league",
+            "season",
+            "match_id",
+            "side",
+            "team",
+            "manager_name",
+            *META_COLS,
         },
         # --- season player ---
-        'fbref_player_stats': {
-            'league', 'season', 'player', 'squad', 'mp', 'min', 'gls', *META_COLS,
+        "fbref_player_stats": {
+            "league",
+            "season",
+            "player",
+            "squad",
+            "mp",
+            "min",
+            "gls",
+            *META_COLS,
         },
-        'fbref_player_shooting': {
-            'league', 'season', 'player', 'squad', 'sh', 'sot', 'gls', *META_COLS,
+        "fbref_player_shooting": {
+            "league",
+            "season",
+            "player",
+            "squad",
+            "sh",
+            "sot",
+            "gls",
+            *META_COLS,
         },
-        'fbref_player_playingtime': {
-            'league', 'season', 'player', 'squad', 'mp', 'min', 'starts', *META_COLS,
+        "fbref_player_playingtime": {
+            "league",
+            "season",
+            "player",
+            "squad",
+            "mp",
+            "min",
+            "starts",
+            *META_COLS,
         },
-        'fbref_player_misc': {
-            'league', 'season', 'player', 'squad', 'crdy', 'crdr', 'fls', *META_COLS,
+        "fbref_player_misc": {
+            "league",
+            "season",
+            "player",
+            "squad",
+            "crdy",
+            "crdr",
+            "fls",
+            *META_COLS,
         },
         # --- season team ---
-        'fbref_team_stats': {
-            'league', 'season', 'squad', 'team_id', 'mp', 'gls', 'poss', *META_COLS,
+        "fbref_team_stats": {
+            "league",
+            "season",
+            "squad",
+            "team_id",
+            "mp",
+            "gls",
+            "poss",
+            *META_COLS,
         },
-        'fbref_team_shooting': {
-            'league', 'season', 'squad', 'team_id', 'sh', 'sot', 'gls', *META_COLS,
+        "fbref_team_shooting": {
+            "league",
+            "season",
+            "squad",
+            "team_id",
+            "sh",
+            "sot",
+            "gls",
+            *META_COLS,
         },
-        'fbref_team_playingtime': {
-            'league', 'season', 'squad', 'team_id', 'mp', 'min', 'starts', *META_COLS,
+        "fbref_team_playingtime": {
+            "league",
+            "season",
+            "squad",
+            "team_id",
+            "mp",
+            "min",
+            "starts",
+            *META_COLS,
         },
-        'fbref_team_misc': {
-            'league', 'season', 'squad', 'team_id', 'crdy', 'crdr', 'fls', *META_COLS,
+        "fbref_team_misc": {
+            "league",
+            "season",
+            "squad",
+            "team_id",
+            "crdy",
+            "crdr",
+            "fls",
+            *META_COLS,
         },
         # --- keeper ---
-        'fbref_keeper_keeper': {
-            'league', 'season', 'player', 'squad', 'mp', 'ga', 'saves', *META_COLS,
+        "fbref_keeper_keeper": {
+            "league",
+            "season",
+            "player",
+            "squad",
+            "mp",
+            "ga",
+            "saves",
+            *META_COLS,
         },
         # keeper_adv removed in #606 — scrape stopped, table dropped.
     },
-    'understat': {
+    "understat": {
         # soccerdata reader output (UnderstatScraper). 5 tables, all partitioned
         # ['league', 'season']. Minimal required set = identity keys + core metrics
         # + META_COLS; extra live columns are NOT errors. Column names verified vs
@@ -261,55 +703,81 @@ EXPECTED_TABLES: dict[str, dict[str, set[str]]] = {
         # NOTE: bronze.understat_players carries ×10 row dups upstream (deduped in
         # Silver via ROW_NUMBER) — not a coverage failure (per-column non-NULL is
         # unaffected by row dups).
-        'understat_schedule': {
-            'league', 'season', 'game', 'game_id', 'date',
-            'home_team', 'away_team', 'home_goals', 'away_goals',
-            'home_xg', 'away_xg', *META_COLS,
+        "understat_schedule": {
+            "league",
+            "season",
+            "game",
+            "game_id",
+            "date",
+            "home_team",
+            "away_team",
+            "home_goals",
+            "away_goals",
+            "home_xg",
+            "away_xg",
+            *META_COLS,
         },
-        'understat_shots': {
-            'league', 'season', 'game_id', 'shot_id', 'minute',
-            'player', 'player_id', 'team', 'team_id', 'xg', 'result', *META_COLS,
+        "understat_shots": {
+            "league",
+            "season",
+            "game_id",
+            "shot_id",
+            "minute",
+            "player",
+            "player_id",
+            "team",
+            "team_id",
+            "xg",
+            "result",
+            *META_COLS,
         },
-        'understat_players': {
-            'league', 'season', 'player', 'player_id', 'team', 'position',
-            'matches', 'minutes', 'goals', 'assists', 'shots', 'xg', 'xa', *META_COLS,
+        "understat_players": {
+            "league",
+            "season",
+            "player",
+            "player_id",
+            "team",
+            "position",
+            "matches",
+            "minutes",
+            "goals",
+            "assists",
+            "shots",
+            "xg",
+            "xa",
+            *META_COLS,
         },
-        'understat_team_match_stats': {
-            'league', 'season', 'game_id', 'date', 'home_team', 'away_team',
-            'home_goals', 'away_goals', 'home_xg', 'away_xg', *META_COLS,
+        "understat_team_match_stats": {
+            "league",
+            "season",
+            "game_id",
+            "date",
+            "home_team",
+            "away_team",
+            "home_goals",
+            "away_goals",
+            "home_xg",
+            "away_xg",
+            *META_COLS,
         },
-        'understat_player_match_stats': {
-            'league', 'season', 'game_id', 'player', 'player_id', 'team',
-            'minutes', 'goals', 'assists', 'shots', 'xg', 'xa', *META_COLS,
+        "understat_player_match_stats": {
+            "league",
+            "season",
+            "game_id",
+            "player",
+            "player_id",
+            "team",
+            "minutes",
+            "goals",
+            "assists",
+            "shots",
+            "xg",
+            "xa",
+            *META_COLS,
         },
     },
-    'whoscored': {
-        # soccerdata WhoScored reader + FlareSolverr events fetcher. 4 tables,
-        # all partitioned ['league', 'season']. Minimal required = identity keys +
-        # core + META_COLS; extra live cols are NOT errors; EXPECTED_NULL cols
-        # (extratime/penalty/stage/bets on schedule; event-conditional on events)
-        # are excluded here. Verified vs live bronze 2026-06-04 (#278): all 4
-        # tables materialise (schedule 2280, events 709937, missing_players 21874,
-        # season_stages 6 rows) — 0 missing tables/columns.
-        'whoscored_schedule': {
-            'league', 'season', 'game', 'game_id', 'date',
-            'home_team', 'away_team', 'home_team_id', 'away_team_id',
-            'home_score', 'away_score', *META_COLS,
-        },
-        'whoscored_events': {
-            'league', 'season', 'game', 'game_id', 'minute', 'second', 'period',
-            'type', 'outcome_type', 'team', 'team_id', 'player', 'player_id',
-            'x', 'y', *META_COLS,
-        },
-        'whoscored_missing_players': {
-            'league', 'season', 'game', 'game_id', 'team',
-            'player', 'player_id', 'reason', 'status', *META_COLS,
-        },
-        'whoscored_season_stages': {  # cup/league stage metadata (6 rows live)
-            'league', 'season', 'stage_id', *META_COLS,
-        },
-    },
-    'sofascore': {
+    "whoscored": _whoscored_expected_tables(),
+    "sofascore": {
         # soccerdata Sofascore reader (schedule + league_table) + cherry-pick
         # JSON API endpoints (ratings/shotmap/event+season player stats/profile/
         # match_stats). 8 tables, all partitioned ['league', 'season']. Minimal
@@ -318,44 +786,100 @@ EXPECTED_TABLES: dict[str, dict[str, set[str]]] = {
         # Verified vs live bronze 2026-06-04 (#280): all 8 materialise + non-empty
         # (schedule 380, league_table 20, ratings/event_player_stats 15189,
         # event_shotmap 9543, match_stats 47188, player_season_stats/profile 533).
-        'sofascore_schedule': {
-            'league', 'season', 'game_id', 'date',
-            'home_team', 'away_team', 'home_score', 'away_score',
+        "sofascore_schedule": {
+            "league",
+            "season",
+            "game_id",
+            "date",
+            "home_team",
+            "away_team",
+            "home_score",
+            "away_score",
             *META_COLS,
         },
-        'sofascore_league_table': {
-            'league', 'season', 'team', 'mp', 'w', 'd', 'l',
-            'gf', 'ga', 'gd', 'pts', 'group', *META_COLS,
-        },
-        'sofascore_player_ratings': {
-            'league', 'season', 'match_id', 'player_id',
-            'team_side', 'rating', *META_COLS,
-        },
-        'sofascore_player_season_stats': {
-            'league', 'season', 'player_id', 'team_id', 'team_name',
-            'appearances', 'goals', 'assists', 'minutes_played', 'rating',
+        "sofascore_league_table": {
+            "league",
+            "season",
+            "team",
+            "mp",
+            "w",
+            "d",
+            "l",
+            "gf",
+            "ga",
+            "gd",
+            "pts",
+            "group",
             *META_COLS,
         },
-        'sofascore_player_profile': {
-            'league', 'season', 'player_id', 'name', 'position',
+        "sofascore_player_ratings": {
+            "league",
+            "season",
+            "match_id",
+            "player_id",
+            "team_side",
+            "rating",
             *META_COLS,
         },
-        'sofascore_event_shotmap': {
+        "sofascore_player_season_stats": {
+            "league",
+            "season",
+            "player_id",
+            "team_id",
+            "team_name",
+            "appearances",
+            "goals",
+            "assists",
+            "minutes_played",
+            "rating",
+            *META_COLS,
+        },
+        "sofascore_player_profile": {
+            "league",
+            "season",
+            "player_id",
+            "name",
+            "position",
+            *META_COLS,
+        },
+        "sofascore_event_shotmap": {
             # `period` + `team_id` are 100% NULL upstream (see EXPECTED_NULL),
             # so they are excluded from the required set.
-            'league', 'season', 'match_id', 'shot_id', 'player_id',
-            'minute', 'outcome', 'x', 'y', 'xg', *META_COLS,
+            "league",
+            "season",
+            "match_id",
+            "shot_id",
+            "player_id",
+            "minute",
+            "outcome",
+            "x",
+            "y",
+            "xg",
+            *META_COLS,
         },
-        'sofascore_event_player_stats': {
-            'league', 'season', 'match_id', 'player_id',
-            'minutes_played', 'rating', 'position', *META_COLS,
+        "sofascore_event_player_stats": {
+            "league",
+            "season",
+            "match_id",
+            "player_id",
+            "minutes_played",
+            "rating",
+            "position",
+            *META_COLS,
         },
-        'sofascore_match_stats': {
-            'league', 'season', 'match_id', 'period',
-            'stat_key', 'stat_name', 'home_value', 'away_value', *META_COLS,
+        "sofascore_match_stats": {
+            "league",
+            "season",
+            "match_id",
+            "period",
+            "stat_key",
+            "stat_name",
+            "home_value",
+            "away_value",
+            *META_COLS,
         },
     },
-    'fotmob': {
+    "fotmob": {
         # FotMob scraper (scrapers/fotmob/scraper.py, scrape_all). 9 tables, all
         # partitioned ['league', 'season']. Minimal required = identity keys +
         # core metrics + META_COLS; extra live cols are NOT errors; 14 100%-NULL
@@ -364,46 +888,100 @@ EXPECTED_TABLES: dict[str, dict[str, set[str]]] = {
         # materialise + non-empty (schedule 760, team_stats 40, player_stats 20227,
         # team_profile 20, team_squad 607, team_leaderboards 574, transfers 100,
         # match_details 380, player_details 607 rows) — 0 missing tables/columns.
-        'fotmob_schedule': {
-            'league', 'season', 'match_id', 'date',
-            'home_team', 'away_team', 'home_team_id', 'away_team_id',
+        "fotmob_schedule": {
+            "league",
+            "season",
+            "match_id",
+            "date",
+            "home_team",
+            "away_team",
+            "home_team_id",
+            "away_team_id",
             *META_COLS,
         },
-        'fotmob_team_stats': {
-            'league', 'season', 'team_id', 'team_name',
-            'position', 'played', 'points', 'group', *META_COLS,
-        },
-        'fotmob_player_stats': {
-            'league', 'season', 'participant_id', 'participant_name', 'team_id',
-            'stat_name', 'stat_category_header', 'stat_value', 'minutes_played',
+        "fotmob_team_stats": {
+            "league",
+            "season",
+            "team_id",
+            "team_name",
+            "position",
+            "played",
+            "points",
+            "group",
             *META_COLS,
         },
-        'fotmob_team_profile': {
-            'league', 'season', 'team_id', 'team_name',
-            'short_name', 'overview_season', *META_COLS,
+        "fotmob_player_stats": {
+            "league",
+            "season",
+            "participant_id",
+            "participant_name",
+            "team_id",
+            "stat_name",
+            "stat_category_header",
+            "stat_value",
+            "minutes_played",
+            *META_COLS,
         },
-        'fotmob_team_squad': {
-            'league', 'season', 'team_id', 'player_id', 'player_name',
-            'role', 'shirt_number', *META_COLS,
+        "fotmob_team_profile": {
+            "league",
+            "season",
+            "team_id",
+            "team_name",
+            "short_name",
+            "overview_season",
+            *META_COLS,
         },
-        'fotmob_team_leaderboards': {
-            'league', 'season', 'team_id', 'participant_name',
-            'stat_name', 'stat_category_group', 'stat_value', *META_COLS,
+        "fotmob_team_squad": {
+            "league",
+            "season",
+            "team_id",
+            "player_id",
+            "player_name",
+            "role",
+            "shirt_number",
+            *META_COLS,
         },
-        'fotmob_transfers': {
-            'league', 'season', 'player_id', 'player_name',
-            'transfer_date', 'to_club_id', 'from_club', *META_COLS,
+        "fotmob_team_leaderboards": {
+            "league",
+            "season",
+            "team_id",
+            "participant_name",
+            "stat_name",
+            "stat_category_group",
+            "stat_value",
+            *META_COLS,
         },
-        'fotmob_match_details': {
-            'league', 'season', 'match_id', 'home_team', 'away_team',
-            'lineup_json', 'events_json', *META_COLS,
+        "fotmob_transfers": {
+            "league",
+            "season",
+            "player_id",
+            "player_name",
+            "transfer_date",
+            "to_club_id",
+            "from_club",
+            *META_COLS,
         },
-        'fotmob_player_details': {
-            'league', 'season', 'player_id', 'name',
-            'birth_date', 'primary_team_id', *META_COLS,
+        "fotmob_match_details": {
+            "league",
+            "season",
+            "match_id",
+            "home_team",
+            "away_team",
+            "lineup_json",
+            "events_json",
+            *META_COLS,
+        },
+        "fotmob_player_details": {
+            "league",
+            "season",
+            "player_id",
+            "name",
+            "birth_date",
+            "primary_team_id",
+            *META_COLS,
         },
     },
-    'clubelo': {
+    "clubelo": {
         # ClubElo scraper (scrapers/clubelo/scraper.py). 2 tables. Verified vs
         # live bronze 2026-06-04 (#283). Identity col is `team` (NOT `club`).
         # `rank`/`league` are upstream-sparse but present (not all-NULL), so they
@@ -412,33 +990,63 @@ EXPECTED_TABLES: dict[str, dict[str, set[str]]] = {
         # the heavy ratings_historical table is produced weekly by
         # dag_ingest_clubelo_full with replace_partitions=['rating_date'] —
         # never daily APPEND (2026-05-04 HDFS overflow).
-        'clubelo_ratings': {
-            'team', 'country', 'level', 'elo', 'from', 'to', 'rating_date',
+        "clubelo_ratings": {
+            "team",
+            "country",
+            "level",
+            "elo",
+            "from",
+            "to",
+            "rating_date",
             *META_COLS,
         },
-        'clubelo_ratings_historical': {
-            'team', 'country', 'level', 'elo', 'from', 'to', 'rating_date',
+        "clubelo_ratings_historical": {
+            "team",
+            "country",
+            "level",
+            "elo",
+            "from",
+            "to",
+            "rating_date",
             *META_COLS,
         },
     },
-    'matchhistory': {
+    "matchhistory": {
         # football-data.co.uk CSV scraper, COLUMN_MAPPING (scrapers/matchhistory/scraper.py).
         # 1 table, partitioned ['league','season']. Минимальный контракт = identity +
         # core match stats + META_COLS. Широкие odds-колонки (odds_home_b365, maxh, ...) —
         # extra live cols, НЕ ошибки. 0 all-NULL колонок live (verified 2026-06-04, #282).
         # #307 RESOLVED: silver мигрирован на matchhistory_results, legacy
         # matchhistory_games дропнут — дрейфа больше нет.
-        'matchhistory_results': {
-            'league', 'season', 'match_date', 'home_team', 'away_team',
-            'home_goals', 'away_goals', 'result',
-            'home_goals_ht', 'away_goals_ht', 'result_ht', 'referee',
-            'home_shots', 'away_shots', 'home_shots_on_target', 'away_shots_on_target',
-            'home_fouls', 'away_fouls', 'home_corners', 'away_corners',
-            'home_yellow', 'away_yellow', 'home_red', 'away_red',
+        "matchhistory_results": {
+            "league",
+            "season",
+            "match_date",
+            "home_team",
+            "away_team",
+            "home_goals",
+            "away_goals",
+            "result",
+            "home_goals_ht",
+            "away_goals_ht",
+            "result_ht",
+            "referee",
+            "home_shots",
+            "away_shots",
+            "home_shots_on_target",
+            "away_shots_on_target",
+            "home_fouls",
+            "away_fouls",
+            "home_corners",
+            "away_corners",
+            "home_yellow",
+            "away_yellow",
+            "home_red",
+            "away_red",
             *META_COLS,
         },
     },
-    'sofifa': {
+    "sofifa": {
         # SoFIFA scraper (scrapers/sofifa/scraper.py — soccerdata reader +
         # FlareSolverr override). 6 tables (sofifa_leagues unpartitioned, the
         # other 5 partitioned ['fifa_edition']). Minimal required = identity keys
@@ -450,119 +1058,418 @@ EXPECTED_TABLES: dict[str, dict[str, set[str]]] = {
         # FC 26 / ENG-Premier League — player_ratings 546, players 546,
         # team_ratings 20, teams 20, versions 852, leagues 1 — 0 missing
         # tables/columns, 0 all-NULL outside the allowlist.
-        'sofifa_players': {
-            'fifa_edition', 'player', 'player_id', 'team', 'league', *META_COLS,
+        "sofifa_players": {
+            "fifa_edition",
+            "player",
+            "player_id",
+            "team",
+            "league",
+            *META_COLS,
         },
-        'sofifa_teams': {
-            'fifa_edition', 'team', 'team_id', 'league', *META_COLS,
+        "sofifa_teams": {
+            "fifa_edition",
+            "team",
+            "team_id",
+            "league",
+            *META_COLS,
         },
-        'sofifa_player_ratings': {
-            'fifa_edition', 'player', 'player_id', 'position',
-            'overallrating', 'potential', 'pace', 'shooting', 'passing',
-            'dribbling', 'defending', 'physical', *META_COLS,
+        "sofifa_player_ratings": {
+            "fifa_edition",
+            "player",
+            "player_id",
+            "position",
+            "overallrating",
+            "potential",
+            "pace",
+            "shooting",
+            "passing",
+            "dribbling",
+            "defending",
+            "physical",
+            *META_COLS,
         },
         # build_up_*/chance_creation_*/defence_*/...prestige/whole_team_average_age
         # (15 cols) were removed by FC 26 upstream; the parser no longer scrapes
         # them and they were dropped from Bronze (#601).
-        'sofifa_team_ratings': {
-            'fifa_edition', 'team', 'team_id', 'league',
-            'overall', 'attack', 'midfield', 'defence', *META_COLS,
+        "sofifa_team_ratings": {
+            "fifa_edition",
+            "team",
+            "team_id",
+            "league",
+            "overall",
+            "attack",
+            "midfield",
+            "defence",
+            *META_COLS,
         },
-        'sofifa_versions': {  # FIFA-edition lookup (soccerdata read_versions)
-            'version_id', 'fifa_edition', 'update', *META_COLS,
+        "sofifa_versions": {  # FIFA-edition lookup (soccerdata read_versions)
+            "version_id",
+            "fifa_edition",
+            "update",
+            *META_COLS,
         },
         # league -> sofifa league_id lookup (soccerdata read_leagues).
         # Unpartitioned reference table; replace-on-`league` keeps it idempotent.
-        'sofifa_leagues': {
-            'league', 'league_id', *META_COLS,
-        },
-    },
-    'transfermarkt': {
-        # 3 tables, ENG-PL MVP only (TM_LEAGUE_MAP). Verified live 2026-06-05
-        # (#285): players 555, market_value_history 2121, transfers 750 rows on
-        # ('ENG-Premier League','2526'). 0 all-NULL columns -> no EXPECTED_NULL.
-        # Minimal required set (identity keys + core metrics); extra live columns
-        # are NOT errors. Sparse-by-design (NOT all-NULL): transfers.fee_eur
-        # 176/750 (free transfers), transfers.market_value_eur 435/750.
-        'transfermarkt_players': {
-            'league', 'season', 'player_id', 'name', 'position', 'nationality',
-            'market_value_eur', 'current_club_id', 'current_club_name', *META_COLS,
-        },
-        'transfermarkt_market_value_history': {
-            'league', 'season', 'player_id', 'mv_date', 'value_eur', 'club_name',
+        "sofifa_leagues": {
+            "league",
+            "league_id",
             *META_COLS,
         },
-        'transfermarkt_transfers': {
-            'league', 'season', 'player_id', 'transfer_date', 'from_club_id',
-            'to_club_id', 'fee_text', 'is_upcoming', *META_COLS,
+    },
+    "transfermarkt": {
+        # Native-v2 contracts separate season-bound observations from global
+        # career facts. The four legacy tables remain required throughout the
+        # dual-write/rollback retention window.
+        "transfermarkt_players": {
+            "league",
+            "season",
+            "player_id",
+            "name",
+            "position",
+            "nationality",
+            "market_value_eur",
+            "current_club_id",
+            "current_club_name",
+            *META_COLS,
+        },
+        "transfermarkt_market_value_history": {
+            "league",
+            "season",
+            "player_id",
+            "mv_date",
+            "value_eur",
+            "club_name",
+            *META_COLS,
+        },
+        "transfermarkt_transfers": {
+            "league",
+            "season",
+            "player_id",
+            "transfer_date",
+            "from_club_id",
+            "to_club_id",
+            "fee_text",
+            "is_upcoming",
+            *META_COLS,
+        },
+        "transfermarkt_coaches": {
+            "league",
+            "season",
+            "coach_id",
+            "coach_slug",
+            "name",
+            "role",
+            "current_club_id",
+            "current_club_name",
+            *META_COLS,
+        },
+        "transfermarkt_squad_memberships": {
+            "competition_id",
+            "edition_id",
+            "league",
+            "season",
+            "club_id",
+            "club_slug",
+            "club_name",
+            "player_id",
+            "player_slug",
+            "player_name",
+            "observed_at",
+            *META_COLS,
+            *TM_LINEAGE_COLS,
+            *TM_SOURCE_SCOPE_COLS,
+        },
+        "transfermarkt_player_attribute_observations": {
+            "competition_id",
+            "edition_id",
+            "league",
+            "season",
+            "club_id",
+            "club_name",
+            "player_id",
+            "player_slug",
+            "name",
+            "position",
+            "dob",
+            "age",
+            "height_cm",
+            "foot",
+            "nationality",
+            "contract_until",
+            "market_value_eur",
+            "observed_at",
+            *META_COLS,
+            *TM_LINEAGE_COLS,
+            *TM_SOURCE_SCOPE_COLS,
+        },
+        "transfermarkt_player_contract_observations": {
+            "competition_id",
+            "edition_id",
+            "team_id",
+            "team_name",
+            "player_id",
+            "contract_until",
+            "observed_at",
+            "applicability_status",
+            *META_COLS,
+            *TM_LINEAGE_COLS,
+        },
+        "transfermarkt_market_value_points": {
+            "player_id",
+            "mv_date",
+            "value_eur",
+            "club_name",
+            "age",
+            "mv_raw",
+            *META_COLS,
+            *TM_LINEAGE_COLS,
+            *TM_SOURCE_SCOPE_COLS,
+        },
+        "transfermarkt_transfer_events": {
+            "transfer_id",
+            "player_id",
+            "transfer_date",
+            "event_season",
+            "from_club_id",
+            "from_club_name",
+            "to_club_id",
+            "to_club_name",
+            "fee_text",
+            "fee_eur",
+            "market_value_eur",
+            "is_upcoming",
+            *META_COLS,
+            *TM_LINEAGE_COLS,
+            *TM_SOURCE_SCOPE_COLS,
+        },
+        "transfermarkt_coach_profiles": {
+            "coach_id",
+            "coach_slug",
+            "name",
+            "dob",
+            "nationality",
+            *META_COLS,
+            *TM_LINEAGE_COLS,
+            *TM_SOURCE_SCOPE_COLS,
+        },
+        "transfermarkt_coach_stints": {
+            "club_id",
+            "club_name",
+            "coach_id",
+            "coach_slug",
+            "name",
+            "role",
+            "appointed_date",
+            "left_date",
+            *META_COLS,
+            *TM_LINEAGE_COLS,
+            *TM_SOURCE_SCOPE_COLS,
+        },
+        "transfermarkt_competitions": {
+            "competition_id",
+            "slug",
+            "name",
+            "country",
+            "confederation",
+            "competition_type",
+            "gender",
+            "team_type",
+            "age_category",
+            "season_format",
+            "active",
+            "source_url",
+            "discovered_at",
+            "canonical_competition_id",
+            "classification_status",
+            "classification_evidence",
+            "registry_snapshot_id",
+            *TM_LINEAGE_COLS,
+            *META_COLS,
+        },
+        "transfermarkt_competition_editions": {
+            "competition_id",
+            "edition_id",
+            "edition_label",
+            "canonical_season",
+            "season_format",
+            "start_date",
+            "end_date",
+            "active",
+            "current",
+            "participant_count",
+            "participant_hash",
+            "discovered_at",
+            "registry_snapshot_id",
+            *TM_LINEAGE_COLS,
+            *META_COLS,
         },
     },
-    'capology': {
+    "capology": {
         # 4 APL data products (#321), all from the same anti-bot-free tls path,
         # partition (league, season[, currency]). All 3 currencies inline.
         # Verified live 2026-06-05 across seasons 2324/2425/2526. Backfill of
         # completed seasons populates adjusted_total_* (resolves #319) so the
         # salaries adjusted_total_* cols are no longer all-NULL — hence no
         # EXPECTED_NULL entry for capology.
-        'capology_player_salaries': {
-            'league', 'season', 'currency', 'player_slug', 'player_name',
-            'club_slug', 'club_name', 'country_code', 'age', 'position',
-            'status', 'active', 'loan', 'verified',
-            'weekly_gross_gbp', 'weekly_gross_eur', 'weekly_gross_usd',
-            'annual_gross_gbp', 'annual_gross_eur', 'annual_gross_usd',
-            'weekly_net_gbp', 'weekly_net_eur', 'weekly_net_usd',
-            'annual_net_gbp', 'annual_net_eur', 'annual_net_usd',
-            'bonus_gross_gbp', 'bonus_gross_eur', 'bonus_gross_usd',
-            'bonus_net_gbp', 'bonus_net_eur', 'bonus_net_usd',
-            'total_gross_gbp', 'total_gross_eur', 'total_gross_usd',
-            'total_net_gbp', 'total_net_eur', 'total_net_usd',
-            'adjusted_total_gross_gbp', 'adjusted_total_gross_eur', 'adjusted_total_gross_usd',
-            'adjusted_total_net_gbp', 'adjusted_total_net_eur', 'adjusted_total_net_usd',
+        "capology_player_salaries": {
+            "league",
+            "season",
+            "currency",
+            "player_slug",
+            "player_name",
+            "club_slug",
+            "club_name",
+            "country_code",
+            "age",
+            "position",
+            "status",
+            "active",
+            "loan",
+            "verified",
+            "weekly_gross_gbp",
+            "weekly_gross_eur",
+            "weekly_gross_usd",
+            "annual_gross_gbp",
+            "annual_gross_eur",
+            "annual_gross_usd",
+            "weekly_net_gbp",
+            "weekly_net_eur",
+            "weekly_net_usd",
+            "annual_net_gbp",
+            "annual_net_eur",
+            "annual_net_usd",
+            "bonus_gross_gbp",
+            "bonus_gross_eur",
+            "bonus_gross_usd",
+            "bonus_net_gbp",
+            "bonus_net_eur",
+            "bonus_net_usd",
+            "total_gross_gbp",
+            "total_gross_eur",
+            "total_gross_usd",
+            "total_net_gbp",
+            "total_net_eur",
+            "total_net_usd",
+            "adjusted_total_gross_gbp",
+            "adjusted_total_gross_eur",
+            "adjusted_total_gross_usd",
+            "adjusted_total_net_gbp",
+            "adjusted_total_net_eur",
+            "adjusted_total_net_usd",
             *META_COLS,
         },
         # Club-level wage totals. Positional split d/f/k/m is Pro-locked
         # upstream → intentionally not ingested (so NOT in the contract).
-        'capology_team_payrolls': {
-            'league', 'season', 'club_slug', 'club_name', 'club_code',
-            'weekly_gross_gbp', 'weekly_gross_eur', 'weekly_gross_usd',
-            'weekly_net_gbp', 'weekly_net_eur', 'weekly_net_usd',
-            'annual_gross_gbp', 'annual_gross_eur', 'annual_gross_usd',
-            'annual_net_gbp', 'annual_net_eur', 'annual_net_usd',
-            'bonus_gross_gbp', 'bonus_gross_eur', 'bonus_gross_usd',
-            'bonus_net_gbp', 'bonus_net_eur', 'bonus_net_usd',
-            'total_gross_gbp', 'total_gross_eur', 'total_gross_usd',
-            'total_net_gbp', 'total_net_eur', 'total_net_usd',
-            'adjusted_total_gross_gbp', 'adjusted_total_gross_eur', 'adjusted_total_gross_usd',
-            'adjusted_total_net_gbp', 'adjusted_total_net_eur', 'adjusted_total_net_usd',
+        "capology_team_payrolls": {
+            "league",
+            "season",
+            "club_slug",
+            "club_name",
+            "club_code",
+            "weekly_gross_gbp",
+            "weekly_gross_eur",
+            "weekly_gross_usd",
+            "weekly_net_gbp",
+            "weekly_net_eur",
+            "weekly_net_usd",
+            "annual_gross_gbp",
+            "annual_gross_eur",
+            "annual_gross_usd",
+            "annual_net_gbp",
+            "annual_net_eur",
+            "annual_net_usd",
+            "bonus_gross_gbp",
+            "bonus_gross_eur",
+            "bonus_gross_usd",
+            "bonus_net_gbp",
+            "bonus_net_eur",
+            "bonus_net_usd",
+            "total_gross_gbp",
+            "total_gross_eur",
+            "total_gross_usd",
+            "total_net_gbp",
+            "total_net_eur",
+            "total_net_usd",
+            "adjusted_total_gross_gbp",
+            "adjusted_total_gross_eur",
+            "adjusted_total_gross_usd",
+            "adjusted_total_net_gbp",
+            "adjusted_total_net_eur",
+            "adjusted_total_net_usd",
             *META_COLS,
         },
         # Player-level contracts: signed/expiration ISO dates + years +
         # salary + full contract_total value.
-        'capology_contract_extensions': {
-            'league', 'season', 'player_slug', 'player_name',
-            'club_slug', 'club_name', 'signed', 'expiration', 'years',
-            'weekly_gross_gbp', 'weekly_gross_eur', 'weekly_gross_usd',
-            'weekly_net_gbp', 'weekly_net_eur', 'weekly_net_usd',
-            'annual_gross_gbp', 'annual_gross_eur', 'annual_gross_usd',
-            'annual_net_gbp', 'annual_net_eur', 'annual_net_usd',
-            'bonus_gross_gbp', 'bonus_gross_eur', 'bonus_gross_usd',
-            'bonus_net_gbp', 'bonus_net_eur', 'bonus_net_usd',
-            'total_gross_gbp', 'total_gross_eur', 'total_gross_usd',
-            'total_net_gbp', 'total_net_eur', 'total_net_usd',
-            'adjusted_total_gross_gbp', 'adjusted_total_gross_eur', 'adjusted_total_gross_usd',
-            'adjusted_total_net_gbp', 'adjusted_total_net_eur', 'adjusted_total_net_usd',
-            'contract_total_gross_gbp', 'contract_total_gross_eur', 'contract_total_gross_usd',
-            'contract_total_net_gbp', 'contract_total_net_eur', 'contract_total_net_usd',
+        "capology_contract_extensions": {
+            "league",
+            "season",
+            "player_slug",
+            "player_name",
+            "club_slug",
+            "club_name",
+            "signed",
+            "expiration",
+            "years",
+            "weekly_gross_gbp",
+            "weekly_gross_eur",
+            "weekly_gross_usd",
+            "weekly_net_gbp",
+            "weekly_net_eur",
+            "weekly_net_usd",
+            "annual_gross_gbp",
+            "annual_gross_eur",
+            "annual_gross_usd",
+            "annual_net_gbp",
+            "annual_net_eur",
+            "annual_net_usd",
+            "bonus_gross_gbp",
+            "bonus_gross_eur",
+            "bonus_gross_usd",
+            "bonus_net_gbp",
+            "bonus_net_eur",
+            "bonus_net_usd",
+            "total_gross_gbp",
+            "total_gross_eur",
+            "total_gross_usd",
+            "total_net_gbp",
+            "total_net_eur",
+            "total_net_usd",
+            "adjusted_total_gross_gbp",
+            "adjusted_total_gross_eur",
+            "adjusted_total_gross_usd",
+            "adjusted_total_net_gbp",
+            "adjusted_total_net_eur",
+            "adjusted_total_net_usd",
+            "contract_total_gross_gbp",
+            "contract_total_gross_eur",
+            "contract_total_gross_usd",
+            "contract_total_net_gbp",
+            "contract_total_net_eur",
+            "contract_total_net_usd",
             *META_COLS,
         },
         # Club-level transfer-window net spend (balances can be negative).
-        'capology_transfer_window': {
-            'league', 'season', 'club_slug', 'club_name', 'club_code',
-            'players', 'age', 'foreign',
-            'income_gbp', 'income_eur', 'income_usd',
-            'expense_gbp', 'expense_eur', 'expense_usd',
-            'balance_gbp', 'balance_eur', 'balance_usd',
-            'adjbalance_gbp', 'adjbalance_eur', 'adjbalance_usd',
+        "capology_transfer_window": {
+            "league",
+            "season",
+            "club_slug",
+            "club_name",
+            "club_code",
+            "players",
+            "age",
+            "foreign",
+            "income_gbp",
+            "income_eur",
+            "income_usd",
+            "expense_gbp",
+            "expense_eur",
+            "expense_usd",
+            "balance_gbp",
+            "balance_eur",
+            "balance_usd",
+            "adjbalance_gbp",
+            "adjbalance_eur",
+            "adjbalance_usd",
             *META_COLS,
         },
     },
@@ -572,37 +1479,37 @@ EXPECTED_TABLES: dict[str, dict[str, set[str]]] = {
 # (upstream restriction). Absent / empty == PASS, surfaced as "expected absent (OK)"
 # instead of a missing-table failure.
 EXPECTED_ABSENT: dict[str, set[str]] = {
-    'fbref': {'fbref_shot_events'},  # FBref Feb-2026 shot-data restriction (#276)
+    "fbref": {"fbref_shot_events"},  # FBref Feb-2026 shot-data restriction (#276)
 }
 
 # Source prefix → group label for the report
 SOURCE_GROUPS = [
-    ('fbref_', 'FBref'),
-    ('fotmob_', 'FotMob'),
-    ('sofascore_', 'Sofascore'),
-    ('sofifa_', 'SoFIFA'),
-    ('understat_', 'Understat'),
-    ('whoscored_', 'WhoScored'),
-    ('espn_', 'ESPN'),
-    ('clubelo_', 'ClubElo'),
-    ('matchhistory_', 'MatchHistory'),
+    ("fbref_", "FBref"),
+    ("fotmob_", "FotMob"),
+    ("sofascore_", "Sofascore"),
+    ("sofifa_", "SoFIFA"),
+    ("understat_", "Understat"),
+    ("whoscored_", "WhoScored"),
+    ("espn_", "ESPN"),
+    ("clubelo_", "ClubElo"),
+    ("matchhistory_", "MatchHistory"),
 ]
 
 
 # CLI slug -> live bronze table prefix. Slug == key in EXPECTED_TABLES.
 # (SOURCE_GROUPS is label-oriented for the full-scan report; --source needs a slug.)
 SOURCE_PREFIXES: dict[str, str] = {
-    'fbref': 'fbref_',
-    'understat': 'understat_',
-    'whoscored': 'whoscored_',
-    'espn': 'espn_',
-    'sofascore': 'sofascore_',
-    'fotmob': 'fotmob_',
-    'matchhistory': 'matchhistory_',
-    'clubelo': 'clubelo_',
-    'sofifa': 'sofifa_',
-    'transfermarkt': 'transfermarkt_',
-    'capology': 'capology_',
+    "fbref": "fbref_",
+    "understat": "understat_",
+    "whoscored": "whoscored_",
+    "espn": "espn_",
+    "sofascore": "sofascore_",
+    "fotmob": "fotmob_",
+    "matchhistory": "matchhistory_",
+    "clubelo": "clubelo_",
+    "sofifa": "sofifa_",
+    "transfermarkt": "transfermarkt_",
+    "capology": "capology_",
 }
 
 
@@ -610,12 +1517,14 @@ def source_of(table: str) -> str:
     for prefix, label in SOURCE_GROUPS:
         if table.startswith(prefix):
             return label
-    return 'Other'
+    return "Other"
 
 
 # ---- Helpers ----
 
-_PARTITIONING_RE = re.compile(r"partitioning\s*=\s*ARRAY\[(.*?)\]", re.IGNORECASE | re.DOTALL)
+_PARTITIONING_RE = re.compile(
+    r"partitioning\s*=\s*ARRAY\[(.*?)\]", re.IGNORECASE | re.DOTALL
+)
 
 
 def get_partition_cols(cur, table: str) -> set[str]:
@@ -624,7 +1533,7 @@ def get_partition_cols(cur, table: str) -> set[str]:
     m = _PARTITIONING_RE.search(ddl)
     if not m:
         return set()
-    return {x.strip().strip("'\"") for x in m.group(1).split(',') if x.strip()}
+    return {x.strip().strip("'\"") for x in m.group(1).split(",") if x.strip()}
 
 
 def describe(cur, table: str) -> list[tuple[str, str]]:
@@ -634,22 +1543,28 @@ def describe(cur, table: str) -> list[tuple[str, str]]:
 
 def safe_alias(col: str, idx: int) -> str:
     """Produce a SQL-safe alias for arbitrary column name."""
-    base = re.sub(r'[^a-zA-Z0-9_]', '_', col)
-    if not base or not base[0].isalpha() and base[0] != '_':
+    base = re.sub(r"[^a-zA-Z0-9_]", "_", col)
+    if not base or not base[0].isalpha() and base[0] != "_":
         base = f"c{idx}_{base}"
     return base
 
 
 def is_varchar(typ: str) -> bool:
-    return typ.startswith('varchar')
+    return typ.startswith("varchar")
 
 
 def is_skip_distinct(typ: str) -> bool:
     """Skip distinct count on types where it's expensive or unsupported."""
-    return typ.startswith('timestamp') or typ.startswith('row(') or typ.startswith('array(') or typ.startswith('map(')
+    return (
+        typ.startswith("timestamp")
+        or typ.startswith("row(")
+        or typ.startswith("array(")
+        or typ.startswith("map(")
+    )
 
 
 # ---- Audit ----
+
 
 def audit_table(cur, table: str) -> tuple[int, list[dict]]:
     """Return (total_rows, findings) for one table."""
@@ -686,16 +1601,18 @@ def audit_table(cur, table: str) -> tuple[int, list[dict]]:
     row = cur.fetchall()[0]
     res = dict(zip(desc, row))
 
-    total = int(res.get('_total', 0) or 0)
+    total = int(res.get("_total", 0) or 0)
     if total == 0:
-        return 0, [{'table': table, 'col': '*', 'sev': 'INFO', 'detail': 'table is empty'}]
+        return 0, [
+            {"table": table, "col": "*", "sev": "INFO", "detail": "table is empty"}
+        ]
 
     findings: list[dict] = []
     allow_for_table = EXPECTED_NULL.get(table, set())
     allow_constant = EXPECTED_CONSTANT.get(table, set())
 
     for col, typ, alias, do_es in plan:
-        nn = int(res.get(f'{alias}__nn', 0) or 0)
+        nn = int(res.get(f"{alias}__nn", 0) or 0)
         nulls = total - nn
         null_rate = nulls / total if total else 0.0
         in_allowlist = col in allow_for_table
@@ -704,51 +1621,81 @@ def audit_table(cur, table: str) -> tuple[int, list[dict]]:
         # NULL classification
         if null_rate == 1.0:
             if in_allowlist:
-                findings.append({
-                    'table': table, 'col': col, 'sev': 'INFO',
-                    'detail': f'EXPECTED_NULL (100% NULL by allowlist, {typ})',
-                })
+                findings.append(
+                    {
+                        "table": table,
+                        "col": col,
+                        "sev": "INFO",
+                        "detail": f"EXPECTED_NULL (100% NULL by allowlist, {typ})",
+                    }
+                )
             else:
-                findings.append({
-                    'table': table, 'col': col, 'sev': 'ERROR',
-                    'detail': f'ALL_NULL — 0 of {total} non-NULL ({typ})',
-                })
+                findings.append(
+                    {
+                        "table": table,
+                        "col": col,
+                        "sev": "ERROR",
+                        "detail": f"ALL_NULL — 0 of {total} non-NULL ({typ})",
+                    }
+                )
         elif null_rate > 0.95 and not in_allowlist:
-            findings.append({
-                'table': table, 'col': col, 'sev': 'WARN',
-                'detail': f'HIGH_NULL — null_rate={null_rate:.1%} ({nn}/{total} non-NULL, {typ})',
-            })
+            findings.append(
+                {
+                    "table": table,
+                    "col": col,
+                    "sev": "WARN",
+                    "detail": f"HIGH_NULL — null_rate={null_rate:.1%} ({nn}/{total} non-NULL, {typ})",
+                }
+            )
 
         # Empty-string classification (varchar only)
         if do_es and nn > 0:
-            es = int(res.get(f'{alias}__es', 0) or 0)
+            es = int(res.get(f"{alias}__es", 0) or 0)
             if es == nn:
-                findings.append({
-                    'table': table, 'col': col, 'sev': 'ERROR',
-                    'detail': f"ALL_EMPTY_STR — all {nn} non-NULL values are '' ({typ})",
-                })
+                findings.append(
+                    {
+                        "table": table,
+                        "col": col,
+                        "sev": "ERROR",
+                        "detail": f"ALL_EMPTY_STR — all {nn} non-NULL values are '' ({typ})",
+                    }
+                )
 
         # Constant classification (skip meta cols + partition cols + small tables)
-        if total >= 10 and not is_meta and col not in partition_cols and not is_skip_distinct(typ):
-            d = res.get(f'{alias}__d')
+        if (
+            total >= 10
+            and not is_meta
+            and col not in partition_cols
+            and not is_skip_distinct(typ)
+        ):
+            d = res.get(f"{alias}__d")
             if d is not None:
                 d = int(d)
                 if d == 1 and nn > 0:
                     if col in allow_constant:
-                        findings.append({
-                            'table': table, 'col': col, 'sev': 'INFO',
-                            'detail': f'EXPECTED_CONSTANT (1 distinct by design across {nn} non-NULL rows, {typ})',
-                        })
+                        findings.append(
+                            {
+                                "table": table,
+                                "col": col,
+                                "sev": "INFO",
+                                "detail": f"EXPECTED_CONSTANT (1 distinct by design across {nn} non-NULL rows, {typ})",
+                            }
+                        )
                     else:
-                        findings.append({
-                            'table': table, 'col': col, 'sev': 'WARN',
-                            'detail': f'CONSTANT — only 1 distinct value across {nn} non-NULL rows ({typ})',
-                        })
+                        findings.append(
+                            {
+                                "table": table,
+                                "col": col,
+                                "sev": "WARN",
+                                "detail": f"CONSTANT — only 1 distinct value across {nn} non-NULL rows ({typ})",
+                            }
+                        )
 
     return total, findings
 
 
 # ---- Contract diff (--source mode) ----
+
 
 def diff_contract(
     cur,
@@ -778,19 +1725,21 @@ def diff_contract(
         in_absent_ok = table in absent_ok
         if table not in live_tables:
             if in_absent_ok:
-                expected_absent.append((table, 'absent — expected (upstream restriction)'))
+                expected_absent.append(
+                    (table, "absent — expected (upstream restriction)")
+                )
             else:
-                missing_tables.append((table, 'absent from bronze'))
+                missing_tables.append((table, "absent from bronze"))
             continue
         total = per_table.get(table, (0, []))[0]
         if total == -1:
-            missing_tables.append((table, 'audit scan failed'))
+            missing_tables.append((table, "audit scan failed"))
             continue
         if total == 0:
             if in_absent_ok:
-                expected_absent.append((table, 'present but empty — expected'))
+                expected_absent.append((table, "present but empty — expected"))
             else:
-                missing_tables.append((table, 'present but empty (0 rows)'))
+                missing_tables.append((table, "present but empty (0 rows)"))
             continue
         live_cols = {c.lower() for c, _ in describe(cur, table)}
         for col in sorted(expected_cols):
@@ -801,31 +1750,37 @@ def diff_contract(
     for table in sorted(per_table):
         _, findings = per_table[table]
         for f in findings:
-            if f['sev'] == 'ERROR' and f['detail'].startswith('ALL_NULL'):
-                all_null_columns.append((table, f['col'], f['detail']))
+            if f["sev"] == "ERROR" and f["detail"].startswith("ALL_NULL"):
+                all_null_columns.append((table, f["col"], f["detail"]))
 
     return {
-        'missing_tables': missing_tables,
-        'expected_absent': expected_absent,
-        'missing_columns': missing_columns,
-        'all_null_columns': all_null_columns,
+        "missing_tables": missing_tables,
+        "expected_absent": expected_absent,
+        "missing_columns": missing_columns,
+        "all_null_columns": all_null_columns,
     }
 
 
 # ---- Report ----
 
-SEV_ORDER = {'ERROR': 0, 'WARN': 1, 'INFO': 2}
+SEV_ORDER = {"ERROR": 0, "WARN": 1, "INFO": 2}
 
 
 def render_report(per_table: dict[str, tuple[int, list[dict]]], output: Path) -> None:
     total_tables = len(per_table)
-    err_findings = [f for _, fs in per_table.values() for f in fs if f['sev'] == 'ERROR']
-    warn_findings = [f for _, fs in per_table.values() for f in fs if f['sev'] == 'WARN']
-    info_findings = [f for _, fs in per_table.values() for f in fs if f['sev'] == 'INFO']
-    err_tables = len({f['table'] for f in err_findings})
-    warn_tables = len({f['table'] for f in warn_findings})
+    err_findings = [
+        f for _, fs in per_table.values() for f in fs if f["sev"] == "ERROR"
+    ]
+    warn_findings = [
+        f for _, fs in per_table.values() for f in fs if f["sev"] == "WARN"
+    ]
+    info_findings = [
+        f for _, fs in per_table.values() for f in fs if f["sev"] == "INFO"
+    ]
+    err_tables = len({f["table"] for f in err_findings})
+    warn_tables = len({f["table"] for f in warn_findings})
 
-    today = datetime.utcnow().strftime('%Y-%m-%d')
+    today = datetime.utcnow().strftime("%Y-%m-%d")
     lines: list[str] = [
         f"# Bronze column quality audit — {today}",
         "",
@@ -848,7 +1803,7 @@ def render_report(per_table: dict[str, tuple[int, list[dict]]], output: Path) ->
     by_source: dict[str, list[dict]] = defaultdict(list)
     for table, (_, fs) in per_table.items():
         for f in fs:
-            if f['sev'] in ('ERROR', 'WARN'):
+            if f["sev"] in ("ERROR", "WARN"):
                 by_source[source_of(table)].append(f)
 
     if not by_source:
@@ -856,13 +1811,18 @@ def render_report(per_table: dict[str, tuple[int, list[dict]]], output: Path) ->
         lines.append("")
     else:
         for source in sorted(by_source.keys()):
-            findings = sorted(by_source[source], key=lambda f: (SEV_ORDER[f['sev']], f['table'], f['col']))
+            findings = sorted(
+                by_source[source],
+                key=lambda f: (SEV_ORDER[f["sev"]], f["table"], f["col"]),
+            )
             lines.append(f"### {source} ({len(findings)})")
             lines.append("")
             lines.append("| Table | Column | Severity | Detail |")
             lines.append("|---|---|---|---|")
             for f in findings:
-                lines.append(f"| `{f['table']}` | `{f['col']}` | **{f['sev']}** | {f['detail']} |")
+                lines.append(
+                    f"| `{f['table']}` | `{f['col']}` | **{f['sev']}** | {f['detail']} |"
+                )
             lines.append("")
 
     # Per-table summary (totals + finding counts)
@@ -872,9 +1832,9 @@ def render_report(per_table: dict[str, tuple[int, list[dict]]], output: Path) ->
     lines.append("|---|---:|---:|---:|---:|")
     for table in sorted(per_table.keys()):
         total, fs = per_table[table]
-        e = sum(1 for f in fs if f['sev'] == 'ERROR')
-        w = sum(1 for f in fs if f['sev'] == 'WARN')
-        i = sum(1 for f in fs if f['sev'] == 'INFO')
+        e = sum(1 for f in fs if f["sev"] == "ERROR")
+        w = sum(1 for f in fs if f["sev"] == "WARN")
+        i = sum(1 for f in fs if f["sev"] == "INFO")
         lines.append(f"| `{table}` | {total} | {e} | {w} | {i} |")
     lines.append("")
 
@@ -882,13 +1842,15 @@ def render_report(per_table: dict[str, tuple[int, list[dict]]], output: Path) ->
     lines.append("## Allowlist hits (expected 100% NULL)")
     lines.append("")
     if not info_findings:
-        lines.append("Нет allowlist-hit'ов (значит ни одна expected-NULL колонка реально не 100% NULL — проверить!).")
+        lines.append(
+            "Нет allowlist-hit'ов (значит ни одна expected-NULL колонка реально не 100% NULL — проверить!)."
+        )
         lines.append("")
     else:
         lines.append("| Table | Column | Note |")
         lines.append("|---|---|---|")
-        for f in sorted(info_findings, key=lambda f: (f['table'], f['col'])):
-            if f['col'] == '*':
+        for f in sorted(info_findings, key=lambda f: (f["table"], f["col"])):
+            if f["col"] == "*":
                 continue
             lines.append(f"| `{f['table']}` | `{f['col']}` | {f['detail']} |")
         lines.append("")
@@ -905,7 +1867,7 @@ def render_report(per_table: dict[str, tuple[int, list[dict]]], output: Path) ->
         lines.append("(none)")
         lines.append("")
 
-    output.write_text('\n'.join(lines), encoding='utf-8')
+    output.write_text("\n".join(lines), encoding="utf-8")
 
 
 def render_source_report(
@@ -915,13 +1877,13 @@ def render_source_report(
     output: Path,
 ) -> None:
     """Per-source contract report: missing tables / columns / all-NULL columns."""
-    missing_tables = diff['missing_tables']
-    expected_absent = diff.get('expected_absent', [])
-    missing_columns = diff['missing_columns']
-    all_null_columns = diff['all_null_columns']
+    missing_tables = diff["missing_tables"]
+    expected_absent = diff.get("expected_absent", [])
+    missing_columns = diff["missing_columns"]
+    all_null_columns = diff["all_null_columns"]
     contract = EXPECTED_TABLES.get(source, {})
 
-    today = datetime.utcnow().strftime('%Y-%m-%d')
+    today = datetime.utcnow().strftime("%Y-%m-%d")
     lines: list[str] = [
         f"# Bronze contract audit — {source} — {today}",
         "",
@@ -1003,24 +1965,30 @@ def render_source_report(
         lines.append("|---|---:|---:|---:|")
         for table in sorted(per_table):
             total, fs = per_table[table]
-            e = sum(1 for f in fs if f['sev'] == 'ERROR')
-            w = sum(1 for f in fs if f['sev'] == 'WARN')
+            e = sum(1 for f in fs if f["sev"] == "ERROR")
+            w = sum(1 for f in fs if f["sev"] == "WARN")
             lines.append(f"| `{table}` | {total} | {e} | {w} |")
     else:
         lines.append("(none — нет живых таблиц с этим префиксом)")
     lines.append("")
 
-    output.write_text('\n'.join(lines), encoding='utf-8')
+    output.write_text("\n".join(lines), encoding="utf-8")
 
 
 # ---- Main ----
 
+
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--output', default=f'/tmp/bronze_column_audit_{datetime.utcnow():%Y-%m-%d}.md')
-    p.add_argument('--source', default=None,
-                   help='slug (espn, fbref, ...) — scan only {source}_* tables and '
-                        'diff against the parser contract (EXPECTED_TABLES)')
+    p.add_argument(
+        "--output", default=f"/tmp/bronze_column_audit_{datetime.utcnow():%Y-%m-%d}.md"
+    )
+    p.add_argument(
+        "--source",
+        default=None,
+        help="slug (espn, fbref, ...) — scan only {source}_* tables and "
+        "diff against the parser contract (EXPECTED_TABLES)",
+    )
     args = p.parse_args()
 
     source: Optional[str] = None
@@ -1031,7 +1999,7 @@ def main():
 
     conn = _get_trino_connection()
     cur = conn.cursor()
-    cur.execute('SHOW TABLES FROM iceberg.bronze')
+    cur.execute("SHOW TABLES FROM iceberg.bronze")
     all_tables = sorted(r[0] for r in cur.fetchall())
 
     if source:
@@ -1049,10 +2017,17 @@ def main():
             per_table[t] = (total, findings)
         except Exception as e:
             print(f"  ! {t}: SCAN FAILED — {type(e).__name__}: {e}", file=sys.stderr)
-            per_table[t] = (-1, [{
-                'table': t, 'col': '*', 'sev': 'ERROR',
-                'detail': f'audit script failed: {type(e).__name__}: {e}',
-            }])
+            per_table[t] = (
+                -1,
+                [
+                    {
+                        "table": t,
+                        "col": "*",
+                        "sev": "ERROR",
+                        "detail": f"audit script failed: {type(e).__name__}: {e}",
+                    }
+                ],
+            )
 
     output = Path(args.output)
     if source:
@@ -1063,5 +2038,5 @@ def main():
     print(f"\nReport written to: {output}", file=sys.stderr)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

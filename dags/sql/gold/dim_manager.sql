@@ -115,7 +115,7 @@ tm_manager AS (
         x.canonical_id,
         MAX_BY(tc.nationality, tc.season) AS nationality,
         MAX_BY(tc.dob,         tc.season) AS dob
-    FROM iceberg.silver.transfermarkt_coaches tc
+    FROM iceberg.silver.transfermarkt_coaches_legacy tc
     JOIN xref_tm x
       ON CAST(tc.coach_id AS varchar) = x.tm_coach_id
     GROUP BY x.canonical_id

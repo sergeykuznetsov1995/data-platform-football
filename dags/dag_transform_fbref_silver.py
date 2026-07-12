@@ -4,12 +4,12 @@ FBref Silver Layer Transformation DAG
 
 Transforms Bronze FBref data into Silver layer Iceberg tables.
 
-Runs after dag_ingest_fbref completes (trigger-only, no schedule).
+Runs from dag_master_pipeline after ingestion completes (trigger-only, no schedule).
 Uses CTAS (CREATE TABLE AS SELECT) via Trino to deduplicate Bronze data,
 join multiple tables, cast types, and produce clean analytical tables.
 
 Architecture:
-    Triggered by dag_ingest_fbref via TriggerDagRunOperator (or manual trigger)
+    Triggered by dag_master_pipeline (or manual trigger)
         |
         v
     TaskGroup: silver_transforms (7 SEQUENTIAL tasks, max_active_tasks=1)
@@ -29,6 +29,10 @@ Architecture:
         |
         v
     trigger_xref  — blocking, fail-closed identity handoff
+
+Gold publication is deliberately not triggered from this DAG.  The master
+pipeline is the single owner of the final Gold run because it first publishes
+fresh xref and E3 tables; a nested trigger here could race that ordered path.
 
 Silver Tables Created:
     iceberg.silver.fbref_player_season_profile  — player stats + shooting + playingtime + misc
@@ -106,7 +110,8 @@ SILVER_TRANSFORMS = [
         'fbref_team_season_profile',
     ),
     # E5: WhoScored confirmed-absences feed (per-match player unavailability).
-    # Reads bronze.whoscored_missing_players + bronze.whoscored_schedule.
+    # Reads manifest-filtered bronze.whoscored_missing_players_current plus
+    # bronze.whoscored_schedule.
     # Optional Bronze — see OPTIONAL_BRONZE_TABLES below.
     (
         'whoscored_player_unavailable',
@@ -152,7 +157,7 @@ OPTIONAL_BRONZE_TABLES = {
     # E5: WhoScored ingest is paused on some deployments (see
     # project_whoscored_cloudflare.md) — Silver must skip gracefully when the
     # Bronze source is absent rather than failing the whole DAG.
-    'whoscored_player_unavailable': 'whoscored_missing_players',
+    'whoscored_player_unavailable': 'whoscored_missing_players_current',
     # issue #613: combined_match_data may not have populated officials yet on
     # some deployments — skip the Silver transform gracefully if absent.
     'fbref_match_officials': 'fbref_match_officials',
@@ -610,7 +615,7 @@ def _validate_silver_quality(**context) -> Dict[str, Any]:
     else:
         logger.warning(
             "silver.whoscored_player_unavailable not found — skipping E5 DQ "
-            "checks (Bronze whoscored_missing_players likely paused)."
+            "checks (Bronze whoscored_missing_players_current likely unavailable)."
         )
 
     # issue #613: FBref officials is optional Bronze (combined_match_data may
@@ -670,7 +675,7 @@ with DAG(
     dag_id='dag_transform_fbref_silver',
     default_args=SILVER_ARGS,
     description='Transform Bronze FBref data into Silver Iceberg tables via Trino CTAS',
-    schedule=None,  # Trigger-only (called after ingestion)
+    schedule=None,  # Trigger-only (master-owned after ingestion)
     start_date=datetime(2026, 3, 1),
     catchup=False,
     tags=['transform', 'fbref', 'silver', 'football', 'trino'],
@@ -703,7 +708,7 @@ with DAG(
     | `fbref_match_events` | Detailed match events | match_events |
     | `fbref_match_lineups` | Detailed lineup entries | lineups |
     | `fbref_shot_events` | Per-shot xG data (optional) | shot_events |
-    | `whoscored_player_unavailable` | Confirmed player absences per match (optional) | whoscored_missing_players |
+    | `whoscored_player_unavailable` | Confirmed player absences per match (optional) | whoscored_missing_players_current |
 
     ### Transformations Applied
 
@@ -721,6 +726,9 @@ with DAG(
     - **Referential integrity** (ERROR): orphan match_id in child tables fails the run
     - **Freshness** (WARNING): `_bronze_ingested_at` within 48h of Monday ingest
     - **Value ranges** (WARNING): outliers for monitoring, do not block
+
+    Both validation tasks are fail-closed. Gold is published separately by
+    `dag_master_pipeline`, after xref and E3 have completed successfully.
 
     ### Manual Trigger
 

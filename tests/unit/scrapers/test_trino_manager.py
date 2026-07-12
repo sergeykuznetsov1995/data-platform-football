@@ -461,17 +461,18 @@ class TestTrinoTableManagerInsertDataFrameAtomic:
 
             # Batches are staged on the throwaway table, not the target.
             mock_insert.assert_called_once()
-            assert mock_insert.call_args[0][1] == 'test_table__stg'
+            stage = mock_insert.call_args[0][1]
+            assert stage.startswith('test_table__stg_')
 
             # Stage is dropped before (crash leftovers) and after (cleanup).
             assert mock_drop.call_count == 2
             for call in mock_drop.call_args_list:
-                assert call[0][1] == 'test_table__stg'
+                assert call[0][1] == stage
 
             executed = [c[0][0] for c in mock_execute.call_args_list]
             # Empty-schema copy of the target.
             assert any(
-                'CREATE TABLE iceberg.bronze.test_table__stg AS SELECT * FROM '
+                f'CREATE TABLE iceberg.bronze.{stage} AS SELECT * FROM '
                 'iceberg.bronze.test_table WHERE false' in sql for sql in executed
             )
             # Exactly ONE INSERT into the target — the merge from stage.
@@ -481,7 +482,7 @@ class TestTrinoTableManagerInsertDataFrameAtomic:
             ]
             assert len(target_inserts) == 1
             assert 'SELECT' in target_inserts[0]
-            assert 'FROM iceberg.bronze.test_table__stg' in target_inserts[0]
+            assert f'FROM iceberg.bronze.{stage}' in target_inserts[0]
             # Plain append → no DELETE issued.
             assert not any('DELETE FROM' in sql for sql in executed)
 
@@ -565,7 +566,7 @@ class TestTrinoTableManagerInsertDataFrameAtomic:
             executed = [c[0][0] for c in mock_execute.call_args_list]
 
             # Staging happens before any DELETE: insert_dataframe targets the stage.
-            assert mock_insert.call_args[0][1] == 'test_table__stg'
+            assert mock_insert.call_args[0][1].startswith('test_table__stg_')
 
             delete_idx = next(i for i, s in enumerate(executed) if 'DELETE FROM iceberg.bronze.test_table ' in s)
             insert_idx = next(i for i, s in enumerate(executed) if 'INSERT INTO iceberg.bronze.test_table ' in s)
@@ -1134,6 +1135,30 @@ class TestFormatSqlValueHardening:
         m = self._manager()
         val = "2024-01-01 00:00:00' x"
         assert m._format_sql_value(val, "TIMESTAMP") == "TIMESTAMP '" + val.replace("'", "''") + "'"
+
+    def test_timestamp_iso_utc_string_is_normalized_for_trino(self):
+        m = self._manager()
+        assert m._format_sql_value(
+            "2025-08-22T18:30:00Z", "TIMESTAMP(6)"
+        ) == "TIMESTAMP '2025-08-22 18:30:00.000000'"
+
+    def test_timestamp_offset_is_normalized_to_utc(self):
+        m = self._manager()
+        assert m._format_sql_value(
+            "2025-08-22T20:30:00+02:00", "TIMESTAMP(6)"
+        ) == "TIMESTAMP '2025-08-22 18:30:00.000000'"
+
+    def test_timestamp_with_time_zone_preserves_instant(self):
+        m = self._manager()
+        assert m._format_sql_value(
+            "2025-08-22T20:30:00+02:00", "TIMESTAMP(6) WITH TIME ZONE"
+        ) == "TIMESTAMP '2025-08-22 18:30:00.000000 UTC'"
+
+    def test_naive_timestamp_with_time_zone_is_explicitly_utc(self):
+        m = self._manager()
+        assert m._format_sql_value(
+            "2025-08-22 18:30:00", "TIMESTAMP WITH TIME ZONE"
+        ) == "TIMESTAMP '2025-08-22 18:30:00.000000 UTC'"
 
 
 class TestTrinoManagerRestartResilience:

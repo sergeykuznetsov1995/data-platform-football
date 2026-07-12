@@ -1,7 +1,8 @@
 -- =============================================================================
 -- Silver: whoscored_events_spadl
 -- =============================================================================
--- Normalises `iceberg.bronze.whoscored_events` (Opta-derived JSON, 39 distinct
+-- Normalises `iceberg.bronze.whoscored_events_current` (latest successful
+-- manifest batch per match; Opta-derived JSON, 39 distinct
 -- WhoScored type values, ~700K rows / season for APL) into a SPADL-shaped
 -- canonical action vocabulary plus a single proprietary supplement
 -- (`ball_recovery`).
@@ -19,7 +20,12 @@
 -- =============================================================================
 -- Output schema (frozen for E3 wave-1)
 -- =============================================================================
---   event_id              varchar     synthetic stable id (game_id || '_' || seq)
+--   event_id              varchar     source-backed stable id for v2 rows;
+--                                     legacy fallback = game_id || '_' || seq
+--   source_event_id_raw   varchar     global Opta `id` from matchCentreData
+--   team_event_id_raw     varchar     team-local Opta `eventId` sequence
+--   related_team_event_id_raw varchar  raw team-local `relatedEventId`; this is
+--                                     not a FK to source_event_id_raw
 --   match_id              varchar     CAST(game_id AS varchar)
 --   team_id_raw           varchar     bronze team_id (NOT resolved via xref —
 --                                     that is a Gold-job concern)
@@ -185,29 +191,42 @@
 --     credited as a shot to the deflecting defender.
 --   * CornerAwarded / OffsideProvoked / OffsideGiven: marker events with
 --     no SPADL action; mapped to 'unknown' to preserve event-count parity.
---   * BronZE re-scrape duplicates: deduplicated via ROW_NUMBER() over the
---     full natural key (15-col tuple verified unique on 2425 corpus —
---     166,453 rows / 166,453 distinct natural keys). Dedup ORDER BY
---     _ingested_at DESC keeps the most recent re-scrape.
+--   * Bronze current view exposes only successful logical commits. The V2
+--     migration already collapsed legacy re-scrape duplicates on the complete
+--     event natural key before seeding one successful manifest batch per game;
+--     new V2 commits require source_event_id = raw Opta `id`, reject duplicate
+--     global IDs and retain the distinct team-local `eventId` separately.
+--     Silver therefore preserves that strict-current row set one-for-one.
+--     Repeating the dedup here used a 20-column ROW_NUMBER partition key
+--     (including qualifiers JSON) and exhausted Trino's 8.3 GB heap at 28M
+--     rows while re-enforcing an upstream invariant.
 --   * Cross-source league/season/team-id resolution: NOT done here.
 --     Silver is a pure normaliser; xref join lives in Gold (E3.3 fct_event).
 --
 -- =============================================================================
 -- Verification status
 -- =============================================================================
---   * Bronze schema verified via DESCRIBE on 2026-05-08 (33 cols, type list
---     above matches).
+--   * Legacy Bronze schema verified via DESCRIBE on 2026-07-12; V2 adds the
+--     explicit global/team-local event identity fields described above.
 --   * 39 distinct `type` values verified; all 39 covered in CASE tree.
---   * event_id uniqueness verified: game_id || '_' || LPAD(seq,5,'0') yields
---     166,453 unique IDs on 166,453 rows (100% PK uniqueness).
---   * EXPLAIN parsability: TODO — execute via `make shell-trino` once SQL
---     is wrapped in CTAS by silver_tasks (this file is a SELECT-only fragment
---     and `EXPLAIN <SELECT>` will succeed standalone).
+--   * v2 event_id = 'ws:' || game_id || ':' || source_event_id. Historical
+--     rows with source_event_id=NULL retain the established game-local
+--     chronological sequence. This is the only remaining window: it partitions
+--     by (league, season, game_id), orders on seven narrow scalar columns, then
+--     breaks exact chronology ties with a 32-byte SHA-256 of the complete
+--     migration natural key. The hash excludes _ingested_at, so replay order
+--     and capture time cannot renumber legacy ids. It is an ORDER BY value only:
+--     the established game_id_00001 formula/format remains unchanged.
+--   * Native Trino EXPLAIN verified on 2026-07-11 with an outer
+--     (league, season) scope: the predicate reaches the Iceberg ScanFilter and
+--     the remaining window stays partitioned by one match.
 -- =============================================================================
 
-WITH src AS (
+WITH seq AS (
     SELECT
         game_id,
+        source_event_id,
+        team_event_id,
         period,
         minute,
         second,
@@ -221,52 +240,18 @@ WITH src AS (
         end_x,
         end_y,
         qualifiers,
-        related_event_id,
+        related_team_event_id,
         related_player_id,
         team,
         league,
         season,
         _ingested_at,
         ROW_NUMBER() OVER (
-            -- league/season lead the PARTITION BY on purpose: game_id is
-            -- unique per match so they change no dedup group, but they make
-            -- a backfill's outer WHERE league/season pushdown-legal through
-            -- the window — without them a single-partition INSERT window-sorts
-            -- the ENTIRE bronze table (heap-OOM'd Trino on the #913 WC run).
-            PARTITION BY
-                league, season,
-                game_id, period, minute, second, expanded_minute,
-                type, outcome_type, team_id, player_id,
-                x, y, end_x, end_y, qualifiers, related_event_id,
-                related_player_id, team
-            ORDER BY _ingested_at DESC
-        ) AS dedup_rn
-    FROM iceberg.bronze.whoscored_events
-),
-
-dedup AS (
-    SELECT *
-    FROM src
-    WHERE dedup_rn = 1
-),
-
-seq AS (
-    SELECT
-        *,
-        ROW_NUMBER() OVER (
-            -- league/season lead for the same pushdown reason as the dedup
-            -- window above: the backfill's outer WHERE must push through
-            -- EVERY window in the chain, or the whole bronze table is
-            -- window-sorted (this second window re-OOM'd the #913 WC run
-            -- after the first one was fixed). game_id is unique per match,
-            -- so the grouping is unchanged.
+            -- league/season lead the partition key so the E3 partition runner's
+            -- outer scope predicate can push below this window. game_id keeps
+            -- each partition bounded to one match (~1.5K rows), unlike the
+            -- removed 20-column corpus-wide dedup key containing qualifiers.
             PARTITION BY league, season, game_id
-            -- #477: period is VARCHAR; a raw `ORDER BY period` sorts it
-            -- lexically, which is only accidentally correct for FirstHalf/
-            -- SecondHalf. Cup matches with extra time / shootouts (e.g.
-            -- 'PenaltyShootout' < 'SecondHalf' lexically) would get a
-            -- non-monotonic event_seq. Map period → explicit chronological
-            -- ordinal so the sequence always follows real match time.
             ORDER BY
                 CASE period
                     WHEN 'PreMatch'                THEN 0
@@ -278,16 +263,47 @@ seq AS (
                     WHEN 'PostGame'                THEN 6
                     ELSE 99
                 END,
-                minute, second, expanded_minute, type, x, y
+                minute, second, expanded_minute, type, x, y,
+                -- The chronological fields above are not unique: two events
+                -- can share the same clock, type and start coordinates. Hash
+                -- the complete migration natural key as one fixed-width final
+                -- key instead of retaining its wide strings/qualifiers as
+                -- separate sort channels. _ingested_at is deliberately absent.
+                sha256(
+                    to_utf8(
+                        json_format(
+                            CAST(
+                                ROW(
+                                    league, season, game_id, source_event_id,
+                                    period, minute, second, expanded_minute,
+                                    type, outcome_type, team_id, player_id,
+                                    x, y, end_x, end_y, qualifiers,
+                                    related_team_event_id, related_player_id, team
+                                ) AS JSON
+                            )
+                        )
+                    )
+                )
         ) AS event_seq
-    FROM dedup
+    FROM iceberg.bronze.whoscored_events_current
 )
 
 SELECT
-    -- ========= Synthetic stable PK =========
-    CAST(game_id AS varchar)
-        || '_' || LPAD(CAST(event_seq AS varchar), 5, '0')   AS event_id,
+    -- ========= Source-backed stable PK with legacy fallback =========
+    CASE
+        WHEN source_event_id IS NOT NULL THEN
+            'ws:' || CAST(game_id AS varchar)
+                  || ':' || CAST(source_event_id AS varchar)
+        ELSE CAST(game_id AS varchar)
+                  || '_' || LPAD(CAST(event_seq AS varchar), 5, '0')
+    END                                                      AS event_id,
     CAST(game_id AS varchar)                                 AS match_id,
+
+    -- Keep the source relationship explicit instead of forcing consumers to
+    -- parse the canonical event_id string.
+    CAST(source_event_id AS varchar)                          AS source_event_id_raw,
+    CAST(team_event_id AS varchar)                            AS team_event_id_raw,
+    CAST(related_team_event_id AS varchar)                    AS related_team_event_id_raw,
 
     -- ========= Raw entity references (resolved in Gold via xref) =========
     -- bronze stores team_id / player_id as DOUBLE; direct CAST to varchar

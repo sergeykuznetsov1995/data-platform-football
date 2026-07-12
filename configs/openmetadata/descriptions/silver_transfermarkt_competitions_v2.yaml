@@ -1,0 +1,44 @@
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.transfermarkt_competitions_v2
+  description: |
+    Typed, latest-snapshot Transfermarkt competition registry deduplicated at
+    (competition_id) grain and natural key. Lineage is
+    bronze.transfermarkt_competitions, selected by discovered_at, ingest time,
+    batch, and body hash. Completeness and 24h active freshness are inherited
+    without weakening; review_required/conflict rows remain visible but are not
+    crawl-eligible.
+  tags: [Tier.Silver, Domain.Football, PII.None]
+columns:
+  - name: competition_id
+    description: Stable Transfermarkt competition code; natural key.
+  - name: canonical_competition_id
+    description: Cross-source competition id when resolved.
+  - name: competition_type
+    description: Validated competition-type classification.
+  - name: gender
+    description: Validated source-backed gender classification.
+  - name: team_type
+    description: Validated team-type classification.
+  - name: age_category
+    description: Validated senior/youth classification.
+  - name: season_format
+    description: Validated split_year or single_year season policy.
+  - name: classification_status
+    description: Only classified rows may enter the scope planner.
+  - name: discovered_at
+    description: Discovery freshness timestamp; active rows must be at most 24h old.
+  - name: source_body_hash
+    description: Bronze response hash propagated for lineage.
+  - name: fetched_at
+    description: Bronze source fetch timestamp propagated for lineage.
+  - name: cycle_id
+    description: Parent discovery-cycle lineage identifier.
+  - name: scope_id
+    description: Registry-snapshot lineage scope.
+  - name: _bronze_ingested_at
+    description: Winning Bronze ingest timestamp.
+relationships:
+  - from: trino_iceberg.iceberg.silver.transfermarkt_competitions_v2.competition_id
+    to: trino_iceberg.iceberg.bronze.transfermarkt_competitions.competition_id
+    type: FOREIGN_KEY
+    description: Typed and deduplicated directly from the Bronze registry.

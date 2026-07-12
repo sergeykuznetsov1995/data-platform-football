@@ -11,9 +11,8 @@ table:
     FBref ∩ Understat (INNER JOIN spine, design doc §8.3). SofaScore / WhoScored
     / FotMob (#97) — LEFT JOIN → diff = NULL при отсутствии записи.
 
-    WS-блок ожидаемо NULL для current seasons (2425/2526) — bridge
-    bronze.whoscored_schedule (team_id NUMERIC ↔ NAME) заполнен только для
-    season='2021'. Followup → issue #120 (canonical resolve в Silver).
+    WhoScored-команды резолвятся через bronze.whoscored_schedule_current
+    (team_id NUMERIC ↔ NAME); NULL означает отсутствие сопоставленной записи.
 
     Формула diff:
       * FBref-metric diff: fb.<metric> - <source>.<metric>
@@ -78,19 +77,19 @@ columns:
       Diff владения мячом (%): fb.possession - ss.possession_pct.
       Разные методологии (FBref считает на open-play, SS — total). Threshold ±5%.
 
-  # ─── WhoScored diff (LEFT JOIN → NULL ожидается для current seasons; #120) ───
+  # ─── WhoScored diff (LEFT JOIN → NULL при отсутствии записи) ───
   - name: shots_diff_ws
-    description: "Diff ударов: fb.shots - ws.shots_total. NULL для current seasons (#120)."
+    description: "Diff ударов: fb.shots - ws.shots_total. NULL при отсутствии WhoScored-записи."
   - name: shots_on_target_diff_ws
     description: |
       Diff ударов в створ: fb.shots_on_target - ws.shots_on_target_proxy.
       WS proxy = SPADL shot где _action_source_note IN ('SavedShot','Goal') —
       сейвы + забитые голы (#573); прокси vs точного fct_shot.
-      NULL для current seasons (#120).
+      NULL при отсутствии WhoScored-записи.
   - name: fouls_diff_ss_ws
     description: |
       Diff фолов: ss.fouls - ws.fouls_committed. FBref не отдаёт team-fouls на
-      match-grain → spine = SofaScore. NULL для current seasons (#120).
+      match-grain → spine = SofaScore. NULL при отсутствии WhoScored-записи.
 
   # ─── vs FotMob (#97, LEFT — NULL при отсутствии) ───
   - name: goals_for_diff_fm

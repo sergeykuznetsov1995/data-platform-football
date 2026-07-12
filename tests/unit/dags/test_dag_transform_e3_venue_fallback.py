@@ -54,6 +54,35 @@ class TestVenueFallbackConfig:
         assert fb["fallback_sql_file"] == "dags/sql/silver/sofascore_venue_empty.sql"
         assert fb["require_bronze"] == ["sofascore_venue"]
 
+    def test_spadl_uses_partition_staged_runner(self, e3):
+        version_sql = e3.WHOSCORED_EVENTS_SOURCE_VERSION_SQL
+        config = e3.SILVER_E3_PARTITION_STAGED["whoscored_events_spadl"]
+        assert config == {
+            "partition_source_table":
+                "iceberg.bronze.whoscored_events_current",
+            "source_version_sql": version_sql,
+        }
+        assert version_sql == (
+            "SELECT league, season, game_id, batch_id\n"
+            "FROM iceberg.bronze.whoscored_match_ingest_latest_success\n"
+            "ORDER BY league, season, game_id, batch_id"
+        )
+
+        from airflow.operators.python import PythonOperator
+
+        task = next(
+            op for op in PythonOperator._instances
+            if op.task_id == "silver_e3.whoscored_events_spadl"
+        )
+        assert task.op_kwargs["partition_source_table"] == (
+            "iceberg.bronze.whoscored_events_current"
+        )
+        assert task.op_kwargs["source_version_sql"] == version_sql
+        timeout = e3.SILVER_E3_TASK_OVERRIDES["whoscored_events_spadl"][
+            "execution_timeout"
+        ]
+        assert timeout.total_seconds() == 8 * 60 * 60
+
 
 class TestRunSilverE3GracefulDegrade:
     def test_missing_bronze_uses_fallback_sql(self, e3, monkeypatch):
@@ -97,3 +126,61 @@ class TestRunSilverE3GracefulDegrade:
             table_name="understat_team_match",
         )
         assert calls == ["dags/sql/silver/understat_team_match.sql"]
+
+    def test_spadl_routes_only_to_partition_staged_runner(self, e3, monkeypatch):
+        regular_calls = []
+        staged_calls = []
+        fake = _fake_silver_tasks(bronze_exists=True, calls=regular_calls)
+
+        def run_staged(
+            sql_file,
+            table_name,
+            source_table,
+            source_version_sql,
+            schema="silver",
+            **kw,
+        ):
+            staged_calls.append((
+                sql_file,
+                table_name,
+                source_table,
+                source_version_sql,
+                schema,
+            ))
+            return {"rows": 28, "table": f"iceberg.{schema}.{table_name}"}
+
+        fake.run_silver_transform_partition_staged = run_staged
+        monkeypatch.setitem(sys.modules, "utils.silver_tasks", fake)
+
+        result = e3._run_silver_e3(
+            sql_file="dags/sql/silver/whoscored_events_spadl.sql",
+            table_name="whoscored_events_spadl",
+            partition_source_table=(
+                "iceberg.bronze.whoscored_events_current"
+            ),
+            source_version_sql=e3.WHOSCORED_EVENTS_SOURCE_VERSION_SQL,
+        )
+
+        assert regular_calls == []
+        assert staged_calls == [(
+            "dags/sql/silver/whoscored_events_spadl.sql",
+            "whoscored_events_spadl",
+            "iceberg.bronze.whoscored_events_current",
+            e3.WHOSCORED_EVENTS_SOURCE_VERSION_SQL,
+            "silver",
+        )]
+        assert result["rows"] == 28
+
+    def test_partition_staged_route_requires_source_version(self, e3, monkeypatch):
+        fake = _fake_silver_tasks(bronze_exists=True, calls=[])
+        fake.run_silver_transform_partition_staged = lambda **kw: None
+        monkeypatch.setitem(sys.modules, "utils.silver_tasks", fake)
+
+        with pytest.raises(ValueError, match="requires source_version_sql"):
+            e3._run_silver_e3(
+                sql_file="dags/sql/silver/whoscored_events_spadl.sql",
+                table_name="whoscored_events_spadl",
+                partition_source_table=(
+                    "iceberg.bronze.whoscored_events_current"
+                ),
+            )

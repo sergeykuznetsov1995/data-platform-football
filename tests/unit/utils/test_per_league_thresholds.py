@@ -80,9 +80,8 @@ class TestEquivalenceWithMasterConstants:
         # for every call without a league scope.
         from utils.config import MIN_ROW_THRESHOLDS
         assert MIN_ROW_THRESHOLDS == {
-            'whoscored_schedule': 2040,   # 340 * 6 WHOSCORED_LEAGUES
+            'whoscored_schedule': 340,    # dynamic scopes validate separately
             'whoscored_events': 20_000_000,
-            'whoscored_player_profile': 300,
             'espn_schedule': 340,
             'espn_lineup': 9000,
             'espn_matchsheet': 620,

@@ -69,6 +69,15 @@ class TestFotMobScraperUnit:
 
         assert result == {'data': 'test'}
         mock_scraper._session.get.assert_called()
+        assert mock_scraper.get_stats()['requests'] == 1
+        assert mock_scraper.get_stats()['http_requests_count'] == 1
+
+    def test_real_session_never_inherits_environment_proxies(self, scraper_class):
+        scraper = scraper_class(leagues=['ENG-Premier League'], seasons=[2025])
+        session = scraper._get_session()
+        assert session.trust_env is False
+        assert session.proxies == {}
+        scraper.close()
 
     def test_fetch_api_json_absolute_url(self, mock_scraper):
         """Absolute http(s) endpoints bypass API_BASE (used for fetchAllUrl)."""
@@ -233,7 +242,7 @@ class TestFotMobScraperUnit:
             assert 'away_team' in df.columns
             assert df.iloc[0]['home_team'] == 'Arsenal'
             assert df.iloc[0]['home_score'] == 2
-            assert df.iloc[0]['is_finished'] == True
+        assert bool(df.iloc[0]['is_finished']) is True
 
     def test_read_schedule_no_league(self, mock_scraper):
         """Test schedule with unknown league."""
@@ -448,7 +457,8 @@ class TestFotMobScraperUnit:
         assert row['country_code'] == 'ENG'
         assert row['stat_category_header'] == 'FotMob rating'
         assert row['stat_name'] == 'rating_team'
-        assert row['team_name'] is None or pd.isna(row['team_name'])  # no TeamName key
+        # Team leaderboards use ParticipantName; FotMob does not emit TeamName.
+        assert row['team_name'] == 'Arsenal'
 
     def test_read_transfers(self, mock_scraper):
         """transfers flattens position/transferType, picks euro estimate fee."""
@@ -473,7 +483,7 @@ class TestFotMobScraperUnit:
         assert row['transfer_type_key'] == 'contract'
         assert row['transfer_type_text'] == 'contract'
         assert row['market_value'] == '362217'
-        assert row['on_loan'] == False
+        assert bool(row['on_loan']) is False
 
     def test_read_match_details(self, mock_scraper):
         """match_details maps a finished match's _next/data content to JSON cols."""
@@ -506,6 +516,26 @@ class TestFotMobScraperUnit:
         assert row['lineup_json'] == '{"a": 1}'
         assert row['events_json'] == '[{"e": 1}]'
         assert row['page_url'].startswith('/matches/')
+
+    def test_finished_fixture_page_url_avoids_redundant_match_header_request(
+        self, mock_scraper
+    ):
+        league_data = {'fixtures': {'allMatches': [{
+            'id': 4813374,
+            'pageUrl': '/matches/liverpool-vs-bournemouth/x#4813374',
+            'status': {'finished': True},
+            'home': {'id': 1, 'name': 'Liverpool'},
+            'away': {'id': 2, 'name': 'Bournemouth'},
+        }]}}
+        payload = {'content': {'matchFacts': {'events': []}, 'stats': {'x': 1}}}
+        with patch.object(mock_scraper, '_get_league_data', return_value=league_data), \
+             patch.object(mock_scraper, '_fetch_api_json', return_value=payload) as fetch:
+            frame = mock_scraper.read_match_details('ENG-Premier League', 2025)
+
+        assert frame is not None and len(frame) == 1
+        fetch.assert_called_once_with(
+            'matchDetails', params={'matchId': '4813374'}
+        )
 
     def test_read_player_details(self, mock_scraper):
         """player_details maps pageProps.data scalars + JSON columns."""

@@ -708,6 +708,119 @@ def test_real_config_savinho_alias_resolves(real_config_dir):
     ) == "fe6e7156"
 
 
+def test_player_alias_legacy_entry_defaults_to_map(mock_config_dir):
+    path = mock_config_dir.CONFIG_DIR / "player_aliases.yaml"
+    path.write_text(
+        "aliases:\n"
+        "  - source: transfermarkt\n"
+        "    source_id: '42'\n"
+        "    fbref_player_id: 'abcdef12'\n"
+        "    season: '*'\n"
+    )
+    mock_config_dir.reset_cache()
+
+    assert mock_config_dir.get_player_alias(
+        "transfermarkt", "42", "2526"
+    ) == "abcdef12"
+    assert mock_config_dir.get_player_alias_rule(
+        "transfermarkt", "42", "2526"
+    ) == {"action": "map", "fbref_player_id": "abcdef12"}
+
+
+def test_player_alias_exact_orphan_beats_wildcard_map(mock_config_dir):
+    path = mock_config_dir.CONFIG_DIR / "player_aliases.yaml"
+    path.write_text(
+        "aliases:\n"
+        "  - source: transfermarkt\n"
+        "    source_id: '42'\n"
+        "    action: map\n"
+        "    fbref_player_id: 'abcdef12'\n"
+        "    season: '*'\n"
+        "  - source: transfermarkt\n"
+        "    source_id: '42'\n"
+        "    action: orphan\n"
+        "    season: '2324'\n"
+    )
+    mock_config_dir.reset_cache()
+
+    assert mock_config_dir.get_player_alias(
+        "transfermarkt", "42", "2324"
+    ) is None
+    assert mock_config_dir.get_player_alias_rule(
+        "transfermarkt", "42", "2324"
+    ) == {"action": "orphan", "fbref_player_id": None}
+    assert mock_config_dir.get_player_alias(
+        "transfermarkt", "42", "2425"
+    ) == "abcdef12"
+
+
+@pytest.mark.parametrize(
+    "body, error",
+    [
+        (
+            "aliases:\n"
+            "  - source: transfermarkt\n"
+            "    source_id: '42'\n"
+            "    action: merge\n"
+            "    season: '*'\n",
+            "action must be 'map' or 'orphan'",
+        ),
+        (
+            "aliases:\n"
+            "  - source: transfermarkt\n"
+            "    source_id: '42'\n"
+            "    action: map\n"
+            "    season: '*'\n",
+            "fbref_player_id.*action='map'",
+        ),
+        (
+            "aliases:\n"
+            "  - source: transfermarkt\n"
+            "    source_id: '42'\n"
+            "    action: orphan\n"
+            "    fbref_player_id: 'abcdef12'\n"
+            "    season: '*'\n",
+            "fbref_player_id must be omitted.*action='orphan'",
+        ),
+    ],
+)
+def test_player_alias_action_schema_validation(
+    mock_config_dir, body, error,
+):
+    (mock_config_dir.CONFIG_DIR / "player_aliases.yaml").write_text(body)
+    mock_config_dir.reset_cache()
+
+    with pytest.raises(mock_config_dir.MedallionConfigError, match=error):
+        mock_config_dir.load_player_aliases()
+
+
+@pytest.mark.parametrize(
+    "source_id, season",
+    [
+        ("1000135", "2324"),
+        ("1000626", "2324"),
+        ("364405", "1920"),
+        ("707271", "2223"),
+    ],
+)
+def test_real_config_dob_negative_overrides(real_config_dir, source_id, season):
+    assert real_config_dir.get_player_alias_rule(
+        "transfermarkt", source_id, season
+    ) == {"action": "orphan", "fbref_player_id": None}
+    assert real_config_dir.get_player_alias(
+        "transfermarkt", source_id, season
+    ) is None
+
+
+def test_real_config_dob_positive_override_is_global(real_config_dir):
+    assert real_config_dir.get_player_alias(
+        "transfermarkt", "277118", "1920"
+    ) == "6ed1a2a2"
+    assert real_config_dir.get_player_alias(
+        "transfermarkt", "277118", "2526"
+    ) == "6ed1a2a2"
+
+
 class TestGetActiveSingleYearSeason:
     """#920 bridge: ingest runners substitute the tournament year for
     single_year competitions while [start, end + grace] contains today."""

@@ -5,7 +5,7 @@ table:
   fullyQualifiedName: trino_iceberg.iceberg.silver.whoscored_player_match_aggregate
   description: |
     Статистика игрока за матч из WhoScored — один row на
-    (match_id, player_id, team_id, league, season). Источник: bronze.whoscored_events,
+    (match_id, player_id, team_id, league, season). Источник: bronze.whoscored_events_current,
     дедуп re-scrape'ов (ROW_NUMBER по натуральному ключу события ORDER BY
     _ingested_at DESC), затем GROUP BY игрок+матч с COUNT_IF по сырым Opta-типам
     (goals, shots, passes, отборы, дисциплина, касания). Сырые WhoScored id

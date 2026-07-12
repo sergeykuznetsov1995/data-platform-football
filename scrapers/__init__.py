@@ -17,7 +17,7 @@ _EXPORTS = {
     "IcebergWriter": ("scrapers.base.iceberg_writer", "IcebergWriter"),
     "FotMobScraper": ("scrapers.fotmob", "FotMobScraper"),
     "MatchHistoryScraper": ("scrapers.matchhistory", "MatchHistoryScraper"),
-    "WhoScoredScraper": ("scrapers.whoscored", "WhoScoredScraper"),
+    "WhoScoredIngestService": ("scrapers.whoscored", "WhoScoredIngestService"),
 }
 
 __all__ = list(_EXPORTS)
