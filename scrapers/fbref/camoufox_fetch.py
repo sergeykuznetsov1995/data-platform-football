@@ -204,6 +204,11 @@ class CamoufoxFbrefTransport:
         self._navigation_attempts = 0
         self._budget_blocked_count = 0
         self._inflight_byte_reservations: Dict[int, int] = {}
+        # Playwright/Firefox may hand a *different* Request wrapper to the
+        # response/finished callbacks than the one seen by route(), so the
+        # reservation is also indexed by request URL to survive re-wrapping.
+        self._inflight_request_urls: Dict[int, str] = {}
+        self._inflight_ids_by_url: Dict[str, list] = {}
         self._inflight_reserved_bytes = 0
         self._unobserved_reserved_bytes = 0
         self._byte_budget_exhausted = False
@@ -326,8 +331,69 @@ class CamoufoxFbrefTransport:
         return False
 
     # -- byte accounting / blocking --------------------------------------- #
+    @staticmethod
+    def _request_url(req) -> Optional[str]:
+        try:
+            url = req.url
+        except Exception:  # noqa: BLE001 — detached requests have no url
+            return None
+        return str(url) if url else None
+
+    def _track_reservation(self, req, reservation: int) -> None:
+        key = id(req)
+        self._inflight_byte_reservations[key] = reservation
+        self._inflight_reserved_bytes += reservation
+        url = self._request_url(req)
+        if url is not None:
+            self._inflight_request_urls[key] = url
+            self._inflight_ids_by_url.setdefault(url, []).append(key)
+
+    def _forget_reservation(self, key: int) -> int:
+        reserved = self._inflight_byte_reservations.pop(key, 0)
+        url = self._inflight_request_urls.pop(key, None)
+        if url is not None:
+            keys = self._inflight_ids_by_url.get(url)
+            if keys:
+                try:
+                    keys.remove(key)
+                except ValueError:
+                    pass
+                if not keys:
+                    self._inflight_ids_by_url.pop(url, None)
+        return reserved
+
+    def _reservation_key(self, req) -> Optional[int]:
+        """Reservation key for ``req``, re-keying a re-wrapped request by URL.
+
+        The route callback and the response/finished callbacks can receive
+        different Python wrappers for the same in-flight request, so identity
+        alone loses the reservation and would fail the session closed.
+        """
+        key = id(req)
+        if key in self._inflight_byte_reservations:
+            return key
+        url = self._request_url(req)
+        if url is None:
+            return None
+        keys = self._inflight_ids_by_url.get(url)
+        if not keys:
+            return None
+        stale_key = keys[0]
+        reserved = self._inflight_byte_reservations.pop(stale_key, 0)
+        self._inflight_request_urls.pop(stale_key, None)
+        keys.pop(0)
+        if not keys:
+            self._inflight_ids_by_url.pop(url, None)
+        self._inflight_byte_reservations[key] = reserved
+        self._inflight_request_urls[key] = url
+        self._inflight_ids_by_url.setdefault(url, []).append(key)
+        return key
+
     def _release_byte_reservation(self, req) -> int:
-        reserved = self._inflight_byte_reservations.pop(id(req), 0)
+        key = self._reservation_key(req)
+        if key is None:
+            return 0
+        reserved = self._forget_reservation(key)
         self._inflight_reserved_bytes = max(
             0, self._inflight_reserved_bytes - reserved
         )
@@ -422,9 +488,9 @@ class CamoufoxFbrefTransport:
             # interrupted requests still consumed one global network attempt.
             self._network_requests_started += 1
             if self._max_network_bytes is not None:
-                reservation = BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
-                self._inflight_byte_reservations[id(req)] = reservation
-                self._inflight_reserved_bytes += reservation
+                self._track_reservation(
+                    req, BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
+                )
             route.continue_()
         except Exception:  # noqa: BLE001 — fail closed at the proxy boundary
             if req is not None:
@@ -450,26 +516,21 @@ class CamoufoxFbrefTransport:
         except Exception:  # noqa: BLE001 — fail closed in _on_response
             return {}
 
-    def _reserve_redirect_hop(self, req) -> Optional[int]:
-        """Reserve fixed overhead for a server-redirect hop, or return None.
+    def _adopt_unrouted_request(self, req) -> Optional[int]:
+        """Charge an in-flight request that ``route()`` never reserved.
 
-        Only requests that Playwright links to a tracked chain via
-        ``redirected_from`` qualify; the hop consumes a request slot and the
-        standard fixed overhead against the same caps as a routed request.
-        A hop that would cross either cap aborts the whole session, because
-        unlike ``route()`` there is no way to refuse it before transport.
+        Server redirects are not re-routed by Playwright, and Firefox can hand
+        the response callbacks a request the route callback never saw. Such a
+        request is still real proxy traffic, so it consumes a request slot and
+        the same fixed overhead as a routed one, enforced against the same
+        caps. Only a cap breach aborts the session — unlike ``route()`` there
+        is no way to refuse the transfer before transport.
         """
-        try:
-            redirected_from = getattr(req, "redirected_from", None)
-        except Exception:  # noqa: BLE001 — fail closed on detached requests
-            return None
-        if redirected_from is None:
-            return None
         if (
             self._max_network_requests is not None
             and self._network_requests_started >= self._max_network_requests
         ):
-            self._abort_session_for_byte_budget("redirect_hop_over_request_cap")
+            self._abort_session_for_byte_budget("unrouted_request_over_request_cap")
             return None
         reservation = BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
         projected = (
@@ -479,11 +540,10 @@ class CamoufoxFbrefTransport:
             + reservation
         )
         if projected > self._max_network_bytes:
-            self._abort_session_for_byte_budget("redirect_hop_over_byte_cap")
+            self._abort_session_for_byte_budget("unrouted_request_over_byte_cap")
             return None
         self._network_requests_started += 1
-        self._inflight_byte_reservations[id(req)] = reservation
-        self._inflight_reserved_bytes += reservation
+        self._track_reservation(req, reservation)
         return reservation
 
     def _on_response(self, response) -> None:
@@ -495,20 +555,14 @@ class CamoufoxFbrefTransport:
         if req is None:
             self._abort_session_for_byte_budget("response_without_request")
             return
-        reservation_key = id(req)
-        fixed = self._inflight_byte_reservations.get(reservation_key)
-        if fixed is None:
-            # Playwright does not re-run ``route()`` for server redirects: the
-            # follow-up hop arrives as a new request object with no
-            # reservation.  The hop is still real proxy traffic, so it must
-            # pass the same request/byte caps and reserve the same fixed
-            # overhead as a routed request; anything that is not a genuine
-            # redirect continuation stays fail-closed below.
-            fixed = self._reserve_redirect_hop(req)
+        reservation_key = self._reservation_key(req)
+        if reservation_key is None:
+            fixed = self._adopt_unrouted_request(req)
             if fixed is None:
-                if not self._byte_budget_exhausted:
-                    self._abort_session_for_byte_budget("untracked_response")
-                return
+                return  # a cap breach already aborted the session
+            reservation_key = id(req)
+        else:
+            fixed = self._inflight_byte_reservations[reservation_key]
 
         headers = self._response_headers(response)
         transfer_encoding = headers.get("transfer-encoding", "")
