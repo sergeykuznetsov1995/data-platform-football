@@ -1,0 +1,491 @@
+{
+  "expected_competition_ids": [
+    "AFCN",
+    "CL",
+    "FIWC",
+    "GB1",
+    "GB1R",
+    "GB1W",
+    "MYSTERY",
+    "U21EC",
+    "UNLA"
+  ],
+  "pages": [
+    {
+      "snapshot_id": "fixture-2026-07-11",
+      "page_number": 1,
+      "page_count": 2,
+      "source_url": "https://www.transfermarkt.com/navigation/wettbewerbe?page=1",
+      "source_body_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+      "competitions": [
+        {
+          "competition_id": "GB1",
+          "slug": "premier-league",
+          "name": "Premier League",
+          "country": "England",
+          "confederation": "UEFA",
+          "competition_type": "domestic_league",
+          "gender": "men",
+          "team_type": "club",
+          "age_category": "senior",
+          "season_format": "split_year",
+          "active": true,
+          "source_url": "https://www.transfermarkt.com/premier-league/startseite/wettbewerb/GB1",
+          "discovered_at": "2026-07-11T00:00:00+00:00",
+          "canonical_competition_id": "ENG-Premier League",
+          "aliases": ["English Premier League"],
+          "evidence": [
+            {
+              "field": "competition_context",
+              "value": "domestic_league:club",
+              "source_url": "https://www.transfermarkt.com/premier-league/startseite/wettbewerb/GB1",
+              "origin": "source_page",
+              "signals": {"competition_type": "domestic_league", "team_type": "club"}
+            },
+            {
+              "field": "competition_audience",
+              "value": "men:senior",
+              "source_url": "https://www.transfermarkt.com/premier-league/startseite/wettbewerb/GB1",
+              "origin": "structured",
+              "signals": {"gender": "men", "age_category": "senior"}
+            },
+            {
+              "field": "season_selector",
+              "value": "2025/26",
+              "source_url": "https://www.transfermarkt.com/premier-league/startseite/wettbewerb/GB1",
+              "origin": "structured",
+              "signals": {"season_format": "split_year"}
+            }
+          ]
+        },
+        {
+          "competition_id": "CL",
+          "slug": "uefa-champions-league",
+          "name": "UEFA Champions League",
+          "country": "Europe",
+          "confederation": "UEFA",
+          "competition_type": "continental_club",
+          "gender": "men",
+          "team_type": "club",
+          "age_category": "senior",
+          "season_format": "split_year",
+          "active": true,
+          "source_url": "https://www.transfermarkt.com/uefa-champions-league/startseite/pokalwettbewerb/CL",
+          "discovered_at": "2026-07-11T00:00:00+00:00",
+          "canonical_competition_id": "UEFA-Champions League",
+          "evidence": [
+            {
+              "field": "competition_context",
+              "value": "continental_club:club",
+              "source_url": "https://www.transfermarkt.com/uefa-champions-league/startseite/pokalwettbewerb/CL",
+              "origin": "source_page",
+              "signals": {"competition_type": "continental_club", "team_type": "club"}
+            },
+            {
+              "field": "competition_audience",
+              "value": "men:senior",
+              "source_url": "https://www.transfermarkt.com/uefa-champions-league/startseite/pokalwettbewerb/CL",
+              "origin": "structured",
+              "signals": {"gender": "men", "age_category": "senior"}
+            },
+            {
+              "field": "season_selector",
+              "value": "2025/26",
+              "source_url": "https://www.transfermarkt.com/uefa-champions-league/startseite/pokalwettbewerb/CL",
+              "origin": "structured",
+              "signals": {"season_format": "split_year"}
+            }
+          ]
+        },
+        {
+          "competition_id": "GB1W",
+          "slug": "womens-super-league",
+          "name": "Women's Super League",
+          "country": "England",
+          "confederation": "UEFA",
+          "competition_type": "domestic_league",
+          "gender": "women",
+          "team_type": "club",
+          "age_category": "senior",
+          "season_format": "split_year",
+          "active": true,
+          "source_url": "https://www.transfermarkt.com/womens-super-league/startseite/wettbewerb/GB1W",
+          "discovered_at": "2026-07-11T00:00:00+00:00",
+          "evidence": [
+            {
+              "field": "competition_context",
+              "value": "domestic_league:club",
+              "source_url": "https://www.transfermarkt.com/womens-super-league/startseite/wettbewerb/GB1W",
+              "origin": "source_page",
+              "signals": {"competition_type": "domestic_league", "team_type": "club"}
+            },
+            {
+              "field": "competition_audience",
+              "value": "women:senior",
+              "source_url": "https://www.transfermarkt.com/womens-super-league/startseite/wettbewerb/GB1W",
+              "origin": "structured",
+              "signals": {"gender": "women", "age_category": "senior"}
+            },
+            {
+              "field": "season_selector",
+              "value": "2025/26",
+              "source_url": "https://www.transfermarkt.com/womens-super-league/startseite/wettbewerb/GB1W",
+              "origin": "structured",
+              "signals": {"season_format": "split_year"}
+            }
+          ]
+        },
+        {
+          "competition_id": "MYSTERY",
+          "slug": "mystery-league",
+          "name": "Men's Senior Mystery League",
+          "country": "Unknown",
+          "confederation": "Unknown",
+          "competition_type": "domestic_league",
+          "gender": "men",
+          "team_type": "club",
+          "age_category": "senior",
+          "season_format": "split_year",
+          "active": true,
+          "source_url": "https://www.transfermarkt.com/mystery-league/startseite/wettbewerb/MYSTERY",
+          "discovered_at": "2026-07-11T00:00:00+00:00",
+          "evidence": [
+            {
+              "field": "name",
+              "value": "Men's Senior Mystery League",
+              "source_url": "https://www.transfermarkt.com/mystery-league/startseite/wettbewerb/MYSTERY",
+              "origin": "name",
+              "signals": {
+                "competition_type": "domestic_league",
+                "gender": "men",
+                "team_type": "club",
+                "age_category": "senior",
+                "season_format": "split_year"
+              }
+            }
+          ]
+        }
+      ],
+      "editions": [
+        {
+          "competition_id": "GB1",
+          "edition_id": "2025",
+          "edition_label": "2025/26",
+          "season_format": "split_year",
+          "start_date": "2025-08-15",
+          "end_date": "2026-05-24",
+          "active": true,
+          "current": true,
+          "participant_count": 20,
+          "participant_hash": "gb1-participants-2025",
+          "source_url": "https://www.transfermarkt.com/premier-league/startseite/wettbewerb/GB1/plus/?saison_id=2025",
+          "discovered_at": "2026-07-11T00:00:00+00:00"
+        },
+        {
+          "competition_id": "CL",
+          "edition_id": "2025",
+          "edition_label": "2025/26",
+          "season_format": "split_year",
+          "start_date": "2025-07-08",
+          "end_date": "2026-05-30",
+          "active": true,
+          "current": true,
+          "participant_count": 36,
+          "participant_hash": "cl-participants-2025",
+          "source_url": "https://www.transfermarkt.com/uefa-champions-league/startseite/pokalwettbewerb/CL/saison_id/2025",
+          "discovered_at": "2026-07-11T00:00:00+00:00"
+        },
+        {
+          "competition_id": "GB1W",
+          "edition_id": "2025",
+          "edition_label": "2025/26",
+          "season_format": "split_year",
+          "active": true,
+          "current": true,
+          "participant_count": 12,
+          "participant_hash": "gb1w-participants-2025",
+          "source_url": "https://www.transfermarkt.com/womens-super-league/startseite/wettbewerb/GB1W/saison_id/2025",
+          "discovered_at": "2026-07-11T00:00:00+00:00"
+        },
+        {
+          "competition_id": "MYSTERY",
+          "edition_id": "2025",
+          "edition_label": "2025/26",
+          "season_format": "split_year",
+          "active": true,
+          "current": true,
+          "participant_count": null,
+          "participant_hash": null,
+          "source_url": "https://www.transfermarkt.com/mystery-league/startseite/wettbewerb/MYSTERY/saison_id/2025",
+          "discovered_at": "2026-07-11T00:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "snapshot_id": "fixture-2026-07-11",
+      "page_number": 2,
+      "page_count": 2,
+      "source_url": "https://www.transfermarkt.com/navigation/wettbewerbe?page=2",
+      "source_body_hash": "2222222222222222222222222222222222222222222222222222222222222222",
+      "competitions": [
+        {
+          "competition_id": "AFCN",
+          "slug": "afrika-cup",
+          "name": "Africa Cup of Nations",
+          "country": "Africa",
+          "confederation": "CAF",
+          "competition_type": "national_team_tournament",
+          "gender": "men",
+          "team_type": "national_team",
+          "age_category": "senior",
+          "season_format": "single_year",
+          "active": true,
+          "source_url": "https://www.transfermarkt.com/afrika-cup/startseite/pokalwettbewerb/AFCN",
+          "discovered_at": "2026-07-11T00:00:00+00:00",
+          "evidence": [
+            {
+              "field": "competition_context",
+              "value": "national_team_tournament:national_team",
+              "source_url": "https://www.transfermarkt.com/afrika-cup/startseite/pokalwettbewerb/AFCN",
+              "origin": "source_page",
+              "signals": {"competition_type": "national_team_tournament", "team_type": "national_team"}
+            },
+            {
+              "field": "competition_audience",
+              "value": "men:senior",
+              "source_url": "https://www.transfermarkt.com/afrika-cup/startseite/pokalwettbewerb/AFCN",
+              "origin": "structured",
+              "signals": {"gender": "men", "age_category": "senior"}
+            },
+            {
+              "field": "season_selector",
+              "value": "2025",
+              "source_url": "https://www.transfermarkt.com/afrika-cup/startseite/pokalwettbewerb/AFCN",
+              "origin": "structured",
+              "signals": {"season_format": "single_year"}
+            }
+          ]
+        },
+        {
+          "competition_id": "UNLA",
+          "slug": "uefa-nations-league-a",
+          "name": "UEFA Nations League A",
+          "country": "Europe",
+          "confederation": "UEFA",
+          "competition_type": "national_team_tournament",
+          "gender": "men",
+          "team_type": "national_team",
+          "age_category": "senior",
+          "season_format": "split_year",
+          "active": true,
+          "source_url": "https://www.transfermarkt.com/uefa-nations-league-a/startseite/pokalwettbewerb/UNLA",
+          "discovered_at": "2026-07-11T00:00:00+00:00",
+          "evidence": [
+            {
+              "field": "competition_context",
+              "value": "national_team_tournament:national_team",
+              "source_url": "https://www.transfermarkt.com/uefa-nations-league-a/startseite/pokalwettbewerb/UNLA",
+              "origin": "source_page",
+              "signals": {"competition_type": "national_team_tournament", "team_type": "national_team"}
+            },
+            {
+              "field": "competition_audience",
+              "value": "men:senior",
+              "source_url": "https://www.transfermarkt.com/uefa-nations-league-a/startseite/pokalwettbewerb/UNLA",
+              "origin": "structured",
+              "signals": {"gender": "men", "age_category": "senior"}
+            },
+            {
+              "field": "season_selector",
+              "value": "2026/27",
+              "source_url": "https://www.transfermarkt.com/uefa-nations-league-a/startseite/pokalwettbewerb/UNLA",
+              "origin": "structured",
+              "signals": {"season_format": "split_year"}
+            }
+          ]
+        },
+        {
+          "competition_id": "FIWC",
+          "slug": "world-cup",
+          "name": "FIFA World Cup",
+          "country": "World",
+          "confederation": "FIFA",
+          "competition_type": "national_team_tournament",
+          "gender": "men",
+          "team_type": "national_team",
+          "age_category": "senior",
+          "season_format": "single_year",
+          "active": true,
+          "source_url": "https://www.transfermarkt.com/world-cup/startseite/wettbewerb/FIWC",
+          "discovered_at": "2026-07-11T00:00:00+00:00",
+          "canonical_competition_id": "INT-World Cup",
+          "evidence": [
+            {
+              "field": "competition_context",
+              "value": "national_team_tournament:national_team",
+              "source_url": "https://www.transfermarkt.com/world-cup/startseite/wettbewerb/FIWC",
+              "origin": "source_page",
+              "signals": {"competition_type": "national_team_tournament", "team_type": "national_team"}
+            },
+            {
+              "field": "competition_audience",
+              "value": "men:senior",
+              "source_url": "https://www.transfermarkt.com/world-cup/startseite/wettbewerb/FIWC",
+              "origin": "structured",
+              "signals": {"gender": "men", "age_category": "senior"}
+            },
+            {
+              "field": "season_selector",
+              "value": "2026",
+              "source_url": "https://www.transfermarkt.com/world-cup/startseite/wettbewerb/FIWC",
+              "origin": "structured",
+              "signals": {"season_format": "single_year"}
+            }
+          ]
+        },
+        {
+          "competition_id": "U21EC",
+          "slug": "uefa-under-21-championship",
+          "name": "UEFA European Under-21 Championship",
+          "country": "Europe",
+          "confederation": "UEFA",
+          "competition_type": "national_team_tournament",
+          "gender": "men",
+          "team_type": "national_team",
+          "age_category": "uxx",
+          "season_format": "single_year",
+          "active": true,
+          "source_url": "https://www.transfermarkt.com/uefa-under-21-championship/startseite/pokalwettbewerb/U21EC",
+          "discovered_at": "2026-07-11T00:00:00+00:00",
+          "evidence": [
+            {
+              "field": "competition_context",
+              "value": "national_team_tournament:national_team",
+              "source_url": "https://www.transfermarkt.com/uefa-under-21-championship/startseite/pokalwettbewerb/U21EC",
+              "origin": "source_page",
+              "signals": {"competition_type": "national_team_tournament", "team_type": "national_team"}
+            },
+            {
+              "field": "competition_audience",
+              "value": "men:under_21",
+              "source_url": "https://www.transfermarkt.com/uefa-under-21-championship/startseite/pokalwettbewerb/U21EC",
+              "origin": "structured",
+              "signals": {"gender": "men", "age_category": "uxx"}
+            },
+            {
+              "field": "season_selector",
+              "value": "2025",
+              "source_url": "https://www.transfermarkt.com/uefa-under-21-championship/startseite/pokalwettbewerb/U21EC",
+              "origin": "structured",
+              "signals": {"season_format": "single_year"}
+            }
+          ]
+        },
+        {
+          "competition_id": "GB1R",
+          "slug": "premier-reserve-league",
+          "name": "Premier Reserve League",
+          "country": "England",
+          "confederation": "UEFA",
+          "competition_type": "domestic_league",
+          "gender": "men",
+          "team_type": "reserve",
+          "age_category": "senior",
+          "season_format": "split_year",
+          "active": true,
+          "source_url": "https://www.transfermarkt.com/premier-reserve-league/startseite/wettbewerb/GB1R",
+          "discovered_at": "2026-07-11T00:00:00+00:00",
+          "evidence": [
+            {
+              "field": "competition_context",
+              "value": "domestic_league:reserve",
+              "source_url": "https://www.transfermarkt.com/premier-reserve-league/startseite/wettbewerb/GB1R",
+              "origin": "source_page",
+              "signals": {"competition_type": "domestic_league", "team_type": "reserve"}
+            },
+            {
+              "field": "competition_audience",
+              "value": "men:senior",
+              "source_url": "https://www.transfermarkt.com/premier-reserve-league/startseite/wettbewerb/GB1R",
+              "origin": "structured",
+              "signals": {"gender": "men", "age_category": "senior"}
+            },
+            {
+              "field": "season_selector",
+              "value": "2025/26",
+              "source_url": "https://www.transfermarkt.com/premier-reserve-league/startseite/wettbewerb/GB1R",
+              "origin": "structured",
+              "signals": {"season_format": "split_year"}
+            }
+          ]
+        }
+      ],
+      "editions": [
+        {
+          "competition_id": "AFCN",
+          "edition_id": "2025",
+          "edition_label": "2025",
+          "season_format": "single_year",
+          "start_date": "2025-12-21",
+          "end_date": "2026-01-18",
+          "active": true,
+          "current": true,
+          "participant_count": 24,
+          "participant_hash": "afcn-participants-2025",
+          "source_url": "https://www.transfermarkt.com/afrika-cup/startseite/pokalwettbewerb/AFCN/saison_id/2025",
+          "discovered_at": "2026-07-11T00:00:00+00:00"
+        },
+        {
+          "competition_id": "UNLA",
+          "edition_id": "2026",
+          "edition_label": "2026/27",
+          "season_format": "split_year",
+          "active": true,
+          "current": true,
+          "participant_count": 16,
+          "participant_hash": "unla-participants-2026",
+          "source_url": "https://www.transfermarkt.com/uefa-nations-league-a/teilnehmer/pokalwettbewerb/UNLA/saison_id/2026",
+          "discovered_at": "2026-07-11T00:00:00+00:00"
+        },
+        {
+          "competition_id": "FIWC",
+          "edition_id": "2026",
+          "edition_label": "2026",
+          "season_format": "single_year",
+          "start_date": "2026-06-11",
+          "end_date": "2026-07-19",
+          "active": true,
+          "current": true,
+          "participant_count": 48,
+          "participant_hash": "fiwc-participants-2026",
+          "source_url": "https://www.transfermarkt.com/world-cup/startseite/wettbewerb/FIWC/saison_id/2026",
+          "discovered_at": "2026-07-11T00:00:00+00:00"
+        },
+        {
+          "competition_id": "U21EC",
+          "edition_id": "2025",
+          "edition_label": "2025",
+          "season_format": "single_year",
+          "active": true,
+          "current": true,
+          "participant_count": 16,
+          "participant_hash": "u21ec-participants-2025",
+          "source_url": "https://www.transfermarkt.com/uefa-under-21-championship/startseite/pokalwettbewerb/U21EC/saison_id/2025",
+          "discovered_at": "2026-07-11T00:00:00+00:00"
+        },
+        {
+          "competition_id": "GB1R",
+          "edition_id": "2025",
+          "edition_label": "2025/26",
+          "season_format": "split_year",
+          "active": true,
+          "current": true,
+          "participant_count": 20,
+          "participant_hash": "gb1r-participants-2025",
+          "source_url": "https://www.transfermarkt.com/premier-reserve-league/startseite/wettbewerb/GB1R/saison_id/2025",
+          "discovered_at": "2026-07-11T00:00:00+00:00"
+        }
+      ]
+    }
+  ]
+}

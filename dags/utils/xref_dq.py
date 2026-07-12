@@ -887,10 +887,11 @@ def report_orphan_teams(
 # Cross-source DOB conflicts (companion to the resolver's name_team_dob tier)
 # ---------------------------------------------------------------------------
 
-#: Bronze DOB projections per source: (source, SQL yielding (source_id, dob)).
-#: Mirrors xref_player_resolver._fetch_dob_maps (Bronze only — silver profile
-#: tables depend on xref_player, reading them here would be circular). Trino
-#: dialect; tests inject DuckDB-compatible projections instead.
+#: Source DOB projections: (source, SQL yielding (source_id, dob)). Raw Bronze
+#: is used where it is the stable contract. WhoScored uses its manifest-backed
+#: current view; Transfermarkt uses its state-selected canonical reader. Neither
+#: reader depends on xref_player, so these projections introduce no cycle.
+#: Trino dialect; tests inject DuckDB-compatible projections instead.
 DEFAULT_PLAYER_DOB_PROJECTIONS = (
     ('fotmob',
      "SELECT CAST(player_id AS varchar) AS source_id, "
@@ -904,8 +905,9 @@ DEFAULT_PLAYER_DOB_PROJECTIONS = (
      "GROUP BY CAST(player_id AS varchar)"),
     ('transfermarkt',
      "SELECT CAST(player_id AS varchar) AS source_id, "
-     "max_by(dob, _ingested_at) AS dob "
-     "FROM iceberg.bronze.transfermarkt_players WHERE player_id IS NOT NULL "
+     "max_by(dob, _bronze_ingested_at) AS dob "
+     "FROM iceberg.silver.transfermarkt_players "
+     "WHERE player_id IS NOT NULL "
      "GROUP BY CAST(player_id AS varchar)"),
     ('sofifa',
      "SELECT CAST(player_id AS varchar) AS source_id, "
@@ -914,10 +916,10 @@ DEFAULT_PLAYER_DOB_PROJECTIONS = (
      "WHERE player_id IS NOT NULL AND dob IS NOT NULL "
      "GROUP BY CAST(player_id AS varchar)"),
     ('whoscored',
-     "SELECT CAST(CAST(player_id AS bigint) AS varchar) AS source_id, "
-     "max_by(TRY_CAST(date_of_birth AS DATE), _ingested_at) AS dob "
-     "FROM iceberg.bronze.whoscored_player_profile WHERE player_id IS NOT NULL "
-     "GROUP BY CAST(CAST(player_id AS bigint) AS varchar)"),
+     "SELECT CAST(player_id AS varchar) AS source_id, "
+     "max_by(date_of_birth, fetched_at) AS dob "
+     "FROM iceberg.silver.whoscored_player_profile_current "
+     "WHERE player_id IS NOT NULL GROUP BY CAST(player_id AS varchar)"),
 )
 
 
@@ -1016,9 +1018,10 @@ def evaluate_manager_dob_collisions(
     the reviewer sees which tier produced the link). Candidates for a
     ``manager_aliases.yaml`` correction.
 
-    Reads the two profile silver tables (not Bronze): unlike the player DOB
-    maps this is NOT circular — fotmob_manager_profile / transfermarkt_coaches
-    do not consume xref_manager.
+    Reads stable canonical Silver readers, never a physical ``_v2`` table.
+    The state-selected Transfermarkt v2 compatibility adapter retains the
+    legacy-shaped (coach_id, league, season) contract required by this scoped
+    comparison. Neither profile reader consumes xref_manager.
 
     Returns ``{'collisions': N, 'rows': [...≤limit], 'truncated': bool,
     'verdict': 'OK'|'WARNING'}`` — never escalates to ERROR.
@@ -1129,7 +1132,7 @@ def evaluate_bronze_xref_freshness_gap(
     Args:
         bronze_tables: Iterable of (source_label, qualified_bronze_table).
             Defaults to Understat + FotMob; WhoScored excluded because the
-            resolver reads players from ``bronze.whoscored_events`` which is
+            resolver reads players from ``bronze.whoscored_events_current`` which is
             too large to scan freshness-per-season cheaply.
         xref_table: Iceberg table whose snapshot timestamp represents the
             last successful resolver run.

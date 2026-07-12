@@ -1,0 +1,13 @@
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.transfermarkt_market_value_points
+  description: |
+    Global Transfermarkt market-value career timeline. Grain is
+    (player_id, mv_date); scrape league and season are intentionally absent.
+  tags: [Tier.Bronze, Domain.Football, PII.Low]
+columns:
+  - name: player_id
+    description: Global Transfermarkt player id; natural-key component.
+  - name: mv_date
+    description: Valuation date; natural-key component.
+  - name: value_eur
+    description: Market value in EUR.

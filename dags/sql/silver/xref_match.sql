@@ -130,7 +130,7 @@ ws_resolved AS (
         xt_h.canonical_id                                              AS home_canonical_id,
         xt_a.canonical_id                                              AS away_canonical_id,
         CONCAT(s.home_team, ' vs ', s.away_team)                       AS display_name
-    FROM iceberg.bronze.whoscored_schedule s
+    FROM iceberg.bronze.whoscored_schedule_current s
     LEFT JOIN iceberg.silver.xref_team xt_h
            ON xt_h.source    = 'whoscored'
           AND xt_h.source_id = s.home_team

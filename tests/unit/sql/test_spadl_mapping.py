@@ -26,12 +26,14 @@ Coverage
 * Goalkeeper actions (Save / KeeperSweeper / Smother / Punch / Claim / ...).
 * Meta / marker events → 'unknown' + confidence='unmappable'.
 * Confidence label cascade (high / medium / low / unmappable).
-* Synthetic ``event_id`` uniqueness within a game.
+* Source-backed V2 and stable chronological legacy ``event_id`` contracts.
+* Strict-current row parity and removal of the redundant wide dedup window.
 * Enum completeness vs ``utils.e3_dq.SPADL_ACTION_ENUM``.
 """
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 import sys
@@ -62,17 +64,19 @@ def _translate_trino_to_duckdb(sql: str) -> str:
     """Adapt the Silver SQL for execution on DuckDB.
 
     Adjustments:
-      * ``iceberg.bronze.whoscored_events`` → ``bronze_whoscored_events``
+      * ``iceberg.bronze.whoscored_events_current`` → fixture table
         (single-namespace table seeded by the fixture).
       * ``regexp_like(<col>, <pat>)`` → ``regexp_matches(<col>, <pat>)`` —
         DuckDB's idiomatic spelling. Both treat the second argument as a
         POSIX-extended regex, so ``\\s*`` etc. work identically.
+      * Trino's ``sha256(to_utf8(json_format(CAST(ROW(...) AS JSON))))``
+        tie-breaker → DuckDB's equivalent SHA-256 over ``json_array(...)``.
       * ``LPAD`` / ``TRY_CAST`` / ``ROW_NUMBER OVER`` / ``COALESCE`` —
         already DuckDB-compatible, no rewrite needed.
     """
     # 1. Source table reference.
     sql = sql.replace(
-        "iceberg.bronze.whoscored_events",
+        "iceberg.bronze.whoscored_events_current",
         "bronze_whoscored_events",
     )
 
@@ -84,6 +88,21 @@ def _translate_trino_to_duckdb(sql: str) -> str:
         flags=re.IGNORECASE,
     )
 
+    # 3. Trino hashes VARBINARY and therefore needs to_utf8/json_format around
+    # the typed ROW. DuckDB's sha256 accepts VARCHAR directly; json_array keeps
+    # nulls, value boundaries and the migration-key field order deterministic.
+    sql, hash_rewrites = re.subn(
+        r"sha256\s*\(\s*to_utf8\s*\(\s*json_format\s*\(\s*"
+        r"CAST\s*\(\s*ROW\s*\((?P<fields>[a-z0-9_,\s]+?)\)\s*"
+        r"AS\s+JSON\s*\)\s*\)\s*\)\s*\)",
+        lambda match: (
+            "sha256(CAST(json_array(" + match.group("fields") + ") AS VARCHAR))"
+        ),
+        sql,
+        flags=re.IGNORECASE,
+    )
+    assert hash_rewrites == 1, "expected one legacy event-id SHA-256 tie-breaker"
+
     return sql
 
 
@@ -92,19 +111,63 @@ def _read_sql() -> str:
 
 
 # Bronze schema mirrors the columns the Silver SELECT consumes from
-# ``iceberg.bronze.whoscored_events`` (per file header L189-L216).
+# ``iceberg.bronze.whoscored_events_current`` (per the Silver SELECT contract).
 _BRONZE_COLUMNS: List[str] = [
-    "game_id", "period", "minute", "second", "expanded_minute",
-    "type", "outcome_type", "team_id", "player_id",
-    "x", "y", "end_x", "end_y",
-    "qualifiers", "related_event_id", "related_player_id", "team",
-    "league", "season", "_ingested_at",
+    "game_id",
+    "source_event_id",
+    "team_event_id",
+    "period",
+    "minute",
+    "second",
+    "expanded_minute",
+    "type",
+    "outcome_type",
+    "team_id",
+    "player_id",
+    "x",
+    "y",
+    "end_x",
+    "end_y",
+    "qualifiers",
+    "related_team_event_id",
+    "related_player_id",
+    "team",
+    "league",
+    "season",
+    "_ingested_at",
 ]
+
+# Must stay byte-for-byte aligned with scripts.migrate_whoscored_v2.EVENT_KEY.
+# The order is part of the JSON-array hash contract, not merely set membership.
+_MIGRATION_EVENT_NATURAL_KEY = (
+    "league",
+    "season",
+    "game_id",
+    "source_event_id",
+    "period",
+    "minute",
+    "second",
+    "expanded_minute",
+    "type",
+    "outcome_type",
+    "team_id",
+    "player_id",
+    "x",
+    "y",
+    "end_x",
+    "end_y",
+    "qualifiers",
+    "related_event_id",
+    "related_player_id",
+    "team",
+)
 
 
 def _row(
     *,
     game_id: int = 100,
+    source_event_id: Optional[int] = None,
+    team_event_id: Optional[int] = None,
     period: str = "FirstHalf",
     minute: int = 5,
     second: int = 12,
@@ -118,7 +181,7 @@ def _row(
     end_x: Optional[float] = 60.0,
     end_y: Optional[float] = 50.0,
     qualifiers: Optional[str] = None,
-    related_event_id: Optional[int] = None,
+    related_team_event_id: Optional[int] = None,
     related_player_id: Optional[int] = None,
     team: str = "Arsenal",
     league: str = "ENG-Premier League",
@@ -128,6 +191,8 @@ def _row(
     """Build a single bronze fixture row with sensible defaults."""
     return {
         "game_id": game_id,
+        "source_event_id": source_event_id,
+        "team_event_id": team_event_id,
         "period": period,
         "minute": minute,
         "second": second,
@@ -136,9 +201,12 @@ def _row(
         "outcome_type": outcome_type,
         "team_id": team_id,
         "player_id": player_id,
-        "x": x, "y": y, "end_x": end_x, "end_y": end_y,
+        "x": x,
+        "y": y,
+        "end_x": end_x,
+        "end_y": end_y,
         "qualifiers": qualifiers,
-        "related_event_id": related_event_id,
+        "related_team_event_id": related_team_event_id,
         "related_player_id": related_player_id,
         "team": team,
         "league": league,
@@ -178,6 +246,8 @@ def _seed_and_run(con, fixture_rows: List[Dict[str, Any]]) -> List[Dict[str, Any
         """
         CREATE TABLE bronze_whoscored_events (
             game_id           BIGINT,
+            source_event_id    BIGINT,
+            team_event_id      BIGINT,
             period            VARCHAR,
             minute            BIGINT,
             second            BIGINT,
@@ -191,7 +261,7 @@ def _seed_and_run(con, fixture_rows: List[Dict[str, Any]]) -> List[Dict[str, Any
             end_x             DOUBLE,
             end_y             DOUBLE,
             qualifiers        VARCHAR,
-            related_event_id  BIGINT,
+            related_team_event_id BIGINT,
             related_player_id DOUBLE,
             team              VARCHAR,
             league            VARCHAR,
@@ -227,78 +297,116 @@ class TestPassRouting:
     """Pass + qualifier → SPADL action_canonical mapping."""
 
     def test_throw_in(self, duck_conn):
-        out = _seed_and_run(duck_conn, [
-            _row(type_="Pass", qualifiers=_qualifiers_json(["ThrowIn"])),
-        ])
+        out = _seed_and_run(
+            duck_conn,
+            [
+                _row(type_="Pass", qualifiers=_qualifiers_json(["ThrowIn"])),
+            ],
+        )
         assert out[0]["action_canonical"] == "throw_in"
         assert out[0]["_action_confidence"] == "medium"
 
     def test_goalkick(self, duck_conn):
-        out = _seed_and_run(duck_conn, [
-            _row(type_="Pass", qualifiers=_qualifiers_json(["GoalKick"])),
-        ])
+        out = _seed_and_run(
+            duck_conn,
+            [
+                _row(type_="Pass", qualifiers=_qualifiers_json(["GoalKick"])),
+            ],
+        )
         assert out[0]["action_canonical"] == "goalkick"
 
     def test_corner_crossed(self, duck_conn):
         """CornerTaken + Cross → corner_crossed."""
-        out = _seed_and_run(duck_conn, [
-            _row(type_="Pass", qualifiers=_qualifiers_json(["CornerTaken", "Cross"])),
-        ])
+        out = _seed_and_run(
+            duck_conn,
+            [
+                _row(
+                    type_="Pass", qualifiers=_qualifiers_json(["CornerTaken", "Cross"])
+                ),
+            ],
+        )
         assert out[0]["action_canonical"] == "corner_crossed"
 
     def test_corner_short(self, duck_conn):
         """CornerTaken without Cross → corner_short."""
-        out = _seed_and_run(duck_conn, [
-            _row(type_="Pass", qualifiers=_qualifiers_json(["CornerTaken"])),
-        ])
+        out = _seed_and_run(
+            duck_conn,
+            [
+                _row(type_="Pass", qualifiers=_qualifiers_json(["CornerTaken"])),
+            ],
+        )
         assert out[0]["action_canonical"] == "corner_short"
 
     def test_freekick_crossed(self, duck_conn):
-        out = _seed_and_run(duck_conn, [
-            _row(type_="Pass", qualifiers=_qualifiers_json(["FreekickTaken", "Cross"])),
-        ])
+        out = _seed_and_run(
+            duck_conn,
+            [
+                _row(
+                    type_="Pass",
+                    qualifiers=_qualifiers_json(["FreekickTaken", "Cross"]),
+                ),
+            ],
+        )
         assert out[0]["action_canonical"] == "freekick_crossed"
 
     def test_freekick_short(self, duck_conn):
-        out = _seed_and_run(duck_conn, [
-            _row(type_="Pass", qualifiers=_qualifiers_json(["FreekickTaken"])),
-        ])
+        out = _seed_and_run(
+            duck_conn,
+            [
+                _row(type_="Pass", qualifiers=_qualifiers_json(["FreekickTaken"])),
+            ],
+        )
         assert out[0]["action_canonical"] == "freekick_short"
 
     def test_open_cross(self, duck_conn):
         """Cross qualifier (no other) → cross."""
-        out = _seed_and_run(duck_conn, [
-            _row(type_="Pass", qualifiers=_qualifiers_json(["Cross"])),
-        ])
+        out = _seed_and_run(
+            duck_conn,
+            [
+                _row(type_="Pass", qualifiers=_qualifiers_json(["Cross"])),
+            ],
+        )
         assert out[0]["action_canonical"] == "cross"
 
     def test_default_no_qualifiers(self, duck_conn):
         """Pass with NULL qualifiers → 'pass' fallback (medium confidence)."""
-        out = _seed_and_run(duck_conn, [
-            _row(type_="Pass", qualifiers=None),
-        ])
+        out = _seed_and_run(
+            duck_conn,
+            [
+                _row(type_="Pass", qualifiers=None),
+            ],
+        )
         assert out[0]["action_canonical"] == "pass"
         assert out[0]["_action_confidence"] == "medium"
 
     def test_empty_qualifiers_string(self, duck_conn):
         """Pass with empty-string qualifiers → 'pass' fallback."""
-        out = _seed_and_run(duck_conn, [
-            _row(type_="Pass", qualifiers=""),
-        ])
+        out = _seed_and_run(
+            duck_conn,
+            [
+                _row(type_="Pass", qualifiers=""),
+            ],
+        )
         assert out[0]["action_canonical"] == "pass"
 
     def test_empty_array_qualifiers(self, duck_conn):
         """Pass with '[]' literal → 'pass' fallback (per CASE branch)."""
-        out = _seed_and_run(duck_conn, [
-            _row(type_="Pass", qualifiers="[]"),
-        ])
+        out = _seed_and_run(
+            duck_conn,
+            [
+                _row(type_="Pass", qualifiers="[]"),
+            ],
+        )
         assert out[0]["action_canonical"] == "pass"
 
     def test_offside_pass(self, duck_conn):
         """OffsidePass type → 'pass' (still pass, low confidence)."""
-        out = _seed_and_run(duck_conn, [
-            _row(type_="OffsidePass", qualifiers=None),
-        ])
+        out = _seed_and_run(
+            duck_conn,
+            [
+                _row(type_="OffsidePass", qualifiers=None),
+            ],
+        )
         assert out[0]["action_canonical"] == "pass"
         assert out[0]["_action_confidence"] == "low"
 
@@ -311,15 +419,18 @@ class TestPassRouting:
 class TestDirectMatches:
     """type → action_canonical direct CASE branches (high confidence)."""
 
-    @pytest.mark.parametrize("ws_type, expected", [
-        ("Foul", "foul"),
-        ("TakeOn", "take_on"),
-        ("Tackle", "tackle"),
-        ("Interception", "interception"),
-        ("BlockedPass", "interception"),
-        ("Challenge", "tackle"),
-        ("Clearance", "clearance"),
-    ])
+    @pytest.mark.parametrize(
+        "ws_type, expected",
+        [
+            ("Foul", "foul"),
+            ("TakeOn", "take_on"),
+            ("Tackle", "tackle"),
+            ("Interception", "interception"),
+            ("BlockedPass", "interception"),
+            ("Challenge", "tackle"),
+            ("Clearance", "clearance"),
+        ],
+    )
     def test_high_confidence_direct_routes(self, duck_conn, ws_type, expected):
         out = _seed_and_run(duck_conn, [_row(type_=ws_type)])
         assert out[0]["action_canonical"] == expected
@@ -369,28 +480,40 @@ class TestAerialPaired:
 class TestShotSubtypes:
     """Shot variants resolve to shot / shot_freekick / shot_penalty by qualifier."""
 
-    @pytest.mark.parametrize("ws_type", ["SavedShot", "MissedShots", "ShotOnPost", "Goal"])
+    @pytest.mark.parametrize(
+        "ws_type", ["SavedShot", "MissedShots", "ShotOnPost", "Goal"]
+    )
     def test_shot_default(self, duck_conn, ws_type):
         out = _seed_and_run(duck_conn, [_row(type_=ws_type, qualifiers=None)])
         assert out[0]["action_canonical"] == "shot"
 
-    @pytest.mark.parametrize("ws_type", ["SavedShot", "MissedShots", "ShotOnPost", "Goal"])
+    @pytest.mark.parametrize(
+        "ws_type", ["SavedShot", "MissedShots", "ShotOnPost", "Goal"]
+    )
     def test_shot_penalty(self, duck_conn, ws_type):
-        out = _seed_and_run(duck_conn, [
-            _row(type_=ws_type, qualifiers=_qualifiers_json(["Penalty"])),
-        ])
+        out = _seed_and_run(
+            duck_conn,
+            [
+                _row(type_=ws_type, qualifiers=_qualifiers_json(["Penalty"])),
+            ],
+        )
         assert out[0]["action_canonical"] == "shot_penalty"
 
-    @pytest.mark.parametrize("ws_type", ["SavedShot", "MissedShots", "ShotOnPost", "Goal"])
+    @pytest.mark.parametrize(
+        "ws_type", ["SavedShot", "MissedShots", "ShotOnPost", "Goal"]
+    )
     def test_shot_freekick(self, duck_conn, ws_type):
         """DirectFreekick qualifier on shot → shot_freekick.
 
         Free-kick *shots* carry `DirectFreekick`; `FreekickTaken` only tags the
         pass set-piece and never appears on a shot event.
         """
-        out = _seed_and_run(duck_conn, [
-            _row(type_=ws_type, qualifiers=_qualifiers_json(["DirectFreekick"])),
-        ])
+        out = _seed_and_run(
+            duck_conn,
+            [
+                _row(type_=ws_type, qualifiers=_qualifiers_json(["DirectFreekick"])),
+            ],
+        )
         assert out[0]["action_canonical"] == "shot_freekick"
 
     def test_chance_missed_routes_to_shot(self, duck_conn):
@@ -410,27 +533,37 @@ class TestOwnGoal:
     the scorer is not credited with a shot. Plain Goals stay 'shot' (#462)."""
 
     def test_own_goal_routes_to_own_goal(self, duck_conn):
-        out = _seed_and_run(duck_conn, [
-            _row(type_="Goal", qualifiers=_qualifiers_json(["OwnGoal"])),
-        ])
+        out = _seed_and_run(
+            duck_conn,
+            [
+                _row(type_="Goal", qualifiers=_qualifiers_json(["OwnGoal"])),
+            ],
+        )
         assert out[0]["action_canonical"] == "own_goal"
 
     def test_plain_goal_still_routes_to_shot(self, duck_conn):
         """Guard against over-matching: a Goal without the OwnGoal qualifier
         must still land in the shot family (#462 behaviour preserved)."""
-        out = _seed_and_run(duck_conn, [
-            _row(type_="Goal", qualifiers=None),
-        ])
+        out = _seed_and_run(
+            duck_conn,
+            [
+                _row(type_="Goal", qualifiers=None),
+            ],
+        )
         assert out[0]["action_canonical"] == "shot"
 
     def test_own_goal_in_enum(self, duck_conn):
         """'own_goal' must be a registered SPADL_ACTION_ENUM value or the
         DQ enum-violation guard would hard-fail on it."""
         from utils.e3_dq import SPADL_ACTION_ENUM
+
         assert "own_goal" in SPADL_ACTION_ENUM
-        out = _seed_and_run(duck_conn, [
-            _row(type_="Goal", qualifiers=_qualifiers_json(["OwnGoal"])),
-        ])
+        out = _seed_and_run(
+            duck_conn,
+            [
+                _row(type_="Goal", qualifiers=_qualifiers_json(["OwnGoal"])),
+            ],
+        )
         assert out[0]["action_canonical"] in set(SPADL_ACTION_ENUM)
 
 
@@ -440,16 +573,19 @@ class TestOwnGoal:
 
 
 class TestGoalkeeperActions:
-    @pytest.mark.parametrize("ws_type, expected", [
-        ("Save", "keeper_save"),
-        ("KeeperSweeper", "keeper_save"),
-        ("Smother", "keeper_save"),
-        ("PenaltyFaced", "keeper_save"),
-        ("KeeperPickup", "keeper_pick_up"),
-        ("Punch", "keeper_punch"),
-        ("Claim", "keeper_claim"),
-        ("CrossNotClaimed", "keeper_claim"),
-    ])
+    @pytest.mark.parametrize(
+        "ws_type, expected",
+        [
+            ("Save", "keeper_save"),
+            ("KeeperSweeper", "keeper_save"),
+            ("Smother", "keeper_save"),
+            ("PenaltyFaced", "keeper_save"),
+            ("KeeperPickup", "keeper_pick_up"),
+            ("Punch", "keeper_punch"),
+            ("Claim", "keeper_claim"),
+            ("CrossNotClaimed", "keeper_claim"),
+        ],
+    )
     def test_keeper_action_routing(self, duck_conn, ws_type, expected):
         out = _seed_and_run(duck_conn, [_row(type_=ws_type)])
         assert out[0]["action_canonical"] == expected
@@ -465,9 +601,12 @@ class TestBallTouchAndDribbleVariants:
 
     def test_ball_touch_unsuccessful(self, duck_conn):
         """BallTouch with outcome_type='Unsuccessful' → bad_touch."""
-        out = _seed_and_run(duck_conn, [
-            _row(type_="BallTouch", outcome_type="Unsuccessful"),
-        ])
+        out = _seed_and_run(
+            duck_conn,
+            [
+                _row(type_="BallTouch", outcome_type="Unsuccessful"),
+            ],
+        )
         assert out[0]["action_canonical"] == "bad_touch"
         assert out[0]["outcome_success"] is False
 
@@ -475,18 +614,24 @@ class TestBallTouchAndDribbleVariants:
         """BallTouch with outcome_type='Successful' → bad_touch (parity-preserving;
         R3.D2 originally proposed dropping but kept for row-count parity).
         """
-        out = _seed_and_run(duck_conn, [
-            _row(type_="BallTouch", outcome_type="Successful"),
-        ])
+        out = _seed_and_run(
+            duck_conn,
+            [
+                _row(type_="BallTouch", outcome_type="Successful"),
+            ],
+        )
         assert out[0]["action_canonical"] == "bad_touch"
         assert out[0]["outcome_success"] is True
 
-    @pytest.mark.parametrize("ws_type, expected", [
-        ("Dispossessed", "bad_touch"),
-        ("Error", "bad_touch"),
-        ("ShieldBallOpp", "dribble"),
-        ("GoodSkill", "dribble"),
-    ])
+    @pytest.mark.parametrize(
+        "ws_type, expected",
+        [
+            ("Dispossessed", "bad_touch"),
+            ("Error", "bad_touch"),
+            ("ShieldBallOpp", "dribble"),
+            ("GoodSkill", "dribble"),
+        ],
+    )
     def test_dribble_and_bad_touch_routes(self, duck_conn, ws_type, expected):
         out = _seed_and_run(duck_conn, [_row(type_=ws_type)])
         assert out[0]["action_canonical"] == expected
@@ -549,14 +694,33 @@ class TestSchemaVersionLiterals:
 # ---------------------------------------------------------------------------
 
 
-class TestSyntheticEventId:
-    """event_id = game_id || '_' || LPAD(event_seq, 5, '0') is unique per game."""
+class TestStableEventId:
+    """V2 uses source IDs; migrated legacy rows retain sequence IDs."""
 
-    def test_event_id_format(self, duck_conn):
-        out = _seed_and_run(duck_conn, [
-            _row(game_id=200, minute=1, second=0, type_="Pass"),
-        ])
-        # LPAD(1, 5, '0') = '00001' with the dedup ROW_NUMBER assigning event_seq=1
+    def test_source_event_id_is_preferred(self, duck_conn):
+        out = _seed_and_run(
+            duck_conn,
+            [
+                _row(
+                    game_id=200,
+                    source_event_id=98765,
+                    team_event_id=65,
+                    related_team_event_id=64,
+                ),
+            ],
+        )
+        assert out[0]["event_id"] == "ws:200:98765"
+        assert out[0]["source_event_id_raw"] == "98765"
+        assert out[0]["team_event_id_raw"] == "65"
+        assert out[0]["related_team_event_id_raw"] == "64"
+
+    def test_legacy_event_id_format(self, duck_conn):
+        out = _seed_and_run(
+            duck_conn,
+            [
+                _row(game_id=200, minute=1, second=0, type_="Pass"),
+            ],
+        )
         assert out[0]["event_id"] == "200_00001"
 
     def test_event_id_unique_per_game(self, duck_conn):
@@ -577,9 +741,24 @@ class TestSyntheticEventId:
             _row(game_id=302, minute=1, second=0, type_="Pass"),
         ]
         out = _seed_and_run(duck_conn, rows)
-        # Same minute/second but different games → different event_id prefixes.
+        # Same minute/second but different games have different id prefixes.
         prefixes = {r["event_id"].split("_")[0] for r in out}
         assert prefixes == {"301", "302"}
+
+    def test_legacy_id_is_stable_across_ingest_timestamp(self, duck_conn):
+        older = _seed_and_run(
+            duck_conn,
+            [
+                _row(game_id=303, minute=12, ingested_at="2026-05-01 10:00:00"),
+            ],
+        )[0]["event_id"]
+        newer = _seed_and_run(
+            duck_conn,
+            [
+                _row(game_id=303, minute=12, ingested_at="2026-07-11 10:00:00"),
+            ],
+        )[0]["event_id"]
+        assert older == newer
 
     def test_match_id_is_varchar_game_id(self, duck_conn):
         out = _seed_and_run(duck_conn, [_row(game_id=400)])
@@ -597,9 +776,12 @@ class TestRawPassthroughColumns736:
     of bronze. Values are byte-for-byte the bronze columns (ids double-cast)."""
 
     def test_minute_and_second_passthrough(self, duck_conn):
-        out = _seed_and_run(duck_conn, [
-            _row(game_id=500, minute=47, second=12, type_="Pass"),
-        ])
+        out = _seed_and_run(
+            duck_conn,
+            [
+                _row(game_id=500, minute=47, second=12, type_="Pass"),
+            ],
+        )
         assert out[0]["minute"] == 47
         assert out[0]["second"] == 12
 
@@ -619,31 +801,39 @@ class TestRawPassthroughColumns736:
 
 
 # ---------------------------------------------------------------------------
-# Deduplication of bronze re-scrapes (ROW_NUMBER on natural key)
+# Strict-current row parity
 # ---------------------------------------------------------------------------
 
 
-class TestBronzeDedup:
-    """When two bronze rows share the full natural key, only the freshest survives."""
+class TestStrictCurrentParity:
+    """Silver is a one-for-one projection of the manifest-current view."""
 
-    def test_keeps_latest_ingested(self, duck_conn):
-        # Same natural key (15-col tuple) but different _ingested_at timestamps.
+    def test_does_not_hide_upstream_contract_violation(self, duck_conn):
+        # The migration/current-view contract prevents this duplicate in
+        # production. If it ever regresses, Silver must preserve both rows so
+        # it remains observable instead of silently deduplicating 28M rows.
         rows = [
             _row(
-                game_id=500, minute=1, second=0,
-                type_="Pass", qualifiers=_qualifiers_json(["Cross"]),
+                game_id=500,
+                minute=1,
+                second=0,
+                type_="Pass",
+                qualifiers=_qualifiers_json(["Cross"]),
                 ingested_at="2026-05-01 10:00:00",
             ),
             _row(
-                game_id=500, minute=1, second=0,
-                type_="Pass", qualifiers=_qualifiers_json(["Cross"]),
+                game_id=500,
+                minute=1,
+                second=0,
+                type_="Pass",
+                qualifiers=_qualifiers_json(["Cross"]),
                 ingested_at="2026-05-08 10:00:00",  # newer
             ),
         ]
         out = _seed_and_run(duck_conn, rows)
-        # Dedup collapses the duplicate.
-        assert len(out) == 1
-        assert out[0]["action_canonical"] == "cross"
+        assert len(out) == len(rows)
+        assert {r["action_canonical"] for r in out} == {"cross"}
+        assert len({r["event_id"] for r in out}) == len(rows)
 
 
 # ---------------------------------------------------------------------------
@@ -654,42 +844,45 @@ class TestBronzeDedup:
 class TestConfidenceCascade:
     """The confidence label distribution per file header L342-364."""
 
-    @pytest.mark.parametrize("ws_type, conf", [
-        ("Foul", "high"),
-        ("TakeOn", "high"),
-        ("Tackle", "high"),
-        ("Interception", "high"),
-        ("BlockedPass", "high"),
-        ("Challenge", "high"),
-        ("Clearance", "high"),
-        ("Save", "high"),
-        ("KeeperPickup", "high"),
-        ("Claim", "high"),
-        ("Punch", "high"),
-        ("Smother", "high"),
-        ("Pass", "medium"),
-        ("Aerial", "medium"),
-        ("BallTouch", "medium"),
-        ("Dispossessed", "medium"),
-        ("SavedShot", "medium"),
-        ("MissedShots", "medium"),
-        ("ShotOnPost", "medium"),
-        ("Goal", "medium"),
-        ("KeeperSweeper", "medium"),
-        ("GoodSkill", "medium"),
-        ("CrossNotClaimed", "medium"),
-        ("BallRecovery", "low"),
-        ("OffsidePass", "low"),
-        ("Error", "low"),
-        ("ShieldBallOpp", "low"),
-        ("PenaltyFaced", "low"),
-        ("ChanceMissed", "low"),
-        # unmappable — sample
-        ("Card", "unmappable"),
-        ("Start", "unmappable"),
-        ("End", "unmappable"),
-        ("FormationChange", "unmappable"),
-    ])
+    @pytest.mark.parametrize(
+        "ws_type, conf",
+        [
+            ("Foul", "high"),
+            ("TakeOn", "high"),
+            ("Tackle", "high"),
+            ("Interception", "high"),
+            ("BlockedPass", "high"),
+            ("Challenge", "high"),
+            ("Clearance", "high"),
+            ("Save", "high"),
+            ("KeeperPickup", "high"),
+            ("Claim", "high"),
+            ("Punch", "high"),
+            ("Smother", "high"),
+            ("Pass", "medium"),
+            ("Aerial", "medium"),
+            ("BallTouch", "medium"),
+            ("Dispossessed", "medium"),
+            ("SavedShot", "medium"),
+            ("MissedShots", "medium"),
+            ("ShotOnPost", "medium"),
+            ("Goal", "medium"),
+            ("KeeperSweeper", "medium"),
+            ("GoodSkill", "medium"),
+            ("CrossNotClaimed", "medium"),
+            ("BallRecovery", "low"),
+            ("OffsidePass", "low"),
+            ("Error", "low"),
+            ("ShieldBallOpp", "low"),
+            ("PenaltyFaced", "low"),
+            ("ChanceMissed", "low"),
+            # unmappable — sample
+            ("Card", "unmappable"),
+            ("Start", "unmappable"),
+            ("End", "unmappable"),
+            ("FormationChange", "unmappable"),
+        ],
+    )
     def test_confidence_for_type(self, duck_conn, ws_type, conf):
         out = _seed_and_run(duck_conn, [_row(type_=ws_type)])
         assert out[0]["_action_confidence"] == conf, (
@@ -723,6 +916,7 @@ class TestEnumCompleteness:
 
     def test_action_canonical_enum_size_is_25(self):
         from utils.e3_dq import SPADL_ACTION_ENUM
+
         assert len(SPADL_ACTION_ENUM) == 25
 
     def test_all_observed_routes_in_enum(self, duck_conn):
@@ -730,19 +924,50 @@ class TestEnumCompleteness:
         action_canonical lands inside the enum (no silent drift).
         """
         from utils.e3_dq import SPADL_ACTION_ENUM
+
         allowed = set(SPADL_ACTION_ENUM)
 
         # Sample one row per type — the 39 documented WhoScored types.
         documented_types = [
-            "Pass", "BallRecovery", "BallTouch", "Aerial", "Clearance",
-            "Foul", "TakeOn", "Tackle", "CornerAwarded", "Dispossessed",
-            "Interception", "BlockedPass", "Challenge", "SavedShot",
-            "Save", "KeeperPickup", "MissedShots", "SubstitutionOff",
-            "SubstitutionOn", "End", "Card", "Start", "OffsideProvoked",
-            "OffsideGiven", "OffsidePass", "FormationChange", "Goal",
-            "FormationSet", "Claim", "Error", "ShieldBallOpp",
-            "KeeperSweeper", "Punch", "ShotOnPost", "Smother",
-            "PenaltyFaced", "GoodSkill", "ChanceMissed", "CrossNotClaimed",
+            "Pass",
+            "BallRecovery",
+            "BallTouch",
+            "Aerial",
+            "Clearance",
+            "Foul",
+            "TakeOn",
+            "Tackle",
+            "CornerAwarded",
+            "Dispossessed",
+            "Interception",
+            "BlockedPass",
+            "Challenge",
+            "SavedShot",
+            "Save",
+            "KeeperPickup",
+            "MissedShots",
+            "SubstitutionOff",
+            "SubstitutionOn",
+            "End",
+            "Card",
+            "Start",
+            "OffsideProvoked",
+            "OffsideGiven",
+            "OffsidePass",
+            "FormationChange",
+            "Goal",
+            "FormationSet",
+            "Claim",
+            "Error",
+            "ShieldBallOpp",
+            "KeeperSweeper",
+            "Punch",
+            "ShotOnPost",
+            "Smother",
+            "PenaltyFaced",
+            "GoodSkill",
+            "ChanceMissed",
+            "CrossNotClaimed",
         ]
         rows = [
             _row(game_id=900 + i, minute=i + 1, second=0, type_=t)
@@ -759,85 +984,327 @@ class TestEnumCompleteness:
     def test_qualifier_branches_also_in_enum(self, duck_conn):
         """Pass+qualifier branches and shot-subtype branches all in enum too."""
         from utils.e3_dq import SPADL_ACTION_ENUM
+
         allowed = set(SPADL_ACTION_ENUM)
 
         rows = [
-            _row(game_id=1000, minute=1, type_="Pass",
-                 qualifiers=_qualifiers_json(["ThrowIn"])),
-            _row(game_id=1000, minute=2, type_="Pass",
-                 qualifiers=_qualifiers_json(["GoalKick"])),
-            _row(game_id=1000, minute=3, type_="Pass",
-                 qualifiers=_qualifiers_json(["CornerTaken", "Cross"])),
-            _row(game_id=1000, minute=4, type_="Pass",
-                 qualifiers=_qualifiers_json(["CornerTaken"])),
-            _row(game_id=1000, minute=5, type_="Pass",
-                 qualifiers=_qualifiers_json(["FreekickTaken", "Cross"])),
-            _row(game_id=1000, minute=6, type_="Pass",
-                 qualifiers=_qualifiers_json(["FreekickTaken"])),
-            _row(game_id=1000, minute=7, type_="Pass",
-                 qualifiers=_qualifiers_json(["Cross"])),
-            _row(game_id=1000, minute=8, type_="SavedShot",
-                 qualifiers=_qualifiers_json(["Penalty"])),
-            _row(game_id=1000, minute=9, type_="SavedShot",
-                 qualifiers=_qualifiers_json(["DirectFreekick"])),
+            _row(
+                game_id=1000,
+                minute=1,
+                type_="Pass",
+                qualifiers=_qualifiers_json(["ThrowIn"]),
+            ),
+            _row(
+                game_id=1000,
+                minute=2,
+                type_="Pass",
+                qualifiers=_qualifiers_json(["GoalKick"]),
+            ),
+            _row(
+                game_id=1000,
+                minute=3,
+                type_="Pass",
+                qualifiers=_qualifiers_json(["CornerTaken", "Cross"]),
+            ),
+            _row(
+                game_id=1000,
+                minute=4,
+                type_="Pass",
+                qualifiers=_qualifiers_json(["CornerTaken"]),
+            ),
+            _row(
+                game_id=1000,
+                minute=5,
+                type_="Pass",
+                qualifiers=_qualifiers_json(["FreekickTaken", "Cross"]),
+            ),
+            _row(
+                game_id=1000,
+                minute=6,
+                type_="Pass",
+                qualifiers=_qualifiers_json(["FreekickTaken"]),
+            ),
+            _row(
+                game_id=1000,
+                minute=7,
+                type_="Pass",
+                qualifiers=_qualifiers_json(["Cross"]),
+            ),
+            _row(
+                game_id=1000,
+                minute=8,
+                type_="SavedShot",
+                qualifiers=_qualifiers_json(["Penalty"]),
+            ),
+            _row(
+                game_id=1000,
+                minute=9,
+                type_="SavedShot",
+                qualifiers=_qualifiers_json(["DirectFreekick"]),
+            ),
         ]
         out = _seed_and_run(duck_conn, rows)
         observed = {r["action_canonical"] for r in out}
         leaked = observed - allowed
-        assert not leaked, (
-            f"qualifier branch leaked outside enum: {sorted(leaked)}"
-        )
+        assert not leaked, f"qualifier branch leaked outside enum: {sorted(leaked)}"
 
 
 # ---------------------------------------------------------------------------
-# event_seq chronology across periods (#477)
+# Memory-safe plan shape and order independence
 # ---------------------------------------------------------------------------
 
 
-class TestEventSeqChronology:
-    """event_seq must follow true match chronology, NOT lexical period order.
-
-    Regression for #477: the seq CTE used ``ORDER BY period`` where period is a
-    VARCHAR. Lexically 'FirstPeriodOfExtraTime' < 'PenaltyShootout' < 'SecondHalf'
-    < 'SecondPeriodOfExtraTime', so cup matches with extra time / shootouts got a
-    non-monotonic event_seq (extra-time/shootout events sorted BEFORE the second
-    half). The fix replaces the raw period column with an explicit chronological
-    CASE ordinal.
-    """
+class TestMemorySafeProjection:
+    """Only the compatibility-critical, per-match sequence window may remain."""
 
     @staticmethod
-    def _seq(event_id: str) -> int:
-        return int(event_id.split("_")[1])
+    def _executable_sql() -> str:
+        sql = re.sub(r"--[^\n]*", "", _read_sql())
+        return re.sub(r"/\*.*?\*/", "", sql, flags=re.DOTALL)
 
-    def test_extra_time_and_shootout_ordered_after_second_half(self, duck_conn):
-        # Seeded in deliberately NON-chronological insert order; the SQL must
-        # still assign event_seq following real match time.
-        rows = [
-            _row(game_id=700, period="PenaltyShootout",         minute=120, second=0, type_="Pass"),
-            _row(game_id=700, period="FirstHalf",               minute=10,  second=0, type_="Pass"),
-            _row(game_id=700, period="SecondPeriodOfExtraTime", minute=115, second=0, type_="Pass"),
-            _row(game_id=700, period="SecondHalf",              minute=80,  second=0, type_="Pass"),
-            _row(game_id=700, period="FirstPeriodOfExtraTime",  minute=100, second=0, type_="Pass"),
-        ]
-        out = _seed_and_run(duck_conn, rows)
-        seq = {r["period"]: self._seq(r["event_id"]) for r in out}
-        chronological = [
-            "FirstHalf", "SecondHalf", "FirstPeriodOfExtraTime",
-            "SecondPeriodOfExtraTime", "PenaltyShootout",
-        ]
-        ordered = [seq[p] for p in chronological]
-        assert ordered == sorted(ordered), (
-            f"event_seq not monotonic with match chronology: {seq}"
+    def test_removes_wide_dedup_and_keeps_one_bounded_window(self):
+        sql = self._executable_sql()
+        windows = re.findall(r"\bROW_NUMBER\s*\(", sql, re.IGNORECASE)
+        assert len(windows) == 1
+        assert not re.search(
+            r"\b(?:GROUP\s+BY|DISTINCT|JOIN|WHERE)\b",
+            sql,
+            re.IGNORECASE,
         )
+        window = re.search(
+            r"ROW_NUMBER\s*\(\s*\)\s*OVER\s*\((.*?)\)\s*AS\s+event_seq",
+            sql,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        assert window
+        body = window.group(1)
+        partition, order = re.split(
+            r"\bORDER\s+BY\b",
+            body,
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )
+        assert re.search(
+            r"PARTITION\s+BY\s+league\s*,\s*season\s*,\s*game_id\b",
+            partition,
+            re.IGNORECASE,
+        )
+        # The OOMing predecessor put the full natural key — including the
+        # qualifiers JSON payload — in the window partition key.
+        assert "qualifiers" not in partition.lower()
+        assert order.lower().count("sha256") == 1
 
-    def test_within_period_minute_order_preserved(self, duck_conn):
-        """Within a single period, event_seq still follows ascending minute."""
+    def test_tie_breaker_hashes_complete_migration_natural_key(self):
+        sql = self._executable_sql()
+        hashed_row = re.search(
+            r"sha256\s*\(\s*to_utf8\s*\(\s*json_format\s*\(\s*"
+            r"CAST\s*\(\s*ROW\s*\((?P<fields>[a-z0-9_,\s]+?)\)\s*"
+            r"AS\s+JSON\s*\)\s*\)\s*\)\s*\)",
+            sql,
+            flags=re.IGNORECASE,
+        )
+        assert hashed_row, "legacy sequence must end in a typed SHA-256 key"
+        hash_fields = tuple(
+            field.strip() for field in hashed_row.group("fields").split(",")
+        )
+        # The reversible Bronze migration honestly renames the legacy
+        # team-local relation. Its value and position in the legacy hash stay
+        # unchanged, preserving all historical fallback event IDs.
+        legacy_hash_fields = tuple(
+            "related_event_id" if field == "related_team_event_id" else field
+            for field in hash_fields
+        )
+        assert legacy_hash_fields == _MIGRATION_EVENT_NATURAL_KEY
+        assert "_ingested_at" not in hash_fields
+
+        migration_tree = ast.parse(
+            (PROJECT_ROOT / "scripts" / "migrate_whoscored_v2.py").read_text(
+                encoding="utf-8"
+            )
+        )
+        migration_key = next(
+            ast.literal_eval(node.value)
+            for node in migration_tree.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "EVENT_KEY"
+                for target in node.targets
+            )
+        )
+        assert tuple(migration_key) == _MIGRATION_EVENT_NATURAL_KEY
+
+    def test_output_columns_remain_frozen(self, duck_conn):
+        row = _seed_and_run(duck_conn, [_row()])[0]
+        assert list(row) == [
+            "event_id",
+            "match_id",
+            "source_event_id_raw",
+            "team_event_id_raw",
+            "related_team_event_id_raw",
+            "team_id_raw",
+            "team_name_raw",
+            "player_id_raw",
+            "related_player_id_raw",
+            "period",
+            "expanded_minute",
+            "minute",
+            "second",
+            "x",
+            "y",
+            "end_x",
+            "end_y",
+            "action_canonical",
+            "action_source",
+            "action_version",
+            "_action_source_note",
+            "_action_confidence",
+            "outcome_success",
+            "qualifiers_raw",
+            "_bronze_ingested_at",
+            "league",
+            "season",
+        ]
+
+    def test_legacy_ids_do_not_depend_on_input_order(self, duck_conn):
         rows = [
-            _row(game_id=701, period="FirstHalf", minute=30, second=0, expanded_minute=30, type_="Pass"),
-            _row(game_id=701, period="FirstHalf", minute=5,  second=0, expanded_minute=5,  type_="Pass"),
-            _row(game_id=701, period="FirstHalf", minute=15, second=0, expanded_minute=15, type_="Pass"),
+            _row(
+                game_id=700,
+                period="PenaltyShootout",
+                minute=120,
+                second=0,
+                type_="Pass",
+            ),
+            _row(game_id=700, period="FirstHalf", minute=10, second=0, type_="Pass"),
+            _row(
+                game_id=700,
+                period="SecondPeriodOfExtraTime",
+                minute=115,
+                second=0,
+                type_="Pass",
+            ),
+            _row(game_id=700, period="SecondHalf", minute=80, second=0, type_="Pass"),
+            _row(
+                game_id=700,
+                period="FirstPeriodOfExtraTime",
+                minute=100,
+                second=0,
+                type_="Pass",
+            ),
+        ]
+        forward = {
+            (r["period"], r["minute"]): r["event_id"]
+            for r in _seed_and_run(duck_conn, rows)
+        }
+        reversed_input = {
+            (r["period"], r["minute"]): r["event_id"]
+            for r in _seed_and_run(duck_conn, list(reversed(rows)))
+        }
+        assert forward == reversed_input
+        chronological = [
+            "FirstHalf",
+            "SecondHalf",
+            "FirstPeriodOfExtraTime",
+            "SecondPeriodOfExtraTime",
+            "PenaltyShootout",
+        ]
+        sequence = [
+            int(
+                forward[
+                    (
+                        period,
+                        next(row["minute"] for row in rows if row["period"] == period),
+                    )
+                ].split("_")[1]
+            )
+            for period in chronological
+        ]
+        assert sequence == sorted(sequence)
+
+    def test_legacy_ties_do_not_depend_on_input_order(self, duck_conn):
+        # Every pre-existing chronological sort field is identical. Only
+        # migration-natural-key fields differ, so this specifically proves the
+        # final SHA-256 tie-breaker rather than the ordinary clock ordering.
+        rows = [
+            _row(
+                game_id=702,
+                period="FirstHalf",
+                minute=10,
+                second=7,
+                expanded_minute=10,
+                type_="Pass",
+                x=42.0,
+                y=31.0,
+                outcome_type="Successful",
+                team_id=13,
+                player_id=555,
+                end_x=61.0,
+                end_y=32.0,
+                qualifiers=_qualifiers_json(["Cross"]),
+                related_team_event_id=80,
+                related_player_id=556,
+                team="Arsenal",
+                ingested_at="2026-05-01 10:00:00",
+            ),
+            _row(
+                game_id=702,
+                period="FirstHalf",
+                minute=10,
+                second=7,
+                expanded_minute=10,
+                type_="Pass",
+                x=42.0,
+                y=31.0,
+                outcome_type="Unsuccessful",
+                team_id=14,
+                player_id=777,
+                end_x=25.0,
+                end_y=12.0,
+                qualifiers=_qualifiers_json(["ThrowIn"]),
+                related_team_event_id=81,
+                related_player_id=778,
+                team="Chelsea",
+                ingested_at="2026-07-11 10:00:00",
+            ),
+        ]
+
+        def mapping(fixture_rows):
+            return {
+                row["player_id_raw"]: row["event_id"]
+                for row in _seed_and_run(duck_conn, fixture_rows)
+            }
+
+        forward = mapping(rows)
+        reversed_input = mapping(list(reversed(rows)))
+        assert forward == reversed_input
+        assert set(forward.values()) == {"702_00001", "702_00002"}
+
+    def test_legacy_sequence_orders_minutes_within_period(self, duck_conn):
+        rows = [
+            _row(
+                game_id=701,
+                period="FirstHalf",
+                minute=30,
+                second=0,
+                expanded_minute=30,
+                type_="Pass",
+            ),
+            _row(
+                game_id=701,
+                period="FirstHalf",
+                minute=5,
+                second=0,
+                expanded_minute=5,
+                type_="Pass",
+            ),
+            _row(
+                game_id=701,
+                period="FirstHalf",
+                minute=15,
+                second=0,
+                expanded_minute=15,
+                type_="Pass",
+            ),
         ]
         out = _seed_and_run(duck_conn, rows)
-        ordered = sorted(out, key=lambda r: self._seq(r["event_id"]))
-        minutes = [r["expanded_minute"] for r in ordered]
-        assert minutes == [5, 15, 30], f"within-period order broken: {minutes}"
+        ordered = sorted(out, key=lambda row: int(row["event_id"].split("_")[1]))
+        assert [row["expanded_minute"] for row in ordered] == [5, 15, 30]

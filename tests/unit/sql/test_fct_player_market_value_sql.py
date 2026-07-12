@@ -4,9 +4,9 @@ Unit tests for Gold ``fct_player_market_value`` SQL logic (issue #430).
 Two-source market-value timeline, one row per
 (player_id, valuation_date, source). Logic under test:
 
-  * FotMob bridged to canonical via silver.xref_player (INNER JOIN non-orphan =
-    canonical-only); Transfermarkt reads canonical_id straight from Silver,
-    canonical-only (WHERE canonical_id IS NOT NULL).
+  * FotMob is bridged to canonical via silver.xref_player with a LEFT JOIN;
+    Transfermarkt reads canonical_id straight from Silver.  Unresolved points
+    retain stable source-prefixed ids (issue #871).
   * `source` in the PK keeps a FotMob and a Transfermarkt point on the same
     (player, date) as two distinct rows.
   * cross-season collapse: the same FotMob (player, date) point lands in
@@ -63,7 +63,7 @@ def _bootstrap(con) -> None:
         [
             ("fb_x", "fotmob", "500", LEAGUE, "2425", "exact"),
             ("fb_x", "fotmob", "500", LEAGUE, "2526", "exact"),
-            # orphan bridge row -> filtered out -> fotmob '900' resolves to nothing.
+            # Explicit orphan bridge row; the Gold fallback remains fm_900.
             ("fm_900", "fotmob", "900", LEAGUE, "2526", "orphan"),
         ],
     )
@@ -85,7 +85,7 @@ def _bootstrap(con) -> None:
             # SAME (player, date) point re-emitted in two season partitions.
             ("500", date(2024, 1, 1), 100_000_000, "EUR", INGESTED, LEAGUE, "2425"),
             ("500", date(2024, 1, 1), 100_000_000, "EUR", INGESTED2, LEAGUE, "2526"),
-            # Orphan FotMob player -> INNER JOIN non-orphan drops it.
+            # Orphan FotMob player -> retained with a stable prefixed id.
             ("900", date(2024, 1, 1), 5_000_000, "EUR", INGESTED, LEAGUE, "2526"),
         ],
     )
@@ -110,7 +110,7 @@ def _bootstrap(con) -> None:
             # Resolved canonical — same (player, date) as FotMob, different source.
             ("700", "fb_x", date(2024, 1, 1), 95_000_000, "Man City", 24,
              INGESTED, LEAGUE, "2526"),
-            # Orphan (canonical_id NULL) -> dropped (canonical-only contract).
+            # Orphan (canonical_id NULL) -> retained with a stable prefixed id.
             ("701", None, date(2024, 2, 1), 3_000_000, "Youth FC", 19,
              INGESTED, LEAGUE, "2526"),
         ],
@@ -145,29 +145,35 @@ pytestmark = pytest.mark.unit
 
 class TestFctPlayerMarketValue:
 
-    def test_exactly_two_rows(self, gold_rows):
-        # fotmob (cross-season collapsed) + transfermarkt, both for fb_x@2024-01-01.
-        assert len(gold_rows) == 2
+    def test_all_four_source_points_are_retained(self, gold_rows):
+        # Resolved FotMob collapses across seasons; both source orphans survive.
+        assert len(gold_rows) == 4
 
     def test_distinct_sources(self, gold_rows):
         assert {r["source"] for r in gold_rows} == {"fotmob", "transfermarkt"}
 
     def test_fotmob_point_collapsed_cross_season(self, gold_rows):
-        fm = [r for r in gold_rows if r["source"] == "fotmob"]
+        fm = [
+            r for r in gold_rows
+            if r["source"] == "fotmob" and r["player_id"] == "fb_x"
+        ]
         assert len(fm) == 1, "the two season partitions must collapse to one row"
         assert fm[0]["player_id"] == "fb_x"
         assert fm[0]["valuation_date"] == date(2024, 1, 1)
         assert fm[0]["market_value_eur"] == 100_000_000
 
     def test_transfermarkt_point_present(self, gold_rows):
-        tm = next(r for r in gold_rows if r["source"] == "transfermarkt")
+        tm = next(
+            r for r in gold_rows
+            if r["source"] == "transfermarkt" and r["player_id"] == "fb_x"
+        )
         assert tm["player_id"] == "fb_x"
         assert tm["market_value_eur"] == 95_000_000
         assert tm["currency"] == "EUR"
 
-    def test_orphans_dropped_canonical_only(self, gold_rows):
-        # FotMob '900' (orphan bridge) and TM '701' (NULL canonical) are gone.
-        assert all(r["player_id"].startswith("fb_") for r in gold_rows)
+    def test_orphans_are_retained_with_stable_source_prefixes(self, gold_rows):
+        ids = {r["player_id"] for r in gold_rows}
+        assert {"fm_900", "tm_701"} <= ids
 
     def test_pk_unique_with_source(self, gold_rows):
         pks = [(r["player_id"], r["valuation_date"], r["source"])

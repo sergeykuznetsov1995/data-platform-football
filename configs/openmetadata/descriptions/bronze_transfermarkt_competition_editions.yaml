@@ -1,0 +1,56 @@
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.transfermarkt_competition_editions
+  description: |
+    Source-faithful Transfermarkt edition registry. Grain and natural key are
+    (competition_id, edition_id); lineage is the edition selector recorded in
+    source_url/source_body_hash. The original source edition is never rewritten.
+    Completeness requires the exact edition set and participant hash for every
+    active classified competition in its registry snapshot. Current-edition
+    discovery freshness is 24h; verified historical editions are immutable.
+  tags: [Tier.Bronze, Domain.Football, PII.None]
+columns:
+  - name: competition_id
+    description: Transfermarkt competition code; natural-key component.
+  - name: edition_id
+    description: Exact Transfermarkt edition/year id; natural-key component.
+  - name: edition_label
+    description: Human-readable source label, retained for round-trip checks.
+  - name: canonical_season
+    description: Canonical split-year or single-year season slug derived from classified season_format.
+  - name: season_format
+    description: split_year or single_year; unknown blocks crawling.
+  - name: start_date
+    description: Source-backed edition start date when published.
+  - name: end_date
+    description: Source-backed edition end date when published.
+  - name: active
+    description: Whether this edition remains active.
+  - name: current
+    description: Whether this is the source's current edition.
+  - name: participant_count
+    description: Expected participant count used by completeness DQ.
+  - name: participant_hash
+    description: Deterministic hash of the complete source participant set.
+  - name: source_url
+    description: Transfermarkt edition-selector URL used as lineage evidence.
+  - name: discovered_at
+    description: UTC discovery timestamp; current-edition freshness must be at most 24h.
+  - name: registry_snapshot_id
+    description: Parent complete competition-registry snapshot.
+  - name: source_body_hash
+    description: SHA-256 of the source response.
+  - name: fetched_at
+    description: UTC response fetch timestamp retained for source lineage.
+  - name: cycle_id
+    description: Parent discovery-cycle identifier.
+  - name: scope_id
+    description: Deterministic competition:edition discovery scope.
+  - name: _ingested_at
+    description: Bronze commit timestamp.
+  - name: _batch_id
+    description: Discovery batch identifier.
+relationships:
+  - from: trino_iceberg.iceberg.bronze.transfermarkt_competition_editions.competition_id
+    to: trino_iceberg.iceberg.bronze.transfermarkt_competitions.competition_id
+    type: FOREIGN_KEY
+    description: Every edition belongs to its registry competition.

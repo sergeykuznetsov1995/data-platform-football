@@ -30,6 +30,7 @@ import base64
 import binascii
 import fcntl
 import hashlib
+import ipaddress
 import json
 import logging
 import os
@@ -156,6 +157,19 @@ _SENSITIVE_QUERY_KEYS = frozenset(
         "token",
     }
 )
+PROXY_POOL_ENV = "PROXY_POOL_JSON"
+MAX_PROXY_POOL_JSON_BYTES = 1024 * 1024
+MAX_PROXY_POOL_ENTRIES = 1000
+_PROXY_POOL_FIELDS = frozenset({"host", "port", "username", "password"})
+_DNS_LABEL = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
+
+
+class ProxyPoolConfigurationError(ValueError):
+    """A redaction-safe proxy-pool configuration error."""
+
+
+class _DuplicateJsonField(ValueError):
+    """Internal marker for duplicate JSON object fields."""
 
 
 def _dagrun_budget_bytes(dag_id: str) -> int:
@@ -403,26 +417,178 @@ def _control_token_valid(headers: dict[str, str]) -> bool:
     return bool(CONTROL_TOKEN) and secrets.compare_digest(supplied, CONTROL_TOKEN)
 
 
-def _residential_manager(proxy_file: str):
-    """A ProxyManager loaded from the custom-format pool file (host:port:user:pass).
+def _json_object_without_duplicate_fields(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise _DuplicateJsonField
+        result[key] = value
+    return result
+
+
+def _pool_error(index: int | None, field: str, reason: str) -> ProxyPoolConfigurationError:
+    location = "proxy pool" if index is None else f"proxy pool entry {index}"
+    return ProxyPoolConfigurationError(f"{location}: invalid {field} ({reason})")
+
+
+def _contains_control_character(value: str) -> bool:
+    return any(ord(character) < 32 or ord(character) == 127 for character in value)
+
+
+def _normalise_proxy_host(value: Any, *, index: int) -> str:
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise _pool_error(index, "host", "must be a non-empty trimmed string")
+    if _contains_control_character(value) or len(value) > 253:
+        raise _pool_error(index, "host", "contains unsupported characters")
+    try:
+        return ipaddress.ip_address(value).compressed
+    except ValueError:
+        pass
+    try:
+        ascii_host = value.encode("idna").decode("ascii").lower()
+    except UnicodeError as exc:
+        raise _pool_error(index, "host", "is not a valid hostname") from exc
+    labels = ascii_host.rstrip(".").split(".")
+    if (
+        ascii_host.endswith(".")
+        or len(ascii_host) > 253
+        or not labels
+        or any(not _DNS_LABEL.fullmatch(label) for label in labels)
+    ):
+        raise _pool_error(index, "host", "is not a valid hostname")
+    return ascii_host
+
+
+def _normalise_proxy_credential(
+    value: Any,
+    *,
+    index: int,
+    field: str,
+    max_length: int,
+) -> str:
+    if not isinstance(value, str) or not value:
+        raise _pool_error(index, field, "must be a non-empty string")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise _pool_error(index, field, "contains unsupported characters") from exc
+    if len(value) > max_length or _contains_control_character(value):
+        raise _pool_error(index, field, "contains unsupported characters")
+    if field == "username" and ":" in value:
+        raise _pool_error(index, field, "must not contain ':'")
+    return value
+
+
+def _parse_proxy_pool_json(raw: str) -> tuple[dict[str, Any], ...]:
+    """Parse a bounded, strict pool while keeping credential values out of errors."""
+    if not isinstance(raw, str) or not raw.strip():
+        raise _pool_error(None, PROXY_POOL_ENV, "is required and must not be blank")
+    try:
+        encoded_size = len(raw.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise _pool_error(None, PROXY_POOL_ENV, "is not valid UTF-8") from exc
+    if encoded_size > MAX_PROXY_POOL_JSON_BYTES:
+        raise _pool_error(None, PROXY_POOL_ENV, "exceeds the size limit")
+    try:
+        payload = json.loads(raw, object_pairs_hook=_json_object_without_duplicate_fields)
+    except _DuplicateJsonField as exc:
+        raise _pool_error(None, PROXY_POOL_ENV, "contains a duplicate object field") from exc
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise _pool_error(None, PROXY_POOL_ENV, "is not valid JSON") from exc
+    if not isinstance(payload, list) or not payload:
+        raise _pool_error(None, PROXY_POOL_ENV, "must be a non-empty JSON array")
+    if len(payload) > MAX_PROXY_POOL_ENTRIES:
+        raise _pool_error(None, PROXY_POOL_ENV, "contains too many entries")
+
+    records: list[dict[str, Any]] = []
+    identities: set[tuple[str, int, str]] = set()
+    for index, item in enumerate(payload):
+        if not isinstance(item, dict):
+            raise _pool_error(index, "entry", "must be a JSON object")
+        keys = frozenset(item)
+        if keys != _PROXY_POOL_FIELDS:
+            raise _pool_error(
+                index,
+                "fields",
+                "must contain exactly host, port, username and password",
+            )
+        host = _normalise_proxy_host(item["host"], index=index)
+        port = item["port"]
+        if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+            raise _pool_error(index, "port", "must be an integer in 1..65535")
+        username = _normalise_proxy_credential(
+            item["username"], index=index, field="username", max_length=1024
+        )
+        password = _normalise_proxy_credential(
+            item["password"], index=index, field="password", max_length=4096
+        )
+        identity = (host, port, username)
+        if identity in identities:
+            raise _pool_error(index, "entry", "duplicates an earlier endpoint identity")
+        identities.add(identity)
+        records.append(
+            {
+                "host": host,
+                "port": port,
+                "username": username,
+                "password": password,
+            }
+        )
+    return tuple(records)
+
+
+def _residential_manager(
+    *,
+    proxy_pool_json: str | None,
+    proxy_file: str,
+    allow_file_fallback: bool,
+):
+    """Load the paid pool from the environment, or an explicitly enabled file.
 
     The upstream is refreshed per FlareSolverr session (idle-refresh, see
     ``_acquire_upstream``) so each session lands on a different residential exit —
     keeping IP diversity that a pin-one-proxy startup would have thrown away, while
     holding one exit per CF session so the page and its Turnstile challenge stay on
-    a single IP (#652)."""
-    from scrapers.utils.proxy_manager import ProxyManager
+    a single IP (#652). Credential values are never included in errors or logs.
+    """
+    from scrapers.utils.proxy_manager import ProxyManager, ProxyType
 
     mgr = ProxyManager(rotation_strategy="random")
-    n = mgr.load_from_file_custom_format(proxy_file)
+    if proxy_pool_json is not None and proxy_pool_json.strip():
+        records = _parse_proxy_pool_json(proxy_pool_json)
+        for record in records:
+            mgr.add_proxy(
+                host=record["host"],
+                port=record["port"],
+                proxy_type=ProxyType.HTTP,
+                username=record["username"],
+                password=record["password"],
+            )
+        n = len(records)
+        source = PROXY_POOL_ENV
+    elif allow_file_fallback:
+        n = mgr.load_from_file_custom_format(proxy_file)
+        source = "explicit file fallback"
+    else:
+        raise ProxyPoolConfigurationError(
+            f"{PROXY_POOL_ENV} is required; file fallback is disabled"
+        )
     if n <= 0:
-        raise SystemExit(f"no proxies in {proxy_file}")
-    return mgr
+        raise ProxyPoolConfigurationError("proxy pool contains no usable entries")
+    return mgr, source
 
 
 def _pick_upstream(mgr):
     """(host, port, user, pass) of one residential proxy from the pool."""
-    u = urlsplit(mgr.get_proxy().url)  # http://user:pass@host:port
+    selected = mgr.get_proxy()
+    if all(
+        hasattr(selected, field)
+        for field in ("host", "port", "username", "password")
+    ):
+        return selected.host, selected.port, selected.username, selected.password
+    u = urlsplit(selected.url)  # Compatibility with the minimal unit-test fake.
     return u.hostname, u.port, u.username, u.password
 
 
@@ -2509,6 +2675,14 @@ async def main() -> None:
     )
     ap.add_argument("--proxy-file", default="/opt/airflow/proxys.txt")
     ap.add_argument(
+        "--allow-proxy-file-fallback",
+        action="store_true",
+        help=(
+            "explicitly allow --proxy-file only when PROXY_POOL_JSON is blank; "
+            "disabled by default"
+        ),
+    )
+    ap.add_argument(
         "--blocklist", default=None, help="domain blocklist file (omit = observe only)"
     )
     ap.add_argument("--out", default="/tmp/filter_bytes.json")
@@ -2724,10 +2898,26 @@ async def main() -> None:
     )
 
     proxy_file = str(getattr(args, "proxy_file", "/opt/airflow/proxys.txt"))
-    mgr = _residential_manager(proxy_file)
+    env_file_fallback = os.environ.get("PROXY_FILTER_ALLOW_FILE_FALLBACK", "false")
+    if env_file_fallback.lower() not in {"true", "false"}:
+        raise SystemExit("PROXY_FILTER_ALLOW_FILE_FALLBACK must be true or false")
+    allow_file_fallback = (
+        bool(getattr(args, "allow_proxy_file_fallback", False))
+        or env_file_fallback.lower() == "true"
+    )
+    try:
+        mgr, pool_source = _residential_manager(
+            proxy_pool_json=os.environ.get(PROXY_POOL_ENV),
+            proxy_file=proxy_file,
+            allow_file_fallback=allow_file_fallback,
+        )
+    except (OSError, ProxyPoolConfigurationError) as exc:
+        raise SystemExit(f"proxy pool configuration error: {exc}") from None
     log.info(
-        "residential pool = %d proxies (explicit sticky leases; legacy idle-refresh enabled)",
+        "residential pool = %d proxies from %s "
+        "(explicit sticky leases; legacy idle-refresh enabled)",
         mgr.total_count,
+        pool_source,
     )
     listen = str(getattr(args, "listen", "0.0.0.0:8899"))
     host, port = listen.rsplit(":", 1)

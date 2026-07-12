@@ -4,10 +4,11 @@
 table:
   fullyQualifiedName: trino_iceberg.iceberg.bronze.whoscored_missing_players
   description: |
-    Сырые предматчевые сводки недоступных игроков из WhoScored (soccerdata
-    WhoScored.read_missing_players через FlareSolverr). Grain — один row на
-    (game, team, player): травмы, дисквалификации, вызовы в сборную. Источник
-    отметок reason/status. Партиционирование ['league','season'].
+    Append-only предматчевые сводки parser v7: один row на (game, team, player)
+    для травм, дисквалификаций и вызовов в сборную. Raw HTML фиксируется до
+    разбора, а downstream читает whoscored_missing_players_current — batch из
+    последнего успешного preview manifest. Успешный zero-row commit скрывает
+    устаревший список без Iceberg DELETE. Партиционирование ['league','season'].
   tags:
     - Tier.Bronze
     - Domain.Football
@@ -16,7 +17,7 @@ columns:
   - name: league
     description: Лига (e.g. 'ENG-Premier League'); partition key.
   - name: season
-    description: Сезон в формате WhoScored 'YYZZ' (e.g. '2425'); partition key.
+    description: Канонический scope season ('2526', '2026'; при source-коллизии '2021-single-ws8534'); partition key.
   - name: game
     description: Строковый идентификатор матча WhoScored (slug).
   - name: team

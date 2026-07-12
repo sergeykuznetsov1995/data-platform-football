@@ -1,540 +1,771 @@
-"""
-Transfermarkt Data Ingestion DAG
-================================
+"""Bounded production ingest for Transfermarkt native v2.
 
-Weekly Bronze ingest of Transfermarkt player + transfer data (issue #43).
-
-Tasks (run sequentially — players is the anchor entity):
-
-    scrape_players
-        ↓
-        ├─► scrape_market_value_history  ─┐
-        └─► scrape_transfers              ─┴► validate_data (all_done)
-
-``transfers`` and ``market_value_history`` resolve their per-player roster
-from ``bronze.transfermarkt_players``; if ``scrape_players`` exits with the
-TM_FALLBACK soft-success (exit code 2 → bash wrapper exits 0), those tasks
-will themselves fall back gracefully and validate_data records the surface.
-
-Architecture mirrors ``dag_ingest_sofascore.py``: BashOperator to run the
-scraper in an isolated subprocess (LocalExecutor fork-memory contention),
-PythonOperator for cross-task validation.
-
-Schedule: weekly, Monday 04:00 UTC (one hour before Capology, two hours
-before FBref).
+The promoted registry is the only source of crawl scopes.  One mapped child
+owns one exact ``competition x edition`` cycle; mapped children are serialized
+through the paid-proxy pool and share one provider-byte ledger.  The downstream
+Silver build is triggered only after every immutable child manifest is green.
 """
 
-from datetime import datetime
-from typing import Any, Dict, List
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+from datetime import datetime, timedelta
+import json
+import os
+from pathlib import Path
+from typing import Any
 
 from airflow import DAG
 from airflow.exceptions import AirflowException
 from airflow.models.param import Param
 from airflow.operators.bash import BashOperator
 from airflow.operators.python import PythonOperator
-from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 
-from utils.config import CURRENT_SEASON, DAG_TAGS, LEAGUES, SCHEDULES
+from utils.config import CURRENT_SEASON, DAG_TAGS, SCHEDULES
 from utils.default_args import SCRAPER_ARGS
-from utils.ingest_helpers import load_result as _load_result
 
 
-PLAYERS_RESULT_PATH = '/tmp/transfermarkt_players_result.json'
-MV_HISTORY_RESULT_PATH = '/tmp/transfermarkt_mv_history_result.json'
-TRANSFERS_RESULT_PATH = '/tmp/transfermarkt_transfers_result.json'
-COACHES_RESULT_PATH = '/tmp/transfermarkt_coaches_result.json'
+MV_HISTORY_DAILY_LIMIT = 100
+COACH_HISTORY_TTL_DAYS = 28
+CHECKPOINT_TTL_DAYS = 35
+MAX_SCOPE_BATCH = 8
+PENDING_CHECKPOINT_DIR = '/opt/airflow/logs/transfermarkt-checkpoints'
+APPROVAL_JOURNAL = '/opt/airflow/logs/transfermarkt-approvals/journal.json'
+PROVIDER_HARD_CAP_BYTES = 15 * 1024 * 1024
+PROVIDER_SOFT_STOP_BYTES = 14 * 1024 * 1024
+# Preserve the former per-entity ceilings (26 + 120 + 120 + 50) as one
+# source-wide ceiling. Response reuse should make normal cycles much smaller.
+PROXY_REQUEST_LIMIT = 316
+PROXY_RETRY_LIMIT = 2
+PROXY_CONCURRENCY = 1
+SCOPE_SET_COVERAGE_MAX_AGE_DAYS = 7
 
-# Smoke caps for the first weeks of the DAG — APL has ~600 player rows per
-# season, so PLAYERS_DAILY_LIMIT = None means full crawl. market_value_history
-# and transfers fan out per-player via the ceapi JSON endpoints (1 HTTP call per
-# player); 100 players ≈ 8 min at 12 req/min. This cap is the default for the
-# UI-configurable `mv_transfers_limit` Param: the weekly run keeps the rotating
-# 100-player window (#620), while a historical backfill overrides it with 0 (no
-# cap = full roster in one run, #793).
-PLAYERS_DAILY_LIMIT: int = None  # None == full league roster
-MV_HISTORY_DAILY_LIMIT: int = 100
+_APPROVAL_FIELDS = (
+    'paid_proxy_packet_id',
+    'paid_proxy_packet_hash',
+    'production_write_packet_id',
+    'production_write_packet_hash',
+)
 
 
-def validate_data(**context) -> Dict[str, Any]:
-    """Aggregate per-entity row counts + flag soft-fallbacks."""
-    import logging
-
-    logger = logging.getLogger(__name__)
-    players = _load_result(PLAYERS_RESULT_PATH, logger)
-    mv = _load_result(MV_HISTORY_RESULT_PATH, logger)
-    transfers = _load_result(TRANSFERS_RESULT_PATH, logger)
-    coaches = _load_result(COACHES_RESULT_PATH, logger)
-
-    if not players:
-        raise AirflowException(
-            f"Players results file {PLAYERS_RESULT_PATH} missing — anchor entity broken"
-        )
-
-    validation = {
-        'status': 'success',
-        'warnings': [],
-        'summary': {
-            'players_rows': players.get('rows', 0),
-            'players_with_rows': players.get('players_with_rows', 0),
-            'players_fallback': players.get('fallback', False),
-            'mv_history_rows': mv.get('rows', 0),
-            'mv_history_players': mv.get('players_with_rows', 0),
-            'mv_history_fallback': mv.get('fallback', False),
-            'transfers_rows': transfers.get('rows', 0),
-            'transfers_players': transfers.get('players_with_rows', 0),
-            'transfers_fallback': transfers.get('fallback', False),
-            'coaches_rows': coaches.get('rows', 0),
-            'coaches_fallback': coaches.get('fallback', False),
-            'tables': (
-                players.get('tables', [])
-                + mv.get('tables', [])
-                + transfers.get('tables', [])
-                + coaches.get('tables', [])
-            ),
-        },
+def _truthy_env(name: str) -> bool:
+    return os.environ.get(name, '').strip().lower() in {
+        '1', 'true', 'yes', 'on',
     }
 
-    errors: List[str] = []
-    errors.extend(players.get('errors', []) or [])
-    errors.extend(mv.get('errors', []) or [])
-    errors.extend(transfers.get('errors', []) or [])
-    errors.extend(coaches.get('errors', []) or [])
-    if errors:
-        validation['warnings'] = errors
-        total_rows = sum([
-            validation['summary']['players_rows'],
-            validation['summary']['mv_history_rows'],
-            validation['summary']['transfers_rows'],
-            validation['summary']['coaches_rows'],
-        ])
-        validation['status'] = 'partial_success' if total_rows > 0 else 'failed'
 
-    # Minimum thresholds (APL: 20 clubs × ~25 players ≈ 500 players/season).
-    if validation['summary']['players_rows'] < 400:
-        if validation['summary']['players_fallback']:
-            validation['warnings'].append(
-                f"players TM_FALLBACK: rows={validation['summary']['players_rows']}"
-            )
-            if validation['status'] == 'success':
-                validation['status'] = 'partial_success'
-        else:
-            validation['warnings'].append(
-                f"Low players row count: {validation['summary']['players_rows']} < 400"
-            )
+def _preflight_reader_route_for_paid_cycle() -> dict[str, Any]:
+    """Pin the live reader revision and inactive slot before any proxy I/O."""
 
-    # MV history ≥ ~10 timeline points per player on average.
-    if validation['summary']['mv_history_rows'] < 500:
-        if validation['summary']['mv_history_fallback']:
-            validation['warnings'].append(
-                f"mv_history TM_FALLBACK: rows={validation['summary']['mv_history_rows']}"
-            )
-            if validation['status'] == 'success':
-                validation['status'] = 'partial_success'
-        else:
-            validation['warnings'].append(
-                f"Low mv_history row count: {validation['summary']['mv_history_rows']} < 500"
-            )
+    if not _truthy_env('TM_NATIVE_V2_ENABLED'):
+        raise AirflowException(
+            'TM_NATIVE_V2_ENABLED must be true before a paid exact cycle'
+        )
+    from utils import transfermarkt_native_v2 as tm_v2
 
-    # Transfers: typical APL player has 1–4 transfer events; smoke cap=100 players.
-    if validation['summary']['transfers_rows'] < 50:
-        if validation['summary']['transfers_fallback']:
-            validation['warnings'].append(
-                f"transfers TM_FALLBACK: rows={validation['summary']['transfers_rows']}"
+    conn = tm_v2.connect()
+    cur = conn.cursor()
+    try:
+        state = tm_v2.read_reader_state(cur, allow_missing=True)
+        if not state.exists:
+            raise AirflowException(
+                'Transfermarkt control-plane bootstrap is required before '
+                'any paid cycle'
             )
-            if validation['status'] == 'success':
-                validation['status'] = 'partial_success'
-        else:
-            validation['warnings'].append(
-                f"Low transfers row count: {validation['summary']['transfers_rows']} < 50"
+        candidate_slot = tm_v2.inactive_slot(state)
+        try:
+            views = tm_v2.verify_reader_views(
+                cur,
+                expected_version=state.active_version,
+                expected_revision=state.revision,
+                expected_slot=(
+                    state.active_slot if state.active_version == 'v2' else None
+                ),
+                allow_static_slot=state.cleanup_completed_at is not None,
             )
+        except Exception as exc:  # fresh bootstrap still has physical bases
+            views = {'passed': False, 'error': str(exc)}
 
-    # Coaches: ~20 head coaches + mid-season replacements per season (#434).
-    if validation['summary']['coaches_rows'] < 15:
-        if validation['summary']['coaches_fallback']:
-            validation['warnings'].append(
-                f"coaches TM_FALLBACK: rows={validation['summary']['coaches_rows']}"
+        if not views['passed']:
+            fresh_legacy_bootstrap = bool(
+                state.active_version == 'legacy'
+                and state.active_slot is None
+                and state.revision == 0
             )
-            if validation['status'] == 'success':
-                validation['status'] = 'partial_success'
-        else:
-            validation['warnings'].append(
-                f"Low coaches row count: {validation['summary']['coaches_rows']} < 15"
+            canonical_bases: dict[str, str | None] = {}
+            bootstrap_upstreams: dict[str, str | None] = {}
+            if fresh_legacy_bootstrap:
+                inventory = tm_v2._relation_inventory(cur)
+                canonical_bases = {
+                    relation.canonical: inventory.get(relation.canonical)
+                    for relation in tm_v2.CANONICAL_READER_RELATIONS
+                }
+                derived_team_value = (
+                    'iceberg.gold.transfermarkt_team_season_market_value'
+                )
+                physical_bases = {
+                    name: kind for name, kind in canonical_bases.items()
+                    if name != derived_team_value
+                }
+                bootstrap_upstreams = {
+                    'iceberg.silver.xref_team': inventory.get(
+                        'iceberg.silver.xref_team'
+                    ),
+                }
+                fresh_legacy_bootstrap = bool(
+                    all(
+                        kind in {'BASE TABLE', 'TABLE'}
+                        for kind in physical_bases.values()
+                    )
+                    and canonical_bases[derived_team_value]
+                    in {None, 'BASE TABLE', 'TABLE'}
+                    and all(
+                        kind in {'BASE TABLE', 'TABLE', 'VIEW'}
+                        for kind in bootstrap_upstreams.values()
+                    )
+                )
+            if not fresh_legacy_bootstrap:
+                raise AirflowException(
+                    f'Transfermarkt reader preflight failed: {views}'
+                )
+            views = {
+                'passed': True,
+                'mode': 'fresh_legacy_base_bootstrap',
+                'canonical_bases': canonical_bases,
+                'bootstrap_upstreams': bootstrap_upstreams,
+            }
+    finally:
+        cur.close()
+        conn.close()
+
+    return {
+        'active_version': state.active_version,
+        'active_slot': state.active_slot,
+        'candidate_slot': candidate_slot,
+        'revision': state.revision,
+        'reader_views': views,
+        'write_mode': (
+            'native-only'
+            if state.legacy_writers_disabled_at is not None else 'dual'
+        ),
+        'paid_io_allowed': True,
+    }
+
+
+def _description_name(item: Any) -> str:
+    name = getattr(item, 'name', None)
+    if name is not None:
+        return str(name)
+    if isinstance(item, Sequence) and not isinstance(item, (str, bytes)) and item:
+        return str(item[0])
+    raise AirflowException('promoted-registry query returned invalid metadata')
+
+
+def _read_promoted_registry(
+    *, registry_snapshot_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Read the exact promoted registry snapshot; never discover implicitly."""
+
+    from utils import transfermarkt_native_v2 as tm_v2
+    from utils.transfermarkt_scope_planner import build_promoted_registry_query
+
+    query = build_promoted_registry_query(
+        registry_snapshot_id=registry_snapshot_id or None,
+    )
+    conn = tm_v2.connect()
+    cur = conn.cursor()
+    try:
+        cur.execute(query)
+        rows = list(cur.fetchall())
+        columns = [_description_name(item) for item in (cur.description or ())]
+    finally:
+        cur.close()
+        conn.close()
+    if not rows or not columns:
+        raise AirflowException(
+            'no exact promoted Transfermarkt registry snapshot is available'
+        )
+    if any(len(row) != len(columns) for row in rows):
+        raise AirflowException('promoted-registry row shape is inconsistent')
+    return [dict(zip(columns, row, strict=True)) for row in rows]
+
+
+def _approval_bundle(
+    bundles: Any,
+    *,
+    scope_id: str,
+) -> dict[str, str]:
+    if not isinstance(bundles, Mapping):
+        raise AirflowException('params.approval_bundles must be an object')
+    value = bundles.get(scope_id)
+    if not isinstance(value, Mapping):
+        raise AirflowException(
+            f'{scope_id}: exact paid/write approval bundle is required'
+        )
+    result = {field: str(value.get(field, '')).strip() for field in _APPROVAL_FIELDS}
+    missing = [field for field, item in result.items() if not item]
+    if missing:
+        raise AirflowException(
+            f'{scope_id}: approval bundle is missing {missing}'
+        )
+    if len(set(result.values())) != len(result):
+        raise AirflowException(
+            f'{scope_id}: paid and write approvals must be distinct one-shot packets'
+        )
+    for field in ('paid_proxy_packet_hash', 'production_write_packet_hash'):
+        digest = result[field]
+        if len(digest) != 64 or any(ch not in '0123456789abcdef' for ch in digest):
+            raise AirflowException(f'{scope_id}: {field} must be a sha256 digest')
+    return result
+
+
+def _plan_exact_scopes(**context: Any) -> list[dict[str, str]]:
+    """Build the bounded mapped environments from promoted registry rows."""
+
+    from utils.transfermarkt_scope_planner import plan_transfermarkt_scopes
+
+    ti = context['ti']
+    preflight = ti.xcom_pull(task_ids='preflight_reader_route_for_paid_cycle') or {}
+    if not preflight.get('paid_io_allowed'):
+        raise AirflowException('reader preflight did not allow paid I/O')
+    if not os.environ.get('TM_PROXY_CONTROL_URL', '').strip():
+        raise AirflowException('TM_PROXY_CONTROL_URL is required; direct fallback is forbidden')
+
+    params = dict(context.get('params') or {})
+    journal = Path(str(params.get('approval_journal') or '')).expanduser()
+    if not journal.is_absolute():
+        raise AirflowException('params.approval_journal must be an absolute path')
+    approved_root = Path('/opt/airflow/logs/transfermarkt-approvals')
+    if journal != approved_root and approved_root not in journal.parents:
+        raise AirflowException('approval journal must be under Airflow logs')
+
+    registry_rows = _read_promoted_registry(
+        registry_snapshot_id=str(params.get('registry_snapshot_id') or ''),
+    )
+    plan = plan_transfermarkt_scopes(
+        params,
+        parent_cycle_id=str(context['run_id']),
+        registry_rows=registry_rows,
+        max_batch_size=int(params['max_batch']),
+    )
+    if not plan.mapped_payloads:
+        raise AirflowException('promoted registry produced no exact due scope')
+
+    mapped_envs: list[dict[str, str]] = []
+    used_approvals: set[str] = set()
+    for payload in plan.mapped_payloads:
+        scope_id = str(payload['scope_id'])
+        approval = _approval_bundle(
+            params.get('approval_bundles'), scope_id=scope_id,
+        )
+        identities = set(approval.values())
+        overlap = identities & used_approvals
+        if overlap:
+            raise AirflowException(
+                f'{scope_id}: one-shot approval identity is reused: {sorted(overlap)}'
             )
+        used_approvals.update(identities)
+        refresh_mode = str(params['refresh_mode'])
+        if refresh_mode == 'auto':
+            edition_record = payload.get('edition_record') or {}
+            if not isinstance(edition_record, Mapping):
+                raise AirflowException(f'{scope_id}: edition_record is invalid')
+            refresh_mode = (
+                'current' if bool(edition_record.get('current')) else 'historical'
+            )
+        mapped_envs.append({
+            'PYTHONPATH': '/opt/airflow:/opt/airflow/dags',
+            'PATH': '/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin',
+            'HOME': '/home/airflow',
+            'TM_REQUIRE_METERED_PROXY': 'true',
+            'TM_DAG_ID': str(context['dag'].dag_id),
+            'TM_RUN_ID': str(context['run_id']),
+            'TM_TASK_ID': 'run_exact_child_cycle',
+            'TM_SCOPE_ID': scope_id,
+            'TM_SCOPE_PAYLOAD_JSON': json.dumps(
+                payload, sort_keys=True, separators=(',', ':'),
+            ),
+            'TM_READER_REVISION': str(int(preflight['revision'])),
+            'TM_CANDIDATE_SLOT': str(preflight['candidate_slot']),
+            'TM_WRITE_MODE': str(preflight['write_mode']),
+            'TM_APPROVAL_JOURNAL': str(journal),
+            'TM_PAID_APPROVAL_PACKET_ID': approval['paid_proxy_packet_id'],
+            'TM_PAID_APPROVAL_PACKET_HASH': approval['paid_proxy_packet_hash'],
+            'TM_WRITE_APPROVAL_PACKET_ID': approval[
+                'production_write_packet_id'
+            ],
+            'TM_WRITE_APPROVAL_PACKET_HASH': approval[
+                'production_write_packet_hash'
+            ],
+            'TM_MV_TRANSFERS_LIMIT': str(int(params['mv_transfers_limit'])),
+            'TM_REFRESH_MODE': refresh_mode,
+            'TM_COACH_HISTORY_TTL_DAYS': str(
+                int(params['coach_history_ttl_days'])
+            ),
+            'TM_PROXY_LEASE_TTL_SECONDS': str(
+                int(params['proxy_lease_ttl_seconds'])
+            ),
+            'TM_CHECKPOINT_TTL_DAYS': str(
+                int(params['checkpoint_ttl_days'])
+            ),
+            'TM_ENTITY_TIMEOUT_SECONDS': str(
+                int(params['entity_timeout_seconds'])
+            ),
+            'TM_PROVIDER_HARD_CAP_BYTES': str(PROVIDER_HARD_CAP_BYTES),
+            'TM_PROVIDER_SOFT_STOP_BYTES': str(PROVIDER_SOFT_STOP_BYTES),
+            'TM_PROXY_REQUEST_LIMIT': str(int(params['proxy_request_limit'])),
+            'TM_PROXY_RETRY_LIMIT': str(int(params['proxy_retry_limit'])),
+            'TM_PENDING_CHECKPOINT_DIR': PENDING_CHECKPOINT_DIR,
+        })
+    return mapped_envs
 
-    logger.info("Validation: status=%s summary=%s", validation['status'], validation['summary'])
-    if validation['warnings']:
-        logger.warning("Warnings: %s", validation['warnings'])
 
-    if validation['status'] == 'failed':
-        raise AirflowException(f"Validation failed: {validation.get('warnings', [])}")
-    return validation
+def _load_json_object(path: str, *, label: str) -> dict[str, Any]:
+    file_path = Path(path)
+    if not file_path.is_absolute() or not file_path.is_file():
+        raise AirflowException(f'{label} is missing: {path}')
+    try:
+        value = json.loads(file_path.read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise AirflowException(f'{label} is unreadable: {path}') from exc
+    if not isinstance(value, dict):
+        raise AirflowException(f'{label} must contain a JSON object: {path}')
+    return value
+
+
+def _sql_literal(value: str) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _read_completed_scope_manifest_rows(
+    *, registry_snapshot_id: str, reader_revision: int,
+) -> list[dict[str, Any]]:
+    """Read fresh exact child evidence accumulated by earlier bounded batches."""
+
+    from utils import transfermarkt_native_v2 as tm_v2
+    from utils.transfermarkt_scope_state import (
+        SCOPE_COMPLETION_STATUS,
+        SCOPE_MANIFEST_TABLE,
+    )
+
+    conn = tm_v2.connect()
+    cur = conn.cursor()
+    try:
+        cur.execute(f"""
+SELECT parent_cycle_id, child_cycle_id, scope_id, competition_id, edition_id,
+       canonical_competition_id, canonical_season, registry_snapshot_id,
+       capture_revision, parser_revision, schema_revision, reader_revision,
+       entity_manifest_json, manifest_digest, status, committed_at
+FROM {SCOPE_MANIFEST_TABLE}
+WHERE registry_snapshot_id = {_sql_literal(registry_snapshot_id)}
+  AND status = {_sql_literal(SCOPE_COMPLETION_STATUS)}
+  AND reader_revision <= {int(reader_revision)}
+  AND committed_at >= CURRENT_TIMESTAMP
+      - INTERVAL '{SCOPE_SET_COVERAGE_MAX_AGE_DAYS}' DAY
+ORDER BY scope_id, reader_revision DESC, committed_at DESC
+""")
+        rows = list(cur.fetchall())
+        columns = [_description_name(item) for item in (cur.description or ())]
+    finally:
+        cur.close()
+        conn.close()
+    if rows and (not columns or any(len(row) != len(columns) for row in rows)):
+        raise AirflowException('persisted scope-manifest row shape is inconsistent')
+    return [dict(zip(columns, row, strict=True)) for row in rows]
+
+
+def _manifest_from_ops_row(value: Mapping[str, Any]):
+    from utils import transfermarkt_native_v2 as tm_v2
+    from utils.transfermarkt_scope_state import (
+        SCOPE_COMPLETION_STATUS,
+        ScopeManifest,
+        ScopeManifestError,
+    )
+
+    try:
+        entity_value = value['entity_manifest_json']
+        if isinstance(entity_value, str):
+            entity_value = json.loads(entity_value)
+        if not isinstance(entity_value, Mapping) or set(entity_value) != {
+            'entities', 'dq_evidence',
+        }:
+            raise ScopeManifestError(
+                'persisted entity manifest must contain entities and dq_evidence'
+            )
+        manifest = ScopeManifest.from_mapping({
+            key: value[key]
+            for key in (
+                'parent_cycle_id', 'child_cycle_id', 'scope_id',
+                'competition_id', 'edition_id', 'canonical_competition_id',
+                'canonical_season', 'registry_snapshot_id', 'capture_revision',
+                'parser_revision', 'schema_revision', 'reader_revision',
+            )
+        } | {
+            'entities': entity_value['entities'],
+            'dq_evidence': entity_value['dq_evidence'],
+        })
+        manifest.validate(tm_v2.NATIVE_ENTITIES)
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ScopeManifestError('persisted scope manifest is invalid') from exc
+    if str(value.get('status')) != SCOPE_COMPLETION_STATUS:
+        raise ScopeManifestError(f'{manifest.scope_id}: scope is not complete')
+    if manifest.digest != str(value.get('manifest_digest') or ''):
+        raise ScopeManifestError(
+            f'{manifest.scope_id}: persisted manifest digest mismatch'
+        )
+    return manifest
+
+
+def _build_scope_set(
+    planned_envs: Sequence[Mapping[str, str]],
+    preflight: Mapping[str, Any],
+    *,
+    target_scope_ids: Sequence[str] | None = None,
+    persisted_manifest_rows: Sequence[Mapping[str, Any]] = (),
+) -> dict[str, Any]:
+    """Validate exact immutable manifests and the shared provider ledger."""
+
+    from utils import transfermarkt_native_v2 as tm_v2
+    from utils.transfermarkt_scope_state import (
+        ScopeManifest,
+        ScopeManifestError,
+        ScopeSetManifest,
+        aggregate_traffic,
+    )
+
+    if not planned_envs:
+        raise AirflowException('scope-set gate received no mapped scopes')
+    manifests = []
+    payloads = []
+    ledger_paths: set[str] = set()
+    try:
+        for environment in planned_envs:
+            payload = json.loads(environment['TM_SCOPE_PAYLOAD_JSON'])
+            manifest_value = _load_json_object(
+                payload['result_paths']['scope_manifest'],
+                label=f"{payload['scope_id']} scope manifest",
+            )
+            manifest = ScopeManifest.from_mapping(manifest_value)
+            manifest.validate(tm_v2.NATIVE_ENTITIES)
+            if manifest_value.get('manifest_digest') != manifest.digest:
+                raise AirflowException(
+                    f"{payload['scope_id']}: immutable manifest digest mismatch"
+                )
+            expected_identity = {
+                'parent_cycle_id': payload['parent_cycle_id'],
+                'child_cycle_id': payload['child_cycle_id'],
+                'scope_id': payload['scope_id'],
+                'competition_id': payload['competition_id'],
+                'edition_id': payload['edition_id'],
+                'canonical_competition_id': payload[
+                    'canonical_competition_id'
+                ],
+                'canonical_season': payload['canonical_season'],
+                'registry_snapshot_id': payload['registry_snapshot_id'],
+                'reader_revision': int(preflight['revision']),
+            }
+            actual_identity = {
+                key: getattr(manifest, key) for key in expected_identity
+            }
+            if actual_identity != expected_identity:
+                raise AirflowException(
+                    f"{payload['scope_id']}: scope manifest identity drift"
+                )
+            manifests.append(manifest)
+            payloads.append(payload)
+            ledger_paths.add(str(payload['parent_ledger']['path']))
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise AirflowException('mapped scope payload is invalid') from exc
+    except ScopeManifestError as exc:
+        raise AirflowException(f'scope manifest failed closed: {exc}') from exc
+
+    if len(ledger_paths) != 1:
+        raise AirflowException('mapped scopes do not share one parent proxy ledger')
+    traffic = aggregate_traffic(manifests)
+    if traffic['provider_metered_bytes'] > PROVIDER_HARD_CAP_BYTES:
+        raise AirflowException(
+            'provider hard byte cap exceeded: '
+            f"{traffic['provider_metered_bytes']}/{PROVIDER_HARD_CAP_BYTES}"
+        )
+    ledger = _load_json_object(next(iter(ledger_paths)), label='parent proxy ledger')
+    required_ledger = {
+        'provider_metered_bytes': traffic['provider_metered_bytes'],
+        'requests': traffic['requests'],
+        'retries': traffic['retries'],
+        'hard_provider_byte_budget': PROVIDER_HARD_CAP_BYTES,
+        'soft_provider_byte_stop': PROVIDER_SOFT_STOP_BYTES,
+    }
+    if any(int(ledger.get(key, -1)) != value for key, value in required_ledger.items()):
+        raise AirflowException('parent proxy ledger disagrees with scope manifests')
+
+    current_manifests = tuple(manifests)
+    target_ids = set(target_scope_ids or (item.scope_id for item in manifests))
+    if not target_ids or len(target_ids) != len(tuple(target_scope_ids or target_ids)):
+        raise AirflowException('registry slot target contains empty/duplicate scope ids')
+    current_identity = {
+        (
+            item.registry_snapshot_id, item.capture_revision,
+            item.parser_revision, item.schema_revision,
+        )
+        for item in current_manifests
+    }
+    if len(current_identity) != 1:
+        raise AirflowException('current bounded batch has mixed capture revisions')
+    registry, capture, parser, schema = next(iter(current_identity))
+    by_scope = {item.scope_id: item for item in current_manifests}
+    for row in persisted_manifest_rows:
+        try:
+            candidate = _manifest_from_ops_row(row)
+        except ScopeManifestError as exc:
+            raise AirflowException(f'persisted scope manifest failed closed: {exc}') from exc
+        if candidate.scope_id not in target_ids or candidate.scope_id in by_scope:
+            continue
+        if (
+            candidate.registry_snapshot_id,
+            candidate.capture_revision,
+            candidate.parser_revision,
+            candidate.schema_revision,
+        ) != (registry, capture, parser, schema):
+            continue
+        if int(candidate.reader_revision) > int(preflight['revision']):
+            raise AirflowException(
+                f'{candidate.scope_id}: persisted reader revision is from the future'
+            )
+        by_scope[candidate.scope_id] = candidate
+    unexpected = sorted(set(by_scope) - target_ids)
+    if unexpected:
+        raise AirflowException(
+            f'bounded batch contains scopes outside promoted slot target: {unexpected}'
+        )
+    missing = sorted(target_ids - set(by_scope))
+    complete_manifests = tuple(by_scope[key] for key in sorted(by_scope))
+    scope_set = None
+    if not missing:
+        scope_set = ScopeSetManifest.build(
+            complete_manifests,
+            expected_entities=tm_v2.NATIVE_ENTITIES,
+            reader_revision=int(preflight['revision']),
+        )
+    parent_ids = {str(payload['parent_cycle_id']) for payload in payloads}
+    if len(parent_ids) != 1:
+        raise AirflowException('scope set spans multiple parent cycles')
+    continuation_required = any(
+        bool(payload.get('continuation_required')) for payload in payloads
+    )
+    remaining_count = max(
+        (int(payload.get('remaining_count', 0)) for payload in payloads),
+        default=0,
+    )
+    return {
+        'parent_cycle_id': next(iter(parent_ids)),
+        'scope_set_id': scope_set.scope_set_id if scope_set else None,
+        'scope_set_manifest': scope_set.as_dict() if scope_set else None,
+        'scope_count': len(complete_manifests),
+        'coverage_target_count': len(target_ids),
+        'coverage_complete': not missing,
+        'missing_scope_ids': missing,
+        'traffic': aggregate_traffic(complete_manifests),
+        'current_batch_traffic': traffic,
+        'candidate_slot': str(preflight['candidate_slot']),
+        'reader_revision': int(preflight['revision']),
+        'continuation_required': continuation_required or bool(missing),
+        'remaining_count': max(remaining_count, len(missing)),
+    }
+
+
+def _validate_scope_set(**context: Any) -> dict[str, Any]:
+    ti = context['ti']
+    planned_envs = ti.xcom_pull(task_ids='plan_exact_scopes') or []
+    preflight = (
+        ti.xcom_pull(task_ids='preflight_reader_route_for_paid_cycle') or {}
+    )
+    from utils.transfermarkt_scope_planner import eligible_registry_scopes
+
+    params = dict(context.get('params') or {})
+    registry_rows = _read_promoted_registry(
+        registry_snapshot_id=str(params.get('registry_snapshot_id') or ''),
+    )
+    targets = eligible_registry_scopes(registry_rows)
+    snapshot_ids = {
+        str(row.get('registry_snapshot_id') or '') for row in registry_rows
+    }
+    if len(snapshot_ids) != 1 or '' in snapshot_ids:
+        raise AirflowException('promoted registry rows do not share one snapshot')
+    persisted_rows = _read_completed_scope_manifest_rows(
+        registry_snapshot_id=next(iter(snapshot_ids)),
+        reader_revision=int(preflight['revision']),
+    )
+    result = _build_scope_set(
+        planned_envs,
+        preflight,
+        target_scope_ids=[item.scope_id for item in targets],
+        persisted_manifest_rows=persisted_rows,
+    )
+
+    # No reader transition may race the paid cycle or its Silver build.
+    from utils import transfermarkt_native_v2 as tm_v2
+
+    conn = tm_v2.connect()
+    cur = conn.cursor()
+    try:
+        state = tm_v2.read_reader_state(cur, allow_missing=False)
+    finally:
+        cur.close()
+        conn.close()
+    if (
+        state.revision != result['reader_revision']
+        or tm_v2.inactive_slot(state) != result['candidate_slot']
+    ):
+        raise AirflowException('reader revision/candidate slot changed during crawl')
+    explicit_scope_selection = bool(
+        params.get('scopes') or params.get('leagues')
+    )
+    result['explicit_scope_selection'] = explicit_scope_selection
+    if not result['coverage_complete']:
+        result['promotion_ready'] = False
+        result['transform_conf'] = None
+        result['next_action'] = (
+            'capture the remaining bounded registry scopes; a partial registry '
+            'coverage set cannot build or promote an inactive slot'
+        )
+    else:
+        result['promotion_ready'] = True
+        result['transform_conf'] = {
+            'transfermarkt_parent_cycle_id': result['parent_cycle_id'],
+            'transfermarkt_scope_set_id': result['scope_set_id'],
+            'transfermarkt_scope_set_manifest': result['scope_set_manifest'],
+            'transfermarkt_reader_revision': result['reader_revision'],
+            'transfermarkt_candidate_slot': result['candidate_slot'],
+        }
+        result['next_action'] = (
+            'issue fresh exact Silver and Gold production-write packets, then '
+            'trigger dag_transform_transfermarkt_silver with transform_conf plus '
+            'the packet refs and approval journal'
+        )
+    return result
 
 
 with DAG(
     dag_id='dag_ingest_transfermarkt',
     default_args=SCRAPER_ARGS,
-    description='Ingest Transfermarkt player + transfer Bronze (issue #43)',
+    description='Bounded registry-driven Transfermarkt native-v2 ingest',
     schedule=SCHEDULES.get('dag_ingest_transfermarkt', '0 4 * * 1'),
     start_date=datetime(2024, 1, 1),
     catchup=False,
+    render_template_as_native_obj=True,
     tags=DAG_TAGS.get(
-        'transfermarkt',
-        ['scraping', 'transfermarkt', 'bronze', 'football'],
+        'transfermarkt', ['scraping', 'transfermarkt', 'bronze', 'football'],
     ),
     max_active_runs=1,
     params={
-        'leagues': LEAGUES,
-        # Season is UI-configurable: the weekly scheduled run uses the default
-        # (CURRENT_SEASON); to backfill a past season, use "Trigger DAG w/ config"
-        # and set season (e.g. 2016 = 2016/17). New (league, season) partitions
-        # are written via replace_partitions, so backfilling an early season
-        # leaves all other partitions untouched (issue #717, epic #708).
+        'scopes': Param(default=[], type='array'),
+        'leagues': Param(default=[], type='array'),
         'season': Param(
-            default=CURRENT_SEASON,
-            type='integer',
-            minimum=2000,
-            maximum=CURRENT_SEASON,
-            title='Season (start year)',
-            description=(
-                'APL season start year (2016 = 2016/17 season). '
-                'Default = current season for the weekly run. Override here to '
-                'backfill a past season (e.g. 2016…2024 for 10-season history).'
-            ),
+            default=None,
+            type=['null', 'integer'],
+            minimum=1900,
+            maximum=CURRENT_SEASON + 1,
         ),
-        # market_value_history / transfers fan out per-player, so the weekly run
-        # caps each at MV_HISTORY_DAILY_LIMIT (100) and rotates the roster window
-        # (#620) — the full roster accumulates over ~6 weeks. That one-shot
-        # window is too shallow for a historical backfill (~100 of ~750 players),
-        # so the cap is UI-configurable: set 0 = no cap = full roster in one run
-        # (issue #793). The default leaves the weekly window behaviour unchanged.
+        'registry_snapshot_id': Param(default='', type='string'),
+        'max_batch': Param(
+            default=MAX_SCOPE_BATCH, type='integer', minimum=1, maximum=8,
+        ),
+        'approval_journal': Param(default=APPROVAL_JOURNAL, type='string'),
+        'approval_bundles': Param(default={}, type='object'),
         'mv_transfers_limit': Param(
             default=MV_HISTORY_DAILY_LIMIT,
-            type='integer',
-            minimum=0,
-            title='MV/transfers roster cap',
-            description=(
-                'Players per run for market_value_history / transfers. '
-                '100 = weekly rotating window (#620). 0 = full roster in one '
-                'run (historical backfill, #793).'
-            ),
+            type='integer', minimum=1, maximum=100,
+        ),
+        'refresh_mode': Param(
+            default='auto', type='string',
+            enum=['auto', 'current', 'historical', 'force'],
+        ),
+        'coach_history_ttl_days': Param(
+            default=COACH_HISTORY_TTL_DAYS,
+            type='integer', minimum=1, maximum=90,
+        ),
+        'checkpoint_ttl_days': Param(
+            default=CHECKPOINT_TTL_DAYS,
+            type='integer', minimum=1, maximum=90,
+        ),
+        'proxy_lease_ttl_seconds': Param(
+            default=3600, type='integer', minimum=60, maximum=3600,
+        ),
+        'proxy_request_limit': Param(
+            default=PROXY_REQUEST_LIMIT,
+            type='integer', minimum=1, maximum=PROXY_REQUEST_LIMIT,
+        ),
+        'proxy_retry_limit': Param(
+            default=PROXY_RETRY_LIMIT,
+            type='integer', minimum=0, maximum=2,
+        ),
+        'entity_timeout_seconds': Param(
+            default=3600, type='integer', minimum=60, maximum=3600,
         ),
     },
     doc_md="""
-    ## Transfermarkt Data Ingestion (Issue #43)
-
-    Bronze ingest for Transfermarkt player snapshots, market-value history,
-    and transfer events.
-
-    ### Architecture
-
-    - BashOperator per entity (isolated subprocess for memory safety)
-    - ``scrape_players`` is the anchor — MV history and transfers resolve
-      their player_id roster from ``bronze.transfermarkt_players``
-    - ``validate_data`` (PythonOperator, ``trigger_rule='all_done'``)
-      aggregates per-entity row counts and flags soft TM_FALLBACK exits
-
-    ### Bronze tables written
-    - ``iceberg.bronze.transfermarkt_players`` (partition: league/season)
-    - ``iceberg.bronze.transfermarkt_market_value_history`` (partition: league/season)
-    - ``iceberg.bronze.transfermarkt_transfers`` (partition: league/season)
-
-    ``players`` is a full crawl written with whole-partition replace
-    (``replace_partitions=['league','season']``). ``market_value_history`` and
-    ``transfers`` are rate-capped to ~100 players/run, so each run scrapes the
-    NEXT rotating roster window (``--as-of-date {{ ds }}`` → window index) and
-    **upserts by player** (``replace_partitions=['league','season','player_id']``)
-    so prior windows accumulate — full roster covered over ~6 weekly runs (#620).
-
-    ### Backfill past seasons (issue #717, epic #708)
-
-    Season is UI-configurable via the ``season`` Param. Use "Trigger DAG w/
-    config" and set ``season`` to a start year (e.g. 2016 = 2016/17) to ingest a
-    past season; ``replace_partitions`` keeps other ``(league, season)``
-    partitions untouched. ``players`` and ``coaches`` are full per-season crawls.
-    ``market_value_history`` / ``transfers`` default to one rotating ~100-player
-    window per run (keyed on ``{{ ds }}``); for a historical backfill that one
-    window is too shallow (~100 of ~750 players), so set ``mv_transfers_limit=0``
-    in the trigger config to scrape the **full roster in a single run** (issue
-    #793). Example backfill config: ``{"season": 2018, "mv_transfers_limit": 0}``.
+    The scheduled run reads only the promoted central competition registry.
+    Empty selectors mean all due eligible senior-men scopes, capped at eight.
+    Every mapped child needs separate one-shot paid-proxy and production-write
+    approvals. Unknown classification, missing approval, missing manifest,
+    unknown provider traffic, reader drift, or DQ failure blocks scope-set
+    completion. Silver/Gold are a second Airflow phase because their exact
+    one-shot approvals can only be issued after this DAG computes scope_set_id.
+    Scheduled empty selectors are capture-only; only an explicit bounded
+    scopes/leagues run can become promotion-ready.
     """,
 ) as dag:
+    preflight_reader_route_task = PythonOperator(
+        task_id='preflight_reader_route_for_paid_cycle',
+        python_callable=_preflight_reader_route_for_paid_cycle,
+    )
 
-    league = LEAGUES[0]
-    # --season is rendered at runtime from params.season (Jinja), so the season
-    # is UI-configurable ("Trigger DAG w/ config") without a separate backfill
-    # DAG. The f-string escapes {{ }} as {{{{ }}}} so the literal Jinja tag
-    # survives into the rendered command (mirrors dag_ingest_matchhistory #710).
-    players_limit_arg = f' --limit {PLAYERS_DAILY_LIMIT}' if PLAYERS_DAILY_LIMIT else ''
+    plan_exact_scopes_task = PythonOperator(
+        task_id='plan_exact_scopes',
+        python_callable=_plan_exact_scopes,
+    )
 
-    scrape_players_task = BashOperator(
-        task_id='scrape_players',
-        bash_command=f"""
-cd /opt/airflow && \\
-rm -f {PLAYERS_RESULT_PATH} && \\
-python dags/scripts/run_transfermarkt_scraper.py \\
-    --entity players \\
-    --league "{league}" \\
-    --season {{{{ params.season }}}}{players_limit_arg} \\
-    --output {PLAYERS_RESULT_PATH}
-rc=$?
-if [ $rc -eq 2 ]; then
-    echo "TM_FALLBACK exit-code 2 (players) — propagating as soft success."
-    exit 0
-fi
-exit $rc
-""",
-        env={
-            'PYTHONPATH': '/opt/airflow:/opt/airflow/dags',
-            'PATH': '/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin',
-            'HOME': '/home/airflow',
-        },
+    run_exact_child_cycle_task = BashOperator.partial(
+        task_id='run_exact_child_cycle',
+        bash_command=r'''set -euo pipefail
+cd /opt/airflow
+exec python dags/scripts/run_transfermarkt_scope_cycle.py \
+  --payload-json "$TM_SCOPE_PAYLOAD_JSON" \
+  --reader-revision "$TM_READER_REVISION" \
+  --candidate-slot "$TM_CANDIDATE_SLOT" \
+  --write-mode "$TM_WRITE_MODE" \
+  --approval-journal "$TM_APPROVAL_JOURNAL" \
+  --paid-proxy-approval-packet-id "$TM_PAID_APPROVAL_PACKET_ID" \
+  --paid-proxy-approval-packet-hash "$TM_PAID_APPROVAL_PACKET_HASH" \
+  --production-write-approval-packet-id "$TM_WRITE_APPROVAL_PACKET_ID" \
+  --production-write-approval-packet-hash "$TM_WRITE_APPROVAL_PACKET_HASH" \
+  --career-window-limit "$TM_MV_TRANSFERS_LIMIT" \
+  --refresh-mode "$TM_REFRESH_MODE" \
+  --coach-history-ttl-days "$TM_COACH_HISTORY_TTL_DAYS" \
+  --checkpoint-ttl-days "$TM_CHECKPOINT_TTL_DAYS" \
+  --lease-ttl-seconds "$TM_PROXY_LEASE_TTL_SECONDS" \
+  --entity-timeout-seconds "$TM_ENTITY_TIMEOUT_SECONDS" \
+  --cycle-budget-bytes "$TM_PROVIDER_HARD_CAP_BYTES" \
+  --soft-byte-stop-bytes "$TM_PROVIDER_SOFT_STOP_BYTES" \
+  --request-limit "$TM_PROXY_REQUEST_LIMIT" \
+  --retry-limit "$TM_PROXY_RETRY_LIMIT"''',
         append_env=True,
+        retries=0,
+        pool='transfermarkt_proxy',
+        pool_slots=1,
+        max_active_tis_per_dag=1,
+        execution_timeout=timedelta(hours=4, minutes=15),
+        do_xcom_push=False,
+    ).expand(env=plan_exact_scopes_task.output)
+
+    validate_scope_set_task = PythonOperator(
+        task_id='validate_scope_set',
+        python_callable=_validate_scope_set,
     )
 
-    scrape_mv_history_task = BashOperator(
-        task_id='scrape_market_value_history',
-        bash_command=f"""
-cd /opt/airflow && \\
-rm -f {MV_HISTORY_RESULT_PATH} && \\
-python dags/scripts/run_transfermarkt_scraper.py \\
-    --entity market_value_history \\
-    --league "{league}" \\
-    --season {{{{ params.season }}}} \\
-    --limit {{{{ params.mv_transfers_limit }}}} \\
-    --as-of-date {{{{ ds }}}} \\
-    --output {MV_HISTORY_RESULT_PATH}
-rc=$?
-if [ $rc -eq 2 ]; then
-    echo "TM_FALLBACK exit-code 2 (mv_history) — propagating as soft success."
-    exit 0
-fi
-exit $rc
-""",
-        env={
-            'PYTHONPATH': '/opt/airflow:/opt/airflow/dags',
-            'PATH': '/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin',
-            'HOME': '/home/airflow',
-        },
-        append_env=True,
+    (
+        preflight_reader_route_task
+        >> plan_exact_scopes_task
+        >> run_exact_child_cycle_task
+        >> validate_scope_set_task
     )
-
-    scrape_transfers_task = BashOperator(
-        task_id='scrape_transfers',
-        bash_command=f"""
-cd /opt/airflow && \\
-rm -f {TRANSFERS_RESULT_PATH} && \\
-python dags/scripts/run_transfermarkt_scraper.py \\
-    --entity transfers \\
-    --league "{league}" \\
-    --season {{{{ params.season }}}} \\
-    --limit {{{{ params.mv_transfers_limit }}}} \\
-    --as-of-date {{{{ ds }}}} \\
-    --output {TRANSFERS_RESULT_PATH}
-rc=$?
-if [ $rc -eq 2 ]; then
-    echo "TM_FALLBACK exit-code 2 (transfers) — propagating as soft success."
-    exit 0
-fi
-exit $rc
-""",
-        env={
-            'PYTHONPATH': '/opt/airflow:/opt/airflow/dags',
-            'PATH': '/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin',
-            'HOME': '/home/airflow',
-        },
-        append_env=True,
-    )
-
-    # issue #434: head coaches → bronze.transfermarkt_coaches. Independent of
-    # scrape_players (discovers via club staff pages, not the players table).
-    scrape_coaches_task = BashOperator(
-        task_id='scrape_coaches',
-        bash_command=f"""
-cd /opt/airflow && \\
-rm -f {COACHES_RESULT_PATH} && \\
-python dags/scripts/run_transfermarkt_scraper.py \\
-    --entity coaches \\
-    --league "{league}" \\
-    --season {{{{ params.season }}}} \\
-    --output {COACHES_RESULT_PATH}
-rc=$?
-if [ $rc -eq 2 ]; then
-    echo "TM_FALLBACK exit-code 2 (coaches) — propagating as soft success."
-    exit 0
-fi
-exit $rc
-""",
-        env={
-            'PYTHONPATH': '/opt/airflow:/opt/airflow/dags',
-            'PATH': '/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin',
-            'HOME': '/home/airflow',
-        },
-        append_env=True,
-    )
-
-    validate_task = PythonOperator(
-        task_id='validate_data',
-        python_callable=validate_data,
-        trigger_rule='all_done',
-    )
-
-    def _check_traffic_guard(**ctx):
-        """Residential-MB kill-switch per entity (mirrors the FBref guard).
-
-        Thresholds are sized for the squad-first crawl (players ≈ 4-5 MB,
-        coaches ≈ 3-4 MB, ceapi entities ≈ 0.5-7 MB incl. full-roster
-        backfills) with headroom for retries. Override per entity via
-        Airflow Variable ``tm_proxy_mb_threshold_<entity>`` or globally via
-        ``tm_proxy_mb_threshold``.
-        """
-        from utils.proxy_traffic import check_result_traffic_guard
-
-        return check_result_traffic_guard(
-            entity_paths={
-                'players': PLAYERS_RESULT_PATH,
-                'market_value_history': MV_HISTORY_RESULT_PATH,
-                'transfers': TRANSFERS_RESULT_PATH,
-                'coaches': COACHES_RESULT_PATH,
-            },
-            default_thresholds={
-                'players': 10.0,
-                'market_value_history': 4.0,
-                'transfers': 8.0,
-                'coaches': 6.0,
-            },
-        )
-
-    # Parallel leaf, not part of the validate → silver chain: a budget breach
-    # turns the run red (Telegram via SCRAPER_ARGS callbacks) but does NOT
-    # block promoting the already-paid-for data to Silver.
-    traffic_guard_task = PythonOperator(
-        task_id='check_traffic_guard',
-        python_callable=_check_traffic_guard,
-        trigger_rule='all_done',
-    )
-
-    def _validate_bronze_quality(**ctx) -> None:
-        """Trino-level CHECK gate over the 3 Transfermarkt Bronze tables.
-
-        transfermarkt_players checks (row_count/no_duplicates/no_nulls/
-        freshness) are ERROR-severity (promoted after green weekly runs,
-        issue #48). market_value_history / transfers row_count stay
-        WARNING — a TM_FALLBACK soft exit upstream would otherwise
-        legitimately fail them.
-        """
-        from utils.data_quality import CHECK, run_checks
-
-        # Season comes from params (UI-configurable, #717): a backfill run gates
-        # against the season it actually scraped, not CURRENT_SEASON — otherwise
-        # the checks query an empty (league, current-season) partition and the
-        # ERROR row_count gate fails the historical run.
-        season = int(ctx['params']['season'])
-        season_short = (
-            f"{str(season)[2:4]}"
-            f"{(int(str(season)[2:4]) + 1) % 100:02d}"
-        )
-        where = f"league = '{LEAGUES[0]}' AND season = '{season_short}'"
-        checks = [
-            CHECK.row_count(
-                'bronze.transfermarkt_players',
-                min_rows=400, where=where, severity='ERROR',
-            ),
-            # PK includes current_club_id: a player can legitimately appear in
-            # two clubs' squads within one historical season (mid-season
-            # transfer / loan — e.g. Sancho, Rashford in 2024/25), so the raw
-            # Bronze grain is (league, season, player_id, club). Keying on
-            # player_id alone false-flagged ~9–31 such rows per backfilled
-            # season as duplicates (#717). Silver dedups to per-player.
-            CHECK.no_duplicates(
-                'bronze.transfermarkt_players',
-                pk=['league', 'season', 'player_id', 'current_club_id'],
-                where=where, severity='ERROR',
-            ),
-            CHECK.no_nulls(
-                'bronze.transfermarkt_players',
-                cols=['player_id', 'name'],
-                where=where, severity='ERROR',
-            ),
-            CHECK.freshness(
-                'bronze.transfermarkt_players',
-                ts_col='_ingested_at', max_age_hours=48,
-                where=where, severity='ERROR',
-            ),
-            CHECK.row_count(
-                'bronze.transfermarkt_market_value_history',
-                min_rows=500, where=where, severity='WARNING',
-            ),
-            CHECK.row_count(
-                'bronze.transfermarkt_transfers',
-                min_rows=50, where=where, severity='WARNING',
-            ),
-            # coaches (issue #434): ~20 head coaches/season. WARNING — a
-            # TM_FALLBACK soft exit upstream would otherwise fail it.
-            CHECK.row_count(
-                'bronze.transfermarkt_coaches',
-                min_rows=15, where=where, severity='WARNING',
-            ),
-            # Rotating-window roster coverage (#620): every player of the
-            # scraped season should accumulate mv_history/transfers rows
-            # within ~6 weekly runs. WARNING-only (error_threshold=0):
-            # the first weeks after a season start / fresh backfill are
-            # legitimately below target and must not block Silver.
-            CHECK.coverage(
-                'bronze.transfermarkt_players',
-                condition=(
-                    'player_id IN (SELECT player_id FROM '
-                    'iceberg.bronze.transfermarkt_market_value_history)'
-                ),
-                where=where,
-                warn_threshold=0.90,
-                error_threshold=0.0,
-                name='mv_history_roster_coverage',
-            ),
-            CHECK.coverage(
-                'bronze.transfermarkt_players',
-                condition=(
-                    'player_id IN (SELECT player_id FROM '
-                    'iceberg.bronze.transfermarkt_transfers)'
-                ),
-                where=where,
-                warn_threshold=0.90,
-                error_threshold=0.0,
-                name='transfers_roster_coverage',
-            ),
-        ]
-        report = run_checks(checks, raise_on_error=True)
-        import logging
-        logging.getLogger(__name__).info(
-            "validate_bronze_quality: %s", report.summary(),
-        )
-
-    validate_bronze_quality_task = PythonOperator(
-        task_id='validate_bronze_quality',
-        python_callable=_validate_bronze_quality,
-        trigger_rule='all_done',
-    )
-
-    # Cascade Bronze→Silver: triggers dag_transform_transfermarkt_silver
-    # (issue #60). wait_for_completion=False keeps Bronze DAG short; the
-    # Silver DAG runs its own DQ gate.
-    trigger_silver_task = TriggerDagRunOperator(
-        task_id='trigger_silver',
-        trigger_dag_id='dag_transform_transfermarkt_silver',
-        wait_for_completion=False,
-        reset_dag_run=True,
-    )
-
-    scrape_players_task >> scrape_mv_history_task
-    scrape_players_task >> scrape_transfers_task
-    [
-        scrape_players_task,
-        scrape_mv_history_task,
-        scrape_transfers_task,
-        scrape_coaches_task,
-    ] >> validate_task >> validate_bronze_quality_task >> trigger_silver_task
-    [
-        scrape_players_task,
-        scrape_mv_history_task,
-        scrape_transfers_task,
-        scrape_coaches_task,
-    ] >> traffic_guard_task

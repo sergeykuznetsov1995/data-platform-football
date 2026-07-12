@@ -49,8 +49,9 @@ source:
           - "^bronze$"
           - "^silver$"
           - "^gold$"
-      # We don't have views in the medallion stack, but keep flag explicit.
-      processViewLineage: false
+      # Canonical WhoScored manifest-backed readers and Transfermarkt A/B
+      # readers are views. Preserve lineage through their serving boundaries.
+      processViewLineage: true
       processQueryLineage: true
       processStoredProcedureLineage: false
       # SqlGlot handles Trino dialect well (CTAS, WITH, window functions used in Gold).

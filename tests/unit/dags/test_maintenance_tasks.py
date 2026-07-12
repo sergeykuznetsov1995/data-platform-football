@@ -28,7 +28,9 @@ class TestHighChurnBronzeAllowlist:
         # Sanity: at least the historically-known offenders are present.
         for table in (
             "whoscored_events",
+            "whoscored_lineups",
             "whoscored_schedule",
+            "whoscored_match_ingest_manifest",
             "fbref_match_events",
         ):
             assert table in HIGH_CHURN_BRONZE, (

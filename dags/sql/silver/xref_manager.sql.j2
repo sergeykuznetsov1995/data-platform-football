@@ -9,11 +9,11 @@
 --   * FotMob        — iceberg.bronze.fotmob_player_details WHERE is_coach =
 --                     true. Carries a STABLE coachId (player_id) kept verbatim
 --                     in source_id, plus the coach name for cross-source gluing.
---   * Transfermarkt — iceberg.bronze.transfermarkt_coaches (club trainer-history
---                     pages, #619). Carries a STABLE coach_id (source_id) plus
---                     dob/nationality consumed downstream by dim_manager via
---                     the xref bridge (was: direct name-join in
---                     transfermarkt_coaches.sql.j2, now DEPRECATED there).
+--   * Transfermarkt — native iceberg.bronze.transfermarkt_coach_stints plus
+--                     transfermarkt_coach_profiles. Carries a STABLE coach_id
+--                     (source_id); league/season scope comes from the native
+--                     squad membership for the stint's club. Global dob /
+--                     nationality are consumed downstream through the bridge.
 --
 -- Cross-source identity — match cascade (strongest first):
 --   1. name_alias     — manager_aliases.yaml override (human-curated raw form →
@@ -177,12 +177,31 @@ fotmob_coach AS (
     WHERE rn = 1
 ),
 
+tm_profile AS (
+    -- Native profiles are global and append-safe. Collapse defensively before
+    -- joining stints so a retried batch cannot fan out the scoped coach row or
+    -- make the name fallback depend on planner order.
+    SELECT coach_id, name
+    FROM (
+        SELECT
+            CAST(coach_id AS varchar)                           AS coach_id,
+            name,
+            ROW_NUMBER() OVER (
+                PARTITION BY CAST(coach_id AS varchar)
+                ORDER BY _ingested_at DESC, _batch_id DESC
+            )                                                   AS rn
+        FROM iceberg.bronze.transfermarkt_coach_profiles
+        WHERE coach_id IS NOT NULL
+    )
+    WHERE rn = 1
+),
+
 tm_coach AS (
-    -- One coach row per (coach_id, league, season); Bronze ingest mode is
-    -- replace_partitions so ROW_NUMBER keeps the freshest physical row (same
-    -- dedup idiom as transfermarkt_coaches.sql.j2). season is ALREADY the
-    -- varchar slug in TM Bronze (scrapers/transfermarkt/scraper.py::_season_short)
-    -- — no LPAD conversion, and the name_initial join below is slug=slug.
+    -- One coach row per (coach_id, league, season). Coach stints are global,
+    -- so league/season is projected only through a native membership of the
+    -- same club; this recreates the resolver scope without restoring the
+    -- legacy coach snapshot table. Profiles provide a name fallback for a
+    -- stint whose page omitted it.
     SELECT
         coach_id,
         name,
@@ -198,20 +217,51 @@ tm_coach AS (
         )                                                       AS initial_key_dup
     FROM (
         SELECT
-            CAST(coach_id AS varchar)                           AS coach_id,
-            name,
-            league,
-            season,
+            CAST(s.coach_id AS varchar)                         AS coach_id,
+            COALESCE(s.name, p.name)                            AS name,
+            m.league,
+            m.season,
             LOWER(REGEXP_REPLACE(
-                REGEXP_REPLACE(NORMALIZE(name, NFD), '\p{Mn}+', ''),
+                REGEXP_REPLACE(
+                    NORMALIZE(COALESCE(s.name, p.name), NFD), '\p{Mn}+', ''),
                 '[^a-zA-Z0-9]+', '_'))                          AS norm,
             ROW_NUMBER() OVER (
-                PARTITION BY coach_id, league, season
-                ORDER BY _ingested_at DESC
+                PARTITION BY s.coach_id, m.league, m.season
+                ORDER BY s._ingested_at DESC, s._batch_id DESC
             )                                                   AS rn
-        FROM iceberg.bronze.transfermarkt_coaches
-        WHERE coach_id IS NOT NULL
-          AND name IS NOT NULL AND name <> ''
+        FROM iceberg.bronze.transfermarkt_coach_stints s
+        JOIN (
+            SELECT DISTINCT
+                CAST(club_id AS varchar) AS club_id,
+                league,
+                season,
+                TRY_CAST(
+                    CONCAT('20', SUBSTR(season, 1, 2), '-07-01') AS date
+                ) AS season_start,
+                TRY_CAST(
+                    CONCAT('20', SUBSTR(season, 3, 2), '-06-30') AS date
+                ) AS season_end
+            FROM iceberg.bronze.transfermarkt_squad_memberships
+            WHERE club_id IS NOT NULL
+              AND REGEXP_LIKE(season, '^[0-9]{4}$')
+        ) m ON m.club_id = CAST(s.club_id AS varchar)
+        LEFT JOIN tm_profile p
+          ON CAST(p.coach_id AS varchar) = CAST(s.coach_id AS varchar)
+        WHERE s.coach_id IS NOT NULL
+          AND COALESCE(s.name, p.name) IS NOT NULL
+          AND COALESCE(s.name, p.name) <> ''
+          -- A global club history must not attach every coach ever employed
+          -- by that club to every requested season. Unknown/invalid intervals
+          -- fail closed instead of being treated as all-season tenures.
+          AND (s.appointed_date IS NOT NULL OR s.left_date IS NOT NULL)
+          AND (
+              s.appointed_date IS NULL
+              OR TRY_CAST(s.appointed_date AS date) <= m.season_end
+          )
+          AND (
+              s.left_date IS NULL
+              OR TRY_CAST(s.left_date AS date) >= m.season_start
+          )
     )
     WHERE rn = 1
 ),

@@ -1,0 +1,19 @@
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.whoscored_lineups_current
+  description: |
+    Канонические составы WhoScored parser v7. Представление публикует строки
+    только для последнего успешного match manifest по game_id. Grain — один
+    игрок одной команды в матче.
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: game_id
+    description: Числовой идентификатор матча WhoScored.
+  - name: team_id
+    description: Числовой идентификатор команды WhoScored.
+  - name: player_id
+    description: Числовой идентификатор игрока WhoScored.
+  - name: _game_batch_id
+    description: Идентификатор успешно опубликованного match batch.

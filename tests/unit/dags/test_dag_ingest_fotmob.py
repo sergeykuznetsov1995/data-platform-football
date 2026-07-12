@@ -1,16 +1,8 @@
-"""
-Unit tests for ``dags/dag_ingest_fotmob.py``.
+"""Unit tests for the source-native FotMob ingestion DAG.
 
-Verifies the regression fix that adds ``append_env=True`` to the
-``scrape_fotmob_data`` BashOperator. Without it, the operator passes ONLY
-the explicit ``env`` dict to the subprocess, so anything the Airflow
-container relies on (PYTHONPATH extensions, TRINO_PASSWORD, etc.) is
-stripped — and the scraper aborts during import or Trino auth.
-
-These tests run on the host where Airflow is NOT installed, so they
-rely on the lightweight ``airflow.*`` stubs installed by
-``tests/unit/dags/conftest.py`` (DAG, BashOperator, PythonOperator,
-@dag/@task decorators).
+The host uses lightweight Airflow stubs. Tests cover environment inheritance,
+exact-scope params, one schedule owner, run-specific reports, the dedicated
+HTTP pool and fail-closed native validation.
 """
 
 from __future__ import annotations
@@ -85,8 +77,7 @@ class TestFotmobBashOperatorEnv:
         from airflow.operators.bash import BashOperator  # stub
 
         scrape_tasks = [
-            op for op in BashOperator._instances
-            if op.task_id == "scrape_fotmob_data"
+            op for op in BashOperator._instances if op.task_id == "scrape_fotmob_data"
         ]
         assert len(scrape_tasks) == 1, (
             f"Expected exactly one scrape_fotmob_data BashOperator, "
@@ -111,8 +102,7 @@ class TestFotmobBashOperatorEnv:
         from airflow.operators.bash import BashOperator  # stub
 
         task = next(
-            op for op in BashOperator._instances
-            if op.task_id == "scrape_fotmob_data"
+            op for op in BashOperator._instances if op.task_id == "scrape_fotmob_data"
         )
 
         assert task.env is not None, "explicit env dict must be set"
@@ -120,94 +110,141 @@ class TestFotmobBashOperatorEnv:
         assert "/opt/airflow" in task.env["PYTHONPATH"]
 
 
-class TestFotmobSeasonBackfillParam:
-    """#714: season must be a UI-configurable Param wired into the scrape
-    command via Jinja, so past seasons can be backfilled with "Trigger DAG
-    w/ config" (mirrors ESPN #713 / MatchHistory #710)."""
+class TestFotmobNativeParams:
+    """Native runs use exact FotMob scopes instead of calculated years."""
 
     @pytest.mark.unit
-    def test_season_is_ui_configurable_param(self):
-        """``params['season']`` must be an Airflow ``Param`` defaulting to the
-        current season (not a bare int) so the UI exposes a season override."""
+    def test_mode_and_scope_are_ui_configurable_params(self):
         mod = _reload_dag_module()
 
         from airflow.models.param import Param  # stub
-        from utils.config import CURRENT_SEASON
 
-        season = mod.dag._dag_kwargs["params"]["season"]
-        assert isinstance(season, Param), (
-            "season must be wrapped in a Param so it is UI-configurable for "
-            "backfill, not a hardcoded int"
-        )
-        assert season.default == CURRENT_SEASON, (
-            "the daily scheduled run must still default to CURRENT_SEASON"
-        )
+        params = mod.dag._dag_kwargs["params"]
+        assert isinstance(params["mode"], Param)
+        assert params["mode"].default == "daily"
+        assert isinstance(params["scope"], Param)
+        assert params["scope"].default == ""
+        assert "season" not in params
 
     @pytest.mark.unit
-    def test_scrape_command_renders_season_from_params(self):
-        """The bash command must pass ``--season {{ params.season }}`` (Jinja),
-        NOT a hardcoded season literal — otherwise the UI override is ignored
-        and every run scrapes CURRENT_SEASON."""
+    def test_scrape_command_renders_native_mode_and_exact_scope(self):
         _reload_dag_module()
 
         from airflow.operators.bash import BashOperator  # stub
 
         task = next(
-            op for op in BashOperator._instances
-            if op.task_id == "scrape_fotmob_data"
+            op for op in BashOperator._instances if op.task_id == "scrape_fotmob_data"
         )
 
-        assert "--season {{ params.season }}" in task.bash_command, (
-            "season must be rendered from params.season at runtime so the "
-            "backfill override takes effect"
-        )
+        assert '--mode "{{ params.mode }}"' in task.bash_command
+        assert '--scope "{{ params.scope }}"' in task.bash_command
+        assert "--season " not in task.bash_command
+        assert "--leagues " not in task.bash_command
 
 
-class TestTournamentFanOut:
-    """#920 Phase 1: club leagues stay in the original scrape_fotmob_data
-    task (task_id/output/Jinja-season unchanged); each single-year tournament
-    (e.g. INT-World Cup) gets its own dedicated task, always present in the
-    graph (the runner's own #920 bridge resolves/no-ops it)."""
+class TestDynamicDiscoveryDag:
+    """One native task dynamically discovers club and tournament identities."""
 
     @pytest.mark.unit
-    def test_club_task_excludes_tournament_leagues(self):
+    def test_one_native_task_has_run_specific_output_and_http_pool(self):
         _reload_dag_module()
 
         from airflow.operators.bash import BashOperator  # stub
 
         task = next(
-            op for op in BashOperator._instances
-            if op.task_id == "scrape_fotmob_data"
+            op for op in BashOperator._instances if op.task_id == "scrape_fotmob_data"
         )
-        assert '--leagues "ENG-Premier League"' in task.bash_command
-        assert "INT-World Cup" not in task.bash_command
-        assert "/tmp/fotmob_result.json" in task.bash_command
+        assert "{{ ts_nodash }}_{{ ti.try_number }}" in task.bash_command
+        assert "/tmp/fotmob_result_" in task.bash_command
+        assert task._init_kwargs["pool"] == "fotmob_http_pool"
 
     @pytest.mark.unit
-    def test_tournament_task_exists_dedicated(self):
+    def test_no_hardcoded_tournament_fanout(self):
         _reload_dag_module()
 
         from airflow.operators.bash import BashOperator  # stub
 
-        task = next(
-            (op for op in BashOperator._instances
-             if op.task_id == "scrape_fotmob_data_int_world_cup"),
-            None,
-        )
-        assert task is not None
-        assert '--leagues "INT-World Cup"' in task.bash_command
-        assert "--season {{ params.season }}" in task.bash_command
-        assert "/tmp/fotmob_result_int_world_cup.json" in task.bash_command
+        assert [op.task_id for op in BashOperator._instances] == ["scrape_fotmob_data"]
 
     @pytest.mark.unit
-    def test_club_only_leagues_produce_no_tournament_task(self, monkeypatch):
-        import utils.config as config
+    def test_master_is_single_schedule_owner(self):
+        mod = _reload_dag_module()
 
-        monkeypatch.setattr(config, "LEAGUES", ["ENG-Premier League"])
-        _reload_dag_module()
+        assert mod.dag._dag_kwargs["schedule"] is None
 
-        from airflow.operators.bash import BashOperator  # stub
 
-        task_ids = {op.task_id for op in BashOperator._instances}
-        assert "scrape_fotmob_data_int_world_cup" not in task_ids
-        assert "scrape_fotmob_data" in task_ids
+class TestNativeValidation:
+    @pytest.mark.unit
+    def test_incomplete_native_report_fails(self, tmp_path):
+        import json
+
+        from airflow.exceptions import AirflowException
+
+        mod = _reload_dag_module()
+        report = tmp_path / "report.json"
+        report.write_text(
+            json.dumps(
+                {
+                    "mode": "daily",
+                    "status": "incomplete",
+                    "complete": False,
+                    "operations": [],
+                    "transport": {"proxy_bytes": 0},
+                    "budget": {"requests": 1, "max_requests": 2000},
+                    "errors": ["schema drift"],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with pytest.raises(AirflowException, match="Incomplete FotMob"):
+            mod.validate_data(str(report))
+
+    @pytest.mark.unit
+    def test_complete_direct_native_report_passes(self, tmp_path):
+        import json
+
+        mod = _reload_dag_module()
+        report = tmp_path / "report.json"
+        report.write_text(
+            json.dumps(
+                {
+                    "run_id": "run-1",
+                    "mode": "daily",
+                    "status": "success",
+                    "complete": True,
+                    "operations": [
+                        {
+                            "entity": "competition_catalog",
+                            "status": "review_required",
+                            "errors": [],
+                            "retryable": [],
+                            "terminal": [],
+                            "counts": {"competitions": 10},
+                        }
+                    ],
+                    "transport": {
+                        "attempts": 1,
+                        "direct_bytes": 100,
+                        "proxy_bytes": 0,
+                    },
+                    "budget": {
+                        "requests": 1,
+                        "max_requests": 2000,
+                        "direct_bytes": 100,
+                        "max_direct_bytes": 1024,
+                        "proxy_bytes": 0,
+                        "max_proxy_bytes": 0,
+                    },
+                    "errors": [],
+                    "rows": {"competition_catalog": 10},
+                    "tables": ["iceberg.bronze.fotmob_competitions"],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        validation = mod.validate_data(str(report))
+
+        assert validation["status"] == "success"
+        assert validation["transport"]["proxy_bytes"] == 0

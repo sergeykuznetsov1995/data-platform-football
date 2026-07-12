@@ -136,7 +136,7 @@ databases:
           Единая поминутная хроника матча (#427): голы, карточки, замены в одной
           таблице. Заменяет дропнутые fct_goal/fct_card/fct_substitution (#448).
           Зерно: (match_id, event_seq). Источники: silver.fbref_match_events
-          (primary) ∪ bronze.whoscored_events (per-match fallback).
+          (primary) ∪ silver.whoscored_events_spadl (per-match fallback).
           event_type — словарь из 8 значений; score_home/away_after — счёт после события.
         default_endpoint: null
         cache_timeout: 3600
@@ -161,6 +161,6 @@ databases:
         schema: gold
         description: |
           Travail/injuries/suspensions: per-(match, player, reason).
-          Источник: silver.whoscored_missing_players. E5.
+          Источник: silver.whoscored_player_unavailable. E5.
         default_endpoint: null
         cache_timeout: 3600

@@ -48,6 +48,8 @@ without warning.
 
 from __future__ import annotations
 
+import datetime
+
 import os
 import re
 from functools import lru_cache
@@ -327,14 +329,16 @@ def _validate_player_aliases_schema(doc: Dict) -> None:
         aliases:
           - source: understat
             source_id: "12345"
+            action: map | orphan              # optional; defaults to map
             fbref_player_id: "abcdef12"
             season: "2425" | "*"
             reason: "..."                     # optional
 
-    Required fields per entry: ``source``, ``source_id``, ``fbref_player_id``,
-    ``season``. ``reason`` is optional but encouraged. Unknown keys are
-    permitted (forward-compatibility) but flagged via ValueError if the
-    required keys are missing.
+    Required fields per entry: ``source``, ``source_id`` and ``season``.
+    ``action`` defaults to ``map`` for backwards compatibility. Mapping rules
+    additionally require ``fbref_player_id``; explicit ``orphan`` rules omit
+    it and act as negative identity overrides. ``reason`` is optional but
+    encouraged. Unknown keys are permitted for forward compatibility.
     """
     if not isinstance(doc, dict) or 'aliases' not in doc:
         raise MedallionConfigError(
@@ -347,7 +351,7 @@ def _validate_player_aliases_schema(doc: Dict) -> None:
         raise MedallionConfigError(
             "player_aliases.yaml: 'aliases' must be a list"
         )
-    required = ('source', 'source_id', 'fbref_player_id', 'season')
+    required = ('source', 'source_id', 'season')
     for i, entry in enumerate(aliases):
         if not isinstance(entry, dict):
             raise MedallionConfigError(
@@ -359,14 +363,32 @@ def _validate_player_aliases_schema(doc: Dict) -> None:
                     f"player_aliases.yaml: aliases[{i}] missing required "
                     f"key {key!r}"
                 )
-        # Source/source_id/fbref_player_id must be non-empty strings.
-        for key in ('source', 'source_id', 'fbref_player_id'):
+        # Source/source_id must be non-empty strings.
+        for key in ('source', 'source_id'):
             val = entry[key]
             if not isinstance(val, str) or not val.strip():
                 raise MedallionConfigError(
                     f"player_aliases.yaml: aliases[{i}].{key} "
                     f"must be a non-empty string (got {val!r})"
                 )
+        action = entry.get('action', 'map')
+        if action not in ('map', 'orphan'):
+            raise MedallionConfigError(
+                f"player_aliases.yaml: aliases[{i}].action must be 'map' "
+                f"or 'orphan' (got {action!r})"
+            )
+        fbref_player_id = entry.get('fbref_player_id')
+        if action == 'map':
+            if not isinstance(fbref_player_id, str) or not fbref_player_id.strip():
+                raise MedallionConfigError(
+                    f"player_aliases.yaml: aliases[{i}].fbref_player_id "
+                    "must be a non-empty string for action='map'"
+                )
+        elif fbref_player_id is not None:
+            raise MedallionConfigError(
+                f"player_aliases.yaml: aliases[{i}].fbref_player_id must be "
+                "omitted for action='orphan'"
+            )
         # season must be a 4-digit slug OR the literal "*"
         season_raw = entry['season']
         if not isinstance(season_raw, (str, int)):
@@ -1355,16 +1377,54 @@ def get_country_alias_sql_values() -> str:
 # Player aliases — query helper for the v2 resolver tier-3 fallback
 # ---------------------------------------------------------------------------
 
+def get_player_alias_rule(
+    source: str,
+    source_id: str,
+    season: str,
+) -> Optional[Dict[str, Optional[str]]]:
+    """Return the selected identity override for ``(source, source_id, season)``.
+
+    Exact-season rules take precedence over wildcard rules. The returned
+    mapping always contains ``action`` (``map`` or ``orphan``) and
+    ``fbref_player_id`` (non-null only for ``map``). Rules without an explicit
+    action are normalised to ``map`` for compatibility with the original YAML
+    contract.
+    """
+    if not source or not source_id:
+        return None
+    sid = str(source_id)
+    season_str = str(season) if season is not None else ''
+    aliases = (load_player_aliases().get('aliases') or [])
+
+    exact: Optional[Dict[str, Optional[str]]] = None
+    wildcard: Optional[Dict[str, Optional[str]]] = None
+    for entry in aliases:
+        if entry['source'] != source or str(entry['source_id']) != sid:
+            continue
+        rule: Dict[str, Optional[str]] = {
+            'action': entry.get('action', 'map'),
+            'fbref_player_id': entry.get('fbref_player_id'),
+        }
+        entry_season = str(entry['season'])
+        if entry_season == season_str:
+            exact = rule
+            break
+        if entry_season == '*':
+            wildcard = rule
+    return exact if exact is not None else wildcard
+
+
 def get_player_alias(
     source: str,
     source_id: str,
     season: str,
 ) -> Optional[str]:
-    """Look up a hand-curated FBref player_id override for ``(source, source_id, season)``.
+    """Look up a hand-curated FBref player_id mapping override.
 
-    The v2 resolver consults this AFTER all algorithmic tiers fail (surname,
-    token_set, nicknames). Empty YAML / missing file is the common case at
-    E1; this function returns ``None`` cleanly.
+    This is the backwards-compatible API used by existing resolver tests and
+    callers. It returns only positive ``map`` rules. Explicit negative
+    ``orphan`` rules return ``None`` here and are available through
+    :func:`get_player_alias_rule`.
 
     Lookup precedence:
       1. Exact (source, source_id, season) match.
@@ -1375,27 +1435,10 @@ def get_player_alias(
         FBref player_id WITHOUT the ``fb_`` prefix (caller prepends), or
         ``None`` if no entry matches.
     """
-    if not source or not source_id:
+    rule = get_player_alias_rule(source, source_id, season)
+    if rule is None or rule['action'] != 'map':
         return None
-    sid = str(source_id)
-    season_str = str(season) if season is not None else ''
-    doc = load_player_aliases()
-    aliases = doc.get('aliases') or []
-
-    exact: Optional[str] = None
-    wildcard: Optional[str] = None
-    for entry in aliases:
-        if entry['source'] != source:
-            continue
-        if str(entry['source_id']) != sid:
-            continue
-        entry_season = str(entry['season'])
-        if entry_season == season_str:
-            exact = entry['fbref_player_id']
-            break
-        if entry_season == '*':
-            wildcard = entry['fbref_player_id']
-    return exact if exact is not None else wildcard
+    return rule['fbref_player_id']
 
 
 # ---------------------------------------------------------------------------

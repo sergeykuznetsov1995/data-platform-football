@@ -304,25 +304,6 @@ def sofifa_scraper_with_tor(soccerdata_available, tor_available, minimal_version
 # =============================================================================
 
 @pytest.fixture
-def whoscored_scraper(soccerdata_available, undetected_chrome_available, minimal_leagues, minimal_seasons):
-    """WhoScored scraper with Selenium."""
-    if not soccerdata_available:
-        pytest.skip("soccerdata library not installed")
-    if not undetected_chrome_available:
-        pytest.skip("undetected-chromedriver not available")
-
-    from scrapers.whoscored import WhoScoredScraper
-
-    scraper = WhoScoredScraper(
-        leagues=minimal_leagues,
-        seasons=minimal_seasons,
-        headless=True,  # Use headless for CI
-    )
-    yield scraper
-    scraper.close()
-
-
-@pytest.fixture
 def cloudflare_bypass(undetected_chrome_available):
     """CloudflareBypass instance for direct testing."""
     if not undetected_chrome_available:

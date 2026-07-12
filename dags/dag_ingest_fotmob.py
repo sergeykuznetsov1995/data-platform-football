@@ -1,27 +1,9 @@
-"""
-FotMob Data Ingestion DAG
-=========================
+"""Source-native FotMob ingestion DAG.
 
-Airflow DAG for scraping football statistics from FotMob.
-Uses BashOperator to run scraper in isolated subprocess,
-avoiding LocalExecutor memory issues.
-
-Pure HTTP — FotMob's public /api/data/leagues endpoint requires no auth.
-
-Schedules daily at 7 AM UTC (after FBref to avoid overlapping).
-
-Data collected (9 Bronze tables):
-- Match schedules and results        (fotmob_schedule)
-- Team season standings              (fotmob_team_stats)
-- Player stat leaderboards (top)     (fotmob_player_stats)
-- Team profiles                      (fotmob_team_profile)
-- Team squads                        (fotmob_team_squad)
-- Team stat leaderboards             (fotmob_team_leaderboards)
-- Transfers                          (fotmob_transfers)
-- Per-match details                  (fotmob_match_details)
-- Per-player details                 (fotmob_player_details)
-
-All data is written to Iceberg Bronze layer tables.
+The DAG is trigger-only: ``dag_master_pipeline`` is the single daily schedule
+owner.  One isolated runner performs catalog discovery, exact-season planning,
+raw-first ingestion and emits an atomic, run-specific report.  Validation is
+fail-closed and Silver can only run after a complete native report.
 """
 
 from datetime import datetime
@@ -31,237 +13,238 @@ from airflow import DAG
 from airflow.exceptions import AirflowException
 from airflow.models.param import Param
 from airflow.operators.bash import BashOperator
-from airflow.operators.python import PythonOperator
+from airflow.operators.python import PythonOperator, ShortCircuitOperator
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 
-from utils.config import LEAGUES, CURRENT_SEASON, SCHEDULES, DAG_TAGS
+from utils.config import DAG_TAGS, FOTMOB_HTTP_POOL, SCHEDULES
 from utils.default_args import SCRAPER_ARGS
-from utils.ingest_helpers import league_slug as _league_slug
-from utils.medallion_config import is_single_year_competition
-
-# #920 Phase 1: split LEAGUES into club (split_year) and tournament
-# (single_year, e.g. INT-World Cup) leagues — see dag_ingest_sofascore.py for
-# the full rationale (mixed calls drop the tournament in the runner's #920
-# bridge, so it needs its own dedicated task).
-CLUB_LEAGUES = [lg for lg in LEAGUES if not is_single_year_competition(lg)]
-TOURNAMENT_LEAGUES = [lg for lg in LEAGUES if is_single_year_competition(lg)]
 
 
-def validate_data(**context) -> Dict[str, Any]:
-    """
-    Validate scraped data quality.
+RESULT_PATH = "/tmp/fotmob_result_{{ ts_nodash }}_{{ ti.try_number }}.json"
+NATIVE_MODES = frozenset({"discover", "daily", "backfill", "replay"})
 
-    Hard-fails when zero rows were ingested (regardless of whether the
-    scraper script reported explicit errors), so DAG runs go red whenever
-    FotMob changes their API again.
 
-    Returns:
-        Validation results
-    """
+def validate_data(
+    result_path: str = "/tmp/fotmob_result.json",
+    **context,
+) -> Dict[str, Any]:
+    """Fail unless the runner published a complete, direct-only report."""
+
     import json
     import logging
 
     logger = logging.getLogger(__name__)
-
     try:
-        with open('/tmp/fotmob_result.json', 'r') as f:
-            scrape_result = json.load(f)
-    except FileNotFoundError:
-        logger.error("Results file not found - scraping may have failed")
-        raise AirflowException("Results file not found - scraping failed")
-    except json.JSONDecodeError as e:
-        logger.error(f"Invalid JSON in results: {e}")
-        raise AirflowException(f"Invalid JSON in results: {e}")
-
-    # Per-entity soft-warn minimums (APL single-season baselines). Hard-fail is
-    # reserved for a fully empty ingest; individual low counts only warn.
-    MIN_ROWS = {
-        'schedule': 300,
-        'team_stats': 18,
-        'player_stats': 50,
-        'team_profile': 18,
-        'team_squad': 400,
-        'team_leaderboards': 400,
-        'transfers': 1,
-        'match_details': 200,
-        'player_details': 400,
-    }
-
-    # New runner emits a 'rows' dict; fall back to legacy flat '<key>_rows'.
-    rows = scrape_result.get('rows') or {
-        k: scrape_result.get(f'{k}_rows', 0) for k in MIN_ROWS
-    }
-
-    summary = {
-        'rows': rows,
-        'tables': scrape_result.get('tables', []),
-    }
-    total_rows = sum(rows.values())
-
-    validation = {
-        'status': 'success',
-        'warnings': list(scrape_result.get('errors') or []),
-        'summary': summary,
-    }
-
-    # Hard-fail on empty ingest — prevents silent green DAGs when the API
-    # path changes (the bug that caused this validation to be tightened).
-    if total_rows == 0:
-        validation['status'] = 'failed'
-        logger.error(f"FotMob ingest produced zero rows. Warnings: {validation['warnings']}")
+        with open(result_path, "r", encoding="utf-8") as stream:
+            result = json.load(stream)
+    except FileNotFoundError as exc:
+        raise AirflowException(f"FotMob report not found: {result_path}") from exc
+    except json.JSONDecodeError as exc:
         raise AirflowException(
-            f"FotMob ingest produced zero rows. "
-            f"Errors from scraper: {validation['warnings']}"
-        )
+            f"Invalid FotMob report JSON at {result_path}: {exc}"
+        ) from exc
 
-    if scrape_result.get('errors'):
-        validation['status'] = 'partial_success'
-
-    for key, minimum in MIN_ROWS.items():
-        if rows.get(key, 0) < minimum:
-            validation['warnings'].append(
-                f"Low {key} row count ({rows.get(key, 0)} < {minimum}) "
-                f"- possible scraping issue"
+    mode = str(result.get("mode") or "legacy")
+    if mode in NATIVE_MODES:
+        operation_failures = []
+        for operation in result.get("operations") or []:
+            if (
+                operation.get("errors")
+                or operation.get("retryable")
+                or operation.get("terminal")
+                or operation.get("status") in {"failed", "retryable"}
+            ):
+                operation_failures.append(
+                    {
+                        "entity": operation.get("entity"),
+                        "status": operation.get("status"),
+                        "errors": operation.get("errors") or [],
+                        "retryable": operation.get("retryable") or [],
+                        "terminal": operation.get("terminal") or [],
+                    }
+                )
+        transport = result.get("transport") or {}
+        budget = result.get("budget") or {}
+        violations = []
+        required_transport = {
+            "attempts",
+            "direct_bytes",
+            "proxy_bytes",
+        }
+        required_budget = {
+            "requests",
+            "max_requests",
+            "direct_bytes",
+            "max_direct_bytes",
+            "proxy_bytes",
+            "max_proxy_bytes",
+        }
+        missing_transport = sorted(required_transport - transport.keys())
+        missing_budget = sorted(required_budget - budget.keys())
+        if missing_transport:
+            violations.append(f"missing transport metrics={missing_transport!r}")
+        if missing_budget:
+            violations.append(f"missing budget metrics={missing_budget!r}")
+        if result.get("status") != "success" or result.get("complete") is not True:
+            violations.append(
+                f"status={result.get('status')!r}, complete={result.get('complete')!r}"
             )
+        if result.get("errors"):
+            violations.append(f"runner errors={result['errors']!r}")
+        if operation_failures:
+            violations.append(f"operation failures={operation_failures!r}")
+        if int(transport.get("proxy_bytes") or 0) != 0:
+            violations.append(
+                f"proxy_bytes={transport.get('proxy_bytes')} (direct-only invariant)"
+            )
+        if int(budget.get("requests") or 0) > int(budget.get("max_requests") or 0):
+            violations.append("request budget exceeded")
+        if int(budget.get("direct_bytes") or 0) > int(
+            budget.get("max_direct_bytes") or 0
+        ):
+            violations.append("direct-byte budget exceeded")
+        if not result.get("operations"):
+            violations.append("no native operations recorded")
+        catalog_counts = [
+            int((operation.get("counts") or {}).get("competitions") or 0)
+            for operation in result.get("operations") or []
+            if operation.get("entity") == "competition_catalog"
+        ]
+        if not catalog_counts or max(catalog_counts) <= 0:
+            violations.append("complete competition catalog was not recorded")
+        if violations:
+            raise AirflowException(
+                "Incomplete FotMob native ingest: " + "; ".join(violations)
+            )
+        summary = {
+            "status": "success",
+            "run_id": result.get("run_id"),
+            "mode": mode,
+            "rows": result.get("rows") or {},
+            "tables": result.get("tables") or [],
+            "transport": transport,
+            "budget": budget,
+        }
+        logger.info("FotMob native validation complete: %s", summary)
+        return summary
 
-    logger.info(f"Data validation complete: {validation['status']}")
-    logger.info(f"Summary: {summary}")
-    if validation['warnings']:
-        logger.warning(f"Warnings: {validation['warnings']}")
+    # Additive compatibility for manually invoked legacy runner reports.
+    rows = result.get("rows") or {}
+    errors = list(result.get("errors") or [])
+    total_rows = sum(int(value or 0) for value in rows.values())
+    if errors or total_rows == 0:
+        raise AirflowException(
+            f"Incomplete legacy FotMob ingest: rows={total_rows}, errors={errors!r}"
+        )
+    return {
+        "status": "success",
+        "mode": "legacy",
+        "rows": rows,
+        "tables": result.get("tables") or [],
+    }
 
-    return validation
 
+def _should_transform(mode: str) -> bool:
+    """Catalog-only discovery has no season facts for Silver to consume."""
 
-# Build arguments for bash command — club leagues only; tournament leagues
-# get their own dedicated task below.
-leagues_str = ','.join(CLUB_LEAGUES)
+    return str(mode) != "discover"
+
 
 with DAG(
-    dag_id='dag_ingest_fotmob',
+    dag_id="dag_ingest_fotmob",
     default_args=SCRAPER_ARGS,
-    description='Ingest football statistics from FotMob (public /api/data JSON)',
-    schedule=SCHEDULES.get('dag_ingest_fotmob', '0 7 * * *'),
+    description="Discover and ingest source-native FotMob JSON",
+    schedule=SCHEDULES.get("dag_ingest_fotmob"),
     start_date=datetime(2024, 1, 1),
     catchup=False,
-    tags=DAG_TAGS.get('fotmob', ['scraping', 'fotmob', 'bronze', 'football']),
+    tags=DAG_TAGS.get("fotmob", ["scraping", "fotmob", "bronze", "http"]),
     max_active_runs=1,
     params={
-        'leagues': LEAGUES,
-        # season UI-configurable: the daily scheduled run uses the default
-        # (CURRENT_SEASON); to backfill a past season use "Trigger DAG w/
-        # config" and set season (e.g. 2016 = 2016/17). All 9 entities write
-        # via replace_partitions=['league','season'] — backfilling an early
-        # season leaves all other partitions untouched (#714, pattern #710/#713).
-        'season': Param(
-            default=CURRENT_SEASON,
-            type='integer',
-            minimum=2000,
-            maximum=CURRENT_SEASON,
-            title='Season (start year)',
+        "mode": Param(
+            default="daily",
+            type="string",
+            enum=sorted(NATIVE_MODES),
+            title="Native run mode",
+        ),
+        "scope": Param(
+            default="",
+            type="string",
+            title="Exact scopes",
+            description="Optional comma-separated FotMob ID=season keys",
+        ),
+        "entities": Param(
+            default="season,leaderboards,matches,teams,players,transfers",
+            type="string",
+            title="Native entities",
             description=(
-                'APL season start year (2016 = 2016/17). Default = current '
-                'season for the daily run. Override to backfill early history '
-                '(2016…2023 → 10-season corpus, #714).'
+                "Season facts are always synchronized; optional enrichments: "
+                "leaderboards,matches,teams,players,transfers"
             ),
         ),
+        "max_requests": Param(default=2000, type="integer", minimum=1),
+        "max_direct_mib": Param(default=256, type="integer", minimum=1),
+        "competition_limit": Param(default=0, type="integer", minimum=0),
+        "season_limit": Param(default=0, type="integer", minimum=0),
     },
     doc_md="""
-    ## FotMob Data Ingestion
+    ## FotMob native ingestion
 
-    Scrapes football statistics from FotMob's public ``/api/data/leagues``
-    endpoint — no Cloudflare bypass, no Selenium, no cookies required.
+    The runner discovers the complete ``allLeagues`` catalog, classifies every
+    competition, preserves exact FotMob season strings and processes a bounded
+    plan.  JSON is committed to the durable raw store before typed Bronze rows.
+    Defaults are 2,000 requests, 256 MiB direct traffic, 0 proxy bytes, four
+    workers and 30 requests/minute.  Use ``scope`` with numeric identities such
+    as ``42=2025/2026,47=2025/2026``; names are never storage identities.
 
-    ### Data Collected (9 Bronze tables)
-
-    - **Schedule**: match dates, teams, scores
-    - **Team Stats**: season standings (wins, draws, losses, points, goals)
-    - **Player Stats**: top-player categories (goals, assists, rating, ...)
-    - **Team Profile**: venue, country, league position (per team)
-    - **Team Squad**: squad members + coach (per team)
-    - **Team Leaderboards**: team-side stat leaderboards (all categories)
-    - **Transfers**: league transfer list
-    - **Match Details**: lineups, events, stats, shotmap (per finished match)
-    - **Player Details**: career, market values, trophies (per squad player)
-
-    ### Architecture
-
-    BashOperator → ``run_fotmob_scraper.py`` → ``FotMobScraper`` (HTTP only).
-    All 9 entities use ``replace_partitions=['league','season']`` so daily
-    re-runs overwrite the season partition rather than accumulating duplicates.
-
-    ### Failure Mode
-
-    The scraper raises on any 4xx/5xx after retries, and ``validate_data``
-    hard-fails on ``total_rows == 0`` — this is the lesson from the 2025
-    breakage where FotMob renamed ``/api/leagues`` → ``/api/data/leagues``
-    and the DAG silently kept publishing zero rows.
+    ``discover`` writes catalog/season availability only. ``daily`` refreshes
+    selected/latest seasons. ``backfill`` prioritizes required sentinels then
+    active/newest and older source seasons. ``replay`` performs no network I/O.
     """,
 ) as dag:
-
     scrape_data_task = BashOperator(
-        task_id='scrape_fotmob_data',
-        # --season is rendered at runtime from params.season (Jinja), so the
-        # season is configurable from the UI ("Trigger DAG w/ config") without
-        # a separate backfill DAG (#714, pattern #710/#713). The f-string
-        # escapes {{ }} as {{{{ }}}} so the literal Jinja tag survives into
-        # the command.
+        task_id="scrape_fotmob_data",
         bash_command=f"""
 cd /opt/airflow && \\
 python dags/scripts/run_fotmob_scraper.py \\
-    --leagues "{leagues_str}" \\
-    --season {{{{ params.season }}}} \\
-    --output /tmp/fotmob_result.json
+    --mode "{{{{ params.mode }}}}" \\
+    --scope "{{{{ params.scope }}}}" \\
+    --entities "{{{{ params.entities }}}}" \\
+    --max-requests "{{{{ params.max_requests }}}}" \\
+    --max-direct-mib "{{{{ params.max_direct_mib }}}}" \\
+    --max-proxy-mib 0 \\
+    --competition-limit "{{{{ params.competition_limit }}}}" \\
+    --season-limit "{{{{ params.season_limit }}}}" \\
+    --requests-per-minute 30 \\
+    --workers 4 \\
+    --run-id "dag_ingest_fotmob-{{{{ ts_nodash }}}}-{{{{ ti.try_number }}}}" \\
+    --output "{RESULT_PATH}"
 """,
         env={
-            'PYTHONPATH': '/opt/airflow:/opt/airflow/dags',
-            'PATH': '/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin',
-            'HOME': '/home/airflow',
+            "PYTHONPATH": "/opt/airflow:/opt/airflow/dags",
+            "PATH": "/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin",
+            "HOME": "/home/airflow",
         },
         append_env=True,
+        pool=FOTMOB_HTTP_POOL,
     )
 
-    # #920 Phase 1: one dedicated task per tournament league — a mixed
-    # --leagues call would drop it (the runner's #920 bridge needs a
-    # dedicated single-league call to resolve the active tournament season).
-    # Reuses the same `{{ params.season }}` Jinja value as the club task; the
-    # runner resolves it to the real tournament year, or cleanly no-ops
-    # (exit 0) outside the tournament window — the task stays in the graph
-    # year-round as a cheap no-op. Output path is separate from
-    # /tmp/fotmob_result.json, so validate_data() (club-calibrated floors)
-    # never sees it — per-competition floors are #920 Phase 2, out of scope.
-    tournament_tasks = {}
-    for _t_league in TOURNAMENT_LEAGUES:
-        _t_slug = _league_slug(_t_league)
-        tournament_tasks[_t_league] = BashOperator(
-            task_id=f'scrape_fotmob_data_{_t_slug}',
-            bash_command=f"""
-cd /opt/airflow && \\
-python dags/scripts/run_fotmob_scraper.py \\
-    --leagues "{_t_league}" \\
-    --season {{{{ params.season }}}} \\
-    --output /tmp/fotmob_result_{_t_slug}.json
-""",
-            env={
-                'PYTHONPATH': '/opt/airflow:/opt/airflow/dags',
-                'PATH': '/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin',
-                'HOME': '/home/airflow',
-            },
-            append_env=True,
-        )
-
     validate_data_task = PythonOperator(
-        task_id='validate_data',
+        task_id="validate_data",
         python_callable=validate_data,
-        trigger_rule='all_done',
+        op_kwargs={"result_path": RESULT_PATH},
+    )
+
+    transform_gate = ShortCircuitOperator(
+        task_id="season_data_available",
+        python_callable=_should_transform,
+        op_kwargs={"mode": "{{ params.mode }}"},
     )
 
     trigger_silver = TriggerDagRunOperator(
-        task_id='trigger_silver_transform',
-        trigger_dag_id='dag_transform_fotmob_silver',
+        task_id="trigger_silver_transform",
+        trigger_dag_id="dag_transform_fotmob_silver",
         wait_for_completion=False,
         reset_dag_run=True,
     )
 
-    scrape_data_task >> validate_data_task >> trigger_silver
-    for _t_league in TOURNAMENT_LEAGUES:
-        tournament_tasks[_t_league] >> validate_data_task
+    scrape_data_task >> validate_data_task >> transform_gate >> trigger_silver

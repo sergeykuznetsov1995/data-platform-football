@@ -183,10 +183,10 @@ END AS season  -- year-start / WC direct → slug (#404 + #913)
     UNION
     -- ===== whoscored (using schedule, not events) =====
     SELECT 'whoscored' AS source, home_team AS source_id, league, CAST(season AS varchar) AS season
-      FROM iceberg.bronze.whoscored_schedule WHERE home_team IS NOT NULL
+      FROM iceberg.bronze.whoscored_schedule_current WHERE home_team IS NOT NULL
     UNION
     SELECT 'whoscored' AS source, away_team AS source_id, league, CAST(season AS varchar) AS season
-      FROM iceberg.bronze.whoscored_schedule WHERE away_team IS NOT NULL
+      FROM iceberg.bronze.whoscored_schedule_current WHERE away_team IS NOT NULL
 
     UNION
     -- ===== sofascore =====
@@ -271,9 +271,9 @@ END AS season  -- year-start / WC direct → slug (#404 + #913)
       FROM iceberg.bronze.espn_schedule WHERE away_team IS NOT NULL
 
     UNION
-    -- ===== transfermarkt (team universe = player roster's current club; issue #192) =====
-    SELECT 'transfermarkt' AS source, current_club_name AS source_id, league, CAST(season AS varchar) AS season
-      FROM iceberg.bronze.transfermarkt_players WHERE current_club_name IS NOT NULL
+    -- ===== transfermarkt (native squad-membership club universe; issue #192) =====
+    SELECT 'transfermarkt' AS source, club_name AS source_id, league, CAST(season AS varchar) AS season
+      FROM iceberg.bronze.transfermarkt_squad_memberships WHERE club_name IS NOT NULL
 
     UNION
     -- ===== capology (team universe = salary roster's club; issue #192) =====

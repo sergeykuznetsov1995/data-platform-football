@@ -178,34 +178,32 @@ columns:
     description: Набранные очки = wins*3 + draws (Understat-only).
 
   # ─── UNIQUE_WHOSCORED — event-style aggregates (SPADL) ───
-  # NB: текущие сезоны (2425/2526) ожидаемо NULL до issue #120 — bridge
-  # bronze.whoscored_schedule (team_id NUMERIC ↔ NAME) заполнен только для '2021'.
+  # bronze.whoscored_schedule_current (team_id NUMERIC ↔ NAME) служит bridge.
   - name: pass_total
-    description: Всего пасов (WhoScored SPADL). NULL для current seasons (#120).
+    description: Всего пасов (WhoScored SPADL); NULL при отсутствии source-метрики.
   - name: pass_ok
-    description: Точные пасы (WhoScored). NULL для current seasons (#120).
+    description: Точные пасы (WhoScored); NULL при отсутствии source-метрики.
   - name: pass_pct
-    description: Точность пасов, % (WhoScored). NULL для current seasons (#120).
+    description: Точность пасов, % (WhoScored); NULL при отсутствии source-метрики.
   - name: key_passes_ws
-    description: Ключевые пасы (WhoScored). Суффикс _ws во избежание name-conflict. NULL для current seasons (#120).
+    description: Ключевые пасы (WhoScored). Суффикс _ws во избежание name-conflict.
   - name: takeon_att
-    description: Попытки обводки 1v1 (WhoScored). NULL для current seasons (#120).
+    description: Попытки обводки 1v1 (WhoScored); NULL при отсутствии source-метрики.
   - name: takeon_won
-    description: Успешные обводки (WhoScored). NULL для current seasons (#120).
+    description: Успешные обводки (WhoScored); NULL при отсутствии source-метрики.
   - name: takeon_pct
-    description: "% успешных обводок (WhoScored). NULL для current seasons (#120)."
+    description: "% успешных обводок (WhoScored); NULL при отсутствии source-метрики."
   - name: clearances
-    description: Выносы (WhoScored). NULL для current seasons (#120).
+    description: Выносы (WhoScored); NULL при отсутствии source-метрики.
   - name: ball_recoveries
-    description: Возвраты мяча (WhoScored). NULL для current seasons (#120).
+    description: Возвраты мяча (WhoScored); NULL при отсутствии source-метрики.
   - name: touches_in_box
     description: |
-      Касания в чужой штрафной. COALESCE(WhoScored → FotMob) — WS NULL для
-      current seasons (#120), FotMob закрывает пробел.
+      Касания в чужой штрафной. COALESCE(WhoScored → FotMob).
   - name: defensive_actions_third
-    description: Оборонительные действия в защитной трети (WhoScored). NULL для current seasons (#120).
+    description: Оборонительные действия в защитной трети (WhoScored); NULL при отсутствии source-метрики.
   - name: set_piece_share_pct
-    description: "Доля голевых атак со стандартов, % (WhoScored). NULL для current seasons (#120)."
+    description: "Доля голевых атак со стандартов, % (WhoScored); NULL при отсутствии source-метрики."
 
   # ─── UNIQUE_SOFASCORE — passes / duels / breakdowns ───
   - name: total_passes
