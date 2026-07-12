@@ -38,6 +38,15 @@ x-airflow-common: &airflow-common
     S3_ACCESS_KEY: ${S3_ACCESS_KEY}
     S3_SECRET_KEY: ${S3_SECRET_KEY}
     FBREF_RAW_STORE_URI: s3://${ICEBERG_WAREHOUSE}/raw/fbref
+    SOFASCORE_RAW_STORE_URI: s3://${ICEBERG_WAREHOUSE}/raw/sofascore
+    SOFASCORE_MANIFEST_BACKEND: trino
+    SOFASCORE_PROXY_BUDGET_ARTIFACT: /opt/airflow/configs/sofascore/proxy_budget_canary.json
+    SOFASCORE_PROXY_BUDGET_LEDGER: /opt/airflow/logs/sofascore/proxy-budget-ledger.json
+    SOFASCORE_WORKLOAD_PLAN_DIR: /opt/airflow/logs/sofascore/workload-plans
+    SOFASCORE_PROXY_CONTROL_URL: ${SOFASCORE_PROXY_CONTROL_URL:-http://proxy_filter:8899}
+    SOFASCORE_PROXY_CONTROL_TOKEN: ${SOFASCORE_PROXY_CONTROL_TOKEN:-}
+    SOFASCORE_PROXY_LEASE_TTL_SECONDS: ${SOFASCORE_PROXY_LEASE_TTL_SECONDS:-3600}
+    PROXY_FILTER_SOFASCORE_CANARY_HARD_CAP_BYTES: ${PROXY_FILTER_SOFASCORE_CANARY_HARD_CAP_BYTES:-0}
     WHOSCORED_RAW_STORE_URI: s3://${ICEBERG_WAREHOUSE}/raw/whoscored
     WHOSCORED_RAW_S3_ENDPOINT: seaweedfs:8333
     WHOSCORED_RAW_S3_SCHEME: http
@@ -1002,10 +1011,9 @@ services:
   # proxy_filter - ad-tech filtering proxy between FlareSolverr and the
   # residential pool (#652). Cuts billable residential traffic by refusing
   # ad-tech CONNECT hosts (no MITM — preserves Chrome's TLS fingerprint).
-  # Holds the residential creds and rotates the upstream per FlareSolverr session
-  # (idle-refresh: a fresh exit is drawn only when no tunnel is open, so a page and
-  # its CF challenge share one IP). Scrapers route here when the global
-  # PROXY_FILTER_URL=http://proxy_filter:8899 toggle is set.
+  # Port 8899 keeps the compatible lease control API and legacy FlareSolverr
+  # route. Port 8900 accepts proxy traffic only with a short-lived lease token;
+  # each lease pins one upstream and is charged before every provider read.
   # ===========================================================================
   proxy_filter:
     build:
@@ -1019,6 +1027,7 @@ services:
       - ALL
     environment:
       PYTHONPATH: /opt/airflow
+      PROXY_FILTER_CONTROL_TOKEN: ${SOFASCORE_PROXY_CONTROL_TOKEN:-}
       # Secret JSON is injected at runtime. The service fails closed when it is
       # blank; the legacy file is intentionally not mounted into this container.
       PROXY_POOL_JSON: ${PROXY_POOL_JSON:-}
@@ -1028,6 +1037,10 @@ services:
       - /opt/airflow/scripts/proxy_filter/filter_proxy.py
       - --listen
       - 0.0.0.0:8899
+      - --lease-listen
+      - 0.0.0.0:8900
+      - --lease-proxy-url
+      - http://proxy_filter:8900
       - --blocklist
       - /opt/airflow/configs/proxy_filter/blocklist.txt
       - --out
@@ -1045,13 +1058,22 @@ services:
       - --url-budget-bytes
       - ${PROXY_FILTER_URL_BUDGET_BYTES:-2000000}
       - --max-active-leases
-      - "1"
+      - ${PROXY_FILTER_MAX_ACTIVE_LEASES:-4}
+      - --sofascore-budget-artifact
+      - /opt/airflow/configs/sofascore/proxy_budget_canary.json
+      - --sofascore-canary-hard-cap-bytes
+      - ${PROXY_FILTER_SOFASCORE_CANARY_HARD_CAP_BYTES:-0}
       - --ledger
       - /opt/airflow/logs/proxy_filter/paid_requests.jsonl
     volumes:
+      # Paid-canary runtime fingerprint inputs.  The proxy control plane
+      # independently recomputes the same digest as the Airflow producer.
+      - ./dags:/opt/airflow/dags:ro
       - ./scripts:/opt/airflow/scripts
       - ./scrapers:/opt/airflow/scrapers
+      - ./configs/medallion:/opt/airflow/configs/medallion:ro
       - ./configs/proxy_filter:/opt/airflow/configs/proxy_filter:ro
+      - ./configs/sofascore:/opt/airflow/configs/sofascore:ro
       # Mount the already writable Airflow log root. Mounting a missing host
       # subdirectory directly makes Docker create it as root:root, while this
       # image intentionally runs as the unprivileged airflow user.

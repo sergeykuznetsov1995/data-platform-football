@@ -1,1312 +1,212 @@
-"""
-Unit tests for ``dags/scripts/run_sofascore_scraper.py`` argparse hard-fail (#512).
-
-A CLI parse error (unknown/typo'd flag, bad-typed value) must exit 1, NOT 2.
-Exit 2 is the SofaScore fallback soft-success code that the DAG bash wrapper
-maps to ``exit 0`` — so an exit-2 parse error would silently no-op the task.
-
-Parsing fails before any lazy ``scrapers.sofascore`` import, so no stub is needed.
-"""
+"""Fail-closed tests for the canonical SofaScore runner."""
 
 from __future__ import annotations
 
-import importlib
 import json
-import os
-import sys
-import tempfile
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-import pandas as pd
 import pytest
 
 
-def _main_rc(argv: list) -> int:
-    """Run ``run_sofascore_scraper.main()`` with ``argv`` and return its exit code."""
-    sys.argv = ["run_sofascore_scraper.py"] + argv
-    sys.modules.pop("dags.scripts.run_sofascore_scraper", None)
-    mod = importlib.import_module("dags.scripts.run_sofascore_scraper")
-    importlib.reload(mod)
-    return mod.main()
+def _runner_module():
+    from dags.scripts import run_sofascore_scraper
 
+    return run_sofascore_scraper
 
-def _season_to_short(season) -> str:
-    """Offline mirror of ``scrapers.sofascore.scraper._season_to_short`` so the
-    stubbed ``scrapers.sofascore.scraper`` module the runner imports it from
-    behaves like the real helper (a bare MagicMock would return a MagicMock and
-    break season_short). Keep in sync with the real one."""
-    s = str(season)
-    if len(s) != 4 or not s.isdigit():
-        return s
-    if isinstance(season, int) and 1900 <= season <= 2098:
-        return s[-2:] + f"{(season + 1) % 100:02d}"
-    if (int(s[:2]) + 1) % 100 == int(s[2:]):
-        return s
-    if s[2:] == "99":
-        return "9900"
-    return s[-2:] + f"{(int(s[-2:]) + 1) % 100:02d}"
 
+@pytest.mark.unit
+def test_argparse_unknown_flag_is_a_hard_failure():
+    runner = _runner_module()
 
-def _season_label(league: str, season) -> str:
-    """Offline mirror of ``scrapers.sofascore.scraper._season_label`` (#913).
-    Without the medallion config on the test host the real helper falls back
-    to ``_season_to_short`` for every league — mirror that fallback."""
-    return _season_to_short(season)
+    assert runner.main(["--bogus-flag", "x"]) == 1
 
 
-class TestArgparseHardFail:
-    def test_unknown_flag_returns_1_not_2(self):
-        assert _main_rc(['--entity', 'schedule', '--bogus-flag', 'x']) == 1
+@pytest.mark.unit
+def test_live_cli_rejects_local_json_manifest_before_any_side_effect():
+    runner = _runner_module()
 
-    def test_bad_typed_season_returns_1(self):
-        # --season is type=int; a non-int must hard-fail, not soft-fallback.
-        assert _main_rc(['--season', 'notanumber']) == 1
-
-
-def _run_main(argv: list, scraper_cls, *, resolver_ids=None,
-              existing_schedule=None, existing_capture_ids=None,
-              existing_partition=None) -> int:
-    """Run ``main()`` with stubbed ``scrapers.sofascore[.scraper]`` modules.
-
-    ``scrapers.base.base_scraper`` (for ``ReplaceGuardError``) imports for real.
-    ``resolver_ids`` patches ``_resolve_match_ids_from_bronze`` so the
-    player_ratings path skips its Trino lookup and reaches save_to_iceberg.
-    ``_read_existing_schedule`` is always patched (it would otherwise hit Trino)
-    to ``existing_schedule`` (default: an empty frame → captured rows save
-    as-is) so the #761 schedule merge runs offline + deterministically.
-    ``existing_capture_ids`` / ``existing_partition`` patch the #842
-    match_capture status-manifest probe and
-    partition merge read (``_read_existing_partition``) — defaults (empty set /
-    empty frame) mean "nothing in bronze yet": no skip, merge is a no-op.
-    """
-    so_pkg = MagicMock()
-    so_pkg.SofaScoreScraper = scraper_cls
-    so_scraper_mod = MagicMock()
-    so_scraper_mod.R0_2B_FALLBACK_MARKER = 'R0_2B_FALLBACK'
-    so_scraper_mod._season_to_short = _season_to_short
-    so_scraper_mod._season_label = _season_label
-
-    sys.argv = ["run_sofascore_scraper.py"] + argv
-    with patch.dict(sys.modules, {
-        "scrapers.sofascore": so_pkg,
-        "scrapers.sofascore.scraper": so_scraper_mod,
-    }):
-        sys.modules.pop("dags.scripts.run_sofascore_scraper", None)
-        mod = importlib.import_module("dags.scripts.run_sofascore_scraper")
-        importlib.reload(mod)
-        if resolver_ids is not None:
-            mod._resolve_match_ids_from_bronze = lambda *a, **k: resolver_ids
-        _existing = pd.DataFrame() if existing_schedule is None else existing_schedule
-        mod._read_existing_schedule = lambda *a, **k: _existing
-        _ids = set() if existing_capture_ids is None else set(existing_capture_ids)
-        mod._existing_match_ids_in_bronze = lambda *a, **k: _ids
-        mod._existing_complete_capture_ids = lambda *a, **k: set(_ids)
-        _part = pd.DataFrame() if existing_partition is None else existing_partition
-        mod._read_existing_partition = lambda *a, **k: _part
-        return mod.main()
-
-
-def _legacy_scraper(*, guard_blocks: bool = False):
-    """Stub for the default 'all' path: read_schedule + read_league_table both
-    return non-empty frames so both 2-key saves run."""
-    from scrapers.base.base_scraper import ReplaceGuardError
-
-    df = pd.DataFrame({
-        'league': ['ENG-Premier League'] * 10,
-        'season': [2024] * 10,
-        'game_id': list(range(10)),
-    })
-    scraper = MagicMock()
-    scraper.read_schedule.return_value = df
-    scraper.read_league_table.return_value = df
-    scraper.read_tournament_snapshot.return_value = (df, df)
-    if guard_blocks:
-        scraper.save_to_iceberg.side_effect = ReplaceGuardError(
-            'new=1 rows < 90% of existing=380 for bronze.sofascore_schedule '
-            '— refusing replace_partitions save (would shrink the partition)'
-        )
-    else:
-        scraper.save_to_iceberg.return_value = 'iceberg.bronze.sofascore_schedule'
-    scraper.__enter__ = MagicMock(return_value=scraper)
-    scraper.__exit__ = MagicMock(return_value=False)
-    return scraper
-
-
-def _ratings_scraper(*, guard_blocks: bool = False):
-    """Stub for the player_ratings path (single 2-key save at 16-sp indent)."""
-    from scrapers.base.base_scraper import ReplaceGuardError
-
-    df = pd.DataFrame({
-        'league': ['ENG-Premier League'] * 10,
-        'season': [2024] * 10,
-        'match_id': list(range(10)),
-    })
-    scraper = MagicMock()
-    scraper.read_player_ratings.return_value = df
-    if guard_blocks:
-        scraper.save_to_iceberg.side_effect = ReplaceGuardError(
-            'new=1 rows < 90% of existing=200 for bronze.sofascore_player_ratings '
-            '— refusing replace_partitions save (would shrink the partition)'
-        )
-    else:
-        scraper.save_to_iceberg.return_value = (
-            'iceberg.bronze.sofascore_player_ratings'
-        )
-    scraper.__enter__ = MagicMock(return_value=scraper)
-    scraper.__exit__ = MagicMock(return_value=False)
-    return scraper
-
-
-class TestSofascoreReplaceGuard:
-    """#583: completeness-guard wiring in the SofaScore runner.
-
-    Covers the default 'all' path (``_run_legacy``, two 2-key saves) and the
-    ``player_ratings`` path (single save). The guard arithmetic lives in
-    ``BaseScraper.save_to_iceberg`` (covered by ``test_base_scraper.py``); here
-    we cover the runner's handling. The append-only event endpoint is NOT
-    guarded (no replace_partitions, #69) and is not exercised here.
-    """
-
-    @pytest.fixture
-    def temp_output(self):
-        fd, path = tempfile.mkstemp(suffix=".json", prefix="sofascore_")
-        os.close(fd)
-        yield path
-        if os.path.exists(path):
-            os.unlink(path)
-
-    @pytest.mark.unit
-    def test_legacy_guard_refusal_exits_3(self, temp_output):
-        """ReplaceGuardError on a legacy save → exit 3 + SOFASCORE_REPLACE_GUARD
-        marker (distinct from the exit-1 hard-failure path)."""
-        scraper = _legacy_scraper(guard_blocks=True)
-
-        rc = _run_main(
-            ["--leagues", "ENG-Premier League", "--season", "2024",
-             "--output", temp_output],
-            MagicMock(return_value=scraper),
-        )
-
-        assert rc == 3
-        with open(temp_output) as f:
-            payload = json.load(f)
-        assert any("SOFASCORE_REPLACE_GUARD" in e for e in payload["errors"])
-
-    @pytest.mark.unit
-    def test_legacy_normal_path_arms_guard_exits_0(self, temp_output):
-        """Non-force 'all' run arms min_replace_ratio=0.9 on the 2-key saves."""
-        scraper = _legacy_scraper()
-
-        rc = _run_main(
-            ["--leagues", "ENG-Premier League", "--season", "2024",
-             "--output", temp_output],
-            MagicMock(return_value=scraper),
-        )
-
-        assert rc == 0
-        kwargs = scraper.save_to_iceberg.call_args.kwargs
-        assert kwargs["min_replace_ratio"] == 0.9
-        assert kwargs["replace_partitions"] == ["league", "season"]
-        assert "replace_guard_key" not in kwargs
-
-    @pytest.mark.unit
-    def test_legacy_force_replace_disarms_guard(self, temp_output):
-        """--force-replace must pass min_replace_ratio=None to the legacy saves."""
-        scraper = _legacy_scraper()
-
-        rc = _run_main(
-            ["--leagues", "ENG-Premier League", "--season", "2024",
-             "--force-replace", "--output", temp_output],
-            MagicMock(return_value=scraper),
-        )
-
-        assert rc == 0
-        kwargs = scraper.save_to_iceberg.call_args.kwargs
-        assert kwargs["min_replace_ratio"] is None
-
-    @pytest.mark.unit
-    def test_legacy_empty_source_is_hard_failure(self, temp_output):
-        scraper = _legacy_scraper()
-        scraper.read_tournament_snapshot.return_value = (
-            pd.DataFrame(),
-            pd.DataFrame(),
-        )
-
-        rc = _run_main(
-            [
-                "--leagues",
-                "ENG-Premier League",
-                "--season",
-                "2025",
-                "--output",
-                temp_output,
-            ],
-            MagicMock(return_value=scraper),
-        )
-
-        assert rc == 1
-        scraper.save_to_iceberg.assert_not_called()
-        with open(temp_output) as handle:
-            payload = json.load(handle)
-        assert any("no rows" in error for error in payload["errors"])
-
-    @pytest.mark.unit
-    def test_explicit_schedule_does_not_fetch_standings(self, temp_output):
-        scraper = _legacy_scraper()
-
-        rc = _run_main(
-            [
-                "--entity",
-                "schedule",
-                "--leagues",
-                "ENG-Premier League",
-                "--season",
-                "2025",
-                "--output",
-                temp_output,
-            ],
-            MagicMock(return_value=scraper),
-        )
-
-        assert rc == 0
-        scraper.read_schedule.assert_called_once_with()
-        scraper.read_league_table.assert_not_called()
-        scraper.read_tournament_snapshot.assert_not_called()
-
-    @pytest.mark.unit
-    def test_player_ratings_guard_refusal_exits_3(self, temp_output):
-        """player_ratings save refusal → exit 3 + marker (16-sp save path)."""
-        scraper = _ratings_scraper(guard_blocks=True)
-
-        rc = _run_main(
-            ["--entity", "player_ratings", "--league", "ENG-Premier League",
-             "--season", "2024", "--output", temp_output],
-            MagicMock(return_value=scraper),
-            resolver_ids=[1, 2, 3],
-        )
-
-        assert rc == 3
-        with open(temp_output) as f:
-            payload = json.load(f)
-        assert any("SOFASCORE_REPLACE_GUARD" in e for e in payload["errors"])
-
-    @pytest.mark.unit
-    def test_player_ratings_normal_path_arms_guard_exits_0(self, temp_output):
-        """player_ratings non-force run arms min_replace_ratio=0.9."""
-        scraper = _ratings_scraper()
-
-        rc = _run_main(
-            ["--entity", "player_ratings", "--league", "ENG-Premier League",
-             "--season", "2024", "--output", temp_output],
-            MagicMock(return_value=scraper),
-            resolver_ids=[1, 2, 3],
-        )
-
-        assert rc == 0
-        kwargs = scraper.save_to_iceberg.call_args.kwargs
-        assert kwargs["min_replace_ratio"] == 0.9
-        assert kwargs["replace_partitions"] == ["league", "season"]
-
-
-class TestPlayerRatingsCaptureFallback:
-    """#757 B2: when bronze.sofascore_schedule is empty (fresh season — the
-    soccerdata schedule is Turnstile-blocked), the runner resolves finished
-    match_ids via the scraper's Camoufox capture resolver before declaring
-    R0.2B fallback.
-    """
-
-    @pytest.fixture
-    def temp_output(self):
-        fd, path = tempfile.mkstemp(suffix=".json", prefix="sofascore_")
-        os.close(fd)
-        yield path
-        if os.path.exists(path):
-            os.unlink(path)
-
-    @pytest.mark.unit
-    def test_empty_bronze_resolves_via_capture_then_saves(self, temp_output):
-        # Arrange — bronze returns [] for both season forms; capture finds ids.
-        scraper = _ratings_scraper()
-        scraper.resolve_finished_match_ids_via_capture.return_value = ['101', '103']
-
-        # Act
-        rc = _run_main(
-            ["--entity", "player_ratings", "--league", "ENG-Premier League",
-             "--season", "2024", "--output", temp_output],
-            MagicMock(return_value=scraper),
-            resolver_ids=[],
-        )
-
-        # Assert — capture drove the match_ids into read_player_ratings; save ran.
-        assert rc == 0
-        scraper.resolve_finished_match_ids_via_capture.assert_called_once()
-        assert scraper.read_player_ratings.call_args.kwargs['match_ids'] == ['101', '103']
-
-    @pytest.mark.unit
-    def test_empty_bronze_and_empty_capture_exits_2(self, temp_output):
-        # Arrange — neither bronze nor capture yields match_ids (off-season).
-        scraper = _ratings_scraper()
-        scraper.resolve_finished_match_ids_via_capture.return_value = []
-
-        # Act
-        rc = _run_main(
-            ["--entity", "player_ratings", "--league", "ENG-Premier League",
-             "--season", "2024", "--output", temp_output],
-            MagicMock(return_value=scraper),
-            resolver_ids=[],
-        )
-
-        # Assert — graceful R0.2B fallback (soft success), read_player_ratings skipped.
-        assert rc == 2
-        scraper.read_player_ratings.assert_not_called()
-        with open(temp_output) as f:
-            payload = json.load(f)
-        assert payload['fallback'] is True
-        assert payload['fallback_reason'] == 'no_match_ids'
-        assert 'traffic' in payload
-
-
-def _match_capture_scraper(*, guard_blocks: bool = False, empty: bool = False):
-    """Stub for the #751/#753 match_capture path: read_match_capture returns all
-    five frames (player_ratings, event_player_stats, match_stats, event_shotmap,
-    venue) from one capture pass."""
-    from scrapers.base.base_scraper import ReplaceGuardError
-
-    if empty:
-        frames = {'player_ratings': pd.DataFrame(),
-                  'event_player_stats': pd.DataFrame(),
-                  'match_stats': pd.DataFrame(),
-                  'event_shotmap': pd.DataFrame(),
-                  'venue': pd.DataFrame()}
-    else:
-        def _df():
-            return pd.DataFrame({'league': ['ENG-Premier League'] * 4,
-                                 'season': ['2526'] * 4,
-                                 'match_id': ['1', '1', '2', '2']})
-        # venue is keyed by game_id (one row per match), not match_id (#753).
-        venue_df = pd.DataFrame({'league': ['ENG-Premier League'] * 2,
-                                 'season': ['2526'] * 2,
-                                 'game_id': [1, 2],
-                                 'stadium': ['Etihad Stadium', 'Anfield']})
-        frames = {'player_ratings': _df(), 'event_player_stats': _df(),
-                  'match_stats': _df(), 'event_shotmap': _df(),
-                  'venue': venue_df}
-
-    scraper = MagicMock()
-    # No HTTP error recorded → an empty capture classifies as a genuine
-    # empty_payload (soft exit 2), not an http block (#790). Block tests set
-    # this explicitly to a status dict.
-    scraper._last_lineup_error = None
-    scraper._add_metadata.side_effect = lambda df, entity: df
-    scraper.read_match_capture.return_value = frames
-    if guard_blocks:
-        scraper.save_to_iceberg.side_effect = ReplaceGuardError(
-            'new=1 rows < 90% of existing=380 — refusing replace_partitions save')
-    else:
-        scraper.save_to_iceberg.return_value = (
-            'iceberg.bronze.sofascore_player_ratings')
-    scraper.__enter__ = MagicMock(return_value=scraper)
-    scraper.__exit__ = MagicMock(return_value=False)
-    return scraper
-
-
-class TestMatchCaptureRunner:
-    """#751 PR1: the consolidated match_capture entity writes BOTH
-    player_ratings and event_player_stats from one capture pass, each full-state
-    (replace_partitions + completeness guard)."""
-
-    @pytest.fixture
-    def temp_output(self):
-        fd, path = tempfile.mkstemp(suffix=".json", prefix="sofascore_")
-        os.close(fd)
-        yield path
-        if os.path.exists(path):
-            os.unlink(path)
-
-    @pytest.mark.unit
-    def test_normal_path_saves_five_tables_arms_guard(self, temp_output):
-        scraper = _match_capture_scraper()
-        rc = _run_main(
-            ["--entity", "match_capture", "--league", "ENG-Premier League",
-             "--season", "2025", "--output", temp_output],
-            MagicMock(return_value=scraper),
-            resolver_ids=['1', '2'],
-        )
-        assert rc == 0
-        # Five data tables plus the endpoint-status commit manifest.
-        assert scraper.save_to_iceberg.call_count == 6
-        tables = [c.kwargs['table_name']
-                  for c in scraper.save_to_iceberg.call_args_list]
-        assert set(tables) == {'sofascore_player_ratings',
-                               'sofascore_event_player_stats',
-                               'sofascore_match_stats',
-                               'sofascore_event_shotmap',
-                               'sofascore_venue',
-                               'sofascore_match_capture_status'}
-        assert tables[-3:] == [
-            'sofascore_event_player_stats',
-            'sofascore_player_ratings',
-            'sofascore_match_capture_status',
-        ]
-        for c in scraper.save_to_iceberg.call_args_list:
-            assert c.kwargs['replace_partitions'] == ['league', 'season']
-            assert c.kwargs['min_replace_ratio'] == 0.9
-        with open(temp_output) as f:
-            payload = json.load(f)
-        assert payload['rows'] == 4 and payload['eps_rows'] == 4
-        assert payload['match_stats_rows'] == 4 and payload['shotmap_rows'] == 4
-        # #753: venue is keyed by game_id (one row per match) → 2 rows / 2 matches.
-        assert payload['venue_rows'] == 2 and payload['venue_matches'] == 2
-
-    @pytest.mark.unit
-    def test_traffic_stats_land_in_payload(self, temp_output):
-        # #879: match_capture must report get_traffic_stats() (incl. the
-        # camoufox share) so the canary / PROXY_TRAFFIC tooling sees the
-        # residential spend of the heaviest SofaScore path.
-        scraper = _match_capture_scraper()
-        scraper.get_traffic_stats.return_value = {
-            'proxy_response_bytes': 2 * 1024 * 1024,
-            'proxy_response_mb': 2.0,
-            'camoufox_bytes': 2 * 1024 * 1024,
-            'camoufox_mb': 2.0,
-            'requests': 4,
-            'top_traffic_urls': [],
-        }
-        with patch.dict(sys.modules, {'utils.proxy_traffic': MagicMock()}):
-            rc = _run_main(
-                ["--entity", "match_capture", "--league", "ENG-Premier League",
-                 "--season", "2025", "--output", temp_output],
-                MagicMock(return_value=scraper),
-                resolver_ids=['1', '2'],
-            )
-        assert rc == 0
-        with open(temp_output) as f:
-            payload = json.load(f)
-        assert payload['traffic']['proxy_response_mb'] == 2.0
-        assert payload['traffic']['camoufox_mb'] == 2.0
-
-    @pytest.mark.unit
-    def test_guard_refusal_exits_3(self, temp_output):
-        scraper = _match_capture_scraper(guard_blocks=True)
-        rc = _run_main(
-            ["--entity", "match_capture", "--league", "ENG-Premier League",
-             "--season", "2025", "--output", temp_output],
-            MagicMock(return_value=scraper),
-            resolver_ids=['1', '2'],
-        )
-        assert rc == 3
-        with open(temp_output) as f:
-            payload = json.load(f)
-        assert any("SOFASCORE_REPLACE_GUARD" in e for e in payload["errors"])
-
-    @pytest.mark.unit
-    def test_force_replace_disarms_guard(self, temp_output):
-        scraper = _match_capture_scraper()
-        rc = _run_main(
-            ["--entity", "match_capture", "--league", "ENG-Premier League",
-             "--season", "2025", "--force-replace", "--output", temp_output],
-            MagicMock(return_value=scraper),
-            resolver_ids=['1', '2'],
-        )
-        assert rc == 0
-        for c in scraper.save_to_iceberg.call_args_list:
-            assert c.kwargs['min_replace_ratio'] is None
-
-    @pytest.mark.unit
-    def test_empty_capture_exits_2_and_keeps_incomplete_manifest(self, temp_output):
-        scraper = _match_capture_scraper(empty=True)
-        rc = _run_main(
-            ["--entity", "match_capture", "--league", "ENG-Premier League",
-             "--season", "2025", "--output", temp_output],
-            MagicMock(return_value=scraper),
-            resolver_ids=['1', '2'],
-        )
-        assert rc == 2
-        assert [
-            call.kwargs['table_name']
-            for call in scraper.save_to_iceberg.call_args_list
-        ] == ['sofascore_match_capture_status']
-
-    @pytest.mark.unit
-    def test_terminal_empty_capture_commits_manifest_without_fallback(self, temp_output):
-        scraper = _match_capture_scraper(empty=True)
-        scraper.read_match_capture.return_value['capture_status'] = pd.DataFrame(
-            {
-                'match_id': ['1'],
-                'event_status': ['success'],
-                'lineups_status': ['not_available'],
-                'statistics_status': ['not_available'],
-                'shotmap_status': ['not_available'],
-                'capture_complete': [True],
-                'league': ['ENG-Premier League'],
-                'season': ['2526'],
-            }
-        )
-
-        rc = _run_main(
-            ["--entity", "match_capture", "--league", "ENG-Premier League",
-             "--season", "2025", "--output", temp_output],
-            MagicMock(return_value=scraper),
-            resolver_ids=['1'],
-        )
-
-        assert rc == 0
-        with open(temp_output) as result_file:
-            payload = json.load(result_file)
-        assert payload['fallback'] is False
-        assert payload['matches_complete'] == 1
-
-    @pytest.mark.unit
-    def test_primary_failure_still_saves_paid_secondary_payload(self, temp_output):
-        scraper = _match_capture_scraper(empty=True)
-        frames = scraper.read_match_capture.return_value
-        frames['match_stats'] = pd.DataFrame(
-            {
-                'match_id': ['1'],
-                'league': ['ENG-Premier League'],
-                'season': ['2526'],
-                'name': ['Possession'],
-            }
-        )
-
-        rc = _run_main(
-            ["--entity", "match_capture", "--league", "ENG-Premier League",
-             "--season", "2025", "--output", temp_output],
-            MagicMock(return_value=scraper),
-            resolver_ids=['1'],
-        )
-
-        assert rc == 2
-        assert [
-            call.kwargs['table_name']
-            for call in scraper.save_to_iceberg.call_args_list
-        ] == ['sofascore_match_stats', 'sofascore_match_capture_status']
-
-    @pytest.mark.unit
-    def test_http_block_capture_exits_1_red(self, temp_output):
-        """#790: an empty capture caused by an http block (403) is a real
-        failure → exit 1 (red), NOT the soft exit 2 of a genuine empty."""
-        scraper = _match_capture_scraper(empty=True)
-        scraper._last_lineup_error = {'status': 403}
-        rc = _run_main(
-            ["--entity", "match_capture", "--league", "ENG-Premier League",
-             "--season", "2025", "--output", temp_output],
-            MagicMock(return_value=scraper),
-            resolver_ids=['1', '2'],
-        )
-        assert rc == 1
-        assert [
-            call.kwargs['table_name']
-            for call in scraper.save_to_iceberg.call_args_list
-        ] == ['sofascore_match_capture_status']
-        with open(temp_output) as f:
-            payload = json.load(f)
-        assert payload['fallback_reason'] == 'http_403'
-
-    @pytest.mark.unit
-    def test_skip_existing_captures_only_new_matches(self, temp_output):
-        """#842: matches already in bronze.sofascore_player_ratings are not
-        re-captured — the capture call receives only the NEW match_ids."""
-        scraper = _match_capture_scraper()
-        rc = _run_main(
-            ["--entity", "match_capture", "--league", "ENG-Premier League",
-             "--season", "2025", "--output", temp_output],
-            MagicMock(return_value=scraper),
-            resolver_ids=['1', '2', '3'],
-            existing_capture_ids={'3'},
-        )
-        assert rc == 0
-        assert (scraper.read_match_capture.call_args.kwargs['match_ids']
-                == ['1', '2'])
-        with open(temp_output) as f:
-            payload = json.load(f)
-        assert payload['matches_total'] == 3
-        assert payload['matches_skipped_existing'] == 1
-
-    @pytest.mark.unit
-    def test_all_existing_noops_without_opening_scraper(self, temp_output):
-        """#842: nothing new → exit 0 BEFORE the scraper session is even
-        constructed (zero proxy spend), no capture, no save."""
-        scraper_cls = MagicMock()
-        rc = _run_main(
-            ["--entity", "match_capture", "--league", "ENG-Premier League",
-             "--season", "2025", "--output", temp_output],
-            scraper_cls,
-            resolver_ids=['1', '2'],
-            existing_capture_ids={'1', '2'},
-        )
-        assert rc == 0
-        scraper_cls.assert_not_called()
-        with open(temp_output) as f:
-            payload = json.load(f)
-        assert payload['matches_total'] == 2
-        assert payload['matches_skipped_existing'] == 2
-        assert payload['rows'] == 0 and payload['fallback'] is False
-
-    @pytest.mark.unit
-    def test_force_replace_recaptures_existing(self, temp_output):
-        """#842: --force-replace restores the old full re-capture — the
-        skip-existing probe must not filter anything."""
-        scraper = _match_capture_scraper()
-        rc = _run_main(
-            ["--entity", "match_capture", "--league", "ENG-Premier League",
-             "--season", "2025", "--force-replace", "--output", temp_output],
-            MagicMock(return_value=scraper),
-            resolver_ids=['1', '2'],
-            existing_capture_ids={'1', '2'},
-        )
-        assert rc == 0
-        assert (scraper.read_match_capture.call_args.kwargs['match_ids']
-                == ['1', '2'])
-        with open(temp_output) as f:
-            payload = json.load(f)
-        assert payload['matches_skipped_existing'] == 0
-
-    @pytest.mark.unit
-    def test_merge_unions_with_existing_partition(self, temp_output):
-        """#842: the captured frame (new matches only) is unioned with the
-        existing partition before the replace_partitions save — the saved
-        frame never shrinks, so the completeness guard passes."""
-        existing = pd.DataFrame({
-            'league': ['ENG-Premier League'] * 4, 'season': ['2526'] * 4,
-            'match_id': ['8', '8', '9', '9'],
-        })
-        scraper = _match_capture_scraper()
-        rc = _run_main(
-            ["--entity", "match_capture", "--league", "ENG-Premier League",
-             "--season", "2025", "--output", temp_output],
-            MagicMock(return_value=scraper),
-            resolver_ids=['1', '2'],
-            existing_partition=existing,
-        )
-        assert rc == 0
-        ratings_call = next(
-            c for c in scraper.save_to_iceberg.call_args_list
-            if c.kwargs['table_name'] == 'sofascore_player_ratings'
-        )
-        saved = ratings_call.kwargs['df']
-        assert sorted(set(saved['match_id'])) == ['1', '2', '8', '9']
-        assert len(saved) == 8   # 4 existing + 4 captured — never shrinks
-        with open(temp_output) as f:
-            payload = json.load(f)
-        assert payload['rows'] == 8
-
-
-class TestSeasonTokenNoShift:
-    """#888: the runner must resolve match_ids for the SAME season it labels.
-    The old inline formula (``s[2:4]+ (s[2:4]+1)``) always shifted, while the
-    scraper labels rows via ``_season_to_short`` (which passes an already-short
-    token through). For a short-form ``--season`` the two diverged and the
-    partition was silently written under the +1 season. Both paths now use
-    ``_season_label`` (#913: falls back to ``_season_to_short`` for club
-    leagues) — a short-form token must resolve to itself."""
-
-    @pytest.fixture
-    def temp_output(self):
-        fd, path = tempfile.mkstemp(suffix=".json", prefix="sofascore_")
-        os.close(fd)
-        yield path
-        if os.path.exists(path):
-            os.unlink(path)
-
-    def _record_resolve_season(self, argv, scraper, *, resolved_ids=None):
-        seen = []
-        so_pkg = MagicMock()
-        so_pkg.SofaScoreScraper = MagicMock(return_value=scraper)
-        so_scraper_mod = MagicMock()
-        so_scraper_mod.R0_2B_FALLBACK_MARKER = 'R0_2B_FALLBACK'
-        so_scraper_mod._season_to_short = _season_to_short
-        so_scraper_mod._season_label = _season_label
-        sys.argv = ["run_sofascore_scraper.py"] + argv
-        with patch.dict(sys.modules, {
-            "scrapers.sofascore": so_pkg,
-            "scrapers.sofascore.scraper": so_scraper_mod,
-        }):
-            sys.modules.pop("dags.scripts.run_sofascore_scraper", None)
-            mod = importlib.import_module("dags.scripts.run_sofascore_scraper")
-            importlib.reload(mod)
-
-            def _resolver(_league, season_short, _limit=None):
-                seen.append(season_short)
-                if resolved_ids is None:
-                    return ['1', '2']
-                return list(resolved_ids)
-
-            mod._resolve_match_ids_from_bronze = _resolver
-            mod._existing_match_ids_in_bronze = lambda *a, **k: set()
-            mod._existing_complete_capture_ids = lambda *a, **k: set()
-            mod._read_existing_partition = lambda *a, **k: pd.DataFrame()
-            rc = mod.main()
-        return rc, seen
-
-    @pytest.mark.unit
-    def test_short_form_season_resolves_without_plus_one_shift(self, temp_output):
-        # 2122 is the poison case: old inline gave '2223' (2022/23), mislabelling
-        # the 2021/22 partition. It must resolve '2122'.
-        rc, seen = self._record_resolve_season(
-            ["--entity", "match_capture", "--league", "ENG-Premier League",
-             "--season", "2122", "--output", temp_output],
-            _match_capture_scraper(),
-        )
-        assert rc == 0
-        assert seen and seen[0] == '2122'
-
-    @pytest.mark.unit
-    def test_start_year_season_still_resolves_to_short(self, temp_output):
-        # Start-year tokens were always correct and must stay so: 2023 -> '2324'.
-        rc, seen = self._record_resolve_season(
-            ["--entity", "match_capture", "--league", "ENG-Premier League",
-             "--season", "2023", "--output", temp_output],
-            _match_capture_scraper(),
-        )
-        assert rc == 0
-        assert seen and seen[0] == '2324'
-
-    @pytest.mark.unit
-    def test_ambiguous_2021_cli_int_means_start_year(self, temp_output):
-        rc, seen = self._record_resolve_season(
-            [
-                "--entity",
-                "match_capture",
-                "--league",
-                "ENG-Premier League",
-                "--season",
-                "2021",
-                "--output",
-                temp_output,
-            ],
-            _match_capture_scraper(),
-        )
-        assert rc == 0
-        assert seen and seen[0] == "2122"
-
-    @pytest.mark.unit
-    def test_ambiguous_2021_never_probes_raw_2021_partition(self, temp_output):
-        scraper = _match_capture_scraper(empty=True)
-        scraper.resolve_finished_match_ids_via_capture.return_value = []
-
-        rc, seen = self._record_resolve_season(
-            [
-                "--entity",
-                "match_capture",
-                "--league",
-                "ENG-Premier League",
-                "--season",
-                "2021",
-                "--output",
-                temp_output,
-            ],
-            scraper,
-            resolved_ids=[],
-        )
-
-        assert rc == 2
-        assert seen == ["2122"]
-
-
-def _player_capture_scraper(
-    *, guard_blocks: bool = False, empty: bool = False, season_empty: bool = False,
-):
-    """Stub for the #751 PR3 + PR3b player_capture path: read_player_capture
-    returns BOTH the player_profile and player_season_stats frames from one
-    per-player capture."""
-    from scrapers.base.base_scraper import ReplaceGuardError
-
-    if empty:
-        frames = {'player_profile': pd.DataFrame(),
-                  'player_season_stats': pd.DataFrame()}
-    else:
-        season_df = pd.DataFrame() if season_empty else pd.DataFrame({
-            'league': ['ENG-Premier League'] * 2, 'season': ['2526'] * 2,
-            'player_id': ['1', '2']})
-        frames = {
-            'player_profile': pd.DataFrame({
-                'league': ['ENG-Premier League'] * 3,
-                'season': ['2526'] * 3,
-                'player_id': ['1', '2', '3']}),
-            'player_season_stats': season_df,
-        }
-
-    scraper = MagicMock()
-    # No HTTP error recorded → an empty capture classifies as a genuine
-    # empty_payload (soft exit 2), not an http block (#790). Block tests set
-    # this explicitly to a status dict.
-    scraper._last_lineup_error = None
-    scraper.read_player_capture.return_value = frames
-    if guard_blocks:
-        scraper.save_to_iceberg.side_effect = ReplaceGuardError(
-            'new=1 rows < 90% of existing=520 — refusing replace_partitions save')
-    else:
-        scraper.save_to_iceberg.return_value = (
-            'iceberg.bronze.sofascore_player_profile')
-    scraper.__enter__ = MagicMock(return_value=scraper)
-    scraper.__exit__ = MagicMock(return_value=False)
-    return scraper
-
-
-class TestPlayerCaptureRunner:
-    """#751 PR3 + PR3b: the player_capture entity writes player_profile AND
-    player_season_stats from one per-player capture pass, full-state
-    (replace_partitions + completeness guard). Season-stats is secondary — its
-    save is skipped (not a fallback) when no exact aggregate was captured."""
-
-    @pytest.fixture
-    def temp_output(self):
-        fd, path = tempfile.mkstemp(suffix=".json", prefix="sofascore_")
-        os.close(fd)
-        yield path
-        if os.path.exists(path):
-            os.unlink(path)
-
-    @pytest.mark.unit
-    def test_normal_path_saves_both_tables_arms_guard(self, temp_output):
-        scraper = _player_capture_scraper()
-        rc = _run_main(
-            ["--entity", "player_capture", "--league", "ENG-Premier League",
-             "--season", "2025", "--output", temp_output],
-            MagicMock(return_value=scraper),
-        )
-        assert rc == 0
-        assert scraper.save_to_iceberg.call_count == 2
-        saved = {c.kwargs['table_name']: c.kwargs
-                 for c in scraper.save_to_iceberg.call_args_list}
-        assert set(saved) == {'sofascore_player_profile',
-                              'sofascore_player_season_stats'}
-        for kwargs in saved.values():
-            assert kwargs['replace_partitions'] == ['league', 'season']
-            assert kwargs['min_replace_ratio'] == 0.9
-        with open(temp_output) as f:
-            payload = json.load(f)
-        assert payload['rows'] == 3
-        assert payload['season_stats_rows'] == 2
-
-    @pytest.mark.unit
-    def test_season_empty_skips_second_save(self, temp_output):
-        # Picker captured no EPL overall for anyone → profile still saved, but
-        # the season-stats table is NOT touched (don't wipe a good partition).
-        scraper = _player_capture_scraper(season_empty=True)
-        rc = _run_main(
-            ["--entity", "player_capture", "--league", "ENG-Premier League",
-             "--season", "2025", "--output", temp_output],
-            MagicMock(return_value=scraper),
-        )
-        assert rc == 0
-        assert scraper.save_to_iceberg.call_count == 1
-        assert scraper.save_to_iceberg.call_args_list[0].kwargs['table_name'] == \
-            'sofascore_player_profile'
-        with open(temp_output) as f:
-            payload = json.load(f)
-        assert payload['rows'] == 3
-        assert payload['season_stats_rows'] == 0
-
-    @pytest.mark.unit
-    def test_guard_refusal_exits_3(self, temp_output):
-        scraper = _player_capture_scraper(guard_blocks=True)
-        rc = _run_main(
-            ["--entity", "player_capture", "--league", "ENG-Premier League",
-             "--season", "2025", "--output", temp_output],
-            MagicMock(return_value=scraper),
-        )
-        assert rc == 3
-        with open(temp_output) as f:
-            payload = json.load(f)
-        assert any("SOFASCORE_REPLACE_GUARD" in e for e in payload["errors"])
-
-    @pytest.mark.unit
-    def test_force_replace_disarms_guard(self, temp_output):
-        scraper = _player_capture_scraper()
-        rc = _run_main(
-            ["--entity", "player_capture", "--league", "ENG-Premier League",
-             "--season", "2025", "--force-replace", "--output", temp_output],
-            MagicMock(return_value=scraper),
-        )
-        assert rc == 0
-        for c in scraper.save_to_iceberg.call_args_list:
-            assert c.kwargs['min_replace_ratio'] is None
-
-    @pytest.mark.unit
-    def test_empty_capture_exits_2_no_save(self, temp_output):
-        scraper = _player_capture_scraper(empty=True)
-        rc = _run_main(
-            ["--entity", "player_capture", "--league", "ENG-Premier League",
-             "--season", "2025", "--output", temp_output],
-            MagicMock(return_value=scraper),
-        )
-        assert rc == 2
-        scraper.save_to_iceberg.assert_not_called()
-
-    @pytest.mark.unit
-    def test_http_block_capture_exits_1_red(self, temp_output):
-        """#790: an empty player_capture caused by an http block (403) is a real
-        failure → exit 1 (red), NOT the soft exit 2 of a genuine empty."""
-        scraper = _player_capture_scraper(empty=True)
-        scraper._last_lineup_error = {'status': 403}
-        rc = _run_main(
-            ["--entity", "player_capture", "--league", "ENG-Premier League",
-             "--season", "2025", "--output", temp_output],
-            MagicMock(return_value=scraper),
-        )
-        assert rc == 1
-        scraper.save_to_iceberg.assert_not_called()
-        with open(temp_output) as f:
-            payload = json.load(f)
-        assert payload['fallback_reason'] == 'http_403'
-
-
-def _schedule_module():
-    """Import the runner module for direct helper access — its module-level
-    imports are stdlib only (scrapers are lazy), so no stubbing is needed."""
-    sys.modules.pop("dags.scripts.run_sofascore_scraper", None)
-    return importlib.import_module("dags.scripts.run_sofascore_scraper")
-
-
-class TestScheduleMergePartition:
-    """#761 _merge_schedule_partition: union an existing schedule partition with
-    a captured window, keyed by game_id (captured wins). Never shrinks, so the
-    completeness guard passes even on a partial capture."""
-
-    @pytest.mark.unit
-    def test_empty_existing_returns_captured(self):
-        merge = _schedule_module()._merge_schedule_partition
-        captured = pd.DataFrame({'game_id': [1, 2], 'home_score': [1.0, 2.0]})
-        out = merge(pd.DataFrame(), captured)
-        assert sorted(out['game_id']) == [1, 2]
-
-    @pytest.mark.unit
-    def test_none_existing_returns_captured(self):
-        merge = _schedule_module()._merge_schedule_partition
-        captured = pd.DataFrame({'game_id': [1], 'home_score': [3.0]})
-        out = merge(None, captured)
-        assert out['game_id'].tolist() == [1]
-
-    @pytest.mark.unit
-    def test_union_keeps_captured_for_overlap_and_never_shrinks(self):
-        merge = _schedule_module()._merge_schedule_partition
-        existing = pd.DataFrame({
-            'game_id': [1, 2, 4, 5, 6],
-            'home_score': [0.0, 0.0, 3.0, 1.0, 2.0],
-        })
-        captured = pd.DataFrame({
-            'game_id': [1, 2, 3],          # 1,2 overlap (fresh scores); 3 new
-            'home_score': [1.0, 2.0, 9.0],
-        })
-        out = merge(existing, captured)
-        assert sorted(out['game_id']) == [1, 2, 3, 4, 5, 6]
-        assert len(out) >= len(existing)               # never shrinks
-        assert out.set_index('game_id').loc[1, 'home_score'] == 1.0  # captured wins
-        assert out.set_index('game_id').loc[2, 'home_score'] == 2.0
-        assert out.set_index('game_id').loc[4, 'home_score'] == 3.0  # existing kept
-
-    @pytest.mark.unit
-    def test_union_preserves_columns_absent_from_current_capture(self):
-        merge = _schedule_module()._merge_schedule_partition
-        existing = pd.DataFrame(
-            {
-                "game_id": [1, 2],
-                "rare_source_field": ["x", "y"],
-            }
-        )
-        captured = pd.DataFrame({"game_id": [2, 3], "status_type": ["finished"] * 2})
-
-        out = merge(existing, captured).set_index("game_id")
-
-        assert {"rare_source_field", "status_type"} <= set(out.columns)
-        assert out.loc[1, "rare_source_field"] == "x"
-        assert out.loc[2, "rare_source_field"] == "y"
-
-
-class TestScheduleCaptureMergeRunner:
-    """#761 _run_legacy merges the captured schedule window with the existing
-    bronze partition before the replace_partitions save."""
-
-    @pytest.fixture
-    def temp_output(self):
-        fd, path = tempfile.mkstemp(suffix=".json", prefix="sofascore_")
-        os.close(fd)
-        yield path
-        if os.path.exists(path):
-            os.unlink(path)
-
-    @pytest.mark.unit
-    def test_merge_unions_with_existing_partition(self, temp_output):
-        captured = pd.DataFrame({
-            'league': ['ENG-Premier League'] * 3, 'season': ['2526'] * 3,
-            'game_id': [1, 2, 3], 'home_score': [1.0, 2.0, None],
-        })
-        existing = pd.DataFrame({
-            'league': ['ENG-Premier League'] * 5, 'season': ['2526'] * 5,
-            'game_id': [1, 2, 4, 5, 6], 'home_score': [0.0, 0.0, 3.0, 1.0, 2.0],
-        })
-        scraper = _legacy_scraper()
-        scraper.read_schedule.return_value = captured
-        scraper.read_league_table.return_value = pd.DataFrame()  # skip 2nd save
-
-        rc = _run_main(
-            [
-                "--entity",
-                "schedule",
-                "--leagues",
-                "ENG-Premier League",
-                "--season",
-                "2526",
-                "--output",
-                temp_output,
-            ],
-            MagicMock(return_value=scraper),
-            existing_schedule=existing,
-        )
-
-        assert rc == 0
-        schedule_call = next(
-            c for c in scraper.save_to_iceberg.call_args_list
-            if c.kwargs['table_name'] == 'sofascore_schedule'
-        )
-        saved = schedule_call.kwargs['df']
-        assert sorted(saved['game_id']) == [1, 2, 3, 4, 5, 6]   # union
-        assert len(saved) >= len(existing)                       # never shrinks
-        assert saved.set_index('game_id').loc[1, 'home_score'] == 1.0  # captured wins
-
-
-class TestMergeMatchPartition:
-    """#842 _merge_match_partition: union an existing per-match partition with
-    captured rows for NEW matches, keyed by match_id/game_id. A re-captured
-    match replaces its existing rows wholesale; the union never shrinks, so
-    the completeness guard passes."""
-
-    @pytest.mark.unit
-    def test_empty_existing_returns_captured(self):
-        merge = _schedule_module()._merge_match_partition
-        captured = pd.DataFrame({'match_id': ['1', '1'], 'rating': [6.5, 7.0]})
-        out = merge(pd.DataFrame(), captured, key='match_id')
-        assert len(out) == 2
-
-    @pytest.mark.unit
-    def test_none_existing_returns_captured(self):
-        merge = _schedule_module()._merge_match_partition
-        captured = pd.DataFrame({'match_id': ['1'], 'rating': [6.5]})
-        out = merge(None, captured, key='match_id')
-        assert out['match_id'].tolist() == ['1']
-
-    @pytest.mark.unit
-    def test_union_never_shrinks_and_recaptured_match_wins(self):
-        merge = _schedule_module()._merge_match_partition
-        existing = pd.DataFrame({
-            'match_id': ['1', '1', '2'], 'rating': [5.0, 5.5, 6.0],
-        })
-        captured = pd.DataFrame({
-            'match_id': ['2', '3'],       # 2 re-captured, 3 new
-            'rating': [9.0, 8.0],
-        })
-        out = merge(existing, captured, key='match_id')
-        assert sorted(out['match_id']) == ['1', '1', '2', '3']
-        assert len(out) >= len(existing)                 # never shrinks
-        # the re-captured match's OLD row is dropped wholesale — no stale mix.
-        assert out.set_index('match_id').loc['2', 'rating'] == 9.0
-
-    @pytest.mark.unit
-    def test_key_type_mismatch_coerced_via_str(self):
-        """Trino returns varchar keys; a captured frame may carry ints (venue
-        game_id) — the key comparison must coerce both sides to str."""
-        merge = _schedule_module()._merge_match_partition
-        existing = pd.DataFrame({'game_id': ['1', '2'], 'stadium': ['A', 'B']})
-        captured = pd.DataFrame({'game_id': [2, 3], 'stadium': ['B2', 'C']})
-        out = merge(existing, captured, key='game_id')
-        assert len(out) == 3                             # '2' replaced, not doubled
-        assert set(out['stadium']) == {'A', 'B2', 'C'}
-
-    @pytest.mark.unit
-    def test_preserves_evolving_source_columns(self):
-        merge = _schedule_module()._merge_match_partition
-        existing = pd.DataFrame(
-            {
-                "match_id": ["1"],
-                "rare_source_field": ["kept"],
-            }
-        )
-        captured = pd.DataFrame({"match_id": ["2"], "new_source_field": [7]})
-        out = merge(existing, captured, key="match_id").set_index("match_id")
-        assert out.loc["1", "rare_source_field"] == "kept"
-        assert out.loc["2", "new_source_field"] == 7
-
-    @pytest.mark.unit
-    def test_recaptured_player_keeps_column_absent_from_fresh_schema(self):
-        merge = _schedule_module()._merge_match_partition
-        existing = pd.DataFrame(
-            {
-                'match_id': ['2'],
-                'player_id': ['10'],
-                'rare_source_field': ['kept'],
-                'rating': [6.0],
-            }
-        )
-        captured = pd.DataFrame(
-            {
-                'match_id': ['2'],
-                'player_id': ['10'],
-                'rating': [7.0],
-            }
-        )
-
-        out = merge(existing, captured, key='match_id').iloc[0]
-
-        assert out['rating'] == 7.0
-        assert out['rare_source_field'] == 'kept'
-
-
-class TestFilterNewMatchIds:
-    """#842 filter uses the explicit completion manifest."""
-
-    @pytest.mark.unit
-    def test_filters_and_counts(self, monkeypatch):
-        mod = _schedule_module()
-        monkeypatch.setattr(
-            mod, '_existing_complete_capture_ids', lambda *a, **k: {'2', '3'})
-        new, skipped, seed, missing = mod._filter_new_match_ids(
-            ['1', '2', '3'], 'ENG-Premier League', '2526', '2025')
-        assert new == ['1'] and skipped == 2 and seed == set() and not missing
-
-    @pytest.mark.unit
-    def test_empty_probe_skips_nothing(self, monkeypatch):
-        mod = _schedule_module()
-        monkeypatch.setattr(
-            mod, '_existing_complete_capture_ids', lambda *a, **k: set())
-        new, skipped, seed, missing = mod._filter_new_match_ids(
-            ['1', '2'], 'ENG-Premier League', '2526', '2025')
-        assert new == ['1', '2'] and skipped == 0 and seed == set() and not missing
-
-    @pytest.mark.unit
-    def test_int_ids_compared_as_str(self, monkeypatch):
-        mod = _schedule_module()
-        monkeypatch.setattr(
-            mod, '_existing_complete_capture_ids', lambda *a, **k: {'10'})
-        new, skipped, seed, missing = mod._filter_new_match_ids(
-            [10, 11], 'ENG-Premier League', '2526', '2025')
-        assert new == [11] and skipped == 1 and seed == set() and not missing
-
-
-class TestSkipExistingRequiresCompleteCapture:
-    """Legacy data seeds the manifest without a full-season re-download."""
-
-    @pytest.mark.unit
-    def test_missing_manifest_seeds_only_fully_materialised_legacy_matches(
-        self,
-        monkeypatch,
+    with patch(
+        "scrapers.sofascore.catalog.SofaScoreCatalog.load",
+        side_effect=AssertionError("catalog must not be opened"),
     ):
-        mod = _schedule_module()
-        calls = []
+        assert runner.main(["--manifest-backend", "json"]) == 1
 
-        def _probe(table, league, season, id_col='match_id'):
-            calls.append((table, id_col))
-            return {'1'}
 
-        monkeypatch.setattr(mod, '_existing_match_ids_in_bronze', _probe)
-        monkeypatch.setattr(
-            mod,
-            '_existing_complete_capture_ids',
-            lambda *a, **k: None,
+@pytest.mark.unit
+@pytest.mark.parametrize("entity", ["all", "match_capture", "player_capture"])
+def test_out_of_window_tournament_is_clean_noop_before_plan_or_runtime(
+    tmp_path, monkeypatch, entity
+):
+    runner = _runner_module()
+    output = tmp_path / f"{entity}.json"
+    catalog = SimpleNamespace(
+        competition=lambda _league: SimpleNamespace(
+            enabled=True,
+            capture_allowed=True,
+            activation_eligibility=SimpleNamespace(reasons=()),
         )
+    )
+    monkeypatch.setattr(
+        "scrapers.sofascore.catalog.SofaScoreCatalog.load",
+        lambda: catalog,
+    )
+    monkeypatch.setattr(
+        "utils.medallion_config.is_single_year_competition",
+        lambda _league: True,
+    )
+    monkeypatch.setattr(
+        "utils.medallion_config.get_active_season",
+        lambda _league: None,
+    )
+    runtime = MagicMock(side_effect=AssertionError("runtime must not be built"))
+    monkeypatch.setattr("scrapers.sofascore.pipeline.build_capture_runtime", runtime)
 
-        # Act
-        new, skipped, seed, missing = mod._filter_new_match_ids(
-            ['1', '2'], 'ENG-Premier League', '2526', '2025')
+    rc = runner.main(
+        [
+            "--entity",
+            entity,
+            "--league",
+            "INT-World Cup",
+            "--season",
+            "2026",
+            "--output",
+            str(output),
+        ]
+    )
 
-        # Match 1 exists everywhere; match 2 must be captured.
-        assert new == ["2"] and skipped == 1
-        assert seed == {'1'} and missing is True
-        assert {table for table, _ in calls} == {
-            "sofascore_player_ratings",
-            "sofascore_event_player_stats",
-            "sofascore_match_stats",
-            "sofascore_event_shotmap",
-            "sofascore_venue",
-        }
-        assert dict(calls)["sofascore_venue"] == "game_id"
+    assert rc == 0
+    assert json.loads(output.read_text(encoding="utf-8"))["skipped"] == (
+        "out_of_window"
+    )
+    runtime.assert_not_called()
 
-    @pytest.mark.unit
-    def test_preflight_manifest_contains_legacy_and_pending_rows(self):
-        mod = _schedule_module()
-        scraper = MagicMock()
-        scraper._add_metadata.side_effect = lambda frame, entity: frame
 
-        mod._prepare_capture_manifest(
-            scraper,
-            pending_ids=['2'],
-            complete_ids={'1'},
-            league='ENG-Premier League',
-            season='2526',
-        )
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("name", "args"),
+    [
+        (
+            "_run_match_capture",
+            {
+                "leagues": ["ENG-Premier League"],
+                "season": 2025,
+                "limit": None,
+                "output_path": "/tmp/never-written.json",
+            },
+        ),
+        (
+            "_run_player_capture",
+            {
+                "leagues": ["ENG-Premier League"],
+                "season": 2025,
+                "limit": None,
+                "output_path": "/tmp/never-written.json",
+            },
+        ),
+        (
+            "_run_legacy",
+            {
+                "leagues": ["ENG-Premier League"],
+                "season": 2025,
+                "output_path": "/tmp/never-written.json",
+            },
+        ),
+    ],
+)
+def test_direct_entrypoint_requires_runtime_and_plan_before_side_effects(
+    name,
+    args,
+):
+    """A direct import cannot resurrect the removed standalone proxy path."""
+    runner = _runner_module()
+    trino = MagicMock(side_effect=AssertionError("Trino was opened"))
+    browser = MagicMock(side_effect=AssertionError("browser was opened"))
 
-        call = scraper.save_to_iceberg.call_args
-        frame = call.kwargs['df'].set_index('match_id')
-        assert bool(frame.loc['1', 'capture_complete']) is True
-        assert bool(frame.loc['2', 'capture_complete']) is False
-        assert frame.loc['2', 'event_status'] == 'pending'
-        assert call.kwargs['min_replace_ratio'] is None
+    with (
+        patch.object(runner, "_trino_connect", trino),
+        patch("scrapers.sofascore.SofaScoreScraper", browser),
+        pytest.raises(TypeError),
+    ):
+        getattr(runner, name)(**args)
 
-    @pytest.mark.unit
-    def test_probe_sql_selects_the_requested_id_col(self, monkeypatch):
-        # Arrange — venue rows are keyed by game_id, not match_id.
-        mod = _schedule_module()
-        cur = MagicMock()
-        cur.fetchall.return_value = [('101',), ('103',)]
-        conn = MagicMock()
-        conn.cursor.return_value = cur
-        monkeypatch.setattr(mod, '_trino_connect', lambda: conn)
+    trino.assert_not_called()
+    browser.assert_not_called()
 
-        # Act
-        ids = mod._existing_match_ids_in_bronze(
-            'sofascore_venue', 'ENG-Premier League', '2526', id_col='game_id')
 
-        # Assert — the DISTINCT projection follows id_col.
-        sql = cur.execute.call_args[0][0]
-        assert "DISTINCT CAST(game_id AS varchar)" in sql
-        assert ids == {"101", "103"}
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("name", "args"),
+    [
+        (
+            "_run_match_capture",
+            {
+                "leagues": ["ENG-Premier League"],
+                "season": 2025,
+                "limit": None,
+                "output_path": "/tmp/never-written.json",
+                "capture_runtime": MagicMock(),
+            },
+        ),
+        (
+            "_run_player_capture",
+            {
+                "leagues": ["ENG-Premier League"],
+                "season": 2025,
+                "limit": None,
+                "output_path": "/tmp/never-written.json",
+                "capture_runtime": MagicMock(),
+            },
+        ),
+        (
+            "_run_legacy",
+            {
+                "leagues": ["ENG-Premier League"],
+                "season": 2025,
+                "output_path": "/tmp/never-written.json",
+                "capture_runtime": MagicMock(),
+            },
+        ),
+    ],
+)
+def test_direct_entrypoint_requires_explicit_workload_plan(name, args):
+    runner = _runner_module()
 
-    @pytest.mark.unit
-    def test_probe_fails_closed_when_trino_is_unavailable(self, monkeypatch):
-        mod = _schedule_module()
-        conn = MagicMock()
-        conn.cursor.return_value.execute.side_effect = RuntimeError("connection reset")
-        monkeypatch.setattr(mod, "_trino_connect", lambda: conn)
-
-        with pytest.raises(RuntimeError, match="skip-existing probe"):
-            mod._existing_match_ids_in_bronze(
-                "sofascore_venue",
-                "ENG-Premier League",
-                "2526",
-                id_col="game_id",
-            )
+    with pytest.raises(TypeError):
+        getattr(runner, name)(**args)
 
 
 class TestBronzeMatchResolver:
     @pytest.mark.unit
     def test_filters_by_finished_status_not_live_score(self, monkeypatch):
-        mod = _schedule_module()
-        cur = MagicMock()
-        cur.fetchall.return_value = [("101",)]
-        conn = MagicMock()
-        conn.cursor.return_value = cur
-        monkeypatch.setattr(mod, "_trino_connect", lambda: conn)
+        runner = _runner_module()
+        cursor = MagicMock()
+        cursor.fetchall.return_value = [("101",)]
+        connection = MagicMock()
+        connection.cursor.return_value = cursor
+        monkeypatch.setattr(runner, "_trino_connect", lambda: connection)
 
-        assert mod._resolve_match_ids_from_bronze(
+        assert runner._resolve_match_ids_from_bronze(
             "ENG-Premier League",
             "2526",
             None,
         ) == ["101"]
-        sql = cur.execute.call_args[0][0]
+        sql = cursor.execute.call_args[0][0]
         assert "status_type = 'finished'" in sql
         assert "home_score" not in sql
         assert "COALESCE" not in sql
 
     @pytest.mark.unit
     def test_operational_error_fails_closed(self, monkeypatch):
-        mod = _schedule_module()
-        conn = MagicMock()
-        conn.cursor.return_value.execute.side_effect = RuntimeError("connection reset")
-        monkeypatch.setattr(mod, "_trino_connect", lambda: conn)
+        runner = _runner_module()
+        connection = MagicMock()
+        connection.cursor.return_value.execute.side_effect = RuntimeError(
+            "connection reset"
+        )
+        monkeypatch.setattr(runner, "_trino_connect", lambda: connection)
 
         with pytest.raises(RuntimeError, match="schedule match-id probe failed"):
-            mod._resolve_match_ids_from_bronze(
+            runner._resolve_match_ids_from_bronze(
                 "ENG-Premier League",
                 "2526",
                 None,

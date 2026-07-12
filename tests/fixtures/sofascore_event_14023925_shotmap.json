@@ -1,0 +1,26 @@
+{
+  "shotmap": [
+    {
+      "id": 101,
+      "player": {"id": 11111, "name": "Starter One"},
+      "teamId": 1,
+      "isHome": true,
+      "time": 12,
+      "incidentType": "goal",
+      "playerCoordinates": {"x": 88.5, "y": 50.0},
+      "xg": 0.72,
+      "xgot": 0.84
+    },
+    {
+      "id": 102,
+      "player": {"id": 22222, "name": "Used Away"},
+      "teamId": 2,
+      "isHome": false,
+      "time": 76,
+      "incidentType": "save",
+      "playerCoordinates": {"x": 92.1, "y": 48.5},
+      "xg": 0.11,
+      "xgot": 0.19
+    }
+  ]
+}

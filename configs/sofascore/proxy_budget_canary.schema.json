@@ -1,0 +1,298 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "benchmarkSample": {
+      "additionalProperties": true,
+      "properties": {
+        "allocation_bytes": {"minimum": 0, "type": "integer"},
+        "budget_eligible": {"const": false},
+        "endpoint_request_provider_bytes": {"type": "object"},
+        "evidence": {
+          "properties": {
+            "runtime_fingerprint_digest": {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            }
+          },
+          "required": ["runtime_fingerprint_digest"],
+          "type": "object"
+        },
+        "lease_count": {"minimum": 0, "type": "integer"},
+        "mode": {
+          "enum": ["no_op", "offline_replay", "single_endpoint_resume"]
+        },
+        "network_request_count": {"minimum": 0, "type": "integer"},
+        "proxy_exit_hash": {
+          "oneOf": [
+            {"pattern": "^[0-9a-f]{64}$", "type": "string"},
+            {"type": "null"}
+          ]
+        },
+        "run_id": {"minLength": 1, "type": "string"},
+        "source_tournament_id": {"minimum": 1, "type": "integer"},
+        "total_provider_bytes": {"minimum": 0, "type": "integer"},
+        "workload_class": {"minLength": 1, "type": "string"}
+      },
+      "required": [
+        "run_id",
+        "workload_class",
+        "source_tournament_id",
+        "mode",
+        "budget_eligible",
+        "proxy_exit_hash",
+        "total_provider_bytes",
+        "endpoint_request_provider_bytes",
+        "evidence",
+        "lease_count",
+        "network_request_count",
+        "allocation_bytes"
+      ],
+      "type": "object"
+    },
+    "coldSample": {
+      "additionalProperties": true,
+      "properties": {
+        "budget_eligible": {"const": true},
+        "endpoint_provider_bytes": {
+          "additionalProperties": {"minimum": 0, "type": "integer"},
+          "minProperties": 1,
+          "type": "object"
+        },
+        "endpoint_request_provider_bytes": {
+          "additionalProperties": {
+            "items": {"minimum": 0, "type": "integer"},
+            "minItems": 1,
+            "type": "array"
+          },
+          "minProperties": 1,
+          "type": "object"
+        },
+        "evidence": {
+          "properties": {
+            "runtime_fingerprint_digest": {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            }
+          },
+          "required": ["runtime_fingerprint_digest"],
+          "type": "object"
+        },
+        "mode": {"const": "cold"},
+        "proxy_exit_hash": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "run_id": {"minLength": 1, "type": "string"},
+        "source_tournament_id": {"minimum": 1, "type": "integer"},
+        "total_provider_bytes": {"minimum": 1, "type": "integer"},
+        "units": {"minimum": 1, "type": "integer"},
+        "workload_class": {"minLength": 1, "type": "string"}
+      },
+      "required": [
+        "run_id",
+        "workload_class",
+        "source_tournament_id",
+        "mode",
+        "budget_eligible",
+        "units",
+        "proxy_exit_hash",
+        "total_provider_bytes",
+        "endpoint_request_provider_bytes",
+        "evidence"
+      ],
+      "type": "object"
+    },
+    "runtimeFingerprint": {
+      "additionalProperties": false,
+      "properties": {
+        "algorithm": {
+          "const": "sha256-relative-path-content-v1"
+        },
+        "browser_runtime_pins": {
+          "additionalProperties": false,
+          "properties": {
+            "camoufox": {"minLength": 1, "type": "string"},
+            "playwright": {"minLength": 1, "type": "string"}
+          },
+          "required": ["camoufox", "playwright"],
+          "type": "object"
+        },
+        "digest": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "files": {
+          "items": {"minLength": 1, "type": "string"},
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "version": {"const": 1}
+      },
+      "required": [
+        "version",
+        "algorithm",
+        "digest",
+        "files",
+        "browser_runtime_pins"
+      ],
+      "type": "object"
+    },
+    "workloadClass": {
+      "additionalProperties": true,
+      "properties": {
+        "cohort": {"minLength": 1, "type": "string"},
+        "collection_blocker": {"type": "string"},
+        "hard_task_bytes": {
+          "oneOf": [
+            {"minimum": 1, "type": "integer"},
+            {"type": "null"}
+          ]
+        },
+        "max_units": {"minimum": 1, "type": "integer"},
+        "required_endpoints": {
+          "items": {"minLength": 1, "type": "string"},
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "samples": {
+          "items": {"$ref": "#/$defs/coldSample"},
+          "type": "array"
+        },
+        "scope": {"enum": ["match", "player", "season"]},
+        "source_tournament_id": {"minimum": 1, "type": "integer"},
+        "shape": {"minProperties": 1, "type": "object"},
+        "shape_digest": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "scope",
+        "source_tournament_id",
+        "max_units",
+        "required_endpoints",
+        "hard_task_bytes",
+        "samples"
+      ],
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {"verified": {"const": true}},
+        "required": ["verified"]
+      },
+      "then": {
+        "properties": {
+          "workload_classes": {
+            "additionalProperties": {
+              "properties": {
+                "hard_task_bytes": {"minimum": 1, "type": "integer"},
+                "samples": {"minItems": 20}
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "properties": {
+    "benchmark_samples": {
+      "items": {"$ref": "#/$defs/benchmarkSample"},
+      "type": "array"
+    },
+    "bootstrap_authorizes_production": {"const": false},
+    "budget_derivation": {
+      "const": "max_observed_task_bytes_per_workload_class_v2",
+      "description": "Each hard task cap is exactly that class's largest complete cold observation; no multiplier or cross-class aggregation is permitted."
+    },
+    "cohort_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "collection_source": {"const": "sofascore_canary"},
+    "collector_version": {"const": "sofascore-paid-canary-v2"},
+    "experimental_hard_cap_bytes": {
+      "minimum": 1,
+      "type": "integer"
+    },
+    "historical_observations": {"type": "array"},
+    "meter": {"const": "proxy_filter_provider_path_v2"},
+    "rate_limit_policy": {
+      "additionalProperties": false,
+      "properties": {
+        "burst_size": {"minimum": 1, "type": "integer"},
+        "max_requests": {"minimum": 1, "type": "integer"},
+        "source": {"const": "sofascore"},
+        "window_seconds": {"minimum": 1, "type": "integer"}
+      },
+      "required": ["source", "max_requests", "window_seconds", "burst_size"],
+      "type": "object"
+    },
+    "requirements": {
+      "additionalProperties": false,
+      "properties": {
+        "minimum_cold_samples_per_class": {"minimum": 20, "type": "integer"},
+        "minimum_distinct_proxy_exits_per_class": {
+          "minimum": 5,
+          "type": "integer"
+        },
+        "required_benchmark_modes": {
+          "items": {
+            "enum": ["no_op", "offline_replay", "single_endpoint_resume"]
+          },
+          "minItems": 3,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "required_workload_classes": {
+          "items": {"minLength": 1, "type": "string"},
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "minimum_cold_samples_per_class",
+        "minimum_distinct_proxy_exits_per_class",
+        "required_benchmark_modes",
+        "required_workload_classes"
+      ],
+      "type": "object"
+    },
+    "runtime_fingerprint": {"$ref": "#/$defs/runtimeFingerprint"},
+    "schema_version": {"const": 2},
+    "source": {"const": "sofascore"},
+    "verification_blocker": {"minLength": 1, "type": "string"},
+    "verified": {"type": "boolean"},
+    "workload_classes": {
+      "additionalProperties": {"$ref": "#/$defs/workloadClass"},
+      "minProperties": 1,
+      "type": "object"
+    }
+  },
+  "required": [
+    "schema_version",
+    "source",
+    "meter",
+    "budget_derivation",
+    "collection_source",
+    "collector_version",
+    "experimental_hard_cap_bytes",
+    "bootstrap_authorizes_production",
+    "cohort_sha256",
+    "rate_limit_policy",
+    "requirements",
+    "historical_observations",
+    "runtime_fingerprint",
+    "verified",
+    "verification_blocker",
+    "workload_classes",
+    "benchmark_samples"
+  ],
+  "type": "object"
+}

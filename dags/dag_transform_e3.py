@@ -31,6 +31,9 @@ Topology
         |-- fct_lineup   (run_gold_transform, partitions=['league','season'])
         |
         v
+    validate_sofascore_committed_state
+        |               (active-registry endpoint/table DQ, fail closed)
+        v
     validate_e3      (DQ checks + Telegram summary)
         |
         v
@@ -81,6 +84,11 @@ Known limitations (carried over from the SQL-level ADRs)
 
 DQ wiring (validate_e3)
 -----------------------
+``validate_sofascore_committed_state`` first executes the versioned
+SofaScore endpoint/table contract for every capture-allowed registry
+competition-season. SQL/planning failures and threshold violations fail the
+DAG before the cross-source E3 summary can publish a false success.
+
 DQ builders live in ``utils.e3_dq`` (E3.8). The validator imports
 ``build_all_e3_checks`` (39 standard checks) and the standalone
 ``parity_check_event_counts`` (Bronze->Silver->Gold row-count parity gate)
@@ -359,6 +367,14 @@ GOLD_E3_TRANSFORMS = [
         'fct_shot_audit',
     ),
     (
+        # #876: source-explicit SofaScore xGOT. Keep this fact separate from
+        # cross-provider psxg/xG models so a COALESCE can never silently mix
+        # incompatible provider definitions.
+        'fct_sofascore_team_match_post_shot_xg',
+        'dags/sql/gold/fct_sofascore_team_match_post_shot_xg.sql',
+        'fct_sofascore_team_match_post_shot_xg',
+    ),
+    (
         'fct_lineup',
         'dags/sql/gold/fct_lineup.sql',
         'fct_lineup',
@@ -463,6 +479,42 @@ def _run_gold_e3(sql_file: str, table_name: str, **context) -> Dict[str, Any]:
         result.get('rows', 0),
         result.get('table'),
         GOLD_E3_PARTITION_COLUMNS,
+    )
+    return result
+
+
+def _validate_sofascore_committed_state(**context) -> Dict[str, Any]:
+    """Fail closed on committed SofaScore partition quality.
+
+    Scope is derived from the versioned registry: only enabled, evidenced,
+    operator-approved adult-men competitions and their activatable seasons are
+    checked. The callable runs after all E3 SofaScore Silver/Gold CTAS tasks, so
+    duplicate, season, schedule-skeleton, endpoint completeness, profile,
+    rating and Silver-to-Gold lineup attachment gates observe one committed
+    state. Any SQL error or threshold violation fails this Airflow task.
+    """
+
+    from airflow.exceptions import AirflowException
+
+    from utils.sofascore_dq import (
+        SofaScoreDQViolation,
+        run_active_registry_committed_dq,
+    )
+
+    try:
+        result = run_active_registry_committed_dq()
+    except SofaScoreDQViolation as exc:
+        raise AirflowException(
+            f"SofaScore committed-state DQ failed: {exc}"
+        ) from exc
+    except Exception as exc:
+        raise AirflowException(
+            f"SofaScore committed-state DQ crashed fail-closed: {exc}"
+        ) from exc
+    logger.info(
+        "SofaScore committed-state DQ passed: %d checks across %d partitions",
+        result['checks'],
+        result['partitions'],
     )
     return result
 
@@ -619,8 +671,14 @@ with DAG(
             prev = t
 
     # =========================================================================
-    # Validation -- DQ checks + Telegram summary
+    # Validation -- source-specific committed state, then general E3 summary
     # =========================================================================
+    sofascore_committed_dq_task = PythonOperator(
+        task_id='validate_sofascore_committed_state',
+        python_callable=_validate_sofascore_committed_state,
+        trigger_rule='all_success',
+    )
+
     validate_task = PythonOperator(
         task_id='validate_e3',
         python_callable=_validate_e3,
@@ -632,4 +690,11 @@ with DAG(
     # =========================================================================
     # Dependencies
     # =========================================================================
-    start >> silver_group >> gold_group >> validate_task >> end
+    (
+        start
+        >> silver_group
+        >> gold_group
+        >> sofascore_committed_dq_task
+        >> validate_task
+        >> end
+    )

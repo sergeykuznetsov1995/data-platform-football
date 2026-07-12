@@ -266,4 +266,4 @@ def test_output_cannot_replace_registry(module, registry):
     ]) == 1
     # The registry remains a registry; the failure report was not allowed to
     # overwrite it because the paths are validated before source access.
-    assert json.loads(registry.read_text())["schema_version"] == 1
+    assert json.loads(registry.read_text())["schema_version"] == 2

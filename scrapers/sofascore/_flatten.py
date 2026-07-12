@@ -71,7 +71,7 @@ _MAX_FLATTEN_DEPTH = 4
 def _auto_flatten(payload, out, prefix='', skip=(), _depth=0):
     """Recursively flatten a SofaScore dict into Bronze-safe snake_case scalar
     columns, IN PLACE on ``out`` (#840). Generalises the inline loop in
-    :meth:`SofaScoreScraper._flatten_event_player_stats`.
+    the common SofaScore payload parsers.
 
     Rules:
         * scalar (str/int/float/bool/None) -> out[prefix+snake] = _coerce_scalar(v)

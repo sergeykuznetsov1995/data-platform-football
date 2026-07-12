@@ -1,0 +1,233 @@
+{
+  "benchmark_samples": [],
+  "bootstrap_authorizes_production": false,
+  "budget_derivation": "max_observed_task_bytes_per_workload_class_v2",
+  "cohort_sha256": "eab8540e7a82b95d762fbdba5b30796d964da4c1c0a850fe1322f5e4bc14c1a4",
+  "collection_source": "sofascore_canary",
+  "collector_version": "sofascore-paid-canary-v2",
+  "experimental_hard_cap_bytes": 47930410,
+  "historical_observations": [],
+  "meter": "proxy_filter_provider_path_v2",
+  "rate_limit_policy": {
+    "burst_size": 20,
+    "max_requests": 20,
+    "source": "sofascore",
+    "window_seconds": 60
+  },
+  "requirements": {
+    "minimum_cold_samples_per_class": 20,
+    "minimum_distinct_proxy_exits_per_class": 5,
+    "required_benchmark_modes": [
+      "no_op",
+      "offline_replay",
+      "single_endpoint_resume"
+    ],
+    "required_workload_classes": [
+      "match_batch_25_t16",
+      "match_batch_25_t17",
+      "player_batch_50_t16",
+      "player_batch_50_t17",
+      "season_16_b345be809034c692",
+      "season_17_4a1738f5b7504ec2"
+    ]
+  },
+  "runtime_fingerprint": {
+    "algorithm": "sha256-relative-path-content-v1",
+    "browser_runtime_pins": {
+      "camoufox": "0.4.11",
+      "playwright": "1.59.0"
+    },
+    "digest": "c028d5af448197d9db177d219bc3bd87876f1b6ca28957c033c44abcf3dc4639",
+    "files": [
+      "configs/medallion/competitions.yaml",
+      "configs/proxy_filter/blocklist.txt",
+      "configs/sofascore/endpoint_coverage.yaml",
+      "dags/dag_canary_sofascore_proxy.py",
+      "dags/dag_ingest_sofascore.py",
+      "dags/scripts/prepare_sofascore_workload.py",
+      "dags/scripts/run_sofascore_scraper.py",
+      "dags/utils/medallion_config.py",
+      "dags/utils/sofascore_dq.py",
+      "docker/images/airflow/Dockerfile",
+      "docker/images/airflow/requirements-airflow.txt",
+      "docker/images/airflow/requirements-scraping.txt",
+      "docker/images/airflow/requirements.txt",
+      "scrapers/sofascore/__init__.py",
+      "scrapers/sofascore/_flatten.py",
+      "scrapers/sofascore/adapters.py",
+      "scrapers/sofascore/camoufox_capture.py",
+      "scrapers/sofascore/capture_engine.py",
+      "scrapers/sofascore/catalog.py",
+      "scrapers/sofascore/discovery.py",
+      "scrapers/sofascore/lease_client.py",
+      "scrapers/sofascore/live_capture.py",
+      "scrapers/sofascore/manifest.py",
+      "scrapers/sofascore/pipeline.py",
+      "scrapers/sofascore/raw_store.py",
+      "scrapers/sofascore/registry.py",
+      "scrapers/sofascore/runtime_fingerprint.py",
+      "scrapers/sofascore/scraper.py",
+      "scrapers/sofascore/season_pipeline.py",
+      "scrapers/sofascore/workload_plan.py",
+      "scrapers/sofascore/workload_runtime.py",
+      "scrapers/utils/rate_limiter.py",
+      "scripts/backfill_sofascore.py",
+      "scripts/proxy_filter/__init__.py",
+      "scripts/proxy_filter/budget.py",
+      "scripts/proxy_filter/filter_proxy.py",
+      "scripts/research/bench_sofascore_paid_canary.py"
+    ],
+    "version": 1
+  },
+  "schema_version": 2,
+  "source": "sofascore",
+  "verification_blocker": "Collection is experimental and cannot authorize production until the separate verify command validates every policy gate.",
+  "verified": false,
+  "workload_classes": {
+    "match_batch_25_t16": {
+      "cohort": "fixed_world_cup_25_matches",
+      "hard_task_bytes": null,
+      "max_units": 25,
+      "required_endpoints": [
+        "event",
+        "incidents",
+        "lineups",
+        "shotmap",
+        "statistics"
+      ],
+      "samples": [],
+      "scope": "match",
+      "source_tournament_id": 16
+    },
+    "match_batch_25_t17": {
+      "cohort": "fixed_epl_25_matches",
+      "hard_task_bytes": null,
+      "max_units": 25,
+      "required_endpoints": [
+        "event",
+        "incidents",
+        "lineups",
+        "shotmap",
+        "statistics"
+      ],
+      "samples": [],
+      "scope": "match",
+      "source_tournament_id": 17
+    },
+    "player_batch_50_t16": {
+      "cohort": "fixed_world_cup_50_players",
+      "collection_blocker": "",
+      "hard_task_bytes": null,
+      "max_units": 50,
+      "required_endpoints": [
+        "player_profile",
+        "player_season_statistics"
+      ],
+      "samples": [],
+      "scope": "player",
+      "source_tournament_id": 16
+    },
+    "player_batch_50_t17": {
+      "cohort": "fixed_epl_50_players",
+      "hard_task_bytes": null,
+      "max_units": 50,
+      "required_endpoints": [
+        "player_profile",
+        "player_season_statistics"
+      ],
+      "samples": [],
+      "scope": "player",
+      "source_tournament_id": 17
+    },
+    "season_16_b345be809034c692": {
+      "cohort": "enabled_world_cup_2026_shape",
+      "hard_task_bytes": null,
+      "max_units": 1,
+      "representative_season_id": 58210,
+      "required_endpoints": [
+        "cup_trees",
+        "participants",
+        "referee_profile",
+        "rounds",
+        "schedule_last",
+        "schedule_next",
+        "squads",
+        "standings_total"
+      ],
+      "samples": [],
+      "scope": "season",
+      "shape": {
+        "dynamic_endpoints": [
+          "squads",
+          "referee_profile"
+        ],
+        "dynamic_evidence": "stored_schedule_participants_squads_events_v1",
+        "schedule_page_chain": {
+          "directions": [
+            "last",
+            "next"
+          ],
+          "max_pages_per_direction": 50
+        },
+        "season_format": "calendar_year",
+        "shape_version": 1,
+        "source_tournament_id": "16",
+        "static_endpoints": [
+          "schedule_last",
+          "schedule_next",
+          "standings_total",
+          "rounds",
+          "cup_trees",
+          "participants"
+        ]
+      },
+      "shape_digest": "b345be809034c6927e3783c88d5dca3fe83aca8e7073fe3718693852be6cf0b6",
+      "source_tournament_id": 16
+    },
+    "season_17_4a1738f5b7504ec2": {
+      "cohort": "enabled_epl_2526_shape",
+      "hard_task_bytes": null,
+      "max_units": 1,
+      "representative_season_id": 76986,
+      "required_endpoints": [
+        "cup_trees",
+        "participants",
+        "referee_profile",
+        "rounds",
+        "schedule_last",
+        "schedule_next",
+        "squads",
+        "standings_total"
+      ],
+      "samples": [],
+      "scope": "season",
+      "shape": {
+        "dynamic_endpoints": [
+          "squads",
+          "referee_profile"
+        ],
+        "dynamic_evidence": "stored_schedule_participants_squads_events_v1",
+        "schedule_page_chain": {
+          "directions": [
+            "last",
+            "next"
+          ],
+          "max_pages_per_direction": 50
+        },
+        "season_format": "split_year",
+        "shape_version": 1,
+        "source_tournament_id": "17",
+        "static_endpoints": [
+          "schedule_last",
+          "schedule_next",
+          "standings_total",
+          "rounds",
+          "cup_trees",
+          "participants"
+        ]
+      },
+      "shape_digest": "4a1738f5b7504ec2b905ea550884ac220cfc1e717e4aee5eca2e6e04699f4e5b",
+      "source_tournament_id": 17
+    }
+  }
+}

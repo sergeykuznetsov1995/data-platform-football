@@ -1,0 +1,111 @@
+name: SofaScore production CI
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/sofascore-*.yml"
+      - "configs/sofascore/**"
+      - "dags/dag_ingest_sofascore.py"
+      - "dags/dag_canary_sofascore_proxy.py"
+      - "dags/dag_transform_e3.py"
+      - "dags/scripts/*sofascore*"
+      - "dags/sql/**/*sofascore*"
+      - "dags/utils/sofascore_dq.py"
+      - "scrapers/base/**"
+      - "scrapers/sofascore/**"
+      - "scripts/**/*sofascore*"
+      - "scripts/proxy_filter/**"
+      - "tests/fixtures/sofascore*"
+      - "tests/unit/**/*sofascore*"
+      - "tests/unit/scripts/test_filter_proxy.py"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sofascore-ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install test runtime
+        shell: bash
+        run: |
+          # Airflow is deliberately absent: tests/unit/dags/conftest.py installs
+          # its operator stubs only when the real package is missing, and the DAG
+          # topology tests assert against those stubs. Installing Airflow here
+          # would silently disable them.
+          python -m pip install --disable-pip-version-check \
+            pytest ruff pandas numpy pyarrow trino requests PyYAML jinja2 \
+            jsonschema "tls-client-python==1.15.1" python-dotenv tenacity pybreaker \
+            rapidfuzz Unidecode nicknames
+
+      - name: Static checks
+        run: |
+          ruff check \
+            scrapers/sofascore \
+            dags/dag_ingest_sofascore.py \
+            dags/dag_canary_sofascore_proxy.py \
+            dags/scripts/run_sofascore_scraper.py \
+            dags/scripts/prepare_sofascore_workload.py \
+            dags/scripts/run_sofascore_discovery.py \
+            dags/utils/sofascore_dq.py \
+            scripts/migrate_sofascore_production.py \
+            scripts/backfill_sofascore.py \
+            scripts/proxy_filter \
+            scripts/research/bench_sofascore_paid_canary.py
+          python -m compileall -q \
+            scrapers/sofascore dags/scripts dags/utils scripts/proxy_filter \
+            dags/dag_ingest_sofascore.py dags/dag_canary_sofascore_proxy.py \
+            scripts/migrate_sofascore_production.py \
+            scripts/research/bench_sofascore_paid_canary.py
+
+      - name: SofaScore unit and topology tests
+        env:
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+        run: |
+          pytest -q \
+            tests/unit/configs/test_sofascore_endpoint_coverage.py \
+            tests/unit/configs/test_sofascore_proxy_canary_cohort.py \
+            tests/unit/dags/test_dag_ingest_sofascore.py \
+            tests/unit/dags/test_dag_canary_sofascore_proxy.py \
+            tests/unit/dags/test_dag_transform_e3_sofascore_dq.py \
+            tests/unit/dq/test_sofascore_dq.py \
+            tests/unit/scrapers/test_run_sofascore_discovery.py \
+            tests/unit/scrapers/test_run_sofascore_scraper.py \
+            tests/unit/scrapers/test_sofascore_camoufox_capture.py \
+            tests/unit/scrapers/test_sofascore_capture_adapters.py \
+            tests/unit/scrapers/test_sofascore_capture_engine.py \
+            tests/unit/scrapers/test_sofascore_discovery.py \
+            tests/unit/scrapers/test_sofascore_endpoint_manifest.py \
+            tests/unit/scrapers/test_sofascore_lease_client.py \
+            tests/unit/scrapers/test_sofascore_live_capture.py \
+            tests/unit/scrapers/test_sofascore_pipeline.py \
+            tests/unit/scrapers/test_sofascore_runtime_fingerprint.py \
+            tests/unit/scrapers/test_sofascore_workload_plan.py \
+            tests/unit/scrapers/test_sofascore_workload_runtime.py \
+            tests/unit/scrapers/test_sofascore_raw_store.py \
+            tests/unit/scrapers/test_sofascore_registry_v2.py \
+            tests/unit/scrapers/test_scrapers_lazy_import.py \
+            tests/unit/scrapers/test_sofascore_scraper.py \
+            tests/unit/scrapers/test_sofascore_season_pipeline.py \
+            tests/unit/scripts/test_backfill_sofascore.py \
+            tests/unit/scripts/test_bench_sofascore_paid_canary.py \
+            tests/unit/scripts/test_bench_sofascore_offline_replay.py \
+            tests/unit/scripts/test_filter_proxy.py \
+            tests/unit/scripts/test_migrate_sofascore_production.py \
+            tests/unit/scripts/test_prepare_sofascore_workload.py \
+            tests/unit/scripts/test_run_sofascore_workload.py \
+            tests/unit/scripts/test_sofascore_proxy_budget.py \
+            tests/unit/sql/test_sofascore_league_table_silver.py \
+            tests/unit/sql/test_sofascore_post_shot_xg.py
