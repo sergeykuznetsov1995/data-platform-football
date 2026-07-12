@@ -507,16 +507,13 @@ class SofaScoreCatalog:
                 )
                 if canonical_season is not None:
                     resolution_tokens.add(canonical_season)
+                # Parallel divisions and format migrations make some tokens name
+                # more than one real season (tournaments 65 and 278). Rejecting
+                # the whole registry over that would strand every unambiguous
+                # season with it; resolve_source_season already refuses to guess
+                # when a token matches more than one season.
                 for token in resolution_tokens:
-                    previous_alias = seen_resolution_tokens.get(token)
-                    if (
-                        previous_alias is not None
-                        and previous_alias != season_id
-                    ):
-                        raise CatalogError(
-                            f"{prefix} has ambiguous season alias {token!r}"
-                        )
-                    seen_resolution_tokens[token] = season_id
+                    seen_resolution_tokens.setdefault(token, season_id)
                 seasons.append(
                     CatalogSeason(
                         season_id=season_id,
