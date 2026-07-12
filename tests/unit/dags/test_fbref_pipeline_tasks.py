@@ -289,3 +289,25 @@ def test_fetch_wave_fails_closed_without_a_result_document(monkeypatch):
             page_kinds=["competition"],
             run_type="current",
         )
+
+
+@pytest.mark.unit
+def test_fetch_wave_fails_closed_when_the_subprocess_hangs(monkeypatch):
+    """A hung clearance must not hold this wave's leases until they expire."""
+
+    def fake_run(command, **kwargs):
+        assert kwargs["timeout"] == fbref_pipeline_tasks.FETCH_WAVE_TIMEOUT_SECONDS
+        raise fbref_pipeline_tasks.subprocess.TimeoutExpired(
+            cmd=command, timeout=kwargs["timeout"]
+        )
+
+    monkeypatch.setattr(fbref_pipeline_tasks.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match="exceeded 1800s"):
+        fbref_pipeline_tasks.fetch_fbref_wave(
+            airflow_run_id="scheduled__2026-07-12T06:00:00+00:00",
+            dag_id="dag_ingest_fbref",
+            worker_id="current-wave-01",
+            page_kinds=["competition"],
+            run_type="current",
+        )

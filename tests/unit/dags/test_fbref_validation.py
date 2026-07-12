@@ -1,9 +1,11 @@
 """Fail-closed validation wiring for the FBref Silver DAG."""
 
 import ast
+import re
 from pathlib import Path
 
 import pytest
+import yaml
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -57,6 +59,27 @@ def test_silver_dq_registers_new_strict_fbref_contracts():
 
     assert "event_availability, 'unknown'" in source
     assert "NOT IN ('restricted', 'not_applicable')" in source
+
+
+def test_event_source_gap_registry_narrows_the_gate_without_muting_it():
+    """#901: only registered matches leave the gate, and staleness is caught."""
+
+    source = (ROOT / "dags" / "dag_transform_fbref_silver.py").read_text(
+        encoding="utf-8"
+    )
+    assert "stale_event_source_gap[silver.fbref_match_enriched]" in source
+    assert "AND NOT COALESCE(event_gap_acknowledged, FALSE)" in source
+    assert "fbref_event_source_gaps.yaml" in source
+
+    registry = ROOT / "configs" / "medallion" / "fbref_event_source_gaps.yaml"
+    payload = yaml.safe_load(registry.read_text(encoding="utf-8"))
+    assert payload["version"] == 1
+    assert payload["gaps"]
+    for entry in payload["gaps"]:
+        assert set(entry) >= {
+            "match_id", "league", "season", "reason", "evidence"
+        }
+        assert re.fullmatch(r"[a-f0-9]{8}", str(entry["match_id"]))
 
 
 def test_silver_adds_source_identity_columns_before_transforms():
