@@ -231,33 +231,47 @@ reach raw persistence, table inventory, registry coverage, or sentinel gates.
 
 ### Bounded live canary
 
-One direct, no-Silver competition-index canary ran against the clean checkout.
-The runner processed only the source-native `/en/comps/` target and used a
-25-request/25-MiB control budget. The application transport now rejects an
-unbounded response at headers/stream time; the container additionally shared
-an isolated network namespace with defense-in-depth quotas of 18 MiB ingress
-and 4 MiB egress.
+Update 2026-07-12: the bounded live canary **passed** after two transport
+defects were fixed. Both were found by the canary itself and could not have
+been found offline: the browser byte guard rejected every real Cloudflare
+clearance.
 
-The result was intentionally fail-closed:
+1. Reservations were keyed by `id(request)`. Firefox delivers the response
+   callbacks a different `Request` wrapper than `route()` saw, so the guard
+   never found the reservation, classified the main `fbref.com/en/` navigation
+   response as `untracked_response`, and tore down the whole session.
+   Reservations are now indexed by request URL as well, and a request the route
+   callback genuinely never saw (server-redirect hops are not re-routed by
+   Playwright) is adopted: it consumes one request slot plus the fixed overhead
+   under the same caps.
+2. The guard demanded a declared `Content-Length` on every browser response.
+   Cloudflare answers over HTTP/2, and chunked HTTP/1.1 responses carry no
+   length either, so this aborted the session on the very first response. An
+   undeclared body now reserves a 512-KiB ceiling before the browser may read
+   it and settles to the observed size on completion; the cap still fails
+   closed when the reservation does not fit or the body outgrows it.
 
-- logical label: `fbref-production-923-20260711T191717Z-9edaaefd2ff443f6a1af7ca89f13d733`;
-- control run: `f796a73e-6db0-51fb-bff3-f9a25bc38f49`;
-- control status `failed`, one failed attempt, target state `retry`;
-- classified failure `http_status`, HTTP status `500`;
-- `19` charged requests and `1,157,847` fallback-billed bytes;
-- browser document `199,283` bytes, browser assets `955,322` bytes, warm HTTP
-  wire `3,242` bytes, one bootstrap;
-- kernel counters immediately after the canary: ingress `1,426,639` bytes,
-  egress `333,045` bytes, total `1,759,684` bytes;
-- unclassified failures `0`, duplicate canonical fetch violations `0`;
-- provider-billing evidence was unavailable (`null`);
-- raw commit, offline parse, table/sentinel coverage, and Silver trigger did
-  not run.
+Passing canary evidence (`/en/comps/`, 25-request/25-MiB control budget,
+kernel quotas 18 MiB ingress / 4 MiB egress):
 
-No paid retry was attempted: the first attempt had already used 19 of the 25
-authorized requests, while a fresh clearance reserves 20. A new live attempt
-therefore requires separate authorization after the proxy/HTTP-500 cause is
-resolved. The ephemeral quota namespace was removed.
+- logical label: `fbref-canary-20260712T135326Z-922d14a721f941e1842faa7574e2e162`;
+- control run: `562f020a-8f9b-53fe-bb5d-2b3825e5139e`, status `succeeded`;
+- `20` of 25 requests charged, `1,331,685` billed bytes, budget not exceeded;
+- one clearance bootstrap (`19` browser requests), warm HTTP `1` request /
+  `53,101` wire bytes, decoded HTML `268,064` bytes, raw blob `51,451` bytes;
+- warm HTTP success rate `1.0`, unclassified failures `0`, duplicate canonical
+  fetch violations `0`, classified retries `0`;
+- kernel counters: ingress `2,019,083` bytes, egress `2,186,339` bytes — both
+  far below the quotas;
+- raw committed, offline parse `1` page, `10` dataset validations succeeded;
+- registry coverage: `117` male competitions active, `36` female skipped, `0`
+  unknown-gender quarantined; all seven sentinels published and eligible;
+- female/unknown downstream targets: `0`;
+- provider-billing evidence remains unavailable (`null`).
+
+The earlier 2026-07-11 canary (`f796a73e-6db0-51fb-bff3-f9a25bc38f49`) failed
+closed on a classified warm HTTP `500` before raw commit; it is superseded by
+the run above. The ephemeral quota namespace is removed after every run.
 
 ## Offline replay and remediation
 
@@ -634,8 +648,8 @@ runner. The runner never imports Airflow or triggers Silver.
 
 | Blocker | Consequence | Exit evidence |
 |---|---|---|
-| Bounded canary failed on warm HTTP `500` | Clearance completed within budget, but raw persistence, parsing, registry/table coverage, and successful warm-path evidence remain unavailable. | Resolve the proxy/HTTP-500 cause, obtain a fresh bounded-live authorization, and record one successful <=25-request/25-MiB direct canary. |
+| ~~Bounded canary failed on warm HTTP `500`~~ **CLEARED 2026-07-12** | — | Canary `562f020a-8f9b-53fe-bb5d-2b3825e5139e` succeeded: raw committed, parse green, every traffic/eligibility/coverage gate passed. |
 | Full 400-page soak not authorized | No production-scale throughput or long-session stability claim is valid. | Separate approval, hard request/MB cap, and recorded soak report. |
-| #901: 11 raw event gaps | Strict Silver DQ blocks promotion; weakening it would hide missing source data. | Raw replay or approved bounded repair yields zero scored matches without events. |
+| #901: 11 raw event gaps | Strict Silver DQ blocks promotion; weakening it would hide missing source data. | Raw is absent for all eleven (the legacy scraper kept none), so offline replay cannot repair them. `scripts/research/run_fbref_match_refetch.py` performs the bounded, control-plane-native refetch; exit when zero scored matches lack events. |
 | Live traffic benchmark pending | No measured before/after Cloudflare/proxy/provider-billing claim is valid. Offline parser regression is measured at 2.27% and passes. | Reproducible bounded live benchmark with the approved page/request/byte mix and provider evidence. |
 | GitHub Project scope unavailable | Project-field classification cannot be verified or updated. | Credential with `read:project`, followed by a read-only audit or separately authorized mutation. |
