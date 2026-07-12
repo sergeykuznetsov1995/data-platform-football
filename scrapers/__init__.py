@@ -3,16 +3,6 @@
 from __future__ import annotations
 
 from importlib import import_module
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:  # pragma: no cover
-    from scrapers.base.base_scraper import BaseScraper, SeleniumScraper, SoccerdataScraper
-    from scrapers.base.iceberg_writer import IcebergWriter
-    from scrapers.fbref import FBrefScraper
-    from scrapers.fotmob import FotMobScraper
-    from scrapers.matchhistory import MatchHistoryScraper
-    from scrapers.nodriver_fbref import NodriverFBrefScraper
-    from scrapers.whoscored import WhoScoredScraper
 
 _EXPORTS = {
     "BaseScraper": ("scrapers.base.base_scraper", "BaseScraper"),
