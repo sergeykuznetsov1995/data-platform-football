@@ -258,22 +258,42 @@ def test_redirect_hop_response_is_adopted_not_fatal():
 
 
 @pytest.mark.unit
-def test_untracked_response_without_redirect_chain_stays_fatal():
+def test_rewrapped_request_reuses_its_route_reservation():
+    """Firefox can deliver the response with a different Request wrapper for
+    the request route() already reserved; it must not be charged twice."""
+    overhead = BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
     transport = CamoufoxFbrefTransport(
-        max_network_bytes=BROWSER_REQUEST_FIXED_OVERHEAD_BYTES + 100
+        max_network_bytes=(4 * overhead) + 1000,
+        max_network_requests=5,
     )
-    orphan = MagicMock(resource_type="document", url="https://fbref.com/en/")
-    orphan.redirected_from = None
+    route = _Route()
+    transport._maybe_block(route)
 
-    transport._on_response(_Response(orphan, {"content-length": "10"}))
+    rewrapped = MagicMock(resource_type="document", url=route.request.url)
+    rewrapped.redirected_from = None
+    transport._on_response(_Response(rewrapped, {"content-length": "50"}))
 
     stats = transport.traffic_stats()
-    assert stats["byte_budget_exhausted"] is True
-    assert stats["byte_budget_failure"] == "untracked_response"
+    assert stats["byte_budget_exhausted"] is False
+    assert stats["real_requests_count"] == 1  # one slot, not two
+    assert stats["inflight_reserved_bytes"] == overhead + 50
+
+    rewrapped.sizes.return_value = {
+        "responseBodySize": 50,
+        "responseHeadersSize": 10,
+        "requestBodySize": 0,
+        "requestHeadersSize": 10,
+    }
+    transport._on_request_finished(rewrapped)
+
+    stats = transport.traffic_stats()
+    assert stats["inflight_reserved_bytes"] == 0
+    assert stats["unobserved_reserved_bytes"] == 0
+    assert stats["real_bytes_downloaded"] == 70
 
 
 @pytest.mark.unit
-def test_redirect_hop_over_request_cap_aborts_session():
+def test_unrouted_request_over_request_cap_aborts_session():
     transport = CamoufoxFbrefTransport(
         max_network_bytes=10 * BROWSER_REQUEST_FIXED_OVERHEAD_BYTES,
         max_network_requests=1,
@@ -291,11 +311,11 @@ def test_redirect_hop_over_request_cap_aborts_session():
 
     stats = transport.traffic_stats()
     assert stats["byte_budget_exhausted"] is True
-    assert stats["byte_budget_failure"] == "redirect_hop_over_request_cap"
+    assert stats["byte_budget_failure"] == "unrouted_request_over_request_cap"
 
 
 @pytest.mark.unit
-def test_redirect_hop_over_byte_cap_aborts_session():
+def test_unrouted_request_over_byte_cap_aborts_session():
     overhead = BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
     transport = CamoufoxFbrefTransport(
         max_network_bytes=(2 * overhead) - 1,
@@ -314,7 +334,7 @@ def test_redirect_hop_over_byte_cap_aborts_session():
 
     stats = transport.traffic_stats()
     assert stats["byte_budget_exhausted"] is True
-    assert stats["byte_budget_failure"] == "redirect_hop_over_byte_cap"
+    assert stats["byte_budget_failure"] == "unrouted_request_over_byte_cap"
 
 
 @pytest.mark.unit
