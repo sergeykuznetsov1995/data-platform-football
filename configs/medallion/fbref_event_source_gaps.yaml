@@ -1,0 +1,38 @@
+# Matches for which FBref publishes no match events at all (#901).
+#
+# Contract:
+#   * match_id is the stable FBref /matches/<id>/ slug.
+#   * every entry must state what the source publishes (evidence) and why the
+#     gap is legitimate (reason); the Silver renderer rejects missing or
+#     duplicate fields before Trino runs.
+#   * this is a finite evidence registry, not an inference rule: a scored match
+#     with zero events that is NOT listed here still fails the
+#     scored_match_without_events gate, and a listed match that starts carrying
+#     events fails stale_event_source_gap until the entry is removed.
+#
+# Evidence for the entries below was produced by refetching each page through
+# the production control plane on 2026-07-12 (bounded backfill runs): the raw
+# HTML carries the two event columns (div.event id="a"/"b") and both
+# stats_<team>_summary tables as *empty* containers, so Bronze records
+# match_events=empty and match_player_stats=empty in fbref_dataset_availability
+# while managers, team stats and officials parse normally.  FBref simply never
+# published player-level data for these relegation play-offs.
+version: 1
+gaps:
+  - match_id: "5492b4b4"
+    league: "GER-Bundesliga"
+    season: "1617"
+    reason: "FBref publishes no events for this Bundesliga relegation play-off."
+    evidence: "Refetched 2026-07-12: bronze.fbref_dataset_availability records match_events=empty and match_player_stats=empty; raw page ships empty event columns."
+
+  - match_id: "91a143bc"
+    league: "FRA-Ligue 1"
+    season: "1617"
+    reason: "FBref publishes no events for this Ligue 1 relegation play-off."
+    evidence: "Refetched 2026-07-12: bronze.fbref_dataset_availability records match_events=empty and match_player_stats=empty; raw page ships empty event columns."
+
+  - match_id: "7c466a67"
+    league: "FRA-Ligue 1"
+    season: "1617"
+    reason: "FBref publishes no events for this Ligue 1 relegation play-off."
+    evidence: "Refetched 2026-07-12: bronze.fbref_dataset_availability records match_events=empty and match_player_stats=empty; raw page ships empty event columns."

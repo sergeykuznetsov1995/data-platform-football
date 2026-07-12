@@ -32,6 +32,9 @@ import yaml
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 SILVER_PATH = PROJECT_ROOT / "dags" / "sql" / "silver" / "fbref_match_enriched.sql"
 OVERRIDES_PATH = PROJECT_ROOT / "configs" / "medallion" / "match_result_overrides.yaml"
+EVENT_GAPS_PATH = (
+    PROJECT_ROOT / "configs" / "medallion" / "fbref_event_source_gaps.yaml"
+)
 
 pytestmark = pytest.mark.unit
 
@@ -83,6 +86,28 @@ def _render_overrides(sql: str) -> str:
         "(CAST(NULL AS varchar), CAST(NULL AS varchar), CAST(NULL AS varchar),\n"
         "         CAST(NULL AS integer), CAST(NULL AS integer), CAST(NULL AS varchar),\n"
         "         CAST(NULL AS varchar), CAST(NULL AS varchar))"
+    )
+    assert sql.count(typed_empty) == 1
+    return sql.replace(typed_empty, ",\n        ".join(rows))
+
+
+def _render_event_gaps(sql: str) -> str:
+    payload = yaml.safe_load(EVENT_GAPS_PATH.read_text(encoding="utf-8"))
+    rows = []
+
+    def quote(value: Any) -> str:
+        return "'" + str(value).replace("'", "''") + "'"
+
+    for item in payload["gaps"]:
+        rows.append(
+            "(" + ", ".join([
+                quote(item["match_id"]), quote(item["league"]),
+                quote(item["season"]), quote(item["reason"]),
+            ]) + ")"
+        )
+    typed_empty = (
+        "(CAST(NULL AS varchar), CAST(NULL AS varchar), CAST(NULL AS varchar),\n"
+        "         CAST(NULL AS varchar))"
     )
     assert sql.count(typed_empty) == 1
     return sql.replace(typed_empty, ",\n        ".join(rows))
@@ -246,7 +271,11 @@ def _seed(duck_conn) -> None:
 
 
 def _run_silver(duck_conn) -> Dict[str, Dict[str, Any]]:
-    sql = _translate(_render_overrides(SILVER_PATH.read_text(encoding="utf-8")))
+    sql = _translate(
+        _render_event_gaps(
+            _render_overrides(SILVER_PATH.read_text(encoding="utf-8"))
+        )
+    )
     cur = duck_conn.execute(sql)
     cols = [d[0] for d in cur.description]
     rows: List[Dict[str, Any]] = [dict(zip(cols, r)) for r in cur.fetchall()]
@@ -337,3 +366,78 @@ class TestScoreParsing:
                 continue
             stripped = re.sub(r"\(\d+\)\s*", "", row["score"]).strip()
             assert stripped == f"{row['home_score']}{EN_DASH}{row['away_score']}"
+
+
+class TestEventSourceGaps:
+    """#901: FBref publishes no events at all for a finite set of matches."""
+
+    def _seed_scored_match_without_events(
+        self, duck_conn, match_id: str, league: str
+    ) -> None:
+        duck_conn.execute(
+            """
+            INSERT INTO bronze_fbref_schedule
+                (wk, day, date, time, home, score, away, attendance, venue,
+                 referee, notes, match_url, league, season, _ingested_at,
+                 _batch_id)
+            VALUES ('34.0', 'Thu', '2017-05-25', '20:30', 'Wolfsburg', ?,
+                    'Braunschweig', '30000.0', 'Arena', 'Zwayer', NULL, ?, ?,
+                    2016, TIMESTAMP '2026-07-12 19:00:00', 'b2')
+            """,
+            [f"1{EN_DASH}0", f"/en/matches/{match_id}/Play-Off", league],
+        )
+        duck_conn.execute(
+            """
+            INSERT INTO bronze_fbref_dataset_availability
+                (match_id, dataset, availability, reason, _ingested_at, _batch_id)
+            VALUES (?, 'match_events', 'empty', 'parser_returned_no_rows',
+                    TIMESTAMP '2026-07-12 19:00:00', 'b2')
+            """,
+            [match_id],
+        )
+
+    def test_registered_match_is_acknowledged_and_leaves_the_gate(self, duck_conn):
+        _seed(duck_conn)
+        self._seed_scored_match_without_events(
+            duck_conn, "5492b4b4", "GER-Bundesliga"
+        )
+        row = _run_silver(duck_conn)["5492b4b4"]
+
+        assert row["event_gap_acknowledged"] is True
+        assert row["event_gap_reason"].startswith("FBref publishes no events")
+        assert row["event_availability"] == "empty"
+        assert (row["source_home_score"], row["source_away_score"]) == (1, 0)
+        assert not _violates_scored_without_events(row)
+
+    def test_unregistered_match_still_fails_the_gate(self, duck_conn):
+        _seed(duck_conn)
+        self._seed_scored_match_without_events(
+            duck_conn, "eeeeeeee", "GER-Bundesliga"
+        )
+        row = _run_silver(duck_conn)["eeeeeeee"]
+
+        assert row["event_gap_acknowledged"] is False
+        assert _violates_scored_without_events(row)
+
+    def test_registry_entry_is_scoped_to_its_league_and_season(self, duck_conn):
+        _seed(duck_conn)
+        # Same match id, wrong league: the registry must not acknowledge it.
+        self._seed_scored_match_without_events(
+            duck_conn, "5492b4b4", "ITA-Serie A"
+        )
+        row = _run_silver(duck_conn)["5492b4b4"]
+
+        assert row["event_gap_acknowledged"] is False
+        assert _violates_scored_without_events(row)
+
+
+def _violates_scored_without_events(row: Dict[str, Any]) -> bool:
+    """Mirror of scored_match_without_events[silver.fbref_match_enriched]."""
+    return (
+        row["source_home_score"] is not None
+        and row["source_away_score"] is not None
+        and (row["event_row_count"] or 0) == 0
+        and (row["event_availability"] or "unknown")
+        not in ("restricted", "not_applicable")
+        and not (row["event_gap_acknowledged"] or False)
+    )
