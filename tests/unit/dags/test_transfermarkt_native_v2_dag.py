@@ -1015,6 +1015,8 @@ def test_master_has_no_environment_cutover_authority():
     source = (root / 'dags' / 'dag_master_pipeline.py').read_text(encoding='utf-8')
     assert 'TM_NATIVE_V2_CUTOVER_REQUIRED' not in source
     assert source.count('python_callable=_transfermarkt_gold_gate') == 1
-    assert "trigger_rule='none_failed_min_one_success'" in source
+    # #933: every Gold prerequisite edge is fail-closed all_success; the TM
+    # gate blocks Gold by raising instead of relying on a soft trigger rule.
+    assert "trigger_rule='none_failed_min_one_success'" not in source
     assert 'active TM v2 scope-set readiness' in source
     assert "trigger_dag_id='dag_transform_transfermarkt_silver'" not in source

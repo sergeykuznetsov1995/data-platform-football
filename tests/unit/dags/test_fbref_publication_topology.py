@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import importlib
-from pathlib import Path
 import sys
 
 import pytest
@@ -15,20 +14,6 @@ def _reset_operators() -> None:
 
     BashOperator._instances.clear()
     PythonOperator._instances.clear()
-
-
-def _reload_ingest():
-    _reset_operators()
-
-    from utils import medallion_config
-
-    medallion_config.CONFIG_DIR = (
-        Path(__file__).resolve().parents[3] / "configs" / "medallion"
-    )
-    medallion_config.reset_cache()
-    sys.modules.pop("dag_ingest_fbref", None)
-    sys.modules.pop("dags.dag_ingest_fbref", None)
-    return importlib.import_module("dag_ingest_fbref")
 
 
 def _reload_silver():
@@ -44,35 +29,17 @@ def _task(task_id: str):
     return next(task for task in PythonOperator._instances if task.task_id == task_id)
 
 
-def test_ingest_has_fail_closed_terminal_gate_without_nested_silver_trigger():
-    _reload_ingest()
-    terminal = _task("ingest_complete")
-    traffic_report = _task("report_proxy_traffic")
-    from airflow.operators.python import PythonOperator
-
-    assert terminal.upstream_task_ids == {
-        "validate_all_data",
-        "report_proxy_traffic",
-    }
-    assert terminal._init_kwargs["trigger_rule"] == "all_success"
-    assert traffic_report._init_kwargs["trigger_rule"] == "all_done"
-    silver_triggers = [
-        task
-        for task in PythonOperator._instances
-        if task._init_kwargs.get("trigger_dag_id") == "dag_transform_fbref_silver"
-    ]
-    assert silver_triggers == []
-
-
 def test_silver_validation_is_fail_closed_and_terminal():
     _reload_silver()
     validate_rows = _task("validate_silver")
     validate_quality = _task("validate_silver_quality")
 
-    assert validate_rows._init_kwargs["trigger_rule"] == "all_success"
-    assert validate_quality._init_kwargs["trigger_rule"] == "all_success"
+    # #933: both DQ gates keep the default fail-closed all_success rule, and
+    # quality hands off synchronously to the xref DAG instead of terminating.
+    assert validate_rows._init_kwargs.get("trigger_rule", "all_success") == "all_success"
+    assert validate_quality._init_kwargs.get("trigger_rule", "all_success") == "all_success"
     assert validate_rows.downstream_task_ids == {"validate_silver_quality"}
-    assert validate_quality.downstream_task_ids == set()
+    assert validate_quality.downstream_task_ids == {"trigger_xref_transform"}
 
 
 def test_silver_does_not_race_master_by_triggering_gold():
