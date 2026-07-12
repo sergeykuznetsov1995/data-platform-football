@@ -229,6 +229,138 @@ def test_browser_releases_declared_reservation_after_finish_and_failure():
 
 
 @pytest.mark.unit
+def test_redirect_hop_response_is_adopted_not_fatal():
+    overhead = BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
+    transport = CamoufoxFbrefTransport(
+        max_network_bytes=(3 * overhead) + 1000,
+        max_network_requests=5,
+    )
+    route = _Route()
+    transport._maybe_block(route)
+    transport._on_response(
+        _Response(route.request, {"content-length": "50"})
+    )
+
+    hop_request = MagicMock(
+        resource_type="document", url="https://fbref.com/en/?redirected=1"
+    )
+    hop_request.redirected_from = route.request
+    transport._on_response(
+        _Response(hop_request, {"content-length": "60"})
+    )
+
+    stats = transport.traffic_stats()
+    assert stats["byte_budget_exhausted"] is False
+    assert stats["inflight_reserved_bytes"] == (2 * overhead) + 50 + 60
+    # The hop consumes a request slot exactly like a routed request.
+    assert stats["real_requests_count"] == 2
+    assert stats["completed_requests_count"] == 0
+
+
+@pytest.mark.unit
+def test_untracked_response_without_redirect_chain_stays_fatal():
+    transport = CamoufoxFbrefTransport(
+        max_network_bytes=BROWSER_REQUEST_FIXED_OVERHEAD_BYTES + 100
+    )
+    orphan = MagicMock(resource_type="document", url="https://fbref.com/en/")
+    orphan.redirected_from = None
+
+    transport._on_response(_Response(orphan, {"content-length": "10"}))
+
+    stats = transport.traffic_stats()
+    assert stats["byte_budget_exhausted"] is True
+    assert stats["byte_budget_failure"] == "untracked_response"
+
+
+@pytest.mark.unit
+def test_redirect_hop_over_request_cap_aborts_session():
+    transport = CamoufoxFbrefTransport(
+        max_network_bytes=10 * BROWSER_REQUEST_FIXED_OVERHEAD_BYTES,
+        max_network_requests=1,
+    )
+    route = _Route()
+    transport._maybe_block(route)
+
+    hop_request = MagicMock(
+        resource_type="document", url="https://fbref.com/en/?redirected=1"
+    )
+    hop_request.redirected_from = route.request
+    transport._on_response(
+        _Response(hop_request, {"content-length": "60"})
+    )
+
+    stats = transport.traffic_stats()
+    assert stats["byte_budget_exhausted"] is True
+    assert stats["byte_budget_failure"] == "redirect_hop_over_request_cap"
+
+
+@pytest.mark.unit
+def test_redirect_hop_over_byte_cap_aborts_session():
+    overhead = BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
+    transport = CamoufoxFbrefTransport(
+        max_network_bytes=(2 * overhead) - 1,
+        max_network_requests=5,
+    )
+    route = _Route()
+    transport._maybe_block(route)
+
+    hop_request = MagicMock(
+        resource_type="document", url="https://fbref.com/en/?redirected=1"
+    )
+    hop_request.redirected_from = route.request
+    transport._on_response(
+        _Response(hop_request, {"content-length": "60"})
+    )
+
+    stats = transport.traffic_stats()
+    assert stats["byte_budget_exhausted"] is True
+    assert stats["byte_budget_failure"] == "redirect_hop_over_byte_cap"
+
+
+@pytest.mark.unit
+def test_redirect_hop_reservation_settles_on_finish():
+    overhead = BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
+    transport = CamoufoxFbrefTransport(
+        max_network_bytes=(3 * overhead) + 1000,
+        max_network_requests=5,
+    )
+    route = _Route()
+    transport._maybe_block(route)
+    transport._on_response(
+        _Response(route.request, {"content-length": "50"})
+    )
+    route.request.sizes.return_value = {
+        "responseBodySize": 50,
+        "responseHeadersSize": 10,
+        "requestBodySize": 0,
+        "requestHeadersSize": 10,
+    }
+    transport._on_request_finished(route.request)
+
+    hop_request = MagicMock(
+        resource_type="document", url="https://fbref.com/en/?redirected=1"
+    )
+    hop_request.redirected_from = route.request
+    hop_request.sizes.return_value = {
+        "responseBodySize": 60,
+        "responseHeadersSize": 10,
+        "requestBodySize": 0,
+        "requestHeadersSize": 10,
+    }
+    transport._on_response(
+        _Response(hop_request, {"content-length": "60"})
+    )
+    transport._on_request_finished(hop_request)
+
+    stats = transport.traffic_stats()
+    assert stats["byte_budget_exhausted"] is False
+    assert stats["inflight_reserved_bytes"] == 0
+    assert stats["real_bytes_downloaded"] == 70 + 80
+    assert stats["real_requests_count"] == 2
+    assert stats["completed_requests_count"] == 2
+
+
+@pytest.mark.unit
 def test_failed_request_unknown_bytes_keep_full_reservation_charged():
     overhead = BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
     transport = CamoufoxFbrefTransport(
