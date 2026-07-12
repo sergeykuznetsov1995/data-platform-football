@@ -202,3 +202,90 @@ def test_dag_failure_callback_is_best_effort(monkeypatch):
             run_id="manual__failed", dag_id="dag_replay_fbref"
         )
     })
+
+
+@pytest.mark.unit
+def test_fetch_wave_runs_in_an_unforked_subprocess(monkeypatch):
+    """Playwright's sync API deadlocks in a process forked from the scheduler,
+    so the browser wave must never be driven inside the Airflow task itself."""
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return SimpleNamespace(
+            returncode=0,
+            stdout=(
+                "camoufox noise\n"
+                'FBREF_FETCH_WAVE_RESULT:{"claimed": 2, "fetched": 2}\n'
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(fbref_pipeline_tasks.subprocess, "run", fake_run)
+    pipeline = MagicMock()
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "_pipeline", MagicMock(return_value=pipeline)
+    )
+
+    result = fbref_pipeline_tasks.fetch_fbref_wave(
+        airflow_run_id="scheduled__2026-07-12T06:00:00+00:00",
+        dag_id="dag_ingest_fbref",
+        worker_id="current-wave-01",
+        page_kinds=["competition", "season"],
+        run_type="current",
+        request_limit=200,
+        byte_limit_mb=100,
+        shard_size=25,
+    )
+
+    assert result == {"claimed": 2, "fetched": 2}
+    pipeline.fetch_wave.assert_not_called()
+    command = captured["command"]
+    assert command[1] == fbref_pipeline_tasks.FETCH_WAVE_RUNNER
+    assert "--page-kinds" in command
+    assert command[command.index("--page-kinds") + 1] == "competition,season"
+    assert command[command.index("--request-limit") + 1] == "200"
+    assert command[command.index("--proxy-file") + 1] == (
+        fbref_pipeline_tasks.DEFAULT_PROXY_FILE
+    )
+
+
+@pytest.mark.unit
+def test_fetch_wave_fails_closed_when_the_subprocess_fails(monkeypatch):
+    monkeypatch.setattr(
+        fbref_pipeline_tasks.subprocess,
+        "run",
+        lambda command, **kwargs: SimpleNamespace(
+            returncode=1, stdout="", stderr="clearance failed"
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="exit code 1"):
+        fbref_pipeline_tasks.fetch_fbref_wave(
+            airflow_run_id="scheduled__2026-07-12T06:00:00+00:00",
+            dag_id="dag_ingest_fbref",
+            worker_id="current-wave-01",
+            page_kinds=["competition"],
+            run_type="current",
+        )
+
+
+@pytest.mark.unit
+def test_fetch_wave_fails_closed_without_a_result_document(monkeypatch):
+    monkeypatch.setattr(
+        fbref_pipeline_tasks.subprocess,
+        "run",
+        lambda command, **kwargs: SimpleNamespace(
+            returncode=0, stdout="browser noise only\n", stderr=""
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="no result document"):
+        fbref_pipeline_tasks.fetch_fbref_wave(
+            airflow_run_id="scheduled__2026-07-12T06:00:00+00:00",
+            dag_id="dag_ingest_fbref",
+            worker_id="current-wave-01",
+            page_kinds=["competition"],
+            run_type="current",
+        )
