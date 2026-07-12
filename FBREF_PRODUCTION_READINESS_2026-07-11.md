@@ -18,8 +18,8 @@ production validated:
   on a classified warm-HTTP `500`, before raw commit or parsing;
 - a paid/full 400-page soak was not authorized and was not executed;
 - an accepted before/after live traffic benchmark was not run;
-- #901 still has 11 matches with recorded scores but no raw event rows, so the new strict
-  Silver DQ gate is expected to block promotion until the raw gap is repaired;
+- #901 is diagnosed (2026-07-12): FBref publishes no events for those eleven matches at
+  all, so the fix is a finite evidence registry, not a repair — see below;
 - GitHub Project scope is unavailable because the credential lacks
   `read:project`.
 
@@ -330,20 +330,60 @@ audit, or manager-stint Gold output.
 Legacy `home_score`/`away_score` remain FBref source semantics. Consumers that
 need a competition result use `official_*`; Gold `result_1x2` does so.
 
-### Current strict-DQ blocker
+### #901: the gap is in the source, not in the scrape
 
-#901 documents 11 matches with recorded scores whose raw Bronze event dataset
-is absent; seven of those scores are nonzero.
-`scored_match_without_events[silver.fbref_match_enriched]` is intentionally an
-ERROR with a zero-row allowance, so production Silver promotion is expected to
-fail until those raw gaps are repaired. The allowed remediation order is:
+Update 2026-07-12: the eleven matches were refetched through the production
+control plane (bounded backfill runs, `scripts/research/run_fbref_match_refetch.py`).
+The raw pages prove FBref publishes **no events at all** for them: the page
+ships the two `div.event` side columns and both `stats_<team>_summary` tables
+as empty containers, with no `#events_wrap`, while managers, team stats and
+officials parse normally. Nine are relegation play-offs whose player tables are
+empty as well; Nantes–Toulouse (FRA-Ligue 1 2025-2026) publishes full lineups
+and player stats but still no events.
 
-1. replay the immutable raw page with the current parser;
-2. if raw is absent/corrupt, request a separately bounded refetch authorization;
-3. validate the repaired datasets and rerun Silver/xref/Gold.
+This is the "externally unavailable" branch of the #934 criteria, so the fix is
+evidence, not synthesis: `configs/medallion/fbref_event_source_gaps.yaml` is a
+finite registry (match_id, league, season, reason, evidence) rendered into the
+Silver SQL exactly like `match_result_overrides.yaml`.
 
-The pipeline must not synthesize missing FBref events or weaken the gate to
-claim readiness.
+- `scored_match_without_events[silver.fbref_match_enriched]` keeps its zero-row
+  ERROR contract and now excludes **only registered** matches — an unregistered
+  scored match with no events still blocks promotion;
+- `stale_event_source_gap[silver.fbref_match_enriched]` (new, ERROR) fires the
+  moment a registered match starts carrying events, so the registry cannot rot
+  into a mute button.
+
+The pipeline still must not synthesize missing FBref events or weaken the gate.
+
+### Live-only defects found while parsing match pages
+
+Two more defects surfaced only against real match pages and are fixed:
+
+3. The match parser counted the two **empty** `div.event` side columns (present
+   on every FBref match page) as unparsed event rows, and treated published-but-
+   empty player tables as a contract failure. A page whose events, team stats,
+   managers and officials all parse cleanly was therefore rejected wholesale
+   (commit `5bacdd4`).
+4. `discover_page_links` read the page slug of a season-less comps link
+   (`/en/comps/8/Champions-League-Stats` — FBref's address for a competition's
+   *current* season) as a `season_id`, and let a page lend its own season to
+   such links. A 2016-2017 match page thus tried to register a target whose
+   canonical URL already belongs to the registry-seeded current season, the
+   frontier upsert raised `StateConflict`, and **the parse wave failed on every
+   match page** (commit `2870a46`).
+
+### Lease and hang defects found while running bounded batches
+
+5. `reap_expired_leases()` existed but had no caller, and `claim_targets` reaps
+   only the leases of the run doing the claiming. A worker killed mid-wave left
+   its targets `leased` forever: they dropped out of the crawl and kept
+   `promotion_pending_match_count` above zero, which fails the validation gate
+   of every later run. The run start now reaps globally (commit `939d989`).
+6. `Camoufox.__enter__()` has no timeout and hangs indefinitely on a dead proxy
+   (observed twice live, 0 requests charged, the process idle inside
+   Playwright's event loop). The fetch-wave subprocess ran without a timeout, so
+   a hung wave would hold its leases for hours; it is now bounded by
+   `FETCH_WAVE_TIMEOUT_SECONDS = 30 min` and fails closed (commit `949f46b`).
 
 ## Legacy production path removed
 
@@ -658,6 +698,6 @@ runner. The runner never imports Airflow or triggers Silver.
 |---|---|---|
 | ~~Bounded canary failed on warm HTTP `500`~~ **CLEARED 2026-07-12** | — | Canary `562f020a-8f9b-53fe-bb5d-2b3825e5139e` succeeded: raw committed, parse green, every traffic/eligibility/coverage gate passed. |
 | Full 400-page soak not authorized | No production-scale throughput or long-session stability claim is valid. | Separate approval, hard request/MB cap, and recorded soak report. |
-| #901: 11 raw event gaps | Strict Silver DQ blocks promotion; weakening it would hide missing source data. | Raw is absent for all eleven (the legacy scraper kept none), so offline replay cannot repair them. `scripts/research/run_fbref_match_refetch.py` performs the bounded, control-plane-native refetch; exit when zero scored matches lack events. |
+| #901: 11 matches with a score and no events | Strict Silver DQ blocks promotion; weakening it would hide missing source data. | **Diagnosed 2026-07-12**: FBref publishes no events for these pages (empty containers in raw), so this is source absence, not a scrape gap. Exit = every one of the eleven refetched, its emptiness recorded in `bronze.fbref_dataset_availability`, and listed in `configs/medallion/fbref_event_source_gaps.yaml`; the gate stays ERROR for anything unregistered. |
 | Live traffic benchmark pending | No measured before/after Cloudflare/proxy/provider-billing claim is valid. Offline parser regression is measured at 2.27% and passes. | Reproducible bounded live benchmark with the approved page/request/byte mix and provider evidence. |
 | GitHub Project scope unavailable | Project-field classification cannot be verified or updated. | Credential with `read:project`, followed by a read-only audit or separately authorized mutation. |
