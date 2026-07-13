@@ -54,9 +54,11 @@ from scrapers.transfermarkt.registry import (
 MIB = 1024 * 1024
 HARD_BYTE_CAP = 15_728_640
 SOFT_BYTE_STOP = 14_680_064
-# Residential exits fail often enough that a scope meets several bad ones in a
-# row; the client itself never attempts an endpoint more than eight times.
-PARENT_RETRY_LIMIT = 8
+# This is the cycle-wide retry ledger, not a per-page cap: the source answers
+# 502/504 in waves, and a scope fetches dozens of pages, so a handful of retries
+# is spent by the first two pages. A failed attempt costs ~10 KiB, and the real
+# bound on paid traffic is the 15 MiB byte cap, not the number of attempts.
+PARENT_RETRY_LIMIT = 128
 ENTITY_ORDER = (
     'players',
     'market_value_history',
