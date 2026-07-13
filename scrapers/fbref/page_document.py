@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections import Counter
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -87,6 +88,19 @@ def _entity_ids(tag: Tag) -> Dict[str, str]:
     return found
 
 
+def _span(cell: Tag, name: str) -> int:
+    """Read a colspan/rowspan that FBref does not always emit as a number.
+
+    Its player pages ship ``colspan=""`` on every wages row header, and one cell
+    per page comes out of the markup as ``colspan='class="'`` — an unquoted
+    attribute the parser folds into the span. Trusting the value crashed the
+    generic layer and discarded the whole page, which is the one thing a
+    lossless capture must never do: a broken span is a rendering hint, not data.
+    """
+    raw = str(cell.get(name) or "").strip()
+    return max(1, int(raw)) if raw.isdigit() else 1
+
+
 def _expand_header_grid(header_rows: Sequence[Tag]) -> List[List[str]]:
     """Expand rowspan/colspan headers into a rectangular text grid."""
 
@@ -100,8 +114,8 @@ def _expand_header_grid(header_rows: Sequence[Tag]) -> List[List[str]]:
                 rendered.append(occupied[(row_index, column)])
                 column += 1
             value = _text(cell)
-            colspan = max(1, int(cell.get("colspan") or 1))
-            rowspan = max(1, int(cell.get("rowspan") or 1))
+            colspan = _span(cell, "colspan")
+            rowspan = _span(cell, "rowspan")
             for offset in range(colspan):
                 rendered.append(value)
                 for future_row in range(row_index + 1, row_index + rowspan):
@@ -297,6 +311,7 @@ def _parse_table(
     caption = _text(table.find("caption")) or None
 
     rows: List[PageRow] = []
+    identity_counts: Counter = Counter()
     for row_index, row in enumerate(body_rows):
         direct_cells = row.find_all(["th", "td"], recursive=False)
         values = [_text(cell) for cell in direct_cells]
@@ -307,7 +322,19 @@ def _parse_table(
             "values": "\x1f".join(values),
             "ordinal": str(row_index),
         }
-        row_id = _sha256(table_instance_id, json.dumps(stable_identity, sort_keys=True))
+        identity = json.dumps(stable_identity, sort_keys=True)
+        # FBref repeats the same entities across rows of one table: a player's
+        # standard stats carry two rows for the same club, his wages table one
+        # row per season for the same club. Entity identity alone is therefore
+        # not a key — the colliding row_ids reached Iceberg as duplicate MERGE
+        # source rows (MERGE_TARGET_ROW_MULTIPLE_MATCHES) and the page could not
+        # be written at all. The first occurrence keeps its id, so rows already
+        # in Bronze stay addressable; later ones carry their occurrence.
+        occurrence = identity_counts[identity]
+        identity_counts[identity] += 1
+        row_id = _sha256(table_instance_id, identity) if occurrence == 0 else (
+            _sha256(table_instance_id, identity, occurrence)
+        )
         cells: List[PageCell] = []
         for cell_index, cell in enumerate(direct_cells):
             data_stat = str(cell.get("data-stat") or "").strip() or None

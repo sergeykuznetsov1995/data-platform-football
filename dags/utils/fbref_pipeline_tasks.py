@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 import logging
+import subprocess
+import sys
 from typing import Optional, Sequence
 
 from scrapers.fbref.settings import (
@@ -21,6 +23,13 @@ from scrapers.fbref.settings import (
 
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_PROXY_FILE = "/opt/airflow/proxys.txt"
+FETCH_WAVE_RUNNER = "/opt/airflow/dags/scripts/run_fbref_fetch_wave.py"
+FETCH_WAVE_RESULT_PREFIX = "FBREF_FETCH_WAVE_RESULT:"
+# A full 25-page wave sleeps 3s per page and needs one clearance bootstrap, so
+# it finishes in minutes.  Anything past this is a hung browser, not slow work.
+FETCH_WAVE_TIMEOUT_SECONDS = 30 * 60
 
 
 def _pipeline():
@@ -172,23 +181,95 @@ def fetch_fbref_wave(
     shard_size=DEFAULT_SHARD_SIZE,
     reservation_mb=DEFAULT_REQUEST_RESERVATION_BYTES // MIB,
     domain_interval_seconds=3.0,
+    proxy_file: Optional[str] = DEFAULT_PROXY_FILE,
 ) -> dict:
-    settings = _settings(
-        run_type=run_type,
-        request_limit=request_limit,
-        byte_limit_mb=byte_limit_mb,
-        shard_size=shard_size,
-        reservation_mb=reservation_mb,
-        domain_interval_seconds=domain_interval_seconds,
-    )
-    result = _pipeline().fetch_wave(
+    """Run one bounded fetch wave in a dedicated, unforked subprocess.
+
+    The wave is the only task that drives Camoufox, and Playwright's sync API
+    deadlocks inside a process forked from the multi-threaded scheduler: the
+    browser starts, the navigation never opens a socket, and no timeout fires.
+    The wave therefore executes through ``run_fbref_fetch_wave.py`` and this
+    callable only relays its bounded result, so every control-plane budget,
+    lease, and validation gate stays exactly where it was.
+    """
+
+    command = [
+        sys.executable,
+        FETCH_WAVE_RUNNER,
+        "--control-run-id",
         _control_run_id(airflow_run_id=airflow_run_id, dag_id=dag_id),
-        worker_id=worker_id,
-        page_kinds=list(page_kinds),
-        settings=settings,
-    ).as_dict()
+        "--worker-id",
+        worker_id,
+        "--page-kinds",
+        ",".join(page_kinds),
+        "--run-type",
+        run_type,
+        "--request-limit",
+        str(request_limit),
+        "--byte-limit-mb",
+        str(byte_limit_mb),
+        "--shard-size",
+        str(shard_size),
+        "--reservation-mb",
+        str(reservation_mb),
+        "--domain-interval-seconds",
+        str(domain_interval_seconds),
+    ]
+    if proxy_file:
+        command += ["--proxy-file", proxy_file]
+
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=FETCH_WAVE_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        # A hung clearance keeps the browser inside Playwright's event loop and
+        # never returns, holding this wave's fenced leases until they expire.
+        # Fail closed so the DAG's failure callback releases them now — and log
+        # what the wave had printed by then, or the hang is undiagnosable.
+        logger.warning(
+            "FBref fetch wave timed out.\nstdout:\n%s\nstderr:\n%s",
+            _decoded_stream(exc.stdout),
+            _decoded_stream(exc.stderr),
+        )
+        raise RuntimeError(
+            "FBref fetch wave subprocess exceeded "
+            f"{FETCH_WAVE_TIMEOUT_SECONDS}s and was killed"
+        ) from exc
+    if completed.stderr:
+        logger.info("FBref fetch wave stderr:\n%s", completed.stderr.strip())
+    if completed.returncode != 0:
+        raise RuntimeError(
+            "FBref fetch wave subprocess failed with exit code "
+            f"{completed.returncode}"
+        )
+
+    result = _parse_fetch_wave_result(completed.stdout)
     logger.info("FBref fetch wave: %s", json.dumps(result, sort_keys=True))
     return result
+
+
+def _decoded_stream(stream) -> str:
+    """Best-effort text of a killed subprocess stream (bytes or str, may be None)."""
+    if stream is None:
+        return "<empty>"
+    if isinstance(stream, bytes):
+        stream = stream.decode("utf-8", "replace")
+    text = str(stream).strip()
+    return text[-8000:] if text else "<empty>"
+
+
+def _parse_fetch_wave_result(stdout: str) -> dict:
+    """Return the wave result the runner printed, or fail closed."""
+
+    for line in reversed(stdout.splitlines()):
+        if line.startswith(FETCH_WAVE_RESULT_PREFIX):
+            return json.loads(line[len(FETCH_WAVE_RESULT_PREFIX):])
+    raise RuntimeError("FBref fetch wave subprocess emitted no result document")
 
 
 def parse_fbref_wave(

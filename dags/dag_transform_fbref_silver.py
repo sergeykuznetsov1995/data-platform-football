@@ -260,17 +260,69 @@ def _run_transform(sql_file: str, table_name: str, **context) -> Dict[str, Any]:
                 ]) + ')'
             )
 
+        # #901: matches for which FBref itself publishes no events.  Same
+        # finite-evidence contract as the override registry: an unlisted match
+        # with a score and zero events still fails the DQ gate.
+        gaps_path = config_dir / 'fbref_event_source_gaps.yaml'
+        if not gaps_path.exists():
+            raise FileNotFoundError(
+                f'FBref event source-gap registry not found: {gaps_path}'
+            )
+        gaps_payload = yaml.safe_load(gaps_path.read_text(encoding='utf-8')) or {}
+        if gaps_payload.get('version') != 1:
+            raise ValueError('fbref_event_source_gaps.yaml version must be 1')
+        gaps = gaps_payload.get('gaps')
+        if not isinstance(gaps, list) or not gaps:
+            raise ValueError('fbref_event_source_gaps.yaml gaps must be non-empty')
+
+        gap_required = {'match_id', 'league', 'season', 'reason', 'evidence'}
+        gap_seen = set()
+        gap_rows = []
+        for index, item in enumerate(gaps):
+            if not isinstance(item, dict):
+                raise ValueError(f'event source gap #{index} must be a mapping')
+            missing = sorted(k for k in gap_required if item.get(k) in (None, ''))
+            if missing:
+                raise ValueError(
+                    f'event source gap #{index} is missing required evidence: {missing}'
+                )
+            match_id = str(item['match_id'])
+            if not re.fullmatch(r'[a-f0-9]{8}', match_id):
+                raise ValueError(
+                    f'event source gap #{index} has invalid match_id {match_id!r}'
+                )
+            if match_id in gap_seen:
+                raise ValueError(f'duplicate event source gap: {match_id}')
+            gap_seen.add(match_id)
+            gap_rows.append(
+                '(' + ', '.join([
+                    quote(match_id), quote(item['league']),
+                    quote(item['season']), quote(item['reason']),
+                ]) + ')'
+            )
+
         source_sql = sql_path.read_text(encoding='utf-8')
         typed_empty_row = (
             "(CAST(NULL AS varchar), CAST(NULL AS varchar), CAST(NULL AS varchar),\n"
             "         CAST(NULL AS integer), CAST(NULL AS integer), CAST(NULL AS varchar),\n"
             "         CAST(NULL AS varchar), CAST(NULL AS varchar))"
         )
+        typed_empty_gap_row = (
+            "(CAST(NULL AS varchar), CAST(NULL AS varchar), CAST(NULL AS varchar),\n"
+            "         CAST(NULL AS varchar))"
+        )
         if source_sql.count(typed_empty_row) != 1:
             raise ValueError(
                 'fbref_match_enriched override render anchor missing or duplicated'
             )
+        if source_sql.count(typed_empty_gap_row) != 1:
+            raise ValueError(
+                'fbref_match_enriched event-gap render anchor missing or duplicated'
+            )
         rendered_sql = source_sql.replace(typed_empty_row, ',\n        '.join(rows))
+        rendered_sql = rendered_sql.replace(
+            typed_empty_gap_row, ',\n        '.join(gap_rows)
+        )
         with tempfile.NamedTemporaryFile(
             mode='w', suffix='_fbref_match_enriched.sql', delete=False,
             encoding='utf-8',
@@ -496,10 +548,24 @@ def _validate_silver_quality(**context) -> Dict[str, Any]:
                 "source_home_score IS NOT NULL AND source_away_score IS NOT NULL "
                 "AND COALESCE(event_row_count, 0) = 0 "
                 "AND COALESCE(event_availability, 'unknown') "
-                "NOT IN ('restricted', 'not_applicable')"
+                "NOT IN ('restricted', 'not_applicable') "
+                "AND NOT COALESCE(event_gap_acknowledged, FALSE)"
             ),
             severity='ERROR',
             name='scored_match_without_events[silver.fbref_match_enriched]',
+        ),
+        # #901: the source-gap registry is evidence, not a mute button.  A
+        # registered match that now carries events means FBref started
+        # publishing them and the entry must go.
+        CHECK.row_count(
+            'silver.fbref_match_enriched',
+            min_rows=0, max_rows=0,
+            where=(
+                "COALESCE(event_gap_acknowledged, FALSE) "
+                "AND COALESCE(event_row_count, 0) > 0"
+            ),
+            severity='ERROR',
+            name='stale_event_source_gap[silver.fbref_match_enriched]',
         ),
         CHECK.row_count(
             'silver.fbref_match_enriched',

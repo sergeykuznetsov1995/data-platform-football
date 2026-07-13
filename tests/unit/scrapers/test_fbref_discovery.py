@@ -437,6 +437,74 @@ def test_stat_links_stay_distinct_and_known_empty_routes_are_skipped():
     )
 
 
+SEASON_LESS_NAV_HTML = """
+<a href="/en/comps/8/Champions-League-Stats">Champions League</a>
+<a href="/en/comps/20/Bundesliga-Stats">Bundesliga</a>
+<a href="/en/comps/9/schedule/Premier-League-Scores-and-Fixtures">Fixtures</a>
+<a href="/en/comps/9/keepers/Premier-League-Stats">Keepers</a>
+<a href="/en/comps/season/2027">2027 seasons</a>
+"""
+
+
+def test_season_less_comps_links_on_a_match_page_are_not_season_targets():
+    # FBref's navigation addresses every competition's *current* season without
+    # a season segment; a 2016-2017 match page must not mint targets that claim
+    # its own season for them.
+    links = discover_page_links(
+        SEASON_LESS_NAV_HTML,
+        parent_source_ids={
+            "competition_id": "20",
+            "season_id": "2016-2017",
+            "match_id": "5492b4b4",
+        },
+        parent_url="https://fbref.com/en/matches/5492b4b4",
+    )
+
+    assert links == []
+
+
+def test_current_season_page_lends_its_season_to_its_own_subpages_only():
+    links = discover_page_links(
+        SEASON_LESS_NAV_HTML,
+        parent_source_ids={"competition_id": "9", "season_id": "2026"},
+        parent_url="https://fbref.com/en/comps/9/Premier-League-Stats",
+    )
+    by_kind = {link.page_kind: link for link in links}
+
+    assert set(by_kind) == {"schedule", "season_stats"}
+    assert by_kind["schedule"].source_ids == {
+        "competition_id": "9",
+        "season_id": "2026",
+    }
+    assert by_kind["season_stats"].source_ids == {
+        "competition_id": "9",
+        "season_id": "2026",
+        "stat_route": "keepers",
+    }
+    assert not any(
+        link.source_ids.get("competition_id") in {"8", "20", "season"}
+        for link in links
+    )
+
+
+def test_historical_season_page_does_not_lend_its_season_to_current_links():
+    links = discover_page_links(
+        """
+        <a href="/en/comps/9/Premier-League-Stats">Premier League</a>
+        <a href="/en/comps/9/2016-2017/keepers/2016-2017-Premier-League-Stats">
+          Keepers
+        </a>
+        """,
+        parent_source_ids={"competition_id": "9", "season_id": "2016-2017"},
+        parent_url=(
+            "https://fbref.com/en/comps/9/2016-2017/2016-2017-Premier-League-Stats"
+        ),
+    )
+
+    assert [link.page_kind for link in links] == ["season_stats"]
+    assert links[0].source_ids["season_id"] == "2016-2017"
+
+
 def test_sentinel_coverage_observes_but_does_not_filter_arbitrary_male_rows():
     premier = CompetitionRef(
         **{**_competition(comp_id="9").__dict__, "name": "Premier League"}
@@ -477,3 +545,182 @@ def test_sentinel_coverage_matches_source_governing_body_prefixes():
 
     assert report["Champions League"]["competition_id"] == "8"
     assert report["World Cup"]["competition_id"] == "1"
+
+
+TOURNAMENT_CARD_HISTORY_HTML = """
+<div id="content">
+  <div class="content_grid">
+    <div>
+      <h2><a href="/en/comps/255/2026/2026-Play-offs-Stats">2026 Play-offs</a></h2>
+      <p>Top Scorer: <a href="/en/players/2e67fc18/Moises-Paniagua">Moises Paniagua</a></p>
+      <p><a href="/en/comps/1/World-Cup-Stats">2026 World Cup Qualifiers</a>:
+         <a href="/en/squads/9be9f315/Congo-DR-Men-Stats">Congo DR</a></p>
+    </div>
+    <div>
+      <h2><a href="/en/comps/255/2022/2022-Play-offs-Stats">2022 Play-offs</a></h2>
+    </div>
+  </div>
+</div>
+"""
+
+
+def test_history_without_a_seasons_table_reads_the_tournament_card_grid():
+    """Competitions whose editions are standalone tournaments (comp 255, the
+    World Cup inter-confederation play-offs) publish no table#seasons at all —
+    their history is a card grid. Rejecting the page would drop a men's
+    competition from the frontier."""
+    cup = _competition(
+        comp_id="255",
+        competition_format=CompetitionFormat.CUP,
+        participants=ParticipantType.NATIONAL_TEAM,
+    )
+
+    result = parse_competition_html(TOURNAMENT_CARD_HISTORY_HTML, cup)
+    seasons = result.datasets["seasons"].records
+
+    assert not result.has_errors
+    assert [item.season_id for item in seasons] == ["2026", "2022"]
+    assert seasons[0].season_url == (
+        "https://fbref.com/en/comps/255/2026/2026-Play-offs-Stats"
+    )
+    assert seasons[0].calendar_type == CalendarType.TOURNAMENT
+
+
+def test_card_grid_ignores_links_to_other_competitions_and_squads():
+    """The grid also links to the parent competition, squads and players; only
+    season routes of *this* competition may become season targets."""
+    cup = _competition(comp_id="255", competition_format=CompetitionFormat.CUP)
+
+    result = parse_competition_html(TOURNAMENT_CARD_HISTORY_HTML, cup)
+
+    urls = [item.season_url for item in result.datasets["seasons"].records]
+    assert all("/comps/255/" in url for url in urls)
+
+
+def test_a_history_page_with_no_seasons_at_all_still_fails_closed():
+    """No table, no cards — the page contract is broken and must not pass as an
+    empty-but-fine competition."""
+    result = parse_competition_html(
+        "<div id='content'><p>nothing here</p></div>", _competition()
+    )
+    dataset = result.datasets["seasons"]
+
+    assert result.has_errors
+    assert dataset.status == DatasetStatus.ERROR
+    assert dataset.reason == "season_history_table_missing"
+
+
+ONE_MATCH_COMPETITION_HTML = """
+<table id="seasons"><tbody>
+  <tr><th data-stat="year_id">
+        <a href="/en/matches/096e63eb/Crystal-Palace-Liverpool-FA-Community-Shield">2025</a></th>
+      <td data-stat="champ"><a href="/en/squads/47c64c55/Crystal-Palace-Stats">Crystal Palace</a></td></tr>
+  <tr><th data-stat="year_id">
+        <a href="/en/matches/923aa854/Manchester-Derby-FA-Community-Shield">2024</a></th>
+      <td data-stat="champ"><a href="/en/squads/b8fd03ef/Manchester-City-Stats">Manchester City</a></td></tr>
+</tbody></table>
+"""
+
+
+def test_a_one_match_competition_has_no_season_pages_and_is_not_an_error():
+    """The FA Community Shield (comp 602) and the super cups are single matches:
+    their history table links each edition straight to the final's match report
+    and no season page exists to follow. Failing the page would fail the whole
+    wave over a competition FBref publishes exactly as intended."""
+    shield = _competition(comp_id="602", competition_format=CompetitionFormat.CUP)
+
+    result = parse_competition_html(ONE_MATCH_COMPETITION_HTML, shield)
+    dataset = result.datasets["seasons"]
+
+    assert not result.has_errors
+    assert dataset.status == DatasetStatus.NOT_APPLICABLE
+    assert dataset.reason == "competition_publishes_no_season_pages"
+    assert dataset.row_count == 0
+
+
+def test_a_seasons_table_with_unlinked_rows_is_still_a_contract_error():
+    """Rows with no anchors at all mean the page did not render its links — that
+    is a broken contract, not a competition without season pages."""
+    html = """
+    <table id="seasons"><tbody>
+      <tr><th data-stat="year_id">2025</th><td data-stat="champ">Someone</td></tr>
+    </tbody></table>
+    """
+
+    result = parse_competition_html(html, _competition())
+
+    assert result.has_errors
+    assert result.datasets["seasons"].reason == "season_links_missing"
+
+
+def test_a_single_match_season_page_has_no_schedule_to_advertise():
+    """The UEFA Super Cup's season page carries no fixtures and no tables — one
+    match needs no schedule. Failing it would fail the wave on a men's
+    competition FBref publishes exactly as intended."""
+    html = """
+    <div id="content"><h1>2013 UEFA Super Cup Stats</h1>
+      <a href="/en/comps/122/history/UEFA-Super-Cup-Seasons">Seasons</a>
+    </div>
+    """
+    season = SeasonRef(
+        comp_id="122",
+        season_id="2013-2014",
+        label="2013-2014",
+        calendar_type=CalendarType.TOURNAMENT,
+        season_url="https://fbref.com/en/comps/122/2013-2014/2013-UEFA-Super-Cup-Stats",
+    )
+
+    result = parse_season_html(html, season)
+    dataset = result.datasets["schedules"]
+
+    assert not result.has_errors
+    assert dataset.status == DatasetStatus.NOT_APPLICABLE
+    assert dataset.reason == "season_publishes_no_schedule"
+
+
+def test_a_season_page_with_tables_but_no_schedule_link_still_fails_closed():
+    """A league season page always advertises Scores & Fixtures. Tables without
+    that link mean the markup changed — never silently skip the season."""
+    html = """
+    <div id="content"><table id="results2024"><tr><td>x</td></tr></table></div>
+    """
+    season = SeasonRef(
+        comp_id="9",
+        season_id="2024-2025",
+        label="2024-2025",
+        calendar_type=CalendarType.SPLIT_YEAR,
+        season_url="https://fbref.com/en/comps/9/2024-2025/2024-2025-Premier-League-Stats",
+    )
+
+    result = parse_season_html(html, season)
+
+    assert result.has_errors
+    assert result.datasets["schedules"].reason == "schedule_link_missing"
+
+
+def test_the_big5_aggregate_plays_no_fixtures_of_its_own():
+    """FBref's only non-numeric competition id is 'Big5' — the Big 5 European
+    Leagues Combined. It carries stat tables but no schedule: its matches belong
+    to the five leagues it sums up, which are crawled in their own right."""
+    html = """
+    <div id="content"><table id="big5_table"><tr><td>x</td></tr></table>
+      <a href="/en/comps/Big5/history/Big-5-European-Leagues-Seasons">Seasons</a>
+    </div>
+    """
+    season = SeasonRef(
+        comp_id="Big5",
+        season_id="2025-2026",
+        label="2025-2026",
+        calendar_type=CalendarType.SPLIT_YEAR,
+        season_url=(
+            "https://fbref.com/en/comps/Big5/2025-2026/"
+            "2025-2026-Big-5-European-Leagues-Stats"
+        ),
+    )
+
+    result = parse_season_html(html, season)
+    dataset = result.datasets["schedules"]
+
+    assert not result.has_errors
+    assert dataset.status == DatasetStatus.NOT_APPLICABLE
+    assert dataset.reason == "aggregate_competition_has_no_fixtures"

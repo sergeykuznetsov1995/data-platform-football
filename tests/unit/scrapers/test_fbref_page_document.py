@@ -126,3 +126,77 @@ def test_generic_records_keep_raw_header_value_and_entity_json():
     assert cells[0]["raw_value"] == "P"
     assert cells[0]["raw_header_path"] == '["Player"]'
     assert cells[0]["entity_ids"] == '{"player_id": "1234abcd"}'
+
+
+def test_a_broken_colspan_must_not_discard_the_whole_page():
+    """FBref's player pages ship colspan="" on every wages row header, and one
+    cell per page reaches the parser as colspan='class="' (an unquoted attribute
+    the markup folds into the span). int() raised, the generic layer reported
+    parser errors, and the entire player page was rejected — a lossless capture
+    must never lose a page over a rendering hint."""
+    html = """
+    <!--
+    <div class="table_container" id="div_wages">
+      <table id="wages">
+        <thead><tr>
+          <th colspan="" data-stat="year">Year</th>
+          <th colspan='class="' data-stat="team">Team</th>
+          <th colspan="2" data-stat="wages">Wages</th>
+        </tr></thead>
+        <tbody><tr>
+          <th colspan="" data-stat="year" scope="row">2023-2024</th>
+          <td data-stat="team">Lyon</td>
+          <td data-stat="weekly">100</td>
+          <td data-stat="annual">5200</td>
+        </tr></tbody>
+      </table>
+    </div>
+    -->
+    """
+
+    page = parse_page_document(
+        html, target_id="fbref:player:9dbb75ca", page_kind="player",
+        content_hash="abc",
+    )
+
+    assert page.errors == ()
+    wages = [table for table in page.tables if table.table_id == "wages"]
+    assert len(wages) == 1
+    assert wages[0].row_count == 1
+
+
+def test_rows_repeating_the_same_entities_get_distinct_ids():
+    """FBref repeats the same entities across rows of one table — a player's
+    stats carry two rows for the same club. Entity identity alone is not a key:
+    the colliding row_ids reached Iceberg as duplicate MERGE source rows
+    (MERGE_TARGET_ROW_MULTIPLE_MATCHES) and the whole page failed to persist."""
+    html = """
+    <table id="stats_standard">
+      <thead><tr><th data-stat="season">Season</th><th data-stat="team">Squad</th>
+                 <th data-stat="goals">Gls</th></tr></thead>
+      <tbody>
+        <tr><th data-stat="season">2022-2023</th>
+            <td data-stat="team"><a href="/en/squads/d53c0b06/Lyon-Stats">Lyon</a></td>
+            <td data-stat="goals">18</td></tr>
+        <tr><th data-stat="season">2023-2024</th>
+            <td data-stat="team"><a href="/en/squads/d53c0b06/Lyon-Stats">Lyon</a></td>
+            <td data-stat="goals">19</td></tr>
+      </tbody>
+    </table>
+    """
+
+    page = parse_page_document(
+        html, target_id="fbref:player:9dbb75ca", page_kind="player",
+        content_hash="abc",
+    )
+    table = page.tables[0]
+    row_ids = [row.row_id for row in table.rows]
+    cells = page.cell_records()
+    merge_keys = {
+        (cell["table_instance_id"], cell["row_id"], cell["cell_id"])
+        for cell in cells
+    }
+
+    assert len(row_ids) == 2
+    assert len(set(row_ids)) == 2
+    assert len(merge_keys) == len(cells)
