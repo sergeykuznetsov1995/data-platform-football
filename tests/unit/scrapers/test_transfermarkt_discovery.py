@@ -262,6 +262,51 @@ def test_discovery_keeps_the_format_of_each_edition_when_it_changed() -> None:
     assert editions["1977"].season_format is SeasonFormat.SINGLE_YEAR
 
 
+def test_discovery_reads_a_cups_only_edition_from_its_title() -> None:
+    afrika = (FIXTURES / "afrika.html").read_text(encoding="utf-8")
+    cup = (
+        '<!doctype html><html lang="en"><head>'
+        "<title>CAF Champions League 25/26 | Transfermarkt</title>"
+        '</head><body><h1 data-competition-id="AFCN">CAF Champions League</h1>'
+        "</body></html>"
+    )
+
+    pages, *_ = _discover(
+        fetch=FixtureFetch(
+            {BASE_URL + "/afrika-cup/startseite/pokalwettbewerb/AFCN": cup}
+        )
+    )
+    snapshot = reconcile_registry_pages(pages)
+    editions = [item for item in snapshot.editions if item.competition_id == "AFCN"]
+
+    assert len(editions) == 1
+    assert editions[0].edition_id == "2025"
+    assert editions[0].canonical_season == "2526"
+    assert editions[0].current is True
+
+
+def test_discovery_drops_a_competition_the_source_never_staged() -> None:
+    afrika = (FIXTURES / "afrika.html").read_text(encoding="utf-8")
+    unstaged = (
+        '<!doctype html><html lang="en"><head>'
+        "<title>J1 100 Year Vision League | Transfermarkt</title>"
+        '</head><body><h1 data-competition-id="AFCN">J1 League</h1>'
+        "</body></html>"
+    )
+
+    pages, *_ = _discover(
+        fetch=FixtureFetch(
+            {BASE_URL + "/afrika-cup/startseite/pokalwettbewerb/AFCN": unstaged}
+        )
+    )
+    snapshot = reconcile_registry_pages(pages)
+
+    assert not [
+        item for item in snapshot.competitions if item.competition_id == "AFCN"
+    ]
+    assert snapshot.competitions
+
+
 def test_discovery_ignores_navbar_entries_that_every_page_repeats() -> None:
     afrika = (FIXTURES / "afrika.html").read_text(encoding="utf-8")
     navbar = (
@@ -477,12 +522,19 @@ def test_listing_schema_drift_aborts_snapshot() -> None:
         _discover(fetch=fetch)
 
 
-def test_profile_without_edition_selector_aborts_snapshot() -> None:
-    profile_url = BASE_URL + "/uefa-champions-league/startseite/pokalwettbewerb/CL"
-    drift = '<!doctype html><html><body><h1 data-competition-id="CL">CL</h1></body></html>'
-    fetch = FixtureFetch({profile_url: drift})
-    with pytest.raises(DiscoverySchemaError, match="edition selector missing"):
-        _discover(fetch=fetch)
+def test_a_catalog_whose_profiles_all_lost_their_editions_aborts_snapshot() -> None:
+    drift = {
+        url: (
+            '<!doctype html><html><body>'
+            f'<h1 data-competition-id="{url.rsplit("/", 1)[-1]}">x</h1>'
+            "</body></html>"
+        )
+        for url in URL_FIXTURES
+        if "wettbewerb/" in url
+    }
+
+    with pytest.raises(DiscoverySchemaError, match="no competitions"):
+        _discover(fetch=FixtureFetch(drift))
 
 
 def test_corrupt_cached_payload_fails_closed_without_refetch() -> None:
