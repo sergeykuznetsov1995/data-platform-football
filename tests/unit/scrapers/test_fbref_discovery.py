@@ -696,3 +696,31 @@ def test_a_season_page_with_tables_but_no_schedule_link_still_fails_closed():
 
     assert result.has_errors
     assert result.datasets["schedules"].reason == "schedule_link_missing"
+
+
+def test_the_big5_aggregate_plays_no_fixtures_of_its_own():
+    """FBref's only non-numeric competition id is 'Big5' — the Big 5 European
+    Leagues Combined. It carries stat tables but no schedule: its matches belong
+    to the five leagues it sums up, which are crawled in their own right."""
+    html = """
+    <div id="content"><table id="big5_table"><tr><td>x</td></tr></table>
+      <a href="/en/comps/Big5/history/Big-5-European-Leagues-Seasons">Seasons</a>
+    </div>
+    """
+    season = SeasonRef(
+        comp_id="Big5",
+        season_id="2025-2026",
+        label="2025-2026",
+        calendar_type=CalendarType.SPLIT_YEAR,
+        season_url=(
+            "https://fbref.com/en/comps/Big5/2025-2026/"
+            "2025-2026-Big-5-European-Leagues-Stats"
+        ),
+    )
+
+    result = parse_season_html(html, season)
+    dataset = result.datasets["schedules"]
+
+    assert not result.has_errors
+    assert dataset.status == DatasetStatus.NOT_APPLICABLE
+    assert dataset.reason == "aggregate_competition_has_no_fixtures"
