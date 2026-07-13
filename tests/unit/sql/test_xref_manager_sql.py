@@ -324,3 +324,26 @@ class TestXrefManagerRender:
         # The alias VALUES body must parse as tuples of 3 (raw, cid, league).
         assert re.search(r"\)\s+AS\s+t\s*\(raw_name,\s*canonical_id,\s*league\)",
                          rendered), "alias VALUES table shape changed"
+
+
+class TestFbrefSeasonSlugDedup:
+    """The FBref branch must dedupe on the season it emits, not on the raw
+    columns the slug is derived from."""
+
+    def test_fbref_groups_by_output_columns_not_raw_season(self):
+        """A legacy row (season=2025, source_season_id=NULL) and a row from the
+        production pipeline (season=2025, source_season_id='2025-2026') both
+        render the '2526' slug. Grouping by the raw pair kept them in separate
+        groups and emitted the same manager twice, which the xref PK gate
+        (source, source_id, league, season) refuses — it did, in production."""
+        sql = _read_sql()
+        fbref_branch = sql.split("UNION ALL")[0]
+        group_by = fbref_branch.rsplit("GROUP BY", 1)[1]
+        keys = "\n".join(
+            line for line in group_by.splitlines()
+            if not line.strip().startswith("--")
+        )
+
+        assert "source_season_id" not in keys
+        assert "season" not in keys
+        assert re.search(r"^\s*1,\s*3,\s*4,\s*5,\s*6\s*$", keys, re.M)
