@@ -24,6 +24,9 @@ from scrapers.transfermarkt.models import (
 )
 
 
+CONTROL_TOKEN = "c" * 32
+
+
 class _Response:
     def __init__(self, body: bytes, *, status: int = 200, payload=None):
         self.content = body
@@ -166,7 +169,9 @@ def test_production_lease_adapter_uses_exact_api_and_basic_proxy_auth():
         }),
     ])
     provider = ProxyFilterLeaseProvider(
-        "http://proxy_filter:8899", control_client=control,
+        "http://proxy_filter:8899",
+        control_client=control,
+        control_token=CONTROL_TOKEN,
     )
     metadata = {
         **_metadata(),
@@ -184,10 +189,29 @@ def test_production_lease_adapter_uses_exact_api_and_basic_proxy_auth():
     assert post[0:2] == ("POST", "http://proxy_filter:8899/v1/leases")
     assert post[2]["json"]["max_bytes"] == 1234
     assert post[2]["json"]["ttl_seconds"] == 300
+    # The control plane authenticates the caller on every call; the lease's own
+    # bearer token only says which lease a call is about.
+    assert post[2]["headers"] == {"X-Proxy-Control-Token": CONTROL_TOKEN}
     assert control.calls[1][2]["headers"] == {
+        "X-Proxy-Control-Token": CONTROL_TOKEN,
         "Authorization": "Bearer secret/token",
     }
     assert control.calls[2][0] == "DELETE"
+
+
+@pytest.mark.unit
+def test_a_lease_is_refused_before_any_call_when_the_control_token_is_absent(
+    monkeypatch,
+):
+    monkeypatch.delenv("TM_PROXY_CONTROL_TOKEN", raising=False)
+    control = _ControlClient([])
+
+    with pytest.raises(ProxyRequiredError, match="TM_PROXY_CONTROL_TOKEN"):
+        ProxyFilterLeaseProvider(
+            "http://proxy_filter:8899", control_client=control,
+        )
+
+    assert control.calls == []
 
 
 @pytest.mark.unit
