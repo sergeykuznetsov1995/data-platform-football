@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 from datetime import datetime, timedelta, timezone
 
@@ -191,6 +192,31 @@ def test_exact_scopes_take_precedence_and_duplicates_are_removed():
         (item['competition_id'], item['edition_id'])
         for item in plan.mapped_payloads
     ] == [('CL', '2025'), ('GB1', '2025')]
+
+
+def test_a_calendar_league_scope_names_the_source_edition_not_its_season():
+    # The source offsets a calendar league's saison_id from the season it names:
+    # edition '2024' is season 2025, and season 2024 is edition '2023'.
+    league = _competition('2DVB', season_format=SeasonFormat.SINGLE_YEAR)
+    editions = [
+        replace(
+            _edition('2DVB', edition_id, season_format=SeasonFormat.SINGLE_YEAR),
+            edition_label=season,
+            canonical_season=season,
+        )
+        for edition_id, season in (('2023', '2024'), ('2024', '2025'))
+    ]
+    plan = planner.plan_transfermarkt_scopes(
+        {'scopes': ['2DVB:2024']},
+        parent_cycle_id='manual__calendar',
+        competitions=[league],
+        editions=editions,
+        now=NOW,
+    )
+    assert [
+        (item['edition_id'], item['canonical_season'])
+        for item in plan.mapped_payloads
+    ] == [('2024', '2025')]
 
 
 def test_unknown_active_classification_blocks_empty_and_explicit_plans():
