@@ -1268,6 +1268,7 @@ class TransfermarktScraper(BaseScraper):
         # several cycles, and only if the pages already paid for are reused.
         response_cache = kwargs.pop('response_cache', None)
         cache_ttl_seconds = kwargs.pop('cache_ttl_seconds', None)
+        canonical_season_override = kwargs.pop('canonical_season', None)
         retry_budget_raw = kwargs.pop(
             'retry_budget', os.environ.get('TM_RETRY_BUDGET'),
         )
@@ -1359,6 +1360,7 @@ class TransfermarktScraper(BaseScraper):
                 'task_id': os.environ.get('TM_TASK_ID', ''),
                 'scope': os.environ.get('TM_SCOPE_ID', ''),
             }
+        self._canonical_season = str(canonical_season_override or '').strip()
         self._response_cache = response_cache
         self._cache_ttl_seconds = (
             float(cache_ttl_seconds) if cache_ttl_seconds else None
@@ -1415,7 +1417,12 @@ class TransfermarktScraper(BaseScraper):
         edition = str(edition_id).strip()
         if not edition:
             raise TransfermarktError('edition_id is required')
-        canonical = canonical_season(edition, record.season_format)
+        # The source offsets some calendar leagues' saison_id from the season it
+        # names (saison_id 2023 is the 2024 season), so a registry-planned scope
+        # states its season and the edition id is only a fallback.
+        canonical = self._canonical_season or canonical_season(
+            edition, record.season_format,
+        )
         return {
             'record': record,
             'competition_id': record.competition_id,
