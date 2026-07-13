@@ -1845,8 +1845,16 @@ def run_scope_cycle(
                 request_limit=int(args.request_limit),
                 retry_limit=int(args.retry_limit),
             )
+            # The runner's own diagnosis is the only account of why it failed,
+            # and the operator never sees its captured output otherwise.
+            reason = ' | '.join(
+                line.strip()
+                for line in str(completed.stderr or '').splitlines()[-3:]
+                if line.strip()
+            )
             raise ScopeCycleError(
-                f'{parser_entity} runner failed with exit {completed.returncode}'
+                f'{parser_entity} runner failed with exit '
+                f'{completed.returncode}' + (f': {reason}' if reason else '')
             )
         result = _load_json_file(temporary_path)
         result_requests = int(result.get('network_fetches', -1))
