@@ -600,6 +600,39 @@ def _canonical_profile_route(soup: BeautifulSoup, profile_url: str) -> Optional[
     return canonical
 
 
+_TITLE_SEASON_RE = re.compile(
+    r"\b(?P<label>(?:18|19|20|21)?\d{2}\s*/\s*\d{2}|(?:18|19|20|21)\d{2})\b"
+)
+
+
+def _title_edition(
+    soup: BeautifulSoup,
+    profile_url: str,
+) -> dict[str, tuple[str, bool, Mapping[str, Any]]]:
+    """The single edition a season-less profile is showing.
+
+    Cups and qualifiers — a third of the catalogue — carry no season selector
+    at all, not even on their canonical route: the profile shows the current
+    edition only, and names it in the page title ("CAF-Champions League 25/26").
+    Take the last season in the title, since an earlier one can belong to the
+    competition's own name ("AFC Challenge Cup (- 2014) 2013").
+    """
+    title = soup.find("title")
+    heading = _normalise_text(title.get_text(" ", strip=True)) if title else ""
+    heading = heading.split("|")[0]
+    matches = _TITLE_SEASON_RE.findall(heading)
+    if not matches:
+        raise DiscoverySchemaError(f"edition selector missing: {profile_url}")
+    label = _normalise_text(matches[-1])
+    season_format = _label_season_format(label, profile_url)
+    if season_format is SeasonFormat.SINGLE_YEAR:
+        edition_id = label
+    else:
+        start = re.split(r"\s*[/\-]\s*", label)[0]
+        edition_id = start if len(start) == 4 else f"20{start}"
+    return {edition_id: (label, True, {})}
+
+
 def _selector_options(
     soup: BeautifulSoup,
     *,
@@ -644,7 +677,7 @@ def _selector_options(
             values[edition_id] = (label, selected, dict(anchor.attrs))
 
     if not values:
-        raise DiscoverySchemaError(f"edition selector missing: {profile_url}")
+        values = _title_edition(soup, profile_url)
     selected_ids = [key for key, value in values.items() if value[1]]
     if len(selected_ids) != 1:
         raise DiscoverySchemaError(
@@ -854,11 +887,21 @@ class TransfermarktCompetitionDiscovery:
 
         competition_records: dict[str, CompetitionRecord] = {}
         edition_records: dict[str, tuple[EditionRecord, ...]] = {}
+        editionless: list[str] = []
         for competition_id, candidate in sorted(candidates.items()):
             profile_document, profile_soup = profiles[competition_id]
-            options = _selector_options(
-                profile_soup, profile_url=candidate.profile_url
-            )
+            try:
+                options = _selector_options(
+                    profile_soup, profile_url=candidate.profile_url
+                )
+            except DiscoverySchemaError as exc:
+                if "edition selector missing" not in str(exc):
+                    raise
+                # The source publishes no edition at all for these — a Brazilian
+                # relegation play-off, Japan's "100 Year Vision" leagues — so
+                # there is nothing to crawl and nothing to register.
+                editionless.append(competition_id)
+                continue
             season_format = _season_format(options, candidate.profile_url)
             season_evidence = ClassificationEvidence(
                 source_field="edition_selector",
@@ -937,6 +980,11 @@ class TransfermarktCompetitionDiscovery:
                     )
                 )
             edition_records[competition_id] = tuple(editions)
+
+        for competition_id in editionless:
+            candidates.pop(competition_id, None)
+        if not candidates:
+            raise DiscoverySchemaError("complete catalog contains no competitions")
 
         listing_urls = tuple(sorted(listing_documents))
         page_number = {url: index + 1 for index, url in enumerate(listing_urls)}
