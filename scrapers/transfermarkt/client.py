@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import random
 import re
 import socket
@@ -131,14 +132,26 @@ class ProxyFilterLeaseProvider:
         control_base_url: str,
         *,
         control_client: Optional[Any] = None,
+        control_token: Optional[str] = None,
         timeout_seconds: float = 5.0,
     ) -> None:
         base = str(control_base_url).rstrip("/")
         parsed = urlsplit(base)
         if parsed.scheme not in ("http", "https") or not parsed.netloc:
             raise ValueError("proxy lease control URL must be absolute HTTP(S)")
+        resolved = str(
+            control_token
+            if control_token is not None
+            else os.environ.get("TM_PROXY_CONTROL_TOKEN", "")
+        )
+        if len(resolved) < 32:
+            raise ProxyRequiredError(
+                "TM_PROXY_CONTROL_TOKEN must contain at least 32 characters: "
+                "the proxy filter refuses a lease without its control token"
+            )
         self.control_base_url = base
         self._control_client = control_client
+        self._control_token = resolved
         self.timeout_seconds = float(timeout_seconds)
 
     def _client(self):
@@ -156,7 +169,11 @@ class ProxyFilterLeaseProvider:
         token: Optional[str] = None,
         payload: Optional[Mapping[str, Any]] = None,
     ) -> Mapping[str, Any]:
-        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        # The control plane authenticates the caller by its own token; a lease's
+        # bearer token only proves which lease the call is about.
+        headers = {"X-Proxy-Control-Token": self._control_token}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
         response = self._client().request(
             method,
             f"{self.control_base_url}{path}",
