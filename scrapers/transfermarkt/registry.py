@@ -414,6 +414,30 @@ class CompetitionRecord:
         )
 
     def _classification(self) -> tuple[ClassificationStatus, Optional[str]]:
+        # The source only marks age structurally for league competitions, under
+        # its "Youth league" group; for tournaments it says so in the name and
+        # nowhere else, which is why the U17 World Cup sits in the very section
+        # that certifies its entrants as national teams. A name may therefore
+        # exclude a competition from the crawl — it can never admit one.
+        named = [
+            item for item in self.evidence if item.origin is EvidenceOrigin.NAME
+        ]
+        name_exclusions = [
+            f"{dimension}={getattr(item, dimension).value} (name)"
+            for item in named
+            for dimension, excluded in (
+                ("gender", {Gender.WOMEN, Gender.MIXED}),
+                ("age_category", {AgeCategory.YOUTH, AgeCategory.UXX}),
+                ("team_type", {TeamType.RESERVE, TeamType.MIXED}),
+            )
+            if getattr(item, dimension) in excluded
+        ]
+        if name_exclusions:
+            return (
+                ClassificationStatus.EXCLUDED,
+                "; ".join(sorted(set(name_exclusions))),
+            )
+
         conflicts: list[str] = []
         missing: list[str] = []
         for name, enum_type in _DIMENSIONS:
