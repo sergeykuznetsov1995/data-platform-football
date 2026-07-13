@@ -36,7 +36,10 @@ PROVIDER_SOFT_STOP_BYTES = 14 * 1024 * 1024
 # Preserve the former per-entity ceilings (26 + 120 + 120 + 50) as one
 # source-wide ceiling. Response reuse should make normal cycles much smaller.
 PROXY_REQUEST_LIMIT = 316
-PROXY_RETRY_LIMIT = 2
+# Residential exits fail often enough that two retries lose a whole scope to a
+# run of bad exits; a failed attempt costs ~10 KiB against a 15 MiB cycle, and
+# the client itself will not attempt an endpoint more than eight times.
+PROXY_RETRY_LIMIT = 8
 PROXY_CONCURRENCY = 1
 SCOPE_SET_COVERAGE_MAX_AGE_DAYS = 7
 
@@ -697,7 +700,7 @@ with DAG(
         ),
         'proxy_retry_limit': Param(
             default=PROXY_RETRY_LIMIT,
-            type='integer', minimum=0, maximum=2,
+            type='integer', minimum=0, maximum=PROXY_RETRY_LIMIT,
         ),
         'entity_timeout_seconds': Param(
             default=3600, type='integer', minimum=60, maximum=3600,
