@@ -257,7 +257,10 @@ def build_plan(
         }
 
     conf = {
-        "scopes": [str(p["scope_id"]) for p in plan.mapped_payloads],
+        # The DAG's planner re-selects from these, and it speaks competition:edition.
+        "scopes": [
+            f'{p["competition_id"]}:{p["edition_id"]}' for p in plan.mapped_payloads
+        ],
         "max_batch": max_batch,
         "registry_snapshot_id": registry_snapshot_id,
         "approval_journal": str(journal_path),
@@ -270,7 +273,7 @@ def build_plan(
         "candidate_slot": candidate_slot,
         "write_mode": write_mode,
         "scope_count": len(plan.mapped_payloads),
-        "scope_ids": conf["scopes"],
+        "scope_ids": list(bundles),
         "journal_path": str(journal_path),
         "trigger_argv": [
             "airflow",
