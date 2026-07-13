@@ -22,6 +22,7 @@ from scrapers.whoscored.repository import (
     WHOSCORED_BUSINESS_COLUMN_CONTRACTS,
     WHOSCORED_BUSINESS_TABLES,
     WhoScoredRepository,
+    _clean_unicode,
 )
 
 
@@ -87,6 +88,19 @@ def _commit(*, lineups=(), lineups_available=False) -> MatchCommit:
             "lineups": "available" if lineups else "empty",
         },
     )
+
+
+@pytest.mark.unit
+def test_invalid_json_surrogates_are_repaired_before_utf8_write():
+    pair = chr(0xD83C) + chr(0xDDE6)
+    lone = chr(0xD800)
+
+    cleaned = _clean_unicode("flag " + pair + " broken " + lone)
+
+    assert cleaned == "flag " + chr(0x1F1E6) + " broken �"
+    cleaned.encode("utf-8")
+    encoded = WhoScoredRepository._canonical_json({"player": pair + lone})
+    encoded.encode("utf-8")
 
 
 def _preview_commit(
@@ -392,6 +406,8 @@ def test_profile_current_view_matches_legacy_null_hashes_null_safely():
     assert "IS NOT DISTINCT FROM" not in profile_view
     assert "m.parser_version = p.parser_version" in profile_view
     assert "PARTITION BY player_id" in profile_view
+    assert "PARTITION BY p.player_id" in profile_view
+    assert "ORDER BY p.fetched_at DESC, p._ingested_at DESC" in profile_view
     assert "WHERE m.state = 'success'" in profile_view
     assert "JOIN latest m" in profile_view
     assert "m._profile_batch_id = p._profile_batch_id" in profile_view
@@ -793,6 +809,7 @@ def test_match_candidates_replay_parser_failures_only_after_parser_change():
     assert "m.state = 'terminal'" not in sql
     assert "m.state = 'success'" in sql
     assert "m.batch_id NOT LIKE 'ws2-%'" in sql
+    assert sql.count("m.parser_version IS DISTINCT FROM") >= 2
 
 
 @pytest.mark.unit
@@ -1205,6 +1222,30 @@ def test_match_parse_failure_manifest_keeps_raw_identity_for_offline_replay():
 
 
 @pytest.mark.unit
+def test_match_not_available_manifest_is_a_terminal_source_state():
+    writer = MagicMock()
+    repository = WhoScoredRepository(writer=writer, trino=MagicMock())
+
+    repository.record_failure(
+        ManifestFailure(
+            game_id=123,
+            league="WS-100-208",
+            season="2026",
+            state="not_available",
+            failure_code="source_not_available",
+            error="non-Opta match has no matchCentreData",
+            retry_after=None,
+            attempt_no=1,
+        )
+    )
+
+    row = writer.write_dataframe.call_args.args[0].iloc[0]
+    assert row["state"] == "not_available"
+    assert bool(row["is_final"]) is True
+    assert row["retry_after"] is None
+
+
+@pytest.mark.unit
 def test_scope_bundle_rejects_cross_scope_rows_before_publish():
     trino = MagicMock()
     writer = MagicMock()
@@ -1249,6 +1290,32 @@ def test_scope_bundle_authoritative_empty_cannot_shrink_published_snapshot():
         )
 
     writer.write_dataframe.assert_not_called()
+
+
+@pytest.mark.unit
+def test_scope_bundle_allows_expired_match_bets_to_shrink():
+    trino = MagicMock()
+    trino.execute_query.side_effect = [
+        [],
+        [('{"whoscored_match_bets":9}',)],
+        [],
+    ]
+    writer = MagicMock()
+    repository = WhoScoredRepository(writer=writer, trino=trino)
+
+    batch_id = repository.commit_scope_bundle(
+        league="WS-235-196",
+        season="2026",
+        entity_group="season",
+        datasets={"whoscored_match_bets": []},
+        distinct_keys={"whoscored_match_bets": "offer_key"},
+        payload_sha256="a" * 64,
+        raw_uris=["s3://raw/schedule.json.gz"],
+        source_empty={"whoscored_match_bets"},
+    )
+
+    assert batch_id.startswith("wss2-")
+    writer.write_dataframe.assert_called_once()
 
 
 @pytest.mark.unit

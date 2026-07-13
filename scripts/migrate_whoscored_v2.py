@@ -1137,7 +1137,18 @@ def build_shadow(
             f'CASE WHEN "{logical_batch_column}" LIKE '
             f"'{logical_batch_prefix}%' THEN \"{logical_batch_column}\" END"
         )
-    partition_by = ", ".join(partition_expressions)
+    source_partition_by = ", ".join(partition_expressions)
+    shadow_partition_expressions = list(partition_expressions)
+    if table == "whoscored_events" and "related_event_id" in columns:
+        shadow_partition_expressions = [
+            (
+                '"related_team_event_id"'
+                if expression == '"related_event_id"'
+                else expression
+            )
+            for expression in shadow_partition_expressions
+        ]
+    shadow_partition_by = ", ".join(shadow_partition_expressions)
     source_v2_batches = (
         _batch_counts(
             trino,
@@ -1168,9 +1179,9 @@ def build_shadow(
         where = f"league = {_literal(str(league))} AND season = {_literal(str(season))}"
         expected = _scalar(
             trino,
-            f"SELECT COUNT(*) FROM (SELECT {partition_by} "
+            f"SELECT COUNT(*) FROM (SELECT {source_partition_by} "
             f"FROM {_qualified(table)} WHERE {where} "
-            f"GROUP BY {partition_by}) AS source_groups",
+            f"GROUP BY {source_partition_by}) AS source_groups",
         )
         expected_by_scope.append((str(league), str(season), expected))
     expected_count = sum(item[2] for item in expected_by_scope)
@@ -1219,9 +1230,9 @@ def build_shadow(
                 )
                 duplicates = _scalar(
                     trino,
-                    f"SELECT COUNT(*) FROM (SELECT {partition_by}, COUNT(*) n "
+                    f"SELECT COUNT(*) FROM (SELECT {shadow_partition_by}, COUNT(*) n "
                     f"FROM {_qualified(shadow)} WHERE {where} "
-                    f"GROUP BY {partition_by} HAVING COUNT(*) > 1) "
+                    f"GROUP BY {shadow_partition_by} HAVING COUNT(*) > 1) "
                     "AS duplicate_groups",
                 )
                 duplicate_groups += duplicates
@@ -1267,7 +1278,7 @@ def build_shadow(
             FROM (
                 SELECT source_rows.*,
                        ROW_NUMBER() OVER (
-                           PARTITION BY {partition_by}
+                           PARTITION BY {source_partition_by}
                            ORDER BY _ingested_at DESC, _batch_id DESC
                        ) AS _migration_rank
                 FROM {_qualified(table)} source_rows
@@ -1283,8 +1294,8 @@ def build_shadow(
         )
         duplicates = _scalar(
             trino,
-            f"SELECT COUNT(*) FROM (SELECT {partition_by}, COUNT(*) n "
-            f"FROM {_qualified(shadow)} WHERE {where} GROUP BY {partition_by} "
+            f"SELECT COUNT(*) FROM (SELECT {shadow_partition_by}, COUNT(*) n "
+            f"FROM {_qualified(shadow)} WHERE {where} GROUP BY {shadow_partition_by} "
             "HAVING COUNT(*) > 1) AS duplicate_groups",
         )
         if actual != expected or duplicates:

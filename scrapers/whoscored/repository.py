@@ -104,6 +104,13 @@ SCOPE_DATASET_TABLES = {
     "whoscored_referee_stage_stats",
 }
 
+# Betting offers are an expiring source snapshot: WhoScored removes providers
+# and prices after a match starts or finishes.  The physical Iceberg batches
+# remain append-only, while the current manifest is allowed to publish the
+# smaller source snapshot.  Other scope datasets retain the strict no-shrink
+# completeness guard.
+SCOPE_SHRINKABLE_DATASET_TABLES = {"whoscored_match_bets"}
+
 
 # The physical schema of every source business table is a source contract, not
 # an observation about whichever DataFrame happened to be written first.  Keep
@@ -405,6 +412,7 @@ WHOSCORED_BUSINESS_COLUMN_CONTRACTS: dict[str, dict[str, str]] = {
     "whoscored_events": {
         **_MATCH_IDENTITY_COLUMNS,
         "source_event_id": "BIGINT",
+        "opta_event_id": "BIGINT",
         "team_event_id": "BIGINT",
         "period": "VARCHAR",
         "minute": "BIGINT",
@@ -659,6 +667,30 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
+def _clean_unicode(value: str) -> str:
+    """Turn JSON surrogate pairs into valid Unicode and replace lone halves."""
+    try:
+        value.encode("utf-8")
+        return value
+    except UnicodeEncodeError:
+        return value.encode("utf-16-le", "surrogatepass").decode(
+            "utf-16-le", "replace"
+        )
+
+
+def _clean_json_unicode(value: Any) -> Any:
+    if isinstance(value, str):
+        return _clean_unicode(value)
+    if isinstance(value, Mapping):
+        return {
+            _clean_unicode(str(key)): _clean_json_unicode(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_clean_json_unicode(item) for item in value]
+    return value
+
+
 def _sql_string(value: str) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
@@ -888,7 +920,7 @@ class WhoScoredRepository:
     @classmethod
     def _canonical_json(cls, value: Any) -> str:
         return json.dumps(
-            value,
+            _clean_json_unicode(value),
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
@@ -989,8 +1021,13 @@ class WhoScoredRepository:
                     "Float64"
                 )
             elif data_type == "VARCHAR":
+                cleaned = result[column].map(
+                    lambda value: (
+                        value if pd.isna(value) else _clean_unicode(str(value))
+                    )
+                )
                 result[column] = pd.Series(
-                    pd.array(result[column], dtype=pd.ArrowDtype(pa.string())),
+                    pd.array(cleaned, dtype=pd.ArrowDtype(pa.string())),
                     index=result.index,
                 )
             else:  # Every supported contract type must have an explicit coercion.
@@ -1678,8 +1715,8 @@ class WhoScoredRepository:
             FROM (
                 SELECT p.*,
                        ROW_NUMBER() OVER (
-                           PARTITION BY player_id
-                           ORDER BY fetched_at DESC, _ingested_at DESC
+                           PARTITION BY p.player_id
+                           ORDER BY p.fetched_at DESC, p._ingested_at DESC
                        ) AS physical_rn
                 FROM {versions} p
                 JOIN latest m
@@ -2349,6 +2386,8 @@ class WhoScoredRepository:
                         OR m.batch_id NOT LIKE 'ws2-%'
                         OR m.raw_uri IS NULL
                         OR m.payload_sha256 IS NULL
+                        OR m.parser_version IS DISTINCT FROM
+                            {_sql_string(PARSER_VERSION)}
                         OR (
                             m.parser_version = {_sql_string(PARSER_VERSION)}
                             AND s.date >= CAST(
@@ -2605,7 +2644,11 @@ class WhoScoredRepository:
             # published.  Corrections that genuinely remove source rows must
             # be replayed explicitly after review instead of being accepted by
             # an unattended daily run.
-            if old_count and new_count < old_count:
+            if (
+                table not in SCOPE_SHRINKABLE_DATASET_TABLES
+                and old_count
+                and new_count < old_count
+            ):
                 raise ValueError(
                     f"{table} completeness guard: new={new_count}, old={old_count}, "
                     "published snapshot cannot shrink"
@@ -2647,13 +2690,23 @@ class WhoScoredRepository:
                         )
                     )
             frame = self._normalise_frame_types(frame, table=table)
-            self.writer.write_dataframe(
-                frame,
-                database=self.schema,
-                table=table,
-                partition_spec=[("league", "identity"), ("season", "identity")],
-                source="whoscored",
+            table_lock = (
+                ("scope-table:whoscored_player_stage_stats",)
+                if table == "whoscored_player_stage_stats"
+                else ()
             )
+            with self._commit_locks(table_lock):
+                self.writer.write_dataframe(
+                    frame,
+                    database=self.schema,
+                    table=table,
+                    partition_spec=[
+                        ("league", "identity"),
+                        ("season", "identity"),
+                    ],
+                    source="whoscored",
+                    bulk_arrow=(table == "whoscored_player_stage_stats"),
+                )
             physical = self._scope_batch_count(
                 table, league=league, season=season, batch_id=batch_id
             )
@@ -3621,7 +3674,12 @@ class WhoScoredRepository:
         return tuple(commit.batch_id for commit in ordered)
 
     def record_failure(self, failure: ManifestFailure) -> None:
-        if failure.state not in {"retryable", "terminal", "parse_failed"}:
+        if failure.state not in {
+            "retryable",
+            "terminal",
+            "parse_failed",
+            "not_available",
+        }:
             raise ValueError(f"unsupported manifest failure state: {failure.state}")
         if failure.state == "retryable" and failure.retry_after is None:
             raise ValueError("retryable match failure requires retry_after")
