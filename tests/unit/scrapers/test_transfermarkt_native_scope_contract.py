@@ -181,7 +181,7 @@ def test_listing_url_preserves_discovered_source_route(competition_id, route):
     url = _competition_listing_url(record, 2026)
     parsed = urlsplit(url)
 
-    assert parsed.hostname == "www.transfermarkt.us"
+    assert parsed.hostname == "www.transfermarkt.com"
     assert f"/{route}/{competition_id}/" in parsed.path
     assert parse_qs(parsed.query) == {"saison_id": ["2026"]}
 
@@ -233,7 +233,7 @@ def test_global_market_value_and_transfer_rows_retain_scope_lineage(monkeypatch)
         assert row["source_edition_id"] == "2025"
         assert row["scope_id"] == expected_scope
         assert row["cycle_id"] == "cycle-global"
-        assert row["source_url"].startswith("https://www.transfermarkt.us/")
+        assert row["source_url"].startswith("https://www.transfermarkt.com/")
         assert "league" not in frame.columns
         assert "season" not in frame.columns
 

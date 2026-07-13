@@ -22,7 +22,7 @@ with the JSON endpoints that the live site now exposes:
 See ``scripts/research/bench_transfermarkt_fetch.py`` for the bounded live
 benchmark that validates the production transport and parser contracts.
 
-Source: https://www.transfermarkt.us
+Source: https://www.transfermarkt.com
 """
 
 from __future__ import annotations
@@ -69,8 +69,10 @@ logger = logging.getLogger(__name__)
 # Endpoints & constants
 # ---------------------------------------------------------------------------
 
-# .us mirror is the most stable English-language host; same content as .com.
-_TM_BASE = "https://www.transfermarkt.us"
+# The .com host is what the registry crawl reads and what every residential
+# exit serves reliably; the .us mirror carries the same English content but a
+# share of exits cannot reach it, which exhausts a scope's retries.
+_TM_BASE = "https://www.transfermarkt.com"
 
 # {club_slug}/kader/verein/{club_id}/saison_id/{year}/plus/1  (the /plus/1
 # variant exposes the wider, detailed squad table — same selector contract
@@ -159,10 +161,8 @@ def _competition_listing_url(
         raise TransfermarktError(
             f'{competition.competition_id}: source_url has no path'
         )
-    # The .us mirror is the scraper's stable English host; source_url remains
-    # the exact .com lineage value in Bronze.
     return urlunsplit((
-        'https', 'www.transfermarkt.us', f'{path}/plus/',
+        'https', 'www.transfermarkt.com', f'{path}/plus/',
         f'saison_id={edition_id}', '',
     ))
 
