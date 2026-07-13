@@ -405,6 +405,7 @@ WHOSCORED_BUSINESS_COLUMN_CONTRACTS: dict[str, dict[str, str]] = {
     "whoscored_events": {
         **_MATCH_IDENTITY_COLUMNS,
         "source_event_id": "BIGINT",
+        "opta_event_id": "BIGINT",
         "team_event_id": "BIGINT",
         "period": "VARCHAR",
         "minute": "BIGINT",
@@ -659,6 +660,30 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
+def _clean_unicode(value: str) -> str:
+    """Turn JSON surrogate pairs into valid Unicode and replace lone halves."""
+    try:
+        value.encode("utf-8")
+        return value
+    except UnicodeEncodeError:
+        return value.encode("utf-16-le", "surrogatepass").decode(
+            "utf-16-le", "replace"
+        )
+
+
+def _clean_json_unicode(value: Any) -> Any:
+    if isinstance(value, str):
+        return _clean_unicode(value)
+    if isinstance(value, Mapping):
+        return {
+            _clean_unicode(str(key)): _clean_json_unicode(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_clean_json_unicode(item) for item in value]
+    return value
+
+
 def _sql_string(value: str) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
@@ -888,7 +913,7 @@ class WhoScoredRepository:
     @classmethod
     def _canonical_json(cls, value: Any) -> str:
         return json.dumps(
-            value,
+            _clean_json_unicode(value),
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
@@ -989,8 +1014,13 @@ class WhoScoredRepository:
                     "Float64"
                 )
             elif data_type == "VARCHAR":
+                cleaned = result[column].map(
+                    lambda value: (
+                        value if pd.isna(value) else _clean_unicode(str(value))
+                    )
+                )
                 result[column] = pd.Series(
-                    pd.array(result[column], dtype=pd.ArrowDtype(pa.string())),
+                    pd.array(cleaned, dtype=pd.ArrowDtype(pa.string())),
                     index=result.index,
                 )
             else:  # Every supported contract type must have an explicit coercion.
@@ -2647,13 +2677,23 @@ class WhoScoredRepository:
                         )
                     )
             frame = self._normalise_frame_types(frame, table=table)
-            self.writer.write_dataframe(
-                frame,
-                database=self.schema,
-                table=table,
-                partition_spec=[("league", "identity"), ("season", "identity")],
-                source="whoscored",
+            table_lock = (
+                ("scope-table:whoscored_player_stage_stats",)
+                if table == "whoscored_player_stage_stats"
+                else ()
             )
+            with self._commit_locks(table_lock):
+                self.writer.write_dataframe(
+                    frame,
+                    database=self.schema,
+                    table=table,
+                    partition_spec=[
+                        ("league", "identity"),
+                        ("season", "identity"),
+                    ],
+                    source="whoscored",
+                    bulk_arrow=(table == "whoscored_player_stage_stats"),
+                )
             physical = self._scope_batch_count(
                 table, league=league, season=season, batch_id=batch_id
             )

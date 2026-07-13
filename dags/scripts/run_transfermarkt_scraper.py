@@ -893,6 +893,41 @@ def _load_data_derived_state(
     return derived
 
 
+def _load_response_cache() -> tuple[Optional[Dict[str, Any]], Optional[str], Optional[float]]:
+    """Return the scope's durable page cache, its path and TTL.
+
+    A league can exceed one cycle's byte cap, so a cycle finishes what the
+    previous one paid for instead of re-fetching it. A corrupt cache is an
+    ordinary miss.
+    """
+
+    path = os.environ.get('TM_RESPONSE_CACHE_PATH')
+    if not path:
+        return None, None, None
+    ttl = float(os.environ.get('TM_RESPONSE_CACHE_TTL_SECONDS') or 0) or None
+    try:
+        with open(path, encoding='utf-8') as handle:
+            cache = json.load(handle)
+        if not isinstance(cache, dict):
+            cache = {}
+    except (OSError, ValueError):
+        cache = {}
+    return cache, path, ttl
+
+
+def _persist_response_cache(cache: Optional[Dict[str, Any]], path: Optional[str]) -> None:
+    if cache is None or not path:
+        return
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        temporary = f'{path}.tmp'
+        with open(temporary, 'w', encoding='utf-8') as handle:
+            json.dump(cache, handle)
+        os.replace(temporary, path)
+    except OSError as exc:
+        logger.warning('could not persist the scope page cache: %s', exc)
+
+
 def _pending_checkpoint_roots() -> List[str]:
     """Preferred durable journal root followed by a local emergency fallback."""
     preferred = os.environ.get('TM_PENDING_CHECKPOINT_DIR', '/tmp')
@@ -2891,6 +2926,8 @@ def _run_entity(
     cycle_budget = None
     exit_code = 1
     scraper = None
+    response_cache: Optional[Dict[str, Any]] = None
+    cache_path: Optional[str] = None
     selected: Optional[List[str]] = None
     authoritative_frame = None
     checkpoint_frame = None
@@ -2938,9 +2975,12 @@ def _run_entity(
                 effective_bytes / MIB
             )
             results['cycle_budget'] = dict(cycle_budget)
+        response_cache, cache_path, cache_ttl = _load_response_cache()
         with TransfermarktScraper(
             leagues=[league], seasons=[season], proxy_file=proxy_file,
             retry_budget=retry_budget,
+            response_cache=response_cache,
+            cache_ttl_seconds=cache_ttl,
         ) as scraper:
             if spec.state_endpoint:
                 checkpoint_spec = spec
@@ -3397,6 +3437,9 @@ def _run_entity(
             )
         exit_code = 1
     finally:
+        # Persist even when the cycle ran out of budget: those pages are paid
+        # for, and the next cycle needs them to finish the league.
+        _persist_response_cache(response_cache, cache_path)
         if scraper is not None:
             results['traffic'] = _normalise_traffic(scraper)
         traffic = results['traffic']

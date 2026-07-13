@@ -139,6 +139,7 @@ FIELD_RULES: Mapping[str, tuple[FieldRule, ...]] = {
         FieldRule("content.hasPlayoff", FieldDisposition.RAW_ONLY, "match_raw", "UI flag mirroring competition playoff structure"),
         FieldRule("content.attackingZones.*", FieldDisposition.RAW_ONLY, "match_raw", "attacking-zones widget retained raw pending explicit modelling"),
         FieldRule("content.heatmapUrl", FieldDisposition.RAW_ONLY, "match_raw", "external heatmap asset link"),
+        FieldRule("content.weather.*", FieldDisposition.RAW_ONLY, "match_raw", "kickoff weather widget retained raw pending explicit modelling"),
         FieldRule("seo.*", FieldDisposition.RAW_ONLY, "match_raw", "SEO/JSON-LD page markup"),
         FieldRule("nav.*", FieldDisposition.RAW_ONLY, "match_raw", "UI navigation metadata"),
         FieldRule("hasPendingVAR", FieldDisposition.RAW_ONLY, "match_raw", "live VAR UI flag; matches are ingested finished"),
