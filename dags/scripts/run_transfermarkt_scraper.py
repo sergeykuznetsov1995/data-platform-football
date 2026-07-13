@@ -120,9 +120,9 @@ PRODUCTION_CYCLE_BUDGET_BYTES = 15 * MIB
 # DEFAULT_ENTITY_LIMITS.
 PRODUCTION_ENTITY_BUDGETS = {
     ENTITY_PLAYERS: {'decoded_mb': 10.0, 'requests': 60},
-    ENTITY_MV_HISTORY: {'decoded_mb': 4.0, 'requests': 120},
-    ENTITY_TRANSFERS: {'decoded_mb': 8.0, 'requests': 120},
-    ENTITY_COACHES: {'decoded_mb': 6.0, 'requests': 50},
+    ENTITY_MV_HISTORY: {'decoded_mb': 4.0, 'requests': 200},
+    ENTITY_TRANSFERS: {'decoded_mb': 8.0, 'requests': 200},
+    ENTITY_COACHES: {'decoded_mb': 6.0, 'requests': 80},
 }
 
 

@@ -111,9 +111,9 @@ OPS_WRITE_TABLES = {
 # room for the source's failure waves and the entity died mid-league.
 DEFAULT_ENTITY_LIMITS = {
     'players': {'decoded_bytes': 10 * MIB, 'requests': 60},
-    'market_value_history': {'decoded_bytes': 4 * MIB, 'requests': 120},
-    'transfers': {'decoded_bytes': 8 * MIB, 'requests': 120},
-    'coaches': {'decoded_bytes': 6 * MIB, 'requests': 50},
+    'market_value_history': {'decoded_bytes': 4 * MIB, 'requests': 200},
+    'transfers': {'decoded_bytes': 8 * MIB, 'requests': 200},
+    'coaches': {'decoded_bytes': 6 * MIB, 'requests': 80},
 }
 _APPROVAL_FLAGS = {
     '--approval-journal',
