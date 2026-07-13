@@ -410,6 +410,15 @@ class TestParseMvHistory:
         assert _parse_mv_history(None, '1') == []  # type: ignore[arg-type]
 
 
+class TestParseDates:
+    def test_the_day_first_rendering_of_the_com_host_is_understood(self):
+        from scrapers.transfermarkt.scraper import _parse_tm_date
+
+        # A day past the 12th proves which number the host puts first.
+        assert _parse_tm_date('17/08/1993 (31)') == date(1993, 8, 17)
+        assert _parse_tm_date('Aug 17, 1993') == date(1993, 8, 17)
+
+
 class TestParseTransfers:
     def test_the_machine_date_wins_over_the_hosts_rendering_of_it(self):
         # .com renders 27 July 2020 as "27/07/2020" and .us as "Jul 27, 2020";
