@@ -617,7 +617,7 @@ def test_hung_browser_start_kills_only_its_own_browser_processes(monkeypatch):
 
     transport = CamoufoxFbrefTransport(proxy={"server": "http://p:1"})
     browser = _FakeChild("camoufox-bin")
-    driver = _FakeChild("node")
+    driver = _FakeChild("node")  # playwright's driver — must survive
     unrelated = _FakeChild("postgres")
 
     process = MagicMock()
@@ -626,7 +626,10 @@ def test_hung_browser_start_kills_only_its_own_browser_processes(monkeypatch):
 
     transport._kill_browser_processes()
 
-    assert browser.killed and driver.killed
+    assert browser.killed
+    # Killing playwright's driver severs the connection every later session in
+    # this process needs: production then failed every navigation instantly.
+    assert not driver.killed
     assert not unrelated.killed
     assert transport.traffic_stats()["browser_watchdog_kills"] == 1
 
