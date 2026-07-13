@@ -59,6 +59,7 @@ from scrapers.transfermarkt.registry import (
     canonical_season,
     deterministic_scope_id,
     resolve_competition,
+    season_window_year,
 )
 from scrapers.utils.proxy_manager import ProxyManager
 from scrapers.utils.rate_limiter import RateLimiter
@@ -1190,7 +1191,7 @@ def materialize_legacy_market_value_history(
     points: pd.DataFrame,
     league: str,
     season,
-    season_format: SeasonFormat | str = SeasonFormat.SPLIT_YEAR,
+    season_format: SeasonFormat | str,
 ) -> pd.DataFrame:
     """Pure global-point → legacy scrape-partition projection."""
 
@@ -1209,7 +1210,7 @@ def materialize_legacy_transfers(
     events: pd.DataFrame,
     league: str,
     season,
-    season_format: SeasonFormat | str = SeasonFormat.SPLIT_YEAR,
+    season_format: SeasonFormat | str,
 ) -> pd.DataFrame:
     """Pure global-event → legacy scrape-partition projection.
 
@@ -1233,7 +1234,7 @@ def materialize_legacy_coaches(
     stints: pd.DataFrame,
     league: str,
     season,
-    season_format: SeasonFormat | str = SeasonFormat.SPLIT_YEAR,
+    season_format: SeasonFormat | str,
 ) -> pd.DataFrame:
     """Pure global profile/stint → legacy league-season coach projection."""
 
@@ -1483,6 +1484,9 @@ class TransfermarktScraper(BaseScraper):
             'edition_id': edition,
             'season_format': record.season_format,
             'canonical_season': canonical,
+            'season_year': season_window_year(
+                edition, record.season_format, canonical,
+            ),
             'compatibility_league': (
                 record.canonical_competition_id
                 or f'TM-{record.competition_id}'
@@ -2380,6 +2384,10 @@ class TransfermarktScraper(BaseScraper):
         scope = self._resolve_scope(league, season)
         competition = scope['record']
         league = scope['compatibility_league']
+        # A stint is dated, so the window it must overlap is the season the
+        # registry states — never the saison_id, which the source offsets from
+        # it for calendar leagues.
+        season = scope['season_year']
         self._begin_operation_budget('coaches')
 
         def _empty_bundle() -> Dict[str, pd.DataFrame]:
@@ -2518,6 +2526,10 @@ class TransfermarktScraper(BaseScraper):
                     'role': stint['role'],
                     'club_id': stint['club_id'],
                     'current_club_name': club['club_name'],
+                    # The club's history page is what proves this coach worked
+                    # here; a profile fetch, when it succeeds, supersedes it.
+                    '_source_url': history_url,
+                    '_source_body_hash': history_hash,
                 })
 
         if not managers:
@@ -2547,9 +2559,12 @@ class TransfermarktScraper(BaseScraper):
         if coach_profile_cache is None:
             known_bios = self._resolve_coach_bios_from_bronze()
         else:
+            # An identity row carries no bio, so it is not one to reuse.
             known_bios = {
                 str(coach_id): dict(profile)
                 for coach_id, profile in coach_profile_cache.items()
+                if profile.get('dob') is not None
+                or profile.get('nationality') is not None
             }
         resolved_bios: Dict[str, Dict] = dict(known_bios)
         unique_managers = list({
@@ -2584,7 +2599,11 @@ class TransfermarktScraper(BaseScraper):
                             f"failures at {idx}/{len(unique_managers)} — aborting to "
                             f"protect existing partition"
                         )
-                    continue
+                    # His history page named him, so he existed here whether or
+                    # not his bio page answered.  The row states the identity
+                    # and leaves the bio empty; ``_resolve_coach_bios_from_bronze``
+                    # reads no bio out of it, so the next cycle refetches.
+                    bio = {}
                 else:
                     consecutive_failures = 0
                     successes += 1
@@ -2898,7 +2917,7 @@ class TransfermarktScraper(BaseScraper):
         )
         scope = self._resolve_scope(league, season)
         return materialize_legacy_market_value_history(
-            points, scope['compatibility_league'], season,
+            points, scope['compatibility_league'], scope['season_year'],
             scope['season_format'],
         )
 
@@ -2953,7 +2972,7 @@ class TransfermarktScraper(BaseScraper):
         )
         scope = self._resolve_scope(league, season)
         return materialize_legacy_transfers(
-            events, scope['compatibility_league'], season,
+            events, scope['compatibility_league'], scope['season_year'],
             scope['season_format'],
         )
 

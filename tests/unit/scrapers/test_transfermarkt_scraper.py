@@ -1355,7 +1355,7 @@ class TestNativeCareerFacts:
             'ENG-Premier League', 2025, player_ids=['9'],
         )
         legacy = materialize_legacy_market_value_history(
-            points, 'ENG-Premier League', 2025,
+            points, 'ENG-Premier League', 2025, SeasonFormat.SPLIT_YEAR,
         )
 
         assert len(points) == 1
@@ -1382,7 +1382,7 @@ class TestNativeCareerFacts:
             'ENG-Premier League', 2025, player_ids=['9'],
         )
         legacy = materialize_legacy_transfers(
-            events, 'ENG-Premier League', 2025,
+            events, 'ENG-Premier League', 2025, SeasonFormat.SPLIT_YEAR,
         )
 
         assert events.iloc[0]['event_season'] == '2021'
@@ -1664,3 +1664,125 @@ class TestMoneyLocale:
         assert _parse_tm_money_eur('-') is None
         assert _parse_tm_money_eur('?') is None
         assert _parse_tm_money_eur('€0') == 0
+
+
+class TestCalendarLeagueSeason:
+    """The source offsets a calendar league's saison_id from the season it
+    prints (saison_id 2023 is the 2024 season).  Every dated projection —
+    the coach-stint window and the legacy season key — must be dated by the
+    season the registry states, or three of the four legacy tables land under
+    a season the league never played.
+    """
+
+    @staticmethod
+    def _calendar_record():
+        from scrapers.transfermarkt.registry import (
+            CompetitionType, TeamType, _bootstrap_record,
+        )
+
+        return _bootstrap_record(
+            competition_id='2DVB',
+            slug='2-division-b',
+            name='Second League Division B',
+            country='Russia',
+            confederation='UEFA',
+            competition_type=CompetitionType.DOMESTIC_LEAGUE,
+            team_type=TeamType.CLUB,
+            season_format=SeasonFormat.SINGLE_YEAR,
+            source_url=(
+                'https://www.transfermarkt.com/2-division-b/startseite/'
+                'wettbewerb/2DVB'
+            ),
+            canonical_competition_id='TM-2DVB',
+        )
+
+    def test_the_registered_season_dates_the_window_a_saison_id_would_misdate(
+        self,
+    ):
+        from scrapers.transfermarkt.registry import season_window_year
+
+        assert season_window_year('2023', SeasonFormat.SINGLE_YEAR, '2024') == 2024
+        # A split-year season opens in the year its saison_id names.
+        assert season_window_year('2025', SeasonFormat.SPLIT_YEAR, '2526') == 2025
+
+    def test_a_stint_in_the_registered_season_survives_and_keys_that_season(
+        self, monkeypatch,
+    ):
+        import scrapers.transfermarkt.scraper as tm
+
+        scraper = TransfermarktScraper(
+            competition_records=(self._calendar_record(),),
+            canonical_season='2024',
+        )
+        memberships = pd.DataFrame([
+            {'club_id': '1', 'club_slug': 'a', 'club_name': 'A'},
+        ])
+        # Autumn 2024: inside the 2024 calendar season, outside both the
+        # 2023 calendar year and the 2023/24 split year the saison_id names.
+        monkeypatch.setattr(tm, '_parse_coach_history', lambda html, club_id: [{
+            'coach_id': '10', 'coach_slug': 'coach', 'name': 'Coach',
+            'role': 'Manager', 'club_id': club_id,
+            'appointed_date': date(2024, 8, 1), 'left_date': date(2024, 12, 1),
+        }])
+        monkeypatch.setattr(tm, '_parse_coach_profile', lambda html, coach_id: {
+            'coach_id': coach_id, 'name': 'Coach Full',
+            'dob': date(1970, 1, 1), 'nationality': 'Russia',
+        })
+        monkeypatch.setattr(scraper, '_fetch_html', lambda *a, **k: '<html/>')
+
+        bundle = scraper.read_coach_data(
+            '2DVB', 2023, memberships=memberships, coach_profile_cache={},
+        )
+
+        legacy = bundle['legacy_coaches']
+        assert len(legacy) == 1
+        assert legacy.iloc[0]['season'] == '2024'
+        assert legacy.iloc[0]['league'] == 'TM-2DVB'
+
+    def test_a_coach_whose_bio_page_failed_is_still_a_coach(self, monkeypatch):
+        # His club's history page named him, so the legacy projection lists him
+        # with an empty bio.  Without an identity row on the native side the
+        # dual-write parity gate fails the whole scope over one lost page.
+        import scrapers.transfermarkt.scraper as tm
+
+        scraper = TransfermarktScraper(
+            competition_records=(self._calendar_record(),),
+            canonical_season='2024',
+        )
+        memberships = pd.DataFrame([
+            {'club_id': '1', 'club_slug': 'a', 'club_name': 'A'},
+        ])
+        # One page in twelve fails — under the mass-failure ratio that aborts
+        # the scrape, so the scope commits and the gap must be representable.
+        monkeypatch.setattr(tm, '_parse_coach_history', lambda html, club_id: [
+            {
+                'coach_id': str(index), 'coach_slug': f'coach-{index}',
+                'name': f'Coach {index}', 'role': 'Manager', 'club_id': club_id,
+                'appointed_date': date(2024, 8, 1), 'left_date': None,
+            }
+            for index in range(12)
+        ])
+        monkeypatch.setattr(tm, '_parse_coach_profile', lambda html, coach_id: {
+            'coach_id': coach_id, 'name': f'Coach {coach_id} Full',
+            'dob': date(1970, 1, 1), 'nationality': 'Russia',
+        })
+
+        def _fetch(url, label='html', context=None):
+            if label == 'coach_profile' and (context or {}).get('coach_id') == '7':
+                return None
+            return '<html/>'
+
+        monkeypatch.setattr(scraper, '_fetch_html', _fetch)
+
+        bundle = scraper.read_coach_data(
+            '2DVB', 2023, memberships=memberships, coach_profile_cache={},
+        )
+
+        profiles = bundle['profiles'].set_index('coach_id')
+        assert len(profiles) == 12
+        assert pd.isna(profiles.loc['7', 'dob'])
+        assert profiles.loc['7', 'name'] == 'Coach 7'
+        assert profiles.loc['3', 'name'] == 'Coach 3 Full'
+        # Both projections know every coach the source named — the parity gate
+        # compares them key for key.
+        assert set(bundle['legacy_coaches']['coach_id']) == set(profiles.index)
