@@ -354,3 +354,25 @@ def test_a_scope_cannot_understate_the_careers_it_still_owes():
     )
     honest.validate(EXPECTED)
     assert honest.digest != manifest.digest
+
+
+def test_a_manifest_written_before_coverage_existed_is_still_readable():
+    # The ops table holds manifests persisted by an older writer. They said
+    # nothing about the careers they still owed, which is not the same as
+    # lying about them — refusing to read them back locked the pipeline out
+    # of every scope it had already completed.
+    manifest = _manifest('GB1:2025')
+    older = {
+        key: value for key, value in manifest.dq_evidence.items()
+        if key not in {'roster_coverage', 'career_fetches_pending'}
+    }
+    dataclasses.replace(manifest, dq_evidence=older).validate(EXPECTED)
+
+    half = dict(older, roster_coverage={})
+    with pytest.raises(state.ScopeManifestError, match='both the entities'):
+        dataclasses.replace(manifest, dq_evidence=half).validate(EXPECTED)
+
+    with pytest.raises(state.ScopeManifestError, match='unbound field set'):
+        dataclasses.replace(
+            manifest, dq_evidence=dict(manifest.dq_evidence, smuggled=1),
+        ).validate(EXPECTED)
