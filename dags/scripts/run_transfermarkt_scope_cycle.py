@@ -104,8 +104,11 @@ OPS_WRITE_TABLES = {
     'iceberg.ops.proxy_traffic_runs',
     PROXY_LEDGER_TABLE,
 }
+# 'requests' counts attempts, not pages: a squad page that answers 504 twice
+# costs three. A 20-club league already needs ~21 pages, so 26 attempts left no
+# room for the source's failure waves and the entity died mid-league.
 DEFAULT_ENTITY_LIMITS = {
-    'players': {'decoded_bytes': 10 * MIB, 'requests': 26},
+    'players': {'decoded_bytes': 10 * MIB, 'requests': 60},
     'market_value_history': {'decoded_bytes': 4 * MIB, 'requests': 120},
     'transfers': {'decoded_bytes': 8 * MIB, 'requests': 120},
     'coaches': {'decoded_bytes': 6 * MIB, 'requests': 50},
