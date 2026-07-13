@@ -25,6 +25,7 @@ from scrapers.fbref.control import (
     ControlStore,
     FrontierTarget,
     SeasonRegistryEntry,
+    StateConflict,
     make_control_run_id,
     make_logical_refresh_id,
 )
@@ -1320,19 +1321,29 @@ class FBrefPipeline:
                 staging_identity=record.logical_refresh_id,
             )
         except Exception as exc:
-            self.control.record_dataset_manifest(
-                target_id=record.target_id,
-                content_hash=record.content_hash,
-                parser_version=PAGE_DOCUMENT_VERSION,
-                dataset="__page__",
-                availability=Availability.ERROR.value,
-                parse_status=("failed" if page.errors else "succeeded"),
-                persistence_status="failed",
-                validation_status="failed",
-                row_count=0,
-                error_class=type(exc).__name__,
-                error_message=str(exc),
-            )
+            try:
+                self.control.record_dataset_manifest(
+                    target_id=record.target_id,
+                    content_hash=record.content_hash,
+                    parser_version=PAGE_DOCUMENT_VERSION,
+                    dataset="__page__",
+                    availability=Availability.ERROR.value,
+                    parse_status=("failed" if page.errors else "succeeded"),
+                    persistence_status="failed",
+                    validation_status="failed",
+                    row_count=0,
+                    error_class=type(exc).__name__,
+                    error_message=str(exc),
+                )
+            except StateConflict:
+                # These exact bytes already have a completed manifest from an
+                # earlier parse by this exact parser; that evidence stands.
+                # Recording a failure over it must never replace the error that
+                # actually broke this parse — the diagnosis is what we need.
+                logger.warning(
+                    "Failure manifest for %s not recorded: the generic "
+                    "manifest is already completed", record.target_id,
+                )
             raise
         for table in page.tables:
             self.control.record_dataset_manifest(
