@@ -57,7 +57,14 @@ _EDITION_COLUMNS = (
 # keyed on the snapshot, so comparing the stamps would report every row as
 # mismatched.
 _RUN_STAMP_COLUMNS = frozenset(
-    {'fetched_at', 'cycle_id', 'scope_id', '_bronze_ingested_at', '_batch_id'}
+    {
+        'discovered_at',
+        'fetched_at',
+        'cycle_id',
+        'scope_id',
+        '_bronze_ingested_at',
+        '_batch_id',
+    }
 )
 _COMPETITION_CONTENT_COLUMNS = tuple(
     column for column in _COMPETITION_COLUMNS if column not in _RUN_STAMP_COLUMNS
