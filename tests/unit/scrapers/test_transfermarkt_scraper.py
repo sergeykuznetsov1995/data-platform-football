@@ -1581,3 +1581,48 @@ class TestNativeCoachContracts:
         assert len(bundle['stints']) == 2
         assert len(bundle['legacy_coaches']) == 2
         resolver.assert_not_called()
+
+
+class TestLegacyPlayerAgeParity:
+    def test_the_printed_age_survives_into_the_legacy_projection(self):
+        # The dual-write parity gate compares both projections' age. Recomputing
+        # it "as of now" over pages that may be a day old (the scope cache lives
+        # 24h) drifts by a year for anyone whose birthday fell in between.
+        from scrapers.transfermarkt.scraper import materialize_legacy_players
+
+        observations = pd.DataFrame([{
+            'player_id': '1', 'player_slug': 'x', 'name': 'X', 'position': 'CB',
+            'dob': date(1993, 8, 17), 'age': 31, 'height_cm': 180,
+            'foot': 'right', 'nationality': 'RU',
+            'contract_until': date(2026, 6, 30), 'market_value_eur': 100000,
+            'league': 'TM-2DVB', 'season': '2024', 'club_id': '12043',
+            'club_name': 'Dinamo',
+        }])
+        memberships = pd.DataFrame([{
+            'league': 'TM-2DVB', 'season': '2024', 'club_id': '12043',
+            'player_id': '1',
+        }])
+
+        legacy = materialize_legacy_players(memberships, observations)
+
+        assert legacy.iloc[0]['age'] == 31
+
+    def test_an_age_the_source_omits_is_derived_from_the_birth_date(self):
+        from scrapers.transfermarkt.scraper import materialize_legacy_players
+
+        observations = pd.DataFrame([{
+            'player_id': '1', 'player_slug': 'x', 'name': 'X', 'position': 'CB',
+            'dob': date(1993, 8, 17), 'age': None, 'height_cm': 180,
+            'foot': 'right', 'nationality': 'RU',
+            'contract_until': date(2026, 6, 30), 'market_value_eur': 100000,
+            'league': 'TM-2DVB', 'season': '2024', 'club_id': '12043',
+            'club_name': 'Dinamo',
+        }])
+        memberships = pd.DataFrame([{
+            'league': 'TM-2DVB', 'season': '2024', 'club_id': '12043',
+            'player_id': '1',
+        }])
+
+        legacy = materialize_legacy_players(memberships, observations)
+
+        assert legacy.iloc[0]['age'] > 30
