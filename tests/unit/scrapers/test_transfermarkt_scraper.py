@@ -393,16 +393,27 @@ class TestParseMvHistory:
         assert rows[0]['age'] == 16
         assert rows[1]['value_eur'] == 45_000_000
 
-    def test_datum_missing_falls_back_to_epoch_x(self):
-        # Epoch ms is UTC; TM's `datum_mw` is wall-clock CET. When we
-        # synthesise the date from `x` alone we land on the UTC day.
+    def test_the_epoch_is_midnight_in_the_sources_own_timezone(self):
+        # The epoch is midnight CET, which read as UTC lands on the day before.
         payload = {'list': [{
             'x': 1425250800000, 'y': 300000, 'mw': '€300k',
             'verein': 'Club', 'age': '16',
         }]}
         rows = _parse_mv_history(payload, '1')
         assert len(rows) == 1
-        assert rows[0]['mv_date'] == date(2015, 3, 1)
+        assert rows[0]['mv_date'] == date(2015, 3, 2)
+
+    def test_the_machine_date_wins_over_the_hosts_rendering_of_it(self):
+        # '03/05/2015' parses just as happily day-first as month-first; only the
+        # epoch says which one the source meant.
+        payload = {'list': [{
+            'x': 1425250800000, 'datum_mw': '03/05/2015', 'y': 300000,
+            'mw': '€300k', 'verein': 'Club', 'age': '16',
+        }]}
+
+        rows = _parse_mv_history(payload, '1')
+
+        assert rows[0]['mv_date'] == date(2015, 3, 2)
 
     def test_empty_list(self):
         assert _parse_mv_history({'list': []}, '1') == []
@@ -1626,3 +1637,30 @@ class TestLegacyPlayerAgeParity:
         legacy = materialize_legacy_players(memberships, observations)
 
         assert legacy.iloc[0]['age'] > 30
+
+
+class TestMoneyLocale:
+    def test_a_suffix_we_do_not_know_is_an_error_not_a_thousandfold_mistake(self):
+        from scrapers.transfermarkt.scraper import (
+            MoneyLocaleError, _parse_tm_money_eur,
+        )
+
+        assert _parse_tm_money_eur('€1,20 Mrd.') == 1_200_000_000
+        assert _parse_tm_money_eur('€900Th.') == 900_000
+        with pytest.raises(MoneyLocaleError, match='unknown magnitude'):
+            _parse_tm_money_eur('€500 gazillion')
+
+    def test_a_figure_in_another_currency_cannot_become_a_eur_column(self):
+        from scrapers.transfermarkt.scraper import (
+            MoneyLocaleError, _parse_tm_money_eur,
+        )
+
+        with pytest.raises(MoneyLocaleError, match='not EUR'):
+            _parse_tm_money_eur('$30.00m')
+
+    def test_the_absent_figures_stay_absent(self):
+        from scrapers.transfermarkt.scraper import _parse_tm_money_eur
+
+        assert _parse_tm_money_eur('-') is None
+        assert _parse_tm_money_eur('?') is None
+        assert _parse_tm_money_eur('€0') == 0

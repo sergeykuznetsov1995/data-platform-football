@@ -35,6 +35,7 @@ import os
 import re
 from collections import defaultdict
 from datetime import date, datetime, timezone
+from zoneinfo import ZoneInfo
 from decimal import Decimal, InvalidOperation
 from typing import Dict, List, Mapping, Optional, Tuple
 from urllib.parse import urlsplit, urlunsplit
@@ -205,7 +206,36 @@ def _coerce_int(raw) -> Optional[int]:
         return None
 
 
-_TM_MV_RE = re.compile(r'€\s*([\d.,]+)\s*(bn|k|m|b)?', re.IGNORECASE)
+# The currency symbol and the magnitude suffix are host/locale properties. A
+# figure in another currency cannot become a *_eur column, and a suffix we do
+# not know is a thousandfold error waiting to happen — both are schema errors,
+# never a silently wrong number.
+_TM_MONEY_RE = re.compile(
+    r'(?P<currency>€|£|\$|US\$)\s*(?P<amount>[\d.,]+)\s*(?P<unit>[A-Za-z.]*)',
+)
+_TM_MONEY_UNITS = {
+    '': 1,
+    'k': 1_000,
+    'th': 1_000,
+    'th.': 1_000,
+    'tsd': 1_000,
+    'tsd.': 1_000,
+    'thousand': 1_000,
+    'm': 1_000_000,
+    'mio': 1_000_000,
+    'mio.': 1_000_000,
+    'mill': 1_000_000,
+    'million': 1_000_000,
+    'b': 1_000_000_000,
+    'bn': 1_000_000_000,
+    'mrd': 1_000_000_000,
+    'mrd.': 1_000_000_000,
+    'billion': 1_000_000_000,
+}
+
+
+class MoneyLocaleError(TransfermarktError):
+    """The source stated a figure this parser must not guess at."""
 
 
 def _normalise_decimal_number(raw: str) -> Optional[Decimal]:
@@ -254,21 +284,21 @@ def _parse_tm_money_eur(raw) -> Optional[int]:
     if raw is None:
         return None
     s = str(raw)
-    m = _TM_MV_RE.search(s)
+    m = _TM_MONEY_RE.search(s)
     if not m:
         return None
-    num = _normalise_decimal_number(m.group(1))
+    currency = m.group('currency')
+    if currency != '€':
+        raise MoneyLocaleError(
+            f'source stated a figure in {currency}, not EUR: {s!r}'
+        )
+    num = _normalise_decimal_number(m.group('amount'))
     if num is None:
         return None
-    unit = (m.group(2) or '').lower()
-    multiplier = {
-        '': 1,
-        'k': 1_000,
-        'm': 1_000_000,
-        'b': 1_000_000_000,
-        'bn': 1_000_000_000,
-    }.get(unit, 1)
-    return int(num * Decimal(multiplier))
+    unit = (m.group('unit') or '').lower()
+    if unit not in _TM_MONEY_UNITS:
+        raise MoneyLocaleError(f'unknown magnitude suffix in {s!r}')
+    return int(num * Decimal(_TM_MONEY_UNITS[unit]))
 
 
 _HEIGHT_RE = re.compile(r'(\d+[,.]\d+)\s*m')
@@ -291,6 +321,28 @@ def _parse_height_cm(raw) -> Optional[int]:
 _TM_DATE_FORMATS = (
     '%b %d, %Y', '%B %d, %Y', '%Y-%m-%d', '%d.%m.%Y', '%d/%m/%Y',
 )
+
+
+# The market-value epoch is midnight in the source's own timezone; read as UTC
+# it lands on the previous day.
+_TM_TZ = ZoneInfo('Europe/Berlin')
+
+
+def _market_value_date(entry: Dict) -> Optional[date]:
+    """Read a market-value point's date from the machine field, not the rendered one.
+
+    ``datum_mw`` is localised by host, and a day-first rendering parses just as
+    happily as a month-first one — silently swapping day and month. The epoch in
+    ``x`` says the same date unambiguously.
+    """
+
+    x_ms = entry.get('x')
+    if isinstance(x_ms, (int, float)) and not isinstance(x_ms, bool):
+        try:
+            return datetime.fromtimestamp(float(x_ms) / 1000.0, _TM_TZ).date()
+        except (OSError, OverflowError, ValueError):
+            pass
+    return _parse_tm_date(entry.get('datum_mw'))
 
 
 def _transfer_date(entry: Dict) -> Optional[date]:
@@ -662,15 +714,7 @@ def _parse_mv_history(payload: dict, player_id: str) -> List[Dict]:
     for entry in payload.get('list') or []:
         if not isinstance(entry, dict):
             continue
-        mv_date = _parse_tm_date(entry.get('datum_mw'))
-        if mv_date is None:
-            # Fallback: derive from `x` epoch-ms.
-            x_ms = entry.get('x')
-            if isinstance(x_ms, (int, float)):
-                try:
-                    mv_date = datetime.utcfromtimestamp(x_ms / 1000.0).date()
-                except (OSError, OverflowError, ValueError):
-                    mv_date = None
+        mv_date = _market_value_date(entry)
         if mv_date is None:
             continue
         rows.append({
@@ -835,19 +879,8 @@ def _source_row_semantic_error(label: str, entry: Dict) -> Optional[str]:
     """Validate facts required to materialise a native career natural key."""
 
     if label in {'mv_history', 'market_value_points'}:
-        mv_date = _parse_tm_date(entry.get('datum_mw'))
-        if mv_date is None:
-            x_ms = entry.get('x')
-            if (
-                isinstance(x_ms, bool)
-                or not isinstance(x_ms, (int, float))
-                or not math.isfinite(float(x_ms))
-            ):
-                return 'market-value row has no valid date or epoch x'
-            try:
-                datetime.utcfromtimestamp(float(x_ms) / 1000.0)
-            except (OSError, OverflowError, ValueError):
-                return 'market-value row epoch x is outside the valid range'
+        if _market_value_date(entry) is None:
+            return 'market-value row has no valid date or epoch x'
 
         raw_value = entry.get('y')
         if isinstance(raw_value, bool) or raw_value is None:
