@@ -715,7 +715,7 @@ def test_fetch_wave_reserves_budget_and_commits_raw_before_control(tmp_path):
         control,
         raw,
         generic_writer=FakeWriter(),
-        fetcher_factory=lambda _: FakeFetcher(
+        fetcher_factory=lambda *_: FakeFetcher(
             control.events, html, http_requests=2
         ),
         sleep=lambda _: None,
@@ -758,7 +758,7 @@ def test_fetch_wave_persists_retry_failure_evidence_and_exact_request_count(
         control,
         raw,
         generic_writer=FakeWriter(),
-        fetcher_factory=lambda _: FakeFailingFetcher(control.events),
+        fetcher_factory=lambda *_: FakeFailingFetcher(control.events),
         sleep=lambda _: None,
         clock=lambda: NOW,
     )
@@ -807,7 +807,7 @@ def test_fetch_wave_recovers_committed_raw_without_constructing_transport(tmp_pa
         http_status=200,
     )
 
-    def forbidden(_):
+    def forbidden(*_):
         raise AssertionError("transport constructed during raw recovery")
 
     pipeline = FBrefPipeline(
@@ -876,7 +876,7 @@ def test_sequential_wave_renews_current_and_waiting_leases(tmp_path):
         control,
         raw,
         generic_writer=FakeWriter(),
-        fetcher_factory=lambda _: FakeFetcher(
+        fetcher_factory=lambda *_: FakeFetcher(
             control.events, b"<html>ok</html>"
         ),
         sleep=lambda _: None,
@@ -955,7 +955,7 @@ def test_one_shot_transition_refreshes_instead_of_adopting_prior_raw(
         control,
         raw,
         generic_writer=FakeWriter(),
-        fetcher_factory=lambda _: FakeFetcher(control.events, fresh),
+        fetcher_factory=lambda *_: FakeFetcher(control.events, fresh),
         sleep=lambda _: None,
         clock=lambda: NOW,
     )
@@ -990,7 +990,7 @@ def test_recurring_current_target_does_not_adopt_stale_v1_raw(tmp_path):
         control,
         raw,
         generic_writer=FakeWriter(),
-        fetcher_factory=lambda _: FakeFetcher(control.events, fresh),
+        fetcher_factory=lambda *_: FakeFetcher(control.events, fresh),
         sleep=lambda _: None,
         clock=lambda: NOW,
     )
@@ -1033,7 +1033,7 @@ def test_offline_index_parse_seeds_only_male_competitions(tmp_path):
         "logical_refresh_id": refresh,
     }]
 
-    def forbidden(_):
+    def forbidden(*_):
         raise AssertionError("offline parse constructed transport")
 
     pipeline = FBrefPipeline(
@@ -1122,7 +1122,7 @@ def test_current_history_parse_uses_exact_source_season_and_opaque_ids(tmp_path)
         "logical_refresh_id": refresh,
     }]
     pipeline = FBrefPipeline(
-        control, raw, generic_writer=FakeWriter(), fetcher_factory=lambda _: None
+        control, raw, generic_writer=FakeWriter(), fetcher_factory=lambda *_: None
     )
 
     result = pipeline.parse_wave(
@@ -2090,7 +2090,7 @@ def test_a_rejected_clearance_is_burned_instead_of_failing_every_target(tmp_path
         control,
         raw,
         generic_writer=FakeWriter(),
-        fetcher_factory=lambda _: FakeClearanceRejectedFetcher(control.events),
+        fetcher_factory=lambda *_: FakeClearanceRejectedFetcher(control.events),
         sleep=lambda _: None,
         clock=lambda: NOW,
     )
@@ -2148,7 +2148,7 @@ def test_a_run_that_hits_its_budget_requeues_its_targets_and_ends_clean(tmp_path
         control,
         raw,
         generic_writer=FakeWriter(),
-        fetcher_factory=lambda _: FakeFetcher(control.events, b"<html>ok</html>"),
+        fetcher_factory=lambda *_: FakeFetcher(control.events, b"<html>ok</html>"),
         sleep=lambda _: None,
         clock=lambda: NOW,
     )
@@ -2167,3 +2167,46 @@ def test_a_run_that_hits_its_budget_requeues_its_targets_and_ends_clean(tmp_path
         "fbref:competition:9",
         "fbref:competition:12",
     ]
+
+
+def test_the_browser_may_only_spend_the_requests_the_run_reserved(tmp_path):
+    """The bootstrap reservation is what the browser is allowed to spend, so it
+    also decides how many stalled exit IPs a wave can survive. Handing the
+    transport a cap the run never reserved is how a wave overspent its ceiling."""
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    captured = {}
+
+    def factory(proxy_file, max_browser_requests):
+        captured["proxy_file"] = proxy_file
+        captured["max_browser_requests"] = max_browser_requests
+        return FakeFetcher(control.events, b"<html>ok</html>")
+
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=factory,
+        sleep=lambda _: None,
+        clock=lambda: NOW,
+    )
+    settings = PipelineSettings(
+        run_type="current",
+        request_limit=200,
+        byte_limit=100 * 1024 * 1024,
+        shard_size=4,
+        request_reservation_bytes=7 * 1024 * 1024,
+        domain_interval_seconds=0.01,
+        bootstrap_request_reservation=80,
+        proxy_file="/opt/airflow/proxys.txt",
+    )
+
+    pipeline.fetch_wave(
+        str(uuid.UUID(int=1)),
+        worker_id="worker-1",
+        page_kinds=["competition_index"],
+        settings=settings,
+    )
+
+    assert captured["max_browser_requests"] == 80
+    assert control.reservations[0][1]["requests"] == 82

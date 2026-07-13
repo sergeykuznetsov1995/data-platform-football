@@ -225,6 +225,7 @@ class CamoufoxFbrefTransport:
         self._blocked_count = 0
         self._requests_count = 0
         self._network_requests_started = 0
+        self._billed_traffic: Dict[str, object] = {}
         self._browser_start_attempts = 0
         self._browser_watchdog_kills = 0
         self._navigation_attempts = 0
@@ -943,6 +944,32 @@ class CamoufoxFbrefTransport:
             return None
 
     # -- traffic stats ---------------------------------------------------- #
+    def traffic_delta(self) -> Dict[str, object]:
+        """Traffic since the previous call — one bootstrap, billed exactly once.
+
+        The counters are cumulative for the whole session, and the caller
+        charges what it reads to the target that triggered the bootstrap.
+        Charging the running totals made every later target of a wave pay again
+        for the same browser traffic: a wave with a failing clearance billed 140
+        requests for ~20 real ones and exhausted the run's request budget.
+        """
+        stats = self.traffic_stats()
+        baseline = self._billed_traffic
+        delta: Dict[str, object] = {}
+        for key, value in stats.items():
+            if isinstance(value, int) and not isinstance(value, bool):
+                delta[key] = value - int(baseline.get(key, 0) or 0)
+            else:
+                delta[key] = value
+        by_type = dict(stats.get("real_bytes_by_resource_type") or {})
+        billed_by_type = dict(baseline.get("real_bytes_by_resource_type") or {})
+        delta["real_bytes_by_resource_type"] = {
+            name: total - int(billed_by_type.get(name, 0) or 0)
+            for name, total in by_type.items()
+        }
+        self._billed_traffic = stats
+        return delta
+
     def traffic_stats(self) -> Dict[str, object]:
         """Snapshot for the scraper's _stats / traffic guard."""
         return {
