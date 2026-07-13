@@ -992,7 +992,11 @@ class TransfermarktHttpClient:
         url: str,
         *,
         as_json: bool,
-        max_attempts: int = 3,
+        # Residential exits and the source itself answer 502/504 for a large
+        # share of attempts; three tries lose a page outright often enough that
+        # a scope dies without fetching anything. The run-wide retry ledger,
+        # not this cap, is what actually bounds the paid traffic.
+        max_attempts: int = 6,
         label: str = "endpoint",
         context: Optional[Mapping[str, Any]] = None,
         validator: Optional[Callable[[Any], Optional[str]]] = None,

@@ -1682,7 +1682,7 @@ class TransfermarktScraper(BaseScraper):
         self,
         url: str,
         as_json: bool,
-        max_attempts: int = 3,
+        max_attempts: int = 6,
         label: str = 'endpoint',
         context: Optional[Dict] = None,
     ) -> FetchOutcome:
@@ -1710,7 +1710,7 @@ class TransfermarktScraper(BaseScraper):
         self,
         url: str,
         as_json: bool,
-        max_attempts: int = 3,
+        max_attempts: int = 6,
         label: str = 'endpoint',
         context: Optional[Dict] = None,
     ):
