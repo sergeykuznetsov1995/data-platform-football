@@ -110,10 +110,10 @@ OPS_WRITE_TABLES = {
 # costs three. A 20-club league already needs ~21 pages, so 26 attempts left no
 # room for the source's failure waves and the entity died mid-league.
 DEFAULT_ENTITY_LIMITS = {
-    'players': {'decoded_bytes': 10 * MIB, 'requests': 60},
+    'players': {'decoded_bytes': 10 * MIB, 'requests': 150},
     'market_value_history': {'decoded_bytes': 4 * MIB, 'requests': 200},
     'transfers': {'decoded_bytes': 8 * MIB, 'requests': 200},
-    'coaches': {'decoded_bytes': 6 * MIB, 'requests': 80},
+    'coaches': {'decoded_bytes': 6 * MIB, 'requests': 160},
 }
 _APPROVAL_FLAGS = {
     '--approval-journal',

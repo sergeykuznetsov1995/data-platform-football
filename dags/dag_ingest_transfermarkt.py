@@ -33,9 +33,11 @@ PENDING_CHECKPOINT_DIR = '/opt/airflow/logs/transfermarkt-checkpoints'
 APPROVAL_JOURNAL = '/opt/airflow/logs/transfermarkt-approvals/journal.json'
 PROVIDER_HARD_CAP_BYTES = 15 * 1024 * 1024
 PROVIDER_SOFT_STOP_BYTES = 14 * 1024 * 1024
-# One source-wide ceiling over the per-entity attempt budgets (60 + 200 + 200 +
-# 80). Attempts, not pages: the source answers 502 for roughly a third of them.
-PROXY_REQUEST_LIMIT = 540
+# One source-wide ceiling over the per-entity attempt budgets (150 + 200 + 200
+# + 160). Attempts, not pages: the biggest leagues run to ~60 clubs and the
+# source answers 502/504 for a third to a half of the attempts in a bad wave.
+# The 15 MiB byte cap still stops a cycle long before these do.
+PROXY_REQUEST_LIMIT = 710
 # Cycle-wide retry ledger: the source answers 502/504 in waves, and a scope
 # fetches dozens of pages, so a handful of retries dies on the first two. A
 # failed attempt costs ~10 KiB against the 15 MiB cap, which is the real bound.
