@@ -70,7 +70,6 @@ from scrapers.fbref.raw_store import (
     season_page_target,
 )
 from scrapers.fbref.settings import (
-    DEFAULT_BOOTSTRAP_REQUEST_RESERVATION,
     DEFAULT_BYTE_LIMIT,
     DEFAULT_DOMAIN_INTERVAL_SECONDS,
     DEFAULT_REQUEST_LIMIT,
@@ -78,6 +77,7 @@ from scrapers.fbref.settings import (
     DEFAULT_SHARD_SIZE,
     MAX_SHARD_SIZE,
     MIB,
+    bootstrap_reservation_for,
 )
 from scrapers.fbref.typed_bronze import (
     TYPED_BRONZE_PARSER_VERSION,
@@ -148,13 +148,20 @@ class PipelineSettings:
     shard_size: int = DEFAULT_SHARD_SIZE
     request_reservation_bytes: int = DEFAULT_REQUEST_RESERVATION_BYTES
     domain_interval_seconds: float = DEFAULT_DOMAIN_INTERVAL_SECONDS
-    bootstrap_request_reservation: int = (
-        DEFAULT_BOOTSTRAP_REQUEST_RESERVATION
-    )
+    bootstrap_request_reservation: Optional[int] = None
     target_request_reservation: int = MAX_TARGET_HTTP_ATTEMPTS
     proxy_file: Optional[str] = None
 
     def __post_init__(self) -> None:
+        if self.bootstrap_request_reservation is None:
+            # Derived from the run's own budget, so the fetch wave's subprocess
+            # (which rebuilds settings from the command line) spends exactly
+            # what this run reserved for its browser.
+            object.__setattr__(
+                self,
+                "bootstrap_request_reservation",
+                bootstrap_reservation_for(self.request_limit),
+            )
         if self.run_type not in {"current", "backfill", "replay"}:
             raise ValueError("run_type must be current, backfill, or replay")
         if self.request_limit < 0 or self.byte_limit < 0:
@@ -745,10 +752,14 @@ class FBrefPipeline:
         if not leases:
             summary = self.control.get_run_summary(run_id) or {}
             target_counts = summary.get("target_counts") or {}
+            # 'skipped' is a target this run handed back to the queue when it
+            # stopped at its budget. Counting it as unfinished made the wave
+            # after the budget stop raise instead of no-opping, so a run that
+            # spent its budget still went red.
             unfinished = sum(
                 int(count)
                 for status, count in target_counts.items()
-                if status != "succeeded"
+                if status not in {"succeeded", "skipped"}
             )
             if unfinished:
                 raise FetchWaveError(

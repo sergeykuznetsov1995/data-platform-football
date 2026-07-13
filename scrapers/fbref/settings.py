@@ -26,6 +26,23 @@ DEFAULT_BOOTSTRAP_REQUEST_RESERVATION = DEFAULT_BROWSER_REQUESTS_PER_SOLVE
 # budget covers four attempts, and the reservation is released on settlement, so
 # a healthy bootstrap still only bills ~19.
 INGEST_BOOTSTRAP_REQUEST_RESERVATION = DEFAULT_BROWSER_REQUESTS_PER_SOLVE * 4
+
+
+def bootstrap_reservation_for(request_limit: int) -> int:
+    """How many requests the browser may spend on one clearance, for this run.
+
+    Derived from the run's own budget so that every caller agrees — the fetch
+    wave runs in a subprocess that rebuilds its settings from the command line,
+    so a reservation computed only in the DAG never reached the browser at all.
+    A run must be able to pay for its clearance twice over before it is allowed
+    to retry a stalled exit IP; the 25-request backfill therefore gets exactly
+    one solve, and the 200-request daily run gets four.
+    """
+    return (
+        INGEST_BOOTSTRAP_REQUEST_RESERVATION
+        if int(request_limit) >= INGEST_BOOTSTRAP_REQUEST_RESERVATION * 2
+        else DEFAULT_BOOTSTRAP_REQUEST_RESERVATION
+    )
 MAX_SHARD_SIZE = 25
 
 
@@ -33,6 +50,7 @@ __all__ = [
     "DEFAULT_BOOTSTRAP_REQUEST_RESERVATION",
     "DEFAULT_BROWSER_REQUESTS_PER_SOLVE",
     "INGEST_BOOTSTRAP_REQUEST_RESERVATION",
+    "bootstrap_reservation_for",
     "DEFAULT_BROWSER_BYTE_LIMIT_BYTES",
     "DEFAULT_BYTE_LIMIT",
     "DEFAULT_DOMAIN_INTERVAL_SECONDS",

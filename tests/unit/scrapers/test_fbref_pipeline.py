@@ -2210,3 +2210,49 @@ def test_the_browser_may_only_spend_the_requests_the_run_reserved(tmp_path):
 
     assert captured["max_browser_requests"] == 80
     assert control.reservations[0][1]["requests"] == 82
+
+
+def test_a_wave_after_the_budget_stop_no_ops_instead_of_raising(tmp_path):
+    """The wave that follows a budget stop claims nothing, because the run handed
+    its targets back to the queue. Counting those 'skipped' targets as unfinished
+    made it raise — so a run that spent its budget still went red."""
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.claim_targets = lambda *args, **kwargs: []
+    control.create_due_run_cohort = lambda *args, **kwargs: []
+    control.get_run_summary = lambda *args, **kwargs: {
+        "target_counts": {"succeeded": 11, "skipped": 14},
+    }
+
+    def forbidden(*_):
+        raise AssertionError("no fetcher for an empty wave")
+
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=forbidden,
+        sleep=lambda _: None,
+        clock=lambda: NOW,
+    )
+
+    result = pipeline.fetch_wave(
+        str(uuid.UUID(int=1)),
+        worker_id="worker-1",
+        page_kinds=["competition"],
+        settings=_settings(),
+    )
+
+    assert result.claimed == 0
+    assert result.failures == []
+
+
+def test_the_bootstrap_allowance_follows_the_run_budget_everywhere():
+    """The fetch wave runs in a subprocess that rebuilds its settings from the
+    command line, so an allowance computed only in the DAG never reached the
+    browser. Deriving it from the run's own budget keeps every caller in step."""
+    daily = PipelineSettings(run_type="current", request_limit=200)
+    backfill = PipelineSettings(run_type="backfill", request_limit=25)
+
+    assert daily.bootstrap_request_reservation == 80
+    assert backfill.bootstrap_request_reservation == 20
