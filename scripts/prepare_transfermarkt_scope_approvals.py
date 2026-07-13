@@ -229,6 +229,22 @@ def build_plan(
     if not plan.mapped_payloads:
         raise ValueError("promoted registry produced no due scope")
 
+    if not scopes:
+        # The payload states how the batch was selected (its selection hash, the
+        # due remainder, whether a continuation is owed), and the DAG re-plans
+        # from the exact scopes this conf names. Packets are bound to the child's
+        # argv byte for byte, so they must be built from that same second plan.
+        params["scopes"] = [
+            f'{item["competition_id"]}:{item["edition_id"]}'
+            for item in plan.mapped_payloads
+        ]
+        plan = plan_transfermarkt_scopes(
+            params,
+            parent_cycle_id=parent_cycle_id,
+            registry_rows=registry_rows,
+            max_batch_size=max_batch,
+        )
+
     # A scope is crawled again every refresh cycle, and a one-shot packet id can
     # never be reused, so the packet belongs to the (parent cycle, scope) pair.
     cycle_tag = hashlib.sha256(parent_cycle_id.encode()).hexdigest()[:12]
