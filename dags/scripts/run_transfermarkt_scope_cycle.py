@@ -113,7 +113,7 @@ DEFAULT_ENTITY_LIMITS = {
     'players': {'decoded_bytes': 10 * MIB, 'requests': 150},
     'market_value_history': {'decoded_bytes': 4 * MIB, 'requests': 200},
     'transfers': {'decoded_bytes': 8 * MIB, 'requests': 200},
-    'coaches': {'decoded_bytes': 6 * MIB, 'requests': 160},
+    'coaches': {'decoded_bytes': 14 * MIB, 'requests': 160},
 }
 _APPROVAL_FLAGS = {
     '--approval-journal',
