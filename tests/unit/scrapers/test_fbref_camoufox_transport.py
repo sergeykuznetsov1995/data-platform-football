@@ -595,3 +595,77 @@ def test_clearance_requires_cf_cookie():
     transport._page = page
 
     assert transport.get_clearance() is None
+
+
+class _FakeChild:
+    def __init__(self, name: str) -> None:
+        self._name = name
+        self.killed = False
+
+    def name(self) -> str:
+        return self._name
+
+    def kill(self) -> None:
+        self.killed = True
+
+
+def test_hung_browser_start_kills_only_its_own_browser_processes(monkeypatch):
+    """Camoufox's launch never times out on a dead exit IP, so the watchdog
+    kills the browser it spawned — that is what makes the launch raise and the
+    caller rotate onto a fresh proxy."""
+    import psutil
+
+    transport = CamoufoxFbrefTransport(proxy={"server": "http://p:1"})
+    browser = _FakeChild("camoufox-bin")
+    driver = _FakeChild("node")
+    unrelated = _FakeChild("postgres")
+
+    process = MagicMock()
+    process.children.return_value = [browser, driver, unrelated]
+    monkeypatch.setattr(psutil, "Process", lambda: process)
+
+    transport._kill_browser_processes()
+
+    assert browser.killed and driver.killed
+    assert not unrelated.killed
+    assert transport.traffic_stats()["browser_start_timeouts"] == 1
+
+
+def test_browser_start_watchdog_is_disarmed_once_the_browser_is_up(monkeypatch):
+    """A healthy start must not leave a timer that kills a working session."""
+    timers = []
+
+    class _Timer:
+        def __init__(self, interval, function):
+            self.interval = interval
+            self.function = function
+            self.cancelled = False
+            self.daemon = False
+            timers.append(self)
+
+        def start(self):
+            pass
+
+        def cancel(self):
+            self.cancelled = True
+
+    monkeypatch.setattr(
+        "scrapers.fbref.camoufox_fetch.threading.Timer", _Timer
+    )
+    page = MagicMock()
+    browser = MagicMock()
+    browser.new_page.return_value = page
+    camoufox = MagicMock()
+    camoufox.return_value.__enter__.return_value = browser
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "camoufox.sync_api",
+        MagicMock(Camoufox=camoufox),
+    )
+
+    transport = CamoufoxFbrefTransport(proxy={"server": "http://p:1"})
+    transport._start()
+
+    assert len(timers) == 1
+    assert timers[0].cancelled is True
+    assert timers[0].interval == transport.BROWSER_START_TIMEOUT_S
