@@ -1101,14 +1101,11 @@ def _normalise_requested_season(
     season,
     season_format: SeasonFormat | str,
 ) -> str:
-    value = str(season)
-    if (
-        len(value) == 4
-        and value.isdigit()
-        and int(value[2:]) == (int(value[:2]) + 1) % 100
-    ):
-        return value
-    return canonical_season(value, season_format)
+    # A season is stated as the year it opens in; the registry says how to read
+    # it.  Guessing from the digits alone cannot tell the year 2021 from the
+    # key of the 2020/21 season — they are the same four characters — and it
+    # guessed wrong for exactly that year.
+    return canonical_season(season, season_format)
 
 
 def _ensure_metadata(frame: pd.DataFrame, entity_type: str) -> pd.DataFrame:

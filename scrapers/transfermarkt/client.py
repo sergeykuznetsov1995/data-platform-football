@@ -66,6 +66,9 @@ _CHALLENGE_MARKERS = (
 # to a fresh exit, so a required page needs more than a couple of exits before a
 # whole cycle is abandoned.  The run-wide retry ledger is the real bound.
 _MAX_FETCH_ATTEMPTS = 8
+# A 403/429 is worth another exit, but not the full ladder: a source that means
+# it will say so from every exit, and each try burns one.
+_MAX_BLOCKED_ATTEMPTS = 4
 
 _URL_CREDENTIALS_RE = re.compile(
     r"(?P<scheme>(?:https?|socks[45])://)(?P<credentials>[^/@\s]+)@",
@@ -306,6 +309,7 @@ class TransfermarktHttpClient:
         rate_limiter=None,
         timeout_seconds: float = 12.0,
         circuit_failures: int = 5,
+        circuit_reset_seconds: float = 120.0,
         client_factory: Optional[Callable[..., Any]] = None,
         sleep_fn: Callable[[float], None] = time.sleep,
         random_fn: Callable[[], float] = random.random,
@@ -336,6 +340,7 @@ class TransfermarktHttpClient:
         self._rate_limiter = rate_limiter
         self.timeout_seconds = float(timeout_seconds)
         self._circuit_failures = int(circuit_failures)
+        self._circuit_reset_seconds = max(0.0, float(circuit_reset_seconds))
         self._client_factory = client_factory
         self._sleep = sleep_fn
         self._random = random_fn
@@ -348,6 +353,7 @@ class TransfermarktHttpClient:
         self._avoid_explicit_proxy = False
         self._consecutive_endpoint_failures = 0
         self._circuit_open = False
+        self._circuit_opened_at: Optional[float] = None
 
         self._request_attempt_budget: Optional[int] = None
         self._decoded_body_budget: Optional[int] = None
@@ -942,8 +948,27 @@ class TransfermarktHttpClient:
             self._consecutive_endpoint_failures += 1
             if self._consecutive_endpoint_failures >= self._circuit_failures:
                 self._circuit_open = True
+                self._circuit_opened_at = self._time()
                 self.close()
         return outcome
+
+    def _circuit_admits_a_probe(self) -> bool:
+        """Let one request through once the source has had time to recover.
+
+        The source fails in waves.  A breaker that never reopens turns a wave
+        into the end of the entity: every later page is refused without being
+        tried, and a run that had paid for hundreds of pages dies holding them.
+        A failed probe re-opens the breaker on its own, so a source that is
+        still down costs one request per cooldown, not a retry storm.
+        """
+        if self._circuit_opened_at is None:
+            return False
+        if self._time() - self._circuit_opened_at < self._circuit_reset_seconds:
+            return False
+        self._circuit_open = False
+        self._circuit_opened_at = None
+        self._consecutive_endpoint_failures = self._circuit_failures - 1
+        return True
 
     def _load_cached_outcome(self, cache_key: Optional[str]) -> Optional[FetchOutcome[Any]]:
         if self._cache is None or not cache_key:
@@ -1012,10 +1037,14 @@ class TransfermarktHttpClient:
             duration = self._monotonic() - cache_started
             self._record_cache_hit(label=label, duration_seconds=duration)
             return cached.as_cache_hit(duration_seconds=duration)
-        if self._circuit_open:
+        if self._circuit_open and not self._circuit_admits_a_probe():
             return FetchOutcome(
                 status=FetchStatus.RETRY_EXHAUSTED,
-                error="in-run endpoint circuit is open after five failures",
+                error=(
+                    'in-run endpoint circuit is open after '
+                    f'{self._circuit_failures} failures; it admits a probe '
+                    f'after {self._circuit_reset_seconds:.0f}s'
+                ),
                 label=label,
                 context=context,
             )
@@ -1256,9 +1285,13 @@ class TransfermarktHttpClient:
                         ErrorType.FORBIDDEN.value
                         if status_code == 403 else ErrorType.RATE_LIMIT.value
                     )
+                    # A block is a statement about the exit, not the page.  Two
+                    # attempts meant one alternate exit, and a third of the
+                    # residential pool cannot reach the source at any moment —
+                    # so a good page was routinely abandoned as blocked.
                     retry_allowed = (
                         self._has_alternate_proxy(proxy_obj)
-                        and attempt < min(attempts_cap, 2)
+                        and attempt < min(attempts_cap, _MAX_BLOCKED_ATTEMPTS)
                     )
                 elif status_code >= 500 or status_code == 0:
                     terminal_status = FetchStatus.RETRY_EXHAUSTED
