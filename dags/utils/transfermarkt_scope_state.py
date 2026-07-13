@@ -261,11 +261,23 @@ class ScopeManifest:
             'status', 'registry_participant_count', 'edition_current',
             'scope_capture', 'entity_statuses', 'entity_contracts',
             'authoritative_empty_evidence', 'participant_contract',
-            'roster_coverage', 'career_fetches_pending',
         }
-        if not isinstance(value, Mapping) or set(value) != required:
+        # A manifest persisted before scopes stated their roster coverage is
+        # still valid evidence of what it did capture; it simply said nothing
+        # about what it still owed.  Nothing else may enter the hash unbound.
+        coverage = {'roster_coverage', 'career_fetches_pending'}
+        if not isinstance(value, Mapping):
             raise ScopeManifestError('scope DQ evidence has an unbound field set')
-        self._validate_roster_coverage(value)
+        present = set(value)
+        if not required <= present or present - required - coverage:
+            raise ScopeManifestError('scope DQ evidence has an unbound field set')
+        stated = present & coverage
+        if stated:
+            if stated != coverage:
+                raise ScopeManifestError(
+                    'roster coverage must state both the entities and the total'
+                )
+            self._validate_roster_coverage(value)
         if value['status'] != 'passed':
             raise ScopeManifestError('scope DQ evidence is not green')
         if not isinstance(value['edition_current'], bool):
