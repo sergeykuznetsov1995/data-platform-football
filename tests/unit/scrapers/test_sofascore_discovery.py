@@ -36,6 +36,11 @@ TOURNAMENTS = [
     (270, "Africa Cup of Nations", "africa-cup-of-nations", "Africa", "africa", 71636, "2025"),
 ]
 
+# LaLiga is deliberately absent from TOURNAMENTS: it only ever lives in the
+# existing registry, never in a _FakeClient response, so it is the tournament
+# that proves a record missing from the source scan is preserved.
+LALIGA = (8, "LaLiga", "laliga", "Spain", "spain", 61643, "25/26")
+
 
 def _catalog_item(source_id, name, slug, category_name, category_slug):
     return {
@@ -85,6 +90,162 @@ def _season_payload(item):
             "name": f"{name} {year}",
             "year": year,
         }]
+    }
+
+
+def _pending_review_record():
+    return {
+        "status": "pending",
+        "confirmed": {
+            "sport": None,
+            "gender": None,
+            "age_group": None,
+            "team_level": None,
+        },
+        "reviewed_by": None,
+        "reviewed_at": None,
+        "evidence": [],
+        "notes": None,
+    }
+
+
+def _approved_review_record():
+    return {
+        "status": "approved",
+        "confirmed": {
+            "sport": "football",
+            "gender": "male",
+            "age_group": "adult",
+            "team_level": "first_team",
+        },
+        "reviewed_by": "registry-v2-migration",
+        "reviewed_at": "2026-07-11",
+        "evidence": [{
+            "type": "repository",
+            "reference": "configs/medallion/competitions.yaml",
+            "note": "adult men's first-team football",
+        }],
+        "notes": "Existing production activation retained after review.",
+    }
+
+
+def _registry_classification(source_id):
+    return {
+        "sport": "football",
+        "gender": "unknown",
+        "age_group": "unknown",
+        "team_level": "unknown",
+        "status": "unknown",
+        "exclusion_reasons": [],
+        "evidence": [{
+            "type": "source_field",
+            "endpoint": f"/unique-tournament/{source_id}",
+            "field": "category.sport.slug",
+            "value": "football",
+        }],
+    }
+
+
+def _registry_season(item):
+    source_id, name, _, _, _, season_id, year = item
+    split_year = "/" in year
+    label = f"{name} {year}"
+    return {
+        "season_id": season_id,
+        "name": label,
+        "source_name": label,
+        "year": year,
+        "format": "split_year" if split_year else "calendar_year",
+        "season_format": "split_year" if split_year else "single_year",
+        "canonical_season": year.replace("/", ""),
+        "start_date": None,
+        "end_date": None,
+        "aliases": [year, label],
+        "evidence": [{
+            "type": "source_field",
+            "endpoint": f"/unique-tournament/{source_id}/seasons",
+            "field": "name/year",
+            "value": f"{label}|{year}",
+        }],
+    }
+
+
+def _registry_tournament(
+    item,
+    *,
+    canonical_id=None,
+    enabled=False,
+    approved=False,
+    seasons=True,
+):
+    source_id, name, slug, category_name, category_slug, _, _ = item
+    return {
+        "unique_tournament_id": source_id,
+        "name": name,
+        "slug": slug,
+        "category": {
+            "id": source_id + 1000,
+            "name": category_name,
+            "slug": category_slug,
+        },
+        "sport_slug": "football",
+        "page_path": f"football/{category_slug}/{slug}",
+        "canonical_id": canonical_id,
+        "enabled": enabled,
+        "classification": _registry_classification(source_id),
+        "review": (
+            _approved_review_record() if approved
+            else _pending_review_record()
+        ),
+        "seasons": [_registry_season(item)] if seasons else [],
+    }
+
+
+def _existing_registry():
+    """A minimal operator-owned registry, independent of the shipped file.
+
+    The discovery contracts are about merge behaviour, not about whatever the
+    production registry happens to contain today, so these tests own their
+    input. Only the records the contracts need are present:
+
+    * 17/16 are the activated tournaments (canonical_id + approved review).
+    * 270 is an existing, non-activated tournament with one known season.
+    * 8 (LaLiga) never appears in a _FakeClient response.
+    * 7/203 are absent, so discovery sees them as brand-new records.
+
+    Every season here matches the one _FakeClient serves for that tournament,
+    so an unmodified scan never trips the "season traversal shrank" guard.
+    """
+
+    return {
+        "source": "sofascore",
+        "schema_version": 2,
+        "operator_owned_fields": [
+            "canonical_id",
+            "enabled",
+            "review",
+            "seasons[].aliases",
+            "seasons[].canonical_season_override",
+        ],
+        "tournaments": [
+            _registry_tournament(LALIGA, canonical_id="ESP-La Liga", seasons=False),
+            _registry_tournament(
+                TOURNAMENTS[1],
+                canonical_id="INT-World Cup",
+                enabled=True,
+                approved=True,
+            ),
+            _registry_tournament(
+                TOURNAMENTS[0],
+                canonical_id="ENG-Premier League",
+                enabled=True,
+                approved=True,
+            ),
+            _registry_tournament(
+                TOURNAMENTS[4],
+                canonical_id="INT-Africa Cup of Nations",
+            ),
+        ],
     }
 
 
@@ -207,9 +368,7 @@ def test_category_index_and_grouped_tournaments_are_parsed():
 
 @pytest.mark.unit
 def test_discovery_preserves_activation_and_defaults_new_records_off():
-    existing = json.loads(
-        Path("configs/sofascore/tournaments.json").read_text(encoding="utf-8")
-    )
+    existing = _existing_registry()
     merged, report = discover_registry(existing, _FakeClient())
     catalog = SofaScoreCatalog.from_mapping(merged)
 
@@ -232,9 +391,7 @@ def test_discovery_preserves_activation_and_defaults_new_records_off():
 
 @pytest.mark.unit
 def test_category_all_404_uses_compatible_index_fallback():
-    existing = json.loads(
-        Path("configs/sofascore/tournaments.json").read_text(encoding="utf-8")
-    )
+    existing = _existing_registry()
     client = _FakeClient()
     client.payloads[CATEGORIES_FALLBACK_PATH] = client.payloads[CATEGORIES_PATH]
     client.payloads[CATEGORIES_PATH] = DiscoveryHTTPError(
@@ -250,9 +407,7 @@ def test_category_all_404_uses_compatible_index_fallback():
 
 @pytest.mark.unit
 def test_active_reviewed_scope_skips_catalog_and_refreshes_only_reviewed():
-    existing = json.loads(
-        Path("configs/sofascore/tournaments.json").read_text(encoding="utf-8")
-    )
+    existing = _existing_registry()
     client = _FakeClient()
     for item in TOURNAMENTS[:2]:
         client.payloads[TOURNAMENT_PATH.format(
@@ -269,9 +424,7 @@ def test_active_reviewed_scope_skips_catalog_and_refreshes_only_reviewed():
 
 @pytest.mark.unit
 def test_empty_category_index_fails_closed():
-    existing = json.loads(
-        Path("configs/sofascore/tournaments.json").read_text(encoding="utf-8")
-    )
+    existing = _existing_registry()
     client = _FakeClient()
     client.payloads[CATEGORIES_PATH] = {"categories": []}
 
@@ -281,9 +434,7 @@ def test_empty_category_index_fails_closed():
 
 @pytest.mark.unit
 def test_category_fanout_404_fails_instead_of_writing_curated_subset():
-    existing = json.loads(
-        Path("configs/sofascore/tournaments.json").read_text(encoding="utf-8")
-    )
+    existing = _existing_registry()
     client = _FakeClient()
     first_category = TOURNAMENTS[0][0] + 1000
     client.payloads[f"/category/{first_category}/unique-tournaments"] = (
@@ -296,9 +447,7 @@ def test_category_fanout_404_fails_instead_of_writing_curated_subset():
 
 @pytest.mark.unit
 def test_missing_enabled_tournament_seasons_fails_closed():
-    existing = json.loads(
-        Path("configs/sofascore/tournaments.json").read_text(encoding="utf-8")
-    )
+    existing = _existing_registry()
     client = _FakeClient()
     client.payloads["/unique-tournament/17/seasons"] = DiscoveryHTTPError(
         "not found",
@@ -311,9 +460,7 @@ def test_missing_enabled_tournament_seasons_fails_closed():
 
 @pytest.mark.unit
 def test_partial_season_traversal_cannot_shrink_existing_registry():
-    existing = json.loads(
-        Path("configs/sofascore/tournaments.json").read_text(encoding="utf-8")
-    )
+    existing = _existing_registry()
     client = _FakeClient()
     client.payloads["/unique-tournament/270/seasons"] = {"seasons": []}
 
@@ -323,9 +470,7 @@ def test_partial_season_traversal_cannot_shrink_existing_registry():
 
 @pytest.mark.unit
 def test_missing_old_tournaments_and_seasons_are_preserved():
-    existing = json.loads(
-        Path("configs/sofascore/tournaments.json").read_text(encoding="utf-8")
-    )
+    existing = _existing_registry()
     merged, _ = discover_registry(existing, _FakeClient())
     catalog = SofaScoreCatalog.from_mapping(merged)
 
@@ -335,9 +480,7 @@ def test_missing_old_tournaments_and_seasons_are_preserved():
 
 @pytest.mark.unit
 def test_source_season_id_replacement_does_not_create_a_duplicate():
-    existing = json.loads(
-        Path("configs/sofascore/tournaments.json").read_text(encoding="utf-8")
-    )
+    existing = _existing_registry()
     epl = next(
         item for item in existing["tournaments"]
         if item["unique_tournament_id"] == 17
