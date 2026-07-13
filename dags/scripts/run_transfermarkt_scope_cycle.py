@@ -54,6 +54,9 @@ from scrapers.transfermarkt.registry import (
 MIB = 1024 * 1024
 HARD_BYTE_CAP = 15_728_640
 SOFT_BYTE_STOP = 14_680_064
+# Residential exits fail often enough that a scope meets several bad ones in a
+# row; the client itself never attempts an endpoint more than eight times.
+PARENT_RETRY_LIMIT = 8
 ENTITY_ORDER = (
     'players',
     'market_value_history',
@@ -1995,7 +1998,7 @@ def _parser() -> argparse.ArgumentParser:
         '--request-limit', type=int,
         default=sum(item['requests'] for item in DEFAULT_ENTITY_LIMITS.values()),
     )
-    parser.add_argument('--retry-limit', type=int, default=2)
+    parser.add_argument('--retry-limit', type=int, default=PARENT_RETRY_LIMIT)
     parser.add_argument('--entity-limits-json')
     parser.add_argument('--career-window-limit', type=int, default=100)
     parser.add_argument('--coach-history-ttl-days', type=int, default=28)
@@ -2019,9 +2022,13 @@ def _validate_args(args: argparse.Namespace) -> None:
     production_requests = sum(
         item['requests'] for item in DEFAULT_ENTITY_LIMITS.values()
     )
-    if args.request_limit != production_requests or args.retry_limit != 2:
+    if (
+        args.request_limit != production_requests
+        or args.retry_limit != PARENT_RETRY_LIMIT
+    ):
         raise ScopeCycleError(
-            f'parent request/retry limits must equal {production_requests}/2'
+            'parent request/retry limits must equal '
+            f'{production_requests}/{PARENT_RETRY_LIMIT}'
         )
     if not 1 <= args.career_window_limit <= 100:
         raise ScopeCycleError('career window limit must be between 1 and 100')

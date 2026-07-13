@@ -148,7 +148,7 @@ def _approved_args(tmp_path: Path, payload: dict) -> tuple[list[str], Path]:
         request_limit=sum(
             item['requests'] for item in cycle.DEFAULT_ENTITY_LIMITS.values()
         ),
-        retry_limit=2,
+        retry_limit=cycle.PARENT_RETRY_LIMIT,
         **values,
     )
     write = ApprovalPacket(
@@ -334,9 +334,10 @@ def test_exact_cycle_runs_sequentially_without_shell_and_commits_manifest(tmp_pa
         and options['env']['TM_SCOPE_ID'] == payload['scope_id']
         for _, options in calls
     )
+    budget = str(cycle.PARENT_RETRY_LIMIT)
     assert all(
-        command[command.index('--retry-budget') + 1] == '2'
-        and options['env']['TM_RETRY_BUDGET'] == '2'
+        command[command.index('--retry-budget') + 1] == budget
+        and options['env']['TM_RETRY_BUDGET'] == budget
         for command, options in calls
     )
     assert manifest['status'] == 'complete'
@@ -380,7 +381,7 @@ def test_exact_cycle_runs_sequentially_without_shell_and_commits_manifest(tmp_pa
     assert ledger['manifest_count'] == 1
     assert ledger['hard_provider_byte_budget'] == cycle.HARD_BYTE_CAP
     assert ledger['request_limit'] == 316
-    assert ledger['retry_limit'] == 2
+    assert ledger['retry_limit'] == cycle.PARENT_RETRY_LIMIT
     for field in (
         'decoded_bytes', 'wire_bytes', 'provider_metered_bytes',
         'requests', 'retries', 'cache_hits', 'duration_ms',
@@ -540,7 +541,9 @@ def test_retry_limit_stops_next_entity_before_paid_io(tmp_path):
         cycle.run_scope_cycle(
             args,
             operation_argv=cycle.approved_operation_argv(argv),
-            subprocess_runner=_fake_subprocess(calls, first_retries=2),
+            subprocess_runner=_fake_subprocess(
+                calls, first_retries=cycle.PARENT_RETRY_LIMIT,
+            ),
             manifest_writer=lambda manifest: pytest.fail('manifest persisted'),
             parent_ledger_writer=lambda ledger: pytest.fail('ledger persisted'),
             monotonic_ns=ticks.__next__,
@@ -551,8 +554,7 @@ def test_retry_limit_stops_next_entity_before_paid_io(tmp_path):
     attempts = json.loads(
         Path(payload['parent_ledger']['path'] + '.attempts').read_text()
     )
-    assert attempts['requests'] == 2
-    assert attempts['retries'] == 2
+    assert attempts['retries'] == cycle.PARENT_RETRY_LIMIT
 
 
 def test_remaining_parent_retry_budget_is_pinned_in_argv_and_env(tmp_path):
@@ -571,11 +573,13 @@ def test_remaining_parent_retry_budget_is_pinned_in_argv_and_env(tmp_path):
         monotonic_ns=ticks.__next__,
     )
 
-    assert calls[0][0][calls[0][0].index('--retry-budget') + 1] == '2'
-    assert calls[0][1]['env']['TM_RETRY_BUDGET'] == '2'
+    full = str(cycle.PARENT_RETRY_LIMIT)
+    after_one_retry = str(cycle.PARENT_RETRY_LIMIT - 1)
+    assert calls[0][0][calls[0][0].index('--retry-budget') + 1] == full
+    assert calls[0][1]['env']['TM_RETRY_BUDGET'] == full
     for command, options in calls[1:]:
-        assert command[command.index('--retry-budget') + 1] == '1'
-        assert options['env']['TM_RETRY_BUDGET'] == '1'
+        assert command[command.index('--retry-budget') + 1] == after_one_retry
+        assert options['env']['TM_RETRY_BUDGET'] == after_one_retry
 
 
 def test_missing_output_is_red_and_never_checkpointed_or_promoted(tmp_path):
