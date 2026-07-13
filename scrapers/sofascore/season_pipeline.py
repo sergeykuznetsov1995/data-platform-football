@@ -92,6 +92,7 @@ class SeasonPartitionPlan:
     team_ids: tuple[str, ...]
     referee_ids: tuple[str, ...]
     player_universe_evidence_gaps: tuple[str, ...] = ()
+    placeholder_team_ids: tuple[str, ...] = ()
 
     @property
     def complete(self) -> bool:
@@ -152,6 +153,19 @@ def _source_ids(
         _positive_id(source_tournament_id, "source_tournament_id"),
         _positive_id(source_season_id, "source_season_id"),
     )
+
+
+def _is_placeholder_team(team: object) -> bool:
+    """True for SofaScore knockout-bracket stubs ("Winner of match N").
+
+    Unresolved cup slots arrive as team objects with a real numeric id and
+    ``disabled: true`` (real teams omit the flag or send ``false``; see the
+    bronze ``*_team_disabled`` columns). Stubs never appear in participants
+    and have no squads, so counting them keeps the season plan permanently
+    incomplete (#946). ``type`` does not discriminate and the registry
+    ``enabled`` flag is unrelated.
+    """
+    return isinstance(team, Mapping) and team.get("disabled") is True
 
 
 def _schedule_schema(source_season_id: str):
@@ -741,6 +755,7 @@ def plan_season_partition(
     missing_raw: list[ManifestKey] = []
     event_ids: list[str] = []
     scheduled_team_ids: set[str] = set()
+    placeholder_team_ids: set[str] = set()
     embedded_referee_ids: set[str] = set()
     player_universe_evidence_gaps: list[str] = []
 
@@ -825,13 +840,18 @@ def plan_season_partition(
                     event_ids.append(event_id)
                 for side in ("homeTeam", "awayTeam"):
                     try:
-                        scheduled_team_ids.add(
-                            _positive_id(event[side]["id"], f"{side}_id")
-                        )
+                        team = event[side]
+                        team_id = _positive_id(team["id"], f"{side}_id")
                     except (KeyError, TypeError, ValueError) as exc:
                         raise SeasonPlanningError(
                             f"schedule event {event_id} has invalid {side} evidence"
                         ) from exc
+                    if _is_placeholder_team(team):
+                        # #946: an unresolved bracket slot is evidence for the
+                        # event, not for any team; never fan squads out of it.
+                        placeholder_team_ids.add(team_id)
+                        continue
+                    scheduled_team_ids.add(team_id)
                 referee = event.get("referee")
                 if referee is not None:
                     if not isinstance(referee, Mapping) or referee.get("id") is None:
@@ -957,6 +977,7 @@ def plan_season_partition(
         team_ids=tuple(sorted(team_ids, key=int)),
         referee_ids=tuple(sorted(referee_ids, key=int)),
         player_universe_evidence_gaps=tuple(player_universe_evidence_gaps),
+        placeholder_team_ids=tuple(sorted(placeholder_team_ids, key=int)),
     )
 
 
