@@ -408,8 +408,12 @@ def approved_operation_argv(
 ) -> tuple[str, ...]:
     """Return the exact action argv without self-referential approval refs."""
 
+    # `python` resolves to a different alias depending on PATH (the DAG's env
+    # finds /usr/local/bin/python, an interactive shell finds the one in
+    # ~/.local/bin), and both are symlinks to the same interpreter. The approved
+    # operation is the interpreter itself, not the name it was invoked by.
     result = [
-        executable or sys.executable,
+        str(Path(executable or sys.executable).resolve()),
         script_path or str(Path(__file__).resolve()),
     ]
     values = list(argv)
