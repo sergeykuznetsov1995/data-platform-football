@@ -1214,7 +1214,8 @@ WHEN NOT MATCHED THEN INSERT (
     s.edition_id, s.canonical_competition_id, s.canonical_season,
     s.registry_snapshot_id, s.capture_revision, s.parser_revision,
     s.schema_revision, s.reader_revision, s.entity_manifest_json,
-    s.manifest_digest, s.status, CURRENT_TIMESTAMP
+    s.manifest_digest, s.status,
+    CAST(CURRENT_TIMESTAMP AT TIME ZONE 'UTC' AS timestamp(6))
 )"""
 
 
