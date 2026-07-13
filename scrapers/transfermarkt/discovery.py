@@ -57,6 +57,13 @@ _COMPETITION_ROUTE_RE = re.compile(
     r"(?P<competition_id>[A-Za-z0-9_-]+)(?:/.*)?$"
 )
 _CANONICAL_SECTION = "startseite"
+# A snapshot is what the source said *as read by this parser*: the same pages
+# yield different records once the parser changes, and Silver snapshots are
+# immutable, so the parser revision is part of the snapshot identity. Bump it
+# whenever parsing or classification changes — otherwise a restated catalogue
+# cannot be published over the snapshot id it would otherwise reuse.
+PARSER_REVISION = "tm-html-discovery-v2"
+SCHEMA_REVISION = "1"
 # The catalogue states a competition's taxonomy at three levels: a broad section
 # heading, a group separator inside the tables, and the "National Team
 # Competitions" section, which names the entrants themselves — a table group can
@@ -1014,8 +1021,12 @@ class TransfermarktCompetitionDiscovery:
             profiles[candidate.competition_id] = (document, soup)
 
         snapshot_material = {
-            url: document.payload_hash
-            for url, document in sorted(self._documents.items())
+            "pages": {
+                url: document.payload_hash
+                for url, document in sorted(self._documents.items())
+            },
+            "parser_revision": PARSER_REVISION,
+            "schema_revision": SCHEMA_REVISION,
         }
         snapshot_digest = hashlib.sha256(
             json.dumps(snapshot_material, separators=(",", ":"), sort_keys=True).encode()
@@ -1088,8 +1099,8 @@ class TransfermarktCompetitionDiscovery:
                 evidence=evidence,
                 registry_snapshot_id=snapshot_id,
                 source_body_hash=combined_hash,
-                parser_revision="tm-html-discovery-v1",
-                schema_revision="1",
+                parser_revision=PARSER_REVISION,
+                schema_revision=SCHEMA_REVISION,
             )
 
             editions = []
@@ -1115,8 +1126,8 @@ class TransfermarktCompetitionDiscovery:
                         discovered_at=discovered_at,
                         registry_snapshot_id=snapshot_id,
                         source_body_hash=profile_document.payload_hash,
-                        parser_revision="tm-html-discovery-v1",
-                        schema_revision="1",
+                        parser_revision=PARSER_REVISION,
+                        schema_revision=SCHEMA_REVISION,
                     )
                 )
             edition_records[competition_id] = tuple(editions)
