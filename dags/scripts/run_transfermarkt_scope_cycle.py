@@ -52,6 +52,8 @@ from scrapers.transfermarkt.registry import (
 
 
 MIB = 1024 * 1024
+RESPONSE_CACHE_ROOT = Path('/opt/airflow/logs/transfermarkt-native-v2/cache')
+RESPONSE_CACHE_TTL_SECONDS = 24 * 60 * 60
 HARD_BYTE_CAP = 15_728_640
 SOFT_BYTE_STOP = 14_680_064
 # This is the cycle-wide retry ledger, not a per-page cap: the source answers
@@ -701,6 +703,13 @@ def _runner_environment(
         'TM_PENDING_CHECKPOINT_DIR': str(
             Path(identity.result_base_dir) / 'checkpoints'
         ),
+        # A league can be larger than one cycle's byte cap, so the pages already
+        # paid for must outlive the cycle that fetched them. The path is keyed by
+        # scope, not by cycle, which is what lets the next cycle finish the job.
+        'TM_RESPONSE_CACHE_PATH': str(
+            RESPONSE_CACHE_ROOT / f'{identity.scope_id}.json'
+        ),
+        'TM_RESPONSE_CACHE_TTL_SECONDS': str(RESPONSE_CACHE_TTL_SECONDS),
         'TM_CYCLE_BUDGET_DIR': str(Path(identity.parent_ledger_path).parent),
         'TM_COMPETITION_RECORDS_JSON': _stable_json([
             identity.competition_record,

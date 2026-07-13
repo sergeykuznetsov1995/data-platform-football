@@ -7,10 +7,11 @@ instead of being converted to an empty successful run.
 
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import math
 import re
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -818,6 +819,7 @@ def _identity_fields(
 
 EVENT_FIELDS = (
     "source_event_id",
+    "opta_event_id",
     "team_event_id",
     "game_id",
     "period",
@@ -890,6 +892,13 @@ def parse_events(
         if team_id is not None and isinstance(team_name, str) and team_name:
             team_names[team_id] = team_name
 
+    raw_source_ids = [
+        _required_source_bigint(event.get("id"), f"events[{index}].id")
+        for index, event in enumerate(raw_events)
+        if isinstance(event, Mapping)
+    ]
+    source_id_counts = Counter(raw_source_ids)
+    occupied_source_ids = set(raw_source_ids)
     rows: list[dict[str, Any]] = []
     seen_source_ids: set[int] = set()
     seen_team_event_ids: set[tuple[Optional[int], int]] = set()
@@ -903,15 +912,9 @@ def parse_events(
         # World Cup payloads where hundreds of eventId values occur twice).
         # Never fall back from id to eventId: doing so silently merges real
         # actions from opposite teams.
-        source_event_id = _required_source_bigint(
+        opta_event_id = _required_source_bigint(
             event.get("id"), f"events[{index}].id"
         )
-        if source_event_id in seen_source_ids:
-            raise WhoScoredParseError(
-                f"Duplicate global source event id {source_event_id} in game {game_id}"
-            )
-        seen_source_ids.add(source_event_id)
-
         team_event_id = _required_int(event.get("eventId"), f"events[{index}].eventId")
         if team_event_id <= 0:
             raise WhoScoredParseError(
@@ -919,6 +922,26 @@ def parse_events(
             )
 
         team_id = _optional_int(event.get("teamId"), f"events[{index}].teamId")
+        source_event_id = opta_event_id
+        if source_id_counts[opta_event_id] > 1:
+            salt = 0
+            while True:
+                token = (
+                    f"{game_id}:{opta_event_id}:{team_id}:{team_event_id}:{salt}"
+                ).encode("utf-8")
+                candidate = int.from_bytes(
+                    hashlib.sha256(token).digest()[:8], "big"
+                ) & 0x7FFF_FFFF_FFFF_FFFF
+                if candidate > 0 and candidate not in occupied_source_ids:
+                    source_event_id = candidate
+                    occupied_source_ids.add(candidate)
+                    break
+                salt += 1
+        if source_event_id in seen_source_ids:
+            raise WhoScoredParseError(
+                f"Duplicate technical event id {source_event_id} in game {game_id}"
+            )
+        seen_source_ids.add(source_event_id)
         team_event_key = (team_id, team_event_id)
         if team_event_key in seen_team_event_ids:
             raise WhoScoredParseError(
@@ -936,6 +959,7 @@ def parse_events(
         row = {
             **identity,
             "source_event_id": source_event_id,
+            "opta_event_id": opta_event_id,
             "team_event_id": team_event_id,
             "period": _display(event.get("period")),
             "minute": _optional_int(event.get("minute"), f"events[{index}].minute"),
@@ -1174,7 +1198,7 @@ def parse_match_record(
     game_id: int,
     game: Optional[str] = None,
 ) -> ParsedDataset:
-    """Project the match header while retaining the complete source object."""
+    """Project the match header; the complete payload stays in raw storage."""
 
     identity = _identity_fields(scope, _required_int(game_id, "game_id"), game)
     home = data.get("home") or {}
@@ -1229,7 +1253,13 @@ def parse_match_record(
         else None,
         "home_manager": _mapping_text(home.get("manager"), "name", "displayName"),
         "away_manager": _mapping_text(away.get("manager"), "name", "displayName"),
-        **_source_metadata(data),
+        # ``data`` contains every event, player and stat for the match and can
+        # exceed a megabyte.  Duplicating it into the one-row match projection
+        # wastes storage and can exceed Trino's single-query limit.  The exact
+        # payload is already content-addressed by the ingest manifest; retain
+        # only its drift fingerprint here.
+        "source_raw_json": None,
+        "source_schema_fingerprint": schema_fingerprint(data),
     }
     if row["home_team_id"] is None and row["home_team"] is None:
         raise WhoScoredParseError("matchCentreData.home has no team identity")

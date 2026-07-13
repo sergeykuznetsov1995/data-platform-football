@@ -24,6 +24,12 @@ from scrapers.base.sql_validator import validate_identifier, validate_catalog_qu
 
 logger = logging.getLogger(__name__)
 
+# Trino's `query.max-length` defaults to 1,000,000 bytes.  The Python client
+# may wrap a statement in EXECUTE IMMEDIATE and escape embedded quotes, so the
+# server-side query can be materially larger than the UTF-8 payload rendered
+# here.  Keep enough headroom for that wrapper and for wide source rows.
+SQL_BYTE_BUDGET = 300_000
+
 # Trino client import with graceful fallback
 try:
     import trino
@@ -527,12 +533,10 @@ WITH (
         columns = ', '.join(f'"{c}"' for c in df.columns)
         header = f"INSERT INTO {qualified} ({columns})\nVALUES\n"
 
-        # Trino's `query.max-length` defaults to 1,000,000 bytes; leave headroom
-        # for wide schemas (e.g. sofascore_player_season_stats ~150 cols).
-        sql_byte_budget = 900_000
+        sql_byte_budget = SQL_BYTE_BUDGET
 
         pending_rows: List[str] = []
-        pending_bytes = len(header)
+        pending_bytes = len(header.encode("utf-8"))
         batch_num = 0
 
         def _flush() -> None:
@@ -548,7 +552,7 @@ WITH (
                 f"{self.catalog}.{schema}.{table}"
             )
             pending_rows = []
-            pending_bytes = len(header)
+            pending_bytes = len(header.encode("utf-8"))
 
         # ``iterrows`` boxes every scalar into a Series and can silently
         # coerce integer identifiers to float.  Tuple iteration preserves the
@@ -562,18 +566,65 @@ WITH (
                 values.append(self._format_sql_value(val, target_type))
             row_sql = f"({', '.join(values)})"
             # +2 accounts for the ",\n" separator before the next row.
+            row_bytes = len(row_sql.encode("utf-8"))
             if pending_rows and (
-                pending_bytes + len(row_sql) + 2 > sql_byte_budget
+                pending_bytes + row_bytes + 2 > sql_byte_budget
                 or len(pending_rows) >= batch_size
             ):
                 _flush()
             pending_rows.append(row_sql)
-            pending_bytes += len(row_sql) + 2
+            pending_bytes += row_bytes + 2
 
         _flush()
 
         logger.info(f"Inserted {total_inserted} rows into {self.catalog}.{schema}.{table}")
         return total_inserted
+
+    def _insert_single_batch(
+        self,
+        schema: str,
+        table: str,
+        df: pd.DataFrame,
+        batch_size: int,
+    ) -> Optional[int]:
+        """Append ``df`` in one INSERT, or return None if it does not fit.
+
+        The caller must have ruled out DELETE/MERGE semantics: this is a plain
+        append. Returning None means "too big for a single statement" — the
+        caller then stages, which is what keeps a multi-batch write down to one
+        snapshot (#269). The row SQL is rendered exactly as ``insert_dataframe``
+        renders it, so the fit is measured, never estimated.
+        """
+        if len(df) > batch_size:
+            return None
+
+        table_col_types: Dict[str, str] = {}
+        try:
+            raw_types = self.get_table_columns(schema, table)
+            table_col_types = {k.lower(): v for k, v in raw_types.items()}
+        except Exception as e:
+            logger.debug(f"Could not fetch table column types: {e}")
+
+        qualified = validate_catalog_qualified_name(self.catalog, schema, table)
+        columns = ', '.join(f'"{c}"' for c in df.columns)
+        header = f"INSERT INTO {qualified} ({columns})\nVALUES\n"
+
+        rendered: List[str] = []
+        total = len(header.encode("utf-8"))
+        for source_values in df.itertuples(index=False, name=None):
+            values = [
+                self._format_sql_value(val, table_col_types.get(col.lower(), ''))
+                for col, val in zip(df.columns, source_values)
+            ]
+            row_sql = f"({', '.join(values)})"
+            # +2 accounts for the ",\n" separator before the next row.
+            total += len(row_sql.encode("utf-8")) + 2
+            if total > SQL_BYTE_BUDGET:
+                return None
+            rendered.append(row_sql)
+
+        self._execute(header + ",\n".join(rendered))
+        return len(rendered)
 
     def insert_dataframe_atomic(
         self,
@@ -659,6 +710,24 @@ WITH (
                 raise ValueError(f"merge key {key!r} contains null values")
         if keys and df.duplicated(subset=list(keys)).any():
             raise ValueError(f"duplicate rows for merge keys {list(keys)!r}")
+
+        # Fast path: a plain append that fits in ONE ``INSERT ... VALUES``
+        # already produces exactly one snapshot, which is the entire reason the
+        # stage exists (#269). Staging it anyway would add a CREATE TABLE and a
+        # DROP TABLE — two Iceberg catalog round-trips per write. Sources that
+        # commit per target (FotMob native: manifest + inventory + entity rows
+        # for every payload) paid ~5 statements where 1 suffices, which made the
+        # backfill catalog-bound (#930) and drove the catalog into memcg-OOM.
+        # No DELETE and no MERGE happen here, so #314/#283 do not apply: the
+        # INSERT either commits whole or leaves the target untouched.
+        if not delete_filter and not keys:
+            single = self._insert_single_batch(schema, table, df, batch_size)
+            if single is not None:
+                logger.info(
+                    f"Inserted {single} rows into "
+                    f"{self.catalog}.{schema}.{table} (direct, 1 snapshot)"
+                )
+                return single
 
         # Parallel ingestion shards must never share a predictable staging
         # table. Distributed callers pass a run/task/map/try/UUID-qualified
