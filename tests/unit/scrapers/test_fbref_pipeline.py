@@ -1157,7 +1157,7 @@ def test_validation_fails_closed_on_partial_target_state(tmp_path):
 
     with pytest.raises(RunValidationError, match="incomplete_targets"):
         pipeline.validate_and_finish(str(uuid.uuid4()))
-    assert "finish:False" in control.events
+    assert "finish:False" not in control.events
 
 
 def test_validation_accepts_complete_eligible_sentinel_coverage(tmp_path):
@@ -1187,7 +1187,7 @@ def test_validation_rejects_a_browser_driven_page_by_page_session(tmp_path):
     ):
         pipeline.validate_and_finish(str(uuid.uuid4()))
 
-    assert "finish:False" in control.events
+    assert "finish:False" not in control.events
 
 
 def test_validation_accepts_a_clearance_re_solved_on_a_fresh_proxy(tmp_path):
@@ -1228,7 +1228,7 @@ def test_validation_blocks_silver_with_pending_match_backlog(
             ),
         )
 
-    assert "finish:False" in control.events
+    assert "finish:False" not in control.events
 
 
 def test_validation_rejects_missing_sentinel_coverage(tmp_path):
@@ -1242,7 +1242,7 @@ def test_validation_rejects_missing_sentinel_coverage(tmp_path):
     with pytest.raises(RunValidationError, match="sentinel_coverage_missing"):
         pipeline.validate_and_finish(str(uuid.uuid4()))
 
-    assert "finish:False" in control.events
+    assert "finish:False" not in control.events
 
 
 def test_validation_rejects_ineligible_sentinel_coverage(tmp_path):
@@ -1260,7 +1260,7 @@ def test_validation_rejects_ineligible_sentinel_coverage(tmp_path):
     ):
         pipeline.validate_and_finish(str(uuid.uuid4()))
 
-    assert "finish:False" in control.events
+    assert "finish:False" not in control.events
 
 
 def test_backfill_seeds_exact_next_historical_registry_url(tmp_path):
@@ -1494,7 +1494,7 @@ def test_replay_validation_rejects_missing_source_run(tmp_path):
             str(uuid.uuid4()), replay_source_run_id=str(uuid.uuid4())
         )
 
-    assert "finish:False" in control.events
+    assert "finish:False" not in control.events
 
 
 @pytest.mark.parametrize("status", ["failed", "succeeded", "cancelled"])
@@ -2275,3 +2275,29 @@ def test_the_bootstrap_allowance_follows_the_run_budget_everywhere():
 
     assert daily.bootstrap_request_reservation == 80
     assert backfill.bootstrap_request_reservation == 20
+
+
+def test_a_failed_validation_leaves_the_run_open_for_its_retry(tmp_path):
+    """A finished run is terminal. Marking it failed on the first validation
+    error made every retry of the task impossible: the retry re-validated
+    cleanly and then died on 'run cannot finish as succeeded'. The DAG's failure
+    callback aborts the run when the DAG itself gives up — that is the only
+    point at which the outcome is known."""
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    summary = control.get_run_summary(str(uuid.uuid4()))
+    summary["session_metrics"] = {"max_bootstraps_per_session": 25}
+    control.get_run_summary = lambda _, **__: summary
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+    run_id = str(uuid.uuid4())
+
+    with pytest.raises(RunValidationError):
+        pipeline.validate_and_finish(run_id)
+    assert not [event for event in control.events if event.startswith("finish:")]
+
+    # The gate now passes (the operator fixed what it caught): the same run must
+    # be able to finish green.
+    summary["session_metrics"] = {"max_bootstraps_per_session": 1}
+    pipeline.validate_and_finish(run_id)
+
+    assert "finish:True" in control.events

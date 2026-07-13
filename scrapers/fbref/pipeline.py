@@ -1967,7 +1967,12 @@ class FBrefPipeline:
                 _sentinel_gate_errors(summary.get("sentinel_coverage"))
             )
         if errors:
-            self.control.finish_run(run_id, succeeded=False)
+            # Do NOT finish the run here. A finished run is terminal, so marking
+            # it failed on the first validation error made every retry of this
+            # task impossible: the retry re-validated cleanly and then died on
+            # "run cannot finish as succeeded". The DAG's failure callback
+            # aborts the run when the DAG itself gives up, which is the only
+            # point at which the outcome is actually known.
             raise RunValidationError("; ".join(errors))
         self.control.finish_run(run_id, succeeded=True)
         return summary
