@@ -277,8 +277,8 @@ class TestProductionTrafficCeilings:
         [
             (['--decoded-body-budget-mb', '10.0001'],
              '--decoded-body-budget-mb cannot exceed 10.0'),
-            (['--request-budget', '27'],
-             '--request-budget cannot exceed 26'),
+            (['--request-budget', '61'],
+             '--request-budget cannot exceed 60'),
             (['--cycle-budget-bytes', str(15 * 1024 * 1024 + 1)],
              '--cycle-budget-bytes cannot exceed production cap'),
         ],
