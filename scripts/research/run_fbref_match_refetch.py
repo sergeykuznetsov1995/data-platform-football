@@ -37,6 +37,7 @@ import argparse
 import importlib.util
 import json
 import os
+import signal
 import sys
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -611,12 +612,22 @@ def build_cli_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _raise_on_terminate(signum: int, _frame: object) -> None:
+    raise RuntimeError(f"refetch terminated by signal {signum}")
+
+
 def main(
     argv: Optional[Sequence[str]] = None,
     *,
     pipeline: Optional[Any] = None,
 ) -> int:
     args = build_cli_parser().parse_args(argv)
+    # A Camoufox launch can hang on a dead proxy with no timeout of its own, so
+    # this script is normally run under an external one.  Turn that SIGTERM into
+    # an exception: the failure path below then fails the control run and
+    # releases its fenced leases, instead of leaving them attached to a run
+    # that is still marked 'running'.
+    signal.signal(signal.SIGTERM, _raise_on_terminate)
     try:
         config = RefetchConfig(
             logical_run_label=generate_logical_run_label(
