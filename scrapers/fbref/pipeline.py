@@ -108,6 +108,15 @@ SENTINEL_COMPETITIONS = (
 FETCH_LEASE_SECONDS = 60 * 60
 PROCESSING_LEASE_SECONDS = 60 * 60
 
+# Statuses Cloudflare returns when it no longer honours a cf_clearance for the
+# warm HTTP session. They say nothing about the target page — only that this
+# clearance is dead — so the wave re-solves instead of failing every remaining
+# target against it.
+CLEARANCE_REJECTED_STATUSES = frozenset({401, 403, 429})
+# Each refresh costs one browser solve, so a source that rejects clearances
+# outright must still fail the wave rather than launch browsers in a loop.
+MAX_CLEARANCE_REFRESHES = 2
+
 logger = logging.getLogger(__name__)
 
 
@@ -228,6 +237,15 @@ def _registry_snapshot_id(record: RawFetchRecord) -> str:
                 f"{record.content_hash}"
             ),
         )
+    )
+
+
+def _clearance_rejected(exc: FetchError) -> bool:
+    """True when the failure means the clearance died, not that the page did."""
+
+    return (
+        exc.error_class == "http_status"
+        and exc.http_status in CLEARANCE_REJECTED_STATUSES
     )
 
 
@@ -760,6 +778,7 @@ class FBrefPipeline:
             )
         session_id: Optional[str] = None
         fetcher = None
+        clearance_refreshes = 0
         stack = ExitStack()
         try:
             for lease_index, lease in enumerate(leases):
@@ -988,6 +1007,33 @@ class FBrefPipeline:
                     result.failures.append(
                         f"{lease.target_id}:{exc.error_class}"
                     )
+                    if (
+                        _clearance_rejected(exc)
+                        and fetcher is not None
+                        and clearance_refreshes < MAX_CLEARANCE_REFRESHES
+                    ):
+                        # Cloudflare stopped honouring this clearance mid-wave
+                        # (its exit IP fell out of favour). Every remaining
+                        # target would 403 against the same dead session — one
+                        # rejected exit IP burned a whole wave in production.
+                        # Drop the session here; the next target solves again on
+                        # a fresh proxy. Bounded: a source that rejects every
+                        # clearance must fail the wave, not spawn browsers.
+                        clearance_refreshes += 1
+                        logger.warning(
+                            "FBref rejected the warm clearance (HTTP %s) — "
+                            "dropping the session and re-solving on a fresh "
+                            "proxy (refresh %d/%d)",
+                            exc.http_status,
+                            clearance_refreshes,
+                            MAX_CLEARANCE_REFRESHES,
+                        )
+                        stack.close()
+                        fetcher = None
+                        self.control.close_clearance_session(
+                            session_id, status="failed"
+                        )
+                        session_id = None
                 except Exception as exc:
                     if reservation is not None and not budget_settled:
                         self.control.settle_budget(
