@@ -33,7 +33,11 @@ from scrapers.sofascore.registry import (
 
 
 DEFAULT_BASE_URL = "https://api.sofascore.com/api/v1"
-CATALOG_PATH = "/config/unique-tournaments/EN/football"
+# SofaScore retired /config/unique-tournaments/EN/football (it now answers 404
+# from every egress). The curated set moved to the default/top config routes,
+# which return the same {"uniqueTournaments": [...]} shape.
+CATALOG_PATH = "/config/default-unique-tournaments/EN/football"
+CATALOG_FALLBACK_PATH = "/config/top-unique-tournaments/EN/football"
 CATEGORIES_PATH = "/sport/football/categories/all"
 CATEGORIES_FALLBACK_PATH = "/sport/football/categories"
 TOURNAMENT_PATH = "/unique-tournament/{unique_tournament_id}"
@@ -609,7 +613,7 @@ def parse_seasons_payload(
         )
     by_id: dict[int, dict[str, Any]] = {}
     years: dict[str, int] = {}
-    canonical_seasons: dict[str, int] = {}
+    canonical_seasons: dict[str, tuple[str, str]] = {}
     for index, raw in enumerate(raw_seasons):
         if not isinstance(raw, Mapping):
             raise DiscoverySchemaError(
@@ -689,23 +693,33 @@ def parse_seasons_payload(
                 f"tournament {unique_tournament_id} has conflicting "
                 f"season_id {season_id}"
             )
-        previous_year = years.get(year)
-        if previous_year is not None and previous_year != season_id:
-            raise DiscoverySchemaError(
-                f"tournament {unique_tournament_id} has ambiguous year {year!r}"
-            )
-        years[year] = season_id
+        # A tournament may legitimately run parallel divisions within one year:
+        # tournament 65 ships "2nd Division East 14/15" and "... West 14/15"
+        # under the same year label with different season ids. Those are real
+        # source seasons, so the scan keeps both. The one-season-per-token
+        # guarantee still holds where it is consumed —
+        # SofaScoreCatalog.resolve_source_season fails closed on an ambiguous
+        # token rather than guessing a division.
+        years.setdefault(year, season_id)
         if canonical_season is not None:
-            previous_canonical = canonical_seasons.get(canonical_season)
+            # Two labels of the *same* season format collapsing into one
+            # canonical season (e.g. "25/26" and "2025/2026") is corruption and
+            # stays fail-closed. A league that migrated formats legitimately
+            # owns both "20/21" and "2021" (tournament 278) — different seasons
+            # whose canonical labels collide, which resolve time handles.
+            previous = canonical_seasons.get(canonical_season)
             if (
-                previous_canonical is not None
-                and previous_canonical != season_id
+                previous is not None
+                and previous != (year, season_format)
+                and previous[1] == season_format
             ):
                 raise DiscoverySchemaError(
                     f"tournament {unique_tournament_id} has ambiguous "
                     f"canonical_season {canonical_season!r}"
                 )
-            canonical_seasons[canonical_season] = season_id
+            canonical_seasons.setdefault(
+                canonical_season, (year, season_format)
+            )
         by_id[season_id] = record
     return [by_id[season_id] for season_id in sorted(by_id)]
 
@@ -1014,8 +1028,16 @@ def discover_registry(
         # The config endpoint contains only SofaScore's curated competitions.
         # Category fan-out provides the complete set, including regional and
         # lower-profile competitions.
+        catalog_endpoint = CATALOG_PATH
+        try:
+            catalog_payload = client.get_json(CATALOG_PATH)
+        except DiscoveryHTTPError as exc:
+            if exc.status_code != 404:
+                raise
+            catalog_endpoint = CATALOG_FALLBACK_PATH
+            catalog_payload = client.get_json(CATALOG_FALLBACK_PATH)
         curated = parse_catalog_payload(
-            client.get_json(CATALOG_PATH), endpoint=CATALOG_PATH
+            catalog_payload, endpoint=catalog_endpoint
         )
         if not curated:
             raise DiscoverySchemaError(
@@ -1110,11 +1132,19 @@ def discover_registry(
                     f"enabled tournament {source_id} has an incomplete "
                     "season response"
                 ) from exc
-            raise DiscoveryHTTPError(
-                "incomplete season scan for tournament "
-                f"{source_id}: {exc}",
-                status_code=exc.status_code,
-            ) from exc
+            if exc.status_code == 404:
+                # The catalog legitimately lists tournaments the source has no
+                # season index for (e.g. 18789 "KNVB Beker, Women"). An empty
+                # season list is the honest source answer; it cannot be captured
+                # and stays inactivatable. Any other failure is still an
+                # incomplete scan.
+                seasons_payload = {"seasons": []}
+            else:
+                raise DiscoveryHTTPError(
+                    "incomplete season scan for tournament "
+                    f"{source_id}: {exc}",
+                    status_code=exc.status_code,
+                ) from exc
         seasons = parse_seasons_payload(
             seasons_payload,
             source_id,
