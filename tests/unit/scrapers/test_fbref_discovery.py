@@ -545,3 +545,66 @@ def test_sentinel_coverage_matches_source_governing_body_prefixes():
 
     assert report["Champions League"]["competition_id"] == "8"
     assert report["World Cup"]["competition_id"] == "1"
+
+
+TOURNAMENT_CARD_HISTORY_HTML = """
+<div id="content">
+  <div class="content_grid">
+    <div>
+      <h2><a href="/en/comps/255/2026/2026-Play-offs-Stats">2026 Play-offs</a></h2>
+      <p>Top Scorer: <a href="/en/players/2e67fc18/Moises-Paniagua">Moises Paniagua</a></p>
+      <p><a href="/en/comps/1/World-Cup-Stats">2026 World Cup Qualifiers</a>:
+         <a href="/en/squads/9be9f315/Congo-DR-Men-Stats">Congo DR</a></p>
+    </div>
+    <div>
+      <h2><a href="/en/comps/255/2022/2022-Play-offs-Stats">2022 Play-offs</a></h2>
+    </div>
+  </div>
+</div>
+"""
+
+
+def test_history_without_a_seasons_table_reads_the_tournament_card_grid():
+    """Competitions whose editions are standalone tournaments (comp 255, the
+    World Cup inter-confederation play-offs) publish no table#seasons at all —
+    their history is a card grid. Rejecting the page would drop a men's
+    competition from the frontier."""
+    cup = _competition(
+        comp_id="255",
+        competition_format=CompetitionFormat.CUP,
+        participants=ParticipantType.NATIONAL_TEAM,
+    )
+
+    result = parse_competition_html(TOURNAMENT_CARD_HISTORY_HTML, cup)
+    seasons = result.datasets["seasons"].records
+
+    assert not result.has_errors
+    assert [item.season_id for item in seasons] == ["2026", "2022"]
+    assert seasons[0].season_url == (
+        "https://fbref.com/en/comps/255/2026/2026-Play-offs-Stats"
+    )
+    assert seasons[0].calendar_type == CalendarType.TOURNAMENT
+
+
+def test_card_grid_ignores_links_to_other_competitions_and_squads():
+    """The grid also links to the parent competition, squads and players; only
+    season routes of *this* competition may become season targets."""
+    cup = _competition(comp_id="255", competition_format=CompetitionFormat.CUP)
+
+    result = parse_competition_html(TOURNAMENT_CARD_HISTORY_HTML, cup)
+
+    urls = [item.season_url for item in result.datasets["seasons"].records]
+    assert all("/comps/255/" in url for url in urls)
+
+
+def test_a_history_page_with_no_seasons_at_all_still_fails_closed():
+    """No table, no cards — the page contract is broken and must not pass as an
+    empty-but-fine competition."""
+    result = parse_competition_html(
+        "<div id='content'><p>nothing here</p></div>", _competition()
+    )
+    dataset = result.datasets["seasons"]
+
+    assert result.has_errors
+    assert dataset.status == DatasetStatus.ERROR
+    assert dataset.reason == "season_history_table_missing"
