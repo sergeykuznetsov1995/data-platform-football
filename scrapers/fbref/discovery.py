@@ -752,6 +752,16 @@ def parse_season_html(
             error_type="ScheduleDiscoveryError",
             error_message="; ".join(errors)[:1000],
         )
+    elif not any(document.find("table") for document in documents):
+        # A single-match edition (the UEFA Super Cup) publishes a season page
+        # with no fixtures and no tables at all: there is nothing to schedule.
+        # A season page that does carry tables but advertises no schedule is a
+        # broken contract and still fails below.
+        result = _dataset(
+            "schedules",
+            status=DatasetStatus.NOT_APPLICABLE,
+            reason="season_publishes_no_schedule",
+        )
     else:
         result = _dataset(
             "schedules",
