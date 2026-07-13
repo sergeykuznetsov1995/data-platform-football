@@ -310,8 +310,14 @@ def _scope_identity(args: argparse.Namespace) -> ScopeIdentity:
         canonical = edition.canonical_season
         edition_current = bool(edition.current)
         edition_participant_count = edition.participant_count
+    # The source offsets some calendar leagues' saison_id from the season it
+    # names (saison_id 2023 is labelled "2024"), so the registered edition is
+    # checked against the label it was derived from, exactly as registry DQ
+    # does. Only a caller who passed no edition record at all is left with the
+    # edition id as the sole statement of its season.
     expected_canonical = canonical_season(
-        edition_id, competition.season_format,
+        edition.edition_label if raw_edition is not None else edition_id,
+        competition.season_format,
     )
     canonical = _required(canonical or expected_canonical, 'canonical_season')
     if canonical != expected_canonical:
