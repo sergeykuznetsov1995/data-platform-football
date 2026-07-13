@@ -659,8 +659,31 @@ class ControlStore:
                 or row["fetched_at"] != fetched_at
                 or dict(actual_metadata) != dict(metadata or {})
             ):
-                raise StateConflict(
-                    f"snapshot_id {snapshot} already has different evidence"
+                if bool(row["successful"]):
+                    raise StateConflict(
+                        f"snapshot_id {snapshot} already has different evidence"
+                    )
+                # A failed snapshot is evidence about our parse, not about the
+                # source. Freezing it would poison this (parser, page) pair
+                # forever: the retry that fixes the parser could never record
+                # its result, and the target would be stuck until the parser
+                # version changed. Successful snapshots stay immutable.
+                cursor.execute(
+                    """
+                    UPDATE fbref_control.registry_snapshot
+                    SET run_id = %s, source = %s, content_hash = %s,
+                        successful = %s, fetched_at = %s, metadata = %s::jsonb
+                    WHERE snapshot_id = %s
+                    """,
+                    (
+                        normalized_run,
+                        normalized_source,
+                        content_hash,
+                        bool(successful),
+                        fetched_at,
+                        _json(metadata),
+                        snapshot,
+                    ),
                 )
         return snapshot
 
