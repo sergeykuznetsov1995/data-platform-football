@@ -1293,8 +1293,10 @@ class TestRunnerInternals:
                 raise AssertionError('paid reader must not run')
 
             def materialize_legacy_market_value_history(
-                self, native, league, season,
+                self, native, league, season, season_format,
             ):
+                assert str(season_format) == 'SeasonFormat.SPLIT_YEAR'
+                assert season == 2025
                 return native.assign(league=league, season='2526')
 
             def get_traffic_stats(self):
@@ -1992,3 +1994,63 @@ def test_cli_keeps_child_run_key_but_uses_explicit_parent_cycle_ledger(
     assert mod.main() == 0
     assert captured['run_key'] == 'tm-child-exact'
     assert captured['cycle_ledger_key'] == 'scheduled__parent'
+
+
+class TestCoachCacheMergeSeason:
+    def test_the_cache_merge_dates_the_season_the_scraper_dated(
+        self, monkeypatch,
+    ):
+        """The scraper projects the season, then this merge reprojects it from
+        the union with bronze.  Letting the merge default the season format
+        turned a calendar season into a split one, and the two projections
+        disagreed key for key — which is exactly what the parity gate reads.
+        """
+        import pandas as pd
+        from scrapers.transfermarkt.registry import (
+            CompetitionType, SeasonFormat, TeamType, _bootstrap_record,
+        )
+
+        mod = _import_runner()
+        record = _bootstrap_record(
+            competition_id='2DVB',
+            slug='2-division-b',
+            name='Second League Division B',
+            country='Russia',
+            confederation='UEFA',
+            competition_type=CompetitionType.DOMESTIC_LEAGUE,
+            team_type=TeamType.CLUB,
+            season_format=SeasonFormat.SINGLE_YEAR,
+            source_url=(
+                'https://www.transfermarkt.com/2-division-b/startseite/'
+                'wettbewerb/2DVB'
+            ),
+            canonical_competition_id='TM-2DVB',
+        )
+        monkeypatch.setattr(mod, '_competition_record', lambda value: record)
+        monkeypatch.setenv('TM_CANONICAL_SEASON', '2024')
+        seen = {}
+
+        class _Scraper:
+            def materialize_legacy_coaches(
+                self, profiles, stints, league, season, season_format,
+            ):
+                seen.update(season=season, season_format=season_format)
+                return pd.DataFrame([{'coach_id': '10'}])
+
+        frames = mod._merge_coach_cache_frames(
+            _Scraper(),
+            {},
+            {
+                'profiles': pd.DataFrame([{'coach_id': '10'}]),
+                'stints': pd.DataFrame([{
+                    'club_id': '1', 'coach_id': '10',
+                    'appointed_date': None, 'left_date': None,
+                }]),
+            },
+            'TM-2DVB',
+            2023,
+        )
+
+        assert seen['season'] == 2024
+        assert seen['season_format'] is SeasonFormat.SINGLE_YEAR
+        assert list(frames['legacy_coaches']['coach_id']) == ['10']

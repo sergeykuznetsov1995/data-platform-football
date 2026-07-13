@@ -443,6 +443,22 @@ def _canonical_scope_season(competition: str, edition_id: int | str) -> str:
     return canonical_season(edition_id, record.season_format)
 
 
+def _scope_season(competition: str, edition_id: int | str) -> Dict[str, Any]:
+    """The season a dated projection must use, and the format that dates it."""
+
+    from scrapers.transfermarkt.registry import season_window_year
+
+    record = _competition_record(competition)
+    canonical = _canonical_scope_season(competition, edition_id)
+    return {
+        'canonical_season': canonical,
+        'season_format': record.season_format,
+        'season_year': season_window_year(
+            edition_id, record.season_format, canonical,
+        ),
+    }
+
+
 def _compatibility_league(competition: str) -> str:
     record = _competition_record(competition)
     return record.canonical_competition_id or f'TM-{record.competition_id}'
@@ -1967,15 +1983,18 @@ def _merge_career_cache_frames(
     )
     if not native.empty:
         native = native.drop_duplicates(list(natural_key), keep='last')
+    scope = _scope_season(league, season)
     if spec.name == ENTITY_MV_HISTORY:
         legacy = scraper.materialize_legacy_market_value_history(
-            native, league, season,
+            native, league, scope['season_year'], scope['season_format'],
         )
         return {
             'market_value_points': native,
             'legacy_market_value_history': legacy,
         }
-    legacy = scraper.materialize_legacy_transfers(native, league, season)
+    legacy = scraper.materialize_legacy_transfers(
+        native, league, scope['season_year'], scope['season_format'],
+    )
     return {'transfer_events': native, 'legacy_transfers': legacy}
 
 
@@ -2038,8 +2057,12 @@ def _merge_coach_cache_frames(
     ).drop_duplicates(
         ['club_id', 'coach_id', 'appointed_date', 'left_date'], keep='last',
     )
+    # Both the scraper and this merge project the same league-season, so both
+    # must date its window the same way.  Defaulting the format here made a
+    # calendar season a split one and the two projections disagreed.
+    scope = _scope_season(league, season)
     legacy = scraper.materialize_legacy_coaches(
-        profiles, stints, league, season,
+        profiles, stints, league, scope['season_year'], scope['season_format'],
     )
     return {
         'profiles': profiles,
@@ -2104,8 +2127,10 @@ def _read_frames(
                 authoritative = 'legacy_players'
         else:
             if mode == 'dual' and 'legacy_coaches' not in frames:
+                scope = _scope_season(league, season)
                 frames['legacy_coaches'] = scraper.materialize_legacy_coaches(
-                    frames['profiles'], frames['stints'], league, season,
+                    frames['profiles'], frames['stints'], league,
+                    scope['season_year'], scope['season_format'],
                 )
             if mode == 'native-only':
                 frames.pop('legacy_coaches', None)
@@ -2118,7 +2143,10 @@ def _read_frames(
         points = getattr(scraper, spec.native_reader)(**common)
         if mode == 'native-only':
             return {'market_value_points': points}, 'market_value_points', True
-        legacy = scraper.materialize_legacy_market_value_history(points, league, season)
+        scope = _scope_season(league, season)
+        legacy = scraper.materialize_legacy_market_value_history(
+            points, league, scope['season_year'], scope['season_format'],
+        )
         return {
             'market_value_points': points,
             'legacy_market_value_history': legacy,
@@ -2128,7 +2156,10 @@ def _read_frames(
         events = getattr(scraper, spec.native_reader)(**common)
         if mode == 'native-only':
             return {'transfer_events': events}, 'transfer_events', True
-        legacy = scraper.materialize_legacy_transfers(events, league, season)
+        scope = _scope_season(league, season)
+        legacy = scraper.materialize_legacy_transfers(
+            events, league, scope['season_year'], scope['season_format'],
+        )
         return {
             'transfer_events': events,
             'legacy_transfers': legacy,
