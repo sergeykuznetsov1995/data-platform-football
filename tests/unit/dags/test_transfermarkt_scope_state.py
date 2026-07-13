@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 
 import pytest
@@ -93,6 +94,8 @@ def _manifest(
                 team_type='club',
             ),
             'authoritative_empty_evidence': {},
+            'roster_coverage': {},
+            'career_fetches_pending': 0,
             'participant_contract': {
                 'passed': True,
                 'competition_type': 'domestic_league',
@@ -214,6 +217,8 @@ def test_scope_digest_binds_strict_participant_dq_evidence():
                 competition_type='continental_club',
                 team_type='club',
             ),
+            'roster_coverage': {},
+            'career_fetches_pending': 0,
             'participant_contract': {
                 **manifest.dq_evidence['participant_contract'],
                 'competition_type': 'continental_club',
@@ -311,3 +316,41 @@ def test_scope_control_ddl_is_additive_and_has_global_ledger():
     assert state.SCOPE_SET_MANIFEST_TABLE in sql
     assert state.PROXY_LEDGER_TABLE in sql
     assert 'provider_metered_bytes bigint' in sql
+
+
+def test_a_scope_cannot_understate_the_careers_it_still_owes():
+    # A career fact is bought a roster window at a time, so a scope can be
+    # 'complete' while holding a hundred of a league's several thousand
+    # players. The count rides inside the manifest hash precisely so that it
+    # cannot be edited afterwards to say the slot is fuller than it is.
+    manifest = _manifest('GB1:2025')
+    lying = dataclasses.replace(
+        manifest,
+        dq_evidence={
+            **manifest.dq_evidence,
+            'roster_coverage': {
+                'market_value_history': {
+                    'roster_size': 2859, 'selected': 100, 'pending': 2759,
+                },
+            },
+            'career_fetches_pending': 0,
+        },
+    )
+
+    with pytest.raises(state.ScopeManifestError, match='career_fetches_pending'):
+        lying.validate(EXPECTED)
+
+    honest = dataclasses.replace(
+        manifest,
+        dq_evidence={
+            **manifest.dq_evidence,
+            'roster_coverage': {
+                'market_value_history': {
+                    'roster_size': 2859, 'selected': 100, 'pending': 2759,
+                },
+            },
+            'career_fetches_pending': 2759,
+        },
+    )
+    honest.validate(EXPECTED)
+    assert honest.digest != manifest.digest

@@ -101,6 +101,8 @@ def _manifest(mod, suffix='1', **changes):
                 team_type='club',
             ),
             'authoritative_empty_evidence': {},
+            'roster_coverage': {},
+            'career_fetches_pending': 0,
             'participant_contract': {
                 'passed': True,
                 'competition_type': 'domestic_league',

@@ -475,6 +475,8 @@ def _scope_manifest_fixture(
             team_type='club',
         ),
         'authoritative_empty_evidence': {},
+        'roster_coverage': {},
+        'career_fetches_pending': 0,
         'participant_contract': {
             'passed': True,
             'competition_type': competition_type,

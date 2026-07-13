@@ -1099,6 +1099,24 @@ def _build_scope_manifest(
                 'kind': kind,
                 'result_sha256': run.result_sha256,
             }
+    # A career fact is bought a roster window at a time.  Say how much of the
+    # roster this scope actually holds: a manifest that only says 'complete'
+    # cannot tell a scope covering every player from one covering a hundred.
+    roster_coverage = {
+        run.parser_entity: dict(run.result['roster_coverage'])
+        for run in runs
+        if isinstance(run.result.get('roster_coverage'), Mapping)
+    }
+    pending_total = sum(
+        int(item.get('pending', 0)) for item in roster_coverage.values()
+    )
+    if pending_total:
+        print(
+            f'ROSTER COVERAGE: {pending_total} career fetches still pending '
+            f'for {identity.scope_id}; a later cycle continues from the '
+            'checkpoint',
+            file=sys.stderr,
+        )
     dq_evidence = {
         'status': 'passed',
         'registry_participant_count': identity.edition_participant_count,
@@ -1108,6 +1126,8 @@ def _build_scope_manifest(
         'entity_contracts': entity_contracts,
         'authoritative_empty_evidence': authoritative_empty_evidence,
         'participant_contract': dict(participant_dq),
+        'roster_coverage': roster_coverage,
+        'career_fetches_pending': pending_total,
     }
     scope = ScopeManifest(
         parent_cycle_id=identity.parent_cycle_id,
