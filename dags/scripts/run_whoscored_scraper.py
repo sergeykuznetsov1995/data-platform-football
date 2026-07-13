@@ -593,6 +593,12 @@ def _invoke(
                 else None
             ),
             force_replay=bool(getattr(args, "_force_replay", False)),
+            kickoff_from=(
+                datetime_lib.datetime.now(datetime_lib.timezone.utc)
+                - datetime_lib.timedelta(days=7)
+                if daily_incremental
+                else None
+            ),
         )
     if operation == "profiles":
         return service.sync_profiles(
