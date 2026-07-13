@@ -37,11 +37,35 @@ gaps:
     reason: "FBref publishes no events for this Ligue 1 relegation play-off."
     evidence: "Refetched 2026-07-12: bronze.fbref_dataset_availability records match_events=empty and match_player_stats=empty; raw page ships empty event columns."
 
+  - match_id: "492076cf"
+    league: "GER-Bundesliga"
+    season: "1617"
+    reason: "FBref publishes no events for this Bundesliga relegation play-off."
+    evidence: "Refetched 2026-07-13: bronze.fbref_dataset_availability records match_events=empty and match_player_stats=empty; raw page ships empty event columns."
+
+  - match_id: "5dc40876"
+    league: "GER-Bundesliga"
+    season: "1718"
+    reason: "FBref publishes no events for this Bundesliga relegation play-off."
+    evidence: "Refetched 2026-07-13: bronze.fbref_dataset_availability records match_events=empty and match_player_stats=empty; raw page ships empty event columns."
+
   - match_id: "9c6a24db"
     league: "GER-Bundesliga"
     season: "1718"
     reason: "FBref publishes no events for this Bundesliga relegation play-off."
     evidence: "Refetched 2026-07-12: bronze.fbref_dataset_availability records match_events=empty and match_player_stats=empty; raw page ships empty event columns."
+
+  - match_id: "f5e7a5c2"
+    league: "GER-Bundesliga"
+    season: "1819"
+    reason: "FBref publishes no events for this Bundesliga relegation play-off."
+    evidence: "Refetched 2026-07-13: bronze.fbref_dataset_availability records match_events=empty and match_player_stats=empty; raw page ships empty event columns."
+
+  - match_id: "434865ef"
+    league: "GER-Bundesliga"
+    season: "1920"
+    reason: "FBref publishes no events for this Bundesliga relegation play-off."
+    evidence: "Refetched 2026-07-13: bronze.fbref_dataset_availability records match_events=empty and match_player_stats=empty; raw page ships empty event columns."
 
   - match_id: "e262266b"
     league: "GER-Bundesliga"
