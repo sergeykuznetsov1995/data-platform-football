@@ -87,6 +87,19 @@ def _entity_ids(tag: Tag) -> Dict[str, str]:
     return found
 
 
+def _span(cell: Tag, name: str) -> int:
+    """Read a colspan/rowspan that FBref does not always emit as a number.
+
+    Its player pages ship ``colspan=""`` on every wages row header, and one cell
+    per page comes out of the markup as ``colspan='class="'`` — an unquoted
+    attribute the parser folds into the span. Trusting the value crashed the
+    generic layer and discarded the whole page, which is the one thing a
+    lossless capture must never do: a broken span is a rendering hint, not data.
+    """
+    raw = str(cell.get(name) or "").strip()
+    return max(1, int(raw)) if raw.isdigit() else 1
+
+
 def _expand_header_grid(header_rows: Sequence[Tag]) -> List[List[str]]:
     """Expand rowspan/colspan headers into a rectangular text grid."""
 
@@ -100,8 +113,8 @@ def _expand_header_grid(header_rows: Sequence[Tag]) -> List[List[str]]:
                 rendered.append(occupied[(row_index, column)])
                 column += 1
             value = _text(cell)
-            colspan = max(1, int(cell.get("colspan") or 1))
-            rowspan = max(1, int(cell.get("rowspan") or 1))
+            colspan = _span(cell, "colspan")
+            rowspan = _span(cell, "rowspan")
             for offset in range(colspan):
                 rendered.append(value)
                 for future_row in range(row_index + 1, row_index + rowspan):
