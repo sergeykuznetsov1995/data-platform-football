@@ -28,6 +28,7 @@ Requirements (already in the image, do NOT bump):
 import asyncio
 import logging
 import os
+import threading
 import time
 from collections import Counter
 from typing import Callable, Dict, Optional
@@ -160,6 +161,13 @@ class CamoufoxFbrefTransport:
     CLICK_ATTEMPTS = 3
     # Browser restarts (each on a fresh proxy) before giving up on a page.
     MAX_PROXY_ROTATIONS = 3
+    # Camoufox's launch has no timeout of its own.  On an exit IP that accepts
+    # the connection but never answers, it waits forever inside Playwright's
+    # event loop, and no navigation timeout applies because navigation never
+    # starts — a production fetch wave then hangs until its own kill deadline.
+    # A healthy launch (Firefox start plus the geoip lookup through the proxy)
+    # completes in seconds.
+    BROWSER_START_TIMEOUT_S = 120.0
 
     def __init__(
         self,
@@ -209,6 +217,7 @@ class CamoufoxFbrefTransport:
         self._requests_count = 0
         self._network_requests_started = 0
         self._browser_start_attempts = 0
+        self._browser_start_timeouts = 0
         self._navigation_attempts = 0
         self._budget_blocked_count = 0
         self._inflight_byte_reservations: Dict[int, int] = {}
@@ -287,9 +296,20 @@ class CamoufoxFbrefTransport:
         if self._proxy:
             kwargs["proxy"] = self._proxy
             kwargs["geoip"] = self._geoip  # locale/timezone matched to exit IP
-        self._cm = Camoufox(**kwargs)
-        self._browser = self._cm.__enter__()
-        self._page = self._browser.new_page()
+        # The launch itself is unbounded (see BROWSER_START_TIMEOUT_S), so kill
+        # the browser it spawned if it overruns: Playwright then raises out of
+        # the launch and the caller rotates onto a fresh exit IP.
+        watchdog = threading.Timer(
+            self.BROWSER_START_TIMEOUT_S, self._kill_browser_processes
+        )
+        watchdog.daemon = True
+        watchdog.start()
+        try:
+            self._cm = Camoufox(**kwargs)
+            self._browser = self._cm.__enter__()
+            self._page = self._browser.new_page()
+        finally:
+            watchdog.cancel()
         if (
             self._block_resources
             or self._max_network_requests is not None
@@ -303,6 +323,36 @@ class CamoufoxFbrefTransport:
         server = (self._proxy or {}).get("server", "direct")
         logger.info("Camoufox session started (proxy=%s, humanize=%s)",
                     server, self._humanize)
+
+    def _kill_browser_processes(self) -> None:
+        """Kill the browser processes this transport spawned, and only those.
+
+        Runs on a watchdog thread, so it must not touch Playwright objects:
+        killing the processes is what makes the blocked launch call raise.
+        """
+        import psutil
+
+        try:
+            children = psutil.Process().children(recursive=True)
+        except psutil.Error:  # the process tree can vanish mid-walk
+            return
+        killed = 0
+        for child in children:
+            try:
+                name = (child.name() or "").casefold()
+                if "camoufox" in name or "firefox" in name or "node" in name:
+                    child.kill()
+                    killed += 1
+            except psutil.Error:
+                continue
+        if killed:
+            self._browser_start_timeouts += 1
+            logger.warning(
+                "Camoufox start exceeded %.0fs (dead exit IP?) — killed %d "
+                "browser process(es) to force a proxy rotation",
+                self.BROWSER_START_TIMEOUT_S,
+                killed,
+            )
 
     def _stop(self) -> None:
         if self._cm is not None:
@@ -852,6 +902,7 @@ class CamoufoxFbrefTransport:
                 self._browser_start_attempts, self._navigation_attempts
             ),
             "browser_start_attempts": self._browser_start_attempts,
+            "browser_start_timeouts": self._browser_start_timeouts,
             "browser_navigation_attempts": self._navigation_attempts,
             "budget_blocked_count": self._budget_blocked_count,
             "inflight_reserved_bytes": self._inflight_reserved_bytes,
