@@ -2987,6 +2987,7 @@ def _run_entity(
             retry_budget=retry_budget,
             response_cache=response_cache,
             cache_ttl_seconds=cache_ttl,
+            canonical_season=os.environ.get('TM_CANONICAL_SEASON'),
         ) as scraper:
             if spec.state_endpoint:
                 checkpoint_spec = spec
