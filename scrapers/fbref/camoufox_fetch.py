@@ -342,10 +342,14 @@ class CamoufoxFbrefTransport:
     def _kill_browser_processes(
         self, phase: str = "start", timeout_s: Optional[float] = None
     ) -> None:
-        """Kill the browser processes this transport spawned, and only those.
+        """Kill the browser this transport spawned, and only the browser.
 
         Runs on a watchdog thread, so it must not touch Playwright objects:
-        killing the processes is what makes the blocked call raise.
+        the browser's death is what makes the blocked call raise. Playwright's
+        node driver is deliberately spared — killing it severs the connection
+        every later session in this process depends on, and every subsequent
+        navigation then failed instantly with NS_ERROR_FAILURE (observed in
+        production: three fresh proxies "failed" 150ms after launch).
         """
         import psutil
 
@@ -357,7 +361,7 @@ class CamoufoxFbrefTransport:
         for child in children:
             try:
                 name = (child.name() or "").casefold()
-                if "camoufox" in name or "firefox" in name or "node" in name:
+                if "camoufox" in name or "firefox" in name:
                     child.kill()
                     killed += 1
             except psutil.Error:
