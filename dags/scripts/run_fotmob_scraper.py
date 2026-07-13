@@ -242,7 +242,7 @@ def _build_native_service(args, run_id: str):
         max_attempts=args.max_attempts,
         rate_limiter=limiter,
     )
-    repository = FotMobRepository(batch_size=args.commit_batch_size)
+    repository = FotMobRepository()
     budget = TransportBudget(
         max_requests=args.max_requests,
         max_direct_bytes=int(args.max_direct_mib * 1024 * 1024),
@@ -278,20 +278,6 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
     operations = []
 
     def finish() -> tuple[int, dict[str, Any]]:
-        # Buffered commits are only durable once flushed. Every exit path of
-        # this run — completion, budget cut, empty catalog — goes through
-        # finish(), so the flush belongs here and its failure must turn the
-        # run red instead of silently dropping targets.
-        flush_operation = OperationResult("commit_flush", attempted=1)
-        try:
-            flush_operation.tables.extend(service.repository.flush())
-            flush_operation.succeeded = 1
-        except Exception as exc:
-            flush_operation.errors.append(
-                f"commit flush: {type(exc).__name__}: {exc}"
-            )
-        operations.append(flush_operation)
-
         view_operation = OperationResult("current_views", attempted=1)
         try:
             views = service.repository.ensure_current_views()
@@ -886,15 +872,6 @@ def _argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--requests-per-minute", type=int, default=30)
     parser.add_argument("--max-attempts", type=int, default=4)
     parser.add_argument("--workers", type=int, default=4)
-    parser.add_argument(
-        "--commit-batch-size",
-        type=int,
-        default=50,
-        help=(
-            "Targets buffered into one Iceberg commit per table. 1 commits "
-            "every target separately (one single-row data file per target)."
-        ),
-    )
     parser.add_argument("--competition-limit", type=int, default=0)
     parser.add_argument("--season-limit", type=int, default=0)
     parser.add_argument("--match-limit", type=int, default=0)

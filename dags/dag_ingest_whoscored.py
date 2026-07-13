@@ -1498,7 +1498,12 @@ with DAG(
             # An earlier Airflow retry would see no due candidates and could
             # overwrite the failed report with a false-green empty run.
             retries=0,
-            execution_timeout=timedelta(minutes=45),
+            # World Cup qualification exposes many active stages and is the
+            # measured worst case: bounded browser batches plus atomic Iceberg
+            # staging can exceed 45 minutes on a cold scope. Completed table
+            # batches are resumable, but the task needs enough time to publish
+            # the final scope manifest in one attempt.
+            execution_timeout=timedelta(minutes=75),
         ).expand(bash_command=build_commands.output)
         scope_dq = PythonOperator.partial(
             task_id="validate_active_scope",

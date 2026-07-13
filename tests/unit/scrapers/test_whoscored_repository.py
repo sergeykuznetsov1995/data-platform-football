@@ -22,6 +22,7 @@ from scrapers.whoscored.repository import (
     WHOSCORED_BUSINESS_COLUMN_CONTRACTS,
     WHOSCORED_BUSINESS_TABLES,
     WhoScoredRepository,
+    _clean_unicode,
 )
 
 
@@ -87,6 +88,19 @@ def _commit(*, lineups=(), lineups_available=False) -> MatchCommit:
             "lineups": "available" if lineups else "empty",
         },
     )
+
+
+@pytest.mark.unit
+def test_invalid_json_surrogates_are_repaired_before_utf8_write():
+    pair = chr(0xD83C) + chr(0xDDE6)
+    lone = chr(0xD800)
+
+    cleaned = _clean_unicode("flag " + pair + " broken " + lone)
+
+    assert cleaned == "flag " + chr(0x1F1E6) + " broken �"
+    cleaned.encode("utf-8")
+    encoded = WhoScoredRepository._canonical_json({"player": pair + lone})
+    encoded.encode("utf-8")
 
 
 def _preview_commit(
@@ -392,6 +406,8 @@ def test_profile_current_view_matches_legacy_null_hashes_null_safely():
     assert "IS NOT DISTINCT FROM" not in profile_view
     assert "m.parser_version = p.parser_version" in profile_view
     assert "PARTITION BY player_id" in profile_view
+    assert "PARTITION BY p.player_id" in profile_view
+    assert "ORDER BY p.fetched_at DESC, p._ingested_at DESC" in profile_view
     assert "WHERE m.state = 'success'" in profile_view
     assert "JOIN latest m" in profile_view
     assert "m._profile_batch_id = p._profile_batch_id" in profile_view
@@ -1203,6 +1219,30 @@ def test_match_parse_failure_manifest_keeps_raw_identity_for_offline_replay():
     assert row["payload_sha256"] == "a" * 64
     assert row["raw_uri"] == "s3://raw/match.html.gz"
     assert row["parser_version"] == PARSER_VERSION
+
+
+@pytest.mark.unit
+def test_match_not_available_manifest_is_a_terminal_source_state():
+    writer = MagicMock()
+    repository = WhoScoredRepository(writer=writer, trino=MagicMock())
+
+    repository.record_failure(
+        ManifestFailure(
+            game_id=123,
+            league="WS-100-208",
+            season="2026",
+            state="not_available",
+            failure_code="source_not_available",
+            error="non-Opta match has no matchCentreData",
+            retry_after=None,
+            attempt_no=1,
+        )
+    )
+
+    row = writer.write_dataframe.call_args.args[0].iloc[0]
+    assert row["state"] == "not_available"
+    assert bool(row["is_final"]) is True
+    assert row["retry_after"] is None
 
 
 @pytest.mark.unit
