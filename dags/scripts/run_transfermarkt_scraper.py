@@ -122,7 +122,7 @@ PRODUCTION_ENTITY_BUDGETS = {
     ENTITY_PLAYERS: {'decoded_mb': 10.0, 'requests': 150},
     ENTITY_MV_HISTORY: {'decoded_mb': 4.0, 'requests': 200},
     ENTITY_TRANSFERS: {'decoded_mb': 8.0, 'requests': 200},
-    ENTITY_COACHES: {'decoded_mb': 6.0, 'requests': 160},
+    ENTITY_COACHES: {'decoded_mb': 14.0, 'requests': 160},
 }
 
 
