@@ -13,6 +13,7 @@ Emits the exact `airflow dags trigger --conf` payload for the batch.
 from __future__ import annotations
 
 import argparse
+import hashlib
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
@@ -138,6 +139,7 @@ def _packets(
     scope_id: str,
     argv: tuple[str, ...],
     *,
+    cycle_tag: str,
     write_mode: str,
     approval_root: Path,
     journal_path: Path,
@@ -161,7 +163,7 @@ def _packets(
         ),
     }
     paid = ApprovalPacket(
-        packet_id=f"tm-scope-paid-{scope_id}",
+        packet_id=f"tm-scope-paid-{cycle_tag}-{scope_id}",
         action="paid_proxy",
         byte_cap_bytes=PROVIDER_HARD_CAP_BYTES,
         byte_cap_mib=PROVIDER_HARD_CAP_BYTES / 1024 / 1024,
@@ -170,7 +172,7 @@ def _packets(
         **common,
     )
     write = ApprovalPacket(
-        packet_id=f"tm-scope-write-{scope_id}",
+        packet_id=f"tm-scope-write-{cycle_tag}-{scope_id}",
         action="production_write",
         byte_cap_bytes=0,
         byte_cap_mib=0,
@@ -181,8 +183,8 @@ def _packets(
     return {
         "paid": paid,
         "write": write,
-        "paid_path": approval_root / f"scope-paid-{scope_id}.json",
-        "write_path": approval_root / f"scope-write-{scope_id}.json",
+        "paid_path": approval_root / f"scope-paid-{cycle_tag}-{scope_id}.json",
+        "write_path": approval_root / f"scope-write-{cycle_tag}-{scope_id}.json",
     }
 
 
@@ -227,6 +229,10 @@ def build_plan(
     if not plan.mapped_payloads:
         raise ValueError("promoted registry produced no due scope")
 
+    # A scope is crawled again every refresh cycle, and a one-shot packet id can
+    # never be reused, so the packet belongs to the (parent cycle, scope) pair.
+    cycle_tag = hashlib.sha256(parent_cycle_id.encode()).hexdigest()[:12]
+
     bundles: dict[str, dict[str, str]] = {}
     packets: dict[str, dict] = {}
     for payload in plan.mapped_payloads:
@@ -244,6 +250,7 @@ def build_plan(
         bundle = _packets(
             scope_id,
             argv,
+            cycle_tag=cycle_tag,
             write_mode=write_mode,
             approval_root=approval_root,
             journal_path=journal_path,

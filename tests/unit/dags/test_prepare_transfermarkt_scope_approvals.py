@@ -105,9 +105,14 @@ def _registry_row(competition_id: str, edition_id: str) -> dict:
     }
 
 
-def _plan(module, tmp_path: Path, rows: list[dict] | None = None):
+def _plan(
+    module,
+    tmp_path: Path,
+    rows: list[dict] | None = None,
+    parent_cycle_id: str = PARENT_CYCLE_ID,
+):
     return module.build_plan(
-        PARENT_CYCLE_ID,
+        parent_cycle_id,
         registry_snapshot_id=SNAPSHOT_ID,
         approval_root=tmp_path / "approvals",
         journal_path=tmp_path / "approvals" / "journal.json",
@@ -115,6 +120,24 @@ def _plan(module, tmp_path: Path, rows: list[dict] | None = None):
             [_registry_row("GB1", "2025")] if rows is None else rows
         ),
     )
+
+
+def test_the_same_scope_can_be_crawled_again_by_a_later_cycle(tmp_path):
+    module = _load()
+    first = _plan(module, tmp_path)
+    module.apply_plan(first)
+
+    # A one-shot packet id is never reusable and its file is never overwritten,
+    # so a refresh of the same scope needs packets of its own.
+    second = _plan(module, tmp_path, parent_cycle_id="manual__tm_ingest_later")
+    scope_id = second["scope_ids"][0]
+    assert scope_id == first["scope_ids"][0]
+    for kind in ("paid", "write"):
+        assert (
+            second["packets"][scope_id][kind].packet_id
+            != first["packets"][scope_id][kind].packet_id
+        )
+    module.apply_plan(second)
 
 
 def test_paid_and_write_packets_share_the_childs_own_argv(tmp_path):
