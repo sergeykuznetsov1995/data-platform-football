@@ -578,3 +578,66 @@ class TestFotmobNativeRunner:
         assert rc == 1
         assert report["status"] == "incomplete"
         assert any("not advertised" in error for error in report["errors"])
+
+    @pytest.mark.unit
+    def test_every_exit_path_flushes_buffered_commits(self):
+        # Batched commits live in memory until flushed. finish() is the single
+        # exit of _run_native, so a missing flush there silently drops the
+        # last targets of every run — including budget-cut runs.
+        from scrapers.fotmob.transport import canonicalize_target
+        from tests.unit.scrapers.test_fotmob_service import (
+            _league_payload,
+            _service,
+        )
+
+        mod = self._module()
+        responses = {
+            canonicalize_target("allLeagues").canonical_url: {
+                "countries": [{"leagues": [{"id": 47, "name": "Premier League"}]}]
+            },
+            canonicalize_target("leagues", {"id": 47}).canonical_url: _league_payload(),
+            canonicalize_target(
+                "leagues", {"id": 47, "season": "2025/2026"}
+            ).canonical_url: _league_payload(),
+        }
+        service, _, repository = _service(responses)
+        repository.ensure_current_views = MagicMock(return_value=[])
+        repository.flush = MagicMock(return_value=["iceberg.bronze.fotmob_matches"])
+        args = mod._argument_parser().parse_args(
+            ["--mode", "daily", "--scope", "47=2025/2026", "--entities", "season"]
+        )
+
+        rc, report = mod._run_native(args, service=service)
+
+        assert rc == 0
+        repository.flush.assert_called_once_with()
+
+    @pytest.mark.unit
+    def test_failed_flush_turns_the_run_red_instead_of_losing_targets(self):
+        from scrapers.fotmob.transport import canonicalize_target
+        from tests.unit.scrapers.test_fotmob_service import (
+            _league_payload,
+            _service,
+        )
+
+        mod = self._module()
+        responses = {
+            canonicalize_target("allLeagues").canonical_url: {
+                "countries": [{"leagues": [{"id": 47, "name": "Premier League"}]}]
+            },
+            canonicalize_target("leagues", {"id": 47}).canonical_url: _league_payload(),
+            canonicalize_target(
+                "leagues", {"id": 47, "season": "2025/2026"}
+            ).canonical_url: _league_payload(),
+        }
+        service, _, repository = _service(responses)
+        repository.ensure_current_views = MagicMock(return_value=[])
+        repository.flush = MagicMock(side_effect=RuntimeError("catalog down"))
+        args = mod._argument_parser().parse_args(
+            ["--mode", "daily", "--scope", "47=2025/2026", "--entities", "season"]
+        )
+
+        rc, report = mod._run_native(args, service=service)
+
+        assert rc == 1
+        assert any("commit flush" in error for error in report["errors"])
