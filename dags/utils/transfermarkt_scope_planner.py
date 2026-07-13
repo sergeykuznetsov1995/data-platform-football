@@ -338,13 +338,18 @@ def _resolve_edition(
         edition for key, edition in editions.items()
         if key[0] == competition.competition_id
     ]
-    direct = [
-        item for item in available
-        if raw in {item.edition_id, item.edition_label, item.canonical_season}
-    ]
-    if direct:
-        matches = direct
-    else:
+    # A calendar-year league offsets its saison_id from the season it names:
+    # 2DVB's edition '2024' is season 2025, and season 2024 is edition '2023'.
+    # Matching the three fields as one set makes every such selector ambiguous,
+    # so read them narrowest first: the source's own key, then its label.
+    matches: list[EditionRecord] = []
+    for field in ('edition_id', 'edition_label', 'canonical_season'):
+        matches = [
+            item for item in available if getattr(item, field) == raw
+        ]
+        if matches:
+            break
+    if not matches:
         try:
             requested_canonical = canonical_season(
                 raw, competition.season_format
