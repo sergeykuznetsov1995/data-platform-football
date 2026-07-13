@@ -762,6 +762,17 @@ def parse_season_html(
             status=DatasetStatus.NOT_APPLICABLE,
             reason="season_publishes_no_schedule",
         )
+    elif not _COMPETITION_ID_RE.match(season.comp_id):
+        # FBref addresses its aggregate views by name rather than by id (comp
+        # "Big5", the Big 5 European Leagues Combined — the only non-numeric id
+        # it publishes). An aggregate has stat tables but plays no fixtures of
+        # its own: its matches belong to the five leagues it sums up, which are
+        # crawled in their own right.
+        result = _dataset(
+            "schedules",
+            status=DatasetStatus.NOT_APPLICABLE,
+            reason="aggregate_competition_has_no_fixtures",
+        )
     else:
         result = _dataset(
             "schedules",
