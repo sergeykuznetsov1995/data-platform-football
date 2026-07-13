@@ -346,6 +346,39 @@ def test_catalog_table_groups_classify_rows_the_section_only_brackets() -> None:
     assert by_id["GB18"].age_category is not by_id["GB1"].age_category
 
 
+def test_a_youth_tournament_is_excluded_even_where_the_source_marks_no_age() -> None:
+    navigation = (FIXTURES / "navigation.html").read_text(encoding="utf-8")
+    youth_tournament = (
+        '<a href="/u17-world-cup/startseite/wettbewerb/17WC">U17 World Cup</a>'
+    )
+    navigation = navigation.replace("</body>", youth_tournament + "</body>")
+    profile = (
+        '<!doctype html><html lang="en"><body>'
+        '<h1 data-competition-id="17WC">U17 World Cup</h1>'
+        '<select name="saison_id"><option value="2026" selected>2026</option>'
+        "</select></body></html>"
+    )
+
+    pages, *_ = _discover(
+        fetch=FixtureFetch(
+            {
+                BASE_URL + "/navigation/wettbewerbe": navigation,
+                BASE_URL + "/u17-world-cup/startseite/wettbewerb/17WC": profile,
+            }
+        )
+    )
+    snapshot = reconcile_registry_pages(pages)
+    tournament = next(
+        item for item in snapshot.competitions if item.competition_id == "17WC"
+    )
+    senior = next(
+        item for item in snapshot.competitions if item.competition_id == "GB1"
+    )
+
+    assert tournament.classification_status is ClassificationStatus.EXCLUDED
+    assert senior.classification_status is ClassificationStatus.ELIGIBLE
+
+
 def test_discovery_ignores_navbar_entries_that_every_page_repeats() -> None:
     afrika = (FIXTURES / "afrika.html").read_text(encoding="utf-8")
     navbar = (

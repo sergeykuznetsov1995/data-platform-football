@@ -498,6 +498,36 @@ def _signal_evidence(
     )
 
 
+_NAME_AGE_RE = re.compile(r"\b[uU]-?(?:1[4-9]|2[0-3])\b|\byouth\b", re.IGNORECASE)
+_NAME_WOMEN_RE = re.compile(r"\bwomen(?:'s)?\b|\bfrauen\b|\bfeminin\w*\b", re.IGNORECASE)
+
+
+def _name_exclusion_evidence(
+    name: str,
+    source_url: str,
+) -> Optional[ClassificationEvidence]:
+    """What the competition's own name rules out.
+
+    Age is stated structurally only for leagues, under the catalogue's "Youth
+    league" group. A youth *tournament* is listed beside the senior ones — the
+    U17 World Cup sits in the same "National Team Competitions" section as the
+    World Cup — and says so only in its name. This evidence can exclude a
+    competition from the crawl; ``_classification`` never lets it admit one.
+    """
+    age = AgeCategory.UXX if _NAME_AGE_RE.search(name) else None
+    gender = Gender.WOMEN if _NAME_WOMEN_RE.search(name) else None
+    if age is None and gender is None:
+        return None
+    return ClassificationEvidence(
+        source_field="competition_name",
+        source_value=name,
+        source_url=source_url,
+        origin=EvidenceOrigin.NAME,
+        age_category=age,
+        gender=gender,
+    )
+
+
 def _taxonomy_evidence(source_url: str) -> ClassificationEvidence:
     return ClassificationEvidence(
         source_field="transfermarkt_taxonomy",
@@ -581,6 +611,9 @@ def _listing_candidates(
         # manufacture a conflict and block the whole registry instead of
         # source-backed exclusion of that competition.
         evidence = []
+        excluded_by_name = _name_exclusion_evidence(name, page_url)
+        if excluded_by_name is not None:
+            evidence.append(excluded_by_name)
         if all(signals.gender is not Gender.WOMEN for _, signals, _p in stated):
             evidence.append(_taxonomy_evidence(page_url))
         for label, signals, precedence in stated:
