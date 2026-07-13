@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import time
 import uuid
 from contextlib import ExitStack
@@ -24,6 +25,7 @@ from scrapers.fbref.control import (
     ControlStore,
     FrontierTarget,
     SeasonRegistryEntry,
+    StateConflict,
     make_control_run_id,
     make_logical_refresh_id,
 )
@@ -68,14 +70,15 @@ from scrapers.fbref.raw_store import (
     season_page_target,
 )
 from scrapers.fbref.settings import (
-    DEFAULT_BOOTSTRAP_REQUEST_RESERVATION,
     DEFAULT_BYTE_LIMIT,
     DEFAULT_DOMAIN_INTERVAL_SECONDS,
     DEFAULT_REQUEST_LIMIT,
     DEFAULT_REQUEST_RESERVATION_BYTES,
     DEFAULT_SHARD_SIZE,
+    MAX_CLEARANCE_SOLVE_ATTEMPTS,
     MAX_SHARD_SIZE,
     MIB,
+    bootstrap_reservation_for,
 )
 from scrapers.fbref.typed_bronze import (
     TYPED_BRONZE_PARSER_VERSION,
@@ -106,6 +109,17 @@ SENTINEL_COMPETITIONS = (
 FETCH_LEASE_SECONDS = 60 * 60
 PROCESSING_LEASE_SECONDS = 60 * 60
 
+# Statuses Cloudflare returns when it no longer honours a cf_clearance for the
+# warm HTTP session. They say nothing about the target page — only that this
+# clearance is dead — so the wave re-solves instead of failing every remaining
+# target against it.
+CLEARANCE_REJECTED_STATUSES = frozenset({401, 403, 429})
+# Each refresh costs one browser solve, so a source that rejects clearances
+# outright must still fail the wave rather than launch browsers in a loop.
+MAX_CLEARANCE_REFRESHES = 2
+
+logger = logging.getLogger(__name__)
+
 
 class PipelineError(RuntimeError):
     """Base error for a fail-closed FBref pipeline task."""
@@ -135,13 +149,20 @@ class PipelineSettings:
     shard_size: int = DEFAULT_SHARD_SIZE
     request_reservation_bytes: int = DEFAULT_REQUEST_RESERVATION_BYTES
     domain_interval_seconds: float = DEFAULT_DOMAIN_INTERVAL_SECONDS
-    bootstrap_request_reservation: int = (
-        DEFAULT_BOOTSTRAP_REQUEST_RESERVATION
-    )
+    bootstrap_request_reservation: Optional[int] = None
     target_request_reservation: int = MAX_TARGET_HTTP_ATTEMPTS
     proxy_file: Optional[str] = None
 
     def __post_init__(self) -> None:
+        if self.bootstrap_request_reservation is None:
+            # Derived from the run's own budget, so the fetch wave's subprocess
+            # (which rebuilds settings from the command line) spends exactly
+            # what this run reserved for its browser.
+            object.__setattr__(
+                self,
+                "bootstrap_request_reservation",
+                bootstrap_reservation_for(self.request_limit),
+            )
         if self.run_type not in {"current", "backfill", "replay"}:
             raise ValueError("run_type must be current, backfill, or replay")
         if self.request_limit < 0 or self.byte_limit < 0:
@@ -177,6 +198,9 @@ class WaveResult:
     browser_document_bytes: int = 0
     browser_asset_bytes: int = 0
     browser_bootstraps: int = 0
+    budget_exhausted: bool = False
+    requeued_at_budget: int = 0
+    requeued_dead_clearance: int = 0
     failures: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict:
@@ -224,6 +248,15 @@ def _registry_snapshot_id(record: RawFetchRecord) -> str:
                 f"{record.content_hash}"
             ),
         )
+    )
+
+
+def _clearance_rejected(exc: FetchError) -> bool:
+    """True when the failure means the clearance died, not that the page did."""
+
+    return (
+        exc.error_class == "http_status"
+        and exc.http_status in CLEARANCE_REJECTED_STATUSES
     )
 
 
@@ -448,7 +481,7 @@ class FBrefPipeline:
         *,
         generic_writer=None,
         typed_adapter=None,
-        fetcher_factory: Optional[Callable[[Optional[str]], object]] = None,
+        fetcher_factory: Optional[Callable[..., object]] = None,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], datetime] = _utcnow,
     ) -> None:
@@ -457,7 +490,10 @@ class FBrefPipeline:
         self.generic_writer = generic_writer or FBrefGenericBronzeWriter()
         self.typed_adapter = typed_adapter or FBrefTypedBronzeAdapter()
         self.fetcher_factory = fetcher_factory or (
-            lambda proxy_file: FBrefFetcher(proxy_file=proxy_file)
+            lambda proxy_file, max_browser_requests: FBrefFetcher(
+                proxy_file=proxy_file,
+                max_browser_requests=max_browser_requests,
+            )
         )
         self.sleep = sleep
         self.clock = clock
@@ -484,6 +520,16 @@ class FBrefPipeline:
         settings: PipelineSettings,
     ) -> str:
         self.control.migrate()
+        # A worker that dies mid-wave (OOM, kill, hung browser) leaves fenced
+        # leases behind.  claim_targets only reaps its own run's leases, so
+        # without a global reap here those targets stay 'leased' forever: they
+        # drop out of the crawl and keep promotion_pending_match_count above
+        # zero, which fails every later run's validation.
+        reaped = self.control.reap_expired_leases()
+        if reaped:
+            logger.warning(
+                "Reaped %d expired FBref lease(s) left by earlier runs", reaped
+            )
         run_id = make_control_run_id(airflow_run_id, dag_id=dag_id)
         self.control.create_run(
             settings.run_type,
@@ -708,10 +754,14 @@ class FBrefPipeline:
         if not leases:
             summary = self.control.get_run_summary(run_id) or {}
             target_counts = summary.get("target_counts") or {}
+            # 'skipped' is a target this run handed back to the queue when it
+            # stopped at its budget. Counting it as unfinished made the wave
+            # after the budget stop raise instead of no-opping, so a run that
+            # spent its budget still went red.
             unfinished = sum(
                 int(count)
                 for status, count in target_counts.items()
-                if status != "succeeded"
+                if status not in {"succeeded", "skipped"}
             )
             if unfinished:
                 raise FetchWaveError(
@@ -746,6 +796,7 @@ class FBrefPipeline:
             )
         session_id: Optional[str] = None
         fetcher = None
+        clearance_refreshes = 0
         stack = ExitStack()
         try:
             for lease_index, lease in enumerate(leases):
@@ -815,7 +866,10 @@ class FBrefPipeline:
                             metadata={"worker_id": worker_id},
                         )
                         fetcher = stack.enter_context(
-                            self.fetcher_factory(settings.proxy_file)
+                            self.fetcher_factory(
+                                settings.proxy_file,
+                                settings.bootstrap_request_reservation,
+                            )
                         )
                     response = fetcher.fetch(
                         lease.canonical_url,
@@ -901,13 +955,23 @@ class FBrefPipeline:
                         response.browser_bootstrap_attempts
                     )
                 except BudgetExceeded as exc:
-                    self.control.fail_fetch(
-                        lease,
-                        error_class="budget_exhausted",
-                        error_message=str(exc),
-                        retry_delay_seconds=0,
+                    # The budget is a ceiling the crawler is meant to stop at,
+                    # not a fault. Failing these targets made every day that
+                    # spent its budget a red run — and the pages had not even
+                    # been touched. Hand them back to the queue and end the wave
+                    # cleanly; the next run picks them up.
+                    unfetched = leases[lease_index:]
+                    result.requeued_at_budget = (
+                        self.control.requeue_unfetched_targets(unfetched)
                     )
-                    result.failures.append(f"{lease.target_id}:budget_exhausted")
+                    result.budget_exhausted = True
+                    logger.warning(
+                        "FBref run budget exhausted (%s) — %d unfetched "
+                        "target(s) returned to the queue for the next run",
+                        exc,
+                        result.requeued_at_budget,
+                    )
+                    break
                 except FetchError as exc:
                     billed = (
                         exc.provider_billed_bytes
@@ -943,12 +1007,21 @@ class FBrefPipeline:
                             http_wire_bytes=max(0, int(exc.wire_bytes)),
                             provider_billed_bytes=exc.provider_billed_bytes,
                         )
+                    # A clearance the source stopped honouring says nothing
+                    # about the page: record the attempt, but hand the target
+                    # straight back to the queue instead of failing it.
+                    dead_clearance = (
+                        _clearance_rejected(exc)
+                        and fetcher is not None
+                        and clearance_refreshes < MAX_CLEARANCE_REFRESHES
+                    )
                     self.control.fail_fetch(
                         lease,
                         error_class=exc.error_class,
                         error_message=str(exc),
                         retry_delay_seconds=60,
                         permanent=(exc.error_class == "response_too_large"),
+                        requeue=dead_clearance,
                         http_status=exc.http_status,
                         http_request_count=exc.http_requests,
                         http_status_history=exc.http_status_history,
@@ -971,9 +1044,35 @@ class FBrefPipeline:
                     result.browser_bootstraps += (
                         exc.browser_bootstrap_attempts
                     )
-                    result.failures.append(
-                        f"{lease.target_id}:{exc.error_class}"
-                    )
+                    if dead_clearance:
+                        # Cloudflare stopped honouring this clearance mid-wave
+                        # (its exit IP fell out of favour). Every remaining
+                        # target would 403 against the same dead session — one
+                        # rejected exit IP burned a whole wave in production.
+                        # Drop the session here; the next target solves again on
+                        # a fresh proxy. Bounded: a source that rejects every
+                        # clearance must fail the wave, not spawn browsers.
+                        clearance_refreshes += 1
+                        result.requeued_dead_clearance += 1
+                        logger.warning(
+                            "FBref rejected the warm clearance (HTTP %s) — "
+                            "%s went back to the queue and the session is being "
+                            "re-solved on a fresh proxy (refresh %d/%d)",
+                            exc.http_status,
+                            lease.target_id,
+                            clearance_refreshes,
+                            MAX_CLEARANCE_REFRESHES,
+                        )
+                        stack.close()
+                        fetcher = None
+                        self.control.close_clearance_session(
+                            session_id, status="failed"
+                        )
+                        session_id = None
+                    else:
+                        result.failures.append(
+                            f"{lease.target_id}:{exc.error_class}"
+                        )
                 except Exception as exc:
                     if reservation is not None and not budget_settled:
                         self.control.settle_budget(
@@ -1268,7 +1367,9 @@ class FBrefPipeline:
                 directly_seeded += seeded
                 directly_skipped += skipped
         discovered = discover_page_links(
-            html, parent_source_ids=record.source_ids
+            html,
+            parent_source_ids=record.source_ids,
+            parent_url=record.canonical_url,
         )
         # A match inherits competition/season identity only from a parsed
         # schedule row.  Generic navigation links on player or other pages are
@@ -1305,19 +1406,29 @@ class FBrefPipeline:
                 staging_identity=record.logical_refresh_id,
             )
         except Exception as exc:
-            self.control.record_dataset_manifest(
-                target_id=record.target_id,
-                content_hash=record.content_hash,
-                parser_version=PAGE_DOCUMENT_VERSION,
-                dataset="__page__",
-                availability=Availability.ERROR.value,
-                parse_status=("failed" if page.errors else "succeeded"),
-                persistence_status="failed",
-                validation_status="failed",
-                row_count=0,
-                error_class=type(exc).__name__,
-                error_message=str(exc),
-            )
+            try:
+                self.control.record_dataset_manifest(
+                    target_id=record.target_id,
+                    content_hash=record.content_hash,
+                    parser_version=PAGE_DOCUMENT_VERSION,
+                    dataset="__page__",
+                    availability=Availability.ERROR.value,
+                    parse_status=("failed" if page.errors else "succeeded"),
+                    persistence_status="failed",
+                    validation_status="failed",
+                    row_count=0,
+                    error_class=type(exc).__name__,
+                    error_message=str(exc),
+                )
+            except StateConflict:
+                # These exact bytes already have a completed manifest from an
+                # earlier parse by this exact parser; that evidence stands.
+                # Recording a failure over it must never replace the error that
+                # actually broke this parse — the diagnosis is what we need.
+                logger.warning(
+                    "Failure manifest for %s not recorded: the generic "
+                    "manifest is already completed", record.target_id,
+                )
             raise
         for table in page.tables:
             self.control.record_dataset_manifest(
@@ -1773,10 +1884,13 @@ class FBrefPipeline:
         if summary is None:
             raise RunValidationError(f"Unknown run {run_id}")
         target_counts = summary.get("target_counts") or {}
+        # 'skipped' is a target the run deliberately did not fetch — it stopped
+        # at its budget and handed the target back to the queue. That is the
+        # designed steady state of a budgeted crawler, not an incomplete run.
         incomplete = {
             status: count
             for status, count in target_counts.items()
-            if status != "succeeded" and int(count) > 0
+            if status not in {"succeeded", "skipped"} and int(count) > 0
         }
         dataset_counts = summary.get("dataset_validation_counts") or {}
         dataset_failures = sum(
@@ -1826,7 +1940,15 @@ class FBrefPipeline:
                 f"{int(traffic['duplicate_fetch_violations'])}"
             )
         sessions = summary.get("session_metrics") or {}
-        if int(sessions.get("max_bootstraps_per_session") or 0) > 1:
+        # The invariant is that the browser establishes ONE clearance per
+        # session and every page then rides the warm HTTP path — a regression
+        # that drove the browser per page would show one attempt per page. A
+        # stalled exit IP legitimately costs a re-solve on a fresh proxy, which
+        # the transport bounds at MAX_CLEARANCE_SOLVE_ATTEMPTS; demanding a
+        # single attempt failed a run whose only sin was surviving a bad proxy.
+        if int(sessions.get("max_bootstraps_per_session") or 0) > (
+            MAX_CLEARANCE_SOLVE_ATTEMPTS
+        ):
             errors.append("browser_bootstrap_exceeded_per_session")
         if str(summary.get("run_type")) == "replay" and (
             int(traffic.get("network_attempts") or 0) != 0
@@ -1854,7 +1976,12 @@ class FBrefPipeline:
                 _sentinel_gate_errors(summary.get("sentinel_coverage"))
             )
         if errors:
-            self.control.finish_run(run_id, succeeded=False)
+            # Do NOT finish the run here. A finished run is terminal, so marking
+            # it failed on the first validation error made every retry of this
+            # task impossible: the retry re-validated cleanly and then died on
+            # "run cannot finish as succeeded". The DAG's failure callback
+            # aborts the run when the DAG itself gives up, which is the only
+            # point at which the outcome is actually known.
             raise RunValidationError("; ".join(errors))
         self.control.finish_run(run_id, succeeded=True)
         return summary

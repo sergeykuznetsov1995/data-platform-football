@@ -1,168 +1,2331 @@
 {
-  "schema_version": 2,
   "source": "sofascore",
-  "operator_owned_fields": ["canonical_id", "enabled", "review", "seasons[].aliases", "seasons[].canonical_season_override"],
+  "operator_owned_fields": [
+    "canonical_id",
+    "enabled",
+    "review",
+    "seasons[].aliases",
+    "seasons[].canonical_season_override"
+  ],
+  "schema_version": 2,
   "tournaments": [
     {
       "unique_tournament_id": 1,
       "name": "EURO",
       "slug": "european-championship",
-      "category": {"id": null, "name": "Europe", "slug": "europe"},
+      "category": {
+        "id": null,
+        "name": "Europe",
+        "slug": "europe"
+      },
       "sport_slug": "football",
       "page_path": "football/europe/european-championship",
       "canonical_id": "INT-European Championship",
       "enabled": false,
-      "classification": {"sport": "football", "gender": "unknown", "age_group": "unknown", "team_level": "unknown", "status": "unknown", "exclusion_reasons": [], "evidence": [{"type": "registry_migration", "endpoint": "configs/sofascore/tournaments.json@schema-v1", "field": "sport_slug", "value": "football"}]},
-      "review": {"status": "pending", "confirmed": {"sport": null, "gender": null, "age_group": null, "team_level": null}, "reviewed_by": null, "reviewed_at": null, "evidence": [], "notes": null},
+      "classification": {
+        "sport": "football",
+        "gender": "unknown",
+        "age_group": "unknown",
+        "team_level": "unknown",
+        "status": "unknown",
+        "exclusion_reasons": [],
+        "evidence": [
+          {
+            "type": "registry_migration",
+            "endpoint": "configs/sofascore/tournaments.json@schema-v1",
+            "field": "sport_slug",
+            "value": "football"
+          }
+        ]
+      },
+      "review": {
+        "status": "pending",
+        "confirmed": {
+          "sport": null,
+          "gender": null,
+          "age_group": null,
+          "team_level": null
+        },
+        "reviewed_by": null,
+        "reviewed_at": null,
+        "evidence": [],
+        "notes": null
+      },
       "seasons": []
     },
     {
       "unique_tournament_id": 7,
       "name": "UEFA Champions League",
       "slug": "uefa-champions-league",
-      "category": {"id": null, "name": "Europe", "slug": "europe"},
+      "category": {
+        "id": null,
+        "name": "Europe",
+        "slug": "europe"
+      },
       "sport_slug": "football",
       "page_path": "football/europe/uefa-champions-league",
       "canonical_id": null,
       "enabled": false,
-      "classification": {"sport": "football", "gender": "unknown", "age_group": "unknown", "team_level": "unknown", "status": "unknown", "exclusion_reasons": [], "evidence": [{"type": "registry_migration", "endpoint": "configs/sofascore/tournaments.json@schema-v1", "field": "sport_slug", "value": "football"}]},
-      "review": {"status": "pending", "confirmed": {"sport": null, "gender": null, "age_group": null, "team_level": null}, "reviewed_by": null, "reviewed_at": null, "evidence": [], "notes": null},
+      "classification": {
+        "sport": "football",
+        "gender": "unknown",
+        "age_group": "unknown",
+        "team_level": "unknown",
+        "status": "unknown",
+        "exclusion_reasons": [],
+        "evidence": [
+          {
+            "type": "registry_migration",
+            "endpoint": "configs/sofascore/tournaments.json@schema-v1",
+            "field": "sport_slug",
+            "value": "football"
+          }
+        ]
+      },
+      "review": {
+        "status": "pending",
+        "confirmed": {
+          "sport": null,
+          "gender": null,
+          "age_group": null,
+          "team_level": null
+        },
+        "reviewed_by": null,
+        "reviewed_at": null,
+        "evidence": [],
+        "notes": null
+      },
       "seasons": []
     },
     {
       "unique_tournament_id": 8,
       "name": "LaLiga",
       "slug": "laliga",
-      "category": {"id": null, "name": "Spain", "slug": "spain"},
+      "category": {
+        "id": null,
+        "name": "Spain",
+        "slug": "spain"
+      },
       "sport_slug": "football",
       "page_path": "football/spain/laliga",
       "canonical_id": "ESP-La Liga",
       "enabled": false,
-      "classification": {"sport": "football", "gender": "unknown", "age_group": "unknown", "team_level": "unknown", "status": "unknown", "exclusion_reasons": [], "evidence": [{"type": "registry_migration", "endpoint": "configs/sofascore/tournaments.json@schema-v1", "field": "sport_slug", "value": "football"}]},
-      "review": {"status": "pending", "confirmed": {"sport": null, "gender": null, "age_group": null, "team_level": null}, "reviewed_by": null, "reviewed_at": null, "evidence": [], "notes": null},
+      "classification": {
+        "sport": "football",
+        "gender": "unknown",
+        "age_group": "unknown",
+        "team_level": "unknown",
+        "status": "unknown",
+        "exclusion_reasons": [],
+        "evidence": [
+          {
+            "type": "registry_migration",
+            "endpoint": "configs/sofascore/tournaments.json@schema-v1",
+            "field": "sport_slug",
+            "value": "football"
+          }
+        ]
+      },
+      "review": {
+        "status": "pending",
+        "confirmed": {
+          "sport": null,
+          "gender": null,
+          "age_group": null,
+          "team_level": null
+        },
+        "reviewed_by": null,
+        "reviewed_at": null,
+        "evidence": [],
+        "notes": null
+      },
       "seasons": []
     },
     {
       "unique_tournament_id": 16,
-      "name": "World Cup",
+      "name": "FIFA World Cup",
       "slug": "world-championship",
-      "category": {"id": null, "name": "World", "slug": "world"},
+      "category": {
+        "id": 1468,
+        "name": "World",
+        "slug": "world"
+      },
       "sport_slug": "football",
       "page_path": "football/world/world-championship",
       "canonical_id": "INT-World Cup",
       "enabled": true,
-      "classification": {"sport": "football", "gender": "male", "age_group": "unknown", "team_level": "unknown", "status": "review_required", "exclusion_reasons": [], "evidence": [{"type": "source_dataset", "endpoint": "bronze.sofascore_schedule", "field": "home_gender/away_gender", "value": "M"}]},
-      "review": {"status": "approved", "confirmed": {"sport": "football", "gender": "male", "age_group": "adult", "team_level": "first_team"}, "reviewed_by": "registry-v2-migration", "reviewed_at": "2026-07-11", "evidence": [{"type": "repository", "reference": "configs/medallion/competitions.yaml#INT-World-Cup", "note": "adult men's senior national-team competition"}], "notes": "Existing production activation retained after fail-closed review."},
+      "classification": {
+        "sport": "football",
+        "gender": "male",
+        "age_group": "unknown",
+        "team_level": "unknown",
+        "status": "review_required",
+        "exclusion_reasons": [],
+        "evidence": [
+          {
+            "type": "source_field",
+            "endpoint": "/unique-tournament/16",
+            "field": "category.sport.slug",
+            "value": "football"
+          },
+          {
+            "type": "source_field",
+            "endpoint": "/unique-tournament/16",
+            "field": "gender",
+            "value": "M"
+          },
+          {
+            "type": "source_field",
+            "endpoint": "/unique-tournament/16",
+            "field": "name",
+            "value": "FIFA World Cup"
+          },
+          {
+            "type": "source_dataset",
+            "endpoint": "bronze.sofascore_schedule",
+            "field": "home_gender/away_gender",
+            "value": "M"
+          }
+        ]
+      },
+      "review": {
+        "status": "approved",
+        "confirmed": {
+          "sport": "football",
+          "gender": "male",
+          "age_group": "adult",
+          "team_level": "first_team"
+        },
+        "reviewed_by": "registry-v2-migration",
+        "reviewed_at": "2026-07-11",
+        "evidence": [
+          {
+            "type": "repository",
+            "reference": "configs/medallion/competitions.yaml#INT-World-Cup",
+            "note": "adult men's senior national-team competition"
+          }
+        ],
+        "notes": "Existing production activation retained after fail-closed review."
+      },
       "seasons": [
-        {"season_id": 58210, "name": "World Cup 2026", "source_name": "World Cup 2026", "year": "2026", "format": "calendar_year", "season_format": "single_year", "canonical_season": "2026", "start_date": null, "end_date": null, "aliases": ["2026", "World Cup 2026"], "evidence": [{"type": "source_field", "endpoint": "/unique-tournament/16/seasons", "field": "name/year", "value": "World Cup 2026|2026"}]}
+        {
+          "season_id": 16,
+          "name": "World Cup 2006",
+          "source_name": "World Cup 2006",
+          "year": "2006",
+          "format": "calendar_year",
+          "season_format": "single_year",
+          "canonical_season": "2006",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "2006",
+            "World Cup 2006"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/16/seasons",
+              "field": "name",
+              "value": "World Cup 2006"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/16/seasons",
+              "field": "year",
+              "value": "2006"
+            }
+          ]
+        },
+        {
+          "season_id": 1151,
+          "name": "World Cup 1998",
+          "source_name": "World Cup 1998",
+          "year": "1998",
+          "format": "calendar_year",
+          "season_format": "single_year",
+          "canonical_season": "1998",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "1998",
+            "World Cup 1998"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/16/seasons",
+              "field": "name",
+              "value": "World Cup 1998"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/16/seasons",
+              "field": "year",
+              "value": "1998"
+            }
+          ]
+        },
+        {
+          "season_id": 2531,
+          "name": "World Cup 2010",
+          "source_name": "World Cup 2010",
+          "year": "2010",
+          "format": "calendar_year",
+          "season_format": "single_year",
+          "canonical_season": "2010",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "2010",
+            "World Cup 2010"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/16/seasons",
+              "field": "name",
+              "value": "World Cup 2010"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/16/seasons",
+              "field": "year",
+              "value": "2010"
+            }
+          ]
+        },
+        {
+          "season_id": 2636,
+          "name": "World Cup 2002",
+          "source_name": "World Cup 2002",
+          "year": "2002",
+          "format": "calendar_year",
+          "season_format": "single_year",
+          "canonical_season": "2002",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "2002",
+            "World Cup 2002"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/16/seasons",
+              "field": "name",
+              "value": "World Cup 2002"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/16/seasons",
+              "field": "year",
+              "value": "2002"
+            }
+          ]
+        },
+        {
+          "season_id": 7528,
+          "name": "World Cup 2014",
+          "source_name": "World Cup 2014",
+          "year": "2014",
+          "format": "calendar_year",
+          "season_format": "single_year",
+          "canonical_season": "2014",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "2014",
+            "World Cup 2014"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/16/seasons",
+              "field": "name",
+              "value": "World Cup 2014"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/16/seasons",
+              "field": "year",
+              "value": "2014"
+            }
+          ]
+        },
+        {
+          "season_id": 15586,
+          "name": "World Cup 2018",
+          "source_name": "World Cup 2018",
+          "year": "2018",
+          "format": "calendar_year",
+          "season_format": "single_year",
+          "canonical_season": "2018",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "2018",
+            "World Cup 2018"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/16/seasons",
+              "field": "name",
+              "value": "World Cup 2018"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/16/seasons",
+              "field": "year",
+              "value": "2018"
+            }
+          ]
+        },
+        {
+          "season_id": 17559,
+          "name": "World Cup 1934",
+          "source_name": "World Cup 1934",
+          "year": "1934",
+          "format": "calendar_year",
+          "season_format": "single_year",
+          "canonical_season": "1934",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "1934",
+            "World Cup 1934"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/16/seasons",
+              "field": "name",
+              "value": "World Cup 1934"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/16/seasons",
+              "field": "year",
+              "value": "1934"
+            }
+          ]
+        },
+        {
+          "season_id": 17560,
+          "name": "World Cup 1938",
+          "source_name": "World Cup 1938",
+          "year": "1938",
+          "format": "calendar_year",
+          "season_format": "single_year",
+          "canonical_season": "1938",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "1938",
+            "World Cup 1938"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/16/seasons",
+              "field": "name",
+              "value": "World Cup 1938"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/16/seasons",
+              "field": "year",
+              "value": "1938"
+            }
+          ]
+        },
+        {
+          "season_id": 17561,
+          "name": "World Cup 1954",
+          "source_name": "World Cup 1954",
+          "year": "1954",
+          "format": "calendar_year",
+          "season_format": "single_year",
+          "canonical_season": "1954",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "1954",
+            "World Cup 1954"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/16/seasons",
+              "field": "name",
+              "value": "World Cup 1954"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/16/seasons",
+              "field": "year",
+              "value": "1954"
+            }
+          ]
+        },
+        {
+          "season_id": 17562,
+          "name": "World Cup 1958",
+          "source_name": "World Cup 1958",
+          "year": "1958",
+          "format": "calendar_year",
+          "season_format": "single_year",
+          "canonical_season": "1958",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "1958",
+            "World Cup 1958"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/16/seasons",
+              "field": "name",
+              "value": "World Cup 1958"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/16/seasons",
+              "field": "year",
+              "value": "1958"
+            }
+          ]
+        },
+        {
+          "season_id": 17563,
+          "name": "World Cup 1962",
+          "source_name": "World Cup 1962",
+          "year": "1962",
+          "format": "calendar_year",
+          "season_format": "single_year",
+          "canonical_season": "1962",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "1962",
+            "World Cup 1962"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/16/seasons",
+              "field": "name",
+              "value": "World Cup 1962"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/16/seasons",
+              "field": "year",
+              "value": "1962"
+            }
+          ]
+        },
+        {
+          "season_id": 17564,
+          "name": "World Cup 1966",
+          "source_name": "World Cup 1966",
+          "year": "1966",
+          "format": "calendar_year",
+          "season_format": "single_year",
+          "canonical_season": "1966",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "1966",
+            "World Cup 1966"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/16/seasons",
+              "field": "name",
+              "value": "World Cup 1966"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/16/seasons",
+              "field": "year",
+              "value": "1966"
+            }
+          ]
+        },
+        {
+          "season_id": 17565,
+          "name": "World Cup 1970",
+          "source_name": "World Cup 1970",
+          "year": "1970",
+          "format": "calendar_year",
+          "season_format": "single_year",
+          "canonical_season": "1970",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "1970",
+            "World Cup 1970"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/16/seasons",
+              "field": "name",
+              "value": "World Cup 1970"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/16/seasons",
+              "field": "year",
+              "value": "1970"
+            }
+          ]
+        },
+        {
+          "season_id": 17566,
+          "name": "World Cup 1974",
+          "source_name": "World Cup 1974",
+          "year": "1974",
+          "format": "calendar_year",
+          "season_format": "single_year",
+          "canonical_season": "1974",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "1974",
+            "World Cup 1974"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/16/seasons",
+              "field": "name",
+              "value": "World Cup 1974"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/16/seasons",
+              "field": "year",
+              "value": "1974"
+            }
+          ]
+        },
+        {
+          "season_id": 17567,
+          "name": "World Cup 1978",
+          "source_name": "World Cup 1978",
+          "year": "1978",
+          "format": "calendar_year",
+          "season_format": "single_year",
+          "canonical_season": "1978",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "1978",
+            "World Cup 1978"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/16/seasons",
+              "field": "name",
+              "value": "World Cup 1978"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/16/seasons",
+              "field": "year",
+              "value": "1978"
+            }
+          ]
+        },
+        {
+          "season_id": 17568,
+          "name": "World Cup 1982",
+          "source_name": "World Cup 1982",
+          "year": "1982",
+          "format": "calendar_year",
+          "season_format": "single_year",
+          "canonical_season": "1982",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "1982",
+            "World Cup 1982"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/16/seasons",
+              "field": "name",
+              "value": "World Cup 1982"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/16/seasons",
+              "field": "year",
+              "value": "1982"
+            }
+          ]
+        },
+        {
+          "season_id": 17569,
+          "name": "World Cup 1986",
+          "source_name": "World Cup 1986",
+          "year": "1986",
+          "format": "calendar_year",
+          "season_format": "single_year",
+          "canonical_season": "1986",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "1986",
+            "World Cup 1986"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/16/seasons",
+              "field": "name",
+              "value": "World Cup 1986"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/16/seasons",
+              "field": "year",
+              "value": "1986"
+            }
+          ]
+        },
+        {
+          "season_id": 17570,
+          "name": "World Cup 1990",
+          "source_name": "World Cup 1990",
+          "year": "1990",
+          "format": "calendar_year",
+          "season_format": "single_year",
+          "canonical_season": "1990",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "1990",
+            "World Cup 1990"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/16/seasons",
+              "field": "name",
+              "value": "World Cup 1990"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/16/seasons",
+              "field": "year",
+              "value": "1990"
+            }
+          ]
+        },
+        {
+          "season_id": 17571,
+          "name": "World Cup 1994",
+          "source_name": "World Cup 1994",
+          "year": "1994",
+          "format": "calendar_year",
+          "season_format": "single_year",
+          "canonical_season": "1994",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "1994",
+            "World Cup 1994"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/16/seasons",
+              "field": "name",
+              "value": "World Cup 1994"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/16/seasons",
+              "field": "year",
+              "value": "1994"
+            }
+          ]
+        },
+        {
+          "season_id": 40712,
+          "name": "World Cup 1930",
+          "source_name": "World Cup 1930",
+          "year": "1930",
+          "format": "calendar_year",
+          "season_format": "single_year",
+          "canonical_season": "1930",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "1930",
+            "World Cup 1930"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/16/seasons",
+              "field": "name",
+              "value": "World Cup 1930"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/16/seasons",
+              "field": "year",
+              "value": "1930"
+            }
+          ]
+        },
+        {
+          "season_id": 40714,
+          "name": "World Cup 1950",
+          "source_name": "World Cup 1950",
+          "year": "1950",
+          "format": "calendar_year",
+          "season_format": "single_year",
+          "canonical_season": "1950",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "1950",
+            "World Cup 1950"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/16/seasons",
+              "field": "name",
+              "value": "World Cup 1950"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/16/seasons",
+              "field": "year",
+              "value": "1950"
+            }
+          ]
+        },
+        {
+          "season_id": 41087,
+          "name": "World Cup 2022",
+          "source_name": "World Cup 2022",
+          "year": "2022",
+          "format": "calendar_year",
+          "season_format": "single_year",
+          "canonical_season": "2022",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "2022",
+            "World Cup 2022"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/16/seasons",
+              "field": "name",
+              "value": "World Cup 2022"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/16/seasons",
+              "field": "year",
+              "value": "2022"
+            }
+          ]
+        },
+        {
+          "season_id": 58210,
+          "name": "World Cup 2026",
+          "source_name": "World Cup 2026",
+          "year": "2026",
+          "format": "calendar_year",
+          "season_format": "single_year",
+          "canonical_season": "2026",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "2026",
+            "World Cup 2026"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/16/seasons",
+              "field": "name",
+              "value": "World Cup 2026"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/16/seasons",
+              "field": "year",
+              "value": "2026"
+            }
+          ]
+        }
       ]
     },
     {
       "unique_tournament_id": 17,
       "name": "Premier League",
       "slug": "premier-league",
-      "category": {"id": null, "name": "England", "slug": "england"},
+      "category": {
+        "id": 1,
+        "name": "England",
+        "slug": "england"
+      },
       "sport_slug": "football",
       "page_path": "football/england/premier-league",
       "canonical_id": "ENG-Premier League",
       "enabled": true,
-      "classification": {"sport": "football", "gender": "male", "age_group": "unknown", "team_level": "unknown", "status": "review_required", "exclusion_reasons": [], "evidence": [{"type": "source_dataset", "endpoint": "bronze.sofascore_schedule", "field": "home_gender/away_gender", "value": "M"}]},
-      "review": {"status": "approved", "confirmed": {"sport": "football", "gender": "male", "age_group": "adult", "team_level": "first_team"}, "reviewed_by": "registry-v2-migration", "reviewed_at": "2026-07-11", "evidence": [{"type": "repository", "reference": "configs/medallion/competitions.yaml#ENG-Premier-League", "note": "adult men's first-team club competition"}], "notes": "Existing production activation retained after fail-closed review."},
+      "classification": {
+        "sport": "football",
+        "gender": "male",
+        "age_group": "unknown",
+        "team_level": "unknown",
+        "status": "review_required",
+        "exclusion_reasons": [],
+        "evidence": [
+          {
+            "type": "source_field",
+            "endpoint": "/unique-tournament/17",
+            "field": "category.sport.slug",
+            "value": "football"
+          },
+          {
+            "type": "source_field",
+            "endpoint": "/unique-tournament/17",
+            "field": "gender",
+            "value": "M"
+          },
+          {
+            "type": "source_field",
+            "endpoint": "/unique-tournament/17",
+            "field": "name",
+            "value": "Premier League"
+          },
+          {
+            "type": "source_dataset",
+            "endpoint": "bronze.sofascore_schedule",
+            "field": "home_gender/away_gender",
+            "value": "M"
+          }
+        ]
+      },
+      "review": {
+        "status": "approved",
+        "confirmed": {
+          "sport": "football",
+          "gender": "male",
+          "age_group": "adult",
+          "team_level": "first_team"
+        },
+        "reviewed_by": "registry-v2-migration",
+        "reviewed_at": "2026-07-11",
+        "evidence": [
+          {
+            "type": "repository",
+            "reference": "configs/medallion/competitions.yaml#ENG-Premier-League",
+            "note": "adult men's first-team club competition"
+          }
+        ],
+        "notes": "Existing production activation retained after fail-closed review."
+      },
       "seasons": [
-        {"season_id": 76986, "name": "Premier League 25/26", "source_name": "Premier League 25/26", "year": "25/26", "format": "split_year", "season_format": "split_year", "canonical_season": "2526", "start_date": null, "end_date": null, "aliases": ["25/26", "Premier League 25/26", "2526"], "evidence": [{"type": "source_field", "endpoint": "/unique-tournament/17/seasons", "field": "name/year", "value": "Premier League 25/26|25/26"}]}
+        {
+          "season_id": 1,
+          "name": "Premier League 03/04",
+          "source_name": "Premier League 03/04",
+          "year": "03/04",
+          "format": "split_year",
+          "season_format": "split_year",
+          "canonical_season": "0304",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "03/04",
+            "Premier League 03/04",
+            "0304"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "name",
+              "value": "Premier League 03/04"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "year",
+              "value": "03/04"
+            }
+          ]
+        },
+        {
+          "season_id": 2,
+          "name": "Premier League 04/05",
+          "source_name": "Premier League 04/05",
+          "year": "04/05",
+          "format": "split_year",
+          "season_format": "split_year",
+          "canonical_season": "0405",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "04/05",
+            "Premier League 04/05",
+            "0405"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "name",
+              "value": "Premier League 04/05"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "year",
+              "value": "04/05"
+            }
+          ]
+        },
+        {
+          "season_id": 3,
+          "name": "Premier League 05/06",
+          "source_name": "Premier League 05/06",
+          "year": "05/06",
+          "format": "split_year",
+          "season_format": "split_year",
+          "canonical_season": "0506",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "05/06",
+            "Premier League 05/06",
+            "0506"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "name",
+              "value": "Premier League 05/06"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "year",
+              "value": "05/06"
+            }
+          ]
+        },
+        {
+          "season_id": 4,
+          "name": "Premier League 06/07",
+          "source_name": "Premier League 06/07",
+          "year": "06/07",
+          "format": "split_year",
+          "season_format": "split_year",
+          "canonical_season": "0607",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "06/07",
+            "Premier League 06/07",
+            "0607"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "name",
+              "value": "Premier League 06/07"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "year",
+              "value": "06/07"
+            }
+          ]
+        },
+        {
+          "season_id": 46,
+          "name": "Premier League 02/03",
+          "source_name": "Premier League 02/03",
+          "year": "02/03",
+          "format": "split_year",
+          "season_format": "split_year",
+          "canonical_season": "0203",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "02/03",
+            "Premier League 02/03",
+            "0203"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "name",
+              "value": "Premier League 02/03"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "year",
+              "value": "02/03"
+            }
+          ]
+        },
+        {
+          "season_id": 47,
+          "name": "Premier League 01/02",
+          "source_name": "Premier League 01/02",
+          "year": "01/02",
+          "format": "split_year",
+          "season_format": "split_year",
+          "canonical_season": "0102",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "01/02",
+            "Premier League 01/02",
+            "0102"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "name",
+              "value": "Premier League 01/02"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "year",
+              "value": "01/02"
+            }
+          ]
+        },
+        {
+          "season_id": 48,
+          "name": "Premier League 00/01",
+          "source_name": "Premier League 00/01",
+          "year": "00/01",
+          "format": "split_year",
+          "season_format": "split_year",
+          "canonical_season": "0001",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "00/01",
+            "Premier League 00/01",
+            "0001"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "name",
+              "value": "Premier League 00/01"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "year",
+              "value": "00/01"
+            }
+          ]
+        },
+        {
+          "season_id": 49,
+          "name": "Premier League 99/00",
+          "source_name": "Premier League 99/00",
+          "year": "99/00",
+          "format": "split_year",
+          "season_format": "split_year",
+          "canonical_season": "9900",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "99/00",
+            "Premier League 99/00",
+            "9900"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "name",
+              "value": "Premier League 99/00"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "year",
+              "value": "99/00"
+            }
+          ]
+        },
+        {
+          "season_id": 50,
+          "name": "Premier League 98/99",
+          "source_name": "Premier League 98/99",
+          "year": "98/99",
+          "format": "split_year",
+          "season_format": "split_year",
+          "canonical_season": "9899",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "98/99",
+            "Premier League 98/99",
+            "9899"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "name",
+              "value": "Premier League 98/99"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "year",
+              "value": "98/99"
+            }
+          ]
+        },
+        {
+          "season_id": 51,
+          "name": "Premier League 97/98",
+          "source_name": "Premier League 97/98",
+          "year": "97/98",
+          "format": "split_year",
+          "season_format": "split_year",
+          "canonical_season": "9798",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "97/98",
+            "Premier League 97/98",
+            "9798"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "name",
+              "value": "Premier League 97/98"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "year",
+              "value": "97/98"
+            }
+          ]
+        },
+        {
+          "season_id": 581,
+          "name": "Premier League 07/08",
+          "source_name": "Premier League 07/08",
+          "year": "07/08",
+          "format": "split_year",
+          "season_format": "split_year",
+          "canonical_season": "0708",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "07/08",
+            "Premier League 07/08",
+            "0708"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "name",
+              "value": "Premier League 07/08"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "year",
+              "value": "07/08"
+            }
+          ]
+        },
+        {
+          "season_id": 1544,
+          "name": "Premier League 08/09",
+          "source_name": "Premier League 08/09",
+          "year": "08/09",
+          "format": "split_year",
+          "season_format": "split_year",
+          "canonical_season": "0809",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "08/09",
+            "Premier League 08/09",
+            "0809"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "name",
+              "value": "Premier League 08/09"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "year",
+              "value": "08/09"
+            }
+          ]
+        },
+        {
+          "season_id": 2139,
+          "name": "Premier League 09/10",
+          "source_name": "Premier League 09/10",
+          "year": "09/10",
+          "format": "split_year",
+          "season_format": "split_year",
+          "canonical_season": "0910",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "09/10",
+            "Premier League 09/10",
+            "0910"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "name",
+              "value": "Premier League 09/10"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "year",
+              "value": "09/10"
+            }
+          ]
+        },
+        {
+          "season_id": 2746,
+          "name": "Premier League 10/11",
+          "source_name": "Premier League 10/11",
+          "year": "10/11",
+          "format": "split_year",
+          "season_format": "split_year",
+          "canonical_season": "1011",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "10/11",
+            "Premier League 10/11",
+            "1011"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "name",
+              "value": "Premier League 10/11"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "year",
+              "value": "10/11"
+            }
+          ]
+        },
+        {
+          "season_id": 3391,
+          "name": "Premier League 11/12",
+          "source_name": "Premier League 11/12",
+          "year": "11/12",
+          "format": "split_year",
+          "season_format": "split_year",
+          "canonical_season": "1112",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "11/12",
+            "Premier League 11/12",
+            "1112"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "name",
+              "value": "Premier League 11/12"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "year",
+              "value": "11/12"
+            }
+          ]
+        },
+        {
+          "season_id": 4710,
+          "name": "Premier League 12/13",
+          "source_name": "Premier League 12/13",
+          "year": "12/13",
+          "format": "split_year",
+          "season_format": "split_year",
+          "canonical_season": "1213",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "12/13",
+            "Premier League 12/13",
+            "1213"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "name",
+              "value": "Premier League 12/13"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "year",
+              "value": "12/13"
+            }
+          ]
+        },
+        {
+          "season_id": 6311,
+          "name": "Premier League 13/14",
+          "source_name": "Premier League 13/14",
+          "year": "13/14",
+          "format": "split_year",
+          "season_format": "split_year",
+          "canonical_season": "1314",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "13/14",
+            "Premier League 13/14",
+            "1314"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "name",
+              "value": "Premier League 13/14"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "year",
+              "value": "13/14"
+            }
+          ]
+        },
+        {
+          "season_id": 8186,
+          "name": "Premier League 14/15",
+          "source_name": "Premier League 14/15",
+          "year": "14/15",
+          "format": "split_year",
+          "season_format": "split_year",
+          "canonical_season": "1415",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "14/15",
+            "Premier League 14/15",
+            "1415"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "name",
+              "value": "Premier League 14/15"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "year",
+              "value": "14/15"
+            }
+          ]
+        },
+        {
+          "season_id": 10356,
+          "name": "Premier League 15/16",
+          "source_name": "Premier League 15/16",
+          "year": "15/16",
+          "format": "split_year",
+          "season_format": "split_year",
+          "canonical_season": "1516",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "15/16",
+            "Premier League 15/16",
+            "1516"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "name",
+              "value": "Premier League 15/16"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "year",
+              "value": "15/16"
+            }
+          ]
+        },
+        {
+          "season_id": 11733,
+          "name": "Premier League 16/17",
+          "source_name": "Premier League 16/17",
+          "year": "16/17",
+          "format": "split_year",
+          "season_format": "split_year",
+          "canonical_season": "1617",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "16/17",
+            "Premier League 16/17",
+            "1617"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "name",
+              "value": "Premier League 16/17"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "year",
+              "value": "16/17"
+            }
+          ]
+        },
+        {
+          "season_id": 13043,
+          "name": "Premier League 92/93",
+          "source_name": "Premier League 92/93",
+          "year": "92/93",
+          "format": "split_year",
+          "season_format": "split_year",
+          "canonical_season": "9293",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "92/93",
+            "Premier League 92/93",
+            "9293"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "name",
+              "value": "Premier League 92/93"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "year",
+              "value": "92/93"
+            }
+          ]
+        },
+        {
+          "season_id": 13380,
+          "name": "Premier League 17/18",
+          "source_name": "Premier League 17/18",
+          "year": "17/18",
+          "format": "split_year",
+          "season_format": "split_year",
+          "canonical_season": "1718",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "17/18",
+            "Premier League 17/18",
+            "1718"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "name",
+              "value": "Premier League 17/18"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "year",
+              "value": "17/18"
+            }
+          ]
+        },
+        {
+          "season_id": 17359,
+          "name": "Premier League 18/19",
+          "source_name": "Premier League 18/19",
+          "year": "18/19",
+          "format": "split_year",
+          "season_format": "split_year",
+          "canonical_season": "1819",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "18/19",
+            "Premier League 18/19",
+            "1819"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "name",
+              "value": "Premier League 18/19"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "year",
+              "value": "18/19"
+            }
+          ]
+        },
+        {
+          "season_id": 23776,
+          "name": "Premier League 19/20",
+          "source_name": "Premier League 19/20",
+          "year": "19/20",
+          "format": "split_year",
+          "season_format": "split_year",
+          "canonical_season": "1920",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "19/20",
+            "Premier League 19/20",
+            "1920"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "name",
+              "value": "Premier League 19/20"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "year",
+              "value": "19/20"
+            }
+          ]
+        },
+        {
+          "season_id": 25680,
+          "name": "Premier League 93/94",
+          "source_name": "Premier League 93/94",
+          "year": "93/94",
+          "format": "split_year",
+          "season_format": "split_year",
+          "canonical_season": "9394",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "93/94",
+            "Premier League 93/94",
+            "9394"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "name",
+              "value": "Premier League 93/94"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "year",
+              "value": "93/94"
+            }
+          ]
+        },
+        {
+          "season_id": 25681,
+          "name": "Premier League 95/96",
+          "source_name": "Premier League 95/96",
+          "year": "95/96",
+          "format": "split_year",
+          "season_format": "split_year",
+          "canonical_season": "9596",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "95/96",
+            "Premier League 95/96",
+            "9596"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "name",
+              "value": "Premier League 95/96"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "year",
+              "value": "95/96"
+            }
+          ]
+        },
+        {
+          "season_id": 25682,
+          "name": "Premier League 96/97",
+          "source_name": "Premier League 96/97",
+          "year": "96/97",
+          "format": "split_year",
+          "season_format": "split_year",
+          "canonical_season": "9697",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "96/97",
+            "Premier League 96/97",
+            "9697"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "name",
+              "value": "Premier League 96/97"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "year",
+              "value": "96/97"
+            }
+          ]
+        },
+        {
+          "season_id": 29167,
+          "name": "Premier League 94/95",
+          "source_name": "Premier League 94/95",
+          "year": "94/95",
+          "format": "split_year",
+          "season_format": "split_year",
+          "canonical_season": "9495",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "94/95",
+            "Premier League 94/95",
+            "9495"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "name",
+              "value": "Premier League 94/95"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "year",
+              "value": "94/95"
+            }
+          ]
+        },
+        {
+          "season_id": 29415,
+          "name": "Premier League 20/21",
+          "source_name": "Premier League 20/21",
+          "year": "20/21",
+          "format": "split_year",
+          "season_format": "split_year",
+          "canonical_season": "2021",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "20/21",
+            "Premier League 20/21",
+            "2021"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "name",
+              "value": "Premier League 20/21"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "year",
+              "value": "20/21"
+            }
+          ]
+        },
+        {
+          "season_id": 37036,
+          "name": "Premier League 21/22",
+          "source_name": "Premier League 21/22",
+          "year": "21/22",
+          "format": "split_year",
+          "season_format": "split_year",
+          "canonical_season": "2122",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "21/22",
+            "Premier League 21/22",
+            "2122"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "name",
+              "value": "Premier League 21/22"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "year",
+              "value": "21/22"
+            }
+          ]
+        },
+        {
+          "season_id": 41886,
+          "name": "Premier League 22/23",
+          "source_name": "Premier League 22/23",
+          "year": "22/23",
+          "format": "split_year",
+          "season_format": "split_year",
+          "canonical_season": "2223",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "22/23",
+            "Premier League 22/23",
+            "2223"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "name",
+              "value": "Premier League 22/23"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "year",
+              "value": "22/23"
+            }
+          ]
+        },
+        {
+          "season_id": 52186,
+          "name": "Premier League 23/24",
+          "source_name": "Premier League 23/24",
+          "year": "23/24",
+          "format": "split_year",
+          "season_format": "split_year",
+          "canonical_season": "2324",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "23/24",
+            "Premier League 23/24",
+            "2324"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "name",
+              "value": "Premier League 23/24"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "year",
+              "value": "23/24"
+            }
+          ]
+        },
+        {
+          "season_id": 61627,
+          "name": "Premier League 24/25",
+          "source_name": "Premier League 24/25",
+          "year": "24/25",
+          "format": "split_year",
+          "season_format": "split_year",
+          "canonical_season": "2425",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "24/25",
+            "Premier League 24/25",
+            "2425"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "name",
+              "value": "Premier League 24/25"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "year",
+              "value": "24/25"
+            }
+          ]
+        },
+        {
+          "season_id": 76986,
+          "name": "Premier League 25/26",
+          "source_name": "Premier League 25/26",
+          "year": "25/26",
+          "format": "split_year",
+          "season_format": "split_year",
+          "canonical_season": "2526",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "25/26",
+            "Premier League 25/26",
+            "2526"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "name",
+              "value": "Premier League 25/26"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "year",
+              "value": "25/26"
+            }
+          ]
+        },
+        {
+          "season_id": 96668,
+          "name": "Premier League 26/27",
+          "source_name": "Premier League 26/27",
+          "year": "26/27",
+          "format": "split_year",
+          "season_format": "split_year",
+          "canonical_season": "2627",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "26/27",
+            "Premier League 26/27",
+            "2627"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "name",
+              "value": "Premier League 26/27"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/17/seasons",
+              "field": "year",
+              "value": "26/27"
+            }
+          ]
+        }
       ]
     },
     {
       "unique_tournament_id": 23,
       "name": "Serie A",
       "slug": "serie-a",
-      "category": {"id": null, "name": "Italy", "slug": "italy"},
+      "category": {
+        "id": null,
+        "name": "Italy",
+        "slug": "italy"
+      },
       "sport_slug": "football",
       "page_path": "football/italy/serie-a",
       "canonical_id": "ITA-Serie A",
       "enabled": false,
-      "classification": {"sport": "football", "gender": "unknown", "age_group": "unknown", "team_level": "unknown", "status": "unknown", "exclusion_reasons": [], "evidence": [{"type": "registry_migration", "endpoint": "configs/sofascore/tournaments.json@schema-v1", "field": "sport_slug", "value": "football"}]},
-      "review": {"status": "pending", "confirmed": {"sport": null, "gender": null, "age_group": null, "team_level": null}, "reviewed_by": null, "reviewed_at": null, "evidence": [], "notes": null},
+      "classification": {
+        "sport": "football",
+        "gender": "unknown",
+        "age_group": "unknown",
+        "team_level": "unknown",
+        "status": "unknown",
+        "exclusion_reasons": [],
+        "evidence": [
+          {
+            "type": "registry_migration",
+            "endpoint": "configs/sofascore/tournaments.json@schema-v1",
+            "field": "sport_slug",
+            "value": "football"
+          }
+        ]
+      },
+      "review": {
+        "status": "pending",
+        "confirmed": {
+          "sport": null,
+          "gender": null,
+          "age_group": null,
+          "team_level": null
+        },
+        "reviewed_by": null,
+        "reviewed_at": null,
+        "evidence": [],
+        "notes": null
+      },
       "seasons": []
     },
     {
       "unique_tournament_id": 34,
       "name": "Ligue 1",
       "slug": "ligue-1",
-      "category": {"id": null, "name": "France", "slug": "france"},
+      "category": {
+        "id": null,
+        "name": "France",
+        "slug": "france"
+      },
       "sport_slug": "football",
       "page_path": "football/france/ligue-1",
       "canonical_id": "FRA-Ligue 1",
       "enabled": false,
-      "classification": {"sport": "football", "gender": "unknown", "age_group": "unknown", "team_level": "unknown", "status": "unknown", "exclusion_reasons": [], "evidence": [{"type": "registry_migration", "endpoint": "configs/sofascore/tournaments.json@schema-v1", "field": "sport_slug", "value": "football"}]},
-      "review": {"status": "pending", "confirmed": {"sport": null, "gender": null, "age_group": null, "team_level": null}, "reviewed_by": null, "reviewed_at": null, "evidence": [], "notes": null},
+      "classification": {
+        "sport": "football",
+        "gender": "unknown",
+        "age_group": "unknown",
+        "team_level": "unknown",
+        "status": "unknown",
+        "exclusion_reasons": [],
+        "evidence": [
+          {
+            "type": "registry_migration",
+            "endpoint": "configs/sofascore/tournaments.json@schema-v1",
+            "field": "sport_slug",
+            "value": "football"
+          }
+        ]
+      },
+      "review": {
+        "status": "pending",
+        "confirmed": {
+          "sport": null,
+          "gender": null,
+          "age_group": null,
+          "team_level": null
+        },
+        "reviewed_by": null,
+        "reviewed_at": null,
+        "evidence": [],
+        "notes": null
+      },
       "seasons": []
     },
     {
       "unique_tournament_id": 35,
       "name": "Bundesliga",
       "slug": "bundesliga",
-      "category": {"id": null, "name": "Germany", "slug": "germany"},
+      "category": {
+        "id": null,
+        "name": "Germany",
+        "slug": "germany"
+      },
       "sport_slug": "football",
       "page_path": "football/germany/bundesliga",
       "canonical_id": "GER-Bundesliga",
       "enabled": false,
-      "classification": {"sport": "football", "gender": "unknown", "age_group": "unknown", "team_level": "unknown", "status": "unknown", "exclusion_reasons": [], "evidence": [{"type": "registry_migration", "endpoint": "configs/sofascore/tournaments.json@schema-v1", "field": "sport_slug", "value": "football"}]},
-      "review": {"status": "pending", "confirmed": {"sport": null, "gender": null, "age_group": null, "team_level": null}, "reviewed_by": null, "reviewed_at": null, "evidence": [], "notes": null},
+      "classification": {
+        "sport": "football",
+        "gender": "unknown",
+        "age_group": "unknown",
+        "team_level": "unknown",
+        "status": "unknown",
+        "exclusion_reasons": [],
+        "evidence": [
+          {
+            "type": "registry_migration",
+            "endpoint": "configs/sofascore/tournaments.json@schema-v1",
+            "field": "sport_slug",
+            "value": "football"
+          }
+        ]
+      },
+      "review": {
+        "status": "pending",
+        "confirmed": {
+          "sport": null,
+          "gender": null,
+          "age_group": null,
+          "team_level": null
+        },
+        "reviewed_by": null,
+        "reviewed_at": null,
+        "evidence": [],
+        "notes": null
+      },
       "seasons": []
     },
     {
       "unique_tournament_id": 133,
       "name": "Copa América",
       "slug": "copa-america",
-      "category": {"id": null, "name": "South America", "slug": "south-america"},
+      "category": {
+        "id": null,
+        "name": "South America",
+        "slug": "south-america"
+      },
       "sport_slug": "football",
       "page_path": "football/south-america/copa-america",
       "canonical_id": "INT-Copa America",
       "enabled": false,
-      "classification": {"sport": "football", "gender": "unknown", "age_group": "unknown", "team_level": "unknown", "status": "unknown", "exclusion_reasons": [], "evidence": [{"type": "registry_migration", "endpoint": "configs/sofascore/tournaments.json@schema-v1", "field": "sport_slug", "value": "football"}]},
-      "review": {"status": "pending", "confirmed": {"sport": null, "gender": null, "age_group": null, "team_level": null}, "reviewed_by": null, "reviewed_at": null, "evidence": [], "notes": null},
+      "classification": {
+        "sport": "football",
+        "gender": "unknown",
+        "age_group": "unknown",
+        "team_level": "unknown",
+        "status": "unknown",
+        "exclusion_reasons": [],
+        "evidence": [
+          {
+            "type": "registry_migration",
+            "endpoint": "configs/sofascore/tournaments.json@schema-v1",
+            "field": "sport_slug",
+            "value": "football"
+          }
+        ]
+      },
+      "review": {
+        "status": "pending",
+        "confirmed": {
+          "sport": null,
+          "gender": null,
+          "age_group": null,
+          "team_level": null
+        },
+        "reviewed_by": null,
+        "reviewed_at": null,
+        "evidence": [],
+        "notes": null
+      },
       "seasons": []
     },
     {
       "unique_tournament_id": 203,
       "name": "Premier Liga",
       "slug": "premier-liga",
-      "category": {"id": null, "name": "Russia", "slug": "russia"},
+      "category": {
+        "id": null,
+        "name": "Russia",
+        "slug": "russia"
+      },
       "sport_slug": "football",
       "page_path": "football/russia/premier-liga",
       "canonical_id": null,
       "enabled": false,
-      "classification": {"sport": "football", "gender": "unknown", "age_group": "unknown", "team_level": "unknown", "status": "unknown", "exclusion_reasons": [], "evidence": [{"type": "registry_migration", "endpoint": "configs/sofascore/tournaments.json@schema-v1", "field": "sport_slug", "value": "football"}]},
-      "review": {"status": "pending", "confirmed": {"sport": null, "gender": null, "age_group": null, "team_level": null}, "reviewed_by": null, "reviewed_at": null, "evidence": [], "notes": null},
+      "classification": {
+        "sport": "football",
+        "gender": "unknown",
+        "age_group": "unknown",
+        "team_level": "unknown",
+        "status": "unknown",
+        "exclusion_reasons": [],
+        "evidence": [
+          {
+            "type": "registry_migration",
+            "endpoint": "configs/sofascore/tournaments.json@schema-v1",
+            "field": "sport_slug",
+            "value": "football"
+          }
+        ]
+      },
+      "review": {
+        "status": "pending",
+        "confirmed": {
+          "sport": null,
+          "gender": null,
+          "age_group": null,
+          "team_level": null
+        },
+        "reviewed_by": null,
+        "reviewed_at": null,
+        "evidence": [],
+        "notes": null
+      },
       "seasons": []
     },
     {
       "unique_tournament_id": 270,
       "name": "Africa Cup of Nations",
       "slug": "africa-cup-of-nations",
-      "category": {"id": null, "name": "Africa", "slug": "africa"},
+      "category": {
+        "id": null,
+        "name": "Africa",
+        "slug": "africa"
+      },
       "sport_slug": "football",
       "page_path": "football/africa/africa-cup-of-nations",
       "canonical_id": "INT-Africa Cup of Nations",
       "enabled": false,
-      "classification": {"sport": "football", "gender": "unknown", "age_group": "unknown", "team_level": "unknown", "status": "unknown", "exclusion_reasons": [], "evidence": [{"type": "registry_migration", "endpoint": "configs/sofascore/tournaments.json@schema-v1", "field": "sport_slug", "value": "football"}]},
-      "review": {"status": "pending", "confirmed": {"sport": null, "gender": null, "age_group": null, "team_level": null}, "reviewed_by": null, "reviewed_at": null, "evidence": [], "notes": null},
+      "classification": {
+        "sport": "football",
+        "gender": "unknown",
+        "age_group": "unknown",
+        "team_level": "unknown",
+        "status": "unknown",
+        "exclusion_reasons": [],
+        "evidence": [
+          {
+            "type": "registry_migration",
+            "endpoint": "configs/sofascore/tournaments.json@schema-v1",
+            "field": "sport_slug",
+            "value": "football"
+          }
+        ]
+      },
+      "review": {
+        "status": "pending",
+        "confirmed": {
+          "sport": null,
+          "gender": null,
+          "age_group": null,
+          "team_level": null
+        },
+        "reviewed_by": null,
+        "reviewed_at": null,
+        "evidence": [],
+        "notes": null
+      },
       "seasons": [
-        {"season_id": 71636, "name": "Africa Cup of Nations 2025", "source_name": "Africa Cup of Nations 2025", "year": "2025", "format": "calendar_year", "season_format": "single_year", "canonical_season": "2025", "start_date": null, "end_date": null, "aliases": ["2025", "Africa Cup of Nations 2025"], "evidence": [{"type": "source_field", "endpoint": "/unique-tournament/270/seasons", "field": "name/year", "value": "Africa Cup of Nations 2025|2025"}]}
+        {
+          "season_id": 71636,
+          "name": "Africa Cup of Nations 2025",
+          "source_name": "Africa Cup of Nations 2025",
+          "year": "2025",
+          "format": "calendar_year",
+          "season_format": "single_year",
+          "canonical_season": "2025",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "2025",
+            "Africa Cup of Nations 2025"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/270/seasons",
+              "field": "name/year",
+              "value": "Africa Cup of Nations 2025|2025"
+            }
+          ]
+        }
       ]
     },
     {
       "unique_tournament_id": 10783,
       "name": "UEFA Nations League",
       "slug": "uefa-nations-league",
-      "category": {"id": null, "name": "Europe", "slug": "europe"},
+      "category": {
+        "id": null,
+        "name": "Europe",
+        "slug": "europe"
+      },
       "sport_slug": "football",
       "page_path": "football/europe/uefa-nations-league",
       "canonical_id": null,
       "enabled": false,
-      "classification": {"sport": "football", "gender": "unknown", "age_group": "unknown", "team_level": "unknown", "status": "unknown", "exclusion_reasons": [], "evidence": [{"type": "registry_migration", "endpoint": "configs/sofascore/tournaments.json@schema-v1", "field": "sport_slug", "value": "football"}]},
-      "review": {"status": "pending", "confirmed": {"sport": null, "gender": null, "age_group": null, "team_level": null}, "reviewed_by": null, "reviewed_at": null, "evidence": [], "notes": null},
+      "classification": {
+        "sport": "football",
+        "gender": "unknown",
+        "age_group": "unknown",
+        "team_level": "unknown",
+        "status": "unknown",
+        "exclusion_reasons": [],
+        "evidence": [
+          {
+            "type": "registry_migration",
+            "endpoint": "configs/sofascore/tournaments.json@schema-v1",
+            "field": "sport_slug",
+            "value": "football"
+          }
+        ]
+      },
+      "review": {
+        "status": "pending",
+        "confirmed": {
+          "sport": null,
+          "gender": null,
+          "age_group": null,
+          "team_level": null
+        },
+        "reviewed_by": null,
+        "reviewed_at": null,
+        "evidence": [],
+        "notes": null
+      },
       "seasons": []
     }
   ]

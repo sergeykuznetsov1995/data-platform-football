@@ -75,6 +75,14 @@ from .transport import (
     WhoScoredTransportError,
 )
 
+_SOURCE_STAGE_HEADER_UNAVAILABLE = "WhoScored page request header is unavailable."
+
+
+def _is_source_stage_statistics_unavailable(exc: WhoScoredTransportError) -> bool:
+    return exc.kind is FailureKind.BROWSER and _SOURCE_STAGE_HEADER_UNAVAILABLE in str(
+        exc
+    )
+
 
 ACTIVE_SCHEDULE_CACHE_TTL = timedelta(hours=6)
 MIN_INITIAL_CATALOG_TOURNAMENTS = 100
@@ -1628,12 +1636,48 @@ class WhoScoredIngestService:
                     )
                 result.errors.append("catalog completeness: " + "; ".join(problems))
             else:
+                persisted_raw_inputs: Sequence[Mapping[str, Any]] = raw_inputs
+                persisted_raw_uri = root_raw_uri
+                # A first full-history catalog has more provenance than can
+                # fit in one Trino query literal (10k+ raw inputs can exceed
+                # query.max-length). Persist the complete canonical list as
+                # one content-addressed raw object and put only its compact,
+                # hash-bound descriptor in the commit manifest. Tests may use
+                # a minimal raw-store seam; production always has store_bytes.
+                if hasattr(store, "store_bytes") and hasattr(store, "object_uri"):
+                    provenance_target = RawTarget(
+                        source="whoscored",
+                        page_kind="catalog_provenance",
+                        target_id=f"whoscored:catalog-provenance:{discovery_batch_id}",
+                        canonical_url=(
+                            "https://www.whoscored.com/catalog/provenance/"
+                            f"{discovery_batch_id}"
+                        ),
+                        source_ids={"discovery_batch_id": discovery_batch_id},
+                    )
+                    provenance_record = store.store_bytes(
+                        provenance_target,
+                        raw_inputs_payload.encode("utf-8"),
+                        content_type="application/json",
+                        charset="utf-8",
+                        fetcher_version=PARSER_VERSION,
+                    )
+                    persisted_raw_uri = store.object_uri(provenance_record.blob_key)
+                    persisted_raw_inputs = (
+                        {
+                            "target_id": provenance_target.target_id,
+                            "raw_uri": persisted_raw_uri,
+                            "payload_sha256": raw_inputs_sha256,
+                            "input_count": len(raw_inputs),
+                            "encoding": "application/json+gzip",
+                        },
+                    )
                 repo.persist_discovered_catalog(
                     discovered,
                     discovery_batch_id=discovery_batch_id,
-                    raw_uri=root_raw_uri,
+                    raw_uri=persisted_raw_uri,
                     payload_sha256=catalog_payload_sha256,
-                    raw_inputs=raw_inputs,
+                    raw_inputs=persisted_raw_inputs,
                 )
                 result.succeeded = len(competition_rows)
         except Exception as exc:
@@ -2092,7 +2136,46 @@ class WhoScoredIngestService:
                         )
                     )
 
-                structured_results = self._fetch_parsed_many(structured_specs)
+                # WhoScored advertises the next domestic edition before its
+                # first kickoff, but the stage statistics page intentionally
+                # has no Model-last-Mode token until statistics exist. This is
+                # explicit source unavailability, not a browser failure and
+                # not a reason to discard the already available schedule.
+                if stage_kickoffs and min(stage_kickoffs).date() > today:
+                    for feed_key, table, _required, _label in structured_contracts:
+                        feed_states[feed_key] = DatasetStatus.NOT_AVAILABLE.value
+                        source_unavailable.add(table)
+                    feed_states[f"{stage_id}:referee:summary"] = (
+                        DatasetStatus.NOT_AVAILABLE.value
+                    )
+                    source_unavailable.add("whoscored_referee_stage_stats")
+                    continue
+
+                try:
+                    structured_results = self._fetch_parsed_many(structured_specs)
+                except WhoScoredTransportError as exc:
+                    # The restricted browser endpoint emits this exact error
+                    # only after the loaded WhoScored page has lacked its
+                    # source-owned Model-last-Mode token for the full bounded
+                    # wait. Some lower-tier/current stages publish fixtures
+                    # but no statistics UI at all. Preserve that distinction
+                    # as explicit feed unavailability; unrelated browser/5xx
+                    # failures still fail closed.
+                    if not _is_source_stage_statistics_unavailable(exc):
+                        raise
+                    for (
+                        feed_key,
+                        table,
+                        _required,
+                        _label,
+                    ) in structured_contracts:
+                        feed_states[feed_key] = DatasetStatus.NOT_AVAILABLE.value
+                        source_unavailable.add(table)
+                    feed_states[f"{stage_id}:referee:summary"] = (
+                        DatasetStatus.NOT_AVAILABLE.value
+                    )
+                    source_unavailable.add("whoscored_referee_stage_stats")
+                    continue
                 if len(structured_results) != len(structured_contracts):
                     raise WhoScoredParseError(
                         f"stage {stage_id} structured feed batch is incomplete"
@@ -2153,7 +2236,7 @@ class WhoScoredIngestService:
             for table, rows in stage_stat_rows.items():
                 datasets[table] = self._entity_keyed(rows)
                 distinct_keys[table] = "entity_key"
-                if not rows:
+                if not rows and table not in source_unavailable:
                     source_empty.add(table)
 
             combined_hash = hashlib.sha256(
@@ -2275,7 +2358,14 @@ class WhoScoredIngestService:
                     raise WhoScoredParseError(str(exc)) from exc
                 pending.append((commit, parsed))
             except WhoScoredTransportError as exc:
-                if exc.kind is FailureKind.CONTENT:
+                source_match_unavailable = (
+                    exc.kind is FailureKind.CONTENT
+                    and not candidate.match_is_opta
+                    and "JavaScript assignment 'matchCentreData' not found" in str(exc)
+                )
+                if source_match_unavailable:
+                    state = "not_available"
+                elif exc.kind is FailureKind.CONTENT:
                     state = "parse_failed"
                 else:
                     # Task-scoped safety ceilings and cache/proxy
@@ -2337,7 +2427,11 @@ class WhoScoredIngestService:
                         f"{type(manifest_exc).__name__}: {manifest_exc}"
                     )
                 else:
-                    if state == "parse_failed":
+                    if state == "not_available":
+                        # Explicit durable source state. The schedule row stays
+                        # published and this candidate is not probed again.
+                        pass
+                    elif state == "parse_failed":
                         result.errors.append(f"game {candidate.game_id}: {exc}")
                     else:
                         target_list = (
@@ -2704,9 +2798,18 @@ class WhoScoredIngestService:
                         "height_cm",
                         "nationality",
                         "current_team_id",
+                        "shirt_number",
+                        "age",
+                        "positions",
                     )
                 )
-                if not row.get("name") or useful < 2:
+                # WhoScored legitimately omits biographical fields for some
+                # reserve/new players while still publishing their team,
+                # position and tournament participation.  Those are valid
+                # profiles, not parser drift.  Requiring a name plus one
+                # independent descriptor keeps challenge/error shells out
+                # without rejecting sparse source records.
+                if not row.get("name") or useful < 1:
                     raise WhoScoredParseError("profile lacks required identity fields")
                 return True
 

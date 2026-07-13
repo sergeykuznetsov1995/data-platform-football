@@ -6,6 +6,7 @@ import pytest
 
 from scrapers.fbref.camoufox_fetch import (
     BROWSER_REQUEST_FIXED_OVERHEAD_BYTES,
+    BROWSER_UNDECLARED_BODY_RESERVATION_BYTES,
     CamoufoxFbrefTransport,
     is_cloudflare_blocked,
     should_block_request,
@@ -132,17 +133,14 @@ def test_continue_exception_keeps_unknown_reservation_charged():
 
 @pytest.mark.unit
 @pytest.mark.parametrize(
-    ("headers", "reason"),
+    "headers",
     [
-        ({}, "missing_or_invalid_content_length"),
-        ({"content-length": "not-a-number"}, "missing_or_invalid_content_length"),
-        (
-            {"content-length": "10", "transfer-encoding": "chunked"},
-            "chunked_content_length",
-        ),
+        {},
+        {"content-length": "not-a-number"},
+        {"content-length": "10", "transfer-encoding": "chunked"},
     ],
 )
-def test_browser_aborts_whole_session_on_unbounded_response(headers, reason):
+def test_browser_aborts_whole_session_when_undeclared_body_cannot_fit(headers):
     cap = BROWSER_REQUEST_FIXED_OVERHEAD_BYTES + 100
     transport = CamoufoxFbrefTransport(max_network_bytes=cap)
     route = _Route()
@@ -153,12 +151,81 @@ def test_browser_aborts_whole_session_on_unbounded_response(headers, reason):
     stats = transport.traffic_stats()
     assert route.continued == 1
     assert stats["byte_budget_exhausted"] is True
-    assert stats["byte_budget_failure"] == reason
+    assert stats["byte_budget_failure"] == (
+        f"undeclared_body_exceeds_cap:{BROWSER_UNDECLARED_BODY_RESERVATION_BYTES}"
+    )
     assert stats["inflight_reserved_bytes"] == 0
     assert stats["budget_unobserved_bytes"] == (
         BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
     )
     assert stats["budget_blocked_count"] == 1
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {},
+        {"content-length": "not-a-number"},
+        {"content-length": "10", "transfer-encoding": "chunked"},
+    ],
+)
+def test_undeclared_body_reserves_the_ceiling_and_settles_to_observed(headers):
+    """Cloudflare/HTTP-2 responses carry no usable Content-Length; the guard
+    must reserve a ceiling instead of killing the clearance session."""
+    overhead = BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
+    ceiling = BROWSER_UNDECLARED_BODY_RESERVATION_BYTES
+    transport = CamoufoxFbrefTransport(
+        max_network_bytes=overhead + ceiling + 1_000
+    )
+    route = _Route()
+    transport._maybe_block(route)
+
+    transport._on_response(_Response(route.request, headers))
+
+    stats = transport.traffic_stats()
+    assert stats["byte_budget_exhausted"] is False
+    assert stats["inflight_reserved_bytes"] == overhead + ceiling
+
+    route.request.sizes.return_value = {
+        "responseBodySize": 40_000,
+        "responseHeadersSize": 1_000,
+        "requestBodySize": 0,
+        "requestHeadersSize": 500,
+    }
+    transport._on_request_finished(route.request)
+
+    stats = transport.traffic_stats()
+    assert stats["byte_budget_exhausted"] is False
+    assert stats["inflight_reserved_bytes"] == 0
+    assert stats["real_bytes_downloaded"] == 41_500
+
+
+@pytest.mark.unit
+def test_undeclared_body_that_outgrows_its_reservation_aborts_at_completion():
+    overhead = BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
+    ceiling = BROWSER_UNDECLARED_BODY_RESERVATION_BYTES
+    transport = CamoufoxFbrefTransport(
+        max_network_bytes=overhead + ceiling + 1_000
+    )
+    route = _Route()
+    transport._maybe_block(route)
+    transport._on_response(_Response(route.request, {}))
+
+    oversized = overhead + ceiling + 1
+    route.request.sizes.return_value = {
+        "responseBodySize": oversized,
+        "responseHeadersSize": 0,
+        "requestBodySize": 0,
+        "requestHeadersSize": 0,
+    }
+    transport._on_request_finished(route.request)
+
+    stats = transport.traffic_stats()
+    assert stats["byte_budget_exhausted"] is True
+    assert stats["byte_budget_failure"].startswith(
+        "completed_size_exceeded_reservation:"
+    )
 
 
 @pytest.mark.unit
@@ -226,6 +293,158 @@ def test_browser_releases_declared_reservation_after_finish_and_failure():
     assert stats["real_bytes_downloaded"] == 130
     assert stats["unobserved_reserved_bytes"] == overhead + 200
     assert stats["byte_budget_exhausted"] is False
+
+
+@pytest.mark.unit
+def test_redirect_hop_response_is_adopted_not_fatal():
+    overhead = BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
+    transport = CamoufoxFbrefTransport(
+        max_network_bytes=(3 * overhead) + 1000,
+        max_network_requests=5,
+    )
+    route = _Route()
+    transport._maybe_block(route)
+    transport._on_response(
+        _Response(route.request, {"content-length": "50"})
+    )
+
+    hop_request = MagicMock(
+        resource_type="document", url="https://fbref.com/en/?redirected=1"
+    )
+    hop_request.redirected_from = route.request
+    transport._on_response(
+        _Response(hop_request, {"content-length": "60"})
+    )
+
+    stats = transport.traffic_stats()
+    assert stats["byte_budget_exhausted"] is False
+    assert stats["inflight_reserved_bytes"] == (2 * overhead) + 50 + 60
+    # The hop consumes a request slot exactly like a routed request.
+    assert stats["real_requests_count"] == 2
+    assert stats["completed_requests_count"] == 0
+
+
+@pytest.mark.unit
+def test_rewrapped_request_reuses_its_route_reservation():
+    """Firefox can deliver the response with a different Request wrapper for
+    the request route() already reserved; it must not be charged twice."""
+    overhead = BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
+    transport = CamoufoxFbrefTransport(
+        max_network_bytes=(4 * overhead) + 1000,
+        max_network_requests=5,
+    )
+    route = _Route()
+    transport._maybe_block(route)
+
+    rewrapped = MagicMock(resource_type="document", url=route.request.url)
+    rewrapped.redirected_from = None
+    transport._on_response(_Response(rewrapped, {"content-length": "50"}))
+
+    stats = transport.traffic_stats()
+    assert stats["byte_budget_exhausted"] is False
+    assert stats["real_requests_count"] == 1  # one slot, not two
+    assert stats["inflight_reserved_bytes"] == overhead + 50
+
+    rewrapped.sizes.return_value = {
+        "responseBodySize": 50,
+        "responseHeadersSize": 10,
+        "requestBodySize": 0,
+        "requestHeadersSize": 10,
+    }
+    transport._on_request_finished(rewrapped)
+
+    stats = transport.traffic_stats()
+    assert stats["inflight_reserved_bytes"] == 0
+    assert stats["unobserved_reserved_bytes"] == 0
+    assert stats["real_bytes_downloaded"] == 70
+
+
+@pytest.mark.unit
+def test_unrouted_request_over_request_cap_aborts_session():
+    transport = CamoufoxFbrefTransport(
+        max_network_bytes=10 * BROWSER_REQUEST_FIXED_OVERHEAD_BYTES,
+        max_network_requests=1,
+    )
+    route = _Route()
+    transport._maybe_block(route)
+
+    hop_request = MagicMock(
+        resource_type="document", url="https://fbref.com/en/?redirected=1"
+    )
+    hop_request.redirected_from = route.request
+    transport._on_response(
+        _Response(hop_request, {"content-length": "60"})
+    )
+
+    stats = transport.traffic_stats()
+    assert stats["byte_budget_exhausted"] is True
+    assert stats["byte_budget_failure"] == "unrouted_request_over_request_cap"
+
+
+@pytest.mark.unit
+def test_unrouted_request_over_byte_cap_aborts_session():
+    overhead = BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
+    transport = CamoufoxFbrefTransport(
+        max_network_bytes=(2 * overhead) - 1,
+        max_network_requests=5,
+    )
+    route = _Route()
+    transport._maybe_block(route)
+
+    hop_request = MagicMock(
+        resource_type="document", url="https://fbref.com/en/?redirected=1"
+    )
+    hop_request.redirected_from = route.request
+    transport._on_response(
+        _Response(hop_request, {"content-length": "60"})
+    )
+
+    stats = transport.traffic_stats()
+    assert stats["byte_budget_exhausted"] is True
+    assert stats["byte_budget_failure"] == "unrouted_request_over_byte_cap"
+
+
+@pytest.mark.unit
+def test_redirect_hop_reservation_settles_on_finish():
+    overhead = BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
+    transport = CamoufoxFbrefTransport(
+        max_network_bytes=(3 * overhead) + 1000,
+        max_network_requests=5,
+    )
+    route = _Route()
+    transport._maybe_block(route)
+    transport._on_response(
+        _Response(route.request, {"content-length": "50"})
+    )
+    route.request.sizes.return_value = {
+        "responseBodySize": 50,
+        "responseHeadersSize": 10,
+        "requestBodySize": 0,
+        "requestHeadersSize": 10,
+    }
+    transport._on_request_finished(route.request)
+
+    hop_request = MagicMock(
+        resource_type="document", url="https://fbref.com/en/?redirected=1"
+    )
+    hop_request.redirected_from = route.request
+    hop_request.sizes.return_value = {
+        "responseBodySize": 60,
+        "responseHeadersSize": 10,
+        "requestBodySize": 0,
+        "requestHeadersSize": 10,
+    }
+    transport._on_response(
+        _Response(hop_request, {"content-length": "60"})
+    )
+    transport._on_request_finished(hop_request)
+
+    stats = transport.traffic_stats()
+    assert stats["byte_budget_exhausted"] is False
+    assert stats["inflight_reserved_bytes"] == 0
+    assert stats["real_bytes_downloaded"] == 70 + 80
+    assert stats["real_requests_count"] == 2
+    assert stats["completed_requests_count"] == 2
 
 
 @pytest.mark.unit
@@ -376,3 +595,204 @@ def test_clearance_requires_cf_cookie():
     transport._page = page
 
     assert transport.get_clearance() is None
+
+
+class _FakeChild:
+    def __init__(self, name: str) -> None:
+        self._name = name
+        self.killed = False
+
+    def name(self) -> str:
+        return self._name
+
+    def kill(self) -> None:
+        self.killed = True
+
+
+def test_hung_browser_start_kills_only_its_own_browser_processes(monkeypatch):
+    """Camoufox's launch never times out on a dead exit IP, so the watchdog
+    kills the browser it spawned — that is what makes the launch raise and the
+    caller rotate onto a fresh proxy."""
+    import psutil
+
+    transport = CamoufoxFbrefTransport(proxy={"server": "http://p:1"})
+    browser = _FakeChild("camoufox-bin")
+    driver = _FakeChild("node")  # playwright's driver — must survive
+    unrelated = _FakeChild("postgres")
+
+    process = MagicMock()
+    process.children.return_value = [browser, driver, unrelated]
+    monkeypatch.setattr(psutil, "Process", lambda: process)
+
+    transport._kill_browser_processes()
+
+    assert browser.killed
+    # Killing playwright's driver severs the connection every later session in
+    # this process needs: production then failed every navigation instantly.
+    assert not driver.killed
+    assert not unrelated.killed
+    assert transport.traffic_stats()["browser_watchdog_kills"] == 1
+
+
+def test_browser_start_watchdog_is_disarmed_once_the_browser_is_up(monkeypatch):
+    """A healthy start must not leave a timer that kills a working session."""
+    timers = []
+
+    class _Timer:
+        def __init__(self, interval, function, args=()):
+            self.interval = interval
+            self.function = function
+            self.args = args
+            self.cancelled = False
+            self.daemon = False
+            timers.append(self)
+
+        def start(self):
+            pass
+
+        def cancel(self):
+            self.cancelled = True
+
+    monkeypatch.setattr(
+        "scrapers.fbref.camoufox_fetch.threading.Timer", _Timer
+    )
+    page = MagicMock()
+    browser = MagicMock()
+    browser.new_page.return_value = page
+    camoufox = MagicMock()
+    camoufox.return_value.__enter__.return_value = browser
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "camoufox.sync_api",
+        MagicMock(Camoufox=camoufox),
+    )
+
+    transport = CamoufoxFbrefTransport(proxy={"server": "http://p:1"})
+    transport._start()
+
+    assert len(timers) == 1
+    assert timers[0].cancelled is True
+    assert timers[0].interval == transport.BROWSER_START_TIMEOUT_S
+
+
+def test_byte_budget_abort_never_closes_the_browser_from_a_callback():
+    """Playwright's sync API deadlocks when the browser is torn down inside an
+    event callback: the callback waits for the close, the close waits for the
+    callback. The cap must only raise its flag there — closing is the fetch
+    loop's job, back on the main thread."""
+    transport = CamoufoxFbrefTransport(max_network_bytes=100)
+    stopped = []
+    transport._stop = lambda: stopped.append(True)  # type: ignore[method-assign]
+    transport._cm = object()
+
+    transport._abort_session_for_byte_budget("declared_content_length_exceeds_cap:999")
+
+    assert stopped == []
+    assert transport._byte_budget_exhausted is True
+    assert transport.traffic_stats()["byte_budget_failure"] == (
+        "declared_content_length_exceeds_cap:999"
+    )
+
+
+def test_fetch_closes_the_session_after_the_budget_aborted_it():
+    transport = CamoufoxFbrefTransport(max_network_bytes=100)
+    stopped = []
+    transport._stop = lambda: stopped.append(True)  # type: ignore[method-assign]
+    transport._cm = object()
+    transport._page = MagicMock()
+    transport._page.goto.side_effect = lambda *a, **k: (
+        transport._abort_session_for_byte_budget("undeclared_body_exceeds_cap:1")
+    )
+
+    assert transport.fetch("https://fbref.com/en/") is None
+    assert stopped == [True]
+
+
+def test_a_wedged_navigation_is_killed_by_the_attempt_deadline(monkeypatch):
+    """Playwright's nav timeout lives in its driver: when a stalled exit IP
+    wedges the driver connection, goto never returns and its own timeout never
+    fires. The attempt deadline kills the browser, which raises out of goto and
+    puts the fetch back on the rotation path instead of hanging the wave."""
+    timers = []
+
+    class _Timer:
+        def __init__(self, interval, function, args=()):
+            self.interval = interval
+            self.function = function
+            self.args = args
+            self.daemon = False
+            self.cancelled = False
+            timers.append(self)
+
+        def start(self):
+            # A wedged call is what the timer exists for: fire immediately.
+            self.function(*self.args)
+
+        def cancel(self):
+            self.cancelled = True
+
+    monkeypatch.setattr(
+        "scrapers.fbref.camoufox_fetch.threading.Timer", _Timer
+    )
+    transport = CamoufoxFbrefTransport(proxy={"server": "http://p:1"})
+    killed = []
+    monkeypatch.setattr(
+        transport, "_kill_browser_processes",
+        lambda phase="start", timeout_s=None: killed.append(phase),
+    )
+    transport._page = MagicMock()
+    transport._page.goto.side_effect = RuntimeError("Target closed")
+    transport._restart = MagicMock()  # type: ignore[method-assign]
+
+    assert transport.fetch("https://fbref.com/en/") is None
+    assert killed and killed[0] == "navigation"
+    assert timers[0].interval == transport.BROWSER_ATTEMPT_TIMEOUT_S
+    assert transport._restart.call_count == transport.MAX_PROXY_ROTATIONS
+
+
+def test_a_wedged_solve_is_killed_by_the_attempt_deadline(monkeypatch):
+    """The solve loop checks its own deadline between polls — but a wedged
+    evaluate() blocks before the check. The killed browser must surface as a
+    failed attempt, not as an exception out of fetch."""
+    monkeypatch.setattr(
+        "scrapers.fbref.camoufox_fetch.threading.Timer",
+        lambda interval, function, args=(): MagicMock(),
+    )
+    transport = CamoufoxFbrefTransport(proxy={"server": "http://p:1"})
+    transport._page = MagicMock()
+    transport._solve_current_page = MagicMock(  # type: ignore[method-assign]
+        side_effect=RuntimeError("Target closed")
+    )
+    transport._restart = MagicMock()  # type: ignore[method-assign]
+
+    assert transport.fetch("https://fbref.com/en/") is None
+    assert transport._restart.call_count == transport.MAX_PROXY_ROTATIONS
+
+
+def test_traffic_is_billed_once_per_bootstrap_not_once_per_target():
+    """The counters are cumulative for the session. Charging the running totals
+    made every later target of a wave pay again for the same browser traffic:
+    one wave billed 140 requests for ~20 real ones and exhausted the run's
+    budget on traffic that never crossed the proxy."""
+    transport = CamoufoxFbrefTransport(proxy={"server": "http://p:1"})
+    transport._bytes_total = 1_000_000
+    transport._requests_count = 19
+    transport._bytes_by_type["document"] = 700_000
+
+    first = transport.traffic_delta()
+    assert first["real_bytes_downloaded"] == 1_000_000
+    assert first["real_requests_count"] == 19
+    assert first["real_bytes_by_resource_type"]["document"] == 700_000
+
+    # Nothing new crossed the wire: the next target must be charged nothing.
+    second = transport.traffic_delta()
+    assert second["real_bytes_downloaded"] == 0
+    assert second["real_requests_count"] == 0
+    assert second["real_bytes_by_resource_type"]["document"] == 0
+
+    # A second solve is charged exactly its own cost.
+    transport._bytes_total += 1_100_000
+    transport._requests_count += 21
+    third = transport.traffic_delta()
+    assert third["real_bytes_downloaded"] == 1_100_000
+    assert third["real_requests_count"] == 21

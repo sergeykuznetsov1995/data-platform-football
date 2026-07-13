@@ -36,6 +36,7 @@ from scrapers.whoscored.service import (
     STRUCTURED_REQUEST_BURST_SIZE,
     WhoScoredIngestService,
     _ParsedFetchSpec,
+    _is_source_stage_statistics_unavailable,
     catalog_requests_per_minute_from_env,
     structured_requests_per_minute_from_env,
 )
@@ -671,6 +672,28 @@ def test_catalog_rate_limit_defaults_to_hard_max_with_four_request_burst():
     assert CATALOG_REQUEST_BURST_SIZE == 4
 
 
+def test_only_exact_browser_source_header_absence_marks_stage_stats_unavailable():
+    unavailable = WhoScoredTransportError(
+        "FlareSolverr HTTP 502: WhoScored page request header is unavailable.",
+        kind=FailureKind.BROWSER,
+        url="https://www.whoscored.com/statisticsfeed/1/getteamstatistics",
+    )
+    ordinary_502 = WhoScoredTransportError(
+        "FlareSolverr HTTP 502: Bad gateway",
+        kind=FailureKind.BROWSER,
+        url="https://www.whoscored.com/statisticsfeed/1/getteamstatistics",
+    )
+    wrong_route_kind = WhoScoredTransportError(
+        "WhoScored page request header is unavailable.",
+        kind=FailureKind.HTTP_STATUS,
+        url="https://www.whoscored.com/statisticsfeed/1/getteamstatistics",
+    )
+
+    assert _is_source_stage_statistics_unavailable(unavailable)
+    assert not _is_source_stage_statistics_unavailable(ordinary_502)
+    assert not _is_source_stage_statistics_unavailable(wrong_route_kind)
+
+
 @pytest.mark.parametrize("value", ["", "0", "61", "1.5", "sixty", "+60", "060"])
 def test_structured_rate_limit_env_is_fail_closed(value):
     with pytest.raises(ValueError, match="WHOSCORED_STRUCTURED_REQUESTS_PER_MINUTE"):
@@ -770,16 +793,35 @@ def test_discover_catalog_automatically_bootstraps_full_history_before_initial_p
         schedule_rows=(schedule,),
         minimum=1,
     )
+    raw_store = WhoScoredRawStore(fs.LocalFileSystem(), str(tmp_path / "raw"))
 
     result = WhoScoredIngestService.discover_catalog(
         repository=repository,
         transport=_CatalogTransport(),
-        raw_store=object(),
+        raw_store=raw_store,
     )
 
     assert result.status == "success"
     assert result.counts["full_history"] == 1
     assert len(repository.persisted) == 1
+    metadata = repository.persisted[0][1]
+    assert len(metadata["raw_inputs"]) == 1
+    descriptor = metadata["raw_inputs"][0]
+    assert descriptor["input_count"] > 1
+    target = RawTarget(
+        source="whoscored",
+        page_kind="catalog_provenance",
+        target_id=descriptor["target_id"],
+        canonical_url=(
+            "https://www.whoscored.com/catalog/provenance/"
+            f"{metadata['discovery_batch_id']}"
+        ),
+        source_ids={"discovery_batch_id": metadata["discovery_batch_id"]},
+    )
+    payload, record = raw_store.load_bytes(target)
+    assert len(json.loads(payload)) == descriptor["input_count"]
+    assert record.content_hash == descriptor["payload_sha256"]
+    assert metadata["raw_uri"] == raw_store.object_uri(record.blob_key)
 
 
 def test_discovery_batch_identity_includes_normalized_raw_provenance(
@@ -1963,6 +2005,35 @@ def test_parser_drift_is_fatal_and_manifested_without_commit(tmp_path):
     assert raw_store.has(match_page_target(123))
 
 
+def test_non_opta_match_without_matchcentre_is_explicitly_unavailable(tmp_path):
+    service, repository, raw_store = _service(tmp_path)
+    repository.list_match_candidates = lambda *_args, **_kwargs: [
+        MatchCandidate(
+            game_id=123,
+            league="INT-World Cup",
+            season="2026",
+            game="Home-Away",
+            kickoff=datetime(2026, 6, 12),
+            status=6,
+            match_is_opta=False,
+        )
+    ]
+    service.transport = _RawPersistingContentFailureTransport(
+        b"<html><body>source has no match payload</body></html>"
+    )
+
+    result = service.sync_matches()
+
+    assert result.status == "success", result.as_dict()
+    assert repository.commits == []
+    assert result.errors == []
+    assert result.retryable == []
+    assert result.terminal == []
+    assert len(repository.failures) == 1
+    assert repository.failures[0].state == "not_available"
+    assert raw_store.has(match_page_target(123))
+
+
 def test_semantically_truncated_match_is_manifested_as_parse_failed(tmp_path):
     service, repository, raw_store = _service(tmp_path)
 
@@ -2248,6 +2319,32 @@ def test_profile_missing_participation_structure_cannot_publish_partial_success(
     assert failure["state"] == "parse_failed"
     assert "participation/playerStatistics structure is absent" in failure["error"]
     assert raw_store.has(profile_page_target(42))
+
+
+def test_sparse_but_identifiable_profile_is_published(tmp_path):
+    service, repository, _ = _service(tmp_path)
+    repository.profile_candidates = [621946]
+    service.transport = _Transport(
+        """
+        <div><span class="info-label">Name: </span>Luiz Felipe</div>
+        <div><span class="info-label">Current Team: </span>
+          <a href="/Teams/1219/Show/Brazil-Internacional">Internacional</a>
+        </div>
+        <div><span class="info-label">Shirt Number: </span>53</div>
+        <div><span class="info-label">Positions: </span>Defender</div>
+        <script>var currentParticipations = [{
+          tournamentId:1,seasonId:2,stageId:3,teamId:1219,
+          teamName:'Internacional',position:{displayName:'DC'}
+        }];</script>
+        """
+    )
+
+    result = service.sync_profiles(limit=1)
+
+    assert result.status == "success"
+    assert result.succeeded == 1
+    assert repository.profile_failures == []
+    assert repository.profile_commits[0].profile["player_id"] == 621946
 
 
 def test_profile_candidates_use_one_deduplicated_union_scope_query(tmp_path):

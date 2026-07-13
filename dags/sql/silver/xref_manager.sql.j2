@@ -326,8 +326,13 @@ SELECT
 FROM iceberg.bronze.fbref_match_managers
 WHERE manager_name IS NOT NULL AND manager_name <> ''
 GROUP BY
-    -- GROUP BY all output columns — also serves as DISTINCT
-    1, manager_name, league, season, source_season_id
+    -- Group by the OUTPUT columns (ordinals), never the raw inputs. The season
+    -- slug is a function of BOTH raw columns: a legacy row (season=2025,
+    -- source_season_id=NULL) and a row from the production pipeline (season=2025,
+    -- source_season_id='2025-2026') both render '2526', but grouping by the raw
+    -- pair kept them in separate groups and emitted the same manager twice —
+    -- the duplicate the xref PK gate (correctly) refuses.
+    1, 3, 4, 5, 6
 
 UNION ALL
 

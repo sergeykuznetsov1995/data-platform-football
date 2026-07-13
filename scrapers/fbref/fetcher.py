@@ -12,8 +12,8 @@ from typing import Mapping, Optional, Sequence
 
 from scrapers.fbref.camoufox_fetch import CamoufoxFbrefTransport
 from scrapers.fbref.settings import (
-    DEFAULT_BOOTSTRAP_REQUEST_RESERVATION,
     DEFAULT_BROWSER_BYTE_LIMIT_BYTES,
+    DEFAULT_BROWSER_REQUESTS_PER_SOLVE,
     DEFAULT_DOMAIN_INTERVAL_SECONDS,
     DEFAULT_HTTP_BODY_LIMIT_BYTES,
 )
@@ -23,7 +23,9 @@ from scrapers.utils.proxy_manager import Proxy, ProxyManager
 FETCHER_VERSION = "fbref-camoufox-warm-http-v2"
 DEFAULT_BOOTSTRAP_URL = "https://fbref.com/en/"
 MAX_HTML_BYTES = DEFAULT_HTTP_BODY_LIMIT_BYTES
-DEFAULT_BROWSER_REQUEST_LIMIT = DEFAULT_BOOTSTRAP_REQUEST_RESERVATION
+# The browser cap bounds ONE clearance attempt; the run's reservation covers
+# every attempt (see DEFAULT_BOOTSTRAP_REQUEST_RESERVATION).
+DEFAULT_BROWSER_REQUEST_LIMIT = DEFAULT_BROWSER_REQUESTS_PER_SOLVE
 DEFAULT_BROWSER_BYTE_LIMIT = DEFAULT_BROWSER_BYTE_LIMIT_BYTES
 MAX_TARGET_HTTP_ATTEMPTS = 2
 RETRYABLE_HTTP_STATUSES = frozenset({500, 502, 503, 504})
@@ -385,7 +387,7 @@ class FBrefFetcher:
             return
         transport = self._transport
         html = transport.fetch(self.bootstrap_url)
-        bootstrap_stats = dict(transport.traffic_stats())
+        bootstrap_stats = dict(transport.traffic_delta())
         (
             browser_document,
             browser_asset,

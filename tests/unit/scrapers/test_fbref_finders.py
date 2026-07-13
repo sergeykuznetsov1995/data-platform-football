@@ -1197,3 +1197,69 @@ class TestTeamSideById:
         soup = BeautifulSoup(html, 'html.parser')
         df = parse_player_match_stats_tables(soup, {})
         assert df is None
+
+
+# ===========================================================================
+# TestEventIconContract (#901 follow-up: Strasbourg-Lille 94889482)
+# ===========================================================================
+
+BECOMES_GK_EVENT_HTML = """
+<html><body>
+<div class="scorebox">
+  <div><strong><a href="/en/squads/c0d3d0c8/Strasbourg">Strasbourg</a></strong></div>
+  <div><strong><a href="/en/squads/cb188c0c/Lille">Lille</a></strong></div>
+</div>
+<div id="events_wrap">
+  <div class="event a">
+    <div>74ʼ<small><span>1:0</span></small></div>
+    <div>
+      <div class="event_icon goal"></div>
+      <div><div><a href="/en/players/aaaaaaaa/Jonas-Martin">Jonas Martin</a></div></div>
+      <div style="display: none;">&mdash; Goal</div>
+    </div>
+  </div>
+  <div class="event b">
+    <div>74ʼ<small><span>1:0</span></small></div>
+    <div>
+      <div class="event_icon becomes_gk"></div>
+      <div><div><a href="/en/players/9260926b/Ibrahim-Amadou">Ibrahim Amadou</a></div></div>
+      <div style="display: none;">&mdash; Goal</div>
+    </div>
+  </div>
+  <div class="event b">
+    <div>90ʼ<small><span>1:0</span></small></div>
+    <div>
+      <div class="event_icon brand_new_icon"></div>
+      <div><div><a href="/en/players/bbbbbbbb/Some-Player">Some Player</a></div></div>
+      <div style="display: none;">&mdash; Goal</div>
+    </div>
+  </div>
+</div>
+</body></html>
+"""
+
+
+class TestEventIconContract:
+    """FBref hides a '— Goal' caption inside every event div, so the type must
+    come from the icon: reading the markup instead credited the keeper-change
+    of Strasbourg-Lille (94889482) as a Lille goal and broke the 3-0 score."""
+
+    def _events(self):
+        soup = BeautifulSoup(BECOMES_GK_EVENT_HTML, 'html.parser')
+        return parse_events_from_scorebox(soup)
+
+    def test_keeper_change_is_not_a_goal(self):
+        df = self._events()
+        amadou = df[df['player'] == 'Ibrahim Amadou'].iloc[0]
+        assert amadou['event_type'] == 'becomes_gk'
+
+    def test_real_goal_still_parses(self):
+        df = self._events()
+        martin = df[df['player'] == 'Jonas Martin'].iloc[0]
+        assert martin['event_type'] == 'goal'
+        assert martin['team_side'] == 'home'
+
+    def test_unknown_icon_is_reported_not_guessed(self):
+        df = self._events()
+        unknown = df[df['player'] == 'Some Player'].iloc[0]
+        assert unknown['event_type'] == 'unknown'

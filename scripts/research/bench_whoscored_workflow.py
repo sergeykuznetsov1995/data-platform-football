@@ -153,9 +153,13 @@ def _normal_table(name: str) -> str:
 
 
 def _json_fingerprint(value: Any) -> str:
+    # Benchmark inputs can contain lone UTF-16 surrogates copied verbatim from
+    # source HTML.  Production canonicalization repairs them before an Iceberg
+    # write; keep the non-publishing fingerprint total as well by escaping all
+    # non-ASCII code points before UTF-8 encoding.
     payload = json.dumps(
         value,
-        ensure_ascii=False,
+        ensure_ascii=True,
         sort_keys=True,
         separators=(",", ":"),
         default=str,

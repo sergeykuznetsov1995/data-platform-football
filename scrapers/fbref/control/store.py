@@ -659,8 +659,31 @@ class ControlStore:
                 or row["fetched_at"] != fetched_at
                 or dict(actual_metadata) != dict(metadata or {})
             ):
-                raise StateConflict(
-                    f"snapshot_id {snapshot} already has different evidence"
+                if bool(row["successful"]):
+                    raise StateConflict(
+                        f"snapshot_id {snapshot} already has different evidence"
+                    )
+                # A failed snapshot is evidence about our parse, not about the
+                # source. Freezing it would poison this (parser, page) pair
+                # forever: the retry that fixes the parser could never record
+                # its result, and the target would be stuck until the parser
+                # version changed. Successful snapshots stay immutable.
+                cursor.execute(
+                    """
+                    UPDATE fbref_control.registry_snapshot
+                    SET run_id = %s, source = %s, content_hash = %s,
+                        successful = %s, fetched_at = %s, metadata = %s::jsonb
+                    WHERE snapshot_id = %s
+                    """,
+                    (
+                        normalized_run,
+                        normalized_source,
+                        content_hash,
+                        bool(successful),
+                        fetched_at,
+                        _json(metadata),
+                        snapshot,
+                    ),
                 )
         return snapshot
 
@@ -3507,6 +3530,50 @@ class ControlStore:
         """Compatibility name used by orchestration for successful completion."""
         self.complete_fetch(lease, **evidence)
 
+    def requeue_unfetched_targets(self, leases: Sequence[TargetLease]) -> int:
+        """Return still-leased targets to the queue, untouched by this run.
+
+        Used when the run stops at its budget: these targets were never fetched,
+        so they carry no failure evidence, must not back off, and must stay
+        claimable by the next run.
+        """
+        requeued = 0
+        with self._transaction() as cursor:
+            for lease in leases:
+                cursor.execute(
+                    """
+                    UPDATE fbref_control.page_frontier
+                    SET state = 'queued', claim_token = NULL,
+                        lease_run_id = NULL, lease_refresh_id = NULL,
+                        leased_by = NULL, lease_expires_at = NULL,
+                        updated_at = clock_timestamp()
+                    WHERE target_id = %s AND state = 'leased'
+                      AND claim_token = %s AND lease_epoch = %s
+                      AND lease_run_id = %s AND lease_refresh_id = %s
+                    RETURNING target_id
+                    """,
+                    (
+                        lease.target_id,
+                        lease.claim_token,
+                        lease.lease_epoch,
+                        lease.run_id,
+                        lease.logical_refresh_id,
+                    ),
+                )
+                if _fetchone(cursor) is None:
+                    continue
+                cursor.execute(
+                    """
+                    UPDATE fbref_control.run_target
+                    SET status = 'skipped', updated_at = clock_timestamp()
+                    WHERE run_id = %s AND target_id = %s
+                      AND logical_refresh_id = %s AND status = 'leased'
+                    """,
+                    (lease.run_id, lease.target_id, lease.logical_refresh_id),
+                )
+                requeued += 1
+        return requeued
+
     def fail_fetch(
         self,
         lease: TargetLease,
@@ -3515,6 +3582,7 @@ class ControlStore:
         error_message: object,
         retry_delay_seconds: int = 60,
         permanent: bool = False,
+        requeue: bool = False,
         http_status: Optional[int] = None,
         wire_bytes: int = 0,
         provider_billed_bytes: Optional[int] = None,
@@ -3555,8 +3623,16 @@ class ControlStore:
             if session_version is None
             else _text(session_version, "session_version")
         )
-        frontier_state = "dead" if permanent else "retry"
-        target_state = "failed" if permanent else "retry"
+        if requeue:
+            # The attempt is real evidence and is recorded, but the page itself
+            # was never judged — the failure was ours (a clearance the source
+            # stopped honouring). It must stay immediately claimable, and this
+            # run must not count it as an unfinished target.
+            frontier_state, target_state = "queued", "skipped"
+        elif permanent:
+            frontier_state, target_state = "dead", "failed"
+        else:
+            frontier_state, target_state = "retry", "retry"
         normalized_class = _text(error_class, "error_class")
         normalized_message = _text(error_message, "error_message")[:4000]
         with self._transaction() as cursor:
@@ -3579,7 +3655,7 @@ class ControlStore:
                 """,
                 (
                     frontier_state,
-                    permanent,
+                    permanent or requeue,
                     retry_delay,
                     http_status,
                     normalized_class,
@@ -3716,7 +3792,12 @@ class ControlStore:
                     existing["manifest_key"],
                 )
                 if requested != installed:
-                    raise StateConflict("A completed dataset manifest is immutable")
+                    raise StateConflict(
+                        "A completed dataset manifest is immutable: "
+                        f"{identity[3]} of {identity[0]} "
+                        f"({identity[2]}) installed={installed!r} "
+                        f"requested={requested!r}"
+                    )
                 return
             cursor.execute(
                 """

@@ -90,6 +90,20 @@ official_overrides AS (
     WHERE match_id IS NOT NULL
 ),
 
+-- Rendered from configs/medallion/fbref_event_source_gaps.yaml by the Airflow
+-- task, exactly like the override registry above: a finite list of matches for
+-- which FBref itself publishes no events (empty event containers), so a scored
+-- match with zero event rows is source truth rather than a scraping failure.
+event_source_gaps AS (
+    SELECT match_id, league, season, reason
+    FROM (VALUES
+        -- __FBREF_EVENT_SOURCE_GAPS_VALUES__
+        (CAST(NULL AS varchar), CAST(NULL AS varchar), CAST(NULL AS varchar),
+         CAST(NULL AS varchar))
+    ) AS t(match_id, league, season, reason)
+    WHERE match_id IS NOT NULL
+),
+
 ts AS (
     SELECT *,
            ROW_NUMBER() OVER (
@@ -285,6 +299,8 @@ SELECT
     ea.event_row_count,
     av.availability AS event_availability,
     av.reason AS event_availability_reason,
+    gap.match_id IS NOT NULL AS event_gap_acknowledged,
+    gap.reason AS event_gap_reason,
     TRY_CAST(ea.on_field_home_score AS INTEGER) AS on_field_home_score,
     TRY_CAST(ea.on_field_away_score AS INTEGER) AS on_field_away_score,
     ea.home_yellows,
@@ -324,6 +340,10 @@ LEFT JOIN official_overrides ov
     ON  ov.match_id = sch.match_id
     AND ov.league  = sch.league
     AND ov.season  = sch.normalized_season
+LEFT JOIN event_source_gaps gap
+    ON  gap.match_id = sch.match_id
+    AND gap.league   = sch.league
+    AND gap.season   = sch.normalized_season
 WHERE sch.rn = 1
   -- match_id is now ALWAYS non-NULL thanks to the COALESCE in sch_raw (real id or 'fut_<xxhash>').
   -- We still filter out rows missing the date (junk) and the literal header row that the FBref
