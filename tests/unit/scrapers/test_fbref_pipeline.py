@@ -14,6 +14,7 @@ from scrapers.fbref.control.models import (
     TargetLease,
     ThrottleSlot,
 )
+from scrapers.fbref.control.store import BudgetExceeded
 from scrapers.fbref.fetcher import FETCHER_VERSION, FetchError, FetchResponse
 from scrapers.fbref.page_document import PAGE_DOCUMENT_VERSION
 from scrapers.fbref.pipeline import (
@@ -2106,3 +2107,63 @@ def test_a_rejected_clearance_is_burned_instead_of_failing_every_target(tmp_path
     # rather than every target being fed to the same rejected clearance.
     assert control.events.count("session_open") == 2
     assert control.events.count("fetcher_exit") == 2
+
+
+def test_a_run_that_hits_its_budget_requeues_its_targets_and_ends_clean(tmp_path):
+    """The budget is a ceiling the crawler is meant to stop at. Failing the
+    untouched targets made every day that spent its budget a red run — and left
+    them backing off instead of ready for the next run."""
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    run_id = str(uuid.UUID(int=1))
+    requeued = []
+
+    def lease(number, target_id):
+        return TargetLease(
+            attempt_id=str(uuid.UUID(int=30 + number)),
+            run_id=run_id,
+            target_id=target_id,
+            logical_refresh_id=str(uuid.UUID(int=40 + number)),
+            canonical_url=f"https://fbref.com/en/comps/{number}/history/x-Seasons",
+            page_kind="competition",
+            source_ids={"competition_id": str(number)},
+            claim_token=str(uuid.UUID(int=50 + number)),
+            lease_epoch=1,
+            attempt_number=1,
+            leased_by="worker-1",
+            lease_expires_at=NOW + timedelta(minutes=10),
+        )
+
+    leases = [lease(9, "fbref:competition:9"), lease(12, "fbref:competition:12")]
+    control.claim_targets = lambda *args, **kwargs: leases
+
+    def out_of_budget(*args, **kwargs):
+        raise BudgetExceeded("request budget exhausted")
+
+    control.reserve_budget = out_of_budget
+    control.requeue_unfetched_targets = lambda items: (
+        requeued.extend(items) or len(items)
+    )
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=lambda _: FakeFetcher(control.events, b"<html>ok</html>"),
+        sleep=lambda _: None,
+        clock=lambda: NOW,
+    )
+
+    result = pipeline.fetch_wave(
+        run_id,
+        worker_id="worker-1",
+        page_kinds=["competition"],
+        settings=_settings(),
+    )
+
+    assert result.failures == []
+    assert result.budget_exhausted is True
+    assert result.requeued_at_budget == 2
+    assert [item.target_id for item in requeued] == [
+        "fbref:competition:9",
+        "fbref:competition:12",
+    ]
