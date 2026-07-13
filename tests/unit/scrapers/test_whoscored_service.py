@@ -2321,6 +2321,32 @@ def test_profile_missing_participation_structure_cannot_publish_partial_success(
     assert raw_store.has(profile_page_target(42))
 
 
+def test_sparse_but_identifiable_profile_is_published(tmp_path):
+    service, repository, _ = _service(tmp_path)
+    repository.profile_candidates = [621946]
+    service.transport = _Transport(
+        """
+        <div><span class="info-label">Name: </span>Luiz Felipe</div>
+        <div><span class="info-label">Current Team: </span>
+          <a href="/Teams/1219/Show/Brazil-Internacional">Internacional</a>
+        </div>
+        <div><span class="info-label">Shirt Number: </span>53</div>
+        <div><span class="info-label">Positions: </span>Defender</div>
+        <script>var currentParticipations = [{
+          tournamentId:1,seasonId:2,stageId:3,teamId:1219,
+          teamName:'Internacional',position:{displayName:'DC'}
+        }];</script>
+        """
+    )
+
+    result = service.sync_profiles(limit=1)
+
+    assert result.status == "success"
+    assert result.succeeded == 1
+    assert repository.profile_failures == []
+    assert repository.profile_commits[0].profile["player_id"] == 621946
+
+
 def test_profile_candidates_use_one_deduplicated_union_scope_query(tmp_path):
     service, repository, _ = _service(tmp_path)
 

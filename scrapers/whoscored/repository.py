@@ -104,6 +104,13 @@ SCOPE_DATASET_TABLES = {
     "whoscored_referee_stage_stats",
 }
 
+# Betting offers are an expiring source snapshot: WhoScored removes providers
+# and prices after a match starts or finishes.  The physical Iceberg batches
+# remain append-only, while the current manifest is allowed to publish the
+# smaller source snapshot.  Other scope datasets retain the strict no-shrink
+# completeness guard.
+SCOPE_SHRINKABLE_DATASET_TABLES = {"whoscored_match_bets"}
+
 
 # The physical schema of every source business table is a source contract, not
 # an observation about whichever DataFrame happened to be written first.  Keep
@@ -2379,6 +2386,8 @@ class WhoScoredRepository:
                         OR m.batch_id NOT LIKE 'ws2-%'
                         OR m.raw_uri IS NULL
                         OR m.payload_sha256 IS NULL
+                        OR m.parser_version IS DISTINCT FROM
+                            {_sql_string(PARSER_VERSION)}
                         OR (
                             m.parser_version = {_sql_string(PARSER_VERSION)}
                             AND s.date >= CAST(
@@ -2635,7 +2644,11 @@ class WhoScoredRepository:
             # published.  Corrections that genuinely remove source rows must
             # be replayed explicitly after review instead of being accepted by
             # an unattended daily run.
-            if old_count and new_count < old_count:
+            if (
+                table not in SCOPE_SHRINKABLE_DATASET_TABLES
+                and old_count
+                and new_count < old_count
+            ):
                 raise ValueError(
                     f"{table} completeness guard: new={new_count}, old={old_count}, "
                     "published snapshot cannot shrink"

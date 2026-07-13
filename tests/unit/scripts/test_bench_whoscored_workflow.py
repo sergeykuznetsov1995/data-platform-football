@@ -30,6 +30,14 @@ sys.modules[SPEC.name] = bench
 SPEC.loader.exec_module(bench)
 
 
+def test_json_fingerprint_accepts_lone_source_surrogates():
+    first = bench._json_fingerprint({"preview": "broken-\ud83d-text"})
+    second = bench._json_fingerprint({"preview": "broken-\ud83d-text"})
+
+    assert first == second
+    assert len(first) == 64
+
+
 class FakeResult:
     def __init__(
         self,

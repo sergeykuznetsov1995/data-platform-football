@@ -2798,9 +2798,18 @@ class WhoScoredIngestService:
                         "height_cm",
                         "nationality",
                         "current_team_id",
+                        "shirt_number",
+                        "age",
+                        "positions",
                     )
                 )
-                if not row.get("name") or useful < 2:
+                # WhoScored legitimately omits biographical fields for some
+                # reserve/new players while still publishing their team,
+                # position and tournament participation.  Those are valid
+                # profiles, not parser drift.  Requiring a name plus one
+                # independent descriptor keeps challenge/error shells out
+                # without rejecting sparse source records.
+                if not row.get("name") or useful < 1:
                     raise WhoScoredParseError("profile lacks required identity fields")
                 return True
 
