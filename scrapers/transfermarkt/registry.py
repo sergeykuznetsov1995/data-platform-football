@@ -209,6 +209,11 @@ class ClassificationEvidence:
     team_type: Optional[TeamType] = None
     age_category: Optional[AgeCategory] = None
     season_format: Optional[SeasonFormat] = None
+    # How narrowly the source made this statement. The catalogue lists one
+    # competition under several headings — the World Cup sits both in the broad
+    # "International cup competitions" rubric and in "National Team
+    # Competitions" — and the narrower statement is the one it means.
+    precedence: int = 0
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -250,6 +255,7 @@ class ClassificationEvidence:
             team_type=signals.get("team_type"),
             age_category=signals.get("age_category"),
             season_format=signals.get("season_format"),
+            precedence=int(value.get("precedence", 0)),
         )
 
     def as_dict(self) -> dict[str, Any]:
@@ -266,6 +272,7 @@ class ClassificationEvidence:
                 signals[name] = value.value
         return {
             "origin": self.origin.value,
+            "precedence": self.precedence,
             "signals": signals,
             "source_field": self.source_field,
             "source_url": self.source_url,
@@ -280,6 +287,26 @@ _DIMENSIONS: tuple[tuple[str, Type[Enum]], ...] = (
     ("age_category", AgeCategory),
     ("season_format", SeasonFormat),
 )
+
+
+def narrowest_signals(
+    evidence: Iterable[ClassificationEvidence],
+    dimension: str,
+) -> set[Any]:
+    """The values stated at the source's narrowest level for one dimension.
+
+    A broad rubric that also brackets the competition does not contradict the
+    narrow statement; two statements at the same level still do.
+    """
+    stated = [item for item in evidence if getattr(item, dimension) is not None]
+    if not stated:
+        return set()
+    narrowest = max(item.precedence for item in stated)
+    return {
+        getattr(item, dimension)
+        for item in stated
+        if item.precedence == narrowest
+    }
 
 
 @dataclass(frozen=True)
@@ -391,13 +418,14 @@ class CompetitionRecord:
         missing: list[str] = []
         for name, enum_type in _DIMENSIONS:
             declared = getattr(self, name)
-            signals = {
-                getattr(item, name)
+            stated = [
+                item
                 for item in self.evidence
                 if item.origin is not EvidenceOrigin.NAME
                 and getattr(item, name) is not None
                 and getattr(item, name) != enum_type("unknown")
-            }
+            ]
+            signals = narrowest_signals(stated, name)
             if len(signals) > 1 or (signals and declared not in signals):
                 conflicts.append(name)
             elif declared == enum_type("unknown") or not signals:
