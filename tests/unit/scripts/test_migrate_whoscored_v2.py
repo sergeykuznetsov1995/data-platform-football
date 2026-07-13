@@ -705,11 +705,16 @@ def test_completed_shadow_is_reused_without_rewriting_it():
         "league": "varchar",
         "season": "varchar",
         "game_id": "bigint",
+        "related_event_id": "bigint",
         "_ingested_at": "timestamp(6)",
         "_batch_id": "varchar",
     }
     shadow_columns = {
-        **source_columns,
+        **{
+            key: value
+            for key, value in source_columns.items()
+            if key != "related_event_id"
+        },
         "source_event_id": "bigint",
         "team_event_id": "bigint",
         "related_team_event_id": "bigint",
@@ -738,6 +743,11 @@ def test_completed_shadow_is_reused_without_rewriting_it():
 
     assert result == (shadow, 10, 5)
     assert trino.executed == []
+    source_group_sql = trino.execute_query.call_args_list[3].args[0]
+    shadow_duplicate_sql = trino.execute_query.call_args_list[7].args[0]
+    assert '"related_event_id"' in source_group_sql
+    assert '"related_team_event_id"' in shadow_duplicate_sql
+    assert '"related_event_id"' not in shadow_duplicate_sql
 
 
 @pytest.mark.unit

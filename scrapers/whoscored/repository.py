@@ -1678,8 +1678,8 @@ class WhoScoredRepository:
             FROM (
                 SELECT p.*,
                        ROW_NUMBER() OVER (
-                           PARTITION BY player_id
-                           ORDER BY fetched_at DESC, _ingested_at DESC
+                           PARTITION BY p.player_id
+                           ORDER BY p.fetched_at DESC, p._ingested_at DESC
                        ) AS physical_rn
                 FROM {versions} p
                 JOIN latest m
@@ -3621,7 +3621,12 @@ class WhoScoredRepository:
         return tuple(commit.batch_id for commit in ordered)
 
     def record_failure(self, failure: ManifestFailure) -> None:
-        if failure.state not in {"retryable", "terminal", "parse_failed"}:
+        if failure.state not in {
+            "retryable",
+            "terminal",
+            "parse_failed",
+            "not_available",
+        }:
             raise ValueError(f"unsupported manifest failure state: {failure.state}")
         if failure.state == "retryable" and failure.retry_after is None:
             raise ValueError("retryable match failure requires retry_after")

@@ -59,5 +59,9 @@ https://trino.{$PLATFORM_DOMAIN} {
 # basic-OM наружу не публикуется, доступ через SSH-туннель 127.0.0.1:8585.
 https://meta.{$PLATFORM_DOMAIN} {
 	import logging
+	# ВРЕМЕННО: OM в basic-режиме после пересидинга конфига — наружу не отдаём.
+	# Снять, когда provider=custom-oidc (scripts/om_apply_security_config.py),
+	# затем: docker compose up -d --force-recreate caddy.
+	respond 403
 	reverse_proxy openmetadata-server:8585
 }

@@ -1306,6 +1306,10 @@ class FotMobScraper(BaseScraper):
             return None
 
         df = pd.DataFrame(rows)
+        # Bronze stores player_id as varchar; the source hands back an int.
+        # Concatenating the two below would otherwise produce a mixed object
+        # column that pyarrow refuses to write ("Expected bytes, got a 'int'").
+        df['player_id'] = df['player_id'].astype(str)
         df['league'] = league
         df['season'] = season
         df = self._add_metadata(df, 'player_details')
@@ -1314,9 +1318,10 @@ class FotMobScraper(BaseScraper):
         # run (replace_partitions rewrites the whole partition) — departed
         # players keep their history and the partition never shrinks.
         if existing is not None and len(existing) and 'player_id' in existing.columns:
-            new_ids = set(df['player_id'].astype(str))
+            new_ids = set(df['player_id'])
             keep = existing[~existing['player_id'].astype(str).isin(new_ids)]
             if len(keep):
+                keep = keep.assign(player_id=keep['player_id'].astype(str))
                 df = pd.concat([keep, df], ignore_index=True)
 
         logger.info(f"Parsed {len(df)} player details")

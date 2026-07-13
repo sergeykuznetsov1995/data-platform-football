@@ -179,6 +179,24 @@ class TestPlayerDetailsSkipExisting:
         assert fetched == [2, 3]
         assert sorted(df['player_id'].astype(str)) == ['1', '2', '3']
 
+    def test_merged_player_id_stays_string_typed(self, scraper):
+        """Bronze player_id is varchar; the source hands back an int.
+
+        Concatenating a re-read partition (str) with fresh rows (int) used to
+        yield a mixed object column that pyarrow refused to write:
+        "Expected bytes, got a 'int' object" (#930 canary, 2026-07-12).
+        """
+        scraper._iceberg_writer.read_table.return_value = self._existing_players([1])
+
+        with patch.object(scraper, '_player_ids_for_league',
+                          return_value=[1, 2]), \
+             patch.object(scraper, '_fetch_next_data_payload',
+                          side_effect=lambda p: _player_payload(int(p.rsplit('/', 1)[1]))):
+            df = scraper.read_player_details(LEAGUE, SEASON)
+
+        assert {type(value) for value in df['player_id']} == {str}
+        assert sorted(df['player_id']) == ['1', '2']
+
     def test_noop_when_no_new_players(self, scraper):
         scraper._iceberg_writer.read_table.return_value = self._existing_players([1, 2])
         with patch.object(scraper, '_player_ids_for_league',

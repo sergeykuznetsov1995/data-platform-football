@@ -469,6 +469,10 @@ _CF_STRONG_BODY_MARKERS = (
     "cf_chl_",
     "cf-chl-",
 )
+_CF_ORIGIN_ERROR_TITLE = re.compile(
+    r"<title>\s*whoscored\.com\s*\|\s*(50[0-9])\s*:[^<]*</title>",
+    re.IGNORECASE,
+)
 
 _WHOSCORED_STRUCTURED_FEED_PATHS = (
     re.compile(r"\A/statisticsfeed/1/get(?:team|player)statistics\Z"),
@@ -601,6 +605,24 @@ def _has_cloudflare_challenge_markup(content: bytes | str) -> bool:
     )
     body = body[:250_000].lower()
     return any(value in body for value in _CF_STRONG_BODY_MARKERS)
+
+
+def _cloudflare_origin_error_status(content: bytes | str) -> Optional[int]:
+    """Recover an origin 5xx that FlareSolverr reports as HTTP 200.
+
+    FlareSolverr returns the rendered document status, while Cloudflare's
+    branded origin-error document can therefore arrive as 200.  Match only
+    WhoScored's exact error title so an application page containing an
+    arbitrary ``502`` string is never reclassified.
+    """
+
+    body = (
+        content.decode("utf-8", errors="ignore")
+        if isinstance(content, bytes)
+        else content
+    )
+    match = _CF_ORIGIN_ERROR_TITLE.search(body[:16_384])
+    return int(match.group(1)) if match is not None else None
 
 
 Validator = Callable[[TransportResponse], Optional[bool]]
@@ -944,7 +966,8 @@ class WhoScoredTransport:
 
         direct_cf_failures = 0
         last_cf: Optional[CloudflareChallenge] = None
-        for _ in range(self.direct_browser_attempts):
+        last_transient: Optional[WhoScoredTransportError] = None
+        for attempt in range(self.direct_browser_attempts):
             try:
                 browser = self._browser_fetch(
                     url,
@@ -967,11 +990,25 @@ class WhoScoredTransport:
                 # rejection must never silently buy residential bandwidth.
                 if direct_gate_key is not None:
                     self._direct_gate_circuits.discard(direct_gate_key)
+                if (
+                    exc.retryable
+                    and exc.kind is FailureKind.HTTP_STATUS
+                    and attempt + 1 < self.direct_browser_attempts
+                ):
+                    last_transient = exc
+                    self._drop_browser_session(
+                        self._direct_fs, TransportRoute.DIRECT_FLARESOLVERR
+                    )
+                    if before_network is not None:
+                        before_network()
+                    continue
                 if exc.kind is FailureKind.CONTENT:
                     self._store_response(key, browser)
                 raise
             return self._store_and_return(key, browser)
 
+        if last_transient is not None and direct_cf_failures == 0:
+            raise last_transient
         if direct_cf_failures != self.direct_browser_attempts:
             assert last_cf is not None
             raise last_cf
@@ -2202,6 +2239,25 @@ class WhoScoredTransport:
                 f"response exceeded {self.budgets.max_response_bytes} bytes",
                 url=response.url,
                 route=response.route,
+            )
+        soft_origin_status = (
+            _cloudflare_origin_error_status(response.content)
+            if response.route
+            in (
+                TransportRoute.DIRECT_FLARESOLVERR,
+                TransportRoute.PAID_FLARESOLVERR,
+            )
+            and response.status_code == 200
+            else None
+        )
+        if soft_origin_status is not None:
+            raise WhoScoredTransportError(
+                f"HTTP {soft_origin_status} rendered as HTTP 200",
+                kind=FailureKind.HTTP_STATUS,
+                url=response.url,
+                route=response.route,
+                status_code=soft_origin_status,
+                retryable=True,
             )
         browser_challenge = (
             response.route
