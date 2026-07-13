@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import itertools
 import json
+import sys
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -761,3 +762,17 @@ def test_a_calendar_league_edition_is_read_as_the_season_it_is_labelled(tmp_path
     identity = cycle._scope_identity(args)
 
     assert (identity.edition_id, identity.canonical_season) == ('2023', '2024')
+
+
+def test_the_approved_interpreter_is_the_one_behind_the_alias(tmp_path):
+    # The DAG's PATH finds /usr/local/bin/python while a shell finds another
+    # alias of the same binary; an argv keyed on the alias would drift.
+    real = Path(sys.executable).resolve()
+    alias = tmp_path / 'python'
+    alias.symlink_to(real)
+
+    argv = cycle.approved_operation_argv(
+        ('--refresh-mode', 'historical'), executable=str(alias),
+    )
+
+    assert argv[0] == str(real)
