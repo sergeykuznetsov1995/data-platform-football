@@ -52,6 +52,19 @@ _EDITION_COLUMNS = (
     'schema_revision', 'fetched_at', 'cycle_id', 'scope_id',
     '_bronze_ingested_at', '_batch_id',
 )
+# Which run produced a row is not part of its content: a snapshot republished by
+# a later cycle carries fresh run stamps and identical data, and the MERGE is
+# keyed on the snapshot, so comparing the stamps would report every row as
+# mismatched.
+_RUN_STAMP_COLUMNS = frozenset(
+    {'fetched_at', 'cycle_id', 'scope_id', '_bronze_ingested_at', '_batch_id'}
+)
+_COMPETITION_CONTENT_COLUMNS = tuple(
+    column for column in _COMPETITION_COLUMNS if column not in _RUN_STAMP_COLUMNS
+)
+_EDITION_CONTENT_COLUMNS = tuple(
+    column for column in _EDITION_COLUMNS if column not in _RUN_STAMP_COLUMNS
+)
 _STATE_COLUMNS = (
     'state_key', 'registry_snapshot_id', 'source_hash', 'competition_count',
     'edition_count', 'unknown_active_count', 'status', 'revision',
@@ -382,8 +395,8 @@ def _dq_sql(
     snapshot = _sql_literal(snapshot_id)
     mismatch = 'CAST(0 AS bigint)'
     if compare_competitions and compare_editions:
-        c_columns = ', '.join(_COMPETITION_COLUMNS)
-        e_columns = ', '.join(_EDITION_COLUMNS)
+        c_columns = ', '.join(_COMPETITION_CONTENT_COLUMNS)
+        e_columns = ', '.join(_EDITION_CONTENT_COLUMNS)
         # Competitions and editions have different shapes, so their differences
         # cannot share one UNION; count each side and add the totals.
         mismatch = f"""(
