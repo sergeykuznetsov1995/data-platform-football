@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
 
 from scrapers.fbref.pipeline import FBrefPipeline, PipelineSettings
@@ -42,6 +43,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Progress goes to stderr (stdout carries the single result document), so a
+    # wave that stalls says why: without this the process is silent and the
+    # Airflow task can only report that it was killed.
+    logging.basicConfig(
+        level=logging.INFO,
+        stream=sys.stderr,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
     args = build_parser().parse_args(argv)
     page_kinds = [kind for kind in args.page_kinds.split(",") if kind]
     if not page_kinds:
