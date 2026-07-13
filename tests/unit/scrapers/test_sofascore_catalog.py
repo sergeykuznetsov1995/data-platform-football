@@ -133,3 +133,26 @@ def test_page_path_must_be_derived_from_source_slugs():
 
     with pytest.raises(CatalogError, match="page_path must equal"):
         SofaScoreCatalog.from_mapping(_document(tournament))
+
+
+@pytest.mark.unit
+def test_parallel_divisions_load_but_stay_unresolvable_by_the_shared_token():
+    # Tournament 65 really ships both divisions under one year label.
+    east = _season(8298, year="14/15", canonical_season="1415")
+    east["name"] = "2nd Division East 14/15"
+    west = _season(8300, year="14/15", canonical_season="1415")
+    west["name"] = "2nd Division West 14/15"
+    tournament = _tournament(65, canonical_id=None, enabled=False,
+                             seasons=[east, west])
+    tournament["name"] = "2nd Division"
+    tournament["slug"] = "2nd-division"
+    tournament["page_path"] = "football/england/2nd-division"
+
+    catalog = SofaScoreCatalog.from_mapping(_document(tournament))
+
+    assert len(catalog.tournament(65).seasons) == 2
+    # The shared token names two seasons, so resolution refuses to guess.
+    with pytest.raises(CatalogError, match="ambiguous season"):
+        catalog.resolve_source_season(65, "14/15")
+    # A season still resolves by its own unambiguous label.
+    assert catalog.resolve_source_season(65, "2nd Division West 14/15").season_id == 8300

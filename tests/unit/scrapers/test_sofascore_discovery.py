@@ -392,6 +392,20 @@ def test_two_source_labels_cannot_resolve_to_one_canonical_season():
 
 
 @pytest.mark.unit
+def test_parallel_divisions_share_one_year_label_without_failing_the_scan():
+    # Tournament 65 really ships both divisions under the same year label.
+    east = {"id": 8298, "name": "2nd Division East 14/15", "year": "14/15"}
+    west = {"id": 8300, "name": "2nd Division West 14/15", "year": "14/15"}
+
+    seasons = parse_seasons_payload({"seasons": [east, west]}, 65)
+
+    assert [season["season_id"] for season in seasons] == [8298, 8300]
+    assert {season["year"] for season in seasons} == {"14/15"}
+    # The ambiguity is not resolved here — it fails closed at resolve time.
+    assert {season["canonical_season"] for season in seasons} == {"1415"}
+
+
+@pytest.mark.unit
 def test_direct_client_ignores_poison_proxy_environment(monkeypatch):
     for name in (
         "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
