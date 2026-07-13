@@ -472,7 +472,7 @@ class FBrefPipeline:
         *,
         generic_writer=None,
         typed_adapter=None,
-        fetcher_factory: Optional[Callable[[Optional[str]], object]] = None,
+        fetcher_factory: Optional[Callable[..., object]] = None,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], datetime] = _utcnow,
     ) -> None:
@@ -481,7 +481,10 @@ class FBrefPipeline:
         self.generic_writer = generic_writer or FBrefGenericBronzeWriter()
         self.typed_adapter = typed_adapter or FBrefTypedBronzeAdapter()
         self.fetcher_factory = fetcher_factory or (
-            lambda proxy_file: FBrefFetcher(proxy_file=proxy_file)
+            lambda proxy_file, max_browser_requests: FBrefFetcher(
+                proxy_file=proxy_file,
+                max_browser_requests=max_browser_requests,
+            )
         )
         self.sleep = sleep
         self.clock = clock
@@ -850,7 +853,10 @@ class FBrefPipeline:
                             metadata={"worker_id": worker_id},
                         )
                         fetcher = stack.enter_context(
-                            self.fetcher_factory(settings.proxy_file)
+                            self.fetcher_factory(
+                                settings.proxy_file,
+                                settings.bootstrap_request_reservation,
+                            )
                         )
                     response = fetcher.fetch(
                         lease.canonical_url,

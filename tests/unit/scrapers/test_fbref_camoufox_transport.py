@@ -767,3 +767,32 @@ def test_a_wedged_solve_is_killed_by_the_attempt_deadline(monkeypatch):
 
     assert transport.fetch("https://fbref.com/en/") is None
     assert transport._restart.call_count == transport.MAX_PROXY_ROTATIONS
+
+
+def test_traffic_is_billed_once_per_bootstrap_not_once_per_target():
+    """The counters are cumulative for the session. Charging the running totals
+    made every later target of a wave pay again for the same browser traffic:
+    one wave billed 140 requests for ~20 real ones and exhausted the run's
+    budget on traffic that never crossed the proxy."""
+    transport = CamoufoxFbrefTransport(proxy={"server": "http://p:1"})
+    transport._bytes_total = 1_000_000
+    transport._requests_count = 19
+    transport._bytes_by_type["document"] = 700_000
+
+    first = transport.traffic_delta()
+    assert first["real_bytes_downloaded"] == 1_000_000
+    assert first["real_requests_count"] == 19
+    assert first["real_bytes_by_resource_type"]["document"] == 700_000
+
+    # Nothing new crossed the wire: the next target must be charged nothing.
+    second = transport.traffic_delta()
+    assert second["real_bytes_downloaded"] == 0
+    assert second["real_requests_count"] == 0
+    assert second["real_bytes_by_resource_type"]["document"] == 0
+
+    # A second solve is charged exactly its own cost.
+    transport._bytes_total += 1_100_000
+    transport._requests_count += 21
+    third = transport.traffic_delta()
+    assert third["real_bytes_downloaded"] == 1_100_000
+    assert third["real_requests_count"] == 21

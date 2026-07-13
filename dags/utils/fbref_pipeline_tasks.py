@@ -14,10 +14,12 @@ import sys
 from typing import Optional, Sequence
 
 from scrapers.fbref.settings import (
+    DEFAULT_BOOTSTRAP_REQUEST_RESERVATION,
     DEFAULT_BYTE_LIMIT,
     DEFAULT_REQUEST_LIMIT,
     DEFAULT_REQUEST_RESERVATION_BYTES,
     DEFAULT_SHARD_SIZE,
+    INGEST_BOOTSTRAP_REQUEST_RESERVATION,
     MIB,
 )
 
@@ -87,6 +89,14 @@ def _settings(
 ) -> object:
     from scrapers.fbref.pipeline import PipelineSettings
 
+    # The bootstrap reservation is also the browser's request allowance, so it
+    # decides how many stalled exit IPs a wave may survive. A daily run can pay
+    # for four solves; the 25-request backfill can only ever pay for one.
+    bootstrap_reservation = (
+        INGEST_BOOTSTRAP_REQUEST_RESERVATION
+        if int(request_limit) >= INGEST_BOOTSTRAP_REQUEST_RESERVATION * 2
+        else DEFAULT_BOOTSTRAP_REQUEST_RESERVATION
+    )
     return PipelineSettings(
         run_type=str(run_type),
         request_limit=int(request_limit),
@@ -94,6 +104,7 @@ def _settings(
         shard_size=int(shard_size),
         request_reservation_bytes=int(reservation_mb) * MIB,
         domain_interval_seconds=float(domain_interval_seconds),
+        bootstrap_request_reservation=bootstrap_reservation,
         proxy_file=proxy_file,
     )
 
