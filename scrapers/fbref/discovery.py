@@ -26,7 +26,7 @@ from scrapers.fbref.raw_store import (
 )
 
 
-DISCOVERY_PARSER_VERSION = "fbref-discovery-parser-v2"
+DISCOVERY_PARSER_VERSION = "fbref-discovery-parser-v3"
 
 _PAGE_SOURCE_ID_KEYS = {
     "competition": ("competition_id",),
@@ -534,6 +534,29 @@ def _season_link(row: Tag, comp_id: str) -> Optional[Tag]:
     return None
 
 
+def _season_cards(documents: Sequence[BeautifulSoup], comp_id: str) -> List[Tag]:
+    """Season links from the card layout used when there is no seasons table.
+
+    A competition whose editions are standalone tournaments (FBref comp 255,
+    the World Cup inter-confederation play-offs) publishes its history as cards
+    in ``div.content_grid`` and carries no ``table#seasons`` at all.  The grid
+    also links to other competitions, squads and players, so only routes that
+    address a season *of this competition* are taken.
+    """
+    anchors: List[Tag] = []
+    prefix = f"/en/comps/{comp_id}/"
+    for document in documents:
+        for grid in document.find_all("div", class_="content_grid"):
+            for anchor in grid.find_all("a", href=True):
+                path = _href_path(str(anchor.get("href") or ""))
+                if not path.startswith(prefix):
+                    continue
+                route = [part for part in path.split("/") if part][1:]
+                if _has_season_component(route):
+                    anchors.append(anchor)
+    return anchors
+
+
 def _season_id_from_url(comp_id: str, season_url: str, label: str) -> str:
     parts = [part for part in urlparse(season_url).path.split("/") if part]
     try:
@@ -583,28 +606,37 @@ def parse_competition_html(
     *,
     parser_version: str = DISCOVERY_PARSER_VERSION,
 ) -> DiscoveryPageResult:
-    """Parse exact season links from one competition's history table."""
+    """Parse exact season links from one competition's history page."""
     documents = _document_soups(html)
     tables = _find_tables(documents, lambda table_id: table_id == "seasons")
-    if not tables:
+    if tables:
+        candidates = [
+            (row, _season_link(row, competition.comp_id))
+            for row in tables[0].find_all("tr")
+        ]
+    else:
+        candidates = [
+            (None, anchor)
+            for anchor in _season_cards(documents, competition.comp_id)
+        ]
+    candidates = [(row, a) for row, a in candidates if a is not None]
+    if not candidates and not tables:
         result = _dataset(
             "seasons",
             status=DatasetStatus.ERROR,
             reason="season_history_table_missing",
             error_type="CompetitionPageContractError",
-            error_message="Expected table#seasons",
+            error_message="Expected table#seasons or a season card grid",
         )
         return _page([result], parser_version=parser_version)
 
     seasons: Dict[str, SeasonRef] = {}
     errors: List[str] = []
-    for row in tables[0].find_all("tr"):
-        anchor = _season_link(row, competition.comp_id)
-        if anchor is None:
-            continue
+    for row, anchor in candidates:
         href = str(anchor.get("href") or "")
         label = (
-            _cell_text(row, "season", "season_id", "year", "year_id")
+            (_cell_text(row, "season", "season_id", "year", "year_id")
+             if row is not None else None)
             or _text(anchor)
             or ""
         )
