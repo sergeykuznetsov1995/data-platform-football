@@ -104,6 +104,7 @@ def _joined_row(
     edition: EditionRecord,
     *,
     last_success_at: datetime | None = None,
+    career_fetches_pending: int = 0,
 ) -> dict:
     return {
         'competition_id': competition.competition_id,
@@ -146,6 +147,7 @@ def _joined_row(
         'last_success_at': (
             last_success_at.isoformat() if last_success_at else None
         ),
+        'career_fetches_pending': career_fetches_pending,
     }
 
 
@@ -324,7 +326,10 @@ def test_completed_ops_scope_is_not_replanned_due_to_status_drift():
     # refuses a timestamp that states no zone — so the read must state it.  The
     # first scope ever completed is what turns this from theory into a failure:
     # until then every last_success_at is NULL.
-    assert "with_timezone(MAX(committed_at), 'UTC')" in query
+    assert "with_timezone(committed_at, 'UTC')" in query
+    # A scope that still owes career fetches is not finished with, whatever its
+    # manifest was called — so the planner must read the debt, not just the date.
+    assert "career_fetches_pending" in query
 
     competition = _competition('DONE')
     plan = planner.plan_transfermarkt_scopes(
@@ -393,3 +398,39 @@ def test_batch_size_cannot_bypass_global_bound(batch_size):
             max_batch_size=batch_size,
             now=NOW,
         )
+
+
+def test_a_scope_that_still_owes_careers_is_asked_for_again():
+    # One cycle buys at most a window of a roster's careers. A historical
+    # edition is never re-planned once it has a complete manifest, so the
+    # careers it still owed would never be bought at all — the league would sit
+    # in the slot with a hundred of its players' histories and no one the wiser.
+    competition = _competition('DONE')
+    edition = _edition('DONE', '2024', current=False)
+
+    settled = planner.plan_transfermarkt_scopes(
+        {},
+        parent_cycle_id='scheduled__settled',
+        registry_rows=[_joined_row(
+            competition, edition,
+            last_success_at=NOW - timedelta(days=1),
+            career_fetches_pending=0,
+        )],
+        now=NOW,
+    )
+    assert settled.mapped_payloads == ()
+
+    owing = planner.plan_transfermarkt_scopes(
+        {},
+        parent_cycle_id='scheduled__still-owing',
+        registry_rows=[_joined_row(
+            competition, edition,
+            last_success_at=NOW - timedelta(days=1),
+            career_fetches_pending=2099,
+        )],
+        now=NOW,
+    )
+    assert [
+        (item['competition_id'], item['edition_id'])
+        for item in owing.mapped_payloads
+    ] == [('DONE', '2024')]
