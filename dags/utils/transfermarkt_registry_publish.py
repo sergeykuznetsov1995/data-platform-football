@@ -432,7 +432,13 @@ SELECT
         OR NOT regexp_like(edition_id, '^(18|19|20|21)[0-9]{{2}}$')
         OR NOT regexp_like(canonical_season, '^[0-9]{{4}}$')
         OR season_format NOT IN ('split_year', 'single_year')
-        OR (season_format = 'single_year' AND canonical_season <> edition_id)
+        -- The source's saison_id is not the season for calendar-year leagues:
+        -- K League's 2026 season is served under saison_id 2025. The label is
+        -- what states the season, so the canonical season answers to it.
+        OR (
+            season_format = 'single_year'
+            AND canonical_season <> regexp_replace(edition_label, '[^0-9]', '')
+        )
         OR (season_format = 'split_year' AND canonical_season <> concat(
             substr(edition_id, 3, 2),
             lpad(CAST(mod(TRY_CAST(edition_id AS integer) + 1, 100) AS varchar), 2, '0')
