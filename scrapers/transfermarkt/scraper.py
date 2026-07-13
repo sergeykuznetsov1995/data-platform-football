@@ -1128,18 +1128,22 @@ def materialize_legacy_players(
         ['league', 'season', 'player_id', 'club_id'], keep='first',
     )
 
+    # Age is a fact the source prints; recomputing it "as of now" over pages
+    # that may be a day old (the scope cache lives 24h) drifts by a year for any
+    # player whose birthday falls in between, and the dual-write parity gate
+    # compares the two projections' age. Derive it only when the source omits it.
     today = datetime.utcnow().date()
-    calculated_age = []
+    ages = []
     for _, row in observations.iterrows():
+        age = row.get('age')
         dob = row.get('dob')
-        if isinstance(dob, date):
-            calculated_age.append(
+        if pd.isna(age) and isinstance(dob, date):
+            age = (
                 today.year - dob.year
                 - ((today.month, today.day) < (dob.month, dob.day))
             )
-        else:
-            calculated_age.append(row.get('age'))
-    observations['age'] = calculated_age
+        ages.append(age)
+    observations['age'] = ages
     observations['market_value_last_update'] = None
     observations['current_club_id'] = observations['club_id']
     observations['current_club_name'] = observations['club_name']
