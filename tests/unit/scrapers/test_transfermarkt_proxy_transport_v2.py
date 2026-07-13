@@ -491,3 +491,40 @@ def test_the_control_secret_is_shared_by_every_source_the_filter_guards(
     )
 
     assert provider._control_token == CONTROL_TOKEN
+
+
+@pytest.mark.unit
+def test_a_page_paid_for_by_one_cycle_is_not_paid_for_again():
+    # A league can exceed one cycle's byte cap, so the next cycle must finish it
+    # from the pages the previous one already bought.
+    cache: dict = {}
+    url = "https://www.transfermarkt.com/x/kader/verein/4128"
+
+    first = TransfermarktHttpClient(
+        lease_provider=_FakeLeaseProvider([
+            LeaseTrafficSnapshot(up_bytes=100, down_bytes=900),
+        ]),
+        traffic_ledger=SharedTrafficLedger(),
+        lease_metadata=_metadata(),
+        client_factory=_TlsFactory([_Response(b"<html/>")]),
+        cache=cache,
+    )
+    paid = first.fetch(url, as_json=False, cache_key=url, cache_ttl_seconds=3600)
+    assert paid.status is FetchStatus.OK
+    assert cache
+
+    # The next cycle: a transport with no responses left would fail any real
+    # request, and the lease provider would refuse to hand out another lease.
+    second = TransfermarktHttpClient(
+        lease_provider=_FakeLeaseProvider([]),
+        traffic_ledger=SharedTrafficLedger(),
+        lease_metadata=_metadata(),
+        client_factory=_TlsFactory([]),
+        cache=cache,
+    )
+    reused = second.fetch(url, as_json=False, cache_key=url, cache_ttl_seconds=3600)
+
+    assert reused.status is FetchStatus.OK
+    stats = second.get_traffic_stats()
+    assert stats["cache_hits"] == 1
+    assert stats["provider_metered_bytes"] == 0

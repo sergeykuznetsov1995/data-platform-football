@@ -1264,6 +1264,10 @@ class TransfermarktScraper(BaseScraper):
         )
         competition_records = kwargs.pop('competition_records', None)
         traffic_ledger = kwargs.pop('traffic_ledger', None)
+        # A league larger than one cycle's byte cap can only be finished across
+        # several cycles, and only if the pages already paid for are reused.
+        response_cache = kwargs.pop('response_cache', None)
+        cache_ttl_seconds = kwargs.pop('cache_ttl_seconds', None)
         retry_budget_raw = kwargs.pop(
             'retry_budget', os.environ.get('TM_RETRY_BUDGET'),
         )
@@ -1355,6 +1359,10 @@ class TransfermarktScraper(BaseScraper):
                 'task_id': os.environ.get('TM_TASK_ID', ''),
                 'scope': os.environ.get('TM_SCOPE_ID', ''),
             }
+        self._response_cache = response_cache
+        self._cache_ttl_seconds = (
+            float(cache_ttl_seconds) if cache_ttl_seconds else None
+        )
         self._http_client = TransfermarktHttpClient(
             proxy_manager=(None if lease_provider else self._proxy_manager),
             proxy=(None if lease_provider else self.proxy),
@@ -1364,6 +1372,7 @@ class TransfermarktScraper(BaseScraper):
             lease_metadata=lease_metadata,
             lease_ttl_seconds=lease_ttl_seconds,
             rate_limiter=self._rate_limiter,
+            cache=response_cache,
             timeout_seconds=12,
             circuit_failures=5,
         )
@@ -1702,6 +1711,8 @@ class TransfermarktScraper(BaseScraper):
             label=label,
             context=context,
             validator=self._endpoint_validator(label, as_json),
+            cache_key=url if self._response_cache is not None else None,
+            cache_ttl_seconds=self._cache_ttl_seconds,
         )
         self._store_fetch_outcome(outcome)
         return outcome
