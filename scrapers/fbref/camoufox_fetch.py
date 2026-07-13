@@ -958,13 +958,16 @@ class CamoufoxFbrefTransport:
         delta: Dict[str, object] = {}
         for key, value in stats.items():
             if isinstance(value, int) and not isinstance(value, bool):
-                delta[key] = value - int(baseline.get(key, 0) or 0)
+                # Not every number is a counter: the in-flight reservations are
+                # a gauge that falls when requests settle, so a plain difference
+                # can go negative and bill a fetch a negative byte count.
+                delta[key] = max(0, value - int(baseline.get(key, 0) or 0))
             else:
                 delta[key] = value
         by_type = dict(stats.get("real_bytes_by_resource_type") or {})
         billed_by_type = dict(baseline.get("real_bytes_by_resource_type") or {})
         delta["real_bytes_by_resource_type"] = {
-            name: total - int(billed_by_type.get(name, 0) or 0)
+            name: max(0, total - int(billed_by_type.get(name, 0) or 0))
             for name, total in by_type.items()
         }
         self._billed_traffic = stats

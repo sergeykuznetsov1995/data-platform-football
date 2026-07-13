@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections import Counter
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -310,6 +311,7 @@ def _parse_table(
     caption = _text(table.find("caption")) or None
 
     rows: List[PageRow] = []
+    identity_counts: Counter = Counter()
     for row_index, row in enumerate(body_rows):
         direct_cells = row.find_all(["th", "td"], recursive=False)
         values = [_text(cell) for cell in direct_cells]
@@ -320,7 +322,19 @@ def _parse_table(
             "values": "\x1f".join(values),
             "ordinal": str(row_index),
         }
-        row_id = _sha256(table_instance_id, json.dumps(stable_identity, sort_keys=True))
+        identity = json.dumps(stable_identity, sort_keys=True)
+        # FBref repeats the same entities across rows of one table: a player's
+        # standard stats carry two rows for the same club, his wages table one
+        # row per season for the same club. Entity identity alone is therefore
+        # not a key — the colliding row_ids reached Iceberg as duplicate MERGE
+        # source rows (MERGE_TARGET_ROW_MULTIPLE_MATCHES) and the page could not
+        # be written at all. The first occurrence keeps its id, so rows already
+        # in Bronze stay addressable; later ones carry their occurrence.
+        occurrence = identity_counts[identity]
+        identity_counts[identity] += 1
+        row_id = _sha256(table_instance_id, identity) if occurrence == 0 else (
+            _sha256(table_instance_id, identity, occurrence)
+        )
         cells: List[PageCell] = []
         for cell_index, cell in enumerate(direct_cells):
             data_stat = str(cell.get("data-stat") or "").strip() or None
