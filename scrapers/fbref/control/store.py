@@ -3716,7 +3716,12 @@ class ControlStore:
                     existing["manifest_key"],
                 )
                 if requested != installed:
-                    raise StateConflict("A completed dataset manifest is immutable")
+                    raise StateConflict(
+                        "A completed dataset manifest is immutable: "
+                        f"{identity[3]} of {identity[0]} "
+                        f"({identity[2]}) installed={installed!r} "
+                        f"requested={requested!r}"
+                    )
                 return
             cursor.execute(
                 """
