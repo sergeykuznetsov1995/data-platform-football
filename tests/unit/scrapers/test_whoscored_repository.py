@@ -1252,6 +1252,32 @@ def test_scope_bundle_authoritative_empty_cannot_shrink_published_snapshot():
 
 
 @pytest.mark.unit
+def test_scope_bundle_allows_expired_match_bets_to_shrink():
+    trino = MagicMock()
+    trino.execute_query.side_effect = [
+        [],
+        [('{"whoscored_match_bets":9}',)],
+        [],
+    ]
+    writer = MagicMock()
+    repository = WhoScoredRepository(writer=writer, trino=trino)
+
+    batch_id = repository.commit_scope_bundle(
+        league="WS-235-196",
+        season="2026",
+        entity_group="season",
+        datasets={"whoscored_match_bets": []},
+        distinct_keys={"whoscored_match_bets": "offer_key"},
+        payload_sha256="a" * 64,
+        raw_uris=["s3://raw/schedule.json.gz"],
+        source_empty={"whoscored_match_bets"},
+    )
+
+    assert batch_id.startswith("wss2-")
+    writer.write_dataframe.assert_called_once()
+
+
+@pytest.mark.unit
 def test_scope_bundle_feed_states_are_canonical_and_idempotent():
     trino = MagicMock()
     trino.table_exists.return_value = True

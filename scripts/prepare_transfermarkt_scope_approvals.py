@@ -68,7 +68,7 @@ from run_transfermarkt_scope_cycle import (  # noqa: E402
 CHILD_SCRIPT = "/opt/airflow/dags/scripts/run_transfermarkt_scope_cycle.py"
 PROVIDER_HARD_CAP_BYTES = 15 * 1024 * 1024
 PROVIDER_SOFT_STOP_BYTES = 14 * 1024 * 1024
-PROXY_REQUEST_LIMIT = 540
+PROXY_REQUEST_LIMIT = 710
 PROXY_RETRY_LIMIT = 128  # keep in sync with dag_ingest_transfermarkt
 MV_HISTORY_DAILY_LIMIT = 100
 COACH_HISTORY_TTL_DAYS = 28
