@@ -26,7 +26,7 @@ from scrapers.fbref.raw_store import (
 )
 
 
-DISCOVERY_PARSER_VERSION = "fbref-discovery-parser-v1"
+DISCOVERY_PARSER_VERSION = "fbref-discovery-parser-v2"
 
 _PAGE_SOURCE_ID_KEYS = {
     "competition": ("competition_id",),
