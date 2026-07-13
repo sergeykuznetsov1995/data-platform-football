@@ -339,7 +339,7 @@ class SofaScoreCatalog:
             seasons: list[CatalogSeason] = []
             seen_season_ids: set[int] = set()
             seen_years: dict[str, int] = {}
-            seen_canonical_seasons: dict[str, int] = {}
+            seen_canonical_seasons: dict[str, tuple[int, str, str]] = {}
             seen_resolution_tokens: dict[str, int] = {}
             for season_index, raw_season in enumerate(raw_seasons):
                 season_prefix = f"{prefix}.seasons[{season_index}]"
@@ -356,12 +356,12 @@ class SofaScoreCatalog:
                 year = _required_string(
                     raw_season.get("year"), f"{season_prefix}.year"
                 )
-                previous = seen_years.get(year)
-                if previous is not None and previous != season_id:
-                    raise CatalogError(
-                        f"{prefix} has ambiguous year {year!r}"
-                    )
-                seen_years[year] = season_id
+                # Parallel divisions share one year label (tournament 65 ships
+                # "2nd Division East 14/15" and "... West 14/15"). Both are real
+                # source seasons, so loading the registry must not reject them.
+                # resolve_source_season still fails closed when a token cannot
+                # name exactly one season.
+                seen_years.setdefault(year, season_id)
                 season_format = _required_string(
                     raw_season.get("season_format"),
                     f"{season_prefix}.season_format",
@@ -421,18 +421,28 @@ class SofaScoreCatalog:
                         f"{season_prefix} unknown format cannot be activatable"
                     )
                 if canonical_season is not None:
+                    # Two labels of the *same* season format collapsing into one
+                    # canonical season is corruption and stays fail-closed. A
+                    # league that migrated formats owns both "20/21" and "2021"
+                    # (tournament 278), and parallel divisions share one year
+                    # (tournament 65) — both are real, and an ambiguous token
+                    # fails closed in resolve_source_season instead.
                     previous_canonical = seen_canonical_seasons.get(
                         canonical_season
                     )
                     if (
                         previous_canonical is not None
-                        and previous_canonical != season_id
+                        and previous_canonical[0] != season_id
+                        and previous_canonical[1] == season_kind
+                        and previous_canonical[2] != year
                     ):
                         raise CatalogError(
                             f"{prefix} has ambiguous canonical_season "
                             f"{canonical_season!r}"
                         )
-                    seen_canonical_seasons[canonical_season] = season_id
+                    seen_canonical_seasons.setdefault(
+                        canonical_season, (season_id, season_kind, year)
+                    )
 
                 if schema_version == SCHEMA_VERSION:
                     source_name = _required_string(
@@ -497,16 +507,13 @@ class SofaScoreCatalog:
                 )
                 if canonical_season is not None:
                     resolution_tokens.add(canonical_season)
+                # Parallel divisions and format migrations make some tokens name
+                # more than one real season (tournaments 65 and 278). Rejecting
+                # the whole registry over that would strand every unambiguous
+                # season with it; resolve_source_season already refuses to guess
+                # when a token matches more than one season.
                 for token in resolution_tokens:
-                    previous_alias = seen_resolution_tokens.get(token)
-                    if (
-                        previous_alias is not None
-                        and previous_alias != season_id
-                    ):
-                        raise CatalogError(
-                            f"{prefix} has ambiguous season alias {token!r}"
-                        )
-                    seen_resolution_tokens[token] = season_id
+                    seen_resolution_tokens.setdefault(token, season_id)
                 seasons.append(
                     CatalogSeason(
                         season_id=season_id,
