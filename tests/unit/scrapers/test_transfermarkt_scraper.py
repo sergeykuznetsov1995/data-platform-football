@@ -411,6 +411,30 @@ class TestParseMvHistory:
 
 
 class TestParseTransfers:
+    def test_the_machine_date_wins_over_the_hosts_rendering_of_it(self):
+        # .com renders 27 July 2020 as "27/07/2020" and .us as "Jul 27, 2020";
+        # only dateUnformatted says which number is the day on every host.
+        payload = {'transfers': [{
+            'date': '27/07/2020',
+            'dateUnformatted': '2020-07-27',
+            'season': '20/21',
+            'upcoming': False,
+            'from': {
+                'clubName': 'PSG',
+                'href': '/psgtm/transfers/verein/583/saison_id/2020',
+            },
+            'to': {
+                'clubName': 'Man City',
+                'href': '/manchester-city/transfers/verein/281/saison_id/2020',
+            },
+            'fee': '€30.00m',
+            'marketValue': '€40.00m',
+        }]}
+
+        rows = _parse_transfers(payload, '315858')
+
+        assert rows[0]['transfer_date'] == date(2020, 7, 27)
+
     def test_happy_path(self):
         payload = {'transfers': [{
             'date': 'Sep 1, 2025',
