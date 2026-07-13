@@ -203,7 +203,14 @@ def test_scope_integrity_summary_counts_schedule_bets_without_offer_rows(monkeyp
         [23752],
         *([0] * len(mod.SCOPE_PARITY_TABLES)),
     ]
-    responses = iter([[match_row], [scope_row], [[0] * 10]])
+    responses = iter(
+        [
+            [[*match_row[:11], *match_row[21:]]],
+            [match_row[11:21]],
+            [scope_row],
+            [[0] * 10],
+        ]
+    )
     queries = []
 
     class _Cursor:
@@ -233,7 +240,7 @@ def test_scope_integrity_summary_counts_schedule_bets_without_offer_rows(monkeyp
     assert "whoscored_match_bets_current" in queries[0]
     assert "json_size(json_parse(s.bets), '$')" in queries[0]
     assert "<> 7" in queries[0]
-    assert "<> 3" in queries[2]
+    assert "<> 3" in queries[3]
 
 
 @pytest.mark.unit
