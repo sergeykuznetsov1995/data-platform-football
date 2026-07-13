@@ -426,8 +426,16 @@ const done = arguments[arguments.length - 1];
     // WhoScored publishes a per-page request token in a fixed RequireJS config
     // and its own statistics XHR adds it as Model-last-Mode.  Read only that
     // exact server-provided field; callers cannot supply a name or value.
-    const siteConfig = window.require && window.require.config &&
-      window.require.config.params && window.require.config.params.site;
+    const sourceHeaderDeadline = Date.now() + Math.min(3000, Math.max(0, timeoutMs - 1000));
+    let siteConfig = null;
+    do {
+      siteConfig = window.require && window.require.config &&
+        window.require.config.params && window.require.config.params.site;
+      if (siteConfig && siteConfig.gSiteHeaderName === "Model-last-Mode" &&
+          typeof siteConfig.gSiteHeaderValue === "string" &&
+          /^[A-Za-z0-9+/]{43}=$/.test(siteConfig.gSiteHeaderValue)) break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    } while (Date.now() < sourceHeaderDeadline);
     if (!siteConfig || siteConfig.gSiteHeaderName !== "Model-last-Mode" ||
         typeof siteConfig.gSiteHeaderValue !== "string" ||
         !/^[A-Za-z0-9+/]{43}=$/.test(siteConfig.gSiteHeaderValue)) {
@@ -557,8 +565,16 @@ const done = arguments[arguments.length - 1];
   }, timeoutMs);
 
   try {
-    const siteConfig = window.require && window.require.config &&
-      window.require.config.params && window.require.config.params.site;
+    const sourceHeaderDeadline = Date.now() + Math.min(3000, Math.max(0, timeoutMs - 1000));
+    let siteConfig = null;
+    do {
+      siteConfig = window.require && window.require.config &&
+        window.require.config.params && window.require.config.params.site;
+      if (siteConfig && siteConfig.gSiteHeaderName === "Model-last-Mode" &&
+          typeof siteConfig.gSiteHeaderValue === "string" &&
+          /^[A-Za-z0-9+/]{43}=$/.test(siteConfig.gSiteHeaderValue)) break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    } while (Date.now() < sourceHeaderDeadline);
     if (!siteConfig || siteConfig.gSiteHeaderName !== "Model-last-Mode" ||
         typeof siteConfig.gSiteHeaderValue !== "string" ||
         !/^[A-Za-z0-9+/]{43}=$/.test(siteConfig.gSiteHeaderValue)) {

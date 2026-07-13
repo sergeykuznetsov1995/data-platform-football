@@ -1274,6 +1274,53 @@ def test_direct_cloudflare_uses_fresh_direct_browser_with_media_disabled():
 
 
 @pytest.mark.unit
+def test_direct_browser_retries_cloudflare_origin_502_rendered_as_http_200():
+    soft_502 = b"<html><title>whoscored.com | 502: Bad gateway</title></html>"
+    direct = FakeHTTPSession(FakeHTTPResponse(403, CF_HTML, {"cf-ray": "x"}))
+    fs = FakeFSClient(
+        {"html": soft_502.decode(), "status": 200},
+        {"html": OK_HTML.decode(), "status": 200},
+    )
+    proxy = FakeProxyClient()
+    tokens = []
+    transport, _ = _transport(direct, direct_fs=fs, proxy=proxy, attempts=2)
+
+    result = transport.fetch(
+        "https://www.whoscored.com/Matches/1/Live",
+        before_network=lambda: tokens.append(1),
+    )
+
+    assert result.content == OK_HTML
+    assert result.route is TransportRoute.DIRECT_FLARESOLVERR
+    assert len(fs.get_calls) == 2
+    # The initial browser attempt shares the logical request's acquired token;
+    # the additional physical retry acquires one more.
+    assert len(tokens) == 2
+    assert proxy.created == []
+
+
+@pytest.mark.unit
+def test_direct_browser_soft_origin_502_exhaustion_never_enables_paid_proxy():
+    soft_502 = b"<html><title>whoscored.com | 502: Bad gateway</title></html>"
+    direct = FakeHTTPSession(FakeHTTPResponse(403, CF_HTML, {"cf-ray": "x"}))
+    fs = FakeFSClient(
+        {"html": soft_502.decode(), "status": 200},
+        {"html": soft_502.decode(), "status": 200},
+    )
+    proxy = FakeProxyClient()
+    transport, _ = _transport(direct, direct_fs=fs, proxy=proxy, attempts=2)
+
+    with pytest.raises(WhoScoredTransportError) as exc:
+        transport.fetch("https://www.whoscored.com/Matches/1/Live")
+
+    assert exc.value.kind is FailureKind.HTTP_STATUS
+    assert exc.value.status_code == 502
+    assert exc.value.retryable is True
+    assert len(fs.get_calls) == 2
+    assert proxy.created == []
+
+
+@pytest.mark.unit
 def test_lost_create_response_destroys_possible_orphan_browser_session():
     class CreateThenTimeoutFS(FakeFSClient):
         def create_session(self, session_id, proxy_url=None):

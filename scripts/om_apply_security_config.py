@@ -110,6 +110,12 @@ def _env_list(name: str) -> list[str] | None:
 
 
 def login() -> str:
+    # Если SSO уже включён, basic-логин отвечает 403 — тогда конфиг применяется
+    # под Bearer'ом админа-человека (см. scripts/om_reapply_sso.sh).
+    bearer = os.environ.get("OM_BEARER")
+    if bearer:
+        return bearer
+
     password = os.environ.get("OM_ADMIN_PASSWORD")
     if not password:
         sys.exit("OM_ADMIN_PASSWORD не задан (локальный админ OM, basic-логин)")
@@ -146,6 +152,9 @@ def build_config(current: dict) -> dict:
     auth["authority"] = os.environ.get("OM_AUTH_AUTHORITY", auth.get("authority", ""))
     auth["clientId"] = os.environ.get("OM_AUTH_CLIENT_ID", "")
     auth["callbackUrl"] = os.environ.get("OM_AUTH_CALLBACK_URL", "")
+    # code, а не дефолтный id_token: иначе JWT летит в адресной строке и Chrome
+    # Safe Browsing блокирует страницу входа как фишинговую.
+    auth["responseType"] = os.environ.get("OM_AUTH_RESPONSE_TYPE", auth.get("responseType", "id_token"))
 
     public_keys = _env_list("OM_AUTH_PUBLIC_KEYS")
     if public_keys:

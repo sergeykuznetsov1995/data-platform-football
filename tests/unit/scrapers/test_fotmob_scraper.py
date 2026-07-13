@@ -560,7 +560,8 @@ class TestFotMobScraperUnit:
 
         assert df is not None and len(df) == 1
         row = df.iloc[0]
-        assert row['player_id'] == 24011
+        # Bronze stores player_id as varchar (see read_player_details).
+        assert row['player_id'] == '24011'
         assert row['primary_team_id'] == 9825
         assert row['primary_team_name'] == 'Arsenal'
         assert row['main_league_id'] == 47

@@ -185,8 +185,10 @@ def _runtime(behaviors=None, *, candidate_ids=None):
             self.calls.append(("previews", None))
             return self._value("previews")
 
-        def sync_matches(self, *, match_ids, limit, force_replay):
+        def sync_matches(self, *, match_ids, limit, force_replay, kickoff_from=None):
             self.match_force_replays.append(bool(force_replay))
+            if kickoff_from is not None:
+                assert kickoff_from.tzinfo is not None
             call = ("matches", limit)
             if match_ids is not None:
                 call = (*call, tuple(match_ids))
