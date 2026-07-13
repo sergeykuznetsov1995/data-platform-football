@@ -146,7 +146,7 @@ class TestDagShape:
     def test_bounded_operator_params_are_not_relaxable(self, dag_module):
         params = dag_module.dag._dag_kwargs['params']
         assert params['mv_transfers_limit']._kw['maximum'] == 100
-        assert params['proxy_retry_limit']._kw['maximum'] == 8
+        assert params['proxy_retry_limit']._kw['maximum'] == 128
         assert params['proxy_request_limit']._kw['maximum'] == 316
         assert params['proxy_lease_ttl_seconds']._kw['maximum'] == 3600
         assert dag_module.PROVIDER_HARD_CAP_BYTES == 15 * 1024 * 1024

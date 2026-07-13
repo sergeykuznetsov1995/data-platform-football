@@ -22,6 +22,7 @@ from scrapers.whoscored.repository import (
     WHOSCORED_BUSINESS_COLUMN_CONTRACTS,
     WHOSCORED_BUSINESS_TABLES,
     WhoScoredRepository,
+    _clean_unicode,
 )
 
 
@@ -87,6 +88,19 @@ def _commit(*, lineups=(), lineups_available=False) -> MatchCommit:
             "lineups": "available" if lineups else "empty",
         },
     )
+
+
+@pytest.mark.unit
+def test_invalid_json_surrogates_are_repaired_before_utf8_write():
+    pair = chr(0xD83C) + chr(0xDDE6)
+    lone = chr(0xD800)
+
+    cleaned = _clean_unicode("flag " + pair + " broken " + lone)
+
+    assert cleaned == "flag " + chr(0x1F1E6) + " broken �"
+    cleaned.encode("utf-8")
+    encoded = WhoScoredRepository._canonical_json({"player": pair + lone})
+    encoded.encode("utf-8")
 
 
 def _preview_commit(
