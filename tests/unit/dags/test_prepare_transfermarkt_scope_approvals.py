@@ -156,6 +156,19 @@ def test_paid_and_write_packets_share_the_childs_own_argv(tmp_path):
     assert paid.packet_hash != write.packet_hash
 
 
+def test_packets_carry_the_payload_the_dag_will_rebuild_from_the_conf(tmp_path):
+    module = _load()
+    rows = [_registry_row("GB1", "2025"), _registry_row("ES1", "2025")]
+    plan = _plan(module, tmp_path, rows=rows)
+
+    # The DAG re-plans from the exact scopes in the conf, so the payload it hands
+    # the child states a fully covered batch — no due remainder, no continuation.
+    argv = plan["packets"][plan["scope_ids"][0]]["paid"].argv
+    payload = json.loads(argv[argv.index("--payload-json") + 1])
+    assert payload["remaining_count"] == 0
+    assert payload["continuation_required"] is False
+
+
 def test_packet_limits_match_what_the_child_verifies(tmp_path):
     module = _load()
     plan = _plan(module, tmp_path)
