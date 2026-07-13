@@ -141,27 +141,8 @@ def _compact_json(value: Any) -> str:
     )
 
 
-def canonical_season(
-    edition_id_or_label: Any,
-    season_format: SeasonFormat | str,
-) -> str:
-    """Return the canonical season without guessing its format.
-
-    A four-digit source year becomes a split season only when
-    ``season_format=split_year``.  Therefore ``2026`` is ``2026`` for a World
-    Cup and ``2627`` for an explicitly split-year competition.
-    """
-
-    fmt = _enum_value(SeasonFormat, season_format)
-    raw = str(edition_id_or_label).strip()
-    if fmt is SeasonFormat.UNKNOWN:
-        raise RegistryError("season_format=unknown cannot produce a season")
-
-    if fmt is SeasonFormat.SINGLE_YEAR:
-        match = re.fullmatch(r"(18|19|20|21)\d{2}", raw)
-        if match is None:
-            raise RegistryError(f"invalid single-year edition: {raw!r}")
-        return raw
+def _split_year_bounds(raw: str) -> tuple[int, int]:
+    """The two calendar years a split-year edition spans."""
 
     # The oldest leagues in the registry reach back into the 1890s.
     pair = re.fullmatch(
@@ -187,13 +168,59 @@ def canonical_season(
             raise RegistryError(
                 f"split-year edition must span one year: {raw!r}"
             )
-        return f"{start_year % 100:02d}{end_year % 100:02d}"
+        return start_year, end_year
 
     if re.fullmatch(r"(19|20|21)\d{2}", raw):
         start_year = int(raw)
-        return f"{start_year % 100:02d}{(start_year + 1) % 100:02d}"
+        return start_year, start_year + 1
 
     raise RegistryError(f"invalid split-year edition: {raw!r}")
+
+
+def canonical_season(
+    edition_id_or_label: Any,
+    season_format: SeasonFormat | str,
+) -> str:
+    """Return the canonical season without guessing its format.
+
+    A four-digit source year becomes a split season only when
+    ``season_format=split_year``.  Therefore ``2026`` is ``2026`` for a World
+    Cup and ``2627`` for an explicitly split-year competition.
+    """
+
+    fmt = _enum_value(SeasonFormat, season_format)
+    raw = str(edition_id_or_label).strip()
+    if fmt is SeasonFormat.UNKNOWN:
+        raise RegistryError("season_format=unknown cannot produce a season")
+
+    if fmt is SeasonFormat.SINGLE_YEAR:
+        match = re.fullmatch(r"(18|19|20|21)\d{2}", raw)
+        if match is None:
+            raise RegistryError(f"invalid single-year edition: {raw!r}")
+        return raw
+
+    start_year, end_year = _split_year_bounds(raw)
+    return f"{start_year % 100:02d}{end_year % 100:02d}"
+
+
+def season_window_year(
+    edition_id_or_label: Any,
+    season_format: SeasonFormat | str,
+    canonical: Optional[str] = None,
+) -> int:
+    """The calendar year a season's date window opens in.
+
+    A split-year season is named by the year it opens in, and that year is its
+    saison_id.  A calendar-year season is named by the year the source prints
+    on it — from which the source offsets some saison_ids — so for those the
+    registered season, not the edition id, states the window.
+    """
+
+    fmt = _enum_value(SeasonFormat, season_format)
+    if fmt is SeasonFormat.SINGLE_YEAR:
+        return int(canonical or canonical_season(edition_id_or_label, fmt))
+    start_year, _ = _split_year_bounds(str(edition_id_or_label).strip())
+    return start_year
 
 
 @dataclass(frozen=True)
