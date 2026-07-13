@@ -2011,3 +2011,98 @@ def test_initialize_run_reaps_leases_left_by_dead_workers(tmp_path):
     assert control.reaped == 1
     assert control.events.index("reap") < control.events.index("create_run")
     assert uuid.UUID(run_id)
+
+
+class FakeClearanceRejectedFetcher:
+    """403s once (a dead cf_clearance), then serves the page normally."""
+
+    def __init__(self, events):
+        self.events = events
+        self.calls = 0
+
+    def __enter__(self):
+        self.events.append("fetcher_enter")
+        return self
+
+    def __exit__(self, *args):
+        self.events.append("fetcher_exit")
+
+    def fetch(self, url, **kwargs):
+        self.calls += 1
+        self.events.append("http")
+        raise FetchError(
+            "FBref returned HTTP 403",
+            error_class="http_status",
+            http_status=403,
+            wire_bytes=200,
+            browser_document_bytes=500,
+            browser_asset_bytes=100,
+            browser_requests=1,
+            browser_bootstrap_attempts=1,
+            target_requests=1,
+            http_status_history=(403,),
+            latency_ms=100,
+        )
+
+
+def test_a_rejected_clearance_is_burned_instead_of_failing_every_target(tmp_path):
+    """Cloudflare can stop honouring a clearance mid-wave (its exit IP falls out
+    of favour). Reusing the dead session 403s every remaining target — one bad
+    exit IP burned a whole production wave. The wave must re-solve on a fresh
+    proxy instead."""
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    run_id = str(uuid.UUID(int=1))
+
+    def lease(number, target_id, page_kind, canonical_url, source_ids):
+        return TargetLease(
+            attempt_id=str(uuid.UUID(int=30 + number)),
+            run_id=run_id,
+            target_id=target_id,
+            logical_refresh_id=str(uuid.UUID(int=40 + number)),
+            canonical_url=canonical_url,
+            page_kind=page_kind,
+            source_ids=source_ids,
+            claim_token=str(uuid.UUID(int=50 + number)),
+            lease_epoch=1,
+            attempt_number=1,
+            leased_by="worker-1",
+            lease_expires_at=NOW + timedelta(minutes=10),
+        )
+
+    first = lease(
+        1,
+        "fbref:competition:9",
+        "competition",
+        "https://fbref.com/en/comps/9/history/Premier-League-Seasons",
+        {"competition_id": "9"},
+    )
+    second = lease(
+        2,
+        "fbref:competition:12",
+        "competition",
+        "https://fbref.com/en/comps/12/history/La-Liga-Seasons",
+        {"competition_id": "12"},
+    )
+    control.claim_targets = lambda *args, **kwargs: [first, second]
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=lambda _: FakeClearanceRejectedFetcher(control.events),
+        sleep=lambda _: None,
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(FetchWaveError):
+        pipeline.fetch_wave(
+            run_id,
+            worker_id="worker-1",
+            page_kinds=["competition"],
+            settings=_settings(),
+        )
+
+    # The dead session is torn down and a fresh one solved for the next target,
+    # rather than every target being fed to the same rejected clearance.
+    assert control.events.count("session_open") == 2
+    assert control.events.count("fetcher_exit") == 2
