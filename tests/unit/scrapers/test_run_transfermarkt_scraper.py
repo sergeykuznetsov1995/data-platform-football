@@ -275,8 +275,8 @@ class TestProductionTrafficCeilings:
     @pytest.mark.parametrize(
         'extra,expected',
         [
-            (['--decoded-body-budget-mb', '10.0001'],
-             '--decoded-body-budget-mb cannot exceed 10.0'),
+            (['--decoded-body-budget-mb', '16.0001'],
+             '--decoded-body-budget-mb cannot exceed 16.0'),
             (['--request-budget', '151'],
              '--request-budget cannot exceed 150'),
             (['--cycle-budget-bytes', str(15 * 1024 * 1024 + 1)],

@@ -38,10 +38,11 @@ PROVIDER_SOFT_STOP_BYTES = 14 * 1024 * 1024
 # source answers 502/504 for a third to a half of the attempts in a bad wave.
 # The 15 MiB byte cap still stops a cycle long before these do.
 PROXY_REQUEST_LIMIT = 710
-# Cycle-wide retry ledger: the source answers 502/504 in waves, and a scope
-# fetches dozens of pages, so a handful of retries dies on the first two. A
-# failed attempt costs ~10 KiB against the 15 MiB cap, which is the real bound.
-PROXY_RETRY_LIMIT = 128
+# Cycle-wide retry ledger. A cold big league fetches ~360 pages across its four
+# entities and the source answers 502/504 for a third to a half of the attempts
+# in a wave, so it needs retries of that order. A failed attempt costs ~10 KiB
+# against the 15 MiB cap, which is what actually bounds the paid traffic.
+PROXY_RETRY_LIMIT = 400
 PROXY_CONCURRENCY = 1
 SCOPE_SET_COVERAGE_MAX_AGE_DAYS = 7
 

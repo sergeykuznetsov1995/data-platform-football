@@ -793,6 +793,7 @@ def test_match_candidates_replay_parser_failures_only_after_parser_change():
     assert "m.state = 'terminal'" not in sql
     assert "m.state = 'success'" in sql
     assert "m.batch_id NOT LIKE 'ws2-%'" in sql
+    assert sql.count("m.parser_version IS DISTINCT FROM") >= 2
 
 
 @pytest.mark.unit

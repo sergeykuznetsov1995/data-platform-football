@@ -52,6 +52,9 @@ SCOPE_PARITY_TABLES = (
 # competitions.  Match/scope commit locks protect idempotency across task
 # processes; the paid route still has its independent hard lease limit of one.
 DIRECT_POOL = os.environ.get("WHOSCORED_DIRECT_POOL", "whoscored_direct_pool")
+# Scope integrity expands several Iceberg current views.  Keep only two such
+# queries active so Trino workers do not hit their remote-task idle timeout.
+DQ_POOL = os.environ.get("WHOSCORED_DQ_POOL", "whoscored_dq_pool")
 
 WHOSCORED_ARGS = {
     **{
@@ -353,6 +356,7 @@ def _scope_integrity_summary(scope_spec: str) -> Dict[str, int]:
     if not separator or not competition_id or not season_id:
         raise AirflowException(f"invalid persisted scope {scope_spec!r}")
 
+    from scrapers.whoscored.parsers import PARSER_VERSION
     from utils.silver_tasks import _get_trino_connection
 
     league_sql = _sql_string(competition_id)
@@ -373,7 +377,15 @@ def _scope_integrity_summary(scope_spec: str) -> Dict[str, int]:
                         FROM iceberg.bronze.whoscored_match_ingest_manifest m
                         WHERE league = {league_sql} AND season = {season_sql}
                           AND batch_id LIKE 'ws2-%' AND raw_uri IS NOT NULL
+                          AND parser_version = {_sql_string(PARSER_VERSION)}
                     ) WHERE rn = 1 AND state = 'success'
+                ),
+                latest_covered_match AS (
+                    SELECT CAST(game_id AS BIGINT) AS game_id
+                    FROM iceberg.bronze.whoscored_match_ingest_latest
+                    WHERE league = {league_sql} AND season = {season_sql}
+                      AND parser_version = {_sql_string(PARSER_VERSION)}
+                      AND state IN ('success', 'not_available')
                 ),
                 schedule AS (
                     SELECT * FROM (
@@ -387,11 +399,15 @@ def _scope_integrity_summary(scope_spec: str) -> Dict[str, int]:
                 ),
                 completed AS (
                     SELECT * FROM schedule
-                    WHERE status = 6 OR (
-                        status = 1 AND home_score IS NOT NULL
-                        AND away_score IS NOT NULL
-                        AND date <= CAST(
-                            CURRENT_TIMESTAMP - INTERVAL '3' HOUR AS TIMESTAMP
+                    WHERE date >= CAST(
+                        CURRENT_TIMESTAMP - INTERVAL '7' DAY AS TIMESTAMP
+                    ) AND (
+                        status = 6 OR (
+                            status = 1 AND home_score IS NOT NULL
+                            AND away_score IS NOT NULL
+                            AND date <= CAST(
+                                CURRENT_TIMESTAMP - INTERVAL '3' HOUR AS TIMESTAMP
+                            )
                         )
                     )
                 ),
@@ -430,12 +446,19 @@ def _scope_integrity_summary(scope_spec: str) -> Dict[str, int]:
                     (SELECT COUNT(*) FROM latest_match),
                     (SELECT COALESCE(SUM(events_count), 0) FROM latest_match),
                     (SELECT COUNT(*) FROM iceberg.bronze.whoscored_events_current
-                     WHERE league = {league_sql} AND season = {season_sql}),
+                     WHERE league = {league_sql} AND season = {season_sql}
+                       AND _game_batch_id IN (
+                           SELECT batch_id FROM latest_match
+                       )),
                     (SELECT COALESCE(SUM(lineups_count), 0) FROM latest_match),
                     (SELECT COUNT(*) FROM iceberg.bronze.whoscored_lineups_current
-                     WHERE league = {league_sql} AND season = {season_sql}),
+                     WHERE league = {league_sql} AND season = {season_sql}
+                       AND _game_batch_id IN (
+                           SELECT batch_id FROM latest_match
+                       )),
                     (SELECT COUNT(*) FROM completed),
-                    (SELECT COUNT(*) FROM completed c LEFT JOIN latest_match m
+                    (SELECT COUNT(*) FROM completed c
+                     LEFT JOIN latest_covered_match m
                      ON m.game_id = CAST(c.game_id AS BIGINT) WHERE m.game_id IS NULL),
                     (SELECT COUNT(*) FROM latest_match m
                      LEFT JOIN events_by_game e ON e.game_id = m.game_id
@@ -443,31 +466,6 @@ def _scope_integrity_summary(scope_spec: str) -> Dict[str, int]:
                     (SELECT COUNT(*) FROM latest_match m
                      LEFT JOIN lineups_by_game l ON l.game_id = m.game_id
                      WHERE COALESCE(l.rows_count, 0) <> m.lineups_count),
-                    (SELECT COALESCE(SUM(CAST(json_extract_scalar(
-                        json_parse(entity_counts_json), '$.matches') AS BIGINT)), 0)
-                     FROM latest_match),
-                    (SELECT COUNT(*) FROM iceberg.bronze.whoscored_matches_current
-                     WHERE league = {league_sql} AND season = {season_sql}),
-                    (SELECT COALESCE(SUM(CAST(json_extract_scalar(
-                        json_parse(entity_counts_json), '$.substitutions') AS BIGINT)), 0)
-                     FROM latest_match),
-                    (SELECT COUNT(*) FROM iceberg.bronze.whoscored_substitutions_current
-                     WHERE league = {league_sql} AND season = {season_sql}),
-                    (SELECT COALESCE(SUM(CAST(json_extract_scalar(
-                        json_parse(entity_counts_json), '$.formations') AS BIGINT)), 0)
-                     FROM latest_match),
-                    (SELECT COUNT(*) FROM iceberg.bronze.whoscored_formations_current
-                     WHERE league = {league_sql} AND season = {season_sql}),
-                    (SELECT COALESCE(SUM(CAST(json_extract_scalar(
-                        json_parse(entity_counts_json), '$.team_match_stats') AS BIGINT)), 0)
-                     FROM latest_match),
-                    (SELECT COUNT(*) FROM iceberg.bronze.whoscored_team_match_stats_current
-                     WHERE league = {league_sql} AND season = {season_sql}),
-                    (SELECT COALESCE(SUM(CAST(json_extract_scalar(
-                        json_parse(entity_counts_json), '$.player_match_stats') AS BIGINT)), 0)
-                     FROM latest_match),
-                    (SELECT COUNT(*) FROM iceberg.bronze.whoscored_player_match_stats_current
-                     WHERE league = {league_sql} AND season = {season_sql}),
                     (SELECT COUNT(*)
                      FROM completed c
                      JOIN latest_match m
@@ -476,6 +474,7 @@ def _scope_integrity_summary(scope_spec: str) -> Dict[str, int]:
                      LEFT JOIN iceberg.bronze.whoscored_matches_current h
                        ON h.league = m.league AND h.season = m.season
                       AND CAST(h.game_id AS BIGINT) = m.game_id
+                      AND h._game_batch_id LIKE 'ws2-%'
                      WHERE m.is_opta = TRUE AND (
                          COALESCE(json_extract_scalar(
                              json_parse(m.dataset_statuses_json), '$.events'
@@ -527,37 +526,100 @@ def _scope_integrity_summary(scope_spec: str) -> Dict[str, int]:
                     (SELECT COUNT(*)
                      FROM iceberg.bronze.whoscored_events_current e
                      WHERE e.league = {league_sql} AND e.season = {season_sql}
-                       AND e._game_batch_id LIKE 'ws2-%'
+                       AND e._game_batch_id IN (
+                           SELECT batch_id FROM latest_match
+                       )
                        AND (
                            e.source_event_id IS NULL OR e.source_event_id <= 0
                            OR e.team_event_id IS NULL OR e.team_event_id <= 0
-                           OR TRY_CAST(TRY(json_extract_scalar(
+                           OR TRY_CAST(TRY_CAST(TRY(json_extract_scalar(
                                e.source_raw_json, '$.id'
-                           )) AS BIGINT) IS DISTINCT FROM e.source_event_id
-                           OR TRY_CAST(TRY(json_extract_scalar(
+                           )) AS DOUBLE) AS BIGINT) IS DISTINCT FROM COALESCE(
+                               e.opta_event_id, e.source_event_id
+                           )
+                           OR TRY_CAST(TRY_CAST(TRY(json_extract_scalar(
                                e.source_raw_json, '$.eventId'
-                           )) AS BIGINT) IS DISTINCT FROM e.team_event_id
-                           OR TRY_CAST(TRY(json_extract_scalar(
+                           )) AS DOUBLE) AS BIGINT) IS DISTINCT FROM e.team_event_id
+                           OR TRY_CAST(TRY_CAST(TRY(json_extract_scalar(
                                e.source_raw_json, '$.relatedEventId'
-                           )) AS BIGINT) IS DISTINCT FROM e.related_team_event_id
+                           )) AS DOUBLE) AS BIGINT) IS DISTINCT FROM
+                               e.related_team_event_id
                        )),
                     (SELECT COUNT(*) FROM (
                         SELECT game_id, source_event_id
                         FROM iceberg.bronze.whoscored_events_current
                         WHERE league = {league_sql} AND season = {season_sql}
-                          AND _game_batch_id LIKE 'ws2-%'
+                          AND _game_batch_id IN (
+                              SELECT batch_id FROM latest_match
+                          )
                         GROUP BY 1, 2 HAVING COUNT(*) > 1
                     ) duplicate_source_ids),
                     (SELECT COUNT(*) FROM (
                         SELECT game_id, team_id, team_event_id
                         FROM iceberg.bronze.whoscored_events_current
                         WHERE league = {league_sql} AND season = {season_sql}
-                          AND _game_batch_id LIKE 'ws2-%'
+                          AND _game_batch_id IN (
+                              SELECT batch_id FROM latest_match
+                          )
                         GROUP BY 1, 2, 3 HAVING COUNT(*) > 1
                     ) duplicate_team_event_ids)
                 """
             )
-            row = cur.fetchall()[0]
+            core_row = cur.fetchall()[0]
+            # Keep this parity block separate from the already complex event
+            # integrity query.  Expanding all Iceberg ``*_current`` views in
+            # one statement exceeded Trino's production 150-stage limit.
+            cur.execute(
+                f"""
+                WITH latest_match AS (
+                    SELECT * FROM (
+                        SELECT m.*, ROW_NUMBER() OVER (
+                            PARTITION BY league, season, game_id
+                            ORDER BY COALESCE(
+                                completed_at, fetched_at, _ingested_at
+                            ) DESC, batch_id DESC
+                        ) AS rn
+                        FROM iceberg.bronze.whoscored_match_ingest_manifest m
+                        WHERE league = {league_sql} AND season = {season_sql}
+                          AND batch_id LIKE 'ws2-%' AND raw_uri IS NOT NULL
+                          AND parser_version = {_sql_string(PARSER_VERSION)}
+                    ) WHERE rn = 1 AND state = 'success'
+                )
+                SELECT
+                    (SELECT COALESCE(SUM(CAST(json_extract_scalar(
+                        json_parse(entity_counts_json), '$.matches') AS BIGINT)), 0)
+                     FROM latest_match),
+                    (SELECT COUNT(*) FROM iceberg.bronze.whoscored_matches_current
+                     WHERE league = {league_sql} AND season = {season_sql}
+                       AND _game_batch_id IN (SELECT batch_id FROM latest_match)),
+                    (SELECT COALESCE(SUM(CAST(json_extract_scalar(
+                        json_parse(entity_counts_json), '$.substitutions') AS BIGINT)), 0)
+                     FROM latest_match),
+                    (SELECT COUNT(*) FROM iceberg.bronze.whoscored_substitutions_current
+                     WHERE league = {league_sql} AND season = {season_sql}
+                       AND _game_batch_id IN (SELECT batch_id FROM latest_match)),
+                    (SELECT COALESCE(SUM(CAST(json_extract_scalar(
+                        json_parse(entity_counts_json), '$.formations') AS BIGINT)), 0)
+                     FROM latest_match),
+                    (SELECT COUNT(*) FROM iceberg.bronze.whoscored_formations_current
+                     WHERE league = {league_sql} AND season = {season_sql}
+                       AND _game_batch_id IN (SELECT batch_id FROM latest_match)),
+                    (SELECT COALESCE(SUM(CAST(json_extract_scalar(
+                        json_parse(entity_counts_json), '$.team_match_stats') AS BIGINT)), 0)
+                     FROM latest_match),
+                    (SELECT COUNT(*) FROM iceberg.bronze.whoscored_team_match_stats_current
+                     WHERE league = {league_sql} AND season = {season_sql}
+                       AND _game_batch_id IN (SELECT batch_id FROM latest_match)),
+                    (SELECT COALESCE(SUM(CAST(json_extract_scalar(
+                        json_parse(entity_counts_json), '$.player_match_stats') AS BIGINT)), 0)
+                     FROM latest_match),
+                    (SELECT COUNT(*) FROM iceberg.bronze.whoscored_player_match_stats_current
+                     WHERE league = {league_sql} AND season = {season_sql}
+                       AND _game_batch_id IN (SELECT batch_id FROM latest_match))
+                """
+            )
+            match_parity_row = cur.fetchall()[0]
+            row = (*core_row[:11], *match_parity_row, *core_row[11:])
             count_sql = ",\n".join(
                 f"(SELECT COUNT(*) FROM iceberg.bronze.{table}_current "
                 f"WHERE league = {league_sql} AND season = {season_sql})"
@@ -623,11 +685,15 @@ def _scope_integrity_summary(scope_spec: str) -> Dict[str, int]:
                         WHERE league = {league_sql} AND season = {season_sql}
                           AND state = 'success' AND batch_id LIKE 'wsp2-%'
                           AND raw_uri IS NOT NULL
+                          AND parser_version = {_sql_string(PARSER_VERSION)}
                     ) WHERE rn = 1
                 )
                 SELECT
                     (SELECT COUNT(*) FROM schedule
                      WHERE has_preview = TRUE
+                       AND date >= CAST(
+                           CURRENT_TIMESTAMP - INTERVAL '48' HOUR AS TIMESTAMP
+                       )
                        AND date <= CAST(
                            CURRENT_TIMESTAMP + INTERVAL '3' HOUR AS TIMESTAMP
                        )),
@@ -636,6 +702,9 @@ def _scope_integrity_summary(scope_spec: str) -> Dict[str, int]:
                      LEFT JOIN latest_preview p
                        ON p.game_id = CAST(s.game_id AS BIGINT)
                      WHERE s.has_preview = TRUE
+                       AND s.date >= CAST(
+                           CURRENT_TIMESTAMP - INTERVAL '48' HOUR AS TIMESTAMP
+                       )
                        AND s.date <= CAST(
                            CURRENT_TIMESTAMP + INTERVAL '3' HOUR AS TIMESTAMP
                        ) AND p.game_id IS NULL),
@@ -644,19 +713,28 @@ def _scope_integrity_summary(scope_spec: str) -> Dict[str, int]:
                     ) AS BIGINT)), 0) FROM latest_preview),
                     (SELECT COUNT(*)
                      FROM iceberg.bronze.whoscored_missing_players_current
-                     WHERE league = {league_sql} AND season = {season_sql}),
+                     WHERE league = {league_sql} AND season = {season_sql}
+                       AND _preview_batch_id IN (
+                           SELECT batch_id FROM latest_preview
+                       )),
                     (SELECT COALESCE(SUM(CAST(json_extract_scalar(
                         json_parse(entity_counts_json), '$.preview_lineups'
                     ) AS BIGINT)), 0) FROM latest_preview),
                     (SELECT COUNT(*)
                      FROM iceberg.bronze.whoscored_preview_lineups_current
-                     WHERE league = {league_sql} AND season = {season_sql}),
+                     WHERE league = {league_sql} AND season = {season_sql}
+                       AND _preview_batch_id IN (
+                           SELECT batch_id FROM latest_preview
+                       )),
                     (SELECT COALESCE(SUM(CAST(json_extract_scalar(
                         json_parse(entity_counts_json), '$.preview_sections'
                     ) AS BIGINT)), 0) FROM latest_preview),
                     (SELECT COUNT(*)
                      FROM iceberg.bronze.whoscored_preview_sections_current
-                     WHERE league = {league_sql} AND season = {season_sql}),
+                     WHERE league = {league_sql} AND season = {season_sql}
+                       AND _preview_batch_id IN (
+                           SELECT batch_id FROM latest_preview
+                       )),
                     (SELECT COUNT(*) FROM latest_preview
                      WHERE dataset_statuses_json IS NULL
                         OR COALESCE(json_size(
@@ -664,13 +742,13 @@ def _scope_integrity_summary(scope_spec: str) -> Dict[str, int]:
                         ), -1) <> 3
                         OR COALESCE(json_extract_scalar(
                             json_parse(dataset_statuses_json), '$.missing_players'
-                        ), 'not_available') = 'not_available'
+                        ), '') NOT IN ('available', 'empty', 'not_available')
                         OR COALESCE(json_extract_scalar(
                             json_parse(dataset_statuses_json), '$.preview_lineups'
-                        ), 'not_available') = 'not_available'
+                        ), '') NOT IN ('available', 'empty', 'not_available')
                         OR COALESCE(json_extract_scalar(
                             json_parse(dataset_statuses_json), '$.preview_sections'
-                        ), 'not_available') = 'not_available')
+                        ), '') NOT IN ('available', 'empty', 'not_available'))
                 """
             )
             preview_row = cur.fetchall()[0]
@@ -754,12 +832,38 @@ def _profile_integrity_summary(scope_specs: Sequence[str]) -> Dict[str, int]:
         try:
             cur.execute(
                 f"""
-                WITH roster AS (
-                    SELECT DISTINCT CAST(player_id AS BIGINT) AS player_id
-                    FROM iceberg.bronze.whoscored_player_roster
-                    WHERE ({" OR ".join(filters)}) AND player_id IS NOT NULL
-                ),
-                latest_success AS (
+                SELECT DISTINCT CAST(player_id AS BIGINT) AS player_id
+                FROM iceberg.bronze.whoscored_player_roster
+                WHERE ({" OR ".join(filters)}) AND player_id IS NOT NULL
+                """
+            )
+            roster = {int(row[0]) for row in cur.fetchall()}
+            cur.execute(
+                f"""
+                SELECT player_id, fetched_at, participations_count
+                FROM (
+                    SELECT m.*, ROW_NUMBER() OVER (
+                        PARTITION BY player_id
+                        ORDER BY COALESCE(
+                            completed_at, fetched_at, _ingested_at
+                        ) DESC, _profile_batch_id DESC, _batch_id DESC
+                    ) AS rn
+                    FROM iceberg.bronze.whoscored_profile_ingest_manifest m
+                    WHERE state = 'success'
+                      AND _profile_batch_id LIKE 'wspr2-%'
+                      AND raw_uri IS NOT NULL
+                      AND payload_sha256 IS NOT NULL
+                      AND parser_version = {_sql_string(PARSER_VERSION)}
+                ) WHERE rn = 1
+                """
+            )
+            latest = {
+                int(player_id): (fetched_at, int(participations_count or 0))
+                for player_id, fetched_at, participations_count in cur.fetchall()
+            }
+            cur.execute(
+                f"""
+                WITH latest_success AS (
                     SELECT * FROM (
                         SELECT m.*, ROW_NUMBER() OVER (
                             PARTITION BY player_id
@@ -774,57 +878,57 @@ def _profile_integrity_summary(scope_specs: Sequence[str]) -> Dict[str, int]:
                           AND payload_sha256 IS NOT NULL
                           AND parser_version = {_sql_string(PARSER_VERSION)}
                     ) WHERE rn = 1
-                ),
-                physical_profiles AS (
-                    SELECT p.player_id
-                    FROM iceberg.bronze.whoscored_player_profile_versions p
-                    JOIN latest_success m
-                      ON m.player_id = p.player_id
-                     AND m._profile_batch_id = p._profile_batch_id
-                     AND m.payload_sha256 = p.payload_sha256
-                     AND m.parser_version = p.parser_version
-                ),
-                physical_participations AS (
-                    SELECT p.player_id
-                    FROM iceberg.bronze.whoscored_player_stage_participations_current p
-                    JOIN roster r ON r.player_id = p.player_id
                 )
-                SELECT
-                    (SELECT COUNT(*) FROM roster),
-                    (SELECT COUNT(*) FROM latest_success m
-                     JOIN roster r ON r.player_id = m.player_id),
-                    (SELECT COUNT(*) FROM physical_profiles p
-                     JOIN roster r ON r.player_id = p.player_id),
-                    (SELECT COUNT(*) FROM roster r
-                     LEFT JOIN latest_success m ON m.player_id = r.player_id
-                     WHERE m.player_id IS NULL),
-                    (SELECT COUNT(*) FROM latest_success m
-                     JOIN roster r ON r.player_id = m.player_id
-                     WHERE COALESCE(
-                         m.fetched_at, TIMESTAMP '1970-01-01 00:00:00'
-                     ) <= CAST(
-                         CURRENT_TIMESTAMP - INTERVAL '{PROFILE_REFRESH_DAYS}' DAY
-                         AS TIMESTAMP
-                     )),
-                    (SELECT COALESCE(SUM(m.participations_count), 0)
-                     FROM latest_success m
-                     JOIN roster r ON r.player_id = m.player_id),
-                    (SELECT COUNT(*) FROM physical_participations)
+                SELECT p.player_id, COUNT(*)
+                FROM iceberg.bronze.whoscored_player_profile_versions p
+                JOIN latest_success m
+                  ON m.player_id = p.player_id
+                 AND m._profile_batch_id = p._profile_batch_id
+                 AND m.payload_sha256 = p.payload_sha256
+                 AND m.parser_version = p.parser_version
+                GROUP BY p.player_id
                 """
             )
-            row = cur.fetchall()[0]
+            physical_profiles = {
+                int(player_id): int(count)
+                for player_id, count in cur.fetchall()
+            }
+            cur.execute(
+                """
+                SELECT CAST(player_id AS BIGINT), COUNT(*)
+                FROM iceberg.bronze.whoscored_player_stage_participations_current
+                WHERE player_id IS NOT NULL
+                GROUP BY player_id
+                """
+            )
+            physical_participations = {
+                int(player_id): int(count)
+                for player_id, count in cur.fetchall()
+            }
         finally:
             cur.close()
     finally:
         conn.close()
+    current_players = roster & latest.keys()
+    cutoff = datetime.utcnow() - timedelta(days=PROFILE_REFRESH_DAYS)
     return {
-        "roster_players": int(row[0] or 0),
-        "current_profile_manifests": int(row[1] or 0),
-        "current_profile_rows": int(row[2] or 0),
-        "uncovered_profiles": int(row[3] or 0),
-        "stale_profiles": int(row[4] or 0),
-        "manifest_participation_rows": int(row[5] or 0),
-        "current_participation_rows": int(row[6] or 0),
+        "roster_players": len(roster),
+        "current_profile_manifests": len(current_players),
+        "current_profile_rows": sum(
+            physical_profiles.get(player_id, 0) for player_id in roster
+        ),
+        "uncovered_profiles": len(roster - latest.keys()),
+        "stale_profiles": sum(
+            fetched_at is None or fetched_at <= cutoff
+            for player_id, (fetched_at, _count) in latest.items()
+            if player_id in roster
+        ),
+        "manifest_participation_rows": sum(
+            latest[player_id][1] for player_id in current_players
+        ),
+        "current_participation_rows": sum(
+            physical_participations.get(player_id, 0) for player_id in roster
+        ),
     }
 
 
@@ -1400,6 +1504,7 @@ with DAG(
             task_id="validate_active_scope",
             python_callable=validate_scope_result,
             trigger_rule="all_done",
+            pool=DQ_POOL,
             execution_timeout=timedelta(minutes=10),
         ).expand(op_kwargs=build_dq.output)
         catalog_dq >> [build_commands, build_dq]
@@ -1427,6 +1532,7 @@ with DAG(
             task_id="validate_active_scopes",
             python_callable=aggregate_traffic_reports,
             trigger_rule="all_done",
+            pool=DQ_POOL,
         )
         catalog_dq >> ingest_scopes >> scope_dq
 
