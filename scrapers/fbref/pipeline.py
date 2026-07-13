@@ -200,6 +200,7 @@ class WaveResult:
     browser_bootstraps: int = 0
     budget_exhausted: bool = False
     requeued_at_budget: int = 0
+    requeued_dead_clearance: int = 0
     failures: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict:
@@ -1006,12 +1007,21 @@ class FBrefPipeline:
                             http_wire_bytes=max(0, int(exc.wire_bytes)),
                             provider_billed_bytes=exc.provider_billed_bytes,
                         )
+                    # A clearance the source stopped honouring says nothing
+                    # about the page: record the attempt, but hand the target
+                    # straight back to the queue instead of failing it.
+                    dead_clearance = (
+                        _clearance_rejected(exc)
+                        and fetcher is not None
+                        and clearance_refreshes < MAX_CLEARANCE_REFRESHES
+                    )
                     self.control.fail_fetch(
                         lease,
                         error_class=exc.error_class,
                         error_message=str(exc),
                         retry_delay_seconds=60,
                         permanent=(exc.error_class == "response_too_large"),
+                        requeue=dead_clearance,
                         http_status=exc.http_status,
                         http_request_count=exc.http_requests,
                         http_status_history=exc.http_status_history,
@@ -1034,14 +1044,7 @@ class FBrefPipeline:
                     result.browser_bootstraps += (
                         exc.browser_bootstrap_attempts
                     )
-                    result.failures.append(
-                        f"{lease.target_id}:{exc.error_class}"
-                    )
-                    if (
-                        _clearance_rejected(exc)
-                        and fetcher is not None
-                        and clearance_refreshes < MAX_CLEARANCE_REFRESHES
-                    ):
+                    if dead_clearance:
                         # Cloudflare stopped honouring this clearance mid-wave
                         # (its exit IP fell out of favour). Every remaining
                         # target would 403 against the same dead session — one
@@ -1050,11 +1053,13 @@ class FBrefPipeline:
                         # a fresh proxy. Bounded: a source that rejects every
                         # clearance must fail the wave, not spawn browsers.
                         clearance_refreshes += 1
+                        result.requeued_dead_clearance += 1
                         logger.warning(
                             "FBref rejected the warm clearance (HTTP %s) — "
-                            "dropping the session and re-solving on a fresh "
-                            "proxy (refresh %d/%d)",
+                            "%s went back to the queue and the session is being "
+                            "re-solved on a fresh proxy (refresh %d/%d)",
                             exc.http_status,
+                            lease.target_id,
                             clearance_refreshes,
                             MAX_CLEARANCE_REFRESHES,
                         )
@@ -1064,6 +1069,10 @@ class FBrefPipeline:
                             session_id, status="failed"
                         )
                         session_id = None
+                    else:
+                        result.failures.append(
+                            f"{lease.target_id}:{exc.error_class}"
+                        )
                 except Exception as exc:
                     if reservation is not None and not budget_settled:
                         self.control.settle_budget(
