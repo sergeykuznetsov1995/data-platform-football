@@ -699,6 +699,12 @@ def _detect_event_type(div) -> str:
             child_classes = [child_classes]
         cls_str = ' '.join(child_classes).lower()
 
+        # A field player taking over in goal after the keeper is sent off.
+        # FBref hides a literal "— Goal" caption inside this event
+        # (`<div style="display: none;">`), which the text fallback below would
+        # otherwise read as a scored goal and inflate the on-field score.
+        if 'becomes_gk' in cls_str or 'becomes-gk' in cls_str:
+            return 'becomes_gk'
         if 'own_goal' in cls_str or 'own-goal' in cls_str:
             return 'own_goal'
         # Missed penalty MUST be checked before the generic 'penalty' branch:
@@ -732,7 +738,15 @@ def _detect_event_type(div) -> str:
         if 'substitute' in cls_str or cls_str.startswith('sub'):
             return 'substitution'
 
-    # Fallback: text-based detection
+    # Fallback: text-based detection.  It may only run when the source
+    # published no event icon at all: an icon we do not recognise must be
+    # reported as such, not guessed from markup that carries hidden captions.
+    if div.find(
+        lambda tag: tag.name in ('div', 'span')
+        and 'event_icon' in (tag.get('class') or [])
+    ):
+        return 'unknown'
+
     text = div.get_text(strip=True).lower()
     if 'penalty' in text or '(pen.)' in text:
         return 'penalty'
