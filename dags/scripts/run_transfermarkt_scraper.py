@@ -1385,11 +1385,11 @@ def _select_player_ids(
     run_key: str,
     allow_state_writes: bool,
     legacy_materialization_required: bool = True,
-) -> Tuple[Optional[List[str]], int, int, List[str]]:
+) -> Tuple[Optional[List[str]], int, int, List[str], Dict[str, int]]:
     roster = _resolve_roster(scraper, league, season)
     if roster is None:
         # Compatibility path: let the legacy scraper resolve its own window.
-        return None, 0, 0, []
+        return None, 0, 0, [], {}
     if not roster:
         raise _EmptyRosterError(
             f'no player ids in Bronze roster for {league}/{season}'
@@ -1503,11 +1503,23 @@ def _select_player_ids(
 
         selected = sorted(candidates, key=_age_key)[:limit]
 
+    # One cycle buys at most ``limit`` careers of a roster that can run to
+    # thousands.  Whoever reads this scope's manifest has to be able to see how
+    # much of the roster it actually covers, or a scope that covered 4% of the
+    # players reads exactly like one that covered all of them.
+    pending = max(0, len(candidates) - len(selected))
+    coverage = {
+        'roster_size': len(roster),
+        'selected': len(selected),
+        'pending': pending,
+    }
     logger.info(
-        'Refresh selection endpoint=%s mode=%s roster=%d selected=%d cache_hits=%d',
-        spec.state_endpoint, refresh_mode, len(roster), len(selected), cache_hits,
+        'Refresh selection endpoint=%s mode=%s roster=%d selected=%d '
+        'cache_hits=%d pending=%d',
+        spec.state_endpoint, refresh_mode, len(roster), len(selected),
+        cache_hits, pending,
     )
-    return selected, cache_hits, seeded, hydrate_ids
+    return selected, cache_hits, seeded, hydrate_ids, coverage
 
 
 def _frame_hash(frame) -> str:
@@ -3045,13 +3057,16 @@ def _run_entity(
         ) as scraper:
             if spec.state_endpoint:
                 checkpoint_spec = spec
-                selected, cache_hits, seeded, career_hydrate_ids = _select_player_ids(
+                (
+                    selected, cache_hits, seeded, career_hydrate_ids, coverage,
+                ) = _select_player_ids(
                     scraper, spec, league, season, int(limit), window_offset,
                     refresh_mode, run_key, allow_state_writes=not dry_run,
                     legacy_materialization_required=legacy_write_enabled,
                 )
                 results['cache_hits'] = cache_hits
                 results['bootstrap_seeded_keys'] = seeded
+                results['roster_coverage'] = coverage
                 if mode == 'native-only':
                     # Post-retention native refresh never needs to reconstruct
                     # a deleted legacy season partition from cached global

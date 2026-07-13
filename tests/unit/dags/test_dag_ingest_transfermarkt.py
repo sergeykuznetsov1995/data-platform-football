@@ -372,6 +372,8 @@ def _write_manifest_and_ledger(module, tmp_path: Path, *, bad_digest=False):
                 team_type='club',
             ),
             'authoritative_empty_evidence': {},
+            'roster_coverage': {},
+            'career_fetches_pending': 0,
             'participant_contract': {
                 'passed': True,
                 'competition_type': 'domestic_league',

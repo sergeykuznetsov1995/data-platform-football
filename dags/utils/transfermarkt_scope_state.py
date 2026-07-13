@@ -213,6 +213,46 @@ class ScopeManifest:
             item.validate()
         self._validate_dq_evidence(expected)
 
+    def _validate_roster_coverage(self, value: Mapping) -> None:
+        """A career entity states how much of the roster this scope holds.
+
+        One cycle buys a bounded window of a roster that runs to thousands, so
+        'complete' alone says nothing about how much of the league is in the
+        slot.  The count travels inside the manifest hash, where it cannot be
+        edited after the fact.
+        """
+        coverage = value['roster_coverage']
+        if not isinstance(coverage, Mapping):
+            raise ScopeManifestError('roster coverage must be a mapping')
+        pending = 0
+        for entity, item in coverage.items():
+            if not isinstance(item, Mapping):
+                raise ScopeManifestError(
+                    f'{entity}: roster coverage must be a mapping'
+                )
+            if set(item) != {'roster_size', 'selected', 'pending'}:
+                raise ScopeManifestError(
+                    f'{entity}: roster coverage has an unbound field set'
+                )
+            for name, number in item.items():
+                if isinstance(number, bool) or not isinstance(number, int):
+                    raise ScopeManifestError(
+                        f'{entity}: roster coverage {name} must be an integer'
+                    )
+                if number < 0:
+                    raise ScopeManifestError(
+                        f'{entity}: roster coverage {name} must not be negative'
+                    )
+            pending += int(item['pending'])
+        declared = value['career_fetches_pending']
+        if isinstance(declared, bool) or not isinstance(declared, int):
+            raise ScopeManifestError('career_fetches_pending must be an integer')
+        if declared != pending:
+            raise ScopeManifestError(
+                f'career_fetches_pending states {declared}, the entities state '
+                f'{pending}'
+            )
+
     def _validate_dq_evidence(self, expected_entities: set[str]) -> None:
         """Recompute the participant contract embedded in the manifest hash."""
 
@@ -221,9 +261,11 @@ class ScopeManifest:
             'status', 'registry_participant_count', 'edition_current',
             'scope_capture', 'entity_statuses', 'entity_contracts',
             'authoritative_empty_evidence', 'participant_contract',
+            'roster_coverage', 'career_fetches_pending',
         }
         if not isinstance(value, Mapping) or set(value) != required:
             raise ScopeManifestError('scope DQ evidence has an unbound field set')
+        self._validate_roster_coverage(value)
         if value['status'] != 'passed':
             raise ScopeManifestError('scope DQ evidence is not green')
         if not isinstance(value['edition_current'], bool):

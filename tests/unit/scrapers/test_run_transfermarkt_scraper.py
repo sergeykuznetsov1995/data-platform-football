@@ -1248,7 +1248,7 @@ class TestRunnerInternals:
             }),
             patch.object(mod, '_persist_fetch_state', return_value=True) as persist,
         ):
-            selected, cache_hits, seeded, hydrate_ids = mod._select_player_ids(
+            selected, cache_hits, seeded, hydrate_ids, _coverage = mod._select_player_ids(
                 RosterScraper(),
                 mod.ENTITY_SPECS['market_value_history'],
                 'ENG-Premier League',
@@ -1329,6 +1329,7 @@ class TestRunnerInternals:
             }),
             patch.object(mod, '_select_player_ids', return_value=(
                 [], 1, 0, ['1'],
+                {'roster_size': 1, 'selected': 0, 'pending': 0},
             )),
             patch.object(mod, '_load_cached_career_frames', return_value={
                 'market_value_points': points,
@@ -1379,7 +1380,7 @@ class TestRunnerInternals:
             }),
             patch.object(mod, '_persist_fetch_state') as persist,
         ):
-            selected, cache_hits, seeded, hydrate_ids = mod._select_player_ids(
+            selected, cache_hits, seeded, hydrate_ids, _coverage = mod._select_player_ids(
                 RosterScraper(),
                 mod.ENTITY_SPECS['market_value_history'],
                 'ENG-Premier League', 2025, 100, 0, 'historical', 'run-1',
@@ -1408,7 +1409,7 @@ class TestRunnerInternals:
             patch.object(mod, '_load_pending_checkpoint', return_value=({}, None)),
             patch.object(mod, '_load_data_derived_state', return_value={}),
         ):
-            selected, cache_hits, seeded, hydrate = mod._select_player_ids(
+            selected, cache_hits, seeded, hydrate, _coverage = mod._select_player_ids(
                 RosterScraper(), mod.ENTITY_SPECS['transfers'],
                 'ENG-Premier League', 2025, 100, 0, 'historical',
                 'native-only-cycle', allow_state_writes=True,
@@ -1904,7 +1905,7 @@ class TestNativeV2RecoverySafety:
             patch.object(mod, '_clear_pending_checkpoint'),
             patch.object(mod, '_load_data_derived_state', return_value={}),
         ):
-            selected, cache_hits, _seeded, _hydrate = mod._select_player_ids(
+            selected, cache_hits, _seeded, _hydrate, _coverage = mod._select_player_ids(
                 RosterScraper(), mod.ENTITY_SPECS['market_value_history'],
                 'ENG-Premier League', 2025, 100, 0, 'current', 'run-1',
                 allow_state_writes=True,
