@@ -35,6 +35,13 @@ import pytest
 
 
 REAL_TM_REGISTRY = importlib.import_module('scrapers.transfermarkt.registry')
+# The stubbed scraper module still has to date a season the way the real one
+# does — the runner and the scraper must never disagree about that again.
+_REAL_TM_SCRAPER = importlib.import_module('scrapers.transfermarkt.scraper')
+REAL_SEASON_HELPERS = {
+    '_season_window': _REAL_TM_SCRAPER._season_window,
+    '_stint_overlaps_season': _REAL_TM_SCRAPER._stint_overlaps_season,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -246,7 +253,9 @@ class TestProductionTrafficCeilings:
     def test_writer_state_rejection_precedes_budget_and_proxy(self):
         mod = _import_runner()
         stub_pkg = MagicMock()
-        stub_scraper_mod = MagicMock(R0_2B_FALLBACK_MARKER='TM_FALLBACK')
+        stub_scraper_mod = MagicMock(
+            R0_2B_FALLBACK_MARKER='TM_FALLBACK', **REAL_SEASON_HELPERS,
+        )
 
         with (
             patch.dict(sys.modules, {
@@ -1312,7 +1321,9 @@ class TestRunnerInternals:
         scraper = CacheScraper()
         stub_pkg = MagicMock()
         stub_pkg.TransfermarktScraper = MagicMock(return_value=scraper)
-        stub_scraper_mod = MagicMock(R0_2B_FALLBACK_MARKER='TM_FALLBACK')
+        stub_scraper_mod = MagicMock(
+            R0_2B_FALLBACK_MARKER='TM_FALLBACK', **REAL_SEASON_HELPERS,
+        )
 
         def committed_outputs(_scraper, spec, frames, _force, results):
             for output in spec.outputs:
@@ -1637,7 +1648,9 @@ class TestRunnerInternals:
         scraper = CacheScraper()
         stub_pkg = MagicMock()
         stub_pkg.TransfermarktScraper = MagicMock(return_value=scraper)
-        stub_scraper_mod = MagicMock(R0_2B_FALLBACK_MARKER='TM_FALLBACK')
+        stub_scraper_mod = MagicMock(
+            R0_2B_FALLBACK_MARKER='TM_FALLBACK', **REAL_SEASON_HELPERS,
+        )
 
         def committed_outputs(_scraper, spec, frames, _force, results):
             for output in spec.outputs:
@@ -2055,3 +2068,86 @@ class TestCoachCacheMergeSeason:
         assert seen['season'] == 2024
         assert seen['season_format'] is SeasonFormat.SINGLE_YEAR
         assert list(frames['legacy_coaches']['coach_id']) == ['10']
+
+
+class TestCoachIdentityFromCachedStints:
+    def test_a_coach_named_only_by_a_cached_history_page_is_still_named(
+        self, monkeypatch,
+    ):
+        """A club's history page is refetched only when its cache ages out, so
+        most clubs' stints come from bronze while profile pages are fetched only
+        for coaches a freshly read page named. The season projection is built
+        from every stint, so it named coaches the profile table had never heard
+        of — and the parity gate failed the scope over the difference.
+        """
+        import pandas as pd
+        from datetime import date
+        from scrapers.transfermarkt.registry import (
+            CompetitionType, SeasonFormat, TeamType, _bootstrap_record,
+        )
+
+        mod = _import_runner()
+        record = _bootstrap_record(
+            competition_id='2DVB',
+            slug='2-division-b',
+            name='Second League Division B',
+            country='Russia',
+            confederation='UEFA',
+            competition_type=CompetitionType.DOMESTIC_LEAGUE,
+            team_type=TeamType.CLUB,
+            season_format=SeasonFormat.SINGLE_YEAR,
+            source_url=(
+                'https://www.transfermarkt.com/2-division-b/startseite/'
+                'wettbewerb/2DVB'
+            ),
+            canonical_competition_id='TM-2DVB',
+        )
+        monkeypatch.setattr(mod, '_competition_record', lambda value: record)
+        monkeypatch.setenv('TM_CANONICAL_SEASON', '2025')
+
+        class _Scraper:
+            _batch_id = 'batch-1'
+
+            def materialize_legacy_coaches(
+                self, profiles, stints, league, season, season_format,
+            ):
+                # The real projection: every in-season stint, bio where known.
+                return pd.DataFrame([
+                    {'coach_id': str(cid)}
+                    for cid in sorted(set(stints['coach_id'].astype(str)))
+                ])
+
+        cached = {
+            # Bronze knows the stint but never had a reason to fetch his bio.
+            'stints': pd.DataFrame([{
+                'club_id': '1', 'coach_id': '77', 'coach_slug': 'old-hand',
+                'name': 'Old Hand', 'role': 'Manager',
+                'appointed_date': date(2025, 3, 1), 'left_date': None,
+            }]),
+            'profiles': pd.DataFrame(
+                columns=['coach_id', 'coach_slug', 'name', 'dob', 'nationality'],
+            ),
+        }
+        fetched = {
+            'stints': pd.DataFrame([{
+                'club_id': '2', 'coach_id': '10', 'coach_slug': 'fresh',
+                'name': 'Fresh', 'role': 'Manager',
+                'appointed_date': date(2025, 2, 1), 'left_date': None,
+            }]),
+            'profiles': pd.DataFrame([{
+                'coach_id': '10', 'coach_slug': 'fresh', 'name': 'Fresh Full',
+                'dob': date(1980, 5, 1), 'nationality': 'Russia',
+            }]),
+        }
+
+        frames = mod._merge_coach_cache_frames(
+            _Scraper(), fetched, cached, 'TM-2DVB', 2024,
+        )
+
+        profiles = frames['profiles'].set_index('coach_id')
+        assert set(profiles.index) == {'10', '77'}
+        assert profiles.loc['77', 'name'] == 'Old Hand'
+        assert pd.isna(profiles.loc['77', 'dob'])   # not a bio, so not reusable
+        assert profiles.loc['10', 'dob'] == date(1980, 5, 1)
+        # Both projections now name the same coaches — which is all parity asks.
+        assert set(frames['legacy_coaches']['coach_id']) == set(profiles.index)
