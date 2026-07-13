@@ -628,7 +628,7 @@ def test_hung_browser_start_kills_only_its_own_browser_processes(monkeypatch):
 
     assert browser.killed and driver.killed
     assert not unrelated.killed
-    assert transport.traffic_stats()["browser_start_timeouts"] == 1
+    assert transport.traffic_stats()["browser_watchdog_kills"] == 1
 
 
 def test_browser_start_watchdog_is_disarmed_once_the_browser_is_up(monkeypatch):
@@ -636,9 +636,10 @@ def test_browser_start_watchdog_is_disarmed_once_the_browser_is_up(monkeypatch):
     timers = []
 
     class _Timer:
-        def __init__(self, interval, function):
+        def __init__(self, interval, function, args=()):
             self.interval = interval
             self.function = function
+            self.args = args
             self.cancelled = False
             self.daemon = False
             timers.append(self)
@@ -702,3 +703,64 @@ def test_fetch_closes_the_session_after_the_budget_aborted_it():
 
     assert transport.fetch("https://fbref.com/en/") is None
     assert stopped == [True]
+
+
+def test_a_wedged_navigation_is_killed_by_the_attempt_deadline(monkeypatch):
+    """Playwright's nav timeout lives in its driver: when a stalled exit IP
+    wedges the driver connection, goto never returns and its own timeout never
+    fires. The attempt deadline kills the browser, which raises out of goto and
+    puts the fetch back on the rotation path instead of hanging the wave."""
+    timers = []
+
+    class _Timer:
+        def __init__(self, interval, function, args=()):
+            self.interval = interval
+            self.function = function
+            self.args = args
+            self.daemon = False
+            self.cancelled = False
+            timers.append(self)
+
+        def start(self):
+            # A wedged call is what the timer exists for: fire immediately.
+            self.function(*self.args)
+
+        def cancel(self):
+            self.cancelled = True
+
+    monkeypatch.setattr(
+        "scrapers.fbref.camoufox_fetch.threading.Timer", _Timer
+    )
+    transport = CamoufoxFbrefTransport(proxy={"server": "http://p:1"})
+    killed = []
+    monkeypatch.setattr(
+        transport, "_kill_browser_processes",
+        lambda phase="start", timeout_s=None: killed.append(phase),
+    )
+    transport._page = MagicMock()
+    transport._page.goto.side_effect = RuntimeError("Target closed")
+    transport._restart = MagicMock()  # type: ignore[method-assign]
+
+    assert transport.fetch("https://fbref.com/en/") is None
+    assert killed and killed[0] == "navigation"
+    assert timers[0].interval == transport.BROWSER_ATTEMPT_TIMEOUT_S
+    assert transport._restart.call_count == transport.MAX_PROXY_ROTATIONS
+
+
+def test_a_wedged_solve_is_killed_by_the_attempt_deadline(monkeypatch):
+    """The solve loop checks its own deadline between polls — but a wedged
+    evaluate() blocks before the check. The killed browser must surface as a
+    failed attempt, not as an exception out of fetch."""
+    monkeypatch.setattr(
+        "scrapers.fbref.camoufox_fetch.threading.Timer",
+        lambda interval, function, args=(): MagicMock(),
+    )
+    transport = CamoufoxFbrefTransport(proxy={"server": "http://p:1"})
+    transport._page = MagicMock()
+    transport._solve_current_page = MagicMock(  # type: ignore[method-assign]
+        side_effect=RuntimeError("Target closed")
+    )
+    transport._restart = MagicMock()  # type: ignore[method-assign]
+
+    assert transport.fetch("https://fbref.com/en/") is None
+    assert transport._restart.call_count == transport.MAX_PROXY_ROTATIONS

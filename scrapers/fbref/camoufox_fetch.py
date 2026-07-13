@@ -31,6 +31,7 @@ import os
 import threading
 import time
 from collections import Counter
+from contextlib import contextmanager
 from typing import Callable, Dict, Optional
 
 from scrapers.fbref.constants import FBREF_UNCOMMENT_TABLES_JS
@@ -168,6 +169,14 @@ class CamoufoxFbrefTransport:
     # A healthy launch (Firefox start plus the geoip lookup through the proxy)
     # completes in seconds.
     BROWSER_START_TIMEOUT_S = 120.0
+    # Playwright's own timeouts (nav_timeout_ms, and the poll deadline in
+    # _solve_current_page) only fire while its driver still answers.  A proxy
+    # that stalls mid-navigation can wedge the driver connection itself: goto
+    # never returns, its timeout never fires, and the solve loop's evaluate()
+    # blocks before it can check its deadline.  Bound the whole attempt —
+    # navigation plus solve — with a deadline of our own; killing the browser
+    # is what makes the blocked call raise, back into the rotation path.
+    BROWSER_ATTEMPT_TIMEOUT_S = 240.0
 
     def __init__(
         self,
@@ -217,7 +226,7 @@ class CamoufoxFbrefTransport:
         self._requests_count = 0
         self._network_requests_started = 0
         self._browser_start_attempts = 0
-        self._browser_start_timeouts = 0
+        self._browser_watchdog_kills = 0
         self._navigation_attempts = 0
         self._budget_blocked_count = 0
         self._inflight_byte_reservations: Dict[int, int] = {}
@@ -299,17 +308,10 @@ class CamoufoxFbrefTransport:
         # The launch itself is unbounded (see BROWSER_START_TIMEOUT_S), so kill
         # the browser it spawned if it overruns: Playwright then raises out of
         # the launch and the caller rotates onto a fresh exit IP.
-        watchdog = threading.Timer(
-            self.BROWSER_START_TIMEOUT_S, self._kill_browser_processes
-        )
-        watchdog.daemon = True
-        watchdog.start()
-        try:
+        with self._browser_deadline(self.BROWSER_START_TIMEOUT_S, "start"):
             self._cm = Camoufox(**kwargs)
             self._browser = self._cm.__enter__()
             self._page = self._browser.new_page()
-        finally:
-            watchdog.cancel()
         if (
             self._block_resources
             or self._max_network_requests is not None
@@ -324,11 +326,26 @@ class CamoufoxFbrefTransport:
         logger.info("Camoufox session started (proxy=%s, humanize=%s)",
                     server, self._humanize)
 
-    def _kill_browser_processes(self) -> None:
+    @contextmanager
+    def _browser_deadline(self, timeout_s: float, phase: str):
+        """Bound a blocking Playwright call: on overrun, kill the browser."""
+        watchdog = threading.Timer(
+            timeout_s, self._kill_browser_processes, args=(phase, timeout_s)
+        )
+        watchdog.daemon = True
+        watchdog.start()
+        try:
+            yield
+        finally:
+            watchdog.cancel()
+
+    def _kill_browser_processes(
+        self, phase: str = "start", timeout_s: Optional[float] = None
+    ) -> None:
         """Kill the browser processes this transport spawned, and only those.
 
         Runs on a watchdog thread, so it must not touch Playwright objects:
-        killing the processes is what makes the blocked launch call raise.
+        killing the processes is what makes the blocked call raise.
         """
         import psutil
 
@@ -346,11 +363,13 @@ class CamoufoxFbrefTransport:
             except psutil.Error:
                 continue
         if killed:
-            self._browser_start_timeouts += 1
+            self._browser_watchdog_kills += 1
             logger.warning(
-                "Camoufox start exceeded %.0fs (dead exit IP?) — killed %d "
+                "Camoufox %s exceeded %.0fs (stalled exit IP?) — killed %d "
                 "browser process(es) to force a proxy rotation",
-                self.BROWSER_START_TIMEOUT_S,
+                phase,
+                timeout_s if timeout_s is not None
+                else self.BROWSER_START_TIMEOUT_S,
                 killed,
             )
 
@@ -828,10 +847,13 @@ class CamoufoxFbrefTransport:
                 # Count before goto: timeouts and interrupted navigations still
                 # consumed a browser/proxy attempt.
                 self._navigation_attempts += 1
-                self._page.goto(
-                    url, wait_until="domcontentloaded",
-                    timeout=self._nav_timeout_ms,
-                )
+                with self._browser_deadline(
+                    self.BROWSER_ATTEMPT_TIMEOUT_S, "navigation"
+                ):
+                    self._page.goto(
+                        url, wait_until="domcontentloaded",
+                        timeout=self._nav_timeout_ms,
+                    )
             except Exception as e:  # noqa: BLE001 — browser/network boundary
                 logger.warning("Camoufox goto failed (attempt %d): %s",
                                attempt + 1, e)
@@ -849,7 +871,19 @@ class CamoufoxFbrefTransport:
 
             # CF challenge counters live in _solve_current_page — only navs
             # that actually surfaced a challenge shell count as attempts.
-            html = self._solve_current_page()
+            try:
+                with self._browser_deadline(
+                    self.BROWSER_ATTEMPT_TIMEOUT_S, "challenge solve"
+                ):
+                    html = self._solve_current_page()
+            except Exception as e:  # noqa: BLE001 — killed browser raises here
+                logger.warning("Camoufox solve failed (attempt %d): %s",
+                               attempt + 1, e)
+                if self._byte_budget_exhausted:
+                    break
+                if attempt < self.MAX_PROXY_ROTATIONS:
+                    self._lifecycle_action(self._restart, 'restart')
+                continue
             if html is not None:
                 self._pages_this_session += 1
                 self._record_proxy_result(True)
@@ -917,7 +951,7 @@ class CamoufoxFbrefTransport:
                 self._browser_start_attempts, self._navigation_attempts
             ),
             "browser_start_attempts": self._browser_start_attempts,
-            "browser_start_timeouts": self._browser_start_timeouts,
+            "browser_watchdog_kills": self._browser_watchdog_kills,
             "browser_navigation_attempts": self._navigation_attempts,
             "budget_blocked_count": self._budget_blocked_count,
             "inflight_reserved_bytes": self._inflight_reserved_bytes,
