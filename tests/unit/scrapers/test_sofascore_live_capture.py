@@ -79,6 +79,7 @@ def _stats(
     allocation=None,
     base_run_id="run-1",
     workload_phase="targets",
+    upstream_repins=0,
 ):
     allocation = allocation or WorkloadAllocation(
         allocation_id="alloc-" + "1" * 32,
@@ -128,6 +129,7 @@ def _stats(
         phase_plan_digest=(plan_digest if source == "sofascore" else ""),
         parent_run_cap_bytes=(dagrun_budget_bytes if source == "sofascore" else 0),
         parent_run_spent_provider_bytes=(total if source == "sofascore" else 0),
+        upstream_repins=upstream_repins,
     )
 
 
@@ -473,17 +475,103 @@ def test_stats_provenance_mismatch_closes_lease(field, value, tmp_path):
 
 
 def test_sticky_upstream_fingerprint_cannot_change_mid_lease(tmp_path):
+    # #946 deliberately relaxes the sticky rule: the residential fingerprint may
+    # drift when the proxy's dead-exit failover re-pinned the upstream, which is
+    # proven by a strictly increased ``upstream_repins`` counter (the filter
+    # re-pins only before the first provider down-byte).  A drift WITHOUT that
+    # increment — here the proxy never reported a re-pin (repins stays 0) — is
+    # still a fatal accounting violation; that invariant is what this guards.
     runtime, _ = _runtime(tmp_path)
 
     class DriftingClient(_LeaseClient):
         def stats(self, lease):
             self.stats_calls += 1
-            return self._stats(
-                0,
-                fingerprint=("f" if self.stats_calls == 1 else "e") * 16,
-            )
+            if self.stats_calls == 1:
+                return self._stats(0, fingerprint="f" * 16)
+            return self._stats(100, fingerprint="e" * 16)
 
     client = DriftingClient([], final_total=0)
+    capture = _Capture([_record(b'{"items":[]}')])
+    factory = _TransportFactory(client, capture)
+
+    # capture_engine masks the transport's typed error as "untyped paid transport
+    # failure"; the invariant under test is simply that the drift fails closed.
+    with pytest.raises(BudgetAccountingError):
+        capture_live_specs(
+            runtime,
+            [_spec(1)],
+            canonical_url="https://www.sofascore.com/event/1",
+            scope="ENG-Premier League:2526",
+            entity="match_capture",
+            transport_factory=factory,
+        )
+
+    assert client.close_calls == 1
+    assert capture.enter_calls == 0
+
+
+def test_transparent_mid_request_failover_is_accepted_by_repins_increment(tmp_path):
+    # Realistic timeline of the proxy's transparent dead-exit failover: the
+    # first tunnel (and thus the only possible re-pin) happens INSIDE request(),
+    # after the `before` stats call.  The client therefore first observes the
+    # drifted fingerprint at finish_endpoint, when down_bytes is already > 0
+    # (the successful attempt billed the response head).  The strictly increased
+    # ``upstream_repins`` counter is the proof that the re-pin happened before
+    # the first provider byte, so the run must succeed.
+    runtime, _ = _runtime(tmp_path)
+
+    class MidRequestFailoverClient(_LeaseClient):
+        # call 1 = __enter__ stats, call 2 = request `before` stats: both see
+        # the ORIGINAL exit A with down_bytes == 0 and no re-pin yet.
+        def stats(self, lease):
+            self.stats_calls += 1
+            return self._stats(0, fingerprint="a" * 16, upstream_repins=0)
+
+        # The browser launch + warm inside this request triggered the proxy's
+        # dead-exit re-pin; the successful attempt billed bytes on exit B.
+        def finish_endpoint(self, lease, request_id):
+            return self._stats(120, fingerprint="b" * 16, upstream_repins=1)
+
+        def close(self, lease, **kwargs):
+            self.close_calls += 1
+            return self._stats(
+                120, closed=True, fingerprint="b" * 16, upstream_repins=1
+            )
+
+    client = MidRequestFailoverClient([], final_total=120)
+    capture = _Capture([_record(b'{"items":[{"id":1}]}')])
+    factory = _TransportFactory(client, capture)
+
+    results, traffic = capture_live_specs(
+        runtime,
+        [_spec(1)],
+        canonical_url="https://www.sofascore.com/event/1",
+        scope="ENG-Premier League:2526",
+        entity="match_capture",
+        transport_factory=factory,
+    )
+
+    assert len(results) == 1
+    assert client.close_calls == 1
+    assert capture.enter_calls == 1  # transparent proxy failover, no relaunch
+    assert traffic["provider_total_bytes"] == 120
+
+
+def test_upstream_drift_without_repins_increment_is_fatal(tmp_path):
+    # The re-pin counter being PRESENT is not enough: a drift is legal only when
+    # the counter strictly increased since the last observation.  Here repins is
+    # already 1 when the fingerprint latches, and the drifted stats report the
+    # same 1 — no new failover happened, so the drift must fail closed.
+    runtime, _ = _runtime(tmp_path)
+
+    class StaleRepinsClient(_LeaseClient):
+        def stats(self, lease):
+            self.stats_calls += 1
+            if self.stats_calls == 1:
+                return self._stats(0, fingerprint="a" * 16, upstream_repins=1)
+            return self._stats(100, fingerprint="b" * 16, upstream_repins=1)
+
+    client = StaleRepinsClient([], final_total=0)
     capture = _Capture([_record(b'{"items":[]}')])
     factory = _TransportFactory(client, capture)
 
@@ -905,3 +993,173 @@ def test_exit_hash_rejects_non_ip_without_echoing_value(value):
         hash_proxy_exit(value)
     if value:
         assert value not in str(captured.value)
+
+
+# --------------------------------------------------------------------------- #
+#  dead residential exit → retryable relaunch (#946)                          #
+# --------------------------------------------------------------------------- #
+def test_dead_exit_launch_failure_is_retryable_and_relaunches_browser(tmp_path):
+    from scrapers.sofascore.camoufox_capture import ProxyConnectivityError
+
+    class _DeadExitLaunchCapture(_Capture):
+        def __enter__(self):
+            self.enter_calls += 1
+            if self.enter_calls == 1:
+                raise ProxyConnectivityError("residential exit refused the CONNECT")
+            return self
+
+    runtime, _ = _runtime(tmp_path)
+    client = _LeaseClient([0, 0, 0, 0, 120], final_total=120)
+    capture = _DeadExitLaunchCapture([_record(b'{"items":[{"id":1}]}')])
+    factory = _TransportFactory(client, capture)
+
+    results, traffic = capture_live_specs(
+        runtime,
+        [_spec(1)],
+        canonical_url="https://www.sofascore.com/event/1",
+        scope="ENG-Premier League:2526",
+        entity="match_capture",
+        transport_factory=factory,
+    )
+
+    assert len(results) == 1
+    assert capture.enter_calls == 2  # first launch died, second succeeded
+    assert traffic["browser_sessions"] == 2
+    assert traffic["provider_total_bytes"] == 120
+
+
+def test_dead_exit_warm_timeout_is_retryable_and_tears_down_browser(tmp_path):
+    from scrapers.sofascore.camoufox_capture import ProxyConnectivityError
+
+    class _DeadExitWarmCapture(_Capture):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.exit_calls_at_relaunch = None
+
+        def __enter__(self):
+            if self.enter_calls >= 1:  # the relaunch
+                self.exit_calls_at_relaunch = self.exit_calls
+            return super().__enter__()
+
+        def warm_exact_json(self, url):
+            self._request()
+            self.warm_calls += 1
+            self._navigation_count += 1
+            if self.warm_calls == 1:
+                raise ProxyConnectivityError("exit timed out before anchor loaded")
+
+    runtime, _ = _runtime(tmp_path)
+    client = _LeaseClient([0, 0, 0, 0, 120], final_total=120)
+    capture = _DeadExitWarmCapture([_record(b'{"items":[{"id":1}]}')])
+    factory = _TransportFactory(client, capture)
+
+    results, _ = capture_live_specs(
+        runtime,
+        [_spec(1)],
+        canonical_url="https://www.sofascore.com/event/1",
+        scope="ENG-Premier League:2526",
+        entity="match_capture",
+        transport_factory=factory,
+    )
+
+    assert len(results) == 1
+    assert capture.enter_calls == 2
+    assert capture.warm_calls == 2
+    # The dead browser was torn down before the relaunch (exit_calls was 1 at the
+    # moment the second __enter__ ran).
+    assert capture.exit_calls_at_relaunch == 1
+
+
+def test_dead_browser_runtime_is_not_retried(tmp_path):
+    class _DeadBrowserRuntimeCapture(_Capture):
+        def __enter__(self):
+            self.enter_calls += 1
+            raise RuntimeError("Sync API inside the asyncio loop")
+
+    runtime, _ = _runtime(tmp_path)
+    client = _LeaseClient([0, 0, 0], final_total=0)
+    capture = _DeadBrowserRuntimeCapture([_record(b'{"items":[{"id":1}]}')])
+    factory = _TransportFactory(client, capture)
+
+    with pytest.raises(RuntimeError, match="did not reach a publishable state"):
+        capture_live_specs(
+            runtime,
+            [_spec(1)],
+            canonical_url="https://www.sofascore.com/event/1",
+            scope="ENG-Premier League:2526",
+            entity="match_capture",
+            transport_factory=factory,
+        )
+
+    assert capture.enter_calls == 1  # a broken runtime is not retried
+
+
+def test_dead_exit_retry_accepts_drifted_fingerprint_with_repins_increment(tmp_path):
+    # Full recovery flow when the proxy's own failover also failed (all its
+    # attempts hit dead exits → client-facing 502 → ProxyConnectivityError):
+    # attempt 1 fails against exit A, the proxy has already re-pinned to exit B
+    # (repins=1, still no down byte), and attempt 2 observes the drifted
+    # fingerprint B.  The repins increment proves the pre-data failover, so the
+    # retry must relaunch the browser and succeed on exit B.
+    from scrapers.sofascore.camoufox_capture import ProxyConnectivityError
+
+    class _DeadExitLaunchCapture(_Capture):
+        def __enter__(self):
+            self.enter_calls += 1
+            if self.enter_calls == 1:
+                raise ProxyConnectivityError("residential exit refused the CONNECT")
+            return self
+
+    class RepinningClient(_LeaseClient):
+        # (total, fingerprint, repins) per meter observation, in call order:
+        # __enter__, request1 before, request1 failure finish_endpoint,
+        # request2 before, request2 success finish_endpoint.
+        _timeline = [
+            (0, "a" * 16, 0),
+            (0, "a" * 16, 0),
+            (0, "b" * 16, 1),
+            (0, "b" * 16, 1),
+            (120, "b" * 16, 1),
+        ]
+
+        def _next_stats(self, *, closed=False):
+            total, fingerprint, repins = self._timeline[
+                min(self.stats_calls, len(self._timeline)) - 1
+            ]
+            return self._stats(
+                total,
+                closed=closed,
+                fingerprint=fingerprint,
+                upstream_repins=repins,
+            )
+
+        def stats(self, lease):
+            self.stats_calls += 1
+            return self._next_stats()
+
+        def finish_endpoint(self, lease, request_id):
+            self.stats_calls += 1
+            return self._next_stats()
+
+        def close(self, lease, **kwargs):
+            self.close_calls += 1
+            self.stats_calls += 1
+            return self._next_stats(closed=True)
+
+    runtime, _ = _runtime(tmp_path)
+    client = RepinningClient([], final_total=120)
+    capture = _DeadExitLaunchCapture([_record(b'{"items":[{"id":1}]}')])
+    factory = _TransportFactory(client, capture)
+
+    results, traffic = capture_live_specs(
+        runtime,
+        [_spec(1)],
+        canonical_url="https://www.sofascore.com/event/1",
+        scope="ENG-Premier League:2526",
+        entity="match_capture",
+        transport_factory=factory,
+    )
+
+    assert len(results) == 1
+    assert capture.enter_calls == 2  # dead-exit launch retried with a new dial
+    assert traffic["provider_total_bytes"] == 120

@@ -21,6 +21,57 @@ from scrapers.sofascore._flatten import _auto_flatten
 
 logger = logging.getLogger(__name__)
 
+
+class ProxyConnectivityError(RuntimeError):
+    """The residential exit did not answer; the browser runtime is still alive.
+
+    A dead exit accepts the TCP CONNECT and then goes silent, so the failure is
+    transient: the same lease can be retried with a fresh dial (the proxy re-pins
+    the upstream once no provider byte has arrived).  Unlike a broken browser
+    runtime, it is deliberately retryable, so callers translate the underlying
+    ``InvalidProxy`` / timeout / ``NS_ERROR_*`` shapes into this type.
+    """
+
+
+# Class names (matched anywhere in the MRO) and Firefox network error codes that
+# denote an unreachable/silent residential exit.  Names — not free-form messages
+# — keep the classifier from importing playwright/camoufox in unit tests.
+_PROXY_CONNECTIVITY_EXCEPTION_NAMES = frozenset({"InvalidProxy", "TimeoutError"})
+_PROXY_CONNECTIVITY_NS_CODES = (
+    "NS_ERROR_PROXY_CONNECTION_REFUSED",
+    "NS_ERROR_NET_TIMEOUT",
+)
+
+
+def _as_proxy_connectivity_error(exc: BaseException) -> "ProxyConnectivityError | None":
+    """Return a ProxyConnectivityError if ``exc`` (or a linked cause) is a dead-
+    exit connectivity failure, else ``None``.
+
+    The exception chain (``exc`` → ``__cause__`` → ``__context__``) is walked
+    with cycle protection.  A link matches when its class name is in the
+    allowlist, when it already is a :class:`ProxyConnectivityError` (idempotent),
+    or when an ``NS_ERROR_*`` code appears in ``str(link)``.  Free-form messages
+    are never matched, so the origin-proof RuntimeError stays fatal.
+    """
+    seen: set[int] = set()
+    link: BaseException | None = exc
+    while link is not None and id(link) not in seen:
+        seen.add(id(link))
+        if isinstance(link, ProxyConnectivityError):
+            return link
+        names = {cls.__name__ for cls in type(link).__mro__}
+        if names & _PROXY_CONNECTIVITY_EXCEPTION_NAMES:
+            return ProxyConnectivityError(
+                f"residential exit unreachable ({type(link).__name__})"
+            )
+        if any(code in str(link) for code in _PROXY_CONNECTIVITY_NS_CODES):
+            return ProxyConnectivityError(
+                "residential exit unreachable (NS proxy error)"
+            )
+        link = link.__cause__ or link.__context__
+    return None
+
+
 BASE = "https://www.sofascore.com"
 _API_PATH = "/api/v1/"
 _EXACT_ANCHOR_URL = f"{BASE}/"
@@ -380,6 +431,12 @@ class SofascoreCamoufoxCapture:
                 logger.warning("Camoufox teardown after failed start also failed",
                                exc_info=True)
             self._cm = None
+            # A dead residential exit (InvalidProxy / timeout) is retryable; the
+            # browser runtime itself is fine.  Surface it as such so the live
+            # transport relaunches instead of latching the session broken (#946).
+            translated = _as_proxy_connectivity_error(e)
+            if translated is not None:
+                raise translated from e
             raise
         return self
 
@@ -601,11 +658,20 @@ class SofascoreCamoufoxCapture:
             raise ValueError("SofaScore anchor must be canonical official HTTPS")
         source_before = self._source_request_count
         self._navigation_count += 1
-        response = self._page.goto(
-            url,
-            wait_until="domcontentloaded",
-            timeout=self._nav_timeout_ms,
-        )
+        try:
+            response = self._page.goto(
+                url,
+                wait_until="domcontentloaded",
+                timeout=self._nav_timeout_ms,
+            )
+        except BaseException as e:
+            # A silent exit surfaces here as a proxy-connection/timeout error;
+            # the origin-proof failure below is a plain RuntimeError and is left
+            # fatal (never translated).
+            translated = _as_proxy_connectivity_error(e)
+            if translated is not None:
+                raise translated from e
+            raise
         status = int(response.status) if response is not None else 0
         final_url_evidence = _anchor_url_evidence(
             response.url if response is not None else None

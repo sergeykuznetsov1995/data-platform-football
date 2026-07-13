@@ -122,6 +122,10 @@ class SofascoreLeaseStats:
     phase_plan_digest: str
     parent_run_cap_bytes: int
     parent_run_spent_provider_bytes: int
+    # Times the filter re-pinned the lease's residential exit before its first
+    # provider byte (#946 dead-exit failover).  Defaults to 0 when the proxy
+    # predates the field, which keeps any fingerprint drift fail-closed.
+    upstream_repins: int = 0
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any]) -> "SofascoreLeaseStats":
@@ -232,6 +236,13 @@ class SofascoreLeaseStats:
             or raw_batch_index < (-1 if source == "sofascore_canary" else 0)
         ):
             raise SofascoreLeaseProtocolError("invalid allocation batch index in stats")
+        raw_upstream_repins = payload.get("upstream_repins", 0)
+        if (
+            isinstance(raw_upstream_repins, bool)
+            or not isinstance(raw_upstream_repins, int)
+            or raw_upstream_repins < 0
+        ):
+            raise SofascoreLeaseProtocolError("invalid upstream re-pin count in stats")
         parent_run_cap_bytes = integer("parent_run_cap_bytes")
         parent_run_spent_provider_bytes = integer("parent_run_spent_provider_bytes")
         if source == "sofascore" and (
@@ -277,6 +288,7 @@ class SofascoreLeaseStats:
             phase_plan_digest=phase_plan_digest,
             parent_run_cap_bytes=parent_run_cap_bytes,
             parent_run_spent_provider_bytes=parent_run_spent_provider_bytes,
+            upstream_repins=raw_upstream_repins,
         )
 
 

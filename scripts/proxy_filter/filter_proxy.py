@@ -33,6 +33,7 @@ import hashlib
 import ipaddress
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -132,6 +133,14 @@ MAX_LEDGER_EVENT_BYTES = 256 * 1024
 MAX_ALLOCATION_WAL_EVENT_BYTES = 4 * 1024 * 1024
 MAX_CONTROL_BODY_BYTES = 4 * 1024 * 1024
 MAX_PROVIDER_RESPONSE_HEAD_BYTES = 64 * 1024
+# A dead residential exit accepts the TCP CONNECT and then goes silent.  Without
+# these bounds the lease's only tunnel hangs forever (byte-metered head read),
+# never drains ``active_tunnels`` and latches the single serial SofaScore slot
+# (#946).  The connect/head reads are bounded, and a re-pin to a fresh exit is
+# allowed only before the first provider byte has been billed.
+LEASE_UPSTREAM_CONNECT_TIMEOUT_SECONDS = 5.0
+LEASE_PROVIDER_HEAD_TIMEOUT_SECONDS = 4.0
+LEASE_UPSTREAM_FAILOVER_ATTEMPTS = 2
 SOFASCORE_CANARY_EXIT_PROBE_HOST = "api.ipify.org"
 CONTROL_TOKEN = ""
 SOFASCORE_ALLOCATION_LEDGER: AllocationLedger | None = None
@@ -170,6 +179,28 @@ class ProxyPoolConfigurationError(ValueError):
 
 class _DuplicateJsonField(ValueError):
     """Internal marker for duplicate JSON object fields."""
+
+
+class UpstreamHeadTimeout(RuntimeError):
+    """The residential upstream accepted the CONNECT but never sent a head."""
+
+
+class UpstreamHeadIncomplete(RuntimeError):
+    """The residential upstream closed before a complete response head arrived."""
+
+
+class _LeaseBudgetRefused(Exception):
+    """Internal marker: a lease write was refused by its own byte budget.
+
+    Distinct from a dead-exit failure — the upstream is fine, the lease is out
+    of allowance — so it must surface as the existing 429, never a failover.
+    """
+
+
+# Test seam for the residential dial.  Every point that opens an upstream
+# connection goes through this name so the connect can be bounded and, for a
+# lease, retargeted to a fresh exit without touching the pool selection logic.
+_open_upstream_connection = asyncio.open_connection
 
 
 def _dagrun_budget_bytes(dag_id: str) -> int:
@@ -261,6 +292,7 @@ class Lease:
     down_bytes: int = 0
     reserved_bytes: int = 0
     active_tunnels: int = 0
+    upstream_repins: int = 0
     closed: bool = False
     close_recorded: bool = False
     budget_exceeded: bool = False
@@ -290,6 +322,7 @@ class Lease:
             "total_bytes": self.total_bytes,
             "active_tunnels": self.active_tunnels,
             "reserved_bytes": self.reserved_bytes,
+            "upstream_repins": self.upstream_repins,
             "closed": self.closed,
             "expired": self.expired,
             "budget_exceeded": self.budget_exceeded,
@@ -1781,6 +1814,7 @@ async def _read_metered_provider_head(
     reader: asyncio.StreamReader,
     lease: Lease,
     host: str,
+    timeout_seconds: float | None = None,
 ) -> tuple[bytes, list[bytes]]:
     """Read an upstream HTTP response head without crossing a paid budget.
 
@@ -1788,6 +1822,12 @@ async def _read_metered_provider_head(
     response one byte at a time under one pre-reserved window is deliberate:
     CONNECT heads are small, and this guarantees that even a maliciously large
     header cannot be read (and billed) past the daily/DagRun/lease boundary.
+
+    ``timeout_seconds`` bounds a silent exit that accepts the CONNECT but never
+    replies (#946).  The deadline is enforced *per read* from inside this
+    function — never as an external ``wait_for`` around the whole call — so a
+    cancellation cannot abandon the partial-byte accounting below.  With
+    ``timeout_seconds=None`` the behaviour is byte-for-byte unchanged.
     """
     reservation = _reserve_lease_bytes(
         lease,
@@ -1798,9 +1838,24 @@ async def _read_metered_provider_head(
         raise RuntimeError("provider budget exhausted before response head")
     payload = bytearray()
     complete = False
+    timed_out = False
+    deadline = (
+        None if timeout_seconds is None else time.monotonic() + timeout_seconds
+    )
     try:
         while len(payload) < reservation:
-            item = await reader.read(1)
+            if deadline is None:
+                item = await reader.read(1)
+            else:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    break
+                try:
+                    item = await asyncio.wait_for(reader.read(1), remaining)
+                except (asyncio.TimeoutError, TimeoutError):
+                    timed_out = True
+                    break
             if not item:
                 break
             payload.extend(item)
@@ -1811,9 +1866,15 @@ async def _read_metered_provider_head(
         _release_lease_reservation(lease, reservation)
     if payload:
         _account_lease_bytes(lease, host, "down", len(payload))
+    if timed_out:
+        raise UpstreamHeadTimeout("provider response head timed out")
     if not complete:
-        lease.budget_exceeded = len(payload) >= reservation
-        raise RuntimeError("incomplete or over-budget provider response head")
+        if len(payload) >= reservation:
+            lease.budget_exceeded = True
+            raise RuntimeError("incomplete or over-budget provider response head")
+        raise UpstreamHeadIncomplete(
+            "provider closed before a complete response head"
+        )
     lines = bytes(payload).splitlines(keepends=True)
     if not lines:
         raise RuntimeError("empty provider response head")
@@ -2339,6 +2400,102 @@ async def _write_upstream(
     return True
 
 
+async def _open_lease_upstream_tunnel(
+    lease: Lease,
+    mgr,
+    *,
+    target: str,
+    host: str,
+) -> tuple[asyncio.StreamReader, asyncio.StreamWriter, bytes, list[bytes]]:
+    """Open the lease's CONNECT tunnel, failing over a silent residential exit.
+
+    A dead exit accepts the TCP connection and then never answers the CONNECT.
+    Each attempt dials the lease's currently-pinned exit, sends the CONNECT head
+    (its up-bytes are metered even against a dead exit) and reads the metered
+    response head under a deadline.  On a connect/write/head failure the exit is
+    re-pinned to a fresh pool entry — but only before the first *down* byte is
+    billed (``down_bytes == 0``): the up-bytes already charged to the dead exit
+    make the running total unusable as the failover gate.  Every failed attempt
+    closes its socket and unregisters it from ``tunnel_writers``.  Credentials
+    and ``host:port`` are never logged — only non-reversible fingerprint hashes.
+    """
+    last_error: BaseException | None = None
+    for _attempt in range(1 + LEASE_UPSTREAM_FAILOVER_ATTEMPTS):
+        up_host, up_port, up_user, up_pass = lease.upstream
+        srv_w = None
+        try:
+            srv_r, srv_w = await asyncio.wait_for(
+                _open_upstream_connection(up_host, up_port),
+                LEASE_UPSTREAM_CONNECT_TIMEOUT_SECONDS,
+            )
+            lease.tunnel_writers.add(srv_w)
+            auth = base64.b64encode(f"{up_user}:{up_pass}".encode()).decode()
+            connect_request = (
+                f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n"
+                f"Proxy-Authorization: Basic {auth}\r\n\r\n".encode()
+            )
+            # An OSError here (exit accepts, then RSTs the CONNECT write) is
+            # failover-eligible like a silent head; a budget refusal is not.
+            if not await _write_upstream(
+                srv_w, connect_request, lease=lease, host=host, direction="up"
+            ):
+                raise _LeaseBudgetRefused()
+            status, response_headers = await _read_metered_provider_head(
+                srv_r,
+                lease,
+                host,
+                timeout_seconds=LEASE_PROVIDER_HEAD_TIMEOUT_SECONDS,
+            )
+            return srv_r, srv_w, status, response_headers
+        except BaseException as exc:
+            # No failed attempt may leak its socket or its tunnel_writers entry.
+            if srv_w is not None:
+                try:
+                    srv_w.close()
+                except Exception:  # noqa: BLE001 - exit is already dead
+                    pass
+                lease.tunnel_writers.discard(srv_w)
+            if not isinstance(
+                exc,
+                (
+                    asyncio.TimeoutError,
+                    TimeoutError,
+                    OSError,
+                    UpstreamHeadTimeout,
+                    UpstreamHeadIncomplete,
+                ),
+            ):
+                # Budget refusals (429), over-budget heads and cancellation are
+                # not dead-exit signals: never failover, surface them as before.
+                raise
+            last_error = exc
+        # Reached only on a connect/write/head failure: re-pin a fresh exit
+        # while no provider byte has yet been received on this lease, and retry.
+        if (
+            lease.down_bytes == 0
+            and lease.usable
+            and _attempt < LEASE_UPSTREAM_FAILOVER_ATTEMPTS
+        ):
+            previous = lease.upstream
+            # The pool draw is random: re-draw (bounded) so the replacement is
+            # not the exit that just failed, unless the pool has nothing else.
+            candidate = _pick_upstream(mgr)
+            for _redraw in range(5):
+                if candidate != previous:
+                    break
+                candidate = _pick_upstream(mgr)
+            lease.upstream = candidate
+            lease.upstream_repins += 1
+            log.warning(
+                "lease %s residential exit unreachable; failing over %s -> %s",
+                lease.lease_id,
+                _upstream_fingerprint(previous),
+                _upstream_fingerprint(lease.upstream),
+            )
+            continue
+        raise last_error
+
+
 async def handle(
     client_r: asyncio.StreamReader,
     client_w: asyncio.StreamWriter,
@@ -2427,26 +2584,47 @@ async def handle(
         try:
             if method == "CONNECT":
                 conn_count[host] += 1
-                srv_r, srv_w = await asyncio.open_connection(up_host, up_port)
                 if lease is not None:
-                    lease.tunnel_writers.add(srv_w)
-                connect_request = (
-                    f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n"
-                    f"Proxy-Authorization: Basic {auth}\r\n\r\n".encode()
-                )
-                if not await _write_upstream(
-                    srv_w, connect_request, lease=lease, host=host, direction="up"
-                ):
-                    client_w.write(b"HTTP/1.1 429 Too Many Requests\r\n\r\n")
-                    await client_w.drain()
-                    return
-                if lease is not None:
-                    status, response_headers = await _read_metered_provider_head(
-                        srv_r,
-                        lease,
-                        host,
-                    )
+                    # Bounded dial + metered head, failing a silent exit over to
+                    # a fresh pool entry so one dead exit cannot latch the slot.
+                    try:
+                        (
+                            srv_r,
+                            srv_w,
+                            status,
+                            response_headers,
+                        ) = await _open_lease_upstream_tunnel(
+                            lease, mgr, target=target, host=host
+                        )
+                    except _LeaseBudgetRefused:
+                        client_w.write(b"HTTP/1.1 429 Too Many Requests\r\n\r\n")
+                        await client_w.drain()
+                        return
+                    except (
+                        asyncio.TimeoutError,
+                        TimeoutError,
+                        OSError,
+                        UpstreamHeadTimeout,
+                        UpstreamHeadIncomplete,
+                    ):
+                        # Do not close the lease: the finally below drains this
+                        # slot and the TTL reaper finalizes it as usual.
+                        client_w.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                        await client_w.drain()
+                        client_w.close()
+                        return
                 else:
+                    srv_r, srv_w = await asyncio.open_connection(up_host, up_port)
+                    connect_request = (
+                        f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n"
+                        f"Proxy-Authorization: Basic {auth}\r\n\r\n".encode()
+                    )
+                    if not await _write_upstream(
+                        srv_w, connect_request, lease=lease, host=host, direction="up"
+                    ):
+                        client_w.write(b"HTTP/1.1 429 Too Many Requests\r\n\r\n")
+                        await client_w.drain()
+                        return
                     status = await srv_r.readline()
                     await _read_headers(srv_r)
                 if b"200" not in status:
@@ -2479,7 +2657,16 @@ async def handle(
                 )
             else:
                 conn_count[host] += 1
-                srv_r, srv_w = await asyncio.open_connection(up_host, up_port)
+                try:
+                    srv_r, srv_w = await asyncio.wait_for(
+                        _open_upstream_connection(up_host, up_port),
+                        LEASE_UPSTREAM_CONNECT_TIMEOUT_SECONDS,
+                    )
+                except (asyncio.TimeoutError, TimeoutError, OSError):
+                    client_w.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                    await client_w.drain()
+                    client_w.close()
+                    return
                 if lease is not None:
                     lease.tunnel_writers.add(srv_w)
                 forwarded_headers = b"".join(
@@ -2655,6 +2842,8 @@ async def main() -> None:
     global SOFASCORE_DAGRUN_BUDGET_BYTES, SOFASCORE_BUDGET_ARTIFACT_ID
     global SOFASCORE_CANARY_HARD_CAP_BYTES, SOFASCORE_CANARY_POLICY_ID
     global URL_BUDGET_BYTES, MAX_ACTIVE_LEASES, LEDGER_PATH, CONTROL_TOKEN
+    global LEASE_UPSTREAM_CONNECT_TIMEOUT_SECONDS, LEASE_PROVIDER_HEAD_TIMEOUT_SECONDS
+    global LEASE_UPSTREAM_FAILOVER_ATTEMPTS
     global SOFASCORE_ALLOCATION_LEDGER_PATH, SOFASCORE_ALLOCATION_WAL_PATH
     global SOFASCORE_ALLOCATION_LEDGER, _SOFASCORE_ALLOCATION_LEDGER_KEY
     global SOFASCORE_PARENT_ENVELOPE_PATH, SOFASCORE_PARENT_ENVELOPE_LEDGER
@@ -2702,6 +2891,39 @@ async def main() -> None:
     )
     ap.add_argument("--url-budget-bytes", type=int, default=2_000_000)
     ap.add_argument("--max-active-leases", type=int, default=MAX_ACTIVE_LEASES)
+    ap.add_argument(
+        "--lease-upstream-connect-timeout-seconds",
+        type=float,
+        default=float(
+            os.environ.get(
+                "PROXY_FILTER_LEASE_CONNECT_TIMEOUT_SECONDS",
+                LEASE_UPSTREAM_CONNECT_TIMEOUT_SECONDS,
+            )
+        ),
+        help="bound the residential CONNECT dial for a lease tunnel",
+    )
+    ap.add_argument(
+        "--lease-provider-head-timeout-seconds",
+        type=float,
+        default=float(
+            os.environ.get(
+                "PROXY_FILTER_LEASE_HEAD_TIMEOUT_SECONDS",
+                LEASE_PROVIDER_HEAD_TIMEOUT_SECONDS,
+            )
+        ),
+        help="bound the metered upstream response-head read for a lease tunnel",
+    )
+    ap.add_argument(
+        "--lease-upstream-failover-attempts",
+        type=int,
+        default=int(
+            os.environ.get(
+                "PROXY_FILTER_LEASE_FAILOVER_ATTEMPTS",
+                LEASE_UPSTREAM_FAILOVER_ATTEMPTS,
+            )
+        ),
+        help="silent-exit re-pin attempts before failing a lease CONNECT closed",
+    )
     ap.add_argument(
         "--ledger",
         default=os.environ.get(
@@ -2784,6 +3006,27 @@ async def main() -> None:
     )
     url_budget_bytes = int(getattr(args, "url_budget_bytes", URL_BUDGET_BYTES))
     max_active_leases = int(getattr(args, "max_active_leases", MAX_ACTIVE_LEASES))
+    lease_connect_timeout_seconds = float(
+        getattr(
+            args,
+            "lease_upstream_connect_timeout_seconds",
+            LEASE_UPSTREAM_CONNECT_TIMEOUT_SECONDS,
+        )
+    )
+    lease_head_timeout_seconds = float(
+        getattr(
+            args,
+            "lease_provider_head_timeout_seconds",
+            LEASE_PROVIDER_HEAD_TIMEOUT_SECONDS,
+        )
+    )
+    lease_failover_attempts = int(
+        getattr(
+            args,
+            "lease_upstream_failover_attempts",
+            LEASE_UPSTREAM_FAILOVER_ATTEMPTS,
+        )
+    )
     sofascore_canary_hard_cap_bytes = int(
         getattr(args, "sofascore_canary_hard_cap_bytes", 0)
     )
@@ -2798,6 +3041,23 @@ async def main() -> None:
         or sofascore_canary_hard_cap_bytes < 0
     ):
         raise SystemExit("proxy byte budgets must be positive")
+    # ``inf``/``nan`` pass a bare ``<= 0`` check but would disable the dead-exit
+    # bound entirely, so the timeouts require strictly finite positive values.
+    if (
+        not (
+            math.isfinite(lease_connect_timeout_seconds)
+            and lease_connect_timeout_seconds > 0
+        )
+        or not (
+            math.isfinite(lease_head_timeout_seconds)
+            and lease_head_timeout_seconds > 0
+        )
+        or lease_failover_attempts < 0
+    ):
+        raise SystemExit(
+            "lease upstream timeouts must be finite positive seconds and "
+            "failover attempts must be >= 0"
+        )
     DAILY_BUDGET_BYTES = int(daily_budget_mb * 1024 * 1024)
     MAX_LEASE_BYTES = int(max_lease_mb * 1024 * 1024)
     MAX_LEASE_TTL_SECONDS = max_lease_ttl_seconds
@@ -2805,6 +3065,9 @@ async def main() -> None:
     TRANSFERMARKT_DAGRUN_BUDGET_BYTES = transfermarkt_budget_bytes
     URL_BUDGET_BYTES = url_budget_bytes
     MAX_ACTIVE_LEASES = max_active_leases
+    LEASE_UPSTREAM_CONNECT_TIMEOUT_SECONDS = lease_connect_timeout_seconds
+    LEASE_PROVIDER_HEAD_TIMEOUT_SECONDS = lease_head_timeout_seconds
+    LEASE_UPSTREAM_FAILOVER_ATTEMPTS = lease_failover_attempts
     LEDGER_PATH = str(getattr(args, "ledger", LEDGER_PATH))
     SOFASCORE_ALLOCATION_LEDGER_PATH = str(
         getattr(

@@ -942,3 +942,68 @@ class TestExactWarmAndCanaryExitProbe:
         assert "lease-secret" not in str(captured.value)
         assert "203.0.113.7" not in str(captured.value)
         assert cap._allowed_external_url is None
+
+
+# --------------------------------------------------------------------------- #
+#  dead-exit connectivity classifier (#946)                                   #
+# --------------------------------------------------------------------------- #
+def test_proxy_connectivity_classifier_matches_connectivity_shapes():
+    """A dead residential exit surfaces as a small set of connectivity-shaped
+    errors (camoufox ``InvalidProxy``, playwright/builtin ``TimeoutError``, or a
+    Firefox ``NS_ERROR_*`` code in the message).  These are retryable exit
+    failures; a broken browser runtime or the origin-proof guard are not."""
+
+    from scrapers.sofascore.camoufox_capture import (
+        ProxyConnectivityError,
+        _as_proxy_connectivity_error,
+    )
+
+    class InvalidProxy(Exception):
+        pass
+
+    class TimeoutError(Exception):  # shadows builtin on purpose; matched by name
+        pass
+
+    # Direct class-name matches (works without importing playwright/camoufox).
+    assert _as_proxy_connectivity_error(InvalidProxy("dead exit")) is not None
+    assert _as_proxy_connectivity_error(TimeoutError("slow")) is not None
+
+    # Nested via ``raise X from Y`` and via ``__context__``.
+    try:
+        try:
+            raise InvalidProxy("dead")
+        except InvalidProxy as inner:
+            raise RuntimeError("browser navigation failed") from inner
+    except RuntimeError as chained:
+        assert _as_proxy_connectivity_error(chained) is not None
+
+    try:
+        try:
+            raise TimeoutError("slow")
+        except TimeoutError:
+            raise RuntimeError("implicit context")
+    except RuntimeError as contextual:
+        assert _as_proxy_connectivity_error(contextual) is not None
+
+    # NS_ERROR codes matched as a substring of the message.
+    for code in ("NS_ERROR_PROXY_CONNECTION_REFUSED", "NS_ERROR_NET_TIMEOUT"):
+        translated = _as_proxy_connectivity_error(RuntimeError(f"goto: {code} at exit"))
+        assert isinstance(translated, ProxyConnectivityError)
+
+    # Idempotent: an already-translated error stays a ProxyConnectivityError.
+    already = ProxyConnectivityError("exit down")
+    assert isinstance(_as_proxy_connectivity_error(already), ProxyConnectivityError)
+
+    # Non-connectivity failures must NOT be translated (kept fatal upstream).
+    assert (
+        _as_proxy_connectivity_error(RuntimeError("Sync API inside the asyncio loop"))
+        is None
+    )
+    assert (
+        _as_proxy_connectivity_error(
+            RuntimeError(
+                "SofaScore exact anchor did not prove official origin: status=200"
+            )
+        )
+        is None
+    )

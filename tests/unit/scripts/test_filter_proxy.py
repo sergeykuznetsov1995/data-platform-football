@@ -20,7 +20,7 @@ import base64
 import hashlib
 import json
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -2108,3 +2108,388 @@ def test_shipped_blocklist_blocks_adtech_but_not_cf_or_sites(mod):
         "cdn.intergient.com",
     ):
         assert mod._is_blocked(drop) is True, f"{drop} must be blocked"
+
+
+# --- dead residential exit failover (#946) -----------------------------------
+#
+# A dead exit accepts the TCP CONNECT and then goes silent.  Before #946 the
+# lease's only tunnel hung forever inside ``_read_metered_provider_head`` (no
+# timeout), never draining ``active_tunnels``; the single SofaScore slot latched
+# and every follow-up 429'd.  These tests drive the whole ``handle`` CONNECT path
+# through a silent upstream and assert bounded failover with exact metering.
+
+
+class _FakeUpstreamReader:
+    """Minimal StreamReader: serves ``read(n)`` from a buffer, optionally
+    blocking forever once the buffer drains (a dead but connected exit)."""
+
+    def __init__(self, data=b"", *, block_when_empty=False):
+        self.buf = bytearray(data)
+        self.block_when_empty = block_when_empty
+
+    async def read(self, size):
+        if not self.buf:
+            if self.block_when_empty:
+                await asyncio.Event().wait()
+            return b""
+        chunk = bytes(self.buf[:size])
+        del self.buf[:size]
+        return chunk
+
+
+class _FakeUpstreamWriter:
+    def __init__(self):
+        self.data = bytearray()
+        self.closed = False
+
+    def write(self, chunk):
+        self.data.extend(chunk)
+
+    async def drain(self):
+        return None
+
+    def close(self):
+        self.closed = True
+
+
+class _ClientConnectReader:
+    """Client leg of one CONNECT: hands back the request head, then EOF for the
+    (empty) client->upstream tunnel payload."""
+
+    def __init__(self, header_lines):
+        self.lines = deque(header_lines)
+
+    async def readline(self):
+        return self.lines.popleft() if self.lines else b""
+
+    async def read(self, size):
+        return b""
+
+
+class _ClientWriter:
+    def __init__(self):
+        self.payload = bytearray()
+        self.closed = False
+
+    def write(self, chunk):
+        self.payload.extend(chunk)
+
+    async def drain(self):
+        return None
+
+    def close(self):
+        self.closed = True
+
+
+def _make_sofascore_lease(mod, mgr, *, budget=4096, endpoint="event"):
+    mod.LEASES.clear()
+    mod.LEASE_TOKENS.clear()
+    mod.up_bytes = defaultdict(int)
+    mod.down_bytes = defaultdict(int)
+    mod._daily_day = ""
+    mod._daily_up_bytes = mod._daily_down_bytes = 0
+    mod.SOFASCORE_DAGRUN_BUDGET_BYTES = budget
+    lease = mod._create_lease(
+        mgr,
+        max_bytes=budget,
+        ttl_seconds=30,
+        metadata=_sofascore_context(budget=budget),
+        require_context=True,
+    )
+    mod._begin_endpoint_request(lease, endpoint)
+    return lease
+
+
+def _connect_header_lines(lease):
+    encoded = base64.b64encode(f"lease:{lease.token}".encode()).decode()
+    return [
+        b"CONNECT www.sofascore.com:443 HTTP/1.1\r\n",
+        b"Host: www.sofascore.com:443\r\n",
+        f"Proxy-Authorization: Basic {encoded}\r\n".encode(),
+        b"\r\n",
+    ]
+
+
+def _expected_connect_head():
+    auth = base64.b64encode(b"u:p").decode()
+    return (
+        b"CONNECT www.sofascore.com:443 HTTP/1.1\r\n"
+        b"Host: www.sofascore.com:443\r\n"
+        + f"Proxy-Authorization: Basic {auth}\r\n\r\n".encode()
+    )
+
+
+def _shrink_failover_timeouts(mod, monkeypatch):
+    monkeypatch.setattr(
+        mod, "LEASE_PROVIDER_HEAD_TIMEOUT_SECONDS", 0.02, raising=False
+    )
+    monkeypatch.setattr(
+        mod, "LEASE_UPSTREAM_CONNECT_TIMEOUT_SECONDS", 0.02, raising=False
+    )
+
+
+def _patch_upstream_opener(mod, monkeypatch, fake_open):
+    # ``_open_upstream_connection`` is the #946 test seam; also patch the raw
+    # asyncio symbol so the pre-#946 code (which lacks the seam) still exercises
+    # the hang and fails by TimeoutError rather than skipping the dial.
+    monkeypatch.setattr(mod, "_open_upstream_connection", fake_open, raising=False)
+    monkeypatch.setattr(mod.asyncio, "open_connection", fake_open)
+
+
+def test_lease_connect_failover_repins_silent_upstream_and_tunnels(mod, monkeypatch):
+    mgr = _FakeManager(
+        ["http://u:p@pool.invalid:10000", "http://u:p@pool.invalid:10001"]
+    )
+    lease = _make_sofascore_lease(mod, mgr)
+    expires_before = lease.expires_at
+    _shrink_failover_timeouts(mod, monkeypatch)
+
+    dead_writer = _FakeUpstreamWriter()
+    live_writer = _FakeUpstreamWriter()
+    live_head = b"HTTP/1.1 200 Connection established\r\n\r\n"
+    tunnel = b"hello-tunnel"
+    opens = []
+
+    async def fake_open(host, port):
+        opens.append((host, port))
+        if len(opens) == 1:
+            return _FakeUpstreamReader(b"", block_when_empty=True), dead_writer
+        return _FakeUpstreamReader(live_head + tunnel), live_writer
+
+    _patch_upstream_opener(mod, monkeypatch, fake_open)
+
+    client_writer = _ClientWriter()
+    asyncio.run(
+        asyncio.wait_for(
+            mod.handle(
+                _ClientConnectReader(_connect_header_lines(lease)),
+                client_writer,
+                mgr,
+                require_lease=True,
+            ),
+            2.0,
+        )
+    )
+
+    head = _expected_connect_head()
+    assert b"200 Connection established" in bytes(client_writer.payload)
+    assert bytes(client_writer.payload).endswith(tunnel)
+    assert lease.upstream == ("pool.invalid", 10001, "u", "p")
+    assert lease.upstream_repins == 1
+    assert dead_writer.data == head
+    assert live_writer.data == head
+    assert dead_writer.closed is True
+    # up == both CONNECT heads (one billed to the dead exit, one to the live
+    # exit); down == the live exit's response head + tunnel payload only.
+    assert lease.up_bytes == 2 * len(head)
+    assert lease.down_bytes == len(live_head) + len(tunnel)
+    assert lease.expires_at == expires_before
+    assert lease.report()["upstream_repins"] == 1
+    assert lease.active_tunnels == 0
+    # M1: no failed attempt may leave its writer behind in tunnel_writers.
+    assert lease.tunnel_writers == set()
+
+
+def test_lease_connect_failover_is_refused_after_first_provider_payload_byte(
+    mod, monkeypatch
+):
+    mgr = _FakeManager(
+        ["http://u:p@pool.invalid:10000", "http://u:p@pool.invalid:10001"]
+    )
+    lease = _make_sofascore_lease(mod, mgr)
+    # A single down byte already arrived on the pinned exit: the exit is proven,
+    # so a later silent read must fail closed (502) rather than silently re-pin.
+    mod._account_lease_bytes(lease, "www.sofascore.com", "down", 1)
+    _shrink_failover_timeouts(mod, monkeypatch)
+
+    async def fake_open(host, port):
+        return _FakeUpstreamReader(b"", block_when_empty=True), _FakeUpstreamWriter()
+
+    _patch_upstream_opener(mod, monkeypatch, fake_open)
+
+    client_writer = _ClientWriter()
+    asyncio.run(
+        asyncio.wait_for(
+            mod.handle(
+                _ClientConnectReader(_connect_header_lines(lease)),
+                client_writer,
+                mgr,
+                require_lease=True,
+            ),
+            2.0,
+        )
+    )
+
+    assert b"502 Bad Gateway" in bytes(client_writer.payload)
+    assert lease.upstream_repins == 0
+    assert lease.upstream == ("pool.invalid", 10000, "u", "p")
+    assert lease.usable is True
+    assert lease.active_tunnels == 0
+    assert lease.tunnel_writers == set()
+    assert mgr.calls == 1
+
+
+def test_failover_redraws_past_the_exit_that_just_failed(mod, monkeypatch):
+    # The pool draw is random, so a re-pin can hand back the exact exit that
+    # just went silent.  The failover must re-draw (bounded) until the
+    # replacement differs from the failed one.
+    mgr = _FakeManager(
+        [
+            "http://u:p@pool.invalid:10000",  # initial pin (dies)
+            "http://u:p@pool.invalid:10000",  # first re-draw: same dead exit
+            "http://u:p@pool.invalid:10001",  # second re-draw: fresh exit
+        ]
+    )
+    lease = _make_sofascore_lease(mod, mgr)
+    _shrink_failover_timeouts(mod, monkeypatch)
+
+    live_head = b"HTTP/1.1 200 Connection established\r\n\r\n"
+    opens = []
+
+    async def fake_open(host, port):
+        opens.append((host, port))
+        if len(opens) == 1:
+            return _FakeUpstreamReader(b"", block_when_empty=True), _FakeUpstreamWriter()
+        return _FakeUpstreamReader(live_head), _FakeUpstreamWriter()
+
+    _patch_upstream_opener(mod, monkeypatch, fake_open)
+
+    client_writer = _ClientWriter()
+    asyncio.run(
+        asyncio.wait_for(
+            mod.handle(
+                _ClientConnectReader(_connect_header_lines(lease)),
+                client_writer,
+                mgr,
+                require_lease=True,
+            ),
+            2.0,
+        )
+    )
+
+    assert b"200 Connection established" in bytes(client_writer.payload)
+    assert lease.upstream == ("pool.invalid", 10001, "u", "p")
+    assert lease.upstream_repins == 1  # one failover, even with the extra draw
+    assert mgr.calls == 3
+    assert opens[-1] == ("pool.invalid", 10001)
+
+
+def test_provider_head_timeout_accounts_partial_bytes_exactly(mod, monkeypatch):
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+    lease = _make_sofascore_lease(mod, mgr)
+
+    class Reader:
+        def __init__(self):
+            self.remaining = bytearray(b"HELLO")
+
+        async def read(self, size):
+            if self.remaining:
+                chunk = bytes(self.remaining[:1])
+                del self.remaining[:1]
+                return chunk
+            await asyncio.Event().wait()
+
+    with pytest.raises(mod.UpstreamHeadTimeout):
+        asyncio.run(
+            asyncio.wait_for(
+                mod._read_metered_provider_head(
+                    Reader(),
+                    lease,
+                    "www.sofascore.com",
+                    timeout_seconds=0.02,
+                ),
+                2.0,
+            )
+        )
+
+    assert lease.down_bytes == 5
+    assert lease.reserved_bytes == 0
+
+
+def test_upstream_eof_before_any_head_byte_triggers_failover(mod, monkeypatch):
+    mgr = _FakeManager(
+        ["http://u:p@pool.invalid:10000", "http://u:p@pool.invalid:10001"]
+    )
+    lease = _make_sofascore_lease(mod, mgr)
+    _shrink_failover_timeouts(mod, monkeypatch)
+
+    live_head = b"HTTP/1.1 200 Connection established\r\n\r\n"
+    opens = []
+
+    async def fake_open(host, port):
+        opens.append((host, port))
+        if len(opens) == 1:
+            # Immediate EOF before any head byte: a closed/reset exit.
+            return _FakeUpstreamReader(b""), _FakeUpstreamWriter()
+        return _FakeUpstreamReader(live_head), _FakeUpstreamWriter()
+
+    _patch_upstream_opener(mod, monkeypatch, fake_open)
+
+    client_writer = _ClientWriter()
+    asyncio.run(
+        asyncio.wait_for(
+            mod.handle(
+                _ClientConnectReader(_connect_header_lines(lease)),
+                client_writer,
+                mgr,
+                require_lease=True,
+            ),
+            2.0,
+        )
+    )
+
+    assert b"200 Connection established" in bytes(client_writer.payload)
+    assert lease.upstream_repins == 1
+    assert lease.upstream == ("pool.invalid", 10001, "u", "p")
+
+
+def test_lease_failover_does_not_mint_second_lease_or_bypass_serial_limit(
+    mod, monkeypatch
+):
+    mgr = _FakeManager(
+        ["http://u:p@pool.invalid:10000", "http://u:p@pool.invalid:10001"]
+    )
+    lease = _make_sofascore_lease(mod, mgr)
+    _shrink_failover_timeouts(mod, monkeypatch)
+
+    live_head = b"HTTP/1.1 200 Connection established\r\n\r\n"
+    opens = []
+    observed = {}
+
+    async def fake_open(host, port):
+        opens.append((host, port))
+        if len(opens) == 1:
+            observed["leases_during"] = len(mod.LEASES)
+            try:
+                mod._create_lease(
+                    mgr,
+                    max_bytes=4096,
+                    ttl_seconds=30,
+                    metadata=_sofascore_context(run_id="concurrent__x::season"),
+                    require_context=True,
+                )
+                observed["second"] = "MINTED"
+            except RuntimeError as exc:
+                observed["second"] = str(exc)
+            return _FakeUpstreamReader(b"", block_when_empty=True), _FakeUpstreamWriter()
+        return _FakeUpstreamReader(live_head), _FakeUpstreamWriter()
+
+    _patch_upstream_opener(mod, monkeypatch, fake_open)
+
+    client_writer = _ClientWriter()
+    asyncio.run(
+        asyncio.wait_for(
+            mod.handle(
+                _ClientConnectReader(_connect_header_lines(lease)),
+                client_writer,
+                mgr,
+                require_lease=True,
+            ),
+            2.0,
+        )
+    )
+
+    assert observed["leases_during"] == 1
+    assert "concurrency" in observed["second"]
+    assert len(mod.LEASES) == 1
+    assert lease.upstream_repins == 1

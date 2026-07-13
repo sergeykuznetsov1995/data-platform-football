@@ -429,6 +429,8 @@ def test_transport_failure_is_not_retried_and_is_redacted():
         lambda payload: payload.update(dagrun_budget_bytes=0),
         lambda payload: payload.update(source="other"),
         lambda payload: payload.update(up_bytes=True),
+        lambda payload: payload.update(upstream_repins=-1),
+        lambda payload: payload.update(upstream_repins=True),
     ],
 )
 def test_stats_fail_closed_on_schema_or_counter_drift(mutate):
@@ -442,6 +444,27 @@ def test_stats_fail_closed_on_schema_or_counter_drift(mutate):
 
     with pytest.raises(SofascoreLeaseProtocolError):
         client.stats(lease)
+
+
+def test_stats_parse_upstream_repins_and_default_to_zero_when_absent():
+    # #946: the dead-exit failover counter rides along in stats.  A proxy that
+    # predates the field must parse as 0, keeping fingerprint drift fail-closed.
+    with_repins = _stats_payload()
+    with_repins["upstream_repins"] = 2
+    session = _Session(_Response(200, with_repins))
+    client = SofascoreLeaseClient(
+        "http://proxy_filter:8899", session=session, control_token=CONTROL_TOKEN
+    )
+    lease = _production_lease(token="token")
+    assert client.stats(lease).upstream_repins == 2
+
+    without_repins = _stats_payload()
+    assert "upstream_repins" not in without_repins
+    session = _Session(_Response(200, without_repins))
+    client = SofascoreLeaseClient(
+        "http://proxy_filter:8899", session=session, control_token=CONTROL_TOKEN
+    )
+    assert client.stats(lease).upstream_repins == 0
 
 
 def test_control_url_rejects_embedded_credentials():
