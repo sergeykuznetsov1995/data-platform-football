@@ -534,6 +534,17 @@ def _season_link(row: Tag, comp_id: str) -> Optional[Tag]:
     return None
 
 
+def _rows_are_linked(tables: Sequence[Tag]) -> bool:
+    """True when the seasons table is populated with linked rows.
+
+    Separates "this competition has no season pages" from "the page did not
+    render its links": the first still carries match/squad anchors per edition.
+    """
+    return bool(tables) and any(
+        row.find("a", href=True) for row in tables[0].find_all("tr")
+    )
+
+
 def _season_cards(documents: Sequence[BeautifulSoup], comp_id: str) -> List[Tag]:
     """Season links from the card layout used when there is no seasons table.
 
@@ -672,6 +683,17 @@ def parse_competition_html(
             reason="season_row_parse_failed",
             error_type="SeasonDiscoveryError",
             error_message="; ".join(errors)[:1000],
+        )
+    elif not records and _rows_are_linked(tables):
+        # A one-match competition (the FA Community Shield, the super cups) has
+        # no season pages at all: every row of its history table links straight
+        # to the final's match report. The page is intact and fully populated —
+        # a season page simply does not exist to follow — so the wave must not
+        # fail on it. Rows carrying no links at all stay a contract error below.
+        result = _dataset(
+            "seasons",
+            status=DatasetStatus.NOT_APPLICABLE,
+            reason="competition_publishes_no_season_pages",
         )
     elif not records:
         result = _dataset(

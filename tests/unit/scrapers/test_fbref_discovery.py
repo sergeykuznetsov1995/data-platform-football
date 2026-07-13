@@ -608,3 +608,46 @@ def test_a_history_page_with_no_seasons_at_all_still_fails_closed():
     assert result.has_errors
     assert dataset.status == DatasetStatus.ERROR
     assert dataset.reason == "season_history_table_missing"
+
+
+ONE_MATCH_COMPETITION_HTML = """
+<table id="seasons"><tbody>
+  <tr><th data-stat="year_id">
+        <a href="/en/matches/096e63eb/Crystal-Palace-Liverpool-FA-Community-Shield">2025</a></th>
+      <td data-stat="champ"><a href="/en/squads/47c64c55/Crystal-Palace-Stats">Crystal Palace</a></td></tr>
+  <tr><th data-stat="year_id">
+        <a href="/en/matches/923aa854/Manchester-Derby-FA-Community-Shield">2024</a></th>
+      <td data-stat="champ"><a href="/en/squads/b8fd03ef/Manchester-City-Stats">Manchester City</a></td></tr>
+</tbody></table>
+"""
+
+
+def test_a_one_match_competition_has_no_season_pages_and_is_not_an_error():
+    """The FA Community Shield (comp 602) and the super cups are single matches:
+    their history table links each edition straight to the final's match report
+    and no season page exists to follow. Failing the page would fail the whole
+    wave over a competition FBref publishes exactly as intended."""
+    shield = _competition(comp_id="602", competition_format=CompetitionFormat.CUP)
+
+    result = parse_competition_html(ONE_MATCH_COMPETITION_HTML, shield)
+    dataset = result.datasets["seasons"]
+
+    assert not result.has_errors
+    assert dataset.status == DatasetStatus.NOT_APPLICABLE
+    assert dataset.reason == "competition_publishes_no_season_pages"
+    assert dataset.row_count == 0
+
+
+def test_a_seasons_table_with_unlinked_rows_is_still_a_contract_error():
+    """Rows with no anchors at all mean the page did not render its links — that
+    is a broken contract, not a competition without season pages."""
+    html = """
+    <table id="seasons"><tbody>
+      <tr><th data-stat="year_id">2025</th><td data-stat="champ">Someone</td></tr>
+    </tbody></table>
+    """
+
+    result = parse_competition_html(html, _competition())
+
+    assert result.has_errors
+    assert result.datasets["seasons"].reason == "season_links_missing"
