@@ -203,7 +203,12 @@ def test_production_lease_adapter_uses_exact_api_and_basic_proxy_auth():
 def test_a_lease_is_refused_before_any_call_when_the_control_token_is_absent(
     monkeypatch,
 ):
-    monkeypatch.delenv("TM_PROXY_CONTROL_TOKEN", raising=False)
+    for name in (
+        "TM_PROXY_CONTROL_TOKEN",
+        "PROXY_FILTER_CONTROL_TOKEN",
+        "SOFASCORE_PROXY_CONTROL_TOKEN",
+    ):
+        monkeypatch.delenv(name, raising=False)
     control = _ControlClient([])
 
     with pytest.raises(ProxyRequiredError, match="TM_PROXY_CONTROL_TOKEN"):
@@ -470,3 +475,19 @@ def test_checkpoint_migrates_valid_empty_and_rejects_hash_tampering():
     corrupt["value"] = ["unexpected"]
     with pytest.raises(ValueError, match="hash mismatch"):
         FetchOutcome.from_checkpoint(corrupt)
+
+
+@pytest.mark.unit
+def test_the_control_secret_is_shared_by_every_source_the_filter_guards(
+    monkeypatch,
+):
+    # One filter, one control secret; it is deployed under the name of the
+    # source that first needed it.
+    monkeypatch.delenv("TM_PROXY_CONTROL_TOKEN", raising=False)
+    monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", CONTROL_TOKEN)
+
+    provider = ProxyFilterLeaseProvider(
+        "http://proxy_filter:8899", control_client=_ControlClient([]),
+    )
+
+    assert provider._control_token == CONTROL_TOKEN
