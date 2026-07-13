@@ -24,7 +24,7 @@ from scrapers.fbref.html_parser import (
 )
 
 
-MATCH_PARSER_VERSION = "fbref-match-parser-v1"
+MATCH_PARSER_VERSION = "fbref-match-parser-v2"
 MATCH_COMPLETION_CONTRACT_VERSION = "match-v2-two-team-marker-last"
 
 
