@@ -163,3 +163,40 @@ def test_a_broken_colspan_must_not_discard_the_whole_page():
     wages = [table for table in page.tables if table.table_id == "wages"]
     assert len(wages) == 1
     assert wages[0].row_count == 1
+
+
+def test_rows_repeating_the_same_entities_get_distinct_ids():
+    """FBref repeats the same entities across rows of one table — a player's
+    stats carry two rows for the same club. Entity identity alone is not a key:
+    the colliding row_ids reached Iceberg as duplicate MERGE source rows
+    (MERGE_TARGET_ROW_MULTIPLE_MATCHES) and the whole page failed to persist."""
+    html = """
+    <table id="stats_standard">
+      <thead><tr><th data-stat="season">Season</th><th data-stat="team">Squad</th>
+                 <th data-stat="goals">Gls</th></tr></thead>
+      <tbody>
+        <tr><th data-stat="season">2022-2023</th>
+            <td data-stat="team"><a href="/en/squads/d53c0b06/Lyon-Stats">Lyon</a></td>
+            <td data-stat="goals">18</td></tr>
+        <tr><th data-stat="season">2023-2024</th>
+            <td data-stat="team"><a href="/en/squads/d53c0b06/Lyon-Stats">Lyon</a></td>
+            <td data-stat="goals">19</td></tr>
+      </tbody>
+    </table>
+    """
+
+    page = parse_page_document(
+        html, target_id="fbref:player:9dbb75ca", page_kind="player",
+        content_hash="abc",
+    )
+    table = page.tables[0]
+    row_ids = [row.row_id for row in table.rows]
+    cells = page.cell_records()
+    merge_keys = {
+        (cell["table_instance_id"], cell["row_id"], cell["cell_id"])
+        for cell in cells
+    }
+
+    assert len(row_ids) == 2
+    assert len(set(row_ids)) == 2
+    assert len(merge_keys) == len(cells)
