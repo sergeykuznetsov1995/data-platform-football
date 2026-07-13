@@ -229,7 +229,13 @@ def fetch_fbref_wave(
     except subprocess.TimeoutExpired as exc:
         # A hung clearance keeps the browser inside Playwright's event loop and
         # never returns, holding this wave's fenced leases until they expire.
-        # Fail closed so the DAG's failure callback releases them now.
+        # Fail closed so the DAG's failure callback releases them now — and log
+        # what the wave had printed by then, or the hang is undiagnosable.
+        logger.warning(
+            "FBref fetch wave timed out.\nstdout:\n%s\nstderr:\n%s",
+            _decoded_stream(exc.stdout),
+            _decoded_stream(exc.stderr),
+        )
         raise RuntimeError(
             "FBref fetch wave subprocess exceeded "
             f"{FETCH_WAVE_TIMEOUT_SECONDS}s and was killed"
@@ -245,6 +251,16 @@ def fetch_fbref_wave(
     result = _parse_fetch_wave_result(completed.stdout)
     logger.info("FBref fetch wave: %s", json.dumps(result, sort_keys=True))
     return result
+
+
+def _decoded_stream(stream) -> str:
+    """Best-effort text of a killed subprocess stream (bytes or str, may be None)."""
+    if stream is None:
+        return "<empty>"
+    if isinstance(stream, bytes):
+        stream = stream.decode("utf-8", "replace")
+    text = str(stream).strip()
+    return text[-8000:] if text else "<empty>"
 
 
 def _parse_fetch_wave_result(stdout: str) -> dict:
