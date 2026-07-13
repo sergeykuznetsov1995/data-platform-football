@@ -287,7 +287,10 @@ def _parse_height_cm(raw) -> Optional[int]:
         return None
 
 
-_TM_DATE_FORMATS = ('%b %d, %Y', '%B %d, %Y', '%Y-%m-%d', '%d.%m.%Y')
+# .com renders dates day-first ('17/08/1993'); .us renders them as 'Aug 17, 1993'.
+_TM_DATE_FORMATS = (
+    '%b %d, %Y', '%B %d, %Y', '%Y-%m-%d', '%d.%m.%Y', '%d/%m/%Y',
+)
 
 
 def _transfer_date(entry: Dict) -> Optional[date]:
