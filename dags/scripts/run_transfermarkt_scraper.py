@@ -2052,6 +2052,57 @@ def _load_cached_coach_data(scraper, club_ids: Sequence[str]) -> Dict[str, Any]:
     return {'profiles': profiles, 'stints': stints}
 
 
+def _coach_identity_rows(
+    scraper,
+    profiles,
+    stints,
+    season_year: int,
+    season_format,
+) -> list:
+    """Name every coach this season's stints name, bio or no bio.
+
+    A club's history page is refetched only when its cached copy ages out, so
+    most clubs' stints come from bronze — while a profile page is fetched only
+    for a coach a *freshly read* page named.  The season projection is built
+    from all the stints and therefore names coaches the profile table has never
+    heard of.  Their identity is not in doubt: a history page named them.  The
+    row states it and leaves the bio empty, which is exactly what the season
+    projection carries for them, so the two agree key for key.  An empty bio is
+    not a bio, so the next cycle that has such a coach in season still fetches
+    his page.
+    """
+    from scrapers.transfermarkt.scraper import (
+        _season_window,
+        _stint_overlaps_season,
+    )
+
+    if stints is None or getattr(stints, 'empty', True):
+        return []
+    win_start, win_end = _season_window(season_year, season_format)
+    known = set()
+    if profiles is not None and 'coach_id' in getattr(profiles, 'columns', []):
+        known = {str(value) for value in profiles['coach_id'].dropna()}
+    rows: Dict[str, Dict[str, Any]] = {}
+    for stint in stints.to_dict('records'):
+        coach_id = str(stint.get('coach_id'))
+        if coach_id in known or coach_id in rows:
+            continue
+        if not _stint_overlaps_season(stint, win_start, win_end):
+            continue
+        rows[coach_id] = {
+            'coach_id': coach_id,
+            'coach_slug': stint.get('coach_slug'),
+            'name': stint.get('name'),
+            'dob': None,
+            'nationality': None,
+            '_source': 'transfermarkt',
+            '_entity_type': 'coach_profiles',
+            '_ingested_at': datetime.utcnow(),
+            '_batch_id': getattr(scraper, '_batch_id', None),
+        }
+    return list(rows.values())
+
+
 def _merge_coach_cache_frames(
     scraper,
     fetched: Mapping[str, Any],
@@ -2073,6 +2124,18 @@ def _merge_coach_cache_frames(
     # must date its window the same way.  Defaulting the format here made a
     # calendar season a split one and the two projections disagreed.
     scope = _scope_season(league, season)
+    identities = _coach_identity_rows(
+        scraper, profiles, stints,
+        scope['season_year'], scope['season_format'],
+    )
+    if identities:
+        logger.info(
+            'coach identities named by cached stints without a profile: %d',
+            len(identities),
+        )
+        profiles = pd.concat(
+            [profiles, pd.DataFrame(identities)], ignore_index=True,
+        ).drop_duplicates('coach_id', keep='first')
     legacy = scraper.materialize_legacy_coaches(
         profiles, stints, league, scope['season_year'], scope['season_format'],
     )
