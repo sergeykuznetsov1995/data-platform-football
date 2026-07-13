@@ -784,6 +784,7 @@ def test_fetch_wave_persists_retry_failure_evidence_and_exact_request_count(
         "error_message": "redacted status_history=500,500 body_sha256=abc",
         "retry_delay_seconds": 60,
         "permanent": False,
+        "requeue": False,
         "http_status": 500,
         "http_request_count": 2,
         "http_status_history": (500, 500),
@@ -2114,18 +2115,22 @@ def test_a_rejected_clearance_is_burned_instead_of_failing_every_target(tmp_path
         clock=lambda: NOW,
     )
 
-    with pytest.raises(FetchWaveError):
-        pipeline.fetch_wave(
-            run_id,
-            worker_id="worker-1",
-            page_kinds=["competition"],
-            settings=_settings(),
-        )
+    result = pipeline.fetch_wave(
+        run_id,
+        worker_id="worker-1",
+        page_kinds=["competition"],
+        settings=_settings(),
+    )
 
     # The dead session is torn down and a fresh one solved for the next target,
-    # rather than every target being fed to the same rejected clearance.
+    # rather than every target being fed to the same rejected clearance. The
+    # pages themselves were never judged, so they go back to the queue instead
+    # of failing the wave.
     assert control.events.count("session_open") == 2
     assert control.events.count("fetcher_exit") == 2
+    assert result.failures == []
+    assert result.requeued_dead_clearance == 2
+    assert [call[1]["requeue"] for call in control.failed] == [True, True]
 
 
 def test_a_run_that_hits_its_budget_requeues_its_targets_and_ends_clean(tmp_path):

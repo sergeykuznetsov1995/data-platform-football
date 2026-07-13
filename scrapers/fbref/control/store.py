@@ -3582,6 +3582,7 @@ class ControlStore:
         error_message: object,
         retry_delay_seconds: int = 60,
         permanent: bool = False,
+        requeue: bool = False,
         http_status: Optional[int] = None,
         wire_bytes: int = 0,
         provider_billed_bytes: Optional[int] = None,
@@ -3622,8 +3623,16 @@ class ControlStore:
             if session_version is None
             else _text(session_version, "session_version")
         )
-        frontier_state = "dead" if permanent else "retry"
-        target_state = "failed" if permanent else "retry"
+        if requeue:
+            # The attempt is real evidence and is recorded, but the page itself
+            # was never judged — the failure was ours (a clearance the source
+            # stopped honouring). It must stay immediately claimable, and this
+            # run must not count it as an unfinished target.
+            frontier_state, target_state = "queued", "skipped"
+        elif permanent:
+            frontier_state, target_state = "dead", "failed"
+        else:
+            frontier_state, target_state = "retry", "retry"
         normalized_class = _text(error_class, "error_class")
         normalized_message = _text(error_message, "error_message")[:4000]
         with self._transaction() as cursor:
@@ -3646,7 +3655,7 @@ class ControlStore:
                 """,
                 (
                     frontier_state,
-                    permanent,
+                    permanent or requeue,
                     retry_delay,
                     http_status,
                     normalized_class,
