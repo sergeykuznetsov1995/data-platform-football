@@ -380,7 +380,9 @@ def test_exact_cycle_runs_sequentially_without_shell_and_commits_manifest(tmp_pa
     assert ledger['retries'] == 0
     assert ledger['manifest_count'] == 1
     assert ledger['hard_provider_byte_budget'] == cycle.HARD_BYTE_CAP
-    assert ledger['request_limit'] == 316
+    assert ledger['request_limit'] == sum(
+        item['requests'] for item in cycle.DEFAULT_ENTITY_LIMITS.values()
+    )
     assert ledger['retry_limit'] == cycle.PARENT_RETRY_LIMIT
     for field in (
         'decoded_bytes', 'wire_bytes', 'provider_metered_bytes',
