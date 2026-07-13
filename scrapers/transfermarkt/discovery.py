@@ -32,6 +32,7 @@ from scrapers.transfermarkt.registry import (
     TeamType,
     UnknownCompetitionError,
     canonical_season,
+    narrowest_signals,
     resolve_competition,
 )
 
@@ -56,6 +57,13 @@ _COMPETITION_ROUTE_RE = re.compile(
     r"(?P<competition_id>[A-Za-z0-9_-]+)(?:/.*)?$"
 )
 _CANONICAL_SECTION = "startseite"
+# The catalogue states a competition's taxonomy at three levels: a broad section
+# heading, a group separator inside the tables, and the "National Team
+# Competitions" section, which names the entrants themselves — a table group can
+# say "cup" about a national-team tournament, but not that clubs play in it.
+_SECTION_PRECEDENCE = 1
+_GROUP_PRECEDENCE = 2
+_ENTRANT_PRECEDENCE = 3
 _EDITION_PATH_RE = re.compile(r"/saison_id/(?P<edition_id>\d{4})(?:/|$)")
 
 
@@ -361,24 +369,39 @@ def _group_signals(label: str) -> _SectionSignals:
     return _SectionSignals()
 
 
-def _merge_signals(
-    section: _SectionSignals,
-    group: _SectionSignals,
-) -> _SectionSignals:
-    """The table group wins: it is the narrower statement.
+def _section_precedence(label: str) -> int:
+    """How narrowly a section heading speaks about the rows under it.
 
-    A confederation page heads its whole table "European leagues & cups" and
-    then groups the rows into "First Tier", "Domestic Cup", "Youth league" — so
-    the group states what the section only brackets. The section still answers
-    for rows that have no group, such as the continental club competitions.
+    "National Team Competitions" names who plays, which no table group can
+    contradict; the broad rubrics ("Cups", "International cup competitions")
+    bracket club and national-team tournaments together and merely locate them.
     """
-
-    return _SectionSignals(
-        competition_type=group.competition_type or section.competition_type,
-        gender=group.gender or section.gender,
-        team_type=group.team_type or section.team_type,
-        age_category=group.age_category or section.age_category,
+    normalised = _normalise_text(label).casefold()
+    if any(
+        token in normalised
+        for token in (
+            "national team competitions",
+            "national-team competitions",
+            "fifa tournaments",
+            # These say who plays, not where the competition sits: the UEFA
+            # Youth League is listed under "Youth Competitions" and again under
+            # the "Cups" rubric, which cannot make its entrants senior.
+            "youth competitions",
+            "women",
+            "frauen",
+        )
+    ):
+        return _ENTRANT_PRECEDENCE
+    narrow = any(
+        token in normalised
+        for token in (
+            "national leagues",
+            "domestic leagues",
+            "national cups",
+            "domestic cups",
+        )
     )
+    return _GROUP_PRECEDENCE if narrow else _SECTION_PRECEDENCE
 
 
 def _section_label(anchor: Tag) -> str:
@@ -460,12 +483,14 @@ def _signal_evidence(
     label: str,
     source_url: str,
     signals: _SectionSignals,
+    precedence: int = _SECTION_PRECEDENCE,
 ) -> ClassificationEvidence:
     return ClassificationEvidence(
         source_field="section_label",
         source_value=label or "unclassified",
         source_url=source_url,
         origin=EvidenceOrigin.SOURCE_PAGE,
+        precedence=precedence,
         competition_type=signals.competition_type,
         gender=signals.gender,
         team_type=signals.team_type,
@@ -540,12 +565,13 @@ def _listing_candidates(
             raise DiscoverySchemaError(
                 f"competition link has no name: {page_url} -> {profile_url}"
             )
-        label = _section_label(anchor)
+        section_label = _section_label(anchor)
         group_label = _row_group_label(anchor)
-        signals = _merge_signals(
-            _section_signals(label), _group_signals(group_label)
+        stated = (
+            (section_label, _section_signals(section_label),
+             _section_precedence(section_label)),
+            (group_label, _group_signals(group_label), _GROUP_PRECEDENCE),
         )
-        label = label or group_label
         country = _normalise_text(anchor.get("data-country") or context.country)
         confederation = _normalise_text(
             anchor.get("data-confederation") or context.confederation
@@ -555,24 +581,26 @@ def _listing_candidates(
         # manufacture a conflict and block the whole registry instead of
         # source-backed exclusion of that competition.
         evidence = []
-        if signals.gender is not Gender.WOMEN:
+        if all(signals.gender is not Gender.WOMEN for _, signals, _p in stated):
             evidence.append(_taxonomy_evidence(page_url))
-        if any(
-            value is not None
-            for value in (
-                signals.competition_type,
-                signals.gender,
-                signals.team_type,
-                signals.age_category,
-            )
-        ):
-            evidence.append(
-                _signal_evidence(
-                    label=label,
-                    source_url=page_url,
-                    signals=signals,
+        for label, signals, precedence in stated:
+            if any(
+                value is not None
+                for value in (
+                    signals.competition_type,
+                    signals.gender,
+                    signals.team_type,
+                    signals.age_category,
                 )
-            )
+            ):
+                evidence.append(
+                    _signal_evidence(
+                        label=label,
+                        source_url=page_url,
+                        signals=signals,
+                        precedence=precedence,
+                    )
+                )
         candidates.append(
             _CompetitionCandidate(
                 competition_id=competition_id,
@@ -813,11 +841,7 @@ def _season_format(
 
 
 def _unique_signal(evidence: Iterable[ClassificationEvidence], name: str, unknown):
-    values = {
-        getattr(item, name)
-        for item in evidence
-        if getattr(item, name) is not None
-    }
+    values = narrowest_signals(evidence, name)
     return next(iter(values)) if len(values) == 1 else unknown
 
 
