@@ -116,8 +116,10 @@ PENDING_CHECKPOINT_TTL_DAYS = int(
 )
 MIB = 1024 * 1024
 PRODUCTION_CYCLE_BUDGET_BYTES = 15 * MIB
+# 'requests' counts attempts, not pages; keep in sync with the parent cycle's
+# DEFAULT_ENTITY_LIMITS.
 PRODUCTION_ENTITY_BUDGETS = {
-    ENTITY_PLAYERS: {'decoded_mb': 10.0, 'requests': 26},
+    ENTITY_PLAYERS: {'decoded_mb': 10.0, 'requests': 60},
     ENTITY_MV_HISTORY: {'decoded_mb': 4.0, 'requests': 120},
     ENTITY_TRANSFERS: {'decoded_mb': 8.0, 'requests': 120},
     ENTITY_COACHES: {'decoded_mb': 6.0, 'requests': 50},
