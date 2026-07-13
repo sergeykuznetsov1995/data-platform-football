@@ -753,7 +753,8 @@ SELECT
     c.season_format AS competition_season_format,
     c.active AS competition_active,
     c.source_url AS competition_source_url,
-    c.discovered_at AS competition_discovered_at,
+    -- Iceberg stores these without a zone; discovery writes them in UTC.
+    with_timezone(c.discovered_at, 'UTC') AS competition_discovered_at,
     c.canonical_competition_id,
     c.classification_status,
     c.classification_evidence,
@@ -771,7 +772,7 @@ SELECT
     e.participant_count,
     e.participant_hash,
     e.source_url AS edition_source_url,
-    e.discovered_at AS edition_discovered_at,
+    with_timezone(e.discovered_at, 'UTC') AS edition_discovered_at,
     e.source_body_hash AS edition_source_body_hash,
     e.parser_revision AS edition_parser_revision,
     e.schema_revision AS edition_schema_revision,
