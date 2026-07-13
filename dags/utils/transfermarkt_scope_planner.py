@@ -740,7 +740,8 @@ def build_promoted_registry_query(
     ORDER BY revision DESC
     LIMIT 1
 ), last_complete_scope AS (
-    SELECT competition_id, edition_id, MAX(committed_at) AS last_success_at
+    SELECT competition_id, edition_id,
+           with_timezone(MAX(committed_at), 'UTC') AS last_success_at
     FROM {SCOPE_MANIFEST_TABLE}
     WHERE status = '{SCOPE_COMPLETION_STATUS}'
     GROUP BY competition_id, edition_id

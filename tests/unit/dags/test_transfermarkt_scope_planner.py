@@ -320,6 +320,11 @@ def test_completed_ops_scope_is_not_replanned_due_to_status_drift():
     assert (
         f"WHERE status = '{scope_state.SCOPE_COMPLETION_STATUS}'" in query
     )
+    # ``committed_at`` is a naive timestamp(6) written in UTC, and the planner
+    # refuses a timestamp that states no zone — so the read must state it.  The
+    # first scope ever completed is what turns this from theory into a failure:
+    # until then every last_success_at is NULL.
+    assert "with_timezone(MAX(committed_at), 'UTC')" in query
 
     competition = _competition('DONE')
     plan = planner.plan_transfermarkt_scopes(
