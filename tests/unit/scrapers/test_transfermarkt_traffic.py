@@ -623,3 +623,71 @@ def test_career_404_cannot_be_negative_cached_or_deleted():
     assert outcome['status'] == 'retry_exhausted'
     assert outcome['status_code'] == 404
     assert outcome['row_count'] == 0
+
+
+@pytest.mark.unit
+def test_the_breaker_reopens_after_the_source_has_had_time_to_recover():
+    # The source fails in waves. A breaker that never reopens turns a wave into
+    # the end of the entity: every later page is refused untried, and a run that
+    # already paid for hundreds of pages dies holding them.
+    clock = {'now': 1_000.0}
+    manager = _manager(2)
+    factory = _ClientFactory([_FakeResp(b'boom', status=502)] * 5 + [
+        _FakeResp(b'<html>back</html>'),
+    ])
+    client = TransfermarktHttpClient(
+        proxy_manager=manager,
+        client_factory=factory,
+        rate_limiter=_NoWaitLimiter(),
+        sleep_fn=lambda _: None,
+        random_fn=lambda: 0,
+        time_fn=lambda: clock['now'],
+        circuit_failures=5,
+        circuit_reset_seconds=120.0,
+    )
+
+    for _ in range(5):
+        client.fetch('https://www.transfermarkt.com/a', as_json=False,
+                     max_attempts=1)
+    assert client.get_traffic_stats()['circuit_state'] == 'open'
+
+    still_open = client.fetch('https://www.transfermarkt.com/b', as_json=False)
+    assert still_open.status == FetchStatus.RETRY_EXHAUSTED
+    assert len(factory.calls) == 5  # refused without touching the network
+
+    clock['now'] += 121.0
+    recovered = client.fetch('https://www.transfermarkt.com/b', as_json=False,
+                             max_attempts=1)
+
+    assert recovered.status == FetchStatus.OK
+    assert client.get_traffic_stats()['circuit_state'] == 'closed'
+
+
+@pytest.mark.unit
+def test_a_failed_probe_reopens_the_breaker_instead_of_starting_a_storm():
+    clock = {'now': 1_000.0}
+    manager = _manager(2)
+    factory = _ClientFactory([_FakeResp(b'boom', status=502)] * 7)
+    client = TransfermarktHttpClient(
+        proxy_manager=manager,
+        client_factory=factory,
+        rate_limiter=_NoWaitLimiter(),
+        sleep_fn=lambda _: None,
+        random_fn=lambda: 0,
+        time_fn=lambda: clock['now'],
+        circuit_failures=5,
+        circuit_reset_seconds=120.0,
+    )
+    for _ in range(5):
+        client.fetch('https://www.transfermarkt.com/a', as_json=False,
+                     max_attempts=1)
+
+    clock['now'] += 121.0
+    probe = client.fetch('https://www.transfermarkt.com/b', as_json=False,
+                         max_attempts=1)
+    assert probe.status == FetchStatus.RETRY_EXHAUSTED
+    assert len(factory.calls) == 6  # the probe, and only the probe
+
+    after = client.fetch('https://www.transfermarkt.com/c', as_json=False)
+    assert after.status == FetchStatus.RETRY_EXHAUSTED
+    assert len(factory.calls) == 6  # shut again, at the cost of one request

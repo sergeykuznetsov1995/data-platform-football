@@ -376,13 +376,16 @@ def test_shared_retry_cap_blocks_paid_retry_n_plus_one_before_io():
         sleep_fn=lambda _: None,
     )
 
+    # max_attempts is what bounds this fetch — a block is now worth more than
+    # one alternate exit, so the ladder must be capped here to spend exactly
+    # the one paid retry the ledger allows.
     first = client.fetch(
-        "https://www.transfermarkt.us/a", as_json=False, max_attempts=3,
+        "https://www.transfermarkt.us/a", as_json=False, max_attempts=2,
     )
     assert first.status is FetchStatus.BLOCKED
     with pytest.raises(TrafficBudgetExceeded, match="paid retry budget"):
         client.fetch(
-            "https://www.transfermarkt.us/b", as_json=False, max_attempts=3,
+            "https://www.transfermarkt.us/b", as_json=False, max_attempts=2,
         )
 
     assert sum(len(item.calls) for item in factory.clients) == 3
