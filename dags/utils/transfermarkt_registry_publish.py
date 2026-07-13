@@ -384,20 +384,24 @@ def _dq_sql(
     if compare_competitions and compare_editions:
         c_columns = ', '.join(_COMPETITION_COLUMNS)
         e_columns = ', '.join(_EDITION_COLUMNS)
+        # Competitions and editions have different shapes, so their differences
+        # cannot share one UNION; count each side and add the totals.
         mismatch = f"""(
-            SELECT COUNT(*) FROM (
+            (SELECT COUNT(*) FROM (
                 (SELECT {c_columns} FROM c
                  EXCEPT SELECT {c_columns} FROM {compare_competitions})
                 UNION ALL
                 (SELECT {c_columns} FROM {compare_competitions}
                  EXCEPT SELECT {c_columns} FROM c)
-                UNION ALL
+            ) competition_differences)
+            +
+            (SELECT COUNT(*) FROM (
                 (SELECT {e_columns} FROM e
                  EXCEPT SELECT {e_columns} FROM {compare_editions})
                 UNION ALL
                 (SELECT {e_columns} FROM {compare_editions}
                  EXCEPT SELECT {e_columns} FROM e)
-            ) differences
+            ) edition_differences)
         )"""
     return f"""/* tm_registry_dq:{tag} */
 WITH c AS (
