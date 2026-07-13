@@ -1705,6 +1705,16 @@ class TestCalendarLeagueSeason:
         # A split-year season opens in the year its saison_id names.
         assert season_window_year('2025', SeasonFormat.SPLIT_YEAR, '2526') == 2025
 
+    def test_the_year_2021_is_not_the_key_of_the_2020_21_season(self):
+        # '2021' is both the year and the key of the season before it — the two
+        # are the same four characters.  Reading a season out of its digits
+        # therefore filed every 2021/22 split-year row under 2020/21.
+        from scrapers.transfermarkt.scraper import _normalise_requested_season
+
+        assert _normalise_requested_season(2021, SeasonFormat.SPLIT_YEAR) == '2122'
+        assert _normalise_requested_season(2020, SeasonFormat.SPLIT_YEAR) == '2021'
+        assert _normalise_requested_season(2024, SeasonFormat.SINGLE_YEAR) == '2024'
+
     def test_a_stint_in_the_registered_season_survives_and_keys_that_season(
         self, monkeypatch,
     ):
