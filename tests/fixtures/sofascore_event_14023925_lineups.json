@@ -1,0 +1,40 @@
+{
+  "confirmed": true,
+  "home": {
+    "formation": "4-3-3",
+    "players": [
+      {
+        "player": {"id": 11111, "name": "Starter One", "position": "F"},
+        "shirtNumber": 9,
+        "position": "ST",
+        "substitute": false,
+        "captain": true,
+        "statistics": {"minutesPlayed": 90, "rating": 8.1, "goals": 1}
+      },
+      {
+        "player": {"id": 11112, "name": "Unused Home", "position": "M"},
+        "shirtNumber": 18,
+        "substitute": true
+      }
+    ]
+  },
+  "away": {
+    "formation": "4-2-3-1",
+    "players": [
+      {
+        "player": {"id": 22221, "name": "Starter Away", "position": "G"},
+        "shirtNumber": 1,
+        "position": "G",
+        "substitute": false,
+        "captain": false,
+        "statistics": {"minutesPlayed": 90, "rating": 7.2, "saves": 4}
+      },
+      {
+        "player": {"id": 22222, "name": "Used Away", "position": "F"},
+        "shirtNumber": 20,
+        "substitute": true,
+        "statistics": {"minutesPlayed": 24, "rating": 6.7}
+      }
+    ]
+  }
+}

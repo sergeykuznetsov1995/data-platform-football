@@ -14,6 +14,7 @@ from scrapers.sofascore.discovery import (
     CATALOG_PATH,
     CATEGORIES_FALLBACK_PATH,
     CATEGORIES_PATH,
+    TOURNAMENT_PATH,
     DirectSofaScoreClient,
     DiscoveryConcurrentUpdate,
     DiscoveryHTTPError,
@@ -41,6 +42,7 @@ def _catalog_item(source_id, name, slug, category_name, category_slug):
         "id": source_id,
         "name": name,
         "slug": slug,
+        "gender": "M",
         "category": {
             "id": source_id + 1000,
             "name": category_name,
@@ -120,6 +122,7 @@ class _FakeClient:
             "direct_response_bytes": 12345,
             "paid_proxy_bytes": 0,
             "browser_sessions": 0,
+            "browser_navigations": 0,
         }
 
 
@@ -246,6 +249,25 @@ def test_category_all_404_uses_compatible_index_fallback():
 
 
 @pytest.mark.unit
+def test_active_reviewed_scope_skips_catalog_and_refreshes_only_reviewed():
+    existing = json.loads(
+        Path("configs/sofascore/tournaments.json").read_text(encoding="utf-8")
+    )
+    client = _FakeClient()
+    for item in TOURNAMENTS[:2]:
+        client.payloads[TOURNAMENT_PATH.format(
+            unique_tournament_id=item[0]
+        )] = {"uniqueTournament": _catalog_item(*item[:5])}
+
+    _, report = discover_registry(existing, client, scope="active-reviewed")
+
+    assert CATALOG_PATH not in client.calls
+    assert CATEGORIES_PATH not in client.calls
+    assert report["scope"] == "active-reviewed"
+    assert report["catalog_tournaments"] == 2
+
+
+@pytest.mark.unit
 def test_empty_category_index_fails_closed():
     existing = json.loads(
         Path("configs/sofascore/tournaments.json").read_text(encoding="utf-8")
@@ -288,6 +310,18 @@ def test_missing_enabled_tournament_seasons_fails_closed():
 
 
 @pytest.mark.unit
+def test_partial_season_traversal_cannot_shrink_existing_registry():
+    existing = json.loads(
+        Path("configs/sofascore/tournaments.json").read_text(encoding="utf-8")
+    )
+    client = _FakeClient()
+    client.payloads["/unique-tournament/270/seasons"] = {"seasons": []}
+
+    with pytest.raises(DiscoverySchemaError, match="season traversal shrank"):
+        discover_registry(existing, client)
+
+
+@pytest.mark.unit
 def test_missing_old_tournaments_and_seasons_are_preserved():
     existing = json.loads(
         Path("configs/sofascore/tournaments.json").read_text(encoding="utf-8")
@@ -309,6 +343,7 @@ def test_source_season_id_replacement_does_not_create_a_duplicate():
         if item["unique_tournament_id"] == 17
     )
     epl["seasons"][0]["season_id"] = 111
+    epl["seasons"][0]["aliases"].append("operator-alias")
     client = _FakeClient()
 
     merged, _ = discover_registry(existing, client)
@@ -318,6 +353,7 @@ def test_source_season_id_replacement_does_not_create_a_duplicate():
     assert [season.season_id for season in catalog.tournament(17).seasons] == [
         76986
     ]
+    assert "operator-alias" in catalog.tournament(17).seasons[0].aliases
 
 
 @pytest.mark.unit
@@ -372,12 +408,15 @@ def test_direct_client_ignores_poison_proxy_environment(monkeypatch):
     assert session.trust_env is False
     assert session.proxies == {}
     assert session.calls[0][1]["proxies"] == {}
+    assert session.headers["x-requested-with"] == "XMLHttpRequest"
+    assert session.headers["origin"] == "https://www.sofascore.com"
     assert any(
         int(option) == 10004 and value == ""
         for option, value in session.curl_options.items()
     )
     assert client.stats["paid_proxy_bytes"] == 0
     assert client.stats["browser_sessions"] == 0
+    assert client.stats["browser_navigations"] == 0
 
 
 @pytest.mark.unit

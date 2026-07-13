@@ -1,5 +1,7 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
+  "source": "sofascore",
+  "operator_owned_fields": ["canonical_id", "enabled", "review", "seasons[].aliases", "seasons[].canonical_season_override"],
   "tournaments": [
     {
       "unique_tournament_id": 1,
@@ -10,6 +12,21 @@
       "page_path": "football/europe/european-championship",
       "canonical_id": "INT-European Championship",
       "enabled": false,
+      "classification": {"sport": "football", "gender": "unknown", "age_group": "unknown", "team_level": "unknown", "status": "unknown", "exclusion_reasons": [], "evidence": [{"type": "registry_migration", "endpoint": "configs/sofascore/tournaments.json@schema-v1", "field": "sport_slug", "value": "football"}]},
+      "review": {"status": "pending", "confirmed": {"sport": null, "gender": null, "age_group": null, "team_level": null}, "reviewed_by": null, "reviewed_at": null, "evidence": [], "notes": null},
+      "seasons": []
+    },
+    {
+      "unique_tournament_id": 7,
+      "name": "UEFA Champions League",
+      "slug": "uefa-champions-league",
+      "category": {"id": null, "name": "Europe", "slug": "europe"},
+      "sport_slug": "football",
+      "page_path": "football/europe/uefa-champions-league",
+      "canonical_id": null,
+      "enabled": false,
+      "classification": {"sport": "football", "gender": "unknown", "age_group": "unknown", "team_level": "unknown", "status": "unknown", "exclusion_reasons": [], "evidence": [{"type": "registry_migration", "endpoint": "configs/sofascore/tournaments.json@schema-v1", "field": "sport_slug", "value": "football"}]},
+      "review": {"status": "pending", "confirmed": {"sport": null, "gender": null, "age_group": null, "team_level": null}, "reviewed_by": null, "reviewed_at": null, "evidence": [], "notes": null},
       "seasons": []
     },
     {
@@ -21,6 +38,8 @@
       "page_path": "football/spain/laliga",
       "canonical_id": "ESP-La Liga",
       "enabled": false,
+      "classification": {"sport": "football", "gender": "unknown", "age_group": "unknown", "team_level": "unknown", "status": "unknown", "exclusion_reasons": [], "evidence": [{"type": "registry_migration", "endpoint": "configs/sofascore/tournaments.json@schema-v1", "field": "sport_slug", "value": "football"}]},
+      "review": {"status": "pending", "confirmed": {"sport": null, "gender": null, "age_group": null, "team_level": null}, "reviewed_by": null, "reviewed_at": null, "evidence": [], "notes": null},
       "seasons": []
     },
     {
@@ -32,14 +51,10 @@
       "page_path": "football/world/world-championship",
       "canonical_id": "INT-World Cup",
       "enabled": true,
+      "classification": {"sport": "football", "gender": "male", "age_group": "unknown", "team_level": "unknown", "status": "review_required", "exclusion_reasons": [], "evidence": [{"type": "source_dataset", "endpoint": "bronze.sofascore_schedule", "field": "home_gender/away_gender", "value": "M"}]},
+      "review": {"status": "approved", "confirmed": {"sport": "football", "gender": "male", "age_group": "adult", "team_level": "first_team"}, "reviewed_by": "registry-v2-migration", "reviewed_at": "2026-07-11", "evidence": [{"type": "repository", "reference": "configs/medallion/competitions.yaml#INT-World-Cup", "note": "adult men's senior national-team competition"}], "notes": "Existing production activation retained after fail-closed review."},
       "seasons": [
-        {
-          "season_id": 58210,
-          "name": "World Cup 2026",
-          "year": "2026",
-          "season_format": "single_year",
-          "canonical_season": "2026"
-        }
+        {"season_id": 58210, "name": "World Cup 2026", "source_name": "World Cup 2026", "year": "2026", "format": "calendar_year", "season_format": "single_year", "canonical_season": "2026", "start_date": null, "end_date": null, "aliases": ["2026", "World Cup 2026"], "evidence": [{"type": "source_field", "endpoint": "/unique-tournament/16/seasons", "field": "name/year", "value": "World Cup 2026|2026"}]}
       ]
     },
     {
@@ -51,14 +66,10 @@
       "page_path": "football/england/premier-league",
       "canonical_id": "ENG-Premier League",
       "enabled": true,
+      "classification": {"sport": "football", "gender": "male", "age_group": "unknown", "team_level": "unknown", "status": "review_required", "exclusion_reasons": [], "evidence": [{"type": "source_dataset", "endpoint": "bronze.sofascore_schedule", "field": "home_gender/away_gender", "value": "M"}]},
+      "review": {"status": "approved", "confirmed": {"sport": "football", "gender": "male", "age_group": "adult", "team_level": "first_team"}, "reviewed_by": "registry-v2-migration", "reviewed_at": "2026-07-11", "evidence": [{"type": "repository", "reference": "configs/medallion/competitions.yaml#ENG-Premier-League", "note": "adult men's first-team club competition"}], "notes": "Existing production activation retained after fail-closed review."},
       "seasons": [
-        {
-          "season_id": 76986,
-          "name": "Premier League 25/26",
-          "year": "25/26",
-          "season_format": "split_year",
-          "canonical_season": "2526"
-        }
+        {"season_id": 76986, "name": "Premier League 25/26", "source_name": "Premier League 25/26", "year": "25/26", "format": "split_year", "season_format": "split_year", "canonical_season": "2526", "start_date": null, "end_date": null, "aliases": ["25/26", "Premier League 25/26", "2526"], "evidence": [{"type": "source_field", "endpoint": "/unique-tournament/17/seasons", "field": "name/year", "value": "Premier League 25/26|25/26"}]}
       ]
     },
     {
@@ -70,6 +81,8 @@
       "page_path": "football/italy/serie-a",
       "canonical_id": "ITA-Serie A",
       "enabled": false,
+      "classification": {"sport": "football", "gender": "unknown", "age_group": "unknown", "team_level": "unknown", "status": "unknown", "exclusion_reasons": [], "evidence": [{"type": "registry_migration", "endpoint": "configs/sofascore/tournaments.json@schema-v1", "field": "sport_slug", "value": "football"}]},
+      "review": {"status": "pending", "confirmed": {"sport": null, "gender": null, "age_group": null, "team_level": null}, "reviewed_by": null, "reviewed_at": null, "evidence": [], "notes": null},
       "seasons": []
     },
     {
@@ -81,6 +94,8 @@
       "page_path": "football/france/ligue-1",
       "canonical_id": "FRA-Ligue 1",
       "enabled": false,
+      "classification": {"sport": "football", "gender": "unknown", "age_group": "unknown", "team_level": "unknown", "status": "unknown", "exclusion_reasons": [], "evidence": [{"type": "registry_migration", "endpoint": "configs/sofascore/tournaments.json@schema-v1", "field": "sport_slug", "value": "football"}]},
+      "review": {"status": "pending", "confirmed": {"sport": null, "gender": null, "age_group": null, "team_level": null}, "reviewed_by": null, "reviewed_at": null, "evidence": [], "notes": null},
       "seasons": []
     },
     {
@@ -92,17 +107,34 @@
       "page_path": "football/germany/bundesliga",
       "canonical_id": "GER-Bundesliga",
       "enabled": false,
+      "classification": {"sport": "football", "gender": "unknown", "age_group": "unknown", "team_level": "unknown", "status": "unknown", "exclusion_reasons": [], "evidence": [{"type": "registry_migration", "endpoint": "configs/sofascore/tournaments.json@schema-v1", "field": "sport_slug", "value": "football"}]},
+      "review": {"status": "pending", "confirmed": {"sport": null, "gender": null, "age_group": null, "team_level": null}, "reviewed_by": null, "reviewed_at": null, "evidence": [], "notes": null},
       "seasons": []
     },
     {
       "unique_tournament_id": 133,
-      "name": "Copa Am\u00e9rica",
+      "name": "Copa América",
       "slug": "copa-america",
       "category": {"id": null, "name": "South America", "slug": "south-america"},
       "sport_slug": "football",
       "page_path": "football/south-america/copa-america",
       "canonical_id": "INT-Copa America",
       "enabled": false,
+      "classification": {"sport": "football", "gender": "unknown", "age_group": "unknown", "team_level": "unknown", "status": "unknown", "exclusion_reasons": [], "evidence": [{"type": "registry_migration", "endpoint": "configs/sofascore/tournaments.json@schema-v1", "field": "sport_slug", "value": "football"}]},
+      "review": {"status": "pending", "confirmed": {"sport": null, "gender": null, "age_group": null, "team_level": null}, "reviewed_by": null, "reviewed_at": null, "evidence": [], "notes": null},
+      "seasons": []
+    },
+    {
+      "unique_tournament_id": 203,
+      "name": "Premier Liga",
+      "slug": "premier-liga",
+      "category": {"id": null, "name": "Russia", "slug": "russia"},
+      "sport_slug": "football",
+      "page_path": "football/russia/premier-liga",
+      "canonical_id": null,
+      "enabled": false,
+      "classification": {"sport": "football", "gender": "unknown", "age_group": "unknown", "team_level": "unknown", "status": "unknown", "exclusion_reasons": [], "evidence": [{"type": "registry_migration", "endpoint": "configs/sofascore/tournaments.json@schema-v1", "field": "sport_slug", "value": "football"}]},
+      "review": {"status": "pending", "confirmed": {"sport": null, "gender": null, "age_group": null, "team_level": null}, "reviewed_by": null, "reviewed_at": null, "evidence": [], "notes": null},
       "seasons": []
     },
     {
@@ -114,15 +146,24 @@
       "page_path": "football/africa/africa-cup-of-nations",
       "canonical_id": "INT-Africa Cup of Nations",
       "enabled": false,
+      "classification": {"sport": "football", "gender": "unknown", "age_group": "unknown", "team_level": "unknown", "status": "unknown", "exclusion_reasons": [], "evidence": [{"type": "registry_migration", "endpoint": "configs/sofascore/tournaments.json@schema-v1", "field": "sport_slug", "value": "football"}]},
+      "review": {"status": "pending", "confirmed": {"sport": null, "gender": null, "age_group": null, "team_level": null}, "reviewed_by": null, "reviewed_at": null, "evidence": [], "notes": null},
       "seasons": [
-        {
-          "season_id": 71636,
-          "name": "Africa Cup of Nations 2025",
-          "year": "2025",
-          "season_format": "single_year",
-          "canonical_season": "2025"
-        }
+        {"season_id": 71636, "name": "Africa Cup of Nations 2025", "source_name": "Africa Cup of Nations 2025", "year": "2025", "format": "calendar_year", "season_format": "single_year", "canonical_season": "2025", "start_date": null, "end_date": null, "aliases": ["2025", "Africa Cup of Nations 2025"], "evidence": [{"type": "source_field", "endpoint": "/unique-tournament/270/seasons", "field": "name/year", "value": "Africa Cup of Nations 2025|2025"}]}
       ]
+    },
+    {
+      "unique_tournament_id": 10783,
+      "name": "UEFA Nations League",
+      "slug": "uefa-nations-league",
+      "category": {"id": null, "name": "Europe", "slug": "europe"},
+      "sport_slug": "football",
+      "page_path": "football/europe/uefa-nations-league",
+      "canonical_id": null,
+      "enabled": false,
+      "classification": {"sport": "football", "gender": "unknown", "age_group": "unknown", "team_level": "unknown", "status": "unknown", "exclusion_reasons": [], "evidence": [{"type": "registry_migration", "endpoint": "configs/sofascore/tournaments.json@schema-v1", "field": "sport_slug", "value": "football"}]},
+      "review": {"status": "pending", "confirmed": {"sport": null, "gender": null, "age_group": null, "team_level": null}, "reviewed_by": null, "reviewed_at": null, "evidence": [], "notes": null},
+      "seasons": []
     }
   ]
 }
