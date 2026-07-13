@@ -173,7 +173,7 @@ Thumbs.db
 *.csv
 *.json
 !configs/**/*.json
-!tests/fixtures/*.json
+!tests/fixtures/**/*.json
 
 # Airflow logs (generated at runtime)
 /airflow/logs/

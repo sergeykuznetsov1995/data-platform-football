@@ -1,0 +1,7 @@
+{
+  "players": [
+    {"player": {"id": 1001, "name": "Player One", "position": "G"}, "shirtNumber": 1},
+    {"player": {"id": 1002, "name": "Player Two", "position": "D"}, "shirtNumber": 2}
+  ],
+  "coach": {"id": 7001, "name": "Head Coach"}
+}

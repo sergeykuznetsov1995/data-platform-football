@@ -1,0 +1,944 @@
+# SofaScore endpoint/table coverage as implemented in this revision.
+#
+# `normalized` means the current production code has a parser AND a real
+# Bronze/Silver destination wired by a runner/task. `raw-only` means a payload
+# is fetched into the exact raw store but has no normalized destination.
+# `unsupported` means the unified production engine cannot currently capture
+# or replay it. `intentionally-excluded` means the endpoint is deliberately not
+# requested. This file must never describe a planned table as materialized.
+
+schema_version: 1
+source: sofascore
+
+coverage_statuses:
+  - normalized
+  - raw-only
+  - unsupported
+  - intentionally-excluded
+
+coverage_summary:
+  normalized: 14
+  raw-only: 4
+  unsupported: 2
+  intentionally-excluded: 8
+
+manifest:
+  table: iceberg.ops.sofascore_capture_manifest
+  natural_key:
+    - source_tournament_id
+    - source_season_id
+    - target_type
+    - target_id
+    - endpoint
+    - freshness_key
+  states:
+    - success
+    - legitimate_empty
+    - not_supported
+    - retryable_failure
+    - schema_error
+  acceptable_terminal_states:
+    required: [success, legitimate_empty]
+    optional: [success, legitimate_empty, not_supported]
+  retryable_http_statuses: [403, 429, 500, 502, 503, 504]
+  exact_raw_lineage:
+    - raw_content_hash
+    - raw_blob_key
+    - request_url
+    - http_status
+    - fetched_at
+  compatibility_projection: bronze.sofascore_match_capture_status
+  raw_replay_endpoints:
+    - schedule_last
+    - schedule_next
+    - standings_total
+    - rounds
+    - cup_trees
+    - participants
+    - squads
+    - referee_profile
+    - event
+    - lineups
+    - statistics
+    - shotmap
+    - incidents
+    - player_profile
+    - player_season_statistics
+
+quality_gates:
+  duplicate_natural_keys: 0
+  season_mismatches: 0
+  skeleton_schedule_rows: 0
+  partition_key_loss: 0
+  required_endpoint_completeness: 1.0
+  player_profile_coverage: 0.95
+  player_rating_coverage: 0.95
+  silver_gold_attach_rate: 0.95
+  raw_array_loss: 0
+  required_field_loss: 0
+
+# Tables available by the end of dag_transform_e3 and relevant to committed
+# season/match/profile state. silver.sofascore_player_ratings is checked later
+# by the existing E4 no-duplicates gate.
+committed_state_dq:
+  required_event_endpoints: [event, lineups, statistics, shotmap, incidents]
+  duplicate_tables:
+    - bronze.sofascore_schedule
+    - bronze.sofascore_league_table
+    - bronze.sofascore_events
+    - bronze.sofascore_event_participants
+    - bronze.sofascore_lineups
+    - bronze.sofascore_incidents
+    - bronze.sofascore_player_ratings
+    - bronze.sofascore_event_player_stats
+    - bronze.sofascore_match_stats
+    - bronze.sofascore_event_shotmap
+    - bronze.sofascore_venue
+    - bronze.sofascore_match_capture_status
+    - bronze.sofascore_player_universe
+    - bronze.sofascore_player_profile
+    - bronze.sofascore_player_season_stats
+    - silver.sofascore_league_table
+    - silver.sofascore_player_match_aggregate
+    - silver.sofascore_team_match
+    - silver.sofascore_shots
+    - silver.sofascore_venue
+    - silver.sofascore_player_profile
+    - silver.sofascore_player_season_aggregate
+    - gold.fct_sofascore_team_match_post_shot_xg
+  # Materialized by E4 after this E3 gate. dags/utils/e4_dq.py owns its
+  # equivalent no_duplicates check on the same declared natural key.
+  later_stage_duplicate_tables:
+    - silver.sofascore_player_ratings
+
+# Static Silver SQL references both legacy and source-key Bronze columns. The
+# writers create this nullable superset so a fresh Iceberg catalog plans the
+# COALESCE expressions successfully.
+bronze_compatibility_columns:
+  sofascore_schedule:
+    - [home_team, home_team_name]
+    - [away_team, away_team_name]
+    - [home_score, home_score_current]
+    - [away_score, away_score_current]
+  sofascore_event_shotmap:
+    - [minute, time]
+    - [x, player_coordinates_x]
+    - [y, player_coordinates_y]
+  sofascore_venue:
+    - [stadium, stadium_name]
+    - [city, city_name]
+    - [country, country_name]
+    - [venue_latitude, venue_coordinates_latitude]
+    - [venue_longitude, venue_coordinates_longitude]
+  sofascore_player_profile:
+    - [height_cm, height]
+    - [date_of_birth, date_of_birth_timestamp]
+    - [nationality, country_name]
+    - [country_code, country_alpha2]
+    - [current_team_id, team_id]
+    - [current_team_name, team_name]
+  sofascore_match_stats:
+    - [stat_name, name]
+    - [stat_key, key, statistics_type]
+    - [home_text, home]
+    - [away_text, away]
+
+# Only physical tables with a current writer or transform task are listed.
+tables:
+  bronze.sofascore_schedule:
+    grain: one SofaScore event in one canonical competition season partition
+    natural_key: [league, season, game_id]
+    required_columns:
+      - game_id
+      - home_team_name
+      - away_team_name
+      - start_timestamp
+      - league
+      - season
+      - _ingested_at
+    partition_columns: [league, season]
+    materialized_by: dags/scripts/run_sofascore_scraper.py#_run_season_capture_engine
+    production_write_status: raw replay/no-op wired; paid live capture fails closed pending verified provider meter
+    downstream: [silver.xref_match, silver.sofascore_team_match, silver.sofascore_shots]
+
+  bronze.sofascore_league_table:
+    grain: one team in one total standings block
+    natural_key: [league, season, group, team]
+    required_columns: [team, mp, w, d, l, gf, ga, gd, pts, group, league, season, _ingested_at]
+    partition_columns: [league, season]
+    materialized_by: dags/scripts/run_sofascore_scraper.py#_run_season_capture_engine
+    production_write_status: raw replay/no-op wired; paid live capture fails closed pending verified provider meter
+    downstream: [silver.sofascore_league_table]
+
+  bronze.sofascore_events:
+    grain: one full-event scalar projection
+    natural_key: [league, season, match_id]
+    required_columns:
+      - match_id
+      - id
+      - source_tournament_id
+      - source_season_id
+      - season_id
+      - home_team_id
+      - away_team_id
+      - start_timestamp
+      - status_type
+      - raw_content_hash
+      - raw_blob_key
+      - league
+      - season
+      - _ingested_at
+    partition_columns: [league, season]
+    materialized_by: dags/scripts/run_sofascore_scraper.py#_run_match_capture
+    production_write_status: replay/no-op wired; paid live capture fails closed pending verified budget
+    downstream: [committed-state season/schema DQ, direct match/referee metadata analysis]
+
+  bronze.sofascore_event_participants:
+    grain: one home or away team in one event
+    natural_key: [league, season, match_id, team_id]
+    required_columns:
+      - match_id
+      - team_id
+      - team_side
+      - name
+      - gender
+      - team_type
+      - source_tournament_id
+      - source_season_id
+      - raw_content_hash
+      - raw_blob_key
+      - league
+      - season
+      - _ingested_at
+    allowed_values:
+      team_side: [home, away]
+    partition_columns: [league, season]
+    materialized_by: dags/scripts/run_sofascore_scraper.py#_run_match_capture
+    production_write_status: replay/no-op wired; paid live capture fails closed pending verified budget
+    downstream: [silver.xref_team]
+
+  bronze.sofascore_lineups:
+    grain: one listed player in one event
+    natural_key: [league, season, match_id, player_id]
+    required_columns:
+      - match_id
+      - player_id
+      - team_side
+      - is_starter
+      - is_bench
+      - is_unused_substitute
+      - participation_status
+      - source_tournament_id
+      - source_season_id
+      - raw_content_hash
+      - raw_blob_key
+      - league
+      - season
+      - _ingested_at
+    allowed_values:
+      team_side: [home, away]
+      participation_status: [starter, substitute_used, unused_substitute]
+    partition_columns: [league, season]
+    materialized_by: dags/scripts/run_sofascore_scraper.py#_run_match_capture
+    production_write_status: replay/no-op wired; paid live capture fails closed pending verified budget
+    downstream: [silver.xref_player]
+
+  bronze.sofascore_incidents:
+    grain: one ordered incident in one event
+    natural_key: [league, season, match_id, incident_id]
+    required_columns:
+      - match_id
+      - incident_id
+      - incident_order
+      - incident_type
+      - source_tournament_id
+      - source_season_id
+      - raw_content_hash
+      - raw_blob_key
+      - league
+      - season
+      - _ingested_at
+    partition_columns: [league, season]
+    materialized_by: dags/scripts/run_sofascore_scraper.py#_run_match_capture
+    production_write_status: replay/no-op wired; paid live capture fails closed pending verified budget
+    downstream: [bronze.sofascore_player_universe, discipline/substitution/VAR analysis]
+
+  bronze.sofascore_player_ratings:
+    grain: one listed player rating in one event
+    natural_key: [league, season, match_id, player_id]
+    required_columns:
+      - match_id
+      - player_id
+      - team_side
+      - rating
+      - source_tournament_id
+      - source_season_id
+      - raw_content_hash
+      - raw_blob_key
+      - league
+      - season
+      - _ingested_at
+    partition_columns: [league, season]
+    materialized_by: dags/scripts/run_sofascore_scraper.py#_run_match_capture
+    production_write_status: replay/no-op wired; paid live capture fails closed pending verified budget
+    downstream: [silver.sofascore_player_ratings]
+
+  bronze.sofascore_event_player_stats:
+    grain: one player statistics block in one event
+    natural_key: [league, season, match_id, player_id]
+    required_columns:
+      - match_id
+      - player_id
+      - team_id
+      - source_tournament_id
+      - source_season_id
+      - raw_content_hash
+      - raw_blob_key
+      - league
+      - season
+      - _ingested_at
+    partition_columns: [league, season]
+    materialized_by: dags/scripts/run_sofascore_scraper.py#_run_match_capture
+    production_write_status: replay/no-op wired; paid live capture fails closed pending verified budget
+    downstream: [silver.sofascore_player_match_aggregate]
+
+  bronze.sofascore_match_stats:
+    grain: one statistic key in one event period
+    natural_key: [league, season, match_id, period, stat_group, statistic_key]
+    required_columns:
+      - match_id
+      - period
+      - stat_group
+      - statistic_key
+      - source_tournament_id
+      - source_season_id
+      - raw_content_hash
+      - raw_blob_key
+      - league
+      - season
+      - _ingested_at
+    partition_columns: [league, season]
+    materialized_by: dags/scripts/run_sofascore_scraper.py#_run_match_capture
+    production_write_status: replay/no-op wired; paid live capture fails closed pending verified budget
+    downstream: [silver.sofascore_team_match]
+
+  bronze.sofascore_event_shotmap:
+    grain: one shot in one event
+    natural_key: [league, season, match_id, shot_id]
+    required_columns:
+      - match_id
+      - shot_id
+      - team_id
+      - source_tournament_id
+      - source_season_id
+      - raw_content_hash
+      - raw_blob_key
+      - league
+      - season
+      - _ingested_at
+    partition_columns: [league, season]
+    materialized_by: dags/scripts/run_sofascore_scraper.py#_run_match_capture
+    production_write_status: replay/no-op wired; paid live capture fails closed pending verified budget
+    downstream: [silver.sofascore_shots]
+
+  bronze.sofascore_venue:
+    grain: one observed venue in one event
+    natural_key: [league, season, game_id]
+    required_columns:
+      - game_id
+      - stadium_name
+      - source_tournament_id
+      - source_season_id
+      - raw_content_hash
+      - raw_blob_key
+      - league
+      - season
+      - _ingested_at
+    partition_columns: [league, season]
+    materialized_by: dags/scripts/run_sofascore_scraper.py#_run_match_capture
+    production_write_status: replay/no-op wired; paid live capture fails closed pending verified budget
+    downstream: [silver.sofascore_venue]
+
+  bronze.sofascore_match_capture_status:
+    grain: one compatibility endpoint-state projection per event
+    natural_key: [league, season, match_id]
+    required_columns:
+      - match_id
+      - event_status
+      - lineups_status
+      - statistics_status
+      - shotmap_status
+      - incidents_status
+      - capture_complete
+      - league
+      - season
+      - _ingested_at
+    partition_columns: [league, season]
+    materialized_by: scrapers/sofascore/adapters.py#project_legacy_match_status
+    production_write_status: active compatibility projection; canonical state is ops manifest
+    downstream: [DAG no-op compatibility]
+
+  bronze.sofascore_player_profile:
+    grain: one player profile snapshot in one competition season
+    natural_key: [league, season, player_id]
+    required_columns: [player_id, name, league, season, _ingested_at]
+    partition_columns: [league, season]
+    materialized_by: dags/scripts/run_sofascore_scraper.py#_run_player_capture
+    production_write_status: replay/no-op wired; paid live capture fails closed pending verified provider meter
+    downstream: [silver.sofascore_player_profile]
+
+  bronze.sofascore_player_universe:
+    grain: one registered or match-observed player in one competition season
+    natural_key: [league, season, player_id]
+    required_columns:
+      - player_id
+      - in_registered_squad
+      - observed_in_match
+      - source_tournament_id
+      - source_season_id
+      - league
+      - season
+      - _ingested_at
+    partition_columns: [league, season]
+    materialized_by: dags/scripts/run_sofascore_scraper.py#_run_player_capture
+    production_write_status: replay/no-op wired; paid live capture fails closed pending verified provider meter
+    downstream: [profile coverage DQ, silver.xref_player]
+
+  bronze.sofascore_player_season_stats:
+    grain: one player in one SofaScore tournament season
+    natural_key: [league, season, player_id, unique_tournament_id, sofascore_season_id]
+    required_columns:
+      - player_id
+      - unique_tournament_id
+      - sofascore_season_id
+      - league
+      - season
+      - _ingested_at
+    partition_columns: [league, season]
+    materialized_by: dags/scripts/run_sofascore_scraper.py#_run_player_capture
+    production_write_status: replay/no-op wired; paid live capture fails closed pending verified provider meter
+    downstream: [silver.sofascore_player_season_aggregate]
+
+  silver.sofascore_league_table:
+    grain: one team in one legacy total standings snapshot
+    natural_key: [league, season, standing_scope, team_name]
+    required_columns: [team_name, played, wins, draws, losses, goals_for, goals_against, goal_diff, points, group_id, standing_scope, league, season]
+    partition_columns: [league, season]
+    materialized_by: dags/dag_transform_e3.py#SILVER_E3_TRANSFORMS
+    production_write_status: transform active over existing Bronze
+    downstream: [gold.fct_standings]
+
+  silver.sofascore_player_ratings:
+    grain: one resolved player rating in one event
+    natural_key: [match_id_canonical, player_id_canonical, league, season]
+    required_columns:
+      - match_id_canonical
+      - player_id_canonical
+      - rating
+      - source
+      - source_version
+      - league
+      - season
+    partition_columns: [league, season]
+    materialized_by: dags/dag_transform_e4.py#SILVER_E4_TRANSFORMS
+    production_write_status: transform active over existing Bronze
+    downstream: [gold.fct_match_rating]
+
+  silver.sofascore_player_match_aggregate:
+    grain: one played player statistics row in one event
+    natural_key: [match_id, player_id, league, season]
+    required_columns: [match_id, player_id, team_id, is_starter, league, season]
+    partition_columns: [league, season]
+    materialized_by: dags/dag_transform_e3.py#SILVER_E3_TRANSFORMS
+    production_write_status: transform active over existing Bronze
+    downstream: [gold.fct_player_match, gold.fct_lineup]
+
+  silver.sofascore_team_match:
+    grain: one team in one event
+    natural_key: [match_id, team_id, league, season]
+    required_columns: [match_id, team_id, opponent_id, is_home, league, season]
+    partition_columns: [league, season]
+    materialized_by: dags/dag_transform_e3.py#SILVER_E3_TRANSFORMS
+    production_write_status: transform active over existing Bronze
+    downstream: [gold.fct_team_match]
+
+  silver.sofascore_shots:
+    grain: one canonicalized SofaScore shot
+    natural_key: [match_id, shot_id]
+    required_columns: [match_id, shot_id, team_id, xg, shot_source, league, season]
+    allowed_values:
+      shot_source: [sofascore_v1]
+    partition_columns: [league, season]
+    materialized_by: dags/dag_transform_e3.py#SILVER_E3_TRANSFORMS
+    production_write_status: transform active over existing Bronze
+    downstream: [gold.fct_shot, gold.fct_shot_audit]
+
+  silver.sofascore_venue:
+    grain: one venue observed in one competition season
+    natural_key: [league, season, stadium]
+    required_columns: [stadium, league, season]
+    partition_columns: [league, season]
+    materialized_by: dags/dag_transform_e3.py#SILVER_E3_TRANSFORMS
+    production_write_status: transform active over existing Bronze
+    downstream: [gold.dim_venue]
+
+  silver.sofascore_player_profile:
+    grain: one player profile snapshot in one competition season
+    natural_key: [player_id, league, season]
+    required_columns: [player_id, player_name, league, season]
+    partition_columns: [league, season]
+    materialized_by: dags/dag_transform_e3.py#SILVER_E3_TRANSFORMS
+    production_write_status: transform active over existing Bronze
+    downstream: [gold.dim_player, gold.dim_player_attributes]
+
+  silver.sofascore_player_season_aggregate:
+    grain: one player in one competition season
+    natural_key: [canonical_id, league, season]
+    required_columns: [canonical_id, league, season]
+    partition_columns: [league, season]
+    materialized_by: dags/dag_transform_e3.py#SILVER_E3_TRANSFORMS
+    production_write_status: transform active over existing Bronze
+    downstream: [gold.fct_player_season_stats]
+
+  gold.fct_sofascore_team_match_post_shot_xg:
+    grain: one team in one two-team match with complete SofaScore xGOT
+    natural_key: [match_id, team_id]
+    required_columns:
+      - match_id
+      - team_id
+      - opponent_id
+      - post_shot_xg
+      - post_shot_xg_against
+      - metric_source
+      - metric_definition
+      - metric_version
+      - league
+      - season
+    allowed_values:
+      metric_source: [sofascore]
+      metric_definition: [sum_shotmap_xgot_on_target]
+    partition_columns: [league, season]
+    materialized_by: dags/dag_transform_e3.py#GOLD_E3_TRANSFORMS
+    production_write_status: transform active over silver.sofascore_shots
+    downstream: [source-explicit goalkeeper and finishing models]
+
+endpoints:
+  tournament_catalog:
+    path: /config/unique-tournaments/EN/football
+    target_type: registry
+    status: normalized
+    required: true
+    raw_collection: uniqueTournaments
+    preserved_arrays: [/uniqueTournaments]
+    normalized_cardinality_paths: [/uniqueTournaments]
+    required_json_paths: [/uniqueTournaments]
+    destination: [configs/sofascore/tournaments.json]
+    grain: one unique tournament
+    natural_key: [source_tournament_id]
+    empty_semantics: never legitimate; registry is preserved on failure
+    dq: [unique source id, non-empty slug, atomic compare-and-swap]
+
+  discovery_categories:
+    path: /sport/football/categories/all (fallback /sport/football/categories)
+    target_type: registry
+    status: normalized
+    required: true
+    raw_collection: categories
+    preserved_arrays: [/categories]
+    normalized_cardinality_paths: [/categories]
+    required_json_paths: [/categories]
+    destination: [configs/sofascore/tournaments.json]
+    grain: one football category
+    natural_key: [category_id]
+    empty_semantics: never legitimate for a complete traversal
+    dq: [unique category id, football evidence retained, incomplete traversal never commits]
+
+  category_tournaments:
+    path: /category/{category_id}/unique-tournaments
+    target_type: registry_category
+    status: normalized
+    required: true
+    raw_collection: groups[].uniqueTournaments[]
+    preserved_arrays: [/groups, /groups/*/uniqueTournaments]
+    normalized_cardinality_paths: [/groups/*/uniqueTournaments]
+    required_json_paths: [/groups]
+    destination: [configs/sofascore/tournaments.json]
+    grain: one unique tournament in one category
+    natural_key: [category_id, source_tournament_id]
+    empty_semantics: legitimate only for a successfully traversed empty category
+    dq: [unique source id, category evidence retained, all categories complete before commit]
+
+  tournament_seasons:
+    path: /unique-tournament/{tournament_id}/seasons
+    target_type: tournament
+    status: normalized
+    required: true
+    raw_collection: seasons
+    preserved_arrays: [/seasons]
+    normalized_cardinality_paths: [/seasons]
+    required_json_paths: [/seasons]
+    destination: [configs/sofascore/tournaments.json]
+    grain: one SofaScore season
+    natural_key: [source_tournament_id, source_season_id]
+    empty_semantics: never legitimate for an active tournament
+    dq: [unique season id, source name and dates retained, canonical season explicit]
+
+  schedule_last:
+    path: /unique-tournament/{tournament_id}/season/{season_id}/events/last/{page}
+    target_type: season_page
+    status: normalized
+    required: true
+    raw_collection: events
+    preserved_arrays: [/events]
+    normalized_cardinality_paths: [/events]
+    required_json_paths: [/events, /hasNextPage]
+    destination: [bronze.sofascore_schedule]
+    grain: one event
+    natural_key: [source_season_id, event_id]
+    empty_semantics: a schema-valid empty page with hasNextPage=false is legitimate
+    dq: [source season match, no skeleton rows, page chain complete, exact raw lineage]
+
+  schedule_next:
+    path: /unique-tournament/{tournament_id}/season/{season_id}/events/next/{page}
+    target_type: season_page
+    status: normalized
+    required: true
+    raw_collection: events
+    preserved_arrays: [/events]
+    normalized_cardinality_paths: [/events]
+    required_json_paths: [/events, /hasNextPage]
+    destination: [bronze.sofascore_schedule]
+    grain: one event
+    natural_key: [source_season_id, event_id]
+    empty_semantics: a schema-valid empty page with hasNextPage=false is legitimate
+    dq: [source season match, no skeleton rows, page chain complete, exact raw lineage]
+
+  standings_total:
+    path: /unique-tournament/{tournament_id}/season/{season_id}/standings/total
+    target_type: season
+    status: normalized
+    required: false
+    raw_collection: standings
+    preserved_arrays: [/standings, /standings/*/rows]
+    normalized_cardinality_paths: [/standings/*/rows]
+    required_json_paths: [/standings]
+    destination: [bronze.sofascore_league_table, silver.sofascore_league_table]
+    grain: one team in one total standings block
+    natural_key: [source_season_id, group_name, team_id]
+    empty_semantics: a schema-valid empty standings array or source 404 is legitimate for cups
+    dq: [unique group and team key, exact source season, exact raw lineage]
+
+  event:
+    path: /event/{event_id}
+    target_type: event
+    status: normalized
+    required: true
+    raw_collection: event
+    preserved_arrays: []
+    required_json_paths: [/event/id, /event/homeTeam/id, /event/awayTeam/id, /event/season/id]
+    destination:
+      - bronze.sofascore_events
+      - bronze.sofascore_event_participants
+      - bronze.sofascore_venue
+      - silver.sofascore_venue
+    grain: one event plus two participant projections and optional venue
+    natural_key: [event_id]
+    empty_semantics: never legitimate for a scheduled event
+    dq: [source season match, two distinct participants, exact raw lineage]
+
+  lineups:
+    path: /event/{event_id}/lineups
+    target_type: event
+    status: normalized
+    required: true
+    raw_collection: home.players + away.players
+    preserved_arrays: [/home/players, /away/players]
+    normalized_cardinality_paths: [/home/players, /away/players]
+    required_json_paths: [/home/players, /away/players]
+    destination:
+      - bronze.sofascore_lineups
+      - bronze.sofascore_player_ratings
+      - bronze.sofascore_event_player_stats
+      - silver.sofascore_player_ratings
+      - silver.sofascore_player_match_aggregate
+    grain: one listed player per event side; statistics is a second projection
+    natural_key: [event_id, player_id]
+    empty_semantics: legitimate only when the source returns a valid empty lineup payload
+    dq: [starters and bench explicit, unused substitutes retained in Bronze, raw cardinality preserved]
+
+  statistics:
+    path: /event/{event_id}/statistics
+    target_type: event
+    status: normalized
+    required: true
+    raw_collection: statistics
+    preserved_arrays: [/statistics, /statistics/*/groups, /statistics/*/groups/*/statisticsItems]
+    normalized_cardinality_paths: [/statistics/*/groups/*/statisticsItems]
+    required_json_paths: [/statistics]
+    destination: [bronze.sofascore_match_stats, silver.sofascore_team_match]
+    grain: one statistic key per event period
+    natural_key: [event_id, period, stat_group, statistic_key]
+    empty_semantics: legitimate for a structurally valid empty endpoint response
+    dq: [home and away values retained, raw item cardinality equals Bronze rows]
+
+  player_event_statistics:
+    path: /event/{event_id}/player/{player_id}/statistics
+    target_type: event_player
+    status: intentionally-excluded
+    required: false
+    raw_collection: statistics
+    preserved_arrays: []
+    destination: []
+    grain: one player in one event
+    natural_key: [event_id, player_id]
+    empty_semantics: endpoint is not requested
+    reason: the unified lineups payload already supplies the played-player statistics block; per-player requests would duplicate data and proxy cost
+    dq: []
+
+  shotmap:
+    path: /event/{event_id}/shotmap
+    target_type: event
+    status: normalized
+    required: true
+    raw_collection: shotmap
+    preserved_arrays: [/shotmap]
+    normalized_cardinality_paths: [/shotmap]
+    required_json_paths: [/shotmap]
+    destination:
+      - bronze.sofascore_event_shotmap
+      - silver.sofascore_shots
+      - gold.fct_sofascore_team_match_post_shot_xg
+    grain: one shot
+    natural_key: [event_id, shot_id]
+    empty_semantics: legitimate for a valid source response with no shots
+    dq: [raw shot count equals Bronze count, xg range 0 to 1, source provenance retained]
+
+  incidents:
+    path: /event/{event_id}/incidents
+    target_type: event
+    status: normalized
+    required: true
+    raw_collection: incidents
+    preserved_arrays: [/incidents]
+    normalized_cardinality_paths: [/incidents]
+    required_json_paths: [/incidents]
+    destination: [bronze.sofascore_incidents]
+    grain: one ordered goal, card, substitution, VAR or other incident
+    natural_key: [event_id, incident_id]
+    empty_semantics: legitimate for a valid source response with no reportable incidents
+    dq: [raw incident count equals Bronze count, deterministic fallback id, source order retained]
+
+  rounds:
+    path: /unique-tournament/{tournament_id}/season/{season_id}/rounds
+    target_type: season
+    status: raw-only
+    required: false
+    raw_collection: rounds
+    preserved_arrays: [/rounds]
+    required_json_paths: [/rounds]
+    destination: []
+    grain: one round
+    natural_key: [source_season_id, round_id]
+    empty_semantics: a schema-valid empty rounds array is legitimate
+    reason: exact arrays are retained for replay; no stable cross-format normalized grain is published yet
+    dq: [schema-valid array, exact raw lineage]
+
+  stages:
+    path: /unique-tournament/{tournament_id}/season/{season_id}/stages
+    target_type: season
+    status: unsupported
+    required: false
+    raw_collection: stages
+    preserved_arrays: []
+    destination: []
+    grain: one source-defined competition stage
+    natural_key: [source_season_id, stage_id]
+    empty_semantics: no stable public response contract has been observed
+    reason: SofaScore exposes stage semantics through schedule fields, rounds and cupTrees for the verified competitions; a separate stable stages payload is not confirmed
+    dq: []
+
+  cup_trees:
+    path: /unique-tournament/{tournament_id}/season/{season_id}/cuptrees
+    target_type: season
+    status: raw-only
+    required: false
+    raw_collection: cupTrees
+    preserved_arrays: [/cupTrees]
+    required_json_paths: [/cupTrees]
+    destination: []
+    grain: one cup-tree node
+    natural_key: [source_season_id, cup_tree_id, node_id]
+    empty_semantics: a schema-valid empty cupTrees array is legitimate for leagues
+    reason: nested bracket nodes are retained exactly pending a versioned node/edge model
+    dq: [schema-valid array, exact raw lineage]
+
+  participants:
+    path: /unique-tournament/{tournament_id}/season/{season_id}/teams
+    target_type: season
+    status: raw-only
+    required: false
+    raw_collection: teams
+    preserved_arrays: [/teams]
+    required_json_paths: [/teams]
+    destination: []
+    grain: one tournament participant team
+    natural_key: [source_season_id, team_id]
+    empty_semantics: a schema-valid empty teams array is terminal but cannot expand squads
+    reason: exact participant objects drive squad expansion; event participants remain the normalized team spine
+    dq: [unique source team ids for expansion, exact raw lineage]
+
+  squads:
+    path: /team/{team_id}/unique-tournament/{tournament_id}/season/{season_id}/players
+    target_type: season_team
+    status: unsupported
+    required: false
+    raw_collection: players
+    preserved_arrays: []
+    required_json_paths: []
+    destination: []
+    grain: one registered player per team season
+    natural_key: [source_season_id, team_id, player_id]
+    empty_semantics: a schema-valid empty players array is legitimate
+    reason: live source evidence returns HTTP 404 for the season-scoped route; /team/{team_id}/players is current-only and intentionally excluded from historical season attribution
+    dq: [terminal not_supported with exact raw lineage; never substitute a current roster for a historical season]
+
+  player_profile:
+    path: /player/{player_id}
+    target_type: player
+    status: normalized
+    required: true
+    raw_collection: player
+    preserved_arrays: []
+    required_json_paths: [/player/id]
+    destination: [bronze.sofascore_player_profile, silver.sofascore_player_profile]
+    grain: one player profile snapshot
+    natural_key: [player_id]
+    empty_semantics: never legitimate for a player in the resolved universe
+    dq: [target player identity, source-season lineage, profile coverage at least 95%]
+
+  player_season_statistics:
+    path: /player/{player_id}/unique-tournament/{tournament_id}/season/{season_id}/statistics/overall
+    target_type: season_player
+    status: normalized
+    required: false
+    raw_collection: statistics
+    preserved_arrays: []
+    required_json_paths: [/statistics]
+    destination: [bronze.sofascore_player_season_stats, silver.sofascore_player_season_aggregate]
+    grain: one player in one tournament season
+    natural_key: [source_season_id, player_id]
+    empty_semantics: a schema-valid missing/null statistics object is legitimate for players without an aggregate
+    dq: [exact tournament and season identity, target player identity, exact raw lineage]
+
+  event_graph:
+    path: /event/{event_id}/graph
+    target_type: event
+    status: intentionally-excluded
+    required: false
+    raw_collection: graphPoints
+    preserved_arrays: []
+    destination: []
+    grain: one momentum sample
+    natural_key: [event_id, minute, ordinal]
+    empty_semantics: endpoint is not requested
+    reason: no declared analytic model or sampling contract; it is not present in EVENT_PATHS and therefore is not retained raw
+    dq: []
+
+  average_positions:
+    path: /event/{event_id}/average-positions
+    target_type: event
+    status: intentionally-excluded
+    required: false
+    raw_collection: playerAveragePositions
+    preserved_arrays: []
+    destination: []
+    grain: one player-event average position
+    natural_key: [event_id, player_id]
+    empty_semantics: endpoint is not requested
+    reason: coordinate orientation/version is undeclared; it is not present in EVENT_PATHS and therefore is not retained raw
+    dq: []
+
+  player_heatmap:
+    path: /event/{event_id}/player/{player_id}/heatmap
+    target_type: event_player
+    status: intentionally-excluded
+    required: false
+    raw_collection: heatmap
+    preserved_arrays: []
+    destination: []
+    grain: one player-event coordinate sample
+    natural_key: [event_id, player_id, ordinal]
+    empty_semantics: endpoint is not requested
+    reason: high-volume coordinates have no sampling contract; endpoint is not retained raw
+    dq: []
+
+  referee_profile:
+    path: /referee/{referee_id}
+    target_type: referee
+    status: raw-only
+    required: false
+    raw_collection: referee
+    preserved_arrays: []
+    required_json_paths: [/referee]
+    destination: []
+    grain: one referee
+    natural_key: [referee_id]
+    empty_semantics: a schema-valid null referee is legitimate
+    reason: exact referee objects are retained for future dimension design; event referee scalars remain in bronze.sofascore_events
+    dq: [referee target identity, exact raw lineage]
+
+  h2h_events:
+    path: /event/{event_id}/h2h/{scope}
+    target_type: event
+    status: intentionally-excluded
+    required: false
+    raw_collection: events
+    preserved_arrays: []
+    destination: []
+    grain: one prior event
+    natural_key: [event_id, prior_event_id]
+    empty_semantics: endpoint is not requested
+    reason: duplicates schedule history and is not source-season bounded
+    dq: []
+
+  odds:
+    path: /event/{event_id}/odds/1/all
+    target_type: event
+    status: intentionally-excluded
+    required: false
+    raw_collection: markets
+    preserved_arrays: []
+    destination: []
+    grain: one bookmaker quote
+    natural_key: [event_id, market_id, bookmaker_id, observed_at]
+    empty_semantics: endpoint is not requested
+    reason: licensing and rapid mutation belong to the separate odds source contract
+    dq: []
+
+  fan_votes:
+    path: /event/{event_id}/votes
+    target_type: event
+    status: intentionally-excluded
+    required: false
+    raw_collection: votes
+    preserved_arrays: []
+    destination: []
+    grain: one aggregate vote snapshot
+    natural_key: [event_id, vote_type, observed_at]
+    empty_semantics: endpoint is not requested
+    reason: mutable engagement data has no match-performance downstream use
+    dq: []
+
+  tv_channels:
+    path: /tv/event/{event_id}/country/{country_code}
+    target_type: event
+    status: intentionally-excluded
+    required: false
+    raw_collection: channels
+    preserved_arrays: []
+    destination: []
+    grain: one event-country broadcaster
+    natural_key: [event_id, country_code, channel_id]
+    empty_semantics: endpoint is not requested
+    reason: territory-specific broadcast metadata is outside the analytical football scope
+    dq: []

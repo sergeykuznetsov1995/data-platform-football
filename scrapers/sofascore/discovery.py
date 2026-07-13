@@ -8,21 +8,45 @@ import re
 import stat
 import tempfile
 import time
+from contextlib import contextmanager
 from copy import deepcopy
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 
-from scrapers.sofascore.catalog import SCHEMA_VERSION, SofaScoreCatalog
+try:  # POSIX production/CI runners.
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover - exercised by the Windows live runner
+    _fcntl = None
+
+try:  # Windows direct-discovery runner.
+    import msvcrt as _msvcrt
+except ImportError:  # pragma: no cover - POSIX path
+    _msvcrt = None
+
+from scrapers.sofascore.catalog import SofaScoreCatalog
+from scrapers.sofascore.registry import (
+    SCHEMA_VERSION,
+    classify_tournament_source,
+    pending_review,
+)
 
 
 DEFAULT_BASE_URL = "https://api.sofascore.com/api/v1"
 CATALOG_PATH = "/config/unique-tournaments/EN/football"
 CATEGORIES_PATH = "/sport/football/categories/all"
 CATEGORIES_FALLBACK_PATH = "/sport/football/categories"
+TOURNAMENT_PATH = "/unique-tournament/{unique_tournament_id}"
 _SPLIT_SHORT_RE = re.compile(r"^(\d{2})/(\d{2})$")
 _SPLIT_LONG_RE = re.compile(r"^(\d{4})/(\d{2}|\d{4})$")
 _SINGLE_YEAR_RE = re.compile(r"^\d{4}$")
 _CURLOPT_PROXY = 10004
+_KNOWN_SEASON_ALIASES = {
+    # UEFA retained the Euro 2020 brand/source season after the tournament was
+    # postponed and played in 2021.  This exception must be explicit rather
+    # than inferred for every delayed calendar-year competition.
+    (1, "2020"): ("2021", "EURO 2020"),
+}
 
 
 class DiscoveryError(RuntimeError):
@@ -66,12 +90,25 @@ def _required_string(value: Any, field: str) -> str:
 
 
 def classify_season_year(year: Any) -> tuple[str, Optional[str]]:
-    """Return ``(season_format, canonical_season)`` without guessing.
+    """Return the legacy ``(season_format, canonical)`` projection.
 
-    SofaScore uses slash-separated consecutive years for ordinary seasons and
-    a literal four-digit year for single-year competitions. Unknown labels are
-    retained in the registry but are deliberately non-activatable.
+    Schema v2 stores the unambiguous ``calendar_year`` term in ``format`` but
+    retains ``single_year`` here and in ``season_format`` for existing capture
+    consumers.  Named source labels stay non-canonical until explicitly mapped.
     """
+
+    season_format, canonical = classify_season_label(year)
+    legacy = {
+        "split_year": "split_year",
+        "calendar_year": "single_year",
+        "named": "unknown",
+        "unknown": "unknown",
+    }[season_format]
+    return legacy, canonical
+
+
+def classify_season_label(year: Any) -> tuple[str, Optional[str]]:
+    """Return schema-v2 season format and canonical season without guessing."""
 
     token = str(year).strip()
     short = _SPLIT_SHORT_RE.fullmatch(token)
@@ -93,8 +130,58 @@ def classify_season_year(year: Any) -> tuple[str, Optional[str]]:
         return "unknown", None
 
     if _SINGLE_YEAR_RE.fullmatch(token):
-        return "single_year", token
+        return "calendar_year", token
+    if token:
+        return "named", None
     return "unknown", None
+
+
+def _source_date(
+    raw: Mapping[str, Any],
+    *,
+    date_key: str,
+    timestamp_key: str,
+) -> Optional[str]:
+    value = raw.get(date_key)
+    if isinstance(value, str) and value.strip():
+        token = value.strip()
+        try:
+            parsed = datetime.fromisoformat(token.replace("Z", "+00:00"))
+            return parsed.date().isoformat()
+        except ValueError as exc:
+            raise DiscoverySchemaError(
+                f"season {date_key} must be an ISO-8601 date"
+            ) from exc
+    value = raw.get(timestamp_key)
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise DiscoverySchemaError(f"season {timestamp_key} must be a timestamp")
+    try:
+        parsed = datetime.fromtimestamp(float(value), tz=timezone.utc)
+        return parsed.date().isoformat()
+    except (TypeError, ValueError, OSError, OverflowError) as exc:
+        raise DiscoverySchemaError(
+            f"season {timestamp_key} must be a Unix timestamp"
+        ) from exc
+
+
+def _season_aliases(
+    unique_tournament_id: int,
+    *,
+    year: str,
+    name: str,
+    canonical_season: Optional[str],
+) -> list[str]:
+    values: list[str] = [year, name]
+    if canonical_season is not None:
+        values.append(canonical_season)
+    values.extend(
+        _KNOWN_SEASON_ALIASES.get(
+            (int(unique_tournament_id), canonical_season or year), ()
+        )
+    )
+    return list(dict.fromkeys(value for value in values if value))
 
 
 def _response_bytes(response: Any) -> int:
@@ -108,6 +195,65 @@ def _response_bytes(response: Any) -> int:
         return len(content or b"")
     except Exception:
         return 0
+
+
+class _DirectTlsSession:
+    """Exact direct Chrome-133 HTTP/2 profile used by SofaScore's JSON edge.
+
+    The Go-backed client accepts an explicit ``proxy=None`` and does not consult
+    Requests/libcurl proxy environment variables.  Keeping the tiny adapter
+    requests-shaped lets tests inject a deterministic in-memory session.
+    """
+
+    _HEADERS = {
+        "accept": "*/*",
+        "accept-language": "en-US,en;q=0.9",
+        "origin": "https://www.sofascore.com",
+        "referer": "https://www.sofascore.com/",
+        "user-agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 "
+            "Safari/537.36"
+        ),
+        "x-requested-with": "XMLHttpRequest",
+    }
+
+    def __init__(self, timeout: float) -> None:
+        try:
+            from tls_client import Session
+        except ImportError as exc:  # pragma: no cover - production dependency
+            raise DiscoveryHTTPError(
+                "tls-client-python is required for direct SofaScore discovery: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        self._inner = Session(
+            client_identifier="chrome_133",
+            proxy=None,
+            timeout_milliseconds=max(1, int(timeout * 1000)),
+            disable_http3=True,
+            follow_redirects=False,
+        )
+        self.headers = dict(self._HEADERS)
+        self.trust_env = False
+        self.proxies: dict[str, str] = {}
+        # Preserve the transport-invariant inspection surface used by the
+        # poison-proxy test; 10004 is libcurl's CURLOPT_PROXY numeric value.
+        self.curl_options = {_CURLOPT_PROXY: ""}
+
+    def get(self, url: str, *, timeout: float, proxies: Mapping[str, str]):
+        if proxies or self.proxies or getattr(self._inner, "proxy", None):
+            raise DiscoveryHTTPError("direct TLS session received proxy settings")
+        return self._inner.execute_request(
+            "GET",
+            url,
+            headers=dict(self.headers),
+            header_order=list(self.headers),
+            timeout_milliseconds=max(1, int(timeout * 1000)),
+            proxy=None,
+        )
+
+    def close(self) -> None:
+        self._inner.close()
 
 
 class DirectSofaScoreClient:
@@ -140,23 +286,7 @@ class DirectSofaScoreClient:
         if self._session_factory is not None:
             session = self._session_factory()
         else:
-            try:
-                from curl_cffi.const import CurlOpt
-                from curl_cffi.requests import Session
-            except ImportError as exc:  # pragma: no cover - production image
-                raise DiscoveryHTTPError(
-                    "curl_cffi is required for direct SofaScore discovery"
-                ) from exc
-            proxy_option = CurlOpt.PROXY
-            session = Session(
-                impersonate="chrome120",
-                trust_env=False,
-                proxies={},
-                # curl_cffi 0.15 stores ``trust_env`` but does not thread it
-                # into libcurl. This option is the transport-level guarantee
-                # that HTTPS_PROXY/ALL_PROXY can never be used.
-                curl_options={proxy_option: ""},
-            )
+            session = _DirectTlsSession(self.timeout)
 
         # Two independent guards: ignore proxy environment variables and clear
         # any proxy mapping a supplied session might carry. Every request also
@@ -185,13 +315,14 @@ class DirectSofaScoreClient:
         headers = getattr(session, "headers", None)
         if headers is not None:
             headers.update({
-                "Accept": "application/json",
-                "Accept-Language": "en-US,en;q=0.9",
-                "Referer": "https://www.sofascore.com/",
-                "User-Agent": (
-                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
-                ),
+                "accept": "*/*",
+                "accept-language": "en-US,en;q=0.9",
+                "origin": "https://www.sofascore.com",
+                "referer": "https://www.sofascore.com/",
+                # Since June 2026 SofaScore's direct JSON edge requires the
+                # same explicit XHR marker its own web client sends. This is a
+                # plain request header, not a browser/session/proxy fallback.
+                "x-requested-with": "XMLHttpRequest",
             })
         return session
 
@@ -208,6 +339,7 @@ class DirectSofaScoreClient:
             "direct_response_bytes": self._direct_response_bytes,
             "paid_proxy_bytes": 0,
             "browser_sessions": 0,
+            "browser_navigations": 0,
         }
 
     def get_json(self, path: str) -> Mapping[str, Any]:
@@ -308,13 +440,12 @@ def parse_categories_payload(payload: Mapping[str, Any]) -> list[dict[str, Any]]
         sport = raw.get("sport") or {}
         if not isinstance(sport, Mapping):
             raise DiscoverySchemaError(f"{prefix}.sport must be an object")
-        sport_slug = str(sport.get("slug") or "football").strip()
-        if sport_slug != "football":
-            raise DiscoverySchemaError(f"{prefix} is not a football category")
+        sport_slug = str(sport.get("slug") or "unknown").strip()
         record = {
             "id": category_id,
             "name": _required_string(raw.get("name"), f"{prefix}.name"),
             "slug": _required_string(raw.get("slug"), f"{prefix}.slug"),
+            "sport_slug": sport_slug,
         }
         previous = by_id.get(category_id)
         if previous is not None and previous != record:
@@ -337,6 +468,13 @@ def _raw_tournament_items(payload: Mapping[str, Any]) -> list[Any]:
             raise DiscoverySchemaError("uniqueTournaments must be a list")
         containers.append(raw_tournaments)
 
+    if "uniqueTournament" in payload:
+        recognized_shape = True
+        raw_tournament = payload["uniqueTournament"]
+        if not isinstance(raw_tournament, Mapping):
+            raise DiscoverySchemaError("uniqueTournament must be an object")
+        containers.append([raw_tournament])
+
     if "groups" in payload:
         recognized_shape = True
         groups = payload["groups"]
@@ -354,12 +492,16 @@ def _raw_tournament_items(payload: Mapping[str, Any]) -> list[Any]:
 
     if not recognized_shape:
         raise DiscoverySchemaError(
-            "tournament payload must contain uniqueTournaments or groups"
+            "tournament payload must contain uniqueTournament(s) or groups"
         )
     return [item for container in containers for item in container]
 
 
-def parse_catalog_payload(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
+def parse_catalog_payload(
+    payload: Mapping[str, Any],
+    *,
+    endpoint: str = "catalog/category tournament payload",
+) -> list[dict[str, Any]]:
     raw_tournaments = _raw_tournament_items(payload)
 
     by_id: dict[int, dict[str, Any]] = {}
@@ -376,11 +518,7 @@ def parse_catalog_payload(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
         sport = category.get("sport") or {}
         if not isinstance(sport, Mapping):
             raise DiscoverySchemaError(f"{prefix}.category.sport must be an object")
-        sport_slug = str(sport.get("slug") or "football").strip()
-        if sport_slug != "football":
-            raise DiscoverySchemaError(
-                f"{prefix} is not a football tournament"
-            )
+        sport_slug = str(sport.get("slug") or "unknown").strip()
         slug = _required_string(raw.get("slug"), f"{prefix}.slug")
         category_slug = _required_string(
             category.get("slug"), f"{prefix}.category.slug"
@@ -388,9 +526,10 @@ def parse_catalog_payload(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
         category_id = category.get("id")
         if category_id is not None:
             category_id = _positive_int(category_id, f"{prefix}.category.id")
+        name = _required_string(raw.get("name"), f"{prefix}.name")
         record = {
             "unique_tournament_id": source_id,
-            "name": _required_string(raw.get("name"), f"{prefix}.name"),
+            "name": name,
             "slug": slug,
             "category": {
                 "id": category_id,
@@ -403,6 +542,13 @@ def parse_catalog_payload(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
             "page_path": f"{sport_slug}/{category_slug}/{slug}",
             "canonical_id": None,
             "enabled": False,
+            "classification": classify_tournament_source(
+                raw,
+                name=name,
+                sport_slug=sport_slug,
+                endpoint=endpoint,
+            ),
+            "review": pending_review(),
             "seasons": [],
         }
         previous = by_id.get(source_id)
@@ -425,11 +571,30 @@ def _merge_tournament_sources(
             source_id = int(tournament["unique_tournament_id"])
             previous = by_id.get(source_id)
             if previous is not None and previous != tournament:
-                raise DiscoverySchemaError(
-                    "conflicting tournament data across discovery endpoints "
-                    f"for unique_tournament_id {source_id}"
-                )
-            by_id[source_id] = tournament
+                previous_comparable = deepcopy(previous)
+                current_comparable = deepcopy(tournament)
+                previous_evidence = previous_comparable[
+                    "classification"
+                ].pop("evidence", [])
+                current_evidence = current_comparable[
+                    "classification"
+                ].pop("evidence", [])
+                if previous_comparable != current_comparable:
+                    raise DiscoverySchemaError(
+                        "conflicting tournament data across discovery endpoints "
+                        f"for unique_tournament_id {source_id}"
+                    )
+                combined = deepcopy(previous)
+                evidence_by_value = {
+                    json.dumps(item, sort_keys=True, ensure_ascii=False): item
+                    for item in [*previous_evidence, *current_evidence]
+                }
+                combined["classification"]["evidence"] = [
+                    evidence_by_value[key] for key in sorted(evidence_by_value)
+                ]
+                by_id[source_id] = combined
+            else:
+                by_id[source_id] = tournament
     return [by_id[source_id] for source_id in sorted(by_id)]
 
 
@@ -454,13 +619,69 @@ def parse_seasons_payload(
         prefix = f"tournament {unique_tournament_id} seasons[{index}]"
         season_id = _positive_int(raw.get("id"), f"{prefix}.id")
         year = _required_string(raw.get("year"), f"{prefix}.year")
-        season_format, canonical_season = classify_season_year(year)
+        source_name = _required_string(raw.get("name"), f"{prefix}.name")
+        season_kind, canonical_season = classify_season_label(year)
+        season_format = {
+            "split_year": "split_year",
+            "calendar_year": "single_year",
+            "named": "unknown",
+            "unknown": "unknown",
+        }[season_kind]
+        start_date = _source_date(
+            raw, date_key="startDate", timestamp_key="startTimestamp"
+        )
+        end_date = _source_date(
+            raw, date_key="endDate", timestamp_key="endTimestamp"
+        )
+        if start_date and end_date and end_date < start_date:
+            raise DiscoverySchemaError(
+                f"{prefix} end date precedes start date"
+            )
+        evidence = [
+            {
+                "type": "source_field",
+                "endpoint": f"/unique-tournament/{unique_tournament_id}/seasons",
+                "field": "name",
+                "value": source_name,
+            },
+            {
+                "type": "source_field",
+                "endpoint": f"/unique-tournament/{unique_tournament_id}/seasons",
+                "field": "year",
+                "value": year,
+            },
+        ]
+        if start_date is not None:
+            evidence.append({
+                "type": "source_field",
+                "endpoint": f"/unique-tournament/{unique_tournament_id}/seasons",
+                "field": "startDate/startTimestamp",
+                "value": start_date,
+            })
+        if end_date is not None:
+            evidence.append({
+                "type": "source_field",
+                "endpoint": f"/unique-tournament/{unique_tournament_id}/seasons",
+                "field": "endDate/endTimestamp",
+                "value": end_date,
+            })
         record = {
             "season_id": season_id,
-            "name": _required_string(raw.get("name"), f"{prefix}.name"),
+            "name": source_name,
+            "source_name": source_name,
             "year": year,
+            "format": season_kind,
             "season_format": season_format,
             "canonical_season": canonical_season,
+            "start_date": start_date,
+            "end_date": end_date,
+            "aliases": _season_aliases(
+                unique_tournament_id,
+                year=year,
+                name=source_name,
+                canonical_season=canonical_season,
+            ),
+            "evidence": evidence,
         }
         previous = by_id.get(season_id)
         if previous is not None and previous != record:
@@ -489,6 +710,158 @@ def parse_seasons_payload(
     return [by_id[season_id] for season_id in sorted(by_id)]
 
 
+def _upgrade_season_v2(
+    raw: Mapping[str, Any], unique_tournament_id: int,
+) -> dict[str, Any]:
+    upgraded = deepcopy(dict(raw))
+    name = _required_string(upgraded.get("name"), "season.name")
+    year = _required_string(upgraded.get("year"), "season.year")
+    kind, canonical = classify_season_label(year)
+    upgraded.setdefault("source_name", name)
+    upgraded.setdefault("format", kind)
+    upgraded.setdefault("canonical_season", canonical)
+    upgraded.setdefault("season_format", {
+        "split_year": "split_year",
+        "calendar_year": "single_year",
+        "named": "unknown",
+        "unknown": "unknown",
+    }[upgraded["format"]])
+    upgraded.setdefault("start_date", None)
+    upgraded.setdefault("end_date", None)
+    upgraded.setdefault("aliases", _season_aliases(
+        unique_tournament_id,
+        year=year,
+        name=name,
+        canonical_season=upgraded.get("canonical_season"),
+    ))
+    upgraded.setdefault("evidence", [{
+        "type": "registry_migration",
+        "endpoint": f"/unique-tournament/{unique_tournament_id}/seasons",
+        "field": "name/year",
+        "value": f"{name}|{year}",
+    }])
+    return upgraded
+
+
+def _upgrade_tournament_v2(raw: Mapping[str, Any]) -> dict[str, Any]:
+    upgraded = deepcopy(dict(raw))
+    source_id = _positive_int(
+        upgraded.get("unique_tournament_id"), "unique_tournament_id"
+    )
+    name = _required_string(upgraded.get("name"), "tournament.name")
+    sport_slug = str(upgraded.get("sport_slug") or "unknown").strip()
+    upgraded.setdefault("classification", classify_tournament_source(
+        {},
+        name=name,
+        sport_slug=sport_slug,
+        endpoint="registry v1 migration (source gender unavailable)",
+    ))
+    upgraded.setdefault("review", pending_review())
+    upgraded["seasons"] = [
+        _upgrade_season_v2(season, source_id)
+        for season in upgraded.get("seasons", [])
+    ]
+    return upgraded
+
+
+def _merge_season_record(
+    previous: Mapping[str, Any], discovered: Mapping[str, Any]
+) -> dict[str, Any]:
+    merged = deepcopy(dict(discovered))
+    # Aliases are operator-extensible.  Source aliases are added, never used to
+    # erase an explicit exceptional-season mapping.
+    aliases = list(previous.get("aliases") or [])
+    aliases.extend(merged.get("aliases") or [])
+    merged["aliases"] = list(dict.fromkeys(str(value) for value in aliases))
+    # A source response can temporarily omit dates.  Retain the last evidenced
+    # value rather than turning a complete registry into a partial one.
+    retained_source_value = False
+    for field in ("start_date", "end_date"):
+        if merged.get(field) is None and previous.get(field) is not None:
+            merged[field] = previous.get(field)
+            retained_source_value = True
+    if retained_source_value:
+        evidence_by_value = {
+            json.dumps(item, sort_keys=True, ensure_ascii=False): deepcopy(item)
+            for item in [
+                *(previous.get("evidence") or []),
+                *(merged.get("evidence") or []),
+            ]
+        }
+        merged["evidence"] = [
+            evidence_by_value[key] for key in sorted(evidence_by_value)
+        ]
+    source_fields = {
+        "season_id", "name", "source_name", "year", "format",
+        "season_format", "canonical_season", "start_date", "end_date",
+        "evidence", "aliases",
+    }
+    for field, value in previous.items():
+        if field not in source_fields:
+            merged[field] = deepcopy(value)
+    return merged
+
+
+def _merge_classification_record(
+    previous: Mapping[str, Any], discovered: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Refresh source evidence without erasing a stronger prior observation.
+
+    SofaScore does not return gender/age/team-level fields consistently across
+    its catalog, category and detail endpoints.  A missing field is not
+    evidence that a previously observed value became unknown.  Explicit
+    negative evidence is authoritative and is never retained over.
+    """
+
+    current = deepcopy(dict(discovered))
+    prior = dict(previous or {})
+    unknown_tokens = {None, "", "unknown"}
+    for field in ("sport", "gender", "age_group", "team_level"):
+        if current.get(field) in unknown_tokens and prior.get(field) not in unknown_tokens:
+            current[field] = deepcopy(prior[field])
+
+    # Source negatives are monotonic evidence.  A later sparse payload or a
+    # source rename is not proof that a competition stopped being youth,
+    # reserve, women/mixed or futsal.  Preserve the reasons themselves as well
+    # as the normalized fields; activation also checks the fields directly as
+    # defence in depth.
+    current["exclusion_reasons"] = sorted(
+        {
+            str(reason).strip()
+            for reason in [
+                *(prior.get("exclusion_reasons") or []),
+                *(current.get("exclusion_reasons") or []),
+            ]
+            if str(reason).strip()
+        }
+    )
+
+    evidence_by_value = {
+        json.dumps(item, sort_keys=True, ensure_ascii=False): deepcopy(item)
+        for item in [
+            *(prior.get("evidence") or []),
+            *(current.get("evidence") or []),
+        ]
+        if isinstance(item, Mapping)
+    }
+    current["evidence"] = [
+        evidence_by_value[key] for key in sorted(evidence_by_value)
+    ]
+
+    if current["exclusion_reasons"]:
+        current["status"] = "excluded"
+    elif current.get("sport") != "football" or current.get("gender") != "male":
+        current["status"] = "unknown"
+    elif (
+        current.get("age_group") == "adult"
+        and current.get("team_level") == "first_team"
+    ):
+        current["status"] = "source_confirmed_adult_men"
+    else:
+        current["status"] = "review_required"
+    return current
+
+
 def merge_registry(
     existing: Mapping[str, Any],
     discovered_tournaments: list[Mapping[str, Any]],
@@ -497,7 +870,7 @@ def merge_registry(
 
     SofaScoreCatalog.from_mapping(existing)
     old_records = {
-        int(raw["unique_tournament_id"]): deepcopy(raw)
+        int(raw["unique_tournament_id"]): _upgrade_tournament_v2(raw)
         for raw in existing.get("tournaments", [])
     }
 
@@ -522,14 +895,31 @@ def merge_registry(
         if previous is None:
             discovered["canonical_id"] = None
             discovered["enabled"] = False
+            discovered["review"] = pending_review()
             merged[source_id] = discovered
             new_count += 1
             continue
 
+        # Explicit operator-owned fields always survive a source refresh.
         discovered["canonical_id"] = previous.get("canonical_id")
         discovered["enabled"] = previous.get("enabled", False)
+        discovered["review"] = deepcopy(
+            previous.get("review") or pending_review()
+        )
+        discovered["classification"] = _merge_classification_record(
+            previous.get("classification") or {},
+            discovered.get("classification") or {},
+        )
+        source_fields = {
+            "unique_tournament_id", "name", "slug", "category",
+            "sport_slug", "page_path", "classification", "seasons",
+            "canonical_id", "enabled", "review",
+        }
+        for field, value in previous.items():
+            if field not in source_fields:
+                discovered[field] = deepcopy(value)
         previous_seasons = {
-            int(season["season_id"]): deepcopy(season)
+            int(season["season_id"]): _upgrade_season_v2(season, source_id)
             for season in previous.get("seasons", [])
         }
         for season in discovered.get("seasons", []):
@@ -537,6 +927,7 @@ def merge_registry(
             # logical year. The current snapshot is authoritative for that
             # canonical season; retaining the superseded id would create an
             # ambiguous registry entry on the next lookup.
+            superseded_season: Optional[Mapping[str, Any]] = None
             for previous_id, previous_season in list(previous_seasons.items()):
                 same_year = previous_season.get("year") == season.get("year")
                 canonical = season.get("canonical_season")
@@ -547,8 +938,17 @@ def merge_registry(
                 if int(previous_id) != int(season["season_id"]) and (
                     same_year or same_canonical
                 ):
+                    superseded_season = previous_season
                     del previous_seasons[previous_id]
-            previous_seasons[int(season["season_id"])] = deepcopy(season)
+            season_id = int(season["season_id"])
+            old_season = previous_seasons.get(season_id)
+            previous_seasons[season_id] = (
+                _merge_season_record(
+                    old_season or superseded_season, season
+                )
+                if old_season is not None or superseded_season is not None
+                else deepcopy(season)
+            )
         discovered["seasons"] = [
             previous_seasons[season_id]
             for season_id in sorted(previous_seasons)
@@ -562,9 +962,14 @@ def merge_registry(
     # Existing tournaments absent from the latest upstream catalog are kept.
     unchanged_count += len(set(old_records) - seen_discovered)
     document = {
+        key: deepcopy(value)
+        for key, value in existing.items()
+        if key not in {"schema_version", "tournaments"}
+    }
+    document.update({
         "schema_version": SCHEMA_VERSION,
         "tournaments": [merged[source_id] for source_id in sorted(merged)],
-    }
+    })
     SofaScoreCatalog.from_mapping(document)
     return document, {
         "new_tournaments": new_count,
@@ -580,8 +985,13 @@ def merge_registry(
 def discover_registry(
     existing: Mapping[str, Any],
     client: DirectSofaScoreClient,
+    *,
+    scope: str = "full",
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Fetch the complete catalog and every season list before merging."""
+
+    if scope not in {"full", "active-reviewed"}:
+        raise ValueError("scope must be 'full' or 'active-reviewed'")
 
     existing_catalog = SofaScoreCatalog.from_mapping(existing)
     enabled_source_ids = {
@@ -589,53 +999,94 @@ def discover_registry(
         for tournament in existing_catalog.tournaments
         if tournament.enabled
     }
+    existing_season_years = {
+        tournament.unique_tournament_id: {
+            season.year for season in tournament.seasons
+        }
+        for tournament in existing_catalog.tournaments
+    }
 
-    # The config endpoint contains only SofaScore's curated competitions. It
-    # remains useful for global/special entries, but the category fan-out is
-    # what turns this into a complete tournament scan.
-    curated = parse_catalog_payload(client.get_json(CATALOG_PATH))
-    try:
-        categories_payload = client.get_json(CATEGORIES_PATH)
-    except DiscoveryHTTPError as exc:
-        if exc.status_code != 404:
-            raise
-        categories_payload = client.get_json(CATEGORIES_FALLBACK_PATH)
-    categories = parse_categories_payload(categories_payload)
-    if not categories:
-        raise DiscoverySchemaError(
-            "complete football category index must not be empty"
-        )
-
+    curated: list[dict[str, Any]] = []
     category_tournaments: list[dict[str, Any]] = []
+    categories: list[dict[str, Any]] = []
     empty_categories = 0
-    for category in categories:
-        try:
-            category_payload = client.get_json(
-                f"/category/{category['id']}/unique-tournaments"
+    if scope == "full":
+        # The config endpoint contains only SofaScore's curated competitions.
+        # Category fan-out provides the complete set, including regional and
+        # lower-profile competitions.
+        curated = parse_catalog_payload(
+            client.get_json(CATALOG_PATH), endpoint=CATALOG_PATH
+        )
+        if not curated:
+            raise DiscoverySchemaError(
+                "curated football tournament catalog must not be empty"
             )
+        try:
+            categories_payload = client.get_json(CATEGORIES_PATH)
         except DiscoveryHTTPError as exc:
             if exc.status_code != 404:
                 raise
-            # The category came from the same source snapshot, so a missing
-            # fan-out route makes this run incomplete. Preserve the previous
-            # registry and let a later run retry instead of reporting success
-            # from a curated-only subset.
-            raise DiscoveryHTTPError(
-                "incomplete category scan: SofaScore returned HTTP 404 for "
-                f"category {category['id']}",
-                status_code=404,
-            ) from exc
-        parsed = parse_catalog_payload(category_payload)
-        if not parsed:
-            empty_categories += 1
-        category_tournaments.extend(parsed)
+            categories_payload = client.get_json(CATEGORIES_FALLBACK_PATH)
+        categories = parse_categories_payload(categories_payload)
+        if not categories:
+            raise DiscoverySchemaError(
+                "complete football category index must not be empty"
+            )
 
-    category_tournaments = _merge_tournament_sources(category_tournaments)
-    if not category_tournaments:
-        raise DiscoverySchemaError(
-            "complete category scan returned no football tournaments"
-        )
-    tournaments = _merge_tournament_sources(curated, category_tournaments)
+        for category in categories:
+            try:
+                category_payload = client.get_json(
+                    f"/category/{category['id']}/unique-tournaments"
+                )
+            except DiscoveryHTTPError as exc:
+                if exc.status_code != 404:
+                    raise
+                raise DiscoveryHTTPError(
+                    "incomplete category scan: SofaScore returned HTTP 404 for "
+                    f"category {category['id']}",
+                    status_code=404,
+                ) from exc
+            parsed = parse_catalog_payload(
+                category_payload,
+                endpoint=f"/category/{category['id']}/unique-tournaments",
+            )
+            if not parsed:
+                empty_categories += 1
+            category_tournaments.extend(parsed)
+
+        category_tournaments = _merge_tournament_sources(category_tournaments)
+        if not category_tournaments:
+            raise DiscoverySchemaError(
+                "complete category scan returned no football tournaments"
+            )
+        tournaments = _merge_tournament_sources(curated, category_tournaments)
+    else:
+        refresh_ids = sorted({
+            tournament.unique_tournament_id
+            for tournament in existing_catalog.tournaments
+            if tournament.enabled
+            or tournament.review.get("status") in {"approved", "rejected"}
+        })
+        if not refresh_ids:
+            raise DiscoverySchemaError(
+                "active-reviewed discovery has no reviewed tournaments"
+            )
+        tournaments = []
+        for source_id in refresh_ids:
+            payload = client.get_json(
+                TOURNAMENT_PATH.format(unique_tournament_id=source_id)
+            )
+            parsed = parse_catalog_payload(
+                payload,
+                endpoint=TOURNAMENT_PATH.format(
+                    unique_tournament_id=source_id
+                ),
+            )
+            if len(parsed) != 1 or parsed[0]["unique_tournament_id"] != source_id:
+                raise DiscoverySchemaError(
+                    f"tournament detail response for {source_id} is incomplete"
+                )
+            tournaments.extend(parsed)
     discovered_source_ids = {
         int(tournament["unique_tournament_id"])
         for tournament in tournaments
@@ -649,23 +1100,36 @@ def discover_registry(
 
     for tournament in tournaments:
         source_id = tournament["unique_tournament_id"]
-        seasons_missing = False
         try:
             seasons_payload = client.get_json(
                 f"/unique-tournament/{source_id}/seasons"
             )
         except DiscoveryHTTPError as exc:
-            if exc.status_code != 404:
-                raise
-            seasons_payload = {"seasons": []}
-            seasons_missing = True
+            if source_id in enabled_source_ids:
+                raise DiscoverySchemaError(
+                    f"enabled tournament {source_id} has an incomplete "
+                    "season response"
+                ) from exc
+            raise DiscoveryHTTPError(
+                "incomplete season scan for tournament "
+                f"{source_id}: {exc}",
+                status_code=exc.status_code,
+            ) from exc
         seasons = parse_seasons_payload(
             seasons_payload,
             source_id,
         )
+        missing_source_years = sorted(
+            existing_season_years.get(source_id, set())
+            - {season["year"] for season in seasons}
+        )
+        if missing_source_years:
+            raise DiscoverySchemaError(
+                f"tournament {source_id} season traversal shrank; missing "
+                + ", ".join(missing_source_years)
+            )
         if source_id in enabled_source_ids and (
-            seasons_missing
-            or not seasons
+            not seasons
             or not any(season["canonical_season"] for season in seasons)
         ):
             raise DiscoverySchemaError(
@@ -682,6 +1146,7 @@ def discover_registry(
         "category_tournaments": len(category_tournaments),
         "categories": len(categories),
         "empty_categories": empty_categories,
+        "scope": scope,
         "changed": merged != existing,
         "traffic": client.stats,
     }
@@ -707,20 +1172,30 @@ def _read_registry_snapshot(path: Path) -> tuple[Mapping[str, Any], int]:
     return current, mode
 
 
-def _assert_expected_registry(
-    destination: Path,
-    expected_current: Mapping[str, Any],
-) -> tuple[Mapping[str, Any], int]:
-    if not destination.exists():
-        raise DiscoveryConcurrentUpdate(
-            f"registry changed during discovery: {destination} was removed; rerun"
-        )
-    current, mode = _read_registry_snapshot(destination)
-    if current != expected_current:
-        raise DiscoveryConcurrentUpdate(
-            f"registry changed during discovery: {destination}; rerun"
-        )
-    return current, mode
+@contextmanager
+def _exclusive_registry_lock(lock_handle):
+    """Hold the one-byte registry lock on POSIX or Windows."""
+
+    if _fcntl is not None:
+        _fcntl.flock(lock_handle.fileno(), _fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            _fcntl.flock(lock_handle.fileno(), _fcntl.LOCK_UN)
+        return
+    if _msvcrt is None:  # pragma: no cover - supported CPython always has one
+        raise DiscoveryError("no supported atomic registry file lock")
+    lock_handle.seek(0, os.SEEK_END)
+    if lock_handle.tell() == 0:
+        lock_handle.write("\0")
+        lock_handle.flush()
+    lock_handle.seek(0)
+    _msvcrt.locking(lock_handle.fileno(), _msvcrt.LK_LOCK, 1)
+    try:
+        yield
+    finally:
+        lock_handle.seek(0)
+        _msvcrt.locking(lock_handle.fileno(), _msvcrt.LK_UNLCK, 1)
 
 
 def write_registry_atomic(
@@ -733,51 +1208,54 @@ def write_registry_atomic(
 
     destination = Path(path)
     payload = render_registry(document)
-    destination_mode = 0o644
-    if destination.exists():
-        current, destination_mode = _read_registry_snapshot(destination)
-        if expected_current is not None and current != expected_current:
-            raise DiscoveryConcurrentUpdate(
-                f"registry changed during discovery: {destination}; rerun"
-            )
-        if current == document:
-            return False
-    elif expected_current is not None:
-        raise DiscoveryConcurrentUpdate(
-            f"registry changed during discovery: {destination} was removed; rerun"
-        )
-
     destination.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary = tempfile.mkstemp(
-        prefix=f".{destination.name}.",
-        dir=str(destination.parent),
-    )
-    try:
-        os.fchmod(fd, destination_mode)
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        # Check again immediately before replace so an activation/canonical-id
-        # edit made while the long network scan was running is never silently
-        # overwritten by the stale snapshot.
-        if expected_current is not None:
-            _, destination_mode = _assert_expected_registry(
-                destination,
-                expected_current,
+    lock_path = destination.with_suffix(destination.suffix + ".lock")
+    with lock_path.open("a+") as lock_handle:
+        # Discovery performs its network walk without holding the lock.  The
+        # final compare-and-swap shares this short critical section with the
+        # review/activation CLI, closing the read->replace race that could
+        # otherwise overwrite an operator decision made between those calls.
+        with _exclusive_registry_lock(lock_handle):
+            destination_mode = 0o644
+            if destination.exists():
+                current, destination_mode = _read_registry_snapshot(destination)
+                if expected_current is not None and current != expected_current:
+                    raise DiscoveryConcurrentUpdate(
+                        f"registry changed during discovery: {destination}; rerun"
+                    )
+                if current == document:
+                    return False
+            elif expected_current is not None:
+                raise DiscoveryConcurrentUpdate(
+                    f"registry changed during discovery: {destination} was removed; rerun"
+                )
+
+            fd, temporary = tempfile.mkstemp(
+                prefix=f".{destination.name}.",
+                dir=str(destination.parent),
             )
-        os.replace(temporary, destination)
-        directory_fd = os.open(destination.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-    except Exception:
-        try:
-            os.unlink(temporary)
-        except FileNotFoundError:
-            pass
-        raise
+            try:
+                if hasattr(os, "fchmod"):
+                    os.fchmod(fd, destination_mode)
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(payload)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary, destination)
+                if not hasattr(os, "fchmod"):
+                    os.chmod(destination, destination_mode)
+                if os.name != "nt":
+                    directory_fd = os.open(destination.parent, os.O_RDONLY)
+                    try:
+                        os.fsync(directory_fd)
+                    finally:
+                        os.close(directory_fd)
+            except Exception:
+                try:
+                    os.unlink(temporary)
+                except FileNotFoundError:
+                    pass
+                raise
     return True
 
 
@@ -786,12 +1264,14 @@ __all__ = [
     "CATEGORIES_FALLBACK_PATH",
     "CATEGORIES_PATH",
     "DEFAULT_BASE_URL",
+    "TOURNAMENT_PATH",
     "DirectSofaScoreClient",
     "DiscoveryError",
     "DiscoveryConcurrentUpdate",
     "DiscoveryHTTPError",
     "DiscoverySchemaError",
     "classify_season_year",
+    "classify_season_label",
     "discover_registry",
     "merge_registry",
     "parse_catalog_payload",
