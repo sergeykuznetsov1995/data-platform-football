@@ -3530,6 +3530,50 @@ class ControlStore:
         """Compatibility name used by orchestration for successful completion."""
         self.complete_fetch(lease, **evidence)
 
+    def requeue_unfetched_targets(self, leases: Sequence[TargetLease]) -> int:
+        """Return still-leased targets to the queue, untouched by this run.
+
+        Used when the run stops at its budget: these targets were never fetched,
+        so they carry no failure evidence, must not back off, and must stay
+        claimable by the next run.
+        """
+        requeued = 0
+        with self._transaction() as cursor:
+            for lease in leases:
+                cursor.execute(
+                    """
+                    UPDATE fbref_control.page_frontier
+                    SET state = 'queued', claim_token = NULL,
+                        lease_run_id = NULL, lease_refresh_id = NULL,
+                        leased_by = NULL, lease_expires_at = NULL,
+                        updated_at = clock_timestamp()
+                    WHERE target_id = %s AND state = 'leased'
+                      AND claim_token = %s AND lease_epoch = %s
+                      AND lease_run_id = %s AND lease_refresh_id = %s
+                    RETURNING target_id
+                    """,
+                    (
+                        lease.target_id,
+                        lease.claim_token,
+                        lease.lease_epoch,
+                        lease.run_id,
+                        lease.logical_refresh_id,
+                    ),
+                )
+                if _fetchone(cursor) is None:
+                    continue
+                cursor.execute(
+                    """
+                    UPDATE fbref_control.run_target
+                    SET status = 'skipped', updated_at = clock_timestamp()
+                    WHERE run_id = %s AND target_id = %s
+                      AND logical_refresh_id = %s AND status = 'leased'
+                    """,
+                    (lease.run_id, lease.target_id, lease.logical_refresh_id),
+                )
+                requeued += 1
+        return requeued
+
     def fail_fetch(
         self,
         lease: TargetLease,
