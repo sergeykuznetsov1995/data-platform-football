@@ -182,7 +182,13 @@ def build_config(current: dict) -> dict:
             "type": os.environ.get("OM_AUTH_PROVIDER_NAME", ""),
             "secret": os.environ.get("OPENMETADATA_OIDC_CLIENT_SECRET", ""),
             "discoveryUri": os.environ.get("OM_OIDC_DISCOVERY_URI", ""),
-            "callbackUrl": os.environ.get("OM_AUTH_CALLBACK_URL", ""),
+            # Серверный callback (pac4j; сюда Keycloak возвращает code) — НЕ равен
+            # фронтовому: OM после обмена кода редиректит браузер на callbackUrl,
+            # и если тот совпадает с серверным путём, запрос ловит AuthCallbackServlet
+            # → «Issuer mismatch, possible mix-up attack».
+            "callbackUrl": os.environ.get(
+                "OM_OIDC_CALLBACK", os.environ.get("OM_AUTH_CALLBACK_URL", "")
+            ),
             "serverUrl": os.environ.get("OM_PUBLIC_URL", ""),
         }
     )

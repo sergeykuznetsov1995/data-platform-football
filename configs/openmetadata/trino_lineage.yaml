@@ -32,7 +32,10 @@ source:
       authType:
         password: "${TRINO_OPENMETADATA_PASSWORD}"
       catalog: iceberg
-      verifySSL: no-ssl
+      # OM 1.5+ выкинул верхнеуровневый `verifySSL` из схемы TrinoConnection
+      # («Extra parameter 'verifySSL'» → workflow не стартует). Отключение
+      # проверки самоподписанного серта идёт только через connectionArguments —
+      # как в trino_ingestion.yaml.
       connectionArguments:
         http_scheme: https
         verify: false
@@ -49,8 +52,9 @@ source:
           - "^bronze$"
           - "^silver$"
           - "^gold$"
-      # We don't have views in the medallion stack, but keep flag explicit.
-      processViewLineage: false
+      # Canonical WhoScored manifest-backed readers and Transfermarkt A/B
+      # readers are views. Preserve lineage through their serving boundaries.
+      processViewLineage: true
       processQueryLineage: true
       processStoredProcedureLineage: false
       # SqlGlot handles Trino dialect well (CTAS, WITH, window functions used in Gold).
