@@ -259,6 +259,7 @@ class TestMatchParser:
         )
         first = result.events.rows[0]
         assert first["source_event_id"] == 4_100_001
+        assert first["opta_event_id"] == 4_100_001
         assert first["team_event_id"] == 41
         assert first["related_team_event_id"] == 40
         assert first["team"] == "Liverpool"
@@ -266,6 +267,8 @@ class TestMatchParser:
         assert first["qualifiers"] == ('[{"type":{"displayName":"Cross","value":2}}]')
         assert result.events.rows[1]["player"] is None
         assert result.events.status is DatasetStatus.AVAILABLE
+        assert result.matches.rows[0]["source_raw_json"] is None
+        assert result.matches.rows[0]["source_schema_fingerprint"]
 
     def test_lineup_minutes_and_latest_rating_are_derived_without_more_io(self):
         lineups = parse_matchcentre_data(
@@ -320,11 +323,16 @@ class TestMatchParser:
         assert extracted["home"]["teamId"] == 26
         assert "events" not in extracted
 
-    def test_duplicate_or_missing_source_event_id_fails_contract(self):
+    def test_duplicate_source_event_id_gets_stable_composite_identity(self):
         data = _matchcentre()
         data["events"][1]["id"] = data["events"][0]["id"]
-        with pytest.raises(WhoScoredParseError, match="Duplicate global source event"):
-            parse_matchcentre_data(data, scope=CLUB_SCOPE, game_id=1)
+        events = parse_matchcentre_data(
+            data, scope=CLUB_SCOPE, game_id=1
+        ).events.rows
+
+        assert len({row["source_event_id"] for row in events}) == 2
+        assert {row["opta_event_id"] for row in events} == {4_100_001}
+
         data["events"][1].pop("id")
         with pytest.raises(WhoScoredParseError, match=r"events\[1\]\.id is required"):
             parse_matchcentre_data(data, scope=CLUB_SCOPE, game_id=1)

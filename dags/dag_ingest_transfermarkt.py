@@ -36,10 +36,10 @@ PROVIDER_SOFT_STOP_BYTES = 14 * 1024 * 1024
 # Preserve the former per-entity ceilings (26 + 120 + 120 + 50) as one
 # source-wide ceiling. Response reuse should make normal cycles much smaller.
 PROXY_REQUEST_LIMIT = 316
-# Residential exits fail often enough that two retries lose a whole scope to a
-# run of bad exits; a failed attempt costs ~10 KiB against a 15 MiB cycle, and
-# the client itself will not attempt an endpoint more than eight times.
-PROXY_RETRY_LIMIT = 8
+# Cycle-wide retry ledger: the source answers 502/504 in waves, and a scope
+# fetches dozens of pages, so a handful of retries dies on the first two. A
+# failed attempt costs ~10 KiB against the 15 MiB cap, which is the real bound.
+PROXY_RETRY_LIMIT = 128
 PROXY_CONCURRENCY = 1
 SCOPE_SET_COVERAGE_MAX_AGE_DAYS = 7
 

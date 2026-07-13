@@ -443,8 +443,42 @@ class TestTrinoTableManagerInsertDataFrameAtomic:
             return None
         return _exec
 
-    def test_insert_dataframe_atomic_stages_and_merges(self):
-        """Staged batches collapse into a single INSERT...SELECT on the target."""
+    def test_single_batch_append_skips_staging(self):
+        """A plain append that fits one INSERT needs no stage (#930).
+
+        The stage exists to collapse multi-batch writes into one snapshot
+        (#269). One INSERT is already one snapshot, so staging it would only
+        add a CREATE TABLE + DROP TABLE catalog round-trip per write.
+        """
+        import pandas as pd
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.trino_manager import TrinoTableManager
+
+            manager = TrinoTableManager()
+            df = pd.DataFrame({'team': ['A', 'B', 'C'], 'goals': [1, 2, 3]})
+
+            with patch.object(manager, '_execute', side_effect=self._exec_ok(3)) as mock_execute, \
+                 patch.object(manager, 'get_table_columns', return_value={}), \
+                 patch.object(manager, 'insert_dataframe') as mock_insert, \
+                 patch.object(manager, 'drop_table') as mock_drop:
+                result = manager.insert_dataframe_atomic('bronze', 'test_table', df)
+
+            assert result == 3
+            mock_insert.assert_not_called()
+            mock_drop.assert_not_called()
+
+            executed = [c[0][0] for c in mock_execute.call_args_list]
+            assert not any('CREATE TABLE' in sql for sql in executed)
+            assert not any('DELETE FROM' in sql for sql in executed)
+            target_inserts = [
+                sql for sql in executed
+                if sql.startswith('INSERT INTO iceberg.bronze.test_table ')
+            ]
+            assert len(target_inserts) == 1
+            assert 'VALUES' in target_inserts[0]
+
+    def test_oversized_append_still_stages_and_merges(self):
+        """A write too big for one INSERT still collapses to one snapshot."""
         import pandas as pd
         with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
             from scrapers.base.trino_manager import TrinoTableManager
@@ -454,6 +488,7 @@ class TestTrinoTableManagerInsertDataFrameAtomic:
             df = pd.DataFrame({'team': ['A', 'B', 'C'], 'goals': [1, 2, 3]})
 
             with patch.object(manager, '_execute', side_effect=self._exec_ok(3)) as mock_execute, \
+                 patch.object(manager, '_insert_single_batch', return_value=None), \
                  patch.object(manager, 'insert_dataframe', return_value=3) as mock_insert, \
                  patch.object(manager, 'drop_table') as mock_drop:
                 result = manager.insert_dataframe_atomic('bronze', 'test_table', df)
@@ -485,6 +520,48 @@ class TestTrinoTableManagerInsertDataFrameAtomic:
             assert f'FROM iceberg.bronze.{stage}' in target_inserts[0]
             # Plain append → no DELETE issued.
             assert not any('DELETE FROM' in sql for sql in executed)
+
+    def test_single_batch_fit_is_measured_not_estimated(self):
+        """The fast path renders real SQL and declines when it exceeds the budget."""
+        import pandas as pd
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.trino_manager import SQL_BYTE_BUDGET, TrinoTableManager
+
+            manager = TrinoTableManager()
+            with patch.object(manager, 'get_table_columns', return_value={}), \
+                 patch.object(manager, '_execute') as mock_execute:
+                fits = manager._insert_single_batch(
+                    'bronze', 't', pd.DataFrame({'blob': ['x' * 10]}), batch_size=1000
+                )
+                assert fits == 1
+                assert mock_execute.call_count == 1
+
+                # One row wider than the whole statement budget cannot fit.
+                oversized = manager._insert_single_batch(
+                    'bronze',
+                    't',
+                    pd.DataFrame({'blob': ['x' * (SQL_BYTE_BUDGET + 1)]}),
+                    batch_size=1000,
+                )
+                assert oversized is None
+                assert mock_execute.call_count == 1  # nothing executed
+
+                # Trino limits UTF-8 bytes, not Python character count.
+                multibyte = manager._insert_single_batch(
+                    'bronze',
+                    't',
+                    pd.DataFrame({'blob': ['⚽' * (SQL_BYTE_BUDGET // 2)]}),
+                    batch_size=1000,
+                )
+                assert multibyte is None
+                assert mock_execute.call_count == 1
+
+                # More rows than the batch size also fall back to staging.
+                too_many = manager._insert_single_batch(
+                    'bronze', 't', pd.DataFrame({'blob': ['x', 'y', 'z']}), batch_size=2
+                )
+                assert too_many is None
+                assert mock_execute.call_count == 1
 
     def test_insert_dataframe_atomic_empty(self):
         """Empty DataFrame is a no-op (no staging)."""

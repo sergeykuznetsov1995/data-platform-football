@@ -59,6 +59,7 @@ def test_production_page_chrome_paths_are_classified_not_drift():
             "content.hasPlayoff",
             "content.attackingZones.expected",
             "content.heatmapUrl",
+            "content.weather.condition",
         ],
         "team": [
             "QAData[].question",
