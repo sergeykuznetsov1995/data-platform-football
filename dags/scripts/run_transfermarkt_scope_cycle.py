@@ -1845,16 +1845,30 @@ def run_scope_cycle(
                 request_limit=int(args.request_limit),
                 retry_limit=int(args.retry_limit),
             )
-            # The runner's own diagnosis is the only account of why it failed,
-            # and the operator never sees its captured output otherwise.
-            reason = ' | '.join(
+            # The runner's captured output is the only account of why it failed,
+            # and it is otherwise discarded with the subprocess.
+            transcript = Path(identity.entity_dir) / f'{parser_entity}-failure.log'
+            try:
+                transcript.parent.mkdir(parents=True, exist_ok=True)
+                transcript.write_text(
+                    f'$ {" ".join(command)}\n\n'
+                    f'--- stdout ---\n{completed.stdout or ""}\n'
+                    f'--- stderr ---\n{completed.stderr or ""}\n',
+                    encoding='utf-8',
+                )
+            except OSError:
+                pass
+            diagnostic = [
                 line.strip()
-                for line in str(completed.stderr or '').splitlines()[-3:]
+                for line in str(completed.stderr or '').splitlines()
                 if line.strip()
-            )
+                and ('Error' in line or 'error' in line or 'Exception' in line)
+            ]
+            reason = ' | '.join(diagnostic[-2:])
             raise ScopeCycleError(
                 f'{parser_entity} runner failed with exit '
                 f'{completed.returncode}' + (f': {reason}' if reason else '')
+                + f' (transcript: {transcript})'
             )
         result = _load_json_file(temporary_path)
         result_requests = int(result.get('network_fetches', -1))
