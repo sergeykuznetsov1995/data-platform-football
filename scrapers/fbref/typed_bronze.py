@@ -47,7 +47,7 @@ from scrapers.fbref.match_parser import (
 )
 
 
-TYPED_BRONZE_PARSER_VERSION = "fbref-typed-bronze-v1"
+TYPED_BRONZE_PARSER_VERSION = "fbref-typed-bronze-v2"
 
 # Output compatibility only.  This mapping is intentionally derived from the
 # legacy aliases instead of being duplicated as another source of crawl scope.
