@@ -693,3 +693,71 @@ def test_scope_manifest_sql_is_exact_idempotent_complete_merge(tmp_path):
     assert proxy_sql.count("'scheduled__2026-07-11'") == 7
     assert str(cycle.HARD_BYTE_CAP) in proxy_sql
     assert str(cycle.SOFT_BYTE_STOP) in proxy_sql
+
+
+def test_a_calendar_league_edition_is_read_as_the_season_it_is_labelled(tmp_path):
+    # The source offsets some calendar leagues' saison_id from the season it
+    # names: saison_id 2023 is the 2024 season. The registry records the label's
+    # season, so deriving the season from the saison_id would reject the scope.
+    snapshot = 'registry-snapshot-20260711'
+    competition = resolve_competition('FIWC').as_dict()
+    competition['registry_snapshot_id'] = snapshot
+    edition = EditionRecord(
+        competition_id='FIWC',
+        edition_id='2023',
+        edition_label='2024',
+        canonical_season='2024',
+        season_format=SeasonFormat.SINGLE_YEAR,
+        start_date=None,
+        end_date=None,
+        active=True,
+        current=False,
+        participant_count=12,
+        participant_hash='participants-2023',
+        source_url='https://www.transfermarkt.com/x/startseite/wettbewerb/FIWC/saison_id/2023',
+        discovered_at=datetime(2026, 7, 11, tzinfo=timezone.utc),
+        registry_snapshot_id=snapshot,
+        source_body_hash='edition-body-hash',
+    )
+    base = tmp_path / 'cycles' / ('a' * 64) / 'scopes' / ('b' * 64)
+    payload = {
+        'parent_cycle_id': 'scheduled__2026-07-11',
+        'child_cycle_id': 'tm-child-0123456789abcdef01234567',
+        'competition_id': 'FIWC',
+        'edition_id': '2023',
+        'canonical_season': '2024',
+        'registry_snapshot_id': snapshot,
+        'scope_id': deterministic_scope_id('FIWC', '2023'),
+        'competition_record': competition,
+        'edition_record': edition.as_dict(),
+        'result_paths': {
+            'base_dir': str(base),
+            'entity_staging_dir': str(base / 'entities'),
+            'scope_manifest': str(base / 'scope-manifest.json'),
+        },
+        'parent_ledger': {
+            'parent_cycle_id': 'scheduled__2026-07-11',
+            'path': str(tmp_path / 'cycles' / ('a' * 64) / 'proxy-ledger.json'),
+        },
+    }
+    args = SimpleNamespace(
+        payload_json=json.dumps(payload),
+        parent_cycle_id=None,
+        child_cycle_id=None,
+        competition_id=None,
+        edition_id=None,
+        registry_snapshot_id=None,
+        scope_id=None,
+        canonical_competition_id=None,
+        canonical_season=None,
+        capture_revision=None,
+        refresh_mode='historical',
+        result_base_dir=None,
+        entity_staging_dir=None,
+        scope_manifest=None,
+        parent_ledger_path=None,
+    )
+
+    identity = cycle._scope_identity(args)
+
+    assert (identity.edition_id, identity.canonical_season) == ('2023', '2024')
