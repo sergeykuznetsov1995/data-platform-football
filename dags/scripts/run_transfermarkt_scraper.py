@@ -434,6 +434,12 @@ def _canonical_scope_season(competition: str, edition_id: int | str) -> str:
             f'{record.competition_id}: classification blocks crawl: '
             f'{record.crawl_block_reason}'
         )
+    # The source offsets some calendar leagues' saison_id from the season it
+    # names, so the registered season — not the edition id — is the truth. The
+    # edition id is only a fallback for a caller that states no season.
+    registered = str(os.environ.get('TM_CANONICAL_SEASON') or '').strip()
+    if registered:
+        return registered
     return canonical_season(edition_id, record.season_format)
 
 
