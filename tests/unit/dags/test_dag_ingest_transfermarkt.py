@@ -53,7 +53,7 @@ def _params(module, **overrides):
         'coach_history_ttl_days': 28,
         'checkpoint_ttl_days': 35,
         'proxy_lease_ttl_seconds': 3600,
-        'proxy_request_limit': 316,
+        'proxy_request_limit': 710,
         'proxy_retry_limit': 2,
         'entity_timeout_seconds': 3600,
     }
@@ -146,8 +146,8 @@ class TestDagShape:
     def test_bounded_operator_params_are_not_relaxable(self, dag_module):
         params = dag_module.dag._dag_kwargs['params']
         assert params['mv_transfers_limit']._kw['maximum'] == 100
-        assert params['proxy_retry_limit']._kw['maximum'] == 2
-        assert params['proxy_request_limit']._kw['maximum'] == 316
+        assert params['proxy_retry_limit']._kw['maximum'] == 400
+        assert params['proxy_request_limit']._kw['maximum'] == 710
         assert params['proxy_lease_ttl_seconds']._kw['maximum'] == 3600
         assert dag_module.PROVIDER_HARD_CAP_BYTES == 15 * 1024 * 1024
         assert dag_module.PROVIDER_SOFT_STOP_BYTES == 14 * 1024 * 1024
@@ -372,6 +372,8 @@ def _write_manifest_and_ledger(module, tmp_path: Path, *, bad_digest=False):
                 team_type='club',
             ),
             'authoritative_empty_evidence': {},
+            'roster_coverage': {},
+            'career_fetches_pending': 0,
             'participant_contract': {
                 'passed': True,
                 'competition_type': 'domestic_league',

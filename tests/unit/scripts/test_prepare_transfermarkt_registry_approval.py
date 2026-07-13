@@ -22,17 +22,23 @@ def _load():
     return module
 
 
-def _plan(module, tmp_path: Path):
+def _plan(module, tmp_path: Path, expected_revision: int = 0):
     approvals = tmp_path / "approvals"
     state = tmp_path / "state"
     return module.build_plan(
         "manual__tm_registry_prod_20260711T180000Z",
+        expected_revision=expected_revision,
         approval_root=approvals,
         state_root=state,
         output_root=state / "manifests",
         cache_path=state / "cache" / "http.json",
         journal_path=approvals / "journal.json",
     )
+
+
+def _trigger_conf(plan) -> dict:
+    argv = plan["trigger_argv"]
+    return json.loads(argv[argv.index("--conf") + 1])
 
 
 def test_plan_is_deterministic_and_side_effect_free(tmp_path):
@@ -51,8 +57,19 @@ def test_plan_is_deterministic_and_side_effect_free(tmp_path):
     }
     assert first["packets"]["paid"].byte_cap_bytes == 15_728_640
     assert first["packets"]["paid"].request_limit == 1024
-    assert first["packets"]["paid"].retry_limit == 12
+    assert first["packets"]["paid"].retry_limit == 96
     assert first["packets"]["paid"].concurrency == 1
+
+
+def test_trigger_conf_carries_the_registry_revision_to_compare_and_swap_against(tmp_path):
+    module = _load()
+    first = _plan(module, tmp_path)
+    assert _trigger_conf(first)["expected_registry_revision"] == 0
+
+    promoted = _plan(module, tmp_path, expected_revision=3)
+    assert _trigger_conf(promoted)["expected_registry_revision"] == 3
+    assert promoted["paid_packet_hash"] == first["paid_packet_hash"]
+    assert promoted["bronze_packet_hash"] == first["bronze_packet_hash"]
 
 
 def test_apply_requires_exact_hashes_and_approves_both(tmp_path):

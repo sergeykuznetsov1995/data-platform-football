@@ -33,10 +33,16 @@ PENDING_CHECKPOINT_DIR = '/opt/airflow/logs/transfermarkt-checkpoints'
 APPROVAL_JOURNAL = '/opt/airflow/logs/transfermarkt-approvals/journal.json'
 PROVIDER_HARD_CAP_BYTES = 15 * 1024 * 1024
 PROVIDER_SOFT_STOP_BYTES = 14 * 1024 * 1024
-# Preserve the former per-entity ceilings (26 + 120 + 120 + 50) as one
-# source-wide ceiling. Response reuse should make normal cycles much smaller.
-PROXY_REQUEST_LIMIT = 316
-PROXY_RETRY_LIMIT = 2
+# One source-wide ceiling over the per-entity attempt budgets (150 + 200 + 200
+# + 160). Attempts, not pages: the biggest leagues run to ~60 clubs and the
+# source answers 502/504 for a third to a half of the attempts in a bad wave.
+# The 15 MiB byte cap still stops a cycle long before these do.
+PROXY_REQUEST_LIMIT = 710
+# Cycle-wide retry ledger. A cold big league fetches ~360 pages across its four
+# entities and the source answers 502/504 for a third to a half of the attempts
+# in a wave, so it needs retries of that order. A failed attempt costs ~10 KiB
+# against the 15 MiB cap, which is what actually bounds the paid traffic.
+PROXY_RETRY_LIMIT = 400
 PROXY_CONCURRENCY = 1
 SCOPE_SET_COVERAGE_MAX_AGE_DAYS = 7
 
@@ -697,7 +703,7 @@ with DAG(
         ),
         'proxy_retry_limit': Param(
             default=PROXY_RETRY_LIMIT,
-            type='integer', minimum=0, maximum=2,
+            type='integer', minimum=0, maximum=PROXY_RETRY_LIMIT,
         ),
         'entity_timeout_seconds': Param(
             default=3600, type='integer', minimum=60, maximum=3600,

@@ -38,7 +38,12 @@ SLOTS = ('a', 'b')
 # A full inactive slot may be assembled from many bounded paid crawl batches.
 # The limits below apply independently to every parent cycle, never to the
 # aggregate ScopeSet traffic metric.
-MAX_SCOPE_SET_SIZE = 512
+#
+# The slot must cover the whole eligible target, and the promoted registry states
+# it: 705 senior-men competitions across 9778 active editions. The cap bounds the
+# manifest, not the crawl — every batch stays bounded by the byte, request and
+# retry limits below.
+MAX_SCOPE_SET_SIZE = 16_384
 SCOPE_SET_HARD_BYTE_CAP = 15_728_640
 SCOPE_SET_SOFT_BYTE_STOP = 14_680_064
 SCOPE_SET_REQUEST_LIMIT = 316

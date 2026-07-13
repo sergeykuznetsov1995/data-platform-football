@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import itertools
 import json
+import sys
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -147,7 +148,7 @@ def _approved_args(tmp_path: Path, payload: dict) -> tuple[list[str], Path]:
         request_limit=sum(
             item['requests'] for item in cycle.DEFAULT_ENTITY_LIMITS.values()
         ),
-        retry_limit=2,
+        retry_limit=cycle.PARENT_RETRY_LIMIT,
         **values,
     )
     write = ApprovalPacket(
@@ -333,9 +334,10 @@ def test_exact_cycle_runs_sequentially_without_shell_and_commits_manifest(tmp_pa
         and options['env']['TM_SCOPE_ID'] == payload['scope_id']
         for _, options in calls
     )
+    budget = str(cycle.PARENT_RETRY_LIMIT)
     assert all(
-        command[command.index('--retry-budget') + 1] == '2'
-        and options['env']['TM_RETRY_BUDGET'] == '2'
+        command[command.index('--retry-budget') + 1] == budget
+        and options['env']['TM_RETRY_BUDGET'] == budget
         for command, options in calls
     )
     assert manifest['status'] == 'complete'
@@ -378,8 +380,10 @@ def test_exact_cycle_runs_sequentially_without_shell_and_commits_manifest(tmp_pa
     assert ledger['retries'] == 0
     assert ledger['manifest_count'] == 1
     assert ledger['hard_provider_byte_budget'] == cycle.HARD_BYTE_CAP
-    assert ledger['request_limit'] == 316
-    assert ledger['retry_limit'] == 2
+    assert ledger['request_limit'] == sum(
+        item['requests'] for item in cycle.DEFAULT_ENTITY_LIMITS.values()
+    )
+    assert ledger['retry_limit'] == cycle.PARENT_RETRY_LIMIT
     for field in (
         'decoded_bytes', 'wire_bytes', 'provider_metered_bytes',
         'requests', 'retries', 'cache_hits', 'duration_ms',
@@ -539,7 +543,9 @@ def test_retry_limit_stops_next_entity_before_paid_io(tmp_path):
         cycle.run_scope_cycle(
             args,
             operation_argv=cycle.approved_operation_argv(argv),
-            subprocess_runner=_fake_subprocess(calls, first_retries=2),
+            subprocess_runner=_fake_subprocess(
+                calls, first_retries=cycle.PARENT_RETRY_LIMIT,
+            ),
             manifest_writer=lambda manifest: pytest.fail('manifest persisted'),
             parent_ledger_writer=lambda ledger: pytest.fail('ledger persisted'),
             monotonic_ns=ticks.__next__,
@@ -550,8 +556,7 @@ def test_retry_limit_stops_next_entity_before_paid_io(tmp_path):
     attempts = json.loads(
         Path(payload['parent_ledger']['path'] + '.attempts').read_text()
     )
-    assert attempts['requests'] == 2
-    assert attempts['retries'] == 2
+    assert attempts['retries'] == cycle.PARENT_RETRY_LIMIT
 
 
 def test_remaining_parent_retry_budget_is_pinned_in_argv_and_env(tmp_path):
@@ -570,11 +575,13 @@ def test_remaining_parent_retry_budget_is_pinned_in_argv_and_env(tmp_path):
         monotonic_ns=ticks.__next__,
     )
 
-    assert calls[0][0][calls[0][0].index('--retry-budget') + 1] == '2'
-    assert calls[0][1]['env']['TM_RETRY_BUDGET'] == '2'
+    full = str(cycle.PARENT_RETRY_LIMIT)
+    after_one_retry = str(cycle.PARENT_RETRY_LIMIT - 1)
+    assert calls[0][0][calls[0][0].index('--retry-budget') + 1] == full
+    assert calls[0][1]['env']['TM_RETRY_BUDGET'] == full
     for command, options in calls[1:]:
-        assert command[command.index('--retry-budget') + 1] == '1'
-        assert options['env']['TM_RETRY_BUDGET'] == '1'
+        assert command[command.index('--retry-budget') + 1] == after_one_retry
+        assert options['env']['TM_RETRY_BUDGET'] == after_one_retry
 
 
 def test_missing_output_is_red_and_never_checkpointed_or_promoted(tmp_path):
@@ -693,3 +700,85 @@ def test_scope_manifest_sql_is_exact_idempotent_complete_merge(tmp_path):
     assert proxy_sql.count("'scheduled__2026-07-11'") == 7
     assert str(cycle.HARD_BYTE_CAP) in proxy_sql
     assert str(cycle.SOFT_BYTE_STOP) in proxy_sql
+
+
+def test_a_calendar_league_edition_is_read_as_the_season_it_is_labelled(tmp_path):
+    # The source offsets some calendar leagues' saison_id from the season it
+    # names: saison_id 2023 is the 2024 season. The registry records the label's
+    # season, so deriving the season from the saison_id would reject the scope.
+    snapshot = 'registry-snapshot-20260711'
+    competition = resolve_competition('FIWC').as_dict()
+    competition['registry_snapshot_id'] = snapshot
+    edition = EditionRecord(
+        competition_id='FIWC',
+        edition_id='2023',
+        edition_label='2024',
+        canonical_season='2024',
+        season_format=SeasonFormat.SINGLE_YEAR,
+        start_date=None,
+        end_date=None,
+        active=True,
+        current=False,
+        participant_count=12,
+        participant_hash='participants-2023',
+        source_url='https://www.transfermarkt.com/x/startseite/wettbewerb/FIWC/saison_id/2023',
+        discovered_at=datetime(2026, 7, 11, tzinfo=timezone.utc),
+        registry_snapshot_id=snapshot,
+        source_body_hash='edition-body-hash',
+    )
+    base = tmp_path / 'cycles' / ('a' * 64) / 'scopes' / ('b' * 64)
+    payload = {
+        'parent_cycle_id': 'scheduled__2026-07-11',
+        'child_cycle_id': 'tm-child-0123456789abcdef01234567',
+        'competition_id': 'FIWC',
+        'edition_id': '2023',
+        'canonical_season': '2024',
+        'registry_snapshot_id': snapshot,
+        'scope_id': deterministic_scope_id('FIWC', '2023'),
+        'competition_record': competition,
+        'edition_record': edition.as_dict(),
+        'result_paths': {
+            'base_dir': str(base),
+            'entity_staging_dir': str(base / 'entities'),
+            'scope_manifest': str(base / 'scope-manifest.json'),
+        },
+        'parent_ledger': {
+            'parent_cycle_id': 'scheduled__2026-07-11',
+            'path': str(tmp_path / 'cycles' / ('a' * 64) / 'proxy-ledger.json'),
+        },
+    }
+    args = SimpleNamespace(
+        payload_json=json.dumps(payload),
+        parent_cycle_id=None,
+        child_cycle_id=None,
+        competition_id=None,
+        edition_id=None,
+        registry_snapshot_id=None,
+        scope_id=None,
+        canonical_competition_id=None,
+        canonical_season=None,
+        capture_revision=None,
+        refresh_mode='historical',
+        result_base_dir=None,
+        entity_staging_dir=None,
+        scope_manifest=None,
+        parent_ledger_path=None,
+    )
+
+    identity = cycle._scope_identity(args)
+
+    assert (identity.edition_id, identity.canonical_season) == ('2023', '2024')
+
+
+def test_the_approved_interpreter_is_the_one_behind_the_alias(tmp_path):
+    # The DAG's PATH finds /usr/local/bin/python while a shell finds another
+    # alias of the same binary; an argv keyed on the alias would drift.
+    real = Path(sys.executable).resolve()
+    alias = tmp_path / 'python'
+    alias.symlink_to(real)
+
+    argv = cycle.approved_operation_argv(
+        ('--refresh-mode', 'historical'), executable=str(alias),
+    )
+
+    assert argv[0] == str(real)

@@ -106,6 +106,7 @@ class _Candidate:
     competition: CompetitionRecord
     edition: EditionRecord
     last_success_at: datetime | None
+    career_fetches_pending: int = 0
     explicit_order: int | None = None
 
     @property
@@ -227,10 +228,12 @@ def _load_registry(
     dict[str, CompetitionRecord],
     dict[tuple[str, str], EditionRecord],
     dict[tuple[str, str], datetime | None],
+    dict[tuple[str, str], int],
 ]:
     competition_map: dict[str, CompetitionRecord] = {}
     edition_map: dict[tuple[str, str], EditionRecord] = {}
     last_success: dict[tuple[str, str], datetime | None] = {}
+    career_pending: dict[tuple[str, str], int] = {}
 
     def add_competition(record: CompetitionRecord) -> None:
         existing = competition_map.get(record.competition_id)
@@ -275,6 +278,7 @@ def _load_registry(
                     f'conflicting last_success_at rows for {key[0]}/{key[1]}'
                 )
             last_success[key] = observed
+            career_pending[key] = int(row.get('career_fetches_pending') or 0)
     except (RegistryError, RegistryConflictError) as exc:
         raise ScopePlanningError(str(exc)) from exc
 
@@ -287,7 +291,7 @@ def _load_registry(
         raise ScopePlanningError(
             f'edition has no competition row: {orphan_editions[0]}'
         )
-    return competition_map, edition_map, last_success
+    return competition_map, edition_map, last_success, career_pending
 
 
 def _competition_aliases(record: CompetitionRecord) -> set[str]:
@@ -338,13 +342,18 @@ def _resolve_edition(
         edition for key, edition in editions.items()
         if key[0] == competition.competition_id
     ]
-    direct = [
-        item for item in available
-        if raw in {item.edition_id, item.edition_label, item.canonical_season}
-    ]
-    if direct:
-        matches = direct
-    else:
+    # A calendar-year league offsets its saison_id from the season it names:
+    # 2DVB's edition '2024' is season 2025, and season 2024 is edition '2023'.
+    # Matching the three fields as one set makes every such selector ambiguous,
+    # so read them narrowest first: the source's own key, then its label.
+    matches: list[EditionRecord] = []
+    for field in ('edition_id', 'edition_label', 'canonical_season'):
+        matches = [
+            item for item in available if getattr(item, field) == raw
+        ]
+        if matches:
+            break
+    if not matches:
         try:
             requested_canonical = canonical_season(
                 raw, competition.season_format
@@ -396,6 +405,12 @@ def _scope_spec(value: Any) -> tuple[Any, Any]:
 def _is_due(candidate: _Candidate, now: datetime) -> bool:
     if candidate.last_success_at is None:
         return True
+    # A cycle buys a bounded window of a roster's careers.  A scope that still
+    # owes some is not finished with, whatever its last manifest was called —
+    # and a historical edition is otherwise never asked for again, so the
+    # careers it still owed would never be bought at all.
+    if candidate.career_fetches_pending > 0:
+        return True
     if candidate.edition.current:
         return candidate.last_success_at <= now - CURRENT_SCOPE_INTERVAL
     return False
@@ -408,6 +423,7 @@ def _select_candidates(
     editions: Mapping[tuple[str, str], EditionRecord],
     last_success: Mapping[tuple[str, str], datetime | None],
     now: datetime,
+    career_pending: Mapping[tuple[str, str], int] | None = None,
 ) -> list[_Candidate]:
     scopes = _normalise_sequence(params.get('scopes'), name='scopes')
     leagues = _normalise_sequence(params.get('leagues'), name='leagues')
@@ -426,6 +442,9 @@ def _select_candidates(
                 last_success_at=last_success.get(
                     (competition.competition_id, edition.edition_id)
                 ),
+                career_fetches_pending=int((career_pending or {}).get(
+                    (competition.competition_id, edition.edition_id), 0
+                )),
                 explicit_order=position,
             ))
     elif leagues:
@@ -452,6 +471,9 @@ def _select_candidates(
                 last_success_at=last_success.get(
                     (competition.competition_id, chosen.edition_id)
                 ),
+                career_fetches_pending=int((career_pending or {}).get(
+                    (competition.competition_id, chosen.edition_id), 0
+                )),
                 explicit_order=position,
             ))
     else:
@@ -479,6 +501,7 @@ def _select_candidates(
                 competition=competition,
                 edition=edition,
                 last_success_at=last_success.get(key),
+                career_fetches_pending=int((career_pending or {}).get(key, 0)),
             )
             if _is_due(candidate, now):
                 selected.append(candidate)
@@ -509,7 +532,7 @@ def eligible_registry_scopes(
     previously served competition with a partial table.
     """
 
-    competitions, editions, _ = _load_registry(
+    competitions, editions, _, _ = _load_registry(
         competitions=None,
         editions=None,
         registry_rows=registry_rows,
@@ -601,7 +624,7 @@ def plan_transfermarkt_scopes(
     current_time = _as_utc(now or datetime.now(timezone.utc))
     assert current_time is not None
 
-    competition_map, edition_map, last_success = _load_registry(
+    competition_map, edition_map, last_success, career_pending = _load_registry(
         competitions=competitions,
         editions=editions,
         registry_rows=registry_rows,
@@ -611,6 +634,7 @@ def plan_transfermarkt_scopes(
         competitions=competition_map,
         editions=edition_map,
         last_success=last_success,
+        career_pending=career_pending,
         now=current_time,
     )
     selection_identity = [
@@ -735,10 +759,20 @@ def build_promoted_registry_query(
     ORDER BY revision DESC
     LIMIT 1
 ), last_complete_scope AS (
-    SELECT competition_id, edition_id, MAX(committed_at) AS last_success_at
-    FROM {SCOPE_MANIFEST_TABLE}
-    WHERE status = '{SCOPE_COMPLETION_STATUS}'
-    GROUP BY competition_id, edition_id
+    SELECT competition_id, edition_id,
+           with_timezone(committed_at, 'UTC') AS last_success_at,
+           COALESCE(TRY_CAST(json_extract_scalar(
+               entity_manifest_json, '$.dq_evidence.career_fetches_pending'
+           ) AS bigint), 0) AS career_fetches_pending
+    FROM (
+        SELECT *, ROW_NUMBER() OVER (
+            PARTITION BY competition_id, edition_id
+            ORDER BY committed_at DESC
+        ) AS rn
+        FROM {SCOPE_MANIFEST_TABLE}
+        WHERE status = '{SCOPE_COMPLETION_STATUS}'
+    )
+    WHERE rn = 1
 )
 SELECT
     c.competition_id,
@@ -753,7 +787,8 @@ SELECT
     c.season_format AS competition_season_format,
     c.active AS competition_active,
     c.source_url AS competition_source_url,
-    c.discovered_at AS competition_discovered_at,
+    -- Iceberg stores these without a zone; discovery writes them in UTC.
+    with_timezone(c.discovered_at, 'UTC') AS competition_discovered_at,
     c.canonical_competition_id,
     c.classification_status,
     c.classification_evidence,
@@ -771,12 +806,13 @@ SELECT
     e.participant_count,
     e.participant_hash,
     e.source_url AS edition_source_url,
-    e.discovered_at AS edition_discovered_at,
+    with_timezone(e.discovered_at, 'UTC') AS edition_discovered_at,
     e.source_body_hash AS edition_source_body_hash,
     e.parser_revision AS edition_parser_revision,
     e.schema_revision AS edition_schema_revision,
     p.registry_snapshot_id,
-    s.last_success_at
+    s.last_success_at,
+    COALESCE(s.career_fetches_pending, 0) AS career_fetches_pending
 FROM {COMPETITIONS_TABLE} c
 JOIN {EDITIONS_TABLE} e
   ON e.competition_id = c.competition_id

@@ -24,6 +24,9 @@ from scrapers.transfermarkt.models import (
 )
 
 
+CONTROL_TOKEN = "c" * 32
+
+
 class _Response:
     def __init__(self, body: bytes, *, status: int = 200, payload=None):
         self.content = body
@@ -166,7 +169,9 @@ def test_production_lease_adapter_uses_exact_api_and_basic_proxy_auth():
         }),
     ])
     provider = ProxyFilterLeaseProvider(
-        "http://proxy_filter:8899", control_client=control,
+        "http://proxy_filter:8899",
+        control_client=control,
+        control_token=CONTROL_TOKEN,
     )
     metadata = {
         **_metadata(),
@@ -184,10 +189,34 @@ def test_production_lease_adapter_uses_exact_api_and_basic_proxy_auth():
     assert post[0:2] == ("POST", "http://proxy_filter:8899/v1/leases")
     assert post[2]["json"]["max_bytes"] == 1234
     assert post[2]["json"]["ttl_seconds"] == 300
+    # The control plane authenticates the caller on every call; the lease's own
+    # bearer token only says which lease a call is about.
+    assert post[2]["headers"] == {"X-Proxy-Control-Token": CONTROL_TOKEN}
     assert control.calls[1][2]["headers"] == {
+        "X-Proxy-Control-Token": CONTROL_TOKEN,
         "Authorization": "Bearer secret/token",
     }
     assert control.calls[2][0] == "DELETE"
+
+
+@pytest.mark.unit
+def test_a_lease_is_refused_before_any_call_when_the_control_token_is_absent(
+    monkeypatch,
+):
+    for name in (
+        "TM_PROXY_CONTROL_TOKEN",
+        "PROXY_FILTER_CONTROL_TOKEN",
+        "SOFASCORE_PROXY_CONTROL_TOKEN",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    control = _ControlClient([])
+
+    with pytest.raises(ProxyRequiredError, match="TM_PROXY_CONTROL_TOKEN"):
+        ProxyFilterLeaseProvider(
+            "http://proxy_filter:8899", control_client=control,
+        )
+
+    assert control.calls == []
 
 
 @pytest.mark.unit
@@ -347,13 +376,16 @@ def test_shared_retry_cap_blocks_paid_retry_n_plus_one_before_io():
         sleep_fn=lambda _: None,
     )
 
+    # max_attempts is what bounds this fetch — a block is now worth more than
+    # one alternate exit, so the ladder must be capped here to spend exactly
+    # the one paid retry the ledger allows.
     first = client.fetch(
-        "https://www.transfermarkt.us/a", as_json=False, max_attempts=3,
+        "https://www.transfermarkt.us/a", as_json=False, max_attempts=2,
     )
     assert first.status is FetchStatus.BLOCKED
     with pytest.raises(TrafficBudgetExceeded, match="paid retry budget"):
         client.fetch(
-            "https://www.transfermarkt.us/b", as_json=False, max_attempts=3,
+            "https://www.transfermarkt.us/b", as_json=False, max_attempts=2,
         )
 
     assert sum(len(item.calls) for item in factory.clients) == 3
@@ -446,3 +478,56 @@ def test_checkpoint_migrates_valid_empty_and_rejects_hash_tampering():
     corrupt["value"] = ["unexpected"]
     with pytest.raises(ValueError, match="hash mismatch"):
         FetchOutcome.from_checkpoint(corrupt)
+
+
+@pytest.mark.unit
+def test_the_control_secret_is_shared_by_every_source_the_filter_guards(
+    monkeypatch,
+):
+    # One filter, one control secret; it is deployed under the name of the
+    # source that first needed it.
+    monkeypatch.delenv("TM_PROXY_CONTROL_TOKEN", raising=False)
+    monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", CONTROL_TOKEN)
+
+    provider = ProxyFilterLeaseProvider(
+        "http://proxy_filter:8899", control_client=_ControlClient([]),
+    )
+
+    assert provider._control_token == CONTROL_TOKEN
+
+
+@pytest.mark.unit
+def test_a_page_paid_for_by_one_cycle_is_not_paid_for_again():
+    # A league can exceed one cycle's byte cap, so the next cycle must finish it
+    # from the pages the previous one already bought.
+    cache: dict = {}
+    url = "https://www.transfermarkt.com/x/kader/verein/4128"
+
+    first = TransfermarktHttpClient(
+        lease_provider=_FakeLeaseProvider([
+            LeaseTrafficSnapshot(up_bytes=100, down_bytes=900),
+        ]),
+        traffic_ledger=SharedTrafficLedger(),
+        lease_metadata=_metadata(),
+        client_factory=_TlsFactory([_Response(b"<html/>")]),
+        cache=cache,
+    )
+    paid = first.fetch(url, as_json=False, cache_key=url, cache_ttl_seconds=3600)
+    assert paid.status is FetchStatus.OK
+    assert cache
+
+    # The next cycle: a transport with no responses left would fail any real
+    # request, and the lease provider would refuse to hand out another lease.
+    second = TransfermarktHttpClient(
+        lease_provider=_FakeLeaseProvider([]),
+        traffic_ledger=SharedTrafficLedger(),
+        lease_metadata=_metadata(),
+        client_factory=_TlsFactory([]),
+        cache=cache,
+    )
+    reused = second.fetch(url, as_json=False, cache_key=url, cache_ttl_seconds=3600)
+
+    assert reused.status is FetchStatus.OK
+    stats = second.get_traffic_stats()
+    assert stats["cache_hits"] == 1
+    assert stats["provider_metered_bytes"] == 0

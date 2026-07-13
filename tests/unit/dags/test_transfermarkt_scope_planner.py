@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 from datetime import datetime, timedelta, timezone
 
@@ -103,6 +104,7 @@ def _joined_row(
     edition: EditionRecord,
     *,
     last_success_at: datetime | None = None,
+    career_fetches_pending: int = 0,
 ) -> dict:
     return {
         'competition_id': competition.competition_id,
@@ -145,6 +147,7 @@ def _joined_row(
         'last_success_at': (
             last_success_at.isoformat() if last_success_at else None
         ),
+        'career_fetches_pending': career_fetches_pending,
     }
 
 
@@ -191,6 +194,31 @@ def test_exact_scopes_take_precedence_and_duplicates_are_removed():
         (item['competition_id'], item['edition_id'])
         for item in plan.mapped_payloads
     ] == [('CL', '2025'), ('GB1', '2025')]
+
+
+def test_a_calendar_league_scope_names_the_source_edition_not_its_season():
+    # The source offsets a calendar league's saison_id from the season it names:
+    # edition '2024' is season 2025, and season 2024 is edition '2023'.
+    league = _competition('2DVB', season_format=SeasonFormat.SINGLE_YEAR)
+    editions = [
+        replace(
+            _edition('2DVB', edition_id, season_format=SeasonFormat.SINGLE_YEAR),
+            edition_label=season,
+            canonical_season=season,
+        )
+        for edition_id, season in (('2023', '2024'), ('2024', '2025'))
+    ]
+    plan = planner.plan_transfermarkt_scopes(
+        {'scopes': ['2DVB:2024']},
+        parent_cycle_id='manual__calendar',
+        competitions=[league],
+        editions=editions,
+        now=NOW,
+    )
+    assert [
+        (item['edition_id'], item['canonical_season'])
+        for item in plan.mapped_payloads
+    ] == [('2024', '2025')]
 
 
 def test_unknown_active_classification_blocks_empty_and_explicit_plans():
@@ -294,6 +322,14 @@ def test_completed_ops_scope_is_not_replanned_due_to_status_drift():
     assert (
         f"WHERE status = '{scope_state.SCOPE_COMPLETION_STATUS}'" in query
     )
+    # ``committed_at`` is a naive timestamp(6) written in UTC, and the planner
+    # refuses a timestamp that states no zone — so the read must state it.  The
+    # first scope ever completed is what turns this from theory into a failure:
+    # until then every last_success_at is NULL.
+    assert "with_timezone(committed_at, 'UTC')" in query
+    # A scope that still owes career fetches is not finished with, whatever its
+    # manifest was called — so the planner must read the debt, not just the date.
+    assert "career_fetches_pending" in query
 
     competition = _competition('DONE')
     plan = planner.plan_transfermarkt_scopes(
@@ -362,3 +398,39 @@ def test_batch_size_cannot_bypass_global_bound(batch_size):
             max_batch_size=batch_size,
             now=NOW,
         )
+
+
+def test_a_scope_that_still_owes_careers_is_asked_for_again():
+    # One cycle buys at most a window of a roster's careers. A historical
+    # edition is never re-planned once it has a complete manifest, so the
+    # careers it still owed would never be bought at all — the league would sit
+    # in the slot with a hundred of its players' histories and no one the wiser.
+    competition = _competition('DONE')
+    edition = _edition('DONE', '2024', current=False)
+
+    settled = planner.plan_transfermarkt_scopes(
+        {},
+        parent_cycle_id='scheduled__settled',
+        registry_rows=[_joined_row(
+            competition, edition,
+            last_success_at=NOW - timedelta(days=1),
+            career_fetches_pending=0,
+        )],
+        now=NOW,
+    )
+    assert settled.mapped_payloads == ()
+
+    owing = planner.plan_transfermarkt_scopes(
+        {},
+        parent_cycle_id='scheduled__still-owing',
+        registry_rows=[_joined_row(
+            competition, edition,
+            last_success_at=NOW - timedelta(days=1),
+            career_fetches_pending=2099,
+        )],
+        now=NOW,
+    )
+    assert [
+        (item['competition_id'], item['edition_id'])
+        for item in owing.mapped_payloads
+    ] == [('DONE', '2024')]

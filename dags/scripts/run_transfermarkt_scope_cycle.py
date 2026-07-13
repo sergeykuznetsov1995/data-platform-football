@@ -52,8 +52,16 @@ from scrapers.transfermarkt.registry import (
 
 
 MIB = 1024 * 1024
+RESPONSE_CACHE_ROOT = Path('/opt/airflow/logs/transfermarkt-native-v2/cache')
+RESPONSE_CACHE_TTL_SECONDS = 24 * 60 * 60
 HARD_BYTE_CAP = 15_728_640
 SOFT_BYTE_STOP = 14_680_064
+# The cycle-wide retry ledger, not a per-page cap. A cold big league fetches
+# ~360 pages across its four entities, and the source answers 502/504 for a
+# third to a half of the attempts in a wave, so it needs retries of that order —
+# measured: 37 retries for 83 market-value pages alone. A failed attempt costs
+# ~10 KiB of the 15 MiB byte cap, which is what actually bounds the traffic.
+PARENT_RETRY_LIMIT = 400
 ENTITY_ORDER = (
     'players',
     'market_value_history',
@@ -99,11 +107,14 @@ OPS_WRITE_TABLES = {
     'iceberg.ops.proxy_traffic_runs',
     PROXY_LEDGER_TABLE,
 }
+# 'requests' counts attempts, not pages: a squad page that answers 504 twice
+# costs three. A 20-club league already needs ~21 pages, so 26 attempts left no
+# room for the source's failure waves and the entity died mid-league.
 DEFAULT_ENTITY_LIMITS = {
-    'players': {'decoded_bytes': 10 * MIB, 'requests': 26},
-    'market_value_history': {'decoded_bytes': 4 * MIB, 'requests': 120},
-    'transfers': {'decoded_bytes': 8 * MIB, 'requests': 120},
-    'coaches': {'decoded_bytes': 6 * MIB, 'requests': 50},
+    'players': {'decoded_bytes': 16 * MIB, 'requests': 150},
+    'market_value_history': {'decoded_bytes': 4 * MIB, 'requests': 200},
+    'transfers': {'decoded_bytes': 8 * MIB, 'requests': 200},
+    'coaches': {'decoded_bytes': 14 * MIB, 'requests': 160},
 }
 _APPROVAL_FLAGS = {
     '--approval-journal',
@@ -310,8 +321,14 @@ def _scope_identity(args: argparse.Namespace) -> ScopeIdentity:
         canonical = edition.canonical_season
         edition_current = bool(edition.current)
         edition_participant_count = edition.participant_count
+    # The source offsets some calendar leagues' saison_id from the season it
+    # names (saison_id 2023 is labelled "2024"), so the registered edition is
+    # checked against the label it was derived from, exactly as registry DQ
+    # does. Only a caller who passed no edition record at all is left with the
+    # edition id as the sole statement of its season.
     expected_canonical = canonical_season(
-        edition_id, competition.season_format,
+        edition.edition_label if raw_edition is not None else edition_id,
+        competition.season_format,
     )
     canonical = _required(canonical or expected_canonical, 'canonical_season')
     if canonical != expected_canonical:
@@ -402,8 +419,12 @@ def approved_operation_argv(
 ) -> tuple[str, ...]:
     """Return the exact action argv without self-referential approval refs."""
 
+    # `python` resolves to a different alias depending on PATH (the DAG's env
+    # finds /usr/local/bin/python, an interactive shell finds the one in
+    # ~/.local/bin), and both are symlinks to the same interpreter. The approved
+    # operation is the interpreter itself, not the name it was invoked by.
     result = [
-        executable or sys.executable,
+        str(Path(executable or sys.executable).resolve()),
         script_path or str(Path(__file__).resolve()),
     ]
     values = list(argv)
@@ -683,6 +704,13 @@ def _runner_environment(
         'TM_PENDING_CHECKPOINT_DIR': str(
             Path(identity.result_base_dir) / 'checkpoints'
         ),
+        # A league can be larger than one cycle's byte cap, so the pages already
+        # paid for must outlive the cycle that fetched them. The path is keyed by
+        # scope, not by cycle, which is what lets the next cycle finish the job.
+        'TM_RESPONSE_CACHE_PATH': str(
+            RESPONSE_CACHE_ROOT / f'{identity.scope_id}.json'
+        ),
+        'TM_RESPONSE_CACHE_TTL_SECONDS': str(RESPONSE_CACHE_TTL_SECONDS),
         'TM_CYCLE_BUDGET_DIR': str(Path(identity.parent_ledger_path).parent),
         'TM_COMPETITION_RECORDS_JSON': _stable_json([
             identity.competition_record,
@@ -1071,6 +1099,24 @@ def _build_scope_manifest(
                 'kind': kind,
                 'result_sha256': run.result_sha256,
             }
+    # A career fact is bought a roster window at a time.  Say how much of the
+    # roster this scope actually holds: a manifest that only says 'complete'
+    # cannot tell a scope covering every player from one covering a hundred.
+    roster_coverage = {
+        run.parser_entity: dict(run.result['roster_coverage'])
+        for run in runs
+        if isinstance(run.result.get('roster_coverage'), Mapping)
+    }
+    pending_total = sum(
+        int(item.get('pending', 0)) for item in roster_coverage.values()
+    )
+    if pending_total:
+        print(
+            f'ROSTER COVERAGE: {pending_total} career fetches still pending '
+            f'for {identity.scope_id}; a later cycle continues from the '
+            'checkpoint',
+            file=sys.stderr,
+        )
     dq_evidence = {
         'status': 'passed',
         'registry_participant_count': identity.edition_participant_count,
@@ -1080,6 +1126,8 @@ def _build_scope_manifest(
         'entity_contracts': entity_contracts,
         'authoritative_empty_evidence': authoritative_empty_evidence,
         'participant_contract': dict(participant_dq),
+        'roster_coverage': roster_coverage,
+        'career_fetches_pending': pending_total,
     }
     scope = ScopeManifest(
         parent_cycle_id=identity.parent_cycle_id,
@@ -1186,7 +1234,8 @@ WHEN NOT MATCHED THEN INSERT (
     s.edition_id, s.canonical_competition_id, s.canonical_season,
     s.registry_snapshot_id, s.capture_revision, s.parser_revision,
     s.schema_revision, s.reader_revision, s.entity_manifest_json,
-    s.manifest_digest, s.status, CURRENT_TIMESTAMP
+    s.manifest_digest, s.status,
+    CAST(CURRENT_TIMESTAMP AT TIME ZONE 'UTC' AS timestamp(6))
 )"""
 
 
@@ -1835,8 +1884,30 @@ def run_scope_cycle(
                 request_limit=int(args.request_limit),
                 retry_limit=int(args.retry_limit),
             )
+            # The runner's captured output is the only account of why it failed,
+            # and it is otherwise discarded with the subprocess.
+            transcript = Path(identity.entity_dir) / f'{parser_entity}-failure.log'
+            try:
+                transcript.parent.mkdir(parents=True, exist_ok=True)
+                transcript.write_text(
+                    f'$ {" ".join(command)}\n\n'
+                    f'--- stdout ---\n{completed.stdout or ""}\n'
+                    f'--- stderr ---\n{completed.stderr or ""}\n',
+                    encoding='utf-8',
+                )
+            except OSError:
+                pass
+            diagnostic = [
+                line.strip()
+                for line in str(completed.stderr or '').splitlines()
+                if line.strip()
+                and ('Error' in line or 'error' in line or 'Exception' in line)
+            ]
+            reason = ' | '.join(diagnostic[-2:])
             raise ScopeCycleError(
-                f'{parser_entity} runner failed with exit {completed.returncode}'
+                f'{parser_entity} runner failed with exit '
+                f'{completed.returncode}' + (f': {reason}' if reason else '')
+                + f' (transcript: {transcript})'
             )
         result = _load_json_file(temporary_path)
         result_requests = int(result.get('network_fetches', -1))
@@ -1963,7 +2034,7 @@ def _parser() -> argparse.ArgumentParser:
         '--request-limit', type=int,
         default=sum(item['requests'] for item in DEFAULT_ENTITY_LIMITS.values()),
     )
-    parser.add_argument('--retry-limit', type=int, default=2)
+    parser.add_argument('--retry-limit', type=int, default=PARENT_RETRY_LIMIT)
     parser.add_argument('--entity-limits-json')
     parser.add_argument('--career-window-limit', type=int, default=100)
     parser.add_argument('--coach-history-ttl-days', type=int, default=28)
@@ -1987,9 +2058,13 @@ def _validate_args(args: argparse.Namespace) -> None:
     production_requests = sum(
         item['requests'] for item in DEFAULT_ENTITY_LIMITS.values()
     )
-    if args.request_limit != production_requests or args.retry_limit != 2:
+    if (
+        args.request_limit != production_requests
+        or args.retry_limit != PARENT_RETRY_LIMIT
+    ):
         raise ScopeCycleError(
-            f'parent request/retry limits must equal {production_requests}/2'
+            'parent request/retry limits must equal '
+            f'{production_requests}/{PARENT_RETRY_LIMIT}'
         )
     if not 1 <= args.career_window_limit <= 100:
         raise ScopeCycleError('career window limit must be between 1 and 100')

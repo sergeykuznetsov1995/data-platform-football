@@ -393,16 +393,27 @@ class TestParseMvHistory:
         assert rows[0]['age'] == 16
         assert rows[1]['value_eur'] == 45_000_000
 
-    def test_datum_missing_falls_back_to_epoch_x(self):
-        # Epoch ms is UTC; TM's `datum_mw` is wall-clock CET. When we
-        # synthesise the date from `x` alone we land on the UTC day.
+    def test_the_epoch_is_midnight_in_the_sources_own_timezone(self):
+        # The epoch is midnight CET, which read as UTC lands on the day before.
         payload = {'list': [{
             'x': 1425250800000, 'y': 300000, 'mw': '€300k',
             'verein': 'Club', 'age': '16',
         }]}
         rows = _parse_mv_history(payload, '1')
         assert len(rows) == 1
-        assert rows[0]['mv_date'] == date(2015, 3, 1)
+        assert rows[0]['mv_date'] == date(2015, 3, 2)
+
+    def test_the_machine_date_wins_over_the_hosts_rendering_of_it(self):
+        # '03/05/2015' parses just as happily day-first as month-first; only the
+        # epoch says which one the source meant.
+        payload = {'list': [{
+            'x': 1425250800000, 'datum_mw': '03/05/2015', 'y': 300000,
+            'mw': '€300k', 'verein': 'Club', 'age': '16',
+        }]}
+
+        rows = _parse_mv_history(payload, '1')
+
+        assert rows[0]['mv_date'] == date(2015, 3, 2)
 
     def test_empty_list(self):
         assert _parse_mv_history({'list': []}, '1') == []
@@ -410,7 +421,40 @@ class TestParseMvHistory:
         assert _parse_mv_history(None, '1') == []  # type: ignore[arg-type]
 
 
+class TestParseDates:
+    def test_the_day_first_rendering_of_the_com_host_is_understood(self):
+        from scrapers.transfermarkt.scraper import _parse_tm_date
+
+        # A day past the 12th proves which number the host puts first.
+        assert _parse_tm_date('17/08/1993 (31)') == date(1993, 8, 17)
+        assert _parse_tm_date('Aug 17, 1993') == date(1993, 8, 17)
+
+
 class TestParseTransfers:
+    def test_the_machine_date_wins_over_the_hosts_rendering_of_it(self):
+        # .com renders 27 July 2020 as "27/07/2020" and .us as "Jul 27, 2020";
+        # only dateUnformatted says which number is the day on every host.
+        payload = {'transfers': [{
+            'date': '27/07/2020',
+            'dateUnformatted': '2020-07-27',
+            'season': '20/21',
+            'upcoming': False,
+            'from': {
+                'clubName': 'PSG',
+                'href': '/psgtm/transfers/verein/583/saison_id/2020',
+            },
+            'to': {
+                'clubName': 'Man City',
+                'href': '/manchester-city/transfers/verein/281/saison_id/2020',
+            },
+            'fee': '€30.00m',
+            'marketValue': '€40.00m',
+        }]}
+
+        rows = _parse_transfers(payload, '315858')
+
+        assert rows[0]['transfer_date'] == date(2020, 7, 27)
+
     def test_happy_path(self):
         payload = {'transfers': [{
             'date': 'Sep 1, 2025',
@@ -1311,7 +1355,7 @@ class TestNativeCareerFacts:
             'ENG-Premier League', 2025, player_ids=['9'],
         )
         legacy = materialize_legacy_market_value_history(
-            points, 'ENG-Premier League', 2025,
+            points, 'ENG-Premier League', 2025, SeasonFormat.SPLIT_YEAR,
         )
 
         assert len(points) == 1
@@ -1338,7 +1382,7 @@ class TestNativeCareerFacts:
             'ENG-Premier League', 2025, player_ids=['9'],
         )
         legacy = materialize_legacy_transfers(
-            events, 'ENG-Premier League', 2025,
+            events, 'ENG-Premier League', 2025, SeasonFormat.SPLIT_YEAR,
         )
 
         assert events.iloc[0]['event_season'] == '2021'
@@ -1548,3 +1592,207 @@ class TestNativeCoachContracts:
         assert len(bundle['stints']) == 2
         assert len(bundle['legacy_coaches']) == 2
         resolver.assert_not_called()
+
+
+class TestLegacyPlayerAgeParity:
+    def test_the_printed_age_survives_into_the_legacy_projection(self):
+        # The dual-write parity gate compares both projections' age. Recomputing
+        # it "as of now" over pages that may be a day old (the scope cache lives
+        # 24h) drifts by a year for anyone whose birthday fell in between.
+        from scrapers.transfermarkt.scraper import materialize_legacy_players
+
+        observations = pd.DataFrame([{
+            'player_id': '1', 'player_slug': 'x', 'name': 'X', 'position': 'CB',
+            'dob': date(1993, 8, 17), 'age': 31, 'height_cm': 180,
+            'foot': 'right', 'nationality': 'RU',
+            'contract_until': date(2026, 6, 30), 'market_value_eur': 100000,
+            'league': 'TM-2DVB', 'season': '2024', 'club_id': '12043',
+            'club_name': 'Dinamo',
+        }])
+        memberships = pd.DataFrame([{
+            'league': 'TM-2DVB', 'season': '2024', 'club_id': '12043',
+            'player_id': '1',
+        }])
+
+        legacy = materialize_legacy_players(memberships, observations)
+
+        assert legacy.iloc[0]['age'] == 31
+
+    def test_an_age_the_source_omits_is_derived_from_the_birth_date(self):
+        from scrapers.transfermarkt.scraper import materialize_legacy_players
+
+        observations = pd.DataFrame([{
+            'player_id': '1', 'player_slug': 'x', 'name': 'X', 'position': 'CB',
+            'dob': date(1993, 8, 17), 'age': None, 'height_cm': 180,
+            'foot': 'right', 'nationality': 'RU',
+            'contract_until': date(2026, 6, 30), 'market_value_eur': 100000,
+            'league': 'TM-2DVB', 'season': '2024', 'club_id': '12043',
+            'club_name': 'Dinamo',
+        }])
+        memberships = pd.DataFrame([{
+            'league': 'TM-2DVB', 'season': '2024', 'club_id': '12043',
+            'player_id': '1',
+        }])
+
+        legacy = materialize_legacy_players(memberships, observations)
+
+        assert legacy.iloc[0]['age'] > 30
+
+
+class TestMoneyLocale:
+    def test_a_suffix_we_do_not_know_is_an_error_not_a_thousandfold_mistake(self):
+        from scrapers.transfermarkt.scraper import (
+            MoneyLocaleError, _parse_tm_money_eur,
+        )
+
+        assert _parse_tm_money_eur('€1,20 Mrd.') == 1_200_000_000
+        assert _parse_tm_money_eur('€900Th.') == 900_000
+        with pytest.raises(MoneyLocaleError, match='unknown magnitude'):
+            _parse_tm_money_eur('€500 gazillion')
+
+    def test_a_figure_in_another_currency_cannot_become_a_eur_column(self):
+        from scrapers.transfermarkt.scraper import (
+            MoneyLocaleError, _parse_tm_money_eur,
+        )
+
+        with pytest.raises(MoneyLocaleError, match='not EUR'):
+            _parse_tm_money_eur('$30.00m')
+
+    def test_the_absent_figures_stay_absent(self):
+        from scrapers.transfermarkt.scraper import _parse_tm_money_eur
+
+        assert _parse_tm_money_eur('-') is None
+        assert _parse_tm_money_eur('?') is None
+        assert _parse_tm_money_eur('€0') == 0
+
+
+class TestCalendarLeagueSeason:
+    """The source offsets a calendar league's saison_id from the season it
+    prints (saison_id 2023 is the 2024 season).  Every dated projection —
+    the coach-stint window and the legacy season key — must be dated by the
+    season the registry states, or three of the four legacy tables land under
+    a season the league never played.
+    """
+
+    @staticmethod
+    def _calendar_record():
+        from scrapers.transfermarkt.registry import (
+            CompetitionType, TeamType, _bootstrap_record,
+        )
+
+        return _bootstrap_record(
+            competition_id='2DVB',
+            slug='2-division-b',
+            name='Second League Division B',
+            country='Russia',
+            confederation='UEFA',
+            competition_type=CompetitionType.DOMESTIC_LEAGUE,
+            team_type=TeamType.CLUB,
+            season_format=SeasonFormat.SINGLE_YEAR,
+            source_url=(
+                'https://www.transfermarkt.com/2-division-b/startseite/'
+                'wettbewerb/2DVB'
+            ),
+            canonical_competition_id='TM-2DVB',
+        )
+
+    def test_the_registered_season_dates_the_window_a_saison_id_would_misdate(
+        self,
+    ):
+        from scrapers.transfermarkt.registry import season_window_year
+
+        assert season_window_year('2023', SeasonFormat.SINGLE_YEAR, '2024') == 2024
+        # A split-year season opens in the year its saison_id names.
+        assert season_window_year('2025', SeasonFormat.SPLIT_YEAR, '2526') == 2025
+
+    def test_the_year_2021_is_not_the_key_of_the_2020_21_season(self):
+        # '2021' is both the year and the key of the season before it — the two
+        # are the same four characters.  Reading a season out of its digits
+        # therefore filed every 2021/22 split-year row under 2020/21.
+        from scrapers.transfermarkt.scraper import _normalise_requested_season
+
+        assert _normalise_requested_season(2021, SeasonFormat.SPLIT_YEAR) == '2122'
+        assert _normalise_requested_season(2020, SeasonFormat.SPLIT_YEAR) == '2021'
+        assert _normalise_requested_season(2024, SeasonFormat.SINGLE_YEAR) == '2024'
+
+    def test_a_stint_in_the_registered_season_survives_and_keys_that_season(
+        self, monkeypatch,
+    ):
+        import scrapers.transfermarkt.scraper as tm
+
+        scraper = TransfermarktScraper(
+            competition_records=(self._calendar_record(),),
+            canonical_season='2024',
+        )
+        memberships = pd.DataFrame([
+            {'club_id': '1', 'club_slug': 'a', 'club_name': 'A'},
+        ])
+        # Autumn 2024: inside the 2024 calendar season, outside both the
+        # 2023 calendar year and the 2023/24 split year the saison_id names.
+        monkeypatch.setattr(tm, '_parse_coach_history', lambda html, club_id: [{
+            'coach_id': '10', 'coach_slug': 'coach', 'name': 'Coach',
+            'role': 'Manager', 'club_id': club_id,
+            'appointed_date': date(2024, 8, 1), 'left_date': date(2024, 12, 1),
+        }])
+        monkeypatch.setattr(tm, '_parse_coach_profile', lambda html, coach_id: {
+            'coach_id': coach_id, 'name': 'Coach Full',
+            'dob': date(1970, 1, 1), 'nationality': 'Russia',
+        })
+        monkeypatch.setattr(scraper, '_fetch_html', lambda *a, **k: '<html/>')
+
+        bundle = scraper.read_coach_data(
+            '2DVB', 2023, memberships=memberships, coach_profile_cache={},
+        )
+
+        legacy = bundle['legacy_coaches']
+        assert len(legacy) == 1
+        assert legacy.iloc[0]['season'] == '2024'
+        assert legacy.iloc[0]['league'] == 'TM-2DVB'
+
+    def test_a_coach_whose_bio_page_failed_is_still_a_coach(self, monkeypatch):
+        # His club's history page named him, so the legacy projection lists him
+        # with an empty bio.  Without an identity row on the native side the
+        # dual-write parity gate fails the whole scope over one lost page.
+        import scrapers.transfermarkt.scraper as tm
+
+        scraper = TransfermarktScraper(
+            competition_records=(self._calendar_record(),),
+            canonical_season='2024',
+        )
+        memberships = pd.DataFrame([
+            {'club_id': '1', 'club_slug': 'a', 'club_name': 'A'},
+        ])
+        # One page in twelve fails — under the mass-failure ratio that aborts
+        # the scrape, so the scope commits and the gap must be representable.
+        monkeypatch.setattr(tm, '_parse_coach_history', lambda html, club_id: [
+            {
+                'coach_id': str(index), 'coach_slug': f'coach-{index}',
+                'name': f'Coach {index}', 'role': 'Manager', 'club_id': club_id,
+                'appointed_date': date(2024, 8, 1), 'left_date': None,
+            }
+            for index in range(12)
+        ])
+        monkeypatch.setattr(tm, '_parse_coach_profile', lambda html, coach_id: {
+            'coach_id': coach_id, 'name': f'Coach {coach_id} Full',
+            'dob': date(1970, 1, 1), 'nationality': 'Russia',
+        })
+
+        def _fetch(url, label='html', context=None):
+            if label == 'coach_profile' and (context or {}).get('coach_id') == '7':
+                return None
+            return '<html/>'
+
+        monkeypatch.setattr(scraper, '_fetch_html', _fetch)
+
+        bundle = scraper.read_coach_data(
+            '2DVB', 2023, memberships=memberships, coach_profile_cache={},
+        )
+
+        profiles = bundle['profiles'].set_index('coach_id')
+        assert len(profiles) == 12
+        assert pd.isna(profiles.loc['7', 'dob'])
+        assert profiles.loc['7', 'name'] == 'Coach 7'
+        assert profiles.loc['3', 'name'] == 'Coach 3 Full'
+        # Both projections know every coach the source named — the parity gate
+        # compares them key for key.
+        assert set(bundle['legacy_coaches']['coach_id']) == set(profiles.index)
