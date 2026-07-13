@@ -190,6 +190,8 @@ class WaveResult:
     browser_document_bytes: int = 0
     browser_asset_bytes: int = 0
     browser_bootstraps: int = 0
+    budget_exhausted: bool = False
+    requeued_at_budget: int = 0
     failures: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict:
@@ -934,13 +936,23 @@ class FBrefPipeline:
                         response.browser_bootstrap_attempts
                     )
                 except BudgetExceeded as exc:
-                    self.control.fail_fetch(
-                        lease,
-                        error_class="budget_exhausted",
-                        error_message=str(exc),
-                        retry_delay_seconds=0,
+                    # The budget is a ceiling the crawler is meant to stop at,
+                    # not a fault. Failing these targets made every day that
+                    # spent its budget a red run — and the pages had not even
+                    # been touched. Hand them back to the queue and end the wave
+                    # cleanly; the next run picks them up.
+                    unfetched = leases[lease_index:]
+                    result.requeued_at_budget = (
+                        self.control.requeue_unfetched_targets(unfetched)
                     )
-                    result.failures.append(f"{lease.target_id}:budget_exhausted")
+                    result.budget_exhausted = True
+                    logger.warning(
+                        "FBref run budget exhausted (%s) — %d unfetched "
+                        "target(s) returned to the queue for the next run",
+                        exc,
+                        result.requeued_at_budget,
+                    )
+                    break
                 except FetchError as exc:
                     billed = (
                         exc.provider_billed_bytes
@@ -1845,10 +1857,13 @@ class FBrefPipeline:
         if summary is None:
             raise RunValidationError(f"Unknown run {run_id}")
         target_counts = summary.get("target_counts") or {}
+        # 'skipped' is a target the run deliberately did not fetch — it stopped
+        # at its budget and handed the target back to the queue. That is the
+        # designed steady state of a budgeted crawler, not an incomplete run.
         incomplete = {
             status: count
             for status, count in target_counts.items()
-            if status != "succeeded" and int(count) > 0
+            if status not in {"succeeded", "skipped"} and int(count) > 0
         }
         dataset_counts = summary.get("dataset_validation_counts") or {}
         dataset_failures = sum(
