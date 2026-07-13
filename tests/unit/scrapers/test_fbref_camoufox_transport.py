@@ -669,3 +669,36 @@ def test_browser_start_watchdog_is_disarmed_once_the_browser_is_up(monkeypatch):
     assert len(timers) == 1
     assert timers[0].cancelled is True
     assert timers[0].interval == transport.BROWSER_START_TIMEOUT_S
+
+
+def test_byte_budget_abort_never_closes_the_browser_from_a_callback():
+    """Playwright's sync API deadlocks when the browser is torn down inside an
+    event callback: the callback waits for the close, the close waits for the
+    callback. The cap must only raise its flag there — closing is the fetch
+    loop's job, back on the main thread."""
+    transport = CamoufoxFbrefTransport(max_network_bytes=100)
+    stopped = []
+    transport._stop = lambda: stopped.append(True)  # type: ignore[method-assign]
+    transport._cm = object()
+
+    transport._abort_session_for_byte_budget("declared_content_length_exceeds_cap:999")
+
+    assert stopped == []
+    assert transport._byte_budget_exhausted is True
+    assert transport.traffic_stats()["byte_budget_failure"] == (
+        "declared_content_length_exceeds_cap:999"
+    )
+
+
+def test_fetch_closes_the_session_after_the_budget_aborted_it():
+    transport = CamoufoxFbrefTransport(max_network_bytes=100)
+    stopped = []
+    transport._stop = lambda: stopped.append(True)  # type: ignore[method-assign]
+    transport._cm = object()
+    transport._page = MagicMock()
+    transport._page.goto.side_effect = lambda *a, **k: (
+        transport._abort_session_for_byte_budget("undeclared_body_exceeds_cap:1")
+    )
+
+    assert transport.fetch("https://fbref.com/en/") is None
+    assert stopped == [True]
