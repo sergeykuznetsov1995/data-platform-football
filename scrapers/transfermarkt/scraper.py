@@ -290,8 +290,21 @@ def _parse_height_cm(raw) -> Optional[int]:
 _TM_DATE_FORMATS = ('%b %d, %Y', '%B %d, %Y', '%Y-%m-%d', '%d.%m.%Y')
 
 
+def _transfer_date(entry: Dict) -> Optional[date]:
+    """Read a transfer's date from the machine field, not the rendered one.
+
+    ``date`` is localised by host (``Jan 1, 2026`` on .us, ``01/01/2026`` on
+    .com, where day and month cannot be told apart), while ``dateUnformatted``
+    is ISO on every host.
+    """
+
+    return _parse_tm_date(
+        entry.get('dateUnformatted') or entry.get('date')
+    )
+
+
 def _parse_tm_date(raw) -> Optional[date]:
-    """Parse the small set of date formats TM exposes on .us. ``None`` on fail."""
+    """Parse the small set of date formats TM exposes. ``None`` on fail."""
     if not raw:
         return None
     s = str(raw).strip()
@@ -736,7 +749,7 @@ def _stable_transfer_id(
     if source_id is None:
         from_id = _extract_club_id_from_href(from_d.get('href'))
         to_id = _extract_club_id_from_href(to_d.get('href'))
-        parsed_date = _parse_tm_date(entry.get('date'))
+        parsed_date = _transfer_date(entry)
         identity.update({
             'event_season': _normalise_event_season(
                 entry.get('season'), parsed_date,
@@ -771,7 +784,7 @@ def _parse_transfers(payload: dict, player_id: str) -> List[Dict]:
     for entry in payload.get('transfers') or []:
         if not isinstance(entry, dict):
             continue
-        transfer_date = _parse_tm_date(entry.get('date'))
+        transfer_date = _transfer_date(entry)
         event_season = _normalise_event_season(entry.get('season'), transfer_date)
         from_d = entry.get('from') if isinstance(entry.get('from'), dict) else {}
         to_d = entry.get('to') if isinstance(entry.get('to'), dict) else {}
@@ -852,7 +865,7 @@ def _source_row_semantic_error(label: str, entry: Dict) -> Optional[str]:
         upcoming = entry.get('upcoming', False)
         if not isinstance(upcoming, bool):
             return 'transfer upcoming flag is not boolean'
-        transfer_date = _parse_tm_date(entry.get('date'))
+        transfer_date = _transfer_date(entry)
         event_season = _normalise_event_season(
             entry.get('season'), transfer_date,
         )
