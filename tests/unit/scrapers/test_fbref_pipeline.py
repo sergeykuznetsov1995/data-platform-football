@@ -1170,11 +1170,14 @@ def test_validation_accepts_complete_eligible_sentinel_coverage(tmp_path):
     assert "finish:True" in control.events
 
 
-def test_validation_rejects_two_browser_bootstrap_attempts(tmp_path):
+def test_validation_rejects_a_browser_driven_page_by_page_session(tmp_path):
+    """The invariant is one clearance per session, every page then riding the
+    warm HTTP path: a regression that drove the browser per page shows one
+    bootstrap attempt per page."""
     raw = _raw_store(tmp_path)
     control = FakeControl(raw)
     summary = control.get_run_summary(str(uuid.uuid4()))
-    summary["session_metrics"] = {"max_bootstraps_per_session": 2}
+    summary["session_metrics"] = {"max_bootstraps_per_session": 25}
     control.get_run_summary = lambda _, **__: summary
     pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
 
@@ -1185,6 +1188,22 @@ def test_validation_rejects_two_browser_bootstrap_attempts(tmp_path):
         pipeline.validate_and_finish(str(uuid.uuid4()))
 
     assert "finish:False" in control.events
+
+
+def test_validation_accepts_a_clearance_re_solved_on_a_fresh_proxy(tmp_path):
+    """A stalled exit IP costs a second solve, which the run reserved and the
+    transport bounds. Demanding a single attempt failed a production run whose
+    only sin was surviving a bad proxy."""
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    summary = control.get_run_summary(str(uuid.uuid4()))
+    summary["session_metrics"] = {"max_bootstraps_per_session": 2}
+    control.get_run_summary = lambda _, **__: summary
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    pipeline.validate_and_finish(str(uuid.uuid4()))
+
+    assert "finish:True" in control.events
 
 
 @pytest.mark.parametrize("run_type", ["current", "backfill", "replay"])

@@ -75,6 +75,7 @@ from scrapers.fbref.settings import (
     DEFAULT_REQUEST_LIMIT,
     DEFAULT_REQUEST_RESERVATION_BYTES,
     DEFAULT_SHARD_SIZE,
+    MAX_CLEARANCE_SOLVE_ATTEMPTS,
     MAX_SHARD_SIZE,
     MIB,
     bootstrap_reservation_for,
@@ -1930,7 +1931,15 @@ class FBrefPipeline:
                 f"{int(traffic['duplicate_fetch_violations'])}"
             )
         sessions = summary.get("session_metrics") or {}
-        if int(sessions.get("max_bootstraps_per_session") or 0) > 1:
+        # The invariant is that the browser establishes ONE clearance per
+        # session and every page then rides the warm HTTP path — a regression
+        # that drove the browser per page would show one attempt per page. A
+        # stalled exit IP legitimately costs a re-solve on a fresh proxy, which
+        # the transport bounds at MAX_CLEARANCE_SOLVE_ATTEMPTS; demanding a
+        # single attempt failed a run whose only sin was surviving a bad proxy.
+        if int(sessions.get("max_bootstraps_per_session") or 0) > (
+            MAX_CLEARANCE_SOLVE_ATTEMPTS
+        ):
             errors.append("browser_bootstrap_exceeded_per_session")
         if str(summary.get("run_type")) == "replay" and (
             int(traffic.get("network_attempts") or 0) != 0
