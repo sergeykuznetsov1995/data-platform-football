@@ -651,3 +651,48 @@ def test_a_seasons_table_with_unlinked_rows_is_still_a_contract_error():
 
     assert result.has_errors
     assert result.datasets["seasons"].reason == "season_links_missing"
+
+
+def test_a_single_match_season_page_has_no_schedule_to_advertise():
+    """The UEFA Super Cup's season page carries no fixtures and no tables — one
+    match needs no schedule. Failing it would fail the wave on a men's
+    competition FBref publishes exactly as intended."""
+    html = """
+    <div id="content"><h1>2013 UEFA Super Cup Stats</h1>
+      <a href="/en/comps/122/history/UEFA-Super-Cup-Seasons">Seasons</a>
+    </div>
+    """
+    season = SeasonRef(
+        comp_id="122",
+        season_id="2013-2014",
+        label="2013-2014",
+        calendar_type=CalendarType.TOURNAMENT,
+        season_url="https://fbref.com/en/comps/122/2013-2014/2013-UEFA-Super-Cup-Stats",
+    )
+
+    result = parse_season_html(html, season)
+    dataset = result.datasets["schedules"]
+
+    assert not result.has_errors
+    assert dataset.status == DatasetStatus.NOT_APPLICABLE
+    assert dataset.reason == "season_publishes_no_schedule"
+
+
+def test_a_season_page_with_tables_but_no_schedule_link_still_fails_closed():
+    """A league season page always advertises Scores & Fixtures. Tables without
+    that link mean the markup changed — never silently skip the season."""
+    html = """
+    <div id="content"><table id="results2024"><tr><td>x</td></tr></table></div>
+    """
+    season = SeasonRef(
+        comp_id="9",
+        season_id="2024-2025",
+        label="2024-2025",
+        calendar_type=CalendarType.SPLIT_YEAR,
+        season_url="https://fbref.com/en/comps/9/2024-2025/2024-2025-Premier-League-Stats",
+    )
+
+    result = parse_season_html(html, season)
+
+    assert result.has_errors
+    assert result.datasets["schedules"].reason == "schedule_link_missing"
