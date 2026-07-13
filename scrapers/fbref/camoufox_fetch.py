@@ -505,9 +505,18 @@ class CamoufoxFbrefTransport:
         self._budget_blocked_count += 1
         self._last_solve_failure = "byte_budget"
         logger.error("Camoufox byte budget aborted the session: %s", reason)
-        # Closing the whole context is deliberate: aborting only one route can
-        # leave parallel responses consuming the proxy after the cap failed.
-        self._stop()
+        # Charge every in-flight reservation in full: those requests may have
+        # crossed an unknown fraction of the wire, and the cap must stay
+        # conservative even though the browser is still up for a moment.
+        self._unobserved_reserved_bytes += self._inflight_reserved_bytes
+        self._inflight_byte_reservations.clear()
+        self._inflight_reserved_bytes = 0
+        # The browser is NOT closed here.  This runs inside a Playwright event
+        # callback (`response` / `requestfinished`), and the sync API deadlocks
+        # if the browser is torn down from one: the callback waits for the
+        # close, the close waits for the callback to return, and the wave hangs
+        # forever holding its leases.  `route()` refuses every further request
+        # while the flag is set, and `fetch()` closes the session on its way out.
 
     def _maybe_block(self, route) -> None:
         req = None
@@ -857,6 +866,12 @@ class CamoufoxFbrefTransport:
             if attempt < self.MAX_PROXY_ROTATIONS:
                 self._lifecycle_action(self._restart, 'restart')
 
+        if self._byte_budget_exhausted and self._cm is not None:
+            # The cap fired inside a Playwright callback, which may not close
+            # the browser (see _abort_session_for_byte_budget).  Do it here,
+            # back on the main thread, so no parallel response keeps spending
+            # proxy bytes after the budget failed.
+            self._stop()
         return None
 
     # -- clearance export (HTTP fast-path) --------------------------------- #
