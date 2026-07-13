@@ -307,6 +307,45 @@ def test_discovery_drops_a_competition_the_source_never_staged() -> None:
     assert snapshot.competitions
 
 
+def test_catalog_table_groups_classify_rows_the_section_only_brackets() -> None:
+    listing = (
+        '<!doctype html><html lang="en"><head>'
+        '<meta name="tm-country" content="England">'
+        '<meta name="tm-confederation" content="UEFA">'
+        "</head><body>"
+        '<div class="box"><h2>European leagues &amp; cups</h2>'
+        '<table class="items"><tbody>'
+        '<tr><td class="extrarow">First Tier</td></tr>'
+        '<tr><td><a href="/premier-league/startseite/wettbewerb/GB1">'
+        "Premier League</a></td></tr>"
+        '<tr><td class="extrarow">Youth league</td></tr>'
+        '<tr><td><a href="/u18-premier-league/startseite/wettbewerb/GB18">'
+        "U18 Premier League</a></td></tr>"
+        "</tbody></table></div></body></html>"
+    )
+    profile = (
+        '<!doctype html><html lang="en"><body>'
+        '<h1 data-competition-id="GB18">U18 Premier League</h1>'
+        '<select name="saison_id"><option value="2025" selected>25/26</option>'
+        "</select></body></html>"
+    )
+
+    pages, *_ = _discover(
+        fetch=FixtureFetch(
+            {
+                BASE_URL + "/wettbewerbe/europa": listing,
+                BASE_URL + "/u18-premier-league/startseite/wettbewerb/GB18": profile,
+            }
+        )
+    )
+    snapshot = reconcile_registry_pages(pages)
+    by_id = {item.competition_id: item for item in snapshot.competitions}
+
+    assert by_id["GB1"].classification_status is ClassificationStatus.ELIGIBLE
+    assert by_id["GB18"].classification_status is ClassificationStatus.EXCLUDED
+    assert by_id["GB18"].age_category is not by_id["GB1"].age_category
+
+
 def test_discovery_ignores_navbar_entries_that_every_page_repeats() -> None:
     afrika = (FIXTURES / "afrika.html").read_text(encoding="utf-8")
     navbar = (

@@ -273,6 +273,12 @@ def _section_signals(label: str) -> _SectionSignals:
             "international club competitions",
             "continental club competitions",
             "club competitions",
+            # The confederation catalogues head their continental club section
+            # "Cups" / "International cups" / "International cup competitions".
+            "international cups",
+            "international cup competitions",
+            "cup competitions",
+            "cups",
         )
     ):
         return _SectionSignals(
@@ -299,6 +305,79 @@ def _section_signals(label: str) -> _SectionSignals:
     return _SectionSignals(
         gender=gender,
         age_category=AgeCategory.UXX if youth else None,
+    )
+
+
+def _row_group_label(anchor: Tag) -> str:
+    """The catalogue table's own group heading above this competition's row.
+
+    The confederation listings group their rows under structural separators —
+    ``First Tier``, ``Domestic Cup``, ``Youth league``, ``Reserve league`` — and
+    that grouping, not the competition's name, is what states its type, age and
+    team category.
+    """
+    row = anchor.find_parent("tr")
+    while row is not None:
+        previous = row.find_previous_sibling("tr")
+        while previous is not None:
+            separator = previous.select_one("td.extrarow")
+            if separator is not None:
+                return _normalise_text(separator.get_text(" ", strip=True))
+            previous = previous.find_previous_sibling("tr")
+        row = row.find_parent("tr")
+    return ""
+
+
+def _group_signals(label: str) -> _SectionSignals:
+    """Map the table's group heading; never inspect a competition name."""
+
+    normalised = _normalise_text(label).casefold()
+    if not normalised:
+        return _SectionSignals()
+    if "reserve" in normalised:
+        return _SectionSignals(
+            competition_type=CompetitionType.DOMESTIC_LEAGUE,
+            team_type=TeamType.RESERVE,
+            age_category=AgeCategory.SENIOR,
+        )
+    age_category = (
+        AgeCategory.UXX if "youth" in normalised else AgeCategory.SENIOR
+    )
+    if "cup" in normalised:
+        return _SectionSignals(
+            competition_type=CompetitionType.DOMESTIC_CUP,
+            team_type=TeamType.CLUB,
+            age_category=age_category,
+        )
+    if any(
+        token in normalised
+        for token in ("tier", "league", "championship", "play-off", "playoff")
+    ):
+        return _SectionSignals(
+            competition_type=CompetitionType.DOMESTIC_LEAGUE,
+            team_type=TeamType.CLUB,
+            age_category=age_category,
+        )
+    return _SectionSignals()
+
+
+def _merge_signals(
+    section: _SectionSignals,
+    group: _SectionSignals,
+) -> _SectionSignals:
+    """The table group wins: it is the narrower statement.
+
+    A confederation page heads its whole table "European leagues & cups" and
+    then groups the rows into "First Tier", "Domestic Cup", "Youth league" — so
+    the group states what the section only brackets. The section still answers
+    for rows that have no group, such as the continental club competitions.
+    """
+
+    return _SectionSignals(
+        competition_type=group.competition_type or section.competition_type,
+        gender=group.gender or section.gender,
+        team_type=group.team_type or section.team_type,
+        age_category=group.age_category or section.age_category,
     )
 
 
@@ -462,7 +541,11 @@ def _listing_candidates(
                 f"competition link has no name: {page_url} -> {profile_url}"
             )
         label = _section_label(anchor)
-        signals = _section_signals(label)
+        group_label = _row_group_label(anchor)
+        signals = _merge_signals(
+            _section_signals(label), _group_signals(group_label)
+        )
+        label = label or group_label
         country = _normalise_text(anchor.get("data-country") or context.country)
         confederation = _normalise_text(
             anchor.get("data-confederation") or context.confederation
