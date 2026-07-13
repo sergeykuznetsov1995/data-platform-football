@@ -119,7 +119,7 @@ PRODUCTION_CYCLE_BUDGET_BYTES = 15 * MIB
 # 'requests' counts attempts, not pages; keep in sync with the parent cycle's
 # DEFAULT_ENTITY_LIMITS.
 PRODUCTION_ENTITY_BUDGETS = {
-    ENTITY_PLAYERS: {'decoded_mb': 10.0, 'requests': 150},
+    ENTITY_PLAYERS: {'decoded_mb': 16.0, 'requests': 150},
     ENTITY_MV_HISTORY: {'decoded_mb': 4.0, 'requests': 200},
     ENTITY_TRANSFERS: {'decoded_mb': 8.0, 'requests': 200},
     ENTITY_COACHES: {'decoded_mb': 14.0, 'requests': 160},
@@ -2500,8 +2500,8 @@ _MANIFEST_COMPATIBILITY = {
 }
 
 
-def _compatibility_fingerprint(frame, columns: Sequence[str]) -> Tuple[int, str]:
-    """Hash sorted DISTINCT normalized key tuples with a stable NULL sentinel."""
+def _compatibility_keys(frame, columns: Sequence[str]) -> List[Tuple[str, ...]]:
+    """Sorted DISTINCT normalized key tuples with a stable NULL sentinel."""
     def normalise(value: Any) -> str:
         if value is None:
             return '__NULL__'
@@ -2525,6 +2525,11 @@ def _compatibility_fingerprint(frame, columns: Sequence[str]) -> Tuple[int, str]
             tuple(normalise(value) for value in row)
             for row in projected.itertuples(index=False, name=None)
         )
+    return values
+
+
+def _compatibility_fingerprint(frame, columns: Sequence[str]) -> Tuple[int, str]:
+    values = _compatibility_keys(frame, columns)
     blob = json.dumps(values, ensure_ascii=False, separators=(',', ':'))
     return len(values), hashlib.sha256(blob.encode('utf-8')).hexdigest()
 
@@ -2645,6 +2650,24 @@ def _persist_dual_write_manifest(
             and legacy_hash == native_hash
             else 'parity_mismatch'
         )
+        if status == 'parity_mismatch':
+            # Which keys diverged is the whole diagnosis; a row count and two
+            # hashes say only that they did.
+            legacy_keys = set(
+                _compatibility_keys(comparison_legacy_frame, contract['legacy'])
+            )
+            native_keys = set(
+                _compatibility_keys(native_frame, contract['native'])
+            )
+            logger.error(
+                'PARITY %s: legacy-only=%d native-only=%d; legacy examples=%s; '
+                'native examples=%s',
+                contract['entity'],
+                len(legacy_keys - native_keys),
+                len(native_keys - legacy_keys),
+                sorted(legacy_keys - native_keys)[:3],
+                sorted(native_keys - legacy_keys)[:3],
+            )
         sql = f"""
 MERGE INTO {DUAL_WRITE_MANIFEST_TABLE} t
 USING (VALUES (

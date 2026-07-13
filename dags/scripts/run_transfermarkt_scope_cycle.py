@@ -56,11 +56,12 @@ RESPONSE_CACHE_ROOT = Path('/opt/airflow/logs/transfermarkt-native-v2/cache')
 RESPONSE_CACHE_TTL_SECONDS = 24 * 60 * 60
 HARD_BYTE_CAP = 15_728_640
 SOFT_BYTE_STOP = 14_680_064
-# This is the cycle-wide retry ledger, not a per-page cap: the source answers
-# 502/504 in waves, and a scope fetches dozens of pages, so a handful of retries
-# is spent by the first two pages. A failed attempt costs ~10 KiB, and the real
-# bound on paid traffic is the 15 MiB byte cap, not the number of attempts.
-PARENT_RETRY_LIMIT = 128
+# The cycle-wide retry ledger, not a per-page cap. A cold big league fetches
+# ~360 pages across its four entities, and the source answers 502/504 for a
+# third to a half of the attempts in a wave, so it needs retries of that order —
+# measured: 37 retries for 83 market-value pages alone. A failed attempt costs
+# ~10 KiB of the 15 MiB byte cap, which is what actually bounds the traffic.
+PARENT_RETRY_LIMIT = 400
 ENTITY_ORDER = (
     'players',
     'market_value_history',
@@ -110,7 +111,7 @@ OPS_WRITE_TABLES = {
 # costs three. A 20-club league already needs ~21 pages, so 26 attempts left no
 # room for the source's failure waves and the entity died mid-league.
 DEFAULT_ENTITY_LIMITS = {
-    'players': {'decoded_bytes': 10 * MIB, 'requests': 150},
+    'players': {'decoded_bytes': 16 * MIB, 'requests': 150},
     'market_value_history': {'decoded_bytes': 4 * MIB, 'requests': 200},
     'transfers': {'decoded_bytes': 8 * MIB, 'requests': 200},
     'coaches': {'decoded_bytes': 14 * MIB, 'requests': 160},
