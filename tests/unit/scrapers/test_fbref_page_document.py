@@ -126,3 +126,40 @@ def test_generic_records_keep_raw_header_value_and_entity_json():
     assert cells[0]["raw_value"] == "P"
     assert cells[0]["raw_header_path"] == '["Player"]'
     assert cells[0]["entity_ids"] == '{"player_id": "1234abcd"}'
+
+
+def test_a_broken_colspan_must_not_discard_the_whole_page():
+    """FBref's player pages ship colspan="" on every wages row header, and one
+    cell per page reaches the parser as colspan='class="' (an unquoted attribute
+    the markup folds into the span). int() raised, the generic layer reported
+    parser errors, and the entire player page was rejected — a lossless capture
+    must never lose a page over a rendering hint."""
+    html = """
+    <!--
+    <div class="table_container" id="div_wages">
+      <table id="wages">
+        <thead><tr>
+          <th colspan="" data-stat="year">Year</th>
+          <th colspan='class="' data-stat="team">Team</th>
+          <th colspan="2" data-stat="wages">Wages</th>
+        </tr></thead>
+        <tbody><tr>
+          <th colspan="" data-stat="year" scope="row">2023-2024</th>
+          <td data-stat="team">Lyon</td>
+          <td data-stat="weekly">100</td>
+          <td data-stat="annual">5200</td>
+        </tr></tbody>
+      </table>
+    </div>
+    -->
+    """
+
+    page = parse_page_document(
+        html, target_id="fbref:player:9dbb75ca", page_kind="player",
+        content_hash="abc",
+    )
+
+    assert page.errors == ()
+    wages = [table for table in page.tables if table.table_id == "wages"]
+    assert len(wages) == 1
+    assert wages[0].row_count == 1
