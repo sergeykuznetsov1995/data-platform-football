@@ -292,6 +292,267 @@ class SofascoreLeaseStats:
         )
 
 
+@dataclass(frozen=True)
+class DiscoveryLeaseTraffic:
+    """Light traffic snapshot for a non-signed SofaScore discovery lease.
+
+    Registry discovery carries no workload plan, no allocation and no browser
+    session, so ``SofascoreLeaseStats`` (which requires that provenance) cannot
+    read its counters.  Only the metered facts are parsed here; the byte
+    ceilings themselves live in the proxy filter.
+    """
+
+    lease_id: str
+    up_bytes: int
+    down_bytes: int
+    closed: bool
+    budget_exceeded: bool
+    source: str
+    upstream_repins: int = 0
+
+    @property
+    def provider_bytes(self) -> int:
+        return self.up_bytes + self.down_bytes
+
+    @classmethod
+    def from_mapping(cls, payload: Mapping[str, Any]) -> "DiscoveryLeaseTraffic":
+        def counter(name: str) -> int:
+            value = payload.get(name, 0)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise SofascoreLeaseProtocolError(
+                    f"discovery lease field {name!r} must be a byte counter"
+                )
+            return value
+
+        lease_id = str(payload.get("id") or "").strip()
+        if not lease_id:
+            raise SofascoreLeaseProtocolError("discovery lease stats have no id")
+        up_bytes = counter("up_bytes")
+        down_bytes = counter("down_bytes")
+        total_bytes = payload.get("total_bytes")
+        if total_bytes is not None and (
+            isinstance(total_bytes, bool)
+            or not isinstance(total_bytes, int)
+            or total_bytes != up_bytes + down_bytes
+        ):
+            raise SofascoreLeaseProtocolError(
+                "discovery lease directional counters do not equal total_bytes"
+            )
+        return cls(
+            lease_id=lease_id,
+            up_bytes=up_bytes,
+            down_bytes=down_bytes,
+            closed=bool(payload.get("closed", False)),
+            budget_exceeded=bool(payload.get("budget_exceeded", False)),
+            source=str(payload.get("source") or ""),
+            upstream_repins=counter("upstream_repins"),
+        )
+
+
+class _DiscoveryLeaseProvider:
+    """Thin ``/v1/leases`` adapter for the metered registry discovery scan.
+
+    Deliberately separate from :class:`SofascoreLeaseClient`: production leases
+    must present a signed workload plan, which a catalog scan has no allocation
+    for.  The control plane still authorizes every byte through the
+    ``sofascore_discovery`` DagRun cap.
+    """
+
+    SOURCE = "sofascore_discovery"
+    DAG_ID = "dag_discover_sofascore_registry"
+
+    def __init__(
+        self,
+        control_url: str,
+        *,
+        control_token: Optional[str] = None,
+        timeout_seconds: float = 5.0,
+        session: Optional[Any] = None,
+    ) -> None:
+        base = str(control_url).rstrip("/")
+        parsed = urlsplit(base)
+        if (
+            parsed.scheme not in ("http", "https")
+            or not parsed.netloc
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
+            raise ValueError("proxy lease control URL must be credential-free HTTP(S)")
+        if timeout_seconds <= 0:
+            raise ValueError("proxy lease timeout must be positive")
+        resolved_token = str(
+            control_token
+            if control_token is not None
+            else os.environ.get("SOFASCORE_PROXY_CONTROL_TOKEN", "")
+        )
+        if len(resolved_token) < 32:
+            raise ValueError(
+                "SOFASCORE_PROXY_CONTROL_TOKEN must contain at least 32 characters"
+            )
+        self.control_url = base
+        self.timeout_seconds = float(timeout_seconds)
+        self._control_token = resolved_token
+        self._session = session
+        if self._session is not None:
+            self._session.trust_env = False
+
+    def _http(self):
+        if self._session is None:
+            import requests
+
+            self._session = requests.Session()
+            self._session.trust_env = False
+        return self._session
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        token: str = "",
+        payload: Optional[Mapping[str, Any]] = None,
+    ) -> Mapping[str, Any]:
+        headers = {"X-Proxy-Control-Token": self._control_token}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        try:
+            response = self._http().request(
+                method,
+                f"{self.control_url}{path}",
+                json=dict(payload) if payload is not None else None,
+                headers=headers,
+                timeout=self.timeout_seconds,
+            )
+        except Exception as exc:  # noqa: BLE001 - requests is an adapter boundary
+            message = redact_sensitive(exc, secrets=(token,))
+            raise SofascoreLeaseProtocolError(
+                f"proxy lease control request failed: {message}"
+            ) from exc
+        status = int(getattr(response, "status_code", 0) or 0)
+        try:
+            body = response.json()
+        except Exception as exc:  # noqa: BLE001 - response adapter boundary
+            raise SofascoreLeaseProtocolError(
+                f"proxy lease API returned invalid JSON (HTTP {status})"
+            ) from exc
+        if not isinstance(body, dict):
+            raise SofascoreLeaseProtocolError(
+                f"proxy lease API returned a non-object (HTTP {status})"
+            )
+        if not 200 <= status < 300:
+            error = redact_sensitive(
+                body.get("error") or "request rejected", secrets=(token,)
+            )
+            raise SofascoreLeaseRejected(
+                f"proxy lease API rejected {method} {path} (HTTP {status}): {error}",
+                status_code=status,
+                code=str(body.get("code") or ""),
+            )
+        return body
+
+    def acquire(
+        self,
+        *,
+        max_bytes: int,
+        ttl_seconds: int,
+        run_id: str,
+        task_id: str,
+        canonical_url: str = "https://api.sofascore.com/",
+    ) -> SofascoreProxyLease:
+        if (
+            isinstance(max_bytes, bool)
+            or not isinstance(max_bytes, int)
+            or max_bytes <= 0
+            or isinstance(ttl_seconds, bool)
+            or not isinstance(ttl_seconds, int)
+            or ttl_seconds <= 0
+        ):
+            raise ValueError("max_bytes and ttl_seconds must be positive integers")
+        context = {
+            "dag_id": self.DAG_ID,
+            "run_id": str(run_id).strip(),
+            "task_id": str(task_id).strip(),
+            "canonical_url": str(canonical_url).strip(),
+        }
+        if not all(context.values()):
+            raise ValueError("run_id, task_id and canonical_url are required")
+        body = self._request(
+            "POST",
+            "/v1/leases",
+            payload={
+                **context,
+                "source": self.SOURCE,
+                "scope": "discovery",
+                "max_bytes": max_bytes,
+                "ttl_seconds": ttl_seconds,
+            },
+        )
+        try:
+            lease = SofascoreProxyLease(
+                lease_id=str(body["id"]),
+                token=str(body["token"]),
+                proxy_url=str(body["proxy_url"]),
+                max_bytes=int(body["max_bytes"]),
+                expires_at=float(body["expires_at"]),
+                source=self.SOURCE,
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise SofascoreLeaseProtocolError(
+                "proxy lease API response schema mismatch"
+            ) from exc
+        proxy = urlsplit(lease.proxy_url)
+        if (
+            not lease.lease_id
+            or not lease.token
+            or proxy.scheme not in ("http", "https")
+            or not proxy.hostname
+            or proxy.username is not None
+            or proxy.password is not None
+            or lease.max_bytes <= 0
+            or lease.max_bytes > max_bytes
+        ):
+            raise SofascoreLeaseProtocolError(
+                "proxy lease API returned an unusable lease"
+            )
+        return lease
+
+    def stats(self, lease: SofascoreProxyLease) -> DiscoveryLeaseTraffic:
+        body = self._request(
+            "GET",
+            f"/v1/leases/{quote(lease.lease_id, safe='')}/stats",
+            token=lease.token,
+        )
+        return self._checked(lease, DiscoveryLeaseTraffic.from_mapping(body))
+
+    def close(self, lease: SofascoreProxyLease) -> DiscoveryLeaseTraffic:
+        stats = self._checked(
+            lease,
+            DiscoveryLeaseTraffic.from_mapping(
+                self._request(
+                    "DELETE",
+                    f"/v1/leases/{quote(lease.lease_id, safe='')}/close",
+                    token=lease.token,
+                    payload={"completed": True},
+                )
+            ),
+        )
+        if not stats.closed:
+            raise SofascoreLeaseProtocolError("proxy lease did not close cleanly")
+        return stats
+
+    @staticmethod
+    def _checked(
+        lease: SofascoreProxyLease, stats: DiscoveryLeaseTraffic
+    ) -> DiscoveryLeaseTraffic:
+        if stats.lease_id != lease.lease_id or stats.source != lease.source:
+            raise SofascoreLeaseProtocolError("proxy lease stats id mismatch")
+        return stats
+
+    @staticmethod
+    def authenticated_proxy_url(lease: SofascoreProxyLease) -> str:
+        return SofascoreLeaseClient.authenticated_proxy_url(lease)
+
+
 class SofascoreLeaseClient:
     """Control-plane adapter for one sticky, metered warmed-browser lease."""
 
@@ -690,6 +951,7 @@ SofaScoreLeaseClient = SofascoreLeaseClient
 
 
 __all__ = [
+    "DiscoveryLeaseTraffic",
     "SofaScoreLeaseClient",
     "SofascoreLeaseClient",
     "SofascoreLeaseError",

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 
@@ -8,10 +9,13 @@ import pytest
 from scrapers.sofascore.runtime_fingerprint import runtime_fingerprint
 from scrapers.sofascore.workload_plan import (
     MATCH_BATCH_SIZE,
-    MATCH_WORKLOAD_CLASS,
+    MATCH_REQUIRED_ENDPOINTS,
     PLAYER_BATCH_SIZE,
+    PLAYER_REQUIRED_ENDPOINTS,
     PLAYER_UNIVERSE_TASK_ID,
-    PLAYER_WORKLOAD_CLASS,
+    SEASON_DYNAMIC_ENDPOINTS,
+    SEASON_STATIC_ENDPOINTS,
+    TEAM_COUNT_BANDS,
     AllocationAccountingError,
     AllocationBudgetExceeded,
     AllocationLedger,
@@ -27,21 +31,35 @@ from scrapers.sofascore.workload_plan import (
     load_verified_workload_policy,
     match_workload_class,
     player_workload_class,
+    production_match_shape,
+    production_player_shape,
     production_season_shape,
-    season_shape_digest,
     season_workload_class,
     stable_partitions,
+    team_count_band,
+    workload_shape_digest,
 )
 
 
 CONTROL_TOKEN = "unit-test-control-token-that-is-longer-than-32-bytes"
-SEASON_SHAPE = {
-    "format": "league",
-    "schedule_pages": 3,
-    "rounds": True,
-    "standings_groups": 1,
-    "source_tournament_id": "17",
-}
+MATCH_SHAPE = production_match_shape()
+PLAYER_SHAPE = production_player_shape()
+SEASON_SHAPE = production_season_shape(
+    season_format="split_year",
+    team_count_band="16_20",
+    max_pages_per_direction=50,
+)
+MATCH_CLASS = match_workload_class()
+PLAYER_CLASS = player_workload_class()
+SEASON_CLASS = season_workload_class(SEASON_SHAPE)
+
+
+def _shape_endpoints(shape: dict) -> tuple[str, ...]:
+    if shape["scope"] == "season":
+        return tuple(
+            sorted(list(shape["static_endpoints"]) + list(shape["dynamic_endpoints"]))
+        )
+    return tuple(sorted(shape["required_endpoints"]))
 
 
 def _class_samples(
@@ -49,7 +67,7 @@ def _class_samples(
     units: int,
     endpoints: tuple[str, ...],
     workload_class: str,
-    source_tournament_id: int,
+    tournaments: tuple[int, ...],
     count: int = 20,
     exits: int = 5,
 ) -> list[dict]:
@@ -62,9 +80,9 @@ def _class_samples(
         }
         samples.append(
             {
-                "run_id": f"cold-{units}-{index}",
+                "run_id": f"cold-{workload_class}-{index}",
                 "workload_class": workload_class,
-                "source_tournament_id": source_tournament_id,
+                "source_tournament_id": tournaments[index % len(tournaments)],
                 "mode": "cold",
                 "budget_eligible": True,
                 "units": units,
@@ -85,68 +103,72 @@ def _class_payload(
     *,
     scope: str,
     max_units: int,
-    endpoints: tuple[str, ...],
-    workload_class: str,
-    source_tournament_id: int,
-    shape_digest: str | None = None,
-    shape: dict | None = None,
-) -> dict:
+    shape: dict,
+    tournaments: tuple[int, ...],
+) -> tuple[str, dict]:
+    if scope == "match":
+        name = match_workload_class()
+    elif scope == "player":
+        name = player_workload_class()
+    else:
+        name = season_workload_class(shape)
+    endpoints = _shape_endpoints(shape)
     samples = _class_samples(
         units=max_units,
         endpoints=endpoints,
-        workload_class=workload_class,
-        source_tournament_id=source_tournament_id,
+        workload_class=name,
+        tournaments=tournaments,
     )
     payload = {
         "scope": scope,
-        "source_tournament_id": source_tournament_id,
         "max_units": max_units,
         "required_endpoints": list(endpoints),
+        "shape": dict(shape),
+        "shape_digest": workload_shape_digest(shape),
+        "measured_tournament_ids": list(tournaments),
         "hard_task_bytes": max(item["total_provider_bytes"] for item in samples),
         "samples": samples,
     }
-    if shape_digest is not None:
-        payload["shape_digest"] = shape_digest
-    if shape is not None:
-        payload["shape"] = shape
-    return payload
+    return name, payload
 
 
-def _artifact_payload() -> dict:
-    season_class = season_workload_class(17, SEASON_SHAPE)
-    digest = season_shape_digest(SEASON_SHAPE)
+def _artifact_payload(
+    *,
+    match_tournaments: tuple[int, ...] = (16, 17),
+    player_tournaments: tuple[int, ...] = (16, 17),
+    season_tournaments: tuple[int, ...] = (17,),
+) -> dict:
+    classes = dict(
+        item
+        for item in (
+            _class_payload(
+                scope="match",
+                max_units=MATCH_BATCH_SIZE,
+                shape=MATCH_SHAPE,
+                tournaments=match_tournaments,
+            ),
+            _class_payload(
+                scope="player",
+                max_units=PLAYER_BATCH_SIZE,
+                shape=PLAYER_SHAPE,
+                tournaments=player_tournaments,
+            ),
+            _class_payload(
+                scope="season",
+                max_units=1,
+                shape=SEASON_SHAPE,
+                tournaments=season_tournaments,
+            ),
+        )
+    )
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "source": "sofascore",
         "meter": "proxy_filter_provider_path_v2",
         "budget_derivation": "max_observed_task_bytes_per_workload_class_v2",
         "runtime_fingerprint": runtime_fingerprint(),
         "verified": True,
-        "workload_classes": {
-            MATCH_WORKLOAD_CLASS: _class_payload(
-                scope="match",
-                max_units=25,
-                endpoints=("event", "lineups"),
-                workload_class=MATCH_WORKLOAD_CLASS,
-                source_tournament_id=17,
-            ),
-            PLAYER_WORKLOAD_CLASS: _class_payload(
-                scope="player",
-                max_units=50,
-                endpoints=("player_profile", "player_season_statistics"),
-                workload_class=PLAYER_WORKLOAD_CLASS,
-                source_tournament_id=17,
-            ),
-            season_class: _class_payload(
-                scope="season",
-                max_units=1,
-                endpoints=("rounds", "schedule", "standings"),
-                workload_class=season_class,
-                source_tournament_id=17,
-                shape_digest=digest,
-                shape=SEASON_SHAPE,
-            ),
-        },
+        "workload_classes": classes,
     }
 
 
@@ -158,11 +180,11 @@ def _write_artifact(path: Path, payload: dict | None = None) -> Path:
     return path
 
 
-def _policy(tmp_path: Path):
-    return load_verified_workload_policy(_write_artifact(tmp_path / "workloads.json"))
+def _policy(tmp_path: Path, payload: dict | None = None, name: str = "workloads.json"):
+    return load_verified_workload_policy(_write_artifact(tmp_path / name, payload))
 
 
-def _plan(tmp_path: Path, **overrides):
+def _plan_kwargs(**overrides) -> dict:
     values = {
         "dag_id": "dag_ingest_sofascore",
         "run_id": "scheduled__2026-07-11T00:00:00+00:00",
@@ -174,42 +196,54 @@ def _plan(tmp_path: Path, **overrides):
         "control_token": CONTROL_TOKEN,
     }
     values.update(overrides)
-    return build_signed_dagrun_plan(_policy(tmp_path), **values)
+    return values
 
 
-def test_v2_policy_derives_each_hard_task_cap_from_exact_observed_max(tmp_path):
+def _plan(tmp_path: Path, **overrides):
+    return build_signed_dagrun_plan(_policy(tmp_path), **_plan_kwargs(**overrides))
+
+
+def _observed_max(endpoint_count: int) -> int:
+    # The 20th sample is the largest: request bytes grow with the sample index.
+    return sum(100 + 19 + index + 10 for index in range(endpoint_count))
+
+
+def test_v3_policy_derives_each_hard_task_cap_from_exact_observed_max(tmp_path):
     policy = _policy(tmp_path)
 
-    match = policy.classes[MATCH_WORKLOAD_CLASS]
-    player = policy.classes[PLAYER_WORKLOAD_CLASS]
-    season = policy.classes[season_workload_class(17, SEASON_SHAPE)]
+    match = policy.classes[MATCH_CLASS]
+    player = policy.classes[PLAYER_CLASS]
+    season = policy.classes[SEASON_CLASS]
 
-    assert match.hard_task_bytes == (119 + 10) + (120 + 10)
-    assert player.hard_task_bytes == (119 + 10) + (120 + 10)
-    assert season.hard_task_bytes == (119 + 10) + (120 + 10) + (121 + 10)
+    assert match.hard_task_bytes == _observed_max(len(MATCH_REQUIRED_ENDPOINTS))
+    assert player.hard_task_bytes == _observed_max(len(PLAYER_REQUIRED_ENDPOINTS))
+    assert season.hard_task_bytes == _observed_max(
+        len(SEASON_STATIC_ENDPOINTS) + len(SEASON_DYNAMIC_ENDPOINTS)
+    )
     assert match.sample_count == 20
     assert match.distinct_proxy_exits == 5
-    assert season.shape_digest == season_shape_digest(SEASON_SHAPE)
+    assert match.shape_digest == workload_shape_digest(MATCH_SHAPE)
+    assert match.measured_tournament_ids == ("16", "17")
+    assert season.shape_digest == workload_shape_digest(SEASON_SHAPE)
+    assert season.measured_tournament_ids == ("17",)
 
 
 @pytest.mark.parametrize(
     ("mutate", "message"),
     [
         (
-            lambda value: value["workload_classes"][MATCH_WORKLOAD_CLASS][
-                "samples"
-            ].pop(),
+            lambda value: value["workload_classes"][MATCH_CLASS]["samples"].pop(),
             "20 cold samples",
         ),
         (
             lambda value: [
                 sample.update(proxy_exit_hash="same-anonymized-exit")
-                for sample in value["workload_classes"][MATCH_WORKLOAD_CLASS]["samples"]
+                for sample in value["workload_classes"][MATCH_CLASS]["samples"]
             ],
             "5 distinct exits",
         ),
         (
-            lambda value: value["workload_classes"][MATCH_WORKLOAD_CLASS].update(
+            lambda value: value["workload_classes"][MATCH_CLASS].update(
                 hard_task_bytes=999999
             ),
             "must equal max observed",
@@ -219,13 +253,13 @@ def test_v2_policy_derives_each_hard_task_cap_from_exact_observed_max(tmp_path):
             "cannot use a multiplier",
         ),
         (
-            lambda value: value["workload_classes"][MATCH_WORKLOAD_CLASS]["samples"][
-                0
-            ].update(total_provider_bytes=1),
+            lambda value: value["workload_classes"][MATCH_CLASS]["samples"][0].update(
+                total_provider_bytes=1
+            ),
             "must equal the exact request map",
         ),
         (
-            lambda value: value["workload_classes"][MATCH_WORKLOAD_CLASS]["samples"][0][
+            lambda value: value["workload_classes"][MATCH_CLASS]["samples"][0][
                 "endpoint_request_provider_bytes"
             ].pop("lineups"),
             "endpoint mismatch",
@@ -235,14 +269,24 @@ def test_v2_policy_derives_each_hard_task_cap_from_exact_observed_max(tmp_path):
             "does not match current runtime",
         ),
         (
-            lambda value: value["workload_classes"][MATCH_WORKLOAD_CLASS]["samples"][
-                0
-            ]["evidence"].update(runtime_fingerprint_digest="0" * 64),
+            lambda value: value["workload_classes"][MATCH_CLASS]["samples"][0][
+                "evidence"
+            ].update(runtime_fingerprint_digest="0" * 64),
             "another runtime fingerprint",
+        ),
+        (
+            lambda value: value.update(schema_version=2),
+            "schema_version must be 3",
+        ),
+        (
+            lambda value: value["workload_classes"][MATCH_CLASS].update(
+                required_endpoints=["event"]
+            ),
+            "must equal the endpoints of its shape",
         ),
     ],
 )
-def test_v2_policy_fails_closed_for_unmeasured_or_inexact_classes(
+def test_v3_policy_fails_closed_for_unmeasured_or_inexact_classes(
     tmp_path, mutate, message
 ):
     payload = _artifact_payload()
@@ -250,6 +294,170 @@ def test_v2_policy_fails_closed_for_unmeasured_or_inexact_classes(
 
     with pytest.raises(WorkloadPolicyUnavailable, match=message):
         load_verified_workload_policy(_write_artifact(tmp_path / "bad.json", payload))
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (
+            lambda shape: shape.update(source_tournament_id="17"),
+            "must not bind a source tournament",
+        ),
+        (
+            lambda shape: shape.update(measured_at="2026-07-14"),
+            "shape key mismatch",
+        ),
+        (
+            lambda shape: shape.pop("band_scheme"),
+            "shape key mismatch",
+        ),
+        (
+            lambda shape: shape.update(season_format="calendar_year"),
+            "shape_digest does not match its shape",
+        ),
+    ],
+)
+def test_v3_policy_rejects_shapes_outside_the_measured_whitelist(
+    tmp_path, mutate, message
+):
+    payload = _artifact_payload()
+    mutate(payload["workload_classes"][SEASON_CLASS]["shape"])
+
+    with pytest.raises(WorkloadPolicyUnavailable, match=message):
+        load_verified_workload_policy(_write_artifact(tmp_path / "bad.json", payload))
+
+
+def test_v3_policy_rejects_two_classes_with_the_same_shape_in_one_scope(tmp_path):
+    payload = _artifact_payload()
+    payload["workload_classes"][f"{SEASON_CLASS}_copy"] = copy.deepcopy(
+        payload["workload_classes"][SEASON_CLASS]
+    )
+
+    with pytest.raises(WorkloadPolicyUnavailable, match="duplicate shape_digest"):
+        load_verified_workload_policy(_write_artifact(tmp_path / "bad.json", payload))
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda value: value["workload_classes"][MATCH_CLASS].update(
+            measured_tournament_ids=[16, 17, 99]
+        ),
+        lambda value: value["workload_classes"][MATCH_CLASS]["samples"][0].update(
+            source_tournament_id=99
+        ),
+    ],
+)
+def test_v3_policy_requires_measured_tournaments_to_equal_sample_tournaments(
+    tmp_path, mutate
+):
+    payload = _artifact_payload()
+    mutate(payload)
+
+    with pytest.raises(
+        WorkloadPolicyUnavailable, match="must equal the tournaments of its cold samples"
+    ):
+        load_verified_workload_policy(_write_artifact(tmp_path / "bad.json", payload))
+
+
+def _season_samples(*, drop: str | None, count: int = 20) -> list[dict]:
+    endpoints = tuple(
+        endpoint for endpoint in _shape_endpoints(SEASON_SHAPE) if endpoint != drop
+    )
+    return _class_samples(
+        units=1,
+        endpoints=endpoints,
+        workload_class=SEASON_CLASS,
+        tournaments=(17,),
+        count=count,
+    )
+
+
+def test_season_class_verifies_when_optional_referee_endpoint_is_absent(tmp_path):
+    # The collector legitimately omits the dynamic ``referee_profile`` request
+    # when the schedule payload exposes no referee IDs.  The loader must accept
+    # such a sample (symmetry with the collector), otherwise a future-season
+    # class could never become verified.
+    payload = _artifact_payload()
+    samples = _season_samples(drop="referee_profile")
+    season = payload["workload_classes"][SEASON_CLASS]
+    season["samples"] = samples
+    season["hard_task_bytes"] = max(item["total_provider_bytes"] for item in samples)
+
+    policy = load_verified_workload_policy(
+        _write_artifact(tmp_path / "season.json", payload)
+    )
+
+    measured = policy.classes[SEASON_CLASS]
+    # The measured shape still declares every endpoint, but the cap is the max
+    # over the actually observed (static + squads) endpoints of one sample.
+    assert "referee_profile" in measured.required_endpoints
+    assert measured.hard_task_bytes == _observed_max(
+        len(SEASON_STATIC_ENDPOINTS) + len(SEASON_DYNAMIC_ENDPOINTS) - 1
+    )
+
+
+def test_season_class_fails_closed_when_a_static_endpoint_is_missing(tmp_path):
+    payload = _artifact_payload()
+    samples = _season_samples(drop="standings_total")
+    season = payload["workload_classes"][SEASON_CLASS]
+    season["samples"] = samples
+    season["hard_task_bytes"] = max(item["total_provider_bytes"] for item in samples)
+
+    with pytest.raises(WorkloadPolicyUnavailable, match="endpoint mismatch"):
+        load_verified_workload_policy(_write_artifact(tmp_path / "bad.json", payload))
+
+
+def test_prod_loader_rejects_a_class_skewed_below_the_even_floor(tmp_path):
+    # A verified artifact that authorizes transfer must carry each measured
+    # tournament's even share of the fixed class minimum (20 // 2 = 10).
+    payload = _artifact_payload()
+    match = payload["workload_classes"][MATCH_CLASS]
+    for index, sample in enumerate(match["samples"]):
+        # 19 samples on tournament 16, 1 on tournament 17.
+        sample["source_tournament_id"] = 16 if index else 17
+
+    with pytest.raises(WorkloadPolicyUnavailable, match="skewed"):
+        load_verified_workload_policy(_write_artifact(tmp_path / "bad.json", payload))
+
+
+def test_class_measured_on_two_tournaments_authorizes_a_new_one(tmp_path):
+    plan = _plan(tmp_path, source_tournament_id=8, season_workloads=[])
+
+    match = [item for item in plan.allocations if item.scope == "match"]
+    player = [item for item in plan.allocations if item.scope == "player"]
+    assert {item.workload_class for item in match} == {MATCH_CLASS}
+    assert {item.workload_class for item in player} == {PLAYER_CLASS}
+
+
+def test_class_measured_on_one_tournament_does_not_generalize(tmp_path):
+    single = _artifact_payload(match_tournaments=(17,), player_tournaments=(17,))
+    policy = _policy(tmp_path, single, name="single.json")
+
+    with pytest.raises(WorkloadPolicyUnavailable, match="measured only for tournament"):
+        build_signed_dagrun_plan(
+            policy,
+            **_plan_kwargs(source_tournament_id=8, season_workloads=[]),
+        )
+
+    plan = build_signed_dagrun_plan(
+        policy, **_plan_kwargs(source_tournament_id=17, season_workloads=[])
+    )
+    assert {item.workload_class for item in plan.allocations} == {
+        MATCH_CLASS,
+        PLAYER_CLASS,
+    }
+
+    # The season class of the shipped artifact is measured on tournament 17 only.
+    with pytest.raises(WorkloadPolicyUnavailable, match="measured only for tournament"):
+        _plan(
+            tmp_path,
+            source_tournament_id=8,
+            pending_match_ids=[],
+            player_universe_ids=[],
+            pending_player_ids=[],
+            season_workloads=[SeasonWorkload(8, 12345, SEASON_SHAPE)],
+        )
 
 
 def test_stable_partitions_include_every_id_exactly_once():
@@ -348,50 +556,100 @@ def test_freshness_snapshot_is_hmac_signed_and_scope_complete(tmp_path):
         _plan(tmp_path, freshness_keys={"season": "day-2026-07-11"})
 
 
-def test_season_budget_is_specific_to_tournament_and_exact_shape(tmp_path):
+def test_season_budget_is_specific_to_the_exact_measured_shape(tmp_path):
     plan = _plan(tmp_path)
     season = next(item for item in plan.allocations if item.scope == "season")
-    assert season.workload_class == season_workload_class(17, SEASON_SHAPE)
+    assert season.workload_class == SEASON_CLASS
 
-    changed_shape = dict(SEASON_SHAPE, schedule_pages=4)
+    other_band = production_season_shape(
+        season_format="split_year",
+        team_count_band="21_32",
+        max_pages_per_direction=50,
+    )
     with pytest.raises(WorkloadPolicyUnavailable, match="has no class"):
         _plan(
             tmp_path,
-            season_workloads=[SeasonWorkload(17, 76986, changed_shape)],
+            season_workloads=[SeasonWorkload(17, 76986, other_band)],
         )
 
 
-def test_match_and_player_caps_are_specific_to_source_tournament(tmp_path):
-    assert MATCH_WORKLOAD_CLASS == match_workload_class(17)
-    assert PLAYER_WORKLOAD_CLASS == player_workload_class(17)
-    assert match_workload_class(16) != MATCH_WORKLOAD_CLASS
-    assert player_workload_class(16) != PLAYER_WORKLOAD_CLASS
-
-    with pytest.raises(WorkloadPolicyUnavailable, match="has no class"):
-        _plan(tmp_path, source_tournament_id=16, season_workloads=[])
-
-
-def test_policy_rejects_sample_from_another_tournament(tmp_path):
-    payload = _artifact_payload()
-    payload["workload_classes"][MATCH_WORKLOAD_CLASS]["samples"][0][
-        "source_tournament_id"
-    ] = 16
-    with pytest.raises(WorkloadPolicyUnavailable, match="measured for tournament"):
-        load_verified_workload_policy(_write_artifact(tmp_path / "bad.json", payload))
+def test_workload_classes_are_named_after_scope_and_shape_digest():
+    assert MATCH_CLASS == (
+        f"match_batch_{MATCH_BATCH_SIZE}_"
+        f"{workload_shape_digest(MATCH_SHAPE)[:16]}"
+    )
+    assert PLAYER_CLASS == (
+        f"player_batch_{PLAYER_BATCH_SIZE}_"
+        f"{workload_shape_digest(PLAYER_SHAPE)[:16]}"
+    )
+    assert SEASON_CLASS == f"season_{workload_shape_digest(SEASON_SHAPE)[:16]}"
 
 
-def test_production_season_shape_is_bounded_and_tournament_specific():
+def test_production_batch_shapes_track_the_captured_endpoints():
+    from scrapers.sofascore.pipeline import EVENT_PATHS, PLAYER_PATHS
+
+    assert MATCH_SHAPE["required_endpoints"] == sorted(EVENT_PATHS)
+    assert PLAYER_SHAPE["required_endpoints"] == sorted(PLAYER_PATHS)
+    assert sorted(MATCH_REQUIRED_ENDPOINTS) == sorted(EVENT_PATHS)
+    assert sorted(PLAYER_REQUIRED_ENDPOINTS) == sorted(PLAYER_PATHS)
+    assert MATCH_SHAPE["batch_size"] == MATCH_BATCH_SIZE
+    assert PLAYER_SHAPE["batch_size"] == PLAYER_BATCH_SIZE
+
+
+def test_production_season_shape_is_bounded_by_format_and_team_count_band():
     epl = production_season_shape(
-        17, season_format="split_year", max_pages_per_direction=50
+        season_format="split_year",
+        team_count_band=team_count_band(20),
+        max_pages_per_direction=50,
+    )
+    la_liga = production_season_shape(
+        season_format="split_year",
+        team_count_band=team_count_band(20),
+        max_pages_per_direction=50,
     )
     world_cup = production_season_shape(
-        16, season_format="calendar_year", max_pages_per_direction=50
+        season_format="calendar_year",
+        team_count_band=team_count_band(48),
+        max_pages_per_direction=50,
     )
 
-    assert epl["source_tournament_id"] == "17"
+    assert "source_tournament_id" not in epl
+    assert epl["band_scheme"] == "team_count_band_v1"
     assert epl["schedule_page_chain"]["max_pages_per_direction"] == 50
     assert str(epl["dynamic_evidence"]).endswith("_v1")
-    assert season_workload_class(17, epl) != season_workload_class(16, world_cup)
+    assert season_workload_class(epl) == season_workload_class(la_liga)
+    assert season_workload_class(epl) != season_workload_class(world_cup)
+
+    with pytest.raises(WorkloadPlanError, match="team_count_band"):
+        production_season_shape(
+            season_format="split_year",
+            team_count_band="17_19",
+            max_pages_per_direction=50,
+        )
+
+
+@pytest.mark.parametrize(
+    ("team_count", "band"),
+    [
+        (8, "8_15"),
+        (15, "8_15"),
+        (16, "16_20"),
+        (20, "16_20"),
+        (21, "21_32"),
+        (32, "21_32"),
+        (33, "33_48"),
+        (48, "33_48"),
+    ],
+)
+def test_team_count_band_grid_is_contiguous(team_count, band):
+    assert team_count_band(team_count) == band
+    assert band in TEAM_COUNT_BANDS
+
+
+@pytest.mark.parametrize("team_count", [0, 7, 49, 100])
+def test_team_count_outside_the_measured_grid_fails_closed(team_count):
+    with pytest.raises(WorkloadPlanError, match="outside the measured"):
+        team_count_band(team_count)
 
 
 def test_noop_plan_has_zero_cap_and_does_not_create_ledger_or_lease(tmp_path):

@@ -110,6 +110,11 @@ TRANSFERMARKT_DAG_IDS = frozenset(
 )
 SOFASCORE_DAG_IDS = frozenset({"dag_ingest_sofascore"})
 SOFASCORE_CANARY_DAG_IDS = frozenset({"dag_canary_sofascore_proxy"})
+# Registry discovery is a non-signed, metered JSON scan of the public catalog.
+# It carries no workload plan and no allocation: its only bound is this DagRun
+# cap, which stays zero (fail-closed) until an operator authorizes a scan.
+SOFASCORE_DISCOVERY_DAG_IDS = frozenset({"dag_discover_sofascore_registry"})
+SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES = 0
 # Zero is deliberately fail-closed.  ``main`` replaces it only after loading a
 # verified SofaScore canary; there is no hand-written production allowance.
 SOFASCORE_DAGRUN_BUDGET_BYTES = 0
@@ -207,6 +212,8 @@ def _dagrun_budget_bytes(dag_id: str) -> int:
     """Return the source-specific hard cap without weakening WhoScored."""
     if dag_id in SOFASCORE_CANARY_DAG_IDS:
         return SOFASCORE_CANARY_HARD_CAP_BYTES
+    if dag_id in SOFASCORE_DISCOVERY_DAG_IDS:
+        return SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES
     if dag_id in SOFASCORE_DAG_IDS:
         return SOFASCORE_DAGRUN_BUDGET_BYTES
     if dag_id in TRANSFERMARKT_DAG_IDS:
@@ -217,6 +224,8 @@ def _dagrun_budget_bytes(dag_id: str) -> int:
 def _source_for_dag(dag_id: str) -> str:
     if dag_id in SOFASCORE_CANARY_DAG_IDS:
         return "sofascore_canary"
+    if dag_id in SOFASCORE_DISCOVERY_DAG_IDS:
+        return "sofascore_discovery"
     if dag_id in SOFASCORE_DAG_IDS:
         return "sofascore"
     if dag_id in TRANSFERMARKT_DAG_IDS:
@@ -667,7 +676,9 @@ def _lease_url_budget_bytes(lease: Lease) -> int:
     # A warmed SofaScore browser intentionally captures many API endpoints in
     # one lease.  The measured DagRun cap is its URL/session cap too, so the
     # legacy per-page WhoScored ceiling cannot truncate the warmed session.
-    if lease.source in ("sofascore", "sofascore_canary"):
+    # Registry discovery has the same shape: thousands of JSON reads against
+    # one canonical API origin, so the 2 MB per-URL ceiling would strangle it.
+    if lease.source in ("sofascore", "sofascore_canary", "sofascore_discovery"):
         return _lease_dagrun_budget_bytes(lease)
     return URL_BUDGET_BYTES
 
@@ -1392,6 +1403,10 @@ def _create_lease(
         raise RuntimeError(
             "SofaScore canary lease unavailable: explicit experimental cap required"
         )
+    if source == "sofascore_discovery" and SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES <= 0:
+        raise RuntimeError(
+            "SofaScore discovery lease unavailable: explicit DagRun cap required"
+        )
     active_leases = [
         item
         for item in LEASES.values()
@@ -1407,6 +1422,13 @@ def _create_lease(
         item.source == "sofascore" for item in active_leases
     ):
         raise RuntimeError("SofaScore paid-proxy concurrency limit reached")
+    # The catalog scan is a single serial walker: it rotates exhausted leases
+    # one after another.  Two concurrent discovery leases would mean a second
+    # unaccounted walker, so the source is serial exactly like production.
+    if source == "sofascore_discovery" and any(
+        item.source == "sofascore_discovery" for item in active_leases
+    ):
+        raise RuntimeError("SofaScore discovery paid-proxy concurrency limit reached")
     # Canary deltas must not overlap any other paid traffic on this provider
     # process.  Conversely, no normal lease starts while a canary is active.
     if (source == "sofascore_canary" and active_leases) or any(
@@ -1433,7 +1455,7 @@ def _create_lease(
         dagrun_budget = _dagrun_budget_bytes(dag_id)
     url_budget = (
         dagrun_budget
-        if source in ("sofascore", "sofascore_canary")
+        if source in ("sofascore", "sofascore_canary", "sofascore_discovery")
         else URL_BUDGET_BYTES
     )
     available = min(
@@ -2174,6 +2196,12 @@ async def _handle_control(
                 "sofascore_canary_enabled": SOFASCORE_CANARY_HARD_CAP_BYTES > 0,
                 "sofascore_canary_hard_cap_bytes": SOFASCORE_CANARY_HARD_CAP_BYTES,
                 "sofascore_canary_policy_id": SOFASCORE_CANARY_POLICY_ID,
+                "sofascore_discovery_enabled": (
+                    SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES > 0
+                ),
+                "sofascore_discovery_dagrun_budget_bytes": (
+                    SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES
+                ),
             },
         )
         return True
@@ -2841,6 +2869,7 @@ async def main() -> None:
     global TRANSFERMARKT_DAGRUN_BUDGET_BYTES
     global SOFASCORE_DAGRUN_BUDGET_BYTES, SOFASCORE_BUDGET_ARTIFACT_ID
     global SOFASCORE_CANARY_HARD_CAP_BYTES, SOFASCORE_CANARY_POLICY_ID
+    global SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES
     global URL_BUDGET_BYTES, MAX_ACTIVE_LEASES, LEDGER_PATH, CONTROL_TOKEN
     global LEASE_UPSTREAM_CONNECT_TIMEOUT_SECONDS, LEASE_PROVIDER_HEAD_TIMEOUT_SECONDS
     global LEASE_UPSTREAM_FAILOVER_ATTEMPTS
@@ -2975,6 +3004,17 @@ async def main() -> None:
             "zero disables bootstrap canaries and never authorizes production"
         ),
     )
+    ap.add_argument(
+        "--sofascore-discovery-dagrun-budget-bytes",
+        type=int,
+        default=int(
+            os.environ.get("PROXY_FILTER_SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES", "0")
+        ),
+        help=(
+            "explicit hard cap for one dag_discover_sofascore_registry scan; "
+            "zero (default) refuses every metered discovery lease"
+        ),
+    )
     # Kept for the existing offline canary process and SharedBudgetLedger API.
     # Production warmed sessions use leases instead.
     ap.add_argument("--budget-artifact")
@@ -3030,6 +3070,9 @@ async def main() -> None:
     sofascore_canary_hard_cap_bytes = int(
         getattr(args, "sofascore_canary_hard_cap_bytes", 0)
     )
+    sofascore_discovery_budget_bytes = int(
+        getattr(args, "sofascore_discovery_dagrun_budget_bytes", 0)
+    )
     if (
         daily_budget_mb <= 0
         or max_lease_mb <= 0
@@ -3039,6 +3082,7 @@ async def main() -> None:
         or url_budget_bytes <= 0
         or max_active_leases <= 0
         or sofascore_canary_hard_cap_bytes < 0
+        or sofascore_discovery_budget_bytes < 0
     ):
         raise SystemExit("proxy byte budgets must be positive")
     # ``inf``/``nan`` pass a bare ``<= 0`` check but would disable the dead-exit
@@ -3106,6 +3150,15 @@ async def main() -> None:
             "experimental SofaScore canary enabled: cap=%d policy=%s production_authorized=false",
             SOFASCORE_CANARY_HARD_CAP_BYTES,
             SOFASCORE_CANARY_POLICY_ID,
+        )
+    # A discovery scan is deliberately served by consecutive leases bounded by
+    # MAX_LEASE_BYTES; the DagRun cap is the whole-scan ceiling and never
+    # raises the per-lease maximum.
+    SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES = sofascore_discovery_budget_bytes
+    if SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES > 0:
+        log.warning(
+            "metered SofaScore registry discovery enabled: dagrun_cap=%d",
+            SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES,
         )
     sofascore_artifact = getattr(args, "sofascore_budget_artifact", None)
     if sofascore_artifact:

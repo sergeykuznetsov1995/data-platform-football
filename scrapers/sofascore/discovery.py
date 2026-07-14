@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 try:  # POSIX production/CI runners.
     import fcntl as _fcntl
@@ -41,6 +41,30 @@ CATALOG_FALLBACK_PATH = "/config/top-unique-tournaments/EN/football"
 CATEGORIES_PATH = "/sport/football/categories/all"
 CATEGORIES_FALLBACK_PATH = "/sport/football/categories"
 TOURNAMENT_PATH = "/unique-tournament/{unique_tournament_id}"
+# One fingerprint for both discovery transports.  The lease path must look
+# exactly like the direct path to SofaScore's edge; only the egress differs.
+TLS_CLIENT_IDENTIFIER = "chrome_133"
+DISCOVERY_HEADERS = {
+    "accept": "*/*",
+    "accept-language": "en-US,en;q=0.9",
+    "origin": "https://www.sofascore.com",
+    "referer": "https://www.sofascore.com/",
+    "user-agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 "
+        "Safari/537.36"
+    ),
+    "x-requested-with": "XMLHttpRequest",
+}
+# Metered lease defaults.  A whole catalog scan is far larger than one lease and
+# longer than one TTL, so the scan is served by consecutive leases; these bounds
+# stay under the proxy filter's own MAX_LEASE_BYTES/MAX_LEASE_TTL_SECONDS.
+DISCOVERY_LEASE_MAX_BYTES = 8 * 1024 * 1024
+DISCOVERY_LEASE_TTL_SECONDS = 3600
+# Rotate before the filter refuses a write mid-request, and before the control
+# plane expires the lease under a slow request.
+_LEASE_BYTE_HEADROOM = 0.9
+_LEASE_TTL_MARGIN_SECONDS = 60.0
 _SPLIT_SHORT_RE = re.compile(r"^(\d{2})/(\d{2})$")
 _SPLIT_LONG_RE = re.compile(r"^(\d{4})/(\d{2}|\d{4})$")
 _SINGLE_YEAR_RE = re.compile(r"^\d{4}$")
@@ -209,18 +233,7 @@ class _DirectTlsSession:
     requests-shaped lets tests inject a deterministic in-memory session.
     """
 
-    _HEADERS = {
-        "accept": "*/*",
-        "accept-language": "en-US,en;q=0.9",
-        "origin": "https://www.sofascore.com",
-        "referer": "https://www.sofascore.com/",
-        "user-agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 "
-            "Safari/537.36"
-        ),
-        "x-requested-with": "XMLHttpRequest",
-    }
+    _HEADERS = DISCOVERY_HEADERS
 
     def __init__(self, timeout: float) -> None:
         try:
@@ -231,7 +244,7 @@ class _DirectTlsSession:
                 f"{type(exc).__name__}: {exc}"
             ) from exc
         self._inner = Session(
-            client_identifier="chrome_133",
+            client_identifier=TLS_CLIENT_IDENTIFIER,
             proxy=None,
             timeout_milliseconds=max(1, int(timeout * 1000)),
             disable_http3=True,
@@ -421,6 +434,294 @@ class DirectSofaScoreClient:
                 close()
 
     def __enter__(self) -> "DirectSofaScoreClient":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+        self.close()
+        return False
+
+
+class _LeaseTlsSession:
+    """The direct Chrome-133 profile pinned to one metered residential exit."""
+
+    _HEADERS = DISCOVERY_HEADERS
+
+    def __init__(self, proxy_url: str, timeout: float) -> None:
+        try:
+            from tls_client import Session
+        except ImportError as exc:  # pragma: no cover - production dependency
+            raise DiscoveryHTTPError(
+                "tls-client-python is required for SofaScore discovery: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        self.proxy_url = str(proxy_url)
+        self._inner = Session(
+            client_identifier=TLS_CLIENT_IDENTIFIER,
+            proxy=self.proxy_url,
+            timeout_milliseconds=max(1, int(timeout * 1000)),
+            disable_http3=True,
+            follow_redirects=False,
+        )
+        self.headers = dict(self._HEADERS)
+        # The lease URL is the only egress; ambient proxy variables must never
+        # redirect a metered request to an unaccounted exit.
+        self.trust_env = False
+
+    def get(self, url: str, *, timeout: float):
+        return self._inner.execute_request(
+            "GET",
+            url,
+            headers=dict(self.headers),
+            header_order=list(self.headers),
+            timeout_milliseconds=max(1, int(timeout * 1000)),
+            proxy=self.proxy_url,
+        )
+
+    def close(self) -> None:
+        self._inner.close()
+
+
+class LeaseProxySofaScoreClient:
+    """Discovery transport over metered proxy-filter leases (explicit opt-in).
+
+    Interchangeable with :class:`DirectSofaScoreClient` — ``get_json``/``stats``/
+    ``close`` — so the traversal and merge code is transport agnostic.  A full
+    catalog scan outgrows one lease (bytes) and one TTL (hours), so the scan is
+    served by consecutive leases; each closed lease reports its provider bytes,
+    which are summed into ``paid_proxy_bytes`` and bounded by ``budget_cap_bytes``.
+    """
+
+    def __init__(
+        self,
+        *,
+        control_url: str,
+        budget_cap_bytes: int,
+        run_id: str,
+        task_id: str = "discover_sofascore_registry",
+        control_token: Optional[str] = None,
+        per_lease_max_bytes: int = DISCOVERY_LEASE_MAX_BYTES,
+        lease_ttl_seconds: int = DISCOVERY_LEASE_TTL_SECONDS,
+        base_url: str = DEFAULT_BASE_URL,
+        timeout: float = 30,
+        max_attempts: int = 3,
+        sleeper: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.time,
+        session_factory: Optional[Callable[[str], Any]] = None,
+        lease_provider: Optional[Any] = None,
+        rate_limiter: Optional[Any] = None,
+    ) -> None:
+        if not base_url.startswith("https://"):
+            raise ValueError("SofaScore discovery base_url must use https")
+        if max_attempts < 1:
+            raise ValueError("max_attempts must be positive")
+        if not isinstance(budget_cap_bytes, int) or isinstance(budget_cap_bytes, bool):
+            raise ValueError("budget_cap_bytes must be a positive integer")
+        if budget_cap_bytes <= 0:
+            raise ValueError(
+                "metered discovery requires an explicit positive budget_cap_bytes"
+            )
+        if per_lease_max_bytes <= 0 or lease_ttl_seconds <= 0:
+            raise ValueError("per-lease byte and TTL bounds must be positive")
+        self.base_url = base_url.rstrip("/")
+        self.budget_cap_bytes = int(budget_cap_bytes)
+        self.per_lease_max_bytes = int(per_lease_max_bytes)
+        self.lease_ttl_seconds = int(lease_ttl_seconds)
+        self.timeout = timeout
+        self.max_attempts = max_attempts
+        self.run_id = str(run_id)
+        self.task_id = str(task_id)
+        self._sleeper = sleeper
+        self._clock = clock
+        self._session_factory = session_factory
+        self._provider = lease_provider or self._default_provider(
+            control_url, control_token
+        )
+        self._rate_limiter = rate_limiter or self._default_rate_limiter()
+        self._lease: Optional[Any] = None
+        self._session: Any = None
+        self._lease_response_bytes = 0
+        self._requests = 0
+        self._paid_proxy_bytes = 0
+        self._lease_count = 0
+        self._upstream_repins = 0
+
+    @staticmethod
+    def _default_provider(control_url: str, control_token: Optional[str]) -> Any:
+        # Imported lazily: the direct transport must keep running where the
+        # control-plane dependencies (and their POSIX-only imports) are absent.
+        from scrapers.sofascore.lease_client import _DiscoveryLeaseProvider
+
+        return _DiscoveryLeaseProvider(control_url, control_token=control_token)
+
+    @staticmethod
+    def _default_rate_limiter() -> Any:
+        from scrapers.utils.rate_limiter import get_rate_limiter
+
+        return get_rate_limiter("sofascore_discovery")
+
+    @property
+    def stats(self) -> dict[str, int]:
+        """Report billed traffic; call :meth:`close` before reading it."""
+
+        return {
+            "requests": self._requests,
+            "direct_response_bytes": 0,
+            "paid_proxy_bytes": self._paid_proxy_bytes,
+            "browser_sessions": 0,
+            "browser_navigations": 0,
+            "lease_count": self._lease_count,
+            "upstream_repins": self._upstream_repins,
+        }
+
+    def _acquire(self) -> Any:
+        remaining = self.budget_cap_bytes - self._paid_proxy_bytes
+        if remaining <= 0:
+            raise DiscoveryError(
+                "SofaScore discovery paid-byte budget exhausted: "
+                f"{self._paid_proxy_bytes}/{self.budget_cap_bytes} bytes"
+            )
+        try:
+            lease = self._provider.acquire(
+                max_bytes=min(self.per_lease_max_bytes, remaining),
+                ttl_seconds=self.lease_ttl_seconds,
+                run_id=self.run_id,
+                task_id=self.task_id,
+            )
+            proxy_url = self._provider.authenticated_proxy_url(lease)
+        except Exception as exc:
+            raise DiscoveryError(
+                f"SofaScore discovery lease unavailable: {exc}"
+            ) from exc
+        factory = self._session_factory or (
+            lambda url: _LeaseTlsSession(url, self.timeout)
+        )
+        self._lease = lease
+        self._session = factory(proxy_url)
+        self._lease_response_bytes = 0
+        self._lease_count += 1
+        return self._session
+
+    def _release(self, *, raise_on_error: bool) -> None:
+        """Close the live lease and bill its exact provider bytes exactly once."""
+
+        lease, session = self._lease, self._session
+        self._lease, self._session, self._lease_response_bytes = None, None, 0
+        if session is not None:
+            close = getattr(session, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:  # noqa: BLE001 - transport teardown is advisory
+                    pass
+        if lease is None:
+            return
+        try:
+            snapshot = self._provider.close(lease)
+        except Exception as exc:
+            # Unmeasured paid traffic is never assumed to be zero: charge the
+            # whole lease allowance and let the caller decide to stop.
+            self._paid_proxy_bytes += int(getattr(lease, "max_bytes", 0) or 0)
+            if raise_on_error:
+                raise DiscoveryError(
+                    f"SofaScore discovery lease did not close cleanly: {exc}"
+                ) from exc
+            return
+        self._paid_proxy_bytes += int(snapshot.provider_bytes)
+        self._upstream_repins += int(snapshot.upstream_repins)
+        if self._paid_proxy_bytes > self.budget_cap_bytes and raise_on_error:
+            raise DiscoveryError(
+                "SofaScore discovery exceeded its paid-byte cap: "
+                f"{self._paid_proxy_bytes}/{self.budget_cap_bytes} bytes"
+            )
+
+    def _live_session(self) -> Any:
+        lease = self._lease
+        if lease is not None and (
+            self._lease_response_bytes >= _LEASE_BYTE_HEADROOM * lease.max_bytes
+            or self._clock() >= lease.expires_at - _LEASE_TTL_MARGIN_SECONDS
+        ):
+            # Exhausted or nearly expired: bill it and continue on a fresh exit.
+            self._release(raise_on_error=True)
+        if self._lease is None:
+            return self._acquire()
+        return self._session
+
+    def get_json(self, path: str) -> Mapping[str, Any]:
+        clean_path = "/" + str(path).lstrip("/")
+        if "://" in clean_path or ".." in clean_path.split("/"):
+            raise ValueError("discovery path must be a relative API path")
+        url = f"{self.base_url}{clean_path}"
+        last_error: Optional[Exception] = None
+
+        for attempt in range(1, self.max_attempts + 1):
+            session = self._live_session()
+            self._rate_limiter.acquire()
+            self._requests += 1
+            try:
+                response = session.get(url, timeout=self.timeout)
+            except Exception as exc:
+                last_error = exc
+                # A dead or refusing exit is the lease's exit: only a new lease
+                # gets a new one.
+                self._release(raise_on_error=True)
+                if attempt == self.max_attempts:
+                    break
+                self._sleeper(min(2 ** (attempt - 1), 4))
+                continue
+
+            self._lease_response_bytes += _response_bytes(response)
+            try:
+                status = int(response.status_code)
+            except (AttributeError, TypeError, ValueError) as exc:
+                raise DiscoveryHTTPError(
+                    f"metered SofaScore response has no valid status: {url}"
+                ) from exc
+
+            if status == 200:
+                try:
+                    payload = response.json()
+                except Exception:
+                    try:
+                        content = response.content
+                        if isinstance(content, bytes):
+                            content = content.decode("utf-8")
+                        payload = json.loads(content)
+                    except Exception as exc:
+                        raise DiscoverySchemaError(
+                            f"invalid JSON from {clean_path}"
+                        ) from exc
+                if not isinstance(payload, Mapping):
+                    raise DiscoverySchemaError(
+                        f"JSON root from {clean_path} must be an object"
+                    )
+                return payload
+
+            error = DiscoveryHTTPError(
+                f"metered SofaScore request failed: HTTP {status} {clean_path}",
+                status_code=status,
+            )
+            if status == 403:
+                # A residential exit that is still refused is a provisioning or
+                # fingerprint failure. Retrying only burns paid bytes.
+                raise error
+            if status == 429 or 500 <= status <= 599:
+                last_error = error
+                self._release(raise_on_error=True)
+                if attempt < self.max_attempts:
+                    self._sleeper(min(2 ** (attempt - 1), 4))
+                    continue
+            raise error
+
+        raise DiscoveryHTTPError(
+            f"metered SofaScore request failed after {self.max_attempts} "
+            f"attempts: {clean_path}: {last_error}",
+            status_code=getattr(last_error, "status_code", None),
+        ) from last_error
+
+    def close(self) -> None:
+        self._release(raise_on_error=False)
+
+    def __enter__(self) -> "LeaseProxySofaScoreClient":
         return self
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
@@ -1001,11 +1302,20 @@ def discover_registry(
     client: DirectSofaScoreClient,
     *,
     scope: str = "full",
+    target_tournament_ids: Optional[Sequence[Any]] = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Fetch the complete catalog and every season list before merging."""
 
-    if scope not in {"full", "active-reviewed"}:
-        raise ValueError("scope must be 'full' or 'active-reviewed'")
+    if scope not in {"full", "active-reviewed", "targeted"}:
+        raise ValueError(
+            "scope must be 'full', 'active-reviewed' or 'targeted'"
+        )
+    if scope != "targeted" and target_tournament_ids:
+        raise ValueError(
+            "target_tournament_ids is only meaningful for scope='targeted'"
+        )
+    if scope == "targeted" and not target_tournament_ids:
+        raise ValueError("targeted discovery requires at least one tournament id")
 
     existing_catalog = SofaScoreCatalog.from_mapping(existing)
     enabled_source_ids = {
@@ -1083,16 +1393,24 @@ def discover_registry(
             )
         tournaments = _merge_tournament_sources(curated, category_tournaments)
     else:
-        refresh_ids = sorted({
-            tournament.unique_tournament_id
-            for tournament in existing_catalog.tournaments
-            if tournament.enabled
-            or tournament.review.get("status") in {"approved", "rejected"}
-        })
-        if not refresh_ids:
-            raise DiscoverySchemaError(
-                "active-reviewed discovery has no reviewed tournaments"
-            )
+        if scope == "targeted":
+            # An operator names the tournaments; a detail pass is the only place
+            # the source states gender and the season list for each of them.
+            refresh_ids = sorted({
+                _positive_int(source_id, "target_tournament_id")
+                for source_id in target_tournament_ids or ()
+            })
+        else:
+            refresh_ids = sorted({
+                tournament.unique_tournament_id
+                for tournament in existing_catalog.tournaments
+                if tournament.enabled
+                or tournament.review.get("status") in {"approved", "rejected"}
+            })
+            if not refresh_ids:
+                raise DiscoverySchemaError(
+                    "active-reviewed discovery has no reviewed tournaments"
+                )
         tournaments = []
         for source_id in refresh_ids:
             payload = client.get_json(
@@ -1113,12 +1431,16 @@ def discover_registry(
         int(tournament["unique_tournament_id"])
         for tournament in tournaments
     }
-    missing_enabled = sorted(enabled_source_ids - discovered_source_ids)
-    if missing_enabled:
-        raise DiscoverySchemaError(
-            "complete discovery omitted enabled tournaments: "
-            + ", ".join(str(source_id) for source_id in missing_enabled)
-        )
+    # A targeted pass is explicitly partial: it refreshes the named tournaments
+    # and merge_registry keeps every other record untouched. Only a scan that
+    # claims to cover the active set must account for all of it.
+    if scope != "targeted":
+        missing_enabled = sorted(enabled_source_ids - discovered_source_ids)
+        if missing_enabled:
+            raise DiscoverySchemaError(
+                "complete discovery omitted enabled tournaments: "
+                + ", ".join(str(source_id) for source_id in missing_enabled)
+            )
 
     for tournament in tournaments:
         source_id = tournament["unique_tournament_id"]
@@ -1294,8 +1616,13 @@ __all__ = [
     "CATEGORIES_FALLBACK_PATH",
     "CATEGORIES_PATH",
     "DEFAULT_BASE_URL",
+    "DISCOVERY_HEADERS",
+    "DISCOVERY_LEASE_MAX_BYTES",
+    "DISCOVERY_LEASE_TTL_SECONDS",
+    "TLS_CLIENT_IDENTIFIER",
     "TOURNAMENT_PATH",
     "DirectSofaScoreClient",
+    "LeaseProxySofaScoreClient",
     "DiscoveryError",
     "DiscoveryConcurrentUpdate",
     "DiscoveryHTTPError",

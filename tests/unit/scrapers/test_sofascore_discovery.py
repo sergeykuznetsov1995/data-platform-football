@@ -6,6 +6,7 @@ import json
 import stat
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -14,11 +15,14 @@ from scrapers.sofascore.discovery import (
     CATALOG_PATH,
     CATEGORIES_FALLBACK_PATH,
     CATEGORIES_PATH,
+    DISCOVERY_HEADERS,
     TOURNAMENT_PATH,
     DirectSofaScoreClient,
     DiscoveryConcurrentUpdate,
+    DiscoveryError,
     DiscoveryHTTPError,
     DiscoverySchemaError,
+    LeaseProxySofaScoreClient,
     classify_season_year,
     discover_registry,
     parse_catalog_payload,
@@ -669,3 +673,433 @@ def test_atomic_writer_rejects_concurrent_activation_change(tmp_path):
         )
 
     assert json.loads(path.read_text(encoding="utf-8")) == concurrent
+
+
+# --- targeted scope (machine layer for the batch onboarding, #946) ------------
+
+
+@pytest.mark.unit
+def test_targeted_scope_refreshes_only_the_named_tournaments():
+    existing = _existing_registry()
+    client = _FakeClient()
+    laliga_detail = _catalog_item(*LALIGA[:5])
+    client.payloads[TOURNAMENT_PATH.format(unique_tournament_id=8)] = {
+        "uniqueTournament": laliga_detail,
+    }
+    client.payloads["/unique-tournament/8/seasons"] = _season_payload(LALIGA)
+
+    merged, report = discover_registry(
+        existing, client, scope="targeted", target_tournament_ids=[8],
+    )
+
+    assert client.calls == [
+        "/unique-tournament/8",
+        "/unique-tournament/8/seasons",
+    ]
+    assert report["scope"] == "targeted"
+    assert report["catalog_tournaments"] == 1
+    laliga = next(
+        item for item in merged["tournaments"]
+        if item["unique_tournament_id"] == 8
+    )
+    # The detail endpoint is the only place the source states gender, and it is
+    # recorded as source evidence, not as a guess.
+    assert laliga["classification"]["gender"] == "male"
+    assert {
+        "type": "source_field",
+        "endpoint": "/unique-tournament/8",
+        "field": "gender",
+        "value": "M",
+    } in laliga["classification"]["evidence"]
+    assert [season["canonical_season"] for season in laliga["seasons"]] == ["2526"]
+
+
+@pytest.mark.unit
+def test_targeted_scope_keeps_untargeted_enabled_tournaments_untouched():
+    # A targeted pass is explicitly partial. The complete-scan guard ("omitted
+    # enabled tournaments") must not fire, and every other record must survive.
+    existing = _existing_registry()
+    client = _FakeClient()
+    client.payloads[TOURNAMENT_PATH.format(unique_tournament_id=8)] = {
+        "uniqueTournament": _catalog_item(*LALIGA[:5]),
+    }
+    client.payloads["/unique-tournament/8/seasons"] = _season_payload(LALIGA)
+
+    merged, _ = discover_registry(
+        existing, client, scope="targeted", target_tournament_ids=[8],
+    )
+
+    before = {
+        item["unique_tournament_id"]: item
+        for item in existing["tournaments"]
+    }
+    after = {
+        item["unique_tournament_id"]: item
+        for item in merged["tournaments"]
+    }
+    assert set(after) == set(before)
+    for source_id in (16, 17, 270):
+        assert after[source_id] == before[source_id]
+    assert after[17]["enabled"] is True
+
+
+@pytest.mark.unit
+def test_targeted_scope_requires_ids_and_rejects_them_elsewhere():
+    existing = _existing_registry()
+    client = _FakeClient()
+
+    with pytest.raises(ValueError, match="at least one tournament id"):
+        discover_registry(existing, client, scope="targeted")
+    with pytest.raises(ValueError, match="only meaningful for scope"):
+        discover_registry(existing, client, target_tournament_ids=[8])
+    assert client.calls == []
+
+
+@pytest.mark.unit
+def test_targeted_detail_response_for_another_tournament_fails_closed():
+    existing = _existing_registry()
+    client = _FakeClient()
+    client.payloads[TOURNAMENT_PATH.format(unique_tournament_id=8)] = {
+        "uniqueTournament": _catalog_item(*TOURNAMENTS[0][:5]),
+    }
+
+    with pytest.raises(DiscoverySchemaError, match="detail response for 8"):
+        discover_registry(
+            existing, client, scope="targeted", target_tournament_ids=[8],
+        )
+
+
+# --- metered lease-proxy transport (opt-in) ----------------------------------
+
+
+CONTROL_URL = "http://proxy_filter:8899"
+CONTROL_TOKEN = "c" * 32
+
+
+class _ControlResponse:
+    def __init__(self, status_code, payload):
+        self.status_code = status_code
+        self._payload = payload
+
+    def json(self):
+        return deepcopy(self._payload)
+
+
+class _FakeProxyFilter:
+    """In-memory proxy-filter lease API and its byte meter (no sockets)."""
+
+    def __init__(self, *, ttl_seconds=3600, now=1_000_000.0, repins=0):
+        self.now = now
+        self.ttl_seconds = ttl_seconds
+        self.repins = repins
+        self.trust_env = True
+        self.leases = {}
+        self.tokens = {}
+        self.acquired = []
+        self.closed = []
+        self.close_error = None
+
+    # --- control plane (requests.Session-shaped) ---
+    def request(self, method, url, *, json=None, headers=None, timeout=None):
+        assert headers["X-Proxy-Control-Token"] == CONTROL_TOKEN
+        path = url[len(CONTROL_URL):]
+        if method == "POST" and path == "/v1/leases":
+            assert json["dag_id"] == "dag_discover_sofascore_registry"
+            assert json["source"] == "sofascore_discovery"
+            if any(not item["closed"] for item in self.leases.values()):
+                return _ControlResponse(
+                    429, {"error": "discovery concurrency limit reached"}
+                )
+            lease_id = f"lease-{len(self.leases) + 1}"
+            token = f"token-{len(self.leases) + 1}"
+            self.leases[lease_id] = {
+                "id": lease_id,
+                "source": "sofascore_discovery",
+                "up_bytes": 0,
+                "down_bytes": 0,
+                "closed": False,
+                "budget_exceeded": False,
+                "upstream_repins": self.repins,
+                "max_bytes": int(json["max_bytes"]),
+            }
+            self.tokens[token] = lease_id
+            self.acquired.append(dict(json))
+            return _ControlResponse(201, {
+                "id": lease_id,
+                "token": token,
+                "proxy_url": "http://proxy_filter:8900",
+                "max_bytes": int(json["max_bytes"]),
+                "expires_at": self.now + int(json["ttl_seconds"]),
+            })
+        lease_id = path.split("/")[3]
+        lease = self.leases[lease_id]
+        if path.endswith("/close"):
+            if self.close_error is not None:
+                return _ControlResponse(500, {"error": self.close_error})
+            lease["closed"] = True
+            self.closed.append(lease_id)
+        state = dict(lease)
+        state["total_bytes"] = state["up_bytes"] + state["down_bytes"]
+        return _ControlResponse(200, state)
+
+    # --- data plane meter ---
+    def bill(self, token, size):
+        lease = self.leases[self.tokens[token]]
+        lease["up_bytes"] += 100
+        lease["down_bytes"] += size
+
+
+class _LeaseSession:
+    """Data-plane session pinned to exactly one lease's authenticated exit."""
+
+    def __init__(self, proxy_filter, proxy_url, responses):
+        from urllib.parse import urlsplit
+
+        self.proxy_filter = proxy_filter
+        self.proxy_url = proxy_url
+        parsed = urlsplit(proxy_url)
+        assert parsed.username == "lease"
+        self.token = parsed.password
+        self.headers = dict(DISCOVERY_HEADERS)
+        self.trust_env = False
+        self.responses = responses
+        self.calls = []
+        self.closed = False
+
+    def get(self, url, *, timeout):
+        self.calls.append(url)
+        response = self.responses.popleft()
+        if isinstance(response, Exception):
+            raise response
+        self.proxy_filter.bill(self.token, len(response.content))
+        return response
+
+    def close(self):
+        self.closed = True
+
+
+def _lease_client(proxy_filter, responses, **kwargs):
+    from collections import deque
+
+    from scrapers.sofascore.lease_client import _DiscoveryLeaseProvider
+
+    queue = deque(responses)
+    sessions = []
+
+    def factory(proxy_url):
+        session = _LeaseSession(proxy_filter, proxy_url, queue)
+        sessions.append(session)
+        return session
+
+    client = LeaseProxySofaScoreClient(
+        control_url=CONTROL_URL,
+        budget_cap_bytes=kwargs.pop("budget_cap_bytes", 10_000_000),
+        run_id="discovery__test",
+        lease_provider=_DiscoveryLeaseProvider(
+            CONTROL_URL, control_token=CONTROL_TOKEN, session=proxy_filter
+        ),
+        session_factory=factory,
+        rate_limiter=SimpleNamespace(acquire=lambda: True),
+        sleeper=lambda _seconds: None,
+        clock=lambda: proxy_filter.now,
+        **kwargs,
+    )
+    return client, sessions
+
+
+@pytest.mark.unit
+def test_lease_transport_meters_paid_bytes_and_never_opens_a_browser():
+    proxy_filter = _FakeProxyFilter()
+    client, sessions = _lease_client(
+        proxy_filter, [_Response(200, {"seasons": []})]
+    )
+
+    payload = client.get_json("/unique-tournament/8/seasons")
+    client.close()
+
+    assert payload == {"seasons": []}
+    # The exit is the lease's exit: Basic-auth lease URL, direct fingerprint.
+    assert sessions[0].proxy_url.startswith("http://lease:token-1@proxy_filter:8900")
+    assert sessions[0].headers["x-requested-with"] == "XMLHttpRequest"
+    assert sessions[0].calls == [
+        "https://api.sofascore.com/api/v1/unique-tournament/8/seasons"
+    ]
+    assert sessions[0].closed is True
+    stats = client.stats
+    lease = proxy_filter.leases["lease-1"]
+    assert stats["paid_proxy_bytes"] == lease["up_bytes"] + lease["down_bytes"]
+    assert stats["paid_proxy_bytes"] > 0
+    assert stats["requests"] == 1
+    assert stats["lease_count"] == 1
+    assert stats["direct_response_bytes"] == 0
+    assert stats["browser_sessions"] == 0
+    assert stats["browser_navigations"] == 0
+    assert proxy_filter.closed == ["lease-1"]
+
+
+@pytest.mark.unit
+def test_exhausted_lease_rotates_to_a_fresh_exit_and_bills_each_once():
+    proxy_filter = _FakeProxyFilter(repins=1)
+    payload = {"seasons": [], "padding": "x" * 4000}
+    client, sessions = _lease_client(
+        proxy_filter,
+        [_Response(200, payload) for _ in range(3)],
+        per_lease_max_bytes=5000,
+    )
+
+    for _ in range(3):
+        client.get_json("/unique-tournament/8/seasons")
+    client.close()
+
+    # Two responses no longer fit under one 5000-byte lease, so the scan
+    # continues on a second, freshly pinned exit.
+    assert len(sessions) >= 2
+    assert client.stats["lease_count"] == len(sessions)
+    billed = sum(
+        item["up_bytes"] + item["down_bytes"]
+        for item in proxy_filter.leases.values()
+    )
+    assert client.stats["paid_proxy_bytes"] == billed
+    assert client.stats["upstream_repins"] == len(sessions)
+    # Every lease is closed exactly once: no lease is billed twice.
+    assert sorted(proxy_filter.closed) == sorted(proxy_filter.leases)
+    assert len(proxy_filter.closed) == len(set(proxy_filter.closed))
+    assert all(item.closed for item in sessions)
+
+
+@pytest.mark.unit
+def test_expiring_lease_is_rotated_before_the_control_plane_kills_it():
+    proxy_filter = _FakeProxyFilter(ttl_seconds=120)
+    client, sessions = _lease_client(
+        proxy_filter,
+        [_Response(200, {"seasons": []}) for _ in range(2)],
+        lease_ttl_seconds=120,
+    )
+
+    client.get_json("/unique-tournament/8/seasons")
+    proxy_filter.now += 90  # inside the 60s expiry margin
+    client.get_json("/unique-tournament/8/seasons")
+    client.close()
+
+    assert len(sessions) == 2
+    assert client.stats["lease_count"] == 2
+    assert proxy_filter.closed == ["lease-1", "lease-2"]
+
+
+@pytest.mark.unit
+def test_429_and_transport_errors_rotate_the_lease_without_double_billing():
+    proxy_filter = _FakeProxyFilter()
+    client, sessions = _lease_client(
+        proxy_filter,
+        [
+            _Response(429, {"error": "slow down"}),
+            ConnectionError("silent exit"),
+            _Response(200, {"seasons": []}),
+        ],
+    )
+
+    payload = client.get_json("/unique-tournament/8/seasons")
+    client.close()
+
+    assert payload == {"seasons": []}
+    assert client.stats["requests"] == 3
+    assert client.stats["lease_count"] == 3
+    assert len(proxy_filter.closed) == 3
+    assert len(set(proxy_filter.closed)) == 3
+    assert client.stats["paid_proxy_bytes"] == sum(
+        item["up_bytes"] + item["down_bytes"]
+        for item in proxy_filter.leases.values()
+    )
+
+
+@pytest.mark.unit
+def test_403_from_a_residential_exit_is_surfaced_without_retrying():
+    proxy_filter = _FakeProxyFilter()
+    client, sessions = _lease_client(
+        proxy_filter, [_Response(403, {"error": "forbidden"})]
+    )
+
+    with pytest.raises(DiscoveryHTTPError) as excinfo:
+        client.get_json("/unique-tournament/8/seasons")
+    client.close()
+
+    assert excinfo.value.status_code == 403
+    assert client.stats["requests"] == 1
+    assert client.stats["lease_count"] == 1
+    # The refused response was still paid for, and it is reported.
+    assert client.stats["paid_proxy_bytes"] > 0
+
+
+@pytest.mark.unit
+def test_scan_stops_at_the_client_budget_cap():
+    proxy_filter = _FakeProxyFilter()
+    payload = {"seasons": [], "padding": "x" * 3000}
+    client, _ = _lease_client(
+        proxy_filter,
+        [_Response(200, payload) for _ in range(4)],
+        per_lease_max_bytes=3200,
+        budget_cap_bytes=4000,
+    )
+
+    with pytest.raises(DiscoveryError, match="paid-byte"):
+        for _ in range(4):
+            client.get_json("/unique-tournament/8/seasons")
+    client.close()
+
+    assert client.stats["paid_proxy_bytes"] <= 4000 + 3200
+    # A lease is never issued for more than the remaining authorized bytes.
+    assert all(
+        int(item["max_bytes"]) <= 4000 for item in proxy_filter.acquired
+    )
+
+
+@pytest.mark.unit
+def test_lease_transport_requires_an_explicit_positive_budget():
+    for cap in (0, -1):
+        with pytest.raises(ValueError, match="budget_cap_bytes"):
+            LeaseProxySofaScoreClient(
+                control_url=CONTROL_URL,
+                budget_cap_bytes=cap,
+                run_id="discovery__test",
+                lease_provider=object(),
+                rate_limiter=SimpleNamespace(acquire=lambda: True),
+            )
+
+
+@pytest.mark.unit
+def test_unmeasurable_lease_close_charges_the_whole_allowance():
+    # A control plane that cannot report the final counters is never assumed to
+    # have billed zero bytes.
+    proxy_filter = _FakeProxyFilter()
+    proxy_filter.close_error = "meter unavailable"
+    client, _ = _lease_client(
+        proxy_filter, [_Response(200, {"seasons": []})], per_lease_max_bytes=4096,
+    )
+
+    client.get_json("/unique-tournament/8/seasons")
+    client.close()
+
+    assert client.stats["paid_proxy_bytes"] == 4096
+
+
+@pytest.mark.unit
+def test_discovery_traversal_runs_on_the_lease_transport_unchanged():
+    # The traversal contract is transport agnostic: the same fake catalog served
+    # through metered leases produces the same registry as the direct client.
+    proxy_filter = _FakeProxyFilter()
+    direct = _FakeClient()
+    expected, _ = discover_registry(_existing_registry(), direct)
+
+    responses = [
+        _Response(200, direct.payloads[path]) for path in direct.calls
+    ]
+    client, _ = _lease_client(
+        proxy_filter, responses, per_lease_max_bytes=1_000_000,
+    )
+    merged, report = discover_registry(_existing_registry(), client)
+    client.close()
+
+    assert merged == expected
+    assert report["traffic"]["browser_sessions"] == 0
+    assert client.stats["requests"] == len(direct.calls)
+    assert client.stats["paid_proxy_bytes"] > 0

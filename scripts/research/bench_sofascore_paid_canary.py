@@ -13,6 +13,16 @@ The collector is deliberately separate from production capture authorization:
 * the separate ``verify`` command atomically flips that one flag only after
   the complete >=20-run / >=5-exit policy and fixed-cohort evidence validates.
 
+Which classes exist, and which tournaments each one is measured on, is declared
+by ``configs/sofascore/proxy_canary_classes.json`` alone; this module recomputes
+every class name and shape digest from the production code shapes, so a class can
+never be re-pointed at another league by editing a config.  Cold runs are spread
+over a class' collection targets in round-robin, and ``verify`` rejects a class
+whose samples are skewed below the even floor - a class that generalizes must be
+evidence of a shape, not of one league.  A verified artifact is immutable: the
+``extend`` command opens the next candidate from it (carrying the cold samples
+over only while the runtime fingerprint is byte-for-byte identical).
+
 The zero-network ``no_op`` and ``offline_replay`` observations and the paid
 ``single_endpoint_resume`` observation are benchmark-only.  They are required
 evidence but never participate in production budget derivation.
@@ -77,16 +87,17 @@ from scrapers.sofascore.season_pipeline import (  # noqa: E402
     plan_season_partition,
 )
 from scrapers.sofascore.workload_plan import (  # noqa: E402
-    MATCH_WORKLOAD_CLASS,
+    MIN_MEASURED_TOURNAMENTS_FOR_TRANSFER,
     SEASON_DYNAMIC_ENDPOINTS,
     SEASON_STATIC_ENDPOINTS,
     WORKLOAD_ARTIFACT_SCHEMA_VERSION,
-    match_workload_class,
-    player_workload_class,
+    WorkloadPlanError,
+    production_match_shape,
+    production_player_shape,
     production_season_shape,
-    season_shape_digest,
-    season_workload_class,
     tournament_canonical_url,
+    workload_class_name,
+    workload_shape_digest,
 )
 from scrapers.sofascore.lease_client import redact_sensitive  # noqa: E402
 from scrapers.sofascore.runtime_fingerprint import (  # noqa: E402
@@ -110,88 +121,39 @@ from scripts.proxy_filter.budget import (  # noqa: E402
 )
 
 
-COLLECTOR_VERSION = "sofascore-paid-canary-v2"
+COLLECTOR_VERSION = "sofascore-paid-canary-v3"
 METER = "proxy_filter_provider_path_v2"
-COHORT_NAME = "25_matches_50_players"
 EXPECTED_MATCHES = 25
 EXPECTED_PLAYERS = 50
-EXPECTED_ENDPOINTS = EXPECTED_MATCHES * len(EVENT_PATHS) + EXPECTED_PLAYERS * len(
-    PLAYER_PATHS
-)
-EXPECTED_SOURCE_TOURNAMENT_ID = 17
-EXPECTED_SOURCE_SEASON_ID = 76986
-EXPECTED_COMPETITION = "ENG-Premier League"
-EXPECTED_SEASON = "2526"
-CANONICAL_URL = tournament_canonical_url("premier-league", 17)
-WORLD_CUP_CANONICAL_URL = tournament_canonical_url("world-cup", 16)
 CANARY_DAG_ID = "dag_canary_sofascore_proxy"
 CANARY_SOURCE = "sofascore_canary"
-DEFAULT_COHORT_PATH = ROOT / "configs" / "sofascore" / "proxy_canary_cohort.json"
-DEFAULT_WORLD_CUP_COHORT_PATH = (
-    ROOT / "configs" / "sofascore" / "proxy_canary_cohort_world_cup.json"
-)
-DEFAULT_ARTIFACT_PATH = ROOT / "configs" / "sofascore" / "proxy_budget_canary.json"
+CONFIG_DIR = ROOT / "configs" / "sofascore"
+DEFAULT_COHORT_PATH = CONFIG_DIR / "proxy_canary_cohort.json"
+DEFAULT_CLASS_MANIFEST_PATH = CONFIG_DIR / "proxy_canary_classes.json"
+DEFAULT_ARTIFACT_PATH = CONFIG_DIR / "proxy_budget_canary.json"
 DEFAULT_WORKSPACE = Path("/tmp/sofascore-paid-canary")
 BENCHMARK_ONLY_MODES = frozenset({"no_op", "offline_replay", "single_endpoint_resume"})
-EPL_SEASON_SHAPE = production_season_shape(
-    17,
-    season_format="split_year",
-    max_pages_per_direction=50,
-)
-WORLD_CUP_SEASON_SHAPE = production_season_shape(
-    16,
-    season_format="calendar_year",
-    max_pages_per_direction=50,
-)
-EPL_SEASON_CLASS = season_workload_class(17, EPL_SEASON_SHAPE)
-WORLD_CUP_SEASON_CLASS = season_workload_class(16, WORLD_CUP_SEASON_SHAPE)
-EPL_MATCH_CLASS = match_workload_class(17)
-EPL_PLAYER_CLASS = player_workload_class(17)
-WORLD_CUP_MATCH_CLASS = match_workload_class(16)
-WORLD_CUP_PLAYER_CLASS = player_workload_class(16)
-REQUIRED_WORKLOAD_CLASSES = (
-    WORLD_CUP_MATCH_CLASS,
-    EPL_MATCH_CLASS,
-    WORLD_CUP_PLAYER_CLASS,
-    EPL_PLAYER_CLASS,
-    WORLD_CUP_SEASON_CLASS,
-    EPL_SEASON_CLASS,
-)
-
-
-def _class_tournament_id(workload_class: str) -> int:
-    if workload_class in {
-        EPL_MATCH_CLASS,
-        EPL_PLAYER_CLASS,
-        EPL_SEASON_CLASS,
-    }:
-        return 17
-    if workload_class in {
-        WORLD_CUP_MATCH_CLASS,
-        WORLD_CUP_PLAYER_CLASS,
-        WORLD_CUP_SEASON_CLASS,
-    }:
-        return 16
-    raise CanaryPolicyError(f"unsupported workload class {workload_class!r}")
-
-
-def canonical_anchor(workload_class: str) -> str:
-    if workload_class in {
-        EPL_MATCH_CLASS,
-        EPL_PLAYER_CLASS,
-        EPL_SEASON_CLASS,
-    }:
-        return CANONICAL_URL
-    if workload_class in {
-        WORLD_CUP_MATCH_CLASS,
-        WORLD_CUP_PLAYER_CLASS,
-        WORLD_CUP_SEASON_CLASS,
-    }:
-        return WORLD_CUP_CANONICAL_URL
-    raise CanaryPolicyError(f"unsupported workload class {workload_class!r}")
-
-
+CLASS_MANIFEST_SCHEMA_VERSION = 1
 SEASON_ENDPOINTS = tuple(SEASON_STATIC_ENDPOINTS + SEASON_DYNAMIC_ENDPOINTS)
+# Units of one full measured task; they are code constants of the production
+# capture, never a manifest choice.
+SCOPE_MAX_UNITS = {"match": EXPECTED_MATCHES, "player": EXPECTED_PLAYERS, "season": 1}
+_SEASON_SHAPE_PARAMS = frozenset(
+    {"season_format", "team_count_band", "max_pages_per_direction"}
+)
+# Everything a class declares before its first paid byte.  Collection may only
+# ever append samples and raise ``hard_task_bytes``.
+IMMUTABLE_CLASS_FIELDS = (
+    "scope",
+    "max_units",
+    "required_endpoints",
+    "shape",
+    "shape_digest",
+    "measured_tournament_ids",
+    "cohorts",
+    "representative_season_ids",
+    "collection_blocker",
+)
 _HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 _IPV4_RE = re.compile(r"(?<![0-9])(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?![0-9])")
 _FORBIDDEN_EVIDENCE_KEYS = frozenset(
@@ -220,13 +182,82 @@ class CanaryCohort:
     digest: str
     source_tournament_id: int
     source_season_id: int
+    canonical_competition: str
+    canonical_season: str
     match_ids: tuple[str, ...]
     player_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class CollectionTarget:
+    """One tournament a class is measured on, with its frozen source evidence."""
+
+    source_tournament_id: int
+    tournament_slug: str
+    cohort_path: Path
+    cohort_name: str
+    representative_season_id: Optional[int] = None
+
+    @property
+    def canonical_url(self) -> str:
+        return tournament_canonical_url(
+            self.tournament_slug, self.source_tournament_id
+        )
+
+
+@dataclass(frozen=True)
+class ClassSpec:
+    """One measured workload class: exactly one (scope, byte-driving shape)."""
+
+    key: str
+    name: str
+    scope: str
+    shape: Mapping[str, Any]
+    shape_digest: str
+    max_units: int
+    required_endpoints: tuple[str, ...]
+    targets: tuple[CollectionTarget, ...]
+
+    @property
+    def measured_tournament_ids(self) -> tuple[int, ...]:
+        return tuple(target.source_tournament_id for target in self.targets)
+
+    def target_for(self, source_tournament_id: object) -> CollectionTarget:
+        for target in self.targets:
+            if target.source_tournament_id == source_tournament_id:
+                return target
+        raise CanaryPolicyError(
+            f"workload class {self.name!r} is not measured on tournament "
+            f"{source_tournament_id!r}"
+        )
+
+
+@dataclass(frozen=True)
+class ClassManifest:
+    """The declared classes; names and digests are always recomputed here."""
+
+    path: Path
+    digest: str
+    classes: Mapping[str, ClassSpec]
+
+    @property
+    def required_workload_classes(self) -> tuple[str, ...]:
+        return tuple(self.classes)
+
+    def spec(self, workload_class: object) -> ClassSpec:
+        try:
+            return self.classes[workload_class]  # type: ignore[index]
+        except (KeyError, TypeError) as exc:
+            raise CanaryPolicyError(
+                f"unsupported workload class {workload_class!r}"
+            ) from exc
 
 
 @dataclass
 class ColdRunState:
     run_id: str
+    class_spec: ClassSpec
+    target: CollectionTarget
     cohort: CanaryCohort
     experimental_cap_bytes: int
     specs: tuple[Any, ...]
@@ -235,7 +266,10 @@ class ColdRunState:
     results: tuple[Any, ...]
     sample: dict[str, Any]
     root: Path
-    workload_class: str = MATCH_WORKLOAD_CLASS
+
+    @property
+    def workload_class(self) -> str:
+        return self.class_spec.name
 
 
 class CountingRawPayloadStore(RawPayloadStore):
@@ -353,6 +387,171 @@ def _canonical_digest(payload: Mapping[str, Any]) -> str:
     return hashlib.sha256(rendered).hexdigest()
 
 
+def _collection_target(
+    entry: object,
+    *,
+    key: str,
+    scope: str,
+    config_dir: Path,
+) -> CollectionTarget:
+    if not isinstance(entry, Mapping):
+        raise CanaryPolicyError(f"class {key!r} has a malformed collection target")
+    tournament_id = _positive_int(
+        entry.get("source_tournament_id"), f"{key}.source_tournament_id"
+    )
+    slug = str(entry.get("tournament_slug") or "").strip()
+    cohort_name = str(entry.get("cohort_name") or "").strip()
+    raw_cohort_path = str(entry.get("cohort_path") or "").strip()
+    if not slug or not cohort_name or not raw_cohort_path:
+        raise CanaryPolicyError(
+            f"class {key!r} target {tournament_id} needs a slug, cohort_path "
+            "and cohort_name"
+        )
+    cohort_path = Path(raw_cohort_path)
+    if cohort_path.is_absolute() or ".." in cohort_path.parts:
+        raise CanaryPolicyError(
+            f"class {key!r} cohort_path must stay inside the manifest directory"
+        )
+    try:
+        tournament_canonical_url(slug, tournament_id)
+    except WorkloadPlanError as exc:
+        raise CanaryPolicyError(f"class {key!r} has an unsafe warm anchor") from exc
+    season_id = entry.get("representative_season_id")
+    if scope == "season":
+        season_id = _positive_int(season_id, f"{key}.representative_season_id")
+    elif season_id is not None:
+        raise CanaryPolicyError(
+            f"{scope} class {key!r} must not pin a representative season"
+        )
+    return CollectionTarget(
+        source_tournament_id=tournament_id,
+        tournament_slug=slug,
+        cohort_path=config_dir / cohort_path,
+        cohort_name=cohort_name,
+        representative_season_id=season_id if scope == "season" else None,
+    )
+
+
+def _class_spec(entry: object, *, config_dir: Path) -> ClassSpec:
+    if not isinstance(entry, Mapping):
+        raise CanaryPolicyError("canary class manifest entries must be objects")
+    key = str(entry.get("key") or "").strip()
+    scope = str(entry.get("scope") or "").strip()
+    if not key:
+        raise CanaryPolicyError("canary class manifest entry needs a key")
+    if scope not in SCOPE_MAX_UNITS:
+        raise CanaryPolicyError(f"class {key!r} has an unsupported scope {scope!r}")
+    raw_params = entry.get("shape_params")
+    try:
+        if scope == "season":
+            if not isinstance(raw_params, Mapping) or set(raw_params) != (
+                _SEASON_SHAPE_PARAMS
+            ):
+                raise CanaryPolicyError(
+                    f"season class {key!r} needs exactly the shape parameters "
+                    + ", ".join(sorted(_SEASON_SHAPE_PARAMS))
+                )
+            shape = production_season_shape(
+                season_format=str(raw_params.get("season_format") or ""),
+                team_count_band=str(raw_params.get("team_count_band") or ""),
+                max_pages_per_direction=_positive_int(
+                    raw_params.get("max_pages_per_direction"),
+                    f"{key}.max_pages_per_direction",
+                ),
+            )
+            required_endpoints = tuple(sorted(SEASON_ENDPOINTS))
+        else:
+            if raw_params is not None:
+                raise CanaryPolicyError(
+                    f"{scope} class {key!r} is measured with the production code "
+                    "shape and cannot declare shape parameters"
+                )
+            shape = (
+                production_match_shape()
+                if scope == "match"
+                else production_player_shape()
+            )
+            required_endpoints = tuple(
+                sorted(EVENT_PATHS if scope == "match" else PLAYER_PATHS)
+            )
+        shape_digest = workload_shape_digest(shape)
+        name = workload_class_name(scope, shape_digest)
+    except WorkloadPlanError as exc:
+        raise CanaryPolicyError(
+            f"class {key!r} does not describe a measurable shape: {exc}"
+        ) from exc
+    raw_targets = entry.get("targets")
+    if not isinstance(raw_targets, list) or not raw_targets:
+        raise CanaryPolicyError(f"class {key!r} declares no collection target")
+    targets = tuple(
+        sorted(
+            (
+                _collection_target(
+                    item, key=key, scope=scope, config_dir=config_dir
+                )
+                for item in raw_targets
+            ),
+            key=lambda target: target.source_tournament_id,
+        )
+    )
+    if len({target.source_tournament_id for target in targets}) != len(targets):
+        raise CanaryPolicyError(f"class {key!r} declares one tournament twice")
+    return ClassSpec(
+        key=key,
+        name=name,
+        scope=scope,
+        shape=dict(shape),
+        shape_digest=shape_digest,
+        max_units=SCOPE_MAX_UNITS[scope],
+        required_endpoints=required_endpoints,
+        targets=targets,
+    )
+
+
+def load_class_manifest(
+    path: os.PathLike[str] | str = DEFAULT_CLASS_MANIFEST_PATH,
+) -> ClassManifest:
+    """Load the class declaration; the collector never hardcodes a tournament."""
+
+    manifest_path = Path(path)
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CanaryPolicyError("canary class manifest is unreadable") from exc
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != CLASS_MANIFEST_SCHEMA_VERSION
+    ):
+        raise CanaryPolicyError("unsupported canary class manifest")
+    entries = payload.get("classes")
+    if not isinstance(entries, list) or not entries:
+        raise CanaryPolicyError("canary class manifest declares no class")
+    classes: dict[str, ClassSpec] = {}
+    keys: set[str] = set()
+    for entry in entries:
+        spec = _class_spec(entry, config_dir=manifest_path.parent)
+        if spec.key in keys:
+            raise CanaryPolicyError(
+                f"canary class manifest declares key {spec.key!r} twice"
+            )
+        keys.add(spec.key)
+        if spec.name in classes:
+            raise CanaryPolicyError(
+                f"canary class manifest declares the same {spec.scope} shape "
+                f"in {classes[spec.name].key!r} and {spec.key!r}"
+            )
+        classes[spec.name] = spec
+    return ClassManifest(
+        path=manifest_path,
+        digest=_canonical_digest(payload),
+        classes=dict(sorted(classes.items())),
+    )
+
+
+CLASS_MANIFEST = load_class_manifest()
+REQUIRED_WORKLOAD_CLASSES = CLASS_MANIFEST.required_workload_classes
+
+
 def load_fixed_cohort(
     path: os.PathLike[str] | str = DEFAULT_COHORT_PATH,
 ) -> CanaryCohort:
@@ -404,9 +603,31 @@ def load_fixed_cohort(
         digest=_canonical_digest(payload),
         source_tournament_id=tournament_id,
         source_season_id=season_id,
+        canonical_competition=str(payload["canonical_competition"]).strip(),
+        canonical_season=str(payload["canonical_season"]).strip(),
         match_ids=tuple(match_ids),
         player_ids=tuple(player_ids),
     )
+
+
+def load_target_cohort(target: CollectionTarget) -> CanaryCohort:
+    """Load the frozen cohort of one collection target and pin its tournament."""
+
+    cohort = load_fixed_cohort(target.cohort_path)
+    if cohort.source_tournament_id != target.source_tournament_id:
+        raise CanaryPolicyError(
+            f"cohort {target.cohort_path.name!r} belongs to tournament "
+            f"{cohort.source_tournament_id}, not {target.source_tournament_id}"
+        )
+    if (
+        target.representative_season_id is not None
+        and cohort.source_season_id != target.representative_season_id
+    ):
+        raise CanaryPolicyError(
+            f"cohort {target.cohort_path.name!r} does not carry the "
+            "representative season of its season class"
+        )
+    return cohort
 
 
 def build_fixed_specs(cohort: CanaryCohort) -> tuple[Any, ...]:
@@ -460,81 +681,51 @@ def _production_rate_limiter():
     return limiter
 
 
-def _class_endpoints(workload_class: str) -> tuple[str, ...]:
-    if workload_class in {EPL_MATCH_CLASS, WORLD_CUP_MATCH_CLASS}:
-        return tuple(sorted(EVENT_PATHS))
-    if workload_class in {EPL_PLAYER_CLASS, WORLD_CUP_PLAYER_CLASS}:
-        return tuple(sorted(PLAYER_PATHS))
-    if workload_class in {EPL_SEASON_CLASS, WORLD_CUP_SEASON_CLASS}:
-        return tuple(sorted(SEASON_ENDPOINTS))
-    raise CanaryPolicyError(f"unsupported workload class {workload_class!r}")
+def _target_blocker(class_spec: ClassSpec, cohort: CanaryCohort) -> str:
+    """Return the frozen source-evidence gap that blocks one target, if any."""
+
+    if class_spec.scope == "match" and len(cohort.match_ids) != EXPECTED_MATCHES:
+        return (
+            str(cohort.payload.get("match_collection_blocker") or "").strip()
+            or "fixed cohort has no 25 match IDs"
+        )
+    if class_spec.scope == "player" and len(cohort.player_ids) != EXPECTED_PLAYERS:
+        return (
+            str(cohort.payload.get("player_collection_blocker") or "").strip()
+            or "fixed cohort has no 50 player IDs"
+        )
+    return ""
 
 
-def _class_units(workload_class: str) -> int:
-    if workload_class in {EPL_MATCH_CLASS, WORLD_CUP_MATCH_CLASS}:
-        return EXPECTED_MATCHES
-    if workload_class in {EPL_PLAYER_CLASS, WORLD_CUP_PLAYER_CLASS}:
-        return EXPECTED_PLAYERS
-    if workload_class in {EPL_SEASON_CLASS, WORLD_CUP_SEASON_CLASS}:
-        return 1
-    raise CanaryPolicyError(f"unsupported workload class {workload_class!r}")
+def _class_specs(class_spec: ClassSpec, cohort: CanaryCohort) -> tuple[Any, ...]:
+    """Return the fixed batch specs of one class/target pair."""
 
-
-def _class_specs(cohort: CanaryCohort, workload_class: str) -> tuple[Any, ...]:
-    expected_tournament_id = _class_tournament_id(workload_class)
-    if cohort.source_tournament_id != expected_tournament_id:
+    blocker = _target_blocker(class_spec, cohort)
+    if blocker:
         raise CanaryPolicyError(
-            f"{workload_class!r} needs tournament {expected_tournament_id} cohort, "
-            f"not {cohort.source_tournament_id}"
+            f"{class_spec.name!r} collection is blocked: {blocker}"
         )
     specs = build_fixed_specs(cohort)
-    if workload_class in {EPL_MATCH_CLASS, WORLD_CUP_MATCH_CLASS}:
-        if len(cohort.match_ids) != EXPECTED_MATCHES:
-            raise CanaryPolicyError(
-                f"{workload_class!r} collection is blocked until 25 match IDs exist"
-            )
+    if class_spec.scope == "match":
         return tuple(spec for spec in specs if spec.key.target_type == "event")
-    if workload_class in {EPL_PLAYER_CLASS, WORLD_CUP_PLAYER_CLASS}:
-        if len(cohort.player_ids) != EXPECTED_PLAYERS:
-            blocker = str(cohort.payload.get("player_collection_blocker") or "")
-            raise CanaryPolicyError(
-                f"{workload_class!r} collection is blocked: {blocker}"
-            )
+    if class_spec.scope == "player":
         return tuple(spec for spec in specs if spec.key.endpoint in PLAYER_PATHS)
     raise CanaryPolicyError(
-        f"season class {workload_class!r} uses the dynamic season planner"
+        f"season class {class_spec.name!r} uses the dynamic season planner"
     )
 
 
-def _cohort_for_workload_class(
-    primary: CanaryCohort,
-    workload_class: str,
-) -> CanaryCohort:
-    tournament_id = _class_tournament_id(workload_class)
-    if primary.source_tournament_id == tournament_id:
-        return primary
-    if tournament_id == 16:
-        return load_fixed_cohort(DEFAULT_WORLD_CUP_COHORT_PATH)
-    raise CanaryPolicyError(
-        f"no fixed cohort is configured for tournament {tournament_id}"
-    )
-
-
-def _experimental_policy(
-    cap: int,
-    cohort: CanaryCohort,
-    workload_class: str = MATCH_WORKLOAD_CLASS,
-) -> BudgetPolicy:
+def _experimental_policy(cap: int, class_spec: ClassSpec) -> BudgetPolicy:
     identity = experimental_canary_policy_id(cap)
     return BudgetPolicy(
         artifact_id=identity,
         hard_run_bytes=cap,
         endpoint_reservation_bytes={
-            endpoint: cap for endpoint in _class_endpoints(workload_class)
+            endpoint: cap for endpoint in class_spec.required_endpoints
         },
         sample_count=0,
         distinct_proxy_exits=0,
-        workload_class=workload_class,
+        workload_class=class_spec.name,
     )
 
 
@@ -638,7 +829,7 @@ def _result_evidence(
     results: Sequence[Any],
     raw_store: RawPayloadStore,
     *,
-    workload_class: str,
+    scope: str,
 ) -> tuple[int, int, int, dict[str, dict[str, int]]]:
     if not specs or len(results) != len(specs):
         raise CanaryPolicyError("canary did not return every planned endpoint result")
@@ -647,16 +838,16 @@ def _result_evidence(
         raise CanaryPolicyError(
             "canary endpoint result set differs from the fixed plan"
         )
-    if workload_class in {EPL_MATCH_CLASS, WORLD_CUP_MATCH_CLASS}:
+    if scope == "match":
         strict_endpoints = frozenset(EVENT_PATHS)
-    elif workload_class in {EPL_PLAYER_CLASS, WORLD_CUP_PLAYER_CLASS}:
+    elif scope == "player":
         # A player's tournament-season statistics can genuinely be unsupported,
         # but the profile is the required identity record for this class.
         strict_endpoints = frozenset({"player_profile"})
-    elif workload_class in {EPL_SEASON_CLASS, WORLD_CUP_SEASON_CLASS}:
+    elif scope == "season":
         strict_endpoints = frozenset({"schedule_last", "schedule_next"})
     else:
-        strict_endpoints = frozenset()
+        raise CanaryPolicyError(f"unsupported workload scope {scope!r}")
     accepted_required = {
         ManifestStatus.SUCCESS,
         ManifestStatus.LEGITIMATE_EMPTY,
@@ -709,6 +900,8 @@ def _sample(
     *,
     run_id: str,
     mode: str,
+    class_spec: ClassSpec,
+    target: CollectionTarget,
     cohort: CanaryCohort,
     cap: int,
     traffic: Mapping[str, Any],
@@ -720,18 +913,17 @@ def _sample(
     profile_success: int,
     endpoint_status_counts: Mapping[str, Mapping[str, int]],
     proxy_exit_hash: Optional[str],
-    workload_class: str,
     season_plan_complete: Optional[bool] = None,
 ) -> dict[str, Any]:
     live = mode in {"cold", "single_endpoint_resume"}
     fingerprint = runtime_fingerprint()
     return {
         "run_id": run_id,
-        "workload_class": workload_class,
-        "source_tournament_id": _class_tournament_id(workload_class),
-        "units": _class_units(workload_class),
+        "workload_class": class_spec.name,
+        "source_tournament_id": target.source_tournament_id,
+        "units": class_spec.max_units,
         "budget_eligible": mode == "cold",
-        "cohort": _class_cohort_name(workload_class),
+        "cohort": target.cohort_name,
         "mode": mode,
         "proxy_exit_hash": proxy_exit_hash,
         "total_provider_bytes": int(traffic.get("provider_total_bytes", 0)),
@@ -764,17 +956,6 @@ def _sample(
     }
 
 
-def _class_cohort_name(workload_class: str) -> str:
-    return {
-        EPL_MATCH_CLASS: "fixed_epl_25_matches",
-        EPL_PLAYER_CLASS: "fixed_epl_50_players",
-        WORLD_CUP_MATCH_CLASS: "fixed_world_cup_25_matches",
-        WORLD_CUP_PLAYER_CLASS: "fixed_world_cup_50_players",
-        EPL_SEASON_CLASS: "enabled_epl_2526_shape",
-        WORLD_CUP_SEASON_CLASS: "enabled_world_cup_2026_shape",
-    }.get(workload_class) or ""
-
-
 def _zero_network_traffic(engine: SofaScoreCaptureEngine) -> dict[str, Any]:
     traffic = engine.metrics.snapshot()
     traffic.update(
@@ -789,21 +970,29 @@ def _zero_network_traffic(engine: SofaScoreCaptureEngine) -> dict[str, Any]:
 
 
 def execute_cold_run(
-    cohort: CanaryCohort,
+    class_spec: ClassSpec,
+    target: CollectionTarget,
     *,
     experimental_cap_bytes: int,
     root: Path,
-    workload_class: str = MATCH_WORKLOAD_CLASS,
 ) -> ColdRunState:
     cap = _positive_int(experimental_cap_bytes, "experimental canary cap")
-    if workload_class not in REQUIRED_WORKLOAD_CLASSES:
-        raise CanaryPolicyError(f"unsupported workload class {workload_class!r}")
-    run_id = f"canary-{workload_class}-cold-{uuid.uuid4().hex}"
+    if CLASS_MANIFEST.spec(class_spec.name) != class_spec:
+        raise CanaryPolicyError(
+            f"workload class {class_spec.name!r} is not declared by the manifest"
+        )
+    if class_spec.target_for(target.source_tournament_id) != target:
+        raise CanaryPolicyError(
+            f"workload class {class_spec.name!r} has another collection target for "
+            f"tournament {target.source_tournament_id}"
+        )
+    cohort = load_target_cohort(target)
+    run_id = f"canary-{class_spec.name}-cold-{uuid.uuid4().hex}"
     raw_store = CountingRawPayloadStore(fs.LocalFileSystem(), str(root / "raw"))
     manifest_store = JsonFileManifestStore(root / "manifest.json")
     budget = SharedBudgetLedger(
         root / "experimental-budget-ledger.json",
-        _experimental_policy(cap, cohort, workload_class),
+        _experimental_policy(cap, class_spec),
     )
     engine = _engine(
         raw_store=raw_store,
@@ -813,28 +1002,25 @@ def execute_cold_run(
     )
     holder: list[RecordingCanaryTransport] = []
     with _canary_environment(cap):
-        if workload_class in {
-            EPL_MATCH_CLASS,
-            EPL_PLAYER_CLASS,
-            WORLD_CUP_MATCH_CLASS,
-            WORLD_CUP_PLAYER_CLASS,
-        }:
-            specs = _class_specs(cohort, workload_class)
+        if class_spec.scope in {"match", "player"}:
+            specs = _class_specs(class_spec, cohort)
             results, traffic = capture_live_specs(
                 SimpleNamespace(engine=engine),
                 specs,
-                canonical_url=canonical_anchor(workload_class),
-                scope=f"{EXPECTED_COMPETITION}:{EXPECTED_SEASON}:{workload_class}",
-                entity=workload_class,
+                canonical_url=target.canonical_url,
+                scope=(
+                    f"{cohort.canonical_competition}:{cohort.canonical_season}:"
+                    f"{class_spec.name}"
+                ),
+                entity=class_spec.name,
                 transport_factory=_transport_factory(engine, cap=cap, holder=holder),
             )
         else:
-            if workload_class == EPL_SEASON_CLASS:
-                tournament_id, season_id = 17, 76986
-                canonical_url = canonical_anchor(workload_class)
-            else:
-                tournament_id, season_id = 16, 58210
-                canonical_url = canonical_anchor(workload_class)
+            tournament_id = target.source_tournament_id
+            season_id = target.representative_season_id
+            max_pages = int(
+                class_spec.shape["schedule_page_chain"]["max_pages_per_direction"]
+            )
 
             def planner():
                 return plan_season_partition(
@@ -842,17 +1028,17 @@ def execute_cold_run(
                     manifest_store,
                     source_tournament_id=tournament_id,
                     source_season_id=season_id,
-                    freshness_key=f"canary-{workload_class}",
+                    freshness_key=f"canary-{class_spec.name}-{tournament_id}",
                     event_freshness_key="final",
                     paid_proxy=True,
-                    max_pages=50,
+                    max_pages=max_pages,
                 )
 
             results, final_plan, traffic = capture_live_dynamic_specs(
                 SimpleNamespace(engine=engine),
                 planner,
-                canonical_url=canonical_url,
-                scope=workload_class,
+                canonical_url=target.canonical_url,
+                scope=class_spec.name,
                 entity="season_capture",
                 transport_factory=_transport_factory(engine, cap=cap, holder=holder),
             )
@@ -861,16 +1047,18 @@ def execute_cold_run(
         raise CanaryPolicyError("cold run did not create exactly one lease transport")
     endpoint_bytes, request_bytes = _provider_maps(holder[0].request_observations)
     season_plan_complete: Optional[bool] = None
-    if workload_class in {EPL_SEASON_CLASS, WORLD_CUP_SEASON_CLASS}:
+    if class_spec.scope == "season":
         _require_complete_season_plan(final_plan)
         season_plan_complete = True
     raw_count, event_success, profile_success, status_counts = _result_evidence(
-        specs, results, raw_store, workload_class=workload_class
+        specs, results, raw_store, scope=class_spec.scope
     )
     raw_writes = sum(raw_store.write_counts.values())
     sample = _sample(
         run_id=run_id,
         mode="cold",
+        class_spec=class_spec,
+        target=target,
         cohort=cohort,
         cap=cap,
         traffic=traffic,
@@ -882,12 +1070,13 @@ def execute_cold_run(
         profile_success=profile_success,
         endpoint_status_counts=status_counts,
         proxy_exit_hash=traffic.get("proxy_exit_hash"),
-        workload_class=workload_class,
         season_plan_complete=season_plan_complete,
     )
     validate_sample(sample, cohort=cohort, cap=cap)
     return ColdRunState(
         run_id=run_id,
+        class_spec=class_spec,
+        target=target,
         cohort=cohort,
         experimental_cap_bytes=cap,
         specs=specs,
@@ -896,7 +1085,6 @@ def execute_cold_run(
         results=tuple(results),
         sample=sample,
         root=root,
-        workload_class=workload_class,
     )
 
 
@@ -914,11 +1102,13 @@ def execute_no_op(state: ColdRunState) -> dict[str, Any]:
         state.specs,
         results,
         state.raw_store,
-        workload_class=state.workload_class,
+        scope=state.class_spec.scope,
     )
     sample = _sample(
         run_id=run_id,
         mode="no_op",
+        class_spec=state.class_spec,
+        target=state.target,
         cohort=state.cohort,
         cap=state.experimental_cap_bytes,
         traffic=traffic,
@@ -930,7 +1120,6 @@ def execute_no_op(state: ColdRunState) -> dict[str, Any]:
         profile_success=profile_success,
         endpoint_status_counts=status_counts,
         proxy_exit_hash=None,
-        workload_class=state.workload_class,
     )
     validate_sample(sample, cohort=state.cohort, cap=state.experimental_cap_bytes)
     return sample
@@ -950,11 +1139,13 @@ def execute_offline_replay(state: ColdRunState) -> dict[str, Any]:
         state.specs,
         results,
         state.raw_store,
-        workload_class=state.workload_class,
+        scope=state.class_spec.scope,
     )
     sample = _sample(
         run_id=run_id,
         mode="offline_replay",
+        class_spec=state.class_spec,
+        target=state.target,
         cohort=state.cohort,
         cap=state.experimental_cap_bytes,
         traffic=traffic,
@@ -966,7 +1157,6 @@ def execute_offline_replay(state: ColdRunState) -> dict[str, Any]:
         profile_success=profile_success,
         endpoint_status_counts=status_counts,
         proxy_exit_hash=None,
-        workload_class=state.workload_class,
     )
     validate_sample(sample, cohort=state.cohort, cap=state.experimental_cap_bytes)
     return sample
@@ -1002,7 +1192,7 @@ def execute_single_endpoint_resume(state: ColdRunState) -> dict[str, Any]:
         (
             spec
             for spec in state.specs
-            if state.workload_class in {EPL_MATCH_CLASS, WORLD_CUP_MATCH_CLASS}
+            if state.class_spec.scope == "match"
             and spec.key.target_id == state.cohort.match_ids[0]
             and spec.key.endpoint == "incidents"
         ),
@@ -1017,11 +1207,7 @@ def execute_single_endpoint_resume(state: ColdRunState) -> dict[str, Any]:
     manifest = InMemoryManifestStore(existing_records)
     budget = SharedBudgetLedger(
         resume_root / "experimental-budget-ledger.json",
-        _experimental_policy(
-            state.experimental_cap_bytes,
-            state.cohort,
-            state.workload_class,
-        ),
+        _experimental_policy(state.experimental_cap_bytes, state.class_spec),
     )
     engine = _engine(
         raw_store=resume_raw,
@@ -1034,8 +1220,11 @@ def execute_single_endpoint_resume(state: ColdRunState) -> dict[str, Any]:
         results, traffic = capture_live_specs(
             SimpleNamespace(engine=engine),
             state.specs,
-            canonical_url=canonical_anchor(state.workload_class),
-            scope=f"{EXPECTED_COMPETITION}:{EXPECTED_SEASON}:resume-canary",
+            canonical_url=state.target.canonical_url,
+            scope=(
+                f"{state.cohort.canonical_competition}:"
+                f"{state.cohort.canonical_season}:resume-canary"
+            ),
             entity="single_endpoint_resume",
             transport_factory=_transport_factory(
                 engine,
@@ -1050,11 +1239,13 @@ def execute_single_endpoint_resume(state: ColdRunState) -> dict[str, Any]:
         state.specs,
         results,
         resume_raw,
-        workload_class=state.workload_class,
+        scope=state.class_spec.scope,
     )
     sample = _sample(
         run_id=run_id,
         mode="single_endpoint_resume",
+        class_spec=state.class_spec,
+        target=state.target,
         cohort=state.cohort,
         cap=state.experimental_cap_bytes,
         traffic=traffic,
@@ -1066,7 +1257,6 @@ def execute_single_endpoint_resume(state: ColdRunState) -> dict[str, Any]:
         profile_success=profile_success,
         endpoint_status_counts=status_counts,
         proxy_exit_hash=traffic.get("proxy_exit_hash"),
-        workload_class=state.workload_class,
     )
     validate_sample(sample, cohort=state.cohort, cap=state.experimental_cap_bytes)
     return sample
@@ -1088,7 +1278,7 @@ def _finite_number(value: object) -> bool:
 def _validate_endpoint_status_evidence(
     evidence: Mapping[str, Any],
     *,
-    workload_class: str,
+    scope: str,
     planned: int,
 ) -> None:
     raw_counts = evidence.get("endpoint_status_counts")
@@ -1118,10 +1308,10 @@ def _validate_endpoint_status_evidence(
     if sum(sum(counts.values()) for counts in normalized.values()) != planned:
         raise CanaryPolicyError("sample endpoint status evidence is incomplete")
 
-    if workload_class in {EPL_MATCH_CLASS, WORLD_CUP_MATCH_CLASS}:
+    if scope == "match":
         expected = {endpoint: EXPECTED_MATCHES for endpoint in EVENT_PATHS}
         strict = set(EVENT_PATHS)
-    elif workload_class in {EPL_PLAYER_CLASS, WORLD_CUP_PLAYER_CLASS}:
+    elif scope == "player":
         expected = {endpoint: EXPECTED_PLAYERS for endpoint in PLAYER_PATHS}
         strict = {"player_profile"}
     else:
@@ -1180,17 +1370,22 @@ def validate_sample(
     workload_class = str(sample.get("workload_class") or "")
     if workload_class not in REQUIRED_WORKLOAD_CLASSES:
         raise CanaryPolicyError("sample has an unknown workload_class")
-    expected_tournament_id = _class_tournament_id(workload_class)
-    if (
-        sample.get("source_tournament_id") != expected_tournament_id
-        or cohort.source_tournament_id != expected_tournament_id
-    ):
+    class_spec = CLASS_MANIFEST.spec(workload_class)
+    tournament_id = sample.get("source_tournament_id")
+    try:
+        target = class_spec.target_for(tournament_id)
+    except CanaryPolicyError as exc:
         raise CanaryPolicyError(
-            "sample source tournament does not match its workload class"
+            "sample source tournament is not a measured target of its "
+            "workload class"
+        ) from exc
+    if cohort.source_tournament_id != target.source_tournament_id:
+        raise CanaryPolicyError(
+            "sample source tournament does not match its cohort"
         )
-    if sample.get("cohort") != _class_cohort_name(workload_class):
-        raise CanaryPolicyError("sample cohort does not match its workload class")
-    if sample.get("units") != _class_units(workload_class):
+    if sample.get("cohort") != target.cohort_name:
+        raise CanaryPolicyError("sample cohort does not match its collection target")
+    if sample.get("units") != class_spec.max_units:
         raise CanaryPolicyError("sample units do not match the full measured class")
     if not str(sample.get("run_id") or "").strip():
         raise CanaryPolicyError("sample run_id is empty")
@@ -1260,17 +1455,17 @@ def validate_sample(
         raise CanaryPolicyError("sample does not retain every planned raw payload")
     _validate_endpoint_status_evidence(
         evidence,
-        workload_class=workload_class,
+        scope=class_spec.scope,
         planned=planned,
     )
 
     if mode == "cold":
-        if workload_class in {EPL_MATCH_CLASS, WORLD_CUP_MATCH_CLASS}:
+        if class_spec.scope == "match":
             expected_request_counts = {
                 endpoint: EXPECTED_MATCHES for endpoint in EVENT_PATHS
             }
             expected_events, expected_profiles = EXPECTED_MATCHES, 0
-        elif workload_class in {EPL_PLAYER_CLASS, WORLD_CUP_PLAYER_CLASS}:
+        elif class_spec.scope == "player":
             expected_request_counts = {
                 endpoint: EXPECTED_PLAYERS for endpoint in PLAYER_PATHS
             }
@@ -1278,7 +1473,7 @@ def validate_sample(
         else:
             expected_request_counts = None
             expected_events, expected_profiles = 0, 0
-        if workload_class in {EPL_SEASON_CLASS, WORLD_CUP_SEASON_CLASS}:
+        if class_spec.scope == "season":
             # Dynamic referee requests exist only when schedule payloads expose
             # referee IDs.  Require every actually planned endpoint and every
             # static season endpoint; do not invent a network request merely
@@ -1289,10 +1484,10 @@ def validate_sample(
             exact_shape = (
                 set(observations) == status_endpoints
                 and set(SEASON_STATIC_ENDPOINTS) <= status_endpoints
-                and status_endpoints <= set(_class_endpoints(workload_class))
+                and status_endpoints <= set(class_spec.required_endpoints)
             )
         else:
-            exact_shape = set(observations) == set(_class_endpoints(workload_class))
+            exact_shape = set(observations) == set(class_spec.required_endpoints)
         if expected_request_counts is None:
             exact_request_count = all(
                 values and all(value > 0 for value in values)
@@ -1310,7 +1505,7 @@ def validate_sample(
             or evidence.get("successful_event_bases") != expected_events
             or evidence.get("successful_player_profiles") != expected_profiles
             or (
-                workload_class in {EPL_SEASON_CLASS, WORLD_CUP_SEASON_CLASS}
+                class_spec.scope == "season"
                 and evidence.get("season_plan_complete") is not True
             )
             or not _is_hash(sample.get("proxy_exit_hash"))
@@ -1374,6 +1569,49 @@ def validate_sample(
         )
 
 
+def _manifest_workload_classes() -> dict[str, dict[str, Any]]:
+    """Materialize the declared classes; the manifest is the only source."""
+
+    cohorts: dict[Path, CanaryCohort] = {}
+    workload_classes: dict[str, dict[str, Any]] = {}
+    for name, class_spec in CLASS_MANIFEST.classes.items():
+        class_cohorts: dict[str, dict[str, str]] = {}
+        representative_season_ids: dict[str, int] = {}
+        blockers: list[str] = []
+        for target in class_spec.targets:
+            if target.cohort_path not in cohorts:
+                cohorts[target.cohort_path] = load_target_cohort(target)
+            cohort = cohorts[target.cohort_path]
+            tournament = str(target.source_tournament_id)
+            class_cohorts[tournament] = {
+                "name": target.cohort_name,
+                "cohort_sha256": cohort.digest,
+            }
+            if class_spec.scope == "season":
+                representative_season_ids[tournament] = int(
+                    target.representative_season_id
+                )
+            blocker = _target_blocker(class_spec, cohort)
+            if blocker:
+                blockers.append(f"tournament {tournament}: {blocker}")
+        entry: dict[str, Any] = {
+            "scope": class_spec.scope,
+            "max_units": class_spec.max_units,
+            "required_endpoints": list(class_spec.required_endpoints),
+            "shape": dict(class_spec.shape),
+            "shape_digest": class_spec.shape_digest,
+            "measured_tournament_ids": list(class_spec.measured_tournament_ids),
+            "cohorts": class_cohorts,
+            "collection_blocker": "; ".join(blockers),
+            "hard_task_bytes": None,
+            "samples": [],
+        }
+        if class_spec.scope == "season":
+            entry["representative_season_ids"] = representative_season_ids
+        workload_classes[name] = entry
+    return workload_classes
+
+
 def _artifact_template(cohort: CanaryCohort, cap: int) -> dict[str, Any]:
     rate = RATE_LIMITS["sofascore"]
     try:
@@ -1381,77 +1619,6 @@ def _artifact_template(cohort: CanaryCohort, cap: int) -> dict[str, Any]:
         historical = shipped.get("historical_observations", [])
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         historical = []
-    world_cup_cohort = load_fixed_cohort(DEFAULT_WORLD_CUP_COHORT_PATH)
-    season_endpoints = sorted(SEASON_ENDPOINTS)
-    workload_classes = {
-        WORLD_CUP_MATCH_CLASS: {
-            "scope": "match",
-            "source_tournament_id": 16,
-            "max_units": EXPECTED_MATCHES,
-            "cohort": _class_cohort_name(WORLD_CUP_MATCH_CLASS),
-            "required_endpoints": sorted(EVENT_PATHS),
-            "hard_task_bytes": None,
-            "samples": [],
-        },
-        EPL_MATCH_CLASS: {
-            "scope": "match",
-            "source_tournament_id": 17,
-            "max_units": EXPECTED_MATCHES,
-            "cohort": _class_cohort_name(EPL_MATCH_CLASS),
-            "required_endpoints": sorted(EVENT_PATHS),
-            "hard_task_bytes": None,
-            "samples": [],
-        },
-        WORLD_CUP_PLAYER_CLASS: {
-            "scope": "player",
-            "source_tournament_id": 16,
-            "max_units": EXPECTED_PLAYERS,
-            "cohort": _class_cohort_name(WORLD_CUP_PLAYER_CLASS),
-            "collection_blocker": (
-                ""
-                if len(world_cup_cohort.player_ids) == EXPECTED_PLAYERS
-                else str(
-                    world_cup_cohort.payload.get("player_collection_blocker") or ""
-                )
-            ),
-            "required_endpoints": sorted(PLAYER_PATHS),
-            "hard_task_bytes": None,
-            "samples": [],
-        },
-        EPL_PLAYER_CLASS: {
-            "scope": "player",
-            "source_tournament_id": 17,
-            "max_units": EXPECTED_PLAYERS,
-            "cohort": _class_cohort_name(EPL_PLAYER_CLASS),
-            "required_endpoints": sorted(PLAYER_PATHS),
-            "hard_task_bytes": None,
-            "samples": [],
-        },
-        WORLD_CUP_SEASON_CLASS: {
-            "scope": "season",
-            "source_tournament_id": 16,
-            "max_units": 1,
-            "cohort": _class_cohort_name(WORLD_CUP_SEASON_CLASS),
-            "representative_season_id": 58210,
-            "required_endpoints": season_endpoints,
-            "shape": dict(WORLD_CUP_SEASON_SHAPE),
-            "shape_digest": season_shape_digest(WORLD_CUP_SEASON_SHAPE),
-            "hard_task_bytes": None,
-            "samples": [],
-        },
-        EPL_SEASON_CLASS: {
-            "scope": "season",
-            "source_tournament_id": 17,
-            "max_units": 1,
-            "cohort": _class_cohort_name(EPL_SEASON_CLASS),
-            "representative_season_id": 76986,
-            "required_endpoints": season_endpoints,
-            "shape": dict(EPL_SEASON_SHAPE),
-            "shape_digest": season_shape_digest(EPL_SEASON_SHAPE),
-            "hard_task_bytes": None,
-            "samples": [],
-        },
-    }
     return {
         "schema_version": WORKLOAD_ARTIFACT_SCHEMA_VERSION,
         "source": "sofascore",
@@ -1463,6 +1630,7 @@ def _artifact_template(cohort: CanaryCohort, cap: int) -> dict[str, Any]:
         "experimental_hard_cap_bytes": cap,
         "bootstrap_authorizes_production": False,
         "cohort_sha256": cohort.digest,
+        "class_manifest_sha256": CLASS_MANIFEST.digest,
         "rate_limit_policy": {
             "source": "sofascore",
             "max_requests": rate.max_requests,
@@ -1472,11 +1640,14 @@ def _artifact_template(cohort: CanaryCohort, cap: int) -> dict[str, Any]:
         "requirements": {
             "minimum_distinct_proxy_exits_per_class": MIN_DISTINCT_PROXY_EXITS,
             "minimum_cold_samples_per_class": MIN_CANARY_RUNS,
+            "minimum_distinct_tournaments_for_transfer": (
+                MIN_MEASURED_TOURNAMENTS_FOR_TRANSFER
+            ),
             "required_workload_classes": list(REQUIRED_WORKLOAD_CLASSES),
             "required_benchmark_modes": sorted(BENCHMARK_ONLY_MODES),
         },
         "historical_observations": historical,
-        "workload_classes": workload_classes,
+        "workload_classes": _manifest_workload_classes(),
         "benchmark_samples": [],
         "verified": False,
         "verification_blocker": (
@@ -1566,6 +1737,7 @@ def bootstrap_artifact(
                 "experimental_hard_cap_bytes",
                 "bootstrap_authorizes_production",
                 "cohort_sha256",
+                "class_manifest_sha256",
                 "rate_limit_policy",
             ):
                 if name in payload and payload[name] != expected[name]:
@@ -1580,18 +1752,9 @@ def bootstrap_artifact(
             if not isinstance(classes, dict) or set(classes) != set(
                 expected["workload_classes"]
             ):
-                raise CanaryPolicyError("artifact workload classes do not match v2")
-            immutable_class_fields = (
-                "scope",
-                "source_tournament_id",
-                "max_units",
-                "cohort",
-                "collection_blocker",
-                "required_endpoints",
-                "representative_season_id",
-                "shape",
-                "shape_digest",
-            )
+                raise CanaryPolicyError(
+                    "artifact workload classes do not match the class manifest"
+                )
             for class_name, expected_class in expected["workload_classes"].items():
                 candidate = classes[class_name]
                 if not isinstance(candidate, dict) or not isinstance(
@@ -1602,7 +1765,7 @@ def bootstrap_artifact(
                     )
                 if any(
                     candidate.get(field) != expected_class.get(field)
-                    for field in immutable_class_fields
+                    for field in IMMUTABLE_CLASS_FIELDS
                 ):
                     raise CanaryPolicyError(
                         f"artifact class {class_name!r} shape changed"
@@ -1615,6 +1778,20 @@ def bootstrap_artifact(
             return payload
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _sample_cohort(
+    sample: Mapping[str, Any],
+    *,
+    cache: dict[Path, CanaryCohort],
+) -> CanaryCohort:
+    """Resolve a sample's frozen cohort from its own tournament provenance."""
+
+    class_spec = CLASS_MANIFEST.spec(str(sample.get("workload_class") or ""))
+    target = class_spec.target_for(sample.get("source_tournament_id"))
+    if target.cohort_path not in cache:
+        cache[target.cohort_path] = load_target_cohort(target)
+    return cache[target.cohort_path]
 
 
 def validate_artifact(
@@ -1637,40 +1814,32 @@ def validate_artifact(
         or payload.get("budget_derivation") != BUDGET_DERIVATION
         or payload.get("bootstrap_authorizes_production") is not False
         or payload.get("cohort_sha256") != cohort.digest
+        or payload.get("class_manifest_sha256") != CLASS_MANIFEST.digest
     ):
         raise CanaryPolicyError("canary artifact provenance is invalid")
     cap = _positive_int(
         payload.get("experimental_hard_cap_bytes"), "experimental canary cap"
     )
-    expected_rate = _artifact_template(cohort, cap)["rate_limit_policy"]
-    if payload.get("rate_limit_policy") != expected_rate:
+    expected = _artifact_template(cohort, cap)
+    if payload.get("rate_limit_policy") != expected["rate_limit_policy"]:
         raise CanaryPolicyError(
             "canary artifact does not pin the production rate limit"
         )
-    expected = _artifact_template(cohort, cap)
     classes = payload.get("workload_classes")
     if not isinstance(classes, dict) or set(classes) != set(REQUIRED_WORKLOAD_CLASSES):
         raise CanaryPolicyError("canary workload classes are incomplete")
     benchmark_samples = payload.get("benchmark_samples")
     if not isinstance(benchmark_samples, list):
         raise CanaryPolicyError("canary benchmark_samples must be an array")
+    cohorts: dict[Path, CanaryCohort] = {}
     run_ids: set[str] = set()
     for class_name in REQUIRED_WORKLOAD_CLASSES:
+        class_spec = CLASS_MANIFEST.spec(class_name)
         raw_class = classes[class_name]
         expected_class = expected["workload_classes"][class_name]
         if not isinstance(raw_class, dict):
             raise CanaryPolicyError(f"workload class {class_name!r} is malformed")
-        for field in (
-            "scope",
-            "source_tournament_id",
-            "max_units",
-            "cohort",
-            "collection_blocker",
-            "required_endpoints",
-            "representative_season_id",
-            "shape",
-            "shape_digest",
-        ):
+        for field in IMMUTABLE_CLASS_FIELDS:
             if raw_class.get(field) != expected_class.get(field):
                 raise CanaryPolicyError(
                     f"workload class {class_name!r} changed {field}"
@@ -1678,16 +1847,20 @@ def validate_artifact(
         samples = raw_class.get("samples")
         if not isinstance(samples, list):
             raise CanaryPolicyError(f"{class_name!r}.samples must be an array")
+        by_tournament = {
+            target.source_tournament_id: 0 for target in class_spec.targets
+        }
         for sample in samples:
             if not isinstance(sample, dict):
                 raise CanaryPolicyError("canary sample must be an object")
-            validate_sample(
-                sample,
-                cohort=_cohort_for_workload_class(cohort, class_name),
-                cap=cap,
-            )
             if sample.get("workload_class") != class_name:
                 raise CanaryPolicyError("sample is stored under the wrong class")
+            validate_sample(
+                sample,
+                cohort=_sample_cohort(sample, cache=cohorts),
+                cap=cap,
+            )
+            by_tournament[sample["source_tournament_id"]] += 1
             run_id = sample["run_id"]
             if run_id in run_ids:
                 raise CanaryPolicyError("canary run IDs must be globally unique")
@@ -1715,16 +1888,34 @@ def validate_artifact(
                     f"{class_name!r} needs at least "
                     f"{MIN_DISTINCT_PROXY_EXITS} distinct exit hashes"
                 )
+            # A shape is only evidence of a shape if every declared tournament
+            # carried its even share of the cold runs; one league must never
+            # dominate a class that is meant to generalize.  The floor is
+            # anchored on the fixed class minimum, never on ``len(samples)``:
+            # otherwise a class legitimately collected past the minimum (e.g. an
+            # ``extend`` that adds a second target to an already-full class)
+            # would raise the bar above what ``collect`` targeted and dead-lock.
+            floor = MIN_CANARY_RUNS // len(class_spec.targets)
+            for tournament_id, count in sorted(by_tournament.items()):
+                if count == 0:
+                    raise CanaryPolicyError(
+                        f"{class_name!r} has no cold sample for measured "
+                        f"tournament {tournament_id}"
+                    )
+                if count < floor:
+                    raise CanaryPolicyError(
+                        f"{class_name!r} cold samples are skewed: tournament "
+                        f"{tournament_id} has {count} of at least {floor}"
+                    )
     modes_by_class: dict[str, set[str]] = {
         name: set() for name in REQUIRED_WORKLOAD_CLASSES
     }
     for sample in benchmark_samples:
         if not isinstance(sample, dict):
             raise CanaryPolicyError("benchmark sample must be an object")
-        sample_class = str(sample.get("workload_class") or "")
         validate_sample(
             sample,
-            cohort=_cohort_for_workload_class(cohort, sample_class),
+            cohort=_sample_cohort(sample, cache=cohorts),
             cap=cap,
         )
         run_id = sample["run_id"]
@@ -1748,8 +1939,16 @@ def _artifact_summary(payload: Mapping[str, Any]) -> dict[str, Any]:
     class_summary = {}
     for name in REQUIRED_WORKLOAD_CLASSES:
         samples = classes.get(name, {}).get("samples", [])
+        by_tournament = {
+            str(target.source_tournament_id): 0
+            for target in CLASS_MANIFEST.spec(name).targets
+        }
+        for sample in samples:
+            tournament = str(sample.get("source_tournament_id"))
+            by_tournament[tournament] = by_tournament.get(tournament, 0) + 1
         class_summary[name] = {
             "cold_samples": len(samples),
+            "cold_samples_by_tournament": by_tournament,
             "distinct_exit_hashes": len(
                 {sample.get("proxy_exit_hash") for sample in samples}
             ),
@@ -1796,6 +1995,7 @@ def collect_canary(
 
     blocked_classes: dict[str, str] = {}
     for workload_class in REQUIRED_WORKLOAD_CLASSES:
+        class_spec = CLASS_MANIFEST.spec(workload_class)
         payload = _read_artifact(artifact)
         validate_artifact(payload, cohort=cohort, require_verifiable=False)
         raw_class = payload["workload_classes"][workload_class]
@@ -1806,25 +2006,41 @@ def collect_canary(
             # the operator and remains a hard failure in ``verify_artifact``.
             blocked_classes[workload_class] = blocker
             continue
+        # Every declared tournament must carry its even share of the cold runs,
+        # otherwise the class measures one league instead of one shape.  The
+        # floor uses the same fixed class minimum as ``verify_artifact`` and the
+        # production loader, so a completed collection always verifies.
+        floor = MIN_CANARY_RUNS // len(class_spec.targets)
         while True:
             payload = _read_artifact(artifact)
             validate_artifact(payload, cohort=cohort, require_verifiable=False)
             class_summary = _artifact_summary(payload)["workload_classes"][
                 workload_class
             ]
+            by_tournament = class_summary["cold_samples_by_tournament"]
             missing_modes = BENCHMARK_ONLY_MODES - set(class_summary["modes"])
-            enough_cold = class_summary["cold_samples"] >= target
+            enough_cold = class_summary["cold_samples"] >= target and all(
+                by_tournament[str(target_spec.source_tournament_id)] >= floor
+                for target_spec in class_spec.targets
+            )
             if enough_cold and not missing_modes:
                 break
+            next_target = min(
+                class_spec.targets,
+                key=lambda item: (
+                    by_tournament[str(item.source_tournament_id)],
+                    item.source_tournament_id,
+                ),
+            )
             with tempfile.TemporaryDirectory(
                 prefix=f"{workload_class}-",
                 dir=workspace_path,
             ) as directory:
                 state = execute_cold_run(
-                    _cohort_for_workload_class(cohort, workload_class),
+                    class_spec,
+                    next_target,
                     experimental_cap_bytes=cap,
                     root=Path(directory),
-                    workload_class=workload_class,
                 )
                 append_canary_sample(
                     artifact,
@@ -1928,6 +2144,98 @@ def verify_artifact(
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
+def extend_artifact(
+    path: os.PathLike[str] | str,
+    *,
+    destination: os.PathLike[str] | str,
+    experimental_cap_bytes: Optional[int] = None,
+    cohort_path: os.PathLike[str] | str = DEFAULT_COHORT_PATH,
+) -> dict[str, Any]:
+    """Open a new unverified candidate from a verified artifact.
+
+    A verified artifact is immutable, so a new tournament, a new class or extra
+    samples can only be measured in a fresh candidate.  Carrying the existing
+    cold samples over is honest evidence *only* while the runtime that produced
+    them is byte-for-byte the current one, so an identical runtime fingerprint
+    digest is the hard precondition; any drift forces a full re-measurement.
+    """
+
+    source_path = Path(path)
+    destination_path = Path(destination)
+    if destination_path == source_path:
+        raise CanaryPolicyError("extend must write a separate candidate artifact")
+    if destination_path.exists():
+        raise CanaryPolicyError(
+            f"extend destination already exists: {destination_path}"
+        )
+    source = _read_artifact(source_path)
+    if source.get("verified") is not True:
+        raise CanaryPolicyError(
+            "extend needs a verified artifact; keep collecting the candidate"
+        )
+    fingerprint = source.get("runtime_fingerprint")
+    if (
+        not isinstance(fingerprint, Mapping)
+        or fingerprint.get("digest") != runtime_fingerprint()["digest"]
+    ):
+        raise CanaryPolicyError(
+            "extend cannot carry samples across a changed runtime fingerprint"
+        )
+    cohort = load_fixed_cohort(cohort_path)
+    cap = _positive_int(
+        source.get("experimental_hard_cap_bytes")
+        if experimental_cap_bytes is None
+        else experimental_cap_bytes,
+        "experimental canary cap",
+    )
+    source_classes = source.get("workload_classes")
+    benchmarks = source.get("benchmark_samples")
+    if not isinstance(source_classes, Mapping) or not isinstance(benchmarks, list):
+        raise CanaryPolicyError("verified artifact is malformed")
+    payload = _artifact_template(cohort, cap)
+    carried: dict[str, int] = {}
+    for name, raw_class in payload["workload_classes"].items():
+        measured = set(CLASS_MANIFEST.spec(name).measured_tournament_ids)
+        previous = source_classes.get(name)
+        samples = previous.get("samples") if isinstance(previous, Mapping) else []
+        if not isinstance(samples, list):
+            raise CanaryPolicyError(f"{name!r}.samples must be an array")
+        kept = [
+            dict(sample)
+            for sample in samples
+            if isinstance(sample, Mapping)
+            and sample.get("source_tournament_id") in measured
+        ]
+        raw_class["samples"] = kept
+        raw_class["hard_task_bytes"] = max(
+            (sample["total_provider_bytes"] for sample in kept),
+            default=None,
+        )
+        carried[name] = len(kept)
+    payload["benchmark_samples"] = [
+        dict(sample)
+        for sample in benchmarks
+        if isinstance(sample, Mapping)
+        and sample.get("workload_class") in payload["workload_classes"]
+        and sample.get("source_tournament_id")
+        in set(
+            CLASS_MANIFEST.spec(sample["workload_class"]).measured_tournament_ids
+        )
+    ]
+    payload["verified"] = False
+    validate_artifact(payload, cohort=cohort, require_verifiable=False)
+    _write_atomic(destination_path, payload)
+    return {
+        "status": "extended_unverified",
+        "artifact": str(destination_path),
+        "source_artifact": str(source_path),
+        "experimental_cap_bytes": cap,
+        "carried_cold_samples": carried,
+        "verified": False,
+        "production_authorized": False,
+    }
+
+
 def _safe_error(exc: BaseException) -> str:
     value = redact_sensitive(exc)
     return _IPV4_RE.sub("[REDACTED_IP]", value)
@@ -1963,6 +2271,21 @@ def _parser() -> argparse.ArgumentParser:
             command.add_argument("--workspace", default=str(DEFAULT_WORKSPACE))
     verify = subparsers.add_parser("verify")
     verify.add_argument("--artifact", default=str(DEFAULT_ARTIFACT_PATH))
+    extend = subparsers.add_parser(
+        "extend",
+        help=(
+            "open a new unverified candidate from a verified artifact, keeping "
+            "its cold samples (requires an identical runtime fingerprint)"
+        ),
+    )
+    extend.add_argument("--artifact", default=str(DEFAULT_ARTIFACT_PATH))
+    extend.add_argument("--destination", required=True)
+    extend.add_argument(
+        "--experimental-cap-bytes",
+        default=None,
+        type=_arg_positive,
+        help="optional new cap; defaults to the verified artifact's cap",
+    )
     return parser
 
 
@@ -1989,6 +2312,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 experimental_cap_bytes=args.experimental_cap_bytes,
                 target_cold_runs=args.target_cold_runs,
                 workspace=args.workspace,
+            )
+        elif args.command == "extend":
+            result = extend_artifact(
+                args.artifact,
+                destination=args.destination,
+                experimental_cap_bytes=args.experimental_cap_bytes,
             )
         else:
             result = verify_artifact(args.artifact)

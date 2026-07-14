@@ -10,7 +10,12 @@ from pathlib import Path
 import pytest
 
 from scrapers.sofascore.runtime_fingerprint import runtime_fingerprint
-from scrapers.sofascore.workload_plan import MATCH_WORKLOAD_CLASS
+from scrapers.sofascore.workload_plan import (
+    WORKLOAD_ARTIFACT_SCHEMA_VERSION,
+    match_workload_class,
+    production_match_shape,
+    workload_shape_digest,
+)
 from scripts.proxy_filter.budget import (
     BudgetAccountingError,
     ProductionBudgetUnavailable,
@@ -19,12 +24,20 @@ from scripts.proxy_filter.budget import (
     anonymize_proxy_exit,
     append_canary_sample,
     load_verified_policy,
-    _validate_v2_sample_status_evidence,
+    _validate_v3_sample_status_evidence,
 )
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SHIPPED_ARTIFACT = REPO_ROOT / "configs" / "sofascore" / "proxy_budget_canary.json"
+
+# A v3 class is named after its measured shape, never after a tournament: the
+# fixtures below reproduce exactly the class this deployment signs for matches.
+MATCH_SHAPE = production_match_shape()
+MATCH_SHAPE_DIGEST = workload_shape_digest(MATCH_SHAPE)
+MATCH_WORKLOAD_CLASS = match_workload_class()
+MATCH_ENDPOINTS = tuple(MATCH_SHAPE["required_endpoints"])
+MEASURED_TOURNAMENT_ID = 17
 
 
 def test_verified_policy_rejects_not_supported_required_season_schedule():
@@ -46,17 +59,31 @@ def test_verified_policy_rejects_not_supported_required_season_schedule():
     }
 
     with pytest.raises(ProductionBudgetUnavailable, match="not_supported"):
-        _validate_v2_sample_status_evidence("season_t17", raw_class, sample)
+        _validate_v3_sample_status_evidence(
+            "season_4a1738f5b7504ec2", raw_class, sample
+        )
+
+
+def _request_map(index: int) -> dict[str, list[int]]:
+    # ``event`` carries the cold browser warm-up in the first sample, so the
+    # class maximum is driven by one observation, exactly as in production.
+    sizes = {
+        "event": [1_000 if index == 0 else 100 + index, 10],
+        "incidents": [50 + index],
+        "lineups": [200 + index],
+        "shotmap": [30 + index],
+        "statistics": [40 + index],
+    }
+    return {endpoint: sizes[endpoint] for endpoint in MATCH_ENDPOINTS}
 
 
 def _sample(index: int, *, exits: int = 5) -> dict:
-    event = [1_000 if index == 0 else 100 + index, 10]
-    lineups = [200 + index]
-    request_map = {"event": event, "lineups": lineups}
+    request_map = _request_map(index)
+    requests = sum(len(values) for values in request_map.values())
     return {
         "run_id": f"cold-{index}",
         "workload_class": MATCH_WORKLOAD_CLASS,
-        "source_tournament_id": 17,
+        "source_tournament_id": MEASURED_TOURNAMENT_ID,
         "mode": "cold",
         "budget_eligible": True,
         "units": 25,
@@ -70,11 +97,11 @@ def _sample(index: int, *, exits: int = 5) -> dict:
         "endpoint_request_provider_bytes": request_map,
         "evidence": {
             "runtime_fingerprint_digest": runtime_fingerprint()["digest"],
-            "planned_endpoints": 3,
-            "raw_payload_count": 3,
+            "planned_endpoints": requests,
+            "raw_payload_count": requests,
             "endpoint_status_counts": {
-                "event": {"success": 2},
-                "lineups": {"success": 1},
+                endpoint: {"success": len(values)}
+                for endpoint, values in request_map.items()
             },
         },
     }
@@ -83,7 +110,7 @@ def _sample(index: int, *, exits: int = 5) -> dict:
 def _payload(*, runs: int = 20, exits: int = 5, verified: bool = True) -> dict:
     samples = [_sample(index, exits=exits) for index in range(runs)]
     return {
-        "schema_version": 2,
+        "schema_version": WORKLOAD_ARTIFACT_SCHEMA_VERSION,
         "source": "sofascore",
         "meter": "proxy_filter_provider_path_v2",
         "budget_derivation": "max_observed_task_bytes_per_workload_class_v2",
@@ -92,9 +119,11 @@ def _payload(*, runs: int = 20, exits: int = 5, verified: bool = True) -> dict:
         "workload_classes": {
             MATCH_WORKLOAD_CLASS: {
                 "scope": "match",
-                "source_tournament_id": 17,
                 "max_units": 25,
-                "required_endpoints": ["event", "lineups"],
+                "required_endpoints": list(MATCH_ENDPOINTS),
+                "shape": dict(MATCH_SHAPE),
+                "shape_digest": MATCH_SHAPE_DIGEST,
+                "measured_tournament_ids": [MEASURED_TOURNAMENT_ID],
                 "hard_task_bytes": max(
                     sample["total_provider_bytes"] for sample in samples
                 ) if samples else None,
@@ -111,15 +140,20 @@ def _artifact(path: Path, **kwargs) -> Path:
 
 
 def test_shipped_historical_observations_do_not_authorize_paid_capture():
-    with pytest.raises(ProductionBudgetUnavailable, match="not verified"):
+    # The shipped artifact is fail-closed today because it is a superseded v2
+    # candidate; after the v3 re-bootstrap it stays fail-closed as an unverified
+    # one.  Either way it must never authorize paid capture.
+    with pytest.raises(
+        ProductionBudgetUnavailable, match="not verified|re-bootstrap v3"
+    ):
         load_verified_policy(
             SHIPPED_ARTIFACT,
             workload_class=MATCH_WORKLOAD_CLASS,
         )
 
 
-def test_v2_requires_explicit_class_and_v1_is_fail_closed(tmp_path):
-    artifact = _artifact(tmp_path / "v2.json")
+def test_v3_requires_explicit_class_and_v1_is_fail_closed(tmp_path):
+    artifact = _artifact(tmp_path / "v3.json")
     with pytest.raises(ProductionBudgetUnavailable, match="explicit workload_class"):
         load_verified_policy(artifact)
 
@@ -127,6 +161,29 @@ def test_v2_requires_explicit_class_and_v1_is_fail_closed(tmp_path):
     legacy.write_text(json.dumps({"schema_version": 1, "verified": True}))
     with pytest.raises(ProductionBudgetUnavailable, match="cannot authorize production"):
         load_verified_policy(legacy)
+
+
+def test_v2_artifact_cannot_authorize_production(tmp_path):
+    # v2 classes are keyed by tournament, so their samples are not evidence for
+    # a shape; no flag may re-interpret them as a production budget.
+    payload = _payload()
+    payload["schema_version"] = 2
+    payload["workload_classes"]["match_batch_25_t17"] = payload[
+        "workload_classes"
+    ].pop(MATCH_WORKLOAD_CLASS)
+    artifact = tmp_path / "v2.json"
+    artifact.write_text(json.dumps(payload), encoding="utf-8")
+
+    for kwargs in (
+        {"workload_class": "match_batch_25_t17"},
+        {"workload_class": MATCH_WORKLOAD_CLASS},
+        {},
+        {"allow_legacy_v1": True},
+    ):
+        with pytest.raises(
+            ProductionBudgetUnavailable, match="re-bootstrap v3"
+        ):
+            load_verified_policy(artifact, **kwargs)
 
 
 @pytest.mark.parametrize(
@@ -151,9 +208,11 @@ def test_class_adapter_allows_any_endpoint_to_spend_measured_task_remainder(
         workload_class=MATCH_WORKLOAD_CLASS,
     )
 
-    assert policy.hard_run_bytes == 1_210
-    assert policy.reservation_for("event") == policy.hard_run_bytes
-    assert policy.reservation_for("lineups") == policy.hard_run_bytes
+    # The maximum observed cold task: the warm-up sample (1_000 + 10 event bytes
+    # plus 50 + 200 + 30 + 40 for the remaining endpoints).
+    assert policy.hard_run_bytes == 1_330
+    for endpoint in MATCH_ENDPOINTS:
+        assert policy.reservation_for(endpoint) == policy.hard_run_bytes
     assert policy.sample_count == 20
     assert policy.distinct_proxy_exits == 5
     assert policy.workload_class == MATCH_WORKLOAD_CLASS

@@ -21,16 +21,83 @@ keys; its ledger and lock files are mode `0600` and atomically fsynced.
   isolated canary lease. The proxy meters its bytes but never inspects or stores
   its response body.
 
-Canary mode measures six immutable workload classes: tournament-scoped
-25-match and 50-player batches for each enabled source tournament, plus the
-canonical enabled EPL and World Cup season shapes. For example,
-`match_batch_25_t17` can authorize EPL only; it cannot authorize World Cup
-(`match_batch_25_t16`). Every class needs 20 complete cold runs over at least
-five hashed exits. After review, those samples become a verified versioned
-artifact; only then can a signed task allocation obtain a non-zero budget for
-its exact source-tournament class.
+## Workload classes (schema v3)
 
-The artifact also stores a deterministic runtime fingerprint over the capture,
+A workload class is one **(scope, byte-driving shape)** pair, never a league.
+The shape is a canonical JSON object of the inputs that actually drive provider
+bytes, and the class name embeds the first 16 hex characters of its SHA-256
+`shape_digest`:
+
+- `match_batch_25_<digest16>` — `production_match_shape()`: batch size 25 and
+  the sorted required event endpoints. Code constants, so identical for every
+  league.
+- `player_batch_50_<digest16>` — `production_player_shape()`: batch size 50 and
+  the sorted required player endpoints. Likewise league-independent.
+- `season_<digest16>` — `production_season_shape(season_format=…,
+  team_count_band=…, max_pages_per_direction=…)`: the season format, the coarse
+  team-count band (`team_count_band_v1` grid `8_15 / 16_20 / 21_32 / 33_48`),
+  the bounded schedule page chain and the static/dynamic endpoint families. It
+  deliberately carries **no** tournament ID: two leagues of the same format and
+  band drive the same bytes.
+
+The current runtime therefore ships four classes: one match, one player, and two
+season shapes (EPL `split_year` + `16_20`, World Cup `calendar_year` + `33_48`).
+The plan builder derives a league's class from its shape, so a class is matched
+by full 64-hex digest equality — a near-miss shape simply has no class and fails
+closed.
+
+### Provenance and the transfer invariant
+
+Identity is replaced by evidence. Each class records
+`measured_tournament_ids` — the tournaments its cold samples actually came from —
+and every sample keeps its own `source_tournament_id`. The loader requires that
+the sample tournaments equal `measured_tournament_ids` exactly, in both
+directions.
+
+A class authorizes an **unmeasured** tournament only when
+`len(measured_tournament_ids) >= 2`
+(`minimum_distinct_tournaments_for_transfer`). One league agreeing with itself
+is not evidence that a shape generalizes; two independent leagues driving the
+same bytes is. A tournament that is itself in `measured_tournament_ids` is always
+authorized. So the merged match/player classes (measured on World Cup + EPL)
+authorize any new league immediately, while a season class measured on a single
+league authorizes only that league until a second league of the same shape is
+collected.
+
+### Class declaration lives outside the fingerprint
+
+Which classes exist, and which tournaments each is measured on, is declared by
+`configs/sofascore/proxy_canary_classes.json` alone. The collector recomputes
+every class name and `shape_digest` from the production code shapes, so a class
+can never be re-pointed at another league by editing that config; the manifest
+only chooses shape parameters and collection targets (cohort, slug,
+representative season). The artifact pins the manifest it was built from via the
+top-level `class_manifest_sha256`.
+
+The manifest and the cohort configs are deliberately **not** part of the runtime
+fingerprint (a regression test asserts this): onboarding a league or adding a
+collection target must not invalidate already-collected byte evidence, because
+neither changes a single metered byte. The code shapes that do drive bytes are
+inside the fingerprint, so any real change to them rotates it.
+
+### Collection and verification
+
+Every class needs 20 complete cold runs over at least five hashed exits. Cold
+runs are spread over the class' collection targets **round-robin**, and `verify`
+rejects a class whose samples fall below the **even floor**
+(`len(samples) // len(targets)` per target) or that leaves any target with no
+samples at all — a class that generalizes must be evidence of a shape, not of
+one league that happened to be cheap. After review those samples become a
+verified versioned artifact; only then can a signed task allocation obtain a
+non-zero budget for its class.
+
+A verified artifact is immutable. A new tournament, a new class or extra samples
+are collected in a fresh candidate opened by the `extend` subcommand, which
+carries the existing cold samples over **only** while the runtime fingerprint
+digest is byte-for-byte identical; any drift forces a full re-measurement and
+leaves `verified=false`.
+
+The artifact also stores that deterministic runtime fingerprint over the capture,
 filter, runner, DQ and endpoint-contract code, proxy blocklist, Dockerfile and
 exact browser dependency pins. Both Airflow and `proxy_filter` recompute it.
 Changing any metered runtime input makes the old evidence unusable; samples are
@@ -42,17 +109,16 @@ The artifact field `budget_derivation` is
 `max_observed_task_bytes_per_workload_class_v2`:
 
 - hard task bytes = maximum measured `total_provider_bytes` among eligible cold
-  runs for that one workload class;
+  runs for that one workload class, across every tournament it is measured on;
 - endpoint reservation = the largest individual request observed for that
   endpoint inside the same class;
-- a v2 loader requires the explicit class and never combines class maxima into
+- the loader requires the explicit class and never combines class maxima into
   one free-form DagRun cap;
-- match and player classes are always full batches of 25 and 50 for one source
-  tournament; smaller
+- match and player classes are always full batches of 25 and 50; smaller
   production batches use the same measured ceiling, never an unmeasured linear
   estimate;
-- the two season classes use the exact canonical `production_season_shape`
-  digests and bounded dynamic schedule/squad/referee endpoint families;
+- the season classes use the exact canonical `production_season_shape` digests
+  and bounded dynamic schedule/squad/referee endpoint families;
 - benchmark-only no-op/replay/resume samples never affect either maximum;
 - no multiplier, handwritten headroom or percentile truncation is added.
 
@@ -68,7 +134,11 @@ before another provider read.
 
 Schema-v1 artifacts are migration input only. They lack task classes and are
 rejected by the production loader unless an explicit offline compatibility flag
-is used. Schema v2 without a selected workload class also fails closed.
+is used. Schema-v2 artifacts are rejected outright ("v2 artifact cannot
+authorize production; re-bootstrap v3"): their classes were bound to a source
+tournament instead of a shape, so their evidence cannot be reinterpreted under
+the v3 transfer rules. A v3 artifact without a selected workload class also
+fails closed.
 
 ## Accounting and concurrency
 
@@ -144,16 +214,16 @@ rate-limited. The candidate remains `verified=false`: these are the first cold
 observations, not a production budget.
 
 The current runtime fingerprint is
-`960283608cb8d5b6602e7d82236c862ade96f30591dd8497704bc32d388498f1`.
-Its first accepted EPL season-shape sample captured 38/38 planned payloads in
-one browser session and 39 navigations, using 463,018 provider bytes
-(0.442 MiB). It recorded 13 schedule pages, standings, rounds and participants
-as success; the empty future schedule as `legitimate_empty`; and cup tree plus
-20 season-scoped squad routes as `not_supported`. Endpoint completeness was
-100%, p50 duration 260 ms and p95 3.145 s. No-op, offline replay and one-endpoint
-resume were also saved. One sample is far below the policy requirement of 20
-cold samples and five distinct exits, so the shipped artifact remains
-`verified=false`.
+`cc82ae9ad526544cc827b3e0ab9baa48242a5f376c0b5232bbc2960b6a4fbe72`.
+The earlier fingerprint
+`960283608cb8d5b6602e7d82236c862ade96f30591dd8497704bc32d388498f1` produced one
+accepted EPL season-shape sample (38/38 planned payloads, one browser session,
+39 navigations, 463,018 provider bytes / 0.442 MiB, 100% endpoint completeness).
+The v3 schema change rewrote metered runtime code, so that sample is ineligible
+and was not carried over: the shipped candidate holds zero cold samples for all
+four classes and remains `verified=false`. Re-collection needs 20 cold runs and
+five distinct exits per class, spread even-floor over each class' collection
+targets.
 
 The World Cup cohorts now contain 25 production-Bronze finished event IDs and
 50 source-evidenced players selected from their frozen lineups. Earlier

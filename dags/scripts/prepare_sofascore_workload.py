@@ -6,10 +6,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
 
@@ -38,6 +39,7 @@ from scrapers.sofascore.workload_plan import (
     SeasonWorkload,
     load_verified_workload_policy,
     production_season_shape,
+    team_count_band,
 )
 from scrapers.sofascore.workload_runtime import (
     PartitionWorkload,
@@ -49,12 +51,119 @@ from scrapers.sofascore.workload_runtime import (
 
 
 VALID_PHASES = frozenset({"season", "targets", "players"})
+# #946 4d: the weekly player capture is the single most expensive phase, so the
+# club leagues are spread over ``modulus`` Saturdays instead of all running on
+# every one.  Both defaults are env-tunable because turning the rotation on/off
+# must NOT rotate the runtime fingerprint (config, not code).  Below
+# MIN_LEAGUES the rotation collapses to modulus=1 (everything due every week) —
+# today's two-league cadence therefore stays byte-for-byte unchanged.
+PLAYER_ROTATION_MODULUS_DEFAULT = 4
+PLAYER_ROTATION_MIN_LEAGUES_DEFAULT = 10
 
 
 @dataclass(frozen=True)
 class CompetitionSeason:
     league: str
     season: str
+
+
+def _positive_env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a positive integer") from exc
+    if value < 1:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+def player_rotation_modulus(club_league_count: int) -> int:
+    """Effective rotation modulus for the current club scope.
+
+    A small scope gains nothing from spreading (each league still needs its
+    weekly refresh), so the rotation only engages once the club scope reaches
+    ``SOFASCORE_PLAYER_ROTATION_MIN_LEAGUES``.
+    """
+
+    modulus = _positive_env_int(
+        "SOFASCORE_PLAYER_ROTATION_MODULUS", PLAYER_ROTATION_MODULUS_DEFAULT
+    )
+    min_leagues = _positive_env_int(
+        "SOFASCORE_PLAYER_ROTATION_MIN_LEAGUES", PLAYER_ROTATION_MIN_LEAGUES_DEFAULT
+    )
+    if club_league_count < min_leagues:
+        return 1
+    return modulus
+
+
+def player_rotation_cohort(league: str, *, modulus: int) -> int:
+    """Stable rotation slot of one league.
+
+    SHA-256 of the canonical id, not :func:`hash` (PYTHONHASHSEED-salted, so it
+    would differ between the DAG gate process and the planner subprocess) and
+    not the league's index in the active scope (onboarding one league would
+    reshuffle everybody else's slot).
+    """
+
+    if isinstance(modulus, bool) or not isinstance(modulus, int) or modulus < 1:
+        raise ValueError("rotation modulus must be a positive integer")
+    digest = hashlib.sha256(str(league).encode("utf-8")).hexdigest()
+    return int(digest, 16) % modulus
+
+
+def player_rotation_due(
+    league: str,
+    *,
+    rotation_date: Optional[date],
+    club_league_count: int,
+    is_tournament: bool = False,
+    force: bool = False,
+) -> bool:
+    """True when this league's players must be captured in ``rotation_date``'s week.
+
+    ``rotation_date=None`` means "no rotation" (a caller that does not pass a
+    date keeps the pre-#946 behaviour: every league every run).  A manual
+    ``force`` run and cup tournaments (their player universe is short-lived and
+    explosive) are always due.
+    """
+
+    if force or is_tournament or rotation_date is None:
+        return True
+    modulus = player_rotation_modulus(club_league_count)
+    if modulus == 1:
+        return True
+    # A continuous, Monday-aligned week counter — NOT the ISO week number. In a
+    # 53-week ISO year ``iso_week % modulus`` collides week 53 with week 1 of the
+    # next year (53 % 4 == 1 == 1 % 4), double-booking one cohort and starving
+    # another. ``(toordinal() - 1) // 7`` increments by exactly one per ISO week
+    # and buckets Monday–Sunday identically, so two dates in the same ISO week
+    # still resolve to the same cohort (the gate/planner determinism invariant).
+    week_index = (rotation_date.toordinal() - 1) // 7
+    return player_rotation_cohort(league, modulus=modulus) == week_index % modulus
+
+
+def _parse_rotation_boundary(value: str) -> Optional[date]:
+    """Parse the rotation boundary as a plain date or a full ISO datetime.
+
+    The rotation gate resolves the master ``data_interval_end`` (a datetime) and
+    the DAG passes that same boundary to the planner, so the planner must accept
+    both ``YYYY-MM-DD`` and a timezone-aware ISO datetime, taking its date.
+    """
+
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        pass
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).date()
+    except ValueError:
+        return None
 
 
 def _trino_connect():
@@ -194,6 +303,8 @@ def prepare_workload_plan(
     manifest_backend: Optional[str] = None,
     force_replace: bool = False,
     allow_inactive_season: bool = False,
+    players_rotation_date: Optional[date] = None,
+    players_force: bool = False,
 ) -> Path:
     """Snapshot local work, sign it, and atomically persist one phase plan."""
 
@@ -236,19 +347,23 @@ def prepare_workload_plan(
         manifest_backend=manifest_backend,
     )
     catalog = SofaScoreCatalog.load()
+    from utils.medallion_config import (
+        get_active_season,
+        get_season_team_count,
+        is_single_year_competition,
+    )
+
     workloads: list[PartitionWorkload] = []
     max_pages = int(os.environ.get("SOFASCORE_SEASON_MAX_PAGES", "50"))
+    club_league_count = sum(
+        1 for item in competition_seasons if not is_single_year_competition(item.league)
+    )
     for item in competition_seasons:
         tournament = catalog.competition(item.league)
         if not tournament.capture_allowed:
             raise RuntimeError(f"{item.league} is not capture-eligible")
         canonical = _season_label(item.league, item.season)
         if not allow_inactive_season:
-            from utils.medallion_config import (
-                get_active_season,
-                is_single_year_competition,
-            )
-
             if (
                 is_single_year_competition(item.league)
                 and get_active_season(item.league) is None
@@ -261,6 +376,18 @@ def prepare_workload_plan(
                     )
                 )
                 continue
+        if phase == "players" and not player_rotation_due(
+            item.league,
+            rotation_date=players_rotation_date,
+            club_league_count=club_league_count,
+            is_tournament=is_single_year_competition(item.league),
+            force=players_force,
+        ):
+            # A league outside this week's cohort is dropped from the signed
+            # plan entirely — no Trino/squad reads, and its capture task (which
+            # the DAG's rotation gate short-circuits) would fail loudly on the
+            # missing partition if it ever ran anyway.
+            continue
         source_season = catalog.resolve_source_season(
             tournament.unique_tournament_id, canonical
         )
@@ -278,9 +405,16 @@ def prepare_workload_plan(
             paid_proxy=True,
             max_pages=max_pages,
         )
+        # The class is keyed by the season's byte-driving shape, not by the
+        # tournament: format comes from the discovered registry season, the
+        # team-count band from competitions.yaml.  An unconfigured season raises
+        # MedallionConfigError here and fails the phase — a silently skipped
+        # league is exactly the fail-open we refuse.
         shape = production_season_shape(
-            tournament.unique_tournament_id,
             season_format=source_season.format,
+            team_count_band=team_count_band(
+                get_season_team_count(item.league, canonical)
+            ),
             max_pages_per_direction=max_pages,
         )
         if phase == "season":
@@ -395,9 +529,30 @@ def main(argv=None) -> int:
     parser.add_argument("--manifest-backend")
     parser.add_argument("--force-replace", action="store_true")
     parser.add_argument("--allow-inactive-season", action="store_true")
+    parser.add_argument(
+        "--players-rotation-date",
+        help=(
+            "Run boundary as YYYY-MM-DD or a full ISO datetime (the master "
+            "data-interval end the rotation gate uses); its week selects the "
+            "club cohort of the players phase. Omitted = no rotation (every "
+            "league is due)."
+        ),
+    )
+    parser.add_argument(
+        "--players-force",
+        action="store_true",
+        help="Plan every league's players regardless of the weekly rotation.",
+    )
     args = parser.parse_args(argv)
     if not args.artifact:
         parser.error("--artifact or SOFASCORE_PROXY_BUDGET_ARTIFACT is required")
+    rotation_date = None
+    if args.players_rotation_date:
+        rotation_date = _parse_rotation_boundary(args.players_rotation_date)
+        if rotation_date is None:
+            parser.error(
+                "--players-rotation-date must be YYYY-MM-DD or an ISO datetime"
+            )
     pairs = []
     for token in args.competition_season:
         if "=" not in token:
@@ -415,6 +570,8 @@ def main(argv=None) -> int:
         manifest_backend=args.manifest_backend,
         force_replace=args.force_replace,
         allow_inactive_season=args.allow_inactive_season,
+        players_rotation_date=rotation_date,
+        players_force=args.players_force,
     )
     print(path)
     return 0

@@ -140,8 +140,31 @@
     },
     "workloadClass": {
       "additionalProperties": true,
+      "allOf": [
+        {
+          "if": {
+            "properties": {"scope": {"const": "season"}},
+            "required": ["scope"]
+          },
+          "then": {"required": ["representative_season_ids"]}
+        }
+      ],
       "properties": {
-        "cohort": {"minLength": 1, "type": "string"},
+        "cohorts": {
+          "additionalProperties": {
+            "additionalProperties": false,
+            "properties": {
+              "cohort_sha256": {"pattern": "^[0-9a-f]{64}$", "type": "string"},
+              "name": {"minLength": 1, "type": "string"}
+            },
+            "required": ["name", "cohort_sha256"],
+            "type": "object"
+          },
+          "description": "Frozen source evidence per measured tournament; the key is the SofaScore tournament ID.",
+          "minProperties": 1,
+          "propertyNames": {"pattern": "^[1-9][0-9]*$"},
+          "type": "object"
+        },
         "collection_blocker": {"type": "string"},
         "hard_task_bytes": {
           "oneOf": [
@@ -150,6 +173,19 @@
           ]
         },
         "max_units": {"minimum": 1, "type": "integer"},
+        "measured_tournament_ids": {
+          "description": "Every tournament this class was measured on. A class authorizes an unmeasured tournament of the same shape only from two entries on.",
+          "items": {"minimum": 1, "type": "integer"},
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "representative_season_ids": {
+          "additionalProperties": {"minimum": 1, "type": "integer"},
+          "minProperties": 1,
+          "propertyNames": {"pattern": "^[1-9][0-9]*$"},
+          "type": "object"
+        },
         "required_endpoints": {
           "items": {"minLength": 1, "type": "string"},
           "minItems": 1,
@@ -161,8 +197,12 @@
           "type": "array"
         },
         "scope": {"enum": ["match", "player", "season"]},
-        "source_tournament_id": {"minimum": 1, "type": "integer"},
-        "shape": {"minProperties": 1, "type": "object"},
+        "shape": {
+          "description": "The byte-driving shape; its SHA-256 is the class identity and its name suffix. It never binds a source tournament.",
+          "minProperties": 1,
+          "not": {"required": ["source_tournament_id"]},
+          "type": "object"
+        },
         "shape_digest": {
           "pattern": "^[0-9a-f]{64}$",
           "type": "string"
@@ -170,9 +210,12 @@
       },
       "required": [
         "scope",
-        "source_tournament_id",
         "max_units",
         "required_endpoints",
+        "shape",
+        "shape_digest",
+        "measured_tournament_ids",
+        "cohorts",
         "hard_task_bytes",
         "samples"
       ],
@@ -210,12 +253,17 @@
       "const": "max_observed_task_bytes_per_workload_class_v2",
       "description": "Each hard task cap is exactly that class's largest complete cold observation; no multiplier or cross-class aggregation is permitted."
     },
+    "class_manifest_sha256": {
+      "description": "Canonical SHA-256 of configs/sofascore/proxy_canary_classes.json: the class declaration these measurements were collected from.",
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
     "cohort_sha256": {
       "pattern": "^[0-9a-f]{64}$",
       "type": "string"
     },
     "collection_source": {"const": "sofascore_canary"},
-    "collector_version": {"const": "sofascore-paid-canary-v2"},
+    "collector_version": {"const": "sofascore-paid-canary-v3"},
     "experimental_hard_cap_bytes": {
       "minimum": 1,
       "type": "integer"
@@ -241,6 +289,10 @@
           "minimum": 5,
           "type": "integer"
         },
+        "minimum_distinct_tournaments_for_transfer": {
+          "const": 2,
+          "description": "Documentation of the transfer invariant; it is enforced by the workload-plan loader and by class_for at plan time."
+        },
         "required_benchmark_modes": {
           "items": {
             "enum": ["no_op", "offline_replay", "single_endpoint_resume"]
@@ -259,14 +311,16 @@
       "required": [
         "minimum_cold_samples_per_class",
         "minimum_distinct_proxy_exits_per_class",
+        "minimum_distinct_tournaments_for_transfer",
         "required_benchmark_modes",
         "required_workload_classes"
       ],
       "type": "object"
     },
     "runtime_fingerprint": {"$ref": "#/$defs/runtimeFingerprint"},
-    "schema_version": {"const": 2},
+    "schema_version": {"const": 3},
     "source": {"const": "sofascore"},
+    "updated_at": {"minLength": 1, "type": "string"},
     "verification_blocker": {"minLength": 1, "type": "string"},
     "verified": {"type": "boolean"},
     "workload_classes": {
@@ -285,6 +339,7 @@
     "experimental_hard_cap_bytes",
     "bootstrap_authorizes_production",
     "cohort_sha256",
+    "class_manifest_sha256",
     "rate_limit_policy",
     "requirements",
     "historical_observations",

@@ -23,9 +23,12 @@ from scrapers.sofascore.workload_plan import (
     match_workload_class,
     parse_qualified_work_unit,
     player_workload_class,
+    production_match_shape,
+    production_player_shape,
     qualify_work_unit,
     source_tournament_token,
     stable_partitions,
+    workload_shape_digest,
 )
 
 
@@ -94,6 +97,8 @@ def build_partitioned_plan(
     requests: list[AllocationRequest] = []
     full_universe: list[str] = []
     seen_keys: set[str] = set()
+    match_shape_digest = workload_shape_digest(production_match_shape())
+    player_shape_digest = workload_shape_digest(production_player_shape())
     for workload in sorted(partitions, key=lambda item: item.key):
         key = workload.key
         tournament_id = source_tournament_token(workload.source_tournament_id)
@@ -130,10 +135,11 @@ def build_partitioned_plan(
                 AllocationRequest(
                     task_id=f"capture_match_{slug}_batch_{index:05d}",
                     scope="match",
-                    workload_class=match_workload_class(tournament_id),
+                    workload_class=match_workload_class(),
                     batch_index=index,
                     units=tuple(qualify_work_unit(key, value) for value in ids),
                     source_tournament_id=tournament_id,
+                    shape_digest=match_shape_digest,
                 )
             )
         for index, ids in enumerate(
@@ -147,10 +153,11 @@ def build_partitioned_plan(
                 AllocationRequest(
                     task_id=f"capture_player_{slug}_batch_{index:05d}",
                     scope="player",
-                    workload_class=player_workload_class(tournament_id),
+                    workload_class=player_workload_class(),
                     batch_index=index,
                     units=tuple(qualify_work_unit(key, value) for value in ids),
                     source_tournament_id=tournament_id,
+                    shape_digest=player_shape_digest,
                 )
             )
         season = workload.season_workload
@@ -163,6 +170,7 @@ def build_partitioned_plan(
                     batch_index=0,
                     units=(qualify_work_unit(key, season.unit),),
                     source_tournament_id=tournament_id,
+                    shape_digest=season.shape_digest,
                 )
             )
     return build_signed_allocation_plan(

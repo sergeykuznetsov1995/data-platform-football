@@ -168,6 +168,12 @@ RATE_LIMITS = {
     'whoscored': RateLimiterConfig(max_requests=10, window_seconds=60),
     'fotmob': RateLimiterConfig(max_requests=30, window_seconds=60),
     'sofascore': RateLimiterConfig(max_requests=20, window_seconds=60),
+    # Registry discovery walks thousands of small public JSON documents through
+    # one metered residential lease at a time. Keep it at the SofaScore pace and
+    # deny it a burst, so a long scan stays an even, human-plausible trickle.
+    'sofascore_discovery': RateLimiterConfig(
+        max_requests=20, window_seconds=60, burst_size=1
+    ),
     'sofifa': RateLimiterConfig(max_requests=30, window_seconds=60),
     'clubelo': RateLimiterConfig(max_requests=60, window_seconds=60),
     'espn': RateLimiterConfig(max_requests=30, window_seconds=60),

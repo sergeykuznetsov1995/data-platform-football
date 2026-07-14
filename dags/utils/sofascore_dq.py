@@ -1372,6 +1372,21 @@ def build_partition_dq_queries(
 
     queries.extend(
         [
+            # The registry is fail-closed on source gender, but a mislabelled
+            # or re-pointed source season could still land women's or youth
+            # rows in an "adult men" partition.  ``gender`` is a contract
+            # column of the participants table; NULL only means the source
+            # gave no evidence, so it is not treated as a contradiction.
+            DQQuery(
+                name="adult_men_gender_tripwire",
+                sql=(
+                    "SELECT COUNT(*) FROM "
+                    "iceberg.bronze.sofascore_event_participants "
+                    f"WHERE {scope} AND gender IS NOT NULL AND "
+                    "TRIM(CAST(gender AS varchar)) <> 'M'"
+                ),
+                expected_value=0,
+            ),
             DQQuery(
                 name="skeleton_schedule_rows",
                 sql=(

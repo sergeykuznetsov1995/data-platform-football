@@ -27,11 +27,17 @@ from types import SimpleNamespace
 import pytest
 
 from scrapers.sofascore.workload_plan import (
-    MATCH_WORKLOAD_CLASS,
-    PLAYER_WORKLOAD_CLASS,
     WorkloadAllocation,
     _signed_plan,
+    match_workload_class,
+    player_workload_class,
 )
+
+# The class names are now derived from the measured production workload shape
+# rather than hard-coded, but every assertion below still means "the class this
+# deployment actually signs".
+MATCH_WORKLOAD_CLASS = match_workload_class()
+PLAYER_WORKLOAD_CLASS = player_workload_class()
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 _SCRIPT_PATH = REPO_ROOT / "scripts" / "proxy_filter" / "filter_proxy.py"
@@ -2493,3 +2499,166 @@ def test_lease_failover_does_not_mint_second_lease_or_bypass_serial_limit(
     assert "concurrency" in observed["second"]
     assert len(mod.LEASES) == 1
     assert lease.upstream_repins == 1
+
+
+# --- metered SofaScore registry discovery (#946) ------------------------------
+
+
+def _discovery_context(run_id="discovery__20260714T000000Z"):
+    return {
+        "dag_id": "dag_discover_sofascore_registry",
+        "run_id": run_id,
+        "task_id": "discover_sofascore_registry",
+        "canonical_url": "https://api.sofascore.com/",
+        "source": "sofascore_discovery",
+        "scope": "discovery",
+    }
+
+
+def test_discovery_lease_is_refused_until_a_cap_is_authorized(mod):
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+
+    assert mod.SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES == 0
+    assert mod._source_for_dag("dag_discover_sofascore_registry") == (
+        "sofascore_discovery"
+    )
+    with pytest.raises(RuntimeError, match="discovery lease unavailable"):
+        mod._create_lease(
+            mgr,
+            max_bytes=1_000_000,
+            ttl_seconds=3600,
+            metadata=_discovery_context(),
+            require_context=True,
+        )
+
+
+def test_authorized_discovery_lease_is_capped_by_its_dagrun_budget(mod):
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+    mod.SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES = 12 * 1024 * 1024
+
+    lease = mod._create_lease(
+        mgr,
+        max_bytes=8 * 1024 * 1024,
+        ttl_seconds=3600,
+        metadata=_discovery_context(),
+        require_context=True,
+    )
+
+    assert lease.source == "sofascore_discovery"
+    assert lease.max_bytes == 8 * 1024 * 1024
+    report = lease.report()
+    assert report["dagrun_budget_bytes"] == 12 * 1024 * 1024
+    # Discovery carries no signed plan, no allocation and no canary artifact.
+    assert report["plan_digest"] == ""
+    assert report["allocation_id"] == ""
+    assert report["budget_artifact_id"] == ""
+    # WhoScored and the other legacy sources keep the shared per-DagRun cap.
+    assert mod._dagrun_budget_bytes("dag_ingest_whoscored") == 8_000_000
+
+
+def test_discovery_lease_is_not_truncated_by_the_2mb_per_url_ceiling(mod):
+    # Every discovery request hits one canonical API origin, so the legacy
+    # per-URL ceiling would strangle a scan into 2 MB no matter its DagRun cap.
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+    mod.URL_BUDGET_BYTES = 2_000_000
+    mod.SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES = 16 * 1024 * 1024
+
+    lease = mod._create_lease(
+        mgr,
+        max_bytes=8 * 1024 * 1024,
+        ttl_seconds=3600,
+        metadata=_discovery_context(),
+        require_context=True,
+    )
+
+    assert lease.max_bytes == 8 * 1024 * 1024 > 2_000_000
+    assert mod._lease_url_budget_bytes(lease) == 16 * 1024 * 1024
+    assert lease.report()["url_budget_bytes"] == 16 * 1024 * 1024
+    # And the whole-scan ceiling still applies across consecutive leases.
+    mod._account_lease_bytes(lease, "api.sofascore.com", "down", 8 * 1024 * 1024)
+    lease.closed = True
+    second = mod._create_lease(
+        mgr,
+        max_bytes=8 * 1024 * 1024,
+        ttl_seconds=3600,
+        metadata=_discovery_context(),
+        require_context=True,
+    )
+    assert second.max_bytes == 8 * 1024 * 1024
+    mod._account_lease_bytes(second, "api.sofascore.com", "down", 8 * 1024 * 1024)
+    second.closed = True
+    with pytest.raises(RuntimeError, match="budget exhausted"):
+        mod._create_lease(
+            mgr,
+            max_bytes=1024,
+            ttl_seconds=3600,
+            metadata=_discovery_context(),
+            require_context=True,
+        )
+
+
+def test_discovery_scan_is_serial(mod):
+    mgr = _FakeManager(
+        ["http://u:p@pool.invalid:10000", "http://u:p@pool.invalid:10001"]
+    )
+    mod.MAX_ACTIVE_LEASES = 4
+    mod.SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES = 12 * 1024 * 1024
+
+    first = mod._create_lease(
+        mgr,
+        max_bytes=1_000_000,
+        ttl_seconds=3600,
+        metadata=_discovery_context(),
+        require_context=True,
+    )
+    with pytest.raises(RuntimeError, match="discovery paid-proxy concurrency"):
+        mod._create_lease(
+            mgr,
+            max_bytes=1_000_000,
+            ttl_seconds=3600,
+            metadata=_discovery_context(run_id="discovery__other"),
+            require_context=True,
+        )
+
+    first.closed = True
+    rotated = mod._create_lease(
+        mgr,
+        max_bytes=1_000_000,
+        ttl_seconds=3600,
+        metadata=_discovery_context(),
+        require_context=True,
+    )
+    # The next lease in the same scan is pinned to a fresh residential exit.
+    assert rotated.upstream[1] == 10001
+
+
+def test_discovery_source_cannot_be_claimed_by_another_dag(mod):
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+    mod.SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES = 12 * 1024 * 1024
+
+    with pytest.raises(ValueError, match="source does not match dag_id"):
+        mod._create_lease(
+            mgr,
+            max_bytes=1_000_000,
+            ttl_seconds=3600,
+            metadata={
+                **_discovery_context(),
+                "dag_id": "dag_ingest_sofascore",
+            },
+            require_context=True,
+        )
+
+
+def test_discovery_budget_is_reported_by_health_and_defaults_to_disabled():
+    compose = _COMPOSE_PATH.read_text()
+    service = compose.split("  proxy_filter:\n", 1)[1].split("\n  caddy:\n", 1)[0]
+    source = _SCRIPT_PATH.read_text()
+
+    assert "--sofascore-discovery-dagrun-budget-bytes" in service
+    assert (
+        "${PROXY_FILTER_SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES:-0}" in service
+    )
+    assert '"sofascore_discovery_enabled"' in source
+    assert '"sofascore_discovery_dagrun_budget_bytes"' in source
+    env_example = (REPO_ROOT / ".env.example").read_text()
+    assert "PROXY_FILTER_SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES=0" in env_example

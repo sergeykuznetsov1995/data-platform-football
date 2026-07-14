@@ -1541,6 +1541,39 @@ def get_competition_floor_basis(competition_id: str) -> Tuple[int, int]:
     )
 
 
+def get_season_team_count(competition_id: str, canonical_season) -> int:
+    """team_count of ONE configured season (#946: SofaScore workload band).
+
+    The paid-proxy workload class of a season is keyed by its coarse team-count
+    band (schedule/standings/squads bytes scale with the field size), so the
+    planner needs the exact season's team count, not the floor-basis minimum
+    over all seasons (get_competition_floor_basis).
+
+    ``canonical_season`` is the Bronze partition label ('2526' for club leagues,
+    '2026' for single_year tournaments) and is matched against the season ids in
+    competitions.yaml. Fail-closed: an unknown competition or a season that is
+    not configured raises MedallionConfigError — guessing a band would authorize
+    paid traffic against an unmeasured workload class. ``team_count`` itself is
+    a load-time invariant (validate_competitions above rejects a season without
+    a positive team_count).
+    """
+    doc = load_competitions()
+    token = str(canonical_season).strip()
+    for c in doc['competitions']:
+        if c['id'] != competition_id:
+            continue
+        for s in (c.get('seasons') or []):
+            if str(s['id']) == token:
+                return int(s['team_count'])
+        raise MedallionConfigError(
+            f"competitions.yaml: {competition_id!r} has no season {token!r} — "
+            f"cannot derive its workload team-count band"
+        )
+    raise MedallionConfigError(
+        f"competition not found in competitions.yaml: {competition_id!r}"
+    )
+
+
 def get_competition_format(competition_id: str) -> str:
     """Top-level ``competition_format`` ('group_knockout' for cup
     tournaments), default 'league' — club leagues omit the field.

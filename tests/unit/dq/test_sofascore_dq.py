@@ -207,6 +207,74 @@ def test_table_contract_rejects_duplicates_missing_fields_and_bad_enum():
     assert {"required_field_loss", "null_natural_key"} <= codes
 
 
+def test_participant_gender_enum_stops_non_male_rows_before_the_write():
+    base = {
+        "match_id": "1",
+        "team_id": "t1",
+        "team_side": "home",
+        "name": "Arsenal",
+        "gender": "M",
+        "team_type": 0,
+        "source_tournament_id": 17,
+        "source_season_id": 76986,
+        "league": "ENG-Premier League",
+        "season": "2526",
+        "raw_content_hash": "a" * 64,
+        "raw_blob_key": "sofascore/17/76986/event/1.json.gz",
+        "_ingested_at": "2026-07-11T00:00:00Z",
+    }
+    table = "bronze.sofascore_event_participants"
+
+    assert validate_table_rows(table, [base]).passed
+
+    women = {**base, "team_id": "t2", "team_side": "away", "gender": "F"}
+    report = validate_table_rows(table, [base, women])
+    assert not report.passed
+    invalid = [
+        finding for finding in report.findings
+        if finding.code == "invalid_enum_value"
+    ]
+    assert invalid and invalid[0].examples[0][1] == "gender"
+    with pytest.raises(SofaScoreDQViolation):
+        report.require()
+
+    # A missing source marker is absence of evidence, not a contradiction.
+    unknown = {**base, "team_id": "t3", "team_side": "away", "gender": None}
+    assert validate_table_rows(table, [base, unknown]).passed
+
+
+def test_adult_men_gender_tripwire_guards_the_committed_partition():
+    query = next(
+        query
+        for query in build_partition_dq_queries(
+            "ENG-Premier League", "2526", 17, 76986
+        )
+        if query.name == "adult_men_gender_tripwire"
+    )
+
+    assert query.expected_value == 0
+    assert query.comparator == "eq"
+    assert "iceberg.bronze.sofascore_event_participants" in query.sql
+    assert "league = 'ENG-Premier League'" in query.sql
+    assert "season = '2526'" in query.sql
+    assert "gender IS NOT NULL" in query.sql
+    assert "TRIM(CAST(gender AS varchar)) <> 'M'" in query.sql
+    # The schedule's flattened gender columns are not contract columns.
+    assert "home_team_gender" not in query.sql
+    assert "away_team_gender" not in query.sql
+
+
+def test_committed_partition_dq_fails_on_a_non_male_participant():
+    connection = _ScalarConnection(
+        overrides={"TRIM(CAST(gender AS varchar)) <> 'M'": 3}
+    )
+    with pytest.raises(SofaScoreDQViolation, match="adult_men_gender_tripwire"):
+        run_committed_partition_dq(
+            ActiveRegistryPartition("ENG-Premier League", "2526", 17, 76986),
+            connection,
+        )
+
+
 def test_lineup_semantics_preserve_unused_bench():
     good = [
         {
@@ -504,6 +572,7 @@ def test_partition_sql_contract_contains_all_hard_gates_and_is_injection_safe():
         "event_shotmap_season_mismatches",
     } <= names
     assert "required_endpoint_completeness" in names
+    assert "adult_men_gender_tripwire" in names
     assert "player_profile_coverage" in names
     assert "player_rating_coverage" in names
     assert "silver_gold_attach_rate" in names

@@ -3,12 +3,12 @@
 The paid proxy budget is measured per *task shape*, not per free-form DAG run.
 This module keeps that contract small and auditable:
 
-* match IDs are partitioned into stable, source-tournament-scoped batches of
-  at most 25;
-* player IDs are partitioned into source-tournament-scoped batches of at most
-  50, while the
+* match IDs are partitioned into stable batches of at most 25;
+* player IDs are partitioned into batches of at most 50, while the
   complete player universe is signed before any slicing;
-* season work is measured separately for each tournament/shape pair;
+* every workload class is keyed by the digest of its byte-driving shape, and a
+  class generalizes to an unmeasured tournament only once it was measured on at
+  least two of them;
 * every network allocation is immutable and HMAC-signed for one DagRun;
 * retries can spend only the remaining bytes of the original allocation.
 
@@ -37,25 +37,37 @@ from scrapers.sofascore.runtime_fingerprint import (
 )
 
 
-WORKLOAD_ARTIFACT_SCHEMA_VERSION = 2
+WORKLOAD_ARTIFACT_SCHEMA_VERSION = 3
 WORKLOAD_PLAN_SCHEMA_VERSION = 2
 ALLOCATION_LEDGER_SCHEMA_VERSION = 1
 WORKLOAD_BUDGET_DERIVATION = "max_observed_task_bytes_per_workload_class_v2"
 WORKLOAD_METER = "proxy_filter_provider_path_v2"
 MIN_COLD_SAMPLES_PER_CLASS = 20
 MIN_DISTINCT_EXITS_PER_CLASS = 5
+# A class measured on a single tournament describes that tournament only; two
+# independent tournaments are the minimum evidence that the shape - and not the
+# league behind it - drives the measured bytes.
+MIN_MEASURED_TOURNAMENTS_FOR_TRANSFER = 2
 MATCH_BATCH_SIZE = 25
 PLAYER_BATCH_SIZE = 50
-# Compatibility aliases for the existing EPL canary.  Production planning
-# must call ``match_workload_class``/``player_workload_class`` with the source
-# tournament ID; these names are intentionally *not* universal budgets.
-MATCH_WORKLOAD_CLASS = "match_batch_25_t17"
-PLAYER_WORKLOAD_CLASS = "player_batch_50_t17"
+# Byte-driving endpoint sets of the production capture.  They mirror
+# ``scrapers.sofascore.pipeline.EVENT_PATHS``/``PLAYER_PATHS``; that module
+# cannot be imported here (it imports the proxy budget, which imports this
+# module), so a unit test pins both lists against each other.
+MATCH_REQUIRED_ENDPOINTS = (
+    "event",
+    "incidents",
+    "lineups",
+    "shotmap",
+    "statistics",
+)
+PLAYER_REQUIRED_ENDPOINTS = ("player_profile", "player_season_statistics")
 PLAYER_UNIVERSE_TASK_ID = "materialize_full_player_universe"
 DQ_TASK_ID = "run_sofascore_dq"
 CONTROL_TOKEN_ENV = "SOFASCORE_PROXY_CONTROL_TOKEN"
 SIGNATURE_ALGORITHM = "hmac-sha256"
-SEASON_WORKLOAD_SHAPE_VERSION = 1
+WORKLOAD_SHAPE_VERSION = 2
+SEASON_WORKLOAD_SHAPE_VERSION = 2
 SEASON_STATIC_ENDPOINTS = (
     "schedule_last",
     "schedule_next",
@@ -66,6 +78,41 @@ SEASON_STATIC_ENDPOINTS = (
 )
 SEASON_DYNAMIC_ENDPOINTS = ("squads", "referee_profile")
 WORKLOAD_FRESHNESS_SCOPES = ("season", "match", "player")
+# Team count drives schedule/standings/squads bytes, so it is part of the season
+# shape - but only as a coarse band, otherwise every league size would need its
+# own paid measurement.  The grid is code, not config: changing it rotates the
+# runtime fingerprint and forces a re-measurement.
+TEAM_COUNT_BAND_SCHEME = "team_count_band_v1"
+TEAM_COUNT_BAND_GRID = (
+    (8, 15, "8_15"),
+    (16, 20, "16_20"),
+    (21, 32, "21_32"),
+    (33, 48, "33_48"),
+)
+TEAM_COUNT_BANDS = tuple(band for _, _, band in TEAM_COUNT_BAND_GRID)
+SEASON_FORMATS = ("split_year", "calendar_year", "named")
+_WORKLOAD_SCOPES = ("match", "player", "season")
+_BATCH_SHAPE_KEYS = frozenset(
+    {"shape_version", "scope", "batch_size", "required_endpoints"}
+)
+_SEASON_SHAPE_KEYS = frozenset(
+    {
+        "shape_version",
+        "scope",
+        "season_format",
+        "team_count_band",
+        "band_scheme",
+        "schedule_page_chain",
+        "static_endpoints",
+        "dynamic_endpoints",
+        "dynamic_evidence",
+    }
+)
+_SHAPE_KEYS = {
+    "match": _BATCH_SHAPE_KEYS,
+    "player": _BATCH_SHAPE_KEYS,
+    "season": _SEASON_SHAPE_KEYS,
+}
 
 
 class WorkloadPolicyUnavailable(RuntimeError):
@@ -148,18 +195,6 @@ def source_tournament_token(value: object) -> str:
     if not token.isdecimal() or int(token) <= 0 or token != str(int(token)):
         raise WorkloadPlanError("source_tournament_id must be a positive integer")
     return token
-
-
-def match_workload_class(source_tournament_id: int | str) -> str:
-    """Measured 25-match class for exactly one source tournament."""
-
-    return f"match_batch_{MATCH_BATCH_SIZE}_t{source_tournament_token(source_tournament_id)}"
-
-
-def player_workload_class(source_tournament_id: int | str) -> str:
-    """Measured 50-player class for exactly one source tournament."""
-
-    return f"player_batch_{PLAYER_BATCH_SIZE}_t{source_tournament_token(source_tournament_id)}"
 
 
 def _normalize_freshness_keys(
@@ -268,10 +303,25 @@ def parse_qualified_work_unit(value: str) -> tuple[str, str]:
     )
 
 
-def season_shape_digest(shape: Mapping[str, object]) -> str:
+def workload_shape_digest(shape: Mapping[str, object]) -> str:
+    """SHA-256 of the canonical byte-driving shape shared by equal workloads."""
+
     if not isinstance(shape, Mapping) or not shape:
-        raise WorkloadPlanError("season workload shape must be a non-empty object")
+        raise WorkloadPlanError("workload shape must be a non-empty object")
     return hashlib.sha256(_canonical_json(dict(shape))).hexdigest()
+
+
+def team_count_band(team_count: int) -> str:
+    """Map a season team count onto its coarse, capture-safe band."""
+
+    if isinstance(team_count, bool) or not isinstance(team_count, int):
+        raise WorkloadPlanError("team_count must be an integer")
+    for low, high, band in TEAM_COUNT_BAND_GRID:
+        if low <= team_count <= high:
+            return band
+    raise WorkloadPlanError(
+        f"team_count={team_count} is outside the measured {TEAM_COUNT_BAND_SCHEME} grid"
+    )
 
 
 def tournament_canonical_url(slug: str, tournament_id: int | str) -> str:
@@ -292,25 +342,53 @@ def tournament_canonical_url(slug: str, tournament_id: int | str) -> str:
     )
 
 
+def production_match_shape() -> Mapping[str, object]:
+    """Byte-driving shape of one 25-match batch; identical for every league."""
+
+    return {
+        "shape_version": WORKLOAD_SHAPE_VERSION,
+        "scope": "match",
+        "batch_size": MATCH_BATCH_SIZE,
+        "required_endpoints": sorted(MATCH_REQUIRED_ENDPOINTS),
+    }
+
+
+def production_player_shape() -> Mapping[str, object]:
+    """Byte-driving shape of one 50-player batch; identical for every league."""
+
+    return {
+        "shape_version": WORKLOAD_SHAPE_VERSION,
+        "scope": "player",
+        "batch_size": PLAYER_BATCH_SIZE,
+        "required_endpoints": sorted(PLAYER_REQUIRED_ENDPOINTS),
+    }
+
+
 def production_season_shape(
-    tournament_id: int | str,
     *,
     season_format: str,
+    team_count_band: str,
     max_pages_per_direction: int,
 ) -> Mapping[str, object]:
     """Canonical bounded shape shared by the DAG and the paid canary.
 
     Schedule chains and evidence-derived squads/referees are dynamic, so the
-    class describes their deterministic algorithm and hard page bound.  If a
-    future season costs more than the measured maximum, the proxy stops the
-    task; operators must collect a new class sample instead of applying a
-    guessed multiplier.
+    class describes their deterministic algorithm and hard page bound.  The
+    shape deliberately carries no tournament ID: two leagues of the same format
+    and team-count band drive the same bytes.  If a future season costs more
+    than the measured maximum, the proxy stops the task; operators must collect
+    a new class sample instead of applying a guessed multiplier.
     """
 
-    tournament = _required_token(str(tournament_id), "tournament_id")
     season_format = _required_token(season_format, "season_format")
-    if season_format not in {"split_year", "calendar_year", "named"}:
+    if season_format not in SEASON_FORMATS:
         raise WorkloadPlanError("season_format is not capture-safe")
+    band = _required_token(team_count_band, "team_count_band")
+    if band not in TEAM_COUNT_BANDS:
+        raise WorkloadPlanError(
+            f"team_count_band must be one of {TEAM_COUNT_BAND_SCHEME}: "
+            + ", ".join(TEAM_COUNT_BANDS)
+        )
     if (
         isinstance(max_pages_per_direction, bool)
         or not isinstance(max_pages_per_direction, int)
@@ -319,8 +397,10 @@ def production_season_shape(
         raise WorkloadPlanError("max_pages_per_direction must be positive")
     return {
         "shape_version": SEASON_WORKLOAD_SHAPE_VERSION,
-        "source_tournament_id": tournament,
+        "scope": "season",
         "season_format": season_format,
+        "team_count_band": band,
+        "band_scheme": TEAM_COUNT_BAND_SCHEME,
         "schedule_page_chain": {
             "directions": ["last", "next"],
             "max_pages_per_direction": max_pages_per_direction,
@@ -331,12 +411,47 @@ def production_season_shape(
     }
 
 
-def season_workload_class(
-    tournament_id: int | str,
-    shape: Mapping[str, object],
-) -> str:
-    tournament = _required_token(str(tournament_id), "tournament_id")
-    return f"season_{tournament}_{season_shape_digest(shape)[:16]}"
+def workload_class_name(scope: str, shape_digest: str) -> str:
+    """Bind one class name to exactly one (scope, shape) pair."""
+
+    digest = _shape_digest_token(shape_digest)[:16]
+    if scope == "match":
+        return f"match_batch_{MATCH_BATCH_SIZE}_{digest}"
+    if scope == "player":
+        return f"player_batch_{PLAYER_BATCH_SIZE}_{digest}"
+    if scope == "season":
+        return f"season_{digest}"
+    raise WorkloadPlanError(f"invalid workload scope {scope!r}")
+
+
+def match_workload_class() -> str:
+    """Measured 25-match class of the current production match shape."""
+
+    return workload_class_name(
+        "match", workload_shape_digest(production_match_shape())
+    )
+
+
+def player_workload_class() -> str:
+    """Measured 50-player class of the current production player shape."""
+
+    return workload_class_name(
+        "player", workload_shape_digest(production_player_shape())
+    )
+
+
+def season_workload_class(shape: Mapping[str, object]) -> str:
+    return workload_class_name("season", workload_shape_digest(shape))
+
+
+def _shape_digest_token(value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(char not in "0123456789abcdef" for char in value)
+    ):
+        raise WorkloadPlanError("shape_digest must be a SHA-256 digest")
+    return value
 
 
 @dataclass(frozen=True)
@@ -348,8 +463,8 @@ class WorkloadClassBudget:
     required_endpoints: tuple[str, ...]
     sample_count: int
     distinct_proxy_exits: int
-    shape_digest: Optional[str] = None
-    source_tournament_id: Optional[str] = None
+    shape_digest: str
+    measured_tournament_ids: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -364,6 +479,7 @@ class WorkloadBudgetPolicy:
         scope: str,
         units: int,
         source_tournament_id: int | str,
+        shape_digest: str,
     ) -> WorkloadClassBudget:
         try:
             policy = self.classes[name]
@@ -375,11 +491,20 @@ class WorkloadBudgetPolicy:
             raise WorkloadPolicyUnavailable(
                 f"workload class {name!r} belongs to {policy.scope!r}, not {scope!r}"
             )
-        tournament = source_tournament_token(source_tournament_id)
-        if policy.source_tournament_id != tournament:
+        if policy.shape_digest != _shape_digest_token(shape_digest):
             raise WorkloadPolicyUnavailable(
-                f"workload class {name!r} is measured for tournament "
-                f"{policy.source_tournament_id!r}, not {tournament!r}"
+                f"workload class {name!r} shape is not measured"
+            )
+        tournament = source_tournament_token(source_tournament_id)
+        if (
+            tournament not in policy.measured_tournament_ids
+            and len(policy.measured_tournament_ids)
+            < MIN_MEASURED_TOURNAMENTS_FOR_TRANSFER
+        ):
+            raise WorkloadPolicyUnavailable(
+                f"workload class {name!r} is measured only for tournament "
+                f"{policy.measured_tournament_ids[0]!r} and cannot authorize "
+                f"tournament {tournament!r}"
             )
         if isinstance(units, bool) or not isinstance(units, int) or units < 1:
             raise WorkloadPlanError("allocation units must be a positive integer")
@@ -395,18 +520,31 @@ def _validate_request_map(
     *,
     required_endpoints: tuple[str, ...],
     field: str,
+    mandatory_endpoints: Optional[tuple[str, ...]] = None,
 ) -> int:
+    """Sum the exact request bytes of one measured sample.
+
+    ``mandatory_endpoints`` defaults to ``required_endpoints``, giving the exact
+    equality that match and player classes need.  Season classes pass their
+    STATIC endpoints instead: the collector legitimately omits a dynamic
+    endpoint (``referee_profile``/``squads``) when the schedule payload carries
+    no such IDs, so the sample map is accepted whenever it covers every static
+    endpoint and stays within the measured shape.
+    """
+
     if not isinstance(value, Mapping):
         raise WorkloadPolicyUnavailable(f"{field} must be an endpoint object")
     endpoints = set(value)
-    if endpoints != set(required_endpoints):
-        missing = sorted(set(required_endpoints) - endpoints)
-        extra = sorted(endpoints - set(required_endpoints))
+    allowed = set(required_endpoints)
+    mandatory = allowed if mandatory_endpoints is None else set(mandatory_endpoints)
+    if not (mandatory <= endpoints <= allowed):
+        missing = sorted(mandatory - endpoints)
+        extra = sorted(endpoints - allowed)
         raise WorkloadPolicyUnavailable(
             f"{field} endpoint mismatch: missing={missing} extra={extra}"
         )
     total = 0
-    for endpoint in required_endpoints:
+    for endpoint in sorted(endpoints):
         observations = value[endpoint]
         if not isinstance(observations, list) or not observations:
             raise WorkloadPolicyUnavailable(
@@ -425,10 +563,95 @@ def _validate_request_map(
     return total
 
 
+def _endpoint_tuple(value: object, field: str) -> tuple[str, ...]:
+    if (
+        not isinstance(value, list)
+        or not value
+        or any(not isinstance(item, str) or not item.strip() for item in value)
+    ):
+        raise WorkloadPolicyUnavailable(f"{field} must be a non-empty string list")
+    endpoints = tuple(sorted(item.strip() for item in value))
+    if len(endpoints) != len(set(endpoints)):
+        raise WorkloadPolicyUnavailable(f"{field} contains duplicates")
+    return endpoints
+
+
+def _validated_shape(
+    name: str, scope: str, raw_class: Mapping[str, object]
+) -> tuple[str, tuple[str, ...]]:
+    """Return the exact shape digest and endpoint set of one measured class."""
+
+    raw_shape = raw_class.get("shape")
+    if not isinstance(raw_shape, Mapping) or not raw_shape:
+        raise WorkloadPolicyUnavailable(
+            f"workload class {name!r} needs its measured shape"
+        )
+    if "source_tournament_id" in raw_shape:
+        raise WorkloadPolicyUnavailable(
+            f"workload class {name!r} shape must not bind a source tournament"
+        )
+    expected_keys = _SHAPE_KEYS[scope]
+    keys = set(raw_shape)
+    if keys != expected_keys:
+        missing = sorted(expected_keys - keys)
+        extra = sorted(keys - expected_keys)
+        raise WorkloadPolicyUnavailable(
+            f"workload class {name!r} shape key mismatch: "
+            f"missing={missing} extra={extra}"
+        )
+    if raw_shape.get("scope") != scope:
+        raise WorkloadPolicyUnavailable(
+            f"workload class {name!r} shape belongs to another scope"
+        )
+    try:
+        shape_digest = _shape_digest_token(raw_class.get("shape_digest"))
+    except WorkloadPlanError as exc:
+        raise WorkloadPolicyUnavailable(
+            f"workload class {name!r} needs its exact shape_digest"
+        ) from exc
+    if workload_shape_digest(raw_shape) != shape_digest:
+        raise WorkloadPolicyUnavailable(
+            f"workload class {name!r} shape_digest does not match its shape"
+        )
+    if scope == "season":
+        endpoints = _endpoint_tuple(
+            list(raw_shape.get("static_endpoints") or [])
+            + list(raw_shape.get("dynamic_endpoints") or []),
+            f"{name}.shape endpoints",
+        )
+    else:
+        endpoints = _endpoint_tuple(
+            raw_shape.get("required_endpoints"), f"{name}.shape.required_endpoints"
+        )
+    return shape_digest, endpoints
+
+
+def _measured_tournament_ids(name: str, raw_class: Mapping[str, object]) -> tuple[str, ...]:
+    raw_measured = raw_class.get("measured_tournament_ids")
+    if not isinstance(raw_measured, list) or not raw_measured:
+        raise WorkloadPolicyUnavailable(
+            f"workload class {name!r} needs measured_tournament_ids"
+        )
+    measured: list[str] = []
+    for value in raw_measured:
+        try:
+            token = source_tournament_token(value)
+        except WorkloadPlanError as exc:
+            raise WorkloadPolicyUnavailable(
+                f"workload class {name!r} has an invalid measured tournament"
+            ) from exc
+        if token in measured:
+            raise WorkloadPolicyUnavailable(
+                f"workload class {name!r} lists duplicate measured tournaments"
+            )
+        measured.append(token)
+    return tuple(sorted(measured, key=int))
+
+
 def load_verified_workload_policy(
     path: os.PathLike[str] | str,
 ) -> WorkloadBudgetPolicy:
-    """Load v2 class budgets and derive every cap from measured cold maxima."""
+    """Load v3 class budgets and derive every cap from measured cold maxima."""
 
     artifact_path = Path(path)
     try:
@@ -441,7 +664,10 @@ def load_verified_workload_policy(
     if not isinstance(payload, Mapping):
         raise WorkloadPolicyUnavailable("workload artifact must be an object")
     if payload.get("schema_version") != WORKLOAD_ARTIFACT_SCHEMA_VERSION:
-        raise WorkloadPolicyUnavailable("workload artifact schema_version must be 2")
+        raise WorkloadPolicyUnavailable(
+            "workload artifact schema_version must be "
+            f"{WORKLOAD_ARTIFACT_SCHEMA_VERSION}"
+        )
     if payload.get("source") != "sofascore":
         raise WorkloadPolicyUnavailable("workload artifact source must be sofascore")
     if payload.get("meter") != WORKLOAD_METER:
@@ -466,6 +692,7 @@ def load_verified_workload_policy(
         raise WorkloadPolicyUnavailable("workload_classes must be a non-empty object")
 
     classes: dict[str, WorkloadClassBudget] = {}
+    measured_shapes: dict[tuple[str, str], str] = {}
     for raw_name, raw_class in sorted(raw_classes.items()):
         if not isinstance(raw_name, str) or not raw_name.strip():
             raise WorkloadPolicyUnavailable("workload class names must be non-empty")
@@ -479,53 +706,41 @@ def load_verified_workload_policy(
                 f"workload class {name!r} cannot use a multiplier"
             )
         scope = raw_class.get("scope")
-        if scope not in {"match", "player", "season"}:
+        if scope not in _WORKLOAD_SCOPES:
             raise WorkloadPolicyUnavailable(
                 f"workload class {name!r} has invalid scope"
             )
-        try:
-            source_tournament_id = source_tournament_token(
-                raw_class.get("source_tournament_id")
-            )
-        except WorkloadPlanError as exc:
+        shape_digest, shape_endpoints = _validated_shape(name, scope, raw_class)
+        duplicate = measured_shapes.get((scope, shape_digest))
+        if duplicate is not None:
             raise WorkloadPolicyUnavailable(
-                f"workload class {name!r} needs one source_tournament_id"
-            ) from exc
+                f"scope {scope!r} has a duplicate shape_digest in classes "
+                f"{duplicate!r} and {name!r}"
+            )
+        measured_shapes[(scope, shape_digest)] = name
         max_units = _positive_int(raw_class.get("max_units"), f"{name}.max_units")
-        if scope == "match" and (
-            name != match_workload_class(source_tournament_id)
-            or max_units != MATCH_BATCH_SIZE
-        ):
+        if name != workload_class_name(scope, shape_digest):
             raise WorkloadPolicyUnavailable(
-                "match workload class must bind batch size and source tournament"
+                f"workload class {name!r} must be named after its scope and shape"
             )
-        if scope == "player" and (
-            name != player_workload_class(source_tournament_id)
-            or max_units != PLAYER_BATCH_SIZE
-        ):
+        expected_units = {
+            "match": MATCH_BATCH_SIZE,
+            "player": PLAYER_BATCH_SIZE,
+            "season": 1,
+        }[scope]
+        if max_units != expected_units:
             raise WorkloadPolicyUnavailable(
-                "player workload class must bind batch size and source tournament"
+                f"{scope} workload class must measure exactly "
+                f"{expected_units} units"
             )
-        if scope == "season" and max_units != 1:
+        required_endpoints = _endpoint_tuple(
+            raw_class.get("required_endpoints"), f"{name}.required_endpoints"
+        )
+        if required_endpoints != shape_endpoints:
             raise WorkloadPolicyUnavailable(
-                "each season allocation must contain one season"
+                f"{name}.required_endpoints must equal the endpoints of its shape"
             )
-        raw_endpoints = raw_class.get("required_endpoints")
-        if (
-            not isinstance(raw_endpoints, list)
-            or not raw_endpoints
-            or any(
-                not isinstance(item, str) or not item.strip() for item in raw_endpoints
-            )
-        ):
-            raise WorkloadPolicyUnavailable(
-                f"{name}.required_endpoints must be a non-empty string list"
-            )
-        required_endpoints = tuple(sorted(item.strip() for item in raw_endpoints))
-        if len(required_endpoints) != len(set(required_endpoints)):
-            raise WorkloadPolicyUnavailable(
-                f"{name}.required_endpoints contains duplicates"
-            )
+        measured_tournament_ids = _measured_tournament_ids(name, raw_class)
         samples = raw_class.get("samples")
         if not isinstance(samples, list) or len(samples) < MIN_COLD_SAMPLES_PER_CLASS:
             raise WorkloadPolicyUnavailable(
@@ -534,6 +749,8 @@ def load_verified_workload_policy(
         run_ids: set[str] = set()
         exits: set[str] = set()
         totals: list[int] = []
+        sample_tournaments: set[str] = set()
+        tournament_counts: dict[str, int] = {}
         for index, sample in enumerate(samples):
             prefix = f"{name}.samples[{index}]"
             if not isinstance(sample, Mapping):
@@ -557,18 +774,17 @@ def load_verified_workload_policy(
                     f"{prefix}.workload_class must equal {name!r}"
                 )
             try:
-                sample_tournament_id = source_tournament_token(
+                sample_tournament = source_tournament_token(
                     sample.get("source_tournament_id")
                 )
             except WorkloadPlanError as exc:
                 raise WorkloadPolicyUnavailable(
                     f"{prefix}.source_tournament_id is invalid"
                 ) from exc
-            if sample_tournament_id != source_tournament_id:
-                raise WorkloadPolicyUnavailable(
-                    f"{prefix} was measured for tournament "
-                    f"{sample_tournament_id!r}, not {source_tournament_id!r}"
-                )
+            sample_tournaments.add(sample_tournament)
+            tournament_counts[sample_tournament] = (
+                tournament_counts.get(sample_tournament, 0) + 1
+            )
             if (
                 sample.get("mode") != "cold"
                 or sample.get("budget_eligible") is not True
@@ -590,6 +806,9 @@ def load_verified_workload_policy(
                 sample.get("endpoint_request_provider_bytes"),
                 required_endpoints=required_endpoints,
                 field=f"{prefix}.endpoint_request_provider_bytes",
+                mandatory_endpoints=(
+                    SEASON_STATIC_ENDPOINTS if scope == "season" else None
+                ),
             )
             total = sample.get("total_provider_bytes")
             if (
@@ -606,50 +825,28 @@ def load_verified_workload_policy(
             raise WorkloadPolicyUnavailable(
                 f"{name!r} needs at least {MIN_DISTINCT_EXITS_PER_CLASS} distinct exits"
             )
+        if sample_tournaments != set(measured_tournament_ids):
+            raise WorkloadPolicyUnavailable(
+                f"{name!r}.measured_tournament_ids must equal the tournaments of "
+                "its cold samples"
+            )
+        # A verified class that generalizes must be evidence of a shape, not of
+        # one dominant league.  The even floor is anchored on the fixed class
+        # minimum (not on the sample count), so it matches the collector and the
+        # verifier and cannot be gamed by piling extra samples onto one league.
+        even_floor = MIN_COLD_SAMPLES_PER_CLASS // len(measured_tournament_ids)
+        for tournament_id in measured_tournament_ids:
+            count = tournament_counts.get(tournament_id, 0)
+            if count < even_floor:
+                raise WorkloadPolicyUnavailable(
+                    f"{name!r} cold samples are skewed: tournament "
+                    f"{tournament_id} has {count} of at least {even_floor}"
+                )
         observed_max = max(totals)
         if raw_class.get("hard_task_bytes") != observed_max:
             raise WorkloadPolicyUnavailable(
                 f"{name!r}.hard_task_bytes must equal max observed bytes {observed_max}"
             )
-        raw_shape_digest = raw_class.get("shape_digest")
-        if scope == "season":
-            if (
-                not isinstance(raw_shape_digest, str)
-                or len(raw_shape_digest) != 64
-                or any(char not in "0123456789abcdef" for char in raw_shape_digest)
-                or not name.endswith(raw_shape_digest[:16])
-            ):
-                raise WorkloadPolicyUnavailable(
-                    f"season class {name!r} needs its exact shape_digest"
-                )
-            raw_shape = raw_class.get("shape")
-            if not isinstance(raw_shape, Mapping):
-                raise WorkloadPolicyUnavailable(
-                    f"season class {name!r} needs its measured shape"
-                )
-            try:
-                shape_tournament_id = source_tournament_token(
-                    raw_shape.get("source_tournament_id")
-                )
-            except WorkloadPlanError as exc:
-                raise WorkloadPolicyUnavailable(
-                    f"season class {name!r} shape has no source tournament"
-                ) from exc
-            if shape_tournament_id != source_tournament_id:
-                raise WorkloadPolicyUnavailable(
-                    f"season class {name!r} shape belongs to another tournament"
-                )
-            if season_shape_digest(raw_shape) != raw_shape_digest:
-                raise WorkloadPolicyUnavailable(
-                    f"season class {name!r} shape_digest does not match its shape"
-                )
-            shape_digest_value: Optional[str] = raw_shape_digest
-        else:
-            if raw_shape_digest is not None:
-                raise WorkloadPolicyUnavailable(
-                    f"non-season class {name!r} cannot declare shape_digest"
-                )
-            shape_digest_value = None
         classes[name] = WorkloadClassBudget(
             name=name,
             scope=scope,
@@ -658,8 +855,8 @@ def load_verified_workload_policy(
             required_endpoints=required_endpoints,
             sample_count=len(samples),
             distinct_proxy_exits=len(exits),
-            shape_digest=shape_digest_value,
-            source_tournament_id=source_tournament_id,
+            shape_digest=shape_digest,
+            measured_tournament_ids=measured_tournament_ids,
         )
     return WorkloadBudgetPolicy(
         artifact_id=hashlib.sha256(raw).hexdigest(),
@@ -676,11 +873,11 @@ class SeasonWorkload:
 
     @property
     def workload_class(self) -> str:
-        return season_workload_class(self.tournament_id, self.shape)
+        return season_workload_class(self.shape)
 
     @property
     def shape_digest(self) -> str:
-        return season_shape_digest(self.shape)
+        return workload_shape_digest(self.shape)
 
     @property
     def unit(self) -> str:
@@ -721,6 +918,7 @@ class AllocationRequest:
     batch_index: int
     units: tuple[str, ...]
     source_tournament_id: int | str
+    shape_digest: str
 
 
 def _allocation_from_dict(value: object) -> WorkloadAllocation:
@@ -848,8 +1046,14 @@ class SignedDagRunPlan:
             raise WorkloadPlanError("DagRun plan must be an object")
         if value.get("schema_version") != WORKLOAD_PLAN_SCHEMA_VERSION:
             raise WorkloadPlanError("unsupported DagRun workload plan schema")
-        if value.get("workload_artifact_schema_version") != 2:
-            raise WorkloadPlanError("DagRun plan is not tied to a v2 artifact")
+        if (
+            value.get("workload_artifact_schema_version")
+            != WORKLOAD_ARTIFACT_SCHEMA_VERSION
+        ):
+            raise WorkloadPlanError(
+                "DagRun plan is not tied to a "
+                f"v{WORKLOAD_ARTIFACT_SCHEMA_VERSION} artifact"
+            )
         universe = value.get("player_universe")
         dq = value.get("dq")
         allocations = value.get("allocations")
@@ -1034,6 +1238,7 @@ def build_signed_allocation_plan(
             scope=scope,
             units=len(units),
             source_tournament_id=source_tournament_id,
+            shape_digest=request.shape_digest,
         )
         identity = {
             "artifact_id": policy.artifact_id,
@@ -1108,18 +1313,21 @@ def build_signed_dagrun_plan(
         raise WorkloadPlanError(
             "source_tournament_id is required for match/player allocations"
         )
+    match_shape_digest = workload_shape_digest(production_match_shape())
+    player_shape_digest = workload_shape_digest(production_player_shape())
     for batch_index, units in enumerate(
         stable_partitions(
             pending_match_ids, MATCH_BATCH_SIZE, field="pending_match_ids"
         )
     ):
         assert tournament is not None
-        workload_class = match_workload_class(tournament)
+        workload_class = match_workload_class()
         measured = policy.class_for(
             workload_class,
             scope="match",
             units=len(units),
             source_tournament_id=tournament,
+            shape_digest=match_shape_digest,
         )
         allocation_inputs.append(
             (
@@ -1136,12 +1344,13 @@ def build_signed_dagrun_plan(
         )
     ):
         assert tournament is not None
-        workload_class = player_workload_class(tournament)
+        workload_class = player_workload_class()
         measured = policy.class_for(
             workload_class,
             scope="player",
             units=len(units),
             source_tournament_id=tournament,
+            shape_digest=player_shape_digest,
         )
         allocation_inputs.append(
             (
@@ -1168,11 +1377,8 @@ def build_signed_dagrun_plan(
             scope="season",
             units=1,
             source_tournament_id=workload.tournament_id,
+            shape_digest=workload.shape_digest,
         )
-        if measured.shape_digest != workload.shape_digest:
-            raise WorkloadPolicyUnavailable(
-                f"season class {workload.workload_class!r} shape is not measured"
-            )
         allocation_inputs.append(
             (
                 "season",

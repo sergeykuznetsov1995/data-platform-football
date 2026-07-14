@@ -133,6 +133,13 @@ def test_new_bronze_tables_require_raw_replay_lineage(coverage):
         } <= required
 
 
+def test_participant_gender_is_a_male_only_pre_write_enum(coverage):
+    participants = coverage["tables"]["bronze.sofascore_event_participants"]
+    assert "gender" in participants["required_columns"]
+    assert participants["allowed_values"]["gender"] == ["M"]
+    assert participants["allowed_values"]["team_side"] == ["home", "away"]
+
+
 def test_every_normalized_destination_has_grain_key_dq_and_downstream(coverage):
     tables = coverage["tables"]
     for name, endpoint in coverage["endpoints"].items():
