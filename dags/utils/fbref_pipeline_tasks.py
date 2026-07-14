@@ -77,10 +77,16 @@ FBREF_REQUIRED_CURRENT_PAGE_KINDS = frozenset(
         "season",
         "season_stats",
         "schedule",
-        "standings",
-        "squad",
-        "player",
-        "matchlog",
+        "match",
+    }
+)
+FBREF_PUBLICATION_CURRENT_PAGE_KINDS = frozenset(
+    {
+        "competition_index",
+        "competition",
+        "season",
+        "season_stats",
+        "schedule",
         "match",
     }
 )
@@ -557,7 +563,11 @@ def validate_fbref_current_scope_freshness(
     if summary is None:
         raise RuntimeError("FBref freshness gate cannot find its control run")
 
-    aggregate = summary.get("current_scope_freshness")
+    aggregate = summary.get("publication_scope_freshness")
+    if not isinstance(aggregate, Mapping):
+        # Rolling upgrade compatibility for summaries written before the
+        # publication-critical split.
+        aggregate = summary.get("current_scope_freshness")
     by_kind = summary.get("freshness_by_page_kind")
     if not isinstance(aggregate, Mapping) and not isinstance(by_kind, Mapping):
         raise RuntimeError(
@@ -572,7 +582,7 @@ def validate_fbref_current_scope_freshness(
             violations.append("missing_page_kinds=" + ",".join(missing))
         for raw_kind, raw_metrics in by_kind.items():
             kind = str(raw_kind)
-            if kind not in FBREF_CURRENT_SCOPE_FRESHNESS_HOURS:
+            if kind not in FBREF_PUBLICATION_CURRENT_PAGE_KINDS:
                 continue
             if not isinstance(raw_metrics, Mapping):
                 violations.append(f"{kind}:invalid_metrics")
@@ -638,7 +648,7 @@ def validate_fbref_current_scope_freshness(
     return {
         "status": "passed",
         "run_type": normalized_run_type,
-        "current_scope_freshness": normalized_aggregate,
+        "publication_scope_freshness": normalized_aggregate,
         "freshness_by_page_kind": normalized_kinds,
     }
 
@@ -1080,6 +1090,7 @@ def validate_fbref_run(
     airflow_run_id: str,
     dag_id: str,
     source_control_run_id: Optional[str] = None,
+    publication_eligible: bool = True,
 ) -> dict:
     summary = _pipeline().validate_and_finish(
         _control_run_id(airflow_run_id=airflow_run_id, dag_id=dag_id),
@@ -1089,6 +1100,7 @@ def validate_fbref_run(
             or not str(source_control_run_id).strip()
             else str(source_control_run_id).strip()
         ),
+        publication_eligible=publication_eligible,
     )
     logger.info(
         "FBref validated run: requests=%s bytes=%s targets=%s datasets=%s",
@@ -1100,6 +1112,24 @@ def validate_fbref_run(
     logger.info("FBref control metrics: %s", json.dumps(summary, default=str))
     _record_control_traffic(summary, airflow_run_id=airflow_run_id)
     return summary
+
+
+def choose_fbref_publication_path(
+    *, request_limit: int, byte_limit_mb: int
+) -> str:
+    """Route the bounded canary away from publication tasks."""
+
+    profile = validate_fbref_runtime_limits(
+        run_type="current",
+        request_limit=request_limit,
+        byte_limit_mb=byte_limit_mb,
+        shard_size=FBREF_MAX_WARM_SESSION_TARGETS,
+    )["profile"]
+    return (
+        "validate_canary_run"
+        if profile == "canary"
+        else "validate_current_scope_freshness"
+    )
 
 
 def abort_fbref_run(

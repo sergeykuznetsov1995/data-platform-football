@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 from airflow import DAG
 from airflow.models.param import Param
 from airflow.operators.python import PythonOperator
+from airflow.operators.python import BranchPythonOperator
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 
 from utils.default_args import DEFAULT_ARGS, INGEST_SCRAPER_POOL
@@ -24,12 +25,14 @@ from utils.fbref_pipeline_tasks import (
     FBREF_PRODUCTION_BYTE_LIMIT_MB,
     FBREF_PRODUCTION_REQUEST_LIMIT,
     acquire_fbref_publication_lock,
+    choose_fbref_publication_path,
     export_fbref_publication_scope,
     fetch_fbref_wave,
     fbref_dag_failure_callback,
     initialize_fbref_run,
     parse_fbref_wave,
     run_recovery_wave,
+    release_fbref_publication_lock,
     seed_fbref_competition_index,
     validate_fbref_current_scope_freshness,
     validate_fbref_production_readiness,
@@ -220,6 +223,37 @@ with DAG(
         previous >> fetch >> parse
         previous = parse
 
+    choose_path = BranchPythonOperator(
+        task_id="choose_publication_path",
+        python_callable=choose_fbref_publication_path,
+        op_kwargs={
+            "request_limit": REQUEST_LIMIT,
+            "byte_limit_mb": BYTE_LIMIT_MB,
+        },
+        trigger_rule="all_success",
+    )
+
+    validate_canary = PythonOperator(
+        task_id="validate_canary_run",
+        python_callable=validate_fbref_run,
+        op_kwargs={
+            "airflow_run_id": AIRFLOW_RUN_ID,
+            "dag_id": DAG_ID,
+            "publication_eligible": False,
+        },
+        trigger_rule="all_success",
+    )
+
+    release_canary_lock = PythonOperator(
+        task_id="release_canary_publication_lock",
+        python_callable=release_fbref_publication_lock,
+        op_kwargs={
+            "airflow_run_id": AIRFLOW_RUN_ID,
+            "dag_id": DAG_ID,
+        },
+        trigger_rule="all_success",
+    )
+
     validate_freshness = PythonOperator(
         task_id="validate_current_scope_freshness",
         python_callable=validate_fbref_current_scope_freshness,
@@ -269,7 +303,9 @@ with DAG(
         trigger_rule="all_success",
     )
 
-    previous >> validate_freshness >> validate_run
+    previous >> choose_path
+    choose_path >> validate_canary >> release_canary_lock
+    choose_path >> validate_freshness >> validate_run
     validate_run >> export_publication_scope >> trigger_silver
 
 

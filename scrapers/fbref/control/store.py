@@ -90,6 +90,17 @@ _PAGE_KIND_SLA_VALUES = ", ".join(
     f"('{page_kind}', {seconds})"
     for page_kind, seconds in sorted(_PAGE_KIND_SLA_SECONDS.items())
 )
+_PUBLICATION_FRESHNESS_PAGE_KINDS = frozenset(
+    {
+        "competition_index",
+        "competition",
+        "season",
+        "season_stats",
+        "schedule",
+        "standings",
+        "match",
+    }
+)
 _FRONTIER_SCOPE_CTE = """
     WITH declared_scope AS (
         SELECT frontier.target_id, frontier.source,
@@ -2487,7 +2498,10 @@ class ControlStore:
             )
             if not policies:
                 return []
-        control_quota = max(1, normalized_limit // 5)
+        # Publication-critical pages must drain before enrichment backlog.
+        # The old five-target lane let thousands of player pages consume most
+        # of a bounded run while overdue schedules/seasons remained stale.
+        control_quota = normalized_limit
         cohort = []
         with self._transaction() as cursor:
             cursor.execute(
@@ -2512,7 +2526,8 @@ class ControlStore:
                            AND frontier.refresh_policy <> 'historical_once'
                            AND frontier.page_kind = ANY(ARRAY[
                                'competition_index', 'competition',
-                               'season', 'schedule'
+                               'season', 'season_stats', 'schedule',
+                               'standings', 'match'
                            ]::text[])
                          ) AS control_lane
                   FROM fbref_control.page_frontier AS frontier
@@ -3258,9 +3273,16 @@ class ControlStore:
                                    - (sla_seconds * interval '1 second')
                                )
                              )
-                             ELSE last_fetched_at IS NOT NULL
-                               AND last_fetched_at >= clock_timestamp()
-                                 - (sla_seconds * interval '1 second')
+                            ELSE (
+                              last_fetched_at IS NOT NULL
+                              AND last_fetched_at >= clock_timestamp()
+                                - (sla_seconds * interval '1 second')
+                            ) OR (
+                              last_fetched_at IS NULL
+                              AND state IN ('queued', 'retry', 'leased')
+                              AND created_at >= clock_timestamp()
+                                - (sla_seconds * interval '1 second')
+                            )
                            END AS within_sla
                     FROM current_scope
                 )
@@ -3317,6 +3339,29 @@ class ControlStore:
                 freshness_totals["stale_targets"] == 0
             )
             summary["current_scope_freshness"] = freshness_totals
+            publication_rows = [
+                row
+                for kind, row in freshness_by_kind.items()
+                if kind in _PUBLICATION_FRESHNESS_PAGE_KINDS
+            ]
+            publication_freshness = {
+                "total_targets": sum(
+                    row["total_targets"] for row in publication_rows
+                ),
+                "fresh_targets": sum(
+                    row["fresh_targets"] for row in publication_rows
+                ),
+                "stale_targets": sum(
+                    row["stale_targets"] for row in publication_rows
+                ),
+                "never_fetched_targets": sum(
+                    row["never_fetched_targets"] for row in publication_rows
+                ),
+            }
+            publication_freshness["all_within_sla"] = (
+                publication_freshness["stale_targets"] == 0
+            )
+            summary["publication_scope_freshness"] = publication_freshness
 
             cursor.execute(
                 """

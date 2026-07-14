@@ -351,7 +351,7 @@ def test_claim_is_bounded_and_returns_uuid_fence():
         store.claim_targets(run_id, "worker-1", limit=26)
 
 
-def test_due_cohort_uses_fifo_age_before_priority():
+def test_due_cohort_prioritizes_publication_lane_before_enrichment():
     selected = {}
 
     def handler(sql, _params):
@@ -374,14 +374,17 @@ def test_due_cohort_uses_fifo_age_before_priority():
     assert "FOR UPDATE" in selected["run_sql"]
     sql = selected["sql"]
     ordering = sql[sql.rindex("ORDER BY CASE") :]
-    assert ordering.index("frontier.created_at") < ordering.index(
+    assert ordering.index("control_lane_rank <= %s") < ordering.index(
         "frontier.priority DESC"
     )
     assert ordering.index("frontier.last_fetched_at IS NOT NULL") < ordering.index(
         "frontier.created_at"
     )
     assert "control_lane_rank <= %s" in sql
-    assert "'competition_index', 'competition', 'season', 'schedule'" in sql
+    assert (
+        "'competition_index', 'competition', 'season', 'season_stats', "
+        "'schedule', 'standings', 'match'"
+    ) in sql
     assert "fbref_control.frontier_provenance" in sql
     assert "scope.scope_count > 0" in sql
     assert "scope.has_female" in sql

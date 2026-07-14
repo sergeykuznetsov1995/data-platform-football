@@ -27,6 +27,7 @@ from scrapers.fbref.pipeline import (
     RunValidationError,
     SENTINEL_COMPETITIONS,
     frontier_target,
+    live_wave_target_capacity,
     page_target_from_link,
     wave_target_capacity,
 )
@@ -65,6 +66,32 @@ def test_wave_capacity_matches_live_canary_and_production_admission(
     )
 
     assert wave_target_capacity(settings) == expected
+
+
+@pytest.mark.parametrize(
+    ("request_limit", "byte_limit", "expected"),
+    [
+        (100, 50 * 1024 * 1024, 25),
+        (200, 100 * 1024 * 1024, 25),
+    ],
+)
+def test_live_wave_capacity_uses_sequential_byte_reservations(
+    request_limit, byte_limit, expected
+):
+    settings = PipelineSettings(
+        run_type="current",
+        request_limit=request_limit,
+        byte_limit=byte_limit,
+        shard_size=25,
+    )
+
+    assert live_wave_target_capacity(settings) == expected
+    assert live_wave_target_capacity(
+        settings, request_remaining=19, byte_remaining=byte_limit
+    ) == 0
+    assert live_wave_target_capacity(
+        settings, request_remaining=100, byte_remaining=6 * 1024 * 1024
+    ) == 0
 
 
 def _complete_sentinel_coverage():
@@ -1963,6 +1990,24 @@ def test_validation_accepts_complete_eligible_sentinel_coverage(tmp_path):
     pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
 
     pipeline.validate_and_finish(str(uuid.uuid4()))
+
+    assert "finish:True" in control.events
+
+
+def test_canary_validation_does_not_require_global_publication_freshness(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    summary = control.get_run_summary(str(uuid.uuid4()))
+    summary["publication_scope_freshness"] = {
+        "total_targets": 4,
+        "fresh_targets": 0,
+        "stale_targets": 4,
+        "all_within_sla": False,
+    }
+    control.get_run_summary = lambda _, **__: summary
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    pipeline.validate_and_finish(str(uuid.uuid4()), publication_eligible=False)
 
     assert "finish:True" in control.events
 
