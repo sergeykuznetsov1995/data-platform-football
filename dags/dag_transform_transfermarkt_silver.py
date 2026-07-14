@@ -820,6 +820,14 @@ def _pin_transform_input_snapshots(**context) -> dict[str, Any]:
         }
         root_tables = sources - outputs
         root_tables.add(tm_scope.SCOPE_MANIFEST_TABLE)
+        # #948: the Bronze DQ gate anti-joins native Bronze against the
+        # non-slotted promoted-registry relations; pin them as roots so the
+        # gate and the candidate CTAS read one consistent registry snapshot.
+        # Safe wrt _run_transform rewrites: rewrite_native_relations() runs
+        # before _pin_sql_relations(), so native SQL only contains slotted
+        # *_v2_<slot> names which these non-slotted pins can never touch.
+        root_tables.add(tm_planner.COMPETITIONS_TABLE)
+        root_tables.add(tm_planner.EDITIONS_TABLE)
     else:
         root_tables = set()
     if reader.get('legacy_writers_disabled_at') is None:
@@ -1031,6 +1039,87 @@ def _authorize_write_phase(
         'candidate_slot': candidate_slot,
         'phase': phase,
         'affected_tables': list(expected_tables),
+    }
+
+
+def _validate_bronze_quality(**context) -> dict[str, Any]:
+    """Blocking cross-table Bronze DQ before the Silver write approval (#948).
+
+    Runs between ``pin_transform_input_snapshots`` and
+    ``authorize_silver_writes`` so a red Bronze fails the run BEFORE the
+    one-shot write-approval packet is consumed.  ERROR results gate; WARNING
+    results are observability-only.  The manual compatibility path writes
+    only legacy tables, so it runs only the legacy Bronze zone.
+    """
+
+    from airflow.exceptions import AirflowException
+    from utils import transfermarkt_bronze_dq as bronze_dq
+    from utils.alerts import telegram_dq_summary
+    from utils.medallion_config import load_competitions
+
+    scope = _transform_scope(context)
+    pins = _captured_pins(context)
+    input_snapshots = dict(pins.get('input_snapshot_ids') or {})
+    legacy_allowlist = sorted({
+        (str(competition['id']), str(season['id']))
+        for competition in load_competitions()['competitions']
+        for season in competition.get('seasons', [])
+    })
+
+    zone = 'scope_set' if scope.get('mode') == 'scope_set' else 'legacy'
+    conn = tm_v2.connect()
+    cur = conn.cursor()
+    try:
+        if zone == 'scope_set':
+            scope_set = _parse_scope_set_conf(_dag_conf(context))
+            manifests = _load_scope_manifests(cur, scope_set=scope_set)
+            results = bronze_dq.run_bronze_dq(
+                cur,
+                registry_snapshot_id=scope['registry_snapshot_id'],
+                pins=input_snapshots,
+                zone='scope_set',
+                manifests=manifests,
+                legacy_allowlist=legacy_allowlist,
+            )
+        else:
+            results = bronze_dq.run_bronze_dq(
+                cur,
+                registry_snapshot_id=scope.get('registry_snapshot_id'),
+                pins=input_snapshots,
+                zone='legacy',
+                legacy_allowlist=legacy_allowlist,
+            )
+    except (TypeError, ValueError, tm_scope.ScopeManifestError) as exc:
+        raise AirflowException(
+            f'Transfermarkt Bronze DQ failed closed: {exc}'
+        ) from exc
+    finally:
+        cur.close()
+        conn.close()
+
+    report = bronze_dq.BronzeDqReport(list(results))
+    logger.info('TM Bronze DQ: %s', report.summary())
+    telegram_dq_summary(report, header='TM Bronze DQ')
+
+    if report.errors:
+        raise AirflowException(
+            f'TM Bronze DQ failed: {len(report.errors)} error(s): '
+            + '; '.join(
+                f'{r.name}: {r.details or r.error}' for r in report.errors[:5]
+            )
+        )
+
+    def _value(name: str) -> Any:
+        return next((r.value for r in results if r.name == name), None)
+
+    return {
+        'zone': zone,
+        'passed': len(report.passed),
+        'total': len(report.results),
+        'errors': [r.name for r in report.errors],
+        'warnings': [r.name for r in report.warnings],
+        'coverage': _value('tm_target_scope_coverage'),
+        'career_debt': _value('tm_career_debt'),
     }
 
 
@@ -2221,6 +2310,11 @@ with DAG(
         python_callable=_pin_transform_input_snapshots,
     )
 
+    validate_bronze_quality = PythonOperator(
+        task_id='validate_bronze_quality',
+        python_callable=_validate_bronze_quality,
+    )
+
     authorize_silver_writes = PythonOperator(
         task_id='authorize_silver_writes',
         python_callable=_authorize_silver_writes,
@@ -2344,7 +2438,10 @@ with DAG(
 
     validate_transform_scope_set >> capture_reader_state
     capture_reader_state >> pin_transform_input_snapshots
-    pin_transform_input_snapshots >> authorize_silver_writes
+    # #948: the Bronze DQ gate fails the run BEFORE the one-shot Silver
+    # write-approval packet is consumed.
+    pin_transform_input_snapshots >> validate_bronze_quality
+    validate_bronze_quality >> authorize_silver_writes
     authorize_silver_writes >> persist_scope_set_manifest
     persist_scope_set_manifest >> transforms_group
     persist_scope_set_manifest >> native_v2_gate
