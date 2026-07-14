@@ -141,7 +141,8 @@ class FakeControl:
         self.fetches = []
         self.registry = {}
         self.seasons = []
-        self.season_aliases = []
+        self.season_aliases = {}
+        self.season_alias_calls = []
         self.manifests = []
         self.observations = {}
         self.provenance = []
@@ -509,7 +510,15 @@ class FakeControl:
         return {}
 
     def upsert_season_alias(self, alias, *, snapshot_id=None):
-        self.season_aliases.append((alias, snapshot_id))
+        key = (alias.source, alias.competition_id, alias.alias)
+        previous = self.season_aliases.get(key)
+        if previous is not None and previous[0].season_id != alias.season_id:
+            raise StateConflict(
+                f"Season alias {alias.competition_id}/{alias.alias} "
+                "is already mapped to a different season"
+            )
+        self.season_aliases[key] = (alias, snapshot_id)
+        self.season_alias_calls.append((alias, snapshot_id))
 
     def upsert_frontier_target(self, target):
         self.events.append(f"frontier_upsert:{target.target_id}")
@@ -1742,7 +1751,7 @@ def test_duplicate_display_label_selects_one_canonical_current_edition(
     current = [entry for entry in control.seasons if entry.is_current]
     assert [entry.season_id for entry in current] == ["2025"]
     display_aliases = [
-        alias for alias, _ in control.season_aliases
+        alias for alias, _ in control.season_aliases.values()
         if alias.alias_kind == "label" and alias.alias == "2025"
     ]
     assert [alias.season_id for alias in display_aliases] == ["2025"]
@@ -1752,6 +1761,104 @@ def test_duplicate_display_label_selects_one_canonical_current_edition(
     ]
     assert len(current_targets) == 1
     assert current_targets[0]["source_ids"]["season_id"] == "2025"
+
+
+def test_non_conflicting_display_label_remains_resolvable(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.registry["9"] = {
+        "competition_id": "9",
+        "canonical_url": "https://fbref.com/en/comps/9/history/x",
+        "name": "Premier League",
+        "gender": "male",
+        "classification": "league:club",
+        "metadata": {"last_season": "2025"},
+    }
+    target = page_target_from_link(DiscoveredPageLink(
+        page_kind="competition",
+        canonical_url="https://fbref.com/en/comps/9/history/x",
+        source_ids={"competition_id": "9"},
+    ))
+    html = """
+    <table id="seasons"><tbody>
+      <tr><th data-stat="season"><a href="/en/comps/9/2024-2025/x">2025</a></th></tr>
+    </tbody></table>
+    """
+    _, record = _commit_for_parse(raw, target, html)
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    seeded, skipped = pipeline._parse_competition(
+        str(uuid.uuid4()), html, record, run_type="current"
+    )
+
+    assert (seeded, skipped) == (1, 0)
+    source_alias, _ = control.season_aliases[(
+        "fbref", "9", "2024-2025"
+    )]
+    display_alias, _ = control.season_aliases[("fbref", "9", "2025")]
+    assert source_alias.season_id == "2024-2025"
+    assert source_alias.alias_kind == "source"
+    assert display_alias.season_id == "2024-2025"
+    assert display_alias.alias_kind == "label"
+
+
+def test_source_season_ids_win_over_shifted_display_labels(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.registry["719"] = {
+        "competition_id": "719",
+        "canonical_url": "https://fbref.com/en/comps/719/history/x",
+        "name": "FIFA Club World Cup",
+        "gender": "male",
+        "classification": "cup:club",
+        "metadata": {"last_season": "2025"},
+    }
+    target = page_target_from_link(DiscoveredPageLink(
+        page_kind="competition",
+        canonical_url="https://fbref.com/en/comps/719/history/x",
+        source_ids={"competition_id": "719"},
+    ))
+    html = """
+    <table id="seasons"><tbody>
+      <tr><th data-stat="season"><a href="/en/comps/719/2019/x">2019</a></th></tr>
+      <tr><th data-stat="season"><a href="/en/comps/719/2020/x">2021</a></th></tr>
+      <tr><th data-stat="season"><a href="/en/comps/719/2021/x">2022</a></th></tr>
+      <tr><th data-stat="season"><a href="/en/comps/719/2022/x">2023</a></th></tr>
+      <tr><th data-stat="season"><a href="/en/comps/719/2023/x">2023</a></th></tr>
+      <tr><th data-stat="season"><a href="/en/comps/719/2025/x">2025</a></th></tr>
+    </tbody></table>
+    """
+    _, record = _commit_for_parse(raw, target, html)
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    seeded, skipped = pipeline._parse_competition(
+        str(uuid.uuid4()), html, record, run_type="current"
+    )
+
+    assert skipped == 0
+    assert seeded == 1
+    current = [entry for entry in control.seasons if entry.is_current]
+    assert [entry.season_id for entry in current] == ["2025"]
+    resolved = {
+        alias.alias: alias.season_id
+        for alias, _ in control.season_aliases.values()
+    }
+    assert resolved == {
+        "2019": "2019",
+        "2020": "2020",
+        "2021": "2021",
+        "2022": "2022",
+        "2023": "2023",
+        "2025": "2025",
+    }
+    alias_2021, _ = control.season_aliases[("fbref", "719", "2021")]
+    alias_2022, _ = control.season_aliases[("fbref", "719", "2022")]
+    assert alias_2021.alias_kind == "source"
+    assert alias_2022.alias_kind == "source"
+    assert not any(
+        alias.alias_kind == "label" and alias.alias in {"2021", "2022"}
+        for alias, _ in control.season_alias_calls
+    )
 
 
 def test_validation_fails_closed_on_partial_target_state(tmp_path):
@@ -2072,7 +2179,7 @@ def test_new_stateful_parser_replay_rebuilds_latest_raw_offline(tmp_path):
         refresh,
         PAGE_DOCUMENT_VERSION,
         TYPED_BRONZE_PARSER_VERSION,
-        "old-discovery-parser",
+        "fbref-discovery-parser-v5",
     )] = {"status": "succeeded"}
     control.fetches = [{
         "target_id": record.target_id,

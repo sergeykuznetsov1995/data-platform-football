@@ -1457,6 +1457,14 @@ class FBrefPipeline:
                         entry.season_id,
                     ),
                 )
+                # Source IDs and display labels share one alias namespace.
+                # Never let a shifted label reinterpret another canonical
+                # source season (for example Club World Cup 2021/"2022").
+                if (
+                    label in registered_season_ids
+                    and canonical.season_id != label
+                ):
+                    continue
                 upsert_alias(SeasonAlias(
                     competition_id=competition_id,
                     alias=label,
