@@ -24,43 +24,43 @@ SPEC.loader.exec_module(bench)
 MIB = bench.MIB
 _phase_delta = bench._phase_delta
 _append_checked_phase = bench._append_checked_phase
-_weekly_projection = bench._weekly_projection
+_cycle_projection = bench._cycle_projection
 run = bench.run
 
 
 def test_production_profile_has_exact_phase_and_shared_caps():
     from scrapers.transfermarkt import scraper as scraper_module
 
-    assert bench.PRODUCTION_CYCLE_BUDGET_BYTES == 15 * MIB
+    assert bench.PRODUCTION_CYCLE_BUDGET_BYTES == 24 * MIB
     assert bench.PRODUCTION_PHASE_BUDGETS == {
         'squads': {
-            'decoded_body_bytes': 10 * MIB,
-            'request_attempts': 26,
+            'decoded_body_bytes': 16 * MIB,
+            'request_attempts': 150,
         },
         'market_value_points': {
             'decoded_body_bytes': 4 * MIB,
-            'request_attempts': 120,
+            'request_attempts': 650,
         },
         'transfer_events': {
-            'decoded_body_bytes': 8 * MIB,
-            'request_attempts': 120,
+            'decoded_body_bytes': 12 * MIB,
+            'request_attempts': 650,
         },
         'coaches': {
-            'decoded_body_bytes': 6 * MIB,
-            'request_attempts': 50,
+            'decoded_body_bytes': 14 * MIB,
+            'request_attempts': 160,
         },
     }
     assert scraper_module._DEFAULT_DECODED_BUDGET_MB == {
-        'players': 10.0,
+        'players': 16.0,
         'market_value_history': 4.0,
-        'transfers': 8.0,
-        'coaches': 6.0,
+        'transfers': 12.0,
+        'coaches': 14.0,
     }
     assert scraper_module._DEFAULT_REQUEST_ATTEMPT_BUDGET == {
-        'players': 26,
-        'market_value_history': 120,
-        'transfers': 120,
-        'coaches': 50,
+        'players': 150,
+        'market_value_history': 650,
+        'transfers': 650,
+        'coaches': 160,
     }
 
 
@@ -68,11 +68,11 @@ def test_phase_cap_plus_one_byte_fails_on_raw_counter():
     report = {'phases': []}
     before = {'decoded_response_body_bytes': 0, 'request_attempts': 0}
     after = {
-        'decoded_response_body_bytes': 10 * MIB + 1,
+        'decoded_response_body_bytes': 16 * MIB + 1,
         'request_attempts': 1,
     }
 
-    with pytest.raises(TrafficBudgetExceeded, match='10485761/10485760 bytes'):
+    with pytest.raises(TrafficBudgetExceeded, match='16777217/16777216 bytes'):
         _append_checked_phase(report, 'squads', before, after)
 
     assert report['phases'][0]['within_budget'] is False
@@ -105,7 +105,8 @@ def test_phase_delta_uses_attempt_and_byte_differences():
     }
 
 
-def test_weekly_projection_keeps_roster_fixed_and_scales_samples():
+def test_cycle_projection_keeps_roster_fixed_and_scales_samples():
+    assert bench.CYCLE_PLAYER_TARGET == 500
     phases = [
         {"phase": "squads", "decoded_response_body_bytes": 2 * MIB},
         {"phase": "market_value_points", "decoded_response_body_bytes": MIB},
@@ -113,14 +114,15 @@ def test_weekly_projection_keeps_roster_fixed_and_scales_samples():
         {"phase": "coaches", "decoded_response_body_bytes": MIB},
     ]
 
-    projected = _weekly_projection(
+    projected = _cycle_projection(
         phases,
         sampled_players=20,
         sampled_coach_clubs=5,
     )
 
-    # 2 fixed + 1*5 MV + 2*5 transfers + 1*4 coaches.
-    assert projected["decoded_response_body_mb"] == 21.0
+    # Careers scale 20 sampled -> 500 window (x25), coaches 5 -> 20 (x4):
+    # 2 fixed + 1*25 MV + 2*25 transfers + 1*4 coaches.
+    assert projected["decoded_response_body_mb"] == 81.0
 
 
 def test_missing_proxy_file_fails_before_network(tmp_path):
@@ -353,4 +355,4 @@ def test_benchmark_fails_closed_below_coach_completeness_gate(
     assert report['status'] == 'failed'
     assert report['coach_completeness']['ratio'] == 0.5
     assert 'below 90%' in report['error']
-    assert 'weekly_projection' not in report
+    assert 'cycle_projection' not in report

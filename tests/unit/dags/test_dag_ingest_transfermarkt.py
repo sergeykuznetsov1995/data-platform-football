@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
 from enum import Enum
 import importlib
 import inspect
@@ -49,12 +50,12 @@ def _params(module, **overrides):
         'max_batch': 8,
         'approval_journal': module.APPROVAL_JOURNAL,
         'approval_bundles': {},
-        'mv_transfers_limit': 100,
+        'mv_transfers_limit': 500,
         'refresh_mode': 'auto',
         'coach_history_ttl_days': 28,
         'checkpoint_ttl_days': 35,
         'proxy_lease_ttl_seconds': 3600,
-        'proxy_request_limit': 710,
+        'proxy_request_limit': 1610,
         'proxy_retry_limit': 2,
         'entity_timeout_seconds': 3600,
     }
@@ -129,6 +130,10 @@ class TestDagShape:
         assert '--career-window-limit "$TM_MV_TRANSFERS_LIMIT"' in command
         assert '--cycle-budget-bytes "$TM_PROVIDER_HARD_CAP_BYTES"' in command
         assert '--soft-byte-stop-bytes "$TM_PROVIDER_SOFT_STOP_BYTES"' in command
+        assert '--parent-byte-budget "$TM_PARENT_BYTE_BUDGET"' in command
+        assert '--parent-soft-byte-stop "$TM_PARENT_SOFT_BYTE_STOP"' in command
+        assert '--parent-request-limit "$TM_PARENT_REQUEST_LIMIT"' in command
+        assert '--parent-retry-limit "$TM_PARENT_RETRY_LIMIT"' in command
         assert '--checkpoint-ttl-days "$TM_CHECKPOINT_TTL_DAYS"' in command
         assert '--entity-timeout-seconds "$TM_ENTITY_TIMEOUT_SECONDS"' in command
         assert '--mv-transfers-limit' not in command
@@ -164,13 +169,47 @@ class TestDagShape:
 
     def test_bounded_operator_params_are_not_relaxable(self, dag_module):
         params = dag_module.dag._dag_kwargs['params']
-        assert params['mv_transfers_limit']._kw['maximum'] == 100
-        assert params['proxy_retry_limit']._kw['maximum'] == 400
-        assert params['proxy_request_limit']._kw['maximum'] == 710
+        assert params['mv_transfers_limit']._kw['maximum'] == 500
+        assert params['proxy_retry_limit']._kw['maximum'] == 800
+        assert params['proxy_request_limit']._kw['maximum'] == 1610
         assert params['proxy_lease_ttl_seconds']._kw['maximum'] == 3600
-        assert dag_module.PROVIDER_HARD_CAP_BYTES == 15 * 1024 * 1024
-        assert dag_module.PROVIDER_SOFT_STOP_BYTES == 14 * 1024 * 1024
+        assert dag_module.PROVIDER_HARD_CAP_BYTES == 24 * 1024 * 1024
+        assert dag_module.PROVIDER_SOFT_STOP_BYTES == 22 * 1024 * 1024
+        assert dag_module.PARENT_BYTE_BUDGET == 84 * 1024 * 1024
+        assert dag_module.PARENT_SOFT_BYTE_STOP == 80 * 1024 * 1024
+        assert dag_module.PARENT_REQUEST_LIMIT == 8 * 1610
+        assert dag_module.PARENT_RETRY_LIMIT == 8 * 800
         assert dag_module.PROXY_CONCURRENCY == 1
+
+    def test_task_timeout_covers_every_entity_subprocess_it_supervises(
+        self, dag_module,
+    ):
+        # A SIGKILL at the task timeout lands in the middle of paid I/O: the
+        # attempt guard is not written and the entity's evidence is lost.  The
+        # ceiling therefore has to be worst-case compatible, not average.
+        from types import SimpleNamespace
+
+        from dags.scripts import run_transfermarkt_scope_cycle as wrapper
+        from scrapers.transfermarkt import models
+
+        task = _bash_task('run_exact_child_cycle')
+        execution_timeout = task._init_kwargs['execution_timeout']
+        params = dag_module.dag._dag_kwargs['params']
+        args = SimpleNamespace(
+            entity_timeout_seconds=params['entity_timeout_seconds']._kw[
+                'maximum'
+            ],
+        )
+        worst_case = sum(
+            wrapper._entity_timeout_seconds(args, entity)
+            for entity in wrapper.ENTITY_ORDER
+        )
+
+        assert worst_case == 18_000
+        assert execution_timeout.total_seconds() >= worst_case
+        assert execution_timeout == timedelta(
+            seconds=models.SCOPE_WALL_CLOCK_TIMEOUT_SECONDS,
+        )
 
     def test_ingest_stops_at_scope_set_before_fresh_transform_approval(
         self, dag_module,
@@ -244,7 +283,11 @@ class TestPlanningGate:
         env = environments[0]
         assert json.loads(env['TM_SCOPE_PAYLOAD_JSON'])['scope_id'] == 'GB1__2025'
         assert env['TM_READER_REVISION'] == '7'
-        assert env['TM_PROVIDER_HARD_CAP_BYTES'] == str(15 * 1024 * 1024)
+        assert env['TM_PROVIDER_HARD_CAP_BYTES'] == str(24 * 1024 * 1024)
+        assert env['TM_PARENT_BYTE_BUDGET'] == str(84 * 1024 * 1024)
+        assert env['TM_PARENT_SOFT_BYTE_STOP'] == str(80 * 1024 * 1024)
+        assert env['TM_PARENT_REQUEST_LIMIT'] == str(8 * 1610)
+        assert env['TM_PARENT_RETRY_LIMIT'] == str(8 * 800)
         assert env['TM_REFRESH_MODE'] == 'current'
         assert env['TM_CHECKPOINT_TTL_DAYS'] == '35'
         assert env['TM_ENTITY_TIMEOUT_SECONDS'] == '3600'
@@ -307,9 +350,9 @@ def _write_standing_policy(tmp_path: Path, **overrides) -> tuple[Path, str]:
         'approved_at': '2026-07-14T00:00:00Z',
         'expires_at': '2100-01-01T00:00:00Z',
         'paid_proxy': {
-            'byte_cap_bytes': 15 * 1024 * 1024,
-            'request_limit': 710,
-            'retry_limit': 400,
+            'byte_cap_bytes': 24 * 1024 * 1024,
+            'request_limit': 1610,
+            'retry_limit': 800,
             'concurrency': 1,
         },
         'production_write': {
@@ -363,7 +406,7 @@ class TestStandingPolicyGate:
         return payload
 
     def _standing_params(self, dag_module, **overrides):
-        values = {'proxy_retry_limit': 400}
+        values = {'proxy_retry_limit': 800}
         values.update(overrides)
         return _params(dag_module, **values)
 
@@ -535,9 +578,9 @@ class TestStandingPolicyGate:
     @pytest.mark.parametrize(
         ('paid_override', 'params_override'),
         [
-            ({'byte_cap_bytes': 16 * 1024 * 1024}, {}),
-            ({'request_limit': 711}, {}),
-            ({'retry_limit': 401}, {}),
+            ({'byte_cap_bytes': 15 * 1024 * 1024}, {}),
+            ({'request_limit': 1611}, {}),
+            ({'retry_limit': 801}, {}),
             ({'concurrency': 2}, {}),
             ({}, {'proxy_retry_limit': 2}),
         ],
@@ -547,9 +590,9 @@ class TestStandingPolicyGate:
     ):
         self._arm(dag_module, monkeypatch, tmp_path)
         paid = {
-            'byte_cap_bytes': 15 * 1024 * 1024,
-            'request_limit': 710,
-            'retry_limit': 400,
+            'byte_cap_bytes': 24 * 1024 * 1024,
+            'request_limit': 1610,
+            'retry_limit': 800,
             'concurrency': 1,
         }
         paid.update(paid_override)
@@ -771,8 +814,8 @@ def _write_manifest_and_ledger(module, tmp_path: Path, *, bad_digest=False):
         'provider_metered_bytes': provider_bytes,
         'requests': len(entities),
         'retries': 0,
-        'hard_provider_byte_budget': module.PROVIDER_HARD_CAP_BYTES,
-        'soft_provider_byte_stop': module.PROVIDER_SOFT_STOP_BYTES,
+        'hard_provider_byte_budget': module.PARENT_BYTE_BUDGET,
+        'soft_provider_byte_stop': module.PARENT_SOFT_BYTE_STOP,
     }
     Path(payload['parent_ledger']['path']).write_text(
         json.dumps(ledger), encoding='utf-8',
@@ -960,6 +1003,150 @@ class TestScopeSetGate:
                 [{'TM_SCOPE_PAYLOAD_JSON': json.dumps(payload)}],
                 {'revision': 7, 'candidate_slot': 'b'},
             )
+
+
+class TestBudgetCanonSingleSource:
+    def test_scheduled_parent_cycle_runs_daily(self):
+        from utils.config import SCHEDULES
+
+        assert SCHEDULES['dag_ingest_transfermarkt'] == '0 4 * * *'
+
+    def test_every_consumer_pins_the_same_budget_canon(self, dag_module):
+        """models == scope_cycle == runner == DAG == bench == prepare == policy.
+
+        The numbers are compared through imports, so any consumer drifting
+        away from the canon in scrapers/transfermarkt/models.py fails here.
+        """
+        import importlib.util
+
+        from dags.scripts import run_transfermarkt_scope_cycle as wrapper
+        from dags.scripts import run_transfermarkt_scraper as runner
+        from dags.utils.transfermarkt_approval import load_standing_policy
+        from scrapers.transfermarkt import models
+        from scrapers.transfermarkt import scraper as scraper_module
+
+        root = Path(__file__).resolve().parents[3]
+
+        def _load(path: Path, name: str):
+            spec = importlib.util.spec_from_file_location(name, path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module
+
+        bench = _load(
+            root / 'scripts' / 'research' / 'bench_transfermarkt_fetch.py',
+            'bench_transfermarkt_fetch_canon',
+        )
+        prepare = _load(
+            root / 'scripts' / 'prepare_transfermarkt_scope_approvals.py',
+            'prepare_transfermarkt_scope_approvals_canon',
+        )
+        policy = load_standing_policy(
+            root / 'dags' / 'configs' / 'transfermarkt'
+            / 'standing_approval_policy.json',
+        )
+
+        # Scope-cycle wrapper.
+        assert wrapper.HARD_BYTE_CAP == models.SCOPE_HARD_PROVIDER_BYTE_CAP
+        assert wrapper.SOFT_BYTE_STOP == models.SCOPE_SOFT_PROVIDER_BYTE_STOP
+        assert wrapper.PARENT_BYTE_BUDGET == (
+            models.PARENT_DAILY_HARD_PROVIDER_BYTE_CAP
+        )
+        assert wrapper.PARENT_SOFT_BYTE_STOP == (
+            models.PARENT_DAILY_SOFT_PROVIDER_BYTE_STOP
+        )
+        assert wrapper.PARENT_RETRY_LIMIT == models.PARENT_RETRY_LIMIT
+        assert wrapper.DEFAULT_ENTITY_LIMITS == {
+            name: {
+                'decoded_bytes': int(budget['decoded_mb'] * 1024 * 1024),
+                'requests': int(budget['requests']),
+            }
+            for name, budget in models.PRODUCTION_ENTITY_BUDGETS.items()
+        }
+        assert sum(
+            item['requests'] for item in wrapper.DEFAULT_ENTITY_LIMITS.values()
+        ) == models.SCOPE_REQUEST_LIMIT
+
+        # Entity runner and the scraper's per-operation defaults.
+        assert runner.PRODUCTION_CYCLE_BUDGET_BYTES == (
+            models.SCOPE_HARD_PROVIDER_BYTE_CAP
+        )
+        assert runner.PRODUCTION_ENTITY_BUDGETS is (
+            models.PRODUCTION_ENTITY_BUDGETS
+        )
+        assert runner.MAX_ROSTER_WINDOW == models.MAX_ROSTER_WINDOW == 500
+        assert scraper_module._DEFAULT_DECODED_BUDGET_MB == {
+            name: float(budget['decoded_mb'])
+            for name, budget in models.PRODUCTION_ENTITY_BUDGETS.items()
+        }
+        assert scraper_module._DEFAULT_REQUEST_ATTEMPT_BUDGET == {
+            name: int(budget['requests'])
+            for name, budget in models.PRODUCTION_ENTITY_BUDGETS.items()
+        }
+
+        # The DAG.
+        assert dag_module.PROVIDER_HARD_CAP_BYTES == (
+            models.SCOPE_HARD_PROVIDER_BYTE_CAP
+        )
+        assert dag_module.PROVIDER_SOFT_STOP_BYTES == (
+            models.SCOPE_SOFT_PROVIDER_BYTE_STOP
+        )
+        assert dag_module.PROXY_REQUEST_LIMIT == models.SCOPE_REQUEST_LIMIT
+        assert dag_module.PROXY_RETRY_LIMIT == models.SCOPE_RETRY_LIMIT
+        assert dag_module.PARENT_BYTE_BUDGET == (
+            models.PARENT_DAILY_HARD_PROVIDER_BYTE_CAP
+        )
+        assert dag_module.PARENT_SOFT_BYTE_STOP == (
+            models.PARENT_DAILY_SOFT_PROVIDER_BYTE_STOP
+        )
+        assert dag_module.PARENT_REQUEST_LIMIT == models.PARENT_REQUEST_LIMIT
+        assert dag_module.PARENT_RETRY_LIMIT == models.PARENT_RETRY_LIMIT
+        assert dag_module.MV_HISTORY_DAILY_LIMIT == models.MAX_ROSTER_WINDOW
+        assert dag_module.MAX_SCOPE_BATCH == models.MAX_SCOPE_BATCH
+
+        # Benchmark phases.
+        assert bench.PRODUCTION_CYCLE_BUDGET_BYTES == (
+            models.SCOPE_HARD_PROVIDER_BYTE_CAP
+        )
+        assert bench.PRODUCTION_PHASE_BUDGETS == {
+            phase: {
+                'decoded_body_bytes': int(
+                    models.PRODUCTION_ENTITY_BUDGETS[entity]['decoded_mb']
+                    * 1024 * 1024
+                ),
+                'request_attempts': int(
+                    models.PRODUCTION_ENTITY_BUDGETS[entity]['requests']
+                ),
+            }
+            for phase, entity in bench._PHASE_ENTITY.items()
+        }
+
+        # Approval preparation script.
+        assert prepare.PROVIDER_HARD_CAP_BYTES == (
+            models.SCOPE_HARD_PROVIDER_BYTE_CAP
+        )
+        assert prepare.PROVIDER_SOFT_STOP_BYTES == (
+            models.SCOPE_SOFT_PROVIDER_BYTE_STOP
+        )
+        assert prepare.PROXY_REQUEST_LIMIT == models.SCOPE_REQUEST_LIMIT
+        assert prepare.PROXY_RETRY_LIMIT == models.SCOPE_RETRY_LIMIT
+        assert prepare.MV_HISTORY_DAILY_LIMIT == models.MAX_ROSTER_WINDOW
+
+        # Committed standing policy pins the SCOPE caps enforced on the child;
+        # the parent caps are pinned via argv equality in the wrapper.
+        assert policy.paid_proxy.byte_cap_bytes == (
+            models.SCOPE_HARD_PROVIDER_BYTE_CAP
+        )
+        assert policy.paid_proxy.request_limit == models.SCOPE_REQUEST_LIMIT
+        assert policy.paid_proxy.retry_limit == models.SCOPE_RETRY_LIMIT
+
+        # Derived parent limits stay derived, not hand-edited.
+        assert models.PARENT_REQUEST_LIMIT == (
+            models.MAX_SCOPE_BATCH * models.SCOPE_REQUEST_LIMIT
+        )
+        assert models.PARENT_RETRY_LIMIT == (
+            models.MAX_SCOPE_BATCH * models.SCOPE_RETRY_LIMIT
+        )
 
 
 class TestReaderPreflight:

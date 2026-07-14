@@ -21,10 +21,216 @@ T = TypeVar("T")
 
 
 HARD_PROVIDER_BYTE_BUDGET = 15_728_640
-"""Emergency provider-metered ceiling for one shared parent cycle (15 MiB)."""
+"""Discovery-contour provider-metered ceiling (15 MiB).
+
+The registry-discovery pipeline pins this pair explicitly; the production
+ingest contour uses the ``SCOPE_*``/``PARENT_DAILY_*`` canon below.
+"""
 
 SOFT_PROVIDER_BYTE_STOP = 14_680_064
-"""Stop starting paid requests before the emergency ceiling is reached (14 MiB)."""
+"""Discovery-contour soft stop before the 15 MiB ceiling (14 MiB)."""
+
+
+# ---------------------------------------------------------------------------
+# Production ingest budget canon.
+#
+# This module is the single source for every paid-traffic number in the
+# Transfermarkt production contour: the entity runner, the scope-cycle
+# wrapper, the ingest DAG, the approval-preparation script, the benchmark
+# and the committed standing policy all import these values.  It is
+# deliberately stdlib-only so any of them can import it cheaply.
+# ---------------------------------------------------------------------------
+
+SCOPE_HARD_PROVIDER_BYTE_CAP = 25_165_824
+"""Hard provider-metered cap for ONE exact scope cycle (24 MiB).
+
+Sized at 1.2x the measured upper estimate of a cold big-league scope
+(~18-21 MiB provider-metered across its four entities).
+"""
+
+SCOPE_SOFT_PROVIDER_BYTE_STOP = 23_068_672
+"""Graceful per-scope stop (22 MiB): no new paid request starts past it."""
+
+PARENT_DAILY_HARD_PROVIDER_BYTE_CAP = 88_080_384
+"""Hard provider-metered cap for one parent (daily) cycle (84 MiB).
+
+The external proxy-filter allowance is 100 MB/day (~95.4 MiB); this keeps a
+~12% reserve under it.  Raising the external allowance (e.g. to 400 MB/day)
+means editing this pair AND ``EXTERNAL_DAILY_PROVIDER_BYTE_LIMIT`` (the
+import-time canon assert bounds the pair by it), plus the proxy-filter's own
+per-DagRun cap in the deployment.  Evidence already committed under an older,
+smaller pair stays valid: readiness reads the persisted ledger caps as a
+ceiling, not as an equality.
+"""
+
+PARENT_DAILY_SOFT_PROVIDER_BYTE_STOP = 83_886_080
+"""Graceful parent-cycle stop (80 MiB) before the daily hard cap."""
+
+EXTERNAL_DAILY_PROVIDER_BYTE_LIMIT = 100_000_000
+"""Documented external proxy-filter allowance (100 MB/day)."""
+
+SCOPE_REQUEST_LIMIT = 1_610
+"""Attempt ceiling for one scope cycle (150 + 650 + 650 + 160)."""
+
+SCOPE_RETRY_LIMIT = 800
+"""Paid-retry ceiling for one scope cycle.
+
+Measured ~0.45 retries/page; in bytes 800 x ~10 KiB = ~7.8 MiB, well under
+the scope byte cap, so bytes remain the binding constraint.  Note the
+per-entity request budgets are deliberately below the bad-wave worst case:
+a full 500-career window at 0.45 retries/page needs ~500 + 225 = 725
+attempts, over the 650 budgeted for one career entity — a wave that bad does
+not finish in one cycle and the remainder is picked up by the next cycle
+through the pending checkpoint, by design.
+"""
+
+DEFAULT_ENTITY_TIMEOUT_SECONDS = 3_600
+"""Subprocess timeout for the small entities (players, coaches)."""
+
+CAREER_ENTITY_TIMEOUT_SECONDS = 5_400
+"""Subprocess timeout for the career entities (market value / transfers).
+
+The client is rate-limited to 12 requests/minute (5 s spacing), so a full
+650-attempt career budget alone waits 650 x 5 s = 3250 s; parsing, retry
+backoff and checkpoint I/O add roughly 1.4 s per attempt, and a 1.3x margin
+keeps a slow wave from dying in TimeoutExpired (which burns attempt-guard
+budget without result evidence): 650 x (5 + 1.4) x 1.3 = 5408 -> 5400 s.
+Players (150 attempts) and coaches (160) stay on 3600 s.
+"""
+
+ENTITY_TIMEOUT_SECONDS: Dict[str, int] = {
+    'players': DEFAULT_ENTITY_TIMEOUT_SECONDS,
+    'market_value_history': CAREER_ENTITY_TIMEOUT_SECONDS,
+    'transfers': CAREER_ENTITY_TIMEOUT_SECONDS,
+    'coaches': DEFAULT_ENTITY_TIMEOUT_SECONDS,
+}
+
+SCOPE_OPS_OVERHEAD_SECONDS = 900
+"""Wall clock one scope cycle needs outside its four entity subprocesses.
+
+Approval consumption, the scope-manifest and proxy-ledger MERGEs, checkpoint
+and evidence fsyncs.
+"""
+
+SCOPE_WALL_CLOCK_TIMEOUT_SECONDS = (
+    sum(ENTITY_TIMEOUT_SECONDS.values()) + SCOPE_OPS_OVERHEAD_SECONDS
+)
+"""Execution timeout of one mapped scope task (3600+5400+5400+3600+900).
+
+Derived, never a literal: an execution timeout below the sum of the entity
+timeouts it supervises means Airflow SIGKILLs a runner in the middle of paid
+I/O, losing the attempt-guard write and the entity's evidence.  A realistic
+full-budget scope finishes in ~2 h 52 m; this 5 h 15 m ceiling only has to be
+worst-case compatible.
+"""
+
+MAX_SCOPE_BATCH = 8
+"""Most scope cycles one parent (daily) cycle may map."""
+
+PARENT_REQUEST_LIMIT = MAX_SCOPE_BATCH * SCOPE_REQUEST_LIMIT
+"""Parent-cycle attempt ceiling, derived — never hand-edited."""
+
+PARENT_RETRY_LIMIT = MAX_SCOPE_BATCH * SCOPE_RETRY_LIMIT
+"""Parent-cycle paid-retry ceiling, derived — never hand-edited."""
+
+MAX_ROSTER_WINDOW = 500
+"""Most careers (market value / transfers) one scope cycle may buy."""
+
+PROVIDER_GRANT_ENV_VAR = 'TM_PROVIDER_BYTE_BUDGET'
+"""Per-entity provider-byte grant the runner exports to its client."""
+
+PROVIDER_GRANT_SOFT_MARGIN_BYTES = 1_048_576
+"""Soft-stop headroom (1 MiB) inside a per-entity provider grant."""
+
+PROVIDER_GRANT_FLOOR_BYTES = 65_536
+"""Smallest usable per-entity provider grant (64 KiB).
+
+A grant below one page's worth of provider bytes would build a degenerate
+ledger whose very first response pierces it; the client refuses such a grant
+before any I/O instead.
+"""
+
+PRODUCTION_ENTITY_BUDGETS: Dict[str, Dict[str, Any]] = {
+    # 'requests' counts attempts, not pages; 'provider_reserve_bytes' is the
+    # amount reserved in the shared scope ledger in PROVIDER-metered bytes —
+    # the same currency the entity later settles with.
+    #
+    # The reserves deliberately over-subscribe the scope cap (10 + 6 + 8 + 8
+    # = 32 MiB > 24 MiB): each reservation is min'ed to the ledger remainder,
+    # so early entities get their full ask while the last one (coaches) may
+    # receive only what is left — and when nothing is left the runner fails
+    # closed with a RuntimeError before any paid I/O.
+    'players': {
+        'decoded_mb': 16.0, 'requests': 150,
+        'provider_reserve_bytes': 10_485_760,  # 16 MiB decoded x ~0.57
+    },
+    'market_value_history': {
+        'decoded_mb': 4.0, 'requests': 650,
+        'provider_reserve_bytes': 6_291_456,  # 650 pages x ~8 KiB + margin
+    },
+    'transfers': {
+        'decoded_mb': 12.0, 'requests': 650,
+        'provider_reserve_bytes': 8_388_608,  # 650 pages x ~10 KiB + margin
+    },
+    'coaches': {
+        'decoded_mb': 14.0, 'requests': 160,
+        'provider_reserve_bytes': 8_388_608,  # 14 MiB decoded x ~0.57
+    },
+}
+
+
+def _assert_budget_canon() -> None:
+    """Fail the import when the budget canon is internally inconsistent."""
+
+    if not (
+        0
+        < SCOPE_SOFT_PROVIDER_BYTE_STOP
+        < SCOPE_HARD_PROVIDER_BYTE_CAP
+        <= PARENT_DAILY_SOFT_PROVIDER_BYTE_STOP
+        < PARENT_DAILY_HARD_PROVIDER_BYTE_CAP
+        <= EXTERNAL_DAILY_PROVIDER_BYTE_LIMIT
+    ):
+        raise AssertionError(
+            'Transfermarkt provider byte budgets must satisfy '
+            'scope soft < scope hard <= parent soft < parent hard '
+            '<= external daily limit'
+        )
+    for entity, budget in PRODUCTION_ENTITY_BUDGETS.items():
+        if not 0 < int(budget['provider_reserve_bytes']) < SCOPE_HARD_PROVIDER_BYTE_CAP:
+            raise AssertionError(
+                f'{entity} provider reserve must fit inside one scope cap'
+            )
+    if not (
+        0
+        < PROVIDER_GRANT_FLOOR_BYTES
+        <= PROVIDER_GRANT_SOFT_MARGIN_BYTES
+        < min(
+            int(budget['provider_reserve_bytes'])
+            for budget in PRODUCTION_ENTITY_BUDGETS.values()
+        )
+    ):
+        raise AssertionError(
+            'provider grant floor/margin must fit inside every entity reserve'
+        )
+    if sum(
+        int(budget['requests']) for budget in PRODUCTION_ENTITY_BUDGETS.values()
+    ) != SCOPE_REQUEST_LIMIT:
+        raise AssertionError(
+            'entity request budgets must sum to SCOPE_REQUEST_LIMIT'
+        )
+    if set(ENTITY_TIMEOUT_SECONDS) != set(PRODUCTION_ENTITY_BUDGETS):
+        raise AssertionError('every entity needs exactly one timeout')
+    if (
+        sum(ENTITY_TIMEOUT_SECONDS.values())
+        > SCOPE_WALL_CLOCK_TIMEOUT_SECONDS
+    ):
+        raise AssertionError(
+            'the scope task timeout must cover every entity timeout it '
+            'supervises'
+        )
+
+
+_assert_budget_canon()
 
 
 def stable_payload_hash(value: Any) -> str:
@@ -275,13 +481,18 @@ class ProxyLease:
 
 
 class SharedTrafficLedger:
-    """Thread-safe traffic ledger shared by every entity/client in a cycle."""
+    """Thread-safe traffic ledger shared per exact scope cycle.
+
+    Every entity/client of one scope cycle accounts against the same ledger;
+    the defaults are the per-scope production caps, not the parent (daily)
+    aggregate — the parent is tracked by the scope-cycle wrapper's own ledger.
+    """
 
     def __init__(
         self,
         *,
-        hard_provider_bytes: int = HARD_PROVIDER_BYTE_BUDGET,
-        soft_provider_bytes: int = SOFT_PROVIDER_BYTE_STOP,
+        hard_provider_bytes: int = SCOPE_HARD_PROVIDER_BYTE_CAP,
+        soft_provider_bytes: int = SCOPE_SOFT_PROVIDER_BYTE_STOP,
         retry_limit: Optional[int] = None,
     ) -> None:
         hard = int(hard_provider_bytes)

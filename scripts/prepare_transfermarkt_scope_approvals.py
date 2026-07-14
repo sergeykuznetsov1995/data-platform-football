@@ -64,13 +64,26 @@ from run_transfermarkt_scope_cycle import (  # noqa: E402
     approved_operation_argv,
     required_write_tables,
 )
+from scrapers.transfermarkt.models import (  # noqa: E402
+    MAX_ROSTER_WINDOW,
+    PARENT_DAILY_HARD_PROVIDER_BYTE_CAP,
+    PARENT_DAILY_SOFT_PROVIDER_BYTE_STOP,
+    PARENT_REQUEST_LIMIT,
+    PARENT_RETRY_LIMIT,
+    SCOPE_HARD_PROVIDER_BYTE_CAP,
+    SCOPE_REQUEST_LIMIT,
+    SCOPE_RETRY_LIMIT,
+    SCOPE_SOFT_PROVIDER_BYTE_STOP,
+)
 
 CHILD_SCRIPT = "/opt/airflow/dags/scripts/run_transfermarkt_scope_cycle.py"
-PROVIDER_HARD_CAP_BYTES = 15 * 1024 * 1024
-PROVIDER_SOFT_STOP_BYTES = 14 * 1024 * 1024
-PROXY_REQUEST_LIMIT = 710
-PROXY_RETRY_LIMIT = 400  # keep in sync with dag_ingest_transfermarkt
-MV_HISTORY_DAILY_LIMIT = 100
+# The packets pin the per-scope caps — the numbers enforced on the child; the
+# parent (daily) caps are pinned by the child's own argv equality checks.
+PROVIDER_HARD_CAP_BYTES = SCOPE_HARD_PROVIDER_BYTE_CAP
+PROVIDER_SOFT_STOP_BYTES = SCOPE_SOFT_PROVIDER_BYTE_STOP
+PROXY_REQUEST_LIMIT = SCOPE_REQUEST_LIMIT
+PROXY_RETRY_LIMIT = SCOPE_RETRY_LIMIT
+MV_HISTORY_DAILY_LIMIT = MAX_ROSTER_WINDOW
 COACH_HISTORY_TTL_DAYS = 28
 CHECKPOINT_TTL_DAYS = 35
 LEASE_TTL_SECONDS = 3600
@@ -130,6 +143,14 @@ def _child_argv(
             str(PROXY_REQUEST_LIMIT),
             "--retry-limit",
             str(PROXY_RETRY_LIMIT),
+            "--parent-byte-budget",
+            str(PARENT_DAILY_HARD_PROVIDER_BYTE_CAP),
+            "--parent-soft-byte-stop",
+            str(PARENT_DAILY_SOFT_PROVIDER_BYTE_STOP),
+            "--parent-request-limit",
+            str(PARENT_REQUEST_LIMIT),
+            "--parent-retry-limit",
+            str(PARENT_RETRY_LIMIT),
         ),
         script_path=CHILD_SCRIPT,
     )
@@ -152,7 +173,11 @@ def _packets(
         "affected_tables": tables,
         "affected_files": (str(journal_path),),
         "stop_conditions": (
-            "stop on the 15 MiB parent provider cap or the soft stop",
+            "hard-stop each scope at the 24 MiB provider cap; each entity "
+            "soft-stops at its own provider grant minus a 1 MiB margin",
+            "refuse to admit a scope once the 84 MiB parent daily budget "
+            "cannot fit another full scope cap (the parent soft value is a "
+            "ledger identity field, not a behavioural stop)",
             "stop on request/retry limits, DQ, schema or reader drift",
         ),
         "backup_commands": (
