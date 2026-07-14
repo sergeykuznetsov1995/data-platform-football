@@ -1,3 +1,5 @@
+import pytest
+
 from scrapers.fbref.discovery import (
     CalendarType,
     CompetitionFormat,
@@ -202,11 +204,11 @@ def test_unknown_league_season_label_keeps_source_opaque_identity():
 
 def test_season_parser_uses_the_exact_discovered_schedule_href():
     html = """
-    <nav>
+    <main id="content">
       <a href="/en/comps/8/2024-2025/stats/noise">Stats</a>
       <a href="/en/comps/999/2024-2025/schedule/wrong-comp">Wrong</a>
       <a href="/en/comps/8/opaque-edition/schedule/source-owned-fixtures-slug?view=all#scores">Scores &amp; Fixtures</a>
-    </nav>
+    </main>
     """
     season = SeasonRef(
         comp_id="8",
@@ -223,6 +225,32 @@ def test_season_parser_uses_the_exact_discovered_schedule_href():
     assert schedule.schedule_url == (
         "https://fbref.com/en/comps/8/opaque-edition/schedule/"
         "source-owned-fixtures-slug"
+    )
+
+
+def test_season_parser_ignores_same_competition_schedule_in_header():
+    html = """
+    <html><body>
+      <div id="nav" role="navigation">
+        <a href="/en/comps/8/old/schedule/header-noise">Scores</a>
+      </div>
+      <main id="content">
+        <a href="/en/comps/8/2025/schedule/source-fixtures">Scores</a>
+      </main>
+    </body></html>
+    """
+    season = SeasonRef(
+        comp_id="8",
+        season_id="2025",
+        label="2025",
+        calendar_type=CalendarType.TOURNAMENT,
+        season_url="https://fbref.com/en/comps/8/2025/source",
+    )
+
+    result = parse_season_html(html, season)
+
+    assert result.datasets["schedules"].records[0].schedule_url == (
+        "https://fbref.com/en/comps/8/2025/schedule/source-fixtures"
     )
 
 
@@ -340,11 +368,13 @@ def test_gender_partition_is_decided_before_child_targets():
 
 def test_source_link_inventory_covers_graph_and_comments_without_url_synthesis():
     html = """
-    <a href="/en/comps/8/history/Champions-League-Seasons">History</a>
-    <a href="/en/comps/8/2025-2026/Champions-League-Stats">Overview</a>
-    <a href="/en/comps/8/2025-2026/schedule/source-schedule">Schedule</a>
-    <a href="/en/squads/abcd1234/Team-Stats">Squad</a>
-    <a href="/en/players/1234abcd/Player">Player</a>
+    <main>
+      <a href="/en/comps/8/history/Champions-League-Seasons">History</a>
+      <a href="/en/comps/8/2025-2026/Champions-League-Stats">Overview</a>
+      <a href="/en/comps/8/2025-2026/schedule/source-schedule">Schedule</a>
+      <a href="/en/squads/abcd1234/Team-Stats">Squad</a>
+      <a href="/en/players/1234abcd/Player">Player</a>
+    </main>
     <!-- <a href="/en/players/1234abcd/matchlogs/2025/summary/Player-Match-Logs">Logs</a>
          <a href="/en/matches/aaaaaaaa/source-slug">Match</a> -->
     """
@@ -366,12 +396,50 @@ def test_source_link_inventory_covers_graph_and_comments_without_url_synthesis()
     }
 
 
+def test_source_link_inventory_excludes_global_navigation_chrome():
+    html = """
+    <div id="header" role="banner">
+      <a href="/en/matches/aaaaaaaa/header">Header match</a>
+    </div>
+    <div id="nav" role="navigation">
+      <a href="/en/squads/aaaaaaaa/Nav-Team">Global squad nav</a>
+      <!-- <a href="/en/players/aaaaaaaa/Commented-Nav">Comment nav</a> -->
+    </div>
+    <div class="sidebar">
+      <a href="/en/comps/99/history/Sidebar-Seasons">Sidebar competition</a>
+      <!-- <a href="/en/players/99999999/Commented-Sidebar">Sidebar player</a> -->
+    </div>
+    <main>
+      <a href="/en/players/11111111/Content-Player">Content player</a>
+      <div id="content">
+        <a href="/en/matches/bbbbbbbb/content">Content match</a>
+      </div>
+    </main>
+    <table><tr><td>
+      <a href="/en/comps/8/history/Source-Seasons">Table competition</a>
+    </td></tr></table>
+    <div id="footer" role="contentinfo"><table><tr><td>
+      <a href="/en/players/ffffffff/Footer">Footer player</a>
+    </td></tr></table></div>
+    """
+
+    links = discover_page_links(html)
+
+    assert {(link.page_kind, link.canonical_url) for link in links} == {
+        ("player", "https://fbref.com/en/players/11111111/Content-Player"),
+        ("match", "https://fbref.com/en/matches/bbbbbbbb"),
+        ("competition", "https://fbref.com/en/comps/8/history/Source-Seasons"),
+    }
+
+
 def test_matchlog_inventory_requires_structural_discriminator():
     html = """
-    <a href="/en/players/1234abcd/matchlogs/">Root</a>
-    <a href="/en/players/1234abcd/matchlogs/2025">Season nav</a>
-    <a href="/en/players/1234abcd/matchlogs/2025/summary">Type nav</a>
-    <a href="/en/players/1234abcd/matchlogs/2025/summary/Player-Logs">Data</a>
+    <main>
+      <a href="/en/players/1234abcd/matchlogs/">Root</a>
+      <a href="/en/players/1234abcd/matchlogs/2025">Season nav</a>
+      <a href="/en/players/1234abcd/matchlogs/2025/summary">Type nav</a>
+      <a href="/en/players/1234abcd/matchlogs/2025/summary/Player-Logs">Data</a>
+    </main>
     """
 
     matchlogs = [
@@ -385,9 +453,11 @@ def test_matchlog_inventory_requires_structural_discriminator():
 
 def test_source_id_allowlists_remove_cross_context_inheritance():
     html = """
-    <a href="/en/players/1234abcd/Player">Player</a>
-    <a href="/en/squads/abcd1234/Team">Squad</a>
-    <a href="/en/comps/8/2025-2026/schedule/Source">Schedule</a>
+    <main>
+      <a href="/en/players/1234abcd/Player">Player</a>
+      <a href="/en/squads/abcd1234/Team">Squad</a>
+      <a href="/en/comps/8/2025-2026/schedule/Source">Schedule</a>
+    </main>
     """
 
     links = discover_page_links(
@@ -415,11 +485,13 @@ def test_source_id_allowlists_remove_cross_context_inheritance():
 
 def test_stat_links_stay_distinct_and_known_empty_routes_are_skipped():
     html = """
-    <a href="/en/comps/9/2025-2026/Premier-League-Stats">Overview</a>
-    <a href="/en/comps/9/2025-2026/shooting/source-shooting">Shooting</a>
-    <a href="/en/comps/9/2025-2026/misc/source-misc">Misc</a>
-    <a href="/en/comps/9/2025-2026/passing/source-passing">Passing</a>
-    <a href="/en/comps/9/2025-2026/keepersadv/source-keepers">Advanced</a>
+    <main>
+      <a href="/en/comps/9/2025-2026/Premier-League-Stats">Overview</a>
+      <a href="/en/comps/9/2025-2026/shooting/source-shooting">Shooting</a>
+      <a href="/en/comps/9/2025-2026/misc/source-misc">Misc</a>
+      <a href="/en/comps/9/2025-2026/passing/source-passing">Passing</a>
+      <a href="/en/comps/9/2025-2026/keepersadv/source-keepers">Advanced</a>
+    </main>
     """
 
     links = discover_page_links(html)
@@ -438,11 +510,13 @@ def test_stat_links_stay_distinct_and_known_empty_routes_are_skipped():
 
 
 SEASON_LESS_NAV_HTML = """
+<main>
 <a href="/en/comps/8/Champions-League-Stats">Champions League</a>
 <a href="/en/comps/20/Bundesliga-Stats">Bundesliga</a>
 <a href="/en/comps/9/schedule/Premier-League-Scores-and-Fixtures">Fixtures</a>
 <a href="/en/comps/9/keepers/Premier-League-Stats">Keepers</a>
 <a href="/en/comps/season/2027">2027 seasons</a>
+</main>
 """
 
 
@@ -490,10 +564,12 @@ def test_current_season_page_lends_its_season_to_its_own_subpages_only():
 def test_historical_season_page_does_not_lend_its_season_to_current_links():
     links = discover_page_links(
         """
-        <a href="/en/comps/9/Premier-League-Stats">Premier League</a>
-        <a href="/en/comps/9/2016-2017/keepers/2016-2017-Premier-League-Stats">
-          Keepers
-        </a>
+        <main>
+          <a href="/en/comps/9/Premier-League-Stats">Premier League</a>
+          <a href="/en/comps/9/2016-2017/keepers/2016-2017-Premier-League-Stats">
+            Keepers
+          </a>
+        </main>
         """,
         parent_source_ids={"competition_id": "9", "season_id": "2016-2017"},
         parent_url=(
@@ -636,6 +712,41 @@ def test_a_one_match_competition_has_no_season_pages_and_is_not_an_error():
     assert dataset.status == DatasetStatus.NOT_APPLICABLE
     assert dataset.reason == "competition_publishes_no_season_pages"
     assert dataset.row_count == 0
+    matches = result.datasets["matches"]
+    assert matches.status == DatasetStatus.AVAILABLE
+    assert [item.match_id for item in matches.records] == [
+        "096e63eb",
+        "923aa854",
+    ]
+    assert [item.season_id for item in matches.records] == ["2025", "2024"]
+
+
+def test_a_mixed_history_row_returns_both_season_and_direct_match_targets():
+    html = """
+    <table id="seasons"><tbody>
+      <tr><th data-stat="year_id">
+        <a href="/en/comps/602/edition-42/source-season">2025</a>
+      </th></tr>
+      <tr><th data-stat="year_id">
+        <a href="/en/matches/abcdef12/source-final">2024</a>
+      </th></tr>
+    </tbody></table>
+    """
+    shield = _competition(comp_id="602", competition_format=CompetitionFormat.CUP)
+
+    result = parse_competition_html(html, shield)
+
+    assert not result.has_errors
+    seasons = result.datasets["seasons"]
+    matches = result.datasets["matches"]
+    assert seasons.status == DatasetStatus.AVAILABLE
+    assert seasons.records[0].season_id == "edition-42"
+    assert matches.status == DatasetStatus.AVAILABLE
+    assert matches.records[0].match_id == "abcdef12"
+    assert matches.records[0].season_id == "2024"
+    assert matches.records[0].canonical_url == (
+        "https://fbref.com/en/matches/abcdef12"
+    )
 
 
 def test_a_seasons_table_with_unlinked_rows_is_still_a_contract_error():
@@ -643,7 +754,9 @@ def test_a_seasons_table_with_unlinked_rows_is_still_a_contract_error():
     is a broken contract, not a competition without season pages."""
     html = """
     <table id="seasons"><tbody>
-      <tr><th data-stat="year_id">2025</th><td data-stat="champ">Someone</td></tr>
+      <tr><th data-stat="year_id">2025</th><td data-stat="champ">
+        <a href="/en/squads/47c64c55/Someone-Stats">Someone</a>
+      </td></tr>
     </tbody></table>
     """
 
@@ -651,6 +764,87 @@ def test_a_seasons_table_with_unlinked_rows_is_still_a_contract_error():
 
     assert result.has_errors
     assert result.datasets["seasons"].reason == "season_links_missing"
+    assert result.datasets["matches"].status == DatasetStatus.EMPTY
+
+
+def test_one_missing_edition_link_fails_the_whole_history_contract():
+    html = """
+    <table id="seasons"><tbody>
+      <tr><th data-stat="year_id">
+        <a href="/en/comps/9/2025/source">2025</a>
+      </th></tr>
+      <tr><th data-stat="year_id">2024</th>
+          <td data-stat="champ"><a href="/en/squads/abcd1234/Winner">Winner</a></td>
+      </tr>
+    </tbody></table>
+    """
+
+    result = parse_competition_html(html, _competition())
+
+    assert result.has_errors
+    assert result.datasets["seasons"].status == DatasetStatus.ERROR
+    assert result.datasets["seasons"].reason == "season_row_parse_failed"
+
+
+def test_unrecognized_edition_cell_fails_instead_of_dropping_a_row():
+    html = """
+    <table id="seasons"><tbody>
+      <tr><th data-stat="year_id">
+        <a href="/en/comps/9/2025/source">2025</a>
+      </th></tr>
+      <tr><th data-stat="edition">
+        <a href="/en/comps/9/2024/source">2024</a>
+      </th></tr>
+    </tbody></table>
+    """
+
+    result = parse_competition_html(html, _competition())
+
+    assert result.has_errors
+    assert result.datasets["seasons"].reason == "season_row_parse_failed"
+    assert [
+        item.season_id for item in result.datasets["seasons"].records
+    ] == ["2025"]
+
+
+def test_competition_index_ignores_an_unknown_header_duplicate():
+    html = """
+    <html><body>
+      <div id="header" role="banner">
+        <a href="/en/comps/9/history/Header-Seasons">Header duplicate</a>
+      </div>
+      <main><h2>Domestic Leagues - 1st Tier</h2>
+        <table id="comps"><tr>
+          <td data-stat="comp_name">
+            <a href="/en/comps/9/history/Premier-League-Seasons">Premier League</a>
+          </td><td data-stat="gender">M</td>
+        </tr></table>
+      </main>
+    </body></html>
+    """
+
+    result = parse_competition_index_html(html)
+
+    record = result.datasets["competitions"].records[0]
+    assert record.name == "Premier League"
+    assert record.gender == CompetitionGender.MALE
+
+
+def test_off_cell_match_link_does_not_turn_a_broken_row_into_single_match():
+    html = """
+    <table id="seasons"><tbody><tr>
+      <th data-stat="year_id">2025</th>
+      <td data-stat="final">
+        <a href="/en/matches/abcdef12/source-final">Match Report</a>
+      </td>
+    </tr></tbody></table>
+    """
+
+    result = parse_competition_html(html, _competition())
+
+    assert result.has_errors
+    assert result.datasets["seasons"].status == DatasetStatus.ERROR
+    assert result.datasets["matches"].status == DatasetStatus.EMPTY
 
 
 def test_a_single_match_season_page_has_no_schedule_to_advertise():
@@ -676,6 +870,65 @@ def test_a_single_match_season_page_has_no_schedule_to_advertise():
     assert not result.has_errors
     assert dataset.status == DatasetStatus.NOT_APPLICABLE
     assert dataset.reason == "season_publishes_no_schedule"
+
+
+@pytest.mark.parametrize(
+    "chrome",
+    [
+        '<aside><table><tr><td>sidebar</td></tr></table></aside>',
+        '<div class="sidebar"><table><tr><td>x</td></tr></table></div>',
+        '<div id="footer"><table><tr><td>x</td></tr></table></div>',
+    ],
+)
+def test_global_chrome_table_does_not_invalidate_zero_table_season(chrome):
+    html = f"""
+    <html><body>
+      {chrome}
+      <main>
+        <h1>2013 UEFA Super Cup Stats</h1>
+        <a href="/en/comps/122/history/UEFA-Super-Cup-Seasons">Seasons</a>
+      </main>
+    </body></html>
+    """
+    season = SeasonRef(
+        comp_id="122",
+        season_id="2013-2014",
+        label="2013-2014",
+        calendar_type=CalendarType.TOURNAMENT,
+        season_url=(
+            "https://fbref.com/en/comps/122/2013-2014/"
+            "2013-UEFA-Super-Cup-Stats"
+        ),
+    )
+
+    result = parse_season_html(html, season)
+
+    assert not result.has_errors
+    dataset = result.datasets["schedules"]
+    assert dataset.status == DatasetStatus.NOT_APPLICABLE
+    assert dataset.reason == "season_publishes_no_schedule"
+
+
+def test_arbitrary_zero_table_shell_is_not_a_single_match_season():
+    season = SeasonRef(
+        comp_id="122",
+        season_id="2013-2014",
+        label="2013-2014",
+        calendar_type=CalendarType.TOURNAMENT,
+        season_url=(
+            "https://fbref.com/en/comps/122/2013-2014/"
+            "2013-UEFA-Super-Cup-Stats"
+        ),
+    )
+
+    result = parse_season_html(
+        "<html><body><p>temporary source shell</p></body></html>", season
+    )
+
+    assert result.has_errors
+    dataset = result.datasets["schedules"]
+    assert dataset.status == DatasetStatus.ERROR
+    assert dataset.reason == "zero_table_season_identity_missing"
 
 
 def test_a_season_page_with_tables_but_no_schedule_link_still_fails_closed():

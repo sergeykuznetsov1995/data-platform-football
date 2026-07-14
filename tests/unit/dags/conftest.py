@@ -235,6 +235,11 @@ def _install_airflow_stubs() -> None:
 
     operators_python_mod.PythonOperator = _PythonOperator
 
+    class _BranchPythonOperator(_PythonOperator):
+        pass
+
+    operators_python_mod.BranchPythonOperator = _BranchPythonOperator
+
     class _TriggerDagRunOperator(_PythonOperator):
         pass
 

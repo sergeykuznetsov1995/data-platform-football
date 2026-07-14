@@ -584,6 +584,7 @@ WITH (
         delete_filter: Optional[str] = None,
         staging_id: Optional[str] = None,
         merge_keys: Optional[Sequence[str]] = None,
+        single_statement_replace: bool = False,
     ) -> int:
         """
         Insert a DataFrame so the target table receives exactly ONE snapshot.
@@ -620,6 +621,10 @@ WITH (
                 never downgraded to a silent append.
             merge_keys: Optional natural key for an incremental Iceberg MERGE.
                 Mutually exclusive with ``delete_filter``.
+            single_statement_replace: Replace ``delete_filter`` scope with one
+                Iceberg MERGE snapshot. The stage carries insert rows plus
+                tombstones copied from the current target, eliminating the
+                committed-empty window between DELETE and INSERT.
             staging_id: Optional caller-owned unique staging suffix.
 
         Returns:
@@ -649,6 +654,10 @@ WITH (
 
         if delete_filter and merge_keys:
             raise ValueError("delete_filter and merge_keys are mutually exclusive")
+        if single_statement_replace and not delete_filter:
+            raise ValueError(
+                "single_statement_replace requires delete_filter"
+            )
 
         keys = tuple(merge_keys or ())
         for key in keys:
@@ -673,15 +682,49 @@ WITH (
         qualified_target = validate_catalog_qualified_name(self.catalog, schema, table)
         qualified_stage = validate_catalog_qualified_name(self.catalog, schema, stage)
 
+        replace_op = "__dpf_replace_op"
+        if single_statement_replace and replace_op in df.columns:
+            raise ValueError(f"reserved replacement column {replace_op!r}")
+
+        # A caller-owned staging id is deliberately retry-stable.  A prior
+        # phase-2 failure retains that fully validated stage for diagnosis, so
+        # an automatic retry must clear it before issuing CREATE TABLE again.
+        # Random stages cannot collide and need no extra metadata operation.
+        if staging_id:
+            self.drop_table(schema, stage, if_exists=True)
+
         # Empty copy of the target schema (column names/types incl. metadata).
-        self._execute(f"CREATE TABLE {qualified_stage} AS SELECT * FROM {qualified_target} WHERE false")
+        # Single-statement replacements carry an operation marker used by the
+        # final MERGE; ordinary append/upsert stages remain schema-identical.
+        if single_statement_replace:
+            self._execute(
+                f"CREATE TABLE {qualified_stage} AS SELECT *, "
+                f"CAST(NULL AS VARCHAR) AS \"{replace_op}\" "
+                f"FROM {qualified_target} WHERE false"
+            )
+            staged_frame = df.copy()
+            staged_frame[replace_op] = "insert"
+        else:
+            self._execute(
+                f"CREATE TABLE {qualified_stage} AS SELECT * "
+                f"FROM {qualified_target} WHERE false"
+            )
+            staged_frame = df
 
         # --- Phase 1: stage every row (all the slow, flaky network I/O). The
         # target is NOT touched yet, so any failure here leaves it intact (#314).
         try:
-            inserted = self.insert_dataframe(schema, stage, df, batch_size)
+            inserted = self.insert_dataframe(
+                schema, stage, staged_frame, batch_size
+            )
             staged = self._execute(
-                f"SELECT count(*) FROM {qualified_stage}", fetch=True
+                f"SELECT count(*) FROM {qualified_stage}"
+                + (
+                    f" WHERE \"{replace_op}\" = 'insert'"
+                    if single_statement_replace
+                    else ""
+                ),
+                fetch=True,
             )[0][0]
             if staged != len(df):
                 raise TrinoError(
@@ -716,6 +759,31 @@ WITH (
                     f"ON {on_clause} {update_clause}"
                     f"WHEN NOT MATCHED THEN INSERT ({cols}) VALUES ({values})"
                 )
+            elif single_statement_replace:
+                quoted_cols = ", ".join(f'\"{column}\"' for column in df.columns)
+                # Copy the exact live rows in scope as tombstones. Insert rows
+                # are forced to the NOT MATCHED branch, so the one MERGE
+                # atomically removes the old partition and inserts its
+                # replacement without exposing an empty committed snapshot.
+                self._execute(
+                    f"INSERT INTO {qualified_stage} ({quoted_cols}, "
+                    f"\"{replace_op}\") SELECT DISTINCT {quoted_cols}, "
+                    f"'delete' FROM {qualified_target} WHERE {delete_filter}"
+                )
+                equality = " AND ".join(
+                    f't.\"{column}\" IS NOT DISTINCT FROM s.\"{column}\"'
+                    for column in df.columns
+                )
+                values = ", ".join(
+                    f's.\"{column}\"' for column in df.columns
+                )
+                self._execute(
+                    f"MERGE INTO {qualified_target} t USING {qualified_stage} s "
+                    f"ON s.\"{replace_op}\" = 'delete' AND ({equality}) "
+                    f"WHEN MATCHED THEN DELETE "
+                    f"WHEN NOT MATCHED AND s.\"{replace_op}\" = 'insert' "
+                    f"THEN INSERT ({cols}) VALUES ({values})"
+                )
             else:
                 if delete_filter:
                     self._execute(f"DELETE FROM {qualified_target} WHERE {delete_filter}")
@@ -727,12 +795,12 @@ WITH (
                     f"SELECT {cols} FROM {qualified_stage}"
                 )
         except Exception:
-            # The DELETE may already be committed while the INSERT failed, so the
-            # stage is now the only copy of these rows. Do NOT drop it — keep it
-            # for recovery (`INSERT INTO target SELECT * FROM stage`) and fail loud.
+            # The stage remains the recovery source. For a single-statement
+            # replacement the live target is unchanged; for the legacy path a
+            # preceding DELETE may already have committed.
             logger.error(
                 f"Atomic swap failed for {qualified_target}; stage {qualified_stage} "
-                f"retained for recovery (holds {inserted} rows)"
+                f"retained for recovery (holds {inserted} insert rows)"
             )
             raise
 

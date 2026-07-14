@@ -15,7 +15,6 @@ never raise, so failing to notify does not mask the original error.
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import urllib.request
@@ -25,6 +24,43 @@ from typing import Any, Dict, Optional
 logger = logging.getLogger(__name__)
 
 _TG_API = "https://api.telegram.org"
+
+
+def validate_alert_environment(expected: str = "prod") -> Dict[str, str]:
+    """Fail closed unless production Telegram alerting is configured.
+
+    Alert callbacks deliberately remain best-effort, but a production source
+    DAG must not start paid work while its notifications are labelled as a
+    development/test environment or have no delivery credentials. Keeping this
+    as an explicit task callable makes the deployment prerequisite visible in
+    the Airflow graph.
+    """
+
+    normalized_expected = str(expected).strip().casefold()
+    actual = str(_get_var("ALERT_ENV", "") or "").strip().casefold()
+    if not normalized_expected:
+        raise ValueError("expected alert environment must not be empty")
+    if actual != normalized_expected:
+        raise RuntimeError(
+            "Production alert environment is not ready: "
+            f"ALERT_ENV={actual or '<unset>'!r}, expected "
+            f"{normalized_expected!r}"
+        )
+    missing = [
+        name
+        for name in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID")
+        if not str(_get_var(name, "") or "").strip()
+    ]
+    if missing:
+        raise RuntimeError(
+            "Production alert delivery is not ready: missing "
+            + ", ".join(missing)
+        )
+    return {
+        "alert_env": actual,
+        "alert_delivery": "telegram",
+        "status": "ready",
+    }
 
 
 def _get_var(name: str, default: Optional[str] = None) -> Optional[str]:

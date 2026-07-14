@@ -28,11 +28,11 @@ Architecture:
     validate_silver_quality  — data quality checks (null rate, ref integrity, ranges)
         |
         v
-    trigger_xref  — blocking, fail-closed identity handoff
+    terminal FBref Silver DQ verdict
 
-Gold publication is deliberately not triggered from this DAG.  The master
-pipeline is the single owner of the final Gold run because it first publishes
-fresh xref and E3 tables; a nested trigger here could race that ordered path.
+xref and Gold publication are deliberately not triggered from this DAG. The
+master pipeline owns that separate fail-closed publication path; standalone
+ingest/backfill/replay verdicts therefore contain FBref evidence only.
 
 Silver Tables Created:
     iceberg.silver.fbref_player_season_profile  — player stats + shooting + playingtime + misc
@@ -49,7 +49,6 @@ from typing import Any, Dict
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator
-from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 from airflow.utils.task_group import TaskGroup
 
 from utils.default_args import SILVER_ARGS
@@ -182,7 +181,13 @@ def _run_transform(sql_file: str, table_name: str, **context) -> Dict[str, Any]:
 
     import yaml
 
-    from utils.silver_tasks import check_bronze_table_exists, run_silver_transform
+    from utils.silver_tasks import (
+        check_bronze_table_exists,
+        fbref_control_run_id_from_context,
+        run_silver_transform,
+    )
+
+    fbref_control_run_id = fbref_control_run_id_from_context(context)
 
     bronze_table = OPTIONAL_BRONZE_TABLES.get(table_name)
     if bronze_table:
@@ -336,15 +341,19 @@ def _run_transform(sql_file: str, table_name: str, **context) -> Dict[str, Any]:
             sql_file=sql_file,
             table_name=table_name,
             schema='silver',
+            fbref_control_run_id=fbref_control_run_id,
         )
     finally:
         if rendered_path:
             Path(rendered_path).unlink(missing_ok=True)
 
 
-def _ensure_fbref_source_identity_columns() -> Dict[str, Any]:
+def _ensure_fbref_source_identity_columns(**context) -> Dict[str, Any]:
     """Add nullable source-native identity columns before Silver reads them."""
 
+    from utils.silver_tasks import fbref_control_run_id_from_context
+
+    control_run_id = fbref_control_run_id_from_context(context)
     from scrapers.base.trino_manager import TrinoTableManager
     from scrapers.fbref.typed_bronze import (
         MATCH_AVAILABILITY_TABLE,
@@ -390,7 +399,11 @@ def _ensure_fbref_source_identity_columns() -> Dict[str, Any]:
             if column not in existing:
                 manager.add_column("bronze", table, column, "VARCHAR")
                 added.append(f"{table}.{column}")
-    return {"tables_checked": len(tables), "columns_added": added}
+    return {
+        "tables_checked": len(tables),
+        "columns_added": added,
+        "fbref_control_run_id": control_run_id,
+    }
 
 
 def _validate_silver(**context) -> Dict[str, Any]:
@@ -547,8 +560,11 @@ def _validate_silver_quality(**context) -> Dict[str, Any]:
             where=(
                 "source_home_score IS NOT NULL AND source_away_score IS NOT NULL "
                 "AND COALESCE(event_row_count, 0) = 0 "
-                "AND COALESCE(event_availability, 'unknown') "
-                "NOT IN ('restricted', 'not_applicable') "
+                # NULL means no availability observation exists because the
+                # match page has not been fetched yet (historical backlog).
+                # Any explicit observation, including empty/error/restricted,
+                # remains a hard completeness failure unless acknowledged.
+                "AND event_availability IS NOT NULL "
                 "AND NOT COALESCE(event_gap_acknowledged, FALSE)"
             ),
             severity='ERROR',
@@ -566,17 +582,6 @@ def _validate_silver_quality(**context) -> Dict[str, Any]:
             ),
             severity='ERROR',
             name='stale_event_source_gap[silver.fbref_match_enriched]',
-        ),
-        CHECK.row_count(
-            'silver.fbref_match_enriched',
-            min_rows=0, max_rows=0,
-            where=(
-                "source_home_score IS NOT NULL AND source_away_score IS NOT NULL "
-                "AND COALESCE(event_row_count, 0) = 0 "
-                "AND event_availability IN ('restricted', 'not_applicable')"
-            ),
-            severity='WARNING',
-            name='restricted_match_events[silver.fbref_match_enriched]',
         ),
         # #902: awarded results are evidence-backed finite decisions.  A new
         # awarded match blocks promotion until its authority/reference is
@@ -759,9 +764,10 @@ with DAG(
     ### Trigger
 
     This DAG has **no schedule** — it is triggered after `dag_ingest_fbref`
-    completes via `TriggerDagRunOperator` or manual trigger.  A successful run
-    includes a successful, fully validated `dag_transform_xref` run; the xref
-    player resolver reads `silver.fbref_player_identity` produced here.
+    completes via `TriggerDagRunOperator` or manual trigger. A successful run
+    means only that the FBref Silver transforms and their DQ gates passed.
+    `dag_master_pipeline` launches `dag_transform_xref` separately before E3
+    and Gold, so failures in other sources cannot turn an FBref source run red.
 
     ### Silver Tables
 
@@ -852,30 +858,7 @@ with DAG(
     )
 
     # =========================================================================
-    # Trigger the identity layer after Silver DQ passes.  This handoff must be
-    # synchronous: xref_player reads silver.fbref_player_identity, and the
-    # master pipeline must not promote stale xref tables to Gold.
-    # =========================================================================
-    trigger_xref = TriggerDagRunOperator(
-        task_id='trigger_xref_transform',
-        trigger_dag_id='dag_transform_xref',
-        trigger_run_id='fbref_xref__{{ dag.dag_id }}__{{ run_id }}',
-        logical_date='{{ ti.start_date }}',
-        wait_for_completion=True,
-        poke_interval=30,
-        allowed_states=['success'],
-        failed_states=['failed'],
-        reset_dag_run=False,
-        # SILVER_ARGS is tuned for individual CTAS tasks (30 minutes, two
-        # retries).  A blocking child-DAG handoff needs its own wall clock and
-        # must never retry by resetting an already-running xref DAG.
-        execution_timeout=timedelta(hours=4),
-        retries=0,
-        trigger_rule='all_success',
-    )
-
-    # =========================================================================
     # Dependencies
     # =========================================================================
     ensure_source_identity_columns >> transforms_group
-    transforms_group >> validate_silver >> validate_quality >> trigger_xref
+    transforms_group >> validate_silver >> validate_quality

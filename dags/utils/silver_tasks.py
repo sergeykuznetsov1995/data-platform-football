@@ -20,8 +20,9 @@ Usage:
 import logging
 import os
 import re
+import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 import trino as trino_lib
 
@@ -47,6 +48,85 @@ def _validate_identifier(name: str, context: str = "identifier") -> str:
     return name
 
 logger = logging.getLogger(__name__)
+
+_FBREF_BRONZE_READ_RE = re.compile(
+    r"(?P<prefix>\b(?:FROM|JOIN)\s+)"
+    r"iceberg\.bronze\.(?P<table>fbref_(?!target_scope\b)[a-z0-9_]+)\b",
+    re.IGNORECASE,
+)
+
+
+def fbref_control_run_id_from_context(context: Mapping[str, Any]) -> str:
+    """Read and validate the scope generation pinned by the parent DagRun."""
+
+    dag_run = context.get("dag_run")
+    conf = getattr(dag_run, "conf", None) if dag_run is not None else None
+    if not isinstance(conf, Mapping):
+        conf = context.get("dag_run_conf")
+    value = conf.get("fbref_control_run_id") if isinstance(conf, Mapping) else None
+    if value is None or not str(value).strip():
+        raise ValueError("DagRun conf requires fbref_control_run_id")
+    try:
+        return str(uuid.UUID(str(value).strip()))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError("fbref_control_run_id must be a UUID") from exc
+
+
+def _scope_fbref_bronze_reads(
+    sql: str, *, control_run_id: Optional[str]
+) -> str:
+    """Pin every typed FBref Bronze read to one immutable male scope export."""
+
+    if _FBREF_BRONZE_READ_RE.search(sql) is None:
+        return sql
+    if control_run_id is None or not str(control_run_id).strip():
+        raise ValueError(
+            "FBref Bronze SQL requires fbref_control_run_id"
+        )
+    try:
+        normalized_control_run_id = str(uuid.UUID(str(control_run_id).strip()))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError("fbref_control_run_id must be a UUID") from exc
+
+    def replacement(match: re.Match) -> str:
+        table = match.group("table")
+        return (
+            f"{match.group('prefix')}(\n"
+            f"  SELECT __fbref_row.*\n"
+            f"  FROM iceberg.bronze.{table} AS __fbref_row\n"
+            "  WHERE EXISTS (\n"
+            "    SELECT 1\n"
+            "    FROM iceberg.bronze.fbref_target_scope AS __fbref_scope\n"
+            "    WHERE __fbref_scope.source = 'fbref'\n"
+            "      AND __fbref_scope.control_run_id = "
+            f"'{normalized_control_run_id}'\n"
+            "      AND __fbref_scope.eligible_male\n"
+            "      AND (\n"
+            "        (\n"
+            "          __fbref_scope.source_competition_id =\n"
+            "            NULLIF(TRIM(CAST(__fbref_row.source_competition_id "
+            "AS varchar)), '')\n"
+            "          AND __fbref_scope.source_season_id =\n"
+            "            NULLIF(TRIM(CAST(__fbref_row.source_season_id "
+            "AS varchar)), '')\n"
+            "        ) OR (\n"
+            "          NULLIF(TRIM(CAST(__fbref_row.source_competition_id "
+            "AS varchar)), '') IS NULL\n"
+            "          AND NULLIF(TRIM(CAST(__fbref_row.source_season_id "
+            "AS varchar)), '') IS NULL\n"
+            "          AND __fbref_scope.scope_kind = 'canonical'\n"
+            "          AND __fbref_scope.legacy_league =\n"
+            "            NULLIF(TRIM(CAST(__fbref_row.league AS varchar)), '')\n"
+            "          AND __fbref_scope.legacy_season =\n"
+            "            TRY_CAST(NULLIF(TRIM(CAST(__fbref_row.season "
+            "AS varchar)), '') AS bigint)\n"
+            "        )\n"
+            "      )\n"
+            "  )\n"
+            ")"
+        )
+
+    return _FBREF_BRONZE_READ_RE.sub(replacement, sql)
 
 
 def _get_trino_connection(
@@ -143,6 +223,7 @@ def run_silver_transform(
     trino_host: str = None,
     trino_port: int = None,
     add_timestamp: bool = True,
+    fbref_control_run_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Execute a Silver-layer transformation via an atomic ``CREATE OR REPLACE`` (#265).
@@ -223,6 +304,9 @@ def run_silver_transform(
     # Remove trailing semicolon if present (Trino CTAS doesn't need it)
     if select_sql.endswith(';'):
         select_sql = select_sql[:-1].rstrip()
+    select_sql = _scope_fbref_bronze_reads(
+        select_sql, control_run_id=fbref_control_run_id
+    )
 
     # --- 2. Connect to Trino ---
     conn = _get_trino_connection(host=trino_host, port=trino_port, catalog=catalog)

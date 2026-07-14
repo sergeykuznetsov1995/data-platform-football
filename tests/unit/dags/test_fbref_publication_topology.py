@@ -34,12 +34,19 @@ def test_silver_validation_is_fail_closed_and_terminal():
     validate_rows = _task("validate_silver")
     validate_quality = _task("validate_silver_quality")
 
-    # #933: both DQ gates keep the default fail-closed all_success rule, and
-    # quality hands off synchronously to the xref DAG instead of terminating.
+    # Both DQ gates keep the default fail-closed all_success rule. Quality is
+    # the FBref-only terminal verdict; xref belongs to master publication.
     assert validate_rows._init_kwargs.get("trigger_rule", "all_success") == "all_success"
     assert validate_quality._init_kwargs.get("trigger_rule", "all_success") == "all_success"
     assert validate_rows.downstream_task_ids == {"validate_silver_quality"}
-    assert validate_quality.downstream_task_ids == {"trigger_xref_transform"}
+    assert validate_quality.downstream_task_ids == set()
+
+    from airflow.operators.python import PythonOperator
+
+    assert not any(
+        task._init_kwargs.get("trigger_dag_id") == "dag_transform_xref"
+        for task in PythonOperator._instances
+    )
 
 
 def test_silver_does_not_race_master_by_triggering_gold():
