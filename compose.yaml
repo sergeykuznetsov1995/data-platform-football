@@ -811,6 +811,10 @@ services:
       AUTHENTICATION_AUTHORITY: ${OM_AUTH_AUTHORITY:-https://accounts.google.com}
       AUTHENTICATION_CLIENT_ID: ${OM_AUTH_CLIENT_ID:-}
       AUTHENTICATION_CALLBACK_URL: ${OM_AUTH_CALLBACK_URL:-}
+      # confidential-клиент обязан ходить authorization-code flow: при дефолтном
+      # id_token сырой JWT прилетает в адресную строку, и Chrome Safe Browsing
+      # помечает страницу входа как фишинг («Опасный сайт»).
+      AUTHENTICATION_RESPONSE_TYPE: ${OM_AUTH_RESPONSE_TYPE:-id_token}
       # В SSO-режиме список ОБЯЗАН содержать и собственный JWKS OM
       # (http://localhost:8585/api/v1/system/config/jwks) — иначе бот-JWT
       # ingestion-контура перестанут валидироваться и каталог замрёт.
