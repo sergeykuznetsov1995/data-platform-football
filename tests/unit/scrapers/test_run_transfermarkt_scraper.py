@@ -288,7 +288,7 @@ class TestProductionTrafficCeilings:
              '--decoded-body-budget-mb cannot exceed 16.0'),
             (['--request-budget', '151'],
              '--request-budget cannot exceed 150'),
-            (['--cycle-budget-bytes', str(15 * 1024 * 1024 + 1)],
+            (['--cycle-budget-bytes', str(24 * 1024 * 1024 + 1)],
              '--cycle-budget-bytes cannot exceed production cap'),
         ],
     )
@@ -788,8 +788,8 @@ class TestArgparseHardFail:
         assert rc == 1
         scraper.read_players.assert_not_called()
 
-    @pytest.mark.parametrize('limit', ['0', '101'])
-    def test_paid_window_must_be_bounded_1_to_100(self, temp_output, limit):
+    @pytest.mark.parametrize('limit', ['0', '501'])
+    def test_paid_window_must_be_bounded_1_to_500(self, temp_output, limit):
         scraper = _build_scraper(df=_players_df(3))
         rc = _run_main(
             ['--entity', 'transfers', '--limit', limit, '--output', temp_output],
@@ -1777,9 +1777,11 @@ class TestNativeV2RecoverySafety:
             for error in results['errors']
         )
         assert results['cycle_budget']['remaining_after_bytes'] == 0
+        # The full 24 MiB scope cap ends up reserved: the entity's own
+        # provider reserve plus the fail-closed remainder reservation.
         assert (
             results['cycle_budget']['telemetry_unknown_reservation_bytes']
-            == 15 * 1024 * 1024
+            == 24 * 1024 * 1024
         )
 
     def test_telemetry_exception_exhausts_cycle_after_successful_read(
@@ -1983,7 +1985,129 @@ class TestNativeV2RecoverySafety:
             assert not hasattr(mod, name)
 
 
-def test_cli_keeps_child_run_key_but_uses_explicit_parent_cycle_ledger(
+class TestProviderByteGrant:
+    def test_every_entity_reserve_fits_inside_one_scope_cap(self):
+        mod = _import_runner()
+        for budget in mod.PRODUCTION_ENTITY_BUDGETS.values():
+            reserve = int(budget['provider_reserve_bytes'])
+            assert 0 < reserve < mod.PRODUCTION_CYCLE_BUDGET_BYTES
+
+    def test_scope_ledger_mins_each_reserve_and_caps_the_settled_sum(
+        self, tmp_path, monkeypatch,
+    ):
+        mod = _import_runner()
+        monkeypatch.setenv('TM_CYCLE_BUDGET_DIR', str(tmp_path))
+        cap = mod.PRODUCTION_CYCLE_BUDGET_BYTES
+        settled = 0
+        # The first three entities reserve their full canonical amount and
+        # settle at a measured cost (9 + 5 + 6 = 20 MiB)…
+        for entity, actual in (
+            ('players', 9 * 1024 * 1024),
+            ('market_value_history', 5 * 1024 * 1024),
+            ('transfers', 6 * 1024 * 1024),
+        ):
+            reserve = int(
+                mod.PRODUCTION_ENTITY_BUDGETS[entity]['provider_reserve_bytes']
+            )
+            reservation = mod._prepare_cycle_budget(
+                'scope-ledger', cap, entity=entity, reserve_bytes=reserve,
+            )
+            assert reservation['reserved_bytes'] == reserve
+            after = mod._record_cycle_traffic(
+                'scope-ledger', cap, entity, actual,
+                reservation_id=reservation['reservation_id'],
+            )
+            settled += actual
+            assert after['consumed_after_bytes'] == settled
+        # …so the last reserve is min'ed to the exact remainder, and the
+        # settled sum can never pierce the scope cap.
+        coaches = mod._prepare_cycle_budget(
+            'scope-ledger', cap, entity='coaches',
+            reserve_bytes=int(
+                mod.PRODUCTION_ENTITY_BUDGETS['coaches']['provider_reserve_bytes']
+            ),
+        )
+        assert coaches['reserved_bytes'] == cap - settled
+        after = mod._record_cycle_traffic(
+            'scope-ledger', cap, 'coaches', coaches['reserved_bytes'],
+            reservation_id=coaches['reservation_id'],
+        )
+        assert after['accounted_after_bytes'] == cap
+        assert after['exhausted'] is False
+        with pytest.raises(RuntimeError, match='budget exhausted'):
+            mod._prepare_cycle_budget(
+                'scope-ledger', cap, entity='players', reserve_bytes=1,
+            )
+
+    def test_runner_reserves_provider_bytes_and_exports_the_exact_grant(
+        self, temp_output, tmp_path,
+    ):
+        mod = _import_runner()
+        scraper = _build_scraper(df=_players_df(3))
+        captured = {}
+
+        def construct(**kwargs):
+            captured['grant_env'] = os.environ.get(mod.PROVIDER_GRANT_ENV_VAR)
+            return scraper
+
+        stub_pkg = MagicMock()
+        stub_pkg.TransfermarktScraper = MagicMock(side_effect=construct)
+        stub_scraper_mod = MagicMock(
+            R0_2B_FALLBACK_MARKER='TM_FALLBACK', **REAL_SEASON_HELPERS,
+        )
+        with (
+            patch.dict(sys.modules, {
+                'scrapers.transfermarkt': stub_pkg,
+                'scrapers.transfermarkt.scraper': stub_scraper_mod,
+                'scrapers.transfermarkt.registry': REAL_TM_REGISTRY,
+            }),
+            patch.dict(os.environ, {'TM_CYCLE_BUDGET_DIR': str(tmp_path)}),
+            patch.object(mod, '_write_results') as write_results,
+        ):
+            os.environ.pop(mod.PROVIDER_GRANT_ENV_VAR, None)
+            rc = mod._run_entity(
+                mod.ENTITY_SPECS['players'], ['GB1'], 2025, None,
+                temp_output, dry_run=True,
+                cycle_budget_bytes=mod.PRODUCTION_CYCLE_BUDGET_BYTES,
+                cycle_ledger_key='grant-cycle',
+            )
+
+        assert rc == 0
+        expected = str(
+            mod.PRODUCTION_ENTITY_BUDGETS['players']['provider_reserve_bytes']
+        )
+        assert captured['grant_env'] == expected
+        results = write_results.call_args.args[1]
+        assert results['provider_byte_grant'] == int(expected)
+        assert results['cycle_budget']['reserved_bytes'] == int(expected)
+
+    def test_career_window_coverage_reports_the_roster_remainder(self):
+        mod = _import_runner()
+
+        class RosterScraper:
+            def _resolve_player_ids_from_bronze(self, *_args, **_kwargs):
+                return [str(value) for value in range(1, 2200)]
+
+        with (
+            patch.object(mod, '_load_fetch_state', return_value={}),
+            patch.object(
+                mod, '_load_pending_checkpoint', return_value=({}, None),
+            ),
+            patch.object(mod, '_load_data_derived_state', return_value={}),
+        ):
+            selected, _hits, _seeded, _hydrate, coverage = mod._select_player_ids(
+                RosterScraper(), mod.ENTITY_SPECS['market_value_history'],
+                'ENG-Premier League', 2025, mod.MAX_ROSTER_WINDOW, 0,
+                'current', 'run-1', allow_state_writes=False,
+            )
+
+        assert len(selected) == 500
+        assert coverage == {
+            'roster_size': 2199, 'selected': 500, 'pending': 1699,
+        }
+
+
+def test_cli_keeps_child_run_key_and_accepts_explicit_scope_ledger_key(
     monkeypatch,
 ):
     mod = _import_runner()

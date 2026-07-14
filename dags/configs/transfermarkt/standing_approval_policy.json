@@ -1,13 +1,13 @@
 {
-  "policy_version": 1,
+  "policy_version": 2,
   "dag_id": "dag_ingest_transfermarkt",
   "approved_by": "sergeykuznetsov1995",
   "approved_at": "2026-07-14T00:00:00Z",
   "expires_at": "2027-01-14T00:00:00Z",
   "paid_proxy": {
-    "byte_cap_bytes": 15728640,
-    "request_limit": 710,
-    "retry_limit": 400,
+    "byte_cap_bytes": 25165824,
+    "request_limit": 1610,
+    "retry_limit": 800,
     "concurrency": 1
   },
   "production_write": {

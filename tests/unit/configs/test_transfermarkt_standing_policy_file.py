@@ -9,7 +9,7 @@ from pathlib import Path
 from dags.scripts.run_transfermarkt_scope_cycle import (
     DEFAULT_ENTITY_LIMITS,
     HARD_BYTE_CAP,
-    PARENT_RETRY_LIMIT,
+    SCOPE_RETRY_LIMIT,
     STANDING_POLICY_DAG_ID,
     required_write_tables,
 )
@@ -29,16 +29,24 @@ def test_committed_policy_parses_into_a_standing_policy():
     assert policy.dag_id == STANDING_POLICY_DAG_ID
     assert policy.dag_id == 'dag_ingest_transfermarkt'
     assert len(policy.policy_hash) == 64
+    # v2 = the daily-throughput caps (24 MiB / 1610 / 800 per scope); the
+    # standing-authorization records key on standing-policy-v{version}.
+    assert policy.policy_version == 2
 
 
 def test_committed_policy_caps_equal_the_child_wrapper_constants():
     policy = load_standing_policy(POLICY_PATH)
 
+    # The policy pins the per-SCOPE caps — the numbers enforced on the child;
+    # the parent (daily) caps are pinned by the wrapper's argv equality.
     assert policy.paid_proxy.byte_cap_bytes == HARD_BYTE_CAP
+    assert policy.paid_proxy.byte_cap_bytes == 25_165_824
     assert policy.paid_proxy.request_limit == sum(
         item['requests'] for item in DEFAULT_ENTITY_LIMITS.values()
     )
-    assert policy.paid_proxy.retry_limit == PARENT_RETRY_LIMIT
+    assert policy.paid_proxy.request_limit == 1_610
+    assert policy.paid_proxy.retry_limit == SCOPE_RETRY_LIMIT
+    assert policy.paid_proxy.retry_limit == 800
     assert policy.paid_proxy.concurrency == 1
     assert policy.production_write.byte_cap_bytes == 0
     assert policy.production_write.request_limit == 0

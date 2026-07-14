@@ -21,6 +21,15 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping, Sequence
 
+# The paid-traffic budget canon is stdlib-only, so readiness can pin the same
+# numbers the crawl actually ran under without importing any scraper runtime.
+from scrapers.transfermarkt.models import (
+    PARENT_DAILY_HARD_PROVIDER_BYTE_CAP,
+    PARENT_DAILY_SOFT_PROVIDER_BYTE_STOP,
+    PARENT_REQUEST_LIMIT,
+    PARENT_RETRY_LIMIT,
+)
+
 
 STATE_KEY = 'canonical'
 STATE_TABLE = 'iceberg.ops.transfermarkt_reader_state_v2'
@@ -43,11 +52,22 @@ SLOTS = ('a', 'b')
 # it: 705 senior-men competitions across 9778 active editions. The cap bounds the
 # manifest, not the crawl — every batch stays bounded by the byte, request and
 # retry limits below.
+#
+# These are the caps a crawl running TODAY is approved for: the scope-cycle
+# wrapper writes exactly this pair into every PROXY_LEDGER_TABLE row it
+# commits (the writer stays strict).  Readiness reads them as a CEILING, not
+# as an equality: a persisted row states the caps its own crawl epoch ran
+# under, so it is valid while 0 < soft <= hard <= today's ceiling, and that
+# parent cycle's actual provider bytes are charged against ITS OWN row cap.
+# Otherwise every raise of the canon would retroactively invalidate all
+# evidence already accumulated under the previous one.  Requests/retries have
+# no per-row limit column and keep today's ceiling, which can only be looser
+# than any earlier epoch's limit.
 MAX_SCOPE_SET_SIZE = 16_384
-SCOPE_SET_HARD_BYTE_CAP = 15_728_640
-SCOPE_SET_SOFT_BYTE_STOP = 14_680_064
-SCOPE_SET_REQUEST_LIMIT = 316
-SCOPE_SET_RETRY_LIMIT = 2
+SCOPE_SET_HARD_BYTE_CAP = PARENT_DAILY_HARD_PROVIDER_BYTE_CAP
+SCOPE_SET_SOFT_BYTE_STOP = PARENT_DAILY_SOFT_PROVIDER_BYTE_STOP
+SCOPE_SET_REQUEST_LIMIT = PARENT_REQUEST_LIMIT
+SCOPE_SET_RETRY_LIMIT = PARENT_RETRY_LIMIT
 
 NATIVE_ENTITIES = (
     'squad_memberships',
@@ -2932,10 +2952,16 @@ ORDER BY scope_id, committed_at
         for parent, parent_manifests in manifests_by_parent.items()
     }
     for parent, metrics in parent_traffic.items():
-        if metrics['provider_metered_bytes'] > hard_cap:
-            raise ReadinessError(
-                f'{parent}: parent cycle exceeds the provider hard byte cap'
-            )
+        # Byte caps are checked against the caps that parent cycle actually
+        # crawled under (its own ledger rows, below).  Requests and retries
+        # have no per-row limit column in PROXY_LEDGER_TABLE, so they are
+        # checked against today's ceiling instead — deliberately: the crawl's
+        # own request/retry limits were already enforced where it matters,
+        # at crawl time (the wrapper's attempt guard plus the argv/approval
+        # pinning), and readiness is only the secondary net here.  Adding two
+        # columns to the ops table for retrospective strictness would not pay
+        # for itself, and today's ceiling can only be looser than an earlier
+        # epoch's limit, so it never turns healthy evidence red.
         if metrics['requests'] > SCOPE_SET_REQUEST_LIMIT:
             raise ReadinessError(
                 f'{parent}: parent cycle exceeds the approved request limit'
@@ -2976,6 +3002,7 @@ ORDER BY parent_cycle_id, entity
     if len(ledger_rows) != len(by_parent_entity):
         raise ReadinessError('per-parent proxy ledger entity set is incomplete')
     seen_ledger = set()
+    parent_row_caps: dict[str, set[tuple[int, int]]] = {}
     for row in ledger_rows:
         row_parent, entity, *values, row_hard_cap, row_soft_cap = row
         key = (str(row_parent), str(entity))
@@ -2996,16 +3023,39 @@ ORDER BY parent_cycle_id, entity
             raise ReadinessError(
                 f'{key[0]}:{key[1]}: parent proxy ledger drifted'
             )
-        if int(row_hard_cap) != hard_cap or int(row_soft_cap) != soft_cap:
+        # A row states the caps ITS crawl ran under.  Equality with today's
+        # canon would turn every earlier epoch's evidence red the moment the
+        # canon moves (and it already would have: production rows carry the
+        # retired 15/14 MiB pair).  The reader therefore accepts any coherent
+        # historical cap that is not above today's ceiling, and charges the
+        # cycle's actual bytes against the cap it was actually approved with.
+        row_hard = int(row_hard_cap)
+        row_soft = int(row_soft_cap)
+        if not (
+            0 < row_soft <= row_hard <= hard_cap
+            and row_soft <= soft_cap
+        ):
             raise ReadinessError(
                 f'{key[0]}: parent proxy ledger budget drifted'
+            )
+        parent_row_caps.setdefault(key[0], set()).add((row_hard, row_soft))
+
+    for parent, caps in parent_row_caps.items():
+        if len(caps) != 1:
+            raise ReadinessError(
+                f'{parent}: parent proxy ledger rows disagree on the budget'
+            )
+        parent_hard, _parent_soft = next(iter(caps))
+        if parent_traffic[parent]['provider_metered_bytes'] > parent_hard:
+            raise ReadinessError(
+                f'{parent}: parent cycle exceeds the provider hard byte cap'
             )
 
     parent_reports = {
         parent: {
             'traffic': metrics,
-            'hard_provider_byte_cap': hard_cap,
-            'soft_provider_byte_stop': soft_cap,
+            'hard_provider_byte_cap': next(iter(parent_row_caps[parent]))[0],
+            'soft_provider_byte_stop': next(iter(parent_row_caps[parent]))[1],
             'request_limit': SCOPE_SET_REQUEST_LIMIT,
             'retry_limit': SCOPE_SET_RETRY_LIMIT,
             'proxy_ledger_exact': True,

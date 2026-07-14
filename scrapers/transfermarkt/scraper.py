@@ -48,6 +48,7 @@ from scrapers.transfermarkt.client import (
     TransfermarktHttpClient,
 )
 from scrapers.transfermarkt.models import (
+    PRODUCTION_ENTITY_BUDGETS,
     FetchOutcome,
     FetchRecord,
     FetchStatus,
@@ -987,17 +988,15 @@ _SCOPE_LINEAGE_COLUMNS = [
     'cycle_id', 'scope_id',
 ]
 
+# Per-operation defaults derive from the production budget canon so the
+# scraper, the runner CLI ceilings and the benchmark can never disagree.
 _DEFAULT_DECODED_BUDGET_MB = {
-    'players': 10.0,
-    'market_value_history': 4.0,
-    'transfers': 8.0,
-    'coaches': 6.0,
+    name: float(budget['decoded_mb'])
+    for name, budget in PRODUCTION_ENTITY_BUDGETS.items()
 }
 _DEFAULT_REQUEST_ATTEMPT_BUDGET = {
-    'players': 26,
-    'market_value_history': 120,
-    'transfers': 120,
-    'coaches': 50,
+    name: int(budget['requests'])
+    for name, budget in PRODUCTION_ENTITY_BUDGETS.items()
 }
 
 SQUAD_MEMBERSHIP_COLUMNS = [
@@ -1497,7 +1496,8 @@ class TransfermarktScraper(BaseScraper):
 
         if decoded_env is not None:
             # Explicit decoded budget is aggregate across every method called
-            # on this scraper (the live benchmark sets 15 MiB once).
+            # on this scraper (the live benchmark sets the whole scope
+            # cap once).
             if not self._environment_decoded_budget_started:
                 self._http_client.set_decoded_body_budget(
                     int(float(decoded_env) * 1024 * 1024)
@@ -1910,7 +1910,7 @@ class TransfermarktScraper(BaseScraper):
 
         Coach bios are immutable, so a profile materialised by ANY earlier
         run can be reused instead of re-fetching ~20-40 profile pages every
-        weekly run.  Native profile cache is queried first.  Only an explicit
+        cycle.  Native profile cache is queried first.  Only an explicit
         TABLE_NOT_FOUND falls back to the transitional legacy table; other
         database failures abort rather than triggering a costly mass refetch.
         """
@@ -2107,7 +2107,7 @@ class TransfermarktScraper(BaseScraper):
         # Step 2 — per-club detailed squad page → full player rows. The
         # `/plus/1` table carries the whole bio, so this is the LAST HTTP
         # hop: the former per-player profile loop (~530 req / ~58 MB
-        # residential proxy per weekly run) is gone.
+        # residential proxy per cycle) is gone.
         squad_players: List[Dict] = []
         squad_successes = 0
         clubs_attempted = 0
@@ -2551,7 +2551,7 @@ class TransfermarktScraper(BaseScraper):
 
         # Step 3 — per-coach profile page → dob + nationality. Coach bios
         # are immutable, so profiles already materialised in bronze (any
-        # season) are reused instead of re-fetched — a typical weekly run
+        # season) are reused instead of re-fetched — a typical cycle
         # downloads only genuinely new appointments (proxy-traffic fix).
         if coach_profile_cache is None:
             known_bios = self._resolve_coach_bios_from_bronze()
