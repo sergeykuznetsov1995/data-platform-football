@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from dags.utils import transfermarkt_scope_planner as planner
+from dags.utils import transfermarkt_scope_state as state
 from scrapers.transfermarkt.registry import (
     AgeCategory,
     ClassificationEvidence,
@@ -368,6 +369,99 @@ def test_payloads_are_json_serializable_content_addressed_and_share_one_ledger()
     assert len(result_dirs) == 2
     assert all(path.startswith(planner.RESULT_ROOT) for path in result_dirs)
     assert len({item['child_cycle_id'] for item in first.mapped_payloads}) == 2
+
+
+def test_capture_revision_is_a_contract_not_the_batch_selection():
+    # The child wrapper writes this into the manifest as capture_revision, and
+    # a scope set may only be assembled from manifests that share it.  While it
+    # fell back to selection_hash — a digest of the batch's candidate list — no
+    # two bounded batches could ever accumulate into one slot, which is the only
+    # way the ~9.7k-scope target can ever be covered.
+    competitions = [_competition('GB1'), _competition('CL')]
+    editions = [_edition('GB1', '2025'), _edition('CL', '2025')]
+    first = planner.plan_transfermarkt_scopes(
+        {'scopes': ['GB1:2025']},
+        parent_cycle_id='scheduled__day-1',
+        competitions=competitions,
+        editions=editions,
+        now=NOW,
+    )
+    second = planner.plan_transfermarkt_scopes(
+        {'scopes': ['CL:2025']},
+        parent_cycle_id='scheduled__day-2',
+        competitions=competitions,
+        editions=editions,
+        now=NOW,
+    )
+    revisions = {
+        item['capture_revision']
+        for plan in (first, second)
+        for item in plan.mapped_payloads
+    }
+    assert revisions == {state.CAPTURE_REVISION}
+    assert first.selection_hash != second.selection_hash
+    assert all(
+        item['selection_hash'] != item['capture_revision']
+        for plan in (first, second)
+        for item in plan.mapped_payloads
+    )
+
+
+def test_every_batch_pays_debt_and_buys_coverage_at_the_same_time():
+    # Neither duty may be a priority.  Debt-first starves coverage (a current
+    # edition re-earns debt at every refresh, so the debt queue never empties
+    # and no new competition is ever bought); coverage-first starves debt (all
+    # ~9.7k never-captured scopes would come first).  And the quota has to be
+    # INTERLEAVED, not blocked: the parent byte cap pays for about three scopes
+    # a day, so a block of four debt slots at the head of the batch would eat
+    # the whole day.
+    registry_rows = []
+    for index in range(4):
+        registry_rows.append(_joined_row(
+            _competition(f'OWES{index}'),
+            _edition(f'OWES{index}', '2024', current=False),
+            last_success_at=NOW - timedelta(days=index + 1),
+            career_fetches_pending=1699,
+        ))
+        registry_rows.append(_joined_row(
+            _competition(f'NEW{index}'),
+            _edition(f'NEW{index}', '2024', current=False),
+            last_success_at=None,
+        ))
+    plan = planner.plan_transfermarkt_scopes(
+        {}, parent_cycle_id='scheduled__quota', registry_rows=registry_rows,
+        now=NOW,
+    )
+
+    duties = [
+        'debt' if item['competition_id'].startswith('OWES') else 'growth'
+        for item in plan.mapped_payloads
+    ]
+    assert duties == ['debt', 'growth'] * 4
+    # Whatever the byte budget stops at, both duties have advanced.
+    assert set(duties[:3]) == {'debt', 'growth'}
+
+
+def test_an_empty_queue_donates_its_slots_to_the_other_duty():
+    plan = planner.plan_transfermarkt_scopes(
+        {},
+        parent_cycle_id='scheduled__debt-only',
+        registry_rows=[
+            _joined_row(
+                _competition(f'OWES{index}'),
+                _edition(f'OWES{index}', '2024', current=False),
+                last_success_at=NOW - timedelta(days=index + 1),
+                career_fetches_pending=900,
+            )
+            for index in range(3)
+        ],
+        now=NOW,
+    )
+
+    # Equal debt, so the oldest capture is served first.
+    assert [item['competition_id'] for item in plan.mapped_payloads] == [
+        'OWES2', 'OWES1', 'OWES0',
+    ]
 
 
 def test_promoted_registry_query_is_read_only_and_escapes_snapshot_literal():

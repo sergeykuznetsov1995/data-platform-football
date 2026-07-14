@@ -875,12 +875,43 @@ def test_standing_policy_cycle_commits_manifest_and_parent_ledger(
     assert not list(tmp_path.glob('**/journal*.json'))
 
 
+def test_standing_policy_signs_the_manifest_it_authorized(tmp_path, monkeypatch):
+    # A scheduled paid scope is authorized by the standing policy instead of a
+    # one-shot packet, so the policy hash is the only authorization trace left.
+    # It rides inside the manifest hash, where it cannot be edited afterwards;
+    # a one-shot cycle keeps its journal and omits the key entirely.
+    monkeypatch.setenv('TM_STANDING_POLICY_ENABLED', 'true')
+    payload = _payload(tmp_path)
+    argv = _standing_args(tmp_path, payload)
+    args = _parse_args(argv)
+    ticks = itertools.count(start=0, step=1_000_000)
+
+    manifest = cycle.run_scope_cycle(
+        args,
+        operation_argv=cycle.approved_operation_argv(argv),
+        subprocess_runner=_fake_subprocess([]),
+        manifest_writer=lambda manifest: None,
+        parent_ledger_writer=lambda ledger: None,
+        monotonic_ns=ticks.__next__,
+    )
+
+    policy = load_standing_policy(argv[argv.index('--standing-policy') + 1])
+    assert manifest['dq_evidence']['standing_policy_hash'] == policy.policy_hash
+    assert manifest['manifest_digest'] == cycle.stable_hash({
+        key: manifest[key] for key in cycle.ScopeManifest.__dataclass_fields__
+    })
+    cycle.ScopeManifest.from_mapping({
+        key: manifest[key]
+        for key in cycle.ScopeManifest.__dataclass_fields__
+    }).validate(cycle.EXPECTED_ENTITIES)
+
+
 def test_standing_policy_records_authorization_in_own_file(
     tmp_path, monkeypatch,
 ):
-    # The manifest's dq_evidence key set is validator-bound, so the durable
-    # record of which policy authorized the cycle lives in its own file —
-    # not in scope-status.json, which a later failed CLI rerun overwrites.
+    # The manifest hash carries the policy hash; this separate file additionally
+    # survives a failed CLI rerun (which overwrites scope-status.json) and names
+    # the policy version.
     monkeypatch.setenv('TM_STANDING_POLICY_ENABLED', 'true')
     payload = _payload(tmp_path)
     argv = _standing_args(tmp_path, payload)

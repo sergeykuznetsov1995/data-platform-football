@@ -56,7 +56,14 @@ PROXY_RETRY_LIMIT = SCOPE_RETRY_LIMIT
 PARENT_BYTE_BUDGET = PARENT_DAILY_HARD_PROVIDER_BYTE_CAP
 PARENT_SOFT_BYTE_STOP = PARENT_DAILY_SOFT_PROVIDER_BYTE_STOP
 PROXY_CONCURRENCY = 1
+# Only an edition the promoted registry still marks current has to have been
+# captured recently; a finished edition's manifest never expires, or a slot that
+# takes months to assemble would evict its own history faster than a bounded
+# daily crawl could re-earn it.
 SCOPE_SET_COVERAGE_MAX_AGE_DAYS = 7
+# A partial slot names the scopes it still owes without dragging the whole
+# ~9.7k-scope target through XCom.
+MAX_REPORTED_SCOPE_IDS = 100
 STANDING_POLICY_PATH = (
     '/opt/airflow/dags/configs/transfermarkt/standing_approval_policy.json'
 )
@@ -431,9 +438,24 @@ def _sql_literal(value: str) -> str:
 
 
 def _read_completed_scope_manifest_rows(
-    *, registry_snapshot_id: str, reader_revision: int,
+    *, reader_revision: int,
 ) -> list[dict[str, Any]]:
-    """Read fresh exact child evidence accumulated by earlier bounded batches."""
+    """Read every exact child manifest accumulated by earlier bounded batches.
+
+    The slot is cumulative: a bounded batch buys at most eight of the ~9.7k
+    target scopes, so an inactive slot can only ever be assembled by adding this
+    batch to everything earlier batches already proved.
+
+    Two things are therefore deliberately NOT filtered here.  Age: a settled
+    edition's manifest is evidence forever, and evicting it after a week would
+    destroy accumulated coverage faster than a bounded daily crawl could re-earn
+    it.  Registry snapshot: the snapshot id is a hash over every page of the
+    source registry, so any byte that moves on the site mints a new one and
+    discovery runs monthly — filtering on it emptied the pool at every rotation
+    and made the target unreachable in principle.  What a manifest captured does
+    not change when the registry is re-read; whether the registry still means
+    the same thing by that scope is checked by the caller, scope by scope.
+    """
 
     from utils import transfermarkt_native_v2 as tm_v2
     from utils.transfermarkt_scope_state import (
@@ -448,14 +470,21 @@ def _read_completed_scope_manifest_rows(
 SELECT parent_cycle_id, child_cycle_id, scope_id, competition_id, edition_id,
        canonical_competition_id, canonical_season, registry_snapshot_id,
        capture_revision, parser_revision, schema_revision, reader_revision,
-       entity_manifest_json, manifest_digest, status, committed_at
-FROM {SCOPE_MANIFEST_TABLE}
-WHERE registry_snapshot_id = {_sql_literal(registry_snapshot_id)}
-  AND status = {_sql_literal(SCOPE_COMPLETION_STATUS)}
-  AND reader_revision <= {int(reader_revision)}
-  AND committed_at >= CURRENT_TIMESTAMP
-      - INTERVAL '{SCOPE_SET_COVERAGE_MAX_AGE_DAYS}' DAY
-ORDER BY scope_id, reader_revision DESC, committed_at DESC
+       entity_manifest_json, manifest_digest, status, committed_at, is_fresh
+FROM (
+    SELECT *,
+           committed_at >= CURRENT_TIMESTAMP
+               - INTERVAL '{SCOPE_SET_COVERAGE_MAX_AGE_DAYS}' DAY AS is_fresh,
+           ROW_NUMBER() OVER (
+               PARTITION BY scope_id
+               ORDER BY committed_at DESC, reader_revision DESC
+           ) AS rn
+    FROM {SCOPE_MANIFEST_TABLE}
+    WHERE status = {_sql_literal(SCOPE_COMPLETION_STATUS)}
+      AND reader_revision <= {int(reader_revision)}
+)
+WHERE rn = 1
+ORDER BY scope_id
 """)
         rows = list(cur.fetchall())
         columns = [_description_name(item) for item in (cur.description or ())]
@@ -509,17 +538,46 @@ def _manifest_from_ops_row(value: Mapping[str, Any]):
     return manifest
 
 
+def _registry_meaning_drifted(manifest, target: Mapping[str, Any]) -> bool:
+    """Does the promoted registry still mean by this scope what was captured?
+
+    Only the attributes that change the meaning of the captured rows are
+    compared: the canonical identity the scope is published under, and the
+    classification that decided which entities were applicable to it.  A new
+    registry snapshot that merely re-read the same competition changes none of
+    them, and the manifest stays valid evidence.
+    """
+
+    capture = manifest.dq_evidence['scope_capture']
+    stated = {
+        'canonical_competition_id': str(manifest.canonical_competition_id),
+        'canonical_season': str(manifest.canonical_season),
+        'competition_type': str(capture['competition_type']),
+        'team_type': str(capture['team_type']),
+        'gender': str(capture['gender']),
+        'age_category': str(capture['age_category']),
+    }
+    for field, captured in stated.items():
+        expected = target.get(field)
+        if expected in (None, ''):
+            continue
+        if str(expected) != captured:
+            return True
+    return False
+
+
 def _build_scope_set(
     planned_envs: Sequence[Mapping[str, str]],
     preflight: Mapping[str, Any],
     *,
-    target_scope_ids: Sequence[str] | None = None,
+    target_scopes: Sequence[Mapping[str, Any]] | None = None,
     persisted_manifest_rows: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     """Validate exact immutable manifests and the shared provider ledger."""
 
     from utils import transfermarkt_native_v2 as tm_v2
     from utils.transfermarkt_scope_state import (
+        CAPTURE_REVISION,
         ScopeManifest,
         ScopeManifestError,
         ScopeSetManifest,
@@ -543,6 +601,23 @@ def _build_scope_set(
             if manifest_value.get('manifest_digest') != manifest.digest:
                 raise AirflowException(
                     f"{payload['scope_id']}: immutable manifest digest mismatch"
+                )
+            # A scope crawled under the standing policy must carry that exact
+            # policy inside its manifest hash: the schedule has no one-shot
+            # packet and no journal, so this is the only authorization trace it
+            # leaves, and an unsigned manifest would make the trace optional.
+            policy_hash = environment.get('TM_STANDING_POLICY_SHA256')
+            stated_policy = manifest.dq_evidence.get('standing_policy_hash')
+            if environment.get('TM_APPROVAL_MODE') == 'standing_policy':
+                if stated_policy != policy_hash:
+                    raise AirflowException(
+                        f"{payload['scope_id']}: manifest does not carry the "
+                        'standing policy that authorized it'
+                    )
+            elif stated_policy is not None:
+                raise AirflowException(
+                    f"{payload['scope_id']}: one-shot scope claims a standing "
+                    'policy authorization'
                 )
             expected_identity = {
                 'parent_cycle_id': payload['parent_cycle_id'],
@@ -592,38 +667,94 @@ def _build_scope_set(
         raise AirflowException('parent proxy ledger disagrees with scope manifests')
 
     current_manifests = tuple(manifests)
-    target_ids = set(target_scope_ids or (item.scope_id for item in manifests))
-    if not target_ids or len(target_ids) != len(tuple(target_scope_ids or target_ids)):
+    targets = {
+        str(item['scope_id']): item
+        for item in (dict(value) for value in target_scopes or ())
+    }
+    if not targets:
+        targets = {
+            item.scope_id: {'scope_id': item.scope_id, 'current': False}
+            for item in current_manifests
+        }
+    if len(targets) != len(tuple(target_scopes or targets)):
         raise AirflowException('registry slot target contains empty/duplicate scope ids')
+    target_ids = set(targets)
     current_identity = {
         (
-            item.registry_snapshot_id, item.capture_revision,
-            item.parser_revision, item.schema_revision,
+            item.capture_revision, item.parser_revision, item.schema_revision,
         )
         for item in current_manifests
     }
     if len(current_identity) != 1:
         raise AirflowException('current bounded batch has mixed capture revisions')
-    registry, capture, parser, schema = next(iter(current_identity))
+    capture, parser, schema = next(iter(current_identity))
+    # The capture revision is the contract every member of a slot must share.
+    # Pin it to the canon: it once defaulted to a per-batch selection hash, and
+    # the two manifests that were captured under that default can never join a
+    # slot again.  A drift here must fail the cycle, not orphan its evidence.
+    if capture != CAPTURE_REVISION:
+        raise AirflowException(
+            f'bounded batch states capture revision {capture!r}; the canon is '
+            f'{CAPTURE_REVISION!r} and a slot may only hold one contract'
+        )
+    batch_snapshots = {item.registry_snapshot_id for item in current_manifests}
+    if len(batch_snapshots) != 1:
+        raise AirflowException(
+            'bounded batch spans registry snapshots: '
+            f'{sorted(batch_snapshots)}'
+        )
+    registry = next(iter(batch_snapshots))
     by_scope = {item.scope_id: item for item in current_manifests}
+    stale: list[str] = []
+    drifted: list[str] = []
+    incompatible: list[str] = []
+    retired: list[str] = []
     for row in persisted_manifest_rows:
         try:
             candidate = _manifest_from_ops_row(row)
         except ScopeManifestError as exc:
             raise AirflowException(f'persisted scope manifest failed closed: {exc}') from exc
-        if candidate.scope_id not in target_ids or candidate.scope_id in by_scope:
+        if candidate.scope_id in by_scope:
             continue
+        if candidate.scope_id not in target_ids:
+            # The promoted registry no longer targets this scope at all: the
+            # competition was retired, or the edition deactivated.  Dropping it
+            # from the slot is correct — but it is a coverage change and it is
+            # named, not silent.  (A scope the registry still targets but now
+            # describes differently is a DIFFERENT case; see below.)
+            retired.append(candidate.scope_id)
+            continue
+        # The manifest's registry snapshot is NOT compared: a snapshot id is a
+        # hash over the whole source registry, so it changes whenever anything
+        # anywhere on the site moves, and requiring the slot's members to share
+        # one wiped every earlier batch at each discovery run.  What must still
+        # hold is that the promoted registry still means the same thing by this
+        # scope — same canonical identity, same classification.  If it does not,
+        # what was captured no longer describes what the registry now targets,
+        # and the scope has to be crawled again.
         if (
-            candidate.registry_snapshot_id,
             candidate.capture_revision,
             candidate.parser_revision,
             candidate.schema_revision,
-        ) != (registry, capture, parser, schema):
+        ) != (capture, parser, schema):
+            incompatible.append(candidate.scope_id)
+            continue
+        if _registry_meaning_drifted(candidate, targets[candidate.scope_id]):
+            drifted.append(candidate.scope_id)
             continue
         if int(candidate.reader_revision) > int(preflight['revision']):
             raise AirflowException(
                 f'{candidate.scope_id}: persisted reader revision is from the future'
             )
+        # A stale current edition stays IN the slot: dropping it would shrink
+        # the slot, and a slot that can shrink can never pass the cutover
+        # monotonicity gate again.  Its age is carried into readiness, where it
+        # gates the reader flip instead.
+        if (
+            bool(targets[candidate.scope_id].get('current'))
+            and not bool(row.get('is_fresh', True))
+        ):
+            stale.append(candidate.scope_id)
         by_scope[candidate.scope_id] = candidate
     unexpected = sorted(set(by_scope) - target_ids)
     if unexpected:
@@ -632,13 +763,19 @@ def _build_scope_set(
         )
     missing = sorted(target_ids - set(by_scope))
     complete_manifests = tuple(by_scope[key] for key in sorted(by_scope))
-    scope_set = None
-    if not missing:
-        scope_set = ScopeSetManifest.build(
-            complete_manifests,
-            expected_entities=tm_v2.NATIVE_ENTITIES,
-            reader_revision=int(preflight['revision']),
-        )
+    # The slot is promoted with whatever it has proved so far; how much of the
+    # target that is, is reported, not gated.  Demanding the whole target here
+    # was unsatisfiable by construction: at eight scopes per bounded daily batch
+    # the 9.7k-scope target takes months, and a 7-day eviction of the evidence
+    # made the collected part expire faster than the rest could be bought.
+    scope_set = ScopeSetManifest.build(
+        complete_manifests,
+        expected_entities=tm_v2.NATIVE_ENTITIES,
+        reader_revision=int(preflight['revision']),
+        # The slot is bound to the promoted snapshot this batch was planned
+        # against; its members may predate it.
+        registry_snapshot_id=registry,
+    )
     parent_ids = {str(payload['parent_cycle_id']) for payload in payloads}
     if len(parent_ids) != 1:
         raise AirflowException('scope set spans multiple parent cycles')
@@ -651,12 +788,25 @@ def _build_scope_set(
     )
     return {
         'parent_cycle_id': next(iter(parent_ids)),
-        'scope_set_id': scope_set.scope_set_id if scope_set else None,
-        'scope_set_manifest': scope_set.as_dict() if scope_set else None,
+        'scope_set_id': scope_set.scope_set_id,
+        'scope_set_manifest': scope_set.as_dict(),
         'scope_count': len(complete_manifests),
         'coverage_target_count': len(target_ids),
         'coverage_complete': not missing,
-        'missing_scope_ids': missing,
+        'coverage_ratio': len(complete_manifests) / len(target_ids),
+        'missing_scope_count': len(missing),
+        'missing_scope_ids': missing[:MAX_REPORTED_SCOPE_IDS],
+        'registry_snapshot_id': registry,
+        'stale_current_scope_count': len(stale),
+        'stale_current_scope_ids': sorted(stale)[:MAX_REPORTED_SCOPE_IDS],
+        'registry_drift_scope_count': len(drifted),
+        'registry_drift_scope_ids': sorted(drifted)[:MAX_REPORTED_SCOPE_IDS],
+        'retired_scope_count': len(retired),
+        'retired_scope_ids': sorted(retired)[:MAX_REPORTED_SCOPE_IDS],
+        'incompatible_capture_scope_count': len(incompatible),
+        'incompatible_capture_scope_ids': (
+            sorted(incompatible)[:MAX_REPORTED_SCOPE_IDS]
+        ),
         'traffic': aggregate_traffic(complete_manifests),
         'current_batch_traffic': traffic,
         'candidate_slot': str(preflight['candidate_slot']),
@@ -685,15 +835,20 @@ def _validate_scope_set(**context: Any) -> dict[str, Any]:
     if len(snapshot_ids) != 1 or '' in snapshot_ids:
         raise AirflowException('promoted registry rows do not share one snapshot')
     persisted_rows = _read_completed_scope_manifest_rows(
-        registry_snapshot_id=next(iter(snapshot_ids)),
         reader_revision=int(preflight['revision']),
     )
     result = _build_scope_set(
         planned_envs,
         preflight,
-        target_scope_ids=[item.scope_id for item in targets],
+        target_scopes=[item.as_dict() for item in targets],
         persisted_manifest_rows=persisted_rows,
     )
+    # The slot is frozen against the snapshot this paid batch was planned under.
+    if result['registry_snapshot_id'] != next(iter(snapshot_ids)):
+        raise AirflowException(
+            'bounded batch was captured under another registry snapshot than '
+            'the promoted one'
+        )
 
     # No reader transition may race the paid cycle or its Silver build.
     from utils import transfermarkt_native_v2 as tm_v2
@@ -714,26 +869,34 @@ def _validate_scope_set(**context: Any) -> dict[str, Any]:
         params.get('scopes') or params.get('leagues')
     )
     result['explicit_scope_selection'] = explicit_scope_selection
-    if not result['coverage_complete']:
-        result['promotion_ready'] = False
-        result['transform_conf'] = None
-        result['next_action'] = (
-            'capture the remaining bounded registry scopes; a partial registry '
-            'coverage set cannot build or promote an inactive slot'
-        )
-    else:
-        result['promotion_ready'] = True
-        result['transform_conf'] = {
-            'transfermarkt_parent_cycle_id': result['parent_cycle_id'],
-            'transfermarkt_scope_set_id': result['scope_set_id'],
-            'transfermarkt_scope_set_manifest': result['scope_set_manifest'],
-            'transfermarkt_reader_revision': result['reader_revision'],
-            'transfermarkt_candidate_slot': result['candidate_slot'],
-        }
+    # The cumulative slot is always promotable to the INACTIVE slot: it is the
+    # sum of every scope this crawl has ever proved under the promoted registry
+    # snapshot, and every bounded batch only adds to it.  What the slot still
+    # owes — the uncaptured share of the target, and the career-fact debt inside
+    # the captured part — is carried into the readiness report and blocks the
+    # reader cutover there, not the build here.
+    result['promotion_ready'] = True
+    result['transform_conf'] = {
+        'transfermarkt_parent_cycle_id': result['parent_cycle_id'],
+        'transfermarkt_scope_set_id': result['scope_set_id'],
+        'transfermarkt_scope_set_manifest': result['scope_set_manifest'],
+        'transfermarkt_reader_revision': result['reader_revision'],
+        'transfermarkt_candidate_slot': result['candidate_slot'],
+    }
+    if result['coverage_complete']:
         result['next_action'] = (
             'issue fresh exact Silver and Gold production-write packets, then '
-            'trigger dag_transform_transfermarkt_silver with transform_conf plus '
-            'the packet refs and approval journal'
+            'trigger dag_transform_transfermarkt_silver with transform_conf '
+            'plus the packet refs and approval journal'
+        )
+    else:
+        result['next_action'] = (
+            f"promote this cumulative slot ({result['scope_count']}/"
+            f"{result['coverage_target_count']} target scopes) through "
+            'dag_transform_transfermarkt_silver; keep capturing the remaining '
+            'scopes — the reader cutover stays blocked by the readiness gates '
+            'until the slot covers the legacy branch and its career debt falls '
+            'under the ceiling'
         )
     return result
 

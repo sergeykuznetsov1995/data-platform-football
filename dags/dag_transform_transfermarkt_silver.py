@@ -155,6 +155,9 @@ NATIVE_V2_TRANSFORMS = [
 ]
 
 MAX_TRANSFORM_SCOPES = tm_scope.MAX_SCOPE_SET_SIZE
+# A partial slot names the scopes it still owes without carrying the whole
+# ~9.7k-scope target through XCom.
+MAX_REPORTED_SCOPES = tm_v2.MAX_REPORTED_SCOPE_IDS
 _DIGEST_RE = re.compile(r'^[0-9a-f]{64}$')
 _LEGACY_BRONZE_RELATIONS = (
     'iceberg.bronze.transfermarkt_players',
@@ -403,8 +406,14 @@ def _load_scope_manifests(
     """Read only content-addressed child rows, across any paid parent cycle."""
 
     expected = dict(scope_set.scope_digests)
-    digest_sql = ', '.join(_sql_literal(item) for item in expected.values())
-    cur.execute(f"""
+    # A cumulative slot carries thousands of members; Trino is fed bounded
+    # IN-lists instead of one unbounded one.
+    rows: list[Any] = []
+    digests = sorted(expected.values())
+    for start in range(0, len(digests), tm_v2.SQL_IN_LIST_CHUNK):
+        chunk = digests[start:start + tm_v2.SQL_IN_LIST_CHUNK]
+        digest_sql = ', '.join(_sql_literal(item) for item in chunk)
+        cur.execute(f"""
 SELECT parent_cycle_id, child_cycle_id, scope_id, competition_id, edition_id,
        canonical_competition_id, canonical_season, registry_snapshot_id,
        capture_revision, parser_revision, schema_revision, reader_revision,
@@ -413,7 +422,7 @@ FROM {tm_scope.SCOPE_MANIFEST_TABLE}
 WHERE manifest_digest IN ({digest_sql})
 ORDER BY scope_id
 """)
-    rows = list(cur.fetchall())
+        rows.extend(cur.fetchall())
     if len(rows) != len(expected):
         raise tm_scope.ScopeManifestError(
             'scope manifest row count differs from immutable scope set'
@@ -470,6 +479,9 @@ ORDER BY scope_id
         manifests,
         expected_entities=tm_v2.NATIVE_ENTITIES,
         reader_revision=scope_set.reader_revision,
+        # The slot names the promoted snapshot it is bound to; its members were
+        # captured over months and carry the snapshots of their own crawl day.
+        registry_snapshot_id=scope_set.registry_snapshot_id,
     )
     if rebuilt != scope_set:
         raise tm_scope.ScopeManifestError(
@@ -485,42 +497,59 @@ ORDER BY scope_id
     return tuple(manifests)
 
 
-def _assert_complete_promoted_registry_target(
+def _assert_promoted_registry_subset(
     cur: Any,
     *,
     scope_set: tm_scope.ScopeSetManifest,
     manifests: Sequence[tm_scope.ScopeManifest],
 ) -> dict[str, Any]:
-    """Block a direct partial-slot trigger before its first production write."""
+    """Bind the slot to the green promoted registry and report its coverage.
+
+    The slot must never contain a scope the promoted registry does not target —
+    that is a foreign scope and stays a hard failure.  It may, however, still be
+    missing part of the target: the target is ~9.7k scopes bought eight at a
+    time under a daily byte budget, so demanding the complete target here would
+    mean no Silver or Gold at all for months.  Coverage of the target is
+    therefore reported (and gates the reader cutover, in readiness), not the
+    build.
+    """
 
     snapshot = scope_set.registry_snapshot_id
     cur.execute(f"""
-SELECT registry_snapshot_id, status, unknown_active_count
+SELECT state_key, registry_snapshot_id, status, unknown_active_count
 FROM {tm_planner.REGISTRY_STATE_TABLE}
-WHERE state_key = 'canonical'
+WHERE status = 'promoted' AND unknown_active_count = 0
 """)
     state_rows = list(cur.fetchall())
-    if len(state_rows) != 1:
+    canonical = [row for row in state_rows if str(row[0]) == 'canonical']
+    if len(canonical) != 1:
         raise tm_scope.ScopeManifestError(
-            'promoted registry must have exactly one canonical state row'
+            'promoted registry must have exactly one green canonical state row'
         )
-    row_snapshot, status, unknown_active_count = state_rows[0]
-    if (
-        str(row_snapshot) != snapshot
-        or str(status) != 'promoted'
-        or int(unknown_active_count) != 0
-    ):
+    promoted_snapshot = str(canonical[0][1])
+    # A slot is frozen against the snapshot that was promoted when its paid batch
+    # ran.  Discovery re-reads the registry on its own schedule and a snapshot id
+    # hashes every page of the source, so it moves for reasons that have nothing
+    # to do with this slot.  The binding that matters is that the slot was frozen
+    # against a GREEN PROMOTED registry, and that the registry still targets each
+    # of its scopes with the same meaning (below) — not that no discovery run has
+    # happened since.
+    promoted_snapshots = {str(row[1]) for row in state_rows}
+    if snapshot not in promoted_snapshots:
         raise tm_scope.ScopeManifestError(
-            'scope set is not bound to the green promoted registry snapshot'
+            'scope set is not bound to any green promoted registry snapshot'
         )
 
     cur.execute(f"""
-SELECT c.competition_id, e.edition_id
+SELECT c.competition_id, e.edition_id,
+       COALESCE(c.canonical_competition_id, 'TM-' || c.competition_id),
+       e.canonical_season, c.competition_type, c.team_type, c.gender,
+       c.age_category
 FROM {tm_planner.COMPETITIONS_TABLE} c
 JOIN {tm_planner.EDITIONS_TABLE} e
   ON e.competition_id = c.competition_id
  AND e.registry_snapshot_id = c.registry_snapshot_id
-WHERE c.registry_snapshot_id = {_sql_literal(snapshot)}
+WHERE c.registry_snapshot_id = {_sql_literal(promoted_snapshot)}
   AND c.active = true
   AND c.classification_status = 'eligible'
   AND c.gender = 'men'
@@ -534,9 +563,20 @@ WHERE c.registry_snapshot_id = {_sql_literal(snapshot)}
 ORDER BY c.competition_id, e.edition_id
 """)
     target_rows = list(cur.fetchall())
-    if any(len(row) != 2 for row in target_rows):
+    if any(len(row) != 8 for row in target_rows):
         raise tm_scope.ScopeManifestError('promoted registry target shape drift')
-    targets = {(str(row[0]), str(row[1])) for row in target_rows}
+    meaning = {
+        (str(row[0]), str(row[1])): {
+            'canonical_competition_id': str(row[2]),
+            'canonical_season': str(row[3]),
+            'competition_type': str(row[4]),
+            'team_type': str(row[5]),
+            'gender': str(row[6]),
+            'age_category': str(row[7]),
+        }
+        for row in target_rows
+    }
+    targets = set(meaning)
     if not targets or len(targets) != len(target_rows):
         raise tm_scope.ScopeManifestError(
             'promoted registry target is empty or duplicated'
@@ -544,16 +584,162 @@ ORDER BY c.competition_id, e.edition_id
     actual = {
         (item.competition_id, item.edition_id) for item in manifests
     }
-    if actual != targets:
+    extra = sorted(actual - targets)
+    if extra:
         raise tm_scope.ScopeManifestError(
-            'scope set is not the complete promoted registry target: '
-            f'missing={sorted(targets - actual)}, '
-            f'extra={sorted(actual - targets)}'
+            'scope set contains scopes outside the promoted registry target: '
+            f'extra={extra[:MAX_REPORTED_SCOPES]}'
         )
+    drifted = sorted(
+        (item.competition_id, item.edition_id)
+        for item in manifests
+        if _registry_meaning_drifted(item, meaning[
+            (item.competition_id, item.edition_id)
+        ])
+    )
+    if drifted:
+        raise tm_scope.ScopeManifestError(
+            'the promoted registry no longer means by these scopes what the '
+            'slot captured; they must be crawled again: '
+            f'{drifted[:MAX_REPORTED_SCOPES]}'
+        )
+    missing = sorted(targets - actual)
     return {
         'registry_snapshot_id': snapshot,
+        'promoted_registry_snapshot_id': promoted_snapshot,
         'target_scope_count': len(targets),
-        'complete': True,
+        'covered_scope_count': len(actual),
+        'missing_scope_count': len(missing),
+        'coverage_ratio': len(actual) / len(targets),
+        'missing_scopes': [list(item) for item in missing[:MAX_REPORTED_SCOPES]],
+        'complete': not missing,
+    }
+
+
+def _registry_meaning_drifted(
+    manifest: tm_scope.ScopeManifest, target: Mapping[str, Any],
+) -> bool:
+    """Does the promoted registry still mean by this scope what was captured?"""
+
+    capture = manifest.dq_evidence['scope_capture']
+    stated = {
+        'canonical_competition_id': str(manifest.canonical_competition_id),
+        'canonical_season': str(manifest.canonical_season),
+        'competition_type': str(capture['competition_type']),
+        'team_type': str(capture['team_type']),
+        'gender': str(capture['gender']),
+        'age_category': str(capture['age_category']),
+    }
+    return any(
+        str(target[field]) != value
+        for field, value in stated.items()
+        if target.get(field) not in (None, '')
+    )
+
+
+def _shrink_witnesses(slot: str) -> list[tuple[str, tuple[str, ...], str]]:
+    """Every relation this DAG rewrites whole, with its grain and its yardstick.
+
+    A CREATE OR REPLACE does not refresh a table — it REPLACES it.  So every
+    relation the DAG rewrites is watched against the set of scopes its next
+    build can actually produce:
+
+    * native slot models keyed by (competition_id, edition_id) — produced from
+      the SLOT, so the slot is the yardstick;
+    * ``transfermarkt_competitions_v2``, whose grain (competition_id) is itself
+      a scope attribute — same yardstick;
+    * the LEGACY Silver tables, which are the contour being SERVED today.  They
+      are rebuilt from the full legacy Bronze (see ``_run_transform``), so their
+      yardstick is legacy Bronze: if Bronze can no longer produce a (league,
+      season) that Silver currently serves, the rebuild would delete it.
+
+    Global native models (player_attributes_v2, coach_profiles_v2, …) have no
+    scope grain; they derive from the scoped ones and can only shrink if those
+    shrink, which is what this guard prevents.
+    """
+
+    witnesses: list[tuple[str, tuple[str, ...], str]] = []
+    for _, _, table, partitions in NATIVE_V2_TRANSFORMS:
+        relation = tm_v2.slotted_relation(f'iceberg.silver.{table}', slot)
+        if partitions == ['competition_id', 'edition_id']:
+            witnesses.append((relation, ('competition_id', 'edition_id'), 'slot'))
+        elif table == 'transfermarkt_competitions_v2':
+            witnesses.append((relation, ('competition_id',), 'slot'))
+    for _, _, table in SILVER_TRANSFORMS:
+        witnesses.append((f'iceberg.silver.{table}', ('league', 'season'), 'legacy'))
+        if table.endswith('_legacy'):
+            # Before the reader-view bootstrap renames it, the served table is
+            # still under its plain name.
+            witnesses.append((
+                f"iceberg.silver.{table[:-len('_legacy')]}",
+                ('league', 'season'),
+                'legacy',
+            ))
+    return witnesses
+
+
+def _assert_no_served_model_shrinks(
+    cur: Any,
+    *,
+    candidate_slot: str,
+    manifests: Sequence[tm_scope.ScopeManifest],
+) -> dict[str, Any]:
+    """Refuse a build that would silently delete scopes from a served model."""
+
+    slot = tm_v2._normalise_slot(candidate_slot)
+    witnesses = _shrink_witnesses(slot)
+    names = ', '.join(sorted({
+        _sql_literal(relation.rsplit('.', 1)[-1]) for relation, _, _ in witnesses
+    }))
+    cur.execute(
+        'SELECT table_name FROM iceberg.information_schema.tables '
+        f"WHERE table_schema = 'silver' AND table_name IN ({names})"
+    )
+    existing = {str(row[0]) for row in cur.fetchall()}
+    slot_keys = {
+        ('competition_id', 'edition_id'): {
+            (item.competition_id, item.edition_id) for item in manifests
+        },
+        ('competition_id',): {(item.competition_id,) for item in manifests},
+    }
+    legacy_source: set[tuple[str, str]] | None = None
+    checked: list[str] = []
+    dropped: dict[str, list[list[str]]] = {}
+    materialized_counts: dict[str, int] = {}
+    for relation, grain, yardstick in witnesses:
+        if relation.rsplit('.', 1)[-1] not in existing:
+            continue
+        if yardstick == 'legacy' and legacy_source is None:
+            legacy_source = _legacy_bronze_scopes(cur)
+        checked.append(relation)
+        cur.execute(f"SELECT DISTINCT {', '.join(grain)} FROM {relation}")
+        rows = {
+            tuple(str(value) for value in row)
+            for row in cur.fetchall()
+            if all(value is not None for value in row)
+        }
+        materialized_counts[relation] = len(rows)
+        producible = (
+            slot_keys[grain] if yardstick == 'slot' else (legacy_source or set())
+        )
+        missing = sorted(rows - producible)
+        if missing:
+            dropped[relation] = [
+                list(item) for item in missing[:MAX_REPORTED_SCOPES]
+            ]
+    if dropped:
+        raise tm_scope.ScopeManifestError(
+            'this build is narrower than the models it would replace; refusing '
+            f'to drop materialized scopes: {dropped}'
+        )
+    return {
+        'checked_relations': checked,
+        'materialized_scope_counts': materialized_counts,
+        'slot_scope_count': len(manifests),
+        'legacy_source_scope_count': (
+            len(legacy_source) if legacy_source is not None else 0
+        ),
+        'dropped_scope_count': 0,
     }
 
 
@@ -620,9 +806,14 @@ def _validate_transform_scope_set(**context) -> dict[str, Any]:
                 cur,
                 scope_set=scope_set,
             )
-            registry_coverage = _assert_complete_promoted_registry_target(
+            registry_coverage = _assert_promoted_registry_subset(
                 cur,
                 scope_set=scope_set,
+                manifests=manifests,
+            )
+            silver_coverage = _assert_no_served_model_shrinks(
+                cur,
+                candidate_slot=candidate_slot,
                 manifests=manifests,
             )
         finally:
@@ -666,6 +857,7 @@ def _validate_transform_scope_set(**context) -> dict[str, Any]:
             'traffic': traffic,
             'traffic_by_parent': traffic_by_parent,
             'registry_coverage': registry_coverage,
+            'silver_coverage': silver_coverage,
         }
     except (TypeError, ValueError, tm_scope.ScopeManifestError) as exc:
         raise AirflowException(
@@ -684,18 +876,88 @@ def _transform_scope(context: Mapping[str, Any]) -> dict[str, Any]:
     return dict(value)
 
 
+NATIVE_SCOPE_CTE = '_tm_scope_set'
+
+
+def _scope_cte_sql(name: str, columns: tuple[str, str], rows) -> str:
+    """One inline relation holding the slot's membership, defined exactly once.
+
+    Two limits of Trino decide the shape of the scope filter, and both are
+    reached by a full slot (~9.7k scopes).  An ``a = x AND b = y OR …`` chain is
+    parsed into a left-deep tree and overflows the parser stack (STACK_OVERFLOW
+    at ~12k terms, measured).  And inlining the membership list into every
+    scoped relation of a model blows ``query.max-length`` (1 MB; measured: eight
+    inlined copies of a 9745-scope list = 1.47 MB, rejected).  So the membership
+    is stated ONCE as a CTE, and every relation refers to it.
+    """
+
+    values = ', '.join(
+        f'({_sql_literal(left)}, {_sql_literal(right)})' for left, right in rows
+    )
+    return f'{name} ({columns[0]}, {columns[1]}) AS (VALUES {values})'
+
+
+def _with_cte(sql: str, cte: str) -> str:
+    """Attach one CTE to a pure-SELECT model, merging an existing WITH clause."""
+
+    index = 0
+    while index < len(sql):
+        if sql[index].isspace():
+            index += 1
+        elif sql.startswith('--', index):
+            end = sql.find('\n', index)
+            index = len(sql) if end < 0 else end + 1
+        elif sql.startswith('/*', index):
+            end = sql.find('*/', index)
+            index = len(sql) if end < 0 else end + 2
+        else:
+            break
+    head, tail = sql[:index], sql[index:]
+    if re.match(r'(?i)WITH\s', tail):
+        return f'{head}WITH {cte},\n{tail[4:].lstrip()}'
+    return f'{head}WITH {cte}\n{tail}'
+
+
+def _scope_membership(
+    *, left_column: str, right_column: str, cte: str, columns: tuple[str, str],
+) -> str:
+    return (
+        f'({left_column}, {right_column}) IN '
+        f'(SELECT {columns[0]}, {columns[1]} FROM {cte})'
+    )
+
+
+def _inline_scope_membership(
+    pairs, *, left_column: str, right_column: str,
+) -> str:
+    """A membership predicate that carries its own data.
+
+    The model SQL states the slot once as a CTE, but a DQ check is a bare
+    ``SELECT … WHERE <predicate>`` built by ``utils.data_quality``: a predicate
+    that referenced the model's CTE would blow up at analysis time, and
+    ``run_checks`` turns an exception into a WARNING — silently disarming a gate
+    that is supposed to escalate to ERROR.  So checks get a self-contained
+    VALUES relation instead (one relation per check keeps it far under Trino's
+    1 MB statement limit).
+    """
+
+    rows = ', '.join(
+        f'({_sql_literal(left)}, {_sql_literal(right)})' for left, right in pairs
+    )
+    return f'({left_column}, {right_column}) IN (VALUES {rows})'
+
+
 def _scope_predicate(
     scopes: Sequence[Mapping[str, Any]],
     *,
     competition_column: str,
     edition_column: str,
 ) -> str:
-    return ' OR '.join(
-        '('
-        f'{competition_column} = {_sql_literal(item["competition_id"])} AND '
-        f'{edition_column} = {_sql_literal(item["edition_id"])}'
-        ')'
-        for item in scopes
+    return _scope_membership(
+        left_column=competition_column,
+        right_column=edition_column,
+        cte=NATIVE_SCOPE_CTE,
+        columns=('competition_id', 'edition_id'),
     )
 
 
@@ -717,6 +979,7 @@ def _scope_native_sql(
 
     result = sql
     competition_ids = sorted({str(item['competition_id']) for item in scopes})
+    used = False
     for relation, kind in _NATIVE_BRONZE_SCOPE_COLUMNS.items():
         if kind == 'competition':
             ids = ', '.join(_sql_literal(item) for item in competition_ids)
@@ -737,29 +1000,31 @@ def _scope_native_sql(
                 edition_column='source_edition_id',
             )
         replacement = f'(SELECT * FROM {relation} WHERE {predicate})'
-        result = _replace_relation(result, relation, replacement)
+        scoped = _replace_relation(result, relation, replacement)
+        used = used or (scoped != result and kind != 'competition')
+        result = scoped
+    if used:
+        result = _with_cte(result, _scope_cte_sql(
+            NATIVE_SCOPE_CTE,
+            ('competition_id', 'edition_id'),
+            (
+                (str(item['competition_id']), str(item['edition_id']))
+                for item in scopes
+            ),
+        ))
     return result
 
 
-def _scope_legacy_sql(
-    sql: str,
-    scopes: Sequence[Mapping[str, Any]],
-) -> str:
-    predicate = ' OR '.join(
-        '('
-        f'league = {_sql_literal(item["canonical_competition_id"])} AND '
-        f'season = {_sql_literal(item["canonical_season"])}'
-        ')'
-        for item in scopes
+def _legacy_bronze_scopes(cur: Any) -> set[tuple[str, str]]:
+    """Every (league, season) the legacy Silver rebuild can still produce."""
+
+    union = '\nUNION\n'.join(
+        f'SELECT DISTINCT league, season FROM {relation} '
+        'WHERE league IS NOT NULL AND season IS NOT NULL'
+        for relation in _LEGACY_BRONZE_RELATIONS
     )
-    result = sql
-    for relation in _LEGACY_BRONZE_RELATIONS:
-        result = _replace_relation(
-            result,
-            relation,
-            f'(SELECT * FROM {relation} WHERE {predicate})',
-        )
-    return result
+    cur.execute(f'SELECT league, season FROM (\n{union}\n)')
+    return {(str(row[0]), str(row[1])) for row in cur.fetchall()}
 
 
 def _pin_sql_relations(sql: str, snapshots: Mapping[str, Any]) -> str:
@@ -1354,8 +1619,13 @@ def _run_transform(
             scope['scopes'],
             registry_snapshot_id=scope['registry_snapshot_id'],
         )
-    else:
-        rendered_sql = _scope_legacy_sql(rendered_sql, scope['scopes'])
+    # The LEGACY Silver tables are deliberately NOT narrowed to the slot.  They
+    # are the contour being SERVED until cutover, they are rebuilt whole with
+    # CREATE OR REPLACE from the full legacy Bronze, and restricting that
+    # rebuild to the scopes of one paid slot would not refresh them — it would
+    # delete every league the slot has not bought yet.  With a cumulative slot
+    # that starts at two scopes out of ~9.7k, the first scheduled transform
+    # would have taken the served top-5 marts with it.
     rendered_sql = _pin_sql_relations(rendered_sql, input_snapshots)
     if use_candidate_slot:
         dag_run = context.get('dag_run')
@@ -1836,20 +2106,23 @@ def _validate_native_v2_quality(**context) -> Dict[str, Any]:
     slot = tm_v2._normalise_slot(snapshot.get('candidate_slot'))
     def s(name: str) -> str:
         return f'silver.{name}_{slot}'
-    compatibility_where = ' OR '.join(
-        '('
-        f"observed_league = {_sql_literal(item['canonical_competition_id'])} "
-        f"AND observed_season = {_sql_literal(item['canonical_season'])}"
-        ')'
-        for item in scopes
+    compatibility_where = _inline_scope_membership(
+        (
+            (item['canonical_competition_id'], item['canonical_season'])
+            for item in scopes
+        ),
+        left_column='observed_league',
+        right_column='observed_season',
     )
-    membership_scope_where = _scope_predicate(
-        scopes, competition_column='competition_id', edition_column='edition_id',
+    membership_scope_where = _inline_scope_membership(
+        ((item['competition_id'], item['edition_id']) for item in scopes),
+        left_column='competition_id',
+        right_column='edition_id',
     )
-    transfer_scope_where = _scope_predicate(
-        scopes,
-        competition_column='source_competition_id',
-        edition_column='source_edition_id',
+    transfer_scope_where = _inline_scope_membership(
+        ((item['competition_id'], item['edition_id']) for item in scopes),
+        left_column='source_competition_id',
+        right_column='source_edition_id',
     )
     competition_count = len({item['competition_id'] for item in scopes})
     lineage_violation_where = _model_lineage_violation_where(context)
@@ -2058,12 +2331,13 @@ def _validate_native_v2_gold(**context) -> Dict[str, Any]:
     slot = tm_v2._normalise_slot(snapshot.get('candidate_slot'))
     def g(name: str) -> str:
         return f'gold.{name}_{slot}'
-    compatibility_where = ' OR '.join(
-        '('
-        f"league = {_sql_literal(item['canonical_competition_id'])} AND "
-        f"season = {_sql_literal(item['canonical_season'])}"
-        ')'
-        for item in scope['scopes']
+    compatibility_where = _inline_scope_membership(
+        (
+            (item['canonical_competition_id'], item['canonical_season'])
+            for item in scope['scopes']
+        ),
+        left_column='league',
+        right_column='season',
     )
     lineage_violation_where = _model_lineage_violation_where(context)
 
@@ -2233,6 +2507,13 @@ def _tm_model_ready_v2(**context) -> Dict[str, Any]:
             scope_set_id=str(scope['scope_set_id']),
             parent_cycle_id=str(scope['parent_cycle_id']),
             candidate_slot_override=str(snapshot['candidate_slot']),
+            # This gate builds and proves the INACTIVE slot; it must not demand
+            # what only a reader flip demands.  A slot still paying off its
+            # career debt, still short of the legacy floor, is exactly what the
+            # months-long cumulative crawl produces, and it still has to reach
+            # Silver and Gold.  The cutover gates are reported here and enforced
+            # in cutover/advance-cycle.
+            cutover_gates=False,
         )
         tm_v2.assert_reader_revision(cur, int(snapshot['revision']))
     finally:
