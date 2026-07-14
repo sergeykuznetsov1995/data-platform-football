@@ -17,7 +17,9 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -27,6 +29,8 @@ from dags.utils.transfermarkt_approval import (
     ApprovalJournal,
     ApprovalPacket,
     ApprovalStateError,
+    StandingPolicy,
+    load_standing_policy,
 )
 from dags.utils.transfermarkt_dq_contracts import (
     ScopeDQError,
@@ -125,7 +129,11 @@ _APPROVAL_FLAGS = {
     '--paid-proxy-approval-packet-hash',
     '--production-write-approval-packet-id',
     '--production-write-approval-packet-hash',
+    '--standing-policy',
+    '--standing-policy-sha256',
 }
+STANDING_POLICY_DAG_ID = 'dag_ingest_transfermarkt'
+STANDING_POLICY_ENV_GATE = 'TM_STANDING_POLICY_ENABLED'
 
 
 class ScopeCycleError(RuntimeError):
@@ -156,6 +164,15 @@ class ScopeIdentity:
 class ApprovalRef:
     packet_id: str
     packet_hash: str
+
+
+@dataclass(frozen=True)
+class PolicyGrant:
+    """Standing-policy stand-in for a consumed one-shot approval packet."""
+
+    packet_id: str
+    packet_hash: str
+    policy_version: int
 
 
 @dataclass(frozen=True)
@@ -512,6 +529,111 @@ def _approval_refs(args: argparse.Namespace) -> Mapping[str, ApprovalRef]:
     }
 
 
+def _approval_mode(args: argparse.Namespace) -> str:
+    standing = bool(args.standing_policy or args.standing_policy_sha256)
+    one_shot = bool(
+        args.approval_journal
+        or args.approval_bundle_json
+        or args.approval_packet_id
+        or args.approval_packet_hash
+        or args.paid_proxy_approval_packet_id
+        or args.paid_proxy_approval_packet_hash
+        or args.production_write_approval_packet_id
+        or args.production_write_approval_packet_hash
+    )
+    if standing and one_shot:
+        raise ScopeCycleError(
+            'standing-policy and one-shot approval flags are mutually exclusive'
+        )
+    if standing:
+        return 'standing_policy'
+    if one_shot:
+        return 'one_shot'
+    raise ScopeCycleError(
+        'approval mode is required: pass --standing-policy/'
+        '--standing-policy-sha256 or the one-shot approval flags'
+    )
+
+
+def validate_standing_policy_for_scope_cycle(
+    policy: StandingPolicy,
+    *,
+    write_mode: str,
+    cycle_budget_bytes: int,
+    request_limit: int,
+    retry_limit: int,
+) -> None:
+    """Check one standing policy against this wrapper's exact pinned limits."""
+
+    if policy.dag_id != STANDING_POLICY_DAG_ID:
+        raise ScopeCycleError(
+            f'standing policy dag_id mismatch: {policy.dag_id!r}'
+        )
+    policy.assert_not_expired(datetime.now(timezone.utc))
+    paid = policy.paid_proxy
+    if (
+        paid.byte_cap_bytes != int(cycle_budget_bytes)
+        or paid.request_limit != int(request_limit)
+        or paid.retry_limit != int(retry_limit)
+        or paid.concurrency != 1
+    ):
+        raise ScopeCycleError(
+            'standing policy paid_proxy caps differ from wrapper limits'
+        )
+    write = policy.production_write
+    if (
+        write.byte_cap_bytes != 0
+        or write.request_limit != 0
+        or write.retry_limit != 0
+        or write.concurrency != 1
+    ):
+        raise ScopeCycleError('standing policy production_write caps are unsafe')
+    required_tables = {
+        value.split('.')[-1] for value in required_write_tables(write_mode)
+    }
+    allowed_tables = {
+        str(value).split('.')[-1] for value in policy.allowed_write_tables
+    }
+    if not required_tables.issubset(allowed_tables):
+        missing = sorted(required_tables - allowed_tables)
+        raise ScopeCycleError(f'standing policy omits write tables: {missing}')
+
+
+def _enforce_standing_policy(
+    args: argparse.Namespace,
+) -> Mapping[str, PolicyGrant]:
+    if os.environ.get(STANDING_POLICY_ENV_GATE, '').strip().lower() not in {
+        '1', 'true', 'yes', 'on',
+    }:
+        raise ScopeCycleError(
+            f'{STANDING_POLICY_ENV_GATE} must be true before a '
+            'standing-policy cycle'
+        )
+    policy = load_standing_policy(
+        _required(args.standing_policy, 'standing_policy'),
+    )
+    expected_hash = _required(
+        args.standing_policy_sha256, 'standing_policy_sha256',
+    )
+    if policy.policy_hash != expected_hash:
+        raise ApprovalDriftError(
+            'standing policy content differs from the pinned sha256'
+        )
+    validate_standing_policy_for_scope_cycle(
+        policy,
+        write_mode=args.write_mode,
+        cycle_budget_bytes=int(args.cycle_budget_bytes),
+        request_limit=int(args.request_limit),
+        retry_limit=int(args.retry_limit),
+    )
+    grant = PolicyGrant(
+        packet_id=f'standing-policy-v{policy.policy_version}',
+        packet_hash=policy.policy_hash,
+        policy_version=int(policy.policy_version),
+    )
+    return {'paid_proxy': grant, 'production_write': grant}
+
+
 def _packet_from_record(
     journal: ApprovalJournal,
     ref: ApprovalRef,
@@ -536,7 +658,12 @@ def _consume_approvals(
     *,
     operation_argv: Sequence[str],
     entity_limits: Mapping[str, Mapping[str, int]],
-) -> Mapping[str, ApprovalPacket]:
+) -> Mapping[str, Any]:
+    expected_requests = int(args.request_limit)
+    if sum(item['requests'] for item in entity_limits.values()) > expected_requests:
+        raise ScopeCycleError('entity request budgets exceed the cycle request limit')
+    if _approval_mode(args) == 'standing_policy':
+        return _enforce_standing_policy(args)
     refs = _approval_refs(args)
     journal = ApprovalJournal(_required(args.approval_journal, 'approval_journal'))
     packets = {
@@ -545,9 +672,6 @@ def _consume_approvals(
     }
     paid = packets['paid_proxy']
     write = packets['production_write']
-    expected_requests = int(args.request_limit)
-    if sum(item['requests'] for item in entity_limits.values()) > expected_requests:
-        raise ScopeCycleError('entity request budgets exceed the cycle request limit')
     if (
         paid.byte_cap_bytes != int(args.cycle_budget_bytes)
         or paid.request_limit != expected_requests
@@ -672,7 +796,7 @@ def _runner_argv(
 def _runner_environment(
     identity: ScopeIdentity,
     args: argparse.Namespace,
-    packets: Mapping[str, ApprovalPacket],
+    packets: Mapping[str, Any],
     parser_entity: str,
     retry_budget: int,
 ) -> Mapping[str, str]:
@@ -1675,6 +1799,38 @@ def _resume_runs(
     return runs
 
 
+def _record_standing_policy_authorization(
+    identity: ScopeIdentity,
+    manifest: Mapping[str, Any],
+    grant: PolicyGrant,
+) -> None:
+    """Persist which standing policy authorized this committed scope cycle.
+
+    The scope manifest's dq_evidence key set is validator-bound, so until the
+    manifest schema itself grows an approval field the durable authorization
+    record lives in its own file next to the manifest.  Deliberately not
+    scope-status.json: that is the CLI failure envelope, which a later failed
+    rerun of the same scope overwrites.
+    """
+
+    _atomic_json(
+        Path(identity.result_base_dir) / 'standing-authorization.json',
+        {
+            'status': 'complete',
+            'parent_cycle_id': identity.parent_cycle_id,
+            'child_cycle_id': identity.child_cycle_id,
+            'scope_id': identity.scope_id,
+            'manifest_digest': manifest['manifest_digest'],
+            'approval_mode': 'standing_policy',
+            'standing_policy': {
+                'policy_hash': grant.packet_hash,
+                'policy_version': grant.policy_version,
+            },
+        },
+        immutable=False,
+    )
+
+
 def run_scope_cycle(
     args: argparse.Namespace,
     *,
@@ -1705,11 +1861,17 @@ def run_scope_cycle(
             checkpoint.get('status') == 'complete'
             and checkpoint.get('manifest_digest') == manifest['manifest_digest']
         )
+        approvals: Mapping[str, Any] = {}
         if not checkpoint_complete:
-            _consume_approvals(
+            approvals = _consume_approvals(
                 args, operation_argv=operation_argv, entity_limits=limits,
             )
             manifest_writer(manifest)
+        elif _approval_mode(args) == 'standing_policy':
+            # A cycle that died between the complete checkpoint and the
+            # authorization record must still leave the record behind, so the
+            # no-op resume re-proves the standing policy and rewrites it.
+            approvals = _enforce_standing_policy(args)
         parent_ledger = _update_parent_ledger(
             identity,
             manifest,
@@ -1731,9 +1893,12 @@ def run_scope_cycle(
                     (_stable_json(parent_ledger) + '\n').encode('utf-8')
                 ),
             }, immutable=False)
+        grant = approvals.get('paid_proxy')
+        if isinstance(grant, PolicyGrant):
+            _record_standing_policy_authorization(identity, manifest, grant)
         return manifest
 
-    packets: Mapping[str, ApprovalPacket] = {}
+    packets: Mapping[str, Any] = {}
     if len(runs) < len(ENTITY_ORDER):
         committed_preflight = _parent_committed_totals(
             identity,
@@ -1833,11 +1998,17 @@ def run_scope_cycle(
             identity, args, parser_entity, temporary, process_limits,
             remaining_retries,
         )
-        attempt_id = stable_hash({
+        attempt_seed = {
             'paid_proxy_packet_hash': packets['paid_proxy'].packet_hash,
             'child_cycle_id': identity.child_cycle_id,
             'parser_entity': parser_entity,
-        })
+        }
+        if _approval_mode(args) == 'standing_policy':
+            # A standing policy keeps its hash across cleared attempts, so the
+            # attempt id needs its own nonce or a rerun with different actual
+            # traffic would trip the attempt-guard evidence-drift check.
+            attempt_seed['attempt_nonce'] = uuid.uuid4().hex
+        attempt_id = stable_hash(attempt_seed)
         started = monotonic_ns()
         try:
             completed = subprocess_runner(
@@ -1998,6 +2169,9 @@ def run_scope_cycle(
             (_stable_json(parent_ledger) + '\n').encode('utf-8')
         ),
     }, immutable=False)
+    grant = packets.get('paid_proxy')
+    if isinstance(grant, PolicyGrant):
+        _record_standing_policy_authorization(identity, manifest, grant)
     return manifest
 
 
@@ -2020,7 +2194,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         '--write-mode', choices=('dual', 'native-only'), required=True,
     )
-    parser.add_argument('--approval-journal', required=True)
+    parser.add_argument('--approval-journal')
     parser.add_argument('--approval-bundle-json')
     parser.add_argument('--approval-packet-id')
     parser.add_argument('--approval-packet-hash')
@@ -2028,6 +2202,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument('--paid-proxy-approval-packet-hash')
     parser.add_argument('--production-write-approval-packet-id')
     parser.add_argument('--production-write-approval-packet-hash')
+    parser.add_argument('--standing-policy')
+    parser.add_argument('--standing-policy-sha256')
     parser.add_argument('--cycle-budget-bytes', type=int, default=HARD_BYTE_CAP)
     parser.add_argument('--soft-byte-stop-bytes', type=int, default=SOFT_BYTE_STOP)
     parser.add_argument(
@@ -2049,6 +2225,7 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _validate_args(args: argparse.Namespace) -> None:
+    _approval_mode(args)
     if args.reader_revision < 0:
         raise ScopeCycleError('reader_revision must be non-negative')
     if args.cycle_budget_bytes != HARD_BYTE_CAP:

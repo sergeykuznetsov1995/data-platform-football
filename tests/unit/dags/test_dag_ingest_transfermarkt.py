@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from enum import Enum
 import importlib
 import inspect
 import json
@@ -104,10 +105,27 @@ class TestDagShape:
     def test_exact_wrapper_receives_both_one_shot_approvals(self, dag_module):
         command = _bash_task('run_exact_child_cycle').bash_command
         assert 'run_transfermarkt_scope_cycle.py' in command
-        assert '--paid-proxy-approval-packet-id' in command
-        assert '--paid-proxy-approval-packet-hash' in command
-        assert '--production-write-approval-packet-id' in command
-        assert '--production-write-approval-packet-hash' in command
+        assert 'case "$TM_APPROVAL_MODE" in' in command
+        standing = command.split('standing_policy)')[1].split(';;')[0]
+        one_shot = command.split('one_shot)')[1].split(';;')[0]
+        fallback = command.split('*)')[1].split(';;')[0]
+        for flag in (
+            '--approval-journal "$TM_APPROVAL_JOURNAL"',
+            '--paid-proxy-approval-packet-id "$TM_PAID_APPROVAL_PACKET_ID"',
+            '--paid-proxy-approval-packet-hash "$TM_PAID_APPROVAL_PACKET_HASH"',
+            '--production-write-approval-packet-id "$TM_WRITE_APPROVAL_PACKET_ID"',
+            '--production-write-approval-packet-hash'
+            ' "$TM_WRITE_APPROVAL_PACKET_HASH"',
+        ):
+            assert flag in one_shot
+        assert '--standing-policy "$TM_STANDING_POLICY_PATH"' in standing
+        assert (
+            '--standing-policy-sha256 "$TM_STANDING_POLICY_SHA256"' in standing
+        )
+        assert 'approval-packet' not in standing
+        assert '--approval-journal' not in standing
+        assert '--standing-policy' not in one_shot
+        assert 'exit 1' in fallback
         assert '--career-window-limit "$TM_MV_TRANSFERS_LIMIT"' in command
         assert '--cycle-budget-bytes "$TM_PROVIDER_HARD_CAP_BYTES"' in command
         assert '--soft-byte-stop-bytes "$TM_PROVIDER_SOFT_STOP_BYTES"' in command
@@ -125,6 +143,7 @@ class TestDagShape:
         command = _bash_task('run_exact_child_cycle').bash_command
         rendered_flags = set(re.findall(r'(?m)^\s*(--[a-z0-9-]+)\b', command))
         parser_flags = set(wrapper._parser()._option_string_actions)
+        assert {'--standing-policy', '--standing-policy-sha256'} <= rendered_flags
         assert rendered_flags <= parser_flags
 
     def test_no_static_scope_or_global_tmp_paths_remain(self, dag_module):
@@ -241,6 +260,7 @@ class TestPlanningGate:
     ):
         from utils import transfermarkt_scope_planner as planner
 
+        monkeypatch.delenv('TM_STANDING_POLICY_ENABLED', raising=False)
         monkeypatch.setattr(
             planner,
             'plan_transfermarkt_scopes',
@@ -274,6 +294,360 @@ class TestPlanningGate:
         }
         with pytest.raises(Exception, match='must be distinct'):
             dag_module._approval_bundle({'scope': value}, scope_id='scope')
+
+
+def _write_standing_policy(tmp_path: Path, **overrides) -> tuple[Path, str]:
+    from dags.scripts.run_transfermarkt_scope_cycle import required_write_tables
+    from dags.utils.transfermarkt_approval import load_standing_policy
+
+    value = {
+        'policy_version': 1,
+        'dag_id': 'dag_ingest_transfermarkt',
+        'approved_by': 'sergeykuznetsov1995',
+        'approved_at': '2026-07-14T00:00:00Z',
+        'expires_at': '2100-01-01T00:00:00Z',
+        'paid_proxy': {
+            'byte_cap_bytes': 15 * 1024 * 1024,
+            'request_limit': 710,
+            'retry_limit': 400,
+            'concurrency': 1,
+        },
+        'production_write': {
+            'byte_cap_bytes': 0,
+            'request_limit': 0,
+            'retry_limit': 0,
+            'concurrency': 1,
+        },
+        'allowed_write_tables': sorted(
+            required_write_tables('dual') | required_write_tables('native-only')
+        ),
+    }
+    value.update(overrides)
+    path = tmp_path / 'standing_approval_policy.json'
+    path.write_text(json.dumps(value), encoding='utf-8')
+    return path, load_standing_policy(path).policy_hash
+
+
+class TestStandingPolicyGate:
+    def _context(self, module, params, *, run_type='scheduled'):
+        ti = MagicMock()
+        ti.xcom_pull.return_value = {
+            'paid_io_allowed': True,
+            'revision': 7,
+            'candidate_slot': 'b',
+            'write_mode': 'dual',
+        }
+        return {
+            'ti': ti,
+            'dag': SimpleNamespace(dag_id='dag_ingest_transfermarkt'),
+            'dag_run': SimpleNamespace(run_type=run_type),
+            'run_id': f'{run_type}__2026-07-13',
+            'ds': '2026-07-13',
+            'params': params,
+        }
+
+    def _arm(self, dag_module, monkeypatch, tmp_path):
+        from utils import transfermarkt_scope_planner as planner
+
+        payload = _payload(tmp_path)
+        monkeypatch.setattr(
+            planner,
+            'plan_transfermarkt_scopes',
+            lambda *a, **kw: SimpleNamespace(mapped_payloads=(payload,)),
+        )
+        monkeypatch.setattr(
+            dag_module, '_read_promoted_registry', lambda **kw: [{'x': 1}],
+        )
+        monkeypatch.setenv('TM_PROXY_CONTROL_URL', 'http://proxy-filter:8890')
+        monkeypatch.setenv('TM_STANDING_POLICY_ENABLED', 'true')
+        return payload
+
+    def _standing_params(self, dag_module, **overrides):
+        values = {'proxy_retry_limit': 400}
+        values.update(overrides)
+        return _params(dag_module, **values)
+
+    def test_standing_policy_scheduled_run_builds_standing_envs(
+        self, dag_module, monkeypatch, tmp_path,
+    ):
+        self._arm(dag_module, monkeypatch, tmp_path)
+        policy_path, policy_hash = _write_standing_policy(tmp_path)
+        monkeypatch.setattr(dag_module, 'STANDING_POLICY_PATH', str(policy_path))
+
+        environments = dag_module._plan_exact_scopes(
+            **self._context(dag_module, self._standing_params(dag_module)),
+        )
+
+        assert len(environments) == 1
+        env = environments[0]
+        assert env['TM_APPROVAL_MODE'] == 'standing_policy'
+        assert env['TM_STANDING_POLICY_PATH'] == str(policy_path)
+        assert env['TM_STANDING_POLICY_SHA256'] == policy_hash
+        assert 'TM_APPROVAL_JOURNAL' not in env
+        assert 'TM_PAID_APPROVAL_PACKET_ID' not in env
+        assert 'TM_PAID_APPROVAL_PACKET_HASH' not in env
+        assert 'TM_WRITE_APPROVAL_PACKET_ID' not in env
+        assert 'TM_WRITE_APPROVAL_PACKET_HASH' not in env
+        assert env['TM_REQUIRE_METERED_PROXY'] == 'true'
+
+    def test_standing_policy_env_gate_off_requires_manual_ritual(
+        self, dag_module, monkeypatch, tmp_path,
+    ):
+        self._arm(dag_module, monkeypatch, tmp_path)
+        monkeypatch.delenv('TM_STANDING_POLICY_ENABLED', raising=False)
+        policy_path, _ = _write_standing_policy(tmp_path)
+        monkeypatch.setattr(dag_module, 'STANDING_POLICY_PATH', str(policy_path))
+
+        with pytest.raises(
+            Exception, match='exact paid/write approval bundle is required',
+        ):
+            dag_module._plan_exact_scopes(
+                **self._context(dag_module, self._standing_params(dag_module)),
+            )
+
+    def test_manual_run_with_explicit_scopes_requires_one_shot_bundles(
+        self, dag_module, monkeypatch, tmp_path,
+    ):
+        # An explicit selector skips the planner's dueness filter, so a manual
+        # trigger must never ride the standing grant even with the gate on.
+        self._arm(dag_module, monkeypatch, tmp_path)
+        policy_path, _ = _write_standing_policy(tmp_path)
+        monkeypatch.setattr(dag_module, 'STANDING_POLICY_PATH', str(policy_path))
+        params = self._standing_params(dag_module, scopes=['GB1:2025'])
+
+        with pytest.raises(
+            Exception, match='exact paid/write approval bundle is required',
+        ):
+            dag_module._plan_exact_scopes(
+                **self._context(dag_module, params, run_type='manual'),
+            )
+
+    def test_manual_run_with_empty_selectors_requires_one_shot_bundles(
+        self, dag_module, monkeypatch, tmp_path,
+    ):
+        self._arm(dag_module, monkeypatch, tmp_path)
+        policy_path, _ = _write_standing_policy(tmp_path)
+        monkeypatch.setattr(dag_module, 'STANDING_POLICY_PATH', str(policy_path))
+
+        with pytest.raises(
+            Exception, match='exact paid/write approval bundle is required',
+        ):
+            dag_module._plan_exact_scopes(
+                **self._context(
+                    dag_module,
+                    self._standing_params(dag_module),
+                    run_type='manual',
+                ),
+            )
+
+    def test_scheduled_run_with_explicit_selectors_requires_one_shot_bundles(
+        self, dag_module, monkeypatch, tmp_path,
+    ):
+        self._arm(dag_module, monkeypatch, tmp_path)
+        policy_path, _ = _write_standing_policy(tmp_path)
+        monkeypatch.setattr(dag_module, 'STANDING_POLICY_PATH', str(policy_path))
+        params = self._standing_params(
+            dag_module, leagues=['ENG-Premier League'],
+        )
+
+        with pytest.raises(
+            Exception, match='exact paid/write approval bundle is required',
+        ):
+            dag_module._plan_exact_scopes(
+                **self._context(dag_module, params),
+            )
+
+    def test_dag_run_without_run_type_is_not_scheduled(
+        self, dag_module, monkeypatch, tmp_path,
+    ):
+        # A present dag_run whose run_type is missing must not fall through
+        # to the run_id prefix: the prefix is operator-controlled input.
+        self._arm(dag_module, monkeypatch, tmp_path)
+        policy_path, _ = _write_standing_policy(tmp_path)
+        monkeypatch.setattr(dag_module, 'STANDING_POLICY_PATH', str(policy_path))
+        context = self._context(dag_module, self._standing_params(dag_module))
+        context['dag_run'] = SimpleNamespace()
+        context['run_id'] = 'scheduled__2026-07-13'
+
+        with pytest.raises(
+            Exception, match='exact paid/write approval bundle is required',
+        ):
+            dag_module._plan_exact_scopes(**context)
+
+    def test_enum_run_type_is_recognized_as_scheduled(
+        self, dag_module, monkeypatch, tmp_path,
+    ):
+        # Airflow's DagRunType is a str Enum; its member must gate the same
+        # way its plain-string value does.
+        class FakeRunType(str, Enum):
+            SCHEDULED = 'scheduled'
+
+        self._arm(dag_module, monkeypatch, tmp_path)
+        policy_path, policy_hash = _write_standing_policy(tmp_path)
+        monkeypatch.setattr(dag_module, 'STANDING_POLICY_PATH', str(policy_path))
+        context = self._context(dag_module, self._standing_params(dag_module))
+        context['dag_run'] = SimpleNamespace(run_type=FakeRunType.SCHEDULED)
+
+        environments = dag_module._plan_exact_scopes(**context)
+
+        assert environments[0]['TM_APPROVAL_MODE'] == 'standing_policy'
+        assert environments[0]['TM_STANDING_POLICY_SHA256'] == policy_hash
+
+    @pytest.mark.parametrize('run_type', ['backfill', 'dataset_triggered'])
+    def test_non_scheduled_run_types_require_one_shot_bundles(
+        self, dag_module, monkeypatch, tmp_path, run_type,
+    ):
+        self._arm(dag_module, monkeypatch, tmp_path)
+        policy_path, _ = _write_standing_policy(tmp_path)
+        monkeypatch.setattr(dag_module, 'STANDING_POLICY_PATH', str(policy_path))
+
+        with pytest.raises(
+            Exception, match='exact paid/write approval bundle is required',
+        ):
+            dag_module._plan_exact_scopes(
+                **self._context(
+                    dag_module,
+                    self._standing_params(dag_module),
+                    run_type=run_type,
+                ),
+            )
+
+    def test_standing_policy_missing_or_invalid_file_fails_closed(
+        self, dag_module, monkeypatch, tmp_path,
+    ):
+        self._arm(dag_module, monkeypatch, tmp_path)
+        monkeypatch.setattr(
+            dag_module, 'STANDING_POLICY_PATH', str(tmp_path / 'absent.json'),
+        )
+        with pytest.raises(Exception, match='unreadable'):
+            dag_module._plan_exact_scopes(
+                **self._context(dag_module, self._standing_params(dag_module)),
+            )
+
+        broken = tmp_path / 'broken.json'
+        broken.write_text('{not json', encoding='utf-8')
+        monkeypatch.setattr(dag_module, 'STANDING_POLICY_PATH', str(broken))
+        with pytest.raises(Exception, match='not valid JSON'):
+            dag_module._plan_exact_scopes(
+                **self._context(dag_module, self._standing_params(dag_module)),
+            )
+
+    @pytest.mark.parametrize(
+        ('paid_override', 'params_override'),
+        [
+            ({'byte_cap_bytes': 16 * 1024 * 1024}, {}),
+            ({'request_limit': 711}, {}),
+            ({'retry_limit': 401}, {}),
+            ({'concurrency': 2}, {}),
+            ({}, {'proxy_retry_limit': 2}),
+        ],
+    )
+    def test_standing_policy_caps_must_equal_pinned_limits(
+        self, dag_module, monkeypatch, tmp_path, paid_override, params_override,
+    ):
+        self._arm(dag_module, monkeypatch, tmp_path)
+        paid = {
+            'byte_cap_bytes': 15 * 1024 * 1024,
+            'request_limit': 710,
+            'retry_limit': 400,
+            'concurrency': 1,
+        }
+        paid.update(paid_override)
+        policy_path, _ = _write_standing_policy(tmp_path, paid_proxy=paid)
+        monkeypatch.setattr(dag_module, 'STANDING_POLICY_PATH', str(policy_path))
+
+        with pytest.raises(
+            Exception, match='caps differ from wrapper limits|pinned',
+        ):
+            dag_module._plan_exact_scopes(
+                **self._context(
+                    dag_module,
+                    self._standing_params(dag_module, **params_override),
+                ),
+            )
+
+    def test_standing_policy_expired_fails_closed(
+        self, dag_module, monkeypatch, tmp_path,
+    ):
+        self._arm(dag_module, monkeypatch, tmp_path)
+        policy_path, _ = _write_standing_policy(
+            tmp_path,
+            approved_at='2026-01-01T00:00:00Z',
+            expires_at='2026-02-01T00:00:00Z',
+        )
+        monkeypatch.setattr(dag_module, 'STANDING_POLICY_PATH', str(policy_path))
+
+        with pytest.raises(Exception, match='expired'):
+            dag_module._plan_exact_scopes(
+                **self._context(dag_module, self._standing_params(dag_module)),
+            )
+
+    def test_standing_policy_wrong_dag_id_fails_closed(
+        self, dag_module, monkeypatch, tmp_path,
+    ):
+        self._arm(dag_module, monkeypatch, tmp_path)
+        policy_path, _ = _write_standing_policy(
+            tmp_path, dag_id='dag_ingest_sofascore',
+        )
+        monkeypatch.setattr(dag_module, 'STANDING_POLICY_PATH', str(policy_path))
+
+        with pytest.raises(Exception, match='dag_id mismatch'):
+            dag_module._plan_exact_scopes(
+                **self._context(dag_module, self._standing_params(dag_module)),
+            )
+
+    def test_standing_policy_missing_required_write_table_fails_closed(
+        self, dag_module, monkeypatch, tmp_path,
+    ):
+        from dags.scripts.run_transfermarkt_scope_cycle import (
+            required_write_tables,
+        )
+
+        self._arm(dag_module, monkeypatch, tmp_path)
+        tables = sorted(
+            (required_write_tables('dual') | required_write_tables('native-only'))
+            - {'iceberg.ops.transfermarkt_scope_manifest_v2'}
+        )
+        policy_path, _ = _write_standing_policy(
+            tmp_path, allowed_write_tables=tables,
+        )
+        monkeypatch.setattr(dag_module, 'STANDING_POLICY_PATH', str(policy_path))
+
+        with pytest.raises(Exception, match='omits write tables'):
+            dag_module._plan_exact_scopes(
+                **self._context(dag_module, self._standing_params(dag_module)),
+            )
+
+    def test_explicit_bundles_take_precedence_over_standing_policy(
+        self, dag_module, monkeypatch, tmp_path,
+    ):
+        payload = self._arm(dag_module, monkeypatch, tmp_path)
+        policy_path, _ = _write_standing_policy(tmp_path)
+        monkeypatch.setattr(dag_module, 'STANDING_POLICY_PATH', str(policy_path))
+        params = self._standing_params(
+            dag_module,
+            approval_bundles={
+                payload['scope_id']: {
+                    'paid_proxy_packet_id': 'paid-1',
+                    'paid_proxy_packet_hash': 'a' * 64,
+                    'production_write_packet_id': 'write-1',
+                    'production_write_packet_hash': 'b' * 64,
+                },
+            },
+        )
+
+        environments = dag_module._plan_exact_scopes(
+            **self._context(dag_module, params),
+        )
+
+        assert len(environments) == 1
+        env = environments[0]
+        assert env['TM_APPROVAL_MODE'] == 'one_shot'
+        assert env['TM_PAID_APPROVAL_PACKET_ID'] == 'paid-1'
+        assert env['TM_WRITE_APPROVAL_PACKET_HASH'] == 'b' * 64
+        assert env['TM_APPROVAL_JOURNAL'] == dag_module.APPROVAL_JOURNAL
+        assert 'TM_STANDING_POLICY_PATH' not in env
+        assert 'TM_STANDING_POLICY_SHA256' not in env
 
 
 class TestRegistryRead:
