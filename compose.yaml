@@ -1304,6 +1304,7 @@ services:
       - ./configs/medallion:/opt/airflow/configs/medallion:ro
       - ./configs/proxy_filter:/opt/airflow/configs/proxy_filter:ro
       - ./configs/sofascore:/opt/airflow/configs/sofascore:ro
+      - ./proxys.txt:/opt/airflow/proxys.txt:ro
       # Mount the already writable Airflow log root. Mounting a missing host
       # subdirectory directly makes Docker create it as root:root, while this
       # image intentionally runs as the unprivileged airflow user.
