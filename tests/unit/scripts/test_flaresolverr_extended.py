@@ -335,10 +335,9 @@ def test_main_installs_media_patch_before_upstream_browser_self_test():
     [
         BASE_URL,
         "https://www.whoscored.com/stagestatfeed/23752/stageteams/?type=2",
-        "https://www.whoscored.com/stageplayerstatfeed/23752/playerstats/?page=1",
     ],
 )
-def test_url_allowlist_accepts_only_three_structured_feed_prefixes(url):
+def test_url_allowlist_accepts_only_active_structured_feed_prefixes(url):
     assert ext._validate_whoscored_feed_url(url) == url
 
 
@@ -360,6 +359,7 @@ def test_url_allowlist_accepts_only_three_structured_feed_prefixes(url):
         "https://www.whoscored.com/statisticsfeed/1/arbitrary",
         "https://www.whoscored.com/stagestatfeed/0/stageteams/?type=2",
         "https://www.whoscored.com/stagestatfeed/23752/other/?type=2",
+        "https://www.whoscored.com/stageplayerstatfeed/23752/playerstats/?page=1",
         "https://www.whoscored.com/stageplayerstatfeed/x/playerstats/?page=1",
         "https://www.whoscored.com\\@evil.test/statisticsfeed/1/x",
         "https://www.whoscored.com/statisticsfeed/1/x\nHost:evil.test",
@@ -451,7 +451,7 @@ def test_fixed_script_enforces_method_headers_credentials_origin_and_size():
     assert 'cache: "no-store"' not in script
     assert "get(?:team|player)statistics" in script
     assert "stagestatfeed\\/[1-9][0-9]*\\/stageteams" in script
-    assert "stageplayerstatfeed\\/[1-9][0-9]*\\/playerstats" in script
+    assert "stageplayerstatfeed" not in script
     assert "response_too_large" in script
     assert "eval(" not in script
     assert "new Function" not in script

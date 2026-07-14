@@ -4,7 +4,10 @@ import json
 import sys
 import time
 import types
+from datetime import datetime
+
 import pytest
+import requests
 
 from scrapers.base.flaresolverr_client import (
     FlareSolverrCFChallengeFailed,
@@ -58,6 +61,7 @@ PLAYER_STATS_BOOTSTRAP = (
     "https://www.whoscored.com/Regions/247/Tournaments/36/Seasons/9967/"
     "Stages/23753/TeamStatistics"
 )
+CONTROL_TOKEN = "c" * 32
 
 
 def _batch_solution(url, content=b'{"teamTableStats":[]}'):
@@ -323,6 +327,8 @@ def test_success_is_stored_in_raw_cache_before_return():
     assert cache.stored[0][0] == "p1"
     assert cache.stored[0][1].content == b"source"
     assert cache.stored[0][2] == result.sha256
+    assert cache.stored[0][1].observed_at == result.observed_at
+    assert datetime.fromisoformat(result.observed_at).tzinfo is not None
 
 
 @pytest.mark.unit
@@ -1803,6 +1809,23 @@ def test_paid_limit_is_zero_when_no_urls_are_eligible():
 
 
 @pytest.mark.unit
+def test_proxy_lease_repr_never_exposes_bearer_credentials():
+    lease = ProxyLease(
+        lease_id="lease-visible-id",
+        token="bearer-super-secret",
+        proxy_url="http://lease:embedded-secret@proxy_filter:8899",
+        max_bytes=1234,
+        expires_at=99.0,
+    )
+
+    rendered = repr(lease)
+    assert "lease-visible-id" in rendered
+    assert "bearer-super-secret" not in rendered
+    assert "embedded-secret" not in rendered
+    assert "proxy_filter" not in rendered
+
+
+@pytest.mark.unit
 def test_proxy_control_client_uses_dedicated_authenticated_lease_listener():
     response = FakeHTTPResponse()
     response.raise_for_status = lambda: None
@@ -1814,7 +1837,12 @@ def test_proxy_control_client_uses_dedicated_authenticated_lease_listener():
         "expires_at": 99.0,
     }
     session = SimpleControlSession(response)
-    client = ProxyFilterClient("http://proxy_filter:8899", session=session, timeout=3)
+    client = ProxyFilterClient(
+        "http://proxy_filter:8899",
+        session=session,
+        timeout=3,
+        control_token=CONTROL_TOKEN,
+    )
 
     context = TransportContext(
         dag_id="dag", run_id="run", task_id="task", map_index=4, try_number=2
@@ -1840,20 +1868,92 @@ def test_proxy_control_client_uses_dedicated_authenticated_lease_listener():
         "scope": "",
         "entity": "",
     }
+    assert session.posts[0][1]["headers"] == {
+        "X-Proxy-Control-Token": CONTROL_TOKEN
+    }
     assert lease.proxy_url == "http://lease:s%2Fecret@proxy_filter:8900"
+    client.stats(lease)
+    client.close(lease)
+    expected_headers = {
+        "X-Proxy-Control-Token": CONTROL_TOKEN,
+        "Authorization": "Bearer s/ecret",
+    }
+    assert session.gets[0][1]["headers"] == expected_headers
+    assert session.deletes[0][1]["headers"] == expected_headers
     client.close_session()
     assert session.closed is True
+
+
+@pytest.mark.unit
+def test_proxy_control_client_fails_closed_without_auth_and_surfaces_401(monkeypatch):
+    for name in (
+        "WHOSCORED_PROXY_CONTROL_TOKEN",
+        "PROXY_FILTER_CONTROL_TOKEN",
+        "SOFASCORE_PROXY_CONTROL_TOKEN",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    with pytest.raises(ValueError, match="PROXY_FILTER_CONTROL_TOKEN"):
+        ProxyFilterClient("http://proxy_filter:8899")
+
+    response = FakeHTTPResponse(status_code=401)
+    response.raise_for_status = lambda: (_ for _ in ()).throw(
+        requests.HTTPError("401 Client Error")
+    )
+    response.json = lambda: {"error": "unauthorized"}
+    session = SimpleControlSession(response)
+    client = ProxyFilterClient(
+        "http://proxy_filter:8899",
+        session=session,
+        control_token=CONTROL_TOKEN,
+    )
+    with pytest.raises(requests.HTTPError, match="401"):
+        client.create_lease(max_bytes=2_000_000, ttl_seconds=60)
+    assert session.posts[0][1]["headers"] == {
+        "X-Proxy-Control-Token": CONTROL_TOKEN
+    }
+    assert session.posts[0][1]["json"]["max_bytes"] == 2_000_000
+
+
+@pytest.mark.unit
+def test_proxy_control_client_reads_provider_neutral_control_token(monkeypatch):
+    monkeypatch.setenv("PROXY_FILTER_CONTROL_TOKEN", CONTROL_TOKEN)
+    response = FakeHTTPResponse()
+    response.raise_for_status = lambda: None
+    response.json = lambda: {
+        "id": "lease-env",
+        "token": "lease-token",
+        "proxy_url": "http://proxy_filter:8900",
+        "max_bytes": 1000,
+    }
+    session = SimpleControlSession(response)
+    client = ProxyFilterClient("http://proxy_filter:8899", session=session)
+
+    client.create_lease(max_bytes=1000, ttl_seconds=60)
+
+    assert session.posts[0][1]["headers"] == {
+        "X-Proxy-Control-Token": CONTROL_TOKEN
+    }
 
 
 class SimpleControlSession:
     def __init__(self, response):
         self.response = response
         self.posts = []
+        self.gets = []
+        self.deletes = []
         self.trust_env = True
         self.closed = False
 
     def post(self, url, **kwargs):
         self.posts.append((url, kwargs))
+        return self.response
+
+    def get(self, url, **kwargs):
+        self.gets.append((url, kwargs))
+        return self.response
+
+    def delete(self, url, **kwargs):
+        self.deletes.append((url, kwargs))
         return self.response
 
     def close(self):

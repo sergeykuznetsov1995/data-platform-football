@@ -256,6 +256,7 @@ class CachedPayload:
     content: bytes
     status_code: int = 200
     headers: Mapping[str, str] = field(default_factory=dict)
+    observed_at: Optional[str] = None
 
 
 @runtime_checkable
@@ -281,6 +282,7 @@ class TransportResponse:
     request_bytes: int = 0
     response_bytes: int = 0
     resource_bytes: int = 0
+    observed_at: str = ""
 
     @property
     def text(self) -> str:
@@ -353,8 +355,8 @@ class TransportStats:
 @dataclass(frozen=True)
 class ProxyLease:
     lease_id: str
-    token: str
-    proxy_url: str
+    token: str = field(repr=False)
+    proxy_url: str = field(repr=False)
     max_bytes: int
     expires_at: float
 
@@ -371,11 +373,23 @@ class ProxyFilterClient:
         proxy_url: str,
         *,
         control_url: Optional[str] = None,
+        control_token: Optional[str] = None,
         timeout: float = 5.0,
         session: Optional[requests.Session] = None,
     ) -> None:
         self.proxy_url = proxy_url.rstrip("/")
         self.control_url = (control_url or proxy_url).rstrip("/")
+        resolved_token = str(
+            control_token
+            if control_token is not None
+            else _proxy_control_token_from_environment()
+        ).strip()
+        if len(resolved_token) < 32:
+            raise ValueError(
+                "PROXY_FILTER_CONTROL_TOKEN must contain at least 32 characters "
+                "when the paid WhoScored proxy is configured"
+            )
+        self._control_token = resolved_token
         self.timeout = timeout
         self.session = session or requests.Session()
         self.session.trust_env = False
@@ -398,6 +412,7 @@ class ProxyFilterClient:
         response = self.session.post(
             f"{self.control_url}/v1/leases",
             json=request,
+            headers={"X-Proxy-Control-Token": self._control_token},
             timeout=self.timeout,
         )
         if int(getattr(response, "status_code", 0) or 0) == 429:
@@ -426,7 +441,10 @@ class ProxyFilterClient:
     def stats(self, lease: ProxyLease) -> dict[str, Any]:
         response = self.session.get(
             f"{self.control_url}/v1/leases/{lease.lease_id}/stats",
-            headers={"Authorization": f"Bearer {lease.token}"},
+            headers={
+                "X-Proxy-Control-Token": self._control_token,
+                "Authorization": f"Bearer {lease.token}",
+            },
             timeout=self.timeout,
         )
         response.raise_for_status()
@@ -435,7 +453,10 @@ class ProxyFilterClient:
     def close(self, lease: ProxyLease) -> dict[str, Any]:
         response = self.session.delete(
             f"{self.control_url}/v1/leases/{lease.lease_id}",
-            headers={"Authorization": f"Bearer {lease.token}"},
+            headers={
+                "X-Proxy-Control-Token": self._control_token,
+                "Authorization": f"Bearer {lease.token}",
+            },
             timeout=self.timeout,
         )
         response.raise_for_status()
@@ -445,6 +466,22 @@ class ProxyFilterClient:
         """Release the control-plane HTTP connection pool."""
 
         self.session.close()
+
+
+def _proxy_control_token_from_environment() -> str:
+    """Resolve the shared proxy-filter control secret without provider lock-in."""
+
+    for name in (
+        "WHOSCORED_PROXY_CONTROL_TOKEN",
+        "PROXY_FILTER_CONTROL_TOKEN",
+        # Compatibility with the original deployment name. New deployments
+        # should use the provider-neutral variable above.
+        "SOFASCORE_PROXY_CONTROL_TOKEN",
+    ):
+        value = str(os.environ.get(name, "")).strip()
+        if value:
+            return value
+    return ""
 
 
 def _proxy_url_with_lease(proxy_url: str, token: str) -> str:
@@ -477,7 +514,6 @@ _CF_ORIGIN_ERROR_TITLE = re.compile(
 _WHOSCORED_STRUCTURED_FEED_PATHS = (
     re.compile(r"\A/statisticsfeed/1/get(?:team|player)statistics\Z"),
     re.compile(r"\A/stagestatfeed/[1-9][0-9]*/stageteams/\Z"),
-    re.compile(r"\A/stageplayerstatfeed/[1-9][0-9]*/playerstats/\Z"),
 )
 _WHOSCORED_STAGE_BOOTSTRAP_PATH = re.compile(
     r"\A/Regions/[1-9][0-9]*/Tournaments/[1-9][0-9]*/"
@@ -1376,6 +1412,7 @@ class WhoScoredTransport:
                 content=response.content,
                 status_code=response.status_code,
                 headers=response.headers,
+                observed_at=response.observed_at,
             )
             try:
                 self.raw_cache.store(key, payload, response.sha256)
@@ -2209,6 +2246,11 @@ class WhoScoredTransport:
                 else max(0, int(wire_bytes))
             ),
             resource_bytes=max(0, int(resource_bytes)),
+            # Bind raw ordering before parser and S3 commit work.  Supported
+            # production uses one LocalExecutor host and a per-target lock;
+            # this timestamp also prevents a slow commit from being mistaken
+            # for a newer source observation.
+            observed_at=datetime.now(timezone.utc).isoformat(),
         )
 
     def _record_response(self, response: TransportResponse) -> None:

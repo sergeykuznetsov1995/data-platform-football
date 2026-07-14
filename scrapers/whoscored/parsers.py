@@ -34,7 +34,16 @@ from .domain import (
 )
 
 
-PARSER_VERSION = "whoscored-parser-v7"
+PARSER_VERSION = "whoscored-parser-v8"
+# Availability is a separate source contract from successful row parsing.
+# Incrementing it replays old content failures even when matchCentreData itself
+# has not changed shape.
+MATCH_AVAILABILITY_VERSION = "whoscored-match-availability-v2"
+MAX_PLAYER_STAGE_STAT_PAGES = 100
+MAX_PLAYER_STAGE_STAT_RESULTS_PER_PAGE = 5_000
+MAX_PLAYER_STAGE_STAT_RESULTS = (
+    MAX_PLAYER_STAGE_STAT_PAGES * MAX_PLAYER_STAGE_STAT_RESULTS_PER_PAGE
+)
 
 
 class WhoScoredParseError(ValueError):
@@ -43,6 +52,10 @@ class WhoScoredParseError(ValueError):
 
 class JavaScriptLiteralError(WhoScoredParseError):
     """An embedded JavaScript value could not be safely extracted or parsed."""
+
+
+class MatchCentreDataAbsent(JavaScriptLiteralError):
+    """A valid match page contains no matchCentreData property or assignment."""
 
 
 class DatasetStatus(str, Enum):
@@ -67,6 +80,37 @@ class ParsedDataset:
     @property
     def row_count(self) -> int:
         return len(self.rows)
+
+
+@dataclass(frozen=True)
+class PlayerStageStatisticsPage:
+    """Validated source page awaiting the remaining player-stat pages."""
+
+    page_number: int
+    page_index: Optional[int]
+    total_pages: int
+    total_results: int
+    results_per_page: int
+    first_record_index: Optional[int]
+    last_record_index: Optional[int]
+    index_base: Optional[int]
+    records: tuple[Mapping[str, Any], ...]
+
+    def __post_init__(self) -> None:
+        if not 1 <= self.page_number <= self.total_pages:
+            raise ValueError("player-stat page number is outside total pages")
+        if self.page_index is not None and self.page_index != self.page_number - 1:
+            raise ValueError("player-stat pageIndex disagrees with page number")
+        if not 1 <= self.total_pages <= MAX_PLAYER_STAGE_STAT_PAGES:
+            raise ValueError("player-stat total pages exceeds the safety bound")
+        if not 0 <= self.total_results <= MAX_PLAYER_STAGE_STAT_RESULTS:
+            raise ValueError("player-stat total results exceeds the safety bound")
+        if not 1 <= self.results_per_page <= MAX_PLAYER_STAGE_STAT_RESULTS_PER_PAGE:
+            raise ValueError("player-stat resultsPerPage is outside its safety bound")
+        if (self.first_record_index is None) != (self.last_record_index is None):
+            raise ValueError("player-stat record range must contain both endpoints")
+        if self.index_base not in {None, 0, 1}:
+            raise ValueError("player-stat index base must be zero, one or absent")
 
 
 @dataclass(frozen=True)
@@ -680,18 +724,88 @@ def extract_matchcentre_data(html: str) -> dict[str, Any]:
     property_pattern = re.compile(
         r"(?:(?:['\"]matchCentreData['\"])|(?:\bmatchCentreData\b))\s*:\s*"
     )
+    assignment_pattern = re.compile(
+        r"(?<![A-Za-z0-9_$])(?:(?:var|let|const)\s+)?"
+        r"matchCentreData\s*=\s*"
+    )
+    parse_errors: list[JavaScriptLiteralError] = []
+    if property_pattern.search(html) is not None:
+        try:
+            value = _extract_after_pattern(
+                html,
+                property_pattern,
+                label="property 'matchCentreData'",
+                allow_date_expressions=False,
+            )
+        except JavaScriptLiteralError as exc:
+            parse_errors.append(exc)
+        else:
+            if not isinstance(value, dict):
+                raise WhoScoredParseError("matchCentreData must be an object")
+            return value
+    if assignment_pattern.search(html) is not None:
+        try:
+            value = _extract_after_pattern(
+                html,
+                assignment_pattern,
+                label="assignment 'matchCentreData'",
+                allow_date_expressions=False,
+            )
+        except JavaScriptLiteralError as exc:
+            parse_errors.append(exc)
+        else:
+            if not isinstance(value, dict):
+                raise WhoScoredParseError("matchCentreData must be an object")
+            return value
+    if parse_errors:
+        raise WhoScoredParseError(
+            "matchCentreData is present but malformed or unsupported"
+        ) from parse_errors[0]
+    raise MatchCentreDataAbsent(
+        "JavaScript assignment 'matchCentreData' not found"
+    )
+
+
+def is_valid_match_page_without_matchcentre(html: str, *, game_id: int) -> bool:
+    """Return whether source HTML proves that matchCentreData is unavailable.
+
+    Generic HTTP-200 error and challenge shells are not availability evidence.
+    A real non-Opta live page contains two independent source-owned match-id
+    markers even though it omits ``matchCentreData``. Requiring both markers
+    prevents an unrelated shell from becoming a durable ``not_available``.
+    """
+
+    if not isinstance(html, str) or not html:
+        return False
     try:
-        value = _extract_after_pattern(
-            html,
-            property_pattern,
-            label="property 'matchCentreData'",
-            allow_date_expressions=False,
-        )
-    except JavaScriptLiteralError:
-        value = extract_js_assignment(html, "matchCentreData")
-    if not isinstance(value, dict):
-        raise WhoScoredParseError("matchCentreData must be an object")
-    return value
+        extract_matchcentre_data(html)
+    except MatchCentreDataAbsent:
+        pass
+    except WhoScoredParseError:
+        return False
+    else:
+        return False
+
+    expected = int(game_id)
+    header = re.search(
+        r"require\.config\.params\[['\"]matchheader['\"]\]\s*=\s*"
+        r"\{(?:(?!</script>).){0,8000}?\bmatchId\s*:\s*([1-9][0-9]*)",
+        html,
+        re.IGNORECASE | re.DOTALL,
+    )
+    scraper = re.search(
+        r"require\.config\.params\[['\"]args['\"]\]\s*=\s*"
+        r"\{(?:(?!</script>).){0,8000}?\bmatchId\s*:\s*([1-9][0-9]*)"
+        r"(?:(?!</script>).){0,8000}?\binitialMatchDataForScrappers\s*:",
+        html,
+        re.IGNORECASE | re.DOTALL,
+    )
+    return bool(
+        header
+        and scraper
+        and int(header.group(1)) == expected
+        and int(scraper.group(1)) == expected
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -3735,6 +3849,405 @@ def _stage_stats_paging_contract(
     )
 
 
+@dataclass(frozen=True)
+class _PlayerStatsPagingMetadata:
+    current_page: Optional[int] = None
+    page_index: Optional[int] = None
+    total_pages: Optional[int] = None
+    total_results: Optional[int] = None
+    results_per_page: Optional[int] = None
+    first_record_index: Optional[int] = None
+    last_record_index: Optional[int] = None
+
+
+def _player_stats_paging_metadata(value: Any) -> _PlayerStatsPagingMetadata:
+    values: dict[str, set[int]] = {
+        "current_page": set(),
+        "page_index": set(),
+        "total_pages": set(),
+        "total_results": set(),
+        "results_per_page": set(),
+        "first_record_index": set(),
+        "last_record_index": set(),
+    }
+    aliases = {
+        "currentpage": "current_page",
+        "pagenumber": "current_page",
+        "page": "current_page",
+        "pageindex": "page_index",
+        "totalpages": "total_pages",
+        "total": "total_results",
+        "totalresults": "total_results",
+        "totalrecords": "total_results",
+        "pagesize": "results_per_page",
+        "resultsperpage": "results_per_page",
+        "recordsperpage": "results_per_page",
+        "firstrecordindex": "first_record_index",
+        "startindex": "first_record_index",
+        "lastrecordindex": "last_record_index",
+        "endindex": "last_record_index",
+    }
+
+    def visit(node: Any) -> None:
+        if not isinstance(node, Mapping):
+            return
+        for raw_key, child in node.items():
+            key = str(raw_key).replace("_", "").casefold()
+            if key in _PAGING_CONTAINER_KEYS:
+                if not isinstance(child, Mapping):
+                    raise WhoScoredParseError(
+                        f"statistics {raw_key} metadata must be an object"
+                    )
+                for paging_key, paging_value in child.items():
+                    normalized = str(paging_key).replace("_", "").casefold()
+                    semantic = aliases.get(normalized)
+                    if semantic is not None:
+                        values[semantic].add(
+                            _required_int(paging_value, f"{raw_key}.{paging_key}")
+                        )
+                continue
+            visit(child)
+
+    visit(value)
+    conflicting = {
+        name: sorted(found) for name, found in values.items() if len(found) > 1
+    }
+    if conflicting:
+        raise WhoScoredParseError(
+            f"player statistics paging metadata conflicts: {conflicting}"
+        )
+    return _PlayerStatsPagingMetadata(
+        **{
+            name: next(iter(found), None)
+            for name, found in values.items()
+        }
+    )
+
+
+def _validate_player_stats_page_metadata(
+    metadata: _PlayerStatsPagingMetadata,
+    *,
+    expected_page: int,
+    records_count: int,
+) -> Optional[int]:
+    current_page = metadata.current_page
+    if current_page is not None:
+        if current_page < 1:
+            raise WhoScoredParseError(
+                "player statistics currentPage must be positive"
+            )
+        if current_page != int(expected_page):
+            raise WhoScoredParseError(
+                f"player statistics returned page {current_page}; "
+                f"expected {int(expected_page)}"
+            )
+    if metadata.page_index is not None:
+        if metadata.page_index < 0:
+            raise WhoScoredParseError(
+                "player statistics pageIndex must be non-negative"
+            )
+        if current_page is not None and metadata.page_index + 1 != current_page:
+            raise WhoScoredParseError(
+                "player statistics pageIndex disagrees with currentPage"
+            )
+
+    total_results = metadata.total_results
+    if total_results is not None and not 0 <= total_results <= MAX_PLAYER_STAGE_STAT_RESULTS:
+        raise WhoScoredParseError(
+            "player statistics totalResults exceeds its safety bound"
+        )
+    results_per_page = metadata.results_per_page
+    if results_per_page is not None:
+        if not 0 <= results_per_page <= MAX_PLAYER_STAGE_STAT_RESULTS_PER_PAGE:
+            raise WhoScoredParseError(
+                "player statistics resultsPerPage exceeds its safety bound"
+            )
+        if results_per_page == 0 and (
+            records_count != 0 or total_results not in {None, 0}
+        ):
+            raise WhoScoredParseError(
+                "player statistics resultsPerPage=0 contradicts returned rows"
+            )
+        if results_per_page > 0 and records_count > results_per_page:
+            raise WhoScoredParseError(
+                "player statistics page contains more rows than resultsPerPage"
+            )
+
+    first_index = metadata.first_record_index
+    last_index = metadata.last_record_index
+    if (first_index is None) != (last_index is None):
+        raise WhoScoredParseError(
+            "player statistics record range must contain both endpoints"
+        )
+    if first_index is not None and last_index is not None:
+        if first_index < 0 or last_index < first_index:
+            raise WhoScoredParseError(
+                "player statistics record range is invalid"
+            )
+        zero_row_sentinel = (
+            records_count == 0
+            and total_results == 0
+            and first_index == 0
+            and last_index == 0
+        )
+        if not zero_row_sentinel and last_index - first_index + 1 != records_count:
+            raise WhoScoredParseError(
+                "player statistics record range cardinality disagrees with rows"
+            )
+
+    total_pages = metadata.total_pages
+    if total_pages is None:
+        return None
+    if not 1 <= total_pages <= MAX_PLAYER_STAGE_STAT_PAGES:
+        raise WhoScoredParseError(
+            "player statistics totalPages exceeds its safety bound"
+        )
+    if current_page is None:
+        raise WhoScoredParseError(
+            "player statistics totalPages requires a positive currentPage"
+        )
+    if current_page > total_pages:
+        raise WhoScoredParseError(
+            "player statistics currentPage exceeds totalPages"
+        )
+    if total_results is None:
+        raise WhoScoredParseError(
+            "player statistics totalPages requires totalResults"
+        )
+    if total_results == 0:
+        if total_pages != 1 or current_page != 1 or records_count != 0:
+            raise WhoScoredParseError(
+                "empty player statistics has inconsistent page metadata"
+            )
+        return 0 if first_index is not None else None
+    if total_pages > total_results or records_count == 0:
+        raise WhoScoredParseError(
+            "player statistics page cardinality contradicts totalResults"
+        )
+    if total_pages > 1 and (results_per_page is None or results_per_page == 0):
+        raise WhoScoredParseError(
+            "paginated player statistics requires positive resultsPerPage"
+        )
+
+    index_base: Optional[int] = None
+    if results_per_page is not None and results_per_page > 0:
+        expected_pages = (total_results + results_per_page - 1) // results_per_page
+        if expected_pages != total_pages:
+            raise WhoScoredParseError(
+                "player statistics totalPages disagrees with totalResults and "
+                "resultsPerPage"
+            )
+        expected_count = (
+            results_per_page
+            if current_page < total_pages
+            else total_results - results_per_page * (total_pages - 1)
+        )
+        if records_count != expected_count:
+            raise WhoScoredParseError(
+                "player statistics page cardinality is inconsistent"
+            )
+        if first_index is not None and last_index is not None:
+            zero_based = (current_page - 1) * results_per_page
+            if first_index == zero_based:
+                index_base = 0
+            elif first_index == zero_based + 1:
+                index_base = 1
+            else:
+                raise WhoScoredParseError(
+                    "player statistics record range starts at an invalid index"
+                )
+            if last_index != first_index + expected_count - 1:
+                raise WhoScoredParseError(
+                    "player statistics record range ends at an invalid index"
+                )
+    elif total_pages == 1 and records_count != total_results:
+        raise WhoScoredParseError(
+            "player statistics single page is incomplete"
+        )
+    return index_base
+
+
+def parse_player_stage_statistics_page(
+    payload: str | bytes | Mapping[str, Any] | Sequence[Any],
+    *,
+    scope: WhoScoredScope,
+    stage_id: int,
+    expected_page: int,
+    source_season_id: Optional[int] = None,
+    source_category: Optional[str] = None,
+    source_subcategory: Optional[str] = None,
+) -> ParsedDataset | PlayerStageStatisticsPage:
+    """Parse one player-stat page or return a validated pagination envelope."""
+
+    if int(expected_page) < 1:
+        raise ValueError("expected player-stat page must be positive")
+    decoded = _decode_discovery_document(payload, variable_names=())
+    if not isinstance(decoded, Mapping):
+        return parse_player_stage_statistics(
+            decoded,
+            scope=scope,
+            stage_id=stage_id,
+            source_season_id=source_season_id,
+            source_category=source_category,
+            source_subcategory=source_subcategory,
+        )
+    metadata = _player_stats_paging_metadata(decoded)
+    lists = _find_named_record_lists(decoded, _STAGE_STAT_LIST_KEYS["player"])
+    if not lists:
+        _validate_player_stats_page_metadata(
+            metadata,
+            expected_page=int(expected_page),
+            records_count=0,
+        )
+        if metadata.total_pages is None:
+            return parse_player_stage_statistics(
+                decoded,
+                scope=scope,
+                stage_id=stage_id,
+                source_season_id=source_season_id,
+                source_category=source_category,
+                source_subcategory=source_subcategory,
+            )
+        raise WhoScoredParseError(
+            "paginated player statistics has no playerTableStats container"
+        )
+    records = tuple(record for record_list in lists for record in record_list)
+    identities = {_stage_stat_record_identity(record) for record in records}
+    if len(identities) != len(records):
+        raise WhoScoredParseError(
+            "player statistics page contains duplicate source records"
+        )
+    index_base = _validate_player_stats_page_metadata(
+        metadata,
+        expected_page=int(expected_page),
+        records_count=len(records),
+    )
+    if metadata.total_pages is None or metadata.total_pages == 1:
+        return parse_player_stage_statistics(
+            decoded,
+            scope=scope,
+            stage_id=stage_id,
+            source_season_id=source_season_id,
+            source_category=source_category,
+            source_subcategory=source_subcategory,
+        )
+    assert metadata.current_page is not None
+    assert metadata.total_results is not None
+    assert metadata.results_per_page is not None
+    return PlayerStageStatisticsPage(
+        page_number=metadata.current_page,
+        page_index=metadata.page_index,
+        total_pages=metadata.total_pages,
+        total_results=metadata.total_results,
+        results_per_page=metadata.results_per_page,
+        first_record_index=metadata.first_record_index,
+        last_record_index=metadata.last_record_index,
+        index_base=index_base,
+        records=records,
+    )
+
+
+def merge_player_stage_statistics_pages(
+    pages: Sequence[PlayerStageStatisticsPage],
+    *,
+    scope: WhoScoredScope,
+    stage_id: int,
+    source_season_id: Optional[int] = None,
+    source_category: Optional[str] = None,
+    source_subcategory: Optional[str] = None,
+) -> ParsedDataset:
+    """Validate and parse one complete ordered player-stat page set."""
+
+    if not pages:
+        raise WhoScoredParseError("player statistics pagination has no pages")
+    if len(pages) > MAX_PLAYER_STAGE_STAT_PAGES:
+        raise WhoScoredParseError(
+            "player statistics pagination exceeds its safety bound"
+        )
+    ordered = tuple(sorted(pages, key=lambda value: value.page_number))
+    expected_pages = ordered[0].total_pages
+    expected_total = ordered[0].total_results
+    expected_page_size = ordered[0].results_per_page
+    ranges_present = ordered[0].first_record_index is not None
+    page_indexes_present = ordered[0].page_index is not None
+    if len(ordered) != expected_pages or any(
+        page.page_number != ordinal
+        for ordinal, page in enumerate(ordered, start=1)
+    ):
+        raise WhoScoredParseError("player statistics pagination is incomplete")
+    if any(
+        page.total_pages != expected_pages
+        or page.total_results != expected_total
+        or page.results_per_page != expected_page_size
+        or (page.first_record_index is not None) != ranges_present
+        or (page.page_index is not None) != page_indexes_present
+        for page in ordered
+    ):
+        raise WhoScoredParseError(
+            "player statistics paging metadata changed between pages"
+        )
+    previous_last: Optional[int] = None
+    observed_base: Optional[int] = None
+    for page in ordered:
+        metadata = _PlayerStatsPagingMetadata(
+            current_page=page.page_number,
+            page_index=page.page_index,
+            total_pages=page.total_pages,
+            total_results=page.total_results,
+            results_per_page=page.results_per_page,
+            first_record_index=page.first_record_index,
+            last_record_index=page.last_record_index,
+        )
+        validated_base = _validate_player_stats_page_metadata(
+            metadata,
+            expected_page=page.page_number,
+            records_count=len(page.records),
+        )
+        if validated_base != page.index_base:
+            raise WhoScoredParseError(
+                "player statistics page index metadata was not preserved"
+            )
+        if validated_base is not None:
+            if observed_base is None:
+                observed_base = validated_base
+            elif observed_base != validated_base:
+                raise WhoScoredParseError(
+                    "player statistics record index base changed between pages"
+                )
+        if page.first_record_index is not None:
+            if previous_last is not None and page.first_record_index != previous_last + 1:
+                raise WhoScoredParseError(
+                    "player statistics record ranges are not contiguous"
+                )
+            previous_last = page.last_record_index
+    records = tuple(record for page in ordered for record in page.records)
+    identities = {_stage_stat_record_identity(record) for record in records}
+    if len(identities) != len(records):
+        raise WhoScoredParseError(
+            "player statistics pagination repeats source records"
+        )
+    if len(records) != expected_total:
+        raise WhoScoredParseError(
+            "player statistics pagination is incomplete: returned "
+            f"{len(records)} distinct records, source declares {expected_total}"
+        )
+    return parse_player_stage_statistics(
+        {
+            "playerTableStats": list(records),
+            "paging": {
+                "currentPage": 1,
+                "totalPages": 1,
+                "totalResults": expected_total,
+            },
+        },
+        scope=scope,
+        stage_id=stage_id,
+        source_season_id=source_season_id,
+        source_category=source_category,
+        source_subcategory=source_subcategory,
+    )
+
+
 def _stage_stat_record_identity(record: Mapping[str, Any]) -> str:
     """Stable identity for one exact source record.
 
@@ -3835,6 +4348,11 @@ def parse_stage_statistics(
     }
     document_fingerprint = schema_fingerprint(decoded)
     for index, record in enumerate(records):
+        # A record can expand into dozens of long-form metric rows.  Its
+        # schema is identical for every one of those leaves, so calculate the
+        # relatively expensive canonical traversal once instead of once per
+        # emitted row.
+        record_fingerprint = schema_fingerprint(record)
         metrics = {
             key: value for key, value in record.items() if key not in identity_keys
         }
@@ -3884,7 +4402,7 @@ def parse_stage_statistics(
                     else None,
                     "rank": _optional_int(record.get("rank"), "rank"),
                     **leaf,
-                    "record_schema_fingerprint": schema_fingerprint(record),
+                    "record_schema_fingerprint": record_fingerprint,
                     "document_schema_fingerprint": document_fingerprint,
                 }
             )

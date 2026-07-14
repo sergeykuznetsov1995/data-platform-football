@@ -14,7 +14,11 @@ import pytest
 
 from scrapers.whoscored.catalog import CatalogSeason
 from scrapers.whoscored.domain import SeasonFormat, WhoScoredScope
-from scrapers.whoscored.repository import MatchCommit, PreviewCommit
+from scrapers.whoscored.repository import (
+    MatchCommit,
+    PreviewCommit,
+    WhoScoredScopeRowSpool,
+)
 
 
 SCRIPT = (
@@ -103,8 +107,13 @@ class FakeRawStore:
             self.invalidated is None or self.invalidated.target_id != target.target_id
         )
 
-    def quarantine(self, target: Any, *, reason: str) -> str:
+    def load_bytes(self, target: Any) -> tuple[bytes, Any]:
+        assert self.has(target)
+        return b"raw", SimpleNamespace(target_id=target.target_id)
+
+    def quarantine(self, target: Any, *, reason: str, record: Any = None) -> str:
         assert "incremental" in reason
+        assert record is not None and record.target_id == target.target_id
         self.invalidated = target
         return f"quarantine/{target.target_id}"
 
@@ -519,6 +528,97 @@ def test_benchmark_feed_contract_is_exact_and_fail_closed():
     wrong_stage = {key: "available" for key in bench._expected_stage_feed_keys([23753])}
     with pytest.raises(ValueError, match="does not cover schedule stages"):
         repository.commit_scope_bundle(**{**kwargs, "feed_states": wrong_stage})
+
+
+def test_in_memory_repository_fingerprints_spooled_stats_without_retaining_rows(
+    tmp_path,
+):
+    season = CatalogSeason(
+        WhoScoredScope("INT-World Cup", "2026", SeasonFormat.SINGLE_YEAR)
+    )
+    repository = bench.InMemoryBenchmarkRepository(season)
+    spool = WhoScoredScopeRowSpool(
+        table="whoscored_team_stage_stats",
+        league="INT-World Cup",
+        season="2026",
+        directory=str(tmp_path),
+    )
+    try:
+        spool.append_entity_rows(
+            {
+                "league": "INT-World Cup",
+                "season": "2026",
+                "stage_id": 23752,
+                "row_index": index,
+                "source_raw_json": "x" * 1024,
+            }
+            for index in range(128)
+        )
+        datasets = {
+            "whoscored_schedule": [
+                {
+                    "game_id": 1,
+                    "stage_id": None,
+                    "status": 6,
+                    "has_preview": True,
+                }
+            ],
+            "whoscored_team_stage_stats": spool,
+        }
+        kwargs = {
+            "league": "INT-World Cup",
+            "season": "2026",
+            "entity_group": "season",
+            "datasets": datasets,
+            "distinct_keys": {
+                "whoscored_schedule": "game_id",
+                "whoscored_team_stage_stats": "entity_key",
+            },
+            "payload_sha256": "a" * 64,
+            "raw_uris": ["/tmp/raw"],
+        }
+
+        repository.commit_scope_bundle(**kwargs)
+        repository.commit_scope_bundle(**kwargs)
+
+        assert set(repository._scope_datasets) == {"whoscored_schedule"}
+        assert repository._scope_counts["whoscored_team_stage_stats"] == 128
+        metrics = repository.metrics_snapshot()
+        assert metrics["new_batch_rows"]["whoscored_team_stage_stats"] == 128
+        assert metrics["idempotent_rows"]["whoscored_team_stage_stats"] == 128
+    finally:
+        spool.close()
+
+
+def test_in_memory_repository_accepts_explicitly_empty_scope_spool(tmp_path):
+    season = CatalogSeason(
+        WhoScoredScope("ENG-Premier League", "2526", SeasonFormat.SPLIT_YEAR)
+    )
+    repository = bench.InMemoryBenchmarkRepository(season)
+    with WhoScoredScopeRowSpool(
+        table="whoscored_referee_stage_stats",
+        league="ENG-Premier League",
+        season="2526",
+        directory=str(tmp_path),
+    ) as spool:
+        repository.commit_scope_bundle(
+            league="ENG-Premier League",
+            season="2526",
+            entity_group="season",
+            datasets={
+                "whoscored_schedule": [{"game_id": 1, "stage_id": None}],
+                "whoscored_referee_stage_stats": spool,
+            },
+            distinct_keys={
+                "whoscored_schedule": "game_id",
+                "whoscored_referee_stage_stats": "entity_key",
+            },
+            payload_sha256="a" * 64,
+            raw_uris=["/tmp/raw"],
+            source_empty={"whoscored_referee_stage_stats"},
+        )
+
+    assert repository._scope_counts["whoscored_referee_stage_stats"] == 0
 
 
 def test_in_memory_repository_deduplicates_warm_batches():

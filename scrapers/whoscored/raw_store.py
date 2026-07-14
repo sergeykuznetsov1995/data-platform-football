@@ -18,13 +18,12 @@ import re
 import fcntl
 import tempfile
 import time
-import uuid
 import zlib
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
-from typing import Callable, Iterator, Mapping, Optional
+from typing import Callable, Iterator, Mapping, Optional, TypeVar
 from urllib.parse import urlparse
 
 from pyarrow import fs
@@ -34,8 +33,14 @@ from .domain import WhoScoredScope
 logger = logging.getLogger(__name__)
 
 RAW_MANIFEST_VERSION = "whoscored-raw-v1"
+RAW_RECEIPT_VERSION = "whoscored-target-receipt-v2"
 FETCHER_VERSION = "whoscored-transport-v3"
 _POSITIVE_ID_RE = re.compile(r"^[1-9][0-9]*$")
+_OBSERVED_AT_RE = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+    r"(?:\.[0-9]{1,6})?(?:Z|[+-][0-9]{2}:[0-9]{2})$"
+)
+_T = TypeVar("_T")
 
 
 class RawStoreError(RuntimeError):
@@ -52,6 +57,14 @@ class RawObjectCorrupt(RawObjectNotFound):
 
 class RawTargetLockTimeout(RawStoreError):
     """Another local worker did not finish the same raw target in time."""
+
+
+class RawSnapshotLockTimeout(RawStoreError):
+    """A writer or snapshot could not acquire the LocalExecutor barrier."""
+
+
+class _RawWriteVerificationError(OSError):
+    """A provider did not make the bytes just written durably observable."""
 
 
 @dataclass(frozen=True)
@@ -186,7 +199,13 @@ def stage_page_target(
 
 
 class WhoScoredRawStore:
-    """Content-addressed gzip blobs plus latest-target JSON manifests."""
+    """Verified content-addressed blobs plus append-only target receipts.
+
+    New commits never depend on an object-store rename.  A gzip blob is put
+    directly at its deterministic hash key and read back before an immutable
+    target receipt is published.  Readers select the newest valid receipt and
+    fall back to the pre-v2 mutable target manifest layout for compatibility.
+    """
 
     def __init__(self, filesystem: fs.FileSystem, root: str) -> None:
         self.filesystem = filesystem
@@ -198,9 +217,26 @@ class WhoScoredRawStore:
         if parsed.scheme == "s3":
             if not parsed.netloc:
                 raise ValueError("S3 raw-store URI must contain a bucket")
+            dedicated_access = os.environ.get(
+                "WHOSCORED_RAW_S3_ACCESS_KEY", ""
+            ).strip()
+            dedicated_secret = os.environ.get(
+                "WHOSCORED_RAW_S3_SECRET_KEY", ""
+            ).strip()
+            if bool(dedicated_access) != bool(dedicated_secret):
+                raise RawStoreError(
+                    "WHOSCORED_RAW_S3_ACCESS_KEY and "
+                    "WHOSCORED_RAW_S3_SECRET_KEY must be set together"
+                )
+            platform_access = os.environ.get("S3_ACCESS_KEY", "").strip()
+            platform_secret = os.environ.get("S3_SECRET_KEY", "").strip()
+            if bool(platform_access) != bool(platform_secret):
+                raise RawStoreError(
+                    "S3_ACCESS_KEY and S3_SECRET_KEY must be set together"
+                )
             filesystem = fs.S3FileSystem(
-                access_key=os.environ.get("S3_ACCESS_KEY"),
-                secret_key=os.environ.get("S3_SECRET_KEY"),
+                access_key=dedicated_access or platform_access or None,
+                secret_key=dedicated_secret or platform_secret or None,
                 endpoint_override=os.environ.get(
                     "WHOSCORED_RAW_S3_ENDPOINT", "seaweedfs:8333"
                 ),
@@ -233,41 +269,118 @@ class WhoScoredRawStore:
         return path
 
     def _exists(self, relative: str) -> bool:
-        return (
-            self.filesystem.get_file_info(self._path(relative)).type
-            != fs.FileType.NotFound
-        )
+        def operation() -> bool:
+            return (
+                self.filesystem.get_file_info(self._path(relative)).type
+                != fs.FileType.NotFound
+            )
+
+        return self._retry_io("stat", relative, operation)
 
     def _read_bytes(self, relative: str) -> bytes:
-        path = self._path(relative)
-        info = self.filesystem.get_file_info(path)
-        if info.type == fs.FileType.NotFound:
-            raise RawObjectNotFound(f"Raw object not found: {relative}")
-        with self.filesystem.open_input_file(path) as stream:
-            return stream.read()
+        def operation() -> bytes:
+            path = self._path(relative)
+            info = self.filesystem.get_file_info(path)
+            if info.type == fs.FileType.NotFound:
+                raise RawObjectNotFound(f"Raw object not found: {relative}")
+            with self.filesystem.open_input_file(path) as stream:
+                return stream.read()
+
+        return self._retry_io("read", relative, operation)
+
+    @staticmethod
+    def _retry_settings() -> tuple[int, float]:
+        attempts_raw = os.environ.get("WHOSCORED_RAW_IO_ATTEMPTS", "4")
+        delay_raw = os.environ.get("WHOSCORED_RAW_RETRY_BASE_SECONDS", "0.2")
+        try:
+            attempts = int(attempts_raw)
+            base_delay = float(delay_raw)
+        except ValueError as exc:
+            raise RawStoreError("Invalid WhoScored raw-store retry settings") from exc
+        if attempts < 1 or attempts > 10:
+            raise RawStoreError("WHOSCORED_RAW_IO_ATTEMPTS must be in 1..10")
+        if not math.isfinite(base_delay) or not 0 <= base_delay <= 10:
+            raise RawStoreError(
+                "WHOSCORED_RAW_RETRY_BASE_SECONDS must be in 0..10"
+            )
+        return attempts, base_delay
+
+    def _retry_io(
+        self,
+        action: str,
+        relative: str,
+        operation: Callable[[], _T],
+    ) -> _T:
+        attempts, base_delay = self._retry_settings()
+        for attempt in range(1, attempts + 1):
+            try:
+                return operation()
+            except RawStoreError:
+                raise
+            except (OSError, TimeoutError) as exc:
+                if attempt == attempts:
+                    raise RawStoreError(
+                        f"Raw-store {action} failed after {attempts} attempts: "
+                        f"{relative}"
+                    ) from exc
+                delay = base_delay * (2 ** (attempt - 1))
+                # Deterministic per-object jitter avoids retry herds while
+                # keeping unit/fault tests reproducible.
+                jitter = (
+                    int(hashlib.sha256(relative.encode("utf-8")).hexdigest()[:4], 16)
+                    / 0xFFFF
+                )
+                time.sleep(delay * (0.75 + 0.5 * jitter))
+        raise AssertionError("raw-store retry loop exhausted unexpectedly")
 
     def _write_bytes(self, relative: str, payload: bytes) -> None:
-        path = self._path(relative)
-        self.filesystem.create_dir(str(PurePosixPath(path).parent), recursive=True)
-        temporary = f"{path}.tmp-{uuid.uuid4().hex}"
-        try:
+        """Put final bytes directly and verify the exact object after close.
+
+        S3-compatible providers publish a completed PUT atomically.  There is
+        intentionally no copy/delete ``move`` in this commit path.  A retry is
+        idempotent because production callers use content-addressed blobs or
+        deterministic immutable receipt keys.
+        """
+
+        if not isinstance(payload, bytes):
+            raise TypeError("Raw-store payload must be bytes")
+        expected_hash = hashlib.sha256(payload).hexdigest()
+
+        def operation() -> None:
+            path = self._path(relative)
+            self.filesystem.create_dir(
+                str(PurePosixPath(path).parent), recursive=True
+            )
             # Arrow auto-detects .gz; compression=None avoids double
-            # compression. The final name appears only after the complete
-            # object has closed, so readers never observe a partial manifest.
+            # compression of already encoded raw blobs.
             with self.filesystem.open_output_stream(
-                temporary, compression=None
+                path, compression=None
             ) as stream:
                 stream.write(payload)
-            self.filesystem.move(temporary, path)
-        finally:
-            try:
-                if (
-                    self.filesystem.get_file_info(temporary).type
-                    != fs.FileType.NotFound
-                ):
-                    self.filesystem.delete_file(temporary)
-            except Exception:
-                logger.warning("Could not remove raw-store temporary %s", temporary)
+            with self.filesystem.open_input_file(path) as stream:
+                stored = stream.read()
+            if (
+                len(stored) != len(payload)
+                or hashlib.sha256(stored).hexdigest() != expected_hash
+            ):
+                raise _RawWriteVerificationError(
+                    f"Read-after-write mismatch for {relative}"
+                )
+
+        self._retry_io("write/verify", relative, operation)
+
+    def _write_immutable_bytes(self, relative: str, payload: bytes) -> None:
+        """Create or idempotently confirm one immutable object."""
+
+        if self._exists(relative):
+            if self._read_bytes(relative) != payload:
+                raise RawStoreError(f"Raw object is immutable: {relative}")
+            return
+        self._write_bytes(relative, payload)
+        # A competing writer can only use this key for the same deterministic
+        # payload.  This final comparison also covers an ambiguous PUT result.
+        if self._read_bytes(relative) != payload:
+            raise RawStoreError(f"Immutable raw object mismatch: {relative}")
 
     @contextmanager
     def target_lock(
@@ -322,6 +435,68 @@ class WhoScoredRawStore:
             finally:
                 handle.close()
 
+    @contextmanager
+    def snapshot_lock(
+        self,
+        *,
+        exclusive: bool,
+        timeout_seconds: Optional[float] = None,
+    ) -> Iterator[None]:
+        """Coordinate LocalExecutor writers with one consistent inventory.
+
+        Raw commits take a shared lock; the inventory task takes the exclusive
+        form.  The lock identity is derived from the configured raw root, so
+        independently constructed source/backup store objects still meet at
+        the same host-local barrier.
+        """
+
+        configured = os.environ.get(
+            "WHOSCORED_RAW_SNAPSHOT_LOCK_TIMEOUT_SECONDS", "300"
+        )
+        try:
+            wait_seconds = (
+                float(configured)
+                if timeout_seconds is None
+                else float(timeout_seconds)
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("raw snapshot lock timeout must be numeric") from exc
+        if not math.isfinite(wait_seconds) or wait_seconds < 0:
+            raise ValueError(
+                "raw snapshot lock timeout must be a finite non-negative number"
+            )
+        root = Path(
+            os.environ.get(
+                "WHOSCORED_RAW_LOCK_DIR",
+                str(Path(tempfile.gettempdir()) / "whoscored_raw_locks"),
+            )
+        )
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(root, 0o700)
+        identity = hashlib.sha256(self.root.encode("utf-8")).hexdigest()
+        handle = (root / f"snapshot-{identity}.lock").open("a+b")
+        os.fchmod(handle.fileno(), 0o600)
+        mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        deadline = time.monotonic() + wait_seconds
+        try:
+            while True:
+                try:
+                    fcntl.flock(handle.fileno(), mode | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError as exc:
+                    if time.monotonic() >= deadline:
+                        kind = "snapshot" if exclusive else "raw writer"
+                        raise RawSnapshotLockTimeout(
+                            f"Timed out waiting for {kind} lock on {self.root}"
+                        ) from exc
+                    time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+            yield
+        finally:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                handle.close()
+
     def _read_json(self, relative: str) -> dict:
         try:
             payload = json.loads(self._read_bytes(relative).decode("utf-8"))
@@ -332,7 +507,11 @@ class WhoScoredRawStore:
         return payload
 
     def _write_json(self, relative: str, payload: Mapping[str, object]) -> None:
-        rendered = (
+        self._write_bytes(relative, self._render_json(payload))
+
+    @staticmethod
+    def _render_json(payload: Mapping[str, object]) -> bytes:
+        return (
             json.dumps(
                 payload,
                 ensure_ascii=False,
@@ -341,47 +520,199 @@ class WhoScoredRawStore:
             ).encode("utf-8")
             + b"\n"
         )
-        self._write_bytes(relative, rendered)
+
+    def _write_immutable_json(
+        self, relative: str, payload: Mapping[str, object]
+    ) -> None:
+        self._write_immutable_bytes(relative, self._render_json(payload))
 
     @staticmethod
     def _target_manifest_key(target: RawTarget) -> str:
+        """Return the legacy mutable-manifest key (read compatibility only)."""
         digest = hashlib.sha256(target.target_id.encode("utf-8")).hexdigest()
         return f"targets/{target.page_kind}/{digest}.json"
+
+    @staticmethod
+    def _target_receipt_prefix(target: RawTarget) -> str:
+        digest = hashlib.sha256(target.target_id.encode("utf-8")).hexdigest()
+        return f"target-history-v2/{target.page_kind}/{digest}"
+
+    @classmethod
+    def _target_receipt_key(
+        cls,
+        target: RawTarget,
+        record_payload: Mapping[str, object],
+    ) -> str:
+        rendered = json.dumps(
+            record_payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        record_hash = hashlib.sha256(rendered).hexdigest()
+        try:
+            observed = cls._observation_time(record_payload["fetched_at"])
+        except (KeyError, RawStoreError) as exc:
+            raise RawStoreError("Raw fetched_at must be an ISO-8601 timestamp") from exc
+        observed_utc = observed.astimezone(timezone.utc)
+        order_token = (
+            f"{observed_utc.year:04d}{observed_utc.month:02d}"
+            f"{observed_utc.day:02d}T{observed_utc.hour:02d}"
+            f"{observed_utc.minute:02d}{observed_utc.second:02d}"
+            f"{observed_utc.microsecond:06d}Z"
+        )
+        return (
+            f"{cls._target_receipt_prefix(target)}/{order_token}-"
+            f"{record_hash}.json"
+        )
+
+    @staticmethod
+    def _receipt_payload(record_payload: Mapping[str, object]) -> dict:
+        normalized = json.loads(
+            json.dumps(record_payload, ensure_ascii=False, sort_keys=True)
+        )
+        canonical = json.dumps(
+            normalized,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return {
+            "receipt_version": RAW_RECEIPT_VERSION,
+            "record_sha256": hashlib.sha256(canonical).hexdigest(),
+            "record": normalized,
+        }
+
+    @staticmethod
+    def _observation_time(value: object) -> datetime:
+        token = str(value).strip()
+        if not _OBSERVED_AT_RE.fullmatch(token):
+            raise RawStoreError(
+                "Raw fetched_at must use ISO-8601 with at most microsecond precision"
+            )
+        try:
+            observed = datetime.fromisoformat(token.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise RawStoreError("Raw fetched_at must be an ISO-8601 timestamp") from exc
+        if (
+            observed.year < 1000
+            or observed.tzinfo is None
+            or observed.utcoffset() is None
+        ):
+            raise RawStoreError(
+                "Raw fetched_at must be timezone-aware and use year 1000..9999"
+            )
+        return observed
+
+    @classmethod
+    def _record_order_key(cls, record: RawObjectRecord) -> tuple[datetime, str]:
+        return (
+            cls._observation_time(record.fetched_at).astimezone(timezone.utc),
+            cls._record_sha256(record),
+        )
+
+    @staticmethod
+    def _record_sha256(record: RawObjectRecord) -> str:
+        canonical = json.dumps(
+            asdict(record),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return hashlib.sha256(canonical).hexdigest()
+
+    @staticmethod
+    def _target_invalidation_key(target: RawTarget, record_sha256: str) -> str:
+        digest = hashlib.sha256(target.target_id.encode("utf-8")).hexdigest()
+        return (
+            f"target-invalidations-v2/{target.page_kind}/{digest}/"
+            f"{record_sha256}.json"
+        )
+
+    def _relative_path(self, path: str) -> str:
+        root = self.root.rstrip("/")
+        prefix = f"{root}/" if root else ""
+        if prefix and path.startswith(prefix):
+            return path[len(prefix) :]
+        if not root:
+            return path.lstrip("/")
+        raise RawObjectCorrupt(f"Raw path escaped configured root: {path}")
 
     @staticmethod
     def _blob_key(content_hash: str) -> str:
         return f"blobs/sha256/{content_hash[:2]}/{content_hash}.raw.gz"
 
-    def quarantine(self, target: RawTarget, *, reason: str) -> Optional[str]:
-        """Move a bad target manifest aside so the next load refetches it.
+    def quarantine(
+        self,
+        target: RawTarget,
+        *,
+        reason: str,
+        record: Optional[RawObjectRecord] = None,
+    ) -> Optional[str]:
+        with self.snapshot_lock(exclusive=False):
+            return self._quarantine_unlocked(target, reason=reason, record=record)
+
+    def _quarantine_unlocked(
+        self,
+        target: RawTarget,
+        *,
+        reason: str,
+        record: Optional[RawObjectRecord] = None,
+    ) -> Optional[str]:
+        """Append durable corruption evidence without mutating raw history.
 
         Content-addressed blobs are deliberately retained: another target may
-        reference the same valid source response. A subsequent ``store_bytes``
-        verifies and repairs a corrupt blob at the deterministic key.
+        reference the same valid source response.  Receipts and legacy
+        manifests remain available for forensic inspection; a subsequent
+        ``store_bytes`` publishes a newer verified receipt.  Only an explicitly
+        supplied record is invalidated.  Re-selecting the current receipt here
+        would race with a concurrent healthy writer and could invalidate the
+        replacement instead of the record that actually failed validation.
         """
-        manifest_key = self._target_manifest_key(target)
-        if not self._exists(manifest_key):
+        if not self._exists(self._target_manifest_key(target)) and not self._exists(
+            self._target_receipt_prefix(target)
+        ):
             return None
         digest = hashlib.sha256(target.target_id.encode("utf-8")).hexdigest()
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-        quarantine_key = (
-            f"quarantine/targets/{target.page_kind}/{digest}/{timestamp}.manifest"
+        quarantined_at = utc_now_iso()
+        timestamp = datetime.fromisoformat(quarantined_at).strftime(
+            "%Y%m%dT%H%M%S%fZ"
         )
-        source_path = self._path(manifest_key)
-        destination_path = self._path(quarantine_key)
-        self.filesystem.create_dir(
-            str(PurePosixPath(destination_path).parent), recursive=True
+        reason_text = str(reason)[:1000]
+        evidence_hash = hashlib.sha256(reason_text.encode("utf-8")).hexdigest()[:16]
+        quarantine_key = (
+            f"quarantine/targets/{target.page_kind}/{digest}/"
+            f"{timestamp}-{evidence_hash}.json"
         )
         try:
-            self.filesystem.move(source_path, destination_path)
-            self._write_json(
-                f"{quarantine_key}.json",
+            invalidated_sha256 = (
+                None if record is None else self._record_sha256(record)
+            )
+            if invalidated_sha256 is not None:
+                self._write_immutable_json(
+                    self._target_invalidation_key(target, invalidated_sha256),
+                    {
+                        "invalidation_version": "whoscored-target-invalidation-v1",
+                        "record_sha256": invalidated_sha256,
+                        "target_id": target.target_id,
+                        "fetched_at": record.fetched_at,
+                        "content_hash": record.content_hash,
+                    },
+                )
+            self._write_immutable_json(
+                quarantine_key,
                 {
-                    "quarantined_at": utc_now_iso(),
+                    "quarantined_at": quarantined_at,
                     "target_id": target.target_id,
                     "canonical_url": target.canonical_url,
-                    "manifest_uri": self.object_uri(quarantine_key),
-                    "reason": str(reason)[:1000],
+                    "legacy_manifest_uri": self.object_uri(
+                        self._target_manifest_key(target)
+                    ),
+                    "receipt_prefix_uri": self.object_uri(
+                        self._target_receipt_prefix(target)
+                    ),
+                    "invalidated_record_sha256": invalidated_sha256,
+                    "reason": reason_text,
                 },
             )
         except Exception:
@@ -395,13 +726,18 @@ class WhoScoredRawStore:
         return quarantine_key
 
     def has(self, target: RawTarget) -> bool:
-        return self._exists(self._target_manifest_key(target))
+        try:
+            self._load_record(target)
+        except (RawObjectNotFound, RawObjectCorrupt):
+            return False
+        return True
 
-    def _load_record(self, target: RawTarget) -> RawObjectRecord:
-        manifest_key = self._target_manifest_key(target)
-        if not self._exists(manifest_key):
-            raise RawObjectNotFound(f"No raw manifest for {target.target_id}")
-        payload = self._read_json(manifest_key)
+    def _record_from_payload(
+        self,
+        target: RawTarget,
+        payload: Mapping[str, object],
+        manifest_key: str,
+    ) -> RawObjectRecord:
         try:
             record = RawObjectRecord(**payload)
         except TypeError as exc:
@@ -444,6 +780,12 @@ class WhoScoredRawStore:
             raise RawObjectCorrupt(
                 f"Unsupported manifest version {record.manifest_version!r}"
             )
+        try:
+            self._observation_time(record.fetched_at)
+        except RawStoreError as exc:
+            raise RawObjectCorrupt(
+                f"Invalid fetched_at in raw manifest: {manifest_key}"
+            ) from exc
         if (
             record.source != target.source
             or record.page_kind != target.page_kind
@@ -465,6 +807,142 @@ class WhoScoredRawStore:
         if not self._exists(record.blob_key):
             raise RawObjectNotFound(f"Raw blob not found: {record.blob_key}")
         return record
+
+    def _record_from_receipt(
+        self,
+        target: RawTarget,
+        receipt: Mapping[str, object],
+        receipt_key: str,
+    ) -> RawObjectRecord:
+        if receipt.get("receipt_version") != RAW_RECEIPT_VERSION:
+            raise RawObjectCorrupt(f"Unsupported raw receipt: {receipt_key}")
+        record_payload = receipt.get("record")
+        if not isinstance(record_payload, Mapping):
+            raise RawObjectCorrupt(f"Receipt has no record: {receipt_key}")
+        canonical = json.dumps(
+            dict(record_payload),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        if receipt.get("record_sha256") != hashlib.sha256(canonical).hexdigest():
+            raise RawObjectCorrupt(f"Receipt checksum mismatch: {receipt_key}")
+        return self._record_from_payload(target, record_payload, receipt_key)
+
+    def _latest_receipt_record(
+        self,
+        target: RawTarget,
+        *,
+        include_invalidated: bool = False,
+    ) -> Optional[RawObjectRecord]:
+        prefix = self._target_receipt_prefix(target)
+
+        def operation():
+            return self.filesystem.get_file_info(
+                fs.FileSelector(
+                    self._path(prefix),
+                    allow_not_found=True,
+                    recursive=False,
+                )
+            )
+
+        infos = self._retry_io("list", prefix, operation)
+        receipt_errors = []
+        receipt_count = 0
+        invalidated_count = 0
+        receipt_infos = sorted(
+            (
+                info
+                for info in infos
+                if info.type == fs.FileType.File and info.path.endswith(".json")
+            ),
+            key=lambda info: info.path,
+            reverse=True,
+        )
+        for info in receipt_infos:
+            if info.type != fs.FileType.File or not info.path.endswith(".json"):
+                continue
+            receipt_count += 1
+            key = self._relative_path(info.path)
+            try:
+                receipt = self._read_json(key)
+                record = self._record_from_receipt(target, receipt, key)
+                try:
+                    expected_key = self._target_receipt_key(target, asdict(record))
+                except RawStoreError as exc:
+                    raise RawObjectCorrupt(
+                        f"Invalid receipt ordering metadata: {key}"
+                    ) from exc
+                if key != expected_key:
+                    raise RawObjectCorrupt(f"Receipt key mismatch: {key}")
+                record_sha256 = str(receipt["record_sha256"])
+                if (
+                    not include_invalidated
+                    and self._exists(
+                        self._target_invalidation_key(target, record_sha256)
+                    )
+                ):
+                    invalidated_count += 1
+                    continue
+                # Receipt names start with fixed-width UTC observation time,
+                # so descending lexical order is the same as record order.
+                return record
+            except (RawObjectNotFound, RawObjectCorrupt) as exc:
+                receipt_errors.append(exc)
+                logger.error("Ignoring invalid WhoScored raw receipt %s: %s", key, exc)
+        if receipt_errors and len(receipt_errors) == receipt_count:
+            raise receipt_errors[-1]
+        if receipt_count and invalidated_count + len(receipt_errors) == receipt_count:
+            raise RawObjectNotFound(
+                f"All raw receipts are invalidated for {target.target_id}"
+            )
+        return None
+
+    def _load_record(self, target: RawTarget) -> RawObjectRecord:
+        receipt_error: Optional[RawObjectNotFound] = None
+        try:
+            receipt_record = self._latest_receipt_record(target)
+        except RawObjectNotFound as exc:
+            # A partially migrated target may still have a valid legacy
+            # manifest alongside a damaged v2 receipt.  Preserve that verified
+            # fallback; once a healthy v2 receipt is published it wins again.
+            receipt_error = exc
+            receipt_record = None
+        manifest_key = self._target_manifest_key(target)
+        legacy_record: Optional[RawObjectRecord] = None
+        legacy_error: Optional[RawObjectNotFound] = None
+        if self._exists(manifest_key):
+            try:
+                candidate = self._record_from_payload(
+                    target, self._read_json(manifest_key), manifest_key
+                )
+                if self._exists(
+                    self._target_invalidation_key(
+                        target, self._record_sha256(candidate)
+                    )
+                ):
+                    raise RawObjectNotFound(
+                        f"Legacy raw manifest is invalidated for {target.target_id}"
+                    )
+                legacy_record = candidate
+            except RawObjectNotFound as exc:
+                legacy_error = exc
+
+        candidates = [
+            record
+            for record in (receipt_record, legacy_record)
+            if record is not None
+        ]
+        if candidates:
+            # During a rolling v1/v2 cutover neither layout is intrinsically
+            # newer. Compare the bound observation timestamp instead of
+            # allowing any v2 receipt to shadow a later legacy writer.
+            return max(candidates, key=self._record_order_key)
+        if receipt_error is not None:
+            raise receipt_error
+        if legacy_error is not None:
+            raise legacy_error
+        raise RawObjectNotFound(f"No raw manifest for {target.target_id}")
 
     def is_fresh(
         self,
@@ -512,24 +990,63 @@ class WhoScoredRawStore:
         fetched_at: Optional[str] = None,
         fetcher_version: str = FETCHER_VERSION,
     ) -> RawObjectRecord:
+        with self.snapshot_lock(exclusive=False):
+            return self._store_bytes_unlocked(
+                target,
+                payload,
+                content_type=content_type,
+                charset=charset,
+                fetched_at=fetched_at,
+                fetcher_version=fetcher_version,
+            )
+
+    def _store_bytes_unlocked(
+        self,
+        target: RawTarget,
+        payload: bytes,
+        *,
+        content_type: str,
+        charset: Optional[str] = None,
+        fetched_at: Optional[str] = None,
+        fetcher_version: str = FETCHER_VERSION,
+    ) -> RawObjectRecord:
         if not isinstance(payload, bytes):
             raise TypeError("Raw payload must be bytes")
         if not payload:
             raise RawStoreError(
                 f"Refusing to store an empty response for {target.target_id}"
             )
+        observed_at = fetched_at or utc_now_iso()
+        self._observation_time(observed_at)
         content_hash = hashlib.sha256(payload).hexdigest()
         blob_key = self._blob_key(content_hash)
         encoded = gzip.compress(payload, compresslevel=6, mtime=0)
         blob_is_valid = False
         if self._exists(blob_key):
             try:
-                existing = gzip.decompress(self._read_bytes(blob_key))
-                blob_is_valid = hashlib.sha256(existing).hexdigest() == content_hash
+                existing_encoded = self._read_bytes(blob_key)
+                existing = gzip.decompress(existing_encoded)
+                blob_is_valid = (
+                    hashlib.sha256(existing).hexdigest() == content_hash
+                    and existing == payload
+                )
+                if blob_is_valid:
+                    encoded = existing_encoded
             except (gzip.BadGzipFile, EOFError, OSError, zlib.error):
                 blob_is_valid = False
         if not blob_is_valid:
             self._write_bytes(blob_key, encoded)
+        verified_encoded = self._read_bytes(blob_key)
+        try:
+            verified_payload = gzip.decompress(verified_encoded)
+        except (gzip.BadGzipFile, EOFError, OSError, zlib.error) as exc:
+            raise RawObjectCorrupt(f"Invalid gzip blob after write: {blob_key}") from exc
+        if (
+            len(verified_encoded) != len(encoded)
+            or len(verified_payload) != len(payload)
+            or hashlib.sha256(verified_payload).hexdigest() != content_hash
+        ):
+            raise RawObjectCorrupt(f"Raw blob verification failed: {blob_key}")
 
         record = RawObjectRecord(
             manifest_version=RAW_MANIFEST_VERSION,
@@ -544,13 +1061,40 @@ class WhoScoredRawStore:
             compression="gzip",
             content_type=str(content_type),
             charset=charset,
-            fetched_at=fetched_at or utc_now_iso(),
+            fetched_at=observed_at,
             fetcher_version=fetcher_version,
             decoded_bytes=len(payload),
             encoded_bytes=len(encoded),
         )
-        # The target manifest is the commit marker and is deliberately last.
-        self._write_json(self._target_manifest_key(target), asdict(record))
+        if self._exists(
+            self._target_invalidation_key(target, self._record_sha256(record))
+        ):
+            raise RawStoreError(
+                "Refusing to republish an invalidated raw observation; "
+                "retry with a new source observation timestamp"
+            )
+        # The immutable receipt is the commit marker and is deliberately last.
+        # No mutable latest pointer is required for correctness: readers order
+        # verified receipts by source observation time.
+        record_payload = asdict(record)
+        receipt_key = self._target_receipt_key(target, record_payload)
+        self._write_immutable_json(
+            receipt_key,
+            self._receipt_payload(record_payload),
+        )
+        committed = self._record_from_receipt(
+            target,
+            self._read_json(receipt_key),
+            receipt_key,
+        )
+        if committed != record:
+            raise RawStoreError(f"Raw receipt verification failed: {receipt_key}")
+        if self._exists(
+            self._target_invalidation_key(target, self._record_sha256(record))
+        ):
+            raise RawStoreError(
+                "Raw observation was invalidated while its receipt was committed"
+            )
         return record
 
     def store_text(
@@ -584,7 +1128,7 @@ class WhoScoredRawStore:
             raw = gzip.decompress(encoded)
         except (gzip.BadGzipFile, EOFError, zlib.error) as exc:
             error = RawObjectCorrupt(f"Invalid gzip blob: {record.blob_key}")
-            self.quarantine(target, reason=str(error))
+            self.quarantine(target, reason=str(error), record=record)
             raise error from exc
         actual_hash = hashlib.sha256(raw).hexdigest()
         if (
@@ -596,7 +1140,7 @@ class WhoScoredRawStore:
                 f"Content integrity mismatch for {target.target_id}: "
                 f"expected={record.content_hash}, actual={actual_hash}"
             )
-            self.quarantine(target, reason=str(error))
+            self.quarantine(target, reason=str(error), record=record)
             raise error
         return raw, record
 
@@ -609,7 +1153,7 @@ class WhoScoredRawStore:
             error = RawObjectCorrupt(
                 f"Raw object cannot be decoded as {charset}: {record.blob_key}"
             )
-            self.quarantine(target, reason=str(error))
+            self.quarantine(target, reason=str(error), record=record)
             raise error from exc
 
     def get_or_fetch(
@@ -624,16 +1168,15 @@ class WhoScoredRawStore:
         """Return cached bytes or invoke ``loader`` exactly once when absent."""
 
         with self.target_lock(target):
-            if self.has(target):
-                try:
-                    raw, record = self.load_bytes(target)
-                except RawObjectNotFound:
-                    # Corrupt manifests are quarantined by ``load_bytes`` and
-                    # are cache misses for the fetch state machine, while
-                    # callers that explicitly load receive typed corruption.
-                    pass
-                else:
-                    return raw, record, True
+            try:
+                raw, record = self.load_bytes(target)
+            except RawObjectNotFound:
+                # Corrupt manifests are quarantined by ``load_bytes`` and are
+                # cache misses for the fetch state machine, while callers that
+                # explicitly load receive typed corruption.
+                pass
+            else:
+                return raw, record, True
             loaded = loader(target.canonical_url)
             payload = loaded.encode("utf-8") if isinstance(loaded, str) else loaded
             if not isinstance(payload, bytes) or not payload:

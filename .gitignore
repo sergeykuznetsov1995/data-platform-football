@@ -204,7 +204,11 @@ configs/openmetadata/jwtkeys/
 # Documentation (local only)
 CLAUDE.md
 PLAN.md
-docs/
+docs/*
+# Production runbooks must be versioned even though local/scratch docs remain
+# ignored by default.
+!docs/operations/
+!docs/operations/*.md
 scrapers/README.md
 
 # Local ad-hoc SQL (not part of pipeline; only dags/sql/ is tracked)

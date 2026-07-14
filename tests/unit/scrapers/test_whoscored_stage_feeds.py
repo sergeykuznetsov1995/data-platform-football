@@ -114,7 +114,9 @@ def test_touch_channels_parse_the_inline_primed_literal_without_execution():
         "type": 2,
     }
     assert all(json.loads(row["filter"]) == expected_filter for row in result.rows)
-    assert all(json.loads(row["source_raw_json"])[0] == 324 for row in result.rows)
+    raw_rows = [row for row in result.rows if row["source_raw_json"] is not None]
+    assert len(raw_rows) == 1
+    assert json.loads(raw_rows[0]["source_raw_json"])[0] == 324
     assert len({row["source_schema_fingerprint"] for row in result.rows}) == 1
     assert len({row["document_schema_fingerprint"] for row in result.rows}) == 1
 

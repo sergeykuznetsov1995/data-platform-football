@@ -140,6 +140,7 @@ MANIFEST_REQUIRED_COLUMNS: Mapping[str, Sequence[str]] = {
         "payload_sha256",
         "raw_uri",
         "parser_version",
+        "availability_version",
         "state",
         "entity_counts_json",
         "dataset_statuses_json",

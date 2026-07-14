@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import gzip
+import io
 import json
 import threading
 import time
 import zlib
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+from pyarrow import fs
 
 from scrapers.whoscored.catalog import CatalogError, WhoScoredCatalog
 from scrapers.whoscored.domain import (
@@ -42,6 +45,8 @@ from scrapers.whoscored.parsers import (
 from scrapers.whoscored.raw_store import (
     RawObjectCorrupt,
     RawObjectNotFound,
+    RawObjectRecord,
+    RawStoreError,
     RawTarget,
     WhoScoredRawStore,
     match_page_target,
@@ -671,6 +676,52 @@ class TestRawStore:
     def _store(self, tmp_path) -> WhoScoredRawStore:
         return WhoScoredRawStore.from_uri(tmp_path.as_uri())
 
+    def test_s3_store_prefers_dedicated_whoscored_credentials(
+        self, monkeypatch
+    ):
+        captured = {}
+        sentinel = object()
+
+        def filesystem(**kwargs):
+            captured.update(kwargs)
+            return sentinel
+
+        monkeypatch.setattr("scrapers.whoscored.raw_store.fs.S3FileSystem", filesystem)
+        monkeypatch.setenv("S3_ACCESS_KEY", "platform-access")
+        monkeypatch.setenv("S3_SECRET_KEY", "platform-secret")
+        monkeypatch.setenv("WHOSCORED_RAW_S3_ACCESS_KEY", "whoscored-access")
+        monkeypatch.setenv("WHOSCORED_RAW_S3_SECRET_KEY", "whoscored-secret")
+
+        store = WhoScoredRawStore.from_uri("s3://warehouse/raw/whoscored")
+
+        assert store.filesystem is sentinel
+        assert captured["access_key"] == "whoscored-access"
+        assert captured["secret_key"] == "whoscored-secret"
+
+    @pytest.mark.parametrize(
+        "name,value",
+        [
+            ("WHOSCORED_RAW_S3_ACCESS_KEY", "dedicated-only"),
+            ("WHOSCORED_RAW_S3_SECRET_KEY", "dedicated-only"),
+            ("S3_ACCESS_KEY", "platform-only"),
+            ("S3_SECRET_KEY", "platform-only"),
+        ],
+    )
+    def test_s3_store_rejects_partial_credential_pairs(
+        self, monkeypatch, name, value
+    ):
+        for variable in (
+            "WHOSCORED_RAW_S3_ACCESS_KEY",
+            "WHOSCORED_RAW_S3_SECRET_KEY",
+            "S3_ACCESS_KEY",
+            "S3_SECRET_KEY",
+        ):
+            monkeypatch.delenv(variable, raising=False)
+        monkeypatch.setenv(name, value)
+
+        with pytest.raises(RawStoreError, match="must be set together"):
+            WhoScoredRawStore.from_uri("s3://warehouse/raw/whoscored")
+
     def test_content_addressed_round_trip_and_cache_hit(self, tmp_path):
         store = self._store(tmp_path)
         target = match_page_target(1903117)
@@ -720,6 +771,359 @@ class TestRawStore:
         assert sorted(result[2] for result in results) == [False, True]
         assert {result[0] for result in results} == {b"<html>singleflight</html>"}
 
+    def test_new_commit_is_append_only_and_never_calls_move(self, tmp_path):
+        class NoMoveFilesystem:
+            def __init__(self, delegate):
+                self.delegate = delegate
+
+            def __getattr__(self, name):
+                return getattr(self.delegate, name)
+
+            def move(self, *_args, **_kwargs):
+                pytest.fail("append-only raw commits must not call move")
+
+        store = WhoScoredRawStore(
+            NoMoveFilesystem(fs.LocalFileSystem()), str(tmp_path)
+        )
+        target = match_page_target(1903120)
+        record = store.store_text(target, "<html>append-only</html>")
+
+        assert not store._exists(store._target_manifest_key(target))
+        receipt_key = store._target_receipt_key(target, asdict(record))
+        assert store._exists(receipt_key)
+        assert store.load_text(target)[0] == "<html>append-only</html>"
+
+    def test_delayed_older_writer_cannot_replace_newer_receipt(self, tmp_path):
+        store = self._store(tmp_path)
+        target = match_page_target(1903121)
+        newest = store.store_text(
+            target,
+            "<html>new</html>",
+            fetched_at="2026-07-14T08:00:00+00:00",
+        )
+        older = store.store_text(
+            target,
+            "<html>old</html>",
+            fetched_at="2026-07-14T07:00:00+00:00",
+        )
+
+        body, loaded = store.load_text(target)
+
+        assert body == "<html>new</html>"
+        assert loaded == newest
+        assert loaded != older
+
+    def test_same_commit_is_idempotent_and_creates_one_receipt(self, tmp_path):
+        store = self._store(tmp_path)
+        target = match_page_target(1903122)
+        kwargs = {"fetched_at": "2026-07-14T08:00:00+00:00"}
+
+        first = store.store_text(target, "<html>same</html>", **kwargs)
+        second = store.store_text(target, "<html>same</html>", **kwargs)
+
+        assert first == second
+        receipt_root = tmp_path / store._target_receipt_prefix(target)
+        assert len(list(receipt_root.glob("*.json"))) == 1
+
+    def test_transient_direct_put_is_retried_and_verified(
+        self, tmp_path, monkeypatch
+    ):
+        class TransientWriteFilesystem:
+            def __init__(self, delegate, failures):
+                self.delegate = delegate
+                self.failures = failures
+
+            def __getattr__(self, name):
+                return getattr(self.delegate, name)
+
+            def open_output_stream(self, *args, **kwargs):
+                if self.failures:
+                    self.failures -= 1
+                    raise OSError("temporary object-store outage")
+                return self.delegate.open_output_stream(*args, **kwargs)
+
+        filesystem = TransientWriteFilesystem(fs.LocalFileSystem(), failures=2)
+        store = WhoScoredRawStore(filesystem, str(tmp_path))
+        monkeypatch.setenv("WHOSCORED_RAW_RETRY_BASE_SECONDS", "0")
+
+        record = store.store_text(match_page_target(1903123), "<html>ok</html>")
+
+        assert filesystem.failures == 0
+        assert gzip.decompress(store._read_bytes(record.blob_key)) == b"<html>ok</html>"
+
+    def test_read_after_write_mismatch_retries_full_put(self, tmp_path, monkeypatch):
+        class StaleReadFilesystem:
+            def __init__(self, delegate):
+                self.delegate = delegate
+                self.stale_reads = 1
+
+            def __getattr__(self, name):
+                return getattr(self.delegate, name)
+
+            def open_input_file(self, *args, **kwargs):
+                if self.stale_reads:
+                    self.stale_reads -= 1
+                    return io.BytesIO(b"partial-object")
+                return self.delegate.open_input_file(*args, **kwargs)
+
+        filesystem = StaleReadFilesystem(fs.LocalFileSystem())
+        store = WhoScoredRawStore(filesystem, str(tmp_path))
+        monkeypatch.setenv("WHOSCORED_RAW_RETRY_BASE_SECONDS", "0")
+
+        record = store.store_text(match_page_target(1903126), "<html>ok</html>")
+
+        assert filesystem.stale_reads == 0
+        assert store.load_text(match_page_target(1903126))[1] == record
+
+    def test_blob_survives_receipt_failure_and_retry_resumes_without_refetch(
+        self, tmp_path, monkeypatch
+    ):
+        class ReceiptFailureFilesystem:
+            def __init__(self, delegate):
+                self.delegate = delegate
+                self.fail_receipt = True
+                self.blob_writes = 0
+
+            def __getattr__(self, name):
+                return getattr(self.delegate, name)
+
+            def open_output_stream(self, path, *args, **kwargs):
+                if path.endswith(".raw.gz"):
+                    self.blob_writes += 1
+                if self.fail_receipt and "target-history-v2" in path:
+                    raise OSError("crash before receipt publish")
+                return self.delegate.open_output_stream(path, *args, **kwargs)
+
+        filesystem = ReceiptFailureFilesystem(fs.LocalFileSystem())
+        store = WhoScoredRawStore(filesystem, str(tmp_path))
+        target = match_page_target(1903127)
+        monkeypatch.setenv("WHOSCORED_RAW_IO_ATTEMPTS", "1")
+
+        with pytest.raises(RawStoreError, match="write/verify failed"):
+            store.store_text(target, "<html>resume</html>")
+
+        assert filesystem.blob_writes == 1
+        assert not store.has(target)
+        filesystem.fail_receipt = False
+
+        record = store.store_text(target, "<html>resume</html>")
+
+        assert filesystem.blob_writes == 1
+        assert store.load_text(target)[1] == record
+
+    def test_corrupt_newer_receipt_falls_back_to_last_valid_version(self, tmp_path):
+        store = self._store(tmp_path)
+        target = match_page_target(1903124)
+        older = store.store_text(
+            target,
+            "<html>valid</html>",
+            fetched_at="2026-07-14T07:00:00+00:00",
+        )
+        newer = store.store_text(
+            target,
+            "<html>corrupt-receipt</html>",
+            fetched_at="2026-07-14T08:00:00+00:00",
+        )
+        store._write_bytes(
+            store._target_receipt_key(target, asdict(newer)), b"{not-json"
+        )
+
+        body, loaded = store.load_text(target)
+
+        assert body == "<html>valid</html>"
+        assert loaded == older
+
+    def test_legacy_mutable_manifest_remains_readable(self, tmp_path):
+        store = self._store(tmp_path)
+        target = match_page_target(1903125)
+        record = store.store_text(
+            target,
+            "<html>legacy</html>",
+            fetched_at="2026-07-14T08:00:00+00:00",
+        )
+        receipt_key = store._target_receipt_key(target, asdict(record))
+        store.filesystem.delete_file(store._path(receipt_key))
+        store._write_json(store._target_manifest_key(target), asdict(record))
+
+        assert store.load_text(target) == ("<html>legacy</html>", record)
+        assert (
+            store.quarantine(target, reason="legacy replay", record=record) is not None
+        )
+        assert not store.has(target)
+
+    def test_corrupt_v2_receipt_falls_back_to_valid_legacy_manifest(self, tmp_path):
+        store = self._store(tmp_path)
+        target = match_page_target(1903130)
+        record = store.store_text(target, "<html>legacy-fallback</html>")
+        receipt_key = store._target_receipt_key(target, asdict(record))
+        store._write_json(store._target_manifest_key(target), asdict(record))
+        store._write_bytes(receipt_key, b"{not-json")
+
+        assert store.load_text(target) == ("<html>legacy-fallback</html>", record)
+
+    def test_missing_blob_v2_receipt_falls_back_to_valid_legacy_manifest(
+        self, tmp_path
+    ):
+        store = self._store(tmp_path)
+        target = match_page_target(1903131)
+        legacy = store.store_text(
+            target,
+            "<html>legacy-fallback</html>",
+            fetched_at="2026-07-14T07:00:00+00:00",
+        )
+        legacy_receipt = store._target_receipt_key(target, asdict(legacy))
+        store.filesystem.delete_file(store._path(legacy_receipt))
+        store._write_json(store._target_manifest_key(target), asdict(legacy))
+        missing = {
+            **asdict(legacy),
+            "content_hash": "f" * 64,
+            "blob_key": store._blob_key("f" * 64),
+            "fetched_at": "2026-07-14T08:00:00+00:00",
+        }
+        missing_receipt = store._target_receipt_key(target, missing)
+        store._write_json(missing_receipt, store._receipt_payload(missing))
+
+        assert store.load_text(target) == ("<html>legacy-fallback</html>", legacy)
+
+    def test_newest_observation_wins_across_legacy_and_v2_layouts(self, tmp_path):
+        store = self._store(tmp_path)
+        target = match_page_target(1903132)
+        older_v2 = store.store_text(
+            target,
+            "<html>older-v2</html>",
+            fetched_at="2026-07-14T07:00:00+00:00",
+        )
+        newer_legacy = store.store_text(
+            target,
+            "<html>newer-legacy</html>",
+            fetched_at="2026-07-14T08:00:00+00:00",
+        )
+        newer_receipt = store._target_receipt_key(target, asdict(newer_legacy))
+        store.filesystem.delete_file(store._path(newer_receipt))
+        store._write_json(store._target_manifest_key(target), asdict(newer_legacy))
+
+        assert store.load_text(target) == ("<html>newer-legacy</html>", newer_legacy)
+
+        newest_v2 = store.store_text(
+            target,
+            "<html>newest-v2</html>",
+            fetched_at="2026-07-14T09:00:00+00:00",
+        )
+        assert store.load_text(target) == ("<html>newest-v2</html>", newest_v2)
+        assert older_v2 != newest_v2
+
+    def test_malformed_legacy_timestamp_cannot_poison_valid_v2(self, tmp_path):
+        store = self._store(tmp_path)
+        target = match_page_target(1903134)
+        valid = store.store_text(target, "<html>valid-v2</html>")
+        store._write_json(
+            store._target_manifest_key(target),
+            {**asdict(valid), "fetched_at": "not-a-timestamp"},
+        )
+
+        assert store.load_text(target) == ("<html>valid-v2</html>", valid)
+
+    @pytest.mark.parametrize(
+        "fetched_at",
+        ["0999-01-01T00:00:00+00:00", "2026-01-01T00:00:00.1234567+00:00"],
+    )
+    def test_receipt_order_rejects_non_fixed_width_timestamps(
+        self, tmp_path, fetched_at
+    ):
+        store = self._store(tmp_path)
+
+        with pytest.raises(RawStoreError, match="fetched_at"):
+            store.store_text(
+                match_page_target(1903133),
+                "<html>x</html>",
+                fetched_at=fetched_at,
+            )
+
+    def test_quarantine_invalidates_only_the_record_that_failed(self, tmp_path):
+        store = self._store(tmp_path)
+        target = match_page_target(1903128)
+        failed = store.store_text(
+            target,
+            "<html>failed</html>",
+            fetched_at="2026-07-14T07:00:00+00:00",
+        )
+        replacement = store.store_text(
+            target,
+            "<html>healthy</html>",
+            fetched_at="2026-07-14T08:00:00+00:00",
+        )
+
+        store.quarantine(target, reason="late validation failure", record=failed)
+
+        assert store.load_text(target) == ("<html>healthy</html>", replacement)
+        assert store._exists(
+            store._target_invalidation_key(target, store._record_sha256(failed))
+        )
+        assert not store._exists(
+            store._target_invalidation_key(target, store._record_sha256(replacement))
+        )
+
+    def test_evidence_only_quarantine_cannot_invalidate_concurrent_writer(
+        self, tmp_path
+    ):
+        store = self._store(tmp_path)
+        target = match_page_target(1903129)
+        replacement = store.store_text(target, "<html>healthy</html>")
+
+        assert store.quarantine(target, reason="malformed superseded receipt")
+
+        assert store.load_text(target) == ("<html>healthy</html>", replacement)
+
+    def test_invalidated_observation_cannot_be_reported_as_repaired(self, tmp_path):
+        store = self._store(tmp_path)
+        target = match_page_target(1903135)
+        observed_at = "2026-07-14T07:00:00+00:00"
+        failed = store.store_text(
+            target,
+            "<html>failed</html>",
+            fetched_at=observed_at,
+        )
+        store.quarantine(target, reason="invalid", record=failed)
+
+        with pytest.raises(RawStoreError, match="invalidated raw observation"):
+            store.store_text(
+                target,
+                "<html>failed</html>",
+                fetched_at=observed_at,
+            )
+
+        repaired = store.store_text(target, "<html>failed</html>")
+        assert store.load_text(target)[1] == repaired
+
+    def test_store_fails_if_observation_is_invalidated_during_receipt_commit(
+        self, tmp_path, monkeypatch
+    ):
+        store = self._store(tmp_path)
+        target = match_page_target(1903136)
+        original = store._write_immutable_json
+
+        def write_with_invalidation(relative, payload):
+            original(relative, payload)
+            if relative.startswith(store._target_receipt_prefix(target)):
+                record = RawObjectRecord(**payload["record"])
+                record_sha = store._record_sha256(record)
+                original(
+                    store._target_invalidation_key(target, record_sha),
+                    {
+                        "invalidation_version": "whoscored-target-invalidation-v1",
+                        "record_sha256": record_sha,
+                        "target_id": target.target_id,
+                        "fetched_at": record.fetched_at,
+                        "content_hash": record.content_hash,
+                    },
+                )
+
+        monkeypatch.setattr(store, "_write_immutable_json", write_with_invalidation)
+
+        with pytest.raises(RawStoreError, match="invalidated while"):
+            store.store_text(target, "<html>raced</html>")
+        assert not store.has(target)
+
     @pytest.mark.parametrize("timeout", ["nan", "inf", "-inf"])
     def test_target_lock_rejects_non_finite_timeout_before_waiting(
         self, tmp_path, monkeypatch, timeout
@@ -756,6 +1160,7 @@ class TestRawStore:
         target = match_page_target(1)
         with pytest.raises(RawObjectNotFound):
             store.load_bytes(target)
+        assert store.quarantine(target, reason="missing") is None
         record = store.store_text(target, "<html>x</html>")
         store._write_bytes(record.blob_key, b"not-gzip")
         with pytest.raises(RawObjectCorrupt):
@@ -822,26 +1227,31 @@ class TestRawStore:
     def test_freshness_fails_closed_for_corrupt_manifest_metadata(self, tmp_path):
         store = self._store(tmp_path)
         target = match_page_target(3)
-        store.store_text(target, "<html>x</html>")
-        manifest_key = store._target_manifest_key(target)
-        manifest = store._read_json(manifest_key)
-        manifest["fetched_at"] = "not-a-timestamp"
-        store._write_json(manifest_key, manifest)
+        record = store.store_text(target, "<html>x</html>")
+        receipt_key = store._target_receipt_key(target, asdict(record))
+        malformed_record = {**asdict(record), "fetched_at": "not-a-timestamp"}
+        store._write_json(
+            receipt_key,
+            store._receipt_payload(malformed_record),
+        )
 
         assert not store.is_fresh(target, max_age=timedelta(hours=6))
 
-        store._write_bytes(manifest_key, b"{not-json")
+        store._write_bytes(receipt_key, b"{not-json")
         assert not store.is_fresh(target, max_age=timedelta(hours=6))
 
-        store.store_text(target, "<html>x</html>")
-        manifest = store._read_json(manifest_key)
-        manifest["blob_key"] = "../outside.raw.gz"
-        store._write_json(manifest_key, manifest)
+        repaired = store.store_text(target, "<html>x</html>")
+        repaired_key = store._target_receipt_key(target, asdict(repaired))
+        escaped_record = {**asdict(repaired), "blob_key": "../outside.raw.gz"}
+        store._write_json(
+            repaired_key,
+            store._receipt_payload(escaped_record),
+        )
         assert not store.is_fresh(target, max_age=timedelta(hours=6))
-        with pytest.raises(RawObjectNotFound):
+        with pytest.raises(RawObjectCorrupt):
             store.load_bytes(target)
         quarantine_root = tmp_path / "quarantine" / "targets" / "match"
-        assert list(quarantine_root.rglob("*.manifest"))
+        assert list(quarantine_root.rglob("*.json"))
 
     def test_corrupt_blob_is_quarantined_refetched_and_repaired(self, tmp_path):
         store = self._store(tmp_path)
@@ -860,16 +1270,18 @@ class TestRawStore:
         assert calls == [target.canonical_url]
         assert payload == b"<html>old</html>"
         assert gzip.decompress(store._read_bytes(repaired.blob_key)) == payload
-        assert list((tmp_path / "quarantine").rglob("*.manifest"))
+        assert list((tmp_path / "quarantine").rglob("*.json"))
 
     def test_malformed_manifest_is_quarantined_and_refetched(self, tmp_path):
         store = self._store(tmp_path)
         target = match_page_target(5)
-        store.store_text(target, "<html>old</html>")
-        manifest_key = store._target_manifest_key(target)
-        manifest = store._read_json(manifest_key)
-        manifest["source_ids"] = None
-        store._write_json(manifest_key, manifest)
+        record = store.store_text(target, "<html>old</html>")
+        receipt_key = store._target_receipt_key(target, asdict(record))
+        malformed_record = {**asdict(record), "source_ids": None}
+        store._write_json(
+            receipt_key,
+            store._receipt_payload(malformed_record),
+        )
         calls = []
 
         payload, repaired, cache_hit = store.get_or_fetch(
@@ -882,7 +1294,7 @@ class TestRawStore:
         assert calls == [target.canonical_url]
         assert payload == b"<html>fresh</html>"
         assert dict(repaired.source_ids) == dict(target.source_ids)
-        assert list((tmp_path / "quarantine").rglob("*.manifest"))
+        assert list((tmp_path / "quarantine").rglob("*.json"))
 
     def test_corrupt_deflate_blob_is_quarantined_refetched_and_repaired(self, tmp_path):
         store = self._store(tmp_path)
@@ -906,4 +1318,4 @@ class TestRawStore:
         assert calls == [target.canonical_url]
         assert payload == source
         assert gzip.decompress(store._read_bytes(repaired.blob_key)) == source
-        assert list((tmp_path / "quarantine").rglob("*.manifest"))
+        assert list((tmp_path / "quarantine").rglob("*.json"))

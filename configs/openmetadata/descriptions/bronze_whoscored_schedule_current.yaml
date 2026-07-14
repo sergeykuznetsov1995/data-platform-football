@@ -1,7 +1,7 @@
 table:
   fullyQualifiedName: trino_iceberg.iceberg.bronze.whoscored_schedule_current
   description: |
-    Каноническое расписание WhoScored parser v7. Представление выбирает
+    Каноническое расписание WhoScored parser v8. Представление выбирает
     последний успешный scope batch для каждой пары (league, season), поэтому
     частично записанный batch не виден downstream. Grain — один матч.
   tags:

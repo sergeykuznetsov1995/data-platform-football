@@ -4,7 +4,7 @@
 table:
   fullyQualifiedName: trino_iceberg.iceberg.bronze.whoscored_events
   description: |
-    Append-only Opta-события матчей из WhoScored, разобранные строгим parser v7
+    Append-only Opta-события матчей из WhoScored, разобранные строгим parser v8
     из matchCentreData. Ответ сначала сохраняется в content-addressed raw store;
     payload rows становятся видимы через whoscored_events_current только после
     успешного match manifest commit. Grain — одно событие (~1500-2000 на матч).
