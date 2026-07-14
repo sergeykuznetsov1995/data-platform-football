@@ -1635,6 +1635,7 @@ class FBrefPipeline:
             html,
             target_id=record.target_id,
             page_kind=record.page_kind,
+            source_ids=record.source_ids,
             content_hash=record.content_hash,
         )
         try:
