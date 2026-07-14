@@ -21,7 +21,16 @@ SCOPE_MANIFEST_TABLE = 'iceberg.ops.transfermarkt_scope_manifest_v2'
 SCOPE_SET_MANIFEST_TABLE = 'iceberg.ops.transfermarkt_scope_set_manifest_v2'
 PROXY_LEDGER_TABLE = 'iceberg.ops.transfermarkt_proxy_ledger_v2'
 SCOPE_COMPLETION_STATUS = 'complete'
-MAX_SCOPE_SET_SIZE = 512
+# One inactive slot is assembled cumulatively from many bounded paid batches:
+# the promoted registry target is ~9.7k senior-men scopes and a single crawl
+# batch buys at most eight of them.  The cap therefore bounds the manifest, not
+# the crawl, and must stay above the whole eligible target.
+MAX_SCOPE_SET_SIZE = 16_384
+# The capture contract revision of a scope manifest.  It is a code/contract
+# marker, not batch content: manifests captured under the same contract may be
+# accumulated into one scope set across parent cycles.  Bump it whenever the
+# capture payload (scope_capture, entity evidence) changes shape.
+CAPTURE_REVISION = 'v2'
 
 
 class ScopeManifestError(RuntimeError):
@@ -266,10 +275,17 @@ class ScopeManifest:
         # still valid evidence of what it did capture; it simply said nothing
         # about what it still owed.  Nothing else may enter the hash unbound.
         coverage = {'roster_coverage', 'career_fetches_pending'}
+        # A scope authorized by the standing policy carries that policy's hash
+        # inside the manifest hash, where it cannot be edited after the fact:
+        # the autonomous schedule replaced the one-shot approval packets, so
+        # the policy is the only remaining authorization trace.  One-shot runs
+        # keep their journal and simply omit the key.
+        provenance = {'standing_policy_hash'}
+        optional = coverage | provenance
         if not isinstance(value, Mapping):
             raise ScopeManifestError('scope DQ evidence has an unbound field set')
         present = set(value)
-        if not required <= present or present - required - coverage:
+        if not required <= present or present - required - optional:
             raise ScopeManifestError('scope DQ evidence has an unbound field set')
         stated = present & coverage
         if stated:
@@ -278,6 +294,12 @@ class ScopeManifest:
                     'roster coverage must state both the entities and the total'
                 )
             self._validate_roster_coverage(value)
+        if 'standing_policy_hash' in present and not re.fullmatch(
+            r'[0-9a-f]{64}', str(value['standing_policy_hash'] or ''),
+        ):
+            raise ScopeManifestError(
+                'standing policy hash is not a lowercase sha256 digest'
+            )
         if value['status'] != 'passed':
             raise ScopeManifestError('scope DQ evidence is not green')
         if not isinstance(value['edition_current'], bool):
@@ -501,7 +523,21 @@ class ScopeSetManifest:
         *,
         expected_entities: Iterable[str],
         reader_revision: int | None = None,
+        registry_snapshot_id: str | None = None,
     ) -> 'ScopeSetManifest':
+        """Freeze a set of child manifests into one content-addressed slot.
+
+        The registry snapshot is an attribute of the SLOT, not of its members.
+        A snapshot id is a hash over every page of the source registry, so any
+        byte that moves on the site mints a new one — while a slot is assembled
+        from bounded paid batches over months.  Requiring the members to share
+        one snapshot meant the accumulated evidence was thrown away at every
+        discovery run and the target could never be covered.  What binds a
+        member to the slot is what it captured (capture/parser/schema revision)
+        and the caller having already checked that the promoted registry still
+        targets that scope with the same meaning.
+        """
+
         if not manifests:
             raise ScopeManifestError('scope set cannot be empty')
         if len(manifests) > MAX_SCOPE_SET_SIZE:
@@ -513,15 +549,27 @@ class ScopeSetManifest:
             item.validate(expected_entities)
         identity = {
             (
-                item.registry_snapshot_id, item.capture_revision,
-                item.parser_revision, item.schema_revision,
+                item.capture_revision, item.parser_revision,
+                item.schema_revision,
             )
             for item in manifests
         }
         if len(identity) != 1:
             raise ScopeManifestError(
-                'scope manifests do not share registry/capture/parser/schema revisions'
+                'scope manifests do not share capture/parser/schema revisions'
             )
+        if registry_snapshot_id is None:
+            snapshots = {item.registry_snapshot_id for item in manifests}
+            if len(snapshots) != 1:
+                raise ScopeManifestError(
+                    'a scope set spanning registry snapshots must state which '
+                    'promoted snapshot it is bound to'
+                )
+            registry = next(iter(snapshots))
+        else:
+            registry = str(registry_snapshot_id).strip()
+            if not registry:
+                raise ScopeManifestError('scope-set registry snapshot is empty')
         child_revisions = tuple(int(item.reader_revision) for item in manifests)
         if any(value < 0 for value in child_revisions):
             raise ScopeManifestError('child reader revision must be non-negative')
@@ -552,7 +600,7 @@ class ScopeSetManifest:
         ))
         if len({scope for scope, _ in scope_digests}) != len(scope_digests):
             raise ScopeManifestError('scope set contains duplicate scope ids')
-        registry, capture, parser, schema = next(iter(identity))
+        capture, parser, schema = next(iter(identity))
         payload = {
             'registry_snapshot_id': registry,
             'capture_revision': capture,

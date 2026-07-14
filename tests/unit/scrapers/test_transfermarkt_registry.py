@@ -5,6 +5,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+import yaml
 
 from scrapers.transfermarkt.registry import (
     BOOTSTRAP_COMPETITIONS,
@@ -87,6 +88,10 @@ def test_single_year_is_never_unconditionally_changed_to_split_year() -> None:
 def test_only_verified_bootstrap_records_are_present_and_resolvable() -> None:
     assert {item.competition_id for item in BOOTSTRAP_COMPETITIONS} == {
         "GB1",
+        "ES1",
+        "IT1",
+        "L1",
+        "FR1",
         "CL",
         "AFCN",
         "UNLA",
@@ -98,7 +103,115 @@ def test_only_verified_bootstrap_records_are_present_and_resolvable() -> None:
     assert resolve_competition("uefa-champions-league").competition_id == "CL"
     assert resolve_competition("INT-World Cup").competition_id == "FIWC"
     with pytest.raises(UnknownCompetitionError):
-        resolve_competition("ESP-La Liga")
+        resolve_competition("NOPE-Not A League")
+
+
+# #948: the seed is the only bridge between a Transfermarkt competition_id and
+# the legacy canonical id.  Discovery stamps canonical_competition_id from
+# resolve_competition(competition_id), and the reader cutover gate demands that
+# every legacy (league, season) pair exists in the v2 slot — so a Top-5 league
+# whose canonical id is absent (or differs by one character) from
+# configs/medallion/competitions.yaml can never satisfy the gate.
+TOP5_TM_IDS = ("GB1", "ES1", "IT1", "L1", "FR1")
+
+LEGACY_COMPETITIONS = (
+    Path(__file__).parents[3] / "configs" / "medallion" / "competitions.yaml"
+)
+
+
+@pytest.fixture(scope="module")
+def legacy_competition_ids() -> set[str]:
+    doc = yaml.safe_load(LEGACY_COMPETITIONS.read_text(encoding="utf-8"))
+    return {item["id"] for item in doc["competitions"]}
+
+
+def test_top5_canonical_ids_match_the_legacy_medallion_contour(
+    legacy_competition_ids: set[str],
+) -> None:
+    """Canonical ids must match competitions.yaml character for character.
+
+    Read from the YAML on purpose: a literal copy here would let the two sides
+    drift apart silently, which is exactly the failure the cutover gate cannot
+    survive.
+    """
+
+    canonical_by_tm_id = {
+        record.competition_id: record.canonical_competition_id
+        for record in BOOTSTRAP_COMPETITIONS
+    }
+    seeded_top5 = {tm_id: canonical_by_tm_id[tm_id] for tm_id in TOP5_TM_IDS}
+
+    assert all(seeded_top5.values()), f"Top-5 canonical id is unset: {seeded_top5}"
+    unknown = set(seeded_top5.values()) - legacy_competition_ids
+    assert not unknown, f"canonical ids absent from competitions.yaml: {sorted(unknown)}"
+
+    # And the seed covers every Top-5 league the legacy contour knows about.
+    top5_legacy = {
+        "ENG-Premier League",
+        "ESP-La Liga",
+        "ITA-Serie A",
+        "GER-Bundesliga",
+        "FRA-Ligue 1",
+    }
+    assert top5_legacy <= legacy_competition_ids  # guard: yaml still spells them so
+    assert set(seeded_top5.values()) == top5_legacy
+
+
+@pytest.mark.parametrize(
+    ("tm_id", "canonical", "slug", "alias"),
+    [
+        ("ES1", "ESP-La Liga", "laliga", "Spanish La Liga"),
+        ("IT1", "ITA-Serie A", "serie-a", "Italian Serie A"),
+        ("L1", "GER-Bundesliga", "bundesliga", "German Bundesliga"),
+        ("FR1", "FRA-Ligue 1", "ligue-1", "French Ligue 1"),
+    ],
+)
+def test_top5_resolves_from_source_and_canonical_identities(
+    tm_id: str, canonical: str, slug: str, alias: str
+) -> None:
+    resolved = {
+        identity: resolve_competition(identity)
+        for identity in (tm_id, f"TM-{tm_id}", canonical, slug, alias)
+    }
+    assert {record.competition_id for record in resolved.values()} == {tm_id}
+    assert {record.canonical_competition_id for record in resolved.values()} == {
+        canonical
+    }
+
+
+def test_bootstrap_identities_are_unambiguous() -> None:
+    """No seeded identity may resolve to two records (UnknownCompetitionError:
+    ambiguous) — adding the Top-5 must not collide with the existing records."""
+
+    for record in BOOTSTRAP_COMPETITIONS:
+        identities = (
+            record.competition_id,
+            f"TM-{record.competition_id}",
+            record.slug,
+            record.name,
+            record.canonical_competition_id,
+            *record.aliases,
+        )
+        for identity in filter(None, identities):
+            assert (
+                resolve_competition(identity).competition_id == record.competition_id
+            ), f"{identity!r} did not resolve back to {record.competition_id}"
+
+
+def test_top5_season_format_is_split_year() -> None:
+    """Pin protecting the Silver market-value transform.
+
+    ``dags/sql/silver/transfermarkt_market_value_history.sql`` selects the
+    season formula from the published registry: ``single_year`` -> calendar
+    year, anything else -> the split-year slug.  Top-5 leagues are split-year
+    at the source; flipping this seed would silently restate their seasons.
+    """
+
+    for tm_id in TOP5_TM_IDS:
+        record = resolve_competition(tm_id)
+        assert record.season_format is SeasonFormat.SPLIT_YEAR, tm_id
+        assert record.competition_type is CompetitionType.DOMESTIC_LEAGUE, tm_id
+        assert record.team_type is TeamType.CLUB, tm_id
 
 
 def test_runtime_resolver_uses_discovered_records_instead_of_bootstrap(

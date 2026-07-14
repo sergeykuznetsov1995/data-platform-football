@@ -722,7 +722,11 @@ class TestRegistryRead:
 def _write_manifest_and_ledger(module, tmp_path: Path, *, bad_digest=False):
     from utils import transfermarkt_native_v2 as tm_v2
     from utils import transfermarkt_dq_contracts as tm_dq
-    from utils.transfermarkt_scope_state import EntityEvidence, ScopeManifest
+    from utils.transfermarkt_scope_state import (
+        CAPTURE_REVISION,
+        EntityEvidence,
+        ScopeManifest,
+    )
 
     payload = _payload(tmp_path)
     entities = tuple(
@@ -754,7 +758,7 @@ def _write_manifest_and_ledger(module, tmp_path: Path, *, bad_digest=False):
         canonical_competition_id=payload['canonical_competition_id'],
         canonical_season=payload['canonical_season'],
         registry_snapshot_id=payload['registry_snapshot_id'],
-        capture_revision='capture-v1',
+        capture_revision=CAPTURE_REVISION,
         parser_revision='parser-v1',
         schema_revision='1',
         reader_revision=7,
@@ -823,6 +827,84 @@ def _write_manifest_and_ledger(module, tmp_path: Path, *, bad_digest=False):
     return payload, manifest, provider_bytes
 
 
+def _target(
+    scope_id: str,
+    *,
+    competition_id: str,
+    edition_id: str = '2025',
+    current: bool = False,
+    canonical_competition_id: str | None = None,
+    canonical_season: str = '2526',
+) -> dict:
+    """One promoted-registry target row as `eligible_registry_scopes` states it."""
+
+    return {
+        'scope_id': scope_id,
+        'competition_id': competition_id,
+        'edition_id': edition_id,
+        'current': current,
+        'canonical_competition_id': (
+            canonical_competition_id or f'TM-{competition_id}'
+        ),
+        'canonical_season': canonical_season,
+        'competition_type': 'domestic_league',
+        'team_type': 'club',
+        'gender': 'men',
+        'age_category': 'senior',
+    }
+
+
+def _persisted_row(
+    manifest,
+    *,
+    scope_id: str,
+    competition_id: str,
+    child_cycle_id: str,
+    is_fresh: bool = True,
+    reader_revision: int = 6,
+    registry_snapshot_id: str | None = None,
+) -> dict:
+    """Shape one earlier batch's committed ops row for the cumulative slot."""
+
+    from utils.transfermarkt_scope_state import ScopeManifest
+
+    value = manifest.as_dict()
+    value.update({
+        'parent_cycle_id': f'scheduled__{child_cycle_id}',
+        'child_cycle_id': child_cycle_id,
+        'scope_id': scope_id,
+        'competition_id': competition_id,
+        'canonical_competition_id': f'TM-{competition_id}',
+        'reader_revision': reader_revision,
+        'registry_snapshot_id': (
+            registry_snapshot_id or manifest.registry_snapshot_id
+        ),
+    })
+    capture = value['dq_evidence']['scope_capture']
+    capture['scope_id'] = scope_id
+    capture['competition_id'] = competition_id
+    persisted = ScopeManifest.from_mapping(value)
+    row = {
+        key: getattr(persisted, key)
+        for key in (
+            'parent_cycle_id', 'child_cycle_id', 'scope_id',
+            'competition_id', 'edition_id', 'canonical_competition_id',
+            'canonical_season', 'registry_snapshot_id', 'capture_revision',
+            'parser_revision', 'schema_revision', 'reader_revision',
+        )
+    }
+    row.update({
+        'entity_manifest_json': json.dumps({
+            'entities': [item.as_dict() for item in persisted.entities],
+            'dq_evidence': persisted.dq_evidence,
+        }),
+        'manifest_digest': persisted.digest,
+        'status': 'complete',
+        'is_fresh': is_fresh,
+    })
+    return row
+
+
 class TestScopeSetGate:
     def test_scope_set_result_exposes_second_phase_transform_conf(
         self, dag_module, monkeypatch,
@@ -843,6 +925,7 @@ class TestScopeSetGate:
             'traffic': {'provider_metered_bytes': 1},
             'candidate_slot': 'b',
             'reader_revision': 7,
+            'registry_snapshot_id': 'registry-1',
             'continuation_required': False,
             'remaining_count': 0,
             'coverage_complete': True,
@@ -858,7 +941,14 @@ class TestScopeSetGate:
         monkeypatch.setattr(
             planner,
             'eligible_registry_scopes',
-            lambda rows: [SimpleNamespace(scope_id='GB1__2025')],
+            lambda rows: [
+                planner.RegistryScopeTarget(
+                    scope_id='GB1__2025',
+                    competition_id='GB1',
+                    edition_id='2025',
+                    current=True,
+                ),
+            ],
         )
         state = tm_v2.ReaderState(
             exists=True, active_version='v2', active_slot='a', revision=7,
@@ -909,43 +999,18 @@ class TestScopeSetGate:
     def test_bounded_batches_accumulate_into_registry_complete_slot(
         self, dag_module, tmp_path,
     ):
-        from utils.transfermarkt_scope_state import ScopeManifest
-
         payload, current, _ = _write_manifest_and_ledger(dag_module, tmp_path)
-        value = current.as_dict()
-        value.update({
-            'parent_cycle_id': 'scheduled__previous-batch',
-            'child_cycle_id': 'tm-child-previous',
-            'scope_id': 'CL__2025',
-            'competition_id': 'CL',
-            'canonical_competition_id': 'TM-CL',
-            'reader_revision': 6,
-        })
-        capture = value['dq_evidence']['scope_capture']
-        capture['scope_id'] = 'CL__2025'
-        capture['competition_id'] = 'CL'
-        previous = ScopeManifest.from_mapping(value)
-        row = {
-            key: getattr(previous, key)
-            for key in (
-                'parent_cycle_id', 'child_cycle_id', 'scope_id',
-                'competition_id', 'edition_id', 'canonical_competition_id',
-                'canonical_season', 'registry_snapshot_id', 'capture_revision',
-                'parser_revision', 'schema_revision', 'reader_revision',
-            )
-        }
-        row.update({
-            'entity_manifest_json': json.dumps({
-                'entities': [item.as_dict() for item in previous.entities],
-                'dq_evidence': previous.dq_evidence,
-            }),
-            'manifest_digest': previous.digest,
-            'status': 'complete',
-        })
+        row = _persisted_row(
+            current, scope_id='CL__2025', competition_id='CL',
+            child_cycle_id='tm-child-previous',
+        )
         result = dag_module._build_scope_set(
             [{'TM_SCOPE_PAYLOAD_JSON': json.dumps(payload)}],
             {'revision': 7, 'candidate_slot': 'b'},
-            target_scope_ids=['GB1__2025', 'CL__2025'],
+            target_scopes=[
+                _target('GB1__2025', competition_id='GB1'),
+                _target('CL__2025', competition_id='CL'),
+            ],
             persisted_manifest_rows=[row],
         )
         assert result['coverage_complete'] is True
@@ -953,19 +1018,167 @@ class TestScopeSetGate:
         assert result['missing_scope_ids'] == []
         assert len(result['scope_set_manifest']['scope_digests']) == 2
 
-    def test_partial_registry_coverage_cannot_produce_transform_scope_set(
+    def test_a_registry_rotation_does_not_wipe_the_accumulated_slot(
         self, dag_module, tmp_path,
     ):
+        # A snapshot id hashes every page of the source registry, so any byte
+        # that moves on the site mints a new one and discovery runs monthly.
+        # While slot membership required one shared snapshot, every rotation
+        # threw away everything earlier batches had bought — the target could
+        # never be reached.  What a manifest captured does not change when the
+        # registry is re-read.
+        payload, current, _ = _write_manifest_and_ledger(dag_module, tmp_path)
+        older_snapshot = _persisted_row(
+            current, scope_id='CL__2025', competition_id='CL',
+            child_cycle_id='tm-child-previous',
+            registry_snapshot_id='tm-discovery-two-rotations-ago',
+        )
+        result = dag_module._build_scope_set(
+            [{'TM_SCOPE_PAYLOAD_JSON': json.dumps(payload)}],
+            {'revision': 7, 'candidate_slot': 'b'},
+            target_scopes=[
+                _target('GB1__2025', competition_id='GB1'),
+                _target('CL__2025', competition_id='CL'),
+            ],
+            persisted_manifest_rows=[older_snapshot],
+        )
+        assert result['scope_count'] == 2
+        assert result['coverage_complete'] is True
+        # The slot is frozen against the snapshot THIS paid batch ran under.
+        assert result['registry_snapshot_id'] == payload['registry_snapshot_id']
+        assert result['registry_drift_scope_count'] == 0
+
+    def test_a_batch_may_not_drift_from_the_capture_canon(
+        self, dag_module, tmp_path,
+    ):
+        # A capture revision that is not the canon is exactly what orphaned the
+        # two production manifests: they were written under a per-batch
+        # selection hash and can never join a slot again.  Fail the cycle
+        # instead of silently minting evidence no slot will ever accept.
+        import dataclasses
+
+        payload, manifest, _ = _write_manifest_and_ledger(dag_module, tmp_path)
+        drifted = dataclasses.replace(manifest, capture_revision='selection-hash')
+        value = drifted.as_dict() | {'manifest_digest': drifted.digest}
+        Path(payload['result_paths']['scope_manifest']).write_text(
+            json.dumps(value), encoding='utf-8',
+        )
+
+        with pytest.raises(Exception, match='capture revision'):
+            dag_module._build_scope_set(
+                [{'TM_SCOPE_PAYLOAD_JSON': json.dumps(payload)}],
+                {'revision': 7, 'candidate_slot': 'b'},
+            )
+
+    def test_a_scope_the_registry_retired_is_dropped_but_named(
+        self, dag_module, tmp_path,
+    ):
+        # A competition the registry no longer targets legitimately leaves the
+        # slot — but a coverage change is never silent.
+        payload, current, _ = _write_manifest_and_ledger(dag_module, tmp_path)
+        retired = _persisted_row(
+            current, scope_id='OLD__2019', competition_id='OLD',
+            child_cycle_id='tm-child-retired',
+        )
+        result = dag_module._build_scope_set(
+            [{'TM_SCOPE_PAYLOAD_JSON': json.dumps(payload)}],
+            {'revision': 7, 'candidate_slot': 'b'},
+            target_scopes=[_target('GB1__2025', competition_id='GB1')],
+            persisted_manifest_rows=[retired],
+        )
+        assert result['retired_scope_ids'] == ['OLD__2019']
+        assert result['registry_drift_scope_count'] == 0
+        assert result['scope_count'] == 1
+
+    def test_a_scope_the_registry_now_means_differently_must_be_recrawled(
+        self, dag_module, tmp_path,
+    ):
+        # Snapshot identity is not evidence, but MEANING is: if the promoted
+        # registry now publishes the scope under another canonical id or another
+        # classification, what was captured no longer describes what is served.
+        payload, current, _ = _write_manifest_and_ledger(dag_module, tmp_path)
+        renamed = _persisted_row(
+            current, scope_id='CL__2025', competition_id='CL',
+            child_cycle_id='tm-child-previous',
+        )
+        result = dag_module._build_scope_set(
+            [{'TM_SCOPE_PAYLOAD_JSON': json.dumps(payload)}],
+            {'revision': 7, 'candidate_slot': 'b'},
+            target_scopes=[
+                _target('GB1__2025', competition_id='GB1'),
+                _target(
+                    'CL__2025', competition_id='CL',
+                    canonical_competition_id='UEFA-Champions League',
+                ),
+            ],
+            persisted_manifest_rows=[renamed],
+        )
+        assert result['scope_count'] == 1
+        assert result['registry_drift_scope_ids'] == ['CL__2025']
+        assert result['missing_scope_ids'] == ['CL__2025']
+
+    def test_partial_registry_coverage_still_builds_and_reports_the_slot(
+        self, dag_module, tmp_path,
+    ):
+        # The ~9.7k-scope target is bought eight scopes per bounded daily batch.
+        # Refusing to build a slot short of the complete target meant no Silver
+        # or Gold for months, so partial coverage is now reported, not refused;
+        # what it blocks is the reader cutover (readiness), not the build.
         payload, _, _ = _write_manifest_and_ledger(dag_module, tmp_path)
         result = dag_module._build_scope_set(
             [{'TM_SCOPE_PAYLOAD_JSON': json.dumps(payload)}],
             {'revision': 7, 'candidate_slot': 'b'},
-            target_scope_ids=['GB1__2025', 'CL__2025'],
+            target_scopes=[
+                _target('GB1__2025', competition_id='GB1'),
+                _target('CL__2025', competition_id='CL'),
+            ],
         )
         assert result['coverage_complete'] is False
-        assert result['scope_set_id'] is None
-        assert result['scope_set_manifest'] is None
+        assert len(result['scope_set_id']) == 64
+        assert result['scope_set_manifest']['scope_digests'] == [
+            [payload['scope_id'], result['scope_set_manifest'][
+                'scope_digests'
+            ][0][1]],
+        ]
+        assert result['scope_count'] == 1
+        assert result['coverage_target_count'] == 2
+        assert result['coverage_ratio'] == 0.5
+        assert result['missing_scope_count'] == 1
         assert result['missing_scope_ids'] == ['CL__2025']
+        assert result['continuation_required'] is True
+
+    def test_a_stale_current_edition_stays_in_the_slot_and_is_reported(
+        self, dag_module, tmp_path,
+    ):
+        # A stale current edition is a quality problem, not a membership one.
+        # Dropping it would let the slot shrink, and a slot that shrinks can
+        # never pass the cutover monotonicity gate again — so it is kept, named,
+        # and blocks the reader flip in readiness instead.
+        payload, current, _ = _write_manifest_and_ledger(dag_module, tmp_path)
+        old_history = _persisted_row(
+            current, scope_id='CL__2025', competition_id='CL',
+            child_cycle_id='tm-child-history', is_fresh=False,
+        )
+        stale_current = _persisted_row(
+            current, scope_id='ES1__2025', competition_id='ES1',
+            child_cycle_id='tm-child-stale', is_fresh=False,
+        )
+        result = dag_module._build_scope_set(
+            [{'TM_SCOPE_PAYLOAD_JSON': json.dumps(payload)}],
+            {'revision': 7, 'candidate_slot': 'b'},
+            target_scopes=[
+                _target('GB1__2025', competition_id='GB1', current=True),
+                _target('CL__2025', competition_id='CL'),
+                _target('ES1__2025', competition_id='ES1', current=True),
+            ],
+            persisted_manifest_rows=[old_history, stale_current],
+        )
+        assert result['scope_count'] == 3
+        assert result['stale_current_scope_ids'] == ['ES1__2025']
+        assert result['missing_scope_ids'] == []
+        assert sorted(
+            item[0] for item in result['scope_set_manifest']['scope_digests']
+        ) == ['CL__2025', 'ES1__2025', 'GB1__2025']
 
     def test_manifest_digest_drift_blocks_silver(self, dag_module, tmp_path):
         payload, _, _ = _write_manifest_and_ledger(

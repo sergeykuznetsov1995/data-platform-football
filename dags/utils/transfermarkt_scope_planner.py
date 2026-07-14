@@ -24,12 +24,18 @@ from scrapers.transfermarkt.registry import (
     canonical_season,
     deterministic_scope_id,
 )
-from utils.transfermarkt_scope_state import SCOPE_COMPLETION_STATUS
+from utils.transfermarkt_scope_state import (
+    CAPTURE_REVISION,
+    SCOPE_COMPLETION_STATUS,
+)
 
 
 RESULT_ROOT = '/opt/airflow/logs/transfermarkt-native-v2'
 MAX_BATCH_SIZE = 8
 CURRENT_SCOPE_INTERVAL = timedelta(days=6)
+# Half of every batch pays down career debt, half buys new coverage.  See
+# ``_quota_order``: neither obligation may starve the other.
+CAREER_DEBT_BATCH_SHARE = 0.5
 
 REGISTRY_STATE_TABLE = 'iceberg.ops.transfermarkt_registry_state_v2'
 SCOPE_MANIFEST_TABLE = 'iceberg.ops.transfermarkt_scope_manifest_v2'
@@ -85,12 +91,25 @@ class ScopePlan:
 
 @dataclass(frozen=True)
 class RegistryScopeTarget:
-    """One exact eligible registry scope required in a complete model slot."""
+    """One exact eligible registry scope required in a complete model slot.
+
+    The target also carries the meaning the registry currently assigns to the
+    scope.  A slot is assembled from manifests captured over months, across many
+    registry snapshots, and a manifest stays valid evidence only while the
+    registry still says the same thing about what it captured — same canonical
+    identity, same classification.  Anything else must be crawled again.
+    """
 
     scope_id: str
     competition_id: str
     edition_id: str
     current: bool
+    canonical_competition_id: str = ''
+    canonical_season: str = ''
+    competition_type: str = ''
+    team_type: str = ''
+    gender: str = ''
+    age_category: str = ''
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -98,6 +117,12 @@ class RegistryScopeTarget:
             'competition_id': self.competition_id,
             'edition_id': self.edition_id,
             'current': self.current,
+            'canonical_competition_id': self.canonical_competition_id,
+            'canonical_season': self.canonical_season,
+            'competition_type': self.competition_type,
+            'team_type': self.team_type,
+            'gender': self.gender,
+            'age_category': self.age_category,
         }
 
 
@@ -424,6 +449,7 @@ def _select_candidates(
     last_success: Mapping[tuple[str, str], datetime | None],
     now: datetime,
     career_pending: Mapping[tuple[str, str], int] | None = None,
+    batch_size: int = MAX_BATCH_SIZE,
 ) -> list[_Candidate]:
     scopes = _normalise_sequence(params.get('scopes'), name='scopes')
     leagues = _normalise_sequence(params.get('leagues'), name='leagues')
@@ -505,12 +531,7 @@ def _select_candidates(
             )
             if _is_due(candidate, now):
                 selected.append(candidate)
-        selected.sort(key=lambda item: (
-            item.last_success_at is not None,
-            item.last_success_at or datetime.min.replace(tzinfo=timezone.utc),
-            item.competition.competition_id,
-            item.edition.edition_id,
-        ))
+        selected = _quota_order(selected, batch_size=batch_size)
 
     deduplicated: list[_Candidate] = []
     seen: set[tuple[str, str]] = set()
@@ -520,6 +541,71 @@ def _select_candidates(
         seen.add(item.key)
         deduplicated.append(item)
     return deduplicated
+
+
+def _quota_order(
+    candidates: Sequence[_Candidate], *, batch_size: int,
+) -> list[_Candidate]:
+    """Share every batch between paying old debt and buying new coverage.
+
+    The two obligations pull against each other and BOTH have to be reachable:
+
+    * the cutover career-debt gate measures the debt of the WHOLE slot, so debt
+      has to be paid down — a scope that owes careers is half-captured;
+    * coverage has to grow, or the legacy floor (and the target) is never met.
+
+    Neither may be a strict priority.  Debt-first starves coverage: a current
+    edition re-earns debt every time it is refreshed, so the debt queue never
+    empties and no new competition is ever bought.  Coverage-first starves debt:
+    ~9.7k never-captured scopes would all have to be crawled before the first
+    owed career is fetched.  So the batch is split by QUOTA — half its slots for
+    debt, half for new coverage — and whichever side runs out donates its slots
+    to the other.  Both goals then advance every single cycle.
+    """
+
+    debt = sorted(
+        (item for item in candidates if item.career_fetches_pending > 0),
+        key=lambda item: (
+            -item.career_fetches_pending,
+            item.last_success_at or datetime.min.replace(tzinfo=timezone.utc),
+            item.competition.competition_id,
+            item.edition.edition_id,
+        ),
+    )
+    growth = sorted(
+        (item for item in candidates if item.career_fetches_pending == 0),
+        key=lambda item: (
+            item.last_success_at is not None,
+            item.last_success_at or datetime.min.replace(tzinfo=timezone.utc),
+            item.competition.competition_id,
+            item.edition.edition_id,
+        ),
+    )
+    # The quota is INTERLEAVED, not blocked.  A batch of eight is planned, but
+    # the parent byte cap only pays for about three scopes a day, so a block of
+    # debt slots at the head of the batch would consume the whole day's budget
+    # and coverage would never move — the same starvation, one level down.
+    # Alternating the two duties makes both advance inside every real day's
+    # spend, whatever the budget stops at.
+    ordered: list[_Candidate] = []
+    debt_index = growth_index = 0
+    credit = CAREER_DEBT_BATCH_SHARE
+    while debt_index < len(debt) or growth_index < len(growth):
+        credit += CAREER_DEBT_BATCH_SHARE
+        wants_debt = credit >= 1.0
+        if wants_debt:
+            credit -= 1.0
+        if wants_debt and debt_index < len(debt):
+            ordered.append(debt[debt_index])
+            debt_index += 1
+        elif growth_index < len(growth):
+            ordered.append(growth[growth_index])
+            growth_index += 1
+        elif debt_index < len(debt):
+            # One queue is empty: the other takes the whole batch.
+            ordered.append(debt[debt_index])
+            debt_index += 1
+    return ordered
 
 
 def eligible_registry_scopes(
@@ -557,6 +643,15 @@ def eligible_registry_scopes(
             competition_id=key[0],
             edition_id=key[1],
             current=bool(edition.current),
+            canonical_competition_id=(
+                competitions[key[0]].canonical_competition_id
+                or f'TM-{key[0]}'
+            ),
+            canonical_season=str(edition.canonical_season),
+            competition_type=competitions[key[0]].competition_type.value,
+            team_type=competitions[key[0]].team_type.value,
+            gender=competitions[key[0]].gender.value,
+            age_category=competitions[key[0]].age_category.value,
         )
         for key, edition in sorted(editions.items())
         if competitions[key[0]].crawl_eligible and edition.active
@@ -636,6 +731,7 @@ def plan_transfermarkt_scopes(
         last_success=last_success,
         career_pending=career_pending,
         now=current_time,
+        batch_size=batch_size,
     )
     selection_identity = [
         {
@@ -704,6 +800,16 @@ def plan_transfermarkt_scopes(
             'season_format': competition.season_format.value,
             'source_url': edition.source_url,
             'registry_snapshot_id': snapshot_id,
+            # The capture contract this scope is crawled under.  It has to be a
+            # code revision, not batch content: the child wrapper writes it into
+            # the manifest as ``capture_revision``, and a scope set may only be
+            # assembled from manifests that share it.  Without an explicit value
+            # the wrapper fell back to ``selection_hash`` — which is a digest of
+            # this batch's candidate list — so every bounded batch produced its
+            # own capture identity and no two batches could ever accumulate into
+            # one slot.  The selection hash stays in the payload as crawl-plan
+            # provenance; it is no longer an identity.
+            'capture_revision': CAPTURE_REVISION,
             'selection_hash': selection_hash,
             'continuation_required': continuation_required,
             'remaining_count': remaining_count,

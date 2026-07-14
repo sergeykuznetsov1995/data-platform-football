@@ -4,7 +4,9 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import re
 import sys
+from collections.abc import Mapping
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -417,6 +419,11 @@ def _scope_manifest_fixture(
     retries=1,
     provider_bytes=120,
     reader_revision=4,
+    edition_current=True,
+    canonical_competition_id='ENG-Premier League',
+    canonical_season='2526',
+    roster_coverage=None,
+    state_career_debt=True,
 ):
     from dags.utils import transfermarkt_dq_contracts as dq
     from dags.utils import transfermarkt_scope_state as scope_state
@@ -461,10 +468,11 @@ def _scope_manifest_fixture(
         'endpoint_status_by_team': {'1': 'ok', '2': 'ok'},
         'fetched_at': '2026-07-11T00:00:00+00:00',
     }
+    coverage = {} if roster_coverage is None else dict(roster_coverage)
     dq_evidence = {
         'status': 'passed',
         'registry_participant_count': 2,
-        'edition_current': True,
+        'edition_current': edition_current,
         'scope_capture': capture,
         'entity_statuses': {
             item.entity: item.applicability_status for item in entities
@@ -475,8 +483,6 @@ def _scope_manifest_fixture(
             team_type='club',
         ),
         'authoritative_empty_evidence': {},
-        'roster_coverage': {},
-        'career_fetches_pending': 0,
         'participant_contract': {
             'passed': True,
             'competition_type': competition_type,
@@ -489,14 +495,19 @@ def _scope_manifest_fixture(
             'fresh': True,
         },
     }
+    if state_career_debt:
+        dq_evidence['roster_coverage'] = coverage
+        dq_evidence['career_fetches_pending'] = sum(
+            int(item['pending']) for item in coverage.values()
+        )
     return scope_state.ScopeManifest(
         parent_cycle_id=parent_cycle_id,
         child_cycle_id=child_cycle_id,
         scope_id=scope_id,
         competition_id=competition_id,
         edition_id=edition_id,
-        canonical_competition_id='ENG-Premier League',
-        canonical_season='2526',
+        canonical_competition_id=canonical_competition_id,
+        canonical_season=canonical_season,
         registry_snapshot_id='registry-1',
         capture_revision='capture-1',
         parser_revision='parser-1',
@@ -515,11 +526,19 @@ class _ScopeEvidenceCursor:
         *,
         traffic_extra=None,
         reader_revision=None,
+        stale_scope_ids=(),
+        superseded_parents=(),
     ):
         from dags.utils import transfermarkt_scope_state as scope_state
 
         self.control = control
         self.manifests = tuple(manifests)
+        # scope_id -> committed age in days; anything listed is also not fresh.
+        stale_ages = (
+            dict(stale_scope_ids)
+            if isinstance(stale_scope_ids, Mapping)
+            else {scope_id: 999 for scope_id in stale_scope_ids}
+        )
         self.scope_set = scope_state.ScopeSetManifest.build(
             self.manifests,
             expected_entities=control.NATIVE_ENTITIES,
@@ -556,10 +575,16 @@ class _ScopeEvidenceCursor:
                 'dq_evidence': item.dq_evidence,
             }),
             item.digest,
-            scope_state.SCOPE_COMPLETION_STATUS, '2026-07-11', True,
+            scope_state.SCOPE_COMPLETION_STATUS, '2026-07-11',
+            item.scope_id not in stale_ages,
+            int(stale_ages.get(item.scope_id, 0)),
         ) for item in self.manifests]
+        self.superseded_parents = tuple(superseded_parents)
         self.ledger_rows = []
-        for parent in sorted({item.parent_cycle_id for item in self.manifests}):
+        for parent in sorted(
+            {item.parent_cycle_id for item in self.manifests}
+            | set(self.superseded_parents)
+        ):
             parent_manifests = tuple(
                 item for item in self.manifests
                 if item.parent_cycle_id == parent
@@ -590,10 +615,25 @@ class _ScopeEvidenceCursor:
         self.sql.append(sql)
         if f'FROM {scope_state.SCOPE_SET_MANIFEST_TABLE}' in sql:
             self.rows = self.set_rows
+        elif 'SELECT DISTINCT parent_cycle_id' in sql:
+            # Every parent cycle that ever crawled one of the slot's scopes,
+            # including cycles whose manifests were later superseded.
+            self.rows = [
+                (parent,) for parent in sorted({
+                    item.parent_cycle_id for item in self.manifests
+                    if f"'{item.scope_id}'" in sql
+                } | set(self.superseded_parents))
+            ]
         elif f'FROM {scope_state.SCOPE_MANIFEST_TABLE}' in sql:
-            self.rows = self.scope_rows
+            # Honour the IN-list: readiness chunks it, and a cursor that
+            # answered every chunk with every row would hide the chunking.
+            self.rows = [
+                row for row in self.scope_rows if f"'{row[13]}'" in sql
+            ]
         elif f'FROM {scope_state.PROXY_LEDGER_TABLE}' in sql:
-            self.rows = self.ledger_rows
+            self.rows = [
+                row for row in self.ledger_rows if f"'{row[0]}'" in sql
+            ]
         else:
             raise AssertionError(sql)
 
@@ -832,6 +872,657 @@ def test_incoherent_ledger_caps_are_budget_drift(hard, soft):
         _readiness(control, cursor)
 
 
+def _roster(*, size, pending):
+    return {
+        'market_value_history': {
+            'roster_size': size, 'selected': size - pending, 'pending': pending,
+        },
+    }
+
+
+class _FreshnessCursor:
+    """Answers only the promoted registry's current-edition count."""
+
+    def __init__(self, *, registry_currents=0):
+        self.registry_currents = registry_currents
+        self.sql = []
+
+    def execute(self, sql):
+        self.sql.append(sql)
+
+    def fetchall(self):
+        return [(self.registry_currents,)]
+
+
+def test_a_superseded_scope_leaves_its_bytes_in_the_parent_ledger():
+    # The cumulative slot keeps the LATEST manifest per scope.  When a later
+    # cycle re-crawls a scope, the older cycle's manifest leaves the slot, but
+    # the bytes it spent stay in that cycle's ledger row.  Exact equality
+    # between the slot's subset and the ledger can therefore no longer hold;
+    # containment must, and the cycle's own full spend is what gets charged
+    # against its cap.
+    mod = _load()
+    control = mod.control
+    manifest = _scope_manifest_fixture(control, provider_bytes=120)
+    cursor = _ScopeEvidenceCursor(control, [manifest])
+    superseded_bytes = 4096
+    cursor.ledger_rows = [
+        (
+            row[0], row[1], row[2], row[3],
+            row[4] + (superseded_bytes if row[1] == 'squad_memberships' else 0),
+            *row[5:],
+        )
+        for row in cursor.ledger_rows
+    ]
+
+    report, _ = _readiness(control, cursor)
+
+    assert report['passed'] is True
+    parent = report['parent_cycles']['parent-1']
+    assert parent['traffic']['provider_metered_bytes'] == 120
+    assert parent['ledger_traffic']['provider_metered_bytes'] == (
+        120 + superseded_bytes
+    )
+    assert parent['proxy_ledger_exact'] is False
+    assert parent['proxy_ledger_contains_scope_set'] is True
+    assert report['proxy_ledger_exact'] is False
+
+
+def test_a_scope_set_may_never_claim_traffic_the_ledger_never_recorded():
+    mod = _load()
+    control = mod.control
+    manifest = _scope_manifest_fixture(control, provider_bytes=120)
+    cursor = _ScopeEvidenceCursor(control, [manifest])
+    cursor.ledger_rows = [
+        (row[0], row[1], row[2], row[3], max(row[4] - 1, 0), *row[5:])
+        for row in cursor.ledger_rows
+    ]
+
+    with pytest.raises(control.ReadinessError, match='never recorded'):
+        _readiness(control, cursor)
+
+
+def test_a_fully_superseded_cycle_still_has_its_budget_audited():
+    # Every scope of parent-0 was re-crawled later, so none of its manifests are
+    # in the slot.  Its overspend must not vanish with them: the ledger of every
+    # cycle that ever crawled a scope of this slot is audited.
+    mod = _load()
+    control = mod.control
+    manifest = _scope_manifest_fixture(control, parent_cycle_id='parent-1')
+    cursor = _ScopeEvidenceCursor(
+        control, [manifest], superseded_parents=['parent-0'],
+    )
+    assert 'parent-0' in {row[0] for row in cursor.ledger_rows}
+
+    report, _ = _readiness(control, cursor)
+    assert report['audited_parent_cycle_ids'] == ['parent-0', 'parent-1']
+    assert report['parent_cycles']['parent-0']['in_scope_set'] is False
+
+    cursor = _ScopeEvidenceCursor(
+        control, [manifest], superseded_parents=['parent-0'],
+    )
+    cursor.ledger_rows = [
+        (
+            row[0], row[1], row[2], row[3],
+            row[4] + (
+                control.SCOPE_SET_HARD_BYTE_CAP + 1
+                if row[0] == 'parent-0' and row[1] == 'squad_memberships'
+                else 0
+            ),
+            *row[5:],
+        )
+        for row in cursor.ledger_rows
+    ]
+
+    with pytest.raises(control.ReadinessError, match='parent-0.*hard byte cap'):
+        _readiness(control, cursor)
+
+
+def test_the_full_cycle_spend_not_the_slot_subset_is_charged_to_the_cap():
+    # The slot's own share stays under the cap, but the cycle spent more than
+    # its cap in total (on a scope that a later cycle superseded).  The budget
+    # evidence must not be laundered by the slot shrinking.
+    mod = _load()
+    control = mod.control
+    manifest = _scope_manifest_fixture(control, provider_bytes=1024)
+    cursor = _ScopeEvidenceCursor(control, [manifest])
+    cursor.ledger_rows = [
+        (
+            row[0], row[1], row[2], row[3],
+            row[4] + (
+                control.SCOPE_SET_HARD_BYTE_CAP
+                if row[1] == 'squad_memberships' else 0
+            ),
+            *row[5:],
+        )
+        for row in cursor.ledger_rows
+    ]
+
+    with pytest.raises(control.ReadinessError, match='hard byte cap'):
+        _readiness(control, cursor)
+
+
+def test_a_settled_edition_keeps_its_evidence_forever():
+    # A historical edition never changes again.  A cumulative slot is assembled
+    # over months, so a blanket 7-day freshness rule would evict settled scopes
+    # faster than a bounded paid crawl could re-earn them, making the slot
+    # unreachable by construction.
+    mod = _load()
+    control = mod.control
+    historical = _scope_manifest_fixture(control, edition_current=False)
+    cursor = _ScopeEvidenceCursor(
+        control, [historical], stale_scope_ids=[historical.scope_id],
+    )
+
+    report, _ = _readiness(control, cursor)
+
+    assert report['passed'] is True
+    scope = report['scopes'][historical.scope_id]
+    assert scope['edition_current'] is False
+    assert scope['fresh'] is False
+    assert scope['age_days'] == 999
+
+    freshness = control._current_edition_freshness_report(
+        _FreshnessCursor(registry_currents=0),
+        scopes=report['scopes'],
+        registry_snapshot_id='registry-1',
+        applicable=True,
+    )
+    assert freshness['passed'] is True
+    assert freshness['current_scope_count'] == 0
+
+
+def test_a_stale_current_edition_stays_in_the_slot_and_blocks_the_cutover():
+    # Staleness may not be a membership rule: dropping the scope would shrink
+    # the slot, and a slot that shrinks can never satisfy the monotonicity gate
+    # of the next advance.  It stays in, and it blocks the reader flip instead.
+    mod = _load()
+    control = mod.control
+    current = _scope_manifest_fixture(control, edition_current=True)
+    cursor = _ScopeEvidenceCursor(
+        control, [current], stale_scope_ids={current.scope_id: 400},
+    )
+
+    report, manifests = _readiness(control, cursor)
+
+    assert report['passed'] is True
+    assert len(manifests) == 1
+
+    freshness = control._current_edition_freshness_report(
+        _FreshnessCursor(registry_currents=1),
+        scopes=report['scopes'],
+        registry_snapshot_id='registry-1',
+        applicable=True,
+    )
+    assert freshness['passed'] is False
+    assert freshness['stale_current_scope_ids'] == [current.scope_id]
+    assert freshness['max_current_age_days'] == 400
+    # Reported, but not enforced, while the slot is merely being built.
+    assert control._current_edition_freshness_report(
+        _FreshnessCursor(registry_currents=1),
+        scopes=report['scopes'],
+        registry_snapshot_id='registry-1',
+        applicable=False,
+    )['passed'] is True
+
+
+def test_a_slot_that_serves_no_current_edition_is_not_fresh_it_is_hollow():
+    # The gate used to pass vacuously on a slot with no current editions at all:
+    # an absent current season is not a fresh one.
+    mod = _load()
+    control = mod.control
+    historical_only = {
+        'scope-1': {'edition_current': False, 'fresh': True, 'age_days': 3},
+    }
+
+    hollow = control._current_edition_freshness_report(
+        _FreshnessCursor(registry_currents=684),
+        scopes=historical_only,
+        registry_snapshot_id='registry-1',
+        applicable=True,
+    )
+    assert hollow['passed'] is False
+    assert hollow['serves_no_current_edition'] is True
+    assert hollow['registry_current_edition_count'] == 684
+
+    # A registry with no current editions at all cannot make the slot hollow.
+    empty_registry = control._current_edition_freshness_report(
+        _FreshnessCursor(registry_currents=0),
+        scopes=historical_only,
+        registry_snapshot_id='registry-1',
+        applicable=True,
+    )
+    assert empty_registry['passed'] is True
+
+
+def test_a_stale_write_manifest_of_a_current_child_blocks_the_cutover():
+    # The write manifest is committed by the same child cycle as the scope
+    # manifest, so its staleness is the same fact seen from the writer's side —
+    # it may not be counted and then quietly ignored.
+    mod = _load()
+    control = mod.control
+    scopes = {
+        'scope-1': {'edition_current': True, 'fresh': True, 'age_days': 1},
+    }
+
+    report = control._current_edition_freshness_report(
+        _FreshnessCursor(registry_currents=1),
+        scopes=scopes,
+        registry_snapshot_id='registry-1',
+        stale_write_children=['child-1'],
+        applicable=True,
+    )
+
+    assert report['passed'] is False
+    assert report['stale_write_manifest_children'] == ['child-1']
+
+
+def test_the_freshness_horizon_is_what_the_paid_budget_can_deliver():
+    # 684 current editions at three scopes a day cannot all be under a week old
+    # — a flat 7-day rule would block every cutover forever.  The gate asks the
+    # only question the crawl can answer: is it keeping up with its own cadence?
+    mod = _load()
+    control = mod.control
+
+    per_day = control.achievable_scopes_per_day()
+    assert per_day == (
+        control.PARENT_DAILY_HARD_PROVIDER_BYTE_CAP
+        // control.SCOPE_HARD_PROVIDER_BYTE_CAP
+    )
+    assert control.current_edition_refresh_horizon_days(0) == (
+        control.READINESS_MAX_AGE_DAYS
+    )
+    assert control.current_edition_refresh_horizon_days(684) == (
+        -(-684 // per_day) * control.CUTOVER_REFRESH_PASS_MARGIN
+    )
+    scopes = {
+        f'scope-{index}': {
+            'edition_current': True,
+            'fresh': False,
+            'age_days': 100,
+        }
+        for index in range(684)
+    }
+    report = control._current_edition_freshness_report(
+        _FreshnessCursor(registry_currents=684),
+        scopes=scopes,
+        registry_snapshot_id='registry-1',
+        applicable=True,
+    )
+    assert report['refresh_horizon_days'] > 100
+    assert report['passed'] is True
+
+    scopes['scope-0']['age_days'] = report['refresh_horizon_days'] + 1
+    behind = control._current_edition_freshness_report(
+        _FreshnessCursor(registry_currents=684),
+        scopes=scopes,
+        registry_snapshot_id='registry-1',
+        applicable=True,
+    )
+    assert behind['passed'] is False
+    assert behind['stale_current_scope_ids'] == ['scope-0']
+
+
+def test_membership_lookups_are_chunked(monkeypatch):
+    mod = _load()
+    control = mod.control
+    assert control.SQL_IN_LIST_CHUNK == 1000
+    assert control._chunked(list(range(2500))) == [
+        list(range(1000)), list(range(1000, 2000)), list(range(2000, 2500)),
+    ]
+
+    first = _scope_manifest_fixture(control)
+    second = _scope_manifest_fixture(
+        control, scope_id='CL:2025', child_cycle_id='child-2',
+        competition_id='CL', edition_id='2025',
+    )
+    monkeypatch.setattr(control, 'SQL_IN_LIST_CHUNK', 1)
+    cursor = _ScopeEvidenceCursor(control, [first, second])
+
+    report, manifests = _readiness(control, cursor)
+
+    assert report['passed'] is True
+    assert len(manifests) == 2
+    digest_queries = [
+        sql for sql in cursor.sql if 'WHERE manifest_digest IN' in sql
+    ]
+    assert len(digest_queries) == 2
+    assert all(
+        len(re.findall(r"'[0-9a-f]{64}'", sql)) == 1 for sql in digest_queries
+    )
+
+
+def test_career_debt_gate_is_exact_at_its_boundary():
+    mod = _load()
+    control = mod.control
+    assert control.CUTOVER_MAX_CAREER_DEBT_RATIO == 0.10
+
+    at_limit = _scope_manifest_fixture(
+        control, roster_coverage=_roster(size=1000, pending=100),
+    )
+    report = control._career_debt_report([at_limit])
+    assert report['career_fetches_pending'] == 100
+    assert report['roster_size'] == 1000
+    assert report['career_debt_ratio'] == 0.10
+    assert report['passed'] is True
+
+    over_limit = _scope_manifest_fixture(
+        control, roster_coverage=_roster(size=10_000, pending=1001),
+    )
+    over = control._career_debt_report([over_limit])
+    assert over['career_debt_ratio'] == 0.1001
+    assert over['passed'] is False
+
+
+def test_career_debt_gate_sums_the_whole_slot_and_honours_an_override():
+    mod = _load()
+    control = mod.control
+    paid_up = _scope_manifest_fixture(
+        control, roster_coverage=_roster(size=900, pending=0),
+    )
+    indebted = _scope_manifest_fixture(
+        control, scope_id='CL:2025', child_cycle_id='child-2',
+        competition_id='CL', roster_coverage=_roster(size=100, pending=50),
+    )
+
+    report = control._career_debt_report([paid_up, indebted])
+    assert report['career_fetches_pending'] == 50
+    assert report['roster_size'] == 1000
+    assert report['career_debt_ratio'] == 0.05
+    assert report['passed'] is True
+
+    strict = control._career_debt_report([paid_up, indebted], max_ratio=0.01)
+    assert strict['passed'] is False
+
+
+def test_a_manifest_that_states_no_career_debt_fails_closed_by_name():
+    # Silence is not proof of a paid-up roster: a manifest written before the
+    # contract existed simply said nothing about what it still owed.
+    mod = _load()
+    control = mod.control
+    unstated = _scope_manifest_fixture(control, state_career_debt=False)
+    stated = _scope_manifest_fixture(
+        control, scope_id='CL:2025', child_cycle_id='child-2',
+        competition_id='CL', roster_coverage=_roster(size=100, pending=1),
+    )
+
+    report = control._career_debt_report([unstated, stated])
+
+    assert report['passed'] is False
+    assert report['unstated_scope_count'] == 1
+    assert report['unstated_scope_ids'] == [unstated.scope_id]
+
+
+class _GateCursor:
+    """Cursor that answers only the legacy-floor and approved-set queries."""
+
+    def __init__(self, *, legacy_rows=(), approved_digests=None):
+        self.legacy_rows = list(legacy_rows)
+        self.approved_digests = approved_digests
+        self.rows = []
+        self.sql = []
+
+    def execute(self, sql):
+        self.sql.append(sql)
+        if 'transfermarkt_scope_set_manifest_v2' in sql:
+            self.rows = (
+                []
+                if self.approved_digests is None
+                else [(json.dumps(self.approved_digests),)]
+            )
+        else:
+            self.rows = self.legacy_rows
+
+    def fetchall(self):
+        return self.rows
+
+
+def test_the_legacy_branch_is_the_coverage_floor_of_the_first_cutover():
+    mod = _load()
+    control = mod.control
+    served = _scope_manifest_fixture(
+        control,
+        canonical_competition_id='ENG-Premier League',
+        canonical_season='2526',
+    )
+    cursor = _GateCursor(legacy_rows=[
+        ('ENG-Premier League', '2526'),
+        ('ITA-Serie A', '2425'),
+    ])
+
+    report = control._legacy_coverage_floor_report(
+        cursor, manifests=[served], applicable=True,
+    )
+
+    assert report['applicable'] is True
+    assert report['passed'] is False
+    assert report['legacy_scope_count'] == 2
+    assert report['covered_scope_count'] == 1
+    assert report['missing_scopes'] == [['ITA-Serie A', '2425']]
+    assert all(
+        table in ' '.join(cursor.sql) for table in control.LEGACY_SCOPE_TABLES
+    )
+
+
+def test_a_slot_that_covers_the_whole_legacy_branch_clears_the_floor():
+    mod = _load()
+    control = mod.control
+    first = _scope_manifest_fixture(control)
+    second = _scope_manifest_fixture(
+        control, scope_id='CL:2025', child_cycle_id='child-2',
+        competition_id='CL', canonical_competition_id='ITA-Serie A',
+        canonical_season='2425',
+    )
+    cursor = _GateCursor(legacy_rows=[
+        ('ENG-Premier League', '2526'),
+        ('ITA-Serie A', '2425'),
+    ])
+
+    report = control._legacy_coverage_floor_report(
+        cursor, manifests=[first, second], applicable=True,
+    )
+
+    assert report['passed'] is True
+    assert report['missing_scope_count'] == 0
+
+
+def test_the_legacy_floor_does_not_apply_once_the_reader_is_on_v2():
+    mod = _load()
+    control = mod.control
+    cursor = _GateCursor(legacy_rows=[('ITA-Serie A', '2425')])
+
+    report = control._legacy_coverage_floor_report(
+        cursor, manifests=[_scope_manifest_fixture(control)], applicable=False,
+    )
+
+    assert report == {
+        'applicable': False,
+        'passed': True,
+        'legacy_scope_count': 0,
+        'covered_scope_count': 0,
+        'missing_scope_count': 0,
+        'missing_scopes': [],
+    }
+    assert cursor.sql == []
+
+
+def test_an_advance_may_grow_the_slot_but_never_shrink_it():
+    mod = _load()
+    control = mod.control
+    kept = _scope_manifest_fixture(control)
+    added = _scope_manifest_fixture(
+        control, scope_id='CL:2025', child_cycle_id='child-2',
+        competition_id='CL',
+    )
+    approved = [[kept.scope_id, 'a' * 64], ['ES1:2025', 'b' * 64]]
+
+    grown = control._scope_set_monotonicity_report(
+        _GateCursor(approved_digests=[[kept.scope_id, 'a' * 64]]),
+        manifests=[kept, added],
+        approved_scope_set_id='c' * 64,
+        scope_set_id='d' * 64,
+        applicable=True,
+    )
+    assert grown['passed'] is True
+    assert grown['approved_scope_count'] == 1
+    assert grown['candidate_scope_count'] == 2
+
+    shrunk = control._scope_set_monotonicity_report(
+        _GateCursor(approved_digests=approved),
+        manifests=[kept, added],
+        approved_scope_set_id='c' * 64,
+        scope_set_id='d' * 64,
+        applicable=True,
+    )
+    assert shrunk['passed'] is False
+    assert shrunk['missing_scope_ids'] == ['ES1:2025']
+
+
+def test_monotonicity_fails_closed_when_the_approved_set_cannot_be_read():
+    mod = _load()
+    control = mod.control
+
+    with pytest.raises(control.ReadinessError, match='monotonicity cannot be proven'):
+        control._scope_set_monotonicity_report(
+            _GateCursor(approved_digests=None),
+            manifests=[_scope_manifest_fixture(control)],
+            approved_scope_set_id='c' * 64,
+            scope_set_id='d' * 64,
+            applicable=True,
+        )
+
+
+def _stub_scope_set_readiness(monkeypatch, control, *, state, manifests):
+    monkeypatch.setattr(control, 'read_reader_state', lambda *a, **kw: state)
+    monkeypatch.setattr(
+        control, '_scope_set_evidence',
+        lambda *a, **kw: ({
+            'passed': True,
+            'parent_cycle_ids': ['parent-1'],
+            'traffic': {},
+            'registry_snapshot_id': 'registry-1',
+            'scopes': {
+                item.scope_id: {
+                    'edition_current': bool(
+                        item.dq_evidence['edition_current']
+                    ),
+                    'fresh': True,
+                    'age_days': 1,
+                }
+                for item in manifests
+            },
+        }, tuple(manifests)),
+    )
+    monkeypatch.setattr(
+        control, '_scope_competition_type_dq_report',
+        lambda *a, **kw: {'passed': True},
+    )
+    monkeypatch.setattr(
+        control, '_scope_write_manifest_report',
+        lambda *a, **kw: {'passed': True},
+    )
+    monkeypatch.setattr(control, '_scalar', lambda *a, **kw: 0)
+    monkeypatch.setattr(
+        control, '_model_manifest_report', lambda *a, **kw: {'passed': True},
+    )
+    monkeypatch.setattr(control, '_gold_contract_report', lambda *a, **kw: {})
+    monkeypatch.setattr(
+        control, '_scope_set_coverage_report',
+        lambda *a, **kw: {'passed': True},
+    )
+    monkeypatch.setattr(
+        control, '_registry_current_edition_count', lambda *a, **kw: 0,
+    )
+    monkeypatch.setattr(
+        control, '_legacy_coverage_floor_report',
+        lambda *a, **kw: {'applicable': False, 'passed': True},
+    )
+    monkeypatch.setattr(
+        control, '_scope_set_monotonicity_report',
+        lambda *a, **kw: {'applicable': False, 'passed': True},
+    )
+
+
+def test_career_debt_blocks_a_cutover_but_never_a_slot_build(monkeypatch):
+    # This is the whole point of the phase: the inactive slot must keep being
+    # built and served while the bounded crawl pays off its career debt; only
+    # the reader flip waits for the debt to fall under the ceiling.
+    mod = _load()
+    control = mod.control
+    indebted = _scope_manifest_fixture(
+        control, roster_coverage=_roster(size=100, pending=50),
+    )
+    state = control.ReaderState(exists=True, active_version='legacy', revision=4)
+    _stub_scope_set_readiness(
+        monkeypatch, control, state=state, manifests=[indebted],
+    )
+
+    blocked = control._scope_set_readiness(
+        object(), 'parent-1', scope_set_id='a' * 64, parent_cycle_id='parent-1',
+        expected_revision=4, require_fresh=True, require_current_snapshots=True,
+        candidate_slot_override=None, allow_retained_rollback_slot=False,
+        allow_previous_slot=False,
+    )
+    assert blocked['ready'] is False
+    assert blocked['cutover_gates_enforced'] is True
+    assert blocked['career_debt']['passed'] is False
+    assert blocked['career_debt']['career_debt_ratio'] == 0.5
+
+    building = control._scope_set_readiness(
+        object(), 'parent-1', scope_set_id='a' * 64, parent_cycle_id='parent-1',
+        expected_revision=4, require_fresh=True, require_current_snapshots=True,
+        candidate_slot_override=None, allow_retained_rollback_slot=False,
+        allow_previous_slot=False, cutover_gates=False,
+    )
+    assert building['ready'] is True
+    assert building['cutover_gates_enforced'] is False
+    # Still measured and still in the report (and therefore in the digest).
+    assert building['career_debt']['passed'] is False
+    assert building['career_debt']['career_debt_ratio'] == 0.5
+
+
+def test_an_already_promoted_cycle_is_not_re_judged_by_the_cutover_gates(
+    monkeypatch,
+):
+    # Re-verifying a cycle that was promoted long ago (the master-pipeline
+    # marker, restore, rollback-slot) must not re-run the promotion gates: their
+    # verdict was taken once, against immutable evidence, and re-taking it could
+    # only strand a live reader if a ceiling moved afterwards.
+    mod = _load()
+    control = mod.control
+    indebted = _scope_manifest_fixture(
+        control, roster_coverage=_roster(size=100, pending=50),
+    )
+    state = control.ReaderState(
+        exists=True,
+        active_version='v2',
+        active_slot='a',
+        approved_cycle_id='parent-1',
+        approved_scope_set_id='a' * 64,
+        approved_model_revision=4,
+        revision=4,
+    )
+    _stub_scope_set_readiness(
+        monkeypatch, control, state=state, manifests=[indebted],
+    )
+    monkeypatch.setattr(
+        control, '_scalar',
+        lambda cur, sql, *a, **kw: 1 if control.HISTORY_TABLE in sql else 0,
+    )
+
+    report = control._scope_set_readiness(
+        object(), 'parent-1', scope_set_id='a' * 64, parent_cycle_id='parent-1',
+        expected_revision=4, require_fresh=True, require_current_snapshots=True,
+        candidate_slot_override=None, allow_retained_rollback_slot=False,
+        allow_previous_slot=False,
+    )
+
+    assert report['historical_promoted_cycle'] is True
+    assert report['cutover_gates_enforced'] is False
+    assert report['career_debt']['passed'] is False
+    assert report['ready'] is True
+
+
 def test_readiness_exposes_separate_strict_competition_thresholds():
     mod = _load()
     control = mod.control
@@ -1025,7 +1716,7 @@ def test_scope_write_manifest_binds_physical_table_names():
     )
     manifest = SimpleNamespace(
         child_cycle_id='child-1', reader_revision=4,
-        entities=(evidence,),
+        entities=(evidence,), dq_evidence={'edition_current': True},
     )
 
     class Cursor:
@@ -1494,6 +2185,122 @@ def test_registry_backup_status_command_includes_reader(monkeypatch):
     assert set(payload['registry_tables']) == set(
         mod.REGISTRY_DISCOVERY_RELATIONS
     )
+
+
+def test_cli_readiness_runs_the_slot_gate_and_exits_nonzero_when_blocked(
+    monkeypatch,
+):
+    mod = _load()
+    captured = {}
+
+    def fake_readiness(cur, cycle_id, **kwargs):
+        captured.update({'cycle_id': cycle_id, **kwargs})
+        return {'ready': False, 'career_debt': {'passed': False}}
+
+    class Conn:
+        def cursor(self):
+            return SimpleNamespace(close=lambda: None)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(mod, '_connect', lambda: Conn())
+    monkeypatch.setattr(mod.control, 'readiness', fake_readiness)
+    out = io.StringIO()
+    with redirect_stdout(out):
+        code = mod.main([
+            'readiness', '--cycle-id', 'parent-1',
+            '--league', 'ENG-Premier League', '--season', '2025',
+            '--expected-revision', '4', '--scope-set-id', 'a' * 64,
+        ])
+
+    assert code == 1
+    assert json.loads(out.getvalue())['ready'] is False
+    assert captured == {
+        'cycle_id': 'parent-1',
+        'expected_revision': 4,
+        'scope_set_id': 'a' * 64,
+        'parent_cycle_id': 'parent-1',
+        # The ceiling cutover enforces is a module constant, so the CLI and the
+        # DAG cannot reach different verdicts about the same slot.
+        'max_career_debt_ratio': mod.control.CUTOVER_MAX_CAREER_DEBT_RATIO,
+    }
+
+
+def test_cli_separates_a_refusal_from_a_half_applied_transition(monkeypatch):
+    # 'refused' must mean exactly one thing to an operator: nothing was written.
+    # The claim is proven from the audit trail, never guessed from the reader's
+    # revision — which moves for many reasons, and never moves at all when the
+    # CAS precondition itself is what failed.
+    mod = _load()
+    applied = iter([0, 1])
+
+    class Conn:
+        def cursor(self):
+            return SimpleNamespace(close=lambda: None)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(mod, '_connect', lambda: Conn())
+    monkeypatch.setattr(mod.control, '_scalar', lambda *a, **kw: next(applied))
+    monkeypatch.setattr(
+        mod.control, 'read_reader_state',
+        lambda *a, **kw: mod.control.ReaderState(exists=True, revision=5),
+    )
+    argv = [
+        'cutover', '--cycle-id', 'tm-cycle', '--expected-revision', '4',
+        '--apply',
+    ]
+    failure = mod.control.ReadinessError('gold contract is red')
+
+    assert mod._failure_status(argv, failure) == {
+        'status': 'refused', 'state_written': False,
+    }
+    assert mod._failure_status(argv, failure) == {
+        'status': 'partially_applied',
+        'state_written': True,
+        'expected_revision': 4,
+        'actual_revision': 5,
+    }
+
+    # A CAS whose precondition failed wrote nothing, whatever the revision says.
+    assert mod._failure_status(
+        argv, mod.control.RevisionConflict('revision moved'),
+    ) == {'status': 'refused', 'state_written': False}
+
+    # A read-only command can never have written anything.
+    assert mod._failure_status(
+        ['readiness', '--expected-revision', '4'], failure,
+    ) == {'status': 'refused', 'state_written': False}
+
+
+def test_cli_career_debt_override_is_report_only(monkeypatch):
+    mod = _load()
+    captured = {}
+
+    class Conn:
+        def cursor(self):
+            return SimpleNamespace(close=lambda: None)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(mod, '_connect', lambda: Conn())
+    monkeypatch.setattr(
+        mod.control, 'readiness',
+        lambda cur, cycle_id, **kwargs: captured.update(kwargs) or {
+            'ready': True,
+        },
+    )
+    with redirect_stdout(io.StringIO()):
+        assert mod.main([
+            'readiness', '--cycle-id', 'parent-1',
+            '--league', 'ENG-Premier League', '--season', '2025',
+            '--expected-revision', '4', '--scope-set-id', 'a' * 64,
+            '--max-career-debt-ratio', '0.5',
+        ]) == 0
+    assert captured['max_career_debt_ratio'] == 0.5
 
 
 def test_registry_discovery_rollback_defaults_to_exact_offline_dry_run(

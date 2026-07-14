@@ -29,7 +29,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -546,7 +546,27 @@ def readiness(
     league: str,
     season: int,
     expected_revision: int,
+    *,
+    scope_set_id: str | None = None,
+    parent_cycle_id: str | None = None,
+    max_career_debt_ratio: float = control.CUTOVER_MAX_CAREER_DEBT_RATIO,
 ) -> dict:
+    """Run the same blocking gate cutover runs, read-only.
+
+    With ``--scope-set-id`` this is the multi-scope gate the cumulative slot is
+    promoted through, including the cutover gates (career debt, legacy coverage
+    floor, monotonicity).  Without it, the legacy single-scope gate.
+    """
+
+    if scope_set_id is not None:
+        return control.readiness(
+            cur,
+            cycle_id,
+            expected_revision=expected_revision,
+            scope_set_id=scope_set_id,
+            parent_cycle_id=parent_cycle_id or cycle_id,
+            max_career_debt_ratio=max_career_debt_ratio,
+        )
     return control.readiness(
         cur,
         cycle_id,
@@ -593,7 +613,78 @@ def _print_statements(statements: Iterable[str]) -> None:
         print(statement.rstrip() + ';')
 
 
+def _failure_status(argv: list[str], exc: Exception) -> dict[str, Any]:
+    """Say whether the failure happened before or after the audited CAS.
+
+    'refused' must mean exactly one thing to an operator: nothing was written.
+    'partially_applied' must mean the opposite, and neither may be guessed from
+    the reader's revision alone — the revision moves for many reasons, and a
+    RevisionConflict is by definition raised BEFORE anything is written (the CAS
+    precondition is what failed).  So the claim is proven from the audit trail:
+    this transition is 'partially applied' only if the history table records it
+    as applied at the revision this invocation would have produced.
+    """
+
+    refused = {'status': 'refused', 'state_written': False}
+    if '--apply' not in argv or isinstance(exc, control.RevisionConflict):
+        return refused
+    if '--expected-revision' not in argv or '--cycle-id' not in argv:
+        return refused
+    try:
+        expected = int(argv[argv.index('--expected-revision') + 1])
+        cycle_id = str(argv[argv.index('--cycle-id') + 1])
+    except (IndexError, ValueError):
+        return refused
+    try:
+        conn = _connect()
+        cur = conn.cursor()
+        try:
+            applied = int(control._scalar(
+                cur,
+                f'SELECT COUNT(*) FROM {control.HISTORY_TABLE} '
+                "WHERE event_type = 'applied' "
+                f'AND cycle_id = {control._sql_literal(cycle_id)} '
+                f'AND to_revision = {expected + 1}',
+            ) or 0)
+            state = control.read_reader_state(cur, allow_missing=True)
+        finally:
+            cur.close()
+            conn.close()
+    except Exception:  # noqa: BLE001 - the verdict must never mask the failure
+        return {'status': 'unknown', 'state_written': None}
+    if applied:
+        return {
+            'status': 'partially_applied',
+            'state_written': True,
+            'expected_revision': expected,
+            'actual_revision': int(state.revision) if state.exists else None,
+        }
+    return refused
+
+
 def main(argv: list[str] | None = None) -> int:
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    try:
+        return _main(arguments)
+    except (
+        control.ReadinessError,
+        control.RevisionConflict,
+        control.StateInvariantError,
+    ) as exc:
+        # A blocked promotion is a verdict, not a bug: the operator gets the
+        # exact reason and a non-zero exit, not a stack trace.
+        print(
+            json.dumps({
+                **_failure_status(arguments, exc),
+                'error': type(exc).__name__,
+                'reason': str(exc),
+            }, indent=2, sort_keys=True),
+            file=sys.stderr,
+        )
+        return 1
+
+
+def _main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='command', required=True)
     sub.add_parser('plan', help='print idempotent bootstrap SQL')
@@ -640,6 +731,24 @@ def main(argv: list[str] | None = None) -> int:
     add_scope(parity)
     ready = sub.add_parser('readiness', help='run the blocking read-only cutover gate')
     add_scope(ready, revision=True)
+    ready.add_argument(
+        '--scope-set-id',
+        help='evaluate the multi-scope slot gate instead of the legacy scope',
+    )
+    ready.add_argument(
+        '--parent-cycle-id',
+        help='parent cycle of the scope set; defaults to --cycle-id',
+    )
+    ready.add_argument(
+        '--max-career-debt-ratio',
+        type=float,
+        default=control.CUTOVER_MAX_CAREER_DEBT_RATIO,
+        help=(
+            'report-only override of the cutover career-debt ceiling '
+            f'(default {control.CUTOVER_MAX_CAREER_DEBT_RATIO}); cutover and '
+            'advance-cycle always enforce the module constant'
+        ),
+    )
     cut = sub.add_parser(
         'cutover', help='read-only plan by default; CAS write only with --apply',
     )
@@ -788,6 +897,9 @@ def main(argv: list[str] | None = None) -> int:
                 args.league,
                 args.season,
                 args.expected_revision,
+                scope_set_id=args.scope_set_id,
+                parent_cycle_id=args.parent_cycle_id,
+                max_career_debt_ratio=args.max_career_debt_ratio,
             )
             print(json.dumps(report, indent=2, sort_keys=True, default=str))
             return 0 if report['ready'] else 1

@@ -1047,8 +1047,21 @@ def _bootstrap_record(
 
 # This is an offline compatibility seed, not a production crawl list.  Runtime
 # callers pass records from a reconciled discovery snapshot to
-# ``resolve_competition``.  Only the five source-verified regression fixtures
-# are intentionally present here.
+# ``resolve_competition``.  Only source-verified records are intentionally
+# present here.
+#
+# #948: the seed is also the *only* place that binds a Transfermarkt
+# ``competition_id`` to the legacy canonical id used by the Medallion contour
+# (``configs/medallion/competitions.yaml``): discovery stamps
+# ``canonical_competition_id`` from ``resolve_competition(competition_id)``, so
+# a Top-5 league missing here is published as ``TM-<id>`` and can never match
+# its legacy ``(league, season)`` pair in the reader cutover gate.  All five
+# Top-5 leagues are therefore seeded, and their fields were reconciled against
+# the live discovery snapshot in ``silver.transfermarkt_competitions_v2``.
+#
+# ``season_format`` for these five is SPLIT_YEAR (source-verified): the Silver
+# market-value transform picks its season formula from the published registry,
+# so any other value here would silently restate Top-5 seasons.
 BOOTSTRAP_COMPETITIONS: tuple[CompetitionRecord, ...] = (
     _bootstrap_record(
         competition_id="GB1",
@@ -1062,6 +1075,58 @@ BOOTSTRAP_COMPETITIONS: tuple[CompetitionRecord, ...] = (
         source_url="https://www.transfermarkt.com/premier-league/startseite/wettbewerb/GB1",
         canonical_competition_id="ENG-Premier League",
         aliases=("English Premier League",),
+    ),
+    _bootstrap_record(
+        competition_id="ES1",
+        slug="laliga",
+        name="LaLiga",
+        country="Spain",
+        confederation="UEFA",
+        competition_type=CompetitionType.DOMESTIC_LEAGUE,
+        team_type=TeamType.CLUB,
+        season_format=SeasonFormat.SPLIT_YEAR,
+        source_url="https://www.transfermarkt.com/laliga/startseite/wettbewerb/ES1",
+        canonical_competition_id="ESP-La Liga",
+        aliases=("Spanish La Liga",),
+    ),
+    _bootstrap_record(
+        competition_id="IT1",
+        slug="serie-a",
+        name="Serie A",
+        country="Italy",
+        confederation="UEFA",
+        competition_type=CompetitionType.DOMESTIC_LEAGUE,
+        team_type=TeamType.CLUB,
+        season_format=SeasonFormat.SPLIT_YEAR,
+        source_url="https://www.transfermarkt.com/serie-a/startseite/wettbewerb/IT1",
+        canonical_competition_id="ITA-Serie A",
+        aliases=("Italian Serie A",),
+    ),
+    _bootstrap_record(
+        competition_id="L1",
+        slug="bundesliga",
+        name="Bundesliga",
+        country="Germany",
+        confederation="UEFA",
+        competition_type=CompetitionType.DOMESTIC_LEAGUE,
+        team_type=TeamType.CLUB,
+        season_format=SeasonFormat.SPLIT_YEAR,
+        source_url="https://www.transfermarkt.com/bundesliga/startseite/wettbewerb/L1",
+        canonical_competition_id="GER-Bundesliga",
+        aliases=("German Bundesliga",),
+    ),
+    _bootstrap_record(
+        competition_id="FR1",
+        slug="ligue-1",
+        name="Ligue 1",
+        country="France",
+        confederation="UEFA",
+        competition_type=CompetitionType.DOMESTIC_LEAGUE,
+        team_type=TeamType.CLUB,
+        season_format=SeasonFormat.SPLIT_YEAR,
+        source_url="https://www.transfermarkt.com/ligue-1/startseite/wettbewerb/FR1",
+        canonical_competition_id="FRA-Ligue 1",
+        aliases=("French Ligue 1",),
     ),
     _bootstrap_record(
         competition_id="CL",
