@@ -80,7 +80,7 @@ class TestFBrefCurrentTopology:
 
     def test_fixed_fetch_parse_waves_are_strictly_sequential(self, loaded_dag):
         module, tasks = loaded_dag
-        assert len(tasks) == 2 * module.CURRENT_WAVE_COUNT + 9
+        assert len(tasks) == 2 * module.CURRENT_WAVE_COUNT + 12
         assert tasks["validate_production_readiness"].downstream_task_ids == {
             "initialize_run"
         }
@@ -113,7 +113,7 @@ class TestFBrefCurrentTopology:
             expected_next = (
                 f"fetch_wave_{number + 1:02d}"
                 if number < module.CURRENT_WAVE_COUNT
-                else "validate_current_scope_freshness"
+                else "choose_publication_path"
             )
             assert parse.downstream_task_ids == {expected_next}
 
@@ -127,8 +127,15 @@ class TestFBrefCurrentTopology:
         assert freshness.python_callable.__name__ == (
             "validate_fbref_current_scope_freshness"
         )
-        assert freshness.upstream_task_ids == {
-            f"parse_wave_{module.CURRENT_WAVE_COUNT:02d}"
+        assert freshness.upstream_task_ids == {"choose_publication_path"}
+        assert tasks["validate_canary_run"].upstream_task_ids == {
+            "choose_publication_path"
+        }
+        assert tasks["validate_canary_run"].downstream_task_ids == {
+            "release_canary_publication_lock"
+        }
+        assert tasks["release_canary_publication_lock"].upstream_task_ids == {
+            "validate_canary_run"
         }
         assert tasks["validate_run"].upstream_task_ids == {
             "validate_current_scope_freshness"

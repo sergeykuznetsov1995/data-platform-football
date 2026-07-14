@@ -209,6 +209,41 @@ def wave_target_capacity(
     return min(settings.shard_size, request_capacity, byte_capacity)
 
 
+def live_wave_target_capacity(
+    settings: PipelineSettings,
+    *,
+    request_remaining: Optional[int] = None,
+    byte_remaining: Optional[int] = None,
+) -> int:
+    """Admit sequential warm-session pages without double-counting bytes.
+
+    A live wave reserves one target at a time and settles that reservation
+    before the next target.  The old capacity calculation divided the whole
+    run's byte budget by the per-target safety reservation, so a 50 MiB
+    canary admitted only seven pages per warm session despite a 25-page shard.
+    The byte guard still rejects a target when less than one reservation
+    remains; the control store enforces the real cumulative byte limit.
+    """
+
+    requests = (
+        settings.request_limit
+        if request_remaining is None
+        else max(0, int(request_remaining))
+    )
+    bytes_available = (
+        settings.byte_limit
+        if byte_remaining is None
+        else max(0, int(byte_remaining))
+    )
+    if bytes_available < settings.request_reservation_bytes:
+        return 0
+    request_capacity = max(
+        0,
+        requests - settings.bootstrap_request_reservation,
+    )
+    return min(settings.shard_size, request_capacity)
+
+
 @dataclass
 class WaveResult:
     cohort_size: int = 0
@@ -671,7 +706,12 @@ class FBrefPipeline:
             - int(run.get("bytes_used") or 0)
             - int(run.get("bytes_reserved") or 0),
         )
-        return wave_target_capacity(
+        capacity_fn = (
+            live_wave_target_capacity
+            if settings.run_type == "current"
+            else wave_target_capacity
+        )
+        return capacity_fn(
             settings,
             request_remaining=request_remaining,
             byte_remaining=byte_remaining,
@@ -2184,6 +2224,7 @@ class FBrefPipeline:
         run_id: str,
         *,
         replay_source_run_id: Optional[str] = None,
+        publication_eligible: bool = True,
     ) -> dict:
         summary = self.control.get_run_summary(
             run_id,
@@ -2268,6 +2309,13 @@ class FBrefPipeline:
         ):
             errors.append("replay_generated_proxy_traffic")
         if str(summary.get("run_type")) == "replay":
+            source_summary = (
+                self.control.get_run_summary(replay_source_run_id)
+                if replay_source_run_id
+                else None
+            )
+            if source_summary and int(source_summary.get("request_limit") or 0) == 100:
+                errors.append("replay_source_canary_not_publication_eligible")
             source_error = self._replay_source_error(replay_source_run_id)
             if source_error:
                 errors.append(source_error)
@@ -2323,16 +2371,20 @@ class FBrefPipeline:
             if int(crawlable_scope.get("eligible_male") or 0) <= 0:
                 errors.append("crawlable_male_scope_empty")
 
-        if str(summary.get("run_type") or "").lower() != "replay":
-            freshness = summary.get("current_scope_freshness")
+        if publication_eligible and str(summary.get("run_type") or "").lower() != "replay":
+            freshness = summary.get("publication_scope_freshness")
+            freshness_label = "publication_scope"
             if not isinstance(freshness, Mapping):
-                errors.append("current_scope_freshness_missing")
+                freshness = summary.get("current_scope_freshness")
+                freshness_label = "current_scope"
+            if not isinstance(freshness, Mapping):
+                errors.append("publication_scope_freshness_missing")
             else:
                 if int(freshness.get("total_targets") or 0) <= 0:
-                    errors.append("current_scope_freshness_empty")
+                    errors.append("publication_scope_freshness_empty")
                 if not bool(freshness.get("all_within_sla")):
                     errors.append(
-                        "current_scope_stale_targets="
+                        f"{freshness_label}_stale_targets="
                         f"{int(freshness.get('stale_targets') or 0)}"
                     )
         if str(summary.get("run_type") or "").lower() != "replay":
@@ -2369,6 +2421,7 @@ __all__ = [
     "SENTINEL_COMPETITIONS",
     "WaveResult",
     "frontier_target",
+    "live_wave_target_capacity",
     "page_target_from_link",
     "wave_target_capacity",
 ]

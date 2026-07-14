@@ -79,6 +79,21 @@ def test_runtime_limits_allow_only_hard_production_canary_and_replay_profiles():
 
 
 @pytest.mark.unit
+def test_canary_publication_path_is_non_publishing():
+    assert (
+        fbref_pipeline_tasks.choose_fbref_publication_path(
+            request_limit=100, byte_limit_mb=50
+        )
+        == "validate_canary_run"
+    )
+    assert (
+        fbref_pipeline_tasks.choose_fbref_publication_path(
+            request_limit=200, byte_limit_mb=100
+        )
+        == "validate_current_scope_freshness"
+    )
+
+@pytest.mark.unit
 def test_production_readiness_combines_alert_env_and_runtime_limits(monkeypatch):
     monkeypatch.setenv("ALERT_ENV", "prod")
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "token")
