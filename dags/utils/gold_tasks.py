@@ -53,6 +53,7 @@ def run_gold_transform(
     fallback_sql_file: Optional[str] = None,
     require_silver: Optional[List[str]] = None,
     add_timestamp: bool = True,
+    fbref_control_run_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run a Gold-layer CTAS.
 
@@ -113,6 +114,7 @@ def run_gold_transform(
                 schema='gold',
                 partition_columns=partition_columns,
                 add_timestamp=add_timestamp,
+                fbref_control_run_id=fbref_control_run_id,
             )
             result['fallback'] = True
             result['fallback_reason'] = f"missing silver tables: {missing}"
@@ -124,6 +126,7 @@ def run_gold_transform(
         schema='gold',
         partition_columns=partition_columns,
         add_timestamp=add_timestamp,
+        fbref_control_run_id=fbref_control_run_id,
     )
 
 

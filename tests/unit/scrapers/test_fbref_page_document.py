@@ -1,6 +1,65 @@
 from scrapers.fbref.page_document import Availability, parse_page_document
 
 
+def test_zero_table_competition_is_deferred_to_semantic_contract():
+    page = parse_page_document(
+        "<html><main><h1>Competition</h1></main></html>",
+        target_id="fbref:competition:zero",
+        page_kind="competition",
+    )
+
+    assert page.tables == ()
+    assert page.errors == ()
+
+    broken_profile = parse_page_document(
+        "<html><main><h1>Player</h1></main></html>",
+        target_id="fbref:player:zero",
+        page_kind="player",
+    )
+    assert broken_profile.errors == ("page_contract:no_tables",)
+
+
+def test_empty_table_evidence_and_new_material_table_are_preserved():
+    empty = parse_page_document(
+        """
+        <table id="stats_empty"><thead><tr>
+          <th data-stat="player">Player</th>
+        </tr></thead><tbody></tbody></table>
+        """,
+        target_id="fbref:squad:empty",
+        page_kind="squad",
+    )
+    novel = parse_page_document(
+        """
+        <table id="brand_new"><tr><th data-stat="new">New</th></tr>
+          <tr><td data-stat="new">value</td></tr></table>
+        """,
+        target_id="fbref:squad:novel",
+        page_kind="squad",
+    )
+
+    assert empty.errors == ()
+    assert empty.tables[0].availability == Availability.EMPTY
+    assert novel.errors == ()
+    assert novel.tables[0].availability == Availability.UNKNOWN
+
+
+def test_required_schedule_table_cannot_be_replaced_by_unrelated_markup():
+    page = parse_page_document(
+        """
+        <table id="advertisement"><tr><th data-stat="name">Name</th></tr>
+          <tr><td data-stat="name">Sponsor</td></tr></table>
+        """,
+        target_id="fbref:schedule:9:2025",
+        page_kind="schedule",
+    )
+
+    assert page.tables[0].availability == Availability.UNKNOWN
+    assert page.errors == (
+        "page_contract:required_table_missing:sched",
+    )
+
+
 def test_inventories_dom_and_every_table_inside_comments_losslessly():
     html = """
     <table id="stats_standard">

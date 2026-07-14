@@ -56,6 +56,48 @@ def _ok_urlopen():
     return MagicMock(return_value=cm)
 
 
+@pytest.mark.unit
+class TestProductionEnvironmentReadiness:
+    def test_prod_alert_environment_is_ready(
+        self, alerts_module, monkeypatch
+    ):
+        monkeypatch.setenv("ALERT_ENV", "prod")
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "token")
+        monkeypatch.setenv("TELEGRAM_CHAT_ID", "123")
+
+        assert alerts_module.validate_alert_environment() == {
+            "alert_env": "prod",
+            "alert_delivery": "telegram",
+            "status": "ready",
+        }
+
+    @pytest.mark.parametrize("value", [None, "dev", "test", "production"])
+    def test_non_prod_alert_environment_fails_closed(
+        self, alerts_module, monkeypatch, value
+    ):
+        if value is None:
+            monkeypatch.delenv("ALERT_ENV", raising=False)
+        else:
+            monkeypatch.setenv("ALERT_ENV", value)
+
+        with pytest.raises(RuntimeError, match="ALERT_ENV"):
+            alerts_module.validate_alert_environment()
+
+    @pytest.mark.parametrize(
+        "missing_name", ["TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"]
+    )
+    def test_missing_telegram_credential_fails_closed(
+        self, alerts_module, monkeypatch, missing_name
+    ):
+        monkeypatch.setenv("ALERT_ENV", "prod")
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "token")
+        monkeypatch.setenv("TELEGRAM_CHAT_ID", "123")
+        monkeypatch.setenv(missing_name, "   ")
+
+        with pytest.raises(RuntimeError, match=missing_name):
+            alerts_module.validate_alert_environment()
+
+
 # ===========================================================================
 # 1. Missing credentials → no-op
 # ===========================================================================

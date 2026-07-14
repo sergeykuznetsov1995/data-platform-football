@@ -532,6 +532,243 @@ MIGRATIONS = (
             """,
         ),
     ),
+    Migration(
+        version=8,
+        name="frontier_provenance_registry_guards_and_cancelled_attempts",
+        statements=(
+            """
+            ALTER TABLE fbref_control.fetch_attempt
+            DROP CONSTRAINT IF EXISTS fetch_attempt_status_check
+            """,
+            """
+            ALTER TABLE fbref_control.fetch_attempt
+            ADD CONSTRAINT fetch_attempt_status_check
+            CHECK (status IN (
+                'claimed', 'succeeded', 'failed', 'expired', 'cancelled'
+            ))
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS fbref_control.frontier_provenance (
+                provenance_id uuid PRIMARY KEY,
+                parent_target_id text NOT NULL
+                    REFERENCES fbref_control.page_frontier(target_id),
+                child_target_id text NOT NULL
+                    REFERENCES fbref_control.page_frontier(target_id),
+                relation text NOT NULL CHECK (btrim(relation) <> ''),
+                carried_competition_id text,
+                carried_season_id text,
+                parent_content_hash text NOT NULL
+                    CHECK (btrim(parent_content_hash) <> ''),
+                parser_version text NOT NULL
+                    CHECK (btrim(parser_version) <> ''),
+                logical_refresh_id uuid,
+                metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+                discovered_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+                CHECK (parent_target_id <> child_target_id),
+                CHECK (
+                    carried_season_id IS NULL
+                    OR carried_competition_id IS NOT NULL
+                ),
+                UNIQUE NULLS NOT DISTINCT (
+                    parent_target_id, child_target_id, relation,
+                    carried_competition_id, carried_season_id,
+                    parent_content_hash, parser_version
+                )
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS frontier_provenance_child_idx
+            ON fbref_control.frontier_provenance (
+                child_target_id, discovered_at DESC
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS frontier_provenance_parent_idx
+            ON fbref_control.frontier_provenance (
+                parent_target_id, relation, discovered_at DESC
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS frontier_provenance_scope_idx
+            ON fbref_control.frontier_provenance (
+                carried_competition_id, carried_season_id, child_target_id
+            )
+            """,
+            """
+            CREATE OR REPLACE FUNCTION
+                fbref_control.guard_frontier_provenance_append_only()
+            RETURNS trigger
+            LANGUAGE plpgsql
+            AS $body$
+            BEGIN
+                RAISE EXCEPTION 'FBref frontier provenance is append-only';
+            END
+            $body$
+            """,
+            """
+            DROP TRIGGER IF EXISTS guard_frontier_provenance_append_only
+            ON fbref_control.frontier_provenance
+            """,
+            """
+            CREATE TRIGGER guard_frontier_provenance_append_only
+            BEFORE UPDATE OR DELETE ON fbref_control.frontier_provenance
+            FOR EACH ROW EXECUTE FUNCTION
+                fbref_control.guard_frontier_provenance_append_only()
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS fbref_control.season_alias (
+                source text NOT NULL DEFAULT 'fbref',
+                competition_id text NOT NULL,
+                alias text NOT NULL CHECK (btrim(alias) <> ''),
+                season_id text NOT NULL,
+                alias_kind text NOT NULL DEFAULT 'source'
+                    CHECK (alias_kind IN (
+                        'source', 'label', 'url', 'legacy', 'operator'
+                    )),
+                first_snapshot_id uuid
+                    REFERENCES fbref_control.registry_snapshot(snapshot_id),
+                last_snapshot_id uuid
+                    REFERENCES fbref_control.registry_snapshot(snapshot_id),
+                metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+                first_seen_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+                last_seen_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+                PRIMARY KEY (source, competition_id, alias),
+                FOREIGN KEY (source, competition_id, season_id) REFERENCES
+                    fbref_control.season_registry(
+                        source, competition_id, season_id
+                    )
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS season_alias_canonical_idx
+            ON fbref_control.season_alias (
+                source, competition_id, season_id
+            )
+            """,
+            """
+            WITH ranked_current AS (
+                SELECT source, competition_id, season_id,
+                       row_number() OVER edition_order AS current_rank,
+                       first_value(season_id) OVER edition_order
+                           AS retained_season_id
+                FROM fbref_control.season_registry
+                WHERE present AND lifecycle_state = 'present' AND is_current
+                WINDOW edition_order AS (
+                    PARTITION BY source, competition_id
+                    ORDER BY last_seen_at DESC, first_seen_at DESC,
+                             season_id DESC
+                )
+            )
+            UPDATE fbref_control.season_registry AS season
+            SET is_current = false,
+                metadata = COALESCE(season.metadata, '{}'::jsonb)
+                    || jsonb_build_object(
+                        'control_migration_v8_current_dedupe',
+                        jsonb_build_object(
+                            'migration_version', 8,
+                            'reason', 'duplicate_present_current_season',
+                            'retained_season_id',
+                                ranked.retained_season_id
+                        )
+                    )
+            FROM ranked_current AS ranked
+            WHERE ranked.current_rank > 1
+              AND season.source = ranked.source
+              AND season.competition_id = ranked.competition_id
+              AND season.season_id = ranked.season_id
+            """,
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS season_registry_one_current_idx
+            ON fbref_control.season_registry (source, competition_id)
+            WHERE present AND lifecycle_state = 'present' AND is_current
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS
+                fbref_control.registry_reconciliation_override (
+                snapshot_id uuid NOT NULL
+                    REFERENCES fbref_control.registry_snapshot(snapshot_id),
+                override_type text NOT NULL
+                    CHECK (override_type IN ('competition_snapshot_shrink')),
+                reason text NOT NULL CHECK (btrim(reason) <> ''),
+                created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+                PRIMARY KEY (snapshot_id, override_type)
+            )
+            """,
+            """
+            CREATE OR REPLACE FUNCTION
+                fbref_control.guard_registry_override_append_only()
+            RETURNS trigger
+            LANGUAGE plpgsql
+            AS $body$
+            BEGIN
+                RAISE EXCEPTION 'FBref registry override is append-only';
+            END
+            $body$
+            """,
+            """
+            DROP TRIGGER IF EXISTS guard_registry_override_append_only
+            ON fbref_control.registry_reconciliation_override
+            """,
+            """
+            CREATE TRIGGER guard_registry_override_append_only
+            BEFORE UPDATE OR DELETE ON
+                fbref_control.registry_reconciliation_override
+            FOR EACH ROW EXECUTE FUNCTION
+                fbref_control.guard_registry_override_append_only()
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS page_frontier_scope_lookup_idx
+            ON fbref_control.page_frontier (
+                source,
+                (source_ids ->> 'competition_id'),
+                (source_ids ->> 'season_id'),
+                page_kind,
+                state
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS fetch_attempt_unprocessed_raw_idx
+            ON fbref_control.fetch_attempt (
+                started_at, attempt_id, target_id, logical_refresh_id
+            )
+            WHERE status = 'succeeded'
+              AND raw_manifest_key IS NOT NULL
+              AND content_hash IS NOT NULL
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS observation_processing_version_idx
+            ON fbref_control.observation_processing (
+                logical_refresh_id, parser_version, typed_parser_version,
+                stateful_parser_version, status
+            )
+            """,
+        ),
+    ),
+    Migration(
+        version=9,
+        name="publication_generation_lock",
+        statements=(
+            """
+            CREATE TABLE IF NOT EXISTS fbref_control.publication_lock (
+                source text PRIMARY KEY,
+                owner_run_id uuid NOT NULL
+                    REFERENCES fbref_control.crawl_run(run_id),
+                owner_dag_id text NOT NULL CHECK (btrim(owner_dag_id) <> ''),
+                acquired_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+                expires_at timestamptz NOT NULL,
+                released_at timestamptz,
+                metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+                CHECK (expires_at > acquired_at),
+                CHECK (released_at IS NULL OR released_at >= acquired_at)
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS publication_lock_expiry_idx
+            ON fbref_control.publication_lock (expires_at)
+            WHERE released_at IS NULL
+            """,
+        ),
+    ),
 )
 
 

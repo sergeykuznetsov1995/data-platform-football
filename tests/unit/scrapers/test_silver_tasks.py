@@ -4,6 +4,7 @@ Unit tests for Silver Transformation Tasks (dags/utils/silver_tasks.py).
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -90,6 +91,48 @@ class TestResolveSqlPath:
             mod._resolve_sql_path("nonexistent_dir/nonexistent_file.sql")
 
 
+class TestFbrefScopeContext:
+    def test_accepts_and_normalizes_pinned_control_run_uuid(self):
+        mod = _import_silver_tasks()
+        context = {
+            "dag_run": SimpleNamespace(
+                conf={
+                    "fbref_control_run_id": (
+                        "11111111-1111-4111-8111-111111111111"
+                    )
+                }
+            )
+        }
+
+        assert mod.fbref_control_run_id_from_context(context) == (
+            "11111111-1111-4111-8111-111111111111"
+        )
+
+    @pytest.mark.parametrize(
+        "context, message",
+        [
+            ({}, "requires fbref_control_run_id"),
+            (
+                {"dag_run": SimpleNamespace(conf={})},
+                "requires fbref_control_run_id",
+            ),
+            (
+                {
+                    "dag_run": SimpleNamespace(
+                        conf={"fbref_control_run_id": "not-a-uuid"}
+                    )
+                },
+                "must be a UUID",
+            ),
+        ],
+    )
+    def test_rejects_missing_or_invalid_scope_generation(self, context, message):
+        mod = _import_silver_tasks()
+
+        with pytest.raises(ValueError, match=message):
+            mod.fbref_control_run_id_from_context(context)
+
+
 class TestRunSilverTransform:
     """Tests for run_silver_transform function."""
 
@@ -131,6 +174,60 @@ class TestRunSilverTransform:
         # SCHEMA + CREATE OR REPLACE + COUNT
         assert mock_cursor.execute.call_count == 3
         mock_conn.close.assert_called_once()
+
+    def test_fbref_bronze_reads_are_fail_closed_through_male_scope(
+        self, tmp_path
+    ):
+        sql_file = tmp_path / "fbref.sql"
+        sql_file.write_text(
+            "SELECT b.* FROM iceberg.bronze.fbref_player_stats b "
+            "JOIN iceberg.bronze.fbref_schedule s ON true"
+        )
+        mock_conn, mock_cursor = self._make_conn(
+            fetchall_side_effect=[[], [], [[1]]]
+        )
+
+        self._run_transform(
+            mock_conn,
+            sql_file,
+            table_name="scoped_fbref",
+            trino_host="localhost",
+            fbref_control_run_id="11111111-1111-4111-8111-111111111111",
+        )
+
+        ctas_sql = mock_cursor.execute.call_args_list[1][0][0]
+        assert ctas_sql.count("iceberg.bronze.fbref_target_scope") == 2
+        assert ctas_sql.count("__fbref_scope.eligible_male") == 2
+        assert ctas_sql.count(
+            "__fbref_scope.control_run_id = "
+            "'11111111-1111-4111-8111-111111111111'"
+        ) == 2
+        assert "FROM iceberg.bronze.fbref_player_stats AS __fbref_row" in ctas_sql
+        assert "FROM iceberg.bronze.fbref_schedule AS __fbref_row" in ctas_sql
+        assert "source_competition_id" in ctas_sql
+        assert "source_season_id" in ctas_sql
+        assert "__fbref_scope.legacy_league" in ctas_sql
+        assert "__fbref_row.league" in ctas_sql
+        assert "__fbref_scope.legacy_season" in ctas_sql
+        assert "TRY_CAST(NULLIF(TRIM(CAST(__fbref_row.season" in ctas_sql
+        assert "__fbref_scope.scope_kind = 'canonical'" in ctas_sql
+
+    def test_fbref_bronze_read_requires_one_scope_generation(self, tmp_path):
+        sql_file = tmp_path / "fbref.sql"
+        sql_file.write_text(
+            "SELECT * FROM iceberg.bronze.fbref_schedule"
+        )
+        mock_conn, _ = self._make_conn()
+
+        with pytest.raises(
+            ValueError, match="requires fbref_control_run_id"
+        ):
+            self._run_transform(
+                mock_conn,
+                sql_file,
+                table_name="scoped_fbref",
+                trino_host="localhost",
+            )
 
     def test_ctas_sql_contains_partition(self, tmp_path):
         sql_file = tmp_path / "test.sql"

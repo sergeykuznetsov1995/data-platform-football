@@ -39,6 +39,9 @@ class TestFBrefCurrentTopology:
         assert module.dag.schedule == "0 6 * * *"
         assert module.dag._dag_kwargs["max_active_runs"] == 1
         assert module.dag._dag_kwargs["max_active_tasks"] == 1
+        assert module.dag._dag_kwargs["dagrun_timeout"].total_seconds() == (
+            18 * 60 * 60
+        )
         assert (
             module.dag._dag_kwargs["on_failure_callback"].__name__
             == "fbref_dag_failure_callback"
@@ -56,11 +59,9 @@ class TestFBrefCurrentTopology:
         module, tasks = loaded_dag
         params = module.dag._dag_kwargs["params"]
         assert params["request_limit"].default == 200
-        assert params["request_limit"]._kw["minimum"] == 22
-        assert params["request_limit"]._kw["maximum"] == 200
+        assert params["request_limit"]._kw["enum"] == [100, 200]
         assert params["byte_limit_mb"].default == 100
-        assert params["byte_limit_mb"]._kw["minimum"] == 7
-        assert params["byte_limit_mb"]._kw["maximum"] == 100
+        assert params["byte_limit_mb"]._kw["enum"] == [50, 100]
         assert params["shard_size"].default == 25
         assert params["shard_size"]._kw["minimum"] == 1
         assert params["shard_size"]._kw["maximum"] == 25
@@ -69,16 +70,32 @@ class TestFBrefCurrentTopology:
         assert initialize.python_callable.__name__ == "initialize_fbref_run"
         assert initialize.op_kwargs["run_type"] == "current"
         assert initialize.op_kwargs["request_limit"] == (
-            "{{ params.request_limit }}"
+            "{{ dag_run.conf.get('request_limit', params.request_limit) }}"
         )
+        readiness = tasks["validate_production_readiness"]
+        assert readiness.python_callable.__name__ == (
+            "validate_fbref_production_readiness"
+        )
+        assert readiness.downstream_task_ids == {"initialize_run"}
 
     def test_fixed_fetch_parse_waves_are_strictly_sequential(self, loaded_dag):
         module, tasks = loaded_dag
-        assert len(tasks) == 2 * module.CURRENT_WAVE_COUNT + 4
+        assert len(tasks) == 2 * module.CURRENT_WAVE_COUNT + 9
+        assert tasks["validate_production_readiness"].downstream_task_ids == {
+            "initialize_run"
+        }
         assert tasks["initialize_run"].downstream_task_ids == {
+            "acquire_publication_lock"
+        }
+        assert tasks["acquire_publication_lock"].downstream_task_ids == {
             "seed_competition_index"
         }
         assert tasks["seed_competition_index"].downstream_task_ids == {
+            "recover_raw_before_fetch"
+        }
+        recovery = tasks["recover_raw_before_fetch"]
+        assert recovery.python_callable.__name__ == "run_recovery_wave"
+        assert recovery.downstream_task_ids == {
             "fetch_wave_01"
         }
 
@@ -89,13 +106,14 @@ class TestFBrefCurrentTopology:
             parse = tasks[parse_id]
             assert fetch.python_callable.__name__ == "fetch_fbref_wave"
             assert parse.python_callable.__name__ == "parse_fbref_wave"
+            assert fetch._captured_kwargs["retries"] == 0
             assert fetch.op_kwargs["page_kinds"] == module.PAGE_KINDS
             assert parse.op_kwargs["page_kinds"] == module.PAGE_KINDS
             assert fetch.downstream_task_ids == {parse_id}
             expected_next = (
                 f"fetch_wave_{number + 1:02d}"
                 if number < module.CURRENT_WAVE_COUNT
-                else "validate_run"
+                else "validate_current_scope_freshness"
             )
             assert parse.downstream_task_ids == {expected_next}
 
@@ -105,14 +123,24 @@ class TestFBrefCurrentTopology:
             task._captured_kwargs.get("trigger_rule") == "all_success"
             for task in tasks.values()
         )
-        assert tasks["validate_run"].upstream_task_ids == {
+        freshness = tasks["validate_current_scope_freshness"]
+        assert freshness.python_callable.__name__ == (
+            "validate_fbref_current_scope_freshness"
+        )
+        assert freshness.upstream_task_ids == {
             f"parse_wave_{module.CURRENT_WAVE_COUNT:02d}"
         }
+        assert tasks["validate_run"].upstream_task_ids == {
+            "validate_current_scope_freshness"
+        }
         assert tasks["validate_run"].downstream_task_ids == {
+            "export_publication_scope"
+        }
+        assert tasks["export_publication_scope"].downstream_task_ids == {
             "trigger_silver_transform"
         }
         assert tasks["trigger_silver_transform"].upstream_task_ids == {
-            "validate_run"
+            "export_publication_scope"
         }
         source = Path(module.__file__).read_text(encoding="utf-8")
         assert "all_done" not in source
@@ -131,6 +159,8 @@ class TestFBrefCurrentTopology:
             "fbref_silver__{{ dag.dag_id }}__{{ run_id }}"
         )
         assert kwargs["logical_date"] == "{{ ti.start_date }}"
+        assert kwargs["conf"]["publication_scope"] == "fbref_silver_only"
+        assert kwargs["conf"]["trigger_xref"] is False
 
     def test_legacy_transport_tasks_are_absent(self, loaded_dag):
         _, tasks = loaded_dag

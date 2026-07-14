@@ -1,4 +1,4 @@
-"""Fail-closed topology for the FBref Silver -> xref -> Gold handoff."""
+"""Fail-closed source/Silver and separate master xref -> Gold topology."""
 
 from __future__ import annotations
 
@@ -52,22 +52,14 @@ def _timedelta_hours(node: ast.AST) -> int:
 
 
 @pytest.mark.unit
-def test_silver_waits_for_validated_xref_and_never_launches_gold():
-    xref = _literal_trigger("dag_transform_fbref_silver.py", "dag_transform_xref")
-
-    assert _literal(xref["task_id"]) == "trigger_xref_transform"
-    assert _literal(xref["wait_for_completion"]) is True
-    assert _literal(xref["allowed_states"]) == ["success"]
-    assert _literal(xref["failed_states"]) == ["failed"]
-    assert _literal(xref["trigger_rule"]) == "all_success"
-
-    gold_targets = [
+def test_silver_is_fbref_only_and_never_launches_xref_or_gold():
+    publication_targets = [
         call["trigger_dag_id"].value
         for call in _trigger_calls("dag_transform_fbref_silver.py")
         if isinstance(call.get("trigger_dag_id"), ast.Constant)
-        and call["trigger_dag_id"].value == "dag_transform_fbref_gold"
     ]
-    assert gold_targets == []
+    assert "dag_transform_xref" not in publication_targets
+    assert "dag_transform_fbref_gold" not in publication_targets
 
 
 @pytest.mark.unit
@@ -77,7 +69,7 @@ def test_silver_waits_for_validated_xref_and_never_launches_gold():
         ("dag_ingest_fbref.py", "dag_transform_fbref_silver", 12),
         ("dag_backfill_fbref.py", "dag_transform_fbref_silver", 12),
         ("dag_replay_fbref.py", "dag_transform_fbref_silver", 12),
-        ("dag_transform_fbref_silver.py", "dag_transform_xref", 4),
+        ("dag_master_pipeline.py", "dag_transform_xref", 5),
         ("dag_master_pipeline.py", "dag_transform_fbref_gold", 12),
     ],
 )
@@ -118,7 +110,7 @@ def test_fbref_child_runs_have_parent_unique_identity_and_never_share_ds():
 
     assert len(rendered_ids) == len(parents)
 
-    xref = _literal_trigger("dag_transform_fbref_silver.py", "dag_transform_xref")
+    xref = _literal_trigger("dag_master_pipeline.py", "dag_transform_xref")
     assert "{{ dag.dag_id }}" in _literal(xref["trigger_run_id"])
     assert "{{ run_id }}" in _literal(xref["trigger_run_id"])
     assert _literal(xref["logical_date"]) == "{{ ti.start_date }}"
@@ -126,27 +118,29 @@ def test_fbref_child_runs_have_parent_unique_identity_and_never_share_ds():
 
 
 @pytest.mark.unit
-def test_silver_run_timeout_contains_blocking_xref_handoff():
+def test_silver_run_has_a_bounded_fbref_only_timeout():
     dag_calls = _operator_calls("dag_transform_fbref_silver.py", "DAG")
     assert len(dag_calls) == 1
     dag_timeout = _timedelta_hours(dag_calls[0]["dagrun_timeout"])
-    xref = _literal_trigger("dag_transform_fbref_silver.py", "dag_transform_xref")
-    xref_timeout = _timedelta_hours(xref["execution_timeout"])
-
     assert dag_timeout >= 8
-    assert dag_timeout > xref_timeout
 
 
 @pytest.mark.unit
-def test_master_has_one_final_fail_closed_gold_and_no_second_xref_launch():
+def test_master_owns_one_fail_closed_xref_and_one_final_gold_launch():
     calls = _trigger_calls("dag_master_pipeline.py")
     literal_targets = [
         call["trigger_dag_id"].value
         for call in calls
         if isinstance(call.get("trigger_dag_id"), ast.Constant)
     ]
-    assert "dag_transform_xref" not in literal_targets
+    assert literal_targets.count("dag_transform_xref") == 1
     assert literal_targets.count("dag_transform_fbref_gold") == 1
+
+    xref = _literal_trigger("dag_master_pipeline.py", "dag_transform_xref")
+    assert _literal(xref["wait_for_completion"]) is True
+    assert _literal(xref["allowed_states"]) == ["success"]
+    assert _literal(xref["failed_states"]) == ["failed"]
+    assert _literal(xref["trigger_rule"]) == "all_success"
 
     gold = _literal_trigger("dag_master_pipeline.py", "dag_transform_fbref_gold")
     assert _literal(gold["wait_for_completion"]) is True
@@ -193,12 +187,16 @@ def test_master_senses_scheduled_fbref_then_runs_direct_gold_prerequisites():
 
     assert "ingestion_triggers.trigger_fbref" not in tasks
     fbref_sensor = tasks["wait_for_scheduled_fbref"]
+    scope = tasks["resolve_fbref_publication_scope"]
+    xref = tasks["trigger_xref_transforms"]
     e3 = tasks["trigger_e3_transforms"]
     e4 = tasks["trigger_e4_transforms"]
     gold = tasks["trigger_fbref_gold"]
     check = tasks["check_pipeline_success"]
 
-    assert e3.task_id in fbref_sensor.downstream_task_ids
+    assert scope.task_id in fbref_sensor.downstream_task_ids
+    assert xref.task_id in scope.downstream_task_ids
+    assert e3.task_id in xref.downstream_task_ids
     assert e4.task_id in e3.downstream_task_ids
     assert {
         "trigger_silver_transfermarkt",

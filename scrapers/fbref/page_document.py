@@ -20,7 +20,17 @@ from urllib.parse import urlparse
 from bs4 import BeautifulSoup, Comment, Tag
 
 
-PAGE_DOCUMENT_VERSION = "fbref-page-document-v1"
+PAGE_DOCUMENT_VERSION = "fbref-page-document-v2"
+BRONZE_TABLE_CONTRACT_VERSION = "fbref-bronze-contract-v1"
+
+# High-confidence source containers only. Page kinds whose table inventory is
+# legitimately heterogeneous still use the universal material-table gate
+# below; a newly published table is preserved as UNKNOWN and does not fail.
+_REQUIRED_TABLE_PREFIXES: Mapping[str, Tuple[str, ...]] = {
+    "competition": ("seasons",),
+    "schedule": ("sched",),
+}
+_ZERO_TABLE_SEMANTIC_PAGE_KINDS = frozenset({"competition", "season"})
 
 
 class Availability(str, Enum):
@@ -438,6 +448,30 @@ def parse_page_document(
             if parsed.availability != Availability.DUPLICATE:
                 seen_content[parsed.content_signature] = parsed.table_instance_id
             ordinal += 1
+
+    # Generic Bronze inventories source structure; page-kind parsers own its
+    # meaning. Competition card grids and single-match season pages are valid
+    # zero-table shapes, while an empty semantic table is still evidence that
+    # must be persisted with Availability.EMPTY (not rejected pre-semantics).
+    if not tables and page_kind not in _ZERO_TABLE_SEMANTIC_PAGE_KINDS:
+        errors.append("page_contract:no_tables")
+    elif tables:
+        required_prefixes = _REQUIRED_TABLE_PREFIXES.get(page_kind, ())
+        material_ids = {
+            table.table_id.casefold()
+            for table in tables
+            if table.availability
+            not in {Availability.DUPLICATE, Availability.LAYOUT_ONLY}
+        }
+        if required_prefixes and not any(
+            table_id.startswith(prefix)
+            for prefix in required_prefixes
+            for table_id in material_ids
+        ):
+            errors.append(
+                "page_contract:required_table_missing:"
+                + "|".join(required_prefixes)
+            )
     return PageDocument(
         target_id=target_id,
         page_kind=page_kind,
@@ -450,6 +484,7 @@ def parse_page_document(
 
 __all__ = [
     "Availability",
+    "BRONZE_TABLE_CONTRACT_VERSION",
     "PAGE_DOCUMENT_VERSION",
     "PageCell",
     "PageDocument",

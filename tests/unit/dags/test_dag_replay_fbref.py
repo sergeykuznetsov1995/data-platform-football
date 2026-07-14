@@ -42,6 +42,9 @@ class TestFBrefReplayTopology:
             module.dag._dag_kwargs["on_failure_callback"].__name__
             == "fbref_dag_failure_callback"
         )
+        assert module.dag._dag_kwargs["dagrun_timeout"].total_seconds() == (
+            18 * 60 * 60
+        )
         assert set(module.dag._dag_kwargs["params"]) == {
             "source_control_run_id"
         }
@@ -77,9 +80,10 @@ class TestFBrefReplayTopology:
 
     def test_graph_contains_no_fetch_or_seed_task(self, loaded_dag):
         module, tasks = loaded_dag
-        assert len(tasks) == module.REPLAY_WAVE_COUNT + 3
+        assert len(tasks) == module.REPLAY_WAVE_COUNT + 7
         assert not any(task_id.startswith("fetch") for task_id in tasks)
         assert not any(task_id.startswith("seed") for task_id in tasks)
+        assert "recover_raw_before_fetch" not in tasks
         callable_names = {
             task.python_callable.__name__
             for task_id, task in tasks.items()
@@ -88,12 +92,16 @@ class TestFBrefReplayTopology:
         assert "fetch_fbref_wave" not in callable_names
         assert callable_names == {
             "initialize_fbref_run",
+            "acquire_fbref_publication_lock",
+            "export_fbref_publication_scope",
             "parse_fbref_wave",
+            "finalize_fbref_publication_lock",
+            "validate_fbref_production_readiness",
             "validate_fbref_run",
         }
 
     def test_replay_run_has_zero_network_budget(self, loaded_dag):
-        _, tasks = loaded_dag
+        module, tasks = loaded_dag
         initialize = tasks["initialize_run"]
         assert initialize.op_kwargs["run_type"] == "replay"
         assert initialize.op_kwargs["request_limit"] == 0
@@ -104,12 +112,18 @@ class TestFBrefReplayTopology:
                 assert task.op_kwargs["request_limit"] == 0
                 assert task.op_kwargs["byte_limit_mb"] == 0
                 assert task.op_kwargs["source_control_run_id"] == (
-                    "{{ params.source_control_run_id }}"
+                    module.SOURCE_CONTROL_RUN_ID
                 )
 
     def test_offline_shards_are_strictly_sequential(self, loaded_dag):
         module, tasks = loaded_dag
+        assert tasks["validate_production_readiness"].downstream_task_ids == {
+            "initialize_run"
+        }
         assert tasks["initialize_run"].downstream_task_ids == {
+            "acquire_publication_lock"
+        }
+        assert tasks["acquire_publication_lock"].downstream_task_ids == {
             "parse_wave_01"
         }
         for number in range(1, module.REPLAY_WAVE_COUNT + 1):
@@ -125,13 +139,20 @@ class TestFBrefReplayTopology:
         module, tasks = loaded_dag
         assert all(
             task._captured_kwargs.get("trigger_rule") == "all_success"
-            for task in tasks.values()
+            for task_id, task in tasks.items()
+            if task_id != "release_publication_lock"
         )
+        assert tasks["release_publication_lock"]._captured_kwargs[
+            "trigger_rule"
+        ] == "all_done"
         assert tasks["validate_run"].upstream_task_ids == {
             f"parse_wave_{module.REPLAY_WAVE_COUNT:02d}"
         }
+        assert tasks["validate_run"].downstream_task_ids == {
+            "export_publication_scope"
+        }
         trigger = tasks["trigger_silver_transform"]
-        assert trigger.upstream_task_ids == {"validate_run"}
+        assert trigger.upstream_task_ids == {"export_publication_scope"}
         assert trigger._captured_kwargs["wait_for_completion"] is True
         assert trigger._captured_kwargs["failed_states"] == ["failed"]
         assert (
@@ -141,3 +162,5 @@ class TestFBrefReplayTopology:
         assert trigger._captured_kwargs["retries"] == 0
         assert trigger._captured_kwargs["reset_dag_run"] is False
         assert trigger._captured_kwargs["logical_date"] == "{{ ti.start_date }}"
+        assert trigger._captured_kwargs["conf"]["trigger_xref"] is False
+        assert trigger.downstream_task_ids == {"release_publication_lock"}

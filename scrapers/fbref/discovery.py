@@ -26,7 +26,7 @@ from scrapers.fbref.raw_store import (
 )
 
 
-DISCOVERY_PARSER_VERSION = "fbref-discovery-parser-v3"
+DISCOVERY_PARSER_VERSION = "fbref-discovery-parser-v5"
 
 _PAGE_SOURCE_ID_KEYS = {
     "competition": ("competition_id",),
@@ -333,15 +333,65 @@ def _page(
     )
 
 
+_GLOBAL_CHROME_IDS = frozenset({"header", "nav", "footer", "sidebar"})
+_GLOBAL_CHROME_ROLES = frozenset({"banner", "navigation", "contentinfo"})
+_GLOBAL_CHROME_CLASSES = frozenset({"sidebar", "side-bar"})
+
+
+def _inside_global_chrome(node: object) -> bool:
+    """Recognize both semantic tags and FBref's production div wrappers."""
+
+    lineage = [node, *getattr(node, "parents", ())]
+    for ancestor in lineage:
+        if not isinstance(ancestor, Tag):
+            continue
+        if ancestor.name in {"aside", "header", "footer", "nav"}:
+            return True
+        ancestor_id = str(ancestor.get("id") or "").strip().casefold()
+        role = str(ancestor.get("role") or "").strip().casefold()
+        classes = {
+            str(value).strip().casefold()
+            for value in ancestor.get("class", ())
+            if str(value).strip()
+        }
+        if (
+            ancestor_id in _GLOBAL_CHROME_IDS
+            or role in _GLOBAL_CHROME_ROLES
+            or classes.intersection(_GLOBAL_CHROME_CLASSES)
+        ):
+            return True
+    return False
+
+
 def _document_soups(html: str) -> List[BeautifulSoup]:
     """Return the DOM plus comment fragments that can contain FBref tables."""
     root = BeautifulSoup(html or "", "html.parser")
     documents = [root]
     for comment in root.find_all(string=lambda value: isinstance(value, Comment)):
+        if _inside_global_chrome(comment):
+            continue
         text = str(comment)
         if "<table" in text or "href=" in text or "/en/" in text:
-            documents.append(BeautifulSoup(text, "html.parser"))
+            fragment = BeautifulSoup(text, "html.parser")
+            # Comments are detached from their source ancestry when parsed.
+            # Mark the fragment as content so discovery can retain FBref's
+            # comment-hidden tables/links without reopening root-page chrome.
+            content = fragment.new_tag("main")
+            for child in list(fragment.contents):
+                content.append(child.extract())
+            fragment.append(content)
+            documents.append(fragment)
     return documents
+
+
+def _has_page_owned_table(documents: Sequence[BeautifulSoup]) -> bool:
+    """Return whether source content, rather than global chrome, has a table."""
+
+    return any(
+        not _inside_global_chrome(table)
+        for document in documents
+        for table in document.find_all("table")
+    )
 
 
 def _text(value: Optional[Tag]) -> Optional[str]:
@@ -362,6 +412,108 @@ def _cell_text(row: Tag, *names: str) -> Optional[str]:
 
 def _href_path(href: str) -> str:
     return urlparse(str(href).strip()).path
+
+
+def has_valid_zero_table_season_signature(
+    html: str,
+    *,
+    competition_id: str,
+    season_id: str,
+    season_label: Optional[str] = None,
+    canonical_url: Optional[str] = None,
+) -> bool:
+    """Prove that a table-free response is a real FBref season page.
+
+    Some source-owned single-match editions legitimately publish no tables.
+    A generic HTML/error shell has the same coarse shape, so accepting it
+    requires two independent positive signals: the expected season identity
+    in the page heading or canonical URL, and a source-content backlink to the
+    expected competition history.  Navigation/sidebar comments never count.
+    """
+
+    documents = _document_soups(html)
+    if _has_page_owned_table(documents):
+        return False
+
+    expected_competition_id = str(competition_id).strip()
+    expected_season_id = str(season_id).strip()
+    expected_history = (
+        f"/en/comps/{expected_competition_id}/history"
+    ).casefold()
+    history_paths = (
+        _href_path(str(anchor.get("href") or "")).rstrip("/").casefold()
+        for document in documents
+        for anchor in _discovery_anchors(document)
+    )
+    has_history_backlink = any(
+        path == expected_history or path.startswith(expected_history + "/")
+        for path in history_paths
+    )
+    if not has_history_backlink:
+        return False
+
+    identity_values = " ".join(
+        value
+        for value in (expected_season_id, str(season_label or "").strip())
+        if value
+    )
+    identity_years = set(re.findall(r"(?<!\d)(?:19|20)\d{2}(?!\d)", identity_values))
+    heading_identity = False
+    for document in documents:
+        for heading in document.find_all("h1"):
+            if _inside_global_chrome(heading):
+                continue
+            rendered = heading.get_text(" ", strip=True)
+            rendered_years = set(
+                re.findall(r"(?<!\d)(?:19|20)\d{2}(?!\d)", rendered)
+            )
+            if identity_years.intersection(rendered_years):
+                heading_identity = True
+                break
+            if (
+                not identity_years
+                and expected_season_id.casefold() in rendered.casefold()
+            ):
+                heading_identity = True
+                break
+        if heading_identity:
+            break
+
+    expected_canonical_path = (
+        _href_path(canonical_url).rstrip("/").casefold()
+        if canonical_url
+        else ""
+    )
+    canonical_identity = False
+    for document in documents:
+        for link in document.find_all("link", href=True):
+            relation = link.get("rel") or ()
+            if isinstance(relation, str):
+                relation = relation.split()
+            if "canonical" not in {
+                str(value).casefold() for value in relation
+            }:
+                continue
+            candidate_path = _href_path(str(link.get("href") or ""))
+            normalized_candidate = candidate_path.rstrip("/").casefold()
+            if expected_canonical_path and (
+                normalized_candidate == expected_canonical_path
+            ):
+                canonical_identity = True
+                break
+            route = [part for part in candidate_path.split("/") if part]
+            if (
+                len(route) >= 4
+                and route[:2] == ["en", "comps"]
+                and route[2].casefold() == expected_competition_id.casefold()
+                and route[3].casefold() == expected_season_id.casefold()
+            ):
+                canonical_identity = True
+                break
+        if canonical_identity:
+            break
+
+    return heading_identity or canonical_identity
 
 
 def _source_section(anchor: Tag) -> str:
@@ -459,7 +611,7 @@ def parse_competition_index_html(
     errors: List[str] = []
 
     for document in documents:
-        for anchor in document.find_all("a", href=True):
+        for anchor in _discovery_anchors(document):
             href = str(anchor.get("href") or "")
             if _HISTORY_PATH_RE.match(_href_path(href)) is None:
                 continue
@@ -505,6 +657,8 @@ def _find_tables(
     seen_markup: set[str] = set()
     for document in documents:
         for table in document.find_all("table"):
+            if _inside_global_chrome(table):
+                continue
             table_id = str(table.get("id") or "")
             if not predicate(table_id):
                 continue
@@ -516,33 +670,46 @@ def _find_tables(
     return tables
 
 
-def _season_link(row: Tag, comp_id: str) -> Optional[Tag]:
-    preferred = row.find(
+def _season_cell(row: Tag) -> Optional[Tag]:
+    return row.find(
         ["th", "td"],
         attrs={
             "data-stat": lambda value: value
             in {"season", "season_id", "year", "year_id"}
         },
     )
-    anchors = preferred.find_all("a", href=True) if preferred else []
-    anchors.extend(row.find_all("a", href=True))
+
+
+def _season_link(row: Tag, comp_id: str) -> Optional[Tag]:
+    season_cell = _season_cell(row)
+    if season_cell is None:
+        return None
     prefix = f"/en/comps/{comp_id}/"
-    for anchor in anchors:
+    for anchor in season_cell.find_all("a", href=True):
         path = _href_path(str(anchor.get("href") or ""))
         if path.startswith(prefix) and "/history" not in path:
             return anchor
     return None
 
 
-def _rows_are_linked(tables: Sequence[Tag]) -> bool:
-    """True when the seasons table is populated with linked rows.
+def _direct_match_links(row: Tag) -> List[Tag]:
+    """Return source-advertised match reports from one edition row.
 
-    Separates "this competition has no season pages" from "the page did not
-    render its links": the first still carries match/squad anchors per edition.
+    A valid edition row must carry a season/year cell.  Requiring that cell
+    prevents unrelated match links in table chrome from being assigned the
+    competition's season identity.
     """
-    return bool(tables) and any(
-        row.find("a", href=True) for row in tables[0].find_all("tr")
-    )
+
+    season_cell = _season_cell(row)
+    if season_cell is None or _text(season_cell) is None:
+        return []
+    return [
+        anchor
+        for anchor in season_cell.find_all("a", href=True)
+        if _MATCH_PATH_RE.search(
+            _href_path(str(anchor.get("href") or ""))
+        )
+    ]
 
 
 def _season_cards(documents: Sequence[BeautifulSoup], comp_id: str) -> List[Tag]:
@@ -559,6 +726,8 @@ def _season_cards(documents: Sequence[BeautifulSoup], comp_id: str) -> List[Tag]
     for document in documents:
         for grid in document.find_all("div", class_="content_grid"):
             for anchor in grid.find_all("a", href=True):
+                if _inside_global_chrome(anchor):
+                    continue
                 path = _href_path(str(anchor.get("href") or ""))
                 if not path.startswith(prefix):
                     continue
@@ -617,33 +786,74 @@ def parse_competition_html(
     *,
     parser_version: str = DISCOVERY_PARSER_VERSION,
 ) -> DiscoveryPageResult:
-    """Parse exact season links from one competition's history page."""
+    """Parse exact season and direct-match links from a competition history."""
     documents = _document_soups(html)
     tables = _find_tables(documents, lambda table_id: table_id == "seasons")
     if tables:
-        candidates = [
+        body = tables[0].find("tbody")
+        rows = [
+            row
+            for row in (body or tables[0]).find_all("tr", recursive=False)
+            if "thead" not in set(row.get("class") or [])
+            and row.find(["th", "td"], recursive=False) is not None
+            and _text(row)
+        ]
+        row_contract_errors = [
+            f"row[{index}]: no recognized season/year cell"
+            for index, row in enumerate(rows)
+            if _season_cell(row) is None or _text(_season_cell(row)) is None
+        ]
+        rows = [
+            row
+            for row in rows
+            if _season_cell(row) is not None and _text(_season_cell(row))
+        ]
+        season_candidates = [
             (row, _season_link(row, competition.comp_id))
-            for row in tables[0].find_all("tr")
+            for row in rows
+        ]
+        direct_match_candidates = [
+            (row, anchor)
+            for row in rows
+            for anchor in _direct_match_links(row)
         ]
     else:
-        candidates = [
+        row_contract_errors = []
+        season_candidates = [
             (None, anchor)
             for anchor in _season_cards(documents, competition.comp_id)
         ]
-    candidates = [(row, a) for row, a in candidates if a is not None]
-    if not candidates and not tables:
-        result = _dataset(
+        direct_match_candidates = []
+    if not season_candidates and not tables:
+        seasons_result = _dataset(
             "seasons",
             status=DatasetStatus.ERROR,
             reason="season_history_table_missing",
             error_type="CompetitionPageContractError",
             error_message="Expected table#seasons or a season card grid",
         )
-        return _page([result], parser_version=parser_version)
+        matches_result = _dataset(
+            "matches",
+            reason="no_direct_match_links",
+        )
+        return _page(
+            [seasons_result, matches_result], parser_version=parser_version
+        )
 
     seasons: Dict[str, SeasonRef] = {}
-    errors: List[str] = []
-    for row, anchor in candidates:
+    season_ids_by_row: Dict[int, str] = {}
+    season_errors: List[str] = row_contract_errors + [
+        f"{_cell_text(row, 'season', 'season_id', 'year', 'year_id')!r}: "
+        "season cell has neither a season link nor a direct match link"
+        for row, anchor in season_candidates
+        if anchor is None and not _direct_match_links(row)
+    ]
+    season_candidates = [
+        (row, anchor)
+        for row, anchor in season_candidates
+        if anchor is not None
+    ]
+    for row, anchor in season_candidates:
         href = str(anchor.get("href") or "")
         label = (
             (_cell_text(row, "season", "season_id", "year", "year_id")
@@ -652,7 +862,7 @@ def parse_competition_html(
             or ""
         )
         if not label:
-            errors.append(f"{href!r}: empty season label")
+            season_errors.append(f"{href!r}: empty season label")
             continue
         try:
             season_url = canonicalize_fbref_url(href)
@@ -661,8 +871,12 @@ def parse_competition_html(
             )
             calendar_type = _calendar_type(competition, label)
         except Exception as exc:
-            errors.append(f"{label!r}: {type(exc).__name__}: {exc}")
+            season_errors.append(
+                f"{label!r}: {type(exc).__name__}: {exc}"
+            )
             continue
+        if row is not None:
+            season_ids_by_row[id(row)] = season_id
         seasons.setdefault(
             season_id,
             SeasonRef(
@@ -674,29 +888,66 @@ def parse_competition_html(
             ),
         )
 
-    records = list(seasons.values())
-    if errors:
-        result = _dataset(
-            "seasons",
-            records,
-            status=DatasetStatus.ERROR,
-            reason="season_row_parse_failed",
-            error_type="SeasonDiscoveryError",
-            error_message="; ".join(errors)[:1000],
+    direct_matches: Dict[str, MatchRef] = {}
+    match_errors: List[str] = []
+    for row, anchor in direct_match_candidates:
+        href = str(anchor.get("href") or "")
+        label = _cell_text(row, "season", "season_id", "year", "year_id")
+        season_id = season_ids_by_row.get(id(row)) or label
+        if not season_id:
+            match_errors.append(f"{href!r}: empty season label")
+            continue
+        try:
+            target = match_page_target(href)
+            match_id = target.source_ids["match_id"]
+        except Exception as exc:
+            match_errors.append(
+                f"{href!r}: {type(exc).__name__}: {exc}"
+            )
+            continue
+        direct_matches.setdefault(
+            match_id,
+            MatchRef(
+                match_id=match_id,
+                comp_id=competition.comp_id,
+                season_id=season_id,
+                canonical_url=target.canonical_url,
+            ),
         )
-    elif not records and _rows_are_linked(tables):
+
+    season_records = list(seasons.values())
+    match_records = list(direct_matches.values())
+    if season_errors:
+        completely_unlinked = not season_records and not match_records
+        seasons_result = _dataset(
+            "seasons",
+            season_records,
+            status=DatasetStatus.ERROR,
+            reason=(
+                "season_links_missing"
+                if completely_unlinked
+                else "season_row_parse_failed"
+            ),
+            error_type=(
+                "CompetitionPageContractError"
+                if completely_unlinked
+                else "SeasonDiscoveryError"
+            ),
+            error_message="; ".join(season_errors)[:1000],
+        )
+    elif not season_records and match_records:
         # A one-match competition (the FA Community Shield, the super cups) has
         # no season pages at all: every row of its history table links straight
         # to the final's match report. The page is intact and fully populated —
         # a season page simply does not exist to follow — so the wave must not
         # fail on it. Rows carrying no links at all stay a contract error below.
-        result = _dataset(
+        seasons_result = _dataset(
             "seasons",
             status=DatasetStatus.NOT_APPLICABLE,
             reason="competition_publishes_no_season_pages",
         )
-    elif not records:
-        result = _dataset(
+    elif not season_records:
+        seasons_result = _dataset(
             "seasons",
             status=DatasetStatus.ERROR,
             reason="season_links_missing",
@@ -704,8 +955,26 @@ def parse_competition_html(
             error_message="table#seasons has no season links",
         )
     else:
-        result = _dataset("seasons", records)
-    return _page([result], parser_version=parser_version)
+        seasons_result = _dataset("seasons", season_records)
+
+    if match_errors:
+        matches_result = _dataset(
+            "matches",
+            match_records,
+            status=DatasetStatus.ERROR,
+            reason="direct_match_link_parse_failed",
+            error_type="MatchDiscoveryError",
+            error_message="; ".join(match_errors)[:1000],
+        )
+    else:
+        matches_result = _dataset(
+            "matches",
+            match_records,
+            reason=None if match_records else "no_direct_match_links",
+        )
+    return _page(
+        [seasons_result, matches_result], parser_version=parser_version
+    )
 
 
 def parse_season_html(
@@ -716,12 +985,13 @@ def parse_season_html(
 ) -> DiscoveryPageResult:
     """Find the exact Scores & Fixtures link advertised by a season page."""
     documents = _document_soups(html)
+    has_page_owned_table = _has_page_owned_table(documents)
     schedule: Optional[ScheduleRef] = None
     errors: List[str] = []
     expected_prefix = f"/en/comps/{season.comp_id}/"
 
     for document in documents:
-        for anchor in document.find_all("a", href=True):
+        for anchor in _discovery_anchors(document):
             href = str(anchor.get("href") or "")
             path = _href_path(href)
             components = [part.lower() for part in path.split("/") if part]
@@ -752,7 +1022,15 @@ def parse_season_html(
             error_type="ScheduleDiscoveryError",
             error_message="; ".join(errors)[:1000],
         )
-    elif not any(document.find("table") for document in documents):
+    elif not has_page_owned_table and (
+        has_valid_zero_table_season_signature(
+            html,
+            competition_id=season.comp_id,
+            season_id=season.season_id,
+            season_label=season.label,
+            canonical_url=season.season_url,
+        )
+    ):
         # A single-match edition (the UEFA Super Cup) publishes a season page
         # with no fixtures and no tables at all: there is nothing to schedule.
         # A season page that does carry tables but advertises no schedule is a
@@ -761,6 +1039,18 @@ def parse_season_html(
             "schedules",
             status=DatasetStatus.NOT_APPLICABLE,
             reason="season_publishes_no_schedule",
+        )
+    elif not has_page_owned_table:
+        result = _dataset(
+            "schedules",
+            status=DatasetStatus.ERROR,
+            reason="zero_table_season_identity_missing",
+            error_type="SeasonPageContractError",
+            error_message=(
+                "A table-free season page must prove its source identity with "
+                "the expected heading/canonical URL and competition history "
+                "backlink"
+            ),
         )
     elif not _COMPETITION_ID_RE.match(season.comp_id):
         # FBref addresses its aggregate views by name rather than by id (comp
@@ -977,6 +1267,40 @@ def _current_season_competition(url: Optional[str]) -> Optional[str]:
     return None if _has_season_component(route) else route[1]
 
 
+def _discovery_anchors(document: BeautifulSoup) -> List[Tag]:
+    """Return links from page-owned content, excluding global navigation.
+
+    Production FBref pages keep their source data below ``main``/``#content``
+    or in tables (including comment-unwrapped tables). Header, footer,
+    navigation and other root-page chrome are never source-owned discovery
+    evidence. Bare stored/test fragments retain their root links because they
+    have no full-document ``html``/``body`` chrome to confuse with content.
+    """
+
+    contexts: List[Tag] = []
+    contexts.extend(document.find_all("main"))
+    contexts.extend(document.find_all(id="content"))
+    contexts.extend(document.find_all("table"))
+    scoped: List[Tag] = []
+    seen: set[int] = set()
+    if contexts:
+        anchor_groups = (
+            context.find_all("a", href=True) for context in contexts
+        )
+    elif document.find(["html", "body"]) is None:
+        anchor_groups = (document.find_all("a", href=True),)
+    else:
+        anchor_groups = ()
+    for anchors in anchor_groups:
+        for anchor in anchors:
+            key = id(anchor)
+            if key in seen:
+                continue
+            seen.add(key)
+            scoped.append(anchor)
+    return [anchor for anchor in scoped if not _inside_global_chrome(anchor)]
+
+
 def discover_page_links(
     html: str,
     *,
@@ -994,7 +1318,7 @@ def discover_page_links(
     current_season_parent = _current_season_competition(parent_url)
     found: Dict[tuple[str, str], DiscoveredPageLink] = {}
     for document in _document_soups(html):
-        for anchor in document.find_all("a", href=True):
+        for anchor in _discovery_anchors(document):
             href = str(anchor.get("href") or "").strip()
             if not href:
                 continue
@@ -1128,6 +1452,7 @@ __all__ = [
     "parse_season_html",
     "competition_eligibility",
     "discover_page_links",
+    "has_valid_zero_table_season_signature",
     "partition_competitions",
     "normalize_page_source_ids",
     "sentinel_coverage",
