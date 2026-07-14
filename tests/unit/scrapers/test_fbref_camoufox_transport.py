@@ -1,5 +1,6 @@
 """Network-free tests for the single FBref Camoufox clearance transport."""
 
+import threading
 from unittest.mock import MagicMock
 
 import pytest
@@ -510,6 +511,31 @@ def test_teardown_conservatively_charges_still_inflight_reservations():
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("cleanup", ["stop", "abort"])
+def test_inflight_cleanup_clears_repeated_url_indexes(cleanup):
+    overhead = BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
+    url = "https://fbref.com/en/repeated"
+    transport = CamoufoxFbrefTransport(max_network_bytes=4 * overhead)
+    first = _Route(url=url)
+    second = _Route(url=url)
+    transport._maybe_block(first)
+    transport._maybe_block(second)
+
+    assert len(transport._inflight_ids_by_url[url]) == 2
+    if cleanup == "stop":
+        transport._stop()
+    else:
+        transport._abort_session_for_byte_budget("test_cleanup")
+
+    assert transport._inflight_byte_reservations == {}
+    assert transport._inflight_request_urls == {}
+    assert transport._inflight_ids_by_url == {}
+    stats = transport.traffic_stats()
+    assert stats["inflight_reserved_bytes"] == 0
+    assert stats["unobserved_reserved_bytes"] == 2 * overhead
+
+
+@pytest.mark.unit
 def test_browser_rejects_single_declared_body_larger_than_remaining_cap():
     overhead = BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
     transport = CamoufoxFbrefTransport(max_network_bytes=overhead + 9)
@@ -754,18 +780,31 @@ def test_a_wedged_solve_is_killed_by_the_attempt_deadline(monkeypatch):
     """The solve loop checks its own deadline between polls — but a wedged
     evaluate() blocks before the check. The killed browser must surface as a
     failed attempt, not as an exception out of fetch."""
-    monkeypatch.setattr(
-        "scrapers.fbref.camoufox_fetch.threading.Timer",
-        lambda interval, function, args=(): MagicMock(),
-    )
     transport = CamoufoxFbrefTransport(proxy={"server": "http://p:1"})
+    transport.BROWSER_ATTEMPT_TIMEOUT_S = 0.01
+    watchdog_fired = threading.Event()
+    killed_phases = []
+
+    def kill_browser(phase="start", timeout_s=None):
+        killed_phases.append((phase, timeout_s))
+        watchdog_fired.set()
+
+    def wedged_solve():
+        assert watchdog_fired.wait(1), "real watchdog Timer did not fire"
+        watchdog_fired.clear()
+        raise RuntimeError("Target closed")
+
+    monkeypatch.setattr(transport, "_kill_browser_processes", kill_browser)
     transport._page = MagicMock()
     transport._solve_current_page = MagicMock(  # type: ignore[method-assign]
-        side_effect=RuntimeError("Target closed")
+        side_effect=wedged_solve
     )
     transport._restart = MagicMock()  # type: ignore[method-assign]
 
     assert transport.fetch("https://fbref.com/en/") is None
+    assert killed_phases == [
+        ("challenge solve", transport.BROWSER_ATTEMPT_TIMEOUT_S)
+    ] * (transport.MAX_PROXY_ROTATIONS + 1)
     assert transport._restart.call_count == transport.MAX_PROXY_ROTATIONS
 
 
@@ -796,3 +835,24 @@ def test_traffic_is_billed_once_per_bootstrap_not_once_per_target():
     third = transport.traffic_delta()
     assert third["real_bytes_downloaded"] == 1_100_000
     assert third["real_requests_count"] == 21
+
+
+def test_traffic_delta_never_bills_a_falling_reservation_gauge_negative():
+    transport = CamoufoxFbrefTransport(proxy={"server": "http://p:1"})
+    transport._inflight_reserved_bytes = 1_000
+
+    first = transport.traffic_delta()
+    assert first["inflight_reserved_bytes"] == 1_000
+
+    transport._inflight_reserved_bytes = 0
+    second = transport.traffic_delta()
+    assert second["inflight_reserved_bytes"] == 0
+    assert second["budget_unobserved_bytes"] == 0
+    assert second["budget_bytes_consumed"] == 0
+
+    # The baseline follows the gauge down, so a later reservation is charged
+    # normally instead of being hidden behind the old high-water mark.
+    transport._inflight_reserved_bytes = 250
+    third = transport.traffic_delta()
+    assert third["inflight_reserved_bytes"] == 250
+    assert third["budget_unobserved_bytes"] == 250

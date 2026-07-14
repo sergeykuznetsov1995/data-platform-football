@@ -41,6 +41,33 @@ class FrontierTarget:
 
 
 @dataclass(frozen=True)
+class FrontierProvenance:
+    """Immutable evidence that one parsed page discovered another target."""
+
+    parent_target_id: str
+    child_target_id: str
+    relation: str
+    parent_content_hash: str
+    parser_version: str
+    carried_competition_id: Optional[str] = None
+    carried_season_id: Optional[str] = None
+    logical_refresh_id: Optional[str] = None
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class SeasonAlias:
+    """A source/legacy season token mapped to one canonical season row."""
+
+    competition_id: str
+    alias: str
+    season_id: str
+    alias_kind: str = "source"
+    source: str = "fbref"
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class CohortTarget:
     target_id: str
     logical_refresh_id: str

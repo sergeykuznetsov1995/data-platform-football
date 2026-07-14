@@ -23,7 +23,9 @@ from scrapers.fbref.control import (
     BudgetExceeded,
     CompetitionRegistryEntry,
     ControlStore,
+    FrontierProvenance,
     FrontierTarget,
+    SeasonAlias,
     SeasonRegistryEntry,
     StateConflict,
     make_control_run_id,
@@ -179,6 +181,32 @@ class PipelineSettings:
             raise ValueError(
                 "target_request_reservation must cover both HTTP attempts"
             )
+
+
+def wave_target_capacity(
+    settings: PipelineSettings,
+    *,
+    request_remaining: Optional[int] = None,
+    byte_remaining: Optional[int] = None,
+) -> int:
+    """Return the exact cohort that the current request/byte budget can fund."""
+
+    requests = (
+        settings.request_limit
+        if request_remaining is None
+        else max(0, int(request_remaining))
+    )
+    bytes_available = (
+        settings.byte_limit
+        if byte_remaining is None
+        else max(0, int(byte_remaining))
+    )
+    byte_capacity = bytes_available // settings.request_reservation_bytes
+    request_capacity = (
+        max(0, requests - settings.bootstrap_request_reservation)
+        // settings.target_request_reservation
+    )
+    return min(settings.shard_size, request_capacity, byte_capacity)
 
 
 @dataclass
@@ -643,15 +671,11 @@ class FBrefPipeline:
             - int(run.get("bytes_used") or 0)
             - int(run.get("bytes_reserved") or 0),
         )
-        byte_capacity = byte_remaining // settings.request_reservation_bytes
-        request_capacity = (
-            max(
-                0,
-                request_remaining - settings.bootstrap_request_reservation,
-            )
-            // settings.target_request_reservation
+        return wave_target_capacity(
+            settings,
+            request_remaining=request_remaining,
+            byte_remaining=byte_remaining,
         )
-        return min(settings.shard_size, request_capacity, byte_capacity)
 
     def _wait_for_slot(self, scheduled_at: datetime) -> None:
         wait_seconds = max(
@@ -813,15 +837,18 @@ class FBrefPipeline:
                 response = None
                 budget_settled = False
                 try:
-                    # Only exact logical-refresh crash recovery is safe. A
-                    # prior recurring snapshot may predate a match final or a
-                    # season rollover, so one-shot policy transitions must
-                    # perform their own final network refresh.
+                    # Exact logical-refresh crash recovery is always safe.
+                    # Historical targets are immutable by contract, so they
+                    # may additionally adopt the latest verified raw-v2 (or
+                    # legacy raw-v1) observation across control runs.  Current
+                    # targets still require an exact refresh: an older page may
+                    # predate a match final or a season rollover.
                     frontier = self.control.get_frontier_target(
                         lease.target_id
                     ) or {}
-                    recoverable = self.raw_store.has_fetch(
-                        lease.logical_refresh_id
+                    recoverable = (
+                        self.raw_store.has_fetch(lease.logical_refresh_id)
+                        or frontier.get("refresh_policy") == "historical_once"
                     )
                     if recoverable:
                         record = self.raw_store.import_fetch_from_available_raw(
@@ -1152,38 +1179,119 @@ class FBrefPipeline:
         *,
         historical: bool,
         refresh_policy: Optional[str] = None,
+        parent_record: Optional[RawFetchRecord] = None,
+        reconcile_after: bool = True,
     ) -> tuple[int, int]:
         eligible = set(self._eligible_competitions())
-        seeded = 0
-        skipped = 0
-        seen_targets: set[str] = set()
+        seeded_targets: set[str] = set()
+        skipped_targets: set[str] = set()
+        upserted_targets: set[str] = set()
+
+        parent_scopes: set[tuple[Optional[str], Optional[str]]] = set()
+        if parent_record is not None:
+            parent_competition = parent_record.source_ids.get(
+                "competition_id"
+            )
+            parent_season = parent_record.source_ids.get("season_id")
+            if parent_competition:
+                parent_scopes.add((
+                    str(parent_competition),
+                    None if parent_season is None else str(parent_season),
+                ))
+            else:
+                list_provenance = getattr(
+                    self.control, "list_frontier_provenance", None
+                )
+                if list_provenance is not None:
+                    for edge in list_provenance(
+                        child_target_id=parent_record.target_id,
+                        limit=1000,
+                    ):
+                        competition_id = edge.get(
+                            "carried_competition_id"
+                        )
+                        season_id = edge.get("carried_season_id")
+                        parent_scopes.add((
+                            None
+                            if competition_id is None
+                            else str(competition_id),
+                            None if season_id is None else str(season_id),
+                        ))
         for link in links:
             source_ids = dict(link.source_ids)
-            competition_id = source_ids.get("competition_id")
-            if competition_id and str(competition_id) not in eligible:
-                skipped += 1
-                continue
             target = page_target_from_link(link)
-            if target.target_id in seen_targets:
-                continue
-            seen_targets.add(target.target_id)
-            prepared = frontier_target(target, historical=historical)
-            if refresh_policy is not None:
-                prepared = FrontierTarget(
-                    target_id=prepared.target_id,
-                    page_kind=prepared.page_kind,
-                    canonical_url=prepared.canonical_url,
-                    source_ids=prepared.source_ids,
-                    refresh_policy=refresh_policy,
-                    priority=prepared.priority,
-                    next_fetch_at=prepared.next_fetch_at,
-                    source=prepared.source,
-                )
-            self.control.upsert_frontier_target(
-                prepared
+            if target.target_id not in upserted_targets:
+                prepared = frontier_target(target, historical=historical)
+                if refresh_policy is not None:
+                    prepared = FrontierTarget(
+                        target_id=prepared.target_id,
+                        page_kind=prepared.page_kind,
+                        canonical_url=prepared.canonical_url,
+                        source_ids=prepared.source_ids,
+                        refresh_policy=refresh_policy,
+                        priority=prepared.priority,
+                        next_fetch_at=prepared.next_fetch_at,
+                        source=prepared.source,
+                    )
+                self.control.upsert_frontier_target(prepared)
+                upserted_targets.add(target.target_id)
+
+            link_competition = source_ids.get("competition_id")
+            link_season = source_ids.get("season_id")
+            scopes = (
+                {(
+                    str(link_competition),
+                    None if link_season is None else str(link_season),
+                )}
+                if link_competition is not None
+                else parent_scopes or {(None, None)}
             )
-            seeded += 1
-        return seeded, skipped
+            male_scope = any(
+                competition_id is not None
+                and competition_id in eligible
+                for competition_id, _ in scopes
+            )
+            if male_scope:
+                seeded_targets.add(target.target_id)
+            else:
+                skipped_targets.add(target.target_id)
+
+            if parent_record is not None:
+                record_provenance = getattr(
+                    self.control, "record_frontier_provenance", None
+                )
+                if record_provenance is not None:
+                    for competition_id, season_id in sorted(
+                        scopes,
+                        key=lambda scope: (
+                            scope[0] or "", scope[1] or ""
+                        ),
+                    ):
+                        record_provenance(FrontierProvenance(
+                            parent_target_id=parent_record.target_id,
+                            child_target_id=target.target_id,
+                            relation=f"page_link:{link.page_kind}",
+                            carried_competition_id=competition_id,
+                            carried_season_id=season_id,
+                            parent_content_hash=parent_record.content_hash,
+                            parser_version=DISCOVERY_PARSER_VERSION,
+                            logical_refresh_id=(
+                                parent_record.logical_refresh_id
+                            ),
+                            metadata={
+                                "child_page_kind": link.page_kind,
+                            },
+                        ))
+        if parent_record is not None and reconcile_after:
+            self._reconcile_frontier_scope()
+        return len(seeded_targets), len(skipped_targets)
+
+    def _reconcile_frontier_scope(self) -> None:
+        reconcile_scope = getattr(
+            self.control, "reconcile_frontier_scope", None
+        )
+        if reconcile_scope is not None:
+            reconcile_scope(source="fbref")
 
     def _parse_competition_index(
         self,
@@ -1211,18 +1319,23 @@ class FBrefPipeline:
         self.control.reconcile_competitions(
             snapshot_id, [_registry_entry(item) for item in competitions]
         )
-        seeded = 0
+        links: list[DiscoveredPageLink] = []
         skipped = 0
         for competition in competitions:
             if competition_eligibility(competition).value != "eligible":
                 skipped += 1
                 continue
-            target = competition_page_target(
-                competition.competition_id, competition.history_url
-            )
-            self.control.upsert_frontier_target(frontier_target(target))
-            seeded += 1
-        return seeded, skipped
+            links.append(DiscoveredPageLink(
+                page_kind="competition",
+                canonical_url=competition.history_url,
+                source_ids={
+                    "competition_id": competition.competition_id,
+                },
+            ))
+        seeded, rejected = self._seed_links(
+            links, historical=False, parent_record=record
+        )
+        return seeded, skipped + rejected
 
     def _parse_competition(
         self,
@@ -1242,6 +1355,7 @@ class FBrefPipeline:
         competition = _competition_from_registry(row)
         parsed = parse_competition_html(html, competition)
         seasons = parsed.datasets["seasons"].records
+        direct_matches = parsed.datasets["matches"].records
         snapshot_id = self.control.create_registry_snapshot(
             snapshot_id=_registry_snapshot_id(record),
             run_id=run_id,
@@ -1258,40 +1372,149 @@ class FBrefPipeline:
                 f"Season discovery failed for competition {competition_id}"
             )
         current_label = competition.last_season
-        current_indexes = {
+        current_candidates = [
             index
             for index, season in enumerate(seasons)
             if current_label and season.label == current_label
-        }
-        if not current_indexes and seasons:
-            current_indexes = {0}
+        ]
+        if current_candidates:
+            # FBref occasionally publishes two history URLs with the same
+            # display label (competition 612 did so for "2025"). A current
+            # edition is singular: prefer the source ID that exactly matches
+            # the advertised label, then the first/newest history row.
+            canonical_current = min(
+                current_candidates,
+                key=lambda index: (
+                    seasons[index].season_id != current_label,
+                    index,
+                ),
+            )
+            current_season_id = seasons[canonical_current].season_id
+        elif current_label and any(
+            match.season_id == current_label for match in direct_matches
+        ):
+            current_season_id = current_label
+        else:
+            current_season_id = (
+                seasons[0].season_id
+                if seasons
+                else direct_matches[0].season_id
+                if direct_matches
+                else None
+            )
+
         entries = [
             SeasonRegistryEntry(
                 competition_id=competition_id,
                 season_id=season.season_id,
                 canonical_url=season.season_url,
                 label=season.label,
-                is_current=index in current_indexes,
+                is_current=season.season_id == current_season_id,
                 metadata={"calendar_type": season.calendar_type.value},
             )
-            for index, season in enumerate(seasons)
+            for season in seasons
         ]
+        registered_season_ids = {entry.season_id for entry in entries}
+        for match in direct_matches:
+            if match.season_id in registered_season_ids:
+                continue
+            # Some competition histories link an edition straight to its only
+            # match report.  The edition still belongs in the registry: scope
+            # reconciliation must be able to prove that the carried season is
+            # an active male edition even though no season page exists.
+            entries.append(SeasonRegistryEntry(
+                competition_id=competition_id,
+                season_id=match.season_id,
+                canonical_url=match.canonical_url,
+                label=match.season_id,
+                is_current=match.season_id == current_season_id,
+                metadata={
+                    "calendar_type": CalendarType.TOURNAMENT.value,
+                    "direct_match_only": True,
+                },
+            ))
+            registered_season_ids.add(match.season_id)
         self.control.reconcile_seasons(snapshot_id, competition_id, entries)
+        upsert_alias = getattr(self.control, "upsert_season_alias", None)
+        if upsert_alias is not None:
+            for entry in entries:
+                upsert_alias(SeasonAlias(
+                    competition_id=competition_id,
+                    alias=entry.season_id,
+                    season_id=entry.season_id,
+                    alias_kind="source",
+                ), snapshot_id=snapshot_id)
+            by_label: dict[str, list[SeasonRegistryEntry]] = {}
+            for entry in entries:
+                if entry.label:
+                    by_label.setdefault(str(entry.label), []).append(entry)
+            for label, candidates in by_label.items():
+                canonical = min(
+                    candidates,
+                    key=lambda entry: (
+                        not entry.is_current,
+                        entry.season_id != label,
+                        entry.season_id,
+                    ),
+                )
+                upsert_alias(SeasonAlias(
+                    competition_id=competition_id,
+                    alias=label,
+                    season_id=canonical.season_id,
+                    alias_kind="label",
+                ), snapshot_id=snapshot_id)
         seeded = 0
-        for index, season in enumerate(seasons):
-            is_current = index in current_indexes
+        skipped = 0
+        for season in seasons:
+            is_current = season.season_id == current_season_id
             if run_type == "current" and not is_current:
                 continue
             if run_type == "backfill" and is_current:
                 continue
-            target = season_page_target(
-                competition_id, season.season_id, season.season_url
+            added, rejected = self._seed_links(
+                [DiscoveredPageLink(
+                    page_kind="season",
+                    canonical_url=season.season_url,
+                    source_ids={
+                        "competition_id": competition_id,
+                        "season_id": season.season_id,
+                    },
+                )],
+                historical=not is_current,
+                parent_record=record,
+                reconcile_after=False,
             )
-            self.control.upsert_frontier_target(
-                frontier_target(target, historical=not is_current)
+            seeded += added
+            skipped += rejected
+        for match in direct_matches:
+            is_current = match.season_id == current_season_id
+            # Inventory every direct edition while the authoritative history
+            # page is in hand. Current fetch waves claim only
+            # ``current_completed_once``; backfill waves claim only
+            # ``historical_once``, so recording both policies here makes old
+            # one-match finals reachable without charging the current crawl.
+            direct_seeded, direct_skipped = self._seed_links(
+                [DiscoveredPageLink(
+                    page_kind="match",
+                    canonical_url=match.canonical_url,
+                    source_ids={
+                        "competition_id": match.comp_id,
+                        "season_id": match.season_id,
+                        "match_id": match.match_id,
+                    },
+                )],
+                historical=not is_current,
+                refresh_policy=(
+                    "current_completed_once" if is_current
+                    else "historical_once"
+                ),
+                parent_record=record,
+                reconcile_after=False,
             )
-            seeded += 1
-        return seeded, 0
+            seeded += direct_seeded
+            skipped += direct_skipped
+        self._reconcile_frontier_scope()
+        return seeded, skipped
 
     @staticmethod
     def _season_ref(record: RawFetchRecord) -> SeasonRef:
@@ -1363,6 +1586,8 @@ class FBrefPipeline:
                         if historical or match.canonical_url not in completed_urls
                         else "current_completed_once"
                     ),
+                    parent_record=record,
+                    reconcile_after=False,
                 )
                 directly_seeded += seeded
                 directly_skipped += skipped
@@ -1383,7 +1608,13 @@ class FBrefPipeline:
             if page_target_from_link(link).target_id != record.target_id
         ]
         links.extend(discovered)
-        seeded, skipped = self._seed_links(links, historical=historical)
+        seeded, skipped = self._seed_links(
+            links,
+            historical=historical,
+            parent_record=record,
+            reconcile_after=False,
+        )
+        self._reconcile_frontier_scope()
         return directly_seeded + seeded, directly_skipped + skipped
 
     def _persist_generic(
@@ -1704,6 +1935,19 @@ class FBrefPipeline:
             html, record, historical=historical
         )
 
+    def _validate_pre_promotion_contract(
+        self, html: str, record: RawFetchRecord
+    ) -> None:
+        """Reject ambiguous source shells before replacing typed Bronze data."""
+
+        if record.page_kind != "season":
+            return
+        parsed = parse_season_html(html, self._season_ref(record))
+        if parsed.has_errors:
+            raise ParseWaveError(
+                f"Season source contract failed for {record.target_id}"
+            )
+
     def parse_wave(
         self,
         run_id: str,
@@ -1711,6 +1955,7 @@ class FBrefPipeline:
         page_kinds: Sequence[str],
         settings: PipelineSettings,
         source_run_id: Optional[str] = None,
+        _recover_cross_run: bool = False,
     ) -> WaveResult:
         """Parse and persist a bounded handoff using raw storage only."""
 
@@ -1724,7 +1969,19 @@ class FBrefPipeline:
             source_run = self.control.get_run(source_run_id)
             stateful_run_id = str(source_run_id)
             stateful_run_type = str(source_run["run_type"])
-        if source_run_id:
+        if _recover_cross_run:
+            if settings.run_type == "replay" or source_run_id is not None:
+                raise ParseWaveError(
+                    "Cross-run recovery is not a replay source selector"
+                )
+            fetches = self.control.list_unprocessed_fetches(
+                parser_version=PAGE_DOCUMENT_VERSION,
+                typed_parser_version=TYPED_BRONZE_PARSER_VERSION,
+                stateful_parser_version=DISCOVERY_PARSER_VERSION,
+                page_kinds=page_kinds,
+                limit=settings.shard_size,
+            )
+        elif source_run_id:
             fetches = self.control.list_replay_fetches(
                 source_run_id,
                 parser_version=PAGE_DOCUMENT_VERSION,
@@ -1743,8 +2000,20 @@ class FBrefPipeline:
                 stateful_parser_version=DISCOVERY_PARSER_VERSION,
                 limit=settings.shard_size,
             )
-        historical = stateful_run_type == "backfill"
+        result.cohort_size = len(fetches)
         for item in fetches:
+            item_stateful_run_id = stateful_run_id
+            item_stateful_run_type = stateful_run_type
+            if _recover_cross_run:
+                item_stateful_run_id = str(item["run_id"])
+                item_stateful_run_type = str(
+                    item.get("source_run_type")
+                    or (
+                        self.control.get_run(item_stateful_run_id) or {}
+                    ).get("run_type")
+                    or "current"
+                )
+            historical = item_stateful_run_type == "backfill"
             logical_refresh_id = str(item["logical_refresh_id"])
             record = None
             page = None
@@ -1778,6 +2047,7 @@ class FBrefPipeline:
                 )
                 if observation_lease is None:
                     continue
+                result.claimed += 1
                 page = self._persist_generic(run_id, html, record)
                 typed_page = record.page_kind in {
                     "schedule",
@@ -1800,6 +2070,7 @@ class FBrefPipeline:
                             f"{record.target_id}"
                         )
                     if is_latest:
+                        self._validate_pre_promotion_contract(html, record)
                         if typed_page:
                             if self._typed_context(record) is None:
                                 raise TypedBronzeError(
@@ -1812,10 +2083,10 @@ class FBrefPipeline:
                         else:
                             typed_status = "skipped"
                         seeded, skipped = self._apply_stateful_effects(
-                            stateful_run_id,
+                            item_stateful_run_id,
                             html,
                             record,
-                            run_type=stateful_run_type,
+                            run_type=item_stateful_run_type,
                             historical=historical,
                         )
                         stateful_status = "succeeded"
@@ -1845,6 +2116,15 @@ class FBrefPipeline:
                         self._record_page_completion(
                             record, page, succeeded=False, error=exc
                         )
+                    except StateConflict:
+                        # A prior retry may already have committed immutable
+                        # completion evidence for these exact bytes/parser.
+                        # Preserve it and, critically, do not mask the error
+                        # that caused this processing attempt to fail.
+                        logger.warning(
+                            "Failure completion marker for %s already exists",
+                            record.target_id,
+                        )
                     except Exception as manifest_exc:
                         result.failures.append(
                             f"{item['target_id']}:manifest:"
@@ -1868,6 +2148,27 @@ class FBrefPipeline:
         if result.failures:
             raise ParseWaveError("; ".join(result.failures))
         return result
+
+    def recover_unprocessed_wave(
+        self,
+        run_id: str,
+        *,
+        page_kinds: Sequence[str],
+        settings: PipelineSettings,
+    ) -> WaveResult:
+        """Drain committed raw left unprocessed by any earlier source run.
+
+        This is deliberately invoked before a current/backfill fetch wave so
+        parse failure can never strand immutable S3 raw behind a terminal
+        parent run or trigger a needless paid re-fetch.
+        """
+
+        return self.parse_wave(
+            run_id,
+            page_kinds=page_kinds,
+            settings=settings,
+            _recover_cross_run=True,
+        )
 
     def validate_and_finish(
         self,
@@ -1903,7 +2204,9 @@ class FBrefPipeline:
             errors.append(f"incomplete_targets={incomplete}")
         if dataset_failures:
             errors.append(f"failed_dataset_manifests={dataset_failures}")
-        if int(summary.get("unvalidated_target_count") or 0) != 0:
+        if "unvalidated_target_count" not in summary:
+            errors.append("unvalidated_target_count_missing")
+        elif int(summary.get("unvalidated_target_count") or 0) != 0:
             errors.append(
                 "unvalidated_target_count="
                 f"{int(summary['unvalidated_target_count'])}"
@@ -1971,6 +2274,58 @@ class FBrefPipeline:
             errors.append("female_downstream_targets_nonzero")
         if int(summary.get("unknown_gender_downstream_targets") or 0) != 0:
             errors.append("unknown_gender_downstream_targets_nonzero")
+        if "unknown_gender_registry_count" not in summary:
+            errors.append("unknown_gender_registry_count_missing")
+        elif int(summary.get("unknown_gender_registry_count") or 0) != 0:
+            errors.append(
+                "unknown_gender_registry_count="
+                f"{int(summary['unknown_gender_registry_count'])}"
+            )
+        if "unprocessed_raw_count" not in summary:
+            errors.append("unprocessed_raw_count_missing")
+        elif int(summary.get("unprocessed_raw_count") or 0) != 0:
+            errors.append(
+                "unprocessed_raw_count="
+                f"{int(summary['unprocessed_raw_count'])}"
+            )
+        if "global_unprocessed_raw_sla_overdue_count" not in summary:
+            errors.append("global_unprocessed_raw_sla_overdue_count_missing")
+        elif int(
+            summary.get("global_unprocessed_raw_sla_overdue_count") or 0
+        ) != 0:
+            errors.append(
+                "global_unprocessed_raw_sla_overdue_count="
+                f"{int(summary['global_unprocessed_raw_sla_overdue_count'])}"
+            )
+
+        crawlable_scope = summary.get("crawlable_frontier_scope_counts")
+        if not isinstance(crawlable_scope, Mapping):
+            errors.append("crawlable_frontier_scope_counts_missing")
+        else:
+            invalid_crawlable = {
+                str(status): int(count)
+                for status, count in crawlable_scope.items()
+                if status != "eligible_male" and int(count) > 0
+            }
+            if invalid_crawlable:
+                errors.append(
+                    f"crawlable_out_of_scope_targets={invalid_crawlable}"
+                )
+            if int(crawlable_scope.get("eligible_male") or 0) <= 0:
+                errors.append("crawlable_male_scope_empty")
+
+        if str(summary.get("run_type") or "").lower() != "replay":
+            freshness = summary.get("current_scope_freshness")
+            if not isinstance(freshness, Mapping):
+                errors.append("current_scope_freshness_missing")
+            else:
+                if int(freshness.get("total_targets") or 0) <= 0:
+                    errors.append("current_scope_freshness_empty")
+                if not bool(freshness.get("all_within_sla")):
+                    errors.append(
+                        "current_scope_stale_targets="
+                        f"{int(freshness.get('stale_targets') or 0)}"
+                    )
         if str(summary.get("run_type") or "").lower() != "replay":
             errors.extend(
                 _sentinel_gate_errors(summary.get("sentinel_coverage"))
@@ -2006,4 +2361,5 @@ __all__ = [
     "WaveResult",
     "frontier_target",
     "page_target_from_link",
+    "wave_target_capacity",
 ]

@@ -63,7 +63,7 @@ Other:
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict
 
 from airflow import DAG
@@ -283,6 +283,7 @@ def _run_transform(
     **_ctx,
 ) -> Dict[str, Any]:
     from utils.gold_tasks import run_gold_transform
+    from utils.silver_tasks import fbref_control_run_id_from_context
 
     if table_name in {
         'dim_manager_legacy', 'fct_player_market_value_legacy',
@@ -306,6 +307,7 @@ def _run_transform(
         fallback_sql_file=fallback_sql_file,
         require_silver=require_silver,
         add_timestamp=add_timestamp,
+        fbref_control_run_id=fbref_control_run_id_from_context(_ctx),
     )
 
 
@@ -495,6 +497,7 @@ with DAG(
     tags=['transform', 'fbref', 'gold', 'football', 'trino', 'star-schema'],
     max_active_runs=1,
     max_active_tasks=1,  # Sequential — predictable RAM on dev Trino
+    dagrun_timeout=timedelta(hours=10),
     doc_md=__doc__,
 ) as dag:
 

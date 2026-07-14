@@ -75,6 +75,44 @@ def _response(
     )
 
 
+def test_clearance_bootstrap_consumes_transport_delta_not_cumulative_stats(
+    monkeypatch,
+):
+    transport = MagicMock()
+    transport.fetch.return_value = "<html><body>source</body></html>"
+    transport.traffic_delta.return_value = {
+        "real_bytes_downloaded": 150,
+        "real_requests_count": 3,
+        "browser_bootstrap_attempts": 1,
+        "budget_unobserved_bytes": 7,
+        "real_bytes_by_resource_type": {"document": 100, "script": 50},
+    }
+    transport.traffic_stats.side_effect = AssertionError(
+        "cumulative traffic must not be billed by FBrefFetcher"
+    )
+    clearance = {
+        "cookies": {"cf_clearance": "test"},
+        "user_agent": "test-agent",
+        "proxy": None,
+    }
+    transport.get_clearance.return_value = clearance
+    session = MagicMock()
+    create_session = MagicMock(return_value=session)
+    monkeypatch.setattr(FBrefFetcher, "_create_http_session", create_session)
+    fetcher = FBrefFetcher.__new__(FBrefFetcher)
+    fetcher.bootstrap_url = "https://fbref.com/en/"
+    fetcher._http_session = None
+    fetcher._transport = transport
+
+    fetcher._ensure_clearance()
+
+    transport.traffic_delta.assert_called_once_with()
+    transport.traffic_stats.assert_not_called()
+    create_session.assert_called_once_with(clearance)
+    assert fetcher._http_session is session
+    assert fetcher._bootstrap_stats == transport.traffic_delta.return_value
+
+
 def test_target_fetch_uses_warm_http_bytes_and_emits_bootstrap_once(monkeypatch):
     monkeypatch.setattr(
         "scrapers.fbref.fetcher._response_wire_size", lambda _response: 42

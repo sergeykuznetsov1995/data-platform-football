@@ -13,7 +13,7 @@ pytestmark = pytest.mark.unit
 
 
 def test_silver_validation_cannot_mask_failed_transform_with_all_done():
-    """A transform failure must skip validation/xref, not validate stale tables."""
+    """A transform failure must skip both FBref validation tasks."""
 
     path = ROOT / "dags" / "dag_transform_fbref_silver.py"
     tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -28,7 +28,6 @@ def test_silver_validation_cannot_mask_failed_transform_with_all_done():
         if task.value not in {
             "validate_silver",
             "validate_silver_quality",
-            "trigger_xref_transform",
         }:
             continue
         rule = kwargs.get("trigger_rule")
@@ -39,7 +38,6 @@ def test_silver_validation_cannot_mask_failed_transform_with_all_done():
     assert set(trigger_rules) == {
         "validate_silver",
         "validate_silver_quality",
-        "trigger_xref_transform",
     }
     assert all(rule != "all_done" for rule in trigger_rules.values())
 
@@ -53,12 +51,14 @@ def test_silver_dq_registers_new_strict_fbref_contracts():
         "scored_match_without_events[silver.fbref_match_enriched]",
         "awarded_result_override_missing[silver.fbref_match_enriched]",
         "shootout_score_parse[silver.fbref_match_enriched]",
-        "restricted_match_events[silver.fbref_match_enriched]",
     ):
         assert check_name in source
 
-    assert "event_availability, 'unknown'" in source
-    assert "NOT IN ('restricted', 'not_applicable')" in source
+    # No availability row means an unfetched historical match and is outside
+    # Silver completeness. Any explicit availability state remains ERROR.
+    assert '"AND event_availability IS NOT NULL "' in source
+    assert "event_availability, 'unknown'" not in source
+    assert "NOT IN ('restricted', 'not_applicable')" not in source
 
 
 def test_event_source_gap_registry_narrows_the_gate_without_muting_it():

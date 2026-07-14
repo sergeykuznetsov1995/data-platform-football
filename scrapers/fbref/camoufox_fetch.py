@@ -387,10 +387,8 @@ class CamoufoxFbrefTransport:
         # Any request that produced no finished/failed callback may have
         # crossed an unknown fraction of its reservation. Charge the full
         # remainder before allowing a restart to reuse capacity.
-        self._unobserved_reserved_bytes += self._inflight_reserved_bytes
+        self._clear_inflight_tracking(charge_unobserved=True)
         self._cm = self._browser = self._page = None
-        self._inflight_byte_reservations.clear()
-        self._inflight_reserved_bytes = 0
 
     def _restart(self) -> None:
         """Tear down and start fresh on the next proxy (rotation on failure)."""
@@ -429,6 +427,16 @@ class CamoufoxFbrefTransport:
         if url is not None:
             self._inflight_request_urls[key] = url
             self._inflight_ids_by_url.setdefault(url, []).append(key)
+
+    def _clear_inflight_tracking(self, *, charge_unobserved: bool) -> None:
+        """Atomically discard every index for the current in-flight set."""
+
+        if charge_unobserved:
+            self._unobserved_reserved_bytes += self._inflight_reserved_bytes
+        self._inflight_byte_reservations.clear()
+        self._inflight_request_urls.clear()
+        self._inflight_ids_by_url.clear()
+        self._inflight_reserved_bytes = 0
 
     def _forget_reservation(self, key: int) -> int:
         reserved = self._inflight_byte_reservations.pop(key, 0)
@@ -532,9 +540,7 @@ class CamoufoxFbrefTransport:
         # Charge every in-flight reservation in full: those requests may have
         # crossed an unknown fraction of the wire, and the cap must stay
         # conservative even though the browser is still up for a moment.
-        self._unobserved_reserved_bytes += self._inflight_reserved_bytes
-        self._inflight_byte_reservations.clear()
-        self._inflight_reserved_bytes = 0
+        self._clear_inflight_tracking(charge_unobserved=True)
         # The browser is NOT closed here.  This runs inside a Playwright event
         # callback (`response` / `requestfinished`), and the sync API deadlocks
         # if the browser is torn down from one: the callback waits for the

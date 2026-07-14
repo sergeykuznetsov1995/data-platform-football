@@ -180,6 +180,7 @@ class RecordingManager:
         batch_size: int = 1000,
         delete_filter: str | None = None,
         staging_id: str | None = None,
+        single_statement_replace: bool = False,
     ) -> int:
         assert schema == "bronze"
         assert batch_size == 1000
@@ -191,6 +192,7 @@ class RecordingManager:
                 "frame": frame.copy(),
                 "delete_filter": delete_filter,
                 "staging_id": staging_id,
+                "single_statement_replace": single_statement_replace,
             }
         )
         return len(frame)
@@ -265,6 +267,9 @@ def test_schedule_parse_and_retry_are_source_idempotent() -> None:
     assert manager.writes[0]["staging_id"] != manager.writes[1][
         "staging_id"
     ]
+    assert all(
+        call["single_statement_replace"] for call in manager.writes
+    )
 
 
 @pytest.mark.unit
@@ -893,7 +898,11 @@ def test_season_standard_page_reuses_existing_pure_finders() -> None:
 def test_unpublished_optional_season_tables_skip_without_deleting_live() -> None:
     context = typed.TypedSourceContext("9", "2025-2026")
     parsed = typed.parse_season_stats_html(
-        "<html><body></body></html>",
+        """
+        <html><body><main><h1>2025-2026 Premier League Stats</h1>
+          <a href="/en/comps/9/history/Premier-League-Seasons">Seasons</a>
+        </main></body></html>
+        """,
         context=context,
         stat_route="shooting",
     )
@@ -913,6 +922,32 @@ def test_unpublished_optional_season_tables_skip_without_deleting_live() -> None
     )
     assert counts == {}
     assert manager.writes == []
+
+
+@pytest.mark.unit
+def test_zero_table_source_shell_is_a_typed_contract_error() -> None:
+    context = typed.TypedSourceContext("9", "2025-2026")
+
+    parsed = typed.parse_season_stats_html(
+        "<html><body><p>temporary source shell</p></body></html>",
+        context=context,
+        stat_route="standard",
+    )
+
+    assert all(result.status == DatasetStatus.ERROR for result in parsed.values())
+    assert {
+        result.reason for result in parsed.values()
+    } == {"zero_table_season_identity_missing"}
+    with pytest.raises(
+        typed.TypedBronzePersistenceError,
+        match="Refusing season persistence; parser errors",
+    ):
+        typed.FBrefTypedBronzeWriter(RecordingManager()).persist_season_stats(
+            parsed,
+            context=context,
+            run_id="invalid-zero-table-shell",
+            target_identity="season:9:2025-2026:standard",
+        )
 
 
 @pytest.mark.unit
