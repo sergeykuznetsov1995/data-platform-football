@@ -15,6 +15,7 @@ from dags.scripts import run_transfermarkt_scope_cycle as cycle
 from dags.utils.transfermarkt_approval import (
     ApprovalJournal,
     ApprovalPacket,
+    load_standing_policy,
 )
 from scrapers.transfermarkt.registry import (
     EditionRecord,
@@ -782,3 +783,461 @@ def test_the_approved_interpreter_is_the_one_behind_the_alias(tmp_path):
     )
 
     assert argv[0] == str(real)
+
+
+def _standing_policy_file(tmp_path: Path, **overrides) -> Path:
+    now = datetime.now(timezone.utc)
+    value = {
+        'policy_version': 1,
+        'dag_id': 'dag_ingest_transfermarkt',
+        'approved_by': 'sergeykuznetsov1995',
+        'approved_at': (now - timedelta(days=1)).isoformat(),
+        'expires_at': (now + timedelta(days=30)).isoformat(),
+        'paid_proxy': {
+            'byte_cap_bytes': cycle.HARD_BYTE_CAP,
+            'request_limit': sum(
+                item['requests'] for item in cycle.DEFAULT_ENTITY_LIMITS.values()
+            ),
+            'retry_limit': cycle.PARENT_RETRY_LIMIT,
+            'concurrency': 1,
+        },
+        'production_write': {
+            'byte_cap_bytes': 0,
+            'request_limit': 0,
+            'retry_limit': 0,
+            'concurrency': 1,
+        },
+        'allowed_write_tables': sorted(
+            cycle.required_write_tables('dual')
+            | cycle.required_write_tables('native-only')
+        ),
+    }
+    value.update(overrides)
+    path = tmp_path / 'standing-approval-policy.json'
+    path.write_text(json.dumps(value), encoding='utf-8')
+    return path
+
+
+def _standing_args(
+    tmp_path: Path, payload: dict, **policy_overrides,
+) -> list[str]:
+    policy_path = _standing_policy_file(tmp_path, **policy_overrides)
+    policy = load_standing_policy(policy_path)
+    return [
+        '--payload-json', json.dumps(payload, sort_keys=True),
+        '--reader-revision', '7',
+        '--candidate-slot', 'b',
+        '--write-mode', 'dual',
+        '--standing-policy', str(policy_path),
+        '--standing-policy-sha256', policy.policy_hash,
+    ]
+
+
+def test_standing_policy_cycle_commits_manifest_and_parent_ledger(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv('TM_STANDING_POLICY_ENABLED', 'true')
+    payload = _payload(tmp_path)
+    argv = _standing_args(tmp_path, payload)
+    args = _parse_args(argv)
+    calls = []
+    persisted = []
+    persisted_ledgers = []
+    ticks = itertools.count(start=0, step=1_000_000)
+
+    manifest = cycle.run_scope_cycle(
+        args,
+        operation_argv=cycle.approved_operation_argv(argv),
+        subprocess_runner=_fake_subprocess(calls),
+        manifest_writer=persisted.append,
+        parent_ledger_writer=persisted_ledgers.append,
+        monotonic_ns=ticks.__next__,
+    )
+
+    assert manifest['status'] == 'complete'
+    assert persisted == [manifest]
+    assert len(persisted_ledgers) == 1
+    assert [
+        command[command.index('--entity') + 1] for command, _ in calls
+    ] == list(cycle.ENTITY_ORDER)
+    policy = load_standing_policy(argv[argv.index('--standing-policy') + 1])
+    assert all(
+        options['env']['TM_PAID_PROXY_APPROVAL_PACKET_ID']
+        == 'standing-policy-v1'
+        and options['env']['TM_PAID_PROXY_APPROVAL_PACKET_HASH']
+        == policy.policy_hash
+        and options['env']['TM_PRODUCTION_WRITE_APPROVAL_PACKET_ID']
+        == 'standing-policy-v1'
+        for _, options in calls
+    )
+    assert Path(payload['parent_ledger']['path'] + '.attempts').is_file()
+    assert Path(payload['parent_ledger']['path']).is_file()
+    assert not (tmp_path / 'approvals.json').exists()
+    assert not list(tmp_path.glob('**/journal*.json'))
+
+
+def test_standing_policy_records_authorization_in_own_file(
+    tmp_path, monkeypatch,
+):
+    # The manifest's dq_evidence key set is validator-bound, so the durable
+    # record of which policy authorized the cycle lives in its own file —
+    # not in scope-status.json, which a later failed CLI rerun overwrites.
+    monkeypatch.setenv('TM_STANDING_POLICY_ENABLED', 'true')
+    payload = _payload(tmp_path)
+    argv = _standing_args(tmp_path, payload)
+    args = _parse_args(argv)
+    ticks = itertools.count(start=0, step=1_000_000)
+
+    manifest = cycle.run_scope_cycle(
+        args,
+        operation_argv=cycle.approved_operation_argv(argv),
+        subprocess_runner=_fake_subprocess([]),
+        manifest_writer=lambda manifest: None,
+        parent_ledger_writer=lambda ledger: None,
+        monotonic_ns=ticks.__next__,
+    )
+
+    policy = load_standing_policy(argv[argv.index('--standing-policy') + 1])
+    base = Path(payload['result_paths']['base_dir'])
+    record = json.loads((base / 'standing-authorization.json').read_text())
+    assert record == {
+        'status': 'complete',
+        'parent_cycle_id': payload['parent_cycle_id'],
+        'child_cycle_id': payload['child_cycle_id'],
+        'scope_id': payload['scope_id'],
+        'manifest_digest': manifest['manifest_digest'],
+        'approval_mode': 'standing_policy',
+        'standing_policy': {
+            'policy_hash': policy.policy_hash,
+            'policy_version': 1,
+        },
+    }
+    assert not (base / 'scope-status.json').exists()
+
+
+def test_one_shot_cycle_writes_no_standing_authorization_file(tmp_path):
+    payload = _payload(tmp_path)
+    argv, _ = _approved_args(tmp_path, payload)
+    args = _parse_args(argv)
+    ticks = itertools.count(start=0, step=1_000_000)
+
+    cycle.run_scope_cycle(
+        args,
+        operation_argv=cycle.approved_operation_argv(argv),
+        subprocess_runner=_fake_subprocess([]),
+        manifest_writer=lambda manifest: None,
+        parent_ledger_writer=lambda ledger: None,
+        monotonic_ns=ticks.__next__,
+    )
+
+    base = Path(payload['result_paths']['base_dir'])
+    assert not (base / 'standing-authorization.json').exists()
+    assert not (base / 'scope-status.json').exists()
+
+
+def test_standing_resume_rewrites_missing_authorization_record(
+    tmp_path, monkeypatch,
+):
+    # A cycle that died between the complete checkpoint and the authorization
+    # record must still leave the record behind after the no-op resume.
+    monkeypatch.setenv('TM_STANDING_POLICY_ENABLED', 'true')
+    payload = _payload(tmp_path)
+    argv = _standing_args(tmp_path, payload)
+    args = _parse_args(argv)
+    ticks = itertools.count(start=0, step=1_000_000)
+    first = cycle.run_scope_cycle(
+        args,
+        operation_argv=cycle.approved_operation_argv(argv),
+        subprocess_runner=_fake_subprocess([]),
+        manifest_writer=lambda manifest: None,
+        parent_ledger_writer=lambda ledger: None,
+        monotonic_ns=ticks.__next__,
+    )
+    base = Path(payload['result_paths']['base_dir'])
+    record_path = base / 'standing-authorization.json'
+    original = record_path.read_text()
+    record_path.unlink()
+
+    second = cycle.run_scope_cycle(
+        args,
+        operation_argv=cycle.approved_operation_argv(argv),
+        subprocess_runner=lambda *a, **kw: pytest.fail('subprocess ran'),
+        manifest_writer=lambda manifest: pytest.fail('manifest persisted'),
+        parent_ledger_writer=lambda ledger: pytest.fail('ledger persisted'),
+    )
+
+    assert second == first
+    assert record_path.read_text() == original
+
+
+def test_failed_cli_rerun_does_not_clobber_standing_authorization(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv('TM_STANDING_POLICY_ENABLED', 'true')
+    payload = _payload(tmp_path)
+    argv = _standing_args(tmp_path, payload)
+    args = _parse_args(argv)
+    ticks = itertools.count(start=0, step=1_000_000)
+    cycle.run_scope_cycle(
+        args,
+        operation_argv=cycle.approved_operation_argv(argv),
+        subprocess_runner=_fake_subprocess([]),
+        manifest_writer=lambda manifest: None,
+        parent_ledger_writer=lambda ledger: None,
+        monotonic_ns=ticks.__next__,
+    )
+    base = Path(payload['result_paths']['base_dir'])
+    record_path = base / 'standing-authorization.json'
+    original = record_path.read_text()
+
+    drifted = list(argv)
+    drifted[drifted.index('--standing-policy-sha256') + 1] = '0' * 64
+
+    assert cycle.main(drifted) == 1
+
+    failure = json.loads((base / 'scope-status.json').read_text())
+    assert failure['status'] == 'failed'
+    assert failure['error_type'] == 'ApprovalDriftError'
+    assert record_path.read_text() == original
+
+
+def test_standing_policy_flag_without_sha_fails_before_subprocess(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv('TM_STANDING_POLICY_ENABLED', 'true')
+    payload = _payload(tmp_path)
+    argv = _standing_args(tmp_path, payload)
+    index = argv.index('--standing-policy-sha256')
+    del argv[index:index + 2]
+    args = _parse_args(argv)
+
+    with pytest.raises(
+        cycle.ScopeCycleError, match='standing_policy_sha256 is required',
+    ):
+        cycle.run_scope_cycle(
+            args,
+            operation_argv=cycle.approved_operation_argv(argv),
+            subprocess_runner=lambda *a, **kw: pytest.fail('subprocess ran'),
+            manifest_writer=lambda manifest: pytest.fail('manifest persisted'),
+            parent_ledger_writer=lambda ledger: pytest.fail('ledger persisted'),
+        )
+
+
+def test_standing_sha_without_policy_path_fails_before_subprocess(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv('TM_STANDING_POLICY_ENABLED', 'true')
+    payload = _payload(tmp_path)
+    argv = _standing_args(tmp_path, payload)
+    index = argv.index('--standing-policy')
+    del argv[index:index + 2]
+    args = _parse_args(argv)
+
+    with pytest.raises(
+        cycle.ScopeCycleError, match='standing_policy is required',
+    ):
+        cycle.run_scope_cycle(
+            args,
+            operation_argv=cycle.approved_operation_argv(argv),
+            subprocess_runner=lambda *a, **kw: pytest.fail('subprocess ran'),
+            manifest_writer=lambda manifest: pytest.fail('manifest persisted'),
+            parent_ledger_writer=lambda ledger: pytest.fail('ledger persisted'),
+        )
+
+
+def test_one_shot_without_journal_fails_before_subprocess(tmp_path):
+    payload = _payload(tmp_path)
+    argv = [
+        '--payload-json', json.dumps(payload, sort_keys=True),
+        '--reader-revision', '7',
+        '--candidate-slot', 'b',
+        '--write-mode', 'dual',
+        '--paid-proxy-approval-packet-id', 'paid-1',
+        '--paid-proxy-approval-packet-hash', 'a' * 64,
+        '--production-write-approval-packet-id', 'write-1',
+        '--production-write-approval-packet-hash', 'b' * 64,
+    ]
+    args = _parse_args(argv)
+
+    with pytest.raises(
+        cycle.ScopeCycleError, match='approval_journal is required',
+    ):
+        cycle.run_scope_cycle(
+            args,
+            operation_argv=cycle.approved_operation_argv(argv),
+            subprocess_runner=lambda *a, **kw: pytest.fail('subprocess ran'),
+            manifest_writer=lambda manifest: pytest.fail('manifest persisted'),
+            parent_ledger_writer=lambda ledger: pytest.fail('ledger persisted'),
+        )
+
+
+def test_standing_policy_requires_env_gate(tmp_path, monkeypatch):
+    monkeypatch.delenv('TM_STANDING_POLICY_ENABLED', raising=False)
+    payload = _payload(tmp_path)
+    argv = _standing_args(tmp_path, payload)
+    args = _parse_args(argv)
+
+    with pytest.raises(
+        cycle.ScopeCycleError, match='TM_STANDING_POLICY_ENABLED must be true',
+    ):
+        cycle.run_scope_cycle(
+            args,
+            operation_argv=cycle.approved_operation_argv(argv),
+            subprocess_runner=lambda *a, **kw: pytest.fail('subprocess ran'),
+            manifest_writer=lambda manifest: pytest.fail('manifest persisted'),
+            parent_ledger_writer=lambda ledger: pytest.fail('ledger persisted'),
+        )
+
+
+def test_standing_policy_content_drift_fails_before_subprocess(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv('TM_STANDING_POLICY_ENABLED', 'true')
+    payload = _payload(tmp_path)
+    argv = _standing_args(tmp_path, payload)
+    argv[argv.index('--standing-policy-sha256') + 1] = '0' * 64
+    args = _parse_args(argv)
+
+    with pytest.raises(Exception, match='differs from the pinned sha256'):
+        cycle.run_scope_cycle(
+            args,
+            operation_argv=cycle.approved_operation_argv(argv),
+            subprocess_runner=lambda *a, **kw: pytest.fail('subprocess ran'),
+            manifest_writer=lambda manifest: pytest.fail('manifest persisted'),
+            parent_ledger_writer=lambda ledger: pytest.fail('ledger persisted'),
+        )
+
+
+def test_standing_and_one_shot_flags_are_mutually_exclusive(tmp_path):
+    payload = _payload(tmp_path)
+    argv = _standing_args(tmp_path, payload) + [
+        '--approval-journal', str(tmp_path / 'approvals.json'),
+    ]
+
+    with pytest.raises(cycle.ScopeCycleError, match='mutually exclusive'):
+        _parse_args(argv)
+
+    bare = [
+        '--payload-json', json.dumps(payload, sort_keys=True),
+        '--reader-revision', '7',
+        '--candidate-slot', 'b',
+        '--write-mode', 'dual',
+    ]
+    with pytest.raises(cycle.ScopeCycleError, match='approval mode is required'):
+        _parse_args(bare)
+
+
+@pytest.mark.parametrize(
+    'paid_override',
+    [
+        {'byte_cap_bytes': 16 * 1024 * 1024},
+        {'request_limit': 709},
+        {'retry_limit': 399},
+        {'concurrency': 2},
+    ],
+)
+def test_standing_policy_limits_must_match_wrapper_argv(
+    tmp_path, monkeypatch, paid_override,
+):
+    monkeypatch.setenv('TM_STANDING_POLICY_ENABLED', 'true')
+    payload = _payload(tmp_path)
+    paid = {
+        'byte_cap_bytes': cycle.HARD_BYTE_CAP,
+        'request_limit': sum(
+            item['requests'] for item in cycle.DEFAULT_ENTITY_LIMITS.values()
+        ),
+        'retry_limit': cycle.PARENT_RETRY_LIMIT,
+        'concurrency': 1,
+    }
+    paid.update(paid_override)
+    argv = _standing_args(tmp_path, payload, paid_proxy=paid)
+    args = _parse_args(argv)
+
+    with pytest.raises(
+        cycle.ScopeCycleError, match='caps differ from wrapper limits',
+    ):
+        cycle.run_scope_cycle(
+            args,
+            operation_argv=cycle.approved_operation_argv(argv),
+            subprocess_runner=lambda *a, **kw: pytest.fail('subprocess ran'),
+            manifest_writer=lambda manifest: pytest.fail('manifest persisted'),
+            parent_ledger_writer=lambda ledger: pytest.fail('ledger persisted'),
+        )
+
+
+def test_standing_policy_expired_fails_before_subprocess(tmp_path, monkeypatch):
+    monkeypatch.setenv('TM_STANDING_POLICY_ENABLED', 'true')
+    payload = _payload(tmp_path)
+    now = datetime.now(timezone.utc)
+    argv = _standing_args(
+        tmp_path,
+        payload,
+        approved_at=(now - timedelta(days=2)).isoformat(),
+        expires_at=(now - timedelta(days=1)).isoformat(),
+    )
+    args = _parse_args(argv)
+
+    with pytest.raises(Exception, match='expired'):
+        cycle.run_scope_cycle(
+            args,
+            operation_argv=cycle.approved_operation_argv(argv),
+            subprocess_runner=lambda *a, **kw: pytest.fail('subprocess ran'),
+            manifest_writer=lambda manifest: pytest.fail('manifest persisted'),
+            parent_ledger_writer=lambda ledger: pytest.fail('ledger persisted'),
+        )
+
+
+def test_standing_policy_resume_uses_no_subprocess(tmp_path, monkeypatch):
+    monkeypatch.setenv('TM_STANDING_POLICY_ENABLED', 'true')
+    payload = _payload(tmp_path)
+    argv = _standing_args(tmp_path, payload)
+    args = _parse_args(argv)
+    ticks = itertools.count(start=0, step=1_000_000)
+    first = cycle.run_scope_cycle(
+        args,
+        operation_argv=cycle.approved_operation_argv(argv),
+        subprocess_runner=_fake_subprocess([]),
+        manifest_writer=lambda manifest: None,
+        parent_ledger_writer=lambda ledger: None,
+        monotonic_ns=ticks.__next__,
+    )
+
+    second = cycle.run_scope_cycle(
+        args,
+        operation_argv=cycle.approved_operation_argv(argv),
+        subprocess_runner=lambda *a, **kw: pytest.fail('subprocess ran'),
+        manifest_writer=lambda manifest: pytest.fail('manifest persisted'),
+        parent_ledger_writer=lambda ledger: pytest.fail('ledger persisted'),
+    )
+
+    assert second == first
+
+
+def test_standing_cycle_retry_limit_still_stops_before_paid_io(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv('TM_STANDING_POLICY_ENABLED', 'true')
+    payload = _payload(tmp_path)
+    argv = _standing_args(tmp_path, payload)
+    args = _parse_args(argv)
+    calls = []
+    ticks = itertools.count(start=0, step=1_000_000)
+
+    with pytest.raises(cycle.ScopeCycleError, match='retry limit exhausted'):
+        cycle.run_scope_cycle(
+            args,
+            operation_argv=cycle.approved_operation_argv(argv),
+            subprocess_runner=_fake_subprocess(
+                calls, first_retries=cycle.PARENT_RETRY_LIMIT,
+            ),
+            manifest_writer=lambda manifest: pytest.fail('manifest persisted'),
+            parent_ledger_writer=lambda ledger: pytest.fail('ledger persisted'),
+            monotonic_ns=ticks.__next__,
+        )
+
+    assert len(calls) == 1
+    assert not Path(payload['result_paths']['scope_manifest']).exists()
+    attempts = json.loads(
+        Path(payload['parent_ledger']['path'] + '.attempts').read_text()
+    )
+    assert attempts['retries'] == cycle.PARENT_RETRY_LIMIT
