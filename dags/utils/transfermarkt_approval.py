@@ -14,7 +14,7 @@ import json
 import os
 import tempfile
 import threading
-from collections.abc import Callable, MutableMapping, Sequence
+from collections.abc import Callable, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -560,3 +560,187 @@ class ApprovalJournal:
             return result
 
         return self._mutate(operation)
+
+
+def _coerce_timestamp(value: Any, *, field: str) -> datetime:
+    if isinstance(value, datetime):
+        return _utc(value)
+    if isinstance(value, str):
+        text = _validate_text(value, field=field)
+        try:
+            parsed = datetime.fromisoformat(text.replace('Z', '+00:00'))
+        except ValueError as exc:
+            raise ApprovalValidationError(
+                f'{field} is not a valid timestamp',
+            ) from exc
+        # A naive string would silently mean the parsing host's local zone and
+        # make the policy hash depend on it; _utc rejects it before astimezone.
+        return _utc(parsed)
+    raise ApprovalValidationError(f'{field} must be a timestamp')
+
+
+def _validate_cap(value: Any, *, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ApprovalValidationError(f'{field} must be an integer')
+    if value < 0:
+        raise ApprovalValidationError(f'{field} must be non-negative')
+    return value
+
+
+@dataclass(frozen=True)
+class StandingPolicyBudget:
+    """Exact per-action caps a standing policy binds an operator's name to."""
+
+    byte_cap_bytes: int
+    request_limit: int
+    retry_limit: int
+    concurrency: int
+
+    def __post_init__(self) -> None:
+        for field in ('byte_cap_bytes', 'request_limit', 'retry_limit'):
+            _validate_cap(getattr(self, field), field=field)
+        if (
+            isinstance(self.concurrency, bool)
+            or not isinstance(self.concurrency, int)
+            or self.concurrency < 1
+        ):
+            raise ApprovalValidationError('concurrency must be a positive integer')
+
+    def payload(self) -> dict[str, Any]:
+        return {
+            'byte_cap_bytes': self.byte_cap_bytes,
+            'concurrency': self.concurrency,
+            'request_limit': self.request_limit,
+            'retry_limit': self.retry_limit,
+        }
+
+
+@dataclass(frozen=True)
+class StandingPolicy:
+    """A named, expiring approval that stands for scheduled runs of one DAG."""
+
+    policy_version: int
+    dag_id: str
+    approved_by: str
+    approved_at: datetime
+    expires_at: datetime
+    paid_proxy: StandingPolicyBudget
+    production_write: StandingPolicyBudget
+    allowed_write_tables: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.policy_version, bool)
+            or not isinstance(self.policy_version, int)
+            or self.policy_version < 1
+        ):
+            raise ApprovalValidationError(
+                'policy_version must be a positive integer',
+            )
+        object.__setattr__(
+            self, 'dag_id', _validate_text(self.dag_id, field='dag_id'),
+        )
+        object.__setattr__(
+            self,
+            'approved_by',
+            _validate_text(self.approved_by, field='approved_by'),
+        )
+        approved_at = _coerce_timestamp(self.approved_at, field='approved_at')
+        expires_at = _coerce_timestamp(self.expires_at, field='expires_at')
+        if expires_at <= approved_at:
+            raise ApprovalValidationError('expires_at must be after approved_at')
+        object.__setattr__(self, 'approved_at', approved_at)
+        object.__setattr__(self, 'expires_at', expires_at)
+        for field in ('paid_proxy', 'production_write'):
+            value = getattr(self, field)
+            if isinstance(value, Mapping):
+                try:
+                    value = StandingPolicyBudget(**value)
+                except TypeError as exc:
+                    raise ApprovalValidationError(
+                        f'{field} budget is invalid',
+                    ) from exc
+            if not isinstance(value, StandingPolicyBudget):
+                raise ApprovalValidationError(f'{field} budget is invalid')
+            object.__setattr__(self, field, value)
+        if self.paid_proxy.byte_cap_bytes == 0:
+            raise ApprovalValidationError(
+                'paid_proxy standing budget requires a positive byte cap',
+            )
+        if self.paid_proxy.request_limit == 0:
+            raise ApprovalValidationError(
+                'paid_proxy standing budget requires a positive request limit',
+            )
+        write = self.production_write
+        if (
+            write.byte_cap_bytes != 0
+            or write.request_limit != 0
+            or write.retry_limit != 0
+        ):
+            raise ApprovalValidationError(
+                'production_write standing budgets must be zero',
+            )
+        tables = _unique_texts(
+            self.allowed_write_tables, field='allowed_write_tables',
+        )
+        if not tables:
+            raise ApprovalValidationError('allowed_write_tables cannot be empty')
+        object.__setattr__(self, 'allowed_write_tables', tables)
+
+    def payload(self) -> dict[str, Any]:
+        """Return the exact JSON-safe structure bound to operator approval."""
+
+        return {
+            'allowed_write_tables': list(self.allowed_write_tables),
+            'approved_at': _timestamp(self.approved_at),
+            'approved_by': self.approved_by,
+            'dag_id': self.dag_id,
+            'expires_at': _timestamp(self.expires_at),
+            'paid_proxy': self.paid_proxy.payload(),
+            'policy_version': self.policy_version,
+            'production_write': self.production_write.payload(),
+        }
+
+    @property
+    def canonical_json(self) -> str:
+        return json.dumps(
+            self.payload(),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(',', ':'),
+        )
+
+    @property
+    def policy_hash(self) -> str:
+        return hashlib.sha256(self.canonical_json.encode('utf-8')).hexdigest()
+
+    def assert_not_expired(self, now: datetime) -> None:
+        if _utc(now) >= self.expires_at:
+            raise ApprovalExpiredError('standing approval policy has expired')
+
+
+def load_standing_policy(path: str | os.PathLike[str]) -> StandingPolicy:
+    """Load one standing policy file, failing closed on any defect."""
+
+    try:
+        raw = Path(path).read_text('utf-8')
+    except OSError as exc:
+        raise ApprovalStateError(
+            f'standing policy file is unreadable: {path}',
+        ) from exc
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ApprovalStateError(
+            f'standing policy file is not valid JSON: {path}',
+        ) from exc
+    if not isinstance(value, dict):
+        raise ApprovalStateError(
+            f'standing policy file must contain a JSON object: {path}',
+        )
+    try:
+        return StandingPolicy(**value)
+    except TypeError as exc:
+        raise ApprovalValidationError(
+            'standing policy fields do not match the schema',
+        ) from exc

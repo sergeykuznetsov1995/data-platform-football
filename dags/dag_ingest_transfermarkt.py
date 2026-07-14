@@ -45,6 +45,10 @@ PROXY_REQUEST_LIMIT = 710
 PROXY_RETRY_LIMIT = 400
 PROXY_CONCURRENCY = 1
 SCOPE_SET_COVERAGE_MAX_AGE_DAYS = 7
+STANDING_POLICY_PATH = (
+    '/opt/airflow/dags/configs/transfermarkt/standing_approval_policy.json'
+)
+STANDING_POLICY_ENV_GATE = 'TM_STANDING_POLICY_ENABLED'
 
 _APPROVAL_FIELDS = (
     'paid_proxy_packet_id',
@@ -225,6 +229,16 @@ def _approval_bundle(
     return result
 
 
+def _is_scheduled_run(context: Mapping[str, Any]) -> bool:
+    dag_run = context.get('dag_run')
+    if dag_run is not None:
+        # A present dag_run is the authority: a missing run_type on it means
+        # "not scheduled", never a fall-through to the run_id prefix.
+        run_type = getattr(dag_run, 'run_type', None)
+        return str(getattr(run_type, 'value', run_type)) == 'scheduled'
+    return str(context.get('run_id') or '').startswith('scheduled__')
+
+
 def _plan_exact_scopes(**context: Any) -> list[dict[str, str]]:
     """Build the bounded mapped environments from promoted registry rows."""
 
@@ -245,6 +259,48 @@ def _plan_exact_scopes(**context: Any) -> list[dict[str, str]]:
     if journal != approved_root and approved_root not in journal.parents:
         raise AirflowException('approval journal must be under Airflow logs')
 
+    # A non-empty explicit approval_bundles always wins. The standing policy
+    # covers only the scheduler's own runs with empty selectors, behind an env
+    # gate: any manual trigger — including one that names scopes/leagues and so
+    # skips the planner's dueness filter — keeps the one-shot ritual (the
+    # operator has scripts/prepare_transfermarkt_scope_approvals.py for that).
+    approval_mode = 'one_shot'
+    standing_policy = None
+    if (
+        not params.get('approval_bundles')
+        and not params.get('scopes')
+        and not params.get('leagues')
+        and _is_scheduled_run(context)
+        and _truthy_env(STANDING_POLICY_ENV_GATE)
+    ):
+        try:
+            from dags.scripts.run_transfermarkt_scope_cycle import (
+                validate_standing_policy_for_scope_cycle,
+            )
+        except ModuleNotFoundError:
+            from scripts.run_transfermarkt_scope_cycle import (
+                validate_standing_policy_for_scope_cycle,
+            )
+        from utils.transfermarkt_approval import load_standing_policy
+
+        if (
+            int(params['proxy_request_limit']) != PROXY_REQUEST_LIMIT
+            or int(params['proxy_retry_limit']) != PROXY_RETRY_LIMIT
+        ):
+            raise AirflowException(
+                'standing-policy runs require the pinned '
+                f'{PROXY_REQUEST_LIMIT}/{PROXY_RETRY_LIMIT} request/retry limits'
+            )
+        standing_policy = load_standing_policy(STANDING_POLICY_PATH)
+        validate_standing_policy_for_scope_cycle(
+            standing_policy,
+            write_mode=str(preflight['write_mode']),
+            cycle_budget_bytes=PROVIDER_HARD_CAP_BYTES,
+            request_limit=PROXY_REQUEST_LIMIT,
+            retry_limit=PROXY_RETRY_LIMIT,
+        )
+        approval_mode = 'standing_policy'
+
     registry_rows = _read_promoted_registry(
         registry_snapshot_id=str(params.get('registry_snapshot_id') or ''),
     )
@@ -261,16 +317,19 @@ def _plan_exact_scopes(**context: Any) -> list[dict[str, str]]:
     used_approvals: set[str] = set()
     for payload in plan.mapped_payloads:
         scope_id = str(payload['scope_id'])
-        approval = _approval_bundle(
-            params.get('approval_bundles'), scope_id=scope_id,
-        )
-        identities = set(approval.values())
-        overlap = identities & used_approvals
-        if overlap:
-            raise AirflowException(
-                f'{scope_id}: one-shot approval identity is reused: {sorted(overlap)}'
+        approval = None
+        if approval_mode == 'one_shot':
+            approval = _approval_bundle(
+                params.get('approval_bundles'), scope_id=scope_id,
             )
-        used_approvals.update(identities)
+            identities = set(approval.values())
+            overlap = identities & used_approvals
+            if overlap:
+                raise AirflowException(
+                    f'{scope_id}: one-shot approval identity is reused: '
+                    f'{sorted(overlap)}'
+                )
+            used_approvals.update(identities)
         refresh_mode = str(params['refresh_mode'])
         if refresh_mode == 'auto':
             edition_record = payload.get('edition_record') or {}
@@ -279,7 +338,7 @@ def _plan_exact_scopes(**context: Any) -> list[dict[str, str]]:
             refresh_mode = (
                 'current' if bool(edition_record.get('current')) else 'historical'
             )
-        mapped_envs.append({
+        environment = {
             'PYTHONPATH': '/opt/airflow:/opt/airflow/dags',
             'PATH': '/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin',
             'HOME': '/home/airflow',
@@ -294,15 +353,7 @@ def _plan_exact_scopes(**context: Any) -> list[dict[str, str]]:
             'TM_READER_REVISION': str(int(preflight['revision'])),
             'TM_CANDIDATE_SLOT': str(preflight['candidate_slot']),
             'TM_WRITE_MODE': str(preflight['write_mode']),
-            'TM_APPROVAL_JOURNAL': str(journal),
-            'TM_PAID_APPROVAL_PACKET_ID': approval['paid_proxy_packet_id'],
-            'TM_PAID_APPROVAL_PACKET_HASH': approval['paid_proxy_packet_hash'],
-            'TM_WRITE_APPROVAL_PACKET_ID': approval[
-                'production_write_packet_id'
-            ],
-            'TM_WRITE_APPROVAL_PACKET_HASH': approval[
-                'production_write_packet_hash'
-            ],
+            'TM_APPROVAL_MODE': approval_mode,
             'TM_MV_TRANSFERS_LIMIT': str(int(params['mv_transfers_limit'])),
             'TM_REFRESH_MODE': refresh_mode,
             'TM_COACH_HISTORY_TTL_DAYS': str(
@@ -322,7 +373,27 @@ def _plan_exact_scopes(**context: Any) -> list[dict[str, str]]:
             'TM_PROXY_REQUEST_LIMIT': str(int(params['proxy_request_limit'])),
             'TM_PROXY_RETRY_LIMIT': str(int(params['proxy_retry_limit'])),
             'TM_PENDING_CHECKPOINT_DIR': PENDING_CHECKPOINT_DIR,
-        })
+        }
+        if approval_mode == 'standing_policy':
+            environment.update({
+                'TM_STANDING_POLICY_PATH': STANDING_POLICY_PATH,
+                'TM_STANDING_POLICY_SHA256': standing_policy.policy_hash,
+            })
+        else:
+            environment.update({
+                'TM_APPROVAL_JOURNAL': str(journal),
+                'TM_PAID_APPROVAL_PACKET_ID': approval['paid_proxy_packet_id'],
+                'TM_PAID_APPROVAL_PACKET_HASH': approval[
+                    'paid_proxy_packet_hash'
+                ],
+                'TM_WRITE_APPROVAL_PACKET_ID': approval[
+                    'production_write_packet_id'
+                ],
+                'TM_WRITE_APPROVAL_PACKET_HASH': approval[
+                    'production_write_packet_hash'
+                ],
+            })
+        mapped_envs.append(environment)
     return mapped_envs
 
 
@@ -712,10 +783,19 @@ with DAG(
     doc_md="""
     The scheduled run reads only the promoted central competition registry.
     Empty selectors mean all due eligible senior-men scopes, capped at eight.
-    Every mapped child needs separate one-shot paid-proxy and production-write
-    approvals. Unknown classification, missing approval, missing manifest,
-    unknown provider traffic, reader drift, or DQ failure blocks scope-set
-    completion. Silver/Gold are a second Airflow phase because their exact
+    A non-empty params.approval_bundles keeps the manual ritual: every mapped
+    child needs separate one-shot paid-proxy and production-write approvals.
+    Only a run_type=scheduled run with empty bundles and empty scopes/leagues
+    selectors, and TM_STANDING_POLICY_ENABLED=true, is instead covered by the
+    committed standing approval policy
+    (dags/configs/transfermarkt/standing_approval_policy.json), whose caps must
+    equal the pinned wrapper limits and whose sha256 is re-verified by each
+    child. Any manual trigger — with or without explicit selectors — and any
+    run without the gate still fails closed without exact one-shot bundles
+    (scripts/prepare_transfermarkt_scope_approvals.py issues them). Unknown
+    classification, missing approval, missing manifest, unknown provider
+    traffic, reader drift, or DQ failure blocks scope-set completion.
+    Silver/Gold are a second Airflow phase because their exact
     one-shot approvals can only be issued after this DAG computes scope_set_id.
     Scheduled empty selectors are capture-only; only an explicit bounded
     scopes/leagues run can become promotion-ready.
@@ -735,16 +815,33 @@ with DAG(
         task_id='run_exact_child_cycle',
         bash_command=r'''set -euo pipefail
 cd /opt/airflow
+case "$TM_APPROVAL_MODE" in
+  standing_policy)
+    approval_args=(
+      --standing-policy "$TM_STANDING_POLICY_PATH"
+      --standing-policy-sha256 "$TM_STANDING_POLICY_SHA256"
+    )
+    ;;
+  one_shot)
+    approval_args=(
+      --approval-journal "$TM_APPROVAL_JOURNAL"
+      --paid-proxy-approval-packet-id "$TM_PAID_APPROVAL_PACKET_ID"
+      --paid-proxy-approval-packet-hash "$TM_PAID_APPROVAL_PACKET_HASH"
+      --production-write-approval-packet-id "$TM_WRITE_APPROVAL_PACKET_ID"
+      --production-write-approval-packet-hash "$TM_WRITE_APPROVAL_PACKET_HASH"
+    )
+    ;;
+  *)
+    echo "unknown TM_APPROVAL_MODE: $TM_APPROVAL_MODE" >&2
+    exit 1
+    ;;
+esac
 exec python dags/scripts/run_transfermarkt_scope_cycle.py \
   --payload-json "$TM_SCOPE_PAYLOAD_JSON" \
   --reader-revision "$TM_READER_REVISION" \
   --candidate-slot "$TM_CANDIDATE_SLOT" \
   --write-mode "$TM_WRITE_MODE" \
-  --approval-journal "$TM_APPROVAL_JOURNAL" \
-  --paid-proxy-approval-packet-id "$TM_PAID_APPROVAL_PACKET_ID" \
-  --paid-proxy-approval-packet-hash "$TM_PAID_APPROVAL_PACKET_HASH" \
-  --production-write-approval-packet-id "$TM_WRITE_APPROVAL_PACKET_ID" \
-  --production-write-approval-packet-hash "$TM_WRITE_APPROVAL_PACKET_HASH" \
+  "${approval_args[@]}" \
   --career-window-limit "$TM_MV_TRANSFERS_LIMIT" \
   --refresh-mode "$TM_REFRESH_MODE" \
   --coach-history-ttl-days "$TM_COACH_HISTORY_TTL_DAYS" \
