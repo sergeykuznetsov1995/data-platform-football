@@ -24,25 +24,37 @@ from airflow.operators.python import PythonOperator
 from utils.config import CURRENT_SEASON, DAG_TAGS, SCHEDULES
 from utils.default_args import SCRAPER_ARGS
 
+# The budget canon (scrapers/transfermarkt/models.py) is stdlib-only and is
+# the single source for every paid-traffic number the DAG pins.
+from scrapers.transfermarkt.models import (
+    DEFAULT_ENTITY_TIMEOUT_SECONDS,
+    MAX_ROSTER_WINDOW,
+    MAX_SCOPE_BATCH,
+    PARENT_DAILY_HARD_PROVIDER_BYTE_CAP,
+    PARENT_DAILY_SOFT_PROVIDER_BYTE_STOP,
+    PARENT_REQUEST_LIMIT,
+    PARENT_RETRY_LIMIT,
+    SCOPE_HARD_PROVIDER_BYTE_CAP,
+    SCOPE_REQUEST_LIMIT,
+    SCOPE_RETRY_LIMIT,
+    SCOPE_SOFT_PROVIDER_BYTE_STOP,
+    SCOPE_WALL_CLOCK_TIMEOUT_SECONDS,
+)
 
-MV_HISTORY_DAILY_LIMIT = 100
+
+MV_HISTORY_DAILY_LIMIT = MAX_ROSTER_WINDOW
 COACH_HISTORY_TTL_DAYS = 28
 CHECKPOINT_TTL_DAYS = 35
-MAX_SCOPE_BATCH = 8
 PENDING_CHECKPOINT_DIR = '/opt/airflow/logs/transfermarkt-checkpoints'
 APPROVAL_JOURNAL = '/opt/airflow/logs/transfermarkt-approvals/journal.json'
-PROVIDER_HARD_CAP_BYTES = 15 * 1024 * 1024
-PROVIDER_SOFT_STOP_BYTES = 14 * 1024 * 1024
-# One source-wide ceiling over the per-entity attempt budgets (150 + 200 + 200
-# + 160). Attempts, not pages: the biggest leagues run to ~60 clubs and the
-# source answers 502/504 for a third to a half of the attempts in a bad wave.
-# The 15 MiB byte cap still stops a cycle long before these do.
-PROXY_REQUEST_LIMIT = 710
-# Cycle-wide retry ledger. A cold big league fetches ~360 pages across its four
-# entities and the source answers 502/504 for a third to a half of the attempts
-# in a wave, so it needs retries of that order. A failed attempt costs ~10 KiB
-# against the 15 MiB cap, which is what actually bounds the paid traffic.
-PROXY_RETRY_LIMIT = 400
+# Per-scope caps (one exact competition x edition child cycle).
+PROVIDER_HARD_CAP_BYTES = SCOPE_HARD_PROVIDER_BYTE_CAP
+PROVIDER_SOFT_STOP_BYTES = SCOPE_SOFT_PROVIDER_BYTE_STOP
+PROXY_REQUEST_LIMIT = SCOPE_REQUEST_LIMIT
+PROXY_RETRY_LIMIT = SCOPE_RETRY_LIMIT
+# Parent (daily) aggregate caps across all mapped scopes of one run.
+PARENT_BYTE_BUDGET = PARENT_DAILY_HARD_PROVIDER_BYTE_CAP
+PARENT_SOFT_BYTE_STOP = PARENT_DAILY_SOFT_PROVIDER_BYTE_STOP
 PROXY_CONCURRENCY = 1
 SCOPE_SET_COVERAGE_MAX_AGE_DAYS = 7
 STANDING_POLICY_PATH = (
@@ -372,6 +384,10 @@ def _plan_exact_scopes(**context: Any) -> list[dict[str, str]]:
             'TM_PROVIDER_SOFT_STOP_BYTES': str(PROVIDER_SOFT_STOP_BYTES),
             'TM_PROXY_REQUEST_LIMIT': str(int(params['proxy_request_limit'])),
             'TM_PROXY_RETRY_LIMIT': str(int(params['proxy_retry_limit'])),
+            'TM_PARENT_BYTE_BUDGET': str(PARENT_BYTE_BUDGET),
+            'TM_PARENT_SOFT_BYTE_STOP': str(PARENT_SOFT_BYTE_STOP),
+            'TM_PARENT_REQUEST_LIMIT': str(PARENT_REQUEST_LIMIT),
+            'TM_PARENT_RETRY_LIMIT': str(PARENT_RETRY_LIMIT),
             'TM_PENDING_CHECKPOINT_DIR': PENDING_CHECKPOINT_DIR,
         }
         if approval_mode == 'standing_policy':
@@ -559,18 +575,18 @@ def _build_scope_set(
     if len(ledger_paths) != 1:
         raise AirflowException('mapped scopes do not share one parent proxy ledger')
     traffic = aggregate_traffic(manifests)
-    if traffic['provider_metered_bytes'] > PROVIDER_HARD_CAP_BYTES:
+    if traffic['provider_metered_bytes'] > PARENT_BYTE_BUDGET:
         raise AirflowException(
-            'provider hard byte cap exceeded: '
-            f"{traffic['provider_metered_bytes']}/{PROVIDER_HARD_CAP_BYTES}"
+            'parent daily provider byte budget exceeded: '
+            f"{traffic['provider_metered_bytes']}/{PARENT_BYTE_BUDGET}"
         )
     ledger = _load_json_object(next(iter(ledger_paths)), label='parent proxy ledger')
     required_ledger = {
         'provider_metered_bytes': traffic['provider_metered_bytes'],
         'requests': traffic['requests'],
         'retries': traffic['retries'],
-        'hard_provider_byte_budget': PROVIDER_HARD_CAP_BYTES,
-        'soft_provider_byte_stop': PROVIDER_SOFT_STOP_BYTES,
+        'hard_provider_byte_budget': PARENT_BYTE_BUDGET,
+        'soft_provider_byte_stop': PARENT_SOFT_BYTE_STOP,
     }
     if any(int(ledger.get(key, -1)) != value for key, value in required_ledger.items()):
         raise AirflowException('parent proxy ledger disagrees with scope manifests')
@@ -726,7 +742,7 @@ with DAG(
     dag_id='dag_ingest_transfermarkt',
     default_args=SCRAPER_ARGS,
     description='Bounded registry-driven Transfermarkt native-v2 ingest',
-    schedule=SCHEDULES.get('dag_ingest_transfermarkt', '0 4 * * 1'),
+    schedule=SCHEDULES.get('dag_ingest_transfermarkt', '0 4 * * *'),
     start_date=datetime(2024, 1, 1),
     catchup=False,
     render_template_as_native_obj=True,
@@ -745,13 +761,14 @@ with DAG(
         ),
         'registry_snapshot_id': Param(default='', type='string'),
         'max_batch': Param(
-            default=MAX_SCOPE_BATCH, type='integer', minimum=1, maximum=8,
+            default=MAX_SCOPE_BATCH, type='integer', minimum=1,
+            maximum=MAX_SCOPE_BATCH,
         ),
         'approval_journal': Param(default=APPROVAL_JOURNAL, type='string'),
         'approval_bundles': Param(default={}, type='object'),
         'mv_transfers_limit': Param(
             default=MV_HISTORY_DAILY_LIMIT,
-            type='integer', minimum=1, maximum=100,
+            type='integer', minimum=1, maximum=MV_HISTORY_DAILY_LIMIT,
         ),
         'refresh_mode': Param(
             default='auto', type='string',
@@ -777,7 +794,8 @@ with DAG(
             type='integer', minimum=0, maximum=PROXY_RETRY_LIMIT,
         ),
         'entity_timeout_seconds': Param(
-            default=3600, type='integer', minimum=60, maximum=3600,
+            default=DEFAULT_ENTITY_TIMEOUT_SECONDS, type='integer',
+            minimum=60, maximum=DEFAULT_ENTITY_TIMEOUT_SECONDS,
         ),
     },
     doc_md="""
@@ -851,13 +869,25 @@ exec python dags/scripts/run_transfermarkt_scope_cycle.py \
   --cycle-budget-bytes "$TM_PROVIDER_HARD_CAP_BYTES" \
   --soft-byte-stop-bytes "$TM_PROVIDER_SOFT_STOP_BYTES" \
   --request-limit "$TM_PROXY_REQUEST_LIMIT" \
-  --retry-limit "$TM_PROXY_RETRY_LIMIT"''',
+  --retry-limit "$TM_PROXY_RETRY_LIMIT" \
+  --parent-byte-budget "$TM_PARENT_BYTE_BUDGET" \
+  --parent-soft-byte-stop "$TM_PARENT_SOFT_BYTE_STOP" \
+  --parent-request-limit "$TM_PARENT_REQUEST_LIMIT" \
+  --parent-retry-limit "$TM_PARENT_RETRY_LIMIT"''',
         append_env=True,
         retries=0,
         pool='transfermarkt_proxy',
         pool_slots=1,
         max_active_tis_per_dag=1,
-        execution_timeout=timedelta(hours=4, minutes=15),
+        # Derived from the budget canon, never a literal: the task supervises
+        # four entity subprocesses whose own timeouts sum to 18000 s (the
+        # career entities need 5400 s each at a full 650-attempt budget), plus
+        # the scope's ops MERGEs.  A shorter task timeout would SIGKILL a
+        # runner mid-crawl and lose its attempt-guard write and evidence.
+        # Scopes run strictly serially (max_active_tis_per_dag=1) and runs do
+        # not overlap or backfill (max_active_runs=1, catchup=False), so a
+        # long worst-case DagRun only delays the next scheduled one.
+        execution_timeout=timedelta(seconds=SCOPE_WALL_CLOCK_TIMEOUT_SECONDS),
         do_xcom_push=False,
     ).expand(env=plan_exact_scopes_task.output)
 

@@ -30,6 +30,14 @@ from dags.utils.transfermarkt_dq_contracts import (
     input_from_capture,
     validate_scope_capture,
 )
+# The budget canon is stdlib-only and safe at module import time; the heavy
+# scraper modules stay lazy inside _run_entity.
+from scrapers.transfermarkt.models import (
+    MAX_ROSTER_WINDOW,
+    PRODUCTION_ENTITY_BUDGETS,
+    PROVIDER_GRANT_ENV_VAR,
+    SCOPE_HARD_PROVIDER_BYTE_CAP,
+)
 
 warnings.filterwarnings('ignore', category=DeprecationWarning)
 
@@ -101,7 +109,6 @@ VALID_ENTITIES = {
 REPLACE_GUARD_MARKER = 'TM_REPLACE_GUARD'
 _MIN_REPLACE_RATIO = 0.9
 _WINDOW_STRIDE_DAYS = 7
-MAX_ROSTER_WINDOW = 100
 FETCH_STATE_TABLE = 'iceberg.ops.transfermarkt_fetch_state'
 PARSER_VERSION = os.environ.get('TM_PARSER_VERSION', 'v2')
 SCHEMA_VERSION = os.environ.get('TM_SCHEMA_VERSION', '2')
@@ -114,16 +121,9 @@ NATIVE_WRITE_MANIFEST_TABLE = (
 PENDING_CHECKPOINT_TTL_DAYS = int(
     os.environ.get('TM_PENDING_CHECKPOINT_TTL_DAYS', '35')
 )
-MIB = 1024 * 1024
-PRODUCTION_CYCLE_BUDGET_BYTES = 15 * MIB
-# 'requests' counts attempts, not pages; keep in sync with the parent cycle's
-# DEFAULT_ENTITY_LIMITS.
-PRODUCTION_ENTITY_BUDGETS = {
-    ENTITY_PLAYERS: {'decoded_mb': 16.0, 'requests': 150},
-    ENTITY_MV_HISTORY: {'decoded_mb': 4.0, 'requests': 200},
-    ENTITY_TRANSFERS: {'decoded_mb': 8.0, 'requests': 200},
-    ENTITY_COACHES: {'decoded_mb': 14.0, 'requests': 160},
-}
+# The shared cycle ledger caps ONE exact scope cycle; the parent (daily)
+# aggregate is enforced by the scope-cycle wrapper against the PARENT_* canon.
+PRODUCTION_CYCLE_BUDGET_BYTES = SCOPE_HARD_PROVIDER_BYTE_CAP
 
 
 @dataclass(frozen=True)
@@ -3090,25 +3090,25 @@ def _run_entity(
                 mode, int(expected_reader_revision),
             )
         if cycle_budget_bytes is not None:
-            configured_mb = os.environ.get('TM_DECODED_BODY_BUDGET_MB')
-            configured_bytes = min(
-                int(float(configured_mb) * MIB)
-                if configured_mb is not None
-                else int(PRODUCTION_ENTITY_BUDGETS[spec.name]['decoded_mb'] * MIB),
-                int(PRODUCTION_ENTITY_BUDGETS[spec.name]['decoded_mb'] * MIB),
+            # The reservation and its later settlement are both denominated in
+            # PROVIDER-metered bytes; decoded-body ceilings stay a separate,
+            # per-entity client budget (TM_DECODED_BODY_BUDGET_MB).
+            reserve_request = int(
+                PRODUCTION_ENTITY_BUDGETS[spec.name]['provider_reserve_bytes']
             )
             cycle_budget = _prepare_cycle_budget(
                 cycle_ledger_key,
                 int(cycle_budget_bytes),
                 entity=spec.name,
-                reserve_bytes=configured_bytes,
+                reserve_bytes=reserve_request,
             )
             effective_bytes = int(cycle_budget['reserved_bytes'])
             if effective_bytes <= 0:
-                raise RuntimeError('no decoded-body budget remains for this entity')
-            os.environ['TM_DECODED_BODY_BUDGET_MB'] = str(
-                effective_bytes / MIB
-            )
+                raise RuntimeError('no provider byte budget remains for this entity')
+            # The exact grant sizes the client's own provider ledger, so one
+            # entity can never eat traffic up to the whole scope cap.
+            os.environ[PROVIDER_GRANT_ENV_VAR] = str(effective_bytes)
+            results['provider_byte_grant'] = effective_bytes
             results['cycle_budget'] = dict(cycle_budget)
         response_cache, cache_path, cache_ttl = _load_response_cache()
         with TransfermarktScraper(
@@ -3678,7 +3678,7 @@ def _run_entity(
                     results['cycle_budget'].update(cycle_after)
                     if cycle_after['exhausted']:
                         results['errors'].append(
-                            'shared cycle decoded-body budget exceeded: '
+                            'shared scope provider byte budget exceeded: '
                             f"{cycle_after['consumed_after_bytes']}/"
                             f"{cycle_after['limit_bytes']} bytes"
                         )
@@ -3761,7 +3761,7 @@ def main() -> int:
     parser.add_argument(
         '--retry-budget', type=int, default=None,
         help=(
-            'Remaining parent-cycle paid retry budget. The metered proxy '
+            'Remaining scope-cycle paid retry budget. The metered proxy '
             'client rejects retry N+1 before network I/O.'
         ),
     )

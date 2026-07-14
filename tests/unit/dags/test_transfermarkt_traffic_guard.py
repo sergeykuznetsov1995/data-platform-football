@@ -158,17 +158,17 @@ class TestCheckResultTrafficGuard:
                 'entity': entity,
                 'traffic': {
                     'telemetry_available': True,
-                    'decoded_response_body_bytes': 8 * 1024 * 1024,
+                    'decoded_response_body_bytes': 13 * 1024 * 1024,
                 },
             }))
             paths[entity] = str(path)
         with patch('airflow.models.Variable') as mock_var:
             mock_var.get.return_value = None
-            with pytest.raises(AirflowException, match='cycle: 16.0000 MiB'):
+            with pytest.raises(AirflowException, match='cycle: 26.0000 MiB'):
                 check_result_traffic_guard(
                     paths,
-                    default_thresholds={'players': 10.0, 'coaches': 10.0},
-                    cycle_budget_bytes=15 * 1024 * 1024,
+                    default_thresholds={'players': 16.0, 'coaches': 16.0},
+                    cycle_budget_bytes=24 * 1024 * 1024,
                 )
 
     @pytest.mark.unit
@@ -184,15 +184,15 @@ class TestCheckResultTrafficGuard:
                 'decoded_response_body_bytes': 1,
             },
             'cycle_budget': {
-                'limit_bytes': 15 * 1024 * 1024,
-                'accounted_after_bytes': 15 * 1024 * 1024 + 1,
+                'limit_bytes': 24 * 1024 * 1024,
+                'accounted_after_bytes': 24 * 1024 * 1024 + 1,
             },
         }))
         with patch('airflow.models.Variable') as mock_var:
             mock_var.get.return_value = None
-            with pytest.raises(AirflowException, match='15728641 bytes'):
+            with pytest.raises(AirflowException, match='25165825 bytes'):
                 check_result_traffic_guard(
                     {'players': str(path)},
                     default_thresholds={'players': 10.0},
-                    cycle_budget_bytes=15 * 1024 * 1024,
+                    cycle_budget_bytes=24 * 1024 * 1024,
                 )

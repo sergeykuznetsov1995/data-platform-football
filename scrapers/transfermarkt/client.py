@@ -19,6 +19,10 @@ from typing import Any, Callable, Dict, Mapping, MutableMapping, Optional
 from urllib.parse import quote, urlsplit, urlunsplit
 
 from scrapers.transfermarkt.models import (
+    PROVIDER_GRANT_ENV_VAR,
+    PROVIDER_GRANT_FLOOR_BYTES,
+    PROVIDER_GRANT_SOFT_MARGIN_BYTES,
+    SCOPE_HARD_PROVIDER_BYTE_CAP,
     FetchOutcome,
     FetchStatus,
     LeaseTrafficSnapshot,
@@ -120,6 +124,58 @@ def _tls_requests_compatible_proxy_url(proxy_url: str) -> str:
     auth = f"{raw_userinfo}@" if separator else ""
     netloc = f"{auth}{rendered_host}{rendered_port}"
     return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+
+
+def _ledger_from_provider_grant(
+    *,
+    metered: bool,
+    retry_limit: Optional[int],
+) -> SharedTrafficLedger:
+    """Build the per-entity provider ledger from the parent-issued byte grant.
+
+    The entity runner reserves ``provider_reserve_bytes`` in the shared scope
+    ledger and exports the granted amount as ``TM_PROVIDER_BYTE_BUDGET``.
+    Sizing this client's ledger to that exact grant closes the hole where one
+    entity's client could eat traffic up to the whole scope cap.  A required
+    metered run (``TM_REQUIRE_METERED_PROXY``) refuses to start without a
+    readable grant; a present-but-unreadable value always fails closed.
+    """
+
+    raw = os.environ.get(PROVIDER_GRANT_ENV_VAR)
+    text = str(raw).strip() if raw is not None else ''
+    if not text:
+        if metered:
+            # A metered client bills the provider on every request; without a
+            # grant it would silently inherit the full per-scope default
+            # ledger, which is exactly the escalation the grant exists to
+            # prevent.  Refuse before any I/O.
+            raise ProxyRequiredError(
+                f'{PROVIDER_GRANT_ENV_VAR} is required for metered runs; '
+                'refusing paid I/O without a per-entity provider grant'
+            )
+        return SharedTrafficLedger(retry_limit=retry_limit)
+    try:
+        grant = int(text)
+    except ValueError as exc:
+        raise TrafficMeterError(
+            f'{PROVIDER_GRANT_ENV_VAR} is unreadable; refusing paid I/O'
+        ) from exc
+    if grant < PROVIDER_GRANT_FLOOR_BYTES:
+        # A grant smaller than one page's worth of provider bytes would be
+        # pierced by the very first response; refuse it before any I/O.
+        raise TrafficMeterError(
+            f'{PROVIDER_GRANT_ENV_VAR} is below the '
+            f'{PROVIDER_GRANT_FLOOR_BYTES}-byte floor; refusing paid I/O'
+        )
+    hard = min(grant, SCOPE_HARD_PROVIDER_BYTE_CAP)
+    # Full 1 MiB of soft headroom for normal grants; small grants keep a
+    # proportional graceful stop instead of collapsing to a degenerate one.
+    soft = min(hard - 1, max(hard - PROVIDER_GRANT_SOFT_MARGIN_BYTES, hard // 2))
+    return SharedTrafficLedger(
+        hard_provider_bytes=hard,
+        soft_provider_bytes=soft,
+        retry_limit=retry_limit,
+    )
 
 
 def _control_token_from_environment() -> str:
@@ -324,7 +380,10 @@ class TransfermarktHttpClient:
         self._explicit_proxy = proxy
         self._lease_provider = lease_provider
         if traffic_ledger is None:
-            traffic_ledger = SharedTrafficLedger(retry_limit=retry_budget)
+            traffic_ledger = _ledger_from_provider_grant(
+                metered=lease_provider is not None,
+                retry_limit=retry_budget,
+            )
         elif (
             retry_budget is not None
             and traffic_ledger.retry_limit != int(retry_budget)

@@ -741,6 +741,97 @@ def test_scope_set_evidence_rejects_one_parent_over_hard_byte_cap():
         )
 
 
+def _with_ledger_caps(cursor, hard, soft):
+    cursor.ledger_rows = [(*row[:-2], hard, soft) for row in cursor.ledger_rows]
+    return cursor
+
+
+def _readiness(control, cursor):
+    return control._scope_set_evidence(
+        cursor,
+        scope_set_id=cursor.scope_set.scope_set_id,
+        expected_revision=4,
+        require_fresh=True,
+    )
+
+
+def test_scope_set_readiness_ceilings_come_from_the_daily_canon():
+    mod = _load()
+    control = mod.control
+
+    assert control.SCOPE_SET_HARD_BYTE_CAP == 88_080_384
+    assert control.SCOPE_SET_SOFT_BYTE_STOP == 83_886_080
+    assert control.SCOPE_SET_REQUEST_LIMIT == 12_880
+    assert control.SCOPE_SET_RETRY_LIMIT == 6_400
+
+    manifest = _scope_manifest_fixture(control)
+    report, _ = _readiness(control, _ScopeEvidenceCursor(control, [manifest]))
+
+    assert report['passed'] is True
+    parent_report = report['parent_cycles']['parent-1']
+    assert parent_report['hard_provider_byte_cap'] == 88_080_384
+    assert parent_report['soft_provider_byte_stop'] == 83_886_080
+    assert parent_report['proxy_ledger_exact'] is True
+
+
+def test_evidence_crawled_under_the_previous_epoch_stays_readable():
+    # Production already holds ledger rows with the retired 15/14 MiB pair.
+    # A cycle that stayed inside ITS OWN cap must remain promotable, or every
+    # raise of the canon would retroactively red every accumulated slot.
+    mod = _load()
+    control = mod.control
+    manifest = _scope_manifest_fixture(
+        control, provider_bytes=12 * 1024 * 1024,
+    )
+    cursor = _with_ledger_caps(
+        _ScopeEvidenceCursor(control, [manifest]), 15_728_640, 14_680_064,
+    )
+
+    report, _ = _readiness(control, cursor)
+
+    assert report['passed'] is True
+    parent_report = report['parent_cycles']['parent-1']
+    assert parent_report['hard_provider_byte_cap'] == 15_728_640
+    assert parent_report['soft_provider_byte_stop'] == 14_680_064
+
+
+def test_a_cycle_over_its_own_epoch_cap_is_still_rejected():
+    mod = _load()
+    control = mod.control
+    manifest = _scope_manifest_fixture(
+        control, provider_bytes=16 * 1024 * 1024,
+    )
+    cursor = _with_ledger_caps(
+        _ScopeEvidenceCursor(control, [manifest]), 15_728_640, 14_680_064,
+    )
+
+    with pytest.raises(control.ReadinessError, match='hard byte cap'):
+        _readiness(control, cursor)
+
+
+@pytest.mark.parametrize(
+    ('hard', 'soft'),
+    [
+        (100 * 1024 * 1024, 14_680_064),  # above today's ceiling
+        (15_728_640, 16_000_000),         # soft above hard
+        (15_728_640, 90_000_000),         # soft above today's soft ceiling
+        (0, 0),                           # meaningless caps
+    ],
+)
+def test_incoherent_ledger_caps_are_budget_drift(hard, soft):
+    mod = _load()
+    control = mod.control
+    manifest = _scope_manifest_fixture(control)
+    cursor = _with_ledger_caps(
+        _ScopeEvidenceCursor(control, [manifest]), hard, soft,
+    )
+
+    with pytest.raises(
+        control.ReadinessError, match='parent proxy ledger budget drifted',
+    ):
+        _readiness(control, cursor)
+
+
 def test_readiness_exposes_separate_strict_competition_thresholds():
     mod = _load()
     control = mod.control

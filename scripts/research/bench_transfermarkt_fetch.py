@@ -12,9 +12,9 @@ Example (from the repository root)::
     PROXY_FILE=/opt/airflow/proxys.txt \
       python scripts/research/bench_transfermarkt_fetch.py \
         --season 2025 --players 20 --coach-clubs 3 \
-        --budget-profile production --cycle-budget-bytes 15728640
+        --budget-profile production --cycle-budget-bytes 25165824
 
-The production weekly estimate scales only the sampled per-player/per-club
+The production cycle estimate scales only the sampled per-player/per-club
 phases.  It is an estimate, while ``actual_*`` fields are measured counters.
 ``decoded_response_body_mb`` is not claimed to be provider billing; see the
 traffic audit document for the distinction.
@@ -37,23 +37,36 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from scrapers.transfermarkt.models import (  # noqa: E402
+    MAX_ROSTER_WINDOW,
+    PRODUCTION_ENTITY_BUDGETS,
+    SCOPE_HARD_PROVIDER_BYTE_CAP,
+)
+
 LOG = logging.getLogger("bench_transfermarkt")
 MIB = 1024 * 1024
-PRODUCTION_CYCLE_BUDGET_BYTES = 15 * MIB
+PRODUCTION_CYCLE_BUDGET_BYTES = SCOPE_HARD_PROVIDER_BYTE_CAP
+# Benchmark phases map one-to-one onto the production entity budgets, so the
+# benchmark can never disagree with the runner/scraper about the caps.
+_PHASE_ENTITY = {
+    "squads": "players",
+    "market_value_points": "market_value_history",
+    "transfer_events": "transfers",
+    "coaches": "coaches",
+}
 PRODUCTION_PHASE_BUDGETS: Dict[str, Dict[str, int]] = {
-    "squads": {"decoded_body_bytes": 10 * MIB, "request_attempts": 26},
-    "market_value_points": {
-        "decoded_body_bytes": 4 * MIB,
-        "request_attempts": 120,
-    },
-    "transfer_events": {
-        "decoded_body_bytes": 8 * MIB,
-        "request_attempts": 120,
-    },
-    "coaches": {"decoded_body_bytes": 6 * MIB, "request_attempts": 50},
+    phase: {
+        "decoded_body_bytes": int(
+            PRODUCTION_ENTITY_BUDGETS[entity]["decoded_mb"] * MIB
+        ),
+        "request_attempts": int(PRODUCTION_ENTITY_BUDGETS[entity]["requests"]),
+    }
+    for phase, entity in _PHASE_ENTITY.items()
 }
 MIN_COACH_COMPLETENESS = 0.9
-WEEKLY_PLAYER_TARGET = 100
+# One production scope cycle buys at most MAX_ROSTER_WINDOW careers per
+# career entity under the daily cadence; the projection scales samples to it.
+CYCLE_PLAYER_TARGET = MAX_ROSTER_WINDOW
 TYPICAL_LEAGUE_CLUBS = 20
 
 
@@ -145,7 +158,7 @@ def _scaled_bytes(phase: Mapping[str, Any], actual_units: int, target_units: int
     )
 
 
-def _weekly_projection(
+def _cycle_projection(
     phases: list[Dict[str, Any]],
     *,
     sampled_players: int,
@@ -156,12 +169,12 @@ def _weekly_projection(
     mv = _scaled_bytes(
         by_name.get("market_value_points", {}),
         sampled_players,
-        WEEKLY_PLAYER_TARGET,
+        CYCLE_PLAYER_TARGET,
     )
     transfers = _scaled_bytes(
         by_name.get("transfer_events", {}),
         sampled_players,
-        WEEKLY_PLAYER_TARGET,
+        CYCLE_PLAYER_TARGET,
     )
     coaches = _scaled_bytes(
         by_name.get("coaches", {}),
@@ -170,13 +183,17 @@ def _weekly_projection(
     )
     total = roster + mv + transfers + coaches
     return {
-        "method": "linear sample scaling; roster fixed, careers to 100 players, coaches to 20 clubs",
+        "method": (
+            "linear sample scaling; roster fixed, careers to "
+            f"{CYCLE_PLAYER_TARGET} players, coaches to "
+            f"{TYPICAL_LEAGUE_CLUBS} clubs"
+        ),
         "decoded_response_body_bytes": total,
         "decoded_response_body_mb": round(total / MIB, 4),
         "components_mb": {
             "squads": round(roster / MIB, 4),
-            "market_value_points_100_players": round(mv / MIB, 4),
-            "transfer_events_100_players": round(transfers / MIB, 4),
+            "market_value_points_window_players": round(mv / MIB, 4),
+            "transfer_events_window_players": round(transfers / MIB, 4),
             "coaches_20_clubs": round(coaches / MIB, 4),
         },
     }
@@ -225,8 +242,8 @@ def run(args: argparse.Namespace) -> tuple[int, Dict[str, Any]]:
         }
 
     # The production scraper reads these legacy aggregate overrides.  Remove
-    # them for this process so its exact per-operation 10/4/8/6 MiB and
-    # 26/120/120/50 attempt scopes remain active; the client gets an
+    # them for this process so its exact per-operation decoded/attempt scopes
+    # (the production entity budget canon) remain active; the client gets an
     # independent shared cycle ceiling below.
     previous_env = {
         key: os.environ.get(key)
@@ -378,7 +395,7 @@ def run(args: argparse.Namespace) -> tuple[int, Dict[str, Any]]:
             actual_mb = round(actual_bytes / MIB, 4)
             report["actual_decoded_response_body_bytes"] = actual_bytes
             report["actual_decoded_response_body_mb"] = actual_mb
-            report["weekly_projection"] = _weekly_projection(
+            report["cycle_projection"] = _cycle_projection(
                 report["phases"],
                 sampled_players=len(player_ids),
                 sampled_coach_clubs=(0 if args.skip_coaches else args.coach_clubs),
@@ -441,7 +458,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--cycle-budget-bytes",
         type=int,
         default=PRODUCTION_CYCLE_BUDGET_BYTES,
-        help="Shared decoded-body cap; cannot exceed the 15 MiB profile",
+        help=(
+            "Shared decoded-body cap; cannot exceed the production "
+            f"scope cap ({PRODUCTION_CYCLE_BUDGET_BYTES} bytes)"
+        ),
     )
     parser.add_argument(
         "--output",
@@ -457,8 +477,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     parser = build_parser()
     args = parser.parse_args(argv)
-    if not 1 <= args.players <= WEEKLY_PLAYER_TARGET:
-        parser.error(f"--players must be in [1, {WEEKLY_PLAYER_TARGET}]")
+    if not 1 <= args.players <= CYCLE_PLAYER_TARGET:
+        parser.error(f"--players must be in [1, {CYCLE_PLAYER_TARGET}]")
     if not 1 <= args.coach_clubs <= TYPICAL_LEAGUE_CLUBS:
         parser.error(f"--coach-clubs must be in [1, {TYPICAL_LEAGUE_CLUBS}]")
     if not 0 < args.cycle_budget_bytes <= PRODUCTION_CYCLE_BUDGET_BYTES:
@@ -478,8 +498,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         "actual_decoded_response_body_bytes": report.get(
             "actual_decoded_response_body_bytes"
         ),
-        "weekly_projection_mb": (
-            report.get("weekly_projection") or {}
+        "cycle_projection_mb": (
+            report.get("cycle_projection") or {}
         ).get("decoded_response_body_mb"),
         "request_attempts": (report.get("traffic") or {}).get("request_attempts"),
         "elapsed_seconds": report.get("elapsed_seconds"),
