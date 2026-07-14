@@ -82,6 +82,42 @@ def _bootstrap(con) -> None:
             confidence    VARCHAR
         )
     """)
+    con.execute("""
+        CREATE TABLE silver.transfermarkt_competitions_v2 (
+            competition_id            VARCHAR,
+            canonical_competition_id  VARCHAR,
+            season_format             VARCHAR,
+            registry_snapshot_id      VARCHAR
+        )
+    """)
+
+    # #948: non-slotted publish registry holds MULTIPLE snapshots per
+    # competition → the SQL must GROUP BY + only trust 'single_year' when ALL
+    # snapshots agree.
+    con.executemany(
+        "INSERT INTO silver.transfermarkt_competitions_v2 VALUES (?, ?, ?, ?)",
+        [
+            # Calendar-year league (no canonical mapping → league = 'TM-2DVB'),
+            # consistent 'single_year' across both snapshots.
+            ("2DVB", None, "single_year", "snap-1"),
+            ("2DVB", None, "single_year", "snap-2"),
+            # Registry-mapped split-year league (like live GB1 → APL).
+            ("GB1", LEAGUE, "split_year", "snap-1"),
+            ("GB1", LEAGUE, "split_year", "snap-2"),
+            # Conflicting formats between snapshots → guard → split_year.
+            ("CONF", None, "single_year", "snap-1"),
+            ("CONF", None, "split_year", "snap-2"),
+            # NULL format in one snapshot must BREAK the single_year consensus
+            # (strict COUNT(*) guard; MIN/MAX would have ignored the NULL).
+            ("NULLF", None, None, "snap-1"),
+            ("NULLF", None, "single_year", "snap-2"),
+            # TWO different competition_ids mapped to ONE canonical key with
+            # conflicting formats → collapsed per canonical key, guard →
+            # split_year on the MATCHED join path.
+            ("CUP1", "XX-Some Cup", "single_year", "snap-1"),
+            ("CUP2", "XX-Some Cup", "split_year", "snap-1"),
+        ],
+    )
 
     # (player_id, mv_date, value_eur, club_name, age, bronze_season, ingested_at)
     bronze_rows = [
@@ -104,6 +140,31 @@ def _bootstrap(con) -> None:
             "INSERT INTO bronze.transfermarkt_market_value_history "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (pid, mv_date, value_eur, club, age, LEAGUE, bronze_season, ts),
+        )
+
+    # #948: calendar-league / registry-format bronze rows. Legacy dual-write
+    # labels these seasons '2024'/'2025' already; the mv_date-derived season
+    # must follow the league's season_format, not the split-year formula.
+    extra_bronze_rows = [
+        # TM-2DVB — single_year in the registry → season = calendar year.
+        # Sep 2024 (split formula would say '2425') and Mar 2025 ('2425' too).
+        ("P_CAL", date(2024, 9, 1), 1_000_000, "Club C", 21, "TM-2DVB", "2024", T0),
+        ("P_CAL", date(2025, 3, 1), 2_000_000, "Club C", 21, "TM-2DVB", "2025", T0),
+        # TM-CONF — snapshots disagree on the format → fallback split_year.
+        ("P_CONF", date(2024, 9, 1), 3_000_000, "Club D", 22, "TM-CONF", "2024", T0),
+        # TM-UNKN — not in the registry at all → fallback split_year.
+        ("P_UNKN", date(2024, 9, 1), 4_000_000, "Club E", 23, "TM-UNKN", "2024", T0),
+        # TM-NULLF — {NULL, 'single_year'} snapshots → strict guard → split_year.
+        ("P_NULLF", date(2024, 9, 1), 5_000_000, "Club F", 24, "TM-NULLF", "2024", T0),
+        # XX-Some Cup — canonical-mapped league (join MATCHES) whose two
+        # competition_ids disagree on the format → guard → split_year.
+        ("P_CUP", date(2024, 9, 1), 6_000_000, "Club G", 25, "XX-Some Cup", "2024", T0),
+    ]
+    for pid, mv_date, value_eur, club, age, league, bronze_season, ts in extra_bronze_rows:
+        con.execute(
+            "INSERT INTO bronze.transfermarkt_market_value_history "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (pid, mv_date, value_eur, club, age, league, bronze_season, ts),
         )
 
     # xref_player — historized per season. max(season) is '2526' (so the OLD
@@ -193,6 +254,61 @@ class TestMvHistoryHistorization:
     def test_orphan_canonical_null(self, silver_rows):
         row = _by_point(silver_rows, "P_ORPH", date(2025, 9, 1))
         assert row["canonical_id"] is None
+
+
+class TestMvHistorySeasonFormat:
+    """#948: season derivation must respect the league's season_format from the
+    publish registry (silver.transfermarkt_competitions_v2)."""
+
+    def test_single_year_league_season_is_calendar_year(self, silver_rows):
+        """A single_year league gets the 4-digit calendar year, not the
+        split-year slug ('2425')."""
+        assert _by_point(silver_rows, "P_CAL", date(2024, 9, 1))["season"] == "2024"
+        assert _by_point(silver_rows, "P_CAL", date(2025, 3, 1))["season"] == "2025"
+
+    def test_single_year_league_has_no_split_slug_seasons(self, silver_rows):
+        """No phantom split slugs for the calendar league: every TM-2DVB season
+        equals str(mv_date.year)."""
+        cal_rows = [r for r in silver_rows if r["league"] == "TM-2DVB"]
+        assert cal_rows, "expected TM-2DVB rows in the output"
+        for r in cal_rows:
+            assert r["season"] == str(r["mv_date"].year), r
+
+    def test_unknown_league_falls_back_to_split_year(self, silver_rows):
+        """A league absent from the registry mapping keeps the historical
+        split-year behaviour bit-for-bit."""
+        row = _by_point(silver_rows, "P_UNKN", date(2024, 9, 1))
+        assert row["season"] == "2425"
+
+    def test_conflicting_snapshot_formats_fall_back_to_split_year(self, silver_rows):
+        """Registry snapshots disagreeing on season_format → the agreement
+        guard falls back to split_year."""
+        row = _by_point(silver_rows, "P_CONF", date(2024, 9, 1))
+        assert row["season"] == "2425"
+
+    def test_null_snapshot_format_falls_back_to_split_year(self, silver_rows):
+        """{NULL, 'single_year'} in the registry must BREAK the consensus:
+        the strict COUNT(*) guard treats NULL as disagreement (MIN/MAX would
+        have silently ignored it)."""
+        row = _by_point(silver_rows, "P_NULLF", date(2024, 9, 1))
+        assert row["season"] == "2425"
+
+    def test_conflicting_canonical_mapped_formats_fall_back_to_split_year(self, silver_rows):
+        """Two competition_ids mapped to ONE canonical key with conflicting
+        formats → collapsed per canonical key, guard → split_year. Unlike the
+        TM-CONF case this league name ('XX-Some Cup') only exists via the
+        canonical mapping, so the join MATCHED and the guard itself (not a
+        join miss) produced the fallback; one output row proves the GROUP BY
+        collapsed both registry rows (no join fan-out)."""
+        row = _by_point(silver_rows, "P_CUP", date(2024, 9, 1))
+        assert row["season"] == "2425"
+
+    def test_single_year_league_canonical_stays_null(self, silver_rows):
+        """Calendar leagues have no xref rows → canonical_id stays NULL (the
+        rows are still kept — LEFT JOIN)."""
+        for r in silver_rows:
+            if r["league"] == "TM-2DVB":
+                assert r["canonical_id"] is None, r
 
 
 class TestMvHistoryGrain:
