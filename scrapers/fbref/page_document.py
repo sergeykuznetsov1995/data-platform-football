@@ -20,7 +20,7 @@ from urllib.parse import urlparse
 from bs4 import BeautifulSoup, Comment, Tag
 
 
-PAGE_DOCUMENT_VERSION = "fbref-page-document-v2"
+PAGE_DOCUMENT_VERSION = "fbref-page-document-v3"
 BRONZE_TABLE_CONTRACT_VERSION = "fbref-bronze-contract-v1"
 
 # High-confidence source containers only. Page kinds whose table inventory is
@@ -69,6 +69,7 @@ _RESTRICTED_RE = re.compile(
     r"(?:not available|restricted|limited competitions|data (?:is|are) unavailable)",
     re.IGNORECASE,
 )
+_PLAYER_ID_RE = re.compile(r"^[0-9a-f]{8}$", re.IGNORECASE)
 
 
 def _sha256(*parts: object) -> str:
@@ -78,6 +79,76 @@ def _sha256(*parts: object) -> str:
 
 def _text(tag: Optional[Tag]) -> str:
     return "" if tag is None else tag.get_text(" ", strip=True)
+
+
+def _matches_player_profile_url(value: object, player_id: str) -> bool:
+    parsed = urlparse(str(value or "").strip())
+    hostname = str(parsed.hostname or "").casefold()
+    if parsed.scheme.casefold() != "https" or hostname not in {
+        "fbref.com",
+        "www.fbref.com",
+    }:
+        return False
+    parts = [part for part in parsed.path.split("/") if part]
+    return (
+        len(parts) == 4
+        and parts[0].casefold() == "en"
+        and parts[1].casefold() == "players"
+        and parts[2].casefold() == player_id.casefold()
+        and bool(parts[3].strip())
+    )
+
+
+def _has_verified_zero_table_player_profile(
+    html: str,
+    *,
+    target_id: str,
+    source_ids: Optional[Mapping[str, object]],
+) -> bool:
+    """Accept a real tableless profile without accepting arbitrary shells."""
+
+    player_id = str((source_ids or {}).get("player_id") or "").strip()
+    if (
+        not _PLAYER_ID_RE.fullmatch(player_id)
+        or target_id != f"fbref:player:{player_id}"
+    ):
+        return False
+
+    soup = BeautifulSoup(html or "", "html.parser")
+    canonical_matches = any(
+        "canonical"
+        in {
+            str(item).strip().casefold()
+            for item in (
+                link.get("rel")
+                if isinstance(link.get("rel"), (list, tuple))
+                else str(link.get("rel") or "").split()
+            )
+        }
+        and _matches_player_profile_url(link.get("href"), player_id)
+        for link in soup.find_all("link", href=True)
+    )
+    og_url_matches = any(
+        str(tag.get("property") or "").strip().casefold() == "og:url"
+        and _matches_player_profile_url(tag.get("content"), player_id)
+        for tag in soup.find_all("meta")
+    )
+    og_type_is_athlete = any(
+        str(tag.get("property") or "").strip().casefold() == "og:type"
+        and str(tag.get("content") or "").strip().casefold() == "athlete"
+        for tag in soup.find_all("meta")
+    )
+    profile_meta = soup.find(id="meta")
+    heading = (
+        profile_meta.find("h1") if isinstance(profile_meta, Tag) else None
+    )
+    return (
+        canonical_matches
+        and og_url_matches
+        and og_type_is_athlete
+        and isinstance(heading, Tag)
+        and bool(_text(heading))
+    )
 
 
 def _entity_ids(tag: Tag) -> Dict[str, str]:
@@ -415,6 +486,7 @@ def parse_page_document(
     *,
     target_id: str,
     page_kind: str,
+    source_ids: Optional[Mapping[str, object]] = None,
     content_hash: Optional[str] = None,
     parser_version: str = PAGE_DOCUMENT_VERSION,
 ) -> PageDocument:
@@ -453,8 +525,18 @@ def parse_page_document(
     # meaning. Competition card grids and single-match season pages are valid
     # zero-table shapes, while an empty semantic table is still evidence that
     # must be persisted with Availability.EMPTY (not rejected pre-semantics).
-    if not tables and page_kind not in _ZERO_TABLE_SEMANTIC_PAGE_KINDS:
-        errors.append("page_contract:no_tables")
+    if not tables:
+        valid_zero_table_page = (
+            page_kind in _ZERO_TABLE_SEMANTIC_PAGE_KINDS
+            or page_kind == "player"
+            and _has_verified_zero_table_player_profile(
+                html,
+                target_id=target_id,
+                source_ids=source_ids,
+            )
+        )
+        if not valid_zero_table_page:
+            errors.append("page_contract:no_tables")
     elif tables:
         required_prefixes = _REQUIRED_TABLE_PREFIXES.get(page_kind, ())
         material_ids = {

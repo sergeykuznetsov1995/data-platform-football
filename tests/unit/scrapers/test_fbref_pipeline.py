@@ -800,6 +800,86 @@ def test_cross_run_recovery_processes_raw_from_failed_source_run_offline(
     assert control.observations[key]["status"] == "succeeded"
 
 
+def test_page_v3_recovers_verified_tableless_player_from_v2_raw_offline(
+    tmp_path,
+):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    target = page_target_from_link(DiscoveredPageLink(
+        page_kind="player",
+        canonical_url=(
+            "https://fbref.com/en/players/406c5597/Naime-Said-Mchindra"
+        ),
+        source_ids={"player_id": "406c5597"},
+    ))
+    html = """
+    <html><head>
+      <link rel="canonical"
+        href="https://fbref.com/en/players/406c5597/Naime-Said-Mchindra">
+      <meta property="og:url"
+        content="https://fbref.com/en/players/406c5597/Naime-Said-Mchindra">
+      <meta property="og:type" content="Athlete">
+    </head><body><div id="meta"><h1>Naime Said Mchindra</h1></div>
+    </body></html>
+    """
+    refresh, record = _commit_for_parse(raw, target, html)
+    source_run_id = str(uuid.uuid4())
+    control.frontier[target.target_id] = {
+        "target_id": target.target_id,
+        "state": "fetched",
+        "last_content_hash": record.content_hash,
+    }
+    old_key = (
+        refresh,
+        "fbref-page-document-v2",
+        TYPED_BRONZE_PARSER_VERSION,
+        DISCOVERY_PARSER_VERSION,
+    )
+    control.observations[old_key] = {"status": "succeeded"}
+    control.fetches = [{
+        "run_id": source_run_id,
+        "source_run_type": "current",
+        "target_id": record.target_id,
+        "page_kind": record.page_kind,
+        "logical_refresh_id": refresh,
+        "content_hash": record.content_hash,
+    }]
+
+    def forbidden_transport(*_args):
+        raise AssertionError("raw recovery cannot construct a transport")
+
+    writer = ContractWriter()
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=writer,
+        fetcher_factory=forbidden_transport,
+    )
+    result = pipeline.recover_unprocessed_wave(
+        str(uuid.uuid4()),
+        page_kinds=["player"],
+        settings=_settings("current"),
+    )
+
+    assert PAGE_DOCUMENT_VERSION == "fbref-page-document-v3"
+    assert result.parsed == 1
+    assert writer.pages[0][0].tables == ()
+    assert writer.pages[0][0].errors == ()
+    new_key = (
+        refresh,
+        PAGE_DOCUMENT_VERSION,
+        TYPED_BRONZE_PARSER_VERSION,
+        DISCOVERY_PARSER_VERSION,
+    )
+    assert control.observations[old_key]["status"] == "succeeded"
+    assert control.observations[new_key]["status"] == "succeeded"
+    completion = next(
+        item for item in control.manifests if item["dataset"] == "__page__"
+    )
+    assert completion["availability"] == "empty"
+    assert completion["row_count"] == 0
+
+
 def test_stats_subpages_have_distinct_canonical_target_identity():
     first = page_target_from_link(DiscoveredPageLink(
         page_kind="season_stats",
@@ -2586,10 +2666,18 @@ def test_player_navigation_cannot_seed_match_and_deduplicates_matchlogs(
         source_ids={"player_id": "1234abcd"},
     )
     html = """
-    <a href="/en/matches/aaaaaaaa/wrong-context">Navigation match</a>
-    <a href="/en/players/1234abcd/matchlogs/">Logs root</a>
-    <a href="/en/players/1234abcd/matchlogs/2025/summary/First-Slug">Logs</a>
-    <a href="/en/players/1234abcd/matchlogs/2025/summary/Second-Slug">Duplicate</a>
+    <html><head>
+      <link rel="canonical"
+        href="https://fbref.com/en/players/1234abcd/Player">
+      <meta property="og:url"
+        content="https://fbref.com/en/players/1234abcd/Player">
+      <meta property="og:type" content="Athlete">
+    </head><body><div id="meta"><h1>Player</h1></div><main>
+      <a href="/en/matches/aaaaaaaa/wrong-context">Navigation match</a>
+      <a href="/en/players/1234abcd/matchlogs/">Logs root</a>
+      <a href="/en/players/1234abcd/matchlogs/2025/summary/First-Slug">Logs</a>
+      <a href="/en/players/1234abcd/matchlogs/2025/summary/Second-Slug">Duplicate</a>
+    </main></body></html>
     """
     refresh, record = _commit_for_parse(raw, target, html)
     control.frontier[target.target_id] = {
@@ -2618,7 +2706,7 @@ def test_player_navigation_cannot_seed_match_and_deduplicates_matchlogs(
         "logical_refresh_id": str(uuid.uuid4()),
         "metadata": {},
     })
-    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+    pipeline = FBrefPipeline(control, raw, generic_writer=ContractWriter())
 
     result = pipeline.parse_wave(
         str(uuid.uuid4()),
