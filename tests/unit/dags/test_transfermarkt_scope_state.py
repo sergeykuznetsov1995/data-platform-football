@@ -134,30 +134,66 @@ def test_scope_set_is_order_independent_and_accepts_older_child_revision():
         )
 
 
-def test_scope_set_supports_512_exact_scopes_and_rejects_513():
-    manifests = [_manifest(f'C{index}:2025') for index in range(512)]
+def test_scope_set_holds_the_whole_registry_target_and_rejects_one_more():
+    # The eligible senior-men target of the promoted registry is ~9.7k scopes
+    # and one inactive slot must be able to hold all of them at once; the old
+    # 512 cap made the slot structurally unable to cover the target it is
+    # promoted against.
+    assert state.MAX_SCOPE_SET_SIZE == 16_384
+    manifests = [
+        _manifest(f'C{index}:2025') for index in range(state.MAX_SCOPE_SET_SIZE)
+    ]
     scope_set = state.ScopeSetManifest.build(
         manifests, expected_entities=EXPECTED,
     )
-    assert len(scope_set.scope_digests) == state.MAX_SCOPE_SET_SIZE == 512
+    assert len(scope_set.scope_digests) == 16_384
 
-    with pytest.raises(state.ScopeManifestError, match='cannot exceed 512'):
+    with pytest.raises(state.ScopeManifestError, match='cannot exceed 16384'):
         state.ScopeSetManifest.build(
             [*manifests, _manifest('OVER:2025')],
             expected_entities=EXPECTED,
         )
 
 
-def test_scope_set_still_requires_one_registry_capture_parser_schema_contract():
+def test_scope_set_still_requires_one_capture_parser_schema_contract():
     one = _manifest('GB1:2025')
     drifted = state.ScopeManifest(**{
         **_manifest('CL:2025').__dict__,
         'parser_revision': 'parser-drift',
     })
-    with pytest.raises(state.ScopeManifestError, match='registry/capture/parser'):
+    with pytest.raises(state.ScopeManifestError, match='capture/parser/schema'):
         state.ScopeSetManifest.build(
             [one, drifted], expected_entities=EXPECTED,
         )
+
+
+def test_a_slot_spans_registry_snapshots_but_must_name_the_one_it_serves():
+    # A snapshot id hashes the whole source registry, so it moves whenever
+    # anything on the site does, while a slot is assembled from bounded paid
+    # batches over months.  Members may therefore carry different snapshots —
+    # but the slot itself has to say which promoted snapshot it is bound to,
+    # and that id is what enters its content address.
+    one = _manifest('GB1:2025')
+    older = state.ScopeManifest(**{
+        **_manifest('CL:2025').__dict__,
+        'registry_snapshot_id': 'tm-discovery-older',
+    })
+
+    with pytest.raises(state.ScopeManifestError, match='which\n?\\s*promoted'):
+        state.ScopeSetManifest.build([one, older], expected_entities=EXPECTED)
+
+    slot = state.ScopeSetManifest.build(
+        [one, older],
+        expected_entities=EXPECTED,
+        registry_snapshot_id='tm-discovery-current',
+    )
+    assert slot.registry_snapshot_id == 'tm-discovery-current'
+    assert len(slot.scope_digests) == 2
+    assert slot.scope_set_id != state.ScopeSetManifest.build(
+        [one, older],
+        expected_entities=EXPECTED,
+        registry_snapshot_id='tm-discovery-other',
+    ).scope_set_id
 
 
 def test_scope_manifest_json_round_trip_is_strict():
@@ -376,3 +412,26 @@ def test_a_manifest_written_before_coverage_existed_is_still_readable():
         dataclasses.replace(
             manifest, dq_evidence=dict(manifest.dq_evidence, smuggled=1),
         ).validate(EXPECTED)
+
+
+def test_a_standing_policy_leaves_its_hash_inside_the_manifest_hash():
+    # The autonomous schedule authorizes paid scopes from the committed
+    # standing policy instead of one-shot packets, so the policy hash is the
+    # only authorization trace left; it belongs inside the manifest hash, where
+    # it cannot be edited after the fact.
+    manifest = _manifest('GB1:2025')
+    signed = dataclasses.replace(
+        manifest,
+        dq_evidence=dict(manifest.dq_evidence, standing_policy_hash='c' * 64),
+    )
+    signed.validate(EXPECTED)
+    assert signed.digest != manifest.digest
+
+    for bogus in ('C' * 64, 'not-a-hash', '', None):
+        with pytest.raises(state.ScopeManifestError, match='standing policy hash'):
+            dataclasses.replace(
+                manifest,
+                dq_evidence=dict(
+                    manifest.dq_evidence, standing_policy_hash=bogus,
+                ),
+            ).validate(EXPECTED)

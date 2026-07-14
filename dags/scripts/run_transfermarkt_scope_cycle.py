@@ -1316,6 +1316,13 @@ def _build_scope_manifest(
         'roster_coverage': roster_coverage,
         'career_fetches_pending': pending_total,
     }
+    if _approval_mode(args) == 'standing_policy':
+        # The autonomous schedule authorizes this paid scope from the standing
+        # policy instead of a one-shot packet, so the policy is the only
+        # authorization left to trace.  Its sha256 was already verified against
+        # the committed file bit-for-bit; putting it inside the manifest hash
+        # makes that authorization immutable evidence rather than a log line.
+        dq_evidence['standing_policy_hash'] = str(args.standing_policy_sha256)
     scope = ScopeManifest(
         parent_cycle_id=identity.parent_cycle_id,
         child_cycle_id=identity.child_cycle_id,

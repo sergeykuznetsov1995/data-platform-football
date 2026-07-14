@@ -28,7 +28,12 @@ from scrapers.transfermarkt.models import (
     PARENT_DAILY_SOFT_PROVIDER_BYTE_STOP,
     PARENT_REQUEST_LIMIT,
     PARENT_RETRY_LIMIT,
+    SCOPE_HARD_PROVIDER_BYTE_CAP,
 )
+
+# The manifest module owns the scope-set size canon; readiness must not carry a
+# second copy of it that can silently drift from the builder's own limit.
+from .transfermarkt_scope_state import MAX_SCOPE_SET_SIZE
 
 
 STATE_KEY = 'canonical'
@@ -63,11 +68,58 @@ SLOTS = ('a', 'b')
 # evidence already accumulated under the previous one.  Requests/retries have
 # no per-row limit column and keep today's ceiling, which can only be looser
 # than any earlier epoch's limit.
-MAX_SCOPE_SET_SIZE = 16_384
 SCOPE_SET_HARD_BYTE_CAP = PARENT_DAILY_HARD_PROVIDER_BYTE_CAP
 SCOPE_SET_SOFT_BYTE_STOP = PARENT_DAILY_SOFT_PROVIDER_BYTE_STOP
 SCOPE_SET_REQUEST_LIMIT = PARENT_REQUEST_LIMIT
 SCOPE_SET_RETRY_LIMIT = PARENT_RETRY_LIMIT
+
+# A cumulative slot holds thousands of scopes; their digests and child cycle
+# ids are looked up by IN-list.  Trino parses one huge IN-list far slower than
+# a handful of bounded ones (and can exceed its expression limits), so every
+# membership lookup is chunked.
+SQL_IN_LIST_CHUNK = 1000
+
+# A gate that fails on thousands of scopes must name enough of them to act on
+# without carrying the whole target through XCom and the readiness digest.
+MAX_REPORTED_SCOPE_IDS = 100
+
+# The cutover debt gate.  A scope buys a bounded window of its roster's career
+# facts per cycle, so a freshly captured scope legitimately owes the rest; the
+# slot may be built and served in the inactive slot with that debt outstanding.
+# Flipping the READER to it is the point where the debt becomes user-visible,
+# and there the whole slot may owe at most this share of its rosters.  It is a
+# module constant on purpose — not a Param and not an env var: readiness must
+# return the identical verdict whether it is called from the operator CLI, from
+# the transform DAG or from cutover itself.
+CUTOVER_MAX_CAREER_DEBT_RATIO = 0.10
+
+# The cutover freshness gate.  A current edition must have been re-captured
+# recently — but "recently" cannot mean READINESS_MAX_AGE_DAYS here: the paid
+# budget buys PARENT_DAILY_HARD_PROVIDER_BYTE_CAP / SCOPE_HARD_PROVIDER_BYTE_CAP
+# scopes a day, so one refresh pass over the current editions of the promoted
+# registry (684 today) already takes months.  A flat 7-day rule would be
+# unsatisfiable by construction and would simply block every cutover forever.
+# The gate therefore asks the only question the crawl can answer: is the crawl
+# keeping up with the cadence its own budget allows?  Anything older than
+# CUTOVER_REFRESH_PASS_MARGIN full passes means the crawl has stalled, not that
+# the budget is small.
+CUTOVER_REFRESH_PASS_MARGIN = 2
+
+# The legacy branch is the coverage floor of the first cutover: whatever the
+# legacy control plane serves today, the v2 slot must serve too.  These are the
+# Bronze legacy relations that carry a (league, season) scope identity.
+LEGACY_SCOPE_TABLES = (
+    'iceberg.bronze.transfermarkt_players',
+    'iceberg.bronze.transfermarkt_market_value_history',
+    'iceberg.bronze.transfermarkt_transfers',
+    'iceberg.bronze.transfermarkt_coaches',
+)
+
+# The promoted registry, read read-only by the freshness gate.
+REGISTRY_COMPETITIONS_TABLE = 'iceberg.silver.transfermarkt_competitions_v2'
+REGISTRY_EDITIONS_TABLE = (
+    'iceberg.silver.transfermarkt_competition_editions_v2'
+)
 
 NATIVE_ENTITIES = (
     'squad_memberships',
@@ -998,6 +1050,32 @@ def _scalar(cur, sql: str):
     cur.execute(sql)
     rows = cur.fetchall()
     return rows[0][0] if rows else None
+
+
+def _chunked(values: Sequence[Any], size: int | None = None) -> list[list[Any]]:
+    """Split an IN-list into Trino-sized chunks, preserving order."""
+
+    limit = int(SQL_IN_LIST_CHUNK if size is None else size)
+    if limit < 1:
+        raise ValueError('IN-list chunk size must be positive')
+    items = list(values)
+    return [items[start:start + limit] for start in range(0, len(items), limit)]
+
+
+def _fetch_in_chunks(cur, sql_template: str, values: Sequence[Any]) -> list[tuple]:
+    """Run one membership query per bounded IN-list chunk and concatenate.
+
+    ``sql_template`` contains a single ``{in_list}`` placeholder.  A cumulative
+    slot carries thousands of members, and Trino handles several bounded lists
+    far better than one unbounded one.
+    """
+
+    rows: list[tuple] = []
+    for chunk in _chunked(values):
+        in_list = ', '.join(_sql_literal(item) for item in chunk)
+        cur.execute(sql_template.format(in_list=in_list))
+        rows.extend(cur.fetchall())
+    return rows
 
 
 def _table_missing(exc: BaseException) -> bool:
@@ -2814,19 +2892,22 @@ WHERE scope_set_id = {_sql_literal(scope_set)}
     if require_fresh and not bool(set_fresh):
         raise ReadinessError('scope-set ops row is stale')
 
-    digest_sql = ', '.join(_sql_literal(item[1]) for item in scope_digests)
-    cur.execute(f"""
+    rows = _fetch_in_chunks(
+        cur,
+        f"""
 SELECT parent_cycle_id, child_cycle_id, scope_id, competition_id, edition_id,
        canonical_competition_id, canonical_season, registry_snapshot_id,
        capture_revision, parser_revision, schema_revision, reader_revision,
        entity_manifest_json, manifest_digest, status, committed_at,
        committed_at >= CURRENT_TIMESTAMP
-           - INTERVAL '{READINESS_MAX_AGE_DAYS}' DAY AS is_fresh
+           - INTERVAL '{READINESS_MAX_AGE_DAYS}' DAY AS is_fresh,
+       DATE_DIFF('day', committed_at, CURRENT_TIMESTAMP) AS age_days
 FROM {scope_state.SCOPE_MANIFEST_TABLE}
-WHERE manifest_digest IN ({digest_sql})
+WHERE manifest_digest IN ({{in_list}})
 ORDER BY scope_id, committed_at
-""")
-    rows = list(cur.fetchall())
+""",
+        [item[1] for item in scope_digests],
+    )
     expected_digests = dict(scope_digests)
     if len(rows) != len(expected_digests):
         raise ReadinessError(
@@ -2840,6 +2921,7 @@ ORDER BY scope_id, committed_at
             canonical_competition, canonical_season, row_registry,
             row_capture, row_parser, row_schema, row_reader,
             entity_json, manifest_digest, status, row_committed_at, row_fresh,
+            row_age_days,
         ) = row
         try:
             entity_value = json.loads(entity_json)
@@ -2875,8 +2957,15 @@ ORDER BY scope_id, committed_at
             raise ReadinessError(f'invalid child scope manifest: {exc}') from exc
         if status != scope_state.SCOPE_COMPLETION_STATUS:
             raise ReadinessError(f'{scope_id}: child scope is not successful')
-        if require_fresh and not bool(row_fresh):
-            raise ReadinessError(f'{scope_id}: child scope manifest is stale')
+        # A finished edition is finished: its manifest is evidence forever.
+        # Only an edition the registry still marks current can go stale, and a
+        # cumulative slot is assembled over months, so a blanket age limit
+        # would evict settled history faster than a bounded paid crawl could
+        # ever re-earn it.  Staleness is a QUALITY verdict on the slot, never a
+        # membership rule: dropping a stale scope would shrink the slot, and a
+        # slot that can shrink can never satisfy the monotonicity gate on the
+        # next advance.  So the scope stays in, and its age is gated at cutover.
+        edition_current = bool(manifest.dq_evidence['edition_current'])
         if manifest.digest != str(manifest_digest):
             raise ReadinessError(f'{scope_id}: child manifest digest drifted')
         if expected_digests.get(str(scope_id)) != manifest.digest:
@@ -2910,6 +2999,8 @@ ORDER BY scope_id, committed_at
             ),
             'committed_at': row_committed_at,
             'fresh': bool(row_fresh),
+            'age_days': int(row_age_days or 0),
+            'edition_current': edition_current,
         }
     if len({item.child_cycle_id for item in manifests}) != len(manifests):
         raise ReadinessError('scope set reuses a child cycle id')
@@ -2925,6 +3016,9 @@ ORDER BY scope_id, committed_at
             manifests,
             expected_entities=NATIVE_ENTITIES,
             reader_revision=revision,
+            # The slot states which promoted registry snapshot it was frozen
+            # against; its members may have been captured under earlier ones.
+            registry_snapshot_id=persisted_set.registry_snapshot_id,
         )
     except scope_state.ScopeManifestError as exc:
         raise ReadinessError(f'scope-set rebuild failed: {exc}') from exc
@@ -2951,58 +3045,75 @@ ORDER BY scope_id, committed_at
         parent: scope_state.aggregate_traffic(parent_manifests)
         for parent, parent_manifests in manifests_by_parent.items()
     }
-    for parent, metrics in parent_traffic.items():
-        # Byte caps are checked against the caps that parent cycle actually
-        # crawled under (its own ledger rows, below).  Requests and retries
-        # have no per-row limit column in PROXY_LEDGER_TABLE, so they are
-        # checked against today's ceiling instead — deliberately: the crawl's
-        # own request/retry limits were already enforced where it matters,
-        # at crawl time (the wrapper's attempt guard plus the argv/approval
-        # pinning), and readiness is only the secondary net here.  Adding two
-        # columns to the ops table for retrospective strictness would not pay
-        # for itself, and today's ceiling can only be looser than an earlier
-        # epoch's limit, so it never turns healthy evidence red.
-        if metrics['requests'] > SCOPE_SET_REQUEST_LIMIT:
-            raise ReadinessError(
-                f'{parent}: parent cycle exceeds the approved request limit'
-            )
-        if metrics['retries'] > SCOPE_SET_RETRY_LIMIT:
-            raise ReadinessError(
-                f'{parent}: parent cycle exceeds the approved retry limit'
-            )
-
-    parent_sql = ', '.join(
-        _sql_literal(parent) for parent in manifests_by_parent
-    )
-    cur.execute(f"""
+    # Byte caps are charged against the caps that parent cycle actually crawled
+    # under (its own ledger rows, below).  Requests and retries have no per-row
+    # limit column in PROXY_LEDGER_TABLE, so they are charged against today's
+    # ceiling instead — deliberately: the crawl's own request/retry limits were
+    # already enforced where it matters, at crawl time (the wrapper's attempt
+    # guard plus the argv/approval pinning), and readiness is only the secondary
+    # net here.  Adding two columns to the ops table for retrospective
+    # strictness would not pay for itself, and today's ceiling can only be
+    # looser than an earlier epoch's limit, so it never turns healthy evidence
+    # red.
+    #
+    # The budget is audited for every parent cycle that ever committed a
+    # complete manifest for a scope in this slot — not merely for the cycles
+    # whose manifests survived latest-per-scope.  Otherwise a cycle could
+    # overspend, be fully superseded by a later re-crawl, and have its overrun
+    # disappear from the evidence with it.
+    audited_parents = sorted(set(manifests_by_parent) | {
+        str(row[0])
+        for row in _fetch_in_chunks(
+            cur,
+            f"""
+SELECT DISTINCT parent_cycle_id
+FROM {scope_state.SCOPE_MANIFEST_TABLE}
+WHERE status = {_sql_literal(scope_state.SCOPE_COMPLETION_STATUS)}
+  AND scope_id IN ({{in_list}})
+""",
+            [item[0] for item in scope_digests],
+        )
+    })
+    ledger_rows = _fetch_in_chunks(
+        cur,
+        f"""
 SELECT parent_cycle_id, entity, decoded_bytes, wire_bytes,
        provider_metered_bytes, requests,
        retries, cache_hits, duration_ms, hard_limit_bytes, soft_limit_bytes
 FROM {scope_state.PROXY_LEDGER_TABLE}
-WHERE parent_cycle_id IN ({parent_sql})
+WHERE parent_cycle_id IN ({{in_list}})
 ORDER BY parent_cycle_id, entity
-""")
-    ledger_rows = list(cur.fetchall())
+""",
+        audited_parents,
+    )
+    traffic_fields_tuple = (
+        'decoded_bytes', 'wire_bytes', 'provider_metered_bytes',
+        'requests', 'retries', 'cache_hits', 'duration_ms',
+    )
     by_parent_entity = {
         (parent, entity): {
             field: sum(
                 int(getattr(manifest_entity, field))
-                for manifest in parent_manifests
+                for manifest in manifests_by_parent.get(parent, ())
                 for manifest_entity in manifest.entities
                 if manifest_entity.entity == entity
             )
-            for field in (
-                'decoded_bytes', 'wire_bytes', 'provider_metered_bytes',
-                'requests', 'retries', 'cache_hits', 'duration_ms',
-            )
+            for field in traffic_fields_tuple
         }
-        for parent, parent_manifests in manifests_by_parent.items()
+        for parent in audited_parents
         for entity in NATIVE_ENTITIES
     }
     if len(ledger_rows) != len(by_parent_entity):
         raise ReadinessError('per-parent proxy ledger entity set is incomplete')
     seen_ledger = set()
     parent_row_caps: dict[str, set[tuple[int, int]]] = {}
+    ledger_traffic: dict[str, dict[str, int]] = {
+        parent: dict.fromkeys(traffic_fields_tuple, 0)
+        for parent in audited_parents
+    }
+    exact_ledger: dict[str, bool] = {
+        parent: True for parent in manifests_by_parent
+    }
     for row in ledger_rows:
         row_parent, entity, *values, row_hard_cap, row_soft_cap = row
         key = (str(row_parent), str(entity))
@@ -3012,17 +3123,29 @@ ORDER BY parent_cycle_id, entity
             )
         seen_ledger.add(key)
         actual = dict(zip(
-            (
-                'decoded_bytes', 'wire_bytes', 'provider_metered_bytes',
-                'requests', 'retries', 'cache_hits', 'duration_ms',
-            ),
+            traffic_fields_tuple,
             (int(value) for value in values),
             strict=True,
         ))
-        if actual != by_parent_entity[key]:
+        # A ledger row is the parent cycle's FULL spend, while the slot holds
+        # only the manifests of that cycle which survived latest-per-scope (a
+        # re-crawl supersedes an older manifest, a failed child leaves none at
+        # all).  So the slot's per-entity sums are a SUBSET of the row, and
+        # exact equality cannot be required.  Containment is what is left, and
+        # it is the direction that matters: the slot may never claim traffic the
+        # ledger did not record.  The budget itself is charged against the
+        # ledger's own totals below — over every cycle that ever crawled a scope
+        # of this slot, including cycles now fully superseded.
+        in_slot = by_parent_entity[key]
+        if any(actual[field] < in_slot[field] for field in traffic_fields_tuple):
             raise ReadinessError(
-                f'{key[0]}:{key[1]}: parent proxy ledger drifted'
+                f'{key[0]}:{key[1]}: scope set claims traffic the parent proxy '
+                'ledger never recorded'
             )
+        if key[0] in exact_ledger and actual != in_slot:
+            exact_ledger[key[0]] = False
+        for field in traffic_fields_tuple:
+            ledger_traffic[key[0]][field] += actual[field]
         # A row states the caps ITS crawl ran under.  Equality with today's
         # canon would turn every earlier epoch's evidence red the moment the
         # canon moves (and it already would have: production rows carry the
@@ -3046,21 +3169,34 @@ ORDER BY parent_cycle_id, entity
                 f'{parent}: parent proxy ledger rows disagree on the budget'
             )
         parent_hard, _parent_soft = next(iter(caps))
-        if parent_traffic[parent]['provider_metered_bytes'] > parent_hard:
+        if ledger_traffic[parent]['provider_metered_bytes'] > parent_hard:
             raise ReadinessError(
                 f'{parent}: parent cycle exceeds the provider hard byte cap'
+            )
+        if ledger_traffic[parent]['requests'] > SCOPE_SET_REQUEST_LIMIT:
+            raise ReadinessError(
+                f'{parent}: parent cycle exceeds the approved request limit'
+            )
+        if ledger_traffic[parent]['retries'] > SCOPE_SET_RETRY_LIMIT:
+            raise ReadinessError(
+                f'{parent}: parent cycle exceeds the approved retry limit'
             )
 
     parent_reports = {
         parent: {
-            'traffic': metrics,
+            'traffic': parent_traffic.get(
+                parent, dict.fromkeys(traffic_fields_tuple, 0),
+            ),
+            'ledger_traffic': ledger_traffic[parent],
+            'in_scope_set': parent in manifests_by_parent,
             'hard_provider_byte_cap': next(iter(parent_row_caps[parent]))[0],
             'soft_provider_byte_stop': next(iter(parent_row_caps[parent]))[1],
             'request_limit': SCOPE_SET_REQUEST_LIMIT,
             'retry_limit': SCOPE_SET_RETRY_LIMIT,
-            'proxy_ledger_exact': True,
+            'proxy_ledger_exact': exact_ledger.get(parent, True),
+            'proxy_ledger_contains_scope_set': True,
         }
-        for parent, metrics in parent_traffic.items()
+        for parent in audited_parents
     }
 
     return ({
@@ -3068,8 +3204,12 @@ ORDER BY parent_cycle_id, entity
         'scope_set_id': scope_set,
         'requested_parent_cycle_id': requested_parent,
         'parent_cycle_ids': list(manifests_by_parent),
+        'audited_parent_cycle_ids': audited_parents,
         'reader_revision': revision,
         'registry_snapshot_id': persisted_set.registry_snapshot_id,
+        'member_registry_snapshot_ids': sorted({
+            item.registry_snapshot_id for item in manifests
+        }),
         'scope_count': len(manifests),
         'scope_digests': [list(item) for item in scope_digests],
         'traffic': traffic,
@@ -3078,7 +3218,8 @@ ORDER BY parent_cycle_id, entity
         'committed_at': committed_at,
         'fresh': bool(set_fresh),
         'scopes': row_evidence,
-        'proxy_ledger_exact': True,
+        'proxy_ledger_exact': all(exact_ledger.values()),
+        'proxy_ledger_contains_scope_set': True,
     }, tuple(manifests))
 
 
@@ -3095,9 +3236,19 @@ def _scope_write_manifest_report(
     if write_mode not in {'dual', 'native-only'}:
         raise ValueError(f'unsupported scope-set write mode: {write_mode}')
     child_ids = tuple(str(item.child_cycle_id) for item in manifests)
-    child_sql = ','.join(_sql_literal(value) for value in child_ids)
+    # Freshness follows the manifest's own immutable claim about its edition: a
+    # settled historical edition keeps its write evidence forever, only a
+    # current edition can be stale.  Staleness is reported, never a membership
+    # or hard-failure rule — the cutover gate decides what to do with it (a slot
+    # that dropped its stale scopes could never stay monotone).
+    current_children = {
+        str(item.child_cycle_id)
+        for item in manifests
+        if bool(item.dq_evidence['edition_current'])
+    }
+    stale_children: set[str] = set()
     if write_mode == 'dual':
-        cur.execute(f"""
+        rows = _fetch_in_chunks(cur, f"""
 SELECT cycle_id, entity, legacy_table, native_table,
        legacy_batch_id, native_batch_id,
        legacy_rows, native_rows, legacy_hash, native_hash, status,
@@ -3105,20 +3256,19 @@ SELECT cycle_id, entity, legacy_table, native_table,
        committed_at >= CURRENT_TIMESTAMP
            - INTERVAL '{READINESS_MAX_AGE_DAYS}' DAY AS is_fresh
 FROM {DUAL_WRITE_MANIFEST_TABLE}
-WHERE cycle_id IN ({child_sql})
+WHERE cycle_id IN ({{in_list}})
 ORDER BY cycle_id, entity
-""")
+""", child_ids)
     else:
-        cur.execute(f"""
+        rows = _fetch_in_chunks(cur, f"""
 SELECT cycle_id, entity, native_table, native_batch_id, native_rows,
        native_hash, writer_revision, write_mode, status, committed_at,
        committed_at >= CURRENT_TIMESTAMP
            - INTERVAL '{READINESS_MAX_AGE_DAYS}' DAY AS is_fresh
 FROM {NATIVE_WRITE_MANIFEST_TABLE}
-WHERE cycle_id IN ({child_sql})
+WHERE cycle_id IN ({{in_list}})
 ORDER BY cycle_id, entity
-""")
-    rows = list(cur.fetchall())
+""", child_ids)
     expected = {
         (str(manifest.child_cycle_id), entity.entity): entity
         for manifest in manifests
@@ -3153,8 +3303,14 @@ ORDER BY cycle_id, entity
         if evidence is None or key in seen:
             raise ReadinessError('write manifest has duplicate/unknown child entity')
         seen.add(key)
-        if status != 'success' or (require_fresh and not bool(is_fresh)):
-            raise ReadinessError(f'{key}: write manifest is red or stale')
+        if status != 'success':
+            raise ReadinessError(f'{key}: write manifest is red')
+        if (
+            require_fresh
+            and str(child) in current_children
+            and not bool(is_fresh)
+        ):
+            stale_children.add(str(child))
         if (
             int(native_rows) != int(evidence.dedup_rows)
             or str(native_hash) != evidence.key_hash
@@ -3230,6 +3386,8 @@ ORDER BY cycle_id, entity
         'passed': len(seen) == len(expected),
         'write_mode': write_mode,
         'expected_rows': len(expected),
+        'stale_child_cycle_count': len(stale_children),
+        'stale_child_cycle_ids': sorted(stale_children)[:MAX_REPORTED_SCOPE_IDS],
         'rows': report,
     }
 
@@ -3407,6 +3565,281 @@ def _scope_competition_type_dq_report(
     }
 
 
+def _career_debt_report(
+    manifests: Sequence[Any],
+    *,
+    max_ratio: float = CUTOVER_MAX_CAREER_DEBT_RATIO,
+) -> dict[str, Any]:
+    """Measure the career-fact debt the slot would serve after a cutover.
+
+    Every scope buys a bounded window of its roster's market-value and transfer
+    histories per cycle and states the remainder as ``career_fetches_pending``
+    inside its manifest hash.  Coverage of the registry target no longer gates
+    promotion of the inactive slot, so this is the gate that keeps a
+    half-fetched slot away from readers.  A manifest that states no debt at all
+    is not treated as debt-free: it is evidence that predates the contract, so
+    the gate fails closed and names it.
+    """
+
+    from fractions import Fraction
+
+    limit = Fraction(str(max_ratio))
+    if not 0 <= limit <= 1:
+        raise ValueError('career debt ratio must be within [0, 1]')
+    unstated = sorted(
+        str(item.scope_id) for item in manifests
+        if 'career_fetches_pending' not in item.dq_evidence
+        or 'roster_coverage' not in item.dq_evidence
+    )
+    pending = sum(
+        int(item.dq_evidence['career_fetches_pending'])
+        for item in manifests
+        if 'career_fetches_pending' in item.dq_evidence
+    )
+    roster = sum(
+        int(entity['roster_size'])
+        for item in manifests
+        if 'roster_coverage' in item.dq_evidence
+        for entity in item.dq_evidence['roster_coverage'].values()
+    )
+    if roster > 0:
+        ratio = Fraction(pending, roster)
+    else:
+        # No roster at all: nothing is owed only if nothing is pending.
+        ratio = Fraction(0) if pending == 0 else Fraction(1)
+    return {
+        'passed': not unstated and ratio <= limit,
+        'career_fetches_pending': pending,
+        'roster_size': roster,
+        'career_debt_ratio': float(ratio),
+        'max_career_debt_ratio': float(limit),
+        'unstated_scope_count': len(unstated),
+        'unstated_scope_ids': unstated[:MAX_REPORTED_SCOPE_IDS],
+    }
+
+
+def achievable_scopes_per_day() -> int:
+    """How many scopes one approved paid day can actually buy."""
+
+    return max(
+        1,
+        int(PARENT_DAILY_HARD_PROVIDER_BYTE_CAP // SCOPE_HARD_PROVIDER_BYTE_CAP),
+    )
+
+
+def current_edition_refresh_horizon_days(current_scope_count: int) -> int:
+    """The age a current edition may reach before the crawl is behind itself."""
+
+    per_day = achievable_scopes_per_day()
+    pass_days = -(-int(current_scope_count) // per_day)  # ceil
+    return max(
+        READINESS_MAX_AGE_DAYS, pass_days * CUTOVER_REFRESH_PASS_MARGIN,
+    )
+
+
+def _registry_current_edition_count(cur, registry_snapshot_id: str) -> int:
+    """How many current editions the promoted registry expects to be served."""
+
+    return int(_scalar(cur, f"""
+SELECT COUNT(*)
+FROM {REGISTRY_COMPETITIONS_TABLE} c
+JOIN {REGISTRY_EDITIONS_TABLE} e
+  ON e.competition_id = c.competition_id
+ AND e.registry_snapshot_id = c.registry_snapshot_id
+WHERE c.registry_snapshot_id = {_sql_literal(registry_snapshot_id)}
+  AND c.active = true
+  AND c.classification_status = 'eligible'
+  AND c.gender = 'men'
+  AND c.age_category = 'senior'
+  AND c.team_type IN ('club', 'national_team')
+  AND e.active = true
+  AND e.is_current = true
+""") or 0)
+
+
+def _current_edition_freshness_report(
+    cur,
+    *,
+    scopes: Mapping[str, Mapping[str, Any]],
+    registry_snapshot_id: str,
+    stale_write_children: Sequence[str] = (),
+    applicable: bool,
+) -> dict[str, Any]:
+    """Gate the age of the slot's current editions against the paid cadence.
+
+    A stale current edition is never dropped from the slot (that would let the
+    slot shrink, and a shrinking slot can never pass the monotonicity gate on
+    the next advance).  It is carried, measured, and blocks the READER flip.
+
+    The gate closes both ends of the same question, having been blind to each:
+
+    * a slot that serves NO current edition while the registry has some may not
+      be flipped to — an absent current season is not a fresh one;
+    * a current edition older than the cadence the paid budget can actually
+      deliver means the crawl has stalled.  A flat READINESS_MAX_AGE_DAYS cannot
+      be that yardstick: the budget buys three scopes a day and the registry has
+      684 current editions, so a 7-day rule is unsatisfiable by construction and
+      would block every cutover forever.
+    * the write manifests of those same current children must be equally recent;
+      they are written in the same child cycle, so a stale one is the same fact
+      seen from the writer's side.
+    """
+
+    current = {
+        scope_id: item for scope_id, item in scopes.items()
+        if bool(item.get('edition_current'))
+    }
+    target_currents = (
+        _registry_current_edition_count(cur, registry_snapshot_id)
+        if applicable else 0
+    )
+    horizon = current_edition_refresh_horizon_days(
+        max(len(current), target_currents)
+    )
+    ages = [int(item.get('age_days') or 0) for item in current.values()]
+    stale = sorted(
+        scope_id for scope_id, item in current.items()
+        if int(item.get('age_days') or 0) > horizon
+    )
+    stale_writes = sorted(str(item) for item in stale_write_children)
+    hollow = bool(target_currents and not current)
+    within_readiness_window = sum(
+        1 for item in current.values() if bool(item.get('fresh'))
+    )
+    return {
+        'applicable': bool(applicable),
+        'passed': bool(
+            not applicable or (not stale and not stale_writes and not hollow)
+        ),
+        'current_scope_count': len(current),
+        'registry_current_edition_count': target_currents,
+        'serves_no_current_edition': hollow,
+        'achievable_scopes_per_day': achievable_scopes_per_day(),
+        'refresh_horizon_days': horizon,
+        'max_current_age_days': max(ages) if ages else 0,
+        'current_within_readiness_window': within_readiness_window,
+        'stale_write_manifest_children': stale_writes[:MAX_REPORTED_SCOPE_IDS],
+        'stale_current_scope_count': len(stale),
+        'stale_current_scope_ids': stale[:MAX_REPORTED_SCOPE_IDS],
+    }
+
+
+def _legacy_coverage_floor_report(
+    cur,
+    *,
+    manifests: Sequence[Any],
+    applicable: bool,
+) -> dict[str, Any]:
+    """The legacy branch is the coverage floor of the first cutover.
+
+    Flipping the reader while the v2 slot serves fewer (league, season) scopes
+    than the legacy branch already serves would silently delete competitions
+    from every downstream mart.  So before the first cutover every distinct
+    scope identity present in the legacy Bronze relations must be present in
+    the slot.  Once the reader is already on v2 this is superseded by the
+    monotonicity gate below.
+    """
+
+    covered = {
+        (str(item.canonical_competition_id), str(item.canonical_season))
+        for item in manifests
+    }
+    if not applicable:
+        return {
+            'applicable': False,
+            'passed': True,
+            'legacy_scope_count': 0,
+            'covered_scope_count': 0,
+            'missing_scope_count': 0,
+            'missing_scopes': [],
+        }
+    union_sql = '\nUNION\n'.join(
+        f'SELECT DISTINCT league, season FROM {table} '
+        'WHERE league IS NOT NULL AND season IS NOT NULL'
+        for table in LEGACY_SCOPE_TABLES
+    )
+    cur.execute(f'SELECT league, season FROM (\n{union_sql}\n) ORDER BY 1, 2')
+    legacy = {
+        (str(row[0]).strip(), str(row[1]).strip()) for row in cur.fetchall()
+    }
+    missing = sorted(legacy - covered)
+    return {
+        'applicable': True,
+        'passed': not missing,
+        'legacy_scope_count': len(legacy),
+        'covered_scope_count': len(legacy & covered),
+        'missing_scope_count': len(missing),
+        'missing_scopes': [list(item) for item in missing[:MAX_REPORTED_SCOPE_IDS]],
+    }
+
+
+def _scope_set_monotonicity_report(
+    cur,
+    *,
+    manifests: Sequence[Any],
+    approved_scope_set_id: str | None,
+    scope_set_id: str,
+    applicable: bool,
+) -> dict[str, Any]:
+    """A promoted slot may grow, never shrink.
+
+    The slot is cumulative, so an advance normally adds scopes.  A scope that
+    silently drops out of it — an evicted stale manifest, a re-planned target —
+    would take its competition out of the served model with it, so the
+    candidate set must contain every scope the currently approved set contains.
+    """
+
+    from . import transfermarkt_scope_state as scope_state
+
+    candidate = {str(item.scope_id) for item in manifests}
+    if (
+        not applicable
+        or approved_scope_set_id is None
+        or approved_scope_set_id == scope_set_id
+    ):
+        return {
+            'applicable': False,
+            'passed': True,
+            'approved_scope_set_id': approved_scope_set_id,
+            'approved_scope_count': 0,
+            'candidate_scope_count': len(candidate),
+            'missing_scope_count': 0,
+            'missing_scope_ids': [],
+        }
+    approved = _normalise_scope_set_id(approved_scope_set_id)
+    cur.execute(f"""
+SELECT scope_digests_json
+FROM {scope_state.SCOPE_SET_MANIFEST_TABLE}
+WHERE scope_set_id = {_sql_literal(approved)}
+  AND status = 'success'
+""")
+    rows = list(cur.fetchall())
+    if len(rows) != 1:
+        raise ReadinessError(
+            'the approved scope set has no exact ops row; coverage '
+            'monotonicity cannot be proven'
+        )
+    try:
+        digests = json.loads(rows[0][0])
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ReadinessError(
+            'approved scope-set digests are unreadable'
+        ) from exc
+    if not isinstance(digests, list) or not digests:
+        raise ReadinessError('approved scope-set digests are empty')
+    approved_scopes = {str(item[0]).strip() for item in digests}
+    missing = sorted(approved_scopes - candidate)
+    return {
+        'applicable': True,
+        'passed': not missing,
+        'approved_scope_set_id': approved,
+        'approved_scope_count': len(approved_scopes),
+        'candidate_scope_count': len(candidate),
+        'missing_scope_count': len(missing),
+        'missing_scope_ids': missing[:MAX_REPORTED_SCOPE_IDS],
+    }
+
+
 def _scope_set_readiness(
     cur,
     cycle_id: str,
@@ -3419,6 +3852,8 @@ def _scope_set_readiness(
     candidate_slot_override: str | None,
     allow_retained_rollback_slot: bool,
     allow_previous_slot: bool,
+    cutover_gates: bool = True,
+    max_career_debt_ratio: float = CUTOVER_MAX_CAREER_DEBT_RATIO,
 ) -> dict[str, Any]:
     """Evaluate production readiness for a bounded immutable set of scopes."""
 
@@ -3531,6 +3966,51 @@ def _scope_set_readiness(
     coverage = _scope_set_coverage_report(
         cur, manifests=manifests, candidate_slot=candidate_slot,
     )
+    # The cutover gates below judge a reader flip, not a slot build.  Building
+    # and serving the inactive slot must stay possible while the crawl is still
+    # paying off its career debt and still growing towards the legacy floor —
+    # that is the whole point of a cumulative slot — so the transform passes
+    # cutover_gates=False.  A promotion (cutover/advance) always evaluates them.
+    # A cycle that is being re-verified after it was already promoted (restore,
+    # rollback-slot, the master-pipeline marker) is not a new promotion: its
+    # gates were judged once, at the transition that approved it, and the
+    # evidence is immutable.  Re-judging it here could only strand a live reader
+    # if a ceiling moved afterwards.
+    enforce_cutover_gates = bool(cutover_gates and not historical)
+    # ``ready`` is judged against the canon, never against a caller's ratio: an
+    # operator asking "what would readiness say at 0.5?" must not be told the
+    # slot is ready when cutover would refuse it.  The requested ratio is
+    # reported next to the verdict, not instead of it.
+    career_debt = _career_debt_report(manifests)
+    requested_ratio = float(max_career_debt_ratio)
+    if requested_ratio != CUTOVER_MAX_CAREER_DEBT_RATIO:
+        career_debt['requested_max_career_debt_ratio'] = requested_ratio
+        career_debt['passes_at_requested_ratio'] = _career_debt_report(
+            manifests, max_ratio=requested_ratio,
+        )['passed']
+    freshness = _current_edition_freshness_report(
+        cur,
+        scopes=scope_report['scopes'],
+        registry_snapshot_id=scope_report['registry_snapshot_id'],
+        stale_write_children=writes.get('stale_child_cycle_ids', ()),
+        applicable=bool(enforce_cutover_gates and require_fresh),
+    )
+    legacy_floor = _legacy_coverage_floor_report(
+        cur,
+        manifests=manifests,
+        applicable=bool(
+            enforce_cutover_gates and state.active_version == 'legacy'
+        ),
+    )
+    monotonicity = _scope_set_monotonicity_report(
+        cur,
+        manifests=manifests,
+        approved_scope_set_id=state.approved_scope_set_id,
+        scope_set_id=scope_set,
+        applicable=bool(
+            enforce_cutover_gates and state.active_version == 'v2'
+        ),
+    )
     gold_ok = all(item['passed'] for item in gold.values())
     ready = bool(
         scope_report['passed']
@@ -3540,6 +4020,10 @@ def _scope_set_readiness(
         and model_manifest['passed']
         and gold_ok
         and coverage['passed']
+        and (not enforce_cutover_gates or career_debt['passed'])
+        and freshness['passed']
+        and legacy_floor['passed']
+        and monotonicity['passed']
         and (not historical or promotion_history_events > 0)
     )
     return {
@@ -3555,6 +4039,11 @@ def _scope_set_readiness(
         'promotion_history_events': promotion_history_events,
         'freshness_required': require_fresh,
         'current_snapshots_required': require_current_snapshots,
+        'cutover_gates_enforced': enforce_cutover_gates,
+        'career_debt': career_debt,
+        'current_edition_freshness': freshness,
+        'legacy_coverage_floor': legacy_floor,
+        'scope_set_monotonicity': monotonicity,
         'ready': ready,
         'scope_set_manifest': scope_report,
         'competition_type_dq': competition_type_dq,
@@ -3587,6 +4076,8 @@ def readiness(
     allow_previous_slot: bool = False,
     scope_set_id: str | None = None,
     parent_cycle_id: str | None = None,
+    cutover_gates: bool = True,
+    max_career_debt_ratio: float = CUTOVER_MAX_CAREER_DEBT_RATIO,
 ) -> dict[str, Any]:
     """Evaluate every gate for exactly one caller-supplied production cycle."""
     if scope_set_id is not None or parent_cycle_id is not None:
@@ -3603,6 +4094,8 @@ def readiness(
             candidate_slot_override=candidate_slot_override,
             allow_retained_rollback_slot=allow_retained_rollback_slot,
             allow_previous_slot=allow_previous_slot,
+            cutover_gates=cutover_gates,
+            max_career_debt_ratio=max_career_debt_ratio,
         )
     if league is None or season is None:
         raise ValueError(
