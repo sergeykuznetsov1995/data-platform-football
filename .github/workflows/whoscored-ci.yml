@@ -1,0 +1,143 @@
+name: WhoScored production CI
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/whoscored-ci.yml"
+      - "compose.yaml"
+      - ".env.example"
+      - ".gitignore"
+      - "docs/operations/**"
+      - "docker/images/airflow/requirements-airflow.txt"
+      - "dags/dag_ingest_whoscored.py"
+      - "dags/dag_backfill_whoscored.py"
+      - "dags/dag_backup_whoscored_storage.py"
+      - "dags/dag_iceberg_maintenance.py"
+      - "dags/dag_iceberg_maintenance_daily.py"
+      - "dags/dag_master_pipeline.py"
+      - "dags/dag_transform_fbref_silver.py"
+      - "dags/scripts/run_whoscored_scraper.py"
+      - "dags/scripts/run_whoscored_backfill_item.py"
+      - "dags/scripts/whoscored_ops_store.py"
+      - "dags/scripts/whoscored_frozen_dq.py"
+      - "dags/scripts/whoscored_identity.py"
+      - "dags/utils/config.py"
+      - "dags/utils/maintenance_tasks.py"
+      - "configs/seaweedfs/**"
+      - "scrapers/base/iceberg_writer.py"
+      - "scrapers/whoscored/**"
+      - "scripts/**/*whoscored*"
+      - "scripts/cutover_seaweedfs_topology.sh"
+      - "scripts/seaweedfs_plane_entrypoint.sh"
+      - "scripts/init_seaweedfs_bucket.py"
+      - "scripts/flaresolverr_extended.py"
+      - "scripts/proxy_filter/**"
+      - "tests/**/*whoscored*"
+      - "tests/unit/scripts/test_cutover_seaweedfs_topology.py"
+      - "tests/unit/scripts/test_seaweedfs_plane_entrypoint.py"
+      - "tests/unit/scripts/test_init_seaweedfs_bucket.py"
+      - "tests/unit/dags/test_maintenance_tasks.py"
+      - "tests/unit/dags/test_dag_iceberg_maintenance_daily.py"
+      - "tests/unit/dags/test_proxy_traffic.py"
+      - "tests/unit/dags/conftest.py"
+      - "tests/unit/scripts/test_filter_proxy.py"
+      - "tests/unit/scripts/test_flaresolverr_extended.py"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: whoscored-ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install test runtime
+        run: |
+          python -m pip install --disable-pip-version-check \
+            pytest pytest-cov ruff pandas numpy pyarrow "pyiceberg==0.11.1" \
+            trino sqlglot requests PyYAML \
+            jinja2 jsonschema beautifulsoup4 lxml python-dateutil tenacity \
+            pybreaker "tls-client-python==1.15.1" rapidfuzz Unidecode nicknames
+
+      - name: Static and import checks
+        run: |
+          ruff check \
+            scrapers/whoscored \
+            scrapers/base/iceberg_writer.py \
+            dags/dag_ingest_whoscored.py \
+            dags/dag_backfill_whoscored.py \
+            dags/dag_backup_whoscored_storage.py \
+            dags/dag_iceberg_maintenance.py \
+            dags/dag_iceberg_maintenance_daily.py \
+            dags/dag_master_pipeline.py \
+            dags/scripts/run_whoscored_scraper.py \
+            dags/scripts/run_whoscored_backfill_item.py \
+            dags/scripts/whoscored_ops_store.py \
+            dags/scripts/whoscored_frozen_dq.py \
+            dags/scripts/whoscored_identity.py \
+            dags/utils/maintenance_tasks.py \
+            scripts/init_seaweedfs_bucket.py \
+            scripts/flaresolverr_extended.py \
+            scripts/proxy_filter/filter_proxy.py \
+            scripts/research/bench_whoscored_workflow.py \
+            $(rg --files scripts tests | rg '(whoscored|test_proxy_traffic|test_filter_proxy).*\.py$')
+          python -m compileall -q \
+            scrapers/whoscored \
+            scrapers/base/iceberg_writer.py \
+            dags/dag_ingest_whoscored.py \
+            dags/dag_backfill_whoscored.py \
+            dags/dag_backup_whoscored_storage.py \
+            dags/dag_master_pipeline.py \
+            dags/scripts/run_whoscored_scraper.py \
+            dags/scripts/run_whoscored_backfill_item.py \
+            dags/scripts/whoscored_ops_store.py \
+            dags/scripts/whoscored_frozen_dq.py \
+            dags/scripts/whoscored_identity.py \
+            scripts/init_seaweedfs_bucket.py \
+            scripts/flaresolverr_extended.py \
+            scripts/proxy_filter/filter_proxy.py
+          bash -n scripts/cutover_seaweedfs_topology.sh
+          bash -n scripts/seaweedfs_plane_entrypoint.sh
+
+      - name: Render production compose
+        env:
+          OIDC_ISSUER: https://ci.invalid
+          PUBLIC_IP: 127.0.0.1
+          KC_PUBLIC_URL: https://auth.ci.invalid
+          TRINO_PUBLIC_HOST: trino.ci.invalid
+          JUPYTER_PUBLIC_HOST: jupyter.ci.invalid
+          LAKEKEEPER_DB_PASSWORD: ci-not-a-secret
+          LAKEKEEPER_PG_ENCRYPTION_KEY: 00000000000000000000000000000000
+        run: docker compose --env-file .env.example config --quiet
+
+      - name: WhoScored unit, DAG and storage contract
+        env:
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+        run: |
+          pytest -q \
+            $(rg --files tests | rg '/test_.*whoscored.*\.py$|/test_whoscored.*\.py$') \
+            tests/unit/scrapers/test_iceberg_writer.py \
+            tests/unit/dags/test_proxy_traffic.py \
+            tests/unit/scrapers/test_flaresolverr_client.py \
+            tests/unit/scrapers/test_flaresolverr_traffic_audit.py \
+            tests/unit/scrapers/test_schemas.py \
+            tests/unit/scripts/test_audit_bronze_columns.py \
+            tests/unit/scripts/test_filter_proxy.py \
+            tests/unit/scripts/test_flaresolverr_extended.py \
+            tests/unit/scripts/test_cutover_seaweedfs_topology.py \
+            tests/unit/scripts/test_seaweedfs_plane_entrypoint.py \
+            tests/unit/scripts/test_init_seaweedfs_bucket.py \
+            tests/unit/dags/test_maintenance_tasks.py \
+            tests/unit/dags/test_dag_iceberg_maintenance.py \
+            tests/unit/dags/test_dag_iceberg_maintenance_daily.py

@@ -77,3 +77,6 @@ def test_every_manifest_requires_content_addressed_raw_provenance():
             assert "raw_uris_json" in required
         else:
             assert "raw_uri" in required
+    assert "availability_version" in contract.MANIFEST_REQUIRED_COLUMNS[
+        "whoscored_match_ingest_manifest"
+    ]

@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from dags.scripts import run_whoscored_scraper as runner
+from scrapers.whoscored.repository import profile_candidate_payload_sha256
 
 
 def _result(
@@ -18,6 +19,7 @@ def _result(
     tables=None,
     errors=None,
     retryable=None,
+    metadata=None,
 ):
     return SimpleNamespace(
         entity=entity,
@@ -25,6 +27,7 @@ def _result(
         tables=list(tables or []),
         errors=list(errors or []),
         retryable=list(retryable or []),
+        metadata=dict(metadata or {}),
     )
 
 
@@ -33,6 +36,7 @@ DEFAULT_RESULTS = {
         "schedule",
         counts={"schedule": 1},
         tables=["iceberg.bronze.whoscored_schedule"],
+        metadata={"source_stage_ids": [23752], "source_stage_count": 1},
     ),
     "previews": _result(
         "previews",
@@ -66,6 +70,7 @@ class _Catalog:
     def __init__(self):
         self._scopes = {
             ("ENG-Premier League", "2526"): SimpleNamespace(
+                stage_ids=(23752,),
                 scope=SimpleNamespace(
                     competition_id="ENG-Premier League",
                     season_id="2526",
@@ -73,6 +78,7 @@ class _Catalog:
                 )
             ),
             ("INT-World Cup", "2026"): SimpleNamespace(
+                stage_ids=tuple(range(23752, 23765)),
                 scope=SimpleNamespace(
                     competition_id="INT-World Cup",
                     season_id="2026",
@@ -92,13 +98,18 @@ class _Catalog:
             raise ValueError(f"unknown competition {competition_id}")
         return SimpleNamespace(whoscored_enabled=True)
 
+    def eligible_scopes(self, *, active_only):
+        del active_only
+        return list(self._scopes.values())
+
 
 class _Repository:
-    def __init__(self, catalog, candidate_ids=None):
+    def __init__(self, catalog, candidate_ids=None, profile_candidate_ids=None):
         self.catalog = catalog
         self.candidate_ids = list(candidate_ids or [])
+        self.profile_candidate_ids = sorted(set(profile_candidate_ids or []))
         self.catalog_calls = []
-        self.include_failed_calls = []
+        self.all_completed_calls = []
         self.ensure_schema_calls = 0
 
     def ensure_schema(self):
@@ -117,7 +128,6 @@ class _Repository:
         limit,
         include_failed,
     ):
-        self.include_failed_calls.append(bool(include_failed))
         ids = list(self.candidate_ids)
         if match_ids is not None:
             selected = {int(value) for value in match_ids}
@@ -132,10 +142,70 @@ class _Repository:
             for value in ids
         ]
 
+    def list_completed_match_candidates(
+        self,
+        competition_id,
+        season_id,
+        *,
+        match_ids=None,
+    ):
+        self.all_completed_calls.append((competition_id, season_id, match_ids))
+        return self.list_match_candidates(
+            competition_id,
+            season_id,
+            match_ids=match_ids,
+            limit=None,
+            include_failed=True,
+        )
 
-def _runtime(behaviors=None, *, candidate_ids=None):
+    def list_roster_player_ids(self, *, scopes):
+        assert len(scopes) == 1
+        return [1001]
+
+    def profile_candidate_snapshot(self, *, scopes, hard_cap):
+        assert scopes
+        assert hard_cap == 3_000
+        return SimpleNamespace(
+            player_ids=tuple(self.profile_candidate_ids),
+            count=len(self.profile_candidate_ids),
+            payload_sha256=profile_candidate_payload_sha256(
+                self.profile_candidate_ids
+            ),
+        )
+
+    def list_preview_candidates(
+        self,
+        _competition_id,
+        _season_id,
+        *,
+        match_ids,
+        force_replay,
+    ):
+        assert force_replay is True
+        return [{"game_id": int(value)} for value in (match_ids or [])]
+
+    def latest_catalog_generation(self):
+        return {
+            "catalog_batch_id": "wsc2-test-generation",
+            "catalog_payload_sha256": "a" * 64,
+            "catalog_discovery_mode": "incremental",
+        }
+
+    def load_discovered_catalog(self, *, batch_id=None):
+        assert batch_id in {None, "wsc2-test-generation"}
+        return self.catalog
+
+    def load_catalog_generation_snapshot(self):
+        return self.latest_catalog_generation(), self.catalog
+
+
+def _runtime(behaviors=None, *, candidate_ids=None, profile_candidate_ids=None):
     catalog = _Catalog()
-    repository = _Repository(catalog, candidate_ids=candidate_ids)
+    repository = _Repository(
+        catalog,
+        candidate_ids=candidate_ids,
+        profile_candidate_ids=profile_candidate_ids,
+    )
     configured = dict(behaviors or {})
 
     class Service:
@@ -183,21 +253,45 @@ def _runtime(behaviors=None, *, candidate_ids=None):
         def sync_previews(self, *, match_ids, force_replay):
             self.preview_force_replays.append(bool(force_replay))
             self.calls.append(("previews", None))
-            return self._value("previews")
+            result = SimpleNamespace(**vars(self._value("previews")))
+            result.attempted = len(match_ids or [])
+            result.succeeded = len(match_ids or []) if not result.retryable else 0
+            result.terminal = list(getattr(result, "terminal", []))
+            return result
 
-        def sync_matches(self, *, match_ids, limit, force_replay, kickoff_from=None):
+        def sync_matches(
+            self,
+            *,
+            match_ids,
+            limit,
+            force_replay,
+            historical_replay=False,
+            kickoff_from=None,
+        ):
             self.match_force_replays.append(bool(force_replay))
+            if historical_replay:
+                assert force_replay is True
             if kickoff_from is not None:
                 assert kickoff_from.tzinfo is not None
             call = ("matches", limit)
             if match_ids is not None:
                 call = (*call, tuple(match_ids))
             self.calls.append(call)
-            return self._value("matches")
+            result = SimpleNamespace(**vars(self._value("matches")))
+            result.attempted = len(match_ids or [])
+            result.succeeded = len(match_ids or []) if not result.retryable else 0
+            result.terminal = list(getattr(result, "terminal", []))
+            return result
 
-        def sync_profiles(self, *, limit, candidate_scopes):
-            self.calls.append(("profiles", limit, tuple(candidate_scopes)))
-            return self._value("profiles")
+        def sync_profiles(self, *, limit, candidate_scopes, player_ids=None):
+            self.calls.append(
+                ("profiles", limit, tuple(candidate_scopes), tuple(player_ids or ()))
+            )
+            result = SimpleNamespace(**vars(self._value("profiles")))
+            result.attempted = len(player_ids or [])
+            result.succeeded = len(player_ids or [])
+            result.terminal = list(getattr(result, "terminal", []))
+            return result
 
         def traffic_stats(self):
             return {
@@ -208,9 +302,22 @@ def _runtime(behaviors=None, *, candidate_ids=None):
     return Service, catalog, repository
 
 
-def _run(monkeypatch, tmp_path, args, *, behaviors=None, candidate_ids=None):
+def _run(
+    monkeypatch,
+    tmp_path,
+    args,
+    *,
+    behaviors=None,
+    candidate_ids=None,
+    profile_candidate_ids=None,
+):
     monkeypatch.delenv("WHOSCORED_SCHEMA_READY", raising=False)
-    runtime, catalog, repository = _runtime(behaviors, candidate_ids=candidate_ids)
+    monkeypatch.setenv("WHOSCORED_OPS_STORE_URI", tmp_path.as_uri())
+    runtime, catalog, repository = _runtime(
+        behaviors,
+        candidate_ids=candidate_ids,
+        profile_candidate_ids=profile_candidate_ids,
+    )
     monkeypatch.setattr(runner, "_load_runtime", lambda: runtime)
     monkeypatch.setattr(runner, "_new_repository", lambda: repository)
     output = tmp_path / "result.json"
@@ -554,10 +661,22 @@ def test_daily_without_scope_reads_all_active_persisted_scopes(monkeypatch, tmp_
 
 @pytest.mark.unit
 def test_daily_profiles_only_uses_one_global_active_scope_union(monkeypatch, tmp_path):
+    candidate_ids = list(range(1, 18))
+    candidate_sha256 = profile_candidate_payload_sha256(candidate_ids)
     rc, report, service_cls, _ = _run(
         monkeypatch,
         tmp_path,
-        ["daily", "--profiles-only", "--profiles-limit", "17"],
+        [
+            "daily",
+            "--profiles-only",
+            "--profiles-limit",
+            "17",
+            "--expected-profile-candidate-count",
+            "17",
+            "--expected-profile-candidate-sha256",
+            candidate_sha256,
+        ],
+        profile_candidate_ids=candidate_ids,
     )
 
     assert rc == 0
@@ -568,7 +687,93 @@ def test_daily_profiles_only_uses_one_global_active_scope_union(monkeypatch, tmp
         "ENG-Premier League=2526",
         "INT-World Cup=2026",
     ]
+    assert call[3] == tuple(candidate_ids)
+    assert report["profile_candidates"] == {
+        "schema_version": 1,
+        "count": 17,
+        "payload_sha256": candidate_sha256,
+        "attempted": 17,
+    }
     assert report["scopes"][1]["delegated_to"] == "ENG-Premier League=2526"
+
+
+@pytest.mark.unit
+def test_daily_zero_profile_snapshot_stays_explicit_and_reports_zero(
+    monkeypatch, tmp_path
+):
+    candidate_sha256 = profile_candidate_payload_sha256([])
+
+    rc, report, service_cls, _ = _run(
+        monkeypatch,
+        tmp_path,
+        [
+            "daily",
+            "--profiles-only",
+            "--profiles-limit",
+            "0",
+            "--expected-profile-candidate-count",
+            "0",
+            "--expected-profile-candidate-sha256",
+            candidate_sha256,
+        ],
+        profile_candidate_ids=[],
+    )
+
+    assert rc == 0
+    assert service_cls.instances[0].calls[0][3] == ()
+    assert report["profile_candidates"] == {
+        "schema_version": 1,
+        "count": 0,
+        "payload_sha256": candidate_sha256,
+        "attempted": 0,
+    }
+
+
+@pytest.mark.unit
+def test_daily_profile_snapshot_drift_fails_before_source_transport(monkeypatch, tmp_path):
+    expected_sha256 = profile_candidate_payload_sha256([1])
+
+    rc, report, service_cls, _ = _run(
+        monkeypatch,
+        tmp_path,
+        [
+            "daily",
+            "--profiles-only",
+            "--profiles-limit",
+            "1",
+            "--expected-profile-candidate-count",
+            "1",
+            "--expected-profile-candidate-sha256",
+            expected_sha256,
+        ],
+        profile_candidate_ids=[2],
+    )
+
+    assert rc == 1
+    assert service_cls.instances == []
+    assert report["paid_proxy_bytes"] == 0
+    assert "changed before source work" in report["errors"][0]
+
+
+@pytest.mark.unit
+def test_daily_worker_loads_the_exact_catalog_generation(monkeypatch, tmp_path):
+    rc, report, service_cls, _ = _run(
+        monkeypatch,
+        tmp_path,
+        [
+            "daily",
+            "--scope",
+            "ENG-Premier League=2526",
+            "--skip-profiles",
+            "--catalog-batch-id",
+            "wsc2-test-generation",
+        ],
+    )
+
+    assert rc == 0
+    assert report["catalog_batch_id"] == "wsc2-test-generation"
+    assert len(service_cls.instances) == 1
+    assert report["scopes"][0]["scope"] == "ENG-Premier League=2526"
 
 
 @pytest.mark.unit
@@ -593,9 +798,10 @@ def test_replay_passes_a_frozen_explicit_game_set(monkeypatch, tmp_path):
 
 
 @pytest.mark.unit
-def test_backfill_freezes_and_checkpoints_25_match_chunks(monkeypatch, tmp_path):
+def test_backfill_freezes_s3_plan_and_receipts_for_25_match_chunks(
+    monkeypatch, tmp_path
+):
     game_ids = list(range(1, 53))
-    state_dir = tmp_path / "state"
     rc, report, service_cls, _ = _run(
         monkeypatch,
         tmp_path,
@@ -603,8 +809,6 @@ def test_backfill_freezes_and_checkpoints_25_match_chunks(monkeypatch, tmp_path)
             "backfill",
             "--scope",
             "ENG-Premier League=2526",
-            "--state-dir",
-            str(state_dir),
             "--queue-id",
             "unit-queue",
         ],
@@ -612,16 +816,14 @@ def test_backfill_freezes_and_checkpoints_25_match_chunks(monkeypatch, tmp_path)
     )
 
     assert rc == 0
-    assert report["queue"] == {
-        "queue_id": "unit-queue",
-        "path": str(state_dir / "unit-queue.json"),
-        "status": "complete",
-        "chunk_size": 25,
-        "pending_matches": 0,
-        "completed_matches": 52,
-        "completed_profiles": 1,
-        "pending_profile_scopes": 0,
-    }
+    assert report["queue"]["queue_id"] == "unit-queue"
+    assert report["queue"]["status"] == "complete"
+    assert report["queue"]["completed_schedules"] == 1
+    assert report["queue"]["completed_match_chunks"] == 3
+    assert report["queue"]["completed_roster_freezes"] == 1
+    assert report["queue"]["completed_profile_chunks"] == 1
+    assert report["queue"]["successful_receipts"] == 6
+    assert report["queue"]["processed_work_items"] == 6
     match_calls = [
         call
         for service in service_cls.instances
@@ -644,17 +846,23 @@ def test_backfill_freezes_and_checkpoints_25_match_chunks(monkeypatch, tmp_path)
         for service in service_cls.instances
         if any(call[0] == "schedule" for call in service.calls)
     )
-    assert planning_repository.include_failed_calls == [True]
+    assert len(planning_repository.all_completed_calls) == 1
     assert planning_repository.ensure_schema_calls == 1
-    queue = json.loads((state_dir / "unit-queue.json").read_text(encoding="utf-8"))
-    assert queue["status"] == "complete"
-    assert queue["scopes"][0]["pending_game_ids"] == []
+    root = tmp_path / "backfill" / "unit-queue"
+    plan_paths = list((root / "plans").rglob("*.json"))
+    assert len(plan_paths) == 1
+    frozen_plan = json.loads(plan_paths[0].read_text(encoding="utf-8"))
+    assert frozen_plan["schedule_stage_ids"] == {
+        "ENG-Premier League=2526": [23752]
+    }
+    assert len(list((root / "receipts").rglob("*.json"))) == 6
+    assert len(list((root / "checkpoints").rglob("*.json"))) == 5
+    assert len(list((root / "batches").rglob("*.json"))) == 4
 
 
 @pytest.mark.unit
 def test_backfill_retry_keeps_the_same_pending_chunk(monkeypatch, tmp_path):
     retryable = _result("matches", retryable=["1"])
-    state_dir = tmp_path / "state"
     rc, report, _, _ = _run(
         monkeypatch,
         tmp_path,
@@ -662,8 +870,6 @@ def test_backfill_retry_keeps_the_same_pending_chunk(monkeypatch, tmp_path):
             "backfill",
             "--scope",
             "ENG-Premier League=2526",
-            "--state-dir",
-            str(state_dir),
             "--queue-id",
             "retry-queue",
         ],
@@ -673,10 +879,27 @@ def test_backfill_retry_keeps_the_same_pending_chunk(monkeypatch, tmp_path):
 
     assert rc == 2
     assert report["status"] == "retryable"
-    assert report["queue"]["pending_matches"] == 3
-    queue = json.loads((state_dir / "retry-queue.json").read_text(encoding="utf-8"))
-    assert queue["scopes"][0]["pending_game_ids"] == [1, 2, 3]
-    assert queue["scopes"][0]["blocked_until"] is not None
+    assert report["queue"]["status"] == "running"
+    assert report["queue"]["completed_schedules"] == 1
+    assert report["queue"]["completed_match_chunks"] == 0
+    assert report["queue"]["next_work_items"] == 1
+    assert report["queue"]["successful_receipts"] == 1
+
+    resumed_rc, resumed, _, _ = _run(
+        monkeypatch,
+        tmp_path,
+        [
+            "backfill",
+            "--queue-id",
+            "retry-queue",
+            "--plan-id",
+            report["queue"]["plan_id"],
+        ],
+        candidate_ids=[1, 2, 3],
+    )
+    assert resumed_rc == 0
+    assert resumed["queue"]["plan_id"] == report["queue"]["plan_id"]
+    assert resumed["queue"]["status"] == "complete"
 
 
 @pytest.mark.unit
@@ -686,13 +909,38 @@ def test_workflow_command_selector_contracts_are_fail_closed():
         args = parser.parse_args(["backfill"])
         runner._validate_args(parser, args)
     with pytest.raises(SystemExit):
-        args = parser.parse_args(["replay", "--scope", "ENG-Premier League=2526"])
+        args = parser.parse_args(
+            [
+                "backfill",
+                "--queue-id",
+                "q",
+                "--plan-id",
+                "a" * 64,
+                "--all-catalog",
+            ]
+        )
         runner._validate_args(parser, args)
-    with pytest.raises(SystemExit):
-        args = parser.parse_args(["discover", "--game-id", "1"])
-        runner._validate_args(parser, args)
+    empty_sha256 = profile_candidate_payload_sha256([])
+    args = parser.parse_args(
+        [
+            "daily",
+            "--profiles-only",
+            "--profiles-limit",
+            "0",
+            "--expected-profile-candidate-count",
+            "0",
+            "--expected-profile-candidate-sha256",
+            empty_sha256,
+        ]
+    )
+    assert runner._validate_args(parser, args) == []
     args = parser.parse_args(["backfill", "--all-catalog"])
     assert runner._validate_args(parser, args) == []
+    with pytest.raises(SystemExit):
+        args = parser.parse_args(
+            ["backfill", "--all-catalog", "--state-dir", "/tmp/legacy"]
+        )
+        runner._validate_args(parser, args)
     with pytest.raises(SystemExit):
         args = parser.parse_args(
             [
@@ -702,4 +950,48 @@ def test_workflow_command_selector_contracts_are_fail_closed():
                 "ENG-Premier League=2526",
             ]
         )
+        runner._validate_args(parser, args)
+    with pytest.raises(SystemExit):
+        args = parser.parse_args(["replay", "--scope", "ENG-Premier League=2526"])
+        runner._validate_args(parser, args)
+    with pytest.raises(SystemExit):
+        args = parser.parse_args(["discover", "--game-id", "1"])
+        runner._validate_args(parser, args)
+    with pytest.raises(SystemExit):
+        args = parser.parse_args(["daily", "--profiles-only"])
+        runner._validate_args(parser, args)
+    with pytest.raises(SystemExit):
+        args = parser.parse_args(
+            [
+                "daily",
+                "--profiles-only",
+                "--profiles-limit",
+                "1",
+                "--expected-profile-candidate-count",
+                "2",
+                "--expected-profile-candidate-sha256",
+                "a" * 64,
+            ]
+        )
+        runner._validate_args(parser, args)
+
+
+@pytest.mark.unit
+def test_daily_profile_cli_enforces_the_deployed_lower_hard_cap(monkeypatch):
+    monkeypatch.setenv("WHOSCORED_DAILY_PROFILE_MAX_LIMIT", "500")
+    parser = runner._build_parser()
+    args = parser.parse_args(
+        [
+            "daily",
+            "--profiles-only",
+            "--profiles-limit",
+            "501",
+            "--expected-profile-candidate-count",
+            "501",
+            "--expected-profile-candidate-sha256",
+            "a" * 64,
+        ]
+    )
+
+    with pytest.raises(SystemExit):
         runner._validate_args(parser, args)

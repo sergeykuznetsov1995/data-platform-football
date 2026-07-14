@@ -4,7 +4,7 @@
 table:
   fullyQualifiedName: trino_iceberg.iceberg.bronze.whoscored_stages_current
   description: |
-    Канонический каталог стадий WhoScored parser v7. Представление публикует
+    Канонический каталог стадий WhoScored parser v8. Представление публикует
     только строки последнего успешного catalog batch; незавершённый discovery
     batch не меняет видимый каталог. Grain — одна стадия турнира в сезоне.
   tags:

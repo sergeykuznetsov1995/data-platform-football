@@ -70,7 +70,6 @@ MIN_TIMEOUT_MS = 1_000
 ALLOWED_PATH_PATTERNS = (
     re.compile(r"\A/statisticsfeed/1/get(?:team|player)statistics\Z"),
     re.compile(r"\A/stagestatfeed/[1-9][0-9]*/stageteams/\Z"),
-    re.compile(r"\A/stageplayerstatfeed/[1-9][0-9]*/playerstats/\Z"),
 )
 _PAYLOAD_FIELDS = frozenset({"url", "session", "maxTimeout"})
 _BATCH_PAYLOAD_FIELDS = frozenset({"urls", "session", "maxTimeout"})
@@ -417,8 +416,7 @@ const done = arguments[arguments.length - 1];
     }
     const allowedPaths = [
       /^\/statisticsfeed\/1\/get(?:team|player)statistics$/,
-      /^\/stagestatfeed\/[1-9][0-9]*\/stageteams\/$/,
-      /^\/stageplayerstatfeed\/[1-9][0-9]*\/playerstats\/$/
+      /^\/stagestatfeed\/[1-9][0-9]*\/stageteams\/$/
     ];
     if (!allowedPaths.some((pattern) => pattern.test(requested.pathname))) {
       throw new Error("forbidden_path");
@@ -539,8 +537,7 @@ const done = arguments[arguments.length - 1];
 (async () => {
   const allowedPaths = [
     /^\/statisticsfeed\/1\/get(?:team|player)statistics$/,
-    /^\/stagestatfeed\/[1-9][0-9]*\/stageteams\/$/,
-    /^\/stageplayerstatfeed\/[1-9][0-9]*\/playerstats\/$/
+    /^\/stagestatfeed\/[1-9][0-9]*\/stageteams\/$/
   ];
   // consumedBytes is monotonic across successes and failures. This bounds
   // actual source bytes read by the whole batch, not merely returned bodies.

@@ -6,6 +6,7 @@ import json
 
 import pytest
 
+import scrapers.whoscored.parsers as whoscored_parsers
 from scrapers.whoscored.catalog import (
     apply_schedule_classification,
     CatalogError,
@@ -20,11 +21,16 @@ from scrapers.whoscored.domain import (
 )
 from scrapers.whoscored.parsers import (
     DatasetStatus,
+    PlayerStageStatisticsPage,
     WhoScoredParseError,
+    extract_matchcentre_data,
     find_source_season_id,
+    is_valid_match_page_without_matchcentre,
+    merge_player_stage_statistics_pages,
     parse_all_regions,
     parse_matchcentre_data,
     parse_player_stage_statistics,
+    parse_player_stage_statistics_page,
     parse_preview_bundle,
     parse_profile_bundle,
     parse_js_literal,
@@ -37,6 +43,41 @@ from scrapers.whoscored.parsers import (
 
 
 SCOPE = WhoScoredScope("WS-252-2", "2526", SeasonFormat.SPLIT_YEAR)
+
+
+@pytest.mark.unit
+def test_matchcentre_unavailability_requires_two_matching_source_markers():
+    valid = """
+    <script>require.config.params['matchheader'] = {
+      input: [1, 2, 'Home', 'Away'], matchId: 1973523
+    };</script>
+    <script>require.config.params["args"] = {
+      matchId: 1973523, initialMatchDataForScrappers: [[[1, 2]]]
+    };</script>
+    """
+    assert is_valid_match_page_without_matchcentre(valid, game_id=1973523)
+    assert not is_valid_match_page_without_matchcentre(valid, game_id=1973524)
+
+    challenge = """
+    <html><title>Just a moment...</title>
+    <script src='/cdn-cgi/challenge-platform/x'></script></html>
+    """
+    error_shell = """
+    <html><title>Page not found</title>
+    <script>require.config.params['args'] = {matchId: 1973523};</script></html>
+    """
+    assert not is_valid_match_page_without_matchcentre(challenge, game_id=1973523)
+    assert not is_valid_match_page_without_matchcentre(error_shell, game_id=1973523)
+
+    unsupported = valid.replace(
+        "initialMatchDataForScrappers:",
+        "matchCentreData: JSON.parse('{}'), initialMatchDataForScrappers:",
+    )
+    with pytest.raises(WhoScoredParseError, match="present but malformed"):
+        extract_matchcentre_data(unsupported)
+    assert not is_valid_match_page_without_matchcentre(
+        unsupported, game_id=1973523
+    )
 
 
 @pytest.mark.unit
@@ -684,6 +725,40 @@ def test_stage_statistics_are_long_form_and_keep_document_shape():
 
 
 @pytest.mark.unit
+def test_stage_statistics_fingerprint_each_source_record_once(monkeypatch):
+    calls = []
+    original = whoscored_parsers.schema_fingerprint
+
+    def counted(value):
+        calls.append(value)
+        return original(value)
+
+    monkeypatch.setattr(whoscored_parsers, "schema_fingerprint", counted)
+    records = [
+        {
+            "playerId": player_id,
+            "teamId": 26,
+            **{f"metric{metric}": metric for metric in range(50)},
+        }
+        for player_id in (11, 12)
+    ]
+
+    result = parse_player_stage_statistics(
+        {
+            "playerTableStats": records,
+            "paging": {"totalResults": 2, "totalPages": 1},
+        },
+        scope=SCOPE,
+        stage_id=700,
+    )
+
+    assert len(result.rows) == 100
+    # One fingerprint for the complete document and one per source record;
+    # the former implementation recalculated it for every emitted metric.
+    assert len(calls) == 3
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize(
     "parser, list_key, identity",
     (
@@ -845,6 +920,142 @@ def test_stage_statistics_reject_truncated_or_paginated_response(paging):
             scope=SCOPE,
             stage_id=700,
             source_season_id=100,
+        )
+
+
+@pytest.mark.unit
+def test_player_statistics_pages_are_merged_only_after_complete_pagination():
+    def payload(page, player_id):
+        return {
+            "playerTableStats": [
+                {
+                    "playerId": player_id,
+                    "teamId": 26,
+                    "playerName": f"Player {player_id}",
+                    "apps": page,
+                }
+            ],
+            "paging": {
+                "currentPage": page,
+                "pageIndex": page - 1,
+                "totalPages": 2,
+                "totalResults": 2,
+                "resultsPerPage": 1,
+                "firstRecordIndex": page - 1,
+                "lastRecordIndex": page - 1,
+            },
+        }
+
+    first = parse_player_stage_statistics_page(
+        payload(1, 11), scope=SCOPE, stage_id=700, expected_page=1
+    )
+    second = parse_player_stage_statistics_page(
+        payload(2, 12), scope=SCOPE, stage_id=700, expected_page=2
+    )
+    assert isinstance(first, PlayerStageStatisticsPage)
+    assert isinstance(second, PlayerStageStatisticsPage)
+    assert first.results_per_page == 1
+    assert first.page_index == 0
+    assert first.first_record_index == 0
+    assert second.last_record_index == 1
+
+    merged = merge_player_stage_statistics_pages(
+        [second, first], scope=SCOPE, stage_id=700
+    )
+    assert merged.status is DatasetStatus.AVAILABLE
+    assert {row["player_id"] for row in merged.rows} == {11, 12}
+    assert {row["row_index"] for row in merged.rows} == {0, 1}
+
+
+@pytest.mark.unit
+def test_player_statistics_pagination_rejects_repeated_or_wrong_pages():
+    payload = {
+        "playerTableStats": [{"playerId": 11, "teamId": 26, "apps": 1}],
+        "paging": {
+            "currentPage": 1,
+            "totalPages": 2,
+            "totalResults": 2,
+            "resultsPerPage": 1,
+        },
+    }
+    with pytest.raises(WhoScoredParseError, match="expected 2"):
+        parse_player_stage_statistics_page(
+            payload, scope=SCOPE, stage_id=700, expected_page=2
+        )
+
+    first = parse_player_stage_statistics_page(
+        payload, scope=SCOPE, stage_id=700, expected_page=1
+    )
+    assert isinstance(first, PlayerStageStatisticsPage)
+    repeated = PlayerStageStatisticsPage(
+        page_number=2,
+        page_index=None,
+        total_pages=2,
+        total_results=2,
+        results_per_page=1,
+        first_record_index=None,
+        last_record_index=None,
+        index_base=None,
+        records=first.records,
+    )
+    with pytest.raises(WhoScoredParseError, match="repeats"):
+        merge_player_stage_statistics_pages(
+            [first, repeated], scope=SCOPE, stage_id=700
+        )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("current_page", (0, -1))
+def test_player_statistics_requires_positive_current_page_on_single_page(
+    current_page,
+):
+    payload = {
+        "playerTableStats": [{"playerId": 11, "teamId": 26, "apps": 1}],
+        "paging": {
+            "currentPage": current_page,
+            "totalPages": 1,
+            "totalResults": 1,
+            "resultsPerPage": 1,
+            "firstRecordIndex": 0,
+            "lastRecordIndex": 0,
+        },
+    }
+    with pytest.raises(WhoScoredParseError, match="currentPage must be positive"):
+        parse_player_stage_statistics_page(
+            payload, scope=SCOPE, stage_id=700, expected_page=1
+        )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("paging_update", "message"),
+    (
+        ({"totalPages": 101}, "totalPages exceeds"),
+        ({"totalResults": 500_001}, "totalResults exceeds"),
+        ({"totalPages": 3}, "cardinality contradicts|totalPages disagrees"),
+        ({"firstRecordIndex": 0, "lastRecordIndex": 1}, "range cardinality"),
+        ({"pageIndex": 1}, "pageIndex disagrees"),
+    ),
+)
+def test_player_statistics_rejects_unbounded_or_inconsistent_page_metadata(
+    paging_update, message
+):
+    paging = {
+        "currentPage": 1,
+        "totalPages": 2,
+        "totalResults": 2,
+        "resultsPerPage": 1,
+        "firstRecordIndex": 0,
+        "lastRecordIndex": 0,
+    }
+    paging.update(paging_update)
+    payload = {
+        "playerTableStats": [{"playerId": 11, "teamId": 26, "apps": 1}],
+        "paging": paging,
+    }
+    with pytest.raises(WhoScoredParseError, match=message):
+        parse_player_stage_statistics_page(
+            payload, scope=SCOPE, stage_id=700, expected_page=1
         )
 
 

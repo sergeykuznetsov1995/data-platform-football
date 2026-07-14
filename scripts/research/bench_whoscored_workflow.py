@@ -53,6 +53,7 @@ from scrapers.whoscored.repository import (  # noqa: E402
     PreviewCommit,
     PreviewFailure,
     ProfileCommit,
+    WhoScoredScopeRowSpool,
 )
 from scrapers.whoscored.service import (  # noqa: E402
     DEFAULT_STRUCTURED_REQUESTS_PER_MINUTE,
@@ -74,7 +75,7 @@ from scrapers.base.flaresolverr_client import MAX_XHR_BATCH_URLS  # noqa: E402
 
 LOG = logging.getLogger("bench_whoscored_workflow")
 MIB = 1024 * 1024
-BENCHMARK_VERSION = "whoscored-workflow-benchmark-v1"
+BENCHMARK_VERSION = "whoscored-workflow-benchmark-v2"
 DEFAULT_SCOPE = "INT-World Cup=2026"
 DEFAULT_MATCH_LIMIT = 3
 DEFAULT_PROFILE_LIMIT = 3
@@ -157,14 +158,45 @@ def _json_fingerprint(value: Any) -> str:
     # source HTML.  Production canonicalization repairs them before an Iceberg
     # write; keep the non-publishing fingerprint total as well by escaping all
     # non-ASCII code points before UTF-8 encoding.
-    payload = json.dumps(
-        value,
+    encoder = json.JSONEncoder(
         ensure_ascii=True,
         sort_keys=True,
         separators=(",", ":"),
         default=str,
-    ).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
+    )
+    digest = hashlib.sha256()
+    for token in encoder.iterencode(value):
+        digest.update(token.encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _dataset_fingerprint(
+    datasets: Mapping[str, Sequence[Mapping[str, Any]]],
+    *,
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> str:
+    """Fingerprint row collections without building one giant JSON document."""
+
+    digest = hashlib.sha256(b"whoscored-benchmark-datasets-v2\0")
+    for name in sorted(datasets):
+        digest.update(json.dumps(str(name), ensure_ascii=True).encode("utf-8"))
+        digest.update(b"\0")
+        rows = datasets[name]
+        if isinstance(rows, WhoScoredScopeRowSpool):
+            digest.update(rows.content_fingerprint().encode("ascii"))
+            observed = len(rows)
+        else:
+            observed = 0
+            for row in rows:
+                digest.update(_json_fingerprint(row).encode("ascii"))
+                digest.update(b"\n")
+                observed += 1
+        if observed != len(rows):
+            raise ValueError(f"benchmark dataset {name} changed while fingerprinting")
+        digest.update(str(observed).encode("ascii"))
+        digest.update(b"\0")
+    digest.update(_json_fingerprint(metadata or {}).encode("ascii"))
+    return digest.hexdigest()
 
 
 def _optional_datetime(value: Any) -> Optional[datetime]:
@@ -203,6 +235,7 @@ class InMemoryBenchmarkRepository:
     def __init__(self, scope: CatalogSeason | WhoScoredScope) -> None:
         self.scope = scope.scope if isinstance(scope, CatalogSeason) else scope
         self._scope_datasets: dict[str, tuple[dict[str, Any], ...]] = {}
+        self._scope_counts: dict[str, int] = {}
         self._match_commits: dict[int, MatchCommit] = {}
         self._preview_commits: dict[int, PreviewCommit] = {}
         self._profile_commits: dict[int, ProfileCommit] = {}
@@ -262,13 +295,20 @@ class InMemoryBenchmarkRepository:
         rows: Sequence[Mapping[str, Any]],
         distinct_key: str,
     ) -> None:
-        values: list[str] = []
+        if isinstance(rows, WhoScoredScopeRowSpool):
+            if distinct_key != "entity_key" or (
+                len(rows) and distinct_key not in rows.columns
+            ):
+                raise ValueError(f"{table}: invalid spool distinct-key contract")
+            return
+        values: set[str] = set()
         for row in rows:
             if row.get(distinct_key) is None:
                 raise ValueError(f"{table}: missing distinct key {distinct_key}")
-            values.append(str(row[distinct_key]))
-        if len(values) != len(set(values)):
-            raise ValueError(f"{table}: duplicate {distinct_key} values")
+            value = str(row[distinct_key])
+            if value in values:
+                raise ValueError(f"{table}: duplicate {distinct_key} values")
+            values.add(value)
 
     def commit_scope_bundle(
         self,
@@ -293,18 +333,21 @@ class InMemoryBenchmarkRepository:
         unavailable = set(source_unavailable)
         if empty & unavailable:
             raise ValueError("a scope dataset cannot be empty and unavailable")
-        copied: dict[str, tuple[dict[str, Any], ...]] = {}
+        schedule_rows: tuple[dict[str, Any], ...] = ()
         for name, source_rows in datasets.items():
-            rows = tuple(dict(row) for row in source_rows)
             if name not in distinct_keys:
                 raise ValueError(f"{name}: no distinct-key contract")
-            self._validate_distinct(name, rows, distinct_keys[name])
-            copied[name] = rows
-        if not copied.get("whoscored_schedule"):
+            self._validate_distinct(name, source_rows, distinct_keys[name])
+            if name == "whoscored_schedule":
+                # Only schedule drives later benchmark candidate selection.
+                # Statistics stay in their production disk spool; retaining a
+                # second dict copy here was benchmark-only multi-GiB overhead.
+                schedule_rows = tuple(dict(row) for row in source_rows)
+        if not schedule_rows:
             raise ValueError("scope commit contains no schedule rows")
         schedule_stage_ids = {
             int(row["stage_id"])
-            for row in copied.get("whoscored_schedule", ())
+            for row in schedule_rows
             if row.get("stage_id") is not None
         }
         normalized_feed_states = dict(sorted((feed_states or {}).items()))
@@ -344,8 +387,9 @@ class InMemoryBenchmarkRepository:
                 raise ValueError(
                     f"scope feed-state contract has invalid statuses {invalid_statuses}"
                 )
-        fingerprint = _json_fingerprint(
-            {"datasets": copied, "feed_states": normalized_feed_states}
+        fingerprint = _dataset_fingerprint(
+            datasets,
+            metadata={"feed_states": normalized_feed_states},
         )
         batch_id = (
             "ws-scope-"
@@ -353,7 +397,7 @@ class InMemoryBenchmarkRepository:
                 f"{league}\0{season}\0{entity_group}\0{payload_sha256}".encode()
             ).hexdigest()
         )
-        counts = self._dataset_counts(copied)
+        counts = self._dataset_counts(datasets)
         self._record_batch(
             kind="scope",
             identity=f"{league}={season}",
@@ -361,7 +405,8 @@ class InMemoryBenchmarkRepository:
             counts=counts,
             fingerprint=fingerprint,
         )
-        self._scope_datasets = copied
+        self._scope_datasets = {"whoscored_schedule": schedule_rows}
+        self._scope_counts = counts
         return batch_id
 
     def _schedule_rows(self) -> list[dict[str, Any]]:
@@ -611,9 +656,7 @@ class InMemoryBenchmarkRepository:
         self.failures.append(dict(failure))
 
     def _logical_current_rows(self) -> dict[str, int]:
-        current: Counter[str] = Counter()
-        for name, rows in self._scope_datasets.items():
-            current[_normal_table(name)] += len(rows)
+        current: Counter[str] = Counter(self._scope_counts)
         for commit in self._match_commits.values():
             for name, rows in self._match_datasets(commit).items():
                 current[name] += len(rows)
@@ -1101,9 +1144,11 @@ def run(
                 raise BenchmarkFailure(
                     f"warm phase did not persist raw target {target.target_id}"
                 )
+            _, invalidated_record = raw_store.load_bytes(target)
             quarantine_key = raw_store.quarantine(
                 target,
                 reason="workflow benchmark incremental invalidation",
+                record=invalidated_record,
             )
             if not quarantine_key or raw_store.has(target):
                 raise BenchmarkFailure(

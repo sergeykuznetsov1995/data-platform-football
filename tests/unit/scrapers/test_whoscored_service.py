@@ -18,7 +18,12 @@ from scrapers.whoscored.catalog import (
     WhoScoredCatalog,
 )
 from scrapers.whoscored.detailed_feeds import DETAILED_FEED_OPTIONS
-from scrapers.whoscored.parsers import CalendarMonth, DatasetStatus, ParsedDataset
+from scrapers.whoscored.parsers import (
+    CalendarMonth,
+    DatasetStatus,
+    ParsedDataset,
+    PlayerStageStatisticsPage,
+)
 from scrapers.whoscored.raw_store import (
     RawTarget,
     WhoScoredRawStore,
@@ -33,6 +38,7 @@ from scrapers.whoscored.service import (
     CATALOG_REQUEST_BURST_SIZE,
     DEFAULT_CATALOG_REQUESTS_PER_MINUTE,
     DEFAULT_STRUCTURED_REQUESTS_PER_MINUTE,
+    STRUCTURED_PARSE_BATCH_SIZE,
     STRUCTURED_REQUEST_BURST_SIZE,
     WhoScoredIngestService,
     _ParsedFetchSpec,
@@ -733,16 +739,36 @@ def test_service_refuses_invalid_structured_rate_limit_before_network(
         _service(tmp_path)
 
 
+def test_schedule_refuses_invalid_write_chunk_before_source_resolution(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("WHOSCORED_SCOPE_WRITE_CHUNK_ROWS", "0")
+    service, _, _ = _service(tmp_path)
+    service._source_season_id = lambda: pytest.fail(
+        "source resolution must not run for invalid memory configuration"
+    )
+
+    result = service.sync_schedule()
+
+    assert result.succeeded == 0
+    assert len(result.errors) == 1
+    assert "WHOSCORED_SCOPE_WRITE_CHUNK_ROWS" in result.errors[0]
+
+
 def test_structured_rate_limit_is_wired_into_example_and_airflow_environment():
     root = Path(__file__).resolve().parents[3]
     env_example = (root / ".env.example").read_text(encoding="utf-8")
     compose = (root / "compose.yaml").read_text(encoding="utf-8")
 
     assert "WHOSCORED_STRUCTURED_REQUESTS_PER_MINUTE=60" in env_example
+    assert "WHOSCORED_SCOPE_WRITE_CHUNK_ROWS=20000" in env_example
     assert "WHOSCORED_CATALOG_REQUESTS_PER_MINUTE=60" in env_example
     assert (
         "WHOSCORED_STRUCTURED_REQUESTS_PER_MINUTE: "
         "${WHOSCORED_STRUCTURED_REQUESTS_PER_MINUTE:-60}"
+    ) in compose
+    assert (
+        "WHOSCORED_SCOPE_WRITE_CHUNK_ROWS: ${WHOSCORED_SCOPE_WRITE_CHUNK_ROWS:-20000}"
     ) in compose
     assert (
         "WHOSCORED_CATALOG_REQUESTS_PER_MINUTE: "
@@ -805,6 +831,7 @@ def test_discover_catalog_automatically_bootstraps_full_history_before_initial_p
     assert result.counts["full_history"] == 1
     assert len(repository.persisted) == 1
     metadata = repository.persisted[0][1]
+    assert metadata["discovery_mode"] == "full_history"
     assert len(metadata["raw_inputs"]) == 1
     descriptor = metadata["raw_inputs"][0]
     assert descriptor["input_count"] > 1
@@ -1525,6 +1552,15 @@ def test_ttl_cache_replays_same_day_then_refreshes_once_after_expiry(tmp_path):
     assert transport.network_calls == 1
     assert rate_limit_calls == ["acquired"]
 
+    # Append-only raw history intentionally refuses to let an older delayed
+    # writer replace the current receipt. Explicitly invalidate the current
+    # test fixture before installing an expired version.
+    _, current_record = raw_store.load_bytes(target)
+    raw_store.quarantine(
+        target,
+        reason="expire TTL cache test fixture",
+        record=current_record,
+    )
     raw_store.store_bytes(
         target,
         transport.content,
@@ -1766,21 +1802,34 @@ def test_schedule_cache_policy_ttls_only_mutable_active_targets(tmp_path, monkey
         return response, f"s3://raw/{target.target_id}"
 
     service._fetch = fake_fetch
-    service._fetch_parsed_many = lambda specs: [
-        service._fetch_parsed(
-            spec.target,
-            parser=spec.parser,
-            content_type=spec.content_type,
-            allow_cache=spec.allow_cache,
-            cache_ttl=spec.cache_ttl,
-            browser_bootstrap_url=spec.browser_bootstrap_url,
-        )
-        for spec in specs
-    ]
+    structured_batch_sizes = []
+
+    def fetch_parsed_many(specs):
+        specs = tuple(specs)
+        structured_batch_sizes.append(len(specs))
+        return [
+            service._fetch_parsed(
+                spec.target,
+                parser=spec.parser,
+                content_type=spec.content_type,
+                allow_cache=spec.allow_cache,
+                cache_ttl=spec.cache_ttl,
+                browser_bootstrap_url=spec.browser_bootstrap_url,
+            )
+            for spec in specs
+        ]
+
+    service._fetch_parsed_many = fetch_parsed_many
 
     result = service.sync_schedule()
 
     assert result.status == "success", result.as_dict()
+    assert result.metadata == {
+        "source_stage_ids": [700],
+        "source_stage_count": 1,
+    }
+    assert sum(structured_batch_sizes) == 17 + 2 * len(DETAILED_FEED_OPTIONS)
+    assert max(structured_batch_sizes) == STRUCTURED_PARSE_BATCH_SIZE
     assert result.counts == {
         "schedule": 2,
         "match_incidents": 0,
@@ -1921,6 +1970,141 @@ def test_schedule_cache_policy_ttls_only_mutable_active_targets(tmp_path, monkey
     assert all(kwargs.get("cache_ttl") is None for _, _, kwargs in calls)
 
 
+def test_player_stage_statistics_fetches_every_declared_page(tmp_path):
+    service, _, _ = _service(tmp_path)
+    spec = service._player_stage_statistics_spec(
+        stage_id=700,
+        source_season_id=9001,
+        active=True,
+        category="summary",
+        subcategory="all",
+        cache_ttl=timedelta(hours=1),
+        browser_bootstrap_url=(
+            "https://www.whoscored.com/Regions/247/Tournaments/36/Seasons/9001/"
+            "Stages/700/TeamStatistics"
+        ),
+    )
+
+    def response_for(current_page, player_id, url):
+        content = json.dumps(
+            {
+                "playerTableStats": [
+                    {"playerId": player_id, "teamId": 26, "apps": current_page}
+                ],
+                "paging": {
+                    "currentPage": current_page,
+                    "pageIndex": current_page - 1,
+                    "totalPages": 2,
+                    "totalResults": 2,
+                    "resultsPerPage": 1,
+                    "firstRecordIndex": current_page - 1,
+                    "lastRecordIndex": current_page - 1,
+                },
+            }
+        ).encode()
+        return TransportResponse(
+            url=url,
+            content=content,
+            status_code=200,
+            headers={},
+            route=TransportRoute.DIRECT_HTTP,
+            wire_bytes=len(content),
+            sha256=hashlib.sha256(content).hexdigest(),
+        )
+
+    first_response = response_for(1, 11, spec.target.canonical_url)
+    first_result = (first_response, "s3://raw/page-1", spec.parser(first_response))
+    requested = []
+
+    def fetch_next(specs):
+        requested.extend(specs)
+        next_spec = specs[0]
+        next_response = response_for(2, 12, next_spec.target.canonical_url)
+        return [(next_response, "s3://raw/page-2", next_spec.parser(next_response))]
+
+    service._fetch_parsed_many = fetch_next
+    completed, additional_raw = service._complete_player_statistics_pages(
+        [spec], [first_result]
+    )
+
+    assert len(requested) == 1
+    params = parse_qs(urlparse(requested[0].target.canonical_url).query)
+    assert params["page"] == ["2"]
+    assert requested[0].target.target_id.endswith(":page:2")
+    parsed = completed[0][2]
+    assert isinstance(parsed, ParsedDataset)
+    assert {row["player_id"] for row in parsed.rows} == {11, 12}
+    assert len(additional_raw) == 1
+    assert additional_raw[0][1] == "s3://raw/page-2"
+
+
+def test_player_stage_pagination_fetches_in_bounded_batches(tmp_path):
+    service, _, _ = _service(tmp_path)
+    spec = service._player_stage_statistics_spec(
+        stage_id=700,
+        source_season_id=9001,
+        active=True,
+        category="summary",
+        subcategory="all",
+        cache_ttl=None,
+        browser_bootstrap_url=(
+            "https://www.whoscored.com/Regions/247/Tournaments/36/Seasons/9001/"
+            "Stages/700/TeamStatistics"
+        ),
+    )
+
+    def page(number):
+        return PlayerStageStatisticsPage(
+            page_number=number,
+            page_index=None,
+            total_pages=10,
+            total_results=10,
+            results_per_page=1,
+            first_record_index=number - 1,
+            last_record_index=number - 1,
+            index_base=0,
+            records=({"playerId": number, "teamId": 26, "apps": 1},),
+        )
+
+    first_response = TransportResponse(
+        url=spec.target.canonical_url,
+        content=b"page-1",
+        status_code=200,
+        headers={},
+        route=TransportRoute.DIRECT_HTTP,
+        wire_bytes=6,
+        sha256=hashlib.sha256(b"page-1").hexdigest(),
+    )
+    batch_sizes = []
+
+    def fetch_next(specs):
+        batch_sizes.append(len(specs))
+        results = []
+        for next_spec in specs:
+            number = int(next_spec.target.source_ids["page"])
+            content = f"page-{number}".encode()
+            response = TransportResponse(
+                url=next_spec.target.canonical_url,
+                content=content,
+                status_code=200,
+                headers={},
+                route=TransportRoute.DIRECT_HTTP,
+                wire_bytes=len(content),
+                sha256=hashlib.sha256(content).hexdigest(),
+            )
+            results.append((response, f"s3://raw/page-{number}", page(number)))
+        return results
+
+    service._fetch_parsed_many = fetch_next
+    completed, additional_raw = service._complete_player_statistics_pages(
+        [spec], [(first_response, "s3://raw/page-1", page(1))]
+    )
+
+    assert batch_sizes == [8, 1]
+    assert len(additional_raw) == 9
+    assert {row["player_id"] for row in completed[0][2].rows} == set(range(1, 11))
+
+
 def test_source_season_discovery_uses_ttl_only_for_active_scope(tmp_path, monkeypatch):
     class _FixedDate(date):
         @classmethod
@@ -1983,6 +2167,24 @@ def test_match_sync_commits_source_id_and_raw_before_manifest(tmp_path):
     assert raw_store.has(match_page_target(123))
 
 
+def test_historical_match_replay_uses_stale_raw_without_network(tmp_path, monkeypatch):
+    service, repository, raw_store = _service(tmp_path)
+    raw_store.store_bytes(
+        match_page_target(123),
+        _match_html().encode(),
+        content_type="text/html",
+    )
+    monkeypatch.setattr(raw_store, "is_fresh", lambda *_args, **_kwargs: False)
+    transport = _RawCacheAwareTransport(b"must not reach the network")
+    service.transport = transport
+
+    result = service.sync_matches(force_replay=True, historical_replay=True)
+
+    assert result.status == "success", result.as_dict()
+    assert transport.network_calls == 0
+    assert repository.commits[0].transport_mode == "raw_cache"
+
+
 def test_parser_drift_is_fatal_and_manifested_without_commit(tmp_path):
     service, repository, raw_store = _service(tmp_path)
     service.transport = _RawPersistingContentFailureTransport(
@@ -2019,7 +2221,17 @@ def test_non_opta_match_without_matchcentre_is_explicitly_unavailable(tmp_path):
         )
     ]
     service.transport = _RawPersistingContentFailureTransport(
-        b"<html><body>source has no match payload</body></html>"
+        b"""
+        <html><head><title>Home 1-0 Away - League 2026 Live</title></head>
+        <body>
+        <script>require.config.params['matchheader'] = {
+          input: [1, 2, 'Home', 'Away'], matchId: 123
+        };</script>
+        <script>require.config.params[\"args\"] = {
+          matchId: 123, initialMatchDataForScrappers: [[[1, 2]]]
+        };</script>
+        </body></html>
+        """
     )
 
     result = service.sync_matches()
@@ -2031,6 +2243,43 @@ def test_non_opta_match_without_matchcentre_is_explicitly_unavailable(tmp_path):
     assert result.terminal == []
     assert len(repository.failures) == 1
     assert repository.failures[0].state == "not_available"
+    assert repository.failures[0].failure_code == "source_not_available"
+    assert raw_store.has(match_page_target(123))
+
+
+def test_present_but_unsupported_matchcentre_is_parse_failed(tmp_path):
+    service, repository, raw_store = _service(tmp_path)
+    repository.list_match_candidates = lambda *_args, **_kwargs: [
+        MatchCandidate(
+            game_id=123,
+            league="INT-World Cup",
+            season="2026",
+            game="Home-Away",
+            kickoff=datetime(2026, 6, 12),
+            status=6,
+            match_is_opta=False,
+        )
+    ]
+    service.transport = _RawPersistingContentFailureTransport(
+        b"""
+        <script>require.config.params['matchheader'] = {
+          input: [1, 2, 'Home', 'Away'], matchId: 123
+        };</script>
+        <script>require.config.params["args"] = {
+          matchId: 123,
+          matchCentreData: JSON.parse('{"events":[]}'),
+          initialMatchDataForScrappers: [[[1, 2]]]
+        };</script>
+        """
+    )
+
+    result = service.sync_matches()
+
+    assert result.status == "failed"
+    assert repository.commits == []
+    assert len(repository.failures) == 1
+    assert repository.failures[0].state == "parse_failed"
+    assert repository.failures[0].failure_code == "content"
     assert raw_store.has(match_page_target(123))
 
 
@@ -2218,6 +2467,40 @@ def test_preview_transport_failure_is_backed_off_and_manifested(tmp_path):
     assert service.transport.budgets.max_paid_urls == 3
 
 
+def test_preview_404_is_proven_not_available(tmp_path):
+    service, repository, _ = _service(tmp_path)
+    repository.preview_candidates = [
+        {
+            "game_id": 404,
+            "game": "Home-Away",
+            "date": datetime(2026, 7, 11, 12),
+            "home_team": "Home",
+            "away_team": "Away",
+            "attempt_no": 1,
+            "force_refresh": False,
+        }
+    ]
+    service.transport = _FailingTransport(
+        WhoScoredTransportError(
+            "HTTP 404",
+            kind=FailureKind.HTTP_STATUS,
+            url="https://www.whoscored.com/Matches/404/Preview",
+            route=TransportRoute.DIRECT_HTTP,
+            status_code=404,
+            retryable=False,
+        )
+    )
+
+    result = service.sync_previews()
+
+    assert result.status == "success"
+    assert result.succeeded == 1
+    assert result.counts["not_available"] == 1
+    assert result.retryable == []
+    assert result.terminal == []
+    assert repository.preview_failures[0].state == "not_available"
+
+
 def test_preview_retry_replays_persisted_raw_without_a_second_network_call(
     tmp_path,
 ):
@@ -2369,7 +2652,33 @@ def test_profile_candidates_use_one_deduplicated_union_scope_query(tmp_path):
     ]
 
 
-def test_profile_terminal_404_is_manifested_and_not_reported_retryable(tmp_path):
+def test_explicit_profile_ids_bypass_mutable_candidate_selection(tmp_path):
+    service, repository, _ = _service(tmp_path)
+    repository.profile_candidates = [999999]
+    service.transport = _Transport(
+        """
+        <div><span class="info-label">Name: </span>Frozen Player</div>
+        <div><span class="info-label">Current Team: </span>
+          <a href="/Teams/1219/Show/Test">Test</a>
+        </div>
+        <div><span class="info-label">Positions: </span>Defender</div>
+        <script>var currentParticipations = [{
+          tournamentId:1,seasonId:2,stageId:3,teamId:1219,
+          teamName:'Test',position:{displayName:'DC'}
+        }];</script>
+        """
+    )
+    candidate_queries = len(repository.profile_candidate_scope_requests)
+
+    result = service.sync_profiles(limit=200, player_ids=[621946])
+
+    assert result.status == "success"
+    assert result.attempted == result.succeeded == 1
+    assert repository.profile_commits[0].player_id == 621946
+    assert len(repository.profile_candidate_scope_requests) == candidate_queries
+
+
+def test_profile_404_is_proven_not_available_and_not_retried(tmp_path):
     service, repository, _ = _service(tmp_path)
     repository.profile_candidates = [404]
     service.transport = _FailingTransport(
@@ -2387,10 +2696,12 @@ def test_profile_terminal_404_is_manifested_and_not_reported_retryable(tmp_path)
 
     assert result.status == "success"
     assert result.retryable == []
-    assert result.terminal == ["404"]
+    assert result.terminal == []
+    assert result.succeeded == 1
+    assert result.counts["not_available"] == 1
     assert result.errors == []
     failure = repository.profile_failures[0]
-    assert failure["state"] == "terminal"
+    assert failure["state"] == "not_available"
     assert failure["retry_after"] is None
     assert failure["http_status"] == 404
     assert failure["failure_code"] == "http_status"
