@@ -341,21 +341,6 @@ _SS_FLOOR_BASES: Dict[str, tuple] = {
 }
 
 
-def _summed_club_floors() -> Dict[str, int]:
-    """WARN floors for the club batch, summed over CLUB_LEAGUES.
-
-    The club JSON is batch-granular (one result file for the whole batch), so
-    per-league resolution inside it is impossible without a runner refactor —
-    the sum is the honest floor. For the current CLUB_LEAGUES ==
-    ['ENG-Premier League'] every value equals the historical literal exactly
-    (100 / 10 / 300 / 300 / 10000 / 10000 / 300).
-    """
-    return {
-        k: sum(_scale(u, b, lg) for lg in CLUB_LEAGUES)
-        for k, (u, b) in _SS_FLOOR_BASES.items()
-    }
-
-
 def _competition_floors(league: str) -> Dict[str, int]:
     """Per-competition floors for independently captured result files."""
     return {
@@ -479,8 +464,8 @@ def validate_data(**context) -> Dict[str, Any]:
 
     # Minimum thresholds (#920 Phase 2: derived per competitions.yaml volumes,
     # not APL literals — see _SS_FLOOR_BASES).
-    floors = _summed_club_floors()
-    capture_floors = _competition_floors(PRIMARY_CLUB_LEAGUE)
+    floors = _competition_floors(PRIMARY_CLUB_LEAGUE)
+    capture_floors = floors
     if validation["summary"]["schedule_rows"] < floors["schedule_rows"]:
         validation["warnings"].append(
             "Low schedule row count - possible scraping issue"

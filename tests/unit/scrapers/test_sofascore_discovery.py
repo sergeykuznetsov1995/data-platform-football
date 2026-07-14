@@ -649,9 +649,12 @@ def test_atomic_writer_preserves_registry_read_mode(tmp_path):
 
 @pytest.mark.unit
 def test_atomic_writer_rejects_concurrent_activation_change(tmp_path):
-    expected = json.loads(
-        Path("configs/sofascore/tournaments.json").read_text(encoding="utf-8")
-    )
+    # The compare-and-swap contract is about *any* operator activation landing
+    # while discovery is on the network, so this test owns its input like the
+    # merge contracts above. Reading the shipped file made the mutation below
+    # depend on which leagues happen to be active: once wave-1 onboarding
+    # enabled 8 (#951), "enable 8" became a no-op and the guard went untested.
+    expected = _existing_registry()
     path = tmp_path / "registry.json"
     path.write_text(json.dumps(expected), encoding="utf-8")
 
@@ -660,6 +663,7 @@ def test_atomic_writer_rejects_concurrent_activation_change(tmp_path):
         item for item in concurrent["tournaments"]
         if item["unique_tournament_id"] == 8
     )
+    assert laliga["enabled"] is False  # the concurrent edit must be a real change
     laliga["enabled"] = True
     path.write_text(json.dumps(concurrent), encoding="utf-8")
 

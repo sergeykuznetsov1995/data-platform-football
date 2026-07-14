@@ -39,6 +39,9 @@ WORLD_CUP_SEASON_SHAPE = production_season_shape(
 )
 EPL_SEASON_CLASS = season_workload_class(EPL_SEASON_SHAPE)
 WORLD_CUP_SEASON_CLASS = season_workload_class(WORLD_CUP_SEASON_SHAPE)
+# The paid canary measures these two tournaments; every other enabled league is
+# authorized through the by-shape transfer rule, never through its own samples.
+MEASURED_TOURNAMENT_IDS = {16, 17}
 
 
 @pytest.fixture
@@ -376,11 +379,18 @@ def test_shipped_candidate_has_exact_required_v3_classes_and_shapes():
         for item in registry["tournaments"]
         if item["enabled"]
     }
-    assert enabled_ids == {16, 17}
+    # Wave 1 (#951): the top-5 club leagues plus the two measured tournaments.
+    assert enabled_ids == {8, 16, 17, 23, 34, 35}
+    # Only t16/t17 carry paid canary samples; the other enabled leagues rely on
+    # the by-shape transfer rule, which needs at least two measured tournaments.
+    assert len(MEASURED_TOURNAMENT_IDS) >= MIN_MEASURED_TOURNAMENTS_FOR_TRANSFER
+    assert MEASURED_TOURNAMENT_IDS <= enabled_ids
     for name in (MATCH_CLASS, PLAYER_CLASS):
         stored = payload["workload_classes"][name]
-        assert stored["measured_tournament_ids"] == sorted(enabled_ids)
-        assert set(stored["cohorts"]) == {str(value) for value in enabled_ids}
+        assert stored["measured_tournament_ids"] == sorted(MEASURED_TOURNAMENT_IDS)
+        assert set(stored["cohorts"]) == {
+            str(value) for value in MEASURED_TOURNAMENT_IDS
+        }
         assert "source_tournament_id" not in stored
         assert "source_tournament_id" not in stored["shape"]
     for name, shape in (

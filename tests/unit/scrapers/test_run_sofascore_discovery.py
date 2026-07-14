@@ -261,14 +261,24 @@ def test_concurrent_activation_is_preserved_and_run_fails_for_retry(
     client = _Client()
     monkeypatch.setattr(module, "DirectSofaScoreClient", lambda: client)
 
+    # The contract is "an operator activation that lands mid-discovery survives
+    # and the run fails for retry" -- it does not care *which* league that is.
+    # Enabling a hardcoded id turned into a no-op (and a false green) the moment
+    # wave-1 onboarding activated it (#951), so activate whatever record this
+    # registry still leaves inactive. Built outside the callback on purpose:
+    # main() swallows callback exceptions into exit code 1, which would keep the
+    # assertion below green even if this mutation stopped being a real change.
+    before = json.loads(registry.read_text(encoding="utf-8"))
+    concurrent = deepcopy(before)
+    inactive = next(
+        item for item in concurrent["tournaments"]
+        if not item["enabled"] and item["canonical_id"]
+    )
+    inactive["enabled"] = True
+    assert concurrent != before
+
     def discover(existing, actual_client):
         assert actual_client is client
-        concurrent = deepcopy(existing)
-        laliga = next(
-            item for item in concurrent["tournaments"]
-            if item["unique_tournament_id"] == 8
-        )
-        laliga["enabled"] = True
         registry.write_text(json.dumps(concurrent), encoding="utf-8")
         return _changed_document(existing), {
             "changed": True,
@@ -281,13 +291,9 @@ def test_concurrent_activation_is_preserved_and_run_fails_for_retry(
         "--registry", str(registry), "--output", str(report),
     ]) == 1
 
-    current = json.loads(registry.read_text(encoding="utf-8"))
-    laliga = next(
-        item for item in current["tournaments"]
-        if item["unique_tournament_id"] == 8
-    )
+    # The operator's decision is intact: discovery did not overwrite one byte.
+    assert json.loads(registry.read_text(encoding="utf-8")) == concurrent
     result = json.loads(report.read_text(encoding="utf-8"))
-    assert laliga["enabled"] is True
     assert result["status"] == "failed"
     assert "changed during discovery" in result["errors"][0]
 

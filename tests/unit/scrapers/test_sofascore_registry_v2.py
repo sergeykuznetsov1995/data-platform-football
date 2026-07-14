@@ -429,9 +429,95 @@ def _cli():
     return importlib.import_module("dags.scripts.manage_sofascore_registry")
 
 
-def _registry_copy(tmp_path) -> Path:
+# The shipped registry is a moving target: every onboarding wave flips rows from
+# "no source evidence yet" to "approved and enabled" (wave 1 activated
+# 8/16/17/23/34/35).  The CLI contracts below never assert *which* leagues are
+# live -- they need an eligible row, a row whose source evidence has not landed
+# yet, and rows with broken canonical links.  Borrowing whichever rows the
+# production registry happened to ship is what silently disarmed the negative
+# arm of these gates when La Liga (8) was onboarded, so pin the archetypes here.
+#
+# The archetypes are built through the production helpers, and the eligible one
+# is re-checked by ``set_activation``, so a fixture that stops exercising the
+# gate it guards fails loudly here instead of passing vacuously below.
+def _undiscovered(row: dict) -> dict:
+    """Pin the pre-discovery archetype: the source detail was never fetched."""
+
+    row = deepcopy(row)
+    row["enabled"] = False
+    row["review"] = pending_review()
+    row["seasons"] = []
+    row["classification"] = classify_tournament_source(
+        {},
+        name=row["name"],
+        sport_slug="football",
+        endpoint=f"/unique-tournament/{row['unique_tournament_id']}",
+    )
+    assert row["classification"]["gender"] == "unknown"
+    assert activation_eligibility(row).allowed is False
+    return row
+
+
+def _approved(row: dict) -> dict:
+    """Pin the shipped archetype: source-confirmed male football + sign-off."""
+
+    row = deepcopy(row)
+    row["classification"] = classify_tournament_source(
+        {"gender": "M"},
+        name=row["name"],
+        sport_slug="football",
+        endpoint=f"/unique-tournament/{row['unique_tournament_id']}",
+    )
+    approved = approve_tournament(
+        row,
+        canonical_id=row["canonical_id"],
+        reviewed_by="fixture@example.com",
+        reviewed_at="2026-07-01T00:00:00+00:00",
+        evidence=[
+            {"type": "operator_reference", "reference": "https://example.org/rules"}
+        ],
+    )
+    return set_activation(approved, enabled=True)
+
+
+def _registry_fixture(tmp_path) -> Path:
+    """A registry pinned to the archetypes the CLI contracts actually need."""
+
+    document = json.loads(
+        Path("configs/sofascore/tournaments.json").read_text(encoding="utf-8")
+    )
+    rows = {item["unique_tournament_id"]: item for item in document["tournaments"]}
+    # 16/17: eligible (approved, enabled, canonical seasons available).
+    rows[16] = _approved(rows[16])
+    rows[17] = _approved(rows[17])
+    # 8: an adult-men candidate whose source gender evidence has not landed.
+    rows[8] = _undiscovered(rows[8])
+    # 7: a registry row that carries no canonical_id at all.
+    rows[7] = _undiscovered(rows[7])
+    rows[7]["canonical_id"] = None
+    # 270: a canonical_id that exists in competitions.yaml, but whose only
+    # canonical source season is not one of the seasons declared there.
+    rows[270] = _undiscovered(rows[270])
+    rows[270]["canonical_id"] = "INT-Africa Cup of Nations"
+    rows[270]["seasons"] = [{
+        "season_id": 1957,
+        "name": "Africa Cup of Nations 1957",
+        "source_name": "Africa Cup of Nations 1957",
+        "year": "1957",
+        "format": "calendar_year",
+        "season_format": "single_year",
+        "canonical_season": "1957",
+        "start_date": None,
+        "end_date": None,
+        "aliases": ["1957"],
+        "evidence": [{"type": "fixture"}],
+    }]
+    document["tournaments"] = list(rows.values())
+
     path = tmp_path / "tournaments.json"
-    path.write_bytes(Path("configs/sofascore/tournaments.json").read_bytes())
+    path.write_text(
+        json.dumps(document, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
     return path
 
 
@@ -452,7 +538,7 @@ def _batch_file(tmp_path, payload: dict) -> Path:
 @pytest.mark.unit
 def test_operator_cli_activation_is_atomic_and_fail_closed(tmp_path):
     module = _cli()
-    path = _registry_copy(tmp_path)
+    path = _registry_fixture(tmp_path)
 
     assert module.main(
         ["--registry", str(path), "disable", "--tournament-ids", "17"]
@@ -471,7 +557,7 @@ def test_operator_cli_activation_is_atomic_and_fail_closed(tmp_path):
 @pytest.mark.unit
 def test_batch_enable_is_all_or_nothing_in_one_write(tmp_path):
     module = _cli()
-    path = _registry_copy(tmp_path)
+    path = _registry_fixture(tmp_path)
 
     # 16 is eligible, 8 is not: the eligible row must not be written either.
     before = path.read_bytes()
@@ -491,7 +577,7 @@ def test_batch_enable_is_all_or_nothing_in_one_write(tmp_path):
 @pytest.mark.unit
 def test_approve_batch_applies_the_whole_wave_in_one_write(tmp_path):
     module = _cli()
-    path = _registry_copy(tmp_path)
+    path = _registry_fixture(tmp_path)
     batch = _batch_file(tmp_path, {
         "reviewed_by": "operator@example.com",
         "reviewed_at": "2026-07-14T00:00:00+00:00",
@@ -541,7 +627,7 @@ def test_approve_batch_rejects_an_unreplaced_evidence_todo(tmp_path):
     # prepare-review placeholder. Filling in only reviewed_by and leaving the
     # `"todo": true` stub must NOT activate a competition.
     module = _cli()
-    path = _registry_copy(tmp_path)
+    path = _registry_fixture(tmp_path)
     before = path.read_bytes()
     with_todo = _batch_file(tmp_path, {
         "reviewed_by": "operator@example.com",
@@ -589,7 +675,7 @@ def test_approve_batch_rejects_an_unreplaced_evidence_todo(tmp_path):
 @pytest.mark.unit
 def test_approve_batch_aborts_before_writing_when_one_row_is_ineligible(tmp_path):
     module = _cli()
-    path = _registry_copy(tmp_path)
+    path = _registry_fixture(tmp_path)
     before = path.read_bytes()
     batch = _batch_file(tmp_path, {
         "reviewed_by": "operator@example.com",
@@ -619,7 +705,7 @@ def test_approve_batch_aborts_before_writing_when_one_row_is_ineligible(tmp_path
 @pytest.mark.unit
 def test_approve_batch_cannot_precede_the_source_gender_evidence(tmp_path):
     module = _cli()
-    path = _registry_copy(tmp_path)
+    path = _registry_fixture(tmp_path)
     batch = _batch_file(tmp_path, {
         "reviewed_by": "operator@example.com",
         "approvals": [{
@@ -661,7 +747,7 @@ def test_approve_batch_cannot_precede_the_source_gender_evidence(tmp_path):
 @pytest.mark.unit
 def test_approve_batch_rejects_a_concurrent_registry_update(tmp_path, monkeypatch):
     module = _cli()
-    path = _registry_copy(tmp_path)
+    path = _registry_fixture(tmp_path)
     batch = _batch_file(tmp_path, {
         "reviewed_by": "operator@example.com",
         "approvals": [{
@@ -695,7 +781,7 @@ def test_approve_batch_rejects_a_concurrent_registry_update(tmp_path, monkeypatc
 @pytest.mark.unit
 def test_approve_batch_refuses_duplicates_and_an_unfilled_reviewer(tmp_path):
     module = _cli()
-    path = _registry_copy(tmp_path)
+    path = _registry_fixture(tmp_path)
     before = path.read_bytes()
 
     unsigned = _batch_file(tmp_path, {
@@ -737,7 +823,7 @@ def test_approve_batch_refuses_duplicates_and_an_unfilled_reviewer(tmp_path):
 @pytest.mark.unit
 def test_reject_batch_disables_and_records_evidence(tmp_path):
     module = _cli()
-    path = _registry_copy(tmp_path)
+    path = _registry_fixture(tmp_path)
     batch = _batch_file(tmp_path, {
         "reviewed_by": "operator@example.com",
         "rejections": [{
@@ -759,9 +845,10 @@ def test_reject_batch_disables_and_records_evidence(tmp_path):
 @pytest.mark.unit
 def test_prepare_review_snapshots_source_state_and_blocks_broken_links(tmp_path):
     module = _cli()
-    path = _registry_copy(tmp_path)
+    path = _registry_fixture(tmp_path)
+    before = path.read_bytes()
     # 7 has no canonical_id, 270's only canonical season is not in
-    # competitions.yaml, 8 is a wave-1 candidate awaiting targeted discovery.
+    # competitions.yaml, 8 is a candidate awaiting targeted discovery.
     output = tmp_path / "review.json"
     assert module.main([
         "--registry", str(path),
@@ -795,15 +882,13 @@ def test_prepare_review_snapshots_source_state_and_blocks_broken_links(tmp_path)
         "overlaps" in reason for reason in rows[270]["blocked"]
     )
     # The registry itself is read-only for this command.
-    assert path.read_bytes() == Path(
-        "configs/sofascore/tournaments.json"
-    ).read_bytes()
+    assert path.read_bytes() == before
 
 
 @pytest.mark.unit
 def test_prepare_review_blocks_a_canonical_id_outside_competitions(tmp_path):
     module = _cli()
-    path = _registry_copy(tmp_path)
+    path = _registry_fixture(tmp_path)
     document = json.loads(path.read_text(encoding="utf-8"))
     laliga = next(
         item for item in document["tournaments"]
