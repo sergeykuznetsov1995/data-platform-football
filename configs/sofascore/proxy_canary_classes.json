@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "description": "Declaration of the paid-canary workload classes and of the fixed cohorts each class is measured on. A class is one (scope, byte-driving shape) pair: its name and shape digest are recomputed by scripts/research/bench_sofascore_paid_canary.py and can never be drawn here. match/player shapes are production code constants; a season shape is declared by its byte-driving parameters only. Every class must be measured on each of its collection targets (even-floor round-robin), because a class transfers to an unmeasured tournament only after >= 2 tournaments agreed on the same shape.",
+  "classes": [
+    {
+      "key": "match",
+      "scope": "match",
+      "targets": [
+        {
+          "source_tournament_id": 16,
+          "tournament_slug": "world-cup",
+          "cohort_path": "proxy_canary_cohort_world_cup.json",
+          "cohort_name": "fixed_world_cup_25_matches"
+        },
+        {
+          "source_tournament_id": 17,
+          "tournament_slug": "premier-league",
+          "cohort_path": "proxy_canary_cohort.json",
+          "cohort_name": "fixed_epl_25_matches"
+        }
+      ]
+    },
+    {
+      "key": "player",
+      "scope": "player",
+      "targets": [
+        {
+          "source_tournament_id": 16,
+          "tournament_slug": "world-cup",
+          "cohort_path": "proxy_canary_cohort_world_cup.json",
+          "cohort_name": "fixed_world_cup_50_players"
+        },
+        {
+          "source_tournament_id": 17,
+          "tournament_slug": "premier-league",
+          "cohort_path": "proxy_canary_cohort.json",
+          "cohort_name": "fixed_epl_50_players"
+        }
+      ]
+    },
+    {
+      "key": "season_split_year_16_20",
+      "scope": "season",
+      "shape_params": {
+        "season_format": "split_year",
+        "team_count_band": "16_20",
+        "max_pages_per_direction": 50
+      },
+      "targets": [
+        {
+          "source_tournament_id": 17,
+          "tournament_slug": "premier-league",
+          "cohort_path": "proxy_canary_cohort.json",
+          "cohort_name": "enabled_epl_2526_shape",
+          "representative_season_id": 76986
+        }
+      ]
+    },
+    {
+      "key": "season_calendar_year_33_48",
+      "scope": "season",
+      "shape_params": {
+        "season_format": "calendar_year",
+        "team_count_band": "33_48",
+        "max_pages_per_direction": 50
+      },
+      "targets": [
+        {
+          "source_tournament_id": 16,
+          "tournament_slug": "world-cup",
+          "cohort_path": "proxy_canary_cohort_world_cup.json",
+          "cohort_name": "enabled_world_cup_2026_shape",
+          "representative_season_id": 58210
+        }
+      ]
+    }
+  ]
+}

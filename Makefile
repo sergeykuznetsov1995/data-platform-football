@@ -162,6 +162,28 @@ sofascore-discovery:
 		python /opt/airflow/dags/scripts/run_sofascore_discovery.py \
 		--registry /work/sofascore/tournaments.json
 
+# Metered variant of the same one-shot: the catalog fan-out that SofaScore's
+# edge refuses from a datacentre egress. Residential bytes are billable, so the
+# byte ceiling is mandatory and there is no default:
+#   make sofascore-discovery-lease BUDGET_CAP_BYTES=6291456 \
+#        DISCOVERY_ARGS="--scope full --dry-run"
+# The proxy filter refuses every discovery lease until it is started with
+# PROXY_FILTER_SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES set.
+sofascore-discovery-lease:
+	@test -n "$(BUDGET_CAP_BYTES)" || { \
+		echo "BUDGET_CAP_BYTES=<bytes> is required: metered discovery never runs on an implicit budget"; \
+		exit 1; \
+	}
+	docker compose run --rm --no-deps \
+		--user "$$(id -u):$$(id -g)" \
+		--volume "$(CURDIR)/configs/sofascore:/work/sofascore:rw" \
+		airflow-scheduler \
+		python /opt/airflow/dags/scripts/run_sofascore_discovery.py \
+		--registry /work/sofascore/tournaments.json \
+		--transport lease-proxy \
+		--budget-cap-bytes $(BUDGET_CAP_BYTES) \
+		$(DISCOVERY_ARGS)
+
 sofascore-discovery-check:
 	docker compose run --rm --no-deps \
 		--user "$$(id -u):$$(id -g)" \

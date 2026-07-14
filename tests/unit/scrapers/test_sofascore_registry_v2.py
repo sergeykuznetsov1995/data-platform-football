@@ -10,7 +10,11 @@ from pathlib import Path
 import pytest
 
 from scrapers.sofascore.catalog import SofaScoreCatalog
-from scrapers.sofascore.discovery import merge_registry, parse_seasons_payload
+from scrapers.sofascore.discovery import (
+    DiscoveryConcurrentUpdate,
+    merge_registry,
+    parse_seasons_payload,
+)
 from scrapers.sofascore.registry import (
     ActivationError,
     activation_eligibility,
@@ -421,27 +425,407 @@ def test_named_season_can_use_an_explicit_operator_canonical_override():
     assert catalog.enabled_competition_ids() == ("ENG-Premier League",)
 
 
+def _cli():
+    return importlib.import_module("dags.scripts.manage_sofascore_registry")
+
+
+def _registry_copy(tmp_path) -> Path:
+    path = tmp_path / "tournaments.json"
+    path.write_bytes(Path("configs/sofascore/tournaments.json").read_bytes())
+    return path
+
+
+def _tournament(path: Path, tournament_id: int) -> dict:
+    document = json.loads(path.read_text(encoding="utf-8"))
+    return next(
+        item for item in document["tournaments"]
+        if item["unique_tournament_id"] == tournament_id
+    )
+
+
+def _batch_file(tmp_path, payload: dict) -> Path:
+    path = tmp_path / "review.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
 @pytest.mark.unit
 def test_operator_cli_activation_is_atomic_and_fail_closed(tmp_path):
-    module = importlib.import_module("dags.scripts.manage_sofascore_registry")
-    path = tmp_path / "tournaments.json"
-    path.write_bytes(
-        Path("configs/sofascore/tournaments.json").read_bytes()
-    )
+    module = _cli()
+    path = _registry_copy(tmp_path)
 
-    assert module.main(["--registry", str(path), "17", "disable"]) == 0
-    disabled = json.loads(path.read_text(encoding="utf-8"))
-    epl = next(
-        item for item in disabled["tournaments"]
-        if item["unique_tournament_id"] == 17
-    )
-    assert epl["enabled"] is False
+    assert module.main(
+        ["--registry", str(path), "disable", "--tournament-ids", "17"]
+    ) == 0
+    assert _tournament(path, 17)["enabled"] is False
 
-    assert module.main(["--registry", str(path), "17", "enable"]) == 0
+    assert module.main(
+        ["--registry", str(path), "enable", "--tournament-ids", "17"]
+    ) == 0
     before_rejected_activation = path.read_bytes()
     with pytest.raises(ActivationError, match="operator review"):
-        module.main(["--registry", str(path), "8", "enable"])
+        module.main(["--registry", str(path), "enable", "--tournament-ids", "8"])
     assert path.read_bytes() == before_rejected_activation
+
+
+@pytest.mark.unit
+def test_batch_enable_is_all_or_nothing_in_one_write(tmp_path):
+    module = _cli()
+    path = _registry_copy(tmp_path)
+
+    # 16 is eligible, 8 is not: the eligible row must not be written either.
+    before = path.read_bytes()
+    with pytest.raises(ActivationError, match="operator review"):
+        module.main(
+            ["--registry", str(path), "enable", "--tournament-ids", "16,8"]
+        )
+    assert path.read_bytes() == before
+
+    assert module.main(
+        ["--registry", str(path), "enable", "--tournament-ids", "16,17"]
+    ) == 0
+    assert _tournament(path, 16)["enabled"] is True
+    assert _tournament(path, 17)["enabled"] is True
+
+
+@pytest.mark.unit
+def test_approve_batch_applies_the_whole_wave_in_one_write(tmp_path):
+    module = _cli()
+    path = _registry_copy(tmp_path)
+    batch = _batch_file(tmp_path, {
+        "reviewed_by": "operator@example.com",
+        "reviewed_at": "2026-07-14T00:00:00+00:00",
+        "approvals": [
+            {
+                "tournament_id": 16,
+                "canonical_id": "INT-World Cup",
+                "evidence": [{
+                    "type": "repository",
+                    "reference": "configs/medallion/competitions.yaml#INT-World Cup",
+                    "note": "adult men's first-team FIFA competition",
+                }],
+                "notes": "wave 1",
+            },
+            {
+                "tournament_id": 17,
+                "canonical_id": "ENG-Premier League",
+                "evidence": ["https://www.premierleague.com/"],
+            },
+        ],
+    })
+
+    assert module.main(
+        ["--registry", str(path), "approve-batch", "--input", str(batch)]
+    ) == 0
+
+    for tournament_id in (16, 17):
+        row = _tournament(path, tournament_id)
+        assert row["review"]["status"] == "approved"
+        assert row["review"]["reviewed_by"] == "operator@example.com"
+        assert row["review"]["confirmed"] == {
+            "sport": "football",
+            "gender": "male",
+            "age_group": "adult",
+            "team_level": "first_team",
+        }
+        # Approval never activates capture on its own.
+        assert row["enabled"] is False
+    assert _tournament(path, 17)["review"]["evidence"] == [
+        {"type": "operator_reference", "reference": "https://www.premierleague.com/"}
+    ]
+
+
+@pytest.mark.unit
+def test_approve_batch_rejects_an_unreplaced_evidence_todo(tmp_path):
+    # #946 phase-4 review: the evidence gate must fail closed against the
+    # prepare-review placeholder. Filling in only reviewed_by and leaving the
+    # `"todo": true` stub must NOT activate a competition.
+    module = _cli()
+    path = _registry_copy(tmp_path)
+    before = path.read_bytes()
+    with_todo = _batch_file(tmp_path, {
+        "reviewed_by": "operator@example.com",
+        "reviewed_at": "2026-07-14T00:00:00+00:00",
+        "approvals": [{
+            "tournament_id": 17,
+            "canonical_id": "ENG-Premier League",
+            "evidence": [{
+                "type": "repository",
+                "reference": "configs/medallion/competitions.yaml#ENG-Premier League",
+                "note": module.REVIEW_TODO,
+                "todo": True,
+            }],
+        }],
+    })
+    with pytest.raises(
+        ActivationError,
+        match="evidence TODO must be replaced with an out-of-source reference",
+    ):
+        module.main(
+            ["--registry", str(path), "approve-batch", "--input", str(with_todo)]
+        )
+    # The unreplaced stub aborts before the compare-and-swap write.
+    assert path.read_bytes() == before
+
+    # Replacing the stub with a real out-of-source reference approves the wave.
+    replaced = _batch_file(tmp_path, {
+        "reviewed_by": "operator@example.com",
+        "reviewed_at": "2026-07-14T00:00:00+00:00",
+        "approvals": [{
+            "tournament_id": 17,
+            "canonical_id": "ENG-Premier League",
+            "evidence": ["https://www.premierleague.com/"],
+        }],
+    })
+    assert module.main(
+        ["--registry", str(path), "approve-batch", "--input", str(replaced)]
+    ) == 0
+    assert _tournament(path, 17)["review"]["status"] == "approved"
+    assert _tournament(path, 17)["review"]["evidence"] == [
+        {"type": "operator_reference", "reference": "https://www.premierleague.com/"}
+    ]
+
+
+@pytest.mark.unit
+def test_approve_batch_aborts_before_writing_when_one_row_is_ineligible(tmp_path):
+    module = _cli()
+    path = _registry_copy(tmp_path)
+    before = path.read_bytes()
+    batch = _batch_file(tmp_path, {
+        "reviewed_by": "operator@example.com",
+        "approvals": [
+            {
+                "tournament_id": 17,
+                "canonical_id": "ENG-Premier League",
+                "evidence": ["https://www.premierleague.com/"],
+            },
+            {
+                # Source classification still says gender=unknown: the machine
+                # layer has not run, so no operator may approve this row.
+                "tournament_id": 8,
+                "canonical_id": "ESP-La Liga",
+                "evidence": ["https://www.laliga.com/"],
+            },
+        ],
+    })
+
+    with pytest.raises(ActivationError, match="source gender is not confirmed male"):
+        module.main(
+            ["--registry", str(path), "approve-batch", "--input", str(batch)]
+        )
+    assert path.read_bytes() == before
+
+
+@pytest.mark.unit
+def test_approve_batch_cannot_precede_the_source_gender_evidence(tmp_path):
+    module = _cli()
+    path = _registry_copy(tmp_path)
+    batch = _batch_file(tmp_path, {
+        "reviewed_by": "operator@example.com",
+        "approvals": [{
+            "tournament_id": 8,
+            "canonical_id": "ESP-La Liga",
+            "evidence": ["https://www.laliga.com/"],
+        }],
+    })
+    with pytest.raises(ActivationError, match="source gender is not confirmed male"):
+        module.main(
+            ["--registry", str(path), "approve-batch", "--input", str(batch)]
+        )
+
+    # Once discovery has written the source evidence, the same batch applies.
+    document = json.loads(path.read_text(encoding="utf-8"))
+    laliga = next(
+        item for item in document["tournaments"]
+        if item["unique_tournament_id"] == 8
+    )
+    laliga["classification"].update({
+        "gender": "male",
+        "status": "review_required",
+        "evidence": [{
+            "type": "source_field",
+            "endpoint": "/unique-tournament/8",
+            "field": "gender",
+            "value": "M",
+        }],
+    })
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    assert module.main(
+        ["--registry", str(path), "approve-batch", "--input", str(batch)]
+    ) == 0
+    assert _tournament(path, 8)["review"]["status"] == "approved"
+    assert _tournament(path, 8)["enabled"] is False
+
+
+@pytest.mark.unit
+def test_approve_batch_rejects_a_concurrent_registry_update(tmp_path, monkeypatch):
+    module = _cli()
+    path = _registry_copy(tmp_path)
+    batch = _batch_file(tmp_path, {
+        "reviewed_by": "operator@example.com",
+        "approvals": [{
+            "tournament_id": 17,
+            "canonical_id": "ENG-Premier League",
+            "evidence": ["https://www.premierleague.com/"],
+        }],
+    })
+
+    original_read = module._read
+
+    def _racing_read(target: Path):
+        document = original_read(target)
+        concurrent = deepcopy(dict(document))
+        other = next(
+            item for item in concurrent["tournaments"]
+            if item["unique_tournament_id"] == 16
+        )
+        other["enabled"] = False
+        target.write_text(json.dumps(concurrent), encoding="utf-8")
+        return document
+
+    monkeypatch.setattr(module, "_read", _racing_read)
+    with pytest.raises(DiscoveryConcurrentUpdate, match="registry changed"):
+        module.main(
+            ["--registry", str(path), "approve-batch", "--input", str(batch)]
+        )
+    assert _tournament(path, 17)["review"]["reviewed_by"] != "operator@example.com"
+
+
+@pytest.mark.unit
+def test_approve_batch_refuses_duplicates_and_an_unfilled_reviewer(tmp_path):
+    module = _cli()
+    path = _registry_copy(tmp_path)
+    before = path.read_bytes()
+
+    unsigned = _batch_file(tmp_path, {
+        "reviewed_by": None,
+        "approvals": [{
+            "tournament_id": 17,
+            "canonical_id": "ENG-Premier League",
+            "evidence": ["https://www.premierleague.com/"],
+        }],
+    })
+    with pytest.raises(ActivationError, match="reviewed_by is required"):
+        module.main(
+            ["--registry", str(path), "approve-batch", "--input", str(unsigned)]
+        )
+
+    duplicated = tmp_path / "duplicated.json"
+    duplicated.write_text(json.dumps({
+        "reviewed_by": "operator@example.com",
+        "approvals": [
+            {
+                "tournament_id": 17,
+                "canonical_id": "ENG-Premier League",
+                "evidence": ["https://www.premierleague.com/"],
+            },
+            {
+                "tournament_id": 17,
+                "canonical_id": "ENG-Premier League",
+                "evidence": ["https://www.premierleague.com/"],
+            },
+        ],
+    }), encoding="utf-8")
+    with pytest.raises(ValueError, match="duplicate tournament id"):
+        module.main(
+            ["--registry", str(path), "approve-batch", "--input", str(duplicated)]
+        )
+    assert path.read_bytes() == before
+
+
+@pytest.mark.unit
+def test_reject_batch_disables_and_records_evidence(tmp_path):
+    module = _cli()
+    path = _registry_copy(tmp_path)
+    batch = _batch_file(tmp_path, {
+        "reviewed_by": "operator@example.com",
+        "rejections": [{
+            "tournament_id": 17,
+            "evidence": ["https://example.org/out-of-scope"],
+            "notes": "out of scope",
+        }],
+    })
+
+    assert module.main(
+        ["--registry", str(path), "reject-batch", "--input", str(batch)]
+    ) == 0
+    epl = _tournament(path, 17)
+    assert epl["review"]["status"] == "rejected"
+    assert epl["enabled"] is False
+    assert epl["review"]["notes"] == "out of scope"
+
+
+@pytest.mark.unit
+def test_prepare_review_snapshots_source_state_and_blocks_broken_links(tmp_path):
+    module = _cli()
+    path = _registry_copy(tmp_path)
+    # 7 has no canonical_id, 270's only canonical season is not in
+    # competitions.yaml, 8 is a wave-1 candidate awaiting targeted discovery.
+    output = tmp_path / "review.json"
+    assert module.main([
+        "--registry", str(path),
+        "prepare-review",
+        "--tournament-ids", "8,7",
+        "--tournament-ids", "270",
+        "--output", str(output),
+    ]) == 0
+
+    draft = json.loads(output.read_text(encoding="utf-8"))
+    assert draft["reviewed_by"] is None
+    assert [row["tournament_id"] for row in draft["approvals"]] == [8, 7, 270]
+    rows = {row["tournament_id"]: row for row in draft["approvals"]}
+
+    laliga = rows[8]
+    assert laliga["canonical_id"] == "ESP-La Liga"
+    assert laliga["source_snapshot"]["gender"] == "unknown"
+    assert laliga["source_snapshot"]["status"] == "unknown"
+    assert laliga["source_snapshot"]["canonical_seasons"] == []
+    assert laliga["evidence"] == [{
+        "type": "repository",
+        "reference": "configs/medallion/competitions.yaml#ESP-La Liga",
+        "note": module.REVIEW_TODO,
+        "todo": True,
+    }]
+    assert any("canonical source season" in reason for reason in laliga["blocked"])
+
+    assert rows[7]["evidence"] == []
+    assert rows[7]["blocked"] == ["canonical_id is missing from the registry row"]
+    assert any(
+        "overlaps" in reason for reason in rows[270]["blocked"]
+    )
+    # The registry itself is read-only for this command.
+    assert path.read_bytes() == Path(
+        "configs/sofascore/tournaments.json"
+    ).read_bytes()
+
+
+@pytest.mark.unit
+def test_prepare_review_blocks_a_canonical_id_outside_competitions(tmp_path):
+    module = _cli()
+    path = _registry_copy(tmp_path)
+    document = json.loads(path.read_text(encoding="utf-8"))
+    laliga = next(
+        item for item in document["tournaments"]
+        if item["unique_tournament_id"] == 8
+    )
+    laliga["canonical_id"] = "ESP-Segunda Division"
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    output = tmp_path / "review.json"
+    assert module.main([
+        "--registry", str(path),
+        "prepare-review",
+        "--tournament-ids", "8",
+        "--output", str(output),
+    ]) == 0
+
+    row = json.loads(output.read_text(encoding="utf-8"))["approvals"][0]
+    assert row["evidence"] == []
+    assert row["blocked"] == [
+        "canonical_id 'ESP-Segunda Division' is not in "
+        "configs/medallion/competitions.yaml"
+    ]
 
 
 @pytest.mark.unit

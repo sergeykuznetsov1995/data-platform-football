@@ -47,20 +47,59 @@ make sofascore-discovery-check
 ```
 
 Review and activation are separate atomic operations. Approval deliberately
-leaves the row disabled:
+leaves the row disabled. The CLI grammar is command-first:
 
 ```bash
-python dags/scripts/manage_sofascore_registry.py 7 approve \
+python dags/scripts/manage_sofascore_registry.py approve \
+  --tournament-id 7 \
   --canonical-id "UEFA-Champions League" \
   --reviewed-by operator@example.com \
   --evidence https://www.uefa.com/uefachampionsleague/
 
-python dags/scripts/manage_sofascore_registry.py 7 enable
+python dags/scripts/manage_sofascore_registry.py enable --tournament-ids 7
 ```
 
 `enable` re-evaluates the full source-plus-review evidence and refuses unknown,
 women, mixed, youth, reserve, futsal, or seasonless records. Airflow mounts this
 registry read-only; discovery and operator commands are the only writers.
+
+## Onboarding a wave of tournaments
+
+Machine evidence first: a targeted discovery pass must have written
+`classification.gender = male` and source seasons for every candidate. Without
+it, approval is impossible — the classifier is fail-closed and no CLI flag can
+override it.
+
+```bash
+python dags/scripts/manage_sofascore_registry.py prepare-review \
+  --tournament-ids 8,23,34,35 --output /tmp/sofascore-review.json
+```
+
+`prepare-review` only reads: it snapshots each row's source classification and
+canonical seasons, drafts the cross-source evidence stub that still needs a
+human reference, and lists `blocked` reasons when `canonical_id` is absent, is
+unknown to `configs/medallion/competitions.yaml`, or has no canonical season in
+common with it. The evidence stub is flagged `"todo": true`; `approve-batch`
+actively rejects any approval whose evidence still carries that flag
+(`evidence TODO must be replaced with an out-of-source reference before
+approval`), so filling in only `reviewed_by` cannot activate a competition. The
+operator fills `reviewed_by`, replaces every evidence `TODO` with a real
+out-of-source reference, then applies the whole wave:
+
+```bash
+python dags/scripts/manage_sofascore_registry.py approve-batch \
+  --input /tmp/sofascore-review.json
+
+python dags/scripts/manage_sofascore_registry.py enable --tournament-ids 8,23,34,35
+```
+
+`approve-batch` (and its `reject-batch` twin, which reads a `rejections` list)
+is all-or-nothing: every row is applied in memory and a single ineligible
+tournament aborts the wave before the compare-and-swap write, so the registry
+file never holds a half-applied wave. A concurrent discovery or operator write
+between read and write aborts with a concurrent-update error; rerun. `enable`
+takes the whole wave in one write and re-checks eligibility per row — enable a
+wave only after its capture budget classes are verified.
 
 ## Production table bootstrap
 

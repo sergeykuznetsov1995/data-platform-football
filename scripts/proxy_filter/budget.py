@@ -21,6 +21,7 @@ from typing import Mapping, Optional
 from scrapers.sofascore.workload_plan import (
     MIN_COLD_SAMPLES_PER_CLASS,
     MIN_DISTINCT_EXITS_PER_CLASS,
+    SEASON_DYNAMIC_ENDPOINTS,
     WORKLOAD_ARTIFACT_SCHEMA_VERSION,
     WORKLOAD_BUDGET_DERIVATION,
     WORKLOAD_METER,
@@ -31,6 +32,9 @@ from scrapers.sofascore.workload_plan import (
 
 CANARY_SCHEMA_VERSION = WORKLOAD_ARTIFACT_SCHEMA_VERSION
 LEGACY_CANARY_SCHEMA_VERSION = 1
+# v2 bound a class to one tournament instead of one measured shape.  Its samples
+# cannot be re-interpreted as shape evidence, so it is rejected explicitly.
+SUPERSEDED_CANARY_SCHEMA_VERSION = 2
 LEDGER_SCHEMA_VERSION = 1
 BUDGET_DERIVATION = WORKLOAD_BUDGET_DERIVATION
 LEGACY_BUDGET_DERIVATION = "max_measured_total_and_per_run_endpoint_max_v1"
@@ -73,7 +77,7 @@ class BudgetAccountingError(RuntimeError):
     """Provider traffic was missing, inconsistent, or exceeded its reservation."""
 
 
-def _validate_v2_sample_status_evidence(
+def _validate_v3_sample_status_evidence(
     class_name: str,
     raw_class: Mapping[str, object],
     sample: Mapping[str, object],
@@ -83,12 +87,22 @@ def _validate_v2_sample_status_evidence(
         evidence, Mapping
     ) else None
     required = raw_class.get("required_endpoints")
+    valid_required = isinstance(required, list) and bool(required)
+    # Dynamic season endpoints (referee_profile/squads) are only present when the
+    # schedule payloads expose the underlying IDs, so a season sample may omit
+    # one.  Its status evidence must still cover every non-dynamic (static)
+    # endpoint and stay within the shape; match/player keep exact equality.
+    if valid_required and raw_class.get("scope") == "season":
+        mandatory = set(required) - set(SEASON_DYNAMIC_ENDPOINTS)
+    elif valid_required:
+        mandatory = set(required)
+    else:
+        mandatory = set()
     if (
         not isinstance(counts, Mapping)
         or not counts
-        or not isinstance(required, list)
-        or not required
-        or set(counts) != set(required)
+        or not valid_required
+        or not (mandatory <= set(counts) <= set(required))
     ):
         raise ProductionBudgetUnavailable(
             f"{class_name!r} sample omitted endpoint status evidence"
@@ -197,17 +211,22 @@ class BudgetPolicy:
         return value
 
 
-def _load_v2_class_policy(
+def _load_v3_class_policy(
     artifact_path: Path,
     raw: bytes,
     payload: Mapping[str, object],
     workload_class: Optional[str],
 ) -> BudgetPolicy:
-    """Adapt one verified workload class to the capture-engine budget API."""
+    """Adapt one verified workload class to the capture-engine budget API.
+
+    The class is selected by name only; shape identity, provenance and the
+    two-tournament transfer invariant are enforced by
+    :func:`load_verified_workload_policy` and by ``class_for`` at plan time.
+    """
 
     if not isinstance(workload_class, str) or not workload_class.strip():
         raise ProductionBudgetUnavailable(
-            "v2 workload artifact requires one explicit workload_class"
+            "v3 workload artifact requires one explicit workload_class"
         )
     name = workload_class.strip()
     try:
@@ -229,6 +248,14 @@ def _load_v2_class_policy(
     samples = raw_class.get("samples")
     if not isinstance(samples, list):
         raise ProductionBudgetUnavailable(f"{name!r}.samples must be an array")
+    # Season schedule payloads only carry a dynamic endpoint
+    # (``referee_profile``/``squads``) when they expose the underlying IDs, so a
+    # season sample may legitimately omit one - exactly as the workload policy
+    # loader accepts.  Its STATIC endpoints stay mandatory; match/player classes
+    # keep requiring every endpoint.
+    mandatory_endpoints = set(measured.required_endpoints)
+    if measured.scope == "season":
+        mandatory_endpoints -= set(SEASON_DYNAMIC_ENDPOINTS)
     observed_endpoint_maxima: dict[str, int] = {
         endpoint: 0 for endpoint in measured.required_endpoints
     }
@@ -237,7 +264,7 @@ def _load_v2_class_policy(
             raise ProductionBudgetUnavailable(
                 f"{name!r} sample must be an object"
             )
-        _validate_v2_sample_status_evidence(name, raw_class, sample)
+        _validate_v3_sample_status_evidence(name, raw_class, sample)
         request_map = sample.get("endpoint_request_provider_bytes")
         if not isinstance(request_map, Mapping):
             # The workload policy validator normally catches this first.  Keep
@@ -247,6 +274,8 @@ def _load_v2_class_policy(
             )
         for endpoint in measured.required_endpoints:
             observations = request_map.get(endpoint)
+            if observations is None and endpoint not in mandatory_endpoints:
+                continue
             if not isinstance(observations, list) or not observations:
                 raise ProductionBudgetUnavailable(
                     f"{name!r} sample omitted endpoint {endpoint!r}"
@@ -255,12 +284,12 @@ def _load_v2_class_policy(
                 observed_endpoint_maxima[endpoint],
                 max(int(value) for value in observations),
             )
-    if any(value <= 0 for value in observed_endpoint_maxima.values()):
-        missing = sorted(
-            endpoint
-            for endpoint, value in observed_endpoint_maxima.items()
-            if value <= 0
-        )
+    missing = sorted(
+        endpoint
+        for endpoint in mandatory_endpoints
+        if observed_endpoint_maxima.get(endpoint, 0) <= 0
+    )
+    if missing:
         raise ProductionBudgetUnavailable(
             f"{name!r} has no positive measured request for: {', '.join(missing)}"
         )
@@ -449,12 +478,13 @@ def load_verified_policy(
     workload_class: Optional[str] = None,
     allow_legacy_v1: bool = False,
 ) -> BudgetPolicy:
-    """Load exactly one measured task budget; never aggregate v2 classes.
+    """Load exactly one measured task budget; never aggregate v3 classes.
 
-    ``workload_class`` is mandatory for schema v2.  The returned artifact ID
+    ``workload_class`` is mandatory for schema v3.  The returned artifact ID
     binds both the parent artifact SHA-256 and the selected class, so a lease
-    cannot be replayed under another task shape.  Schema v1 is accepted only
-    behind an explicit compatibility flag and therefore cannot silently
+    cannot be replayed under another task shape.  Schema v2 is rejected outright
+    (its classes are keyed by tournament, not by measured shape) and schema v1 is
+    accepted only behind an explicit compatibility flag, so neither can silently
     authorize the production capture path.
     """
 
@@ -468,16 +498,20 @@ def load_verified_policy(
         raise ProductionBudgetUnavailable("canary artifact must be an object")
     schema_version = payload.get("schema_version")
     if schema_version == CANARY_SCHEMA_VERSION:
-        return _load_v2_class_policy(
+        return _load_v3_class_policy(
             artifact_path,
             raw,
             payload,
             workload_class,
         )
+    if schema_version == SUPERSEDED_CANARY_SCHEMA_VERSION:
+        raise ProductionBudgetUnavailable(
+            "v2 artifact cannot authorize production; re-bootstrap v3"
+        )
     if schema_version == LEGACY_CANARY_SCHEMA_VERSION:
         if not allow_legacy_v1:
             raise ProductionBudgetUnavailable(
-                "legacy v1 canary cannot authorize production; migrate to workload v2"
+                "legacy v1 canary cannot authorize production; migrate to workload v3"
             )
         if workload_class is not None:
             raise ProductionBudgetUnavailable(
@@ -911,12 +945,19 @@ def _write_artifact_atomic(path: Path, payload: Mapping[str, object]) -> None:
             pass
 
 
-def _append_v2_sample(
+def _append_v3_sample(
     payload: dict,
     sample: Mapping[str, object],
     *,
     workload_class: Optional[str],
 ) -> None:
+    """Append one observation to its declared v3 class.
+
+    The class is addressed by name and validated against the artifact's own
+    declaration (scope, max_units, required_endpoints); this stays deliberately
+    opaque to how the collector derived that name from a measured shape.
+    """
+
     run_id = str(sample.get("run_id", "")).strip()
     if not run_id or run_id in _all_run_ids(payload):
         raise ValueError("canary run_id must be non-empty and globally unique")
@@ -1027,7 +1068,7 @@ def append_canary_sample(
                 raise ValueError("unsupported canary budget_derivation")
             if payload.get("verified") is True:
                 raise ValueError("verified canary artifact is immutable")
-            _append_v2_sample(
+            _append_v3_sample(
                 payload,
                 sample,
                 workload_class=workload_class,

@@ -997,6 +997,76 @@ competitions:
             mock_config_dir.get_competition_floor_basis("XX-Nope")
 
 
+class TestGetSeasonTeamCount:
+    """#946 4a: per-season team count feeding the SofaScore workload band.
+
+    Unlike the floor basis (a MINIMUM over seasons), the paid-proxy band must
+    describe the season actually being captured — and must fail closed when the
+    season is not configured, since a guessed band would authorize traffic
+    against an unmeasured workload class.
+    """
+
+    def test_returns_the_seasons_own_team_count(self, mock_config_dir):
+        assert mock_config_dir.get_season_team_count(
+            "ENG-Premier League", "2526") == 20
+        # The Bronze partition label is a string; the yaml id is an int.
+        assert mock_config_dir.get_season_team_count(
+            "ENG-Premier League", 2425) == 20
+
+    def test_single_year_tournament_season(self, tmp_path, monkeypatch):
+        mod = _write_competitions(tmp_path, monkeypatch, f"""\
+competitions:
+  - id: "INT-World Cup"
+    name: "FIFA World Cup"
+    country: "World"
+    tier: 1
+    competition_format: group_knockout
+    is_international: true
+    seasons:
+{_GK_SEASON}
+    sources: {{primary: [], fallback: []}}
+    in_scope: true
+""")
+        assert mod.get_season_team_count("INT-World Cup", "2026") == 48
+
+    def test_unconfigured_season_raises(self, mock_config_dir):
+        # A league enabled in the SofaScore registry whose competitions.yaml
+        # entry is still a stub (seasons: []) has no band -> the workload phase
+        # must fail, not silently skip the league.
+        with pytest.raises(
+                mock_config_dir.MedallionConfigError, match="has no season"):
+            mock_config_dir.get_season_team_count("ESP-La Liga", "2526")
+        with pytest.raises(
+                mock_config_dir.MedallionConfigError, match="has no season"):
+            mock_config_dir.get_season_team_count("ENG-Premier League", "1617")
+
+    def test_unknown_competition_raises(self, mock_config_dir):
+        with pytest.raises(
+                mock_config_dir.MedallionConfigError, match="not found"):
+            mock_config_dir.get_season_team_count("XX-Nope", "2526")
+
+    def test_season_without_team_count_is_rejected_at_load(
+            self, tmp_path, monkeypatch):
+        # The band's input is a load-time invariant: a season entry without
+        # team_count never reaches the accessor.
+        mod = _write_competitions(tmp_path, monkeypatch, """\
+competitions:
+  - id: "ENG-Premier League"
+    name: "English Premier League"
+    country: "England"
+    tier: 1
+    seasons:
+      - id: 2526
+        format: "league_round_robin"
+        start: "2025-08-15"
+        end: "2026-05-24"
+    sources: {primary: [], fallback: []}
+    in_scope: true
+""")
+        with pytest.raises(mod.MedallionConfigError, match="team_count"):
+            mod.get_season_team_count("ENG-Premier League", "2526")
+
+
 class TestCompetitionsSchemaFloorFields:
     """#920 Phase 2: format/team_count/match_count enforced at load time."""
 

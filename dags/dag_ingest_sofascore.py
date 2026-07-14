@@ -21,7 +21,10 @@ Data collected:
 The per-player capture (~526 players; since #842 one navigation plus in-page
 fetches per bounded session) still is not worth running daily, so a
 ``ShortCircuitOperator`` gates it to Saturday master-runs or an explicit manual
-``run_players=True`` invocation.
+``run_players=True`` invocation.  On that Saturday a per-league rotation gate
+(#946) captures each club league once every ``SOFASCORE_PLAYER_ROTATION_MODULUS``
+weeks; below ``SOFASCORE_PLAYER_ROTATION_MIN_LEAGUES`` club leagues the rotation
+is a no-op and every league still runs weekly.
 
 All data is written to Iceberg Bronze layer tables (via Parquet fallback).
 """
@@ -137,6 +140,37 @@ def _require_successful_producers(
         )
 
 
+def _require_rotation_skipped(context: Dict[str, Any], task_ids: List[str]) -> None:
+    """A league the weekly rotation left out must actually be ``skipped``.
+
+    Its capture writes no result file, so the validator cannot check it. Any
+    other state (running, failed, success from a stale/manual attempt) means the
+    rotation gate and the signed plan disagreed — fail loudly instead of
+    reporting a green player run that captured nothing.
+    """
+
+    dag_run = context.get("dag_run")
+    if dag_run is None:
+        return
+    getter = getattr(dag_run, "get_task_instance", None)
+    if getter is None:
+        return
+    unexpected: List[str] = []
+    for task_id in task_ids:
+        try:
+            task_instance = getter(task_id)
+        except Exception:  # Airflow/DB lookup failure is fail-closed below.
+            task_instance = None
+        state = getattr(task_instance, "state", None)
+        if str(state).lower() != "skipped":
+            unexpected.append(f"{task_id}={state or 'missing'}")
+    if unexpected:
+        raise AirflowException(
+            "SofaScore player capture outside this week's rotation cohort did "
+            "not skip: " + ", ".join(unexpected)
+        )
+
+
 def _schedule_task_id(league: str) -> str:
     if league == PRIMARY_CLUB_LEAGUE:
         return "scrape_sofascore_data"
@@ -153,6 +187,10 @@ def _player_capture_task_id(league: str) -> str:
     if league == PRIMARY_CLUB_LEAGUE:
         return "scrape_player_capture"
     return f"scrape_player_capture_{_league_slug(league)}"
+
+
+def _player_rotation_gate_task_id(league: str) -> str:
+    return f"gate_player_rotation_{_league_slug(league)}"
 
 
 # Discovery and activation are deliberately separate: the registry contains
@@ -801,35 +839,17 @@ def validate_bronze_freshness(**context) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _gate_player_capture(**context) -> bool:
-    """ShortCircuitOperator hook — TRUE means "run the per-player capture".
+def _resolve_player_run_boundary(context: Dict[str, Any]):
+    """The stable weekly boundary of this run (or None outside Airflow).
 
-    The ~526-player capture is heavy (hours, residential proxy), so it must not
-    run every day. It runs only when:
-
-      - a manual "Trigger DAG w/ config" sets ``run_players=True`` (on demand); or
-      - the daily master-pipeline run falls on Saturday (weekly cadence).
-
-    Skipped otherwise.
-    Returning False short-circuits the downstream player tasks to ``skipped``.
+    Master passes its own data-interval boundary in ``dag_run.conf``. This is
+    intentionally not child start_date: queue delays/retries must not move the
+    weekly branch to another weekday — nor, since #946, to another ISO week.
     """
     import logging
 
     logger = logging.getLogger(__name__)
 
-    _require_successful_producers(
-        context,
-        [_match_capture_task_id(league) for league in SOFASCORE_LEAGUES],
-    )
-
-    params = context.get("params") or {}
-    if params.get("run_players"):
-        logger.info("run_players=True → running per-player capture on demand.")
-        return True
-
-    # Master passes its stable data-interval boundary in dag_run.conf. This is
-    # intentionally not child start_date: queue delays/retries must not move the
-    # weekly branch to another weekday.
     dag_run = context.get("dag_run")
     run_conf = getattr(dag_run, "conf", None) or {}
     master_boundary = run_conf.get("master_data_interval_end")
@@ -849,12 +869,72 @@ def _gate_player_capture(**context) -> bool:
         if getattr(dag_run, "external_trigger", False)
         else None
     )
-    run_boundary = (
+    return (
         external_boundary
         or context.get("data_interval_end")
         or context.get("logical_date")
         or context.get("execution_date")
     )
+
+
+def _due_player_leagues(context: Dict[str, Any]) -> set:
+    """Leagues whose players this run must capture (#946 4d rotation).
+
+    Single source of truth for the cohort is the planner module, which the
+    ``prepare_sofascore_player_plan`` subprocess uses to build the signed plan:
+    a gate that let through a league the plan dropped would fail the runner on
+    an empty signed universe. Lazy import keeps DAG parsing free of the
+    scraper/pandas dependency tree.
+    """
+    from dags.scripts.prepare_sofascore_workload import player_rotation_due
+
+    boundary = _resolve_player_run_boundary(context)
+    rotation_date = boundary.date() if hasattr(boundary, "date") else boundary
+    params = context.get("params") or {}
+    force = bool(params.get("run_players"))
+    return {
+        league
+        for league in SOFASCORE_LEAGUES
+        if player_rotation_due(
+            league,
+            rotation_date=rotation_date,
+            club_league_count=len(CLUB_LEAGUES),
+            is_tournament=league in TOURNAMENT_LEAGUES,
+            force=force,
+        )
+    }
+
+
+def _gate_player_capture(**context) -> bool:
+    """ShortCircuitOperator hook — TRUE means "run the per-player capture".
+
+    The ~526-player capture is heavy (hours, residential proxy), so it must not
+    run every day. It runs only when:
+
+      - a manual "Trigger DAG w/ config" sets ``run_players=True`` (on demand); or
+      - the daily master-pipeline run falls on Saturday (weekly cadence).
+
+    Skipped otherwise.
+    Returning False short-circuits the downstream player tasks to ``skipped``.
+
+    This is the global weekly gate; WHICH leagues run on the Saturday it lets
+    through is the per-league rotation gate's decision (``_gate_player_rotation``).
+    """
+    import logging
+
+    logger = logging.getLogger(__name__)
+
+    _require_successful_producers(
+        context,
+        [_match_capture_task_id(league) for league in SOFASCORE_LEAGUES],
+    )
+
+    params = context.get("params") or {}
+    if params.get("run_players"):
+        logger.info("run_players=True → running per-player capture on demand.")
+        return True
+
+    run_boundary = _resolve_player_run_boundary(context)
     if run_boundary is not None and run_boundary.weekday() == 5:  # Saturday
         logger.info("Saturday run → running weekly per-player capture.")
         return True
@@ -863,75 +943,133 @@ def _gate_player_capture(**context) -> bool:
     return False
 
 
-def validate_player_data(**context) -> Dict[str, Any]:
-    """Row-floor + fallback validation for the consolidated player capture."""
+def _gate_player_rotation(league: str, **context) -> bool:
+    """ShortCircuitOperator hook — TRUE when ``league`` is in this week's cohort.
+
+    Player refresh is the most expensive phase per league, and a squad's
+    profile/season aggregates barely move week to week. Once the club scope
+    reaches ``SOFASCORE_PLAYER_ROTATION_MIN_LEAGUES``, each club league is
+    captured on one Saturday out of ``SOFASCORE_PLAYER_ROTATION_MODULUS``
+    (hash-stable slot, so the cadence survives onboarding). Cup tournaments and
+    forced runs are always due; below the threshold every league is due every
+    Saturday, i.e. the current cadence is unchanged.
+
+    ``ignore_downstream_trigger_rules=False`` is mandatory on the operator:
+    otherwise skipping one league would cascade into the shared
+    ``validate_player_data``/``validate_player_freshness`` validators.
+    """
     import logging
 
     logger = logging.getLogger(__name__)
+
+    due = league in _due_player_leagues(context)
+    logger.info(
+        "player rotation: %s is %s this week.",
+        league,
+        "due" if due else "not due (skipping its capture)",
+    )
+    return due
+
+
+def validate_player_data(**context) -> Dict[str, Any]:
+    """Row-floor + fallback validation for the consolidated player capture.
+
+    Only the leagues in this week's rotation cohort (#946 4d) produce a result
+    file; the rest were short-circuited by their rotation gate and are required
+    to be ``skipped`` instead.
+    """
+    import logging
+
+    logger = logging.getLogger(__name__)
+    due = _due_player_leagues(context)
     _require_successful_producers(
         context,
-        [_player_capture_task_id(league) for league in SOFASCORE_LEAGUES],
+        [
+            _player_capture_task_id(league)
+            for league in SOFASCORE_LEAGUES
+            if league in due
+        ],
     )
-    primary_path = _result_path(PLAYER_CAPTURE_RESULT_PATH, context)
-    result = _load_result(primary_path, logger)
-
-    if not result:
-        raise AirflowException(
-            f"player_capture results file {primary_path} "
-            f"missing or unreadable"
-        )
-    if result.get("skipped") or result.get("fallback") or result.get("errors"):
-        raise AirflowException(
-            "Primary player capture returned skipped/fallback/errors"
-        )
+    _require_rotation_skipped(
+        context,
+        [
+            _player_capture_task_id(league)
+            for league in SOFASCORE_LEAGUES
+            if league not in due
+        ],
+    )
 
     validation = {
         "status": "success",
         "warnings": [],
         "summary": {
-            "player_profile_rows": result.get("rows", 0),
-            "player_profile_players": result.get("profile_players", 0),
-            "player_season_stats_rows": result.get("season_stats_rows", 0),
-            "player_season_stats_players": result.get("season_stats_players", 0),
-            "fallback": result.get("fallback", False),
-            "tables": result.get("tables", []),
+            "rotation_skipped": sorted(
+                league for league in SOFASCORE_LEAGUES if league not in due
+            ),
         },
     }
 
-    errors: List[str] = result.get("errors", []) or []
-    if errors:
-        validation["warnings"] = list(errors)
-        total_rows = validation["summary"]["player_profile_rows"]
-        validation["status"] = "partial_success" if total_rows > 0 else "failed"
+    if PRIMARY_CLUB_LEAGUE in due:
+        primary_path = _result_path(PLAYER_CAPTURE_RESULT_PATH, context)
+        result = _load_result(primary_path, logger)
 
-    # APL ≈ 526 active players → 1 profile row each. This legacy row floor is
-    # diagnostic; fallback/errors already fail above and the 95% universe
-    # coverage gate below is authoritative.
-    rows = validation["summary"]["player_profile_rows"]
-    if rows < 400:
-        if validation["summary"]["fallback"]:
-            validation["warnings"].append(
-                f"player_profile R0.2B_FALLBACK: rows={rows} "
-                f"players={validation['summary']['player_profile_players']}"
+        if not result:
+            raise AirflowException(
+                f"player_capture results file {primary_path} "
+                f"missing or unreadable"
             )
-            if validation["status"] == "success":
-                validation["status"] = "partial_success"
-        else:
-            validation["warnings"].append(f"Low player_profile row count: {rows} < 400")
+        if result.get("skipped") or result.get("fallback") or result.get("errors"):
+            raise AirflowException(
+                "Primary player capture returned skipped/fallback/errors"
+            )
 
-    # player_season_stats (#751 PR3b) — a strict subset of profile (the Season
-    # picker can miss for transferred/multi-competition players). WARN-only
-    # floor: low coverage never fails the run, it just flags a possible picker
-    # regression. 300 is a conservative floor below ~526 active APL players.
-    season_rows = validation["summary"]["player_season_stats_rows"]
-    if season_rows < 300:
-        validation["warnings"].append(
-            f"Low player_season_stats row count: {season_rows} < 300 "
-            f"(Season-tab picker coverage)"
+        validation["summary"].update(
+            {
+                "player_profile_rows": result.get("rows", 0),
+                "player_profile_players": result.get("profile_players", 0),
+                "player_season_stats_rows": result.get("season_stats_rows", 0),
+                "player_season_stats_players": result.get("season_stats_players", 0),
+                "fallback": result.get("fallback", False),
+                "tables": result.get("tables", []),
+            }
         )
 
+        errors: List[str] = result.get("errors", []) or []
+        if errors:
+            validation["warnings"] = list(errors)
+            total_rows = validation["summary"]["player_profile_rows"]
+            validation["status"] = "partial_success" if total_rows > 0 else "failed"
+
+        # APL ≈ 526 active players → 1 profile row each. This legacy row floor is
+        # diagnostic; fallback/errors already fail above and the 95% universe
+        # coverage gate below is authoritative.
+        rows = validation["summary"]["player_profile_rows"]
+        if rows < 400:
+            if validation["summary"]["fallback"]:
+                validation["warnings"].append(
+                    f"player_profile R0.2B_FALLBACK: rows={rows} "
+                    f"players={validation['summary']['player_profile_players']}"
+                )
+                if validation["status"] == "success":
+                    validation["status"] = "partial_success"
+            else:
+                validation["warnings"].append(
+                    f"Low player_profile row count: {rows} < 400"
+                )
+
+        # player_season_stats (#751 PR3b) — a strict subset of profile (the Season
+        # picker can miss for transferred/multi-competition players). WARN-only
+        # floor: low coverage never fails the run, it just flags a possible picker
+        # regression. 300 is a conservative floor below ~526 active APL players.
+        season_rows = validation["summary"]["player_season_stats_rows"]
+        if season_rows < 300:
+            validation["warnings"].append(
+                f"Low player_season_stats row count: {season_rows} < 300 "
+                f"(Season-tab picker coverage)"
+            )
+
     for league in SOFASCORE_LEAGUES:
-        if league == PRIMARY_CLUB_LEAGUE:
+        if league == PRIMARY_CLUB_LEAGUE or league not in due:
             continue
         slug = _league_slug(league)
         path = _result_path(
@@ -986,6 +1124,11 @@ def validate_player_freshness(**context) -> None:
 
     Only runs when the gate let the player capture through (Saturday / manual),
     so it never fires on weekday daily runs that skip the player branch.
+
+    The 192h window stays valid under the #946 4d rotation: every Saturday at
+    least ⌈N/modulus⌉ leagues are captured, so the TABLES keep refreshing. What
+    this check cannot see is PER-LEAGUE staleness (one league silently missing
+    its slot for weeks) — a per-partition freshness check is the follow-up.
     """
     import logging
 
@@ -1092,6 +1235,19 @@ with DAG(
     freshly committed match-player Bronze rows. Match and player targets can
     therefore never share a stale pre-match snapshot.
 
+    ### Weekly league rotation (#946)
+
+    On the Saturday the gate lets through, a per-league
+    `gate_player_rotation_<slug>` decides WHICH leagues are captured: each club
+    league gets a hash-stable slot and runs on 1 Saturday out of
+    `SOFASCORE_PLAYER_ROTATION_MODULUS` (default 4). Cup tournaments and
+    `run_players=true` are always due. The rotation only engages once the club
+    scope reaches `SOFASCORE_PLAYER_ROTATION_MIN_LEAGUES` (default 10) — with
+    today's scope every league still runs every Saturday. Leagues outside the
+    cohort are dropped from the signed player plan as well, so no paid byte and
+    no Trino/squad read is spent on them. Matches and league tables are not
+    rotated: they stay daily.
+
     ### Raw-first incremental capture (#842)
 
     The consolidated `match_capture` captures only matches not marked complete
@@ -1154,6 +1310,18 @@ python dags/scripts/prepare_sofascore_workload.py \\
         do_xcom_push=True,
     )
 
+    # #946 4d: the plan itself must honour the rotation — a league whose gate
+    # skips its capture must not be signed into the plan (and a due league must
+    # be, or the runner fails on an empty signed universe). Feed the plan the
+    # SAME boundary the gate resolves (`_resolve_player_run_boundary`): the
+    # master `data_interval_end` from dag_run.conf, falling back to this run's
+    # own interval end. Relying on Fri/Sat/Sun sharing an ISO week is an
+    # implicit dependency this removes.
+    _players_rotation_args = (
+        "--players-rotation-date "
+        "\"{{ dag_run.conf.get('master_data_interval_end') or (data_interval_end | ds) }}\""
+        " {% if params.run_players %}--players-force{% endif %}"
+    )
     prepare_player_plan_task = BashOperator(
         task_id="prepare_sofascore_player_plan",
         bash_command=f"""
@@ -1162,6 +1330,7 @@ python dags/scripts/prepare_sofascore_workload.py \\
     --dag-id dag_ingest_sofascore \\
     --run-id "{{{{ run_id }}}}" \\
     --phase players \\
+    {_players_rotation_args} \\
     {_competition_season_args}
 """,
         env={
@@ -1363,6 +1532,21 @@ python dags/scripts/run_sofascore_scraper.py \\
             append_env=True,
         )
 
+    # #946 4d — one rotation gate per league, between the signed player plan and
+    # that league's capture. ignore_downstream_trigger_rules=False is mandatory:
+    # the default (True) would cascade the skip past the capture into the shared
+    # validate_player_data/validate_player_freshness validators, silently
+    # skipping validation for the leagues that DID run.
+    player_rotation_gate_tasks = {
+        league: ShortCircuitOperator(
+            task_id=_player_rotation_gate_task_id(league),
+            python_callable=_gate_player_rotation,
+            op_kwargs={"league": league},
+            ignore_downstream_trigger_rules=False,
+        )
+        for league in SOFASCORE_LEAGUES
+    }
+
     validate_player_data_task = PythonOperator(
         task_id="validate_player_data",
         python_callable=validate_player_data,
@@ -1401,7 +1585,8 @@ python dags/scripts/run_sofascore_scraper.py \\
     for _match_task in match_capture_tasks.values():
         _match_task >> gate_player_capture_task
     gate_player_capture_task >> prepare_player_plan_task
-    for _player_task in player_capture_tasks.values():
-        prepare_player_plan_task >> _player_task
+    for _player_league, _player_task in player_capture_tasks.items():
+        _rotation_gate = player_rotation_gate_tasks[_player_league]
+        prepare_player_plan_task >> _rotation_gate >> _player_task
         _player_task >> validate_player_data_task
     validate_player_data_task >> validate_player_freshness_task

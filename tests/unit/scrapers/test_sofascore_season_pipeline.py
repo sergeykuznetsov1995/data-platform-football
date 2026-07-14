@@ -63,6 +63,7 @@ FIXTURE_PATHS = {
     "referee_profile": FIXTURES / "sofascore_referee_900_profile.json",
 }
 PLAYER_EVIDENCE_CASES = FIXTURES / "sofascore_season_76986_player_evidence_cases.json"
+CUP_BRACKET_NEXT_PAGE = FIXTURES / "sofascore_season_76986_cup_schedule_next_0.json"
 
 
 class UnlimitedLimiter:
@@ -170,6 +171,21 @@ def _schedule_payload(event_ids, *, has_next: bool) -> dict:
     }
 
 
+def _placeholder_team(team_id: int) -> dict:
+    """Unresolved knockout-bracket slot in the exact shape SofaScore sends (#946)."""
+
+    return {
+        "id": team_id,
+        "name": f"Winner of match {team_id}",
+        "slug": f"winner-of-match-{team_id}",
+        "gender": "M",
+        "userCount": 0,
+        "type": 0,
+        "country": {},
+        "disabled": True,
+    }
+
+
 def _seed_full_event_referee(
     store: RawPayloadStore,
     *,
@@ -201,8 +217,14 @@ def _seed_full_event_referee(
     )
 
 
-def _seed_complete_partition_roots(store: RawPayloadStore) -> None:
+def _seed_complete_partition_roots(
+    store: RawPayloadStore,
+    *,
+    schedule_next_payload=None,
+) -> None:
     evidence = _payload(PLAYER_EVIDENCE_CASES)
+    if schedule_next_payload is None:
+        schedule_next_payload = _payload(FIXTURE_PATHS["schedule_next"])
     roots = [
         (
             build_schedule_page_spec(direction="last", page=0, **_common()),
@@ -210,7 +232,7 @@ def _seed_complete_partition_roots(store: RawPayloadStore) -> None:
         ),
         (
             build_schedule_page_spec(direction="next", page=0, **_common()),
-            _payload(FIXTURE_PATHS["schedule_next"]),
+            schedule_next_payload,
         ),
         (
             build_standings_total_spec(**_common()),
@@ -703,6 +725,157 @@ def test_partial_participants_and_missing_squad_stay_incomplete(tmp_path):
         "participants omitted scheduled team ids: 44",
     )
     assert plan.complete is False
+
+
+@pytest.mark.unit
+def test_disabled_bracket_placeholders_stay_out_of_team_universe(tmp_path):
+    raw_store = _raw_store(tmp_path)
+    manifest = InMemoryManifestStore()
+    evidence = _payload(PLAYER_EVIDENCE_CASES)
+    _seed_json(
+        raw_store,
+        build_schedule_page_spec(direction="last", page=0, **_common()),
+        _payload(FIXTURE_PATHS["schedule_last"]),
+    )
+    _seed_json(
+        raw_store,
+        build_schedule_page_spec(direction="next", page=0, **_common()),
+        _payload(CUP_BRACKET_NEXT_PAGE),
+    )
+    _seed_json(
+        raw_store,
+        build_participants_spec(**_common()),
+        evidence["full_participants"],
+    )
+
+    plan = plan_season_partition(raw_store, manifest, **_common())
+
+    assert plan.team_ids == ("17", "33", "42", "44")
+    assert {
+        spec.key.target_id for spec in plan.specs if spec.key.endpoint == "squads"
+    } == {"17", "33", "42", "44"}
+    assert plan.placeholder_team_ids == ("999901", "999902")
+    assert plan.player_universe_evidence_gaps == ()
+    assert "14000101" in plan.schedule_event_ids
+
+
+@pytest.mark.unit
+def test_unfinished_cup_bracket_plan_completes_without_placeholder_squads(
+    tmp_path,
+):
+    raw_store = _raw_store(tmp_path)
+    manifest = InMemoryManifestStore()
+    evidence = _payload(PLAYER_EVIDENCE_CASES)
+    _seed_complete_partition_roots(
+        raw_store,
+        schedule_next_payload=_payload(CUP_BRACKET_NEXT_PAGE),
+    )
+    initial = plan_season_partition(raw_store, manifest, **_common())
+    for spec in initial.specs:
+        if spec.key.endpoint == "squads":
+            _seed_json(raw_store, spec, evidence["nonempty_squad"])
+        elif spec.key.endpoint == "referee_profile":
+            _seed_raw(raw_store, spec, FIXTURE_PATHS["referee_profile"].read_bytes())
+    engine, transport = _engine(
+        tmp_path,
+        raw_store=raw_store,
+        manifest_store=manifest,
+    )
+    replay_season_specs(engine, initial.specs)
+
+    committed = plan_season_partition(raw_store, manifest, **_common())
+
+    assert committed.complete is True
+    assert committed.team_ids == ("17", "33", "42", "44")
+    assert committed.placeholder_team_ids == ("999901", "999902")
+    assert squad_player_ids(raw_store, committed) == ("1001", "1002")
+
+    materialized = replay_season_partition(
+        engine,
+        committed,
+        canonical_league="ENG-Premier League",
+        canonical_season="2025/26",
+    )
+    assert transport.calls == 0
+    # Two played rows from schedule_last plus the retained placeholder final.
+    assert len(materialized.schedule_rows) == 3
+    assert {row["game_id"] for row in materialized.schedule_rows} == {
+        14000001,
+        14000002,
+        14000101,
+    }
+
+
+@pytest.mark.unit
+def test_missing_real_participant_still_blocks_plan_with_placeholders_filtered(
+    tmp_path,
+):
+    raw_store = _raw_store(tmp_path)
+    manifest = InMemoryManifestStore()
+    evidence = _payload(PLAYER_EVIDENCE_CASES)
+    _seed_json(
+        raw_store,
+        build_schedule_page_spec(direction="last", page=0, **_common()),
+        _schedule_payload([14000001], has_next=False),
+    )
+    _seed_json(
+        raw_store,
+        build_schedule_page_spec(direction="next", page=0, **_common()),
+        _payload(CUP_BRACKET_NEXT_PAGE),
+    )
+    participants = build_participants_spec(**_common())
+    _seed_json(raw_store, participants, evidence["partial_participants"])
+
+    plan = plan_season_partition(raw_store, manifest, **_common())
+
+    assert plan.player_universe_evidence_gaps == (
+        "participants omitted scheduled team ids: 44",
+    )
+    assert participants.key in plan.pending_keys
+    assert plan.complete is False
+    assert plan.team_ids == ("42", "44")
+
+
+@pytest.mark.unit
+def test_mixed_event_keeps_real_disabled_false_team_and_drops_placeholder(
+    tmp_path,
+):
+    raw_store = _raw_store(tmp_path)
+    manifest = InMemoryManifestStore()
+    mixed_event = {
+        "id": 14000201,
+        "season": {"id": SEASON_ID, "name": "Premier League 25/26", "year": "25/26"},
+        "status": {"type": "notstarted"},
+        "startTimestamp": 1782000000,
+        "homeTeam": {"id": 42, "name": "Arsenal", "gender": "M", "disabled": False},
+        "awayTeam": _placeholder_team(999901),
+        "referee": {"id": 900, "name": "Referee 900"},
+        "roundInfo": {"round": 30},
+    }
+    _seed_json(
+        raw_store,
+        build_schedule_page_spec(direction="last", page=0, **_common()),
+        {"events": [mixed_event], "hasNextPage": False},
+    )
+    _seed_json(
+        raw_store,
+        build_schedule_page_spec(direction="next", page=0, **_common()),
+        _schedule_payload([], has_next=False),
+    )
+    _seed_json(
+        raw_store,
+        build_participants_spec(**_common()),
+        {"teams": [{"id": 42, "name": "Arsenal", "gender": "M"}]},
+    )
+
+    plan = plan_season_partition(raw_store, manifest, **_common())
+
+    assert plan.team_ids == ("42",)
+    assert plan.placeholder_team_ids == ("999901",)
+    assert plan.player_universe_evidence_gaps == ()
+    # The placeholder-side skip must stay per-side: the event's embedded
+    # referee is still planned even when one bracket slot is unresolved.
+    assert plan.referee_ids == ("900",)
 
 
 @pytest.mark.unit

@@ -34,6 +34,13 @@ _RESERVE_RE = re.compile(
 )
 _FUTSAL_RE = re.compile(r"(?:^|\W)futsal(?:\W|$)", re.IGNORECASE)
 
+# A prepared review row ships one placeholder evidence item flagged with this
+# key.  It is never meaningful evidence: an operator must replace it with a real
+# out-of-source reference before approval.  Filling in only ``reviewed_by`` must
+# not activate a competition, so an approval that still carries the flag is
+# rejected.
+REVIEW_EVIDENCE_TODO_KEY = "todo"
+
 _MALE = frozenset({"m", "male", "men", "man"})
 _FEMALE = frozenset({"f", "female", "women", "woman"})
 _MIXED = frozenset({"mixed", "mix", "coed", "co-ed", "x"})
@@ -212,11 +219,20 @@ def pending_review() -> dict[str, Any]:
     }
 
 
+def _is_todo_evidence(item: Any) -> bool:
+    """True for an unreplaced ``prepare-review`` placeholder evidence item."""
+
+    return isinstance(item, Mapping) and bool(item.get(REVIEW_EVIDENCE_TODO_KEY))
+
+
 def _meaningful_review_evidence(value: Any) -> bool:
     if not isinstance(value, list) or not value:
         return False
     for item in value:
         if not isinstance(item, Mapping):
+            continue
+        if _is_todo_evidence(item):
+            # An unreplaced prepare-review TODO stub is never evidence.
             continue
         if any(
             isinstance(item.get(field), str) and item[field].strip()
@@ -309,6 +325,11 @@ def approve_tournament(
         raise ActivationError("canonical_id is required")
     if not str(reviewed_by).strip() or not str(reviewed_at).strip():
         raise ActivationError("reviewed_by and reviewed_at are required")
+    if any(_is_todo_evidence(item) for item in evidence):
+        raise ActivationError(
+            "evidence TODO must be replaced with an out-of-source reference "
+            "before approval"
+        )
     if not _meaningful_review_evidence(list(evidence)):
         raise ActivationError("at least one review evidence item is required")
     updated = deepcopy(dict(tournament))
@@ -383,6 +404,7 @@ def reject_tournament(
 __all__ = [
     "ActivationEligibility",
     "ActivationError",
+    "REVIEW_EVIDENCE_TODO_KEY",
     "SCHEMA_VERSION",
     "SUPPORTED_SCHEMA_VERSIONS",
     "activation_eligibility",

@@ -1,20 +1,22 @@
 from __future__ import annotations
 
-import hashlib
-
 import pytest
 
 from scrapers.sofascore.workload_plan import (
-    MATCH_WORKLOAD_CLASS,
-    PLAYER_WORKLOAD_CLASS,
+    MATCH_BATCH_SIZE,
+    PLAYER_BATCH_SIZE,
     SeasonWorkload,
     WorkloadBudgetPolicy,
     WorkloadClassBudget,
     WorkloadPlanError,
-    production_season_shape,
+    WorkloadPolicyUnavailable,
     match_workload_class,
     player_workload_class,
+    production_match_shape,
+    production_player_shape,
+    production_season_shape,
     season_workload_class,
+    workload_shape_digest,
 )
 from scrapers.sofascore.workload_runtime import (
     PartitionWorkload,
@@ -29,59 +31,48 @@ from scrapers.sofascore.workload_runtime import (
 
 
 TOKEN = "runtime-test-control-token-with-at-least-32-bytes"
+EPL_SEASON_SHAPE = production_season_shape(
+    season_format="split_year",
+    team_count_band="16_20",
+    max_pages_per_direction=50,
+)
+WORLD_CUP_SEASON_SHAPE = production_season_shape(
+    season_format="calendar_year",
+    team_count_band="33_48",
+    max_pages_per_direction=50,
+)
 
 
-def _policy() -> WorkloadBudgetPolicy:
-    epl_shape = production_season_shape(
-        17, season_format="split_year", max_pages_per_direction=50
-    )
-    wc_shape = production_season_shape(
-        16, season_format="calendar_year", max_pages_per_direction=50
-    )
+def _policy(*, season_measured: tuple[str, ...] = ("16", "17")) -> WorkloadBudgetPolicy:
     classes = {
-        MATCH_WORKLOAD_CLASS: WorkloadClassBudget(
-            MATCH_WORKLOAD_CLASS,
+        match_workload_class(): WorkloadClassBudget(
+            match_workload_class(),
             "match",
-            25,
+            MATCH_BATCH_SIZE,
             1_000,
             ("event",),
             20,
             5,
-            source_tournament_id="17",
+            workload_shape_digest(production_match_shape()),
+            ("16", "17"),
         ),
-        PLAYER_WORKLOAD_CLASS: WorkloadClassBudget(
-            PLAYER_WORKLOAD_CLASS,
+        player_workload_class(): WorkloadClassBudget(
+            player_workload_class(),
             "player",
-            50,
+            PLAYER_BATCH_SIZE,
             2_000,
             ("player_profile",),
             20,
             5,
-            source_tournament_id="17",
-        ),
-        match_workload_class(16): WorkloadClassBudget(
-            match_workload_class(16),
-            "match",
-            25,
-            4_000,
-            ("event",),
-            20,
-            5,
-            source_tournament_id="16",
-        ),
-        player_workload_class(16): WorkloadClassBudget(
-            player_workload_class(16),
-            "player",
-            50,
-            5_000,
-            ("player_profile",),
-            20,
-            5,
-            source_tournament_id="16",
+            workload_shape_digest(production_player_shape()),
+            ("16", "17"),
         ),
     }
-    for tournament_id, shape in ((17, epl_shape), (16, wc_shape)):
-        name = season_workload_class(tournament_id, shape)
+    for shape, measured in (
+        (EPL_SEASON_SHAPE, season_measured),
+        (WORLD_CUP_SEASON_SHAPE, ("16",)),
+    ):
+        name = season_workload_class(shape)
         classes[name] = WorkloadClassBudget(
             name,
             "season",
@@ -90,28 +81,13 @@ def _policy() -> WorkloadBudgetPolicy:
             ("schedule_last",),
             20,
             5,
-            hashlib.sha256(
-                __import__("json")
-                .dumps(
-                    shape,
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                    sort_keys=True,
-                )
-                .encode()
-            ).hexdigest(),
-            str(tournament_id),
+            workload_shape_digest(shape),
+            measured,
         )
     return WorkloadBudgetPolicy("a" * 64, classes)
 
 
 def _partitions():
-    epl_shape = production_season_shape(
-        17, season_format="split_year", max_pages_per_direction=50
-    )
-    wc_shape = production_season_shape(
-        16, season_format="calendar_year", max_pages_per_direction=50
-    )
     return (
         PartitionWorkload(
             "ENG-Premier League",
@@ -120,7 +96,7 @@ def _partitions():
             pending_match_ids=tuple(str(value) for value in range(1, 28)),
             player_universe_ids=tuple(str(value) for value in range(1, 54)),
             pending_player_ids=tuple(str(value) for value in range(1, 54)),
-            season_workload=SeasonWorkload(17, 76986, epl_shape),
+            season_workload=SeasonWorkload(17, 76986, EPL_SEASON_SHAPE),
         ),
         PartitionWorkload(
             "INT-World Cup",
@@ -129,7 +105,7 @@ def _partitions():
             pending_match_ids=("100", "101"),
             player_universe_ids=("7", "8"),
             pending_player_ids=("7", "8"),
-            season_workload=SeasonWorkload(16, 58210, wc_shape),
+            season_workload=SeasonWorkload(16, 58210, WORLD_CUP_SEASON_SHAPE),
         ),
     )
 
@@ -159,13 +135,50 @@ def test_partitioned_plan_never_mixes_competitions_and_keeps_full_universe():
     assert [target_ids(item) for item in wc_matches] == [("100", "101")]
     assert set(target_ids(epl_matches[0])).isdisjoint(target_ids(wc_matches[0]))
     assert len(plan.player_universe_ids) == 55
-    assert plan.run_cap_bytes == 2 * 1_000 + 2 * 2_000 + 4_000 + 5_000 + 2 * 3_000
-    assert {item.workload_class for item in epl_matches} == {
-        match_workload_class(17)
+    assert plan.run_cap_bytes == 3 * 1_000 + 3 * 2_000 + 2 * 3_000
+    # Match/player bytes are shape-driven, so both competitions share one class.
+    assert {item.workload_class for item in epl_matches + wc_matches} == {
+        match_workload_class()
     }
-    assert {item.workload_class for item in wc_matches} == {
-        match_workload_class(16)
+    assert {
+        item.workload_class for item in plan.allocations if item.scope == "player"
+    } == {player_workload_class()}
+    seasons = {
+        item.workload_class for item in plan.allocations if item.scope == "season"
     }
+    assert seasons == {
+        season_workload_class(EPL_SEASON_SHAPE),
+        season_workload_class(WORLD_CUP_SEASON_SHAPE),
+    }
+
+
+def test_season_class_measured_on_one_tournament_blocks_a_new_league():
+    la_liga = PartitionWorkload(
+        "ESP-La Liga",
+        "2526",
+        8,
+        season_workload=SeasonWorkload(8, 61643, EPL_SEASON_SHAPE),
+    )
+
+    plan = build_partitioned_plan(
+        _policy(),
+        dag_id="dag_ingest_sofascore",
+        run_id="run-1",
+        partitions=(la_liga,),
+        control_token=TOKEN,
+    )
+    assert [item.workload_class for item in plan.allocations] == [
+        season_workload_class(EPL_SEASON_SHAPE)
+    ]
+
+    with pytest.raises(WorkloadPolicyUnavailable, match="measured only for tournament"):
+        build_partitioned_plan(
+            _policy(season_measured=("17",)),
+            dag_id="dag_ingest_sofascore",
+            run_id="run-1",
+            partitions=(la_liga,),
+            control_token=TOKEN,
+        )
 
 
 def test_immutable_plan_file_is_retry_safe_and_tamper_safe(tmp_path):

@@ -13,10 +13,13 @@ from dags.scripts.run_sofascore_scraper import (
     _planned_freshness_key,
 )
 from scrapers.sofascore.workload_plan import (
-    MATCH_WORKLOAD_CLASS,
-    PLAYER_WORKLOAD_CLASS,
     WorkloadBudgetPolicy,
     WorkloadClassBudget,
+    match_workload_class,
+    player_workload_class,
+    production_match_shape,
+    production_player_shape,
+    workload_shape_digest,
 )
 from scrapers.sofascore.workload_runtime import (
     PartitionWorkload,
@@ -27,32 +30,47 @@ from scrapers.sofascore.workload_runtime import (
 
 
 TOKEN = "runner-workload-control-token-at-least-32-bytes"
+MATCH_WORKLOAD_CLASS = match_workload_class()
+PLAYER_WORKLOAD_CLASS = player_workload_class()
+MATCH_SHAPE_DIGEST = workload_shape_digest(production_match_shape())
+PLAYER_SHAPE_DIGEST = workload_shape_digest(production_player_shape())
+MEASURED_TOURNAMENTS = ("16", "17")
+
+
+def _match_budget() -> WorkloadClassBudget:
+    return WorkloadClassBudget(
+        MATCH_WORKLOAD_CLASS,
+        "match",
+        25,
+        100,
+        ("event",),
+        20,
+        5,
+        MATCH_SHAPE_DIGEST,
+        MEASURED_TOURNAMENTS,
+    )
+
+
+def _player_budget() -> WorkloadClassBudget:
+    return WorkloadClassBudget(
+        PLAYER_WORKLOAD_CLASS,
+        "player",
+        50,
+        200,
+        ("player_profile",),
+        20,
+        5,
+        PLAYER_SHAPE_DIGEST,
+        MEASURED_TOURNAMENTS,
+    )
 
 
 def _target_plan(tmp_path):
     policy = WorkloadBudgetPolicy(
         "c" * 64,
         {
-            MATCH_WORKLOAD_CLASS: WorkloadClassBudget(
-                MATCH_WORKLOAD_CLASS,
-                "match",
-                25,
-                100,
-                ("event",),
-                20,
-                5,
-                source_tournament_id="17",
-            ),
-            PLAYER_WORKLOAD_CLASS: WorkloadClassBudget(
-                PLAYER_WORKLOAD_CLASS,
-                "player",
-                50,
-                200,
-                ("player_profile",),
-                20,
-                5,
-                source_tournament_id="17",
-            ),
+            MATCH_WORKLOAD_CLASS: _match_budget(),
+            PLAYER_WORKLOAD_CLASS: _player_budget(),
         },
     )
     plan = build_partitioned_plan(
@@ -76,26 +94,8 @@ def _player_plan(tmp_path):
     policy = WorkloadBudgetPolicy(
         "c" * 64,
         {
-            MATCH_WORKLOAD_CLASS: WorkloadClassBudget(
-                MATCH_WORKLOAD_CLASS,
-                "match",
-                25,
-                100,
-                ("event",),
-                20,
-                5,
-                source_tournament_id="17",
-            ),
-            PLAYER_WORKLOAD_CLASS: WorkloadClassBudget(
-                PLAYER_WORKLOAD_CLASS,
-                "player",
-                50,
-                200,
-                ("player_profile",),
-                20,
-                5,
-                source_tournament_id="17",
-            ),
+            MATCH_WORKLOAD_CLASS: _match_budget(),
+            PLAYER_WORKLOAD_CLASS: _player_budget(),
         },
     )
     plan = build_partitioned_plan(
@@ -180,18 +180,7 @@ def test_runner_ignores_environment_fallback_when_freshness_is_signed(
     plan = build_partitioned_plan(
         WorkloadBudgetPolicy(
             "c" * 64,
-            {
-                MATCH_WORKLOAD_CLASS: WorkloadClassBudget(
-                    MATCH_WORKLOAD_CLASS,
-                    "match",
-                    25,
-                    100,
-                    ("event",),
-                    20,
-                    5,
-                    source_tournament_id="17",
-                ),
-            },
+            {MATCH_WORKLOAD_CLASS: _match_budget()},
         ),
         dag_id="dag_ingest_sofascore",
         run_id="scheduled-1::targets",

@@ -1,0 +1,16 @@
+{
+  "events": [
+    {
+      "id": 14000101,
+      "season": {"id": 76986, "name": "Premier League 25/26", "year": "25/26"},
+      "status": {"type": "notstarted"},
+      "startTimestamp": 1782000000,
+      "homeTeam": {"id": 999901, "name": "Winner of match 5", "slug": "winner-of-match-5",
+                   "gender": "M", "userCount": 0, "type": 0, "country": {}, "disabled": true},
+      "awayTeam": {"id": 999902, "name": "Winner of match 6", "slug": "winner-of-match-6",
+                   "gender": "M", "userCount": 0, "type": 0, "country": {}, "disabled": true},
+      "roundInfo": {"round": 29, "name": "Final"}
+    }
+  ],
+  "hasNextPage": false
+}

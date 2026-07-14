@@ -212,6 +212,10 @@ tables:
       - _ingested_at
     allowed_values:
       team_side: [home, away]
+      # Pre-write "adult men" tripwire: only the source's own male marker may
+      # reach Bronze.  NULL stays allowed (absence of evidence, not a
+      # contradiction); the committed-state twin is adult_men_gender_tripwire.
+      gender: ["M"]
     partition_columns: [league, season]
     materialized_by: dags/scripts/run_sofascore_scraper.py#_run_match_capture
     production_write_status: replay/no-op wired; paid live capture fails closed pending verified budget

@@ -20,18 +20,24 @@ import base64
 import hashlib
 import json
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from scrapers.sofascore.workload_plan import (
-    MATCH_WORKLOAD_CLASS,
-    PLAYER_WORKLOAD_CLASS,
     WorkloadAllocation,
     _signed_plan,
+    match_workload_class,
+    player_workload_class,
 )
+
+# The class names are now derived from the measured production workload shape
+# rather than hard-coded, but every assertion below still means "the class this
+# deployment actually signs".
+MATCH_WORKLOAD_CLASS = match_workload_class()
+PLAYER_WORKLOAD_CLASS = player_workload_class()
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 _SCRIPT_PATH = REPO_ROOT / "scripts" / "proxy_filter" / "filter_proxy.py"
@@ -2108,3 +2114,551 @@ def test_shipped_blocklist_blocks_adtech_but_not_cf_or_sites(mod):
         "cdn.intergient.com",
     ):
         assert mod._is_blocked(drop) is True, f"{drop} must be blocked"
+
+
+# --- dead residential exit failover (#946) -----------------------------------
+#
+# A dead exit accepts the TCP CONNECT and then goes silent.  Before #946 the
+# lease's only tunnel hung forever inside ``_read_metered_provider_head`` (no
+# timeout), never draining ``active_tunnels``; the single SofaScore slot latched
+# and every follow-up 429'd.  These tests drive the whole ``handle`` CONNECT path
+# through a silent upstream and assert bounded failover with exact metering.
+
+
+class _FakeUpstreamReader:
+    """Minimal StreamReader: serves ``read(n)`` from a buffer, optionally
+    blocking forever once the buffer drains (a dead but connected exit)."""
+
+    def __init__(self, data=b"", *, block_when_empty=False):
+        self.buf = bytearray(data)
+        self.block_when_empty = block_when_empty
+
+    async def read(self, size):
+        if not self.buf:
+            if self.block_when_empty:
+                await asyncio.Event().wait()
+            return b""
+        chunk = bytes(self.buf[:size])
+        del self.buf[:size]
+        return chunk
+
+
+class _FakeUpstreamWriter:
+    def __init__(self):
+        self.data = bytearray()
+        self.closed = False
+
+    def write(self, chunk):
+        self.data.extend(chunk)
+
+    async def drain(self):
+        return None
+
+    def close(self):
+        self.closed = True
+
+
+class _ClientConnectReader:
+    """Client leg of one CONNECT: hands back the request head, then EOF for the
+    (empty) client->upstream tunnel payload."""
+
+    def __init__(self, header_lines):
+        self.lines = deque(header_lines)
+
+    async def readline(self):
+        return self.lines.popleft() if self.lines else b""
+
+    async def read(self, size):
+        return b""
+
+
+class _ClientWriter:
+    def __init__(self):
+        self.payload = bytearray()
+        self.closed = False
+
+    def write(self, chunk):
+        self.payload.extend(chunk)
+
+    async def drain(self):
+        return None
+
+    def close(self):
+        self.closed = True
+
+
+def _make_sofascore_lease(mod, mgr, *, budget=4096, endpoint="event"):
+    mod.LEASES.clear()
+    mod.LEASE_TOKENS.clear()
+    mod.up_bytes = defaultdict(int)
+    mod.down_bytes = defaultdict(int)
+    mod._daily_day = ""
+    mod._daily_up_bytes = mod._daily_down_bytes = 0
+    mod.SOFASCORE_DAGRUN_BUDGET_BYTES = budget
+    lease = mod._create_lease(
+        mgr,
+        max_bytes=budget,
+        ttl_seconds=30,
+        metadata=_sofascore_context(budget=budget),
+        require_context=True,
+    )
+    mod._begin_endpoint_request(lease, endpoint)
+    return lease
+
+
+def _connect_header_lines(lease):
+    encoded = base64.b64encode(f"lease:{lease.token}".encode()).decode()
+    return [
+        b"CONNECT www.sofascore.com:443 HTTP/1.1\r\n",
+        b"Host: www.sofascore.com:443\r\n",
+        f"Proxy-Authorization: Basic {encoded}\r\n".encode(),
+        b"\r\n",
+    ]
+
+
+def _expected_connect_head():
+    auth = base64.b64encode(b"u:p").decode()
+    return (
+        b"CONNECT www.sofascore.com:443 HTTP/1.1\r\n"
+        b"Host: www.sofascore.com:443\r\n"
+        + f"Proxy-Authorization: Basic {auth}\r\n\r\n".encode()
+    )
+
+
+def _shrink_failover_timeouts(mod, monkeypatch):
+    monkeypatch.setattr(
+        mod, "LEASE_PROVIDER_HEAD_TIMEOUT_SECONDS", 0.02, raising=False
+    )
+    monkeypatch.setattr(
+        mod, "LEASE_UPSTREAM_CONNECT_TIMEOUT_SECONDS", 0.02, raising=False
+    )
+
+
+def _patch_upstream_opener(mod, monkeypatch, fake_open):
+    # ``_open_upstream_connection`` is the #946 test seam; also patch the raw
+    # asyncio symbol so the pre-#946 code (which lacks the seam) still exercises
+    # the hang and fails by TimeoutError rather than skipping the dial.
+    monkeypatch.setattr(mod, "_open_upstream_connection", fake_open, raising=False)
+    monkeypatch.setattr(mod.asyncio, "open_connection", fake_open)
+
+
+def test_lease_connect_failover_repins_silent_upstream_and_tunnels(mod, monkeypatch):
+    mgr = _FakeManager(
+        ["http://u:p@pool.invalid:10000", "http://u:p@pool.invalid:10001"]
+    )
+    lease = _make_sofascore_lease(mod, mgr)
+    expires_before = lease.expires_at
+    _shrink_failover_timeouts(mod, monkeypatch)
+
+    dead_writer = _FakeUpstreamWriter()
+    live_writer = _FakeUpstreamWriter()
+    live_head = b"HTTP/1.1 200 Connection established\r\n\r\n"
+    tunnel = b"hello-tunnel"
+    opens = []
+
+    async def fake_open(host, port):
+        opens.append((host, port))
+        if len(opens) == 1:
+            return _FakeUpstreamReader(b"", block_when_empty=True), dead_writer
+        return _FakeUpstreamReader(live_head + tunnel), live_writer
+
+    _patch_upstream_opener(mod, monkeypatch, fake_open)
+
+    client_writer = _ClientWriter()
+    asyncio.run(
+        asyncio.wait_for(
+            mod.handle(
+                _ClientConnectReader(_connect_header_lines(lease)),
+                client_writer,
+                mgr,
+                require_lease=True,
+            ),
+            2.0,
+        )
+    )
+
+    head = _expected_connect_head()
+    assert b"200 Connection established" in bytes(client_writer.payload)
+    assert bytes(client_writer.payload).endswith(tunnel)
+    assert lease.upstream == ("pool.invalid", 10001, "u", "p")
+    assert lease.upstream_repins == 1
+    assert dead_writer.data == head
+    assert live_writer.data == head
+    assert dead_writer.closed is True
+    # up == both CONNECT heads (one billed to the dead exit, one to the live
+    # exit); down == the live exit's response head + tunnel payload only.
+    assert lease.up_bytes == 2 * len(head)
+    assert lease.down_bytes == len(live_head) + len(tunnel)
+    assert lease.expires_at == expires_before
+    assert lease.report()["upstream_repins"] == 1
+    assert lease.active_tunnels == 0
+    # M1: no failed attempt may leave its writer behind in tunnel_writers.
+    assert lease.tunnel_writers == set()
+
+
+def test_lease_connect_failover_is_refused_after_first_provider_payload_byte(
+    mod, monkeypatch
+):
+    mgr = _FakeManager(
+        ["http://u:p@pool.invalid:10000", "http://u:p@pool.invalid:10001"]
+    )
+    lease = _make_sofascore_lease(mod, mgr)
+    # A single down byte already arrived on the pinned exit: the exit is proven,
+    # so a later silent read must fail closed (502) rather than silently re-pin.
+    mod._account_lease_bytes(lease, "www.sofascore.com", "down", 1)
+    _shrink_failover_timeouts(mod, monkeypatch)
+
+    async def fake_open(host, port):
+        return _FakeUpstreamReader(b"", block_when_empty=True), _FakeUpstreamWriter()
+
+    _patch_upstream_opener(mod, monkeypatch, fake_open)
+
+    client_writer = _ClientWriter()
+    asyncio.run(
+        asyncio.wait_for(
+            mod.handle(
+                _ClientConnectReader(_connect_header_lines(lease)),
+                client_writer,
+                mgr,
+                require_lease=True,
+            ),
+            2.0,
+        )
+    )
+
+    assert b"502 Bad Gateway" in bytes(client_writer.payload)
+    assert lease.upstream_repins == 0
+    assert lease.upstream == ("pool.invalid", 10000, "u", "p")
+    assert lease.usable is True
+    assert lease.active_tunnels == 0
+    assert lease.tunnel_writers == set()
+    assert mgr.calls == 1
+
+
+def test_failover_redraws_past_the_exit_that_just_failed(mod, monkeypatch):
+    # The pool draw is random, so a re-pin can hand back the exact exit that
+    # just went silent.  The failover must re-draw (bounded) until the
+    # replacement differs from the failed one.
+    mgr = _FakeManager(
+        [
+            "http://u:p@pool.invalid:10000",  # initial pin (dies)
+            "http://u:p@pool.invalid:10000",  # first re-draw: same dead exit
+            "http://u:p@pool.invalid:10001",  # second re-draw: fresh exit
+        ]
+    )
+    lease = _make_sofascore_lease(mod, mgr)
+    _shrink_failover_timeouts(mod, monkeypatch)
+
+    live_head = b"HTTP/1.1 200 Connection established\r\n\r\n"
+    opens = []
+
+    async def fake_open(host, port):
+        opens.append((host, port))
+        if len(opens) == 1:
+            return _FakeUpstreamReader(b"", block_when_empty=True), _FakeUpstreamWriter()
+        return _FakeUpstreamReader(live_head), _FakeUpstreamWriter()
+
+    _patch_upstream_opener(mod, monkeypatch, fake_open)
+
+    client_writer = _ClientWriter()
+    asyncio.run(
+        asyncio.wait_for(
+            mod.handle(
+                _ClientConnectReader(_connect_header_lines(lease)),
+                client_writer,
+                mgr,
+                require_lease=True,
+            ),
+            2.0,
+        )
+    )
+
+    assert b"200 Connection established" in bytes(client_writer.payload)
+    assert lease.upstream == ("pool.invalid", 10001, "u", "p")
+    assert lease.upstream_repins == 1  # one failover, even with the extra draw
+    assert mgr.calls == 3
+    assert opens[-1] == ("pool.invalid", 10001)
+
+
+def test_provider_head_timeout_accounts_partial_bytes_exactly(mod, monkeypatch):
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+    lease = _make_sofascore_lease(mod, mgr)
+
+    class Reader:
+        def __init__(self):
+            self.remaining = bytearray(b"HELLO")
+
+        async def read(self, size):
+            if self.remaining:
+                chunk = bytes(self.remaining[:1])
+                del self.remaining[:1]
+                return chunk
+            await asyncio.Event().wait()
+
+    with pytest.raises(mod.UpstreamHeadTimeout):
+        asyncio.run(
+            asyncio.wait_for(
+                mod._read_metered_provider_head(
+                    Reader(),
+                    lease,
+                    "www.sofascore.com",
+                    timeout_seconds=0.02,
+                ),
+                2.0,
+            )
+        )
+
+    assert lease.down_bytes == 5
+    assert lease.reserved_bytes == 0
+
+
+def test_upstream_eof_before_any_head_byte_triggers_failover(mod, monkeypatch):
+    mgr = _FakeManager(
+        ["http://u:p@pool.invalid:10000", "http://u:p@pool.invalid:10001"]
+    )
+    lease = _make_sofascore_lease(mod, mgr)
+    _shrink_failover_timeouts(mod, monkeypatch)
+
+    live_head = b"HTTP/1.1 200 Connection established\r\n\r\n"
+    opens = []
+
+    async def fake_open(host, port):
+        opens.append((host, port))
+        if len(opens) == 1:
+            # Immediate EOF before any head byte: a closed/reset exit.
+            return _FakeUpstreamReader(b""), _FakeUpstreamWriter()
+        return _FakeUpstreamReader(live_head), _FakeUpstreamWriter()
+
+    _patch_upstream_opener(mod, monkeypatch, fake_open)
+
+    client_writer = _ClientWriter()
+    asyncio.run(
+        asyncio.wait_for(
+            mod.handle(
+                _ClientConnectReader(_connect_header_lines(lease)),
+                client_writer,
+                mgr,
+                require_lease=True,
+            ),
+            2.0,
+        )
+    )
+
+    assert b"200 Connection established" in bytes(client_writer.payload)
+    assert lease.upstream_repins == 1
+    assert lease.upstream == ("pool.invalid", 10001, "u", "p")
+
+
+def test_lease_failover_does_not_mint_second_lease_or_bypass_serial_limit(
+    mod, monkeypatch
+):
+    mgr = _FakeManager(
+        ["http://u:p@pool.invalid:10000", "http://u:p@pool.invalid:10001"]
+    )
+    lease = _make_sofascore_lease(mod, mgr)
+    _shrink_failover_timeouts(mod, monkeypatch)
+
+    live_head = b"HTTP/1.1 200 Connection established\r\n\r\n"
+    opens = []
+    observed = {}
+
+    async def fake_open(host, port):
+        opens.append((host, port))
+        if len(opens) == 1:
+            observed["leases_during"] = len(mod.LEASES)
+            try:
+                mod._create_lease(
+                    mgr,
+                    max_bytes=4096,
+                    ttl_seconds=30,
+                    metadata=_sofascore_context(run_id="concurrent__x::season"),
+                    require_context=True,
+                )
+                observed["second"] = "MINTED"
+            except RuntimeError as exc:
+                observed["second"] = str(exc)
+            return _FakeUpstreamReader(b"", block_when_empty=True), _FakeUpstreamWriter()
+        return _FakeUpstreamReader(live_head), _FakeUpstreamWriter()
+
+    _patch_upstream_opener(mod, monkeypatch, fake_open)
+
+    client_writer = _ClientWriter()
+    asyncio.run(
+        asyncio.wait_for(
+            mod.handle(
+                _ClientConnectReader(_connect_header_lines(lease)),
+                client_writer,
+                mgr,
+                require_lease=True,
+            ),
+            2.0,
+        )
+    )
+
+    assert observed["leases_during"] == 1
+    assert "concurrency" in observed["second"]
+    assert len(mod.LEASES) == 1
+    assert lease.upstream_repins == 1
+
+
+# --- metered SofaScore registry discovery (#946) ------------------------------
+
+
+def _discovery_context(run_id="discovery__20260714T000000Z"):
+    return {
+        "dag_id": "dag_discover_sofascore_registry",
+        "run_id": run_id,
+        "task_id": "discover_sofascore_registry",
+        "canonical_url": "https://api.sofascore.com/",
+        "source": "sofascore_discovery",
+        "scope": "discovery",
+    }
+
+
+def test_discovery_lease_is_refused_until_a_cap_is_authorized(mod):
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+
+    assert mod.SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES == 0
+    assert mod._source_for_dag("dag_discover_sofascore_registry") == (
+        "sofascore_discovery"
+    )
+    with pytest.raises(RuntimeError, match="discovery lease unavailable"):
+        mod._create_lease(
+            mgr,
+            max_bytes=1_000_000,
+            ttl_seconds=3600,
+            metadata=_discovery_context(),
+            require_context=True,
+        )
+
+
+def test_authorized_discovery_lease_is_capped_by_its_dagrun_budget(mod):
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+    mod.SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES = 12 * 1024 * 1024
+
+    lease = mod._create_lease(
+        mgr,
+        max_bytes=8 * 1024 * 1024,
+        ttl_seconds=3600,
+        metadata=_discovery_context(),
+        require_context=True,
+    )
+
+    assert lease.source == "sofascore_discovery"
+    assert lease.max_bytes == 8 * 1024 * 1024
+    report = lease.report()
+    assert report["dagrun_budget_bytes"] == 12 * 1024 * 1024
+    # Discovery carries no signed plan, no allocation and no canary artifact.
+    assert report["plan_digest"] == ""
+    assert report["allocation_id"] == ""
+    assert report["budget_artifact_id"] == ""
+    # WhoScored and the other legacy sources keep the shared per-DagRun cap.
+    assert mod._dagrun_budget_bytes("dag_ingest_whoscored") == 8_000_000
+
+
+def test_discovery_lease_is_not_truncated_by_the_2mb_per_url_ceiling(mod):
+    # Every discovery request hits one canonical API origin, so the legacy
+    # per-URL ceiling would strangle a scan into 2 MB no matter its DagRun cap.
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+    mod.URL_BUDGET_BYTES = 2_000_000
+    mod.SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES = 16 * 1024 * 1024
+
+    lease = mod._create_lease(
+        mgr,
+        max_bytes=8 * 1024 * 1024,
+        ttl_seconds=3600,
+        metadata=_discovery_context(),
+        require_context=True,
+    )
+
+    assert lease.max_bytes == 8 * 1024 * 1024 > 2_000_000
+    assert mod._lease_url_budget_bytes(lease) == 16 * 1024 * 1024
+    assert lease.report()["url_budget_bytes"] == 16 * 1024 * 1024
+    # And the whole-scan ceiling still applies across consecutive leases.
+    mod._account_lease_bytes(lease, "api.sofascore.com", "down", 8 * 1024 * 1024)
+    lease.closed = True
+    second = mod._create_lease(
+        mgr,
+        max_bytes=8 * 1024 * 1024,
+        ttl_seconds=3600,
+        metadata=_discovery_context(),
+        require_context=True,
+    )
+    assert second.max_bytes == 8 * 1024 * 1024
+    mod._account_lease_bytes(second, "api.sofascore.com", "down", 8 * 1024 * 1024)
+    second.closed = True
+    with pytest.raises(RuntimeError, match="budget exhausted"):
+        mod._create_lease(
+            mgr,
+            max_bytes=1024,
+            ttl_seconds=3600,
+            metadata=_discovery_context(),
+            require_context=True,
+        )
+
+
+def test_discovery_scan_is_serial(mod):
+    mgr = _FakeManager(
+        ["http://u:p@pool.invalid:10000", "http://u:p@pool.invalid:10001"]
+    )
+    mod.MAX_ACTIVE_LEASES = 4
+    mod.SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES = 12 * 1024 * 1024
+
+    first = mod._create_lease(
+        mgr,
+        max_bytes=1_000_000,
+        ttl_seconds=3600,
+        metadata=_discovery_context(),
+        require_context=True,
+    )
+    with pytest.raises(RuntimeError, match="discovery paid-proxy concurrency"):
+        mod._create_lease(
+            mgr,
+            max_bytes=1_000_000,
+            ttl_seconds=3600,
+            metadata=_discovery_context(run_id="discovery__other"),
+            require_context=True,
+        )
+
+    first.closed = True
+    rotated = mod._create_lease(
+        mgr,
+        max_bytes=1_000_000,
+        ttl_seconds=3600,
+        metadata=_discovery_context(),
+        require_context=True,
+    )
+    # The next lease in the same scan is pinned to a fresh residential exit.
+    assert rotated.upstream[1] == 10001
+
+
+def test_discovery_source_cannot_be_claimed_by_another_dag(mod):
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+    mod.SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES = 12 * 1024 * 1024
+
+    with pytest.raises(ValueError, match="source does not match dag_id"):
+        mod._create_lease(
+            mgr,
+            max_bytes=1_000_000,
+            ttl_seconds=3600,
+            metadata={
+                **_discovery_context(),
+                "dag_id": "dag_ingest_sofascore",
+            },
+            require_context=True,
+        )
+
+
+def test_discovery_budget_is_reported_by_health_and_defaults_to_disabled():
+    compose = _COMPOSE_PATH.read_text()
+    service = compose.split("  proxy_filter:\n", 1)[1].split("\n  caddy:\n", 1)[0]
+    source = _SCRIPT_PATH.read_text()
+
+    assert "--sofascore-discovery-dagrun-budget-bytes" in service
+    assert (
+        "${PROXY_FILTER_SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES:-0}" in service
+    )
+    assert '"sofascore_discovery_enabled"' in source
+    assert '"sofascore_discovery_dagrun_budget_bytes"' in source
+    env_example = (REPO_ROOT / ".env.example").read_text()
+    assert "PROXY_FILTER_SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES=0" in env_example

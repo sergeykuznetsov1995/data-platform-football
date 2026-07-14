@@ -1067,6 +1067,8 @@ services:
       - /opt/airflow/configs/sofascore/proxy_budget_canary.json
       - --sofascore-canary-hard-cap-bytes
       - ${PROXY_FILTER_SOFASCORE_CANARY_HARD_CAP_BYTES:-0}
+      - --sofascore-discovery-dagrun-budget-bytes
+      - ${PROXY_FILTER_SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES:-0}
       - --ledger
       - /opt/airflow/logs/proxy_filter/paid_requests.jsonl
     volumes:

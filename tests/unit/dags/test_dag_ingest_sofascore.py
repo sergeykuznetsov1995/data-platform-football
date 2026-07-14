@@ -120,8 +120,11 @@ class TestSignedWorkloadTopology:
             task.task_id for task in dag_module.match_capture_tasks.values()
         }
         assert player_plan.upstream_task_ids == {"gate_player_capture"}
+        # #946 4d: the per-league rotation gate now sits between the signed plan
+        # and each capture.
         assert player_plan.downstream_task_ids == {
-            task.task_id for task in dag_module.player_capture_tasks.values()
+            dag_module._player_rotation_gate_task_id(league)
+            for league in dag_module.SOFASCORE_LEAGUES
         }
 
     def test_single_proxy_lease_is_serialized_without_manual_pool(self, dag_module):
@@ -607,6 +610,144 @@ class TestPlayerCaptureGate:
             )
             is True
         )
+
+
+class TestPlayerRotationGate:
+    """#946 4d: on the Saturday the weekly gate lets through, each club league
+    is captured once every ``SOFASCORE_PLAYER_ROTATION_MODULUS`` weeks."""
+
+    SATURDAY = datetime(2026, 1, 10)  # ISO week 2
+    CLUB_SCOPE = [
+        "ENG-Premier League",
+        "ESP-La Liga",
+        "ITA-Serie A",
+        "GER-Bundesliga",
+        "FRA-Ligue 1",
+        "NED-Eredivisie",
+        "POR-Primeira Liga",
+        "BEL-Pro League",
+        "TUR-Super Lig",
+        "SCO-Premiership",
+        "AUT-Bundesliga",
+        "SUI-Super League",
+    ]
+
+    @pytest.fixture
+    def rotation_env(self, monkeypatch):
+        monkeypatch.setenv("SOFASCORE_PLAYER_ROTATION_MODULUS", "4")
+        monkeypatch.setenv("SOFASCORE_PLAYER_ROTATION_MIN_LEAGUES", "10")
+
+    def _wide_scope(self, dag_module, monkeypatch):
+        """Simulate an onboarded 12-club scope without re-importing the DAG."""
+        leagues = self.CLUB_SCOPE + ["INT-World Cup"]
+        monkeypatch.setattr(dag_module, "SOFASCORE_LEAGUES", leagues)
+        monkeypatch.setattr(dag_module, "CLUB_LEAGUES", list(self.CLUB_SCOPE))
+        monkeypatch.setattr(dag_module, "TOURNAMENT_LEAGUES", ["INT-World Cup"])
+        return leagues
+
+    def test_gates_sit_between_the_signed_plan_and_each_capture(self, dag_module):
+        for league, capture in dag_module.player_capture_tasks.items():
+            gate = _python_task(dag_module._player_rotation_gate_task_id(league))
+            assert gate is not None
+            assert gate.python_callable is dag_module._gate_player_rotation
+            assert gate.op_kwargs == {"league": league}
+            assert gate.upstream_task_ids == {"prepare_sofascore_player_plan"}
+            assert capture.task_id in gate.downstream_task_ids
+
+    def test_skip_must_not_cascade_into_the_validators(self, dag_module):
+        from airflow.operators.python import ShortCircuitOperator
+
+        for league in dag_module.SOFASCORE_LEAGUES:
+            gate = _python_task(dag_module._player_rotation_gate_task_id(league))
+            assert isinstance(gate, ShortCircuitOperator)
+            # True (the Airflow default) would skip validate_player_data too.
+            assert gate._init_kwargs["ignore_downstream_trigger_rules"] is False
+
+    def test_todays_two_league_scope_keeps_its_weekly_cadence(
+        self, dag_module, rotation_env
+    ):
+        # Regression: below the threshold the rotation is a no-op — EPL and the
+        # World Cup still run on every Saturday.
+        for week in range(4):
+            boundary = datetime(2026, 1, 10 + 7 * week)
+            due = dag_module._due_player_leagues(
+                {
+                    "params": {},
+                    "dag_run": SimpleNamespace(external_trigger=False),
+                    "data_interval_end": boundary,
+                }
+            )
+            assert due == set(dag_module.SOFASCORE_LEAGUES)
+
+    def test_wide_scope_runs_one_cohort_per_week_and_covers_all_in_modulus(
+        self, dag_module, monkeypatch, rotation_env
+    ):
+        from dags.scripts.prepare_sofascore_workload import player_rotation_due
+
+        leagues = self._wide_scope(dag_module, monkeypatch)
+        seen = {league: 0 for league in leagues}
+        for week in range(4):
+            boundary = datetime(2026, 1, 10 + 7 * week)
+            context = {
+                "params": {},
+                "dag_run": SimpleNamespace(external_trigger=False),
+                "data_interval_end": boundary,
+            }
+            due = dag_module._due_player_leagues(context)
+            expected = {
+                league
+                for league in leagues
+                if player_rotation_due(
+                    league,
+                    rotation_date=boundary.date(),
+                    club_league_count=len(self.CLUB_SCOPE),
+                    is_tournament=league == "INT-World Cup",
+                )
+            }
+            assert due == expected
+            assert due != set(leagues)  # the whole point: a proper subset
+            assert "INT-World Cup" in due  # cups are never rotated out
+            for league in due:
+                seen[league] += 1
+                assert (
+                    dag_module._gate_player_rotation(league=league, **context) is True
+                )
+            for league in set(leagues) - due:
+                assert (
+                    dag_module._gate_player_rotation(league=league, **context) is False
+                )
+        assert all(seen[league] == 1 for league in self.CLUB_SCOPE)
+        assert seen["INT-World Cup"] == 4
+
+    def test_forced_run_captures_every_league(
+        self, dag_module, monkeypatch, rotation_env
+    ):
+        leagues = self._wide_scope(dag_module, monkeypatch)
+        context = {
+            "params": {"run_players": True},
+            "dag_run": SimpleNamespace(external_trigger=True),
+            "data_interval_end": self.SATURDAY,
+        }
+        assert dag_module._due_player_leagues(context) == set(leagues)
+
+    def test_plan_task_signs_only_the_due_cohort(self, dag_module):
+        plan = _bash_task("prepare_sofascore_player_plan")
+        # The plan is fed the SAME boundary the gate resolves
+        # (`_resolve_player_run_boundary`): the master data_interval_end from
+        # dag_run.conf, falling back to this run's own interval end — not an
+        # independent template that only coincides within one ISO week.
+        assert (
+            "--players-rotation-date "
+            "\"{{ dag_run.conf.get('master_data_interval_end') "
+            "or (data_interval_end | ds) }}\""
+        ) in plan.bash_command
+        assert "master_data_interval_end" in plan.bash_command
+        assert "{% if params.run_players %}--players-force{% endif %}" in (
+            plan.bash_command
+        )
+        # Matches and league tables are not rotated.
+        for task_id in ("prepare_sofascore_season_plan", "prepare_sofascore_target_plan"):
+            assert "--players-rotation-date" not in _bash_task(task_id).bash_command
 
 
 class TestPlayerCaptureTasks:
@@ -1131,3 +1272,93 @@ class TestValidatePlayerData:
         out = dag_module.validate_player_data()
         assert out["status"] == "success"
         assert not any("player_season_stats" in w for w in out["warnings"])
+
+
+class TestValidatePlayerDataUnderRotation:
+    """#946 4d: a league outside this week's cohort produces no result file —
+    the validator must require its ``skipped`` state instead of a file."""
+
+    SATURDAY = datetime(2026, 1, 10)
+
+    def _context(self, dag_module, monkeypatch, states):
+        monkeypatch.setenv("SOFASCORE_PLAYER_ROTATION_MODULUS", "2")
+        monkeypatch.setenv("SOFASCORE_PLAYER_ROTATION_MIN_LEAGUES", "1")
+
+        class DagRun:
+            external_trigger = False
+            run_id = "scheduled__rotation"
+            conf: dict = {}
+
+            @staticmethod
+            def get_task_instance(task_id):
+                return SimpleNamespace(state=states.get(task_id, "success"))
+
+        return {
+            "params": {},
+            "dag_run": DagRun(),
+            "run_id": DagRun.run_id,
+            "data_interval_end": self.SATURDAY,
+        }
+
+    def test_skipped_league_needs_no_result_file(
+        self, dag_module, monkeypatch
+    ):
+        # modulus=2 with min_leagues=1 forces a real split on the shipped scope.
+        context = self._context(dag_module, monkeypatch, {})
+        due = dag_module._due_player_leagues(context)
+        assert due != set(dag_module.SOFASCORE_LEAGUES)
+        skipped = [lg for lg in dag_module.SOFASCORE_LEAGUES if lg not in due]
+        states = {
+            dag_module._player_capture_task_id(league): "skipped" for league in skipped
+        }
+        context = self._context(dag_module, monkeypatch, states)
+
+        def load(path, logger):
+            for league in skipped:
+                assert dag_module._league_slug(league) not in path
+            return {
+                "rows": 520,
+                "profile_players": 520,
+                "season_stats_rows": 500,
+                "season_stats_players": 500,
+                "players_total": 520,
+                "fallback": False,
+                "tables": ["t"],
+                "errors": [],
+            }
+
+        monkeypatch.setattr(dag_module, "_load_result", load)
+        out = dag_module.validate_player_data(**context)
+        assert out["status"] == "success"
+        assert out["summary"]["rotation_skipped"] == sorted(skipped)
+
+    def test_non_due_league_that_did_not_skip_fails_loudly(
+        self, dag_module, monkeypatch
+    ):
+        context = self._context(dag_module, monkeypatch, {})
+        due = dag_module._due_player_leagues(context)
+        skipped = [lg for lg in dag_module.SOFASCORE_LEAGUES if lg not in due]
+        states = {
+            dag_module._player_capture_task_id(league): "failed" for league in skipped
+        }
+        monkeypatch.setattr(dag_module, "_load_result", lambda path, logger: {})
+        with pytest.raises(Exception, match="rotation cohort did not skip"):
+            dag_module.validate_player_data(**self._context(dag_module, monkeypatch, states))
+
+    def test_due_league_without_a_result_file_still_fails(
+        self, dag_module, monkeypatch
+    ):
+        # The rotation must not weaken the guard for the leagues that DID run.
+        context = {
+            "params": {"run_players": True},
+            "dag_run": SimpleNamespace(
+                external_trigger=False,
+                conf={},
+                get_task_instance=lambda task_id: SimpleNamespace(state="success"),
+            ),
+            "run_id": "scheduled__forced",
+            "data_interval_end": self.SATURDAY,
+        }
+        monkeypatch.setattr(dag_module, "_load_result", lambda path, logger: {})
+        with pytest.raises(Exception, match="missing or unreadable"):
+            dag_module.validate_player_data(**context)

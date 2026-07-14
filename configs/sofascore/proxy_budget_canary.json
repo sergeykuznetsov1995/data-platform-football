@@ -2,9 +2,10 @@
   "benchmark_samples": [],
   "bootstrap_authorizes_production": false,
   "budget_derivation": "max_observed_task_bytes_per_workload_class_v2",
+  "class_manifest_sha256": "a0a45fd80c8cbe228511739f84c4d8d13dc3172ee600edf71cfb6b5212d60a9a",
   "cohort_sha256": "eab8540e7a82b95d762fbdba5b30796d964da4c1c0a850fe1322f5e4bc14c1a4",
   "collection_source": "sofascore_canary",
-  "collector_version": "sofascore-paid-canary-v2",
+  "collector_version": "sofascore-paid-canary-v3",
   "experimental_hard_cap_bytes": 47930410,
   "historical_observations": [],
   "meter": "proxy_filter_provider_path_v2",
@@ -17,18 +18,17 @@
   "requirements": {
     "minimum_cold_samples_per_class": 20,
     "minimum_distinct_proxy_exits_per_class": 5,
+    "minimum_distinct_tournaments_for_transfer": 2,
     "required_benchmark_modes": [
       "no_op",
       "offline_replay",
       "single_endpoint_resume"
     ],
     "required_workload_classes": [
-      "match_batch_25_t16",
-      "match_batch_25_t17",
-      "player_batch_50_t16",
-      "player_batch_50_t17",
-      "season_16_b345be809034c692",
-      "season_17_4a1738f5b7504ec2"
+      "match_batch_25_5943cd5a087c8ded",
+      "player_batch_50_cd522de61ebecd10",
+      "season_ae9bf9aa625c6ead",
+      "season_c5a3a2e2e467619d"
     ]
   },
   "runtime_fingerprint": {
@@ -37,7 +37,7 @@
       "camoufox": "0.4.11",
       "playwright": "1.59.0"
     },
-    "digest": "d00e7238b8f952a443c0a6542c913fc1e6f70ecf329cf20a757203d616e27d16",
+    "digest": "6a30b9890aafc561e333c47f9a63517fd5ffc76c328f25a1e2cc820e4ad63742",
     "files": [
       "configs/medallion/competitions.yaml",
       "configs/proxy_filter/blocklist.txt",
@@ -79,15 +79,29 @@
     ],
     "version": 1
   },
-  "schema_version": 2,
+  "schema_version": 3,
   "source": "sofascore",
   "verification_blocker": "Collection is experimental and cannot authorize production until the separate verify command validates every policy gate.",
   "verified": false,
   "workload_classes": {
-    "match_batch_25_t16": {
-      "cohort": "fixed_world_cup_25_matches",
+    "match_batch_25_5943cd5a087c8ded": {
+      "cohorts": {
+        "16": {
+          "cohort_sha256": "aef3426b297b4c12ec69c598243f25e70195024a25b71114135aa7cb35b4e2e9",
+          "name": "fixed_world_cup_25_matches"
+        },
+        "17": {
+          "cohort_sha256": "eab8540e7a82b95d762fbdba5b30796d964da4c1c0a850fe1322f5e4bc14c1a4",
+          "name": "fixed_epl_25_matches"
+        }
+      },
+      "collection_blocker": "",
       "hard_task_bytes": null,
       "max_units": 25,
+      "measured_tournament_ids": [
+        16,
+        17
+      ],
       "required_endpoints": [
         "event",
         "incidents",
@@ -97,53 +111,71 @@
       ],
       "samples": [],
       "scope": "match",
-      "source_tournament_id": 16
+      "shape": {
+        "batch_size": 25,
+        "required_endpoints": [
+          "event",
+          "incidents",
+          "lineups",
+          "shotmap",
+          "statistics"
+        ],
+        "scope": "match",
+        "shape_version": 2
+      },
+      "shape_digest": "5943cd5a087c8ded37cd03e288f126fffa0190b2f7e95fec0df7b86639cbcaf9"
     },
-    "match_batch_25_t17": {
-      "cohort": "fixed_epl_25_matches",
-      "hard_task_bytes": null,
-      "max_units": 25,
-      "required_endpoints": [
-        "event",
-        "incidents",
-        "lineups",
-        "shotmap",
-        "statistics"
-      ],
-      "samples": [],
-      "scope": "match",
-      "source_tournament_id": 17
-    },
-    "player_batch_50_t16": {
-      "cohort": "fixed_world_cup_50_players",
+    "player_batch_50_cd522de61ebecd10": {
+      "cohorts": {
+        "16": {
+          "cohort_sha256": "aef3426b297b4c12ec69c598243f25e70195024a25b71114135aa7cb35b4e2e9",
+          "name": "fixed_world_cup_50_players"
+        },
+        "17": {
+          "cohort_sha256": "eab8540e7a82b95d762fbdba5b30796d964da4c1c0a850fe1322f5e4bc14c1a4",
+          "name": "fixed_epl_50_players"
+        }
+      },
       "collection_blocker": "",
       "hard_task_bytes": null,
       "max_units": 50,
+      "measured_tournament_ids": [
+        16,
+        17
+      ],
       "required_endpoints": [
         "player_profile",
         "player_season_statistics"
       ],
       "samples": [],
       "scope": "player",
-      "source_tournament_id": 16
+      "shape": {
+        "batch_size": 50,
+        "required_endpoints": [
+          "player_profile",
+          "player_season_statistics"
+        ],
+        "scope": "player",
+        "shape_version": 2
+      },
+      "shape_digest": "cd522de61ebecd108945ca8f2b9408db9204e32b125359a536dd714bfd69e210"
     },
-    "player_batch_50_t17": {
-      "cohort": "fixed_epl_50_players",
-      "hard_task_bytes": null,
-      "max_units": 50,
-      "required_endpoints": [
-        "player_profile",
-        "player_season_statistics"
-      ],
-      "samples": [],
-      "scope": "player",
-      "source_tournament_id": 17
-    },
-    "season_16_b345be809034c692": {
-      "cohort": "enabled_world_cup_2026_shape",
+    "season_ae9bf9aa625c6ead": {
+      "cohorts": {
+        "16": {
+          "cohort_sha256": "aef3426b297b4c12ec69c598243f25e70195024a25b71114135aa7cb35b4e2e9",
+          "name": "enabled_world_cup_2026_shape"
+        }
+      },
+      "collection_blocker": "",
       "hard_task_bytes": null,
       "max_units": 1,
-      "representative_season_id": 58210,
+      "measured_tournament_ids": [
+        16
+      ],
+      "representative_season_ids": {
+        "16": 58210
+      },
       "required_endpoints": [
         "cup_trees",
         "participants",
@@ -157,6 +189,7 @@
       "samples": [],
       "scope": "season",
       "shape": {
+        "band_scheme": "team_count_band_v1",
         "dynamic_endpoints": [
           "squads",
           "referee_profile"
@@ -169,9 +202,9 @@
           ],
           "max_pages_per_direction": 50
         },
+        "scope": "season",
         "season_format": "calendar_year",
-        "shape_version": 1,
-        "source_tournament_id": "16",
+        "shape_version": 2,
         "static_endpoints": [
           "schedule_last",
           "schedule_next",
@@ -179,16 +212,27 @@
           "rounds",
           "cup_trees",
           "participants"
-        ]
+        ],
+        "team_count_band": "33_48"
       },
-      "shape_digest": "b345be809034c6927e3783c88d5dca3fe83aca8e7073fe3718693852be6cf0b6",
-      "source_tournament_id": 16
+      "shape_digest": "ae9bf9aa625c6ead8b0e72adaf21551a7230b8f06b45cf7cd19e9f685231a24b"
     },
-    "season_17_4a1738f5b7504ec2": {
-      "cohort": "enabled_epl_2526_shape",
+    "season_c5a3a2e2e467619d": {
+      "cohorts": {
+        "17": {
+          "cohort_sha256": "eab8540e7a82b95d762fbdba5b30796d964da4c1c0a850fe1322f5e4bc14c1a4",
+          "name": "enabled_epl_2526_shape"
+        }
+      },
+      "collection_blocker": "",
       "hard_task_bytes": null,
       "max_units": 1,
-      "representative_season_id": 76986,
+      "measured_tournament_ids": [
+        17
+      ],
+      "representative_season_ids": {
+        "17": 76986
+      },
       "required_endpoints": [
         "cup_trees",
         "participants",
@@ -202,6 +246,7 @@
       "samples": [],
       "scope": "season",
       "shape": {
+        "band_scheme": "team_count_band_v1",
         "dynamic_endpoints": [
           "squads",
           "referee_profile"
@@ -214,9 +259,9 @@
           ],
           "max_pages_per_direction": 50
         },
+        "scope": "season",
         "season_format": "split_year",
-        "shape_version": 1,
-        "source_tournament_id": "17",
+        "shape_version": 2,
         "static_endpoints": [
           "schedule_last",
           "schedule_next",
@@ -224,10 +269,10 @@
           "rounds",
           "cup_trees",
           "participants"
-        ]
+        ],
+        "team_count_band": "16_20"
       },
-      "shape_digest": "4a1738f5b7504ec2b905ea550884ac220cfc1e717e4aee5eca2e6e04699f4e5b",
-      "source_tournament_id": 17
+      "shape_digest": "c5a3a2e2e467619dca702acad1466618f7740c41a344b47d6de60001df9d0ca8"
     }
   }
 }

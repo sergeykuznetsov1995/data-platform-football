@@ -28,6 +28,7 @@ from scripts.proxy_filter.budget import (
     BudgetAccountingError,
     ProxyBudgetExceeded,
 )
+from scrapers.sofascore.camoufox_capture import ProxyConnectivityError
 from scrapers.sofascore.manifest import ManifestStatus
 from scrapers.sofascore.workload_plan import SignedDagRunPlan, WorkloadAllocation
 
@@ -236,6 +237,7 @@ class LeaseBackedCamoufoxTransport(AbstractContextManager):
         self._browser_started = False
         self._browser_reported = False
         self._upstream_fingerprint: Optional[str] = None
+        self._observed_upstream_repins = 0
         self._endpoint_request_provider_bytes: dict[str, list[int]] = {}
         self._completed = False
 
@@ -429,14 +431,28 @@ class LeaseBackedCamoufoxTransport(AbstractContextManager):
             raise BudgetAccountingError(
                 "SofaScore lease stats do not match the signed allocation"
             )
+        reported_repins = int(getattr(stats, "upstream_repins", 0) or 0)
         if (
             self._upstream_fingerprint is not None
             and fingerprint != self._upstream_fingerprint
+            and reported_repins <= self._observed_upstream_repins
         ):
+            # A fingerprint drift is legal only as the proxy's dead-exit
+            # failover (#946), whose proof is a strictly increased
+            # ``upstream_repins`` counter: the filter re-pins exclusively before
+            # the first provider down-byte, so a repins increment certifies a
+            # pre-data failover even when the client first observes the drift
+            # after the successful attempt billed bytes (mid-request transparent
+            # failover).  A drift without that increment — including against an
+            # old proxy that does not report the field — stays fail-closed.
             raise BudgetAccountingError(
                 "SofaScore sticky lease changed residential upstream"
             )
         self._upstream_fingerprint = fingerprint
+        # Monotonic: a stale/lower counter must never re-open the drift window.
+        self._observed_upstream_repins = max(
+            self._observed_upstream_repins, reported_repins
+        )
         return stats
 
     @staticmethod
@@ -463,14 +479,24 @@ class LeaseBackedCamoufoxTransport(AbstractContextManager):
                     retryable=False,
                 )
             self._capture_cm = self._new_capture()
+            # A fresh launch is a new, not-yet-counted browser session; a prior
+            # dead-exit attempt already reported its own via ``request``.
+            self._browser_started = True
+            self._browser_reported = False
             try:
                 self._capture = self._capture_cm.__enter__()
-                self._browser_started = True
                 self._capture.warm_exact_json(self.canonical_url)
                 if self.exit_probe_enabled:
                     self._proxy_exit_hash = hash_proxy_exit(
                         self._capture.probe_proxy_exit()
                     )
+            except ProxyConnectivityError:
+                # The residential exit died; the browser runtime is fine.  Tear
+                # it down and drop the session so the next attempt cold-starts a
+                # fresh dial through the same lease.  ``_broken`` stays False, so
+                # ``request`` reports ``retryable=True``.
+                self._teardown_capture()
+                raise
             except BaseException:
                 self._broken = True
                 raise
@@ -480,11 +506,27 @@ class LeaseBackedCamoufoxTransport(AbstractContextManager):
             return sessions, 1
         if self._needs_rewarm:
             before = int(getattr(self._capture, "_navigation_count", 0) or 0)
-            self._capture.warm_exact_json(self.canonical_url)
+            try:
+                self._capture.warm_exact_json(self.canonical_url)
+            except ProxyConnectivityError:
+                # Same dead-exit recovery for a challenge re-warm: drop the
+                # session so the retry cold-starts, without latching ``_broken``.
+                self._teardown_capture()
+                raise
             self._needs_rewarm = False
             after = int(getattr(self._capture, "_navigation_count", 0) or 0)
             return 0, max(0, after - before)
         return 0, 0
+
+    def _teardown_capture(self) -> None:
+        """Best-effort browser teardown that leaves the transport re-launchable."""
+        if self._capture_cm is not None:
+            try:
+                self._capture_cm.__exit__(None, None, None)
+            except Exception:  # noqa: BLE001 — teardown must not mask the retry
+                pass
+        self._capture = None
+        self._capture_cm = None
 
     def request(
         self,

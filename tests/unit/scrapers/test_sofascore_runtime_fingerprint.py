@@ -102,6 +102,28 @@ def test_build_contract_fallback_keeps_logical_paths(tmp_path):
     }
 
 
+def test_class_manifest_and_cohorts_stay_out_of_the_fingerprint():
+    """Declaring classes must not, by itself, rotate the measured runtime digest.
+
+    The canary class manifest and its cohorts declare *what* is collected, not
+    *how* bytes are spent, so changing the class declaration alone leaves
+    verified samples valid.  Onboarding a new league is a separate matter: it
+    edits ``configs/medallion/competitions.yaml``, which *is* in the
+    fingerprint, so those measurements rotate and are re-collected regardless of
+    the manifest (an accepted limitation, batched per F2/§2.4).
+    """
+
+    files = runtime.runtime_fingerprint()["files"]
+
+    assert "configs/sofascore/proxy_canary_classes.json" not in files
+    assert not [
+        path
+        for path in files
+        if path.startswith("configs/sofascore/proxy_canary_cohort")
+    ]
+    assert not [path for path in files if path.startswith("configs/sofascore/proxy_")]
+
+
 def test_proxy_filter_compose_exposes_every_fingerprint_runtime_path():
     root = Path(__file__).resolve().parents[3]
     compose = yaml.safe_load((root / "compose.yaml").read_text(encoding="utf-8"))
