@@ -16,6 +16,7 @@ import argparse
 import hashlib
 import json
 import logging
+import numbers
 import os
 import re
 import sys
@@ -2640,6 +2641,251 @@ def _compatibility_fingerprint(frame, columns: Sequence[str]) -> Tuple[int, str]
     return len(values), hashlib.sha256(blob.encode('utf-8')).hexdigest()
 
 
+# --- Content-idempotent append (#948, phase F5) -----------------------------
+# ``attribute_observations`` is the only native output written as a plain
+# append: every other OutputSpec carries ``replace_keys``, so a re-scan of the
+# same scope rewrites its rows instead of accumulating them.  Its Bronze (and
+# Silver) natural key embeds ``observed_at``, which the scraper stamps fresh
+# on every crawl — so re-scanning an UNCHANGED scope used to mint a brand-new
+# observation per player and multiply the observation grain by the number of
+# scans (live 2026-07-14: 33 510 scoped Bronze rows carrying 8 195 distinct
+# contents; one scope had 10 identical scans).
+#
+# Carry-forward makes that append content-idempotent: a row whose canonical
+# content equals the LATEST stored row for the same key reuses that row's
+# ``observed_at``, so the repeat lands on an existing natural key and the
+# Silver dedup collapses it.  A genuinely changed attribute still gets a fresh
+# ``observed_at`` and becomes a new SCD row.  Parity is unaffected: both
+# manifests hash the ``_MANIFEST_COMPATIBILITY`` projection, which excludes
+# ``observed_at`` by construction.
+_CARRY_FORWARD_SCOPE_COLUMNS = ('competition_id', 'edition_id')
+_CARRY_FORWARD_KEY_COLUMNS = {
+    'attribute_observations': ('club_id', 'player_id'),
+}
+# The row identity Silver resolves ONE current record for, ACROSS the rest of
+# the key.  ``transfermarkt_player_attributes_v2`` ranks a player's rows by
+# ``observed_at DESC`` (before ``_bronze_ingested_at``), so recency — not
+# ingest order — decides which club is reported as current.  A carried stamp is
+# therefore only safe while it stays the newest one the player has in the
+# scope: a loan return (club A → B → A, attributes unchanged) would otherwise
+# reuse A's pre-loan stamp, leaving the LEFT club B ranked first forever.
+_CARRY_FORWARD_LATEST_COLUMNS = {
+    'attribute_observations': ('player_id',),
+}
+_CARRY_FORWARD_NULL = '__NULL__'
+
+
+def _carry_forward_content_columns(output_key: str) -> Tuple[str, ...]:
+    """Canonical content projection: the manifest projection minus identity.
+
+    Reusing ``_MANIFEST_COMPATIBILITY`` keeps ONE definition of "the same row"
+    for transition parity and for idempotency.  ``observed_at`` is not in it
+    (it is the observation grain, not content) and neither is ingest lineage
+    (``_batch_id``, ``fetched_at``, ``source_body_hash``, …), which legitimately
+    differs between two crawls of identical content.
+    """
+    identity = set(_CARRY_FORWARD_SCOPE_COLUMNS) | set(
+        _CARRY_FORWARD_KEY_COLUMNS[output_key]
+    )
+    return tuple(
+        column
+        for column in _MANIFEST_COMPATIBILITY[output_key]['native']
+        if column not in identity
+    )
+
+
+def _canonical_cell(value: Any) -> str:
+    """Store-independent text for one content cell.
+
+    ``_compatibility_keys`` compares two pandas frames inside one process, so
+    ``str()`` is enough there.  Carry-forward compares a pandas frame against
+    rows read back from Trino, where the same fact arrives as a different
+    Python type: ``age`` as ``numpy.int64``/``float`` vs ``int``, ``dob`` as
+    ``pandas.Timestamp`` vs ``datetime.date``, NULL as ``NaN``/``NaT``/``pd.NA``
+    vs ``None``.  A type-blind comparison would report every row as changed and
+    silently disable the carry-forward, so cells are canonicalised by value
+    class.  The projection holds no timestamp column (``observed_at`` is
+    excluded), so a datetime cell can only be a date widened by pandas.
+    """
+    if value is None:
+        return _CARRY_FORWARD_NULL
+    try:
+        if bool(value != value):  # NaN/NaT/pd.NA without importing pandas here.
+            return _CARRY_FORWARD_NULL
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, bool):
+        return 'true' if value else 'false'
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, numbers.Integral):  # bool is handled above.
+        return str(int(value))
+    if isinstance(value, numbers.Real):
+        number = float(value)
+        return str(int(number)) if number.is_integer() else repr(number)
+    text = str(value)
+    if text in {'nan', 'NaT', '<NA>', 'None'}:
+        return _CARRY_FORWARD_NULL
+    return text
+
+
+def _load_previous_observations(
+    scraper,
+    table: str,
+    key_columns: Sequence[str],
+    latest_columns: Sequence[str],
+    content_columns: Sequence[str],
+    scopes: Sequence[Tuple[str, str]],
+) -> Dict[Tuple[str, ...], Tuple[Tuple[str, ...], Any]]:
+    """Carryable stored rows per (scope, key) → (canonical content, observed_at).
+
+    A stored row is carryable only when it is BOTH the latest row of its own
+    key AND still the newest row the entity (scope + ``latest_columns``) has —
+    reusing a stamp that another club's row already beats would rank that left
+    club first in Silver forever.  Non-carryable rows are simply absent from
+    the map, so their fresh ``observed_at`` stands.
+
+    Fail-closed: only a genuinely absent Bronze table is a legal "nothing to
+    carry" answer (first write of a cold table).  Any other lookup failure
+    raises BEFORE anything is written — writing fresh ``observed_at`` values
+    blind to the stored state is exactly the duplication this prevents.
+    """
+    import pandas as pd
+
+    identity = tuple(_CARRY_FORWARD_SCOPE_COLUMNS) + tuple(key_columns)
+    projection = ', '.join(identity + tuple(content_columns) + ('observed_at',))
+    scope_predicate = ' OR '.join(
+        '({} = ? AND {} = ?)'.format(*_CARRY_FORWARD_SCOPE_COLUMNS)
+        for _ in scopes
+    )
+    sql = (
+        f'SELECT {projection} FROM ('
+        f'SELECT {projection}, ROW_NUMBER() OVER ('
+        f'PARTITION BY {", ".join(identity)} '
+        'ORDER BY observed_at DESC, _ingested_at DESC, _batch_id DESC'
+        f') AS rn FROM {table} WHERE {scope_predicate}'
+        ') WHERE rn = 1'
+    )
+    params = [value for scope in scopes for value in scope]
+    try:
+        rows = _execute_cursor(
+            scraper._bronze_connection(), sql, params, fetch=True,
+        ) or []
+    except Exception as exc:  # noqa: BLE001
+        if any(token in str(exc).lower() for token in (
+            'table_not_found', 'table not found', 'does not exist',
+        )):
+            logger.info(
+                '%s absent; every observation of this scope is new', table,
+            )
+            return {}
+        raise RuntimeError(
+            'observed_at carry-forward lookup failed; refusing to write '
+            f'{table}: {_redact_sensitive(exc)}'
+        ) from exc
+
+    width = len(identity)
+    entity_positions = [
+        identity.index(column)
+        for column in tuple(_CARRY_FORWARD_SCOPE_COLUMNS) + tuple(latest_columns)
+    ]
+    # The newest stamp per entity is the newest among its per-key latest rows:
+    # each row here already is the maximum ``observed_at`` of its own key.
+    newest: Dict[Tuple[str, ...], Any] = {}
+    stored: List[Tuple[Tuple[str, ...], Tuple[str, ...], Tuple[str, ...], Any]] = []
+    for row in rows:
+        key = tuple(_canonical_cell(value) for value in row[:width])
+        content = tuple(_canonical_cell(value) for value in row[width:-1])
+        observed_at = pd.Timestamp(row[-1]) if row[-1] is not None else None
+        if observed_at is not None and pd.isna(observed_at):
+            observed_at = None
+        entity = tuple(key[position] for position in entity_positions)
+        stored.append((key, entity, content, observed_at))
+        if observed_at is not None and (
+            entity not in newest or observed_at > newest[entity]
+        ):
+            newest[entity] = observed_at
+
+    previous: Dict[Tuple[str, ...], Tuple[Tuple[str, ...], Any]] = {}
+    for key, entity, content, observed_at in stored:
+        if observed_at is None or observed_at < newest[entity]:
+            continue
+        previous[key] = (content, observed_at)
+    return previous
+
+
+def _carry_forward_observed_at(
+    scraper,
+    spec: EntitySpec,
+    frames: Mapping[str, Any],
+    results: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Reuse the stored ``observed_at`` for rows whose content did not change."""
+    updated = dict(frames)
+    for output in spec.outputs:
+        key_columns = _CARRY_FORWARD_KEY_COLUMNS.get(output.key)
+        if key_columns is None:
+            continue
+        frame = updated.get(output.key)
+        if frame is None or getattr(frame, 'empty', True):
+            continue
+        content_columns = _carry_forward_content_columns(output.key)
+        identity = list(_CARRY_FORWARD_SCOPE_COLUMNS) + list(key_columns)
+        required = identity + list(content_columns) + ['observed_at']
+        missing = [column for column in required if column not in frame.columns]
+        if missing:
+            raise RuntimeError(
+                f'observed_at carry-forward columns missing from {output.key}: '
+                f'{missing}'
+            )
+        scopes = sorted({
+            (str(competition), str(edition))
+            for competition, edition in frame[
+                list(_CARRY_FORWARD_SCOPE_COLUMNS)
+            ].dropna().drop_duplicates().itertuples(index=False, name=None)
+        })
+        if not scopes:
+            raise RuntimeError(
+                f'observed_at carry-forward requires a scope on {output.key}'
+            )
+        previous = _load_previous_observations(
+            scraper,
+            f'iceberg.bronze.{output.table_name}',
+            key_columns,
+            _CARRY_FORWARD_LATEST_COLUMNS[output.key],
+            content_columns,
+            scopes,
+        )
+
+        width = len(identity)
+        observed: List[Any] = []
+        carried = 0
+        for row in frame[required].itertuples(index=False, name=None):
+            key = tuple(_canonical_cell(value) for value in row[:width])
+            content = tuple(_canonical_cell(value) for value in row[width:-1])
+            stored = previous.get(key)
+            if stored is not None and stored[0] == content:
+                # Carryable (see _load_previous_observations) and unchanged.
+                observed.append(stored[1])
+                carried += 1
+            else:
+                observed.append(row[-1])
+        frame = frame.copy()
+        frame['observed_at'] = observed
+        updated[output.key] = frame
+        logger.info(
+            'observed_at carry-forward %s: carried=%d fresh=%d of %d rows',
+            output.key, carried, len(frame) - carried, len(frame),
+        )
+        results.setdefault('observed_at_carry_forward', {})[output.key] = {
+            'carried': carried,
+            'fresh': int(len(frame)) - carried,
+        }
+    return updated
+
+
 def _persist_dual_write_manifest(
     scraper,
     spec: EntitySpec,
@@ -3467,6 +3713,12 @@ def _run_entity(
                 exit_code = 0
                 raise _EntityRunComplete(exit_code)
 
+            # Read the stored observation state BEFORE any write: a failed
+            # lookup must abort the whole entity, not fall back to a fresh
+            # observed_at (that is the duplication being fixed).
+            frames = _carry_forward_observed_at(
+                scraper, write_spec, frames, results,
+            )
             _save_frames(
                 scraper, write_spec, frames, force_replace, results,
             )
