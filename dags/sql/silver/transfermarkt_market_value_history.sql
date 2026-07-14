@@ -38,19 +38,40 @@
 --     а не no_nulls(canonical_id), как в sibling transfermarkt_players.
 -- =============================================================================
 
-WITH bronze_dedup AS (
+WITH league_season_format AS (
+    -- #948: формат сезона лиги из publish-реестра. Таблица содержит НЕСКОЛЬКО
+    -- снапшотов реестра → GROUP BY по canonical-ключу + строгий гард согласия:
+    -- single_year только если ВСЕ строки группы = 'single_year'; NULL или
+    -- конфликт (в т.ч. между разными competition_id одного canonical-ключа)
+    -- ломают консенсус → split_year. Немаппленные слаги (ESP/ITA/GER/FRA и
+    -- пр.) не матчатся в LEFT JOIN ниже → fallback split_year; замаппленные
+    -- split_year-лиги (напр. GB1 → 'ENG-Premier League') идут matched-путём,
+    -- но дают то же ELSE-выражение → историческое поведение бит-в-бит.
+    SELECT
+        COALESCE(canonical_competition_id, 'TM-' || competition_id) AS league,
+        CASE WHEN COUNT(*) = count_if(season_format = 'single_year')
+             THEN 'single_year' ELSE 'split_year' END AS season_format
+    FROM iceberg.silver.transfermarkt_competitions_v2
+    GROUP BY 1
+),
+
+bronze_dedup AS (
     SELECT
         player_id,
         mv_date,
         value_eur,
         club_name,
         age,
-        league,
+        d.league,
         -- #835: футбольный сезон точки из mv_date (Aug–Jun), short-form '2122'
         -- как в xref_player. Месяц ≥ 7 (июль) → сезон стартует в этом году.
-        substr(cast(if(month(mv_date) >= 7, year(mv_date), year(mv_date) - 1) AS varchar), 3, 2)
-            || substr(cast(if(month(mv_date) >= 7, year(mv_date), year(mv_date) - 1) + 1 AS varchar), 3, 2)
-                                                       AS season,
+        -- #948: календарные лиги (season_format='single_year', напр. TM-2DVB)
+        -- получают 4-значный календарный год ('2024') вместо split-слага.
+        CASE WHEN lf.season_format = 'single_year'
+             THEN CAST(year(mv_date) AS varchar)
+             ELSE substr(cast(if(month(mv_date) >= 7, year(mv_date), year(mv_date) - 1) AS varchar), 3, 2)
+                    || substr(cast(if(month(mv_date) >= 7, year(mv_date), year(mv_date) - 1) + 1 AS varchar), 3, 2)
+        END                                            AS season,
         _ingested_at
     FROM (
         SELECT
@@ -62,7 +83,9 @@ WITH bronze_dedup AS (
         FROM iceberg.bronze.transfermarkt_market_value_history b
         WHERE player_id IS NOT NULL
           AND mv_date   IS NOT NULL
-    )
+    ) d
+    LEFT JOIN league_season_format lf
+        ON lf.league = d.league
     WHERE rn = 1
 ),
 
