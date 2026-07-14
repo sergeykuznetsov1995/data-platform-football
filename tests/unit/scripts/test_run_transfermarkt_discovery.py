@@ -9,7 +9,11 @@ from pathlib import Path
 
 import pytest
 
-from dags.utils.transfermarkt_approval import ApprovalJournal, ApprovalPacket
+from dags.utils.transfermarkt_approval import (
+    ApprovalJournal,
+    ApprovalPacket,
+    load_standing_policy,
+)
 from scrapers.transfermarkt.models import (
     FetchOutcome,
     FetchStatus,
@@ -685,6 +689,325 @@ def test_approval_asset_drift_fails_before_proxy_and_state_mutation(
 
     assert _FakeClient.instances == []
     assert not (tmp_path / "checkpoint.json").exists()
+
+
+def _standing_policy_file(mod, tmp_path: Path, **overrides) -> Path:
+    now = datetime.now(timezone.utc)
+    value = {
+        "policy_version": 1,
+        "dag_id": "dag_discover_transfermarkt_registry",
+        "approved_by": "sergeykuznetsov1995",
+        "approved_at": (now - timedelta(days=1)).isoformat(),
+        "expires_at": (now + timedelta(days=30)).isoformat(),
+        "paid_proxy": {
+            "byte_cap_bytes": mod.HARD_PROVIDER_BYTE_BUDGET,
+            # The wrapper limits of the test argv (_raw_args), not the DAG's.
+            "request_limit": 10,
+            "retry_limit": 2,
+            "concurrency": 1,
+        },
+        "production_write": {
+            "byte_cap_bytes": 0,
+            "request_limit": 0,
+            "retry_limit": 0,
+            "concurrency": 1,
+        },
+        "allowed_write_tables": sorted(mod.TARGET_TABLES),
+    }
+    value.update(overrides)
+    path = tmp_path / "standing-registry-policy.json"
+    path.write_text(json.dumps(value), encoding="utf-8")
+    return path
+
+
+def _standing_args(mod, tmp_path: Path, *, dry_run: bool = False, **overrides):
+    policy_path = _standing_policy_file(mod, tmp_path, **overrides)
+    policy = load_standing_policy(policy_path)
+    raw = _raw_args(tmp_path, dry_run=dry_run, approval=False)
+    raw.extend(
+        (
+            "--standing-policy",
+            str(policy_path),
+            "--standing-policy-sha256",
+            policy.policy_hash,
+        )
+    )
+    return raw, policy
+
+
+def _execute_standing(mod, tmp_path, raw, *, writer, discovery=None):
+    return mod.execute(
+        mod._parser().parse_args(raw),
+        execution_argv=(str(SCRIPT), *raw),
+        discovery_fn=discovery or _discovery(call_fetch=True),
+        lease_provider_factory=lambda url: object(),
+        http_client_factory=_FakeClient,
+        writer_factory=lambda: writer,
+        utcnow=lambda: NOW,
+        monotonic=iter((20.0, 23.5)).__next__,
+    )
+
+
+def test_standing_policy_run_writes_bronze_without_journal(
+    tmp_path, monkeypatch
+):
+    mod = _load()
+    _FakeClient.instances.clear()
+    monkeypatch.setenv(mod.STANDING_POLICY_ENV_GATE, "true")
+    raw, policy = _standing_args(mod, tmp_path)
+    writer = _FakeWriter()
+
+    result = _execute_standing(mod, tmp_path, raw, writer=writer)
+
+    assert [call["table"] for call in writer.calls] == [
+        "transfermarkt_competitions",
+        "transfermarkt_competition_editions",
+    ]
+    manifest = result.manifest
+    assert manifest["approval_mode"] == "standing_policy"
+    assert manifest["standing_policy_hash"] == policy.policy_hash
+    assert manifest["fetched_at"] == NOW.isoformat()
+    assert manifest["paid_proxy_approval_packet_hash"] is None
+    assert manifest["production_write_approval_packet_hash"] is None
+    assert not (tmp_path / "journal.json").exists()
+    record = json.loads(
+        (
+            tmp_path
+            / "manifests"
+            / "tm-registry-20260711"
+            / "standing-authorization.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert record == {
+        "status": "complete",
+        "cycle_id": "tm-registry-20260711",
+        "run_id": "manual__2026-07-11",
+        "manifest_hash": result.manifest_hash,
+        "approval_mode": "standing_policy",
+        "standing_policy": {
+            "policy_hash": policy.policy_hash,
+            "policy_version": 1,
+        },
+    }
+
+
+def test_dry_run_standing_writes_no_authorization_record(
+    tmp_path, monkeypatch
+):
+    # The record attests an authorized production write; a dry run writes
+    # nothing to production, so leaving no record is the honest state.
+    mod = _load()
+    _FakeClient.instances.clear()
+    monkeypatch.setenv(mod.STANDING_POLICY_ENV_GATE, "true")
+    raw, policy = _standing_args(mod, tmp_path, dry_run=True)
+
+    result = mod.execute(
+        mod._parser().parse_args(raw),
+        execution_argv=(str(SCRIPT), *raw),
+        discovery_fn=_discovery(call_fetch=True),
+        lease_provider_factory=lambda url: object(),
+        http_client_factory=_FakeClient,
+        writer_factory=lambda: pytest.fail("dry-run created an Iceberg writer"),
+        utcnow=lambda: NOW,
+        monotonic=iter((20.0, 23.5)).__next__,
+    )
+
+    assert result.manifest["approval_mode"] == "standing_policy"
+    assert result.manifest["standing_policy_hash"] == policy.policy_hash
+    assert result.manifest["write_status"]["status"] == "not_applicable"
+    assert not (
+        tmp_path
+        / "manifests"
+        / "tm-registry-20260711"
+        / "standing-authorization.json"
+    ).exists()
+
+
+def test_standing_policy_requires_env_gate(tmp_path, monkeypatch):
+    mod = _load()
+    _FakeClient.instances.clear()
+    monkeypatch.delenv("TM_STANDING_POLICY_ENABLED", raising=False)
+    raw, _ = _standing_args(mod, tmp_path)
+
+    with pytest.raises(
+        mod.DiscoveryRunnerError,
+        match="TM_STANDING_POLICY_ENABLED must be true",
+    ):
+        _execute_standing(
+            mod,
+            tmp_path,
+            raw,
+            writer=None,
+            discovery=_discovery(call_fetch=True),
+        )
+
+    assert _FakeClient.instances == []
+    assert not (tmp_path / "checkpoint.json").exists()
+
+
+def test_standing_policy_sha_drift_fails_before_client_io(
+    tmp_path, monkeypatch
+):
+    mod = _load()
+    _FakeClient.instances.clear()
+    monkeypatch.setenv(mod.STANDING_POLICY_ENV_GATE, "true")
+    raw, _ = _standing_args(mod, tmp_path)
+    raw[raw.index("--standing-policy-sha256") + 1] = "0" * 64
+
+    with pytest.raises(
+        mod.DiscoveryRunnerError, match="differs from the pinned sha256"
+    ) as raised:
+        _execute_standing(mod, tmp_path, raw, writer=None)
+
+    assert _FakeClient.instances == []
+    assert not (tmp_path / "checkpoint.json").exists()
+    # The evidence names the mode the run *attempted*, even though the
+    # enforcement failed before any authorization object existed.
+    assert raised.value.manifest["approval_mode"] == "standing_policy"
+    assert raised.value.manifest["standing_policy_hash"] is None
+    assert raised.value.manifest["traffic"]["requests"] == 0
+
+
+@pytest.mark.parametrize(
+    "paid_override",
+    [
+        {"byte_cap_bytes": 16 * 1024 * 1024},
+        {"request_limit": 11},
+        {"retry_limit": 3},
+        {"concurrency": 2},
+    ],
+)
+def test_standing_policy_caps_must_match_wrapper_argv(
+    tmp_path, monkeypatch, paid_override
+):
+    mod = _load()
+    _FakeClient.instances.clear()
+    monkeypatch.setenv(mod.STANDING_POLICY_ENV_GATE, "true")
+    paid = {
+        "byte_cap_bytes": mod.HARD_PROVIDER_BYTE_BUDGET,
+        "request_limit": 10,
+        "retry_limit": 2,
+        "concurrency": 1,
+    }
+    paid.update(paid_override)
+    raw, _ = _standing_args(mod, tmp_path, paid_proxy=paid)
+
+    with pytest.raises(
+        mod.DiscoveryRunnerError, match="caps differ from discovery limits"
+    ):
+        _execute_standing(mod, tmp_path, raw, writer=None)
+
+    assert _FakeClient.instances == []
+
+
+def test_standing_policy_expired_fails_before_client_io(tmp_path, monkeypatch):
+    mod = _load()
+    _FakeClient.instances.clear()
+    monkeypatch.setenv(mod.STANDING_POLICY_ENV_GATE, "true")
+    now = datetime.now(timezone.utc)
+    raw, _ = _standing_args(
+        mod,
+        tmp_path,
+        approved_at=(now - timedelta(days=2)).isoformat(),
+        expires_at=(now - timedelta(days=1)).isoformat(),
+    )
+
+    with pytest.raises(Exception, match="expired"):
+        _execute_standing(mod, tmp_path, raw, writer=None)
+
+    assert _FakeClient.instances == []
+
+
+def test_standing_policy_wrong_dag_id_fails_before_client_io(
+    tmp_path, monkeypatch
+):
+    mod = _load()
+    _FakeClient.instances.clear()
+    monkeypatch.setenv(mod.STANDING_POLICY_ENV_GATE, "true")
+    raw, _ = _standing_args(mod, tmp_path, dag_id="dag_ingest_transfermarkt")
+
+    with pytest.raises(mod.DiscoveryRunnerError, match="dag_id mismatch"):
+        _execute_standing(mod, tmp_path, raw, writer=None)
+
+    assert _FakeClient.instances == []
+
+
+def test_standing_policy_missing_bronze_table_fails_before_client_io(
+    tmp_path, monkeypatch
+):
+    mod = _load()
+    _FakeClient.instances.clear()
+    monkeypatch.setenv(mod.STANDING_POLICY_ENV_GATE, "true")
+    raw, _ = _standing_args(
+        mod, tmp_path, allowed_write_tables=[mod.COMPETITIONS_TABLE]
+    )
+
+    with pytest.raises(mod.DiscoveryRunnerError, match="omits write tables"):
+        _execute_standing(mod, tmp_path, raw, writer=None)
+
+    assert _FakeClient.instances == []
+
+
+def test_standing_and_one_shot_flags_are_mutually_exclusive(
+    tmp_path, monkeypatch
+):
+    mod = _load()
+    _FakeClient.instances.clear()
+    monkeypatch.setenv(mod.STANDING_POLICY_ENV_GATE, "true")
+    raw, _ = _standing_args(mod, tmp_path)
+    raw.extend(("--approval-journal", str(tmp_path / "journal.json")))
+
+    with pytest.raises(
+        mod.DiscoveryRunnerError, match="mutually exclusive"
+    ):
+        _execute_standing(mod, tmp_path, raw, writer=None)
+
+    assert _FakeClient.instances == []
+
+
+@pytest.mark.parametrize(
+    "dropped", ["--standing-policy", "--standing-policy-sha256"]
+)
+def test_standing_policy_needs_both_flags(tmp_path, monkeypatch, dropped):
+    mod = _load()
+    _FakeClient.instances.clear()
+    monkeypatch.setenv(mod.STANDING_POLICY_ENV_GATE, "true")
+    raw, _ = _standing_args(mod, tmp_path)
+    index = raw.index(dropped)
+    del raw[index:index + 2]
+
+    with pytest.raises(mod.DiscoveryRunnerError, match="is required"):
+        _execute_standing(mod, tmp_path, raw, writer=None)
+
+    assert _FakeClient.instances == []
+
+
+def test_failed_rerun_does_not_clobber_standing_authorization(
+    tmp_path, monkeypatch
+):
+    mod = _load()
+    _FakeClient.instances.clear()
+    monkeypatch.setenv(mod.STANDING_POLICY_ENV_GATE, "true")
+    raw, _ = _standing_args(mod, tmp_path)
+    _execute_standing(mod, tmp_path, raw, writer=_FakeWriter())
+    record_path = (
+        tmp_path
+        / "manifests"
+        / "tm-registry-20260711"
+        / "standing-authorization.json"
+    )
+    original = record_path.read_text(encoding="utf-8")
+
+    drifted = list(raw)
+    drifted[drifted.index("--standing-policy-sha256") + 1] = "0" * 64
+    with pytest.raises(
+        mod.DiscoveryRunnerError, match="differs from the pinned sha256"
+    ) as raised:
+        _execute_standing(mod, tmp_path, drifted, writer=None)
+
+    assert record_path.read_text(encoding="utf-8") == original
+    assert Path(raised.value.manifest_path) != record_path
+    assert Path(raised.value.manifest_path).is_file()
 
 
 def test_corrupt_checkpoint_fails_closed_without_proxy_io(tmp_path):

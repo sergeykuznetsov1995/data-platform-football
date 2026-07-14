@@ -11,7 +11,7 @@ reach Silver or advance the canonical registry CAS pointer.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
@@ -46,6 +46,13 @@ PROXY_RETRY_LIMIT = 96
 PROXY_CONCURRENCY = 1
 CACHE_TTL_SECONDS = 24 * 60 * 60
 LEASE_TTL_SECONDS = 60 * 60
+STANDING_POLICY_PATH = (
+    "/opt/airflow/dags/configs/transfermarkt/standing_registry_policy.json"
+)
+# Deliberately the same activation key as dag_ingest_transfermarkt: both paid
+# Transfermarkt contours stand or fall together on one operator decision, and
+# per-DAG isolation comes from the dag_id pinned inside each policy file.
+STANDING_POLICY_ENV_GATE = "TM_STANDING_POLICY_ENABLED"
 
 BRONZE_TABLES = (
     "iceberg.bronze.transfermarkt_competitions",
@@ -93,6 +100,44 @@ def _run_id(context: Mapping[str, Any]) -> str:
     if not value:
         raise AirflowException("dag_run.run_id is required")
     return str(value)
+
+
+def _truthy_env(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def _is_scheduled_run(context: Mapping[str, Any]) -> bool:
+    dag_run = context.get("dag_run")
+    if dag_run is not None:
+        # A present dag_run is the authority: a missing run_type on it means
+        # "not scheduled", never a fall-through to the run_id prefix.
+        run_type = getattr(dag_run, "run_type", None)
+        return str(getattr(run_type, "value", run_type)) == "scheduled"
+    return str(context.get("run_id") or "").startswith("scheduled__")
+
+
+def _load_validated_standing_policy():
+    """Load and prove the committed policy against the pinned discovery caps."""
+
+    try:
+        from dags.scripts.run_transfermarkt_discovery import (
+            validate_standing_policy_for_discovery,
+        )
+    except ModuleNotFoundError:
+        from scripts.run_transfermarkt_discovery import (
+            validate_standing_policy_for_discovery,
+        )
+    from utils.transfermarkt_approval import load_standing_policy
+
+    policy = load_standing_policy(STANDING_POLICY_PATH)
+    validate_standing_policy_for_discovery(
+        policy,
+        request_limit=PROXY_REQUEST_LIMIT,
+        retry_limit=PROXY_RETRY_LIMIT,
+    )
+    return policy
 
 
 def _load_packet(path: Path):
@@ -227,12 +272,51 @@ def _prepare_discovery(
     approval_journal: str,
     **context,
 ) -> dict[str, str]:
-    """Validate both discovery approvals without consuming either packet."""
+    """Validate both discovery approvals without consuming either packet.
+
+    A run_type=scheduled run with every packet parameter empty and the
+    TM_STANDING_POLICY_ENABLED gate on is instead covered by the committed
+    standing policy; any manual trigger keeps the one-shot ritual
+    (scripts/prepare_transfermarkt_registry_approval.py issues the packets).
+    """
 
     from utils.transfermarkt_approval import ApprovalJournal
 
     run_id = _run_id(context)
     cycle_id = _cycle_id(run_id)
+    if (
+        not any(
+            str(value or "").strip()
+            for value in (
+                paid_proxy_packet_path,
+                paid_proxy_packet_hash,
+                bronze_write_packet_path,
+                bronze_write_packet_hash,
+            )
+        )
+        and _is_scheduled_run(context)
+        and _truthy_env(STANDING_POLICY_ENV_GATE)
+    ):
+        policy = _load_validated_standing_policy()
+        checkpoint = STATE_ROOT / "checkpoints" / f"{cycle_id}.json"
+        return {
+            "TM_APPROVAL_MODE": "standing_policy",
+            "TM_CYCLE_ID": cycle_id,
+            "TM_DAG_ID": DAG_ID,
+            "TM_RUN_ID": run_id,
+            "TM_TASK_ID": DISCOVERY_TASK_ID,
+            "TM_PROXY_CONTROL_URL": _proxy_control_url(),
+            "TM_CHECKPOINT": str(checkpoint),
+            "TM_CACHE": str(CACHE_PATH),
+            "TM_OUTPUT_ROOT": str(OUTPUT_ROOT),
+            "TM_REQUEST_LIMIT": str(PROXY_REQUEST_LIMIT),
+            "TM_RETRY_LIMIT": str(PROXY_RETRY_LIMIT),
+            "TM_CACHE_TTL_SECONDS": str(CACHE_TTL_SECONDS),
+            "TM_LEASE_TTL_SECONDS": str(LEASE_TTL_SECONDS),
+            "TM_STANDING_POLICY_PATH": STANDING_POLICY_PATH,
+            "TM_STANDING_POLICY_SHA256": policy.policy_hash,
+            "TM_REQUIRE_METERED_PROXY": "true",
+        }
     paid_path = _path_under(
         _absolute_path(paid_proxy_packet_path, field="paid_proxy_packet_path"),
         APPROVAL_ROOT,
@@ -313,6 +397,7 @@ def _prepare_discovery(
         _assert_approved(journal, packet, packet_hash=packet_hash)
 
     return {
+        "TM_APPROVAL_MODE": "one_shot",
         "TM_CYCLE_ID": cycle_id,
         "TM_DAG_ID": DAG_ID,
         "TM_RUN_ID": run_id,
@@ -465,6 +550,225 @@ def _connect_trino():
     return connect()
 
 
+def _read_canonical_registry_state(connection) -> tuple[int, datetime | None]:
+    """Read the live canonical revision and promotion time before the CAS."""
+
+    from utils import transfermarkt_registry_publish as registry_publish
+
+    cursor = connection.cursor()
+    try:
+        cursor.execute(
+            "SELECT revision, promoted_at FROM "
+            f"{registry_publish.REGISTRY_STATE_TABLE} "
+            "WHERE state_key = 'canonical'"
+        )
+        rows = list(cursor.fetchall())
+    finally:
+        cursor.close()
+    if not rows:
+        # publish_registry treats a missing canonical row as revision zero.
+        return 0, None
+    if len(rows) != 1 or len(rows[0]) != 2:
+        raise AirflowException("canonical registry state must be exactly one row")
+    revision, promoted_at = rows[0][0], rows[0][1]
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+        raise AirflowException("canonical registry revision is invalid")
+    if not isinstance(promoted_at, datetime):
+        raise AirflowException("canonical registry promoted_at is invalid")
+    if promoted_at.tzinfo is None or promoted_at.utcoffset() is None:
+        # The column is timestamp(6) without zone; every writer is a UTC
+        # in-container session whose CURRENT_TIMESTAMP renders in UTC.
+        promoted_at = promoted_at.replace(tzinfo=timezone.utc)
+    return revision, promoted_at.astimezone(timezone.utc)
+
+
+def _manifest_fetched_at(manifest: Mapping[str, Any]) -> datetime:
+    """The snapshot's own capture time is the standing replay anchor."""
+
+    raw = str(manifest.get("fetched_at") or "").strip()
+    try:
+        value = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        value = None
+    if value is None or value.tzinfo is None or value.utcoffset() is None:
+        raise AirflowException(
+            "discovery manifest has no timezone-aware fetched_at anchor; "
+            "re-run discovery"
+        )
+    return value.astimezone(timezone.utc)
+
+
+def _assert_standing_publication_tables(policy, plan) -> None:
+    """Every publication write target must be covered by the standing policy.
+
+    Staging tables carry a per-manifest suffix, so each is validated as an
+    exact derivation of an allowed Silver table instead of by literal name.
+    """
+
+    from utils import transfermarkt_registry_publish as registry_publish
+
+    allowed = set(policy.allowed_write_tables)
+    silver_targets = {
+        registry_publish.COMPETITIONS_TABLE,
+        registry_publish.EDITIONS_TABLE,
+    }
+    missing = sorted(
+        (silver_targets | {registry_publish.REGISTRY_STATE_TABLE}) - allowed
+    )
+    if missing:
+        raise AirflowException(
+            f"standing policy omits publication tables: {missing}"
+        )
+    for _, staging in plan.staging_tables:
+        base, separator, suffix = str(staging).partition("__publish_")
+        if (
+            not separator
+            # Only the two Silver targets legitimately stage; a state or
+            # Bronze table with a __publish_ suffix is not a derivation.
+            or base not in silver_targets
+            or len(suffix) != 16
+            or any(character not in _DIGEST for character in suffix)
+        ):
+            raise AirflowException(
+                f"staging table is not derived from an allowed table: {staging}"
+            )
+
+
+def _publish_registry_standing(
+    *,
+    ti,
+    run_id: str,
+    cycle_id: str,
+    manifest: Mapping[str, Any],
+    manifest_path: Path,
+    manifest_hash: str,
+    competition_count: int,
+    edition_count: int,
+    revision_param: int,
+    publish_fn,
+    connection_factory,
+) -> dict[str, Any]:
+    """Publish under the committed standing policy against the live revision.
+
+    The one-shot promotion packet argv-pinned the per-run manifest hash and an
+    operator-supplied expected revision.  Standing mode replaces that binding
+    with the committed policy sha (pinned plan -> publish through
+    prepare_discovery's XCom) plus the unchanged publication gates: strict
+    manifest validation, staging and target DQ (unknown_active_count = 0
+    included), and the CAS MERGE whose mandatory readback fails the task if
+    the canonical revision moves between the read below and the swap.
+    """
+
+    from utils import transfermarkt_registry_publish as registry_publish
+
+    if revision_param != 0:
+        raise AirflowException(
+            "standing publication reads the live registry revision; "
+            "expected_registry_revision must stay 0"
+        )
+    prepared = ti.xcom_pull(task_ids="prepare_discovery")
+    if (
+        not isinstance(prepared, Mapping)
+        or prepared.get("TM_APPROVAL_MODE") != "standing_policy"
+    ):
+        raise AirflowException(
+            "standing publication requires a standing prepare_discovery run"
+        )
+    pinned_hash = _digest(
+        str(prepared.get("TM_STANDING_POLICY_SHA256") or ""),
+        field="TM_STANDING_POLICY_SHA256",
+    )
+    policy = _load_validated_standing_policy()
+    if policy.policy_hash != pinned_hash:
+        raise AirflowException(
+            "standing policy content drifted between plan and publication"
+        )
+    fetched_at = _manifest_fetched_at(manifest)
+
+    # The connection is opened only after the policy is proven, and performs
+    # one read before the plan is rendered against the live revision.
+    connection = connection_factory()
+    try:
+        revision, promoted_at = _read_canonical_registry_state(connection)
+        # One-shot replay was blocked by the consumed promotion packet; the
+        # standing equivalent is this freshness anchor: a manifest captured
+        # before the current canonical promotion must not be re-published
+        # over it by clearing an old run's publish task.
+        if promoted_at is not None and promoted_at >= fetched_at:
+            raise AirflowException(
+                "stale discovery manifest: the canonical registry was "
+                f"promoted at {promoted_at.isoformat()}, after this "
+                f"manifest's fetched_at {fetched_at.isoformat()}; "
+                "re-run discovery"
+            )
+        planned = publish_fn(
+            manifest,
+            manifest_hash=manifest_hash,
+            snapshot_id=str(manifest.get("snapshot_id") or ""),
+            competition_count=competition_count,
+            edition_count=edition_count,
+            expected_revision=revision,
+            apply=False,
+        )
+        _assert_standing_publication_tables(policy, planned.plan)
+        applied = publish_fn(
+            manifest,
+            manifest_hash=manifest_hash,
+            snapshot_id=str(manifest.get("snapshot_id") or ""),
+            competition_count=competition_count,
+            edition_count=edition_count,
+            expected_revision=revision,
+            apply=True,
+            connection=connection,
+        )
+        # apply=True re-renders the plan from disk; the executed plan must be
+        # the one whose write targets were validated above, or the evidence
+        # must not claim success (one-shot re-verified the same hash after
+        # consuming its packet).
+        if (
+            applied.plan.registry_manifest_hash
+            != planned.plan.registry_manifest_hash
+        ):
+            raise AirflowException(
+                "registry publication plan changed between validation and "
+                "apply"
+            )
+        publication_path = _publication_manifest_path(
+            cycle_id=cycle_id,
+            registry_manifest_hash=applied.plan.registry_manifest_hash,
+        )
+        evidence = {
+            "status": "success",
+            "cycle_id": cycle_id,
+            "run_id": run_id,
+            "discovery_manifest_path": str(manifest_path),
+            "discovery_manifest_hash": manifest_hash,
+            "approval_mode": "standing_policy",
+            "promotion_approval_packet_hash": None,
+            "standing_policy": {
+                "policy_hash": policy.policy_hash,
+                "policy_version": int(policy.policy_version),
+            },
+            "publication": applied.as_dict(),
+        }
+        publication_hash = registry_publish.stable_hash(evidence)
+        _atomic_json(
+            publication_path,
+            {"manifest_hash": publication_hash, "manifest": evidence},
+        )
+        return {
+            "status": "success",
+            "registry_snapshot_id": applied.plan.snapshot_id,
+            "registry_revision": applied.plan.promoted_revision,
+            "registry_manifest_hash": applied.plan.registry_manifest_hash,
+            "publication_manifest_path": str(publication_path),
+            "publication_manifest_hash": publication_hash,
+            "dq": dict(applied.dq),
+        }
+    finally:
+        connection.close()
+
+
 def _publish_registry(
     *,
     expected_revision: int,
@@ -516,6 +820,36 @@ def _publish_registry(
         expected_revision=revision,
         apply=False,
     )
+
+    params = context.get("params") or {}
+    if (
+        not any(
+            str(value or "").strip()
+            for value in (
+                params.get("paid_proxy_packet_path"),
+                params.get("paid_proxy_packet_hash"),
+                params.get("bronze_write_packet_path"),
+                params.get("bronze_write_packet_hash"),
+                promotion_write_packet_hash,
+            )
+        )
+        and _is_scheduled_run(context)
+        and _truthy_env(STANDING_POLICY_ENV_GATE)
+    ):
+        return _publish_registry_standing(
+            ti=ti,
+            run_id=run_id,
+            cycle_id=cycle_id,
+            manifest=manifest,
+            manifest_path=manifest_path,
+            manifest_hash=manifest_hash,
+            competition_count=competition_count,
+            edition_count=edition_count,
+            revision_param=revision,
+            publish_fn=publish_fn,
+            connection_factory=connection_factory or _connect_trino,
+        )
+
     publication_path = _publication_manifest_path(
         cycle_id=cycle_id,
         registry_manifest_hash=planned.plan.registry_manifest_hash,
@@ -699,13 +1033,26 @@ with DAG(
         ),
     },
     doc_md="""
-    Monthly central-registry refresh. The scheduled run fails closed until
-    separate approved paid-proxy and Bronze-write packets are supplied. The
-    proxy task is single-concurrency in `transfermarkt_proxy` and has a hard
-    15 MiB provider ledger. After discovery, create/approve the third packet
-    for the exact manifest and clear only `publish_registry`; no Silver table
-    or CAS state is touched before that packet is consumed. Unknown or
-    conflicting active classification blocks publication.
+    Monthly central-registry refresh. A manual trigger keeps the one-shot
+    ritual: the run fails closed until separate approved paid-proxy and
+    Bronze-write packets are supplied, and after discovery the third exact
+    packet must be created/approved before clearing `publish_registry`. Only
+    a run_type=scheduled run with every packet parameter empty and
+    TM_STANDING_POLICY_ENABLED=true is instead covered by the committed
+    standing policy (dags/configs/transfermarkt/standing_registry_policy.json),
+    whose caps must equal the pinned 15 MiB/1024/96 discovery limits and whose
+    sha256 is re-verified by the child before paid I/O and by publication.
+    The gate is deliberately the same key as dag_ingest_transfermarkt's: the
+    two paid contours activate together and per-DAG isolation comes from the
+    dag_id inside each policy file. Standing publication reads the live
+    canonical revision immediately before the swap; the CAS MERGE plus its
+    mandatory readback still fail on any concurrent revision change, and all
+    publication DQ gates (unknown_active_count = 0 included) are unchanged.
+    The proxy task is single-concurrency in `transfermarkt_proxy` and has a
+    hard 15 MiB provider ledger. No Silver table or CAS state is touched
+    before the promotion authorization (packet or standing policy) is proven.
+    Unknown or conflicting active classification blocks publication in both
+    modes.
     """,
 ) as dag:
     prepare_discovery_task = PythonOperator(
@@ -726,6 +1073,25 @@ with DAG(
         task_id=DISCOVERY_TASK_ID,
         bash_command=r'''set -euo pipefail
 cd /opt/airflow
+case "$TM_APPROVAL_MODE" in
+  standing_policy)
+    approval_args=(
+      --standing-policy "$TM_STANDING_POLICY_PATH"
+      --standing-policy-sha256 "$TM_STANDING_POLICY_SHA256"
+    )
+    ;;
+  one_shot)
+    approval_args=(
+      --paid-proxy-approval-packet "$TM_PAID_PACKET"
+      --production-write-approval-packet "$TM_BRONZE_PACKET"
+      --approval-journal "$TM_APPROVAL_JOURNAL"
+    )
+    ;;
+  *)
+    echo "unknown TM_APPROVAL_MODE: $TM_APPROVAL_MODE" >&2
+    exit 1
+    ;;
+esac
 exec python /opt/airflow/dags/scripts/run_transfermarkt_discovery.py \
   --cycle-id "$TM_CYCLE_ID" \
   --dag-id "$TM_DAG_ID" \
@@ -739,9 +1105,7 @@ exec python /opt/airflow/dags/scripts/run_transfermarkt_discovery.py \
   --retry-limit "$TM_RETRY_LIMIT" \
   --cache-ttl-seconds "$TM_CACHE_TTL_SECONDS" \
   --lease-ttl-seconds "$TM_LEASE_TTL_SECONDS" \
-  --paid-proxy-approval-packet "$TM_PAID_PACKET" \
-  --production-write-approval-packet "$TM_BRONZE_PACKET" \
-  --approval-journal "$TM_APPROVAL_JOURNAL"''',
+  "${approval_args[@]}"''',
         env="{{ ti.xcom_pull(task_ids='prepare_discovery') }}",
         append_env=True,
         retries=0,

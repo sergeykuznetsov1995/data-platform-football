@@ -34,6 +34,8 @@ from dags.utils.transfermarkt_approval import (
     ApprovalPacket,
     ApprovalStateError,
     ApprovalValidationError,
+    StandingPolicy,
+    load_standing_policy,
 )
 from scrapers.transfermarkt.client import (
     ProxyFilterLeaseProvider,
@@ -72,6 +74,11 @@ EDITIONS_TABLE = "iceberg.bronze.transfermarkt_competition_editions"
 TARGET_TABLES = (COMPETITIONS_TABLE, EDITIONS_TABLE)
 PAID_PRESENTED_HASH_ENV = "TM_PAID_APPROVAL_PRESENTED_HASH"
 WRITE_PRESENTED_HASH_ENV = "TM_WRITE_APPROVAL_PRESENTED_HASH"
+STANDING_POLICY_DAG_ID = "dag_discover_transfermarkt_registry"
+# Deliberately the same activation key as the ingest contour: both paid
+# Transfermarkt DAGs stand or fall together on one operator decision, and
+# per-DAG isolation comes from the dag_id pinned inside each policy file.
+STANDING_POLICY_ENV_GATE = "TM_STANDING_POLICY_ENABLED"
 _SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}$")
 
 COMPETITION_COLUMNS = (
@@ -376,6 +383,144 @@ class _OneShotAuthorization:
             pass
 
 
+def _approval_mode(args: argparse.Namespace) -> str:
+    standing = bool(args.standing_policy or args.standing_policy_sha256)
+    one_shot = bool(
+        args.paid_proxy_approval_packet
+        or args.production_write_approval_packet
+        or args.approval_journal
+    )
+    if standing and one_shot:
+        raise DiscoveryRunnerError(
+            "standing-policy and one-shot approval flags are mutually exclusive"
+        )
+    # No approval flags at all stays on the one-shot path: a dry run needs
+    # neither packet and a production run fails closed inside
+    # _OneShotAuthorization exactly as before.
+    return "standing_policy" if standing else "one_shot"
+
+
+def validate_standing_policy_for_discovery(
+    policy: StandingPolicy,
+    *,
+    request_limit: int,
+    retry_limit: int,
+) -> None:
+    """Check one standing policy against the discovery contour's exact caps."""
+
+    if policy.dag_id != STANDING_POLICY_DAG_ID:
+        raise DiscoveryRunnerError(
+            f"standing policy dag_id mismatch: {policy.dag_id!r}"
+        )
+    policy.assert_not_expired(datetime.now(timezone.utc))
+    paid = policy.paid_proxy
+    if (
+        paid.byte_cap_bytes != HARD_PROVIDER_BYTE_BUDGET
+        or paid.request_limit != int(request_limit)
+        or paid.retry_limit != int(retry_limit)
+        or paid.concurrency != CONCURRENCY
+    ):
+        raise DiscoveryRunnerError(
+            "standing policy paid_proxy caps differ from discovery limits"
+        )
+    write = policy.production_write
+    if (
+        write.byte_cap_bytes != 0
+        or write.request_limit != 0
+        or write.retry_limit != 0
+        or write.concurrency != 1
+    ):
+        raise DiscoveryRunnerError(
+            "standing policy production_write caps are unsafe"
+        )
+    missing = sorted(set(TARGET_TABLES) - set(policy.allowed_write_tables))
+    if missing:
+        raise DiscoveryRunnerError(
+            f"standing policy omits write tables: {missing}"
+        )
+
+
+def _enforce_standing_policy(args: argparse.Namespace) -> StandingPolicy:
+    """Prove the committed policy before the checkpoint, client or any I/O."""
+
+    if os.environ.get(STANDING_POLICY_ENV_GATE, "").strip().lower() not in {
+        "1", "true", "yes", "on",
+    }:
+        raise DiscoveryRunnerError(
+            f"{STANDING_POLICY_ENV_GATE} must be true before a "
+            "standing-policy discovery"
+        )
+    if not args.standing_policy:
+        raise DiscoveryRunnerError("standing_policy is required")
+    if not args.standing_policy_sha256:
+        raise DiscoveryRunnerError("standing_policy_sha256 is required")
+    policy = load_standing_policy(
+        _absolute_path(args.standing_policy, field="standing_policy")
+    )
+    if policy.policy_hash != str(args.standing_policy_sha256):
+        raise DiscoveryRunnerError(
+            "standing policy content differs from the pinned sha256"
+        )
+    validate_standing_policy_for_discovery(
+        policy,
+        request_limit=args.request_limit,
+        retry_limit=args.retry_limit,
+    )
+    return policy
+
+
+class _StandingAuthorization:
+    """Standing-policy stand-in for both one-shot discovery authorizations.
+
+    The policy is fully proven (env gate, pinned sha, caps, tables, expiry)
+    by _enforce_standing_policy before this object exists, so require() has
+    nothing left to consume and fail() has no journal to invalidate: the
+    grant lives in git and failure evidence is the hash-named manifest.
+    """
+
+    packet = None
+
+    def __init__(self, policy: StandingPolicy) -> None:
+        self.policy = policy
+        self.consumed = False
+
+    def require(self) -> None:
+        self.consumed = True
+
+    def fail(self, reason: str) -> None:
+        return None
+
+
+def _record_standing_authorization(
+    *,
+    output_root: str,
+    cycle_id: str,
+    run_id: str,
+    manifest_hash: str,
+    policy: StandingPolicy,
+) -> None:
+    """Persist which standing policy authorized this committed discovery.
+
+    Deliberately its own stable-named file: terminal manifests are hash-named,
+    so a later failed rerun of the same cycle can never overwrite this record.
+    """
+
+    _atomic_json_write(
+        Path(output_root) / cycle_id / "standing-authorization.json",
+        {
+            "status": "complete",
+            "cycle_id": cycle_id,
+            "run_id": run_id,
+            "manifest_hash": manifest_hash,
+            "approval_mode": "standing_policy",
+            "standing_policy": {
+                "policy_hash": policy.policy_hash,
+                "policy_version": int(policy.policy_version),
+            },
+        },
+    )
+
+
 def _validate_html(value: Any) -> str | None:
     if not isinstance(value, str) or not value.strip():
         return "empty HTML body"
@@ -673,10 +818,23 @@ def _failure_manifest(
     write_started: bool,
     write_completed: bool,
     writes: Sequence[Mapping[str, Any]],
-    paid_authorization: _OneShotAuthorization | None,
-    write_authorization: _OneShotAuthorization | None,
+    paid_authorization: _OneShotAuthorization | _StandingAuthorization | None,
+    write_authorization: _OneShotAuthorization | _StandingAuthorization | None,
 ) -> dict[str, Any]:
     """Build non-ambiguous terminal evidence without claiming empty source data."""
+
+    standing_policy_hash = (
+        paid_authorization.policy.policy_hash
+        if isinstance(paid_authorization, _StandingAuthorization)
+        else None
+    )
+    try:
+        # The mode the run *attempted*: an enforcement failure (gate off, sha
+        # drift) happens before any authorization object exists, yet the
+        # evidence must still attribute the failure to the standing path.
+        approval_mode: str | None = _approval_mode(args)
+    except DiscoveryRunnerError:
+        approval_mode = None
 
     if not source_started:
         source_status = "not_started"
@@ -775,6 +933,8 @@ def _failure_manifest(
             and write_authorization.packet is not None
             else None
         ),
+        "approval_mode": approval_mode,
+        "standing_policy_hash": standing_policy_hash,
     }
 
 
@@ -832,28 +992,39 @@ def _execute_once(
         output_root,
         journal_path or "not-used-dry-run-approval-journal",
     )
-    paid_authorization = _OneShotAuthorization(
-        packet_path=paid_packet_path,
-        journal_path=journal_path,
-        execution_argv=execution_argv,
-        expected_action="paid_proxy",
-        required=not bool(args.dry_run),
-        request_limit=args.request_limit,
-        retry_limit=args.retry_limit,
-        affected_files=affected_files,
-        presented_hash=os.environ.get(PAID_PRESENTED_HASH_ENV),
-    )
-    write_authorization = _OneShotAuthorization(
-        packet_path=write_packet_path,
-        journal_path=journal_path,
-        execution_argv=execution_argv,
-        expected_action="production_write",
-        required=not bool(args.dry_run),
-        request_limit=args.request_limit,
-        retry_limit=args.retry_limit,
-        affected_files=affected_files,
-        presented_hash=os.environ.get(WRITE_PRESENTED_HASH_ENV),
-    )
+    approval_mode = _approval_mode(args)
+    standing_policy: StandingPolicy | None = None
+    paid_authorization: _OneShotAuthorization | _StandingAuthorization
+    write_authorization: _OneShotAuthorization | _StandingAuthorization
+    if approval_mode == "standing_policy":
+        # The env gate, pinned sha, caps and table checks all fail here,
+        # before the checkpoint, cache, lease client or any paid I/O exist.
+        standing_policy = _enforce_standing_policy(args)
+        paid_authorization = _StandingAuthorization(standing_policy)
+        write_authorization = paid_authorization
+    else:
+        paid_authorization = _OneShotAuthorization(
+            packet_path=paid_packet_path,
+            journal_path=journal_path,
+            execution_argv=execution_argv,
+            expected_action="paid_proxy",
+            required=not bool(args.dry_run),
+            request_limit=args.request_limit,
+            retry_limit=args.retry_limit,
+            affected_files=affected_files,
+            presented_hash=os.environ.get(PAID_PRESENTED_HASH_ENV),
+        )
+        write_authorization = _OneShotAuthorization(
+            packet_path=write_packet_path,
+            journal_path=journal_path,
+            execution_argv=execution_argv,
+            expected_action="production_write",
+            required=not bool(args.dry_run),
+            request_limit=args.request_limit,
+            retry_limit=args.retry_limit,
+            affected_files=affected_files,
+            presented_hash=os.environ.get(WRITE_PRESENTED_HASH_ENV),
+        )
 
     checkpoint = AtomicJsonMapping(checkpoint_path)
     cache = AtomicJsonMapping(cache_path)
@@ -969,6 +1140,11 @@ def _execute_once(
             "expected_entities": list(EXPECTED_ENTITIES),
             "snapshot_id": snapshot.snapshot_id,
             "snapshot_hash": snapshot.snapshot_hash,
+            # The snapshot's own timezone-aware capture time: standing
+            # publication compares it with the canonical state's promoted_at
+            # so a cleared publish task of an old run cannot replay a stale
+            # snapshot over a newer promotion.
+            "fetched_at": fetched_at.isoformat(),
             "page_count": snapshot.page_count,
             "source_body_hashes": list(snapshot.source_body_hashes),
             "rows": {
@@ -1016,10 +1192,26 @@ def _execute_once(
                 write_authorization.packet.packet_hash
                 if write_authorization.packet is not None else None
             ),
+            "approval_mode": approval_mode,
+            "standing_policy_hash": (
+                standing_policy.policy_hash
+                if standing_policy is not None else None
+            ),
         }
         manifest_path, manifest_hash = _manifest_output(
             output_root, cycle_id, manifest
         )
+        # The record attests an authorized production write under the policy;
+        # a dry run writes nothing, so leaving no record is the honest state —
+        # a "complete" record from a dry run could pass for write evidence.
+        if standing_policy is not None and not bool(args.dry_run):
+            _record_standing_authorization(
+                output_root=output_root,
+                cycle_id=cycle_id,
+                run_id=str(args.run_id),
+                manifest_hash=manifest_hash,
+                policy=standing_policy,
+            )
         return DiscoveryRunResult(
             manifest_path=manifest_path,
             manifest_hash=manifest_hash,
@@ -1166,6 +1358,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--paid-proxy-approval-packet")
     parser.add_argument("--production-write-approval-packet")
     parser.add_argument("--approval-journal")
+    parser.add_argument("--standing-policy")
+    parser.add_argument("--standing-policy-sha256")
     parser.add_argument("--dry-run", action="store_true")
     return parser
 
