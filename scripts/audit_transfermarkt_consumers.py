@@ -64,11 +64,14 @@ LEGACY_RELATION_RE = re.compile(
 
 # These files either populate/verify the compatibility tables or bootstrap
 # native rows from them. Their legacy reads are required until cleanup.
+# transfermarkt_bronze_dq verifies the legacy Bronze relations (phantom
+# (league, season) pairs and intra-batch duplicates) for the #948 gate.
 LEGACY_WRITER_ALLOWLIST = frozenset({
     'dags/dag_ingest_transfermarkt.py',
     'dags/dag_transform_transfermarkt_silver.py',
     'dags/scripts/run_transfermarkt_scope_cycle.py',
     'dags/scripts/run_transfermarkt_scraper.py',
+    'dags/utils/transfermarkt_bronze_dq.py',
     'dags/utils/transfermarkt_native_v2.py',
     'scrapers/transfermarkt/scraper.py',
     'scripts/transfermarkt_native_v2.py',
@@ -128,8 +131,16 @@ PHYSICAL_V2_RELATION_RE = re.compile(
     r'[a-zA-Z0-9_]+_v2(?:_[ab])?(?![A-Za-z0-9_])',
     re.IGNORECASE,
 )
+# transfermarkt_market_value_history.sql is the retained legacy rollback
+# transform, but it reads the non-slotted promoted Silver registry
+# (transfermarkt_competitions_v2) to pick the season formula, so it is also
+# a physical-v2 control reader. transfermarkt_bronze_dq anti-joins native
+# Bronze against the same non-slotted registry relations for the #948
+# cross-table DQ gate.
 PHYSICAL_V2_CONTROL_ALLOWLIST = frozenset({
     'dags/dag_transform_transfermarkt_silver.py',
+    'dags/sql/silver/transfermarkt_market_value_history.sql',
+    'dags/utils/transfermarkt_bronze_dq.py',
     'dags/utils/transfermarkt_native_v2.py',
     'dags/utils/transfermarkt_registry_publish.py',
     'dags/utils/transfermarkt_scope_planner.py',
@@ -152,7 +163,14 @@ CANONICAL_RELATION_RE = re.compile(
 
 
 def _mask(lines: list[str], start: tuple[int, int], end: tuple[int, int]) -> None:
-    """Replace a source span with spaces while preserving line positions."""
+    """Replace a source span with spaces while preserving line positions.
+
+    Line terminators inside the span are preserved: the comment pass
+    tokenizes the docstring-masked text, so a mask that swallowed the
+    newlines of a multi-line docstring shifted every later token
+    coordinate and silently misplaced comment masks (fail-open: relation
+    mentions in comments escaped masking while runtime lines got masked).
+    """
     start_line, start_col = start
     end_line, end_col = end
     for line_no in range(start_line, end_line + 1):
@@ -161,11 +179,9 @@ def _mask(lines: list[str], start: tuple[int, int], end: tuple[int, int]) -> Non
             break
         left = start_col if line_no == start_line else 0
         right = end_col if line_no == end_line else len(lines[index])
-        lines[index] = (
-            lines[index][:left]
-            + ' ' * max(0, right - left)
-            + lines[index][right:]
-        )
+        segment = lines[index][left:right]
+        masked = ''.join(char if char in '\r\n' else ' ' for char in segment)
+        lines[index] = lines[index][:left] + masked + lines[index][right:]
 
 
 def _python_runtime_text(text: str) -> str:

@@ -218,7 +218,8 @@ def test_shadow_gold_is_built_and_ready_marker_is_a_leaf():
     persisted = _task('persist_scope_set_manifest')
     assert capture.upstream_task_ids == {'validate_transform_scope_set'}
     assert pins.upstream_task_ids == {'capture_reader_state'}
-    assert approval.upstream_task_ids == {'pin_transform_input_snapshots'}
+    # #948: the Bronze DQ gate sits between the pins and the write approval.
+    assert approval.upstream_task_ids == {'validate_bronze_quality'}
     assert persisted.upstream_task_ids == {'authorize_silver_writes'}
     assert gold_approval.upstream_task_ids == {'validate_native_v2_quality'}
     for task_id, _, _, _ in mod.NATIVE_V2_GOLD_TRANSFORMS:
