@@ -80,6 +80,7 @@ from scrapers.fbref.settings import (
     MAX_CLEARANCE_SOLVE_ATTEMPTS,
     MAX_SHARD_SIZE,
     MIB,
+    bootstrap_byte_reservation_for,
     bootstrap_reservation_for,
 )
 from scrapers.fbref.typed_bronze import (
@@ -110,6 +111,8 @@ SENTINEL_COMPETITIONS = (
 # fence and renew all outstanding sequential leases before every target.
 FETCH_LEASE_SECONDS = 60 * 60
 PROCESSING_LEASE_SECONDS = 60 * 60
+REPLAY_SOURCE_REQUEST_LIMIT = 200
+REPLAY_SOURCE_BYTE_LIMIT = 100 * MIB
 
 # Statuses Cloudflare returns when it no longer honours a cf_clearance for the
 # warm HTTP session. They say nothing about the target page — only that this
@@ -152,6 +155,7 @@ class PipelineSettings:
     request_reservation_bytes: int = DEFAULT_REQUEST_RESERVATION_BYTES
     domain_interval_seconds: float = DEFAULT_DOMAIN_INTERVAL_SECONDS
     bootstrap_request_reservation: Optional[int] = None
+    bootstrap_byte_reservation: Optional[int] = None
     target_request_reservation: int = MAX_TARGET_HTTP_ATTEMPTS
     proxy_file: Optional[str] = None
 
@@ -165,6 +169,12 @@ class PipelineSettings:
                 "bootstrap_request_reservation",
                 bootstrap_reservation_for(self.request_limit),
             )
+        if self.bootstrap_byte_reservation is None:
+            object.__setattr__(
+                self,
+                "bootstrap_byte_reservation",
+                bootstrap_byte_reservation_for(self.request_limit),
+            )
         if self.run_type not in {"current", "backfill", "replay"}:
             raise ValueError("run_type must be current, backfill, or replay")
         if self.request_limit < 0 or self.byte_limit < 0:
@@ -177,10 +187,51 @@ class PipelineSettings:
             raise ValueError("domain_interval_seconds must be positive")
         if self.bootstrap_request_reservation < 1:
             raise ValueError("bootstrap_request_reservation must be positive")
+        if self.bootstrap_byte_reservation < 1:
+            raise ValueError("bootstrap_byte_reservation must be positive")
         if self.target_request_reservation != MAX_TARGET_HTTP_ATTEMPTS:
             raise ValueError(
                 "target_request_reservation must cover both HTTP attempts"
             )
+
+
+BACKFILL_SEASON_COHORT_RESERVATION_BYTES = 7 * MIB
+
+
+def backfill_season_cohort_capacity(
+    settings: PipelineSettings,
+    *,
+    request_remaining: Optional[int] = None,
+    byte_remaining: Optional[int] = None,
+) -> int:
+    """Bound historical season roots independently from warm page batches.
+
+    A season root expands into schedules, squads, players, matchlogs, and
+    matches.  Its admission contract therefore remains the production-tested
+    conservative 7 MiB aggregate allowance instead of pretending that one
+    season is one 3 MiB HTTP target.  This preserves deterministic 7/14
+    canary/production dry-run cohorts while child pages are still fetched
+    sequentially by the warm runner under the real shared budget.
+    """
+
+    available = (
+        settings.byte_limit
+        if byte_remaining is None
+        else max(0, int(byte_remaining))
+    )
+    requests = (
+        settings.request_limit
+        if request_remaining is None
+        else max(0, int(request_remaining))
+    )
+    request_capacity = max(
+        0, requests - settings.bootstrap_request_reservation
+    ) // settings.target_request_reservation
+    return min(
+        settings.shard_size,
+        request_capacity,
+        available // BACKFILL_SEASON_COHORT_RESERVATION_BYTES,
+    )
 
 
 def wave_target_capacity(
@@ -188,6 +239,7 @@ def wave_target_capacity(
     *,
     request_remaining: Optional[int] = None,
     byte_remaining: Optional[int] = None,
+    bootstrap_required: bool = True,
 ) -> int:
     """Return the exact cohort that the current request/byte budget can fund."""
 
@@ -201,12 +253,65 @@ def wave_target_capacity(
         if byte_remaining is None
         else max(0, int(byte_remaining))
     )
-    byte_capacity = bytes_available // settings.request_reservation_bytes
+    bootstrap_requests = (
+        settings.bootstrap_request_reservation if bootstrap_required else 0
+    )
+    bootstrap_bytes = (
+        settings.bootstrap_byte_reservation if bootstrap_required else 0
+    )
+    byte_capacity = max(
+        0,
+        bytes_available - bootstrap_bytes,
+    ) // settings.request_reservation_bytes
     request_capacity = (
-        max(0, requests - settings.bootstrap_request_reservation)
+        max(0, requests - bootstrap_requests)
         // settings.target_request_reservation
     )
     return min(settings.shard_size, request_capacity, byte_capacity)
+
+
+def live_wave_target_capacity(
+    settings: PipelineSettings,
+    *,
+    request_remaining: Optional[int] = None,
+    byte_remaining: Optional[int] = None,
+    bootstrap_required: bool = True,
+) -> int:
+    """Admit sequential warm-session pages without double-counting bytes.
+
+    A live wave reserves one target at a time and settles that reservation
+    before the next target.  The old capacity calculation divided the whole
+    run's byte budget by the per-target safety reservation, so a 50 MiB
+    canary admitted only seven pages per warm session despite a 25-page shard.
+    The byte guard still rejects a target when less than one reservation
+    remains; the control store enforces the real cumulative byte limit.
+    """
+
+    requests = (
+        settings.request_limit
+        if request_remaining is None
+        else max(0, int(request_remaining))
+    )
+    bytes_available = (
+        settings.byte_limit
+        if byte_remaining is None
+        else max(0, int(byte_remaining))
+    )
+    initial_bytes = settings.request_reservation_bytes + (
+        settings.bootstrap_byte_reservation if bootstrap_required else 0
+    )
+    if bytes_available < initial_bytes:
+        return 0
+    request_capacity = max(
+        0,
+        requests
+        - (
+            settings.bootstrap_request_reservation
+            if bootstrap_required
+            else 0
+        ),
+    )
+    return min(settings.shard_size, request_capacity)
 
 
 @dataclass
@@ -229,10 +334,50 @@ class WaveResult:
     budget_exhausted: bool = False
     requeued_at_budget: int = 0
     requeued_dead_clearance: int = 0
+    requeued_session_exhaustion: int = 0
     failures: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict:
         return asdict(self)
+
+
+@dataclass
+class LiveRunResult:
+    batches: int = 0
+    frontier_closed: bool = False
+    fetch: WaveResult = field(default_factory=WaveResult)
+    parse: WaveResult = field(default_factory=WaveResult)
+
+    def as_dict(self) -> dict:
+        return {
+            "batches": self.batches,
+            "frontier_closed": self.frontier_closed,
+            "fetch": self.fetch.as_dict(),
+            "parse": self.parse.as_dict(),
+        }
+
+
+@dataclass
+class _LiveFetchSession:
+    stack: ExitStack = field(default_factory=ExitStack)
+    fetcher: Optional[object] = None
+    session_id: Optional[str] = None
+    clearance_refreshes: int = 0
+    needs_clearance: bool = True
+
+    def close(self, control, *, status: str) -> None:
+        try:
+            self.stack.close()
+        finally:
+            self.fetcher = None
+            if self.session_id is not None:
+                try:
+                    control.close_clearance_session(
+                        self.session_id, status=status
+                    )
+                finally:
+                    self.session_id = None
+            self.needs_clearance = True
 
 
 def _utcnow() -> datetime:
@@ -279,13 +424,17 @@ def _registry_snapshot_id(record: RawFetchRecord) -> str:
     )
 
 
-def _clearance_rejected(exc: FetchError) -> bool:
-    """True when the failure means the clearance died, not that the page did."""
+def _session_failure(exc: FetchError) -> bool:
+    """True when the failure belongs to the clearance, not the target page."""
 
-    return (
+    return exc.error_class in {
+        "clearance_failed",
+        "clearance_export_failed",
+        "raw_contract_cloudflare_challenge",
+    } or (
         exc.error_class == "http_status"
         and exc.http_status in CLEARANCE_REJECTED_STATUSES
-    )
+    ) or exc.error_class.startswith("warm_session_")
 
 
 def _sentinel_gate_errors(coverage: object) -> list[str]:
@@ -518,9 +667,10 @@ class FBrefPipeline:
         self.generic_writer = generic_writer or FBrefGenericBronzeWriter()
         self.typed_adapter = typed_adapter or FBrefTypedBronzeAdapter()
         self.fetcher_factory = fetcher_factory or (
-            lambda proxy_file, max_browser_requests: FBrefFetcher(
+            lambda proxy_file, max_browser_requests, max_browser_bytes: FBrefFetcher(
                 proxy_file=proxy_file,
                 max_browser_requests=max_browser_requests,
+                max_browser_bytes=max_browser_bytes,
             )
         )
         self.sleep = sleep
@@ -585,7 +735,7 @@ class FBrefPipeline:
         return target.target_id
 
     def _replay_source_error(self, source_run_id: Optional[str]) -> Optional[str]:
-        """Return a fail-closed source-run contract error, if any."""
+        """Require one fully accepted production source run for replay."""
 
         if not source_run_id:
             return "replay_source_run_id_missing"
@@ -599,8 +749,44 @@ class FBrefPipeline:
         if run_type not in {"current", "backfill"}:
             return f"replay_source_run_type_forbidden={run_type}"
         status = str(source_run.get("status") or "unknown").lower()
-        if status not in {"succeeded", "failed", "cancelled"}:
-            return f"replay_source_run_not_terminal={status}"
+        if status != "succeeded":
+            return f"replay_source_run_not_succeeded={status}"
+        try:
+            source_request_limit = int(source_run.get("request_limit"))
+            source_byte_limit = int(source_run.get("byte_limit"))
+        except (TypeError, ValueError):
+            return "replay_source_run_not_production_profile"
+        if source_request_limit != REPLAY_SOURCE_REQUEST_LIMIT or (
+            source_byte_limit != REPLAY_SOURCE_BYTE_LIMIT
+        ):
+            return "replay_source_run_not_production_profile"
+        metadata = source_run.get("metadata")
+        if not isinstance(metadata, Mapping):
+            return "replay_source_raw_audit_missing"
+        raw_audit = metadata.get("raw_audit")
+        if not isinstance(raw_audit, Mapping):
+            return "replay_source_raw_audit_missing"
+        try:
+            successful_attempt_count = int(
+                raw_audit.get("successful_attempt_count")
+            )
+            audited_attempt_count = int(raw_audit.get("audited_attempt_count"))
+        except (TypeError, ValueError):
+            return "replay_source_raw_audit_not_accepted"
+        if (
+            str(raw_audit.get("schema_version") or "")
+            != "fbref-raw-audit-anchor-v1"
+            or str(raw_audit.get("status") or "").casefold() != "passed"
+            or str(raw_audit.get("run_type") or "").casefold() != run_type
+            or raw_audit.get("zero_delta_required") is not False
+            or successful_attempt_count <= 0
+            or audited_attempt_count <= 0
+            or str(raw_audit.get("audited_control_run_id") or "")
+            != str(source_run_id)
+            or str(raw_audit.get("processing_control_run_id") or "")
+            != str(source_run_id)
+        ):
+            return "replay_source_raw_audit_not_accepted"
         return None
 
     def seed_historical_seasons(
@@ -614,8 +800,28 @@ class FBrefPipeline:
 
         if settings.run_type != "backfill":
             raise ValueError("Historical season seeding requires backfill mode")
+        run = self.control.get_run(run_id)
+        if run is None:
+            raise PipelineError(f"Unknown control run {run_id}")
+        request_remaining = max(
+            0,
+            int(run["request_limit"])
+            - int(run.get("requests_used") or 0)
+            - int(run.get("requests_reserved") or 0),
+        )
+        byte_remaining = max(
+            0,
+            int(run["byte_limit"])
+            - int(run.get("bytes_used") or 0)
+            - int(run.get("bytes_reserved") or 0),
+        )
         safe_limit = min(
-            int(limit), self._remaining_wave_limit(run_id, settings)
+            int(limit),
+            backfill_season_cohort_capacity(
+                settings,
+                request_remaining=request_remaining,
+                byte_remaining=byte_remaining,
+            ),
         )
         rows = (
             []
@@ -654,7 +860,11 @@ class FBrefPipeline:
         return {"seeded": len(rows), "auto_resume": True}
 
     def _remaining_wave_limit(
-        self, run_id: str, settings: PipelineSettings
+        self,
+        run_id: str,
+        settings: PipelineSettings,
+        *,
+        bootstrap_required: bool = True,
     ) -> int:
         run = self.control.get_run(run_id)
         if run is None:
@@ -671,10 +881,16 @@ class FBrefPipeline:
             - int(run.get("bytes_used") or 0)
             - int(run.get("bytes_reserved") or 0),
         )
-        return wave_target_capacity(
+        capacity = (
+            live_wave_target_capacity
+            if settings.run_type == "current"
+            else wave_target_capacity
+        )
+        return capacity(
             settings,
             request_remaining=request_remaining,
             byte_remaining=byte_remaining,
+            bootstrap_required=bootstrap_required,
         )
 
     def _wait_for_slot(self, scheduled_at: datetime) -> None:
@@ -745,6 +961,7 @@ class FBrefPipeline:
         worker_id: str,
         page_kinds: Sequence[str],
         settings: PipelineSettings,
+        _live_session: Optional[_LiveFetchSession] = None,
     ) -> WaveResult:
         """Fetch one bounded cohort and commit raw before control success."""
 
@@ -791,7 +1008,14 @@ class FBrefPipeline:
                 raise FetchWaveError(
                     f"Run has {unfinished} unfinished target(s) that are not claimable"
                 )
-            limit = self._remaining_wave_limit(run_id, settings)
+            limit = self._remaining_wave_limit(
+                run_id,
+                settings,
+                bootstrap_required=(
+                    _live_session is None
+                    or _live_session.needs_clearance
+                ),
+            )
             if limit <= 0:
                 return result
             cohort = self.control.create_due_run_cohort(
@@ -818,10 +1042,8 @@ class FBrefPipeline:
             raise FetchWaveError(
                 f"Claimed {len(leases)} of {result.cohort_size} cohort targets"
             )
-        session_id: Optional[str] = None
-        fetcher = None
-        clearance_refreshes = 0
-        stack = ExitStack()
+        owns_session = _live_session is None
+        live_session = _live_session or _LiveFetchSession()
         try:
             for lease_index, lease in enumerate(leases):
                 # A wave owns the whole shard but processes it sequentially.
@@ -865,7 +1087,12 @@ class FBrefPipeline:
 
                     reserved_requests = settings.target_request_reservation + (
                         settings.bootstrap_request_reservation
-                        if fetcher is None
+                        if live_session.needs_clearance
+                        else 0
+                    )
+                    reserved_bytes = settings.request_reservation_bytes + (
+                        settings.bootstrap_byte_reservation
+                        if live_session.needs_clearance
                         else 0
                     )
                     reservation = self.control.reserve_budget(
@@ -873,7 +1100,7 @@ class FBrefPipeline:
                         lease.logical_refresh_id,
                         attempt_id=lease.attempt_id,
                         requests=reserved_requests,
-                        bytes_=settings.request_reservation_bytes,
+                        bytes_=reserved_bytes,
                     )
                     self.control.bind_reservation(
                         lease, reservation.reservation_id
@@ -884,21 +1111,31 @@ class FBrefPipeline:
                     )
                     self._wait_for_slot(slot.scheduled_at)
 
-                    if fetcher is None:
-                        session_id = self.control.open_clearance_session(
-                            domain="fbref.com",
-                            session_version=FETCHER_VERSION,
-                            expires_at=_as_utc(self.clock()) + timedelta(hours=1),
-                            run_id=run_id,
-                            metadata={"worker_id": worker_id},
-                        )
-                        fetcher = stack.enter_context(
-                            self.fetcher_factory(
-                                settings.proxy_file,
-                                settings.bootstrap_request_reservation,
+                    if live_session.needs_clearance:
+                        live_session.session_id = (
+                            self.control.open_clearance_session(
+                                domain="fbref.com",
+                                session_version=FETCHER_VERSION,
+                                expires_at=(
+                                    _as_utc(self.clock())
+                                    + timedelta(hours=1)
+                                ),
+                                run_id=run_id,
+                                metadata={"worker_id": worker_id},
                             )
                         )
-                    response = fetcher.fetch(
+                        if live_session.fetcher is None:
+                            live_session.fetcher = (
+                                live_session.stack.enter_context(
+                                    self.fetcher_factory(
+                                        settings.proxy_file,
+                                        settings.bootstrap_request_reservation,
+                                        settings.bootstrap_byte_reservation,
+                                    )
+                                )
+                            )
+                        live_session.needs_clearance = False
+                    response = live_session.fetcher.fetch(
                         lease.canonical_url,
                         page_kind=lease.page_kind,
                         etag=frontier.get("last_etag"),
@@ -925,7 +1162,7 @@ class FBrefPipeline:
                         ),
                         base_content_hash=frontier.get("last_content_hash"),
                         transport_version=FETCHER_VERSION,
-                        session_version=session_id,
+                        session_version=live_session.session_id,
                     )
                     billed = (
                         response.provider_billed_bytes
@@ -943,9 +1180,9 @@ class FBrefPipeline:
                         bytes_used=billed,
                     )
                     budget_settled = True
-                    if session_id is not None:
+                    if live_session.session_id is not None:
                         self.control.record_session_metrics(
-                            session_id,
+                            live_session.session_id,
                             browser_bootstrap_requests=response.browser_requests,
                             browser_bootstrap_attempts=(
                                 response.browser_bootstrap_attempts
@@ -1016,9 +1253,9 @@ class FBrefPipeline:
                             ),
                             bytes_used=billed,
                         )
-                    if session_id is not None:
+                    if live_session.session_id is not None:
                         self.control.record_session_metrics(
-                            session_id,
+                            live_session.session_id,
                             browser_bootstrap_requests=exc.browser_requests,
                             browser_bootstrap_attempts=(
                                 exc.browser_bootstrap_attempts
@@ -1034,30 +1271,6 @@ class FBrefPipeline:
                             http_wire_bytes=max(0, int(exc.wire_bytes)),
                             provider_billed_bytes=exc.provider_billed_bytes,
                         )
-                    # A clearance the source stopped honouring says nothing
-                    # about the page: record the attempt, but hand the target
-                    # straight back to the queue instead of failing it.
-                    dead_clearance = (
-                        _clearance_rejected(exc)
-                        and fetcher is not None
-                        and clearance_refreshes < MAX_CLEARANCE_REFRESHES
-                    )
-                    self.control.fail_fetch(
-                        lease,
-                        error_class=exc.error_class,
-                        error_message=str(exc),
-                        retry_delay_seconds=60,
-                        permanent=(exc.error_class == "response_too_large"),
-                        requeue=dead_clearance,
-                        http_status=exc.http_status,
-                        http_request_count=exc.http_requests,
-                        http_status_history=exc.http_status_history,
-                        wire_bytes=exc.wire_bytes,
-                        provider_billed_bytes=exc.provider_billed_bytes,
-                        latency_ms=exc.latency_ms,
-                        transport_version=FETCHER_VERSION,
-                        session_version=session_id,
-                    )
                     result.requests += (
                         exc.http_requests + exc.browser_requests
                     )
@@ -1071,32 +1284,118 @@ class FBrefPipeline:
                     result.browser_bootstraps += (
                         exc.browser_bootstrap_attempts
                     )
-                    if dead_clearance:
-                        # Cloudflare stopped honouring this clearance mid-wave
-                        # (its exit IP fell out of favour). Every remaining
-                        # target would 403 against the same dead session — one
-                        # rejected exit IP burned a whole wave in production.
-                        # Drop the session here; the next target solves again on
-                        # a fresh proxy. Bounded: a source that rejects every
-                        # clearance must fail the wave, not spawn browsers.
-                        clearance_refreshes += 1
+                    if _session_failure(exc):
+                        # The attempt is real traffic evidence, but the page
+                        # itself was never judged. Keep the same immutable
+                        # logical refresh claimable in this run and retry it
+                        # before any untouched member of the shard.
+                        self.control.retry_session_fetch(
+                            lease,
+                            error_class=exc.error_class,
+                            error_message=str(exc),
+                            http_status=exc.http_status,
+                            http_request_count=exc.http_requests,
+                            http_status_history=exc.http_status_history,
+                            wire_bytes=exc.wire_bytes,
+                            provider_billed_bytes=exc.provider_billed_bytes,
+                            latency_ms=exc.latency_ms,
+                            transport_version=FETCHER_VERSION,
+                            session_version=live_session.session_id,
+                        )
+                        live_session.clearance_refreshes += 1
                         result.requeued_dead_clearance += 1
                         logger.warning(
-                            "FBref rejected the warm clearance (HTTP %s) — "
-                            "%s went back to the queue and the session is being "
+                            "FBref clearance failed (%s, HTTP %s) — "
+                            "%s stays in this run and the session is being "
                             "re-solved on a fresh proxy (refresh %d/%d)",
+                            exc.error_class,
                             exc.http_status,
                             lease.target_id,
-                            clearance_refreshes,
+                            live_session.clearance_refreshes,
                             MAX_CLEARANCE_REFRESHES,
                         )
-                        stack.close()
-                        fetcher = None
-                        self.control.close_clearance_session(
-                            session_id, status="failed"
+                        if live_session.session_id is not None:
+                            self.control.close_clearance_session(
+                                live_session.session_id,
+                                status="failed",
+                            )
+                            live_session.session_id = None
+                        if (
+                            live_session.clearance_refreshes
+                            > MAX_CLEARANCE_REFRESHES
+                        ):
+                            untouched = leases[lease_index + 1:]
+                            result.requeued_session_exhaustion += (
+                                self.control.requeue_unfetched_targets(
+                                    untouched
+                                )
+                            )
+                            result.failures.append(
+                                "clearance_session_refreshes_exhausted="
+                                f"{MAX_CLEARANCE_REFRESHES}"
+                            )
+                            break
+
+                        reset = getattr(
+                            live_session.fetcher,
+                            "reset_clearance",
+                            None,
                         )
-                        session_id = None
+                        if callable(reset):
+                            reset()
+                        else:
+                            live_session.stack.close()
+                            live_session.stack = ExitStack()
+                            live_session.fetcher = None
+                        live_session.needs_clearance = True
+
+                        retry_leases = self.control.claim_targets(
+                            run_id,
+                            worker_id,
+                            limit=1,
+                            lease_seconds=FETCH_LEASE_SECONDS,
+                            page_kinds=page_kinds,
+                            refresh_policies=policies,
+                        )
+                        if (
+                            len(retry_leases) != 1
+                            or retry_leases[0].logical_refresh_id
+                            != lease.logical_refresh_id
+                        ):
+                            if retry_leases:
+                                self.control.requeue_unfetched_targets(
+                                    retry_leases
+                                )
+                            untouched = leases[lease_index + 1:]
+                            result.requeued_session_exhaustion += (
+                                self.control.requeue_unfetched_targets(
+                                    untouched
+                                )
+                            )
+                            result.failures.append(
+                                "clearance_retry_claim_mismatch"
+                            )
+                            break
+                        leases.insert(lease_index + 1, retry_leases[0])
                     else:
+                        self.control.fail_fetch(
+                            lease,
+                            error_class=exc.error_class,
+                            error_message=str(exc),
+                            retry_delay_seconds=60,
+                            permanent=(
+                                exc.error_class == "response_too_large"
+                            ),
+                            requeue=False,
+                            http_status=exc.http_status,
+                            http_request_count=exc.http_requests,
+                            http_status_history=exc.http_status_history,
+                            wire_bytes=exc.wire_bytes,
+                            provider_billed_bytes=exc.provider_billed_bytes,
+                            latency_ms=exc.latency_ms,
+                            transport_version=FETCHER_VERSION,
+                            session_version=live_session.session_id,
+                        )
                         result.failures.append(
                             f"{lease.target_id}:{exc.error_class}"
                         )
@@ -1150,22 +1449,90 @@ class FBrefPipeline:
                             None if response is None else FETCHER_VERSION
                         ),
                         session_version=(
-                            None if response is None else session_id
+                            None
+                            if response is None
+                            else live_session.session_id
                         ),
                     )
                     result.failures.append(
                         f"{lease.target_id}:{type(exc).__name__}"
                     )
         finally:
-            stack.close()
-            if session_id is not None:
-                self.control.close_clearance_session(
-                    session_id,
+            if owns_session:
+                live_session.close(
+                    self.control,
                     status="failed" if result.failures else "closed",
                 )
         if result.failures:
             raise FetchWaveError("; ".join(result.failures))
         return result
+
+    @staticmethod
+    def _merge_wave_result(target: WaveResult, source: WaveResult) -> None:
+        for name in WaveResult.__dataclass_fields__:
+            value = getattr(source, name)
+            if name == "failures":
+                target.failures.extend(value)
+            elif isinstance(value, bool):
+                setattr(target, name, bool(getattr(target, name)) or value)
+            else:
+                setattr(target, name, int(getattr(target, name)) + int(value))
+
+    def run_live_waves(
+        self,
+        run_id: str,
+        *,
+        worker_id: str,
+        page_kinds: Sequence[str],
+        settings: PipelineSettings,
+        max_batches: int = 16,
+    ) -> LiveRunResult:
+        """Fetch raw and parse offline in one warm, bounded process.
+
+        The fetcher and its proxy quarantine live across batches. Each batch
+        still commits every raw object before the parser receives its manifest,
+        and parser discovery becomes eligible for the next batch.
+        """
+
+        if settings.run_type == "replay":
+            raise PipelineError("Replay mode cannot execute live waves")
+        normalized_batches = int(max_batches)
+        if not 1 <= normalized_batches <= 16:
+            raise ValueError("max_batches must be between 1 and 16")
+
+        aggregate = LiveRunResult()
+        live_session = _LiveFetchSession()
+        failed = True
+        try:
+            for batch in range(1, normalized_batches + 1):
+                fetched = self.fetch_wave(
+                    run_id,
+                    worker_id=f"{worker_id}:batch-{batch:02d}",
+                    page_kinds=page_kinds,
+                    settings=settings,
+                    _live_session=live_session,
+                )
+                parsed = self.parse_wave(
+                    run_id,
+                    page_kinds=page_kinds,
+                    settings=settings,
+                )
+                aggregate.batches = batch
+                self._merge_wave_result(aggregate.fetch, fetched)
+                self._merge_wave_result(aggregate.parse, parsed)
+
+                if fetched.budget_exhausted:
+                    break
+                if fetched.claimed == 0 and parsed.cohort_size == 0:
+                    aggregate.frontier_closed = True
+                    break
+            failed = False
+            return aggregate
+        finally:
+            live_session.close(
+                self.control,
+                status="failed" if failed else "closed",
+            )
 
     def _eligible_competitions(self) -> dict[str, dict]:
         return {
@@ -1457,6 +1824,14 @@ class FBrefPipeline:
                         entry.season_id,
                     ),
                 )
+                # Source IDs and display labels share one alias namespace.
+                # Never let a shifted label reinterpret another canonical
+                # source season (for example Club World Cup 2021/"2022").
+                if (
+                    label in registered_season_ids
+                    and canonical.season_id != label
+                ):
+                    continue
                 upsert_alias(SeasonAlias(
                     competition_id=competition_id,
                     alias=label,
@@ -1627,6 +2002,7 @@ class FBrefPipeline:
             html,
             target_id=record.target_id,
             page_kind=record.page_kind,
+            source_ids=record.source_ids,
             content_hash=record.content_hash,
         )
         try:
@@ -1957,6 +2333,26 @@ class FBrefPipeline:
         source_run_id: Optional[str] = None,
         _recover_cross_run: bool = False,
     ) -> WaveResult:
+        """Parse raw under a database-held publication-generation fence."""
+
+        with self.control.guard_publication_lock(run_id, source="fbref"):
+            return self._parse_wave_under_publication_guard(
+                run_id,
+                page_kinds=page_kinds,
+                settings=settings,
+                source_run_id=source_run_id,
+                _recover_cross_run=_recover_cross_run,
+            )
+
+    def _parse_wave_under_publication_guard(
+        self,
+        run_id: str,
+        *,
+        page_kinds: Sequence[str],
+        settings: PipelineSettings,
+        source_run_id: Optional[str] = None,
+        _recover_cross_run: bool = False,
+    ) -> WaveResult:
         """Parse and persist a bounded handoff using raw storage only."""
 
         result = WaveResult()
@@ -2175,6 +2571,7 @@ class FBrefPipeline:
         run_id: str,
         *,
         replay_source_run_id: Optional[str] = None,
+        publication_eligible: bool = True,
     ) -> dict:
         summary = self.control.get_run_summary(
             run_id,
@@ -2211,7 +2608,11 @@ class FBrefPipeline:
                 "unvalidated_target_count="
                 f"{int(summary['unvalidated_target_count'])}"
             )
-        if int(summary.get("promotion_pending_match_count") or 0) != 0:
+        if (
+            publication_eligible
+            and str(summary.get("run_type") or "").casefold() == "current"
+            and int(summary.get("promotion_pending_match_count") or 0) != 0
+        ):
             errors.append(
                 "promotion_pending_match_count="
                 f"{int(summary['promotion_pending_match_count'])}"
@@ -2259,6 +2660,13 @@ class FBrefPipeline:
         ):
             errors.append("replay_generated_proxy_traffic")
         if str(summary.get("run_type")) == "replay":
+            source_summary = (
+                self.control.get_run_summary(replay_source_run_id)
+                if replay_source_run_id
+                else None
+            )
+            if source_summary and int(source_summary.get("request_limit") or 0) == 100:
+                errors.append("replay_source_canary_not_publication_eligible")
             source_error = self._replay_source_error(replay_source_run_id)
             if source_error:
                 errors.append(source_error)
@@ -2314,16 +2722,20 @@ class FBrefPipeline:
             if int(crawlable_scope.get("eligible_male") or 0) <= 0:
                 errors.append("crawlable_male_scope_empty")
 
-        if str(summary.get("run_type") or "").lower() != "replay":
-            freshness = summary.get("current_scope_freshness")
+        if publication_eligible and str(summary.get("run_type") or "").lower() != "replay":
+            freshness = summary.get("publication_scope_freshness")
+            freshness_label = "publication_scope"
             if not isinstance(freshness, Mapping):
-                errors.append("current_scope_freshness_missing")
+                freshness = summary.get("current_scope_freshness")
+                freshness_label = "current_scope"
+            if not isinstance(freshness, Mapping):
+                errors.append("publication_scope_freshness_missing")
             else:
                 if int(freshness.get("total_targets") or 0) <= 0:
-                    errors.append("current_scope_freshness_empty")
+                    errors.append("publication_scope_freshness_empty")
                 if not bool(freshness.get("all_within_sla")):
                     errors.append(
-                        "current_scope_stale_targets="
+                        f"{freshness_label}_stale_targets="
                         f"{int(freshness.get('stale_targets') or 0)}"
                     )
         if str(summary.get("run_type") or "").lower() != "replay":
@@ -2343,6 +2755,7 @@ class FBrefPipeline:
 
 
 __all__ = [
+    "BACKFILL_SEASON_COHORT_RESERVATION_BYTES",
     "DEFAULT_BYTE_LIMIT",
     "DEFAULT_REQUEST_LIMIT",
     "DEFAULT_REQUEST_RESERVATION_BYTES",
@@ -2350,6 +2763,7 @@ __all__ = [
     "FBrefPipeline",
     "FETCH_LEASE_SECONDS",
     "FetchWaveError",
+    "LiveRunResult",
     "MIB",
     "MAX_SHARD_SIZE",
     "ParseWaveError",
@@ -2359,7 +2773,9 @@ __all__ = [
     "RunValidationError",
     "SENTINEL_COMPETITIONS",
     "WaveResult",
+    "backfill_season_cohort_capacity",
     "frontier_target",
+    "live_wave_target_capacity",
     "page_target_from_link",
     "wave_target_capacity",
 ]

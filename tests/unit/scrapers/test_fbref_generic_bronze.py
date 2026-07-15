@@ -7,6 +7,7 @@ from scrapers.fbref.bronze import (
     FBrefGenericBronzeWriter,
     GenericPersistenceError,
     PAGE_MANIFEST_TABLE,
+    _token,
 )
 from scrapers.fbref.page_document import parse_page_document
 
@@ -87,3 +88,21 @@ def test_parser_error_is_persisted_as_error_marker_and_fails_task():
     ]
     assert manifest_frames[-1].iloc[0]["parse_status"] == "error"
     assert manifest_frames[-1].iloc[0]["validation_status"] == "error"
+
+
+def test_stage_identity_is_deterministic_and_exposes_logical_refresh_owner():
+    logical_refresh_id = "cb02b6ce-aab7-4c9a-85d0-1292a49e03a2"
+
+    first = _token(logical_refresh_id)
+    second = _token(logical_refresh_id)
+
+    assert first == second == "lr_cb02b6ceaab74c9a85d01292a49e03a2"
+
+
+def test_non_uuid_stage_identity_is_stable_and_identifier_safe():
+    token = _token("scheduled__2026-07-15 / secret-looking input")
+
+    assert token == _token("scheduled__2026-07-15 / secret-looking input")
+    assert token.startswith("id_")
+    assert len(token) == 35
+    assert token.replace("_", "").isalnum()

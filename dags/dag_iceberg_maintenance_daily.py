@@ -36,6 +36,12 @@ def _maintain_high_churn(**_ctx) -> Dict[str, Any]:
     )
 
 
+def _maintain_fbref_stages(**_ctx) -> Dict[str, Any]:
+    from utils.maintenance_tasks import maintain_fbref_generic_stages
+
+    return maintain_fbref_generic_stages()
+
+
 with DAG(
     dag_id='dag_iceberg_maintenance_daily',
     default_args=SILVER_ARGS,
@@ -48,7 +54,17 @@ with DAG(
     doc_md=__doc__,
 ) as dag:
 
-    PythonOperator(
+    fbref_stage_janitor = PythonOperator(
+        task_id='janitor_fbref_generic_stages',
+        python_callable=_maintain_fbref_stages,
+    )
+
+    iceberg_maintenance = PythonOperator(
         task_id='maintain_high_churn_bronze',
         python_callable=_maintain_high_churn,
+        # Retained FBref stages need operator attention, but must not suppress
+        # unrelated snapshot/orphan maintenance when the janitor fails closed.
+        trigger_rule='all_done',
     )
+
+    fbref_stage_janitor >> iceberg_maintenance

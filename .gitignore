@@ -205,6 +205,16 @@ configs/openmetadata/jwtkeys/
 CLAUDE.md
 PLAN.md
 docs/
+# Operator-facing, read-only production acceptance queries are versioned.
+!docs/
+docs/*
+!docs/operations/
+docs/operations/*
+!docs/operations/fbref-paid-transport.md
+!docs/operations/sql/
+docs/operations/sql/*
+!docs/operations/sql/fbref_production_acceptance.sql
+!docs/operations/sql/fbref_control_dataset_acceptance.sql
 scrapers/README.md
 
 # Local ad-hoc SQL (not part of pipeline; only dags/sql/ is tracked)

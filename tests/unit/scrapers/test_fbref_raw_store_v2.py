@@ -126,6 +126,95 @@ def test_v2_logical_refresh_is_append_only_and_retry_safe(tmp_path):
         )
 
 
+def test_exact_recovery_repairs_crash_between_fetch_manifest_and_history(
+    tmp_path,
+    monkeypatch,
+):
+    store = _store(tmp_path)
+    target = match_page_target("a071faa8")
+    manifest_key = store.fetch_manifest_key("refresh-crash")
+    history_key = store._v2_target_history_manifest_key(
+        target, "refresh-crash"
+    )
+    mirror_key = store._v2_target_manifest_key(target)
+    publish = store._publish_target_record
+
+    def crash_before_history(*_args, **_kwargs):
+        raise RuntimeError("simulated crash before target history")
+
+    monkeypatch.setattr(store, "_publish_target_record", crash_before_history)
+    with pytest.raises(RuntimeError, match="before target history"):
+        store.commit_fetch(
+            target,
+            b"<html>durable exact response</html>",
+            logical_refresh_id="refresh-crash",
+            http_status=200,
+        )
+
+    assert store._exists(manifest_key)
+    assert not store._exists(history_key)
+    assert not store._exists(mirror_key)
+    manifest_before = store._read_bytes(manifest_key)
+
+    monkeypatch.setattr(store, "_publish_target_record", publish)
+    recovered = store.import_fetch_from_available_raw(
+        target,
+        logical_refresh_id="refresh-crash",
+        attempt_id="retry-attempt",
+    )
+
+    assert recovered is not None
+    assert store._read_bytes(manifest_key) == manifest_before
+    assert store._fetch_record(store._read_json(history_key), history_key) == recovered
+    assert store._fetch_record(store._read_json(mirror_key), mirror_key) == recovered
+
+
+def test_exact_recovery_repairs_crash_between_history_and_mirror(
+    tmp_path,
+    monkeypatch,
+):
+    store = _store(tmp_path)
+    target = match_page_target("a071faa8")
+    manifest_key = store.fetch_manifest_key("refresh-crash")
+    history_key = store._v2_target_history_manifest_key(
+        target, "refresh-crash"
+    )
+    mirror_key = store._v2_target_manifest_key(target)
+    write_json = store._write_json
+
+    def crash_before_mirror(relative, payload):
+        if relative == mirror_key:
+            raise RuntimeError("simulated crash before target mirror")
+        write_json(relative, payload)
+
+    monkeypatch.setattr(store, "_write_json", crash_before_mirror)
+    with pytest.raises(RuntimeError, match="before target mirror"):
+        store.commit_fetch(
+            target,
+            b"<html>durable exact response</html>",
+            logical_refresh_id="refresh-crash",
+            http_status=200,
+        )
+
+    assert store._exists(manifest_key)
+    assert store._exists(history_key)
+    assert not store._exists(mirror_key)
+    manifest_before = store._read_bytes(manifest_key)
+    history_before = store._read_bytes(history_key)
+
+    monkeypatch.setattr(store, "_write_json", write_json)
+    recovered = store.import_fetch_from_available_raw(
+        target,
+        logical_refresh_id="refresh-crash",
+        attempt_id="retry-attempt",
+    )
+
+    assert recovered is not None
+    assert store._read_bytes(manifest_key) == manifest_before
+    assert store._read_bytes(history_key) == history_before
+    assert store._fetch_record(store._read_json(mirror_key), mirror_key) == recovered
+
+
 def test_v2_304_keeps_prior_effective_html_and_exact_empty_response(tmp_path):
     store = _store(tmp_path)
     target = match_page_target("a071faa8")

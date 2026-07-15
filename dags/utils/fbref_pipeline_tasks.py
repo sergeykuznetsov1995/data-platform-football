@@ -10,10 +10,19 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
+import signal
 import subprocess
 import sys
+import time
+import uuid
+from pathlib import Path
 from typing import Mapping, Optional, Sequence
 
+from scrapers.fbref.policy import (
+    PUBLICATION_FRESHNESS_PAGE_KINDS,
+    PUBLICATION_REQUIRED_PAGE_KINDS,
+)
 from scrapers.fbref.settings import (
     DEFAULT_BYTE_LIMIT,
     DEFAULT_REQUEST_LIMIT,
@@ -25,12 +34,60 @@ from scrapers.fbref.settings import (
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_PROXY_FILE = "/opt/airflow/proxys.txt"
-FETCH_WAVE_RUNNER = "/opt/airflow/dags/scripts/run_fbref_fetch_wave.py"
-FETCH_WAVE_RESULT_PREFIX = "FBREF_FETCH_WAVE_RESULT:"
-# A full 25-page wave sleeps 3s per page and needs one clearance bootstrap, so
-# it finishes in minutes.  Anything past this is a hung browser, not slow work.
-FETCH_WAVE_TIMEOUT_SECONDS = 30 * 60
+LIVE_WAVES_RUNNER = "/opt/airflow/dags/scripts/run_fbref_live_waves.py"
+LIVE_WAVES_RESULT_PREFIX = "FBREF_LIVE_WAVES_RESULT:"
+LIVE_WAVES_TIMEOUT_SECONDS = 110 * 60
+LIVE_WAVES_TERMINATION_GRACE_SECONDS = 10
+LIVE_WAVES_KILL_GRACE_SECONDS = 10
+FBREF_MAX_LIVE_BATCHES = 16
+FBREF_ACCEPTANCE_OUTPUT_ROOT_ENV = "FBREF_ACCEPTANCE_OUTPUT_ROOT"
+DEFAULT_FBREF_ACCEPTANCE_OUTPUT_ROOT = (
+    "/opt/airflow/logs/fbref_acceptance"
+)
+FBREF_RAW_BASELINE_FILENAME = "raw_inventory_before.json"
+
+
+class _LiveRunnerTermination(SystemExit):
+    """Interrupt ``communicate`` so the detached child can be reaped first."""
+
+    def __init__(self, signum: int) -> None:
+        self.signum = int(signum)
+        super().__init__(128 + self.signum)
+
+
+class _LiveRunnerLifecycle:
+    """Mutable ownership record shared across the protected spawn boundary."""
+
+    def __init__(self) -> None:
+        self.process = None
+        self.process_group_id: Optional[int] = None
+        self.handler_state: Optional[dict] = None
+        self.previous_sigterm_handler = None
+        self.handler_installed = False
+
+
+def _install_live_runner_sigterm_handler() -> tuple[dict, object]:
+    """Install a handler that defers cancellation until the PGID is saved."""
+
+    previous = signal.getsignal(signal.SIGTERM)
+    state = {"armed": False, "pending_signum": None}
+
+    def handle(signum, _frame) -> None:
+        if state["armed"]:
+            # Raise only once.  Every later SIGTERM is latched while the
+            # process group is being reaped, so cancellation cannot interrupt
+            # the cleanup path and strand the paid browser tree.
+            state["armed"] = False
+            raise _LiveRunnerTermination(signum)
+        state["pending_signum"] = int(signum)
+
+    try:
+        signal.signal(signal.SIGTERM, handle)
+    except ValueError as exc:  # a non-main-thread task runner
+        raise RuntimeError(
+            "FBref live runner must be spawned from the main thread"
+        ) from exc
+    return state, previous
 
 # Runtime limits are repeated here intentionally: the Airflow boundary must
 # reject an unsafe dag_run.conf even when Param validation is bypassed.  The
@@ -71,19 +128,9 @@ FBREF_CURRENT_SCOPE_FRESHNESS_HOURS = {
     "matchlog": FBREF_PLAYER_MATCHLOG_FRESHNESS_HOURS,
 }
 FBREF_REQUIRED_CURRENT_PAGE_KINDS = frozenset(
-    {
-        "competition_index",
-        "competition",
-        "season",
-        "season_stats",
-        "schedule",
-        "standings",
-        "squad",
-        "player",
-        "matchlog",
-        "match",
-    }
+    PUBLICATION_REQUIRED_PAGE_KINDS
 )
+FBREF_PUBLICATION_CURRENT_PAGE_KINDS = PUBLICATION_FRESHNESS_PAGE_KINDS
 
 
 def _pipeline():
@@ -137,7 +184,6 @@ def _settings(
     shard_size=DEFAULT_SHARD_SIZE,
     reservation_mb=DEFAULT_REQUEST_RESERVATION_BYTES // MIB,
     domain_interval_seconds=3.0,
-    proxy_file: Optional[str] = "/opt/airflow/proxys.txt",
 ) -> object:
     from scrapers.fbref.pipeline import PipelineSettings
 
@@ -155,7 +201,6 @@ def _settings(
         shard_size=int(shard_size),
         request_reservation_bytes=int(reservation_mb) * MIB,
         domain_interval_seconds=float(domain_interval_seconds),
-        proxy_file=proxy_file,
     )
 
 
@@ -212,9 +257,18 @@ def validate_fbref_production_readiness(
     byte_limit_mb,
     shard_size,
 ) -> dict:
-    """First-task gate for alert labelling and hard runtime limits."""
+    """Fail closed on every production dependency before creating a run."""
 
     from utils.alerts import validate_alert_environment
+
+    from scrapers.base.trino_manager import TrinoTableManager
+    from scrapers.fbref.raw_store import RawPageStore
+    from scrapers.fbref.readiness import (
+        check_raw_store_roundtrip,
+        check_trino_roundtrip,
+        validate_fbref_proxy_meter,
+        validate_raw_store_uri,
+    )
 
     alert = validate_alert_environment("prod")
     limits = validate_fbref_runtime_limits(
@@ -223,7 +277,32 @@ def validate_fbref_production_readiness(
         byte_limit_mb=byte_limit_mb,
         shard_size=shard_size,
     )
-    return {**alert, **limits}
+    raw_uri = validate_raw_store_uri(os.environ.get("FBREF_RAW_STORE_URI"))
+    migrations = _control_store().validate_migrations()
+    raw_store = RawPageStore.from_uri(raw_uri)
+    raw_health = check_raw_store_roundtrip(raw_store)
+    trino_health = check_trino_roundtrip(TrinoTableManager())
+    proxy = {}
+    if limits["run_type"] != "replay":
+        proxy = validate_fbref_proxy_meter(
+            os.environ.get("FBREF_PROXY_CONTROL_URL"),
+            control_token=os.environ.get("FBREF_PROXY_CONTROL_TOKEN"),
+            required_bytes=int(limits["byte_limit_mb"]) * MIB,
+            minimum_configured_exits=(
+                4 if limits["profile"] == "production" else 1
+            ),
+        )
+    return {
+        **alert,
+        **limits,
+        **proxy,
+        "dependencies": {
+            "control_migrations": migrations,
+            "raw_store": raw_health,
+            "trino": trino_health,
+            "proxy_meter": proxy or {"status": "not_required"},
+        },
+    }
 
 
 def _boolean_parameter(value, *, name: str) -> bool:
@@ -267,9 +346,9 @@ def plan_fbref_backfill(
         byte_limit_mb=byte_limit_mb,
         shard_size=shard_size,
     )
-    from scrapers.fbref.pipeline import wave_target_capacity
+    from scrapers.fbref.pipeline import backfill_season_cohort_capacity
 
-    effective_limit = wave_target_capacity(settings)
+    effective_limit = backfill_season_cohort_capacity(settings)
     rows = _control_store().list_backfill_seasons(limit=effective_limit)
     candidates = [
         {
@@ -302,6 +381,22 @@ def export_fbref_publication_scope(
 ) -> dict:
     """Atomically publish one immutable control-run scope generation."""
 
+    control_run_id = _control_run_id(
+        airflow_run_id=airflow_run_id, dag_id=dag_id
+    )
+    control = _control_store()
+    with control.guard_publication_lock(control_run_id, source="fbref"):
+        return _export_fbref_publication_scope_under_guard(
+            control=control,
+            control_run_id=control_run_id,
+        )
+
+
+def _export_fbref_publication_scope_under_guard(
+    *, control, control_run_id: str
+) -> dict:
+    """Write the scope while a PostgreSQL row lock fences its owner."""
+
     from datetime import datetime, timezone
 
     import pandas as pd
@@ -312,13 +407,10 @@ def export_fbref_publication_scope(
         TypedSourceContext,
     )
 
-    rows = _control_store().list_publication_scope(source="fbref")
+    rows = control.list_publication_scope(source="fbref")
     if not rows:
         raise RuntimeError("FBref publication scope is empty")
     exported_at = datetime.now(timezone.utc).replace(tzinfo=None)
-    control_run_id = _control_run_id(
-        airflow_run_id=airflow_run_id, dag_id=dag_id
-    )
     columns = {
         "source": "VARCHAR",
         "source_competition_id": "VARCHAR",
@@ -557,7 +649,11 @@ def validate_fbref_current_scope_freshness(
     if summary is None:
         raise RuntimeError("FBref freshness gate cannot find its control run")
 
-    aggregate = summary.get("current_scope_freshness")
+    aggregate = summary.get("publication_scope_freshness")
+    if not isinstance(aggregate, Mapping):
+        # Rolling upgrade compatibility for summaries written before the
+        # publication-critical split.
+        aggregate = summary.get("current_scope_freshness")
     by_kind = summary.get("freshness_by_page_kind")
     if not isinstance(aggregate, Mapping) and not isinstance(by_kind, Mapping):
         raise RuntimeError(
@@ -565,6 +661,17 @@ def validate_fbref_current_scope_freshness(
         )
 
     violations = []
+    if (
+        normalized_run_type == "backfill"
+        and _non_negative_metric(
+            summary, "promotion_pending_match_count"
+        )
+        != 0
+    ):
+        violations.append(
+            "promotion_pending_match_count="
+            f"{int(summary['promotion_pending_match_count'])}"
+        )
     normalized_kinds = {}
     if isinstance(by_kind, Mapping):
         missing = sorted(FBREF_REQUIRED_CURRENT_PAGE_KINDS - set(by_kind))
@@ -572,7 +679,7 @@ def validate_fbref_current_scope_freshness(
             violations.append("missing_page_kinds=" + ",".join(missing))
         for raw_kind, raw_metrics in by_kind.items():
             kind = str(raw_kind)
-            if kind not in FBREF_CURRENT_SCOPE_FRESHNESS_HOURS:
+            if kind not in FBREF_PUBLICATION_CURRENT_PAGE_KINDS:
                 continue
             if not isinstance(raw_metrics, Mapping):
                 violations.append(f"{kind}:invalid_metrics")
@@ -638,7 +745,7 @@ def validate_fbref_current_scope_freshness(
     return {
         "status": "passed",
         "run_type": normalized_run_type,
-        "current_scope_freshness": normalized_aggregate,
+        "publication_scope_freshness": normalized_aggregate,
         "freshness_by_page_kind": normalized_kinds,
     }
 
@@ -661,6 +768,354 @@ def _json_safe_control_result(result: Mapping[str, object]) -> dict:
         else:
             safe[str(key)] = str(value)
     return safe
+
+
+def _fbref_acceptance_output_root() -> Path:
+    configured = os.environ.get(
+        FBREF_ACCEPTANCE_OUTPUT_ROOT_ENV,
+        DEFAULT_FBREF_ACCEPTANCE_OUTPUT_ROOT,
+    ).strip()
+    path = Path(configured)
+    if not configured or not path.is_absolute():
+        raise ValueError(
+            f"{FBREF_ACCEPTANCE_OUTPUT_ROOT_ENV} must be an absolute path"
+        )
+    return path.resolve()
+
+
+def _fbref_raw_baseline_path(control_run_id: object) -> Path:
+    import uuid
+
+    normalized = str(uuid.UUID(str(control_run_id)))
+    return (
+        _fbref_acceptance_output_root()
+        / normalized
+        / FBREF_RAW_BASELINE_FILENAME
+    )
+
+
+def capture_fbref_raw_baseline(
+    *, airflow_run_id: str, dag_id: str
+) -> dict:
+    """Persist one immutable pre-source inventory outside the raw prefix."""
+
+    from scrapers.fbref.raw_audit import (
+        capture_and_write_raw_inventory,
+        open_authenticated_raw_inventory_cache,
+        raw_baseline_anchor,
+    )
+    from scrapers.fbref.raw_store import RawPageStore
+
+    control_run_id = _control_run_id(
+        airflow_run_id=airflow_run_id, dag_id=dag_id
+    )
+    path = _fbref_raw_baseline_path(control_run_id)
+    control = _control_store()
+    reuse_inventory = None
+    if not (path.exists() or path.is_symlink()):
+        reuse_inventory = open_authenticated_raw_inventory_cache(
+            _fbref_acceptance_output_root(), control
+        )
+    path, inventory, idempotent = capture_and_write_raw_inventory(
+        RawPageStore.from_env(optional=False),
+        path,
+        reuse_inventory=reuse_inventory,
+    )
+    anchor = raw_baseline_anchor(
+        inventory.summary, inventory.baseline_sha256
+    )
+    anchored = control.record_raw_baseline(control_run_id, anchor)
+    result = {
+        "status": "captured",
+        "control_run_id": control_run_id,
+        "object_count": int(inventory.summary["object_count"]),
+        "encoded_bytes": int(inventory.summary["encoded_bytes"]),
+        "fingerprint_sha256": str(
+            inventory.summary["fingerprint_sha256"]
+        ),
+        "baseline_sha256": inventory.baseline_sha256,
+        "baseline_path": str(path),
+        "idempotent": bool(idempotent or anchored.get("idempotent")),
+        "control_anchored": True,
+    }
+    logger.info("FBref raw baseline: %s", json.dumps(result, sort_keys=True))
+    return result
+
+
+def audit_fbref_raw_integrity(
+    *,
+    airflow_run_id: str,
+    dag_id: str,
+    run_type: str,
+    source_control_run_id: Optional[str] = None,
+) -> dict:
+    """Gate Airflow publication on content-hashed raw evidence."""
+
+    from scrapers.fbref.raw_audit import (
+        audit_raw_fetches,
+        cleanup_anchored_raw_inventory_indexes,
+        load_audit_artifact,
+        load_inventory_baseline,
+        load_successful_run_attempts,
+        open_disk_backed_inventory,
+        promote_raw_inventory_cache,
+        raw_baseline_anchor,
+        successful_attempt_snapshot,
+        write_audit_artifact,
+    )
+    from scrapers.fbref.raw_store import RawPageStore
+
+    normalized_run_type = str(run_type).strip().casefold()
+    if normalized_run_type not in {"current", "backfill", "replay"}:
+        raise ValueError(f"Unknown FBref run_type: {run_type!r}")
+    processing_run_id = _control_run_id(
+        airflow_run_id=airflow_run_id, dag_id=dag_id
+    )
+    if normalized_run_type == "replay":
+        if not source_control_run_id:
+            raise ValueError("FBref replay raw audit requires source_control_run_id")
+        audited_run_id = str(uuid.UUID(str(source_control_run_id).strip()))
+    else:
+        if source_control_run_id not in (None, ""):
+            raise ValueError(
+                "source_control_run_id is valid only for FBref replay"
+            )
+        audited_run_id = processing_run_id
+
+    control = _control_store()
+    root = _fbref_acceptance_output_root()
+    baseline_path = _fbref_raw_baseline_path(processing_run_id)
+    expected_anchor = control.get_raw_baseline(processing_run_id)
+    if expected_anchor is None:
+        raise RuntimeError(
+            "FBref raw baseline has no immutable control-plane anchor"
+        )
+
+    existing_audit = control.get_raw_audit(processing_run_id)
+    if existing_audit is not None:
+        baseline_summary, baseline_sha256 = load_inventory_baseline(
+            baseline_path
+        )
+        actual_anchor = raw_baseline_anchor(
+            baseline_summary, baseline_sha256
+        )
+        if dict(expected_anchor) != actual_anchor:
+            raise RuntimeError(
+                "FBref raw baseline does not match its immutable "
+                "control-plane anchor"
+            )
+        expected_existing = {
+            "status": "passed",
+            "run_type": normalized_run_type,
+            "audited_control_run_id": audited_run_id,
+            "processing_control_run_id": processing_run_id,
+            "zero_delta_required": normalized_run_type == "replay",
+        }
+        if any(
+            existing_audit.get(key) != value
+            for key, value in expected_existing.items()
+        ):
+            raise RuntimeError(
+                "Existing FBref raw audit anchor has the wrong run contract"
+            )
+        sealed_snapshot = control.seal_raw_fetch_attempts(audited_run_id)
+        if (
+            int(sealed_snapshot["successful_attempt_count"])
+            != int(existing_audit["successful_attempt_count"])
+            or str(sealed_snapshot["successful_attempt_ids_sha256"])
+            != str(existing_audit["attempt_snapshot_sha256"])
+        ):
+            raise RuntimeError(
+                "Existing FBref raw audit anchor differs from sealed attempts"
+            )
+        artifact_path = Path(str(existing_audit["artifact"]))
+        if not artifact_path.is_absolute():
+            raise RuntimeError("Existing FBref raw audit path is not absolute")
+        try:
+            artifact_path.parent.resolve().relative_to(root)
+        except ValueError as exc:
+            raise RuntimeError(
+                "Existing FBref raw audit path is outside acceptance storage"
+            ) from exc
+        artifact, digest_path = load_audit_artifact(
+            artifact_path,
+            expected_sha256=str(existing_audit["artifact_sha256"]),
+        )
+        artifact_metadata = artifact.get("metadata") or {}
+        if (
+            str(artifact.get("status") or "") != "passed"
+            or str(artifact.get("control_run_id") or "") != audited_run_id
+            or int(artifact.get("successful_attempt_count") or -1)
+            != int(existing_audit["successful_attempt_count"])
+            or int(artifact.get("audited_attempt_count") or -1)
+            != int(existing_audit["audited_attempt_count"])
+            or list(artifact.get("failures") or [])
+            or not isinstance(artifact_metadata, Mapping)
+            or str(
+                artifact_metadata.get("processing_control_run_id") or ""
+            )
+            != processing_run_id
+            or str(
+                artifact_metadata.get("raw_attempt_snapshot_sha256") or ""
+            )
+            != str(existing_audit["attempt_snapshot_sha256"])
+        ):
+            raise RuntimeError(
+                "Existing FBref raw audit artifact differs from its anchor"
+            )
+        summary = {
+            "status": "passed",
+            "control_run_id": audited_run_id,
+            "processing_control_run_id": processing_run_id,
+            "successful_attempt_count": int(
+                existing_audit["successful_attempt_count"]
+            ),
+            "audited_attempt_count": int(
+                existing_audit["audited_attempt_count"]
+            ),
+            "failure_count": 0,
+            "zero_delta_required": normalized_run_type == "replay",
+            "attempt_snapshot_sha256": str(
+                existing_audit["attempt_snapshot_sha256"]
+            ),
+            "artifact": str(artifact_path),
+            "artifact_sha256": str(existing_audit["artifact_sha256"]),
+            "sha256_sidecar": str(digest_path),
+            "control_anchored": True,
+            "idempotent": True,
+        }
+        summary["inventory_retention"] = (
+            cleanup_anchored_raw_inventory_indexes(
+                root,
+                control,
+                protected_control_run_ids={processing_run_id},
+            )
+        )
+        logger.info(
+            "FBref raw integrity: %s", json.dumps(summary, sort_keys=True)
+        )
+        return summary
+
+    baseline = open_disk_backed_inventory(baseline_path)
+    actual_anchor = raw_baseline_anchor(
+        baseline.summary, baseline.baseline_sha256
+    )
+    if dict(expected_anchor) != actual_anchor:
+        raise RuntimeError(
+            "FBref raw baseline does not match its immutable control-plane "
+            "anchor"
+        )
+
+    sealed_snapshot = control.seal_raw_fetch_attempts(audited_run_id)
+    attempts = load_successful_run_attempts(control, audited_run_id)
+    loaded_snapshot = successful_attempt_snapshot(attempts)
+    comparable_seal = {
+        key: sealed_snapshot[key]
+        for key in (
+            "schema_version",
+            "successful_attempt_count",
+            "successful_attempt_ids_sha256",
+        )
+    }
+    if loaded_snapshot != comparable_seal:
+        raise RuntimeError(
+            "FBref successful-attempt evidence differs from its sealed "
+            "control-plane snapshot"
+        )
+    metadata = {
+        "airflow_run_id": str(airflow_run_id),
+        "dag_id": str(dag_id),
+        "processing_control_run_id": processing_run_id,
+        "run_type": normalized_run_type,
+        "raw_attempt_snapshot_sha256": str(
+            loaded_snapshot["successful_attempt_ids_sha256"]
+        ),
+    }
+    git_sha = str(os.environ.get("GIT_SHA") or "").strip()
+    if git_sha:
+        metadata["git_sha"] = git_sha
+    result = audit_raw_fetches(
+        RawPageStore.from_env(optional=False),
+        attempts,
+        control_run_id=audited_run_id,
+        baseline_inventory=baseline,
+        require_baseline=True,
+        require_nonempty=True,
+        require_zero_delta=normalized_run_type == "replay",
+        metadata=metadata,
+    )
+    resealed_snapshot = control.seal_raw_fetch_attempts(audited_run_id)
+    if {
+        key: resealed_snapshot[key]
+        for key in comparable_seal
+    } != comparable_seal:
+        raise RuntimeError(
+            "FBref successful-attempt evidence changed during raw audit"
+        )
+    artifact_path, digest_path = write_audit_artifact(
+        result,
+        _fbref_acceptance_output_root(),
+        artifact_id=(
+            processing_run_id if normalized_run_type == "replay" else None
+        ),
+    )
+    artifact_sha256 = digest_path.read_text(encoding="ascii").split()[0]
+    summary = {
+        "status": str(result["status"]),
+        "control_run_id": audited_run_id,
+        "processing_control_run_id": processing_run_id,
+        "successful_attempt_count": int(result["successful_attempt_count"]),
+        "audited_attempt_count": int(result["audited_attempt_count"]),
+        "failure_count": len(result["failures"]),
+        "zero_delta_required": normalized_run_type == "replay",
+        "attempt_snapshot_sha256": str(
+            loaded_snapshot["successful_attempt_ids_sha256"]
+        ),
+        "artifact": str(artifact_path),
+        "artifact_sha256": artifact_sha256,
+        "sha256_sidecar": str(digest_path),
+    }
+    logger.info(
+        "FBref raw integrity: %s", json.dumps(summary, sort_keys=True)
+    )
+    if result["status"] != "passed":
+        raise RuntimeError(
+            "FBref raw integrity failed; "
+            f"failure_count={summary['failure_count']}; "
+            f"artifact={artifact_path}"
+        )
+    anchored = control.record_raw_audit(
+        processing_run_id,
+        {
+            "schema_version": "fbref-raw-audit-anchor-v1",
+            "status": "passed",
+            "run_type": normalized_run_type,
+            "audited_control_run_id": audited_run_id,
+            "processing_control_run_id": processing_run_id,
+            "successful_attempt_count": summary[
+                "successful_attempt_count"
+            ],
+            "audited_attempt_count": summary["audited_attempt_count"],
+            "failure_count": summary["failure_count"],
+            "zero_delta_required": summary["zero_delta_required"],
+            "attempt_snapshot_sha256": summary[
+                "attempt_snapshot_sha256"
+            ],
+            "artifact_sha256": artifact_sha256,
+            "artifact": str(artifact_path),
+        },
+    )
+    summary["inventory_cache"] = promote_raw_inventory_cache(
+        root, processing_run_id, control
+    )
+    summary["inventory_retention"] = cleanup_anchored_raw_inventory_indexes(
+        root,
+        control,
+        protected_control_run_ids={processing_run_id},
+    )
+    summary["control_anchored"] = True
+    summary["idempotent"] = bool(anchored.get("idempotent"))
+    return summary
 
 
 def initialize_fbref_run(
@@ -761,6 +1216,15 @@ def finalize_fbref_publication_lock(
     }
     acquire_state = states.get("acquire_publication_lock", "missing")
     plan_state = states.get("plan_backfill", "missing")
+    canary_release_state = states.get(
+        "release_canary_publication_lock", "missing"
+    )
+    if canary_release_state == "success" and acquire_state == "success":
+        return {
+            "released": True,
+            "canary": True,
+            "status": "released_by_canary_path",
+        }
     if acquire_state == "skipped" and plan_state == "success":
         return {
             "released": False,
@@ -887,7 +1351,146 @@ def run_recovery_wave(
     return aggregate
 
 
-def fetch_fbref_wave(
+def _process_group_exists(process_group_id: int) -> bool:
+    """Probe the group itself; an exited leader says nothing about children."""
+
+    try:
+        os.killpg(int(process_group_id), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _wait_for_process_group_exit(
+    process_group_id: int, *, deadline: float
+) -> bool:
+    """Wait only until the supplied monotonic deadline for the whole group."""
+
+    while _process_group_exists(process_group_id):
+        remaining = float(deadline) - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(0.1, remaining))
+    return True
+
+
+def _terminate_process_group(
+    process, process_group_id: Optional[int] = None
+) -> tuple[str, str]:
+    """Terminate the runner tree without an unbounded final wait."""
+
+    pgid = int(
+        process_group_id
+        if process_group_id is not None
+        else process.pid
+    )
+
+    def signal_group(sig) -> bool:
+        try:
+            os.killpg(pgid, sig)
+        except ProcessLookupError:
+            return False
+        except OSError as exc:
+            raise RuntimeError(
+                f"could not signal FBref live process group {pgid}"
+            ) from exc
+        return True
+
+    def partial(exc: BaseException) -> tuple[str, str]:
+        return (
+            getattr(exc, "stdout", None)
+            or getattr(exc, "output", None)
+            or "",
+            getattr(exc, "stderr", None) or "",
+        )
+
+    try:
+        term_deadline = (
+            time.monotonic() + LIVE_WAVES_TERMINATION_GRACE_SECONDS
+        )
+        term_sent = signal_group(signal.SIGTERM)
+        term_output: tuple[str, str]
+        try:
+            term_output = process.communicate(
+                timeout=LIVE_WAVES_TERMINATION_GRACE_SECONDS
+            )
+        except subprocess.TimeoutExpired as term_exc:
+            term_output = partial(term_exc)
+    except BaseException:
+        # A second cancellation while TERM cleanup is running must not leave
+        # the detached group alive. Do not mask it after issuing SIGKILL.
+        kill_deadline = time.monotonic() + LIVE_WAVES_KILL_GRACE_SECONDS
+        kill_sent = signal_group(signal.SIGKILL)
+        try:
+            process.communicate(timeout=LIVE_WAVES_KILL_GRACE_SECONDS)
+        except BaseException:
+            pass
+        if kill_sent and not _wait_for_process_group_exit(
+            pgid, deadline=kill_deadline
+        ):
+            logger.critical(
+                "FBref live process group %s still exists after SIGKILL", pgid
+            )
+        raise
+
+    if not term_sent or _wait_for_process_group_exit(
+        pgid, deadline=term_deadline
+    ):
+        return term_output
+
+    kill_deadline = time.monotonic() + LIVE_WAVES_KILL_GRACE_SECONDS
+    kill_sent = signal_group(signal.SIGKILL)
+    kill_output = ("", "")
+    try:
+        kill_output = process.communicate(timeout=LIVE_WAVES_KILL_GRACE_SECONDS)
+    except subprocess.TimeoutExpired as kill_exc:
+        kill_output = partial(kill_exc)
+    if kill_sent and not _wait_for_process_group_exit(
+        pgid, deadline=kill_deadline
+    ):
+        raise RuntimeError(
+            f"FBref live process group {pgid} survived SIGKILL grace"
+        )
+    return kill_output if any(kill_output) else term_output
+
+
+def _spawn_live_runner(
+    command, lifecycle: _LiveRunnerLifecycle
+) -> None:
+    """Populate caller-owned state before arming cancellation exceptions."""
+
+    handler_state, previous_handler = (
+        _install_live_runner_sigterm_handler()
+    )
+    lifecycle.handler_state = handler_state
+    lifecycle.previous_sigterm_handler = previous_handler
+    lifecycle.handler_installed = True
+    if handler_state["pending_signum"] is not None:
+        pending_signum = int(handler_state["pending_signum"])
+        handler_state["pending_signum"] = None
+        raise _LiveRunnerTermination(pending_signum)
+    lifecycle.process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    # start_new_session makes the child's PID the durable PGID even if the
+    # leader exits before cleanup begins. Keep it in caller-owned state so a
+    # signal immediately after this helper returns can still reap the group.
+    lifecycle.process_group_id = int(lifecycle.process.pid)
+    handler_state["armed"] = True
+    if handler_state["pending_signum"] is not None:
+        pending_signum = int(handler_state["pending_signum"])
+        handler_state["pending_signum"] = None
+        handler_state["armed"] = False
+        raise _LiveRunnerTermination(pending_signum)
+
+
+def run_fbref_live_waves(
     *,
     airflow_run_id: str,
     dag_id: str,
@@ -899,17 +1502,9 @@ def fetch_fbref_wave(
     shard_size=DEFAULT_SHARD_SIZE,
     reservation_mb=DEFAULT_REQUEST_RESERVATION_BYTES // MIB,
     domain_interval_seconds=3.0,
-    proxy_file: Optional[str] = DEFAULT_PROXY_FILE,
+    max_batches: int = FBREF_MAX_LIVE_BATCHES,
 ) -> dict:
-    """Run one bounded fetch wave in a dedicated, unforked subprocess.
-
-    The wave is the only task that drives Camoufox, and Playwright's sync API
-    deadlocks inside a process forked from the multi-threaded scheduler: the
-    browser starts, the navigation never opens a socket, and no timeout fires.
-    The wave therefore executes through ``run_fbref_fetch_wave.py`` and this
-    callable only relays its bounded result, so every control-plane budget,
-    lease, and validation gate stays exactly where it was.
-    """
+    """Run all bounded live batches in one warm, unforked subprocess."""
 
     validate_fbref_runtime_limits(
         run_type=run_type,
@@ -917,12 +1512,18 @@ def fetch_fbref_wave(
         byte_limit_mb=byte_limit_mb,
         shard_size=shard_size,
     )
-
+    normalized_batches = int(max_batches)
+    if not 1 <= normalized_batches <= FBREF_MAX_LIVE_BATCHES:
+        raise ValueError(
+            f"max_batches must be between 1 and {FBREF_MAX_LIVE_BATCHES}"
+        )
     command = [
         sys.executable,
-        FETCH_WAVE_RUNNER,
+        LIVE_WAVES_RUNNER,
         "--control-run-id",
         _control_run_id(airflow_run_id=airflow_run_id, dag_id=dag_id),
+        "--parent-pid",
+        str(os.getpid()),
         "--worker-id",
         worker_id,
         "--page-kinds",
@@ -939,71 +1540,136 @@ def fetch_fbref_wave(
         str(reservation_mb),
         "--domain-interval-seconds",
         str(domain_interval_seconds),
+        "--max-batches",
+        str(normalized_batches),
     ]
-    if proxy_file:
-        command += ["--proxy-file", proxy_file]
-
+    lifecycle = _LiveRunnerLifecycle()
+    stdout = ""
+    stderr = ""
+    process_group_terminated = False
     try:
-        completed = subprocess.run(
-            command,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=FETCH_WAVE_TIMEOUT_SECONDS,
-        )
-    except subprocess.TimeoutExpired as exc:
-        # A hung clearance keeps the browser inside Playwright's event loop and
-        # never returns, holding this wave's fenced leases until they expire.
-        # Fail closed and synchronously abort the control run so retries cannot
-        # inherit its fences. Log what the wave printed, or the hang is opaque.
-        logger.warning(
-            "FBref fetch wave timed out.\nstdout:\n%s\nstderr:\n%s",
-            _decoded_stream(exc.stdout),
-            _decoded_stream(exc.stderr),
-        )
-        _abort_failed_fetch_subprocess(
-            airflow_run_id=airflow_run_id,
-            dag_id=dag_id,
-            error_class="FetchWaveSubprocessTimeout",
-            error_message=(
-                "FBref fetch wave subprocess exceeded "
-                f"{FETCH_WAVE_TIMEOUT_SECONDS}s"
-            ),
-        )
-        raise RuntimeError(
-            "FBref fetch wave subprocess exceeded "
-            f"{FETCH_WAVE_TIMEOUT_SECONDS}s and was killed"
-        ) from exc
-    if completed.stderr:
-        logger.info("FBref fetch wave stderr:\n%s", completed.stderr.strip())
-    if completed.returncode != 0:
-        _abort_failed_fetch_subprocess(
-            airflow_run_id=airflow_run_id,
-            dag_id=dag_id,
-            error_class="FetchWaveSubprocessFailure",
-            error_message=(
-                "FBref fetch wave subprocess failed with exit code "
-                f"{completed.returncode}"
-            ),
-        )
-        raise RuntimeError(
-            "FBref fetch wave subprocess failed with exit code "
-            f"{completed.returncode}"
-        )
+        try:
+            # The spawn and every instruction after it execute inside this
+            # outer exception table. Lifecycle state is caller-owned, so a
+            # signal on an inner TimeoutExpired-handler boundary still reaches
+            # the one cleanup path below.
+            _spawn_live_runner(command, lifecycle)
+            process = lifecycle.process
+            process_group_id = lifecycle.process_group_id
+            if process is None or process_group_id is None:
+                raise RuntimeError(
+                    "FBref live runner spawn did not return a PGID"
+                )
+            stdout, stderr = process.communicate(
+                timeout=LIVE_WAVES_TIMEOUT_SECONDS
+            )
+            if _process_group_exists(process_group_id):
+                raise RuntimeError(
+                    "FBref live runner exited while descendants remained in "
+                    f"its process group {process_group_id}"
+                )
+        except subprocess.TimeoutExpired as exc:
+            if lifecycle.handler_state is not None:
+                lifecycle.handler_state["armed"] = False
+            process = lifecycle.process
+            process_group_id = lifecycle.process_group_id
+            if process is None or process_group_id is None:
+                raise RuntimeError(
+                    "FBref live runner timed out before its PGID was recorded"
+                ) from exc
+            stdout, stderr = _terminate_process_group(
+                process, process_group_id
+            )
+            process_group_terminated = True
+            logger.warning(
+                "FBref live runner timed out.\nstdout:\n%s\nstderr:\n%s",
+                _decoded_stream(stdout),
+                _decoded_stream(stderr),
+            )
+            message = (
+                "FBref live runner exceeded "
+                f"{LIVE_WAVES_TIMEOUT_SECONDS}s"
+            )
+            _abort_failed_live_subprocess(
+                airflow_run_id=airflow_run_id,
+                dag_id=dag_id,
+                error_class="LiveWavesSubprocessTimeout",
+                error_message=message,
+            )
+            raise RuntimeError(
+                message + " and its process group was killed"
+            ) from exc
+    except BaseException:
+        if lifecycle.handler_state is not None:
+            lifecycle.handler_state["armed"] = False
+        process = lifecycle.process
+        process_group_id = lifecycle.process_group_id
+        if process is not None and not process_group_terminated:
+            if process_group_id is None:
+                process_group_id = int(process.pid)
+            stdout, stderr = _terminate_process_group(
+                process, process_group_id
+            )
+            process_group_terminated = True
+            logger.warning(
+                "FBref live runner was externally interrupted; its process "
+                "group was terminated.\nstdout:\n%s\nstderr:\n%s",
+                _decoded_stream(stdout),
+                _decoded_stream(stderr),
+            )
+        raise
+    finally:
+        if lifecycle.handler_installed:
+            if lifecycle.handler_state is not None:
+                lifecycle.handler_state["armed"] = False
+            signal.signal(
+                signal.SIGTERM, lifecycle.previous_sigterm_handler
+            )
+            pending_signum = (
+                None
+                if lifecycle.handler_state is None
+                else lifecycle.handler_state["pending_signum"]
+            )
+            if pending_signum is not None and sys.exception() is None:
+                lifecycle.handler_state["pending_signum"] = None
+                raise _LiveRunnerTermination(int(pending_signum))
 
-    result = _parse_fetch_wave_result(completed.stdout)
-    logger.info("FBref fetch wave: %s", json.dumps(result, sort_keys=True))
+    if stderr:
+        logger.info("FBref live runner stderr:\n%s", stderr.strip())
+    if process.returncode != 0:
+        message = (
+            "FBref live runner failed with exit code "
+            f"{process.returncode}"
+        )
+        _abort_failed_live_subprocess(
+            airflow_run_id=airflow_run_id,
+            dag_id=dag_id,
+            error_class="LiveWavesSubprocessFailure",
+            error_message=message,
+        )
+        raise RuntimeError(message)
+    try:
+        result = _parse_prefixed_result(stdout, LIVE_WAVES_RESULT_PREFIX)
+    except Exception as exc:
+        _abort_failed_live_subprocess(
+            airflow_run_id=airflow_run_id,
+            dag_id=dag_id,
+            error_class="LiveWavesResultMissing",
+            error_message=str(exc),
+        )
+        raise
+    logger.info("FBref live waves: %s", json.dumps(result, sort_keys=True))
     return result
 
 
-def _abort_failed_fetch_subprocess(
+def _abort_failed_live_subprocess(
     *,
     airflow_run_id: str,
     dag_id: str,
     error_class: str,
     error_message: str,
 ) -> None:
-    """Synchronously release the failed wave's leases and reservations."""
+    """Synchronously release the failed live run's leases and reservations."""
 
     try:
         abort_fbref_run(
@@ -1014,7 +1680,7 @@ def _abort_failed_fetch_subprocess(
         )
     except Exception:  # noqa: BLE001 - preserve the subprocess root cause
         logger.exception(
-            "Could not synchronously abort FBref control run after fetch "
+            "Could not synchronously abort FBref control run after live "
             "subprocess failure"
         )
 
@@ -1029,13 +1695,13 @@ def _decoded_stream(stream) -> str:
     return text[-8000:] if text else "<empty>"
 
 
-def _parse_fetch_wave_result(stdout: str) -> dict:
-    """Return the wave result the runner printed, or fail closed."""
+def _parse_prefixed_result(stdout: str, prefix: str) -> dict:
+    """Return the last exact runner document, ignoring library noise."""
 
     for line in reversed(stdout.splitlines()):
-        if line.startswith(FETCH_WAVE_RESULT_PREFIX):
-            return json.loads(line[len(FETCH_WAVE_RESULT_PREFIX):])
-    raise RuntimeError("FBref fetch wave subprocess emitted no result document")
+        if line.startswith(prefix):
+            return json.loads(line[len(prefix):])
+    raise RuntimeError("FBref runner subprocess emitted no result document")
 
 
 def parse_fbref_wave(
@@ -1080,6 +1746,7 @@ def validate_fbref_run(
     airflow_run_id: str,
     dag_id: str,
     source_control_run_id: Optional[str] = None,
+    publication_eligible: bool = True,
 ) -> dict:
     summary = _pipeline().validate_and_finish(
         _control_run_id(airflow_run_id=airflow_run_id, dag_id=dag_id),
@@ -1089,6 +1756,7 @@ def validate_fbref_run(
             or not str(source_control_run_id).strip()
             else str(source_control_run_id).strip()
         ),
+        publication_eligible=publication_eligible,
     )
     logger.info(
         "FBref validated run: requests=%s bytes=%s targets=%s datasets=%s",
@@ -1100,6 +1768,24 @@ def validate_fbref_run(
     logger.info("FBref control metrics: %s", json.dumps(summary, default=str))
     _record_control_traffic(summary, airflow_run_id=airflow_run_id)
     return summary
+
+
+def choose_fbref_publication_path(
+    *, request_limit: int, byte_limit_mb: int
+) -> str:
+    """Route the bounded canary away from publication tasks."""
+
+    profile = validate_fbref_runtime_limits(
+        run_type="current",
+        request_limit=request_limit,
+        byte_limit_mb=byte_limit_mb,
+        shard_size=FBREF_MAX_WARM_SESSION_TARGETS,
+    )["profile"]
+    return (
+        "validate_canary_run"
+        if profile == "canary"
+        else "validate_current_scope_freshness"
+    )
 
 
 def abort_fbref_run(
@@ -1173,16 +1859,18 @@ def fbref_dag_failure_callback(context: dict) -> None:
 
 __all__ = [
     "acquire_fbref_publication_lock",
+    "audit_fbref_raw_integrity",
     "abort_fbref_run",
+    "capture_fbref_raw_baseline",
     "choose_fbref_backfill_mode",
     "export_fbref_publication_scope",
     "finalize_fbref_publication_lock",
-    "fetch_fbref_wave",
     "fbref_dag_failure_callback",
     "initialize_fbref_run",
     "parse_fbref_wave",
     "plan_fbref_backfill",
     "release_fbref_publication_lock",
+    "run_fbref_live_waves",
     "run_recovery_wave",
     "seed_fbref_competition_index",
     "seed_fbref_historical_seasons",

@@ -147,30 +147,6 @@ class TestClubEloIntegration:
 
 
 # =============================================================================
-# FBref Tests (Requires Tor)
-# =============================================================================
-
-@pytest.mark.integration
-@pytest.mark.tor
-@pytest.mark.slow
-class TestFBrefIntegration:
-    """Integration tests for FBref scraper.
-
-    FBref has Cloudflare protection, requires Tor proxy.
-    """
-
-    def test_read_schedule(self, fbref_scraper_with_tor, skip_if_no_network, integration_delay):
-        """Test reading FBref schedule with Tor proxy."""
-        df = fbref_scraper_with_tor.read_schedule()
-
-        assert df is not None, "DataFrame should not be None"
-        assert isinstance(df, pd.DataFrame), "Result should be a DataFrame"
-        assert len(df) > 0, "DataFrame should not be empty"
-        assert '_source' in df.columns, "Should have metadata column"
-        assert df['_source'].iloc[0] == 'fbref', "Source should be 'fbref'"
-
-
-# =============================================================================
 # SoFIFA Tests (Requires Tor)
 # =============================================================================
 

@@ -2,17 +2,14 @@
 Tests for ProxyManager utility.
 """
 
-import pytest
-from unittest.mock import MagicMock, patch
-import tempfile
 import os
+import tempfile
 import time
 
 from scrapers.utils.proxy_manager import (
     Proxy,
     ProxyType,
     ProxyManager,
-    ProxyManagerConfig,
     ErrorType,
     create_proxy_manager,
     classify_error,
@@ -464,6 +461,27 @@ class TestProxyManager:
         assert 'proxy1.example.com:8080' in status
         assert status['proxy1.example.com:8080'] > 0  # In cooldown
         assert status['proxy2.example.com:8080'] == 0  # Not in cooldown
+
+    def test_paid_session_never_reuses_proxy_beyond_bounded_cooldown_wait(self):
+        manager = ProxyManager(cooldown_seconds=60.0)
+        manager.add_proxy('proxy1.example.com', 8080)
+        manager._proxies[0].last_used = time.time()
+
+        assert manager.get_proxy(max_cooldown_wait_seconds=0) is None
+
+    def test_paid_session_waits_for_earliest_proxy_within_bound(self):
+        manager = ProxyManager(cooldown_seconds=60.0)
+        manager.add_proxy('proxy1.example.com', 8080)
+        manager._proxies[0].last_used = time.time() - 59.5
+        waits = []
+
+        selected = manager.get_proxy(
+            max_cooldown_wait_seconds=1.0,
+            sleep=waits.append,
+        )
+
+        assert selected is manager._proxies[0]
+        assert 0 < waits[0] <= 1.0
 
     def test_get_http_proxy_url_with_auth(self):
         """Test get_http_proxy_url returns proper HTTP format with auth."""

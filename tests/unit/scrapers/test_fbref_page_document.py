@@ -1,4 +1,21 @@
+import pytest
+
 from scrapers.fbref.page_document import Availability, parse_page_document
+
+
+TABLELESS_PLAYER_PROFILE = """
+<html><head>
+  <link rel="canonical"
+    href="https://fbref.com/en/players/406c5597/Naime-Said-Mchindra">
+  <meta property="og:url"
+    content="https://fbref.com/en/players/406c5597/Naime-Said-Mchindra">
+  <meta property="og:type" content="Athlete">
+</head><body>
+  <div id="meta"><h1>Naime Said Mchindra</h1>
+    <p>Position: GK</p><p>Born: May 28, 2005</p>
+  </div>
+</body></html>
+"""
 
 
 def test_zero_table_competition_is_deferred_to_semantic_contract():
@@ -17,6 +34,56 @@ def test_zero_table_competition_is_deferred_to_semantic_contract():
         page_kind="player",
     )
     assert broken_profile.errors == ("page_contract:no_tables",)
+
+
+def test_verified_zero_table_player_profile_is_valid_empty_evidence():
+    page = parse_page_document(
+        TABLELESS_PLAYER_PROFILE,
+        target_id="fbref:player:406c5597",
+        page_kind="player",
+        source_ids={"player_id": "406c5597"},
+    )
+
+    assert page.tables == ()
+    assert page.errors == ()
+
+
+@pytest.mark.parametrize(
+    "html",
+    [
+        TABLELESS_PLAYER_PROFILE.replace("406c5597", "aaaaaaaa", 1),
+        TABLELESS_PLAYER_PROFILE.replace(
+            'property="og:url"', 'property="og:wrong"'
+        ),
+        TABLELESS_PLAYER_PROFILE.replace("Athlete", "Website"),
+        TABLELESS_PLAYER_PROFILE.replace(
+            "Naime-Said-Mchindra",
+            "matchlogs/2025/summary/Naime-Said-Mchindra",
+        ),
+        TABLELESS_PLAYER_PROFILE.replace("id=\"meta\"", "id=\"content\""),
+        "<html><head><title>Just a moment...</title></head></html>",
+    ],
+)
+def test_unverified_zero_table_player_shell_still_fails(html):
+    page = parse_page_document(
+        html,
+        target_id="fbref:player:406c5597",
+        page_kind="player",
+        source_ids={"player_id": "406c5597"},
+    )
+
+    assert page.tables == ()
+    assert page.errors == ("page_contract:no_tables",)
+
+
+def test_zero_table_player_requires_source_owned_identity():
+    page = parse_page_document(
+        TABLELESS_PLAYER_PROFILE,
+        target_id="fbref:player:406c5597",
+        page_kind="player",
+    )
+
+    assert page.errors == ("page_contract:no_tables",)
 
 
 def test_empty_table_evidence_and_new_material_table_are_preserved():

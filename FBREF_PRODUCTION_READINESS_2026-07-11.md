@@ -1,21 +1,22 @@
 # FBref production readiness report
 
-Date: 2026-07-11 (updated 2026-07-12)
+Date: 2026-07-11 (updated 2026-07-15)
 
-Baseline: `origin/master` at `9eedd24783c6bb917941082385d685f841e19879`
+Baseline: `origin/master` at `1a93b2b`
 
 Companion backlog: [`FBREF_PRODUCTION_BACKLOG_2026-07-11.md`](FBREF_PRODUCTION_BACKLOG_2026-07-11.md)
 
 ## Executive status
 
-**Code complete; production validation pending.** The checkout contains a
+**Production candidate implemented; deployment validation pending.** The checkout contains a
 single durable raw-first production flow, bounded backfill and zero-network
 replay, generic and typed Bronze persistence, strict promotion edges, and the
 requested DQ/identity/keeper consumers. It is not yet valid to call the source
 production validated:
 
-- the approved bounded live canary executed within both caps but failed closed
-  on a classified warm-HTTP `500`, before raw commit or parsing;
+- the last bounded live canary completed under the earlier candidate, but no
+  paid source request has been made for the post-review checkout documented
+  here;
 - a paid/full 400-page soak was not authorized and was not executed;
 - an accepted before/after live traffic benchmark was not run;
 - #901 is diagnosed (2026-07-12): FBref publishes no events for those eleven matches at
@@ -36,14 +37,15 @@ FBref competition index
   -> durable canonical page frontier and immutable run cohort
   -> filtered SKIP LOCKED claim + fenced lease
   -> atomic request/byte reservation + domain throttle
-  -> one Camoufox clearance bootstrap per fetch shard
+  -> one bounded Camoufox clearance lifecycle per live runner
+     (up to four paid solve attempts only in the 200-request profile)
   -> warm curl_cffi HTTP target fetch
   -> immutable raw-v2 response/content commit
   -> offline discovery + generic PageDocument + typed compatibility parse
   -> Bronze staging/MERGE + independent dataset availability + page marker
   -> run traffic/completeness/eligibility validation
-  -> Silver -> Silver DQ -> xref -> xref DQ
-  -> Gold promotion
+  -> blocking Silver + Silver DQ (source-acceptance boundary)
+  -> separately scheduled xref/Gold chain outside source acceptance
 ```
 
 The configured `LEAGUE_IDS` mapping remains only a backward-compatible output
@@ -52,19 +54,20 @@ FBref crawl scope.
 
 ### Airflow topology
 
-Every `fetch` task drives Camoufox through `dags/scripts/run_fbref_fetch_wave.py`
-in its own process. Playwright's sync API deadlocks inside a task process forked
-from the multi-threaded scheduler — the browser starts, the navigation never
-opens a socket, and no timeout fires — which is why the repository already
-requires browser scrapers to run in a subprocess. The task callable only relays
-the runner's bounded JSON result, so budgets, leases and gates are unchanged;
-`parse`, `validate` and `seed` tasks touch no browser and stay in-process.
+Each live DAG has one `run_live_waves` Airflow task. It starts
+`dags/scripts/run_fbref_live_waves.py` in a new process session and drains up to
+16 raw-first `fetch -> offline parse` batches while retaining one warm HTTP
+session and one in-run proxy quarantine. Camoufox is used only to export a
+clearance: the browser is closed before its final traffic is measured and the
+bootstrap reservation is settled. Parse and seed remain source-network-free;
+readiness and raw-integrity tasks use only PostgreSQL, Trino, and the durable
+raw store, never the paid FBref transport.
 
 | DAG | Schedule and budget | Static topology | Promotion contract |
 |---|---|---|---|
-| `dag_ingest_fbref` | Daily `06:00` UTC; 200 total requests and 100 MiB per run; default/max shard 25 | 20 tasks: initialize, seed index, eight sequential `fetch -> offline parse` waves, validate, trigger Silver | Every edge is `all_success`; Silver trigger blocks and propagates child failure. |
-| `dag_backfill_fbref` | Manual only; maximum 25 total requests and 100 MiB; automatic durable resume; default/maximum shard 2 | 54 tasks: initialize, seed the next bounded unfinished non-current season cohort, 25 sequential `fetch -> parse` waves, validate, trigger Silver | The seed cohort is clamped to worst-case bootstrap/target reservation capacity; claims only `historical_once` targets, completed historical seasons are not requeued, and no operator cursor or manual league list exists. |
-| `dag_replay_fbref` | Manual only; required source control-run UUID; request and byte budgets are both zero | 11 tasks: initialize, eight sequential parse-only waves of 25, validate, trigger Silver | Contains no fetch or seed task; validation fails if source candidates remain or any proxy traffic appears. |
+| `dag_ingest_fbref` | Daily `06:00` UTC; production 200 requests/100 MiB, canary 100/50 MiB; shard at most 25 | 16 tasks: readiness, initialize, lock, seed index, anchored pre-run content inventory, raw recovery, one live runner (up to 16 batches), sealed-attempt raw audit, current-only promotion gates, blocking Silver and lock finalizer | Canary runs validate and release the lock without publishing; production runs require raw integrity, freshness, blocking Silver success, and a final lock verdict. |
+| `dag_backfill_fbref` | Manual only; production 200 requests/100 MiB, canary 100/50 MiB; durable resume; shard at most 25 | dry-run planning or readiness, initialize, current-freshness preflight, bounded historical seed, pre-run inventory, raw recovery, one live runner, persisted raw audit, validation and Silver | Claims only `historical_once` targets. Completed historical seasons are not requeued, and no operator cursor or manual league list exists. |
+| `dag_replay_fbref` | Manual only; required source control-run UUID; request and byte budgets are both zero | 17 tasks: readiness, initialize, lock, pre-run inventory, eight sequential parse-only waves of 25, zero-delta raw audit, validate, export, blocking Silver, finalizer | Contains no fetch or seed task; validation fails if source candidates remain, raw changes, or any proxy traffic appears. |
 
 The master pipeline no longer triggers a second paid FBref crawl at 14:00. It
 uses a fail-closed `ExternalTaskSensor` with an eight-hour execution delta to
@@ -76,7 +79,7 @@ The `fbref_control` schema shares Airflow's PostgreSQL server but has no Airflow
 ORM dependency. `airflow-init` runs `python -m scrapers.fbref.control migrate`
 after the Airflow metadata migration.
 
-Seven checksum-verified, advisory-lock-protected migrations create:
+Nine checksum-verified, advisory-lock-protected migrations create:
 
 - `crawl_run` and atomic budget counters;
 - `budget_reservation` with idempotent settlement per attempt;
@@ -97,23 +100,32 @@ Control invariants:
 - `page_kinds` and `refresh_policies` are SQL filters, isolating current and
   historical work;
 - lease token plus epoch fence every heartbeat, completion, and failure;
-- a retry reuses raw only when that exact `logical_refresh_id` already has a
+- a retry reuses raw when that exact `logical_refresh_id` already has a
   committed manifest, which is crash recovery for the same observation;
-- production never adopts prior-run raw into a new logical refresh. A target
-  moving to `historical_once` or `current_completed_once` performs a fresh
-  final fetch before it can become one-shot complete;
+- a `historical_once` target may additionally adopt a verified prior raw-v2 or
+  legacy raw-v1 observation into a new immutable raw-v2 manifest. Recurring
+  current targets and `current_completed_once` transitions never do this and
+  require a fresh final fetch;
 - request and byte budgets are reserved before network activity and settled
   with observed usage;
 - one shared domain slot enforces a default three-second interval.
+- each pre-run raw inventory is create-once outside the raw prefix and its
+  exact SHA-256 is conflict-checked in `crawl_run.metadata`;
+- raw audit first seals and fingerprints the successful-attempt set under the
+  crawl-run row lock, preventing a late worker from changing paginated audit
+  evidence;
+- `_health/` is the only excluded ephemeral raw namespace; every durable raw
+  object remains covered by the content/metadata inventory.
 
 ## Raw, parsing, and persistence contracts
 
 ### Raw-v2
 
 `RawPageStore` keeps backward read compatibility with raw-v1 and writes
-raw-v2. The production fetch wave does not adopt raw-v1 or prior-run raw-v2 as
-a new observation. It can resume only an already committed raw manifest for
-the exact same `logical_refresh_id`; mismatched or corrupt evidence fails
+raw-v2. Exact-logical-refresh recovery is valid for every lane. To avoid a
+second paid request for immutable history, only a `historical_once` target may
+adopt verified prior raw-v2 or legacy raw-v1 into its new logical refresh;
+recurring/current-completion work cannot. Mismatched or corrupt evidence fails
 closed. A raw-v2 record separates the exact HTTP response from the effective
 parser content:
 
@@ -128,6 +140,33 @@ parser content:
 The compressed blobs are written before the manifest. Recommitting the same
 logical refresh is idempotent only when the evidence is identical; conflicting
 evidence fails closed. Hash verification occurs on read.
+
+The before-run inventory is bounded on heap: local storage is traversed with
+`scandir`, S3 with 1,000-object `ListObjectsV2` pages, and object rows live in
+an authoritative SQLite index beside a small JSON commit marker. Local
+device/inode/ctime or S3 ETag version tokens prevent unsafe mtime-only reuse.
+A per-destination `flock` permits only one full-store hasher, and two stability
+scans fence the commit. The post-run audit artifact and SHA-256 sidecar are
+content-addressed, create-once, fsynced, reopened, and verified; a retry can
+complete a digest-first partial publication but cannot overwrite evidence.
+
+After a passed raw audit is durably anchored in PostgreSQL, a fixed-size local
+cache marker may point at that run's verified SQLite index. The next run still
+lists all raw metadata, but it reuses a SHA-256 only when the object key, size,
+and strong local device/inode/ctime or S3 ETag token are unchanged. New,
+changed, or unversioned objects alone are read and hashed. The marker is
+checked against the control-plane baseline anchor, passed raw-audit anchor,
+content-addressed audit JSON, and its SHA-256 sidecar; missing cache is a safe
+first-run full hash, while corrupt or untrusted cache fails closed before paid
+source work.
+
+Index retention is bounded per call. It removes only old SQLite indexes for
+finished-successful runs that still have a verified passed raw-audit anchor.
+It never removes the active/cache-source index or an index for a running,
+failed, or unanchored run. The small baseline JSON and SHA-256 sidecar plus the
+final raw-audit JSON and sidecar remain queryable after index cleanup, so
+DataGrip/control-plane acceptance evidence is retained without one permanent
+million-row SQLite copy per run.
 
 ### Lossless generic Bronze
 
@@ -165,21 +204,27 @@ session. Camoufox navigates only `https://fbref.com/en/`; target pages use the
 exported cookies, user agent, proxy, and warm HTTP session. Nonessential browser
 assets are blocked while Cloudflare/Turnstile assets remain allowed.
 Every bootstrap navigation attempt is counted separately from browser resource
-requests and persisted; more than one attempt in a clearance session fails the
-run instead of being hidden behind a boolean metric.
+requests and persisted. The 100-request canary can fund one solve; the
+200-request profile may rotate across at most four failed exits. Any attempt
+beyond the reserved profile fails closed instead of being hidden behind a
+boolean metric.
 
 Hard defaults and caps:
 
 - current run: 200 total browser+HTTP requests, 100 MiB;
-- backfill run: at most 25 total browser+HTTP requests, 100 MiB;
+- backfill run: production 200 requests/100 MiB or canary 100/50 MiB;
 - replay: 0 requests and 0 bytes;
 - cumulative warm-HTTP response bodies for one target, including the bounded
   status retry: at most 2 MiB, enforced by the native libcurl write callback;
-- one request reserves 7 MiB before transport: 4 MiB for browser clearance,
-  2 MiB for cumulative HTTP bodies, and 1 MiB for HTTP wire headers;
-- a new clearance reserves up to 20 browser requests and 4 MiB;
-- shard size: current at most 25; backfill at most 2 after worst-case
-  bootstrap/target reservation clamping;
+- each logical warm target reserves two HTTP attempts and 3 MiB before
+  transport: 2 MiB for cumulative bodies plus 1 MiB for wire overhead;
+- bootstrap has an independent reservation: up to 80 browser requests/16 MiB
+  for a 200-request production run, or 20 requests/4 MiB for a 100-request
+  canary. Settlement releases unused capacity;
+- the browser is closed before final bootstrap accounting, so teardown and
+  late in-flight traffic cannot continue after reservation settlement;
+- shard size is at most 25 for current and backfill; the live runner drains at
+  most 16 batches under the single shared run budget;
 - domain interval: three seconds.
 
 The control budget is reserved before transport and fails validation on an
@@ -187,11 +232,14 @@ overspend. The transport also fails closed before an individual response can
 jump the cap: warm HTTP streams through a cumulative callback bound across
 retry attempts, while every browser request reserves fixed framing overhead
 and then its declared `Content-Length` against all parallel in-flight work.
-Missing, invalid, chunked, or oversized browser lengths abort the whole browser
-session. Failed requests use Playwright's observed sizes when available; if
-sizes are unknown, their full reservation remains charged. Teardown likewise
-charges every still-in-flight reservation, so partial traffic cannot be reused
-to cross the cap. The canary network-namespace quota remains defense in depth.
+An undeclared/chunked browser body reserves a bounded 512-KiB ceiling before it
+may be read; an invalid declaration, an oversized declared body, or growth past
+that ceiling aborts the whole browser session. Failed requests use Playwright's
+observed sizes when available; if sizes are unknown, their full reservation
+remains charged. Teardown likewise charges every still-in-flight reservation,
+so partial traffic cannot be reused to cross the cap. The standalone one-page
+diagnostic can additionally use a network-namespace quota; it is not the
+issue-949 Airflow acceptance canary.
 
 Blocking DAG handoffs are collision-safe: current, backfill, and replay render
 the child run id from both parent DAG id and parent run id, use the trigger
@@ -210,10 +258,11 @@ refresh and all three parser versions, so repeated content such as A -> B -> A
 is still processed once per observation. Stale observations keep generic raw
 evidence but cannot overwrite current typed or stateful output.
 
-Because bootstrap activity is charged to the same request budget, a 25-request
-canary does not imply 25 target pages. The 20-request bootstrap reserve leaves
-five request slots, while the 7-MiB per-target reservation under a 25-MiB
-budget lowers the effective maximum to three target requests.
+Because bootstrap activity is charged to the same request budget, the removed
+25-request experimental profile never implied 25 target pages: a 20-request
+bootstrap plus two requests per logical target could admit at most two targets.
+The supported Airflow canary is 100 requests/50 MiB and can admit one 25-target
+shard when the shared actual-traffic budget remains healthy.
 
 Durable metrics distinguish:
 
@@ -229,13 +278,14 @@ Durable metrics distinguish:
 - table availability and competition/sentinel coverage.
 
 Run validation fails when warm HTTP success is below 95%, unclassified failure
-rate is at least 0.5%, duplicate fetch violations are nonzero, any session has
-more than one bootstrap, female/unknown downstream targets are nonzero, a
-dataset/page marker is incomplete, or a budget is exceeded. These gates are
-implemented. Closure also requires the current generic, typed, and stateful
-parser-version tuple for every logical observation in current, backfill, and
-replay runs. The failed live canary exercised the traffic gates, but it did not
-reach raw persistence, table inventory, registry coverage, or sentinel gates.
+rate is at least 0.5%, duplicate fetch violations are nonzero, a session exceeds
+the four-attempt hard solve cap, female/unknown downstream targets are nonzero,
+a dataset/page marker is incomplete, or a budget is exceeded. The smaller
+canary reservation prevents a second solve before this final gate. Closure also
+requires the current generic, typed, and stateful parser-version tuple for every
+logical observation in current, backfill, and replay runs. The failed live
+canary exercised the traffic gates, but it did not reach raw persistence, table
+inventory, registry coverage, or sentinel gates.
 
 ### Bounded live canary
 
@@ -379,11 +429,11 @@ Two more defects surfaced only against real match pages and are fixed:
    its targets `leased` forever: they dropped out of the crawl and kept
    `promotion_pending_match_count` above zero, which fails the validation gate
    of every later run. The run start now reaps globally (commit `939d989`).
-6. `Camoufox.__enter__()` has no timeout and hangs indefinitely on a dead proxy
-   (observed twice live, 0 requests charged, the process idle inside
-   Playwright's event loop). The fetch-wave subprocess ran without a timeout, so
-   a hung wave would hold its leases for hours; it is now bounded by
-   `FETCH_WAVE_TIMEOUT_SECONDS = 30 min` and fails closed (commit `949f46b`).
+6. `Camoufox.__enter__()` can block on a dead proxy (observed twice live, with
+   the process idle inside Playwright's event loop). All live batches now run in
+   one new process session bounded at 110 minutes inside a 120-minute Airflow
+   task. Timeout or external task termination sends SIGTERM to the complete
+   runner/browser process group, then SIGKILL after a bounded grace period.
 
 ## Legacy production path removed
 
@@ -437,44 +487,51 @@ The suites below overlap and must not be added into one total.
 
 | Evidence set | Recorded result | Interpretation |
 |---|---:|---|
-| Final full unit suite | 3,586 passed, 40 skipped | The post-fix rerun includes the updated Gold scope golden and the logical-refresh-aware latest-observation fence. |
-| Post-fix focused golden/scope set | 34 passed | The changed expectation and directly affected Gold scope behavior are green. |
-| Observation/control/pipeline/downstream audit | 414 passed | Per-observation fences, latest-only stateful effects, replay/closure gates, policy and registry transitions, typed availability, and downstream identity/scope contracts. |
-| Exact hard-cap transport audit | 59 passed | Browser/body/header caps, failed/in-flight/unobserved charging, 304 evidence, 7-MiB reservations, and collision-safe DAG handoffs. |
-| Production-image DagBag/integration | 56 passed | Airflow-image DAG imports and the broader relevant integration set. |
+| 2026-07-15 issue-949 offline suite | 916 passed | Final-review CI selection: every FBref unit test plus the shared maintenance DAG/task, proxy-manager, and lazy-import tests, with plugin autoload disabled. |
+| 2026-07-15 real PostgreSQL semantics | 4 passed | Current-match priority, concurrent cohort exclusion, publication-lock fencing, immutable raw-baseline anchoring, and successful-attempt sealing ran against isolated migrated PostgreSQL databases. |
+| 2026-07-15 production Airflow 2.11.2 DagBag | 16 / 16 / 17 tasks | A byte-verified copy of the candidate supplied both `scrapers` and `dags/utils`; current, backfill, and replay loaded with no import errors. |
+| 2026-07-15 real SeaweedFS raw contract | 1 passed | Raw-v2 commit/readback/idempotency plus the disk-backed before/after audit ran through the production S3 API; all 15 objects under the unique test prefix were deleted and absence rechecked. |
+| 2026-07-15 DataGrip/janitor scope | 37 passed, 1 skipped | Both acceptance SQL files parsed (11 Trino and 4 PostgreSQL statements); generated checks ran against real services and exact/no-report match completeness stayed fail-closed. |
+| 2026-07-15 real Trino/Iceberg janitor | 1 passed | A nonempty stale FBref staging table was semantically proven stale, publication-fenced, dropped, and its absence rechecked. |
+| Earlier repository-wide unit baseline | 3,586 passed, 40 skipped | Pre-final-patch regression history including Gold scope and logical-refresh latest-observation behavior. |
+| Earlier focused golden/scope set | 34 passed | Pre-final-patch downstream Gold scope evidence. |
+| Earlier observation/control/downstream audit | 414 passed | Pre-final-patch evidence for observation fences, policy transitions, typed availability, and downstream identity/scope. |
+| Earlier hard-cap transport audit | 59 passed | Pre-final-patch browser/body/header cap, 304, reservation, and DAG-handoff evidence. |
+| Earlier broad production-image integration | 56 passed | Pre-final-patch regression history for Airflow imports and adjacent downstream integrations; not the candidate-specific issue-949 gate. |
 
 ### PostgreSQL 16 smoke
 
-An isolated PostgreSQL `16.14` container was tested through the production
-Airflow image with the checkout mounted read-only:
+The exact candidate copy was tested through the production Airflow runtime
+against an isolated database on PostgreSQL `16.14`. Migrations 1–9 were applied
+before pytest. Four real-transaction tests proved current-match admission ahead
+of enrichment backlog, concurrent cross-run cohort exclusion, publication-lock
+fencing across a simulated Trino write, and immutable raw-baseline/attempt-set
+anchors. The fixture's nested race databases and the candidate database were
+terminated and dropped; a final catalog query found no `fbref_candidate_949_*`
+or `fbref_race_*` database.
 
-- first migration applied `(1, 2, 3, 4, 5, 6, 7)`; second applied `()`;
-- CLI rerun returned `{"applied_migrations": []}`;
-- the advisory migration lock and concurrent claim/lease fences passed;
-- live-PostgreSQL smokes passed for gender eligibility, current/backfill lane
-  separation, recurring-to-one-shot policy transitions, and explicit
-  cross-run cohort exclusion;
-- a live same-hash and A -> B -> A replay smoke proved that only the newest
-  successful logical refresh may apply stateful effects;
-- versioned observation completion and run-summary closure SQL executed under
-  the current generic, typed, and stateful parser fences.
-
-The host test venv lacks `psycopg2`, producing a pre-SQL
-`ControlStoreConfigError`; the production Airflow image contains the runtime
-driver and passed. The temporary database container was removed.
+The host test venv intentionally remains import-light and lacks `psycopg2`;
+the production Airflow runtime contains the driver and is the environment that
+passed this semantic gate.
 
 ### Production-image DagBag and integration
 
-The final read-only run used image `data-platform-airflow-scheduler:latest`,
-which contains Airflow `2.7.3`. DagBag loaded all seven relevant DAGs with
-relevant import errors `{}` and no import errors globally. Observed task counts
-were current `20` at 06:00, backfill `54` manual, replay `11` manual, Silver
-`16`, xref `8`, Gold `31`, and master `16` at 14:00.
+The final read-only run used the active `airflow-scheduler` runtime with
+Airflow `2.11.2` and boto3 `1.42.61`. The candidate was copied to an isolated
+directory rather than imported from the active `/opt/airflow` mounts; SHA-256
+comparison covered all 55 present changed or untracked candidate files with zero
+mismatches. DagBag then loaded current `16`, backfill `16`, and replay `17`
+tasks with import errors `{}`. Module provenance for both `scrapers` and
+`dags/utils` resolved inside that isolated copy.
 
-The dedicated current/backfill/replay production-image smoke passed `7/7`.
-The final broader five-file integration set passed `56/56`. Its two stale
-expectations were corrected to follow the active `xref_manager.sql.j2` template
-and the registered transitive SPADL -> WhoScored lineup -> ESPN topology.
+CI imports the same DAGs on both the repository image pin (`2.7.3`) and the
+active runtime (`2.11.2`). Cross-DAG handoffs use the backward-compatible
+`execution_date` argument accepted by both versions.
+
+This candidate-specific run intentionally makes no fresh claim about unrelated
+xref, Gold, or master DAGs. Their earlier broad integration evidence remains
+useful regression history, but issue #949 accepts the FBref source boundary at
+the blocking Silver/Silver-DQ child.
 
 ## Reproducible verification commands
 
@@ -483,33 +540,26 @@ Offline FBref verification:
 ```bash
 make test-fbref-offline
 
-/root/.venvs/dpf-test/bin/pytest -p no:rerunfailures -q \
-  tests/unit/scrapers/test_fbref_control_store.py \
-  tests/unit/scrapers/test_fbref_raw_store_v2.py \
-  tests/unit/scrapers/test_fbref_page_document.py \
-  tests/unit/scrapers/test_fbref_discovery.py \
-  tests/unit/scrapers/test_fbref_fetcher.py \
-  tests/unit/scrapers/test_fbref_pipeline.py \
-  tests/unit/scrapers/test_fbref_generic_bronze.py \
-  tests/unit/scrapers/test_fbref_typed_bronze.py \
-  tests/unit/dags/test_dag_ingest_fbref.py \
-  tests/unit/dags/test_dag_backfill_fbref.py \
-  tests/unit/dags/test_dag_replay_fbref.py \
-  tests/unit/dags/test_fbref_medallion_order.py \
-  tests/unit/dags/test_fbref_pipeline_tasks.py
+mapfile -t tests < <(find tests/unit -type f -name '*fbref*.py' -print | sort)
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 /root/.venvs/dpf-test/bin/python -m pytest -q \
+  "${tests[@]}" \
+  tests/unit/dags/test_dag_iceberg_maintenance_daily.py \
+  tests/unit/dags/test_maintenance_tasks.py \
+  tests/unit/scrapers/test_proxy_manager.py \
+  tests/unit/scrapers/test_scrapers_lazy_import.py
 ```
 
-Production-image DagBag:
+Production-image DagBag (run after deploying the candidate mounts):
 
 ```bash
 docker compose exec -T airflow-scheduler python -c "\
 from airflow.models import DagBag; \
-ids=['dag_ingest_fbref','dag_backfill_fbref','dag_replay_fbref',\
-'dag_transform_fbref_silver','dag_transform_xref',\
-'dag_transform_fbref_gold','dag_master_pipeline']; \
+expected={'dag_ingest_fbref':16,'dag_backfill_fbref':16,'dag_replay_fbref':17}; \
 b=DagBag('/opt/airflow/dags', include_examples=False); \
-print({i: len(b.dags[i].tasks) for i in ids if i in b.dags}); \
-print({k:v for k,v in b.import_errors.items() if 'fbref' in k or 'master' in k})"
+counts={i:len(b.dags[i].tasks) for i in expected}; \
+assert counts == expected, counts; \
+assert not {k:v for k,v in b.import_errors.items() if 'fbref' in k}, b.import_errors; \
+print(counts)"
 ```
 
 PostgreSQL 16 migration and SQL smoke skeleton:
@@ -643,29 +693,44 @@ git diff --check
 
 ## Rollout plan
 
-1. Merge only after the final focused, full relevant, and production-image
-   DagBag/integration reruns are green.
-2. Deploy the Airflow image and run the idempotent control migration through
-   `airflow-init`; verify migration versions 1–7.
-3. Repair the 11 #901 raw event gaps and prove the strict Silver DQ suite green
-   before enabling automatic Gold promotion.
-4. Diagnose the classified canary HTTP `500`, then obtain a fresh bounded-live
-   authorization. Rerun the direct canary under a preventive kernel byte quota;
-   do not reuse the failed run or infer a green result from unit mocks.
-5. Inspect the control summary for budget use, female/unknown downstream count,
-   warm success, bootstraps, duplicate fetches, failures, P50/P95, page-kind
-   bytes, table availability, and sentinel coverage.
-6. After a successful raw commit, replay that canary source run through
-   `dag_replay_fbref`; require zero network attempts/bytes and zero remaining
-   parser-version candidates.
-7. Promote Silver -> xref -> Gold only after all strict gates pass. Monitor at
-   least one daily 06:00 run before expanding historical backfill.
-8. Run historical backfill manually in repeated 25-request batches. Each new
-   run selects the next unfinished registry cohort automatically; do not supply
-   or maintain an external cursor. A full 400-page soak requires separate
-   authorization and is not part of this plan.
+1. Merge and deploy one immutable SHA only after the final focused, complete
+   offline, real-dependency, and production-image checks are green. Run the
+   idempotent control migration through `airflow-init` and verify migrations
+   1–9 and their checksums.
+2. Repeat the issue-949 backfill dry-run on that SHA. Require the expected
+   seven-season cohort, zero network requests, zero state mutations, and no
+   publication lock or Silver child.
+3. Run one explicitly non-publishing current canary with exactly 100 requests,
+   50 MiB, and shard size 25 through `dag_ingest_fbref` DagRun conf. Reconcile
+   the control counters with the dedicated provider counter; do not substitute
+   the standalone one-page research runner for this Airflow acceptance run.
+4. For that canary, require the anchored raw inventory and sealed-attempt audit,
+   lossless generic Bronze parity, every materialized typed Bronze contract,
+   every run-owned DQ gate, and zero female/unknown publication. Record the
+   global pending-match backlog as a diagnostic; the non-publishing canary is
+   not allowed to claim that a bounded cohort closed the global frontier. Run
+   both DataGrip acceptance scripts against the same control-run UUID.
+5. Run two consecutive publishing current loads on the same immutable SHA with
+   the 200-request / 100-MiB / shard-25 profile. Require the blocking
+   FBref Silver transform and its DQ, zero promotion-pending current matches,
+   and the final publication-lock verdict to succeed for both runs. The
+   separately scheduled master/xref/Gold chain is outside this source
+   acceptance gate.
+6. Replay one accepted source control run through `dag_replay_fbref`. Require
+   request/byte budgets `0/0`, no fetch path, a zero raw-store delta, and no
+   remaining parser-version candidates.
+7. Record run IDs, control summaries, raw object/byte counts, Bronze row counts,
+   DQ output, and provider-traffic deltas in issue #949. Set the source to GO
+   only when the canary, both current runs, and replay are green on the same
+   SHA.
+8. Only after GO, start the separate bounded historical backfill. It selects
+   unfinished male-season cohorts from the durable registry; no manual league
+   list or external cursor is permitted. A full 400-page soak still requires
+   separate traffic authorization.
 
-The bounded no-Silver runner must be invoked through its kernel-quota wrapper:
+The older standalone one-page runner remains an optional transport diagnostic,
+not an issue-949 GO gate. If separately authorized, it must still be invoked
+through its kernel-quota wrapper:
 
 ```bash
 sudo env RUN_LIVE_FBREF_CANARY=1 \
@@ -674,7 +739,8 @@ sudo env RUN_LIVE_FBREF_CANARY=1 \
 
 The wrapper creates a short-lived container/network namespace and installs
 18-MiB ingress plus 4-MiB egress kernel quotas before invoking the one-page
-runner. The runner never imports Airflow or triggers Silver.
+runner. It never imports Airflow or triggers Silver and therefore cannot replace
+the required non-publishing `dag_ingest_fbref` 100/50/25 canary.
 
 ## Rollback plan
 
@@ -692,12 +758,12 @@ runner. The runner never imports Airflow or triggers Silver.
 6. Re-enable the new path only after the bounded canary and strict DQ evidence
    are green.
 
-## Remaining blockers
+## Remaining production-acceptance gates
 
-| Blocker | Consequence | Exit evidence |
+| Gate | Current consequence | Exit evidence |
 |---|---|---|
-| ~~Bounded canary failed on warm HTTP `500`~~ **CLEARED 2026-07-12** | — | Canary `562f020a-8f9b-53fe-bb5d-2b3825e5139e` succeeded: raw committed, parse green, every traffic/eligibility/coverage gate passed. |
-| Full 400-page soak not authorized | No production-scale throughput or long-session stability claim is valid. | Separate approval, hard request/MB cap, and recorded soak report. |
-| #901: 11 matches with a score and no events | Strict Silver DQ blocks promotion; weakening it would hide missing source data. | **Diagnosed 2026-07-12**: FBref publishes no events for these pages (empty containers in raw), so this is source absence, not a scrape gap. Exit = every one of the eleven refetched, its emptiness recorded in `bronze.fbref_dataset_availability`, and listed in `configs/medallion/fbref_event_source_gaps.yaml`; the gate stays ERROR for anything unregistered. |
-| Live traffic benchmark pending | No measured before/after Cloudflare/proxy/provider-billing claim is valid. Offline parser regression is measured at 2.27% and passes. | Reproducible bounded live benchmark with the approved page/request/byte mix and provider evidence. |
-| GitHub Project scope unavailable | Project-field classification cannot be verified or updated. | Credential with `read:project`, followed by a read-only audit or separately authorized mutation. |
+| This candidate is not deployed as one immutable SHA | Offline and dependency smokes do not constitute production acceptance. | Deploy one reviewed SHA, verify migrations 1–9 and record the runtime tree/image identity. |
+| Fresh bounded canary not run on this candidate | The source remains NO-GO and no publication/backfill is authorized. | Green non-publishing 100/50/25 canary with reconciled provider traffic and complete raw/Bronze/DQ evidence. |
+| Two sequential production current runs not run | Daily stability and idempotent second-run behavior remain unproven. | Two green 200/100/25 current runs on the same SHA, including the blocking publication chain. |
+| Zero-network replay not run from an accepted source run | Raw preservation and parser-only recovery are not yet proven in the deployed runtime. | Green replay with budgets `0/0`, no fetch task/path, zero raw delta, and no pending parser-version candidates. |
+| Full 400-page soak not authorized | No production-scale long-session throughput claim is valid. | Separate approval, hard request/byte cap, and a recorded soak report. |

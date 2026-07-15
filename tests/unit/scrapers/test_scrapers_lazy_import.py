@@ -26,3 +26,10 @@ assert 'scrapers.fbref' not in sys.modules
         text=True,
     )
     assert completed.returncode == 0, completed.stderr
+
+
+def test_package_does_not_advertise_removed_fbref_scraper_apis():
+    import scrapers
+
+    assert "FBrefScraper" not in scrapers.__all__
+    assert "NodriverFBrefScraper" not in scrapers.__all__

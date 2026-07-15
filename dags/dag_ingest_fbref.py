@@ -1,11 +1,4 @@
-"""Production FBref current-refresh DAG.
-
-The graph is intentionally static.  Each fetch task asks the PostgreSQL
-frontier for one bounded cohort, commits immutable raw HTML, and is followed
-by an offline parse task.  The durable frontier therefore provides discovery,
-deduplication, leases, retries, and backpressure without scheduler-local files
-or a hand-maintained league allowlist.
-"""
+"""Production FBref current-refresh DAG with one warm live runner."""
 
 from __future__ import annotations
 
@@ -14,6 +7,7 @@ from datetime import datetime, timedelta
 from airflow import DAG
 from airflow.models.param import Param
 from airflow.operators.python import PythonOperator
+from airflow.operators.python import BranchPythonOperator
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 
 from utils.default_args import DEFAULT_ARGS, INGEST_SCRAPER_POOL
@@ -24,12 +18,16 @@ from utils.fbref_pipeline_tasks import (
     FBREF_PRODUCTION_BYTE_LIMIT_MB,
     FBREF_PRODUCTION_REQUEST_LIMIT,
     acquire_fbref_publication_lock,
+    audit_fbref_raw_integrity,
+    capture_fbref_raw_baseline,
+    choose_fbref_publication_path,
     export_fbref_publication_scope,
-    fetch_fbref_wave,
     fbref_dag_failure_callback,
+    finalize_fbref_publication_lock,
     initialize_fbref_run,
-    parse_fbref_wave,
+    run_fbref_live_waves,
     run_recovery_wave,
+    release_fbref_publication_lock,
     seed_fbref_competition_index,
     validate_fbref_current_scope_freshness,
     validate_fbref_production_readiness,
@@ -50,10 +48,9 @@ PAGE_KINDS = (
     "match",
 )
 
-# Eight 25-target shards can consume, but never exceed, the 200-request run
-# budget.  Larger warm-session shards cut paid browser bootstraps from 25 to
-# at most 8 while fetch/parse memory remains bounded and sequential.
-CURRENT_WAVE_COUNT = 8
+# One unforked process advances bounded raw-first batches while retaining the
+# same clearance and proxy quarantine for the run.
+CURRENT_MAX_BATCHES = 16
 CURRENT_REQUEST_LIMIT = FBREF_PRODUCTION_REQUEST_LIMIT
 CURRENT_BYTE_LIMIT_MB = FBREF_PRODUCTION_BYTE_LIMIT_MB
 DEFAULT_SHARD_SIZE = FBREF_MAX_WARM_SESSION_TARGETS
@@ -114,7 +111,9 @@ with DAG(
     Silver starts only after the final completeness/traffic validation passes.
     DagRun conf may select only the measured `100/50` canary profile or the
     default `200/100` production profile; every warm session claims at most 25
-    targets. ALERT_ENV must be `prod` before the control run is created.
+    targets. A content-hashed raw inventory is captured before recovery/fetch,
+    and publication is gated by a persisted integrity artifact. ALERT_ENV must
+    be `prod` before the control run is created.
     """,
 ) as dag:
     validate_production_readiness = PythonOperator(
@@ -139,7 +138,7 @@ with DAG(
             "request_limit": REQUEST_LIMIT,
             "byte_limit_mb": BYTE_LIMIT_MB,
             "shard_size": SHARD_SIZE,
-            "reservation_mb": 7,
+            "reservation_mb": 3,
             "domain_interval_seconds": 3.0,
         },
         trigger_rule="all_success",
@@ -171,54 +170,86 @@ with DAG(
             "request_limit": REQUEST_LIMIT,
             "byte_limit_mb": BYTE_LIMIT_MB,
             "shard_size": SHARD_SIZE,
-            "reservation_mb": 7,
+            "reservation_mb": 3,
         },
+        trigger_rule="all_success",
+    )
+
+    capture_raw_baseline = PythonOperator(
+        task_id="capture_raw_baseline",
+        python_callable=capture_fbref_raw_baseline,
+        op_kwargs={"airflow_run_id": AIRFLOW_RUN_ID, "dag_id": DAG_ID},
         trigger_rule="all_success",
     )
 
     validate_production_readiness >> initialize_run
     initialize_run >> acquire_publication_lock >> seed_competition_index
-    seed_competition_index >> recover_raw
-    previous = recover_raw
-    for wave_number in range(1, CURRENT_WAVE_COUNT + 1):
-        fetch = PythonOperator(
-            task_id=f"fetch_wave_{wave_number:02d}",
-            python_callable=fetch_fbref_wave,
-            op_kwargs={
-                "airflow_run_id": AIRFLOW_RUN_ID,
-                "dag_id": DAG_ID,
-                "worker_id": (
-                    f"current-wave-{wave_number:02d}:{{{{ run_id }}}}"
-                ),
-                "page_kinds": PAGE_KINDS,
-                "run_type": "current",
-                "request_limit": REQUEST_LIMIT,
-                "byte_limit_mb": BYTE_LIMIT_MB,
-                "shard_size": SHARD_SIZE,
-                "reservation_mb": 7,
-                "domain_interval_seconds": 3.0,
-            },
-            pool=INGEST_SCRAPER_POOL,
-            retries=0,
-            trigger_rule="all_success",
-        )
-        parse = PythonOperator(
-            task_id=f"parse_wave_{wave_number:02d}",
-            python_callable=parse_fbref_wave,
-            op_kwargs={
-                "airflow_run_id": AIRFLOW_RUN_ID,
-                "dag_id": DAG_ID,
-                "page_kinds": PAGE_KINDS,
-                "run_type": "current",
-                "request_limit": REQUEST_LIMIT,
-                "byte_limit_mb": BYTE_LIMIT_MB,
-                "shard_size": SHARD_SIZE,
-                "reservation_mb": 7,
-            },
-            trigger_rule="all_success",
-        )
-        previous >> fetch >> parse
-        previous = parse
+    seed_competition_index >> capture_raw_baseline >> recover_raw
+    live_waves = PythonOperator(
+        task_id="run_live_waves",
+        python_callable=run_fbref_live_waves,
+        op_kwargs={
+            "airflow_run_id": AIRFLOW_RUN_ID,
+            "dag_id": DAG_ID,
+            "worker_id": "current-live:{{ run_id }}",
+            "page_kinds": PAGE_KINDS,
+            "run_type": "current",
+            "request_limit": REQUEST_LIMIT,
+            "byte_limit_mb": BYTE_LIMIT_MB,
+            "shard_size": SHARD_SIZE,
+            "reservation_mb": 3,
+            "domain_interval_seconds": 3.0,
+            "max_batches": CURRENT_MAX_BATCHES,
+        },
+        pool=INGEST_SCRAPER_POOL,
+        execution_timeout=timedelta(minutes=120),
+        retries=0,
+        trigger_rule="all_success",
+    )
+    recover_raw >> live_waves
+    audit_raw_integrity = PythonOperator(
+        task_id="audit_raw_integrity",
+        python_callable=audit_fbref_raw_integrity,
+        op_kwargs={
+            "airflow_run_id": AIRFLOW_RUN_ID,
+            "dag_id": DAG_ID,
+            "run_type": "current",
+        },
+        trigger_rule="all_success",
+    )
+    live_waves >> audit_raw_integrity
+    previous = audit_raw_integrity
+
+    choose_path = BranchPythonOperator(
+        task_id="choose_publication_path",
+        python_callable=choose_fbref_publication_path,
+        op_kwargs={
+            "request_limit": REQUEST_LIMIT,
+            "byte_limit_mb": BYTE_LIMIT_MB,
+        },
+        trigger_rule="all_success",
+    )
+
+    validate_canary = PythonOperator(
+        task_id="validate_canary_run",
+        python_callable=validate_fbref_run,
+        op_kwargs={
+            "airflow_run_id": AIRFLOW_RUN_ID,
+            "dag_id": DAG_ID,
+            "publication_eligible": False,
+        },
+        trigger_rule="all_success",
+    )
+
+    release_canary_lock = PythonOperator(
+        task_id="release_canary_publication_lock",
+        python_callable=release_fbref_publication_lock,
+        op_kwargs={
+            "airflow_run_id": AIRFLOW_RUN_ID,
+            "dag_id": DAG_ID,
+        },
+        trigger_rule="all_success",
+    )
 
     validate_freshness = PythonOperator(
         task_id="validate_current_scope_freshness",
@@ -249,7 +280,7 @@ with DAG(
         task_id="trigger_silver_transform",
         trigger_dag_id="dag_transform_fbref_silver",
         trigger_run_id="fbref_silver__{{ dag.dag_id }}__{{ run_id }}",
-        logical_date="{{ ti.start_date }}",
+        execution_date="{{ ti.start_date }}",
         conf={
             "fbref_source_dag_id": DAG_ID,
             "fbref_source_run_id": AIRFLOW_RUN_ID,
@@ -269,8 +300,20 @@ with DAG(
         trigger_rule="all_success",
     )
 
-    previous >> validate_freshness >> validate_run
+    release_publication_lock = PythonOperator(
+        task_id="release_publication_lock",
+        python_callable=finalize_fbref_publication_lock,
+        op_kwargs={"airflow_run_id": AIRFLOW_RUN_ID, "dag_id": DAG_ID},
+        retries=0,
+        trigger_rule="all_done",
+    )
+
+    previous >> choose_path
+    choose_path >> validate_canary >> release_canary_lock
+    choose_path >> validate_freshness >> validate_run
     validate_run >> export_publication_scope >> trigger_silver
+    trigger_silver >> release_publication_lock
+    release_canary_lock >> release_publication_lock
 
 
 __all__ = ["dag"]

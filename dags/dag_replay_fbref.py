@@ -17,6 +17,8 @@ from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 from utils.default_args import DEFAULT_ARGS
 from utils.fbref_pipeline_tasks import (
     acquire_fbref_publication_lock,
+    audit_fbref_raw_integrity,
+    capture_fbref_raw_baseline,
     export_fbref_publication_scope,
     fbref_dag_failure_callback,
     finalize_fbref_publication_lock,
@@ -88,7 +90,8 @@ with DAG(
     `source_control_run_id` is required. The DAG creates a separate replay
     control run with request and byte limits set to zero, then processes only
     raw manifests missing the current parser version. It contains no fetch
-    task and cannot construct the FBref transport.
+    task and cannot construct the FBref transport. A before/after inventory
+    gate proves replay created, deleted, or rewrote zero raw objects.
     """,
 ) as dag:
     validate_production_readiness = PythonOperator(
@@ -113,7 +116,7 @@ with DAG(
             "request_limit": 0,
             "byte_limit_mb": 0,
             "shard_size": REPLAY_SHARD_SIZE,
-            "reservation_mb": 7,
+            "reservation_mb": 3,
             "domain_interval_seconds": 3.0,
         },
         trigger_rule="all_success",
@@ -127,9 +130,16 @@ with DAG(
         trigger_rule="all_success",
     )
 
+    capture_raw_baseline = PythonOperator(
+        task_id="capture_raw_baseline",
+        python_callable=capture_fbref_raw_baseline,
+        op_kwargs={"airflow_run_id": AIRFLOW_RUN_ID, "dag_id": DAG_ID},
+        trigger_rule="all_success",
+    )
+
     validate_production_readiness >> initialize_run
-    initialize_run >> acquire_publication_lock
-    previous = acquire_publication_lock
+    initialize_run >> acquire_publication_lock >> capture_raw_baseline
+    previous = capture_raw_baseline
     for wave_number in range(1, REPLAY_WAVE_COUNT + 1):
         parse = PythonOperator(
             task_id=f"parse_wave_{wave_number:02d}",
@@ -143,12 +153,26 @@ with DAG(
                 "request_limit": 0,
                 "byte_limit_mb": 0,
                 "shard_size": REPLAY_SHARD_SIZE,
-                "reservation_mb": 7,
+                "reservation_mb": 3,
             },
             trigger_rule="all_success",
         )
         previous >> parse
         previous = parse
+
+    audit_raw_integrity = PythonOperator(
+        task_id="audit_raw_integrity",
+        python_callable=audit_fbref_raw_integrity,
+        op_kwargs={
+            "airflow_run_id": AIRFLOW_RUN_ID,
+            "dag_id": DAG_ID,
+            "run_type": "replay",
+            "source_control_run_id": SOURCE_CONTROL_RUN_ID,
+        },
+        trigger_rule="all_success",
+    )
+    previous >> audit_raw_integrity
+    previous = audit_raw_integrity
 
     validate_run = PythonOperator(
         task_id="validate_run",
@@ -172,7 +196,7 @@ with DAG(
         task_id="trigger_silver_transform",
         trigger_dag_id="dag_transform_fbref_silver",
         trigger_run_id="fbref_silver__{{ dag.dag_id }}__{{ run_id }}",
-        logical_date="{{ ti.start_date }}",
+        execution_date="{{ ti.start_date }}",
         conf={
             "fbref_source_dag_id": DAG_ID,
             "fbref_source_run_id": AIRFLOW_RUN_ID,

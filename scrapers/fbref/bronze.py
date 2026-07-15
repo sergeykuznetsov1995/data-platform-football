@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
-import re
 import uuid
 from datetime import datetime, timezone
 from typing import Dict, Iterable, Optional, Sequence
@@ -89,10 +89,21 @@ class GenericPersistenceError(RuntimeError):
 
 
 def _token(value: Optional[str]) -> str:
-    candidate = re.sub(r"[^a-zA-Z0-9_]", "_", value or "").strip("_")
-    candidate = candidate[:48]
-    suffix = uuid.uuid4().hex[:12]
-    return f"{candidate}_{suffix}" if candidate else suffix
+    """Return a deterministic, janitor-readable staging owner token.
+
+    Production passes ``logical_refresh_id`` here.  Keeping the UUID in the
+    table name makes a retained stage attributable to exactly one immutable
+    control-plane observation and makes a retry reuse that stage.  Callers
+    outside the production pipeline still get a stable, collision-resistant
+    token without leaking arbitrary input into an SQL identifier.
+    """
+
+    identity = str(value or "").strip()
+    try:
+        return f"lr_{uuid.UUID(identity).hex}"
+    except (AttributeError, TypeError, ValueError):
+        digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
+        return f"id_{digest}"
 
 
 class FBrefGenericBronzeWriter:
