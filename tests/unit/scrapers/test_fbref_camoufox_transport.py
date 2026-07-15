@@ -233,6 +233,7 @@ def test_duplicate_routed_failure_stays_settled_for_late_response():
     assert transport.traffic_stats()["network_policy_failed"] is False
     assert transport._settled_failed_request_urls == {}
     assert transport._settled_failed_request_guids == {}
+    assert transport._late_response_request_guids == {"request@bootstrap"}
 
 
 @pytest.mark.unit
@@ -565,6 +566,97 @@ def test_unrouted_response_latches_policy_and_conservative_charge():
 
 
 @pytest.mark.unit
+def test_same_url_response_with_different_guid_is_unrouted():
+    admission = (
+        BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
+        + BROWSER_UNDECLARED_BODY_RESERVATION_BYTES
+    )
+    transport = CamoufoxFbrefTransport(
+        max_network_requests=5,
+        max_network_bytes=3 * admission,
+    )
+    admitted = _Route(url="https://fbref.com/en/")
+    admitted.request._impl_obj._guid = "request@admitted"
+    transport._maybe_block(admitted)
+    escaped = MagicMock(
+        resource_type="document",
+        url=admitted.request.url,
+    )
+    escaped._impl_obj._guid = "request@escaped"
+
+    transport._on_response(
+        _Response(escaped, {"content-length": "0"}, status=200)
+    )
+
+    stats = transport.traffic_stats()
+    assert stats["network_policy_failed"] is True
+    assert stats["network_policy_failure"] == "unrouted_http_response"
+    assert stats["real_requests_count"] == 2
+
+
+@pytest.mark.unit
+def test_unrouted_response_diagnostic_is_useful_and_redacted(caplog):
+    transport = CamoufoxFbrefTransport(
+        max_network_requests=5,
+        max_network_bytes=3 * UNEXPECTED_BROWSER_NETWORK_RESERVATION_BYTES,
+    )
+    transport._navigation_source_url = "https://fbref.com/en/"
+    request = MagicMock(
+        resource_type="document",
+        url="https://fbref.com/en/?challenge_secret=do-not-log",
+        is_navigation_request=True,
+        redirected_from=None,
+    )
+    request._impl_obj._guid = "request@escaped"
+    transport._late_response_request_guids.add("request@escaped")
+
+    with caplog.at_level("ERROR"):
+        transport._on_response(
+            _Response(
+                request,
+                {"location": "/next?token=do-not-log"},
+                status=302,
+            )
+        )
+
+    assert "response missed route admission" in caplog.text
+    assert "status=302" in caplog.text
+    assert "resource=document" in caplog.text
+    assert "same_guid_routed_failure=False" in caplog.text
+    assert "same_guid_late_response=True" in caplog.text
+    assert "location_present=True" in caplog.text
+    assert "challenge_secret" not in caplog.text
+    assert "do-not-log" not in caplog.text
+    assert transport.traffic_stats()["network_policy_failed"] is True
+
+
+@pytest.mark.unit
+def test_unrouted_response_stays_fail_closed_when_diagnostic_raises(caplog):
+    transport = CamoufoxFbrefTransport(
+        max_network_requests=5,
+        max_network_bytes=3 * UNEXPECTED_BROWSER_NETWORK_RESERVATION_BYTES,
+    )
+    transport._log_unrouted_response = MagicMock(  # type: ignore[method-assign]
+        side_effect=RuntimeError("secret-url-token")
+    )
+    request = MagicMock(
+        resource_type="document",
+        url="https://fbref.com/en/escaped",
+    )
+
+    with caplog.at_level("ERROR"):
+        transport._on_response(
+            _Response(request, {"content-length": "0"}, status=200)
+        )
+
+    stats = transport.traffic_stats()
+    assert stats["network_policy_failed"] is True
+    assert stats["network_policy_failure"] == "unrouted_http_response"
+    assert stats["real_requests_count"] == 1
+    assert "secret-url-token" not in caplog.text
+
+
+@pytest.mark.unit
 def test_unrouted_request_completion_latches_and_charges_once():
     transport = CamoufoxFbrefTransport(
         max_network_requests=5,
@@ -598,9 +690,11 @@ def test_rewrapped_request_reuses_its_route_reservation():
         max_network_requests=5,
     )
     route = _Route()
+    route.request._impl_obj._guid = "request@rewrapped"
     transport._maybe_block(route)
 
     rewrapped = MagicMock(resource_type="document", url=route.request.url)
+    rewrapped._impl_obj._guid = "request@rewrapped"
     rewrapped.redirected_from = None
     transport._on_response(_Response(rewrapped, {"content-length": "50"}))
 
@@ -621,6 +715,8 @@ def test_rewrapped_request_reuses_its_route_reservation():
     assert stats["inflight_reserved_bytes"] == 0
     assert stats["unobserved_reserved_bytes"] == 0
     assert stats["real_bytes_downloaded"] == 70
+    assert transport._inflight_request_guids == {}
+    assert transport._inflight_ids_by_guid == {}
 
 
 @pytest.mark.unit
