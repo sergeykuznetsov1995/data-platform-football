@@ -501,11 +501,13 @@ class CamoufoxFbrefTransport:
         self._navigation_attempts = 0
         self._budget_blocked_count = 0
         self._inflight_byte_reservations: Dict[int, int] = {}
-        # Playwright/Firefox may hand a *different* Request wrapper to the
-        # response/finished callbacks than the one seen by route(), so the
-        # reservation is also indexed by request URL to survive re-wrapping.
+        # Playwright/Firefox may hand a *different* Request wrapper to later
+        # callbacks. Stable Playwright GUID is the primary identity; URL is a
+        # fail-closed compatibility fallback only when neither side has one.
         self._inflight_request_urls: Dict[int, str] = {}
         self._inflight_ids_by_url: Dict[str, list] = {}
+        self._inflight_request_guids: Dict[int, str] = {}
+        self._inflight_ids_by_guid: Dict[str, list] = {}
         # route.abort() produces a normal Playwright requestfailed event. Keep
         # those request identities so that callback is not mistaken for HTTP
         # traffic that bypassed route admission. URL queues cover Playwright
@@ -523,6 +525,8 @@ class CamoufoxFbrefTransport:
         self._settled_failed_request_urls: Dict[int, Optional[str]] = {}
         self._settled_failed_ids_by_url: Dict[str, list] = {}
         self._settled_failed_request_guids: Dict[int, str] = {}
+        self._routed_failed_request_guids: set[str] = set()
+        self._late_response_request_guids: set[str] = set()
         self._responded_request_urls: Dict[int, Optional[str]] = {}
         self._responded_ids_by_url: Dict[str, list] = {}
         self._navigation_source_url: Optional[str] = None
@@ -991,6 +995,9 @@ class CamoufoxFbrefTransport:
         key = self._settled_failed_marker_key(req)
         if key is None:
             return False
+        guid = self._settled_failed_request_guids.get(key)
+        if guid is not None:
+            self._late_response_request_guids.add(guid)
         self._forget_settled_failed_marker(key)
         return True
 
@@ -1021,6 +1028,8 @@ class CamoufoxFbrefTransport:
         self._settled_failed_request_urls.clear()
         self._settled_failed_ids_by_url.clear()
         self._settled_failed_request_guids.clear()
+        self._routed_failed_request_guids.clear()
+        self._late_response_request_guids.clear()
         self._responded_request_urls.clear()
         self._responded_ids_by_url.clear()
 
@@ -1028,10 +1037,17 @@ class CamoufoxFbrefTransport:
         key = id(req)
         self._inflight_byte_reservations[key] = reservation
         self._inflight_reserved_bytes += reservation
+        self._index_inflight_request(key, req)
+
+    def _index_inflight_request(self, key: int, req) -> None:
         url = self._request_url(req)
         if url is not None:
             self._inflight_request_urls[key] = url
             self._inflight_ids_by_url.setdefault(url, []).append(key)
+        guid = self._request_guid(req)
+        if guid is not None:
+            self._inflight_request_guids[key] = guid
+            self._inflight_ids_by_guid.setdefault(guid, []).append(key)
 
     def _clear_inflight_tracking(self, *, charge_unobserved: bool) -> None:
         """Atomically discard every index for the current in-flight set."""
@@ -1041,6 +1057,8 @@ class CamoufoxFbrefTransport:
         self._inflight_byte_reservations.clear()
         self._inflight_request_urls.clear()
         self._inflight_ids_by_url.clear()
+        self._inflight_request_guids.clear()
+        self._inflight_ids_by_guid.clear()
         self._inflight_reserved_bytes = 0
 
     def _forget_reservation(self, key: int) -> int:
@@ -1055,33 +1073,54 @@ class CamoufoxFbrefTransport:
                     pass
                 if not keys:
                     self._inflight_ids_by_url.pop(url, None)
+        guid = self._inflight_request_guids.pop(key, None)
+        if guid is not None:
+            keys = self._inflight_ids_by_guid.get(guid)
+            if keys:
+                try:
+                    keys.remove(key)
+                except ValueError:
+                    pass
+                if not keys:
+                    self._inflight_ids_by_guid.pop(guid, None)
         return reserved
 
     def _reservation_key(self, req) -> Optional[int]:
-        """Reservation key for ``req``, re-keying a re-wrapped request by URL.
+        """Reservation key for ``req``, re-keying a re-wrapped request.
 
-        The route callback and the response/finished callbacks can receive
-        different Python wrappers for the same in-flight request, so identity
-        alone loses the reservation and would fail the session closed.
+        Different Python wrappers for the same in-flight request share a
+        Playwright GUID. URL fallback is allowed only for legacy/detached
+        wrappers where the admitted request also had no stable GUID.
         """
         key = id(req)
+        guid = self._request_guid(req)
         if key in self._inflight_byte_reservations:
+            known_guid = self._inflight_request_guids.get(key)
+            if known_guid != guid:
+                return None
+            if guid is None and self._inflight_request_urls.get(key) != (
+                self._request_url(req)
+            ):
+                return None
             return key
-        url = self._request_url(req)
-        if url is None:
-            return None
-        keys = self._inflight_ids_by_url.get(url)
-        if not keys:
-            return None
-        stale_key = keys[0]
-        reserved = self._inflight_byte_reservations.pop(stale_key, 0)
-        self._inflight_request_urls.pop(stale_key, None)
-        keys.pop(0)
-        if not keys:
-            self._inflight_ids_by_url.pop(url, None)
+        if guid is not None:
+            keys = self._inflight_ids_by_guid.get(guid)
+            if not keys:
+                return None
+            stale_key = keys[0]
+        else:
+            url = self._request_url(req)
+            if url is None:
+                return None
+            keys = self._inflight_ids_by_url.get(url)
+            if not keys:
+                return None
+            stale_key = keys[0]
+            if stale_key in self._inflight_request_guids:
+                return None
+        reserved = self._forget_reservation(stale_key)
         self._inflight_byte_reservations[key] = reserved
-        self._inflight_request_urls[key] = url
-        self._inflight_ids_by_url.setdefault(url, []).append(key)
+        self._index_inflight_request(key, req)
         return key
 
     def _release_byte_reservation(self, req) -> int:
@@ -1362,6 +1401,72 @@ class CamoufoxFbrefTransport:
 
         self._latch_unexpected_network("unrouted_http_response")
 
+    def _log_unrouted_response(self, response, req) -> None:
+        """Log safe callback facts without exposing URLs or challenge tokens."""
+
+        url = self._request_url(req)
+        guid = self._request_guid(req)
+        try:
+            resource_type = str(req.resource_type or "unknown")[:32]
+        except Exception:  # noqa: BLE001 — detached request diagnostics
+            resource_type = "unknown"
+        try:
+            redirected_from = req.redirected_from
+        except Exception:  # noqa: BLE001 — detached request diagnostics
+            redirected_from = None
+        source = self._navigation_source_url
+        headers = self._response_headers(response)
+        logger.error(
+            "Camoufox response missed route admission "
+            "(status=%s resource=%s navigation=%s "
+            "same_url_inflight=%d same_url_settled=%d "
+            "same_guid_inflight=%s same_guid_settled=%s "
+            "same_guid_routed_failure=%s same_guid_late_response=%s "
+            "source_active=%s source_match=%s "
+            "redirected_from_present=%s redirected_from_source=%s "
+            "redirect_blocked=%s "
+            "location_present=%s location_safe=%s)",
+            self._response_status(response),
+            resource_type,
+            self._is_navigation_request(req),
+            len(self._inflight_ids_by_url.get(url or "", ())),
+            len(self._settled_failed_ids_by_url.get(url or "", ())),
+            bool(
+                guid is not None
+                and guid in self._inflight_request_guids.values()
+            ),
+            bool(
+                guid is not None
+                and guid in self._settled_failed_request_guids.values()
+            ),
+            bool(
+                guid is not None
+                and guid in self._routed_failed_request_guids
+            ),
+            bool(
+                guid is not None
+                and guid in self._late_response_request_guids
+            ),
+            source is not None,
+            self._normalized_https_url(url) == source,
+            redirected_from is not None,
+            self._normalized_https_url(
+                self._request_url(redirected_from)
+                if redirected_from is not None
+                else None
+            )
+            == source,
+            self._redirect_blocked,
+            bool(headers.get("location")),
+            bool(
+                source is not None
+                and self._manual_redirect_target(
+                    source,
+                    headers.get("location"),
+                )
+            ),
+        )
+
     def _on_response(self, response) -> None:
         """Reserve the declared body before any response can cross the cap."""
 
@@ -1382,6 +1487,10 @@ class CamoufoxFbrefTransport:
                 return
             self._remember_unrouted_response(req)
             self._reject_unrouted_request()
+            try:
+                self._log_unrouted_response(response, req)
+            except Exception:  # noqa: BLE001 — policy latch must survive logs
+                logger.error("Camoufox unrouted response diagnostic failed")
             return
         headers = self._response_headers(response)
         self._remember_responded_request(req)
@@ -1479,6 +1588,9 @@ class CamoufoxFbrefTransport:
             return
         reservation_key = self._reservation_key(req)
         if reservation_key is not None:
+            guid = self._request_guid(req)
+            if guid is not None:
+                self._routed_failed_request_guids.add(guid)
             if not self._consume_responded_request(req):
                 self._remember_settled_failed_request(req)
             reserved = self._release_byte_reservation(req)
