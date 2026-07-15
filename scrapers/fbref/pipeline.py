@@ -1284,6 +1284,36 @@ class FBrefPipeline:
                     result.browser_bootstraps += (
                         exc.browser_bootstrap_attempts
                     )
+                    if exc.error_class == "hard_transport_policy":
+                        # This is a run-level paid-transport invariant, not a
+                        # bad target or a clearance that may be re-solved. Save
+                        # the exact failed attempt, leave untouched targets
+                        # claimable, and stop before a new transport/lease can
+                        # spend again.
+                        self.control.fail_fetch(
+                            lease,
+                            error_class=exc.error_class,
+                            error_message=str(exc),
+                            retry_delay_seconds=60,
+                            permanent=False,
+                            requeue=False,
+                            http_status=exc.http_status,
+                            http_request_count=exc.http_requests,
+                            http_status_history=exc.http_status_history,
+                            wire_bytes=exc.wire_bytes,
+                            provider_billed_bytes=exc.provider_billed_bytes,
+                            latency_ms=exc.latency_ms,
+                            transport_version=FETCHER_VERSION,
+                            session_version=live_session.session_id,
+                        )
+                        untouched = leases[lease_index + 1:]
+                        result.requeued_session_exhaustion += (
+                            self.control.requeue_unfetched_targets(untouched)
+                        )
+                        result.failures.append(
+                            f"{lease.target_id}:hard_transport_policy"
+                        )
+                        break
                     if _session_failure(exc):
                         # The attempt is real traffic evidence, but the page
                         # itself was never judged. Keep the same immutable

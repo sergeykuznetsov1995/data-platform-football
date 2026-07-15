@@ -14,8 +14,8 @@ the FBref code path and its separately mounted production pool.
 
 The default hard limits are 100 MiB per DagRun/lease and 300 MiB per UTC day.
 Only one FBref lease may be active. The data plane allows FBref, Cloudflare
-Turnstile, and Camoufox's two IP-location endpoints; every other host gets 403
-before an upstream connection is opened.
+Turnstile, and one bounded Camoufox IP-location endpoint; every other host gets
+403 before an upstream connection is opened.
 
 ## Production mount
 

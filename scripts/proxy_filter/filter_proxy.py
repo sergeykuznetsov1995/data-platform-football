@@ -162,7 +162,6 @@ FBREF_ALLOWED_HOSTS = frozenset(
         "api.ipify.org",
         "challenges.cloudflare.com",
         "fbref.com",
-        "ipinfo.io",
         "turnstile.cloudflare.com",
     }
 )
@@ -458,7 +457,10 @@ def _lease_host_allowed(lease: Lease | None, host: str) -> bool:
     """Enforce source host scope before any residential upstream is dialled."""
     normalized = host.lower().rstrip(".")
     if normalized == SOFASCORE_CANARY_EXIT_PROBE_HOST:
-        return lease is not None and lease.source == "sofascore_canary"
+        return lease is not None and lease.source in {
+            "fbref",
+            "sofascore_canary",
+        }
     if lease is not None and lease.source in ("sofascore", "sofascore_canary"):
         return (
             normalized == "sofascore.com"
@@ -1634,6 +1636,77 @@ def _authorized_control_lease(lease_id: str, authorization: str | None) -> Lease
     return lease if secrets.compare_digest(token, lease.token) else None
 
 
+def _fbref_lease_extension_ceiling(lease: Lease) -> int:
+    """Largest safe absolute cap for one drained FBref lease.
+
+    Shared counters already contain this lease's spend.  Add that spend back to
+    the remaining shared allowance because ``max_bytes`` is an absolute cap for
+    this lease, not a delta.  Reservations from every lease stay subtracted.
+    """
+
+    _refresh_daily_counter()
+    run_key = lease.dagrun_key
+    url_key = (run_key, lease.canonical_url)
+    daily_remaining = max(
+        0,
+        DAILY_BUDGET_BYTES - _daily_total_bytes() - _daily_reserved_bytes,
+    )
+    run_remaining = max(
+        0,
+        _lease_dagrun_budget_bytes(lease)
+        - _run_total_bytes(run_key)
+        - _run_reserved_bytes[run_key],
+    )
+    url_remaining = max(
+        0,
+        _lease_url_budget_bytes(lease)
+        - _url_total_bytes(run_key, lease.canonical_url)
+        - _url_reserved_bytes[url_key],
+    )
+    return min(
+        MAX_LEASE_BYTES,
+        lease.total_bytes + min(daily_remaining, run_remaining, url_remaining),
+    )
+
+
+def _extend_fbref_lease(lease: Lease, new_max_bytes: int) -> dict[str, Any]:
+    """Durably raise one idle FBref lease cap without changing its identity."""
+
+    if isinstance(new_max_bytes, bool) or not isinstance(new_max_bytes, int):
+        raise ValueError("max_bytes must be an integer")
+    if lease.source != "fbref":
+        raise RuntimeError("only FBref leases may be extended")
+    if lease.closed or lease.expired or lease.budget_exceeded:
+        raise RuntimeError("FBref lease is not open and usable")
+    if (
+        lease.active_tunnels != 0
+        or lease.reserved_bytes != 0
+        or bool(lease.current_request_id)
+        or bool(lease.current_endpoint)
+    ):
+        raise RuntimeError("FBref lease still has active provider work")
+    if new_max_bytes <= lease.max_bytes:
+        raise ValueError("max_bytes must increase the current lease cap")
+    if new_max_bytes > MAX_LEASE_BYTES:
+        raise ValueError(f"max_bytes must not exceed {MAX_LEASE_BYTES}")
+    ceiling = _fbref_lease_extension_ceiling(lease)
+    if new_max_bytes > ceiling:
+        raise RuntimeError("FBref lease extension exceeds remaining shared budget")
+
+    previous_max_bytes = lease.max_bytes
+    # The event is the commit point.  A write/fsync failure leaves the live
+    # data-plane cap unchanged and no success response is emitted.
+    _append_budget_event(
+        "lease_extended",
+        lease,
+        previous_max_bytes=previous_max_bytes,
+        max_bytes=new_max_bytes,
+        lease_total_bytes=lease.total_bytes,
+    )
+    lease.max_bytes = new_max_bytes
+    return _control_report(lease)
+
+
 def _lease_remaining(lease: Lease) -> int:
     if not lease.usable:
         return 0
@@ -2373,6 +2446,33 @@ async def _handle_control(
     if lease is None:
         await _send_json(writer, 401, {"error": "invalid lease token"})
         return True
+    if method == "POST" and action == "extend":
+        try:
+            length = int(headers.get("content-length", "0"))
+            if length <= 0 or length > MAX_CONTROL_BODY_BYTES:
+                raise ValueError(
+                    "lease extension body must be in "
+                    f"1..{MAX_CONTROL_BODY_BYTES} bytes"
+                )
+            request = json.loads((await reader.readexactly(length)).decode("utf-8"))
+            if not isinstance(request, dict):
+                raise ValueError("lease extension body must be an object")
+            requested_max = request.get("max_bytes")
+            if isinstance(requested_max, bool) or not isinstance(requested_max, int):
+                raise ValueError("max_bytes must be an integer")
+            report = _extend_fbref_lease(lease, requested_max)
+        except (ValueError, TypeError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+            await _send_json(writer, 400, {"error": str(exc)})
+            return True
+        except RuntimeError as exc:
+            await _send_json(
+                writer,
+                409,
+                {"code": "lease_extend_rejected", "error": str(exc)},
+            )
+            return True
+        await _send_json(writer, 200, report)
+        return True
     if method == "GET" and action == "stats":
         await _send_json(writer, 200, _control_report(lease))
         return True
@@ -2493,12 +2593,12 @@ async def _open_lease_upstream_tunnel(
     A dead exit accepts the TCP connection and then never answers the CONNECT.
     Each attempt dials the lease's currently-pinned exit, sends the CONNECT head
     (its up-bytes are metered even against a dead exit) and reads the metered
-    response head under a deadline.  On a connect/write/head failure the exit is
-    re-pinned to a fresh pool entry — but only before the first *down* byte is
-    billed (``down_bytes == 0``): the up-bytes already charged to the dead exit
-    make the running total unusable as the failover gate.  Every failed attempt
-    closes its socket and unregisters it from ``tunnel_writers``.  Credentials
-    and ``host:port`` are never logged — only non-reversible fingerprint hashes.
+    response head under a deadline. FBref's one-attempt contract never re-pins,
+    including a zero-byte TCP dial failure. Other sources retain their bounded
+    dead-exit recovery until the first response byte (``down_bytes == 0``).
+    Every failed attempt
+    closes its socket and unregisters it from ``tunnel_writers``. Credentials
+    and ``host:port`` are never logged — only fingerprint hashes.
     """
     last_error: BaseException | None = None
     for _attempt in range(1 + LEASE_UPSTREAM_FAILOVER_ATTEMPTS):
@@ -2550,10 +2650,13 @@ async def _open_lease_upstream_tunnel(
                 # not dead-exit signals: never failover, surface them as before.
                 raise
             last_error = exc
-        # Reached only on a connect/write/head failure: re-pin a fresh exit
-        # while no provider byte has yet been received on this lease, and retry.
+        # FBref must never spend a second paid CONNECT attempt. SofaScore's
+        # separately bounded dead-exit policy remains response-byte based.
+        failover_allowed = (
+            False if lease.source == "fbref" else lease.down_bytes == 0
+        )
         if (
-            lease.down_bytes == 0
+            failover_allowed
             and lease.usable
             and _attempt < LEASE_UPSTREAM_FAILOVER_ATTEMPTS
         ):

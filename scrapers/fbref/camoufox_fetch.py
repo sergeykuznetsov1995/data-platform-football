@@ -26,6 +26,8 @@ Requirements (already in the image, do NOT bump):
 """
 
 import asyncio
+import ipaddress
+import json
 import logging
 import os
 import threading
@@ -33,6 +35,7 @@ import time
 from collections import Counter
 from contextlib import contextmanager
 from typing import Callable, Dict, Optional
+from urllib.parse import quote, urlsplit, urlunsplit
 
 from scrapers.fbref.constants import FBREF_UNCOMMENT_TABLES_JS
 
@@ -76,19 +79,266 @@ _CF_MARKERS = (
     "challenge-running", "cf_chl_opt",
 )
 
-# A response body is reserved from Content-Length before the browser may read
-# it.  This fixed allowance covers request/response headers and framing, which
+# Every request reserves its full body ceiling in route() before transport.
+# This fixed allowance covers request/response headers and framing, which
 # Playwright only reports exactly after completion.  The allowance is per
 # in-flight request and is released when that request finishes or fails.
 BROWSER_REQUEST_FIXED_OVERHEAD_BYTES = 64 * 1024
 
 # Cloudflare answers over HTTP/2, and chunked HTTP/1.1 responses carry no
 # Content-Length at all, so an undeclared body is the norm on the clearance
-# path rather than an attack.  Such a response reserves this ceiling before the
-# browser may read it and settles to the observed size on completion; a body
-# that outgrows the reservation still aborts the session at completion, and a
-# reservation that does not fit the remaining budget aborts it before transport.
+# path rather than an attack. A declared smaller body shrinks the reservation
+# after response headers; an undeclared body keeps the ceiling. A body that
+# outgrows it aborts the session, and a ceiling that does not fit the remaining
+# budget aborts in route() before any socket is opened.
 BROWSER_UNDECLARED_BODY_RESERVATION_BYTES = 512 * 1024
+UNEXPECTED_BROWSER_NETWORK_RESERVATION_BYTES = (
+    BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
+    + BROWSER_UNDECLARED_BODY_RESERVATION_BYTES
+)
+
+# Camoufox 0.4.11 resolves ``geoip=True`` before Playwright exists.  Its helper
+# follows redirects and can try six public-IP services, so routing cannot admit
+# those paid requests.  Production performs exactly one bounded request through
+# the sticky lease, with redirects and transport retries disabled, and charges
+# it before opening the socket.  A failed lookup is still one spent request.
+GEOIP_REQUEST_RESERVATION = 1
+GEOIP_LOOKUP_URL = "https://api.ipify.org"
+GEOIP_RESPONSE_LIMIT_BYTES = 64
+GEOIP_CONNECT_TIMEOUT_SECONDS = 3.0
+GEOIP_READ_TIMEOUT_SECONDS = 3.0
+GEOIP_BYTE_RESERVATION_BYTES = (
+    BROWSER_REQUEST_FIXED_OVERHEAD_BYTES + GEOIP_RESPONSE_LIMIT_BYTES
+)
+
+# These Firefox transports can create a proxy connection without producing a
+# Playwright Request (for example ``<link rel=preconnect>`` or a 103 Early
+# Hints preconnect). A metered session disables them at the browser boundary;
+# normal document/fetch/script traffic continues through context.route().
+FIREFOX_METERED_NETWORK_PREFS = {
+    # WebRTC creates ICE/STUN/DTLS sockets below Playwright routing. FBref's
+    # static clearance page does not need it, so disable it before any source
+    # document can run.
+    "media.peerconnection.enabled": False,
+    "network.http.redirection-limit": 0,
+    "network.http.speculative-parallel-limit": 0,
+    "network.preconnect": False,
+    "network.early-hints.enabled": False,
+    "network.early-hints.preconnect.enabled": False,
+    "network.prefetch-next": False,
+    "network.dns.disablePrefetch": True,
+    "network.predictor.enabled": False,
+}
+
+# Network constructors that can open sockets outside context.route(). Keep the
+# Python tuple as the exact, testable contract and derive the injected source
+# from it so a new browser API cannot be added to one side only.
+NETWORK_API_BLOCKED_CONSTRUCTORS = (
+    "WebSocket",
+    "WebTransport",
+    "Worker",
+    "SharedWorker",
+    "RTCPeerConnection",
+)
+
+# Camoufox runs Playwright init scripts in an isolated world, so changing its
+# ``globalThis.WebSocket`` does not affect page JavaScript.  This wrapper adds a
+# short privileged script element at document start; ``bypass_csp=True`` on the
+# browser context makes the guard deterministic even on a strict source CSP.
+# The element reports synchronous installation through a temporary data
+# attribute and is removed before source scripts run.
+_NETWORK_API_DENY_MAIN_WORLD = r"""
+(() => {
+  const sentinel = "__fbrefNetworkApiGuard_v1_7bb0a73d";
+  const markReady = () => {
+    if (document.currentScript) {
+      document.currentScript.dataset.fbrefNetworkGuard = "ready";
+    }
+  };
+  if (globalThis[sentinel] === true) {
+    markReady();
+    return;
+  }
+  const deny = (name) => {
+    throw new DOMException(`${name} is disabled`, "SecurityError");
+  };
+  for (const name of __FBREF_BLOCKED_NETWORK_CONSTRUCTORS__) {
+    const nativeConstructor = globalThis[name];
+    if (typeof nativeConstructor === "function") {
+      const blockedConstructor = new Proxy(nativeConstructor, {
+        apply() {
+          deny(name);
+        },
+        construct() {
+          deny(name);
+        },
+      });
+      Object.defineProperty(globalThis, name, {
+        value: blockedConstructor,
+        writable: false,
+        configurable: false,
+      });
+      // A Proxy forwards ``prototype``. Without replacing this link, page
+      // code can recover the unguarded target with
+      // ``new WebSocket.prototype.constructor(url)`` and open a socket before
+      // Playwright can meter it.
+      Object.defineProperty(nativeConstructor.prototype, "constructor", {
+        value: blockedConstructor,
+        writable: false,
+        configurable: false,
+      });
+    }
+  }
+  const serviceWorkerContainer = navigator.serviceWorker;
+  const serviceWorkerPrototype = serviceWorkerContainer
+    ? Object.getPrototypeOf(serviceWorkerContainer)
+    : null;
+  const nativeRegister = serviceWorkerPrototype?.register;
+  if (typeof nativeRegister === "function") {
+    const blockedRegister = new Proxy(nativeRegister, {
+      apply() {
+        return Promise.reject(
+          new DOMException("ServiceWorker is disabled", "SecurityError")
+        );
+      },
+    });
+    Object.defineProperty(serviceWorkerPrototype, "register", {
+      value: blockedRegister,
+      writable: false,
+      configurable: false,
+    });
+  }
+  Object.defineProperty(globalThis, sentinel, {
+    value: true,
+    enumerable: false,
+    writable: false,
+    configurable: false,
+  });
+  markReady();
+})();
+""".replace(
+    "__FBREF_BLOCKED_NETWORK_CONSTRUCTORS__",
+    json.dumps(NETWORK_API_BLOCKED_CONSTRUCTORS),
+)
+NETWORK_API_BLOCK_INIT_SCRIPT = """
+(() => {
+  const guard = document.createElement("script");
+  guard.textContent = %s;
+  (document.documentElement || document).appendChild(guard);
+  const ready = guard.dataset.fbrefNetworkGuard === "ready";
+  guard.remove();
+  if (!ready) {
+    throw new Error("FBref main-world network guard did not install");
+  }
+  return ready;
+})();
+""" % json.dumps(_NETWORK_API_DENY_MAIN_WORLD)
+
+
+def _proxy_url_with_credentials(proxy: Optional[dict]) -> Optional[str]:
+    if not proxy or not str(proxy.get("server") or "").strip():
+        return None
+    parsed = urlsplit(str(proxy["server"]).strip())
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("Camoufox geo-IP proxy URL is invalid")
+    username = str(proxy.get("username") or "")
+    password = str(proxy.get("password") or "")
+    if username != "lease" or not password:
+        raise ValueError("Camoufox geo-IP requires its authenticated lease proxy")
+    credentials = ""
+    if username:
+        credentials = quote(username, safe="")
+        if password:
+            credentials += ":" + quote(password, safe="")
+        credentials += "@"
+    host = parsed.hostname
+    if ":" in host:
+        host = f"[{host}]"
+    netloc = credentials + host
+    if parsed.port is not None:
+        netloc += f":{parsed.port}"
+    return urlunsplit((parsed.scheme, netloc, "", "", ""))
+
+
+def resolve_geoip_without_redirects(proxy: Optional[dict]) -> str:
+    """Resolve one exit IP using exactly one bounded, non-redirecting attempt."""
+
+    import requests
+    from requests.adapters import HTTPAdapter
+
+    proxy_url = _proxy_url_with_credentials(proxy)
+    if proxy_url is None:
+        raise RuntimeError("Camoufox paid geo-IP lookup requires its lease proxy")
+    proxies = {"http": proxy_url, "https": proxy_url}
+    session = requests.Session()
+    session.trust_env = False
+    session.mount("http://", HTTPAdapter(max_retries=0))
+    session.mount("https://", HTTPAdapter(max_retries=0))
+    try:
+        response = session.get(
+            GEOIP_LOOKUP_URL,
+            proxies=proxies,
+            timeout=(
+                GEOIP_CONNECT_TIMEOUT_SECONDS,
+                GEOIP_READ_TIMEOUT_SECONDS,
+            ),
+            allow_redirects=False,
+            headers={"Connection": "close", "Accept": "text/plain"},
+            stream=True,
+        )
+        try:
+            if int(response.status_code) != 200:
+                raise RuntimeError("Camoufox geo-IP lookup returned non-200")
+            raw_length = str(response.headers.get("content-length") or "").strip()
+            if raw_length and (
+                not raw_length.isascii()
+                or not raw_length.isdigit()
+                or int(raw_length) > GEOIP_RESPONSE_LIMIT_BYTES
+            ):
+                raise RuntimeError("Camoufox geo-IP response is oversized")
+            payload = response.raw.read(
+                GEOIP_RESPONSE_LIMIT_BYTES + 1,
+                decode_content=True,
+            )
+            if len(payload) > GEOIP_RESPONSE_LIMIT_BYTES:
+                raise RuntimeError("Camoufox geo-IP response is oversized")
+            try:
+                value = payload.decode("ascii").strip()
+            except UnicodeDecodeError as exc:
+                raise RuntimeError("Camoufox geo-IP response is not ASCII") from exc
+            try:
+                return str(ipaddress.ip_address(value))
+            except ValueError as exc:
+                raise RuntimeError("Camoufox geo-IP response is invalid") from exc
+        finally:
+            response.close()
+    except requests.RequestException as exc:
+        raise RuntimeError("Camoufox geo-IP lookup failed") from exc
+    finally:
+        session.close()
+
+
+def require_camoufox_geoip_database() -> None:
+    """Prove Camoufox will use its local GeoLite DB, never download at runtime."""
+
+    try:
+        from camoufox.locale import MMDB_FILE
+    except (ImportError, AttributeError) as exc:
+        raise RuntimeError("Camoufox local GeoLite database is unavailable") from exc
+    try:
+        ready = MMDB_FILE.is_file() and MMDB_FILE.stat().st_size > 0
+    except OSError as exc:
+        raise RuntimeError("Camoufox local GeoLite database is unavailable") from exc
+    if not ready:
+        raise RuntimeError("Camoufox local GeoLite database is unavailable")
 
 
 def should_block_request(
@@ -124,6 +374,10 @@ def is_cloudflare_blocked(html: str, title: str = "") -> bool:
 def _navigation_error_type(exc: Exception) -> str:
     """Classify page.goto failures without immediately banning good proxies."""
     message = f"{type(exc).__name__}: {exc}".lower()
+    if "ns_error_redirect_loop" in message:
+        # Native redirects are deliberately disabled so they cannot skip the
+        # request-admission route. This is a policy stop, not a bad proxy.
+        return "redirect_blocked"
     hard_proxy_markers = (
         'err_proxy_connection_failed', 'err_tunnel_connection_failed',
     )
@@ -192,6 +446,12 @@ class CamoufoxFbrefTransport:
         nav_timeout_ms: int = 90000,
         max_network_requests: Optional[int] = None,
         max_network_bytes: Optional[int] = None,
+        geoip_resolver: Callable[[Optional[dict]], str] = (
+            resolve_geoip_without_redirects
+        ),
+        geoip_database_check: Callable[[], None] = (
+            require_camoufox_geoip_database
+        ),
     ):
         # Either a rotating provider or a single fixed proxy dict.
         if proxy_provider is None and proxy is not None:
@@ -213,9 +473,12 @@ class CamoufoxFbrefTransport:
         self._max_network_bytes = (
             None if max_network_bytes is None else int(max_network_bytes)
         )
+        self._geoip_resolver = geoip_resolver
+        self._geoip_database_check = geoip_database_check
 
         self._cm = None
         self._browser = None
+        self._context = None
         self._page = None
         self._proxy = None
 
@@ -236,10 +499,30 @@ class CamoufoxFbrefTransport:
         # reservation is also indexed by request URL to survive re-wrapping.
         self._inflight_request_urls: Dict[int, str] = {}
         self._inflight_ids_by_url: Dict[str, list] = {}
+        # route.abort() produces a normal Playwright requestfailed event. Keep
+        # those request identities so that callback is not mistaken for HTTP
+        # traffic that bypassed route admission. URL queues cover Playwright
+        # re-wrapping and preserve multiplicity for duplicate URLs.
+        self._intentional_abort_request_urls: Dict[int, Optional[str]] = {}
+        self._intentional_abort_ids_by_url: Dict[str, list] = {}
+        # An unrouted response is charged immediately; remember it until its
+        # terminal callback so requestfinished/requestfailed cannot charge the
+        # same escaped request a second time.
+        self._unrouted_response_request_urls: Dict[int, Optional[str]] = {}
+        self._unrouted_response_ids_by_url: Dict[str, list] = {}
+        # An __exit__ failure is a permanent phase-boundary failure. The
+        # Camoufox context-manager handle stays available for a cleanup retry,
+        # but this transport may never start another browser afterwards.
+        self._browser_finalize_error: Optional[Exception] = None
         self._inflight_reserved_bytes = 0
         self._unobserved_reserved_bytes = 0
         self._byte_budget_exhausted = False
         self._byte_budget_failure: Optional[str] = None
+        self._request_budget_exhausted = False
+        self._redirect_blocked = False
+        self._geoip_lookup_failed = False
+        self._network_policy_failed = False
+        self._network_policy_failure: Optional[str] = None
         # CF solve counters (feed the traffic guard / diagnostics).
         self.cf_challenge_attempts = 0
         self.cf_challenges_passed = 0
@@ -270,8 +553,15 @@ class CamoufoxFbrefTransport:
 
     # -- lifecycle -------------------------------------------------------- #
     def _start(self) -> None:
+        if self._browser_finalize_error is not None:
+            raise RuntimeError(
+                "Camoufox browser finalization previously failed; reuse disabled"
+            ) from self._browser_finalize_error
+        if self._geoip_lookup_failed:
+            raise RuntimeError(
+                "Camoufox geo-IP lookup already failed; automatic retry disabled"
+            )
         self._browser_start_attempts += 1
-        from camoufox.sync_api import Camoufox  # lazy: heavy (Firefox)
 
         # Recover from a poisoned thread. camoufox's ``Camoufox.__exit__`` calls
         # an UNGUARDED ``browser.close()`` before playwright's event-loop
@@ -296,32 +586,124 @@ class CamoufoxFbrefTransport:
             )
             asyncio.events._set_running_loop(None)
 
+        if self._geoip is True:
+            # Prove this before acquiring a paid lease. Passing an explicit IP
+            # later makes Camoufox skip public_ip() and use this local DB only.
+            self._geoip_database_check()
+
         self._proxy = self._proxy_provider() if self._proxy_provider else None
         if not self._proxy:
             logger.warning(
                 "CamoufoxFbrefTransport starting WITHOUT a proxy — Turnstile "
                 "403s on a datacenter IP; the fetch will not solve."
             )
+        geoip = self._geoip
+        if geoip is True:
+            if self._max_network_requests is not None and not self._proxy:
+                self._request_budget_exhausted = True
+                self._budget_blocked_count += 1
+                raise RuntimeError(
+                    "Camoufox bounded geo-IP requires its paid lease proxy"
+                )
+            projected = (
+                self._network_requests_started + GEOIP_REQUEST_RESERVATION
+            )
+            projected_bytes = (
+                self._bytes_total
+                + self._unobserved_reserved_bytes
+                + self._inflight_reserved_bytes
+                + GEOIP_BYTE_RESERVATION_BYTES
+            )
+            if (
+                self._max_network_requests is not None
+                and projected > self._max_network_requests
+            ):
+                self._request_budget_exhausted = True
+                self._budget_blocked_count += 1
+                raise RuntimeError(
+                    "Camoufox geo-IP request admission exceeds request cap"
+                )
+            if (
+                self._max_network_bytes is not None
+                and projected_bytes > self._max_network_bytes
+            ):
+                self._byte_budget_exhausted = True
+                self._byte_budget_failure = "geoip_admission_exceeds_byte_cap"
+                self._budget_blocked_count += 1
+                raise RuntimeError(
+                    "Camoufox geo-IP byte admission exceeds byte cap"
+                )
+            # Charge the one allowed lookup and its bounded response before the
+            # resolver can open its paid socket. Failed lookups are not refunded.
+            self._network_requests_started = projected
+            self._unobserved_reserved_bytes += GEOIP_BYTE_RESERVATION_BYTES
+            try:
+                geoip = self._geoip_resolver(self._proxy)
+            except Exception:
+                # A lookup failure already spent its one paid request. Do not
+                # rotate leases and silently repeat it inside this transport.
+                self._geoip_lookup_failed = True
+                raise
+
+        from camoufox.sync_api import Camoufox  # lazy: heavy (Firefox)
+
         kwargs = {"headless": self._headless, "humanize": self._humanize}
         if self._proxy:
             kwargs["proxy"] = self._proxy
-            kwargs["geoip"] = self._geoip  # locale/timezone matched to exit IP
+            kwargs["geoip"] = geoip  # locale/timezone matched to exit IP
+        elif geoip:
+            kwargs["geoip"] = geoip
+        if (
+            self._max_network_requests is not None
+            or self._max_network_bytes is not None
+        ):
+            # Firefox otherwise follows an HTTP 3xx without re-entering the
+            # route handler.  Zero makes that navigation fail closed; JS/meta
+            # navigations are new requests and are admitted by _maybe_block.
+            kwargs["firefox_user_prefs"] = FIREFOX_METERED_NETWORK_PREFS.copy()
         # The launch itself is unbounded (see BROWSER_START_TIMEOUT_S), so kill
         # the browser it spawned if it overruns: Playwright then raises out of
         # the launch and the caller rotates onto a fresh exit IP.
         with self._browser_deadline(self.BROWSER_START_TIMEOUT_S, "start"):
             self._cm = Camoufox(**kwargs)
             self._browser = self._cm.__enter__()
-            self._page = self._browser.new_page()
-        if (
-            self._block_resources
-            or self._max_network_requests is not None
-            or self._max_network_bytes is not None
-        ):
-            self._page.route("**/*", self._maybe_block)
-        self._page.on("response", self._on_response)
-        self._page.on("requestfinished", self._on_request_finished)
-        self._page.on("requestfailed", self._on_request_failed)
+            # Service-worker script fetches and WebSocket handshakes bypass
+            # ordinary Playwright routing. Install the main-world deny guard
+            # before creating any page; bypass_csp is needed only so this
+            # browser-owned guard cannot be suppressed by a source CSP.
+            self._context = self._browser.new_context(
+                service_workers="block",
+                bypass_csp=True,
+            )
+            self._context.add_init_script(
+                script=NETWORK_API_BLOCK_INIT_SCRIPT
+            )
+            if (
+                self._block_resources
+                or self._max_network_requests is not None
+                or self._max_network_bytes is not None
+            ):
+                # Context routing covers every page in the browser context.
+                # Native redirects are disabled above, so every allowed HTTP
+                # request must pass admission before transport.
+                self._context.route("**/*", self._maybe_block)
+            # Playwright's WebSocket close happens after the handshake on
+            # Firefox 135; retain it only as defense after the main-world
+            # constructor guard has already prevented content sockets.
+            self._context.route_web_socket(
+                "**/*",
+                self._on_unexpected_websocket,
+            )
+            # Context events account popups and every other page in this
+            # context; page-only callbacks leave their traffic unobserved.
+            self._context.on("response", self._on_response)
+            self._context.on("requestfinished", self._on_request_finished)
+            self._context.on("requestfailed", self._on_request_failed)
+            self._page = self._context.new_page()
+            if self._page.evaluate(NETWORK_API_BLOCK_INIT_SCRIPT) is not True:
+                raise RuntimeError(
+                    "FBref main-world network guard is unavailable"
+                )
         self._pages_this_session = 0
         server = (self._proxy or {}).get("server", "direct")
         logger.info("Camoufox session started (proxy=%s, humanize=%s)",
@@ -379,16 +761,40 @@ class CamoufoxFbrefTransport:
             )
 
     def _stop(self) -> None:
-        if self._cm is not None:
+        cm = self._cm
+        prior_finalize_error = self._browser_finalize_error
+        if cm is not None:
+            # A browser close cancels admitted requests. Remember their
+            # identities before __exit__ so its requestfailed callbacks remain
+            # distinguishable from routing bypasses.
+            self._remember_all_inflight_as_intentional_aborts()
             try:
-                self._cm.__exit__(None, None, None)
-            except Exception:  # noqa: BLE001 — teardown is best-effort
-                logger.warning("Camoufox teardown failed", exc_info=True)
+                cm.__exit__(None, None, None)
+            except Exception as exc:  # noqa: BLE001 — lifecycle boundary
+                # Never turn a failed lifecycle boundary into success. Retain
+                # the context-manager handle so a later close can retry its
+                # cleanup, but make the browser/page unusable immediately.
+                if self._browser_finalize_error is None:
+                    self._browser_finalize_error = exc
+                logger.error("Camoufox teardown failed", exc_info=True)
+                try:
+                    self._kill_browser_processes("teardown", None)
+                except Exception:  # noqa: BLE001 — preserve __exit__ failure
+                    logger.exception("Camoufox emergency teardown kill failed")
+                self._clear_inflight_tracking(charge_unobserved=True)
+                self._browser = self._context = self._page = None
+                raise self._browser_finalize_error
         # Any request that produced no finished/failed callback may have
         # crossed an unknown fraction of its reservation. Charge the full
         # remainder before allowing a restart to reuse capacity.
         self._clear_inflight_tracking(charge_unobserved=True)
-        self._cm = self._browser = self._page = None
+        self._cm = self._browser = self._context = self._page = None
+        self._clear_request_callback_tracking()
+        # A retry may finish the physical cleanup, but the original failed
+        # boundary must still reach FBrefFetcher. It is what prevents lease
+        # extension and construction of the unmetered HTTP phase.
+        if prior_finalize_error is not None:
+            raise prior_finalize_error
 
     def _restart(self) -> None:
         """Tear down and start fresh on the next proxy (rotation on failure)."""
@@ -418,6 +824,104 @@ class CamoufoxFbrefTransport:
         except Exception:  # noqa: BLE001 — detached requests have no url
             return None
         return str(url) if url else None
+
+    def _remember_intentional_abort(self, req) -> None:
+        """Remember one pre-network route abort until requestfailed arrives."""
+
+        self._remember_request_marker(
+            req,
+            self._intentional_abort_request_urls,
+            self._intentional_abort_ids_by_url,
+        )
+
+    def _remember_request_marker(
+        self,
+        req,
+        request_urls: Dict[int, Optional[str]],
+        ids_by_url: Dict[str, list],
+    ) -> None:
+        key = id(req)
+        if key in request_urls:
+            return
+        url = self._request_url(req)
+        # ``None`` is a real marker value: an exact wrapper callback can still
+        # be recognized when a detached Request no longer exposes its URL.
+        request_urls[key] = url
+        if url is not None:
+            ids_by_url.setdefault(url, []).append(key)
+
+    def _remember_all_inflight_as_intentional_aborts(self) -> None:
+        for key in self._inflight_byte_reservations:
+            if key in self._intentional_abort_request_urls:
+                continue
+            url = self._inflight_request_urls.get(key)
+            self._intentional_abort_request_urls[key] = url
+            if url is not None:
+                self._intentional_abort_ids_by_url.setdefault(url, []).append(key)
+
+    @staticmethod
+    def _forget_request_marker(
+        key: int,
+        request_urls: Dict[int, Optional[str]],
+        ids_by_url: Dict[str, list],
+    ) -> None:
+        url = request_urls.pop(key, None)
+        if url is None:
+            return
+        keys = ids_by_url.get(url)
+        if keys:
+            try:
+                keys.remove(key)
+            except ValueError:
+                pass
+            if not keys:
+                ids_by_url.pop(url, None)
+
+    def _consume_request_marker(
+        self,
+        req,
+        request_urls: Dict[int, Optional[str]],
+        ids_by_url: Dict[str, list],
+    ) -> bool:
+        key = id(req)
+        if key in request_urls:
+            self._forget_request_marker(key, request_urls, ids_by_url)
+            return True
+        url = self._request_url(req)
+        keys = ids_by_url.get(url or "")
+        if not keys:
+            return False
+        self._forget_request_marker(keys[0], request_urls, ids_by_url)
+        return True
+
+    def _consume_intentional_abort(self, req) -> bool:
+        """Consume an abort marker, tolerating a re-wrapped Request object."""
+
+        return self._consume_request_marker(
+            req,
+            self._intentional_abort_request_urls,
+            self._intentional_abort_ids_by_url,
+        )
+
+    def _remember_unrouted_response(self, req) -> None:
+        self._remember_request_marker(
+            req,
+            self._unrouted_response_request_urls,
+            self._unrouted_response_ids_by_url,
+        )
+
+    def _consume_unrouted_response(self, req) -> bool:
+        return self._consume_request_marker(
+            req,
+            self._unrouted_response_request_urls,
+            self._unrouted_response_ids_by_url,
+        )
+
+    def _clear_request_callback_tracking(self) -> None:
+        self._intentional_abort_request_urls.clear()
+        self._intentional_abort_ids_by_url.clear()
+        self._unrouted_response_request_urls.clear()
+        self._unrouted_response_ids_by_url.clear()
 
     def _track_reservation(self, req, reservation: int) -> None:
         key = id(req)
@@ -540,6 +1044,7 @@ class CamoufoxFbrefTransport:
         # Charge every in-flight reservation in full: those requests may have
         # crossed an unknown fraction of the wire, and the cap must stay
         # conservative even though the browser is still up for a moment.
+        self._remember_all_inflight_as_intentional_aborts()
         self._clear_inflight_tracking(charge_unobserved=True)
         # The browser is NOT closed here.  This runs inside a Playwright event
         # callback (`response` / `requestfinished`), and the sync API deadlocks
@@ -547,6 +1052,45 @@ class CamoufoxFbrefTransport:
         # close, the close waits for the callback to return, and the wave hangs
         # forever holding its leases.  `route()` refuses every further request
         # while the flag is set, and `fetch()` closes the session on its way out.
+
+    def _on_unexpected_websocket(self, websocket) -> None:
+        """Fail closed if content bypassed the main-world WebSocket guard.
+
+        Firefox reports this callback after the handshake may have reached the
+        proxy. Treat it as an accounting tripwire, not as a free blocker: one
+        request and a conservative unknown-body ceiling stay permanently spent.
+        """
+
+        self._latch_unexpected_network("unexpected_websocket_handshake")
+        logger.error(
+            "Camoufox unexpected WebSocket handshake aborted the session"
+        )
+        try:
+            websocket.close(
+                code=1008, reason="FBref websocket traffic is disabled"
+            )
+        except Exception:  # noqa: BLE001 — the tripwire stays latched
+            logger.debug("WebSocket tripwire close failed", exc_info=True)
+
+    def _latch_unexpected_network(self, reason: str) -> None:
+        """Permanently charge and reject traffic outside context routing."""
+
+        self._network_requests_started += 1
+        self._unobserved_reserved_bytes += (
+            UNEXPECTED_BROWSER_NETWORK_RESERVATION_BYTES
+        )
+        self._network_policy_failed = True
+        self._network_policy_failure = reason
+        self._last_solve_failure = "network_policy"
+        self._blocked_count += 1
+        self._budget_blocked_count += 1
+
+    def _hard_network_failure_latched(self) -> bool:
+        return bool(
+            self._byte_budget_exhausted
+            or self._request_budget_exhausted
+            or self._network_policy_failed
+        )
 
     def _maybe_block(self, route) -> None:
         req = None
@@ -559,11 +1103,16 @@ class CamoufoxFbrefTransport:
                 )
             ):
                 self._blocked_count += 1
+                self._remember_intentional_abort(req)
                 route.abort()
                 return
             request_cap_reached = (
                 self._max_network_requests is not None
                 and self._network_requests_started >= self._max_network_requests
+            )
+            admission_reservation = (
+                BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
+                + BROWSER_UNDECLARED_BODY_RESERVATION_BYTES
             )
             byte_cap_reached = (
                 self._max_network_bytes is not None
@@ -572,28 +1121,44 @@ class CamoufoxFbrefTransport:
                     or self._bytes_total
                     + self._unobserved_reserved_bytes
                     + self._inflight_reserved_bytes
-                    + BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
+                    + admission_reservation
                     > self._max_network_bytes
                 )
             )
-            if request_cap_reached or byte_cap_reached:
+            if (
+                request_cap_reached
+                or byte_cap_reached
+                or self._network_policy_failed
+            ):
                 self._blocked_count += 1
-                self._budget_blocked_count += 1
+                byte_was_exhausted = self._byte_budget_exhausted
+                if byte_cap_reached:
+                    self._abort_session_for_byte_budget(
+                        "request_admission_exceeds_byte_cap"
+                    )
+                if not byte_cap_reached or byte_was_exhausted:
+                    self._budget_blocked_count += 1
+                if request_cap_reached:
+                    self._request_budget_exhausted = True
+                self._remember_intentional_abort(req)
                 route.abort()
                 return
             # Count before handing the request to Playwright. Failed and
             # interrupted requests still consumed one global network attempt.
             self._network_requests_started += 1
-            if self._max_network_bytes is not None:
-                self._track_reservation(
-                    req, BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
-                )
+            self._track_reservation(
+                req,
+                admission_reservation
+                if self._max_network_bytes is not None
+                else 0,
+            )
             route.continue_()
         except Exception:  # noqa: BLE001 — fail closed at the proxy boundary
             if req is not None:
                 reserved = self._release_byte_reservation(req)
                 if reserved:
                     self._charge_failed_request(req, reserved)
+                self._remember_intentional_abort(req)
             try:
                 self._blocked_count += 1
                 route.abort()
@@ -613,53 +1178,40 @@ class CamoufoxFbrefTransport:
         except Exception:  # noqa: BLE001 — fail closed in _on_response
             return {}
 
-    def _adopt_unrouted_request(self, req) -> Optional[int]:
-        """Charge an in-flight request that ``route()`` never reserved.
+    def _reject_unrouted_request(self) -> None:
+        """Reject a response that appeared without route admission.
 
-        Server redirects are not re-routed by Playwright, and Firefox can hand
-        the response callbacks a request the route callback never saw. Such a
-        request is still real proxy traffic, so it consumes a request slot and
-        the same fixed overhead as a routed one, enforced against the same
-        caps. Only a cap breach aborts the session — unlike ``route()`` there
-        is no way to refuse the transfer before transport.
+        Native redirects are disabled and every context page is routed before
+        creation. A missing reservation is therefore a transport-policy bypass,
+        never an HTTP request that may be silently adopted.
         """
-        if (
-            self._max_network_requests is not None
-            and self._network_requests_started >= self._max_network_requests
-        ):
-            self._abort_session_for_byte_budget("unrouted_request_over_request_cap")
-            return None
-        reservation = BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
-        projected = (
-            self._bytes_total
-            + self._unobserved_reserved_bytes
-            + self._inflight_reserved_bytes
-            + reservation
-        )
-        if projected > self._max_network_bytes:
-            self._abort_session_for_byte_budget("unrouted_request_over_byte_cap")
-            return None
-        self._network_requests_started += 1
-        self._track_reservation(req, reservation)
-        return reservation
+
+        self._latch_unexpected_network("unrouted_http_response")
 
     def _on_response(self, response) -> None:
         """Reserve the declared body before any response can cross the cap."""
 
-        if self._max_network_bytes is None or self._byte_budget_exhausted:
+        if self._byte_budget_exhausted:
+            # A prior hard abort charged and cleared every known in-flight
+            # reservation. Late callbacks belong to those requests and must
+            # not be misclassified or counted a second time as unrouted.
             return
         req = getattr(response, "request", None)
         if req is None:
-            self._abort_session_for_byte_budget("response_without_request")
+            self._latch_unexpected_network("response_without_request")
             return
         reservation_key = self._reservation_key(req)
         if reservation_key is None:
-            fixed = self._adopt_unrouted_request(req)
-            if fixed is None:
-                return  # a cap breach already aborted the session
-            reservation_key = id(req)
-        else:
-            fixed = self._inflight_byte_reservations[reservation_key]
+            self._remember_unrouted_response(req)
+            self._reject_unrouted_request()
+            return
+        if (
+            self._network_policy_failed
+            or self._max_network_bytes is None
+            or self._byte_budget_exhausted
+        ):
+            return
+        admitted = self._inflight_byte_reservations[reservation_key]
 
         headers = self._response_headers(response)
         transfer_encoding = headers.get("transfer-encoding", "")
@@ -679,27 +1231,31 @@ class CamoufoxFbrefTransport:
             if declared
             else BROWSER_UNDECLARED_BODY_RESERVATION_BYTES
         )
-        projected = (
-            self._bytes_total
-            + self._unobserved_reserved_bytes
-            + self._inflight_reserved_bytes
-            + body_reservation
-        )
-        if projected > self._max_network_bytes:
+        desired = BROWSER_REQUEST_FIXED_OVERHEAD_BYTES + body_reservation
+        if desired > admitted:
             self._abort_session_for_byte_budget(
-                f"declared_content_length_exceeds_cap:{body_reservation}"
-                if declared
-                else f"undeclared_body_exceeds_cap:{body_reservation}"
+                f"declared_body_exceeds_admission_reservation:{body_reservation}"
             )
             return
-
-        self._inflight_byte_reservations[reservation_key] = (
-            fixed + body_reservation
-        )
-        self._inflight_reserved_bytes += body_reservation
+        self._inflight_byte_reservations[reservation_key] = desired
+        self._inflight_reserved_bytes -= admitted - desired
 
     def _on_request_finished(self, req) -> None:
+        if self._byte_budget_exhausted:
+            self._consume_intentional_abort(req)
+            self._consume_unrouted_response(req)
+            return
+        reservation_key = self._reservation_key(req)
+        if reservation_key is None:
+            if (
+                self._consume_intentional_abort(req)
+                or self._consume_unrouted_response(req)
+            ):
+                return
+            self._latch_unexpected_network("unrouted_http_completion")
+            return
         reserved = self._release_byte_reservation(req)
+        self._consume_intentional_abort(req)
         try:
             n = self._observed_request_bytes(req)
             self._requests_count += 1
@@ -724,8 +1280,40 @@ class CamoufoxFbrefTransport:
             self._unobserved_reserved_bytes += max(0, int(reserved))
 
     def _on_request_failed(self, req) -> None:
-        reserved = self._release_byte_reservation(req)
-        self._charge_failed_request(req, reserved)
+        try:
+            failure = getattr(req, "failure", None)
+            failure = failure() if callable(failure) else failure
+        except Exception:  # noqa: BLE001 — detached request diagnostics
+            failure = None
+        redirect_blocked = (
+            "ns_error_redirect_loop" in str(failure or "").casefold()
+        )
+        if redirect_blocked:
+            self._redirect_blocked = True
+        if self._byte_budget_exhausted:
+            # The hard abort already charged and cleared every admitted
+            # reservation. Its late cancellation callbacks are not new traffic.
+            self._consume_intentional_abort(req)
+            self._consume_unrouted_response(req)
+            return
+        reservation_key = self._reservation_key(req)
+        if reservation_key is not None:
+            reserved = self._release_byte_reservation(req)
+            self._consume_intentional_abort(req)
+            self._charge_failed_request(req, reserved)
+            return
+        if self._consume_intentional_abort(req):
+            # Browser-owned cancellation happened before another socket could
+            # be opened. Any original routed request was counted at admission.
+            return
+        if self._consume_unrouted_response(req):
+            return
+        if redirect_blocked:
+            return
+        # A requestfailed event with no route reservation and no intentional
+        # abort marker proves that an HTTP transport escaped context.route().
+        # Charge it once, conservatively, and make the session terminal.
+        self._latch_unexpected_network("unrouted_http_failure")
 
     # -- Turnstile solve -------------------------------------------------- #
     def _challenge_frame_present(self) -> bool:
@@ -823,6 +1411,10 @@ class CamoufoxFbrefTransport:
         except Exception as exc:  # noqa: BLE001 — browser process boundary
             error_type = _navigation_error_type(exc)
             logger.warning("Camoufox %s failed: %s", label, exc)
+            if self._browser_finalize_error is not None:
+                # A failed __exit__ is not a rotatable proxy problem. Let the
+                # fetcher observe the phase-boundary failure and refuse HTTP.
+                raise
             # Only failures with a network/proxy signature affect proxy
             # health. Local browser crashes must not burn a healthy exit IP.
             if error_type in {'timeout', 'network'}:
@@ -837,8 +1429,11 @@ class CamoufoxFbrefTransport:
         Reuses the warm session (cf_clearance) across calls; on a solve-timeout
         it restarts on a fresh proxy up to ``MAX_PROXY_ROTATIONS`` times.
         """
-        if self._byte_budget_exhausted:
+        if self._hard_network_failure_latched():
             return None
+        if self._geoip_lookup_failed:
+            return None
+        self._redirect_blocked = False
         if (
             self._page is not None
             and self._pages_this_session >= self._max_pages_per_session
@@ -851,6 +1446,11 @@ class CamoufoxFbrefTransport:
         for attempt in range(self.MAX_PROXY_ROTATIONS + 1):
             if self._page is None:
                 if not self._lifecycle_action(self._start, 'start'):
+                    if (
+                        self._hard_network_failure_latched()
+                        or self._geoip_lookup_failed
+                    ):
+                        break
                     continue
             try:
                 # FBrefFetcher uses Camoufox only for its clearance bootstrap,
@@ -869,7 +1469,11 @@ class CamoufoxFbrefTransport:
                 logger.warning("Camoufox goto failed (attempt %d): %s",
                                attempt + 1, e)
                 error_type = _navigation_error_type(e)
-                if self._byte_budget_exhausted:
+                if self._hard_network_failure_latched():
+                    break
+                if error_type == "redirect_blocked":
+                    self._redirect_blocked = True
+                    self._last_solve_failure = error_type
                     break
                 if error_type in {'timeout', 'network'}:
                     self._record_proxy_result(False, error_type)
@@ -877,7 +1481,7 @@ class CamoufoxFbrefTransport:
                     self._lifecycle_action(self._restart, 'restart')
                 continue
 
-            if self._byte_budget_exhausted:
+            if self._hard_network_failure_latched():
                 break
 
             # CF challenge counters live in _solve_current_page — only navs
@@ -890,11 +1494,16 @@ class CamoufoxFbrefTransport:
             except Exception as e:  # noqa: BLE001 — killed browser raises here
                 logger.warning("Camoufox solve failed (attempt %d): %s",
                                attempt + 1, e)
-                if self._byte_budget_exhausted:
+                if self._redirect_blocked:
+                    self._last_solve_failure = "redirect_blocked"
+                    break
+                if self._hard_network_failure_latched():
                     break
                 if attempt < self.MAX_PROXY_ROTATIONS:
                     self._lifecycle_action(self._restart, 'restart')
                 continue
+            if self._hard_network_failure_latched():
+                break
             if html is not None:
                 self._pages_this_session += 1
                 self._record_proxy_result(True)
@@ -906,12 +1515,15 @@ class CamoufoxFbrefTransport:
                 "Camoufox page did not satisfy %s for %s (attempt %d/%d)",
                 failure_type, url, attempt + 1,
                 self.MAX_PROXY_ROTATIONS + 1)
+            if self._redirect_blocked:
+                self._last_solve_failure = "redirect_blocked"
+                break
             if failure_type == 'cloudflare':
                 self._record_proxy_result(False, failure_type)
             if attempt < self.MAX_PROXY_ROTATIONS:
                 self._lifecycle_action(self._restart, 'restart')
 
-        if self._byte_budget_exhausted and self._cm is not None:
+        if self._hard_network_failure_latched() and self._cm is not None:
             # The cap fired inside a Playwright callback, which may not close
             # the browser (see _abort_session_for_byte_budget).  Do it here,
             # back on the main thread, so no parallel response keeps spending
@@ -929,7 +1541,12 @@ class CamoufoxFbrefTransport:
         cf_clearance is bound to the exit IP and the browser fingerprint —
         the caller must reuse the same proxy and a Firefox impersonation.
         """
-        if self._page is None:
+        if (
+            self._page is None
+            or self._hard_network_failure_latched()
+            or self._redirect_blocked
+            or self._geoip_lookup_failed
+        ):
             return None
         try:
             cookies = {
@@ -1007,6 +1624,11 @@ class CamoufoxFbrefTransport:
             ),
             "byte_budget_exhausted": self._byte_budget_exhausted,
             "byte_budget_failure": self._byte_budget_failure,
+            "request_budget_exhausted": self._request_budget_exhausted,
+            "network_policy_failed": self._network_policy_failed,
+            "network_policy_failure": self._network_policy_failure,
+            "geoip_lookup_failed": self._geoip_lookup_failed,
+            "redirect_blocked": self._redirect_blocked,
             "real_bytes_by_resource_type": dict(self._bytes_by_type),
             "blocked_count": self._blocked_count,
             "cf_challenge_attempts": self.cf_challenge_attempts,

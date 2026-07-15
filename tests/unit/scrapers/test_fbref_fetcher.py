@@ -142,10 +142,11 @@ def test_clearance_closes_browser_before_counting_background_traffic(
 
     transport.traffic_delta.side_effect = final_delta
     session = MagicMock()
+    create_http_session = MagicMock(return_value=session)
     monkeypatch.setattr(
         FBrefFetcher,
         "_create_http_session",
-        MagicMock(return_value=session),
+        create_http_session,
     )
     fetcher = FBrefFetcher.__new__(FBrefFetcher)
     fetcher.bootstrap_url = "https://fbref.com/en/"
@@ -157,6 +158,40 @@ def test_clearance_closes_browser_before_counting_background_traffic(
     assert events == ["closed", "accounted"]
     assert fetcher._http_session is session
     assert fetcher._bootstrap_stats == final_stats
+
+
+def test_late_hard_policy_callback_rejects_exported_clearance(monkeypatch):
+    transport = MagicMock()
+    transport.fetch.return_value = "<html><body>source</body></html>"
+    transport.get_clearance.return_value = {
+        "cookies": {"cf_clearance": "test"},
+        "user_agent": "test-agent",
+        "proxy": None,
+    }
+    transport.traffic_delta.return_value = {
+        "real_bytes_downloaded": 0,
+        "real_requests_count": 1,
+        "budget_unobserved_bytes": 589824,
+        "network_policy_failed": True,
+        "network_policy_failure": "unexpected_websocket_handshake",
+    }
+    create_http_session = MagicMock()
+    monkeypatch.setattr(
+        FBrefFetcher,
+        "_create_http_session",
+        create_http_session,
+    )
+    fetcher = FBrefFetcher.__new__(FBrefFetcher)
+    fetcher.bootstrap_url = "https://fbref.com/en/"
+    fetcher._http_session = None
+    fetcher._transport = transport
+
+    with pytest.raises(FetchError) as raised:
+        fetcher._ensure_clearance()
+
+    assert raised.value.error_class == "hard_transport_policy"
+    assert "unexpected_websocket_handshake" in str(raised.value)
+    create_http_session.assert_not_called()
 
 
 def test_clearance_traffic_export_failure_charges_full_reserved_ceiling():
@@ -173,7 +208,7 @@ def test_clearance_traffic_export_failure_charges_full_reserved_ceiling():
     with pytest.raises(FetchError) as raised:
         fetcher._ensure_clearance()
 
-    assert raised.value.error_class == "clearance_failed"
+    assert raised.value.error_class == "hard_transport_policy"
     assert raised.value.browser_requests == 80
     assert raised.value.browser_bootstrap_attempts == 4
     assert raised.value.browser_unobserved_bytes == 16 * 1024 * 1024
@@ -415,6 +450,26 @@ def test_bootstrap_provider_exception_is_session_scoped_fetch_error():
 
     assert raised.value.error_class == "clearance_failed"
     assert "RuntimeError" in str(raised.value)
+
+
+def test_failed_geoip_is_a_non_refreshable_hard_transport_error():
+    fetcher = FBrefFetcher.__new__(FBrefFetcher)
+    transport = MagicMock()
+    transport.fetch.return_value = None
+    transport.traffic_delta.return_value = {
+        "real_requests_count": 1,
+        "real_bytes_downloaded": 0,
+        "geoip_lookup_failed": True,
+    }
+    fetcher._http_session = None
+    fetcher._transport = transport
+    fetcher.bootstrap_url = "https://fbref.com/en/"
+
+    with pytest.raises(FetchError) as raised:
+        fetcher._ensure_clearance()
+
+    assert raised.value.error_class == "hard_transport_policy"
+    assert "geoip_lookup_failed" in str(raised.value)
 
 
 def test_reset_clearance_drops_session_transport_and_metered_lease():

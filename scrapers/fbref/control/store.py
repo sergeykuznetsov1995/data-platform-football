@@ -3507,6 +3507,7 @@ class ControlStore:
                 "budget_exhausted",
                 "clearance_failed",
                 "clearance_export_failed",
+                "hard_transport_policy",
                 "http_exception",
                 "http_status",
                 "empty_body",

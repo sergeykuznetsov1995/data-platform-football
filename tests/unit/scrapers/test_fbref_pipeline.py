@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import uuid
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from scrapers.fbref.camoufox_fetch import GEOIP_BYTE_RESERVATION_BYTES
 from scrapers.fbref.control import StateConflict
 from scrapers.fbref.control.models import (
     BudgetReservation,
@@ -1120,6 +1122,42 @@ def test_fetch_wave_reserves_budget_and_commits_raw_before_control(tmp_path):
     assert control.completed[0][1]["http_status_history"] == (500, 200)
     assert result.requests == 3
     assert control.claim_calls[0]["lease_seconds"] == FETCH_LEASE_SECONDS
+
+
+def test_fetch_wave_settles_exact_provider_bytes_not_geoip_reserve(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    html = b"<html><table id='comps'><tr><td>x</td></tr></table></html>"
+
+    class MeteredFetcher(FakeFetcher):
+        def fetch(self, url, **kwargs):
+            return replace(
+                super().fetch(url, **kwargs),
+                browser_unobserved_bytes=GEOIP_BYTE_RESERVATION_BYTES,
+                provider_billed_bytes=321,
+            )
+
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=lambda *_: MeteredFetcher(control.events, html),
+        sleep=lambda _: None,
+        clock=lambda: NOW,
+    )
+
+    pipeline.fetch_wave(
+        str(uuid.UUID(int=1)),
+        worker_id="worker-1",
+        page_kinds=["competition_index"],
+        settings=_settings(),
+    )
+
+    assert control.settlements[0][1]["bytes_used"] == 321
+    assert control.session_metrics[0][1]["browser_unobserved_bytes"] == (
+        GEOIP_BYTE_RESERVATION_BYTES
+    )
+    assert control.session_metrics[0][1]["provider_billed_bytes"] == 321
 
 
 def test_fetch_wave_persists_retry_failure_evidence_and_exact_request_count(
@@ -3288,6 +3326,186 @@ def test_a_rejected_clearance_is_burned_instead_of_failing_every_target(
     assert all(call[1]["session_retry"] for call in control.failed)
 
 
+def test_hard_transport_policy_stops_wave_without_new_session_or_lease(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    run_id = str(uuid.UUID(int=1))
+
+    def lease(number):
+        return TargetLease(
+            attempt_id=str(uuid.UUID(int=30 + number)),
+            run_id=run_id,
+            target_id=f"fbref:competition:{number}",
+            logical_refresh_id=str(uuid.UUID(int=40 + number)),
+            canonical_url=(
+                f"https://fbref.com/en/comps/{number}/history/x-Seasons"
+            ),
+            page_kind="competition",
+            source_ids={"competition_id": str(number)},
+            claim_token=str(uuid.UUID(int=50 + number)),
+            lease_epoch=1,
+            attempt_number=1,
+            leased_by="worker-1",
+            lease_expires_at=NOW + timedelta(minutes=10),
+        )
+
+    first, untouched = lease(9), lease(12)
+    claim_calls = []
+
+    def claim(*args, **kwargs):
+        claim_calls.append((args, kwargs))
+        return [first, untouched]
+
+    control.claim_targets = claim
+    factories = []
+
+    def factory(*_):
+        factories.append(True)
+        return FakeClearanceRejectedFetcher(
+            control.events,
+            error_class="hard_transport_policy",
+            http_status=None,
+        )
+
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=factory,
+        sleep=lambda _: None,
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(FetchWaveError, match="hard_transport_policy"):
+        pipeline.fetch_wave(
+            run_id,
+            worker_id="worker-1",
+            page_kinds=["competition"],
+            settings=_settings(),
+        )
+
+    assert len(claim_calls) == 1
+    assert len(factories) == 1
+    assert control.events.count("fetcher_enter") == 1
+    assert control.events.count("fetcher_exit") == 1
+    assert "session_retry" not in control.events
+    assert f"requeue:{untouched.target_id}" in control.events
+    assert [item[0].target_id for item in control.failed] == [first.target_id]
+    assert control.failed[0][1]["error_class"] == "hard_transport_policy"
+
+
+def test_unknown_paid_counter_stops_wave_and_requeues_untouched_target(
+    tmp_path,
+):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    run_id = str(uuid.UUID(int=1))
+
+    def lease(number):
+        return TargetLease(
+            attempt_id=str(uuid.UUID(int=70 + number)),
+            run_id=run_id,
+            target_id=f"fbref:competition:{number}",
+            logical_refresh_id=str(uuid.UUID(int=80 + number)),
+            canonical_url=(
+                f"https://fbref.com/en/comps/{number}/history/x-Seasons"
+            ),
+            page_kind="competition",
+            source_ids={"competition_id": str(number)},
+            claim_token=str(uuid.UUID(int=90 + number)),
+            lease_epoch=1,
+            attempt_number=1,
+            leased_by="worker-1",
+            lease_expires_at=NOW + timedelta(minutes=10),
+        )
+
+    current, untouched = lease(9), lease(12)
+    control.claim_targets = lambda *args, **kwargs: [current, untouched]
+
+    class CounterUncertainFetcher:
+        def __init__(self):
+            self.fetch_calls = 0
+            self.reset_calls = 0
+
+        def __enter__(self):
+            control.events.append("fetcher_enter")
+            return self
+
+        def __exit__(self, *args):
+            control.events.append("fetcher_exit")
+
+        def fetch(self, *args, **kwargs):
+            self.fetch_calls += 1
+            control.events.append("http")
+            raise FetchError(
+                "FBref paid transport accounting is uncertain; "
+                "counter=drain unavailable; final_close=close unavailable; "
+                "target_error=http_status: target status=503",
+                error_class="hard_transport_policy",
+                http_status=503,
+                wire_bytes=303,
+                browser_document_bytes=500,
+                browser_asset_bytes=100,
+                browser_requests=3,
+                browser_bootstrap_attempts=2,
+                browser_unobserved_bytes=400,
+                provider_billed_bytes=None,
+                target_requests=2,
+                http_status_history=(500, 503),
+                latency_ms=321,
+            )
+
+        def reset_clearance(self):
+            self.reset_calls += 1
+
+    fetcher = CounterUncertainFetcher()
+    factory_calls = []
+
+    def factory(*args):
+        factory_calls.append(args)
+        return fetcher
+
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=factory,
+        sleep=lambda _: None,
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(FetchWaveError, match="hard_transport_policy"):
+        pipeline.fetch_wave(
+            run_id,
+            worker_id="worker-1",
+            page_kinds=["competition"],
+            settings=_settings(),
+        )
+
+    assert len(factory_calls) == 1
+    assert fetcher.fetch_calls == 1
+    assert fetcher.reset_calls == 0
+    assert control.events.count("session_open") == 1
+    assert "session_retry" not in control.events
+    assert control.settlements[0][1] == {
+        "requests_used": 5,
+        "bytes_used": 1303,
+    }
+    assert control.session_metrics[0][1]["provider_billed_bytes"] is None
+    assert control.session_metrics[0][1]["http_requests"] == 2
+    assert [item[0].target_id for item in control.failed] == [
+        current.target_id
+    ]
+    failure = control.failed[0][1]
+    assert failure["error_class"] == "hard_transport_policy"
+    assert failure["provider_billed_bytes"] is None
+    assert failure["wire_bytes"] == 303
+    assert "drain unavailable" in failure["error_message"]
+    assert "close unavailable" in failure["error_message"]
+    assert "target status=503" in failure["error_message"]
+    assert f"requeue:{untouched.target_id}" in control.events
+
+
 @pytest.mark.parametrize(
     ("error_class", "http_status"),
     [
@@ -3309,6 +3527,12 @@ def test_session_poison_is_classified_for_retry(error_class, http_status):
 
 def test_unknown_http_exception_remains_target_scoped():
     error = FetchError("decoder exploded", error_class="http_exception")
+
+    assert _session_failure(error) is False
+
+
+def test_hard_transport_policy_is_never_a_refreshable_session_failure():
+    error = FetchError("hard stop", error_class="hard_transport_policy")
 
     assert _session_failure(error) is False
 
