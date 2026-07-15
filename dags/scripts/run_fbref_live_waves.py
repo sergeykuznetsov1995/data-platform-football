@@ -1,16 +1,8 @@
-"""Run exactly one FBref fetch wave in a clean, unforked process.
+"""Run bounded FBref fetch/parse batches in one clean, unforked process.
 
-Airflow's LocalExecutor forks the multi-threaded scheduler to run a task, and
-Playwright's sync API deadlocks in such a process: Camoufox launches, but the
-navigation never opens a socket and no timeout fires. The repository's own
-convention (see CLAUDE.md) is therefore that browser scrapers run in their own
-subprocess, never inside a PythonOperator.
-
-This runner is that subprocess. It takes the wave parameters, reconstructs the
-pipeline from the environment, runs one bounded fetch wave, and prints the wave
-result as a single JSON document on stdout. It performs no seeding, no parsing,
-and no Silver trigger, so the control plane keeps every budget, lease, and
-validation gate it would have applied in-process.
+The process owns one warm fetcher and ProxyManager for the whole live run.
+Every batch commits immutable raw evidence before running offline discovery,
+then immediately admits newly discovered targets into the next batch.
 """
 
 from __future__ import annotations
@@ -24,7 +16,7 @@ from scrapers.fbref.pipeline import FBrefPipeline, PipelineSettings
 from scrapers.fbref.settings import MIB
 
 
-RESULT_PREFIX = "FBREF_FETCH_WAVE_RESULT:"
+RESULT_PREFIX = "FBREF_LIVE_WAVES_RESULT:"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -38,14 +30,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--shard-size", type=int, required=True)
     parser.add_argument("--reservation-mb", type=int, required=True)
     parser.add_argument("--domain-interval-seconds", type=float, required=True)
+    parser.add_argument("--max-batches", type=int, default=16)
     parser.add_argument("--proxy-file", default=None)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    # Progress goes to stderr (stdout carries the single result document), so a
-    # wave that stalls says why: without this the process is silent and the
-    # Airflow task can only report that it was killed.
     logging.basicConfig(
         level=logging.INFO,
         stream=sys.stderr,
@@ -65,11 +55,12 @@ def main(argv: list[str] | None = None) -> int:
         domain_interval_seconds=args.domain_interval_seconds,
         proxy_file=args.proxy_file,
     )
-    result = FBrefPipeline.from_env().fetch_wave(
+    result = FBrefPipeline.from_env().run_live_waves(
         args.control_run_id,
         worker_id=args.worker_id,
         page_kinds=page_kinds,
         settings=settings,
+        max_batches=args.max_batches,
     ).as_dict()
     print(f"{RESULT_PREFIX}{json.dumps(result, sort_keys=True)}", flush=True)
     return 0

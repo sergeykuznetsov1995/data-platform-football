@@ -80,7 +80,7 @@ class TestFBrefReplayTopology:
 
     def test_graph_contains_no_fetch_or_seed_task(self, loaded_dag):
         module, tasks = loaded_dag
-        assert len(tasks) == module.REPLAY_WAVE_COUNT + 7
+        assert len(tasks) == module.REPLAY_WAVE_COUNT + 9
         assert not any(task_id.startswith("fetch") for task_id in tasks)
         assert not any(task_id.startswith("seed") for task_id in tasks)
         assert "recover_raw_before_fetch" not in tasks
@@ -89,10 +89,12 @@ class TestFBrefReplayTopology:
             for task_id, task in tasks.items()
             if task_id != "trigger_silver_transform"
         }
-        assert "fetch_fbref_wave" not in callable_names
+        assert "run_fbref_live_waves" not in callable_names
         assert callable_names == {
             "initialize_fbref_run",
             "acquire_fbref_publication_lock",
+            "audit_fbref_raw_integrity",
+            "capture_fbref_raw_baseline",
             "export_fbref_publication_scope",
             "parse_fbref_wave",
             "finalize_fbref_publication_lock",
@@ -106,11 +108,13 @@ class TestFBrefReplayTopology:
         assert initialize.op_kwargs["run_type"] == "replay"
         assert initialize.op_kwargs["request_limit"] == 0
         assert initialize.op_kwargs["byte_limit_mb"] == 0
+        assert initialize.op_kwargs["reservation_mb"] == 3
         for task_id, task in tasks.items():
             if task_id.startswith("parse_wave_"):
                 assert task.op_kwargs["run_type"] == "replay"
                 assert task.op_kwargs["request_limit"] == 0
                 assert task.op_kwargs["byte_limit_mb"] == 0
+                assert task.op_kwargs["reservation_mb"] == 3
                 assert task.op_kwargs["source_control_run_id"] == (
                     module.SOURCE_CONTROL_RUN_ID
                 )
@@ -124,6 +128,9 @@ class TestFBrefReplayTopology:
             "acquire_publication_lock"
         }
         assert tasks["acquire_publication_lock"].downstream_task_ids == {
+            "capture_raw_baseline"
+        }
+        assert tasks["capture_raw_baseline"].downstream_task_ids == {
             "parse_wave_01"
         }
         for number in range(1, module.REPLAY_WAVE_COUNT + 1):
@@ -131,9 +138,12 @@ class TestFBrefReplayTopology:
             expected_next = (
                 f"parse_wave_{number + 1:02d}"
                 if number < module.REPLAY_WAVE_COUNT
-                else "validate_run"
+                else "audit_raw_integrity"
             )
             assert task.downstream_task_ids == {expected_next}
+        assert tasks["audit_raw_integrity"].downstream_task_ids == {
+            "validate_run"
+        }
 
     def test_validation_precedes_waiting_silver_trigger(self, loaded_dag):
         module, tasks = loaded_dag
@@ -146,7 +156,7 @@ class TestFBrefReplayTopology:
             "trigger_rule"
         ] == "all_done"
         assert tasks["validate_run"].upstream_task_ids == {
-            f"parse_wave_{module.REPLAY_WAVE_COUNT:02d}"
+            "audit_raw_integrity"
         }
         assert tasks["validate_run"].downstream_task_ids == {
             "export_publication_scope"

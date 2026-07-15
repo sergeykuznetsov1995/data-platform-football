@@ -73,15 +73,15 @@ class TestFBrefBackfillTopology:
         assert "after_season_id" not in module.dag._dag_kwargs["params"]
         assert seed.op_kwargs["request_limit"] == module.REQUEST_LIMIT
         assert seed.op_kwargs["byte_limit_mb"] == module.BYTE_LIMIT_MB
-        assert seed.op_kwargs["reservation_mb"] == 7
+        assert seed.op_kwargs["reservation_mb"] == 3
         assert "competition_index" not in module.BACKFILL_PAGE_KINDS
         assert "competition" not in module.BACKFILL_PAGE_KINDS
 
-    def test_fixed_fetch_parse_batches_are_sequential(self, loaded_dag):
+    def test_one_warm_live_runner_is_bounded(self, loaded_dag):
         module, tasks = loaded_dag
-        assert module.BACKFILL_WAVE_COUNT == 8
+        assert module.BACKFILL_MAX_BATCHES == 16
         assert module.BACKFILL_REQUEST_LIMIT == 200
-        assert len(tasks) == 2 * module.BACKFILL_WAVE_COUNT + 13
+        assert len(tasks) == 16
         assert tasks["initialize_run"].downstream_task_ids == {
             "validate_current_scope_freshness_preflight"
         }
@@ -97,30 +97,35 @@ class TestFBrefBackfillTopology:
             "seed_historical_seasons"
         }
         assert tasks["seed_historical_seasons"].downstream_task_ids == {
+            "capture_raw_baseline"
+        }
+        assert tasks["capture_raw_baseline"].downstream_task_ids == {
             "recover_raw_before_fetch"
         }
         recovery = tasks["recover_raw_before_fetch"]
         assert recovery.python_callable.__name__ == "run_recovery_wave"
         assert recovery.downstream_task_ids == {
-            "fetch_wave_01"
+            "run_live_waves"
         }
-        for number in range(1, module.BACKFILL_WAVE_COUNT + 1):
-            fetch_id = f"fetch_wave_{number:02d}"
-            parse_id = f"parse_wave_{number:02d}"
-            fetch = tasks[fetch_id]
-            parse = tasks[parse_id]
-            assert fetch.python_callable.__name__ == "fetch_fbref_wave"
-            assert parse.python_callable.__name__ == "parse_fbref_wave"
-            assert fetch._captured_kwargs["retries"] == 0
-            assert fetch.op_kwargs["run_type"] == "backfill"
-            assert parse.op_kwargs["run_type"] == "backfill"
-            assert fetch.downstream_task_ids == {parse_id}
-            expected_next = (
-                f"fetch_wave_{number + 1:02d}"
-                if number < module.BACKFILL_WAVE_COUNT
-                else "validate_current_scope_freshness"
-            )
-            assert parse.downstream_task_ids == {expected_next}
+        live = tasks["run_live_waves"]
+        assert live.python_callable.__name__ == "run_fbref_live_waves"
+        assert live.op_kwargs["run_type"] == "backfill"
+        assert live.op_kwargs["max_batches"] == 16
+        assert live.op_kwargs["reservation_mb"] == 3
+        assert live._captured_kwargs["execution_timeout"].total_seconds() == (
+            120 * 60
+        )
+        assert live._captured_kwargs["retries"] == 0
+        assert live.downstream_task_ids == {
+            "audit_raw_integrity"
+        }
+        assert tasks["audit_raw_integrity"].downstream_task_ids == {
+            "validate_current_scope_freshness"
+        }
+        assert not any(
+            task_id.startswith(("fetch_wave_", "parse_wave_"))
+            for task_id in tasks
+        )
 
     def test_validation_is_fail_closed_before_silver(self, loaded_dag):
         module, tasks = loaded_dag
@@ -134,7 +139,7 @@ class TestFBrefBackfillTopology:
         ] == "all_done"
         freshness = tasks["validate_current_scope_freshness"]
         assert freshness.upstream_task_ids == {
-            f"parse_wave_{module.BACKFILL_WAVE_COUNT:02d}"
+            "audit_raw_integrity"
         }
         assert tasks["validate_run"].upstream_task_ids == {
             "validate_current_scope_freshness"

@@ -26,10 +26,14 @@ from scrapers.fbref.pipeline import (
     PipelineSettings,
     RunValidationError,
     SENTINEL_COMPETITIONS,
+    WaveResult,
+    backfill_season_cohort_capacity,
     frontier_target,
     live_wave_target_capacity,
     page_target_from_link,
     wave_target_capacity,
+    _session_failure,
+    _session_proxy_error_type,
 )
 from scrapers.fbref.discovery import (
     DISCOVERY_PARSER_VERSION,
@@ -51,8 +55,8 @@ NOW = datetime(2026, 7, 11, 12, 0, tzinfo=timezone.utc)
 @pytest.mark.parametrize(
     ("request_limit", "byte_limit", "expected"),
     [
-        (100, 50 * 1024 * 1024, 7),
-        (200, 100 * 1024 * 1024, 14),
+        (100, 50 * 1024 * 1024, 15),
+        (200, 100 * 1024 * 1024, 25),
     ],
 )
 def test_wave_capacity_matches_live_canary_and_production_admission(
@@ -66,6 +70,26 @@ def test_wave_capacity_matches_live_canary_and_production_admission(
     )
 
     assert wave_target_capacity(settings) == expected
+
+
+@pytest.mark.parametrize(
+    ("request_limit", "byte_limit", "expected"),
+    [
+        (100, 50 * 1024 * 1024, 7),
+        (200, 100 * 1024 * 1024, 14),
+    ],
+)
+def test_backfill_season_cohort_retains_conservative_aggregate_contract(
+    request_limit, byte_limit, expected
+):
+    settings = PipelineSettings(
+        run_type="backfill",
+        request_limit=request_limit,
+        byte_limit=byte_limit,
+        shard_size=25,
+    )
+
+    assert backfill_season_cohort_capacity(settings) == expected
 
 
 @pytest.mark.parametrize(
@@ -348,6 +372,20 @@ class FakeControl:
     def fail_fetch(self, lease, **kwargs):
         self.events.append("fail")
         self.failed.append((lease, kwargs))
+
+    def retry_session_fetch(self, lease, **kwargs):
+        self.events.append("session_retry")
+        self.failed.append((lease, {**kwargs, "session_retry": True}))
+
+    def requeue_unfetched_targets(self, leases):
+        items = list(leases)
+        self.events.extend(f"requeue:{lease.target_id}" for lease in items)
+        return len(items)
+
+    @contextmanager
+    def guard_publication_lock(self, run_id, *, source="fbref"):
+        assert source == "fbref"
+        yield {"owner_run_id": run_id, "active": True}
 
     def close_clearance_session(self, session_id, **kwargs):
         self.events.append("session_close")
@@ -1130,6 +1168,47 @@ def test_fetch_wave_persists_retry_failure_evidence_and_exact_request_count(
         "transport_version": FETCHER_VERSION,
         "session_version": str(uuid.UUID(int=7)),
     }
+
+
+def test_generic_fetch_exception_settles_and_terminates_attempt(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+
+    class ExplodingFetcher:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def fetch(self, *args, **kwargs):
+            raise RuntimeError("driver exploded")
+
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=lambda *_: ExplodingFetcher(),
+        sleep=lambda _: None,
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(FetchWaveError, match="RuntimeError"):
+        pipeline.fetch_wave(
+            str(uuid.UUID(int=1)),
+            worker_id="worker-1",
+            page_kinds=["competition_index"],
+            settings=_settings(),
+        )
+
+    assert control.settlements[0][1] == {
+        "requests_used": 0,
+        "bytes_used": 0,
+    }
+    assert len(control.failed) == 1
+    assert control.failed[0][1]["error_class"] == "RuntimeError"
+    assert control.failed[0][1]["error_message"] == "driver exploded"
+    assert control.events.index("settle") < control.events.index("fail")
 
 
 def test_fetch_wave_recovers_committed_raw_without_constructing_transport(tmp_path):
@@ -2115,9 +2194,28 @@ def test_validation_accepts_a_clearance_re_solved_on_a_fresh_proxy(tmp_path):
     assert "finish:True" in control.events
 
 
-@pytest.mark.parametrize("run_type", ["current", "backfill", "replay"])
-def test_validation_blocks_silver_with_pending_match_backlog(
-    tmp_path, run_type
+def test_current_publication_blocks_pending_match_backlog(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    summary = control.get_run_summary(str(uuid.uuid4()))
+    summary["promotion_pending_match_count"] = 26
+    control.get_run_summary = lambda _, **__: summary
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    with pytest.raises(
+        RunValidationError, match="promotion_pending_match_count=26"
+    ):
+        pipeline.validate_and_finish(str(uuid.uuid4()))
+
+    assert "finish:False" not in control.events
+
+
+@pytest.mark.parametrize(
+    ("run_type", "publication_eligible"),
+    [("current", False), ("backfill", True)],
+)
+def test_nonpublishing_or_noncurrent_run_reports_but_does_not_gate_global_pending(
+    tmp_path, run_type, publication_eligible
 ):
     raw = _raw_store(tmp_path)
     control = FakeControl(raw)
@@ -2127,17 +2225,12 @@ def test_validation_blocks_silver_with_pending_match_backlog(
     control.get_run_summary = lambda _, **__: summary
     pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
 
-    with pytest.raises(
-        RunValidationError, match="promotion_pending_match_count=26"
-    ):
-        pipeline.validate_and_finish(
-            str(uuid.uuid4()),
-            replay_source_run_id=(
-                str(uuid.uuid4()) if run_type == "replay" else None
-            ),
-        )
+    pipeline.validate_and_finish(
+        str(uuid.uuid4()),
+        publication_eligible=publication_eligible,
+    )
 
-    assert "finish:False" not in control.events
+    assert "finish:True" in control.events
 
 
 def test_validation_rejects_missing_sentinel_coverage(tmp_path):
@@ -2981,11 +3074,13 @@ def test_initialize_run_reaps_leases_left_by_dead_workers(tmp_path):
 
 
 class FakeClearanceRejectedFetcher:
-    """403s once (a dead cf_clearance), then serves the page normally."""
+    """A poisoned warm session that always rejects its target."""
 
-    def __init__(self, events):
+    def __init__(self, events, *, error_class="http_status", http_status=403):
         self.events = events
         self.calls = 0
+        self.error_class = error_class
+        self.http_status = http_status
 
     def __enter__(self):
         self.events.append("fetcher_enter")
@@ -2998,21 +3093,33 @@ class FakeClearanceRejectedFetcher:
         self.calls += 1
         self.events.append("http")
         raise FetchError(
-            "FBref returned HTTP 403",
-            error_class="http_status",
-            http_status=403,
+            "FBref warm session was rejected",
+            error_class=self.error_class,
+            http_status=self.http_status,
             wire_bytes=200,
             browser_document_bytes=500,
             browser_asset_bytes=100,
             browser_requests=1,
             browser_bootstrap_attempts=1,
             target_requests=1,
-            http_status_history=(403,),
+            http_status_history=(
+                () if self.http_status is None else (self.http_status,)
+            ),
             latency_ms=100,
         )
 
 
-def test_a_rejected_clearance_is_burned_instead_of_failing_every_target(tmp_path):
+@pytest.mark.parametrize(
+    ("error_class", "http_status"),
+    [
+        ("http_status", 403),
+        ("raw_contract_cloudflare_challenge", 200),
+        ("warm_session_connection", None),
+    ],
+)
+def test_a_rejected_clearance_is_burned_instead_of_failing_every_target(
+    tmp_path, error_class, http_status
+):
     """Cloudflare can stop honouring a clearance mid-wave (its exit IP falls out
     of favour). Reusing the dead session 403s every remaining target — one bad
     exit IP burned a whole production wave. The wave must re-solve on a fresh
@@ -3051,12 +3158,44 @@ def test_a_rejected_clearance_is_burned_instead_of_failing_every_target(tmp_path
         "https://fbref.com/en/comps/12/history/La-Liga-Seasons",
         {"competition_id": "12"},
     )
-    control.claim_targets = lambda *args, **kwargs: [first, second]
+    retry_one = TargetLease(
+        **{
+            **first.__dict__,
+            "attempt_id": str(uuid.UUID(int=61)),
+            "claim_token": str(uuid.UUID(int=62)),
+            "lease_epoch": 2,
+            "attempt_number": 2,
+        }
+    )
+    retry_two = TargetLease(
+        **{
+            **first.__dict__,
+            "attempt_id": str(uuid.UUID(int=63)),
+            "claim_token": str(uuid.UUID(int=64)),
+            "lease_epoch": 3,
+            "attempt_number": 3,
+        }
+    )
+    claims = iter(([first, second], [retry_one], [retry_two]))
+    control.claim_targets = lambda *args, **kwargs: next(claims)
+    factories = 0
+
+    def factory(*_):
+        nonlocal factories
+        factories += 1
+        if factories <= 2:
+            return FakeClearanceRejectedFetcher(
+                control.events,
+                error_class=error_class,
+                http_status=http_status,
+            )
+        return FakeFetcher(control.events, b"<html>ok</html>")
+
     pipeline = FBrefPipeline(
         control,
         raw,
         generic_writer=FakeWriter(),
-        fetcher_factory=lambda *_: FakeClearanceRejectedFetcher(control.events),
+        fetcher_factory=factory,
         sleep=lambda _: None,
         clock=lambda: NOW,
     )
@@ -3068,15 +3207,199 @@ def test_a_rejected_clearance_is_burned_instead_of_failing_every_target(tmp_path
         settings=_settings(),
     )
 
-    # The dead session is torn down and a fresh one solved for the next target,
-    # rather than every target being fed to the same rejected clearance. The
-    # pages themselves were never judged, so they go back to the queue instead
-    # of failing the wave.
-    assert control.events.count("session_open") == 2
-    assert control.events.count("fetcher_exit") == 2
+    # The exact first logical refresh is retried twice before the untouched
+    # second target; neither page is falsely failed by the dead sessions.
+    assert control.events.count("session_open") == 3
+    assert control.events.count("fetcher_exit") == 3
     assert result.failures == []
     assert result.requeued_dead_clearance == 2
-    assert [call[1]["requeue"] for call in control.failed] == [True, True]
+    assert result.fetched == 2
+    assert [call[0].logical_refresh_id for call in control.failed] == [
+        first.logical_refresh_id,
+        first.logical_refresh_id,
+    ]
+    assert all(call[1]["session_retry"] for call in control.failed)
+
+
+@pytest.mark.parametrize(
+    ("error_class", "http_status", "expected_proxy_error"),
+    [
+        ("http_status", 403, "cloudflare"),
+        ("raw_contract_cloudflare_challenge", 200, "cloudflare"),
+        ("warm_session_connection", None, "connection"),
+        ("warm_session_timeout", None, "timeout"),
+    ],
+)
+def test_session_poison_is_classified_for_retry_and_proxy_quarantine(
+    error_class, http_status, expected_proxy_error
+):
+    error = FetchError(
+        "poisoned warm session",
+        error_class=error_class,
+        http_status=http_status,
+    )
+
+    assert _session_failure(error) is True
+    assert _session_proxy_error_type(error) == expected_proxy_error
+
+
+def test_unknown_http_exception_remains_target_scoped():
+    error = FetchError("decoder exploded", error_class="http_exception")
+
+    assert _session_failure(error) is False
+    assert _session_proxy_error_type(error) is None
+
+
+def test_live_runner_reuses_one_fetch_session_and_parses_after_each_raw_batch(
+    tmp_path,
+):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+    events = []
+    sessions = []
+    fetch_results = iter((WaveResult(claimed=1, fetched=1), WaveResult()))
+    parse_results = iter((WaveResult(cohort_size=1, parsed=1), WaveResult()))
+
+    def fake_fetch(*args, _live_session, **kwargs):
+        sessions.append(_live_session)
+        events.append("fetch")
+        _live_session.fetcher = object()
+        _live_session.needs_clearance = False
+        return next(fetch_results)
+
+    def fake_parse(*args, **kwargs):
+        events.append("parse")
+        return next(parse_results)
+
+    pipeline.fetch_wave = fake_fetch
+    pipeline.parse_wave = fake_parse
+
+    result = pipeline.run_live_waves(
+        str(uuid.uuid4()),
+        worker_id="current-live",
+        page_kinds=["competition_index"],
+        settings=_settings(),
+        max_batches=16,
+    )
+
+    assert events == ["fetch", "parse", "fetch", "parse"]
+    assert sessions[0] is sessions[1]
+    assert result.batches == 2
+    assert result.frontier_closed is True
+    assert result.fetch.fetched == 1
+    assert result.parse.parsed == 1
+
+
+def test_parse_wave_holds_publication_fence_through_external_writes(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+    events = []
+    guarded = False
+
+    @contextmanager
+    def guard(run_id, *, source="fbref"):
+        nonlocal guarded
+        assert source == "fbref"
+        events.append(f"guard:{run_id}:enter")
+        guarded = True
+        try:
+            yield {"owner_run_id": run_id, "active": True}
+        finally:
+            guarded = False
+            events.append(f"guard:{run_id}:exit")
+
+    def persist(run_id, **_kwargs):
+        assert guarded is True
+        events.append(f"persist:{run_id}")
+        return WaveResult(parsed=1)
+
+    control.guard_publication_lock = guard
+    pipeline._parse_wave_under_publication_guard = persist
+    run_id = str(uuid.uuid4())
+
+    result = pipeline.parse_wave(
+        run_id,
+        page_kinds=["match"],
+        settings=_settings(),
+    )
+
+    assert result.parsed == 1
+    assert events == [
+        f"guard:{run_id}:enter",
+        f"persist:{run_id}",
+        f"guard:{run_id}:exit",
+    ]
+
+
+def test_session_refresh_exhaustion_requeues_untouched_without_false_failures(
+    tmp_path,
+):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    run_id = str(uuid.UUID(int=1))
+
+    def make_lease(attempt, target, refresh, epoch):
+        return TargetLease(
+            attempt_id=str(uuid.UUID(int=attempt)),
+            run_id=run_id,
+            target_id=target,
+            logical_refresh_id=str(uuid.UUID(int=refresh)),
+            canonical_url="https://fbref.com/en/comps/9/history/x-Seasons",
+            page_kind="competition",
+            source_ids={"competition_id": "9"},
+            claim_token=str(uuid.UUID(int=attempt + 100)),
+            lease_epoch=epoch,
+            attempt_number=epoch,
+            leased_by="worker-1",
+            lease_expires_at=NOW + timedelta(minutes=10),
+        )
+
+    first = make_lease(71, "fbref:competition:9", 81, 1)
+    untouched = make_lease(72, "fbref:competition:12", 82, 1)
+    retry_one = make_lease(73, first.target_id, 81, 2)
+    retry_two = make_lease(74, first.target_id, 81, 3)
+    claims = iter(([first, untouched], [retry_one], [retry_two]))
+    control.claim_targets = lambda *args, **kwargs: next(claims)
+    factories = 0
+
+    def factory(*_):
+        nonlocal factories
+        factories += 1
+        return FakeClearanceRejectedFetcher(control.events)
+
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=factory,
+        sleep=lambda _: None,
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(
+        FetchWaveError,
+        match="clearance_session_refreshes_exhausted=2",
+    ):
+        pipeline.fetch_wave(
+            run_id,
+            worker_id="worker-1",
+            page_kinds=["competition"],
+            settings=_settings(),
+        )
+
+    assert factories == 3
+    assert len(control.failed) == 3
+    assert all(
+        lease.logical_refresh_id == first.logical_refresh_id
+        for lease, _ in control.failed
+    )
+    assert control.events.count(f"requeue:{untouched.target_id}") == 1
+    assert not any(
+        lease.target_id == untouched.target_id
+        for lease, _ in control.failed
+    )
 
 
 def test_a_run_that_hits_its_budget_requeues_its_targets_and_ends_clean(tmp_path):
@@ -3147,9 +3470,16 @@ def test_the_browser_may_only_spend_the_requests_the_run_reserved(tmp_path):
     control = FakeControl(raw)
     captured = {}
 
-    def factory(proxy_file, max_browser_requests):
+    def factory(
+        proxy_file,
+        max_browser_requests,
+        max_browser_bytes,
+        min_healthy_proxies,
+    ):
         captured["proxy_file"] = proxy_file
         captured["max_browser_requests"] = max_browser_requests
+        captured["max_browser_bytes"] = max_browser_bytes
+        captured["min_healthy_proxies"] = min_healthy_proxies
         return FakeFetcher(control.events, b"<html>ok</html>")
 
     pipeline = FBrefPipeline(
@@ -3179,7 +3509,10 @@ def test_the_browser_may_only_spend_the_requests_the_run_reserved(tmp_path):
     )
 
     assert captured["max_browser_requests"] == 80
+    assert captured["max_browser_bytes"] == 16 * 1024 * 1024
+    assert captured["min_healthy_proxies"] == 4
     assert control.reservations[0][1]["requests"] == 82
+    assert control.reservations[0][1]["bytes_"] == 23 * 1024 * 1024
 
 
 def test_a_wave_after_the_budget_stop_no_ops_instead_of_raising(tmp_path):

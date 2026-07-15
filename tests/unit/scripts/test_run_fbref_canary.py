@@ -34,6 +34,12 @@ class FakeControl:
         self.cohort = []
         self.forced_due_target = None
 
+    def acquire_publication_lock(self, run_id, **kwargs):
+        return {"owner_run_id": run_id, "active": True}
+
+    def release_publication_lock(self, run_id):
+        return {"owner_run_id": run_id, "released": True}
+
     def upsert_frontier_target(self, target) -> None:
         self.events.append("force_due")
         self.forced_due_target = target
@@ -135,7 +141,8 @@ class FakePipeline:
             browser_bootstraps=0,
         )
 
-    def validate_and_finish(self, run_id):
+    def validate_and_finish(self, run_id, *, publication_eligible=True):
+        assert publication_eligible is False
         self.events.append("validate")
         self._fail("validate")
         self.control.finish_run(run_id, succeeded=True)
@@ -470,7 +477,7 @@ def test_generated_logical_labels_are_unique_and_traceable() -> None:
         ("request_limit", 20),
         ("request_limit", 21),
         ("request_limit", 26),
-        ("byte_limit_mb", 5),
+        ("byte_limit_mb", canary.MIN_BYTE_LIMIT_MB - 1),
         ("byte_limit_mb", 26),
     ],
 )
@@ -487,7 +494,7 @@ def test_programmatic_config_rejects_unsafe_budget_bounds(
         ("--request-limit", "20"),
         ("--request-limit", "21"),
         ("--request-limit", "26"),
-        ("--byte-limit-mb", "5"),
+        ("--byte-limit-mb", str(canary.MIN_BYTE_LIMIT_MB - 1)),
         ("--byte-limit-mb", "26"),
     ],
 )

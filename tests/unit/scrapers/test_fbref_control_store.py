@@ -1,4 +1,5 @@
 import inspect
+import json
 import uuid
 from datetime import datetime, timezone
 
@@ -9,6 +10,7 @@ from scrapers.fbref.control import (
     CohortTarget,
     ControlStore,
     ControlStoreConfigError,
+    MigrationError,
     StateConflict,
     TargetLease,
     make_budget_reservation_id,
@@ -17,6 +19,12 @@ from scrapers.fbref.control import (
     resolve_control_db_uri,
 )
 from scrapers.fbref.control.migrations import MIGRATIONS
+from scrapers.fbref.policy import (
+    DISCOVERY_SPINE_PAGE_KINDS,
+    OTHER_PUBLICATION_CRITICAL_PAGE_KINDS,
+    PUBLICATION_FRESHNESS_PAGE_KINDS,
+    PUBLICATION_REQUIRED_PAGE_KINDS,
+)
 
 
 class FakeCursor:
@@ -104,6 +112,196 @@ def test_airflow_and_attempt_ids_map_to_stable_uuids():
     assert uuid.UUID(reservation).version == 5
 
 
+def test_raw_baseline_anchor_is_create_once_and_conflict_checked():
+    run_id = str(uuid.uuid4())
+    metadata = {}
+
+    def handler(sql, params):
+        if (
+            "SELECT status, metadata FROM fbref_control.crawl_run" in sql
+            and "FOR UPDATE" in sql
+        ):
+            return [{"status": "running", "metadata": dict(metadata)}], 1
+        if "AS source_started" in sql:
+            return [{"source_started": False}], 1
+        if "SET metadata = metadata ||" in sql:
+            metadata.update(json.loads(params[0]))
+            return [], 1
+        if "metadata -> 'raw_baseline'" in sql:
+            return [{"raw_baseline": metadata.get("raw_baseline")}], 1
+        raise AssertionError(sql)
+
+    store = ControlStore(
+        "postgresql://airflow:pw@postgres/airflow",
+        connection_factory=FakeFactory(handler),
+    )
+    evidence = {
+        "schema_version": "fbref-raw-inventory-v2",
+        "raw_root_sha256": "a" * 64,
+        "object_count": 2,
+        "encoded_bytes": 42,
+        "fingerprint_sha256": "b" * 64,
+        "baseline_sha256": "c" * 64,
+    }
+
+    first = store.record_raw_baseline(run_id, evidence)
+    retried = store.record_raw_baseline(run_id, evidence)
+
+    assert first["idempotent"] is False
+    assert retried["idempotent"] is True
+    assert store.get_raw_baseline(run_id) == evidence
+    with pytest.raises(StateConflict, match="different raw baseline"):
+        store.record_raw_baseline(
+            run_id, {**evidence, "baseline_sha256": "d" * 64}
+        )
+
+
+@pytest.mark.parametrize(
+    ("status", "source_started", "message"),
+    [
+        ("succeeded", False, "leaving running state"),
+        ("running", True, "fetch processing started"),
+    ],
+)
+def test_first_raw_baseline_cannot_be_anchored_after_source_progress(
+    status, source_started, message
+):
+    run_id = str(uuid.uuid4())
+
+    def handler(sql, _params):
+        if "SELECT status, metadata FROM fbref_control.crawl_run" in sql:
+            return [{"status": status, "metadata": {}}], 1
+        if "AS source_started" in sql:
+            return [{"source_started": source_started}], 1
+        raise AssertionError(sql)
+
+    store = ControlStore(
+        "postgresql://airflow:pw@postgres/airflow",
+        connection_factory=FakeFactory(handler),
+    )
+    evidence = {
+        "schema_version": "fbref-raw-inventory-v2",
+        "raw_root_sha256": "a" * 64,
+        "object_count": 0,
+        "encoded_bytes": 0,
+        "fingerprint_sha256": "b" * 64,
+        "baseline_sha256": "c" * 64,
+    }
+
+    with pytest.raises(StateConflict, match=message):
+        store.record_raw_baseline(run_id, evidence)
+
+
+def test_raw_attempt_seal_blocks_active_work_and_detects_set_changes():
+    run_id = str(uuid.uuid4())
+    attempt_ids = [str(uuid.uuid4()), str(uuid.uuid4())]
+    metadata = {}
+    active = {
+        "claimed_attempts": 1,
+        "active_leases": 1,
+        "active_reservations": 0,
+    }
+
+    def handler(sql, params):
+        if "SELECT status, metadata" in sql and "FOR UPDATE" in sql:
+            return [{"status": "running", "metadata": dict(metadata)}], 1
+        if "AS claimed_attempts" in sql:
+            return [dict(active)], 1
+        if "SELECT attempt_id" in sql and "status = 'succeeded'" in sql:
+            return [{"attempt_id": item} for item in attempt_ids], len(
+                attempt_ids
+            )
+        if "SET metadata = metadata ||" in sql:
+            metadata.update(json.loads(params[0]))
+            return [], 1
+        raise AssertionError(sql)
+
+    store = ControlStore(
+        "postgresql://airflow:pw@postgres/airflow",
+        connection_factory=FakeFactory(handler),
+    )
+
+    with pytest.raises(StateConflict, match="active fetch work"):
+        store.seal_raw_fetch_attempts(run_id)
+
+    active.update(
+        claimed_attempts=0, active_leases=0, active_reservations=0
+    )
+    first = store.seal_raw_fetch_attempts(run_id)
+    retried = store.seal_raw_fetch_attempts(run_id)
+    assert first["successful_attempt_count"] == 2
+    assert first["idempotent"] is False
+    assert retried["idempotent"] is True
+
+    attempt_ids.append(str(uuid.uuid4()))
+    with pytest.raises(StateConflict, match="changed after seal"):
+        store.seal_raw_fetch_attempts(run_id)
+
+
+@pytest.mark.parametrize("status", ["succeeded", "failed", "cancelled"])
+def test_raw_attempt_seal_accepts_terminal_replay_source_runs(status):
+    run_id = str(uuid.uuid4())
+
+    def handler(sql, params):
+        if "SELECT status, metadata" in sql and "FOR UPDATE" in sql:
+            return [{"status": status, "metadata": {}}], 1
+        if "AS claimed_attempts" in sql:
+            return [
+                {
+                    "claimed_attempts": 0,
+                    "active_leases": 0,
+                    "active_reservations": 0,
+                }
+            ], 1
+        if "SELECT attempt_id" in sql and "status = 'succeeded'" in sql:
+            return [], 0
+        if "SET metadata = metadata ||" in sql:
+            assert json.loads(params[0])["raw_fetch_attempt_snapshot"][
+                "successful_attempt_count"
+            ] == 0
+            return [], 1
+        raise AssertionError(sql)
+
+    store = ControlStore(
+        "postgresql://airflow:pw@postgres/airflow",
+        connection_factory=FakeFactory(handler),
+    )
+
+    assert store.seal_raw_fetch_attempts(run_id)[
+        "successful_attempt_count"
+    ] == 0
+
+
+def test_claim_returns_no_work_after_raw_attempt_snapshot_is_sealed():
+    run_id = str(uuid.uuid4())
+    executions = []
+
+    def handler(sql, _params):
+        executions.append(sql)
+        if "SELECT status, metadata FROM fbref_control.crawl_run" in sql:
+            return [
+                {
+                    "status": "running",
+                    "metadata": {
+                        "raw_fetch_attempt_snapshot": {
+                            "schema_version": (
+                                "fbref-raw-attempt-snapshot-v1"
+                            )
+                        }
+                    },
+                }
+            ], 1
+        raise AssertionError(sql)
+
+    store = ControlStore(
+        "postgresql://airflow:pw@postgres/airflow",
+        connection_factory=FakeFactory(handler),
+    )
+
+    assert store.claim_targets(run_id, "late-worker") == []
+    assert len(executions) == 1
+
+
 def test_migrations_are_advisory_locked_versioned_and_idempotent():
     installed = {}
 
@@ -135,6 +333,71 @@ def test_migrations_are_advisory_locked_versioned_and_idempotent():
     assert any("pg_advisory_xact_lock" in sql for sql in statements)
     assert all(connection.committed for connection in factory.connections)
     assert len(installed) == len(MIGRATIONS)
+
+
+def test_migration_validation_is_exact_and_read_only():
+    installed = {
+        migration.version: {
+            "version": migration.version,
+            "name": migration.name,
+            "checksum": migration.checksum,
+        }
+        for migration in MIGRATIONS
+    }
+
+    def handler(sql, _params):
+        if "SELECT version, name, checksum" in sql:
+            return list(installed.values()), len(installed)
+        return [], 0
+
+    factory = FakeFactory(handler)
+    store = ControlStore(
+        "postgresql://airflow:pw@postgres/airflow",
+        connection_factory=factory,
+    )
+
+    assert store.validate_migrations() == {
+        "status": "passed",
+        "versions": [migration.version for migration in MIGRATIONS],
+        "checksum_verified": True,
+        "read_only": True,
+    }
+    statements = factory.connections[0].fake_cursor.executions
+    assert statements[0] == ("SET TRANSACTION READ ONLY", None)
+    assert all(
+        not sql.startswith(("CREATE ", "ALTER ", "INSERT ", "UPDATE "))
+        for sql, _ in statements
+    )
+
+
+def test_migration_validation_rejects_missing_or_changed_history():
+    rows = [
+        {
+            "version": migration.version,
+            "name": migration.name,
+            "checksum": migration.checksum,
+        }
+        for migration in MIGRATIONS
+    ]
+
+    def store_for(selected):
+        def handler(sql, _params):
+            if "SELECT version, name, checksum" in sql:
+                return list(selected), len(selected)
+            return [], 0
+
+        return ControlStore(
+            "postgresql://airflow:pw@postgres/airflow",
+            connection_factory=FakeFactory(handler),
+        )
+
+    with pytest.raises(MigrationError, match="missing"):
+        store_for(rows[:-1]).validate_migrations()
+
+    changed = [dict(row) for row in rows]
+    changed[-1]["checksum"] = "0" * 64
+    with pytest.raises(MigrationError, match="checksum mismatch"):
+        store_for(changed).validate_migrations()
 
 
 def test_schema_contains_all_control_entities_and_fencing_constraints():
@@ -301,9 +564,9 @@ def test_claim_is_bounded_and_returns_uuid_fence():
     expiry = datetime(2026, 7, 11, 12, tzinfo=timezone.utc)
 
     def handler(sql, _params):
-        if "SELECT status FROM fbref_control.crawl_run" in sql:
+        if "SELECT status, metadata FROM fbref_control.crawl_run" in sql:
             assert "FOR UPDATE" in sql
-            return [{"status": "running"}], 1
+            return [{"status": "running", "metadata": {}}], 1
         if "SELECT DISTINCT lease_run_id AS run_id" in sql:
             return [], 0
         if "SELECT target_id, claim_token, lease_epoch" in sql:
@@ -351,15 +614,33 @@ def test_claim_is_bounded_and_returns_uuid_fence():
         store.claim_targets(run_id, "worker-1", limit=26)
 
 
-def test_due_cohort_prioritizes_publication_lane_before_enrichment():
+def test_publication_policy_distinguishes_required_from_discovered_standings():
+    assert PUBLICATION_REQUIRED_PAGE_KINDS == (
+        "competition_index",
+        "competition",
+        "season",
+        "season_stats",
+        "schedule",
+        "match",
+    )
+    assert PUBLICATION_FRESHNESS_PAGE_KINDS == frozenset(
+        (*PUBLICATION_REQUIRED_PAGE_KINDS, "standings")
+    )
+    assert set(DISCOVERY_SPINE_PAGE_KINDS).isdisjoint(
+        OTHER_PUBLICATION_CRITICAL_PAGE_KINDS
+    )
+
+
+def test_due_cohort_uses_explicit_publication_admission_tiers():
     selected = {}
 
-    def handler(sql, _params):
+    def handler(sql, params):
         if "SELECT status FROM fbref_control.crawl_run" in sql:
             selected["run_sql"] = sql
             return [{"status": "running"}], 1
         if "SELECT frontier.target_id" in sql:
             selected["sql"] = sql
+            selected["params"] = params
             return [], 0
         if "SELECT COALESCE(max(ordinal)" in sql:
             return [{"next_ordinal": 0}], 1
@@ -373,24 +654,74 @@ def test_due_cohort_prioritizes_publication_lane_before_enrichment():
     assert store.create_due_run_cohort(str(uuid.uuid4()), limit=5) == []
     assert "FOR UPDATE" in selected["run_sql"]
     sql = selected["sql"]
-    ordering = sql[sql.rindex("ORDER BY CASE") :]
-    assert ordering.index("control_lane_rank <= %s") < ordering.index(
-        "frontier.priority DESC"
+    ordering = sql[sql.rindex("ORDER BY eligible.admission_tier") :]
+    assert ordering.index("eligible.admission_tier") < ordering.index(
+        "eligible.due_at"
+    ) < ordering.index("frontier.priority DESC")
+    assert "last_fetched_at IS NOT NULL" not in sql[
+        sql.index("CASE") : sql.index("END AS admission_tier")
+    ]
+    assert "frontier.page_kind = 'competition_index' THEN 0" in sql
+    assert "frontier.page_kind = 'match'" in sql
+    assert "COALESCE(scope.has_current_season, false) THEN 1" in sql
+    assert "frontier.refresh_policy <> 'historical_once'" in sql
+    assert selected["params"][:2] == (
+        list(DISCOVERY_SPINE_PAGE_KINDS),
+        list(OTHER_PUBLICATION_CRITICAL_PAGE_KINDS),
     )
-    assert ordering.index("frontier.last_fetched_at IS NOT NULL") < ordering.index(
-        "frontier.created_at"
-    )
-    assert "control_lane_rank <= %s" in sql
-    assert (
-        "'competition_index', 'competition', 'season', 'season_stats', "
-        "'schedule', 'standings', 'match'"
-    ) in sql
     assert "fbref_control.frontier_provenance" in sql
     assert "scope.scope_count > 0" in sql
     assert "scope.has_female" in sql
     assert "scope.has_unknown" in sql
     assert "scope.has_current_season" in sql
     assert "NOT (frontier.source_ids ? 'competition_id')" not in sql
+    assert "FOR UPDATE OF frontier SKIP LOCKED" in sql
+
+
+def test_due_cohort_rechecks_cross_run_membership_after_frontier_lock():
+    run_id = str(uuid.uuid4())
+    already_owned = "fbref:match:already-owned"
+    accepted = "fbref:match:accepted"
+    inserted = []
+
+    def handler(sql, params):
+        if "SELECT status FROM fbref_control.crawl_run" in sql:
+            return [{"status": "running"}], 1
+        if "SELECT frontier.target_id" in sql:
+            return [
+                {"target_id": already_owned},
+                {"target_id": accepted},
+            ], 2
+        if "SELECT COALESCE(max(ordinal)" in sql:
+            return [{"next_ordinal": 5}], 1
+        if "SELECT outstanding.run_id" in sql:
+            if params == (already_owned,):
+                return [{"run_id": str(uuid.uuid4())}], 1
+            return [], 0
+        if "INSERT INTO fbref_control.run_target" in sql:
+            inserted.append(params)
+            return [], 1
+        if "UPDATE fbref_control.page_frontier" in sql:
+            return [], 1
+        raise AssertionError(sql)
+
+    store = ControlStore(
+        "postgresql://airflow:pw@postgres/airflow",
+        connection_factory=FakeFactory(handler),
+    )
+
+    cohort = store.create_due_run_cohort(run_id, limit=2)
+
+    assert [item.target_id for item in cohort] == [accepted]
+    assert cohort[0].ordinal == 5
+    assert inserted == [
+        (
+            run_id,
+            accepted,
+            make_logical_refresh_id(run_id, accepted),
+            5,
+        )
+    ]
 
 
 def test_claim_rechecks_registry_scope_before_any_network_lease():
@@ -765,6 +1096,172 @@ def test_versioned_run_summary_uses_current_observation_and_parser_fences():
     assert "page-current" in versioned_params
     assert "typed-current" in versioned_params
     assert "discovery-current" in versioned_params
+
+
+def test_successful_fetch_inventory_is_stably_paginated_and_json_safe():
+    run_id = str(uuid.uuid4())
+    after_attempt_id = str(uuid.uuid4())
+    result_attempt_id = str(uuid.uuid4())
+    refresh_id = str(uuid.uuid4())
+    captured = {}
+
+    def handler(sql, params):
+        captured["sql"] = sql
+        captured["params"] = params
+        return [
+            {
+                "attempt_id": uuid.UUID(result_attempt_id),
+                "run_id": uuid.UUID(run_id),
+                "target_id": "fbref:match:096e63eb",
+                "logical_refresh_id": uuid.UUID(refresh_id),
+                "attempt_number": 2,
+                "ordinal": 4,
+                "page_kind": "match",
+                "canonical_url": "https://fbref.com/en/matches/096e63eb",
+                "source_ids": '{"competition_id":"602","season_id":"2025"}',
+                "http_status": 200,
+                "content_hash": "a" * 64,
+                "raw_manifest_key": "raw/fetch.json",
+                "decoded_bytes": 100,
+                "compressed_bytes": 50,
+                "wire_bytes": 75,
+                "provider_billed_bytes": None,
+                "http_request_count": 1,
+                "http_status_history": [200],
+                "etag": None,
+                "last_modified": None,
+                "transport_version": "http-v2",
+                "session_version": "clearance-v3",
+                "latency_ms": 25,
+                "started_at": None,
+                "finished_at": None,
+            }
+        ], 1
+
+    store = ControlStore(
+        "postgresql://airflow:pw@postgres/airflow",
+        connection_factory=FakeFactory(handler),
+    )
+    rows = store.list_successful_fetch_attempts(
+        run_id,
+        limit=25,
+        after=(3, 1, after_attempt_id),
+    )
+
+    assert captured["params"] == (
+        run_id,
+        3,
+        3,
+        1,
+        after_attempt_id,
+        25,
+    )
+    assert "attempt.status = 'succeeded'" in captured["sql"]
+    assert "target.ordinal, attempt.attempt_number" in captured["sql"]
+    assert "ORDER BY target.ordinal, attempt.attempt_number" in captured["sql"]
+    assert rows[0]["attempt_id"] == result_attempt_id
+    assert rows[0]["run_id"] == run_id
+    assert rows[0]["logical_refresh_id"] == refresh_id
+    assert rows[0]["source_ids"] == {
+        "competition_id": "602",
+        "season_id": "2025",
+    }
+    with pytest.raises(ValueError, match="between 1 and 1000"):
+        store.list_successful_fetch_attempts(run_id, limit=0)
+
+
+def test_fetch_attempt_lineage_is_scoped_to_exact_run_and_refresh():
+    run_id = str(uuid.uuid4())
+    refresh_id = str(uuid.uuid4())
+    attempt_id = str(uuid.uuid4())
+    captured = {}
+
+    def handler(sql, params):
+        captured["sql"] = sql
+        captured["params"] = params
+        return [
+            {
+                "attempt_id": uuid.UUID(attempt_id),
+                "run_id": uuid.UUID(run_id),
+                "target_id": "fbref:match:096e63eb",
+                "logical_refresh_id": uuid.UUID(refresh_id),
+                "attempt_number": 1,
+                "status": "failed",
+                "http_status": 200,
+                "content_hash": "a" * 64,
+                "raw_manifest_key": "raw/fetch.json",
+                "decoded_bytes": 100,
+                "compressed_bytes": 50,
+                "wire_bytes": 75,
+                "provider_billed_bytes": 80,
+                "http_request_count": 1,
+                "http_status_history": [200],
+                "etag": None,
+                "last_modified": None,
+                "transport_version": "http-v2",
+                "session_version": "clearance-v3",
+                "latency_ms": 25,
+                "started_at": None,
+                "finished_at": None,
+            }
+        ], 1
+
+    store = ControlStore(
+        "postgresql://airflow:pw@postgres/airflow",
+        connection_factory=FakeFactory(handler),
+    )
+
+    rows = store.list_fetch_attempts_for_refresh(run_id, refresh_id)
+
+    assert captured["params"] == (run_id, refresh_id)
+    assert "WHERE run_id = %s AND logical_refresh_id = %s" in captured["sql"]
+    assert rows[0]["attempt_id"] == attempt_id
+    assert rows[0]["run_id"] == run_id
+    assert rows[0]["logical_refresh_id"] == refresh_id
+
+
+def test_cleanup_evidence_uses_database_clock_and_active_ownership():
+    run_id = str(uuid.uuid4())
+    refresh_id = str(uuid.uuid4())
+    captured = {}
+
+    def handler(sql, params):
+        captured["sql"] = sql
+        captured["params"] = params
+        return [
+            {
+                "run_id": uuid.UUID(run_id),
+                "run_status": "succeeded",
+                "active_fetch_lease": False,
+                "active_budget_reservation": 0,
+                "active_observation_processing": False,
+            }
+        ], 1
+
+    store = ControlStore(
+        "postgresql://airflow:pw@postgres/airflow",
+        connection_factory=FakeFactory(handler),
+    )
+    evidence = store.get_observation_cleanup_evidence(refresh_id)
+
+    assert evidence == {
+        "run_id": run_id,
+        "run_status": "succeeded",
+        "active_fetch_lease": False,
+        "active_budget_reservation": False,
+        "active_observation_processing": False,
+    }
+    assert captured["params"] == (refresh_id,)
+    assert captured["sql"].count("clock_timestamp()") == 1
+    assert "frontier.target_id = target.target_id" in captured["sql"]
+    assert "frontier.lease_run_id = target.run_id" in captured["sql"]
+    assert "frontier.lease_expires_at > clock_timestamp()" in captured["sql"]
+    assert "reservation.status = 'reserved'" in captured["sql"]
+    assert "processing.status = 'processing'" in captured["sql"]
+    processing_clause = captured["sql"].split(
+        "FROM fbref_control.observation_processing", 1
+    )[1].split(") AS active_observation_processing", 1)[0]
+    assert "lease_expires_at" not in processing_clause
 
 
 def test_reaper_locks_frontier_before_conservative_reservation_settlement():

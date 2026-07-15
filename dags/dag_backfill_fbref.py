@@ -25,15 +25,16 @@ from utils.fbref_pipeline_tasks import (
     FBREF_PRODUCTION_BYTE_LIMIT_MB,
     FBREF_PRODUCTION_REQUEST_LIMIT,
     acquire_fbref_publication_lock,
+    audit_fbref_raw_integrity,
+    capture_fbref_raw_baseline,
     choose_fbref_backfill_mode,
     export_fbref_publication_scope,
-    fetch_fbref_wave,
     fbref_dag_failure_callback,
     finalize_fbref_publication_lock,
     initialize_fbref_run,
-    parse_fbref_wave,
     plan_fbref_backfill,
     run_recovery_wave,
+    run_fbref_live_waves,
     seed_fbref_historical_seasons,
     validate_fbref_current_scope_freshness,
     validate_fbref_production_readiness,
@@ -55,8 +56,7 @@ BACKFILL_REQUEST_LIMIT = FBREF_PRODUCTION_REQUEST_LIMIT
 BACKFILL_BYTE_LIMIT_MB = FBREF_PRODUCTION_BYTE_LIMIT_MB
 DEFAULT_SHARD_SIZE = FBREF_MAX_WARM_SESSION_TARGETS
 MAX_SHARD_SIZE = FBREF_MAX_WARM_SESSION_TARGETS
-# Eight 25-target sessions can consume, but never exceed, the 200-request cap.
-BACKFILL_WAVE_COUNT = 8
+BACKFILL_MAX_BATCHES = 16
 
 AIRFLOW_RUN_ID = "{{ run_id }}"
 DAG_ID = "{{ dag.dag_id }}"
@@ -115,18 +115,20 @@ with DAG(
     ## FBref historical backfill
 
     Manual only. The DAG selects the next bounded unfinished page of
-    non-current seasons from the source-discovered male registry, then runs up
-    to eight sequential raw-first waves under a 200-request/100-MiB hard cap.
+    non-current seasons from the source-discovered male registry, then runs
+    up to sixteen raw-first batches in one warm process under a
+    200-request/100-MiB hard cap.
     A `100/50` canary profile is available through Params or DagRun conf.
     Set `dry_run=true` to inspect the exact next cohort without creating a
     control run, opening a proxy session, or changing frontier state.
     Live mode checks current-scope freshness immediately after run creation,
     before seeding, raw recovery, or any paid fetch, and checks it again after
-    all waves to catch drift during the run.
+    all batches to catch drift during the run.
     Completed
     historical targets are never requeued; verified raw-v2 or raw-v1 content
     is imported into a new run without a network request. Run again to resume
-    the next remaining cohort automatically.
+    the next remaining cohort automatically. A pre-run content inventory and
+    post-run raw-integrity artifact are mandatory before Silver publication.
     """,
 ) as dag:
     choose_mode = BranchPythonOperator(
@@ -169,7 +171,7 @@ with DAG(
             "request_limit": REQUEST_LIMIT,
             "byte_limit_mb": BYTE_LIMIT_MB,
             "shard_size": SHARD_SIZE,
-            "reservation_mb": 7,
+            "reservation_mb": 3,
             "domain_interval_seconds": 3.0,
         },
         trigger_rule="all_success",
@@ -203,7 +205,7 @@ with DAG(
             "request_limit": REQUEST_LIMIT,
             "byte_limit_mb": BYTE_LIMIT_MB,
             "shard_size": SHARD_SIZE,
-            "reservation_mb": 7,
+            "reservation_mb": 3,
         },
         trigger_rule="all_success",
     )
@@ -219,8 +221,15 @@ with DAG(
             "request_limit": REQUEST_LIMIT,
             "byte_limit_mb": BYTE_LIMIT_MB,
             "shard_size": SHARD_SIZE,
-            "reservation_mb": 7,
+            "reservation_mb": 3,
         },
+        trigger_rule="all_success",
+    )
+
+    capture_raw_baseline = PythonOperator(
+        task_id="capture_raw_baseline",
+        python_callable=capture_fbref_raw_baseline,
+        op_kwargs={"airflow_run_id": AIRFLOW_RUN_ID, "dag_id": DAG_ID},
         trigger_rule="all_success",
     )
 
@@ -230,47 +239,41 @@ with DAG(
     initialize_run >> validate_freshness_preflight
     validate_freshness_preflight >> acquire_publication_lock
     acquire_publication_lock >> seed_historical_seasons
-    seed_historical_seasons >> recover_raw
-    previous = recover_raw
-    for wave_number in range(1, BACKFILL_WAVE_COUNT + 1):
-        fetch = PythonOperator(
-            task_id=f"fetch_wave_{wave_number:02d}",
-            python_callable=fetch_fbref_wave,
-            op_kwargs={
-                "airflow_run_id": AIRFLOW_RUN_ID,
-                "dag_id": DAG_ID,
-                "worker_id": (
-                    f"backfill-wave-{wave_number:02d}:{{{{ run_id }}}}"
-                ),
-                "page_kinds": BACKFILL_PAGE_KINDS,
-                "run_type": "backfill",
-                "request_limit": REQUEST_LIMIT,
-                "byte_limit_mb": BYTE_LIMIT_MB,
-                "shard_size": SHARD_SIZE,
-                "reservation_mb": 7,
-                "domain_interval_seconds": 3.0,
-            },
-            pool=INGEST_SCRAPER_POOL,
-            retries=0,
-            trigger_rule="all_success",
-        )
-        parse = PythonOperator(
-            task_id=f"parse_wave_{wave_number:02d}",
-            python_callable=parse_fbref_wave,
-            op_kwargs={
-                "airflow_run_id": AIRFLOW_RUN_ID,
-                "dag_id": DAG_ID,
-                "page_kinds": BACKFILL_PAGE_KINDS,
-                "run_type": "backfill",
-                "request_limit": REQUEST_LIMIT,
-                "byte_limit_mb": BYTE_LIMIT_MB,
-                "shard_size": SHARD_SIZE,
-                "reservation_mb": 7,
-            },
-            trigger_rule="all_success",
-        )
-        previous >> fetch >> parse
-        previous = parse
+    seed_historical_seasons >> capture_raw_baseline >> recover_raw
+    live_waves = PythonOperator(
+        task_id="run_live_waves",
+        python_callable=run_fbref_live_waves,
+        op_kwargs={
+            "airflow_run_id": AIRFLOW_RUN_ID,
+            "dag_id": DAG_ID,
+            "worker_id": "backfill-live:{{ run_id }}",
+            "page_kinds": BACKFILL_PAGE_KINDS,
+            "run_type": "backfill",
+            "request_limit": REQUEST_LIMIT,
+            "byte_limit_mb": BYTE_LIMIT_MB,
+            "shard_size": SHARD_SIZE,
+            "reservation_mb": 3,
+            "domain_interval_seconds": 3.0,
+            "max_batches": BACKFILL_MAX_BATCHES,
+        },
+        pool=INGEST_SCRAPER_POOL,
+        execution_timeout=timedelta(minutes=120),
+        retries=0,
+        trigger_rule="all_success",
+    )
+    recover_raw >> live_waves
+    audit_raw_integrity = PythonOperator(
+        task_id="audit_raw_integrity",
+        python_callable=audit_fbref_raw_integrity,
+        op_kwargs={
+            "airflow_run_id": AIRFLOW_RUN_ID,
+            "dag_id": DAG_ID,
+            "run_type": "backfill",
+        },
+        trigger_rule="all_success",
+    )
+    live_waves >> audit_raw_integrity
+    previous = audit_raw_integrity
 
     validate_freshness = PythonOperator(
         task_id="validate_current_scope_freshness",

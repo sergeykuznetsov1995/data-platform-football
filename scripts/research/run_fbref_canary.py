@@ -42,6 +42,7 @@ from scrapers.fbref.pipeline import (  # noqa: E402
 from scrapers.fbref.raw_store import competition_index_target  # noqa: E402
 from scrapers.fbref.settings import (  # noqa: E402
     DEFAULT_BOOTSTRAP_REQUEST_RESERVATION,
+    DEFAULT_BROWSER_BYTE_LIMIT_BYTES,
     DEFAULT_DOMAIN_INTERVAL_SECONDS,
     DEFAULT_REQUEST_RESERVATION_BYTES,
     MIB,
@@ -56,7 +57,16 @@ MAX_BYTE_LIMIT_MB = 25
 MIN_REQUEST_LIMIT = (
     DEFAULT_BOOTSTRAP_REQUEST_RESERVATION + MAX_TARGET_HTTP_ATTEMPTS
 )
-MIN_BYTE_LIMIT_MB = max(1, DEFAULT_REQUEST_RESERVATION_BYTES // MIB)
+MIN_BYTE_LIMIT_MB = max(
+    1,
+    (
+        DEFAULT_BROWSER_BYTE_LIMIT_BYTES
+        + DEFAULT_REQUEST_RESERVATION_BYTES
+        + MIB
+        - 1
+    )
+    // MIB,
+)
 _RUN_LABEL_PREFIX = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,79}\Z")
 _WAVE_INTEGER_FIELDS = (
     "cohort_size",
@@ -445,6 +455,13 @@ def _best_effort_fail_run(pipeline: object, run_id: str) -> None:
         pass
 
 
+def _best_effort_release_lock(pipeline: object, run_id: str) -> None:
+    try:
+        pipeline.control.release_publication_lock(run_id)
+    except Exception:  # noqa: BLE001 - preserve the original safe failure class
+        pass
+
+
 def run_canary(
     config: CanaryConfig,
     *,
@@ -472,6 +489,13 @@ def run_canary(
         )
         if initialized_run_id != expected_run_id:
             raise CanaryInvariantError("pipeline returned an unexpected run id")
+
+        stage = "acquire_publication_lock"
+        active_pipeline.control.acquire_publication_lock(
+            expected_run_id,
+            dag_id=CANARY_DAG_ID,
+            ttl_seconds=2 * 60 * 60,
+        )
 
         stage = "seed"
         target_id = active_pipeline.seed_competition_index()
@@ -524,12 +548,19 @@ def run_canary(
         _assert_parse_scope(parse_result)
 
         stage = "validate"
-        validation = active_pipeline.validate_and_finish(expected_run_id)
+        validation = active_pipeline.validate_and_finish(
+            expected_run_id,
+            publication_eligible=False,
+        )
+
+        stage = "release_publication_lock"
+        active_pipeline.control.release_publication_lock(expected_run_id)
     except Exception as exc:  # noqa: BLE001 - return a redacted JSON failure
         finish_attempted = False
         if active_pipeline is not None:
             finish_attempted = True
             _best_effort_fail_run(active_pipeline, expected_run_id)
+            _best_effort_release_lock(active_pipeline, expected_run_id)
         raise CanaryExecutionError(
             stage=stage,
             error_class=type(exc).__name__,

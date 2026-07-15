@@ -768,6 +768,16 @@ class RawPageStore:
         if self.has_fetch(logical_refresh_id):
             record = self.read_fetch_record(logical_refresh_id)
             self._validate_recovery_identity(target, record, version="v2")
+            # A live commit makes the immutable fetch manifest visible before
+            # publishing its target-history candidate and compatibility
+            # mirror.  If the worker dies in that window, control recovery
+            # must finish the publication before it declares the fetch
+            # complete.  Verify both referenced blobs first so corrupt raw
+            # evidence cannot be promoted while repairing the pointers.
+            self._load_record_blob(record, response=True)
+            self._load_record_blob(record, response=False)
+            if record.imported_from_manifest_key is None:
+                self._publish_target_record(target, record)
             return record
 
         latest_key = self._v2_target_manifest_key(target)
