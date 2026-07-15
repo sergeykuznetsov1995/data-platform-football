@@ -1,5 +1,9 @@
 -- FBref typed season-dataset acceptance for DataGrip / PostgreSQL.
 -- Set :control_run_id to the same UUID used by the Trino acceptance script.
+-- Bind :expected_run_type, :expected_request_limit, and
+-- :expected_byte_limit_mb to the exact Airflow profile. Supported acceptance
+-- bindings are current/100/50 for canary, current/200/100 for production, and
+-- replay/0/0 for offline replay.
 -- This control-plane evidence is required because a legitimate empty typed
 -- dataset intentionally does not create an Iceberg table.
 
@@ -7,6 +11,10 @@ SELECT
     'control_run' AS check_name,
     CASE
         WHEN status = 'succeeded'
+         AND run_type = CAST(:expected_run_type AS text)
+         AND request_limit = CAST(:expected_request_limit AS integer)
+         AND byte_limit =
+             CAST(:expected_byte_limit_mb AS bigint) * 1048576
          AND metadata ? 'raw_baseline'
          AND metadata ? 'raw_audit'
          AND metadata -> 'raw_audit' ->> 'status' = 'passed'
@@ -23,6 +31,11 @@ SELECT
     run_id,
     run_type,
     status,
+    request_limit,
+    byte_limit,
+    CAST(:expected_run_type AS text) AS expected_run_type,
+    CAST(:expected_request_limit AS integer) AS expected_request_limit,
+    CAST(:expected_byte_limit_mb AS bigint) AS expected_byte_limit_mb,
     started_at,
     finished_at,
     metadata -> 'raw_baseline' AS raw_baseline_anchor,
