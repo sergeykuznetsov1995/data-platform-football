@@ -297,6 +297,77 @@ class FBrefProxyLeaseClient:
         )
         return self._stats_from_mapping(lease, body, expected=expected)
 
+    def extend(
+        self,
+        lease: FBrefProxyLease,
+        *,
+        max_bytes: int,
+        expected: Mapping[str, Any],
+    ) -> FBrefProxyLease:
+        """Raise one drained FBref lease cap and keep its identity immutable."""
+
+        if isinstance(max_bytes, bool) or not isinstance(max_bytes, int):
+            raise ValueError("FBref lease extension max_bytes must be an integer")
+        if max_bytes <= lease.max_bytes:
+            raise ValueError("FBref lease extension must increase max_bytes")
+        _, body = self._request(
+            "POST",
+            f"/v1/leases/{lease.lease_id}/extend",
+            lease=lease,
+            payload={"max_bytes": max_bytes},
+        )
+        try:
+            returned_max = body["max_bytes"]
+            returned_expiry = body["expires_at"]
+            up = int(body["up_bytes"])
+            down = int(body["down_bytes"])
+            total = int(body["total_bytes"])
+            active = int(body["active_tunnels"])
+            reserved = int(body["reserved_bytes"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise FBrefProxyLeaseError(
+                "FBref proxy meter extension schema mismatch"
+            ) from exc
+        if (
+            isinstance(returned_max, bool)
+            or not isinstance(returned_max, int)
+            or returned_max != max_bytes
+            or isinstance(returned_expiry, bool)
+            or not isinstance(returned_expiry, (int, float))
+            or float(returned_expiry) != lease.expires_at
+            or str(body.get("id") or "") != lease.lease_id
+            or str(body.get("meter") or "") != METER_ID
+            or str(body.get("source") or "") != "fbref"
+            or str(body.get("dag_id") or "") != str(expected.get("dag_id") or "")
+            or str(body.get("run_id") or "") != str(expected.get("run_id") or "")
+            or min(up, down, active, reserved) < 0
+            or total != up + down
+            or total > lease.max_bytes
+            or active != 0
+            or reserved != 0
+            or bool(body.get("closed"))
+            or bool(body.get("expired"))
+            or bool(body.get("budget_exceeded"))
+            or (
+                "token" in body
+                and str(body.get("token") or "") != lease.token
+            )
+            or (
+                "proxy_url" in body
+                and str(body.get("proxy_url") or "") != lease.proxy_url
+            )
+        ):
+            raise FBrefProxyLeaseError(
+                "FBref proxy meter extension failed provenance validation"
+            )
+        return FBrefProxyLease(
+            lease_id=lease.lease_id,
+            token=lease.token,
+            proxy_url=lease.proxy_url,
+            max_bytes=returned_max,
+            expires_at=lease.expires_at,
+        )
+
     def wait_drained(
         self,
         lease: FBrefProxyLease,

@@ -67,6 +67,16 @@ def _stats_body(**overrides):
     return body
 
 
+def _extension_body(**overrides):
+    body = _stats_body(
+        max_bytes=2000,
+        expires_at=9999999999.0,
+        expired=False,
+    )
+    body.update(overrides)
+    return body
+
+
 def test_acquire_never_returns_upstream_credentials_to_the_fetcher():
     session = _Session([_Response(201, _lease_body())])
     client = FBrefProxyLeaseClient(
@@ -135,6 +145,74 @@ def test_stats_require_exact_meter_and_run_provenance():
     assert session.calls[-1][2]["headers"]["Authorization"] == (
         "Bearer lease-token"
     )
+
+
+def test_extend_returns_same_frozen_identity_with_larger_cap():
+    session = _Session(
+        [_Response(201, _lease_body()), _Response(200, _extension_body())]
+    )
+    client = FBrefProxyLeaseClient(
+        "http://fbref_proxy_filter:8899",
+        control_token=TOKEN,
+        session=session,
+    )
+    original = client.acquire(max_bytes=1000, ttl_seconds=7200, metadata=CONTEXT)
+
+    extended = client.extend(original, max_bytes=2000, expected=CONTEXT)
+
+    assert extended is not original
+    assert extended.lease_id == original.lease_id
+    assert extended.token == original.token
+    assert extended.proxy_url == original.proxy_url
+    assert extended.expires_at == original.expires_at
+    assert extended.max_bytes == 2000
+    method, url, request = session.calls[-1]
+    assert method == "POST"
+    assert url.endswith("/v1/leases/lease-1/extend")
+    assert request["json"] == {"max_bytes": 2000}
+    assert request["headers"]["Authorization"] == "Bearer lease-token"
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"id": "another-lease"},
+        {"max_bytes": 1999},
+        {"expires_at": 9999999998.0},
+        {"active_tunnels": 1},
+        {"total_bytes": 1001, "up_bytes": 500, "down_bytes": 501},
+        {"proxy_url": "http://other-filter:8900"},
+    ],
+)
+def test_extend_rejects_invalid_or_lost_acknowledgement(change):
+    body = _extension_body(**change)
+    session = _Session([_Response(201, _lease_body()), _Response(200, body)])
+    client = FBrefProxyLeaseClient(
+        "http://fbref_proxy_filter:8899",
+        control_token=TOKEN,
+        session=session,
+    )
+    original = client.acquire(max_bytes=1000, ttl_seconds=7200, metadata=CONTEXT)
+
+    with pytest.raises(FBrefProxyLeaseError, match="provenance"):
+        client.extend(original, max_bytes=2000, expected=CONTEXT)
+
+    assert original.max_bytes == 1000
+
+
+def test_extend_lost_response_keeps_the_original_frozen_handle():
+    session = _Session([_Response(201, _lease_body())])
+    client = FBrefProxyLeaseClient(
+        "http://fbref_proxy_filter:8899",
+        control_token=TOKEN,
+        session=session,
+    )
+    original = client.acquire(max_bytes=1000, ttl_seconds=7200, metadata=CONTEXT)
+
+    with pytest.raises(FBrefProxyLeaseError, match="request failed"):
+        client.extend(original, max_bytes=2000, expected=CONTEXT)
+
+    assert original.max_bytes == 1000
 
 
 @pytest.mark.parametrize(

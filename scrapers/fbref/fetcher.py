@@ -26,7 +26,7 @@ from scrapers.fbref.settings import (
 from scrapers.utils.proxy_manager import classify_error
 
 
-FETCHER_VERSION = "fbref-camoufox-metered-warm-http-v3"
+FETCHER_VERSION = "fbref-camoufox-metered-warm-http-v4"
 DEFAULT_BOOTSTRAP_URL = "https://fbref.com/en/"
 MAX_HTML_BYTES = DEFAULT_HTTP_BODY_LIMIT_BYTES
 # The browser cap bounds ONE clearance attempt; the run's reservation covers
@@ -289,6 +289,9 @@ class FBrefFetcher:
         self._provider_lease: Optional[FBrefProxyLease] = None
         self._provider_lease_observed_bytes = 0
         self._provider_total_bytes = 0
+        self._provider_bootstrap_max_bytes = 0
+        self._provider_bootstrap_spent_bytes = 0
+        self._provider_http_ready = False
         self._clearance: Optional[dict] = None
         configured_control_url = str(
             proxy_control_url
@@ -331,6 +334,10 @@ class FBrefFetcher:
             self._lease_client = lease_client
             self._provider_context = context
             self._provider_max_bytes = maximum
+            self._provider_bootstrap_max_bytes = min(
+                maximum,
+                self._max_browser_bytes,
+            )
             self._provider_lease_ttl_seconds = ttl
         self._transport = self._create_transport()
         self._http_session = None
@@ -386,16 +393,32 @@ class FBrefFetcher:
         if self._transport is not None:
             self._transport.close()
         self._close_provider_lease()
+        self._provider_http_ready = False
+        # A pipeline clearance refresh reserves a new browser phase.  Keep
+        # rotations inside one transport cumulative, but do not carry the old
+        # phase's spend into the newly reserved transport.
+        self._provider_bootstrap_spent_bytes = 0
         self._bootstrap_stats = None
         self._clearance = None
         self._transport = self._create_transport()
 
     def _next_proxy(self) -> Optional[dict]:
         if self._lease_client is not None:
+            if self._provider_http_ready:
+                raise FBrefProxyLeaseError(
+                    "FBref browser cannot rotate an HTTP-enabled paid lease"
+                )
             self._close_provider_lease()
-            remaining = self._provider_max_bytes - self._provider_total_bytes
+            run_remaining = self._provider_max_bytes - self._provider_total_bytes
+            bootstrap_remaining = (
+                self._provider_bootstrap_max_bytes
+                - self._provider_bootstrap_spent_bytes
+            )
+            remaining = min(run_remaining, bootstrap_remaining)
             if remaining <= 0:
-                raise FBrefProxyLeaseError("FBref provider byte budget exhausted")
+                raise FBrefProxyLeaseError(
+                    "FBref browser provider byte budget exhausted"
+                )
             lease = self._lease_client.acquire(
                 max_bytes=remaining,
                 ttl_seconds=self._provider_lease_ttl_seconds,
@@ -415,18 +438,25 @@ class FBrefFetcher:
         delta = current - self._provider_lease_observed_bytes
         self._provider_lease_observed_bytes = current
         self._provider_total_bytes += delta
+        if not self._provider_http_ready:
+            self._provider_bootstrap_spent_bytes += delta
         if self._provider_total_bytes > self._provider_max_bytes:
             raise FBrefProxyLeaseError("FBref proxy meter exceeded the run cap")
+        if self._provider_bootstrap_spent_bytes > self._provider_bootstrap_max_bytes:
+            raise FBrefProxyLeaseError(
+                "FBref proxy meter exceeded the browser phase cap"
+            )
         return delta
 
-    def _wait_and_observe_provider(self) -> None:
+    def _wait_and_observe_provider(self) -> Optional[FBrefLeaseStats]:
         if self._lease_client is None or self._provider_lease is None:
-            return
+            return None
         stats = self._lease_client.wait_drained(
             self._provider_lease,
             expected=self._provider_context,
         )
         self._observe_provider_stats(stats)
+        return stats
 
     def _close_provider_lease(self) -> None:
         lease_client = getattr(self, "_lease_client", None)
@@ -434,15 +464,76 @@ class FBrefFetcher:
         if lease_client is None or provider_lease is None:
             return
         lease = provider_lease
-        try:
-            stats = lease_client.close(
-                lease,
-                expected=self._provider_context,
+        stats = lease_client.close(
+            lease,
+            expected=self._provider_context,
+        )
+        self._observe_provider_stats(stats)
+        # Clear ownership only after close + authoritative observation both
+        # succeeded. On failure, _next_proxy must retry reconciliation instead
+        # of acquiring a second paid lease with an unknown first balance.
+        self._provider_lease = None
+        self._provider_lease_observed_bytes = 0
+        self._provider_http_ready = False
+
+    def _extend_provider_lease_for_http(self) -> None:
+        """Drain the browser, then widen the same lease for warm HTTP."""
+
+        lease_client = getattr(self, "_lease_client", None)
+        lease = getattr(self, "_provider_lease", None)
+        if lease_client is None:
+            return
+        if lease is None:
+            raise FBrefProxyLeaseError(
+                "FBref browser clearance has no paid provider lease"
             )
-            self._observe_provider_stats(stats)
-        finally:
-            self._provider_lease = None
-            self._provider_lease_observed_bytes = 0
+        if self._provider_http_ready:
+            return
+
+        # This is the mandatory browser/HTTP phase boundary.  A timeout or a
+        # late provider reservation aborts before the extend call and before a
+        # curl session can send a target request.
+        stats = self._wait_and_observe_provider()
+        if (
+            stats is None
+            or stats.closed
+            or stats.budget_exceeded
+            or lease.expires_at <= time.time()
+        ):
+            raise FBrefProxyLeaseError(
+                "FBref browser lease is not usable for warm HTTP"
+            )
+        previous_lease_spend = (
+            self._provider_total_bytes - self._provider_lease_observed_bytes
+        )
+        desired_max = self._provider_max_bytes - previous_lease_spend
+        if desired_max < lease.max_bytes:
+            raise FBrefProxyLeaseError(
+                "FBref provider lease exceeds its remaining run budget"
+            )
+        if desired_max == lease.max_bytes:
+            # The run cap itself was smaller than the browser phase cap.  The
+            # drained lease already has the exact final ceiling, so there is no
+            # upward mutation for the control API to perform.
+            self._provider_http_ready = True
+            return
+        extended = lease_client.extend(
+            lease,
+            max_bytes=desired_max,
+            expected=self._provider_context,
+        )
+        if (
+            extended.lease_id != lease.lease_id
+            or extended.token != lease.token
+            or extended.proxy_url != lease.proxy_url
+            or extended.expires_at != lease.expires_at
+            or extended.max_bytes != desired_max
+        ):
+            raise FBrefProxyLeaseError(
+                "FBref proxy meter returned a different extended lease"
+            )
+        self._provider_lease = extended
+        self._provider_http_ready = True
 
     def _finish_metered_fetch(self) -> None:
         """Close the HTTP tunnel, then read a final provider counter.
@@ -559,6 +650,14 @@ class FBrefFetcher:
             return
         retained_clearance = getattr(self, "_clearance", None)
         if retained_clearance is not None:
+            if (
+                getattr(self, "_lease_client", None) is not None
+                and not self._provider_http_ready
+            ):
+                raise FetchError(
+                    "FBref paid lease was not extended for warm HTTP",
+                    error_class="hard_transport_policy",
+                )
             self._http_session = self._create_http_session(retained_clearance)
             return
         transport = self._transport
@@ -573,6 +672,35 @@ class FBrefFetcher:
             bootstrap_stats, finalize_error = (
                 self._close_browser_and_collect_traffic(transport)
             )
+            hard_policy = self._hard_transport_policy_reason(bootstrap_stats)
+            if finalize_error is not None and hard_policy is None:
+                hard_policy = "browser_finalization_failed"
+            if (
+                finalize_error is None
+                and getattr(self, "_lease_client", None) is not None
+            ):
+                provider_stats = None
+                try:
+                    provider_stats = self._wait_and_observe_provider()
+                except Exception:
+                    hard_policy = hard_policy or "browser_provider_drain_failed"
+                if (
+                    (
+                        self._provider_bootstrap_max_bytes > 0
+                        and self._provider_bootstrap_spent_bytes
+                        >= self._provider_bootstrap_max_bytes
+                    )
+                    or (
+                        self._provider_lease is not None
+                        and self._provider_lease_observed_bytes
+                        >= self._provider_lease.max_bytes
+                    )
+                    or bool(
+                        provider_stats is not None
+                        and provider_stats.budget_exceeded
+                    )
+                ):
+                    hard_policy = hard_policy or "browser_provider_cap_exhausted"
             breakdown = (
                 self._full_browser_reservation_breakdown()
                 if finalize_error is not None
@@ -580,12 +708,19 @@ class FBrefFetcher:
             )
             raise FetchError(
                 (
-                    "Camoufox clearance bootstrap failed: "
+                    "Camoufox hard transport policy failed: "
+                    f"{hard_policy}"
+                    if hard_policy is not None
+                    else "Camoufox clearance bootstrap failed: "
                     f"{type(bootstrap_error).__name__}"
                     if bootstrap_error is not None
                     else "Camoufox could not establish an FBref clearance lease"
                 ),
-                error_class="clearance_failed",
+                error_class=(
+                    "hard_transport_policy"
+                    if hard_policy is not None
+                    else "clearance_failed"
+                ),
                 browser_document_bytes=breakdown[0],
                 browser_asset_bytes=breakdown[1],
                 browser_requests=breakdown[2],
@@ -602,24 +737,28 @@ class FBrefFetcher:
         if clearance_error is None and not clearance:
             clearance_error = RuntimeError("no usable clearance exported")
 
-        http_session = None
-        if clearance_error is None:
-            try:
-                http_session = self._create_http_session(clearance)
-            except Exception as exc:
-                clearance_error = exc
-
         bootstrap_stats, finalize_error = (
             self._close_browser_and_collect_traffic(transport)
         )
+        hard_policy = self._hard_transport_policy_reason(bootstrap_stats)
+        if finalize_error is not None and hard_policy is None:
+            hard_policy = "browser_finalization_failed"
         breakdown = (
             self._full_browser_reservation_breakdown()
             if finalize_error is not None
             else self._browser_breakdown(bootstrap_stats)
         )
+        if hard_policy is not None:
+            raise FetchError(
+                f"Camoufox hard transport policy failed: {hard_policy}",
+                error_class="hard_transport_policy",
+                browser_document_bytes=breakdown[0],
+                browser_asset_bytes=breakdown[1],
+                browser_requests=breakdown[2],
+                browser_bootstrap_attempts=breakdown[3],
+                browser_unobserved_bytes=breakdown[4],
+            )
         if finalize_error is not None:
-            if http_session is not None:
-                http_session.close()
             raise FetchError(
                 "Camoufox browser finalization/accounting failed: "
                 f"{type(finalize_error).__name__}",
@@ -641,9 +780,56 @@ class FBrefFetcher:
                 browser_bootstrap_attempts=breakdown[3],
                 browser_unobserved_bytes=breakdown[4],
             ) from clearance_error
+        try:
+            self._extend_provider_lease_for_http()
+        except Exception as exc:
+            raise FetchError(
+                "FBref browser/HTTP provider phase boundary failed: "
+                f"{type(exc).__name__}",
+                error_class="hard_transport_policy",
+                browser_document_bytes=breakdown[0],
+                browser_asset_bytes=breakdown[1],
+                browser_requests=breakdown[2],
+                browser_bootstrap_attempts=breakdown[3],
+                browser_unobserved_bytes=breakdown[4],
+            ) from exc
+        try:
+            http_session = self._create_http_session(clearance)
+        except Exception as exc:
+            raise FetchError(
+                "FBref warm HTTP session creation failed: "
+                f"{type(exc).__name__}",
+                error_class="clearance_export_failed",
+                browser_document_bytes=breakdown[0],
+                browser_asset_bytes=breakdown[1],
+                browser_requests=breakdown[2],
+                browser_bootstrap_attempts=breakdown[3],
+                browser_unobserved_bytes=breakdown[4],
+            ) from exc
         self._http_session = http_session
         self._clearance = dict(clearance)
         self._bootstrap_stats = bootstrap_stats
+
+    @staticmethod
+    def _hard_transport_policy_reason(stats: Optional[dict]) -> Optional[str]:
+        source = stats or {}
+        if source.get("geoip_lookup_failed"):
+            return "geoip_lookup_failed"
+        if source.get("redirect_blocked"):
+            return "redirect_blocked"
+        if source.get("network_policy_failed"):
+            return str(
+                source.get("network_policy_failure")
+                or "unexpected_network"
+            )
+        if source.get("request_budget_exhausted"):
+            return "request_budget_exhausted"
+        if source.get("byte_budget_exhausted"):
+            return str(
+                source.get("byte_budget_failure")
+                or "byte_budget_exhausted"
+            )
+        return None
 
     @staticmethod
     def _browser_breakdown(
@@ -745,6 +931,14 @@ class FBrefFetcher:
         last_modified: Optional[str] = None,
     ) -> FetchResponse:
         self._ensure_clearance()
+        if (
+            getattr(self, "_lease_client", None) is not None
+            and not self._provider_http_ready
+        ):
+            raise FetchError(
+                "FBref warm HTTP is blocked before paid lease extension",
+                error_class="hard_transport_policy",
+            )
         headers = {}
         if etag:
             headers["If-None-Match"] = etag
@@ -1041,10 +1235,12 @@ class FBrefFetcher:
         # A close is a second, stronger accounting read: proxy-filter revokes
         # every tunnel and returns only after its final byte event is durable.
         exact_close = False
+        close_error = None
         try:
             self._close_provider_lease()
             exact_close = True
-        except Exception:  # noqa: BLE001 - the returned error stays fail-closed
+        except Exception as exc:  # noqa: BLE001 - return one terminal error
+            close_error = exc
             logger.exception("FBref paid lease final accounting failed")
         self._clearance = None
         values = {
@@ -1093,9 +1289,27 @@ class FBrefFetcher:
                     "latency_ms": original.latency_ms,
                 }
             )
+        details = [f"counter={type(error).__name__}: {error}"]
+        if close_error is not None:
+            details.append(
+                f"final_close={type(close_error).__name__}: {close_error}"
+            )
+        if isinstance(original, FetchError):
+            details.append(
+                f"target_error={original.error_class}: {original}"
+            )
+        elif isinstance(original, FetchResponse):
+            details.append(f"target_response_status={original.status_code}")
+        elif original is not None:
+            details.append(
+                f"target_error={type(original).__name__}: {original}"
+            )
         return FetchError(
-            "FBref provider counter unavailable: " f"{type(error).__name__}",
-            error_class="provider_meter_unavailable",
+            "FBref paid transport accounting is uncertain; "
+            + "; ".join(details),
+            # An unknown paid counter can outlive this target.  It is always a
+            # run-level stop, even when the target error itself was ordinary.
+            error_class="hard_transport_policy",
             provider_billed_bytes=(
                 max(0, self._provider_total_bytes - before_provider_bytes)
                 if exact_close
