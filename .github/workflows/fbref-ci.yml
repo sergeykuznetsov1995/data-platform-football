@@ -48,7 +48,7 @@ jobs:
           python -m pip install --disable-pip-version-check \
             pytest ruff pandas numpy pyarrow boto3==1.42.61 trino requests beautifulsoup4 lxml \
             psycopg2-binary python-dotenv tenacity pybreaker rapidfuzz \
-            Unidecode nicknames PyYAML jsonschema
+            Unidecode nicknames PyYAML jsonschema psutil
       - name: Static checks
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -126,7 +126,9 @@ jobs:
                   safe_mode=False,
               )
               errors.update(bag.import_errors)
-              dag = bag.get_dag(dag_id)
+              # ``get_dag`` consults Airflow's metadata DB. This job tests
+              # import only and deliberately has no initialized DB.
+              dag = bag.dags.get(dag_id)
               if dag is None:
                   raise AssertionError((dag_id, bag.import_errors))
               counts[dag_id] = len(dag.tasks)
