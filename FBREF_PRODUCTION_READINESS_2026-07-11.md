@@ -709,16 +709,24 @@ git diff --check
    every run-owned DQ gate, and zero female/unknown publication. Record the
    global pending-match backlog as a diagnostic; the non-publishing canary is
    not allowed to claim that a bounded cohort closed the global frontier. Run
-   both DataGrip acceptance scripts against the same control-run UUID.
+   `fbref_canary_acceptance.sql` in Trino and
+   `fbref_control_dataset_acceptance.sql` in PostgreSQL against the same
+   control-run UUID. Bind the control check to `current`, `100`, and `50` for
+   expected run type, request limit, and byte limit MiB. The canary has no
+   publication-scope generation or Silver child, so the production Trino
+   script is not a canary gate.
 5. Run two consecutive publishing current loads on the same immutable SHA with
    the 200-request / 100-MiB / shard-25 profile. Require the blocking
    FBref Silver transform and its DQ, zero promotion-pending current matches,
    and the final publication-lock verdict to succeed for both runs. The
    separately scheduled master/xref/Gold chain is outside this source
-   acceptance gate.
+   acceptance gate. Run `fbref_production_acceptance.sql` in Trino and the
+   PostgreSQL companion for each control-run UUID; bind the companion to
+   `current`, `200`, and `100`.
 6. Replay one accepted source control run through `dag_replay_fbref`. Require
    request/byte budgets `0/0`, no fetch path, a zero raw-store delta, and no
-   remaining parser-version candidates.
+   remaining parser-version candidates. Run the PostgreSQL companion against
+   the replay control-run UUID with bindings `replay`, `0`, and `0`.
 7. Record run IDs, control summaries, raw object/byte counts, Bronze row counts,
    DQ output, and provider-traffic deltas in issue #949. Set the source to GO
    only when the canary, both current runs, and replay are green on the same

@@ -9,12 +9,23 @@ SQL = (
     / "sql"
     / "fbref_production_acceptance.sql"
 ).read_text(encoding="utf-8")
+CANARY_SQL = (
+    Path(__file__).parents[3]
+    / "docs"
+    / "operations"
+    / "sql"
+    / "fbref_canary_acceptance.sql"
+).read_text(encoding="utf-8")
 CONTROL_SQL = (
     Path(__file__).parents[3]
     / "docs"
     / "operations"
     / "sql"
     / "fbref_control_dataset_acceptance.sql"
+).read_text(encoding="utf-8")
+READINESS = (
+    Path(__file__).parents[3]
+    / "FBREF_PRODUCTION_READINESS_2026-07-11.md"
 ).read_text(encoding="utf-8")
 
 
@@ -80,6 +91,58 @@ def test_acceptance_sql_enumerates_every_production_typed_dataset():
         }
         if f"('{dataset}'," not in SQL
     ) == []
+
+
+def test_canary_sql_is_read_only_and_has_exact_profile_scope():
+    executable = _without_comments(CANARY_SQL)
+
+    assert ":control_run_id" in executable
+    assert executable.count(";") == 5
+    assert not re.search(
+        r"\b(CREATE|ALTER|DROP|INSERT|UPDATE|DELETE|MERGE|CALL)\b",
+        executable,
+        flags=re.IGNORECASE,
+    )
+    for relation in (
+        "fbref_page_manifest",
+        "fbref_table_inventory",
+        "fbref_table_cells",
+        "fbref_dataset_availability",
+        "information_schema.tables",
+    ):
+        assert relation in CANARY_SQL
+    assert "fbref_target_scope" not in executable
+    assert "outside_scope_rows" not in executable
+    assert "iceberg.silver" not in executable
+
+
+def test_canary_sql_enumerates_every_typed_dataset_and_exact_batch():
+    from scrapers.fbref.typed_bronze import (
+        MATCH_AVAILABILITY_TABLE,
+        MATCH_DATASET_TABLES,
+        SEASON_DATASET_TABLES,
+    )
+
+    typed_tables = {
+        "fbref_schedule",
+        MATCH_AVAILABILITY_TABLE,
+        *MATCH_DATASET_TABLES.values(),
+        *SEASON_DATASET_TABLES.values(),
+    }
+    assert sorted(table for table in typed_tables if table not in CANARY_SQL) == []
+    datasets = {
+        "schedule",
+        "dataset_availability",
+        *MATCH_DATASET_TABLES,
+        *SEASON_DATASET_TABLES,
+    }
+    assert sorted(
+        dataset for dataset in datasets if f"('{dataset}'," not in CANARY_SQL
+    ) == []
+    generator = CANARY_SQL.split("-- 3.", 1)[1].split("-- 4.", 1)[0]
+    assert "WHERE _batch_id =" in generator
+    assert "CAST(:control_run_id AS varchar)" in generator
+    assert "fbref_target_scope" not in generator
 
 
 def test_scope_and_dataset_gates_are_derived_not_hardcoded():
@@ -148,6 +211,18 @@ def test_postgres_companion_proves_explicit_empty_season_manifests():
     executable = _without_comments(CONTROL_SQL)
 
     assert ":control_run_id" in executable
+    assert ":expected_run_type" in executable
+    assert ":expected_request_limit" in executable
+    assert ":expected_byte_limit_mb" in executable
+    assert "run_type = CAST(:expected_run_type AS text)" in executable
+    assert (
+        "request_limit = CAST(:expected_request_limit AS integer)"
+        in executable
+    )
+    assert (
+        "CAST(:expected_byte_limit_mb AS bigint) * 1048576"
+        in executable
+    )
     assert "observation_processing" in CONTROL_SQL
     assert "dataset_manifest" in CONTROL_SQL
     assert "typed:__complete__" in CONTROL_SQL
@@ -193,3 +268,13 @@ def test_silver_freshness_uses_oldest_row_not_one_fresh_row():
     assert _without_comments(silver).count("min(_silver_created_at)") == 2
     assert "max(_silver_created_at)" not in silver
     assert "null_freshness = 0" in silver
+
+
+def test_profile_specific_acceptance_scripts_are_routed_explicitly():
+    header = "\n".join(SQL.splitlines()[:8])
+    assert "only for the publishing 200-request / 100-MiB" in header
+    assert "use fbref_canary_acceptance.sql" in header
+    assert "`fbref_canary_acceptance.sql`" in READINESS
+    assert "`fbref_production_acceptance.sql`" in READINESS
+    assert "`fbref_control_dataset_acceptance.sql`" in READINESS
+    assert "bindings `replay`, `0`, and `0`" in READINESS

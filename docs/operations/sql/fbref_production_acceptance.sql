@@ -1,4 +1,7 @@
 -- FBref production acceptance for DataGrip / Trino.
+-- This file is only for the publishing 200-request / 100-MiB current profile.
+-- The non-publishing 100/50 canary has no publication-scope generation or
+-- Silver child; use fbref_canary_acceptance.sql for that profile.
 -- Set :control_run_id to the accepted PostgreSQL control run UUID.
 -- Set :expected_current_male_competitions from the control PostgreSQL
 -- datasource (never hardcode it):
