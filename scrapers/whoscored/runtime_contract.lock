@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "parser_version": "whoscored-parser-v8",
+  "report_schema_version": 3,
+  "business_dataset_count": 25,
+  "files": {
+    "dags/scripts/run_whoscored_backfill_item.py": "0f6c0ae97f1a4ca404800706b63a62257954be412f17a8fcdd970ff986c3db87",
+    "dags/scripts/run_whoscored_scraper.py": "4879e51e33f90056f3adb4811607c7073bd0cfc6c5c571356bf9d69bd3cb69e3",
+    "scrapers/base/flaresolverr_client.py": "11f02779714a7c4a5f127b6acd8dc812c9e5c8983207ed626f7c88bce07fdf3c",
+    "scrapers/base/iceberg_writer.py": "91ca6e8b51ccc1e1202c9d2accf1a90349c3e903adfda93a94978b8ea4ae9374",
+    "scrapers/whoscored/parsers.py": "be308645ab48f267a9ef7b4baab77ae6d34d60cc36afa7895d17b61d0ab3f8e7",
+    "scrapers/whoscored/repository.py": "0803165ef9036fb5b086c5d8b5fb9bbc9e563763584deb8ae044eceb8f5d979b",
+    "scrapers/whoscored/service.py": "686e46f0a6e9e5f5c8cba900e457bfff016e4caaa35ce5ae9c7510a4751cb7bd",
+    "scrapers/whoscored/source_circuit.py": "656adddc96c2efe73f09160034317656473393c5617fab424f3213bed9365cfe",
+    "scrapers/whoscored/transport.py": "242341951865eae56ecc40a0746ee234052bc394dcaa87691030962e86c192fa"
+  }
+}

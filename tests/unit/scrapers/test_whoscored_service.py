@@ -418,8 +418,12 @@ class _CatalogRepository:
     def __init__(self, previous=None):
         self.previous = previous
         self.persisted = []
+        self.load_options = []
 
-    def load_discovered_catalog(self):
+    def load_discovered_catalog(
+        self, *, allow_legacy_parser_for_full_history=False
+    ):
+        self.load_options.append(bool(allow_legacy_parser_for_full_history))
         return self.previous
 
     def persist_discovered_catalog(self, catalog, **metadata):
@@ -432,6 +436,22 @@ class _CatalogTransport:
 
     def close(self):
         return None
+
+
+def test_full_history_service_requests_the_narrow_legacy_catalog_migration_path():
+    repository = _CatalogRepository(previous=None)
+
+    # A source failure after bootstrap is sufficient here: the regression is
+    # that the explicit full-history boundary requested the legacy-safe read.
+    result = WhoScoredIngestService.discover_catalog(
+        repository=repository,
+        transport=_CatalogTransport(),
+        raw_store=object(),
+        full_history=True,
+    )
+
+    assert repository.load_options == [True]
+    assert result.errors
 
 
 def _discovery_competition_row(
@@ -2285,6 +2305,8 @@ def test_present_but_unsupported_matchcentre_is_parse_failed(tmp_path):
 
 def test_semantically_truncated_match_is_manifested_as_parse_failed(tmp_path):
     service, repository, raw_store = _service(tmp_path)
+    candidate = replace(repository.list_match_candidates()[0], attempt_no=3)
+    repository.list_match_candidates = lambda *_args, **_kwargs: [candidate]
 
     def reject(_commit):
         raise ValueError("game 123 has incomplete final Opta events")
@@ -2298,6 +2320,8 @@ def test_semantically_truncated_match_is_manifested_as_parse_failed(tmp_path):
     assert len(repository.failures) == 1
     failure = repository.failures[0]
     assert failure.state == "parse_failed"
+    assert failure.attempt_no == 3
+    assert failure.retry_after is None
     assert "incomplete final Opta events" in failure.error
     assert failure.raw_uri
     assert raw_store.has(match_page_target(123))
@@ -2322,6 +2346,70 @@ def test_match_task_budget_is_backed_off_not_permanently_blacklisted(tmp_path):
     assert result.terminal == []
     assert repository.failures[0].state == "retryable"
     assert repository.failures[0].failure_code == "budget"
+
+
+@pytest.mark.parametrize(
+    ("attempt_no", "delay_hours"),
+    [(1, 6), (2, 12), (3, 24), (4, 48), (7, 48)],
+)
+def test_match_retry_backoff_increases_and_caps(tmp_path, attempt_no, delay_hours):
+    service, repository, _ = _service(tmp_path)
+    candidate = replace(repository.list_match_candidates()[0], attempt_no=attempt_no)
+    repository.list_match_candidates = lambda *_args, **_kwargs: [candidate]
+    service.transport = _FailingTransport(
+        WhoScoredTransportError(
+            "origin timed out",
+            kind=FailureKind.TIMEOUT,
+            url="https://www.whoscored.com/Matches/123/Live",
+            route=TransportRoute.DIRECT_HTTP,
+            retryable=True,
+        )
+    )
+
+    before = datetime.utcnow()
+    result = service.sync_matches()
+
+    assert result.status == "retryable"
+    failure = repository.failures[0]
+    assert failure.attempt_no == attempt_no
+    assert before + timedelta(hours=delay_hours) <= failure.retry_after
+    assert failure.retry_after <= before + timedelta(hours=delay_hours, seconds=2)
+
+
+def test_match_success_after_retry_carries_attempt_into_manifest_commit(tmp_path):
+    service, repository, _ = _service(tmp_path)
+    candidate = replace(repository.list_match_candidates()[0], attempt_no=3)
+    repository.list_match_candidates = lambda *_args, **_kwargs: [candidate]
+
+    result = service.sync_matches()
+
+    assert result.status == "success", result.as_dict()
+    assert repository.commits[0].attempt_no == 3
+
+
+def test_match_terminal_failure_keeps_attempt_and_has_no_retry_deadline(tmp_path):
+    service, repository, _ = _service(tmp_path)
+    candidate = replace(repository.list_match_candidates()[0], attempt_no=4)
+    repository.list_match_candidates = lambda *_args, **_kwargs: [candidate]
+    service.transport = _FailingTransport(
+        WhoScoredTransportError(
+            "origin rejected request",
+            kind=FailureKind.HTTP_STATUS,
+            url="https://www.whoscored.com/Matches/123/Live",
+            route=TransportRoute.DIRECT_HTTP,
+            status_code=403,
+            retryable=False,
+        )
+    )
+
+    result = service.sync_matches()
+
+    assert result.status == "success"
+    assert result.terminal == ["123"]
+    failure = repository.failures[0]
+    assert failure.state == "terminal"
+    assert failure.attempt_no == 4
+    assert failure.retry_after is None
 
 
 def test_match_failure_manifest_error_is_visible_without_aborting_result(tmp_path):

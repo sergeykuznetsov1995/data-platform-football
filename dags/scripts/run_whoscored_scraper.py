@@ -1080,6 +1080,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     report["catalog_batch_id"] = args.catalog_batch_id
 
     try:
+        from scrapers.whoscored.runtime_contract import validate_runtime_contract
+
+        # Recheck inside every mapped Bash process. A scheduler preflight alone
+        # cannot protect mutable bind mounts from deployment between tasks.
+        validate_runtime_contract(report_schema_version=REPORT_SCHEMA_VERSION)
         service_cls = _load_runtime()
     except Exception as exc:
         for scope in scopes:

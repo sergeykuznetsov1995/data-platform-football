@@ -1,47 +1,10 @@
 name: WhoScored production CI
 
 on:
+  # The production contract crosses scraper, writer, schema, DAG utility,
+  # image, dependency and Compose boundaries.  Run on every PR so a shared
+  # dependency cannot silently bypass this gate through a fragile path list.
   pull_request:
-    paths:
-      - ".github/workflows/whoscored-ci.yml"
-      - "compose.yaml"
-      - ".env.example"
-      - ".gitignore"
-      - "docs/operations/**"
-      - "docker/images/airflow/requirements-airflow.txt"
-      - "dags/dag_ingest_whoscored.py"
-      - "dags/dag_backfill_whoscored.py"
-      - "dags/dag_backup_whoscored_storage.py"
-      - "dags/dag_iceberg_maintenance.py"
-      - "dags/dag_iceberg_maintenance_daily.py"
-      - "dags/dag_master_pipeline.py"
-      - "dags/dag_transform_fbref_silver.py"
-      - "dags/scripts/run_whoscored_scraper.py"
-      - "dags/scripts/run_whoscored_backfill_item.py"
-      - "dags/scripts/whoscored_ops_store.py"
-      - "dags/scripts/whoscored_frozen_dq.py"
-      - "dags/scripts/whoscored_identity.py"
-      - "dags/utils/config.py"
-      - "dags/utils/maintenance_tasks.py"
-      - "configs/seaweedfs/**"
-      - "scrapers/base/iceberg_writer.py"
-      - "scrapers/whoscored/**"
-      - "scripts/**/*whoscored*"
-      - "scripts/cutover_seaweedfs_topology.sh"
-      - "scripts/seaweedfs_plane_entrypoint.sh"
-      - "scripts/init_seaweedfs_bucket.py"
-      - "scripts/flaresolverr_extended.py"
-      - "scripts/proxy_filter/**"
-      - "tests/**/*whoscored*"
-      - "tests/unit/scripts/test_cutover_seaweedfs_topology.py"
-      - "tests/unit/scripts/test_seaweedfs_plane_entrypoint.py"
-      - "tests/unit/scripts/test_init_seaweedfs_bucket.py"
-      - "tests/unit/dags/test_maintenance_tasks.py"
-      - "tests/unit/dags/test_dag_iceberg_maintenance_daily.py"
-      - "tests/unit/dags/test_proxy_traffic.py"
-      - "tests/unit/dags/conftest.py"
-      - "tests/unit/scripts/test_filter_proxy.py"
-      - "tests/unit/scripts/test_flaresolverr_extended.py"
 
 permissions:
   contents: read
@@ -106,7 +69,9 @@ jobs:
             dags/scripts/whoscored_identity.py \
             scripts/init_seaweedfs_bucket.py \
             scripts/flaresolverr_extended.py \
-            scripts/proxy_filter/filter_proxy.py
+            scripts/proxy_filter/filter_proxy.py \
+            scripts/research/bench_whoscored_workflow.py \
+            scripts/research/bench_whoscored_capacity.py
           bash -n scripts/cutover_seaweedfs_topology.sh
           bash -n scripts/seaweedfs_plane_entrypoint.sh
 
@@ -141,3 +106,70 @@ jobs:
             tests/unit/dags/test_maintenance_tasks.py \
             tests/unit/dags/test_dag_iceberg_maintenance.py \
             tests/unit/dags/test_dag_iceberg_maintenance_daily.py
+
+  real-airflow-dag-import:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      AIRFLOW_HOME: ${{ runner.temp }}/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: sqlite:///${{ runner.temp }}/airflow/airflow.db
+      PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/dags
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install the production Airflow parser runtime
+        run: |
+          python -m pip install --disable-pip-version-check \
+            "apache-airflow==2.11.2" pandas pyarrow beautifulsoup4 \
+            trino requests PyYAML \
+            --constraint \
+            https://raw.githubusercontent.com/apache/airflow/constraints-2.11.2/constraints-3.11.txt
+
+      - name: Stage production WhoScored DAGs
+        run: |
+          dag_dir="${RUNNER_TEMP}/whoscored-dags"
+          mkdir -p "${dag_dir}"
+          for dag in \
+            dag_ingest_whoscored.py \
+            dag_backfill_whoscored.py \
+            dag_backup_whoscored_storage.py
+          do
+            ln -s "${GITHUB_WORKSPACE}/dags/${dag}" "${dag_dir}/${dag}"
+          done
+          echo "AIRFLOW__CORE__DAGS_FOLDER=${dag_dir}" >> "${GITHUB_ENV}"
+
+      - name: Check real Airflow DAG imports
+        run: |
+          airflow db migrate
+          airflow dags list-import-errors
+          python - <<'PY'
+          import os
+          from airflow.models import DagBag
+
+          dag_bag = DagBag(
+              dag_folder=os.environ["AIRFLOW__CORE__DAGS_FOLDER"],
+              include_examples=False,
+              safe_mode=False,
+          )
+          if dag_bag.import_errors:
+              details = "\n".join(
+                  f"{path}: {error}"
+                  for path, error in sorted(dag_bag.import_errors.items())
+              )
+              raise SystemExit(f"real Airflow DAG import errors:\n{details}")
+
+          expected = {
+              "dag_ingest_whoscored",
+              "dag_backfill_whoscored",
+              "dag_backup_whoscored_storage",
+          }
+          missing = expected.difference(dag_bag.dag_ids)
+          if missing:
+              raise SystemExit(f"real Airflow did not load DAGs: {sorted(missing)}")
+          PY

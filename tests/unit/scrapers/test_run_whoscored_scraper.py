@@ -570,6 +570,39 @@ def test_runtime_import_failure_still_publishes_failure_report(monkeypatch, tmp_
 
 
 @pytest.mark.unit
+def test_every_cli_process_rechecks_the_runtime_contract(monkeypatch, tmp_path):
+    from scrapers.whoscored import runtime_contract
+
+    def fail_contract(**_kwargs):
+        raise runtime_contract.RuntimeContractError("worker tree changed")
+
+    monkeypatch.setattr(runtime_contract, "validate_runtime_contract", fail_contract)
+    monkeypatch.setattr(
+        runner,
+        "_load_runtime",
+        lambda: pytest.fail("source runtime loaded before contract validation"),
+    )
+    output = tmp_path / "result.json"
+
+    rc = runner.main(
+        [
+            "replay",
+            "--scope",
+            "ENG-Premier League=2526",
+            "--game-id",
+            "123",
+            "--output",
+            str(output),
+        ]
+    )
+
+    report = json.loads(output.read_text(encoding="utf-8"))
+    assert rc == 1
+    assert report["status"] == "failed"
+    assert "worker tree changed" in report["errors"][0]
+
+
+@pytest.mark.unit
 def test_removed_entity_cli_commands_are_rejected():
     parser = runner._build_parser()
     with pytest.raises(SystemExit):

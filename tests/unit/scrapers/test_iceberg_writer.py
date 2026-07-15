@@ -238,6 +238,36 @@ class TestIcebergWriterWriteDataFrame:
                 written_df = call_args[0][0]
                 assert "_source" not in written_df.columns
 
+    def test_real_public_writer_interface_accepts_and_forwards_bulk_arrow(self):
+        """The deployed writer must match the WhoScored repository call site."""
+        with patch.dict(
+            "sys.modules", {"trino": MagicMock(), "trino.dbapi": MagicMock()}
+        ):
+            from scrapers.base.iceberg_writer import IcebergWriter
+
+            writer = IcebergWriter()
+            frame = pd.DataFrame({"entity_key": ["one"]})
+
+            with patch.object(
+                writer,
+                "_write_to_iceberg",
+                return_value="iceberg.bronze.whoscored_player_stage_stats",
+            ) as write:
+                result = writer.write_dataframe(
+                    frame,
+                    database="bronze",
+                    table="whoscored_player_stage_stats",
+                    add_metadata=False,
+                    source="whoscored",
+                    bulk_arrow=True,
+                )
+
+            assert result == "iceberg.bronze.whoscored_player_stage_stats"
+            assert write.call_args.kwargs["bulk_arrow"] is True
+            assert write.call_args.kwargs["mode"] == "append"
+            assert write.call_args.kwargs["delete_filter"] is None
+            assert write.call_args.kwargs["merge_keys"] is None
+
 
 class TestIcebergWriterWriteToIceberg:
     """Tests for _write_to_iceberg internal method."""

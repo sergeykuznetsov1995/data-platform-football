@@ -934,7 +934,9 @@ class WhoScoredIngestService:
         raw_inputs: list[dict[str, str]] = []
         root_raw_uri = ""
         try:
-            previous_catalog = repo.load_discovered_catalog()
+            previous_catalog = repo.load_discovered_catalog(
+                allow_legacy_parser_for_full_history=bool(full_history)
+            )
         except LookupError:
             previous_catalog = None
         # The first atomic snapshot must always contain historical stage
@@ -2520,6 +2522,7 @@ class WhoScoredIngestService:
                     ),
                     parser_version=parsed.parser_version,
                     kickoff=candidate.kickoff,
+                    attempt_no=int(candidate.attempt_no),
                     datasets=additional,
                     dataset_statuses={
                         name: dataset.status.value
@@ -2570,11 +2573,13 @@ class WhoScoredIngestService:
                         )
                         else "terminal"
                     )
-                retry_after = (
-                    datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=6)
-                    if state == "retryable"
-                    else None
-                )
+                attempt_no = int(candidate.attempt_no)
+                retry_after = None
+                if state == "retryable":
+                    delay_hours = min(6 * (2 ** min(attempt_no - 1, 3)), 48)
+                    retry_after = datetime.now(timezone.utc).replace(
+                        tzinfo=None
+                    ) + timedelta(hours=delay_hours)
                 try:
                     self.repository.record_failure(
                         ManifestFailure(
@@ -2589,7 +2594,7 @@ class WhoScoredIngestService:
                             ),
                             error=str(exc)[:4000],
                             retry_after=retry_after,
-                            attempt_no=1,
+                            attempt_no=attempt_no,
                             game=candidate.game,
                             kickoff=candidate.kickoff,
                             is_opta=candidate.match_is_opta,
@@ -2634,7 +2639,7 @@ class WhoScoredIngestService:
                             failure_code=FailureKind.CONTENT.value,
                             error=str(exc)[:4000],
                             retry_after=None,
-                            attempt_no=1,
+                            attempt_no=int(candidate.attempt_no),
                             game=candidate.game,
                             kickoff=candidate.kickoff,
                             is_opta=candidate.match_is_opta,

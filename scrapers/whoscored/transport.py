@@ -23,7 +23,9 @@ import hashlib
 import fcntl
 import json
 import logging
+import math
 import os
+import random
 import re
 import threading
 import time
@@ -57,8 +59,40 @@ from scrapers.base.flaresolverr_client import (
     MAX_XHR_BATCH_URLS,
     is_chromium_error_page,
 )
+from scrapers.whoscored.source_circuit import (
+    CircuitPermit,
+    SharedSourceCircuit,
+    SourceCircuitError,
+    SourceCircuitOpen,
+)
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_DIRECT_BROWSER_ATTEMPTS = 4
+DEFAULT_DIRECT_HTTP_RETRY_BACKOFF_SECONDS = 2.0
+DEFAULT_BROWSER_RETRY_BACKOFF_SECONDS = 2.0
+DEFAULT_BROWSER_RETRY_JITTER_SECONDS = 2.0
+MAX_BROWSER_RETRY_BACKOFF_SECONDS = 30.0
+SOURCE_CIRCUIT_PATH_ENV = "WHOSCORED_SOURCE_CIRCUIT_PATH"
+SOURCE_CIRCUIT_WAIT_ENV = "WHOSCORED_SOURCE_CIRCUIT_WAIT"
+CAPACITY_BROWSER_SESSION_OWNER_PATTERN = r"[a-z0-9]{16,32}"
+_CAPACITY_BROWSER_SESSION_OWNER_RE = re.compile(
+    rf"\A{CAPACITY_BROWSER_SESSION_OWNER_PATTERN}\Z",
+    re.ASCII,
+)
+
+
+def capacity_browser_session_prefix(owner: str) -> str:
+    """Return the isolated capacity-session prefix for one validated owner."""
+
+    if type(owner) is not str or _CAPACITY_BROWSER_SESSION_OWNER_RE.fullmatch(
+        owner
+    ) is None:
+        raise ValueError(
+            "browser_session_owner must be an exact str of 16..32 "
+            "lowercase ASCII letters or digits"
+        )
+    return f"ws-cap-{owner}-"
 
 
 class TransportRoute(str, Enum):
@@ -111,6 +145,7 @@ class CloudflareChallenge(WhoScoredTransportError):
         url: str,
         route: TransportRoute,
         status_code: Optional[int] = None,
+        source_wide: bool = False,
     ) -> None:
         super().__init__(
             message,
@@ -120,6 +155,7 @@ class CloudflareChallenge(WhoScoredTransportError):
             status_code=status_code,
             retryable=True,
         )
+        self.source_wide = bool(source_wide)
 
 
 class TransportBudgetExceeded(WhoScoredTransportError):
@@ -710,7 +746,14 @@ class WhoScoredTransport:
         request_timeout: float = 30.0,
         browser_timeout_ms: int = 60_000,
         direct_http_attempts: int = 3,
-        direct_browser_attempts: int = 2,
+        direct_http_retry_backoff_seconds: float = (
+            DEFAULT_DIRECT_HTTP_RETRY_BACKOFF_SECONDS
+        ),
+        direct_browser_attempts: int = DEFAULT_DIRECT_BROWSER_ATTEMPTS,
+        browser_retry_backoff_seconds: float = (
+            DEFAULT_BROWSER_RETRY_BACKOFF_SECONDS
+        ),
+        browser_retry_jitter_seconds: float = DEFAULT_BROWSER_RETRY_JITTER_SECONDS,
         impersonate: str = "chrome120",
         direct_http_session: Any = None,
         direct_fs_client: Optional[FlareSolverrClient] = None,
@@ -721,17 +764,67 @@ class WhoScoredTransport:
         request_ledger: Optional[RequestLedger] = None,
         browser_session_ttl_seconds: int = 300,
         browser_session_max_requests: int = 96,
+        browser_session_owner: Optional[str] = None,
+        source_circuit: Optional[SharedSourceCircuit] = None,
+        source_circuit_wait: Optional[bool] = None,
     ) -> None:
         if direct_http_attempts < 1:
             raise ValueError("direct_http_attempts must be >= 1")
         if direct_browser_attempts < 1:
             raise ValueError("direct_browser_attempts must be >= 1")
+        if (
+            isinstance(direct_http_retry_backoff_seconds, bool)
+            or not isinstance(direct_http_retry_backoff_seconds, (int, float))
+            or not math.isfinite(float(direct_http_retry_backoff_seconds))
+            or direct_http_retry_backoff_seconds < 0
+        ):
+            raise ValueError(
+                "direct_http_retry_backoff_seconds must be finite and >= 0"
+            )
+        if (
+            isinstance(browser_retry_backoff_seconds, bool)
+            or not isinstance(browser_retry_backoff_seconds, (int, float))
+            or not math.isfinite(float(browser_retry_backoff_seconds))
+            or browser_retry_backoff_seconds < 0
+        ):
+            raise ValueError("browser_retry_backoff_seconds must be finite and >= 0")
+        if (
+            isinstance(browser_retry_jitter_seconds, bool)
+            or not isinstance(browser_retry_jitter_seconds, (int, float))
+            or not math.isfinite(float(browser_retry_jitter_seconds))
+            or browser_retry_jitter_seconds < 0
+        ):
+            raise ValueError("browser_retry_jitter_seconds must be finite and >= 0")
+        browser_session_prefix = (
+            capacity_browser_session_prefix(browser_session_owner)
+            if browser_session_owner is not None
+            else None
+        )
+        if source_circuit_wait is None:
+            wait_value = os.environ.get(SOURCE_CIRCUIT_WAIT_ENV, "0").strip()
+            if wait_value not in {"0", "1"}:
+                raise ValueError(f"{SOURCE_CIRCUIT_WAIT_ENV} must be 0 or 1")
+            source_circuit_wait = wait_value == "1"
+        elif type(source_circuit_wait) is not bool:
+            raise ValueError("source_circuit_wait must be a boolean")
+        circuit_path = os.environ.get(SOURCE_CIRCUIT_PATH_ENV, "").strip()
+        if source_circuit is None and circuit_path:
+            source_circuit = SharedSourceCircuit(circuit_path)
+        if source_circuit_wait and source_circuit is None:
+            raise ValueError(
+                f"{SOURCE_CIRCUIT_WAIT_ENV}=1 requires {SOURCE_CIRCUIT_PATH_ENV}"
+            )
         self.raw_cache = raw_cache
         self.budgets = budgets or TransportBudgets()
         self.request_timeout = request_timeout
         self.browser_timeout_ms = browser_timeout_ms
         self.direct_http_attempts = direct_http_attempts
+        self.direct_http_retry_backoff_seconds = float(
+            direct_http_retry_backoff_seconds
+        )
         self.direct_browser_attempts = direct_browser_attempts
+        self.browser_retry_backoff_seconds = float(browser_retry_backoff_seconds)
+        self.browser_retry_jitter_seconds = float(browser_retry_jitter_seconds)
         self.impersonate = impersonate
         self.paid_proxy_url = paid_proxy_url
         self.context = context or TransportContext.from_env()
@@ -741,6 +834,10 @@ class WhoScoredTransport:
         )
         self.browser_session_ttl_seconds = max(1, browser_session_ttl_seconds)
         self.browser_session_max_requests = max(1, browser_session_max_requests)
+        self._capacity_browser_session_prefix = browser_session_prefix
+        self._source_circuit = source_circuit
+        self._source_circuit_wait = source_circuit_wait
+        self._source_circuit_permit: Optional[CircuitPermit] = None
         self._http_session_factory = http_session_factory
         self._direct_http = direct_http_session or self._new_http_session(None)
         self._direct_fs = direct_fs_client or FlareSolverrClient(url=flaresolverr_url)
@@ -762,6 +859,152 @@ class WhoScoredTransport:
         self._active_context = self.context
         self._active_cache_key = ""
         self._active_request_id = ""
+
+    def _begin_source_operation(self) -> None:
+        """Finish an unresolved prior probe before a new public operation."""
+
+        if self._source_circuit is None or self._source_circuit_permit is None:
+            return
+        permit = self._source_circuit_permit
+        self._source_circuit_permit = None
+        try:
+            self._source_circuit.inconclusive(permit)
+        except SourceCircuitError as exc:
+            raise WhoScoredTransportError(
+                "WhoScored source circuit could not preserve an uncertain probe",
+                kind=FailureKind.CONFIG,
+                url="https://www.whoscored.com/",
+                route=TransportRoute.DIRECT_FLARESOLVERR,
+            ) from exc
+
+    def _admit_structured_source(self, url: str) -> None:
+        if (
+            self._source_circuit is None
+            or self._source_circuit_permit is not None
+            or not _is_whoscored_structured_feed_url(url)
+        ):
+            return
+        try:
+            self._source_circuit_permit = self._source_circuit.admit(
+                wait=self._source_circuit_wait
+            )
+        except SourceCircuitOpen as exc:
+            raise CloudflareChallenge(
+                "WhoScored source cooldown is active",
+                url=url,
+                route=TransportRoute.DIRECT_FLARESOLVERR,
+                source_wide=True,
+            ) from exc
+        except SourceCircuitError as exc:
+            raise WhoScoredTransportError(
+                "WhoScored source circuit state is unavailable",
+                kind=FailureKind.CONFIG,
+                url=url,
+                route=TransportRoute.DIRECT_FLARESOLVERR,
+            ) from exc
+
+    def _source_probe_active(self) -> bool:
+        return bool(
+            self._source_circuit_permit is not None
+            and self._source_circuit_permit.is_probe
+        )
+
+    def _source_succeeded(self, url: str) -> None:
+        if (
+            self._source_circuit is None
+            or self._source_circuit_permit is None
+            or not _is_whoscored_structured_feed_url(url)
+        ):
+            return
+        permit = self._source_circuit_permit
+        self._source_circuit_permit = None
+        try:
+            self._source_circuit.succeed(permit)
+        except SourceCircuitError as exc:
+            raise WhoScoredTransportError(
+                "WhoScored source circuit could not record a successful probe",
+                kind=FailureKind.CONFIG,
+                url=url,
+                route=TransportRoute.DIRECT_FLARESOLVERR,
+            ) from exc
+
+    def _source_tripped(self, exc: CloudflareChallenge) -> None:
+        if (
+            not exc.source_wide
+            or self._source_circuit is None
+            or self._source_circuit_permit is None
+        ):
+            return
+        permit = self._source_circuit_permit
+        self._source_circuit_permit = None
+        try:
+            self._source_circuit.trip(permit)
+        except SourceCircuitError as circuit_exc:
+            raise WhoScoredTransportError(
+                "WhoScored source circuit could not record a source block",
+                kind=FailureKind.CONFIG,
+                url=exc.url,
+                route=TransportRoute.DIRECT_FLARESOLVERR,
+            ) from circuit_exc
+
+    def _source_inconclusive(self, url: str) -> bool:
+        """Reopen one uncertain half-open probe without escalating it."""
+
+        if (
+            self._source_circuit is None
+            or self._source_circuit_permit is None
+            or not self._source_circuit_permit.is_probe
+            or not _is_whoscored_structured_feed_url(url)
+        ):
+            return False
+        permit = self._source_circuit_permit
+        self._source_circuit_permit = None
+        try:
+            self._source_circuit.inconclusive(permit)
+        except SourceCircuitError as exc:
+            raise WhoScoredTransportError(
+                "WhoScored source circuit could not preserve an uncertain probe",
+                kind=FailureKind.CONFIG,
+                url=url,
+                route=TransportRoute.DIRECT_FLARESOLVERR,
+            ) from exc
+        return True
+
+    def _wait_before_browser_retry(self, attempt: int) -> None:
+        """Apply one bounded exponential delay before a physical retry."""
+
+        if self.browser_retry_backoff_seconds == 0:
+            return
+        multiplier = 2 ** min(max(0, int(attempt)), 10)
+        base_delay = min(
+            self.browser_retry_backoff_seconds * multiplier,
+            MAX_BROWSER_RETRY_BACKOFF_SECONDS,
+        )
+        jitter = (
+            random.uniform(
+                0.0,
+                min(
+                    self.browser_retry_jitter_seconds,
+                    MAX_BROWSER_RETRY_BACKOFF_SECONDS,
+                ),
+            )
+            if self.browser_retry_jitter_seconds
+            else 0.0
+        )
+        delay = min(base_delay + jitter, MAX_BROWSER_RETRY_BACKOFF_SECONDS)
+        time.sleep(delay)
+
+    def _wait_before_direct_http_retry(self, attempt: int) -> None:
+        """Space transient origin retries so one short 5xx wave can clear."""
+
+        if self.direct_http_retry_backoff_seconds == 0:
+            return
+        multiplier = 2 ** min(max(0, int(attempt)), 10)
+        delay = min(
+            self.direct_http_retry_backoff_seconds * multiplier,
+            MAX_BROWSER_RETRY_BACKOFF_SECONDS,
+        )
+        time.sleep(delay)
 
     def _new_http_session(self, proxy_url: Optional[str]) -> Any:
         if self._http_session_factory is not None:
@@ -812,44 +1055,50 @@ class WhoScoredTransport:
             existing = None
         if existing is not None:
             return existing
-        session_id = f"ws-{route.value}-{uuid.uuid4().hex[:10]}"
-        try:
-            client.create_session(session_id, proxy_url=proxy_url)
-        except Exception:
-            # The POST may have reached FlareSolverr even when the response was
-            # lost.  Destroy the deterministic id so a retry cannot leak an
-            # orphan Chromium process outside ``_browser_sessions``.
-            try:
-                client.destroy_session(session_id)
-            except Exception:
-                logger.debug(
-                    "Could not destroy possibly-created WhoScored browser session %s",
-                    session_id,
-                    exc_info=True,
-                )
-            raise
-        self.stats.browser_sessions += 1
+        suffix = f"{route.value}-{uuid.uuid4().hex[:10]}"
+        session_id = (
+            f"{self._capacity_browser_session_prefix}{suffix}"
+            if self._capacity_browser_session_prefix is not None
+            else f"ws-{suffix}"
+        )
         created = _BrowserSession(
             session_id=session_id,
             proxy_url=proxy_url,
             created_at=now,
         )
-        self._browser_sessions[route] = created
+        # Track ownership before the external side effect.  A signal can then
+        # interrupt create or local accounting without losing the only id that
+        # close() needs for an idempotent server-side destroy.
+        try:
+            self._browser_sessions[route] = created
+            client.create_session(session_id, proxy_url=proxy_url)
+            self.stats.browser_sessions += 1
+        except BaseException:
+            # Destroy even when create never reached the server; the endpoint
+            # is idempotent.  A BaseException from cleanup deliberately keeps
+            # tracking intact so the outer termination close can retry it.
+            self._drop_browser_session(client, route)
+            raise
         return created
 
     def _drop_browser_session(
         self, client: FlareSolverrClient, route: TransportRoute
     ) -> None:
-        existing = self._browser_sessions.pop(route, None)
+        existing = self._browser_sessions.get(route)
         if existing is not None:
             try:
                 client.destroy_session(existing.session_id)
-            except Exception:  # destroy is best-effort and idempotent
+            except Exception as exc:  # destroy is best-effort and idempotent
                 logger.debug(
-                    "Could not destroy WhoScored browser session %s",
-                    existing.session_id,
-                    exc_info=True,
+                    "Could not destroy WhoScored browser session for route %s (%s)",
+                    route.value,
+                    type(exc).__name__,
                 )
+            # An ordinary destroy failure remains best-effort, but a
+            # BaseException skips this line and keeps the id tracked so the
+            # termination unwind can retry the idempotent destroy in close().
+            if self._browser_sessions.get(route) is existing:
+                self._browser_sessions.pop(route, None)
 
     def _replay_browser_identity(self, solution: Mapping[str, Any]) -> None:
         """Replay solved CF cookies into direct HTTP when the session supports it."""
@@ -925,6 +1174,8 @@ class WhoScoredTransport:
         if cached is not None:
             return cached
         cache_entry_was_invalid = self.stats.cache_invalid > cache_invalid_before
+        self._begin_source_operation()
+        self._admit_structured_source(url)
         if before_network is not None:
             # The gate belongs after cache validation, not before ``has``.
             # A parser-invalid but integrity-valid raw object intentionally
@@ -956,8 +1207,10 @@ class WhoScoredTransport:
         def _direct_with_retries(
             *, acquire_first_token: bool = False
         ) -> TransportResponse:
-            if acquire_first_token and before_network is not None:
-                before_network()
+            if acquire_first_token:
+                self._admit_structured_source(url)
+                if before_network is not None:
+                    before_network()
             for attempt in range(self.direct_http_attempts):
                 try:
                     return _direct_once()
@@ -966,12 +1219,15 @@ class WhoScoredTransport:
                     # HTTP failure. Move to the direct browser immediately.
                     raise
                 except WhoScoredTransportError as exc:
+                    if self._source_inconclusive(url):
+                        raise
                     retryable_direct = exc.retryable and exc.kind in {
                         FailureKind.HTTP_STATUS,
                         FailureKind.TIMEOUT,
                     }
                     if not retryable_direct or attempt + 1 >= self.direct_http_attempts:
                         raise
+                    self._wait_before_direct_http_retry(attempt)
                     if before_network is not None:
                         # Every physical retry consumes a source-rate token.
                         before_network()
@@ -998,13 +1254,16 @@ class WhoScoredTransport:
             else:
                 if direct_gate_key is not None:
                     self._direct_gate_circuits.discard(direct_gate_key)
-                return self._store_and_return(key, direct)
+                stored = self._store_and_return(key, direct)
+                self._source_succeeded(url)
+                return stored
 
         direct_cf_failures = 0
         last_cf: Optional[CloudflareChallenge] = None
         last_transient: Optional[WhoScoredTransportError] = None
         for attempt in range(self.direct_browser_attempts):
             try:
+                self._admit_structured_source(url)
                 browser = self._browser_fetch(
                     url,
                     client=self._direct_fs,
@@ -1020,28 +1279,59 @@ class WhoScoredTransport:
                 direct_cf_failures += 1
                 last_cf = exc
                 self.stats.failures[FailureKind.CLOUDFLARE.value] += 1
+                self._source_tripped(exc)
+                if not exc.source_wide and self._source_inconclusive(url):
+                    raise
+                if (
+                    exc.source_wide
+                    and self._source_circuit is not None
+                    and not self._source_circuit_wait
+                ):
+                    raise
+                if attempt + 1 < self.direct_browser_attempts:
+                    if not (exc.source_wide and self._source_circuit is not None):
+                        self._wait_before_browser_retry(attempt)
+                    self._admit_structured_source(url)
+                    if before_network is not None:
+                        before_network()
                 continue
             except WhoScoredTransportError as exc:
                 # A tab crash, timeout, ordinary browser error or parser
                 # rejection must never silently buy residential bandwidth.
                 if direct_gate_key is not None:
                     self._direct_gate_circuits.discard(direct_gate_key)
+                if self._source_inconclusive(url):
+                    self._drop_browser_session(
+                        self._direct_fs, TransportRoute.DIRECT_FLARESOLVERR
+                    )
+                    if exc.kind is FailureKind.CONTENT:
+                        self._store_response(key, browser)
+                    raise
                 if (
                     exc.retryable
-                    and exc.kind is FailureKind.HTTP_STATUS
+                    and exc.kind
+                    in {
+                        FailureKind.HTTP_STATUS,
+                        FailureKind.TIMEOUT,
+                        FailureKind.BROWSER,
+                    }
                     and attempt + 1 < self.direct_browser_attempts
                 ):
                     last_transient = exc
                     self._drop_browser_session(
                         self._direct_fs, TransportRoute.DIRECT_FLARESOLVERR
                     )
+                    self._wait_before_browser_retry(attempt)
+                    self._admit_structured_source(url)
                     if before_network is not None:
                         before_network()
                     continue
                 if exc.kind is FailureKind.CONTENT:
                     self._store_response(key, browser)
                 raise
-            return self._store_and_return(key, browser)
+            stored = self._store_and_return(key, browser)
+            self._source_succeeded(url)
+            return stored
 
         if last_transient is not None and direct_cf_failures == 0:
             raise last_transient
@@ -1068,7 +1358,9 @@ class WhoScoredTransport:
                 # therefore stop before paid traffic with the circuit clear.
                 raise
             else:
-                return self._store_and_return(key, direct)
+                stored = self._store_and_return(key, direct)
+                self._source_succeeded(url)
+                return stored
 
         paid = self._paid_fetch(
             url,
@@ -1135,6 +1427,7 @@ class WhoScoredTransport:
         # bootstrap-scoped circuit as the serial path; later raw misses avoid
         # known-useless duplicate direct requests. Paid still requires a fresh
         # direct recheck below.
+        misses: list[tuple[int, FetchRequest, bool]] = []
         for index, item in enumerate(items):
             self._activate_request(
                 cache_key=item.cache_key,
@@ -1148,42 +1441,87 @@ class WhoScoredTransport:
                 results[index] = cached
                 continue
             cache_entry_was_invalid = self.stats.cache_invalid > cache_invalid_before
+            misses.append((index, item, cache_entry_was_invalid))
+
+        if not misses:
+            return [response for response in results if response is not None]
+
+        # An unresolved prior half-open probe is settled only after every raw
+        # object has had its chance to satisfy this logical batch.  Circuit
+        # state can therefore never block a complete warm-cache replay.
+        self._begin_source_operation()
+        for index, item, cache_entry_was_invalid in misses:
+            self._activate_request(
+                cache_key=item.cache_key,
+                scope=item.scope,
+                entity=item.entity,
+                request_id=request_ids[item.cache_key],
+            )
             if not cache_entry_was_invalid and gate_key in self._direct_gate_circuits:
                 gated.append((index, item, False))
                 continue
+            self._admit_structured_source(item.url)
             if item.before_network is not None:
                 item.before_network()
-            direct = self._http_fetch(
-                item.url,
-                session=self._direct_http,
-                route=TransportRoute.DIRECT_HTTP,
-                referer=bootstrap_url,
-            )
-            try:
-                self._validate(direct, item.validator)
-            except CloudflareChallenge:
-                self.stats.failures[FailureKind.CLOUDFLARE.value] += 1
-                self._direct_gate_circuits.add(gate_key)
-                gated.append((index, item, True))
-            except WhoScoredTransportError as exc:
-                self._direct_gate_circuits.discard(gate_key)
-                if exc.kind is FailureKind.CONTENT:
+            for attempt in range(self.direct_http_attempts):
+                direct: Optional[TransportResponse] = None
+                try:
+                    direct = self._http_fetch(
+                        item.url,
+                        session=self._direct_http,
+                        route=TransportRoute.DIRECT_HTTP,
+                        referer=bootstrap_url,
+                    )
+                    self._validate(direct, item.validator)
+                except CloudflareChallenge:
+                    self.stats.failures[FailureKind.CLOUDFLARE.value] += 1
+                    self._direct_gate_circuits.add(gate_key)
+                    gated.append((index, item, True))
+                    break
+                except WhoScoredTransportError as exc:
+                    if exc.kind is FailureKind.CONTENT:
+                        assert direct is not None
+                        self._store_response(item.cache_key, direct)
+                    if self._source_inconclusive(item.url):
+                        self._direct_gate_circuits.discard(gate_key)
+                        raise
+                    retryable_direct = exc.retryable and exc.kind in {
+                        FailureKind.HTTP_STATUS,
+                        FailureKind.TIMEOUT,
+                    }
+                    if (
+                        retryable_direct
+                        and attempt + 1 < self.direct_http_attempts
+                    ):
+                        self._wait_before_direct_http_retry(attempt)
+                        if item.before_network is not None:
+                            item.before_network()
+                        continue
+                    self._direct_gate_circuits.discard(gate_key)
+                    raise
+                else:
+                    assert direct is not None
+                    self._direct_gate_circuits.discard(gate_key)
                     self._store_response(item.cache_key, direct)
-                raise
-            else:
-                self._direct_gate_circuits.discard(gate_key)
-                self._store_response(item.cache_key, direct)
-                results[index] = direct
+                    results[index] = direct
+                    self._source_succeeded(item.url)
+                    break
 
-        for offset in range(0, len(gated), MAX_XHR_BATCH_URLS):
-            pending = gated[offset : offset + MAX_XHR_BATCH_URLS]
+        offset = 0
+        while offset < len(gated):
+            self._admit_structured_source(gated[offset][1].url)
+            batch_size = 1 if self._source_probe_active() else MAX_XHR_BATCH_URLS
+            pending = gated[offset : offset + batch_size]
+            offset += len(pending)
             last_cf: Optional[CloudflareChallenge] = None
             last_item_errors: dict[str, WhoScoredTransportError] = {}
             non_cf_evidence: dict[str, WhoScoredTransportError] = {}
             cf_failure_counts: Counter[str] = Counter()
-            for _ in range(self.direct_browser_attempts):
+            rechunk_after_cooldown: list[tuple[int, FetchRequest, bool]] = []
+            for attempt in range(self.direct_browser_attempts):
                 if not pending:
                     break
+                self._admit_structured_source(pending[0][1].url)
                 rate_limited_pending: list[tuple[int, FetchRequest, bool]] = []
                 for index, item, network_gate_acquired in pending:
                     if not network_gate_acquired and item.before_network is not None:
@@ -1208,6 +1546,32 @@ class WhoScoredTransport:
                     for _, item, _ in pending:
                         last_item_errors[item.cache_key] = exc
                         cf_failure_counts[item.cache_key] += 1
+                    pending = [(index, item, False) for index, item, _ in pending]
+                    self._source_tripped(exc)
+                    if (
+                        not exc.source_wide
+                        and self._source_inconclusive(pending[0][1].url)
+                    ):
+                        raise
+                    if (
+                        exc.source_wide
+                        and self._source_circuit is not None
+                        and not self._source_circuit_wait
+                    ):
+                        raise
+                    if (
+                        exc.source_wide
+                        and self._source_circuit is not None
+                        and self._source_circuit_wait
+                    ):
+                        rechunk_after_cooldown = list(pending)
+                        pending = []
+                        break
+                    if attempt + 1 < self.direct_browser_attempts:
+                        if not (
+                            exc.source_wide and self._source_circuit is not None
+                        ):
+                            self._wait_before_browser_retry(attempt)
                     continue
                 except WhoScoredTransportError as exc:
                     # Endpoint-level timeout/protocol failures do not produce
@@ -1215,18 +1579,25 @@ class WhoScoredTransport:
                     # browser/bootstrap failures; retain them as non-CF
                     # evidence so a later challenge can never authorize paid.
                     self._direct_gate_circuits.discard(gate_key)
-                    if not exc.retryable:
-                        raise
                     self._drop_browser_session(
                         self._direct_fs, TransportRoute.DIRECT_FLARESOLVERR
                     )
+                    if not exc.retryable:
+                        self._source_inconclusive(pending[0][1].url)
+                        raise
                     for _, item, _ in pending:
                         last_item_errors[item.cache_key] = exc
                         non_cf_evidence[item.cache_key] = exc
+                    pending = [(index, item, False) for index, item, _ in pending]
+                    if self._source_inconclusive(pending[0][1].url):
+                        raise
+                    if attempt + 1 < self.direct_browser_attempts:
+                        self._wait_before_browser_retry(attempt)
                     continue
 
                 retry: list[tuple[int, FetchRequest, bool]] = []
                 terminal_error: Optional[WhoScoredTransportError] = None
+                source_wide_cf: Optional[CloudflareChallenge] = None
                 for (index, item, network_gate_acquired), outcome in zip(
                     pending, browser_outcomes
                 ):
@@ -1234,7 +1605,7 @@ class WhoScoredTransport:
                         last_item_errors[item.cache_key] = outcome.error
                         non_cf_evidence[item.cache_key] = outcome.error
                         if outcome.error.retryable:
-                            retry.append((index, item, network_gate_acquired))
+                            retry.append((index, item, False))
                         else:
                             terminal_error = terminal_error or outcome.error
                         continue
@@ -1253,16 +1624,56 @@ class WhoScoredTransport:
                         last_cf = exc
                         last_item_errors[item.cache_key] = exc
                         cf_failure_counts[item.cache_key] += 1
-                        retry.append((index, item, network_gate_acquired))
+                        retry.append((index, item, False))
+                        if exc.source_wide:
+                            source_wide_cf = source_wide_cf or exc
                     except WhoScoredTransportError as exc:
                         if exc.kind is FailureKind.CONTENT:
                             self._store_response(item.cache_key, browser)
-                        terminal_error = terminal_error or exc
+                        last_item_errors[item.cache_key] = exc
+                        non_cf_evidence[item.cache_key] = exc
+                        if exc.retryable:
+                            retry.append((index, item, False))
+                        else:
+                            terminal_error = terminal_error or exc
                     else:
                         self._store_response(item.cache_key, browser)
                         results[index] = browser
                         last_item_errors.pop(item.cache_key, None)
                         non_cf_evidence.pop(item.cache_key, None)
+                if source_wide_cf is not None:
+                    # Record authoritative source evidence before any sibling
+                    # item error can win exception precedence.  The blocked
+                    # browser session is never reused after that evidence.
+                    self._drop_browser_session(
+                        self._direct_fs, TransportRoute.DIRECT_FLARESOLVERR
+                    )
+                    self._source_tripped(source_wide_cf)
+                    if (
+                        self._source_circuit is not None
+                        and not self._source_circuit_wait
+                    ):
+                        raise source_wide_cf
+                    if (
+                        self._source_circuit is not None
+                        and self._source_circuit_wait
+                    ):
+                        if terminal_error is not None:
+                            self._direct_gate_circuits.discard(gate_key)
+                            raise terminal_error
+                        rechunk_after_cooldown = list(retry)
+                        pending = []
+                        break
+                if self._source_probe_active() and (terminal_error or retry):
+                    uncertain = terminal_error or last_item_errors[
+                        retry[0][1].cache_key
+                    ]
+                    self._drop_browser_session(
+                        self._direct_fs, TransportRoute.DIRECT_FLARESOLVERR
+                    )
+                    self._direct_gate_circuits.discard(gate_key)
+                    self._source_inconclusive(pending[0][1].url)
+                    raise uncertain
                 if terminal_error is not None:
                     self._direct_gate_circuits.discard(gate_key)
                     raise terminal_error
@@ -1271,7 +1682,21 @@ class WhoScoredTransport:
                     self._drop_browser_session(
                         self._direct_fs, TransportRoute.DIRECT_FLARESOLVERR
                     )
+                    if attempt + 1 < self.direct_browser_attempts:
+                        if not (
+                            source_wide_cf is not None
+                            and self._source_circuit is not None
+                        ):
+                            self._wait_before_browser_retry(attempt)
+                else:
+                    self._source_succeeded(items[0].url)
 
+            if rechunk_after_cooldown:
+                # Re-enter the outer chunker only after shared admission.  The
+                # half-open permit then forces exactly one XHR, never the old
+                # multi-item batch that observed the block.
+                gated[offset:offset] = rechunk_after_cooldown
+                continue
             if not pending:
                 continue
             non_cf_errors: list[WhoScoredTransportError] = []
@@ -1304,23 +1729,48 @@ class WhoScoredTransport:
                     entity=item.entity,
                     request_id=request_ids[item.cache_key],
                 )
-                fresh_direct = self._http_fetch(
-                    item.url,
-                    session=self._direct_http,
-                    route=TransportRoute.DIRECT_HTTP,
-                    referer=bootstrap_url,
-                )
-                try:
-                    self._validate(fresh_direct, item.validator)
-                except CloudflareChallenge:
-                    self.stats.failures[FailureKind.CLOUDFLARE.value] += 1
-                except WhoScoredTransportError as exc:
-                    if exc.kind is FailureKind.CONTENT:
+                self._admit_structured_source(item.url)
+                if item.before_network is not None:
+                    item.before_network()
+                fresh_cloudflare = False
+                for attempt in range(self.direct_http_attempts):
+                    fresh_direct: Optional[TransportResponse] = None
+                    try:
+                        fresh_direct = self._http_fetch(
+                            item.url,
+                            session=self._direct_http,
+                            route=TransportRoute.DIRECT_HTTP,
+                            referer=bootstrap_url,
+                        )
+                        self._validate(fresh_direct, item.validator)
+                    except CloudflareChallenge:
+                        self.stats.failures[FailureKind.CLOUDFLARE.value] += 1
+                        fresh_cloudflare = True
+                        break
+                    except WhoScoredTransportError as exc:
+                        retryable_direct = exc.retryable and exc.kind in {
+                            FailureKind.HTTP_STATUS,
+                            FailureKind.TIMEOUT,
+                        }
+                        if (
+                            retryable_direct
+                            and attempt + 1 < self.direct_http_attempts
+                        ):
+                            self._wait_before_direct_http_retry(attempt)
+                            if item.before_network is not None:
+                                item.before_network()
+                            continue
+                        if exc.kind is FailureKind.CONTENT:
+                            assert fresh_direct is not None
+                            self._store_response(item.cache_key, fresh_direct)
+                        raise
+                    else:
+                        assert fresh_direct is not None
                         self._store_response(item.cache_key, fresh_direct)
-                    raise
-                else:
-                    self._store_response(item.cache_key, fresh_direct)
-                    results[index] = fresh_direct
+                        results[index] = fresh_direct
+                        self._source_succeeded(item.url)
+                        break
+                if not fresh_cloudflare:
                     continue
                 paid = self._paid_fetch(
                     item.url,
@@ -1338,6 +1788,7 @@ class WhoScoredTransport:
                 url=items[0].url,
                 route=TransportRoute.DIRECT_FLARESOLVERR,
             )
+        self._source_succeeded(items[0].url)
         return [response for response in results if response is not None]
 
     def _load_cached(
@@ -1507,7 +1958,12 @@ class WhoScoredTransport:
                 failure_kind=FailureKind.CLOUDFLARE,
                 error=exc,
             )
-            raise CloudflareChallenge(str(exc), url=url, route=route) from exc
+            raise CloudflareChallenge(
+                str(exc),
+                url=url,
+                route=route,
+                source_wide=route is TransportRoute.DIRECT_FLARESOLVERR,
+            ) from exc
         except FlareSolverrResponseTooLarge as exc:
             self._record_ledger(
                 url=url,
@@ -1630,7 +2086,12 @@ class WhoScoredTransport:
                 failure_kind=FailureKind.CLOUDFLARE,
                 error=exc,
             )
-            raise CloudflareChallenge(str(exc), url=url, route=route) from exc
+            raise CloudflareChallenge(
+                str(exc),
+                url=url,
+                route=route,
+                source_wide=route is TransportRoute.DIRECT_FLARESOLVERR,
+            ) from exc
         except FlareSolverrResponseTooLarge as exc:
             self._drop_browser_session(client, route)
             self._record_ledger(
@@ -1757,7 +2218,12 @@ class WhoScoredTransport:
             )
         except FlareSolverrCFChallengeFailed as exc:
             record_error(FailureKind.CLOUDFLARE, exc)
-            raise CloudflareChallenge(str(exc), url=items[0].url, route=route) from exc
+            raise CloudflareChallenge(
+                str(exc),
+                url=items[0].url,
+                route=route,
+                source_wide=route is TransportRoute.DIRECT_FLARESOLVERR,
+            ) from exc
         except FlareSolverrResponseTooLarge as exc:
             record_error(FailureKind.BUDGET, exc)
             raise TransportBudgetExceeded(
@@ -1848,7 +2314,12 @@ class WhoScoredTransport:
         except FlareSolverrCFChallengeFailed as exc:
             self._drop_browser_session(client, route)
             record_error(FailureKind.CLOUDFLARE, exc)
-            raise CloudflareChallenge(str(exc), url=items[0].url, route=route) from exc
+            raise CloudflareChallenge(
+                str(exc),
+                url=items[0].url,
+                route=route,
+                source_wide=route is TransportRoute.DIRECT_FLARESOLVERR,
+            ) from exc
         except FlareSolverrResponseTooLarge as exc:
             self._drop_browser_session(client, route)
             record_error(FailureKind.BUDGET, exc)
@@ -2310,16 +2781,36 @@ class WhoScoredTransport:
             and response.status_code in (403, 429, 503)
             and _has_cloudflare_challenge_markup(response.content)
         )
+        structured_access_gate = is_whoscored_structured_feed_access_gate(
+            response.url,
+            response.status_code,
+            response.content,
+            response.headers,
+        )
+        if structured_access_gate and not browser_challenge:
+            if response.route is TransportRoute.DIRECT_HTTP:
+                # This stable origin mask is only route-selection evidence:
+                # the same feed may succeed inside its official stage page.
+                raise CloudflareChallenge(
+                    "WhoScored structured-feed direct access gate",
+                    url=response.url,
+                    route=response.route,
+                    status_code=response.status_code,
+                    source_wide=False,
+                )
+            # Seeing the mask in a browser is not a Cloudflare challenge and
+            # must never count toward paid-route authority or shared cooldown.
+            raise WhoScoredTransportError(
+                "WhoScored structured-feed access gate rendered in browser",
+                kind=FailureKind.CONTENT,
+                url=response.url,
+                route=response.route,
+                status_code=response.status_code,
+            )
         if (
             browser_challenge
             or is_cloudflare_response(
                 response.status_code, response.headers, response.content
-            )
-            or is_whoscored_structured_feed_access_gate(
-                response.url,
-                response.status_code,
-                response.content,
-                response.headers,
             )
         ):
             raise CloudflareChallenge(
@@ -2327,6 +2818,10 @@ class WhoScoredTransport:
                 url=response.url,
                 route=response.route,
                 status_code=response.status_code,
+                source_wide=bool(
+                    response.route is TransportRoute.DIRECT_FLARESOLVERR
+                    and browser_challenge
+                ),
             )
         if not 200 <= response.status_code < 300:
             raise WhoScoredTransportError(
@@ -2444,6 +2939,13 @@ class WhoScoredTransport:
         return self.stats.as_dict()
 
     def close(self) -> None:
+        if self._source_circuit is not None and self._source_circuit_permit is not None:
+            permit = self._source_circuit_permit
+            self._source_circuit_permit = None
+            try:
+                self._source_circuit.abandon(permit)
+            except SourceCircuitError:
+                logger.error("WhoScored source circuit probe cleanup failed")
         self._drop_browser_session(self._direct_fs, TransportRoute.DIRECT_FLARESOLVERR)
         self._drop_browser_session(self._paid_fs, TransportRoute.PAID_FLARESOLVERR)
         self._direct_gate_circuits.clear()

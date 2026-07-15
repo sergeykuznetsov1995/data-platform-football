@@ -78,13 +78,18 @@ def test_recovery_uses_admin_identity_not_read_only_backup_reader() -> None:
 def test_fresh_airflow_deploy_creates_configured_whoscored_pools() -> None:
     command = "\n".join(_compose()["services"]["airflow-init"]["command"])
 
-    assert 'airflow pools set "$${WHOSCORED_DIRECT_POOL}" 2' in command
-    assert 'airflow pools set "$${WHOSCORED_BACKFILL_POOL}" 2' in command
+    assert (
+        'airflow pools set "$${WHOSCORED_DIRECT_POOL}" '
+        '"$${WHOSCORED_SOURCE_POOL_SLOTS}"' in command
+    )
+    assert 'airflow pools set "$${WHOSCORED_BACKFILL_POOL}"' not in command
+    assert 'case "$${WHOSCORED_SOURCE_POOL_SLOTS}"' in command
     assert 'airflow pools set "$${WHOSCORED_DQ_POOL}" 2' in command
     assert (
         '"$${WHOSCORED_BACKFILL_POOL}" != "$${WHOSCORED_DIRECT_POOL}"'
         in command
     )
+    assert "daily and backfill must share one source pool" in command
     assert "airflow pools set 'whoscored_storage_pool' 1" in command
 
 
@@ -96,12 +101,22 @@ def test_daily_profile_hard_cap_is_available_to_airflow_tasks() -> None:
     )
 
 
+def test_airflow_tasks_share_one_fail_fast_whoscored_source_circuit() -> None:
+    environment = _compose()["x-airflow-common"]["environment"]
+
+    assert environment["WHOSCORED_SOURCE_CIRCUIT_PATH"] == (
+        "/opt/airflow/logs/whoscored/source-circuit-v1.json"
+    )
+    assert environment["WHOSCORED_SOURCE_CIRCUIT_WAIT"] == "0"
+
+
 def test_documented_whoscored_runtime_controls_reach_airflow_tasks() -> None:
     environment = _compose()["x-airflow-common"]["environment"]
     expected_defaults = {
         "WHOSCORED_DIRECT_POOL": "whoscored_direct_pool",
         "WHOSCORED_BACKFILL_POOL": "whoscored_direct_pool",
         "WHOSCORED_DQ_POOL": "whoscored_dq_pool",
+        "WHOSCORED_SOURCE_POOL_SLOTS": "2",
         "WHOSCORED_DAILY_SLO_WINDOW": "30",
         "WHOSCORED_DAILY_SLO_MIN_SAMPLES": "20",
         "WHOSCORED_DAILY_P95_LIMIT_HOURS": "4",
@@ -143,6 +158,9 @@ def test_proxy_control_token_is_shared_without_hardcoded_secret() -> None:
     assert services["proxy_filter"]["environment"]["PROXY_FILTER_CONTROL_TOKEN"] == (
         "${PROXY_FILTER_CONTROL_TOKEN:-${SOFASCORE_PROXY_CONTROL_TOKEN:-}}"
     )
+    assert services["proxy_filter"]["environment"][
+        "PROXY_FILTER_ALLOW_FILE_FALLBACK"
+    ] == "false"
 
 
 def test_backup_secrets_are_scoped_to_localexecutor_scheduler() -> None:

@@ -65,7 +65,7 @@ def _add_unique_objects(store: WhoScoredRawStore, count: int) -> None:
         )
 
 
-def test_versioned_recovery_runbook_uses_real_restore_cli_flags():
+def test_versioned_recovery_reference_uses_real_cli_but_backup_stays_paused():
     runbook = (ROOT / "docs" / "operations" / "whoscored-production.md").read_text(
         encoding="utf-8"
     )
@@ -82,7 +82,8 @@ def test_versioned_recovery_runbook_uses_real_restore_cli_flags():
     assert "airflow-scheduler -euc" in runbook
     assert '--inventory-key "$RECOVERY_INVENTORY_KEY"' in runbook
     assert '--inventory "$RECOVERY_INVENTORY"' in runbook
-    assert "airflow dags unpause dag_backup_whoscored_storage" in runbook
+    assert "airflow dags pause dag_backup_whoscored_storage" in runbook
+    assert "airflow dags unpause dag_backup_whoscored_storage" not in runbook
     assert "airflow dags unpause dag_ingest_whoscored" in runbook
 
 

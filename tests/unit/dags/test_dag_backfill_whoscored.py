@@ -22,6 +22,15 @@ def _clean_operator_registries(monkeypatch):
     BashOperator._instances.clear()
     PythonOperator._instances.clear()
     monkeypatch.setenv("AIRFLOW__CORE__EXECUTOR", "LocalExecutor")
+    monkeypatch.delenv("WHOSCORED_SOURCE_POOL_SLOTS", raising=False)
+    monkeypatch.delenv(
+        "WHOSCORED_BACKFILL_ASSUMED_REQUEST_UNITS_PER_DAY", raising=False
+    )
+    from scrapers.whoscored import runtime_contract
+
+    monkeypatch.setattr(runtime_contract, "_airflow_pool_slots", lambda _pool: 2)
+    monkeypatch.setenv("WHOSCORED_DIRECT_POOL", "whoscored_direct_pool")
+    monkeypatch.setenv("WHOSCORED_BACKFILL_POOL", "whoscored_direct_pool")
     yield
 
 
@@ -29,6 +38,14 @@ def _load_module():
     sys.modules.pop("dag_backfill_whoscored", None)
     sys.modules.pop("dags.dag_backfill_whoscored", None)
     return importlib.import_module("dag_backfill_whoscored")
+
+
+@pytest.mark.unit
+def test_backfill_alerts_are_deduplicated_at_dagrun_level():
+    mod = _load_module()
+
+    assert "on_failure_callback" not in mod.BACKFILL_ARGS
+    assert callable(mod.dag._dag_kwargs["on_failure_callback"])
 
 
 def _timing_provenance(**values):
@@ -118,11 +135,126 @@ def _backfill_context(*, task_id="prepare_backfill_plan"):
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    ("source_pool_slots", "hard_ceiling"),
+    ((2, 86_400), (3, 129_600), (4, 172_800)),
+)
+def test_source_pool_slots_drive_capacity_and_exclusive_tasks(
+    monkeypatch, source_pool_slots, hard_ceiling
+):
+    monkeypatch.setenv("WHOSCORED_SOURCE_POOL_SLOTS", str(source_pool_slots))
+    mod = _load_module()
+    now = datetime(2026, 7, 14, tzinfo=timezone.utc)
+    plan = {
+        "provenance": {
+            "backfill_started_at": now.isoformat(),
+            "backfill_deadline_at": (now + timedelta(days=30)).isoformat(),
+        }
+    }
+
+    summary = mod._backfill_slo_summary(
+        plan,
+        {"remaining_request_units": 1_000},
+        now=now,
+    )
+
+    assert mod.BACKFILL_SOURCE_POOL_SLOTS == source_pool_slots
+    assert mod.BACKFILL_CAPACITY_HARD_CEILING_REQUEST_UNITS_PER_DAY == hard_ceiling
+    assert summary["source_pool_slots"] == source_pool_slots
+    assert summary["capacity_hard_ceiling_request_units_per_day"] == hard_ceiling
+    assert summary["assumed_capacity_request_units_per_day"] == hard_ceiling
+    assert summary["capacity_hard_ceiling_basis"] == (
+        f"{source_pool_slots}-source-pool-slots-x-30-page-requests-per-minute-x-1440"
+    )
+
+    from airflow.operators.bash import BashOperator
+    from airflow.operators.python import PythonOperator
+
+    prepare_plan = next(
+        item
+        for item in PythonOperator._instances
+        if item.task_id == "prepare_backfill_plan"
+    )
+    worker = next(
+        item
+        for item in BashOperator._instances
+        if item.task_id == "run_whoscored_backfill_item"
+    )
+    historical_dq = next(
+        item
+        for item in PythonOperator._instances
+        if item.task_id == "validate_global_historical_dq"
+    )
+    assert prepare_plan._init_kwargs["pool_slots"] == source_pool_slots
+    assert worker._init_kwargs["pool_slots"] == 1
+    assert historical_dq._init_kwargs["pool_slots"] == source_pool_slots
+
+
+@pytest.mark.unit
+def test_source_pool_slots_use_safe_default(monkeypatch):
+    monkeypatch.delenv("WHOSCORED_SOURCE_POOL_SLOTS", raising=False)
+
+    mod = _load_module()
+
+    assert mod.BACKFILL_SOURCE_POOL_SLOTS == 2
+    assert mod.BACKFILL_CAPACITY_HARD_CEILING_REQUEST_UNITS_PER_DAY == 86_400
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("invalid", ("", "1", "5", "2.5", "many"))
+def test_source_pool_slots_reject_invalid_values(monkeypatch, invalid):
+    from airflow.exceptions import AirflowException
+
+    monkeypatch.setenv("WHOSCORED_SOURCE_POOL_SLOTS", invalid)
+
+    with pytest.raises(
+        AirflowException,
+        match=("WHOSCORED_SOURCE_POOL_SLOTS must be an integer in 2\\.\\.4"),
+    ):
+        _load_module()
+
+
+@pytest.mark.unit
+def test_planned_capacity_remains_separate_from_hard_ceiling(monkeypatch):
+    monkeypatch.setenv("WHOSCORED_SOURCE_POOL_SLOTS", "4")
+    monkeypatch.setenv("WHOSCORED_BACKFILL_ASSUMED_REQUEST_UNITS_PER_DAY", "100000")
+    mod = _load_module()
+    now = datetime(2026, 7, 14, tzinfo=timezone.utc)
+    plan = {
+        "provenance": {
+            "backfill_started_at": now.isoformat(),
+            "backfill_deadline_at": (now + timedelta(days=30)).isoformat(),
+        }
+    }
+
+    summary = mod._backfill_slo_summary(
+        plan,
+        {"remaining_request_units": 1_000},
+        now=now,
+    )
+
+    assert summary["assumed_capacity_request_units_per_day"] == 100_000
+    assert summary["capacity_hard_ceiling_request_units_per_day"] == 172_800
+
+    monkeypatch.setenv("WHOSCORED_BACKFILL_ASSUMED_REQUEST_UNITS_PER_DAY", "172801")
+    with pytest.raises(
+        mod.AirflowException,
+        match=(
+            "WHOSCORED_BACKFILL_ASSUMED_REQUEST_UNITS_PER_DAY must be "
+            "in 1000\\.\\.172800"
+        ),
+    ):
+        mod._backfill_slo_summary(
+            plan,
+            {"remaining_request_units": 1_000},
+            now=now,
+        )
+
+
+@pytest.mark.unit
 def test_multi_stage_schedule_units_drive_capacity_breach(monkeypatch):
     mod = _load_module()
-    monkeypatch.setenv(
-        "WHOSCORED_BACKFILL_ASSUMED_REQUEST_UNITS_PER_DAY", "1000"
-    )
+    monkeypatch.setenv("WHOSCORED_BACKFILL_ASSUMED_REQUEST_UNITS_PER_DAY", "1000")
     now = datetime(2026, 7, 14, tzinfo=timezone.utc)
     started = now - timedelta(days=29, hours=12)
     plan = {
@@ -342,6 +474,42 @@ def test_backfill_rejects_non_local_executor_and_paid_override(monkeypatch):
     monkeypatch.setenv("AIRFLOW__CORE__EXECUTOR", "LocalExecutor")
     with pytest.raises(mod.AirflowException, match="permanently direct-only"):
         mod.validate_backfill_params(params={**valid, "direct_only": False})
+
+
+@pytest.mark.unit
+def test_backfill_preflight_rejects_a_mixed_runtime(monkeypatch):
+    mod = _load_module()
+    from scrapers.whoscored import runtime_contract
+
+    def fail_contract():
+        raise runtime_contract.RuntimeContractError("mixed release tree")
+
+    monkeypatch.setattr(runtime_contract, "validate_runtime_contract", fail_contract)
+
+    with pytest.raises(mod.AirflowException, match="mixed release tree"):
+        mod.validate_backfill_params(
+            params={"scopes": ["WS-252-2=2526"], "game_ids": []}
+        )
+
+
+@pytest.mark.unit
+def test_backfill_preflight_rejects_pool_name_and_size_drift(monkeypatch):
+    from scrapers.whoscored import runtime_contract
+
+    monkeypatch.setenv("WHOSCORED_BACKFILL_POOL", "separate_backfill_pool")
+    mod = _load_module()
+    with pytest.raises(mod.AirflowException, match="must share one Airflow source"):
+        mod.validate_backfill_params(
+            params={"scopes": ["WS-252-2=2526"], "game_ids": []}
+        )
+
+    monkeypatch.setenv("WHOSCORED_BACKFILL_POOL", "whoscored_direct_pool")
+    monkeypatch.setattr(runtime_contract, "_airflow_pool_slots", lambda _pool: 3)
+    mod = _load_module()
+    with pytest.raises(mod.AirflowException, match="pool size mismatch"):
+        mod.validate_backfill_params(
+            params={"scopes": ["WS-252-2=2526"], "game_ids": []}
+        )
 
 
 @pytest.mark.unit

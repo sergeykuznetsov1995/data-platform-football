@@ -11,6 +11,7 @@ from dags.scripts.run_whoscored_backfill_item import (
     _filtered_candidates,
     _schedule_request_accounting,
     _source_request_attempts,
+    main,
 )
 from dags.scripts.run_whoscored_scraper import RunnerScope
 
@@ -113,3 +114,32 @@ def test_schedule_accounting_rejects_missing_stage_evidence():
             SimpleNamespace(metadata={}),
             {"route_requests": {}, "failures": {}},
         )
+
+
+@pytest.mark.unit
+def test_backfill_worker_rechecks_runtime_before_loading_plan(monkeypatch, tmp_path):
+    from scrapers.whoscored import runtime_contract
+
+    observed = []
+
+    def validate(**kwargs):
+        observed.append(kwargs)
+
+    monkeypatch.setattr(runtime_contract, "validate_runtime_contract", validate)
+    output = tmp_path / "worker.json"
+
+    rc = main(
+        [
+            "--queue-id",
+            "queue",
+            "--plan-id",
+            "a" * 64,
+            "--work-item",
+            "not-valid-base64",
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert rc == 1
+    assert observed == [{"report_schema_version": 3}]

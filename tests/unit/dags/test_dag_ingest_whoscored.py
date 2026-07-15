@@ -21,12 +21,18 @@ from scrapers.whoscored.repository import (
 
 
 @pytest.fixture(autouse=True)
-def _clean_operator_registries():
+def _clean_operator_registries(monkeypatch):
     from airflow.operators.bash import BashOperator
     from airflow.operators.python import PythonOperator
 
     BashOperator._instances.clear()
     PythonOperator._instances.clear()
+    from scrapers.whoscored import runtime_contract
+
+    monkeypatch.setattr(runtime_contract, "_airflow_pool_slots", lambda _pool: 2)
+    monkeypatch.setenv("WHOSCORED_DIRECT_POOL", "whoscored_direct_pool")
+    monkeypatch.setenv("WHOSCORED_BACKFILL_POOL", "whoscored_direct_pool")
+    monkeypatch.setenv("WHOSCORED_SOURCE_POOL_SLOTS", "2")
     yield
 
 
@@ -196,7 +202,26 @@ def test_runtime_preflight_requires_local_executor_and_forbids_paid_override(
     monkeypatch.setenv("AIRFLOW__CORE__EXECUTOR", "LocalExecutor")
     with pytest.raises(mod.AirflowException, match="permanently direct-only"):
         mod.validate_whoscored_runtime(params={"direct_only": False})
-    assert mod.validate_whoscored_runtime(params={})["direct_only"] is True
+    result = mod.validate_whoscored_runtime(params={})
+    assert result["direct_only"] is True
+    assert result["runtime_contract"]["parser_version"] == "whoscored-parser-v8"
+    assert result["source_pool_contract"] == {
+        "pool": "whoscored_direct_pool",
+        "expected_slots": 2,
+        "actual_slots": 2,
+    }
+
+    monkeypatch.setenv("WHOSCORED_BACKFILL_POOL", "different_pool")
+    with pytest.raises(mod.AirflowException, match="must share one Airflow source"):
+        mod.validate_whoscored_runtime(params={})
+
+
+@pytest.mark.unit
+def test_daily_alerts_are_deduplicated_at_dagrun_level():
+    mod = _load_dag_module()
+
+    assert "on_failure_callback" not in mod.WHOSCORED_ARGS
+    assert callable(mod.dag._dag_kwargs["on_failure_callback"])
 
 
 @pytest.mark.unit

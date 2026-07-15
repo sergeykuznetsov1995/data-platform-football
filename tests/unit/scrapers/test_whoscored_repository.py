@@ -320,6 +320,68 @@ def test_load_discovered_catalog_rejects_same_count_payload_corruption():
 
 
 @pytest.mark.unit
+def test_explicit_full_history_bootstrap_can_read_one_valid_v7_catalog():
+    """The v8 migration may compare against v7 without weakening normal reads."""
+
+    batch_id = "wsc2-v7-bootstrap"
+    rows = canonical_catalog_rows(
+        {
+            "competitions": (
+                {
+                    "competition_id": "INT-World Cup",
+                    "region_id": 247,
+                    "tournament_id": 36,
+                    "tournament_name": "World Cup",
+                    "source_sex": 1,
+                    "eligibility": "included",
+                    "classification_reason": "source_sex_male_no_youth_marker",
+                },
+            ),
+            "seasons": (),
+            "stages": (),
+        }
+    )
+    legacy_fingerprint = "7" * 64
+
+    class LegacyCatalogTrino:
+        @staticmethod
+        def table_exists(_schema, _table):
+            return True
+
+        @staticmethod
+        def execute_query(sql):
+            if "SELECT batch_id FROM" in sql:
+                return [(batch_id,)]
+            for kind in ("competitions", "seasons", "stages"):
+                if f"whoscored_{kind}" in sql and "SELECT payload_json" in sql:
+                    return [(json.dumps(row),) for row in rows[kind]]
+            if "SELECT competitions_count" in sql:
+                return [
+                    (
+                        1,
+                        0,
+                        0,
+                        legacy_fingerprint,
+                        "whoscored-parser-v7",
+                        legacy_fingerprint,
+                    )
+                ]
+            raise AssertionError(sql)
+
+    repository = WhoScoredRepository(
+        writer=MagicMock(), trino=LegacyCatalogTrino()
+    )
+    with pytest.raises(BatchConflict, match="manifest identity mismatch"):
+        repository.load_discovered_catalog(batch_id=batch_id)
+
+    catalog = repository.load_discovered_catalog(
+        batch_id=batch_id,
+        allow_legacy_parser_for_full_history=True,
+    )
+    assert len(catalog.competitions) == 1
+
+
+@pytest.mark.unit
 def test_payload_json_exists_only_for_business_datasets_that_write_it():
     contracts = WHOSCORED_BUSINESS_COLUMN_CONTRACTS
     tables_with_payload_json = {
@@ -759,7 +821,7 @@ def test_idempotent_match_commit_verifies_manifest_and_physical_counts():
 def test_unchanged_match_refresh_advances_only_a_due_or_failed_manifest(
     latest_state, latest_age, expect_heartbeat
 ):
-    commit = _commit()
+    commit = replace(_commit(), attempt_no=3)
     now = datetime.now()
     trino = MagicMock()
     trino.table_exists.return_value = True
@@ -800,6 +862,7 @@ def test_unchanged_match_refresh_advances_only_a_due_or_failed_manifest(
         row = call.args[0].iloc[0]
         assert row["state"] == "success"
         assert row["batch_id"] == commit.batch_id
+        assert row["attempt_no"] == 3
     else:
         writer.write_dataframe.assert_not_called()
 
@@ -1017,6 +1080,49 @@ def test_match_candidates_replay_failures_after_parser_or_availability_change():
     assert "m.state = 'success'" in sql
     assert "m.batch_id NOT LIKE 'ws2-%'" in sql
     assert sql.count("m.parser_version IS DISTINCT FROM") >= 2
+
+
+@pytest.mark.unit
+def test_match_candidates_increment_latest_retry_and_reset_after_success():
+    trino = MagicMock()
+    trino.execute_query.side_effect = [
+        [
+            (
+                123,
+                "INT-World Cup",
+                "2026",
+                "Home-Away",
+                datetime(2026, 7, 11),
+                6,
+                True,
+                4,
+            )
+        ],
+        [
+            (
+                124,
+                "INT-World Cup",
+                "2026",
+                "Other-Away",
+                datetime(2026, 7, 12),
+                6,
+                True,
+                1,
+            )
+        ],
+    ]
+    repository = WhoScoredRepository(writer=MagicMock(), trino=trino)
+
+    retry = repository.list_match_candidates("INT-World Cup", "2026")
+    success_refresh = repository.list_match_candidates("INT-World Cup", "2026")
+
+    assert retry[0].attempt_no == 4
+    assert success_refresh[0].attempt_no == 1
+    sql = trino.execute_query.call_args_list[0].args[0]
+    assert "whoscored_match_ingest_latest" in sql
+    assert "WHEN m.state = 'retryable'" in sql
+    assert "THEN COALESCE(m.attempt_no, 0) + 1" in sql
+    assert "ELSE 1" in sql
 
 
 @pytest.mark.unit

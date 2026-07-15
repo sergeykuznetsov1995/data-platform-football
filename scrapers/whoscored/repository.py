@@ -48,6 +48,14 @@ MATCH_REFRESH_DAYS = 7
 PREVIEW_REFRESH_HOURS = 6
 PROFILE_REFRESH_DAYS = 90
 
+# Parser v7 catalog manifests predate the canonical row-order fingerprint used
+# by v8. Their physical rows no longer retain enough ordering information to
+# recompute that legacy digest, but an explicit full-history v8 migration still
+# needs the last committed catalog for loss detection. This narrow allowlist is
+# accepted only when the caller opts into the migration path below; normal
+# reads remain pinned to the current parser and its reproducible fingerprint.
+_LEGACY_CATALOG_MIGRATION_PARSERS = frozenset({"whoscored-parser-v7"})
+
 # Source business datasets.  Operational manifests and request telemetry are
 # intentionally not counted here.
 WHOSCORED_BUSINESS_TABLES = (
@@ -1001,6 +1009,7 @@ class MatchCandidate:
     kickoff: Optional[datetime]
     status: int
     match_is_opta: bool
+    attempt_no: int = 1
 
 
 @dataclass(frozen=True)
@@ -1023,6 +1032,7 @@ class MatchCommit:
     availability_version: str = MATCH_AVAILABILITY_VERSION
     kickoff: Optional[datetime] = None
     fetched_at: Optional[datetime] = None
+    attempt_no: int = 1
     # Additional matchCentre datasets share the same logical commit point.
     # ``events`` and ``lineups`` remain explicit for the existing consumers.
     datasets: Mapping[str, Sequence[Mapping[str, Any]]] = field(default_factory=dict)
@@ -1802,8 +1812,16 @@ class WhoScoredRepository:
         self,
         *,
         batch_id: Optional[str] = None,
+        allow_legacy_parser_for_full_history: bool = False,
     ) -> WhoScoredCatalog:
-        """Load one exact logically committed discovery snapshot."""
+        """Load one exact logically committed discovery snapshot.
+
+        ``allow_legacy_parser_for_full_history`` exists only for the explicit
+        v7 -> v8 full-history bootstrap. Legacy manifests still have to prove
+        physical counts, valid JSON/catalog structure and their original
+        internally consistent SHA-256 identity. They are never accepted by a
+        normal current-catalog read.
+        """
         if not self.trino.table_exists(self.schema, CATALOG_MANIFEST_TABLE):
             raise LookupError("WhoScored discovered catalog is not initialized")
         batch_filter = (
@@ -1857,11 +1875,18 @@ class WhoScoredRepository:
         manifest_payload = str(expected[3] or "")
         manifest_parser = str(expected[4] or "")
         manifest_schema = str(expected[5] or "")
-        if (
-            manifest_payload != physical_fingerprint
-            or manifest_schema != physical_fingerprint
-            or manifest_parser != PARSER_VERSION
-        ):
+        current_identity = (
+            manifest_parser == PARSER_VERSION
+            and manifest_payload == physical_fingerprint
+            and manifest_schema == physical_fingerprint
+        )
+        legacy_identity = (
+            bool(allow_legacy_parser_for_full_history)
+            and manifest_parser in _LEGACY_CATALOG_MIGRATION_PARSERS
+            and manifest_payload == manifest_schema
+            and re.fullmatch(r"[0-9a-f]{64}", manifest_payload) is not None
+        )
+        if not current_identity and not legacy_identity:
             raise BatchConflict(
                 f"catalog {batch_id} manifest identity mismatch: "
                 f"payload={manifest_payload}, schema={manifest_schema}, "
@@ -2950,7 +2975,12 @@ class WhoScoredRepository:
                   AND season = {_sql_string(season)}
             )
             SELECT CAST(s.game_id AS BIGINT), s.league, s.season, s.game,
-                   s.date, CAST(s.status AS INTEGER), s.match_is_opta
+                   s.date, CAST(s.status AS INTEGER), s.match_is_opta,
+                   CASE
+                       WHEN m.state = 'retryable'
+                       THEN COALESCE(m.attempt_no, 0) + 1
+                       ELSE 1
+                   END AS attempt_no
             FROM schedule s
             LEFT JOIN {latest} m
               ON m.league = s.league
@@ -2985,6 +3015,7 @@ class WhoScoredRepository:
                 kickoff=row[4],
                 status=int(row[5]),
                 match_is_opta=_coerce_bool(row[6]),
+                attempt_no=int(row[7]),
             )
             for row in rows
         ]
@@ -3886,6 +3917,8 @@ class WhoScoredRepository:
     def _prepare_match_commit(
         self, commit: MatchCommit
     ) -> tuple[dict[str, Sequence[Mapping[str, Any]]], dict[str, int], str]:
+        if int(commit.attempt_no) < 1:
+            raise ValueError("match commit attempt_no must be positive")
         event_ids = [row.get("source_event_id") for row in commit.events]
         if any(value is None for value in event_ids):
             raise ValueError(f"game {commit.game_id} has null source_event_id")
@@ -4286,7 +4319,7 @@ class WhoScoredRepository:
                     "http_status": int(commit.http_status),
                     "failure_code": None,
                     "error": None,
-                    "attempt_no": 1,
+                    "attempt_no": int(commit.attempt_no),
                     "retry_after": None,
                     "fetched_at": commit.fetched_at or now,
                     "completed_at": now,

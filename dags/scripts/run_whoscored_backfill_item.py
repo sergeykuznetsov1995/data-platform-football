@@ -375,6 +375,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # compatibility, but cannot enable paid transport by omission.
     os.environ["WHOSCORED_PAID_PROXY_URL"] = ""
     try:
+        from scrapers.whoscored.runtime_contract import validate_runtime_contract
+
+        validate_runtime_contract(report_schema_version=runner.REPORT_SCHEMA_VERSION)
         state = WhoScoredBackfillState.from_env()
         item = _decode_work_item(args.work_item)
     except Exception as exc:

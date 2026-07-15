@@ -71,7 +71,14 @@ WHOSCORED_ARGS = {
     **{
         key: value
         for key, value in SCRAPER_ARGS.items()
-        if key not in {"pool", "retries", "retry_delay", "execution_timeout"}
+        if key
+        not in {
+            "pool",
+            "retries",
+            "retry_delay",
+            "execution_timeout",
+            "on_failure_callback",
+        }
     },
     "retries": 0,
     "execution_timeout": timedelta(minutes=20),
@@ -368,7 +375,7 @@ def initialize_whoscored_schema() -> Dict[str, Any]:
 
 
 def validate_whoscored_runtime(**context: Any) -> Dict[str, Any]:
-    """Fail unless this release runs direct-only on one LocalExecutor host."""
+    """Fail unless one coherent direct-only release runs on LocalExecutor."""
 
     executor = os.environ.get("AIRFLOW__CORE__EXECUTOR", "").strip()
     if not executor.endswith("LocalExecutor"):
@@ -384,7 +391,29 @@ def validate_whoscored_runtime(**context: Any) -> Dict[str, Any]:
         )
     if not bool(params.get("require_zero_paid", True)):
         raise AirflowException("daily WhoScored must enforce zero paid proxy bytes")
-    return {"status": "success", "executor": executor, "direct_only": True}
+    from scrapers.whoscored.runtime_contract import (
+        RuntimeContractError,
+        validate_airflow_source_pool,
+        validate_runtime_contract,
+    )
+
+    try:
+        contract = validate_runtime_contract()
+        pool_contract = validate_airflow_source_pool(
+            direct_pool=DIRECT_POOL,
+            backfill_pool=os.environ.get(
+                "WHOSCORED_BACKFILL_POOL", "whoscored_direct_pool"
+            ),
+        )
+    except RuntimeContractError as exc:
+        raise AirflowException(str(exc)) from exc
+    return {
+        "status": "success",
+        "executor": executor,
+        "direct_only": True,
+        "runtime_contract": contract,
+        "source_pool_contract": pool_contract,
+    }
 
 
 def build_daily_commands(
@@ -2285,6 +2314,9 @@ with DAG(
     catchup=False,
     max_active_runs=1,
     dagrun_timeout=timedelta(hours=COLD_DAGRUN_HARD_LIMIT_HOURS),
+    # Task-level callbacks on a mapped fan-out produce one page per failed
+    # map index.  A DAG-level callback reports the failed DagRun exactly once.
+    on_failure_callback=SCRAPER_ARGS.get("on_failure_callback"),
     params={"require_zero_paid": True, "direct_only": True},
     user_defined_filters={"stable_safe_token": stable_safe_token},
     tags=DAG_TAGS.get("whoscored", ["scraping", "whoscored", "bronze"]),

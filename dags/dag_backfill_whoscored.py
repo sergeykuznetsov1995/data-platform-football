@@ -26,7 +26,11 @@ from airflow.operators.bash import BashOperator
 from airflow.operators.python import PythonOperator
 
 from dags.scripts.whoscored_identity import stable_safe_token
-from scrapers.whoscored.runtime_limits import SOURCE_PAGE_REQUESTS_PER_MINUTE
+from scrapers.whoscored.runtime_limits import (
+    SOURCE_PAGE_REQUESTS_PER_MINUTE,
+    source_page_request_hard_ceiling_per_day,
+    source_pool_slots,
+)
 from utils.config import DAG_TAGS
 from utils.default_args import SCRAPER_ARGS
 
@@ -36,13 +40,13 @@ BACKFILL_CHUNK_SIZE = 25
 PROFILE_CHUNK_SIZE = 200
 MAX_WORK_ITEMS_PER_RUN = 100
 BACKFILL_DEADLINE_DAYS = 30
-BACKFILL_SOURCE_POOL_SLOTS = 2
+try:
+    BACKFILL_SOURCE_POOL_SLOTS = source_pool_slots()
+except ValueError as exc:
+    raise AirflowException(str(exc)) from exc
 BACKFILL_PAGE_REQUESTS_PER_MINUTE_PER_SLOT = SOURCE_PAGE_REQUESTS_PER_MINUTE
 BACKFILL_CAPACITY_HARD_CEILING_REQUEST_UNITS_PER_DAY = (
-    BACKFILL_SOURCE_POOL_SLOTS
-    * BACKFILL_PAGE_REQUESTS_PER_MINUTE_PER_SLOT
-    * 60
-    * 24
+    source_page_request_hard_ceiling_per_day(BACKFILL_SOURCE_POOL_SLOTS)
 )
 BACKFILL_OBSERVED_MIN_ELAPSED_SECONDS = 6 * 60 * 60
 BACKFILL_OBSERVED_MIN_COMPLETED_REQUEST_UNITS = 1_000
@@ -560,8 +564,9 @@ def _backfill_slo_summary(
     """Enforce the immutable deadline against an honest capacity assumption.
 
     The configured value is an SLO planning assumption, not a throttle.  Its
-    hard maximum is the deployed two-slot pool multiplied by the slower
-    30-request/minute page limiter used by matches, previews, and profiles.
+    hard maximum is the validated deployed source-pool slot count multiplied
+    by the slower 30-request/minute page limiter used by matches, previews,
+    and profiles.
     Observed wall-clock throughput is reported only after a useful sample and
     remains advisory so a planned pause cannot create a second false gate.
     """
@@ -649,8 +654,11 @@ def _backfill_slo_summary(
         ),
         "capacity_assumption": "slo-planning-only-not-a-runtime-throttle",
         "capacity_hard_ceiling_basis": (
-            "2-source-pool-slots-x-30-page-requests-per-minute-x-1440"
+            f"{BACKFILL_SOURCE_POOL_SLOTS}-source-pool-slots-x-"
+            f"{BACKFILL_PAGE_REQUESTS_PER_MINUTE_PER_SLOT}-"
+            "page-requests-per-minute-x-1440"
         ),
+        "source_pool_slots": BACKFILL_SOURCE_POOL_SLOTS,
         "capacity_hard_ceiling_request_units_per_day": (
             BACKFILL_CAPACITY_HARD_CEILING_REQUEST_UNITS_PER_DAY
         ),
@@ -689,7 +697,14 @@ BACKFILL_ARGS = {
     **{
         key: value
         for key, value in SCRAPER_ARGS.items()
-        if key not in {"pool", "retries", "retry_delay", "execution_timeout"}
+        if key
+        not in {
+            "pool",
+            "retries",
+            "retry_delay",
+            "execution_timeout",
+            "on_failure_callback",
+        }
     },
     "retries": 1,
     "retry_delay": timedelta(minutes=10),
@@ -935,6 +950,20 @@ def validate_backfill_params(**context: Any) -> Dict[str, Any]:
         )
     if not bool(params.get("require_zero_paid", True)):
         raise AirflowException("WhoScored backfill must enforce zero paid proxy bytes")
+    from scrapers.whoscored.runtime_contract import (
+        RuntimeContractError,
+        validate_airflow_source_pool,
+        validate_runtime_contract,
+    )
+
+    try:
+        validate_runtime_contract()
+        validate_airflow_source_pool(
+            direct_pool=DIRECT_POOL,
+            backfill_pool=BACKFILL_POOL,
+        )
+    except RuntimeContractError as exc:
+        raise AirflowException(str(exc)) from exc
     raw_scopes = params.get("scopes") or []
     game_ids = params.get("game_ids") or []
     all_catalog = bool(params.get("all_catalog", False))
@@ -2317,6 +2346,8 @@ with DAG(
     catchup=False,
     max_active_runs=1,
     dagrun_timeout=timedelta(hours=12),
+    # Deduplicate mapped-worker failures into one notification per DagRun.
+    on_failure_callback=SCRAPER_ARGS.get("on_failure_callback"),
     params={
         "scopes": Param(default=[], type="array", items={"type": "string"}),
         "game_ids": Param(default=[], type="array", items={"type": "integer"}),
@@ -2352,7 +2383,9 @@ with DAG(
         task_id="prepare_backfill_plan",
         python_callable=prepare_backfill_plan,
         pool=BACKFILL_POOL,
-        pool_slots=2,
+        # Discovery is serialized against mapped source workers by holding the
+        # full validated source-pool capacity.
+        pool_slots=BACKFILL_SOURCE_POOL_SLOTS,
         execution_timeout=timedelta(hours=8),
     )
     build_commands = PythonOperator(
@@ -2389,11 +2422,11 @@ with DAG(
             "progress_ref": backfill_dq.output,
         },
         trigger_rule="all_done",
-        # Hold both production direct-writer slots for the complete multi-query
+        # Hold every production direct-writer slot for the complete multi-query
         # cut. This prevents daily manifests/business tables from changing
         # between the snapshot-pinned key proof and parity statements.
         pool=DIRECT_POOL,
-        pool_slots=2,
+        pool_slots=BACKFILL_SOURCE_POOL_SLOTS,
         execution_timeout=timedelta(hours=2),
     )
     traffic_dq = PythonOperator(

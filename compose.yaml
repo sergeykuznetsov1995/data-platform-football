@@ -86,6 +86,11 @@ x-airflow-common: &airflow-common
     WHOSCORED_PAID_PROXY_URL: ${WHOSCORED_PAID_PROXY_URL:-http://proxy_filter:8900}
     WHOSCORED_PROXY_CONTROL_URL: ${WHOSCORED_PROXY_CONTROL_URL:-http://proxy_filter:8899}
     WHOSCORED_REQUEST_LEDGER_PATH: /opt/airflow/logs/whoscored/request_ledger.jsonl
+    # All LocalExecutor children share one durable direct-source cooldown.
+    # Production fails fast while the circuit is open; the capacity harness
+    # alone opts into waiting so its six-hour wall clock remains honest.
+    WHOSCORED_SOURCE_CIRCUIT_PATH: /opt/airflow/logs/whoscored/source-circuit-v1.json
+    WHOSCORED_SOURCE_CIRCUIT_WAIT: "0"
     WHOSCORED_LOCK_DIR: /opt/airflow/logs/whoscored/commit_locks
     WHOSCORED_RAW_LOCK_DIR: /opt/airflow/logs/whoscored/raw_locks
     # Keep every documented WhoScored runtime control in the Airflow process
@@ -95,12 +100,15 @@ x-airflow-common: &airflow-common
     WHOSCORED_DIRECT_POOL: ${WHOSCORED_DIRECT_POOL:-whoscored_direct_pool}
     WHOSCORED_BACKFILL_POOL: ${WHOSCORED_BACKFILL_POOL:-whoscored_direct_pool}
     WHOSCORED_DQ_POOL: ${WHOSCORED_DQ_POOL:-whoscored_dq_pool}
+    # Safe default is two. Promote to four only after the sustained direct-only
+    # canary passes; runtime_limits.py rejects every value outside 2..4.
+    WHOSCORED_SOURCE_POOL_SLOTS: ${WHOSCORED_SOURCE_POOL_SLOTS:-2}
     WHOSCORED_DAILY_SLO_WINDOW: ${WHOSCORED_DAILY_SLO_WINDOW:-30}
     WHOSCORED_DAILY_SLO_MIN_SAMPLES: ${WHOSCORED_DAILY_SLO_MIN_SAMPLES:-20}
     WHOSCORED_DAILY_P95_LIMIT_HOURS: ${WHOSCORED_DAILY_P95_LIMIT_HOURS:-4}
     WHOSCORED_BACKFILL_REQUEST_UNITS_PER_RUN: ${WHOSCORED_BACKFILL_REQUEST_UNITS_PER_RUN:-3000}
-    # SLO planning assumption only; runtime throughput remains bounded by the
-    # two-slot source pool and the 30 rpm/page worker limiter.
+    # SLO planning assumption only; it may never exceed the independently
+    # derived source-pool-slots x 30 rpm x 1,440 hard ceiling.
     WHOSCORED_BACKFILL_ASSUMED_REQUEST_UNITS_PER_DAY: ${WHOSCORED_BACKFILL_ASSUMED_REQUEST_UNITS_PER_DAY:-86400}
     WHOSCORED_BACKFILL_MAX_NO_PROGRESS_RUNS: ${WHOSCORED_BACKFILL_MAX_NO_PROGRESS_RUNS:-3}
     WHOSCORED_RUN_RETENTION_DAYS: ${WHOSCORED_RUN_RETENTION_DAYS:-90}
@@ -612,14 +620,19 @@ services:
         # FotMob is lightweight direct HTTP.  A separate bounded pool prevents
         # browser scrapers from serializing it while limiting source fan-out.
         airflow pools set 'fotmob_http_pool' 4 'Bounded direct FotMob HTTP work'
-        # WhoScored daily scopes use one slot each; the resumable backfill
-        # deliberately consumes both slots so it cannot overlap a daily run.
+        # WhoScored daily scopes use one slot each; exclusive controller/DQ
+        # tasks consume every configured slot so they cannot overlap writers.
         # `pools set` is an idempotent create/update operation on fresh and
         # already-initialised Airflow metadata databases.
-        airflow pools set "$${WHOSCORED_DIRECT_POOL}" 2 'WhoScored direct-only scopes; backfill consumes both slots'
+        case "$${WHOSCORED_SOURCE_POOL_SLOTS}" in
+          2|3|4) ;;
+          *) echo 'WHOSCORED_SOURCE_POOL_SLOTS must be 2, 3, or 4' >&2; exit 1 ;;
+        esac
         if [[ "$${WHOSCORED_BACKFILL_POOL}" != "$${WHOSCORED_DIRECT_POOL}" ]]; then
-          airflow pools set "$${WHOSCORED_BACKFILL_POOL}" 2 'WhoScored resumable direct-only backfill'
+          echo 'WhoScored daily and backfill must share one source pool' >&2
+          exit 1
         fi
+        airflow pools set "$${WHOSCORED_DIRECT_POOL}" "$${WHOSCORED_SOURCE_POOL_SLOTS}" 'WhoScored bounded direct-only source concurrency'
         airflow pools set "$${WHOSCORED_DQ_POOL}" 2 'WhoScored bounded Iceberg data-quality queries'
         airflow pools set 'whoscored_storage_pool' 1 'WhoScored serialized backup and restore verification'
         echo "Airflow initialization complete"
@@ -1261,7 +1274,9 @@ services:
       # Secret JSON is injected at runtime. The service fails closed when it is
       # blank; the legacy file is intentionally not mounted into this container.
       PROXY_POOL_JSON: ${PROXY_POOL_JSON:-}
-      PROXY_FILTER_ALLOW_FILE_FALLBACK: ${PROXY_FILTER_ALLOW_FILE_FALLBACK:-false}
+      # Production is structurally env-only. Development file fallback, when
+      # needed, must use a separate explicit service definition.
+      PROXY_FILTER_ALLOW_FILE_FALLBACK: "false"
     command:
       - python
       - /opt/airflow/scripts/proxy_filter/filter_proxy.py
@@ -1304,7 +1319,6 @@ services:
       - ./configs/medallion:/opt/airflow/configs/medallion:ro
       - ./configs/proxy_filter:/opt/airflow/configs/proxy_filter:ro
       - ./configs/sofascore:/opt/airflow/configs/sofascore:ro
-      - ./proxys.txt:/opt/airflow/proxys.txt:ro
       # Mount the already writable Airflow log root. Mounting a missing host
       # subdirectory directly makes Docker create it as root:root, while this
       # image intentionally runs as the unprivileged airflow user.
