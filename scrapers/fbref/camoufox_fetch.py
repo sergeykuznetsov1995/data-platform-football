@@ -392,7 +392,7 @@ def _navigation_error_type(exc: Exception) -> str:
         return 'timeout'
     transient_network_markers = (
         'timeout', 'timed out', 'err_connection_reset',
-        'err_connection_timed_out',
+        'err_connection_timed_out', 'ns_error_proxy_bad_gateway',
     )
     if any(marker in message for marker in transient_network_markers):
         return 'network'
@@ -522,6 +522,7 @@ class CamoufoxFbrefTransport:
         # response arrives so it cannot be mistaken for a routing bypass.
         self._settled_failed_request_urls: Dict[int, Optional[str]] = {}
         self._settled_failed_ids_by_url: Dict[str, list] = {}
+        self._settled_failed_request_guids: Dict[int, str] = {}
         self._responded_request_urls: Dict[int, Optional[str]] = {}
         self._responded_ids_by_url: Dict[str, list] = {}
         self._navigation_source_url: Optional[str] = None
@@ -939,13 +940,64 @@ class CamoufoxFbrefTransport:
             self._settled_failed_request_urls,
             self._settled_failed_ids_by_url,
         )
+        key = id(req)
+        guid = self._request_guid(req)
+        if guid is not None and key not in self._settled_failed_request_guids:
+            self._settled_failed_request_guids[key] = guid
 
-    def _consume_settled_failed_request(self, req) -> bool:
-        return self._consume_request_marker(
-            req,
+    @staticmethod
+    def _request_guid(req) -> Optional[str]:
+        """Return Playwright's stable request identity when it is available."""
+
+        try:
+            guid = getattr(getattr(req, "_impl_obj", None), "_guid", None)
+        except Exception:  # noqa: BLE001 — detached request diagnostics
+            return None
+        if not isinstance(guid, str) or not guid.startswith("request@"):
+            return None
+        return guid
+
+    def _settled_failed_marker_key(
+        self,
+        req,
+    ) -> Optional[int]:
+        key = id(req)
+        guid = self._request_guid(req)
+        if key in self._settled_failed_request_urls:
+            known_guid = self._settled_failed_request_guids.get(key)
+            # Guard against CPython reusing an old wrapper id for a new
+            # Playwright request after the original wrapper was collected.
+            return key if known_guid == guid else None
+        if guid is not None:
+            current_url = self._request_url(req)
+            for known_key, known_guid in self._settled_failed_request_guids.items():
+                if known_guid != guid:
+                    continue
+                known_url = self._settled_failed_request_urls.get(known_key)
+                if known_url is not None and current_url != known_url:
+                    return None
+                return known_key
+        return None
+
+    def _forget_settled_failed_marker(self, key: int) -> None:
+        self._settled_failed_request_guids.pop(key, None)
+        self._forget_request_marker(
+            key,
             self._settled_failed_request_urls,
             self._settled_failed_ids_by_url,
         )
+
+    def _consume_settled_failed_request(self, req) -> bool:
+        key = self._settled_failed_marker_key(req)
+        if key is None:
+            return False
+        self._forget_settled_failed_marker(key)
+        return True
+
+    def _is_duplicate_settled_failure(self, req) -> bool:
+        """Recognize only the same routed request, never merely the same URL."""
+
+        return self._settled_failed_marker_key(req) is not None
 
     def _remember_responded_request(self, req) -> None:
         self._remember_request_marker(
@@ -968,6 +1020,7 @@ class CamoufoxFbrefTransport:
         self._unrouted_response_ids_by_url.clear()
         self._settled_failed_request_urls.clear()
         self._settled_failed_ids_by_url.clear()
+        self._settled_failed_request_guids.clear()
         self._responded_request_urls.clear()
         self._responded_ids_by_url.clear()
 
@@ -1437,6 +1490,12 @@ class CamoufoxFbrefTransport:
             # be opened. Any original routed request was counted at admission.
             return
         if self._consume_unrouted_response(req):
+            return
+        if self._is_duplicate_settled_failure(req):
+            # Firefox can report the same routed transport failure twice. The
+            # first callback already charged and settled its reservation. Keep
+            # the marker for a possible late response (notably a blocked 3xx)
+            # instead of misclassifying the duplicate as a routing bypass.
             return
         if redirect_blocked:
             return

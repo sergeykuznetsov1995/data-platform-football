@@ -1,7 +1,7 @@
 """Network-free tests for the single FBref Camoufox clearance transport."""
 
 import threading
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call as mock_call
 
 import pytest
 
@@ -16,6 +16,7 @@ from scrapers.fbref.camoufox_fetch import (
     NETWORK_API_BLOCK_INIT_SCRIPT,
     NETWORK_API_BLOCKED_CONSTRUCTORS,
     UNEXPECTED_BROWSER_NETWORK_RESERVATION_BYTES,
+    _navigation_error_type,
     is_cloudflare_blocked,
     resolve_geoip_without_redirects,
     should_block_request,
@@ -179,6 +180,154 @@ def test_unknown_request_failure_latches_and_charges_once():
     )
     assert stats["network_policy_failed"] is True
     assert stats["network_policy_failure"] == "unrouted_http_failure"
+
+
+@pytest.mark.unit
+def test_duplicate_routed_failure_stays_settled_for_late_response():
+    admission = (
+        BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
+        + BROWSER_UNDECLARED_BODY_RESERVATION_BYTES
+    )
+    transport = CamoufoxFbrefTransport(
+        max_network_requests=5,
+        max_network_bytes=3 * admission,
+    )
+    route = _Route(url="https://fbref.com/en/")
+    route.request._impl_obj._guid = "request@bootstrap"
+    route.request.sizes.side_effect = RuntimeError("sizes unavailable")
+    transport._navigation_source_url = "https://fbref.com/en/"
+    transport._maybe_block(route)
+
+    route.request.failure = "NS_ERROR_PROXY_BAD_GATEWAY"
+    transport._on_request_failed(route.request)
+    duplicate = MagicMock(
+        resource_type="document",
+        url=route.request.url,
+        is_navigation_request=True,
+    )
+    duplicate.failure = "NS_ERROR_PROXY_BAD_GATEWAY"
+    duplicate._impl_obj._guid = "request@bootstrap"
+    transport._on_request_failed(duplicate)
+
+    stats = transport.traffic_stats()
+    assert stats["real_requests_count"] == 1
+    assert stats["unobserved_reserved_bytes"] == admission
+    assert stats["network_policy_failed"] is False
+    assert len(transport._settled_failed_request_urls) == 1
+
+    late = MagicMock(
+        resource_type="document",
+        url=route.request.url,
+        is_navigation_request=True,
+    )
+    late._impl_obj._guid = "request@bootstrap"
+    transport._on_response(
+        _Response(
+            late,
+            {"content-length": "0", "location": "/next"},
+            status=302,
+        )
+    )
+
+    assert transport._pending_manual_redirect_url == "https://fbref.com/next"
+    assert transport.traffic_stats()["network_policy_failed"] is False
+    assert transport._settled_failed_request_urls == {}
+    assert transport._settled_failed_request_guids == {}
+
+
+@pytest.mark.unit
+def test_proxy_bad_gateway_is_a_rotatable_network_failure():
+    assert _navigation_error_type(
+        RuntimeError("Page.goto: NS_ERROR_PROXY_BAD_GATEWAY")
+    ) == "network"
+
+    callback = MagicMock()
+    transport = CamoufoxFbrefTransport(
+        geoip=False,
+        proxy_result_callback=callback,
+    )
+    transport._page = MagicMock()
+    transport._page.goto.side_effect = [
+        RuntimeError("Page.goto: NS_ERROR_PROXY_BAD_GATEWAY"),
+        None,
+    ]
+    transport._restart = MagicMock()  # type: ignore[method-assign]
+    transport._solve_current_page = MagicMock(  # type: ignore[method-assign]
+        return_value="<html><table></table></html>"
+    )
+
+    assert transport.fetch("https://fbref.com/en/") == (
+        "<html><table></table></html>"
+    )
+    assert transport._page.goto.call_count == 2
+    transport._restart.assert_called_once_with()
+    assert callback.call_args_list == [
+        mock_call(False, "network"),
+        mock_call(True, None),
+    ]
+
+
+@pytest.mark.unit
+def test_settled_failure_does_not_hide_same_url_with_a_different_guid():
+    admission = (
+        BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
+        + BROWSER_UNDECLARED_BODY_RESERVATION_BYTES
+    )
+    transport = CamoufoxFbrefTransport(
+        max_network_requests=5,
+        max_network_bytes=3 * admission,
+    )
+    admitted = _Route(url="https://fbref.com/admitted")
+    admitted.request._impl_obj._guid = "request@admitted"
+    admitted.request.sizes.side_effect = RuntimeError("sizes unavailable")
+    transport._maybe_block(admitted)
+    admitted.request.failure = "NS_ERROR_PROXY_BAD_GATEWAY"
+    transport._on_request_failed(admitted.request)
+
+    escaped = MagicMock(
+        resource_type="document",
+        url=admitted.request.url,
+    )
+    escaped._impl_obj._guid = "request@escaped"
+    escaped.failure = "NS_ERROR_NET_RESET"
+    transport._on_request_failed(escaped)
+
+    stats = transport.traffic_stats()
+    assert stats["real_requests_count"] == 2
+    assert stats["network_policy_failed"] is True
+    assert stats["network_policy_failure"] == "unrouted_http_failure"
+
+
+@pytest.mark.unit
+def test_settled_failure_does_not_hide_same_url_response_with_different_guid():
+    admission = (
+        BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
+        + BROWSER_UNDECLARED_BODY_RESERVATION_BYTES
+    )
+    transport = CamoufoxFbrefTransport(
+        max_network_requests=5,
+        max_network_bytes=3 * admission,
+    )
+    admitted = _Route(url="https://fbref.com/admitted")
+    admitted.request._impl_obj._guid = "request@admitted"
+    admitted.request.sizes.side_effect = RuntimeError("sizes unavailable")
+    transport._maybe_block(admitted)
+    admitted.request.failure = "NS_ERROR_PROXY_BAD_GATEWAY"
+    transport._on_request_failed(admitted.request)
+
+    escaped = MagicMock(
+        resource_type="document",
+        url=admitted.request.url,
+    )
+    escaped._impl_obj._guid = "request@escaped"
+    transport._on_response(
+        _Response(escaped, {"content-length": "0"}, status=200)
+    )
+
+    stats = transport.traffic_stats()
+    assert stats["real_requests_count"] == 2
+    assert stats["network_policy_failed"] is True
+    assert stats["network_policy_failure"] == "unrouted_http_response"
 
 
 @pytest.mark.unit
@@ -1333,11 +1482,13 @@ def test_late_redirect_response_after_failure_is_not_a_routing_bypass():
         "requestBodySize": 0,
         "requestHeadersSize": 200,
     }
+    route.request._impl_obj._guid = "request@late-redirect"
     transport._navigation_source_url = "https://fbref.com/en/"
     transport._maybe_block(route)
     transport._on_request_failed(route.request)
 
     rewrapped = MagicMock(resource_type="document", url=route.request.url)
+    rewrapped._impl_obj._guid = "request@late-redirect"
     rewrapped.is_navigation_request.return_value = True
     transport._on_response(
         _Response(
@@ -1353,6 +1504,7 @@ def test_late_redirect_response_after_failure_is_not_a_routing_bypass():
     assert transport._pending_manual_redirect_url == "https://fbref.com/next"
     assert transport._settled_failed_request_urls == {}
     assert transport._settled_failed_ids_by_url == {}
+    assert transport._settled_failed_request_guids == {}
 
 
 @pytest.mark.unit
