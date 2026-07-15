@@ -34,10 +34,12 @@ Topology
 Trigger model
 -------------
 ``schedule=None`` — the DAG is triggered synchronously by
-``dag_transform_fbref_silver`` after its transforms and DQ gates pass.
+``dag_master_pipeline`` after the independently scheduled FBref source and
+Silver DQ gates pass.
 ``xref_player`` deliberately consumes the freshly materialised
-``silver.fbref_player_identity`` universe; the Silver trigger waits for this
-entire DAG, including ``validate_xref``, before it can succeed.
+``silver.fbref_player_identity`` universe; the master waits for this entire
+DAG, including ``validate_xref``, before it can proceed to E3 and Gold. xref
+failures never alter the terminal verdict of ingest/backfill/replay runs.
 
 Notes for maintainers
 ---------------------
@@ -57,7 +59,7 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict
 
 from airflow import DAG
@@ -111,7 +113,10 @@ def _run_xref_team(**context) -> Dict[str, Any]:
         get_team_alias_sql_values,
         render_sql_template,
     )
-    from utils.silver_tasks import run_silver_transform
+    from utils.silver_tasks import (
+        fbref_control_run_id_from_context,
+        run_silver_transform,
+    )
 
     template_path = Path('/opt/airflow/dags/sql/silver/xref_team.sql.j2')
     if not template_path.exists():
@@ -151,6 +156,7 @@ def _run_xref_team(**context) -> Dict[str, Any]:
             sql_file=tmp_path,
             table_name='xref_team',
             schema='silver',
+            fbref_control_run_id=fbref_control_run_id_from_context(context),
         )
         logger.info(
             "xref_team CTAS complete: %d rows in %s",
@@ -180,7 +186,10 @@ def _run_xref_referee(**context) -> Dict[str, Any]:
         get_referee_alias_sql_values,
         render_sql_template,
     )
-    from utils.silver_tasks import run_silver_transform
+    from utils.silver_tasks import (
+        fbref_control_run_id_from_context,
+        run_silver_transform,
+    )
 
     template_path = Path('/opt/airflow/dags/sql/silver/xref_referee.sql.j2')
     if not template_path.exists():
@@ -208,6 +217,7 @@ def _run_xref_referee(**context) -> Dict[str, Any]:
             sql_file=tmp_path,
             table_name='xref_referee',
             schema='silver',
+            fbref_control_run_id=fbref_control_run_id_from_context(context),
         )
         logger.info(
             "xref_referee CTAS complete: %d rows in %s",
@@ -239,7 +249,10 @@ def _run_xref_manager(**context) -> Dict[str, Any]:
         get_manager_alias_sql_values,
         render_sql_template,
     )
-    from utils.silver_tasks import run_silver_transform
+    from utils.silver_tasks import (
+        fbref_control_run_id_from_context,
+        run_silver_transform,
+    )
 
     template_path = Path('/opt/airflow/dags/sql/silver/xref_manager.sql.j2')
     if not template_path.exists():
@@ -265,6 +278,7 @@ def _run_xref_manager(**context) -> Dict[str, Any]:
             sql_file=tmp_path,
             table_name='xref_manager',
             schema='silver',
+            fbref_control_run_id=fbref_control_run_id_from_context(context),
         )
         logger.info(
             "xref_manager CTAS complete: %d rows in %s",
@@ -285,12 +299,16 @@ def _run_pure_sql_xref(sql_file: str, table_name: str, **context) -> Dict[str, A
     Kept list-driven for any future pure-SQL xref additions; xref_referee and
     xref_manager graduated to dedicated Jinja callables.
     """
-    from utils.silver_tasks import run_silver_transform
+    from utils.silver_tasks import (
+        fbref_control_run_id_from_context,
+        run_silver_transform,
+    )
 
     result = run_silver_transform(
         sql_file=sql_file,
         table_name=table_name,
         schema='silver',
+        fbref_control_run_id=fbref_control_run_id_from_context(context),
     )
     logger.info(
         "%s CTAS complete: %d rows in %s",
@@ -595,12 +613,13 @@ with DAG(
         'Materialise Silver xref_* tables (team/match/referee/manager/player) '
         'from Bronze and FBref Silver identity. Runs after fbref Silver DQ.'
     ),
-    schedule=None,           # Triggered synchronously by FBref Silver
+    schedule=None,           # Triggered synchronously by the master publisher
     start_date=datetime(2026, 5, 1),
     catchup=False,
     tags=['silver', 'xref', 'medallion-e1', 'transform'],
     max_active_runs=1,
     max_active_tasks=1,      # Sequential — same OOM-safety reasoning as fbref Silver
+    dagrun_timeout=timedelta(hours=4),
     doc_md=__doc__,
 ) as dag:
 

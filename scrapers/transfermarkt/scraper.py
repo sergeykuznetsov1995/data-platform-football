@@ -22,7 +22,7 @@ with the JSON endpoints that the live site now exposes:
 See ``scripts/research/bench_transfermarkt_fetch.py`` for the bounded live
 benchmark that validates the production transport and parser contracts.
 
-Source: https://www.transfermarkt.us
+Source: https://www.transfermarkt.com
 """
 
 from __future__ import annotations
@@ -35,6 +35,7 @@ import os
 import re
 from collections import defaultdict
 from datetime import date, datetime, timezone
+from zoneinfo import ZoneInfo
 from decimal import Decimal, InvalidOperation
 from typing import Dict, List, Mapping, Optional, Tuple
 from urllib.parse import urlsplit, urlunsplit
@@ -58,6 +59,7 @@ from scrapers.transfermarkt.registry import (
     canonical_season,
     deterministic_scope_id,
     resolve_competition,
+    season_window_year,
 )
 from scrapers.utils.proxy_manager import ProxyManager
 from scrapers.utils.rate_limiter import RateLimiter
@@ -69,8 +71,10 @@ logger = logging.getLogger(__name__)
 # Endpoints & constants
 # ---------------------------------------------------------------------------
 
-# .us mirror is the most stable English-language host; same content as .com.
-_TM_BASE = "https://www.transfermarkt.us"
+# The .com host is what the registry crawl reads and what every residential
+# exit serves reliably; the .us mirror carries the same English content but a
+# share of exits cannot reach it, which exhausts a scope's retries.
+_TM_BASE = "https://www.transfermarkt.com"
 
 # {club_slug}/kader/verein/{club_id}/saison_id/{year}/plus/1  (the /plus/1
 # variant exposes the wider, detailed squad table — same selector contract
@@ -159,10 +163,8 @@ def _competition_listing_url(
         raise TransfermarktError(
             f'{competition.competition_id}: source_url has no path'
         )
-    # The .us mirror is the scraper's stable English host; source_url remains
-    # the exact .com lineage value in Bronze.
     return urlunsplit((
-        'https', 'www.transfermarkt.us', f'{path}/plus/',
+        'https', 'www.transfermarkt.com', f'{path}/plus/',
         f'saison_id={edition_id}', '',
     ))
 
@@ -205,7 +207,36 @@ def _coerce_int(raw) -> Optional[int]:
         return None
 
 
-_TM_MV_RE = re.compile(r'€\s*([\d.,]+)\s*(bn|k|m|b)?', re.IGNORECASE)
+# The currency symbol and the magnitude suffix are host/locale properties. A
+# figure in another currency cannot become a *_eur column, and a suffix we do
+# not know is a thousandfold error waiting to happen — both are schema errors,
+# never a silently wrong number.
+_TM_MONEY_RE = re.compile(
+    r'(?P<currency>€|£|\$|US\$)\s*(?P<amount>[\d.,]+)\s*(?P<unit>[A-Za-z.]*)',
+)
+_TM_MONEY_UNITS = {
+    '': 1,
+    'k': 1_000,
+    'th': 1_000,
+    'th.': 1_000,
+    'tsd': 1_000,
+    'tsd.': 1_000,
+    'thousand': 1_000,
+    'm': 1_000_000,
+    'mio': 1_000_000,
+    'mio.': 1_000_000,
+    'mill': 1_000_000,
+    'million': 1_000_000,
+    'b': 1_000_000_000,
+    'bn': 1_000_000_000,
+    'mrd': 1_000_000_000,
+    'mrd.': 1_000_000_000,
+    'billion': 1_000_000_000,
+}
+
+
+class MoneyLocaleError(TransfermarktError):
+    """The source stated a figure this parser must not guess at."""
 
 
 def _normalise_decimal_number(raw: str) -> Optional[Decimal]:
@@ -254,21 +285,21 @@ def _parse_tm_money_eur(raw) -> Optional[int]:
     if raw is None:
         return None
     s = str(raw)
-    m = _TM_MV_RE.search(s)
+    m = _TM_MONEY_RE.search(s)
     if not m:
         return None
-    num = _normalise_decimal_number(m.group(1))
+    currency = m.group('currency')
+    if currency != '€':
+        raise MoneyLocaleError(
+            f'source stated a figure in {currency}, not EUR: {s!r}'
+        )
+    num = _normalise_decimal_number(m.group('amount'))
     if num is None:
         return None
-    unit = (m.group(2) or '').lower()
-    multiplier = {
-        '': 1,
-        'k': 1_000,
-        'm': 1_000_000,
-        'b': 1_000_000_000,
-        'bn': 1_000_000_000,
-    }.get(unit, 1)
-    return int(num * Decimal(multiplier))
+    unit = (m.group('unit') or '').lower()
+    if unit not in _TM_MONEY_UNITS:
+        raise MoneyLocaleError(f'unknown magnitude suffix in {s!r}')
+    return int(num * Decimal(_TM_MONEY_UNITS[unit]))
 
 
 _HEIGHT_RE = re.compile(r'(\d+[,.]\d+)\s*m')
@@ -287,11 +318,49 @@ def _parse_height_cm(raw) -> Optional[int]:
         return None
 
 
-_TM_DATE_FORMATS = ('%b %d, %Y', '%B %d, %Y', '%Y-%m-%d', '%d.%m.%Y')
+# .com renders dates day-first ('17/08/1993'); .us renders them as 'Aug 17, 1993'.
+_TM_DATE_FORMATS = (
+    '%b %d, %Y', '%B %d, %Y', '%Y-%m-%d', '%d.%m.%Y', '%d/%m/%Y',
+)
+
+
+# The market-value epoch is midnight in the source's own timezone; read as UTC
+# it lands on the previous day.
+_TM_TZ = ZoneInfo('Europe/Berlin')
+
+
+def _market_value_date(entry: Dict) -> Optional[date]:
+    """Read a market-value point's date from the machine field, not the rendered one.
+
+    ``datum_mw`` is localised by host, and a day-first rendering parses just as
+    happily as a month-first one — silently swapping day and month. The epoch in
+    ``x`` says the same date unambiguously.
+    """
+
+    x_ms = entry.get('x')
+    if isinstance(x_ms, (int, float)) and not isinstance(x_ms, bool):
+        try:
+            return datetime.fromtimestamp(float(x_ms) / 1000.0, _TM_TZ).date()
+        except (OSError, OverflowError, ValueError):
+            pass
+    return _parse_tm_date(entry.get('datum_mw'))
+
+
+def _transfer_date(entry: Dict) -> Optional[date]:
+    """Read a transfer's date from the machine field, not the rendered one.
+
+    ``date`` is localised by host (``Jan 1, 2026`` on .us, ``01/01/2026`` on
+    .com, where day and month cannot be told apart), while ``dateUnformatted``
+    is ISO on every host.
+    """
+
+    return _parse_tm_date(
+        entry.get('dateUnformatted') or entry.get('date')
+    )
 
 
 def _parse_tm_date(raw) -> Optional[date]:
-    """Parse the small set of date formats TM exposes on .us. ``None`` on fail."""
+    """Parse the small set of date formats TM exposes. ``None`` on fail."""
     if not raw:
         return None
     s = str(raw).strip()
@@ -646,15 +715,7 @@ def _parse_mv_history(payload: dict, player_id: str) -> List[Dict]:
     for entry in payload.get('list') or []:
         if not isinstance(entry, dict):
             continue
-        mv_date = _parse_tm_date(entry.get('datum_mw'))
-        if mv_date is None:
-            # Fallback: derive from `x` epoch-ms.
-            x_ms = entry.get('x')
-            if isinstance(x_ms, (int, float)):
-                try:
-                    mv_date = datetime.utcfromtimestamp(x_ms / 1000.0).date()
-                except (OSError, OverflowError, ValueError):
-                    mv_date = None
+        mv_date = _market_value_date(entry)
         if mv_date is None:
             continue
         rows.append({
@@ -736,7 +797,7 @@ def _stable_transfer_id(
     if source_id is None:
         from_id = _extract_club_id_from_href(from_d.get('href'))
         to_id = _extract_club_id_from_href(to_d.get('href'))
-        parsed_date = _parse_tm_date(entry.get('date'))
+        parsed_date = _transfer_date(entry)
         identity.update({
             'event_season': _normalise_event_season(
                 entry.get('season'), parsed_date,
@@ -771,7 +832,7 @@ def _parse_transfers(payload: dict, player_id: str) -> List[Dict]:
     for entry in payload.get('transfers') or []:
         if not isinstance(entry, dict):
             continue
-        transfer_date = _parse_tm_date(entry.get('date'))
+        transfer_date = _transfer_date(entry)
         event_season = _normalise_event_season(entry.get('season'), transfer_date)
         from_d = entry.get('from') if isinstance(entry.get('from'), dict) else {}
         to_d = entry.get('to') if isinstance(entry.get('to'), dict) else {}
@@ -819,19 +880,8 @@ def _source_row_semantic_error(label: str, entry: Dict) -> Optional[str]:
     """Validate facts required to materialise a native career natural key."""
 
     if label in {'mv_history', 'market_value_points'}:
-        mv_date = _parse_tm_date(entry.get('datum_mw'))
-        if mv_date is None:
-            x_ms = entry.get('x')
-            if (
-                isinstance(x_ms, bool)
-                or not isinstance(x_ms, (int, float))
-                or not math.isfinite(float(x_ms))
-            ):
-                return 'market-value row has no valid date or epoch x'
-            try:
-                datetime.utcfromtimestamp(float(x_ms) / 1000.0)
-            except (OSError, OverflowError, ValueError):
-                return 'market-value row epoch x is outside the valid range'
+        if _market_value_date(entry) is None:
+            return 'market-value row has no valid date or epoch x'
 
         raw_value = entry.get('y')
         if isinstance(raw_value, bool) or raw_value is None:
@@ -852,7 +902,7 @@ def _source_row_semantic_error(label: str, entry: Dict) -> Optional[str]:
         upcoming = entry.get('upcoming', False)
         if not isinstance(upcoming, bool):
             return 'transfer upcoming flag is not boolean'
-        transfer_date = _parse_tm_date(entry.get('date'))
+        transfer_date = _transfer_date(entry)
         event_season = _normalise_event_season(
             entry.get('season'), transfer_date,
         )
@@ -1051,14 +1101,11 @@ def _normalise_requested_season(
     season,
     season_format: SeasonFormat | str,
 ) -> str:
-    value = str(season)
-    if (
-        len(value) == 4
-        and value.isdigit()
-        and int(value[2:]) == (int(value[:2]) + 1) % 100
-    ):
-        return value
-    return canonical_season(value, season_format)
+    # A season is stated as the year it opens in; the registry says how to read
+    # it.  Guessing from the digits alone cannot tell the year 2021 from the
+    # key of the 2020/21 season — they are the same four characters — and it
+    # guessed wrong for exactly that year.
+    return canonical_season(season, season_format)
 
 
 def _ensure_metadata(frame: pd.DataFrame, entity_type: str) -> pd.DataFrame:
@@ -1112,18 +1159,22 @@ def materialize_legacy_players(
         ['league', 'season', 'player_id', 'club_id'], keep='first',
     )
 
+    # Age is a fact the source prints; recomputing it "as of now" over pages
+    # that may be a day old (the scope cache lives 24h) drifts by a year for any
+    # player whose birthday falls in between, and the dual-write parity gate
+    # compares the two projections' age. Derive it only when the source omits it.
     today = datetime.utcnow().date()
-    calculated_age = []
+    ages = []
     for _, row in observations.iterrows():
+        age = row.get('age')
         dob = row.get('dob')
-        if isinstance(dob, date):
-            calculated_age.append(
+        if pd.isna(age) and isinstance(dob, date):
+            age = (
                 today.year - dob.year
                 - ((today.month, today.day) < (dob.month, dob.day))
             )
-        else:
-            calculated_age.append(row.get('age'))
-    observations['age'] = calculated_age
+        ages.append(age)
+    observations['age'] = ages
     observations['market_value_last_update'] = None
     observations['current_club_id'] = observations['club_id']
     observations['current_club_name'] = observations['club_name']
@@ -1137,7 +1188,7 @@ def materialize_legacy_market_value_history(
     points: pd.DataFrame,
     league: str,
     season,
-    season_format: SeasonFormat | str = SeasonFormat.SPLIT_YEAR,
+    season_format: SeasonFormat | str,
 ) -> pd.DataFrame:
     """Pure global-point → legacy scrape-partition projection."""
 
@@ -1156,7 +1207,7 @@ def materialize_legacy_transfers(
     events: pd.DataFrame,
     league: str,
     season,
-    season_format: SeasonFormat | str = SeasonFormat.SPLIT_YEAR,
+    season_format: SeasonFormat | str,
 ) -> pd.DataFrame:
     """Pure global-event → legacy scrape-partition projection.
 
@@ -1180,7 +1231,7 @@ def materialize_legacy_coaches(
     stints: pd.DataFrame,
     league: str,
     season,
-    season_format: SeasonFormat | str = SeasonFormat.SPLIT_YEAR,
+    season_format: SeasonFormat | str,
 ) -> pd.DataFrame:
     """Pure global profile/stint → legacy league-season coach projection."""
 
@@ -1264,6 +1315,11 @@ class TransfermarktScraper(BaseScraper):
         )
         competition_records = kwargs.pop('competition_records', None)
         traffic_ledger = kwargs.pop('traffic_ledger', None)
+        # A league larger than one cycle's byte cap can only be finished across
+        # several cycles, and only if the pages already paid for are reused.
+        response_cache = kwargs.pop('response_cache', None)
+        cache_ttl_seconds = kwargs.pop('cache_ttl_seconds', None)
+        canonical_season_override = kwargs.pop('canonical_season', None)
         retry_budget_raw = kwargs.pop(
             'retry_budget', os.environ.get('TM_RETRY_BUDGET'),
         )
@@ -1355,6 +1411,11 @@ class TransfermarktScraper(BaseScraper):
                 'task_id': os.environ.get('TM_TASK_ID', ''),
                 'scope': os.environ.get('TM_SCOPE_ID', ''),
             }
+        self._canonical_season = str(canonical_season_override or '').strip()
+        self._response_cache = response_cache
+        self._cache_ttl_seconds = (
+            float(cache_ttl_seconds) if cache_ttl_seconds else None
+        )
         self._http_client = TransfermarktHttpClient(
             proxy_manager=(None if lease_provider else self._proxy_manager),
             proxy=(None if lease_provider else self.proxy),
@@ -1364,6 +1425,7 @@ class TransfermarktScraper(BaseScraper):
             lease_metadata=lease_metadata,
             lease_ttl_seconds=lease_ttl_seconds,
             rate_limiter=self._rate_limiter,
+            cache=response_cache,
             timeout_seconds=12,
             circuit_failures=5,
         )
@@ -1406,7 +1468,12 @@ class TransfermarktScraper(BaseScraper):
         edition = str(edition_id).strip()
         if not edition:
             raise TransfermarktError('edition_id is required')
-        canonical = canonical_season(edition, record.season_format)
+        # The source offsets some calendar leagues' saison_id from the season it
+        # names (saison_id 2023 is the 2024 season), so a registry-planned scope
+        # states its season and the edition id is only a fallback.
+        canonical = self._canonical_season or canonical_season(
+            edition, record.season_format,
+        )
         return {
             'record': record,
             'competition_id': record.competition_id,
@@ -1414,6 +1481,9 @@ class TransfermarktScraper(BaseScraper):
             'edition_id': edition,
             'season_format': record.season_format,
             'canonical_season': canonical,
+            'season_year': season_window_year(
+                edition, record.season_format, canonical,
+            ),
             'compatibility_league': (
                 record.canonical_competition_id
                 or f'TM-{record.competition_id}'
@@ -1682,7 +1752,7 @@ class TransfermarktScraper(BaseScraper):
         self,
         url: str,
         as_json: bool,
-        max_attempts: int = 3,
+        max_attempts: int = 6,
         label: str = 'endpoint',
         context: Optional[Dict] = None,
     ) -> FetchOutcome:
@@ -1702,6 +1772,8 @@ class TransfermarktScraper(BaseScraper):
             label=label,
             context=context,
             validator=self._endpoint_validator(label, as_json),
+            cache_key=url if self._response_cache is not None else None,
+            cache_ttl_seconds=self._cache_ttl_seconds,
         )
         self._store_fetch_outcome(outcome)
         return outcome
@@ -1710,7 +1782,7 @@ class TransfermarktScraper(BaseScraper):
         self,
         url: str,
         as_json: bool,
-        max_attempts: int = 3,
+        max_attempts: int = 6,
         label: str = 'endpoint',
         context: Optional[Dict] = None,
     ):
@@ -2309,6 +2381,10 @@ class TransfermarktScraper(BaseScraper):
         scope = self._resolve_scope(league, season)
         competition = scope['record']
         league = scope['compatibility_league']
+        # A stint is dated, so the window it must overlap is the season the
+        # registry states — never the saison_id, which the source offsets from
+        # it for calendar leagues.
+        season = scope['season_year']
         self._begin_operation_budget('coaches')
 
         def _empty_bundle() -> Dict[str, pd.DataFrame]:
@@ -2447,6 +2523,10 @@ class TransfermarktScraper(BaseScraper):
                     'role': stint['role'],
                     'club_id': stint['club_id'],
                     'current_club_name': club['club_name'],
+                    # The club's history page is what proves this coach worked
+                    # here; a profile fetch, when it succeeds, supersedes it.
+                    '_source_url': history_url,
+                    '_source_body_hash': history_hash,
                 })
 
         if not managers:
@@ -2476,9 +2556,12 @@ class TransfermarktScraper(BaseScraper):
         if coach_profile_cache is None:
             known_bios = self._resolve_coach_bios_from_bronze()
         else:
+            # An identity row carries no bio, so it is not one to reuse.
             known_bios = {
                 str(coach_id): dict(profile)
                 for coach_id, profile in coach_profile_cache.items()
+                if profile.get('dob') is not None
+                or profile.get('nationality') is not None
             }
         resolved_bios: Dict[str, Dict] = dict(known_bios)
         unique_managers = list({
@@ -2513,7 +2596,11 @@ class TransfermarktScraper(BaseScraper):
                             f"failures at {idx}/{len(unique_managers)} — aborting to "
                             f"protect existing partition"
                         )
-                    continue
+                    # His history page named him, so he existed here whether or
+                    # not his bio page answered.  The row states the identity
+                    # and leaves the bio empty; ``_resolve_coach_bios_from_bronze``
+                    # reads no bio out of it, so the next cycle refetches.
+                    bio = {}
                 else:
                     consecutive_failures = 0
                     successes += 1
@@ -2827,7 +2914,7 @@ class TransfermarktScraper(BaseScraper):
         )
         scope = self._resolve_scope(league, season)
         return materialize_legacy_market_value_history(
-            points, scope['compatibility_league'], season,
+            points, scope['compatibility_league'], scope['season_year'],
             scope['season_format'],
         )
 
@@ -2882,7 +2969,7 @@ class TransfermarktScraper(BaseScraper):
         )
         scope = self._resolve_scope(league, season)
         return materialize_legacy_transfers(
-            events, scope['compatibility_league'], season,
+            events, scope['compatibility_league'], scope['season_year'],
             scope['season_format'],
         )
 

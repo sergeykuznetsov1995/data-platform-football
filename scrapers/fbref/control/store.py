@@ -25,8 +25,10 @@ from scrapers.fbref.control.models import (
     BudgetReservation,
     CohortTarget,
     CompetitionRegistryEntry,
+    FrontierProvenance,
     FrontierTarget,
     ObservationLease,
+    SeasonAlias,
     SeasonRegistryEntry,
     TargetLease,
     ThrottleSlot,
@@ -71,6 +73,96 @@ _AVAILABILITY_STATES = {
     "unknown",
     "error",
 }
+_SEASON_ALIAS_KINDS = {"source", "label", "url", "legacy", "operator"}
+_PAGE_KIND_SLA_SECONDS = {
+    "competition_index": 86_400,
+    "schedule": 86_400,
+    "match": 86_400,
+    "competition": 604_800,
+    "season": 604_800,
+    "season_stats": 604_800,
+    "standings": 604_800,
+    "squad": 604_800,
+    "player": 2_592_000,
+    "matchlog": 2_592_000,
+}
+_PAGE_KIND_SLA_VALUES = ", ".join(
+    f"('{page_kind}', {seconds})"
+    for page_kind, seconds in sorted(_PAGE_KIND_SLA_SECONDS.items())
+)
+_FRONTIER_SCOPE_CTE = """
+    WITH declared_scope AS (
+        SELECT frontier.target_id, frontier.source,
+               frontier.source_ids ->> 'competition_id' AS competition_id,
+               frontier.source_ids ->> 'season_id' AS season_id
+        FROM fbref_control.page_frontier AS frontier
+        WHERE frontier.source_ids ? 'competition_id'
+        UNION
+        SELECT edge.child_target_id AS target_id, child.source,
+               edge.carried_competition_id AS competition_id,
+               edge.carried_season_id AS season_id
+        FROM fbref_control.frontier_provenance AS edge
+        JOIN fbref_control.page_frontier AS child
+          ON child.target_id = edge.child_target_id
+        WHERE edge.carried_competition_id IS NOT NULL
+    ),
+    canonical_scope AS (
+        SELECT declared.target_id, declared.source,
+               declared.competition_id,
+               COALESCE(alias.season_id, declared.season_id) AS season_id
+        FROM declared_scope AS declared
+        LEFT JOIN fbref_control.season_alias AS alias
+          ON alias.source = declared.source
+         AND alias.competition_id = declared.competition_id
+         AND alias.alias = declared.season_id
+    ),
+    scope_rollup AS (
+        SELECT scoped.target_id,
+               count(DISTINCT (
+                   scoped.competition_id, scoped.season_id
+               )) AS scope_count,
+               bool_or(competition.competition_id IS NULL)
+                   AS competition_missing,
+               bool_or(competition.gender = 'female') AS has_female,
+               bool_or(competition.gender = 'unknown') AS has_unknown,
+               bool_or(
+                   competition.competition_id IS NOT NULL
+                   AND (
+                       competition.gender <> 'male'
+                       OR competition.crawl_state <> 'active'
+                       OR competition.lifecycle_state NOT IN (
+                           'present', 'missing_once'
+                       )
+                       OR NOT competition.present
+                   )
+               ) AS inactive_competition,
+               bool_or(
+                   scoped.season_id IS NOT NULL
+                   AND (
+                       season.season_id IS NULL
+                       OR season.lifecycle_state <> 'present'
+                       OR NOT season.present
+                   )
+               ) AS invalid_season,
+               bool_or(
+                   scoped.season_id IS NOT NULL
+                   AND season.lifecycle_state = 'present'
+                   AND season.present
+                   AND season.is_current
+               ) AS has_current_season,
+               bool_or(scoped.season_id IS NULL)
+                   AS has_competition_scope
+        FROM canonical_scope AS scoped
+        LEFT JOIN fbref_control.competition_registry AS competition
+          ON competition.source = scoped.source
+         AND competition.competition_id = scoped.competition_id
+        LEFT JOIN fbref_control.season_registry AS season
+          ON season.source = scoped.source
+         AND season.competition_id = scoped.competition_id
+         AND season.season_id = scoped.season_id
+        GROUP BY scoped.target_id
+    )
+"""
 
 
 def _postgres_dsn(uri: str) -> str:
@@ -136,6 +228,44 @@ def make_budget_reservation_id(attempt_id: object) -> str:
     """Return the retry-safe budget idempotency key for one fetch attempt."""
     attempt = str(uuid.UUID(str(attempt_id)))
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f"fbref-budget:{attempt}"))
+
+
+def make_frontier_provenance_id(
+    *,
+    parent_target_id: object,
+    child_target_id: object,
+    relation: object,
+    parent_content_hash: object,
+    parser_version: object,
+    carried_competition_id: Optional[object] = None,
+    carried_season_id: Optional[object] = None,
+) -> str:
+    """Return the stable identity of one immutable discovery edge."""
+    competition = (
+        None
+        if carried_competition_id is None
+        else _text(carried_competition_id, "carried_competition_id")
+    )
+    season = (
+        None
+        if carried_season_id is None
+        else _text(carried_season_id, "carried_season_id")
+    )
+    if season is not None and competition is None:
+        raise ValueError("A carried season requires a carried competition")
+    identity = json.dumps(
+        [
+            _text(parent_target_id, "parent_target_id"),
+            _text(child_target_id, "child_target_id"),
+            _text(relation, "relation"),
+            competition,
+            season,
+            _text(parent_content_hash, "parent_content_hash"),
+            _text(parser_version, "parser_version"),
+        ],
+        separators=(",", ":"),
+    )
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"fbref-provenance:{identity}"))
 
 
 def _uuid(value: object, name: str) -> str:
@@ -373,6 +503,230 @@ class ControlStore:
             )
             if cursor.rowcount != 1:
                 raise StateConflict(f"Run {normalized} cannot be started")
+
+    def acquire_publication_lock(
+        self,
+        run_id: object,
+        *,
+        dag_id: object,
+        source: str = "fbref",
+        ttl_seconds: int = 8 * 24 * 60 * 60,
+    ) -> dict:
+        """Acquire the source lock spanning Bronze through master Gold."""
+
+        normalized_run_id = _uuid(run_id, "run_id")
+        normalized_dag_id = _text(dag_id, "dag_id")
+        normalized_source = _text(source, "source")
+        normalized_ttl = int(ttl_seconds)
+        if not 60 <= normalized_ttl <= 14 * 24 * 60 * 60:
+            raise ValueError("publication lock ttl_seconds must be 60..1209600")
+        with self._transaction() as cursor:
+            cursor.execute(
+                "SELECT status FROM fbref_control.crawl_run WHERE run_id = %s",
+                (normalized_run_id,),
+            )
+            run = _fetchone(cursor)
+            if run is None or str(run["status"]) != "running":
+                raise StateConflict(
+                    "Publication lock owner must be an existing running run"
+                )
+            cursor.execute(
+                """
+                INSERT INTO fbref_control.publication_lock (
+                    source, owner_run_id, owner_dag_id, expires_at
+                ) VALUES (
+                    %s, %s, %s,
+                    clock_timestamp() + (%s * interval '1 second')
+                )
+                ON CONFLICT (source) DO NOTHING
+                """,
+                (
+                    normalized_source,
+                    normalized_run_id,
+                    normalized_dag_id,
+                    normalized_ttl,
+                ),
+            )
+            inserted = cursor.rowcount == 1
+            cursor.execute(
+                """
+                SELECT source, owner_run_id, owner_dag_id, acquired_at,
+                       expires_at, released_at,
+                       (released_at IS NULL
+                        AND expires_at > clock_timestamp()) AS active
+                FROM fbref_control.publication_lock
+                WHERE source = %s
+                FOR UPDATE
+                """,
+                (normalized_source,),
+            )
+            lock = _fetchone(cursor)
+            if lock is None:  # pragma: no cover - guarded by INSERT/PK
+                raise ControlStoreError("Publication lock row disappeared")
+            current_owner = str(lock["owner_run_id"])
+            if current_owner == normalized_run_id:
+                if lock["released_at"] is not None or not bool(lock["active"]):
+                    raise StateConflict(
+                        "Released or expired publication generation cannot "
+                        "be reacquired by the same run"
+                    )
+                return {
+                    **lock,
+                    "acquired": inserted,
+                    "idempotent": not inserted,
+                }
+            if bool(lock["active"]):
+                raise StateConflict(
+                    "FBref publication is locked by another control run"
+                )
+            cursor.execute(
+                """
+                UPDATE fbref_control.publication_lock
+                SET owner_run_id = %s,
+                    owner_dag_id = %s,
+                    acquired_at = clock_timestamp(),
+                    expires_at = clock_timestamp()
+                        + (%s * interval '1 second'),
+                    released_at = NULL,
+                    metadata = '{}'::jsonb
+                WHERE source = %s
+                RETURNING source, owner_run_id, owner_dag_id, acquired_at,
+                          expires_at, released_at
+                """,
+                (
+                    normalized_run_id,
+                    normalized_dag_id,
+                    normalized_ttl,
+                    normalized_source,
+                ),
+            )
+            replaced = _fetchone(cursor)
+            return {**replaced, "acquired": True, "idempotent": False}
+
+    def release_publication_lock(
+        self,
+        run_id: object,
+        *,
+        source: str = "fbref",
+    ) -> dict:
+        """Release only the publication generation owned by ``run_id``."""
+
+        normalized_run_id = _uuid(run_id, "run_id")
+        normalized_source = _text(source, "source")
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                SELECT owner_run_id, released_at
+                FROM fbref_control.publication_lock
+                WHERE source = %s
+                FOR UPDATE
+                """,
+                (normalized_source,),
+            )
+            lock = _fetchone(cursor)
+            if lock is None:
+                return {"source": normalized_source, "released": False}
+            if str(lock["owner_run_id"]) != normalized_run_id:
+                raise StateConflict(
+                    "Cannot release another control run's publication lock"
+                )
+            if lock["released_at"] is not None:
+                return {
+                    "source": normalized_source,
+                    "owner_run_id": normalized_run_id,
+                    "released": True,
+                    "idempotent": True,
+                }
+            cursor.execute(
+                """
+                UPDATE fbref_control.publication_lock
+                SET released_at = clock_timestamp()
+                WHERE source = %s AND owner_run_id = %s
+                RETURNING released_at
+                """,
+                (normalized_source, normalized_run_id),
+            )
+            released = _fetchone(cursor)
+            if released is None:  # pragma: no cover - row lock guards this
+                raise ControlStoreError("Publication lock release lost its row")
+            return {
+                "source": normalized_source,
+                "owner_run_id": normalized_run_id,
+                "released": True,
+                "idempotent": False,
+                "released_at": released["released_at"],
+            }
+
+    def renew_publication_lock(
+        self,
+        run_id: object,
+        *,
+        source: str = "fbref",
+        ttl_seconds: int = 8 * 24 * 60 * 60,
+    ) -> dict:
+        """Extend only an active exact-owner lock from the database clock."""
+
+        normalized_run_id = _uuid(run_id, "run_id")
+        normalized_source = _text(source, "source")
+        normalized_ttl = int(ttl_seconds)
+        if not 60 <= normalized_ttl <= 14 * 24 * 60 * 60:
+            raise ValueError("publication lock ttl_seconds must be 60..1209600")
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                SELECT owner_run_id, released_at,
+                       expires_at > clock_timestamp() AS active
+                FROM fbref_control.publication_lock
+                WHERE source = %s
+                FOR UPDATE
+                """,
+                (normalized_source,),
+            )
+            lock = _fetchone(cursor)
+            if (
+                lock is None
+                or str(lock["owner_run_id"]) != normalized_run_id
+                or lock["released_at"] is not None
+                or not bool(lock["active"])
+            ):
+                raise StateConflict(
+                    "Only the active publication owner can renew the lock"
+                )
+            cursor.execute(
+                """
+                UPDATE fbref_control.publication_lock
+                SET expires_at = clock_timestamp()
+                    + (%s * interval '1 second')
+                WHERE source = %s AND owner_run_id = %s
+                RETURNING source, owner_run_id, owner_dag_id, acquired_at,
+                          expires_at, released_at
+                """,
+                (normalized_ttl, normalized_source, normalized_run_id),
+            )
+            renewed = _fetchone(cursor)
+            if renewed is None:  # pragma: no cover - row lock guards this
+                raise ControlStoreError("Publication lock renewal lost its row")
+            return renewed
+
+    def get_publication_lock(
+        self, *, source: str = "fbref"
+    ) -> Optional[dict]:
+        """Return current lock evidence with a database-clock active flag."""
+
+        normalized_source = _text(source, "source")
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                SELECT source, owner_run_id, owner_dag_id, acquired_at,
+                       expires_at, released_at,
+                       (released_at IS NULL
+                        AND expires_at > clock_timestamp()) AS active
+                FROM fbref_control.publication_lock
+                WHERE source = %s
+                """,
+                (normalized_source,),
+            )
+            return _fetchone(cursor)
 
     def finish_run(self, run_id: object, *, succeeded: bool) -> None:
         normalized = _uuid(run_id, "run_id")
@@ -659,8 +1013,31 @@ class ControlStore:
                 or row["fetched_at"] != fetched_at
                 or dict(actual_metadata) != dict(metadata or {})
             ):
-                raise StateConflict(
-                    f"snapshot_id {snapshot} already has different evidence"
+                if bool(row["successful"]):
+                    raise StateConflict(
+                        f"snapshot_id {snapshot} already has different evidence"
+                    )
+                # A failed snapshot is evidence about our parse, not about the
+                # source. Freezing it would poison this (parser, page) pair
+                # forever: the retry that fixes the parser could never record
+                # its result, and the target would be stuck until the parser
+                # version changed. Successful snapshots stay immutable.
+                cursor.execute(
+                    """
+                    UPDATE fbref_control.registry_snapshot
+                    SET run_id = %s, source = %s, content_hash = %s,
+                        successful = %s, fetched_at = %s, metadata = %s::jsonb
+                    WHERE snapshot_id = %s
+                    """,
+                    (
+                        normalized_run,
+                        normalized_source,
+                        content_hash,
+                        bool(successful),
+                        fetched_at,
+                        _json(metadata),
+                        snapshot,
+                    ),
                 )
         return snapshot
 
@@ -704,10 +1081,34 @@ class ControlStore:
         self,
         snapshot_id: object,
         entries: Iterable[CompetitionRegistryEntry],
+        *,
+        shrink_override_reason: Optional[object] = None,
     ) -> dict[str, int]:
-        """Reconcile one successful index snapshot without deleting history."""
+        """Reconcile an accepted index snapshot without deleting history.
+
+        An unknown-gender row blocks the entire snapshot.  A drop of more than
+        ten percent from the live registry likewise fails closed unless an
+        explicit, durable operator reason accompanies the reconciliation.
+        Because both checks happen in the reconciliation transaction, rejected
+        snapshots never advance disappearance counters.
+        """
         snapshot = _uuid(snapshot_id, "snapshot_id")
         competitions = self._validated_competitions(entries)
+        unknown_ids = sorted(
+            entry.competition_id
+            for entry in competitions
+            if entry.gender == "unknown"
+        )
+        if unknown_ids:
+            raise StateConflict(
+                "Competition snapshot contains unknown gender: "
+                + ", ".join(unknown_ids)
+            )
+        override_reason = (
+            None
+            if shrink_override_reason is None
+            else _text(shrink_override_reason, "shrink_override_reason")
+        )
         with self._transaction() as cursor:
             cursor.execute(
                 """
@@ -734,6 +1135,39 @@ class ControlStore:
             latest = _fetchone(cursor)
             if latest and latest["latest"] and latest["latest"] > fetched_at:
                 raise StateConflict("Registry snapshots must reconcile chronologically")
+
+            cursor.execute(
+                """
+                SELECT count(*) AS count
+                FROM fbref_control.competition_registry
+                WHERE source = %s AND lifecycle_state <> 'disappeared'
+                """,
+                (source,),
+            )
+            baseline_row = _fetchone(cursor) or {}
+            baseline_count = int(baseline_row.get("count") or 0)
+            severe_shrink = (
+                baseline_count > 0
+                and len(competitions) * 10 < baseline_count * 9
+            )
+            if severe_shrink and override_reason is None:
+                raise StateConflict(
+                    "Competition snapshot shrank by more than 10%: "
+                    f"{baseline_count} -> {len(competitions)}"
+                )
+            if severe_shrink:
+                cursor.execute(
+                    """
+                    INSERT INTO
+                        fbref_control.registry_reconciliation_override (
+                            snapshot_id, override_type, reason
+                        ) VALUES (
+                            %s, 'competition_snapshot_shrink', %s
+                        )
+                    ON CONFLICT (snapshot_id, override_type) DO NOTHING
+                    """,
+                    (snapshot, override_reason),
+                )
 
             counts = {"active": 0, "skipped": 0, "quarantined": 0}
             seen_ids = []
@@ -805,7 +1239,7 @@ class ControlStore:
                         WHEN consecutive_misses + 1 >= 2 THEN 'disappeared'
                         ELSE 'missing_once'
                     END,
-                    present = false,
+                    present = consecutive_misses + 1 < 2,
                     last_snapshot_id = %s
                 WHERE source = %s
                   AND last_snapshot_id <> %s
@@ -814,10 +1248,20 @@ class ControlStore:
                 (snapshot, source, snapshot, seen_ids),
             )
             counts["missing"] = cursor.rowcount
+            counts["snapshot_baseline"] = baseline_count
+            counts["snapshot_shrink_overridden"] = int(severe_shrink)
             cursor.execute(
                 """
                 UPDATE fbref_control.page_frontier AS frontier
                 SET state = 'queued', next_fetch_at = clock_timestamp(),
+                    last_error_class = CASE
+                        WHEN frontier.state = 'quarantined' THEN NULL
+                        ELSE frontier.last_error_class
+                    END,
+                    last_error_message = CASE
+                        WHEN frontier.state = 'quarantined' THEN NULL
+                        ELSE frontier.last_error_message
+                    END,
                     updated_at = clock_timestamp()
                 FROM fbref_control.competition_registry AS competition
                 WHERE competition.source = frontier.source
@@ -825,9 +1269,17 @@ class ControlStore:
                       frontier.source_ids ->> 'competition_id'
                   AND competition.gender = 'male'
                   AND competition.crawl_state = 'active'
-                  AND competition.lifecycle_state = 'present'
+                  AND competition.lifecycle_state IN (
+                      'present', 'missing_once'
+                  )
                   AND competition.present
-                  AND frontier.state IN ('skipped', 'quarantined')
+                  AND (
+                    frontier.state = 'skipped'
+                    OR (
+                      frontier.state = 'quarantined'
+                      AND frontier.last_error_class = 'ScopeQuarantined'
+                    )
+                  )
                 """
             )
             counts["frontier_scope_reopened"] = cursor.rowcount
@@ -835,11 +1287,23 @@ class ControlStore:
                 """
                 UPDATE fbref_control.page_frontier AS frontier
                 SET state = CASE
-                        WHEN competition.gender = 'unknown'
+                        WHEN competition.gender IN ('female', 'unknown')
                         THEN 'quarantined'
                         ELSE 'skipped'
                     END,
                     next_fetch_at = NULL, retry_after = NULL,
+                    last_error_class = CASE
+                        WHEN competition.gender IN ('female', 'unknown')
+                        THEN 'ScopeQuarantined'
+                        ELSE frontier.last_error_class
+                    END,
+                    last_error_message = CASE
+                        WHEN competition.gender = 'female'
+                        THEN 'female_gender'
+                        WHEN competition.gender = 'unknown'
+                        THEN 'unknown_gender'
+                        ELSE frontier.last_error_message
+                    END,
                     updated_at = clock_timestamp()
                 FROM fbref_control.competition_registry AS competition
                 WHERE competition.source = frontier.source
@@ -848,7 +1312,9 @@ class ControlStore:
                   AND (
                     competition.gender <> 'male'
                     OR competition.crawl_state <> 'active'
-                    OR competition.lifecycle_state <> 'present'
+                    OR competition.lifecycle_state NOT IN (
+                        'present', 'missing_once'
+                    )
                     OR NOT competition.present
                   )
                   AND frontier.state <> 'leased'
@@ -865,8 +1331,76 @@ class ControlStore:
                 SELECT * FROM fbref_control.competition_registry
                 WHERE source = %s AND gender = 'male'
                   AND crawl_state = 'active'
-                  AND lifecycle_state = 'present' AND present
+                  AND lifecycle_state IN ('present', 'missing_once')
+                  AND present
                 ORDER BY competition_id
+                """,
+                (_text(source, "source"),),
+            )
+            return _fetchall(cursor)
+
+    def list_publication_scope(
+        self, *, source: str = "fbref"
+    ) -> list[dict]:
+        """Export canonical and aliased season scope for Bronze/Silver gates."""
+
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                WITH scope_token AS (
+                    SELECT season.source, season.competition_id,
+                           season.season_id AS canonical_season_id,
+                           season.season_id AS source_season_id,
+                           'canonical'::text AS scope_kind
+                    FROM fbref_control.season_registry AS season
+                    UNION ALL
+                    SELECT alias.source, alias.competition_id,
+                           alias.season_id AS canonical_season_id,
+                           alias.alias AS source_season_id,
+                           'alias'::text AS scope_kind
+                    FROM fbref_control.season_alias AS alias
+                    WHERE alias.alias <> alias.season_id
+                )
+                SELECT token.source,
+                       token.competition_id AS source_competition_id,
+                       token.source_season_id,
+                       token.canonical_season_id,
+                       token.scope_kind,
+                       competition.name AS competition_name,
+                       competition.gender,
+                       competition.crawl_state AS competition_crawl_state,
+                       competition.lifecycle_state
+                           AS competition_lifecycle_state,
+                       competition.present AS competition_present,
+                       season.label AS season_label,
+                       season.is_current AS season_is_current,
+                       season.lifecycle_state AS season_lifecycle_state,
+                       season.present AS season_present,
+                       COALESCE(
+                           season.metadata ->> 'direct_match_only' = 'true',
+                           false
+                       ) AS direct_match_only,
+                       (
+                           competition.gender = 'male'
+                           AND competition.crawl_state = 'active'
+                           AND competition.lifecycle_state IN (
+                               'present', 'missing_once'
+                           )
+                           AND competition.present
+                           AND season.lifecycle_state = 'present'
+                           AND season.present
+                       ) AS eligible_male
+                FROM scope_token AS token
+                JOIN fbref_control.competition_registry AS competition
+                  ON competition.source = token.source
+                 AND competition.competition_id = token.competition_id
+                JOIN fbref_control.season_registry AS season
+                  ON season.source = token.source
+                 AND season.competition_id = token.competition_id
+                 AND season.season_id = token.canonical_season_id
+                WHERE token.source = %s
+                ORDER BY token.competition_id, token.source_season_id,
+                         token.scope_kind
                 """,
                 (_text(source, "source"),),
             )
@@ -901,6 +1435,12 @@ class ControlStore:
                     is_current=bool(entry.is_current),
                     metadata=dict(entry.metadata),
                 )
+            )
+        current_ids = [entry.season_id for entry in result if entry.is_current]
+        if len(current_ids) > 1:
+            raise ValueError(
+                "Season snapshot contains more than one current season: "
+                + ", ".join(sorted(current_ids))
             )
         return result
 
@@ -942,7 +1482,10 @@ class ControlStore:
             if (
                 parent is None
                 or parent["crawl_state"] != "active"
-                or parent["lifecycle_state"] != "present"
+                or parent["lifecycle_state"] not in {
+                    "present",
+                    "missing_once",
+                }
                 or not parent["present"]
             ):
                 raise StateConflict(
@@ -962,6 +1505,22 @@ class ControlStore:
 
             seen_ids = []
             current_count = 0
+            incoming_current = next(
+                (entry.season_id for entry in seasons if entry.is_current),
+                None,
+            )
+            if incoming_current is not None:
+                # Avoid a transient violation of the v8 partial unique index
+                # while the newly published current season is upserted.
+                cursor.execute(
+                    """
+                    UPDATE fbref_control.season_registry
+                    SET is_current = false
+                    WHERE source = %s AND competition_id = %s
+                      AND is_current AND season_id <> %s
+                    """,
+                    (source, competition, incoming_current),
+                )
             for entry in seasons:
                 seen_ids.append(entry.season_id)
                 current_count += int(entry.is_current)
@@ -1078,6 +1637,105 @@ class ControlStore:
                 "frontier_scope_closed": cursor.rowcount,
             }
 
+    def upsert_season_alias(
+        self,
+        alias: SeasonAlias,
+        *,
+        snapshot_id: Optional[object] = None,
+    ) -> None:
+        """Map one durable source/legacy token to a canonical season."""
+        source = _text(alias.source, "source")
+        competition = _text(alias.competition_id, "competition_id")
+        alias_value = _text(alias.alias, "alias")
+        season = _text(alias.season_id, "season_id")
+        alias_kind = _text(alias.alias_kind, "alias_kind").lower()
+        if alias_kind not in _SEASON_ALIAS_KINDS:
+            raise ValueError(f"Unsupported season alias kind: {alias_kind}")
+        snapshot = (
+            None
+            if snapshot_id is None
+            else _uuid(snapshot_id, "snapshot_id")
+        )
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO fbref_control.season_alias (
+                    source, competition_id, alias, season_id, alias_kind,
+                    first_snapshot_id, last_snapshot_id, metadata
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s::jsonb
+                )
+                ON CONFLICT (source, competition_id, alias) DO UPDATE SET
+                    alias_kind = EXCLUDED.alias_kind,
+                    last_snapshot_id = COALESCE(
+                        EXCLUDED.last_snapshot_id,
+                        fbref_control.season_alias.last_snapshot_id
+                    ),
+                    metadata = EXCLUDED.metadata,
+                    last_seen_at = clock_timestamp()
+                WHERE fbref_control.season_alias.season_id = EXCLUDED.season_id
+                RETURNING season_id
+                """,
+                (
+                    source,
+                    competition,
+                    alias_value,
+                    season,
+                    alias_kind,
+                    snapshot,
+                    snapshot,
+                    _json(alias.metadata),
+                ),
+            )
+            row = _fetchone(cursor)
+            if row is None or str(row["season_id"]) != season:
+                raise StateConflict(
+                    f"Season alias {competition}/{alias_value} is already "
+                    "mapped to a different season"
+                )
+
+    def resolve_season_alias(
+        self,
+        competition_id: object,
+        alias: object,
+        *,
+        source: str = "fbref",
+    ) -> Optional[dict]:
+        """Resolve an alias only through a currently published male registry."""
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                SELECT mapped.source, mapped.competition_id, mapped.alias,
+                       mapped.alias_kind, mapped.season_id,
+                       season.canonical_url, season.label, season.is_current,
+                       mapped.metadata
+                FROM fbref_control.season_alias AS mapped
+                JOIN fbref_control.season_registry AS season
+                  ON season.source = mapped.source
+                 AND season.competition_id = mapped.competition_id
+                 AND season.season_id = mapped.season_id
+                JOIN fbref_control.competition_registry AS competition
+                  ON competition.source = season.source
+                 AND competition.competition_id = season.competition_id
+                WHERE mapped.source = %s AND mapped.competition_id = %s
+                  AND mapped.alias = %s
+                  AND season.present
+                  AND season.lifecycle_state = 'present'
+                  AND competition.gender = 'male'
+                  AND competition.crawl_state = 'active'
+                  AND competition.present
+                  AND competition.lifecycle_state IN (
+                      'present', 'missing_once'
+                  )
+                """,
+                (
+                    _text(source, "source"),
+                    _text(competition_id, "competition_id"),
+                    _text(alias, "alias"),
+                ),
+            )
+            return _fetchone(cursor)
+
     def list_seasons(
         self,
         *,
@@ -1115,7 +1773,9 @@ class ControlStore:
                   AND season.lifecycle_state = 'present' AND season.present
                   AND competition.gender = 'male'
                   AND competition.crawl_state = 'active'
-                  AND competition.lifecycle_state = 'present'
+                  AND competition.lifecycle_state IN (
+                      'present', 'missing_once'
+                  )
                   AND competition.present
                   AND (%s::boolean IS NULL OR season.is_current = %s)
                   AND (
@@ -1178,9 +1838,13 @@ class ControlStore:
                 WHERE season.source = %s
                   AND season.lifecycle_state = 'present' AND season.present
                   AND NOT season.is_current
+                  AND season.metadata ->> 'direct_match_only'
+                      IS DISTINCT FROM 'true'
                   AND competition.gender = 'male'
                   AND competition.crawl_state = 'active'
-                  AND competition.lifecycle_state = 'present'
+                  AND competition.lifecycle_state IN (
+                      'present', 'missing_once'
+                  )
                   AND competition.present
                   AND (
                       frontier.target_id IS NULL
@@ -1323,6 +1987,350 @@ class ControlStore:
                     target.next_fetch_at,
                 ),
             )
+
+    def record_frontier_provenance(
+        self,
+        provenance: FrontierProvenance,
+    ) -> str:
+        """Append one idempotent, content-addressed discovery edge."""
+        parent = _text(provenance.parent_target_id, "parent_target_id")
+        child = _text(provenance.child_target_id, "child_target_id")
+        if parent == child:
+            raise ValueError("A frontier provenance edge cannot point to itself")
+        relation = _text(provenance.relation, "relation")
+        content_hash = _text(
+            provenance.parent_content_hash, "parent_content_hash"
+        )
+        parser_version = _text(provenance.parser_version, "parser_version")
+        competition = (
+            None
+            if provenance.carried_competition_id is None
+            else _text(
+                provenance.carried_competition_id,
+                "carried_competition_id",
+            )
+        )
+        season = (
+            None
+            if provenance.carried_season_id is None
+            else _text(provenance.carried_season_id, "carried_season_id")
+        )
+        if season is not None and competition is None:
+            raise ValueError("A carried season requires a carried competition")
+        refresh = (
+            None
+            if provenance.logical_refresh_id is None
+            else _uuid(provenance.logical_refresh_id, "logical_refresh_id")
+        )
+        provenance_id = make_frontier_provenance_id(
+            parent_target_id=parent,
+            child_target_id=child,
+            relation=relation,
+            carried_competition_id=competition,
+            carried_season_id=season,
+            parent_content_hash=content_hash,
+            parser_version=parser_version,
+        )
+        expected_metadata = dict(provenance.metadata)
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO fbref_control.frontier_provenance (
+                    provenance_id, parent_target_id, child_target_id,
+                    relation, carried_competition_id, carried_season_id,
+                    parent_content_hash, parser_version,
+                    logical_refresh_id, metadata
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb
+                )
+                ON CONFLICT (
+                    parent_target_id, child_target_id, relation,
+                    carried_competition_id, carried_season_id,
+                    parent_content_hash, parser_version
+                ) DO NOTHING
+                """,
+                (
+                    provenance_id,
+                    parent,
+                    child,
+                    relation,
+                    competition,
+                    season,
+                    content_hash,
+                    parser_version,
+                    refresh,
+                    _json(expected_metadata),
+                ),
+            )
+            cursor.execute(
+                """
+                SELECT provenance_id, carried_competition_id,
+                       carried_season_id, logical_refresh_id, metadata
+                FROM fbref_control.frontier_provenance
+                WHERE parent_target_id = %s AND child_target_id = %s
+                  AND relation = %s
+                  AND carried_competition_id IS NOT DISTINCT FROM %s
+                  AND carried_season_id IS NOT DISTINCT FROM %s
+                  AND parent_content_hash = %s
+                  AND parser_version = %s
+                """,
+                (
+                    parent,
+                    child,
+                    relation,
+                    competition,
+                    season,
+                    content_hash,
+                    parser_version,
+                ),
+            )
+            row = _fetchone(cursor)
+            if row is None:
+                raise ControlStoreError("Frontier provenance insert returned no row")
+            installed_metadata = row.get("metadata") or {}
+            if isinstance(installed_metadata, str):
+                installed_metadata = json.loads(installed_metadata)
+            if (
+                row.get("carried_competition_id") != competition
+                or row.get("carried_season_id") != season
+                or dict(installed_metadata) != expected_metadata
+            ):
+                raise StateConflict(
+                    f"Frontier provenance {parent} -> {child} already has "
+                    "different immutable evidence"
+                )
+            return str(row["provenance_id"])
+
+    def list_frontier_provenance(
+        self,
+        *,
+        parent_target_id: Optional[object] = None,
+        child_target_id: Optional[object] = None,
+        limit: int = 100,
+    ) -> list[dict]:
+        """Query bounded discovery ancestry in deterministic oldest-first order."""
+        normalized_limit = int(limit)
+        if not 1 <= normalized_limit <= 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        parent = (
+            None
+            if parent_target_id is None
+            else _text(parent_target_id, "parent_target_id")
+        )
+        child = (
+            None
+            if child_target_id is None
+            else _text(child_target_id, "child_target_id")
+        )
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                SELECT provenance_id, parent_target_id, child_target_id,
+                       relation, carried_competition_id, carried_season_id,
+                       parent_content_hash, parser_version,
+                       logical_refresh_id, metadata, discovered_at
+                FROM fbref_control.frontier_provenance
+                WHERE (%s::text IS NULL OR parent_target_id = %s)
+                  AND (%s::text IS NULL OR child_target_id = %s)
+                ORDER BY discovered_at, provenance_id
+                LIMIT %s
+                """,
+                (parent, parent, child, child, normalized_limit),
+            )
+            return _fetchall(cursor)
+
+    def list_male_eligible_frontier_targets(
+        self,
+        *,
+        source: str = "fbref",
+        page_kinds: Optional[Sequence[str]] = None,
+        after_target_id: Optional[object] = None,
+        limit: int = 25,
+    ) -> list[dict]:
+        """Return targets whose every carried scope resolves to an active male."""
+        normalized_limit = int(limit)
+        if not 1 <= normalized_limit <= 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        kinds = (
+            None
+            if page_kinds is None
+            else sorted({_text(kind, "page_kind") for kind in page_kinds})
+        )
+        if kinds == []:
+            return []
+        after = (
+            None
+            if after_target_id is None
+            else _text(after_target_id, "after_target_id")
+        )
+        with self._transaction() as cursor:
+            cursor.execute(
+                _FRONTIER_SCOPE_CTE
+                + """
+                SELECT frontier.*, scope.scope_count
+                FROM fbref_control.page_frontier AS frontier
+                JOIN scope_rollup AS scope ON scope.target_id = frontier.target_id
+                WHERE frontier.source = %s
+                  AND frontier.state IN ('queued', 'retry', 'fetched')
+                  AND scope.scope_count > 0
+                  AND NOT COALESCE(scope.competition_missing, true)
+                  AND NOT COALESCE(scope.has_female, false)
+                  AND NOT COALESCE(scope.has_unknown, true)
+                  AND NOT COALESCE(scope.inactive_competition, true)
+                  AND NOT COALESCE(scope.invalid_season, true)
+                  AND (
+                    COALESCE(scope.has_competition_scope, false)
+                    OR COALESCE(scope.has_current_season, false)
+                    OR frontier.refresh_policy = 'historical_once'
+                  )
+                  AND (%s::text[] IS NULL OR frontier.page_kind = ANY(%s))
+                  AND (%s::text IS NULL OR frontier.target_id > %s)
+                ORDER BY frontier.target_id
+                LIMIT %s
+                """,
+                (
+                    _text(source, "source"),
+                    kinds,
+                    kinds,
+                    after,
+                    after,
+                    normalized_limit,
+                ),
+            )
+            return _fetchall(cursor)
+
+    def reconcile_frontier_scope(
+        self,
+        *,
+        source: str = "fbref",
+    ) -> dict[str, int]:
+        """Fail closed on scope and reopen only our own resolved quarantine.
+
+        This reconciliation changes frontier scheduling state only.  Immutable
+        raw fetches, manifests, and Bronze datasets remain available for audit
+        and parser replay.
+        """
+        normalized_source = _text(source, "source")
+        with self._transaction() as cursor:
+            cursor.execute(
+                _FRONTIER_SCOPE_CTE
+                + """
+                , classified AS (
+                    SELECT frontier.target_id,
+                           CASE
+                             WHEN scope.target_id IS NULL
+                               THEN 'unresolved_scope'
+                             WHEN COALESCE(scope.competition_missing, true)
+                               THEN 'missing_competition'
+                             WHEN COALESCE(scope.has_unknown, false)
+                               THEN 'unknown_gender'
+                             WHEN COALESCE(scope.has_female, false)
+                               THEN 'female_gender'
+                             WHEN COALESCE(scope.inactive_competition, true)
+                               THEN 'inactive_competition'
+                             WHEN COALESCE(scope.invalid_season, false)
+                               THEN 'invalid_season'
+                             WHEN NOT (
+                               COALESCE(
+                                 scope.has_competition_scope, false
+                               )
+                               OR COALESCE(scope.has_current_season, false)
+                               OR frontier.refresh_policy = 'historical_once'
+                             ) THEN 'noncurrent_season'
+                             ELSE NULL
+                           END AS reason
+                    FROM fbref_control.page_frontier AS frontier
+                    LEFT JOIN scope_rollup AS scope
+                      ON scope.target_id = frontier.target_id
+                    WHERE frontier.source = %s
+                      AND frontier.page_kind <> 'competition_index'
+                )
+                UPDATE fbref_control.page_frontier AS frontier
+                SET state = 'queued', next_fetch_at = clock_timestamp(),
+                    retry_after = NULL, last_error_class = NULL,
+                    last_error_message = NULL,
+                    updated_at = clock_timestamp()
+                FROM classified
+                WHERE classified.target_id = frontier.target_id
+                  AND classified.reason IS NULL
+                  AND frontier.state = 'quarantined'
+                  AND frontier.last_error_class = 'ScopeQuarantined'
+                RETURNING frontier.target_id
+                """,
+                (normalized_source,),
+            )
+            reopened = len(_fetchall(cursor))
+
+            cursor.execute(
+                _FRONTIER_SCOPE_CTE
+                + """
+                , classified AS (
+                    SELECT frontier.target_id,
+                           CASE
+                             WHEN scope.target_id IS NULL
+                               THEN 'unresolved_scope'
+                             WHEN COALESCE(scope.competition_missing, true)
+                               THEN 'missing_competition'
+                             WHEN COALESCE(scope.has_unknown, false)
+                               THEN 'unknown_gender'
+                             WHEN COALESCE(scope.has_female, false)
+                               THEN 'female_gender'
+                             WHEN COALESCE(scope.inactive_competition, true)
+                               THEN 'inactive_competition'
+                             WHEN COALESCE(scope.invalid_season, false)
+                               THEN 'invalid_season'
+                             WHEN NOT (
+                               COALESCE(
+                                 scope.has_competition_scope, false
+                               )
+                               OR COALESCE(scope.has_current_season, false)
+                               OR frontier.refresh_policy = 'historical_once'
+                             ) THEN 'noncurrent_season'
+                             ELSE NULL
+                           END AS reason
+                    FROM fbref_control.page_frontier AS frontier
+                    LEFT JOIN scope_rollup AS scope
+                      ON scope.target_id = frontier.target_id
+                    WHERE frontier.source = %s
+                      AND frontier.page_kind <> 'competition_index'
+                )
+                UPDATE fbref_control.page_frontier AS frontier
+                SET state = 'quarantined', next_fetch_at = NULL,
+                    retry_after = NULL,
+                    last_error_class = 'ScopeQuarantined',
+                    last_error_message = classified.reason,
+                    updated_at = clock_timestamp()
+                FROM classified
+                WHERE classified.target_id = frontier.target_id
+                  AND classified.reason IS NOT NULL
+                  AND frontier.state NOT IN ('leased', 'dead')
+                  AND (
+                    frontier.state <> 'quarantined'
+                    OR (
+                      frontier.last_error_class = 'ScopeQuarantined'
+                      AND frontier.last_error_message IS DISTINCT FROM
+                          classified.reason
+                    )
+                  )
+                RETURNING classified.reason
+                """,
+                (normalized_source,),
+            )
+            counts: dict[str, int] = {"reopened": reopened, "quarantined": 0}
+            for row in _fetchall(cursor):
+                reason = str(row["reason"])
+                counts[reason] = counts.get(reason, 0) + 1
+                counts["quarantined"] += 1
+            counts["total"] = counts["quarantined"]
+            return counts
+
+    def quarantine_ineligible_frontier_targets(
+        self,
+        *,
+        source: str = "fbref",
+    ) -> dict[str, int]:
+        """Compatibility alias for full frontier scope reconciliation."""
+        return self.reconcile_frontier_scope(source=source)
 
     def create_run_cohort(
         self,
@@ -1493,8 +2501,9 @@ class ControlStore:
             if crawl_run is None or crawl_run["status"] not in {"pending", "running"}:
                 raise StateConflict(f"Run {run} cannot accept a due cohort")
             cursor.execute(
-                """
-                WITH eligible AS MATERIALIZED (
+                _FRONTIER_SCOPE_CTE
+                + """
+                , eligible AS MATERIALIZED (
                   SELECT frontier.target_id, frontier.page_kind,
                          frontier.last_fetched_at, frontier.created_at,
                          frontier.priority, frontier.next_fetch_at,
@@ -1507,6 +2516,8 @@ class ControlStore:
                            ]::text[])
                          ) AS control_lane
                   FROM fbref_control.page_frontier AS frontier
+                  LEFT JOIN scope_rollup AS scope
+                    ON scope.target_id = frontier.target_id
                   WHERE (
                         frontier.state IN ('queued', 'retry')
                         OR (
@@ -1524,35 +2535,19 @@ class ControlStore:
                   AND (%s::text[] IS NULL
                        OR frontier.refresh_policy = ANY(%s::text[]))
                   AND (
-                    NOT (frontier.source_ids ? 'competition_id')
-                    OR EXISTS (
-                      SELECT 1
-                      FROM fbref_control.competition_registry AS competition
-                      WHERE competition.source = frontier.source
-                        AND competition.competition_id =
-                            frontier.source_ids ->> 'competition_id'
-                        AND competition.gender = 'male'
-                        AND competition.crawl_state = 'active'
-                        AND competition.lifecycle_state = 'present'
-                        AND competition.present
-                    )
-                  )
-                  AND (
-                    NOT (frontier.source_ids ? 'season_id')
-                    OR EXISTS (
-                      SELECT 1
-                      FROM fbref_control.season_registry AS season
-                      WHERE season.source = frontier.source
-                        AND season.competition_id =
-                            frontier.source_ids ->> 'competition_id'
-                        AND season.season_id =
-                            frontier.source_ids ->> 'season_id'
-                        AND season.lifecycle_state = 'present'
-                        AND season.present
-                        AND (
-                          season.is_current
-                          OR frontier.refresh_policy = 'historical_once'
-                        )
+                    frontier.page_kind = 'competition_index'
+                    OR (
+                      scope.scope_count > 0
+                      AND NOT COALESCE(scope.competition_missing, true)
+                      AND NOT COALESCE(scope.has_female, false)
+                      AND NOT COALESCE(scope.has_unknown, true)
+                      AND NOT COALESCE(scope.inactive_competition, true)
+                      AND NOT COALESCE(scope.invalid_season, true)
+                      AND (
+                        COALESCE(scope.has_competition_scope, false)
+                        OR COALESCE(scope.has_current_season, false)
+                        OR frontier.refresh_policy = 'historical_once'
+                      )
                     )
                   )
                   AND NOT EXISTS (
@@ -1667,6 +2662,7 @@ class ControlStore:
         parser_version: Optional[object] = None,
         typed_parser_version: Optional[object] = None,
         stateful_parser_version: Optional[object] = None,
+        raw_processing_sla_seconds: int = 86_400,
     ) -> Optional[dict]:
         """Return compact budget/target/attempt/dataset counts for DAG gates.
 
@@ -1699,6 +2695,9 @@ class ControlStore:
             if stateful_parser_version is None
             else _text(stateful_parser_version, "stateful_parser_version")
         )
+        raw_sla = int(raw_processing_sla_seconds)
+        if raw_sla <= 0:
+            raise ValueError("raw_processing_sla_seconds must be positive")
         with self._transaction() as cursor:
             cursor.execute(
                 "SELECT * FROM fbref_control.crawl_run WHERE run_id = %s",
@@ -1721,8 +2720,23 @@ class ControlStore:
             }
             cursor.execute(
                 """
-                SELECT count(*) AS count
+                SELECT
+                    count(*) FILTER (WHERE season.is_current)
+                        AS current_pending_match_count,
+                    count(*) FILTER (
+                        WHERE NOT season.is_current
+                          AND frontier.refresh_policy = 'historical_once'
+                    ) AS historical_pending_match_count
                 FROM fbref_control.page_frontier AS frontier
+                JOIN fbref_control.competition_registry AS competition
+                  ON competition.source = frontier.source
+                 AND competition.competition_id =
+                     frontier.source_ids ->> 'competition_id'
+                JOIN fbref_control.season_registry AS season
+                  ON season.source = frontier.source
+                 AND season.competition_id = competition.competition_id
+                 AND season.season_id =
+                     frontier.source_ids ->> 'season_id'
                 WHERE frontier.source = 'fbref'
                   AND frontier.page_kind = 'match'
                   AND (
@@ -1733,44 +2747,32 @@ class ControlStore:
                       AND frontier.next_fetch_at <= clock_timestamp()
                     )
                   )
-                  AND (
-                    NOT (frontier.source_ids ? 'competition_id')
-                    OR EXISTS (
-                      SELECT 1
-                      FROM fbref_control.competition_registry AS competition
-                      WHERE competition.source = frontier.source
-                        AND competition.competition_id =
-                            frontier.source_ids ->> 'competition_id'
-                        AND competition.gender = 'male'
-                        AND competition.crawl_state = 'active'
-                        AND competition.lifecycle_state = 'present'
-                        AND competition.present
-                    )
+                  AND competition.gender = 'male'
+                  AND competition.crawl_state = 'active'
+                  AND competition.lifecycle_state IN (
+                      'present', 'missing_once'
                   )
-                  AND (
-                    NOT (frontier.source_ids ? 'season_id')
-                    OR EXISTS (
-                      SELECT 1
-                      FROM fbref_control.season_registry AS season
-                      WHERE season.source = frontier.source
-                        AND season.competition_id =
-                            frontier.source_ids ->> 'competition_id'
-                        AND season.season_id =
-                            frontier.source_ids ->> 'season_id'
-                        AND season.lifecycle_state = 'present'
-                        AND season.present
-                        AND (
-                          season.is_current
-                          OR frontier.refresh_policy = 'historical_once'
-                        )
-                    )
-                  )
+                  AND competition.present
+                  AND season.lifecycle_state = 'present'
+                  AND season.present
                 """
             )
             pending_matches = _fetchone(cursor)
-            summary["promotion_pending_match_count"] = int(
-                0 if pending_matches is None else pending_matches["count"]
+            current_pending = int(
+                0
+                if pending_matches is None
+                else pending_matches.get("current_pending_match_count") or 0
             )
+            historical_pending = int(
+                0
+                if pending_matches is None
+                else pending_matches.get("historical_pending_match_count") or 0
+            )
+            # Compatibility key consumed by the existing hard gate.  It now
+            # deliberately describes only the current registry snapshot.
+            summary["promotion_pending_match_count"] = current_pending
+            summary["current_pending_match_count"] = current_pending
+            summary["historical_pending_match_count"] = historical_pending
             cursor.execute(
                 """
                 SELECT status, count(*) AS count
@@ -2134,6 +3136,365 @@ class ControlStore:
             summary["competition_coverage"] = _fetchall(cursor)
             cursor.execute(
                 """
+                SELECT gender, count(*) AS count
+                FROM fbref_control.competition_registry
+                WHERE source = 'fbref'
+                  AND lifecycle_state <> 'disappeared'
+                GROUP BY gender
+                ORDER BY gender
+                """
+            )
+            registry_gender_counts = {
+                "male": 0,
+                "female": 0,
+                "unknown": 0,
+            }
+            for row in _fetchall(cursor):
+                registry_gender_counts[str(row["gender"])] = int(
+                    row["count"] or 0
+                )
+            summary["registry_gender_counts"] = registry_gender_counts
+            summary["unknown_gender_registry_count"] = (
+                registry_gender_counts["unknown"]
+            )
+            cursor.execute(
+                """
+                SELECT page_kind, state, count(*) AS count,
+                       count(*) FILTER (
+                           WHERE state IN ('queued', 'retry')
+                              OR (
+                                  state = 'fetched'
+                                  AND next_fetch_at IS NOT NULL
+                                  AND next_fetch_at <= clock_timestamp()
+                              )
+                       ) AS due_count,
+                       min(
+                           CASE
+                             WHEN state = 'retry' THEN retry_after
+                             WHEN state = 'fetched' THEN next_fetch_at
+                             WHEN state = 'queued' THEN created_at
+                             ELSE NULL
+                           END
+                       ) AS oldest_due_at
+                FROM fbref_control.page_frontier
+                WHERE source = 'fbref'
+                GROUP BY page_kind, state
+                ORDER BY page_kind, state
+                """
+            )
+            frontier_sla: dict[str, dict[str, Any]] = {}
+            for row in _fetchall(cursor):
+                kind = str(row["page_kind"])
+                bucket = frontier_sla.setdefault(
+                    kind,
+                    {
+                        "states": {},
+                        "total": 0,
+                        "due": 0,
+                        "oldest_due_at": None,
+                    },
+                )
+                count = int(row["count"] or 0)
+                due = int(row["due_count"] or 0)
+                bucket["states"][str(row["state"])] = count
+                bucket["total"] += count
+                bucket["due"] += due
+                observed_oldest = row.get("oldest_due_at")
+                if observed_oldest is not None and (
+                    bucket["oldest_due_at"] is None
+                    or observed_oldest < bucket["oldest_due_at"]
+                ):
+                    bucket["oldest_due_at"] = observed_oldest
+            summary["frontier_sla_by_page_kind"] = frontier_sla
+
+            cursor.execute(
+                _FRONTIER_SCOPE_CTE
+                + f"""
+                , sla(page_kind, sla_seconds) AS (
+                    VALUES {_PAGE_KIND_SLA_VALUES}
+                ), current_scope AS (
+                    SELECT frontier.page_kind, frontier.state,
+                           frontier.refresh_policy, frontier.created_at,
+                           frontier.last_fetched_at, sla.sla_seconds
+                    FROM fbref_control.page_frontier AS frontier
+                    JOIN sla ON sla.page_kind = frontier.page_kind
+                    LEFT JOIN scope_rollup AS scope
+                      ON scope.target_id = frontier.target_id
+                    WHERE frontier.source = 'fbref'
+                      AND (
+                        frontier.page_kind = 'competition_index'
+                        OR (
+                          scope.scope_count > 0
+                          AND NOT COALESCE(
+                              scope.competition_missing, true
+                          )
+                          AND NOT COALESCE(scope.has_female, false)
+                          AND NOT COALESCE(scope.has_unknown, true)
+                          AND NOT COALESCE(
+                              scope.inactive_competition, true
+                          )
+                          AND NOT COALESCE(scope.invalid_season, true)
+                          AND (
+                            frontier.page_kind = 'competition'
+                            OR COALESCE(scope.has_current_season, false)
+                          )
+                        )
+                      )
+                ), evaluated_scope AS (
+                    SELECT current_scope.*,
+                           CASE
+                             WHEN page_kind = 'match'
+                              AND refresh_policy = 'current_completed_once'
+                             THEN (
+                               (
+                                 state = 'fetched'
+                                 AND last_fetched_at IS NOT NULL
+                               )
+                               OR (
+                                 state IN ('queued', 'retry', 'leased')
+                                 AND COALESCE(
+                                   last_fetched_at, created_at
+                                 ) >= clock_timestamp()
+                                   - (sla_seconds * interval '1 second')
+                               )
+                             )
+                             ELSE last_fetched_at IS NOT NULL
+                               AND last_fetched_at >= clock_timestamp()
+                                 - (sla_seconds * interval '1 second')
+                           END AS within_sla
+                    FROM current_scope
+                )
+                SELECT page_kind, max(sla_seconds) AS sla_seconds,
+                       count(*) AS total_targets,
+                       count(*) FILTER (
+                           WHERE last_fetched_at IS NULL
+                       ) AS never_fetched_targets,
+                       count(*) FILTER (WHERE NOT within_sla)
+                           AS stale_targets,
+                       count(*) FILTER (WHERE within_sla)
+                           AS fresh_targets,
+                       min(last_fetched_at) AS oldest_last_fetched_at
+                FROM evaluated_scope
+                GROUP BY page_kind
+                ORDER BY page_kind
+                """
+            )
+            freshness_by_kind = {
+                str(row["page_kind"]): {
+                    "sla_seconds": int(row["sla_seconds"]),
+                    "total_targets": int(row["total_targets"] or 0),
+                    "fresh_targets": int(row["fresh_targets"] or 0),
+                    "stale_targets": int(row["stale_targets"] or 0),
+                    "never_fetched_targets": int(
+                        row["never_fetched_targets"] or 0
+                    ),
+                    "oldest_last_fetched_at": row.get(
+                        "oldest_last_fetched_at"
+                    ),
+                }
+                for row in _fetchall(cursor)
+            }
+            summary["freshness_by_page_kind"] = freshness_by_kind
+            freshness_totals = {
+                "total_targets": sum(
+                    row["total_targets"]
+                    for row in freshness_by_kind.values()
+                ),
+                "fresh_targets": sum(
+                    row["fresh_targets"]
+                    for row in freshness_by_kind.values()
+                ),
+                "stale_targets": sum(
+                    row["stale_targets"]
+                    for row in freshness_by_kind.values()
+                ),
+                "never_fetched_targets": sum(
+                    row["never_fetched_targets"]
+                    for row in freshness_by_kind.values()
+                ),
+            }
+            freshness_totals["all_within_sla"] = (
+                freshness_totals["stale_targets"] == 0
+            )
+            summary["current_scope_freshness"] = freshness_totals
+
+            cursor.execute(
+                """
+                SELECT frontier.page_kind,
+                       count(*) FILTER (
+                           WHERE attempt.run_id = %s
+                       ) AS run_count,
+                       count(*) AS global_count,
+                       count(*) FILTER (
+                           WHERE COALESCE(
+                               attempt.finished_at, attempt.started_at
+                           ) < clock_timestamp()
+                               - (%s * interval '1 second')
+                       ) AS global_sla_overdue_count,
+                       min(COALESCE(
+                           attempt.finished_at, attempt.started_at
+                       )) FILTER (
+                           WHERE attempt.run_id = %s
+                       ) AS run_oldest_raw_at,
+                       min(COALESCE(
+                           attempt.finished_at, attempt.started_at
+                       )) AS global_oldest_raw_at
+                FROM fbref_control.fetch_attempt AS attempt
+                JOIN fbref_control.page_frontier AS frontier
+                  ON frontier.target_id = attempt.target_id
+                WHERE attempt.status = 'succeeded'
+                  AND attempt.raw_manifest_key IS NOT NULL
+                  AND attempt.content_hash IS NOT NULL
+                  AND (
+                    (
+                      %s::text IS NULL
+                      AND NOT EXISTS (
+                        SELECT 1
+                        FROM fbref_control.dataset_manifest AS manifest
+                        WHERE manifest.target_id = attempt.target_id
+                          AND manifest.content_hash = attempt.content_hash
+                          AND manifest.dataset = '__page__'
+                          AND manifest.parse_status = 'succeeded'
+                          AND manifest.persistence_status = 'succeeded'
+                          AND manifest.validation_status = 'succeeded'
+                      )
+                    )
+                    OR (
+                      %s::text IS NOT NULL
+                      AND NOT EXISTS (
+                        SELECT 1
+                        FROM fbref_control.observation_processing AS observed
+                        WHERE observed.logical_refresh_id =
+                              attempt.logical_refresh_id
+                          AND observed.parser_version = %s
+                          AND observed.typed_parser_version = %s
+                          AND observed.stateful_parser_version = %s
+                          AND observed.status = 'succeeded'
+                          AND observed.generic_status = 'succeeded'
+                          AND observed.typed_status IN (
+                              'succeeded', 'skipped'
+                          )
+                          AND observed.stateful_status IN (
+                              'succeeded', 'skipped'
+                          )
+                          AND observed.validation_status = 'succeeded'
+                      )
+                    )
+                  )
+                GROUP BY frontier.page_kind
+                ORDER BY frontier.page_kind
+                """,
+                (
+                    run,
+                    raw_sla,
+                    run,
+                    parser,
+                    parser,
+                    parser,
+                    typed_parser,
+                    stateful_parser,
+                ),
+            )
+            raw_rows = _fetchall(cursor)
+            run_raw_by_kind = {
+                str(row["page_kind"]): {
+                    "count": int(row["run_count"] or 0),
+                    "oldest_raw_at": row.get("run_oldest_raw_at"),
+                }
+                for row in raw_rows
+                if int(row["run_count"] or 0) > 0
+            }
+            global_raw_by_kind = {
+                str(row["page_kind"]): {
+                    "count": int(row["global_count"] or 0),
+                    "sla_overdue_count": int(
+                        row["global_sla_overdue_count"] or 0
+                    ),
+                    "oldest_raw_at": row.get("global_oldest_raw_at"),
+                }
+                for row in raw_rows
+            }
+            summary["unprocessed_raw_by_page_kind"] = run_raw_by_kind
+            summary["unprocessed_raw_count"] = sum(
+                row["count"] for row in run_raw_by_kind.values()
+            )
+            summary["global_unprocessed_raw_by_page_kind"] = (
+                global_raw_by_kind
+            )
+            summary["global_unprocessed_raw_count"] = sum(
+                row["count"] for row in global_raw_by_kind.values()
+            )
+            global_sla_overdue = sum(
+                row["sla_overdue_count"]
+                for row in global_raw_by_kind.values()
+            )
+            summary["global_unprocessed_raw_sla_overdue_count"] = (
+                global_sla_overdue
+            )
+            # Compatibility for operational dashboards created before the
+            # run/global split. Validation uses the explicit global key above.
+            summary["unprocessed_raw_sla_overdue_count"] = global_sla_overdue
+            summary["raw_processing_sla_seconds"] = raw_sla
+
+            cursor.execute(
+                _FRONTIER_SCOPE_CTE
+                + """
+                SELECT
+                    CASE
+                      WHEN scope.target_id IS NULL THEN 'unresolved_scope'
+                      WHEN COALESCE(scope.competition_missing, true)
+                        THEN 'missing_competition'
+                      WHEN COALESCE(scope.has_unknown, false)
+                        THEN 'unknown_gender'
+                      WHEN COALESCE(scope.has_female, false)
+                        THEN 'female_gender'
+                      WHEN COALESCE(scope.inactive_competition, true)
+                        THEN 'inactive_competition'
+                      WHEN COALESCE(scope.invalid_season, false)
+                        THEN 'invalid_season'
+                      WHEN NOT (
+                        COALESCE(scope.has_competition_scope, false)
+                        OR COALESCE(scope.has_current_season, false)
+                        OR frontier.refresh_policy = 'historical_once'
+                      ) THEN 'noncurrent_season'
+                      ELSE 'eligible_male'
+                    END AS scope_status,
+                    frontier.state NOT IN (
+                      'skipped', 'quarantined', 'dead'
+                    ) AS crawlable,
+                    count(*) AS count
+                FROM fbref_control.page_frontier AS frontier
+                LEFT JOIN scope_rollup AS scope
+                  ON scope.target_id = frontier.target_id
+                WHERE frontier.source = 'fbref'
+                  AND frontier.page_kind <> 'competition_index'
+                GROUP BY scope_status, crawlable
+                ORDER BY scope_status, crawlable
+                """
+            )
+            scope_rows = _fetchall(cursor)
+            scope_counts: dict[str, int] = {}
+            crawlable_scope_counts: dict[str, int] = {}
+            noncrawlable_scope_counts: dict[str, int] = {}
+            for row in scope_rows:
+                status = str(row["scope_status"])
+                count = int(row["count"] or 0)
+                scope_counts[status] = scope_counts.get(status, 0) + count
+                target = (
+                    crawlable_scope_counts
+                    if row["crawlable"]
+                    else noncrawlable_scope_counts
+                )
+                target[status] = target.get(status, 0) + count
+            summary["frontier_scope_counts"] = scope_counts
+            summary["crawlable_frontier_scope_counts"] = (
+                crawlable_scope_counts
+            )
+            summary["noncrawlable_frontier_scope_counts"] = (
+                noncrawlable_scope_counts
+            )
+            cursor.execute(
+                """
                 SELECT manifest.availability, count(*) AS count
                 FROM fbref_control.dataset_manifest AS manifest
                 JOIN fbref_control.fetch_attempt AS attempt
@@ -2213,6 +3574,92 @@ class ControlStore:
                 else dict(snapshot.get("metadata") or {}).get("sentinels", {})
             )
             return summary
+
+    def list_unprocessed_fetches(
+        self,
+        *,
+        parser_version: object,
+        typed_parser_version: object,
+        stateful_parser_version: object,
+        source: str = "fbref",
+        page_kinds: Optional[Sequence[str]] = None,
+        limit: int = 25,
+    ) -> list[dict]:
+        """Return global raw observations missing the exact successful parse.
+
+        Selection is intentionally independent of the source crawl-run status:
+        a successful immutable raw commit remains recoverable when a later task
+        made its parent run fail or get cancelled.  Oldest raw is drained first
+        so repeated bounded calls cannot starve earlier observations.
+        """
+        parser = _text(parser_version, "parser_version")
+        typed_parser = _text(typed_parser_version, "typed_parser_version")
+        stateful_parser = _text(
+            stateful_parser_version, "stateful_parser_version"
+        )
+        normalized_limit = int(limit)
+        if not 1 <= normalized_limit <= 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        kinds = (
+            None
+            if page_kinds is None
+            else sorted({_text(kind, "page_kind") for kind in page_kinds})
+        )
+        if kinds == []:
+            return []
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                SELECT attempt.attempt_id, attempt.run_id,
+                       source_run.status AS source_run_status,
+                       source_run.run_type AS source_run_type,
+                       attempt.target_id, attempt.logical_refresh_id,
+                       attempt.content_hash, attempt.raw_manifest_key,
+                       attempt.http_status, attempt.started_at,
+                       attempt.finished_at, frontier.page_kind,
+                       frontier.canonical_url, frontier.source_ids
+                FROM fbref_control.fetch_attempt AS attempt
+                JOIN fbref_control.crawl_run AS source_run
+                  ON source_run.run_id = attempt.run_id
+                JOIN fbref_control.page_frontier AS frontier
+                  ON frontier.target_id = attempt.target_id
+                WHERE frontier.source = %s
+                  AND attempt.status = 'succeeded'
+                  AND attempt.raw_manifest_key IS NOT NULL
+                  AND attempt.content_hash IS NOT NULL
+                  AND (%s::text[] IS NULL OR frontier.page_kind = ANY(%s))
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM fbref_control.observation_processing AS observed
+                    WHERE observed.logical_refresh_id =
+                          attempt.logical_refresh_id
+                      AND observed.parser_version = %s
+                      AND observed.typed_parser_version = %s
+                      AND observed.stateful_parser_version = %s
+                      AND observed.status = 'succeeded'
+                      AND observed.generic_status = 'succeeded'
+                      AND observed.typed_status IN ('succeeded', 'skipped')
+                      AND observed.stateful_status IN (
+                          'succeeded', 'skipped'
+                      )
+                      AND observed.validation_status = 'succeeded'
+                  )
+                ORDER BY COALESCE(
+                    attempt.finished_at, attempt.started_at
+                ), attempt.attempt_id
+                LIMIT %s
+                """,
+                (
+                    _text(source, "source"),
+                    kinds,
+                    kinds,
+                    parser,
+                    typed_parser,
+                    stateful_parser,
+                    normalized_limit,
+                ),
+            )
+            return _fetchall(cursor)
 
     def get_frontier_target(self, target_id: object) -> Optional[dict]:
         """Return fetch validators and latest content for conditional requests."""
@@ -3042,7 +4489,8 @@ class ControlStore:
                 run_rows_locked=True,
             )
             cursor.execute(
-                """
+                _FRONTIER_SCOPE_CTE
+                + """
                 SELECT target.target_id, target.logical_refresh_id,
                        frontier.canonical_url, frontier.page_kind,
                        frontier.source_ids, frontier.lease_epoch
@@ -3051,6 +4499,8 @@ class ControlStore:
                   ON run.run_id = target.run_id
                 JOIN fbref_control.page_frontier AS frontier
                   ON frontier.target_id = target.target_id
+                LEFT JOIN scope_rollup AS scope
+                  ON scope.target_id = frontier.target_id
                 WHERE target.run_id = %s AND run.status = 'running'
                   AND target.status IN ('pending', 'retry')
                   AND frontier.state IN ('queued', 'retry')
@@ -3059,35 +4509,19 @@ class ControlStore:
                   AND (%s::text[] IS NULL
                        OR frontier.refresh_policy = ANY(%s::text[]))
                   AND (
-                    NOT (frontier.source_ids ? 'competition_id')
-                    OR EXISTS (
-                      SELECT 1
-                      FROM fbref_control.competition_registry AS competition
-                      WHERE competition.source = frontier.source
-                        AND competition.competition_id =
-                            frontier.source_ids ->> 'competition_id'
-                        AND competition.gender = 'male'
-                        AND competition.crawl_state = 'active'
-                        AND competition.lifecycle_state = 'present'
-                        AND competition.present
-                    )
-                  )
-                  AND (
-                    NOT (frontier.source_ids ? 'season_id')
-                    OR EXISTS (
-                      SELECT 1
-                      FROM fbref_control.season_registry AS season
-                      WHERE season.source = frontier.source
-                        AND season.competition_id =
-                            frontier.source_ids ->> 'competition_id'
-                        AND season.season_id =
-                            frontier.source_ids ->> 'season_id'
-                        AND season.lifecycle_state = 'present'
-                        AND season.present
-                        AND (
-                          season.is_current
-                          OR frontier.refresh_policy = 'historical_once'
-                        )
+                    frontier.page_kind = 'competition_index'
+                    OR (
+                      scope.scope_count > 0
+                      AND NOT COALESCE(scope.competition_missing, true)
+                      AND NOT COALESCE(scope.has_female, false)
+                      AND NOT COALESCE(scope.has_unknown, true)
+                      AND NOT COALESCE(scope.inactive_competition, true)
+                      AND NOT COALESCE(scope.invalid_season, true)
+                      AND (
+                        COALESCE(scope.has_competition_scope, false)
+                        OR COALESCE(scope.has_current_season, false)
+                        OR frontier.refresh_policy = 'historical_once'
+                      )
                     )
                   )
                   AND (frontier.next_fetch_at IS NULL
@@ -3507,6 +4941,82 @@ class ControlStore:
         """Compatibility name used by orchestration for successful completion."""
         self.complete_fetch(lease, **evidence)
 
+    def requeue_unfetched_targets(self, leases: Sequence[TargetLease]) -> int:
+        """Return still-leased targets to the queue, untouched by this run.
+
+        Used when the run stops at its budget: these targets were never fetched,
+        so they carry no source-failure evidence, must not back off, and must
+        stay claimable by the next run.  Their claimed attempt is nevertheless
+        closed as ``cancelled`` so no terminal run leaks an active attempt.
+        """
+        requeued = 0
+        with self._transaction() as cursor:
+            for lease in leases:
+                cursor.execute(
+                    """
+                    UPDATE fbref_control.page_frontier
+                    SET state = 'queued', claim_token = NULL,
+                        lease_run_id = NULL, lease_refresh_id = NULL,
+                        leased_by = NULL, lease_expires_at = NULL,
+                        updated_at = clock_timestamp()
+                    WHERE target_id = %s AND state = 'leased'
+                      AND claim_token = %s AND lease_epoch = %s
+                      AND lease_run_id = %s AND lease_refresh_id = %s
+                    RETURNING target_id
+                    """,
+                    (
+                        lease.target_id,
+                        lease.claim_token,
+                        lease.lease_epoch,
+                        lease.run_id,
+                        lease.logical_refresh_id,
+                    ),
+                )
+                if _fetchone(cursor) is None:
+                    continue
+                cursor.execute(
+                    """
+                    UPDATE fbref_control.run_target
+                    SET status = 'skipped', updated_at = clock_timestamp()
+                    WHERE run_id = %s AND target_id = %s
+                      AND logical_refresh_id = %s AND status = 'leased'
+                    """,
+                    (lease.run_id, lease.target_id, lease.logical_refresh_id),
+                )
+                if cursor.rowcount != 1:
+                    raise LeaseLost(
+                        f"Run target lease lost for {lease.target_id}"
+                    )
+                cursor.execute(
+                    """
+                    UPDATE fbref_control.fetch_attempt
+                    SET status = 'cancelled',
+                        error_class = 'UnfetchedRequeue',
+                        error_message =
+                            'Target returned before network activity',
+                        heartbeat_at = clock_timestamp(),
+                        finished_at = clock_timestamp()
+                    WHERE attempt_id = %s AND status = 'claimed'
+                      AND claim_token = %s AND lease_epoch = %s
+                      AND run_id = %s AND target_id = %s
+                      AND logical_refresh_id = %s
+                    """,
+                    (
+                        lease.attempt_id,
+                        lease.claim_token,
+                        lease.lease_epoch,
+                        lease.run_id,
+                        lease.target_id,
+                        lease.logical_refresh_id,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise LeaseLost(
+                        f"Attempt lease lost for {lease.target_id}"
+                    )
+                requeued += 1
+        return requeued
+
     def fail_fetch(
         self,
         lease: TargetLease,
@@ -3515,6 +5025,7 @@ class ControlStore:
         error_message: object,
         retry_delay_seconds: int = 60,
         permanent: bool = False,
+        requeue: bool = False,
         http_status: Optional[int] = None,
         wire_bytes: int = 0,
         provider_billed_bytes: Optional[int] = None,
@@ -3555,8 +5066,16 @@ class ControlStore:
             if session_version is None
             else _text(session_version, "session_version")
         )
-        frontier_state = "dead" if permanent else "retry"
-        target_state = "failed" if permanent else "retry"
+        if requeue:
+            # The attempt is real evidence and is recorded, but the page itself
+            # was never judged — the failure was ours (a clearance the source
+            # stopped honouring). It must stay immediately claimable, and this
+            # run must not count it as an unfinished target.
+            frontier_state, target_state = "queued", "skipped"
+        elif permanent:
+            frontier_state, target_state = "dead", "failed"
+        else:
+            frontier_state, target_state = "retry", "retry"
         normalized_class = _text(error_class, "error_class")
         normalized_message = _text(error_message, "error_message")[:4000]
         with self._transaction() as cursor:
@@ -3579,7 +5098,7 @@ class ControlStore:
                 """,
                 (
                     frontier_state,
-                    permanent,
+                    permanent or requeue,
                     retry_delay,
                     http_status,
                     normalized_class,
@@ -3716,7 +5235,12 @@ class ControlStore:
                     existing["manifest_key"],
                 )
                 if requested != installed:
-                    raise StateConflict("A completed dataset manifest is immutable")
+                    raise StateConflict(
+                        "A completed dataset manifest is immutable: "
+                        f"{identity[3]} of {identity[0]} "
+                        f"({identity[2]}) installed={installed!r} "
+                        f"requested={requested!r}"
+                    )
                 return
             cursor.execute(
                 """

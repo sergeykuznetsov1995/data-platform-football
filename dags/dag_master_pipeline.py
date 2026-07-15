@@ -3,19 +3,20 @@ Master Pipeline DAG
 ===================
 
 Airflow DAG for orchestrating all data ingestion DAGs.
-Uses TriggerDagRunOperator for child DAGs and a fail-closed sensor for the
-independently scheduled 06:00 FBref run.
+Uses TriggerDagRunOperator for trigger-owned child DAGs and fail-closed sensors
+for the independently scheduled 06:00 FBref and 10:00 WhoScored runs.
 
 Schedules daily at 2 PM UTC and is the sole schedule owner for trigger-only
 sources such as FotMob.
 
 This DAG:
 1. Triggers non-FBref ingestion DAGs in sequence
-2. Waits for each plus the scheduled FBref chain to complete before proceeding
-3. Validates overall pipeline success
-4. Logs completion summary
+2. Waits for each plus the scheduled FBref source/Silver run to complete
+3. Publishes xref, E3/E4, and Gold through a separate fail-closed path
+4. Validates overall pipeline success and logs a summary
 """
 
+import logging
 from datetime import datetime, timedelta
 from typing import Any, Dict
 
@@ -30,21 +31,23 @@ from utils.default_args import DEFAULT_ARGS
 from utils import transfermarkt_native_v2 as tm_v2
 
 
+logger = logging.getLogger(__name__)
+
+
 # Bronze DAGs actively triggered by this master run.
 TRIGGERED_INGESTION_DAGS = [
     'dag_ingest_fotmob',
     'dag_ingest_matchhistory',
     'dag_ingest_understat',
-    'dag_ingest_whoscored',
     'dag_ingest_sofascore',
     'dag_ingest_espn',
     'dag_ingest_clubelo',
 ]
 
-# FBref owns its 06:00 schedule and its daily request/byte budget.  Master only
-# waits for that run; triggering it again at 14:00 would create a second
-# control run and could double paid proxy traffic.
-SCHEDULED_INGESTION_DAGS = ['dag_ingest_fbref']
+# FBref and WhoScored own their 06:00/10:00 schedules and request/byte budgets.
+# Master only waits for those exact runs; triggering them again at 14:00 would
+# create duplicate crawls and traffic accounting generations.
+SCHEDULED_INGESTION_DAGS = ['dag_ingest_fbref', 'dag_ingest_whoscored']
 
 # Complete reporting scope (both master-triggered and externally scheduled).
 INGESTION_DAGS = [*TRIGGERED_INGESTION_DAGS, *SCHEDULED_INGESTION_DAGS]
@@ -55,16 +58,18 @@ INGESTION_DAGS = [*TRIGGERED_INGESTION_DAGS, *SCHEDULED_INGESTION_DAGS]
 # downstream from a failed or partial required source would mix generations.
 REQUIRED_SOURCE_TASKS = {
     'dag_ingest_fotmob': 'ingestion_triggers.trigger_fotmob',
-    'dag_ingest_whoscored': 'ingestion_triggers.trigger_whoscored',
+    'dag_ingest_whoscored': 'wait_for_scheduled_whoscored',
 }
 
 # Publication evidence whose failure must make the current master DagRun fail.
-# The scheduled FBref chain (Bronze -> Silver -> xref, sensed fail-closed) and
-# the E3 -> Gold path form the published generation; accepting a failed child
+# The scheduled FBref chain (Bronze -> FBref Silver, sensed fail-closed) and the
+# separately triggered xref -> E3 -> Gold path form the published generation;
+# accepting a failed child
 # as a successful trigger would publish a mixed generation and let the
 # terminal report turn green despite failed DQ.
 REQUIRED_PUBLICATION_TASKS = {
     'dag_ingest_fbref': 'wait_for_scheduled_fbref',
+    'dag_transform_xref': 'trigger_xref_transforms',
     'dag_transform_e3': 'trigger_e3_transforms',
     'dag_transform_fbref_gold': 'trigger_fbref_gold',
 }
@@ -73,8 +78,146 @@ REQUIRED_PUBLICATION_TASKS = {
 MASTER_ARGS = {
     **DEFAULT_ARGS,
     'execution_timeout': timedelta(hours=12),  # Long timeout for full pipeline
-    'retries': 1,
+    # Retrying a blocking child trigger can reset or duplicate publication.
+    # One bounded attempt keeps the critical path and side effects explicit.
+    'retries': 0,
 }
+
+MASTER_SOURCE_CHAIN_HOURS = len(TRIGGERED_INGESTION_DAGS) * 12
+MASTER_PUBLICATION_CHAIN_HOURS = 12 + 5 + 12 + 12 + 12 + 12
+MASTER_CONTROL_TASK_HOURS = 2
+MASTER_TIMEOUT_SLACK_HOURS = 12
+MASTER_CRITICAL_PATH_HOURS = (
+    MASTER_SOURCE_CHAIN_HOURS
+    + MASTER_PUBLICATION_CHAIN_HOURS
+    + MASTER_CONTROL_TASK_HOURS
+)
+MASTER_DAGRUN_TIMEOUT_HOURS = (
+    MASTER_CRITICAL_PATH_HOURS + MASTER_TIMEOUT_SLACK_HOURS
+)
+
+
+def resolve_scheduled_fbref_control_run(**context) -> str:
+    """Pin downstream publication to the exact sensed 06:00 source run."""
+
+    from airflow.exceptions import AirflowException
+    from scrapers.fbref.control import ControlStore, make_control_run_id
+
+    logical_date = context.get('logical_date')
+    if logical_date is None:
+        dag_run = context.get('dag_run')
+        logical_date = getattr(dag_run, 'logical_date', None)
+    if logical_date is None:
+        raise AirflowException('master run has no logical_date')
+    source_logical_date = logical_date - timedelta(hours=8)
+    source_airflow_run_id = f"scheduled__{source_logical_date.isoformat()}"
+    control_run_id = make_control_run_id(
+        source_airflow_run_id, dag_id='dag_ingest_fbref'
+    )
+    control = ControlStore.from_env()
+    source_run = control.get_run(control_run_id)
+    if source_run is None:
+        raise AirflowException(
+            f'FBref control run not found for {source_airflow_run_id}'
+        )
+    if str(source_run.get('run_type') or '').casefold() != 'current':
+        raise AirflowException('scheduled FBref control run is not current')
+    if str(source_run.get('status') or '').casefold() != 'succeeded':
+        raise AirflowException('scheduled FBref control run is not succeeded')
+    publication_lock = control.get_publication_lock(source='fbref')
+    if (
+        publication_lock is None
+        or not bool(publication_lock.get('active'))
+        or str(publication_lock.get('owner_run_id')) != str(control_run_id)
+    ):
+        raise AirflowException(
+            'scheduled FBref publication generation is not exclusively locked'
+        )
+    from utils.fbref_pipeline_tasks import (
+        FBREF_PUBLICATION_LOCK_TTL_SECONDS,
+    )
+
+    control.renew_publication_lock(
+        control_run_id,
+        source='fbref',
+        ttl_seconds=FBREF_PUBLICATION_LOCK_TTL_SECONDS,
+    )
+    return str(control_run_id)
+
+
+def release_scheduled_fbref_publication_lock(**context) -> dict:
+    """Release only after the exact scheduled source sensor succeeded."""
+
+    from scrapers.fbref.control import make_control_run_id
+    from utils.fbref_pipeline_tasks import release_fbref_publication_lock
+
+    dag_run = context.get('dag_run')
+    instances = (
+        dag_run.get_task_instances() if dag_run is not None else []
+    )
+    states = {
+        str(getattr(instance, 'task_id', '')): str(
+            getattr(instance, 'state', '') or ''
+        ).casefold()
+        for instance in instances
+    }
+    sensor_state = states.get('wait_for_scheduled_fbref', 'missing')
+    report_state = states.get('generate_pipeline_report', 'missing')
+    if sensor_state != 'success' or report_state != 'success':
+        from airflow.exceptions import AirflowException
+
+        publication_task_ids = {
+            'trigger_xref_transforms',
+            'trigger_e3_transforms',
+            'trigger_e4_transforms',
+            'trigger_silver_transfermarkt',
+            'trigger_silver_capology',
+            'trigger_silver_sofifa',
+            'trigger_fbref_gold',
+        }
+        publication_states = {
+            task_id: states.get(task_id, 'missing')
+            for task_id in publication_task_ids
+        }
+        safely_terminal = (
+            sensor_state == 'success'
+            and set(publication_states.values())
+            <= {'success', 'skipped', 'upstream_failed'}
+        )
+        if safely_terminal:
+            logical_date = context.get('logical_date')
+            if logical_date is None and dag_run is not None:
+                logical_date = getattr(dag_run, 'logical_date', None)
+            if logical_date is None:
+                raise ValueError('master cleanup has no logical_date')
+            source_logical_date = logical_date - timedelta(hours=8)
+            source_airflow_run_id = (
+                f"scheduled__{source_logical_date.isoformat()}"
+            )
+            control_run_id = make_control_run_id(
+                source_airflow_run_id, dag_id='dag_ingest_fbref'
+            )
+            release_fbref_publication_lock(
+                control_run_id=control_run_id
+            )
+        raise AirflowException(
+            'FBref master publication did not succeed; '
+            + ('lock released after terminal tasks' if safely_terminal else
+               'lock retained because child state is ambiguous')
+            + f' (sensor={sensor_state}, report={report_state}, '
+            f'publication={publication_states})'
+        )
+    logical_date = context.get('logical_date')
+    if logical_date is None and dag_run is not None:
+        logical_date = getattr(dag_run, 'logical_date', None)
+    if logical_date is None:
+        raise ValueError('master cleanup has no logical_date')
+    source_logical_date = logical_date - timedelta(hours=8)
+    source_airflow_run_id = f"scheduled__{source_logical_date.isoformat()}"
+    control_run_id = make_control_run_id(
+        source_airflow_run_id, dag_id='dag_ingest_fbref'
+    )
+    return release_fbref_publication_lock(control_run_id=control_run_id)
 
 
 def enforce_required_source_success(**context) -> Dict[str, str]:
@@ -82,9 +225,9 @@ def enforce_required_source_success(**context) -> Dict[str, str]:
 
     The check deliberately reads task instances from *this* master DagRun.
     Looking up the latest child DagRun is racy because a separately scheduled
-    child run can finish while the master is still executing. The
-    TriggerDagRunOperator is configured to fail when its WhoScored child fails,
-    so its task-instance state is the exact publication evidence we need.
+    child run can finish while the master is still executing. Trigger-owned
+    sources and the exact-date WhoScored sensor both expose their publication
+    evidence as task-instance state in this master DagRun.
     """
     from airflow.exceptions import AirflowException
 
@@ -333,6 +476,9 @@ with DAG(
     catchup=False,
     tags=DAG_TAGS.get('master', ['orchestration', 'master', 'pipeline']),
     max_active_runs=1,
+    # Computed from seven sequential 12h source triggers, then the bounded
+    # sensor/xref/E3/E4/aux/Gold path, control tasks, and 12h scheduler slack.
+    dagrun_timeout=timedelta(hours=MASTER_DAGRUN_TIMEOUT_HOURS),
     doc_md="""
     ## Master Pipeline
 
@@ -343,20 +489,23 @@ with DAG(
     1. Other Bronze ingestion DAGs run in sequence.
     2. Master waits for the successful scheduled **FBref 06:00** run; it does
        not launch a second crawl or consume a second traffic budget.
-    3. E3/E4 and auxiliary Silver transforms run on the validated xref spine.
+    3. Master publishes xref, then E3/E4 and auxiliary Silver transforms run
+       on that validated identity spine.
     4. A single final FBref Gold run consumes all successful prerequisites.
 
     ### E1: Silver xref step
 
-    The scheduled FBref ingestion waits for `dag_transform_fbref_silver`;
-    FBref Silver in turn waits for `dag_transform_xref` and its DQ gate. The
-    master uses a fail-closed external-DAG sensor for that completed chain,
-    so `xref_player` cannot race `silver.fbref_player_identity` and FBref is
-    never crawled twice for one daily promotion.
+    The scheduled FBref ingestion waits only for `dag_transform_fbref_silver`
+    and its FBref-local DQ. The master uses a fail-closed external-DAG sensor
+    for that source verdict, then separately launches and waits for
+    `dag_transform_xref`. Thus xref cannot race
+    `silver.fbref_player_identity`, while xref failures from other sources do
+    not affect the ingest/backfill/replay verdict.
 
     ### E3: Core event facts (Silver + Gold)
 
-    After the sensed FBref Silver/xref chain finishes, `dag_transform_e3` runs the E3
+    After the sensed FBref Silver run and master-owned xref finish,
+    `dag_transform_e3` runs the E3
     medallion-redesign chain: Silver `whoscored_events_spadl` +
     `espn_lineup` → Gold `fct_event` / `fct_shot` / `fct_lineup` →
     `validate_e3`. It depends on `silver.xref_match`, `silver.xref_team`,
@@ -411,7 +560,8 @@ with DAG(
     - Scheduled FBref is sensed at the matching 06:00 logical date
     - Optional source failures are reported as degraded; a failed/partial
       WhoScored child blocks all downstream publication and fails the master
-    - FBref Silver, xref, Gold, and direct Gold prerequisites are fail-closed
+    - FBref Silver, master-owned xref, Gold, and direct Gold prerequisites are
+      fail-closed
     - Final report is generated only after successful promotion
     - SoFIFA runs weekly (Sunday) and is not included here
     - Transfermarkt/Capology Bronze run weekly (Monday); master only re-
@@ -457,14 +607,36 @@ with DAG(
         python_callable=enforce_required_source_success,
         # It must execute (and raise) when a required trigger failed.
         trigger_rule='all_done',
+        execution_timeout=timedelta(minutes=5),
+        retries=0,
     )
     trigger_tasks >> required_sources_gate
+
+    # WhoScored is the sole owner of its 10:00 schedule. The 14:00 master run
+    # senses the exact logical date four hours earlier and fails closed on a
+    # missing or failed source generation. ``reschedule`` releases the worker
+    # slot while the source is still running.
+    wait_for_scheduled_whoscored = ExternalTaskSensor(
+        task_id='wait_for_scheduled_whoscored',
+        external_dag_id='dag_ingest_whoscored',
+        external_task_id=None,
+        allowed_states=['success'],
+        failed_states=['failed'],
+        execution_delta=timedelta(hours=4),
+        mode='reschedule',
+        poke_interval=60,
+        timeout=timedelta(hours=8).total_seconds(),
+        check_existence=True,
+    )
+    wait_for_scheduled_whoscored >> required_sources_gate
 
     # FBref runs once per day on its own 06:00 schedule.  The master DAG's
     # 14:00 logical date is eight hours later, so execution_delta maps to the
     # exact same daily data interval without launching another paid crawl.
-    # Waiting for the whole external DAG is intentional: dag_ingest_fbref
-    # cannot succeed until its blocking Silver -> xref -> DQ chain succeeds.
+    # Waiting for the whole external DAG proves Bronze plus FBref-only Silver
+    # DQ. The source may legally run for 18 hours from 06:00, leaving ten hours
+    # at the master's 14:00 start; two additional hours cover scheduler slack.
+    # Cross-source xref is launched below and cannot affect source verdict.
     wait_for_scheduled_fbref = ExternalTaskSensor(
         task_id='wait_for_scheduled_fbref',
         external_dag_id='dag_ingest_fbref',
@@ -474,8 +646,44 @@ with DAG(
         execution_delta=timedelta(hours=8),
         mode='reschedule',
         poke_interval=60,
-        timeout=timedelta(hours=6).total_seconds(),
+        timeout=timedelta(hours=12).total_seconds(),
         check_existence=True,
+    )
+
+    resolve_fbref_publication_scope = PythonOperator(
+        task_id='resolve_fbref_publication_scope',
+        python_callable=resolve_scheduled_fbref_control_run,
+        retries=0,
+        execution_timeout=timedelta(minutes=5),
+    )
+
+    # =========================================================================
+    # E1 identity publication: separate from the FBref source verdict
+    # =========================================================================
+    trigger_xref_transforms = TriggerDagRunOperator(
+        task_id='trigger_xref_transforms',
+        trigger_dag_id='dag_transform_xref',
+        trigger_run_id='master_xref__{{ dag.dag_id }}__{{ run_id }}',
+        logical_date='{{ ti.start_date }}',
+        conf={
+            'publication_owner': 'dag_master_pipeline',
+            'master_run_id': '{{ run_id }}',
+            'fbref_source_dag_id': 'dag_ingest_fbref',
+            'fbref_control_run_id': (
+                "{{ ti.xcom_pull(task_ids="
+                "'resolve_fbref_publication_scope') }}"
+            ),
+        },
+        wait_for_completion=True,
+        poke_interval=30,
+        allowed_states=['success'],
+        failed_states=['failed'],
+        reset_dag_run=False,
+        # Child has a 4h DagRun timeout; leave one hour for scheduler handoff
+        # and terminal-state propagation before this parent task expires.
+        execution_timeout=timedelta(hours=5),
+        retries=0,
+        trigger_rule='all_success',
     )
 
     # =========================================================================
@@ -587,6 +795,14 @@ with DAG(
         failed_states=['failed'],
         reset_dag_run=True,
         execution_date='{{ ds }}',
+        conf={
+            'fbref_control_run_id': (
+                "{{ ti.xcom_pull(task_ids="
+                "'resolve_fbref_publication_scope') }}"
+            ),
+            'publication_owner': 'dag_master_pipeline',
+            'master_run_id': '{{ run_id }}',
+        },
         execution_timeout=timedelta(hours=12),
         retries=0,
         trigger_rule='all_success',
@@ -598,20 +814,33 @@ with DAG(
         python_callable=check_pipeline_success,
 
         trigger_rule='all_done',
+        execution_timeout=timedelta(minutes=5),
+        retries=0,
     )
 
     # Generate summary report
     generate_report_task = PythonOperator(
         task_id='generate_pipeline_report',
         python_callable=generate_pipeline_report,
+        execution_timeout=timedelta(minutes=5),
+        retries=0,
+    )
 
+    release_fbref_publication = PythonOperator(
+        task_id='release_fbref_publication_lock',
+        python_callable=release_scheduled_fbref_publication_lock,
+        trigger_rule='all_done',
+        execution_timeout=timedelta(minutes=5),
+        retries=0,
     )
 
     # Dependencies
-    # The sensor waits for the scheduled FBref run, whose child DAG does not
-    # complete until Silver DQ and xref DQ have both passed.
-    (required_sources_gate >> wait_for_scheduled_fbref
-     >> trigger_e3_transforms >> trigger_e4_transforms)
+    # Source/Silver and cross-source publication have independent verdicts.
+    [required_sources_gate, wait_for_scheduled_fbref] \
+        >> resolve_fbref_publication_scope
+    (resolve_fbref_publication_scope
+     >> trigger_xref_transforms >> trigger_e3_transforms
+     >> trigger_e4_transforms)
     trigger_e4_transforms >> [
         trigger_silver_transfermarkt,
         trigger_silver_capology,
@@ -623,3 +852,5 @@ with DAG(
         trigger_silver_sofifa,
     ] >> trigger_fbref_gold
     trigger_fbref_gold >> check_success_task >> generate_report_task
+    [wait_for_scheduled_fbref, generate_report_task] \
+        >> release_fbref_publication

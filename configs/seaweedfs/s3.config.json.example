@@ -1,11 +1,38 @@
 {
   "identities": [
     {
-      "name": "football",
+      "name": "football-platform-admin",
       "credentials": [
         { "accessKey": "<S3_ACCESS_KEY>", "secretKey": "<S3_SECRET_KEY>" }
       ],
       "actions": ["Admin", "Read", "List", "Tagging", "Write"]
+    },
+    {
+      "name": "whoscored-writer",
+      "credentials": [
+        {
+          "accessKey": "<WHOSCORED_RAW_S3_ACCESS_KEY>",
+          "secretKey": "<WHOSCORED_RAW_S3_SECRET_KEY>"
+        }
+      ],
+      "actions": [
+        "Read:<ICEBERG_WAREHOUSE>",
+        "List:<ICEBERG_WAREHOUSE>",
+        "Write:<ICEBERG_WAREHOUSE>"
+      ]
+    },
+    {
+      "name": "whoscored-backup-reader",
+      "credentials": [
+        {
+          "accessKey": "<WHOSCORED_BACKUP_SOURCE_S3_ACCESS_KEY>",
+          "secretKey": "<WHOSCORED_BACKUP_SOURCE_S3_SECRET_KEY>"
+        }
+      ],
+      "actions": [
+        "Read:<ICEBERG_WAREHOUSE>",
+        "List:<ICEBERG_WAREHOUSE>"
+      ]
     }
   ]
 }

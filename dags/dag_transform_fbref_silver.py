@@ -28,11 +28,11 @@ Architecture:
     validate_silver_quality  — data quality checks (null rate, ref integrity, ranges)
         |
         v
-    trigger_xref  — blocking, fail-closed identity handoff
+    terminal FBref Silver DQ verdict
 
-Gold publication is deliberately not triggered from this DAG.  The master
-pipeline is the single owner of the final Gold run because it first publishes
-fresh xref and E3 tables; a nested trigger here could race that ordered path.
+xref and Gold publication are deliberately not triggered from this DAG. The
+master pipeline owns that separate fail-closed publication path; standalone
+ingest/backfill/replay verdicts therefore contain FBref evidence only.
 
 Silver Tables Created:
     iceberg.silver.fbref_player_season_profile  — player stats + shooting + playingtime + misc
@@ -49,7 +49,6 @@ from typing import Any, Dict
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator
-from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 from airflow.utils.task_group import TaskGroup
 
 from utils.default_args import SILVER_ARGS
@@ -182,7 +181,13 @@ def _run_transform(sql_file: str, table_name: str, **context) -> Dict[str, Any]:
 
     import yaml
 
-    from utils.silver_tasks import check_bronze_table_exists, run_silver_transform
+    from utils.silver_tasks import (
+        check_bronze_table_exists,
+        fbref_control_run_id_from_context,
+        run_silver_transform,
+    )
+
+    fbref_control_run_id = fbref_control_run_id_from_context(context)
 
     bronze_table = OPTIONAL_BRONZE_TABLES.get(table_name)
     if bronze_table:
@@ -260,17 +265,69 @@ def _run_transform(sql_file: str, table_name: str, **context) -> Dict[str, Any]:
                 ]) + ')'
             )
 
+        # #901: matches for which FBref itself publishes no events.  Same
+        # finite-evidence contract as the override registry: an unlisted match
+        # with a score and zero events still fails the DQ gate.
+        gaps_path = config_dir / 'fbref_event_source_gaps.yaml'
+        if not gaps_path.exists():
+            raise FileNotFoundError(
+                f'FBref event source-gap registry not found: {gaps_path}'
+            )
+        gaps_payload = yaml.safe_load(gaps_path.read_text(encoding='utf-8')) or {}
+        if gaps_payload.get('version') != 1:
+            raise ValueError('fbref_event_source_gaps.yaml version must be 1')
+        gaps = gaps_payload.get('gaps')
+        if not isinstance(gaps, list) or not gaps:
+            raise ValueError('fbref_event_source_gaps.yaml gaps must be non-empty')
+
+        gap_required = {'match_id', 'league', 'season', 'reason', 'evidence'}
+        gap_seen = set()
+        gap_rows = []
+        for index, item in enumerate(gaps):
+            if not isinstance(item, dict):
+                raise ValueError(f'event source gap #{index} must be a mapping')
+            missing = sorted(k for k in gap_required if item.get(k) in (None, ''))
+            if missing:
+                raise ValueError(
+                    f'event source gap #{index} is missing required evidence: {missing}'
+                )
+            match_id = str(item['match_id'])
+            if not re.fullmatch(r'[a-f0-9]{8}', match_id):
+                raise ValueError(
+                    f'event source gap #{index} has invalid match_id {match_id!r}'
+                )
+            if match_id in gap_seen:
+                raise ValueError(f'duplicate event source gap: {match_id}')
+            gap_seen.add(match_id)
+            gap_rows.append(
+                '(' + ', '.join([
+                    quote(match_id), quote(item['league']),
+                    quote(item['season']), quote(item['reason']),
+                ]) + ')'
+            )
+
         source_sql = sql_path.read_text(encoding='utf-8')
         typed_empty_row = (
             "(CAST(NULL AS varchar), CAST(NULL AS varchar), CAST(NULL AS varchar),\n"
             "         CAST(NULL AS integer), CAST(NULL AS integer), CAST(NULL AS varchar),\n"
             "         CAST(NULL AS varchar), CAST(NULL AS varchar))"
         )
+        typed_empty_gap_row = (
+            "(CAST(NULL AS varchar), CAST(NULL AS varchar), CAST(NULL AS varchar),\n"
+            "         CAST(NULL AS varchar))"
+        )
         if source_sql.count(typed_empty_row) != 1:
             raise ValueError(
                 'fbref_match_enriched override render anchor missing or duplicated'
             )
+        if source_sql.count(typed_empty_gap_row) != 1:
+            raise ValueError(
+                'fbref_match_enriched event-gap render anchor missing or duplicated'
+            )
         rendered_sql = source_sql.replace(typed_empty_row, ',\n        '.join(rows))
+        rendered_sql = rendered_sql.replace(
+            typed_empty_gap_row, ',\n        '.join(gap_rows)
+        )
         with tempfile.NamedTemporaryFile(
             mode='w', suffix='_fbref_match_enriched.sql', delete=False,
             encoding='utf-8',
@@ -284,15 +341,19 @@ def _run_transform(sql_file: str, table_name: str, **context) -> Dict[str, Any]:
             sql_file=sql_file,
             table_name=table_name,
             schema='silver',
+            fbref_control_run_id=fbref_control_run_id,
         )
     finally:
         if rendered_path:
             Path(rendered_path).unlink(missing_ok=True)
 
 
-def _ensure_fbref_source_identity_columns() -> Dict[str, Any]:
+def _ensure_fbref_source_identity_columns(**context) -> Dict[str, Any]:
     """Add nullable source-native identity columns before Silver reads them."""
 
+    from utils.silver_tasks import fbref_control_run_id_from_context
+
+    control_run_id = fbref_control_run_id_from_context(context)
     from scrapers.base.trino_manager import TrinoTableManager
     from scrapers.fbref.typed_bronze import (
         MATCH_AVAILABILITY_TABLE,
@@ -338,7 +399,11 @@ def _ensure_fbref_source_identity_columns() -> Dict[str, Any]:
             if column not in existing:
                 manager.add_column("bronze", table, column, "VARCHAR")
                 added.append(f"{table}.{column}")
-    return {"tables_checked": len(tables), "columns_added": added}
+    return {
+        "tables_checked": len(tables),
+        "columns_added": added,
+        "fbref_control_run_id": control_run_id,
+    }
 
 
 def _validate_silver(**context) -> Dict[str, Any]:
@@ -495,22 +560,28 @@ def _validate_silver_quality(**context) -> Dict[str, Any]:
             where=(
                 "source_home_score IS NOT NULL AND source_away_score IS NOT NULL "
                 "AND COALESCE(event_row_count, 0) = 0 "
-                "AND COALESCE(event_availability, 'unknown') "
-                "NOT IN ('restricted', 'not_applicable')"
+                # NULL means no availability observation exists because the
+                # match page has not been fetched yet (historical backlog).
+                # Any explicit observation, including empty/error/restricted,
+                # remains a hard completeness failure unless acknowledged.
+                "AND event_availability IS NOT NULL "
+                "AND NOT COALESCE(event_gap_acknowledged, FALSE)"
             ),
             severity='ERROR',
             name='scored_match_without_events[silver.fbref_match_enriched]',
         ),
+        # #901: the source-gap registry is evidence, not a mute button.  A
+        # registered match that now carries events means FBref started
+        # publishing them and the entry must go.
         CHECK.row_count(
             'silver.fbref_match_enriched',
             min_rows=0, max_rows=0,
             where=(
-                "source_home_score IS NOT NULL AND source_away_score IS NOT NULL "
-                "AND COALESCE(event_row_count, 0) = 0 "
-                "AND event_availability IN ('restricted', 'not_applicable')"
+                "COALESCE(event_gap_acknowledged, FALSE) "
+                "AND COALESCE(event_row_count, 0) > 0"
             ),
-            severity='WARNING',
-            name='restricted_match_events[silver.fbref_match_enriched]',
+            severity='ERROR',
+            name='stale_event_source_gap[silver.fbref_match_enriched]',
         ),
         # #902: awarded results are evidence-backed finite decisions.  A new
         # awarded match blocks promotion until its authority/reference is
@@ -585,9 +656,9 @@ def _validate_silver_quality(**context) -> Dict[str, Any]:
                           min_val=0, severity='WARNING'),
     ]
 
-    # E5: WhoScored unavailability is optional Bronze (see OPTIONAL_BRONZE_TABLES).
-    # Probe before appending checks — otherwise run_checks records SQL failures
-    # as ERRORs and raises in deployments where the WhoScored DAG is paused.
+    # E5: the derived WhoScored unavailable-player view is optional during the
+    # V2 bootstrap. Probe before appending checks so a fresh deployment can
+    # complete the profile/preview backfill before strict downstream DQ starts.
     if check_bronze_table_exists(
         table_name='whoscored_player_unavailable', schema='silver',
     ):
@@ -602,13 +673,12 @@ def _validate_silver_quality(**context) -> Dict[str, Any]:
                 'silver.whoscored_player_unavailable',
                 pk=['match_id', 'team_name', 'ws_player_id'],
             ),
-            # 168h (7d) tolerance — WhoScored ingest is weekly and sometimes
-            # paused (project_whoscored_cloudflare.md); staleness past that
-            # is observable but not a blocker for Gold.
+            # WhoScored is a daily source. Allow one missed daily run, then
+            # surface stale optional data without blocking unrelated FBref Gold.
             CHECK.freshness(
                 'silver.whoscored_player_unavailable',
                 ts_col='_bronze_ingested_at',
-                max_age_hours=168,
+                max_age_hours=48,
                 severity='WARNING',
             ),
         ])
@@ -693,9 +763,10 @@ with DAG(
     ### Trigger
 
     This DAG has **no schedule** — it is triggered after `dag_ingest_fbref`
-    completes via `TriggerDagRunOperator` or manual trigger.  A successful run
-    includes a successful, fully validated `dag_transform_xref` run; the xref
-    player resolver reads `silver.fbref_player_identity` produced here.
+    completes via `TriggerDagRunOperator` or manual trigger. A successful run
+    means only that the FBref Silver transforms and their DQ gates passed.
+    `dag_master_pipeline` launches `dag_transform_xref` separately before E3
+    and Gold, so failures in other sources cannot turn an FBref source run red.
 
     ### Silver Tables
 
@@ -786,30 +857,7 @@ with DAG(
     )
 
     # =========================================================================
-    # Trigger the identity layer after Silver DQ passes.  This handoff must be
-    # synchronous: xref_player reads silver.fbref_player_identity, and the
-    # master pipeline must not promote stale xref tables to Gold.
-    # =========================================================================
-    trigger_xref = TriggerDagRunOperator(
-        task_id='trigger_xref_transform',
-        trigger_dag_id='dag_transform_xref',
-        trigger_run_id='fbref_xref__{{ dag.dag_id }}__{{ run_id }}',
-        logical_date='{{ ti.start_date }}',
-        wait_for_completion=True,
-        poke_interval=30,
-        allowed_states=['success'],
-        failed_states=['failed'],
-        reset_dag_run=False,
-        # SILVER_ARGS is tuned for individual CTAS tasks (30 minutes, two
-        # retries).  A blocking child-DAG handoff needs its own wall clock and
-        # must never retry by resetting an already-running xref DAG.
-        execution_timeout=timedelta(hours=4),
-        retries=0,
-        trigger_rule='all_success',
-    )
-
-    # =========================================================================
     # Dependencies
     # =========================================================================
     ensure_source_identity_columns >> transforms_group
-    transforms_group >> validate_silver >> validate_quality >> trigger_xref
+    transforms_group >> validate_silver >> validate_quality

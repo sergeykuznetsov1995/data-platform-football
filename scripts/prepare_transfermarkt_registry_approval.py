@@ -40,7 +40,7 @@ BRONZE_TABLES = (
 )
 PROVIDER_HARD_CAP_BYTES = 15 * 1024 * 1024
 PROXY_REQUEST_LIMIT = 1024
-PROXY_RETRY_LIMIT = 12
+PROXY_RETRY_LIMIT = 96
 PROXY_CONCURRENCY = 1
 EXPECTED_DURATION_SECONDS = 2 * 60 * 60
 APPROVAL_TTL_SECONDS = 3 * 60 * 60
@@ -100,6 +100,7 @@ def _packet_paths(approval_root: Path, cycle_id: str) -> dict[str, Path]:
 def build_plan(
     run_id: str,
     *,
+    expected_revision: int = 0,
     approval_root: Path = APPROVAL_ROOT,
     state_root: Path = STATE_ROOT,
     output_root: Path = OUTPUT_ROOT,
@@ -182,7 +183,7 @@ def build_plan(
         "promotion_write_packet_path": str(paths["promotion"]),
         "promotion_write_packet_hash": "",
         "approval_journal": str(journal_path),
-        "expected_registry_revision": 0,
+        "expected_registry_revision": int(expected_revision),
     }
     return {
         "status": "planned",
@@ -301,8 +302,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--present-paid-hash", default="")
     parser.add_argument("--present-bronze-hash", default="")
+    parser.add_argument("--expected-revision", type=int, default=0)
     args = parser.parse_args(argv)
-    plan = build_plan(args.run_id)
+    plan = build_plan(args.run_id, expected_revision=args.expected_revision)
     if args.apply:
         result = apply_plan(
             plan,

@@ -18,8 +18,8 @@ production validated:
   on a classified warm-HTTP `500`, before raw commit or parsing;
 - a paid/full 400-page soak was not authorized and was not executed;
 - an accepted before/after live traffic benchmark was not run;
-- #901 still has 11 matches with recorded scores but no raw event rows, so the new strict
-  Silver DQ gate is expected to block promotion until the raw gap is repaired;
+- #901 is diagnosed (2026-07-12): FBref publishes no events for those eleven matches at
+  all, so the fix is a finite evidence registry, not a repair — see below;
 - GitHub Project scope is unavailable because the credential lacks
   `read:project`.
 
@@ -51,6 +51,14 @@ projection for existing Bronze/Silver consumers. It is never iterated to choose
 FBref crawl scope.
 
 ### Airflow topology
+
+Every `fetch` task drives Camoufox through `dags/scripts/run_fbref_fetch_wave.py`
+in its own process. Playwright's sync API deadlocks inside a task process forked
+from the multi-threaded scheduler — the browser starts, the navigation never
+opens a socket, and no timeout fires — which is why the repository already
+requires browser scrapers to run in a subprocess. The task callable only relays
+the runner's bounded JSON result, so budgets, leases and gates are unchanged;
+`parse`, `validate` and `seed` tasks touch no browser and stay in-process.
 
 | DAG | Schedule and budget | Static topology | Promotion contract |
 |---|---|---|---|
@@ -231,33 +239,47 @@ reach raw persistence, table inventory, registry coverage, or sentinel gates.
 
 ### Bounded live canary
 
-One direct, no-Silver competition-index canary ran against the clean checkout.
-The runner processed only the source-native `/en/comps/` target and used a
-25-request/25-MiB control budget. The application transport now rejects an
-unbounded response at headers/stream time; the container additionally shared
-an isolated network namespace with defense-in-depth quotas of 18 MiB ingress
-and 4 MiB egress.
+Update 2026-07-12: the bounded live canary **passed** after two transport
+defects were fixed. Both were found by the canary itself and could not have
+been found offline: the browser byte guard rejected every real Cloudflare
+clearance.
 
-The result was intentionally fail-closed:
+1. Reservations were keyed by `id(request)`. Firefox delivers the response
+   callbacks a different `Request` wrapper than `route()` saw, so the guard
+   never found the reservation, classified the main `fbref.com/en/` navigation
+   response as `untracked_response`, and tore down the whole session.
+   Reservations are now indexed by request URL as well, and a request the route
+   callback genuinely never saw (server-redirect hops are not re-routed by
+   Playwright) is adopted: it consumes one request slot plus the fixed overhead
+   under the same caps.
+2. The guard demanded a declared `Content-Length` on every browser response.
+   Cloudflare answers over HTTP/2, and chunked HTTP/1.1 responses carry no
+   length either, so this aborted the session on the very first response. An
+   undeclared body now reserves a 512-KiB ceiling before the browser may read
+   it and settles to the observed size on completion; the cap still fails
+   closed when the reservation does not fit or the body outgrows it.
 
-- logical label: `fbref-production-923-20260711T191717Z-9edaaefd2ff443f6a1af7ca89f13d733`;
-- control run: `f796a73e-6db0-51fb-bff3-f9a25bc38f49`;
-- control status `failed`, one failed attempt, target state `retry`;
-- classified failure `http_status`, HTTP status `500`;
-- `19` charged requests and `1,157,847` fallback-billed bytes;
-- browser document `199,283` bytes, browser assets `955,322` bytes, warm HTTP
-  wire `3,242` bytes, one bootstrap;
-- kernel counters immediately after the canary: ingress `1,426,639` bytes,
-  egress `333,045` bytes, total `1,759,684` bytes;
-- unclassified failures `0`, duplicate canonical fetch violations `0`;
-- provider-billing evidence was unavailable (`null`);
-- raw commit, offline parse, table/sentinel coverage, and Silver trigger did
-  not run.
+Passing canary evidence (`/en/comps/`, 25-request/25-MiB control budget,
+kernel quotas 18 MiB ingress / 4 MiB egress):
 
-No paid retry was attempted: the first attempt had already used 19 of the 25
-authorized requests, while a fresh clearance reserves 20. A new live attempt
-therefore requires separate authorization after the proxy/HTTP-500 cause is
-resolved. The ephemeral quota namespace was removed.
+- logical label: `fbref-canary-20260712T135326Z-922d14a721f941e1842faa7574e2e162`;
+- control run: `562f020a-8f9b-53fe-bb5d-2b3825e5139e`, status `succeeded`;
+- `20` of 25 requests charged, `1,331,685` billed bytes, budget not exceeded;
+- one clearance bootstrap (`19` browser requests), warm HTTP `1` request /
+  `53,101` wire bytes, decoded HTML `268,064` bytes, raw blob `51,451` bytes;
+- warm HTTP success rate `1.0`, unclassified failures `0`, duplicate canonical
+  fetch violations `0`, classified retries `0`;
+- kernel counters: ingress `2,019,083` bytes, egress `2,186,339` bytes — both
+  far below the quotas;
+- raw committed, offline parse `1` page, `10` dataset validations succeeded;
+- registry coverage: `117` male competitions active, `36` female skipped, `0`
+  unknown-gender quarantined; all seven sentinels published and eligible;
+- female/unknown downstream targets: `0`;
+- provider-billing evidence remains unavailable (`null`).
+
+The earlier 2026-07-11 canary (`f796a73e-6db0-51fb-bff3-f9a25bc38f49`) failed
+closed on a classified warm HTTP `500` before raw commit; it is superseded by
+the run above. The ephemeral quota namespace is removed after every run.
 
 ## Offline replay and remediation
 
@@ -308,20 +330,60 @@ audit, or manager-stint Gold output.
 Legacy `home_score`/`away_score` remain FBref source semantics. Consumers that
 need a competition result use `official_*`; Gold `result_1x2` does so.
 
-### Current strict-DQ blocker
+### #901: the gap is in the source, not in the scrape
 
-#901 documents 11 matches with recorded scores whose raw Bronze event dataset
-is absent; seven of those scores are nonzero.
-`scored_match_without_events[silver.fbref_match_enriched]` is intentionally an
-ERROR with a zero-row allowance, so production Silver promotion is expected to
-fail until those raw gaps are repaired. The allowed remediation order is:
+Update 2026-07-12: the eleven matches were refetched through the production
+control plane (bounded backfill runs, `scripts/research/run_fbref_match_refetch.py`).
+The raw pages prove FBref publishes **no events at all** for them: the page
+ships the two `div.event` side columns and both `stats_<team>_summary` tables
+as empty containers, with no `#events_wrap`, while managers, team stats and
+officials parse normally. Nine are relegation play-offs whose player tables are
+empty as well; Nantes–Toulouse (FRA-Ligue 1 2025-2026) publishes full lineups
+and player stats but still no events.
 
-1. replay the immutable raw page with the current parser;
-2. if raw is absent/corrupt, request a separately bounded refetch authorization;
-3. validate the repaired datasets and rerun Silver/xref/Gold.
+This is the "externally unavailable" branch of the #934 criteria, so the fix is
+evidence, not synthesis: `configs/medallion/fbref_event_source_gaps.yaml` is a
+finite registry (match_id, league, season, reason, evidence) rendered into the
+Silver SQL exactly like `match_result_overrides.yaml`.
 
-The pipeline must not synthesize missing FBref events or weaken the gate to
-claim readiness.
+- `scored_match_without_events[silver.fbref_match_enriched]` keeps its zero-row
+  ERROR contract and now excludes **only registered** matches — an unregistered
+  scored match with no events still blocks promotion;
+- `stale_event_source_gap[silver.fbref_match_enriched]` (new, ERROR) fires the
+  moment a registered match starts carrying events, so the registry cannot rot
+  into a mute button.
+
+The pipeline still must not synthesize missing FBref events or weaken the gate.
+
+### Live-only defects found while parsing match pages
+
+Two more defects surfaced only against real match pages and are fixed:
+
+3. The match parser counted the two **empty** `div.event` side columns (present
+   on every FBref match page) as unparsed event rows, and treated published-but-
+   empty player tables as a contract failure. A page whose events, team stats,
+   managers and officials all parse cleanly was therefore rejected wholesale
+   (commit `5bacdd4`).
+4. `discover_page_links` read the page slug of a season-less comps link
+   (`/en/comps/8/Champions-League-Stats` — FBref's address for a competition's
+   *current* season) as a `season_id`, and let a page lend its own season to
+   such links. A 2016-2017 match page thus tried to register a target whose
+   canonical URL already belongs to the registry-seeded current season, the
+   frontier upsert raised `StateConflict`, and **the parse wave failed on every
+   match page** (commit `2870a46`).
+
+### Lease and hang defects found while running bounded batches
+
+5. `reap_expired_leases()` existed but had no caller, and `claim_targets` reaps
+   only the leases of the run doing the claiming. A worker killed mid-wave left
+   its targets `leased` forever: they dropped out of the crawl and kept
+   `promotion_pending_match_count` above zero, which fails the validation gate
+   of every later run. The run start now reaps globally (commit `939d989`).
+6. `Camoufox.__enter__()` has no timeout and hangs indefinitely on a dead proxy
+   (observed twice live, 0 requests charged, the process idle inside
+   Playwright's event loop). The fetch-wave subprocess ran without a timeout, so
+   a hung wave would hold its leases for hours; it is now bounded by
+   `FETCH_WAVE_TIMEOUT_SECONDS = 30 min` and fails closed (commit `949f46b`).
 
 ## Legacy production path removed
 
@@ -634,8 +696,8 @@ runner. The runner never imports Airflow or triggers Silver.
 
 | Blocker | Consequence | Exit evidence |
 |---|---|---|
-| Bounded canary failed on warm HTTP `500` | Clearance completed within budget, but raw persistence, parsing, registry/table coverage, and successful warm-path evidence remain unavailable. | Resolve the proxy/HTTP-500 cause, obtain a fresh bounded-live authorization, and record one successful <=25-request/25-MiB direct canary. |
+| ~~Bounded canary failed on warm HTTP `500`~~ **CLEARED 2026-07-12** | — | Canary `562f020a-8f9b-53fe-bb5d-2b3825e5139e` succeeded: raw committed, parse green, every traffic/eligibility/coverage gate passed. |
 | Full 400-page soak not authorized | No production-scale throughput or long-session stability claim is valid. | Separate approval, hard request/MB cap, and recorded soak report. |
-| #901: 11 raw event gaps | Strict Silver DQ blocks promotion; weakening it would hide missing source data. | Raw replay or approved bounded repair yields zero scored matches without events. |
+| #901: 11 matches with a score and no events | Strict Silver DQ blocks promotion; weakening it would hide missing source data. | **Diagnosed 2026-07-12**: FBref publishes no events for these pages (empty containers in raw), so this is source absence, not a scrape gap. Exit = every one of the eleven refetched, its emptiness recorded in `bronze.fbref_dataset_availability`, and listed in `configs/medallion/fbref_event_source_gaps.yaml`; the gate stays ERROR for anything unregistered. |
 | Live traffic benchmark pending | No measured before/after Cloudflare/proxy/provider-billing claim is valid. Offline parser regression is measured at 2.27% and passes. | Reproducible bounded live benchmark with the approved page/request/byte mix and provider evidence. |
 | GitHub Project scope unavailable | Project-field classification cannot be verified or updated. | Credential with `read:project`, followed by a read-only audit or separately authorized mutation. |

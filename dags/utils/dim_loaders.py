@@ -322,6 +322,7 @@ def run_inline_ctas(
     """
     # Lazy import: avoids loading scrapers/__init__.py at DAG-parse time.
     from utils.gold_tasks import run_gold_transform
+    from utils.silver_tasks import fbref_control_run_id_from_context
 
     template_path = Path(template_sql)
     if not template_path.is_absolute():
@@ -342,4 +343,5 @@ def run_inline_ctas(
         table_name=table_name,
         partition_columns=partition_cols,
         add_timestamp=True,
+        fbref_control_run_id=fbref_control_run_id_from_context(_ctx),
     )

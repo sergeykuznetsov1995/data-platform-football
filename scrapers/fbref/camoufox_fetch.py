@@ -28,8 +28,10 @@ Requirements (already in the image, do NOT bump):
 import asyncio
 import logging
 import os
+import threading
 import time
 from collections import Counter
+from contextlib import contextmanager
 from typing import Callable, Dict, Optional
 
 from scrapers.fbref.constants import FBREF_UNCOMMENT_TABLES_JS
@@ -79,6 +81,14 @@ _CF_MARKERS = (
 # Playwright only reports exactly after completion.  The allowance is per
 # in-flight request and is released when that request finishes or fails.
 BROWSER_REQUEST_FIXED_OVERHEAD_BYTES = 64 * 1024
+
+# Cloudflare answers over HTTP/2, and chunked HTTP/1.1 responses carry no
+# Content-Length at all, so an undeclared body is the norm on the clearance
+# path rather than an attack.  Such a response reserves this ceiling before the
+# browser may read it and settles to the observed size on completion; a body
+# that outgrows the reservation still aborts the session at completion, and a
+# reservation that does not fit the remaining budget aborts it before transport.
+BROWSER_UNDECLARED_BODY_RESERVATION_BYTES = 512 * 1024
 
 
 def should_block_request(
@@ -152,6 +162,21 @@ class CamoufoxFbrefTransport:
     CLICK_ATTEMPTS = 3
     # Browser restarts (each on a fresh proxy) before giving up on a page.
     MAX_PROXY_ROTATIONS = 3
+    # Camoufox's launch has no timeout of its own.  On an exit IP that accepts
+    # the connection but never answers, it waits forever inside Playwright's
+    # event loop, and no navigation timeout applies because navigation never
+    # starts — a production fetch wave then hangs until its own kill deadline.
+    # A healthy launch (Firefox start plus the geoip lookup through the proxy)
+    # completes in seconds.
+    BROWSER_START_TIMEOUT_S = 120.0
+    # Playwright's own timeouts (nav_timeout_ms, and the poll deadline in
+    # _solve_current_page) only fire while its driver still answers.  A proxy
+    # that stalls mid-navigation can wedge the driver connection itself: goto
+    # never returns, its timeout never fires, and the solve loop's evaluate()
+    # blocks before it can check its deadline.  Bound the whole attempt —
+    # navigation plus solve — with a deadline of our own; killing the browser
+    # is what makes the blocked call raise, back into the rotation path.
+    BROWSER_ATTEMPT_TIMEOUT_S = 240.0
 
     def __init__(
         self,
@@ -200,10 +225,17 @@ class CamoufoxFbrefTransport:
         self._blocked_count = 0
         self._requests_count = 0
         self._network_requests_started = 0
+        self._billed_traffic: Dict[str, object] = {}
         self._browser_start_attempts = 0
+        self._browser_watchdog_kills = 0
         self._navigation_attempts = 0
         self._budget_blocked_count = 0
         self._inflight_byte_reservations: Dict[int, int] = {}
+        # Playwright/Firefox may hand a *different* Request wrapper to the
+        # response/finished callbacks than the one seen by route(), so the
+        # reservation is also indexed by request URL to survive re-wrapping.
+        self._inflight_request_urls: Dict[int, str] = {}
+        self._inflight_ids_by_url: Dict[str, list] = {}
         self._inflight_reserved_bytes = 0
         self._unobserved_reserved_bytes = 0
         self._byte_budget_exhausted = False
@@ -274,9 +306,13 @@ class CamoufoxFbrefTransport:
         if self._proxy:
             kwargs["proxy"] = self._proxy
             kwargs["geoip"] = self._geoip  # locale/timezone matched to exit IP
-        self._cm = Camoufox(**kwargs)
-        self._browser = self._cm.__enter__()
-        self._page = self._browser.new_page()
+        # The launch itself is unbounded (see BROWSER_START_TIMEOUT_S), so kill
+        # the browser it spawned if it overruns: Playwright then raises out of
+        # the launch and the caller rotates onto a fresh exit IP.
+        with self._browser_deadline(self.BROWSER_START_TIMEOUT_S, "start"):
+            self._cm = Camoufox(**kwargs)
+            self._browser = self._cm.__enter__()
+            self._page = self._browser.new_page()
         if (
             self._block_resources
             or self._max_network_requests is not None
@@ -291,6 +327,57 @@ class CamoufoxFbrefTransport:
         logger.info("Camoufox session started (proxy=%s, humanize=%s)",
                     server, self._humanize)
 
+    @contextmanager
+    def _browser_deadline(self, timeout_s: float, phase: str):
+        """Bound a blocking Playwright call: on overrun, kill the browser."""
+        watchdog = threading.Timer(
+            timeout_s, self._kill_browser_processes, args=(phase, timeout_s)
+        )
+        watchdog.daemon = True
+        watchdog.start()
+        try:
+            yield
+        finally:
+            watchdog.cancel()
+
+    def _kill_browser_processes(
+        self, phase: str = "start", timeout_s: Optional[float] = None
+    ) -> None:
+        """Kill the browser this transport spawned, and only the browser.
+
+        Runs on a watchdog thread, so it must not touch Playwright objects:
+        the browser's death is what makes the blocked call raise. Playwright's
+        node driver is deliberately spared — killing it severs the connection
+        every later session in this process depends on, and every subsequent
+        navigation then failed instantly with NS_ERROR_FAILURE (observed in
+        production: three fresh proxies "failed" 150ms after launch).
+        """
+        import psutil
+
+        try:
+            children = psutil.Process().children(recursive=True)
+        except psutil.Error:  # the process tree can vanish mid-walk
+            return
+        killed = 0
+        for child in children:
+            try:
+                name = (child.name() or "").casefold()
+                if "camoufox" in name or "firefox" in name:
+                    child.kill()
+                    killed += 1
+            except psutil.Error:
+                continue
+        if killed:
+            self._browser_watchdog_kills += 1
+            logger.warning(
+                "Camoufox %s exceeded %.0fs (stalled exit IP?) — killed %d "
+                "browser process(es) to force a proxy rotation",
+                phase,
+                timeout_s if timeout_s is not None
+                else self.BROWSER_START_TIMEOUT_S,
+                killed,
+            )
+
     def _stop(self) -> None:
         if self._cm is not None:
             try:
@@ -300,10 +387,8 @@ class CamoufoxFbrefTransport:
         # Any request that produced no finished/failed callback may have
         # crossed an unknown fraction of its reservation. Charge the full
         # remainder before allowing a restart to reuse capacity.
-        self._unobserved_reserved_bytes += self._inflight_reserved_bytes
+        self._clear_inflight_tracking(charge_unobserved=True)
         self._cm = self._browser = self._page = None
-        self._inflight_byte_reservations.clear()
-        self._inflight_reserved_bytes = 0
 
     def _restart(self) -> None:
         """Tear down and start fresh on the next proxy (rotation on failure)."""
@@ -326,8 +411,79 @@ class CamoufoxFbrefTransport:
         return False
 
     # -- byte accounting / blocking --------------------------------------- #
+    @staticmethod
+    def _request_url(req) -> Optional[str]:
+        try:
+            url = req.url
+        except Exception:  # noqa: BLE001 — detached requests have no url
+            return None
+        return str(url) if url else None
+
+    def _track_reservation(self, req, reservation: int) -> None:
+        key = id(req)
+        self._inflight_byte_reservations[key] = reservation
+        self._inflight_reserved_bytes += reservation
+        url = self._request_url(req)
+        if url is not None:
+            self._inflight_request_urls[key] = url
+            self._inflight_ids_by_url.setdefault(url, []).append(key)
+
+    def _clear_inflight_tracking(self, *, charge_unobserved: bool) -> None:
+        """Atomically discard every index for the current in-flight set."""
+
+        if charge_unobserved:
+            self._unobserved_reserved_bytes += self._inflight_reserved_bytes
+        self._inflight_byte_reservations.clear()
+        self._inflight_request_urls.clear()
+        self._inflight_ids_by_url.clear()
+        self._inflight_reserved_bytes = 0
+
+    def _forget_reservation(self, key: int) -> int:
+        reserved = self._inflight_byte_reservations.pop(key, 0)
+        url = self._inflight_request_urls.pop(key, None)
+        if url is not None:
+            keys = self._inflight_ids_by_url.get(url)
+            if keys:
+                try:
+                    keys.remove(key)
+                except ValueError:
+                    pass
+                if not keys:
+                    self._inflight_ids_by_url.pop(url, None)
+        return reserved
+
+    def _reservation_key(self, req) -> Optional[int]:
+        """Reservation key for ``req``, re-keying a re-wrapped request by URL.
+
+        The route callback and the response/finished callbacks can receive
+        different Python wrappers for the same in-flight request, so identity
+        alone loses the reservation and would fail the session closed.
+        """
+        key = id(req)
+        if key in self._inflight_byte_reservations:
+            return key
+        url = self._request_url(req)
+        if url is None:
+            return None
+        keys = self._inflight_ids_by_url.get(url)
+        if not keys:
+            return None
+        stale_key = keys[0]
+        reserved = self._inflight_byte_reservations.pop(stale_key, 0)
+        self._inflight_request_urls.pop(stale_key, None)
+        keys.pop(0)
+        if not keys:
+            self._inflight_ids_by_url.pop(url, None)
+        self._inflight_byte_reservations[key] = reserved
+        self._inflight_request_urls[key] = url
+        self._inflight_ids_by_url.setdefault(url, []).append(key)
+        return key
+
     def _release_byte_reservation(self, req) -> int:
-        reserved = self._inflight_byte_reservations.pop(id(req), 0)
+        key = self._reservation_key(req)
+        if key is None:
+            return 0
+        reserved = self._forget_reservation(key)
         self._inflight_reserved_bytes = max(
             0, self._inflight_reserved_bytes - reserved
         )
@@ -381,9 +537,16 @@ class CamoufoxFbrefTransport:
         self._budget_blocked_count += 1
         self._last_solve_failure = "byte_budget"
         logger.error("Camoufox byte budget aborted the session: %s", reason)
-        # Closing the whole context is deliberate: aborting only one route can
-        # leave parallel responses consuming the proxy after the cap failed.
-        self._stop()
+        # Charge every in-flight reservation in full: those requests may have
+        # crossed an unknown fraction of the wire, and the cap must stay
+        # conservative even though the browser is still up for a moment.
+        self._clear_inflight_tracking(charge_unobserved=True)
+        # The browser is NOT closed here.  This runs inside a Playwright event
+        # callback (`response` / `requestfinished`), and the sync API deadlocks
+        # if the browser is torn down from one: the callback waits for the
+        # close, the close waits for the callback to return, and the wave hangs
+        # forever holding its leases.  `route()` refuses every further request
+        # while the flag is set, and `fetch()` closes the session on its way out.
 
     def _maybe_block(self, route) -> None:
         req = None
@@ -422,9 +585,9 @@ class CamoufoxFbrefTransport:
             # interrupted requests still consumed one global network attempt.
             self._network_requests_started += 1
             if self._max_network_bytes is not None:
-                reservation = BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
-                self._inflight_byte_reservations[id(req)] = reservation
-                self._inflight_reserved_bytes += reservation
+                self._track_reservation(
+                    req, BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
+                )
             route.continue_()
         except Exception:  # noqa: BLE001 — fail closed at the proxy boundary
             if req is not None:
@@ -450,6 +613,36 @@ class CamoufoxFbrefTransport:
         except Exception:  # noqa: BLE001 — fail closed in _on_response
             return {}
 
+    def _adopt_unrouted_request(self, req) -> Optional[int]:
+        """Charge an in-flight request that ``route()`` never reserved.
+
+        Server redirects are not re-routed by Playwright, and Firefox can hand
+        the response callbacks a request the route callback never saw. Such a
+        request is still real proxy traffic, so it consumes a request slot and
+        the same fixed overhead as a routed one, enforced against the same
+        caps. Only a cap breach aborts the session — unlike ``route()`` there
+        is no way to refuse the transfer before transport.
+        """
+        if (
+            self._max_network_requests is not None
+            and self._network_requests_started >= self._max_network_requests
+        ):
+            self._abort_session_for_byte_budget("unrouted_request_over_request_cap")
+            return None
+        reservation = BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
+        projected = (
+            self._bytes_total
+            + self._unobserved_reserved_bytes
+            + self._inflight_reserved_bytes
+            + reservation
+        )
+        if projected > self._max_network_bytes:
+            self._abort_session_for_byte_budget("unrouted_request_over_byte_cap")
+            return None
+        self._network_requests_started += 1
+        self._track_reservation(req, reservation)
+        return reservation
+
     def _on_response(self, response) -> None:
         """Reserve the declared body before any response can cross the cap."""
 
@@ -459,39 +652,51 @@ class CamoufoxFbrefTransport:
         if req is None:
             self._abort_session_for_byte_budget("response_without_request")
             return
-        reservation_key = id(req)
-        fixed = self._inflight_byte_reservations.get(reservation_key)
-        if fixed is None:
-            self._abort_session_for_byte_budget("untracked_response")
-            return
+        reservation_key = self._reservation_key(req)
+        if reservation_key is None:
+            fixed = self._adopt_unrouted_request(req)
+            if fixed is None:
+                return  # a cap breach already aborted the session
+            reservation_key = id(req)
+        else:
+            fixed = self._inflight_byte_reservations[reservation_key]
 
         headers = self._response_headers(response)
         transfer_encoding = headers.get("transfer-encoding", "")
-        if "chunked" in {
+        chunked = "chunked" in {
             token.strip().casefold()
             for token in transfer_encoding.split(",")
-        }:
-            self._abort_session_for_byte_budget("chunked_content_length")
-            return
+        }
         raw_length = headers.get("content-length", "").strip()
-        if not raw_length or not raw_length.isascii() or not raw_length.isdigit():
-            self._abort_session_for_byte_budget("missing_or_invalid_content_length")
-            return
-        content_length = int(raw_length)
+        declared = (
+            not chunked
+            and raw_length
+            and raw_length.isascii()
+            and raw_length.isdigit()
+        )
+        body_reservation = (
+            int(raw_length)
+            if declared
+            else BROWSER_UNDECLARED_BODY_RESERVATION_BYTES
+        )
         projected = (
             self._bytes_total
             + self._unobserved_reserved_bytes
             + self._inflight_reserved_bytes
-            + content_length
+            + body_reservation
         )
         if projected > self._max_network_bytes:
             self._abort_session_for_byte_budget(
-                f"declared_content_length_exceeds_cap:{content_length}"
+                f"declared_content_length_exceeds_cap:{body_reservation}"
+                if declared
+                else f"undeclared_body_exceeds_cap:{body_reservation}"
             )
             return
 
-        self._inflight_byte_reservations[reservation_key] = fixed + content_length
-        self._inflight_reserved_bytes += content_length
+        self._inflight_byte_reservations[reservation_key] = (
+            fixed + body_reservation
+        )
+        self._inflight_reserved_bytes += body_reservation
 
     def _on_request_finished(self, req) -> None:
         reserved = self._release_byte_reservation(req)
@@ -653,10 +858,13 @@ class CamoufoxFbrefTransport:
                 # Count before goto: timeouts and interrupted navigations still
                 # consumed a browser/proxy attempt.
                 self._navigation_attempts += 1
-                self._page.goto(
-                    url, wait_until="domcontentloaded",
-                    timeout=self._nav_timeout_ms,
-                )
+                with self._browser_deadline(
+                    self.BROWSER_ATTEMPT_TIMEOUT_S, "navigation"
+                ):
+                    self._page.goto(
+                        url, wait_until="domcontentloaded",
+                        timeout=self._nav_timeout_ms,
+                    )
             except Exception as e:  # noqa: BLE001 — browser/network boundary
                 logger.warning("Camoufox goto failed (attempt %d): %s",
                                attempt + 1, e)
@@ -674,7 +882,19 @@ class CamoufoxFbrefTransport:
 
             # CF challenge counters live in _solve_current_page — only navs
             # that actually surfaced a challenge shell count as attempts.
-            html = self._solve_current_page()
+            try:
+                with self._browser_deadline(
+                    self.BROWSER_ATTEMPT_TIMEOUT_S, "challenge solve"
+                ):
+                    html = self._solve_current_page()
+            except Exception as e:  # noqa: BLE001 — killed browser raises here
+                logger.warning("Camoufox solve failed (attempt %d): %s",
+                               attempt + 1, e)
+                if self._byte_budget_exhausted:
+                    break
+                if attempt < self.MAX_PROXY_ROTATIONS:
+                    self._lifecycle_action(self._restart, 'restart')
+                continue
             if html is not None:
                 self._pages_this_session += 1
                 self._record_proxy_result(True)
@@ -691,6 +911,12 @@ class CamoufoxFbrefTransport:
             if attempt < self.MAX_PROXY_ROTATIONS:
                 self._lifecycle_action(self._restart, 'restart')
 
+        if self._byte_budget_exhausted and self._cm is not None:
+            # The cap fired inside a Playwright callback, which may not close
+            # the browser (see _abort_session_for_byte_budget).  Do it here,
+            # back on the main thread, so no parallel response keeps spending
+            # proxy bytes after the budget failed.
+            self._stop()
         return None
 
     # -- clearance export (HTTP fast-path) --------------------------------- #
@@ -724,6 +950,35 @@ class CamoufoxFbrefTransport:
             return None
 
     # -- traffic stats ---------------------------------------------------- #
+    def traffic_delta(self) -> Dict[str, object]:
+        """Traffic since the previous call — one bootstrap, billed exactly once.
+
+        The counters are cumulative for the whole session, and the caller
+        charges what it reads to the target that triggered the bootstrap.
+        Charging the running totals made every later target of a wave pay again
+        for the same browser traffic: a wave with a failing clearance billed 140
+        requests for ~20 real ones and exhausted the run's request budget.
+        """
+        stats = self.traffic_stats()
+        baseline = self._billed_traffic
+        delta: Dict[str, object] = {}
+        for key, value in stats.items():
+            if isinstance(value, int) and not isinstance(value, bool):
+                # Not every number is a counter: the in-flight reservations are
+                # a gauge that falls when requests settle, so a plain difference
+                # can go negative and bill a fetch a negative byte count.
+                delta[key] = max(0, value - int(baseline.get(key, 0) or 0))
+            else:
+                delta[key] = value
+        by_type = dict(stats.get("real_bytes_by_resource_type") or {})
+        billed_by_type = dict(baseline.get("real_bytes_by_resource_type") or {})
+        delta["real_bytes_by_resource_type"] = {
+            name: max(0, total - int(billed_by_type.get(name, 0) or 0))
+            for name, total in by_type.items()
+        }
+        self._billed_traffic = stats
+        return delta
+
     def traffic_stats(self) -> Dict[str, object]:
         """Snapshot for the scraper's _stats / traffic guard."""
         return {
@@ -736,6 +991,7 @@ class CamoufoxFbrefTransport:
                 self._browser_start_attempts, self._navigation_attempts
             ),
             "browser_start_attempts": self._browser_start_attempts,
+            "browser_watchdog_kills": self._browser_watchdog_kills,
             "browser_navigation_attempts": self._navigation_attempts,
             "budget_blocked_count": self._budget_blocked_count,
             "inflight_reserved_bytes": self._inflight_reserved_bytes,

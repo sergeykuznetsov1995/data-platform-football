@@ -116,11 +116,13 @@ PENDING_CHECKPOINT_TTL_DAYS = int(
 )
 MIB = 1024 * 1024
 PRODUCTION_CYCLE_BUDGET_BYTES = 15 * MIB
+# 'requests' counts attempts, not pages; keep in sync with the parent cycle's
+# DEFAULT_ENTITY_LIMITS.
 PRODUCTION_ENTITY_BUDGETS = {
-    ENTITY_PLAYERS: {'decoded_mb': 10.0, 'requests': 26},
-    ENTITY_MV_HISTORY: {'decoded_mb': 4.0, 'requests': 120},
-    ENTITY_TRANSFERS: {'decoded_mb': 8.0, 'requests': 120},
-    ENTITY_COACHES: {'decoded_mb': 6.0, 'requests': 50},
+    ENTITY_PLAYERS: {'decoded_mb': 16.0, 'requests': 150},
+    ENTITY_MV_HISTORY: {'decoded_mb': 4.0, 'requests': 200},
+    ENTITY_TRANSFERS: {'decoded_mb': 8.0, 'requests': 200},
+    ENTITY_COACHES: {'decoded_mb': 14.0, 'requests': 160},
 }
 
 
@@ -432,7 +434,29 @@ def _canonical_scope_season(competition: str, edition_id: int | str) -> str:
             f'{record.competition_id}: classification blocks crawl: '
             f'{record.crawl_block_reason}'
         )
+    # The source offsets some calendar leagues' saison_id from the season it
+    # names, so the registered season — not the edition id — is the truth. The
+    # edition id is only a fallback for a caller that states no season.
+    registered = str(os.environ.get('TM_CANONICAL_SEASON') or '').strip()
+    if registered:
+        return registered
     return canonical_season(edition_id, record.season_format)
+
+
+def _scope_season(competition: str, edition_id: int | str) -> Dict[str, Any]:
+    """The season a dated projection must use, and the format that dates it."""
+
+    from scrapers.transfermarkt.registry import season_window_year
+
+    record = _competition_record(competition)
+    canonical = _canonical_scope_season(competition, edition_id)
+    return {
+        'canonical_season': canonical,
+        'season_format': record.season_format,
+        'season_year': season_window_year(
+            edition_id, record.season_format, canonical,
+        ),
+    }
 
 
 def _compatibility_league(competition: str) -> str:
@@ -891,6 +915,41 @@ def _load_data_derived_state(
     return derived
 
 
+def _load_response_cache() -> tuple[Optional[Dict[str, Any]], Optional[str], Optional[float]]:
+    """Return the scope's durable page cache, its path and TTL.
+
+    A league can exceed one cycle's byte cap, so a cycle finishes what the
+    previous one paid for instead of re-fetching it. A corrupt cache is an
+    ordinary miss.
+    """
+
+    path = os.environ.get('TM_RESPONSE_CACHE_PATH')
+    if not path:
+        return None, None, None
+    ttl = float(os.environ.get('TM_RESPONSE_CACHE_TTL_SECONDS') or 0) or None
+    try:
+        with open(path, encoding='utf-8') as handle:
+            cache = json.load(handle)
+        if not isinstance(cache, dict):
+            cache = {}
+    except (OSError, ValueError):
+        cache = {}
+    return cache, path, ttl
+
+
+def _persist_response_cache(cache: Optional[Dict[str, Any]], path: Optional[str]) -> None:
+    if cache is None or not path:
+        return
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        temporary = f'{path}.tmp'
+        with open(temporary, 'w', encoding='utf-8') as handle:
+            json.dump(cache, handle)
+        os.replace(temporary, path)
+    except OSError as exc:
+        logger.warning('could not persist the scope page cache: %s', exc)
+
+
 def _pending_checkpoint_roots() -> List[str]:
     """Preferred durable journal root followed by a local emergency fallback."""
     preferred = os.environ.get('TM_PENDING_CHECKPOINT_DIR', '/tmp')
@@ -1326,11 +1385,11 @@ def _select_player_ids(
     run_key: str,
     allow_state_writes: bool,
     legacy_materialization_required: bool = True,
-) -> Tuple[Optional[List[str]], int, int, List[str]]:
+) -> Tuple[Optional[List[str]], int, int, List[str], Dict[str, int]]:
     roster = _resolve_roster(scraper, league, season)
     if roster is None:
         # Compatibility path: let the legacy scraper resolve its own window.
-        return None, 0, 0, []
+        return None, 0, 0, [], {}
     if not roster:
         raise _EmptyRosterError(
             f'no player ids in Bronze roster for {league}/{season}'
@@ -1444,11 +1503,23 @@ def _select_player_ids(
 
         selected = sorted(candidates, key=_age_key)[:limit]
 
+    # One cycle buys at most ``limit`` careers of a roster that can run to
+    # thousands.  Whoever reads this scope's manifest has to be able to see how
+    # much of the roster it actually covers, or a scope that covered 4% of the
+    # players reads exactly like one that covered all of them.
+    pending = max(0, len(candidates) - len(selected))
+    coverage = {
+        'roster_size': len(roster),
+        'selected': len(selected),
+        'pending': pending,
+    }
     logger.info(
-        'Refresh selection endpoint=%s mode=%s roster=%d selected=%d cache_hits=%d',
-        spec.state_endpoint, refresh_mode, len(roster), len(selected), cache_hits,
+        'Refresh selection endpoint=%s mode=%s roster=%d selected=%d '
+        'cache_hits=%d pending=%d',
+        spec.state_endpoint, refresh_mode, len(roster), len(selected),
+        cache_hits, pending,
     )
-    return selected, cache_hits, seeded, hydrate_ids
+    return selected, cache_hits, seeded, hydrate_ids, coverage
 
 
 def _frame_hash(frame) -> str:
@@ -1924,15 +1995,18 @@ def _merge_career_cache_frames(
     )
     if not native.empty:
         native = native.drop_duplicates(list(natural_key), keep='last')
+    scope = _scope_season(league, season)
     if spec.name == ENTITY_MV_HISTORY:
         legacy = scraper.materialize_legacy_market_value_history(
-            native, league, season,
+            native, league, scope['season_year'], scope['season_format'],
         )
         return {
             'market_value_points': native,
             'legacy_market_value_history': legacy,
         }
-    legacy = scraper.materialize_legacy_transfers(native, league, season)
+    legacy = scraper.materialize_legacy_transfers(
+        native, league, scope['season_year'], scope['season_format'],
+    )
     return {'transfer_events': native, 'legacy_transfers': legacy}
 
 
@@ -1978,6 +2052,57 @@ def _load_cached_coach_data(scraper, club_ids: Sequence[str]) -> Dict[str, Any]:
     return {'profiles': profiles, 'stints': stints}
 
 
+def _coach_identity_rows(
+    scraper,
+    profiles,
+    stints,
+    season_year: int,
+    season_format,
+) -> list:
+    """Name every coach this season's stints name, bio or no bio.
+
+    A club's history page is refetched only when its cached copy ages out, so
+    most clubs' stints come from bronze — while a profile page is fetched only
+    for a coach a *freshly read* page named.  The season projection is built
+    from all the stints and therefore names coaches the profile table has never
+    heard of.  Their identity is not in doubt: a history page named them.  The
+    row states it and leaves the bio empty, which is exactly what the season
+    projection carries for them, so the two agree key for key.  An empty bio is
+    not a bio, so the next cycle that has such a coach in season still fetches
+    his page.
+    """
+    from scrapers.transfermarkt.scraper import (
+        _season_window,
+        _stint_overlaps_season,
+    )
+
+    if stints is None or getattr(stints, 'empty', True):
+        return []
+    win_start, win_end = _season_window(season_year, season_format)
+    known = set()
+    if profiles is not None and 'coach_id' in getattr(profiles, 'columns', []):
+        known = {str(value) for value in profiles['coach_id'].dropna()}
+    rows: Dict[str, Dict[str, Any]] = {}
+    for stint in stints.to_dict('records'):
+        coach_id = str(stint.get('coach_id'))
+        if coach_id in known or coach_id in rows:
+            continue
+        if not _stint_overlaps_season(stint, win_start, win_end):
+            continue
+        rows[coach_id] = {
+            'coach_id': coach_id,
+            'coach_slug': stint.get('coach_slug'),
+            'name': stint.get('name'),
+            'dob': None,
+            'nationality': None,
+            '_source': 'transfermarkt',
+            '_entity_type': 'coach_profiles',
+            '_ingested_at': datetime.utcnow(),
+            '_batch_id': getattr(scraper, '_batch_id', None),
+        }
+    return list(rows.values())
+
+
 def _merge_coach_cache_frames(
     scraper,
     fetched: Mapping[str, Any],
@@ -1995,8 +2120,24 @@ def _merge_coach_cache_frames(
     ).drop_duplicates(
         ['club_id', 'coach_id', 'appointed_date', 'left_date'], keep='last',
     )
+    # Both the scraper and this merge project the same league-season, so both
+    # must date its window the same way.  Defaulting the format here made a
+    # calendar season a split one and the two projections disagreed.
+    scope = _scope_season(league, season)
+    identities = _coach_identity_rows(
+        scraper, profiles, stints,
+        scope['season_year'], scope['season_format'],
+    )
+    if identities:
+        logger.info(
+            'coach identities named by cached stints without a profile: %d',
+            len(identities),
+        )
+        profiles = pd.concat(
+            [profiles, pd.DataFrame(identities)], ignore_index=True,
+        ).drop_duplicates('coach_id', keep='first')
     legacy = scraper.materialize_legacy_coaches(
-        profiles, stints, league, season,
+        profiles, stints, league, scope['season_year'], scope['season_format'],
     )
     return {
         'profiles': profiles,
@@ -2061,8 +2202,10 @@ def _read_frames(
                 authoritative = 'legacy_players'
         else:
             if mode == 'dual' and 'legacy_coaches' not in frames:
+                scope = _scope_season(league, season)
                 frames['legacy_coaches'] = scraper.materialize_legacy_coaches(
-                    frames['profiles'], frames['stints'], league, season,
+                    frames['profiles'], frames['stints'], league,
+                    scope['season_year'], scope['season_format'],
                 )
             if mode == 'native-only':
                 frames.pop('legacy_coaches', None)
@@ -2075,7 +2218,10 @@ def _read_frames(
         points = getattr(scraper, spec.native_reader)(**common)
         if mode == 'native-only':
             return {'market_value_points': points}, 'market_value_points', True
-        legacy = scraper.materialize_legacy_market_value_history(points, league, season)
+        scope = _scope_season(league, season)
+        legacy = scraper.materialize_legacy_market_value_history(
+            points, league, scope['season_year'], scope['season_format'],
+        )
         return {
             'market_value_points': points,
             'legacy_market_value_history': legacy,
@@ -2085,7 +2231,10 @@ def _read_frames(
         events = getattr(scraper, spec.native_reader)(**common)
         if mode == 'native-only':
             return {'transfer_events': events}, 'transfer_events', True
-        legacy = scraper.materialize_legacy_transfers(events, league, season)
+        scope = _scope_season(league, season)
+        legacy = scraper.materialize_legacy_transfers(
+            events, league, scope['season_year'], scope['season_format'],
+        )
         return {
             'transfer_events': events,
             'legacy_transfers': legacy,
@@ -2457,8 +2606,8 @@ _MANIFEST_COMPATIBILITY = {
 }
 
 
-def _compatibility_fingerprint(frame, columns: Sequence[str]) -> Tuple[int, str]:
-    """Hash sorted DISTINCT normalized key tuples with a stable NULL sentinel."""
+def _compatibility_keys(frame, columns: Sequence[str]) -> List[Tuple[str, ...]]:
+    """Sorted DISTINCT normalized key tuples with a stable NULL sentinel."""
     def normalise(value: Any) -> str:
         if value is None:
             return '__NULL__'
@@ -2482,6 +2631,11 @@ def _compatibility_fingerprint(frame, columns: Sequence[str]) -> Tuple[int, str]
             tuple(normalise(value) for value in row)
             for row in projected.itertuples(index=False, name=None)
         )
+    return values
+
+
+def _compatibility_fingerprint(frame, columns: Sequence[str]) -> Tuple[int, str]:
+    values = _compatibility_keys(frame, columns)
     blob = json.dumps(values, ensure_ascii=False, separators=(',', ':'))
     return len(values), hashlib.sha256(blob.encode('utf-8')).hexdigest()
 
@@ -2602,6 +2756,24 @@ def _persist_dual_write_manifest(
             and legacy_hash == native_hash
             else 'parity_mismatch'
         )
+        if status == 'parity_mismatch':
+            # Which keys diverged is the whole diagnosis; a row count and two
+            # hashes say only that they did.
+            legacy_keys = set(
+                _compatibility_keys(comparison_legacy_frame, contract['legacy'])
+            )
+            native_keys = set(
+                _compatibility_keys(native_frame, contract['native'])
+            )
+            logger.error(
+                'PARITY %s: legacy-only=%d native-only=%d; legacy examples=%s; '
+                'native examples=%s',
+                contract['entity'],
+                len(legacy_keys - native_keys),
+                len(native_keys - legacy_keys),
+                sorted(legacy_keys - native_keys)[:3],
+                sorted(native_keys - legacy_keys)[:3],
+            )
         sql = f"""
 MERGE INTO {DUAL_WRITE_MANIFEST_TABLE} t
 USING (VALUES (
@@ -2889,6 +3061,8 @@ def _run_entity(
     cycle_budget = None
     exit_code = 1
     scraper = None
+    response_cache: Optional[Dict[str, Any]] = None
+    cache_path: Optional[str] = None
     selected: Optional[List[str]] = None
     authoritative_frame = None
     checkpoint_frame = None
@@ -2936,19 +3110,26 @@ def _run_entity(
                 effective_bytes / MIB
             )
             results['cycle_budget'] = dict(cycle_budget)
+        response_cache, cache_path, cache_ttl = _load_response_cache()
         with TransfermarktScraper(
             leagues=[league], seasons=[season], proxy_file=proxy_file,
             retry_budget=retry_budget,
+            response_cache=response_cache,
+            cache_ttl_seconds=cache_ttl,
+            canonical_season=os.environ.get('TM_CANONICAL_SEASON'),
         ) as scraper:
             if spec.state_endpoint:
                 checkpoint_spec = spec
-                selected, cache_hits, seeded, career_hydrate_ids = _select_player_ids(
+                (
+                    selected, cache_hits, seeded, career_hydrate_ids, coverage,
+                ) = _select_player_ids(
                     scraper, spec, league, season, int(limit), window_offset,
                     refresh_mode, run_key, allow_state_writes=not dry_run,
                     legacy_materialization_required=legacy_write_enabled,
                 )
                 results['cache_hits'] = cache_hits
                 results['bootstrap_seeded_keys'] = seeded
+                results['roster_coverage'] = coverage
                 if mode == 'native-only':
                     # Post-retention native refresh never needs to reconstruct
                     # a deleted legacy season partition from cached global
@@ -3395,6 +3576,9 @@ def _run_entity(
             )
         exit_code = 1
     finally:
+        # Persist even when the cycle ran out of budget: those pages are paid
+        # for, and the next cycle needs them to finish the league.
+        _persist_response_cache(response_cache, cache_path)
         if scraper is not None:
             results['traffic'] = _normalise_traffic(scraper)
         traffic = results['traffic']

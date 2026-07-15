@@ -32,6 +32,7 @@ import pyarrow as pa
 from bs4 import BeautifulSoup
 
 from scrapers.fbref.constants import LEAGUE_IDS
+from scrapers.fbref.discovery import has_valid_zero_table_season_signature
 from scrapers.fbref.html_parser import (
     extract_tables_from_comments,
     find_player_stats_table,
@@ -47,7 +48,7 @@ from scrapers.fbref.match_parser import (
 )
 
 
-TYPED_BRONZE_PARSER_VERSION = "fbref-typed-bronze-v1"
+TYPED_BRONZE_PARSER_VERSION = "fbref-typed-bronze-v3"
 
 # Output compatibility only.  This mapping is intentionally derived from the
 # legacy aliases instead of being duplicated as another source of crawl scope.
@@ -231,6 +232,7 @@ class _TrinoManager(Protocol):
         batch_size: int = 1000,
         delete_filter: Optional[str] = None,
         staging_id: Optional[str] = None,
+        single_statement_replace: bool = False,
     ) -> int: ...
 
 
@@ -514,10 +516,21 @@ def parse_season_stats_html(
     if extracts is None:
         raise ValueError(f"Unsupported typed season stat route: {stat_route!r}")
 
-    soup = BeautifulSoup(_html_text(html), "html.parser")
+    html_text = _html_text(html)
+    soup = BeautifulSoup(html_text, "html.parser")
     results: Dict[str, DatasetParseResult] = {}
     try:
         comment_tables = extract_tables_from_comments(soup)
+        has_any_table = soup.find("table") is not None or bool(comment_tables)
+        valid_zero_table_page = (
+            not has_any_table
+            and has_valid_zero_table_season_signature(
+                html_text,
+                competition_id=context.source_competition_id,
+                season_id=context.source_season_id,
+                season_label=context.season_label,
+            )
+        )
         for category, stat_type in extracts:
             dataset_name = _season_dataset_name(category, stat_type)
             try:
@@ -540,7 +553,18 @@ def parse_season_stats_html(
                         _table_has_materialized_rows(table)
                         for table in source_tables
                     )
-                    if source_tables and not has_rows:
+                    if not has_any_table and not valid_zero_table_page:
+                        results[dataset_name] = DatasetParseResult(
+                            dataset=dataset_name,
+                            status=DatasetStatus.ERROR,
+                            reason="zero_table_season_identity_missing",
+                            error_type="SeasonPageContractError",
+                            error_message=(
+                                "Table-free season response lacks the expected "
+                                "source identity and competition history backlink"
+                            ),
+                        )
+                    elif source_tables and not has_rows:
                         results[dataset_name] = DatasetParseResult(
                             dataset=dataset_name,
                             status=DatasetStatus.EMPTY,
@@ -715,6 +739,7 @@ class FBrefTypedBronzeWriter:
             decorated,
             delete_filter=delete_filter,
             staging_id=staging_id,
+            single_statement_replace=True,
         )
         if inserted != len(decorated):
             raise TypedBronzePersistenceError(

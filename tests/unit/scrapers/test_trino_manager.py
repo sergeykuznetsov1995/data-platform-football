@@ -3,7 +3,7 @@ Unit tests for TrinoTableManager.
 """
 
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 import pandas as pd
 import pyarrow as pa
 
@@ -576,6 +576,95 @@ class TestTrinoTableManagerInsertDataFrameAtomic:
             assert delete_idx < insert_idx
             # Success → unique stage dropped once.
             mock_drop.assert_called_once_with('bronze', stage, if_exists=True)
+
+    def test_single_statement_replace_uses_tombstone_merge_without_delete(self):
+        """FBref typed partitions publish in one Iceberg snapshot.
+
+        The live target is never exposed between a committed DELETE and a
+        later INSERT: old scoped rows become tombstones in the stage and one
+        MERGE both removes them and inserts the replacement rows.
+        """
+        import pandas as pd
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.trino_manager import TrinoTableManager
+
+            manager = TrinoTableManager()
+            df = pd.DataFrame({'match_id': ['m1'], 'goals': [2]})
+
+            with patch.object(manager, '_execute', side_effect=self._exec_ok(1)) as execute, \
+                 patch.object(manager, 'insert_dataframe', return_value=1) as insert, \
+                 patch.object(manager, 'drop_table') as drop:
+                assert manager.insert_dataframe_atomic(
+                    'bronze',
+                    'fbref_match_team_stats',
+                    df,
+                    delete_filter="match_id = 'm1'",
+                    single_statement_replace=True,
+                ) == 1
+
+            statements = [call.args[0] for call in execute.call_args_list]
+            assert not any(sql.startswith('DELETE FROM') for sql in statements)
+            assert any(
+                sql.startswith('INSERT INTO iceberg.bronze.')
+                and "'delete' FROM iceberg.bronze.fbref_match_team_stats"
+                in sql
+                for sql in statements
+            )
+            merge = next(sql for sql in statements if sql.startswith('MERGE INTO'))
+            assert 'WHEN MATCHED THEN DELETE' in merge
+            assert "WHEN NOT MATCHED AND s.\"__dpf_replace_op\" = 'insert'" in merge
+            staged_frame = insert.call_args.args[2]
+            assert staged_frame['__dpf_replace_op'].tolist() == ['insert']
+            drop.assert_called_once()
+
+    def test_deterministic_stage_is_cleared_before_retry_and_after_success(self):
+        """A retained phase-two stage cannot make an Airflow retry collide."""
+        import pandas as pd
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.trino_manager import TrinoError, TrinoTableManager
+
+            manager = TrinoTableManager()
+            df = pd.DataFrame({'control_run_id': ['run-1'], 'rows': [2]})
+            merge_attempts = 0
+
+            def execute(sql, fetch=False):
+                nonlocal merge_attempts
+                if fetch:
+                    return [[1]]
+                if sql.startswith('MERGE INTO'):
+                    merge_attempts += 1
+                    if merge_attempts == 1:
+                        raise TrinoError('transient commit failure')
+                return None
+
+            with patch.object(manager, '_execute', side_effect=execute), \
+                 patch.object(manager, 'insert_dataframe', return_value=1), \
+                 patch.object(manager, 'drop_table') as drop:
+                with pytest.raises(TrinoError, match='transient commit failure'):
+                    manager.insert_dataframe_atomic(
+                        'bronze',
+                        'fbref_target_scope',
+                        df,
+                        delete_filter="control_run_id = 'run-1'",
+                        staging_id='scope_retry_safe',
+                        single_statement_replace=True,
+                    )
+
+                assert manager.insert_dataframe_atomic(
+                    'bronze',
+                    'fbref_target_scope',
+                    df,
+                    delete_filter="control_run_id = 'run-1'",
+                    staging_id='scope_retry_safe',
+                    single_statement_replace=True,
+                ) == 1
+
+            stage = 'fbref_target_scope__stg_scope_retry_safe'
+            assert drop.call_args_list == [
+                call('bronze', stage, if_exists=True),
+                call('bronze', stage, if_exists=True),
+                call('bronze', stage, if_exists=True),
+            ]
 
     def test_replace_partitions_retains_stage_when_swap_insert_fails(self):
         """The #283/#314 wipe scenario: DELETE commits, the merge INSERT then

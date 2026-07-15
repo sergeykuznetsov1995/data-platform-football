@@ -141,31 +141,13 @@ def _compact_json(value: Any) -> str:
     )
 
 
-def canonical_season(
-    edition_id_or_label: Any,
-    season_format: SeasonFormat | str,
-) -> str:
-    """Return the canonical season without guessing its format.
+def _split_year_bounds(raw: str) -> tuple[int, int]:
+    """The two calendar years a split-year edition spans."""
 
-    A four-digit source year becomes a split season only when
-    ``season_format=split_year``.  Therefore ``2026`` is ``2026`` for a World
-    Cup and ``2627`` for an explicitly split-year competition.
-    """
-
-    fmt = _enum_value(SeasonFormat, season_format)
-    raw = str(edition_id_or_label).strip()
-    if fmt is SeasonFormat.UNKNOWN:
-        raise RegistryError("season_format=unknown cannot produce a season")
-
-    if fmt is SeasonFormat.SINGLE_YEAR:
-        match = re.fullmatch(r"(19|20|21)\d{2}", raw)
-        if match is None:
-            raise RegistryError(f"invalid single-year edition: {raw!r}")
-        return raw
-
+    # The oldest leagues in the registry reach back into the 1890s.
     pair = re.fullmatch(
-        r"(?P<start>(?:19|20|21)?\d{2})\s*[/\-]\s*"
-        r"(?P<end>(?:19|20|21)?\d{2})",
+        r"(?P<start>(?:18|19|20|21)?\d{2})\s*[/\-]\s*"
+        r"(?P<end>(?:18|19|20|21)?\d{2})",
         raw,
     )
     if pair is not None:
@@ -186,13 +168,59 @@ def canonical_season(
             raise RegistryError(
                 f"split-year edition must span one year: {raw!r}"
             )
-        return f"{start_year % 100:02d}{end_year % 100:02d}"
+        return start_year, end_year
 
     if re.fullmatch(r"(19|20|21)\d{2}", raw):
         start_year = int(raw)
-        return f"{start_year % 100:02d}{(start_year + 1) % 100:02d}"
+        return start_year, start_year + 1
 
     raise RegistryError(f"invalid split-year edition: {raw!r}")
+
+
+def canonical_season(
+    edition_id_or_label: Any,
+    season_format: SeasonFormat | str,
+) -> str:
+    """Return the canonical season without guessing its format.
+
+    A four-digit source year becomes a split season only when
+    ``season_format=split_year``.  Therefore ``2026`` is ``2026`` for a World
+    Cup and ``2627`` for an explicitly split-year competition.
+    """
+
+    fmt = _enum_value(SeasonFormat, season_format)
+    raw = str(edition_id_or_label).strip()
+    if fmt is SeasonFormat.UNKNOWN:
+        raise RegistryError("season_format=unknown cannot produce a season")
+
+    if fmt is SeasonFormat.SINGLE_YEAR:
+        match = re.fullmatch(r"(18|19|20|21)\d{2}", raw)
+        if match is None:
+            raise RegistryError(f"invalid single-year edition: {raw!r}")
+        return raw
+
+    start_year, end_year = _split_year_bounds(raw)
+    return f"{start_year % 100:02d}{end_year % 100:02d}"
+
+
+def season_window_year(
+    edition_id_or_label: Any,
+    season_format: SeasonFormat | str,
+    canonical: Optional[str] = None,
+) -> int:
+    """The calendar year a season's date window opens in.
+
+    A split-year season is named by the year it opens in, and that year is its
+    saison_id.  A calendar-year season is named by the year the source prints
+    on it — from which the source offsets some saison_ids — so for those the
+    registered season, not the edition id, states the window.
+    """
+
+    fmt = _enum_value(SeasonFormat, season_format)
+    if fmt is SeasonFormat.SINGLE_YEAR:
+        return int(canonical or canonical_season(edition_id_or_label, fmt))
+    start_year, _ = _split_year_bounds(str(edition_id_or_label).strip())
+    return start_year
 
 
 @dataclass(frozen=True)
@@ -208,6 +236,11 @@ class ClassificationEvidence:
     team_type: Optional[TeamType] = None
     age_category: Optional[AgeCategory] = None
     season_format: Optional[SeasonFormat] = None
+    # How narrowly the source made this statement. The catalogue lists one
+    # competition under several headings — the World Cup sits both in the broad
+    # "International cup competitions" rubric and in "National Team
+    # Competitions" — and the narrower statement is the one it means.
+    precedence: int = 0
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -249,6 +282,7 @@ class ClassificationEvidence:
             team_type=signals.get("team_type"),
             age_category=signals.get("age_category"),
             season_format=signals.get("season_format"),
+            precedence=int(value.get("precedence", 0)),
         )
 
     def as_dict(self) -> dict[str, Any]:
@@ -265,6 +299,7 @@ class ClassificationEvidence:
                 signals[name] = value.value
         return {
             "origin": self.origin.value,
+            "precedence": self.precedence,
             "signals": signals,
             "source_field": self.source_field,
             "source_url": self.source_url,
@@ -279,6 +314,26 @@ _DIMENSIONS: tuple[tuple[str, Type[Enum]], ...] = (
     ("age_category", AgeCategory),
     ("season_format", SeasonFormat),
 )
+
+
+def narrowest_signals(
+    evidence: Iterable[ClassificationEvidence],
+    dimension: str,
+) -> set[Any]:
+    """The values stated at the source's narrowest level for one dimension.
+
+    A broad rubric that also brackets the competition does not contradict the
+    narrow statement; two statements at the same level still do.
+    """
+    stated = [item for item in evidence if getattr(item, dimension) is not None]
+    if not stated:
+        return set()
+    narrowest = max(item.precedence for item in stated)
+    return {
+        getattr(item, dimension)
+        for item in stated
+        if item.precedence == narrowest
+    }
 
 
 @dataclass(frozen=True)
@@ -386,17 +441,42 @@ class CompetitionRecord:
         )
 
     def _classification(self) -> tuple[ClassificationStatus, Optional[str]]:
+        # The source only marks age structurally for league competitions, under
+        # its "Youth league" group; for tournaments it says so in the name and
+        # nowhere else, which is why the U17 World Cup sits in the very section
+        # that certifies its entrants as national teams. A name may therefore
+        # exclude a competition from the crawl — it can never admit one.
+        named = [
+            item for item in self.evidence if item.origin is EvidenceOrigin.NAME
+        ]
+        name_exclusions = [
+            f"{dimension}={getattr(item, dimension).value} (name)"
+            for item in named
+            for dimension, excluded in (
+                ("gender", {Gender.WOMEN, Gender.MIXED}),
+                ("age_category", {AgeCategory.YOUTH, AgeCategory.UXX}),
+                ("team_type", {TeamType.RESERVE, TeamType.MIXED}),
+            )
+            if getattr(item, dimension) in excluded
+        ]
+        if name_exclusions:
+            return (
+                ClassificationStatus.EXCLUDED,
+                "; ".join(sorted(set(name_exclusions))),
+            )
+
         conflicts: list[str] = []
         missing: list[str] = []
         for name, enum_type in _DIMENSIONS:
             declared = getattr(self, name)
-            signals = {
-                getattr(item, name)
+            stated = [
+                item
                 for item in self.evidence
                 if item.origin is not EvidenceOrigin.NAME
                 and getattr(item, name) is not None
                 and getattr(item, name) != enum_type("unknown")
-            }
+            ]
+            signals = narrowest_signals(stated, name)
             if len(signals) > 1 or (signals and declared not in signals):
                 conflicts.append(name)
             elif declared == enum_type("unknown") or not signals:
@@ -653,8 +733,10 @@ class CrawlScope:
             raise UnsafeCrawlError(
                 f"{competition.competition_id}/{edition.edition_id} is inactive"
             )
-        if competition.season_format is not edition.season_format:
-            raise RegistryConflictError("competition/edition season_format mismatch")
+        # A competition's format is the one its current edition runs on, and
+        # older editions legitimately keep theirs (Australia played 1977 as a
+        # calendar year); each edition's canonical_season already carries its
+        # own format, so the two need not agree.
         if (
             competition.registry_snapshot_id
             and edition.registry_snapshot_id
@@ -851,14 +933,6 @@ def reconcile_registry_pages(
             "editions reference undiscovered competitions: "
             + ", ".join(missing_parents)
         )
-    for edition in editions.values():
-        competition = competitions[edition.competition_id]
-        if edition.season_format is not competition.season_format:
-            raise RegistryConflictError(
-                "competition/edition season_format mismatch: "
-                f"{edition.competition_id}/{edition.edition_id}"
-            )
-
     if expected_competition_ids is not None:
         expected_ids = {_required_text("competition_id", item) for item in expected_competition_ids}
         actual_ids = set(competitions)

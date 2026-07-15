@@ -179,6 +179,7 @@ def test_backfill_registry_selection_is_bounded_and_skips_completed_once():
     assert "historical_once" in source
     assert "frontier.state = 'fetched'" in source
     assert "frontier.next_fetch_at IS NULL" in source
+    assert "direct_match_only" in source
     assert "LIMIT %s" in source
 
     store = ControlStore(
@@ -381,21 +382,25 @@ def test_due_cohort_uses_fifo_age_before_priority():
     )
     assert "control_lane_rank <= %s" in sql
     assert "'competition_index', 'competition', 'season', 'schedule'" in sql
-    assert "competition.gender = 'male'" in sql
-    assert "competition.crawl_state = 'active'" in sql
-    assert "season.is_current" in sql
+    assert "fbref_control.frontier_provenance" in sql
+    assert "scope.scope_count > 0" in sql
+    assert "scope.has_female" in sql
+    assert "scope.has_unknown" in sql
+    assert "scope.has_current_season" in sql
+    assert "NOT (frontier.source_ids ? 'competition_id')" not in sql
 
 
 def test_claim_rechecks_registry_scope_before_any_network_lease():
     source = inspect.getsource(ControlStore.claim_targets)
 
-    assert "competition.gender = 'male'" in source
-    assert "competition.lifecycle_state = 'present'" in source
-    assert "competition.present" in source
-    assert "season.lifecycle_state = 'present'" in source
-    assert "season.present" in source
-    assert "season.is_current" in source
+    assert "_FRONTIER_SCOPE_CTE" in source
+    assert "scope.scope_count > 0" in source
+    assert "scope.competition_missing" in source
+    assert "scope.has_female" in source
+    assert "scope.has_unknown" in source
+    assert "scope.has_current_season" in source
     assert "frontier.refresh_policy = 'historical_once'" in source
+    assert "NOT (frontier.source_ids ? 'competition_id')" not in source
 
 
 def test_explicit_cohort_cannot_steal_target_from_active_run_or_canary():
@@ -465,6 +470,7 @@ def test_registry_transitions_close_out_of_scope_frontier_without_deletion():
 
     assert "frontier_scope_closed" in competition_source
     assert "THEN 'quarantined'" in competition_source
+    assert "frontier.last_error_class = 'ScopeQuarantined'" in competition_source
     assert "ELSE 'skipped'" in competition_source
     assert "frontier.state <> 'leased'" in competition_source
     assert "frontier_scope_closed" in season_source
@@ -1121,3 +1127,86 @@ def test_raw_recovery_reattributes_network_metrics_to_reserved_source_attempt():
     assert "array_positions(" in summary_source
     assert "attempt.http_request_count - 1" in summary_source
     assert "500, 502, 503, 504" in summary_source
+
+
+def test_a_failed_registry_snapshot_can_be_replaced_by_a_successful_retry():
+    """A failed snapshot records what our parse did, not what the source said.
+    Freezing it would poison the (parser, page) pair forever — the retry that
+    fixes the parser could never record its result, and the target would stay
+    stuck until the parser version changed."""
+    snapshot_id = str(uuid.uuid4())
+    run_id = str(uuid.uuid4())
+    fetched_at = datetime(2026, 7, 13, 12, tzinfo=timezone.utc)
+    updates = []
+
+    def handler(sql, params):
+        if "INSERT INTO fbref_control.registry_snapshot" in sql:
+            return [], 0
+        if "UPDATE fbref_control.registry_snapshot" in sql:
+            updates.append(params)
+            return [], 1
+        if "FROM fbref_control.registry_snapshot" in sql:
+            return [{
+                "run_id": run_id,
+                "source": "fbref",
+                "content_hash": "abc123",
+                "successful": False,
+                "fetched_at": fetched_at,
+                "metadata": {"page_kind": "competition"},
+            }], 1
+        raise AssertionError(sql)
+
+    store = ControlStore(
+        "postgresql://airflow:pw@postgres/airflow",
+        connection_factory=FakeFactory(handler),
+    )
+
+    store.create_registry_snapshot(
+        snapshot_id=snapshot_id,
+        run_id=run_id,
+        fetched_at=fetched_at,
+        successful=True,
+        content_hash="abc123",
+        metadata={"page_kind": "competition"},
+    )
+
+    assert len(updates) == 1
+    assert True in updates[0]
+
+
+def test_a_successful_registry_snapshot_stays_immutable():
+    """Evidence about the source itself must never be rewritten."""
+    snapshot_id = str(uuid.uuid4())
+    run_id = str(uuid.uuid4())
+    fetched_at = datetime(2026, 7, 13, 12, tzinfo=timezone.utc)
+
+    def handler(sql, _params):
+        if "INSERT INTO fbref_control.registry_snapshot" in sql:
+            return [], 0
+        if "UPDATE fbref_control.registry_snapshot" in sql:
+            raise AssertionError("a successful snapshot must not be updated")
+        if "FROM fbref_control.registry_snapshot" in sql:
+            return [{
+                "run_id": run_id,
+                "source": "fbref",
+                "content_hash": "abc123",
+                "successful": True,
+                "fetched_at": fetched_at,
+                "metadata": {"page_kind": "competition"},
+            }], 1
+        raise AssertionError(sql)
+
+    store = ControlStore(
+        "postgresql://airflow:pw@postgres/airflow",
+        connection_factory=FakeFactory(handler),
+    )
+
+    with pytest.raises(StateConflict, match="different evidence"):
+        store.create_registry_snapshot(
+            snapshot_id=snapshot_id,
+            run_id=run_id,
+            fetched_at=fetched_at,
+            successful=False,
+            content_hash="abc123",
+            metadata={"page_kind": "competition"},
+        )

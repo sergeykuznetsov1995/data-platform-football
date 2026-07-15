@@ -52,15 +52,38 @@ _EDITION_COLUMNS = (
     'schema_revision', 'fetched_at', 'cycle_id', 'scope_id',
     '_bronze_ingested_at', '_batch_id',
 )
+# Which run produced a row is not part of its content: a snapshot republished by
+# a later cycle carries fresh run stamps and identical data, and the MERGE is
+# keyed on the snapshot, so comparing the stamps would report every row as
+# mismatched.
+_RUN_STAMP_COLUMNS = frozenset(
+    {
+        'discovered_at',
+        'fetched_at',
+        'cycle_id',
+        'scope_id',
+        '_bronze_ingested_at',
+        '_batch_id',
+    }
+)
+_COMPETITION_CONTENT_COLUMNS = tuple(
+    column for column in _COMPETITION_COLUMNS if column not in _RUN_STAMP_COLUMNS
+)
+_EDITION_CONTENT_COLUMNS = tuple(
+    column for column in _EDITION_COLUMNS if column not in _RUN_STAMP_COLUMNS
+)
 _STATE_COLUMNS = (
     'state_key', 'registry_snapshot_id', 'source_hash', 'competition_count',
     'edition_count', 'unknown_active_count', 'status', 'revision',
 )
+# A competition's format is the one its current edition runs on; older editions
+# keep theirs, so the two legitimately differ and only each edition's own
+# format-vs-season agreement is checked (canonical_season_violations).
 _DQ_FIELDS = (
     'competition_count', 'competition_distinct_count', 'edition_count',
     'edition_distinct_count', 'orphan_editions',
     'competitions_without_editions', 'current_edition_violations',
-    'season_format_mismatches', 'canonical_season_violations',
+    'canonical_season_violations',
     'classification_evidence_violations', 'classification_field_violations',
     'unknown_active_count', 'content_mismatch_count',
 )
@@ -379,22 +402,26 @@ def _dq_sql(
     snapshot = _sql_literal(snapshot_id)
     mismatch = 'CAST(0 AS bigint)'
     if compare_competitions and compare_editions:
-        c_columns = ', '.join(_COMPETITION_COLUMNS)
-        e_columns = ', '.join(_EDITION_COLUMNS)
+        c_columns = ', '.join(_COMPETITION_CONTENT_COLUMNS)
+        e_columns = ', '.join(_EDITION_CONTENT_COLUMNS)
+        # Competitions and editions have different shapes, so their differences
+        # cannot share one UNION; count each side and add the totals.
         mismatch = f"""(
-            SELECT COUNT(*) FROM (
+            (SELECT COUNT(*) FROM (
                 (SELECT {c_columns} FROM c
                  EXCEPT SELECT {c_columns} FROM {compare_competitions})
                 UNION ALL
                 (SELECT {c_columns} FROM {compare_competitions}
                  EXCEPT SELECT {c_columns} FROM c)
-                UNION ALL
+            ) competition_differences)
+            +
+            (SELECT COUNT(*) FROM (
                 (SELECT {e_columns} FROM e
                  EXCEPT SELECT {e_columns} FROM {compare_editions})
                 UNION ALL
                 (SELECT {e_columns} FROM {compare_editions}
                  EXCEPT SELECT {e_columns} FROM e)
-            ) differences
+            ) edition_differences)
         )"""
     return f"""/* tm_registry_dq:{tag} */
 WITH c AS (
@@ -424,16 +451,18 @@ SELECT
      LEFT JOIN current_counts cc USING (competition_id)
      WHERE COALESCE(cc.current_count, 0) <> 1)
         AS current_edition_violations,
-    (SELECT COUNT(*) FROM e
-     JOIN c USING (competition_id)
-     WHERE e.season_format <> c.season_format)
-        AS season_format_mismatches,
     (SELECT count_if(
         TRY_CAST(edition_id AS integer) IS NULL
-        OR NOT regexp_like(edition_id, '^(19|20|21)[0-9]{{2}}$')
+        OR NOT regexp_like(edition_id, '^(18|19|20|21)[0-9]{{2}}$')
         OR NOT regexp_like(canonical_season, '^[0-9]{{4}}$')
         OR season_format NOT IN ('split_year', 'single_year')
-        OR (season_format = 'single_year' AND canonical_season <> edition_id)
+        -- The source's saison_id is not the season for calendar-year leagues:
+        -- K League's 2026 season is served under saison_id 2025. The label is
+        -- what states the season, so the canonical season answers to it.
+        OR (
+            season_format = 'single_year'
+            AND canonical_season <> regexp_replace(edition_label, '[^0-9]', '')
+        )
         OR (season_format = 'split_year' AND canonical_season <> concat(
             substr(edition_id, 3, 2),
             lpad(CAST(mod(TRY_CAST(edition_id AS integer) + 1, 100) AS varchar), 2, '0')

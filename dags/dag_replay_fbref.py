@@ -16,9 +16,13 @@ from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 
 from utils.default_args import DEFAULT_ARGS
 from utils.fbref_pipeline_tasks import (
+    acquire_fbref_publication_lock,
+    export_fbref_publication_scope,
     fbref_dag_failure_callback,
+    finalize_fbref_publication_lock,
     initialize_fbref_run,
     parse_fbref_wave,
+    validate_fbref_production_readiness,
     validate_fbref_run,
 )
 
@@ -43,6 +47,10 @@ REPLAY_SHARD_SIZE = 25
 
 AIRFLOW_RUN_ID = "{{ run_id }}"
 DAG_ID = "{{ dag.dag_id }}"
+SOURCE_CONTROL_RUN_ID = (
+    "{{ dag_run.conf.get('source_control_run_id', "
+    "params.source_control_run_id) }}"
+)
 
 
 with DAG(
@@ -54,6 +62,7 @@ with DAG(
     catchup=False,
     max_active_runs=1,
     max_active_tasks=1,
+    dagrun_timeout=timedelta(hours=18),
     on_failure_callback=fbref_dag_failure_callback,
     render_template_as_native_obj=True,
     tags=["fbref", "bronze", "replay", "network-disabled"],
@@ -82,6 +91,18 @@ with DAG(
     task and cannot construct the FBref transport.
     """,
 ) as dag:
+    validate_production_readiness = PythonOperator(
+        task_id="validate_production_readiness",
+        python_callable=validate_fbref_production_readiness,
+        op_kwargs={
+            "run_type": "replay",
+            "request_limit": 0,
+            "byte_limit_mb": 0,
+            "shard_size": REPLAY_SHARD_SIZE,
+        },
+        trigger_rule="all_success",
+    )
+
     initialize_run = PythonOperator(
         task_id="initialize_run",
         python_callable=initialize_fbref_run,
@@ -98,7 +119,17 @@ with DAG(
         trigger_rule="all_success",
     )
 
-    previous = initialize_run
+    acquire_publication_lock = PythonOperator(
+        task_id="acquire_publication_lock",
+        python_callable=acquire_fbref_publication_lock,
+        op_kwargs={"airflow_run_id": AIRFLOW_RUN_ID, "dag_id": DAG_ID},
+        retries=0,
+        trigger_rule="all_success",
+    )
+
+    validate_production_readiness >> initialize_run
+    initialize_run >> acquire_publication_lock
+    previous = acquire_publication_lock
     for wave_number in range(1, REPLAY_WAVE_COUNT + 1):
         parse = PythonOperator(
             task_id=f"parse_wave_{wave_number:02d}",
@@ -108,9 +139,7 @@ with DAG(
                 "dag_id": DAG_ID,
                 "page_kinds": REPLAY_PAGE_KINDS,
                 "run_type": "replay",
-                "source_control_run_id": (
-                    "{{ params.source_control_run_id }}"
-                ),
+                "source_control_run_id": SOURCE_CONTROL_RUN_ID,
                 "request_limit": 0,
                 "byte_limit_mb": 0,
                 "shard_size": REPLAY_SHARD_SIZE,
@@ -127,8 +156,15 @@ with DAG(
         op_kwargs={
             "airflow_run_id": AIRFLOW_RUN_ID,
             "dag_id": DAG_ID,
-            "source_control_run_id": "{{ params.source_control_run_id }}",
+            "source_control_run_id": SOURCE_CONTROL_RUN_ID,
         },
+        trigger_rule="all_success",
+    )
+
+    export_publication_scope = PythonOperator(
+        task_id="export_publication_scope",
+        python_callable=export_fbref_publication_scope,
+        op_kwargs={"airflow_run_id": AIRFLOW_RUN_ID, "dag_id": DAG_ID},
         trigger_rule="all_success",
     )
 
@@ -137,6 +173,16 @@ with DAG(
         trigger_dag_id="dag_transform_fbref_silver",
         trigger_run_id="fbref_silver__{{ dag.dag_id }}__{{ run_id }}",
         logical_date="{{ ti.start_date }}",
+        conf={
+            "fbref_source_dag_id": DAG_ID,
+            "fbref_source_run_id": AIRFLOW_RUN_ID,
+            "fbref_control_run_id": (
+                "{{ ti.xcom_pull(task_ids='initialize_run') }}"
+            ),
+            "replay_source_control_run_id": SOURCE_CONTROL_RUN_ID,
+            "publication_scope": "fbref_silver_only",
+            "trigger_xref": False,
+        },
         wait_for_completion=True,
         reset_dag_run=False,
         poke_interval=30,
@@ -147,7 +193,16 @@ with DAG(
         trigger_rule="all_success",
     )
 
-    previous >> validate_run >> trigger_silver
+    release_publication_lock = PythonOperator(
+        task_id="release_publication_lock",
+        python_callable=finalize_fbref_publication_lock,
+        op_kwargs={"airflow_run_id": AIRFLOW_RUN_ID, "dag_id": DAG_ID},
+        retries=0,
+        trigger_rule="all_done",
+    )
+
+    previous >> validate_run >> export_publication_scope >> trigger_silver
+    trigger_silver >> release_publication_lock
 
 
 __all__ = ["dag"]

@@ -32,6 +32,7 @@ from scrapers.transfermarkt.registry import (
     TeamType,
     UnknownCompetitionError,
     canonical_season,
+    narrowest_signals,
     resolve_competition,
 )
 
@@ -51,9 +52,25 @@ _COUNTRY_ROUTE_RE = re.compile(
     r"^/wettbewerbe/national/wettbewerbe/[A-Za-z0-9_-]+(?:/.*)?$"
 )
 _COMPETITION_ROUTE_RE = re.compile(
-    r"^/(?P<slug>[^/?#]+)/[^?#]*/(?P<kind>pokalwettbewerb|wettbewerb)/"
+    r"^/(?P<slug>[^/?#]+)/(?:[^?#]*/)?(?P<section>[^/?#]+)/"
+    r"(?P<kind>pokalwettbewerb|wettbewerb)/"
     r"(?P<competition_id>[A-Za-z0-9_-]+)(?:/.*)?$"
 )
+_CANONICAL_SECTION = "startseite"
+# A snapshot is what the source said *as read by this parser*: the same pages
+# yield different records once the parser changes, and Silver snapshots are
+# immutable, so the parser revision is part of the snapshot identity. Bump it
+# whenever parsing or classification changes — otherwise a restated catalogue
+# cannot be published over the snapshot id it would otherwise reuse.
+PARSER_REVISION = "tm-html-discovery-v2"
+SCHEMA_REVISION = "1"
+# The catalogue states a competition's taxonomy at three levels: a broad section
+# heading, a group separator inside the tables, and the "National Team
+# Competitions" section, which names the entrants themselves — a table group can
+# say "cup" about a national-team tournament, but not that clubs play in it.
+_SECTION_PRECEDENCE = 1
+_GROUP_PRECEDENCE = 2
+_ENTRANT_PRECEDENCE = 3
 _EDITION_PATH_RE = re.compile(r"/saison_id/(?P<edition_id>\d{4})(?:/|$)")
 
 
@@ -137,7 +154,7 @@ def _canonical_url(value: str, *, base_url: str = BASE_URL) -> Optional[str]:
     return urlunsplit(("https", "www.transfermarkt.com", path, query, ""))
 
 
-def _profile_identity(url: str) -> Optional[tuple[str, str, str]]:
+def _profile_identity(url: str) -> Optional[tuple[str, str, str, str]]:
     parsed = urlsplit(url)
     match = _COMPETITION_ROUTE_RE.match(parsed.path)
     if match is None:
@@ -146,6 +163,35 @@ def _profile_identity(url: str) -> Optional[tuple[str, str, str]]:
         match.group("competition_id"),
         match.group("slug"),
         match.group("kind"),
+        match.group("section"),
+    )
+
+
+def _preferred_name(existing: str, candidate: str) -> str:
+    """Pick the fuller label for one competition.
+
+    Cards label the same competition differently (``World Cup`` beside ``FIFA
+    World Cup``, a bare table figure beside the listing name); a trailing year
+    is card context, not part of the name.
+    """
+    return min(
+        (existing, candidate),
+        key=lambda value: (
+            bool(re.search(r"\b(?:19|20)\d{2}$", value)),
+            -len(value),
+            value.casefold(),
+        ),
+    )
+
+
+def _route_rank(url: str) -> tuple[bool, bool, str]:
+    identity = _profile_identity(url)
+    if identity is None:
+        raise DiscoverySchemaError(f"invalid profile route: {url}")
+    return (
+        identity[2] != "wettbewerb",
+        identity[3] != _CANONICAL_SECTION,
+        url,
     )
 
 
@@ -167,6 +213,30 @@ def _is_seed_listing(url: str) -> bool:
     parsed = urlsplit(url)
     path = parsed.path.rstrip("/")
     return path in SEED_ROUTES
+
+
+def _in_site_chrome(anchor: Any) -> bool:
+    """True for anchors in the global navbar, which every page repeats.
+
+    The navbar advertises a fixed set of headline competitions (the World Cup
+    among them).  Reading them as listing entries would attribute the hosting
+    page's country to a competition that merely appears in the site chrome.
+    """
+    for parent in anchor.parents:
+        classes = parent.get("class") or () if hasattr(parent, "get") else ()
+        if any(str(cls).startswith("main-navbar") for cls in classes):
+            return True
+    return False
+
+
+def _has_listing_query_only(url: str) -> bool:
+    """True unless the URL carries query state other than pagination.
+
+    Confederation listings render the same rows under ``?sort=`` links in the
+    table head; following them re-buys an identical page.
+    """
+    query = parse_qsl(urlsplit(url).query, keep_blank_values=True)
+    return all(key == "page" for key, _ in query)
 
 
 def _is_country_listing(url: str) -> bool:
@@ -218,6 +288,12 @@ def _section_signals(label: str) -> _SectionSignals:
             "international club competitions",
             "continental club competitions",
             "club competitions",
+            # The confederation catalogues head their continental club section
+            # "Cups" / "International cups" / "International cup competitions".
+            "international cups",
+            "international cup competitions",
+            "cup competitions",
+            "cups",
         )
     ):
         return _SectionSignals(
@@ -245,6 +321,94 @@ def _section_signals(label: str) -> _SectionSignals:
         gender=gender,
         age_category=AgeCategory.UXX if youth else None,
     )
+
+
+def _row_group_label(anchor: Tag) -> str:
+    """The catalogue table's own group heading above this competition's row.
+
+    The confederation listings group their rows under structural separators —
+    ``First Tier``, ``Domestic Cup``, ``Youth league``, ``Reserve league`` — and
+    that grouping, not the competition's name, is what states its type, age and
+    team category.
+    """
+    row = anchor.find_parent("tr")
+    while row is not None:
+        previous = row.find_previous_sibling("tr")
+        while previous is not None:
+            separator = previous.select_one("td.extrarow")
+            if separator is not None:
+                return _normalise_text(separator.get_text(" ", strip=True))
+            previous = previous.find_previous_sibling("tr")
+        row = row.find_parent("tr")
+    return ""
+
+
+def _group_signals(label: str) -> _SectionSignals:
+    """Map the table's group heading; never inspect a competition name."""
+
+    normalised = _normalise_text(label).casefold()
+    if not normalised:
+        return _SectionSignals()
+    if "reserve" in normalised:
+        return _SectionSignals(
+            competition_type=CompetitionType.DOMESTIC_LEAGUE,
+            team_type=TeamType.RESERVE,
+            age_category=AgeCategory.SENIOR,
+        )
+    age_category = (
+        AgeCategory.UXX if "youth" in normalised else AgeCategory.SENIOR
+    )
+    if "cup" in normalised:
+        return _SectionSignals(
+            competition_type=CompetitionType.DOMESTIC_CUP,
+            team_type=TeamType.CLUB,
+            age_category=age_category,
+        )
+    if any(
+        token in normalised
+        for token in ("tier", "league", "championship", "play-off", "playoff")
+    ):
+        return _SectionSignals(
+            competition_type=CompetitionType.DOMESTIC_LEAGUE,
+            team_type=TeamType.CLUB,
+            age_category=age_category,
+        )
+    return _SectionSignals()
+
+
+def _section_precedence(label: str) -> int:
+    """How narrowly a section heading speaks about the rows under it.
+
+    "National Team Competitions" names who plays, which no table group can
+    contradict; the broad rubrics ("Cups", "International cup competitions")
+    bracket club and national-team tournaments together and merely locate them.
+    """
+    normalised = _normalise_text(label).casefold()
+    if any(
+        token in normalised
+        for token in (
+            "national team competitions",
+            "national-team competitions",
+            "fifa tournaments",
+            # These say who plays, not where the competition sits: the UEFA
+            # Youth League is listed under "Youth Competitions" and again under
+            # the "Cups" rubric, which cannot make its entrants senior.
+            "youth competitions",
+            "women",
+            "frauen",
+        )
+    ):
+        return _ENTRANT_PRECEDENCE
+    narrow = any(
+        token in normalised
+        for token in (
+            "national leagues",
+            "domestic leagues",
+            "national cups",
+            "domestic cups",
+        )
+    )
+    return _GROUP_PRECEDENCE if narrow else _SECTION_PRECEDENCE
 
 
 def _section_label(anchor: Tag) -> str:
@@ -326,16 +490,48 @@ def _signal_evidence(
     label: str,
     source_url: str,
     signals: _SectionSignals,
+    precedence: int = _SECTION_PRECEDENCE,
 ) -> ClassificationEvidence:
     return ClassificationEvidence(
         source_field="section_label",
         source_value=label or "unclassified",
         source_url=source_url,
         origin=EvidenceOrigin.SOURCE_PAGE,
+        precedence=precedence,
         competition_type=signals.competition_type,
         gender=signals.gender,
         team_type=signals.team_type,
         age_category=signals.age_category,
+    )
+
+
+_NAME_AGE_RE = re.compile(r"\b[uU]-?(?:1[4-9]|2[0-3])\b|\byouth\b", re.IGNORECASE)
+_NAME_WOMEN_RE = re.compile(r"\bwomen(?:'s)?\b|\bfrauen\b|\bfeminin\w*\b", re.IGNORECASE)
+
+
+def _name_exclusion_evidence(
+    name: str,
+    source_url: str,
+) -> Optional[ClassificationEvidence]:
+    """What the competition's own name rules out.
+
+    Age is stated structurally only for leagues, under the catalogue's "Youth
+    league" group. A youth *tournament* is listed beside the senior ones — the
+    U17 World Cup sits in the same "National Team Competitions" section as the
+    World Cup — and says so only in its name. This evidence can exclude a
+    competition from the crawl; ``_classification`` never lets it admit one.
+    """
+    age = AgeCategory.UXX if _NAME_AGE_RE.search(name) else None
+    gender = Gender.WOMEN if _NAME_WOMEN_RE.search(name) else None
+    if age is None and gender is None:
+        return None
+    return ClassificationEvidence(
+        source_field="competition_name",
+        source_value=name,
+        source_url=source_url,
+        origin=EvidenceOrigin.NAME,
+        age_category=age,
+        gender=gender,
     )
 
 
@@ -352,11 +548,14 @@ def _taxonomy_evidence(source_url: str) -> ClassificationEvidence:
 def _listing_links(soup: BeautifulSoup, page_url: str) -> tuple[str, ...]:
     links: set[str] = set()
     for anchor in soup.select("a[href]"):
+        if _in_site_chrome(anchor):
+            continue
         canonical = _canonical_url(str(anchor.get("href")), base_url=page_url)
         if canonical is None:
             continue
         if _is_seed_listing(canonical) or _is_country_listing(canonical):
-            links.add(canonical)
+            if _has_listing_query_only(canonical):
+                links.add(canonical)
             continue
         classes = set(anchor.get("class", ()))
         parent_classes = set(anchor.parent.get("class", ())) if anchor.parent else set()
@@ -382,6 +581,8 @@ def _listing_candidates(
     candidates: list[_CompetitionCandidate] = []
     seen_links = 0
     for anchor in soup.select("a[href]"):
+        if _in_site_chrome(anchor):
+            continue
         profile_url = _profile_url(str(anchor.get("href")))
         if profile_url is None:
             continue
@@ -389,7 +590,7 @@ def _listing_candidates(
         if identity is None:
             continue
         seen_links += 1
-        competition_id, slug, _kind = identity
+        competition_id, slug, _kind, _section = identity
         image = anchor.find("img")
         name = _normalise_text(
             anchor.get_text(" ", strip=True)
@@ -401,8 +602,13 @@ def _listing_candidates(
             raise DiscoverySchemaError(
                 f"competition link has no name: {page_url} -> {profile_url}"
             )
-        label = _section_label(anchor)
-        signals = _section_signals(label)
+        section_label = _section_label(anchor)
+        group_label = _row_group_label(anchor)
+        stated = (
+            (section_label, _section_signals(section_label),
+             _section_precedence(section_label)),
+            (group_label, _group_signals(group_label), _GROUP_PRECEDENCE),
+        )
         country = _normalise_text(anchor.get("data-country") or context.country)
         confederation = _normalise_text(
             anchor.get("data-confederation") or context.confederation
@@ -412,24 +618,29 @@ def _listing_candidates(
         # manufacture a conflict and block the whole registry instead of
         # source-backed exclusion of that competition.
         evidence = []
-        if signals.gender is not Gender.WOMEN:
+        excluded_by_name = _name_exclusion_evidence(name, page_url)
+        if excluded_by_name is not None:
+            evidence.append(excluded_by_name)
+        if all(signals.gender is not Gender.WOMEN for _, signals, _p in stated):
             evidence.append(_taxonomy_evidence(page_url))
-        if any(
-            value is not None
-            for value in (
-                signals.competition_type,
-                signals.gender,
-                signals.team_type,
-                signals.age_category,
-            )
-        ):
-            evidence.append(
-                _signal_evidence(
-                    label=label,
-                    source_url=page_url,
-                    signals=signals,
+        for label, signals, precedence in stated:
+            if any(
+                value is not None
+                for value in (
+                    signals.competition_type,
+                    signals.gender,
+                    signals.team_type,
+                    signals.age_category,
                 )
-            )
+            ):
+                evidence.append(
+                    _signal_evidence(
+                        label=label,
+                        source_url=page_url,
+                        signals=signals,
+                        precedence=precedence,
+                    )
+                )
         candidates.append(
             _CompetitionCandidate(
                 competition_id=competition_id,
@@ -470,12 +681,16 @@ def _merge_candidate(
     if existing is None:
         target[candidate.competition_id] = candidate
         return
-    # Transfermarkt can publish two routes for the same competition ID.  The
-    # current World Cup navigation, for example, contains both the legacy
-    # ``.../pokalwettbewerb/FIWC`` route and the canonical
-    # ``.../wettbewerb/FIWC`` route.  The source ID is the identity; prefer the
-    # generic competition route when this exact legacy/canonical pair occurs.
-    # Conflicts between two slugs of the same route kind remain fail-closed.
+    # Transfermarkt publishes several routes for the same competition ID: the
+    # legacy ``.../pokalwettbewerb/FIWC`` cup route beside the canonical
+    # ``.../wettbewerb/FIWC`` one, a secondary tab
+    # (``.../gastarbeiter/wettbewerb/EGY1``) beside the profile itself, and a
+    # renamed competition under its historical slug (``torneo-intermedio``
+    # beside ``liga-auf-intermedio`` for URUI).  The source ID is the identity
+    # and the slug is only URL decoration, so resolve the route deterministically
+    # rather than failing: prefer the generic competition route, then the
+    # ``startseite`` profile section.  Genuine source disagreement still fails
+    # closed on country/confederation below and on classification conflicts.
     existing_identity = _profile_identity(existing.profile_url)
     candidate_identity = _profile_identity(candidate.profile_url)
     if existing_identity is None or candidate_identity is None:
@@ -483,35 +698,15 @@ def _merge_candidate(
             f"invalid profile route for {candidate.competition_id}"
         )
     if existing.profile_url != candidate.profile_url:
-        existing_kind = existing_identity[2]
-        candidate_kind = candidate_identity[2]
-        if existing_kind == candidate_kind:
-            raise DiscoverySchemaError(
-                f"conflicting slug for {candidate.competition_id}"
-            )
         preferred = min(
             (existing, candidate),
-            key=lambda item: (
-                _profile_identity(item.profile_url)[2] != "wettbewerb",  # type: ignore[index]
-                item.profile_url,
-            ),
+            key=lambda item: _route_rank(item.profile_url),
         )
         existing.slug = preferred.slug
-        existing.name = preferred.name
         existing.profile_url = preferred.profile_url
+        existing.name = _preferred_name(existing.name, candidate.name)
     elif existing.name != candidate.name:
-        # Navigation cards may label the same canonical URL differently (for
-        # example ``World Cup`` and ``FIFA World Cup``).  Prefer the fuller
-        # non-edition label deterministically; a trailing year is card context,
-        # not part of the competition name.
-        existing.name = min(
-            (existing.name, candidate.name),
-            key=lambda value: (
-                bool(re.search(r"\b(?:19|20)\d{2}$", value)),
-                -len(value),
-                value.casefold(),
-            ),
-        )
+        existing.name = _preferred_name(existing.name, candidate.name)
     for name in ("country", "confederation"):
         old = getattr(existing, name)
         new = getattr(candidate, name)
@@ -532,6 +727,61 @@ def _merge_candidate(
         if serialised not in known_evidence:
             existing.evidence.append(item)
             known_evidence.add(serialised)
+
+
+def _has_season_markup(soup: BeautifulSoup) -> bool:
+    return bool(
+        soup.select('select[name*="saison"] option[value]')
+        or soup.select('a[href*="saison_id"]')
+    )
+
+
+def _canonical_profile_route(soup: BeautifulSoup, profile_url: str) -> Optional[str]:
+    """The route the source itself calls canonical, when it differs.
+
+    A cup is listed under both the generic ``/wettbewerb/`` route and its own
+    ``/pokalwettbewerb/`` one, but only the canonical route carries the season
+    selector — the generic one answers with a season-less page.
+    """
+    tag = soup.select_one('link[rel="canonical"]')
+    href = str(tag.get("href") or "") if tag is not None else ""
+    canonical = _profile_url(href) if href else None
+    if canonical is None or canonical == profile_url:
+        return None
+    return canonical
+
+
+_TITLE_SEASON_RE = re.compile(
+    r"\b(?P<label>(?:18|19|20|21)?\d{2}\s*/\s*\d{2}|(?:18|19|20|21)\d{2})\b"
+)
+
+
+def _title_edition(
+    soup: BeautifulSoup,
+    profile_url: str,
+) -> dict[str, tuple[str, bool, Mapping[str, Any]]]:
+    """The single edition a season-less profile is showing.
+
+    Cups and qualifiers — a third of the catalogue — carry no season selector
+    at all, not even on their canonical route: the profile shows the current
+    edition only, and names it in the page title ("CAF-Champions League 25/26").
+    Take the last season in the title, since an earlier one can belong to the
+    competition's own name ("AFC Challenge Cup (- 2014) 2013").
+    """
+    title = soup.find("title")
+    heading = _normalise_text(title.get_text(" ", strip=True)) if title else ""
+    heading = heading.split("|")[0]
+    matches = _TITLE_SEASON_RE.findall(heading)
+    if not matches:
+        raise DiscoverySchemaError(f"edition selector missing: {profile_url}")
+    label = _normalise_text(matches[-1])
+    season_format = _label_season_format(label, profile_url)
+    if season_format is SeasonFormat.SINGLE_YEAR:
+        edition_id = label
+    else:
+        start = re.split(r"\s*[/\-]\s*", label)[0]
+        edition_id = start if len(start) == 4 else f"20{start}"
+    return {edition_id: (label, True, {})}
 
 
 def _selector_options(
@@ -578,7 +828,7 @@ def _selector_options(
             values[edition_id] = (label, selected, dict(anchor.attrs))
 
     if not values:
-        raise DiscoverySchemaError(f"edition selector missing: {profile_url}")
+        values = _title_edition(soup, profile_url)
     selected_ids = [key for key, value in values.items() if value[1]]
     if len(selected_ids) != 1:
         raise DiscoverySchemaError(
@@ -589,32 +839,49 @@ def _selector_options(
     )
 
 
-def _season_format(labels: Iterable[str], profile_url: str) -> SeasonFormat:
-    formats: set[SeasonFormat] = set()
-    for label in labels:
-        if re.fullmatch(r"(?:19|20|21)\d{2}", label):
-            formats.add(SeasonFormat.SINGLE_YEAR)
-        elif re.fullmatch(
-            r"(?:(?:19|20|21)\d{2}|\d{2})\s*[/\-]\s*"
-            r"(?:\d{2}|(?:19|20|21)\d{2})",
-            label,
-        ):
-            formats.add(SeasonFormat.SPLIT_YEAR)
-        else:
-            raise DiscoverySchemaError(
-                f"unrecognised edition label {label!r}: {profile_url}"
-            )
-    if len(formats) != 1:
-        raise DiscoverySchemaError(f"mixed season formats: {profile_url}")
-    return next(iter(formats))
+def _label_season_format(label: str, profile_url: str) -> SeasonFormat:
+    if re.fullmatch(r"(?:18|19|20|21)\d{2}", label):
+        return SeasonFormat.SINGLE_YEAR
+    if re.fullmatch(
+        r"(?:(?:18|19|20|21)\d{2}|\d{2})\s*[/\-]\s*"
+        r"(?:\d{2}|(?:18|19|20|21)\d{2})",
+        label,
+    ):
+        return SeasonFormat.SPLIT_YEAR
+    raise DiscoverySchemaError(
+        f"unrecognised edition label {label!r}: {profile_url}"
+    )
+
+
+def _season_format(
+    options: Iterable[tuple[str, str, bool, Mapping[str, Any]]],
+    profile_url: str,
+) -> SeasonFormat:
+    """The format a competition runs on now.
+
+    Competitions switch format over their history — Australia played 1977 as a
+    calendar year and every season since as a split year — so the format is a
+    property of each edition, and the competition carries the one its current
+    edition uses.
+    """
+    formats = {
+        edition_id: _label_season_format(label, profile_url)
+        for edition_id, label, _selected, _attrs in options
+    }
+    current = [
+        edition_id
+        for edition_id, _label, selected, _attrs in options
+        if selected
+    ]
+    if len(current) != 1:
+        raise DiscoverySchemaError(
+            f"edition selector must mark exactly one current edition: {profile_url}"
+        )
+    return formats[current[0]]
 
 
 def _unique_signal(evidence: Iterable[ClassificationEvidence], name: str, unknown):
-    values = {
-        getattr(item, name)
-        for item in evidence
-        if getattr(item, name) is not None
-    }
+    values = narrowest_signals(evidence, name)
     return next(iter(values)) if len(values) == 1 else unknown
 
 
@@ -732,6 +999,18 @@ class TransfermarktCompetitionDiscovery:
         for candidate in sorted(candidates.values(), key=lambda item: item.competition_id):
             document = self._get(candidate.profile_url)
             soup = self._soup(document)
+            if not _has_season_markup(soup):
+                canonical = _canonical_profile_route(soup, candidate.profile_url)
+                if canonical is not None:
+                    document = self._get(canonical)
+                    soup = self._soup(document)
+                    identity = _profile_identity(canonical)
+                    if identity is None or identity[0] != candidate.competition_id:
+                        raise DiscoverySchemaError(
+                            f"canonical route changes identity: {canonical}"
+                        )
+                    candidate.slug = identity[1]
+                    candidate.profile_url = canonical
             declared_id = soup.select_one("[data-competition-id]")
             if declared_id is not None and str(
                 declared_id.get("data-competition-id")
@@ -742,8 +1021,12 @@ class TransfermarktCompetitionDiscovery:
             profiles[candidate.competition_id] = (document, soup)
 
         snapshot_material = {
-            url: document.payload_hash
-            for url, document in sorted(self._documents.items())
+            "pages": {
+                url: document.payload_hash
+                for url, document in sorted(self._documents.items())
+            },
+            "parser_revision": PARSER_REVISION,
+            "schema_revision": SCHEMA_REVISION,
         }
         snapshot_digest = hashlib.sha256(
             json.dumps(snapshot_material, separators=(",", ":"), sort_keys=True).encode()
@@ -755,14 +1038,22 @@ class TransfermarktCompetitionDiscovery:
 
         competition_records: dict[str, CompetitionRecord] = {}
         edition_records: dict[str, tuple[EditionRecord, ...]] = {}
+        editionless: list[str] = []
         for competition_id, candidate in sorted(candidates.items()):
             profile_document, profile_soup = profiles[competition_id]
-            options = _selector_options(
-                profile_soup, profile_url=candidate.profile_url
-            )
-            season_format = _season_format(
-                (item[1] for item in options), candidate.profile_url
-            )
+            try:
+                options = _selector_options(
+                    profile_soup, profile_url=candidate.profile_url
+                )
+            except DiscoverySchemaError as exc:
+                if "edition selector missing" not in str(exc):
+                    raise
+                # The source publishes no edition at all for these — a Brazilian
+                # relegation play-off, Japan's "100 Year Vision" leagues — so
+                # there is nothing to crawl and nothing to register.
+                editionless.append(competition_id)
+                continue
+            season_format = _season_format(options, candidate.profile_url)
             season_evidence = ClassificationEvidence(
                 source_field="edition_selector",
                 source_value=",".join(item[1] for item in options),
@@ -808,8 +1099,8 @@ class TransfermarktCompetitionDiscovery:
                 evidence=evidence,
                 registry_snapshot_id=snapshot_id,
                 source_body_hash=combined_hash,
-                parser_revision="tm-html-discovery-v1",
-                schema_revision="1",
+                parser_revision=PARSER_REVISION,
+                schema_revision=SCHEMA_REVISION,
             )
 
             editions = []
@@ -817,13 +1108,14 @@ class TransfermarktCompetitionDiscovery:
                 edition_source_url = (
                     candidate.profile_url.rstrip("/") + f"/saison_id/{edition_id}"
                 )
+                edition_format = _label_season_format(label, candidate.profile_url)
                 editions.append(
                     EditionRecord(
                         competition_id=competition_id,
                         edition_id=edition_id,
                         edition_label=label,
-                        canonical_season=canonical_season(label, season_format),
-                        season_format=season_format,
+                        canonical_season=canonical_season(label, edition_format),
+                        season_format=edition_format,
                         start_date=attrs.get("data-start-date"),
                         end_date=attrs.get("data-end-date"),
                         active="disabled" not in attrs,
@@ -834,11 +1126,16 @@ class TransfermarktCompetitionDiscovery:
                         discovered_at=discovered_at,
                         registry_snapshot_id=snapshot_id,
                         source_body_hash=profile_document.payload_hash,
-                        parser_revision="tm-html-discovery-v1",
-                        schema_revision="1",
+                        parser_revision=PARSER_REVISION,
+                        schema_revision=SCHEMA_REVISION,
                     )
                 )
             edition_records[competition_id] = tuple(editions)
+
+        for competition_id in editionless:
+            candidates.pop(competition_id, None)
+        if not candidates:
+            raise DiscoverySchemaError("complete catalog contains no competitions")
 
         listing_urls = tuple(sorted(listing_documents))
         page_number = {url: index + 1 for index, url in enumerate(listing_urls)}

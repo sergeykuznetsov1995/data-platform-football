@@ -35,6 +35,13 @@ import pytest
 
 
 REAL_TM_REGISTRY = importlib.import_module('scrapers.transfermarkt.registry')
+# The stubbed scraper module still has to date a season the way the real one
+# does — the runner and the scraper must never disagree about that again.
+_REAL_TM_SCRAPER = importlib.import_module('scrapers.transfermarkt.scraper')
+REAL_SEASON_HELPERS = {
+    '_season_window': _REAL_TM_SCRAPER._season_window,
+    '_stint_overlaps_season': _REAL_TM_SCRAPER._stint_overlaps_season,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -246,7 +253,9 @@ class TestProductionTrafficCeilings:
     def test_writer_state_rejection_precedes_budget_and_proxy(self):
         mod = _import_runner()
         stub_pkg = MagicMock()
-        stub_scraper_mod = MagicMock(R0_2B_FALLBACK_MARKER='TM_FALLBACK')
+        stub_scraper_mod = MagicMock(
+            R0_2B_FALLBACK_MARKER='TM_FALLBACK', **REAL_SEASON_HELPERS,
+        )
 
         with (
             patch.dict(sys.modules, {
@@ -275,10 +284,10 @@ class TestProductionTrafficCeilings:
     @pytest.mark.parametrize(
         'extra,expected',
         [
-            (['--decoded-body-budget-mb', '10.0001'],
-             '--decoded-body-budget-mb cannot exceed 10.0'),
-            (['--request-budget', '27'],
-             '--request-budget cannot exceed 26'),
+            (['--decoded-body-budget-mb', '16.0001'],
+             '--decoded-body-budget-mb cannot exceed 16.0'),
+            (['--request-budget', '151'],
+             '--request-budget cannot exceed 150'),
             (['--cycle-budget-bytes', str(15 * 1024 * 1024 + 1)],
              '--cycle-budget-bytes cannot exceed production cap'),
         ],
@@ -1248,7 +1257,7 @@ class TestRunnerInternals:
             }),
             patch.object(mod, '_persist_fetch_state', return_value=True) as persist,
         ):
-            selected, cache_hits, seeded, hydrate_ids = mod._select_player_ids(
+            selected, cache_hits, seeded, hydrate_ids, _coverage = mod._select_player_ids(
                 RosterScraper(),
                 mod.ENTITY_SPECS['market_value_history'],
                 'ENG-Premier League',
@@ -1293,8 +1302,10 @@ class TestRunnerInternals:
                 raise AssertionError('paid reader must not run')
 
             def materialize_legacy_market_value_history(
-                self, native, league, season,
+                self, native, league, season, season_format,
             ):
+                assert str(season_format) == 'SeasonFormat.SPLIT_YEAR'
+                assert season == 2025
                 return native.assign(league=league, season='2526')
 
             def get_traffic_stats(self):
@@ -1310,7 +1321,9 @@ class TestRunnerInternals:
         scraper = CacheScraper()
         stub_pkg = MagicMock()
         stub_pkg.TransfermarktScraper = MagicMock(return_value=scraper)
-        stub_scraper_mod = MagicMock(R0_2B_FALLBACK_MARKER='TM_FALLBACK')
+        stub_scraper_mod = MagicMock(
+            R0_2B_FALLBACK_MARKER='TM_FALLBACK', **REAL_SEASON_HELPERS,
+        )
 
         def committed_outputs(_scraper, spec, frames, _force, results):
             for output in spec.outputs:
@@ -1327,6 +1340,7 @@ class TestRunnerInternals:
             }),
             patch.object(mod, '_select_player_ids', return_value=(
                 [], 1, 0, ['1'],
+                {'roster_size': 1, 'selected': 0, 'pending': 0},
             )),
             patch.object(mod, '_load_cached_career_frames', return_value={
                 'market_value_points': points,
@@ -1377,7 +1391,7 @@ class TestRunnerInternals:
             }),
             patch.object(mod, '_persist_fetch_state') as persist,
         ):
-            selected, cache_hits, seeded, hydrate_ids = mod._select_player_ids(
+            selected, cache_hits, seeded, hydrate_ids, _coverage = mod._select_player_ids(
                 RosterScraper(),
                 mod.ENTITY_SPECS['market_value_history'],
                 'ENG-Premier League', 2025, 100, 0, 'historical', 'run-1',
@@ -1406,7 +1420,7 @@ class TestRunnerInternals:
             patch.object(mod, '_load_pending_checkpoint', return_value=({}, None)),
             patch.object(mod, '_load_data_derived_state', return_value={}),
         ):
-            selected, cache_hits, seeded, hydrate = mod._select_player_ids(
+            selected, cache_hits, seeded, hydrate, _coverage = mod._select_player_ids(
                 RosterScraper(), mod.ENTITY_SPECS['transfers'],
                 'ENG-Premier League', 2025, 100, 0, 'historical',
                 'native-only-cycle', allow_state_writes=True,
@@ -1634,7 +1648,9 @@ class TestRunnerInternals:
         scraper = CacheScraper()
         stub_pkg = MagicMock()
         stub_pkg.TransfermarktScraper = MagicMock(return_value=scraper)
-        stub_scraper_mod = MagicMock(R0_2B_FALLBACK_MARKER='TM_FALLBACK')
+        stub_scraper_mod = MagicMock(
+            R0_2B_FALLBACK_MARKER='TM_FALLBACK', **REAL_SEASON_HELPERS,
+        )
 
         def committed_outputs(_scraper, spec, frames, _force, results):
             for output in spec.outputs:
@@ -1902,7 +1918,7 @@ class TestNativeV2RecoverySafety:
             patch.object(mod, '_clear_pending_checkpoint'),
             patch.object(mod, '_load_data_derived_state', return_value={}),
         ):
-            selected, cache_hits, _seeded, _hydrate = mod._select_player_ids(
+            selected, cache_hits, _seeded, _hydrate, _coverage = mod._select_player_ids(
                 RosterScraper(), mod.ENTITY_SPECS['market_value_history'],
                 'ENG-Premier League', 2025, 100, 0, 'current', 'run-1',
                 allow_state_writes=True,
@@ -1992,3 +2008,146 @@ def test_cli_keeps_child_run_key_but_uses_explicit_parent_cycle_ledger(
     assert mod.main() == 0
     assert captured['run_key'] == 'tm-child-exact'
     assert captured['cycle_ledger_key'] == 'scheduled__parent'
+
+
+class TestCoachCacheMergeSeason:
+    def test_the_cache_merge_dates_the_season_the_scraper_dated(
+        self, monkeypatch,
+    ):
+        """The scraper projects the season, then this merge reprojects it from
+        the union with bronze.  Letting the merge default the season format
+        turned a calendar season into a split one, and the two projections
+        disagreed key for key — which is exactly what the parity gate reads.
+        """
+        import pandas as pd
+        from scrapers.transfermarkt.registry import (
+            CompetitionType, SeasonFormat, TeamType, _bootstrap_record,
+        )
+
+        mod = _import_runner()
+        record = _bootstrap_record(
+            competition_id='2DVB',
+            slug='2-division-b',
+            name='Second League Division B',
+            country='Russia',
+            confederation='UEFA',
+            competition_type=CompetitionType.DOMESTIC_LEAGUE,
+            team_type=TeamType.CLUB,
+            season_format=SeasonFormat.SINGLE_YEAR,
+            source_url=(
+                'https://www.transfermarkt.com/2-division-b/startseite/'
+                'wettbewerb/2DVB'
+            ),
+            canonical_competition_id='TM-2DVB',
+        )
+        monkeypatch.setattr(mod, '_competition_record', lambda value: record)
+        monkeypatch.setenv('TM_CANONICAL_SEASON', '2024')
+        seen = {}
+
+        class _Scraper:
+            def materialize_legacy_coaches(
+                self, profiles, stints, league, season, season_format,
+            ):
+                seen.update(season=season, season_format=season_format)
+                return pd.DataFrame([{'coach_id': '10'}])
+
+        frames = mod._merge_coach_cache_frames(
+            _Scraper(),
+            {},
+            {
+                'profiles': pd.DataFrame([{'coach_id': '10'}]),
+                'stints': pd.DataFrame([{
+                    'club_id': '1', 'coach_id': '10',
+                    'appointed_date': None, 'left_date': None,
+                }]),
+            },
+            'TM-2DVB',
+            2023,
+        )
+
+        assert seen['season'] == 2024
+        assert seen['season_format'] is SeasonFormat.SINGLE_YEAR
+        assert list(frames['legacy_coaches']['coach_id']) == ['10']
+
+
+class TestCoachIdentityFromCachedStints:
+    def test_a_coach_named_only_by_a_cached_history_page_is_still_named(
+        self, monkeypatch,
+    ):
+        """A club's history page is refetched only when its cache ages out, so
+        most clubs' stints come from bronze while profile pages are fetched only
+        for coaches a freshly read page named. The season projection is built
+        from every stint, so it named coaches the profile table had never heard
+        of — and the parity gate failed the scope over the difference.
+        """
+        import pandas as pd
+        from datetime import date
+        from scrapers.transfermarkt.registry import (
+            CompetitionType, SeasonFormat, TeamType, _bootstrap_record,
+        )
+
+        mod = _import_runner()
+        record = _bootstrap_record(
+            competition_id='2DVB',
+            slug='2-division-b',
+            name='Second League Division B',
+            country='Russia',
+            confederation='UEFA',
+            competition_type=CompetitionType.DOMESTIC_LEAGUE,
+            team_type=TeamType.CLUB,
+            season_format=SeasonFormat.SINGLE_YEAR,
+            source_url=(
+                'https://www.transfermarkt.com/2-division-b/startseite/'
+                'wettbewerb/2DVB'
+            ),
+            canonical_competition_id='TM-2DVB',
+        )
+        monkeypatch.setattr(mod, '_competition_record', lambda value: record)
+        monkeypatch.setenv('TM_CANONICAL_SEASON', '2025')
+
+        class _Scraper:
+            _batch_id = 'batch-1'
+
+            def materialize_legacy_coaches(
+                self, profiles, stints, league, season, season_format,
+            ):
+                # The real projection: every in-season stint, bio where known.
+                return pd.DataFrame([
+                    {'coach_id': str(cid)}
+                    for cid in sorted(set(stints['coach_id'].astype(str)))
+                ])
+
+        cached = {
+            # Bronze knows the stint but never had a reason to fetch his bio.
+            'stints': pd.DataFrame([{
+                'club_id': '1', 'coach_id': '77', 'coach_slug': 'old-hand',
+                'name': 'Old Hand', 'role': 'Manager',
+                'appointed_date': date(2025, 3, 1), 'left_date': None,
+            }]),
+            'profiles': pd.DataFrame(
+                columns=['coach_id', 'coach_slug', 'name', 'dob', 'nationality'],
+            ),
+        }
+        fetched = {
+            'stints': pd.DataFrame([{
+                'club_id': '2', 'coach_id': '10', 'coach_slug': 'fresh',
+                'name': 'Fresh', 'role': 'Manager',
+                'appointed_date': date(2025, 2, 1), 'left_date': None,
+            }]),
+            'profiles': pd.DataFrame([{
+                'coach_id': '10', 'coach_slug': 'fresh', 'name': 'Fresh Full',
+                'dob': date(1980, 5, 1), 'nationality': 'Russia',
+            }]),
+        }
+
+        frames = mod._merge_coach_cache_frames(
+            _Scraper(), fetched, cached, 'TM-2DVB', 2024,
+        )
+
+        profiles = frames['profiles'].set_index('coach_id')
+        assert set(profiles.index) == {'10', '77'}
+        assert profiles.loc['77', 'name'] == 'Old Hand'
+        assert pd.isna(profiles.loc['77', 'dob'])   # not a bio, so not reusable
+        assert profiles.loc['10', 'dob'] == date(1980, 5, 1)
+        # Both projections now name the same coaches — which is all parity asks.
+        assert set(frames['legacy_coaches']['coach_id']) == set(profiles.index)
