@@ -37,6 +37,11 @@ x-airflow-common: &airflow-common
     # outside Iceberg table prefixes. The parser uses pyarrow.fs directly.
     S3_ACCESS_KEY: ${S3_ACCESS_KEY}
     S3_SECRET_KEY: ${S3_SECRET_KEY}
+    ICEBERG_WAREHOUSE: ${ICEBERG_WAREHOUSE}
+    # Lakekeeper REST warehouse identifier is not the S3 bucket name above.
+    ICEBERG_REST_WAREHOUSE: ${ICEBERG_REST_WAREHOUSE:-football}
+    S3_ENDPOINT: seaweedfs:8333
+    S3_SCHEME: http
     FBREF_RAW_STORE_URI: s3://${ICEBERG_WAREHOUSE}/raw/fbref
     SOFASCORE_RAW_STORE_URI: s3://${ICEBERG_WAREHOUSE}/raw/sofascore
     SOFASCORE_MANIFEST_BACKEND: trino
@@ -45,11 +50,33 @@ x-airflow-common: &airflow-common
     SOFASCORE_WORKLOAD_PLAN_DIR: /opt/airflow/logs/sofascore/workload-plans
     SOFASCORE_PROXY_CONTROL_URL: ${SOFASCORE_PROXY_CONTROL_URL:-http://proxy_filter:8899}
     SOFASCORE_PROXY_CONTROL_TOKEN: ${SOFASCORE_PROXY_CONTROL_TOKEN:-}
+    # Shared authenticated lease control plane.  Keep the SofaScore variable
+    # as a migration fallback, but new deployments set the provider-neutral
+    # token once for proxy_filter and every explicitly approved client.
+    PROXY_FILTER_CONTROL_TOKEN: ${PROXY_FILTER_CONTROL_TOKEN:-${SOFASCORE_PROXY_CONTROL_TOKEN:-}}
     SOFASCORE_PROXY_LEASE_TTL_SECONDS: ${SOFASCORE_PROXY_LEASE_TTL_SECONDS:-3600}
     PROXY_FILTER_SOFASCORE_CANARY_HARD_CAP_BYTES: ${PROXY_FILTER_SOFASCORE_CANARY_HARD_CAP_BYTES:-0}
     WHOSCORED_RAW_STORE_URI: s3://${ICEBERG_WAREHOUSE}/raw/whoscored
+    WHOSCORED_OPS_STORE_URI: s3://${ICEBERG_WAREHOUSE}/ops/whoscored
+    WHOSCORED_BACKUP_DESTINATION_URI: ${WHOSCORED_BACKUP_DESTINATION_URI:-}
+    WHOSCORED_BACKUP_SOURCE_SITE_ID: ${WHOSCORED_BACKUP_SOURCE_SITE_ID:-local-seaweedfs}
+    WHOSCORED_BACKUP_DESTINATION_SITE_ID: ${WHOSCORED_BACKUP_DESTINATION_SITE_ID:-}
+    WHOSCORED_BACKUP_DESTINATION_RETENTION_MODE: ${WHOSCORED_BACKUP_DESTINATION_RETENTION_MODE:-}
+    WHOSCORED_BACKUP_SOURCE_S3_ENDPOINT: seaweedfs:8333
+    WHOSCORED_BACKUP_SOURCE_S3_SCHEME: http
+    WHOSCORED_BACKUP_SOURCE_S3_REGION: ${WHOSCORED_RAW_S3_REGION:-us-east-1}
+    WHOSCORED_BACKUP_DESTINATION_S3_ENDPOINT: ${WHOSCORED_BACKUP_DESTINATION_S3_ENDPOINT:-}
+    WHOSCORED_BACKUP_DESTINATION_S3_SCHEME: ${WHOSCORED_BACKUP_DESTINATION_S3_SCHEME:-https}
+    WHOSCORED_BACKUP_DESTINATION_S3_REGION: ${WHOSCORED_BACKUP_DESTINATION_S3_REGION:-us-east-1}
+    WHOSCORED_BACKUP_RESTORE_S3_ENDPOINT: ${WHOSCORED_BACKUP_RESTORE_S3_ENDPOINT:-}
+    WHOSCORED_BACKUP_RESTORE_S3_SCHEME: ${WHOSCORED_BACKUP_RESTORE_S3_SCHEME:-https}
+    WHOSCORED_BACKUP_RESTORE_S3_REGION: ${WHOSCORED_BACKUP_RESTORE_S3_REGION:-us-east-1}
     WHOSCORED_RAW_S3_ENDPOINT: seaweedfs:8333
     WHOSCORED_RAW_S3_SCHEME: http
+    # Keep dedicated pairs unexpanded so Python can reject a partial pair
+    # instead of silently mixing one dedicated value with one platform value.
+    WHOSCORED_RAW_S3_ACCESS_KEY: ${WHOSCORED_RAW_S3_ACCESS_KEY:-}
+    WHOSCORED_RAW_S3_SECRET_KEY: ${WHOSCORED_RAW_S3_SECRET_KEY:-}
     # WhoScored V2 uses this endpoint only after two classified direct
     # Cloudflare failures.  PROXY_FILTER_URL remains the legacy always-proxy
     # toggle and is deliberately not reused here.
@@ -59,10 +86,52 @@ x-airflow-common: &airflow-common
     WHOSCORED_PAID_PROXY_URL: ${WHOSCORED_PAID_PROXY_URL:-http://proxy_filter:8900}
     WHOSCORED_PROXY_CONTROL_URL: ${WHOSCORED_PROXY_CONTROL_URL:-http://proxy_filter:8899}
     WHOSCORED_REQUEST_LEDGER_PATH: /opt/airflow/logs/whoscored/request_ledger.jsonl
+    # All LocalExecutor children share one durable direct-source cooldown.
+    # Production fails fast while the circuit is open; the capacity harness
+    # alone opts into waiting so its six-hour wall clock remains honest.
+    WHOSCORED_SOURCE_CIRCUIT_PATH: /opt/airflow/logs/whoscored/source-circuit-v1.json
+    WHOSCORED_SOURCE_CIRCUIT_WAIT: "0"
     WHOSCORED_LOCK_DIR: /opt/airflow/logs/whoscored/commit_locks
     WHOSCORED_RAW_LOCK_DIR: /opt/airflow/logs/whoscored/raw_locks
+    # Keep every documented WhoScored runtime control in the Airflow process
+    # environment.  Docker Compose does not automatically forward values from
+    # .env into containers, so omitting one here would silently select the
+    # Python fallback even when an operator changed .env.
+    WHOSCORED_DIRECT_POOL: ${WHOSCORED_DIRECT_POOL:-whoscored_direct_pool}
+    WHOSCORED_BACKFILL_POOL: ${WHOSCORED_BACKFILL_POOL:-whoscored_direct_pool}
+    WHOSCORED_DQ_POOL: ${WHOSCORED_DQ_POOL:-whoscored_dq_pool}
+    # Safe default is two. Promote to four only after the sustained direct-only
+    # canary passes; runtime_limits.py rejects every value outside 2..4.
+    WHOSCORED_SOURCE_POOL_SLOTS: ${WHOSCORED_SOURCE_POOL_SLOTS:-2}
+    WHOSCORED_DAILY_SLO_WINDOW: ${WHOSCORED_DAILY_SLO_WINDOW:-30}
+    WHOSCORED_DAILY_SLO_MIN_SAMPLES: ${WHOSCORED_DAILY_SLO_MIN_SAMPLES:-20}
+    WHOSCORED_DAILY_P95_LIMIT_HOURS: ${WHOSCORED_DAILY_P95_LIMIT_HOURS:-4}
+    WHOSCORED_BACKFILL_REQUEST_UNITS_PER_RUN: ${WHOSCORED_BACKFILL_REQUEST_UNITS_PER_RUN:-3000}
+    # SLO planning assumption only; it may never exceed the independently
+    # derived source-pool-slots x 30 rpm x 1,440 hard ceiling.
+    WHOSCORED_BACKFILL_ASSUMED_REQUEST_UNITS_PER_DAY: ${WHOSCORED_BACKFILL_ASSUMED_REQUEST_UNITS_PER_DAY:-86400}
+    WHOSCORED_BACKFILL_MAX_NO_PROGRESS_RUNS: ${WHOSCORED_BACKFILL_MAX_NO_PROGRESS_RUNS:-3}
+    WHOSCORED_RUN_RETENTION_DAYS: ${WHOSCORED_RUN_RETENTION_DAYS:-90}
+    WHOSCORED_OPS_IO_ATTEMPTS: ${WHOSCORED_OPS_IO_ATTEMPTS:-4}
+    WHOSCORED_OPS_RETRY_BASE_SECONDS: ${WHOSCORED_OPS_RETRY_BASE_SECONDS:-0.2}
+    WHOSCORED_RAW_IO_ATTEMPTS: ${WHOSCORED_RAW_IO_ATTEMPTS:-4}
+    WHOSCORED_RAW_RETRY_BASE_SECONDS: ${WHOSCORED_RAW_RETRY_BASE_SECONDS:-0.2}
     WHOSCORED_RAW_LOCK_TIMEOUT_SECONDS: ${WHOSCORED_RAW_LOCK_TIMEOUT_SECONDS:-55}
+    WHOSCORED_RAW_SNAPSHOT_LOCK_TIMEOUT_SECONDS: ${WHOSCORED_RAW_SNAPSHOT_LOCK_TIMEOUT_SECONDS:-300}
+    WHOSCORED_DAILY_PROFILE_MAX_LIMIT: ${WHOSCORED_DAILY_PROFILE_MAX_LIMIT:-3000}
+    WHOSCORED_BACKUP_WORKERS: ${WHOSCORED_BACKUP_WORKERS:-16}
+    WHOSCORED_BACKUP_LOCAL_RETENTION_DAYS: ${WHOSCORED_BACKUP_LOCAL_RETENTION_DAYS:-14}
+    # Non-secret, measured end-to-end recovery rehearsal inputs. The cutover
+    # script requires all of them before it stops a single writer.
+    SEAWEEDFS_CUTOVER_REHEARSAL_INVENTORY: ${SEAWEEDFS_CUTOVER_REHEARSAL_INVENTORY:-}
+    SEAWEEDFS_CUTOVER_REHEARSAL_MAX_AGE_HOURS: ${SEAWEEDFS_CUTOVER_REHEARSAL_MAX_AGE_HOURS:-24}
+    SEAWEEDFS_CUTOVER_INVENTORY_MIBPS: ${SEAWEEDFS_CUTOVER_INVENTORY_MIBPS:-}
+    SEAWEEDFS_CUTOVER_BACKUP_MIBPS: ${SEAWEEDFS_CUTOVER_BACKUP_MIBPS:-}
+    SEAWEEDFS_CUTOVER_VERIFY_MIBPS: ${SEAWEEDFS_CUTOVER_VERIFY_MIBPS:-}
+    SEAWEEDFS_CUTOVER_FIXED_OVERHEAD_SECONDS: ${SEAWEEDFS_CUTOVER_FIXED_OVERHEAD_SECONDS:-}
+    SEAWEEDFS_CUTOVER_MAX_DOWNTIME_SECONDS: ${SEAWEEDFS_CUTOVER_MAX_DOWNTIME_SECONDS:-}
     WHOSCORED_STRUCTURED_REQUESTS_PER_MINUTE: ${WHOSCORED_STRUCTURED_REQUESTS_PER_MINUTE:-60}
+    WHOSCORED_SCOPE_WRITE_CHUNK_ROWS: ${WHOSCORED_SCOPE_WRITE_CHUNK_ROWS:-20000}
     # Single catalog task, source requests only; hard-capped to 60 with burst 4.
     WHOSCORED_CATALOG_REQUESTS_PER_MINUTE: ${WHOSCORED_CATALOG_REQUESTS_PER_MINUTE:-60}
     # Transfermarkt stays disabled and cannot acquire an unmanaged proxy until
@@ -132,15 +201,17 @@ x-airflow-common: &airflow-common
 
 services:
   # ===========================================================================
-  # SeaweedFS - S3-compatible object storage (replaces HDFS)
-  # `mini` = single-process dev mode (master+volume+filer+S3). -bucket pre-creates
-  # the warehouse bucket; -s3.config supplies static credentials (no STS/vending).
+  # SeaweedFS - S3-compatible object storage (replaces HDFS).
+  # Production runs the control, volume, metadata and S3 planes as separate
+  # supervised processes.  They intentionally reuse the historic volume
+  # layout, so upgrading from `weed mini -dir=/data` does not rewrite objects.
   # ===========================================================================
-  seaweedfs:
+  seaweedfs-master:
     image: chrislusf/seaweedfs:4.36
-    container_name: seaweedfs
-    hostname: seaweedfs
+    container_name: seaweedfs-master
+    hostname: seaweedfs-master
     restart: unless-stopped
+    stop_grace_period: 60s
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -151,34 +222,184 @@ services:
       - SETUID
       - DAC_OVERRIDE
       - FOWNER
+    entrypoint: ["/usr/local/bin/seaweedfs-plane-entrypoint"]
     command:
-      - mini
-      - -dir=/data
-      - -bucket=${ICEBERG_WAREHOUSE}
-      - -s3.config=/etc/seaweedfs/s3.config.json
-    ports:
-      - "127.0.0.1:8333:8333"  # S3 API
+      - master
+      - -ip=seaweedfs-master
+      - -ip.bind=0.0.0.0
+      - -port=9333
+      # `weed master` appends its own `m9333` directory. Point at the volume
+      # root to recover the existing `weed mini -dir=/data` Raft state.
+      - -mdir=/data
+      - -peers=none
+      - -volumeSizeLimitMB=1024
+      - -defaultReplication=000
     volumes:
-      - seaweedfs_data:/data
-      - ./configs/seaweedfs/s3.config.json:/etc/seaweedfs/s3.config.json:ro
+      - type: volume
+        source: seaweedfs_data
+        target: /data
+        volume:
+          nocopy: true
+      - ./scripts/seaweedfs_plane_entrypoint.sh:/usr/local/bin/seaweedfs-plane-entrypoint:ro
     networks:
       - storage
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8333/status"]
+      test: ["CMD", "curl", "-f", "http://localhost:9333/cluster/status"]
       interval: 10s
       timeout: 5s
-      retries: 5
+      retries: 12
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 128M
+
+  seaweedfs-volume:
+    image: chrislusf/seaweedfs:4.36
+    container_name: seaweedfs-volume
+    hostname: seaweedfs-volume
+    restart: unless-stopped
+    stop_grace_period: 90s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+      - DAC_OVERRIDE
+      - FOWNER
+    entrypoint: ["/usr/local/bin/seaweedfs-plane-entrypoint"]
+    command:
+      - volume
+      - -ip=seaweedfs-volume
+      - -ip.bind=0.0.0.0
+      - -port=8080
+      - -dir=/data
+      - -master=seaweedfs-master:9333
+      - -max=0
+      - -minFreeSpace=5
+      - -preStopSeconds=30
+    volumes:
+      - type: volume
+        source: seaweedfs_data
+        target: /data
+        volume:
+          nocopy: true
+      - ./scripts/seaweedfs_plane_entrypoint.sh:/usr/local/bin/seaweedfs-plane-entrypoint:ro
+    networks:
+      - storage
+    depends_on:
+      seaweedfs-master:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/status"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
       start_period: 20s
     deploy:
       resources:
         limits:
-          # 1G caused a memcg-OOM crashloop (weed RSS ~1G under Iceberg
-          # read/write + metadata load; 5 restarts in ~1h during a bronze
-          # backfill). S3 store dying mid-write corrupts the edition write.
-          # 4G leaves headroom over the observed ~1G working set.
-          memory: 4G
+          memory: 2G
         reservations:
           memory: 256M
+
+  seaweedfs-filer:
+    image: chrislusf/seaweedfs:4.36
+    container_name: seaweedfs-filer
+    hostname: seaweedfs-filer
+    restart: unless-stopped
+    stop_grace_period: 60s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+      - DAC_OVERRIDE
+      - FOWNER
+    entrypoint: ["/usr/local/bin/seaweedfs-plane-entrypoint"]
+    command:
+      - filer
+      - -ip=seaweedfs-filer
+      - -ip.bind=0.0.0.0
+      - -port=8888
+      - -master=seaweedfs-master:9333
+      - -defaultStoreDir=/data
+      - -disableDirListing
+    volumes:
+      - type: volume
+        source: seaweedfs_data
+        target: /data
+        volume:
+          nocopy: true
+      - ./scripts/seaweedfs_plane_entrypoint.sh:/usr/local/bin/seaweedfs-plane-entrypoint:ro
+    networks:
+      - storage
+    depends_on:
+      seaweedfs-master:
+        condition: service_healthy
+      seaweedfs-volume:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8888/"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 128M
+
+  seaweedfs:
+    image: chrislusf/seaweedfs:4.36
+    container_name: seaweedfs
+    hostname: seaweedfs
+    restart: unless-stopped
+    stop_grace_period: 60s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    command:
+      - s3
+      - -ip.bind=0.0.0.0
+      - -port=8333
+      - -filer=seaweedfs-filer:8888
+      - -config=/etc/seaweedfs/s3.config.json
+      - -allowDeleteBucketNotEmpty=false
+      - -concurrentFileUploadLimit=16
+      - -concurrentUploadLimitMB=512
+    ports:
+      - "127.0.0.1:8333:8333"
+    volumes:
+      - ./configs/seaweedfs/s3.config.json:/etc/seaweedfs/s3.config.json:ro
+    networks:
+      - storage
+    depends_on:
+      seaweedfs-filer:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8333/status"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 128M
 
   # ===========================================================================
   # Lakekeeper - Iceberg REST Catalog (replaces Hive Metastore)
@@ -379,6 +600,7 @@ services:
       - -c
       - |
         set -euo pipefail
+        python /opt/airflow/scripts/init_seaweedfs_bucket.py
         airflow db migrate
         # Durable FBref registry/frontier shares Airflow's PostgreSQL server
         # in an isolated schema.  The migration is advisory-lock protected and
@@ -398,11 +620,21 @@ services:
         # FotMob is lightweight direct HTTP.  A separate bounded pool prevents
         # browser scrapers from serializing it while limiting source fan-out.
         airflow pools set 'fotmob_http_pool' 4 'Bounded direct FotMob HTTP work'
-        # WhoScored daily scopes use one slot each; the resumable backfill
-        # deliberately consumes both slots so it cannot overlap a daily run.
+        # WhoScored daily scopes use one slot each; exclusive controller/DQ
+        # tasks consume every configured slot so they cannot overlap writers.
         # `pools set` is an idempotent create/update operation on fresh and
         # already-initialised Airflow metadata databases.
-        airflow pools set 'whoscored_direct_pool' 2 'WhoScored direct-only scopes; backfill consumes both slots'
+        case "$${WHOSCORED_SOURCE_POOL_SLOTS}" in
+          2|3|4) ;;
+          *) echo 'WHOSCORED_SOURCE_POOL_SLOTS must be 2, 3, or 4' >&2; exit 1 ;;
+        esac
+        if [[ "$${WHOSCORED_BACKFILL_POOL}" != "$${WHOSCORED_DIRECT_POOL}" ]]; then
+          echo 'WhoScored daily and backfill must share one source pool' >&2
+          exit 1
+        fi
+        airflow pools set "$${WHOSCORED_DIRECT_POOL}" "$${WHOSCORED_SOURCE_POOL_SLOTS}" 'WhoScored bounded direct-only source concurrency'
+        airflow pools set "$${WHOSCORED_DQ_POOL}" 2 'WhoScored bounded Iceberg data-quality queries'
+        airflow pools set 'whoscored_storage_pool' 1 'WhoScored serialized backup and restore verification'
         echo "Airflow initialization complete"
     environment:
       <<: *airflow-common-env
@@ -422,6 +654,17 @@ services:
         AIRFLOW_RUNTIME_BASE: ${AIRFLOW_RUNTIME_BASE:-data-platform-airflow-webserver:latest}
     container_name: airflow-scheduler
     command: scheduler
+    environment:
+      <<: *airflow-common-env
+      # LocalExecutor runs backup/restore tasks in this process. Keep the
+      # off-host credentials out of webserver/init and use a read-only source
+      # identity when one is configured.
+      WHOSCORED_BACKUP_SOURCE_S3_ACCESS_KEY: ${WHOSCORED_BACKUP_SOURCE_S3_ACCESS_KEY:-}
+      WHOSCORED_BACKUP_SOURCE_S3_SECRET_KEY: ${WHOSCORED_BACKUP_SOURCE_S3_SECRET_KEY:-}
+      WHOSCORED_BACKUP_DESTINATION_S3_ACCESS_KEY: ${WHOSCORED_BACKUP_DESTINATION_S3_ACCESS_KEY:-}
+      WHOSCORED_BACKUP_DESTINATION_S3_SECRET_KEY: ${WHOSCORED_BACKUP_DESTINATION_S3_SECRET_KEY:-}
+      WHOSCORED_BACKUP_RESTORE_S3_ACCESS_KEY: ${WHOSCORED_BACKUP_RESTORE_S3_ACCESS_KEY:-}
+      WHOSCORED_BACKUP_RESTORE_S3_SECRET_KEY: ${WHOSCORED_BACKUP_RESTORE_S3_SECRET_KEY:-}
     depends_on:
       airflow-init:
         condition: service_completed_successfully
@@ -1031,11 +1274,13 @@ services:
       - ALL
     environment:
       PYTHONPATH: /opt/airflow
-      PROXY_FILTER_CONTROL_TOKEN: ${SOFASCORE_PROXY_CONTROL_TOKEN:-}
+      PROXY_FILTER_CONTROL_TOKEN: ${PROXY_FILTER_CONTROL_TOKEN:-${SOFASCORE_PROXY_CONTROL_TOKEN:-}}
       # Secret JSON is injected at runtime. The service fails closed when it is
       # blank; the legacy file is intentionally not mounted into this container.
       PROXY_POOL_JSON: ${PROXY_POOL_JSON:-}
-      PROXY_FILTER_ALLOW_FILE_FALLBACK: ${PROXY_FILTER_ALLOW_FILE_FALLBACK:-false}
+      # Production is structurally env-only. Development file fallback, when
+      # needed, must use a separate explicit service definition.
+      PROXY_FILTER_ALLOW_FILE_FALLBACK: "false"
     command:
       - python
       - /opt/airflow/scripts/proxy_filter/filter_proxy.py
@@ -1294,7 +1539,9 @@ volumes:
   soccerdata_cache:
     name: soccerdata_cache
   seaweedfs_data:
-    name: seaweedfs_data
+    # Recovery can point every supervised plane at a new empty named volume
+    # while preserving the failed volume byte-for-byte for forensics/rollback.
+    name: ${SEAWEEDFS_DATA_VOLUME_NAME:-seaweedfs_data}
   postgres_data:
     name: postgres_data
   redis_data:

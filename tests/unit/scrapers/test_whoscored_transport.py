@@ -4,15 +4,25 @@ import json
 import sys
 import time
 import types
+from datetime import datetime
+
 import pytest
+import requests
 
 from scrapers.base.flaresolverr_client import (
     FlareSolverrCFChallengeFailed,
+    FlareSolverrError,
     FlareSolverrResponseTooLarge,
     FlareSolverrTimeout,
 )
+from scrapers.whoscored.source_circuit import (
+    CircuitPermit,
+    SharedSourceCircuit,
+    SourceCircuitOpen,
+)
 from scrapers.whoscored.transport import (
     CachedPayload,
+    CloudflareChallenge,
     FailureKind,
     FetchRequest,
     JsonlRequestLedger,
@@ -58,6 +68,7 @@ PLAYER_STATS_BOOTSTRAP = (
     "https://www.whoscored.com/Regions/247/Tournaments/36/Seasons/9967/"
     "Stages/23753/TeamStatistics"
 )
+CONTROL_TOKEN = "c" * 32
 
 
 def _batch_solution(url, content=b'{"teamTableStats":[]}'):
@@ -209,6 +220,41 @@ class MemoryLedger:
         self.events.append(dict(event))
 
 
+class FakeSourceCircuit:
+    def __init__(self, *, probe=False, opened=False, recover_on_wait=False):
+        self.probe = probe
+        self.opened = opened
+        self.recover_on_wait = recover_on_wait
+        self.calls = []
+        self.generation = 1
+
+    def admit(self, *, wait=False):
+        self.calls.append(("admit", wait))
+        if self.opened:
+            if not (wait and self.recover_on_wait):
+                raise SourceCircuitOpen(state="open", retry_at=9_999.0)
+            self.opened = False
+            self.probe = True
+        return CircuitPermit(
+            generation=self.generation,
+            probe_nonce=("a" * 32 if self.probe else None),
+        )
+
+    def succeed(self, permit):
+        self.calls.append(("succeed", permit.is_probe))
+        self.probe = False
+
+    def trip(self, permit):
+        self.calls.append(("trip", permit.is_probe))
+        self.opened = True
+
+    def inconclusive(self, permit):
+        self.calls.append(("inconclusive", permit.is_probe))
+
+    def abandon(self, permit):
+        self.calls.append(("abandon", permit.is_probe))
+
+
 def _transport(
     direct_http,
     *,
@@ -220,6 +266,12 @@ def _transport(
     budgets=None,
     attempts=2,
     http_attempts=3,
+    http_retry_backoff=0.0,
+    retry_backoff=0.0,
+    retry_jitter=0.0,
+    browser_session_owner=None,
+    source_circuit=None,
+    source_circuit_wait=False,
 ):
     factory_calls = []
 
@@ -238,7 +290,13 @@ def _transport(
         raw_cache=raw_cache,
         budgets=budgets,
         direct_http_attempts=http_attempts,
+        direct_http_retry_backoff_seconds=http_retry_backoff,
         direct_browser_attempts=attempts,
+        browser_retry_backoff_seconds=retry_backoff,
+        browser_retry_jitter_seconds=retry_jitter,
+        browser_session_owner=browser_session_owner,
+        source_circuit=source_circuit,
+        source_circuit_wait=source_circuit_wait,
     )
     return transport, factory_calls
 
@@ -313,6 +371,32 @@ def test_valid_raw_cache_skips_every_network_route():
 
 
 @pytest.mark.unit
+def test_valid_structured_raw_cache_precedes_unresolved_source_probe():
+    cache = MemoryRawCache(CachedPayload(content=b'{"cached":true}'))
+    circuit = FakeSourceCircuit(probe=True)
+    direct = FakeHTTPSession()
+    transport, _ = _transport(
+        direct,
+        raw_cache=cache,
+        source_circuit=circuit,
+    )
+    transport._source_circuit_permit = CircuitPermit(
+        generation=1,
+        probe_nonce="a" * 32,
+    )
+
+    result = transport.fetch(
+        TEAM_STATS_URL,
+        browser_bootstrap_url=TEAM_STATS_BOOTSTRAP,
+        validator=lambda response: json.loads(response.content) is not None,
+    )
+
+    assert result.route is TransportRoute.RAW_CACHE
+    assert circuit.calls == []
+    assert direct.calls == []
+
+
+@pytest.mark.unit
 def test_success_is_stored_in_raw_cache_before_return():
     cache = MemoryRawCache()
     direct = FakeHTTPSession(FakeHTTPResponse(content=b"source"))
@@ -323,6 +407,8 @@ def test_success_is_stored_in_raw_cache_before_return():
     assert cache.stored[0][0] == "p1"
     assert cache.stored[0][1].content == b"source"
     assert cache.stored[0][2] == result.sha256
+    assert cache.stored[0][1].observed_at == result.observed_at
+    assert datetime.fromisoformat(result.observed_at).tzinfo is not None
 
 
 @pytest.mark.unit
@@ -405,6 +491,198 @@ def test_transient_direct_502_retries_with_a_token_and_never_uses_proxy():
     assert tokens == ["token", "token", "token"]
     assert fs.created == []
     assert proxy.created == []
+
+
+@pytest.mark.unit
+def test_production_direct_http_defaults_space_two_502s_before_success(monkeypatch):
+    direct = FakeHTTPSession(
+        FakeHTTPResponse(status_code=502, content=b"temporary upstream error"),
+        FakeHTTPResponse(status_code=502, content=b"temporary upstream error"),
+        FakeHTTPResponse(content=OK_HTML),
+    )
+    fs = FakeFSClient()
+    proxy = FakeProxyClient()
+    sleeps = []
+    tokens = []
+    monkeypatch.setattr(
+        "scrapers.whoscored.transport.time.sleep", lambda delay: sleeps.append(delay)
+    )
+    transport = WhoScoredTransport(
+        direct_http_session=direct,
+        direct_fs_client=fs,
+        paid_fs_client=FakeFSClient(),
+        proxy_client=proxy,
+    )
+
+    result = transport.fetch(
+        "https://www.whoscored.com/Regions/247/Tournaments/36/Seasons/10498",
+        before_network=lambda: tokens.append("token"),
+    )
+
+    assert result.route is TransportRoute.DIRECT_HTTP
+    assert len(direct.calls) == 3
+    assert sleeps == [2.0, 4.0]
+    assert tokens == ["token"] * 3
+    assert fs.created == []
+    assert proxy.created == []
+
+
+@pytest.mark.unit
+def test_production_direct_http_defaults_fail_closed_after_three_502s(monkeypatch):
+    direct = FakeHTTPSession(
+        *[
+            FakeHTTPResponse(status_code=502, content=b"temporary upstream error")
+            for _ in range(3)
+        ]
+    )
+    fs = FakeFSClient()
+    proxy = FakeProxyClient()
+    sleeps = []
+    tokens = []
+    monkeypatch.setattr(
+        "scrapers.whoscored.transport.time.sleep", lambda delay: sleeps.append(delay)
+    )
+    transport = WhoScoredTransport(
+        direct_http_session=direct,
+        direct_fs_client=fs,
+        paid_fs_client=FakeFSClient(),
+        proxy_client=proxy,
+    )
+
+    with pytest.raises(WhoScoredTransportError) as raised:
+        transport.fetch(
+            "https://www.whoscored.com/Regions/247/Tournaments/36/Seasons/10498",
+            before_network=lambda: tokens.append("token"),
+        )
+
+    assert raised.value.kind is FailureKind.HTTP_STATUS
+    assert raised.value.status_code == 502
+    assert len(direct.calls) == 3
+    assert sleeps == [2.0, 4.0]
+    assert tokens == ["token"] * 3
+    assert fs.created == []
+    assert proxy.created == []
+    assert transport.get_traffic_stats().get("paid_route_requests", 0) == 0
+
+
+@pytest.mark.unit
+def test_production_direct_http_timeout_waits_and_reacquires_token(monkeypatch):
+    direct = FakeHTTPSession(
+        requests.exceptions.Timeout("temporary timeout"),
+        FakeHTTPResponse(content=OK_HTML),
+    )
+    fs = FakeFSClient()
+    proxy = FakeProxyClient()
+    sleeps = []
+    tokens = []
+    monkeypatch.setattr(
+        "scrapers.whoscored.transport.time.sleep", lambda delay: sleeps.append(delay)
+    )
+    transport = WhoScoredTransport(
+        direct_http_session=direct,
+        direct_fs_client=fs,
+        paid_fs_client=FakeFSClient(),
+        proxy_client=proxy,
+    )
+
+    result = transport.fetch(
+        "https://www.whoscored.com/Regions/247/Tournaments/36/Seasons/10498",
+        before_network=lambda: tokens.append("token"),
+    )
+
+    assert result.route is TransportRoute.DIRECT_HTTP
+    assert len(direct.calls) == 2
+    assert sleeps == [2.0]
+    assert tokens == ["token"] * 2
+    assert fs.created == []
+    assert proxy.created == []
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("status", [404, 429])
+def test_production_direct_http_nonretryable_status_does_not_sleep(
+    monkeypatch, status
+):
+    direct = FakeHTTPSession(
+        FakeHTTPResponse(status_code=status, content=b"ordinary origin error")
+    )
+    sleeps = []
+    tokens = []
+    monkeypatch.setattr(
+        "scrapers.whoscored.transport.time.sleep", lambda delay: sleeps.append(delay)
+    )
+    transport = WhoScoredTransport(
+        direct_http_session=direct,
+        direct_fs_client=FakeFSClient(),
+        paid_fs_client=FakeFSClient(),
+    )
+
+    with pytest.raises(WhoScoredTransportError) as raised:
+        transport.fetch(
+            "https://www.whoscored.com/Regions/247/Tournaments/36/Seasons/10498",
+            before_network=lambda: tokens.append("token"),
+        )
+
+    assert raised.value.kind is FailureKind.HTTP_STATUS
+    assert len(direct.calls) == 1
+    assert sleeps == []
+    assert tokens == ["token"]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("value", [True, -1, float("nan"), float("inf"), "2"])
+def test_invalid_direct_http_retry_backoff_fails_before_network(value):
+    direct = FakeHTTPSession()
+    fs = FakeFSClient()
+
+    with pytest.raises(ValueError, match="direct_http_retry_backoff_seconds"):
+        WhoScoredTransport(
+            direct_http_session=direct,
+            direct_fs_client=fs,
+            paid_fs_client=FakeFSClient(),
+            direct_http_retry_backoff_seconds=value,
+        )
+
+    assert direct.calls == []
+    assert fs.created == []
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("value", ["", "true", "2", "yes"])
+def test_invalid_source_circuit_wait_environment_fails_before_network(
+    monkeypatch, value
+):
+    direct = FakeHTTPSession()
+    fs = FakeFSClient()
+    monkeypatch.setenv("WHOSCORED_SOURCE_CIRCUIT_WAIT", value)
+
+    with pytest.raises(ValueError, match="WHOSCORED_SOURCE_CIRCUIT_WAIT"):
+        WhoScoredTransport(
+            direct_http_session=direct,
+            direct_fs_client=fs,
+            paid_fs_client=FakeFSClient(),
+        )
+
+    assert direct.calls == []
+    assert fs.created == []
+
+
+@pytest.mark.unit
+def test_source_circuit_wait_requires_shared_path_before_network(monkeypatch):
+    direct = FakeHTTPSession()
+    fs = FakeFSClient()
+    monkeypatch.setenv("WHOSCORED_SOURCE_CIRCUIT_WAIT", "1")
+    monkeypatch.delenv("WHOSCORED_SOURCE_CIRCUIT_PATH", raising=False)
+
+    with pytest.raises(ValueError, match="requires WHOSCORED_SOURCE_CIRCUIT_PATH"):
+        WhoScoredTransport(
+            direct_http_session=direct,
+            direct_fs_client=fs,
+            paid_fs_client=FakeFSClient(),
+        )
+
+    assert direct.calls == []
+    assert fs.created == []
 
 
 @pytest.mark.unit
@@ -703,6 +981,739 @@ def test_structured_batch_uses_one_direct_gate_then_bounded_browser_batch():
 
 
 @pytest.mark.unit
+def test_source_circuit_does_not_trip_on_expected_direct_access_gate():
+    direct = FakeHTTPSession(FakeHTTPResponse(content=MASKED_STATS_HTML))
+    fs = FakeFSClient(
+        {
+            "html": "<html><body>Team Statistics</body></html>",
+            "status": 200,
+        },
+        {
+            "content": b'{"teamTableStats":[]}',
+            "headers": {"content-type": "application/json"},
+            "status": 200,
+            "responseBytes": 21,
+            "finalUrl": TEAM_STATS_URL,
+        },
+    )
+    circuit = FakeSourceCircuit()
+    transport, _ = _transport(
+        direct,
+        direct_fs=fs,
+        source_circuit=circuit,
+    )
+
+    result = transport.fetch(
+        TEAM_STATS_URL,
+        browser_bootstrap_url=TEAM_STATS_BOOTSTRAP,
+        validator=lambda response: json.loads(response.content) is not None,
+    )
+
+    assert result.route is TransportRoute.DIRECT_FLARESOLVERR
+    assert circuit.calls == [("admit", False), ("succeed", False)]
+
+
+@pytest.mark.unit
+def test_browser_access_gate_never_counts_as_cf_or_authorizes_paid():
+    direct = FakeHTTPSession(FakeHTTPResponse(content=MASKED_STATS_HTML))
+    fs = FakeFSClient(
+        {"html": "<html><body>Team Statistics</body></html>", "status": 200},
+        *[
+            {
+                "content": MASKED_STATS_HTML,
+                "headers": {},
+                "status": 200,
+                "responseBytes": len(MASKED_STATS_HTML),
+                "finalUrl": TEAM_STATS_URL,
+            }
+            for _ in range(4)
+        ],
+    )
+    circuit = FakeSourceCircuit()
+    proxy = FakeProxyClient()
+    transport, _ = _transport(
+        direct,
+        direct_fs=fs,
+        proxy=proxy,
+        paid_http=FakeHTTPSession(FakeHTTPResponse(content=b'{"paid":true}')),
+        attempts=4,
+        source_circuit=circuit,
+    )
+
+    with pytest.raises(WhoScoredTransportError) as raised:
+        transport.fetch(
+            TEAM_STATS_URL,
+            browser_bootstrap_url=TEAM_STATS_BOOTSTRAP,
+            validator=lambda response: json.loads(response.content) is not None,
+        )
+
+    assert not isinstance(raised.value, CloudflareChallenge)
+    assert raised.value.kind is FailureKind.CONTENT
+    assert len(fs.xhr_calls) == 1
+    assert circuit.calls == [("admit", False)]
+    assert proxy.created == []
+
+
+@pytest.mark.unit
+def test_authoritative_browser_cf_trips_shared_circuit_once_and_stops_retries():
+    direct = FakeHTTPSession(FakeHTTPResponse(content=MASKED_STATS_HTML))
+    fs = FakeFSClient(
+        {
+            "html": "<html><body>Team Statistics</body></html>",
+            "status": 200,
+        },
+        {
+            "content": CF_HTML,
+            "headers": {"server": "cloudflare", "cf-ray": "ray"},
+            "status": 403,
+            "responseBytes": len(CF_HTML),
+            "finalUrl": TEAM_STATS_URL,
+        },
+    )
+    circuit = FakeSourceCircuit()
+    proxy = FakeProxyClient()
+    transport, _ = _transport(
+        direct,
+        direct_fs=fs,
+        proxy=proxy,
+        paid_http=FakeHTTPSession(FakeHTTPResponse(content=b'{"paid":true}')),
+        attempts=4,
+        source_circuit=circuit,
+    )
+
+    with pytest.raises(CloudflareChallenge) as raised:
+        transport.fetch(
+            TEAM_STATS_URL,
+            browser_bootstrap_url=TEAM_STATS_BOOTSTRAP,
+            validator=lambda response: json.loads(response.content) is not None,
+        )
+
+    assert raised.value.source_wide is True
+    assert len(fs.created) == 1
+    assert len(fs.xhr_calls) == 1
+    assert circuit.calls == [("admit", False), ("trip", False)]
+    assert proxy.created == []
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("batched", [False, True])
+def test_structured_bootstrap_typed_cf_is_authoritative_source_evidence(batched):
+    direct = FakeHTTPSession(FakeHTTPResponse(content=MASKED_STATS_HTML))
+    fs = FakeFSClient(FlareSolverrCFChallengeFailed("cloudflare blocked"))
+    circuit = FakeSourceCircuit()
+    proxy = FakeProxyClient()
+    transport, _ = _transport(
+        direct,
+        direct_fs=fs,
+        proxy=proxy,
+        attempts=4,
+        source_circuit=circuit,
+    )
+
+    with pytest.raises(CloudflareChallenge) as raised:
+        if batched:
+            transport.fetch_many(
+                [
+                    FetchRequest(
+                        url=TEAM_STATS_URL,
+                        cache_key="bootstrap-cf",
+                        browser_bootstrap_url=TEAM_STATS_BOOTSTRAP,
+                    )
+                ]
+            )
+        else:
+            transport.fetch(
+                TEAM_STATS_URL,
+                browser_bootstrap_url=TEAM_STATS_BOOTSTRAP,
+            )
+
+    assert raised.value.source_wide is True
+    assert len(fs.get_calls) == 1
+    assert fs.xhr_calls == []
+    assert fs.xhr_many_calls == []
+    assert circuit.calls == [("admit", False), ("trip", False)]
+    assert proxy.created == []
+
+
+@pytest.mark.unit
+def test_open_source_circuit_rejects_before_rate_token_or_network():
+    direct = FakeHTTPSession(FakeHTTPResponse(content=MASKED_STATS_HTML))
+    fs = FakeFSClient()
+    circuit = FakeSourceCircuit(opened=True)
+    tokens = []
+    transport, _ = _transport(
+        direct,
+        direct_fs=fs,
+        source_circuit=circuit,
+    )
+
+    with pytest.raises(CloudflareChallenge) as raised:
+        transport.fetch(
+            TEAM_STATS_URL,
+            browser_bootstrap_url=TEAM_STATS_BOOTSTRAP,
+            before_network=lambda: tokens.append("token"),
+        )
+
+    assert raised.value.source_wide is True
+    assert circuit.calls == [("admit", False)]
+    assert tokens == []
+    assert direct.calls == []
+    assert fs.created == []
+
+
+@pytest.mark.unit
+def test_corrupt_source_circuit_fails_closed_before_token_or_network(tmp_path):
+    state_path = tmp_path / "circuit" / "state.json"
+    state_path.parent.mkdir()
+    state_path.write_text("{broken\n", encoding="utf-8")
+    state_path.chmod(0o600)
+    direct = FakeHTTPSession(FakeHTTPResponse(content=MASKED_STATS_HTML))
+    fs = FakeFSClient()
+    tokens = []
+    transport, _ = _transport(
+        direct,
+        direct_fs=fs,
+        source_circuit=SharedSourceCircuit(state_path),
+    )
+
+    with pytest.raises(WhoScoredTransportError) as raised:
+        transport.fetch(
+            TEAM_STATS_URL,
+            browser_bootstrap_url=TEAM_STATS_BOOTSTRAP,
+            before_network=lambda: tokens.append("token"),
+        )
+
+    assert raised.value.kind is FailureKind.CONFIG
+    assert tokens == []
+    assert direct.calls == []
+    assert fs.created == []
+
+
+@pytest.mark.unit
+def test_complete_raw_cache_replay_ignores_unresolved_source_probe():
+    second_url = TEAM_STATS_URL + "&category=offensive"
+    cache = KeyedMemoryRawCache()
+    cache.payloads = {
+        "warm-0": CachedPayload(content=b'{"cached":0}'),
+        "warm-1": CachedPayload(content=b'{"cached":1}'),
+    }
+    direct = FakeHTTPSession()
+    fs = FakeFSClient()
+    circuit = FakeSourceCircuit(probe=True)
+    transport, _ = _transport(
+        direct,
+        direct_fs=fs,
+        raw_cache=cache,
+        source_circuit=circuit,
+    )
+    transport._source_circuit_permit = CircuitPermit(
+        generation=1,
+        probe_nonce="a" * 32,
+    )
+
+    results = transport.fetch_many(
+        [
+            FetchRequest(
+                url=url,
+                cache_key=f"warm-{index}",
+                browser_bootstrap_url=TEAM_STATS_BOOTSTRAP,
+                validator=lambda response: json.loads(response.content) is not None,
+            )
+            for index, url in enumerate((TEAM_STATS_URL, second_url))
+        ]
+    )
+
+    assert [result.route for result in results] == [
+        TransportRoute.RAW_CACHE,
+        TransportRoute.RAW_CACHE,
+    ]
+    assert circuit.calls == []
+    assert direct.calls == []
+    assert fs.created == []
+
+
+@pytest.mark.unit
+def test_half_open_batch_probes_one_feed_before_returning_to_bounded_batches():
+    second_url = TEAM_STATS_URL + "&category=offensive"
+    direct = FakeHTTPSession(FakeHTTPResponse(content=MASKED_STATS_HTML))
+    fs = FakeFSClient(
+        {
+            "html": "<html><body>Team Statistics</body></html>",
+            "status": 200,
+        },
+        [_batch_solution(TEAM_STATS_URL)],
+        [_batch_solution(second_url)],
+    )
+    circuit = FakeSourceCircuit(probe=True)
+    transport, _ = _transport(
+        direct,
+        direct_fs=fs,
+        source_circuit=circuit,
+    )
+
+    results = transport.fetch_many(
+        [
+            FetchRequest(
+                url=url,
+                cache_key=f"probe-{index}",
+                browser_bootstrap_url=TEAM_STATS_BOOTSTRAP,
+            )
+            for index, url in enumerate((TEAM_STATS_URL, second_url))
+        ]
+    )
+
+    assert len(results) == 2
+    assert [call[0] for call in fs.xhr_many_calls] == [
+        [TEAM_STATS_URL],
+        [second_url],
+    ]
+    assert circuit.calls == [
+        ("admit", False),
+        ("succeed", True),
+        ("admit", False),
+        ("succeed", False),
+    ]
+
+
+@pytest.mark.unit
+def test_half_open_direct_502_is_one_inconclusive_physical_attempt():
+    direct = FakeHTTPSession(
+        FakeHTTPResponse(status_code=502, content=b"temporary upstream error")
+    )
+    fs = FakeFSClient()
+    circuit = FakeSourceCircuit(probe=True)
+    proxy = FakeProxyClient()
+    tokens = []
+    transport, _ = _transport(
+        direct,
+        direct_fs=fs,
+        proxy=proxy,
+        http_attempts=3,
+        source_circuit=circuit,
+    )
+
+    with pytest.raises(WhoScoredTransportError) as raised:
+        transport.fetch(
+            TEAM_STATS_URL,
+            browser_bootstrap_url=TEAM_STATS_BOOTSTRAP,
+            before_network=lambda: tokens.append("token"),
+        )
+
+    assert raised.value.status_code == 502
+    assert len(direct.calls) == 1
+    assert fs.created == []
+    assert tokens == ["token"]
+    assert circuit.calls == [("admit", False), ("inconclusive", True)]
+    assert proxy.created == []
+
+
+@pytest.mark.unit
+def test_half_open_serial_browser_502_is_one_inconclusive_xhr():
+    soft_502 = b"<html><title>whoscored.com | 502: Bad gateway</title></html>"
+    direct = FakeHTTPSession(FakeHTTPResponse(content=MASKED_STATS_HTML))
+    fs = FakeFSClient(
+        {"html": "<html><body>Team Statistics</body></html>", "status": 200},
+        {
+            "content": soft_502,
+            "headers": {},
+            "status": 200,
+            "responseBytes": len(soft_502),
+            "finalUrl": TEAM_STATS_URL,
+        },
+    )
+    circuit = FakeSourceCircuit(probe=True)
+    proxy = FakeProxyClient()
+    transport, _ = _transport(
+        direct,
+        direct_fs=fs,
+        proxy=proxy,
+        attempts=4,
+        source_circuit=circuit,
+    )
+
+    with pytest.raises(WhoScoredTransportError) as raised:
+        transport.fetch(
+            TEAM_STATS_URL,
+            browser_bootstrap_url=TEAM_STATS_BOOTSTRAP,
+        )
+
+    assert raised.value.status_code == 502
+    assert len(fs.xhr_calls) == 1
+    assert len(fs.destroyed) == 1
+    assert circuit.calls == [("admit", False), ("inconclusive", True)]
+    assert proxy.created == []
+
+
+@pytest.mark.unit
+def test_half_open_batch_browser_502_is_one_inconclusive_xhr():
+    transient_502 = _batch_solution(TEAM_STATS_URL)
+    transient_502["status"] = 502
+    direct = FakeHTTPSession(FakeHTTPResponse(content=MASKED_STATS_HTML))
+    fs = FakeFSClient(
+        {"html": "<html><body>Team Statistics</body></html>", "status": 200},
+        [transient_502],
+    )
+    circuit = FakeSourceCircuit(probe=True)
+    proxy = FakeProxyClient()
+    transport, _ = _transport(
+        direct,
+        direct_fs=fs,
+        proxy=proxy,
+        attempts=4,
+        source_circuit=circuit,
+    )
+
+    with pytest.raises(WhoScoredTransportError) as raised:
+        transport.fetch_many(
+            [
+                FetchRequest(
+                    url=TEAM_STATS_URL,
+                    cache_key="half-open-502",
+                    browser_bootstrap_url=TEAM_STATS_BOOTSTRAP,
+                )
+            ]
+        )
+
+    assert raised.value.status_code == 502
+    assert [call[0] for call in fs.xhr_many_calls] == [[TEAM_STATS_URL]]
+    assert len(fs.destroyed) == 1
+    assert circuit.calls == [("admit", False), ("inconclusive", True)]
+    assert proxy.created == []
+
+
+@pytest.mark.unit
+def test_batch_authoritative_browser_cf_trips_once_and_never_pays():
+    second_url = TEAM_STATS_URL + "&category=offensive"
+    direct = FakeHTTPSession(FakeHTTPResponse(content=MASKED_STATS_HTML))
+    def cf_solution(url):
+        return {
+            "ok": True,
+            "content": CF_HTML,
+            "headers": {"server": "cloudflare", "cf-ray": "ray"},
+            "status": 403,
+            "responseBytes": len(CF_HTML),
+            "finalUrl": url,
+        }
+    fs = FakeFSClient(
+        {
+            "html": "<html><body>Team Statistics</body></html>",
+            "status": 200,
+        },
+        [cf_solution(TEAM_STATS_URL), cf_solution(second_url)],
+    )
+    circuit = FakeSourceCircuit()
+    proxy = FakeProxyClient()
+    transport, _ = _transport(
+        direct,
+        direct_fs=fs,
+        proxy=proxy,
+        paid_http=FakeHTTPSession(FakeHTTPResponse(content=b'{"paid":true}')),
+        attempts=4,
+        source_circuit=circuit,
+    )
+
+    with pytest.raises(CloudflareChallenge) as raised:
+        transport.fetch_many(
+            [
+                FetchRequest(
+                    url=url,
+                    cache_key=f"blocked-{index}",
+                    browser_bootstrap_url=TEAM_STATS_BOOTSTRAP,
+                )
+                for index, url in enumerate((TEAM_STATS_URL, second_url))
+            ]
+        )
+
+    assert raised.value.source_wide is True
+    assert len(fs.xhr_many_calls) == 1
+    assert circuit.calls == [("admit", False), ("trip", False)]
+    assert proxy.created == []
+
+
+@pytest.mark.unit
+def test_batch_source_cf_trips_before_terminal_sibling_error():
+    second_url = TEAM_STATS_URL + "&category=offensive"
+    cf_solution = {
+        "ok": True,
+        "content": CF_HTML,
+        "headers": {"server": "cloudflare", "cf-ray": "ray"},
+        "status": 403,
+        "responseBytes": len(CF_HTML),
+        "finalUrl": second_url,
+    }
+    direct = FakeHTTPSession(FakeHTTPResponse(content=MASKED_STATS_HTML))
+    fs = FakeFSClient(
+        {"html": "<html><body>Team Statistics</body></html>", "status": 200},
+        [_batch_solution(TEAM_STATS_URL, b'{"bad":true}'), cf_solution],
+    )
+    circuit = FakeSourceCircuit()
+    proxy = FakeProxyClient()
+    transport, _ = _transport(
+        direct,
+        direct_fs=fs,
+        proxy=proxy,
+        attempts=4,
+        source_circuit=circuit,
+    )
+
+    with pytest.raises(CloudflareChallenge) as raised:
+        transport.fetch_many(
+            [
+                FetchRequest(
+                    url=TEAM_STATS_URL,
+                    cache_key="mixed-terminal",
+                    validator=lambda _response: False,
+                    browser_bootstrap_url=TEAM_STATS_BOOTSTRAP,
+                ),
+                FetchRequest(
+                    url=second_url,
+                    cache_key="mixed-cf",
+                    browser_bootstrap_url=TEAM_STATS_BOOTSTRAP,
+                ),
+            ]
+        )
+
+    assert raised.value.source_wide is True
+    assert circuit.calls == [("admit", False), ("trip", False)]
+    assert len(fs.xhr_many_calls) == 1
+    assert len(fs.destroyed) == 1
+    assert proxy.created == []
+
+
+@pytest.mark.unit
+def test_capacity_wait_mode_resumes_with_one_half_open_probe_after_cooldown():
+    direct = FakeHTTPSession(FakeHTTPResponse(content=MASKED_STATS_HTML))
+    fs = FakeFSClient(
+        {"html": "<html><body>Team Statistics</body></html>", "status": 200},
+        {
+            "content": CF_HTML,
+            "headers": {"server": "cloudflare", "cf-ray": "ray"},
+            "status": 403,
+            "responseBytes": len(CF_HTML),
+            "finalUrl": TEAM_STATS_URL,
+        },
+        {"html": "<html><body>Team Statistics</body></html>", "status": 200},
+        {
+            "content": b'{"teamTableStats":[]}',
+            "headers": {"content-type": "application/json"},
+            "status": 200,
+            "responseBytes": 21,
+            "finalUrl": TEAM_STATS_URL,
+        },
+    )
+    circuit = FakeSourceCircuit(recover_on_wait=True)
+    tokens = []
+    transport, _ = _transport(
+        direct,
+        direct_fs=fs,
+        attempts=4,
+        source_circuit=circuit,
+        source_circuit_wait=True,
+    )
+
+    result = transport.fetch(
+        TEAM_STATS_URL,
+        browser_bootstrap_url=TEAM_STATS_BOOTSTRAP,
+        validator=lambda response: json.loads(response.content) is not None,
+        before_network=lambda: tokens.append("token"),
+    )
+
+    assert result.route is TransportRoute.DIRECT_FLARESOLVERR
+    assert len(fs.created) == 2
+    assert tokens == ["token", "token"]
+    assert circuit.calls == [
+        ("admit", True),
+        ("trip", False),
+        ("admit", True),
+        ("succeed", True),
+    ]
+
+
+@pytest.mark.unit
+def test_capacity_wait_mode_rechunks_blocked_batch_to_one_half_open_probe():
+    second_url = TEAM_STATS_URL + "&category=offensive"
+
+    def cf_solution(url):
+        return {
+            "ok": True,
+            "content": CF_HTML,
+            "headers": {"server": "cloudflare", "cf-ray": "ray"},
+            "status": 403,
+            "responseBytes": len(CF_HTML),
+            "finalUrl": url,
+        }
+
+    direct = FakeHTTPSession(FakeHTTPResponse(content=MASKED_STATS_HTML))
+    fs = FakeFSClient(
+        {"html": "<html><body>Team Statistics</body></html>", "status": 200},
+        [cf_solution(TEAM_STATS_URL), cf_solution(second_url)],
+        {"html": "<html><body>Team Statistics</body></html>", "status": 200},
+        [_batch_solution(TEAM_STATS_URL)],
+        [_batch_solution(second_url)],
+    )
+    circuit = FakeSourceCircuit(recover_on_wait=True)
+    proxy = FakeProxyClient()
+    transport, _ = _transport(
+        direct,
+        direct_fs=fs,
+        proxy=proxy,
+        attempts=4,
+        source_circuit=circuit,
+        source_circuit_wait=True,
+    )
+
+    results = transport.fetch_many(
+        [
+            FetchRequest(
+                url=url,
+                cache_key=f"cooldown-{index}",
+                browser_bootstrap_url=TEAM_STATS_BOOTSTRAP,
+            )
+            for index, url in enumerate((TEAM_STATS_URL, second_url))
+        ]
+    )
+
+    assert len(results) == 2
+    assert [len(call[0]) for call in fs.xhr_many_calls] == [2, 1, 1]
+    assert len(fs.created) == 2
+    assert len(fs.destroyed) == 1
+    assert circuit.calls == [
+        ("admit", True),
+        ("trip", False),
+        ("admit", True),
+        ("succeed", True),
+        ("admit", True),
+        ("succeed", False),
+    ]
+    assert proxy.created == []
+
+
+@pytest.mark.unit
+def test_structured_batch_direct_probe_spaces_two_502s_before_success(monkeypatch):
+    direct = FakeHTTPSession(
+        FakeHTTPResponse(status_code=502, content=b"temporary upstream error"),
+        FakeHTTPResponse(status_code=502, content=b"temporary upstream error"),
+        FakeHTTPResponse(content=b'{"teamTableStats":[]}'),
+    )
+    fs = FakeFSClient()
+    proxy = FakeProxyClient()
+    sleeps = []
+    tokens = []
+    monkeypatch.setattr(
+        "scrapers.whoscored.transport.time.sleep", lambda delay: sleeps.append(delay)
+    )
+    transport = WhoScoredTransport(
+        direct_http_session=direct,
+        direct_fs_client=fs,
+        paid_fs_client=FakeFSClient(),
+        proxy_client=proxy,
+    )
+
+    results = transport.fetch_many(
+        [
+            FetchRequest(
+                url=TEAM_STATS_URL,
+                cache_key="direct-probe-recovers",
+                validator=lambda response: json.loads(response.content) is not None,
+                before_network=lambda: tokens.append("token"),
+                browser_bootstrap_url=TEAM_STATS_BOOTSTRAP,
+            )
+        ]
+    )
+
+    assert results[0].route is TransportRoute.DIRECT_HTTP
+    assert len(direct.calls) == 3
+    assert sleeps == [2.0, 4.0]
+    assert tokens == ["token"] * 3
+    assert fs.created == []
+    assert proxy.created == []
+
+
+@pytest.mark.unit
+def test_structured_batch_direct_probe_retries_timeout_with_new_token(monkeypatch):
+    direct = FakeHTTPSession(
+        requests.exceptions.Timeout("temporary timeout"),
+        FakeHTTPResponse(content=b'{"teamTableStats":[]}'),
+    )
+    fs = FakeFSClient()
+    sleeps = []
+    tokens = []
+    monkeypatch.setattr(
+        "scrapers.whoscored.transport.time.sleep", lambda delay: sleeps.append(delay)
+    )
+    transport = WhoScoredTransport(
+        direct_http_session=direct,
+        direct_fs_client=fs,
+        paid_fs_client=FakeFSClient(),
+    )
+
+    results = transport.fetch_many(
+        [
+            FetchRequest(
+                url=TEAM_STATS_URL,
+                cache_key="direct-probe-timeout",
+                validator=lambda response: json.loads(response.content) is not None,
+                before_network=lambda: tokens.append("token"),
+                browser_bootstrap_url=TEAM_STATS_BOOTSTRAP,
+            )
+        ]
+    )
+
+    assert results[0].route is TransportRoute.DIRECT_HTTP
+    assert len(direct.calls) == 2
+    assert sleeps == [2.0]
+    assert tokens == ["token"] * 2
+    assert fs.created == []
+
+
+@pytest.mark.unit
+def test_structured_batch_direct_probe_three_502s_never_use_browser_or_paid(
+    monkeypatch,
+):
+    direct = FakeHTTPSession(
+        *[
+            FakeHTTPResponse(status_code=502, content=b"temporary upstream error")
+            for _ in range(3)
+        ]
+    )
+    fs = FakeFSClient()
+    proxy = FakeProxyClient()
+    sleeps = []
+    tokens = []
+    monkeypatch.setattr(
+        "scrapers.whoscored.transport.time.sleep", lambda delay: sleeps.append(delay)
+    )
+    transport = WhoScoredTransport(
+        direct_http_session=direct,
+        direct_fs_client=fs,
+        paid_fs_client=FakeFSClient(),
+        proxy_client=proxy,
+    )
+
+    with pytest.raises(WhoScoredTransportError) as raised:
+        transport.fetch_many(
+            [
+                FetchRequest(
+                    url=TEAM_STATS_URL,
+                    cache_key="direct-probe-exhausted",
+                    validator=lambda response: json.loads(response.content) is not None,
+                    before_network=lambda: tokens.append("token"),
+                    browser_bootstrap_url=TEAM_STATS_BOOTSTRAP,
+                )
+            ]
+        )
+
+    assert raised.value.kind is FailureKind.HTTP_STATUS
+    assert raised.value.status_code == 502
+    assert len(direct.calls) == 3
+    assert sleeps == [2.0, 4.0]
+    assert tokens == ["token"] * 3
+    assert fs.created == []
+    assert proxy.created == []
+    assert transport.get_traffic_stats().get("paid_route_requests", 0) == 0
+
+
+@pytest.mark.unit
 def test_eight_structured_source_urls_consume_exactly_eight_rate_tokens():
     urls = [TEAM_STATS_URL + f"&category=token-{index}" for index in range(8)]
     direct = FakeHTTPSession(FakeHTTPResponse(content=MASKED_STATS_HTML))
@@ -795,6 +1806,111 @@ def test_partial_browser_batch_caches_success_and_retry_fetches_only_failed_targ
 
 
 @pytest.mark.unit
+def test_browser_batch_retries_only_transient_502_target_without_paid():
+    second_url = TEAM_STATS_URL + "&category=offensive"
+    direct = FakeHTTPSession(FakeHTTPResponse(content=MASKED_STATS_HTML))
+    bootstrap = {
+        "html": "<html><body>Team Statistics</body></html>",
+        "status": 200,
+    }
+    transient_502 = _batch_solution(second_url)
+    transient_502["status"] = 502
+    fs = FakeFSClient(
+        bootstrap,
+        [_batch_solution(TEAM_STATS_URL), transient_502],
+        bootstrap,
+        [_batch_solution(second_url)],
+    )
+    proxy = FakeProxyClient()
+    cache = KeyedMemoryRawCache()
+    tokens = []
+    transport, factory_calls = _transport(
+        direct,
+        direct_fs=fs,
+        proxy=proxy,
+        raw_cache=cache,
+        attempts=2,
+    )
+    requests = [
+        FetchRequest(
+            url=url,
+            cache_key=f"transient-502-{index}",
+            validator=lambda response: json.loads(response.content) is not None,
+            before_network=lambda: tokens.append("token"),
+            browser_bootstrap_url=TEAM_STATS_BOOTSTRAP,
+        )
+        for index, url in enumerate((TEAM_STATS_URL, second_url))
+    ]
+
+    results = transport.fetch_many(requests)
+
+    assert [result.status_code for result in results] == [200, 200]
+    assert [call[0] for call in fs.xhr_many_calls] == [
+        [TEAM_STATS_URL, second_url],
+        [second_url],
+    ]
+    assert len(fs.created) == 2
+    assert len(fs.destroyed) == 1
+    assert tokens == ["token"] * 3
+    assert set(cache.payloads) == {"transient-502-0", "transient-502-1"}
+    assert proxy.created == []
+    assert factory_calls == []
+
+
+@pytest.mark.unit
+def test_browser_batch_repeated_502_fails_closed_without_paid():
+    direct = FakeHTTPSession(FakeHTTPResponse(content=MASKED_STATS_HTML))
+    bootstrap = {
+        "html": "<html><body>Team Statistics</body></html>",
+        "status": 200,
+    }
+    first_502 = _batch_solution(TEAM_STATS_URL)
+    first_502["status"] = 502
+    second_502 = _batch_solution(TEAM_STATS_URL)
+    second_502["status"] = 502
+    fs = FakeFSClient(
+        bootstrap,
+        [first_502],
+        bootstrap,
+        [second_502],
+    )
+    proxy = FakeProxyClient()
+    tokens = []
+    transport, factory_calls = _transport(
+        direct,
+        direct_fs=fs,
+        proxy=proxy,
+        attempts=2,
+    )
+
+    with pytest.raises(WhoScoredTransportError) as exc:
+        transport.fetch_many(
+            [
+                FetchRequest(
+                    url=TEAM_STATS_URL,
+                    cache_key="repeated-502",
+                    validator=lambda response: json.loads(response.content) is not None,
+                    before_network=lambda: tokens.append("token"),
+                    browser_bootstrap_url=TEAM_STATS_BOOTSTRAP,
+                )
+            ]
+        )
+
+    assert exc.value.kind is FailureKind.HTTP_STATUS
+    assert exc.value.status_code == 502
+    assert exc.value.retryable is True
+    assert [call[0] for call in fs.xhr_many_calls] == [
+        [TEAM_STATS_URL],
+        [TEAM_STATS_URL],
+    ]
+    assert len(fs.created) == 2
+    assert len(fs.destroyed) == 2
+    assert tokens == ["token"] * 2
+    assert proxy.created == []
+    assert factory_calls == []
+
+
+@pytest.mark.unit
 def test_transient_browser_bootstrap_redirect_retries_direct_without_paid():
     direct = FakeHTTPSession(FakeHTTPResponse(content=MASKED_STATS_HTML))
     fs = FakeFSClient(
@@ -876,6 +1992,66 @@ def test_batch_runtime_error_then_cf_never_enables_paid_fallback():
     assert len(fs.xhr_many_calls) == 2
     assert proxy.created == []
     assert factory_calls == []
+
+
+@pytest.mark.unit
+def test_batch_prepaid_recheck_spaces_502s_then_fails_without_paid(monkeypatch):
+    direct = FakeHTTPSession(
+        FakeHTTPResponse(content=MASKED_STATS_HTML),
+        *[
+            FakeHTTPResponse(status_code=502, content=b"temporary upstream error")
+            for _ in range(3)
+        ],
+    )
+    cf_solution = {
+        "ok": True,
+        "content": CF_HTML,
+        "headers": {"server": "cloudflare", "cf-ray": "abc"},
+        "status": 403,
+        "responseBytes": len(CF_HTML),
+        "finalUrl": TEAM_STATS_URL,
+    }
+    fs = FakeFSClient(
+        {"html": "<html><body>Team Statistics</body></html>", "status": 200},
+        [cf_solution],
+    )
+    proxy = FakeProxyClient()
+    sleeps = []
+    tokens = []
+    monkeypatch.setattr(
+        "scrapers.whoscored.transport.time.sleep", lambda delay: sleeps.append(delay)
+    )
+    transport, factory_calls = _transport(
+        direct,
+        direct_fs=fs,
+        proxy=proxy,
+        paid_http=FakeHTTPSession(FakeHTTPResponse(content=b'{"paid":true}')),
+        attempts=1,
+        http_retry_backoff=2.0,
+    )
+
+    with pytest.raises(WhoScoredTransportError) as raised:
+        transport.fetch_many(
+            [
+                FetchRequest(
+                    url=TEAM_STATS_URL,
+                    cache_key="prepaid-recheck-502",
+                    validator=lambda response: json.loads(response.content) is not None,
+                    before_network=lambda: tokens.append("token"),
+                    browser_bootstrap_url=TEAM_STATS_BOOTSTRAP,
+                )
+            ]
+        )
+
+    assert raised.value.kind is FailureKind.HTTP_STATUS
+    assert raised.value.status_code == 502
+    assert len(direct.calls) == 4
+    assert len(fs.xhr_many_calls) == 1
+    assert sleeps == [2.0, 4.0]
+    assert tokens == ["token"] * 4
+    assert proxy.created == []
+    assert factory_calls == []
+    assert transport.get_traffic_stats().get("paid_route_requests", 0) == 0
 
 
 @pytest.mark.unit
@@ -1274,6 +2450,78 @@ def test_direct_cloudflare_uses_fresh_direct_browser_with_media_disabled():
 
 
 @pytest.mark.unit
+def test_default_browser_session_name_is_unchanged(monkeypatch):
+    monkeypatch.setattr(
+        "scrapers.whoscored.transport.uuid.uuid4",
+        lambda: types.SimpleNamespace(hex="0123456789abcdef"),
+    )
+    direct = FakeHTTPSession(FakeHTTPResponse(403, CF_HTML, {"cf-ray": "x"}))
+    fs = FakeFSClient({"html": OK_HTML.decode(), "status": 200})
+    transport, _ = _transport(direct, direct_fs=fs)
+
+    transport.fetch("https://www.whoscored.com/Matches/1/Live")
+
+    assert fs.created == [("ws-direct_flaresolverr-0123456789", None)]
+
+
+@pytest.mark.unit
+def test_capacity_owner_isolated_browser_session_name(monkeypatch):
+    monkeypatch.setattr(
+        "scrapers.whoscored.transport.uuid.uuid4",
+        lambda: types.SimpleNamespace(hex="0123456789abcdef"),
+    )
+    owner = "a1b2c3d4e5f60718"
+    direct = FakeHTTPSession(FakeHTTPResponse(403, CF_HTML, {"cf-ray": "x"}))
+    fs = FakeFSClient({"html": OK_HTML.decode(), "status": 200})
+    transport, _ = _transport(
+        direct,
+        direct_fs=fs,
+        browser_session_owner=owner,
+    )
+
+    transport.fetch("https://www.whoscored.com/Matches/1/Live")
+
+    assert fs.created == [
+        (f"ws-cap-{owner}-direct_flaresolverr-0123456789", None)
+    ]
+
+
+class _OwnerStringSubclass(str):
+    pass
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "owner",
+    [
+        "",
+        "a" * 15,
+        "a" * 33,
+        "A" * 16,
+        "a" * 15 + "-",
+        "a" * 15 + "/",
+        "a" * 15 + "é",
+        1234567890123456,
+        _OwnerStringSubclass("a" * 16),
+    ],
+)
+def test_invalid_capacity_owner_fails_before_session_side_effect(owner):
+    direct = FakeHTTPSession()
+    fs = FakeFSClient()
+
+    with pytest.raises(ValueError, match="browser_session_owner"):
+        WhoScoredTransport(
+            direct_http_session=direct,
+            direct_fs_client=fs,
+            paid_fs_client=FakeFSClient(),
+            browser_session_owner=owner,
+        )
+
+    assert direct.calls == []
+    assert fs.created == []
+
+
+@pytest.mark.unit
 def test_direct_browser_retries_cloudflare_origin_502_rendered_as_http_200():
     soft_502 = b"<html><title>whoscored.com | 502: Bad gateway</title></html>"
     direct = FakeHTTPSession(FakeHTTPResponse(403, CF_HTML, {"cf-ray": "x"}))
@@ -1297,6 +2545,529 @@ def test_direct_browser_retries_cloudflare_origin_502_rendered_as_http_200():
     # the additional physical retry acquires one more.
     assert len(tokens) == 2
     assert proxy.created == []
+
+
+@pytest.mark.unit
+def test_production_browser_defaults_recover_two_masked_502s_with_backoff(
+    monkeypatch,
+):
+    soft_502 = b"<html><title>whoscored.com | 502: Bad gateway</title></html>"
+    direct = FakeHTTPSession(FakeHTTPResponse(403, CF_HTML, {"cf-ray": "x"}))
+    fs = FakeFSClient(
+        {"html": soft_502.decode(), "status": 200},
+        {"html": soft_502.decode(), "status": 200},
+        {"html": OK_HTML.decode(), "status": 200},
+    )
+    proxy = FakeProxyClient()
+    sleeps = []
+    tokens = []
+    monkeypatch.setattr(
+        "scrapers.whoscored.transport.time.sleep", lambda delay: sleeps.append(delay)
+    )
+    monkeypatch.setattr(
+        "scrapers.whoscored.transport.random.uniform", lambda _low, _high: 0.0
+    )
+    transport = WhoScoredTransport(
+        direct_http_session=direct,
+        direct_fs_client=fs,
+        paid_fs_client=FakeFSClient(),
+        proxy_client=proxy,
+    )
+
+    result = transport.fetch(
+        "https://www.whoscored.com/Matches/1/Live",
+        before_network=lambda: tokens.append("token"),
+    )
+
+    assert result.content == OK_HTML
+    assert result.route is TransportRoute.DIRECT_FLARESOLVERR
+    assert len(fs.get_calls) == 3
+    assert len(fs.created) == 3
+    assert len(fs.destroyed) == 2
+    assert sleeps == [2.0, 4.0]
+    assert tokens == ["token"] * 3
+    assert proxy.created == []
+
+
+@pytest.mark.unit
+def test_production_batch_defaults_recover_two_masked_502s_with_backoff(
+    monkeypatch,
+):
+    bootstrap = {"html": "<html>Team Statistics</html>", "status": 200}
+    first_502 = _batch_solution(TEAM_STATS_URL)
+    first_502["status"] = 502
+    second_502 = _batch_solution(TEAM_STATS_URL)
+    second_502["status"] = 502
+    direct = FakeHTTPSession(FakeHTTPResponse(content=MASKED_STATS_HTML))
+    fs = FakeFSClient(
+        bootstrap,
+        [first_502],
+        bootstrap,
+        [second_502],
+        bootstrap,
+        [_batch_solution(TEAM_STATS_URL)],
+    )
+    proxy = FakeProxyClient()
+    sleeps = []
+    tokens = []
+    monkeypatch.setattr(
+        "scrapers.whoscored.transport.time.sleep", lambda delay: sleeps.append(delay)
+    )
+    monkeypatch.setattr(
+        "scrapers.whoscored.transport.random.uniform", lambda _low, _high: 0.0
+    )
+    transport = WhoScoredTransport(
+        direct_http_session=direct,
+        direct_fs_client=fs,
+        paid_fs_client=FakeFSClient(),
+        proxy_client=proxy,
+    )
+
+    result = transport.fetch_many(
+        [
+            FetchRequest(
+                url=TEAM_STATS_URL,
+                cache_key="production-default-502",
+                validator=lambda response: json.loads(response.content) is not None,
+                before_network=lambda: tokens.append("token"),
+                browser_bootstrap_url=TEAM_STATS_BOOTSTRAP,
+            )
+        ]
+    )
+
+    assert result[0].route is TransportRoute.DIRECT_FLARESOLVERR
+    assert len(fs.xhr_many_calls) == 3
+    assert len(fs.created) == 3
+    assert len(fs.destroyed) == 2
+    assert sleeps == [2.0, 4.0]
+    assert tokens == ["token"] * 3
+    assert proxy.created == []
+
+
+@pytest.mark.unit
+def test_production_browser_defaults_recover_three_cf_challenges_with_jitter(
+    monkeypatch,
+):
+    direct = FakeHTTPSession(FakeHTTPResponse(403, CF_HTML, {"cf-ray": "x"}))
+    fs = FakeFSClient(
+        FlareSolverrCFChallengeFailed("cloudflare challenge"),
+        FlareSolverrCFChallengeFailed("cloudflare challenge"),
+        FlareSolverrCFChallengeFailed("cloudflare challenge"),
+        {"html": OK_HTML.decode(), "status": 200},
+    )
+    proxy = FakeProxyClient()
+    cache = MemoryRawCache()
+    sleeps = []
+    tokens = []
+    jitter_values = iter((0.5, 1.0, 2.0))
+    monkeypatch.setattr(
+        "scrapers.whoscored.transport.time.sleep", lambda delay: sleeps.append(delay)
+    )
+    monkeypatch.setattr(
+        "scrapers.whoscored.transport.random.uniform",
+        lambda low, high: next(jitter_values),
+    )
+    transport = WhoScoredTransport(
+        direct_http_session=direct,
+        direct_fs_client=fs,
+        paid_fs_client=FakeFSClient(),
+        proxy_client=proxy,
+        raw_cache=cache,
+    )
+
+    result = transport.fetch(
+        "https://www.whoscored.com/Matches/1/Live",
+        before_network=lambda: tokens.append("token"),
+    )
+
+    assert result.route is TransportRoute.DIRECT_FLARESOLVERR
+    assert len(fs.get_calls) == 4
+    assert len(fs.created) == 4
+    assert len(fs.destroyed) == 3
+    assert sleeps == [2.5, 5.0, 10.0]
+    assert tokens == ["token"] * 4
+    assert proxy.created == []
+    assert len(cache.stored) == 1
+
+
+@pytest.mark.unit
+def test_production_batch_defaults_recover_three_cf_challenges_with_jitter(
+    monkeypatch,
+):
+    bootstrap = {"html": "<html>Team Statistics</html>", "status": 200}
+    direct = FakeHTTPSession(FakeHTTPResponse(content=MASKED_STATS_HTML))
+    fs = FakeFSClient(
+        FlareSolverrCFChallengeFailed("cloudflare challenge"),
+        FlareSolverrCFChallengeFailed("cloudflare challenge"),
+        FlareSolverrCFChallengeFailed("cloudflare challenge"),
+        bootstrap,
+        [_batch_solution(TEAM_STATS_URL)],
+    )
+    proxy = FakeProxyClient()
+    sleeps = []
+    tokens = []
+    jitter_values = iter((0.5, 1.0, 2.0))
+    monkeypatch.setattr(
+        "scrapers.whoscored.transport.time.sleep", lambda delay: sleeps.append(delay)
+    )
+    monkeypatch.setattr(
+        "scrapers.whoscored.transport.random.uniform",
+        lambda low, high: next(jitter_values),
+    )
+    transport = WhoScoredTransport(
+        direct_http_session=direct,
+        direct_fs_client=fs,
+        paid_fs_client=FakeFSClient(),
+        proxy_client=proxy,
+    )
+
+    result = transport.fetch_many(
+        [
+            FetchRequest(
+                url=TEAM_STATS_URL,
+                cache_key="production-default-cf",
+                validator=lambda response: json.loads(response.content) is not None,
+                before_network=lambda: tokens.append("token"),
+                browser_bootstrap_url=TEAM_STATS_BOOTSTRAP,
+            )
+        ]
+    )
+
+    assert result[0].route is TransportRoute.DIRECT_FLARESOLVERR
+    assert len(fs.get_calls) == 4
+    assert len(fs.xhr_many_calls) == 1
+    assert len(fs.created) == 4
+    assert len(fs.destroyed) == 3
+    assert sleeps == [2.5, 5.0, 10.0]
+    assert tokens == ["token"] * 4
+    assert proxy.created == []
+
+
+@pytest.mark.unit
+def test_production_batch_retries_only_four_cf_items_until_fourth_attempt(
+    monkeypatch,
+):
+    urls = [TEAM_STATS_URL + f"&category=cf-{index}" for index in range(8)]
+
+    def cf_solution(url):
+        solution = _batch_solution(url, CF_HTML)
+        solution.update(
+            {
+                "status": 403,
+                "headers": {"server": "cloudflare", "cf-ray": "abc"},
+            }
+        )
+        return solution
+
+    bootstrap = {"html": "<html>Team Statistics</html>", "status": 200}
+    first_outcomes = [
+        *[_batch_solution(url) for url in urls[:4]],
+        *[cf_solution(url) for url in urls[4:]],
+    ]
+    direct = FakeHTTPSession(FakeHTTPResponse(content=MASKED_STATS_HTML))
+    fs = FakeFSClient(
+        bootstrap,
+        first_outcomes,
+        bootstrap,
+        [cf_solution(url) for url in urls[4:]],
+        bootstrap,
+        [cf_solution(url) for url in urls[4:]],
+        bootstrap,
+        [_batch_solution(url) for url in urls[4:]],
+    )
+    proxy = FakeProxyClient()
+    cache = KeyedMemoryRawCache()
+    sleeps = []
+    tokens = []
+    jitter_values = iter((0.5, 1.0, 2.0))
+    monkeypatch.setattr(
+        "scrapers.whoscored.transport.time.sleep", lambda delay: sleeps.append(delay)
+    )
+    monkeypatch.setattr(
+        "scrapers.whoscored.transport.random.uniform",
+        lambda low, high: next(jitter_values),
+    )
+    transport = WhoScoredTransport(
+        direct_http_session=direct,
+        direct_fs_client=fs,
+        paid_fs_client=FakeFSClient(),
+        proxy_client=proxy,
+        raw_cache=cache,
+    )
+
+    results = transport.fetch_many(
+        [
+            FetchRequest(
+                url=url,
+                cache_key=f"partial-cf-{index}",
+                validator=lambda response: json.loads(response.content) is not None,
+                before_network=lambda: tokens.append("token"),
+                browser_bootstrap_url=TEAM_STATS_BOOTSTRAP,
+            )
+            for index, url in enumerate(urls)
+        ]
+    )
+
+    assert all(result.route is TransportRoute.DIRECT_FLARESOLVERR for result in results)
+    assert [len(call[0]) for call in fs.xhr_many_calls] == [8, 4, 4, 4]
+    assert len(fs.created) == 4
+    assert len(fs.destroyed) == 3
+    assert sleeps == [2.5, 5.0, 10.0]
+    assert tokens == ["token"] * 20
+    assert len(cache.stored) == 8
+    assert set(cache.payloads) == {f"partial-cf-{index}" for index in range(8)}
+    assert proxy.created == []
+
+
+@pytest.mark.unit
+def test_production_browser_four_cf_challenges_fail_closed_without_paid(
+    monkeypatch,
+):
+    direct = FakeHTTPSession(FakeHTTPResponse(403, CF_HTML, {"cf-ray": "x"}))
+    fs = FakeFSClient(
+        *[
+            FlareSolverrCFChallengeFailed("cloudflare challenge")
+            for _ in range(4)
+        ]
+    )
+    sleeps = []
+    tokens = []
+    monkeypatch.setattr(
+        "scrapers.whoscored.transport.time.sleep", lambda delay: sleeps.append(delay)
+    )
+    monkeypatch.setattr(
+        "scrapers.whoscored.transport.random.uniform", lambda _low, _high: 0.0
+    )
+    transport = WhoScoredTransport(
+        direct_http_session=direct,
+        direct_fs_client=fs,
+        paid_fs_client=FakeFSClient(),
+    )
+
+    with pytest.raises(CloudflareChallenge):
+        transport.fetch(
+            "https://www.whoscored.com/Matches/1/Live",
+            before_network=lambda: tokens.append("token"),
+        )
+
+    assert len(fs.get_calls) == 4
+    assert len(fs.created) == 4
+    assert len(fs.destroyed) == 4
+    assert sleeps == [2.0, 4.0, 8.0]
+    assert tokens == ["token"] * 4
+
+
+@pytest.mark.unit
+def test_production_four_cf_challenges_require_fresh_direct_cf_before_paid(
+    monkeypatch,
+):
+    direct = FakeHTTPSession(
+        FakeHTTPResponse(content=MASKED_STATS_HTML),
+        FakeHTTPResponse(content=MASKED_STATS_HTML),
+    )
+    fs = FakeFSClient(
+        *[
+            FlareSolverrCFChallengeFailed("cloudflare challenge")
+            for _ in range(4)
+        ]
+    )
+    proxy = FakeProxyClient()
+    paid_http = FakeHTTPSession(FakeHTTPResponse(content=b'{"paid":true}'))
+    factory_calls = []
+    sleeps = []
+    tokens = []
+    monkeypatch.setattr(
+        "scrapers.whoscored.transport.time.sleep", lambda delay: sleeps.append(delay)
+    )
+    monkeypatch.setattr(
+        "scrapers.whoscored.transport.random.uniform", lambda _low, _high: 0.0
+    )
+
+    def factory(proxy_url):
+        factory_calls.append(proxy_url)
+        return paid_http
+
+    transport = WhoScoredTransport(
+        direct_http_session=direct,
+        direct_fs_client=fs,
+        paid_fs_client=FakeFSClient(),
+        proxy_client=proxy,
+        paid_proxy_url="http://proxy_filter:8899",
+        http_session_factory=factory,
+    )
+
+    result = transport.fetch(
+        TEAM_STATS_URL,
+        validator=lambda response: json.loads(response.content) is not None,
+        before_network=lambda: tokens.append("token"),
+        browser_bootstrap_url=TEAM_STATS_BOOTSTRAP,
+    )
+
+    assert result.route is TransportRoute.PAID_HTTP
+    assert len(fs.get_calls) == 4
+    assert len(direct.calls) == 2
+    assert sleeps == [2.0, 4.0, 8.0]
+    assert tokens == ["token"] * 5
+    assert len(proxy.created) == 1
+    assert factory_calls == ["http://lease:secret@proxy_filter:8899"]
+
+
+@pytest.mark.unit
+def test_three_cf_then_browser_error_on_fourth_attempt_never_enables_paid(
+    monkeypatch,
+):
+    direct = FakeHTTPSession(FakeHTTPResponse(content=MASKED_STATS_HTML))
+    fs = FakeFSClient(
+        FlareSolverrCFChallengeFailed("cloudflare challenge"),
+        FlareSolverrCFChallengeFailed("cloudflare challenge"),
+        FlareSolverrCFChallengeFailed("cloudflare challenge"),
+        FlareSolverrError("ordinary browser failure"),
+    )
+    proxy = FakeProxyClient()
+    factory_calls = []
+    sleeps = []
+    tokens = []
+    monkeypatch.setattr(
+        "scrapers.whoscored.transport.time.sleep", lambda delay: sleeps.append(delay)
+    )
+    monkeypatch.setattr(
+        "scrapers.whoscored.transport.random.uniform", lambda _low, _high: 0.0
+    )
+
+    def factory(proxy_url):
+        factory_calls.append(proxy_url)
+        return FakeHTTPSession(FakeHTTPResponse(content=b'{"paid":true}'))
+
+    transport = WhoScoredTransport(
+        direct_http_session=direct,
+        direct_fs_client=fs,
+        paid_fs_client=FakeFSClient(),
+        proxy_client=proxy,
+        paid_proxy_url="http://proxy_filter:8899",
+        http_session_factory=factory,
+    )
+
+    with pytest.raises(WhoScoredTransportError) as raised:
+        transport.fetch(
+            TEAM_STATS_URL,
+            before_network=lambda: tokens.append("token"),
+            browser_bootstrap_url=TEAM_STATS_BOOTSTRAP,
+        )
+
+    assert raised.value.kind is FailureKind.BROWSER
+    assert len(fs.get_calls) == 4
+    assert sleeps == [2.0, 4.0, 8.0]
+    assert tokens == ["token"] * 4
+    assert proxy.created == []
+    assert factory_calls == []
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("value", [True, -1, float("nan"), float("inf"), "2"])
+def test_invalid_browser_retry_jitter_fails_before_network(value):
+    direct = FakeHTTPSession()
+    fs = FakeFSClient()
+
+    with pytest.raises(ValueError, match="browser_retry_jitter_seconds"):
+        WhoScoredTransport(
+            direct_http_session=direct,
+            direct_fs_client=fs,
+            paid_fs_client=FakeFSClient(),
+            browser_retry_jitter_seconds=value,
+        )
+
+    assert direct.calls == []
+    assert fs.created == []
+
+
+@pytest.mark.unit
+def test_browser_retry_jitter_never_exceeds_total_backoff_cap(monkeypatch):
+    transport, _ = _transport(
+        FakeHTTPSession(),
+        retry_backoff=30.0,
+        retry_jitter=2.0,
+    )
+    sleeps = []
+    jitter_calls = []
+    monkeypatch.setattr(
+        "scrapers.whoscored.transport.time.sleep", lambda delay: sleeps.append(delay)
+    )
+
+    def maximum_jitter(low, high):
+        jitter_calls.append((low, high))
+        return high
+
+    monkeypatch.setattr(
+        "scrapers.whoscored.transport.random.uniform", maximum_jitter
+    )
+
+    transport._wait_before_browser_retry(0)
+
+    assert jitter_calls == [(0.0, 2.0)]
+    assert sleeps == [30.0]
+
+
+@pytest.mark.unit
+def test_zero_browser_backoff_skips_jitter_rng_and_sleep(monkeypatch):
+    transport, _ = _transport(
+        FakeHTTPSession(),
+        retry_backoff=0.0,
+        retry_jitter=2.0,
+    )
+    sleeps = []
+    monkeypatch.setattr(
+        "scrapers.whoscored.transport.time.sleep", lambda delay: sleeps.append(delay)
+    )
+
+    def unexpected_jitter(_low, _high):
+        raise AssertionError("jitter RNG must not run when browser backoff is zero")
+
+    monkeypatch.setattr(
+        "scrapers.whoscored.transport.random.uniform", unexpected_jitter
+    )
+
+    transport._wait_before_browser_retry(3)
+
+    assert sleeps == []
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "transient_error",
+    [
+        FlareSolverrError("internal browser failure"),
+        FlareSolverrTimeout("browser timeout"),
+    ],
+)
+def test_serial_retryable_browser_failure_rotates_and_retries_without_paid(
+    transient_error,
+):
+    direct = FakeHTTPSession(FakeHTTPResponse(403, CF_HTML, {"cf-ray": "x"}))
+    fs = FakeFSClient(
+        transient_error,
+        {"html": OK_HTML.decode(), "status": 200},
+    )
+    proxy = FakeProxyClient()
+    tokens = []
+    transport, factory_calls = _transport(
+        direct,
+        direct_fs=fs,
+        proxy=proxy,
+        attempts=2,
+    )
+
+    result = transport.fetch(
+        "https://www.whoscored.com/Matches/1/Live",
+        before_network=lambda: tokens.append("token"),
+    )
+
+    assert result.route is TransportRoute.DIRECT_FLARESOLVERR
+    assert len(fs.get_calls) == 2
+    assert len(fs.created) == 2
+    assert len(fs.destroyed) == 1
+    assert tokens == ["token"] * 2
+    assert proxy.created == []
+    assert factory_calls == []
 
 
 @pytest.mark.unit
@@ -1336,10 +3107,118 @@ def test_lost_create_response_destroys_possible_orphan_browser_session():
         transport.fetch("https://www.whoscored.com/Matches/1/Live")
 
     assert exc.value.kind is FailureKind.TIMEOUT
-    assert len(fs.created) == 1
-    assert fs.destroyed == [fs.created[0][0]]
+    assert len(fs.created) == 2
+    assert fs.destroyed == [created[0] for created in fs.created]
     assert transport.get_traffic_stats()["browser_sessions"] == 0
     assert proxy.created == []
+
+
+@pytest.mark.unit
+def test_system_exit_during_browser_create_destroys_deterministic_session_id():
+    class CreateThenTerminateFS(FakeFSClient):
+        def create_session(self, session_id, proxy_url=None):
+            self.created.append((session_id, proxy_url))
+            raise SystemExit(143)
+
+    direct = FakeHTTPSession(FakeHTTPResponse(403, CF_HTML, {"cf-ray": "x"}))
+    fs = CreateThenTerminateFS()
+    transport, _ = _transport(direct, direct_fs=fs)
+
+    with pytest.raises(SystemExit) as raised:
+        transport.fetch("https://www.whoscored.com/Matches/1/Live")
+
+    assert raised.value.code == 143
+    assert len(fs.created) == 1
+    assert fs.destroyed == [fs.created[0][0]]
+    assert transport._browser_sessions == {}
+
+
+@pytest.mark.unit
+def test_system_exit_after_remote_create_before_return_destroys_tracked_session():
+    class TerminateOnBrowserSessionIncrement:
+        def __init__(self, wrapped):
+            object.__setattr__(self, "_wrapped", wrapped)
+            object.__setattr__(self, "_terminated", False)
+
+        def __getattr__(self, name):
+            return getattr(self._wrapped, name)
+
+        def __setattr__(self, name, value):
+            if name == "browser_sessions" and not self._terminated:
+                object.__setattr__(self, "_terminated", True)
+                raise SystemExit(143)
+            setattr(self._wrapped, name, value)
+
+    direct = FakeHTTPSession(FakeHTTPResponse(403, CF_HTML, {"cf-ray": "x"}))
+    fs = FakeFSClient()
+    transport, _ = _transport(direct, direct_fs=fs)
+    transport.stats = TerminateOnBrowserSessionIncrement(transport.stats)
+
+    with pytest.raises(SystemExit) as raised:
+        transport.fetch("https://www.whoscored.com/Matches/1/Live")
+
+    assert raised.value.code == 143
+    assert len(fs.created) == 1
+    assert fs.destroyed == [fs.created[0][0]]
+    assert transport._browser_sessions == {}
+    assert transport.get_traffic_stats()["browser_sessions"] == 0
+
+
+@pytest.mark.unit
+def test_system_exit_during_destroy_keeps_session_tracked_for_close_retry():
+    class TerminateFirstDestroyFS(FakeFSClient):
+        def destroy_session(self, session_id):
+            self.destroyed.append(session_id)
+            if len(self.destroyed) == 1:
+                raise SystemExit(143)
+
+    direct = FakeHTTPSession(FakeHTTPResponse(403, CF_HTML, {"cf-ray": "x"}))
+    fs = TerminateFirstDestroyFS(
+        {"html": OK_HTML.decode(), "status": 200, "cookies": [], "userAgent": "x"}
+    )
+    transport, _ = _transport(direct, direct_fs=fs)
+    transport.fetch("https://www.whoscored.com/Matches/1/Live")
+    session_id = fs.created[0][0]
+
+    with pytest.raises(SystemExit) as raised:
+        transport.close()
+
+    assert raised.value.code == 143
+    assert transport._browser_sessions[
+        TransportRoute.DIRECT_FLARESOLVERR
+    ].session_id == session_id
+
+    transport.close()
+
+    assert fs.destroyed == [session_id, session_id]
+    assert transport._browser_sessions == {}
+    assert direct.closed is True
+    assert fs.closed is True
+
+
+@pytest.mark.unit
+def test_ordinary_destroy_error_remains_best_effort_and_untracks_session(caplog):
+    class FailDestroyFS(FakeFSClient):
+        def destroy_session(self, session_id):
+            self.destroyed.append(session_id)
+            raise RuntimeError(f"destroy failed {session_id}")
+
+    direct = FakeHTTPSession(FakeHTTPResponse(403, CF_HTML, {"cf-ray": "x"}))
+    fs = FailDestroyFS(
+        {"html": OK_HTML.decode(), "status": 200, "cookies": [], "userAgent": "x"}
+    )
+    transport, _ = _transport(direct, direct_fs=fs)
+    transport.fetch("https://www.whoscored.com/Matches/1/Live")
+    session_id = fs.created[0][0]
+
+    with caplog.at_level("DEBUG"):
+        transport.close()
+
+    assert fs.destroyed == [session_id]
+    assert session_id not in caplog.text
+    assert transport._browser_sessions == {}
+    assert direct.closed is True
+    assert fs.closed is True
 
 
 @pytest.mark.unit
@@ -1367,7 +3246,10 @@ def test_transport_close_releases_http_browser_and_proxy_control_pools():
 @pytest.mark.unit
 def test_timeout_from_direct_browser_does_not_enable_paid_proxy():
     direct = FakeHTTPSession(FakeHTTPResponse(403, CF_HTML, {"cf-ray": "x"}))
-    fs = FakeFSClient(FlareSolverrTimeout("down"))
+    fs = FakeFSClient(
+        FlareSolverrTimeout("down"),
+        FlareSolverrTimeout("still down"),
+    )
     proxy = FakeProxyClient()
     transport, _ = _transport(direct, direct_fs=fs, proxy=proxy)
 
@@ -1375,6 +3257,9 @@ def test_timeout_from_direct_browser_does_not_enable_paid_proxy():
         transport.fetch("https://www.whoscored.com/Matches/1/Live")
 
     assert exc.value.kind is FailureKind.TIMEOUT
+    assert len(fs.get_calls) == 2
+    assert len(fs.created) == 2
+    assert len(fs.destroyed) == 2
     assert proxy.created == []
 
 
@@ -1436,6 +3321,8 @@ def test_paid_lease_is_finalized_when_http_session_creation_fails():
         proxy_client=proxy,
         paid_proxy_url="http://proxy_filter:8899",
         http_session_factory=failing_factory,
+        direct_browser_attempts=2,
+        browser_retry_backoff_seconds=0,
     )
 
     with pytest.raises(WhoScoredTransportError) as exc:
@@ -1803,6 +3690,23 @@ def test_paid_limit_is_zero_when_no_urls_are_eligible():
 
 
 @pytest.mark.unit
+def test_proxy_lease_repr_never_exposes_bearer_credentials():
+    lease = ProxyLease(
+        lease_id="lease-visible-id",
+        token="bearer-super-secret",
+        proxy_url="http://lease:embedded-secret@proxy_filter:8899",
+        max_bytes=1234,
+        expires_at=99.0,
+    )
+
+    rendered = repr(lease)
+    assert "lease-visible-id" in rendered
+    assert "bearer-super-secret" not in rendered
+    assert "embedded-secret" not in rendered
+    assert "proxy_filter" not in rendered
+
+
+@pytest.mark.unit
 def test_proxy_control_client_uses_dedicated_authenticated_lease_listener():
     response = FakeHTTPResponse()
     response.raise_for_status = lambda: None
@@ -1814,7 +3718,12 @@ def test_proxy_control_client_uses_dedicated_authenticated_lease_listener():
         "expires_at": 99.0,
     }
     session = SimpleControlSession(response)
-    client = ProxyFilterClient("http://proxy_filter:8899", session=session, timeout=3)
+    client = ProxyFilterClient(
+        "http://proxy_filter:8899",
+        session=session,
+        timeout=3,
+        control_token=CONTROL_TOKEN,
+    )
 
     context = TransportContext(
         dag_id="dag", run_id="run", task_id="task", map_index=4, try_number=2
@@ -1840,20 +3749,92 @@ def test_proxy_control_client_uses_dedicated_authenticated_lease_listener():
         "scope": "",
         "entity": "",
     }
+    assert session.posts[0][1]["headers"] == {
+        "X-Proxy-Control-Token": CONTROL_TOKEN
+    }
     assert lease.proxy_url == "http://lease:s%2Fecret@proxy_filter:8900"
+    client.stats(lease)
+    client.close(lease)
+    expected_headers = {
+        "X-Proxy-Control-Token": CONTROL_TOKEN,
+        "Authorization": "Bearer s/ecret",
+    }
+    assert session.gets[0][1]["headers"] == expected_headers
+    assert session.deletes[0][1]["headers"] == expected_headers
     client.close_session()
     assert session.closed is True
+
+
+@pytest.mark.unit
+def test_proxy_control_client_fails_closed_without_auth_and_surfaces_401(monkeypatch):
+    for name in (
+        "WHOSCORED_PROXY_CONTROL_TOKEN",
+        "PROXY_FILTER_CONTROL_TOKEN",
+        "SOFASCORE_PROXY_CONTROL_TOKEN",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    with pytest.raises(ValueError, match="PROXY_FILTER_CONTROL_TOKEN"):
+        ProxyFilterClient("http://proxy_filter:8899")
+
+    response = FakeHTTPResponse(status_code=401)
+    response.raise_for_status = lambda: (_ for _ in ()).throw(
+        requests.HTTPError("401 Client Error")
+    )
+    response.json = lambda: {"error": "unauthorized"}
+    session = SimpleControlSession(response)
+    client = ProxyFilterClient(
+        "http://proxy_filter:8899",
+        session=session,
+        control_token=CONTROL_TOKEN,
+    )
+    with pytest.raises(requests.HTTPError, match="401"):
+        client.create_lease(max_bytes=2_000_000, ttl_seconds=60)
+    assert session.posts[0][1]["headers"] == {
+        "X-Proxy-Control-Token": CONTROL_TOKEN
+    }
+    assert session.posts[0][1]["json"]["max_bytes"] == 2_000_000
+
+
+@pytest.mark.unit
+def test_proxy_control_client_reads_provider_neutral_control_token(monkeypatch):
+    monkeypatch.setenv("PROXY_FILTER_CONTROL_TOKEN", CONTROL_TOKEN)
+    response = FakeHTTPResponse()
+    response.raise_for_status = lambda: None
+    response.json = lambda: {
+        "id": "lease-env",
+        "token": "lease-token",
+        "proxy_url": "http://proxy_filter:8900",
+        "max_bytes": 1000,
+    }
+    session = SimpleControlSession(response)
+    client = ProxyFilterClient("http://proxy_filter:8899", session=session)
+
+    client.create_lease(max_bytes=1000, ttl_seconds=60)
+
+    assert session.posts[0][1]["headers"] == {
+        "X-Proxy-Control-Token": CONTROL_TOKEN
+    }
 
 
 class SimpleControlSession:
     def __init__(self, response):
         self.response = response
         self.posts = []
+        self.gets = []
+        self.deletes = []
         self.trust_env = True
         self.closed = False
 
     def post(self, url, **kwargs):
         self.posts.append((url, kwargs))
+        return self.response
+
+    def get(self, url, **kwargs):
+        self.gets.append((url, kwargs))
+        return self.response
+
+    def delete(self, url, **kwargs):
+        self.deletes.append((url, kwargs))
         return self.response
 
     def close(self):

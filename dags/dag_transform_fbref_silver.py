@@ -656,9 +656,9 @@ def _validate_silver_quality(**context) -> Dict[str, Any]:
                           min_val=0, severity='WARNING'),
     ]
 
-    # E5: WhoScored unavailability is optional Bronze (see OPTIONAL_BRONZE_TABLES).
-    # Probe before appending checks — otherwise run_checks records SQL failures
-    # as ERRORs and raises in deployments where the WhoScored DAG is paused.
+    # E5: the derived WhoScored unavailable-player view is optional during the
+    # V2 bootstrap. Probe before appending checks so a fresh deployment can
+    # complete the profile/preview backfill before strict downstream DQ starts.
     if check_bronze_table_exists(
         table_name='whoscored_player_unavailable', schema='silver',
     ):
@@ -673,13 +673,12 @@ def _validate_silver_quality(**context) -> Dict[str, Any]:
                 'silver.whoscored_player_unavailable',
                 pk=['match_id', 'team_name', 'ws_player_id'],
             ),
-            # 168h (7d) tolerance — WhoScored ingest is weekly and sometimes
-            # paused (project_whoscored_cloudflare.md); staleness past that
-            # is observable but not a blocker for Gold.
+            # WhoScored is a daily source. Allow one missed daily run, then
+            # surface stale optional data without blocking unrelated FBref Gold.
             CHECK.freshness(
                 'silver.whoscored_player_unavailable',
                 ts_col='_bronze_ingested_at',
-                max_age_hours=168,
+                max_age_hours=48,
                 severity='WARNING',
             ),
         ])

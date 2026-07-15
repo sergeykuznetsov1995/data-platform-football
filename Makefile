@@ -2,7 +2,7 @@
 # Data Platform - Makefile
 # =============================================================================
 
-.PHONY: help build up up-lite up-full up-build down restart logs ps clean health test-trino init-storage shell-airflow shell-trino sofascore-discovery sofascore-discovery-check test-fbref-offline test-proxy-stats up-bi up-catalog down-bi down-catalog superset-init superset-import superset-dashboards om-ingest-trino om-lineage-trino om-apply-descriptions om-cleanup-lineage logs-superset logs-om shell-superset shell-om
+.PHONY: help build up up-lite up-full up-build down restart logs ps clean health test-trino shell-airflow shell-trino sofascore-discovery sofascore-discovery-check test-fbref-offline test-proxy-stats up-bi up-catalog down-bi down-catalog superset-init superset-import superset-dashboards om-ingest-trino om-lineage-trino om-apply-descriptions om-cleanup-lineage logs-superset logs-om shell-superset shell-om
 
 # Default target
 help:
@@ -19,7 +19,6 @@ help:
 	@echo "  make clean        - Remove all containers and volumes"
 	@echo "  make health       - Check health of all services"
 	@echo ""
-	@echo "  make init-storage - Initialize HDFS + Hive schemas (recommended)"
 	@echo "  make test-trino   - Run Trino integration test"
 	@echo "  make sofascore-discovery       - Refresh source metadata via direct JSON"
 	@echo "  make sofascore-discovery-check - Check registry drift without writing"
@@ -107,11 +106,11 @@ clean:
 health:
 	@echo "Checking service health..."
 	@echo ""
-	@echo "=== HDFS NameNode ==="
-	@curl -sf http://localhost:9870/ > /dev/null && echo "OK: http://localhost:9870" || echo "FAIL: NameNode not responding"
+	@echo "=== SeaweedFS S3 ==="
+	@curl -sf http://localhost:8333/status > /dev/null && echo "OK: SeaweedFS S3" || echo "FAIL: SeaweedFS S3 not responding"
 	@echo ""
-	@echo "=== Spark Master ==="
-	@curl -sf http://localhost:8080/ > /dev/null && echo "OK: http://localhost:8080" || echo "FAIL: Spark Master not responding"
+	@echo "=== Lakekeeper ==="
+	@docker compose exec -T lakekeeper /home/nonroot/lakekeeper healthcheck > /dev/null && echo "OK: Lakekeeper" || echo "FAIL: Lakekeeper not healthy"
 	@echo ""
 	@echo "=== Airflow ==="
 	@curl -sf http://localhost:8081/health > /dev/null && echo "OK: http://localhost:8081" || echo "FAIL: Airflow not responding"
@@ -125,18 +124,13 @@ health:
 	@echo "=== Redis ==="
 	@docker compose exec -T redis redis-cli -a redis123 ping 2>/dev/null | grep -q PONG && echo "OK: Redis ready" || echo "FAIL: Redis not ready"
 
-# Initialize storage (HDFS + Hive schemas via Python)
-init-storage:
-	@echo "Initializing storage (HDFS directories + Hive schemas)..."
-	docker compose exec airflow-scheduler python /opt/airflow/scripts/init_storage.py
-
 # Test Trino
 test-trino:
 	@echo "Testing Trino connectivity..."
 	@docker compose exec trino trino --execute "SHOW CATALOGS"
 	@echo ""
-	@echo "Testing Hive catalog..."
-	@docker compose exec trino trino --execute "SHOW SCHEMAS FROM hive"
+	@echo "Testing Iceberg REST catalog..."
+	@docker compose exec trino trino --execute "SHOW SCHEMAS FROM iceberg"
 	@echo ""
 	@echo "Trino integration test completed!"
 
@@ -146,9 +140,6 @@ shell-airflow:
 
 shell-trino:
 	docker compose exec trino /bin/bash
-
-shell-namenode:
-	docker compose exec namenode /bin/bash
 
 # Source metadata discovery is deliberately outside the ingestion DAG. The
 # normal Airflow mount stays read-only; this one-shot overrides only the
@@ -196,8 +187,8 @@ sofascore-discovery-check:
 # Show Web UI URLs
 urls:
 	@echo "Web UI URLs:"
-	@echo "  HDFS NameNode:  http://localhost:9870"
-	@echo "  Spark Master:   http://localhost:8080"
+	@echo "  SeaweedFS S3:   http://localhost:8333"
+	@echo "  Lakekeeper:     http://localhost:8181"
 	@echo "  Airflow:        http://localhost:8081 (admin/admin)"
 	@echo "  Trino:          http://localhost:8082"
 	@echo "  Superset:       http://localhost:8088"

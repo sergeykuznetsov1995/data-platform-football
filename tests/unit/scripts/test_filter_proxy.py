@@ -281,7 +281,7 @@ def test_proxy_filter_compose_is_env_only_by_default():
     service = compose.split("  proxy_filter:\n", 1)[1].split("\n  caddy:\n", 1)[0]
 
     assert "PROXY_POOL_JSON: ${PROXY_POOL_JSON:-}" in service
-    assert "PROXY_FILTER_ALLOW_FILE_FALLBACK" in service
+    assert 'PROXY_FILTER_ALLOW_FILE_FALLBACK: "false"' in service
     assert "proxys.txt:/opt/airflow/proxys.txt" not in service
     # The lease concurrency limit is operator-tunable; the serial guarantees
     # that matter are per source (SofaScore production/canary), not global.

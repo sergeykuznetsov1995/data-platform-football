@@ -14,7 +14,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import pickle
 import re
+import sqlite3
 import tempfile
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
@@ -31,7 +33,8 @@ from scrapers.base.iceberg_writer import IcebergWriter
 from scrapers.base.trino_manager import TrinoTableManager
 from scrapers.whoscored.catalog import WhoScoredCatalog
 from scrapers.whoscored.domain import WhoScoredScope
-from scrapers.whoscored.parsers import PARSER_VERSION
+from scrapers.whoscored.parsers import MATCH_AVAILABILITY_VERSION, PARSER_VERSION
+from scrapers.whoscored.profile_policy import MAX_DAILY_PROFILE_CANDIDATES
 
 
 MATCH_MANIFEST_TABLE = "whoscored_match_ingest_manifest"
@@ -44,6 +47,14 @@ MATCH_COMPLETION_GRACE = timedelta(hours=3)
 MATCH_REFRESH_DAYS = 7
 PREVIEW_REFRESH_HOURS = 6
 PROFILE_REFRESH_DAYS = 90
+
+# Parser v7 catalog manifests predate the canonical row-order fingerprint used
+# by v8. Their physical rows no longer retain enough ordering information to
+# recompute that legacy digest, but an explicit full-history v8 migration still
+# needs the last committed catalog for loss detection. This narrow allowlist is
+# accepted only when the caller opts into the migration path below; normal
+# reads remain pinned to the current parser and its reproducible fingerprint.
+_LEGACY_CATALOG_MIGRATION_PARSERS = frozenset({"whoscored-parser-v7"})
 
 # Source business datasets.  Operational manifests and request telemetry are
 # intentionally not counted here.
@@ -110,6 +121,230 @@ SCOPE_DATASET_TABLES = {
 # smaller source snapshot.  Other scope datasets retain the strict no-shrink
 # completeness guard.
 SCOPE_SHRINKABLE_DATASET_TABLES = {"whoscored_match_bets"}
+
+DEFAULT_SCOPE_WRITE_CHUNK_ROWS = 20_000
+MAX_SCOPE_WRITE_CHUNK_ROWS = 100_000
+_SPOOL_INSERT_BATCH_ROWS = 256
+
+
+def scope_write_chunk_rows_from_env(
+    environ: Mapping[str, str] = os.environ,
+) -> int:
+    """Return the bounded number of scope rows materialised for one write."""
+
+    raw = environ.get(
+        "WHOSCORED_SCOPE_WRITE_CHUNK_ROWS",
+        str(DEFAULT_SCOPE_WRITE_CHUNK_ROWS),
+    )
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "WHOSCORED_SCOPE_WRITE_CHUNK_ROWS must be an integer in 1..100000"
+        ) from exc
+    if str(raw).strip() != str(value) or not 1 <= value <= MAX_SCOPE_WRITE_CHUNK_ROWS:
+        raise ValueError(
+            "WHOSCORED_SCOPE_WRITE_CHUNK_ROWS must be an integer in 1..100000"
+        )
+    return value
+
+
+class WhoScoredScopeRowSpool:
+    """Disk-backed, re-iterable set of entity-keyed scope rows.
+
+    Stage statistics expand compact source documents into millions of long-form
+    rows.  Keeping those Python dictionaries for every stage made two
+    LocalExecutor tasks capable of exhausting the 16 GiB worker.  This spool
+    preserves the exact row dictionaries in a private SQLite file, enforces the
+    same SHA-256 entity-key deduplication as the former in-memory helper, and
+    materialises only a small fetch batch while iterating.
+
+    A stage savepoint lets the service discard a partially parsed stage if the
+    source proves that its statistics UI is unavailable after an earlier feed
+    batch succeeded.  The file is ephemeral staging only; raw S3 objects and
+    the Iceberg manifest remain the durable sources of truth.
+    """
+
+    def __init__(
+        self,
+        *,
+        table: str,
+        league: str,
+        season: str,
+        directory: Optional[str] = None,
+    ) -> None:
+        if table not in SCOPE_DATASET_TABLES:
+            raise ValueError(f"unsupported WhoScored scope spool table {table!r}")
+        self.table = table
+        self.league = str(league)
+        self.season = str(season)
+        configured_root = (
+            directory or os.environ.get("WHOSCORED_SCOPE_SPOOL_DIR", "").strip() or None
+        )
+        if configured_root is not None:
+            spool_root = Path(configured_root).expanduser()
+            spool_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+            if not spool_root.is_dir():
+                raise ValueError("WhoScored scope spool root must be a directory")
+            configured_root = str(spool_root)
+        self._temporary = tempfile.TemporaryDirectory(
+            prefix="whoscored-scope-",
+            dir=configured_root,
+        )
+        os.chmod(self._temporary.name, 0o700)
+        self.path = Path(self._temporary.name) / "rows.sqlite3"
+        self._connection = sqlite3.connect(str(self.path))
+        # A disk journal keeps per-stage rollback bounded by disk rather than
+        # retaining the undo log in Python/SQLite heap memory.
+        self._connection.execute("PRAGMA journal_mode=DELETE")
+        self._connection.execute("PRAGMA synchronous=OFF")
+        self._connection.execute("PRAGMA temp_store=FILE")
+        self._connection.execute("PRAGMA cache_size=-2048")
+        self._connection.execute(
+            "CREATE TABLE rows ("
+            "ordinal INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "entity_key TEXT NOT NULL UNIQUE, payload BLOB NOT NULL)"
+        )
+        self._connection.commit()
+        self._count = 0
+        self._columns: set[str] = set()
+        self._stage_snapshot: Optional[tuple[int, set[str]]] = None
+        self._closed = False
+
+    @staticmethod
+    def _entity_key(row: Mapping[str, Any]) -> str:
+        payload = json.dumps(
+            dict(row),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def begin_stage(self) -> None:
+        if self._stage_snapshot is not None:
+            raise RuntimeError(f"{self.table} already has an open stage savepoint")
+        self._connection.execute("SAVEPOINT source_stage")
+        self._stage_snapshot = (self._count, set(self._columns))
+
+    def commit_stage(self) -> None:
+        if self._stage_snapshot is None:
+            raise RuntimeError(f"{self.table} has no open stage savepoint")
+        self._connection.execute("RELEASE SAVEPOINT source_stage")
+        self._stage_snapshot = None
+
+    def rollback_stage(self) -> None:
+        if self._stage_snapshot is None:
+            return
+        count, columns = self._stage_snapshot
+        self._connection.execute("ROLLBACK TO SAVEPOINT source_stage")
+        self._connection.execute("RELEASE SAVEPOINT source_stage")
+        self._count = count
+        self._columns = columns
+        self._stage_snapshot = None
+
+    def append_entity_rows(self, rows: Iterable[Mapping[str, Any]]) -> None:
+        """Append rows with stable entity keys without retaining the iterable."""
+
+        pending: list[tuple[str, sqlite3.Binary]] = []
+
+        def flush() -> None:
+            if not pending:
+                return
+            before = self._connection.total_changes
+            self._connection.executemany(
+                "INSERT OR IGNORE INTO rows(entity_key, payload) VALUES (?, ?)",
+                pending,
+            )
+            self._count += self._connection.total_changes - before
+            pending.clear()
+
+        for source in rows:
+            row = dict(source)
+            if "entity_key" in row:
+                raise ValueError(f"{self.table} source row already has entity_key")
+            for column, expected in (
+                ("league", self.league),
+                ("season", self.season),
+            ):
+                value = row.get(column)
+                if value is not None and str(value) != expected:
+                    raise ValueError(
+                        f"{self.table} contains {column}={value!r} outside {expected!r}"
+                    )
+            key = self._entity_key(row)
+            row["entity_key"] = key
+            self._columns.update(str(column) for column in row)
+            pending.append(
+                (
+                    key,
+                    sqlite3.Binary(pickle.dumps(row, protocol=pickle.HIGHEST_PROTOCOL)),
+                )
+            )
+            if len(pending) >= _SPOOL_INSERT_BATCH_ROWS:
+                flush()
+        flush()
+        if self._stage_snapshot is None:
+            self._connection.commit()
+
+    @property
+    def columns(self) -> frozenset[str]:
+        return frozenset(self._columns)
+
+    @property
+    def on_disk_bytes(self) -> int:
+        return self.path.stat().st_size if self.path.exists() else 0
+
+    def content_fingerprint(self) -> str:
+        """Hash exact row identities without deserializing the row payloads."""
+
+        digest = hashlib.sha256(b"whoscored-scope-spool-v1\0")
+        cursor = self._connection.execute(
+            "SELECT entity_key FROM rows ORDER BY ordinal"
+        )
+        try:
+            while True:
+                batch = cursor.fetchmany(_SPOOL_INSERT_BATCH_ROWS)
+                if not batch:
+                    return digest.hexdigest()
+                for (entity_key,) in batch:
+                    digest.update(str(entity_key).encode("ascii"))
+                    digest.update(b"\n")
+        finally:
+            cursor.close()
+
+    def __len__(self) -> int:
+        return self._count
+
+    def __enter__(self) -> "WhoScoredScopeRowSpool":
+        return self
+
+    def __exit__(self, _exc_type, _exc_value, _traceback) -> None:
+        self.close()
+
+    def __iter__(self):
+        cursor = self._connection.execute("SELECT payload FROM rows ORDER BY ordinal")
+        try:
+            while True:
+                batch = cursor.fetchmany(_SPOOL_INSERT_BATCH_ROWS)
+                if not batch:
+                    return
+                for (payload,) in batch:
+                    row = pickle.loads(payload)
+                    if not isinstance(row, dict):  # pragma: no cover - internal DB
+                        raise RuntimeError(f"{self.table} spool payload is invalid")
+                    yield row
+        finally:
+            cursor.close()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self.rollback_stage()
+        self._connection.close()
+        self._temporary.cleanup()
+        self._closed = True
 
 
 # The physical schema of every source business table is a source contract, not
@@ -673,9 +908,7 @@ def _clean_unicode(value: str) -> str:
         value.encode("utf-8")
         return value
     except UnicodeEncodeError:
-        return value.encode("utf-16-le", "surrogatepass").decode(
-            "utf-16-le", "replace"
-        )
+        return value.encode("utf-16-le", "surrogatepass").decode("utf-16-le", "replace")
 
 
 def _clean_json_unicode(value: Any) -> Any:
@@ -689,6 +922,46 @@ def _clean_json_unicode(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_clean_json_unicode(item) for item in value]
     return value
+
+
+def canonical_catalog_rows(
+    rows: Mapping[str, Sequence[Mapping[str, Any]]],
+) -> dict[str, tuple[dict[str, Any], ...]]:
+    """Return the order-independent canonical catalog wire representation."""
+
+    canonical: dict[str, tuple[dict[str, Any], ...]] = {}
+    for kind in ("competitions", "seasons", "stages"):
+        materialised = [
+            dict(_clean_json_unicode(dict(row))) for row in rows.get(kind, ())
+        ]
+        canonical[kind] = tuple(
+            sorted(
+                materialised,
+                key=lambda row: json.dumps(
+                    row,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    default=str,
+                ),
+            )
+        )
+    return canonical
+
+
+def catalog_payload_sha256(
+    rows: Mapping[str, Sequence[Mapping[str, Any]]],
+) -> str:
+    """Hash all canonical catalog rows for manifest/read-back integrity."""
+
+    payload = json.dumps(
+        canonical_catalog_rows(rows),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _sql_string(value: str) -> str:
@@ -736,6 +1009,7 @@ class MatchCandidate:
     kickoff: Optional[datetime]
     status: int
     match_is_opta: bool
+    attempt_no: int = 1
 
 
 @dataclass(frozen=True)
@@ -755,8 +1029,10 @@ class MatchCommit:
     direct_bytes: int = 0
     paid_bytes: int = 0
     parser_version: str = PARSER_VERSION
+    availability_version: str = MATCH_AVAILABILITY_VERSION
     kickoff: Optional[datetime] = None
     fetched_at: Optional[datetime] = None
+    attempt_no: int = 1
     # Additional matchCentre datasets share the same logical commit point.
     # ``events`` and ``lineups`` remain explicit for the existing consumers.
     datasets: Mapping[str, Sequence[Mapping[str, Any]]] = field(default_factory=dict)
@@ -793,6 +1069,7 @@ class ManifestFailure:
     payload_sha256: Optional[str] = None
     raw_uri: Optional[str] = None
     parser_version: str = PARSER_VERSION
+    availability_version: str = MATCH_AVAILABILITY_VERSION
 
 
 @dataclass(frozen=True)
@@ -810,6 +1087,7 @@ class PreviewCommit:
     direct_bytes: int = 0
     paid_bytes: int = 0
     parser_version: str = PARSER_VERSION
+    availability_version: str = MATCH_AVAILABILITY_VERSION
     kickoff: Optional[datetime] = None
     fetched_at: Optional[datetime] = None
     attempt_no: int = 1
@@ -844,6 +1122,7 @@ class PreviewFailure:
     direct_bytes: int = 0
     paid_bytes: int = 0
     parser_version: str = PARSER_VERSION
+    availability_version: str = MATCH_AVAILABILITY_VERSION
 
 
 @dataclass(frozen=True)
@@ -858,6 +1137,7 @@ class ProfileCommit:
     paid_bytes: int = 0
     fetched_at: Optional[datetime] = None
     parser_version: str = PARSER_VERSION
+    availability_version: str = MATCH_AVAILABILITY_VERSION
     participations: Sequence[Mapping[str, Any]] = field(default_factory=tuple)
     participations_status: str = "empty"
 
@@ -868,6 +1148,40 @@ class ProfileCommit:
             f"{self.parser_version}"
         ).encode("utf-8")
         return "wspr2-" + hashlib.sha256(identity).hexdigest()
+
+
+@dataclass(frozen=True)
+class ProfileCandidateSnapshot:
+    """One complete, deterministic daily profile candidate generation."""
+
+    player_ids: tuple[int, ...]
+    count: int
+    payload_sha256: str
+
+
+class ProfileCandidateCapacityExceeded(RuntimeError):
+    """The exact due backlog cannot be completed inside one bounded task."""
+
+    def __init__(self, *, count: int, hard_cap: int) -> None:
+        self.count = int(count)
+        self.hard_cap = int(hard_cap)
+        super().__init__(
+            "WhoScored due profile backlog exceeds the daily hard cap: "
+            f"count={self.count}, hard_cap={self.hard_cap}"
+        )
+
+
+def profile_candidate_payload_sha256(player_ids: Iterable[int]) -> str:
+    """Hash a complete candidate set independently of query priority order."""
+
+    raw_values = list(player_ids)
+    if any(type(value) is not int or value <= 0 for value in raw_values):
+        raise ValueError("profile candidate ids must be positive and unique")
+    values = sorted(raw_values)
+    if len(values) != len(set(values)):
+        raise ValueError("profile candidate ids must be positive and unique")
+    encoded = json.dumps(values, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 class WhoScoredRepository:
@@ -1088,6 +1402,7 @@ class WhoScoredRepository:
                 payload_sha256 VARCHAR,
                 raw_uri VARCHAR,
                 raw_inputs_json VARCHAR,
+                discovery_mode VARCHAR,
                 parser_version VARCHAR,
                 state VARCHAR,
                 competitions_count BIGINT,
@@ -1111,10 +1426,11 @@ class WhoScoredRepository:
                 self.schema, CATALOG_MANIFEST_TABLE
             )
         }
-        if "raw_inputs_json" not in manifest_columns:
-            self.trino.add_column(
-                self.schema, CATALOG_MANIFEST_TABLE, "raw_inputs_json", "VARCHAR"
-            )
+        for name in ("raw_inputs_json", "discovery_mode"):
+            if name not in manifest_columns:
+                self.trino.add_column(
+                    self.schema, CATALOG_MANIFEST_TABLE, name, "VARCHAR"
+                )
         if not create_views:
             return
         latest = f"{self.catalog}.{self.schema}.whoscored_catalog_latest_success"
@@ -1239,6 +1555,7 @@ class WhoScoredRepository:
                 payload_sha256 VARCHAR,
                 raw_uri VARCHAR,
                 parser_version VARCHAR,
+                availability_version VARCHAR,
                 state VARCHAR,
                 is_final BOOLEAN,
                 is_opta BOOLEAN,
@@ -1271,6 +1588,7 @@ class WhoScoredRepository:
             for name in self.trino.get_table_columns(self.schema, MATCH_MANIFEST_TABLE)
         }
         for name, data_type in {
+            "availability_version": "VARCHAR",
             "entity_counts_json": "VARCHAR",
             "dataset_statuses_json": "VARCHAR",
             "schema_fingerprint": "VARCHAR",
@@ -1317,6 +1635,7 @@ class WhoScoredRepository:
         raw_uri: str,
         payload_sha256: str,
         raw_inputs: Sequence[Mapping[str, Any]],
+        discovery_mode: str,
     ) -> str:
         """Append a complete discovery snapshot, then publish one manifest.
 
@@ -1324,13 +1643,17 @@ class WhoScoredRepository:
         A retry with the same deterministic batch verifies physical counts and
         performs no duplicate writes.
         """
-        if not discovery_batch_id or not payload_sha256 or not raw_uri:
+        if (
+            not discovery_batch_id
+            or not payload_sha256
+            or not raw_uri
+            or discovery_mode not in {"incremental", "full_history"}
+        ):
             raise ValueError(
-                "catalog batch id, payload sha256 and raw_uri are required"
+                "catalog batch id, payload sha256, raw_uri and discovery mode are required"
             )
-        datasets = catalog.to_rows()
-        all_payload = self._canonical_json(datasets)
-        fingerprint = hashlib.sha256(all_payload.encode("utf-8")).hexdigest()
+        datasets = canonical_catalog_rows(catalog.to_rows())
+        fingerprint = catalog_payload_sha256(datasets)
         if payload_sha256 != fingerprint:
             raise ValueError(
                 "catalog payload_sha256 must identify the complete canonical output"
@@ -1350,7 +1673,8 @@ class WhoScoredRepository:
         }
         existing_manifest = self.trino.execute_query(
             f"SELECT competitions_count, seasons_count, stages_count, "
-            "payload_sha256, parser_version, schema_fingerprint, raw_inputs_json "
+            "payload_sha256, parser_version, schema_fingerprint, raw_inputs_json, "
+            "discovery_mode "
             f"FROM {self._catalog_manifest} "
             f"WHERE batch_id = {_sql_string(discovery_batch_id)} "
             "AND state = 'success' ORDER BY completed_at DESC LIMIT 1"
@@ -1370,6 +1694,7 @@ class WhoScoredRepository:
                 PARSER_VERSION,
                 fingerprint,
                 raw_inputs_json,
+                discovery_mode,
             )
             if identity != wanted_identity:
                 raise BatchConflict(
@@ -1462,6 +1787,7 @@ class WhoScoredRepository:
                         "payload_sha256": payload_sha256,
                         "raw_uri": raw_uri,
                         "raw_inputs_json": raw_inputs_json,
+                        "discovery_mode": discovery_mode,
                         "parser_version": PARSER_VERSION,
                         "state": "success",
                         "competitions_count": expected["competitions"],
@@ -1482,13 +1808,28 @@ class WhoScoredRepository:
         )
         return discovery_batch_id
 
-    def load_discovered_catalog(self) -> WhoScoredCatalog:
-        """Load the latest logically committed discovery snapshot."""
+    def load_discovered_catalog(
+        self,
+        *,
+        batch_id: Optional[str] = None,
+        allow_legacy_parser_for_full_history: bool = False,
+    ) -> WhoScoredCatalog:
+        """Load one exact logically committed discovery snapshot.
+
+        ``allow_legacy_parser_for_full_history`` exists only for the explicit
+        v7 -> v8 full-history bootstrap. Legacy manifests still have to prove
+        physical counts, valid JSON/catalog structure and their original
+        internally consistent SHA-256 identity. They are never accepted by a
+        normal current-catalog read.
+        """
         if not self.trino.table_exists(self.schema, CATALOG_MANIFEST_TABLE):
             raise LookupError("WhoScored discovered catalog is not initialized")
+        batch_filter = (
+            "" if batch_id is None else f"AND batch_id = {_sql_string(batch_id)} "
+        )
         manifests = self.trino.execute_query(
             f"SELECT batch_id FROM {self._catalog_manifest} "
-            "WHERE state = 'success' "
+            f"WHERE state = 'success' {batch_filter}"
             "ORDER BY completed_at DESC, _ingested_at DESC, batch_id DESC LIMIT 1"
         )
         if not manifests:
@@ -1510,22 +1851,85 @@ class WhoScoredRepository:
                     )
                 decoded.append(value)
             datasets[kind] = decoded
+        datasets = canonical_catalog_rows(datasets)
         catalog = WhoScoredCatalog.from_rows(datasets)
-        expected = self.trino.execute_query(
-            f"SELECT competitions_count, seasons_count, stages_count "
+        expected_rows = self.trino.execute_query(
+            f"SELECT competitions_count, seasons_count, stages_count, "
+            "payload_sha256, parser_version, schema_fingerprint "
             f"FROM {self._catalog_manifest} "
             f"WHERE batch_id = {_sql_string(batch_id)} AND state = 'success' "
             "ORDER BY completed_at DESC LIMIT 1"
-        )[0]
+        )
+        if not expected_rows:
+            raise BatchConflict(f"catalog {batch_id} success manifest disappeared")
+        expected = expected_rows[0]
         actual = tuple(
             len(datasets[kind]) for kind in ("competitions", "seasons", "stages")
         )
-        if tuple(int(value) for value in expected) != actual:
+        if tuple(int(value) for value in expected[:3]) != actual:
             raise BatchConflict(
                 f"catalog {batch_id} manifest/physical mismatch: "
-                f"manifest={tuple(expected)}, physical={actual}"
+                f"manifest={tuple(expected[:3])}, physical={actual}"
+            )
+        physical_fingerprint = catalog_payload_sha256(catalog.to_rows())
+        manifest_payload = str(expected[3] or "")
+        manifest_parser = str(expected[4] or "")
+        manifest_schema = str(expected[5] or "")
+        current_identity = (
+            manifest_parser == PARSER_VERSION
+            and manifest_payload == physical_fingerprint
+            and manifest_schema == physical_fingerprint
+        )
+        legacy_identity = (
+            bool(allow_legacy_parser_for_full_history)
+            and manifest_parser in _LEGACY_CATALOG_MIGRATION_PARSERS
+            and manifest_payload == manifest_schema
+            and re.fullmatch(r"[0-9a-f]{64}", manifest_payload) is not None
+        )
+        if not current_identity and not legacy_identity:
+            raise BatchConflict(
+                f"catalog {batch_id} manifest identity mismatch: "
+                f"payload={manifest_payload}, schema={manifest_schema}, "
+                f"parser={manifest_parser}, physical={physical_fingerprint}, "
+                f"expected_parser={PARSER_VERSION}"
             )
         return catalog
+
+    def load_catalog_generation_snapshot(
+        self,
+    ) -> tuple[dict[str, Any], WhoScoredCatalog]:
+        """Bind latest manifest provenance to rows from that exact batch."""
+        generation = self.latest_catalog_generation()
+        catalog = self.load_discovered_catalog(
+            batch_id=str(generation["catalog_batch_id"])
+        )
+        return generation, catalog
+
+    def latest_catalog_generation(self) -> dict[str, Any]:
+        """Return verifiable provenance for the current catalog snapshot."""
+        if not self.trino.table_exists(self.schema, CATALOG_MANIFEST_TABLE):
+            raise LookupError("WhoScored discovered catalog is not initialized")
+        rows = self.trino.execute_query(
+            f"SELECT batch_id, payload_sha256, parser_version, raw_uri, "
+            "raw_inputs_json, completed_at, discovery_mode "
+            f"FROM {self._catalog_manifest} WHERE state = 'success' "
+            "ORDER BY completed_at DESC, _ingested_at DESC, batch_id DESC LIMIT 1"
+        )
+        if not rows:
+            raise LookupError("WhoScored discovered catalog has no successful snapshot")
+        row = rows[0]
+        raw_inputs_json = str(row[4] or "")
+        return {
+            "catalog_batch_id": str(row[0]),
+            "catalog_payload_sha256": str(row[1]),
+            "catalog_parser_version": str(row[2]),
+            "catalog_raw_uri": str(row[3]),
+            "catalog_raw_inputs_sha256": hashlib.sha256(
+                raw_inputs_json.encode("utf-8")
+            ).hexdigest(),
+            "catalog_completed_at": str(row[5]),
+            "catalog_discovery_mode": str(row[6] or ""),
+        }
 
     def list_catalog_scopes(
         self,
@@ -1559,6 +1963,7 @@ class WhoScoredRepository:
                 payload_sha256 VARCHAR,
                 raw_uri VARCHAR,
                 parser_version VARCHAR,
+                availability_version VARCHAR,
                 state VARCHAR,
                 missing_players_count BIGINT,
                 entity_counts_json VARCHAR,
@@ -1592,6 +1997,7 @@ class WhoScoredRepository:
             "entity_counts_json": "VARCHAR",
             "dataset_statuses_json": "VARCHAR",
             "schema_fingerprint": "VARCHAR",
+            "availability_version": "VARCHAR",
         }.items():
             if name not in manifest_columns:
                 self.trino.add_column(
@@ -1612,6 +2018,7 @@ class WhoScoredRepository:
                 payload_sha256 VARCHAR,
                 raw_uri VARCHAR,
                 parser_version VARCHAR,
+                availability_version VARCHAR,
                 state VARCHAR,
                 http_status INTEGER,
                 failure_code VARCHAR,
@@ -1643,6 +2050,7 @@ class WhoScoredRepository:
         for name, data_type in {
             "_profile_batch_id": "VARCHAR",
             "participations_count": "BIGINT",
+            "availability_version": "VARCHAR",
         }.items():
             if name not in manifest_columns:
                 self.trino.add_column(
@@ -1772,29 +2180,206 @@ class WhoScoredRepository:
             """
         )
 
+    @staticmethod
+    def _profile_candidate_query(
+        *,
+        catalog: str,
+        schema: str,
+        scopes: Sequence[WhoScoredScope],
+        include_exact_count: bool,
+        limit: int,
+    ) -> Optional[str]:
+        """Build the one canonical daily due/retry candidate predicate."""
+
+        selected = tuple(
+            dict.fromkeys((scope.competition_id, scope.season_id) for scope in scopes)
+        )
+        if not selected or limit == 0:
+            return None
+        roster = f"{catalog}.{schema}.whoscored_player_roster"
+        manifest = f"{catalog}.{schema}.{PROFILE_MANIFEST_TABLE}"
+        scope_filter = " OR ".join(
+            f"(league = {_sql_string(league)} AND season = {_sql_string(season)})"
+            for league, season in selected
+        )
+        count_projection = ", COUNT(*) OVER () AS exact_candidate_count"
+        if not include_exact_count:
+            count_projection = ""
+        return f"""
+            WITH latest AS (
+                SELECT * FROM (
+                    SELECT m.*, ROW_NUMBER() OVER (
+                        PARTITION BY CAST(player_id AS BIGINT)
+                        ORDER BY COALESCE(
+                            completed_at, fetched_at, _ingested_at
+                        ) DESC, COALESCE(_profile_batch_id, '') DESC,
+                        COALESCE(_batch_id, '') DESC
+                    ) AS rn
+                    FROM {manifest} m
+                ) WHERE rn = 1
+            ), roster AS (
+                SELECT DISTINCT CAST(player_id AS BIGINT) AS player_id
+                FROM {roster}
+                WHERE player_id IS NOT NULL AND ({scope_filter})
+            ), candidates AS (
+                SELECT r.player_id,
+                       CASE
+                           WHEN m.player_id IS NULL THEN 0
+                           WHEN m._profile_batch_id IS NULL
+                             OR m._profile_batch_id NOT LIKE 'wspr2-%' THEN 1
+                           ELSE 2
+                       END AS candidate_priority,
+                       COALESCE(
+                           m.fetched_at, TIMESTAMP '1970-01-01 00:00:00'
+                       ) AS candidate_fetched_at
+                FROM roster r
+                LEFT JOIN latest m ON CAST(m.player_id AS BIGINT) = r.player_id
+                WHERE m.player_id IS NULL
+                   OR (
+                        m.state = 'success'
+                        AND (
+                            m._profile_batch_id IS NULL
+                            OR m._profile_batch_id NOT LIKE 'wspr2-%'
+                            OR m.raw_uri IS NULL
+                            OR m.payload_sha256 IS NULL
+                            OR m.parser_version IS DISTINCT FROM
+                                {_sql_string(PARSER_VERSION)}
+                            OR COALESCE(
+                                m.fetched_at, TIMESTAMP '1970-01-01 00:00:00'
+                            ) <= CAST(
+                                CURRENT_TIMESTAMP
+                                    - INTERVAL '{PROFILE_REFRESH_DAYS}' DAY
+                                AS TIMESTAMP
+                            )
+                        )
+                   )
+                   OR (
+                        m.state = 'retryable'
+                        AND COALESCE(
+                            m.retry_after, TIMESTAMP '1970-01-01 00:00:00'
+                        ) <= CAST(CURRENT_TIMESTAMP AS TIMESTAMP)
+                   )
+                   OR (
+                        m.state = 'parse_failed'
+                        AND m.parser_version IS DISTINCT FROM
+                            {_sql_string(PARSER_VERSION)}
+                   )
+                   OR (
+                        m.state = 'not_available'
+                        AND (
+                            m.parser_version IS DISTINCT FROM
+                                {_sql_string(PARSER_VERSION)}
+                            OR m.availability_version IS DISTINCT FROM
+                                {_sql_string(MATCH_AVAILABILITY_VERSION)}
+                            OR m.failure_code IS NULL
+                            OR (
+                                m.raw_uri IS NULL
+                                AND COALESCE(m.http_status, 0) NOT IN (404, 410)
+                            )
+                        )
+                   )
+            )
+            SELECT player_id{count_projection}
+            FROM candidates
+            ORDER BY candidate_priority, candidate_fetched_at, player_id
+            LIMIT {limit}
+            """
+
     def list_profile_candidates(
         self,
         *,
         scopes: Sequence[WhoScoredScope],
         limit: int = 500,
     ) -> list[int]:
-        """Return unseen or due-retry profiles from the selected rosters.
+        """Return a bounded prefix of the canonical daily candidate set."""
 
-        Profile pages are global, but their candidate population is not: only
-        players present in the explicitly selected competition-season scopes
-        are eligible. Legacy/raw-less versions are recaptured, while current
-        Current identities refresh on a bounded 90-day cadence. At 500 pages
-        per daily run this keeps a roughly 45k-player active roster sustainable
-        without proxy traffic; historical profiles remain immutable snapshots.
-        """
         if int(limit) < 0:
             raise ValueError("profile candidate limit must be non-negative")
+        query = self._profile_candidate_query(
+            catalog=self.catalog,
+            schema=self.schema,
+            scopes=scopes,
+            include_exact_count=False,
+            limit=int(limit),
+        )
+        if query is None:
+            return []
+        rows = self.trino.execute_query(query)
+        return [int(row[0]) for row in rows]
+
+    def profile_candidate_snapshot(
+        self,
+        *,
+        scopes: Sequence[WhoScoredScope],
+        hard_cap: int = MAX_DAILY_PROFILE_CANDIDATES,
+    ) -> ProfileCandidateSnapshot:
+        """Freeze every currently due profile or fail before source traffic.
+
+        ``COUNT(*) OVER`` and the IDs are read by one Trino query, so the
+        count cannot describe a different manifest generation from the set it
+        fingerprints. The extra row is only a defensive bound on the result;
+        the window count remains the exact backlog size.
+        """
+
+        if type(hard_cap) is not int or not 1 <= hard_cap <= 3_000:
+            raise ValueError("profile candidate hard cap must be in 1..3000")
+        query = self._profile_candidate_query(
+            catalog=self.catalog,
+            schema=self.schema,
+            scopes=scopes,
+            include_exact_count=True,
+            limit=hard_cap + 1,
+        )
+        if query is None:
+            player_ids: tuple[int, ...] = ()
+            return ProfileCandidateSnapshot(
+                player_ids=player_ids,
+                count=0,
+                payload_sha256=profile_candidate_payload_sha256(player_ids),
+            )
+        rows = self.trino.execute_query(query)
+        if not rows:
+            player_ids = ()
+            return ProfileCandidateSnapshot(
+                player_ids=player_ids,
+                count=0,
+                payload_sha256=profile_candidate_payload_sha256(player_ids),
+            )
+        exact_counts = {int(row[1]) for row in rows}
+        if len(exact_counts) != 1:
+            raise BatchConflict("profile candidate query returned inconsistent counts")
+        count = exact_counts.pop()
+        if count < 0 or count < len(rows):
+            raise BatchConflict("profile candidate query returned an invalid count")
+        if count > hard_cap:
+            raise ProfileCandidateCapacityExceeded(count=count, hard_cap=hard_cap)
+        if len(rows) != count:
+            raise BatchConflict(
+                "profile candidate query did not return its complete exact set"
+            )
+        player_ids = tuple(sorted(int(row[0]) for row in rows))
+        return ProfileCandidateSnapshot(
+            player_ids=player_ids,
+            count=count,
+            payload_sha256=profile_candidate_payload_sha256(player_ids),
+        )
+
+    def list_roster_player_ids(
+        self,
+        *,
+        scopes: Sequence[WhoScoredScope],
+    ) -> list[int]:
+        """Freeze every roster player in the selected historical scopes.
+
+        Unlike the daily candidate query this deliberately ignores profile
+        manifest state, refresh cadence and retry_after. A historical plan
+        must remain capable of repairing every current/failed/missing profile.
+        """
         selected = tuple(
             dict.fromkeys((scope.competition_id, scope.season_id) for scope in scopes)
         )
-        if not selected or int(limit) == 0:
+        if not selected:
             return []
-        manifest = f"{self.catalog}.{self.schema}.{PROFILE_MANIFEST_TABLE}"
         roster = f"{self.catalog}.{self.schema}.whoscored_player_roster"
         scope_filter = " OR ".join(
             f"(league = {_sql_string(league)} AND season = {_sql_string(season)})"
@@ -1802,61 +2387,10 @@ class WhoScoredRepository:
         )
         rows = self.trino.execute_query(
             f"""
-            WITH latest AS (
-                SELECT * FROM (
-                    SELECT m.*, ROW_NUMBER() OVER (
-                        PARTITION BY player_id
-                        ORDER BY fetched_at DESC, _ingested_at DESC
-                    ) AS rn
-                    FROM {manifest} m
-                ) WHERE rn = 1
-            )
-            SELECT r.player_id
-            FROM (
-                SELECT DISTINCT player_id
-                FROM {roster}
-                WHERE {scope_filter}
-            ) r
-            LEFT JOIN latest m ON m.player_id = r.player_id
-            WHERE m.player_id IS NULL
-               OR (
-                    m.state = 'success'
-                    AND (
-                        m._profile_batch_id IS NULL
-                        OR m._profile_batch_id NOT LIKE 'wspr2-%'
-                        OR m.raw_uri IS NULL
-                        OR m.payload_sha256 IS NULL
-                        OR m.parser_version IS DISTINCT FROM
-                            {_sql_string(PARSER_VERSION)}
-                        OR COALESCE(
-                            m.fetched_at, TIMESTAMP '1970-01-01 00:00:00'
-                        ) <= CAST(
-                            CURRENT_TIMESTAMP - INTERVAL '{PROFILE_REFRESH_DAYS}' DAY
-                            AS TIMESTAMP
-                        )
-                    )
-               )
-               OR (
-                    m.state = 'retryable'
-                    AND COALESCE(m.retry_after, TIMESTAMP '1970-01-01 00:00:00')
-                        <= CAST(CURRENT_TIMESTAMP AS TIMESTAMP)
-               )
-               OR (
-                    m.state = 'parse_failed'
-                    AND m.parser_version IS DISTINCT FROM
-                        {_sql_string(PARSER_VERSION)}
-               )
-            ORDER BY CASE
-                         WHEN m.player_id IS NULL THEN 0
-                         WHEN m._profile_batch_id IS NULL
-                           OR m._profile_batch_id NOT LIKE 'wspr2-%' THEN 1
-                         ELSE 2
-                     END,
-                     COALESCE(
-                         m.fetched_at, TIMESTAMP '1970-01-01 00:00:00'
-                     ),
-                     r.player_id
-            LIMIT {int(limit)}
+            SELECT DISTINCT CAST(player_id AS BIGINT)
+            FROM {roster}
+            WHERE player_id IS NOT NULL AND ({scope_filter})
+            ORDER BY CAST(player_id AS BIGINT)
             """
         )
         return [int(row[0]) for row in rows]
@@ -1877,9 +2411,15 @@ class WhoScoredRepository:
         payload_sha256: Optional[str] = None,
         raw_uri: Optional[str] = None,
         attempt_no: int = 1,
+        availability_version: str = MATCH_AVAILABILITY_VERSION,
     ) -> None:
         """Persist a failed profile attempt in the current manifest schema."""
-        if state not in {"retryable", "terminal", "parse_failed"}:
+        if state not in {
+            "retryable",
+            "terminal",
+            "parse_failed",
+            "not_available",
+        }:
             raise ValueError(f"unsupported profile failure state: {state}")
         if state == "retryable" and retry_after is None:
             raise ValueError("retryable profile failure requires retry_after")
@@ -1894,6 +2434,7 @@ class WhoScoredRepository:
             "payload_sha256": payload_sha256,
             "raw_uri": raw_uri,
             "parser_version": PARSER_VERSION,
+            "availability_version": availability_version,
             "state": state,
             "http_status": http_status,
             "failure_code": str(failure_code),
@@ -2178,6 +2719,7 @@ class WhoScoredRepository:
                     "payload_sha256": commit.payload_sha256,
                     "raw_uri": commit.raw_uri,
                     "parser_version": commit.parser_version,
+                    "availability_version": commit.availability_version,
                     "state": "success",
                     "http_status": 200,
                     "failure_code": None,
@@ -2342,6 +2884,7 @@ class WhoScoredRepository:
         limit: Optional[int] = None,
         include_success: bool = False,
         include_failed: bool = False,
+        include_all_completed: bool = False,
         kickoff_from: Optional[datetime] = None,
     ) -> list[MatchCandidate]:
         """Return completed games without a successful manifest commit.
@@ -2352,7 +2895,7 @@ class WhoScoredRepository:
         """
         latest = f"{self.catalog}.{self.schema}.whoscored_match_ingest_latest"
         ids = [int(value) for value in (match_ids or [])]
-        if include_success and not ids:
+        if include_success and not ids and not include_all_completed:
             raise ValueError("include_success requires explicit match_ids")
         id_filter = ""
         if ids:
@@ -2375,7 +2918,7 @@ class WhoScoredRepository:
         )
         manifest_filter = (
             "TRUE"
-            if include_success
+            if include_success or include_all_completed
             else f"""
                 (
                     m.game_id IS NULL
@@ -2410,8 +2953,12 @@ class WhoScoredRepository:
                     )
                     OR (
                         m.state = 'parse_failed'
-                        AND m.parser_version IS DISTINCT FROM
-                            {_sql_string(PARSER_VERSION)}
+                        AND (
+                            m.parser_version IS DISTINCT FROM
+                                {_sql_string(PARSER_VERSION)}
+                            OR m.availability_version IS DISTINCT FROM
+                                {_sql_string(MATCH_AVAILABILITY_VERSION)}
+                        )
                     )
                     {failed_filter}
                 )
@@ -2428,7 +2975,12 @@ class WhoScoredRepository:
                   AND season = {_sql_string(season)}
             )
             SELECT CAST(s.game_id AS BIGINT), s.league, s.season, s.game,
-                   s.date, CAST(s.status AS INTEGER), s.match_is_opta
+                   s.date, CAST(s.status AS INTEGER), s.match_is_opta,
+                   CASE
+                       WHEN m.state = 'retryable'
+                       THEN COALESCE(m.attempt_no, 0) + 1
+                       ELSE 1
+                   END AS attempt_no
             FROM schedule s
             LEFT JOIN {latest} m
               ON m.league = s.league
@@ -2463,9 +3015,31 @@ class WhoScoredRepository:
                 kickoff=row[4],
                 status=int(row[5]),
                 match_is_opta=_coerce_bool(row[6]),
+                attempt_no=int(row[7]),
             )
             for row in rows
         ]
+
+    def list_completed_match_candidates(
+        self,
+        league: str,
+        season: str,
+        *,
+        match_ids: Optional[Iterable[int]] = None,
+    ) -> list[MatchCandidate]:
+        """Return the complete schedule-backed historical candidate set.
+
+        This policy intentionally ignores every manifest state/version and
+        retry_after. It is used only while freezing an immutable backfill plan;
+        regular daily ingestion continues to use ``list_match_candidates``.
+        """
+        return self.list_match_candidates(
+            league,
+            season,
+            match_ids=match_ids,
+            limit=None,
+            include_all_completed=True,
+        )
 
     def latest_source_season_id(self, league: str, season: str) -> Optional[int]:
         if not self.trino.table_exists(self.schema, "whoscored_seasons"):
@@ -2548,7 +3122,7 @@ class WhoScoredRepository:
         }
         if normalized_feed_states:
             dataset_states["__feeds__"] = dict(sorted(normalized_feed_states.items()))
-        prepared: dict[str, pd.DataFrame] = {}
+        row_sources: dict[str, Iterable[Mapping[str, Any]]] = {}
         counts: dict[str, int] = {}
         schema_fields: dict[str, list[str]] = {}
         for table, source_rows in datasets.items():
@@ -2557,34 +3131,65 @@ class WhoScoredRepository:
             key = distinct_keys.get(table)
             if not key or not key.replace("_", "").isalnum():
                 raise ValueError(f"{table} requires a safe distinct key")
-            materialised = [dict(row) for row in source_rows]
-            if not materialised and table not in explicit_empty | unavailable:
+            try:
+                row_count = len(source_rows)
+            except TypeError as exc:
+                raise ValueError(
+                    f"{table} rows must be bounded and re-iterable"
+                ) from exc
+            if not row_count and table not in explicit_empty | unavailable:
                 raise ValueError(
                     f"{table} is empty without an explicit source_empty state"
                 )
-            frame = pd.DataFrame(materialised)
-            if materialised:
-                for column, expected in (("league", league), ("season", season)):
-                    if column in frame and frame[column].notna().any():
-                        actual = {
-                            str(value) for value in frame[column].dropna().unique()
-                        }
-                        if actual != {str(expected)}:
-                            raise ValueError(
-                                f"{table} contains {column} outside {expected!r}: {actual}"
-                            )
-                    frame[column] = expected
-                if key not in frame:
+            if isinstance(source_rows, WhoScoredScopeRowSpool):
+                if (
+                    source_rows.table != table
+                    or source_rows.league != str(league)
+                    or source_rows.season != str(season)
+                ):
+                    raise ValueError(f"{table} spool identity does not match commit")
+                if row_count and key != "entity_key":
+                    raise ValueError(
+                        f"{table} spool supports only its entity_key contract"
+                    )
+                columns = set(source_rows.columns)
+                if row_count and key not in columns:
                     raise ValueError(f"{table} lacks distinct key {key!r}")
-                if frame[key].isna().any():
-                    raise ValueError(f"{table}.{key} contains nulls")
-                if frame[key].astype(str).duplicated().any():
-                    raise ValueError(f"{table}.{key} contains duplicates")
-                schema_fields[table] = sorted(str(column) for column in frame.columns)
             else:
-                schema_fields[table] = []
-            counts[table] = len(materialised)
-            prepared[table] = frame
+                columns: set[str] = set()
+                distinct_values: set[str] = set()
+                observed = 0
+                for source in source_rows:
+                    row = dict(source)
+                    observed += 1
+                    columns.update(str(column) for column in row)
+                    for column, expected in (
+                        ("league", league),
+                        ("season", season),
+                    ):
+                        value = row.get(column)
+                        if value is not None and str(value) != str(expected):
+                            raise ValueError(
+                                f"{table} contains {column}={value!r} outside "
+                                f"{expected!r}"
+                            )
+                    if key not in row:
+                        raise ValueError(f"{table} lacks distinct key {key!r}")
+                    value = row[key]
+                    if value is None:
+                        raise ValueError(f"{table}.{key} contains nulls")
+                    normalized = str(value)
+                    if normalized in distinct_values:
+                        raise ValueError(f"{table}.{key} contains duplicates")
+                    distinct_values.add(normalized)
+                if observed != row_count:
+                    raise ValueError(
+                        f"{table} changed cardinality while validating: "
+                        f"len={row_count}, iterated={observed}"
+                    )
+            schema_fields[table] = sorted(columns)
+            counts[table] = row_count
+            row_sources[table] = source_rows
 
         identity = self._canonical_json(
             {
@@ -2657,64 +3262,109 @@ class WhoScoredRepository:
         schema_fingerprint = hashlib.sha256(
             self._canonical_json(schema_fields).encode("utf-8")
         ).hexdigest()
-        for table, frame in prepared.items():
-            existing_count = self._scope_batch_count(
-                table, league=league, season=season, batch_id=batch_id
-            )
-            if existing_count == counts[table]:
-                continue
-            if existing_count:
-                raise BatchConflict(
-                    f"scope batch {batch_id}/{table} has an incomplete orphan "
-                    f"batch: physical={existing_count}, expected={counts[table]}"
-                )
-            if frame.empty:
-                continue
-            frame = frame.copy()
-            frame["batch_schema_fingerprint"] = schema_fingerprint
-            frame["_scope_batch_id"] = batch_id
-            frame["_payload_sha256"] = payload_sha256
-            frame["_parser_version"] = PARSER_VERSION
-            frame["_entity_type"] = table.removeprefix("whoscored_")
-            for column in frame.columns:
-                if (
-                    frame[column]
-                    .map(lambda value: isinstance(value, (dict, list)))
-                    .any()
-                ):
-                    frame[column] = frame[column].map(
-                        lambda value: (
-                            self._canonical_json(value)
-                            if isinstance(value, (dict, list))
-                            else value
-                        )
-                    )
-            frame = self._normalise_frame_types(frame, table=table)
+        chunk_rows = scope_write_chunk_rows_from_env()
+        for table, source_rows in row_sources.items():
             table_lock = (
                 ("scope-table:whoscored_player_stage_stats",)
                 if table == "whoscored_player_stage_stats"
                 else ()
             )
             with self._commit_locks(table_lock):
-                self.writer.write_dataframe(
-                    frame,
-                    database=self.schema,
-                    table=table,
-                    partition_spec=[
-                        ("league", "identity"),
-                        ("season", "identity"),
-                    ],
-                    source="whoscored",
-                    bulk_arrow=(table == "whoscored_player_stage_stats"),
+                existing_count = self._scope_batch_count(
+                    table, league=league, season=season, batch_id=batch_id
                 )
-            physical = self._scope_batch_count(
-                table, league=league, season=season, batch_id=batch_id
-            )
-            if physical != counts[table]:
-                raise BatchConflict(
-                    f"scope batch {batch_id}/{table}: wrote={physical}, "
-                    f"expected={counts[table]}"
+                if existing_count == counts[table]:
+                    continue
+                if existing_count:
+                    # No success manifest references this exact batch (the early
+                    # return above already handled that case). A previous chunked
+                    # attempt therefore left a hidden physical orphan. Remove only
+                    # that unpublished batch and replay it from deterministic raw
+                    # inputs. The player table lock also serializes this DELETE
+                    # with PyIceberg appends for other concurrently running scopes.
+                    self.trino._execute(
+                        f"DELETE FROM {self.catalog}.{self.schema}.{table} "
+                        f"WHERE league = {_sql_string(league)} "
+                        f"AND season = {_sql_string(season)} "
+                        f"AND _scope_batch_id = {_sql_string(batch_id)}"
+                    )
+                    remaining = self._scope_batch_count(
+                        table, league=league, season=season, batch_id=batch_id
+                    )
+                    if remaining:
+                        raise BatchConflict(
+                            f"scope batch {batch_id}/{table} orphan cleanup left "
+                            f"{remaining} rows"
+                        )
+                if not counts[table]:
+                    continue
+                pending: list[dict[str, Any]] = []
+
+                def write_pending() -> None:
+                    if not pending:
+                        return
+                    frame = pd.DataFrame(pending)
+                    # Pandas has already extracted the column arrays. Release
+                    # the Python row dictionaries before normalization,
+                    # metadata copies and Arrow conversion overlap in memory.
+                    pending.clear()
+                    frame["batch_schema_fingerprint"] = schema_fingerprint
+                    frame["_scope_batch_id"] = batch_id
+                    frame["_payload_sha256"] = payload_sha256
+                    frame["_parser_version"] = PARSER_VERSION
+                    frame["_entity_type"] = table.removeprefix("whoscored_")
+                    for column in frame.columns:
+                        if (
+                            frame[column]
+                            .map(lambda value: isinstance(value, (dict, list)))
+                            .any()
+                        ):
+                            frame[column] = frame[column].map(
+                                lambda value: (
+                                    self._canonical_json(value)
+                                    if isinstance(value, (dict, list))
+                                    else value
+                                )
+                            )
+                    normalized = self._normalise_frame_types(frame, table=table)
+                    del frame
+                    self.writer.write_dataframe(
+                        normalized,
+                        database=self.schema,
+                        table=table,
+                        partition_spec=[
+                            ("league", "identity"),
+                            ("season", "identity"),
+                        ],
+                        source="whoscored",
+                        bulk_arrow=(table == "whoscored_player_stage_stats"),
+                    )
+
+                written = 0
+                for source in source_rows:
+                    row = dict(source)
+                    row["league"] = league
+                    row["season"] = season
+                    pending.append(row)
+                    if len(pending) >= chunk_rows:
+                        written += len(pending)
+                        write_pending()
+                if pending:
+                    written += len(pending)
+                    write_pending()
+                if written != counts[table]:
+                    raise BatchConflict(
+                        f"scope batch {batch_id}/{table} iterator changed "
+                        f"cardinality: wrote={written}, expected={counts[table]}"
+                    )
+                physical = self._scope_batch_count(
+                    table, league=league, season=season, batch_id=batch_id
                 )
+                if physical != counts[table]:
+                    raise BatchConflict(
+                        f"scope batch {batch_id}/{table}: wrote={physical}, "
+                        f"expected={counts[table]}"
+                    )
 
         now = _utc_now()
         self.writer.write_dataframe(
@@ -2815,6 +3465,11 @@ class WhoScoredRepository:
                         AND m.parser_version IS DISTINCT FROM
                             {_sql_string(PARSER_VERSION)}
                     )
+                    OR (
+                        m.state = 'not_available'
+                        AND m.availability_version IS DISTINCT FROM
+                            {_sql_string(MATCH_AVAILABILITY_VERSION)}
+                    )
         """
         )
         latest = f"{self.catalog}.{self.schema}.whoscored_preview_ingest_latest"
@@ -2878,7 +3533,12 @@ class WhoScoredRepository:
         ]
 
     def record_preview_failure(self, failure: PreviewFailure) -> None:
-        if failure.state not in {"retryable", "terminal", "parse_failed"}:
+        if failure.state not in {
+            "retryable",
+            "terminal",
+            "parse_failed",
+            "not_available",
+        }:
             raise ValueError(f"unsupported preview failure state: {failure.state}")
         if failure.state == "retryable" and failure.retry_after is None:
             raise ValueError("retryable preview failure requires retry_after")
@@ -2900,6 +3560,7 @@ class WhoScoredRepository:
                         "payload_sha256": failure.payload_sha256,
                         "raw_uri": failure.raw_uri,
                         "parser_version": failure.parser_version,
+                        "availability_version": failure.availability_version,
                         "state": failure.state,
                         "missing_players_count": None,
                         "entity_counts_json": None,
@@ -3221,6 +3882,7 @@ class WhoScoredRepository:
                     "payload_sha256": commit.payload_sha256,
                     "raw_uri": commit.raw_uri,
                     "parser_version": commit.parser_version,
+                    "availability_version": commit.availability_version,
                     "state": "success",
                     "missing_players_count": counts["missing_players"],
                     "entity_counts_json": self._canonical_json(counts),
@@ -3255,6 +3917,8 @@ class WhoScoredRepository:
     def _prepare_match_commit(
         self, commit: MatchCommit
     ) -> tuple[dict[str, Sequence[Mapping[str, Any]]], dict[str, int], str]:
+        if int(commit.attempt_no) < 1:
+            raise ValueError("match commit attempt_no must be positive")
         event_ids = [row.get("source_event_id") for row in commit.events]
         if any(value is None for value in event_ids):
             raise ValueError(f"game {commit.game_id} has null source_event_id")
@@ -3638,6 +4302,7 @@ class WhoScoredRepository:
                     "payload_sha256": commit.payload_sha256,
                     "raw_uri": commit.raw_uri,
                     "parser_version": commit.parser_version,
+                    "availability_version": commit.availability_version,
                     "state": "success",
                     "is_final": self._is_completed_match(commit),
                     "is_opta": commit.is_opta,
@@ -3654,7 +4319,7 @@ class WhoScoredRepository:
                     "http_status": int(commit.http_status),
                     "failure_code": None,
                     "error": None,
-                    "attempt_no": 1,
+                    "attempt_no": int(commit.attempt_no),
                     "retry_after": None,
                     "fetched_at": commit.fetched_at or now,
                     "completed_at": now,
@@ -3697,6 +4362,7 @@ class WhoScoredRepository:
                 "payload_sha256": failure.payload_sha256,
                 "raw_uri": failure.raw_uri,
                 "parser_version": failure.parser_version,
+                "availability_version": failure.availability_version,
                 "is_final": failure.state != "retryable",
                 "is_opta": failure.is_opta,
                 "events_count": 0,

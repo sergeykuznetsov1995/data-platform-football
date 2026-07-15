@@ -7,7 +7,7 @@ cannot write Bronze/Trino tables or execute DDL.  The same workflow is run as:
 
 * ``cold``: the temporary raw store is empty;
 * ``warm``: every source object must be replayed from that raw store;
-* ``incremental``: exactly one profile target is invalidated before the run.
+* ``incremental``: exactly one match target is invalidated before the run.
 
 Any paid-route use, partial entity result, unexpected warm network request, or
 incremental fetch of more than the invalidated target fails the process.
@@ -16,6 +16,7 @@ incremental fetch of more than the invalidated target fails the process.
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 import hashlib
 import json
 import logging
@@ -24,6 +25,8 @@ from collections import Counter
 from datetime import date, datetime
 from pathlib import Path
 import re
+import signal
+import stat
 import sys
 from tempfile import TemporaryDirectory
 import time
@@ -40,11 +43,15 @@ from scrapers.whoscored.catalog import (  # noqa: E402
     WhoScoredCatalog,
 )
 from scrapers.whoscored.domain import WhoScoredScope  # noqa: E402
-from scrapers.whoscored.parsers import DatasetStatus  # noqa: E402
+from scrapers.whoscored.parsers import (  # noqa: E402
+    DatasetStatus,
+    parse_preview_bundle,
+)
 from scrapers.whoscored.raw_store import (  # noqa: E402
     RawTarget,
     WhoScoredRawStore,
     match_page_target,
+    preview_page_target,
 )
 from scrapers.whoscored.repository import (  # noqa: E402
     ManifestFailure,
@@ -53,6 +60,7 @@ from scrapers.whoscored.repository import (  # noqa: E402
     PreviewCommit,
     PreviewFailure,
     ProfileCommit,
+    WhoScoredScopeRowSpool,
 )
 from scrapers.whoscored.service import (  # noqa: E402
     DEFAULT_STRUCTURED_REQUESTS_PER_MINUTE,
@@ -66,6 +74,7 @@ from scrapers.whoscored.service import (  # noqa: E402
 )
 from scrapers.whoscored.stage_feeds import STAGE_TEAM_FEED_CATALOG  # noqa: E402
 from scrapers.whoscored.transport import (  # noqa: E402
+    capacity_browser_session_prefix,
     TransportContext,
     WhoScoredTransport,
 )
@@ -74,12 +83,14 @@ from scrapers.base.flaresolverr_client import MAX_XHR_BATCH_URLS  # noqa: E402
 
 LOG = logging.getLogger("bench_whoscored_workflow")
 MIB = 1024 * 1024
-BENCHMARK_VERSION = "whoscored-workflow-benchmark-v1"
+BENCHMARK_VERSION = "whoscored-workflow-benchmark-v2"
 DEFAULT_SCOPE = "INT-World Cup=2026"
 DEFAULT_MATCH_LIMIT = 3
 DEFAULT_PROFILE_LIMIT = 3
 MAX_MATCH_LIMIT = 10
 MAX_PROFILE_LIMIT = 20
+PREVIEW_CANDIDATE_POOL_MULTIPLIER = 3
+MAX_PREVIEW_CANDIDATE_POOL = MAX_MATCH_LIMIT * PREVIEW_CANDIDATE_POOL_MULTIPLIER
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 _ROUTE_COUNTER_FIELDS = (
     "route_requests",
@@ -101,6 +112,9 @@ _SCALAR_COUNTER_FIELDS = (
 _PAID_ROUTES = {"paid_http", "paid_flaresolverr"}
 _DIRECT_ROUTES = {"direct_http", "direct_flaresolverr"}
 _FEED_STATUSES = frozenset({"available", "empty", "not_available"})
+_CAPACITY_CONTROL_SCHEMA_VERSION = 1
+_CAPACITY_CONTROL_READ_LIMIT = 512
+_CAPACITY_FLARESOLVERR_ENDPOINT = "http://127.0.0.1:8191"
 
 
 def _expected_stage_feed_keys(stage_ids: Iterable[int]) -> frozenset[str]:
@@ -157,14 +171,45 @@ def _json_fingerprint(value: Any) -> str:
     # source HTML.  Production canonicalization repairs them before an Iceberg
     # write; keep the non-publishing fingerprint total as well by escaping all
     # non-ASCII code points before UTF-8 encoding.
-    payload = json.dumps(
-        value,
+    encoder = json.JSONEncoder(
         ensure_ascii=True,
         sort_keys=True,
         separators=(",", ":"),
         default=str,
-    ).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
+    )
+    digest = hashlib.sha256()
+    for token in encoder.iterencode(value):
+        digest.update(token.encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _dataset_fingerprint(
+    datasets: Mapping[str, Sequence[Mapping[str, Any]]],
+    *,
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> str:
+    """Fingerprint row collections without building one giant JSON document."""
+
+    digest = hashlib.sha256(b"whoscored-benchmark-datasets-v2\0")
+    for name in sorted(datasets):
+        digest.update(json.dumps(str(name), ensure_ascii=True).encode("utf-8"))
+        digest.update(b"\0")
+        rows = datasets[name]
+        if isinstance(rows, WhoScoredScopeRowSpool):
+            digest.update(rows.content_fingerprint().encode("ascii"))
+            observed = len(rows)
+        else:
+            observed = 0
+            for row in rows:
+                digest.update(_json_fingerprint(row).encode("ascii"))
+                digest.update(b"\n")
+                observed += 1
+        if observed != len(rows):
+            raise ValueError(f"benchmark dataset {name} changed while fingerprinting")
+        digest.update(str(observed).encode("ascii"))
+        digest.update(b"\0")
+    digest.update(_json_fingerprint(metadata or {}).encode("ascii"))
+    return digest.hexdigest()
 
 
 def _optional_datetime(value: Any) -> Optional[datetime]:
@@ -203,6 +248,7 @@ class InMemoryBenchmarkRepository:
     def __init__(self, scope: CatalogSeason | WhoScoredScope) -> None:
         self.scope = scope.scope if isinstance(scope, CatalogSeason) else scope
         self._scope_datasets: dict[str, tuple[dict[str, Any], ...]] = {}
+        self._scope_counts: dict[str, int] = {}
         self._match_commits: dict[int, MatchCommit] = {}
         self._preview_commits: dict[int, PreviewCommit] = {}
         self._profile_commits: dict[int, ProfileCommit] = {}
@@ -262,13 +308,20 @@ class InMemoryBenchmarkRepository:
         rows: Sequence[Mapping[str, Any]],
         distinct_key: str,
     ) -> None:
-        values: list[str] = []
+        if isinstance(rows, WhoScoredScopeRowSpool):
+            if distinct_key != "entity_key" or (
+                len(rows) and distinct_key not in rows.columns
+            ):
+                raise ValueError(f"{table}: invalid spool distinct-key contract")
+            return
+        values: set[str] = set()
         for row in rows:
             if row.get(distinct_key) is None:
                 raise ValueError(f"{table}: missing distinct key {distinct_key}")
-            values.append(str(row[distinct_key]))
-        if len(values) != len(set(values)):
-            raise ValueError(f"{table}: duplicate {distinct_key} values")
+            value = str(row[distinct_key])
+            if value in values:
+                raise ValueError(f"{table}: duplicate {distinct_key} values")
+            values.add(value)
 
     def commit_scope_bundle(
         self,
@@ -293,18 +346,21 @@ class InMemoryBenchmarkRepository:
         unavailable = set(source_unavailable)
         if empty & unavailable:
             raise ValueError("a scope dataset cannot be empty and unavailable")
-        copied: dict[str, tuple[dict[str, Any], ...]] = {}
+        schedule_rows: tuple[dict[str, Any], ...] = ()
         for name, source_rows in datasets.items():
-            rows = tuple(dict(row) for row in source_rows)
             if name not in distinct_keys:
                 raise ValueError(f"{name}: no distinct-key contract")
-            self._validate_distinct(name, rows, distinct_keys[name])
-            copied[name] = rows
-        if not copied.get("whoscored_schedule"):
+            self._validate_distinct(name, source_rows, distinct_keys[name])
+            if name == "whoscored_schedule":
+                # Only schedule drives later benchmark candidate selection.
+                # Statistics stay in their production disk spool; retaining a
+                # second dict copy here was benchmark-only multi-GiB overhead.
+                schedule_rows = tuple(dict(row) for row in source_rows)
+        if not schedule_rows:
             raise ValueError("scope commit contains no schedule rows")
         schedule_stage_ids = {
             int(row["stage_id"])
-            for row in copied.get("whoscored_schedule", ())
+            for row in schedule_rows
             if row.get("stage_id") is not None
         }
         normalized_feed_states = dict(sorted((feed_states or {}).items()))
@@ -344,8 +400,9 @@ class InMemoryBenchmarkRepository:
                 raise ValueError(
                     f"scope feed-state contract has invalid statuses {invalid_statuses}"
                 )
-        fingerprint = _json_fingerprint(
-            {"datasets": copied, "feed_states": normalized_feed_states}
+        fingerprint = _dataset_fingerprint(
+            datasets,
+            metadata={"feed_states": normalized_feed_states},
         )
         batch_id = (
             "ws-scope-"
@@ -353,7 +410,7 @@ class InMemoryBenchmarkRepository:
                 f"{league}\0{season}\0{entity_group}\0{payload_sha256}".encode()
             ).hexdigest()
         )
-        counts = self._dataset_counts(copied)
+        counts = self._dataset_counts(datasets)
         self._record_batch(
             kind="scope",
             identity=f"{league}={season}",
@@ -361,7 +418,8 @@ class InMemoryBenchmarkRepository:
             counts=counts,
             fingerprint=fingerprint,
         )
-        self._scope_datasets = copied
+        self._scope_datasets = {"whoscored_schedule": schedule_rows}
+        self._scope_counts = counts
         return batch_id
 
     def _schedule_rows(self) -> list[dict[str, Any]]:
@@ -611,9 +669,7 @@ class InMemoryBenchmarkRepository:
         self.failures.append(dict(failure))
 
     def _logical_current_rows(self) -> dict[str, int]:
-        current: Counter[str] = Counter()
-        for name, rows in self._scope_datasets.items():
-            current[_normal_table(name)] += len(rows)
+        current: Counter[str] = Counter(self._scope_counts)
         for commit in self._match_commits.values():
             for name, rows in self._match_datasets(commit).items():
                 current[name] += len(rows)
@@ -649,12 +705,14 @@ class BenchmarkFactories:
         create_transport: Callable[[str, MemoryRequestLedger, argparse.Namespace], Any],
         create_repository: Callable[[Any], Any],
         create_service: Callable[..., Any],
+        parse_preview: Callable[..., Any] = parse_preview_bundle,
     ) -> None:
         self.load_catalog = load_catalog
         self.create_raw_store = create_raw_store
         self.create_transport = create_transport
         self.create_repository = create_repository
         self.create_service = create_service
+        self.parse_preview = parse_preview
 
 
 def _default_factories() -> BenchmarkFactories:
@@ -672,6 +730,7 @@ def _default_factories() -> BenchmarkFactories:
                 entity="workflow_benchmark",
             ),
             request_ledger=ledger,
+            browser_session_owner=getattr(args, "browser_session_owner", None),
         )
 
     def create_service(**kwargs: Any) -> WhoScoredIngestService:
@@ -683,6 +742,7 @@ def _default_factories() -> BenchmarkFactories:
         create_transport=create_transport,
         create_repository=InMemoryBenchmarkRepository,
         create_service=create_service,
+        parse_preview=parse_preview_bundle,
     )
 
 
@@ -734,6 +794,17 @@ def _traffic_delta(
             if event.get("cache_key")
         }
     )
+    delta["successful_source_targets"] = sorted(
+        {
+            str(event.get("cache_key"))
+            for event in source_events
+            if event.get("cache_key") and event.get("status") == "success"
+        }
+    )
+    # Capacity is charged in completed logical page units. Multiple physical
+    # attempts or route fallbacks for one target must not inflate the useful
+    # throughput projection.
+    delta["successful_page_units"] = len(delta["successful_source_targets"])
     delta["source_urls"] = sorted(
         {str(event.get("url")) for event in source_events if event.get("url")}
     )
@@ -821,6 +892,108 @@ def _parsed_rows(results: Sequence[Any]) -> dict[str, Any]:
     return {"by_dataset": dict(sorted(counts.items())), "total": sum(counts.values())}
 
 
+def _select_complete_preview_match_ids(
+    *,
+    service: Any,
+    repository: Any,
+    match_limit: int,
+    preview_parser: Callable[..., Any],
+) -> tuple[list[int], dict[str, Any]]:
+    """Select a bounded deterministic sample with complete preview structures.
+
+    The probe uses the production fetch/cache path and parser.  An explicitly
+    parsed ``not_available`` dataset makes only that candidate ineligible;
+    transport and parser exceptions remain fatal.  Running this inside every
+    phase makes cold probe requests part of throughput evidence and replays
+    every probed raw object during warm/incremental phases.
+    """
+
+    pool_limit = min(
+        MAX_PREVIEW_CANDIDATE_POOL,
+        int(match_limit) * PREVIEW_CANDIDATE_POOL_MULTIPLIER,
+    )
+    pool_ids = list(repository.benchmark_match_ids(pool_limit))
+    if len(pool_ids) != len(set(pool_ids)) or any(
+        type(game_id) is not int or game_id <= 0 for game_id in pool_ids
+    ):
+        raise BenchmarkFailure("preview candidate pool has invalid match identities")
+    candidates = repository.list_preview_candidates(
+        service.scope.competition_id,
+        service.scope.season_id,
+        match_ids=pool_ids,
+        limit=pool_limit,
+        force_replay=True,
+    )
+    by_id: dict[int, Mapping[str, Any]] = {}
+    for candidate in candidates:
+        game_id = int(candidate["game_id"])
+        if game_id in by_id:
+            raise BenchmarkFailure("preview candidate pool contains duplicate matches")
+        by_id[game_id] = candidate
+    if set(by_id) != set(pool_ids):
+        raise BenchmarkFailure("preview candidate pool changed during selection")
+
+    expected_datasets = {
+        "missing_players",
+        "preview_lineups",
+        "preview_sections",
+    }
+    selected: list[int] = []
+    probed: list[int] = []
+    rejected_not_available = 0
+    for game_id in pool_ids:
+        candidate = by_id[game_id]
+        target = preview_page_target(game_id)
+        parsed_holder: dict[str, Any] = {}
+
+        def validate(
+            response: Any,
+            *,
+            current_candidate: Mapping[str, Any] = candidate,
+            current_game_id: int = game_id,
+        ) -> bool:
+            parsed_holder["preview"] = preview_parser(
+                response.text,
+                scope=service.scope,
+                game_id=current_game_id,
+                game=current_candidate["game"],
+                home_team=current_candidate["home_team"],
+                away_team=current_candidate["away_team"],
+            )
+            return True
+
+        service._fetch(target, validator=validate, allow_cache=True)
+        parsed = parsed_holder.get("preview")
+        if parsed is None:
+            raise BenchmarkFailure("preview probe parser returned no result")
+        datasets = dict(getattr(parsed, "datasets", {}) or {})
+        if set(datasets) != expected_datasets:
+            raise BenchmarkFailure("preview probe dataset contract drifted")
+        statuses = [dataset.status for dataset in datasets.values()]
+        if any(type(status) is not DatasetStatus for status in statuses):
+            raise BenchmarkFailure("preview probe returned an invalid dataset status")
+        probed.append(game_id)
+        if DatasetStatus.NOT_AVAILABLE in statuses:
+            rejected_not_available += 1
+            continue
+        selected.append(game_id)
+        if len(selected) == int(match_limit):
+            break
+
+    if len(selected) != int(match_limit):
+        raise BenchmarkFailure(
+            f"scope has only {len(selected)} complete previews in the first "
+            f"{len(probed)} bounded candidates; {match_limit} required"
+        )
+    return selected, {
+        "candidate_pool_limit": pool_limit,
+        "candidate_count": len(pool_ids),
+        "probed_match_ids": probed,
+        "rejected_not_available": rejected_not_available,
+        "selected_match_ids": list(selected),
+    }
+
+
 def _execute_phase(
     name: str,
     *,
@@ -830,6 +1003,7 @@ def _execute_phase(
     ledger: MemoryRequestLedger,
     match_limit: int,
     profile_limit: int,
+    preview_parser: Callable[..., Any],
 ) -> dict[str, Any]:
     traffic_before = dict(transport.get_traffic_stats())
     metrics_before = dict(repository.metrics_snapshot())
@@ -838,17 +1012,18 @@ def _execute_phase(
     results: list[Any] = []
     selected_match_ids: list[int] = []
     selected_profile_ids: list[int] = []
+    preview_probe: dict[str, Any] = {}
     try:
         schedule = service.sync_schedule()
         results.append(schedule)
         _require_complete(schedule, entity="schedule", expected=1)
 
-        selected_match_ids = repository.benchmark_match_ids(match_limit)
-        if len(selected_match_ids) != match_limit:
-            raise BenchmarkFailure(
-                f"scope has only {len(selected_match_ids)} completed matches with "
-                f"previews; {match_limit} required"
-            )
+        selected_match_ids, preview_probe = _select_complete_preview_match_ids(
+            service=service,
+            repository=repository,
+            match_limit=match_limit,
+            preview_parser=preview_parser,
+        )
         matches = service.sync_matches(
             match_ids=selected_match_ids,
             limit=match_limit,
@@ -896,6 +1071,7 @@ def _execute_phase(
         "elapsed_seconds": round(elapsed, 3),
         "selected_match_ids": selected_match_ids,
         "selected_profile_ids": selected_profile_ids,
+        "preview_probe": preview_probe,
         "results": [_result_document(result) for result in results],
         "parsed_rows": _parsed_rows(results),
         "committed_rows": committed,
@@ -917,6 +1093,8 @@ def _require_phase_success(phase: Mapping[str, Any]) -> None:
 
 
 def _validate_args(args: argparse.Namespace) -> Optional[str]:
+    if getattr(args, "capacity_control_fd", None) is not None:
+        return "capacity control fd was not resolved"
     scope = str(getattr(args, "scope", ""))
     if scope.count("=") != 1 or not all(part.strip() for part in scope.split("=", 1)):
         return "scope must have the form '<competition>=<season-id>'"
@@ -926,7 +1104,78 @@ def _validate_args(args: argparse.Namespace) -> Optional[str]:
         return f"match limit must be in 1..{MAX_MATCH_LIMIT}"
     if not 1 <= profile_limit <= MAX_PROFILE_LIMIT:
         return f"profile limit must be in 1..{MAX_PROFILE_LIMIT}"
+    browser_session_owner = getattr(args, "browser_session_owner", None)
+    if browser_session_owner is not None:
+        try:
+            capacity_browser_session_prefix(browser_session_owner)
+        except ValueError:
+            return "browser session owner is invalid"
     return None
+
+
+def _apply_capacity_control(args: argparse.Namespace) -> argparse.Namespace:
+    """Consume one protected inherited pipe without exposing controls in argv."""
+
+    control_fd = getattr(args, "capacity_control_fd", None)
+    if control_fd is None:
+        if getattr(args, "flaresolverr_url", None) is None:
+            args.flaresolverr_url = os.environ.get(
+                "FLARESOLVERR_URL", "http://flaresolverr:8191"
+            )
+        return args
+    if type(control_fd) is not int or control_fd < 3:
+        raise ValueError("capacity control arguments conflict")
+    if (
+        getattr(args, "browser_session_owner", None) is not None
+        or getattr(args, "flaresolverr_url", None) is not None
+    ):
+        try:
+            os.close(control_fd)
+        except OSError:
+            pass
+        raise ValueError("capacity control arguments conflict")
+    try:
+        metadata = os.fstat(control_fd)
+        if not stat.S_ISFIFO(metadata.st_mode):
+            raise ValueError("capacity control descriptor is not a pipe")
+        os.set_blocking(control_fd, False)
+        payload = os.read(control_fd, _CAPACITY_CONTROL_READ_LIMIT)
+    except (OSError, ValueError) as exc:
+        raise ValueError("capacity control is unavailable") from exc
+    finally:
+        try:
+            os.close(control_fd)
+        except OSError:
+            pass
+    if not payload or len(payload) >= _CAPACITY_CONTROL_READ_LIMIT:
+        raise ValueError("capacity control payload size is invalid")
+    try:
+        document = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("capacity control payload is invalid") from exc
+    if not isinstance(document, Mapping) or set(document) != {
+        "schema_version",
+        "owner",
+        "flaresolverr_endpoint",
+    }:
+        raise ValueError("capacity control payload shape is invalid")
+    if (
+        type(document["schema_version"]) is not int
+        or document["schema_version"] != _CAPACITY_CONTROL_SCHEMA_VERSION
+    ):
+        raise ValueError("capacity control schema version is invalid")
+    owner = document["owner"]
+    endpoint = document["flaresolverr_endpoint"]
+    try:
+        capacity_browser_session_prefix(owner)
+    except ValueError as exc:
+        raise ValueError("capacity control owner is invalid") from exc
+    if type(endpoint) is not str or endpoint != _CAPACITY_FLARESOLVERR_ENDPOINT:
+        raise ValueError("capacity control endpoint is invalid")
+    args.browser_session_owner = owner
+    args.flaresolverr_url = endpoint
+    args.capacity_control_fd = None
+    return args
 
 
 def run(
@@ -1039,12 +1288,55 @@ def run(
     }
 
     transport: Any = None
+    transport_close_error: Optional[str] = None
+
+    def close_transport() -> None:
+        """Close network resources once, before temporary raw files are removed."""
+
+        nonlocal transport, transport_close_error
+        current = transport
+        if current is None:
+            return
+        try:
+            current.close()
+        except Exception as exc:
+            transport_close_error = (
+                f"transport close failed: {type(exc).__name__}: {exc}"
+            )
+            transport = None
+        except BaseException:
+            # A termination signal can arrive inside the first close attempt.
+            # The CLI handler is one-shot, so retry synchronously while the
+            # ExitStack still owns the temporary directory, then preserve the
+            # original process exit.  A failed retry keeps the reference for
+            # the outer fallback after ExitStack finishes unwinding.
+            try:
+                current.close()
+            except Exception as exc:
+                transport_close_error = (
+                    f"transport close failed: {type(exc).__name__}: {exc}"
+                )
+            except BaseException:
+                pass
+            else:
+                transport = None
+            raise
+        else:
+            transport = None
+
     started = time.monotonic()
     try:
-        with TemporaryDirectory(prefix="whoscored-workflow-bench-") as raw_root:
+        with ExitStack() as resources:
+            raw_root = resources.enter_context(
+                TemporaryDirectory(prefix="whoscored-workflow-bench-")
+            )
             raw_store = dependencies.create_raw_store(Path(raw_root).resolve().as_uri())
             ledger = MemoryRequestLedger()
             repository = dependencies.create_repository(catalog_season)
+            # Registered after the temporary directory, so LIFO cleanup closes
+            # the browser transport first.  This gives the supervisor's fixed
+            # SIGTERM grace window to destroy its FlareSolverr session.
+            resources.callback(close_transport)
             transport = dependencies.create_transport(
                 catalog_season.scope.spec, ledger, args
             )
@@ -1064,6 +1356,7 @@ def run(
                 ledger=ledger,
                 match_limit=int(args.match_limit),
                 profile_limit=int(args.profile_limit),
+                preview_parser=dependencies.parse_preview,
             )
             report["phases"].append(cold)
             _require_phase_success(cold)
@@ -1078,6 +1371,7 @@ def run(
                 ledger=ledger,
                 match_limit=int(args.match_limit),
                 profile_limit=int(args.profile_limit),
+                preview_parser=dependencies.parse_preview,
             )
             report["phases"].append(warm)
             _require_phase_success(warm)
@@ -1101,9 +1395,11 @@ def run(
                 raise BenchmarkFailure(
                     f"warm phase did not persist raw target {target.target_id}"
                 )
+            _, invalidated_record = raw_store.load_bytes(target)
             quarantine_key = raw_store.quarantine(
                 target,
                 reason="workflow benchmark incremental invalidation",
+                record=invalidated_record,
             )
             if not quarantine_key or raw_store.has(target):
                 raise BenchmarkFailure(
@@ -1123,6 +1419,7 @@ def run(
                 ledger=ledger,
                 match_limit=int(args.match_limit),
                 profile_limit=int(args.profile_limit),
+                preview_parser=dependencies.parse_preview,
             )
             report["phases"].append(incremental)
             _require_phase_success(incremental)
@@ -1146,6 +1443,11 @@ def run(
                 or cold["selected_profile_ids"] != incremental["selected_profile_ids"]
             ):
                 raise BenchmarkFailure("profile sample changed between phases")
+            if (
+                cold["preview_probe"] != warm["preview_probe"]
+                or cold["preview_probe"] != incremental["preview_probe"]
+            ):
+                raise BenchmarkFailure("preview probe changed between phases")
 
             total_traffic = dict(transport.get_traffic_stats())
             if int(total_traffic.get("paid_proxy_bytes", 0) or 0) != 0:
@@ -1159,12 +1461,13 @@ def run(
         report["status"] = "failed"
         report["error"] = f"{type(exc).__name__}: {exc}"
     finally:
-        if transport is not None:
-            try:
-                transport.close()
-            except Exception as exc:
-                report["status"] = "failed"
-                report["error"] = f"transport close failed: {type(exc).__name__}: {exc}"
+        # Safe fallback for failures before the ExitStack callback is active.
+        close_transport()
+        if transport_close_error is not None:
+            # Preserve the original fail-closed precedence: an inability to
+            # release network resources overrides an earlier workflow error.
+            report["status"] = "failed"
+            report["error"] = transport_close_error
         report["elapsed_seconds"] = round(time.monotonic() - started, 3)
 
     # Prove JSON serializability before returning success to the shell.
@@ -1192,9 +1495,44 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--flaresolverr-url",
-        default=os.environ.get("FLARESOLVERR_URL", "http://flaresolverr:8191"),
+        default=None,
+    )
+    parser.add_argument(
+        "--browser-session-owner",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--capacity-control-fd",
+        type=int,
+        default=None,
+        help=argparse.SUPPRESS,
     )
     return parser
+
+
+def _install_cli_termination_handlers() -> dict[int, Any]:
+    """Turn host termination into an unwind through ``run`` cleanup."""
+
+    previous: dict[int, Any] = {}
+    termination_started = False
+
+    def terminate(signum: int, _frame: Any) -> None:
+        nonlocal termination_started
+        if termination_started:
+            return
+        termination_started = True
+        raise SystemExit(128 + signum)
+
+    for signum in (signal.SIGTERM, signal.SIGHUP):
+        previous[signum] = signal.getsignal(signum)
+        signal.signal(signum, terminate)
+    return previous
+
+
+def _restore_cli_termination_handlers(previous: Mapping[int, Any]) -> None:
+    for signum, handler in previous.items():
+        signal.signal(signum, handler)
 
 
 def main() -> int:
@@ -1204,7 +1542,26 @@ def main() -> int:
         stream=sys.stderr,
     )
     args = _parser().parse_args()
-    code, report = run(args)
+    try:
+        args = _apply_capacity_control(args)
+    except ValueError:
+        print(
+            json.dumps(
+                {
+                    "benchmark_version": BENCHMARK_VERSION,
+                    "status": "configuration_error",
+                    "error": "capacity control is invalid",
+                    "publishes": False,
+                },
+                sort_keys=True,
+            )
+        )
+        return 2
+    previous_handlers = _install_cli_termination_handlers()
+    try:
+        code, report = run(args)
+    finally:
+        _restore_cli_termination_handlers(previous_handlers)
     print(json.dumps(report, ensure_ascii=False, sort_keys=True, default=str))
     return code
 

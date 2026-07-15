@@ -7,6 +7,7 @@ import hashlib
 import importlib.util
 import inspect
 import json
+import logging
 from pathlib import Path
 import shutil
 import subprocess
@@ -31,6 +32,13 @@ SPEC.loader.exec_module(ext)
 
 
 BASE_URL = "https://www.whoscored.com/statisticsfeed/1/getteamstatistics"
+
+
+@pytest.fixture(autouse=True)
+def _fresh_global_xhr_pacer(monkeypatch):
+    """Keep fast fake-driver tests independent while production stays process-wide."""
+
+    monkeypatch.setattr(ext, "_XHR_START_PACER", ext._XhrStartPacer())
 
 
 def _payload(**overrides):
@@ -66,7 +74,7 @@ def _batch_success(url=BASE_URL, body=b'{"teamTableStats":[]}'):
 
 
 class FakeDriver:
-    def __init__(self, result=None, *, delay=0.0):
+    def __init__(self, result=None, *, delay=0.0, launch_delay=0.0):
         body = b'{"teamTableStats":[]}'
         self.result = result or {
             "ok": True,
@@ -77,9 +85,18 @@ class FakeDriver:
             "responseBytes": len(body),
         }
         self.delay = delay
+        self.launch_delay = launch_delay
         self.timeouts = SimpleNamespace(script=17.0)
         self.timeout_calls = []
         self.execute_calls = []
+        self.launch_calls = []
+        self.abort_calls = []
+        self.actual_starts = []
+        self.collect_started = threading.Event()
+        self.collect_release = threading.Event()
+        self.collect_release.set()
+        self.quit_started = threading.Event()
+        self.quit_calls = 0
         self._active_guard = threading.Lock()
         self.active = 0
         self.max_active = 0
@@ -88,17 +105,51 @@ class FakeDriver:
         self.timeout_calls.append(timeout)
         self.timeouts.script = timeout
 
+    def execute_script(self, *args):
+        if args[0] == ext.XHR_ABORT_SCRIPT:
+            self.abort_calls.append(args)
+            return True
+        assert args[0] == ext.XHR_SCRIPT
+        self.launch_calls.append(args)
+        time.sleep(self.launch_delay)
+        self.actual_starts.append(time.monotonic())
+        return {"ok": True, "started": True, "itemIndex": args[-1]}
+
     def execute_async_script(self, *args):
+        assert args[0] == ext.XHR_COLLECT_SCRIPT
         self.execute_calls.append(args)
+        self.collect_started.set()
+        assert self.collect_release.wait(timeout=3)
         with self._active_guard:
             self.active += 1
             self.max_active = max(self.max_active, self.active)
         try:
             time.sleep(self.delay)
-            return self.result
+            if "responses" in self.result or self.result.get("kind") == (
+                "aggregate_too_large"
+            ):
+                return self.result
+            requested_url = self.launch_calls[-1][1]
+            item = {"requestedUrl": requested_url, **self.result}
+            return {
+                "ok": True,
+                "responses": [item],
+                "responseBytes": (
+                    self.result.get("responseBytes", 0)
+                    if self.result.get("ok") is True
+                    else 0
+                ),
+            }
         finally:
             with self._active_guard:
                 self.active -= 1
+
+    def close(self):
+        return None
+
+    def quit(self):
+        self.quit_calls += 1
+        self.quit_started.set()
 
 
 class FakeStorage:
@@ -112,6 +163,35 @@ class FakeStorage:
     def get(self, *_args, **_kwargs):
         self.get_called = True
         raise AssertionError("the XHR endpoint must not create a missing session")
+
+    def create(self, session_id=None, proxy=None, force_new=False):
+        del proxy
+        if force_new:
+            self.destroy(session_id)
+        if session_id in self.sessions:
+            return self.sessions[session_id], False
+        session = SimpleNamespace(session_id=session_id, driver=SimpleNamespace())
+        self.sessions[session_id] = session
+        return session, True
+
+    def destroy(self, session_id):
+        return self.sessions.pop(session_id, None) is not None
+
+    def session_ids(self):
+        return list(self.sessions)
+
+
+class FakeV1Response:
+    def __init__(self, _value):
+        self.__error_500__ = False
+
+
+def _stock_controller_v1(req):
+    return req
+
+
+def _stock_controller_handler(req):
+    return req
 
 
 class FakeCdpDriver:
@@ -155,15 +235,35 @@ def _stock_wrong_signature(req, driver):
 
 
 def _fake_upstream_service(function, *, configured=False):
+    utils = SimpleNamespace(
+        get_config_disable_media=lambda: configured,
+        get_flaresolverr_version=lambda: "3.4.6",
+        PLATFORM_VERSION="linux",
+    )
     return SimpleNamespace(
         _evil_logic=function,
-        utils=SimpleNamespace(get_config_disable_media=lambda: configured),
+        utils=utils,
+        controller_v1_endpoint=_stock_controller_v1,
+        _controller_v1_handler=_stock_controller_handler,
+        V1ResponseBase=FakeV1Response,
+        STATUS_ERROR="error",
     )
 
 
 def _pin_function_source(monkeypatch, function):
     digest = hashlib.sha256(inspect.getsource(function).encode("utf-8")).hexdigest()
     monkeypatch.setattr(ext, "_UPSTREAM_EVIL_LOGIC_SHA256", digest)
+
+
+def _pin_lifecycle_sources(monkeypatch, service):
+    storage_digest = hashlib.sha256(
+        inspect.getsource(type(service.SESSIONS_STORAGE)).encode("utf-8")
+    ).hexdigest()
+    controller_digest = hashlib.sha256(
+        inspect.getsource(service.controller_v1_endpoint).encode("utf-8")
+    ).hexdigest()
+    monkeypatch.setattr(ext, "_UPSTREAM_SESSIONS_STORAGE_SHA256", storage_digest)
+    monkeypatch.setattr(ext, "_UPSTREAM_CONTROLLER_V1_SHA256", controller_digest)
 
 
 def _media_request(*, disable_media=True, configured=False):
@@ -288,6 +388,8 @@ def test_create_app_installs_media_patch_before_registering_route(monkeypatch):
     service = _fake_upstream_service(_stock_like_evil_logic)
     service.SESSIONS_STORAGE = FakeStorage()
     _pin_function_source(monkeypatch, service._evil_logic)
+    _pin_lifecycle_sources(monkeypatch, service)
+    monkeypatch.setattr(ext, "_install_safe_logging", lambda: None)
 
     class _App:
         def __init__(self):
@@ -316,6 +418,12 @@ def test_create_app_installs_media_patch_before_registering_route(monkeypatch):
     assert ext.create_app() is app
     assert app.routes[0][0] == "/v1/xhr"
     assert app.routes[1][0] == "/v1/xhr/batch"
+    assert app.routes[2][0] == "/v1/whoscored/capacity-sessions/cleanup"
+    assert isinstance(service.SESSIONS_STORAGE, ext._TrackingSessionsStorage)
+    assert getattr(service.controller_v1_endpoint, ext._SAFE_CONTROLLER_MARKER) == (
+        "3.4.6",
+        ext._UPSTREAM_CONTROLLER_V1_SHA256,
+    )
     assert getattr(service._evil_logic, ext._MEDIA_PATCH_MARKER) == (
         "3.4.6",
         ext._UPSTREAM_EVIL_LOGIC_SHA256,
@@ -325,9 +433,654 @@ def test_create_app_installs_media_patch_before_registering_route(monkeypatch):
 def test_main_installs_media_patch_before_upstream_browser_self_test():
     source = inspect.getsource(ext.main)
 
+    assert ext.WAITRESS_THREADS == 8
+    assert "threads=WAITRESS_THREADS" in source
+    assert "threads=int(os.environ" not in source
     assert source.index("_install_disable_media_extension(") < source.index(
         "test_browser_installation()"
     )
+    assert source.index("_install_capacity_session_tracking(") < source.index(
+        "test_browser_installation()"
+    )
+    assert source.index("_install_safe_v1_controller(") < source.index(
+        "test_browser_installation()"
+    )
+
+
+def test_extension_identity_matches_current_helper_bytes():
+    expected = hashlib.sha256(SCRIPT_PATH.read_bytes()).hexdigest()
+
+    assert ext.EXTENSION_SHA256 == expected
+    assert len(ext.EXTENSION_SHA256) == 64
+    assert ext.EXTENSION_SHA256 == ext.EXTENSION_SHA256.lower()
+
+
+def test_extension_identity_is_frozen_at_module_startup(tmp_path):
+    copied_script = tmp_path / "flaresolverr_extended_frozen.py"
+    original_bytes = SCRIPT_PATH.read_bytes()
+    copied_script.write_bytes(original_bytes)
+    module_name = "flaresolverr_extended_frozen_identity_test"
+    spec = importlib.util.spec_from_file_location(module_name, copied_script)
+    assert spec is not None and spec.loader is not None
+    frozen = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = frozen
+    try:
+        spec.loader.exec_module(frozen)
+    finally:
+        sys.modules.pop(module_name, None)
+
+    startup_hash = hashlib.sha256(original_bytes).hexdigest()
+    assert frozen.EXTENSION_SHA256 == startup_hash
+    copied_script.write_bytes(original_bytes + b"\n# changed after import\n")
+    assert frozen.EXTENSION_SHA256 == startup_hash
+    assert (
+        frozen.EXTENSION_SHA256
+        != hashlib.sha256(copied_script.read_bytes()).hexdigest()
+    )
+
+
+class LifecycleDriver:
+    def __init__(self, quit_effects=None):
+        self.quit_effects = list(quit_effects or [None])
+        self.quit_started = threading.Event()
+        self.quit_release = threading.Event()
+        self.quit_release.set()
+        self.quit_calls = 0
+
+    def close(self):
+        return None
+
+    def quit(self):
+        self.quit_calls += 1
+        self.quit_started.set()
+        assert self.quit_release.wait(timeout=2)
+        effect = self.quit_effects.pop(0) if self.quit_effects else None
+        if isinstance(effect, BaseException):
+            raise effect
+
+
+class LifecycleSession:
+    def __init__(self, session_id, driver):
+        self.session_id = session_id
+        self.driver = driver
+
+    def lifetime(self):
+        return 0
+
+
+class LifecycleStorage:
+    def __init__(self, driver_factory=None):
+        self.sessions = {}
+        self.driver_factory = driver_factory or (lambda _proxy: LifecycleDriver())
+
+    def create(self, session_id=None, proxy=None, force_new=False):
+        if force_new:
+            self.destroy(session_id)
+        if session_id in self.sessions:
+            return self.sessions[session_id], False
+        driver = self.driver_factory(proxy)
+        session = LifecycleSession(session_id, driver)
+        self.sessions[session_id] = session
+        return session, True
+
+    def exists(self, session_id):
+        return session_id in self.sessions
+
+    def destroy(self, session_id):
+        if session_id not in self.sessions:
+            return False
+        session = self.sessions.pop(session_id)
+        session.driver.quit()
+        return True
+
+    def get(self, session_id, ttl=None):
+        session, fresh = self.create(session_id)
+        if ttl is not None and not fresh and session.lifetime() > ttl:
+            return self.create(session_id, force_new=True)
+        return session, fresh
+
+    def session_ids(self):
+        return list(self.sessions)
+
+
+def _tracking_storage(delegate=None, *, execution_locks=None):
+    return ext._TrackingSessionsStorage(
+        delegate or LifecycleStorage(),
+        platform_version_getter=lambda: "linux",
+        execution_locks=execution_locks,
+    )
+
+
+def _wait_until(predicate, *, timeout=2):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.005)
+    raise AssertionError("condition did not become true")
+
+
+def test_capacity_blocked_create_is_pending_then_active_and_cleaned_async():
+    owner = "a1b2c3d4e5f60718"
+    session_id = f"ws-cap-{owner}-direct-1"
+    create_started = threading.Event()
+    create_release = threading.Event()
+    driver = LifecycleDriver()
+
+    def driver_factory(_proxy):
+        create_started.set()
+        assert create_release.wait(timeout=2)
+        return driver
+
+    storage = _tracking_storage(LifecycleStorage(driver_factory))
+    create_thread = threading.Thread(target=storage.create, args=(session_id,))
+    create_thread.start()
+    assert create_started.wait(timeout=1)
+    assert storage.owner_snapshot(owner) == {
+        "active": 0,
+        "pending_create": 1,
+        "pending_destroy": 0,
+        "failed_create": 0,
+        "failed_destroy": 0,
+        "failure_generation": 0,
+        "cleanup_scheduled": False,
+    }
+
+    body, status = ext.handle_capacity_session_cleanup(
+        {"owner": owner}, storage=storage
+    )
+    assert status == 200
+    assert body["pending_create"] == 1
+    create_release.set()
+    create_thread.join(timeout=1)
+    assert not create_thread.is_alive()
+    assert storage.owner_snapshot(owner)["active"] == 1
+
+    ext.handle_capacity_session_cleanup({"owner": owner}, storage=storage)
+    _wait_until(lambda: storage.owner_snapshot(owner)["active"] == 0)
+    assert driver.quit_calls == 1
+
+
+def test_capacity_blocked_quit_stays_pending_without_blocking_handler():
+    owner = "b1b2c3d4e5f60718"
+    session_id = f"ws-cap-{owner}-direct-1"
+    driver = LifecycleDriver()
+    driver.quit_release.clear()
+    storage = _tracking_storage(LifecycleStorage(lambda _proxy: driver))
+    storage.create(session_id)
+
+    started = time.monotonic()
+    body, status = ext.handle_capacity_session_cleanup(
+        {"owner": owner}, storage=storage
+    )
+    elapsed = time.monotonic() - started
+    assert status == 200
+    assert elapsed < 0.2
+    assert body["cleanup_scheduled"] is True
+    assert driver.quit_started.wait(timeout=1)
+    assert storage.owner_snapshot(owner)["pending_destroy"] == 1
+    assert session_id not in storage.sessions
+
+    driver.quit_release.set()
+    _wait_until(lambda: storage.owner_snapshot(owner)["pending_destroy"] == 0)
+
+
+def test_capacity_cleanup_waits_for_active_paced_xhr_before_pop_and_quit():
+    owner = "b9b8c7d6e5f40321"
+    session_id = f"ws-cap-{owner}-direct-1"
+    locks = ext._SessionLocks()
+    driver = FakeDriver()
+    driver.collect_release.clear()
+    storage = _tracking_storage(
+        LifecycleStorage(lambda _proxy: driver), execution_locks=locks
+    )
+    storage.create(session_id)
+    request_result = []
+
+    request_thread = threading.Thread(
+        target=lambda: request_result.append(
+            ext.handle_xhr_request(
+                _payload(session=session_id, maxTimeout=5_000),
+                storage=storage,
+                version_getter=lambda: "3.4.6",
+            )
+        )
+    )
+    request_thread.start()
+    assert driver.collect_started.wait(timeout=1)
+
+    body, status = ext.handle_capacity_session_cleanup(
+        {"owner": owner}, storage=storage
+    )
+    assert status == 200
+    assert body["cleanup_scheduled"] is True
+    time.sleep(0.05)
+    assert session_id in storage.sessions
+    assert driver.quit_calls == 0
+
+    driver.collect_release.set()
+    request_thread.join(timeout=2)
+    assert not request_thread.is_alive()
+    assert request_result[0][1] == 200
+    assert driver.quit_started.wait(timeout=1)
+    _wait_until(lambda: session_id not in storage.sessions)
+
+
+def test_ordinary_session_destroy_waits_for_active_paced_xhr_lease():
+    session_id = "ws-direct_flaresolverr-destroy-race"
+    locks = ext._SessionLocks()
+    driver = FakeDriver()
+    driver.collect_release.clear()
+    storage = _tracking_storage(
+        LifecycleStorage(lambda _proxy: driver), execution_locks=locks
+    )
+    storage.create(session_id)
+    request_thread = threading.Thread(
+        target=ext.handle_xhr_request,
+        kwargs={
+            "payload": _payload(session=session_id, maxTimeout=5_000),
+            "storage": storage,
+            "version_getter": lambda: "3.4.6",
+        },
+    )
+    request_thread.start()
+    assert driver.collect_started.wait(timeout=1)
+
+    destroyed = []
+    destroy_thread = threading.Thread(
+        target=lambda: destroyed.append(storage.destroy(session_id))
+    )
+    destroy_thread.start()
+    time.sleep(0.05)
+    assert destroy_thread.is_alive()
+    assert session_id in storage.sessions
+    assert driver.quit_calls == 0
+
+    driver.collect_release.set()
+    request_thread.join(timeout=2)
+    destroy_thread.join(timeout=2)
+    assert not request_thread.is_alive()
+    assert not destroy_thread.is_alive()
+    assert destroyed == [True]
+    assert driver.quit_calls == 1
+
+
+def test_ordinary_force_new_reuses_lifecycle_lock_without_deadlock():
+    session_id = "ws-direct_flaresolverr-force-new"
+    locks = ext._SessionLocks()
+    old_driver = FakeDriver()
+    new_driver = FakeDriver()
+    drivers = iter([old_driver, new_driver])
+    storage = _tracking_storage(
+        LifecycleStorage(lambda _proxy: next(drivers)), execution_locks=locks
+    )
+    old_session, fresh = storage.create(session_id)
+    assert fresh is True
+    result = []
+
+    thread = threading.Thread(
+        target=lambda: result.append(storage.create(session_id, force_new=True))
+    )
+    thread.start()
+    thread.join(timeout=1)
+
+    assert not thread.is_alive()
+    new_session, fresh = result[0]
+    assert fresh is True
+    assert new_session is not old_session
+    assert old_driver.quit_calls == 1
+    assert storage.sessions[session_id] is new_session
+
+
+def test_capacity_failed_destroy_increments_generation_and_retries_later():
+    owner = "c1b2c3d4e5f60718"
+    session_id = f"ws-cap-{owner}-direct-1"
+    driver = LifecycleDriver([RuntimeError("secret failure"), None])
+    storage = _tracking_storage(LifecycleStorage(lambda _proxy: driver))
+    storage.create(session_id)
+
+    ext.handle_capacity_session_cleanup({"owner": owner}, storage=storage)
+    _wait_until(
+        lambda: (
+            storage.owner_snapshot(owner)["failed_destroy"] == 1
+            and storage.owner_snapshot(owner)["cleanup_scheduled"] is False
+        )
+    )
+    failed = storage.owner_snapshot(owner)
+    assert failed["failure_generation"] == 1
+    assert failed["active"] == 0
+    assert failed["pending_destroy"] == 0
+    assert session_id not in storage.sessions
+
+    ext.handle_capacity_session_cleanup({"owner": owner}, storage=storage)
+    _wait_until(lambda: storage.owner_snapshot(owner)["failed_destroy"] == 0)
+    assert driver.quit_calls == 2
+    assert storage.owner_snapshot(owner)["failure_generation"] == 1
+
+
+def test_cleanup_response_freezes_generation_before_instant_failed_retry(
+    monkeypatch,
+):
+    owner = "c9b8a7d6e5f40321"
+    session_id = f"ws-cap-{owner}-direct-1"
+    driver = LifecycleDriver(
+        [RuntimeError("stale failure"), RuntimeError("instant retry failure"), None]
+    )
+    storage = _tracking_storage(LifecycleStorage(lambda _proxy: driver))
+    storage.create(session_id)
+    with pytest.raises(RuntimeError, match="stale failure"):
+        storage.destroy(session_id)
+    assert storage.owner_snapshot(owner)["failure_generation"] == 1
+
+    class InlineThread:
+        def __init__(self, *, target, args, name, daemon):
+            del name, daemon
+            self.target = target
+            self.args = args
+
+        def start(self):
+            self.target(*self.args)
+
+    monkeypatch.setattr(ext.threading, "Thread", InlineThread)
+
+    baseline, status = ext.handle_capacity_session_cleanup(
+        {"owner": owner}, storage=storage
+    )
+    assert status == 200
+    assert baseline["failure_generation"] == 1
+    assert baseline["failed_destroy"] == 1
+    assert baseline["cleanup_scheduled"] is True
+    # The inline worker already failed, but that new failure was not folded
+    # into the response that triggered it.
+    assert storage.owner_snapshot(owner)["failure_generation"] == 2
+
+    observed, status = ext.handle_capacity_session_cleanup(
+        {"owner": owner}, storage=storage
+    )
+    assert status == 200
+    assert observed["failure_generation"] == 2
+    assert observed["failed_destroy"] == 1
+    assert observed["cleanup_scheduled"] is True
+    assert storage.owner_snapshot(owner)["failed_destroy"] == 0
+
+
+def test_capacity_failed_create_is_retained_as_fail_closed_evidence():
+    owner = "d1b2c3d4e5f60718"
+    session_id = f"ws-cap-{owner}-direct-1"
+
+    def fail_create(_proxy):
+        raise RuntimeError("driver failed")
+
+    storage = _tracking_storage(LifecycleStorage(fail_create))
+    with pytest.raises(RuntimeError, match="driver failed"):
+        storage.create(session_id)
+    assert storage.owner_snapshot(owner) == {
+        "active": 0,
+        "pending_create": 0,
+        "pending_destroy": 0,
+        "failed_create": 1,
+        "failed_destroy": 0,
+        "failure_generation": 1,
+        "cleanup_scheduled": False,
+    }
+
+
+def test_capacity_cleanup_is_exact_owner_isolated():
+    owner = "e1b2c3d4e5f60718"
+    other_owner = "f1b2c3d4e5f60718"
+    own_driver = LifecycleDriver()
+    other_driver = LifecycleDriver()
+    drivers = iter([own_driver, other_driver])
+    storage = _tracking_storage(LifecycleStorage(lambda _proxy: next(drivers)))
+    storage.create(f"ws-cap-{owner}-direct-1")
+    storage.create(f"ws-cap-{other_owner}-direct-1")
+
+    ext.handle_capacity_session_cleanup({"owner": owner}, storage=storage)
+    _wait_until(lambda: storage.owner_snapshot(owner)["active"] == 0)
+
+    assert own_driver.quit_calls == 1
+    assert other_driver.quit_calls == 0
+    assert storage.owner_snapshot(other_owner)["active"] == 1
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        None,
+        {},
+        {"owner": "a" * 15},
+        {"owner": "A" * 16},
+        {"owner": "a" * 33},
+        {"owner": "a" * 16, "extra": True},
+        {"owner": 123},
+    ],
+)
+def test_capacity_cleanup_validation_and_response_are_exact_and_secret_free(payload):
+    body, status = ext.handle_capacity_session_cleanup(
+        payload, storage=_tracking_storage()
+    )
+
+    assert status == 400
+    assert set(body) == ext._CAPACITY_CLEANUP_RESPONSE_FIELDS
+    assert body == {
+        "status": "error",
+        "version": "3.4.6",
+        "extension_sha256": ext.EXTENSION_SHA256,
+        "active": 0,
+        "pending_create": 0,
+        "pending_destroy": 0,
+        "failed_create": 0,
+        "failed_destroy": 0,
+        "failure_generation": 0,
+        "cleanup_scheduled": False,
+    }
+    encoded = json.dumps(body)
+    assert "owner" not in encoded
+    assert "ws-cap" not in encoded
+
+
+def test_capacity_cleanup_quiet_zero_is_accepted_and_scheduled():
+    body, status = ext.handle_capacity_session_cleanup(
+        {"owner": "a1b2c3d4e5f60718"}, storage=_tracking_storage()
+    )
+
+    assert status == 200
+    assert set(body) == ext._CAPACITY_CLEANUP_RESPONSE_FIELDS
+    assert body == {
+        "status": "ok",
+        "version": "3.4.6",
+        "extension_sha256": ext.EXTENSION_SHA256,
+        "active": 0,
+        "pending_create": 0,
+        "pending_destroy": 0,
+        "failed_create": 0,
+        "failed_destroy": 0,
+        "failure_generation": 0,
+        "cleanup_scheduled": True,
+    }
+
+
+def test_capacity_tracking_install_is_source_pinned_and_idempotent(monkeypatch):
+    storage = LifecycleStorage()
+    service = SimpleNamespace(
+        SESSIONS_STORAGE=storage,
+        utils=SimpleNamespace(PLATFORM_VERSION="linux"),
+    )
+    digest = hashlib.sha256(
+        inspect.getsource(LifecycleStorage).encode("utf-8")
+    ).hexdigest()
+    monkeypatch.setattr(ext, "_UPSTREAM_SESSIONS_STORAGE_SHA256", digest)
+
+    installed = ext._install_capacity_session_tracking(service, version="3.4.6")
+    assert installed is service.SESSIONS_STORAGE
+    assert ext._install_capacity_session_tracking(service, version="3.4.6") is installed
+
+    wrong = SimpleNamespace(
+        SESSIONS_STORAGE=LifecycleStorage(),
+        utils=SimpleNamespace(PLATFORM_VERSION="linux"),
+    )
+    monkeypatch.setattr(ext, "_UPSTREAM_SESSIONS_STORAGE_SHA256", "0" * 64)
+    with pytest.raises(ext.CapacitySessionLifecycleError, match="does not match"):
+        ext._install_capacity_session_tracking(wrong, version="3.4.6")
+    with pytest.raises(ext.CapacitySessionLifecycleError, match="Unsupported"):
+        ext._install_capacity_session_tracking(wrong, version="3.5.0")
+
+
+def test_safe_controller_logs_no_session_owner_url_or_proxy_credentials(
+    monkeypatch, caplog
+):
+    owner = "a9b8c7d6e5f40321"
+    session_id = f"ws-cap-{owner}-direct-secret"
+    source_url = 'https://www.whoscored.com/secret-source?token=quoted")\\source-tail'
+    proxy_url = 'http://proxy.internal:8080/path?token=quoted")\\proxy-tail'
+    proxy_user = 'unique"proxy\\user'
+    proxy_password = "p'ass\"\\word"
+
+    def handler(req):
+        values = (
+            req.session,
+            req.url,
+            req.proxy["url"],
+            req.proxy["username"],
+            req.proxy["password"],
+        )
+        for level in (logging.DEBUG, logging.INFO, logging.WARNING, logging.ERROR):
+            logging.log(level, "unsafe %s %s %s %s %s", *values)
+        logging.error(
+            "unsafe json %s",
+            json.dumps(
+                {
+                    "session": req.session,
+                    "url": req.url,
+                    "proxy": req.proxy,
+                }
+            ),
+        )
+        logging.error("unsafe repr %r", {"values": values})
+        json_document = json.dumps(
+            {"password": req.proxy["password"]}, ensure_ascii=True
+        )
+        logging.error("unsafe nested repr %r", json_document)
+        logging.error("unsafe nested bytes %r", json_document.encode("utf-8"))
+        try:
+            raise RuntimeError(" ".join(values))
+        except RuntimeError:
+            logging.exception("unsafe exception %s", req.url)
+        return FakeV1Response({})
+
+    service = SimpleNamespace(
+        controller_v1_endpoint=_stock_controller_v1,
+        _controller_v1_handler=handler,
+        V1ResponseBase=FakeV1Response,
+        STATUS_ERROR="error",
+        utils=SimpleNamespace(get_flaresolverr_version=lambda: "3.4.6"),
+    )
+    digest = hashlib.sha256(
+        inspect.getsource(service.controller_v1_endpoint).encode("utf-8")
+    ).hexdigest()
+    monkeypatch.setattr(ext, "_UPSTREAM_CONTROLLER_V1_SHA256", digest)
+    old_factory = logging.getLogRecordFactory()
+    try:
+        ext._install_safe_logging()
+        ext._install_safe_v1_controller(service, version="3.4.6")
+        with caplog.at_level(logging.DEBUG):
+            service.controller_v1_endpoint(
+                SimpleNamespace(
+                    session=session_id,
+                    url=source_url,
+                    proxy={
+                        "url": proxy_url,
+                        "username": proxy_user,
+                        "password": proxy_password,
+                    },
+                )
+            )
+        logs = "\n".join(record.getMessage() for record in caplog.records)
+        for secret in (
+            session_id,
+            owner,
+            source_url,
+            proxy_url,
+            proxy_user,
+            proxy_password,
+        ):
+            for variant in ext._sensitive_log_variants(secret):
+                assert variant not in logs
+        assert "POST /v1 body" not in logs
+        assert ext._SENSITIVE_LOG_VALUES.snapshot() == ()
+    finally:
+        logging.setLogRecordFactory(old_factory)
+
+
+def test_fixed_log_redaction_does_not_need_per_request_url_or_ws_registry():
+    session_id = "ws-cap-1234567890abcdef-direct-never-registered"
+    source_url = (
+        'https://www.whoscored.com/path?secret=value")\\still-secret-after-quote'
+    )
+
+    redacted = ext._redact_log_text(f"session={session_id} url={source_url}")
+
+    assert session_id not in redacted
+    assert source_url not in redacted
+    assert "never-registered" not in redacted
+    assert "secret=value" not in redacted
+    assert "still-secret-after-quote" not in redacted
+
+
+def test_sensitive_variants_cover_nested_json_repr_and_bytes_with_fixed_bound():
+    secret = "p'ass\"\\word"
+    json_inner = json.dumps(secret, ensure_ascii=True)[1:-1]
+    variants = ext._sensitive_log_variants(secret)
+
+    assert secret in variants
+    assert json_inner in variants
+    assert repr(json_inner) in variants
+    assert repr(json_inner)[1:-1] in variants
+    assert repr(json_inner.encode("utf-8")) in variants
+    assert repr(json_inner.encode("utf-8"))[2:-1] in variants
+    assert len(variants) <= ext._MAX_SENSITIVE_VARIANTS_PER_VALUE == 64
+
+    document = json.dumps({"password": secret}, ensure_ascii=True)
+    registry = ext._SensitiveLogValues()
+    with registry.scope(secret):
+        assert secret not in registry.redact(repr(document))
+        assert secret not in registry.redact(repr(document.encode("utf-8")))
+        assert "p\\'ass" not in registry.redact(repr(document))
+        assert "p\\'ass" not in registry.redact(repr(document.encode("utf-8")))
+    assert registry.snapshot() == ()
+
+
+def test_sensitive_log_scope_refcounts_concurrent_requests_and_removes_values():
+    registry = ext._SensitiveLogValues()
+    secret = 'same"secret\\for-both'
+    entered = [threading.Event(), threading.Event()]
+    release = [threading.Event(), threading.Event()]
+
+    def hold_scope(index):
+        with registry.scope(secret):
+            entered[index].set()
+            assert release[index].wait(timeout=2)
+
+    threads = [threading.Thread(target=hold_scope, args=(index,)) for index in range(2)]
+    for thread in threads:
+        thread.start()
+    assert all(event.wait(timeout=1) for event in entered)
+    assert ext._sensitive_log_variants(secret) <= set(registry.snapshot())
+
+    release[0].set()
+    threads[0].join(timeout=1)
+    assert not threads[0].is_alive()
+    assert ext._sensitive_log_variants(secret) <= set(registry.snapshot())
+
+    release[1].set()
+    threads[1].join(timeout=1)
+    assert not threads[1].is_alive()
+    assert registry.snapshot() == ()
+
+    with pytest.raises(RuntimeError):
+        with registry.scope(secret):
+            raise RuntimeError("stop")
+    assert registry.snapshot() == ()
 
 
 @pytest.mark.parametrize(
@@ -335,10 +1088,9 @@ def test_main_installs_media_patch_before_upstream_browser_self_test():
     [
         BASE_URL,
         "https://www.whoscored.com/stagestatfeed/23752/stageteams/?type=2",
-        "https://www.whoscored.com/stageplayerstatfeed/23752/playerstats/?page=1",
     ],
 )
-def test_url_allowlist_accepts_only_three_structured_feed_prefixes(url):
+def test_url_allowlist_accepts_only_active_structured_feed_prefixes(url):
     assert ext._validate_whoscored_feed_url(url) == url
 
 
@@ -360,6 +1112,7 @@ def test_url_allowlist_accepts_only_three_structured_feed_prefixes(url):
         "https://www.whoscored.com/statisticsfeed/1/arbitrary",
         "https://www.whoscored.com/stagestatfeed/0/stageteams/?type=2",
         "https://www.whoscored.com/stagestatfeed/23752/other/?type=2",
+        "https://www.whoscored.com/stageplayerstatfeed/23752/playerstats/?page=1",
         "https://www.whoscored.com/stageplayerstatfeed/x/playerstats/?page=1",
         "https://www.whoscored.com\\@evil.test/statisticsfeed/1/x",
         "https://www.whoscored.com/statisticsfeed/1/x\nHost:evil.test",
@@ -381,6 +1134,9 @@ def test_url_allowlist_rejects_other_origins_ports_credentials_and_paths(url):
         ("cookies", [{"name": "x", "value": "y"}]),
         ("credentials", "omit"),
         ("maxResponseBytes", 999_999_999),
+        ("minimumStartIntervalMs", 0),
+        ("startNotBeforeEpochMs", 0),
+        ("executionMarginMs", 0),
     ],
 )
 def test_payload_rejects_every_request_controlled_browser_option(field, value):
@@ -398,6 +1154,9 @@ def test_payload_rejects_every_request_controlled_browser_option(field, value):
         ("proxy", {"url": "http://paid-proxy"}),
         ("cookies", [{"name": "x", "value": "y"}]),
         ("maxResponseBytes", 999_999_999),
+        ("minimumStartIntervalMs", 0),
+        ("startNotBeforeEpochMs", 0),
+        ("executionMarginMs", 0),
     ],
 )
 def test_batch_payload_rejects_every_request_controlled_browser_option(field, value):
@@ -451,8 +1210,12 @@ def test_fixed_script_enforces_method_headers_credentials_origin_and_size():
     assert 'cache: "no-store"' not in script
     assert "get(?:team|player)statistics" in script
     assert "stagestatfeed\\/[1-9][0-9]*\\/stageteams" in script
-    assert "stageplayerstatfeed\\/[1-9][0-9]*\\/playerstats" in script
+    assert "stageplayerstatfeed" not in script
     assert "response_too_large" in script
+    assert "deadlineEpochMs - Date.now() < minimumExecutionMarginMs" in script
+    assert "responsePromise = fetch(requested.href" in script
+    assert "startNotBeforeEpochMs" not in script
+    assert "minimumStartIntervalMs" not in script
     assert "eval(" not in script
     assert "new Function" not in script
     assert BASE_URL not in script
@@ -460,6 +1223,7 @@ def test_fixed_script_enforces_method_headers_credentials_origin_and_size():
 
 def test_fixed_batch_script_has_server_side_security_and_resource_limits():
     script = ext.BATCH_XHR_SCRIPT
+    assert script == ext.XHR_SCRIPT
     assert ext.MAX_BATCH_URLS == MAX_XHR_BATCH_URLS == 8
     assert ext.BATCH_CONCURRENCY == STRUCTURED_REQUEST_BURST_SIZE == 4
     assert ext.MAX_RESPONSE_BYTES == 4 * 1024 * 1024
@@ -470,20 +1234,209 @@ def test_fixed_batch_script_has_server_side_security_and_resource_limits():
     assert 'redirect: "error"' in script
     assert 'redirect: "follow"' not in script
     assert '"Model-last-Mode": siteConfig.gSiteHeaderValue' in script
-    assert "Math.min(concurrency, targetUrls.length)" in script
     assert "maxBytesPerResponse" in script
     assert "maxAggregateBytes" in script
-    assert "let consumedBytes = 0" in script
-    assert "let successBytes = 0" in script
-    assert "consumedBytes += item.value.byteLength" in script
-    assert "consumedBytes -=" not in script
-    assert 'kind: "aggregate_too_large"' in script
+    assert "consumedBytes: 0" in script
+    assert "operation.consumedBytes += item.value.byteLength" in script
+    assert "operation.consumedBytes -=" not in script
+    assert 'failure("aggregate_too_large")' not in script
+    assert 'kind: "aggregate_too_large"' in ext.XHR_COLLECT_SCRIPT
     assert (
-        "for (const activeController of controllers) activeController.abort()" in script
+        "for (const activeController of operation.controllers)" in script
+    )
+    assert "range(0, len(request_data.urls), BATCH_CONCURRENCY)" in inspect.getsource(
+        ext._execute_browser_batch_fetch
     )
     assert "eval(" not in script
     assert "new Function" not in script
     assert BASE_URL not in script
+
+
+class FakeMonotonicClock:
+    def __init__(self, now):
+        self.now = now
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+def test_process_wide_xhr_pacer_has_one_immediate_start_and_no_burst_credit():
+    clock = FakeMonotonicClock(10.0)
+    pacer = ext._XhrStartPacer(monotonic=clock.monotonic, sleep=clock.sleep)
+    starts = []
+
+    def start():
+        starts.append(clock.monotonic())
+        return len(starts)
+
+    assert pacer.launch(deadline=20.0, starter=start) == 1
+    assert pacer.launch(deadline=20.0, starter=start) == 2
+    clock.now = 100.0
+    assert pacer.launch(deadline=110.0, starter=start) == 3
+    assert pacer.launch(deadline=110.0, starter=start) == 4
+
+    assert starts == [10.0, 10.546, 100.0, 100.546]
+
+
+def test_process_wide_xhr_pacer_arbitrates_delayed_independent_commands():
+    interval_ms = 25
+    pacer = ext._XhrStartPacer(
+        interval_ms=interval_ms,
+        execution_margin_ms=10,
+    )
+    actual_starts = []
+    guard = threading.Lock()
+
+    def delayed_command(delay):
+        def start():
+            time.sleep(delay)
+            with guard:
+                actual_starts.append(time.monotonic())
+            # Keep the command in flight after its real fetch invocation.
+            time.sleep(delay)
+
+        pacer.launch(deadline=time.monotonic() + 2, starter=start)
+
+    threads = [
+        threading.Thread(target=delayed_command, args=(0.06,)),
+        threading.Thread(target=delayed_command, args=(0.01,)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+
+    ordered = sorted(actual_starts)
+    assert len(ordered) == 2
+    assert ordered[1] - ordered[0] >= (interval_ms / 1_000.0)
+
+
+def test_process_wide_xhr_pacer_rejects_deadline_without_starting_or_consuming():
+    clock = FakeMonotonicClock(30.0)
+    pacer = ext._XhrStartPacer(monotonic=clock.monotonic, sleep=clock.sleep)
+    starts = []
+
+    def starter():
+        starts.append(clock.monotonic())
+
+    pacer.launch(deadline=40.0, starter=starter)
+
+    with pytest.raises(ext.XhrEndpointError, match="global WhoScored source pace"):
+        pacer.launch(deadline=30.9, starter=starter)
+
+    assert starts == [30.0]
+    pacer.launch(deadline=32.0, starter=starter)
+    assert starts == [30.0, 30.546]
+
+
+@pytest.mark.parametrize("interval", [True, 0, -1, 1.5])
+def test_process_wide_xhr_pacer_rejects_invalid_fixed_policy(interval):
+    with pytest.raises(ValueError):
+        ext._XhrStartPacer(interval_ms=interval)
+
+
+@pytest.mark.parametrize("margin", [True, 0, -1, 1.5])
+def test_process_wide_xhr_pacer_rejects_invalid_execution_margin(margin):
+    with pytest.raises(ValueError):
+        ext._XhrStartPacer(execution_margin_ms=margin)
+
+
+def test_delayed_independent_single_and_batch_commands_cannot_burst():
+    interval_ms = 35
+    pacer = ext._XhrStartPacer(
+        interval_ms=interval_ms,
+        execution_margin_ms=10,
+    )
+    locks = ext._SessionLocks()
+    single_session = "ws-direct_flaresolverr-independent-single"
+    batch_session = "ws-direct_flaresolverr-independent-batch"
+    single_driver = FakeDriver(launch_delay=0.08)
+    batch_driver = FakeDriver(launch_delay=0.03)
+    storage = FakeStorage(
+        {
+            single_session: SimpleNamespace(driver=single_driver),
+            batch_session: SimpleNamespace(driver=batch_driver),
+        }
+    )
+    responses = []
+
+    threads = [
+        threading.Thread(
+            target=lambda: responses.append(
+                ext.handle_xhr_request(
+                    _payload(session=single_session, maxTimeout=5_000),
+                    storage=storage,
+                    version_getter=lambda: "3.4.6",
+                    locks=locks,
+                    pacer=pacer,
+                )
+            )
+        ),
+        threading.Thread(
+            target=lambda: responses.append(
+                ext.handle_xhr_batch_request(
+                    _batch_payload(session=batch_session, maxTimeout=5_000),
+                    storage=storage,
+                    version_getter=lambda: "3.4.6",
+                    locks=locks,
+                    pacer=pacer,
+                )
+            )
+        ),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+
+    assert len(responses) == 2
+    assert all(status == 200 for _body, status in responses)
+    actual_starts = sorted(single_driver.actual_starts + batch_driver.actual_starts)
+    assert len(actual_starts) == 2
+    assert actual_starts[1] - actual_starts[0] >= interval_ms / 1_000.0
+
+
+def test_deadline_without_safe_execution_margin_is_504_before_browser_start():
+    pacer = ext._XhrStartPacer()
+    locks = ext._SessionLocks()
+    first_session = "ws-direct_flaresolverr-deadline-first"
+    late_session = "ws-direct_flaresolverr-deadline-late"
+    first_driver = FakeDriver()
+    late_driver = FakeDriver()
+    storage = FakeStorage(
+        {
+            first_session: SimpleNamespace(driver=first_driver),
+            late_session: SimpleNamespace(driver=late_driver),
+        }
+    )
+
+    first_body, first_status = ext.handle_xhr_request(
+        _payload(session=first_session, maxTimeout=5_000),
+        storage=storage,
+        version_getter=lambda: "3.4.6",
+        locks=locks,
+        pacer=pacer,
+    )
+    late_body, late_status = ext.handle_xhr_request(
+        _payload(session=late_session, maxTimeout=1_000),
+        storage=storage,
+        version_getter=lambda: "3.4.6",
+        locks=locks,
+        pacer=pacer,
+    )
+
+    assert first_status == 200
+    assert first_body["status"] == "ok"
+    assert late_status == 504
+    assert late_body["status"] == "error"
+    assert "global WhoScored source pace" in late_body["message"]
+    assert late_driver.launch_calls == []
+    assert late_driver.actual_starts == []
 
 
 def test_success_uses_existing_session_and_returns_exact_client_contract():
@@ -513,11 +1466,25 @@ def test_success_uses_existing_session_and_returns_exact_client_contract():
     assert body["solution"]["status"] == 200
     assert storage.get_called is False
     assert len(driver.execute_calls) == 1
-    script, url, response_limit, timeout_ms = driver.execute_calls[0]
+    (
+        script,
+        url,
+        response_limit,
+        aggregate_limit,
+        deadline_epoch_ms,
+        execution_margin_ms,
+        operation_key,
+        item_index,
+    ) = driver.launch_calls[0]
     assert script == ext.XHR_SCRIPT
     assert url == BASE_URL
     assert response_limit == 4 * 1024 * 1024
-    assert 0 < timeout_ms <= 30_000
+    assert aggregate_limit == response_limit
+    assert deadline_epoch_ms > int(time.time() * 1_000)
+    assert execution_margin_ms == ext.XHR_MIN_EXECUTION_MARGIN_MS == 500
+    assert operation_key.startswith("xhr-")
+    assert item_index == 0
+    assert driver.execute_calls[0][0] == ext.XHR_COLLECT_SCRIPT
     assert driver.timeout_calls[-1] == 17.0
 
 
@@ -554,15 +1521,15 @@ def test_batch_returns_successes_and_sanitised_runtime_item_errors_in_order():
         "requestedUrl": second_url,
         "kind": "fetch_failed",
     }
-    script, urls, per_item_limit, aggregate_limit, timeout_ms, concurrency = (
-        driver.execute_calls[0]
-    )
-    assert script == ext.BATCH_XHR_SCRIPT
-    assert urls == [BASE_URL, second_url]
-    assert per_item_limit == 4 * 1024 * 1024
-    assert aggregate_limit == 8 * 1024 * 1024
-    assert 0 < timeout_ms <= 30_000
-    assert concurrency == 4
+    assert len(driver.launch_calls) == 2
+    assert [call[1] for call in driver.launch_calls] == [BASE_URL, second_url]
+    assert all(call[0] == ext.BATCH_XHR_SCRIPT for call in driver.launch_calls)
+    assert all(call[2] == 4 * 1024 * 1024 for call in driver.launch_calls)
+    assert all(call[3] == 8 * 1024 * 1024 for call in driver.launch_calls)
+    assert [call[-1] for call in driver.launch_calls] == [0, 1]
+    assert driver.actual_starts[1] - driver.actual_starts[0] >= 0.54
+    assert driver.execute_calls[0][0] == ext.XHR_COLLECT_SCRIPT
+    assert driver.execute_calls[0][2] == [0, 1]
 
 
 @pytest.mark.parametrize(
@@ -597,10 +1564,10 @@ def test_batch_aggregate_limit_is_global_monotonic_and_exposes_no_bodies():
     """Eight failed items cannot each consume a fresh per-item allowance."""
 
     script = ext.BATCH_XHR_SCRIPT
-    assert "consumedBytes += item.value.byteLength" in script
+    assert "operation.consumedBytes += item.value.byteLength" in script
     assert "consumedBytes = Math.max" not in script
     assert "aggregateBytes" not in script
-    assert "if (consumedBytes > maxAggregateBytes)" in script
+    assert "if (operation.consumedBytes > maxAggregateBytes)" in script
 
     # Even if a compromised driver includes previously successful bodies, the
     # endpoint maps the global terminal result before inspecting responses.
@@ -630,16 +1597,18 @@ def test_batch_aggregate_limit_is_global_monotonic_and_exposes_no_bodies():
     assert "solution" not in body
 
 
-def test_batch_aggregate_limit_aborts_eight_adversarial_streams_in_node():
+def test_batch_aggregate_limit_aborts_adversarial_wave_in_node():
     """Execute the shipped JS: failed items cannot reset the global byte cap."""
 
     node = shutil.which("node")
     assert node is not None, "Node.js is required for the browser-script safety test"
-    batch_script = json.dumps(ext.BATCH_XHR_SCRIPT)
+    launch_script = json.dumps(ext.BATCH_XHR_SCRIPT)
+    collect_script = json.dumps(ext.XHR_COLLECT_SCRIPT)
     harness = f"""
-const batchScript = {batch_script};
+const launch = new Function({launch_script});
+const collect = new Function({collect_script});
 const MiB = 1024 * 1024;
-const urls = Array.from({{length: 8}}, (_, index) =>
+const urls = Array.from({{length: 4}}, (_, index) =>
   "https://www.whoscored.com/statisticsfeed/1/getteamstatistics?item=" + index
 );
 global.window = {{require: {{config: {{params: {{site: {{
@@ -690,18 +1659,34 @@ global.fetch = async (url, options) => {{
     body: {{getReader: () => reader}}
   }};
 }};
-const execute = new Function(batchScript);
+const operationKey = "xhr-" + "a".repeat(32);
+const deadline = Date.now() + 3000;
+const acknowledgements = urls.map((url, index) => launch(
+  url,
+  4 * MiB,
+  8 * MiB,
+  deadline,
+  {ext.XHR_MIN_EXECUTION_MARGIN_MS},
+  operationKey,
+  index
+));
 const terminal = await new Promise((resolve, reject) => {{
   const timer = setTimeout(
     () => reject(new Error("batch callback timeout")),
     5000
   );
-  execute(urls, 4 * MiB, 8 * MiB, 3000, 4, (result) => {{
-    clearTimeout(timer);
-    resolve(result);
-  }});
+  collect(
+    operationKey,
+    [0, 1, 2, 3],
+    true,
+    (result) => {{
+      clearTimeout(timer);
+      resolve(result);
+    }}
+  );
 }});
 process.stdout.write(JSON.stringify({{
+  acknowledgements,
   terminal,
   observedBytes,
   fetchStarts,
@@ -726,6 +1711,7 @@ process.stdout.write(JSON.stringify({{
         "kind": "aggregate_too_large",
         "error": "aggregate_too_large",
     }
+    assert all(item["ok"] is True for item in observed["acknowledgements"])
     assert "responses" not in observed["terminal"]
     assert ext.MAX_BATCH_RESPONSE_BYTES < observed["observedBytes"]
     assert observed["observedBytes"] <= (
@@ -734,6 +1720,78 @@ process.stdout.write(JSON.stringify({{
     assert observed["fetchStarts"] <= ext.BATCH_CONCURRENCY
     assert observed["maxActiveStreams"] <= ext.BATCH_CONCURRENCY
     assert observed["activeStreams"] == 0
+
+
+def test_shipped_launch_script_starts_synchronously_and_rejects_stale_deadline():
+    """The fixed JS has no stale timer between arbitration and ``fetch``."""
+
+    node = shutil.which("node")
+    assert node is not None, "Node.js is required for the browser pacing test"
+    launch_script = json.dumps(ext.XHR_SCRIPT)
+    abort_script = json.dumps(ext.XHR_ABORT_SCRIPT)
+    harness = f"""
+const launch = new Function({launch_script});
+const abort = new Function({abort_script});
+global.window = {{require: {{config: {{params: {{site: {{
+  gSiteHeaderName: "Model-last-Mode",
+  gSiteHeaderValue: "A".repeat(43) + "="
+}}}}}}}}}};
+const starts = [];
+global.fetch = async (url) => {{
+  starts.push(Date.now());
+  return {{
+    url,
+    status: 200,
+    headers: {{entries: () => []}},
+    body: {{getReader: () => ({{
+      read: async () => ({{done: true}}),
+      releaseLock: () => {{}}
+    }})}}
+  }};
+}};
+const operationKey = "xhr-" + "b".repeat(32);
+const ack = launch(
+  "https://www.whoscored.com/statisticsfeed/1/getteamstatistics?item=0",
+  1024,
+  4096,
+  Date.now() + 2000,
+  {ext.XHR_MIN_EXECUTION_MARGIN_MS},
+  operationKey,
+  0
+);
+const startsAtAck = starts.length;
+const stale = launch(
+  "https://www.whoscored.com/statisticsfeed/1/getteamstatistics?item=1",
+  1024,
+  4096,
+  Date.now() + {ext.XHR_MIN_EXECUTION_MARGIN_MS - 1},
+  {ext.XHR_MIN_EXECUTION_MARGIN_MS},
+  "xhr-" + "c".repeat(32),
+  0
+);
+abort(operationKey);
+process.stdout.write(JSON.stringify({{ack, stale, starts, startsAtAck}}));
+"""
+
+    completed = subprocess.run(
+        [node, "-"],
+        input=harness,
+        text=True,
+        capture_output=True,
+        check=True,
+        timeout=10,
+    )
+    observed = json.loads(completed.stdout)
+
+    assert observed["ack"] == {"ok": True, "started": True, "itemIndex": 0}
+    assert observed["startsAtAck"] == 1
+    assert len(observed["starts"]) == 1
+    assert observed["stale"] == {
+        "ok": False,
+        "started": False,
+        "kind": "timeout",
+        "error": "fetch_timeout",
+    }
 
 
 def test_missing_session_is_404_and_never_created():
@@ -891,6 +1949,7 @@ def test_same_session_browser_calls_are_serialised():
     session_id = _payload()["session"]
     storage = FakeStorage({session_id: SimpleNamespace(driver=driver)})
     locks = ext._SessionLocks()
+    pacer = ext._XhrStartPacer(interval_ms=5, execution_margin_ms=10)
     results = []
 
     def run_request():
@@ -900,6 +1959,7 @@ def test_same_session_browser_calls_are_serialised():
                 storage=storage,
                 version_getter=lambda: "3.4.6",
                 locks=locks,
+                pacer=pacer,
             )
         )
 

@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import base64
+import json
 from unittest.mock import MagicMock, patch
 
 import pytest
 import requests
 
 from scrapers.base.flaresolverr_client import (
+    _MAX_SENSITIVE_VARIANTS_PER_VALUE,
+    _escaped_sensitive_variants,
     FlareSolverrCFChallengeFailed,
     FlareSolverrClient,
     FlareSolverrError,
@@ -73,6 +76,21 @@ def _ok_solution_payload() -> dict:
 # -----------------------------------------------------------------------------
 @pytest.mark.unit
 class TestFlareSolverrGet:
+    def test_sensitive_variants_cover_nested_json_repr_and_bytes_with_fixed_bound(
+        self,
+    ):
+        secret = "p'ass\"\\word"
+        json_inner = json.dumps(secret, ensure_ascii=True)[1:-1]
+        variants = _escaped_sensitive_variants(secret)
+
+        assert secret in variants
+        assert json_inner in variants
+        assert repr(json_inner) in variants
+        assert repr(json_inner)[1:-1] in variants
+        assert repr(json_inner.encode("utf-8")) in variants
+        assert repr(json_inner.encode("utf-8"))[2:-1] in variants
+        assert len(variants) <= _MAX_SENSITIVE_VARIANTS_PER_VALUE == 64
+
     def test_get_happy_path(self):
         client = FlareSolverrClient(url="http://fs:8191")
         with patch.object(client, "session", new=MagicMock()) as sess:
@@ -121,6 +139,137 @@ class TestFlareSolverrGet:
         assert retries.total == 2
         assert retries.allowed_methods == frozenset({"GET"})
         assert client.session.trust_env is False
+
+    def test_debug_log_identifies_operation_without_endpoint_url(self, caplog):
+        endpoint_base = "http://endpoint-user:endpoint-secret@fs.internal:8191"
+        client = FlareSolverrClient(url=endpoint_base)
+        with patch.object(client, "session", new=MagicMock()) as sess:
+            sess.post.return_value = _ok_response(
+                {"status": "ok", "sessions": []}
+            )
+            with caplog.at_level("DEBUG"):
+                assert client.list_sessions() == []
+
+        assert endpoint_base not in caplog.text
+        assert "endpoint-secret" not in caplog.text
+        assert "endpoint_type=api" in caplog.text
+        assert "cmd=sessions.list" in caplog.text
+
+    def test_transport_error_redacts_endpoint_source_and_session_without_context(
+        self, caplog
+    ):
+        endpoint_base = "http://endpoint-user:endpoint-secret@fs.internal:8191"
+        source_url = 'https://source.invalid/a"quoted\\path?token=source-secret'
+        session_id = "ws-cap-a1b2c3d4e5f60718-direct-0123456789"
+        endpoint = f"{endpoint_base}/v1"
+        failure = requests.exceptions.ConnectionError(
+            f"failed endpoint={endpoint!r} source={source_url!r} session={session_id}"
+        )
+        client = FlareSolverrClient(url=endpoint_base)
+        with patch.object(client, "session", new=MagicMock()) as sess:
+            sess.post.side_effect = failure
+            with caplog.at_level("WARNING"):
+                with pytest.raises(FlareSolverrTimeout) as raised:
+                    client.get(source_url, session_id)
+
+        diagnostic = caplog.text + str(raised.value)
+        for sensitive in (
+            endpoint_base,
+            endpoint,
+            "endpoint-secret",
+            source_url,
+            repr(source_url)[1:-1],
+            "source-secret",
+            session_id,
+        ):
+            assert sensitive not in diagnostic
+        assert "error_type=ConnectionError" in caplog.text
+        assert "cmd=request.get" in caplog.text
+        assert raised.value.__cause__ is None
+        assert raised.value.__context__ is None
+        assert raised.value.__suppress_context__ is True
+
+    def test_batch_transport_error_redacts_every_source_url(self, caplog):
+        urls = [
+            "https://source.invalid/one?token=batch-secret-one",
+            'https://source.invalid/two"quoted\\path?token=batch-secret-two',
+        ]
+        session_id = "ws-cap-a1b2c3d4e5f60718-direct-0123456789"
+        client = FlareSolverrClient(url="http://private-fs.invalid:8191")
+        with patch.object(client, "session", new=MagicMock()) as sess:
+            sess.post.side_effect = requests.exceptions.RequestException(
+                f"batch failed: {urls!r}"
+            )
+            with caplog.at_level("WARNING"):
+                with pytest.raises(FlareSolverrError) as raised:
+                    client.xhr_get_many(urls, session_id)
+
+        diagnostic = caplog.text + str(raised.value)
+        for url in urls:
+            assert url not in diagnostic
+            assert repr(url)[1:-1] not in diagnostic
+        assert "batch-secret-one" not in diagnostic
+        assert "batch-secret-two" not in diagnostic
+        assert "endpoint_type=xhr_batch" in caplog.text
+        assert "error_type=RequestException" in caplog.text
+        assert raised.value.__cause__ is None
+        assert raised.value.__context__ is None
+
+    @pytest.mark.parametrize("as_bytes", [False, True])
+    def test_transport_error_redacts_repr_of_json_document_and_bytes(
+        self, caplog, as_bytes
+    ):
+        secret = "p'ass\"\\word"
+        payload = {
+            "cmd": "sessions.create",
+            "session": "ws-cap-a1b2c3d4e5f60718-direct-nested",
+            "proxy": {
+                "url": "http://proxy_filter:8900",
+                "username": "lease",
+                "password": secret,
+            },
+        }
+        document = json.dumps(payload, ensure_ascii=True)
+        rendered = repr(document.encode("utf-8") if as_bytes else document)
+        client = FlareSolverrClient()
+        with patch.object(client, "session", new=MagicMock()) as sess:
+            sess.post.side_effect = requests.exceptions.ConnectionError(
+                f"nested diagnostic={rendered}"
+            )
+            with caplog.at_level("WARNING"):
+                with pytest.raises(FlareSolverrTimeout) as raised:
+                    client._post(payload)
+
+        diagnostic = caplog.text + str(raised.value)
+        assert secret not in diagnostic
+        assert "p\\'ass" not in diagnostic
+        for variant in _escaped_sensitive_variants(secret):
+            assert variant not in diagnostic
+        assert raised.value.__cause__ is None
+        assert raised.value.__context__ is None
+
+    def test_non_json_error_redacts_values_and_drops_decoder_context(self):
+        endpoint_base = "http://private-fs.invalid:8191"
+        source_url = "https://source.invalid/page?token=non-json-secret"
+        session_id = "ws-cap-a1b2c3d4e5f60718-direct-0123456789"
+        response = _ok_response({"status": "ok"})
+        response.json.side_effect = ValueError(
+            f"invalid response for {endpoint_base}/v1 {source_url} {session_id}"
+        )
+        client = FlareSolverrClient(url=endpoint_base)
+        with patch.object(client, "session", new=MagicMock()) as sess:
+            sess.post.return_value = response
+            with pytest.raises(FlareSolverrError) as raised:
+                client.get(source_url, session_id)
+
+        diagnostic = str(raised.value)
+        assert endpoint_base not in diagnostic
+        assert source_url not in diagnostic
+        assert "non-json-secret" not in diagnostic
+        assert session_id not in diagnostic
+        assert "ValueError" in diagnostic
+        assert raised.value.__cause__ is None
+        assert raised.value.__context__ is None
 
     def test_xhr_get_uses_restricted_endpoint_and_decodes_exact_body(self):
         client = FlareSolverrClient(url="http://fs:8191")
@@ -273,6 +422,55 @@ class TestFlareSolverrGet:
             with pytest.raises(FlareSolverrCFChallengeFailed):
                 client.get("https://x.com", "s1")
 
+    @pytest.mark.parametrize("status_code", [200, 500])
+    def test_generic_error_solving_challenge_is_not_cf(self, caplog, status_code):
+        client = FlareSolverrClient()
+        source_url = (
+            "https://source.invalid/cloudflare-status?token=internal-secret"
+        )
+        session_id = "ws-cap-a1b2c3d4e5f60718-turnstile-internal"
+        payload = {
+            "status": "error",
+            "message": (
+                "Error: Error solving the challenge. WebDriver failed for "
+                f"{source_url} in {session_id}"
+            ),
+        }
+        response = _ok_response(payload, status_code=status_code)
+        response.text = json.dumps(payload)
+
+        with patch.object(client, "session", new=MagicMock()) as sess:
+            sess.post.return_value = response
+            with caplog.at_level("WARNING"):
+                with pytest.raises(FlareSolverrError) as raised:
+                    client.get(source_url, session_id)
+
+        assert not isinstance(raised.value, FlareSolverrCFChallengeFailed)
+        assert client.get_traffic_stats()["cf_challenge_failures"] == 0
+        diagnostic = caplog.text + str(raised.value)
+        assert source_url not in diagnostic
+        assert "internal-secret" not in diagnostic
+        assert session_id not in diagnostic
+
+    @pytest.mark.parametrize(
+        ("status_code", "message"),
+        [
+            (500, "Cloudflare has blocked this request"),
+            (503, "Turnstile verification failed"),
+        ],
+    )
+    def test_http_error_keeps_explicit_cf_evidence(self, status_code, message):
+        client = FlareSolverrClient()
+        response = _ok_response({}, status_code=status_code)
+        response.text = json.dumps({"status": "error", "message": message})
+
+        with patch.object(client, "session", new=MagicMock()) as sess:
+            sess.post.return_value = response
+            with pytest.raises(FlareSolverrCFChallengeFailed):
+                client.get("https://x.com", "s1")
+
+        assert client.get_traffic_stats()["cf_challenge_failures"] == 1
+
     def test_get_raises_generic_error(self):
         client = FlareSolverrClient()
         with patch.object(client, "session", new=MagicMock()) as sess:
@@ -409,15 +607,153 @@ class TestFlareSolverrSessions:
 
     def test_create_session_log_never_contains_proxy_credentials(self, caplog):
         client = FlareSolverrClient()
+        session_id = "ws-cap-a1b2c3d4e5f60718-direct-0123456789"
         with patch.object(client, "session", new=MagicMock()) as sess:
             sess.post.return_value = _ok_response({"status": "ok"})
             with caplog.at_level("INFO"):
                 client.create_session(
-                    "id", proxy_url="http://lease:top-secret@proxy_filter:8900"
+                    session_id,
+                    proxy_url="http://lease:top-secret@proxy_filter:8900",
                 )
 
+        assert session_id not in caplog.text
         assert "top-secret" not in caplog.text
         assert "ad-tech filter" in caplog.text
+
+    def test_create_error_redacts_echoed_session_and_proxy_values(self, caplog):
+        endpoint_base = "http://endpoint-user:endpoint-secret@fs.internal:8191"
+        endpoint = f"{endpoint_base}/v1"
+        client = FlareSolverrClient(url=endpoint_base)
+        session_id = "ws-cap-a1b2c3d4e5f60718-direct-0123456789"
+        secret = "top-secret"
+        proxy_url = "http://proxy_filter:8900"
+        with patch.object(client, "session", new=MagicMock()) as sess:
+            sess.post.return_value = _ok_response(
+                {
+                    "status": "error",
+                    "message": (
+                        f"failed {session_id} at {endpoint} through {proxy_url} "
+                        f"with user lease and password {secret}"
+                    ),
+                }
+            )
+            with caplog.at_level("WARNING"):
+                with pytest.raises(FlareSolverrError) as raised:
+                    client.create_session(
+                        session_id,
+                        proxy_url=f"http://lease:{secret}@proxy_filter:8900",
+                    )
+
+        assert session_id not in caplog.text
+        assert endpoint_base not in caplog.text
+        assert "endpoint-secret" not in caplog.text
+        assert proxy_url not in caplog.text
+        assert "lease" not in caplog.text
+        assert secret not in caplog.text
+        assert session_id not in str(raised.value)
+        assert endpoint_base not in str(raised.value)
+        assert proxy_url not in str(raised.value)
+        assert "lease" not in str(raised.value)
+        assert secret not in str(raised.value)
+
+    @pytest.mark.parametrize("rendering", ["json", "repr"])
+    def test_http_error_redacts_escaped_credential_before_truncation(
+        self, caplog, rendering
+    ):
+        client = FlareSolverrClient()
+        session_id = "ws-cap-a1b2c3d4e5f60718-direct-0123456789"
+        secret = 'BOUNDARY-"quoted\\credential'
+        proxy_url = "http://proxy_filter:8900"
+        encoded_proxy_url = (
+            "http://lease:BOUNDARY-%22quoted%5Ccredential@proxy_filter:8900"
+        )
+        rendered_secret = (
+            json.dumps(secret)[1:-1]
+            if rendering == "json"
+            else repr(secret)[1:-1]
+        )
+        response = _ok_response({"status": "error"}, status_code=500)
+        # The old implementation truncated here first and leaked "BOUND" from
+        # a sensitive value spanning its 300-character boundary.
+        response.text = (
+            "x" * 294
+            + rendered_secret
+            + f" {session_id} {proxy_url} lease"
+        )
+        with patch.object(client, "session", new=MagicMock()) as sess:
+            sess.post.return_value = response
+            with caplog.at_level("WARNING"):
+                with pytest.raises(FlareSolverrError) as raised:
+                    client.create_session(session_id, proxy_url=encoded_proxy_url)
+
+        diagnostic = caplog.text + str(raised.value)
+        assert "BOUND" not in diagnostic
+        assert secret not in diagnostic
+        assert json.dumps(secret)[1:-1] not in diagnostic
+        assert repr(secret)[1:-1] not in diagnostic
+        assert session_id not in diagnostic
+        assert proxy_url not in diagnostic
+        assert "HTTP 500" in diagnostic
+        assert "cmd=sessions.create" in caplog.text
+
+    @pytest.mark.parametrize("as_bytes", [False, True])
+    def test_http_body_redacts_nested_repr_before_truncation(
+        self, caplog, as_bytes
+    ):
+        secret = "p'ass\"\\word"
+        payload = {
+            "cmd": "sessions.create",
+            "session": "ws-cap-a1b2c3d4e5f60718-direct-nested",
+            "proxy": {
+                "url": "http://proxy_filter:8900",
+                "username": "lease",
+                "password": secret,
+            },
+        }
+        json_secret = json.dumps(secret, ensure_ascii=True)
+        nested = repr(json_secret.encode("utf-8") if as_bytes else json_secret)
+        response = _ok_response({"status": "error"}, status_code=500)
+        # The nested secret straddles the 300-character diagnostic boundary.
+        # Redaction must happen on the complete body before slicing it.
+        response.text = "x" * 280 + nested + "tail" * 100
+        client = FlareSolverrClient()
+        with patch.object(client, "session", new=MagicMock()) as sess:
+            sess.post.return_value = response
+            with caplog.at_level("WARNING"):
+                with pytest.raises(FlareSolverrError) as raised:
+                    client._post(payload)
+
+        diagnostic = caplog.text + str(raised.value)
+        assert secret not in diagnostic
+        assert "p\\'ass" not in diagnostic
+        for variant in _escaped_sensitive_variants(secret):
+            assert variant not in diagnostic
+        assert "HTTP 500" in diagnostic
+
+    def test_create_transport_error_suppresses_sensitive_cause(self, caplog):
+        client = FlareSolverrClient()
+        session_id = "ws-cap-a1b2c3d4e5f60718-direct-0123456789"
+        with patch.object(client, "session", new=MagicMock()) as sess:
+            sess.post.side_effect = requests.exceptions.ConnectionError(session_id)
+            with caplog.at_level("WARNING"):
+                with pytest.raises(FlareSolverrTimeout) as raised:
+                    client.create_session(session_id)
+
+        assert session_id not in caplog.text
+        assert session_id not in str(raised.value)
+        assert raised.value.__suppress_context__ is True
+        assert raised.value.__cause__ is None
+        assert raised.value.__context__ is None
+
+    def test_destroy_session_log_never_contains_session_id(self, caplog):
+        client = FlareSolverrClient()
+        session_id = "ws-cap-a1b2c3d4e5f60718-direct-0123456789"
+        with patch.object(client, "session", new=MagicMock()) as sess:
+            sess.post.return_value = _ok_response({"status": "ok"})
+            with caplog.at_level("INFO"):
+                client.destroy_session(session_id)
+
+        assert session_id not in caplog.text
 
     def test_destroy_session_idempotent(self):
         client = FlareSolverrClient()
@@ -480,6 +816,22 @@ class TestFlareSolverrHealth:
 # -----------------------------------------------------------------------------
 @pytest.mark.unit
 class TestFlareSolverrContextManager:
+    @pytest.mark.parametrize("method", ["close", "exit"])
+    def test_context_cleanup_log_never_contains_session_id(self, caplog, method):
+        client = FlareSolverrClient()
+        session_id = "ws-cap-a1b2c3d4e5f60718-direct-0123456789"
+        client._auto_session_id = session_id
+        error = RuntimeError(f"could not destroy {session_id}")
+
+        with patch.object(client, "destroy_session", side_effect=error):
+            with caplog.at_level("DEBUG"):
+                if method == "close":
+                    client.close()
+                else:
+                    client.__exit__(None, None, None)
+
+        assert session_id not in caplog.text
+
     def test_context_manager_failed_create_destroys_orphan_and_closes_pool(self):
         client = FlareSolverrClient()
         with patch.object(client, "session", new=MagicMock()) as sess:
