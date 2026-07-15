@@ -35,7 +35,7 @@ import time
 from collections import Counter
 from contextlib import contextmanager
 from typing import Callable, Dict, Optional
-from urllib.parse import quote, urlsplit, urlunsplit
+from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 
 from scrapers.fbref.constants import FBREF_UNCOMMENT_TABLES_JS
 
@@ -96,6 +96,13 @@ UNEXPECTED_BROWSER_NETWORK_RESERVATION_BYTES = (
     BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
     + BROWSER_UNDECLARED_BODY_RESERVATION_BYTES
 )
+
+# Firefox is kept at zero automatic redirects because it does not re-enter
+# context.route() for server-redirect hops. The bootstrap may still follow one
+# proved same-origin HTTPS Location by issuing a second explicit page.goto();
+# that request passes the normal request/byte admission guard before transport.
+MANUAL_SERVER_REDIRECT_HOPS = 1
+_SERVER_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 
 # Camoufox 0.4.11 resolves ``geoip=True`` before Playwright exists.  Its helper
 # follows redirects and can try six public-IP services, so routing cannot admit
@@ -510,6 +517,15 @@ class CamoufoxFbrefTransport:
         # same escaped request a second time.
         self._unrouted_response_request_urls: Dict[int, Optional[str]] = {}
         self._unrouted_response_ids_by_url: Dict[str, list] = {}
+        # Firefox can emit requestfailed just before the response callback for
+        # the same routed request. Keep that settled identity until the late
+        # response arrives so it cannot be mistaken for a routing bypass.
+        self._settled_failed_request_urls: Dict[int, Optional[str]] = {}
+        self._settled_failed_ids_by_url: Dict[str, list] = {}
+        self._responded_request_urls: Dict[int, Optional[str]] = {}
+        self._responded_ids_by_url: Dict[str, list] = {}
+        self._navigation_source_url: Optional[str] = None
+        self._pending_manual_redirect_url: Optional[str] = None
         # An __exit__ failure is a permanent phase-boundary failure. The
         # Camoufox context-manager handle stays available for a cleanup retry,
         # but this transport may never start another browser afterwards.
@@ -917,11 +933,43 @@ class CamoufoxFbrefTransport:
             self._unrouted_response_ids_by_url,
         )
 
+    def _remember_settled_failed_request(self, req) -> None:
+        self._remember_request_marker(
+            req,
+            self._settled_failed_request_urls,
+            self._settled_failed_ids_by_url,
+        )
+
+    def _consume_settled_failed_request(self, req) -> bool:
+        return self._consume_request_marker(
+            req,
+            self._settled_failed_request_urls,
+            self._settled_failed_ids_by_url,
+        )
+
+    def _remember_responded_request(self, req) -> None:
+        self._remember_request_marker(
+            req,
+            self._responded_request_urls,
+            self._responded_ids_by_url,
+        )
+
+    def _consume_responded_request(self, req) -> bool:
+        return self._consume_request_marker(
+            req,
+            self._responded_request_urls,
+            self._responded_ids_by_url,
+        )
+
     def _clear_request_callback_tracking(self) -> None:
         self._intentional_abort_request_urls.clear()
         self._intentional_abort_ids_by_url.clear()
         self._unrouted_response_request_urls.clear()
         self._unrouted_response_ids_by_url.clear()
+        self._settled_failed_request_urls.clear()
+        self._settled_failed_ids_by_url.clear()
+        self._responded_request_urls.clear()
+        self._responded_ids_by_url.clear()
 
     def _track_reservation(self, req, reservation: int) -> None:
         key = id(req)
@@ -1166,6 +1214,79 @@ class CamoufoxFbrefTransport:
                 pass
 
     @staticmethod
+    def _response_status(response) -> Optional[int]:
+        try:
+            raw = response.status
+            raw = raw() if callable(raw) else raw
+            status = int(raw)
+        except Exception:  # noqa: BLE001 — detached response is not proof
+            return None
+        return status if 100 <= status <= 599 else None
+
+    @staticmethod
+    def _is_navigation_request(req) -> bool:
+        try:
+            value = req.is_navigation_request
+            value = value() if callable(value) else value
+        except Exception:  # noqa: BLE001 — detached request is not navigation
+            return False
+        return value is True
+
+    @staticmethod
+    def _normalized_https_url(value: object) -> Optional[str]:
+        try:
+            parsed = urlsplit(str(value or ""))
+            port = parsed.port
+        except (TypeError, ValueError):
+            return None
+        if (
+            parsed.scheme.casefold() != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or port not in (None, 443)
+        ):
+            return None
+        host = parsed.hostname.casefold()
+        return urlunsplit(
+            ("https", host, parsed.path or "/", parsed.query, "")
+        )
+
+    def _manual_redirect_target(
+        self,
+        source_url: object,
+        location: object,
+    ) -> Optional[str]:
+        source = self._normalized_https_url(source_url)
+        raw_location = str(location or "").strip()
+        if source is None or not raw_location:
+            return None
+        target = self._normalized_https_url(urljoin(source, raw_location))
+        if target is None:
+            return None
+        if urlsplit(source).netloc != urlsplit(target).netloc:
+            return None
+        return target
+
+    def _capture_manual_redirect(
+        self,
+        response,
+        req,
+        headers: Dict[str, str],
+    ) -> None:
+        source = self._navigation_source_url
+        if source is None or not self._is_navigation_request(req):
+            return
+        if self._normalized_https_url(self._request_url(req)) != source:
+            return
+        if self._response_status(response) not in _SERVER_REDIRECT_STATUSES:
+            return
+        self._pending_manual_redirect_url = self._manual_redirect_target(
+            source,
+            headers.get("location"),
+        )
+
+    @staticmethod
     def _response_headers(response) -> Dict[str, str]:
         try:
             raw = response.headers
@@ -1202,9 +1323,16 @@ class CamoufoxFbrefTransport:
             return
         reservation_key = self._reservation_key(req)
         if reservation_key is None:
+            if self._consume_settled_failed_request(req):
+                headers = self._response_headers(response)
+                self._capture_manual_redirect(response, req, headers)
+                return
             self._remember_unrouted_response(req)
             self._reject_unrouted_request()
             return
+        headers = self._response_headers(response)
+        self._remember_responded_request(req)
+        self._capture_manual_redirect(response, req, headers)
         if (
             self._network_policy_failed
             or self._max_network_bytes is None
@@ -1213,7 +1341,6 @@ class CamoufoxFbrefTransport:
             return
         admitted = self._inflight_byte_reservations[reservation_key]
 
-        headers = self._response_headers(response)
         transfer_encoding = headers.get("transfer-encoding", "")
         chunked = "chunked" in {
             token.strip().casefold()
@@ -1255,6 +1382,7 @@ class CamoufoxFbrefTransport:
             self._latch_unexpected_network("unrouted_http_completion")
             return
         reserved = self._release_byte_reservation(req)
+        self._consume_responded_request(req)
         self._consume_intentional_abort(req)
         try:
             n = self._observed_request_bytes(req)
@@ -1298,6 +1426,8 @@ class CamoufoxFbrefTransport:
             return
         reservation_key = self._reservation_key(req)
         if reservation_key is not None:
+            if not self._consume_responded_request(req):
+                self._remember_settled_failed_request(req)
             reserved = self._release_byte_reservation(req)
             self._consume_intentional_abort(req)
             self._charge_failed_request(req, reserved)
@@ -1422,6 +1552,48 @@ class CamoufoxFbrefTransport:
             self._stop()
             return False
 
+    def _navigate_with_one_manual_redirect(self, url: str) -> None:
+        """Navigate with one explicit, routed server-redirect continuation."""
+
+        current_url = url
+        for hop in range(MANUAL_SERVER_REDIRECT_HOPS + 1):
+            self._pending_manual_redirect_url = None
+            self._navigation_source_url = self._normalized_https_url(
+                current_url
+            )
+            self._navigation_attempts += 1
+            try:
+                with self._browser_deadline(
+                    self.BROWSER_ATTEMPT_TIMEOUT_S, "navigation"
+                ):
+                    self._page.goto(
+                        current_url,
+                        wait_until="domcontentloaded",
+                        timeout=self._nav_timeout_ms,
+                    )
+            except Exception as exc:
+                error_type = _navigation_error_type(exc)
+                redirect_url = self._pending_manual_redirect_url
+                self._pending_manual_redirect_url = None
+                if (
+                    (self._redirect_blocked or error_type == "redirect_blocked")
+                    and redirect_url is not None
+                    and hop < MANUAL_SERVER_REDIRECT_HOPS
+                    and not self._hard_network_failure_latched()
+                ):
+                    # network.http.redirection-limit=0 stopped Firefox before
+                    # the hop. The explicit continuation is a fresh route(),
+                    # so its request and byte caps are checked before transport.
+                    self._redirect_blocked = False
+                    current_url = redirect_url
+                    logger.info("Camoufox following one admitted server redirect")
+                    continue
+                raise
+            finally:
+                self._navigation_source_url = None
+            self._pending_manual_redirect_url = None
+            return
+
     # -- public fetch ----------------------------------------------------- #
     def fetch(self, url: str) -> Optional[str]:
         """Navigate to ``url``, solve Turnstile if present, return page HTML.
@@ -1454,26 +1626,18 @@ class CamoufoxFbrefTransport:
                     continue
             try:
                 # FBrefFetcher uses Camoufox only for its clearance bootstrap,
-                # so every navigation here is one exact bootstrap attempt.
-                # Count before goto: timeouts and interrupted navigations still
-                # consumed a browser/proxy attempt.
-                self._navigation_attempts += 1
-                with self._browser_deadline(
-                    self.BROWSER_ATTEMPT_TIMEOUT_S, "navigation"
-                ):
-                    self._page.goto(
-                        url, wait_until="domcontentloaded",
-                        timeout=self._nav_timeout_ms,
-                    )
+                # so this is one bootstrap plus at most one explicit, routed
+                # same-origin server-redirect continuation.
+                self._navigate_with_one_manual_redirect(url)
             except Exception as e:  # noqa: BLE001 — browser/network boundary
                 logger.warning("Camoufox goto failed (attempt %d): %s",
                                attempt + 1, e)
                 error_type = _navigation_error_type(e)
                 if self._hard_network_failure_latched():
                     break
-                if error_type == "redirect_blocked":
+                if self._redirect_blocked or error_type == "redirect_blocked":
                     self._redirect_blocked = True
-                    self._last_solve_failure = error_type
+                    self._last_solve_failure = "redirect_blocked"
                     break
                 if error_type in {'timeout', 'network'}:
                     self._record_proxy_result(False, error_type)
@@ -1482,6 +1646,9 @@ class CamoufoxFbrefTransport:
                 continue
 
             if self._hard_network_failure_latched():
+                break
+            if self._redirect_blocked:
+                self._last_solve_failure = "redirect_blocked"
                 break
 
             # CF challenge counters live in _solve_current_page — only navs
@@ -1503,6 +1670,9 @@ class CamoufoxFbrefTransport:
                     self._lifecycle_action(self._restart, 'restart')
                 continue
             if self._hard_network_failure_latched():
+                break
+            if self._redirect_blocked:
+                self._last_solve_failure = "redirect_blocked"
                 break
             if html is not None:
                 self._pages_this_session += 1

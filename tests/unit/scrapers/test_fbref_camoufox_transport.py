@@ -106,9 +106,20 @@ class _Route:
 
 
 class _Response:
+    def __init__(self, request, headers, status=200):
+        self.request = request
+        self.headers = headers
+        self.status = status
+
+
+class _StatusFailsResponse:
     def __init__(self, request, headers):
         self.request = request
         self.headers = headers
+
+    @property
+    def status(self):
+        raise RuntimeError("response detached")
 
 
 class _ContinueFailsRoute(_Route):
@@ -1171,14 +1182,224 @@ def test_blocked_native_redirect_does_not_rotate_proxy():
     transport = CamoufoxFbrefTransport(geoip=False)
     transport._page = MagicMock()
     transport._page.goto.side_effect = RuntimeError("NS_ERROR_REDIRECT_LOOP")
+    transport._solve_current_page = MagicMock()  # type: ignore[method-assign]
     transport._restart = MagicMock()  # type: ignore[method-assign]
 
     assert transport.fetch("https://fbref.com/en/") is None
 
     transport._page.goto.assert_called_once()
+    transport._solve_current_page.assert_not_called()
     transport._restart.assert_not_called()
     assert transport._last_solve_failure == "redirect_blocked"
     assert transport.traffic_stats()["redirect_blocked"] is True
+
+
+def test_redirect_callback_with_generic_goto_error_does_not_rotate_proxy():
+    transport = CamoufoxFbrefTransport(geoip=False)
+    transport._page = MagicMock()
+
+    def failed_goto(*_args, **_kwargs):
+        transport._redirect_blocked = True
+        raise RuntimeError("Target closed")
+
+    transport._page.goto.side_effect = failed_goto
+    transport._solve_current_page = MagicMock()  # type: ignore[method-assign]
+    transport._restart = MagicMock()  # type: ignore[method-assign]
+
+    assert transport.fetch("https://fbref.com/en/") is None
+
+    transport._page.goto.assert_called_once()
+    transport._solve_current_page.assert_not_called()
+    transport._restart.assert_not_called()
+    assert transport._last_solve_failure == "redirect_blocked"
+
+
+@pytest.mark.unit
+def test_one_safe_server_redirect_is_reissued_through_route_admission():
+    admission = (
+        BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
+        + BROWSER_UNDECLARED_BODY_RESERVATION_BYTES
+    )
+    transport = CamoufoxFbrefTransport(
+        geoip=False,
+        max_network_requests=2,
+        max_network_bytes=2 * admission,
+    )
+    transport._page = MagicMock()
+    seen_routes = []
+
+    def goto(current_url, **_kwargs):
+        route = _Route(url=current_url)
+        route.request.is_navigation_request.return_value = True
+        route.request.sizes.return_value = {
+            "responseBodySize": 0,
+            "responseHeadersSize": 300,
+            "requestBodySize": 0,
+            "requestHeadersSize": 200,
+        }
+        seen_routes.append(route)
+        transport._maybe_block(route)
+        if route.aborted:
+            raise RuntimeError("NS_BINDING_ABORTED")
+        if current_url == "https://fbref.com/en/":
+            transport._on_response(
+                _Response(
+                    route.request,
+                    {"content-length": "0", "location": "/en/redirected"},
+                    status=302,
+                )
+            )
+            route.request.failure = "NS_ERROR_REDIRECT_LOOP"
+            transport._on_request_failed(route.request)
+            raise RuntimeError("Target closed after redirect callback")
+        transport._on_response(
+            _Response(route.request, {"content-length": "0"}, status=200)
+        )
+        transport._on_request_finished(route.request)
+
+    transport._page.goto.side_effect = goto
+
+    transport._navigate_with_one_manual_redirect("https://fbref.com/en/")
+
+    assert [call.args[0] for call in transport._page.goto.call_args_list] == [
+        "https://fbref.com/en/",
+        "https://fbref.com/en/redirected",
+    ]
+    assert all(route.continued == 1 for route in seen_routes)
+    stats = transport.traffic_stats()
+    assert stats["real_requests_count"] == 2
+    assert stats["completed_requests_count"] == 1
+    assert stats["network_policy_failed"] is False
+    assert stats["request_budget_exhausted"] is False
+    assert stats["redirect_blocked"] is False
+    assert stats["browser_navigation_attempts"] == 2
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "location",
+    [
+        "http://fbref.com/en/other",
+        "https://evil.example/en/other",
+        "https://user:secret@fbref.com/en/other",
+        "https://fbref.com:444/en/other",
+    ],
+)
+def test_unsafe_server_redirect_is_never_reissued(location):
+    transport = CamoufoxFbrefTransport(max_network_requests=2)
+    route = _Route()
+    route.request.is_navigation_request.return_value = True
+    transport._navigation_source_url = "https://fbref.com/en/"
+    transport._maybe_block(route)
+
+    transport._on_response(
+        _Response(
+            route.request,
+            {"content-length": "0", "location": location},
+            status=302,
+        )
+    )
+
+    assert transport._pending_manual_redirect_url is None
+
+
+@pytest.mark.unit
+def test_unknown_redirect_status_is_never_reissued():
+    transport = CamoufoxFbrefTransport(max_network_requests=2)
+    route = _Route()
+    route.request.is_navigation_request.return_value = True
+    transport._navigation_source_url = "https://fbref.com/en/"
+    transport._maybe_block(route)
+
+    transport._on_response(
+        _StatusFailsResponse(
+            route.request,
+            {"content-length": "0", "location": "/next"},
+        )
+    )
+
+    assert transport._pending_manual_redirect_url is None
+
+
+@pytest.mark.unit
+def test_late_redirect_response_after_failure_is_not_a_routing_bypass():
+    transport = CamoufoxFbrefTransport(max_network_requests=2)
+    route = _Route()
+    route.request.is_navigation_request.return_value = True
+    route.request.failure = "NS_ERROR_REDIRECT_LOOP"
+    route.request.sizes.return_value = {
+        "responseBodySize": 0,
+        "responseHeadersSize": 300,
+        "requestBodySize": 0,
+        "requestHeadersSize": 200,
+    }
+    transport._navigation_source_url = "https://fbref.com/en/"
+    transport._maybe_block(route)
+    transport._on_request_failed(route.request)
+
+    rewrapped = MagicMock(resource_type="document", url=route.request.url)
+    rewrapped.is_navigation_request.return_value = True
+    transport._on_response(
+        _Response(
+            rewrapped,
+            {"content-length": "0", "location": "/next"},
+            status=302,
+        )
+    )
+
+    stats = transport.traffic_stats()
+    assert stats["network_policy_failed"] is False
+    assert stats["real_requests_count"] == 1
+    assert transport._pending_manual_redirect_url == "https://fbref.com/next"
+    assert transport._settled_failed_request_urls == {}
+    assert transport._settled_failed_ids_by_url == {}
+
+
+@pytest.mark.unit
+def test_manual_redirect_second_request_still_obeys_request_cap():
+    transport = CamoufoxFbrefTransport(
+        geoip=False,
+        max_network_requests=1,
+    )
+    transport._page = MagicMock()
+    seen_routes = []
+
+    def goto(current_url, **_kwargs):
+        route = _Route(url=current_url)
+        route.request.is_navigation_request.return_value = True
+        route.request.sizes.return_value = {
+            "responseBodySize": 0,
+            "responseHeadersSize": 300,
+            "requestBodySize": 0,
+            "requestHeadersSize": 200,
+        }
+        seen_routes.append(route)
+        transport._maybe_block(route)
+        if route.aborted:
+            raise RuntimeError("NS_BINDING_ABORTED")
+        transport._on_response(
+            _Response(
+                route.request,
+                {"content-length": "0", "location": "/next"},
+                status=302,
+            )
+        )
+        route.request.failure = "NS_ERROR_REDIRECT_LOOP"
+        transport._on_request_failed(route.request)
+        raise RuntimeError("NS_ERROR_REDIRECT_LOOP")
+
+    transport._page.goto.side_effect = goto
+
+    with pytest.raises(RuntimeError, match="NS_BINDING_ABORTED"):
+        transport._navigate_with_one_manual_redirect("https://fbref.com/en/")
+
+    assert len(seen_routes) == 2
+    assert seen_routes[0].continued == 1
+    assert seen_routes[1].continued == 0
+    assert seen_routes[1].aborted == 1
+    stats = transport.traffic_stats()
+    assert stats["real_requests_count"] == 1
+    assert stats["request_budget_exhausted"] is True
 
 
 def test_redirect_seen_while_solve_raises_never_rotates_proxy():
@@ -1253,6 +1474,7 @@ def test_byte_cap_during_solve_rejects_valid_partial_html_and_stops_browser():
     assert transport.fetch("https://fbref.com/en/") is None
 
     transport._page.goto.assert_called_once()
+    transport._solve_current_page.assert_called_once_with()
     transport._restart.assert_not_called()
     transport._stop.assert_called_once_with()
 
@@ -1278,14 +1500,12 @@ def test_subresource_redirect_failure_never_rotates_proxy(valid_page):
     )
     transport._restart = MagicMock()  # type: ignore[method-assign]
 
-    assert transport.fetch("https://fbref.com/en/") == html
+    assert transport.fetch("https://fbref.com/en/") is None
 
     transport._page.goto.assert_called_once()
+    transport._solve_current_page.assert_not_called()
     transport._restart.assert_not_called()
-    if valid_page:
-        assert transport._last_solve_failure != "redirect_blocked"
-    else:
-        assert transport._last_solve_failure == "redirect_blocked"
+    assert transport._last_solve_failure == "redirect_blocked"
 
 
 def test_byte_budget_abort_never_closes_the_browser_from_a_callback():
