@@ -34,7 +34,6 @@ from scrapers.fbref.settings import (
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_PROXY_FILE = "/opt/airflow/proxys.txt"
 LIVE_WAVES_RUNNER = "/opt/airflow/dags/scripts/run_fbref_live_waves.py"
 LIVE_WAVES_RESULT_PREFIX = "FBREF_LIVE_WAVES_RESULT:"
 LIVE_WAVES_TIMEOUT_SECONDS = 110 * 60
@@ -75,6 +74,10 @@ def _install_live_runner_sigterm_handler() -> tuple[dict, object]:
 
     def handle(signum, _frame) -> None:
         if state["armed"]:
+            # Raise only once.  Every later SIGTERM is latched while the
+            # process group is being reaped, so cancellation cannot interrupt
+            # the cleanup path and strand the paid browser tree.
+            state["armed"] = False
             raise _LiveRunnerTermination(signum)
         state["pending_signum"] = int(signum)
 
@@ -181,7 +184,6 @@ def _settings(
     shard_size=DEFAULT_SHARD_SIZE,
     reservation_mb=DEFAULT_REQUEST_RESERVATION_BYTES // MIB,
     domain_interval_seconds=3.0,
-    proxy_file: Optional[str] = "/opt/airflow/proxys.txt",
 ) -> object:
     from scrapers.fbref.pipeline import PipelineSettings
 
@@ -199,7 +201,6 @@ def _settings(
         shard_size=int(shard_size),
         request_reservation_bytes=int(reservation_mb) * MIB,
         domain_interval_seconds=float(domain_interval_seconds),
-        proxy_file=proxy_file,
     )
 
 
@@ -255,7 +256,6 @@ def validate_fbref_production_readiness(
     request_limit,
     byte_limit_mb,
     shard_size,
-    proxy_file: Optional[str] = DEFAULT_PROXY_FILE,
 ) -> dict:
     """Fail closed on every production dependency before creating a run."""
 
@@ -266,7 +266,7 @@ def validate_fbref_production_readiness(
     from scrapers.fbref.readiness import (
         check_raw_store_roundtrip,
         check_trino_roundtrip,
-        validate_proxy_pool,
+        validate_fbref_proxy_meter,
         validate_raw_store_uri,
     )
 
@@ -284,9 +284,11 @@ def validate_fbref_production_readiness(
     trino_health = check_trino_roundtrip(TrinoTableManager())
     proxy = {}
     if limits["run_type"] != "replay":
-        proxy = validate_proxy_pool(
-            proxy_file,
-            minimum_healthy=(
+        proxy = validate_fbref_proxy_meter(
+            os.environ.get("FBREF_PROXY_CONTROL_URL"),
+            control_token=os.environ.get("FBREF_PROXY_CONTROL_TOKEN"),
+            required_bytes=int(limits["byte_limit_mb"]) * MIB,
+            minimum_configured_exits=(
                 4 if limits["profile"] == "production" else 1
             ),
         )
@@ -298,7 +300,7 @@ def validate_fbref_production_readiness(
             "control_migrations": migrations,
             "raw_store": raw_health,
             "trino": trino_health,
-            "proxy_pool": proxy or {"status": "not_required"},
+            "proxy_meter": proxy or {"status": "not_required"},
         },
     }
 
@@ -799,6 +801,7 @@ def capture_fbref_raw_baseline(
 
     from scrapers.fbref.raw_audit import (
         capture_and_write_raw_inventory,
+        open_authenticated_raw_inventory_cache,
         raw_baseline_anchor,
     )
     from scrapers.fbref.raw_store import RawPageStore
@@ -808,8 +811,15 @@ def capture_fbref_raw_baseline(
     )
     path = _fbref_raw_baseline_path(control_run_id)
     control = _control_store()
+    reuse_inventory = None
+    if not (path.exists() or path.is_symlink()):
+        reuse_inventory = open_authenticated_raw_inventory_cache(
+            _fbref_acceptance_output_root(), control
+        )
     path, inventory, idempotent = capture_and_write_raw_inventory(
-        RawPageStore.from_env(optional=False), path
+        RawPageStore.from_env(optional=False),
+        path,
+        reuse_inventory=reuse_inventory,
     )
     anchor = raw_baseline_anchor(
         inventory.summary, inventory.baseline_sha256
@@ -843,8 +853,12 @@ def audit_fbref_raw_integrity(
 
     from scrapers.fbref.raw_audit import (
         audit_raw_fetches,
+        cleanup_anchored_raw_inventory_indexes,
+        load_audit_artifact,
+        load_inventory_baseline,
         load_successful_run_attempts,
         open_disk_backed_inventory,
+        promote_raw_inventory_cache,
         raw_baseline_anchor,
         successful_attempt_snapshot,
         write_audit_artifact,
@@ -869,13 +883,120 @@ def audit_fbref_raw_integrity(
         audited_run_id = processing_run_id
 
     control = _control_store()
+    root = _fbref_acceptance_output_root()
     baseline_path = _fbref_raw_baseline_path(processing_run_id)
-    baseline = open_disk_backed_inventory(baseline_path)
     expected_anchor = control.get_raw_baseline(processing_run_id)
     if expected_anchor is None:
         raise RuntimeError(
             "FBref raw baseline has no immutable control-plane anchor"
         )
+
+    existing_audit = control.get_raw_audit(processing_run_id)
+    if existing_audit is not None:
+        baseline_summary, baseline_sha256 = load_inventory_baseline(
+            baseline_path
+        )
+        actual_anchor = raw_baseline_anchor(
+            baseline_summary, baseline_sha256
+        )
+        if dict(expected_anchor) != actual_anchor:
+            raise RuntimeError(
+                "FBref raw baseline does not match its immutable "
+                "control-plane anchor"
+            )
+        expected_existing = {
+            "status": "passed",
+            "run_type": normalized_run_type,
+            "audited_control_run_id": audited_run_id,
+            "processing_control_run_id": processing_run_id,
+            "zero_delta_required": normalized_run_type == "replay",
+        }
+        if any(
+            existing_audit.get(key) != value
+            for key, value in expected_existing.items()
+        ):
+            raise RuntimeError(
+                "Existing FBref raw audit anchor has the wrong run contract"
+            )
+        sealed_snapshot = control.seal_raw_fetch_attempts(audited_run_id)
+        if (
+            int(sealed_snapshot["successful_attempt_count"])
+            != int(existing_audit["successful_attempt_count"])
+            or str(sealed_snapshot["successful_attempt_ids_sha256"])
+            != str(existing_audit["attempt_snapshot_sha256"])
+        ):
+            raise RuntimeError(
+                "Existing FBref raw audit anchor differs from sealed attempts"
+            )
+        artifact_path = Path(str(existing_audit["artifact"]))
+        if not artifact_path.is_absolute():
+            raise RuntimeError("Existing FBref raw audit path is not absolute")
+        try:
+            artifact_path.parent.resolve().relative_to(root)
+        except ValueError as exc:
+            raise RuntimeError(
+                "Existing FBref raw audit path is outside acceptance storage"
+            ) from exc
+        artifact, digest_path = load_audit_artifact(
+            artifact_path,
+            expected_sha256=str(existing_audit["artifact_sha256"]),
+        )
+        artifact_metadata = artifact.get("metadata") or {}
+        if (
+            str(artifact.get("status") or "") != "passed"
+            or str(artifact.get("control_run_id") or "") != audited_run_id
+            or int(artifact.get("successful_attempt_count") or -1)
+            != int(existing_audit["successful_attempt_count"])
+            or int(artifact.get("audited_attempt_count") or -1)
+            != int(existing_audit["audited_attempt_count"])
+            or list(artifact.get("failures") or [])
+            or not isinstance(artifact_metadata, Mapping)
+            or str(
+                artifact_metadata.get("processing_control_run_id") or ""
+            )
+            != processing_run_id
+            or str(
+                artifact_metadata.get("raw_attempt_snapshot_sha256") or ""
+            )
+            != str(existing_audit["attempt_snapshot_sha256"])
+        ):
+            raise RuntimeError(
+                "Existing FBref raw audit artifact differs from its anchor"
+            )
+        summary = {
+            "status": "passed",
+            "control_run_id": audited_run_id,
+            "processing_control_run_id": processing_run_id,
+            "successful_attempt_count": int(
+                existing_audit["successful_attempt_count"]
+            ),
+            "audited_attempt_count": int(
+                existing_audit["audited_attempt_count"]
+            ),
+            "failure_count": 0,
+            "zero_delta_required": normalized_run_type == "replay",
+            "attempt_snapshot_sha256": str(
+                existing_audit["attempt_snapshot_sha256"]
+            ),
+            "artifact": str(artifact_path),
+            "artifact_sha256": str(existing_audit["artifact_sha256"]),
+            "sha256_sidecar": str(digest_path),
+            "control_anchored": True,
+            "idempotent": True,
+        }
+        summary["inventory_retention"] = (
+            cleanup_anchored_raw_inventory_indexes(
+                root,
+                control,
+                protected_control_run_ids={processing_run_id},
+            )
+        )
+        logger.info(
+            "FBref raw integrity: %s", json.dumps(summary, sort_keys=True)
+        )
+        return summary
+
+    baseline = open_disk_backed_inventory(baseline_path)
     actual_anchor = raw_baseline_anchor(
         baseline.summary, baseline.baseline_sha256
     )
@@ -963,6 +1084,37 @@ def audit_fbref_raw_integrity(
             f"failure_count={summary['failure_count']}; "
             f"artifact={artifact_path}"
         )
+    anchored = control.record_raw_audit(
+        processing_run_id,
+        {
+            "schema_version": "fbref-raw-audit-anchor-v1",
+            "status": "passed",
+            "run_type": normalized_run_type,
+            "audited_control_run_id": audited_run_id,
+            "processing_control_run_id": processing_run_id,
+            "successful_attempt_count": summary[
+                "successful_attempt_count"
+            ],
+            "audited_attempt_count": summary["audited_attempt_count"],
+            "failure_count": summary["failure_count"],
+            "zero_delta_required": summary["zero_delta_required"],
+            "attempt_snapshot_sha256": summary[
+                "attempt_snapshot_sha256"
+            ],
+            "artifact_sha256": artifact_sha256,
+            "artifact": str(artifact_path),
+        },
+    )
+    summary["inventory_cache"] = promote_raw_inventory_cache(
+        root, processing_run_id, control
+    )
+    summary["inventory_retention"] = cleanup_anchored_raw_inventory_indexes(
+        root,
+        control,
+        protected_control_run_ids={processing_run_id},
+    )
+    summary["control_anchored"] = True
+    summary["idempotent"] = bool(anchored.get("idempotent"))
     return summary
 
 
@@ -1254,15 +1406,18 @@ def _terminate_process_group(
             getattr(exc, "stderr", None) or "",
         )
 
-    term_deadline = time.monotonic() + LIVE_WAVES_TERMINATION_GRACE_SECONDS
-    term_sent = signal_group(signal.SIGTERM)
-    term_output: tuple[str, str]
     try:
-        term_output = process.communicate(
-            timeout=LIVE_WAVES_TERMINATION_GRACE_SECONDS
+        term_deadline = (
+            time.monotonic() + LIVE_WAVES_TERMINATION_GRACE_SECONDS
         )
-    except subprocess.TimeoutExpired as term_exc:
-        term_output = partial(term_exc)
+        term_sent = signal_group(signal.SIGTERM)
+        term_output: tuple[str, str]
+        try:
+            term_output = process.communicate(
+                timeout=LIVE_WAVES_TERMINATION_GRACE_SECONDS
+            )
+        except subprocess.TimeoutExpired as term_exc:
+            term_output = partial(term_exc)
     except BaseException:
         # A second cancellation while TERM cleanup is running must not leave
         # the detached group alive. Do not mask it after issuing SIGKILL.
@@ -1331,6 +1486,7 @@ def _spawn_live_runner(
     if handler_state["pending_signum"] is not None:
         pending_signum = int(handler_state["pending_signum"])
         handler_state["pending_signum"] = None
+        handler_state["armed"] = False
         raise _LiveRunnerTermination(pending_signum)
 
 
@@ -1347,7 +1503,6 @@ def run_fbref_live_waves(
     reservation_mb=DEFAULT_REQUEST_RESERVATION_BYTES // MIB,
     domain_interval_seconds=3.0,
     max_batches: int = FBREF_MAX_LIVE_BATCHES,
-    proxy_file: Optional[str] = DEFAULT_PROXY_FILE,
 ) -> dict:
     """Run all bounded live batches in one warm, unforked subprocess."""
 
@@ -1367,6 +1522,8 @@ def run_fbref_live_waves(
         LIVE_WAVES_RUNNER,
         "--control-run-id",
         _control_run_id(airflow_run_id=airflow_run_id, dag_id=dag_id),
+        "--parent-pid",
+        str(os.getpid()),
         "--worker-id",
         worker_id,
         "--page-kinds",
@@ -1386,64 +1543,74 @@ def run_fbref_live_waves(
         "--max-batches",
         str(normalized_batches),
     ]
-    if proxy_file:
-        command += ["--proxy-file", proxy_file]
-
     lifecycle = _LiveRunnerLifecycle()
     stdout = ""
     stderr = ""
+    process_group_terminated = False
     try:
-        # The spawn and every instruction after it execute inside this same
-        # exception table.  Lifecycle state is caller-owned, so even SIGTERM
-        # on the helper-return bytecode boundary can find and reap the PGID.
-        _spawn_live_runner(command, lifecycle)
-        process = lifecycle.process
-        process_group_id = lifecycle.process_group_id
-        if process is None or process_group_id is None:
-            raise RuntimeError("FBref live runner spawn did not return a PGID")
-        stdout, stderr = process.communicate(
-            timeout=LIVE_WAVES_TIMEOUT_SECONDS
-        )
-        if _process_group_exists(process_group_id):
-            raise RuntimeError(
-                "FBref live runner exited while descendants remained in its "
-                f"process group {process_group_id}"
+        try:
+            # The spawn and every instruction after it execute inside this
+            # outer exception table. Lifecycle state is caller-owned, so a
+            # signal on an inner TimeoutExpired-handler boundary still reaches
+            # the one cleanup path below.
+            _spawn_live_runner(command, lifecycle)
+            process = lifecycle.process
+            process_group_id = lifecycle.process_group_id
+            if process is None or process_group_id is None:
+                raise RuntimeError(
+                    "FBref live runner spawn did not return a PGID"
+                )
+            stdout, stderr = process.communicate(
+                timeout=LIVE_WAVES_TIMEOUT_SECONDS
             )
-    except subprocess.TimeoutExpired as exc:
-        process = lifecycle.process
-        process_group_id = lifecycle.process_group_id
-        if process is None or process_group_id is None:
+            if _process_group_exists(process_group_id):
+                raise RuntimeError(
+                    "FBref live runner exited while descendants remained in "
+                    f"its process group {process_group_id}"
+                )
+        except subprocess.TimeoutExpired as exc:
+            if lifecycle.handler_state is not None:
+                lifecycle.handler_state["armed"] = False
+            process = lifecycle.process
+            process_group_id = lifecycle.process_group_id
+            if process is None or process_group_id is None:
+                raise RuntimeError(
+                    "FBref live runner timed out before its PGID was recorded"
+                ) from exc
+            stdout, stderr = _terminate_process_group(
+                process, process_group_id
+            )
+            process_group_terminated = True
+            logger.warning(
+                "FBref live runner timed out.\nstdout:\n%s\nstderr:\n%s",
+                _decoded_stream(stdout),
+                _decoded_stream(stderr),
+            )
+            message = (
+                "FBref live runner exceeded "
+                f"{LIVE_WAVES_TIMEOUT_SECONDS}s"
+            )
+            _abort_failed_live_subprocess(
+                airflow_run_id=airflow_run_id,
+                dag_id=dag_id,
+                error_class="LiveWavesSubprocessTimeout",
+                error_message=message,
+            )
             raise RuntimeError(
-                "FBref live runner timed out before its PGID was recorded"
+                message + " and its process group was killed"
             ) from exc
-        stdout, stderr = _terminate_process_group(
-            process, process_group_id
-        )
-        logger.warning(
-            "FBref live runner timed out.\nstdout:\n%s\nstderr:\n%s",
-            _decoded_stream(stdout),
-            _decoded_stream(stderr),
-        )
-        message = (
-            "FBref live runner exceeded "
-            f"{LIVE_WAVES_TIMEOUT_SECONDS}s"
-        )
-        _abort_failed_live_subprocess(
-            airflow_run_id=airflow_run_id,
-            dag_id=dag_id,
-            error_class="LiveWavesSubprocessTimeout",
-            error_message=message,
-        )
-        raise RuntimeError(message + " and its process group was killed") from exc
     except BaseException:
+        if lifecycle.handler_state is not None:
+            lifecycle.handler_state["armed"] = False
         process = lifecycle.process
         process_group_id = lifecycle.process_group_id
-        if process is not None:
+        if process is not None and not process_group_terminated:
             if process_group_id is None:
                 process_group_id = int(process.pid)
             stdout, stderr = _terminate_process_group(
                 process, process_group_id
             )
+            process_group_terminated = True
             logger.warning(
                 "FBref live runner was externally interrupted; its process "
                 "group was terminated.\nstdout:\n%s\nstderr:\n%s",
@@ -1458,6 +1625,14 @@ def run_fbref_live_waves(
             signal.signal(
                 signal.SIGTERM, lifecycle.previous_sigterm_handler
             )
+            pending_signum = (
+                None
+                if lifecycle.handler_state is None
+                else lifecycle.handler_state["pending_signum"]
+            )
+            if pending_signum is not None and sys.exception() is None:
+                lifecycle.handler_state["pending_signum"] = None
+                raise _LiveRunnerTermination(int(pending_signum))
 
     if stderr:
         logger.info("FBref live runner stderr:\n%s", stderr.strip())

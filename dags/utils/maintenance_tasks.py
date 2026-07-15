@@ -600,10 +600,19 @@ def maintain_fbref_generic_stages(*, mode: str | None = None) -> dict[str, Any]:
             before_drop=destructive_fence,
             apply=normalized_mode == "apply",
         )
-        if int(result.get("attention_required_count") or 0):
+        attention_required = int(
+            result.get("attention_required_count") or 0
+        )
+        audit_only_backlog = (
+            int(result.get("eligible_count") or 0)
+            if normalized_mode == "audit"
+            else 0
+        )
+        if attention_required or audit_only_backlog:
             raise RuntimeError(
                 "FBref stage janitor retained stale stages requiring recovery: "
-                f"{result['attention_required_count']}"
+                f"attention={attention_required}, "
+                f"audit_only_eligible={audit_only_backlog}"
             )
         succeeded = True
         return {**result, "control_run_id": run_id}

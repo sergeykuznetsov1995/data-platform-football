@@ -417,30 +417,27 @@ def test_bootstrap_provider_exception_is_session_scoped_fetch_error():
     assert "RuntimeError" in str(raised.value)
 
 
-def test_reset_clearance_retains_proxy_manager_quarantine():
+def test_reset_clearance_drops_session_transport_and_metered_lease():
     fetcher = FBrefFetcher.__new__(FBrefFetcher)
-    manager = MagicMock()
-    proxy = object()
     old_transport = MagicMock()
     old_session = MagicMock()
     new_transport = MagicMock()
-    fetcher._proxy_manager = manager
-    fetcher._current_proxy = proxy
+    close_lease = MagicMock()
     fetcher._transport = old_transport
     fetcher._http_session = old_session
     fetcher._bootstrap_stats = {"old": True}
+    fetcher._clearance = {"old": True}
+    fetcher._close_provider_lease = close_lease
     fetcher._create_transport = MagicMock(return_value=new_transport)
 
-    fetcher.reset_clearance(error_type="cloudflare")
+    fetcher.reset_clearance()
 
-    manager.record_result.assert_called_once_with(
-        proxy, success=False, error_type="cloudflare"
-    )
     old_session.close.assert_called_once_with()
     old_transport.close.assert_called_once_with()
-    assert fetcher._proxy_manager is manager
+    close_lease.assert_called_once_with()
     assert fetcher._transport is new_transport
     assert fetcher._bootstrap_stats is None
+    assert fetcher._clearance is None
 
 
 def test_target_and_bootstrap_have_independent_byte_reservations():

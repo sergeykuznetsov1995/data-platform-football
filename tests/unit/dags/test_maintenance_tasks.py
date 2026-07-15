@@ -645,3 +645,51 @@ def test_maintenance_wrapper_defaults_to_audit_and_wires_per_drop_fence(
     ]
     assert events[-1] == ("finish", run_id, True)
     assert result["control_run_id"] == run_id
+
+
+@pytest.mark.unit
+def test_maintenance_audit_mode_fails_when_drop_eligible_stage_remains(
+    monkeypatch,
+):
+    import utils.maintenance_tasks as maintenance
+    from scrapers.fbref.control import ControlStore
+
+    finished = []
+
+    class FakeControl:
+        def create_run(self, *_args, **_kwargs):
+            return "8ca16a99-4039-44a6-a47d-206037f11e70"
+
+        def start_run(self, _run_id):
+            pass
+
+        def acquire_publication_lock(self, *_args, **_kwargs):
+            pass
+
+        def release_publication_lock(self, _run_id):
+            pass
+
+        def finish_run(self, _run_id, *, succeeded):
+            finished.append(succeeded)
+
+        def get_observation_cleanup_evidence(self, _refresh):
+            return None
+
+        def get_run(self, _run_id):
+            return None
+
+    monkeypatch.setattr(ControlStore, "from_env", FakeControl)
+    monkeypatch.setattr(
+        maintenance,
+        "janitor_fbref_generic_stages",
+        lambda **_kwargs: {
+            "mode": "audit",
+            "attention_required_count": 0,
+            "eligible_count": 1,
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="audit_only_eligible=1"):
+        maintenance.maintain_fbref_generic_stages(mode="audit")
+
+    assert finished == [False]

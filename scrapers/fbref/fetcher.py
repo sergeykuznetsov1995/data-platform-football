@@ -6,21 +6,27 @@ import hashlib
 import logging
 import os
 import time
-from dataclasses import dataclass, field
-from pathlib import Path
+from dataclasses import dataclass, field, replace
 from typing import Mapping, Optional, Sequence
 
 from scrapers.fbref.camoufox_fetch import CamoufoxFbrefTransport
+from scrapers.fbref.proxy_lease import (
+    DEFAULT_LEASE_TTL_SECONDS,
+    FBrefLeaseStats,
+    FBrefProxyLease,
+    FBrefProxyLeaseClient,
+    FBrefProxyLeaseError,
+)
 from scrapers.fbref.settings import (
     DEFAULT_BROWSER_BYTE_LIMIT_BYTES,
     DEFAULT_BROWSER_REQUESTS_PER_SOLVE,
     DEFAULT_DOMAIN_INTERVAL_SECONDS,
     DEFAULT_HTTP_BODY_LIMIT_BYTES,
 )
-from scrapers.utils.proxy_manager import Proxy, ProxyManager, classify_error
+from scrapers.utils.proxy_manager import classify_error
 
 
-FETCHER_VERSION = "fbref-camoufox-warm-http-v2"
+FETCHER_VERSION = "fbref-camoufox-metered-warm-http-v3"
 DEFAULT_BOOTSTRAP_URL = "https://fbref.com/en/"
 MAX_HTML_BYTES = DEFAULT_HTTP_BODY_LIMIT_BYTES
 # The browser cap bounds ONE clearance attempt; the run's reservation covers
@@ -30,7 +36,6 @@ DEFAULT_BROWSER_BYTE_LIMIT = DEFAULT_BROWSER_BYTE_LIMIT_BYTES
 MAX_TARGET_HTTP_ATTEMPTS = 2
 RETRYABLE_HTTP_STATUSES = frozenset({500, 502, 503, 504})
 DEFAULT_STATUS_RETRY_DELAY_SECONDS = DEFAULT_DOMAIN_INTERVAL_SECONDS
-DEFAULT_PROXY_COOLDOWN_WAIT_SECONDS = 60.0
 _FAILURE_EVIDENCE_HEADERS = (
     "content-type",
     "content-length",
@@ -250,9 +255,12 @@ class FBrefFetcher:
         max_browser_bytes: int = DEFAULT_BROWSER_BYTE_LIMIT,
         max_target_http_attempts: int = MAX_TARGET_HTTP_ATTEMPTS,
         status_retry_delay_seconds: float = DEFAULT_STATUS_RETRY_DELAY_SECONDS,
-        min_healthy_proxies: int = 1,
-        proxy_validation_timeout_seconds: float = 5.0,
-        proxy_cooldown_wait_seconds: float = DEFAULT_PROXY_COOLDOWN_WAIT_SECONDS,
+        proxy_control_url: Optional[str] = None,
+        proxy_control_token: Optional[str] = None,
+        provider_context: Optional[Mapping[str, object]] = None,
+        provider_max_bytes: Optional[int] = None,
+        provider_lease_ttl_seconds: Optional[int] = None,
+        lease_client: Optional[FBrefProxyLeaseClient] = None,
         sleep=time.sleep,
     ) -> None:
         self.bootstrap_url = bootstrap_url
@@ -272,35 +280,58 @@ class FBrefFetcher:
         self._sleep = sleep
         self._max_browser_requests = int(max_browser_requests)
         self._max_browser_bytes = int(max_browser_bytes)
-        self._proxy_cooldown_wait_seconds = float(proxy_cooldown_wait_seconds)
         if self._max_browser_requests <= 0 or self._max_browser_bytes <= 0:
             raise ValueError("browser request/byte limits must be positive")
-        if self._proxy_cooldown_wait_seconds < 0:
-            raise ValueError("proxy_cooldown_wait_seconds must be non-negative")
-        self._proxy_manager: Optional[ProxyManager] = None
-        self._current_proxy: Optional[Proxy] = None
-        if proxy_file:
-            path = Path(proxy_file)
-            if not path.is_file():
-                raise FileNotFoundError(f"FBref proxy file not found: {path}")
-            manager = ProxyManager(rotation_strategy="random")
-            loaded = manager.load_from_file_custom_format(str(path))
-            if loaded <= 0:
-                raise ValueError(f"FBref proxy file contains no proxies: {path}")
-            health = manager.validate_proxies(
-                timeout=float(proxy_validation_timeout_seconds),
-                max_workers=min(50, loaded),
-                ban_failed=True,
-            )
-            minimum = int(min_healthy_proxies)
-            if minimum <= 0:
-                raise ValueError("min_healthy_proxies must be positive")
-            if int(health["alive"]) < minimum:
-                raise ValueError(
-                    "FBref proxy preflight found "
-                    f"{health['alive']} healthy exits; {minimum} required"
+        self._lease_client: Optional[FBrefProxyLeaseClient] = None
+        self._provider_context: dict[str, object] = {}
+        self._provider_max_bytes = 0
+        self._provider_lease_ttl_seconds = 0
+        self._provider_lease: Optional[FBrefProxyLease] = None
+        self._provider_lease_observed_bytes = 0
+        self._provider_total_bytes = 0
+        self._clearance: Optional[dict] = None
+        configured_control_url = str(
+            proxy_control_url
+            or os.environ.get("FBREF_PROXY_CONTROL_URL")
+            or ""
+        ).strip()
+        paid_proxy_requested = bool(
+            proxy_file
+            or configured_control_url
+            or lease_client is not None
+            or provider_context is not None
+            or provider_max_bytes is not None
+        )
+        if paid_proxy_requested:
+            if lease_client is None:
+                if not configured_control_url:
+                    raise FBrefProxyLeaseError(
+                        "FBref paid proxy requires FBREF_PROXY_CONTROL_URL; "
+                        "direct proxy credentials are forbidden"
+                    )
+                lease_client = FBrefProxyLeaseClient(
+                    configured_control_url,
+                    control_token=proxy_control_token,
                 )
-            self._proxy_manager = manager
+            context = dict(provider_context or {})
+            required = ("dag_id", "run_id", "task_id", "canonical_url")
+            if not all(str(context.get(name) or "").strip() for name in required):
+                raise FBrefProxyLeaseError(
+                    "FBref paid proxy requires complete run provenance"
+                )
+            context["source"] = "fbref"
+            maximum = int(provider_max_bytes or 0)
+            ttl = int(
+                provider_lease_ttl_seconds
+                or os.environ.get("FBREF_PROXY_LEASE_TTL_SECONDS")
+                or DEFAULT_LEASE_TTL_SECONDS
+            )
+            if maximum <= 0 or ttl <= 0:
+                raise ValueError("FBref paid proxy byte and TTL caps must be positive")
+            self._lease_client = lease_client
+            self._provider_context = context
+            self._provider_max_bytes = maximum
+            self._provider_lease_ttl_seconds = ttl
         self._transport = self._create_transport()
         self._http_session = None
         self._bootstrap_stats: Optional[dict] = None
@@ -308,7 +339,6 @@ class FBrefFetcher:
     def _create_transport(self) -> CamoufoxFbrefTransport:
         return CamoufoxFbrefTransport(
             proxy_provider=self._next_proxy,
-            proxy_result_callback=self._record_proxy_result,
             geoip=True,
             headless=True,
             humanize=True,
@@ -325,6 +355,29 @@ class FBrefFetcher:
         return False
 
     def close(self) -> None:
+        close_error = None
+        if self._http_session is not None:
+            try:
+                self._http_session.close()
+            except Exception as exc:  # noqa: BLE001 - finish lease regardless
+                close_error = exc
+            finally:
+                self._http_session = None
+        if self._transport is not None:
+            try:
+                self._transport.close()
+            except Exception as exc:  # noqa: BLE001 - finish lease regardless
+                close_error = close_error or exc
+        try:
+            self._close_provider_lease()
+        except Exception as exc:  # noqa: BLE001 - retain first lifecycle error
+            close_error = close_error or exc
+        if close_error is not None:
+            raise close_error
+
+    def reset_clearance(self) -> None:
+        """Drop a dead clearance and its sticky metered lease."""
+
         if self._http_session is not None:
             try:
                 self._http_session.close()
@@ -332,60 +385,82 @@ class FBrefFetcher:
                 self._http_session = None
         if self._transport is not None:
             self._transport.close()
-
-    def reset_clearance(
-        self, *, error_type: Optional[str] = "cloudflare"
-    ) -> None:
-        """Drop the dead clearance while retaining in-run proxy quarantine."""
-
-        if (
-            error_type
-            and self._proxy_manager is not None
-            and self._current_proxy is not None
-        ):
-            self._proxy_manager.record_result(
-                self._current_proxy,
-                success=False,
-                error_type=error_type,
-            )
-        if self._http_session is not None:
-            try:
-                self._http_session.close()
-            finally:
-                self._http_session = None
-        if self._transport is not None:
-            self._transport.close()
-        self._current_proxy = None
+        self._close_provider_lease()
         self._bootstrap_stats = None
+        self._clearance = None
         self._transport = self._create_transport()
 
     def _next_proxy(self) -> Optional[dict]:
-        if self._proxy_manager is None:
-            self._current_proxy = None
-            return None
-        proxy = self._proxy_manager.get_proxy(
-            max_cooldown_wait_seconds=self._proxy_cooldown_wait_seconds,
-            sleep=self._sleep,
-        )
-        self._current_proxy = proxy
-        if proxy is None:
-            raise RuntimeError("fbref_proxy_pool_unavailable")
-        result = {"server": f"{proxy.proxy_type.value}://{proxy.host}:{proxy.port}"}
-        if proxy.username:
-            result["username"] = proxy.username
-            result["password"] = proxy.password or ""
-        return result
+        if self._lease_client is not None:
+            self._close_provider_lease()
+            remaining = self._provider_max_bytes - self._provider_total_bytes
+            if remaining <= 0:
+                raise FBrefProxyLeaseError("FBref provider byte budget exhausted")
+            lease = self._lease_client.acquire(
+                max_bytes=remaining,
+                ttl_seconds=self._provider_lease_ttl_seconds,
+                metadata=self._provider_context,
+            )
+            self._provider_lease = lease
+            self._provider_lease_observed_bytes = 0
+            return self._lease_client.playwright_proxy(lease)
+        return None
 
-    def _record_proxy_result(
-        self, success: bool, error_type: Optional[str] = None
-    ) -> None:
-        if self._proxy_manager is None or self._current_proxy is None:
+    def _observe_provider_stats(self, stats: FBrefLeaseStats) -> int:
+        if self._provider_lease is None:
+            raise FBrefProxyLeaseError("FBref proxy meter returned orphan stats")
+        current = int(stats.total_bytes)
+        if current < self._provider_lease_observed_bytes:
+            raise FBrefProxyLeaseError("FBref proxy meter counter moved backwards")
+        delta = current - self._provider_lease_observed_bytes
+        self._provider_lease_observed_bytes = current
+        self._provider_total_bytes += delta
+        if self._provider_total_bytes > self._provider_max_bytes:
+            raise FBrefProxyLeaseError("FBref proxy meter exceeded the run cap")
+        return delta
+
+    def _wait_and_observe_provider(self) -> None:
+        if self._lease_client is None or self._provider_lease is None:
             return
-        self._proxy_manager.record_result(
-            self._current_proxy,
-            success=success,
-            error_type=error_type,
+        stats = self._lease_client.wait_drained(
+            self._provider_lease,
+            expected=self._provider_context,
         )
+        self._observe_provider_stats(stats)
+
+    def _close_provider_lease(self) -> None:
+        lease_client = getattr(self, "_lease_client", None)
+        provider_lease = getattr(self, "_provider_lease", None)
+        if lease_client is None or provider_lease is None:
+            return
+        lease = provider_lease
+        try:
+            stats = lease_client.close(
+                lease,
+                expected=self._provider_context,
+            )
+            self._observe_provider_stats(stats)
+        finally:
+            self._provider_lease = None
+            self._provider_lease_observed_bytes = 0
+
+    def _finish_metered_fetch(self) -> None:
+        """Close the HTTP tunnel, then read a final provider counter.
+
+        Closing per logical fetch costs one new TCP/TLS connection on the next
+        page, but it makes every emitted ``provider_billed_bytes`` exact: no
+        keep-alive tail can be silently charged after the response is stored.
+        The Cloudflare clearance cookie and sticky lease exit are still reused.
+        """
+
+        if self._lease_client is None:
+            return
+        if self._http_session is not None:
+            try:
+                self._http_session.close()
+            finally:
+                self._http_session = None
+        self._wait_and_observe_provider()
 
     @staticmethod
     def _proxy_url(proxy: Optional[Mapping[str, str]]) -> Optional[str]:
@@ -482,6 +557,10 @@ class FBrefFetcher:
     def _ensure_clearance(self) -> None:
         if self._http_session is not None:
             return
+        retained_clearance = getattr(self, "_clearance", None)
+        if retained_clearance is not None:
+            self._http_session = self._create_http_session(retained_clearance)
+            return
         transport = self._transport
         html = None
         bootstrap_error = None
@@ -563,6 +642,7 @@ class FBrefFetcher:
                 browser_unobserved_bytes=breakdown[4],
             ) from clearance_error
         self._http_session = http_session
+        self._clearance = dict(clearance)
         self._bootstrap_stats = bootstrap_stats
 
     @staticmethod
@@ -656,7 +736,7 @@ class FBrefFetcher:
                 evidence.append(f"{name.replace('-', '_')}={value}")
         return ",".join(evidence)
 
-    def fetch(
+    def _fetch_without_provider_meter(
         self,
         url: str,
         *,
@@ -949,12 +1029,148 @@ class FBrefFetcher:
             metadata={"page_kind": page_kind, "fetcher_version": FETCHER_VERSION},
         )
 
+    def _provider_meter_failure(
+        self,
+        error: Exception,
+        *,
+        original: Optional[object],
+        before_provider_bytes: int,
+    ) -> FetchError:
+        """Turn a missing authoritative counter into a fail-closed fetch."""
+
+        # A close is a second, stronger accounting read: proxy-filter revokes
+        # every tunnel and returns only after its final byte event is durable.
+        exact_close = False
+        try:
+            self._close_provider_lease()
+            exact_close = True
+        except Exception:  # noqa: BLE001 - the returned error stays fail-closed
+            logger.exception("FBref paid lease final accounting failed")
+        self._clearance = None
+        values = {
+            "http_status": None,
+            "wire_bytes": 0,
+            "browser_document_bytes": 0,
+            "browser_asset_bytes": 0,
+            "browser_requests": 0,
+            "browser_bootstrap_attempts": 0,
+            "browser_unobserved_bytes": 0,
+            "target_requests": 0,
+            "http_status_history": (),
+            "latency_ms": 0,
+        }
+        if isinstance(original, FetchError):
+            values.update(
+                {
+                    "http_status": original.http_status,
+                    "wire_bytes": original.wire_bytes,
+                    "browser_document_bytes": original.browser_document_bytes,
+                    "browser_asset_bytes": original.browser_asset_bytes,
+                    "browser_requests": original.browser_requests,
+                    "browser_bootstrap_attempts": (
+                        original.browser_bootstrap_attempts
+                    ),
+                    "browser_unobserved_bytes": original.browser_unobserved_bytes,
+                    "target_requests": original.http_requests,
+                    "http_status_history": original.http_status_history,
+                    "latency_ms": original.latency_ms,
+                }
+            )
+        elif isinstance(original, FetchResponse):
+            values.update(
+                {
+                    "http_status": original.status_code,
+                    "wire_bytes": original.http_wire_bytes,
+                    "browser_document_bytes": original.browser_document_bytes,
+                    "browser_asset_bytes": original.browser_asset_bytes,
+                    "browser_requests": original.browser_requests,
+                    "browser_bootstrap_attempts": (
+                        original.browser_bootstrap_attempts
+                    ),
+                    "browser_unobserved_bytes": original.browser_unobserved_bytes,
+                    "target_requests": original.http_requests,
+                    "http_status_history": original.http_status_history,
+                    "latency_ms": original.latency_ms,
+                }
+            )
+        return FetchError(
+            "FBref provider counter unavailable: " f"{type(error).__name__}",
+            error_class="provider_meter_unavailable",
+            provider_billed_bytes=(
+                max(0, self._provider_total_bytes - before_provider_bytes)
+                if exact_close
+                else None
+            ),
+            **values,
+        )
+
+    def fetch(
+        self,
+        url: str,
+        *,
+        page_kind: str,
+        etag: Optional[str] = None,
+        last_modified: Optional[str] = None,
+    ) -> FetchResponse:
+        """Fetch one page and attach the exact proxy-filter byte delta."""
+
+        if getattr(self, "_lease_client", None) is None:
+            return self._fetch_without_provider_meter(
+                url,
+                page_kind=page_kind,
+                etag=etag,
+                last_modified=last_modified,
+            )
+        before = int(self._provider_total_bytes)
+        try:
+            response = self._fetch_without_provider_meter(
+                url,
+                page_kind=page_kind,
+                etag=etag,
+                last_modified=last_modified,
+            )
+        except Exception as original:
+            try:
+                self._finish_metered_fetch()
+            except Exception as meter_error:
+                raise self._provider_meter_failure(
+                    meter_error,
+                    original=original,
+                    before_provider_bytes=before,
+                ) from original
+            billed = int(self._provider_total_bytes) - before
+            if billed < 0:
+                raise FBrefProxyLeaseError(
+                    "FBref provider aggregate counter moved backwards"
+                ) from original
+            if isinstance(original, FetchError):
+                original.provider_billed_bytes = billed
+                raise
+            raise FetchError(
+                f"FBref transport failed: {type(original).__name__}",
+                error_class="transport_internal_error",
+                provider_billed_bytes=billed,
+            ) from original
+        try:
+            self._finish_metered_fetch()
+        except Exception as meter_error:
+            raise self._provider_meter_failure(
+                meter_error,
+                original=response,
+                before_provider_bytes=before,
+            ) from meter_error
+        billed = int(self._provider_total_bytes) - before
+        if billed < 0:
+            raise FBrefProxyLeaseError(
+                "FBref provider aggregate counter moved backwards"
+            )
+        return replace(response, provider_billed_bytes=billed)
+
 
 __all__ = [
     "DEFAULT_BROWSER_BYTE_LIMIT",
     "DEFAULT_BROWSER_REQUEST_LIMIT",
     "DEFAULT_BOOTSTRAP_URL",
-    "DEFAULT_PROXY_COOLDOWN_WAIT_SECONDS",
     "FETCHER_VERSION",
     "FBrefFetcher",
     "FetchError",

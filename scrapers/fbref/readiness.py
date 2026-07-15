@@ -10,14 +10,14 @@ from __future__ import annotations
 
 import hashlib
 import os
-import stat
 import uuid
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Mapping, Optional
+from urllib.parse import urlsplit
 
 from pyarrow import fs
 
-from scrapers.utils.proxy_manager import ProxyManager
+from scrapers.fbref.proxy_lease import FBREF_DAG_IDS, METER_ID
 
 
 EXPECTED_RAW_STORE_URI = "s3://football/raw/fbref"
@@ -45,67 +45,120 @@ def validate_raw_store_uri(uri: object) -> str:
     return normalized
 
 
-def validate_proxy_pool(
-    proxy_file: object,
+def validate_fbref_proxy_meter(
+    control_url: object,
     *,
-    minimum_healthy: int,
-    timeout_seconds: float = 3.0,
-    max_workers: int = 100,
-    manager_factory: Callable[..., ProxyManager] = ProxyManager,
+    control_token: object,
+    required_bytes: int,
+    minimum_configured_exits: int,
+    required_ttl_seconds: int = 7200,
+    timeout_seconds: float = 5.0,
+    session: Optional[Any] = None,
 ) -> dict[str, Any]:
-    """Parse and TCP-probe a proxy pool without issuing a paid HTTP request."""
+    """Authenticate and validate the dedicated meter without paid traffic."""
 
-    required = int(minimum_healthy)
-    if required <= 0:
-        raise ValueError("minimum_healthy must be positive")
-    path = Path(str(proxy_file)).expanduser()
-    if not path.is_absolute():
-        path = path.absolute()
-    try:
-        metadata = path.lstat()
-    except FileNotFoundError as exc:
-        raise ReadinessError(f"FBref proxy file not found: {path}") from exc
-    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
-        raise ReadinessError("FBref proxy path must be a regular non-symlink file")
-    if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-        raise ReadinessError("FBref proxy file must not be group/world writable")
-
-    payload = path.read_bytes()
-    digest = hashlib.sha256(payload).hexdigest()
-    configured = sum(
-        1
-        for raw_line in payload.decode("utf-8").splitlines()
-        if raw_line.strip() and not raw_line.lstrip().startswith("#")
-    )
-    if configured <= 0:
-        raise ReadinessError("FBref proxy file contains no configured exits")
-
-    manager = manager_factory(rotation_strategy="random")
-    loaded = int(manager.load_from_file_custom_format(str(path)))
-    if loaded != configured:
+    requested = int(required_bytes)
+    minimum = int(minimum_configured_exits)
+    required_ttl = int(required_ttl_seconds)
+    timeout = float(timeout_seconds)
+    if requested <= 0 or minimum <= 0 or required_ttl <= 0 or timeout <= 0:
+        raise ValueError("FBref proxy readiness limits must be positive")
+    base = str(control_url or "").strip().rstrip("/")
+    parsed = urlsplit(base)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
         raise ReadinessError(
-            "FBref proxy file contains malformed entries: "
-            f"configured={configured}, parsed={loaded}"
+            "FBREF_PROXY_CONTROL_URL must be credential-free absolute HTTP(S)"
         )
-    evidence = manager.validate_proxies(
-        timeout=float(timeout_seconds),
-        max_workers=int(max_workers),
-        ban_failed=True,
-    )
-    healthy = int(evidence.get("alive") or 0)
-    if healthy < required:
+    token = str(control_token or "").strip()
+    if len(token) < 32:
         raise ReadinessError(
-            f"FBref proxy pool has {healthy} healthy exits; {required} required"
+            "FBREF_PROXY_CONTROL_TOKEN must contain at least 32 characters"
+        )
+    client = session
+    if client is None:
+        import requests
+
+        client = requests.Session()
+        client.trust_env = False
+    try:
+        response = client.get(
+            f"{base}/v1/auth-check",
+            headers={"X-Proxy-Control-Token": token},
+            timeout=timeout,
+        )
+    except Exception as exc:  # noqa: BLE001 - secret-safe dependency boundary
+        raise ReadinessError(
+            f"FBref proxy meter is unavailable: {type(exc).__name__}"
+        ) from exc
+    status = int(getattr(response, "status_code", 0) or 0)
+    if status != 200:
+        raise ReadinessError(
+            f"FBref proxy meter authentication failed (HTTP {status})"
+        )
+    try:
+        payload = response.json()
+    except Exception as exc:  # noqa: BLE001 - untrusted health response
+        raise ReadinessError("FBref proxy meter returned invalid JSON") from exc
+    if not isinstance(payload, Mapping):
+        raise ReadinessError("FBref proxy meter returned a non-object")
+
+    def integer(name: str) -> int:
+        value = payload.get(name)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ReadinessError(f"FBref proxy meter has invalid {name}")
+        return value
+
+    daily_total = integer("daily_total_bytes")
+    daily_budget = integer("daily_budget_bytes")
+    daily_remaining = integer("daily_remaining_bytes")
+    dagrun_budget = integer("dagrun_budget_bytes")
+    url_budget = integer("url_budget_bytes")
+    max_lease = integer("max_lease_bytes")
+    max_ttl = integer("max_lease_ttl_seconds")
+    max_active = integer("max_active_leases")
+    configured = integer("configured_pool_count")
+    lease_proxy_url = urlsplit(str(payload.get("lease_proxy_url") or ""))
+    if (
+        str(payload.get("status") or "") != "ok"
+        or str(payload.get("meter") or "") != METER_ID
+        or payload.get("fbref_source_ready") is not True
+        or payload.get("fbref_dag_ids") != sorted(FBREF_DAG_IDS)
+        or daily_total + daily_remaining != daily_budget
+        or min(daily_remaining, dagrun_budget, url_budget, max_lease) < requested
+        or max_ttl < required_ttl
+        or max_active != 1
+        or configured < minimum
+        or lease_proxy_url.scheme != parsed.scheme
+        or lease_proxy_url.hostname != parsed.hostname
+        or lease_proxy_url.username is not None
+        or lease_proxy_url.password is not None
+        or lease_proxy_url.path not in {"", "/"}
+        or lease_proxy_url.query
+        or lease_proxy_url.fragment
+    ):
+        raise ReadinessError(
+            "FBref dedicated proxy meter does not satisfy the live hard profile"
         )
     return {
-        "proxy_file_sha256": digest,
+        "status": "passed",
+        "meter": METER_ID,
         "configured": configured,
-        "parsed": loaded,
-        "healthy": healthy,
-        "dead": int(evidence.get("dead") or 0),
-        "minimum_healthy": required,
-        # Deliberately exclude the path, hosts, usernames, and passwords.
-        "probe": "tcp_connect_only",
+        "minimum_configured": minimum,
+        "daily_remaining_bytes": daily_remaining,
+        "dagrun_budget_bytes": dagrun_budget,
+        "url_budget_bytes": url_budget,
+        "max_lease_bytes": max_lease,
+        "max_lease_ttl_seconds": max_ttl,
+        "max_active_leases": max_active,
+        "probe": "authenticated_control_only_zero_paid_bytes",
     }
 
 
@@ -186,6 +239,6 @@ __all__ = [
     "ReadinessError",
     "check_raw_store_roundtrip",
     "check_trino_roundtrip",
-    "validate_proxy_pool",
+    "validate_fbref_proxy_meter",
     "validate_raw_store_uri",
 ]

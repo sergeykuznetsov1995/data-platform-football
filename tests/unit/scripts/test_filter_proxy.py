@@ -288,6 +288,55 @@ def test_proxy_filter_compose_is_env_only_by_default():
     assert "${PROXY_FILTER_MAX_ACTIVE_LEASES:-4}" in service
 
 
+def test_fbref_has_an_isolated_metered_proxy_service():
+    compose = _COMPOSE_PATH.read_text()
+    service = compose.split("  fbref_proxy_filter:\n", 1)[1].split(
+        "\n  proxy_filter:\n", 1
+    )[0]
+
+    assert "PROXY_POOL_JSON: \"\"" in service
+    assert "PROXY_FILTER_ALLOW_FILE_FALLBACK: \"true\"" in service
+    assert "./proxys.txt:/opt/airflow/proxys.txt:ro" in service
+    assert "http://fbref_proxy_filter:8900" in service
+    assert "${FBREF_PROXY_DAGRUN_BUDGET_BYTES:-104857600}" in service
+    assert "${FBREF_PROXY_URL_BUDGET_BYTES:-104857600}" in service
+    assert '\n      - "1"' in service
+    assert "/logs/fbref/proxy_filter/unused_sofascore_claims.jsonl" in service
+    assert "/logs/proxy_filter/sofascore_allocation_claims.jsonl" not in service
+
+
+def test_fbref_lease_is_scoped_metered_and_host_restricted(mod):
+    assert mod._source_for_dag("dag_ingest_fbref") == "fbref"
+    assert mod._source_for_dag("dag_backfill_fbref") == "fbref"
+    lease = mod.Lease(
+        lease_id="fbref-lease",
+        token="secret",
+        upstream=("proxy.example", 10000, "user", "password"),
+        created_at=0.0,
+        expires_at=9999999999.0,
+        max_bytes=1000,
+        dag_id="dag_ingest_fbref",
+        run_id="run",
+        source="fbref",
+    )
+
+    assert lease.report()["meter"] == "proxy_filter_provider_path_v2"
+    assert mod._lease_host_allowed(lease, "fbref.com") is True
+    assert mod._lease_host_allowed(lease, "www.fbref.com") is True
+    assert mod._lease_host_allowed(lease, "challenges.cloudflare.com") is True
+    assert mod._lease_host_allowed(lease, "example.com") is False
+    assert mod._lease_url_budget_bytes(lease) == mod.DAGRUN_BUDGET_BYTES
+
+
+def test_production_airflow_enables_safe_fbref_stage_janitor():
+    compose = _COMPOSE_PATH.read_text()
+    common = compose.split("x-airflow-common:", 1)[1].split("\nservices:", 1)[0]
+
+    assert (
+        "FBREF_STAGE_JANITOR_MODE: ${FBREF_STAGE_JANITOR_MODE:-apply}" in common
+    )
+
+
 # --- _dump --------------------------------------------------------------------
 
 
@@ -593,6 +642,10 @@ class _FakeManager:
         url = self._urls[self.calls % len(self._urls)]
         self.calls += 1
         return _FakeProxy(url)
+
+    @property
+    def total_count(self):
+        return len(self._urls)
 
 
 def test_pick_upstream_parses_creds_from_url(mod):
@@ -1597,6 +1650,62 @@ def test_v1_lease_control_contract_returns_token_and_authenticated_stats(mod):
     assert stats["dagrun_budget_bytes"] == 4096
     assert stats["budget_artifact_id"] == "a" * 64
     assert created["token"] not in stats_body.decode()
+
+
+def test_fbref_auth_check_proves_meter_config_without_paid_lease(mod):
+    mgr = _FakeManager(
+        [
+            "http://u:p@pool.invalid:10000",
+            "http://u:p@pool.invalid:10001",
+        ]
+    )
+    mod.DAILY_BUDGET_BYTES = 300_000_000
+    mod.DAGRUN_BUDGET_BYTES = 104_857_600
+    mod.URL_BUDGET_BYTES = 104_857_600
+    mod.MAX_LEASE_BYTES = 104_857_600
+    mod.MAX_LEASE_TTL_SECONDS = 7200
+    mod.MAX_ACTIVE_LEASES = 1
+    mod.LEASE_PROXY_URL = "http://fbref_proxy_filter:8900"
+
+    class Reader:
+        async def readexactly(self, _length):
+            raise AssertionError("auth check must not read a request body")
+
+    class Writer:
+        def __init__(self):
+            self.payload = bytearray()
+
+        def write(self, value):
+            self.payload.extend(value)
+
+        async def drain(self):
+            return None
+
+        def close(self):
+            return None
+
+    writer = Writer()
+    handled = asyncio.run(
+        mod._handle_control(
+            "GET",
+            "/v1/auth-check",
+            {"x-proxy-control-token": mod.CONTROL_TOKEN},
+            Reader(),
+            writer,
+            mgr,
+        )
+    )
+    head, body = bytes(writer.payload).split(b"\r\n\r\n", 1)
+    report = json.loads(body)
+
+    assert handled is True
+    assert b"200 OK" in head
+    assert report["meter"] == "proxy_filter_provider_path_v2"
+    assert report["fbref_source_ready"] is True
+    assert report["configured_pool_count"] == 2
+    assert report["max_active_leases"] == 1
+    assert mod.LEASES == {}
+    assert mgr.calls == 0
 
 
 def test_lease_creation_rejects_missing_control_token_without_state(mod):

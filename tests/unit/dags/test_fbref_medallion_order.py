@@ -100,8 +100,10 @@ def test_fbref_child_runs_have_parent_unique_identity_and_never_share_ds():
         template = _literal(trigger["trigger_run_id"])
         assert "{{ dag.dag_id }}" in template
         assert "{{ run_id }}" in template
-        assert _literal(trigger["logical_date"]) == "{{ ti.start_date }}"
-        assert "execution_date" not in trigger
+        # Airflow 2.7 names this TriggerDagRunOperator argument
+        # ``execution_date``; Airflow 2.11 keeps it as a compatible alias.
+        assert _literal(trigger["execution_date"]) == "{{ ti.start_date }}"
+        assert "logical_date" not in trigger
         rendered_ids.add(
             template.replace("{{ dag.dag_id }}", parent_dag_id).replace(
                 "{{ run_id }}", "same-day-run"

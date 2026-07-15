@@ -156,6 +156,85 @@ def test_raw_baseline_anchor_is_create_once_and_conflict_checked():
         )
 
 
+def test_passed_raw_audit_anchor_is_create_once_and_queryable():
+    run_id = str(uuid.uuid4())
+    metadata = {"raw_baseline": {"baseline_sha256": "a" * 64}}
+
+    def handler(sql, params):
+        if (
+            "SELECT status, metadata FROM fbref_control.crawl_run" in sql
+            and "FOR UPDATE" in sql
+        ):
+            return [{"status": "running", "metadata": dict(metadata)}], 1
+        if "SET metadata = metadata ||" in sql:
+            metadata.update(json.loads(params[0]))
+            return [], 1
+        if "metadata -> 'raw_audit'" in sql:
+            return [{"raw_audit": metadata.get("raw_audit")}], 1
+        raise AssertionError(sql)
+
+    store = ControlStore(
+        "postgresql://airflow:pw@postgres/airflow",
+        connection_factory=FakeFactory(handler),
+    )
+    evidence = {
+        "schema_version": "fbref-raw-audit-anchor-v1",
+        "status": "passed",
+        "run_type": "current",
+        "audited_control_run_id": run_id,
+        "processing_control_run_id": run_id,
+        "successful_attempt_count": 2,
+        "audited_attempt_count": 2,
+        "failure_count": 0,
+        "zero_delta_required": False,
+        "attempt_snapshot_sha256": "b" * 64,
+        "artifact_sha256": "c" * 64,
+        "artifact": f"/opt/airflow/logs/fbref_acceptance/{run_id}.json",
+    }
+
+    first = store.record_raw_audit(run_id, evidence)
+    retried = store.record_raw_audit(run_id, evidence)
+
+    assert first["idempotent"] is False
+    assert retried["idempotent"] is True
+    assert store.get_raw_audit(run_id) == evidence
+    with pytest.raises(StateConflict, match="different raw audit anchor"):
+        store.record_raw_audit(
+            run_id, {**evidence, "artifact_sha256": "d" * 64}
+        )
+
+
+def test_raw_audit_anchor_rejects_wrong_run_or_missing_baseline():
+    run_id = str(uuid.uuid4())
+    evidence = {
+        "schema_version": "fbref-raw-audit-anchor-v1",
+        "status": "passed",
+        "run_type": "current",
+        "audited_control_run_id": run_id,
+        "processing_control_run_id": str(uuid.uuid4()),
+        "successful_attempt_count": 1,
+        "audited_attempt_count": 1,
+        "failure_count": 0,
+        "zero_delta_required": False,
+        "attempt_snapshot_sha256": "b" * 64,
+        "artifact_sha256": "c" * 64,
+        "artifact": "/tmp/raw-audit.json",
+    }
+    store = ControlStore(
+        "postgresql://airflow:pw@postgres/airflow",
+        connection_factory=FakeFactory(
+            lambda sql, params: ([{"status": "running", "metadata": {}}], 1)
+        ),
+    )
+
+    with pytest.raises(StateConflict, match="does not match"):
+        store.record_raw_audit(run_id, evidence)
+
+    evidence["processing_control_run_id"] = run_id
+    with pytest.raises(StateConflict, match="without a baseline"):
+        store.record_raw_audit(run_id, evidence)
+
+
 @pytest.mark.parametrize(
     ("status", "source_started", "message"),
     [

@@ -83,6 +83,10 @@ jobs:
   airflow-dagbag:
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        airflow-version: ["2.7.3", "2.11.2"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -90,11 +94,13 @@ jobs:
           python-version: "3.11"
           cache: pip
       - name: Install the production Airflow runtime
+        env:
+          AIRFLOW_VERSION: ${{ matrix.airflow-version }}
         run: |
           python -m pip install --disable-pip-version-check \
-            "apache-airflow==2.11.2" \
+            "apache-airflow==$AIRFLOW_VERSION" \
             --constraint \
-            "https://raw.githubusercontent.com/apache/airflow/constraints-2.11.2/constraints-3.11.txt"
+            "https://raw.githubusercontent.com/apache/airflow/constraints-$AIRFLOW_VERSION/constraints-3.11.txt"
       - name: Import production FBref DAGs
         env:
           AIRFLOW_HOME: ${{ runner.temp }}/airflow

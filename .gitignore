@@ -210,6 +210,7 @@ docs/
 docs/*
 !docs/operations/
 docs/operations/*
+!docs/operations/fbref-paid-transport.md
 !docs/operations/sql/
 docs/operations/sql/*
 !docs/operations/sql/fbref_production_acceptance.sql

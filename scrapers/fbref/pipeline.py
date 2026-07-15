@@ -111,6 +111,8 @@ SENTINEL_COMPETITIONS = (
 # fence and renew all outstanding sequential leases before every target.
 FETCH_LEASE_SECONDS = 60 * 60
 PROCESSING_LEASE_SECONDS = 60 * 60
+REPLAY_SOURCE_REQUEST_LIMIT = 200
+REPLAY_SOURCE_BYTE_LIMIT = 100 * MIB
 
 # Statuses Cloudflare returns when it no longer honours a cf_clearance for the
 # warm HTTP session. They say nothing about the target page — only that this
@@ -435,32 +437,6 @@ def _session_failure(exc: FetchError) -> bool:
     ) or exc.error_class.startswith("warm_session_")
 
 
-def _session_proxy_error_type(exc: FetchError) -> Optional[str]:
-    """Map a poisoned session to the proxy quarantine's stable vocabulary."""
-
-    if (
-        exc.http_status in CLEARANCE_REJECTED_STATUSES
-        or exc.error_class
-        in {
-            "clearance_export_failed",
-            "raw_contract_cloudflare_challenge",
-        }
-    ):
-        return "cloudflare"
-    prefix = "warm_session_"
-    if exc.error_class.startswith(prefix):
-        error_type = exc.error_class[len(prefix):]
-        if error_type in {
-            "cloudflare",
-            "connection",
-            "forbidden",
-            "rate_limit",
-            "timeout",
-        }:
-            return error_type
-    return None
-
-
 def _sentinel_gate_errors(coverage: object) -> list[str]:
     """Validate expected published men's competitions without seeding scope."""
 
@@ -691,12 +667,10 @@ class FBrefPipeline:
         self.generic_writer = generic_writer or FBrefGenericBronzeWriter()
         self.typed_adapter = typed_adapter or FBrefTypedBronzeAdapter()
         self.fetcher_factory = fetcher_factory or (
-            lambda proxy_file, max_browser_requests, max_browser_bytes,
-            min_healthy_proxies: FBrefFetcher(
+            lambda proxy_file, max_browser_requests, max_browser_bytes: FBrefFetcher(
                 proxy_file=proxy_file,
                 max_browser_requests=max_browser_requests,
                 max_browser_bytes=max_browser_bytes,
-                min_healthy_proxies=min_healthy_proxies,
             )
         )
         self.sleep = sleep
@@ -761,7 +735,7 @@ class FBrefPipeline:
         return target.target_id
 
     def _replay_source_error(self, source_run_id: Optional[str]) -> Optional[str]:
-        """Return a fail-closed source-run contract error, if any."""
+        """Require one fully accepted production source run for replay."""
 
         if not source_run_id:
             return "replay_source_run_id_missing"
@@ -775,8 +749,44 @@ class FBrefPipeline:
         if run_type not in {"current", "backfill"}:
             return f"replay_source_run_type_forbidden={run_type}"
         status = str(source_run.get("status") or "unknown").lower()
-        if status not in {"succeeded", "failed", "cancelled"}:
-            return f"replay_source_run_not_terminal={status}"
+        if status != "succeeded":
+            return f"replay_source_run_not_succeeded={status}"
+        try:
+            source_request_limit = int(source_run.get("request_limit"))
+            source_byte_limit = int(source_run.get("byte_limit"))
+        except (TypeError, ValueError):
+            return "replay_source_run_not_production_profile"
+        if source_request_limit != REPLAY_SOURCE_REQUEST_LIMIT or (
+            source_byte_limit != REPLAY_SOURCE_BYTE_LIMIT
+        ):
+            return "replay_source_run_not_production_profile"
+        metadata = source_run.get("metadata")
+        if not isinstance(metadata, Mapping):
+            return "replay_source_raw_audit_missing"
+        raw_audit = metadata.get("raw_audit")
+        if not isinstance(raw_audit, Mapping):
+            return "replay_source_raw_audit_missing"
+        try:
+            successful_attempt_count = int(
+                raw_audit.get("successful_attempt_count")
+            )
+            audited_attempt_count = int(raw_audit.get("audited_attempt_count"))
+        except (TypeError, ValueError):
+            return "replay_source_raw_audit_not_accepted"
+        if (
+            str(raw_audit.get("schema_version") or "")
+            != "fbref-raw-audit-anchor-v1"
+            or str(raw_audit.get("status") or "").casefold() != "passed"
+            or str(raw_audit.get("run_type") or "").casefold() != run_type
+            or raw_audit.get("zero_delta_required") is not False
+            or successful_attempt_count <= 0
+            or audited_attempt_count <= 0
+            or str(raw_audit.get("audited_control_run_id") or "")
+            != str(source_run_id)
+            or str(raw_audit.get("processing_control_run_id") or "")
+            != str(source_run_id)
+        ):
+            return "replay_source_raw_audit_not_accepted"
         return None
 
     def seed_historical_seasons(
@@ -1121,11 +1131,6 @@ class FBrefPipeline:
                                         settings.proxy_file,
                                         settings.bootstrap_request_reservation,
                                         settings.bootstrap_byte_reservation,
-                                        (
-                                            4
-                                            if settings.request_limit >= 200
-                                            else 1
-                                        ),
                                     )
                                 )
                             )
@@ -1337,7 +1342,7 @@ class FBrefPipeline:
                             None,
                         )
                         if callable(reset):
-                            reset(error_type=_session_proxy_error_type(exc))
+                            reset()
                         else:
                             live_session.stack.close()
                             live_session.stack = ExitStack()

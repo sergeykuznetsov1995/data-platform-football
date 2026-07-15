@@ -601,6 +601,7 @@ FROM iceberg.information_schema.tables
 WHERE table_schema = 'bronze'
   AND regexp_like(table_name, '^fbref_.*__stg_');
 
--- Raw S3 integrity is intentionally not inferred from Trino. Match the same
--- control_run_id against the content-addressed raw_integrity-<sha256>.json and
--- its SHA256 sidecar produced by scripts/audit_fbref_production.py.
+-- Raw S3 integrity is intentionally not inferred from Trino. Run the
+-- PostgreSQL companion query with the same control_run_id: crawl_run.metadata
+-- contains the create-once passed artifact digest, path, attempt fingerprint,
+-- and run identity that DataGrip can verify without reading Airflow XCom.

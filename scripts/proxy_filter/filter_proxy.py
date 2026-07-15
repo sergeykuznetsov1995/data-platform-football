@@ -77,6 +77,7 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s filter_proxy: %(message)s"
 )
 log = logging.getLogger("filter_proxy")
+PROVIDER_METER_ID = "proxy_filter_provider_path_v2"
 
 # billable residential bytes, per target host (sum of both tunnel directions)
 up_bytes: dict[str, int] = defaultdict(int)
@@ -108,6 +109,7 @@ TRANSFERMARKT_DAG_IDS = frozenset(
         "dag_discover_transfermarkt_registry",
     }
 )
+FBREF_DAG_IDS = frozenset({"dag_ingest_fbref", "dag_backfill_fbref"})
 SOFASCORE_DAG_IDS = frozenset({"dag_ingest_sofascore"})
 SOFASCORE_CANARY_DAG_IDS = frozenset({"dag_canary_sofascore_proxy"})
 # Registry discovery is a non-signed, metered JSON scan of the public catalog.
@@ -154,6 +156,15 @@ SOFASCORE_PARENT_ENVELOPE_LEDGER: "ParentRunEnvelopeLedger | None" = None
 _SOFASCORE_PARENT_ENVELOPE_LEDGER_PATH = ""
 SOFASCORE_CHALLENGE_HOSTS = frozenset(
     {"challenges.cloudflare.com", "turnstile.cloudflare.com"}
+)
+FBREF_ALLOWED_HOSTS = frozenset(
+    {
+        "api.ipify.org",
+        "challenges.cloudflare.com",
+        "fbref.com",
+        "ipinfo.io",
+        "turnstile.cloudflare.com",
+    }
 )
 _SENSITIVE_QUERY_KEYS = frozenset(
     {
@@ -230,6 +241,8 @@ def _source_for_dag(dag_id: str) -> str:
         return "sofascore"
     if dag_id in TRANSFERMARKT_DAG_IDS:
         return "transfermarkt"
+    if dag_id in FBREF_DAG_IDS:
+        return "fbref"
     if dag_id == "dag_ingest_whoscored":
         return "whoscored"
     return ""
@@ -322,6 +335,7 @@ class Lease:
 
     def report(self) -> dict[str, Any]:
         return {
+            "meter": PROVIDER_METER_ID,
             "id": self.lease_id,
             "created_at": self.created_at,
             "expires_at": self.expires_at,
@@ -450,6 +464,11 @@ def _lease_host_allowed(lease: Lease | None, host: str) -> bool:
             normalized == "sofascore.com"
             or normalized.endswith(".sofascore.com")
             or normalized in SOFASCORE_CHALLENGE_HOSTS
+        )
+    if lease is not None and lease.source == "fbref":
+        return (
+            normalized in FBREF_ALLOWED_HOSTS
+            or normalized.endswith(".fbref.com")
         )
     return True
 
@@ -678,7 +697,12 @@ def _lease_url_budget_bytes(lease: Lease) -> int:
     # legacy per-page WhoScored ceiling cannot truncate the warmed session.
     # Registry discovery has the same shape: thousands of JSON reads against
     # one canonical API origin, so the 2 MB per-URL ceiling would strangle it.
-    if lease.source in ("sofascore", "sofascore_canary", "sofascore_discovery"):
+    if lease.source in (
+        "fbref",
+        "sofascore",
+        "sofascore_canary",
+        "sofascore_discovery",
+    ):
         return _lease_dagrun_budget_bytes(lease)
     return URL_BUDGET_BYTES
 
@@ -1429,6 +1453,8 @@ def _create_lease(
         item.source == "sofascore_discovery" for item in active_leases
     ):
         raise RuntimeError("SofaScore discovery paid-proxy concurrency limit reached")
+    if source == "fbref" and any(item.source == "fbref" for item in active_leases):
+        raise RuntimeError("FBref paid-proxy concurrency limit reached")
     # Canary deltas must not overlap any other paid traffic on this provider
     # process.  Conversely, no normal lease starts while a canary is active.
     if (source == "sofascore_canary" and active_leases) or any(
@@ -1455,7 +1481,8 @@ def _create_lease(
         dagrun_budget = _dagrun_budget_bytes(dag_id)
     url_budget = (
         dagrun_budget
-        if source in ("sofascore", "sofascore_canary", "sofascore_discovery")
+        if source
+        in ("fbref", "sofascore", "sofascore_canary", "sofascore_discovery")
         else URL_BUDGET_BYTES
     )
     available = min(
@@ -2172,6 +2199,46 @@ def _control_report(lease: Lease) -> dict[str, Any]:
     return report
 
 
+def _service_health_report(mgr) -> dict[str, Any]:
+    """Credential-free configuration and counters, never pool identities."""
+
+    remaining = max(0, DAILY_BUDGET_BYTES - _daily_total_bytes())
+    return {
+        "status": "ok",
+        "meter": PROVIDER_METER_ID,
+        "daily_total_bytes": _daily_total_bytes(),
+        "daily_budget_bytes": DAILY_BUDGET_BYTES,
+        "daily_remaining_bytes": remaining,
+        "max_lease_bytes": MAX_LEASE_BYTES,
+        "max_lease_ttl_seconds": MAX_LEASE_TTL_SECONDS,
+        "max_active_leases": MAX_ACTIVE_LEASES,
+        "dagrun_budget_bytes": DAGRUN_BUDGET_BYTES,
+        "url_budget_bytes": URL_BUDGET_BYTES,
+        "lease_proxy_url": LEASE_PROXY_URL,
+        "configured_pool_count": int(mgr.total_count),
+        "fbref_source_ready": bool(
+            FBREF_DAG_IDS
+            and DAGRUN_BUDGET_BYTES > 0
+            and URL_BUDGET_BYTES > 0
+            and MAX_LEASE_BYTES > 0
+            and int(mgr.total_count) > 0
+        ),
+        "fbref_dag_ids": sorted(FBREF_DAG_IDS),
+        "sofascore_paid_enabled": SOFASCORE_DAGRUN_BUDGET_BYTES > 0,
+        "sofascore_dagrun_budget_bytes": SOFASCORE_DAGRUN_BUDGET_BYTES,
+        "sofascore_budget_artifact_id": SOFASCORE_BUDGET_ARTIFACT_ID,
+        "sofascore_canary_enabled": SOFASCORE_CANARY_HARD_CAP_BYTES > 0,
+        "sofascore_canary_hard_cap_bytes": SOFASCORE_CANARY_HARD_CAP_BYTES,
+        "sofascore_canary_policy_id": SOFASCORE_CANARY_POLICY_ID,
+        "sofascore_discovery_enabled": (
+            SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES > 0
+        ),
+        "sofascore_discovery_dagrun_budget_bytes": (
+            SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES
+        ),
+    }
+
+
 async def _handle_control(
     method: str,
     target: str,
@@ -2183,29 +2250,15 @@ async def _handle_control(
     """Serve the lease API on the proxy listener; return False for proxy traffic."""
     path = urlsplit(target).path
     if method == "GET" and path == "/health":
-        await _send_json(
-            writer,
-            200,
-            {
-                "status": "ok",
-                "daily_total_bytes": _daily_total_bytes(),
-                "daily_budget_bytes": DAILY_BUDGET_BYTES,
-                "sofascore_paid_enabled": SOFASCORE_DAGRUN_BUDGET_BYTES > 0,
-                "sofascore_dagrun_budget_bytes": SOFASCORE_DAGRUN_BUDGET_BYTES,
-                "sofascore_budget_artifact_id": SOFASCORE_BUDGET_ARTIFACT_ID,
-                "sofascore_canary_enabled": SOFASCORE_CANARY_HARD_CAP_BYTES > 0,
-                "sofascore_canary_hard_cap_bytes": SOFASCORE_CANARY_HARD_CAP_BYTES,
-                "sofascore_canary_policy_id": SOFASCORE_CANARY_POLICY_ID,
-                "sofascore_discovery_enabled": (
-                    SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES > 0
-                ),
-                "sofascore_discovery_dagrun_budget_bytes": (
-                    SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES
-                ),
-            },
-        )
+        await _send_json(writer, 200, _service_health_report(mgr))
         return True
 
+    if method == "GET" and path == "/v1/auth-check":
+        if not _control_token_valid(headers):
+            await _send_json(writer, 401, {"error": "invalid control token"})
+            return True
+        await _send_json(writer, 200, _service_health_report(mgr))
+        return True
     if path.startswith("/v1/leases") and not _control_token_valid(headers):
         await _send_json(writer, 401, {"error": "invalid control token"})
         return True

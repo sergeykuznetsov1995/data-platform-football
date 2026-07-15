@@ -304,7 +304,7 @@ with DAG(
         task_id="trigger_silver_transform",
         trigger_dag_id="dag_transform_fbref_silver",
         trigger_run_id="fbref_silver__{{ dag.dag_id }}__{{ run_id }}",
-        logical_date="{{ ti.start_date }}",
+        execution_date="{{ ti.start_date }}",
         conf={
             "fbref_source_dag_id": DAG_ID,
             "fbref_source_run_id": AIRFLOW_RUN_ID,

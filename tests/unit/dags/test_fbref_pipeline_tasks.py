@@ -101,13 +101,17 @@ def test_production_readiness_combines_alert_env_and_runtime_limits(monkeypatch)
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "token")
     monkeypatch.setenv("TELEGRAM_CHAT_ID", "123")
     monkeypatch.setenv("FBREF_RAW_STORE_URI", "s3://football/raw/fbref")
+    monkeypatch.setenv(
+        "FBREF_PROXY_CONTROL_URL", "http://fbref_proxy_filter:8899"
+    )
+    monkeypatch.setenv("FBREF_PROXY_CONTROL_TOKEN", "t" * 32)
     proxy_check = MagicMock(return_value={
-        "healthy": 4,
-        "minimum_healthy": 4,
-        "probe": "tcp_connect_only",
+        "configured": 1000,
+        "minimum_configured": 4,
+        "probe": "authenticated_control_only_zero_paid_bytes",
     })
     monkeypatch.setattr(
-        "scrapers.fbref.readiness.validate_proxy_pool", proxy_check
+        "scrapers.fbref.readiness.validate_fbref_proxy_meter", proxy_check
     )
     control = MagicMock()
     control.validate_migrations.return_value = {
@@ -149,7 +153,7 @@ def test_production_readiness_combines_alert_env_and_runtime_limits(monkeypatch)
     assert result["alert_env"] == "prod"
     assert result["alert_delivery"] == "telegram"
     assert result["profile"] == "production"
-    assert result["healthy"] == 4
+    assert result["configured"] == 1000
     assert result["dependencies"]["control_migrations"]["read_only"] is True
     assert result["dependencies"]["raw_store"] == {"status": "passed"}
     assert result["dependencies"]["trino"] == {"status": "passed"}
@@ -158,8 +162,10 @@ def test_production_readiness_combines_alert_env_and_runtime_limits(monkeypatch)
     raw_health.assert_called_once_with(raw_store)
     trino_health.assert_called_once_with(trino)
     proxy_check.assert_called_once_with(
-        fbref_pipeline_tasks.DEFAULT_PROXY_FILE,
-        minimum_healthy=4,
+        "http://fbref_proxy_filter:8899",
+        control_token="t" * 32,
+        required_bytes=100 * fbref_pipeline_tasks.MIB,
+        minimum_configured_exits=4,
     )
 
 
@@ -261,6 +267,7 @@ def test_airflow_raw_audit_is_a_persisted_publication_gate(
             "logical_refresh_id": str(uuid.uuid4()),
         }
     ]
+    attempt_snapshot = successful_attempt_snapshot(attempts)
     load = MagicMock(return_value=attempts)
     monkeypatch.setattr(
         "scrapers.fbref.raw_audit.load_successful_run_attempts", load
@@ -272,6 +279,12 @@ def test_airflow_raw_audit_is_a_persisted_publication_gate(
             "successful_attempt_count": 1,
             "audited_attempt_count": 1,
             "failures": [],
+            "metadata": {
+                "processing_control_run_id": processing_run_id,
+                "raw_attempt_snapshot_sha256": attempt_snapshot[
+                    "successful_attempt_ids_sha256"
+                ],
+            },
         }
     )
     monkeypatch.setattr("scrapers.fbref.raw_audit.audit_raw_fetches", audit)
@@ -284,8 +297,19 @@ def test_airflow_raw_audit_is_a_persisted_publication_gate(
     control.get_raw_baseline.return_value = raw_baseline_anchor(
         baseline.summary, baseline.baseline_sha256
     )
-    attempt_snapshot = successful_attempt_snapshot(attempts)
+    installed_raw_audit = None
+
+    def get_raw_audit(_run_id):
+        return installed_raw_audit
+
+    def record_raw_audit(_run_id, evidence):
+        nonlocal installed_raw_audit
+        installed_raw_audit = dict(evidence)
+        return {**installed_raw_audit, "idempotent": False}
+
+    control.get_raw_audit.side_effect = get_raw_audit
     control.seal_raw_fetch_attempts.return_value = attempt_snapshot
+    control.record_raw_audit.side_effect = record_raw_audit
     monkeypatch.setattr(
         fbref_pipeline_tasks, "_control_store", MagicMock(return_value=control)
     )
@@ -317,7 +341,33 @@ def test_airflow_raw_audit_is_a_persisted_publication_gate(
     assert summary["attempt_snapshot_sha256"] == (
         attempt_snapshot["successful_attempt_ids_sha256"]
     )
+    assert summary["control_anchored"] is True
+    assert summary["idempotent"] is False
     assert control.seal_raw_fetch_attempts.call_count == 2
+    assert control.record_raw_audit.call_count == 1
+    anchored_run_id, anchored = control.record_raw_audit.call_args.args
+    assert anchored_run_id == processing_run_id
+    assert anchored["audited_control_run_id"] == audited_run_id
+    assert anchored["artifact_sha256"] == summary["artifact_sha256"]
+
+    # Simulate a worker crash after the database anchor committed but before
+    # Airflow recorded task success. The retry verifies and reuses that exact
+    # artifact instead of generating a timestamp-dependent conflicting one.
+    retried = fbref_pipeline_tasks.audit_fbref_raw_integrity(
+        airflow_run_id=airflow_run_id,
+        dag_id=dag_id,
+        run_type=run_type,
+        source_control_run_id=(
+            source_run_id if run_type == "replay" else None
+        ),
+    )
+
+    assert retried["idempotent"] is True
+    assert retried["artifact_sha256"] == summary["artifact_sha256"]
+    assert audit.call_count == 1
+    assert load.call_count == 1
+    assert control.record_raw_audit.call_count == 1
+    assert control.seal_raw_fetch_attempts.call_count == 3
 
 
 @pytest.mark.unit
@@ -356,6 +406,7 @@ def test_airflow_raw_audit_rejects_a_replaced_baseline_file(
     )
     control = MagicMock()
     control.get_raw_baseline.return_value = anchor
+    control.get_raw_audit.return_value = None
     monkeypatch.setattr(
         fbref_pipeline_tasks, "_control_store", MagicMock(return_value=control)
     )
@@ -1123,6 +1174,9 @@ def test_live_waves_use_one_process_group_for_all_batches(monkeypatch):
     assert captured["kwargs"]["start_new_session"] is True
     command = captured["command"]
     assert command[1] == fbref_pipeline_tasks.LIVE_WAVES_RUNNER
+    assert command[command.index("--parent-pid") + 1] == str(
+        fbref_pipeline_tasks.os.getpid()
+    )
     assert command[command.index("--max-batches") + 1] == "16"
     assert command[command.index("--reservation-mb") + 1] == "3"
 
@@ -1369,6 +1423,229 @@ def test_live_waves_sigterm_reaps_child_and_restores_signal_handlers(
             fbref_pipeline_tasks.signal.SIGALRM
         )
         is previous_sigalrm
+    )
+
+
+@pytest.mark.unit
+def test_live_waves_repeated_sigterm_cannot_interrupt_group_cleanup(
+    monkeypatch,
+):
+    calls = 0
+    previous_sigterm = fbref_pipeline_tasks.signal.getsignal(
+        fbref_pipeline_tasks.signal.SIGTERM
+    )
+
+    class Process:
+        pid = 7755
+        returncode = None
+
+        def communicate(self, *, timeout=None):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                fbref_pipeline_tasks.os.kill(
+                    fbref_pipeline_tasks.os.getpid(),
+                    fbref_pipeline_tasks.signal.SIGTERM,
+                )
+                raise AssertionError("first SIGTERM did not interrupt wait")
+            return "terminated stdout", "terminated stderr"
+
+    monkeypatch.setattr(
+        fbref_pipeline_tasks.subprocess,
+        "Popen",
+        lambda *args, **kwargs: Process(),
+    )
+    killed = []
+
+    def killpg(pid, sig):
+        killed.append((pid, sig))
+        if sig == fbref_pipeline_tasks.signal.SIGTERM:
+            fbref_pipeline_tasks.os.kill(
+                fbref_pipeline_tasks.os.getpid(),
+                fbref_pipeline_tasks.signal.SIGTERM,
+            )
+
+    monkeypatch.setattr(fbref_pipeline_tasks.os, "killpg", killpg)
+    monkeypatch.setattr(
+        fbref_pipeline_tasks,
+        "_wait_for_process_group_exit",
+        lambda *args, **kwargs: True,
+    )
+
+    with pytest.raises(
+        fbref_pipeline_tasks._LiveRunnerTermination
+    ) as terminated:
+        fbref_pipeline_tasks.run_fbref_live_waves(
+            airflow_run_id="scheduled__repeated-sigterm",
+            dag_id="dag_ingest_fbref",
+            worker_id="current-live",
+            page_kinds=["competition"],
+            run_type="current",
+            request_limit=200,
+            byte_limit_mb=100,
+            shard_size=25,
+        )
+
+    assert terminated.value.code == 128 + fbref_pipeline_tasks.signal.SIGTERM
+    assert calls == 2
+    assert killed == [(7755, fbref_pipeline_tasks.signal.SIGTERM)]
+    assert (
+        fbref_pipeline_tasks.signal.getsignal(
+            fbref_pipeline_tasks.signal.SIGTERM
+        )
+        is previous_sigterm
+    )
+
+
+@pytest.mark.unit
+def test_live_waves_sigterm_on_timeout_handler_boundary_still_reaps_group(
+    monkeypatch,
+):
+    calls = 0
+
+    class Process:
+        pid = 7766
+        returncode = None
+
+        def communicate(self, *, timeout=None):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise fbref_pipeline_tasks.subprocess.TimeoutExpired(
+                    cmd=["runner"], timeout=timeout
+                )
+            return "terminated stdout", "terminated stderr"
+
+    monkeypatch.setattr(
+        fbref_pipeline_tasks.subprocess,
+        "Popen",
+        lambda *args, **kwargs: Process(),
+    )
+    killed = []
+    monkeypatch.setattr(
+        fbref_pipeline_tasks.os,
+        "killpg",
+        lambda pid, sig: killed.append((pid, sig)),
+    )
+    monkeypatch.setattr(
+        fbref_pipeline_tasks,
+        "_wait_for_process_group_exit",
+        lambda *args, **kwargs: True,
+    )
+
+    function = fbref_pipeline_tasks.run_fbref_live_waves
+    source, first_line = inspect.getsourcelines(function)
+    timeout_index = next(
+        index
+        for index, line in enumerate(source)
+        if "except subprocess.TimeoutExpired as exc:" in line
+    )
+    boundary_line = first_line + timeout_index + 1
+    fired = False
+
+    def trace_timeout_boundary(frame, event, _arg):
+        nonlocal fired
+        if (
+            frame.f_code is function.__code__
+            and event == "line"
+            and frame.f_lineno == boundary_line
+            and not fired
+        ):
+            fired = True
+            fbref_pipeline_tasks.os.kill(
+                fbref_pipeline_tasks.os.getpid(),
+                fbref_pipeline_tasks.signal.SIGTERM,
+            )
+        return trace_timeout_boundary
+
+    previous_trace = sys.gettrace()
+    sys.settrace(trace_timeout_boundary)
+    try:
+        with pytest.raises(
+            fbref_pipeline_tasks._LiveRunnerTermination
+        ) as terminated:
+            function(
+                airflow_run_id="scheduled__timeout-boundary",
+                dag_id="dag_ingest_fbref",
+                worker_id="current-live",
+                page_kinds=["competition"],
+                run_type="current",
+                request_limit=200,
+                byte_limit_mb=100,
+                shard_size=25,
+            )
+    finally:
+        sys.settrace(previous_trace)
+
+    assert fired is True
+    assert terminated.value.code == 128 + fbref_pipeline_tasks.signal.SIGTERM
+    assert calls == 2
+    assert killed == [(7766, fbref_pipeline_tasks.signal.SIGTERM)]
+
+
+@pytest.mark.unit
+def test_live_waves_sigterm_during_handler_restore_is_not_lost(monkeypatch):
+    previous_sigterm = fbref_pipeline_tasks.signal.getsignal(
+        fbref_pipeline_tasks.signal.SIGTERM
+    )
+
+    class Process:
+        pid = 7777
+        returncode = 0
+
+        def communicate(self, *, timeout=None):
+            return 'FBREF_LIVE_WAVES_RESULT:{"batches": 1}\n', ""
+
+    monkeypatch.setattr(
+        fbref_pipeline_tasks.subprocess,
+        "Popen",
+        lambda *args, **kwargs: Process(),
+    )
+    monkeypatch.setattr(
+        fbref_pipeline_tasks,
+        "_process_group_exists",
+        lambda _process_group_id: False,
+    )
+    real_signal = fbref_pipeline_tasks.signal.signal
+    restore_hook_fired = False
+
+    def signal_with_restore_hook(signum, handler):
+        nonlocal restore_hook_fired
+        if (
+            signum == fbref_pipeline_tasks.signal.SIGTERM
+            and handler is previous_sigterm
+            and not restore_hook_fired
+        ):
+            restore_hook_fired = True
+            installed = fbref_pipeline_tasks.signal.getsignal(signum)
+            installed(signum, None)
+        return real_signal(signum, handler)
+
+    monkeypatch.setattr(
+        fbref_pipeline_tasks.signal, "signal", signal_with_restore_hook
+    )
+
+    with pytest.raises(
+        fbref_pipeline_tasks._LiveRunnerTermination
+    ) as terminated:
+        fbref_pipeline_tasks.run_fbref_live_waves(
+            airflow_run_id="scheduled__restore-boundary",
+            dag_id="dag_ingest_fbref",
+            worker_id="current-live",
+            page_kinds=["competition"],
+            run_type="current",
+            request_limit=200,
+            byte_limit_mb=100,
+            shard_size=25,
+        )
+
+    assert restore_hook_fired is True
+    assert terminated.value.code == 128 + fbref_pipeline_tasks.signal.SIGTERM
+    assert (
+        fbref_pipeline_tasks.signal.getsignal(
+            fbref_pipeline_tasks.signal.SIGTERM
+        )
+        is previous_sigterm
     )
 
 

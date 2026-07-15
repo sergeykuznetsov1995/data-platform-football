@@ -377,6 +377,61 @@ def _validated_attempt_snapshot(value: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _raw_audit_evidence(value: Mapping[str, Any]) -> dict[str, Any]:
+    evidence = dict(value)
+    if evidence.get("schema_version") != "fbref-raw-audit-anchor-v1":
+        raise StateConflict("raw audit anchor schema is unsupported")
+    if str(evidence.get("status") or "").casefold() != "passed":
+        raise StateConflict("raw audit anchor must have passed status")
+    run_type = str(evidence.get("run_type") or "").strip().casefold()
+    if run_type not in {"current", "backfill", "replay"}:
+        raise StateConflict("raw audit anchor run_type is unsupported")
+    failure_count = _non_negative(
+        evidence.get("failure_count"), "raw audit failure_count"
+    )
+    if failure_count:
+        raise StateConflict("passed raw audit anchor has failures")
+    zero_delta_required = evidence.get("zero_delta_required")
+    if not isinstance(zero_delta_required, bool):
+        raise StateConflict("raw audit zero_delta_required must be boolean")
+    successful_attempt_count = _non_negative(
+        evidence.get("successful_attempt_count"),
+        "raw audit successful_attempt_count",
+    )
+    audited_attempt_count = _non_negative(
+        evidence.get("audited_attempt_count"),
+        "raw audit audited_attempt_count",
+    )
+    if audited_attempt_count != successful_attempt_count:
+        raise StateConflict("raw audit did not audit every successful attempt")
+    return {
+        "schema_version": "fbref-raw-audit-anchor-v1",
+        "status": "passed",
+        "run_type": run_type,
+        "audited_control_run_id": _uuid(
+            evidence.get("audited_control_run_id"),
+            "audited_control_run_id",
+        ),
+        "processing_control_run_id": _uuid(
+            evidence.get("processing_control_run_id"),
+            "processing_control_run_id",
+        ),
+        "successful_attempt_count": successful_attempt_count,
+        "audited_attempt_count": audited_attempt_count,
+        "failure_count": 0,
+        "zero_delta_required": zero_delta_required,
+        "attempt_snapshot_sha256": _sha256_hex(
+            evidence.get("attempt_snapshot_sha256"),
+            "raw audit attempt_snapshot_sha256",
+        ),
+        "artifact_sha256": _sha256_hex(
+            evidence.get("artifact_sha256"),
+            "raw audit artifact_sha256",
+        ),
+        "artifact": _text(evidence.get("artifact"), "raw audit artifact"),
+    }
+
+
 def _row_dict(cursor: Any, row: Any) -> Optional[dict]:
     if row is None:
         return None
@@ -1059,6 +1114,88 @@ class ControlStore:
             _json_mapping(value, "raw_baseline")
         )
 
+    def record_raw_audit(
+        self,
+        run_id: object,
+        evidence: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Anchor one passed final raw audit before run validation."""
+
+        run = _uuid(run_id, "run_id")
+        normalized = _raw_audit_evidence(evidence)
+        if normalized["processing_control_run_id"] != run:
+            raise StateConflict(
+                "Raw audit processing_control_run_id does not match its run"
+            )
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                SELECT status, metadata
+                FROM fbref_control.crawl_run
+                WHERE run_id = %s
+                FOR UPDATE
+                """,
+                (run,),
+            )
+            row = _fetchone(cursor)
+            if row is None:
+                raise StateConflict(f"Raw audit run {run} does not exist")
+            metadata = _json_mapping(
+                row.get("metadata") or {}, "crawl run metadata"
+            )
+            installed_value = metadata.get("raw_audit")
+            if installed_value is not None:
+                installed = _raw_audit_evidence(
+                    _json_mapping(installed_value, "raw_audit")
+                )
+                if installed != normalized:
+                    raise StateConflict(
+                        f"Run {run} already has a different raw audit anchor"
+                    )
+                return {**normalized, "idempotent": True}
+            if row["status"] != "running":
+                raise StateConflict(
+                    f"Run {run} cannot anchor its first raw audit after "
+                    f"leaving running state ({row['status']})"
+                )
+            if metadata.get("raw_baseline") is None:
+                raise StateConflict(
+                    f"Run {run} cannot anchor raw audit without a baseline"
+                )
+            cursor.execute(
+                """
+                UPDATE fbref_control.crawl_run
+                SET metadata = metadata || %s::jsonb,
+                    updated_at = clock_timestamp()
+                WHERE run_id = %s
+                """,
+                (_json({"raw_audit": normalized}), run),
+            )
+            if cursor.rowcount != 1:
+                raise StateConflict(f"Raw audit run {run} disappeared")
+        return {**normalized, "idempotent": False}
+
+    def get_raw_audit(self, run_id: object) -> Optional[dict[str, Any]]:
+        """Read one create-once passed final raw-audit anchor."""
+
+        run = _uuid(run_id, "run_id")
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                SELECT metadata -> 'raw_audit' AS raw_audit
+                FROM fbref_control.crawl_run
+                WHERE run_id = %s
+                """,
+                (run,),
+            )
+            row = _fetchone(cursor)
+        if row is None:
+            raise StateConflict(f"Raw audit run {run} does not exist")
+        value = row.get("raw_audit")
+        if value is None:
+            return None
+        return _raw_audit_evidence(_json_mapping(value, "raw_audit"))
+
     def seal_raw_fetch_attempts(self, run_id: object) -> dict[str, Any]:
         """Freeze and fingerprint the successful-attempt set before audit.
 
@@ -1491,11 +1628,10 @@ class ControlStore:
     ) -> dict[str, int]:
         """Reconcile an accepted index snapshot without deleting history.
 
-        An unknown-gender row blocks the entire snapshot.  A drop of more than
-        ten percent from the live registry likewise fails closed unless an
-        explicit, durable operator reason accompanies the reconciliation.
-        Because both checks happen in the reconciliation transaction, rejected
-        snapshots never advance disappearance counters.
+        Unknown-gender rows are durably stored as quarantined and then fail the
+        caller, so operators can see and classify them without any downstream
+        crawl. A drop of more than ten percent from the live registry fails
+        closed unless an explicit, durable operator reason accompanies it.
         """
         snapshot = _uuid(snapshot_id, "snapshot_id")
         competitions = self._validated_competitions(entries)
@@ -1504,11 +1640,6 @@ class ControlStore:
             for entry in competitions
             if entry.gender == "unknown"
         )
-        if unknown_ids:
-            raise StateConflict(
-                "Competition snapshot contains unknown gender: "
-                + ", ".join(unknown_ids)
-            )
         override_reason = (
             None
             if shrink_override_reason is None
@@ -1726,7 +1857,12 @@ class ControlStore:
                 """
             )
             counts["frontier_scope_closed"] = cursor.rowcount
-            return counts
+        if unknown_ids:
+            raise StateConflict(
+                "Competition snapshot durably quarantined unknown gender: "
+                + ", ".join(unknown_ids)
+            )
+        return counts
 
     def eligible_competitions(self, *, source: str = "fbref") -> list[dict]:
         """Return only current male rows eligible to create downstream targets."""

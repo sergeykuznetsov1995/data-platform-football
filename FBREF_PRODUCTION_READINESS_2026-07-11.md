@@ -150,6 +150,24 @@ scans fence the commit. The post-run audit artifact and SHA-256 sidecar are
 content-addressed, create-once, fsynced, reopened, and verified; a retry can
 complete a digest-first partial publication but cannot overwrite evidence.
 
+After a passed raw audit is durably anchored in PostgreSQL, a fixed-size local
+cache marker may point at that run's verified SQLite index. The next run still
+lists all raw metadata, but it reuses a SHA-256 only when the object key, size,
+and strong local device/inode/ctime or S3 ETag token are unchanged. New,
+changed, or unversioned objects alone are read and hashed. The marker is
+checked against the control-plane baseline anchor, passed raw-audit anchor,
+content-addressed audit JSON, and its SHA-256 sidecar; missing cache is a safe
+first-run full hash, while corrupt or untrusted cache fails closed before paid
+source work.
+
+Index retention is bounded per call. It removes only old SQLite indexes for
+finished-successful runs that still have a verified passed raw-audit anchor.
+It never removes the active/cache-source index or an index for a running,
+failed, or unanchored run. The small baseline JSON and SHA-256 sidecar plus the
+final raw-audit JSON and sidecar remain queryable after index cleanup, so
+DataGrip/control-plane acceptance evidence is retained without one permanent
+million-row SQLite copy per run.
+
 ### Lossless generic Bronze
 
 `PageDocument` is transport-free and scans visible DOM plus every HTML comment.
@@ -505,6 +523,10 @@ comparison covered all 55 present changed or untracked candidate files with zero
 mismatches. DagBag then loaded current `16`, backfill `16`, and replay `17`
 tasks with import errors `{}`. Module provenance for both `scrapers` and
 `dags/utils` resolved inside that isolated copy.
+
+CI imports the same DAGs on both the repository image pin (`2.7.3`) and the
+active runtime (`2.11.2`). Cross-DAG handoffs use the backward-compatible
+`execution_date` argument accepted by both versions.
 
 This candidate-specific run intentionally makes no fresh claim about unrelated
 xref, Gold, or master DAGs. Their earlier broad integration evidence remains

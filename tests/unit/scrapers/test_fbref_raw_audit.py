@@ -18,10 +18,13 @@ from scrapers.fbref.raw_audit import (
     RAW_INVENTORY_EVIDENCE_LIMIT,
     RawAuditError,
     audit_raw_fetches,
+    cleanup_anchored_raw_inventory_indexes,
     capture_and_write_raw_inventory,
     capture_raw_inventory,
     load_inventory_baseline,
     load_successful_run_attempts,
+    open_authenticated_raw_inventory_cache,
+    promote_raw_inventory_cache,
     write_audit_artifact,
     write_inventory_baseline,
 )
@@ -31,6 +34,9 @@ from scrapers.fbref.raw_store import RawPageStore, match_page_target
 RUN_ID = "8ca16a99-4039-44a6-a47d-206037f11e70"
 REFRESH_ID = "bb254c88-c23a-4cd8-bd88-1c68c45baa2e"
 ATTEMPT_ID = "f1c2d5bb-a992-4423-baad-49841a1f1140"
+SECOND_RUN_ID = "d9135bf5-0a1b-4782-8f0c-70bf80fe2f38"
+THIRD_RUN_ID = "cab3cd10-6e35-4389-bda9-dac52e265610"
+FOURTH_RUN_ID = "4abbb2be-482e-4779-9e66-d7ce12f0d3c0"
 
 
 def _seed(tmp_path):
@@ -56,6 +62,45 @@ def _seed(tmp_path):
         "provider_billed_bytes": 44,
     }
     return store, record, attempt
+
+
+def _add_passed_raw_evidence(
+    output_root,
+    control,
+    run_id,
+    inventory,
+    *,
+    status="succeeded",
+):
+    result = {
+        "schema_version": "fbref-raw-audit-v3",
+        "control_run_id": run_id,
+        "status": "passed",
+        "successful_attempt_count": 1,
+        "audited_attempt_count": 1,
+        "failures": [],
+        "metadata": {"processing_control_run_id": run_id},
+    }
+    artifact, sidecar = write_audit_artifact(result, output_root)
+    digest = sidecar.read_text(encoding="ascii").split()[0]
+    control.baselines[run_id] = raw_audit_module.raw_baseline_anchor(
+        inventory.summary, inventory.baseline_sha256
+    )
+    control.audits[run_id] = {
+        "status": "passed",
+        "processing_control_run_id": run_id,
+        "artifact": str(artifact),
+        "artifact_sha256": digest,
+    }
+    control.runs[run_id] = {"status": status}
+
+
+def _fake_raw_evidence_control():
+    control = SimpleNamespace(baselines={}, audits={}, runs={})
+    control.get_raw_baseline = lambda run_id: control.baselines.get(str(run_id))
+    control.get_raw_audit = lambda run_id: control.audits.get(str(run_id))
+    control.get_run = lambda run_id: control.runs.get(str(run_id))
+    return control
 
 
 def test_raw_audit_verifies_every_object_without_raw_store_writes(
@@ -847,6 +892,177 @@ def test_streaming_baseline_and_disk_backed_audit_do_not_materialize_objects(
 
     assert result["status"] == "passed"
     assert hash_spy.call_count == 0
+
+
+def test_next_run_baseline_reuses_authenticated_rolling_hashes(
+    tmp_path, monkeypatch
+):
+    store = RawPageStore.from_uri((tmp_path / "raw").as_uri())
+    store._write_bytes("immutable/a.bin", b"first")
+    store._write_bytes("immutable/b.bin", b"second")
+    output_root = tmp_path / "acceptance"
+    first_path = (
+        output_root / RUN_ID / "raw_inventory_before.json"
+    )
+    _, first, _ = capture_and_write_raw_inventory(store, first_path)
+    control = _fake_raw_evidence_control()
+    _add_passed_raw_evidence(output_root, control, RUN_ID, first)
+    promote_raw_inventory_cache(output_root, RUN_ID, control)
+
+    prior = open_authenticated_raw_inventory_cache(output_root, control)
+    original_hash = raw_audit_module._hash_raw_object
+    hash_spy = MagicMock(side_effect=original_hash)
+    monkeypatch.setattr(raw_audit_module, "_hash_raw_object", hash_spy)
+    second_path = (
+        output_root / SECOND_RUN_ID / "raw_inventory_before.json"
+    )
+    _, second, _ = capture_and_write_raw_inventory(
+        store, second_path, reuse_inventory=prior
+    )
+
+    assert second.summary["fingerprint_sha256"] == first.summary[
+        "fingerprint_sha256"
+    ]
+    assert hash_spy.call_count == 0
+
+
+def test_next_run_baseline_hashes_only_changed_and_new_objects(
+    tmp_path, monkeypatch
+):
+    store = RawPageStore.from_uri((tmp_path / "raw").as_uri())
+    store._write_bytes("immutable/unchanged.bin", b"same")
+    store._write_bytes("immutable/changed.bin", b"before")
+    output_root = tmp_path / "acceptance"
+    first_path = (
+        output_root / RUN_ID / "raw_inventory_before.json"
+    )
+    _, first, _ = capture_and_write_raw_inventory(store, first_path)
+    control = _fake_raw_evidence_control()
+    _add_passed_raw_evidence(output_root, control, RUN_ID, first)
+    promote_raw_inventory_cache(output_root, RUN_ID, control)
+    prior = open_authenticated_raw_inventory_cache(output_root, control)
+    store._write_bytes("immutable/changed.bin", b"after-longer")
+    store._write_bytes("immutable/new.bin", b"new")
+
+    original_hash = raw_audit_module._hash_raw_object
+    hashed_keys = []
+
+    def hash_spy(raw_store, key, size):
+        hashed_keys.append(key)
+        return original_hash(raw_store, key, size)
+
+    monkeypatch.setattr(raw_audit_module, "_hash_raw_object", hash_spy)
+    second_path = (
+        output_root / SECOND_RUN_ID / "raw_inventory_before.json"
+    )
+    capture_and_write_raw_inventory(
+        store, second_path, reuse_inventory=prior
+    )
+
+    assert hashed_keys == [
+        "immutable/changed.bin",
+        "immutable/new.bin",
+    ]
+
+
+@pytest.mark.parametrize("failure_kind", ["corrupt", "untrusted"])
+def test_rolling_inventory_cache_fails_closed(
+    tmp_path, failure_kind
+):
+    store = RawPageStore.from_uri((tmp_path / "raw").as_uri())
+    store._write_bytes("immutable/a.bin", b"payload")
+    output_root = tmp_path / "acceptance"
+    baseline_path = (
+        output_root / RUN_ID / "raw_inventory_before.json"
+    )
+    _, baseline, _ = capture_and_write_raw_inventory(store, baseline_path)
+    control = _fake_raw_evidence_control()
+    _add_passed_raw_evidence(output_root, control, RUN_ID, baseline)
+    promote_raw_inventory_cache(output_root, RUN_ID, control)
+
+    if failure_kind == "corrupt":
+        cache_path = (
+            output_root
+            / raw_audit_module.RAW_INVENTORY_CACHE_FILENAME
+        )
+        cache_path.chmod(0o640)
+        cache_path.write_text("not-json\n", encoding="ascii")
+    else:
+        control.baselines[RUN_ID] = {
+            **control.baselines[RUN_ID],
+            "fingerprint_sha256": "0" * 64,
+        }
+
+    with pytest.raises(RawAuditError, match="rolling raw inventory"):
+        open_authenticated_raw_inventory_cache(output_root, control)
+
+
+def test_raw_inventory_index_retention_cleans_only_old_anchored_successes(
+    tmp_path,
+):
+    store = RawPageStore.from_uri((tmp_path / "raw").as_uri())
+    store._write_bytes("immutable/a.bin", b"payload")
+    output_root = tmp_path / "acceptance"
+    control = _fake_raw_evidence_control()
+    inventories = {}
+    for run_id in (RUN_ID, SECOND_RUN_ID, THIRD_RUN_ID, FOURTH_RUN_ID):
+        path = output_root / run_id / "raw_inventory_before.json"
+        _, inventories[run_id], _ = capture_and_write_raw_inventory(
+            store, path
+        )
+    _add_passed_raw_evidence(
+        output_root, control, RUN_ID, inventories[RUN_ID]
+    )
+    _add_passed_raw_evidence(
+        output_root,
+        control,
+        SECOND_RUN_ID,
+        inventories[SECOND_RUN_ID],
+    )
+    _add_passed_raw_evidence(
+        output_root,
+        control,
+        THIRD_RUN_ID,
+        inventories[THIRD_RUN_ID],
+        status="running",
+    )
+    control.baselines[FOURTH_RUN_ID] = raw_audit_module.raw_baseline_anchor(
+        inventories[FOURTH_RUN_ID].summary,
+        inventories[FOURTH_RUN_ID].baseline_sha256,
+    )
+    control.runs[FOURTH_RUN_ID] = {"status": "succeeded"}
+    promote_raw_inventory_cache(
+        output_root, SECOND_RUN_ID, control
+    )
+    old_artifacts = list(
+        (output_root / RUN_ID).glob("raw_integrity-*.json")
+    )
+
+    result = cleanup_anchored_raw_inventory_indexes(
+        output_root,
+        control,
+        protected_control_run_ids={THIRD_RUN_ID},
+        keep_latest=0,
+        max_deletes=4,
+    )
+
+    assert result["deleted_control_run_ids"] == [RUN_ID]
+    assert not (
+        output_root / RUN_ID / "raw_inventory_before.json.sqlite3"
+    ).exists()
+    assert (
+        output_root / RUN_ID / "raw_inventory_before.json"
+    ).is_file()
+    assert (
+        output_root / RUN_ID / "raw_inventory_before.json.sha256"
+    ).is_file()
+    assert old_artifacts and all(path.is_file() for path in old_artifacts)
+    for run_id in (SECOND_RUN_ID, THIRD_RUN_ID, FOURTH_RUN_ID):
+        assert (
+            output_root
+            / run_id
+            / "raw_inventory_before.json.sqlite3"
+        ).is_file()
 
 
 @pytest.mark.parametrize("crash_after", ["index", "digest", "commit"])

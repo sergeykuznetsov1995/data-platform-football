@@ -41,6 +41,12 @@ RAW_INVENTORY_EVIDENCE_LIMIT = 100
 RAW_INVENTORY_HASH_CHUNK_BYTES = 1024 * 1024
 RAW_AUDIT_MAX_ATTEMPTS = 1_000
 RAW_EPHEMERAL_PREFIXES: tuple[str, ...] = ("_health/",)
+RAW_INVENTORY_CACHE_SCHEMA_VERSION = "fbref-raw-inventory-cache-v1"
+RAW_INVENTORY_CACHE_FILENAME = ".fbref_raw_inventory_cache.json"
+RAW_INVENTORY_BASELINE_FILENAME = "raw_inventory_before.json"
+RAW_INVENTORY_RETAIN_INDEXES = 2
+RAW_INVENTORY_RETENTION_MAX_ENTRIES = 10_000
+RAW_INVENTORY_RETENTION_MAX_DELETES = 16
 
 
 def _utc_now() -> str:
@@ -372,6 +378,7 @@ def _captured_inventory_index(
     content_hashed: bool,
     max_objects: int = RAW_INVENTORY_MAX_OBJECTS,
     temp_directory: Path | None = None,
+    reuse_inventory: DiskBackedRawInventory | None = None,
 ) -> Iterator[_InventoryIndex]:
     """Build a disk-backed index with bounded Python heap usage."""
 
@@ -397,11 +404,9 @@ def _captured_inventory_index(
                 )
             key = store._relative_path(info.path)
             size = int(info.size)
-            digest = (
-                _hash_raw_object(store, key, size)
-                if content_hashed
-                else None
-            )
+            digest = None
+            if content_hashed and reuse_inventory is None:
+                digest = _hash_raw_object(store, key, size)
             try:
                 connection.execute(
                     """
@@ -421,6 +426,20 @@ def _captured_inventory_index(
                 raise RawAuditError(
                     f"raw inventory contains duplicate object key: {key}"
                 ) from exc
+        if reuse_inventory is not None:
+            if not content_hashed:
+                raise ValueError(
+                    "reuse_inventory requires a content-hashed capture"
+                )
+            raw_root_sha256 = _raw_store_identity_sha256(store)
+            _load_validated_baseline(
+                connection,
+                reuse_inventory,
+                expected_root_sha256=raw_root_sha256,
+            )
+            _hydrate_current_hashes_from_baseline(store, connection)
+            connection.execute("DROP TABLE baseline_object")
+            connection.commit()
         raw_store_identity = _raw_store_identity(store)
         summary = _summarize_inventory_table(
             connection,
@@ -1647,6 +1666,42 @@ def write_audit_artifact(
     return path, digest_path
 
 
+def load_audit_artifact(
+    path: str | os.PathLike[str], *, expected_sha256: str
+) -> tuple[dict[str, Any], Path]:
+    """Load a passed artifact only when its bytes and sidecar still agree."""
+
+    source = Path(path)
+    expected = str(expected_sha256).strip().casefold()
+    if len(expected) != 64 or any(
+        character not in "0123456789abcdef" for character in expected
+    ):
+        raise RawAuditError("expected raw audit SHA256 is invalid")
+    payload = _existing_regular_bytes(
+        source, label="FBref raw audit artifact"
+    )
+    actual = hashlib.sha256(payload).hexdigest()
+    if actual != expected:
+        raise RawAuditError("FBref raw audit artifact digest changed")
+    sidecar = source.with_name(f"{source.name}.sha256")
+    sidecar_payload = _existing_regular_bytes(
+        sidecar, label="FBref raw audit SHA256 sidecar"
+    )
+    try:
+        sidecar_digest, sidecar_name = sidecar_payload.decode("ascii").split()
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise RawAuditError("FBref raw audit sidecar is invalid") from exc
+    if sidecar_digest != expected or sidecar_name != source.name:
+        raise RawAuditError("FBref raw audit sidecar does not match the file")
+    try:
+        result = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RawAuditError("FBref raw audit artifact is invalid JSON") from exc
+    if not isinstance(result, dict):
+        raise RawAuditError("FBref raw audit artifact must be a JSON object")
+    return result, sidecar
+
+
 def _normalized_local_destination(path: str | os.PathLike[str]) -> Path:
     candidate = Path(path).expanduser()
     if not candidate.is_absolute():
@@ -2064,11 +2119,432 @@ def open_disk_backed_inventory(
     )
 
 
+def _acceptance_output_root(path: str | os.PathLike[str]) -> Path:
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute():
+        raise RawAuditError("FBref acceptance output root must be absolute")
+    candidate.mkdir(parents=True, exist_ok=True)
+    if candidate.is_symlink() or not candidate.is_dir():
+        raise RawAuditError(
+            "FBref acceptance output root is not a safe directory"
+        )
+    return candidate.resolve()
+
+
+def _validated_control_raw_audit(
+    output_root: Path,
+    control: ControlStore,
+    control_run_id: str,
+) -> dict[str, Any]:
+    """Authenticate a passed audit anchor and its immutable local artifact."""
+
+    try:
+        anchor = control.get_raw_audit(control_run_id)
+    except Exception as exc:
+        raise RawAuditError(
+            "could not authenticate the rolling raw inventory audit anchor"
+        ) from exc
+    if not isinstance(anchor, Mapping):
+        raise RawAuditError(
+            "rolling raw inventory has no durable raw audit anchor"
+        )
+    if (
+        str(anchor.get("status") or "") != "passed"
+        or str(anchor.get("processing_control_run_id") or "")
+        != control_run_id
+    ):
+        raise RawAuditError(
+            "rolling raw inventory audit anchor is not a passed processing "
+            "run"
+        )
+    artifact_value = str(anchor.get("artifact") or "")
+    artifact_path = Path(artifact_value)
+    if not artifact_path.is_absolute() or artifact_path.is_symlink():
+        raise RawAuditError(
+            "rolling raw inventory audit artifact path is unsafe"
+        )
+    try:
+        artifact_path.resolve(strict=True).relative_to(output_root)
+    except (OSError, ValueError) as exc:
+        raise RawAuditError(
+            "rolling raw inventory audit artifact is outside acceptance "
+            "storage"
+        ) from exc
+    artifact, _sidecar = load_audit_artifact(
+        artifact_path,
+        expected_sha256=str(anchor.get("artifact_sha256") or ""),
+    )
+    metadata = artifact.get("metadata")
+    if (
+        str(artifact.get("status") or "") != "passed"
+        or list(artifact.get("failures") or [])
+        or not isinstance(metadata, Mapping)
+        or str(metadata.get("processing_control_run_id") or "")
+        != control_run_id
+    ):
+        raise RawAuditError(
+            "rolling raw inventory audit artifact does not match its anchor"
+        )
+    return dict(anchor)
+
+
+def _authenticated_inventory_for_run(
+    output_root: Path,
+    control: ControlStore,
+    control_run_id: object,
+) -> tuple[DiskBackedRawInventory, dict[str, Any]]:
+    """Open a prior baseline only when PostgreSQL and JSON evidence agree."""
+
+    try:
+        normalized_run_id = str(uuid.UUID(str(control_run_id)))
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise RawAuditError("rolling raw inventory run ID is invalid") from exc
+    run_directory = output_root / normalized_run_id
+    if run_directory.is_symlink():
+        raise RawAuditError("rolling raw inventory run directory is unsafe")
+    baseline_path = run_directory / RAW_INVENTORY_BASELINE_FILENAME
+    try:
+        baseline_path.parent.resolve(strict=True).relative_to(output_root)
+    except (OSError, ValueError) as exc:
+        raise RawAuditError(
+            "rolling raw inventory baseline is outside acceptance storage"
+        ) from exc
+    inventory = open_disk_backed_inventory(baseline_path)
+    try:
+        control_anchor = control.get_raw_baseline(normalized_run_id)
+    except Exception as exc:
+        raise RawAuditError(
+            "could not authenticate the rolling raw inventory baseline"
+        ) from exc
+    actual_anchor = raw_baseline_anchor(
+        inventory.summary, inventory.baseline_sha256
+    )
+    if not isinstance(control_anchor, Mapping) or dict(control_anchor) != actual_anchor:
+        raise RawAuditError(
+            "rolling raw inventory differs from its control-plane baseline "
+            "anchor"
+        )
+    audit_anchor = _validated_control_raw_audit(
+        output_root, control, normalized_run_id
+    )
+    return inventory, audit_anchor
+
+
+def _raw_inventory_cache_path(output_root: Path) -> Path:
+    return output_root / RAW_INVENTORY_CACHE_FILENAME
+
+
+def _read_raw_inventory_cache_manifest(
+    output_root: Path,
+) -> dict[str, Any] | None:
+    path = _raw_inventory_cache_path(output_root)
+    if not path.exists() and not path.is_symlink():
+        return None
+    payload = _existing_regular_bytes(
+        path, label="FBref rolling raw inventory cache manifest"
+    )
+    if len(payload) > 64 * 1024:
+        raise RawAuditError(
+            "FBref rolling raw inventory cache manifest is too large"
+        )
+    try:
+        manifest = json.loads(payload.decode("ascii"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RawAuditError(
+            "FBref rolling raw inventory cache manifest is invalid"
+        ) from exc
+    expected_fields = {
+        "schema_version",
+        "updated_at",
+        "source_control_run_id",
+        "baseline_sha256",
+        "raw_root_sha256",
+        "fingerprint_sha256",
+        "raw_audit_artifact_sha256",
+    }
+    if not isinstance(manifest, dict) or set(manifest) != expected_fields:
+        raise RawAuditError(
+            "FBref rolling raw inventory cache fields are invalid"
+        )
+    if manifest.get("schema_version") != RAW_INVENTORY_CACHE_SCHEMA_VERSION:
+        raise RawAuditError(
+            "FBref rolling raw inventory cache schema is unsupported"
+        )
+    for field in (
+        "baseline_sha256",
+        "raw_root_sha256",
+        "fingerprint_sha256",
+        "raw_audit_artifact_sha256",
+    ):
+        value = str(manifest.get(field) or "")
+        if len(value) != 64 or any(
+            character not in "0123456789abcdef" for character in value
+        ):
+            raise RawAuditError(
+                f"FBref rolling raw inventory cache {field} is invalid"
+            )
+    try:
+        normalized_run_id = str(
+            uuid.UUID(str(manifest["source_control_run_id"]))
+        )
+        datetime.fromisoformat(str(manifest["updated_at"]))
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise RawAuditError(
+            "FBref rolling raw inventory cache identity is invalid"
+        ) from exc
+    if normalized_run_id != manifest["source_control_run_id"]:
+        raise RawAuditError(
+            "FBref rolling raw inventory cache run ID is not canonical"
+        )
+    return manifest
+
+
+def open_authenticated_raw_inventory_cache(
+    output_root: str | os.PathLike[str],
+    control: ControlStore,
+) -> DiskBackedRawInventory | None:
+    """Open the last passed baseline or fail closed on an untrusted cache."""
+
+    root = _acceptance_output_root(output_root)
+    manifest = _read_raw_inventory_cache_manifest(root)
+    if manifest is None:
+        return None
+    run_id = str(manifest["source_control_run_id"])
+    inventory, audit_anchor = _authenticated_inventory_for_run(
+        root, control, run_id
+    )
+    expected = {
+        "baseline_sha256": inventory.baseline_sha256,
+        "raw_root_sha256": str(inventory.summary["raw_root_sha256"]),
+        "fingerprint_sha256": str(inventory.summary["fingerprint_sha256"]),
+        "raw_audit_artifact_sha256": str(audit_anchor["artifact_sha256"]),
+    }
+    if any(str(manifest[key]) != value for key, value in expected.items()):
+        raise RawAuditError(
+            "FBref rolling raw inventory cache differs from authenticated "
+            "evidence"
+        )
+    return inventory
+
+
+def _replace_raw_inventory_cache_manifest(
+    output_root: Path,
+    payload: bytes,
+) -> None:
+    destination = _raw_inventory_cache_path(output_root)
+    if destination.is_symlink():
+        raise RawAuditError(
+            "FBref rolling raw inventory cache manifest is unsafe"
+        )
+    temporary = destination.with_name(
+        f".{destination.name}.tmp"
+    )
+    if temporary.is_symlink():
+        raise RawAuditError(
+            "FBref rolling raw inventory cache temporary is unsafe"
+        )
+    if temporary.exists():
+        if not temporary.is_file():
+            raise RawAuditError(
+                "FBref rolling raw inventory cache temporary is unsafe"
+            )
+        temporary.unlink()
+    descriptor = os.open(
+        temporary,
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | os.O_CLOEXEC
+        | getattr(os, "O_NOFOLLOW", 0),
+        0o440,
+    )
+    try:
+        with os.fdopen(descriptor, "wb", closefd=True) as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, destination)
+        _fsync_directory(output_root)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def promote_raw_inventory_cache(
+    output_root: str | os.PathLike[str],
+    control_run_id: object,
+    control: ControlStore,
+) -> dict[str, Any]:
+    """Point the rolling cache at one fully audited control-plane baseline."""
+
+    root = _acceptance_output_root(output_root)
+    normalized_run_id = str(uuid.UUID(str(control_run_id)))
+    inventory, audit_anchor = _authenticated_inventory_for_run(
+        root, control, normalized_run_id
+    )
+    manifest = {
+        "schema_version": RAW_INVENTORY_CACHE_SCHEMA_VERSION,
+        "updated_at": _utc_now(),
+        "source_control_run_id": normalized_run_id,
+        "baseline_sha256": inventory.baseline_sha256,
+        "raw_root_sha256": str(inventory.summary["raw_root_sha256"]),
+        "fingerprint_sha256": str(inventory.summary["fingerprint_sha256"]),
+        "raw_audit_artifact_sha256": str(audit_anchor["artifact_sha256"]),
+    }
+    payload = (
+        json.dumps(
+            manifest,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("ascii")
+        + b"\n"
+    )
+    cache_path = _raw_inventory_cache_path(root)
+    with _baseline_capture_lock(cache_path):
+        _replace_raw_inventory_cache_manifest(root, payload)
+        installed = _read_raw_inventory_cache_manifest(root)
+    if installed != manifest:
+        raise RawAuditError(
+            "FBref rolling raw inventory cache publication was inconsistent"
+        )
+    return manifest
+
+
+def cleanup_anchored_raw_inventory_indexes(
+    output_root: str | os.PathLike[str],
+    control: ControlStore,
+    *,
+    protected_control_run_ids: Iterable[object] = (),
+    keep_latest: int = RAW_INVENTORY_RETAIN_INDEXES,
+    max_entries: int = RAW_INVENTORY_RETENTION_MAX_ENTRIES,
+    max_deletes: int = RAW_INVENTORY_RETENTION_MAX_DELETES,
+) -> dict[str, Any]:
+    """Bound old indexes, preserving active, failed, and unaudited runs."""
+
+    if int(keep_latest) < 0:
+        raise ValueError("keep_latest must be non-negative")
+    if int(max_entries) <= 0 or int(max_deletes) <= 0:
+        raise ValueError("retention bounds must be positive")
+    root = _acceptance_output_root(output_root)
+    protected = {
+        str(uuid.UUID(str(run_id))) for run_id in protected_control_run_ids
+    }
+    with _baseline_capture_lock(_raw_inventory_cache_path(root)):
+        return _cleanup_anchored_raw_inventory_indexes_locked(
+            root,
+            control,
+            protected=protected,
+            keep_latest=int(keep_latest),
+            max_entries=int(max_entries),
+            max_deletes=int(max_deletes),
+        )
+
+
+def _cleanup_anchored_raw_inventory_indexes_locked(
+    root: Path,
+    control: ControlStore,
+    *,
+    protected: set[str],
+    keep_latest: int,
+    max_entries: int,
+    max_deletes: int,
+) -> dict[str, Any]:
+    """Apply retention while cache promotion is excluded."""
+
+    manifest = _read_raw_inventory_cache_manifest(root)
+    if manifest is not None:
+        # Authentication is intentional: cleanup must never trust a mutable
+        # local pointer when deciding which large evidence file to preserve.
+        open_authenticated_raw_inventory_cache(root, control)
+        protected.add(str(manifest["source_control_run_id"]))
+
+    candidates: list[tuple[int, str, Path]] = []
+    scanned = 0
+    skipped_active_or_untrusted = 0
+    try:
+        entries = os.scandir(root)
+    except OSError as exc:
+        raise RawAuditError(
+            "could not scan FBref acceptance retention root"
+        ) from exc
+    with entries:
+        for entry in entries:
+            scanned += 1
+            if scanned > max_entries:
+                raise RawAuditError(
+                    "FBref acceptance retention entry limit exceeded: "
+                    f"limit={max_entries}"
+                )
+            if not entry.is_dir(follow_symlinks=False):
+                continue
+            try:
+                run_id = str(uuid.UUID(entry.name))
+            except ValueError:
+                continue
+            if run_id != entry.name or run_id in protected:
+                continue
+            index_path = (
+                Path(entry.path)
+                / f"{RAW_INVENTORY_BASELINE_FILENAME}.sqlite3"
+            )
+            if index_path.is_symlink() or not index_path.is_file():
+                continue
+            try:
+                run = control.get_run(run_id)
+                if not isinstance(run, Mapping) or run.get("status") != "succeeded":
+                    skipped_active_or_untrusted += 1
+                    continue
+                _validated_control_raw_audit(root, control, run_id)
+            except Exception:
+                skipped_active_or_untrusted += 1
+                continue
+            try:
+                modified_ns = index_path.stat(follow_symlinks=False).st_mtime_ns
+            except OSError:
+                skipped_active_or_untrusted += 1
+                continue
+            candidates.append((modified_ns, run_id, index_path))
+
+    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    delete_candidates = candidates[keep_latest:]
+    deleted: list[str] = []
+    for _modified_ns, run_id, index_path in delete_candidates:
+        if len(deleted) >= max_deletes:
+            break
+        baseline_path = index_path.with_suffix("")
+        with _baseline_capture_lock(baseline_path):
+            try:
+                run = control.get_run(run_id)
+                if not isinstance(run, Mapping) or run.get("status") != "succeeded":
+                    continue
+                _validated_control_raw_audit(root, control, run_id)
+                if index_path.is_symlink() or not index_path.is_file():
+                    continue
+                index_path.unlink()
+                _fsync_directory(index_path.parent)
+            except (OSError, RawAuditError):
+                continue
+        deleted.append(run_id)
+    return {
+        "schema_version": "fbref-raw-inventory-retention-v1",
+        "scanned_entry_count": scanned,
+        "eligible_index_count": len(candidates),
+        "deleted_index_count": len(deleted),
+        "deleted_control_run_ids": deleted,
+        "protected_control_run_ids": sorted(protected),
+        "skipped_active_or_untrusted_count": skipped_active_or_untrusted,
+        "remaining_delete_backlog": max(
+            0, len(delete_candidates) - len(deleted)
+        ),
+    }
+
+
 def _capture_and_write_raw_inventory_locked(
     store: RawPageStore,
     destination: Path,
     *,
     max_objects: int = RAW_INVENTORY_MAX_OBJECTS,
+    reuse_inventory: DiskBackedRawInventory | None = None,
 ) -> tuple[Path, DiskBackedRawInventory, bool]:
     """Capture under the per-destination interprocess lease."""
 
@@ -2120,6 +2596,7 @@ def _capture_and_write_raw_inventory_locked(
         content_hashed=True,
         max_objects=max_objects,
         temp_directory=destination.parent,
+        reuse_inventory=reuse_inventory,
     ) as captured_index:
         _assert_store_matches_captured_index(
             store,
@@ -2175,8 +2652,9 @@ def capture_and_write_raw_inventory(
     path: str | os.PathLike[str],
     *,
     max_objects: int = RAW_INVENTORY_MAX_OBJECTS,
+    reuse_inventory: DiskBackedRawInventory | None = None,
 ) -> tuple[Path, DiskBackedRawInventory, bool]:
-    """Hash once and publish a crash-safe disk-backed raw baseline."""
+    """Publish a crash-safe baseline, reusing trusted immutable hashes."""
 
     destination = _normalized_local_destination(path)
     with _baseline_capture_lock(destination):
@@ -2184,6 +2662,7 @@ def capture_and_write_raw_inventory(
             store,
             destination,
             max_objects=max_objects,
+            reuse_inventory=reuse_inventory,
         )
 
 
@@ -2291,11 +2770,15 @@ __all__: Sequence[str] = (
     "RAW_AUDIT_MAX_ATTEMPTS",
     "RawAuditError",
     "audit_raw_fetches",
+    "cleanup_anchored_raw_inventory_indexes",
     "capture_and_write_raw_inventory",
     "capture_raw_inventory",
     "load_inventory_baseline",
+    "load_audit_artifact",
     "load_successful_run_attempts",
+    "open_authenticated_raw_inventory_cache",
     "open_disk_backed_inventory",
+    "promote_raw_inventory_cache",
     "raw_baseline_anchor",
     "successful_attempt_snapshot",
     "write_audit_artifact",

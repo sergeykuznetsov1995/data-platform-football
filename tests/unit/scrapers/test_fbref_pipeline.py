@@ -33,7 +33,6 @@ from scrapers.fbref.pipeline import (
     page_target_from_link,
     wave_target_capacity,
     _session_failure,
-    _session_proxy_error_type,
 )
 from scrapers.fbref.discovery import (
     DISCOVERY_PARSER_VERSION,
@@ -2404,11 +2403,13 @@ def test_new_stateful_parser_replay_rebuilds_latest_raw_offline(tmp_path):
         "page_kind": record.page_kind,
         "logical_refresh_id": refresh,
     }]
+    source_run_id = str(uuid.uuid4())
+    control.get_run = lambda _: _accepted_replay_source(source_run_id)
     pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
 
     result = pipeline.parse_wave(
         str(uuid.uuid4()),
-        source_run_id=str(uuid.uuid4()),
+        source_run_id=source_run_id,
         page_kinds=["competition_index"],
         settings=_settings("replay"),
     )
@@ -2439,11 +2440,11 @@ def test_new_stateful_parser_replay_rebuilds_latest_raw_offline(tmp_path):
         ),
         (
             {"run_type": "current", "status": "pending"},
-            "replay_source_run_not_terminal=pending",
+            "replay_source_run_not_succeeded=pending",
         ),
         (
             {"run_type": "backfill", "status": "running"},
-            "replay_source_run_not_terminal=running",
+            "replay_source_run_not_succeeded=running",
         ),
     ],
 )
@@ -2466,22 +2467,84 @@ def test_replay_parse_rejects_invalid_or_live_source_run(
     assert not any(event.startswith("replay:") for event in control.events)
 
 
-@pytest.mark.parametrize("status", ["failed", "succeeded", "cancelled"])
-def test_replay_parse_accepts_terminal_non_replay_source_run(tmp_path, status):
+@pytest.mark.parametrize("status", ["failed", "cancelled"])
+def test_replay_parse_rejects_unsuccessful_source_run(tmp_path, status):
     raw = _raw_store(tmp_path)
     control = FakeControl(raw)
     control.get_run = lambda _: {"run_type": "current", "status": status}
     pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
 
-    result = pipeline.parse_wave(
-        str(uuid.uuid4()),
-        source_run_id=str(uuid.uuid4()),
-        page_kinds=["match"],
-        settings=_settings("replay"),
-    )
+    with pytest.raises(
+        ParseWaveError, match=f"replay_source_run_not_succeeded={status}"
+    ):
+        pipeline.parse_wave(
+            str(uuid.uuid4()),
+            source_run_id=str(uuid.uuid4()),
+            page_kinds=["match"],
+            settings=_settings("replay"),
+        )
 
-    assert result.parsed == 0
-    assert any(event.startswith("replay:") for event in control.events)
+    assert not any(event.startswith("replay:") for event in control.events)
+
+
+def _accepted_replay_source(source_run_id, *, run_type="current"):
+    return {
+        "run_type": run_type,
+        "status": "succeeded",
+        "request_limit": 200,
+        "byte_limit": 100 * 1024 * 1024,
+        "metadata": {
+            "raw_audit": {
+                "schema_version": "fbref-raw-audit-anchor-v1",
+                "status": "passed",
+                "run_type": run_type,
+                "audited_control_run_id": source_run_id,
+                "processing_control_run_id": source_run_id,
+                "successful_attempt_count": 1,
+                "audited_attempt_count": 1,
+                "zero_delta_required": False,
+            }
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    ("mutate", "error"),
+    [
+        (
+            lambda run: run.update(request_limit=100),
+            "replay_source_run_not_production_profile",
+        ),
+        (
+            lambda run: run.update(metadata={}),
+            "replay_source_raw_audit_missing",
+        ),
+        (
+            lambda run: run["metadata"]["raw_audit"].update(
+                status="failed"
+            ),
+            "replay_source_raw_audit_not_accepted",
+        ),
+    ],
+)
+def test_replay_parse_rejects_unaccepted_source_evidence(
+    tmp_path, mutate, error
+):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    source_run_id = str(uuid.uuid4())
+    source_run = _accepted_replay_source(source_run_id)
+    mutate(source_run)
+    control.get_run = lambda _: source_run
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    with pytest.raises(ParseWaveError, match=error):
+        pipeline.parse_wave(
+            str(uuid.uuid4()),
+            source_run_id=source_run_id,
+            page_kinds=["match"],
+            settings=_settings("replay"),
+        )
 
 
 def test_replay_validation_rejects_missing_source_run(tmp_path):
@@ -2499,16 +2562,18 @@ def test_replay_validation_rejects_missing_source_run(tmp_path):
     assert "finish:False" not in control.events
 
 
-@pytest.mark.parametrize("status", ["failed", "succeeded", "cancelled"])
-def test_replay_validation_accepts_terminal_source_run(tmp_path, status):
+def test_replay_validation_accepts_audited_production_source_run(tmp_path):
     raw = _raw_store(tmp_path)
     control = FakeControl(raw)
     control.run["run_type"] = "replay"
-    control.get_run = lambda _: {"run_type": "backfill", "status": status}
+    source_run_id = str(uuid.uuid4())
+    control.get_run = lambda _: _accepted_replay_source(
+        source_run_id, run_type="backfill"
+    )
     pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
 
     pipeline.validate_and_finish(
-        str(uuid.uuid4()), replay_source_run_id=str(uuid.uuid4())
+        str(uuid.uuid4()), replay_source_run_id=source_run_id
     )
 
     assert "finish:True" in control.events
@@ -2572,14 +2637,16 @@ def test_typed_promotion_is_guarded_for_live_and_replay(
         generic_writer=FakeWriter(),
         typed_adapter=FakeTypedAdapter(typed_writer),
     )
+    source_run_id = None
+    if run_type == "replay":
+        source_run_id = str(uuid.uuid4())
+        control.get_run = lambda _: _accepted_replay_source(source_run_id)
 
     if latest is None:
         with pytest.raises(ParseWaveError, match="TypedPromotionDeferred"):
             pipeline.parse_wave(
                 str(uuid.uuid4()),
-                source_run_id=(
-                    str(uuid.uuid4()) if run_type == "replay" else None
-                ),
+                source_run_id=source_run_id,
                 page_kinds=["schedule"],
                 settings=_settings(run_type),
             )
@@ -2595,7 +2662,7 @@ def test_typed_promotion_is_guarded_for_live_and_replay(
 
     result = pipeline.parse_wave(
         str(uuid.uuid4()),
-        source_run_id=(str(uuid.uuid4()) if run_type == "replay" else None),
+        source_run_id=source_run_id,
         page_kinds=["schedule"],
         settings=_settings(run_type),
     )
@@ -3222,17 +3289,15 @@ def test_a_rejected_clearance_is_burned_instead_of_failing_every_target(
 
 
 @pytest.mark.parametrize(
-    ("error_class", "http_status", "expected_proxy_error"),
+    ("error_class", "http_status"),
     [
-        ("http_status", 403, "cloudflare"),
-        ("raw_contract_cloudflare_challenge", 200, "cloudflare"),
-        ("warm_session_connection", None, "connection"),
-        ("warm_session_timeout", None, "timeout"),
+        ("http_status", 403),
+        ("raw_contract_cloudflare_challenge", 200),
+        ("warm_session_connection", None),
+        ("warm_session_timeout", None),
     ],
 )
-def test_session_poison_is_classified_for_retry_and_proxy_quarantine(
-    error_class, http_status, expected_proxy_error
-):
+def test_session_poison_is_classified_for_retry(error_class, http_status):
     error = FetchError(
         "poisoned warm session",
         error_class=error_class,
@@ -3240,14 +3305,12 @@ def test_session_poison_is_classified_for_retry_and_proxy_quarantine(
     )
 
     assert _session_failure(error) is True
-    assert _session_proxy_error_type(error) == expected_proxy_error
 
 
 def test_unknown_http_exception_remains_target_scoped():
     error = FetchError("decoder exploded", error_class="http_exception")
 
     assert _session_failure(error) is False
-    assert _session_proxy_error_type(error) is None
 
 
 def test_live_runner_reuses_one_fetch_session_and_parses_after_each_raw_batch(
@@ -3474,12 +3537,10 @@ def test_the_browser_may_only_spend_the_requests_the_run_reserved(tmp_path):
         proxy_file,
         max_browser_requests,
         max_browser_bytes,
-        min_healthy_proxies,
     ):
         captured["proxy_file"] = proxy_file
         captured["max_browser_requests"] = max_browser_requests
         captured["max_browser_bytes"] = max_browser_bytes
-        captured["min_healthy_proxies"] = min_healthy_proxies
         return FakeFetcher(control.events, b"<html>ok</html>")
 
     pipeline = FBrefPipeline(
@@ -3510,7 +3571,6 @@ def test_the_browser_may_only_spend_the_requests_the_run_reserved(tmp_path):
 
     assert captured["max_browser_requests"] == 80
     assert captured["max_browser_bytes"] == 16 * 1024 * 1024
-    assert captured["min_healthy_proxies"] == 4
     assert control.reservations[0][1]["requests"] == 82
     assert control.reservations[0][1]["bytes_"] == 23 * 1024 * 1024
 

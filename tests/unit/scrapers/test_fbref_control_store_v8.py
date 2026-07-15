@@ -548,18 +548,45 @@ def test_global_unprocessed_raw_includes_failed_source_runs_oldest_first():
     )
 
 
-def test_registry_unknown_gender_blocks_snapshot_before_database_mutation():
-    store, factory = make_store(
-        lambda sql, _params: (_ for _ in ()).throw(AssertionError(sql))
-    )
+def test_registry_unknown_gender_is_durably_quarantined_then_blocks_caller():
+    fetched_at = datetime(2026, 7, 14, tzinfo=timezone.utc)
+    persisted = {}
 
-    with pytest.raises(StateConflict, match="unknown gender: 99"):
+    def handler(sql, params):
+        if "SELECT * FROM fbref_control.registry_snapshot" in sql:
+            return [{
+                "successful": True,
+                "source": "fbref",
+                "fetched_at": fetched_at,
+            }], 1
+        if "SELECT max(last_seen_at) AS latest" in sql:
+            return [{"latest": None}], 1
+        if "SELECT count(*) AS count" in sql:
+            return [{"count": 0}], 1
+        if "INSERT INTO fbref_control.competition_registry" in sql:
+            persisted["competition_id"] = params[1]
+            persisted["gender"] = params[4]
+            persisted["crawl_state"] = params[7]
+            return [], 1
+        return [], 0
+
+    store, factory = make_store(handler)
+
+    with pytest.raises(
+        StateConflict, match="durably quarantined unknown gender: 99"
+    ):
         store.reconcile_competitions(
             str(uuid.uuid4()),
             [competition_entry(99, gender="unknown")],
         )
 
-    assert factory.connections == []
+    assert persisted == {
+        "competition_id": "99",
+        "gender": "unknown",
+        "crawl_state": "quarantined",
+    }
+    assert factory.connections[0].committed is True
+    assert factory.connections[0].rolled_back is False
 
 
 def test_registry_shrink_over_ten_percent_rolls_back_without_override():

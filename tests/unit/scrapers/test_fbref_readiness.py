@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import uuid
 from types import SimpleNamespace
 
@@ -11,7 +10,7 @@ from scrapers.fbref.readiness import (
     ReadinessError,
     check_raw_store_roundtrip,
     check_trino_roundtrip,
-    validate_proxy_pool,
+    validate_fbref_proxy_meter,
     validate_raw_store_uri,
 )
 from scrapers.fbref.raw_store import RawPageStore
@@ -25,52 +24,84 @@ def test_raw_store_uri_is_exact_and_fail_closed():
         validate_raw_store_uri("/tmp/fbref")
 
 
-def test_proxy_preflight_is_secret_safe_and_tcp_only(tmp_path):
-    path = tmp_path / "proxys.txt"
-    path.write_text("one:80:user:password\ntwo:81:user:other\n")
-    os.chmod(path, 0o600)
+def _meter_payload(**changes):
+    payload = {
+        "status": "ok",
+        "meter": "proxy_filter_provider_path_v2",
+        "daily_total_bytes": 10,
+        "daily_budget_bytes": 300_000_000,
+        "daily_remaining_bytes": 299_999_990,
+        "max_lease_bytes": 104_857_600,
+        "max_lease_ttl_seconds": 7200,
+        "max_active_leases": 1,
+        "dagrun_budget_bytes": 104_857_600,
+        "url_budget_bytes": 104_857_600,
+        "lease_proxy_url": "http://fbref_proxy_filter:8900",
+        "configured_pool_count": 4,
+        "fbref_source_ready": True,
+        "fbref_dag_ids": ["dag_backfill_fbref", "dag_ingest_fbref"],
+    }
+    payload.update(changes)
+    return payload
 
-    class Manager:
-        def __init__(self, **kwargs):
-            self.kwargs = kwargs
 
-        def load_from_file_custom_format(self, value):
-            assert value == str(path)
-            return 2
+class _MeterSession:
+    def __init__(self, payload, *, status=200):
+        self.payload = payload
+        self.status = status
+        self.calls = []
 
-        def validate_proxies(self, **kwargs):
-            assert kwargs == {
-                "timeout": 3.0,
-                "max_workers": 100,
-                "ban_failed": True,
-            }
-            return {"alive": 2, "dead": 0, "total": 2}
+    def get(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        return SimpleNamespace(
+            status_code=self.status,
+            json=lambda: self.payload,
+        )
 
-    result = validate_proxy_pool(
-        path, minimum_healthy=2, manager_factory=Manager
+
+def test_proxy_meter_preflight_is_authenticated_secret_safe_and_zero_paid():
+    session = _MeterSession(_meter_payload())
+
+    result = validate_fbref_proxy_meter(
+        "http://fbref_proxy_filter:8899",
+        control_token="s" * 32,
+        required_bytes=100 * 1024 * 1024,
+        minimum_configured_exits=4,
+        session=session,
     )
 
-    assert result["healthy"] == 2
-    assert result["probe"] == "tcp_connect_only"
-    assert "password" not in repr(result)
-    assert "one" not in repr(result)
+    assert result["configured"] == 4
+    assert result["probe"] == "authenticated_control_only_zero_paid_bytes"
+    assert "s" * 32 not in repr(result)
+    assert session.calls == [
+        (
+            "http://fbref_proxy_filter:8899/v1/auth-check",
+            {
+                "headers": {"X-Proxy-Control-Token": "s" * 32},
+                "timeout": 5.0,
+            },
+        )
+    ]
 
 
-def test_proxy_preflight_rejects_malformed_or_writable_pool(tmp_path):
-    path = tmp_path / "proxys.txt"
-    path.write_text("one:80:user:password\nbad\n")
-    os.chmod(path, 0o622)
-    with pytest.raises(ReadinessError, match="group/world writable"):
-        validate_proxy_pool(path, minimum_healthy=1)
-
-    os.chmod(path, 0o600)
-    manager = SimpleNamespace(
-        load_from_file_custom_format=lambda _: 1,
-        validate_proxies=lambda **_: {"alive": 1, "dead": 0, "total": 1},
-    )
-    with pytest.raises(ReadinessError, match="malformed entries"):
-        validate_proxy_pool(
-            path, minimum_healthy=1, manager_factory=lambda **_: manager
+@pytest.mark.parametrize(
+    ("payload", "status"),
+    [
+        (_meter_payload(), 401),
+        (_meter_payload(dagrun_budget_bytes=99), 200),
+        (_meter_payload(max_active_leases=2), 200),
+        (_meter_payload(lease_proxy_url="http://shared-proxy:8900"), 200),
+        (_meter_payload(configured_pool_count=3), 200),
+    ],
+)
+def test_proxy_meter_preflight_fails_closed(payload, status):
+    with pytest.raises(ReadinessError):
+        validate_fbref_proxy_meter(
+            "http://fbref_proxy_filter:8899",
+            control_token="s" * 32,
+            required_bytes=100 * 1024 * 1024,
+            minimum_configured_exits=4,
+            session=_MeterSession(payload, status=status),
         )
 
 

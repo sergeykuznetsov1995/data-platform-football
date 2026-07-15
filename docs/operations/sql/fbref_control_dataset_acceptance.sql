@@ -8,6 +8,12 @@ SELECT
     CASE
         WHEN status = 'succeeded'
          AND metadata ? 'raw_baseline'
+         AND metadata ? 'raw_audit'
+         AND metadata -> 'raw_audit' ->> 'status' = 'passed'
+         AND metadata -> 'raw_audit' ->> 'processing_control_run_id'
+             = run_id::text
+         AND metadata -> 'raw_audit' ->> 'artifact_sha256'
+             ~ '^[0-9a-f]{64}$'
          AND (
              run_type = 'replay'
              OR metadata ? 'raw_fetch_attempt_snapshot'
@@ -20,7 +26,8 @@ SELECT
     started_at,
     finished_at,
     metadata -> 'raw_baseline' AS raw_baseline_anchor,
-    metadata -> 'raw_fetch_attempt_snapshot' AS raw_attempt_snapshot
+    metadata -> 'raw_fetch_attempt_snapshot' AS raw_attempt_snapshot,
+    metadata -> 'raw_audit' AS raw_audit_anchor
 FROM fbref_control.crawl_run
 WHERE run_id = CAST(:control_run_id AS uuid);
 

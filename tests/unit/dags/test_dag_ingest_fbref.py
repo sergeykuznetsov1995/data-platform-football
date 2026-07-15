@@ -185,7 +185,7 @@ class TestFBrefCurrentTopology:
         assert kwargs["trigger_run_id"] == (
             "fbref_silver__{{ dag.dag_id }}__{{ run_id }}"
         )
-        assert kwargs["logical_date"] == "{{ ti.start_date }}"
+        assert kwargs["execution_date"] == "{{ ti.start_date }}"
         assert kwargs["conf"]["publication_scope"] == "fbref_silver_only"
         assert kwargs["conf"]["trigger_xref"] is False
 

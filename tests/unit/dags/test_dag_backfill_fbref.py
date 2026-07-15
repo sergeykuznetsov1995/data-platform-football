@@ -157,7 +157,7 @@ class TestFBrefBackfillTopology:
         )
         assert trigger._captured_kwargs["retries"] == 0
         assert trigger._captured_kwargs["reset_dag_run"] is False
-        assert trigger._captured_kwargs["logical_date"] == "{{ ti.start_date }}"
+        assert trigger._captured_kwargs["execution_date"] == "{{ ti.start_date }}"
         assert trigger._captured_kwargs["conf"]["trigger_xref"] is False
         assert trigger.downstream_task_ids == {"release_publication_lock"}
 
