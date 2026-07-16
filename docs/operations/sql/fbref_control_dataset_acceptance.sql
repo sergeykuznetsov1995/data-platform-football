@@ -68,7 +68,9 @@ WITH attempts AS (
 ), sessions AS (
     SELECT
         count(*) AS clearance_sessions,
-        count(*) FILTER (WHERE status = 'closed') AS closed_sessions,
+        count(*) FILTER (
+            WHERE status IN ('closed', 'failed', 'expired')
+        ) AS terminal_sessions,
         count(*) FILTER (WHERE status = 'active') AS active_sessions,
         count(*) FILTER (
             WHERE session_version IS DISTINCT FROM
@@ -87,7 +89,7 @@ WITH attempts AS (
               AND session.session_id IS NOT NULL
               AND session.session_version =
                   'fbref-camoufox-metered-warm-http-v6'
-              AND session.status = 'closed'
+              AND session.status IN ('closed', 'failed', 'expired')
               AND session.browser_bootstrap_attempts > 0
               AND session.browser_bootstrap_requests > 0
               AND session.http_requests > 0
@@ -102,7 +104,7 @@ WITH attempts AS (
                       'fbref-camoufox-metered-warm-http-v6'
                   OR session.session_version IS DISTINCT FROM
                       'fbref-camoufox-metered-warm-http-v6'
-                  OR session.status IS DISTINCT FROM 'closed'
+                  OR session.status NOT IN ('closed', 'failed', 'expired')
                   OR session.browser_bootstrap_attempts <= 0
                   OR session.browser_bootstrap_requests <= 0
                   OR session.http_requests <= 0
@@ -128,7 +130,7 @@ SELECT
          AND unlinked_successful_warm_http_attempts = 0
          AND unexpected_transport_versions = 0
          AND clearance_sessions > 0
-         AND closed_sessions > 0
+         AND terminal_sessions = clearance_sessions
          AND active_sessions = 0
          AND unexpected_session_versions = 0
         THEN 'PASS'

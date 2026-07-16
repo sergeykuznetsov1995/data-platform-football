@@ -242,6 +242,9 @@ def test_postgres_companion_proves_explicit_empty_season_manifests():
     assert "fbref-camoufox-metered-warm-http-v6" in CONTROL_SQL
     assert "successful_warm_http_attempts > 0" in CONTROL_SQL
     assert "attempt.session_version = session.session_id::text" in CONTROL_SQL
+    assert "status IN ('closed', 'failed', 'expired')" in CONTROL_SQL
+    assert "terminal_sessions = clearance_sessions" in CONTROL_SQL
+    assert "closed_sessions" not in CONTROL_SQL
     assert "linked_successful_warm_http_attempts > 0" in CONTROL_SQL
     assert "unlinked_successful_warm_http_attempts = 0" in CONTROL_SQL
     assert "session.browser_bootstrap_attempts > 0" in CONTROL_SQL
