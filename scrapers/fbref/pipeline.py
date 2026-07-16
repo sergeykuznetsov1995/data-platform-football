@@ -119,9 +119,12 @@ REPLAY_SOURCE_BYTE_LIMIT = 100 * MIB
 # clearance is dead — so the wave re-solves instead of failing every remaining
 # target against it.
 CLEARANCE_REJECTED_STATUSES = frozenset({401, 403, 429})
-# Each refresh costs one browser solve, so a source that rejects clearances
-# outright must still fail the wave rather than launch browsers in a loop.
-MAX_CLEARANCE_REFRESHES = 2
+# Each consecutive refresh costs one browser solve, so a source that rejects
+# fresh clearances outright must still fail the wave rather than launch
+# browsers in a loop. A productive warm session resets this streak: later
+# expiry is independent transport churn, not evidence that the source rejects
+# every fresh clearance.
+MAX_CONSECUTIVE_CLEARANCE_REFRESHES = 2
 
 logger = logging.getLogger(__name__)
 
@@ -314,6 +317,13 @@ def live_wave_target_capacity(
     return min(settings.shard_size, request_capacity)
 
 
+@dataclass(frozen=True)
+class _FrontierSeedCandidate:
+    link: DiscoveredPageLink
+    historical: bool
+    refresh_policy: Optional[str] = None
+
+
 @dataclass
 class WaveResult:
     cohort_size: int = 0
@@ -362,7 +372,7 @@ class _LiveFetchSession:
     stack: ExitStack = field(default_factory=ExitStack)
     fetcher: Optional[object] = None
     session_id: Optional[str] = None
-    clearance_refreshes: int = 0
+    consecutive_clearance_refreshes: int = 0
     needs_clearance: bool = True
 
     def close(self, control, *, status: str) -> None:
@@ -1205,6 +1215,7 @@ class FBrefPipeline:
                     self._complete_from_record(
                         lease, record, historical=historical
                     )
+                    live_session.consecutive_clearance_refreshes = 0
                     result.fetched += 1
                     result.requests += (
                         response.http_requests + response.browser_requests
@@ -1332,7 +1343,7 @@ class FBrefPipeline:
                             transport_version=FETCHER_VERSION,
                             session_version=live_session.session_id,
                         )
-                        live_session.clearance_refreshes += 1
+                        live_session.consecutive_clearance_refreshes += 1
                         result.requeued_dead_clearance += 1
                         run_after_failure = self.control.get_run(run_id)
                         if run_after_failure is None:
@@ -1409,16 +1420,17 @@ class FBrefPipeline:
                         logger.warning(
                             "FBref clearance failed (%s, HTTP %s) — "
                             "%s stays in this run and the session is being "
-                            "re-solved on a fresh proxy (refresh %d/%d)",
+                            "re-solved on a fresh proxy "
+                            "(consecutive refresh %d/%d)",
                             exc.error_class,
                             exc.http_status,
                             lease.target_id,
-                            live_session.clearance_refreshes,
-                            MAX_CLEARANCE_REFRESHES,
+                            live_session.consecutive_clearance_refreshes,
+                            MAX_CONSECUTIVE_CLEARANCE_REFRESHES,
                         )
                         if (
-                            live_session.clearance_refreshes
-                            > MAX_CLEARANCE_REFRESHES
+                            live_session.consecutive_clearance_refreshes
+                            > MAX_CONSECUTIVE_CLEARANCE_REFRESHES
                         ):
                             untouched = leases[lease_index + 1:]
                             result.requeued_session_exhaustion += (
@@ -1428,7 +1440,7 @@ class FBrefPipeline:
                             )
                             result.failures.append(
                                 "clearance_session_refreshes_exhausted="
-                                f"{MAX_CLEARANCE_REFRESHES}"
+                                f"{MAX_CONSECUTIVE_CLEARANCE_REFRESHES}"
                             )
                             break
 
@@ -1644,10 +1656,36 @@ class FBrefPipeline:
         parent_record: Optional[RawFetchRecord] = None,
         reconcile_after: bool = True,
     ) -> tuple[int, int]:
-        eligible = set(self._eligible_competitions())
+        return self._seed_link_candidates(
+            (
+                _FrontierSeedCandidate(
+                    link=link,
+                    historical=historical,
+                    refresh_policy=refresh_policy,
+                )
+                for link in links
+            ),
+            parent_record=parent_record,
+            reconcile_after=reconcile_after,
+        )
+
+    def _seed_link_candidates(
+        self,
+        candidates: Iterable[_FrontierSeedCandidate],
+        *,
+        parent_record: Optional[RawFetchRecord] = None,
+        reconcile_after: bool = True,
+        eligible_competitions: Optional[Mapping[str, dict]] = None,
+    ) -> tuple[int, int]:
+        eligible = set(
+            self._eligible_competitions()
+            if eligible_competitions is None
+            else eligible_competitions
+        )
         seeded_targets: set[str] = set()
         skipped_targets: set[str] = set()
-        upserted_targets: set[str] = set()
+        prepared_targets: dict[str, FrontierTarget] = {}
+        provenance_edges: list[FrontierProvenance] = []
 
         parent_scopes: set[tuple[Optional[str], Optional[str]]] = set()
         if parent_record is not None:
@@ -1679,24 +1717,39 @@ class FBrefPipeline:
                             else str(competition_id),
                             None if season_id is None else str(season_id),
                         ))
-        for link in links:
+        for candidate in candidates:
+            link = candidate.link
             source_ids = dict(link.source_ids)
             target = page_target_from_link(link)
-            if target.target_id not in upserted_targets:
-                prepared = frontier_target(target, historical=historical)
-                if refresh_policy is not None:
-                    prepared = FrontierTarget(
-                        target_id=prepared.target_id,
-                        page_kind=prepared.page_kind,
-                        canonical_url=prepared.canonical_url,
-                        source_ids=prepared.source_ids,
-                        refresh_policy=refresh_policy,
-                        priority=prepared.priority,
-                        next_fetch_at=prepared.next_fetch_at,
-                        source=prepared.source,
-                    )
-                self.control.upsert_frontier_target(prepared)
-                upserted_targets.add(target.target_id)
+            prepared = frontier_target(
+                target, historical=candidate.historical
+            )
+            if candidate.refresh_policy is not None:
+                prepared = FrontierTarget(
+                    target_id=prepared.target_id,
+                    page_kind=prepared.page_kind,
+                    canonical_url=prepared.canonical_url,
+                    source_ids=prepared.source_ids,
+                    refresh_policy=candidate.refresh_policy,
+                    priority=prepared.priority,
+                    next_fetch_at=prepared.next_fetch_at,
+                    source=prepared.source,
+                )
+            existing = prepared_targets.get(target.target_id)
+            if existing is None:
+                prepared_targets[target.target_id] = prepared
+            elif (
+                existing.refresh_policy,
+                existing.priority,
+                existing.next_fetch_at,
+            ) != (
+                prepared.refresh_policy,
+                prepared.priority,
+                prepared.next_fetch_at,
+            ):
+                raise StateConflict(
+                    f"Target {target.target_id} has conflicting seed policies"
+                )
 
             link_competition = source_ids.get("competition_id")
             link_season = source_ids.get("season_id")
@@ -1719,31 +1772,35 @@ class FBrefPipeline:
                 skipped_targets.add(target.target_id)
 
             if parent_record is not None:
-                record_provenance = getattr(
-                    self.control, "record_frontier_provenance", None
-                )
-                if record_provenance is not None:
-                    for competition_id, season_id in sorted(
-                        scopes,
-                        key=lambda scope: (
-                            scope[0] or "", scope[1] or ""
+                for competition_id, season_id in sorted(
+                    scopes,
+                    key=lambda scope: (
+                        scope[0] or "", scope[1] or ""
+                    ),
+                ):
+                    provenance_edges.append(FrontierProvenance(
+                        parent_target_id=parent_record.target_id,
+                        child_target_id=target.target_id,
+                        relation=f"page_link:{link.page_kind}",
+                        carried_competition_id=competition_id,
+                        carried_season_id=season_id,
+                        parent_content_hash=parent_record.content_hash,
+                        parser_version=DISCOVERY_PARSER_VERSION,
+                        logical_refresh_id=(
+                            parent_record.logical_refresh_id
                         ),
-                    ):
-                        record_provenance(FrontierProvenance(
-                            parent_target_id=parent_record.target_id,
-                            child_target_id=target.target_id,
-                            relation=f"page_link:{link.page_kind}",
-                            carried_competition_id=competition_id,
-                            carried_season_id=season_id,
-                            parent_content_hash=parent_record.content_hash,
-                            parser_version=DISCOVERY_PARSER_VERSION,
-                            logical_refresh_id=(
-                                parent_record.logical_refresh_id
-                            ),
-                            metadata={
-                                "child_page_kind": link.page_kind,
-                            },
-                        ))
+                        metadata={
+                            "child_page_kind": link.page_kind,
+                        },
+                    ))
+        if prepared_targets or provenance_edges:
+            self.control.upsert_frontier_discovery_batch(
+                targets=[
+                    prepared_targets[target_id]
+                    for target_id in sorted(prepared_targets)
+                ],
+                provenance=provenance_edges,
+            )
         if parent_record is not None and reconcile_after:
             self._reconcile_frontier_scope()
         return len(seeded_targets), len(skipped_targets)
@@ -1933,29 +1990,24 @@ class FBrefPipeline:
                     season_id=canonical.season_id,
                     alias_kind="label",
                 ), snapshot_id=snapshot_id)
-        seeded = 0
-        skipped = 0
+        candidates: list[_FrontierSeedCandidate] = []
         for season in seasons:
             is_current = season.season_id == current_season_id
             if run_type == "current" and not is_current:
                 continue
             if run_type == "backfill" and is_current:
                 continue
-            added, rejected = self._seed_links(
-                [DiscoveredPageLink(
+            candidates.append(_FrontierSeedCandidate(
+                link=DiscoveredPageLink(
                     page_kind="season",
                     canonical_url=season.season_url,
                     source_ids={
                         "competition_id": competition_id,
                         "season_id": season.season_id,
                     },
-                )],
+                ),
                 historical=not is_current,
-                parent_record=record,
-                reconcile_after=False,
-            )
-            seeded += added
-            skipped += rejected
+            ))
         for match in direct_matches:
             is_current = match.season_id == current_season_id
             # Inventory every direct edition while the authoritative history
@@ -1963,8 +2015,8 @@ class FBrefPipeline:
             # ``current_completed_once``; backfill waves claim only
             # ``historical_once``, so recording both policies here makes old
             # one-match finals reachable without charging the current crawl.
-            direct_seeded, direct_skipped = self._seed_links(
-                [DiscoveredPageLink(
+            candidates.append(_FrontierSeedCandidate(
+                link=DiscoveredPageLink(
                     page_kind="match",
                     canonical_url=match.canonical_url,
                     source_ids={
@@ -1972,19 +2024,18 @@ class FBrefPipeline:
                         "season_id": match.season_id,
                         "match_id": match.match_id,
                     },
-                )],
+                ),
                 historical=not is_current,
                 refresh_policy=(
                     "current_completed_once" if is_current
                     else "historical_once"
                 ),
-                parent_record=record,
-                reconcile_after=False,
-            )
-            seeded += direct_seeded
-            skipped += direct_skipped
-        self._reconcile_frontier_scope()
-        return seeded, skipped
+            ))
+        return self._seed_link_candidates(
+            candidates,
+            parent_record=record,
+            eligible_competitions=registry,
+        )
 
     @staticmethod
     def _season_ref(record: RawFetchRecord) -> SeasonRef:
@@ -2004,9 +2055,7 @@ class FBrefPipeline:
         *,
         historical: bool,
     ) -> tuple[int, int]:
-        links: list[DiscoveredPageLink] = []
-        directly_seeded = 0
-        directly_skipped = 0
+        candidates: list[_FrontierSeedCandidate] = []
         if record.page_kind == "season":
             parsed = parse_season_html(html, self._season_ref(record))
             if parsed.has_errors:
@@ -2014,16 +2063,17 @@ class FBrefPipeline:
                     f"Schedule discovery failed for {record.target_id}"
                 )
             for schedule in parsed.datasets["schedules"].records:
-                links.append(
-                    DiscoveredPageLink(
+                candidates.append(_FrontierSeedCandidate(
+                    link=DiscoveredPageLink(
                         page_kind="schedule",
                         canonical_url=schedule.schedule_url,
                         source_ids={
                             "competition_id": schedule.competition_id,
                             "season_id": schedule.season_id,
                         },
-                    )
-                )
+                    ),
+                    historical=historical,
+                ))
         elif record.page_kind == "schedule":
             parsed = parse_schedule_html(html, self._season_ref(record))
             if parsed.has_errors:
@@ -2046,8 +2096,8 @@ class FBrefPipeline:
                         "match_id": match.match_id,
                     },
                 )
-                seeded, skipped = self._seed_links(
-                    [match_link],
+                candidates.append(_FrontierSeedCandidate(
+                    link=match_link,
                     historical=(
                         historical
                     ),
@@ -2056,11 +2106,7 @@ class FBrefPipeline:
                         if historical or match.canonical_url not in completed_urls
                         else "current_completed_once"
                     ),
-                    parent_record=record,
-                    reconcile_after=False,
-                )
-                directly_seeded += seeded
-                directly_skipped += skipped
+                ))
         discovered = discover_page_links(
             html,
             parent_source_ids=record.source_ids,
@@ -2077,15 +2123,14 @@ class FBrefPipeline:
             for link in discovered
             if page_target_from_link(link).target_id != record.target_id
         ]
-        links.extend(discovered)
-        seeded, skipped = self._seed_links(
-            links,
-            historical=historical,
-            parent_record=record,
-            reconcile_after=False,
+        candidates.extend(
+            _FrontierSeedCandidate(link=link, historical=historical)
+            for link in discovered
         )
-        self._reconcile_frontier_scope()
-        return directly_seeded + seeded, directly_skipped + skipped
+        return self._seed_link_candidates(
+            candidates,
+            parent_record=record,
+        )
 
     def _persist_generic(
         self,

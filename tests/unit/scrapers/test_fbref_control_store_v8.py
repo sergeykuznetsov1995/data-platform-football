@@ -9,6 +9,7 @@ from scrapers.fbref.control import (
     CompetitionRegistryEntry,
     ControlStore,
     FrontierProvenance,
+    FrontierTarget,
     SeasonRegistryEntry,
     StateConflict,
     TargetLease,
@@ -498,6 +499,160 @@ def test_provenance_identity_preserves_many_scopes_for_same_edge():
         parent_content_hash=common["parent_content_hash"],
         parser_version=common["parser_version"],
     )
+
+
+def test_frontier_discovery_batch_reuses_one_transaction_and_is_idempotent():
+    installed_targets = {}
+    installed_edges = {}
+
+    def handler(sql, params):
+        if "FROM fbref_control.page_frontier" in sql and "FOR UPDATE" in sql:
+            target_id, canonical_url = params
+            rows = [
+                dict(row)
+                for row in installed_targets.values()
+                if row["target_id"] == target_id
+                or row["canonical_url"] == canonical_url
+            ]
+            return rows, len(rows)
+        if "INSERT INTO fbref_control.page_frontier" in sql:
+            installed_targets[params[0]] = {
+                "target_id": params[0],
+                "source": params[1],
+                "page_kind": params[2],
+                "canonical_url": params[3],
+                "source_ids": json.loads(params[4]),
+                "state": "queued",
+            }
+            return [], 1
+        if "INSERT INTO fbref_control.frontier_provenance" in sql:
+            key = tuple(params[1:8])
+            installed_edges.setdefault(key, {
+                "provenance_id": params[0],
+                "carried_competition_id": params[4],
+                "carried_season_id": params[5],
+                "logical_refresh_id": params[8],
+                "metadata": json.loads(params[9]),
+            })
+            return [], 1
+        if "SELECT provenance_id, carried_competition_id" in sql:
+            return [dict(installed_edges[tuple(params)])], 1
+        raise AssertionError(sql)
+
+    store, factory = make_store(handler)
+    refresh_id = str(uuid.uuid4())
+    targets = [
+        FrontierTarget(
+            target_id=f"fbref:player:{index:08d}",
+            page_kind="player",
+            canonical_url=f"https://fbref.com/en/players/{index:08d}/x",
+            source_ids={"player_id": f"{index:08d}"},
+            refresh_policy="monthly",
+        )
+        for index in reversed(range(50))
+    ]
+    edges = [
+        FrontierProvenance(
+            parent_target_id="fbref:match:parent",
+            child_target_id=target.target_id,
+            relation="page_link:player",
+            carried_competition_id="9",
+            carried_season_id="2025-2026",
+            parent_content_hash="a" * 64,
+            parser_version="discovery-v8",
+            logical_refresh_id=refresh_id,
+            metadata={"child_page_kind": "player"},
+        )
+        for target in reversed(targets)
+    ]
+
+    first = store.upsert_frontier_discovery_batch(
+        targets=targets, provenance=edges
+    )
+    repeated = store.upsert_frontier_discovery_batch(
+        targets=targets, provenance=edges
+    )
+
+    assert first == repeated == {"target_count": 50, "provenance_count": 50}
+    assert len(factory.connections) == 2
+    assert all(connection.committed for connection in factory.connections)
+    assert len(installed_targets) == 50
+    assert len(installed_edges) == 50
+    for connection in factory.connections:
+        executions = connection.fake_cursor.executions
+        assert len(executions) == 200
+        target_ids = [
+            params[0]
+            for sql, params in executions
+            if "INSERT INTO fbref_control.page_frontier" in sql
+        ]
+        provenance_ids = [
+            params[0]
+            for sql, params in executions
+            if "INSERT INTO fbref_control.frontier_provenance" in sql
+        ]
+        assert target_ids == sorted(target_ids)
+        assert provenance_ids == sorted(provenance_ids)
+
+
+def test_frontier_discovery_batch_rolls_back_a_late_identity_conflict():
+    inserted = []
+
+    def handler(sql, params):
+        if "FROM fbref_control.page_frontier" in sql and "FOR UPDATE" in sql:
+            if params[0] == "fbref:player:b":
+                return [{
+                    "target_id": "fbref:player:someone-else",
+                    "source": "fbref",
+                    "page_kind": "player",
+                    "canonical_url": params[1],
+                    "source_ids": {"player_id": "someone-else"},
+                    "state": "queued",
+                }], 1
+            return [], 0
+        if "INSERT INTO fbref_control.page_frontier" in sql:
+            inserted.append(params[0])
+            return [], 1
+        raise AssertionError(sql)
+
+    store, factory = make_store(handler)
+    targets = [
+        FrontierTarget(
+            target_id=f"fbref:player:{suffix}",
+            page_kind="player",
+            canonical_url=f"https://fbref.com/en/players/{suffix}/x",
+            source_ids={"player_id": suffix},
+            refresh_policy="monthly",
+        )
+        for suffix in ("b", "a")
+    ]
+
+    with pytest.raises(StateConflict, match="Canonical URL already belongs"):
+        store.upsert_frontier_discovery_batch(targets=targets, provenance=[])
+
+    assert inserted == ["fbref:player:a"]
+    assert len(factory.connections) == 1
+    assert factory.connections[0].rolled_back is True
+    assert factory.connections[0].committed is False
+
+
+def test_frontier_discovery_batch_rejects_unbounded_input_before_connecting():
+    store, factory = make_store(lambda sql, params: ([], 0))
+    target = FrontierTarget(
+        target_id="fbref:player:a",
+        page_kind="player",
+        canonical_url="https://fbref.com/en/players/a/x",
+        source_ids={"player_id": "a"},
+        refresh_policy="monthly",
+    )
+
+    with pytest.raises(ValueError, match="target batch exceeds 1000"):
+        store.upsert_frontier_discovery_batch(
+            targets=[target] * 1001,
+            provenance=[],
+        )
+
+    assert factory.connections == []
 
 
 def test_global_unprocessed_raw_includes_failed_source_runs_oldest_first():
