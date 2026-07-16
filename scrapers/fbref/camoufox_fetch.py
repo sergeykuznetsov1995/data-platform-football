@@ -525,10 +525,31 @@ class CamoufoxFbrefTransport:
         self._settled_failed_request_urls: Dict[int, Optional[str]] = {}
         self._settled_failed_ids_by_url: Dict[str, list] = {}
         self._settled_failed_request_guids: Dict[int, str] = {}
+        self._settled_failed_request_objects: Dict[int, object] = {}
+        self._settled_failed_reserved_bytes: Dict[int, int] = {}
+        self._settled_failed_charged_bytes: Dict[int, int] = {}
+        self._settled_failed_response_seen: Dict[int, bool] = {}
+        # Firefox may also dispatch requestfinished before its response event.
+        # Keep the admitted identity so that only that exact late response is
+        # accepted; another request for the same URL must still fail closed.
+        self._settled_finished_request_urls: Dict[int, Optional[str]] = {}
+        self._settled_finished_ids_by_url: Dict[str, list] = {}
+        self._settled_finished_request_guids: Dict[int, str] = {}
+        self._settled_finished_request_objects: Dict[int, object] = {}
+        self._settled_finished_reserved_bytes: Dict[int, int] = {}
+        self._settled_finished_charged_bytes: Dict[int, int] = {}
+        self._settled_finished_response_seen: Dict[int, bool] = {}
         self._routed_failed_request_guids: set[str] = set()
         self._late_response_request_guids: set[str] = set()
+        self._late_response_request_urls_by_guid: Dict[
+            str, Optional[str]
+        ] = {}
+        self._late_response_accounting_by_guid: Dict[
+            str, tuple[int, bool, int]
+        ] = {}
         self._responded_request_urls: Dict[int, Optional[str]] = {}
         self._responded_ids_by_url: Dict[str, list] = {}
+        self._responded_request_guids: Dict[int, str] = {}
         self._navigation_source_url: Optional[str] = None
         self._pending_manual_redirect_url: Optional[str] = None
         # An __exit__ failure is a permanent phase-boundary failure. The
@@ -860,6 +881,8 @@ class CamoufoxFbrefTransport:
         req,
         request_urls: Dict[int, Optional[str]],
         ids_by_url: Dict[str, list],
+        request_guids: Optional[Dict[int, str]] = None,
+        request_objects: Optional[Dict[int, object]] = None,
     ) -> None:
         key = id(req)
         if key in request_urls:
@@ -870,6 +893,15 @@ class CamoufoxFbrefTransport:
         request_urls[key] = url
         if url is not None:
             ids_by_url.setdefault(url, []).append(key)
+        guid = self._request_guid(req)
+        if request_guids is not None:
+            if guid is not None:
+                request_guids[key] = guid
+        # Retaining settled wrappers prevents id() reuse from overwriting a
+        # still-live tombstone. The set is bounded by the browser session (and
+        # by the hard request cap in production) and is cleared on _stop().
+        if request_objects is not None:
+            request_objects[key] = req
 
     def _remember_all_inflight_as_intentional_aborts(self) -> None:
         for key in self._inflight_byte_reservations:
@@ -885,7 +917,13 @@ class CamoufoxFbrefTransport:
         key: int,
         request_urls: Dict[int, Optional[str]],
         ids_by_url: Dict[str, list],
+        request_guids: Optional[Dict[int, str]] = None,
+        request_objects: Optional[Dict[int, object]] = None,
     ) -> None:
+        if request_guids is not None:
+            request_guids.pop(key, None)
+        if request_objects is not None:
+            request_objects.pop(key, None)
         url = request_urls.pop(key, None)
         if url is None:
             return
@@ -903,17 +941,83 @@ class CamoufoxFbrefTransport:
         req,
         request_urls: Dict[int, Optional[str]],
         ids_by_url: Dict[str, list],
+        request_guids: Optional[Dict[int, str]] = None,
+        request_objects: Optional[Dict[int, object]] = None,
+        allow_url_fallback: bool = True,
     ) -> bool:
-        key = id(req)
-        if key in request_urls:
-            self._forget_request_marker(key, request_urls, ids_by_url)
-            return True
-        url = self._request_url(req)
-        keys = ids_by_url.get(url or "")
-        if not keys:
+        if request_guids is None:
+            key = id(req)
+            if key not in request_urls:
+                url = self._request_url(req)
+                keys = ids_by_url.get(url or "")
+                if not keys:
+                    return False
+                key = keys[0]
+        else:
+            key = self._request_marker_key(
+                req,
+                request_urls,
+                ids_by_url,
+                request_guids,
+                request_objects=request_objects,
+                allow_url_fallback=allow_url_fallback,
+            )
+        if key is None:
             return False
-        self._forget_request_marker(keys[0], request_urls, ids_by_url)
+        self._forget_request_marker(
+            key,
+            request_urls,
+            ids_by_url,
+            request_guids,
+            request_objects,
+        )
         return True
+
+    def _request_marker_key(
+        self,
+        req,
+        request_urls: Dict[int, Optional[str]],
+        ids_by_url: Dict[str, list],
+        request_guids: Dict[int, str],
+        *,
+        request_objects: Optional[Dict[int, object]] = None,
+        allow_url_fallback: bool = True,
+    ) -> Optional[int]:
+        """Match by GUID or exact wrapper; optionally fall back to URL."""
+
+        key = id(req)
+        guid = self._request_guid(req)
+        current_url = self._request_url(req)
+        if key in request_urls:
+            if request_guids.get(key) != guid:
+                return None
+            if (
+                guid is None
+                and request_objects is not None
+                and request_objects.get(key) is not req
+            ):
+                return None
+            known_url = request_urls.get(key)
+            if known_url is not None and current_url != known_url:
+                return None
+            return key
+        if guid is not None:
+            for known_key, known_guid in request_guids.items():
+                if known_guid != guid:
+                    continue
+                known_url = request_urls.get(known_key)
+                if known_url is not None and current_url != known_url:
+                    return None
+                return known_key
+            return None
+        if not allow_url_fallback:
+            return None
+        if current_url is None:
+            return None
+        for known_key in ids_by_url.get(current_url, ()):
+            if known_key not in request_guids:
+                return known_key
+        return None
 
     def _consume_intentional_abort(self, req) -> bool:
         """Consume an abort marker, tolerating a re-wrapped Request object."""
@@ -938,16 +1042,25 @@ class CamoufoxFbrefTransport:
             self._unrouted_response_ids_by_url,
         )
 
-    def _remember_settled_failed_request(self, req) -> None:
+    def _remember_settled_failed_request(
+        self,
+        req,
+        *,
+        reserved: int,
+        charged: int,
+        response_seen: bool,
+    ) -> None:
         self._remember_request_marker(
             req,
             self._settled_failed_request_urls,
             self._settled_failed_ids_by_url,
+            self._settled_failed_request_guids,
+            self._settled_failed_request_objects,
         )
         key = id(req)
-        guid = self._request_guid(req)
-        if guid is not None and key not in self._settled_failed_request_guids:
-            self._settled_failed_request_guids[key] = guid
+        self._settled_failed_reserved_bytes[key] = max(0, int(reserved))
+        self._settled_failed_charged_bytes[key] = max(0, int(charged))
+        self._settled_failed_response_seen[key] = bool(response_seen)
 
     @staticmethod
     def _request_guid(req) -> Optional[str]:
@@ -965,52 +1078,137 @@ class CamoufoxFbrefTransport:
         self,
         req,
     ) -> Optional[int]:
-        key = id(req)
-        guid = self._request_guid(req)
-        if key in self._settled_failed_request_urls:
-            known_guid = self._settled_failed_request_guids.get(key)
-            # Guard against CPython reusing an old wrapper id for a new
-            # Playwright request after the original wrapper was collected.
-            return key if known_guid == guid else None
-        if guid is not None:
-            current_url = self._request_url(req)
-            for known_key, known_guid in self._settled_failed_request_guids.items():
-                if known_guid != guid:
-                    continue
-                known_url = self._settled_failed_request_urls.get(known_key)
-                if known_url is not None and current_url != known_url:
-                    return None
-                return known_key
-        return None
+        return self._request_marker_key(
+            req,
+            self._settled_failed_request_urls,
+            self._settled_failed_ids_by_url,
+            self._settled_failed_request_guids,
+            request_objects=self._settled_failed_request_objects,
+            allow_url_fallback=False,
+        )
 
     def _forget_settled_failed_marker(self, key: int) -> None:
-        self._settled_failed_request_guids.pop(key, None)
+        self._settled_failed_reserved_bytes.pop(key, None)
+        self._settled_failed_charged_bytes.pop(key, None)
+        self._settled_failed_response_seen.pop(key, None)
         self._forget_request_marker(
             key,
             self._settled_failed_request_urls,
             self._settled_failed_ids_by_url,
+            self._settled_failed_request_guids,
+            self._settled_failed_request_objects,
         )
 
-    def _consume_settled_failed_request(self, req) -> bool:
+    def _consume_settled_failed_request(
+        self,
+        req,
+    ) -> Optional[tuple[int, bool, int]]:
         key = self._settled_failed_marker_key(req)
         if key is None:
-            return False
+            return None
+        accounting = (
+            self._settled_failed_reserved_bytes.get(key, 0),
+            self._settled_failed_response_seen.get(key, False),
+            self._settled_failed_charged_bytes.get(key, 0),
+        )
         guid = self._settled_failed_request_guids.get(key)
         if guid is not None:
             self._late_response_request_guids.add(guid)
-        self._forget_settled_failed_marker(key)
-        return True
+            self._late_response_request_urls_by_guid[guid] = (
+                self._settled_failed_request_urls.get(key)
+            )
+            self._late_response_accounting_by_guid[guid] = accounting
+        if guid is not None:
+            self._forget_settled_failed_marker(key)
+        return accounting
 
     def _is_duplicate_settled_failure(self, req) -> bool:
         """Recognize only the same routed request, never merely the same URL."""
 
         return self._settled_failed_marker_key(req) is not None
 
+    def _remember_settled_finished_request(
+        self,
+        req,
+        *,
+        reserved: int,
+        charged: int,
+        response_seen: bool,
+    ) -> None:
+        self._remember_request_marker(
+            req,
+            self._settled_finished_request_urls,
+            self._settled_finished_ids_by_url,
+            self._settled_finished_request_guids,
+            self._settled_finished_request_objects,
+        )
+        key = id(req)
+        self._settled_finished_reserved_bytes[key] = max(0, int(reserved))
+        self._settled_finished_charged_bytes[key] = max(0, int(charged))
+        self._settled_finished_response_seen[key] = bool(response_seen)
+
+    def _settled_finished_marker_key(self, req) -> Optional[int]:
+        return self._request_marker_key(
+            req,
+            self._settled_finished_request_urls,
+            self._settled_finished_ids_by_url,
+            self._settled_finished_request_guids,
+            request_objects=self._settled_finished_request_objects,
+            allow_url_fallback=False,
+        )
+
+    def _consume_settled_finished_request(
+        self,
+        req,
+    ) -> Optional[tuple[int, bool, int]]:
+        key = self._settled_finished_marker_key(req)
+        if key is None:
+            return None
+        accounting = (
+            self._settled_finished_reserved_bytes.get(key, 0),
+            self._settled_finished_response_seen.get(key, False),
+            self._settled_finished_charged_bytes.get(key, 0),
+        )
+        guid = self._settled_finished_request_guids.get(key)
+        if guid is not None:
+            self._late_response_request_guids.add(guid)
+            self._late_response_request_urls_by_guid[guid] = (
+                self._settled_finished_request_urls.get(key)
+            )
+            self._late_response_accounting_by_guid[guid] = accounting
+        if guid is not None:
+            self._settled_finished_reserved_bytes.pop(key, None)
+            self._settled_finished_charged_bytes.pop(key, None)
+            self._settled_finished_response_seen.pop(key, None)
+            self._forget_request_marker(
+                key,
+                self._settled_finished_request_urls,
+                self._settled_finished_ids_by_url,
+                self._settled_finished_request_guids,
+                self._settled_finished_request_objects,
+            )
+        return accounting
+
+    def _is_duplicate_settled_finish(self, req) -> bool:
+        return self._settled_finished_marker_key(req) is not None
+
+    def _is_known_late_response_request(self, req) -> bool:
+        guid = self._request_guid(req)
+        if (
+            guid is None
+            or guid not in self._late_response_request_guids
+            or guid not in self._late_response_accounting_by_guid
+        ):
+            return False
+        known_url = self._late_response_request_urls_by_guid.get(guid)
+        return known_url is None or self._request_url(req) == known_url
+
     def _remember_responded_request(self, req) -> None:
         self._remember_request_marker(
             req,
             self._responded_request_urls,
             self._responded_ids_by_url,
+            self._responded_request_guids,
         )
 
     def _consume_responded_request(self, req) -> bool:
@@ -1018,6 +1216,7 @@ class CamoufoxFbrefTransport:
             req,
             self._responded_request_urls,
             self._responded_ids_by_url,
+            self._responded_request_guids,
         )
 
     def _clear_request_callback_tracking(self) -> None:
@@ -1028,10 +1227,24 @@ class CamoufoxFbrefTransport:
         self._settled_failed_request_urls.clear()
         self._settled_failed_ids_by_url.clear()
         self._settled_failed_request_guids.clear()
+        self._settled_failed_request_objects.clear()
+        self._settled_failed_reserved_bytes.clear()
+        self._settled_failed_charged_bytes.clear()
+        self._settled_failed_response_seen.clear()
+        self._settled_finished_request_urls.clear()
+        self._settled_finished_ids_by_url.clear()
+        self._settled_finished_request_guids.clear()
+        self._settled_finished_request_objects.clear()
+        self._settled_finished_reserved_bytes.clear()
+        self._settled_finished_charged_bytes.clear()
+        self._settled_finished_response_seen.clear()
         self._routed_failed_request_guids.clear()
         self._late_response_request_guids.clear()
+        self._late_response_request_urls_by_guid.clear()
+        self._late_response_accounting_by_guid.clear()
         self._responded_request_urls.clear()
         self._responded_ids_by_url.clear()
+        self._responded_request_guids.clear()
 
     def _track_reservation(self, req, reservation: int) -> None:
         key = id(req)
@@ -1152,15 +1365,17 @@ class CamoufoxFbrefTransport:
         self._bytes_by_type[req.resource_type] += observed
         self._bytes_total += observed
 
-    def _charge_failed_request(self, req, reserved: int) -> None:
+    def _charge_failed_request(self, req, reserved: int) -> int:
         try:
             observed = self._observed_request_bytes(req)
         except Exception:  # noqa: BLE001 — failed requests often lack sizes
             observed = 0
         if observed > 0:
             self._record_observed_request_bytes(req, observed)
+            charged = observed
         else:
             self._unobserved_reserved_bytes += max(0, int(reserved))
+            charged = max(0, int(reserved))
 
         if (
             self._max_network_bytes is not None
@@ -1172,6 +1387,7 @@ class CamoufoxFbrefTransport:
             self._abort_session_for_byte_budget(
                 "failed_request_consumed_byte_cap"
             )
+        return charged
 
     def _abort_session_for_byte_budget(self, reason: str) -> None:
         if self._byte_budget_exhausted:
@@ -1391,6 +1607,78 @@ class CamoufoxFbrefTransport:
         except Exception:  # noqa: BLE001 — fail closed in _on_response
             return {}
 
+    @staticmethod
+    def _declared_response_body_bytes(
+        headers: Dict[str, str],
+    ) -> Optional[int]:
+        transfer_encoding = headers.get("transfer-encoding", "")
+        chunked = "chunked" in {
+            token.strip().casefold()
+            for token in transfer_encoding.split(",")
+        }
+        raw_length = headers.get("content-length", "").strip()
+        if not (
+            not chunked
+            and raw_length
+            and raw_length.isascii()
+            and raw_length.isdigit()
+        ):
+            return None
+        return int(raw_length)
+
+    @classmethod
+    def _desired_response_reservation(cls, headers: Dict[str, str]) -> int:
+        declared = cls._declared_response_body_bytes(headers)
+        body_reservation = (
+            declared
+            if declared is not None
+            else BROWSER_UNDECLARED_BODY_RESERVATION_BYTES
+        )
+        return BROWSER_REQUEST_FIXED_OVERHEAD_BYTES + body_reservation
+
+    def _handle_settled_response(
+        self,
+        response,
+        req,
+        accounting: tuple[int, bool, int],
+    ) -> None:
+        """Validate an exact late/duplicate response without double counting."""
+
+        reserved, response_seen, charged = accounting
+        headers = self._response_headers(response)
+        self._capture_manual_redirect(response, req, headers)
+        if (
+            response_seen
+            or self._max_network_bytes is None
+            or self._byte_budget_exhausted
+        ):
+            validated = True
+        else:
+            desired = self._desired_response_reservation(headers)
+            fits_reservation = desired <= reserved
+            # Missing/undeclared headers keep the tombstone open: a later
+            # duplicate may expose a Content-Length that this callback lacked.
+            validated = bool(
+                fits_reservation
+                and self._declared_response_body_bytes(headers) is not None
+            )
+            if not fits_reservation:
+                # Bring total accounting up to the newly proven response size.
+                # ``sizes()`` may have charged an observed value smaller than
+                # the reservation, while an unknown request charged it all.
+                self._unobserved_reserved_bytes += max(0, desired - charged)
+                self._abort_session_for_byte_budget(
+                    "late_declared_body_exceeds_settled_reservation:"
+                    f"{desired}>{reserved}"
+                )
+        guid = self._request_guid(req)
+        if validated and guid in self._late_response_accounting_by_guid:
+            self._late_response_accounting_by_guid[guid] = (
+                reserved,
+                True,
+                charged,
+            )
+
     def _reject_unrouted_request(self) -> None:
         """Reject a response that appeared without route admission.
 
@@ -1481,9 +1769,21 @@ class CamoufoxFbrefTransport:
             return
         reservation_key = self._reservation_key(req)
         if reservation_key is None:
-            if self._consume_settled_failed_request(req):
-                headers = self._response_headers(response)
-                self._capture_manual_redirect(response, req, headers)
+            accounting = self._consume_settled_failed_request(req)
+            if accounting is not None:
+                self._handle_settled_response(response, req, accounting)
+                return
+            accounting = self._consume_settled_finished_request(req)
+            if accounting is not None:
+                self._handle_settled_response(response, req, accounting)
+                return
+            if self._is_known_late_response_request(req):
+                guid = self._request_guid(req)
+                self._handle_settled_response(
+                    response,
+                    req,
+                    self._late_response_accounting_by_guid[guid],
+                )
                 return
             self._remember_unrouted_response(req)
             self._reject_unrouted_request()
@@ -1503,27 +1803,11 @@ class CamoufoxFbrefTransport:
             return
         admitted = self._inflight_byte_reservations[reservation_key]
 
-        transfer_encoding = headers.get("transfer-encoding", "")
-        chunked = "chunked" in {
-            token.strip().casefold()
-            for token in transfer_encoding.split(",")
-        }
-        raw_length = headers.get("content-length", "").strip()
-        declared = (
-            not chunked
-            and raw_length
-            and raw_length.isascii()
-            and raw_length.isdigit()
-        )
-        body_reservation = (
-            int(raw_length)
-            if declared
-            else BROWSER_UNDECLARED_BODY_RESERVATION_BYTES
-        )
-        desired = BROWSER_REQUEST_FIXED_OVERHEAD_BYTES + body_reservation
+        desired = self._desired_response_reservation(headers)
         if desired > admitted:
             self._abort_session_for_byte_budget(
-                f"declared_body_exceeds_admission_reservation:{body_reservation}"
+                "declared_body_exceeds_admission_reservation:"
+                f"{desired - BROWSER_REQUEST_FIXED_OVERHEAD_BYTES}"
             )
             return
         self._inflight_byte_reservations[reservation_key] = desired
@@ -1539,35 +1823,47 @@ class CamoufoxFbrefTransport:
             if (
                 self._consume_intentional_abort(req)
                 or self._consume_unrouted_response(req)
+                or self._is_duplicate_settled_failure(req)
+                or self._is_duplicate_settled_finish(req)
+                or self._is_known_late_response_request(req)
             ):
                 return
             self._latch_unexpected_network("unrouted_http_completion")
             return
+        response_seen = self._consume_responded_request(req)
         reserved = self._release_byte_reservation(req)
-        self._consume_responded_request(req)
         self._consume_intentional_abort(req)
+        charged = max(0, int(reserved))
         try:
             n = self._observed_request_bytes(req)
             self._requests_count += 1
             if self._max_network_bytes is not None and n == 0:
                 self._unobserved_reserved_bytes += max(0, int(reserved))
-                return
-            self._record_observed_request_bytes(req, n)
-            if (
-                self._max_network_bytes is not None
-                and (
-                    n > reserved
-                    or self._bytes_total
-                    + self._unobserved_reserved_bytes
-                    + self._inflight_reserved_bytes
-                    > self._max_network_bytes
-                )
-            ):
-                self._abort_session_for_byte_budget(
-                    f"completed_size_exceeded_reservation:{n}>{reserved}"
-                )
+            else:
+                charged = n
+                self._record_observed_request_bytes(req, n)
+                if (
+                    self._max_network_bytes is not None
+                    and (
+                        n > reserved
+                        or self._bytes_total
+                        + self._unobserved_reserved_bytes
+                        + self._inflight_reserved_bytes
+                        > self._max_network_bytes
+                    )
+                ):
+                    self._abort_session_for_byte_budget(
+                        f"completed_size_exceeded_reservation:{n}>{reserved}"
+                    )
         except Exception:  # noqa: BLE001 — sizes() can race on teardown
             self._unobserved_reserved_bytes += max(0, int(reserved))
+        finally:
+            self._remember_settled_finished_request(
+                req,
+                reserved=reserved,
+                charged=charged,
+                response_seen=response_seen,
+            )
 
     def _on_request_failed(self, req) -> None:
         try:
@@ -1591,11 +1887,16 @@ class CamoufoxFbrefTransport:
             guid = self._request_guid(req)
             if guid is not None:
                 self._routed_failed_request_guids.add(guid)
-            if not self._consume_responded_request(req):
-                self._remember_settled_failed_request(req)
+            response_seen = self._consume_responded_request(req)
             reserved = self._release_byte_reservation(req)
             self._consume_intentional_abort(req)
-            self._charge_failed_request(req, reserved)
+            charged = self._charge_failed_request(req, reserved)
+            self._remember_settled_failed_request(
+                req,
+                reserved=reserved,
+                charged=charged,
+                response_seen=response_seen,
+            )
             return
         if self._consume_intentional_abort(req):
             # Browser-owned cancellation happened before another socket could
@@ -1608,6 +1909,12 @@ class CamoufoxFbrefTransport:
             # first callback already charged and settled its reservation. Keep
             # the marker for a possible late response (notably a blocked 3xx)
             # instead of misclassifying the duplicate as a routing bypass.
+            return
+        if self._is_duplicate_settled_finish(req):
+            # A duplicate terminal callback for an admitted request cannot be
+            # a new socket. Keep its marker for a possible late response.
+            return
+        if self._is_known_late_response_request(req):
             return
         if redirect_blocked:
             return
