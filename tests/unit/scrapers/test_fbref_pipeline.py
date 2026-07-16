@@ -3639,6 +3639,147 @@ def test_live_runner_reuses_one_fetch_session_and_parses_after_each_raw_batch(
     assert result.parse.parsed == 1
 
 
+def test_productive_refreshes_do_not_accumulate_into_session_exhaustion(
+    tmp_path,
+):
+    """A fresh session that serves a valid page is healthy. Its later expiry
+    must not count together with earlier, independently productive sessions."""
+    raw = _raw_store(tmp_path)
+    control = BudgetAwareFakeControl(raw)
+    control.run.update(
+        request_limit=200,
+        byte_limit=100 * 1024 * 1024,
+    )
+    run_id = str(uuid.UUID(int=1))
+
+    def make_lease(number, epoch=1):
+        return TargetLease(
+            attempt_id=str(uuid.UUID(int=2000 + number * 10 + epoch)),
+            run_id=run_id,
+            target_id=f"fbref:competition:{number}",
+            logical_refresh_id=str(uuid.UUID(int=3000 + number)),
+            canonical_url=(
+                f"https://fbref.com/en/comps/{number}/history/x-Seasons"
+            ),
+            page_kind="competition",
+            source_ids={"competition_id": str(number)},
+            claim_token=str(uuid.UUID(int=4000 + number * 10 + epoch)),
+            lease_epoch=epoch,
+            attempt_number=epoch,
+            leased_by="worker-1",
+            lease_expires_at=NOW + timedelta(minutes=10),
+        )
+
+    initial = [make_lease(number) for number in (9, 12, 13, 14, 15)]
+    retries = [make_lease(number, 2) for number in (12, 13, 14)]
+    claims = iter((initial, *([retry] for retry in retries)))
+    control.claim_targets = lambda *args, **kwargs: next(claims)
+
+    class ProductiveThenRejectedFetcher:
+        def __init__(self):
+            self.session_number = 1
+            self.session_fetches = 0
+            self.reset_calls = 0
+
+        def __enter__(self):
+            control.events.append("fetcher_enter")
+            return self
+
+        def __exit__(self, *args):
+            control.events.append("fetcher_exit")
+
+        def reset_clearance(self):
+            self.reset_calls += 1
+            self.session_number += 1
+            self.session_fetches = 0
+
+        def fetch(self, url, **kwargs):
+            self.session_fetches += 1
+            control.events.append("http")
+            if self.session_number <= 3 and self.session_fetches == 2:
+                raise FetchError(
+                    "FBref warm session was rejected after a valid page",
+                    error_class="http_status",
+                    http_status=403,
+                    wire_bytes=200,
+                    target_requests=1,
+                    http_status_history=(403,),
+                    latency_ms=100,
+                )
+            body = b"<html>ok</html>"
+            browser_requests = 20 if self.session_fetches == 1 else 0
+            return FetchResponse(
+                url=url,
+                status_code=200,
+                body=body,
+                headers={"etag": '"v1"'},
+                latency_ms=10,
+                http_wire_bytes=len(body) + 120,
+                decoded_html_bytes=len(body),
+                http_requests=1,
+                http_status_history=(200,),
+                browser_document_bytes=(500 if browser_requests else 0),
+                browser_asset_bytes=(100 if browser_requests else 0),
+                browser_requests=browser_requests,
+                browser_bootstrap_attempts=(1 if browser_requests else 0),
+            )
+
+    fetcher = ProductiveThenRejectedFetcher()
+    factory_calls = []
+
+    def factory(*args):
+        factory_calls.append(args)
+        return fetcher
+
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=factory,
+        sleep=lambda _: None,
+        clock=lambda: NOW,
+    )
+
+    result = pipeline.fetch_wave(
+        run_id,
+        worker_id="worker-1",
+        page_kinds=["competition"],
+        settings=PipelineSettings(
+            run_type="current",
+            request_limit=200,
+            byte_limit=100 * 1024 * 1024,
+            shard_size=5,
+            request_reservation_bytes=4 * 1024 * 1024,
+            domain_interval_seconds=0.01,
+        ),
+    )
+
+    assert len(factory_calls) == 1
+    assert fetcher.session_number == 4
+    assert fetcher.reset_calls == 3
+    assert control.events.count("session_open") == 4
+    assert [item[1]["requests"] for item in control.reservations] == [
+        82,
+        2,
+        82,
+        2,
+        82,
+        2,
+        82,
+        2,
+    ]
+    assert control.run["requests_used"] == 88
+    assert control.run["requests_reserved"] == 0
+    assert result.requests == 88
+    assert result.fetched == 5
+    assert result.requeued_dead_clearance == 3
+    assert result.requeued_session_exhaustion == 0
+    assert result.budget_exhausted is False
+    assert result.failures == []
+    assert len(control.failed) == 3
+    assert all(item[1]["session_retry"] for item in control.failed)
+
+
 def test_parse_wave_holds_publication_fence_through_external_writes(tmp_path):
     raw = _raw_store(tmp_path)
     control = FakeControl(raw)
