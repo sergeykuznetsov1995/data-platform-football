@@ -259,6 +259,82 @@ def test_postgres_companion_proves_explicit_empty_season_manifests():
     )
 
 
+def test_postgres_dataset_matrices_use_only_exact_run_fetches():
+    dataset_matrices = CONTROL_SQL.split("FROM route_targets;", 1)[1]
+    season_matrix, match_matrix = dataset_matrices.split(
+        "-- Prove every eligible match identity", 1
+    )
+
+    for matrix in (season_matrix, match_matrix):
+        assert "WITH selected_run AS" in matrix
+        assert "END AS evidence_run_id" in matrix
+        assert "attempt.run_id = selected_run.evidence_run_id" in matrix
+        assert "attempt.run_id = CAST(:control_run_id AS uuid)" not in matrix
+        assert "attempt.status = 'succeeded'" in matrix
+        assert "attempt.raw_manifest_key IS NOT NULL" in matrix
+        assert "JOIN run_fetches AS run_fetch" in matrix
+        assert "run_fetch.target_id = frontier.target_id" in matrix
+        assert (
+            "processing.logical_refresh_id = run_fetch.logical_refresh_id"
+            in matrix
+        )
+        assert "processing.content_hash = run_fetch.content_hash" in matrix
+        assert (
+            "processing.parser_version = 'fbref-page-document-v3'" in matrix
+        )
+        assert (
+            "processing.typed_parser_version = 'fbref-typed-bronze-v3'"
+            in matrix
+        )
+        assert (
+            "processing.stateful_parser_version = "
+            "'fbref-discovery-parser-v6'" in matrix
+        )
+        assert "latest_observation" not in matrix
+        assert "DISTINCT ON (processing.target_id)" not in matrix
+        assert not re.search(r"\bAS fetch\b", matrix, flags=re.IGNORECASE)
+
+    assert (
+        "observation.logical_refresh_id = requirement.logical_refresh_id"
+        in season_matrix
+    )
+    assert (
+        "observation.logical_refresh_id = direct.logical_refresh_id"
+        in match_matrix
+    )
+    assert match_matrix.count("('match_") == 6
+    assert "('shot_events')" in match_matrix
+    assert "('lineups')" in match_matrix
+
+
+def test_postgres_replay_uses_audited_source_run_evidence():
+    control_gate = CONTROL_SQL.split("-- Prove that a live run", 1)[0]
+    dataset_matrices = CONTROL_SQL.split("FROM route_targets;", 1)[1]
+
+    assert "audited_control_run_id IS NOT NULL" in control_gate
+    assert "audited_control_run_id = run_id" in control_gate
+    assert "audited_control_run_id <> run_id" in control_gate
+    assert "evidence_run.status = 'succeeded'" in control_gate
+    assert "evidence_run.run_type IN ('current', 'backfill')" in control_gate
+    assert "evidence_run.request_limit = 200" in control_gate
+    assert "evidence_run.byte_limit = 100 * 1048576" in control_gate
+    assert "->> 'run_type' = run_type" in control_gate
+    assert "->> 'zero_delta_required'" in control_gate
+    assert "run_type = 'replay' THEN 'true' ELSE 'false'" in control_gate
+    assert (
+        "metadata -> 'raw_audit' ->> 'processing_control_run_id'\n"
+        "             = run_id::text"
+    ) in control_gate
+
+    for matrix in dataset_matrices.split(
+        "-- Prove every eligible match identity", 1
+    ):
+        assert "WHEN run.run_type = 'replay'" in matrix
+        assert "->> 'audited_control_run_id'" in matrix
+        assert "WHEN run.run_type <> 'replay' THEN run.run_id" in matrix
+        assert "attempt.run_id = selected_run.evidence_run_id" in matrix
+
+
 def test_match_matrix_anti_joins_exact_expected_match_ids():
     match_matrix = SQL.split("-- 3c.", 1)[1].split("-- 3d.", 1)[0]
 

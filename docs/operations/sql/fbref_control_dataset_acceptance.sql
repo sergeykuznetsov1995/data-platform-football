@@ -8,6 +8,21 @@
 -- This control-plane evidence is required because a legitimate empty typed
 -- dataset intentionally does not create an Iceberg table.
 
+WITH selected_run AS (
+    SELECT
+        run.*,
+        CASE
+            WHEN run.metadata -> 'raw_audit'
+                     ->> 'audited_control_run_id'
+                 ~* '^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$'
+            THEN CAST(
+                run.metadata -> 'raw_audit'
+                    ->> 'audited_control_run_id' AS uuid
+            )
+        END AS audited_control_run_id
+    FROM fbref_control.crawl_run AS run
+    WHERE run.run_id = CAST(:control_run_id AS uuid)
+)
 SELECT
     'control_run' AS check_name,
     CASE
@@ -18,9 +33,34 @@ SELECT
              CAST(:expected_byte_limit_mb AS bigint) * 1048576
          AND metadata ? 'raw_baseline'
          AND metadata ? 'raw_audit'
+         AND metadata -> 'raw_audit' ->> 'schema_version'
+             = 'fbref-raw-audit-anchor-v1'
          AND metadata -> 'raw_audit' ->> 'status' = 'passed'
+         AND metadata -> 'raw_audit' ->> 'run_type' = run_type
+         AND metadata -> 'raw_audit' ->> 'zero_delta_required'
+             = CASE WHEN run_type = 'replay' THEN 'true' ELSE 'false' END
          AND metadata -> 'raw_audit' ->> 'processing_control_run_id'
              = run_id::text
+         AND audited_control_run_id IS NOT NULL
+         AND (
+             (
+                 run_type <> 'replay'
+                 AND audited_control_run_id = run_id
+             )
+             OR (
+                 run_type = 'replay'
+                 AND audited_control_run_id <> run_id
+                 AND EXISTS (
+                     SELECT 1
+                     FROM fbref_control.crawl_run AS evidence_run
+                     WHERE evidence_run.run_id = audited_control_run_id
+                       AND evidence_run.status = 'succeeded'
+                       AND evidence_run.run_type IN ('current', 'backfill')
+                       AND evidence_run.request_limit = 200
+                       AND evidence_run.byte_limit = 100 * 1048576
+                 )
+             )
+         )
          AND metadata -> 'raw_audit' ->> 'artifact_sha256'
              ~ '^[0-9a-f]{64}$'
          AND (
@@ -41,9 +81,9 @@ SELECT
     finished_at,
     metadata -> 'raw_baseline' AS raw_baseline_anchor,
     metadata -> 'raw_fetch_attempt_snapshot' AS raw_attempt_snapshot,
+    audited_control_run_id,
     metadata -> 'raw_audit' AS raw_audit_anchor
-FROM fbref_control.crawl_run
-WHERE run_id = CAST(:control_run_id AS uuid);
+FROM selected_run;
 
 -- Prove that a live run crossed the Firefox-152 -> warm-HTTP handoff with the
 -- reviewed v6 transport. Replay must remain completely network-free.
@@ -196,7 +236,41 @@ SELECT
     ) AS policy_exempt_route_targets
 FROM route_targets;
 
-WITH eligible_seasons AS (
+WITH selected_run AS (
+    SELECT
+        run.run_id,
+        run.run_type,
+        CASE
+            WHEN run.run_type = 'replay'
+             AND run.metadata -> 'raw_audit'
+                     ->> 'audited_control_run_id'
+                 ~* '^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$'
+            THEN CAST(
+                run.metadata -> 'raw_audit'
+                    ->> 'audited_control_run_id' AS uuid
+            )
+            WHEN run.run_type <> 'replay' THEN run.run_id
+        END AS evidence_run_id
+    FROM fbref_control.crawl_run AS run
+    WHERE run.run_id = CAST(:control_run_id AS uuid)
+), run_fetches AS (
+    SELECT DISTINCT ON (
+        attempt.target_id, attempt.logical_refresh_id
+    )
+        attempt.target_id,
+        attempt.logical_refresh_id,
+        attempt.content_hash
+    FROM fbref_control.fetch_attempt AS attempt
+    CROSS JOIN selected_run
+    WHERE attempt.run_id = selected_run.evidence_run_id
+      AND attempt.status = 'succeeded'
+      AND attempt.raw_manifest_key IS NOT NULL
+      AND attempt.content_hash IS NOT NULL
+    ORDER BY attempt.target_id,
+             attempt.logical_refresh_id,
+             COALESCE(attempt.finished_at, attempt.heartbeat_at) DESC,
+             attempt.attempt_number DESC
+), eligible_seasons AS (
     SELECT
         season.competition_id,
         season.season_id
@@ -231,20 +305,24 @@ WITH eligible_seasons AS (
         season.season_id,
         required.dataset,
         required.stat_route,
-        frontier.target_id
+        frontier.target_id,
+        run_fetch.logical_refresh_id
     FROM eligible_seasons AS season
     JOIN fbref_control.page_frontier AS frontier
       ON frontier.source = 'fbref'
      AND frontier.page_kind IN ('season', 'season_stats')
      AND frontier.source_ids ->> 'competition_id' = season.competition_id
      AND frontier.source_ids ->> 'season_id' = season.season_id
+    JOIN run_fetches AS run_fetch
+      ON run_fetch.target_id = frontier.target_id
     JOIN required
       ON required.stat_route = CASE
           WHEN frontier.page_kind = 'season' THEN 'standard'
           ELSE frontier.source_ids ->> 'stat_route'
       END
-), latest_observation AS (
-    SELECT DISTINCT ON (processing.target_id)
+), run_observations AS (
+    SELECT DISTINCT ON (run_fetch.logical_refresh_id)
+        run_fetch.logical_refresh_id,
         processing.target_id,
         processing.content_hash,
         processing.typed_parser_version,
@@ -252,8 +330,15 @@ WITH eligible_seasons AS (
         processing.typed_status,
         processing.validation_status AS processing_validation_status,
         processing.completed_at
-    FROM fbref_control.observation_processing AS processing
-    ORDER BY processing.target_id,
+    FROM run_fetches AS run_fetch
+    JOIN fbref_control.observation_processing AS processing
+      ON processing.logical_refresh_id = run_fetch.logical_refresh_id
+     AND processing.target_id = run_fetch.target_id
+     AND processing.content_hash = run_fetch.content_hash
+     AND processing.parser_version = 'fbref-page-document-v3'
+     AND processing.typed_parser_version = 'fbref-typed-bronze-v3'
+     AND processing.stateful_parser_version = 'fbref-discovery-parser-v6'
+    ORDER BY run_fetch.logical_refresh_id,
              COALESCE(processing.completed_at, processing.updated_at) DESC,
              processing.typed_parser_version DESC
 ), matrix AS (
@@ -263,6 +348,7 @@ WITH eligible_seasons AS (
         requirement.dataset,
         requirement.stat_route,
         requirement.target_id,
+        requirement.logical_refresh_id,
         observation.content_hash,
         observation.typed_parser_version,
         observation.processing_status,
@@ -275,8 +361,9 @@ WITH eligible_seasons AS (
         manifest.validation_status,
         manifest.row_count
     FROM discovered_requirements AS requirement
-    LEFT JOIN latest_observation AS observation
-      ON observation.target_id = requirement.target_id
+    LEFT JOIN run_observations AS observation
+      ON observation.logical_refresh_id = requirement.logical_refresh_id
+     AND observation.target_id = requirement.target_id
     LEFT JOIN fbref_control.dataset_manifest AS completion
       ON completion.target_id = observation.target_id
      AND completion.content_hash = observation.content_hash
@@ -323,9 +410,44 @@ ORDER BY competition_id, season_id, stat_route, dataset;
 -- typed manifest for every dataset. Direct-match editions use these identities
 -- in place of a schedule page. For any absent Iceberg payload table,
 -- dataset_requires_materialized_table must be false.
-WITH eligible_matches AS (
+WITH selected_run AS (
+    SELECT
+        run.run_id,
+        run.run_type,
+        CASE
+            WHEN run.run_type = 'replay'
+             AND run.metadata -> 'raw_audit'
+                     ->> 'audited_control_run_id'
+                 ~* '^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$'
+            THEN CAST(
+                run.metadata -> 'raw_audit'
+                    ->> 'audited_control_run_id' AS uuid
+            )
+            WHEN run.run_type <> 'replay' THEN run.run_id
+        END AS evidence_run_id
+    FROM fbref_control.crawl_run AS run
+    WHERE run.run_id = CAST(:control_run_id AS uuid)
+), run_fetches AS (
+    SELECT DISTINCT ON (
+        attempt.target_id, attempt.logical_refresh_id
+    )
+        attempt.target_id,
+        attempt.logical_refresh_id,
+        attempt.content_hash
+    FROM fbref_control.fetch_attempt AS attempt
+    CROSS JOIN selected_run
+    WHERE attempt.run_id = selected_run.evidence_run_id
+      AND attempt.status = 'succeeded'
+      AND attempt.raw_manifest_key IS NOT NULL
+      AND attempt.content_hash IS NOT NULL
+    ORDER BY attempt.target_id,
+             attempt.logical_refresh_id,
+             COALESCE(attempt.finished_at, attempt.heartbeat_at) DESC,
+             attempt.attempt_number DESC
+), eligible_matches AS (
     SELECT
         frontier.target_id,
+        run_fetch.logical_refresh_id,
         frontier.source_ids ->> 'competition_id' AS competition_id,
         frontier.source_ids ->> 'season_id' AS season_id,
         frontier.source_ids ->> 'match_id' AS match_id,
@@ -333,6 +455,8 @@ WITH eligible_matches AS (
             season.metadata ->> 'direct_match_only' = 'true', false
         ) AS direct_match_only
     FROM fbref_control.page_frontier AS frontier
+    JOIN run_fetches AS run_fetch
+      ON run_fetch.target_id = frontier.target_id
     JOIN fbref_control.competition_registry AS competition
       ON competition.source = frontier.source
      AND competition.competition_id =
@@ -359,16 +483,24 @@ WITH eligible_matches AS (
         ('match_officials'),
         ('match_keeper_stats'),
         ('match_player_stats')
-), latest_observation AS (
-    SELECT DISTINCT ON (processing.target_id)
+), run_observations AS (
+    SELECT DISTINCT ON (run_fetch.logical_refresh_id)
+        run_fetch.logical_refresh_id,
         processing.target_id,
         processing.content_hash,
         processing.typed_parser_version,
         processing.status AS processing_status,
         processing.typed_status,
         processing.validation_status AS processing_validation_status
-    FROM fbref_control.observation_processing AS processing
-    ORDER BY processing.target_id,
+    FROM run_fetches AS run_fetch
+    JOIN fbref_control.observation_processing AS processing
+      ON processing.logical_refresh_id = run_fetch.logical_refresh_id
+     AND processing.target_id = run_fetch.target_id
+     AND processing.content_hash = run_fetch.content_hash
+     AND processing.parser_version = 'fbref-page-document-v3'
+     AND processing.typed_parser_version = 'fbref-typed-bronze-v3'
+     AND processing.stateful_parser_version = 'fbref-discovery-parser-v6'
+    ORDER BY run_fetch.logical_refresh_id,
              COALESCE(processing.completed_at, processing.updated_at) DESC,
              processing.typed_parser_version DESC
 )
@@ -408,12 +540,14 @@ SELECT
     direct.direct_match_only,
     required.dataset,
     direct.target_id,
+    direct.logical_refresh_id,
     manifest.availability,
     manifest.row_count
 FROM eligible_matches AS direct
 CROSS JOIN required
-LEFT JOIN latest_observation AS observation
-  ON observation.target_id = direct.target_id
+LEFT JOIN run_observations AS observation
+  ON observation.logical_refresh_id = direct.logical_refresh_id
+ AND observation.target_id = direct.target_id
 LEFT JOIN fbref_control.dataset_manifest AS completion
   ON completion.target_id = observation.target_id
  AND completion.content_hash = observation.content_hash
