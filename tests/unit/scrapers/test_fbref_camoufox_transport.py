@@ -237,6 +237,299 @@ def test_duplicate_routed_failure_stays_settled_for_late_response():
 
 
 @pytest.mark.unit
+def test_routed_finish_before_response_accepts_only_that_late_response():
+    admission = (
+        BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
+        + BROWSER_UNDECLARED_BODY_RESERVATION_BYTES
+    )
+    transport = CamoufoxFbrefTransport(
+        max_network_requests=5,
+        max_network_bytes=3 * admission,
+    )
+    route = _Route(url="https://fbref.com/en/")
+    route.request._impl_obj._guid = "request@bootstrap"
+    route.request.sizes.return_value = {
+        "responseBodySize": 100,
+        "responseHeadersSize": 20,
+        "requestBodySize": 0,
+        "requestHeadersSize": 10,
+    }
+    transport._navigation_source_url = "https://fbref.com/en/"
+    transport._maybe_block(route)
+
+    # This is the order observed from the real Firefox canary: the admitted
+    # request settles, then its response callback is dispatched.
+    transport._on_request_finished(route.request)
+    late = MagicMock(
+        resource_type="document",
+        url=route.request.url,
+        is_navigation_request=True,
+    )
+    late._impl_obj._guid = "request@bootstrap"
+    transport._on_response(_Response(late, {}, status=403))
+
+    stats = transport.traffic_stats()
+    assert stats["real_requests_count"] == 1
+    assert stats["real_bytes_downloaded"] == 130
+    assert stats["network_policy_failed"] is False
+    assert transport._settled_finished_request_urls == {}
+    assert transport._settled_finished_request_guids == {}
+    assert transport._late_response_request_guids == {"request@bootstrap"}
+
+
+@pytest.mark.unit
+def test_duplicate_response_after_normal_finish_is_accepted_once():
+    admission = (
+        BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
+        + BROWSER_UNDECLARED_BODY_RESERVATION_BYTES
+    )
+    transport = CamoufoxFbrefTransport(
+        max_network_requests=5,
+        max_network_bytes=3 * admission,
+    )
+    route = _Route(url="https://fbref.com/en/")
+    route.request._impl_obj._guid = "request@bootstrap"
+    route.request.sizes.return_value = {
+        "responseBodySize": 100,
+        "responseHeadersSize": 20,
+        "requestBodySize": 0,
+        "requestHeadersSize": 10,
+    }
+    transport._maybe_block(route)
+    transport._on_response(
+        _Response(route.request, {"content-length": "100"}, status=403)
+    )
+    transport._on_request_finished(route.request)
+
+    duplicate = MagicMock(resource_type="document", url=route.request.url)
+    duplicate._impl_obj._guid = "request@bootstrap"
+    transport._on_response(_Response(duplicate, {}, status=403))
+    transport._on_request_finished(duplicate)
+    transport._on_response(_Response(duplicate, {}, status=403))
+    duplicate.failure = "NS_ERROR_NET_RESET"
+    transport._on_request_failed(duplicate)
+
+    stats = transport.traffic_stats()
+    assert stats["real_requests_count"] == 1
+    assert stats["real_bytes_downloaded"] == 130
+    assert stats["network_policy_failed"] is False
+    assert transport._settled_finished_request_urls == {}
+
+
+@pytest.mark.unit
+def test_late_oversized_response_trips_byte_cap_after_unknown_finish():
+    admission = (
+        BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
+        + BROWSER_UNDECLARED_BODY_RESERVATION_BYTES
+    )
+    transport = CamoufoxFbrefTransport(
+        max_network_requests=5,
+        max_network_bytes=3 * admission,
+    )
+    route = _Route(url="https://fbref.com/en/")
+    route.request._impl_obj._guid = "request@bootstrap"
+    route.request.sizes.side_effect = RuntimeError("sizes unavailable")
+    transport._maybe_block(route)
+    transport._on_request_finished(route.request)
+
+    late = MagicMock(resource_type="document", url=route.request.url)
+    late._impl_obj._guid = "request@bootstrap"
+    transport._on_response(_Response(late, {}, status=200))
+    assert transport.traffic_stats()["byte_budget_exhausted"] is False
+
+    declared_body = BROWSER_UNDECLARED_BODY_RESERVATION_BYTES + 1
+    transport._on_response(
+        _Response(
+            late,
+            {"content-length": str(declared_body)},
+            status=200,
+        )
+    )
+
+    stats = transport.traffic_stats()
+    assert stats["byte_budget_exhausted"] is True
+    assert stats["byte_budget_failure"] == (
+        "late_declared_body_exceeds_settled_reservation:"
+        f"{BROWSER_REQUEST_FIXED_OVERHEAD_BYTES + declared_body}>{admission}"
+    )
+    assert stats["unobserved_reserved_bytes"] == (
+        BROWSER_REQUEST_FIXED_OVERHEAD_BYTES + declared_body
+    )
+
+
+@pytest.mark.unit
+def test_late_oversized_response_tops_up_successful_size_accounting():
+    admission = (
+        BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
+        + BROWSER_UNDECLARED_BODY_RESERVATION_BYTES
+    )
+    transport = CamoufoxFbrefTransport(
+        max_network_requests=5,
+        max_network_bytes=3 * admission,
+    )
+    route = _Route(url="https://fbref.com/en/")
+    route.request._impl_obj._guid = "request@bootstrap"
+    route.request.sizes.return_value = {
+        "responseBodySize": 100,
+        "responseHeadersSize": 20,
+        "requestBodySize": 0,
+        "requestHeadersSize": 10,
+    }
+    transport._maybe_block(route)
+    transport._on_request_finished(route.request)
+
+    late = MagicMock(resource_type="document", url=route.request.url)
+    late._impl_obj._guid = "request@bootstrap"
+    declared_body = BROWSER_UNDECLARED_BODY_RESERVATION_BYTES + 1
+    desired = BROWSER_REQUEST_FIXED_OVERHEAD_BYTES + declared_body
+    transport._on_response(
+        _Response(
+            late,
+            {"content-length": str(declared_body)},
+            status=200,
+        )
+    )
+
+    stats = transport.traffic_stats()
+    assert stats["byte_budget_exhausted"] is True
+    assert stats["real_bytes_downloaded"] == 130
+    assert stats["unobserved_reserved_bytes"] == desired - 130
+    assert stats["budget_bytes_consumed"] == desired
+
+
+@pytest.mark.unit
+def test_settled_marker_retains_wrapper_until_session_cleanup():
+    transport = CamoufoxFbrefTransport(max_network_requests=5)
+    route = _Route(url="https://fbref.com/en/")
+    route.request._impl_obj._guid = "request@bootstrap"
+    route.request.sizes.side_effect = RuntimeError("sizes unavailable")
+    transport._maybe_block(route)
+    transport._on_request_finished(route.request)
+
+    key = id(route.request)
+    assert transport._settled_finished_request_objects[key] is route.request
+
+    transport._clear_request_callback_tracking()
+
+    assert transport._settled_finished_request_objects == {}
+
+
+@pytest.mark.unit
+def test_no_guid_exact_wrapper_accepts_repeated_late_callbacks():
+    transport = CamoufoxFbrefTransport(max_network_requests=5)
+    route = _Route(url="https://fbref.com/en/")
+    route.request.sizes.side_effect = RuntimeError("sizes unavailable")
+    transport._maybe_block(route)
+    transport._on_request_finished(route.request)
+
+    response = _Response(route.request, {}, status=403)
+    transport._on_response(response)
+    transport._on_request_finished(route.request)
+    transport._on_response(response)
+
+    stats = transport.traffic_stats()
+    assert stats["real_requests_count"] == 1
+    assert stats["network_policy_failed"] is False
+
+
+@pytest.mark.unit
+def test_settled_finish_does_not_hide_same_url_response_with_different_guid():
+    admission = (
+        BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
+        + BROWSER_UNDECLARED_BODY_RESERVATION_BYTES
+    )
+    transport = CamoufoxFbrefTransport(
+        max_network_requests=5,
+        max_network_bytes=3 * admission,
+    )
+    admitted = _Route(url="https://fbref.com/en/")
+    admitted.request._impl_obj._guid = "request@admitted"
+    admitted.request.sizes.return_value = {
+        "responseBodySize": 100,
+        "responseHeadersSize": 20,
+        "requestBodySize": 0,
+        "requestHeadersSize": 10,
+    }
+    transport._maybe_block(admitted)
+    transport._on_request_finished(admitted.request)
+
+    escaped = MagicMock(
+        resource_type="document",
+        url=admitted.request.url,
+    )
+    escaped._impl_obj._guid = "request@escaped"
+    transport._on_response(_Response(escaped, {}, status=403))
+
+    stats = transport.traffic_stats()
+    assert stats["real_requests_count"] == 2
+    assert stats["network_policy_failed"] is True
+    assert stats["network_policy_failure"] == "unrouted_http_response"
+
+
+@pytest.mark.unit
+def test_settled_finish_does_not_hide_same_guid_response_with_different_url():
+    admission = (
+        BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
+        + BROWSER_UNDECLARED_BODY_RESERVATION_BYTES
+    )
+    transport = CamoufoxFbrefTransport(
+        max_network_requests=5,
+        max_network_bytes=3 * admission,
+    )
+    admitted = _Route(url="https://fbref.com/en/")
+    admitted.request._impl_obj._guid = "request@admitted"
+    admitted.request.sizes.return_value = {
+        "responseBodySize": 100,
+        "responseHeadersSize": 20,
+        "requestBodySize": 0,
+        "requestHeadersSize": 10,
+    }
+    transport._maybe_block(admitted)
+    transport._on_request_finished(admitted.request)
+
+    escaped = MagicMock(
+        resource_type="document",
+        url="https://fbref.com/en/other",
+    )
+    escaped._impl_obj._guid = "request@admitted"
+    transport._on_response(_Response(escaped, {}, status=403))
+
+    stats = transport.traffic_stats()
+    assert stats["real_requests_count"] == 2
+    assert stats["network_policy_failed"] is True
+    assert stats["network_policy_failure"] == "unrouted_http_response"
+
+
+@pytest.mark.unit
+def test_no_guid_settled_finish_does_not_hide_same_url_other_wrapper():
+    admission = (
+        BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
+        + BROWSER_UNDECLARED_BODY_RESERVATION_BYTES
+    )
+    transport = CamoufoxFbrefTransport(
+        max_network_requests=5,
+        max_network_bytes=3 * admission,
+    )
+    admitted = _Route(url="https://fbref.com/en/")
+    admitted.request.sizes.return_value = {
+        "responseBodySize": 100,
+        "responseHeadersSize": 20,
+        "requestBodySize": 0,
+        "requestHeadersSize": 10,
+    }
+    transport._maybe_block(admitted)
+    transport._on_request_finished(admitted.request)
+
+    escaped = MagicMock(resource_type="document", url=admitted.request.url)
+    transport._on_response(_Response(escaped, {}, status=403))
+
+    stats = transport.traffic_stats()
+    assert stats["real_requests_count"] == 2
+    assert stats["network_policy_failed"] is True
+    assert stats["network_policy_failure"] == "unrouted_http_response"
+
+
+@pytest.mark.unit
 def test_proxy_bad_gateway_is_a_rotatable_network_failure():
     assert _navigation_error_type(
         RuntimeError("Page.goto: NS_ERROR_PROXY_BAD_GATEWAY")
@@ -608,7 +901,6 @@ def test_unrouted_response_diagnostic_is_useful_and_redacted(caplog):
         redirected_from=None,
     )
     request._impl_obj._guid = "request@escaped"
-    transport._late_response_request_guids.add("request@escaped")
 
     with caplog.at_level("ERROR"):
         transport._on_response(
@@ -623,7 +915,7 @@ def test_unrouted_response_diagnostic_is_useful_and_redacted(caplog):
     assert "status=302" in caplog.text
     assert "resource=document" in caplog.text
     assert "same_guid_routed_failure=False" in caplog.text
-    assert "same_guid_late_response=True" in caplog.text
+    assert "same_guid_late_response=False" in caplog.text
     assert "location_present=True" in caplog.text
     assert "challenge_secret" not in caplog.text
     assert "do-not-log" not in caplog.text
