@@ -278,7 +278,11 @@ def test_malformed_env_never_silently_falls_back_to_file(mod, tmp_path):
 
 def test_proxy_filter_compose_is_env_only_by_default():
     compose = _COMPOSE_PATH.read_text()
-    service = compose.split("  proxy_filter:\n", 1)[1].split("\n  caddy:\n", 1)[0]
+    # The dedicated sofascore_proxy_filter service (#951) now sits between the
+    # shared proxy_filter and caddy — bound the slice on that neighbour.
+    service = compose.split("  proxy_filter:\n", 1)[1].split(
+        "\n  sofascore_proxy_filter:\n", 1
+    )[0]
 
     assert "PROXY_POOL_JSON: ${PROXY_POOL_JSON:-}" in service
     assert "PROXY_FILTER_ALLOW_FILE_FALLBACK" in service
@@ -286,6 +290,32 @@ def test_proxy_filter_compose_is_env_only_by_default():
     # The lease concurrency limit is operator-tunable; the serial guarantees
     # that matter are per source (SofaScore production/canary), not global.
     assert "${PROXY_FILTER_MAX_ACTIVE_LEASES:-4}" in service
+
+
+def test_sofascore_has_a_dedicated_production_metered_proxy_service():
+    compose = _COMPOSE_PATH.read_text()
+    service = compose.split("  sofascore_proxy_filter:\n", 1)[1].split(
+        "\n  caddy:\n", 1
+    )[0]
+
+    # Dedicated pool secret + file fallback until the purchased pool lands.
+    assert "PROXY_POOL_JSON: ${SOFASCORE_PROXY_POOL_JSON:-}" in service
+    assert 'PROXY_FILTER_ALLOW_FILE_FALLBACK: "true"' in service
+    assert "./proxys.txt:/opt/airflow/proxys.txt:ro" in service
+    assert "http://sofascore_proxy_filter:8900" in service
+    # hard-cap 0 => production signer (a >0 cap is the never-authorized canary).
+    assert '\n      - --sofascore-canary-hard-cap-bytes\n      - "0"' in service
+    # One active SofaScore lease at a time.
+    assert '\n      - --max-active-leases\n      - "1"' in service
+    # Ledger/WAL on the persistent log root, isolated from the shared gateway.
+    assert (
+        "/logs/sofascore_proxy_filter/sofascore_allocation_claims.jsonl"
+        in service
+    )
+    assert (
+        "SOFASCORE_PROXY_BUDGET_ARTIFACT:"
+        "-/opt/airflow/configs/sofascore/proxy_budget_canary.json"
+    ) in service
 
 
 def test_fbref_has_an_isolated_metered_proxy_service():
