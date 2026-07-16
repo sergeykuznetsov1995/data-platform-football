@@ -502,9 +502,7 @@ def test_publication_lock_task_uses_exact_control_generation(monkeypatch):
 
 
 @pytest.mark.unit
-def test_publication_lock_finalizer_propagates_failure_and_allows_dry_run(
-    monkeypatch,
-):
+def test_publication_lock_finalizer_releases_after_silver_success(monkeypatch):
     release = MagicMock(return_value={"released": True})
     monkeypatch.setattr(
         fbref_pipeline_tasks, "release_fbref_publication_lock", release
@@ -527,11 +525,23 @@ def test_publication_lock_finalizer_propagates_failure_and_allows_dry_run(
     assert result == {"released": True}
     release.assert_called_once()
 
-    release.reset_mock()
+
+@pytest.mark.unit
+def test_publication_lock_finalizer_retains_failed_production_silver(
+    monkeypatch,
+):
+    release = MagicMock(return_value={"released": True})
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "release_fbref_publication_lock", release
+    )
     failed_run = SimpleNamespace(
         get_task_instances=lambda: [
             SimpleNamespace(
                 task_id="acquire_publication_lock", state="success"
+            ),
+            SimpleNamespace(task_id="validate_canary_run", state="skipped"),
+            SimpleNamespace(
+                task_id="release_canary_publication_lock", state="skipped"
             ),
             SimpleNamespace(
                 task_id="trigger_silver_transform", state="failed"
@@ -548,6 +558,17 @@ def test_publication_lock_finalizer_propagates_failure_and_allows_dry_run(
         )
     release.assert_not_called()
 
+
+@pytest.mark.unit
+def test_publication_lock_finalizer_releases_when_silver_never_started(
+    monkeypatch,
+):
+    from airflow.exceptions import AirflowException
+
+    release = MagicMock(return_value={"released": True})
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "release_fbref_publication_lock", release
+    )
     never_started = SimpleNamespace(
         get_task_instances=lambda: [
             SimpleNamespace(
@@ -567,7 +588,13 @@ def test_publication_lock_finalizer_propagates_failure_and_allows_dry_run(
         )
     release.assert_called_once()
 
-    release.reset_mock()
+
+@pytest.mark.unit
+def test_publication_lock_finalizer_allows_dry_run(monkeypatch):
+    release = MagicMock(return_value={"released": True})
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "release_fbref_publication_lock", release
+    )
     dry_run = SimpleNamespace(
         get_task_instances=lambda: [
             SimpleNamespace(
@@ -588,13 +615,21 @@ def test_publication_lock_finalizer_propagates_failure_and_allows_dry_run(
         "dry_run": True,
         "status": "not_acquired",
     }
+    release.assert_not_called()
 
-    release.reset_mock()
+
+@pytest.mark.unit
+def test_publication_lock_finalizer_preserves_successful_canary(monkeypatch):
+    release = MagicMock(return_value={"released": True})
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "release_fbref_publication_lock", release
+    )
     canary_run = SimpleNamespace(
         get_task_instances=lambda: [
             SimpleNamespace(
                 task_id="acquire_publication_lock", state="success"
             ),
+            SimpleNamespace(task_id="validate_canary_run", state="success"),
             SimpleNamespace(
                 task_id="release_canary_publication_lock", state="success"
             ),
@@ -613,6 +648,44 @@ def test_publication_lock_finalizer_propagates_failure_and_allows_dry_run(
         "status": "released_by_canary_path",
     }
     release.assert_not_called()
+
+
+@pytest.mark.unit
+def test_publication_lock_finalizer_cleans_up_failed_canary(monkeypatch):
+    release = MagicMock(return_value={"released": True})
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "release_fbref_publication_lock", release
+    )
+    canary_run = SimpleNamespace(
+        get_task_instances=lambda: [
+            SimpleNamespace(
+                task_id="acquire_publication_lock", state="success"
+            ),
+            SimpleNamespace(task_id="validate_canary_run", state="failed"),
+            SimpleNamespace(
+                task_id="release_canary_publication_lock",
+                state="upstream_failed",
+            ),
+            SimpleNamespace(
+                task_id="trigger_silver_transform", state="skipped"
+            ),
+        ]
+    )
+
+    assert fbref_pipeline_tasks.finalize_fbref_publication_lock(
+        airflow_run_id="manual__failed_canary",
+        dag_id="dag_ingest_fbref",
+        dag_run=canary_run,
+    ) == {
+        "released": True,
+        "canary": True,
+        "validation_state": "failed",
+        "status": "released_after_canary",
+    }
+    release.assert_called_once_with(
+        airflow_run_id="manual__failed_canary",
+        dag_id="dag_ingest_fbref",
+    )
 
 
 @pytest.mark.unit
