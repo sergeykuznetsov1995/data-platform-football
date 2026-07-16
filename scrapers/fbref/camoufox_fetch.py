@@ -26,6 +26,7 @@ Requirements (already in the image, do NOT bump):
 """
 
 import asyncio
+import base64
 import ipaddress
 import json
 import logging
@@ -128,6 +129,9 @@ FIREFOX_METERED_NETWORK_PREFS = {
     # document can run.
     "media.peerconnection.enabled": False,
     "network.http.redirection-limit": 0,
+    # Never send origin traffic (or its context headers) directly when the
+    # explicit paid proxy is unavailable.
+    "network.proxy.failover_direct": False,
     "network.http.speculative-parallel-limit": 0,
     "network.preconnect": False,
     "network.early-hints.enabled": False,
@@ -459,6 +463,7 @@ class CamoufoxFbrefTransport:
         geoip_database_check: Callable[[], None] = (
             require_camoufox_geoip_database
         ),
+        preemptive_proxy_auth: bool = False,
     ):
         # Either a rotating provider or a single fixed proxy dict.
         if proxy_provider is None and proxy is not None:
@@ -482,6 +487,7 @@ class CamoufoxFbrefTransport:
         )
         self._geoip_resolver = geoip_resolver
         self._geoip_database_check = geoip_database_check
+        self._preemptive_proxy_auth = bool(preemptive_proxy_auth)
 
         self._cm = None
         self._browser = None
@@ -594,6 +600,40 @@ class CamoufoxFbrefTransport:
             logger.debug("proxy result callback failed", exc_info=True)
 
     # -- lifecycle -------------------------------------------------------- #
+    def _proxy_authorization_header(self) -> Optional[str]:
+        """Build the lease proxy header without exposing it to logs."""
+
+        if not self._preemptive_proxy_auth:
+            return None
+        proxy = self._proxy or {}
+        username = str(proxy.get("username") or "")
+        password = str(proxy.get("password") or "")
+        invalid = False
+        try:
+            invalid = _proxy_url_with_credentials(proxy) is None
+        except (TypeError, ValueError, UnicodeError):
+            invalid = True
+        invalid = bool(
+            invalid
+            or username != "lease"
+            or not password
+            or len(password) > 512
+            or not password.isascii()
+            or any(
+                ord(character) < 32 or ord(character) == 127
+                for character in password
+            )
+        )
+        if invalid:
+            self._network_policy_failed = True
+            self._network_policy_failure = "invalid_proxy_credential"
+            self._last_solve_failure = "network_policy"
+            raise RuntimeError("Camoufox paid proxy credential is invalid")
+        encoded = base64.b64encode(
+            f"{username}:{password}".encode("ascii")
+        ).decode("ascii")
+        return f"Basic {encoded}"
+
     def _start(self) -> None:
         if self._browser_finalize_error is not None:
             raise RuntimeError(
@@ -634,6 +674,7 @@ class CamoufoxFbrefTransport:
             self._geoip_database_check()
 
         self._proxy = self._proxy_provider() if self._proxy_provider else None
+        proxy_authorization = self._proxy_authorization_header()
         if not self._proxy:
             logger.warning(
                 "CamoufoxFbrefTransport starting WITHOUT a proxy — Turnstile "
@@ -713,9 +754,20 @@ class CamoufoxFbrefTransport:
             # ordinary Playwright routing. Install the main-world deny guard
             # before creating any page; bypass_csp is needed only so this
             # browser-owned guard cannot be suppressed by a source CSP.
+            context_options = {
+                "service_workers": "block",
+                "bypass_csp": True,
+            }
+            if proxy_authorization is not None:
+                # Firefox otherwise waits for a 407 and retries below
+                # context.route(). Proxy-Authorization is hop-by-hop: the
+                # lease filter consumes it on CONNECT and strips it from HTTP
+                # forwarding, so the FBref origin never receives the token.
+                context_options["extra_http_headers"] = {
+                    "Proxy-Authorization": proxy_authorization,
+                }
             self._context = self._browser.new_context(
-                service_workers="block",
-                bypass_csp=True,
+                **context_options,
             )
             self._context.add_init_script(
                 script=NETWORK_API_BLOCK_INIT_SCRIPT

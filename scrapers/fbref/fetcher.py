@@ -26,7 +26,7 @@ from scrapers.fbref.settings import (
 from scrapers.utils.proxy_manager import classify_error
 
 
-FETCHER_VERSION = "fbref-camoufox-metered-warm-http-v4"
+FETCHER_VERSION = "fbref-camoufox-metered-warm-http-v5"
 DEFAULT_BOOTSTRAP_URL = "https://fbref.com/en/"
 MAX_HTML_BYTES = DEFAULT_HTTP_BODY_LIMIT_BYTES
 # The browser cap bounds ONE clearance attempt; the run's reservation covers
@@ -352,6 +352,7 @@ class FBrefFetcher:
             block_resources=True,
             max_network_requests=self._max_browser_requests,
             max_network_bytes=self._max_browser_bytes,
+            preemptive_proxy_auth=self._lease_client is not None,
         )
 
     def __enter__(self) -> "FBrefFetcher":
