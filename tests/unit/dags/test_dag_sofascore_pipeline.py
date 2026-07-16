@@ -117,3 +117,28 @@ def test_master_no_longer_triggers_sofascore():
     master = importlib.import_module("dag_master_pipeline")
 
     assert "dag_ingest_sofascore" not in master.TRIGGERED_INGESTION_DAGS
+
+
+@pytest.mark.unit
+def test_dag_has_an_explicit_start_date():
+    # Regression: DEFAULT_ARGS carries no start_date, and Airflow raises
+    # "DAG is missing the start_date parameter" at construction. Stub-based
+    # topology tests don't run that validation, so assert it directly — a live
+    # DagBag parse caught this after deploy.
+    module = _reload_pipeline()
+
+    assert module.dag._dag_kwargs.get("start_date") is not None
+
+
+@pytest.mark.unit
+def test_module_does_not_import_master_dag_at_top_level():
+    # Regression: `from dag_master_pipeline import ...` at module top level
+    # re-registers the master DAG under this file during DagBag parsing
+    # (AirflowDagDuplicatedIdException). The helper must be resolved lazily
+    # inside the callable, so the master symbol must NOT leak into this
+    # module's globals.
+    module = _reload_pipeline()
+
+    assert not hasattr(module, "resolve_scheduled_fbref_control_run")
+    # The wrapper callable that does the deferred import must exist instead.
+    assert callable(module.resolve_fbref_publication_scope)

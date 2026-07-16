@@ -34,16 +34,31 @@ One source = one DAG (#782) stays intact: this file adds no scraping tasks,
 it only sequences existing DAGs.
 """
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 from airflow.sensors.external_task import ExternalTaskSensor
 
-from dag_master_pipeline import resolve_scheduled_fbref_control_run
 from utils.config import SCHEDULES
 from utils.default_args import DEFAULT_ARGS
+
+
+def resolve_fbref_publication_scope(**context):
+    """Pin the scheduled 06:00 FBref generation for xref publication.
+
+    The import is deferred into the callable on purpose: importing
+    ``dag_master_pipeline`` at module top level executes that DAG file during
+    DagBag parsing and re-registers its ``dag_master_pipeline`` DAG under this
+    file, raising ``AirflowDagDuplicatedIdException``. DAG files must not import
+    each other at parse time. Resolving at task runtime is collision-free and
+    keeps the master helper the single source of truth.
+    """
+
+    from dag_master_pipeline import resolve_scheduled_fbref_control_run
+
+    return resolve_scheduled_fbref_control_run(**context)
 
 PIPELINE_ARGS = {
     **DEFAULT_ARGS,
@@ -60,7 +75,9 @@ with DAG(
         'pipeline is paused'
     ),
     schedule=SCHEDULES.get('dag_sofascore_pipeline'),
-    start_date=DEFAULT_ARGS.get('start_date'),
+    # Explicit, like dag_master_pipeline / dag_ingest_sofascore — DEFAULT_ARGS
+    # carries no start_date, and Airflow requires one at DAG construction.
+    start_date=datetime(2024, 1, 1),
     catchup=False,
     max_active_runs=1,
     default_args=PIPELINE_ARGS,
@@ -98,9 +115,9 @@ with DAG(
         check_existence=True,
     )
 
-    resolve_fbref_publication_scope = PythonOperator(
+    resolve_fbref_scope = PythonOperator(
         task_id='resolve_fbref_publication_scope',
-        python_callable=resolve_scheduled_fbref_control_run,
+        python_callable=resolve_fbref_publication_scope,
         retries=0,
         execution_timeout=timedelta(minutes=5),
     )
@@ -159,8 +176,8 @@ with DAG(
         trigger_rule='all_success',
     )
 
-    wait_for_scheduled_fbref >> resolve_fbref_publication_scope
+    wait_for_scheduled_fbref >> resolve_fbref_scope
     trigger_sofascore_ingest >> trigger_xref_transforms
-    resolve_fbref_publication_scope >> trigger_xref_transforms
+    resolve_fbref_scope >> trigger_xref_transforms
     trigger_xref_transforms >> trigger_e3_transforms
     trigger_e3_transforms >> trigger_e4_transforms
