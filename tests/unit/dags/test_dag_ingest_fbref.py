@@ -139,6 +139,7 @@ class TestFBrefCurrentTopology:
         assert freshness.python_callable.__name__ == (
             "validate_fbref_current_scope_freshness"
         )
+        assert freshness.op_kwargs["fail_fast"] is True
         assert freshness.upstream_task_ids == {"choose_publication_path"}
         assert tasks["validate_canary_run"].upstream_task_ids == {
             "choose_publication_path"

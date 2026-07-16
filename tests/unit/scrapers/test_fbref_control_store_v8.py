@@ -945,6 +945,15 @@ def test_run_summary_splits_current_historical_and_crawlable_scope_metrics():
     freshness_sql = next(
         sql for sql, _ in executions if "FROM evaluated_scope" in sql
     )
+    current_scope_sql = freshness_sql.split(
+        "), current_scope AS (", 1
+    )[1].split("), evaluated_scope AS (", 1)[0]
+    normalized_current_scope_sql = " ".join(current_scope_sql.split())
+    assert (
+        "AND NOT ( frontier.page_kind = 'match' "
+        "AND frontier.refresh_policy = 'historical_once' )"
+        in normalized_current_scope_sql
+    )
     assert "refresh_policy = 'current_completed_once'" in freshness_sql
     assert "state = 'fetched'" in freshness_sql
     assert "state IN ('queued', 'retry', 'leased')" in freshness_sql

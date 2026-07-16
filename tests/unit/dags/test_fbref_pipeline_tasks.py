@@ -896,6 +896,8 @@ def test_current_scope_freshness_accepts_complete_per_kind_evidence(monkeypatch)
 
 @pytest.mark.unit
 def test_backfill_freshness_preflight_blocks_pending_current_matches(monkeypatch):
+    from airflow.exceptions import AirflowFailException
+
     control = MagicMock()
     summary = _freshness_summary()
     summary["promotion_pending_match_count"] = 4
@@ -904,7 +906,9 @@ def test_backfill_freshness_preflight_blocks_pending_current_matches(monkeypatch
         fbref_pipeline_tasks, "_control_store", MagicMock(return_value=control)
     )
 
-    with pytest.raises(Exception, match="promotion_pending_match_count=4"):
+    with pytest.raises(
+        AirflowFailException, match="promotion_pending_match_count=4"
+    ):
         fbref_pipeline_tasks.validate_fbref_current_scope_freshness(
             airflow_run_id="manual__backfill",
             dag_id="dag_backfill_fbref",
@@ -941,7 +945,7 @@ def test_current_scope_freshness_allows_new_final_match_inside_24h_sla(
 def test_current_scope_freshness_fails_closed_for_stale_or_missing_evidence(
     monkeypatch,
 ):
-    from airflow.exceptions import AirflowException
+    from airflow.exceptions import AirflowFailException
 
     control = MagicMock()
     monkeypatch.setattr(
@@ -950,12 +954,23 @@ def test_current_scope_freshness_fails_closed_for_stale_or_missing_evidence(
     control.get_run_summary.return_value = _freshness_summary(
         stale_kind="schedule"
     )
-    with pytest.raises(AirflowException, match="schedule:stale=1"):
+    with pytest.raises(AirflowFailException, match="schedule:stale=1"):
         fbref_pipeline_tasks.validate_fbref_current_scope_freshness(
             airflow_run_id="manual__stale",
             dag_id="dag_backfill_fbref",
             run_type="backfill",
         )
+
+    from airflow.exceptions import AirflowException
+
+    with pytest.raises(AirflowException) as retryable:
+        fbref_pipeline_tasks.validate_fbref_current_scope_freshness(
+            airflow_run_id="manual__stale",
+            dag_id="dag_backfill_fbref",
+            run_type="backfill",
+            fail_fast=False,
+        )
+    assert not isinstance(retryable.value, AirflowFailException)
 
     control.get_run_summary.return_value = {"target_counts": {}}
     with pytest.raises(RuntimeError, match="no current-scope freshness"):
