@@ -835,6 +835,16 @@ class TestTrinoTableManagerInsertDataFrameAtomic:
             assert 'WHEN MATCHED THEN UPDATE SET' in merge
             assert 'WHEN NOT MATCHED THEN INSERT' in merge
             assert not any(sql.startswith('DELETE FROM') for sql in statements)
+            # Regression (#951): a Trino MERGE forbids qualifying the SET target
+            # column with the target alias. `SET t."col" = ...` raised
+            # SYNTAX_ERROR ("mismatched input '.'. Expecting: '='") against the
+            # live warehouse and blocked every SofaScore manifest upsert. The ON
+            # clause legally qualifies with `t."`; the SET clause must not.
+            set_clause = merge.split(
+                'WHEN MATCHED THEN UPDATE SET ', 1
+            )[1].split(' WHEN NOT MATCHED', 1)[0]
+            assert '"rating" = s."rating"' in set_clause
+            assert 't."' not in set_clause
 
     @pytest.mark.parametrize(
         ('frame', 'keys', 'message'),
