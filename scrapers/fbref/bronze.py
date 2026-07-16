@@ -117,8 +117,11 @@ class FBrefGenericBronzeWriter:
     ) -> None:
         self.manager = manager or TrinoTableManager()
         self.schema = schema
+        self._tables_ready = False
 
     def ensure_tables(self) -> None:
+        if self._tables_ready:
+            return
         for table, columns in GENERIC_TABLE_SCHEMAS.items():
             self.manager.create_iceberg_table(
                 self.schema,
@@ -126,6 +129,10 @@ class FBrefGenericBronzeWriter:
                 columns,
                 partition_columns=["page_kind"] if "page_kind" in columns else None,
             )
+        # Cache only a fully successful preflight.  A partial DDL failure must
+        # retry every idempotent CREATE on the next page rather than turning a
+        # broken schema into process-local success.
+        self._tables_ready = True
 
     def _merge_dataframe(
         self,

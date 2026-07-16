@@ -133,9 +133,17 @@ class RecordingManager:
         self.columns: dict[str, dict[str, str]] = {}
         self.writes: list[dict] = []
         self.fail_table = fail_table
+        self.table_exists_calls: list[str] = []
+        self.get_columns_calls: list[str] = []
+        self.create_calls: list[str] = []
+        self.add_calls: list[tuple[str, str, str]] = []
+        self.fail_create_count = 0
+        self.fail_describe_count = 0
+        self.fail_add_count = 0
 
     def table_exists(self, schema: str, table: str) -> bool:
         assert schema == "bronze"
+        self.table_exists_calls.append(table)
         return table in self.columns
 
     def arrow_schema_to_trino(self, arrow_schema: pa.Schema) -> dict[str, str]:
@@ -160,16 +168,28 @@ class RecordingManager:
     ) -> None:
         assert schema == "bronze"
         assert partition_columns == ["league", "season"]
+        self.create_calls.append(table)
+        if self.fail_create_count:
+            self.fail_create_count -= 1
+            raise RuntimeError(f"injected CREATE failure for {table}")
         self.columns[table] = dict(columns)
 
     def get_table_columns(self, schema: str, table: str) -> dict[str, str]:
         assert schema == "bronze"
+        self.get_columns_calls.append(table)
+        if self.fail_describe_count:
+            self.fail_describe_count -= 1
+            raise RuntimeError(f"injected DESCRIBE failure for {table}")
         return dict(self.columns[table])
 
     def add_column(
         self, schema: str, table: str, column: str, column_type: str
     ) -> None:
         assert schema == "bronze"
+        self.add_calls.append((table, column, column_type))
+        if self.fail_add_count:
+            self.fail_add_count -= 1
+            raise RuntimeError(f"injected ALTER failure for {table}.{column}")
         self.columns[table][column] = column_type
 
     def insert_dataframe_atomic(
@@ -181,6 +201,7 @@ class RecordingManager:
         delete_filter: str | None = None,
         staging_id: str | None = None,
         single_statement_replace: bool = False,
+        target_column_types: dict[str, str] | None = None,
     ) -> int:
         assert schema == "bronze"
         assert batch_size == 1000
@@ -193,6 +214,7 @@ class RecordingManager:
                 "delete_filter": delete_filter,
                 "staging_id": staging_id,
                 "single_statement_replace": single_statement_replace,
+                "target_column_types": dict(target_column_types or {}),
             }
         )
         return len(frame)
@@ -270,6 +292,134 @@ def test_schedule_parse_and_retry_are_source_idempotent() -> None:
     assert all(
         call["single_statement_replace"] for call in manager.writes
     )
+    assert manager.table_exists_calls == ["fbref_schedule"]
+    assert manager.create_calls == ["fbref_schedule"]
+    assert manager.get_columns_calls == ["fbref_schedule"]
+    assert manager.writes[0]["target_column_types"] == manager.writes[1][
+        "target_column_types"
+    ]
+
+
+@pytest.mark.unit
+def test_typed_writer_caches_existing_schema_and_adds_new_columns() -> None:
+    manager = RecordingManager()
+    manager.columns["fbref_probe"] = {
+        "league": "VARCHAR",
+        "season": "BIGINT",
+        "value": "BIGINT",
+    }
+    writer = typed.FBrefTypedBronzeWriter(manager)
+    original = pd.DataFrame(
+        {"league": ["L"], "season": [2025], "value": [1]}
+    )
+
+    first = writer._ensure_table("fbref_probe", original)
+    second = writer._ensure_table("fbref_probe", original)
+
+    assert first == second
+    assert manager.table_exists_calls == ["fbref_probe"]
+    assert manager.get_columns_calls == ["fbref_probe"]
+    assert manager.add_calls == []
+
+    expanded = original.assign(new_metric=2.5)
+    evolved = writer._ensure_table("fbref_probe", expanded)
+    writer._ensure_table("fbref_probe", expanded)
+
+    assert manager.add_calls == [("fbref_probe", "new_metric", "DOUBLE")]
+    assert evolved["new_metric"] == "DOUBLE"
+    assert manager.get_columns_calls == ["fbref_probe"]
+
+
+@pytest.mark.unit
+def test_typed_writer_describes_after_masked_false_existence_probe() -> None:
+    class MaskedFalseManager(RecordingManager):
+        def table_exists(self, schema: str, table: str) -> bool:
+            assert schema == "bronze"
+            self.table_exists_calls.append(table)
+            return False
+
+        def create_iceberg_table(
+            self,
+            schema: str,
+            table: str,
+            columns: dict[str, str],
+            partition_columns=None,
+        ) -> None:
+            assert schema == "bronze"
+            self.create_calls.append(table)
+            # Model CREATE IF NOT EXISTS against a table that was present even
+            # though the preceding metadata query transiently failed.
+            if table not in self.columns:
+                self.columns[table] = dict(columns)
+
+    manager = MaskedFalseManager()
+    manager.columns["fbref_probe"] = {
+        "league": "VARCHAR",
+        "season": "VARCHAR",
+        "value": "DOUBLE",
+    }
+    writer = typed.FBrefTypedBronzeWriter(manager)
+    frame = pd.DataFrame(
+        {"league": ["L"], "season": [2025], "value": [1]}
+    )
+
+    installed = writer._ensure_table("fbref_probe", frame)
+
+    assert manager.create_calls == ["fbref_probe"]
+    assert manager.get_columns_calls == ["fbref_probe"]
+    assert installed["season"] == "VARCHAR"
+    assert installed["value"] == "DOUBLE"
+    assert manager.add_calls == []
+
+
+@pytest.mark.unit
+def test_typed_writer_does_not_cache_failed_create_or_add() -> None:
+    manager = RecordingManager()
+    manager.fail_create_count = 1
+    writer = typed.FBrefTypedBronzeWriter(manager)
+    frame = pd.DataFrame(
+        {"league": ["L"], "season": [2025], "value": [1]}
+    )
+
+    with pytest.raises(RuntimeError, match="CREATE failure"):
+        writer._ensure_table("fbref_retry", frame)
+    writer._ensure_table("fbref_retry", frame)
+
+    assert manager.table_exists_calls == ["fbref_retry", "fbref_retry"]
+    assert manager.create_calls == ["fbref_retry", "fbref_retry"]
+
+    manager.fail_add_count = 1
+    expanded = frame.assign(new_metric=2)
+    with pytest.raises(RuntimeError, match="ALTER failure"):
+        writer._ensure_table("fbref_retry", expanded)
+    writer._ensure_table("fbref_retry", expanded)
+
+    assert manager.add_calls[-2:] == [
+        ("fbref_retry", "new_metric", "BIGINT"),
+        ("fbref_retry", "new_metric", "BIGINT"),
+    ]
+
+
+@pytest.mark.unit
+def test_typed_writer_rechecks_existence_after_failed_describe() -> None:
+    manager = RecordingManager()
+    manager.columns["fbref_retry"] = {
+        "league": "VARCHAR",
+        "season": "BIGINT",
+        "value": "BIGINT",
+    }
+    manager.fail_describe_count = 1
+    writer = typed.FBrefTypedBronzeWriter(manager)
+    frame = pd.DataFrame(
+        {"league": ["L"], "season": [2025], "value": [1]}
+    )
+
+    with pytest.raises(RuntimeError, match="DESCRIBE failure"):
+        writer._ensure_table("fbref_retry", frame)
+    writer._ensure_table("fbref_retry", frame)
+
+    assert manager.table_exists_calls == ["fbref_retry", "fbref_retry"]
+    assert manager.get_columns_calls == ["fbref_retry", "fbref_retry"]
 
 
 @pytest.mark.unit
@@ -362,6 +512,55 @@ def test_empty_schedule_with_absent_table_is_successful_zero() -> None:
 
     assert counts == {"schedule": 0}
     assert manager.writes == []
+
+    # Negative existence is deliberately not cached: Trino's table_exists()
+    # treats a failed metadata query as false, so a later observation must
+    # probe again instead of silently preserving stale rows.
+    writer = typed.FBrefTypedBronzeWriter(manager)
+    empty = DatasetParseResult("schedule", DatasetStatus.EMPTY)
+    writer.persist_schedule(
+        empty,
+        context=context,
+        run_id="empty-schedule-1",
+        target_identity="schedule:9:2025-2026",
+    )
+    writer.persist_schedule(
+        empty,
+        context=context,
+        run_id="empty-schedule-2",
+        target_identity="schedule:9:2025-2026",
+    )
+    assert manager.table_exists_calls == [
+        "fbref_schedule",
+        "fbref_schedule",
+        "fbref_schedule",
+    ]
+
+
+@pytest.mark.unit
+def test_empty_typed_replacement_caches_positive_table_metadata() -> None:
+    context = typed.TypedSourceContext("9", "2025-2026")
+    manager = RecordingManager()
+    manager.columns["fbref_schedule"] = {
+        "league": "VARCHAR",
+        "season": "BIGINT",
+        "source_competition_id": "VARCHAR",
+        "source_season_id": "VARCHAR",
+    }
+    writer = typed.FBrefTypedBronzeWriter(manager)
+    empty = DatasetParseResult("schedule", DatasetStatus.EMPTY)
+
+    for run_id in ("empty-1", "empty-2"):
+        writer.persist_schedule(
+            empty,
+            context=context,
+            run_id=run_id,
+            target_identity="schedule:9:2025-2026",
+        )
+
+    assert manager.table_exists_calls == ["fbref_schedule"]
+    assert manager.get_columns_calls == ["fbref_schedule"]
+    assert len(manager.writes) == 2
 
 
 @pytest.mark.unit

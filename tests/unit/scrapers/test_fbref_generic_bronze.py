@@ -68,6 +68,39 @@ def test_generic_writer_merges_by_identity_and_commits_page_manifest_last():
     stages = [sql.split(" USING ", 1)[1].split(" s ON", 1)[0] for sql in merge_sql]
     assert len(stages) == len(set(stages))
 
+    writer.persist_page(
+        _page(),
+        canonical_url="https://fbref.com/en/comps/9/2025/source",
+        run_id="scheduled__2026-07-11-retry",
+        staging_identity="dag_task_0_2",
+    )
+    assert manager.create_iceberg_table.call_count == 3
+
+
+def test_generic_writer_retries_table_preflight_after_partial_failure():
+    manager = _manager()
+    writer = FBrefGenericBronzeWriter(manager)
+    manager.create_iceberg_table.side_effect = [
+        RuntimeError("injected CREATE failure"),
+        None,
+        None,
+        None,
+    ]
+
+    with pytest.raises(RuntimeError, match="CREATE failure"):
+        writer.persist_page(
+            _page(),
+            canonical_url="https://fbref.com/test",
+            run_id="failed-preflight",
+        )
+
+    writer.persist_page(
+        _page(),
+        canonical_url="https://fbref.com/test",
+        run_id="preflight-retry",
+    )
+    assert manager.create_iceberg_table.call_count == 4
+
 
 def test_parser_error_is_persisted_as_error_marker_and_fails_task():
     manager = _manager()
