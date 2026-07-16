@@ -2,7 +2,14 @@
 # Data Platform - Makefile
 # =============================================================================
 
-.PHONY: help build up up-lite up-full up-build down restart logs ps clean health test-trino shell-airflow shell-trino sofascore-discovery sofascore-discovery-check test-fbref-offline test-proxy-stats up-bi up-catalog down-bi down-catalog superset-init superset-import superset-dashboards om-ingest-trino om-lineage-trino om-apply-descriptions om-cleanup-lineage logs-superset logs-om shell-superset shell-om
+.DEFAULT_GOAL := help
+
+# This wrapper reads the host-persistent topology state on every invocation,
+# rejects caller-supplied Compose files and cannot be replaced from make's
+# command line. The default state path lives outside release checkouts.
+override COMPOSE := ./scripts/compose.sh
+
+.PHONY: help build up up-lite up-full up-build down restart logs ps clean health test-trino shell-airflow shell-trino sofascore-discovery sofascore-discovery-check sofascore-discovery-lease test-fbref-offline test-proxy-stats up-bi up-catalog down-bi down-catalog superset-init superset-import superset-dashboards om-ingest-trino om-lineage-trino om-apply-descriptions om-cleanup-lineage logs-superset logs-om shell-superset shell-om
 
 # Default target
 help:
@@ -16,12 +23,13 @@ help:
 	@echo "  make restart      - Restart all services"
 	@echo "  make logs         - Show logs (use SERVICE=name for specific)"
 	@echo "  make ps           - Show service status"
-	@echo "  make clean        - Remove all containers and volumes"
+	@echo "  make clean        - Remove containers and caches; preserve named data volumes"
 	@echo "  make health       - Check health of all services"
 	@echo ""
 	@echo "  make test-trino   - Run Trino integration test"
 	@echo "  make sofascore-discovery       - Refresh source metadata via direct JSON"
 	@echo "  make sofascore-discovery-check - Check registry drift without writing"
+	@echo "  make sofascore-discovery-lease - Refresh metadata with an explicit paid byte cap"
 	@echo ""
 	@echo "  make shell-airflow - Open shell in Airflow webserver"
 	@echo "  make shell-trino  - Open shell in Trino"
@@ -47,11 +55,11 @@ help:
 
 # Build images
 build:
-	docker compose build
+	$(COMPOSE) build
 
 # Start services (FULL: core + heavy profile = OM, ES, superset-worker/beat, tor)
 up:
-	docker compose --profile heavy up -d
+	$(COMPOSE) --profile heavy up -d --no-recreate
 	@echo ""
 	@echo "Waiting for services to start..."
 	@sleep 10
@@ -59,16 +67,16 @@ up:
 
 # Start services with build (FULL)
 up-build:
-	docker compose --profile heavy up -d --build
+	$(COMPOSE) --profile heavy up -d --build --no-recreate
 	@echo ""
 	@echo "Waiting for services to start..."
 	@sleep 10
 	@$(MAKE) ps
 
 # Start LITE stack (core only: SeaweedFS + Lakekeeper + Postgres + Redis + Airflow + Trino + Superset + FlareSolverr).
-# Skips: superset-worker/beat, elasticsearch, openmetadata-*, tor. Use when RAM-constrained.
+# Skips: superset-worker/beat, opensearch, openmetadata-*, tor. Use when RAM-constrained.
 up-lite:
-	docker compose up -d
+	$(COMPOSE) up -d --no-recreate
 	@echo ""
 	@echo "Waiting for services to start..."
 	@sleep 10
@@ -79,27 +87,28 @@ up-full: up
 
 # Stop services (includes heavy profile so nothing is left orphaned)
 down:
-	docker compose --profile heavy down
+	$(COMPOSE) --profile heavy down
 
 # Restart services
 restart:
-	docker compose restart
+	$(COMPOSE) restart airflow-scheduler airflow-webserver trino lakekeeper
 
 # Show logs
 logs:
 ifdef SERVICE
-	docker compose logs -f $(SERVICE)
+	$(COMPOSE) logs -f $(SERVICE)
 else
-	docker compose logs -f
+	$(COMPOSE) logs -f
 endif
 
 # Show status
 ps:
-	@docker compose ps --format "table {{.Name}}\t{{.Status}}\t{{.Ports}}"
+	@$(COMPOSE) ps --format "table {{.Name}}\t{{.Status}}\t{{.Ports}}"
 
-# Clean everything
+# Clean containers and caches. Named data volumes are deliberately preserved;
+# storage removal requires a separate reviewed recovery/destruction procedure.
 clean:
-	docker compose down -v --remove-orphans
+	$(COMPOSE) down --remove-orphans
 	docker system prune -f
 
 # Health check
@@ -110,7 +119,7 @@ health:
 	@curl -sf http://localhost:8333/status > /dev/null && echo "OK: SeaweedFS S3" || echo "FAIL: SeaweedFS S3 not responding"
 	@echo ""
 	@echo "=== Lakekeeper ==="
-	@docker compose exec -T lakekeeper /home/nonroot/lakekeeper healthcheck > /dev/null && echo "OK: Lakekeeper" || echo "FAIL: Lakekeeper not healthy"
+	@$(COMPOSE) exec -T lakekeeper /home/nonroot/lakekeeper healthcheck > /dev/null && echo "OK: Lakekeeper" || echo "FAIL: Lakekeeper not healthy"
 	@echo ""
 	@echo "=== Airflow ==="
 	@curl -sf http://localhost:8081/health > /dev/null && echo "OK: http://localhost:8081" || echo "FAIL: Airflow not responding"
@@ -119,37 +128,37 @@ health:
 	@curl -sf http://localhost:8082/v1/info > /dev/null && echo "OK: http://localhost:8082" || echo "FAIL: Trino not responding"
 	@echo ""
 	@echo "=== PostgreSQL ==="
-	@docker compose exec -T postgres pg_isready -U postgres > /dev/null && echo "OK: PostgreSQL ready" || echo "FAIL: PostgreSQL not ready"
+	@$(COMPOSE) exec -T postgres pg_isready -U postgres > /dev/null && echo "OK: PostgreSQL ready" || echo "FAIL: PostgreSQL not ready"
 	@echo ""
 	@echo "=== Redis ==="
-	@docker compose exec -T redis redis-cli -a redis123 ping 2>/dev/null | grep -q PONG && echo "OK: Redis ready" || echo "FAIL: Redis not ready"
+	@$(COMPOSE) exec -T redis redis-cli -a redis123 ping 2>/dev/null | grep -q PONG && echo "OK: Redis ready" || echo "FAIL: Redis not ready"
 
 # Test Trino
 test-trino:
 	@echo "Testing Trino connectivity..."
-	@docker compose exec trino trino --execute "SHOW CATALOGS"
+	@$(COMPOSE) exec trino trino --execute "SHOW CATALOGS"
 	@echo ""
 	@echo "Testing Iceberg REST catalog..."
-	@docker compose exec trino trino --execute "SHOW SCHEMAS FROM iceberg"
+	@$(COMPOSE) exec trino trino --execute "SHOW SCHEMAS FROM iceberg"
 	@echo ""
 	@echo "Trino integration test completed!"
 
 # Shell access
 shell-airflow:
-	docker compose exec airflow-webserver /bin/bash
+	$(COMPOSE) exec airflow-webserver /bin/bash
 
 shell-trino:
-	docker compose exec trino /bin/bash
+	$(COMPOSE) exec trino /bin/bash
 
 # Source metadata discovery is deliberately outside the ingestion DAG. The
 # normal Airflow mount stays read-only; this one-shot overrides only the
 # SofaScore registry directory and runs as the checkout owner. New records are
 # still enabled=false, so refreshing source metadata never activates scraping.
 sofascore-discovery:
-	docker compose run --rm --no-deps \
+	$(COMPOSE) run --rm --no-deps \
 		--user "$$(id -u):$$(id -g)" \
 		--volume "$(CURDIR)/configs/sofascore:/work/sofascore:rw" \
-		airflow-scheduler \
+		airflow-webserver \
 		python /opt/airflow/dags/scripts/run_sofascore_discovery.py \
 		--registry /work/sofascore/tournaments.json
 
@@ -165,10 +174,10 @@ sofascore-discovery-lease:
 		echo "BUDGET_CAP_BYTES=<bytes> is required: metered discovery never runs on an implicit budget"; \
 		exit 1; \
 	}
-	docker compose run --rm --no-deps \
+	$(COMPOSE) run --rm --no-deps \
 		--user "$$(id -u):$$(id -g)" \
 		--volume "$(CURDIR)/configs/sofascore:/work/sofascore:rw" \
-		airflow-scheduler \
+		airflow-webserver \
 		python /opt/airflow/dags/scripts/run_sofascore_discovery.py \
 		--registry /work/sofascore/tournaments.json \
 		--transport lease-proxy \
@@ -176,10 +185,10 @@ sofascore-discovery-lease:
 		$(DISCOVERY_ARGS)
 
 sofascore-discovery-check:
-	docker compose run --rm --no-deps \
+	$(COMPOSE) run --rm --no-deps \
 		--user "$$(id -u):$$(id -g)" \
 		--volume "$(CURDIR)/configs/sofascore:/work/sofascore:ro" \
-		airflow-scheduler \
+		airflow-webserver \
 		python /opt/airflow/dags/scripts/run_sofascore_discovery.py \
 		--registry /work/sofascore/tournaments.json \
 		--check
@@ -201,7 +210,7 @@ urls:
 # Deterministic FBref verification. Live traffic requires an explicit bounded
 # canary; this target never opens the production transport.
 test-fbref-offline:
-	docker compose exec airflow-scheduler python -m pytest -q \
+	$(COMPOSE) exec airflow-scheduler python -m pytest -q \
 		tests/unit/scrapers/test_fbref_control_store.py \
 		tests/unit/scrapers/test_fbref_raw_store_v2.py \
 		tests/unit/scrapers/test_fbref_page_document.py \
@@ -223,7 +232,7 @@ test-fbref-offline:
 # Test proxy pool statistics
 test-proxy-stats:
 	@echo "Testing proxy pool statistics..."
-	@docker compose exec airflow-webserver python -c "\
+	@$(COMPOSE) exec airflow-webserver python -c "\
 from scrapers.utils.proxy_manager import ProxyManager, ProxyType; \
 import json; \
 pm = ProxyManager(cooldown_seconds=60.0); \
@@ -242,54 +251,54 @@ for p in stats['proxies'][:5]: \
 
 # Start Superset stack (web + worker + beat)
 up-bi:
-	@docker compose up -d superset superset-worker superset-beat
+	@$(COMPOSE) up -d --no-deps --force-recreate superset superset-worker superset-beat
 
-# Start OpenMetadata stack (server + ingestion + Elasticsearch)
+# Start OpenMetadata stack (server + ingestion + OpenSearch)
 up-catalog:
-	@docker compose up -d elasticsearch openmetadata-server openmetadata-ingestion
+	@$(COMPOSE) up -d --no-deps --force-recreate opensearch openmetadata-server openmetadata-ingestion
 
 # Stop Superset stack
 down-bi:
-	@docker compose stop superset superset-worker superset-beat
+	@$(COMPOSE) stop superset superset-worker superset-beat
 
 # Stop OpenMetadata stack
 down-catalog:
-	@docker compose stop openmetadata-server openmetadata-ingestion elasticsearch
+	@$(COMPOSE) stop openmetadata-server openmetadata-ingestion opensearch
 
 # Bootstrap Superset (creates admin, runs db upgrade, imports datasources/dashboards)
 superset-init:
-	@docker compose exec superset bash /app/pythonpath/bootstrap.sh
+	@$(COMPOSE) exec superset bash /app/pythonpath/bootstrap.sh
 
 # Import only datasources (skip admin/db upgrade)
 superset-import:
-	@docker compose exec superset python /app/pythonpath/import_datasources.py
+	@$(COMPOSE) exec superset python /app/pythonpath/import_datasources.py
 
 # E7: Import declarative dashboards from configs/superset/dashboards/*.py
 # (#496: оркестратор живёт в dashboards/ — top-level копия не монтировалась)
 superset-dashboards:
-	@docker compose exec superset python /app/pythonpath/dashboards/import_dashboards.py
+	@$(COMPOSE) exec superset python /app/pythonpath/dashboards/import_dashboards.py
 
 # Run OpenMetadata Trino schema ingestion workflow
 om-ingest-trino:
-	@docker compose exec openmetadata-ingestion metadata ingest -c /opt/configs/trino_ingestion.yaml
+	@$(COMPOSE) exec openmetadata-ingestion metadata ingest -c /opt/configs/trino_ingestion.yaml
 
 # Run OpenMetadata Trino lineage workflow
 om-lineage-trino:
-	@docker compose exec openmetadata-ingestion metadata ingest -c /opt/configs/trino_lineage.yaml
+	@$(COMPOSE) exec openmetadata-ingestion metadata ingest -c /opt/configs/trino_lineage.yaml
 
 # Apply YAML-based table descriptions to OpenMetadata
 om-apply-descriptions:
-	@docker compose exec openmetadata-ingestion python /opt/configs/apply_descriptions.py
+	@$(COMPOSE) exec openmetadata-ingestion python /opt/configs/apply_descriptions.py
 
 # Bootstrap OpenMetadata classifications (Tier / Domain / PII / UseCase) — idempotent.
 # Reads JWT from OPENMETADATA_JWT_TOKEN, falling back to OM_JWT_TOKEN (already in compose env).
 om-bootstrap:
-	@docker compose exec openmetadata-ingestion python /opt/configs/bootstrap_classifications.py
+	@$(COMPOSE) exec openmetadata-ingestion python /opt/configs/bootstrap_classifications.py
 
 # Hard-delete OM entities of tables dropped in epic #478 → cascades to remove their stale lineage edges (#529).
 # Default = dry-run preview; real delete needs --apply (see configs/openmetadata/README.md). Reads OM_JWT_TOKEN.
 om-cleanup-lineage:
-	@docker compose exec openmetadata-ingestion python /opt/configs/cleanup_lineage.py
+	@$(COMPOSE) exec openmetadata-ingestion python /opt/configs/cleanup_lineage.py
 
 # RSA-ключи подписи бот-JWT OpenMetadata (вместо публично известного дефолта
 # образа) — обязательны до публикации meta (#866). См. configs/openmetadata/README.md.
@@ -304,19 +313,19 @@ om-apply-security-config:
 
 # Tail Superset web logs
 logs-superset:
-	@docker compose logs -f --tail=100 superset
+	@$(COMPOSE) logs -f --tail=100 superset
 
 # Tail OpenMetadata server logs
 logs-om:
-	@docker compose logs -f --tail=100 openmetadata-server
+	@$(COMPOSE) logs -f --tail=100 openmetadata-server
 
 # Open shell in Superset container
 shell-superset:
-	@docker compose exec superset bash
+	@$(COMPOSE) exec superset bash
 
 # Open shell in OpenMetadata server container
 shell-om:
-	@docker compose exec openmetadata-server bash
+	@$(COMPOSE) exec openmetadata-server bash
 
 
 # --- Analyst access (docs/design/analyst-access.md) ---
@@ -331,7 +340,7 @@ keycloak-db:
 
 # Tail Keycloak logs
 logs-keycloak:
-	@docker compose logs -f --tail=100 keycloak
+	@$(COMPOSE) logs -f --tail=100 keycloak
 
 # Собрать образы JupyterHub и ноутбука аналитика
 build-jupyter:
@@ -340,4 +349,4 @@ build-jupyter:
 
 # Tail JupyterHub logs
 logs-jupyterhub:
-	@docker compose logs -f --tail=100 jupyterhub
+	@$(COMPOSE) logs -f --tail=100 jupyterhub

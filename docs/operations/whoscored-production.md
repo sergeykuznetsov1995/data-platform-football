@@ -8,10 +8,28 @@ Airflow orchestration, historical replay, proxy policy, DQ and recovery.
 
 - Catalog discovery includes every source tournament classified as senior men.
   Women, youth, reserve and academy competitions are excluded with persisted
-  classification evidence.
-- Scheduled daily and historical Airflow runs are direct-only and must report
-  zero paid-proxy bytes. Paid fallback is available only through the manual CLI
-  with the explicit `--allow-paid-proxy` flag and the proxy-filter byte cap.
+  classification evidence. Each discovery also stores a content-addressed
+  technical-exclusion audit bound to the exact `allRegions` SHA-256. It lists
+  normalized-name-within-region, canonical-link and cross-tournament stage-ID
+  candidates plus the versioned source-ID override disposition. Any unresolved
+  candidate blocks catalog publication; an empty candidate list is itself
+  immutable, reproducible evidence rather than an undocumented assertion.
+- Scheduled daily and historical Airflow runs are structurally `direct_only`.
+  Only the paused manual `dag_canary_whoscored_proxy` may select
+  `direct_then_paid`, and only with an exact signed canary approval pinned by ID
+  and SHA-256. A boolean, environment scalar or the removed
+  `--allow-paid-proxy` flag cannot enable paid traffic. Every canary request
+  remains raw-cache first and direct first; the paid route is available only
+  after authoritative Cloudflare evidence and a fresh direct recheck.
+- The canary's two code-owned invoice-boundary and application-gateway
+  sentinels are enabled only for its exact decimal `1_000_000_000`-byte
+  contract. Execution additionally requires the admitted `ready-v1` release,
+  fresh active order-38950 quota receipt, exact signed approval, active
+  gateway-authenticated campaign and gateway-owned alert proof. The filtering
+  proxy independently caps the lifetime of the initialized provider-order
+  state at `850 MiB` across every campaign, UTC rollover and restart. The
+  independent `WHOSCORED_FULL_PAID_CRAWL_AVAILABLE=False` sentinel keeps normal
+  paid ingest and backfill unavailable regardless of canary evidence.
 - Raw source observations are append-only. A successful receipt is published
   only after final-object readback; quarantine invalidates the exact failed
   observation and cannot hide a concurrent healthy writer.
@@ -63,12 +81,69 @@ Airflow orchestration, historical replay, proxy policy, DQ and recovery.
 | Backfill checkpoints | Recovery materialized the cumulative receipt history and latest-state lookup grew with generations | Checkpoint v3 keeps a compact frontier snapshot plus at most 63 bounded deltas, a <=64 KiB index, and a 12-level radix lookup; full receipts are materialized only for terminal DQ/recovery |
 | Backfill capacity | Every match was charged for a preview and the configured requests/day value could exceed neither a throttle nor a proven source ceiling | Policy v6 charges exact match plus frozen preview identities; the hard ceiling is always `source slots * 30 * 1,440` (86,400..172,800), reports observed wall-clock throughput, and stops before the next source batch on breach |
 | Daily profiles | Limit estimated as roster/90, so a first run, outage or parser bump could scrape only a prefix and then fail full-coverage DQ | One exact shared candidate predicate; count/set hash pinned through planner, CLI report and DQ; complete repair or pre-source hard-cap failure |
-| Proxy use | Manual/default behavior could select the paid endpoint implicitly | Daily/backfill structurally direct-only; manual paid use requires an explicit flag and authenticated capped lease |
+| Proxy use | Manual/default behavior could select the paid endpoint implicitly | Direct-only by default; only the small signed measurement canary is code-enabled through the quota receipt, authenticated gateway and durable 850 MiB safety cap; every full-crawl paid lease remains code-disabled |
 | Source block handling | Independent workers could retry the same block and browser batches could start together | One fixed process-global 546 ms actual-start governor plus a persistent 15/30/60-minute shared cooldown and one half-open probe; expected origin masks and ordinary 502/timeouts never authorize paid traffic |
 | DQ | Primarily task success and partial current-run checks | Snapshot-pinned frozen scope/match/profile identities, exact stage/feed proof, owner-level parity across 25 datasets, NULL-identity duplicate sentinels, parser/availability proof, profile terminal proof and zero-paid gates; the complete historical read is 33 cardinality-invariant queries |
 | Iceberg failure handling | Metadata corruption repair could drop/recreate a table; maintenance could return green with partial failures and had no safe live-file compaction | Corruption and partial maintenance fail closed; delete-safe exact-path compaction is bounded to 64 files/512 MiB per table and 4 tables/2 GiB per task; effective retention is 30d weekly, 14d daily for WhoScored and 3d for other high-churn feeds |
 
 ## Deployment prerequisites
+
+> **Production NO-GO:** the production Airflow image intentionally contains a
+> root-owned `blocked-v1` WhoScored build-provenance attestation.  The immutable
+> launcher exits 78 before WhoScored application imports, storage writes,
+> source/proxy connections or approval signing.  Absence of the attestation is
+> also a failure; there is no environment, Airflow Variable, DagRun or CLI
+> override.  Do not start a WhoScored production service until a reviewed image
+> rebuild replaces it with `ready-v1` and the exact SHA-256 of a root-owned
+> content-addressed provenance manifest.  That manifest must bind the dated
+> signed APT snapshot and exact packages, every downloaded artifact, fully
+> hashed Python locks for both interpreters, GitHub Action commit SHAs, all
+> third-party Compose image digests, and the immutable payload-stage image
+> identities before the gate layer is added.  Because an image cannot contain
+> its own final digest without a circular claim, promotion additionally
+> requires a deployment-owned attestation generated after the final build and
+> verified against the exact `docker inspect .Image` digest before service
+> creation.  Neither a payload-stage ID nor a local test target is final-image
+> promotion evidence.
+
+The blocked attestation is enforced only by the production-class
+`airflow-scheduler` and dedicated `whoscored_proxy_filter` targets; both stop
+with exit 78 before their command or any mounted application import.  The
+generic Airflow base used by init/webserver and the shared non-WhoScored proxy
+remains operable for unrelated platform workloads and is not a WhoScored
+execution target.  Every WhoScored source, raw/Iceberg/ops persistence,
+migration, cleanup, backup, campaign and `whoscored-only` proxy entrypoint also
+requires the image-private `production-v1` verifier before its first I/O, so a
+generic service cannot become a WhoScored runner merely by naming a mounted
+script. Routine Compose `run`/`exec` against either production-class service is
+forbidden by the reviewed wrapper, including entrypoint overrides.
+
+All public system-Python aliases and installed shebangs in a production target
+pass through the immutable gate, including `python -S`. The interpreter at
+`/usr/local/libexec/whoscored-python-real` is an internal implementation detail
+needed to evaluate the gate itself and is deliberately absent from commands,
+environment values and application shebangs. Direct access to that path (or to
+the raw legacy-venv interpreter) is part of the trusted Docker-host authority
+boundary, not an application security boundary. Production is GO only on a
+dedicated single-tenant host where every Docker-capable process and principal
+is trusted, or behind an independently persistent firewall/loopback boundary
+that untrusted principals cannot reconfigure. Do not claim that Compose or a
+container wrapper can constrain a host principal with Docker authority.
+
+FlareSolverr is part of that same production closure.  Compose builds it from
+the digest-pinned 3.4.6 base into a dedicated derived image; the WhoScored
+extension, launcher, digest receipt and pristine ChromeDriver are root-owned,
+the application directory and container root are read-only, and only bounded
+browser state lives on tmpfs.  There is no source bind mount.  The client checks
+the side-effect-free runtime identity before every session/browser POST and
+checks the response again.  A `ready-v1` promotion must bind the externally
+observed final digest of this derived image as well as the Airflow scheduler and
+dedicated WhoScored proxy images; a local mutable tag is not sufficient.
+The repository-root and Dockerfile-specific ignore files are identical strict
+allowlists: only those two control files, the derived Dockerfile, its entrypoint
+and `scripts/flaresolverr_extended.py` enter the build context. Never widen an
+allowlist to send `.env`, logs, raw data, Git metadata or unrelated untracked
+worktree content to a local or remote builder.
 
 Set the rollout paths once before running any command in this section:
 
@@ -76,15 +151,29 @@ Set the rollout paths once before running any command in this section:
 export COMPOSE_ENV_FILE=/root/data-platform-football/.env
 export WHOSCORED_ENV_FILE=/root/data-platform-football/.env.whoscored-rollout
 export PROXY_POOL_ENV_FILE=/root/data-platform-football/.env.proxy-pool.whoscored-v2
-export RELEASE=/root/dpf-fbref-949-release
-export RUNTIME=/root/dpf-fbref-949-candidate
-export RUNTIME_OVERRIDE=/root/fbref-949-evidence/20260714T073514Z/runtime-compose.override.yaml
-export WHOSCORED_OVERRIDE=/root/fbref-949-evidence/20260714T073514Z/whoscored-runtime.override.yaml
+export RELEASE=/absolute/path/to/the-reviewed-release
+
+# Clear host loader controls before starting even `/usr/bin/env`; a shell that
+# was itself launched under hostile injected code is already inside the trusted
+# Docker-host boundary. Every host-side Python admission command uses this
+# isolated, environment-empty interpreter prefix.
+for variable in ${!LD_@} ${!DYLD_@}; do
+  unset "$variable"
+done
+unset GCONV_PATH GLIBC_TUNABLES LOCPATH MALLOC_TRACE
+ADMISSION_PYTHON=(
+  /usr/bin/env -i
+  HOME=/nonexistent PATH=/usr/bin:/bin
+  LANG=C.UTF-8 LC_ALL=C.UTF-8
+  /usr/bin/python3 -I -S
+)
 ```
 
-1. Keep `dag_ingest_whoscored`, `dag_backfill_whoscored`, and
-   `dag_backup_whoscored_storage` paused while code and schema gates run.
-2. Rotate both `PROXY_FILTER_CONTROL_TOKEN` and the legacy
+1. Keep `dag_ingest_whoscored`, `dag_backfill_whoscored`,
+   `dag_canary_whoscored_proxy`, and `dag_backup_whoscored_storage` paused
+   while code, approval and schema gates run.
+2. Rotate `PROXY_FILTER_CONTROL_TOKEN`, the dedicated
+   `WHOSCORED_PROXY_FILTER_CONTROL_TOKEN`, and the legacy
    `SOFASCORE_PROXY_CONTROL_TOKEN` if either value has appeared in logs or a
    terminal transcript.
 3. Generate the environment secret from the approved legacy pool with
@@ -92,57 +181,549 @@ export WHOSCORED_OVERRIDE=/root/fbref-949-evidence/20260714T073514Z/whoscored-ru
    without printing entries, set `PROXY_FILTER_ALLOW_FILE_FALLBACK=false`, and
    pass all three environment files to every rollout Compose command. `proxy_filter` must
    have no `proxys.txt` mount; the Airflow mount is retained for other sources.
+   That shared legacy credential is not valid for a WhoScored canary. Use only
+   the dedicated credential for PROXYS.IO order `38950`, plan `Bronze`, with
+   exact active quota and remaining values of `1.00` decimal GB. Expose it only
+   as `WHOSCORED_PROXY_POOL_JSON` to the opt-in `whoscored_proxy_filter`
+   service. Admission requires a fresh canonical credential-free receipt bound
+   to a protected screenshot before every rollout. Its provider hop must use
+   verified HTTPS/mTLS or an
+   authenticated private tunnel with an IP-bound one-campaign credential;
+   plaintext Basic authentication over the current raw TCP opener is not an
+   authorized boundary. Do not place the dedicated credential in common Airflow
+   mounts or environment. The generic service runs in
+   `shared-no-whoscored` mode; the dedicated service runs in
+   `whoscored-only` mode. Production also leaves the port-8899 credential-less
+   data plane disabled; never add `--allow-legacy-noauth` to its command.
 4. Render the production Compose model before changing services:
 
    ```bash
-   docker compose -p data-platform --project-directory "$RELEASE" \
+   "$RELEASE/scripts/compose.sh" -p data-platform \
      --env-file "$COMPOSE_ENV_FILE" --env-file "$WHOSCORED_ENV_FILE" \
-     --env-file "$PROXY_POOL_ENV_FILE" -f "$RELEASE/compose.yaml" \
+     --env-file "$PROXY_POOL_ENV_FILE" \
      config --quiet
    ```
 
-The live `weed mini` service and its volume are deliberately not recreated by
-this rollout. Off-host backup, WORM retention and four-plane cutover are outside
-the approved scope; loss of this one host can therefore lose raw and Iceberg
-data. The owner accepted that risk, and `dag_backup_whoscored_storage` remains
-paused.
+5. Leave `WHOSCORED_PROXY_APPROVAL_PATH` empty for ordinary direct-only
+   deployment. The two enabled code-owned sentinels cover only the exact
+   measurement-canary contract; they do not authorize a rollout. Only after
+   admission accepts the exact schema-v1 `ready-v1` deployment attestation, the
+   fresh order-38950 provider receipt and every protected service may one
+   reviewed canary set it to the exact in-container path
+   `/opt/airflow/secure/whoscored-approvals/<approval_id>.json`. Install that
+   file under `WHOSCORED_PROXY_APPROVAL_HOST_DIR` as UID `50000`, mode `0600`;
+   Compose mounts the directory read-only into `airflow-scheduler` alone. Never
+   use a mutable `current` symlink or expose the signing workspace to Airflow.
+   The scheduler performs structural approval checks and receives no approval
+   HMAC, campaign-ledger HMAC, filter control token or paid-alert authority.
+   `whoscored_proxy_filter` alone mounts
+   `WHOSCORED_PROXY_FILTER_STATE_HOST_DIR` read-write at
+   `/opt/airflow/state/whoscored-proxy-filter`; the scheduler mounts that exact
+   host source read-only for provider-event reconciliation. Campaign mutation
+   and snapshots go through the authenticated L7 gateway rather than direct
+   scheduler ledger access.
+
+   Enabled canary sentinels do not relax loaded-code provenance. Paid
+   enablement still requires the digest-attested image payloads, the exact
+   protected release bind sources admitted read-only, validation before any
+   application import, forced process recreation and the in-memory paid
+   FlareSolverr extension-hash attestation. Hashing a current on-disk tree after
+   older modules were loaded is not sufficient provenance. The independent
+   `WHOSCORED_FULL_PAID_CRAWL_AVAILABLE=False` sentinel keeps normal paid ingest
+   and backfill unavailable.
+
+The data volume and single `weed mini` storage core remain in scope, but an old
+pre-isolation container identity cannot be left running with this release. The
+wrapper deliberately blocks every writer-start command until a one-time,
+quiesced isolation rollout replaces that container around the same external
+volume and creates the private S3 gateway plus digest-pinned HTTP proxy. This is
+not the four-plane cutover: no data migration or topology-state file is created.
+Off-host backup/WORM and the four-plane cutover remain outside the approved
+scope, so loss of this one host can still lose raw and Iceberg data;
+`dag_backup_whoscored_storage` remains paused.
+
+If `scripts/compose.sh` reports an old `/entrypoint.sh` mini identity, obtain a
+full-platform downtime approval and run this exact one-time rollout before the
+targeted WhoScored deployment. Abort if the volume is not `seaweedfs_data`, any
+supervised plane exists without protected state, or any unreviewed container
+uses the volume. Provision the mode-0600 S3 identity config and pull both pinned
+SeaweedFS/Caddy images first. Stop external S3 clients, then:
+
+```bash
+set -Eeuo pipefail
+COMPOSE=(
+  "$RELEASE/scripts/compose.sh" -p data-platform
+  --env-file "$COMPOSE_ENV_FILE" --env-file "$WHOSCORED_ENV_FILE"
+  --env-file "$PROXY_POOL_ENV_FILE"
+)
+PROFILED_SERVICES=(
+  tor superset-worker superset-beat opensearch
+  openmetadata-server openmetadata-ingestion
+)
+PROFILED_WAS_RUNNING=()
+for service in "${PROFILED_SERVICES[@]}"; do
+  if [[ "$(docker inspect --format '{{.State.Running}}' "$service" 2>/dev/null || true)" == true ]]; then
+    test "$(docker inspect --format \
+      '{{index .Config.Labels "com.docker.compose.project"}}' "$service")" = data-platform
+    PROFILED_WAS_RUNNING+=("$service")
+  fi
+done
+# Migration/init services must not be running during this maintenance window.
+for service in airflow-init lakekeeper-migrate openmetadata-migrate; do
+  test "$(docker inspect --format '{{.State.Running}}' "$service" 2>/dev/null || true)" != true
+done
+# The paid profile is outside this rollout. A stopped container is still an
+# inactive-profile orphan, so require the service to be completely absent.
+if docker inspect whoscored_proxy_filter >/dev/null 2>&1; then
+  echo "whoscored_proxy_filter must be absent before storage isolation" >&2
+  exit 2
+fi
+SEAWEEDFS_VOLUME_IDENTITY_SHA256="$(
+  docker volume inspect seaweedfs_data | sha256sum | awk '{print $1}'
+)"
+test -n "$SEAWEEDFS_VOLUME_IDENTITY_SHA256"
+"${COMPOSE[@]}" --profile heavy down --remove-orphans
+WRITERS_RE='^(airflow-init|airflow-scheduler|airflow-webserver|lakekeeper-migrate|lakekeeper|trino|superset|superset-worker|superset-beat|openmetadata-migrate|openmetadata-server|openmetadata-ingestion|jupyterhub)$'
+test -z "$(docker ps --format '{{.Names}}' | grep -E "$WRITERS_RE" || true)"
+test -z "$(docker ps --filter label=com.docker.compose.oneoff=True \
+  --format '{{.Label "com.docker.compose.service"}}' | \
+  grep -E "$WRITERS_RE|^seaweedfs($|-)' || true)"
+test -z "$(docker ps --all --filter volume=seaweedfs_data --format '{{.ID}}')"
+test "$(docker volume inspect seaweedfs_data | sha256sum | awk '{print $1}')" = \
+  "$SEAWEEDFS_VOLUME_IDENTITY_SHA256"
+"${COMPOSE[@]}" up -d --no-recreate
+for service in "${PROFILED_WAS_RUNNING[@]}"; do
+  "${COMPOSE[@]}" up -d --no-deps "$service"
+done
+# A no-op start performs a second live runtime/network/mount/port attestation.
+"${COMPOSE[@]}" start trino
+for service in "${PROFILED_WAS_RUNNING[@]}"; do
+  test "$(docker inspect --format '{{.State.Running}}' "$service")" = true
+done
+docker network inspect dp-seaweedfs-control --format '{{.Internal}}' | grep -qx true
+docker exec trino trino --execute 'SHOW SCHEMAS FROM iceberg'
+```
+
+Do not roll back the new storage Compose/wrapper/Make/lifecycle files after this
+step. Application images may be rolled back while retaining that boundary; an
+old checkout's `make clean`/`down -v` can delete the live volume.
 
 ### Targeted runtime deployment
 
-The current Airflow runtime contains an independent FBref fix, so its base
-worktree is retained and the reviewed WhoScored files are mounted through the
-tracked runtime override. Use all three env files, `--no-deps`, `--no-build`
-and an explicit service list. The SeaweedFS fingerprint binds container ID,
-command and `/data` mount and must be identical after both recreations:
+There are two deliberately different procedures. The checked-in repository can
+perform only blocked acceptance; it must not create or restart a production
+service. A future promotion procedure becomes valid only after the external
+evidence listed below exists.
+
+#### Current blocked-v1 acceptance
+
+Use `airflow-scheduler-test` for dependency, DagBag and legacy-venv checks. Then
+build the two final targets only to prove their immutable gate exits 78 before
+the requested command. Do not tag a payload stage as a production service, and
+do not run `compose up`, `create`, `start` or `restart` for either final image.
 
 ```bash
-SEAWEED_BEFORE=$(docker inspect seaweedfs | jq -c '.[0] | {
+"${ADMISSION_PYTHON[@]}" \
+  "$RELEASE/scripts/validate_whoscored_build_provenance.py" \
+  --root "$RELEASE" --expect-blocked \
+  > /tmp/whoscored-build-provenance-blocked.json
+
+docker build --target airflow-scheduler-test \
+  -t data-platform-airflow-scheduler:test-only \
+  "$RELEASE/docker/images/airflow"
+docker run --rm --entrypoint /bin/bash \
+  data-platform-airflow-scheduler:test-only -euc '
+    test "$(airflow version)" = 2.11.2
+    /usr/local/bin/python -m pip check
+    /opt/legacy-scraper-venv/bin/python -m pip check
+  '
+docker build --target airflow-scheduler \
+  -t data-platform-airflow-scheduler:blocked-v1 \
+  "$RELEASE/docker/images/airflow"
+docker build --target airflow-whoscored-proxy \
+  -t data-platform-airflow-whoscored-proxy:blocked-v1 \
+  "$RELEASE/docker/images/airflow"
+
+set +e
+docker run --rm data-platform-airflow-scheduler:blocked-v1 true
+SCHEDULER_STATUS=$?
+docker run --rm data-platform-airflow-whoscored-proxy:blocked-v1 true
+PROXY_STATUS=$?
+set -e
+test "$SCHEDULER_STATUS" = 78
+test "$PROXY_STATUS" = 78
+```
+
+CI additionally proves `python`, `python3`, `python3.11`, `python -S` through a
+bash entrypoint, and a real WhoScored runner through the internal raw
+interpreter all fail before a sentinel write. Those checks are acceptance
+evidence, not permission to create a production container.
+
+#### Future ready-v1 promotion
+
+This section is dormant until a clean, reviewed promotion revision supplies
+all of the following: canonical `ready-v1` manifest and attestation; immutable
+IDs for `airflow-scheduler-payload` and `airflow-whoscored-proxy-payload`; an
+external deployment attestation binding each payload ID to a final
+`repository@sha256:<64 hex>` digest; the final derived FlareSolverr digest; and
+the exact merged base-plus-supervised Compose model. The validator must reject
+any image/build/target override in that overlay. Provider quota/origin-gateway
+evidence is additionally required before the paid proxy service itself may be
+created.
+
+Do not edit either provenance JSON by hand. First resolve every source-closure
+issue, leave the checked-in `blocked-v1` pair in place, and create one clean,
+reviewed payload commit. Build the six payload images from that exact commit
+(`airflow-base`, `airflow-scheduler-payload`,
+`airflow-whoscored-proxy-payload`, FlareSolverr, JupyterHub and Superset), then
+capture each exact `docker image inspect --format '{{.Id}}'` value. The four
+Airflow base services share one ID and the three Superset services share one
+ID, but every Compose service must be named explicitly:
+
+```bash
+GENERATED_AT="$(/usr/bin/date -u +%Y-%m-%dT%H:%M:%SZ)"
+"${ADMISSION_PYTHON[@]}" \
+  "$RELEASE/scripts/validate_whoscored_build_provenance.py" \
+  --root "$RELEASE" --generate-ready --generated-at "$GENERATED_AT" \
+  --payload-image-id "airflow-init=$AIRFLOW_BASE_ID" \
+  --payload-image-id "airflow-log-init=$AIRFLOW_BASE_ID" \
+  --payload-image-id "airflow-scheduler=$AIRFLOW_SCHEDULER_PAYLOAD_ID" \
+  --payload-image-id "airflow-webserver=$AIRFLOW_BASE_ID" \
+  --payload-image-id "flaresolverr=$FLARESOLVERR_PAYLOAD_ID" \
+  --payload-image-id "flaresolverr_whoscored_paid=$FLARESOLVERR_PAYLOAD_ID" \
+  --payload-image-id "jupyterhub=$JUPYTERHUB_PAYLOAD_ID" \
+  --payload-image-id "proxy_filter=$AIRFLOW_BASE_ID" \
+  --payload-image-id "superset=$SUPERSET_PAYLOAD_ID" \
+  --payload-image-id "superset-beat=$SUPERSET_PAYLOAD_ID" \
+  --payload-image-id "superset-worker=$SUPERSET_PAYLOAD_ID" \
+  --payload-image-id "whoscored_paid_gateway=$WHOSCORED_PROXY_PAYLOAD_ID" \
+  --payload-image-id "whoscored_proxy_filter=$WHOSCORED_PROXY_PAYLOAD_ID"
+
+test "$(/usr/bin/git -C "$RELEASE" diff --name-only | /usr/bin/sort)" = \
+"docker/images/airflow/whoscored-build-provenance-attestation.json
+docker/images/airflow/whoscored-build-provenance-manifest.json"
+```
+
+The generator rejects missing, extra, duplicate or malformed payload IDs,
+unresolved discovery issues, untracked evidence and every dirty path outside
+those two generated files. It publishes the manifest first and the ready
+attestation last, so interruption remains fail-closed and an identical rerun
+is safe. Commit exactly those two files as the immediate child of the payload
+commit. CI then uses `--expect-ready-build` to prove that child and the complete
+repository closure agree. On a pull request it checks the explicit PR-head SHA
+inside GitHub's clean synthetic merge checkout, with full history available;
+the release SHA itself must still be the single-parent promotion child. This
+CI mode is build verification only: ordinary validation and production
+admission still require the separate external deployment attestation and final
+registry digests.
+
+Deploy that exact reviewed promotion SHA. A GitHub merge commit, squash or
+rebased copy has a different ancestry/identity and is rejected even when its
+files look identical. Integrate the promotion commit only with a SHA-preserving
+fast-forward, or regenerate the blocked payload commit, payload image IDs and
+two-file promotion child after integration. Never rewrite the manifest's
+`source_revision` to make a merge result fit.
+
+Run every admission command as root from the exact protected release. The
+helper rejects another `--root`, a non-system interpreter, a non-isolated
+Python startup, symlinked or writable release ancestors, and Docker/Compose
+control variables inherited from the shell. All three environment files, the
+deployment attestation and the admission directory must likewise be root-owned
+and have only root-owned, non-writable ancestors.
+Create a new evidence directory and validate ready mode before any service
+lifecycle command:
+
+```bash
+set -Eeuo pipefail
+test "$(/usr/bin/id -u)" = 0
+test "$RELEASE" = "$(/usr/bin/realpath -e -- "$RELEASE")"
+for file in "$COMPOSE_ENV_FILE" "$WHOSCORED_ENV_FILE" "$PROXY_POOL_ENV_FILE"; do
+  test "$file" = "$(/usr/bin/realpath -e -- "$file")"
+done
+unset COMPOSE_DISABLE_ENV_FILE COMPOSE_ENV_FILES COMPOSE_FILE \
+  COMPOSE_PATH_SEPARATOR COMPOSE_PROFILES COMPOSE_PROJECT_NAME \
+  DOCKER_API_VERSION DOCKER_CERT_PATH DOCKER_CONFIG DOCKER_CONTEXT \
+  DOCKER_HOST DOCKER_TLS_VERIFY PYTHONPATH LD_PRELOAD LD_AUDIT \
+  LD_LIBRARY_PATH GCONV_PATH GLIBC_TUNABLES LOCPATH MALLOC_TRACE
+umask 077
+
+export WHOSCORED_DEPLOYMENT_ATTESTATION=/absolute/protected/deployment-attestation.json
+export WHOSCORED_PROVIDER_QUOTA_RECEIPT=/absolute/protected/provider-quota-receipt.json
+test "$WHOSCORED_DEPLOYMENT_ATTESTATION" = \
+  "$(/usr/bin/realpath -e -- "$WHOSCORED_DEPLOYMENT_ATTESTATION")"
+test "$WHOSCORED_PROVIDER_QUOTA_RECEIPT" = \
+  "$(/usr/bin/realpath -e -- "$WHOSCORED_PROVIDER_QUOTA_RECEIPT")"
+export WHOSCORED_ADMISSION_DIR="/absolute/protected/admission-$(/usr/bin/date -u +%Y%m%dT%H%M%SZ)"
+test ! -e "$WHOSCORED_ADMISSION_DIR"
+/usr/bin/install -d -o root -g root -m 0700 "$WHOSCORED_ADMISSION_DIR"
+export WHOSCORED_DIGEST_OVERRIDE="$WHOSCORED_ADMISSION_DIR/digest-only.yaml"
+export WHOSCORED_RENDERED_COMPOSE="$WHOSCORED_ADMISSION_DIR/rendered-compose.json"
+
+"${ADMISSION_PYTHON[@]}" \
+  "$RELEASE/scripts/validate_whoscored_build_provenance.py" \
+  --root "$RELEASE" \
+  --deployment-attestation "$WHOSCORED_DEPLOYMENT_ATTESTATION" \
+  > "$WHOSCORED_ADMISSION_DIR/build-provenance-ready.json"
+
+"${ADMISSION_PYTHON[@]}" \
+  "$RELEASE/scripts/whoscored_production_admission.py" generate-override \
+  --root "$RELEASE" \
+  --deployment-attestation "$WHOSCORED_DEPLOYMENT_ATTESTATION" \
+  --output "$WHOSCORED_DIGEST_OVERRIDE" \
+  > "$WHOSCORED_ADMISSION_DIR/override-receipt.json"
+```
+
+The generated file contains exactly `airflow-scheduler`, `flaresolverr`,
+`flaresolverr_whoscored_paid`, `whoscored_paid_gateway`, and
+`whoscored_proxy_filter`. Every `image` is the attested
+`repository@sha256:<64 hex>` value and every inherited local `build` is removed
+with Compose 2.24.4+ `!reset`. The helper rejects an existing output of any
+kind and publishes the mode-0600 file without following symlinks. Mutable local
+tags are not admission evidence.
+
+The admission helper, not a caller-provided render, now invokes
+`/usr/bin/docker compose config --format json` and `config --hash` for each
+protected service. It fixes the project, profile, environment-file order and
+the exact base, supervised and digest-only file order. Do not append another
+Compose file or set a Docker/Compose control variable. The protected canonical
+provider receipt must bind a fresh root-owned screenshot, its SHA-256 and
+mtime, PROXYS.IO order 38950, Bronze, active status, and exact decimal
+quota/remaining values of 1.00 GB without containing proxy credentials. The
+helper publishes a new mode-0600 rendered model only after all five protected
+services and that external evidence pass:
+
+```bash
+"${ADMISSION_PYTHON[@]}" \
+  "$RELEASE/scripts/whoscored_production_admission.py" verify-rendered \
+  --root "$RELEASE" \
+  --deployment-attestation "$WHOSCORED_DEPLOYMENT_ATTESTATION" \
+  --override "$WHOSCORED_DIGEST_OVERRIDE" \
+  --env-file "$COMPOSE_ENV_FILE" \
+  --env-file "$WHOSCORED_ENV_FILE" \
+  --env-file "$PROXY_POOL_ENV_FILE" \
+  --project data-platform \
+  --provider-quota-receipt "$WHOSCORED_PROVIDER_QUOTA_RECEIPT" \
+  --output "$WHOSCORED_RENDERED_COMPOSE" \
+  > "$WHOSCORED_ADMISSION_DIR/rendered-receipt.json"
+
+# This is the only lifecycle command prefix permitted after admission. It is
+# intentionally independent of the caller environment and repeats the exact
+# helper-owned model. The whoscored-paid profile renders the protected proxy;
+# it does not authorize creating or starting it.
+COMPOSE=(
+  /usr/bin/env -i
+  HOME=/nonexistent PATH=/usr/bin:/bin
+  LANG=C.UTF-8 LC_ALL=C.UTF-8
+  DOCKER_HOST=unix:///run/docker.sock
+  /usr/bin/docker compose --project-name data-platform
+  --env-file "$COMPOSE_ENV_FILE"
+  --env-file "$WHOSCORED_ENV_FILE"
+  --env-file "$PROXY_POOL_ENV_FILE"
+  --profile whoscored-paid
+  --file "$RELEASE/compose.yaml"
+  --file "$RELEASE/compose.seaweedfs-supervised.yaml"
+  --file "$WHOSCORED_DIGEST_OVERRIDE"
+)
+
+# Production requires Engine 23+ support for the explicit builtin seccomp
+# profile. This operator-side check is informational; post-create admission
+# repeats it and proves AppArmor enforcement inside a constrained container.
+DOCKER_SECURITY_OPTIONS=$(
+  /usr/bin/env -i HOME=/nonexistent PATH=/usr/bin:/bin \
+    LANG=C.UTF-8 LC_ALL=C.UTF-8 DOCKER_HOST=unix:///run/docker.sock \
+    /usr/bin/docker info --format '{{json .SecurityOptions}}'
+)
+/usr/bin/printf '%s\n' "$DOCKER_SECURITY_OPTIONS" | /usr/bin/jq -e '
+  type == "array" and
+  ([.[] | select(startswith("name=apparmor") or startswith("name=seccomp"))]
+    | sort) == ["name=apparmor", "name=seccomp,profile=builtin"]
+' >/dev/null
+```
+
+Do not require host reads of
+`/sys/kernel/security/apparmor/profiles`: hardened production hosts can deny
+that securityfs read even to root. Post-create admission instead launches one
+ephemeral probe from the already attested scheduler image digest with
+`--pull=never`, no network, a read-only root filesystem, UID/GID `50000:0`, no
+capabilities, no-new-privileges, builtin seccomp and `docker-default`. The exact
+`/proc/self/attr/current` result must be `docker-default (enforce)`; any probe
+failure or different output blocks admission.
+
+Only after those commands succeed may an approved operator capture the storage
+identity and create the scheduler without starting it. The fingerprint binds
+container ID, command and `/data` mount and must remain identical. `--no-build`
+is mandatory even though the verified model has no remaining protected build;
+`--pull always` resolves the attested registry digest, never a mutable tag.
+Post-create admission is mandatory before the first start and names the exact
+one-service rollout wave. It repeats the daemon security-options proof, runs
+the constrained digest-attested AppArmor probe, and requires both the explicit
+container `AppArmorProfile=docker-default` and the exact three Compose
+`security_opt` values. All three protected services also drop every Linux
+capability and add none; CI requires the scheduler and FlareSolverr processes
+to report an all-zero `CapEff` before their functional smoke checks:
+
+```bash
+SEAWEED_BEFORE=$(/usr/bin/docker inspect seaweedfs | /usr/bin/jq -c '.[0] | {
   id: .Id, command: .Config.Cmd,
   data_mounts: [.Mounts[] | select(.Destination == "/data") |
     {name: .Name, source: .Source, destination: .Destination}]
-}' | sha256sum | cut -d" " -f1)
+}' | /usr/bin/sha256sum | /usr/bin/cut -d" " -f1)
 
-docker compose -p data-platform --project-directory "$RELEASE" \
-  --env-file "$COMPOSE_ENV_FILE" --env-file "$WHOSCORED_ENV_FILE" \
-  --env-file "$PROXY_POOL_ENV_FILE" -f "$RELEASE/compose.yaml" \
-  up -d --no-deps --no-build --force-recreate proxy_filter
+"${COMPOSE[@]}" create --no-deps --no-build --pull always \
+  airflow-scheduler
 
-docker compose -p data-platform --project-directory "$RUNTIME" \
-  --env-file "$COMPOSE_ENV_FILE" --env-file "$WHOSCORED_ENV_FILE" \
-  --env-file "$PROXY_POOL_ENV_FILE" -f "$RUNTIME/compose.yaml" \
-  -f "$RUNTIME_OVERRIDE" -f "$WHOSCORED_OVERRIDE" \
-  up -d --no-deps --no-build --force-recreate \
-  airflow-webserver airflow-scheduler
+"${ADMISSION_PYTHON[@]}" \
+  "$RELEASE/scripts/whoscored_production_admission.py" post-create \
+  --root "$RELEASE" \
+  --deployment-attestation "$WHOSCORED_DEPLOYMENT_ATTESTATION" \
+  --override "$WHOSCORED_DIGEST_OVERRIDE" \
+  --env-file "$COMPOSE_ENV_FILE" \
+  --env-file "$WHOSCORED_ENV_FILE" \
+  --env-file "$PROXY_POOL_ENV_FILE" \
+  --project data-platform \
+  --provider-quota-receipt "$WHOSCORED_PROVIDER_QUOTA_RECEIPT" \
+  --service airflow-scheduler \
+  > "$WHOSCORED_ADMISSION_DIR/post-create-scheduler-receipt.json"
 
-SEAWEED_AFTER=$(docker inspect seaweedfs | jq -c '.[0] | {
+"${COMPOSE[@]}" start airflow-scheduler
+
+SEAWEED_AFTER=$(/usr/bin/docker inspect seaweedfs | /usr/bin/jq -c '.[0] | {
   id: .Id, command: .Config.Cmd,
   data_mounts: [.Mounts[] | select(.Destination == "/data") |
     {name: .Name, source: .Source, destination: .Destination}]
-}' | sha256sum | cut -d" " -f1)
+}' | /usr/bin/sha256sum | /usr/bin/cut -d" " -f1)
 test "$SEAWEED_AFTER" = "$SEAWEED_BEFORE"
 ```
 
+FlareSolverr is a separate rollout wave. Re-run the same storage fingerprint,
+then create only `flaresolverr`, run the same post-create command with
+`--service flaresolverr` and a fresh receipt path, and only then run
+`"${COMPOSE[@]}" start flaresolverr`. Do not combine its receipt with the
+scheduler receipt.
+
+##### Initialize the paid-filter state exactly once
+
+The paid filter never auto-creates authoritative state. Before
+`verify-rendered`, provision the canonical host directory referenced by
+`WHOSCORED_PROXY_FILTER_STATE_HOST_DIR` as an empty root-owned `root:root`
+directory with mode `0770`; the gateway and alert-authority host directories
+must be separate. After the ready deployment, rendered model and fresh provider
+receipt pass admission—but before the first `whoscored_proxy_filter` container
+is created or started—run this one-shot initializer. Export the same canonical
+state path and the three filter secrets from the approved secret manager; their
+values must not appear in command arguments:
+
+```bash
+set -Eeuo pipefail
+test "$(/usr/bin/id -u)" = 0
+: "${WHOSCORED_PROXY_FILTER_STATE_HOST_DIR:?export the admitted filter-state path}"
+: "${WHOSCORED_PROXY_FILTER_CONTROL_TOKEN:?inject the filter control token}"
+: "${WHOSCORED_PROXY_APPROVAL_HMAC_SECRET:?inject the approval HMAC}"
+: "${WHOSCORED_PROXY_LEDGER_HMAC_SECRET:?inject the ledger HMAC}"
+PROXY_FILTER_CONTROL_TOKEN="$WHOSCORED_PROXY_FILTER_CONTROL_TOKEN"
+export PROXY_FILTER_CONTROL_TOKEN \
+  WHOSCORED_PROXY_APPROVAL_HMAC_SECRET \
+  WHOSCORED_PROXY_LEDGER_HMAC_SECRET
+
+STATE="$WHOSCORED_PROXY_FILTER_STATE_HOST_DIR"
+test "$STATE" = "$(/usr/bin/realpath -e -- "$STATE")"
+test "$(/usr/bin/stat -c '%u:%g:%a' -- "$STATE")" = '0:0:770'
+test -z "$(/usr/bin/find "$STATE" -mindepth 1 -maxdepth 1 -print -quit)"
+
+FILTER_IMAGE="$(/usr/bin/jq -er \
+  '.images[] | select(.service == "whoscored_proxy_filter") | .final_image' \
+  "$WHOSCORED_DEPLOYMENT_ATTESTATION")"
+test "$FILTER_IMAGE" = "$(/usr/bin/jq -er \
+  '.services.whoscored_proxy_filter.image' "$WHOSCORED_RENDERED_COMPOSE")"
+case "$FILTER_IMAGE" in
+  *@sha256:????????????????????????????????????????????????????????????????) ;;
+  *) echo 'filter image is not digest-qualified' >&2; exit 2 ;;
+esac
+/usr/bin/docker pull "$FILTER_IMAGE"
+/usr/bin/docker image inspect "$FILTER_IMAGE" >/dev/null
+
+/usr/bin/docker run --rm --pull=never --network=none --read-only \
+  --user=50000:0 --cap-drop=ALL --pids-limit=64 --memory=256m \
+  --security-opt=no-new-privileges=true \
+  --security-opt=apparmor=docker-default \
+  --security-opt=seccomp=builtin \
+  --tmpfs /tmp:rw,noexec,nosuid,nodev,size=32m,uid=50000,gid=0,mode=0700 \
+  --env CONNECTION_CHECK_MAX_COUNT=0 \
+  --env PROXY_FILTER_CONTROL_TOKEN \
+  --env WHOSCORED_PROXY_APPROVAL_HMAC_SECRET \
+  --env WHOSCORED_PROXY_LEDGER_HMAC_SECRET \
+  --env TM_PROXY_CONTROL_TOKEN= \
+  --env PROXY_FILTER_ALLOW_FILE_FALLBACK=false \
+  --mount "type=bind,src=$RELEASE/dags,dst=/opt/airflow/dags,readonly" \
+  --mount "type=bind,src=$RELEASE/scripts,dst=/opt/airflow/scripts,readonly" \
+  --mount "type=bind,src=$RELEASE/scrapers,dst=/opt/airflow/scrapers,readonly" \
+  --mount "type=bind,src=$RELEASE/configs/medallion,dst=/opt/airflow/configs/medallion,readonly" \
+  --mount "type=bind,src=$RELEASE/configs/proxy_filter,dst=/opt/airflow/configs/proxy_filter,readonly" \
+  --mount "type=bind,src=$RELEASE/configs/sofascore,dst=/opt/airflow/configs/sofascore,readonly" \
+  --mount "type=bind,src=$STATE,dst=/opt/airflow/state/whoscored-proxy-filter" \
+  "$FILTER_IMAGE" \
+  python /opt/airflow/scripts/proxy_filter/filter_proxy.py \
+  --source-mode whoscored-only \
+  --listen 0.0.0.0:8899 \
+  --lease-listen 0.0.0.0:8900 \
+  --lease-proxy-url http://whoscored_proxy_filter:8900 \
+  --blocklist /opt/airflow/configs/proxy_filter/blocklist.txt \
+  --out /opt/airflow/state/whoscored-proxy-filter/bytes.json \
+  --daily-budget-mb 850 \
+  --max-lease-mb 2 \
+  --max-lease-ttl-seconds 3600 \
+  --dagrun-budget-bytes 1000000000 \
+  --transfermarkt-dagrun-budget-bytes 0 \
+  --url-budget-bytes 2000000 \
+  --max-active-leases 2 \
+  --sofascore-budget-artifact /opt/airflow/configs/sofascore/proxy_budget_canary.json \
+  --sofascore-canary-hard-cap-bytes 0 \
+  --sofascore-discovery-dagrun-budget-bytes 0 \
+  --ledger /opt/airflow/state/whoscored-proxy-filter/paid_requests.jsonl \
+  --whoscored-campaign-ledger /opt/airflow/state/whoscored-proxy-filter/whoscored_campaigns.json \
+  --whoscored-state-marker /opt/airflow/state/whoscored-proxy-filter/.whoscored_state_initialized.json \
+  --initialize-whoscored-state
+
+for file in \
+  bytes.json \
+  paid_requests.jsonl \
+  paid_requests.jsonl.checkpoint.json \
+  whoscored_campaigns.json \
+  .whoscored_state_initialized.json; do
+  test -f "$STATE/$file"
+  test "$(/usr/bin/stat -c '%u:%g:%a' -- "$STATE/$file")" = '50000:0:600'
+done
+test ! -s "$STATE/paid_requests.jsonl"
+```
+
+The container has no network, ports, provider credential or proxy-pool input;
+the production entrypoint and Python runtime attestors still execute from the
+exact admitted digest. `--mount` refuses a missing host source, so Docker cannot
+silently create a replacement state directory. The initializer refuses any
+pre-existing state file and the service command contains no initialization
+flag. Never add that flag to Compose, use `compose up` for initialization, or
+delete partial/authenticated files to force a rerun. Quarantine a failed state
+directory and repeat the full render/admission review with a new empty canonical
+directory.
+
+The three paid-boundary services remain forbidden to create or start until the
+dedicated provider quota/usage receipt and the reviewed exact-origin release
+have both been approved. After that separate approval, create and attest
+`whoscored_proxy_filter` and `flaresolverr_whoscored_paid` first, start both,
+then create, attest and start `whoscored_paid_gateway`. Use `--no-deps
+--no-build --pull always` and a separate `post-create --service ...` receipt
+for each service. The paid browser has no host port/direct egress, the filter
+has only provider egress, and the gateway alone spans the API, browser and
+direct-egress networks. Rendering the `whoscored-paid` profile is never
+paid-route authority. The Docker daemon and every principal able to access its
+socket remain part of the trusted single-tenant host boundary; no receipt can
+constrain a Docker-authorized attacker.
+
 ## Idempotent Airflow migration
+
+This and every later scheduler command in the runbook belong to the future
+`ready-v1` path above. Under the checked-in `blocked-v1` image there must be no
+running production scheduler to exec into.
 
 Do not assume a previously completed `airflow-init` container has created new
 pools. Apply the pool contract explicitly during deployment:
@@ -173,24 +754,26 @@ the daily schedule:
 docker exec airflow-scheduler airflow dags unpause dag_ingest_whoscored
 ```
 
-`dag_backfill_whoscored` intentionally has no schedule and remains a
-manual/continuation-only DAG. Verify pause state and the next-run timestamps in
-the Airflow UI or `airflow dags list` after the scheduler heartbeat.
+`dag_backfill_whoscored` and `dag_canary_whoscored_proxy` intentionally have no
+schedule and remain paused manual/continuation-only DAGs. Verify all WhoScored
+pause states and the next-run timestamps in the Airflow UI or
+`airflow dags list` after the scheduler heartbeat.
 
 ## Storage scope
 
-Do not run the SeaweedFS cutover playbook and do not recreate the storage
-service during this source rollout. Verify the existing `seaweedfs` container
-and a Trino read before and after the Airflow/proxy deployment, but leave the
-container command, volume and credentials unchanged. The backup/cutover tools
-remain available for a separately approved resilience project.
+Do not run the four-plane SeaweedFS cutover playbook during this source rollout.
+The one-time quiesced isolation rollout above is a deployment prerequisite for
+an old mini identity; after it succeeds, do not recreate the storage boundary
+during the targeted Airflow/proxy update. Verify the exact live runtime through
+the wrapper and a Trino read before and after. Backup/cutover tools remain
+code-owned disabled for a separately approved resilience project.
 
 For that future project only, keep the versioned recovery command contract
 below. It is not a gate or an authorization to enable backup in this rollout.
 An operator first lists and authenticates an exact immutable inventory key:
 
 ```bash
-docker compose --env-file "$COMPOSE_ENV_FILE" \
+"$RELEASE/scripts/compose.sh" --env-file "$COMPOSE_ENV_FILE" \
   --env-file "$PROXY_POOL_ENV_FILE" run --rm --no-deps \
   --entrypoint bash airflow-scheduler -euc '
     python /opt/airflow/scripts/whoscored_raw_backup.py list-inventories \
@@ -206,7 +789,7 @@ selected key; never infer a latest marker or restore over an existing prefix:
 export RECOVERY_TARGET_URI=s3://approved-empty-recovery-bucket/whoscored
 export RECOVERY_EXPECTED_SOURCE_URI=s3://original-bucket/raw/whoscored
 export RECOVERY_INVENTORY_KEY=backup-inventories/EXACT_APPROVED_KEY.json
-docker compose --env-file "$COMPOSE_ENV_FILE" \
+"$RELEASE/scripts/compose.sh" --env-file "$COMPOSE_ENV_FILE" \
   --env-file "$PROXY_POOL_ENV_FILE" run --rm --no-deps \
   --entrypoint bash -e RECOVERY_TARGET_URI -e RECOVERY_EXPECTED_SOURCE_URI \
   -e RECOVERY_INVENTORY_KEY airflow-scheduler -euc '
@@ -252,16 +835,34 @@ The reproducible manual sequence is:
 ```bash
 DISCOVERY=/opt/airflow/logs/whoscored/manual/20260714T152100Z/discovery.json
 SMOKE=/opt/airflow/logs/whoscored/manual/20260714T161016Z/daily_epl_2627.json
-CATALOG_BATCH=wsc2-c1d277275b85c0064ee72819d37a58a1b86a5852a5e9aea4636e3ec82ae4cfd5
 
 python dags/scripts/run_whoscored_scraper.py discover \
-  --full-history --direct-only --output "$DISCOVERY"
+  --full-history --as-of-date 2026-07-14 \
+  --direct-only --output "$DISCOVERY"
+
+export CATALOG_BATCH="$(python - "$DISCOVERY" <<'PY'
+import json
+import re
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    report = json.load(handle)
+batch_id = str(report.get("catalog_batch_id") or "")
+if report.get("status") != "success" or not re.fullmatch(
+    r"wsc2-[0-9a-f]{64}", batch_id
+):
+    raise SystemExit("discovery report has no successful exact catalog identity")
+print(batch_id)
+PY
+)"
 
 python dags/scripts/run_whoscored_scraper.py daily \
   --scope 'ENG-Premier League=2627' --skip-profiles \
   --catalog-batch-id "$CATALOG_BATCH" --direct-only --output "$SMOKE"
 
 python - <<'PY'
+import os
+
 from dags.dag_ingest_whoscored import validate_scope_result
 validate_scope_result(
     scope_spec="ENG-Premier League=2627",
@@ -270,12 +871,16 @@ validate_scope_result(
         "daily_epl_2627.json"
     ),
     require_zero_paid=True,
-    expected_catalog_batch_id=(
-        "wsc2-c1d277275b85c0064ee72819d37a58a1b86a5852a5e9aea4636e3ec82ae4cfd5"
-    ),
+    expected_catalog_batch_id=os.environ["CATALOG_BATCH"],
 )
 PY
 ```
+
+`--as-of-date` is mandatory and immutable. Scheduled runs use the Airflow
+logical date. A catalog manifest created before the `as_of_date`, raw
+provenance and parent-lineage fields existed is not a valid incremental
+parent: keep the DAGs paused and publish one reviewed `--full-history`
+generation first.
 
 Verify the write through the same authenticated Trino endpoint used by
 DataGrip. At minimum, these queries must return a parser-v8 full-history catalog
@@ -283,7 +888,10 @@ and parser-v8 current evidence for the smoke scope:
 
 ```sql
 SELECT batch_id, parser_version, discovery_mode, state,
-       competitions_count, seasons_count, stages_count
+       competitions_count, seasons_count, stages_count,
+       raw_provenance_sha256, as_of_date,
+       parent_catalog_batch_id, parent_catalog_payload_sha256,
+       parent_catalog_raw_provenance_sha256, raw_inputs_json
 FROM iceberg.bronze.whoscored_catalog_manifest
 ORDER BY completed_at DESC
 LIMIT 5;
@@ -344,9 +952,34 @@ process-tree RSS plus monitored-container cgroup memory <=12 GiB, and no
 container restart/OOM evidence. Use the exact invocation printed by
 `--help`; keep the normal short duration only for CI and operator rehearsal.
 
+The v2 supervisor resolves the local ID behind the exact derived image reference
+`data-platform-flaresolverr-whoscored:3.4.6` on every sample. The running
+container must keep that ID and the current checkout's Compose hash/labels,
+use the image-baked root-owned launcher and extension with no bind/volume
+mounts and only the four exact reviewed tmpfs paths, keep a read-only root
+filesystem, numeric UID/GID, dropped capabilities and the exact AppArmor/seccomp
+options. Retagging the reference, using the old upstream image with an extension
+bind, shadowing the payload with tmpfs, or starting the service from another
+checkout stops the canary fail-closed.
+It renders that hash through the current checkout's `scripts/compose.sh` and
+all three protected environment files, so the selected SeaweedFS topology state
+and `WHOSCORED_PROXY_APPROVAL_HOST_DIR` prerequisite must already pass even
+though this canary itself is direct-only.
+
+For the current issue-954 candidate, set `RELEASE=/root/dpf-whoscored-merge`.
+The evidence directory is outside the checkout and create-once output remains
+mode `0600`:
+
 ```bash
-cd /root/dpf-fbref-949-release
-CANARY_OUTPUT=/root/fbref-949-runtime/whoscored-capacity-$(date -u +%Y%m%dT%H%M%SZ).json
+RELEASE=/root/dpf-whoscored-merge
+cd "$RELEASE"
+test "$(pwd -P)" = "$RELEASE"
+: "${WHOSCORED_PROXY_APPROVAL_HOST_DIR:?set the protected approval directory used by the admitted Compose model}"
+test -d "$WHOSCORED_PROXY_APPROVAL_HOST_DIR"
+export WHOSCORED_PROXY_APPROVAL_HOST_DIR
+CANARY_EVIDENCE_DIR=/root/whoscored-954-runtime
+install -d -o root -g root -m 0700 "$CANARY_EVIDENCE_DIR"
+CANARY_OUTPUT="$CANARY_EVIDENCE_DIR/whoscored-capacity-$(date -u +%Y%m%dT%H%M%SZ).json"
 /root/.venvs/dpf-test/bin/python \
   scripts/research/bench_whoscored_capacity.py \
   --duration-seconds 21600 \
@@ -426,15 +1059,25 @@ Airflow overhead, retries, or source failures. These ratios are sizing evidence,
 not a frozen all-catalog population.
 
 Do **not** trigger the all-catalog crawl at two slots. First pass the sustained
-four-worker non-publishing canary, promote the real Airflow pool to four, and
-complete one manual plus one scheduled daily run. If any throughput, memory,
-restart, paid-byte or DQ gate fails, return to two slots and do not create the
-plan. Only after all evidence makes the exact preflight sufficient may the
-single production crawl be started:
+four-worker non-publishing capacity canary, promote the real Airflow pool to
+four, and complete one manual plus one scheduled daily run. The paid-proxy
+measurement is a separate gate described in
+`docs/operations/whoscored-proxy-campaign.md`: run only its exact 1 GB signed
+canary, whose executable provider-order ceiling is the durable `850 MiB`
+safety cap, persist the immutable p95 evidence, and review the proposed full
+cap. That canary does not authorize the full crawl.
+
+The separately reviewed production crawl must remain `direct_only` in this
+release. If paid fallback is still required, stop: the full-crawl sentinel is
+false, and neither a new approval nor DagRun configuration can enable it. A
+future paid-backfill proposal requires a different reviewed release; never
+reuse the measurement approval.
+
+Direct-only trigger:
 
 ```bash
 docker exec airflow-scheduler airflow dags trigger dag_backfill_whoscored \
-  --conf '{"all_catalog":true,"direct_only":true,"require_zero_paid":true}'
+  --conf '{"all_catalog":true,"transport_policy":"direct_only","require_zero_paid":true}'
 ```
 
 Do not trigger a second selector for the same crawl. The first run stores the
@@ -444,8 +1087,12 @@ immutable plan and queues deterministic continuation runs. Completion means:
 - full-history discovery provenance is bound to the plan;
 - historical DQ passes for all frozen eligible scopes and 25 datasets;
 - every eligible roster player has a current profile or typed terminal proof;
-- aggregate paid proxy bytes are zero; and
+- aggregate paid proxy bytes are exactly zero; and
 - the plan completed no later than its 30-day deadline.
+
+Any `awaiting_approval` state in a production backfill is fail-closed evidence,
+not a prompt to mint paid authority. Pause and investigate it; DagRun
+configuration cannot increase a budget or bypass the full-crawl sentinel.
 
 ## Validation evidence
 
@@ -613,8 +1260,9 @@ result are recorded below.
 Until a new full six-hour canary exits zero, direct/DQ pools remain 2/2, all
 WhoScored DAGs stay paused, and no `all_catalog` plan may be created.
 
-The live storage service remains one `weed mini` container and is intentionally
-unchanged. Promote concurrency only through the sustained canary. Do not create
+The live storage core remains one `weed mini`, isolated behind the private S3
+gateway and HTTP proxy after the required one-time rollout. Promote concurrency
+only through the sustained canary. Do not create
 an `all_catalog` plan until the canary, pool promotion, manual daily and
 scheduled daily gates are green.
 

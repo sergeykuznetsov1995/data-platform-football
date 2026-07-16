@@ -6,6 +6,7 @@ import base64
 import hashlib
 import importlib.util
 import inspect
+import io
 import json
 import logging
 from pathlib import Path
@@ -39,6 +40,8 @@ def _fresh_global_xhr_pacer(monkeypatch):
     """Keep fast fake-driver tests independent while production stays process-wide."""
 
     monkeypatch.setattr(ext, "_XHR_START_PACER", ext._XhrStartPacer())
+    monkeypatch.delenv(ext.PAID_EXCLUSIVE_MODE_ENV, raising=False)
+    monkeypatch.delenv(ext.PAID_GATEWAY_SECRET_ENV, raising=False)
 
 
 def _payload(**overrides):
@@ -384,6 +387,490 @@ def test_disable_media_patch_is_version_source_and_signature_pinned(monkeypatch)
     assert service._evil_logic is patched
 
 
+def test_paid_exclusive_mode_is_explicit_and_requires_a_strong_secret():
+    secret = "gateway-secret-0123456789abcdef-strong"
+
+    assert ext._paid_gateway_authorizer_from_environment({}) is None
+    assert (
+        ext._paid_gateway_authorizer_from_environment(
+            {
+                ext.PAID_EXCLUSIVE_MODE_ENV: "0",
+                ext.PAID_GATEWAY_SECRET_ENV: secret,
+            }
+        )
+        is None
+    )
+    with pytest.raises(ext.PaidGatewayConfigurationError, match="must be 0 or 1"):
+        ext._paid_gateway_authorizer_from_environment(
+            {ext.PAID_EXCLUSIVE_MODE_ENV: "true"}
+        )
+    for invalid_secret in ("", "short", " " * 32, "a" * 31):
+        with pytest.raises(ext.PaidGatewayConfigurationError, match="32..4096"):
+            ext._paid_gateway_authorizer_from_environment(
+                {
+                    ext.PAID_EXCLUSIVE_MODE_ENV: "1",
+                    ext.PAID_GATEWAY_SECRET_ENV: invalid_secret,
+                }
+            )
+
+    authorizer = ext._paid_gateway_authorizer_from_environment(
+        {
+            ext.PAID_EXCLUSIVE_MODE_ENV: "1",
+            ext.PAID_GATEWAY_SECRET_ENV: secret,
+        }
+    )
+    assert isinstance(authorizer, ext._PaidGatewayAuthorizer)
+    assert secret not in repr(authorizer)
+
+
+def test_paid_secret_and_capability_never_enter_errors_or_logs(caplog):
+    invalid_secret = "a" * 32 + "\ud800"
+    with pytest.raises(ext.PaidGatewayConfigurationError) as invalid:
+        ext._PaidGatewayAuthorizer(invalid_secret)
+    assert invalid_secret not in str(invalid.value)
+    assert invalid.value.__context__ is None
+
+    secret = "gateway-secret-0123456789abcdef-strong"
+    instance_id = "9" * 32
+    body = b'{"cmd":"sessions.list"}'
+    headers = ext.build_paid_gateway_capability_headers(
+        secret,
+        instance_id=instance_id,
+        method="POST",
+        path="/v1",
+        body=body,
+        timestamp=1_750_000_000,
+        nonce="8" * 32,
+    )
+    authorizer = ext._PaidGatewayAuthorizer(
+        secret,
+        instance_id=instance_id,
+        clock=lambda: 1_750_000_000,
+    )
+    with caplog.at_level(logging.DEBUG):
+        assert authorizer.authorize(
+            method="POST",
+            path="/v1",
+            query_string="",
+            body=body,
+            headers=headers,
+        )
+        assert not authorizer.authorize(
+            method="POST",
+            path="/v1",
+            query_string="",
+            body=body,
+            headers=headers,
+        )
+    assert secret not in caplog.text
+    assert headers[ext.PAID_GATEWAY_CAPABILITY_HEADER] not in caplog.text
+
+
+def test_paid_capability_is_body_session_path_instance_and_replay_bound():
+    now = 1_750_000_000
+    secret = "gateway-secret-0123456789abcdef-strong"
+    instance_id = "a" * 32
+    authorizer = ext._PaidGatewayAuthorizer(
+        secret,
+        instance_id=instance_id,
+        clock=lambda: now,
+    )
+    body = json.dumps(
+        {
+            "cmd": "sessions.create",
+            "session": "ws-paid-session-a",
+        },
+        separators=(",", ":"),
+    ).encode()
+    headers = ext.build_paid_gateway_capability_headers(
+        secret,
+        instance_id=instance_id,
+        method="POST",
+        path="/v1",
+        body=body,
+        timestamp=now,
+        nonce="b" * 32,
+    )
+
+    assert authorizer.authorize(
+        method="POST", path="/v1", query_string="", body=body, headers=headers
+    )
+    assert not authorizer.authorize(
+        method="POST", path="/v1", query_string="", body=body, headers=headers
+    )
+
+    # A fresh verifier proves the HMAC itself cannot cross a session/body,
+    # route, method, query or process-instance boundary.
+    mutations = (
+        {
+            "body": body.replace(b"session-a", b"session-b"),
+        },
+        {"path": "/v1/xhr"},
+        {"method": "DELETE"},
+        {"query_string": "debug=1"},
+    )
+    for mutation in mutations:
+        verifier = ext._PaidGatewayAuthorizer(
+            secret,
+            instance_id=instance_id,
+            clock=lambda: now,
+        )
+        request = {
+            "method": "POST",
+            "path": "/v1",
+            "query_string": "",
+            "body": body,
+            "headers": headers,
+            **mutation,
+        }
+        assert not verifier.authorize(**request)
+    restarted = ext._PaidGatewayAuthorizer(
+        secret,
+        instance_id="c" * 32,
+        clock=lambda: now,
+    )
+    assert not restarted.authorize(
+        method="POST", path="/v1", query_string="", body=body, headers=headers
+    )
+
+
+@pytest.mark.parametrize("offset", [-31, 31])
+def test_paid_capability_rejects_stale_or_future_timestamp(offset):
+    now = 1_750_000_000
+    secret = "gateway-secret-0123456789abcdef-strong"
+    instance_id = "d" * 32
+    body = b'{"cmd":"sessions.list"}'
+    headers = ext.build_paid_gateway_capability_headers(
+        secret,
+        instance_id=instance_id,
+        method="POST",
+        path="/v1",
+        body=body,
+        timestamp=now + offset,
+        nonce="e" * 32,
+    )
+    authorizer = ext._PaidGatewayAuthorizer(
+        secret,
+        instance_id=instance_id,
+        clock=lambda: now,
+    )
+
+    assert not authorizer.authorize(
+        method="POST", path="/v1", query_string="", body=body, headers=headers
+    )
+
+
+def test_paid_capability_rejects_huge_numeric_timestamp_before_int(monkeypatch):
+    authorizer = ext._PaidGatewayAuthorizer(
+        "gateway-secret-0123456789abcdef-strong",
+        instance_id="d" * 32,
+        clock=lambda: 1_750_000_000,
+    )
+    original_int = int
+
+    def bounded_int(value):
+        if isinstance(value, str):
+            raise AssertionError("oversized timestamp reached int()")
+        return original_int(value)
+
+    monkeypatch.setattr(ext, "int", bounded_int, raising=False)
+    assert not authorizer.authorize(
+        method="POST",
+        path="/v1",
+        query_string="",
+        body=b'{"cmd":"sessions.list"}',
+        headers={
+            ext.PAID_GATEWAY_INSTANCE_HEADER: authorizer.instance_id,
+            ext.PAID_GATEWAY_TIMESTAMP_HEADER: "9" * 100_000,
+            ext.PAID_GATEWAY_NONCE_HEADER: "e" * 32,
+            ext.PAID_GATEWAY_CAPABILITY_HEADER: "f" * 64,
+        },
+    )
+
+
+def test_paid_capability_cache_ceiling_fails_closed_and_expiry_reclaims_space():
+    now = [1_750_000_000]
+    secret = "gateway-secret-0123456789abcdef-strong"
+    instance_id = "e" * 32
+    body = b'{"cmd":"sessions.list"}'
+    authorizer = ext._PaidGatewayAuthorizer(
+        secret,
+        instance_id=instance_id,
+        clock=lambda: now[0],
+    )
+    authorizer._used_nonces = {
+        f"{index:032x}": now[0] + ext.PAID_GATEWAY_MAX_CLOCK_SKEW_SECONDS
+        for index in range(ext.PAID_GATEWAY_MAX_REPLAY_ENTRIES)
+    }
+    full_nonce = "f" * 32
+    full_headers = ext.build_paid_gateway_capability_headers(
+        secret,
+        instance_id=instance_id,
+        method="POST",
+        path="/v1",
+        body=body,
+        timestamp=now[0],
+        nonce=full_nonce,
+    )
+
+    assert not authorizer.authorize(
+        method="POST", path="/v1", query_string="", body=body, headers=full_headers
+    )
+    assert len(authorizer._used_nonces) == ext.PAID_GATEWAY_MAX_REPLAY_ENTRIES
+    assert full_nonce not in authorizer._used_nonces
+
+    now[0] += ext.PAID_GATEWAY_MAX_CLOCK_SKEW_SECONDS + 1
+    fresh_nonce = "a" * 32
+    fresh_headers = ext.build_paid_gateway_capability_headers(
+        secret,
+        instance_id=instance_id,
+        method="POST",
+        path="/v1",
+        body=body,
+        timestamp=now[0],
+        nonce=fresh_nonce,
+    )
+    assert authorizer.authorize(
+        method="POST", path="/v1", query_string="", body=body, headers=fresh_headers
+    )
+    assert authorizer._used_nonces == {
+        fresh_nonce: now[0] + ext.PAID_GATEWAY_MAX_CLOCK_SKEW_SECONDS
+    }
+
+
+def test_paid_capability_replay_consumption_is_atomic():
+    now = 1_750_000_000
+    secret = "gateway-secret-0123456789abcdef-strong"
+    instance_id = "f" * 32
+    body = b'{"cmd":"sessions.destroy","session":"ws-paid-a"}'
+    headers = ext.build_paid_gateway_capability_headers(
+        secret,
+        instance_id=instance_id,
+        method="POST",
+        path="/v1",
+        body=body,
+        timestamp=now,
+        nonce="1" * 32,
+    )
+    authorizer = ext._PaidGatewayAuthorizer(
+        secret,
+        instance_id=instance_id,
+        clock=lambda: now,
+    )
+    barrier = threading.Barrier(8)
+    outcomes = []
+    outcome_lock = threading.Lock()
+
+    def authorize_once():
+        barrier.wait(timeout=2)
+        result = authorizer.authorize(
+            method="POST",
+            path="/v1",
+            query_string="",
+            body=body,
+            headers=headers,
+        )
+        with outcome_lock:
+            outcomes.append(result)
+
+    threads = [threading.Thread(target=authorize_once) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=2)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert outcomes.count(True) == 1
+    assert outcomes.count(False) == 7
+
+
+def test_paid_capability_malformed_auth_still_uses_constant_time_comparisons(
+    monkeypatch,
+):
+    authorizer = ext._PaidGatewayAuthorizer(
+        "gateway-secret-0123456789abcdef-strong",
+        instance_id="2" * 32,
+        clock=lambda: 1_750_000_000,
+    )
+    original = ext.secrets.compare_digest
+    compared = []
+
+    def record_compare(left, right):
+        compared.append((left, right))
+        return original(left, right)
+
+    monkeypatch.setattr(ext.secrets, "compare_digest", record_compare)
+
+    assert not authorizer.authorize(
+        method="POST",
+        path="/v1",
+        query_string="",
+        body=b"{}",
+        headers={},
+    )
+    assert len(compared) == 2
+    assert all(len(left) == len(right) for left, right in compared)
+
+
+def test_paid_create_app_protects_all_v1_routes_and_leaves_identity_read_only(
+    monkeypatch,
+):
+    service = _fake_upstream_service(_stock_like_evil_logic)
+    service.SESSIONS_STORAGE = FakeStorage()
+    _pin_function_source(monkeypatch, service._evil_logic)
+    _pin_lifecycle_sources(monkeypatch, service)
+    monkeypatch.setattr(ext, "_install_safe_logging", lambda: None)
+
+    class PaidAbort(Exception):
+        def __init__(self, status, message):
+            super().__init__(message)
+            self.status = status
+
+    class _App:
+        def __init__(self):
+            self.routes = []
+            self.hooks = []
+
+        def get(self, path):
+            def register(function):
+                self.routes.append((path, function))
+                return function
+
+            return register
+
+        def post(self, path):
+            def register(function):
+                self.routes.append((path, function))
+                return function
+
+            return register
+
+        def hook(self, name):
+            assert name == "before_request"
+
+            def register(function):
+                self.hooks.append(function)
+                return function
+
+            return register
+
+    request = SimpleNamespace(
+        method="GET",
+        path="/health",
+        query_string="",
+        body=io.BytesIO(b""),
+        headers={},
+        content_type="application/json",
+    )
+    app = _App()
+    bottle = ModuleType("bottle")
+    bottle.request = request
+    bottle.response = SimpleNamespace()
+
+    def abort(status, message):
+        raise PaidAbort(status, message)
+
+    bottle.abort = abort
+    upstream = ModuleType("flaresolverr")
+    upstream.app = app
+    utils = ModuleType("utils")
+    utils.get_flaresolverr_version = lambda: "3.4.6"
+    monkeypatch.setitem(sys.modules, "bottle", bottle)
+    monkeypatch.setitem(sys.modules, "flaresolverr", upstream)
+    monkeypatch.setitem(sys.modules, "flaresolverr_service", service)
+    monkeypatch.setitem(sys.modules, "utils", utils)
+    secret = "gateway-secret-0123456789abcdef-strong"
+    now = 1_750_000_000
+    authorizer = ext._PaidGatewayAuthorizer(
+        secret,
+        instance_id="3" * 32,
+        clock=lambda: now,
+    )
+
+    assert ext.create_app(paid_gateway_authorizer=authorizer) is app
+    assert len(app.hooks) == 1
+    hook = app.hooks[0]
+    assert hook() is None  # GET /health
+    request.path = "/v1/whoscored/runtime-identity"
+    assert hook() is None
+    identity_route = next(
+        function
+        for path, function in app.routes
+        if path == "/v1/whoscored/runtime-identity"
+    )
+    assert identity_route() == {
+        "status": "ok",
+        "version": "3.4.6",
+        "extension_sha256": ext.EXTENSION_SHA256,
+        "paid_exclusive": True,
+        "capability_schema": ext.PAID_GATEWAY_CAPABILITY_SCHEMA,
+        "capability_instance_id": "3" * 32,
+    }
+
+    protected_requests = (
+        ("/v1", b'{"cmd":"sessions.list"}'),
+        (
+            "/v1",
+            b'{"cmd":"sessions.create","session":"ws-paid-create"}',
+        ),
+        (
+            "/v1",
+            b'{"cmd":"request.get","session":"ws-paid-use",'
+            b'"url":"https://www.whoscored.com/"}',
+        ),
+        (
+            "/v1",
+            b'{"cmd":"sessions.destroy","session":"ws-paid-destroy"}',
+        ),
+        ("/v1/xhr", b"{}"),
+        ("/v1/xhr/batch", b"{}"),
+        ("/v1/whoscored/capacity-sessions/cleanup", b"{}"),
+    )
+    for path, body in protected_requests:
+        request.method = "POST"
+        request.path = path
+        request.body = io.BytesIO(body)
+        request.headers = {}
+        with pytest.raises(PaidAbort) as denied:
+            hook()
+        assert denied.value.status == 401
+
+    body = b'{"cmd":"sessions.create","session":"ws-paid-create"}'
+    request.method = "POST"
+    request.path = "/v1"
+    request.body = io.BytesIO(body)
+    request.content_type = "text/plain"
+    request.headers = ext.build_paid_gateway_capability_headers(
+        secret,
+        instance_id=authorizer.instance_id,
+        method="POST",
+        path="/v1",
+        body=body,
+        timestamp=now,
+        nonce="5" * 32,
+    )
+    with pytest.raises(PaidAbort) as wrong_content_type:
+        hook()
+    assert wrong_content_type.value.status == 401
+
+    request.body = io.BytesIO(body)
+    request.content_type = "application/json; charset=utf-8"
+    request.headers = ext.build_paid_gateway_capability_headers(
+        secret,
+        instance_id=authorizer.instance_id,
+        method="POST",
+        path="/v1",
+        body=body,
+        timestamp=now,
+        nonce="4" * 32,
+    )
+    assert hook() is None
+    assert request.body.tell() == 0
+    with pytest.raises(PaidAbort) as replayed:
+        hook()
+    assert replayed.value.status == 401
+
+
 def test_create_app_installs_media_patch_before_registering_route(monkeypatch):
     service = _fake_upstream_service(_stock_like_evil_logic)
     service.SESSIONS_STORAGE = FakeStorage()
@@ -394,6 +881,13 @@ def test_create_app_installs_media_patch_before_registering_route(monkeypatch):
     class _App:
         def __init__(self):
             self.routes = []
+
+        def get(self, path):
+            def register(function):
+                self.routes.append((path, function))
+                return function
+
+            return register
 
         def post(self, path):
             def register(function):
@@ -416,9 +910,15 @@ def test_create_app_installs_media_patch_before_registering_route(monkeypatch):
     monkeypatch.setitem(sys.modules, "utils", utils)
 
     assert ext.create_app() is app
-    assert app.routes[0][0] == "/v1/xhr"
-    assert app.routes[1][0] == "/v1/xhr/batch"
-    assert app.routes[2][0] == "/v1/whoscored/capacity-sessions/cleanup"
+    assert app.routes[0][0] == "/v1/whoscored/runtime-identity"
+    assert app.routes[0][1]() == {
+        "status": "ok",
+        "version": "3.4.6",
+        "extension_sha256": ext.EXTENSION_SHA256,
+    }
+    assert app.routes[1][0] == "/v1/xhr"
+    assert app.routes[2][0] == "/v1/xhr/batch"
+    assert app.routes[3][0] == "/v1/whoscored/capacity-sessions/cleanup"
     assert isinstance(service.SESSIONS_STORAGE, ext._TrackingSessionsStorage)
     assert getattr(service.controller_v1_endpoint, ext._SAFE_CONTROLLER_MARKER) == (
         "3.4.6",
@@ -436,6 +936,9 @@ def test_main_installs_media_patch_before_upstream_browser_self_test():
     assert ext.WAITRESS_THREADS == 8
     assert "threads=WAITRESS_THREADS" in source
     assert "threads=int(os.environ" not in source
+    assert source.index("_paid_gateway_authorizer_from_environment()") < source.index(
+        "test_browser_installation()"
+    )
     assert source.index("_install_disable_media_extension(") < source.index(
         "test_browser_installation()"
     )
@@ -984,7 +1487,7 @@ def test_safe_controller_logs_no_session_owner_url_or_proxy_credentials(
         ext._install_safe_logging()
         ext._install_safe_v1_controller(service, version="3.4.6")
         with caplog.at_level(logging.DEBUG):
-            service.controller_v1_endpoint(
+            response = service.controller_v1_endpoint(
                 SimpleNamespace(
                     session=session_id,
                     url=source_url,
@@ -995,6 +1498,8 @@ def test_safe_controller_logs_no_session_owner_url_or_proxy_credentials(
                     },
                 )
             )
+        assert response.version == "3.4.6"
+        assert response.extension_sha256 == ext.EXTENSION_SHA256
         logs = "\n".join(record.getMessage() for record in caplog.records)
         for secret in (
             session_id,
@@ -1241,9 +1746,7 @@ def test_fixed_batch_script_has_server_side_security_and_resource_limits():
     assert "operation.consumedBytes -=" not in script
     assert 'failure("aggregate_too_large")' not in script
     assert 'kind: "aggregate_too_large"' in ext.XHR_COLLECT_SCRIPT
-    assert (
-        "for (const activeController of operation.controllers)" in script
-    )
+    assert "for (const activeController of operation.controllers)" in script
     assert "range(0, len(request_data.urls), BATCH_CONCURRENCY)" in inspect.getsource(
         ext._execute_browser_batch_fetch
     )
@@ -1451,6 +1954,7 @@ def test_success_uses_existing_session_and_returns_exact_client_contract():
     assert status == 200
     assert body["status"] == "ok"
     assert body["version"] == "3.4.6"
+    assert body["extension_sha256"] == ext.EXTENSION_SHA256
     assert set(body["solution"]) == {
         "responseBase64",
         "responseBytes",
@@ -1557,6 +2061,8 @@ def test_malformed_runtime_batch_item_fails_whole_endpoint_contract(bad_item):
 
     assert status == 502
     assert body["status"] == "error"
+    assert body["version"] == "3.4.6"
+    assert body["extension_sha256"] == ext.EXTENSION_SHA256
     assert "solution" not in body
 
 

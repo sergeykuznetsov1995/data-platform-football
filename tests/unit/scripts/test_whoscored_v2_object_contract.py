@@ -80,3 +80,19 @@ def test_every_manifest_requires_content_addressed_raw_provenance():
     assert "availability_version" in contract.MANIFEST_REQUIRED_COLUMNS[
         "whoscored_match_ingest_manifest"
     ]
+
+
+@pytest.mark.unit
+def test_catalog_manifest_requires_lineage_and_as_of_identity():
+    required = set(
+        contract.MANIFEST_REQUIRED_COLUMNS["whoscored_catalog_manifest"]
+    )
+
+    assert {
+        "raw_provenance_sha256",
+        "discovery_mode",
+        "as_of_date",
+        "parent_catalog_batch_id",
+        "parent_catalog_payload_sha256",
+        "parent_catalog_raw_provenance_sha256",
+    } <= required

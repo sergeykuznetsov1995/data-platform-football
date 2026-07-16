@@ -46,6 +46,7 @@ import base64
 import binascii
 import functools
 import hashlib
+import hmac
 import inspect
 import json
 import logging
@@ -93,6 +94,363 @@ _CONTROL_OR_SPACE_RE = re.compile(r"[\x00-\x20\x7f]")
 _FEED_PATH_RE = re.compile(r"\A/[A-Za-z0-9_/-]+\Z")
 _HEADER_NAME_RE = re.compile(r"\A[!#$%&'*+.^_`|~0-9A-Za-z-]+\Z")
 _HEADER_VALUE_CONTROL_RE = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
+
+# The normal shared FlareSolverr remains backward compatible.  A separate paid
+# instance opts into this boundary with the exact value ``1`` and then fails at
+# startup unless it has a strong gateway-only secret.  The secret itself never
+# crosses HTTP: callers send a short-lived HMAC capability bound to the exact
+# method, path, query and request-body bytes.
+PAID_EXCLUSIVE_MODE_ENV = "WHOSCORED_FLARESOLVERR_PAID_EXCLUSIVE"
+PAID_GATEWAY_SECRET_ENV = "WHOSCORED_FLARESOLVERR_GATEWAY_SECRET"
+PAID_GATEWAY_CAPABILITY_SCHEMA = "whoscored-flaresolverr-paid-v1"
+PAID_GATEWAY_INSTANCE_HEADER = "X-Whoscored-Gateway-Instance"
+PAID_GATEWAY_TIMESTAMP_HEADER = "X-Whoscored-Gateway-Timestamp"
+PAID_GATEWAY_NONCE_HEADER = "X-Whoscored-Gateway-Nonce"
+PAID_GATEWAY_CAPABILITY_HEADER = "X-Whoscored-Gateway-Capability"
+PAID_GATEWAY_MAX_CLOCK_SKEW_SECONDS = 30
+PAID_GATEWAY_MAX_REPLAY_ENTRIES = 4096
+_PAID_GATEWAY_INSTANCE_RE = re.compile(r"\A[0-9a-f]{32}\Z")
+_PAID_GATEWAY_NONCE_RE = re.compile(r"\A[0-9a-f]{32}\Z")
+_PAID_GATEWAY_CAPABILITY_RE = re.compile(r"\A[0-9a-f]{64}\Z")
+_PAID_GATEWAY_ENV_UNSET = object()
+
+
+class PaidGatewayConfigurationError(RuntimeError):
+    """The optional paid-exclusive FlareSolverr boundary is unsafe."""
+
+
+def _paid_gateway_secret_bytes(value: object) -> bytes:
+    """Validate a gateway secret without ever rendering it in an error."""
+
+    if isinstance(value, str):
+        encoding_failed = False
+        try:
+            encoded = value.encode("utf-8")
+        except UnicodeEncodeError:
+            encoded = b""
+            encoding_failed = True
+        if encoding_failed:
+            raise PaidGatewayConfigurationError(
+                "paid gateway secret is not valid UTF-8"
+            ) from None
+    elif isinstance(value, bytes):
+        encoded = value
+    else:
+        raise PaidGatewayConfigurationError("paid gateway secret must be text or bytes")
+    if not 32 <= len(encoded) <= 4096 or any(
+        byte <= 0x20 or byte == 0x7F for byte in encoded
+    ):
+        raise PaidGatewayConfigurationError(
+            "paid gateway secret must contain 32..4096 non-whitespace bytes"
+        )
+    return encoded
+
+
+def _paid_gateway_capability_message(
+    *,
+    instance_id: str,
+    method: str,
+    path: str,
+    query_string: str,
+    timestamp: str,
+    nonce: str,
+    body: bytes,
+) -> bytes:
+    """Return one unambiguous HMAC message containing no request body."""
+
+    return json.dumps(
+        {
+            "body_sha256": hashlib.sha256(body).hexdigest(),
+            "instance_id": instance_id,
+            "method": method,
+            "nonce": nonce,
+            "path": path,
+            "query_string": query_string,
+            "schema": PAID_GATEWAY_CAPABILITY_SCHEMA,
+            "timestamp": timestamp,
+        },
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+
+
+def build_paid_gateway_capability_headers(
+    secret: str | bytes,
+    *,
+    instance_id: str,
+    method: str,
+    path: str,
+    body: bytes,
+    query_string: str = "",
+    timestamp: int | None = None,
+    nonce: str | None = None,
+) -> dict[str, str]:
+    """Build one request-scoped, single-use paid-gateway capability.
+
+    This helper defines the wire contract for the future isolated gateway.  It
+    does not read the service environment and never returns the gateway secret.
+    The body digest binds stock ``sessions.*`` and ``request.*`` commands to the
+    exact session named in their JSON payload.
+    """
+
+    key = _paid_gateway_secret_bytes(secret)
+    if _PAID_GATEWAY_INSTANCE_RE.fullmatch(instance_id) is None:
+        raise ValueError("paid gateway instance ID must be lowercase hex")
+    if (
+        not isinstance(method, str)
+        or not method
+        or method != method.upper()
+        or len(method) > 16
+        or not method.isascii()
+    ):
+        raise ValueError("paid gateway method is invalid")
+    if (
+        not isinstance(path, str)
+        or not path.startswith("/")
+        or len(path) > 512
+        or any(ord(character) < 0x20 or ord(character) == 0x7F for character in path)
+    ):
+        raise ValueError("paid gateway path is invalid")
+    if (
+        not isinstance(query_string, str)
+        or len(query_string) > 2048
+        or any(
+            ord(character) < 0x20 or ord(character) == 0x7F
+            for character in query_string
+        )
+    ):
+        raise ValueError("paid gateway query string is invalid")
+    if not isinstance(body, bytes) or len(body) > MAX_REQUEST_BYTES:
+        raise ValueError("paid gateway body is invalid")
+    issued_at = int(time.time()) if timestamp is None else timestamp
+    if isinstance(issued_at, bool) or not isinstance(issued_at, int) or issued_at < 1:
+        raise ValueError("paid gateway timestamp is invalid")
+    request_nonce = secrets.token_hex(16) if nonce is None else nonce
+    if (
+        not isinstance(request_nonce, str)
+        or _PAID_GATEWAY_NONCE_RE.fullmatch(request_nonce) is None
+    ):
+        raise ValueError("paid gateway nonce must be lowercase hex")
+    timestamp_text = str(issued_at)
+    capability = hmac.new(
+        key,
+        _paid_gateway_capability_message(
+            instance_id=instance_id,
+            method=method,
+            path=path,
+            query_string=query_string,
+            timestamp=timestamp_text,
+            nonce=request_nonce,
+            body=body,
+        ),
+        hashlib.sha256,
+    ).hexdigest()
+    return {
+        PAID_GATEWAY_INSTANCE_HEADER: instance_id,
+        PAID_GATEWAY_TIMESTAMP_HEADER: timestamp_text,
+        PAID_GATEWAY_NONCE_HEADER: request_nonce,
+        PAID_GATEWAY_CAPABILITY_HEADER: capability,
+    }
+
+
+class _PaidGatewayAuthorizer:
+    """Verify single-use HMAC capabilities for one FlareSolverr process."""
+
+    def __init__(
+        self,
+        secret: str | bytes,
+        *,
+        instance_id: str | None = None,
+        clock: Any = time.time,
+    ) -> None:
+        self._secret = _paid_gateway_secret_bytes(secret)
+        resolved_instance = instance_id or secrets.token_hex(16)
+        if _PAID_GATEWAY_INSTANCE_RE.fullmatch(resolved_instance) is None:
+            raise PaidGatewayConfigurationError(
+                "paid gateway instance ID must be lowercase hex"
+            )
+        if not callable(clock):
+            raise PaidGatewayConfigurationError("paid gateway clock is invalid")
+        self.instance_id = resolved_instance
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._used_nonces: dict[str, int] = {}
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}(instance_id={self.instance_id!r})"
+
+    def authorize(
+        self,
+        *,
+        method: object,
+        path: object,
+        query_string: object,
+        body: object,
+        headers: Mapping[str, object],
+    ) -> bool:
+        """Authenticate once, atomically consuming a valid nonce."""
+
+        actual_method = method if isinstance(method, str) else ""
+        actual_path = path if isinstance(path, str) else ""
+        actual_query = query_string if isinstance(query_string, str) else ""
+        actual_body = body if isinstance(body, bytes) else b""
+        provided_instance = str(headers.get(PAID_GATEWAY_INSTANCE_HEADER) or "")
+        provided_timestamp = str(headers.get(PAID_GATEWAY_TIMESTAMP_HEADER) or "")
+        provided_nonce = str(headers.get(PAID_GATEWAY_NONCE_HEADER) or "")
+        provided_capability = str(headers.get(PAID_GATEWAY_CAPABILITY_HEADER) or "")
+
+        # Bound attacker-controlled values before including them in the HMAC
+        # message.  A malformed request still performs one compare_digest with
+        # fixed-length values; error handling never depends on secret bytes.
+        message_timestamp = (
+            provided_timestamp if len(provided_timestamp) <= 20 else "<invalid>"
+        )
+        message_nonce = provided_nonce if len(provided_nonce) <= 64 else "<invalid>"
+        expected_capability = hmac.new(
+            self._secret,
+            _paid_gateway_capability_message(
+                instance_id=self.instance_id,
+                method=actual_method[:16],
+                path=actual_path[:512],
+                query_string=actual_query[:2048],
+                timestamp=message_timestamp,
+                nonce=message_nonce,
+                body=actual_body[: MAX_REQUEST_BYTES + 1],
+            ),
+            hashlib.sha256,
+        ).hexdigest()
+        comparable_capability = (
+            provided_capability
+            if _PAID_GATEWAY_CAPABILITY_RE.fullmatch(provided_capability)
+            else "0" * 64
+        )
+        comparable_instance = (
+            provided_instance
+            if _PAID_GATEWAY_INSTANCE_RE.fullmatch(provided_instance)
+            else "0" * 32
+        )
+        capability_matches = secrets.compare_digest(
+            comparable_capability, expected_capability
+        )
+        instance_matches = secrets.compare_digest(comparable_instance, self.instance_id)
+
+        timestamp_shape_valid = bool(
+            1 <= len(provided_timestamp) <= 20
+            and provided_timestamp.isascii()
+            and provided_timestamp.isdecimal()
+        )
+        parsed_timestamp = int(provided_timestamp) if timestamp_shape_valid else 0
+        now = int(self._clock())
+        request_shape_valid = bool(
+            actual_method
+            and actual_method == actual_method.upper()
+            and len(actual_method) <= 16
+            and actual_method.isascii()
+            and actual_path.startswith("/")
+            and len(actual_path) <= 512
+            and len(actual_query) <= 2048
+            and isinstance(body, bytes)
+            and len(actual_body) <= MAX_REQUEST_BYTES
+            and _PAID_GATEWAY_NONCE_RE.fullmatch(provided_nonce) is not None
+            and timestamp_shape_valid
+            and provided_timestamp == str(parsed_timestamp)
+            and parsed_timestamp >= 1
+            and abs(now - parsed_timestamp) <= PAID_GATEWAY_MAX_CLOCK_SKEW_SECONDS
+        )
+        if not (request_shape_valid and capability_matches and instance_matches):
+            return False
+
+        with self._lock:
+            self._used_nonces = {
+                nonce: expires_at
+                for nonce, expires_at in self._used_nonces.items()
+                if expires_at >= now
+            }
+            if (
+                provided_nonce in self._used_nonces
+                or len(self._used_nonces) >= PAID_GATEWAY_MAX_REPLAY_ENTRIES
+            ):
+                return False
+            self._used_nonces[provided_nonce] = (
+                parsed_timestamp + PAID_GATEWAY_MAX_CLOCK_SKEW_SECONDS
+            )
+        return True
+
+
+def _paid_gateway_authorizer_from_environment(
+    environ: Mapping[str, str] | None = None,
+) -> _PaidGatewayAuthorizer | None:
+    source = os.environ if environ is None else environ
+    mode = str(source.get(PAID_EXCLUSIVE_MODE_ENV, ""))
+    if mode in {"", "0"}:
+        return None
+    if mode != "1":
+        raise PaidGatewayConfigurationError(f"{PAID_EXCLUSIVE_MODE_ENV} must be 0 or 1")
+    return _PaidGatewayAuthorizer(source.get(PAID_GATEWAY_SECRET_ENV, ""))
+
+
+def _paid_gateway_request_body(request: Any) -> bytes:
+    """Read and rewind one bounded Bottle body before any route side effect."""
+
+    stream = getattr(request, "body", None)
+    if stream is None:
+        raise ValueError("paid gateway request body is unavailable")
+    try:
+        stream.seek(0)
+        payload = stream.read(MAX_REQUEST_BYTES + 1)
+        stream.seek(0)
+    except (AttributeError, OSError, ValueError) as exc:
+        raise ValueError("paid gateway request body is unreadable") from exc
+    if not isinstance(payload, bytes) or len(payload) > MAX_REQUEST_BYTES:
+        raise ValueError("paid gateway request body is invalid")
+    return payload
+
+
+def _install_paid_gateway_hook(
+    app: Any,
+    *,
+    request: Any,
+    abort: Any,
+    authorizer: _PaidGatewayAuthorizer,
+) -> Any:
+    """Protect every paid-instance ``/v1`` operation before route dispatch."""
+
+    @app.hook("before_request")
+    def paid_gateway_authorization_hook() -> None:
+        method = str(getattr(request, "method", "") or "").upper()
+        path = str(getattr(request, "path", "") or "")
+        if method == "GET" and path in {
+            "/health",
+            "/v1/whoscored/runtime-identity",
+        }:
+            return
+        if path != "/v1" and not path.startswith("/v1/"):
+            return
+        try:
+            body = _paid_gateway_request_body(request)
+            capability_accepted = authorizer.authorize(
+                method=method,
+                path=path,
+                query_string=str(getattr(request, "query_string", "") or ""),
+                body=body,
+                headers=getattr(request, "headers", {}),
+            )
+            content_type = str(getattr(request, "content_type", "") or "")
+            accepted = bool(
+                capability_accepted
+                and method == "POST"
+                and content_type.split(";", 1)[0].lower() == "application/json"
+            )
+        except (TypeError, ValueError):
+            accepted = False
+        if not accepted:
+            # Keep the response deliberately generic.  In particular, never
+            # expose whether timestamp, nonce, body binding or HMAC was wrong.
+            abort(401, "Paid FlareSolverr capability required.")
+
+    return paid_gateway_authorization_hook
 
 
 class _XhrStartPacer:
@@ -646,6 +1004,10 @@ def _install_safe_v1_controller(upstream_service: Any, *, version: str) -> None:
             result.startTimestamp = start_ts
             result.endTimestamp = int(time.time() * 1_000)
             result.version = utils_module.get_flaresolverr_version()
+            # Every stock /v1 response is also a runtime-identity receipt.  The
+            # WhoScored client verifies this before it accepts browser output,
+            # creates a paid session, or attributes any response bytes.
+            result.extension_sha256 = EXTENSION_SHA256
             logging.info(
                 "Response in %s s",
                 (result.endTimestamp - result.startTimestamp) / 1_000,
@@ -1538,12 +1900,8 @@ def _execute_browser_batch_fetch(
         responses: list[Any] = []
         response_bytes = 0
         for wave_start in range(0, len(request_data.urls), BATCH_CONCURRENCY):
-            wave_urls = request_data.urls[
-                wave_start : wave_start + BATCH_CONCURRENCY
-            ]
-            wave_indexes = tuple(
-                range(wave_start, wave_start + len(wave_urls))
-            )
+            wave_urls = request_data.urls[wave_start : wave_start + BATCH_CONCURRENCY]
+            wave_indexes = tuple(range(wave_start, wave_start + len(wave_urls)))
             for item_index, url in zip(wave_indexes, wave_urls):
                 acknowledgement = _launch_browser_fetch(
                     driver,
@@ -1890,6 +2248,30 @@ def _version(version_getter: Any) -> str:
         return "unknown"
 
 
+def runtime_identity_response(
+    *,
+    paid_gateway_authorizer: _PaidGatewayAuthorizer | None = None,
+) -> dict[str, Any]:
+    """Return the side-effect-free identity of the image-baked extension."""
+
+    response: dict[str, Any] = {
+        "status": "ok",
+        "version": PINNED_FLARESOLVERR_VERSION,
+        "extension_sha256": EXTENSION_SHA256,
+    }
+    if paid_gateway_authorizer is not None:
+        # This random, non-secret process identity makes every capability die
+        # across a restart even while its short wall-clock window remains open.
+        response.update(
+            {
+                "paid_exclusive": True,
+                "capability_schema": PAID_GATEWAY_CAPABILITY_SCHEMA,
+                "capability_instance_id": paid_gateway_authorizer.instance_id,
+            }
+        )
+    return response
+
+
 def handle_xhr_request(
     payload: Any,
     *,
@@ -1969,6 +2351,7 @@ def handle_xhr_request(
                 "startTimestamp": start_ms,
                 "endTimestamp": end_ms,
                 "version": api_version,
+                "extension_sha256": EXTENSION_SHA256,
             },
             200,
         )
@@ -1980,6 +2363,7 @@ def handle_xhr_request(
                 "startTimestamp": start_ms,
                 "endTimestamp": int(time.time() * 1_000),
                 "version": api_version,
+                "extension_sha256": EXTENSION_SHA256,
             },
             exc.http_status,
         )
@@ -1992,6 +2376,7 @@ def handle_xhr_request(
                 "startTimestamp": start_ms,
                 "endTimestamp": int(time.time() * 1_000),
                 "version": api_version,
+                "extension_sha256": EXTENSION_SHA256,
             },
             500,
         )
@@ -2073,6 +2458,7 @@ def handle_xhr_batch_request(
                 "startTimestamp": start_ms,
                 "endTimestamp": end_ms,
                 "version": api_version,
+                "extension_sha256": EXTENSION_SHA256,
             },
             200,
         )
@@ -2084,6 +2470,7 @@ def handle_xhr_batch_request(
                 "startTimestamp": start_ms,
                 "endTimestamp": int(time.time() * 1_000),
                 "version": api_version,
+                "extension_sha256": EXTENSION_SHA256,
             },
             exc.http_status,
         )
@@ -2096,19 +2483,44 @@ def handle_xhr_batch_request(
                 "startTimestamp": start_ms,
                 "endTimestamp": int(time.time() * 1_000),
                 "version": api_version,
+                "extension_sha256": EXTENSION_SHA256,
             },
             500,
         )
 
 
-def create_app() -> Any:
+def create_app(
+    *,
+    paid_gateway_authorizer: _PaidGatewayAuthorizer | None | object = (
+        _PAID_GATEWAY_ENV_UNSET
+    ),
+) -> Any:
     """Import the upstream app lazily and register the restricted route."""
 
     from bottle import request, response
 
+    if paid_gateway_authorizer is _PAID_GATEWAY_ENV_UNSET:
+        resolved_paid_gateway_authorizer = _paid_gateway_authorizer_from_environment()
+    elif paid_gateway_authorizer is None or isinstance(
+        paid_gateway_authorizer, _PaidGatewayAuthorizer
+    ):
+        resolved_paid_gateway_authorizer = paid_gateway_authorizer
+    else:
+        raise PaidGatewayConfigurationError("paid gateway authorizer is invalid")
+
     import flaresolverr as upstream
     import flaresolverr_service
     import utils
+
+    if resolved_paid_gateway_authorizer is not None:
+        from bottle import abort
+
+        _install_paid_gateway_hook(
+            upstream.app,
+            request=request,
+            abort=abort,
+            authorizer=resolved_paid_gateway_authorizer,
+        )
 
     upstream_version = str(utils.get_flaresolverr_version())
     _install_safe_logging()
@@ -2124,6 +2536,12 @@ def create_app() -> Any:
         flaresolverr_service,
         version=upstream_version,
     )
+
+    @upstream.app.get("/v1/whoscored/runtime-identity")
+    def controller_runtime_identity() -> dict[str, Any]:
+        return runtime_identity_response(
+            paid_gateway_authorizer=resolved_paid_gateway_authorizer
+        )
 
     @upstream.app.post("/v1/xhr")
     def controller_xhr() -> dict[str, Any]:
@@ -2253,6 +2671,11 @@ def main() -> None:
     if sys.version_info < (3, 9):
         raise RuntimeError("Python 3.9 or newer is required.")
 
+    # Validate paid-exclusive authority before importing the container app or
+    # running its browser self-test.  A missing/weak secret must cause a clean
+    # startup failure before any browser or source side effect.
+    paid_gateway_authorizer = _paid_gateway_authorizer_from_environment()
+
     # All container-only imports remain below this point.
     import certifi
     from bottle import ServerAdapter, run
@@ -2298,8 +2721,9 @@ def main() -> None:
     logging.getLogger("undetected_chromedriver").setLevel(logging.WARNING)
     upstream_version = str(utils.get_flaresolverr_version())
     logging.info(
-        "FlareSolverr %s with restricted WhoScored XHR",
+        "FlareSolverr %s with restricted WhoScored XHR (%s mode)",
         upstream_version,
+        "paid-exclusive" if paid_gateway_authorizer is not None else "direct",
     )
 
     # Install before the upstream browser self-test or any request handling.
@@ -2319,7 +2743,7 @@ def main() -> None:
     )
     utils.get_current_platform()
     flaresolverr_service.test_browser_installation()
-    app = create_app()
+    app = create_app(paid_gateway_authorizer=paid_gateway_authorizer)
     app.install(logger_plugin)
     app.install(error_plugin)
     prometheus_plugin.setup()

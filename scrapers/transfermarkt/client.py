@@ -123,23 +123,9 @@ def _tls_requests_compatible_proxy_url(proxy_url: str) -> str:
 
 
 def _control_token_from_environment() -> str:
-    """Return the proxy filter's control token.
+    """Return the Transfermarkt-only proxy-filter control token."""
 
-    One filter guards the paid exit for every source, so there is one control
-    secret.  It is deployed under the name of the source that first needed it
-    (``SOFASCORE_PROXY_CONTROL_TOKEN``); ``TM_PROXY_CONTROL_TOKEN`` overrides it
-    where the deployment names it per source.
-    """
-
-    for name in (
-        "TM_PROXY_CONTROL_TOKEN",
-        "PROXY_FILTER_CONTROL_TOKEN",
-        "SOFASCORE_PROXY_CONTROL_TOKEN",
-    ):
-        value = str(os.environ.get(name, "")).strip()
-        if value:
-            return value
-    return ""
+    return str(os.environ.get("TM_PROXY_CONTROL_TOKEN", "")).strip()
 
 
 class ProxyFilterLeaseProvider:

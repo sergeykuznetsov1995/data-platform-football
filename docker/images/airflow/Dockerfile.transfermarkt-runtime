@@ -3,7 +3,7 @@
 # The live Airflow runtime is newer than the repository's legacy full-image
 # Dockerfile.  Build this small overlay on the already verified production
 # runtime base; do not re-resolve or downgrade the shared Airflow environment.
-ARG AIRFLOW_RUNTIME_BASE=data-platform-airflow-webserver:latest
+ARG AIRFLOW_RUNTIME_BASE=data-platform-airflow-base:2.11.2-whoscored
 FROM ${AIRFLOW_RUNTIME_BASE}
 
 USER airflow

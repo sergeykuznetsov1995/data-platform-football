@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 
 import pytest
 
 import scrapers.whoscored.parsers as whoscored_parsers
 from scrapers.whoscored.catalog import (
     apply_schedule_classification,
+    build_technical_exclusion_audit,
     CatalogError,
+    classify_tournament,
     DEFAULT_TOURNAMENT_OVERRIDES,
     TournamentOverride,
     WhoScoredCatalog,
@@ -40,6 +43,7 @@ from scrapers.whoscored.parsers import (
     parse_tournament_seasons,
     schema_fingerprint,
 )
+from scrapers.whoscored.repository import canonical_catalog_rows
 
 
 SCOPE = WhoScoredScope("WS-252-2", "2526", SeasonFormat.SPLIT_YEAR)
@@ -111,7 +115,7 @@ def test_all_regions_classifies_every_tournament_without_defaulting_to_men():
     assert by_id[4]["eligibility"] == "excluded_youth"
     assert by_id[5]["eligibility"] == "included"
     assert by_id[6]["eligibility"] == "quarantined"
-    assert by_id[7]["eligibility"] == "excluded_youth"
+    assert by_id[7]["eligibility"] == "excluded_reserve"
     assert by_id[8]["eligibility"] == "excluded_youth"
     assert by_id[9]["eligibility"] == "excluded_women"
     assert by_id[10]["eligibility"] == "excluded_women"
@@ -149,6 +153,458 @@ def test_versioned_override_is_an_exception_not_an_allow_list():
     assert rows[0]["override_version"] == "review-7"
     assert rows[0]["eligibility"] == "included"
     assert rows[1]["eligibility"] == "quarantined"
+
+
+@pytest.mark.unit
+def test_reserve_markers_have_a_distinct_disposition_from_youth():
+    names = {
+        20: "Reserve League",
+        21: "National B-Team Cup",
+        22: "Development League",
+        23: "Premier League 2",
+        24: "National U21 League",
+    }
+    rows = parse_all_regions(
+        [
+            {
+                "id": 1,
+                "name": "Test Region",
+                "tournaments": [
+                    {"id": tournament_id, "name": name, "sex": 1}
+                    for tournament_id, name in names.items()
+                ],
+            }
+        ],
+        overrides=(),
+    ).rows
+
+    by_id = {row["tournament_id"]: row for row in rows}
+    assert {
+        by_id[tournament_id]["eligibility"] for tournament_id in (20, 21, 22, 23)
+    } == {"excluded_reserve"}
+    assert by_id[24]["eligibility"] == "excluded_youth"
+    assert by_id[20]["classification_reason"] == "name_marks_reserve"
+
+
+@pytest.mark.unit
+def test_technical_exclusion_requires_a_versioned_source_id_override():
+    rows = parse_all_regions(
+        [
+            {
+                "id": 1,
+                "name": "Test Region",
+                "tournaments": [
+                    {"id": 30, "name": "Technical Tournament"},
+                    {"id": 31, "name": "Technical Tournament"},
+                ],
+            }
+        ],
+        overrides=(
+            TournamentOverride(
+                30,
+                TournamentEligibility.EXCLUDED_TECHNICAL,
+                "duplicate source shell",
+                version="technical-review-1",
+                canonical_competition_id="WS-1-31",
+            ),
+        ),
+    ).rows
+
+    by_id = {row["tournament_id"]: row for row in rows}
+    assert by_id[30]["eligibility"] == "excluded_technical"
+    assert by_id[30]["override_version"] == "technical-review-1"
+    assert by_id[30]["classification_reason"] == (
+        "explicit_override:duplicate source shell"
+    )
+    assert by_id[31]["eligibility"] == "quarantined"
+    assert by_id[31]["override_version"] is None
+
+    catalog = WhoScoredCatalog.from_rows(
+        {"competitions": [by_id[30]], "seasons": [], "stages": []}
+    )
+    assert (
+        catalog.competition(by_id[30]["competition_id"]).eligibility
+        is TournamentEligibility.EXCLUDED_TECHNICAL
+    )
+    assert catalog.quarantined == ()
+
+
+@pytest.mark.unit
+def test_technical_canonical_binding_is_not_used_as_an_identity_alias():
+    overrides = (
+        TournamentOverride(
+            30,
+            TournamentEligibility.EXCLUDED_TECHNICAL,
+            "duplicate source shell",
+            version="technical-review-identity-1",
+            canonical_competition_id="WS-1-31",
+        ),
+    )
+    parsed = parse_all_regions(
+        [
+            {
+                "id": 1,
+                "name": "Test Region",
+                "tournaments": [
+                    {"id": 30, "name": "Duplicate Cup", "sex": 1},
+                    {"id": 31, "name": "duplicate cup", "sex": 1},
+                ],
+            }
+        ],
+        overrides=overrides,
+        competition_aliases={(1, 30): "WS-1-31"},
+    ).rows
+    by_id = {row["tournament_id"]: row for row in parsed}
+
+    assert by_id[30]["competition_id"] == "WS-1-30"
+    assert by_id[31]["competition_id"] == "WS-1-31"
+    canonical = canonical_catalog_rows(
+        {"competitions": parsed, "seasons": (), "stages": ()}
+    )
+    catalog = WhoScoredCatalog.from_rows(canonical)
+    assert len(catalog.competitions) == 2
+    audit = build_technical_exclusion_audit(
+        canonical,
+        source_snapshot_sha256="f" * 64,
+        overrides=overrides,
+    )
+    assert audit["unresolved_candidate_count"] == 0
+    assert audit["components"][0]["canonical_competition_id"] == "WS-1-31"
+
+
+@pytest.mark.unit
+def test_technical_audit_is_snapshot_bound_and_requires_versioned_id_review():
+    rows = {
+        "competitions": [
+            {
+                "competition_id": "WS-1-30",
+                "region_id": 1,
+                "tournament_id": 30,
+                "tournament_name": "Duplicate Cup",
+                "tournament_url": "/Regions/1/Tournaments/31/Show/Cup",
+                "eligibility": "excluded_technical",
+            },
+            {
+                "competition_id": "WS-1-31",
+                "region_id": 1,
+                "tournament_id": 31,
+                "tournament_name": "duplicate  cup",
+                "tournament_url": "/Regions/1/Tournaments/31/Show/Cup/",
+                "eligibility": "included",
+            },
+        ],
+        "seasons": [],
+        "stages": [
+            {
+                "competition_id": "WS-1-30",
+                "tournament_id": 30,
+                "stage_id": 700,
+            },
+            {
+                "competition_id": "WS-1-31",
+                "tournament_id": 31,
+                "stage_id": 700,
+            },
+        ],
+    }
+
+    unresolved = build_technical_exclusion_audit(
+        rows,
+        source_snapshot_sha256="a" * 64,
+        overrides=(),
+    )
+    assert unresolved["source_snapshot_sha256"] == "a" * 64
+    assert unresolved["candidate_count"] == 3
+    assert unresolved["unresolved_candidate_count"] == 3
+    assert {item["candidate_type"] for item in unresolved["candidates"]} == {
+        "normalized_name_within_region",
+        "canonical_tournament_link",
+        "stage_id_overlap",
+    }
+    assert {item["review_disposition"] for item in unresolved["candidates"]} == {
+        "requires_versioned_source_id_review"
+    }
+
+    reviewed = build_technical_exclusion_audit(
+        rows,
+        source_snapshot_sha256="a" * 64,
+        overrides=(
+            TournamentOverride(
+                30,
+                TournamentEligibility.EXCLUDED_TECHNICAL,
+                "duplicate source shell",
+                version="technical-review-1",
+                canonical_competition_id="WS-1-31",
+            ),
+        ),
+    )
+    assert reviewed["candidate_count"] == 3
+    assert reviewed["unresolved_candidate_count"] == 0
+    assert reviewed["technical_override_registry"] == [
+        {
+            "tournament_id": 30,
+            "reason": "duplicate source shell",
+            "version": "technical-review-1",
+            "canonical_competition_id": "WS-1-31",
+            "present_in_source_snapshot": True,
+            "component_id": "component-0001",
+        }
+    ]
+    assert {
+        tuple(item["canonical_tournament_ids"]) for item in reviewed["candidates"]
+    } == {
+        (31,)
+    }
+
+
+@pytest.mark.unit
+def test_technical_audit_records_a_reproducible_zero_candidate_result():
+    report = build_technical_exclusion_audit(
+        {
+            "competitions": [
+                {
+                    "competition_id": "WS-1-31",
+                    "region_id": 1,
+                    "tournament_id": 31,
+                    "tournament_name": "Unique Cup",
+                    "tournament_url": "/Regions/1/Tournaments/31/Show/Cup",
+                    "eligibility": "included",
+                }
+            ],
+            "seasons": [],
+            "stages": [],
+        },
+        source_snapshot_sha256="b" * 64,
+        overrides=(),
+    )
+
+    assert report == {
+        "schema_version": 1,
+        "audit_type": "whoscored_technical_exclusion_audit",
+        "source_snapshot_sha256": "b" * 64,
+        "classifier_version": "senior-men-v3",
+        "technical_override_registry": [],
+        "candidate_count": 0,
+        "unresolved_candidate_count": 0,
+        "component_count": 0,
+        "unresolved_component_count": 0,
+        "candidates": [],
+        "components": [],
+    }
+
+
+@pytest.mark.unit
+def test_technical_audit_rejects_a_present_orphan_override():
+    rows = {
+        "competitions": [
+            {
+                "competition_id": "WS-1-30",
+                "region_id": 1,
+                "tournament_id": 30,
+                "tournament_name": "Unique Cup",
+                "tournament_url": "/Regions/1/Tournaments/30/Show/Unique-Cup",
+                "eligibility": "excluded_technical",
+            }
+        ],
+        "seasons": [],
+        "stages": [],
+    }
+    report = build_technical_exclusion_audit(
+        rows,
+        source_snapshot_sha256="c" * 64,
+        overrides=(
+            TournamentOverride(
+                30,
+                TournamentEligibility.EXCLUDED_TECHNICAL,
+                "stale duplicate decision",
+                version="technical-review-2",
+                canonical_competition_id="WS-1-31",
+            ),
+        ),
+    )
+
+    assert report["candidate_count"] == 1
+    assert report["unresolved_candidate_count"] == 1
+    assert report["unresolved_component_count"] == 1
+    assert report["candidates"][0]["candidate_type"] == (
+        "technical_override_without_duplicate_evidence"
+    )
+    assert "component_has_0_canonical_tournaments" in report["components"][0][
+        "validation_failures"
+    ]
+
+
+@pytest.mark.unit
+def test_technical_audit_resolves_connected_signals_as_one_component():
+    rows = {
+        "competitions": [
+            {
+                "competition_id": "WS-1-30",
+                "region_id": 1,
+                "tournament_id": 30,
+                "tournament_name": "Shared Cup",
+                "tournament_url": "/shared-link",
+                "eligibility": "excluded_technical",
+            },
+            {
+                "competition_id": "WS-1-31",
+                "region_id": 1,
+                "tournament_id": 31,
+                "tournament_name": "shared cup",
+                "tournament_url": "/only-b",
+                "eligibility": "included",
+            },
+            {
+                "competition_id": "WS-1-32",
+                "region_id": 1,
+                "tournament_id": 32,
+                "tournament_name": "Other Cup",
+                "tournament_url": "/shared-link/",
+                "eligibility": "included",
+            },
+        ],
+        "seasons": [],
+        "stages": [],
+    }
+    report = build_technical_exclusion_audit(
+        rows,
+        source_snapshot_sha256="d" * 64,
+        overrides=(
+            TournamentOverride(
+                30,
+                TournamentEligibility.EXCLUDED_TECHNICAL,
+                "duplicate source shell",
+                version="technical-review-3",
+                canonical_competition_id="WS-1-31",
+            ),
+        ),
+    )
+
+    assert report["candidate_count"] == 2
+    assert report["component_count"] == 1
+    assert report["unresolved_candidate_count"] == 2
+    assert report["unresolved_component_count"] == 1
+    assert report["components"][0]["canonical_tournament_ids"] == [31, 32]
+    assert "component_has_2_canonical_tournaments" in report["components"][0][
+        "validation_failures"
+    ]
+    assert {item["component_id"] for item in report["candidates"]} == {
+        "component-0001"
+    }
+
+
+@pytest.mark.unit
+def test_technical_audit_enforces_the_canonical_competition_binding():
+    rows = {
+        "competitions": [
+            {
+                "competition_id": "WS-1-30",
+                "region_id": 1,
+                "tournament_id": 30,
+                "tournament_name": "Shared Cup",
+                "eligibility": "excluded_technical",
+            },
+            {
+                "competition_id": "WS-1-31",
+                "region_id": 1,
+                "tournament_id": 31,
+                "tournament_name": "shared cup",
+                "eligibility": "included",
+            },
+        ],
+        "seasons": [],
+        "stages": [],
+    }
+    report = build_technical_exclusion_audit(
+        rows,
+        source_snapshot_sha256="e" * 64,
+        overrides=(
+            TournamentOverride(
+                30,
+                TournamentEligibility.EXCLUDED_TECHNICAL,
+                "duplicate source shell",
+                version="technical-review-4",
+                canonical_competition_id="WS-1-999",
+            ),
+        ),
+    )
+
+    assert report["unresolved_candidate_count"] == 1
+    assert "override_30_canonical_competition_mismatch" in report["components"][
+        0
+    ]["validation_failures"]
+
+
+@pytest.mark.unit
+def test_technical_audit_requires_an_included_canonical_survivor():
+    rows = {
+        "competitions": [
+            {
+                "competition_id": "WS-1-30",
+                "region_id": 1,
+                "tournament_id": 30,
+                "tournament_name": "Shared Cup",
+                "eligibility": "excluded_technical",
+            },
+            {
+                "competition_id": "WS-1-31",
+                "region_id": 1,
+                "tournament_id": 31,
+                "tournament_name": "shared cup",
+                "eligibility": "excluded_women",
+            },
+        ],
+        "seasons": [],
+        "stages": [],
+    }
+    report = build_technical_exclusion_audit(
+        rows,
+        source_snapshot_sha256="1" * 64,
+        overrides=(
+            TournamentOverride(
+                30,
+                TournamentEligibility.EXCLUDED_TECHNICAL,
+                "duplicate source shell",
+                version="technical-review-6",
+                canonical_competition_id="WS-1-31",
+            ),
+        ),
+    )
+
+    assert report["unresolved_candidate_count"] == 1
+    assert "canonical_tournament_is_not_included" in report["components"][0][
+        "validation_failures"
+    ]
+
+
+@pytest.mark.unit
+def test_technical_override_requires_a_canonical_competition_binding():
+    with pytest.raises(CatalogError, match="has no canonical competition id"):
+        TournamentOverride(
+            30,
+            TournamentEligibility.EXCLUDED_TECHNICAL,
+            "duplicate source shell",
+            version="technical-review-5",
+        )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (("reason", ""), ("reason", None), ("version", "  "), ("version", None)),
+)
+def test_tournament_override_requires_audit_metadata(field, value):
+    kwargs = {
+        "tournament_id": 30,
+        "eligibility": TournamentEligibility.EXCLUDED_TECHNICAL,
+        "reason": "duplicate source shell",
+        "version": "technical-review-1",
+        "canonical_competition_id": "WS-1-31",
+    }
+    kwargs[field] = value
+
+    with pytest.raises(CatalogError, match=f"has no {field}"):
+        TournamentOverride(**kwargs)
 
 
 @pytest.mark.unit
@@ -213,6 +669,59 @@ def test_default_overrides_cover_only_audited_empty_calendar_senior_men():
     contradictory_by_id = {row["tournament_id"]: row for row in contradictory}
     assert contradictory_by_id[599]["eligibility"] == "excluded_women"
     assert contradictory_by_id[23]["eligibility"] == "excluded_youth"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "source_sex",
+    (
+        1.5,
+        0.5,
+        Decimal("1.5"),
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        2,
+        -1,
+        True,
+    ),
+)
+def test_non_exact_source_sex_never_fails_open_or_crashes(source_sex):
+    classification = classify_tournament(
+        tournament_id=999999,
+        tournament_name="Unverified Cup",
+        source_sex=source_sex,
+        overrides=(),
+    )
+
+    assert classification.source_sex is None
+    assert classification.eligibility is TournamentEligibility.QUARANTINED
+    assert classification.reason in {
+        "source_sex_is_boolean",
+        "source_sex_is_unknown",
+    }
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "source_sex",
+    (0, 1, 0.0, 1.0, Decimal("0"), Decimal("1"), "0", "1"),
+)
+def test_exact_binary_source_sex_is_accepted(source_sex):
+    classification = classify_tournament(
+        tournament_id=999999,
+        tournament_name="Verified Cup",
+        source_sex=source_sex,
+        overrides=(),
+    )
+
+    assert classification.source_sex in {0, 1}
+    expected = (
+        TournamentEligibility.INCLUDED
+        if classification.source_sex == 1
+        else TournamentEligibility.EXCLUDED_WOMEN
+    )
+    assert classification.eligibility is expected
 
 
 @pytest.mark.unit
@@ -431,6 +940,54 @@ def test_discovered_catalog_round_trip_and_active_legacy_compatible_scope():
     assert active[0].stage_ids == (700,)
     assert catalog.resolve_scope("WS-252-2", "2526") == active[0]
     assert WhoScoredCatalog.from_rows(catalog.to_rows()).to_rows() == catalog.to_rows()
+
+
+@pytest.mark.unit
+def test_discovered_catalog_preserves_legacy_exclusion_rows():
+    legacy_row = {
+        "competition_id": "WS-1-20",
+        "region_id": 1,
+        "tournament_id": 20,
+        "tournament_name": "Reserve League",
+        "eligibility": "excluded_youth",
+        "classification_reason": "name_marks_youth",
+        "classifier_version": "senior-men-v2",
+    }
+
+    catalog = WhoScoredCatalog.from_rows(
+        {"competitions": [legacy_row], "seasons": [], "stages": []}
+    )
+
+    competition = catalog.competition("WS-1-20")
+    assert competition.eligibility is TournamentEligibility.EXCLUDED_YOUTH
+    assert competition.whoscored_enabled is False
+    assert catalog.to_rows()["competitions"] == (legacy_row,)
+
+
+@pytest.mark.unit
+def test_unversioned_persisted_technical_exclusion_is_quarantined_losslessly():
+    untrusted_row = {
+        "competition_id": "WS-1-30",
+        "region_id": 1,
+        "tournament_id": 30,
+        "tournament_name": "Technical Tournament",
+        "eligibility": "excluded_technical",
+        "classification_reason": "explicit_override:duplicate source shell",
+        "classifier_version": "senior-men-v3",
+        "override_version": None,
+    }
+
+    catalog = WhoScoredCatalog.from_rows(
+        {"competitions": [untrusted_row], "seasons": [], "stages": []}
+    )
+
+    competition = catalog.competition("WS-1-30")
+    assert competition.eligibility is TournamentEligibility.QUARANTINED
+    assert competition.classification_reason == (
+        "excluded_technical_without_override_version"
+    )
+    assert catalog.quarantined[0]["eligibility"] == "quarantined"
+    assert catalog.to_rows()["competitions"] == (untrusted_row,)
 
 
 @pytest.mark.unit

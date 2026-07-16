@@ -1276,7 +1276,7 @@ with DAG(
         task_id="prepare_sofascore_season_plan",
         bash_command=f"""
 cd /opt/airflow && \\
-python dags/scripts/prepare_sofascore_workload.py \\
+/opt/legacy-scraper-venv/bin/python dags/scripts/prepare_sofascore_workload.py \\
     --dag-id dag_ingest_sofascore \\
     --run-id "{{{{ run_id }}}}" \\
     --phase season \\
@@ -1295,7 +1295,7 @@ python dags/scripts/prepare_sofascore_workload.py \\
         task_id="prepare_sofascore_target_plan",
         bash_command=f"""
 cd /opt/airflow && \\
-python dags/scripts/prepare_sofascore_workload.py \\
+/opt/legacy-scraper-venv/bin/python dags/scripts/prepare_sofascore_workload.py \\
     --dag-id dag_ingest_sofascore \\
     --run-id "{{{{ run_id }}}}" \\
     --phase targets \\
@@ -1326,7 +1326,7 @@ python dags/scripts/prepare_sofascore_workload.py \\
         task_id="prepare_sofascore_player_plan",
         bash_command=f"""
 cd /opt/airflow && \\
-python dags/scripts/prepare_sofascore_workload.py \\
+/opt/legacy-scraper-venv/bin/python dags/scripts/prepare_sofascore_workload.py \\
     --dag-id dag_ingest_sofascore \\
     --run-id "{{{{ run_id }}}}" \\
     --phase players \\
@@ -1348,7 +1348,7 @@ python dags/scripts/prepare_sofascore_workload.py \\
 cd /opt/airflow && \\
 {RESULT_DIR_BASH}
 rm -f "$SOFASCORE_RESULT_DIR/{Path(SCHEDULE_RESULT_PATH).name}" && \\
-python dags/scripts/run_sofascore_scraper.py \\
+/opt/legacy-scraper-venv/bin/python dags/scripts/run_sofascore_scraper.py \\
     --league "{PRIMARY_CLUB_LEAGUE}" \\
     --season {{{{ params.season }}}} \\
     --workload-plan "{SEASON_PLAN_XCOM}" \\
@@ -1377,7 +1377,7 @@ python dags/scripts/run_sofascore_scraper.py \\
 cd /opt/airflow && \\
 {RESULT_DIR_BASH}
 rm -f "$SOFASCORE_RESULT_DIR/sofascore_result_{_schedule_slug}.json" && \\
-python dags/scripts/run_sofascore_scraper.py \\
+/opt/legacy-scraper-venv/bin/python dags/scripts/run_sofascore_scraper.py \\
     --league "{_schedule_league}" \\
     --season {_schedule_season} \\
     --workload-plan "{SEASON_PLAN_XCOM}" \\
@@ -1425,7 +1425,7 @@ python dags/scripts/run_sofascore_scraper.py \\
 cd /opt/airflow && \\
 {RESULT_DIR_BASH}
 rm -f "$SOFASCORE_RESULT_DIR/{_mc_output}" && \\
-python dags/scripts/run_sofascore_scraper.py \\
+/opt/legacy-scraper-venv/bin/python dags/scripts/run_sofascore_scraper.py \\
     --entity match_capture \\
     --league "{_league}" \\
     --season {_mc_season} \\
@@ -1485,7 +1485,7 @@ python dags/scripts/run_sofascore_scraper.py \\
 cd /opt/airflow && \\
 {RESULT_DIR_BASH}
 rm -f "$SOFASCORE_RESULT_DIR/{Path(PLAYER_CAPTURE_RESULT_PATH).name}" && \\
-python dags/scripts/run_sofascore_scraper.py \\
+/opt/legacy-scraper-venv/bin/python dags/scripts/run_sofascore_scraper.py \\
     --entity player_capture \\
     --league "{PRIMARY_CLUB_LEAGUE}" \\
     --season {{{{ params.season }}}} \\
@@ -1516,7 +1516,7 @@ python dags/scripts/run_sofascore_scraper.py \\
 cd /opt/airflow && \\
 {RESULT_DIR_BASH}
 rm -f "$SOFASCORE_RESULT_DIR/{_player_output}" && \\
-python dags/scripts/run_sofascore_scraper.py \\
+/opt/legacy-scraper-venv/bin/python dags/scripts/run_sofascore_scraper.py \\
     --entity player_capture \\
     --league "{_player_league}" \\
     --season {_player_season} \\

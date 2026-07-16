@@ -134,12 +134,12 @@ ssh -L 8180:127.0.0.1:8180 -L 8585:127.0.0.1:8585 root@159.195.193.250
 Пайплайны не зависят от Keycloak и продолжают работать. Для входа людей:
 
 - Airflow: `AIRFLOW_OAUTH_ENABLED=false` в `.env` →
-  `docker compose up -d --no-deps airflow-webserver` → форма пароля (локальный admin).
-- Superset: `SUPERSET_OAUTH_ENABLED=false` → `docker compose up -d --no-deps superset`.
+  `./scripts/compose.sh up -d --no-deps airflow-webserver` → форма пароля (локальный admin).
+- Superset: `SUPERSET_OAUTH_ENABLED=false` → `./scripts/compose.sh up -d --no-deps superset`.
 - Trino: машинные аккаунты и `analyst_svc` работают по password.db всегда.
 - OpenMetadata: закомментировать блок `OM_AUTH_*` в `.env` (ключи `OM_RSA_*`
   оставить!) + закомментировать meta-блок Caddyfile (`caddy reload`) →
-  `docker compose --profile heavy up -d openmetadata-server` → basic-вход
+  `./scripts/compose.sh --profile heavy up -d --no-deps openmetadata-server` → basic-вход
   локальным `admin` через SSH-туннель. Ingestion (бот-JWT) не зависит от
   Keycloak и работает всё это время.
 - Админ-доступ по SSH-туннелям (127.0.0.1-порты) никуда не делся.

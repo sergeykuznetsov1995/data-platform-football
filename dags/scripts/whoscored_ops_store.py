@@ -22,6 +22,7 @@ from typing import Any, Callable, Iterable, Mapping, Optional, TypeVar
 from pyarrow import fs
 
 from scrapers.whoscored.raw_store import WhoScoredRawStore
+from scrapers.whoscored.runtime_contract import require_production_runtime_class
 
 
 OPS_SCHEMA_VERSION = 1
@@ -142,6 +143,9 @@ class WhoScoredOpsStore:
     """Append-only JSON objects co-located with the WhoScored raw store."""
 
     def __init__(self, raw_store: WhoScoredRawStore, prefix: str = "ops") -> None:
+        require_production_runtime_class(
+            operation="WhoScored operational persistence"
+        )
         self.raw_store = raw_store
         self.filesystem = raw_store.filesystem
         self.root = str(PurePosixPath(raw_store.root) / prefix.strip("/"))

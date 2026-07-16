@@ -11,7 +11,12 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 from urllib.parse import urlencode, urljoin
 
-from .catalog import CatalogSeason, WhoScoredCatalog, apply_schedule_classification
+from .catalog import (
+    CatalogSeason,
+    WhoScoredCatalog,
+    apply_schedule_classification,
+    build_technical_exclusion_audit,
+)
 from .domain import SeasonFormat, TournamentEligibility, WhoScoredScope
 from .detailed_feeds import (
     DETAILED_FEED_CATALOG,
@@ -62,11 +67,20 @@ from .stage_feeds import (
     stage_team_feed_url,
 )
 from .repository import (
+    canonical_catalog_raw_inputs,
     canonical_catalog_rows,
+    catalog_raw_provenance_sha256,
     catalog_payload_sha256,
+    entity_id_payload_sha256,
+    deterministic_match_not_available_batch_id,
+    deterministic_preview_not_available_batch_id,
+    deterministic_profile_not_available_batch_id,
     ManifestFailure,
     MatchCommit,
     MATCH_REFRESH_DAYS,
+    MATCH_NOT_AVAILABLE_BATCH_ID_PREFIX,
+    PREVIEW_NOT_AVAILABLE_BATCH_ID_PREFIX,
+    PROFILE_NOT_AVAILABLE_BATCH_ID_PREFIX,
     PROFILE_REFRESH_DAYS,
     ProfileCommit,
     PreviewCommit,
@@ -87,6 +101,12 @@ from .transport import (
 )
 
 _SOURCE_STAGE_HEADER_UNAVAILABLE = "WhoScored page request header is unavailable."
+
+
+def _is_lower_sha256(value: str) -> bool:
+    return len(value) == 64 and all(
+        character in "0123456789abcdef" for character in value
+    )
 
 
 def _is_source_stage_statistics_unavailable(exc: WhoScoredTransportError) -> bool:
@@ -202,6 +222,8 @@ class EntityResult:
     terminal: list[str] = field(default_factory=list)
     tables: list[str] = field(default_factory=list)
     counts: dict[str, int] = field(default_factory=dict)
+    committed_batches: dict[str, list[str]] = field(default_factory=dict)
+    attempted_snapshots: dict[str, dict[str, Any]] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
     traffic: dict[str, Any] = field(default_factory=dict)
@@ -226,6 +248,14 @@ class EntityResult:
             "terminal": list(self.terminal),
             "tables": list(dict.fromkeys(self.tables)),
             "counts": dict(self.counts),
+            "committed_batches": {
+                str(kind): list(batch_ids)
+                for kind, batch_ids in self.committed_batches.items()
+            },
+            "attempted_snapshots": {
+                str(kind): dict(snapshot)
+                for kind, snapshot in self.attempted_snapshots.items()
+            },
             "metadata": dict(self.metadata),
             "errors": list(self.errors),
             "traffic": dict(self.traffic),
@@ -360,11 +390,8 @@ class WhoScoredIngestService:
             flaresolverr_url=os.environ.get(
                 "FLARESOLVERR_URL", "http://flaresolverr:8191"
             ),
-            paid_proxy_url=(
-                os.environ.get("WHOSCORED_PAID_PROXY_URL", "").strip() or None
-            ),
-            proxy_control_url=(
-                os.environ.get("WHOSCORED_PROXY_CONTROL_URL", "").strip() or None
+            paid_gateway_url=(
+                os.environ.get("WHOSCORED_PAID_GATEWAY_URL", "").strip() or None
             ),
             context=TransportContext.from_env().request_context(scope=self.scope.spec),
         )
@@ -891,6 +918,7 @@ class WhoScoredIngestService:
     def discover_catalog(
         cls,
         *,
+        as_of_date: date,
         repository: Optional[WhoScoredRepository] = None,
         transport: Optional[WhoScoredTransport] = None,
         raw_store: Optional[WhoScoredRawStore] = None,
@@ -902,18 +930,30 @@ class WhoScoredIngestService:
         publishes nothing until every tournament/season/stage page required
         for the snapshot was parsed successfully.
         """
+        if type(as_of_date) is not date:
+            raise ValueError("as_of_date must be an exact date (not datetime)")
+        as_of_iso = as_of_date.isoformat()
         result = EntityResult("catalog", "catalog", attempted=1)
         repo = repository or WhoScoredRepository()
+        previous_generation: Optional[dict[str, Any]] = None
+        try:
+            previous_generation, previous_catalog = (
+                repo.load_catalog_generation_snapshot(
+                    allow_legacy_parser_for_full_history=bool(full_history)
+                )
+            )
+        except LookupError:
+            previous_catalog = None
+        except Exception as exc:
+            result.errors.append(f"catalog: {type(exc).__name__}: {exc}")
+            return result
         store = raw_store or WhoScoredRawStore.from_env(optional=False)
         network = transport or WhoScoredTransport(
             flaresolverr_url=os.environ.get(
                 "FLARESOLVERR_URL", "http://flaresolverr:8191"
             ),
-            paid_proxy_url=(
-                os.environ.get("WHOSCORED_PAID_PROXY_URL", "").strip() or None
-            ),
-            proxy_control_url=(
-                os.environ.get("WHOSCORED_PROXY_CONTROL_URL", "").strip() or None
+            paid_gateway_url=(
+                os.environ.get("WHOSCORED_PAID_GATEWAY_URL", "").strip() or None
             ),
             context=TransportContext.from_env().request_context(
                 scope="catalog", entity="discovery"
@@ -933,12 +973,6 @@ class WhoScoredIngestService:
         )
         raw_inputs: list[dict[str, str]] = []
         root_raw_uri = ""
-        try:
-            previous_catalog = repo.load_discovered_catalog(
-                allow_legacy_parser_for_full_history=bool(full_history)
-            )
-        except LookupError:
-            previous_catalog = None
         # The first atomic snapshot must always contain historical stage
         # evidence.  Making that safety property automatic keeps the scheduled
         # production DAG bootstrappable; callers cannot accidentally publish a
@@ -946,6 +980,33 @@ class WhoScoredIngestService:
         # Once a successful snapshot exists, ordinary discovery remains
         # incremental unless an explicit backfill requests full history.
         full_history = bool(full_history or previous_catalog is None)
+        parent_catalog_batch_id: Optional[str] = None
+        parent_catalog_payload_sha256: Optional[str] = None
+        parent_catalog_raw_provenance_sha256: Optional[str] = None
+        parent_generation_error: Optional[str] = None
+        if not full_history:
+            if previous_generation is None:
+                parent_generation_error = (
+                    "incremental catalog requires an exact parent generation"
+                )
+            else:
+                parent_catalog_batch_id = str(
+                    previous_generation.get("catalog_batch_id") or ""
+                )
+                parent_catalog_payload_sha256 = str(
+                    previous_generation.get("catalog_payload_sha256") or ""
+                )
+                parent_catalog_raw_provenance_sha256 = str(
+                    previous_generation.get("catalog_raw_provenance_sha256") or ""
+                )
+                if (
+                    not parent_catalog_batch_id
+                    or not _is_lower_sha256(parent_catalog_payload_sha256)
+                    or not _is_lower_sha256(parent_catalog_raw_provenance_sha256)
+                ):
+                    parent_generation_error = (
+                        "incremental catalog parent generation is incomplete"
+                    )
         previous_activity: dict[tuple[str, int], bool] = {}
         previous_season_keys: set[tuple[str, int]] = set()
         previous_season_rows: dict[tuple[str, int], dict[str, Any]] = {}
@@ -995,6 +1056,7 @@ class WhoScoredIngestService:
                     "url": target.canonical_url,
                     "raw_uri": uri,
                     "sha256": response.sha256,
+                    "as_of_date": as_of_iso,
                 }
             )
             # The validator is the single parse. A raw-cache implementation
@@ -1006,6 +1068,8 @@ class WhoScoredIngestService:
             return response, uri, parsed_holder["value"]
 
         try:
+            if parent_generation_error is not None:
+                raise RuntimeError(parent_generation_error)
             identity_catalog = WhoScoredCatalog.from_file()
             competition_aliases = {
                 (int(item.region_id), int(item.tournament_id)): item.competition_id
@@ -1078,10 +1142,16 @@ class WhoScoredIngestService:
                 region_id = int(competition["region_id"])
                 tournament_id = int(competition["tournament_id"])
                 # Names/source metadata already give a definitive exclusion
-                # for women and youth tournaments.  Keep those tournament
-                # rows in the auditable catalog, but do not spend requests on
-                # season/stage pages that can never become an ingest scope.
-                if str(competition.get("eligibility", "")).startswith("excluded_"):
+                # for women, youth and reserve tournaments. Keep those rows in
+                # the auditable catalog without spending more requests. A
+                # technical override is different: fetch its current
+                # season/stage evidence so the snapshot-bound duplicate audit
+                # can revalidate it instead of trusting a stale registry entry.
+                if str(competition.get("eligibility", "")) in {
+                    TournamentEligibility.EXCLUDED_WOMEN.value,
+                    TournamentEligibility.EXCLUDED_YOUTH.value,
+                    TournamentEligibility.EXCLUDED_RESERVE.value,
+                }:
                     continue
                 tournament_url = urljoin(
                     "https://www.whoscored.com/",
@@ -1207,7 +1277,10 @@ class WhoScoredIngestService:
                             cache_ttl=mutable_ttl if activity_candidate else None,
                         )
                     except WhoScoredTransportError as exc:
-                        if exc.status_code not in {403, 404}:
+                        if (
+                            exc.kind is not FailureKind.HTTP_STATUS
+                            or exc.status_code not in {403, 404}
+                        ):
                             raise
                         season.update(
                             {
@@ -1330,7 +1403,10 @@ class WhoScoredIngestService:
                                     if month_records[month_key]:
                                         break
                     except WhoScoredTransportError as exc:
-                        if exc.status_code not in {403, 404}:
+                        if (
+                            exc.kind is not FailureKind.HTTP_STATUS
+                            or exc.status_code not in {403, 404}
+                        ):
                             raise
                         activity_dates = []
                         schedule_source_unavailable = True
@@ -1358,17 +1434,16 @@ class WhoScoredIngestService:
                         last_fixture = max(activity_dates)
                         season["start"] = first_fixture.isoformat()
                         season["end"] = last_fixture.isoformat()
-                        today = date.today()
                         season["is_active"] = (
                             first_fixture - timedelta(days=45)
-                            <= today
+                            <= as_of_date
                             <= last_fixture + timedelta(days=45)
                         )
                         if season["is_active"]:
                             activity_search_complete = True
                             if not requires_stage_backfill:
                                 break
-                        elif last_fixture < today - timedelta(days=45):
+                        elif last_fixture < as_of_date - timedelta(days=45):
                             # Source order is newest-first. Once the first
                             # accessible edition has ended, every following
                             # edition is historical and cannot be active.
@@ -1441,16 +1516,15 @@ class WhoScoredIngestService:
                             )
                         except ValueError:
                             previous_start = previous_end = None
-                        today = date.today()
                         season["is_active"] = bool(
                             (previous_start is not None or previous_end is not None)
                             and (
                                 previous_start is None
-                                or previous_start - timedelta(days=45) <= today
+                                or previous_start - timedelta(days=45) <= as_of_date
                             )
                             and (
                                 previous_end is None
-                                or today <= previous_end + timedelta(days=45)
+                                or as_of_date <= previous_end + timedelta(days=45)
                             )
                         )
                 current_season_keys = {
@@ -1612,6 +1686,17 @@ class WhoScoredIngestService:
                 if not season.stage_ids
             )
             catalog_payload_sha256_value = catalog_payload_sha256(resolved_rows)
+            technical_audit = build_technical_exclusion_audit(
+                resolved_rows,
+                source_snapshot_sha256=_root_response.sha256,
+            )
+            technical_audit_payload = json.dumps(
+                technical_audit,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            technical_audit_sha256 = hashlib.sha256(technical_audit_payload).hexdigest()
             # A discovery batch represents both the parsed catalog and the
             # immutable raw observations that produced it.  Hashing only the
             # parser output makes a source refresh whose semantics are
@@ -1620,32 +1705,78 @@ class WhoScoredIngestService:
             # correctly rejects that ambiguous provenance as a conflict.
             # Normalize the list once and use the exact same order for both
             # identity and persistence.
-            raw_inputs = sorted(
-                (dict(item) for item in raw_inputs),
-                key=lambda item: json.dumps(
-                    item,
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ),
-            )
+            raw_inputs = list(canonical_catalog_raw_inputs(raw_inputs))
             raw_inputs_payload = json.dumps(
                 raw_inputs,
                 ensure_ascii=False,
                 sort_keys=True,
                 separators=(",", ":"),
             )
-            raw_inputs_sha256 = hashlib.sha256(
-                raw_inputs_payload.encode("utf-8")
-            ).hexdigest()
+            raw_inputs_sha256 = catalog_raw_provenance_sha256(raw_inputs)
             discovery_mode = "full_history" if full_history else "incremental"
             batch_identity = (
                 f"{PARSER_VERSION}\0{discovery_mode}\0"
-                f"{catalog_payload_sha256_value}\0{raw_inputs_sha256}"
+                f"{catalog_payload_sha256_value}\0{raw_inputs_sha256}\0"
+                f"{technical_audit_sha256}\0{as_of_iso}\0"
+                f"{parent_catalog_batch_id or ''}\0"
+                f"{parent_catalog_payload_sha256 or ''}\0"
+                f"{parent_catalog_raw_provenance_sha256 or ''}"
             )
             discovery_batch_id = (
                 "wsc2-" + hashlib.sha256(batch_identity.encode("utf-8")).hexdigest()
             )
+            technical_audit_descriptor: Optional[dict[str, Any]] = None
+            result.metadata.update(
+                {
+                    "catalog_batch_id": discovery_batch_id,
+                    "catalog_payload_sha256": catalog_payload_sha256_value,
+                    "catalog_raw_provenance_sha256": raw_inputs_sha256,
+                    "catalog_as_of_date": as_of_iso,
+                    "catalog_source_snapshot_sha256": _root_response.sha256,
+                    "technical_exclusion_audit_sha256": technical_audit_sha256,
+                    "technical_exclusion_audit": technical_audit,
+                    "parent_catalog_batch_id": parent_catalog_batch_id,
+                    "parent_catalog_payload_sha256": (parent_catalog_payload_sha256),
+                    "parent_catalog_raw_provenance_sha256": (
+                        parent_catalog_raw_provenance_sha256
+                    ),
+                }
+            )
+            if hasattr(store, "store_bytes") and hasattr(store, "object_uri"):
+                technical_audit_target = RawTarget(
+                    source="whoscored",
+                    page_kind="catalog_technical_audit",
+                    target_id=(
+                        f"whoscored:catalog-technical-audit:{discovery_batch_id}"
+                    ),
+                    canonical_url=(
+                        "https://www.whoscored.com/catalog/technical-audit/"
+                        f"{discovery_batch_id}"
+                    ),
+                    source_ids={"discovery_batch_id": discovery_batch_id},
+                )
+                technical_audit_record = store.store_bytes(
+                    technical_audit_target,
+                    technical_audit_payload,
+                    content_type="application/json",
+                    charset="utf-8",
+                    fetcher_version=PARSER_VERSION,
+                )
+                technical_audit_uri = store.object_uri(technical_audit_record.blob_key)
+                technical_audit_descriptor = {
+                    "target_id": technical_audit_target.target_id,
+                    "raw_uri": technical_audit_uri,
+                    "payload_sha256": technical_audit_sha256,
+                    "audit_type": technical_audit["audit_type"],
+                    "source_snapshot_sha256": _root_response.sha256,
+                    "candidate_count": technical_audit["candidate_count"],
+                    "unresolved_candidate_count": technical_audit[
+                        "unresolved_candidate_count"
+                    ],
+                    "as_of_date": as_of_iso,
+                    "encoding": "application/json+gzip",
+                }
+                result.metadata["technical_exclusion_audit_uri"] = technical_audit_uri
             quarantined_by_kind: dict[str, int] = {}
             quarantined_by_reason: dict[str, int] = {}
             quarantined_competition_ids: set[str] = set()
@@ -1672,6 +1803,20 @@ class WhoScoredIngestService:
                     "excluded_youth": sum(
                         str(row.get("eligibility")) == "excluded_youth"
                         for row in resolved_rows["competitions"]
+                    ),
+                    "excluded_reserve": sum(
+                        str(row.get("eligibility")) == "excluded_reserve"
+                        for row in resolved_rows["competitions"]
+                    ),
+                    "excluded_technical": sum(
+                        str(row.get("eligibility")) == "excluded_technical"
+                        for row in resolved_rows["competitions"]
+                    ),
+                    "technical_duplicate_candidates": int(
+                        technical_audit["candidate_count"]
+                    ),
+                    "unresolved_technical_duplicate_candidates": int(
+                        technical_audit["unresolved_candidate_count"]
                     ),
                     "seasons": len(season_rows),
                     "source_unavailable_seasons": sum(
@@ -1705,7 +1850,11 @@ class WhoScoredIngestService:
                     "iceberg.bronze.whoscored_catalog_manifest",
                 ]
             )
-            if discovered.quarantined or eligible_without_stages:
+            if (
+                discovered.quarantined
+                or eligible_without_stages
+                or technical_audit["unresolved_candidate_count"]
+            ):
                 result.succeeded = 0
                 problems: list[str] = []
                 if discovered.quarantined:
@@ -1739,6 +1888,18 @@ class WhoScoredIngestService:
                         f"{len(eligible_without_stages)} eligible seasons without stages "
                         f"({', '.join(eligible_without_stages[:10])})"
                     )
+                if technical_audit["unresolved_candidate_count"]:
+                    unresolved_samples = [
+                        f"{item['candidate_type']}:{item['candidate_key']}"
+                        for item in technical_audit["candidates"]
+                        if item["review_disposition"]
+                        == "requires_versioned_source_id_review"
+                    ]
+                    problems.append(
+                        f"{technical_audit['unresolved_candidate_count']} "
+                        "unreviewed technical duplicate candidates "
+                        f"({', '.join(unresolved_samples[:10])})"
+                    )
                 result.errors.append("catalog completeness: " + "; ".join(problems))
             else:
                 persisted_raw_inputs: Sequence[Mapping[str, Any]] = raw_inputs
@@ -1768,14 +1929,23 @@ class WhoScoredIngestService:
                         fetcher_version=PARSER_VERSION,
                     )
                     persisted_raw_uri = store.object_uri(provenance_record.blob_key)
-                    persisted_raw_inputs = (
+                    descriptors = [
                         {
                             "target_id": provenance_target.target_id,
                             "raw_uri": persisted_raw_uri,
                             "payload_sha256": raw_inputs_sha256,
                             "input_count": len(raw_inputs),
+                            "as_of_date": as_of_iso,
                             "encoding": "application/json+gzip",
                         },
+                    ]
+                    if technical_audit_descriptor is not None:
+                        descriptors.append(technical_audit_descriptor)
+                    persisted_raw_inputs = tuple(
+                        sorted(
+                            descriptors,
+                            key=lambda item: str(item.get("target_id") or ""),
+                        )
                     )
                 repo.persist_discovered_catalog(
                     discovered,
@@ -1783,7 +1953,14 @@ class WhoScoredIngestService:
                     raw_uri=persisted_raw_uri,
                     payload_sha256=catalog_payload_sha256_value,
                     raw_inputs=persisted_raw_inputs,
+                    raw_provenance_sha256=raw_inputs_sha256,
                     discovery_mode=discovery_mode,
+                    as_of_date=as_of_date,
+                    parent_catalog_batch_id=parent_catalog_batch_id,
+                    parent_catalog_payload_sha256=(parent_catalog_payload_sha256),
+                    parent_catalog_raw_provenance_sha256=(
+                        parent_catalog_raw_provenance_sha256
+                    ),
                 )
                 result.succeeded = len(competition_rows)
         except Exception as exc:
@@ -1856,6 +2033,15 @@ class WhoScoredIngestService:
         large roster/preview candidate list from turning a transient
         Cloudflare incident into one paid lease per candidate.
         """
+        campaign = getattr(
+            getattr(self.transport, "context", None), "proxy_campaign", {}
+        )
+        if isinstance(campaign, Mapping) and campaign.get("proxy_allocation"):
+            # A verified campaign already fixes the exact durable work-item
+            # request/lease/byte ceilings. Local cardinality heuristics must
+            # not silently shrink that signed allocation; proxy-filter carries
+            # its remaining balance across retries and DagRun continuations.
+            return
         current = self.transport.budgets
         self.transport.budgets = TransportBudgets.for_eligible_urls(
             eligible_urls,
@@ -1868,7 +2054,12 @@ class WhoScoredIngestService:
         )
 
     def sync_schedule(self) -> EntityResult:
-        result = EntityResult("schedule", self.scope.spec, attempted=1)
+        result = EntityResult(
+            "schedule",
+            self.scope.spec,
+            attempted=1,
+            committed_batches={"scope": []},
+        )
         self._bound_paid_fallback(2)
         scope_spools: list[WhoScoredScopeRowSpool] = []
         try:
@@ -2406,7 +2597,7 @@ class WhoScoredIngestService:
                     "utf-8"
                 )
             ).hexdigest()
-            self.repository.commit_scope_bundle(
+            scope_batch_id = self.repository.commit_scope_bundle(
                 league=self.scope.competition_id,
                 season=self.scope.season_id,
                 entity_group="season",
@@ -2418,6 +2609,7 @@ class WhoScoredIngestService:
                 source_unavailable=source_unavailable,
                 feed_states=feed_states,
             )
+            result.committed_batches["scope"].append(str(scope_batch_id))
             result.succeeded = 1
             for table, rows in datasets.items():
                 result.counts[table.removeprefix("whoscored_")] = len(rows)
@@ -2438,7 +2630,11 @@ class WhoScoredIngestService:
         historical_replay: bool = False,
         kickoff_from: Optional[datetime] = None,
     ) -> EntityResult:
-        result = EntityResult("matches", self.scope.spec)
+        result = EntityResult(
+            "matches",
+            self.scope.spec,
+            committed_batches={"match": [], "match_not_available": []},
+        )
         self._ensure_schema_once()
         candidates = self.repository.list_match_candidates(
             self.scope.competition_id,
@@ -2449,6 +2645,13 @@ class WhoScoredIngestService:
             kickoff_from=kickoff_from,
         )
         result.attempted = len(candidates)
+        result.attempted_snapshots["match"] = {
+            "schema_version": 1,
+            "count": result.attempted,
+            "payload_sha256": entity_id_payload_sha256(
+                int(candidate.game_id) for candidate in candidates
+            ),
+        }
         self._bound_paid_fallback(len(candidates))
         pending: list[tuple[MatchCommit, Any]] = []
         for candidate in candidates:
@@ -2581,7 +2784,7 @@ class WhoScoredIngestService:
                         tzinfo=None
                     ) + timedelta(hours=delay_hours)
                 try:
-                    self.repository.record_failure(
+                    failure_batch_id = self.repository.record_failure(
                         ManifestFailure(
                             game_id=candidate.game_id,
                             league=self.scope.competition_id,
@@ -2616,9 +2819,44 @@ class WhoScoredIngestService:
                     )
                 else:
                     if state == "not_available":
-                        # Explicit durable source state. The schedule row stays
-                        # published and this candidate is not probed again.
-                        pass
+                        expected_failure_batch_id = (
+                            deterministic_match_not_available_batch_id(
+                                candidate.game_id,
+                                league=self.scope.competition_id,
+                                season=self.scope.season_id,
+                                failure_code="source_not_available",
+                                http_status=exc.status_code,
+                                payload_sha256=getattr(exc, "payload_sha256", None),
+                                raw_uri=getattr(exc, "raw_uri", None),
+                            )
+                        )
+                        suffix = (
+                            failure_batch_id.removeprefix(
+                                MATCH_NOT_AVAILABLE_BATCH_ID_PREFIX
+                            )
+                            if isinstance(failure_batch_id, str)
+                            else ""
+                        )
+                        if (
+                            not isinstance(failure_batch_id, str)
+                            or not failure_batch_id.startswith(
+                                MATCH_NOT_AVAILABLE_BATCH_ID_PREFIX
+                            )
+                            or not _is_lower_sha256(suffix)
+                            or failure_batch_id != expected_failure_batch_id
+                        ):
+                            result.errors.append(
+                                f"game {candidate.game_id}: repository returned no "
+                                "exact not-available outcome identity"
+                            )
+                        else:
+                            result.committed_batches["match_not_available"].append(
+                                failure_batch_id
+                            )
+                            result.succeeded += 1
+                            result.counts["not_available"] = (
+                                result.counts.get("not_available", 0) + 1
+                            )
                     elif state == "parse_failed":
                         result.errors.append(f"game {candidate.game_id}: {exc}")
                     else:
@@ -2685,10 +2923,22 @@ class WhoScoredIngestService:
                 )
         if pending:
             try:
-                self.repository.commit_matches([commit for commit, _parsed in pending])
+                expected_batch_ids = tuple(
+                    commit.batch_id for commit, _parsed in pending
+                )
+                committed_batch_ids = tuple(
+                    self.repository.commit_matches(
+                        [commit for commit, _parsed in pending]
+                    )
+                )
+                if committed_batch_ids != expected_batch_ids:
+                    raise RuntimeError(
+                        "match repository returned different committed batch ids"
+                    )
             except Exception as exc:
                 result.errors.append(f"match batch: {type(exc).__name__}: {exc}")
             else:
+                result.committed_batches["match"].extend(committed_batch_ids)
                 result.succeeded += len(pending)
                 for _commit, parsed in pending:
                     for name, dataset in parsed.datasets.items():
@@ -2717,7 +2967,11 @@ class WhoScoredIngestService:
         match_ids: Optional[Iterable[int]] = None,
         force_replay: bool = False,
     ) -> EntityResult:
-        result = EntityResult("previews", self.scope.spec)
+        result = EntityResult(
+            "previews",
+            self.scope.spec,
+            committed_batches={"preview": [], "preview_not_available": []},
+        )
         self._ensure_schema_once()
         candidates = self.repository.list_preview_candidates(
             self.scope.competition_id,
@@ -2727,6 +2981,13 @@ class WhoScoredIngestService:
             force_replay=force_replay,
         )
         result.attempted = len(candidates)
+        result.attempted_snapshots["preview"] = {
+            "schema_version": 1,
+            "count": result.attempted,
+            "payload_sha256": entity_id_payload_sha256(
+                int(candidate["game_id"]) for candidate in candidates
+            ),
+        }
         self._bound_paid_fallback(len(candidates))
         pending: list[tuple[PreviewCommit, Any]] = []
         for candidate in candidates:
@@ -2782,7 +3043,7 @@ class WhoScoredIngestService:
                         tzinfo=None
                     ) + timedelta(hours=delay_hours)
                 try:
-                    self.repository.record_preview_failure(
+                    failure_batch_id = self.repository.record_preview_failure(
                         PreviewFailure(
                             game_id=int(candidate["game_id"]),
                             league=self.scope.competition_id,
@@ -2814,10 +3075,44 @@ class WhoScoredIngestService:
                     if state == "retryable":
                         result.retryable.append(str(candidate["game_id"]))
                     elif state == "not_available":
-                        result.succeeded += 1
-                        result.counts["not_available"] = (
-                            result.counts.get("not_available", 0) + 1
+                        expected_failure_batch_id = (
+                            deterministic_preview_not_available_batch_id(
+                                int(candidate["game_id"]),
+                                league=self.scope.competition_id,
+                                season=self.scope.season_id,
+                                failure_code=exc.kind.value,
+                                http_status=exc.status_code,
+                                payload_sha256=getattr(exc, "payload_sha256", None),
+                                raw_uri=getattr(exc, "raw_uri", None),
+                            )
                         )
+                        suffix = (
+                            failure_batch_id.removeprefix(
+                                PREVIEW_NOT_AVAILABLE_BATCH_ID_PREFIX
+                            )
+                            if isinstance(failure_batch_id, str)
+                            else ""
+                        )
+                        if (
+                            not isinstance(failure_batch_id, str)
+                            or not failure_batch_id.startswith(
+                                PREVIEW_NOT_AVAILABLE_BATCH_ID_PREFIX
+                            )
+                            or not _is_lower_sha256(suffix)
+                            or failure_batch_id != expected_failure_batch_id
+                        ):
+                            result.errors.append(
+                                f"preview {candidate['game_id']}: repository returned "
+                                "no exact not-available outcome identity"
+                            )
+                        else:
+                            result.committed_batches["preview_not_available"].append(
+                                failure_batch_id
+                            )
+                            result.succeeded += 1
+                            result.counts["not_available"] = (
+                                result.counts.get("not_available", 0) + 1
+                            )
                     elif state == "terminal":
                         result.terminal.append(str(candidate["game_id"]))
                     else:
@@ -2896,10 +3191,22 @@ class WhoScoredIngestService:
                 )
         if pending:
             try:
-                self.repository.commit_previews([commit for commit, _parsed in pending])
+                expected_batch_ids = tuple(
+                    commit.batch_id for commit, _parsed in pending
+                )
+                committed_batch_ids = tuple(
+                    self.repository.commit_previews(
+                        [commit for commit, _parsed in pending]
+                    )
+                )
+                if committed_batch_ids != expected_batch_ids:
+                    raise RuntimeError(
+                        "preview repository returned different committed batch ids"
+                    )
             except Exception as exc:
                 result.errors.append(f"preview batch: {type(exc).__name__}: {exc}")
             else:
+                result.committed_batches["preview"].extend(committed_batch_ids)
                 result.succeeded += len(pending)
                 for _commit, parsed in pending:
                     for name, dataset in parsed.datasets.items():
@@ -2963,7 +3270,11 @@ class WhoScoredIngestService:
     ) -> EntityResult:
         self._ensure_schema_once()
         scopes = self._profile_candidate_scopes(candidate_scopes)
-        result = EntityResult("profiles", ",".join(scope.spec for scope in scopes))
+        result = EntityResult(
+            "profiles",
+            ",".join(scope.spec for scope in scopes),
+            committed_batches={"profile": [], "profile_not_available": []},
+        )
         if player_ids is None:
             selected_player_ids = self.repository.list_profile_candidates(
                 scopes=scopes,
@@ -2981,6 +3292,11 @@ class WhoScoredIngestService:
             if len(selected_player_ids) > int(limit):
                 raise ValueError("explicit profile player_ids exceed the task limit")
         result.attempted = len(selected_player_ids)
+        result.attempted_snapshots["profile"] = {
+            "schema_version": 1,
+            "count": result.attempted,
+            "payload_sha256": entity_id_payload_sha256(selected_player_ids),
+        }
         self._bound_paid_fallback(len(selected_player_ids))
         pending_commits: list[ProfileCommit] = []
         for player_id in selected_player_ids:
@@ -3053,7 +3369,7 @@ class WhoScoredIngestService:
                     else None
                 )
                 try:
-                    self.repository.record_profile_failure(
+                    failure_batch_id = self.repository.record_profile_failure(
                         player_id=player_id,
                         state=state,
                         failure_code=exc.kind.value,
@@ -3078,10 +3394,42 @@ class WhoScoredIngestService:
                     if state == "parse_failed":
                         result.errors.append(f"profile {player_id}: {exc}")
                     elif state == "not_available":
-                        result.succeeded += 1
-                        result.counts["not_available"] = (
-                            result.counts.get("not_available", 0) + 1
+                        expected_failure_batch_id = (
+                            deterministic_profile_not_available_batch_id(
+                                player_id,
+                                failure_code=exc.kind.value,
+                                http_status=exc.status_code,
+                                payload_sha256=getattr(exc, "payload_sha256", None),
+                                raw_uri=getattr(exc, "raw_uri", None),
+                            )
                         )
+                        suffix = (
+                            failure_batch_id.removeprefix(
+                                PROFILE_NOT_AVAILABLE_BATCH_ID_PREFIX
+                            )
+                            if isinstance(failure_batch_id, str)
+                            else ""
+                        )
+                        if (
+                            not isinstance(failure_batch_id, str)
+                            or not failure_batch_id.startswith(
+                                PROFILE_NOT_AVAILABLE_BATCH_ID_PREFIX
+                            )
+                            or not _is_lower_sha256(suffix)
+                            or failure_batch_id != expected_failure_batch_id
+                        ):
+                            result.errors.append(
+                                f"profile {player_id}: repository returned no exact "
+                                "not-available outcome identity"
+                            )
+                        else:
+                            result.committed_batches["profile_not_available"].append(
+                                failure_batch_id
+                            )
+                            result.succeeded += 1
+                            result.counts["not_available"] = (
+                                result.counts.get("not_available", 0) + 1
+                            )
                     else:
                         target_list = (
                             result.retryable
@@ -3142,10 +3490,20 @@ class WhoScoredIngestService:
             )
         if pending_commits:
             try:
-                self.repository.commit_profiles(pending_commits)
+                expected_batch_ids = tuple(
+                    commit.batch_id for commit in pending_commits
+                )
+                committed_batch_ids = tuple(
+                    self.repository.commit_profiles(pending_commits)
+                )
+                if committed_batch_ids != expected_batch_ids:
+                    raise RuntimeError(
+                        "profile repository returned different committed batch ids"
+                    )
             except Exception as exc:
                 result.errors.append(f"profile batch: {type(exc).__name__}: {exc}")
             else:
+                result.committed_batches["profile"].extend(committed_batch_ids)
                 result.succeeded += len(pending_commits)
                 result.counts["player_profile_versions"] = len(pending_commits)
                 result.counts["player_stage_participations"] = sum(

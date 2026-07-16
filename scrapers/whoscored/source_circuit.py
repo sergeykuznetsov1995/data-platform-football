@@ -31,6 +31,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Optional
 
+from scrapers.whoscored.runtime_contract import require_production_runtime_class
+
 
 STATE_SCHEMA_VERSION = 1
 DEFAULT_COOLDOWN_SECONDS = 15 * 60.0
@@ -199,6 +201,7 @@ class SharedSourceCircuit:
         random_uniform: Callable[[float, float], float] = random.uniform,
         nonce_factory: Callable[[], str] = lambda: secrets.token_hex(16),
     ) -> None:
+        require_production_runtime_class(operation="WhoScored source circuit")
         try:
             raw_path = os.fspath(path)
         except TypeError as exc:

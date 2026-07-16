@@ -102,8 +102,10 @@ def test_script_entrypoint_is_standalone_and_executable(tmp_path):
 
 @pytest.mark.unit
 def test_make_one_shots_use_a_distinct_registry_mount():
-    makefile = (
-        Path(__file__).resolve().parents[3] / "Makefile"
+    root = Path(__file__).resolve().parents[3]
+    makefile = (root / "Makefile").read_text(encoding="utf-8")
+    core_requirements = (
+        root / "docker/images/airflow/requirements.txt"
     ).read_text(encoding="utf-8")
 
     # Compose keeps the inherited /opt/airflow registry mount read-only even
@@ -113,6 +115,14 @@ def test_make_one_shots_use_a_distinct_registry_mount():
     assert "configs/sofascore:/work/sofascore:ro" in makefile
     # direct write, direct check, and the metered opt-in one-shot.
     assert makefile.count("--registry /work/sofascore/tournaments.json") == 3
+    discovery_targets = makefile.split("sofascore-discovery:\n", 1)[1].split(
+        "\n# Show Web UI URLs", 1
+    )[0]
+    assert discovery_targets.count("airflow-webserver") == 3
+    assert "airflow-scheduler" not in discovery_targets
+    assert core_requirements.splitlines().count(
+        "tls-client-python==1.15.1"
+    ) == 1
 
 
 @pytest.mark.unit

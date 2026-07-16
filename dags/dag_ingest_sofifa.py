@@ -206,7 +206,7 @@ with DAG(
         task_id='scrape_sofifa_data',
         bash_command=f"""
 cd /opt/airflow && \\
-python dags/scripts/run_sofifa_scraper.py \\
+/opt/legacy-scraper-venv/bin/python dags/scripts/run_sofifa_scraper.py \\
     --leagues "{leagues_str}" \\
     --versions "{versions_str}" \\
     --output /tmp/sofifa_result.json

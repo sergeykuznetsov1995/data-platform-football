@@ -8,11 +8,14 @@ import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-DOCKERFILE = REPO_ROOT / "docker/images/airflow/Dockerfile.transfermarkt-runtime"
-LEGACY_DOCKERFILE = REPO_ROOT / "docker/images/airflow/Dockerfile"
+DOCKERFILE = REPO_ROOT / "docker/images/airflow/Dockerfile"
 SCRAPING_REQUIREMENTS = (
     REPO_ROOT / "docker/images/airflow/requirements-scraping.txt"
 )
+RUNNER_REQUIREMENTS = (
+    REPO_ROOT / "docker/images/airflow/requirements-scraper-runner.txt"
+)
+CORE_REQUIREMENTS = REPO_ROOT / "docker/images/airflow/requirements.txt"
 COMPOSE_FILE = REPO_ROOT / "compose.yaml"
 
 EXPECTED_VERSION = "1.13.1"
@@ -25,21 +28,33 @@ EXPECTED_PATH = "/opt/tls-client/tls-client.so"
 @pytest.mark.unit
 def test_tls_wrapper_and_native_library_are_pinned_in_the_image():
     requirements = SCRAPING_REQUIREMENTS.read_text(encoding="utf-8")
+    runner_requirements = RUNNER_REQUIREMENTS.read_text(encoding="utf-8")
+    core_requirements = CORE_REQUIREMENTS.read_text(encoding="utf-8")
     dockerfile = DOCKERFILE.read_text(encoding="utf-8")
-    legacy_dockerfile = LEGACY_DOCKERFILE.read_text(encoding="utf-8")
 
     # Do not invalidate and re-resolve the large shared scraping layer just to
     # pin one transitive dependency; unrelated packages must not drift.
     assert requirements.splitlines().count("wrapper-tls-requests==1.2.5") == 0
-    assert "wrapper-tls-requests==1.2.5" not in legacy_dockerfile
-    assert "TLS_LIBRARY_PATH" not in legacy_dockerfile
-    assert "ARG AIRFLOW_RUNTIME_BASE=" in dockerfile
-    assert "FROM ${AIRFLOW_RUNTIME_BASE}" in dockerfile
-    wrapper_pin = (
-        "RUN pip install --no-cache-dir --no-deps "
-        "wrapper-tls-requests==1.2.5"
-    )
-    assert dockerfile.splitlines().count(wrapper_pin) == 1
+    wrapper_locks = [
+        line
+        for line in runner_requirements.splitlines()
+        if line.startswith("wrapper-tls-requests==1.2.5 ")
+    ]
+    assert len(wrapper_locks) == 1
+    assert "--hash=sha256:" in wrapper_locks[0]
+    chardet_locks = [
+        line
+        for line in core_requirements.splitlines()
+        if line.startswith("chardet==5.2.0 ")
+    ]
+    assert len(chardet_locks) == 1
+    assert "--hash=sha256:" in chardet_locks[0]
+    assert "AS airflow-base" in dockerfile
+    assert "FROM airflow-base AS airflow-scheduler" in dockerfile
+    assert "apache/airflow:2.11.2-python3.11@sha256:" in dockerfile
+    wrapper_pin = "-r /tmp/requirements-scraper-runner.txt"
+    assert dockerfile.count(wrapper_pin) == 1
+    assert "--no-deps --require-hashes --only-binary=:all:" in dockerfile
     assert (
         f"releases/download/v{EXPECTED_VERSION}/"
         f"tls-client-linux-ubuntu-amd64-{EXPECTED_VERSION}.so"
@@ -59,6 +74,9 @@ def test_tls_wrapper_and_native_library_are_pinned_in_the_image():
     assert make_read_only < runtime_path < abi_smoke
     assert dockerfile.rfind("USER root", 0, download) >= 0
     assert dockerfile.index("USER airflow", make_read_only) < abi_smoke
+    assert "PYTHONWARNINGS=error /usr/local/bin/python" in dockerfile
+    assert "m.version('chardet') == '5.2.0'" in dockerfile
+    assert "m.version('wrapper-tls-requests') == '1.2.5'" in dockerfile
 
 
 @pytest.mark.unit
@@ -66,8 +84,62 @@ def test_compose_cannot_clear_the_image_level_tls_library_path():
     compose = COMPOSE_FILE.read_text(encoding="utf-8")
     assert "TLS_LIBRARY_PATH:" not in compose
     assert "TLS_LIBRARY_PATH=" not in compose
-    assert compose.count("dockerfile: Dockerfile.transfermarkt-runtime") == 1
-    assert "AIRFLOW_RUNTIME_BASE:" in compose
+    assert "Dockerfile.transfermarkt-runtime" not in compose
+    assert compose.count("target: airflow-base") == 3
+    assert compose.count("target: airflow-scheduler") == 1
+    assert "WHOSCORED_SCRAPER_PYTHON: /usr/local/bin/python" in compose
+    workflow = (REPO_ROOT / ".github/workflows/whoscored-ci.yml").read_text(
+        encoding="utf-8"
+    )
+    assert "import curl_cffi,tls_client,tls_requests" in workflow
+    assert 'm.version(\\"tls-client-python\\") == \\"1.15.1\\"' in workflow
+
+
+@pytest.mark.unit
+def test_legacy_browser_jobs_use_only_the_isolated_runner():
+    dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+    assert "python -S -m venv /opt/legacy-scraper-venv" in dockerfile
+    assert "--system-site-packages" not in dockerfile
+    assert "/opt/legacy-scraper-venv/bin/python -I -m pip check" in dockerfile
+    assert "s/^include-system-site-packages = //p" in dockerfile
+    assert "assert sys.prefix == '/opt/legacy-scraper-venv'" in dockerfile
+    assert "PIP_REQUIRE_VIRTUALENV=1" in dockerfile
+    assert dockerfile.count("PIP_REQUIRE_VIRTUALENV=1") == 2
+    assert "/home/airflow/soccerdata" in dockerfile
+    assert "/opt/legacy-scraper-venv/bin/python -I -m pip install" in dockerfile
+    assert "--no-cache-dir --no-deps --require-hashes --only-binary=:all:" in dockerfile
+    assert (
+        "/opt/legacy-scraper-venv/bin/python -I -m pip install "
+        "--no-cache-dir --user"
+    ) not in dockerfile
+    commands = {
+        "dags/dag_ingest_sofifa.py": "run_sofifa_scraper.py",
+        "dags/dag_ingest_understat.py": "run_understat_scraper.py",
+        "dags/dag_ingest_espn.py": "run_espn_scraper.py",
+        "dags/dag_ingest_clubelo.py": "run_clubelo_scraper.py",
+        "dags/dag_ingest_sofascore.py": "run_sofascore_scraper.py",
+    }
+    for relative, runner in commands.items():
+        source = (REPO_ROOT / relative).read_text(encoding="utf-8")
+        assert f"/opt/legacy-scraper-venv/bin/python dags/scripts/{runner}" in source
+
+
+@pytest.mark.unit
+def test_fresh_and_existing_soccerdata_volumes_are_owned_before_airflow_starts():
+    dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+    compose = COMPOSE_FILE.read_text(encoding="utf-8")
+
+    base_stage = dockerfile.split("FROM airflow-base AS airflow-scheduler-payload", 1)[0]
+    assert (
+        "install -d -o 50000 -g 0 -m 0755 /home/airflow/soccerdata"
+        in base_stage
+    )
+    log_init = compose.split("  airflow-log-init:", 1)[1].split(
+        "\n  airflow-init:", 1
+    )[0]
+    assert "soccerdata_cache:/home/airflow/soccerdata" in log_init
+    assert "chown -R --no-dereference 50000:0 /home/airflow/soccerdata" in log_init
+    assert "chmod -R u+rwX,g+rwX,o-rwx /home/airflow/soccerdata" in log_init
 
 
 @pytest.mark.unit

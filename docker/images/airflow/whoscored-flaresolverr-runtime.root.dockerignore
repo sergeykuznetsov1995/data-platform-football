@@ -1,0 +1,14 @@
+*
+!.dockerignore
+!docker/
+docker/*
+!docker/images/
+docker/images/*
+!docker/images/flaresolverr-whoscored/
+docker/images/flaresolverr-whoscored/*
+!docker/images/flaresolverr-whoscored/Dockerfile
+!docker/images/flaresolverr-whoscored/Dockerfile.dockerignore
+!docker/images/flaresolverr-whoscored/entrypoint.sh
+!scripts/
+scripts/*
+!scripts/flaresolverr_extended.py

@@ -1,6 +1,38 @@
 """Daily immutable off-host backup and verification for WhoScored raw data."""
 
+# ruff: noqa: E402 -- the trust anchor must run before every non-built-in import
+
 from __future__ import annotations
+
+import sys as _whoscored_bootstrap_sys
+
+_whoscored_source = __file__
+if not _whoscored_source.startswith("/"):
+    raise RuntimeError("WhoScored entrypoint requires an absolute source path")
+_whoscored_production = _whoscored_source.startswith("/opt/airflow/")
+_whoscored_root = "/opt/airflow" if _whoscored_production else _whoscored_source.rsplit("/dags/", 1)[0]
+if _whoscored_production:
+    if getattr(_whoscored_bootstrap_sys, "_whoscored_runtime_startup_schema", None) != 2:
+        raise RuntimeError("image-baked WhoScored startup anchor is required")
+elif getattr(_whoscored_bootstrap_sys, "_whoscored_runtime_startup_root", None) != _whoscored_root:
+    _whoscored_anchor_path = (
+        _whoscored_root + "/docker/images/airflow/whoscored_runtime_startup.py"
+    )
+    _whoscored_anchor_globals = {
+        "__builtins__": __builtins__,
+        "sys": _whoscored_bootstrap_sys,
+        "_WHOSCORED_RUNTIME_ROOT": _whoscored_root,
+        "_WHOSCORED_REQUIRE_FULL_ATTESTATION": False,
+    }
+    with open(_whoscored_anchor_path, "rb") as _whoscored_anchor_handle:
+        _whoscored_anchor_source = _whoscored_anchor_handle.read()
+    exec(
+        compile(_whoscored_anchor_source, _whoscored_anchor_path, "exec"),
+        _whoscored_anchor_globals,
+    )
+_WHOSCORED_RUNTIME_CONTRACT = (
+    _whoscored_bootstrap_sys._load_whoscored_runtime_contract(_whoscored_root)
+)
 
 from datetime import datetime, timedelta
 
@@ -21,7 +53,6 @@ RAW_INVENTORY = f"{RUN_DIR}/raw-inventory.json"
 OPS_INVENTORY = f"{RUN_DIR}/ops-inventory.json"
 
 _ENV = {
-    "PYTHONPATH": "/opt/airflow",
     "PATH": "/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin",
 }
 

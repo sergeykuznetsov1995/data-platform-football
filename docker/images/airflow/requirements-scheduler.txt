@@ -1,0 +1,7 @@
+# Scheduler-only immutable wheel lock
+# Generated from the already smoke-tested linux/amd64 Python 3.11 image.
+# Every install uses --require-hashes --only-binary=:all: --no-deps.
+aenum==3.1.17 --hash=sha256:8b883a37a04e74cc838ac442bdd28c266eae5bbf13e1342c7ef123ed25230139
+astronomer-cosmos==1.14.2 --hash=sha256:462005b74aa405e38f2484be7ad115660e8f629e8587bc3f7d6cf9468721e2c8
+deprecation==2.1.0 --hash=sha256:a10811591210e1fb0e768a8c25517cabeabcba6f0bf96564f8ff45189f90b14a
+wrapper-tls-requests==1.2.5 --hash=sha256:36f297aff6102fe85bf803c67917c87664ddf1aace056032ab1455aed88fdc44

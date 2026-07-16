@@ -17,8 +17,8 @@ Data collected:
 All data is written to Iceberg Bronze layer tables (via Parquet fallback).
 """
 
-from datetime import datetime, timedelta
-from typing import Any, Dict, List
+from datetime import datetime
+from typing import Any, Dict
 
 from airflow import DAG
 from airflow.exceptions import AirflowException
@@ -206,8 +206,9 @@ with DAG(
         # separate backfill DAG. f-string escapes {{ }} as {{{{ }}}} so the
         # literal Jinja tag survives into the rendered command.
         bash_command=f"""
+set -euo pipefail
 cd /opt/airflow && \\
-python dags/scripts/run_matchhistory_scraper.py \\
+/opt/legacy-scraper-venv/bin/python dags/scripts/run_matchhistory_scraper.py \\
     --leagues "{leagues_str}" \\
     --season {{{{ params.season }}}} \\
     --output /tmp/matchhistory_result.json \\

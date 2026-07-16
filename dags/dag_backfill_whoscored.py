@@ -6,7 +6,49 @@ so a task/container/host restart resumes from durable evidence rather than a
 mutable file under Airflow logs.
 """
 
+# ruff: noqa: E402 -- the trust anchor must run before every non-built-in import
+
 from __future__ import annotations
+
+import sys as _whoscored_bootstrap_sys
+
+_whoscored_source = __file__
+if not _whoscored_source.startswith("/"):
+    raise RuntimeError("WhoScored entrypoint requires an absolute source path")
+_whoscored_production = _whoscored_source.startswith("/opt/airflow/")
+_whoscored_root = (
+    "/opt/airflow"
+    if _whoscored_production
+    else _whoscored_source.rsplit("/dags/", 1)[0]
+)
+if _whoscored_production:
+    if (
+        getattr(_whoscored_bootstrap_sys, "_whoscored_runtime_startup_schema", None)
+        != 2
+    ):
+        raise RuntimeError("image-baked WhoScored startup anchor is required")
+elif (
+    getattr(_whoscored_bootstrap_sys, "_whoscored_runtime_startup_root", None)
+    != _whoscored_root
+):
+    _whoscored_anchor_path = (
+        _whoscored_root + "/docker/images/airflow/whoscored_runtime_startup.py"
+    )
+    _whoscored_anchor_globals = {
+        "__builtins__": __builtins__,
+        "sys": _whoscored_bootstrap_sys,
+        "_WHOSCORED_RUNTIME_ROOT": _whoscored_root,
+        "_WHOSCORED_REQUIRE_FULL_ATTESTATION": False,
+    }
+    with open(_whoscored_anchor_path, "rb") as _whoscored_anchor_handle:
+        _whoscored_anchor_source = _whoscored_anchor_handle.read()
+    exec(
+        compile(_whoscored_anchor_source, _whoscored_anchor_path, "exec"),
+        _whoscored_anchor_globals,
+    )
+_WHOSCORED_RUNTIME_CONTRACT = _whoscored_bootstrap_sys._load_whoscored_runtime_contract(
+    _whoscored_root
+)
 
 import base64
 import hashlib
@@ -15,7 +57,7 @@ import math
 import os
 import re
 import shlex
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
 
@@ -26,6 +68,17 @@ from airflow.operators.bash import BashOperator
 from airflow.operators.python import PythonOperator
 
 from dags.scripts.whoscored_identity import stable_safe_token
+from dags.scripts.whoscored_proxy_runtime import (
+    PaidRuntime,
+    WhoScoredProxyRuntimeError,
+    paid_campaign_gateway_call,
+    paid_alert_source_guard_command,
+    projected_paid_alert_environment,
+    projected_transport_environment,
+    resolve_paid_runtime,
+    validate_paid_alert_for_source,
+    validate_transport_alert_delivery,
+)
 from scrapers.whoscored.runtime_limits import (
     SOURCE_PAGE_REQUESTS_PER_MINUTE,
     source_page_request_hard_ceiling_per_day,
@@ -57,6 +110,37 @@ _QUEUE_ID = re.compile(r"^[A-Za-z0-9_.-]{0,120}$")
 _PLAN_ID = re.compile(r"^[0-9a-f]{64}$")
 FROZEN_DQ_POPULATION_VERSION = 1
 FROZEN_SCOPE_QUERY_CHUNK_SIZE = 500
+
+
+def _transport_runtime(
+    context: Mapping[str, Any],
+    *,
+    task_id: Optional[str] = None,
+    work_item_id: Optional[str] = None,
+) -> PaidRuntime:
+    try:
+        return resolve_paid_runtime(
+            context,
+            task_id=task_id,
+            work_item_id=work_item_id,
+        )
+    except WhoScoredProxyRuntimeError as exc:
+        raise AirflowException(str(exc)) from exc
+
+
+def _bind_transport_allocation(
+    transport: PaidRuntime,
+    *,
+    task_id: str,
+    work_item_id: str,
+) -> PaidRuntime:
+    try:
+        return transport.for_allocation(
+            task_id=task_id,
+            work_item_id=work_item_id,
+        )
+    except WhoScoredProxyRuntimeError as exc:
+        raise AirflowException(str(exc)) from exc
 
 
 def _sql_string(value: object) -> str:
@@ -184,9 +268,7 @@ def _frozen_dq_population(
     schedule_by_scope = {
         str(receipt["scope"]): receipt for receipt in by_kind["schedule"]
     }
-    roster_by_scope = {
-        str(receipt["scope"]): receipt for receipt in by_kind["roster"]
-    }
+    roster_by_scope = {str(receipt["scope"]): receipt for receipt in by_kind["roster"]}
     if (
         len(schedule_by_scope) != len(by_kind["schedule"])
         or sorted(schedule_by_scope) != plan_scopes
@@ -224,7 +306,10 @@ def _frozen_dq_population(
         if (
             not source_stage_ids
             or source_stage_ids != sorted(set(source_stage_ids))
-            or any(type(stage_id) is not int or stage_id <= 0 for stage_id in source_stage_ids)
+            or any(
+                type(stage_id) is not int or stage_id <= 0
+                for stage_id in source_stage_ids
+            )
         ):
             raise AirflowException(
                 f"schedule receipt has invalid frozen stage IDs for {scope}"
@@ -298,9 +383,7 @@ def _frozen_dq_population(
         {
             int(player_id)
             for receipt in by_kind["roster"]
-            for player_id in receipt.get("outcome", {}).get(
-                "profile_player_ids", []
-            )
+            for player_id in receipt.get("outcome", {}).get("profile_player_ids", [])
         }
     )
     owner_scope = plan_scopes[0]
@@ -318,10 +401,9 @@ def _frozen_dq_population(
         for receipt in by_kind["profiles"]
         for player_id in receipt.get("outcome", {}).get("player_ids", [])
     ]
-    if (
-        len(receipt_player_ids) != len(frozen_player_ids)
-        or set(receipt_player_ids) != set(frozen_player_ids)
-    ):
+    if len(receipt_player_ids) != len(frozen_player_ids) or set(
+        receipt_player_ids
+    ) != set(frozen_player_ids):
         raise AirflowException(
             "backfill profile receipts do not exactly cover the frozen roster population"
         )
@@ -332,8 +414,7 @@ def _frozen_dq_population(
         "queue_id": queue_id,
         "plan_id": plan_id,
         "checkpoint": {
-            field: checkpoint_artifact[field]
-            for field in ("key", "sha256", "bytes")
+            field: checkpoint_artifact[field] for field in ("key", "sha256", "bytes")
         },
         "matches": sorted(
             matches,
@@ -381,7 +462,7 @@ def _frozen_scope_feed_integrity(
 
     from dags.dag_ingest_whoscored import _feed_state_integrity_summary
     from scrapers.whoscored.parsers import PARSER_VERSION
-    from utils.silver_tasks import _get_trino_connection
+    from scrapers.base.trino_manager import get_trino_connection
 
     counters = {
         "frozen_scope_stage_count": 0,
@@ -427,7 +508,7 @@ def _frozen_scope_feed_integrity(
         eligible_sql = staged_scope_relation_sql(staged_relation)
     except FrozenDQError as exc:
         raise AirflowException(str(exc)) from exc
-    conn = _get_trino_connection()
+    conn = get_trino_connection()
     try:
         cur = conn.cursor()
         try:
@@ -505,6 +586,15 @@ def _as_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc)
+
+
+def _catalog_as_of_date(context: Mapping[str, Any]) -> date:
+    logical_date = context.get("logical_date")
+    if not isinstance(logical_date, datetime) or logical_date.tzinfo is None:
+        raise AirflowException(
+            "WhoScored catalog discovery requires a timezone-aware logical_date"
+        )
+    return logical_date.date()
 
 
 def _initial_backfill_started_at(context: Mapping[str, Any]) -> datetime:
@@ -677,9 +767,7 @@ def _backfill_slo_summary(
         "observed_sample_elapsed_hours": round(elapsed_seconds / 3600, 6),
         "observed_sample_completed_request_units": actual_completed,
         "observed_request_units_per_day": (
-            round(observed_per_day, 6)
-            if observed_per_day is not None
-            else None
+            round(observed_per_day, 6) if observed_per_day is not None else None
         ),
         "observed_projected_days_remaining": (
             round(observed_projected_days, 6)
@@ -712,11 +800,9 @@ BACKFILL_ARGS = {
 }
 
 _RUN_DIR_TEMPLATE = (
-    RUN_ROOT + "/{{ dag.dag_id | stable_safe_token }}/"
-    "{{ run_id | stable_safe_token }}"
+    RUN_ROOT + "/{{ dag.dag_id | stable_safe_token }}/{{ run_id | stable_safe_token }}"
 )
 _TASK_ENV = {
-    "PYTHONPATH": "/opt/airflow:/opt/airflow/dags",
     "PATH": "/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin",
     "HOME": "/home/airflow",
     "WHOSCORED_SCHEMA_READY": "1",
@@ -750,6 +836,9 @@ def _runtime_params(context: Mapping[str, Any]) -> Dict[str, Any]:
             "all_catalog",
             "require_zero_paid",
             "direct_only",
+            "transport_policy",
+            "paid_approval_id",
+            "paid_approval_sha256",
             "full_history_catalog",
         ):
             if key in conf:
@@ -887,10 +976,7 @@ def _persist_discovery_request_ledger(
             )
         return value
 
-    if any(
-        counter(event, "paid_proxy_bytes")
-        for event in request_events
-    ):
+    if any(counter(event, "paid_proxy_bytes") for event in request_events):
         raise AirflowException(
             "WhoScored discovery ledger contains unaccounted paid bytes"
         )
@@ -935,6 +1021,56 @@ def _persist_discovery_request_ledger(
     }
 
 
+def _persist_discovery_report_attribution(
+    *,
+    traffic: Mapping[str, Any],
+    identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Persist report-owned paid attribution independently of request events."""
+
+    from dags.dag_ingest_whoscored import _canonical_traffic_url
+
+    raw_paid = traffic.get("paid_proxy_bytes", 0)
+    raw_urls = traffic.get("paid_proxy_bytes_by_url", {})
+    if type(raw_paid) is not int or raw_paid < 0 or not isinstance(raw_urls, Mapping):
+        raise AirflowException(
+            "WhoScored discovery returned invalid paid report attribution"
+        )
+    urls: dict[str, int] = {}
+    for raw_url, raw_count in raw_urls.items():
+        url = _canonical_traffic_url(raw_url)
+        if not url or type(raw_count) is not int or raw_count <= 0 or url in urls:
+            raise AirflowException(
+                "WhoScored discovery returned invalid paid URL attribution"
+            )
+        urls[url] = raw_count
+    if sum(urls.values()) != raw_paid:
+        raise AirflowException("WhoScored discovery paid report URL counters differ")
+    task_key = f"{identity['task_id']}[{identity['map_index']}]"
+    task_try_key = f"{task_key}/try{identity['try_number']}"
+    evidence = {
+        "schema_version": 1,
+        "evidence_type": "whoscored_report_paid_attribution",
+        **dict(identity),
+        "paid_proxy_bytes": raw_paid,
+        "paid_proxy_bytes_by_url": dict(sorted(urls.items())),
+        "paid_proxy_bytes_by_task": {task_key: raw_paid} if raw_paid else {},
+        "paid_proxy_bytes_by_task_try": ({task_try_key: raw_paid} if raw_paid else {}),
+    }
+    from dags.scripts.whoscored_ops_store import WhoScoredOpsStore
+
+    ops_store = WhoScoredOpsStore.from_env(optional=False)
+    if ops_store is None:  # pragma: no cover - guarded by optional=False
+        raise AirflowException("WhoScored operational S3 store is required")
+    prefix = (
+        "traffic/"
+        f"{stable_safe_token(identity['dag_id'])}/"
+        f"{stable_safe_token(identity['run_id'])}/report-attribution"
+    )
+    artifact = ops_store.put_content_addressed_json(prefix, evidence)
+    return {**artifact, "paid_proxy_bytes": raw_paid}
+
+
 def validate_backfill_params(**context: Any) -> Dict[str, Any]:
     params = _runtime_params(context)
     executor = os.environ.get("AIRFLOW__CORE__EXECUTOR", "").strip()
@@ -943,26 +1079,22 @@ def validate_backfill_params(**context: Any) -> Dict[str, Any]:
             "WhoScored backfill requires AIRFLOW__CORE__EXECUTOR=LocalExecutor; "
             f"got {executor or 'unset'}"
         )
-    if not bool(params.get("direct_only", True)):
+    transport = _transport_runtime(context)
+    if not transport.is_paid and (
+        not bool(params.get("direct_only", True))
+        or not bool(params.get("require_zero_paid", True))
+    ):
         raise AirflowException(
-            "dag_backfill_whoscored is permanently direct-only; paid transport is "
-            "available only through an explicitly approved manual replay CLI"
+            "legacy booleans cannot authorize paid WhoScored traffic; use a "
+            "signed direct_then_paid DagRun configuration"
         )
-    if not bool(params.get("require_zero_paid", True)):
-        raise AirflowException("WhoScored backfill must enforce zero paid proxy bytes")
-    from scrapers.whoscored.runtime_contract import (
-        RuntimeContractError,
-        validate_airflow_source_pool,
-        validate_runtime_contract,
-    )
-
     try:
-        validate_runtime_contract()
-        validate_airflow_source_pool(
+        _WHOSCORED_RUNTIME_CONTRACT.validate_runtime_contract()
+        _WHOSCORED_RUNTIME_CONTRACT.validate_airflow_source_pool(
             direct_pool=DIRECT_POOL,
             backfill_pool=BACKFILL_POOL,
         )
-    except RuntimeContractError as exc:
+    except _WHOSCORED_RUNTIME_CONTRACT.RuntimeContractError as exc:
         raise AirflowException(str(exc)) from exc
     raw_scopes = params.get("scopes") or []
     game_ids = params.get("game_ids") or []
@@ -1036,11 +1168,14 @@ def validate_backfill_params(**context: Any) -> Dict[str, Any]:
     }
 
 
-def prepare_backfill_plan(**context: Any) -> Dict[str, Any]:
+def prepare_backfill_plan(
+    *,
+    alert_metadata: Optional[Mapping[str, Any]] = None,
+    **context: Any,
+) -> Dict[str, Any]:
     """Freeze the exact eligible scope set as one immutable S3 plan."""
 
     validated = validate_backfill_params(**context)
-    os.environ["WHOSCORED_PAID_PROXY_URL"] = ""
     params = _runtime_params(context)
     from dags.scripts import run_whoscored_scraper as runner
     from dags.scripts.whoscored_ops_store import WhoScoredBackfillState
@@ -1062,6 +1197,7 @@ def prepare_backfill_plan(**context: Any) -> Dict[str, Any]:
             "catalog_generation": plan.get("provenance", {}).get("catalog_batch_id"),
             "discovery_traffic_required": False,
             "discovery_traffic_evidence": None,
+            "discovery_report_attribution": None,
         }
 
     repository = runner._new_repository()
@@ -1070,6 +1206,16 @@ def prepare_backfill_plan(**context: Any) -> Dict[str, Any]:
         validated["all_catalog"] or params.get("full_history_catalog", False)
     )
     if full_history_catalog:
+        discovery_transport = _transport_runtime(
+            context,
+            task_id="prepare_backfill_plan",
+            work_item_id="catalog-discovery",
+        )
+        discovery_alert_metadata = validate_paid_alert_for_source(
+            discovery_transport,
+            alert_metadata,
+            context,
+        )
         service_cls = runner._load_runtime()
         discovery_report = runner._new_report("discover", ())
         ledger_path, traffic_identity = _discovery_request_ledger_path(context)
@@ -1085,47 +1231,53 @@ def prepare_backfill_plan(**context: Any) -> Dict[str, Any]:
         previous_environment = {
             key: os.environ.get(key) for key in discovery_environment
         }
-        os.environ.update(discovery_environment)
-        try:
-            result = runner._run_discover(
-                service_cls,
-                repository,
-                discovery_report,
-                full_history=True,
-            )
-        finally:
-            try:
-                discovery_traffic_evidence = _persist_discovery_request_ledger(
-                    path=ledger_path,
-                    identity=traffic_identity,
-                )
-            finally:
-                for key, value in previous_environment.items():
-                    if value is None:
-                        os.environ.pop(key, None)
-                    else:
-                        os.environ[key] = value
+        with projected_paid_alert_environment(discovery_alert_metadata):
+            with projected_transport_environment(discovery_transport, context):
+                os.environ.update(discovery_environment)
+                try:
+                    result = runner._run_discover(
+                        service_cls,
+                        repository,
+                        discovery_report,
+                        full_history=True,
+                        as_of_date=_catalog_as_of_date(context),
+                    )
+                finally:
+                    try:
+                        discovery_traffic_evidence = _persist_discovery_request_ledger(
+                            path=ledger_path,
+                            identity=traffic_identity,
+                        )
+                    finally:
+                        for key, value in previous_environment.items():
+                            if value is None:
+                                os.environ.pop(key, None)
+                            else:
+                                os.environ[key] = value
         reported_traffic = getattr(result, "traffic", {})
-        try:
-            reported_paid = int(
-                reported_traffic.get("paid_proxy_bytes", 0)
-                if isinstance(reported_traffic, Mapping)
-                else 0
-            )
-        except (TypeError, ValueError) as exc:
+        raw_reported_paid = (
+            reported_traffic.get("paid_proxy_bytes", 0)
+            if isinstance(reported_traffic, Mapping)
+            else 0
+        )
+        if type(raw_reported_paid) is not int or raw_reported_paid < 0:
             raise AirflowException(
                 "WhoScored discovery returned invalid paid traffic evidence"
-            ) from exc
+            )
+        reported_paid = raw_reported_paid
+        discovery_report_attribution = _persist_discovery_report_attribution(
+            traffic=(reported_traffic if isinstance(reported_traffic, Mapping) else {}),
+            identity=traffic_identity,
+        )
         if reported_paid != discovery_traffic_evidence["paid_proxy_bytes"]:
             raise AirflowException(
                 "WhoScored discovery paid traffic ledger/report mismatch: "
                 f"ledger={discovery_traffic_evidence['paid_proxy_bytes']}, "
                 f"report={reported_paid}"
             )
-        if reported_paid:
+        if not discovery_transport.is_paid and reported_paid:
             raise AirflowException(
-                "WhoScored backfill discovery used paid proxy: "
-                f"{reported_paid} bytes"
+                f"WhoScored backfill discovery used paid proxy: {reported_paid} bytes"
             )
         if getattr(result, "errors", None):
             raise AirflowException(
@@ -1134,6 +1286,7 @@ def prepare_backfill_plan(**context: Any) -> Dict[str, Any]:
             )
     else:
         discovery_traffic_evidence = None
+        discovery_report_attribution = None
 
     provenance, catalog_snapshot = repository.load_catalog_generation_snapshot()
     catalog_discovery_mode = str(provenance.get("catalog_discovery_mode") or "")
@@ -1218,6 +1371,7 @@ def prepare_backfill_plan(**context: Any) -> Dict[str, Any]:
         "catalog_generation": provenance["catalog_batch_id"],
         "discovery_traffic_required": full_history_catalog,
         "discovery_traffic_evidence": discovery_traffic_evidence,
+        "discovery_report_attribution": discovery_report_attribution,
     }
 
 
@@ -1247,6 +1401,7 @@ def _controller_batch_id(context: Mapping[str, Any]) -> str:
 def build_backfill_commands(
     *,
     plan_ref: Mapping[str, Any],
+    alert_metadata: Optional[Mapping[str, Any]] = None,
     **context: Any,
 ) -> list[str]:
     """Return at most 100 independent commands from durable pending state."""
@@ -1280,9 +1435,20 @@ def build_backfill_commands(
         limit=MAX_WORK_ITEMS_PER_RUN,
         request_unit_limit=request_unit_limit,
     )
-    direct_flag = " --direct-only"
+    base_transport = _transport_runtime(context)
     commands: list[str] = []
     for item in batch["work_items"]:
+        work_item_id = str(item["work_id"])
+        transport = _bind_transport_allocation(
+            base_transport,
+            task_id="run_whoscored_backfill_item",
+            work_item_id=work_item_id,
+        )
+        alert_guard = paid_alert_source_guard_command(
+            transport,
+            alert_metadata,
+            context,
+        )
         encoded = (
             base64.urlsafe_b64encode(
                 json.dumps(item, separators=(",", ":"), sort_keys=True).encode("utf-8")
@@ -1290,14 +1456,21 @@ def build_backfill_commands(
             .decode("ascii")
             .rstrip("=")
         )
-        output = _work_output_path(context, str(item["work_id"]))
+        output = _work_output_path(context, work_item_id)
+        output_argument = (
+            shlex.quote(str(output.with_suffix("")) + "_try")
+            + '"${AIRFLOW_CTX_TRY_NUMBER}"'
+            + shlex.quote(output.suffix)
+        )
         commands.append(
             "cd /opt/airflow && "
+            f"{alert_guard}"
             "python dags/scripts/run_whoscored_backfill_item.py "
             f"--queue-id {shlex.quote(queue_id)} "
             f"--plan-id {shlex.quote(plan_id)} "
             f"--work-item {shlex.quote(encoded)} "
-            f"--output {shlex.quote(str(output))}{direct_flag}"
+            f"--output {output_argument} "
+            f"{transport.cli_args(work_item_id=work_item_id)}"
         )
     return commands
 
@@ -1325,6 +1498,52 @@ def validate_backfill_batch(
     return {**progress, "slo": _backfill_slo_summary(plan, progress)}
 
 
+def _continuation_transport_conf(transport: PaidRuntime) -> Dict[str, Any]:
+    if transport.is_paid:
+        raise AirflowException(
+            "paid authority is bound to one exact DagRun and cannot be continued"
+        )
+    return {
+        "transport_policy": transport.policy,
+        "direct_only": True,
+        "require_zero_paid": True,
+    }
+
+
+_CONTINUATION_REQUIRED_TASK_IDS = frozenset(
+    {
+        "run_whoscored_backfill_item",
+        "validate_whoscored_backfill_batch",
+        "validate_global_historical_dq",
+        "report_whoscored_backfill_traffic",
+    }
+)
+
+
+def _require_successful_continuation_upstreams(context: Mapping[str, Any]) -> None:
+    """Refuse a new DagRun unless every source and terminal DQ task succeeded."""
+    dag_run = context.get("dag_run")
+    if dag_run is None or not callable(getattr(dag_run, "get_task_instances", None)):
+        raise AirflowException("continuation requires DagRun task-state context")
+    observed: dict[str, list[str]] = {
+        task_id: [] for task_id in _CONTINUATION_REQUIRED_TASK_IDS
+    }
+    for item in dag_run.get_task_instances():
+        if item.task_id not in observed:
+            continue
+        observed[item.task_id].append(str(item.state or "none").lower().split(".")[-1])
+    failures = [
+        f"{task_id}={states or ['missing']}"
+        for task_id, states in sorted(observed.items())
+        if not states or any(state != "success" for state in states)
+    ]
+    if failures:
+        raise AirflowException(
+            "WhoScored continuation blocked by unsuccessful upstreams: "
+            + ", ".join(failures)
+        )
+
+
 def schedule_backfill_continuation(
     *,
     plan_ref: Mapping[str, Any],
@@ -1345,8 +1564,7 @@ def schedule_backfill_continuation(
     slo = _backfill_slo_summary(plan, progress, enforce_capacity=False)
     if slo["capacity_status"] == "breach":
         raise AirflowException(
-            "WhoScored continuation stopped by 30-day capacity preflight: "
-            f"{slo}"
+            f"WhoScored continuation stopped by 30-day capacity preflight: {slo}"
         )
     if progress["status"] == "complete":
         return {**progress, "slo": slo, "continuation": "not_required"}
@@ -1354,6 +1572,38 @@ def schedule_backfill_continuation(
         raise AirflowException(
             f"incomplete WhoScored plan has no schedulable work: {progress}"
         )
+    _require_successful_continuation_upstreams(context)
+
+    transport = _transport_runtime(context)
+    if transport.is_paid:
+        if transport.approval is None:
+            raise AirflowException("paid continuation has no verified approval")
+        try:
+            campaign = paid_campaign_gateway_call(transport.approval, "snapshot")
+        except WhoScoredProxyRuntimeError as exc:
+            raise AirflowException(
+                f"WhoScored paid continuation campaign gateway is invalid: {exc}"
+            ) from exc
+        campaign_status = str(campaign.get("status") or "")
+        if campaign_status == "revoked":
+            raise AirflowException("WhoScored paid campaign is revoked")
+        if campaign_status not in {"active", "awaiting_approval", "complete"}:
+            raise AirflowException(
+                f"WhoScored paid campaign has invalid state: {campaign_status!r}"
+            )
+        # Campaign state is bound to the current signed DagRun. Reusing the
+        # approval in the deterministic continuation would either violate the
+        # replay boundary or fail its run-id claim, so a new approval is always
+        # required for the next DagRun.
+        return {
+            **progress,
+            "slo": slo,
+            "continuation": "awaiting_approval",
+            "campaign_id": transport.campaign_id,
+            "approval_id": transport.approval_id,
+            "campaign_status": campaign_status,
+            "awaiting_reason": "new_dagrun_requires_new_approval",
+        }
 
     dag_run = context.get("dag_run")
     parent_run_id = str(context.get("run_id") or getattr(dag_run, "run_id", "") or "")
@@ -1393,11 +1643,10 @@ def schedule_backfill_continuation(
     conf = {
         "queue_id": queue_id,
         "plan_id": plan_id,
-        "direct_only": True,
-        "require_zero_paid": True,
         "parent_run_id": parent_run_id,
         "start_receipts": int(progress["successful_receipts"]),
         "no_progress_runs": no_progress_runs,
+        **_continuation_transport_conf(transport),
     }
     from airflow.api.common.trigger_dag import trigger_dag
     from airflow.exceptions import DagRunAlreadyExists
@@ -1440,7 +1689,7 @@ def _global_historical_integrity_summary(
         PREVIEW_DATASET_TABLES,
         SCOPE_DATASET_TABLES,
     )
-    from utils.silver_tasks import _get_trino_connection
+    from scrapers.base.trino_manager import get_trino_connection
 
     parser_sql = "'" + PARSER_VERSION.replace("'", "''") + "'"
     availability_sql = "'" + MATCH_AVAILABILITY_VERSION.replace("'", "''") + "'"
@@ -1516,7 +1765,7 @@ def _global_historical_integrity_summary(
         else "WHERE state='success' ORDER BY completed_at DESC LIMIT 1"
     )
     frozen_summary: dict[str, int] = {}
-    conn = _get_trino_connection()
+    conn = get_trino_connection()
     try:
         cur = conn.cursor()
         try:
@@ -1733,8 +1982,7 @@ def _global_historical_integrity_summary(
                 if frozen_population is not None:
                     eligible_cte = f"eligible AS ({eligible_sql}),"
                     eligible_join = (
-                        "JOIN eligible e ON e.league=m.league "
-                        "AND e.season=m.season"
+                        "JOIN eligible e ON e.league=m.league AND e.season=m.season"
                     )
                 cur.execute(
                     f"""
@@ -1801,9 +2049,7 @@ def _global_historical_integrity_summary(
                 }
 
             for entity, table in (
-                ()
-                if frozen_population is not None
-                else MATCH_DATASET_TABLES.items()
+                () if frozen_population is not None else MATCH_DATASET_TABLES.items()
             ):
                 cur.execute(
                     f"""
@@ -1837,9 +2083,7 @@ def _global_historical_integrity_summary(
                 }
 
             for entity, table in (
-                ()
-                if frozen_population is not None
-                else PREVIEW_DATASET_TABLES.items()
+                () if frozen_population is not None else PREVIEW_DATASET_TABLES.items()
             ):
                 cur.execute(
                     f"""
@@ -2207,9 +2451,9 @@ def validate_global_historical_dq(
         raise AirflowException(
             f"WhoScored global historical DQ failed: {failures}; {summary}"
         )
-    from utils.silver_tasks import _get_trino_connection
+    from scrapers.base.trino_manager import get_trino_connection
 
-    conn = _get_trino_connection()
+    conn = get_trino_connection()
     try:
         cur = conn.cursor()
         try:
@@ -2235,15 +2479,10 @@ def report_backfill_traffic(
 ) -> Dict[str, Any]:
     from dags.dag_ingest_whoscored import aggregate_traffic_reports
 
-    summary = aggregate_traffic_reports(allow_empty=True, **context)
-    if not plan_ref or not bool(plan_ref.get("discovery_traffic_required")):
-        return summary
-    expected = plan_ref.get("discovery_traffic_evidence")
-    if not isinstance(expected, Mapping):
-        raise AirflowException(
-            "WhoScored backfill discovery traffic evidence is missing"
-        )
-    required_fields = {
+    discovery_required = bool(plan_ref and plan_ref.get("discovery_traffic_required"))
+    expected_request = plan_ref.get("discovery_traffic_evidence") if plan_ref else None
+    expected_report = plan_ref.get("discovery_report_attribution") if plan_ref else None
+    request_reference_fields = {
         "uri",
         "key",
         "sha256",
@@ -2253,18 +2492,45 @@ def report_backfill_traffic(
         "wire_bytes",
         "paid_proxy_bytes",
     }
-    if set(expected) != required_fields:
+    report_reference_fields = {
+        "uri",
+        "key",
+        "sha256",
+        "bytes",
+        "paid_proxy_bytes",
+    }
+    if discovery_required and (
+        not isinstance(expected_request, Mapping)
+        or set(expected_request) != request_reference_fields
+        or not isinstance(expected_report, Mapping)
+        or set(expected_report) != report_reference_fields
+    ):
         raise AirflowException(
             "WhoScored backfill discovery traffic reference is invalid"
         )
+    if not discovery_required:
+        return aggregate_traffic_reports(allow_empty=True, **context)
+    assert isinstance(expected_request, Mapping)  # validated above
+    assert isinstance(expected_report, Mapping)  # validated above
     identity = _discovery_traffic_identity(context)
-    prefix = (
+    request_prefix = (
         "traffic/"
         f"{stable_safe_token(identity['dag_id'])}/"
         f"{stable_safe_token(identity['run_id'])}/request-ledgers/"
     )
-    key = expected.get("key")
-    if not isinstance(key, str) or not key.startswith(prefix):
+    report_prefix = (
+        "traffic/"
+        f"{stable_safe_token(identity['dag_id'])}/"
+        f"{stable_safe_token(identity['run_id'])}/report-attribution/"
+    )
+    request_key = expected_request.get("key")
+    report_key = expected_report.get("key")
+    if (
+        not isinstance(request_key, str)
+        or not request_key.startswith(request_prefix)
+        or not isinstance(report_key, str)
+        or not report_key.startswith(report_prefix)
+    ):
         raise AirflowException(
             "WhoScored discovery traffic artifact belongs to another DagRun"
         )
@@ -2273,18 +2539,45 @@ def report_backfill_traffic(
     ops_store = WhoScoredOpsStore.from_env(optional=False)
     if ops_store is None:  # pragma: no cover - guarded by optional=False
         raise AirflowException("WhoScored operational S3 store is required")
-    evidence = ops_store.read_content_addressed_json(
-        key,
-        expected_sha256=str(expected.get("sha256") or ""),
-        expected_bytes=int(expected.get("bytes") or 0),
+    request_evidence = ops_store.read_content_addressed_json(
+        request_key,
+        expected_sha256=str(expected_request.get("sha256") or ""),
+        expected_bytes=int(expected_request.get("bytes") or 0),
+    )
+    report_evidence = ops_store.read_content_addressed_json(
+        report_key,
+        expected_sha256=str(expected_report.get("sha256") or ""),
+        expected_bytes=int(expected_report.get("bytes") or 0),
     )
     for field in ("event_count", "request_count", "wire_bytes", "paid_proxy_bytes"):
-        if evidence.get(field) != expected.get(field):
+        if request_evidence.get(field) != expected_request.get(field):
             raise AirflowException(
                 "WhoScored discovery traffic artifact summary mismatch: " + field
             )
-    if int(expected.get("paid_proxy_bytes") or 0) != 0:
+    if (
+        report_evidence.get("paid_proxy_bytes")
+        != expected_report.get("paid_proxy_bytes")
+        or report_evidence.get("paid_proxy_bytes")
+        != request_evidence.get("paid_proxy_bytes")
+        or report_evidence.get("dag_id") != identity["dag_id"]
+        or report_evidence.get("run_id") != identity["run_id"]
+        or report_evidence.get("task_id") != "prepare_backfill_plan"
+    ):
+        raise AirflowException(
+            "WhoScored discovery report/request attribution mismatch"
+        )
+    external_paid = report_evidence.get("paid_proxy_bytes")
+    if type(external_paid) is not int or external_paid < 0:
+        raise AirflowException(
+            "WhoScored backfill discovery paid traffic reference is invalid"
+        )
+    if not _transport_runtime(context).is_paid and external_paid != 0:
         raise AirflowException("WhoScored backfill discovery used paid proxy")
+    summary = aggregate_traffic_reports(
+        allow_empty=True,
+        additional_reported_paid_attribution=report_evidence,
+        **context,
+    )
     if int(summary.get("durable_request_ledgers") or 0) < 1:
         raise AirflowException(
             "WhoScored terminal traffic DQ omitted discovery evidence"
@@ -2344,6 +2637,7 @@ with DAG(
     schedule=None,
     start_date=datetime(2024, 1, 1),
     catchup=False,
+    is_paused_upon_creation=True,
     max_active_runs=1,
     dagrun_timeout=timedelta(hours=12),
     # Deduplicate mapped-worker failures into one notification per DagRun.
@@ -2356,6 +2650,17 @@ with DAG(
         "queue_id": Param(default="", type="string", pattern="^[A-Za-z0-9_.-]{0,120}$"),
         "plan_id": Param(default="", type="string", pattern="^$|^[0-9a-f]{64}$"),
         "all_catalog": Param(default=False, type="boolean"),
+        "transport_policy": Param(
+            default="direct_only",
+            type="string",
+            enum=["direct_only", "direct_then_paid"],
+        ),
+        "paid_approval_id": Param(default="", type="string"),
+        "paid_approval_sha256": Param(
+            default="",
+            type="string",
+            pattern="^$|^[0-9a-f]{64}$",
+        ),
         "require_zero_paid": Param(default=True, type="boolean"),
         "direct_only": Param(default=True, type="boolean"),
         "full_history_catalog": Param(default=False, type="boolean"),
@@ -2379,19 +2684,33 @@ with DAG(
         python_callable=validate_backfill_params,
         execution_timeout=timedelta(minutes=5),
     )
+    paid_alert_preflight = PythonOperator(
+        task_id="validate_whoscored_paid_alert_delivery",
+        python_callable=validate_transport_alert_delivery,
+        retries=0,
+        execution_timeout=timedelta(minutes=1),
+    )
     prepare_plan = PythonOperator(
         task_id="prepare_backfill_plan",
         python_callable=prepare_backfill_plan,
+        op_kwargs={"alert_metadata": paid_alert_preflight.output},
         pool=BACKFILL_POOL,
         # Discovery is serialized against mapped source workers by holding the
         # full validated source-pool capacity.
         pool_slots=BACKFILL_SOURCE_POOL_SLOTS,
+        # In-process discovery persists one exact task/request report. Airflow
+        # retry would retain provider bytes but replace that report; a later
+        # manually approved DagRun resumes safely from raw storage instead.
+        retries=0,
         execution_timeout=timedelta(hours=8),
     )
     build_commands = PythonOperator(
         task_id="build_backfill_work",
         python_callable=build_backfill_commands,
-        op_kwargs={"plan_ref": prepare_plan.output},
+        op_kwargs={
+            "plan_ref": prepare_plan.output,
+            "alert_metadata": paid_alert_preflight.output,
+        },
         execution_timeout=timedelta(minutes=10),
     )
     run_backfill = BashOperator.partial(
@@ -2459,7 +2778,8 @@ with DAG(
         trigger_rule="all_done",
     )
 
-    validate_params >> prepare_plan >> build_commands >> run_backfill
+    validate_params >> paid_alert_preflight >> prepare_plan
+    prepare_plan >> build_commands >> run_backfill
     run_backfill >> [backfill_dq, traffic_dq]
     backfill_dq >> historical_dq
     [run_backfill, backfill_dq, historical_dq, traffic_dq] >> continue_backfill

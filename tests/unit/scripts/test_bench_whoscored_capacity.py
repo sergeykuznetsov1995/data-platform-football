@@ -30,6 +30,11 @@ capacity = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = capacity
 SPEC.loader.exec_module(capacity)
 
+DERIVED_FLARESOLVERR_IMAGE_ID = "sha256:" + "f" * 64
+EXPECTED_CURL_CFFI_SHA256 = (
+    "2b6c847d86283b07ae69bb72c82eb8a59242277142aa35b89850f89e792a02fc"
+)
+
 
 def _args(**overrides: Any) -> Namespace:
     values = {
@@ -103,17 +108,22 @@ def _container_state(
     running: bool = True,
     container_id: str | None = None,
     image_id: str | None = None,
+    image_identity_contract_ok: bool = True,
 ) -> dict[str, Any]:
     return {
         "name": name,
         "id": container_id or f"id-{name}",
         "image_id": image_id or (
-            capacity.REQUIRED_FLARESOLVERR_IMAGE_ID
+            DERIVED_FLARESOLVERR_IMAGE_ID
             if name == "flaresolverr"
             else f"sha256:{name}"
         ),
         "command_contract_ok": name == "flaresolverr",
-        "helper_mount_contract_ok": name == "flaresolverr",
+        "image_identity_contract_ok": (
+            name == "flaresolverr" and image_identity_contract_ok
+        ),
+        "immutable_payload_contract_ok": name == "flaresolverr",
+        "security_contract_ok": name == "flaresolverr",
         "compose_identity_ok": name == "flaresolverr",
         "published_endpoint_contract_ok": name == "flaresolverr",
         "status": "running" if running else "exited",
@@ -688,7 +698,24 @@ def test_preflight_pin_matches_production_scraping_requirements():
         / "requirements-scraping.txt"
     ).read_text().splitlines()
 
-    assert f"curl_cffi=={capacity.REQUIRED_CURL_CFFI_VERSION}" in requirements
+    requirement_rows = [
+        line.split()
+        for line in requirements
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    curl_cffi_rows = [
+        [row[0].lower().replace("_", "-"), *row[1:]]
+        for row in requirement_rows
+        if row[0].partition("==")[0].lower().replace("_", "-")
+        == "curl-cffi"
+    ]
+
+    assert curl_cffi_rows == [
+        [
+            f"curl-cffi=={capacity.REQUIRED_CURL_CFFI_VERSION}",
+            f"--hash=sha256:{EXPECTED_CURL_CFFI_SHA256}",
+        ]
+    ]
 
 
 def test_real_run_stops_before_host_monitoring_when_preflight_fails(monkeypatch):
@@ -757,6 +784,7 @@ def test_wrong_flaresolverr_image_digest_stops_before_worker_launch():
                 image_id=("sha256:" + "0" * 64)
                 if name == "flaresolverr"
                 else None,
+                image_identity_contract_ok=name != "flaresolverr",
             )
             for name in names
         }
@@ -771,7 +799,7 @@ def test_wrong_flaresolverr_image_digest_stops_before_worker_launch():
     container_gate = _gate(report, "container_restart_oom")
     assert container_gate["passed"] is False
     assert any(
-        "image digest" in violation
+        "derived image ID" in violation
         for violation in container_gate["violations"]
     )
 
@@ -779,37 +807,44 @@ def test_wrong_flaresolverr_image_digest_stops_before_worker_launch():
 def test_host_docker_inspector_binds_restart_oom_and_pid_evidence(
     monkeypatch, tmp_path
 ):
-    environment_file = tmp_path / ".env"
-    environment_file.write_text("SAFE_TEST_VALUE=1\n")
-    environment_file.chmod(0o600)
+    environment_files = tuple(
+        tmp_path / name
+        for name in (".env", ".env.whoscored-rollout", ".env.proxy-pool")
+    )
+    for environment_file in environment_files:
+        environment_file.write_text("SAFE_TEST_VALUE=1\n")
+        environment_file.chmod(0o600)
     monkeypatch.setattr(
-        capacity, "PRODUCTION_COMPOSE_ENV_FILE", environment_file
+        capacity, "PRODUCTION_COMPOSE_ENV_FILES", environment_files
     )
     docker_payload = [
         {
             "Name": f"/{name}",
             "Id": ("a" if name == "airflow-scheduler" else "b") * 64,
             "Image": (
-                capacity.REQUIRED_FLARESOLVERR_IMAGE_ID
+                DERIVED_FLARESOLVERR_IMAGE_ID
                 if name == "flaresolverr"
                 else "sha256:" + "c" * 64
             ),
             "Config": (
                 {
                     "Cmd": list(capacity.REQUIRED_FLARESOLVERR_COMMAND),
+                    "Entrypoint": list(capacity.REQUIRED_FLARESOLVERR_ENTRYPOINT),
+                    "Image": capacity.REQUIRED_FLARESOLVERR_IMAGE_REFERENCE,
+                    "User": "1000:1000",
                     "Labels": {
                         "com.docker.compose.project": "data-platform",
                         "com.docker.compose.service": "flaresolverr",
                         "com.docker.compose.config-hash": "d" * 64,
                         "com.docker.compose.image": (
-                            capacity.REQUIRED_FLARESOLVERR_IMAGE_ID
+                            DERIVED_FLARESOLVERR_IMAGE_ID
                         ),
                         "com.docker.compose.oneoff": "False",
                         "com.docker.compose.project.config_files": str(
                             (capacity.REPO_ROOT / "compose.yaml").resolve()
                         ),
                         "com.docker.compose.project.environment_file": str(
-                            capacity.PRODUCTION_COMPOSE_ENV_FILE
+                            ",".join(str(path) for path in environment_files)
                         ),
                         "com.docker.compose.project.working_dir": str(
                             capacity.REPO_ROOT.resolve()
@@ -819,25 +854,24 @@ def test_host_docker_inspector_binds_restart_oom_and_pid_evidence(
                 if name == "flaresolverr"
                 else {}
             ),
-            "Mounts": (
-                [
-                    {
-                        "Type": "bind",
-                        "Source": str(
-                            (
-                                capacity.REPO_ROOT
-                                / "scripts"
-                                / "flaresolverr_extended.py"
-                            ).resolve()
-                        ),
-                        "Destination": "/app/flaresolverr_extended.py",
-                        "Mode": "ro",
-                        "RW": False,
-                    }
-                ]
+            "HostConfig": (
+                {
+                    "ReadonlyRootfs": True,
+                    "Tmpfs": dict(capacity.REQUIRED_FLARESOLVERR_TMPFS),
+                    "Privileged": False,
+                    "CapDrop": ["ALL"],
+                    "CapAdd": None,
+                    "SecurityOpt": [
+                        "no-new-privileges:true",
+                        "apparmor=docker-default",
+                        "seccomp=builtin",
+                    ],
+                }
                 if name == "flaresolverr"
-                else []
+                else {}
             ),
+            "AppArmorProfile": "docker-default" if name == "flaresolverr" else "",
+            "Mounts": [],
             "NetworkSettings": (
                 {
                     "Ports": {
@@ -865,9 +899,13 @@ def test_host_docker_inspector_binds_restart_oom_and_pid_evidence(
         observed["calls"].append((argv, kwargs))
         if argv[1] == "inspect":
             return SimpleNamespace(returncode=0, stdout=json.dumps(docker_payload))
-        if argv[1] == "compose":
+        if argv[0] == str(capacity.PRODUCTION_COMPOSE_WRAPPER):
             return SimpleNamespace(
                 returncode=0, stdout=f"flaresolverr {'d' * 64}\n"
+            )
+        if argv[1] == "image":
+            return SimpleNamespace(
+                returncode=0, stdout=DERIVED_FLARESOLVERR_IMAGE_ID + "\n"
             )
         stats = "\n".join(
             json.dumps(
@@ -895,8 +933,28 @@ def test_host_docker_inspector_binds_restart_oom_and_pid_evidence(
         "airflow-scheduler",
         "flaresolverr",
     ]
-    assert observed["calls"][1][0][:2] == ["docker", "compose"]
+    assert observed["calls"][1][0] == [
+        str(capacity.PRODUCTION_COMPOSE_WRAPPER),
+        *[
+            argument
+            for path in environment_files
+            for argument in ("--env-file", str(path))
+        ],
+        "-p",
+        capacity.REQUIRED_COMPOSE_PROJECT,
+        "config",
+        "--hash",
+        "flaresolverr",
+    ]
     assert observed["calls"][2][0] == [
+        "docker",
+        "image",
+        "inspect",
+        "--format",
+        "{{.Id}}",
+        capacity.REQUIRED_FLARESOLVERR_IMAGE_REFERENCE,
+    ]
+    assert observed["calls"][3][0] == [
         "docker",
         "stats",
         "--no-stream",
@@ -910,11 +968,12 @@ def test_host_docker_inspector_binds_restart_oom_and_pid_evidence(
     assert result["flaresolverr"]["restart_count"] == 1
     assert result["flaresolverr"]["pid"] == 1001
     assert (
-        result["flaresolverr"]["image_id"]
-        == capacity.REQUIRED_FLARESOLVERR_IMAGE_ID
+        result["flaresolverr"]["image_id"] == DERIVED_FLARESOLVERR_IMAGE_ID
     )
     assert result["flaresolverr"]["command_contract_ok"] is True
-    assert result["flaresolverr"]["helper_mount_contract_ok"] is True
+    assert result["flaresolverr"]["image_identity_contract_ok"] is True
+    assert result["flaresolverr"]["immutable_payload_contract_ok"] is True
+    assert result["flaresolverr"]["security_contract_ok"] is True
     assert result["flaresolverr"]["compose_identity_ok"] is True
     assert result["flaresolverr"]["published_endpoint_contract_ok"] is True
     assert result["flaresolverr"]["memory_usage_bytes"] == int(
@@ -922,13 +981,55 @@ def test_host_docker_inspector_binds_restart_oom_and_pid_evidence(
     )
 
 
+@pytest.mark.parametrize(
+    ("returncode", "stdout"),
+    [(1, ""), (0, "sha256:not-a-digest\n")],
+)
+def test_derived_image_resolution_fails_closed(monkeypatch, returncode, stdout):
+    monkeypatch.setattr(
+        capacity.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=returncode,
+            stdout=stdout,
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="image ID is unavailable"):
+        capacity._resolved_flaresolverr_image_id()
+
+
+def test_compose_hash_resolution_rejects_insecure_environment_file(
+    monkeypatch, tmp_path
+):
+    environment_files = tuple(tmp_path / f"env-{index}" for index in range(3))
+    for environment_file in environment_files:
+        environment_file.write_text("SAFE_TEST_VALUE=1\n")
+        environment_file.chmod(0o600)
+    environment_files[1].chmod(0o644)
+    monkeypatch.setattr(
+        capacity, "PRODUCTION_COMPOSE_ENV_FILES", environment_files
+    )
+    monkeypatch.setattr(
+        capacity.subprocess,
+        "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("compose wrapper reached")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="environment metadata is invalid"):
+        capacity._resolved_flaresolverr_compose_hash()
+
+
 def test_flaresolverr_inspect_contract_fails_each_runtime_binding():
     expected_hash = "d" * 64
     raw = {
         "Name": "/flaresolverr",
         "Id": "a" * 64,
-        "Image": capacity.REQUIRED_FLARESOLVERR_IMAGE_ID,
+        "Image": DERIVED_FLARESOLVERR_IMAGE_ID,
         "RestartCount": 0,
+        "AppArmorProfile": "docker-default",
         "State": {
             "Status": "running",
             "Running": True,
@@ -937,52 +1038,63 @@ def test_flaresolverr_inspect_contract_fails_each_runtime_binding():
         },
         "Config": {
             "Cmd": list(capacity.REQUIRED_FLARESOLVERR_COMMAND),
+            "Entrypoint": list(capacity.REQUIRED_FLARESOLVERR_ENTRYPOINT),
+            "Image": capacity.REQUIRED_FLARESOLVERR_IMAGE_REFERENCE,
+            "User": "1000:1000",
             "Labels": {
                 "com.docker.compose.project": capacity.REQUIRED_COMPOSE_PROJECT,
                 "com.docker.compose.service": "flaresolverr",
                 "com.docker.compose.config-hash": expected_hash,
-                "com.docker.compose.image": capacity.REQUIRED_FLARESOLVERR_IMAGE_ID,
+                "com.docker.compose.image": DERIVED_FLARESOLVERR_IMAGE_ID,
                 "com.docker.compose.oneoff": "False",
                 "com.docker.compose.project.config_files": str(
                     (capacity.REPO_ROOT / "compose.yaml").resolve()
                 ),
                 "com.docker.compose.project.environment_file": str(
-                    capacity.PRODUCTION_COMPOSE_ENV_FILE
+                    ",".join(
+                        str(path) for path in capacity.PRODUCTION_COMPOSE_ENV_FILES
+                    )
                 ),
                 "com.docker.compose.project.working_dir": str(
                     capacity.REPO_ROOT.resolve()
                 ),
             },
         },
-        "Mounts": [
-            {
-                "Type": "bind",
-                "Source": str(
-                    (
-                        capacity.REPO_ROOT
-                        / "scripts"
-                        / "flaresolverr_extended.py"
-                    ).resolve()
-                ),
-                "Destination": capacity.REQUIRED_FLARESOLVERR_MOUNT_TARGET,
-                "Mode": "ro",
-                "RW": False,
-            }
-        ],
+        "HostConfig": {
+            "ReadonlyRootfs": True,
+            "Tmpfs": dict(capacity.REQUIRED_FLARESOLVERR_TMPFS),
+            "Privileged": False,
+            "CapDrop": ["ALL"],
+            "CapAdd": None,
+            "SecurityOpt": [
+                "no-new-privileges:true",
+                "apparmor=docker-default",
+                "seccomp=builtin",
+            ],
+        },
+        "Mounts": [],
         "NetworkSettings": {
             "Ports": {
                 "8191/tcp": [{"HostIp": "127.0.0.1", "HostPort": "8191"}]
             }
         },
     }
-    valid = capacity._normalise_container(
-        raw, expected_flaresolverr_config_hash=expected_hash
-    )
+
+    def normalise(document):
+        return capacity._normalise_container(
+            document,
+            expected_flaresolverr_config_hash=expected_hash,
+            expected_flaresolverr_image_id=DERIVED_FLARESOLVERR_IMAGE_ID,
+        )
+
+    valid = normalise(raw)
     assert all(
         valid[field]
         for field in (
             "command_contract_ok",
-            "helper_mount_contract_ok",
+            "image_identity_contract_ok",
+            "immutable_payload_contract_ok",
+            "security_contract_ok",
             "compose_identity_ok",
             "published_endpoint_contract_ok",
         )
@@ -990,24 +1102,71 @@ def test_flaresolverr_inspect_contract_fails_each_runtime_binding():
 
     wrong_command = deepcopy(raw)
     wrong_command["Config"]["Cmd"] = ["python", "stock.py"]
-    assert capacity._normalise_container(
-        wrong_command, expected_flaresolverr_config_hash=expected_hash
-    )["command_contract_ok"] is False
-    writable_mount = deepcopy(raw)
-    writable_mount["Mounts"][0]["RW"] = True
-    assert capacity._normalise_container(
-        writable_mount, expected_flaresolverr_config_hash=expected_hash
-    )["helper_mount_contract_ok"] is False
+    assert normalise(wrong_command)["command_contract_ok"] is False
+    wrong_entrypoint = deepcopy(raw)
+    wrong_entrypoint["Config"]["Entrypoint"] = ["/bin/sh"]
+    assert normalise(wrong_entrypoint)["command_contract_ok"] is False
+    shadow_mount = deepcopy(raw)
+    shadow_mount["Mounts"] = [
+        {
+            "Type": "bind",
+            "Source": "/tmp/flaresolverr_extended.py",
+            "Destination": "/usr/local/libexec/whoscored/flaresolverr_extended.py",
+            "Mode": "ro",
+            "RW": False,
+        }
+    ]
+    assert normalise(shadow_mount)["immutable_payload_contract_ok"] is False
+    writable_root = deepcopy(raw)
+    writable_root["HostConfig"]["ReadonlyRootfs"] = False
+    assert normalise(writable_root)["immutable_payload_contract_ok"] is False
+    shadow_tmpfs = deepcopy(raw)
+    shadow_tmpfs["HostConfig"]["Tmpfs"][
+        "/usr/local/libexec/whoscored"
+    ] = "rw,noexec,nosuid,nodev,size=16m"
+    assert normalise(shadow_tmpfs)["immutable_payload_contract_ok"] is False
+    privileged = deepcopy(raw)
+    privileged["HostConfig"]["Privileged"] = True
+    assert normalise(privileged)["security_contract_ok"] is False
+    wrong_user = deepcopy(raw)
+    wrong_user["Config"]["User"] = "root"
+    assert normalise(wrong_user)["security_contract_ok"] is False
+    missing_cap_drop = deepcopy(raw)
+    missing_cap_drop["HostConfig"]["CapDrop"] = None
+    assert normalise(missing_cap_drop)["security_contract_ok"] is False
+    unexpected_cap_add = deepcopy(raw)
+    unexpected_cap_add["HostConfig"]["CapAdd"] = ["NET_ADMIN"]
+    assert normalise(unexpected_cap_add)["security_contract_ok"] is False
+    changed_security_options = deepcopy(raw)
+    changed_security_options["HostConfig"]["SecurityOpt"] = [
+        "no-new-privileges:true"
+    ]
+    assert normalise(changed_security_options)["security_contract_ok"] is False
+    changed_apparmor = deepcopy(raw)
+    changed_apparmor["AppArmorProfile"] = "unconfined"
+    assert normalise(changed_apparmor)["security_contract_ok"] is False
+    wrong_image = deepcopy(raw)
+    wrong_image["Image"] = "sha256:" + "0" * 64
+    assert normalise(wrong_image)["image_identity_contract_ok"] is False
+    wrong_image_reference = deepcopy(raw)
+    wrong_image_reference["Config"]["Image"] = "unreviewed:latest"
+    assert normalise(wrong_image_reference)["image_identity_contract_ok"] is False
+    supervised_compose = deepcopy(raw)
+    supervised_compose["Config"]["Labels"][
+        "com.docker.compose.project.config_files"
+    ] = ",".join(str(path.resolve()) for path in capacity.PRODUCTION_COMPOSE_FILES)
+    assert normalise(supervised_compose)["compose_identity_ok"] is True
+    unreviewed_overlay = deepcopy(raw)
+    unreviewed_overlay["Config"]["Labels"][
+        "com.docker.compose.project.config_files"
+    ] += ",/tmp/unreviewed.yaml"
+    assert normalise(unreviewed_overlay)["compose_identity_ok"] is False
     stale_compose = deepcopy(raw)
     stale_compose["Config"]["Labels"]["com.docker.compose.config-hash"] = "e" * 64
-    assert capacity._normalise_container(
-        stale_compose, expected_flaresolverr_config_hash=expected_hash
-    )["compose_identity_ok"] is False
+    assert normalise(stale_compose)["compose_identity_ok"] is False
     public_port = deepcopy(raw)
     public_port["NetworkSettings"]["Ports"]["8191/tcp"][0]["HostIp"] = "0.0.0.0"
-    assert capacity._normalise_container(
-        public_port, expected_flaresolverr_config_hash=expected_hash
-    )["published_endpoint_contract_ok"] is False
+    assert normalise(public_port)["published_endpoint_contract_ok"] is False
 
 
 def test_subprocess_round_launches_four_real_isolated_processes():
@@ -2611,6 +2770,7 @@ def test_procfs_sampler_fails_when_a_required_root_is_not_visible():
 def test_runtime_identity_covers_canary_parser_transport_and_container_helpers():
     identity = capacity._runtime_identity(capacity._parser().parse_args([]))
 
+    assert capacity.CANARY_VERSION == "whoscored-capacity-canary-v2"
     assert len(identity["git_revision"]) == 40
     assert len(identity["manifest_sha256"]) == 64
     assert identity["python_executable"] == sys.executable
@@ -2619,11 +2779,23 @@ def test_runtime_identity_covers_canary_parser_transport_and_container_helpers()
         "curl_cffi": capacity._installed_curl_cffi_version()
     }
     assert {
+        ".dockerignore",
+        "compose.seaweedfs-supervised.yaml",
         "compose.yaml",
+        "configs/seaweedfs/S3ProxyCaddyfile",
+        "docker/images/flaresolverr-whoscored/Dockerfile",
+        "docker/images/flaresolverr-whoscored/Dockerfile.dockerignore",
+        "docker/images/flaresolverr-whoscored/entrypoint.sh",
         "scripts/research/bench_whoscored_capacity.py",
         "scripts/research/bench_whoscored_workflow.py",
         "scripts/research/whoscored_capacity_worker_exec.py",
         "scripts/flaresolverr_extended.py",
+        "scripts/audit_seaweedfs_control_network.py",
+        "scripts/audit_seaweedfs_runtime_container.py",
+        "scripts/compose.sh",
+        "scripts/seaweedfs_legacy_entrypoint.sh",
+        "scripts/seaweedfs_lifecycle_lock.sh",
+        "scripts/validate_seaweedfs_s3_identity_config.py",
         "scripts/proxy_filter/filter_proxy.py",
         "docker/images/airflow/requirements-scraping.txt",
         "scrapers/utils/rate_limiter.py",

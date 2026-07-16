@@ -10,8 +10,9 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
+from pathlib import Path
 import subprocess
-import sys
 from typing import Mapping, Optional, Sequence
 
 from scrapers.fbref.settings import (
@@ -27,6 +28,8 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_PROXY_FILE = "/opt/airflow/proxys.txt"
 FETCH_WAVE_RUNNER = "/opt/airflow/dags/scripts/run_fbref_fetch_wave.py"
+LEGACY_SCRAPER_PYTHON_ENV = "LEGACY_SCRAPER_PYTHON"
+DEFAULT_LEGACY_SCRAPER_PYTHON = "/opt/legacy-scraper-venv/bin/python"
 FETCH_WAVE_RESULT_PREFIX = "FBREF_FETCH_WAVE_RESULT:"
 # A full 25-page wave sleeps 3s per page and needs one clearance bootstrap, so
 # it finishes in minutes.  Anything past this is a hung browser, not slow work.
@@ -49,6 +52,29 @@ FBREF_LIVE_BUDGET_PROFILES = {
     ),
     (FBREF_CANARY_REQUEST_LIMIT, FBREF_CANARY_BYTE_LIMIT_MB): "canary",
 }
+
+
+def _legacy_scraper_python() -> str:
+    """Return the explicit isolated browser runner or fail before claiming work."""
+
+    raw = os.environ.get(
+        LEGACY_SCRAPER_PYTHON_ENV,
+        DEFAULT_LEGACY_SCRAPER_PYTHON,
+    )
+    path = Path(str(raw))
+    if not path.is_absolute():
+        raise RuntimeError(f"{LEGACY_SCRAPER_PYTHON_ENV} must be an absolute path")
+    try:
+        metadata = path.stat()
+    except OSError as exc:
+        raise RuntimeError("isolated FBref browser interpreter is unavailable") from exc
+    if not path.is_file() or not os.access(path, os.X_OK):
+        raise RuntimeError("isolated FBref browser interpreter is not executable")
+    if metadata.st_size <= 0:
+        raise RuntimeError("isolated FBref browser interpreter is empty")
+    # A venv's bin/python is normally a symlink. Resolving it would bypass the
+    # venv and execute the system interpreter, so preserve the configured path.
+    return str(path)
 
 # Current-scope source SLAs.  ControlStore.get_run_summary owns the target
 # selection and reports the measured state; this Airflow layer owns the policy
@@ -919,7 +945,7 @@ def fetch_fbref_wave(
     )
 
     command = [
-        sys.executable,
+        _legacy_scraper_python(),
         FETCH_WAVE_RUNNER,
         "--control-run-id",
         _control_run_id(airflow_run_id=airflow_run_id, dag_id=dag_id),

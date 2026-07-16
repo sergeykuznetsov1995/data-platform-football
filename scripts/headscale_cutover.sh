@@ -5,6 +5,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+compose() { ./scripts/compose.sh --env-file .env "$@"; }
+
 D=$(grep '^PLATFORM_DOMAIN=' .env | cut -d= -f2-)
 HS_SECRET=$(grep '^HEADSCALE_OIDC_CLIENT_SECRET=' .env | cut -d= -f2-)
 KC_ADMIN=$(grep '^KC_BOOTSTRAP_ADMIN_USERNAME=' .env | cut -d= -f2-); KC_ADMIN=${KC_ADMIN:-admin}
@@ -12,7 +14,7 @@ KC_PASS=$(grep '^KC_BOOTSTRAP_ADMIN_PASSWORD=' .env | cut -d= -f2-)
 [ -n "$D" ] && [ -n "$HS_SECRET" ] && [ -n "$KC_PASS" ] || { echo "ERROR: .env не заполнен"; exit 1; }
 echo "== Домен: $D"
 
-kcadm() { docker compose exec -T keycloak /opt/keycloak/bin/kcadm.sh "$@"; }
+kcadm() { compose exec -T keycloak /opt/keycloak/bin/kcadm.sh "$@"; }
 client_id() {
     kcadm get clients -r football -q "clientId=$1" --fields id \
         | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["id"])'
@@ -49,7 +51,7 @@ EOF
 
 echo "== 3/8 Caddy: гибридный роутинг + Keycloak: новый issuer"
 cp configs/caddy/Caddyfile.hybrid.example configs/caddy/Caddyfile
-docker compose up -d keycloak caddy
+compose up -d --no-deps --force-recreate keycloak caddy
 ISS=""
 for i in $(seq 1 30); do
     ISS=$(curl -sk "https://auth.$D/realms/football/.well-known/openid-configuration" 2>/dev/null \
@@ -60,7 +62,7 @@ done
 [ "$ISS" = "https://auth.$D/realms/football" ] || { echo "ERROR: issuer не переключился"; exit 1; }
 
 echo "== 4/8 Headscale: старт с OIDC"
-docker compose restart headscale
+compose restart headscale
 for i in $(seq 1 12); do
     [ "$(docker inspect -f '{{.State.Health.Status}}' headscale)" = healthy ] && { echo "   healthy"; break; }
     sleep 5
@@ -68,11 +70,11 @@ done
 [ "$(docker inspect -f '{{.State.Health.Status}}' headscale)" = healthy ] || { echo "ERROR: headscale не поднялся"; exit 1; }
 
 echo "== 5/8 VM входит в свой VPN"
-docker compose exec -T headscale headscale users create platform 2>/dev/null || true
+compose exec -T headscale headscale users create platform 2>/dev/null || true
 # в 0.29 --user принимает числовой ID, не имя
-HS_UID=$(docker compose exec -T headscale headscale users list --output json \
+HS_UID=$(compose exec -T headscale headscale users list --output json \
     | python3 -c 'import json,sys; print(next(u["id"] for u in json.load(sys.stdin) if u["name"]=="platform"))')
-KEY=$(docker compose exec -T headscale headscale preauthkeys create --user "$HS_UID" --expiration 1h --output json \
+KEY=$(compose exec -T headscale headscale preauthkeys create --user "$HS_UID" --expiration 1h --output json \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["key"])')
 tailscale logout || true
 # --snat-subnet-routes=false: иначе tailscale MASQUERADE'ит транзит в docker-bridge
@@ -101,10 +103,11 @@ assert "extra_records: []" in t, "extra_records не найден"
 open(p, "w").write(t.replace("extra_records: []", recs))
 print("   extra_records OK (4 VPN + 3 public)")
 PYEOF
-docker compose restart headscale
+compose restart headscale
 
 echo "== 7/8 Пересоздание сервисов с новым issuer"
-docker compose up -d caddy trino superset airflow-webserver jupyterhub
+compose up -d --no-deps --force-recreate \
+  caddy trino superset airflow-webserver jupyterhub
 
 echo "== 8/8 Проверки"
 sleep 20

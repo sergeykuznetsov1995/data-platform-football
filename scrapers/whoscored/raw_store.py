@@ -29,6 +29,7 @@ from urllib.parse import urlparse
 from pyarrow import fs
 
 from .domain import WhoScoredScope
+from .runtime_contract import require_production_runtime_class
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,10 @@ RAW_MANIFEST_VERSION = "whoscored-raw-v1"
 RAW_RECEIPT_VERSION = "whoscored-target-receipt-v2"
 FETCHER_VERSION = "whoscored-transport-v3"
 _POSITIVE_ID_RE = re.compile(r"^[1-9][0-9]*$")
+_S3_BUCKET_RE = re.compile(
+    r"\A[a-z0-9](?:[a-z0-9.-]{1,61}[a-z0-9])\Z",
+    re.ASCII,
+)
 _OBSERVED_AT_RE = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
     r"(?:\.[0-9]{1,6})?(?:Z|[+-][0-9]{2}:[0-9]{2})$"
@@ -208,15 +213,54 @@ class WhoScoredRawStore:
     """
 
     def __init__(self, filesystem: fs.FileSystem, root: str) -> None:
+        require_production_runtime_class(operation="WhoScored raw persistence")
         self.filesystem = filesystem
         self.root = root.strip("/") if not root.startswith("/") else root.rstrip("/")
 
     @classmethod
     def from_uri(cls, uri: str) -> "WhoScoredRawStore":
-        parsed = urlparse(uri)
+        require_production_runtime_class(operation="WhoScored raw persistence")
+        invalid_uri = "Invalid S3 raw-store URI"
+        if (
+            type(uri) is not str
+            or not uri
+            or uri != uri.strip()
+            or any(ord(character) <= 0x20 or ord(character) == 0x7F for character in uri)
+        ):
+            raise ValueError(invalid_uri)
+        try:
+            # Parsing itself can reject NFKC-confusable authority characters;
+            # keep that provider error, and therefore the input URI, hidden.
+            parsed = urlparse(uri)
+        except (TypeError, ValueError):
+            raise ValueError(invalid_uri) from None
         if parsed.scheme == "s3":
-            if not parsed.netloc:
-                raise ValueError("S3 raw-store URI must contain a bucket")
+            try:
+                bucket = parsed.hostname
+                port = parsed.port
+            except (TypeError, ValueError):
+                raise ValueError(invalid_uri) from None
+            if (
+                not bucket
+                or parsed.netloc != bucket
+                or uri != f"s3://{bucket}{parsed.path}"
+                or _S3_BUCKET_RE.fullmatch(bucket) is None
+                or ".." in bucket
+                or ".-" in bucket
+                or "-." in bucket
+                or ";" in parsed.path
+                or re.fullmatch(r"[0-9]{1,3}(?:\.[0-9]{1,3}){3}", bucket)
+                is not None
+                or parsed.username is not None
+                or parsed.password is not None
+                or port is not None
+                or bool(parsed.params)
+                or bool(parsed.query)
+                or bool(parsed.fragment)
+            ):
+                # Never reflect the URI: credentials and signed query values
+                # must not enter raw receipts, Bronze manifests, or tracebacks.
+                raise ValueError(invalid_uri)
             dedicated_access = os.environ.get(
                 "WHOSCORED_RAW_S3_ACCESS_KEY", ""
             ).strip()
@@ -244,7 +288,7 @@ class WhoScoredRawStore:
                 region=os.environ.get("WHOSCORED_RAW_S3_REGION", "us-east-1"),
                 background_writes=False,
             )
-            root = f"{parsed.netloc}/{parsed.path.lstrip('/')}".rstrip("/")
+            root = f"{bucket}/{parsed.path.lstrip('/')}".rstrip("/")
             return cls(filesystem, root)
         filesystem, root = fs.FileSystem.from_uri(uri)
         return cls(filesystem, root.rstrip("/"))

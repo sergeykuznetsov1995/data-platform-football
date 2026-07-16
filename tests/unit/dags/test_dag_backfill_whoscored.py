@@ -46,6 +46,131 @@ def test_backfill_alerts_are_deduplicated_at_dagrun_level():
 
     assert "on_failure_callback" not in mod.BACKFILL_ARGS
     assert callable(mod.dag._dag_kwargs["on_failure_callback"])
+    from airflow.operators.python import PythonOperator
+
+    preflight = next(
+        task
+        for task in PythonOperator._instances
+        if task.task_id == "validate_whoscored_paid_alert_delivery"
+    )
+    assert preflight._init_kwargs["retries"] == 0
+    prepare = next(
+        task
+        for task in PythonOperator._instances
+        if task.task_id == "prepare_backfill_plan"
+    )
+    build = next(
+        task
+        for task in PythonOperator._instances
+        if task.task_id == "build_backfill_work"
+    )
+    assert (
+        prepare._init_kwargs["op_kwargs"]["alert_metadata"].operator.task_id
+        == preflight.task_id
+    )
+    assert (
+        build._init_kwargs["op_kwargs"]["alert_metadata"].operator.task_id
+        == preflight.task_id
+    )
+
+
+@pytest.mark.unit
+def test_paid_alert_mutation_blocks_backfill_discovery_before_source(
+    monkeypatch,
+):
+    mod = _load_module()
+    from dags.scripts import run_whoscored_scraper, whoscored_ops_store
+
+    monkeypatch.setattr(
+        mod,
+        "validate_backfill_params",
+        lambda **_context: {
+            "plan_id": None,
+            "queue_id": "q",
+            "all_catalog": True,
+            "scopes": [],
+            "game_ids": [],
+        },
+    )
+    repository = SimpleNamespace(ensure_schema=lambda: None)
+    monkeypatch.setattr(run_whoscored_scraper, "_new_repository", lambda: repository)
+    monkeypatch.setattr(
+        run_whoscored_scraper,
+        "_load_runtime",
+        lambda: pytest.fail("source runtime reached after alert mutation"),
+    )
+    monkeypatch.setattr(
+        whoscored_ops_store.WhoScoredBackfillState,
+        "from_env",
+        classmethod(lambda _cls: SimpleNamespace()),
+    )
+    paid = SimpleNamespace(is_paid=True)
+    monkeypatch.setattr(mod, "_transport_runtime", lambda *_args, **_kwargs: paid)
+    calls = []
+
+    def reject_mutation(runtime, metadata, context):
+        calls.append((runtime, metadata, context))
+        raise mod.WhoScoredProxyRuntimeError("paid source alert receipt is invalid")
+
+    monkeypatch.setattr(mod, "validate_paid_alert_for_source", reject_mutation)
+    metadata = {"status": "delivered", "receipt_sha256": "stale"}
+
+    with pytest.raises(
+        mod.WhoScoredProxyRuntimeError,
+        match="alert receipt is invalid",
+    ):
+        mod.prepare_backfill_plan(
+            alert_metadata=metadata,
+            **_backfill_context(),
+        )
+    assert calls and calls[0][1] is metadata
+
+
+@pytest.mark.unit
+def test_paid_alert_mutation_blocks_mapped_backfill_source_command(monkeypatch):
+    mod = _load_module()
+    from dags.scripts import whoscored_ops_store
+
+    state = SimpleNamespace(
+        load_plan=lambda _queue, _plan: {
+            "provenance": _timing_provenance(),
+        },
+        checkpoint_progress=lambda _queue, _plan: {
+            "remaining_request_units": 1,
+            "estimated_completed_request_units": 0,
+            "actual_completed_request_units": 0,
+            "schedule_stage_cardinality_drifts": 0,
+        },
+        create_batch=lambda *_args, **_kwargs: {
+            "work_items": [{"work_id": "work-1", "kind": "schedule"}]
+        },
+    )
+    monkeypatch.setattr(
+        whoscored_ops_store.WhoScoredBackfillState,
+        "from_env",
+        classmethod(lambda _cls: state),
+    )
+    paid = SimpleNamespace(is_paid=True)
+    monkeypatch.setattr(mod, "_transport_runtime", lambda *_args, **_kwargs: paid)
+    monkeypatch.setattr(
+        mod,
+        "_bind_transport_allocation",
+        lambda *_args, **_kwargs: paid,
+    )
+
+    def reject_mutation(*_args, **_kwargs):
+        raise mod.WhoScoredProxyRuntimeError("paid source alert receipt is invalid")
+
+    monkeypatch.setattr(mod, "paid_alert_source_guard_command", reject_mutation)
+    with pytest.raises(
+        mod.WhoScoredProxyRuntimeError,
+        match="alert receipt is invalid",
+    ):
+        mod.build_backfill_commands(
+            plan_ref={"queue_id": "q", "plan_id": "a" * 64},
+            alert_metadata={"status": "delivered", "receipt_sha256": "stale"},
+            run_id="manual__paid",
+        )
 
 
 def _timing_provenance(**values):
@@ -61,6 +186,30 @@ def _timing_provenance(**values):
         "backfill_deadline_at": (started + timedelta(days=30)).isoformat(),
         **values,
     }
+
+
+def _successful_continuation_dag_run(
+    *,
+    run_id="manual__parent",
+    conf=None,
+    state_overrides=None,
+):
+    states = {
+        "run_whoscored_backfill_item": "success",
+        "validate_whoscored_backfill_batch": "success",
+        "validate_global_historical_dq": "success",
+        "report_whoscored_backfill_traffic": "success",
+        **(state_overrides or {}),
+    }
+    instances = [
+        SimpleNamespace(task_id=task_id, state=state, map_index=-1)
+        for task_id, state in states.items()
+    ]
+    return SimpleNamespace(
+        run_id=run_id,
+        conf=conf or {},
+        get_task_instances=lambda: instances,
+    )
 
 
 def _staged_population_ref():
@@ -124,6 +273,7 @@ def _backfill_context(*, task_id="prepare_backfill_plan"):
     return {
         "dag": SimpleNamespace(dag_id="dag_backfill_whoscored"),
         "run_id": "manual__discovery-traffic",
+        "logical_date": datetime(2026, 7, 11, 10, tzinfo=timezone.utc),
         "ti": SimpleNamespace(task_id=task_id, map_index=-1, try_number=1),
         "params": {
             "all_catalog": True,
@@ -132,6 +282,15 @@ def _backfill_context(*, task_id="prepare_backfill_plan"):
             "require_zero_paid": True,
         },
     }
+
+
+@pytest.mark.unit
+def test_backfill_catalog_discovery_uses_logical_date_only():
+    mod = _load_module()
+
+    assert mod._catalog_as_of_date(_backfill_context()).isoformat() == "2026-07-11"
+    with pytest.raises(mod.AirflowException, match="logical_date"):
+        mod._catalog_as_of_date({"logical_date": datetime(2026, 7, 11, 10)})
 
 
 @pytest.mark.unit
@@ -310,15 +469,11 @@ def test_all_catalog_scale_is_blocked_by_enforced_source_ceiling(monkeypatch):
         "schedule_stage_cardinality_drifts": 0,
     }
 
-    summary = mod._backfill_slo_summary(
-        plan, progress, now=now, enforce_capacity=False
-    )
+    summary = mod._backfill_slo_summary(plan, progress, now=now, enforce_capacity=False)
 
     assert summary["capacity_hard_ceiling_request_units_per_day"] == 86_400
     assert summary["assumed_capacity_request_units_per_day"] == 86_400
-    assert summary["required_request_units_per_day"] == pytest.approx(
-        remaining / 30
-    )
+    assert summary["required_request_units_per_day"] == pytest.approx(remaining / 30)
     assert summary["capacity_status"] == "breach"
     assert summary["capacity_blocker"] == (
         "required_request_units_per_day_exceed_assumed_capacity"
@@ -331,9 +486,7 @@ def test_all_catalog_scale_is_blocked_by_enforced_source_ceiling(monkeypatch):
 @pytest.mark.unit
 def test_capacity_assumption_cannot_exceed_enforced_source_ceiling(monkeypatch):
     mod = _load_module()
-    monkeypatch.setenv(
-        "WHOSCORED_BACKFILL_ASSUMED_REQUEST_UNITS_PER_DAY", "86401"
-    )
+    monkeypatch.setenv("WHOSCORED_BACKFILL_ASSUMED_REQUEST_UNITS_PER_DAY", "86401")
     now = datetime(2026, 7, 14, tzinfo=timezone.utc)
     plan = {
         "provenance": {
@@ -345,8 +498,7 @@ def test_capacity_assumption_cannot_exceed_enforced_source_ceiling(monkeypatch):
     with pytest.raises(
         mod.AirflowException,
         match=(
-            "WHOSCORED_BACKFILL_ASSUMED_REQUEST_UNITS_PER_DAY must be "
-            "in 1000..86400"
+            "WHOSCORED_BACKFILL_ASSUMED_REQUEST_UNITS_PER_DAY must be in 1000..86400"
         ),
     ):
         mod._backfill_slo_summary(
@@ -398,6 +550,7 @@ def test_backfill_is_manual_bounded_mapped_and_uses_durable_state():
 
     assert mod.dag.schedule is None
     assert mod.dag._dag_kwargs["max_active_runs"] == 1
+    assert mod.dag._dag_kwargs["is_paused_upon_creation"] is True
     assert mod.BACKFILL_CHUNK_SIZE == 25
     task = next(
         item
@@ -458,9 +611,7 @@ def test_frozen_scope_values_relation_is_escaped_and_hard_bounded():
     with pytest.raises(mod.AirflowException, match="must contain 1..500"):
         mod._scope_values_sql([])
     with pytest.raises(mod.AirflowException, match="must contain 1..500"):
-        mod._scope_values_sql(
-            [(f"WS-{index}", "2026") for index in range(501)]
-        )
+        mod._scope_values_sql([(f"WS-{index}", "2026") for index in range(501)])
 
 
 @pytest.mark.unit
@@ -472,7 +623,7 @@ def test_backfill_rejects_non_local_executor_and_paid_override(monkeypatch):
         mod.validate_backfill_params(params=valid)
 
     monkeypatch.setenv("AIRFLOW__CORE__EXECUTOR", "LocalExecutor")
-    with pytest.raises(mod.AirflowException, match="permanently direct-only"):
+    with pytest.raises(mod.AirflowException, match="legacy booleans cannot authorize"):
         mod.validate_backfill_params(params={**valid, "direct_only": False})
 
 
@@ -650,7 +801,8 @@ def test_all_catalog_forces_full_history_and_binds_generation(monkeypatch, tmp_p
         run_whoscored_scraper,
         "_run_discover",
         lambda *_args, **kwargs: (
-            calls.append(kwargs["full_history"]) or SimpleNamespace(errors=[])
+            calls.append((kwargs["full_history"], kwargs["as_of_date"]))
+            or SimpleNamespace(errors=[])
         ),
     )
     monkeypatch.setattr(
@@ -684,20 +836,17 @@ def test_all_catalog_forces_full_history_and_binds_generation(monkeypatch, tmp_p
         params={"all_catalog": True, "queue_id": "q", "scopes": []},
         dag=SimpleNamespace(dag_id="dag_backfill_whoscored"),
         run_id="manual__traffic-proof",
-        ti=SimpleNamespace(
-            task_id="prepare_backfill_plan", map_index=-1, try_number=1
-        ),
+        logical_date=datetime(2026, 7, 10, 23, tzinfo=timezone.utc),
+        ti=SimpleNamespace(task_id="prepare_backfill_plan", map_index=-1, try_number=1),
     )
 
     assert result["resumed"] is False
-    assert calls == [True]
+    assert calls == [(True, datetime(2026, 7, 10).date())]
     assert captured["selector"]["full_history_catalog"] is True
     assert captured["provenance"]["catalog_batch_id"] == "wsc2-full"
     assert captured["provenance"]["full_history_discovery"] is True
     assert captured["provenance"]["catalog_eligible_scope_count"] == 1
-    assert captured["schedule_stage_ids"] == {
-        "WS-1=2026": list(range(23752, 23765))
-    }
+    assert captured["schedule_stage_ids"] == {"WS-1=2026": list(range(23752, 23765))}
     assert len(captured["provenance"]["catalog_eligible_scopes_sha256"]) == 64
     assert "backfill_started_at" in captured["provenance"]
     assert "backfill_deadline_at" in captured["provenance"]
@@ -739,9 +888,7 @@ def test_discovery_requests_survive_local_loss_and_reach_terminal_traffic_dq(
             )
         return SimpleNamespace(errors=[], traffic={"paid_proxy_bytes": 0})
 
-    mod = _configure_full_history_prepare(
-        monkeypatch, tmp_path, run_discover
-    )
+    mod = _configure_full_history_prepare(monkeypatch, tmp_path, run_discover)
     context = _backfill_context()
     plan_ref = mod.prepare_backfill_plan(**context)
     local_ledger = next((tmp_path / "runs").rglob("requests_*.jsonl"))
@@ -755,11 +902,14 @@ def test_discovery_requests_survive_local_loss_and_reach_terminal_traffic_dq(
     )
     summary = mod.report_backfill_traffic(
         plan_ref=plan_ref,
-        **{**context, "ti": SimpleNamespace(
-            task_id="report_whoscored_backfill_traffic",
-            map_index=-1,
-            try_number=1,
-        )},
+        **{
+            **context,
+            "ti": SimpleNamespace(
+                task_id="report_whoscored_backfill_traffic",
+                map_index=-1,
+                try_number=1,
+            ),
+        },
     )
 
     assert plan_ref["discovery_traffic_evidence"]["request_count"] == 2
@@ -768,6 +918,101 @@ def test_discovery_requests_survive_local_loss_and_reach_terminal_traffic_dq(
     assert summary["wire_bytes"] == 150
     assert summary["durable_request_ledgers"] == 1
     assert summary["paid_proxy_bytes"] == 0
+
+
+@pytest.mark.unit
+def test_paid_discovery_passes_immutable_exact_report_attribution_to_terminal_dq(
+    monkeypatch, tmp_path
+):
+    mod = _load_module()
+    from dags import dag_ingest_whoscored as traffic_mod
+    from dags.scripts.whoscored_ops_store import WhoScoredOpsStore
+
+    monkeypatch.setenv("WHOSCORED_OPS_STORE_URI", tmp_path.as_uri())
+    context = _backfill_context()
+    identity = {
+        "dag_id": "dag_backfill_whoscored",
+        "run_id": context["run_id"],
+        "task_id": "prepare_backfill_plan",
+        "map_index": -1,
+        "try_number": 1,
+    }
+    request_evidence = {
+        "schema_version": 1,
+        "evidence_type": "whoscored_request_ledger",
+        **identity,
+        "source_name": "requests_prepare_backfill_plan_-1_try1.jsonl",
+        "source_sha256": "a" * 64,
+        "source_bytes": 100,
+        "event_count": 1,
+        "request_count": 0,
+        "wire_bytes": 0,
+        "paid_proxy_bytes": 123,
+        "events": [],
+    }
+    task_key = "prepare_backfill_plan[-1]"
+    report_evidence = {
+        "schema_version": 1,
+        "evidence_type": "whoscored_report_paid_attribution",
+        **identity,
+        "paid_proxy_bytes": 123,
+        "paid_proxy_bytes_by_url": {"https://www.whoscored.com/discovery/paid": 123},
+        "paid_proxy_bytes_by_task": {task_key: 123},
+        "paid_proxy_bytes_by_task_try": {f"{task_key}/try1": 123},
+    }
+    store = WhoScoredOpsStore.from_env(optional=False)
+    assert store is not None
+    base = (
+        f"traffic/{mod.stable_safe_token('dag_backfill_whoscored')}/"
+        f"{mod.stable_safe_token(context['run_id'])}"
+    )
+    request_ref = store.put_content_addressed_json(
+        f"{base}/request-ledgers", request_evidence
+    )
+    report_ref = store.put_content_addressed_json(
+        f"{base}/report-attribution", report_evidence
+    )
+    plan_ref = {
+        "discovery_traffic_required": True,
+        "discovery_traffic_evidence": {
+            **request_ref,
+            "event_count": 1,
+            "request_count": 0,
+            "wire_bytes": 0,
+            "paid_proxy_bytes": 123,
+        },
+        "discovery_report_attribution": {
+            **report_ref,
+            "paid_proxy_bytes": 123,
+        },
+    }
+    captured = {}
+
+    def aggregate(**kwargs):
+        captured.update(kwargs)
+        return {"durable_request_ledgers": 1, "paid_proxy_bytes": 123}
+
+    monkeypatch.setattr(traffic_mod, "aggregate_traffic_reports", aggregate)
+    monkeypatch.setattr(
+        mod,
+        "_transport_runtime",
+        lambda _context: SimpleNamespace(is_paid=True),
+    )
+
+    result = mod.report_backfill_traffic(
+        plan_ref=plan_ref,
+        **{
+            **context,
+            "ti": SimpleNamespace(
+                task_id="report_whoscored_backfill_traffic",
+                map_index=-1,
+                try_number=1,
+            ),
+        },
+    )
+
+    assert result["paid_proxy_bytes"] == 123
+    assert captured["additional_reported_paid_attribution"] == report_evidence
 
 
 @pytest.mark.unit
@@ -797,11 +1042,17 @@ def test_discovery_paid_usage_fails_before_plan_and_in_terminal_dq(
                 "paid_proxy_bytes": 123,
             }
         )
-        return SimpleNamespace(errors=[], traffic={"paid_proxy_bytes": 123})
+        return SimpleNamespace(
+            errors=[],
+            traffic={
+                "paid_proxy_bytes": 123,
+                "paid_proxy_bytes_by_url": {
+                    "https://www.whoscored.com/discovery/paid": 123
+                },
+            },
+        )
 
-    mod = _configure_full_history_prepare(
-        monkeypatch, tmp_path, run_discover
-    )
+    mod = _configure_full_history_prepare(monkeypatch, tmp_path, run_discover)
     context = _backfill_context()
     with pytest.raises(mod.AirflowException, match="used paid proxy: 123 bytes"):
         mod.prepare_backfill_plan(**context)
@@ -812,7 +1063,7 @@ def test_discovery_paid_usage_fails_before_plan_and_in_terminal_dq(
     monkeypatch.setattr(
         traffic_mod, "PAID_LEDGER_PATH", str(tmp_path / "missing-paid.jsonl")
     )
-    with pytest.raises(mod.AirflowException, match="used paid proxy: 123 bytes"):
+    with pytest.raises(mod.AirflowException, match="used paid proxy"):
         mod.report_backfill_traffic(**context)
 
 
@@ -962,6 +1213,119 @@ def test_capacity_breach_stops_automatic_continuation(monkeypatch):
 
 
 @pytest.mark.unit
+def test_paid_continuation_stops_cleanly_while_campaign_awaits_approval(
+    monkeypatch,
+):
+    mod = _load_module()
+    from dags.scripts import whoscored_ops_store
+
+    progress = {
+        "status": "running",
+        "next_work_items": 10,
+        "successful_receipts": 25,
+        "remaining_request_units": 100,
+    }
+    state = SimpleNamespace(
+        load_plan=lambda _queue, _plan: {"provenance": _timing_provenance()},
+    )
+    monkeypatch.setattr(
+        whoscored_ops_store.WhoScoredBackfillState,
+        "from_env",
+        classmethod(lambda _cls: state),
+    )
+    approval = object()
+    transport = SimpleNamespace(
+        is_paid=True,
+        approval=approval,
+        campaign_id="campaign-full-1",
+        approval_id="approval-full-1",
+    )
+    monkeypatch.setattr(mod, "_transport_runtime", lambda _context: transport)
+    campaign = {
+        "status": "awaiting_approval",
+        "awaiting_reason": "byte_cap",
+    }
+    monkeypatch.setattr(
+        mod,
+        "paid_campaign_gateway_call",
+        lambda value, operation: (
+            campaign
+            if value is approval and operation == "snapshot"
+            else (_ for _ in ()).throw(AssertionError(operation))
+        ),
+    )
+    trigger_mod = types.ModuleType("airflow.api.common.trigger_dag")
+    trigger_mod.trigger_dag = lambda **_kwargs: pytest.fail(
+        "awaiting campaign must not trigger another DagRun"
+    )
+    monkeypatch.setitem(sys.modules, "airflow.api.common.trigger_dag", trigger_mod)
+
+    result = mod.schedule_backfill_continuation(
+        plan_ref={"queue_id": "q", "plan_id": "a" * 64},
+        progress_ref=progress,
+        dag_run=_successful_continuation_dag_run(),
+    )
+
+    assert result["continuation"] == "awaiting_approval"
+    assert result["campaign_status"] == "awaiting_approval"
+    assert result["awaiting_reason"] == "new_dagrun_requires_new_approval"
+    assert result["campaign_id"] == "campaign-full-1"
+
+    campaign["status"] = "revoked"
+    with pytest.raises(mod.AirflowException, match="campaign is revoked"):
+        mod.schedule_backfill_continuation(
+            plan_ref={"queue_id": "q", "plan_id": "a" * 64},
+            progress_ref=progress,
+            dag_run=_successful_continuation_dag_run(),
+        )
+
+
+@pytest.mark.unit
+def test_paid_continuation_authority_cannot_be_reused_in_another_dagrun():
+    mod = _load_module()
+
+    with pytest.raises(mod.AirflowException, match="bound to one exact DagRun"):
+        mod._continuation_transport_conf(
+            SimpleNamespace(
+                is_paid=True,
+                policy="direct_then_paid",
+                approval_id="approval-full-2",
+                approval_sha256="c" * 64,
+            )
+        )
+
+
+@pytest.mark.unit
+def test_continuation_refuses_failed_terminal_dq(monkeypatch):
+    mod = _load_module()
+    from dags.scripts import whoscored_ops_store
+
+    progress = {
+        "status": "running",
+        "next_work_items": 10,
+        "successful_receipts": 10,
+        "remaining_request_units": 100,
+    }
+    state = SimpleNamespace(
+        load_plan=lambda _queue, _plan: {"provenance": _timing_provenance()},
+    )
+    monkeypatch.setattr(
+        whoscored_ops_store.WhoScoredBackfillState,
+        "from_env",
+        classmethod(lambda _cls: state),
+    )
+
+    with pytest.raises(mod.AirflowException, match="traffic.*failed"):
+        mod.schedule_backfill_continuation(
+            plan_ref={"queue_id": "q", "plan_id": "a" * 64},
+            progress_ref=progress,
+            dag_run=_successful_continuation_dag_run(
+                state_overrides={"report_whoscored_backfill_traffic": "failed"}
+            ),
+        )
+
+
+@pytest.mark.unit
 def test_global_historical_dq_is_deferred_until_plan_complete(monkeypatch):
     mod = _load_module()
     from dags.scripts import whoscored_ops_store
@@ -1068,10 +1432,13 @@ def test_frozen_dq_population_is_exact_content_addressed_receipt_state(
         }
     ]
     assert population["population_sha256"] == population["artifact"]["sha256"]
-    assert state.store.read_content_addressed_json(
-        population["artifact"]["key"],
-        expected_sha256=population["population_sha256"],
-    )["matches"] == population["matches"]
+    assert (
+        state.store.read_content_addressed_json(
+            population["artifact"]["key"],
+            expected_sha256=population["population_sha256"],
+        )["matches"]
+        == population["matches"]
+    )
 
 
 @pytest.mark.unit
@@ -1253,7 +1620,7 @@ def test_final_catalog_proof_rejects_same_count_payload_mutation(monkeypatch):
 def test_frozen_scope_feed_contract_uses_receipt_stage_ids(monkeypatch):
     mod = _load_module()
     from dags import dag_ingest_whoscored as daily
-    import utils.silver_tasks as silver_tasks
+    from scrapers.base import trino_manager
 
     expected = daily._expected_feed_state_keys([7])
     payload = json.dumps(
@@ -1281,7 +1648,7 @@ def test_frozen_scope_feed_contract_uses_receipt_stage_ids(monkeypatch):
         def close(self):
             return None
 
-    monkeypatch.setattr(silver_tasks, "_get_trino_connection", Connection)
+    monkeypatch.setattr(trino_manager, "get_trino_connection", Connection)
     summary = mod._frozen_scope_feed_integrity(
         {
             "scope_stages": [
@@ -1308,7 +1675,7 @@ def test_frozen_scope_feed_contract_is_set_based_and_round_trips_full_catalog(
 ):
     mod = _load_module()
     from dags import dag_ingest_whoscored as daily
-    import utils.silver_tasks as silver_tasks
+    from scrapers.base import trino_manager
 
     queries = []
 
@@ -1348,7 +1715,7 @@ def test_frozen_scope_feed_contract_is_set_based_and_round_trips_full_catalog(
         def close(self):
             return None
 
-    monkeypatch.setattr(silver_tasks, "_get_trino_connection", Connection)
+    monkeypatch.setattr(trino_manager, "get_trino_connection", Connection)
     scope_count = 1_201
     summary = mod._frozen_scope_feed_integrity(
         {
@@ -1379,7 +1746,7 @@ def test_frozen_scope_feed_contract_fails_on_incomplete_identity_round_trip(
     monkeypatch,
 ):
     mod = _load_module()
-    import utils.silver_tasks as silver_tasks
+    from scrapers.base import trino_manager
 
     class Cursor:
         def execute(self, _query):
@@ -1398,7 +1765,7 @@ def test_frozen_scope_feed_contract_fails_on_incomplete_identity_round_trip(
         def close(self):
             return None
 
-    monkeypatch.setattr(silver_tasks, "_get_trino_connection", Connection)
+    monkeypatch.setattr(trino_manager, "get_trino_connection", Connection)
 
     with pytest.raises(mod.AirflowException, match="round-trip every identity"):
         mod._frozen_scope_feed_integrity(
@@ -1557,9 +1924,9 @@ def test_global_historical_summary_covers_25_datasets_and_full_history(monkeypat
         def close(self):
             return None
 
-    import utils.silver_tasks as silver_tasks
+    from scrapers.base import trino_manager
 
-    monkeypatch.setattr(silver_tasks, "_get_trino_connection", Connection)
+    monkeypatch.setattr(trino_manager, "get_trino_connection", Connection)
     summary = mod._global_historical_integrity_summary()
 
     assert summary["dataset_count"] == 25
@@ -1627,9 +1994,9 @@ def test_frozen_historical_summary_skips_mutable_population_scans(monkeypatch):
         "frozen_historical_integrity",
         lambda *_args, **_kwargs: ({}, match_parity),
     )
-    import utils.silver_tasks as silver_tasks
+    from scrapers.base import trino_manager
 
-    monkeypatch.setattr(silver_tasks, "_get_trino_connection", Connection)
+    monkeypatch.setattr(trino_manager, "get_trino_connection", Connection)
     summary = mod._global_historical_integrity_summary(
         ["WS-1=2026"],
         catalog_batch_id="wsc2-generation",
@@ -1655,7 +2022,7 @@ def test_full_catalog_frozen_scope_dq_is_set_based_and_aggregates_parity(
         MATCH_DATASET_TABLES,
         PREVIEW_DATASET_TABLES,
     )
-    import utils.silver_tasks as silver_tasks
+    from scrapers.base import trino_manager
 
     queries = []
 
@@ -1672,9 +2039,7 @@ def test_full_catalog_frozen_scope_dq_is_set_based_and_aggregates_parity(
         def fetchall(self):
             import re
 
-            scope_count = len(
-                re.findall(r"\('WS-\d+', '2026'\)", self.query)
-            )
+            scope_count = len(re.findall(r"\('WS-\d+', '2026'\)", self.query))
             if "row_kind='scope'" in self.query:
                 scope_count = self.stage_scope_count
             if "scope_success AS" in self.query:
@@ -1685,17 +2050,16 @@ def test_full_catalog_frozen_scope_dq_is_set_based_and_aggregates_parity(
                 if self.parity_gap and "whoscored_schedule d" in self.query:
                     physical = max(0, physical - 1)
                     owner_mismatches = 1
-                if (
-                    self.parity_compensation
-                    and "whoscored_schedule d" in self.query
-                ):
+                if self.parity_compensation and "whoscored_schedule d" in self.query:
                     owner_mismatches = 2
-                return [[
-                    scope_count,
-                    physical,
-                    scope_count,
-                    owner_mismatches,
-                ]]
+                return [
+                    [
+                        scope_count,
+                        physical,
+                        scope_count,
+                        owner_mismatches,
+                    ]
+                ]
             return [[0, 0, 0]]
 
         def close(self):
@@ -1722,7 +2086,7 @@ def test_full_catalog_frozen_scope_dq_is_set_based_and_aggregates_parity(
         "frozen_historical_integrity",
         lambda *_args, **_kwargs: ({}, frozen_entity_parity),
     )
-    monkeypatch.setattr(silver_tasks, "_get_trino_connection", Connection)
+    monkeypatch.setattr(trino_manager, "get_trino_connection", Connection)
 
     scopes = [f"WS-{index}=2026" for index in range(7_472)]
     Cursor.stage_scope_count = len(scopes)
@@ -1771,7 +2135,7 @@ def test_full_catalog_frozen_scope_dq_is_set_based_and_aggregates_parity(
 def test_scoped_historical_dq_runs_for_explicit_plan(monkeypatch):
     mod = _load_module()
     from dags.scripts import whoscored_frozen_dq, whoscored_ops_store
-    import utils.silver_tasks as silver_tasks
+    from scrapers.base import trino_manager
 
     fake_state = SimpleNamespace(
         checkpoint_progress=lambda _queue, _plan: {"status": "complete"},
@@ -1843,7 +2207,7 @@ def test_scoped_historical_dq_runs_for_explicit_plan(monkeypatch):
         def close(self):
             return None
 
-    monkeypatch.setattr(silver_tasks, "_get_trino_connection", Connection)
+    monkeypatch.setattr(trino_manager, "get_trino_connection", Connection)
 
     result = mod.validate_global_historical_dq(
         plan_ref={"queue_id": "q", "plan_id": "a" * 64}
@@ -1914,7 +2278,7 @@ def test_continuation_is_deterministic_and_idempotent(monkeypatch):
     monkeypatch.setitem(sys.modules, "airflow.models.dagrun", dagrun_mod)
     ref = {"queue_id": "q", "plan_id": "a" * 64}
 
-    dag_run = SimpleNamespace(run_id="manual__parent", conf={})
+    dag_run = _successful_continuation_dag_run()
     context = {
         "run_id": "manual__parent",
         "dag_run": dag_run,
@@ -1930,6 +2294,7 @@ def test_continuation_is_deterministic_and_idempotent(monkeypatch):
         {
             "queue_id": "q",
             "plan_id": "a" * 64,
+            "transport_policy": "direct_only",
             "direct_only": True,
             "require_zero_paid": True,
             "parent_run_id": "manual__parent",

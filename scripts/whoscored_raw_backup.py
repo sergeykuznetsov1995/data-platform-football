@@ -17,7 +17,39 @@ the immutable path cut; historical bytes are hashed after writers resume.
 Legacy writers that do not honor this barrier must be stopped during cutover.
 """
 
+# ruff: noqa: E402 -- the trust anchor must run before every non-built-in import
+
 from __future__ import annotations
+
+import sys as _whoscored_bootstrap_sys
+
+_whoscored_source = __file__
+if not _whoscored_source.startswith("/"):
+    raise RuntimeError("WhoScored entrypoint requires an absolute source path")
+_whoscored_production = _whoscored_source.startswith("/opt/airflow/")
+_whoscored_root = "/opt/airflow" if _whoscored_production else _whoscored_source.rsplit("/scripts/", 1)[0]
+if _whoscored_production:
+    if getattr(_whoscored_bootstrap_sys, "_whoscored_runtime_startup_schema", None) != 2:
+        raise RuntimeError("image-baked WhoScored startup anchor is required")
+elif getattr(_whoscored_bootstrap_sys, "_whoscored_runtime_startup_root", None) != _whoscored_root:
+    _whoscored_anchor_path = (
+        _whoscored_root + "/docker/images/airflow/whoscored_runtime_startup.py"
+    )
+    _whoscored_anchor_globals = {
+        "__builtins__": __builtins__,
+        "sys": _whoscored_bootstrap_sys,
+        "_WHOSCORED_RUNTIME_ROOT": _whoscored_root,
+        "_WHOSCORED_REQUIRE_FULL_ATTESTATION": False,
+    }
+    with open(_whoscored_anchor_path, "rb") as _whoscored_anchor_handle:
+        _whoscored_anchor_source = _whoscored_anchor_handle.read()
+    exec(
+        compile(_whoscored_anchor_source, _whoscored_anchor_path, "exec"),
+        _whoscored_anchor_globals,
+    )
+_WHOSCORED_RUNTIME_CONTRACT = (
+    _whoscored_bootstrap_sys._load_whoscored_runtime_contract(_whoscored_root)
+)
 
 import argparse
 import hashlib
@@ -209,6 +241,9 @@ def open_store(
 ) -> WhoScoredRawStore:
     """Open one local/S3 store with isolated role-specific credentials."""
 
+    _WHOSCORED_RUNTIME_CONTRACT.require_production_runtime_class(
+        operation="WhoScored raw backup storage"
+    )
     clean_uri = _safe_store_uri(uri)
     parsed = urlparse(clean_uri)
     if parsed.scheme != "s3":
@@ -1223,6 +1258,9 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[list[str]] = None) -> int:
     args = _parser().parse_args(argv)
+    _WHOSCORED_RUNTIME_CONTRACT.require_production_runtime_class(
+        operation="WhoScored raw backup entrypoint"
+    )
     try:
         if args.command == "preflight":
             result = validate_backup_configuration(

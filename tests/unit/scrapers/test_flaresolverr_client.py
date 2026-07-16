@@ -16,6 +16,7 @@ from scrapers.base.flaresolverr_client import (
     FlareSolverrClient,
     FlareSolverrError,
     FlareSolverrResponseTooLarge,
+    FlareSolverrRuntimeIdentityError,
     FlareSolverrTimeout,
     describe_proxy_mode,
     is_chromium_error_page,
@@ -58,6 +59,18 @@ def _ok_response(json_payload: dict, status_code: int = 200) -> MagicMock:
     return resp
 
 
+def _identity_response(
+    *, version: str = "3.4.6", extension_sha256: str = "a" * 64
+) -> MagicMock:
+    return _ok_response(
+        {
+            "status": "ok",
+            "version": version,
+            "extension_sha256": extension_sha256,
+        }
+    )
+
+
 def _ok_solution_payload() -> dict:
     return {
         "status": "ok",
@@ -76,6 +89,37 @@ def _ok_solution_payload() -> dict:
 # -----------------------------------------------------------------------------
 @pytest.mark.unit
 class TestFlareSolverrGet:
+    @pytest.mark.parametrize(
+        ("version", "extension_sha256"),
+        [
+            (None, None),
+            ("3.4.5", "a" * 64),
+            ("3.4.6", None),
+            ("3.4.6", "b" * 64),
+        ],
+    )
+    def test_expected_runtime_identity_rejects_stale_or_missing_v1_receipt(
+        self, version, extension_sha256
+    ):
+        client = FlareSolverrClient(
+            expected_version="3.4.6",
+            expected_extension_sha256="a" * 64,
+        )
+        payload = {
+            **_ok_solution_payload(),
+            "version": version,
+            "extension_sha256": extension_sha256,
+        }
+        with patch.object(client, "session", new=MagicMock()) as sess:
+            sess.get.return_value = _identity_response()
+            sess.post.return_value = _ok_response(payload)
+            with pytest.raises(FlareSolverrRuntimeIdentityError):
+                client.get("https://example.com", "ws-direct-1")
+
+        stats = client.get_traffic_stats()
+        assert stats["fs_response_bytes"] == 0
+        assert stats["requests"] == 0
+
     def test_sensitive_variants_cover_nested_json_repr_and_bytes_with_fixed_bound(
         self,
     ):
@@ -144,9 +188,7 @@ class TestFlareSolverrGet:
         endpoint_base = "http://endpoint-user:endpoint-secret@fs.internal:8191"
         client = FlareSolverrClient(url=endpoint_base)
         with patch.object(client, "session", new=MagicMock()) as sess:
-            sess.post.return_value = _ok_response(
-                {"status": "ok", "sessions": []}
-            )
+            sess.post.return_value = _ok_response({"status": "ok", "sessions": []})
             with caplog.at_level("DEBUG"):
                 assert client.list_sessions() == []
 
@@ -285,6 +327,7 @@ class TestFlareSolverrGet:
             },
         }
         with patch.object(client, "session", new=MagicMock()) as sess:
+            sess.get.return_value = _identity_response()
             sess.post.return_value = _ok_response(payload)
             out = client.xhr_get(
                 "https://www.whoscored.com/statisticsfeed/1/getteamstatistics",
@@ -302,6 +345,127 @@ class TestFlareSolverrGet:
             "session": "ws-direct-1",
             "maxTimeout": 30_000,
         }
+
+    @pytest.mark.parametrize(
+        "mutation",
+        [
+            {"version": "3.4.5"},
+            {"extension_sha256": "b" * 64},
+            {"extension_sha256": None},
+            {"unexpected": True},
+        ],
+    )
+    def test_xhr_identity_is_exact_and_checked_before_bytes_or_body(self, mutation):
+        expected_hash = "a" * 64
+        client = FlareSolverrClient(
+            expected_version="3.4.6",
+            expected_extension_sha256=expected_hash,
+        )
+        source_url = "https://www.whoscored.com/statisticsfeed/1/x"
+        body = b'{"secret":"must-not-be-exposed"}'
+        payload = {
+            "status": "ok",
+            "message": "completed",
+            "solution": {
+                "responseBase64": base64.b64encode(body).decode(),
+                "responseBytes": len(body),
+                "headers": {},
+                "finalUrl": source_url,
+                "status": 200,
+            },
+            "startTimestamp": 100,
+            "endTimestamp": 101,
+            "version": "3.4.6",
+            "extension_sha256": expected_hash,
+            **mutation,
+        }
+        with patch.object(client, "session", new=MagicMock()) as sess:
+            sess.post.return_value = _ok_response(payload)
+            with pytest.raises(FlareSolverrRuntimeIdentityError):
+                client.xhr_get(source_url, "ws-direct-1")
+
+        stats = client.get_traffic_stats()
+        assert stats["fs_response_bytes"] == 0
+        assert stats["requests"] == 0
+
+    def test_exact_xhr_runtime_identity_allows_body_and_accounting(self):
+        expected_hash = "a" * 64
+        client = FlareSolverrClient(
+            expected_version="3.4.6",
+            expected_extension_sha256=expected_hash,
+        )
+        source_url = "https://www.whoscored.com/statisticsfeed/1/x"
+        body = b'{"rows":[]}'
+        payload = {
+            "status": "ok",
+            "message": "completed",
+            "solution": {
+                "responseBase64": base64.b64encode(body).decode(),
+                "responseBytes": len(body),
+                "headers": {"content-type": "application/json"},
+                "finalUrl": source_url,
+                "status": 200,
+            },
+            "startTimestamp": 100,
+            "endTimestamp": 101,
+            "version": "3.4.6",
+            "extension_sha256": expected_hash,
+        }
+        response = _ok_response(payload)
+        response.content = b"identity-envelope"
+        with patch.object(client, "session", new=MagicMock()) as sess:
+            sess.get.return_value = _identity_response()
+            sess.post.return_value = response
+            result = client.xhr_get(source_url, "ws-direct-1")
+
+        assert result["content"] == body
+        stats = client.get_traffic_stats()
+        assert stats["fs_response_bytes"] == len(response.content)
+        assert stats["requests"] == 1
+
+    def test_xhr_http_error_requires_identity_before_status_handling(self):
+        client = FlareSolverrClient(
+            expected_version="3.4.6",
+            expected_extension_sha256="a" * 64,
+        )
+        payload = {
+            "status": "error",
+            "message": "rejected",
+            "startTimestamp": 100,
+            "endTimestamp": 101,
+            "version": "3.4.6",
+        }
+        with patch.object(client, "session", new=MagicMock()) as sess:
+            sess.get.return_value = _identity_response()
+            sess.post.return_value = _ok_response(payload, status_code=400)
+            with pytest.raises(FlareSolverrRuntimeIdentityError):
+                client.xhr_get(
+                    "https://www.whoscored.com/statisticsfeed/1/x", "ws-direct-1"
+                )
+
+        assert client.get_traffic_stats()["fs_response_bytes"] == 0
+
+    @pytest.mark.parametrize(
+        "identity_response",
+        [
+            _identity_response(version="3.4.5"),
+            _identity_response(extension_sha256="b" * 64),
+            _ok_response({"status": "ok", "version": "3.4.6"}),
+            _ok_response({}, status_code=404),
+        ],
+    )
+    def test_preflight_rejects_stale_runtime_before_post(self, identity_response):
+        client = FlareSolverrClient(
+            expected_version="3.4.6",
+            expected_extension_sha256="a" * 64,
+        )
+        with patch.object(client, "session", new=MagicMock()) as sess:
+            sess.get.return_value = identity_response
+            with pytest.raises(FlareSolverrRuntimeIdentityError):
+                client.create_session("ws-direct-1")
+
+        sess.post.assert_not_called()
+        assert client.get_traffic_stats()["sessions_created"] == 0
 
     def test_xhr_get_rejects_mismatched_body_size(self):
         client = FlareSolverrClient()
@@ -425,9 +589,7 @@ class TestFlareSolverrGet:
     @pytest.mark.parametrize("status_code", [200, 500])
     def test_generic_error_solving_challenge_is_not_cf(self, caplog, status_code):
         client = FlareSolverrClient()
-        source_url = (
-            "https://source.invalid/cloudflare-status?token=internal-secret"
-        )
+        source_url = "https://source.invalid/cloudflare-status?token=internal-secret"
         session_id = "ws-cap-a1b2c3d4e5f60718-turnstile-internal"
         payload = {
             "status": "error",
@@ -668,18 +830,12 @@ class TestFlareSolverrSessions:
             "http://lease:BOUNDARY-%22quoted%5Ccredential@proxy_filter:8900"
         )
         rendered_secret = (
-            json.dumps(secret)[1:-1]
-            if rendering == "json"
-            else repr(secret)[1:-1]
+            json.dumps(secret)[1:-1] if rendering == "json" else repr(secret)[1:-1]
         )
         response = _ok_response({"status": "error"}, status_code=500)
         # The old implementation truncated here first and leaked "BOUND" from
         # a sensitive value spanning its 300-character boundary.
-        response.text = (
-            "x" * 294
-            + rendered_secret
-            + f" {session_id} {proxy_url} lease"
-        )
+        response.text = "x" * 294 + rendered_secret + f" {session_id} {proxy_url} lease"
         with patch.object(client, "session", new=MagicMock()) as sess:
             sess.post.return_value = response
             with caplog.at_level("WARNING"):
@@ -697,9 +853,7 @@ class TestFlareSolverrSessions:
         assert "cmd=sessions.create" in caplog.text
 
     @pytest.mark.parametrize("as_bytes", [False, True])
-    def test_http_body_redacts_nested_repr_before_truncation(
-        self, caplog, as_bytes
-    ):
+    def test_http_body_redacts_nested_repr_before_truncation(self, caplog, as_bytes):
         secret = "p'ass\"\\word"
         payload = {
             "cmd": "sessions.create",

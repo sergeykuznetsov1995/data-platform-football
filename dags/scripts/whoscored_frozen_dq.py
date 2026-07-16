@@ -6,6 +6,8 @@ import hashlib
 from datetime import datetime, timezone
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 
+from scrapers.whoscored.runtime_contract import require_production_runtime_class
+
 
 DQ_STAGE_TABLE = "whoscored_backfill_dq_population"
 DQ_STAGE_QUALIFIED = f"iceberg.bronze.{DQ_STAGE_TABLE}"
@@ -393,6 +395,7 @@ def stage_frozen_population(
     set-based proof detects any row-level corruption against that marker.
     """
 
+    require_production_runtime_class(operation="WhoScored frozen DQ persistence")
     from scrapers.base.iceberg_writer import IcebergWriter
 
     marker = _stage_population_marker(population)
@@ -1275,6 +1278,7 @@ def frozen_historical_integrity(
 ) -> tuple[dict[str, int], dict[str, dict[str, int]]]:
     """Return exact semantic counters and 12-table parity for frozen keys."""
 
+    require_production_runtime_class(operation="WhoScored frozen DQ validation")
     relation = population.get("staged_relation")
     if not isinstance(relation, Mapping):
         raise FrozenDQError("frozen DQ requires a staged relation reference")
@@ -1557,6 +1561,7 @@ def cleanup_staged_frozen_populations(
     still advances when no backfill reaches its success-only cleanup path.
     """
 
+    require_production_runtime_class(operation="WhoScored frozen DQ cleanup")
     if (
         (keep_population_sha256 is not None and not _is_sha256(keep_population_sha256))
         or type(retention_days) is not int

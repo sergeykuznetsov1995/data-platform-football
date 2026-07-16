@@ -58,22 +58,35 @@ WORKER_EXEC_SCRIPT = (
     REPO_ROOT / "scripts" / "research" / "whoscored_capacity_worker_exec.py"
 )
 
-CANARY_VERSION = "whoscored-capacity-canary-v1"
+CANARY_VERSION = "whoscored-capacity-canary-v2"
 EXPECTED_WORKFLOW_VERSION = "whoscored-workflow-benchmark-v2"
 REQUIRED_CURL_CFFI_VERSION = "0.15.0"
 REQUIRED_FLARESOLVERR_VERSION = "3.4.6"
-REQUIRED_FLARESOLVERR_IMAGE_ID = (
-    "sha256:7962759d99d7e125e108e0f5e7f3cdbcd36161776d058d1d9b7153b92ef1af9e"
+REQUIRED_FLARESOLVERR_IMAGE_REFERENCE = (
+    "data-platform-flaresolverr-whoscored:3.4.6"
 )
 REQUIRED_FLARESOLVERR_ENDPOINT = "http://127.0.0.1:8191"
 REQUIRED_FLARESOLVERR_COMMAND = (
-    "/usr/local/bin/python",
-    "-u",
-    "/app/flaresolverr_extended.py",
+    "/usr/local/bin/whoscored-flaresolverr-entrypoint",
 )
-REQUIRED_FLARESOLVERR_MOUNT_TARGET = "/app/flaresolverr_extended.py"
+REQUIRED_FLARESOLVERR_ENTRYPOINT = ("/usr/bin/dumb-init", "--")
+REQUIRED_FLARESOLVERR_TMPFS = {
+    "/tmp": "rw,exec,nosuid,nodev,size=2g,uid=1000,gid=1000,mode=1770",
+    "/config": "rw,noexec,nosuid,nodev,size=16m,uid=1000,gid=1000,mode=0700",
+    "/app/.config": "rw,noexec,nosuid,nodev,size=64m,uid=1000,gid=1000,mode=0700",
+    "/app/.local": "rw,noexec,nosuid,nodev,size=64m,uid=1000,gid=1000,mode=0700",
+}
 REQUIRED_COMPOSE_PROJECT = "data-platform"
-PRODUCTION_COMPOSE_ENV_FILE = Path("/root/data-platform-football/.env")
+PRODUCTION_COMPOSE_WRAPPER = REPO_ROOT / "scripts" / "compose.sh"
+PRODUCTION_COMPOSE_FILES = (
+    REPO_ROOT / "compose.yaml",
+    REPO_ROOT / "compose.seaweedfs-supervised.yaml",
+)
+PRODUCTION_COMPOSE_ENV_FILES = (
+    Path("/root/data-platform-football/.env"),
+    Path("/root/data-platform-football/.env.whoscored-rollout"),
+    Path("/root/data-platform-football/.env.proxy-pool.whoscored-v2"),
+)
 CAPACITY_SOURCE_CIRCUIT_PATH = (
     REPO_ROOT / "logs" / "whoscored" / "source-circuit-v1.json"
 )
@@ -95,11 +108,23 @@ MIN_PAGE_UNITS_PER_DAY = 144_000
 GIB = 1024**3
 MAX_RSS_BYTES = 12 * GIB
 _RUNTIME_STATIC_PATHS = (
+    ".dockerignore",
+    "compose.seaweedfs-supervised.yaml",
     "compose.yaml",
+    "configs/seaweedfs/S3ProxyCaddyfile",
+    "docker/images/flaresolverr-whoscored/Dockerfile",
+    "docker/images/flaresolverr-whoscored/Dockerfile.dockerignore",
+    "docker/images/flaresolverr-whoscored/entrypoint.sh",
     "scripts/research/bench_whoscored_capacity.py",
     "scripts/research/bench_whoscored_workflow.py",
     "scripts/research/whoscored_capacity_worker_exec.py",
     "scripts/flaresolverr_extended.py",
+    "scripts/audit_seaweedfs_control_network.py",
+    "scripts/audit_seaweedfs_runtime_container.py",
+    "scripts/compose.sh",
+    "scripts/seaweedfs_legacy_entrypoint.sh",
+    "scripts/seaweedfs_lifecycle_lock.sh",
+    "scripts/validate_seaweedfs_s3_identity_config.py",
     "scripts/proxy_filter/filter_proxy.py",
     "docker/images/airflow/requirements-scraping.txt",
     "scrapers/base/flaresolverr_client.py",
@@ -1402,6 +1427,7 @@ def _normalise_container(
     raw: Mapping[str, Any],
     *,
     expected_flaresolverr_config_hash: Optional[str] = None,
+    expected_flaresolverr_image_id: Optional[str] = None,
 ) -> dict[str, Any]:
     state = raw.get("State") or {}
     if not isinstance(state, Mapping):
@@ -1411,17 +1437,28 @@ def _normalise_container(
     if not name or not container_id:
         raise RuntimeError("docker inspect omitted container identity")
     command_contract_ok = False
-    helper_mount_contract_ok = False
+    image_identity_contract_ok = False
+    immutable_payload_contract_ok = False
+    security_contract_ok = False
     compose_identity_ok = False
     published_endpoint_contract_ok = False
     if name == "flaresolverr":
         config = raw.get("Config") or {}
+        host_config = raw.get("HostConfig") or {}
         mounts = raw.get("Mounts") or []
         network_settings = raw.get("NetworkSettings") or {}
+        allowed_compose_file_labels = {
+            str(PRODUCTION_COMPOSE_FILES[0].resolve()),
+            ",".join(str(path.resolve()) for path in PRODUCTION_COMPOSE_FILES),
+        }
         if isinstance(config, Mapping):
             command = config.get("Cmd")
-            command_contract_ok = type(command) is list and tuple(command) == (
-                REQUIRED_FLARESOLVERR_COMMAND
+            entrypoint = config.get("Entrypoint")
+            command_contract_ok = (
+                type(command) is list
+                and tuple(command) == REQUIRED_FLARESOLVERR_COMMAND
+                and type(entrypoint) is list
+                and tuple(entrypoint) == REQUIRED_FLARESOLVERR_ENTRYPOINT
             )
             labels = config.get("Labels") or {}
             compose_identity_ok = isinstance(labels, Mapping) and (
@@ -1431,32 +1468,46 @@ def _normalise_container(
                 and labels.get("com.docker.compose.service") == "flaresolverr"
                 and labels.get("com.docker.compose.config-hash")
                 == expected_flaresolverr_config_hash
-                and labels.get("com.docker.compose.image")
-                == REQUIRED_FLARESOLVERR_IMAGE_ID
                 and labels.get("com.docker.compose.oneoff") == "False"
                 and labels.get("com.docker.compose.project.config_files")
-                == str((REPO_ROOT / "compose.yaml").resolve())
+                in allowed_compose_file_labels
                 and labels.get("com.docker.compose.project.environment_file")
-                == str(PRODUCTION_COMPOSE_ENV_FILE)
+                == ",".join(str(path) for path in PRODUCTION_COMPOSE_ENV_FILES)
                 and labels.get("com.docker.compose.project.working_dir")
                 == str(REPO_ROOT.resolve())
             )
-        required_mount_source = str(
-            (REPO_ROOT / "scripts" / "flaresolverr_extended.py").resolve()
-        )
-        if isinstance(mounts, list):
-            target_mounts = [
-                mount
-                for mount in mounts
-                if isinstance(mount, Mapping)
-                and mount.get("Destination")
-                == REQUIRED_FLARESOLVERR_MOUNT_TARGET
-            ]
-            helper_mount_contract_ok = len(target_mounts) == 1 and (
-                target_mounts[0].get("Type") == "bind"
-                and target_mounts[0].get("Source") == required_mount_source
-                and target_mounts[0].get("RW") is False
-                and target_mounts[0].get("Mode") == "ro"
+            image_identity_contract_ok = (
+                isinstance(labels, Mapping)
+                and config.get("Image")
+                == REQUIRED_FLARESOLVERR_IMAGE_REFERENCE
+                and type(expected_flaresolverr_image_id) is str
+                and re.fullmatch(
+                    r"sha256:[0-9a-f]{64}", expected_flaresolverr_image_id
+                )
+                is not None
+                and raw.get("Image") == expected_flaresolverr_image_id
+                and labels.get("com.docker.compose.image")
+                == expected_flaresolverr_image_id
+            )
+        if isinstance(host_config, Mapping) and isinstance(config, Mapping):
+            immutable_payload_contract_ok = (
+                host_config.get("ReadonlyRootfs") is True
+                and host_config.get("Tmpfs") == REQUIRED_FLARESOLVERR_TMPFS
+                and isinstance(mounts, list)
+                and not mounts
+            )
+            security_contract_ok = (
+                config.get("User") == "1000:1000"
+                and host_config.get("Privileged") is False
+                and host_config.get("CapDrop") == ["ALL"]
+                and host_config.get("CapAdd") in (None, [])
+                and host_config.get("SecurityOpt")
+                == [
+                    "no-new-privileges:true",
+                    "apparmor=docker-default",
+                    "seccomp=builtin",
+                ]
+                and raw.get("AppArmorProfile") == "docker-default"
             )
         if isinstance(network_settings, Mapping):
             ports = network_settings.get("Ports") or {}
@@ -1476,7 +1527,9 @@ def _normalise_container(
         "id": container_id[:12],
         "image_id": str(raw.get("Image") or ""),
         "command_contract_ok": command_contract_ok,
-        "helper_mount_contract_ok": helper_mount_contract_ok,
+        "image_identity_contract_ok": image_identity_contract_ok,
+        "immutable_payload_contract_ok": immutable_payload_contract_ok,
+        "security_contract_ok": security_contract_ok,
         "compose_identity_ok": compose_identity_ok,
         "published_endpoint_contract_ok": published_endpoint_contract_ok,
         "status": str(state.get("Status") or "unknown"),
@@ -1548,26 +1601,30 @@ def _inspect_container_resources(
 def _resolved_flaresolverr_compose_hash() -> str:
     """Hash the currently resolved production service without retaining values."""
 
-    try:
-        metadata = PRODUCTION_COMPOSE_ENV_FILE.stat()
-    except OSError as exc:
-        raise RuntimeError("production compose environment is unavailable") from exc
-    if (
-        not stat.S_ISREG(metadata.st_mode)
-        or stat.S_IMODE(metadata.st_mode) != 0o600
-    ):
-        raise RuntimeError("production compose environment metadata is invalid")
+    for environment_file in PRODUCTION_COMPOSE_ENV_FILES:
+        try:
+            metadata = environment_file.stat()
+        except OSError as exc:
+            raise RuntimeError(
+                "production compose environment is unavailable"
+            ) from exc
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            raise RuntimeError("production compose environment metadata is invalid")
+    environment_arguments = [
+        argument
+        for environment_file in PRODUCTION_COMPOSE_ENV_FILES
+        for argument in ("--env-file", str(environment_file))
+    ]
     try:
         result = subprocess.run(
             [
-                "docker",
-                "compose",
-                "--env-file",
-                str(PRODUCTION_COMPOSE_ENV_FILE),
+                str(PRODUCTION_COMPOSE_WRAPPER),
+                *environment_arguments,
                 "-p",
                 REQUIRED_COMPOSE_PROJECT,
-                "-f",
-                str((REPO_ROOT / "compose.yaml").resolve()),
                 "config",
                 "--hash",
                 "flaresolverr",
@@ -1589,6 +1646,35 @@ def _resolved_flaresolverr_compose_hash() -> str:
     ):
         raise RuntimeError("production FlareSolverr config hash is unavailable")
     return fields[1]
+
+
+def _resolved_flaresolverr_image_id() -> str:
+    """Resolve the exact local ID behind the reviewed derived-image reference."""
+
+    try:
+        result = subprocess.run(
+            [
+                "docker",
+                "image",
+                "inspect",
+                "--format",
+                "{{.Id}}",
+                REQUIRED_FLARESOLVERR_IMAGE_REFERENCE,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError("cannot resolve production FlareSolverr image") from exc
+    image_id = result.stdout.strip()
+    if (
+        result.returncode != 0
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", image_id) is None
+    ):
+        raise RuntimeError("production FlareSolverr image ID is unavailable")
+    return image_id
 
 
 def _inspect_containers(names: Sequence[str]) -> Mapping[str, Mapping[str, Any]]:
@@ -1620,6 +1706,9 @@ def _inspect_containers(names: Sequence[str]) -> Mapping[str, Mapping[str, Any]]
         if "flaresolverr" in names
         else None
     )
+    expected_flaresolverr_image_id = (
+        _resolved_flaresolverr_image_id() if "flaresolverr" in names else None
+    )
     inspected = {
         item["name"]: item
         for item in (
@@ -1628,6 +1717,7 @@ def _inspect_containers(names: Sequence[str]) -> Mapping[str, Mapping[str, Any]]
                 expected_flaresolverr_config_hash=(
                     expected_flaresolverr_config_hash
                 ),
+                expected_flaresolverr_image_id=expected_flaresolverr_image_id,
             )
             for raw in payload
         )
@@ -2572,22 +2662,22 @@ def run(
                 accumulator.baseline_containers, current
             )
             flaresolverr = current.get("flaresolverr")
-            if (
-                not isinstance(flaresolverr, Mapping)
-                or flaresolverr.get("image_id")
-                != REQUIRED_FLARESOLVERR_IMAGE_ID
-            ):
-                violations.append(
-                    "flaresolverr: production image digest does not match"
-                )
             flaresolverr_contracts = (
                 (
                     "command_contract_ok",
                     "flaresolverr: running command does not match production",
                 ),
                 (
-                    "helper_mount_contract_ok",
-                    "flaresolverr: helper bind mount is not exact read-only production mount",
+                    "image_identity_contract_ok",
+                    "flaresolverr: derived image ID does not match the reviewed compose image",
+                ),
+                (
+                    "immutable_payload_contract_ok",
+                    "flaresolverr: immutable payload/root filesystem contract does not match",
+                ),
+                (
+                    "security_contract_ok",
+                    "flaresolverr: runtime security contract does not match production",
                 ),
                 (
                     "compose_identity_ok",

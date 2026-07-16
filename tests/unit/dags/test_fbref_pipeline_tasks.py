@@ -11,6 +11,14 @@ import pytest
 from dags.utils import fbref_pipeline_tasks
 
 
+@pytest.fixture(autouse=True)
+def _select_test_browser_interpreter(monkeypatch):
+    monkeypatch.setenv(
+        fbref_pipeline_tasks.LEGACY_SCRAPER_PYTHON_ENV,
+        sys.executable,
+    )
+
+
 def _freshness_summary(*, stale_kind: str | None = None) -> dict:
     by_kind = {}
     for kind in fbref_pipeline_tasks.FBREF_REQUIRED_CURRENT_PAGE_KINDS:
@@ -799,6 +807,7 @@ def test_fetch_wave_runs_in_an_unforked_subprocess(monkeypatch):
     assert result == {"claimed": 2, "fetched": 2}
     pipeline.fetch_wave.assert_not_called()
     command = captured["command"]
+    assert command[0] == sys.executable
     assert command[1] == fbref_pipeline_tasks.FETCH_WAVE_RUNNER
     assert "--page-kinds" in command
     assert command[command.index("--page-kinds") + 1] == "competition,season"

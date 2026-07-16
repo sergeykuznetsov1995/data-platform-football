@@ -20,7 +20,7 @@ import sqlite3
 import tempfile
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from functools import wraps
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional, Sequence
@@ -35,6 +35,7 @@ from scrapers.whoscored.catalog import WhoScoredCatalog
 from scrapers.whoscored.domain import WhoScoredScope
 from scrapers.whoscored.parsers import MATCH_AVAILABILITY_VERSION, PARSER_VERSION
 from scrapers.whoscored.profile_policy import MAX_DAILY_PROFILE_CANDIDATES
+from scrapers.whoscored.runtime_contract import require_production_runtime_class
 
 
 MATCH_MANIFEST_TABLE = "whoscored_match_ingest_manifest"
@@ -964,6 +965,106 @@ def catalog_payload_sha256(
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def canonical_catalog_raw_inputs(
+    raw_inputs: Sequence[Mapping[str, Any]],
+) -> tuple[dict[str, Any], ...]:
+    """Return the exact order-independent catalog provenance representation."""
+
+    materialised = [dict(_clean_json_unicode(dict(item))) for item in raw_inputs]
+    return tuple(
+        sorted(
+            materialised,
+            key=lambda item: json.dumps(
+                item,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ),
+        )
+    )
+
+
+def catalog_raw_provenance_sha256(
+    raw_inputs: Sequence[Mapping[str, Any]],
+) -> str:
+    """Hash the complete canonical list of raw observations."""
+
+    payload = json.dumps(
+        canonical_catalog_raw_inputs(raw_inputs),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _catalog_manifest_as_of_date(value: Any) -> date:
+    """Decode one exact manifest DATE without accepting datetime coercion."""
+
+    if type(value) is date:
+        return value
+    if type(value) is str and re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        try:
+            parsed = date.fromisoformat(value)
+        except ValueError as exc:
+            raise BatchConflict("catalog manifest has an invalid as_of_date") from exc
+        if parsed.isoformat() == value:
+            return parsed
+    raise BatchConflict("catalog manifest has an invalid as_of_date")
+
+
+def _validate_catalog_raw_provenance(
+    *,
+    batch_id: str,
+    raw_inputs_json: str,
+    raw_provenance_sha256: str,
+    as_of_date: date,
+) -> None:
+    """Verify direct inputs or their content-addressed provenance descriptor."""
+
+    if re.fullmatch(r"[0-9a-f]{64}", raw_provenance_sha256) is None:
+        raise BatchConflict(f"catalog {batch_id} has an invalid raw provenance sha256")
+    try:
+        decoded = json.loads(raw_inputs_json)
+    except (TypeError, ValueError) as exc:
+        raise BatchConflict(f"catalog {batch_id} has invalid raw_inputs_json") from exc
+    if not isinstance(decoded, list) or not decoded:
+        raise BatchConflict(
+            f"catalog {batch_id} raw_inputs_json must be a non-empty list"
+        )
+    if any(not isinstance(item, dict) for item in decoded):
+        raise BatchConflict(f"catalog {batch_id} raw_inputs_json contains a non-object")
+    expected_as_of = as_of_date.isoformat()
+    if any(str(item.get("as_of_date") or "") != expected_as_of for item in decoded):
+        raise BatchConflict(
+            f"catalog {batch_id} raw provenance is not bound to as_of_date"
+        )
+    if catalog_raw_provenance_sha256(decoded) == raw_provenance_sha256:
+        return
+    descriptors = [
+        item
+        for item in decoded
+        if str(item.get("target_id") or "").startswith("whoscored:catalog-provenance:")
+    ]
+    if len(descriptors) == 1:
+        descriptor = descriptors[0]
+        if (
+            str(descriptor.get("target_id") or "")
+            == f"whoscored:catalog-provenance:{batch_id}"
+            and str(descriptor.get("payload_sha256") or "") == raw_provenance_sha256
+            and str(descriptor.get("raw_uri") or "")
+            and type(descriptor.get("input_count")) is int
+            and int(descriptor["input_count"]) > 0
+        ):
+            return
+    raise BatchConflict(
+        f"catalog {batch_id} raw provenance hash is not reconstructible "
+        "from its manifest"
+    )
+
+
 def _sql_string(value: str) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
@@ -984,20 +1085,191 @@ def _coerce_bool(value: Any) -> bool:
     raise ValueError(f"invalid boolean value from WhoScored/Trino: {value!r}")
 
 
+MATCH_BATCH_ID_PREFIX = "ws2-v3-"
+PREVIEW_BATCH_ID_PREFIX = "wsp2-v3-"
+MATCH_NOT_AVAILABLE_BATCH_ID_PREFIX = "wsna2-v3-"
+PREVIEW_NOT_AVAILABLE_BATCH_ID_PREFIX = "wspna2-v3-"
+PROFILE_BATCH_ID_PREFIX = "wspr2-v3-"
+PROFILE_NOT_AVAILABLE_BATCH_ID_PREFIX = "wsprna2-"
+
+
 def deterministic_game_batch_id(
-    game_id: int, payload_sha256: str, parser_version: str = PARSER_VERSION
+    game_id: int,
+    payload_sha256: str,
+    parser_version: str = PARSER_VERSION,
+    *,
+    league: str,
+    season: str,
 ) -> str:
-    value = f"{int(game_id)}\0{payload_sha256}\0{parser_version}".encode("utf-8")
-    return "ws2-" + hashlib.sha256(value).hexdigest()
+    """Return the V3 physical identity bound to its complete logical scope."""
+
+    value = json.dumps(
+        {
+            "game_id": int(game_id),
+            "league": league,
+            "parser_version": parser_version,
+            "payload_sha256": payload_sha256,
+            "season": season,
+            "version": "match-v3",
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return MATCH_BATCH_ID_PREFIX + hashlib.sha256(value).hexdigest()
 
 
 def deterministic_preview_batch_id(
-    game_id: int, payload_sha256: str, parser_version: str = PARSER_VERSION
+    game_id: int,
+    payload_sha256: str,
+    parser_version: str = PARSER_VERSION,
+    *,
+    league: str,
+    season: str,
 ) -> str:
-    value = f"preview\0{int(game_id)}\0{payload_sha256}\0{parser_version}".encode(
-        "utf-8"
+    """Return the V3 preview identity bound to its complete logical scope."""
+
+    value = json.dumps(
+        {
+            "game_id": int(game_id),
+            "league": league,
+            "parser_version": parser_version,
+            "payload_sha256": payload_sha256,
+            "season": season,
+            "version": "preview-v3",
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return PREVIEW_BATCH_ID_PREFIX + hashlib.sha256(value).hexdigest()
+
+
+def deterministic_profile_not_available_batch_id(
+    player_id: int,
+    *,
+    failure_code: str,
+    http_status: Optional[int],
+    payload_sha256: Optional[str],
+    raw_uri: Optional[str],
+    parser_version: str = PARSER_VERSION,
+    availability_version: str = MATCH_AVAILABILITY_VERSION,
+) -> str:
+    """Bind one durable source-owned profile absence proof to its player."""
+
+    if int(player_id) <= 0:
+        raise ValueError("profile not-available player_id must be positive")
+    if not str(failure_code):
+        raise ValueError("profile not-available failure_code is required")
+    identity = json.dumps(
+        {
+            "availability_version": str(availability_version),
+            "failure_code": str(failure_code),
+            "http_status": int(http_status) if http_status is not None else None,
+            "parser_version": str(parser_version),
+            "payload_sha256": (
+                str(payload_sha256) if payload_sha256 is not None else None
+            ),
+            "player_id": int(player_id),
+            "raw_uri": str(raw_uri) if raw_uri is not None else None,
+            "state": "not_available",
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return PROFILE_NOT_AVAILABLE_BATCH_ID_PREFIX + hashlib.sha256(identity).hexdigest()
+
+
+def _deterministic_game_not_available_batch_id(
+    prefix: str,
+    kind: str,
+    game_id: int,
+    *,
+    league: str,
+    season: str,
+    failure_code: str,
+    http_status: Optional[int],
+    payload_sha256: Optional[str],
+    raw_uri: Optional[str],
+    parser_version: str,
+    availability_version: str,
+) -> str:
+    if int(game_id) <= 0 or not league or not season or not str(failure_code):
+        raise ValueError(f"{kind} not-available identity is incomplete")
+    identity = json.dumps(
+        {
+            "availability_version": str(availability_version),
+            "failure_code": str(failure_code),
+            "game_id": int(game_id),
+            "http_status": int(http_status) if http_status is not None else None,
+            "kind": kind,
+            "league": str(league),
+            "parser_version": str(parser_version),
+            "payload_sha256": (
+                str(payload_sha256) if payload_sha256 is not None else None
+            ),
+            "raw_uri": str(raw_uri) if raw_uri is not None else None,
+            "season": str(season),
+            "state": "not_available",
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return prefix + hashlib.sha256(identity).hexdigest()
+
+
+def deterministic_match_not_available_batch_id(
+    game_id: int,
+    *,
+    league: str,
+    season: str,
+    failure_code: str,
+    http_status: Optional[int],
+    payload_sha256: Optional[str],
+    raw_uri: Optional[str],
+    parser_version: str = PARSER_VERSION,
+    availability_version: str = MATCH_AVAILABILITY_VERSION,
+) -> str:
+    return _deterministic_game_not_available_batch_id(
+        MATCH_NOT_AVAILABLE_BATCH_ID_PREFIX,
+        "match",
+        game_id,
+        league=league,
+        season=season,
+        failure_code=failure_code,
+        http_status=http_status,
+        payload_sha256=payload_sha256,
+        raw_uri=raw_uri,
+        parser_version=parser_version,
+        availability_version=availability_version,
     )
-    return "wsp2-" + hashlib.sha256(value).hexdigest()
+
+
+def deterministic_preview_not_available_batch_id(
+    game_id: int,
+    *,
+    league: str,
+    season: str,
+    failure_code: str,
+    http_status: Optional[int],
+    payload_sha256: Optional[str],
+    raw_uri: Optional[str],
+    parser_version: str = PARSER_VERSION,
+    availability_version: str = MATCH_AVAILABILITY_VERSION,
+) -> str:
+    return _deterministic_game_not_available_batch_id(
+        PREVIEW_NOT_AVAILABLE_BATCH_ID_PREFIX,
+        "preview",
+        game_id,
+        league=league,
+        season=season,
+        failure_code=failure_code,
+        http_status=http_status,
+        payload_sha256=payload_sha256,
+        raw_uri=raw_uri,
+        parser_version=parser_version,
+        availability_version=availability_version,
+    )
 
 
 @dataclass(frozen=True)
@@ -1044,7 +1316,11 @@ class MatchCommit:
     @property
     def batch_id(self) -> str:
         return deterministic_game_batch_id(
-            self.game_id, self.payload_sha256, self.parser_version
+            self.game_id,
+            self.payload_sha256,
+            self.parser_version,
+            league=self.league,
+            season=self.season,
         )
 
 
@@ -1098,7 +1374,11 @@ class PreviewCommit:
     @property
     def batch_id(self) -> str:
         return deterministic_preview_batch_id(
-            self.game_id, self.payload_sha256, self.parser_version
+            self.game_id,
+            self.payload_sha256,
+            self.parser_version,
+            league=self.league,
+            season=self.season,
         )
 
 
@@ -1143,11 +1423,18 @@ class ProfileCommit:
 
     @property
     def batch_id(self) -> str:
-        identity = (
-            f"profile\0{int(self.player_id)}\0{self.payload_sha256}\0"
-            f"{self.parser_version}"
+        identity = json.dumps(
+            {
+                "kind": "profile",
+                "parser_version": str(self.parser_version),
+                "payload_sha256": str(self.payload_sha256),
+                "player_id": int(self.player_id),
+                "version": 3,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
         ).encode("utf-8")
-        return "wspr2-" + hashlib.sha256(identity).hexdigest()
+        return PROFILE_BATCH_ID_PREFIX + hashlib.sha256(identity).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -1171,17 +1458,23 @@ class ProfileCandidateCapacityExceeded(RuntimeError):
         )
 
 
+def entity_id_payload_sha256(entity_ids: Iterable[int]) -> str:
+    """Hash one complete positive-ID set independently of source order."""
+
+    raw_values = list(entity_ids)
+    if any(type(value) is not int or value <= 0 for value in raw_values):
+        raise ValueError("entity ids must be positive and unique")
+    values = sorted(raw_values)
+    if len(values) != len(set(values)):
+        raise ValueError("entity ids must be positive and unique")
+    encoded = json.dumps(values, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def profile_candidate_payload_sha256(player_ids: Iterable[int]) -> str:
     """Hash a complete candidate set independently of query priority order."""
 
-    raw_values = list(player_ids)
-    if any(type(value) is not int or value <= 0 for value in raw_values):
-        raise ValueError("profile candidate ids must be positive and unique")
-    values = sorted(raw_values)
-    if len(values) != len(set(values)):
-        raise ValueError("profile candidate ids must be positive and unique")
-    encoded = json.dumps(values, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    return entity_id_payload_sha256(player_ids)
 
 
 class WhoScoredRepository:
@@ -1195,6 +1488,7 @@ class WhoScoredRepository:
         catalog: str = "iceberg",
         schema: str = "bronze",
     ) -> None:
+        require_production_runtime_class(operation="WhoScored Iceberg persistence")
         self.writer = writer or IcebergWriter(catalog=catalog)
         self.trino = trino or self.writer._get_trino_manager()
         # An injected Trino manager must also back writes.  Otherwise the
@@ -1402,7 +1696,12 @@ class WhoScoredRepository:
                 payload_sha256 VARCHAR,
                 raw_uri VARCHAR,
                 raw_inputs_json VARCHAR,
+                raw_provenance_sha256 VARCHAR,
                 discovery_mode VARCHAR,
+                as_of_date DATE,
+                parent_catalog_batch_id VARCHAR,
+                parent_catalog_payload_sha256 VARCHAR,
+                parent_catalog_raw_provenance_sha256 VARCHAR,
                 parser_version VARCHAR,
                 state VARCHAR,
                 competitions_count BIGINT,
@@ -1426,10 +1725,19 @@ class WhoScoredRepository:
                 self.schema, CATALOG_MANIFEST_TABLE
             )
         }
-        for name in ("raw_inputs_json", "discovery_mode"):
+        additive_columns = {
+            "raw_inputs_json": "VARCHAR",
+            "raw_provenance_sha256": "VARCHAR",
+            "discovery_mode": "VARCHAR",
+            "as_of_date": "DATE",
+            "parent_catalog_batch_id": "VARCHAR",
+            "parent_catalog_payload_sha256": "VARCHAR",
+            "parent_catalog_raw_provenance_sha256": "VARCHAR",
+        }
+        for name, data_type in additive_columns.items():
             if name not in manifest_columns:
                 self.trino.add_column(
-                    self.schema, CATALOG_MANIFEST_TABLE, name, "VARCHAR"
+                    self.schema, CATALOG_MANIFEST_TABLE, name, data_type
                 )
         if not create_views:
             return
@@ -1626,6 +1934,186 @@ class WhoScoredRepository:
             raise ValueError(f"unsupported catalog dataset: {kind!r}")
         return "|".join("" if part is None else str(part) for part in parts)
 
+    def _read_catalog_manifest(self, batch_id: str) -> dict[str, Any]:
+        rows = self.trino.execute_query(
+            f"SELECT competitions_count, seasons_count, stages_count, "
+            "payload_sha256, parser_version, schema_fingerprint, raw_inputs_json, "
+            "raw_provenance_sha256, discovery_mode, as_of_date, "
+            "parent_catalog_batch_id, parent_catalog_payload_sha256, "
+            "parent_catalog_raw_provenance_sha256, COUNT(*) OVER () "
+            "AS _identity_count "
+            f"FROM {self._catalog_manifest} "
+            f"WHERE batch_id = {_sql_string(batch_id)} AND state = 'success' "
+            "ORDER BY completed_at DESC, _ingested_at DESC LIMIT 1"
+        )
+        if not rows:
+            raise BatchConflict(f"catalog {batch_id} success manifest is missing")
+        row = rows[0]
+        if len(row) != 14 or int(row[13]) != 1:
+            raise BatchConflict(f"catalog {batch_id} manifest shape is invalid")
+        return {
+            "batch_id": batch_id,
+            "competitions_count": row[0],
+            "seasons_count": row[1],
+            "stages_count": row[2],
+            "payload_sha256": str(row[3] or ""),
+            "parser_version": str(row[4] or ""),
+            "schema_fingerprint": str(row[5] or ""),
+            "raw_inputs_json": str(row[6] or ""),
+            "raw_provenance_sha256": str(row[7] or ""),
+            "discovery_mode": str(row[8] or ""),
+            "as_of_date": row[9],
+            "parent_catalog_batch_id": str(row[10] or ""),
+            "parent_catalog_payload_sha256": str(row[11] or ""),
+            "parent_catalog_raw_provenance_sha256": str(row[12] or ""),
+        }
+
+    def _validate_catalog_lineage(
+        self,
+        manifest: Mapping[str, Any],
+        *,
+        allow_legacy_parser_for_full_history: bool = False,
+    ) -> None:
+        """Validate every exact parent edge and reject cycles fail-closed."""
+
+        seen: set[str] = set()
+        current = dict(manifest)
+        first = True
+        lineage_manifests: Optional[dict[str, dict[str, Any]]] = None
+        while True:
+            batch_id = str(current["batch_id"])
+            if batch_id in seen:
+                raise BatchConflict(
+                    f"catalog lineage cycle detected at batch {batch_id}"
+                )
+            seen.add(batch_id)
+            parser_version = str(current.get("parser_version") or "")
+            if parser_version != PARSER_VERSION:
+                if (
+                    first
+                    and allow_legacy_parser_for_full_history
+                    and parser_version in _LEGACY_CATALOG_MIGRATION_PARSERS
+                ):
+                    return
+                raise BatchConflict(
+                    f"catalog {batch_id} lineage uses unsupported parser "
+                    f"{parser_version!r}"
+                )
+            if (
+                first
+                and allow_legacy_parser_for_full_history
+                and not current.get("raw_provenance_sha256")
+                and current.get("as_of_date") is None
+                and not current.get("parent_catalog_batch_id")
+                and not current.get("parent_catalog_payload_sha256")
+                and not current.get("parent_catalog_raw_provenance_sha256")
+            ):
+                # A reviewed full-history run may use one physically verified
+                # pre-lineage snapshot only for loss detection. It is never a
+                # valid incremental parent and the new snapshot has no parent.
+                return
+            current_as_of = _catalog_manifest_as_of_date(current.get("as_of_date"))
+            _validate_catalog_raw_provenance(
+                batch_id=batch_id,
+                raw_inputs_json=str(current.get("raw_inputs_json") or ""),
+                raw_provenance_sha256=str(current.get("raw_provenance_sha256") or ""),
+                as_of_date=current_as_of,
+            )
+            discovery_mode = str(current.get("discovery_mode") or "")
+            parent_batch_id = str(current.get("parent_catalog_batch_id") or "")
+            parent_payload_sha256 = str(
+                current.get("parent_catalog_payload_sha256") or ""
+            )
+            parent_raw_provenance_sha256 = str(
+                current.get("parent_catalog_raw_provenance_sha256") or ""
+            )
+            parent_identity = (
+                parent_batch_id,
+                parent_payload_sha256,
+                parent_raw_provenance_sha256,
+            )
+            if discovery_mode == "full_history":
+                if any(parent_identity):
+                    raise BatchConflict(
+                        f"full-history catalog {batch_id} declares a parent"
+                    )
+                return
+            if discovery_mode != "incremental":
+                raise BatchConflict(
+                    f"catalog {batch_id} has invalid discovery mode {discovery_mode!r}"
+                )
+            if (
+                not all(parent_identity)
+                or re.fullmatch(r"[0-9a-f]{64}", parent_payload_sha256) is None
+                or re.fullmatch(r"[0-9a-f]{64}", parent_raw_provenance_sha256) is None
+            ):
+                raise BatchConflict(
+                    f"incremental catalog {batch_id} has incomplete parent lineage"
+                )
+            if parent_batch_id in seen:
+                raise BatchConflict(
+                    f"catalog lineage cycle detected at batch {parent_batch_id}"
+                )
+            if lineage_manifests is None:
+                rows = self.trino.execute_query(
+                    f"SELECT batch_id, payload_sha256, parser_version, "
+                    "raw_inputs_json, raw_provenance_sha256, discovery_mode, "
+                    "as_of_date, parent_catalog_batch_id, "
+                    "parent_catalog_payload_sha256, "
+                    "parent_catalog_raw_provenance_sha256, "
+                    "COUNT(*) OVER (PARTITION BY batch_id) AS _identity_count "
+                    f"FROM {self._catalog_manifest} WHERE state = 'success'"
+                )
+                lineage_manifests = {}
+                for row in rows:
+                    if len(row) != 11:
+                        raise BatchConflict("catalog lineage manifest shape is invalid")
+                    candidate_batch_id = str(row[0] or "")
+                    if (
+                        not candidate_batch_id
+                        or candidate_batch_id in lineage_manifests
+                    ):
+                        continue
+                    lineage_manifests[candidate_batch_id] = {
+                        "batch_id": candidate_batch_id,
+                        "payload_sha256": str(row[1] or ""),
+                        "parser_version": str(row[2] or ""),
+                        "raw_inputs_json": str(row[3] or ""),
+                        "raw_provenance_sha256": str(row[4] or ""),
+                        "discovery_mode": str(row[5] or ""),
+                        "as_of_date": row[6],
+                        "parent_catalog_batch_id": str(row[7] or ""),
+                        "parent_catalog_payload_sha256": str(row[8] or ""),
+                        "parent_catalog_raw_provenance_sha256": str(row[9] or ""),
+                        "identity_count": int(row[10]),
+                    }
+            parent = lineage_manifests.get(parent_batch_id)
+            if parent is None:
+                raise BatchConflict(
+                    f"catalog {batch_id} parent {parent_batch_id} is missing"
+                )
+            if int(parent["identity_count"]) != 1:
+                raise BatchConflict(
+                    f"catalog {batch_id} parent {parent_batch_id} is ambiguous"
+                )
+            if parent_payload_sha256 != parent["payload_sha256"]:
+                raise BatchConflict(
+                    f"catalog {batch_id} parent payload hash does not match "
+                    f"{parent_batch_id}"
+                )
+            if parent_raw_provenance_sha256 != parent["raw_provenance_sha256"]:
+                raise BatchConflict(
+                    f"catalog {batch_id} parent raw provenance hash does not "
+                    f"match {parent_batch_id}"
+                )
+            parent_as_of = _catalog_manifest_as_of_date(parent.get("as_of_date"))
+            if parent_as_of > current_as_of:
+                raise BatchConflict(
+                    f"catalog {batch_id} as_of_date precedes parent {parent_batch_id}"
+                )
+            current = parent
+            first = False
+
     @_lock_catalog_commit
     def persist_discovered_catalog(
         self,
@@ -1635,7 +2123,12 @@ class WhoScoredRepository:
         raw_uri: str,
         payload_sha256: str,
         raw_inputs: Sequence[Mapping[str, Any]],
+        raw_provenance_sha256: str,
         discovery_mode: str,
+        as_of_date: date,
+        parent_catalog_batch_id: Optional[str],
+        parent_catalog_payload_sha256: Optional[str],
+        parent_catalog_raw_provenance_sha256: Optional[str],
     ) -> str:
         """Append a complete discovery snapshot, then publish one manifest.
 
@@ -1647,26 +2140,59 @@ class WhoScoredRepository:
             not discovery_batch_id
             or not payload_sha256
             or not raw_uri
+            or re.fullmatch(r"[0-9a-f]{64}", raw_provenance_sha256) is None
             or discovery_mode not in {"incremental", "full_history"}
+            or type(as_of_date) is not date
         ):
             raise ValueError(
-                "catalog batch id, payload sha256, raw_uri and discovery mode are required"
+                "catalog batch id, payload/raw provenance sha256, raw_uri, "
+                "discovery mode and exact as_of_date are required"
             )
+        parent_identity = (
+            parent_catalog_batch_id,
+            parent_catalog_payload_sha256,
+            parent_catalog_raw_provenance_sha256,
+        )
+        if discovery_mode == "full_history" and any(parent_identity):
+            raise ValueError("full-history catalog cannot declare a parent")
+        if discovery_mode == "incremental" and (
+            not all(parent_identity)
+            or re.fullmatch(r"[0-9a-f]{64}", str(parent_catalog_payload_sha256)) is None
+            or re.fullmatch(r"[0-9a-f]{64}", str(parent_catalog_raw_provenance_sha256))
+            is None
+        ):
+            raise ValueError("incremental catalog requires an exact parent identity")
         datasets = canonical_catalog_rows(catalog.to_rows())
         fingerprint = catalog_payload_sha256(datasets)
         if payload_sha256 != fingerprint:
             raise ValueError(
                 "catalog payload_sha256 must identify the complete canonical output"
             )
-        raw_inputs_json = self._canonical_json(
-            sorted(
-                (dict(item) for item in raw_inputs),
-                key=lambda item: (
-                    str(item.get("target_id") or ""),
-                    str(item.get("url") or ""),
-                ),
-            )
+        raw_inputs_json = self._canonical_json(canonical_catalog_raw_inputs(raw_inputs))
+        _validate_catalog_raw_provenance(
+            batch_id=discovery_batch_id,
+            raw_inputs_json=raw_inputs_json,
+            raw_provenance_sha256=raw_provenance_sha256,
+            as_of_date=as_of_date,
         )
+        if discovery_mode == "incremental":
+            parent_manifest = self._read_catalog_manifest(str(parent_catalog_batch_id))
+            self._validate_catalog_lineage(parent_manifest)
+            if (
+                parent_manifest["payload_sha256"] != parent_catalog_payload_sha256
+                or parent_manifest["raw_provenance_sha256"]
+                != parent_catalog_raw_provenance_sha256
+            ):
+                raise BatchConflict(
+                    f"catalog {discovery_batch_id} exact parent identity differs "
+                    f"from {parent_catalog_batch_id}"
+                )
+            parent_as_of = _catalog_manifest_as_of_date(parent_manifest["as_of_date"])
+            if parent_as_of > as_of_date:
+                raise BatchConflict(
+                    f"catalog {discovery_batch_id} as_of_date precedes parent "
+                    f"{parent_catalog_batch_id}"
+                )
         expected = {
             kind: len(tuple(datasets.get(kind, ())))
             for kind in ("competitions", "seasons", "stages")
@@ -1674,7 +2200,9 @@ class WhoScoredRepository:
         existing_manifest = self.trino.execute_query(
             f"SELECT competitions_count, seasons_count, stages_count, "
             "payload_sha256, parser_version, schema_fingerprint, raw_inputs_json, "
-            "discovery_mode "
+            "raw_provenance_sha256, discovery_mode, as_of_date, "
+            "parent_catalog_batch_id, parent_catalog_payload_sha256, "
+            "parent_catalog_raw_provenance_sha256 "
             f"FROM {self._catalog_manifest} "
             f"WHERE batch_id = {_sql_string(discovery_batch_id)} "
             "AND state = 'success' ORDER BY completed_at DESC LIMIT 1"
@@ -1694,7 +2222,12 @@ class WhoScoredRepository:
                 PARSER_VERSION,
                 fingerprint,
                 raw_inputs_json,
+                raw_provenance_sha256,
                 discovery_mode,
+                as_of_date.isoformat(),
+                str(parent_catalog_batch_id or ""),
+                str(parent_catalog_payload_sha256 or ""),
+                str(parent_catalog_raw_provenance_sha256 or ""),
             )
             if identity != wanted_identity:
                 raise BatchConflict(
@@ -1787,7 +2320,16 @@ class WhoScoredRepository:
                         "payload_sha256": payload_sha256,
                         "raw_uri": raw_uri,
                         "raw_inputs_json": raw_inputs_json,
+                        "raw_provenance_sha256": raw_provenance_sha256,
                         "discovery_mode": discovery_mode,
+                        "as_of_date": as_of_date,
+                        "parent_catalog_batch_id": parent_catalog_batch_id,
+                        "parent_catalog_payload_sha256": (
+                            parent_catalog_payload_sha256
+                        ),
+                        "parent_catalog_raw_provenance_sha256": (
+                            parent_catalog_raw_provenance_sha256
+                        ),
                         "parser_version": PARSER_VERSION,
                         "state": "success",
                         "competitions_count": expected["competitions"],
@@ -1835,6 +2377,7 @@ class WhoScoredRepository:
         if not manifests:
             raise LookupError("WhoScored discovered catalog has no successful snapshot")
         batch_id = str(manifests[0][0])
+        manifest = self._read_catalog_manifest(batch_id)
         datasets: dict[str, list[dict[str, Any]]] = {}
         for kind in ("competitions", "seasons", "stages"):
             rows = self.trino.execute_query(
@@ -1853,28 +2396,22 @@ class WhoScoredRepository:
             datasets[kind] = decoded
         datasets = canonical_catalog_rows(datasets)
         catalog = WhoScoredCatalog.from_rows(datasets)
-        expected_rows = self.trino.execute_query(
-            f"SELECT competitions_count, seasons_count, stages_count, "
-            "payload_sha256, parser_version, schema_fingerprint "
-            f"FROM {self._catalog_manifest} "
-            f"WHERE batch_id = {_sql_string(batch_id)} AND state = 'success' "
-            "ORDER BY completed_at DESC LIMIT 1"
-        )
-        if not expected_rows:
-            raise BatchConflict(f"catalog {batch_id} success manifest disappeared")
-        expected = expected_rows[0]
         actual = tuple(
             len(datasets[kind]) for kind in ("competitions", "seasons", "stages")
         )
-        if tuple(int(value) for value in expected[:3]) != actual:
+        manifest_counts = tuple(
+            int(manifest[f"{kind}_count"])
+            for kind in ("competitions", "seasons", "stages")
+        )
+        if manifest_counts != actual:
             raise BatchConflict(
                 f"catalog {batch_id} manifest/physical mismatch: "
-                f"manifest={tuple(expected[:3])}, physical={actual}"
+                f"manifest={manifest_counts}, physical={actual}"
             )
         physical_fingerprint = catalog_payload_sha256(catalog.to_rows())
-        manifest_payload = str(expected[3] or "")
-        manifest_parser = str(expected[4] or "")
-        manifest_schema = str(expected[5] or "")
+        manifest_payload = str(manifest["payload_sha256"] or "")
+        manifest_parser = str(manifest["parser_version"] or "")
+        manifest_schema = str(manifest["schema_fingerprint"] or "")
         current_identity = (
             manifest_parser == PARSER_VERSION
             and manifest_payload == physical_fingerprint
@@ -1893,43 +2430,109 @@ class WhoScoredRepository:
                 f"parser={manifest_parser}, physical={physical_fingerprint}, "
                 f"expected_parser={PARSER_VERSION}"
             )
+        self._validate_catalog_lineage(
+            manifest,
+            allow_legacy_parser_for_full_history=(allow_legacy_parser_for_full_history),
+        )
         return catalog
 
     def load_catalog_generation_snapshot(
         self,
+        *,
+        batch_id: Optional[str] = None,
+        allow_legacy_parser_for_full_history: bool = False,
     ) -> tuple[dict[str, Any], WhoScoredCatalog]:
-        """Bind latest manifest provenance to rows from that exact batch."""
-        generation = self.latest_catalog_generation()
+        """Bind one exact manifest generation to rows from that same batch."""
+        generation = self.catalog_generation(
+            batch_id=batch_id,
+            allow_legacy_parser_for_full_history=(allow_legacy_parser_for_full_history),
+        )
         catalog = self.load_discovered_catalog(
-            batch_id=str(generation["catalog_batch_id"])
+            batch_id=str(generation["catalog_batch_id"]),
+            allow_legacy_parser_for_full_history=(allow_legacy_parser_for_full_history),
         )
         return generation, catalog
 
-    def latest_catalog_generation(self) -> dict[str, Any]:
-        """Return verifiable provenance for the current catalog snapshot."""
+    def catalog_generation(
+        self,
+        *,
+        batch_id: Optional[str] = None,
+        allow_legacy_parser_for_full_history: bool = False,
+    ) -> dict[str, Any]:
+        """Return verifiable provenance for one exact or latest snapshot."""
         if not self.trino.table_exists(self.schema, CATALOG_MANIFEST_TABLE):
             raise LookupError("WhoScored discovered catalog is not initialized")
+        batch_filter = (
+            "" if batch_id is None else f"AND batch_id = {_sql_string(batch_id)} "
+        )
         rows = self.trino.execute_query(
             f"SELECT batch_id, payload_sha256, parser_version, raw_uri, "
-            "raw_inputs_json, completed_at, discovery_mode "
+            "raw_inputs_json, completed_at, discovery_mode, "
+            "raw_provenance_sha256, as_of_date, parent_catalog_batch_id, "
+            "parent_catalog_payload_sha256, "
+            "parent_catalog_raw_provenance_sha256, "
+            "COUNT(*) OVER (PARTITION BY batch_id) AS _identity_count "
             f"FROM {self._catalog_manifest} WHERE state = 'success' "
+            f"{batch_filter}"
             "ORDER BY completed_at DESC, _ingested_at DESC, batch_id DESC LIMIT 1"
         )
         if not rows:
             raise LookupError("WhoScored discovered catalog has no successful snapshot")
         row = rows[0]
+        if len(row) != 13 or int(row[12]) != 1:
+            raise BatchConflict("catalog generation manifest shape is invalid")
         raw_inputs_json = str(row[4] or "")
+        parser_version = str(row[2] or "")
+        pre_lineage_full_history_bootstrap = (
+            allow_legacy_parser_for_full_history
+            and parser_version == PARSER_VERSION
+            and not row[7]
+            and row[8] is None
+            and not any(row[index] for index in (9, 10, 11))
+        )
+        if (
+            allow_legacy_parser_for_full_history
+            and parser_version in _LEGACY_CATALOG_MIGRATION_PARSERS
+        ) or pre_lineage_full_history_bootstrap:
+            catalog_as_of_date: Optional[str] = None
+        else:
+            catalog_as_of_date = _catalog_manifest_as_of_date(row[8]).isoformat()
+        self._validate_catalog_lineage(
+            {
+                "batch_id": str(row[0]),
+                "payload_sha256": str(row[1] or ""),
+                "parser_version": parser_version,
+                "raw_inputs_json": raw_inputs_json,
+                "raw_provenance_sha256": str(row[7] or ""),
+                "discovery_mode": str(row[6] or ""),
+                "as_of_date": row[8],
+                "parent_catalog_batch_id": str(row[9] or ""),
+                "parent_catalog_payload_sha256": str(row[10] or ""),
+                "parent_catalog_raw_provenance_sha256": str(row[11] or ""),
+            },
+            allow_legacy_parser_for_full_history=(allow_legacy_parser_for_full_history),
+        )
         return {
             "catalog_batch_id": str(row[0]),
             "catalog_payload_sha256": str(row[1]),
-            "catalog_parser_version": str(row[2]),
+            "catalog_parser_version": parser_version,
             "catalog_raw_uri": str(row[3]),
             "catalog_raw_inputs_sha256": hashlib.sha256(
                 raw_inputs_json.encode("utf-8")
             ).hexdigest(),
             "catalog_completed_at": str(row[5]),
             "catalog_discovery_mode": str(row[6] or ""),
+            "catalog_raw_provenance_sha256": str(row[7] or ""),
+            "catalog_as_of_date": catalog_as_of_date,
+            "parent_catalog_batch_id": str(row[9] or "") or None,
+            "parent_catalog_payload_sha256": str(row[10] or "") or None,
+            "parent_catalog_raw_provenance_sha256": (str(row[11] or "") or None),
         }
+
+    def latest_catalog_generation(self) -> dict[str, Any]:
+        """Return verifiable provenance for the current catalog snapshot."""
+
+        return self.catalog_generation()
 
     def list_catalog_scopes(
         self,
@@ -2412,7 +3015,7 @@ class WhoScoredRepository:
         raw_uri: Optional[str] = None,
         attempt_no: int = 1,
         availability_version: str = MATCH_AVAILABILITY_VERSION,
-    ) -> None:
+    ) -> Optional[str]:
         """Persist a failed profile attempt in the current manifest schema."""
         if state not in {
             "retryable",
@@ -2427,6 +3030,25 @@ class WhoScoredRepository:
             raise ValueError(f"{state} profile failure cannot have retry_after")
         if int(attempt_no) < 1:
             raise ValueError("profile failure attempt_no must be positive")
+        if (
+            state == "not_available"
+            and raw_uri is None
+            and http_status not in {404, 410}
+        ):
+            raise ValueError(
+                "not_available profile failure requires raw proof or HTTP 404/410"
+            )
+
+        outcome_batch_id = None
+        if state == "not_available":
+            outcome_batch_id = deterministic_profile_not_available_batch_id(
+                player_id,
+                failure_code=failure_code,
+                http_status=http_status,
+                payload_sha256=payload_sha256,
+                raw_uri=raw_uri,
+                availability_version=availability_version,
+            )
 
         now = _utc_now()
         row = {
@@ -2447,6 +3069,7 @@ class WhoScoredRepository:
             "paid_bytes": int(paid_bytes),
             "fetched_at": now,
             "completed_at": now if state != "retryable" else None,
+            "_profile_batch_id": outcome_batch_id,
             "_entity_type": "profile_manifest",
         }
         self.writer.write_dataframe(
@@ -2456,6 +3079,7 @@ class WhoScoredRepository:
             partition_spec=[("player_id", "bucket(32)")],
             source="whoscored",
         )
+        return outcome_batch_id
 
     @_lock_commit_sequence
     def commit_profiles(self, commits: Sequence[ProfileCommit]) -> tuple[str, ...]:
@@ -2487,43 +3111,67 @@ class WhoScoredRepository:
                     "with parsed rows"
                 )
 
-        filters = " OR ".join(
-            "(player_id = "
-            f"{int(commit.player_id)} AND payload_sha256 = "
-            f"{_sql_string(commit.payload_sha256)} AND parser_version = "
-            f"{_sql_string(commit.parser_version)})"
+        batch_ids = [commit.batch_id for commit in ordered]
+        expected_by_batch = {
+            commit.batch_id: (
+                int(commit.player_id),
+                commit.payload_sha256,
+                commit.parser_version,
+            )
             for commit in ordered
-        )
+        }
+        if len(expected_by_batch) != len(ordered):
+            raise BatchConflict("duplicate profile batch identity")
+        quoted_batches = ",".join(_sql_string(value) for value in batch_ids)
         versions = f"{self.catalog}.{self.schema}.{PROFILE_VERSIONS_TABLE}"
         manifest = f"{self.catalog}.{self.schema}.{PROFILE_MANIFEST_TABLE}"
         physical_rows = self.trino.execute_query(
-            f"SELECT player_id, payload_sha256, parser_version, COUNT(*) "
-            f"FROM {versions} WHERE {filters} "
-            "GROUP BY player_id, payload_sha256, parser_version"
+            f"SELECT _profile_batch_id, player_id, payload_sha256, "
+            f"parser_version, COUNT(*) FROM {versions} "
+            f"WHERE _profile_batch_id IN ({quoted_batches}) "
+            "GROUP BY _profile_batch_id, player_id, payload_sha256, parser_version"
         )
-        physical = {
-            (int(row[0]), str(row[1]), str(row[2])): int(row[3])
-            for row in physical_rows
-        }
-        for identity, count in physical.items():
+        physical: dict[str, int] = {}
+        for row in physical_rows:
+            batch_id = str(row[0])
+            identity = (int(row[1]), str(row[2]), str(row[3]))
+            if expected_by_batch.get(batch_id) != identity:
+                raise BatchConflict(
+                    f"profile batch {batch_id} has unexpected identity {identity}"
+                )
+            if batch_id in physical:
+                raise BatchConflict(
+                    f"profile batch {batch_id} has multiple physical identities"
+                )
+            count = int(row[4])
+            physical[batch_id] = count
             if count > 1:
-                raise BatchConflict(f"profile version {identity} has {count} rows")
+                raise BatchConflict(f"profile batch {batch_id} has {count} rows")
 
         success_rows = self.trino.execute_query(
-            f"SELECT player_id, payload_sha256, parser_version, "
-            "MAX(COALESCE(participations_count, 0)) "
-            f"FROM {manifest} WHERE ({filters}) AND state = 'success' "
-            "GROUP BY player_id, payload_sha256, parser_version"
+            f"SELECT _profile_batch_id, player_id, payload_sha256, "
+            "parser_version, MAX(COALESCE(participations_count, 0)) "
+            f"FROM {manifest} WHERE _profile_batch_id IN ({quoted_batches}) "
+            "AND state = 'success' GROUP BY _profile_batch_id, player_id, "
+            "payload_sha256, parser_version"
         )
-        successes = {
-            (int(row[0]), str(row[1]), str(row[2])): int(row[3]) for row in success_rows
-        }
-        batch_ids = [commit.batch_id for commit in ordered]
+        successes: dict[str, int] = {}
+        for row in success_rows:
+            batch_id = str(row[0])
+            identity = (int(row[1]), str(row[2]), str(row[3]))
+            if expected_by_batch.get(batch_id) != identity:
+                raise BatchConflict(
+                    f"profile success {batch_id} has unexpected identity {identity}"
+                )
+            if batch_id in successes:
+                raise BatchConflict(
+                    f"profile batch {batch_id} has multiple success identities"
+                )
+            successes[batch_id] = int(row[4])
         participation_counts: dict[str, int] = {}
         if self.trino.table_exists(
             self.schema, "whoscored_player_stage_participations"
         ):
-            quoted_batches = ",".join(_sql_string(value) for value in batch_ids)
             participation_rows_existing = self.trino.execute_query(
                 f"SELECT _profile_batch_id, COUNT(*) FROM "
                 f"{self.catalog}.{self.schema}.whoscored_player_stage_participations "
@@ -2539,20 +3187,23 @@ class WhoScoredRepository:
                 commit.payload_sha256,
                 commit.parser_version,
             )
-            physical_count = physical.get(identity, 0)
+            physical_count = physical.get(commit.batch_id, 0)
             participation_count = participation_counts.get(commit.batch_id, 0)
             expected_participations = len(commit.participations)
-            if identity in successes and physical_count != 1:
+            if commit.batch_id in successes and physical_count != 1:
                 raise BatchConflict(
                     f"profile {commit.player_id}/{commit.payload_sha256} is "
                     f"committed but has {physical_count} physical versions"
                 )
-            if identity in successes and participation_count != expected_participations:
+            if (
+                commit.batch_id in successes
+                and participation_count != expected_participations
+            ):
                 raise BatchConflict(
                     f"profile {identity} is committed but has "
                     f"{participation_count}/{expected_participations} participations"
                 )
-            if identity not in successes and participation_count not in {
+            if commit.batch_id not in successes and participation_count not in {
                 0,
                 expected_participations,
             }:
@@ -2565,12 +3216,7 @@ class WhoScoredRepository:
         participation_rows: list[dict[str, Any]] = []
         now = _utc_now()
         for commit in ordered:
-            identity = (
-                int(commit.player_id),
-                commit.payload_sha256,
-                commit.parser_version,
-            )
-            if physical.get(identity, 0) == 0:
+            if physical.get(commit.batch_id, 0) == 0:
                 row = dict(commit.profile)
                 row.update(
                     {
@@ -2623,28 +3269,39 @@ class WhoScoredRepository:
             )
 
         verified_rows = self.trino.execute_query(
-            f"SELECT player_id, payload_sha256, parser_version, COUNT(*) "
-            f"FROM {versions} WHERE {filters} "
-            "GROUP BY player_id, payload_sha256, parser_version"
+            f"SELECT _profile_batch_id, player_id, payload_sha256, "
+            f"parser_version, COUNT(*) FROM {versions} "
+            f"WHERE _profile_batch_id IN ({quoted_batches}) "
+            "GROUP BY _profile_batch_id, player_id, payload_sha256, parser_version"
         )
-        verified = {
-            (int(row[0]), str(row[1]), str(row[2])): int(row[3])
-            for row in verified_rows
-        }
+        verified: dict[str, int] = {}
+        for row in verified_rows:
+            batch_id = str(row[0])
+            identity = (int(row[1]), str(row[2]), str(row[3]))
+            if expected_by_batch.get(batch_id) != identity:
+                raise BatchConflict(
+                    f"profile batch {batch_id} has unexpected verified identity "
+                    f"{identity}"
+                )
+            if batch_id in verified:
+                raise BatchConflict(
+                    f"profile batch {batch_id} has multiple verified identities"
+                )
+            verified[batch_id] = int(row[4])
         for commit in ordered:
             identity = (
                 int(commit.player_id),
                 commit.payload_sha256,
                 commit.parser_version,
             )
-            if verified.get(identity) != 1:
+            if verified.get(commit.batch_id) != 1:
                 raise BatchConflict(
-                    f"profile {identity} physical count is {verified.get(identity, 0)}"
+                    f"profile {identity} physical count is "
+                    f"{verified.get(commit.batch_id, 0)}"
                 )
         if self.trino.table_exists(
             self.schema, "whoscored_player_stage_participations"
         ):
-            quoted_batches = ",".join(_sql_string(value) for value in batch_ids)
             rows = self.trino.execute_query(
                 f"SELECT _profile_batch_id, COUNT(*) FROM "
                 f"{self.catalog}.{self.schema}.whoscored_player_stage_participations "
@@ -2687,11 +3344,12 @@ class WhoScoredRepository:
                 commit.parser_version,
             )
             expected_participations = len(commit.participations)
-            if identity in successes:
-                if successes[identity] != expected_participations:
+            if commit.batch_id in successes:
+                if successes[commit.batch_id] != expected_participations:
                     raise BatchConflict(
                         f"profile {identity} participation count: "
-                        f"manifest={successes[identity]}, parser={expected_participations}"
+                        f"manifest={successes[commit.batch_id]}, "
+                        f"parser={expected_participations}"
                     )
             latest = latest_by_player.get(int(commit.player_id))
             if latest is not None:
@@ -3532,7 +4190,7 @@ class WhoScoredRepository:
             for row in rows
         ]
 
-    def record_preview_failure(self, failure: PreviewFailure) -> None:
+    def record_preview_failure(self, failure: PreviewFailure) -> Optional[str]:
         if failure.state not in {
             "retryable",
             "terminal",
@@ -3546,6 +4204,27 @@ class WhoScoredRepository:
             raise ValueError(f"{failure.state} preview failure cannot have retry_after")
         if int(failure.attempt_no) < 1:
             raise ValueError("preview failure attempt_no must be positive")
+        if (
+            failure.state == "not_available"
+            and failure.raw_uri is None
+            and failure.http_status not in {404, 410}
+        ):
+            raise ValueError(
+                "not_available preview failure requires raw proof or HTTP 404/410"
+            )
+        outcome_batch_id = None
+        if failure.state == "not_available":
+            outcome_batch_id = deterministic_preview_not_available_batch_id(
+                failure.game_id,
+                league=failure.league,
+                season=failure.season,
+                failure_code=failure.failure_code,
+                http_status=failure.http_status,
+                payload_sha256=failure.payload_sha256,
+                raw_uri=failure.raw_uri,
+                parser_version=failure.parser_version,
+                availability_version=failure.availability_version,
+            )
         now = _utc_now()
         self.writer.write_dataframe(
             pd.DataFrame(
@@ -3556,7 +4235,7 @@ class WhoScoredRepository:
                         "game_id": int(failure.game_id),
                         "game": failure.game,
                         "kickoff": failure.kickoff,
-                        "batch_id": None,
+                        "batch_id": outcome_batch_id,
                         "payload_sha256": failure.payload_sha256,
                         "raw_uri": failure.raw_uri,
                         "parser_version": failure.parser_version,
@@ -3586,6 +4265,7 @@ class WhoScoredRepository:
             partition_spec=[("league", "identity"), ("season", "identity")],
             source="whoscored",
         )
+        return outcome_batch_id
 
     def _prepare_preview_commit(
         self, commit: PreviewCommit
@@ -4338,7 +5018,7 @@ class WhoScoredRepository:
             )
         return tuple(commit.batch_id for commit in ordered)
 
-    def record_failure(self, failure: ManifestFailure) -> None:
+    def record_failure(self, failure: ManifestFailure) -> Optional[str]:
         if failure.state not in {
             "retryable",
             "terminal",
@@ -4352,13 +5032,34 @@ class WhoScoredRepository:
             raise ValueError(f"{failure.state} match failure cannot have retry_after")
         if int(failure.attempt_no) < 1:
             raise ValueError("match failure attempt_no must be positive")
+        if (
+            failure.state == "not_available"
+            and failure.raw_uri is None
+            and failure.http_status not in {404, 410}
+        ):
+            raise ValueError(
+                "not_available match failure requires raw proof or HTTP 404/410"
+            )
+        outcome_batch_id = None
+        if failure.state == "not_available":
+            outcome_batch_id = deterministic_match_not_available_batch_id(
+                failure.game_id,
+                league=failure.league,
+                season=failure.season,
+                failure_code=failure.failure_code,
+                http_status=failure.http_status,
+                payload_sha256=failure.payload_sha256,
+                raw_uri=failure.raw_uri,
+                parser_version=failure.parser_version,
+                availability_version=failure.availability_version,
+            )
         now = _utc_now()
         row = asdict(failure)
         row.update(
             {
                 "game": failure.game,
                 "kickoff": failure.kickoff,
-                "batch_id": None,
+                "batch_id": outcome_batch_id,
                 "payload_sha256": failure.payload_sha256,
                 "raw_uri": failure.raw_uri,
                 "parser_version": failure.parser_version,
@@ -4380,3 +5081,4 @@ class WhoScoredRepository:
             partition_spec=[("league", "identity"), ("season", "identity")],
             source="whoscored",
         )
+        return outcome_batch_id

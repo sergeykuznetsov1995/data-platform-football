@@ -17,21 +17,47 @@ jobs:
   contract:
     runs-on: ubuntu-latest
     timeout-minutes: 35
+    env:
+      PYTHONPYCACHEPREFIX: /tmp/whoscored-ci-pycache
+      PYTHONDONTWRITEBYTECODE: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          # ready-v1 validates the exact PR-head promotion child while the
+          # worktree remains GitHub's synthetic merge result.
+          fetch-depth: 0
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.11"
           cache: pip
 
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Validate declared WhoScored build-provenance state
+        run: |
+          provenance_status="$(python -I -S -c \
+            'import json; print(json.load(open("docker/images/airflow/whoscored-build-provenance-attestation.json"))["status"])')"
+          case "$provenance_status" in
+            blocked-v1) provenance_mode=(--expect-blocked) ;;
+            ready-v1)
+              provenance_mode=(
+                --expect-ready-build
+                --release-revision "${{ github.event.pull_request.head.sha }}"
+              )
+              ;;
+            *) echo "unsupported provenance state: $provenance_status" >&2; exit 78 ;;
+          esac
+          python -I -S scripts/validate_whoscored_build_provenance.py \
+            --root . "${provenance_mode[@]}" \
+            --report /tmp/whoscored-build-closure.json
+
       - name: Install test runtime
         run: |
-          python -m pip install --disable-pip-version-check \
-            pytest pytest-cov ruff pandas numpy pyarrow "pyiceberg==0.11.1" \
-            trino sqlglot requests PyYAML \
-            jinja2 jsonschema beautifulsoup4 lxml python-dateutil tenacity \
-            pybreaker "tls-client-python==1.15.1" rapidfuzz Unidecode nicknames
+          python -m pip install \
+            --disable-pip-version-check --no-deps \
+            --require-hashes --only-binary=:all: \
+            -r .github/workflows/whoscored-test.lock
 
       - name: Static and import checks
         run: |
@@ -40,7 +66,9 @@ jobs:
             scrapers/base/iceberg_writer.py \
             dags/dag_ingest_whoscored.py \
             dags/dag_backfill_whoscored.py \
+            dags/dag_canary_whoscored_proxy.py \
             dags/dag_backup_whoscored_storage.py \
+            dags/dag_ingest_matchhistory.py \
             dags/dag_iceberg_maintenance.py \
             dags/dag_iceberg_maintenance_daily.py \
             dags/dag_master_pipeline.py \
@@ -49,10 +77,19 @@ jobs:
             dags/scripts/whoscored_ops_store.py \
             dags/scripts/whoscored_frozen_dq.py \
             dags/scripts/whoscored_identity.py \
+            dags/scripts/whoscored_proxy_runtime.py \
             dags/utils/maintenance_tasks.py \
+            dags/utils/fbref_pipeline_tasks.py \
             scripts/init_seaweedfs_bucket.py \
+            scripts/audit_seaweedfs_control_network.py \
+            scripts/audit_seaweedfs_runtime_container.py \
             scripts/flaresolverr_extended.py \
             scripts/proxy_filter/filter_proxy.py \
+            scripts/transition_seaweedfs_recovery_state.py \
+            scripts/validate_seaweedfs_s3_identity_config.py \
+            scripts/validate_whoscored_build_provenance.py \
+            scripts/whoscored_production_admission.py \
+            scripts/whoscored_proxy_campaign.py \
             scripts/research/bench_whoscored_workflow.py \
             $(rg --files scripts tests | rg '(whoscored|test_proxy_traffic|test_filter_proxy).*\.py$')
           python -m compileall -q \
@@ -60,20 +97,35 @@ jobs:
             scrapers/base/iceberg_writer.py \
             dags/dag_ingest_whoscored.py \
             dags/dag_backfill_whoscored.py \
+            dags/dag_canary_whoscored_proxy.py \
             dags/dag_backup_whoscored_storage.py \
+            dags/dag_ingest_matchhistory.py \
             dags/dag_master_pipeline.py \
             dags/scripts/run_whoscored_scraper.py \
             dags/scripts/run_whoscored_backfill_item.py \
             dags/scripts/whoscored_ops_store.py \
             dags/scripts/whoscored_frozen_dq.py \
             dags/scripts/whoscored_identity.py \
+            dags/scripts/whoscored_proxy_runtime.py \
+            dags/utils/fbref_pipeline_tasks.py \
             scripts/init_seaweedfs_bucket.py \
+            scripts/audit_seaweedfs_control_network.py \
+            scripts/audit_seaweedfs_runtime_container.py \
             scripts/flaresolverr_extended.py \
             scripts/proxy_filter/filter_proxy.py \
+            scripts/transition_seaweedfs_recovery_state.py \
+            scripts/validate_seaweedfs_s3_identity_config.py \
+            scripts/validate_whoscored_build_provenance.py \
+            scripts/whoscored_production_admission.py \
+            scripts/whoscored_proxy_campaign.py \
             scripts/research/bench_whoscored_workflow.py \
             scripts/research/bench_whoscored_capacity.py
           bash -n scripts/cutover_seaweedfs_topology.sh
+          bash -n scripts/compose.sh
+          bash -n scripts/seaweedfs_legacy_entrypoint.sh
+          bash -n scripts/seaweedfs_lifecycle_lock.sh
           bash -n scripts/seaweedfs_plane_entrypoint.sh
+          bash -n scripts/research/run_fbref_canary_guarded.sh
 
       - name: Render production compose
         env:
@@ -84,7 +136,262 @@ jobs:
           JUPYTER_PUBLIC_HOST: jupyter.ci.invalid
           LAKEKEEPER_DB_PASSWORD: ci-not-a-secret
           LAKEKEEPER_PG_ENCRYPTION_KEY: 00000000000000000000000000000000
-        run: docker compose --env-file .env.example config --quiet
+          SEAWEEDFS_VOLUME_SIZE_LIMIT_MB: "1024"
+        run: |
+          minimum=2.24.4
+          actual="$(docker compose version --short)"
+          test "$(printf '%s\n%s\n' "$minimum" "$actual" | sort -V | head -n1)" = "$minimum"
+          docker compose --env-file .env.example config --quiet
+          docker compose --env-file .env.example \
+            -f compose.yaml -f compose.seaweedfs-supervised.yaml \
+            config --quiet
+          docker compose --env-file .env.example \
+            -f compose.yaml -f compose.seaweedfs-supervised.yaml \
+            config --format json > /tmp/supervised-compose.json
+          python - <<'PY'
+          import json
+
+          services = json.load(open("/tmp/supervised-compose.json"))["services"]
+          assert services["seaweedfs"]["command"][0] == "s3"
+          assert all(
+              mount.get("target") != "/data"
+              for mount in services["seaweedfs"]["volumes"]
+          )
+          for name in ("seaweedfs-master", "seaweedfs-volume", "seaweedfs-filer"):
+              assert any(
+                  mount.get("target") == "/data"
+                  for mount in services[name]["volumes"]
+              )
+          PY
+
+      - name: Prove checked-in evidence and closure report agree
+        run: |
+          python - <<'PY'
+          import json
+
+          attestation = json.load(open(
+              "docker/images/airflow/whoscored-build-provenance-attestation.json"
+          ))
+          report = json.load(open("/tmp/whoscored-build-closure.json"))
+          assert attestation["status"] in {"blocked-v1", "ready-v1"}
+          assert report["status"] == attestation["status"]
+          assert bool(report["issues"]) == (report["status"] == "blocked-v1")
+          PY
+
+      - name: Build immutable Superset and JupyterHub runtimes
+        run: |
+          docker buildx build \
+            --cache-from type=gha,scope=whoscored-superset \
+            --cache-to type=gha,mode=max,scope=whoscored-superset \
+            --load \
+            -t data-platform-superset:ci \
+            docker/images/superset
+          docker buildx build \
+            --cache-from type=gha,scope=whoscored-jupyterhub \
+            --cache-to type=gha,mode=max,scope=whoscored-jupyterhub \
+            --load \
+            -t data-platform-jupyterhub:ci \
+            docker/images/jupyterhub
+
+      - name: Build and smoke the hardened scheduler test image
+        run: |
+          docker buildx build \
+            --target airflow-scheduler-test \
+            --cache-from type=gha,scope=whoscored-airflow \
+            --cache-to type=gha,mode=max,scope=whoscored-airflow \
+            --load \
+            -t data-platform-airflow-scheduler:ci \
+            docker/images/airflow
+          docker run --rm \
+            --cap-drop ALL \
+            --security-opt no-new-privileges:true \
+            --security-opt apparmor=docker-default \
+            --security-opt seccomp=builtin \
+            --entrypoint bash \
+            -e PYTHONPATH=/opt/airflow:/opt/airflow/dags \
+            -v "$PWD/dags:/opt/airflow/dags:ro" \
+            -v "$PWD/scrapers:/opt/airflow/scrapers:ro" \
+            -v "$PWD/scripts:/opt/airflow/scripts:ro" \
+            -v "$PWD/configs:/opt/airflow/configs:ro" \
+            data-platform-airflow-scheduler:ci -euc '
+              test "$(id -u):$(id -g)" = 50000:0
+              test "$(awk '\''/^CapEff:/ {print $2}'\'' /proc/self/status)" = 0000000000000000
+              timeout 30 chromium \
+                --headless --no-sandbox --disable-setuid-sandbox \
+                --disable-gpu --user-data-dir=/tmp/whoscored-chromium-ci \
+                --dump-dom "data:text/html,whoscored-zero-cap-smoke" \
+                | grep -q whoscored-zero-cap-smoke
+              test "$(airflow version)" = 2.11.2
+              /usr/local/bin/python -m pip check
+              /opt/legacy-scraper-venv/bin/python -m pip check
+              PYTHONWARNINGS=error /usr/local/bin/python -c "import importlib.metadata as m; import requests; assert m.version(\"chardet\") == \"5.2.0\""
+              /usr/local/bin/python -c "import importlib.metadata as m; import curl_cffi,tls_client,tls_requests; assert m.version(\"tls-client-python\") == \"1.15.1\"; client=tls_requests.Client(proxy=\"http://127.0.0.1:9\"); client.close()"
+              /opt/legacy-scraper-venv/bin/python -c "import importlib.metadata as m; import camoufox,playwright,selenium,soccerdata; import scrapers.matchhistory.scraper; assert m.version(\"wrapper-tls-requests\") == \"1.2.5\""
+              for runner in \
+                run_clubelo_scraper.py \
+                run_espn_scraper.py \
+                run_understat_scraper.py \
+                run_sofifa_scraper.py \
+                prepare_sofascore_workload.py \
+                run_sofascore_scraper.py
+              do
+                /opt/legacy-scraper-venv/bin/python "/opt/airflow/dags/scripts/${runner}" --help >/dev/null
+              done
+              /opt/legacy-scraper-venv/bin/python /opt/airflow/dags/scripts/run_fbref_fetch_wave.py --help >/dev/null
+              /opt/legacy-scraper-venv/bin/python /opt/airflow/dags/scripts/run_matchhistory_scraper.py --help >/dev/null
+              /usr/local/bin/python -c "from airflow.models import DagBag; bag=DagBag(\"/opt/airflow/dags\", include_examples=False, safe_mode=False); assert not bag.import_errors, bag.import_errors"
+            '
+
+      - name: Build production targets and prove the declared gate state
+        run: |
+          docker buildx build \
+            --target airflow-scheduler \
+            --cache-from type=gha,scope=whoscored-airflow \
+            --load \
+            -t data-platform-airflow-scheduler:provenance-ci \
+            docker/images/airflow
+          docker buildx build \
+            --target airflow-whoscored-proxy \
+            --cache-from type=gha,scope=whoscored-airflow \
+            --load \
+            -t data-platform-airflow-whoscored-proxy:provenance-ci \
+            docker/images/airflow
+
+          sentinel="$(mktemp -d)"
+          trap 'rm -rf "$sentinel"' EXIT
+          assert_exit_78_before_sentinel() {
+            label="$1"
+            shift
+            set +e
+            docker run --rm -v "$sentinel:/sentinel" "$@"
+            status="$?"
+            set -e
+            test "$status" = 78
+            test ! -e "$sentinel/$label"
+          }
+
+          assert_success_after_gate() {
+            label="$1"
+            shift
+            docker run --rm -v "$sentinel:/sentinel" "$@"
+            test -e "$sentinel/$label"
+          }
+
+          scheduler=data-platform-airflow-scheduler:provenance-ci
+          proxy=data-platform-airflow-whoscored-proxy:provenance-ci
+          provenance_status="$(python -I -S -c \
+            'import json; print(json.load(open("docker/images/airflow/whoscored-build-provenance-attestation.json"))["status"])')"
+          case "$provenance_status" in
+            blocked-v1)
+              assert_exit_78_before_sentinel scheduler-normal \
+                "$scheduler" bash -c 'touch /sentinel/scheduler-normal'
+              for alias in python python3 python3.11; do
+                assert_exit_78_before_sentinel "scheduler-$alias" \
+                  --entrypoint "$alias" "$scheduler" -S -c \
+                  "open('/sentinel/scheduler-$alias','w').close()"
+              done
+              assert_exit_78_before_sentinel scheduler-bash-python-s \
+                --entrypoint bash "$scheduler" -c \
+                "python -S -c \"open('/sentinel/scheduler-bash-python-s','w').close()\""
+              assert_exit_78_before_sentinel proxy-normal \
+                "$proxy" bash -c 'touch /sentinel/proxy-normal'
+              assert_exit_78_before_sentinel proxy-python-s \
+                --entrypoint python "$proxy" -S -c \
+                "open('/sentinel/proxy-python-s','w').close()"
+              ;;
+            ready-v1)
+              assert_success_after_gate scheduler-ready \
+                "$scheduler" bash -c 'touch /sentinel/scheduler-ready'
+              assert_success_after_gate scheduler-python-ready \
+                --entrypoint python "$scheduler" -S -c \
+                "open('/sentinel/scheduler-python-ready','w').close()"
+              assert_success_after_gate proxy-ready \
+                "$proxy" bash -c 'touch /sentinel/proxy-ready'
+              ;;
+            *) echo "unsupported provenance state: $provenance_status" >&2; exit 78 ;;
+          esac
+
+          # The internal raw interpreter is an explicit trusted-host boundary,
+          # not a public alias. Even through it, a real mounted WhoScored runner
+          # refuses production execution before argparse, imports or I/O.
+          set +e
+          docker run --rm \
+            --entrypoint /usr/local/libexec/whoscored-python-real \
+            -v "$PWD/dags:/opt/airflow/dags:ro" \
+            -v "$PWD/scrapers:/opt/airflow/scrapers:ro" \
+            -v "$PWD/scripts:/opt/airflow/scripts:ro" \
+            -v "$sentinel:/sentinel" \
+            "$scheduler" -S \
+            /opt/airflow/dags/scripts/run_whoscored_scraper.py
+          raw_status="$?"
+          set -e
+          test "$raw_status" -ne 0
+          test ! -e "$sentinel/raw-runner"
+
+          # Materializing a venv-local executable before replacing the system
+          # aliases preserves the isolated legacy dependency identity.
+          docker run --rm \
+            --entrypoint /opt/legacy-scraper-venv/bin/python \
+            "$scheduler" -c \
+            "import importlib.metadata as m, urllib3; assert urllib3.__version__.startswith('1.'); assert m.version('rich') == '14.3.4'"
+
+      - name: Build and smoke the immutable WhoScored FlareSolverr image
+        run: |
+          docker buildx build \
+            --file docker/images/flaresolverr-whoscored/Dockerfile \
+            --load \
+            -t data-platform-flaresolverr-whoscored:ci \
+            .
+          container="$(docker run -d \
+              --read-only \
+              --shm-size 1g \
+              --security-opt no-new-privileges:true \
+              --security-opt apparmor=docker-default \
+              --security-opt seccomp=builtin \
+              --cap-drop ALL \
+              --tmpfs /tmp:rw,exec,nosuid,nodev,size=2g,uid=1000,gid=1000,mode=1770 \
+              --tmpfs /config:rw,noexec,nosuid,nodev,size=16m,uid=1000,gid=1000,mode=0700 \
+              --tmpfs /app/.config:rw,noexec,nosuid,nodev,size=64m,uid=1000,gid=1000,mode=0700 \
+              --tmpfs /app/.local:rw,noexec,nosuid,nodev,size=64m,uid=1000,gid=1000,mode=0700 \
+              data-platform-flaresolverr-whoscored:ci)"
+          trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
+          test "$(docker inspect --format '{{.Config.User}}' "$container")" = 1000:1000
+          test "$(docker inspect --format '{{.AppArmorProfile}}' "$container")" = docker-default
+          test "$(docker inspect --format '{{json .HostConfig.SecurityOpt}}' "$container")" = \
+            '["no-new-privileges:true","apparmor=docker-default","seccomp=builtin"]'
+          test "$(docker inspect --format '{{json .HostConfig.CapAdd}}' "$container")" = null
+          test "$(docker exec "$container" awk '/^CapEff:/ {print $2}' /proc/1/status)" = \
+            0000000000000000
+          ready=0
+          for _ in $(seq 1 30); do
+            if docker exec "$container" curl -fsS \
+              http://127.0.0.1:8191/v1/whoscored/runtime-identity \
+              > /tmp/whoscored-flaresolverr-identity.json; then
+              ready=1
+              break
+            fi
+            sleep 2
+          done
+          test "$ready" = 1
+          docker exec "$container" curl -fsS \
+            -H 'Content-Type: application/json' \
+            -d '{"cmd":"sessions.list"}' \
+            http://127.0.0.1:8191/v1 \
+            > /tmp/whoscored-flaresolverr-v1.json
+          python - <<'PY'
+          import json
+          import re
+
+          identity = json.load(open("/tmp/whoscored-flaresolverr-identity.json"))
+          response = json.load(open("/tmp/whoscored-flaresolverr-v1.json"))
+          assert set(identity) == {"status", "version", "extension_sha256"}
+          assert identity["status"] == "ok"
+          assert identity["version"] == "3.4.6"
+          assert re.fullmatch(r"[0-9a-f]{64}", identity["extension_sha256"])
+          assert response["version"] == identity["version"]
+          assert response["extension_sha256"] == identity["extension_sha256"]
+          assert response["sessions"] == []
+          PY
 
       - name: WhoScored unit, DAG and storage contract
         env:
@@ -101,75 +408,75 @@ jobs:
             tests/unit/scripts/test_filter_proxy.py \
             tests/unit/scripts/test_flaresolverr_extended.py \
             tests/unit/scripts/test_cutover_seaweedfs_topology.py \
+            tests/unit/scripts/test_seaweedfs_legacy_entrypoint.py \
             tests/unit/scripts/test_seaweedfs_plane_entrypoint.py \
+            tests/unit/scripts/test_seaweedfs_runtime_boundary.py \
+            tests/unit/scripts/test_transition_seaweedfs_recovery_state.py \
             tests/unit/scripts/test_init_seaweedfs_bucket.py \
             tests/unit/dags/test_maintenance_tasks.py \
             tests/unit/dags/test_dag_iceberg_maintenance.py \
-            tests/unit/dags/test_dag_iceberg_maintenance_daily.py
+            tests/unit/dags/test_dag_iceberg_maintenance_daily.py \
+            tests/unit/dags/test_fbref_pipeline_tasks.py \
+            tests/unit/dags/test_dag_ingest_matchhistory.py \
+            tests/unit/configs/test_tls_requests_runtime.py \
+            tests/unit/dags/test_dag_ingest_clubelo.py \
+            tests/unit/dags/test_dag_ingest_sofascore.py \
+            tests/unit/dags/test_dag_ingest_sofifa.py \
+            tests/unit/dags/test_dag_ingest_understat.py \
+            tests/unit/scrapers/test_run_clubelo_scraper.py \
+            tests/unit/scrapers/test_run_espn_scraper.py \
+            tests/unit/scrapers/test_run_sofascore_scraper.py \
+            tests/unit/scrapers/test_run_sofifa_scraper.py \
+            tests/unit/scrapers/test_run_understat_scraper.py
 
   real-airflow-dag-import:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    env:
-      AIRFLOW_HOME: ${{ runner.temp }}/airflow
-      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
-      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: sqlite:///${{ runner.temp }}/airflow/airflow.db
-      PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/dags
+    strategy:
+      fail-fast: false
+      matrix:
+        # 2.11.2 is the pinned production image; 2.7.3 remains a supported
+        # backward-compatibility parser check for existing metadata upgrades.
+        airflow-version: ["2.7.3", "2.11.2"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: pip
-
-      - name: Install the production Airflow parser runtime
+      - name: Build the immutable Airflow parser runtime
         run: |
-          python -m pip install --disable-pip-version-check \
-            "apache-airflow==2.11.2" pandas pyarrow beautifulsoup4 \
-            trino requests PyYAML \
-            --constraint \
-            https://raw.githubusercontent.com/apache/airflow/constraints-2.11.2/constraints-3.11.txt
+          docker build \
+            --file "docker/images/airflow/Dockerfile.ci-dag-import-${{ matrix.airflow-version }}" \
+            --tag "whoscored-airflow-import:${{ matrix.airflow-version }}" \
+            docker/images/airflow
 
       - name: Stage production WhoScored DAGs
         run: |
-          dag_dir="${RUNNER_TEMP}/whoscored-dags"
+          dag_dir="${GITHUB_WORKSPACE}/dags/.whoscored-ci-staged"
+          test ! -e "${dag_dir}"
           mkdir -p "${dag_dir}"
           for dag in \
             dag_ingest_whoscored.py \
             dag_backfill_whoscored.py \
+            dag_canary_whoscored_proxy.py \
             dag_backup_whoscored_storage.py
           do
-            ln -s "${GITHUB_WORKSPACE}/dags/${dag}" "${dag_dir}/${dag}"
+            cp "${GITHUB_WORKSPACE}/dags/${dag}" "${dag_dir}/${dag}"
           done
-          echo "AIRFLOW__CORE__DAGS_FOLDER=${dag_dir}" >> "${GITHUB_ENV}"
 
       - name: Check real Airflow DAG imports
         run: |
-          airflow db migrate
-          airflow dags list-import-errors
-          python - <<'PY'
-          import os
-          from airflow.models import DagBag
-
-          dag_bag = DagBag(
-              dag_folder=os.environ["AIRFLOW__CORE__DAGS_FOLDER"],
-              include_examples=False,
-              safe_mode=False,
-          )
-          if dag_bag.import_errors:
-              details = "\n".join(
-                  f"{path}: {error}"
-                  for path, error in sorted(dag_bag.import_errors.items())
-              )
-              raise SystemExit(f"real Airflow DAG import errors:\n{details}")
-
-          expected = {
-              "dag_ingest_whoscored",
-              "dag_backfill_whoscored",
-              "dag_backup_whoscored_storage",
-          }
-          missing = expected.difference(dag_bag.dag_ids)
-          if missing:
-              raise SystemExit(f"real Airflow did not load DAGs: {sorted(missing)}")
-          PY
+          docker run --rm \
+            --read-only \
+            --network none \
+            --cap-drop ALL \
+            --security-opt no-new-privileges:true \
+            --tmpfs /tmp:rw,nosuid,nodev,noexec,mode=1777 \
+            -e HOME=/tmp/home \
+            -e AIRFLOW_HOME=/tmp/airflow \
+            -e AIRFLOW__CORE__LOAD_EXAMPLES=False \
+            -e AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=sqlite:////tmp/airflow/airflow.db \
+            -e AIRFLOW__CORE__DAGS_FOLDER=/workspace/dags/.whoscored-ci-staged \
+            -e PYTHONPATH=/workspace:/workspace/dags \
+            -v "${GITHUB_WORKSPACE}:/workspace:ro" \
+            --entrypoint /bin/bash \
+            "whoscored-airflow-import:${{ matrix.airflow-version }}" \
+            -euc 'mkdir -p "$HOME" "$AIRFLOW_HOME"; airflow db migrate; airflow dags list-import-errors; python /workspace/scripts/ci/check_whoscored_dag_imports.py'

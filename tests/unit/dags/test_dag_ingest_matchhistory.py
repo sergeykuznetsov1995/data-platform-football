@@ -75,6 +75,11 @@ class TestMultiLeagueScope:
         assert task is not None
         leagues_arg = ','.join(MATCHHISTORY_LEAGUES)
         assert f'--leagues "{leagues_arg}"' in task.bash_command
+        assert (
+            "/opt/legacy-scraper-venv/bin/python "
+            "dags/scripts/run_matchhistory_scraper.py"
+        ) in task.bash_command
+        assert "\npython dags/scripts/run_matchhistory_scraper.py" not in task.bash_command
 
     @pytest.mark.unit
     def test_scope_covers_top5(self):

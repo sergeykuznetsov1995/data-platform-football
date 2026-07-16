@@ -26,6 +26,7 @@ from .catalog import (
 )
 from .domain import (
     SeasonFormat,
+    TournamentEligibility,
     WhoScoredScope,
     base_season_id,
     canonical_season_id,
@@ -2553,6 +2554,7 @@ def parse_all_regions(
         int(item.tournament_id): item.canonical_competition_id
         for item in overrides
         if item.canonical_competition_id
+        and item.eligibility is TournamentEligibility.INCLUDED
     }
     source_aliases = {
         (int(region_id), int(tournament_id)): str(competition_id).strip()
@@ -2609,8 +2611,14 @@ def parse_all_regions(
                 },
                 "tournament": dict(tournament),
             }
+            source_alias = (
+                None
+                if classification.eligibility
+                is TournamentEligibility.EXCLUDED_TECHNICAL
+                else source_aliases.get((region_id, tournament_id))
+            )
             competition_id = (
-                source_aliases.get((region_id, tournament_id))
+                source_alias
                 or override_aliases.get(tournament_id)
                 or f"WS-{region_id}-{tournament_id}"
             )

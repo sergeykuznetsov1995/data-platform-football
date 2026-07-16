@@ -1,0 +1,11 @@
+{
+	admin off
+	auto_https off
+}
+
+:8333 {
+	reverse_proxy http://seaweedfs-s3-internal:8333 {
+		# Preserve streaming request/response semantics for large S3 objects.
+		flush_interval -1
+	}
+}

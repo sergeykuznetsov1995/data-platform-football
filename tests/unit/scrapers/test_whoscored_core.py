@@ -7,6 +7,7 @@ import io
 import json
 import threading
 import time
+import traceback
 import zlib
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
@@ -697,6 +698,55 @@ class TestRawStore:
         assert store.filesystem is sentinel
         assert captured["access_key"] == "whoscored-access"
         assert captured["secret_key"] == "whoscored-secret"
+
+    @pytest.mark.parametrize(
+        ("uri", "secret"),
+        [
+            ("s3://operator:userinfo-secret@bucket/raw", "userinfo-secret"),
+            (
+                "s3://operator%3Aencoded-secret%40bucket/raw",
+                "encoded-secret",
+            ),
+            ("s3://bucket/raw?token=query-secret", "query-secret"),
+            ("s3://bucket/raw#fragment-secret", "fragment-secret"),
+            ("s3://bucket:not-a-port-secret/raw", "not-a-port-secret"),
+            (
+                "s3://operator:unicode-secret＠bucket/raw",
+                "unicode-secret",
+            ),
+            ("s3://bucket;authority-secret/raw", "authority-secret"),
+            ("s3://bucket\\userinfo-secret/raw", "userinfo-secret"),
+            ("s3://bucket\x00nul-secret/raw", "nul-secret"),
+            ("s3://[::1]/ipv6-secret", "ipv6-secret"),
+            ("s3://bucket:/empty-port-secret", "empty-port-secret"),
+            ("s3://Bucket/uppercase-secret", "uppercase-secret"),
+            ("s3://bucket-\ntoken-secret/raw", "token-secret"),
+            ("\x00s3://bucket/leading-control-secret", "leading-control-secret"),
+            ("s\t3://bucket/scheme-control-secret", "scheme-control-secret"),
+            ("s3://buck\tet/host-control-secret", "host-control-secret"),
+            ("s3://bucket/empty-query-secret?", "empty-query-secret"),
+            ("s3://bucket/empty-fragment-secret#", "empty-fragment-secret"),
+            ("s3://bucket/path-param-secret;", "path-param-secret"),
+        ],
+    )
+    def test_s3_store_rejects_authority_metadata_without_echo(
+        self, monkeypatch, uri, secret
+    ):
+        monkeypatch.setattr(
+            "scrapers.whoscored.raw_store.fs.S3FileSystem",
+            lambda **_kwargs: pytest.fail("invalid URI reached S3FileSystem"),
+        )
+
+        with pytest.raises(ValueError, match="Invalid S3 raw-store URI") as exc:
+            WhoScoredRawStore.from_uri(uri)
+
+        rendered = "".join(
+            traceback.format_exception(
+                type(exc.value), exc.value, exc.value.__traceback__
+            )
+        )
+        assert secret not in str(exc.value)
+        assert secret not in rendered
 
     @pytest.mark.parametrize(
         "name,value",

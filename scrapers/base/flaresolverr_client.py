@@ -34,6 +34,12 @@ class FlareSolverrError(Exception):
     pass
 
 
+class FlareSolverrRuntimeIdentityError(FlareSolverrError):
+    """Raised before browser output is accepted from an unexpected runtime."""
+
+    pass
+
+
 class FlareSolverrTimeout(FlareSolverrError):
     """Raised when the FlareSolverr endpoint times out or is unreachable."""
 
@@ -252,9 +258,7 @@ def _redact_request_values(
 
     variants = {
         variant
-        for sensitive in _sensitive_request_values(
-            payload, endpoint_url=endpoint_url
-        )
+        for sensitive in _sensitive_request_values(payload, endpoint_url=endpoint_url)
         for variant in _escaped_sensitive_variants(sensitive)
     }
     text = str(value)
@@ -263,7 +267,9 @@ def _redact_request_values(
     # One substitution pass prevents a short credential from corrupting the
     # replacement marker or exposing text introduced by an earlier replacement.
     pattern = re.compile(
-        "|".join(re.escape(variant) for variant in sorted(variants, key=len, reverse=True))
+        "|".join(
+            re.escape(variant) for variant in sorted(variants, key=len, reverse=True)
+        )
     )
     return pattern.sub("<redacted-request-value>", text)
 
@@ -274,16 +280,37 @@ class FlareSolverrClient:
     #: Number of top per-URL consumers surfaced by get_traffic_stats().
     _TOP_URLS_N = 25
     _MAX_XHR_BATCH_URLS = MAX_XHR_BATCH_URLS
+    _RUNTIME_IDENTITY_PATH = "/v1/whoscored/runtime-identity"
 
     def __init__(
         self,
         url: str = "http://flaresolverr:8191",
         default_timeout: float = 90.0,
         default_max_timeout_ms: int = 60_000,
+        *,
+        expected_version: Optional[str] = None,
+        expected_extension_sha256: Optional[str] = None,
     ) -> None:
+        if (expected_version is None) != (expected_extension_sha256 is None):
+            raise ValueError(
+                "expected FlareSolverr version and extension SHA-256 must be "
+                "configured together"
+            )
+        if expected_version is not None:
+            if type(expected_version) is not str or not expected_version:
+                raise ValueError("expected FlareSolverr version must be a string")
+            if (
+                type(expected_extension_sha256) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", expected_extension_sha256) is None
+            ):
+                raise ValueError(
+                    "expected FlareSolverr extension SHA-256 must be lowercase hex"
+                )
         self.url = url.rstrip("/")
         self.default_timeout = default_timeout
         self.default_max_timeout_ms = default_max_timeout_ms
+        self._expected_version = expected_version
+        self._expected_extension_sha256 = expected_extension_sha256
         self._session: Optional[requests.Session] = None
         self._auto_session_id: Optional[str] = None
         # Traffic-audit counters (issue #616). ``fs_response_bytes`` is the
@@ -299,6 +326,82 @@ class FlareSolverrClient:
         self._sessions_created = 0
         self._cf_challenge_failures = 0
         self._last_post_bytes = 0
+
+    def _verify_runtime_identity(self, data: dict, *, endpoint_path: str) -> None:
+        """Fail before interpreting or accounting output from a stale runtime."""
+
+        if self._expected_version is None:
+            return
+        if (
+            data.get("version") != self._expected_version
+            or data.get("extension_sha256") != self._expected_extension_sha256
+        ):
+            raise FlareSolverrRuntimeIdentityError(
+                "FlareSolverr runtime identity does not match the attested "
+                "WhoScored extension"
+            )
+        if endpoint_path not in {"/v1/xhr", "/v1/xhr/batch"}:
+            return
+        status = data.get("status")
+        expected_fields = {
+            "status",
+            "message",
+            "startTimestamp",
+            "endTimestamp",
+            "version",
+            "extension_sha256",
+        }
+        if status == "ok":
+            expected_fields.add("solution")
+        if (
+            set(data) != expected_fields
+            or status not in {"ok", "error"}
+            or type(data.get("message")) is not str
+            or type(data.get("startTimestamp")) is not int
+            or type(data.get("endTimestamp")) is not int
+            or data["startTimestamp"] < 0
+            or data["endTimestamp"] < data["startTimestamp"]
+        ):
+            raise FlareSolverrRuntimeIdentityError(
+                "FlareSolverr WhoScored endpoint returned an invalid identity envelope"
+            )
+
+    def _preflight_runtime_identity(self) -> None:
+        """Verify the immutable extension before any browser/source side effect."""
+
+        if self._expected_version is None:
+            return
+        endpoint = f"{self.url}{self._RUNTIME_IDENTITY_PATH}"
+        try:
+            response = self.session.get(endpoint, timeout=self.default_timeout)
+        except requests.exceptions.RequestException as exc:
+            safe_error = _redact_request_values(
+                exc,
+                {},
+                endpoint_url=self.url,
+            )
+            raise FlareSolverrRuntimeIdentityError(
+                "FlareSolverr runtime identity preflight failed: " + safe_error
+            ) from None
+        if not response.ok:
+            raise FlareSolverrRuntimeIdentityError(
+                "FlareSolverr runtime identity preflight returned an HTTP error"
+            )
+        try:
+            data = response.json()
+        except ValueError:
+            raise FlareSolverrRuntimeIdentityError(
+                "FlareSolverr runtime identity preflight is not JSON"
+            ) from None
+        if (
+            not isinstance(data, dict)
+            or set(data) != {"status", "version", "extension_sha256"}
+            or data.get("status") != "ok"
+        ):
+            raise FlareSolverrRuntimeIdentityError(
+                "FlareSolverr runtime identity preflight envelope is invalid"
+            )
+        self._verify_runtime_identity(data, endpoint_path=self._RUNTIME_IDENTITY_PATH)
 
     @property
     def session(self) -> requests.Session:
@@ -352,9 +455,12 @@ class FlareSolverrClient:
             "/v1/xhr": "xhr",
             "/v1/xhr/batch": "xhr_batch",
         }.get(endpoint_path, "custom")
-        logger.debug(
-            "FlareSolverr POST (endpoint_type=%s, cmd=%s)", endpoint_type, cmd
-        )
+        logger.debug("FlareSolverr POST (endpoint_type=%s, cmd=%s)", endpoint_type, cmd)
+
+        # The GET has no browser/session/source side effect.  A stale service
+        # is rejected before sessions.create or request.get can spend proxy
+        # bytes; the POST response is checked again below to detect restarts.
+        self._preflight_runtime_identity()
 
         request_error: Optional[FlareSolverrError] = None
         try:
@@ -365,9 +471,7 @@ class FlareSolverrClient:
             )
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
             error_type = type(e).__name__
-            safe_error = _redact_request_values(
-                e, payload, endpoint_url=self.url
-            )
+            safe_error = _redact_request_values(e, payload, endpoint_url=self.url)
             logger.warning(
                 "FlareSolverr transport error "
                 "(endpoint_type=%s, cmd=%s, error_type=%s): %s",
@@ -381,9 +485,7 @@ class FlareSolverrClient:
             )
         except requests.exceptions.RequestException as e:
             error_type = type(e).__name__
-            safe_error = _redact_request_values(
-                e, payload, endpoint_url=self.url
-            )
+            safe_error = _redact_request_values(e, payload, endpoint_url=self.url)
             logger.warning(
                 "FlareSolverr request error "
                 "(endpoint_type=%s, cmd=%s, error_type=%s): %s",
@@ -400,11 +502,28 @@ class FlareSolverrClient:
             # ``__context__`` retains the original URL-bearing exception.
             raise request_error from None
 
+        data: object = None
+        if self._expected_version is not None:
+            try:
+                data = response.json()
+            except ValueError as e:
+                error_type = type(e).__name__
+                safe_error = _redact_request_values(e, payload, endpoint_url=self.url)
+                raise FlareSolverrRuntimeIdentityError(
+                    "FlareSolverr identity response is not JSON "
+                    f"({error_type}): {safe_error}"
+                ) from None
+            if not isinstance(data, dict):
+                raise FlareSolverrRuntimeIdentityError(
+                    "FlareSolverr identity response is not a JSON object"
+                )
+            self._verify_runtime_identity(data, endpoint_path=endpoint_path)
+
         if not response.ok:
             body = response.text
-            safe_body = _redact_request_values(
-                body, payload, endpoint_url=self.url
-            )[:300]
+            safe_body = _redact_request_values(body, payload, endpoint_url=self.url)[
+                :300
+            ]
             logger.warning(
                 "FlareSolverr HTTP %s (endpoint_type=%s, cmd=%s): %s",
                 response.status_code,
@@ -425,21 +544,20 @@ class FlareSolverrClient:
                 f"FlareSolverr HTTP {response.status_code}: {safe_body}"
             )
 
-        json_error: Optional[FlareSolverrError] = None
-        try:
-            data = response.json()
-        except ValueError as e:
-            error_type = type(e).__name__
-            safe_error = _redact_request_values(
-                e, payload, endpoint_url=self.url
-            )
-            json_error = FlareSolverrError(
-                f"FlareSolverr returned non-JSON ({error_type}): {safe_error}"
-            )
-        if json_error is not None:
-            # JSON decoder exceptions can retain document excerpts. Do not keep
-            # them as exception context for URL- or credential-bearing requests.
-            raise json_error from None
+        if data is None:
+            json_error: Optional[FlareSolverrError] = None
+            try:
+                data = response.json()
+            except ValueError as e:
+                error_type = type(e).__name__
+                safe_error = _redact_request_values(e, payload, endpoint_url=self.url)
+                json_error = FlareSolverrError(
+                    f"FlareSolverr returned non-JSON ({error_type}): {safe_error}"
+                )
+            if json_error is not None:
+                # JSON decoder exceptions can retain document excerpts. Do not keep
+                # them as exception context for URL- or credential-bearing requests.
+                raise json_error from None
         if not isinstance(data, dict):
             raise FlareSolverrError("FlareSolverr returned a non-object JSON response")
 
@@ -450,9 +568,7 @@ class FlareSolverrClient:
             )
             lowered = message.lower()
             if any(marker in lowered for marker in _TAB_CRASH_MARKERS):
-                logger.warning(
-                    f"FlareSolverr tab crashed (cmd={cmd}): {safe_message}"
-                )
+                logger.warning(f"FlareSolverr tab crashed (cmd={cmd}): {safe_message}")
                 raise FlareSolverrTabCrashed(safe_message)
             if _is_explicit_cf_failure(safe_message):
                 self._cf_challenge_failures += 1
@@ -499,10 +615,15 @@ class FlareSolverrClient:
             self._post(payload)
             logger.info("FlareSolverr session destroyed")
         except FlareSolverrError as e:
-            safe_error = _redact_request_values(
-                e, payload, endpoint_url=self.url
-            )
+            safe_error = _redact_request_values(e, payload, endpoint_url=self.url)
             logger.debug(f"FlareSolverr destroy_session ignored: {safe_error}")
+
+    def destroy_session_strict(self, session_id: str) -> None:
+        """Destroy a supervised session and surface every remote failure."""
+
+        payload = {"cmd": "sessions.destroy", "session": session_id}
+        self._post(payload)
+        logger.info("Supervised FlareSolverr session destroyed")
 
     def list_sessions(self) -> list[str]:
         """List active FlareSolverr session IDs."""
@@ -798,8 +919,7 @@ class FlareSolverrClient:
                 self.destroy_session(self._auto_session_id)
             except Exception as e:
                 logger.warning(
-                    "FlareSolverr __exit__ destroy_session failed "
-                    f"({type(e).__name__})"
+                    f"FlareSolverr __exit__ destroy_session failed ({type(e).__name__})"
                 )
             finally:
                 self._auto_session_id = None

@@ -1,18 +1,22 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 import time
+import traceback
 import types
 from datetime import datetime
 
 import pytest
 import requests
 
+import scrapers.whoscored.transport as transport_module
 from scrapers.base.flaresolverr_client import (
     FlareSolverrCFChallengeFailed,
     FlareSolverrError,
     FlareSolverrResponseTooLarge,
+    FlareSolverrRuntimeIdentityError,
     FlareSolverrTimeout,
 )
 from scrapers.whoscored.source_circuit import (
@@ -20,17 +24,24 @@ from scrapers.whoscored.source_circuit import (
     SharedSourceCircuit,
     SourceCircuitOpen,
 )
+from scrapers.whoscored.runtime_contract import RuntimeContractError
 from scrapers.whoscored.transport import (
     CachedPayload,
     CloudflareChallenge,
     FailureKind,
     FetchRequest,
     JsonlRequestLedger,
+    PaidGatewayError,
+    PaidGatewayProtocolError,
+    PaidGatewayReceipt,
+    PaidGatewayRejected,
+    PaidGatewayResponse,
     ProxyBudgetRejected,
     ProxyFilterClient,
     ProxyLease,
     TransportBudgets,
     TransportContext,
+    TransportPolicy,
     TransportRoute,
     WhoScoredTransport,
     WhoScoredTransportError,
@@ -69,6 +80,24 @@ PLAYER_STATS_BOOTSTRAP = (
     "Stages/23753/TeamStatistics"
 )
 CONTROL_TOKEN = "c" * 32
+_REAL_PAID_RUNTIME_AUTHORITY = transport_module.assert_paid_runtime_available
+_REAL_PAID_ALERT_AUTHORITY = transport_module.assert_paid_alert_runtime_available
+
+
+@pytest.fixture(autouse=True)
+def _stub_paid_runtime_authority(monkeypatch):
+    """Route-mechanics tests fake the paid authority below its own boundary."""
+
+    monkeypatch.setattr(
+        transport_module,
+        "assert_paid_runtime_available",
+        lambda _metadata: None,
+    )
+    monkeypatch.setattr(
+        transport_module,
+        "assert_paid_alert_runtime_available",
+        lambda _context: None,
+    )
 
 
 def _batch_solution(url, content=b'{"teamTableStats":[]}'):
@@ -144,6 +173,9 @@ class FakeFSClient:
     def destroy_session(self, session_id):
         self.destroyed.append(session_id)
 
+    def destroy_session_strict(self, session_id):
+        self.destroyed.append(session_id)
+
     def get_traffic_stats(self):
         return {"sessions_created": len(self.created)}
 
@@ -177,7 +209,9 @@ class FakeProxyClient:
             "up_bytes": self.up,
             "down_bytes": self.down,
             "total_bytes": self.up + self.down,
+            "provider_billed_bytes": self.up + self.down,
             "canonical_url": self.created[-1][3],
+            "close_complete": True,
         }
         if self.stats_override is not None:
             report.update(self.stats_override)
@@ -185,6 +219,189 @@ class FakeProxyClient:
 
     def close_session(self):
         self.session_closed = True
+
+
+class LegacyRouteGatewayAdapter:
+    """Exercise old route fixtures through the new high-level gateway seam.
+
+    Proxy/browser capabilities remain inside this test-only adapter.  The
+    production transport sees only ``fetch`` and a credential-free receipt.
+    """
+
+    def __init__(self, *, proxy, paid_http, paid_fs, session_factory):
+        self.proxy = proxy
+        self.paid_http = paid_http
+        self.paid_fs = paid_fs
+        self.session_factory = session_factory
+        self.closed = False
+
+    @staticmethod
+    def _receipt(context, url, lease, stats, route):
+        def counter(field):
+            value = stats.get(field)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise PaidGatewayProtocolError("invalid accounting")
+            return value
+
+        if stats.get("id") != lease.lease_id:
+            raise PaidGatewayProtocolError("invalid accounting")
+        reported_url = stats.get("canonical_url")
+        canonical = transport_module._canonical_url_key(url)
+        if (
+            not isinstance(reported_url, str)
+            or transport_module._canonical_url_key(reported_url) != canonical
+            or stats.get("close_complete") is not True
+        ):
+            raise PaidGatewayProtocolError("invalid accounting")
+        up = counter("up_bytes")
+        down = counter("down_bytes")
+        total = counter("total_bytes")
+        billed = counter("provider_billed_bytes")
+        if total != up + down or billed != total:
+            raise PaidGatewayProtocolError("invalid accounting")
+        campaign = context.proxy_campaign
+        return PaidGatewayReceipt(
+            campaign_id=str(campaign.get("proxy_campaign_id") or "test-campaign"),
+            approval_id=str(campaign.get("proxy_approval_id") or "test-approval"),
+            approval_sha256=str(
+                campaign.get("proxy_approval_sha256") or "a" * 64
+            ),
+            allocation_id=str(
+                campaign.get("proxy_allocation_id") or "test-allocation"
+            ),
+            attempt_id_hash="b" * 64,
+            canonical_url_sha256=hashlib.sha256(canonical.encode()).hexdigest(),
+            lease_id_hash=hashlib.sha256(lease.lease_id.encode()).hexdigest(),
+            route=route,
+            up_bytes=up,
+            down_bytes=down,
+            total_bytes=total,
+            provider_billed_bytes=billed,
+            close_complete=True,
+            cleanup_complete=True,
+        )
+
+    def fetch(
+        self,
+        url,
+        *,
+        context,
+        max_response_bytes,
+        max_provider_bytes,
+        timeout_ms,
+        browser_bootstrap_url=None,
+    ):
+        try:
+            lease = self.proxy.create_lease(
+                max_bytes=max_provider_bytes,
+                ttl_seconds=60,
+                context=context,
+                canonical_url=transport_module._canonical_url_key(url),
+            )
+        except ProxyBudgetRejected:
+            raise PaidGatewayRejected("budget_rejected") from None
+        except Exception as exc:
+            raise PaidGatewayError(type(exc).__name__) from None
+        paid_http = None
+        route = TransportRoute.PAID_HTTP
+        content = b""
+        status = 0
+        headers = {}
+        session_id = "ws-test-paid"
+        browser_attempted = False
+        pending = None
+        stats = None
+        try:
+            paid_http = self.session_factory(lease.proxy_url)
+            raw = paid_http.get(
+                url,
+                timeout=timeout_ms / 1000,
+                headers=(
+                    {"Referer": browser_bootstrap_url}
+                    if browser_bootstrap_url
+                    else {}
+                ),
+                allow_redirects=False,
+            )
+            content = bytes(raw.content or b"")
+            status = int(raw.status_code)
+            headers = dict(raw.headers or {})
+            challenge = transport_module.is_cloudflare_response(
+                status, headers, content
+            ) or transport_module.is_whoscored_structured_feed_access_gate(
+                url, status, content, headers
+            )
+            if challenge:
+                route = TransportRoute.PAID_FLARESOLVERR
+                browser_attempted = True
+                self.paid_fs.create_session(session_id, proxy_url=lease.proxy_url)
+                if browser_bootstrap_url:
+                    self.paid_fs.get(
+                        browser_bootstrap_url,
+                        session_id,
+                        max_timeout_ms=timeout_ms,
+                        disable_media=True,
+                    )
+                    solution = self.paid_fs.xhr_get(
+                        url, session_id, max_timeout_ms=timeout_ms
+                    )
+                    content = bytes(solution.get("content") or b"")
+                    status = int(solution.get("status") or 0)
+                    headers = dict(solution.get("headers") or {})
+                else:
+                    solution = self.paid_fs.get(
+                        url,
+                        session_id,
+                        max_timeout_ms=timeout_ms,
+                        disable_media=True,
+                    )
+                    content = str(solution.get("html") or "").encode()
+                    status = int(solution.get("status") or 0)
+                    headers = {}
+            if len(content) > max_response_bytes:
+                raise PaidGatewayProtocolError("response too large")
+        except Exception as exc:
+            pending = exc
+        finally:
+            close = getattr(paid_http, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception as exc:
+                    pending = pending or exc
+            if browser_attempted:
+                try:
+                    self.paid_fs.destroy_session_strict(session_id)
+                except Exception as exc:
+                    pending = pending or exc
+            try:
+                stats = self.proxy.close(lease)
+            except Exception as exc:
+                pending = PaidGatewayProtocolError(type(exc).__name__)
+        if stats is None:
+            raise PaidGatewayProtocolError("missing accounting")
+        receipt = self._receipt(context, url, lease, stats, route)
+        if pending is not None:
+            if isinstance(pending, (PaidGatewayError, PaidGatewayProtocolError)):
+                raise pending
+            raise PaidGatewayError(type(pending).__name__) from None
+        return PaidGatewayResponse(
+            url=url,
+            content=content,
+            status_code=status,
+            headers=headers,
+            route=route,
+            receipt=receipt,
+        )
+
+    def close(self):
+        self.closed = True
+        fs_close = getattr(self.paid_fs, "close", None)
+        if callable(fs_close):
+            fs_close()
+        proxy_close = getattr(self.proxy, "close_session", None)
+        if callable(proxy_close):
+            proxy_close()
 
 
 class MemoryRawCache:
@@ -272,20 +489,35 @@ def _transport(
     browser_session_owner=None,
     source_circuit=None,
     source_circuit_wait=False,
+    transport_policy=None,
 ):
     factory_calls = []
+    resolved_policy = TransportPolicy.parse(
+        transport_policy
+        or (TransportPolicy.DIRECT_THEN_PAID if proxy else TransportPolicy.DIRECT_ONLY)
+    )
 
     def factory(proxy_url):
         factory_calls.append(proxy_url)
         assert paid_http is not None
         return paid_http
 
+    paid_gateway = (
+        LegacyRouteGatewayAdapter(
+            proxy=proxy,
+            paid_http=paid_http,
+            paid_fs=paid_fs or FakeFSClient(),
+            session_factory=factory,
+        )
+        if proxy
+        else None
+    )
+
     transport = WhoScoredTransport(
         direct_http_session=direct_http,
         direct_fs_client=direct_fs or FakeFSClient(),
-        paid_fs_client=paid_fs or FakeFSClient(),
-        proxy_client=proxy,
-        paid_proxy_url="http://proxy_filter:8899" if proxy else None,
+        paid_fs_client=(paid_fs or FakeFSClient()) if proxy is None else None,
+        paid_gateway_client=paid_gateway,
         http_session_factory=factory,
         raw_cache=raw_cache,
         budgets=budgets,
@@ -297,6 +529,8 @@ def _transport(
         browser_session_owner=browser_session_owner,
         source_circuit=source_circuit,
         source_circuit_wait=source_circuit_wait,
+        context=TransportContext(transport_policy=resolved_policy.value),
+        transport_policy=resolved_policy,
     )
     return transport, factory_calls
 
@@ -316,6 +550,161 @@ def test_direct_http_success_never_starts_browser_or_proxy():
     assert proxy.created == []
     assert factory_calls == []
     assert transport.get_traffic_stats()["paid_proxy_bytes"] == 0
+
+
+@pytest.mark.unit
+def test_internal_flaresolverr_clients_bind_attested_runtime_hash(monkeypatch):
+    expected_hash = "a" * 64
+    monkeypatch.setattr(
+        transport_module,
+        "attested_runtime_file_sha256",
+        lambda relative: (
+            expected_hash
+            if relative == "scripts/flaresolverr_extended.py"
+            else pytest.fail("unexpected runtime identity path")
+        ),
+    )
+
+    transport = WhoScoredTransport(
+        direct_http_session=FakeHTTPSession(),
+    )
+
+    assert transport._direct_fs._expected_version == "3.4.6"
+    assert transport._direct_fs._expected_extension_sha256 == expected_hash
+    assert transport._paid_fs._expected_version == "3.4.6"
+    assert transport._paid_fs._expected_extension_sha256 == expected_hash
+
+
+@pytest.mark.unit
+def test_production_marker_cannot_lose_flaresolverr_attested_hash(monkeypatch):
+    def unavailable(_relative):
+        raise RuntimeContractError("guard missing")
+
+    monkeypatch.setattr(
+        transport_module,
+        "attested_runtime_file_sha256",
+        unavailable,
+    )
+    monkeypatch.setattr(
+        transport_module,
+        "require_production_runtime_class",
+        lambda *, operation: "production-v1",
+    )
+    monkeypatch.setattr(
+        transport_module.sys,
+        "_whoscored_runtime_class",
+        "production-v1",
+        raising=False,
+    )
+    direct = FakeHTTPSession()
+
+    with pytest.raises(RuntimeContractError, match="no attested FlareSolverr"):
+        WhoScoredTransport(direct_http_session=direct)
+
+    assert direct.calls == []
+
+
+@pytest.mark.unit
+def test_proxy_endpoint_without_explicit_policy_cannot_authorize_paid_traffic():
+    direct = FakeHTTPSession(FakeHTTPResponse(403, CF_HTML, {"cf-ray": "direct"}))
+    direct_fs = FakeFSClient(FlareSolverrCFChallengeFailed("browser blocked"))
+    proxy = FakeProxyClient()
+    transport = WhoScoredTransport(
+        direct_http_session=direct,
+        direct_fs_client=direct_fs,
+        paid_fs_client=FakeFSClient(),
+        proxy_client=proxy,
+        paid_proxy_url="http://proxy_filter:8899",
+        direct_browser_attempts=1,
+        browser_retry_backoff_seconds=0,
+    )
+
+    with pytest.raises(CloudflareChallenge):
+        transport.fetch("https://www.whoscored.com/Matches/1/Live")
+
+    assert transport.transport_policy is TransportPolicy.DIRECT_ONLY
+    assert proxy.created == []
+
+
+@pytest.mark.unit
+def test_explicit_paid_policy_cannot_override_direct_context():
+    with pytest.raises(ValueError, match="authenticated TransportContext"):
+        WhoScoredTransport(
+            direct_http_session=FakeHTTPSession(),
+            direct_fs_client=FakeFSClient(),
+            paid_fs_client=FakeFSClient(),
+            proxy_client=FakeProxyClient(),
+            paid_proxy_url="http://proxy_filter:8899",
+            context=TransportContext(),
+            transport_policy=TransportPolicy.DIRECT_THEN_PAID,
+        )
+
+
+@pytest.mark.unit
+def test_forged_paid_context_reaches_the_real_authority_before_clients(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        transport_module,
+        "assert_paid_runtime_available",
+        _REAL_PAID_RUNTIME_AUTHORITY,
+    )
+    with pytest.raises(ValueError, match="proxy campaign approval"):
+        WhoScoredTransport(
+            direct_http_session=FakeHTTPSession(),
+            direct_fs_client=FakeFSClient(),
+            paid_fs_client=FakeFSClient(),
+            proxy_client=FakeProxyClient(),
+            paid_proxy_url="http://proxy_filter:8899",
+            context=TransportContext(transport_policy="direct_then_paid"),
+        )
+
+
+@pytest.mark.unit
+def test_runner_alert_check_requires_no_receipt_environment(monkeypatch):
+    from dags.utils.alerts import PAID_ALERT_RECEIPT_ENV
+
+    for name in PAID_ALERT_RECEIPT_ENV.values():
+        monkeypatch.delenv(name, raising=False)
+    context = TransportContext(
+        dag_id="dag_ingest_whoscored",
+        run_id="manual__paid-1",
+        task_id="ingest_active_scope",
+        map_index=0,
+        try_number=1,
+        transport_policy="direct_then_paid",
+        proxy_campaign={
+            "proxy_campaign_id": "campaign-1",
+            "proxy_approval_id": "approval-1",
+            "proxy_approval_sha256": "a" * 64,
+        },
+    )
+
+    _REAL_PAID_ALERT_AUTHORITY(context)
+
+
+@pytest.mark.unit
+def test_signed_allocation_replaces_local_cardinality_heuristic_limits():
+    context = TransportContext(
+        transport_policy="direct_then_paid",
+        proxy_campaign={
+            "proxy_allocation": {
+                "budget_bytes": 123_456_789,
+                "request_limit": 321,
+                "lease_limit": 123,
+            }
+        },
+    )
+    transport = WhoScoredTransport(
+        direct_http_session=FakeHTTPSession(FakeHTTPResponse()),
+        direct_fs_client=FakeFSClient(),
+        paid_gateway_client=types.SimpleNamespace(fetch=pytest.fail),
+        context=context,
+    )
+
+    assert transport.budgets.max_paid_bytes_per_task == 123_456_789
+    assert transport.budgets.max_paid_urls == 321
+    assert transport.budgets.max_paid_browser_bootstraps == 123
 
 
 @pytest.mark.unit
@@ -600,9 +989,7 @@ def test_production_direct_http_timeout_waits_and_reacquires_token(monkeypatch):
 
 @pytest.mark.unit
 @pytest.mark.parametrize("status", [404, 429])
-def test_production_direct_http_nonretryable_status_does_not_sleep(
-    monkeypatch, status
-):
+def test_production_direct_http_nonretryable_status_does_not_sleep(monkeypatch, status):
     direct = FakeHTTPSession(
         FakeHTTPResponse(status_code=status, content=b"ordinary origin error")
     )
@@ -1038,6 +1425,7 @@ def test_browser_access_gate_never_counts_as_cf_or_authorizes_paid():
         paid_http=FakeHTTPSession(FakeHTTPResponse(content=b'{"paid":true}')),
         attempts=4,
         source_circuit=circuit,
+        transport_policy=TransportPolicy.DIRECT_ONLY,
     )
 
     with pytest.raises(WhoScoredTransportError) as raised:
@@ -1079,6 +1467,7 @@ def test_authoritative_browser_cf_trips_shared_circuit_once_and_stops_retries():
         paid_http=FakeHTTPSession(FakeHTTPResponse(content=b'{"paid":true}')),
         attempts=4,
         source_circuit=circuit,
+        transport_policy=TransportPolicy.DIRECT_ONLY,
     )
 
     with pytest.raises(CloudflareChallenge) as raised:
@@ -1096,6 +1485,45 @@ def test_authoritative_browser_cf_trips_shared_circuit_once_and_stops_retries():
 
 
 @pytest.mark.unit
+def test_serial_mixed_browser_evidence_never_authorizes_paid_with_source_circuit():
+    bootstrap = {
+        "html": "<html><body>Team Statistics</body></html>",
+        "status": 200,
+    }
+    direct = FakeHTTPSession(FakeHTTPResponse(content=MASKED_STATS_HTML))
+    fs = FakeFSClient(
+        bootstrap,
+        FlareSolverrTimeout("browser timed out"),
+        bootstrap,
+        FlareSolverrCFChallengeFailed("later browser cf"),
+    )
+    circuit = FakeSourceCircuit()
+    proxy = FakeProxyClient()
+    transport, factory_calls = _transport(
+        direct,
+        direct_fs=fs,
+        proxy=proxy,
+        paid_http=FakeHTTPSession(FakeHTTPResponse(content=b'{"paid":true}')),
+        attempts=2,
+        source_circuit=circuit,
+    )
+
+    with pytest.raises(WhoScoredTransportError) as raised:
+        transport.fetch(
+            TEAM_STATS_URL,
+            browser_bootstrap_url=TEAM_STATS_BOOTSTRAP,
+            validator=lambda response: json.loads(response.content) is not None,
+        )
+
+    assert raised.value.kind is FailureKind.TIMEOUT
+    assert len(direct.calls) == 1
+    assert len(fs.xhr_calls) == 2
+    assert circuit.calls == [("admit", False), ("trip", False)]
+    assert proxy.created == []
+    assert factory_calls == []
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize("batched", [False, True])
 def test_structured_bootstrap_typed_cf_is_authoritative_source_evidence(batched):
     direct = FakeHTTPSession(FakeHTTPResponse(content=MASKED_STATS_HTML))
@@ -1108,6 +1536,7 @@ def test_structured_bootstrap_typed_cf_is_authoritative_source_evidence(batched)
         proxy=proxy,
         attempts=4,
         source_circuit=circuit,
+        transport_policy=TransportPolicy.DIRECT_ONLY,
     )
 
     with pytest.raises(CloudflareChallenge) as raised:
@@ -1159,6 +1588,138 @@ def test_open_source_circuit_rejects_before_rate_token_or_network():
     assert tokens == []
     assert direct.calls == []
     assert fs.created == []
+
+
+@pytest.mark.unit
+def test_open_source_circuit_never_substitutes_for_current_browser_evidence():
+    direct = FakeHTTPSession(FakeHTTPResponse(403, CF_HTML, {"cf-ray": "fresh-direct"}))
+    direct_fs = FakeFSClient()
+    paid_http = FakeHTTPSession(FakeHTTPResponse(content=b'{"ok":true}'))
+    proxy = FakeProxyClient(up=40, down=60)
+    circuit = FakeSourceCircuit(opened=True)
+    transport, factory_calls = _transport(
+        direct,
+        direct_fs=direct_fs,
+        proxy=proxy,
+        paid_http=paid_http,
+        source_circuit=circuit,
+        attempts=4,
+    )
+
+    with pytest.raises(CloudflareChallenge):
+        transport.fetch(
+            TEAM_STATS_URL,
+            browser_bootstrap_url=TEAM_STATS_BOOTSTRAP,
+            validator=lambda response: json.loads(response.content) is not None,
+        )
+
+    assert len(direct.calls) == 1
+    assert direct_fs.created == []
+    assert circuit.calls == [("admit", False)]
+    assert proxy.created == []
+    assert factory_calls == []
+
+
+@pytest.mark.unit
+def test_open_source_circuit_timeout_never_authorizes_paid_route():
+    direct = FakeHTTPSession(requests.Timeout("direct timeout"))
+    proxy = FakeProxyClient()
+    circuit = FakeSourceCircuit(opened=True)
+    transport, _ = _transport(
+        direct,
+        direct_fs=FakeFSClient(),
+        proxy=proxy,
+        paid_http=FakeHTTPSession(FakeHTTPResponse(content=b'{"ok":true}')),
+        source_circuit=circuit,
+        http_attempts=1,
+    )
+
+    with pytest.raises(WhoScoredTransportError) as raised:
+        transport.fetch(
+            TEAM_STATS_URL,
+            browser_bootstrap_url=TEAM_STATS_BOOTSTRAP,
+        )
+
+    assert raised.value.kind is FailureKind.TIMEOUT
+    assert proxy.created == []
+
+
+@pytest.mark.unit
+def test_open_source_circuit_batch_never_substitutes_for_browser_evidence():
+    second_url = f"{TEAM_STATS_URL}&page=2"
+    direct = FakeHTTPSession(
+        FakeHTTPResponse(403, CF_HTML, {"cf-ray": "fresh-one"}),
+        FakeHTTPResponse(403, CF_HTML, {"cf-ray": "fresh-two"}),
+    )
+    direct_fs = FakeFSClient()
+    paid_http = FakeHTTPSession(
+        FakeHTTPResponse(content=b'{"teamTableStats":[]}'),
+        FakeHTTPResponse(content=b'{"teamTableStats":[]}'),
+    )
+    proxy = FakeProxyClient(up=20, down=30)
+    circuit = FakeSourceCircuit(opened=True)
+    transport, _ = _transport(
+        direct,
+        direct_fs=direct_fs,
+        proxy=proxy,
+        paid_http=paid_http,
+        source_circuit=circuit,
+        attempts=4,
+    )
+
+    with pytest.raises(CloudflareChallenge):
+        transport.fetch_many(
+            [
+                FetchRequest(
+                    url=url,
+                    cache_key=f"open-circuit-{index}",
+                    browser_bootstrap_url=TEAM_STATS_BOOTSTRAP,
+                    validator=lambda response: json.loads(response.content) is not None,
+                )
+                for index, url in enumerate((TEAM_STATS_URL, second_url))
+            ]
+        )
+
+    assert len(direct.calls) == 1
+    assert direct_fs.created == []
+    assert proxy.created == []
+    assert circuit.calls == [("admit", False)]
+
+
+@pytest.mark.unit
+def test_half_open_source_circuit_runs_one_browser_probe_before_paid_route():
+    direct = FakeHTTPSession(
+        FakeHTTPResponse(content=MASKED_STATS_HTML),
+        FakeHTTPResponse(403, CF_HTML, {"cf-ray": "fresh-recheck"}),
+    )
+    direct_fs = FakeFSClient(
+        *(FlareSolverrCFChallengeFailed("source blocked") for _ in range(4))
+    )
+    proxy = FakeProxyClient()
+    circuit = FakeSourceCircuit(probe=True)
+    transport, _ = _transport(
+        direct,
+        direct_fs=direct_fs,
+        proxy=proxy,
+        paid_http=FakeHTTPSession(FakeHTTPResponse(content=b'{"ok":true}')),
+        source_circuit=circuit,
+        attempts=4,
+    )
+
+    result = transport.fetch(
+        TEAM_STATS_URL,
+        browser_bootstrap_url=TEAM_STATS_BOOTSTRAP,
+        validator=lambda response: json.loads(response.content) is not None,
+    )
+
+    assert result.route is TransportRoute.PAID_HTTP
+    assert len(direct_fs.get_calls) == 4
+    assert circuit.calls == [
+        ("admit", False),
+        ("trip", True),
+        ("admit", False),
+    ]
+    assert len(proxy.created) == 1
 
 
 @pytest.mark.unit
@@ -1329,6 +1890,7 @@ def test_half_open_serial_browser_502_is_one_inconclusive_xhr():
         proxy=proxy,
         attempts=4,
         source_circuit=circuit,
+        transport_policy=TransportPolicy.DIRECT_ONLY,
     )
 
     with pytest.raises(WhoScoredTransportError) as raised:
@@ -1385,6 +1947,7 @@ def test_half_open_batch_browser_502_is_one_inconclusive_xhr():
 def test_batch_authoritative_browser_cf_trips_once_and_never_pays():
     second_url = TEAM_STATS_URL + "&category=offensive"
     direct = FakeHTTPSession(FakeHTTPResponse(content=MASKED_STATS_HTML))
+
     def cf_solution(url):
         return {
             "ok": True,
@@ -1394,6 +1957,7 @@ def test_batch_authoritative_browser_cf_trips_once_and_never_pays():
             "responseBytes": len(CF_HTML),
             "finalUrl": url,
         }
+
     fs = FakeFSClient(
         {
             "html": "<html><body>Team Statistics</body></html>",
@@ -1410,6 +1974,7 @@ def test_batch_authoritative_browser_cf_trips_once_and_never_pays():
         paid_http=FakeHTTPSession(FakeHTTPResponse(content=b'{"paid":true}')),
         attempts=4,
         source_circuit=circuit,
+        transport_policy=TransportPolicy.DIRECT_ONLY,
     )
 
     with pytest.raises(CloudflareChallenge) as raised:
@@ -1454,6 +2019,7 @@ def test_batch_source_cf_trips_before_terminal_sibling_error():
         proxy=proxy,
         attempts=4,
         source_circuit=circuit,
+        transport_policy=TransportPolicy.DIRECT_ONLY,
     )
 
     with pytest.raises(CloudflareChallenge) as raised:
@@ -2333,6 +2899,49 @@ def test_paid_structured_feed_requires_fresh_direct_gate_after_browser_cf():
 
 
 @pytest.mark.unit
+def test_paid_structured_access_gate_advances_same_lease_to_paid_browser():
+    bootstrap = {
+        "html": "<html><body>Team Statistics</body></html>",
+        "status": 200,
+    }
+    direct = FakeHTTPSession(
+        FakeHTTPResponse(content=MASKED_STATS_HTML),
+        FakeHTTPResponse(content=MASKED_STATS_HTML),
+    )
+    direct_fs = FakeFSClient(
+        bootstrap,
+        FlareSolverrCFChallengeFailed("direct browser cf"),
+    )
+    paid_http = FakeHTTPSession(FakeHTTPResponse(content=MASKED_STATS_HTML))
+    paid_fs = FakeFSClient(bootstrap, _batch_solution(TEAM_STATS_URL))
+    proxy = FakeProxyClient()
+    transport, factory_calls = _transport(
+        direct,
+        direct_fs=direct_fs,
+        paid_fs=paid_fs,
+        proxy=proxy,
+        paid_http=paid_http,
+        attempts=1,
+    )
+
+    result = transport.fetch(
+        TEAM_STATS_URL,
+        browser_bootstrap_url=TEAM_STATS_BOOTSTRAP,
+        validator=lambda response: json.loads(response.content) is not None,
+    )
+
+    assert result.route is TransportRoute.PAID_FLARESOLVERR
+    assert len(direct.calls) == 2
+    assert len(proxy.created) == 1
+    assert factory_calls == ["http://lease:secret@proxy_filter:8899"]
+    assert len(paid_http.calls) == 1
+    assert paid_http.calls[0][2]["allow_redirects"] is False
+    assert paid_fs.created[0][1] == "http://lease:secret@proxy_filter:8899"
+    assert len(paid_fs.get_calls) == 1
+    assert len(paid_fs.xhr_calls) == 1
+
+
+@pytest.mark.unit
 def test_parser_and_browser_errors_do_not_leave_direct_gate_circuit_open():
     parser_direct = FakeHTTPSession(
         FakeHTTPResponse(content=b'{"unexpected":true}'),
@@ -2481,9 +3090,7 @@ def test_capacity_owner_isolated_browser_session_name(monkeypatch):
 
     transport.fetch("https://www.whoscored.com/Matches/1/Live")
 
-    assert fs.created == [
-        (f"ws-cap-{owner}-direct_flaresolverr-0123456789", None)
-    ]
+    assert fs.created == [(f"ws-cap-{owner}-direct_flaresolverr-0123456789", None)]
 
 
 class _OwnerStringSubclass(str):
@@ -2825,10 +3432,7 @@ def test_production_browser_four_cf_challenges_fail_closed_without_paid(
 ):
     direct = FakeHTTPSession(FakeHTTPResponse(403, CF_HTML, {"cf-ray": "x"}))
     fs = FakeFSClient(
-        *[
-            FlareSolverrCFChallengeFailed("cloudflare challenge")
-            for _ in range(4)
-        ]
+        *[FlareSolverrCFChallengeFailed("cloudflare challenge") for _ in range(4)]
     )
     sleeps = []
     tokens = []
@@ -2866,10 +3470,7 @@ def test_production_four_cf_challenges_require_fresh_direct_cf_before_paid(
         FakeHTTPResponse(content=MASKED_STATS_HTML),
     )
     fs = FakeFSClient(
-        *[
-            FlareSolverrCFChallengeFailed("cloudflare challenge")
-            for _ in range(4)
-        ]
+        *[FlareSolverrCFChallengeFailed("cloudflare challenge") for _ in range(4)]
     )
     proxy = FakeProxyClient()
     paid_http = FakeHTTPSession(FakeHTTPResponse(content=b'{"paid":true}'))
@@ -2887,12 +3488,18 @@ def test_production_four_cf_challenges_require_fresh_direct_cf_before_paid(
         factory_calls.append(proxy_url)
         return paid_http
 
+    paid_gateway = LegacyRouteGatewayAdapter(
+        proxy=proxy,
+        paid_http=paid_http,
+        paid_fs=FakeFSClient(),
+        session_factory=factory,
+    )
     transport = WhoScoredTransport(
         direct_http_session=direct,
         direct_fs_client=fs,
-        paid_fs_client=FakeFSClient(),
-        proxy_client=proxy,
-        paid_proxy_url="http://proxy_filter:8899",
+        paid_gateway_client=paid_gateway,
+        context=TransportContext(transport_policy="direct_then_paid"),
+        transport_policy=TransportPolicy.DIRECT_THEN_PAID,
         http_session_factory=factory,
     )
 
@@ -2938,12 +3545,18 @@ def test_three_cf_then_browser_error_on_fourth_attempt_never_enables_paid(
         factory_calls.append(proxy_url)
         return FakeHTTPSession(FakeHTTPResponse(content=b'{"paid":true}'))
 
+    paid_gateway = LegacyRouteGatewayAdapter(
+        proxy=proxy,
+        paid_http=None,
+        paid_fs=FakeFSClient(),
+        session_factory=factory,
+    )
     transport = WhoScoredTransport(
         direct_http_session=direct,
         direct_fs_client=fs,
-        paid_fs_client=FakeFSClient(),
-        proxy_client=proxy,
-        paid_proxy_url="http://proxy_filter:8899",
+        paid_gateway_client=paid_gateway,
+        context=TransportContext(transport_policy="direct_then_paid"),
+        transport_policy=TransportPolicy.DIRECT_THEN_PAID,
         http_session_factory=factory,
     )
 
@@ -2958,6 +3571,41 @@ def test_three_cf_then_browser_error_on_fourth_attempt_never_enables_paid(
     assert len(fs.get_calls) == 4
     assert sleeps == [2.0, 4.0, 8.0]
     assert tokens == ["token"] * 4
+    assert proxy.created == []
+    assert factory_calls == []
+
+
+@pytest.mark.unit
+def test_stale_flaresolverr_identity_is_config_failure_before_cache_or_paid():
+    direct = FakeHTTPSession(FakeHTTPResponse(content=MASKED_STATS_HTML))
+    runtime_error = FlareSolverrRuntimeIdentityError(
+        "FlareSolverr runtime identity does not match the attested extension"
+    )
+    fs = FakeFSClient(runtime_error)
+    proxy = FakeProxyClient()
+    cache = MemoryRawCache()
+    paid_http = FakeHTTPSession(FakeHTTPResponse(content=b'{"paid":true}'))
+    transport, factory_calls = _transport(
+        direct,
+        direct_fs=fs,
+        proxy=proxy,
+        paid_http=paid_http,
+        raw_cache=cache,
+        attempts=4,
+    )
+
+    with pytest.raises(WhoScoredTransportError) as raised:
+        transport.fetch(
+            TEAM_STATS_URL,
+            validator=lambda response: json.loads(response.content) is not None,
+            browser_bootstrap_url=TEAM_STATS_BOOTSTRAP,
+        )
+
+    assert raised.value.kind is FailureKind.CONFIG
+    assert raised.value.retryable is False
+    assert len(fs.get_calls) == 1
+    assert len(fs.created) == 1
+    assert cache.stored == []
     assert proxy.created == []
     assert factory_calls == []
 
@@ -2997,9 +3645,7 @@ def test_browser_retry_jitter_never_exceeds_total_backoff_cap(monkeypatch):
         jitter_calls.append((low, high))
         return high
 
-    monkeypatch.setattr(
-        "scrapers.whoscored.transport.random.uniform", maximum_jitter
-    )
+    monkeypatch.setattr("scrapers.whoscored.transport.random.uniform", maximum_jitter)
 
     transport._wait_before_browser_retry(0)
 
@@ -3184,9 +3830,10 @@ def test_system_exit_during_destroy_keeps_session_tracked_for_close_retry():
         transport.close()
 
     assert raised.value.code == 143
-    assert transport._browser_sessions[
-        TransportRoute.DIRECT_FLARESOLVERR
-    ].session_id == session_id
+    assert (
+        transport._browser_sessions[TransportRoute.DIRECT_FLARESOLVERR].session_id
+        == session_id
+    )
 
     transport.close()
 
@@ -3194,6 +3841,39 @@ def test_system_exit_during_destroy_keeps_session_tracked_for_close_retry():
     assert transport._browser_sessions == {}
     assert direct.closed is True
     assert fs.closed is True
+
+
+@pytest.mark.unit
+def test_supervised_browser_session_is_fsynced_before_create_and_after_destroy(
+    tmp_path,
+    monkeypatch,
+):
+    owner = "a" * 24
+    ledger_path = tmp_path / "remote-resources.jsonl"
+    monkeypatch.setenv(transport_module.SUPERVISOR_SESSION_OWNER_ENV, owner)
+    monkeypatch.setenv(
+        transport_module.SUPERVISOR_RESOURCE_LEDGER_ENV,
+        str(ledger_path),
+    )
+    direct = FakeHTTPSession(FakeHTTPResponse(403, CF_HTML, {"cf-ray": "x"}))
+    fs = FakeFSClient(
+        {"html": OK_HTML.decode(), "status": 200, "cookies": [], "userAgent": "x"}
+    )
+    transport, _ = _transport(direct, direct_fs=fs)
+
+    transport.fetch("https://www.whoscored.com/Matches/1/Live")
+
+    events = [json.loads(line) for line in ledger_path.read_text().splitlines()]
+    assert [event["event"] for event in events] == ["owned"]
+    session_id = events[0]["session_id"]
+    assert session_id.startswith(f"ws-cap-{owner}-")
+    assert fs.created == [(session_id, None)]
+
+    transport.close()
+
+    events = [json.loads(line) for line in ledger_path.read_text().splitlines()]
+    assert [event["event"] for event in events] == ["owned", "released"]
+    assert fs.destroyed == [session_id]
 
 
 @pytest.mark.unit
@@ -3264,8 +3944,56 @@ def test_timeout_from_direct_browser_does_not_enable_paid_proxy():
 
 
 @pytest.mark.unit
-def test_paid_curl_only_after_every_direct_browser_attempt_is_cf():
-    direct = FakeHTTPSession(FakeHTTPResponse(403, CF_HTML, {"cf-ray": "x"}))
+def test_fresh_direct_recheck_recovery_blocks_paid_page_fallback():
+    direct = FakeHTTPSession(
+        FakeHTTPResponse(403, CF_HTML, {"cf-ray": "initial"}),
+        FakeHTTPResponse(200, OK_HTML),
+    )
+    direct_fs = FakeFSClient(
+        FlareSolverrCFChallengeFailed("cf one"),
+        FlareSolverrCFChallengeFailed("cf two"),
+    )
+    proxy = FakeProxyClient()
+    transport, _ = _transport(direct, direct_fs=direct_fs, proxy=proxy)
+
+    result = transport.fetch("https://www.whoscored.com/Matches/1/Live")
+
+    assert result.route is TransportRoute.DIRECT_HTTP
+    assert len(direct.calls) == 2
+    assert len(direct_fs.created) == 2
+    assert proxy.created == []
+
+
+@pytest.mark.unit
+def test_fresh_direct_recheck_timeout_blocks_paid_page_fallback():
+    direct = FakeHTTPSession(
+        FakeHTTPResponse(403, CF_HTML, {"cf-ray": "initial"}),
+        requests.Timeout("recheck one"),
+        requests.Timeout("recheck two"),
+        requests.Timeout("recheck three"),
+    )
+    direct_fs = FakeFSClient(
+        FlareSolverrCFChallengeFailed("cf one"),
+        FlareSolverrCFChallengeFailed("cf two"),
+    )
+    proxy = FakeProxyClient()
+    transport, _ = _transport(direct, direct_fs=direct_fs, proxy=proxy)
+
+    with pytest.raises(WhoScoredTransportError) as exc:
+        transport.fetch("https://www.whoscored.com/Matches/1/Live")
+
+    assert exc.value.kind is FailureKind.TIMEOUT
+    assert len(direct.calls) == 4
+    assert len(direct_fs.created) == 2
+    assert proxy.created == []
+
+
+@pytest.mark.unit
+def test_paid_curl_only_after_fresh_direct_recheck_is_cf():
+    direct = FakeHTTPSession(
+        FakeHTTPResponse(403, CF_HTML, {"cf-ray": "initial"}),
+        FakeHTTPResponse(403, CF_HTML, {"cf-ray": "fresh"}),
+    )
     direct_fs = FakeFSClient(
         FlareSolverrCFChallengeFailed("cf one"),
         FlareSolverrCFChallengeFailed("cf two"),
@@ -3286,6 +4014,7 @@ def test_paid_curl_only_after_every_direct_browser_attempt_is_cf():
     result = transport.fetch("https://www.whoscored.com/Matches/1/Live?d=1")
 
     assert result.route is TransportRoute.PAID_HTTP
+    assert len(direct.calls) == 2
     assert len(direct_fs.created) == 2
     assert len(proxy.created) == 1
     assert factory_calls == ["http://lease:secret@proxy_filter:8899"]
@@ -3304,7 +4033,10 @@ def test_paid_curl_only_after_every_direct_browser_attempt_is_cf():
 
 @pytest.mark.unit
 def test_paid_lease_is_finalized_when_http_session_creation_fails():
-    direct = FakeHTTPSession(FakeHTTPResponse(403, CF_HTML, {"cf-ray": "x"}))
+    direct = FakeHTTPSession(
+        FakeHTTPResponse(403, CF_HTML, {"cf-ray": "initial"}),
+        FakeHTTPResponse(403, CF_HTML, {"cf-ray": "fresh"}),
+    )
     direct_fs = FakeFSClient(
         FlareSolverrCFChallengeFailed("cf one"),
         FlareSolverrCFChallengeFailed("cf two"),
@@ -3314,12 +4046,18 @@ def test_paid_lease_is_finalized_when_http_session_creation_fails():
     def failing_factory(_proxy_url):
         raise RuntimeError("session unavailable")
 
+    paid_gateway = LegacyRouteGatewayAdapter(
+        proxy=proxy,
+        paid_http=None,
+        paid_fs=FakeFSClient(),
+        session_factory=failing_factory,
+    )
     transport = WhoScoredTransport(
         direct_http_session=direct,
         direct_fs_client=direct_fs,
-        paid_fs_client=FakeFSClient(),
-        proxy_client=proxy,
-        paid_proxy_url="http://proxy_filter:8899",
+        paid_gateway_client=paid_gateway,
+        context=TransportContext(transport_policy="direct_then_paid"),
+        transport_policy=TransportPolicy.DIRECT_THEN_PAID,
         http_session_factory=failing_factory,
         direct_browser_attempts=2,
         browser_retry_backoff_seconds=0,
@@ -3335,8 +4073,87 @@ def test_paid_lease_is_finalized_when_http_session_creation_fails():
 
 
 @pytest.mark.unit
+def test_paid_lease_creation_error_never_exposes_proxy_credentials():
+    secret = "create-route-secret"
+
+    class LeakingCreateProxy(FakeProxyClient):
+        def create_lease(self, **_kwargs):
+            raise RuntimeError(f"socks5://operator:{secret}@paid.example:1080")
+
+    transport, _ = _transport(
+        FakeHTTPSession(
+            FakeHTTPResponse(403, CF_HTML, {"cf-ray": "initial"}),
+            FakeHTTPResponse(403, CF_HTML, {"cf-ray": "fresh"}),
+        ),
+        direct_fs=FakeFSClient(
+            FlareSolverrCFChallengeFailed("cf one"),
+            FlareSolverrCFChallengeFailed("cf two"),
+        ),
+        proxy=LeakingCreateProxy(),
+        paid_http=FakeHTTPSession(),
+    )
+
+    with pytest.raises(WhoScoredTransportError) as exc:
+        transport.fetch("https://www.whoscored.com/Matches/1/Live")
+
+    assert exc.value.kind is FailureKind.PROXY
+    assert secret not in str(exc.value)
+    assert "operator" not in str(exc.value)
+    rendered = "".join(
+        traceback.format_exception(type(exc.value), exc.value, exc.value.__traceback__)
+    )
+    assert secret not in rendered
+    assert "operator" not in rendered
+
+
+@pytest.mark.unit
+def test_paid_finalize_error_redacts_itself_and_prior_paid_route_error():
+    close_secret = "close-route-secret"
+    request_secret = "request-route-secret"
+
+    class LeakingCloseProxy(FakeProxyClient):
+        def close(self, _lease):
+            raise RuntimeError(
+                f"http://operator:{close_secret}@proxy_filter:8899/finalize"
+            )
+
+    transport, _ = _transport(
+        FakeHTTPSession(
+            FakeHTTPResponse(403, CF_HTML, {"cf-ray": "initial"}),
+            FakeHTTPResponse(403, CF_HTML, {"cf-ray": "fresh"}),
+        ),
+        direct_fs=FakeFSClient(
+            FlareSolverrCFChallengeFailed("cf one"),
+            FlareSolverrCFChallengeFailed("cf two"),
+        ),
+        proxy=LeakingCloseProxy(),
+        paid_http=FakeHTTPSession(
+            requests.exceptions.ProxyError(
+                f"https://operator:{request_secret}@paid.example:8443"
+            )
+        ),
+    )
+
+    with pytest.raises(WhoScoredTransportError) as exc:
+        transport.fetch("https://www.whoscored.com/Matches/1/Live")
+
+    rendered = "".join(
+        traceback.format_exception(type(exc.value), exc.value, exc.value.__traceback__)
+    )
+    assert exc.value.route is TransportRoute.PAID_LEASE
+    assert close_secret not in rendered
+    assert request_secret not in rendered
+    assert "operator" not in rendered
+    assert "paid application gateway fetch failed" in rendered
+    assert exc.value.__cause__ is None
+
+
+@pytest.mark.unit
 def test_paid_lease_and_stats_use_full_deterministic_query_url():
-    direct = FakeHTTPSession(FakeHTTPResponse(403, CF_HTML, {"cf-ray": "x"}))
+    direct = FakeHTTPSession(
+        FakeHTTPResponse(403, CF_HTML, {"cf-ray": "initial"}),
+        FakeHTTPResponse(403, CF_HTML, {"cf-ray": "fresh"}),
+    )
     direct_fs = FakeFSClient(
         FlareSolverrCFChallengeFailed("cf one"),
         FlareSolverrCFChallengeFailed("cf two"),
@@ -3358,7 +4175,10 @@ def test_paid_lease_and_stats_use_full_deterministic_query_url():
 
 @pytest.mark.unit
 def test_rendered_browser_challenge_without_source_headers_is_confirmed_cf():
-    direct = FakeHTTPSession(FakeHTTPResponse(403, CF_HTML, {"cf-ray": "x"}))
+    direct = FakeHTTPSession(
+        FakeHTTPResponse(403, CF_HTML, {"cf-ray": "initial"}),
+        FakeHTTPResponse(403, CF_HTML, {"cf-ray": "fresh"}),
+    )
     direct_fs = FakeFSClient(
         {"html": CF_HTML.decode(), "status": 403},
         {"html": CF_HTML.decode(), "status": 403},
@@ -3381,7 +4201,10 @@ def test_rendered_browser_challenge_without_source_headers_is_confirmed_cf():
 
 @pytest.mark.unit
 def test_paid_browser_uses_same_lease_but_separate_fs_client():
-    direct = FakeHTTPSession(FakeHTTPResponse(403, CF_HTML, {"cf-ray": "x"}))
+    direct = FakeHTTPSession(
+        FakeHTTPResponse(403, CF_HTML, {"cf-ray": "initial"}),
+        FakeHTTPResponse(403, CF_HTML, {"cf-ray": "fresh"}),
+    )
     direct_fs = FakeFSClient(
         FlareSolverrCFChallengeFailed("cf one"),
         FlareSolverrCFChallengeFailed("cf two"),
@@ -3409,11 +4232,45 @@ def test_paid_browser_uses_same_lease_but_separate_fs_client():
     assert all(proxy_url is None for _, proxy_url in direct_fs.created)
     accounted = [event for event in ledger.events if event["status"] == "accounted"]
     assert accounted[0]["route"] == "paid_lease"
-    assert accounted[0]["paid_routes_attempted"] == [
-        "paid_http",
-        "paid_flaresolverr",
-    ]
+    assert accounted[0]["paid_routes_attempted"] == ["paid_flaresolverr"]
     assert accounted[0]["final_paid_route"] == "paid_flaresolverr"
+
+
+@pytest.mark.unit
+def test_paid_browser_error_traceback_never_exposes_proxy_credentials():
+    secret = "paid-browser-route-secret"
+    direct = FakeHTTPSession(
+        FakeHTTPResponse(403, CF_HTML, {"cf-ray": "initial"}),
+        FakeHTTPResponse(403, CF_HTML, {"cf-ray": "fresh"}),
+    )
+    direct_fs = FakeFSClient(
+        FlareSolverrCFChallengeFailed("cf one"),
+        FlareSolverrCFChallengeFailed("cf two"),
+    )
+    paid_http = FakeHTTPSession(
+        FakeHTTPResponse(403, CF_HTML, {"server": "cloudflare"})
+    )
+    paid_fs = FakeFSClient(
+        FlareSolverrError(f"http://operator:{secret}@paid.example:8899")
+    )
+    transport, _ = _transport(
+        direct,
+        direct_fs=direct_fs,
+        paid_fs=paid_fs,
+        proxy=FakeProxyClient(),
+        paid_http=paid_http,
+    )
+
+    with pytest.raises(WhoScoredTransportError) as exc:
+        transport.fetch("https://www.whoscored.com/Matches/1/Live")
+
+    rendered = "".join(
+        traceback.format_exception(type(exc.value), exc.value, exc.value.__traceback__)
+    )
+    assert exc.value.route is TransportRoute.PAID_LEASE
+    assert secret not in rendered
+    assert "operator" not in rendered
+    assert exc.value.__cause__ is None
 
 
 @pytest.mark.unit
@@ -3423,6 +4280,8 @@ def test_paid_browser_uses_same_lease_but_separate_fs_client():
         {"up_bytes": -1, "total_bytes": 899},
         {"down_bytes": True, "total_bytes": 100},
         {"total_bytes": 9999},
+        {"provider_billed_bytes": 9999},
+        {"close_complete": False},
         {"id": "different-lease"},
         {"canonical_url": "https://www.whoscored.com/Matches/999/Live"},
     ],
@@ -3430,7 +4289,10 @@ def test_paid_browser_uses_same_lease_but_separate_fs_client():
 def test_malformed_paid_lease_accounting_fails_closed_without_counting_bytes(
     stats_override,
 ):
-    direct = FakeHTTPSession(FakeHTTPResponse(403, CF_HTML, {"cf-ray": "x"}))
+    direct = FakeHTTPSession(
+        FakeHTTPResponse(403, CF_HTML, {"cf-ray": "initial"}),
+        FakeHTTPResponse(403, CF_HTML, {"cf-ray": "fresh"}),
+    )
     direct_fs = FakeFSClient(
         FlareSolverrCFChallengeFailed("cf one"),
         FlareSolverrCFChallengeFailed("cf two"),
@@ -3456,7 +4318,10 @@ def test_malformed_paid_lease_accounting_fails_closed_without_counting_bytes(
 
 @pytest.mark.unit
 def test_paid_accounting_failure_takes_precedence_over_source_failure():
-    direct = FakeHTTPSession(FakeHTTPResponse(403, CF_HTML, {"cf-ray": "x"}))
+    direct = FakeHTTPSession(
+        FakeHTTPResponse(403, CF_HTML, {"cf-ray": "initial"}),
+        FakeHTTPResponse(403, CF_HTML, {"cf-ray": "fresh"}),
+    )
     direct_fs = FakeFSClient(
         FlareSolverrCFChallengeFailed("cf one"),
         FlareSolverrCFChallengeFailed("cf two"),
@@ -3474,8 +4339,8 @@ def test_paid_accounting_failure_takes_precedence_over_source_failure():
 
     assert exc.value.kind is FailureKind.PROXY
     assert exc.value.route is TransportRoute.PAID_LEASE
-    assert "prior source error" in str(exc.value)
-    assert isinstance(exc.value.__cause__, WhoScoredTransportError)
+    assert "PaidGatewayProtocolError" in str(exc.value)
+    assert exc.value.__cause__ is None
 
 
 @pytest.mark.unit
@@ -3585,7 +4450,10 @@ def test_shared_proxy_budget_rejection_fails_without_permanent_blacklist_state()
             raise ProxyBudgetRejected("DagRun budget exhausted")
 
     transport, _ = _transport(
-        FakeHTTPSession(FakeHTTPResponse(403, CF_HTML, {"cf-ray": "x"})),
+        FakeHTTPSession(
+            FakeHTTPResponse(403, CF_HTML, {"cf-ray": "initial"}),
+            FakeHTTPResponse(403, CF_HTML, {"cf-ray": "fresh"}),
+        ),
         direct_fs=FakeFSClient(FlareSolverrCFChallengeFailed("cf")),
         proxy=RejectingProxy(),
         paid_http=FakeHTTPSession(),
@@ -3707,6 +4575,64 @@ def test_proxy_lease_repr_never_exposes_bearer_credentials():
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    ("proxy_url", "secret"),
+    (
+        ("http://alice:plain-secret@proxy_filter:8899", "plain-secret"),
+        ("https://alice:p%40ss-secret@proxy_filter:8899", "p%40ss-secret"),
+        ("http://alice%3Aencoded-secret%40proxy_filter:8899", "encoded-secret"),
+        ("socks5://alice:socks-secret@proxy_filter:8899", "socks-secret"),
+        ("http://proxy_filter:not-a-port-secret", "not-a-port-secret"),
+    ),
+)
+def test_proxy_client_rejects_credentialed_or_non_http_origins_without_echo(
+    proxy_url, secret
+):
+    with pytest.raises(ValueError, match="invalid filtering proxy URL") as exc:
+        ProxyFilterClient(proxy_url, control_token=CONTROL_TOKEN)
+
+    assert secret not in str(exc.value)
+
+
+@pytest.mark.unit
+def test_proxy_client_rejects_credentialed_control_origin_without_echo():
+    secret = "control-secret"
+    with pytest.raises(ValueError, match="invalid filtering proxy control URL") as exc:
+        ProxyFilterClient(
+            "http://proxy_filter:8899",
+            control_url=f"https://operator:{secret}@proxy_filter:8900",
+            control_token=CONTROL_TOKEN,
+        )
+
+    assert secret not in str(exc.value)
+
+
+@pytest.mark.unit
+def test_proxy_lease_response_rejects_malformed_origin_without_echo():
+    secret = "response-secret"
+    response = FakeHTTPResponse()
+    response.raise_for_status = lambda: None
+    response.json = lambda: {
+        "id": "abc",
+        "token": "lease-secret",
+        "proxy_url": f"http://operator:{secret}@proxy_filter:8900",
+        "max_bytes": 1234,
+        "expires_at": 99.0,
+    }
+    client = ProxyFilterClient(
+        "http://proxy_filter:8899",
+        session=SimpleControlSession(response),
+        control_token=CONTROL_TOKEN,
+    )
+
+    with pytest.raises(ValueError, match="invalid filtering proxy lease URL") as exc:
+        client.create_lease(max_bytes=1234, ttl_seconds=60)
+
+    assert secret not in str(exc.value)
+    assert "lease-secret" not in str(exc.value)
+
+
+@pytest.mark.unit
 def test_proxy_control_client_uses_dedicated_authenticated_lease_listener():
     response = FakeHTTPResponse()
     response.raise_for_status = lambda: None
@@ -3748,10 +4674,9 @@ def test_proxy_control_client_uses_dedicated_authenticated_lease_listener():
         "try_number": 2,
         "scope": "",
         "entity": "",
+        "transport_policy": "direct_only",
     }
-    assert session.posts[0][1]["headers"] == {
-        "X-Proxy-Control-Token": CONTROL_TOKEN
-    }
+    assert session.posts[0][1]["headers"] == {"X-Proxy-Control-Token": CONTROL_TOKEN}
     assert lease.proxy_url == "http://lease:s%2Fecret@proxy_filter:8900"
     client.stats(lease)
     client.close(lease)
@@ -3773,7 +4698,7 @@ def test_proxy_control_client_fails_closed_without_auth_and_surfaces_401(monkeyp
         "SOFASCORE_PROXY_CONTROL_TOKEN",
     ):
         monkeypatch.delenv(name, raising=False)
-    with pytest.raises(ValueError, match="PROXY_FILTER_CONTROL_TOKEN"):
+    with pytest.raises(ValueError, match="WHOSCORED_PROXY_CONTROL_TOKEN"):
         ProxyFilterClient("http://proxy_filter:8899")
 
     response = FakeHTTPResponse(status_code=401)
@@ -3789,15 +4714,13 @@ def test_proxy_control_client_fails_closed_without_auth_and_surfaces_401(monkeyp
     )
     with pytest.raises(requests.HTTPError, match="401"):
         client.create_lease(max_bytes=2_000_000, ttl_seconds=60)
-    assert session.posts[0][1]["headers"] == {
-        "X-Proxy-Control-Token": CONTROL_TOKEN
-    }
+    assert session.posts[0][1]["headers"] == {"X-Proxy-Control-Token": CONTROL_TOKEN}
     assert session.posts[0][1]["json"]["max_bytes"] == 2_000_000
 
 
 @pytest.mark.unit
-def test_proxy_control_client_reads_provider_neutral_control_token(monkeypatch):
-    monkeypatch.setenv("PROXY_FILTER_CONTROL_TOKEN", CONTROL_TOKEN)
+def test_proxy_control_client_reads_dedicated_whoscored_control_token(monkeypatch):
+    monkeypatch.setenv("WHOSCORED_PROXY_CONTROL_TOKEN", CONTROL_TOKEN)
     response = FakeHTTPResponse()
     response.raise_for_status = lambda: None
     response.json = lambda: {
@@ -3811,9 +4734,7 @@ def test_proxy_control_client_reads_provider_neutral_control_token(monkeypatch):
 
     client.create_lease(max_bytes=1000, ttl_seconds=60)
 
-    assert session.posts[0][1]["headers"] == {
-        "X-Proxy-Control-Token": CONTROL_TOKEN
-    }
+    assert session.posts[0][1]["headers"] == {"X-Proxy-Control-Token": CONTROL_TOKEN}
 
 
 class SimpleControlSession:

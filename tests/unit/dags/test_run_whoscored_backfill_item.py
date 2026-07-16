@@ -9,8 +9,10 @@ import pytest
 
 from dags.scripts.run_whoscored_backfill_item import (
     _filtered_candidates,
+    _parser,
     _schedule_request_accounting,
     _source_request_attempts,
+    _validate_transport_args,
     main,
 )
 from dags.scripts.run_whoscored_scraper import RunnerScope
@@ -117,7 +119,9 @@ def test_schedule_accounting_rejects_missing_stage_evidence():
 
 
 @pytest.mark.unit
-def test_backfill_worker_rechecks_runtime_before_loading_plan(monkeypatch, tmp_path):
+def test_backfill_worker_rejects_invalid_plan_before_runtime_projection(
+    monkeypatch, tmp_path
+):
     from scrapers.whoscored import runtime_contract
 
     observed = []
@@ -142,4 +146,41 @@ def test_backfill_worker_rechecks_runtime_before_loading_plan(monkeypatch, tmp_p
     )
 
     assert rc == 1
-    assert observed == [{"report_schema_version": 3}]
+    assert observed == []
+
+
+@pytest.mark.unit
+def test_backfill_worker_binds_paid_selector_to_decoded_work_item():
+    parser = _parser()
+    common = [
+        "--queue-id",
+        "queue",
+        "--plan-id",
+        "a" * 64,
+        "--work-item",
+        "encoded",
+        "--output",
+        "/tmp/result.json",
+        "--transport-policy",
+        "direct_then_paid",
+        "--proxy-approval-path",
+        "/run/approval.json",
+        "--proxy-approval-id",
+        "approval-1",
+        "--proxy-approval-sha256",
+        "b" * 64,
+    ]
+    args = parser.parse_args(common + ["--proxy-work-item-id", "wrong-item"])
+    with pytest.raises(SystemExit):
+        _validate_transport_args(parser, args, work_item_id="immutable-item")
+
+    args = parser.parse_args(
+        common + ["--proxy-allocation-id", "attacker-allocation"]
+    )
+    with pytest.raises(SystemExit):
+        _validate_transport_args(parser, args, work_item_id="immutable-item")
+
+    args = parser.parse_args(common)
+    _validate_transport_args(parser, args, work_item_id="immutable-item")
+    assert args.proxy_work_item_id == "immutable-item"
+    assert args.expected_proxy_work_item_id == "immutable-item"
