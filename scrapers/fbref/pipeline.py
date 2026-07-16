@@ -1186,12 +1186,14 @@ class FBrefPipeline:
                         live_session.needs_clearance = False
                         if browser_navigated:
                             # The first slot admitted the browser bootstrap.
-                            # Wait after it is fully closed, then reserve a
-                            # second durable slot for the first warm target.
-                            # Otherwise the old slot expires while Camoufox
-                            # solves Cloudflare and two page requests can leave
-                            # almost back-to-back.
-                            self.sleep(settings.domain_interval_seconds)
+                            # Advance the durable throttle immediately after
+                            # the browser closes, then reserve the real target
+                            # slot. This keeps the cooldown visible to another
+                            # worker while this process is waiting.
+                            self.control.reserve_domain_slot(
+                                "fbref.com",
+                                interval_seconds=settings.domain_interval_seconds,
+                            )
                             target_slot = self.control.reserve_domain_slot(
                                 "fbref.com",
                                 interval_seconds=(
@@ -1335,6 +1337,20 @@ class FBrefPipeline:
                             http_requests=exc.http_requests,
                             http_wire_bytes=max(0, int(exc.wire_bytes)),
                             provider_billed_bytes=exc.provider_billed_bytes,
+                        )
+                    if (
+                        exc.browser_requests > 0
+                        or exc.browser_bootstrap_attempts > 0
+                    ):
+                        # The browser may have navigated successfully and then
+                        # failed while exporting cookies, finalising, or
+                        # extending the paid lease. The original throttle slot
+                        # is stale by then. Reserve an intentionally empty
+                        # slot so the next solve (in this or the next run) is
+                        # durably delayed by the source minimum.
+                        self.control.reserve_domain_slot(
+                            "fbref.com",
+                            interval_seconds=settings.domain_interval_seconds,
                         )
                     result.requests += (
                         exc.http_requests + exc.browser_requests
