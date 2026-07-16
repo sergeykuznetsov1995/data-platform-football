@@ -198,6 +198,7 @@ class FakeControl:
         self.manifests = []
         self.observations = {}
         self.provenance = []
+        self.frontier_batches = []
         self.completed = []
         self.failed = []
         self.snapshots = []
@@ -206,6 +207,7 @@ class FakeControl:
         self.session_metrics = []
         self.heartbeats = []
         self.claim_calls = []
+        self.eligible_competition_calls = 0
         self.run = {
             "run_type": "current",
             "status": "succeeded",
@@ -567,6 +569,7 @@ class FakeControl:
         return {}
 
     def eligible_competitions(self):
+        self.eligible_competition_calls += 1
         return [
             row for row in self.registry.values() if row["gender"] == "male"
         ]
@@ -628,6 +631,21 @@ class FakeControl:
                 else NOW if upgrade_to_recurring or lifecycle_transition
                 else previous.get("next_fetch_at")
             ),
+        }
+
+    def upsert_frontier_discovery_batch(self, *, targets, provenance):
+        targets = list(targets)
+        provenance = list(provenance)
+        self.frontier_batches.append((targets, provenance))
+        self.events.append("frontier_batch:start")
+        for target in targets:
+            self.upsert_frontier_target(target)
+        for edge in provenance:
+            self.record_frontier_provenance(edge)
+        self.events.append("frontier_batch:end")
+        return {
+            "target_count": len(targets),
+            "provenance_count": len(provenance),
         }
 
     def create_run_cohort(self, run_id, cohort):
@@ -1125,6 +1143,161 @@ def test_current_and_backfill_share_player_without_policy_downgrade():
         "historical_once"
     )
     assert lifecycle.frontier[season.target_id]["next_fetch_at"] == NOW
+
+
+def test_seed_links_persists_one_ordered_batch_per_observation(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.registry["9"] = {
+        "competition_id": "9",
+        "canonical_url": "https://fbref.com/en/comps/9/history/x",
+        "name": "Premier League",
+        "gender": "male",
+        "classification": "league:club",
+        "metadata": {},
+    }
+    parent = page_target_from_link(DiscoveredPageLink(
+        page_kind="schedule",
+        canonical_url=(
+            "https://fbref.com/en/comps/9/2025-2026/schedule/x"
+        ),
+        source_ids={"competition_id": "9", "season_id": "2025-2026"},
+    ))
+    _, parent_record = _commit_for_parse(raw, parent, "<html></html>")
+    links = [
+        DiscoveredPageLink(
+            page_kind="player",
+            canonical_url=(
+                f"https://fbref.com/en/players/{index:08x}/Player"
+            ),
+            source_ids={
+                "player_id": f"{index:08x}",
+                "competition_id": "9",
+                "season_id": "2025-2026",
+            },
+        )
+        for index in reversed(range(50))
+    ]
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+    )
+
+    seeded, skipped = pipeline._seed_links(
+        links,
+        historical=False,
+        parent_record=parent_record,
+    )
+
+    assert (seeded, skipped) == (50, 0)
+    assert control.eligible_competition_calls == 1
+    assert len(control.frontier_batches) == 1
+    targets, provenance = control.frontier_batches[0]
+    assert len(targets) == len(provenance) == 50
+    assert [target.target_id for target in targets] == sorted(
+        target.target_id for target in targets
+    )
+    assert control.events.index("frontier_batch:end") < control.events.index(
+        "scope_reconcile"
+    )
+
+
+def test_schedule_seeds_50_mixed_matches_in_one_frontier_batch(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.registry["9"] = {
+        "competition_id": "9",
+        "canonical_url": "https://fbref.com/en/comps/9/history/x",
+        "name": "Premier League",
+        "gender": "male",
+        "classification": "league:club",
+        "metadata": {},
+    }
+    target = page_target_from_link(DiscoveredPageLink(
+        page_kind="schedule",
+        canonical_url=(
+            "https://fbref.com/en/comps/9/2025-2026/schedule/x"
+        ),
+        source_ids={"competition_id": "9", "season_id": "2025-2026"},
+    ))
+    rows = "".join(
+        f"""
+        <tr><th data-stat="date">2026-01-{index % 28 + 1:02d}</th>
+          <td data-stat="home_team">Home {index}</td>
+          <td data-stat="away_team">Away {index}</td>
+          <td data-stat="score">{"1–0" if index < 25 else ""}</td>
+          <td data-stat="match_report"><a
+            href="/en/matches/{index:08x}/Match-{index}">Report</a></td>
+        </tr>
+        """
+        for index in range(50)
+    )
+    html = f"""
+    <table id="sched_all"><thead><tr>
+      <th data-stat="date">Date</th>
+      <th data-stat="home_team">Home</th>
+      <th data-stat="away_team">Away</th>
+      <th data-stat="score">Score</th>
+      <th data-stat="match_report">Report</th>
+    </tr></thead><tbody>{rows}</tbody></table>
+    """
+    refresh, record = _commit_for_parse(raw, target, html)
+    control.frontier[target.target_id] = {
+        "target_id": target.target_id,
+        "state": "fetched",
+        "last_content_hash": record.content_hash,
+    }
+    control.fetches = [{
+        "target_id": record.target_id,
+        "page_kind": record.page_kind,
+        "logical_refresh_id": refresh,
+    }]
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        typed_adapter=FakeTypedAdapter(FakeTypedWriter()),
+    )
+    seed_eligible_reads = []
+    seed_candidates = pipeline._seed_link_candidates
+
+    def measured_seed(*args, **kwargs):
+        before = control.eligible_competition_calls
+        result = seed_candidates(*args, **kwargs)
+        seed_eligible_reads.append(
+            control.eligible_competition_calls - before
+        )
+        return result
+
+    pipeline._seed_link_candidates = measured_seed
+
+    result = pipeline.parse_wave(
+        str(uuid.uuid4()),
+        page_kinds=["schedule"],
+        settings=_settings("current"),
+    )
+
+    assert (result.seeded, result.skipped_ineligible) == (50, 0)
+    assert seed_eligible_reads == [1]
+    assert len(control.frontier_batches) == 1
+    targets, provenance = control.frontier_batches[0]
+    assert len(targets) == len(provenance) == 50
+    policies = {
+        target.source_ids["match_id"]: target.refresh_policy
+        for target in targets
+    }
+    assert set(policies.values()) == {"current_completed_once", "daily"}
+    assert all(
+        policies[f"{index:08x}"] == (
+            "current_completed_once" if index < 25 else "daily"
+        )
+        for index in range(50)
+    )
+    assert control.events.count("scope_reconcile") == 1
+    assert control.events.index("frontier_batch:end") < control.events.index(
+        "scope_reconcile"
+    )
 
 
 def test_fetch_wave_reserves_budget_and_commits_raw_before_control(tmp_path):
@@ -1784,6 +1957,88 @@ def test_single_match_competition_inventories_current_and_backfill_targets(
     assert all(
         entry.metadata.get("direct_match_only") is True
         for entry in control.seasons
+    )
+
+
+@pytest.mark.parametrize(
+    ("run_type", "seeded_season", "season_policy"),
+    [
+        ("current", "2025", "daily"),
+        ("backfill", "2024", "historical_once"),
+    ],
+)
+def test_competition_history_aggregates_seasons_and_direct_matches(
+    tmp_path, run_type, seeded_season, season_policy
+):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.registry["602"] = {
+        "competition_id": "602",
+        "canonical_url": "https://fbref.com/en/comps/602/history/x",
+        "name": "Super Cup",
+        "gender": "male",
+        "classification": "cup:club",
+        "metadata": {"last_season": "2025"},
+    }
+    target = page_target_from_link(DiscoveredPageLink(
+        page_kind="competition",
+        canonical_url="https://fbref.com/en/comps/602/history/x",
+        source_ids={"competition_id": "602"},
+    ))
+    html = """
+    <table id="seasons"><tbody>
+      <tr><th data-stat="season"><a
+        href="/en/comps/602/2025/current">2025</a></th></tr>
+      <tr><th data-stat="season"><a
+        href="/en/comps/602/2024/old">2024</a></th></tr>
+      <tr><th data-stat="season"><a
+        href="/en/matches/abcdef12/Current-Final">2025</a></th></tr>
+      <tr><th data-stat="season"><a
+        href="/en/matches/98765432/Old-Final">2023</a></th></tr>
+    </tbody></table>
+    """
+    refresh, record = _commit_for_parse(raw, target, html)
+    control.frontier[record.target_id] = {
+        "target_id": record.target_id,
+        "page_kind": record.page_kind,
+        "source_ids": dict(record.source_ids),
+        "state": "fetched",
+        "last_content_hash": record.content_hash,
+    }
+    control.fetches = [{
+        "target_id": record.target_id,
+        "page_kind": record.page_kind,
+        "logical_refresh_id": refresh,
+    }]
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    result = pipeline.parse_wave(
+        str(uuid.uuid4()),
+        page_kinds=["competition"],
+        settings=_settings(run_type),
+    )
+
+    assert (result.seeded, result.skipped_ineligible) == (3, 0)
+    assert control.eligible_competition_calls == 1
+    assert len(control.frontier_batches) == 1
+    targets, provenance = control.frontier_batches[0]
+    assert len(targets) == len(provenance) == 3
+    season_target = next(
+        target for target in targets if target.page_kind == "season"
+    )
+    assert season_target.source_ids["season_id"] == seeded_season
+    assert season_target.refresh_policy == season_policy
+    match_policies = {
+        target.source_ids["match_id"]: target.refresh_policy
+        for target in targets if target.page_kind == "match"
+    }
+    assert match_policies == {
+        "abcdef12": "current_completed_once",
+        "98765432": "historical_once",
+    }
+    assert control.events.count("scope_reconcile") == 1
+    assert control.events.index("frontier_batch:end") < control.events.index(
+        "scope_reconcile"
     )
 
 
