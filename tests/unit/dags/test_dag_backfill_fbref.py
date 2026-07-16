@@ -90,6 +90,7 @@ class TestFBrefBackfillTopology:
             "validate_fbref_current_scope_freshness"
         )
         assert preflight.op_kwargs["run_type"] == "backfill"
+        assert preflight.op_kwargs["fail_fast"] is False
         assert preflight.downstream_task_ids == {
             "acquire_publication_lock"
         }
@@ -138,6 +139,7 @@ class TestFBrefBackfillTopology:
             "trigger_rule"
         ] == "all_done"
         freshness = tasks["validate_current_scope_freshness"]
+        assert freshness.op_kwargs["fail_fast"] is True
         assert freshness.upstream_task_ids == {
             "audit_raw_integrity"
         }

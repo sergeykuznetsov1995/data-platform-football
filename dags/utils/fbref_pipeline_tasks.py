@@ -632,7 +632,11 @@ def _non_negative_metric(payload: Mapping[str, object], key: str) -> int:
 
 
 def validate_fbref_current_scope_freshness(
-    *, airflow_run_id: str, dag_id: str, run_type: str
+    *,
+    airflow_run_id: str,
+    dag_id: str,
+    run_type: str,
+    fail_fast: bool = True,
 ) -> dict:
     """Fail closed when any active male/current target exceeds its source SLA.
 
@@ -741,9 +745,13 @@ def validate_fbref_current_scope_freshness(
         }
 
     if violations:
-        from airflow.exceptions import AirflowException
+        from airflow.exceptions import AirflowException, AirflowFailException
 
-        raise AirflowException(
+        # A verdict checked under the publication lock cannot change on retry.
+        # The backfill preflight runs before that lock and remains retryable so
+        # a concurrent current refresh may finish first.
+        error_type = AirflowFailException if fail_fast else AirflowException
+        raise error_type(
             "FBref current-scope freshness failed: " + "; ".join(violations)
         )
     return {

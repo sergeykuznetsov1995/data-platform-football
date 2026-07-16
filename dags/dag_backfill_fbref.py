@@ -192,6 +192,7 @@ with DAG(
             "airflow_run_id": AIRFLOW_RUN_ID,
             "dag_id": DAG_ID,
             "run_type": "backfill",
+            "fail_fast": False,
         },
         trigger_rule="all_success",
     )
@@ -282,6 +283,7 @@ with DAG(
             "airflow_run_id": AIRFLOW_RUN_ID,
             "dag_id": DAG_ID,
             "run_type": "backfill",
+            "fail_fast": True,
         },
         trigger_rule="all_success",
     )

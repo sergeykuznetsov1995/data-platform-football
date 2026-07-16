@@ -258,6 +258,7 @@ with DAG(
             "airflow_run_id": AIRFLOW_RUN_ID,
             "dag_id": DAG_ID,
             "run_type": "current",
+            "fail_fast": True,
         },
         trigger_rule="all_success",
     )

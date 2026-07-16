@@ -3840,6 +3840,11 @@ class ControlStore:
                     LEFT JOIN scope_rollup AS scope
                       ON scope.target_id = frontier.target_id
                     WHERE frontier.source = 'fbref'
+                      -- Current runs cannot claim historical one-shot matches.
+                      AND NOT (
+                        frontier.page_kind = 'match'
+                        AND frontier.refresh_policy = 'historical_once'
+                      )
                       AND (
                         frontier.page_kind = 'competition_index'
                         OR (
