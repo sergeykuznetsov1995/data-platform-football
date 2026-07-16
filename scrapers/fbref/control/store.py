@@ -97,6 +97,8 @@ _PAGE_KIND_SLA_VALUES = ", ".join(
     for page_kind, seconds in sorted(_PAGE_KIND_SLA_SECONDS.items())
 )
 _PENDING_MATCH_SAMPLE_LIMIT = 10
+_MAX_FRONTIER_DISCOVERY_TARGETS = 1000
+_MAX_FRONTIER_DISCOVERY_EDGES = 5000
 _FRONTIER_SCOPE_CTE = """
     WITH declared_scope AS (
         SELECT frontier.target_id, frontier.source,
@@ -516,7 +518,10 @@ class ControlStore:
             return connection.cursor()
 
     @contextmanager
-    def _transaction(self):
+    def _transaction(self, existing_cursor: Any = None):
+        if existing_cursor is not None:
+            yield existing_cursor
+            return
         connection = self._connect()
         cursor = self._cursor(connection)
         try:
@@ -2410,19 +2415,25 @@ class ControlStore:
             )
             return _fetchall(cursor)
 
-    def upsert_frontier_target(self, target: FrontierTarget) -> None:
+    def upsert_frontier_target(
+        self,
+        target: FrontierTarget,
+        *,
+        _cursor: Any = None,
+    ) -> None:
         """Create/update one canonical identity before any network request."""
         target_id = _text(target.target_id, "target_id")
         canonical_url = _text(target.canonical_url, "canonical_url")
         if urlsplit(canonical_url).scheme not in {"http", "https"}:
             raise ValueError("canonical_url must be absolute HTTP(S)")
-        with self._transaction() as cursor:
+        with self._transaction(_cursor) as cursor:
             cursor.execute(
                 """
                 SELECT target_id, source, page_kind, canonical_url,
                        source_ids, state
                 FROM fbref_control.page_frontier
                 WHERE target_id = %s OR canonical_url = %s
+                ORDER BY target_id, canonical_url
                 FOR UPDATE
                 """,
                 (target_id, canonical_url),
@@ -2532,6 +2543,8 @@ class ControlStore:
     def record_frontier_provenance(
         self,
         provenance: FrontierProvenance,
+        *,
+        _cursor: Any = None,
     ) -> str:
         """Append one idempotent, content-addressed discovery edge."""
         parent = _text(provenance.parent_target_id, "parent_target_id")
@@ -2573,7 +2586,7 @@ class ControlStore:
             parser_version=parser_version,
         )
         expected_metadata = dict(provenance.metadata)
-        with self._transaction() as cursor:
+        with self._transaction(_cursor) as cursor:
             cursor.execute(
                 """
                 INSERT INTO fbref_control.frontier_provenance (
@@ -2641,6 +2654,72 @@ class ControlStore:
                     "different immutable evidence"
                 )
             return str(row["provenance_id"])
+
+    def upsert_frontier_discovery_batch(
+        self,
+        *,
+        targets: Sequence[FrontierTarget],
+        provenance: Sequence[FrontierProvenance],
+    ) -> dict[str, int]:
+        """Atomically persist one bounded observation's discovery output."""
+        raw_targets = list(targets)
+        raw_provenance = list(provenance)
+        if len(raw_targets) > _MAX_FRONTIER_DISCOVERY_TARGETS:
+            raise ValueError(
+                "frontier discovery target batch exceeds "
+                f"{_MAX_FRONTIER_DISCOVERY_TARGETS}"
+            )
+        if len(raw_provenance) > _MAX_FRONTIER_DISCOVERY_EDGES:
+            raise ValueError(
+                "frontier discovery provenance batch exceeds "
+                f"{_MAX_FRONTIER_DISCOVERY_EDGES}"
+            )
+        ordered_targets = sorted(
+            raw_targets,
+            key=lambda target: (
+                _text(target.target_id, "target_id"),
+                _text(target.canonical_url, "canonical_url"),
+            ),
+        )
+        ordered_provenance = sorted(
+            raw_provenance,
+            key=lambda edge: make_frontier_provenance_id(
+                parent_target_id=edge.parent_target_id,
+                child_target_id=edge.child_target_id,
+                relation=edge.relation,
+                carried_competition_id=edge.carried_competition_id,
+                carried_season_id=edge.carried_season_id,
+                parent_content_hash=edge.parent_content_hash,
+                parser_version=edge.parser_version,
+            ),
+        )
+        observation_keys = {
+            (
+                _text(edge.parent_target_id, "parent_target_id"),
+                _text(edge.parent_content_hash, "parent_content_hash"),
+                _text(edge.parser_version, "parser_version"),
+                None
+                if edge.logical_refresh_id is None
+                else _uuid(edge.logical_refresh_id, "logical_refresh_id"),
+            )
+            for edge in ordered_provenance
+        }
+        if len(observation_keys) > 1:
+            raise ValueError(
+                "frontier discovery batch must belong to one observation"
+            )
+        if not ordered_targets and not ordered_provenance:
+            return {"target_count": 0, "provenance_count": 0}
+
+        with self._transaction() as cursor:
+            for target in ordered_targets:
+                self.upsert_frontier_target(target, _cursor=cursor)
+            for edge in ordered_provenance:
+                self.record_frontier_provenance(edge, _cursor=cursor)
+        return {
+            "target_count": len(ordered_targets),
+            "provenance_count": len(ordered_provenance),
+        }
 
     def list_frontier_provenance(
         self,
