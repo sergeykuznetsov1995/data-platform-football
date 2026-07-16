@@ -1368,6 +1368,62 @@ def test_fetch_wave_reserves_budget_and_commits_raw_before_control(tmp_path):
     assert control.claim_calls[0]["lease_seconds"] == FETCH_LEASE_SECONDS
 
 
+def test_browser_failure_advances_throttle_before_the_next_clearance(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+
+    class BrowserFailureFetcher:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def ensure_clearance(self):
+            control.events.append("browser_failure")
+            raise FetchError(
+                "browser export failed",
+                error_class="clearance_failed",
+                browser_requests=1,
+                browser_bootstrap_attempts=1,
+            )
+
+    fetchers = iter(
+        (
+            BrowserFailureFetcher(),
+            FakeFetcher(control.events, b"<html>ok</html>"),
+        )
+    )
+    sleeps = []
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=lambda *_: next(fetchers),
+        sleep=lambda seconds: sleeps.append(seconds),
+        clock=lambda: NOW,
+    )
+
+    result = pipeline.fetch_wave(
+        str(uuid.UUID(int=1)),
+        worker_id="worker-1",
+        page_kinds=["competition_index"],
+        settings=_settings(),
+    )
+
+    assert result.fetched == 1
+    throttles = [
+        index
+        for index, event in enumerate(control.events)
+        if event == "throttle"
+    ]
+    assert len(throttles) == 5
+    assert control.events.index("browser_failure") < throttles[1]
+    assert throttles[1] < throttles[2] < control.events.index("browser")
+    assert control.events.index("browser") < throttles[3] < throttles[4]
+    assert sleeps == []
+
+
 def test_browser_bootstrap_and_warm_targets_have_separate_rate_slots(tmp_path):
     raw = _raw_store(tmp_path)
     control = FakeControl(raw)
@@ -1420,17 +1476,12 @@ def test_browser_bootstrap_and_warm_targets_have_separate_rate_slots(tmp_path):
         index for index, event in enumerate(control.events) if event == "http"
     ]
     browser = control.events.index("browser")
-    delay = control.events.index(
-        f"sleep:{DEFAULT_DOMAIN_INTERVAL_SECONDS}"
-    )
-    assert len(throttles) == 3
+    assert len(throttles) == 4
     assert len(requests) == 2
-    assert throttles[0] < browser < delay < throttles[1] < requests[0]
-    assert requests[0] < throttles[2] < requests[1]
+    assert throttles[0] < browser < throttles[1] < throttles[2]
+    assert throttles[2] < requests[0] < throttles[3] < requests[1]
     assert control.events.count("browser") == 1
-    assert control.events.count(
-        f"sleep:{DEFAULT_DOMAIN_INTERVAL_SECONDS}"
-    ) == 1
+    assert not any(event.startswith("sleep:") for event in control.events)
 
 
 def test_fetch_wave_settles_exact_provider_bytes_not_geoip_reserve(tmp_path):
@@ -1493,6 +1544,10 @@ def test_fetch_wave_persists_retry_failure_evidence_and_exact_request_count(
 
     assert control.reservations[0][1]["requests"] == 22
     assert control.settlements[0][1]["requests_used"] == 5
+    assert control.events.count("throttle") == 4
+    assert control.events.index("http") < control.events.index(
+        "throttle", control.events.index("http") + 1
+    )
     assert control.run["requests_used"] == 5
     assert control.session_metrics[0][1]["http_requests"] == 2
     assert control.session_metrics[0][1]["browser_bootstrap_requests"] == 3
