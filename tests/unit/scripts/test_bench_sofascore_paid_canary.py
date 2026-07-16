@@ -382,8 +382,9 @@ def test_shipped_candidate_has_exact_required_v3_classes_and_shapes():
         for item in registry["tournaments"]
         if item["enabled"]
     }
-    # Wave 1 (#951): the top-5 club leagues plus the two measured tournaments.
-    assert enabled_ids == {8, 16, 17, 23, 34, 35}
+    # Wave 1 (#951): the top-5 club leagues plus the two measured tournaments,
+    # extended with the Russian Premier League (t203) by the owner's decision.
+    assert enabled_ids == {8, 16, 17, 23, 34, 35, 203}
     # Only t16/t17 carry paid canary samples; the other enabled leagues rely on
     # the by-shape transfer rule, which needs at least two measured tournaments.
     assert len(MEASURED_TOURNAMENT_IDS) >= MIN_MEASURED_TOURNAMENTS_FOR_TRANSFER
