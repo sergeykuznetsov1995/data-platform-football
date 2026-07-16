@@ -2891,6 +2891,57 @@ def _make_fbref_lease(mod, mgr, *, max_bytes=1000):
     )
 
 
+def test_fbref_absolute_http_replaces_browser_lease_auth_with_provider_auth(
+    mod, monkeypatch
+):
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+    lease = _make_fbref_lease(mod, mgr)
+    client_auth = base64.b64encode(f"lease:{lease.token}".encode()).decode()
+    provider_auth = base64.b64encode(b"u:p").decode()
+    target = "http://www.fbref.com/en/"
+    upstream_reader = _FakeUpstreamReader(
+        b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n"
+    )
+    upstream_writer = _FakeUpstreamWriter()
+
+    async def fake_open(host, port):
+        assert (host, port) == ("pool.invalid", 10000)
+        return upstream_reader, upstream_writer
+
+    monkeypatch.setattr(mod, "_open_upstream_connection", fake_open)
+    client_writer = _ClientWriter()
+    asyncio.run(
+        mod.handle(
+            _ClientConnectReader(
+                [
+                    f"GET {target} HTTP/1.1\r\n".encode(),
+                    b"Host: www.fbref.com\r\n",
+                    b"User-Agent: browser-test\r\n",
+                    f"Proxy-Authorization: Basic {client_auth}\r\n".encode(),
+                    b"\r\n",
+                ]
+            ),
+            client_writer,
+            mgr,
+            require_lease=True,
+        )
+    )
+
+    forwarded = bytes(upstream_writer.data)
+    assert forwarded == (
+        f"GET {target} HTTP/1.1\r\n".encode()
+        + b"Host: www.fbref.com\r\n"
+        + b"User-Agent: browser-test\r\n"
+        + f"Proxy-Authorization: Basic {provider_auth}\r\n\r\n".encode()
+    )
+    assert forwarded.count(b"Proxy-Authorization:") == 1
+    assert client_auth.encode() not in forwarded
+    assert lease.token.encode() not in forwarded
+    assert b"lease:" not in forwarded
+    assert lease.active_tunnels == 0
+    assert lease.tunnel_writers == set()
+
+
 def test_fbref_drained_lease_extension_is_durable_before_cap_mutation(mod):
     mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
     lease = _make_fbref_lease(mod, mgr)

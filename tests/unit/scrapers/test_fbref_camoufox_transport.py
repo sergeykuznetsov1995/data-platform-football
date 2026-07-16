@@ -1,5 +1,6 @@
 """Network-free tests for the single FBref Camoufox clearance transport."""
 
+import base64
 import threading
 from unittest.mock import MagicMock, call as mock_call
 
@@ -70,6 +71,7 @@ def test_metered_browser_disables_every_pre_route_network_api():
     assert FIREFOX_METERED_NETWORK_PREFS == {
         "media.peerconnection.enabled": False,
         "network.http.redirection-limit": 0,
+        "network.proxy.failover_direct": False,
         "network.http.speculative-parallel-limit": 0,
         "network.preconnect": False,
         "network.early-hints.enabled": False,
@@ -1377,6 +1379,77 @@ def test_browser_start_watchdog_is_disarmed_once_the_browser_is_up(monkeypatch):
     assert timers[0].interval == transport.BROWSER_START_TIMEOUT_S
 
 
+def test_proxy_authorization_header_requires_explicit_lease_client_flag():
+    transport = CamoufoxFbrefTransport(
+        proxy={
+            "server": "http://untrusted-proxy:8900",
+            "username": "lease",
+            "password": "secret-token",
+        },
+        geoip=False,
+    )
+    transport._proxy = transport._proxy_provider()
+
+    assert transport._proxy_authorization_header() is None
+
+
+@pytest.mark.parametrize(
+    "proxy",
+    [
+        {},
+        {"username": "lease", "password": "secret-token"},
+        {
+            "server": "",
+            "username": "lease",
+            "password": "secret-token",
+        },
+        {
+            "server": "http://fbref_proxy_filter:8900",
+            "username": "other",
+            "password": "token",
+        },
+        {
+            "server": "http://fbref_proxy_filter:8900",
+            "username": "lease",
+            "password": "",
+        },
+        {
+            "server": "http://fbref_proxy_filter:8900",
+            "username": "lease",
+            "password": "токен",
+        },
+        {
+            "server": "http://fbref_proxy_filter:8900",
+            "username": "lease",
+            "password": "x" * 513,
+        },
+    ],
+)
+def test_preemptive_proxy_auth_rejects_bad_lease_before_network(proxy):
+    resolver = MagicMock(return_value="203.0.113.9")
+    transport = CamoufoxFbrefTransport(
+        proxy=proxy,
+        max_network_requests=10,
+        geoip_resolver=resolver,
+        geoip_database_check=lambda: None,
+        preemptive_proxy_auth=True,
+    )
+
+    with pytest.raises(
+        RuntimeError, match="paid proxy credential is invalid"
+    ) as raised:
+        transport._start()
+
+    resolver.assert_not_called()
+    secret = str(proxy.get("password") or "")
+    if secret:
+        assert secret not in str(raised.value)
+    stats = transport.traffic_stats()
+    assert stats["real_requests_count"] == 0
+    assert stats["network_policy_failed"] is True
+    assert stats["network_policy_failure"] == "invalid_proxy_credential"
+
+
 def test_geoip_resolver_is_one_bounded_attempt_without_redirects(monkeypatch):
     import requests
 
@@ -1565,6 +1638,7 @@ def test_each_start_preadmits_geoip_and_disables_automatic_redirects(
         max_network_requests=10,
         geoip_resolver=resolver,
         geoip_database_check=lambda: None,
+        preemptive_proxy_auth=True,
     )
 
     transport._start()
@@ -1584,13 +1658,20 @@ def test_each_start_preadmits_geoip_and_disables_automatic_redirects(
         assert call.kwargs["firefox_user_prefs"] == (
             FIREFOX_METERED_NETWORK_PREFS
         )
+    expected_proxy_authorization = "Basic " + base64.b64encode(
+        b"lease:lease-token"
+    ).decode("ascii")
     assert all(
         call.kwargs == {
             "service_workers": "block",
             "bypass_csp": True,
+            "extra_http_headers": {
+                "Proxy-Authorization": expected_proxy_authorization,
+            },
         }
         for call in browser.new_context.call_args_list
     )
+    assert "lease-token" not in repr(browser.new_context.call_args_list)
     assert context.add_init_script.call_count == 2
     assert all(
         call.kwargs == {"script": NETWORK_API_BLOCK_INIT_SCRIPT}

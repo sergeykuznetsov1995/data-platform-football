@@ -114,7 +114,14 @@ def _fetcher(client) -> FBrefFetcher:
         "username": "lease",
         "password": "secret-token",
     }
+    assert fetcher._transport._preemptive_proxy_auth is True
     return fetcher
+
+
+def test_unmetered_fetcher_does_not_enable_preemptive_proxy_auth():
+    fetcher = FBrefFetcher()
+
+    assert fetcher._transport._preemptive_proxy_auth is False
 
 
 def test_paid_fetch_uses_authoritative_provider_delta_and_drains_tunnel():
