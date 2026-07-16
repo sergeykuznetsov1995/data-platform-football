@@ -141,6 +141,10 @@ class TestFBrefCurrentTopology:
         )
         assert freshness.op_kwargs["fail_fast"] is True
         assert freshness.upstream_task_ids == {"choose_publication_path"}
+        assert tasks["choose_publication_path"].downstream_task_ids == {
+            "validate_canary_run",
+            "validate_current_scope_freshness",
+        }
         assert tasks["validate_canary_run"].upstream_task_ids == {
             "choose_publication_path"
         }

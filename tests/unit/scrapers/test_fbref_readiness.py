@@ -116,7 +116,11 @@ def _meter_payload(**changes):
         "lease_proxy_url": "http://fbref_proxy_filter:8900",
         "configured_pool_count": 4,
         "fbref_source_ready": True,
-        "fbref_dag_ids": ["dag_backfill_fbref", "dag_ingest_fbref"],
+        "fbref_dag_ids": [
+            "dag_backfill_fbref",
+            "dag_bootstrap_fbref",
+            "dag_ingest_fbref",
+        ],
     }
     payload.update(changes)
     return payload

@@ -12,6 +12,9 @@ Architecture:
     Triggered by dag_master_pipeline (or manual trigger)
         |
         v
+    validate_publication_scope — reject non-publishing source before writes
+        |
+        v
     TaskGroup: silver_transforms (7 SEQUENTIAL tasks, max_active_tasks=1)
         ├── player_season_profile  — wide player profile per season
         ├── keeper_profile         — goalkeeper profile per season
@@ -166,6 +169,17 @@ OPTIONAL_BRONZE_TABLES = {
 # ---------------------------------------------------------------------------
 # Task callables
 # ---------------------------------------------------------------------------
+
+def _validate_fbref_publication_preflight(**context) -> Dict[str, Any]:
+    """Reject non-publishing or incomplete source runs before any write."""
+
+    from utils.fbref_pipeline_tasks import validate_fbref_publication_scope
+    from utils.silver_tasks import fbref_control_run_id_from_context
+
+    return validate_fbref_publication_scope(
+        control_run_id=fbref_control_run_id_from_context(context)
+    )
+
 
 def _run_transform(sql_file: str, table_name: str, **context) -> Dict[str, Any]:
     """
@@ -805,10 +819,16 @@ with DAG(
     ### Manual Trigger
 
     ```bash
-    airflow dags trigger dag_transform_fbref_silver
+    airflow dags trigger dag_transform_fbref_silver \
+      --conf '{"fbref_control_run_id":"<succeeded-publishing-control-uuid>"}'
     ```
     """,
 ) as dag:
+
+    validate_publication_scope = PythonOperator(
+        task_id='validate_publication_scope',
+        python_callable=_validate_fbref_publication_preflight,
+    )
 
     ensure_source_identity_columns = PythonOperator(
         task_id='ensure_source_identity_columns',
@@ -860,5 +880,6 @@ with DAG(
     # =========================================================================
     # Dependencies
     # =========================================================================
+    validate_publication_scope >> ensure_source_identity_columns
     ensure_source_identity_columns >> transforms_group
     transforms_group >> validate_silver >> validate_quality

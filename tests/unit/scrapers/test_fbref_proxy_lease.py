@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from scrapers.fbref.proxy_lease import (
+    FBREF_DAG_IDS,
     FBrefProxyLeaseClient,
     FBrefProxyLeaseError,
     METER_ID,
@@ -96,6 +97,27 @@ def test_acquire_never_returns_upstream_credentials_to_the_fetcher():
     _, _, request = session.calls[0]
     assert request["headers"] == {"X-Proxy-Control-Token": TOKEN}
     assert request["json"]["source"] == "fbref"
+
+
+def test_paid_fbref_dag_allowlist_is_exact_and_bootstrap_can_acquire():
+    assert FBREF_DAG_IDS == frozenset(
+        {
+            "dag_ingest_fbref",
+            "dag_bootstrap_fbref",
+            "dag_backfill_fbref",
+        }
+    )
+    session = _Session([_Response(201, _lease_body())])
+    client = FBrefProxyLeaseClient(
+        "http://fbref_proxy_filter:8899",
+        control_token=TOKEN,
+        session=session,
+    )
+
+    context = {**CONTEXT, "dag_id": "dag_bootstrap_fbref"}
+    client.acquire(max_bytes=1000, ttl_seconds=7200, metadata=context)
+
+    assert session.calls[0][2]["json"]["dag_id"] == "dag_bootstrap_fbref"
 
 
 def test_internal_control_session_ignores_ambient_http_proxy():

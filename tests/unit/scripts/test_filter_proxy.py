@@ -306,7 +306,15 @@ def test_fbref_has_an_isolated_metered_proxy_service():
 
 
 def test_fbref_lease_is_scoped_metered_and_host_restricted(mod):
+    assert mod.FBREF_DAG_IDS == frozenset(
+        {
+            "dag_ingest_fbref",
+            "dag_bootstrap_fbref",
+            "dag_backfill_fbref",
+        }
+    )
     assert mod._source_for_dag("dag_ingest_fbref") == "fbref"
+    assert mod._source_for_dag("dag_bootstrap_fbref") == "fbref"
     assert mod._source_for_dag("dag_backfill_fbref") == "fbref"
     lease = mod.Lease(
         lease_id="fbref-lease",

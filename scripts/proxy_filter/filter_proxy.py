@@ -109,7 +109,13 @@ TRANSFERMARKT_DAG_IDS = frozenset(
         "dag_discover_transfermarkt_registry",
     }
 )
-FBREF_DAG_IDS = frozenset({"dag_ingest_fbref", "dag_backfill_fbref"})
+FBREF_DAG_IDS = frozenset(
+    {
+        "dag_ingest_fbref",
+        "dag_bootstrap_fbref",
+        "dag_backfill_fbref",
+    }
+)
 SOFASCORE_DAG_IDS = frozenset({"dag_ingest_sofascore"})
 SOFASCORE_CANARY_DAG_IDS = frozenset({"dag_canary_sofascore_proxy"})
 # Registry discovery is a non-signed, metered JSON scan of the public catalog.

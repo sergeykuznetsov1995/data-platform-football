@@ -89,3 +89,41 @@ The durable provider ledger is
 `logs/fbref/proxy_filter/paid_requests.jsonl`; the aggregate report is
 `logs/fbref/proxy_filter/bytes.json`. These files contain counters and hashed
 upstream identifiers, not proxy credentials.
+
+## Manual non-publishing bootstrap
+
+Use this mode only to advance the durable current-scope queue while production
+freshness is still being established. It performs the normal raw-first
+recovery, paid fetch, parse, and raw-integrity audit, but it cannot run the
+freshness gate, export a publication scope, or trigger Silver.
+
+```bash
+airflow dags unpause dag_bootstrap_fbref
+airflow dags trigger dag_bootstrap_fbref
+```
+
+`dag_bootstrap_fbref` has `schedule=None`, so it is safe to leave unpaused: it
+can create only an explicitly triggered manual DagRun. Its tasks contain
+literal `200 requests / 100 MiB / shard 25` limits and literal
+`bootstrap_only=true`; DagRun conf cannot change them. The scheduled
+`dag_ingest_fbref` keeps its original daily schedule, parameters, and
+publishing default. The existing `100/50` canary remains a separate path.
+
+A successful bootstrap has these three pieces of evidence:
+
+1. Airflow task `validate_bootstrap_run` returns the deterministic control run
+   ID, `execution_mode=bootstrap_only`, `publication_eligible=false`, and the
+   validation summary.
+2. `fbref_control.crawl_run.metadata` stores the same mode and publication
+   flag, and the control run status is `succeeded`.
+3. `release_bootstrap_publication_lock` succeeds, followed by the common
+   `release_publication_lock` finalizer. No `export_publication_scope` or
+   `trigger_silver_transform` task may run.
+
+The finalizer always attempts an exact idempotent lock release, then requires
+all ten earlier bootstrap tasks (including the direct release task) to be
+`success`. If live fetch, audit, validation, or release failed, the lock is
+cleaned but the finalizer raises, so Airflow keeps the DagRun red. The
+control-run mode also blocks publication-scope export, replay-source
+selection, and the first Silver preflight. Start a normal production DagRun
+after freshness is complete.

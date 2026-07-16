@@ -2832,6 +2832,9 @@ def _accepted_replay_source(source_run_id, *, run_type="current"):
         "request_limit": 200,
         "byte_limit": 100 * 1024 * 1024,
         "metadata": {
+            "execution_mode": "publishing",
+            "bootstrap_only": False,
+            "publication_eligible": True,
             "raw_audit": {
                 "schema_version": "fbref-raw-audit-anchor-v1",
                 "status": "passed",
@@ -2854,8 +2857,16 @@ def _accepted_replay_source(source_run_id, *, run_type="current"):
             "replay_source_run_not_production_profile",
         ),
         (
-            lambda run: run.update(metadata={}),
+            lambda run: run["metadata"].pop("raw_audit"),
             "replay_source_raw_audit_missing",
+        ),
+        (
+            lambda run: run["metadata"].update(
+                publication_eligible=False,
+                execution_mode="bootstrap_only",
+                bootstrap_only=True,
+            ),
+            "replay_source_run_not_publication_eligible",
         ),
         (
             lambda run: run["metadata"]["raw_audit"].update(
@@ -2883,6 +2894,22 @@ def test_replay_parse_rejects_unaccepted_source_evidence(
             page_kinds=["match"],
             settings=_settings("replay"),
         )
+
+
+def test_replay_accepts_legacy_audited_production_source_without_mode_metadata(
+    tmp_path,
+):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    source_run_id = str(uuid.uuid4())
+    source_run = _accepted_replay_source(source_run_id)
+    source_run["metadata"].pop("execution_mode")
+    source_run["metadata"].pop("bootstrap_only")
+    source_run["metadata"].pop("publication_eligible")
+    control.get_run = lambda _: source_run
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    assert pipeline._replay_source_error(source_run_id) is None
 
 
 def test_replay_validation_rejects_missing_source_run(tmp_path):
@@ -3448,6 +3475,7 @@ def test_initialize_run_reaps_leases_left_by_dead_workers(tmp_path):
         def __init__(self, raw_store):
             super().__init__(raw_store)
             self.reaped = 0
+            self.created_kwargs = None
 
         def migrate(self):
             self.events.append("migrate")
@@ -3459,6 +3487,7 @@ def test_initialize_run_reaps_leases_left_by_dead_workers(tmp_path):
 
         def create_run(self, run_type, **kwargs):
             self.events.append("create_run")
+            self.created_kwargs = kwargs
 
         def start_run(self, run_id):
             self.events.append("start_run")
@@ -3471,10 +3500,20 @@ def test_initialize_run_reaps_leases_left_by_dead_workers(tmp_path):
         airflow_run_id="scheduled__2026-07-12T06:00:00+00:00",
         dag_id="dag_ingest_fbref",
         settings=_settings(),
+        execution_metadata={
+            "execution_mode": "bootstrap_only",
+            "bootstrap_only": True,
+            "publication_eligible": False,
+        },
     )
 
     assert control.reaped == 1
     assert control.events.index("reap") < control.events.index("create_run")
+    assert control.created_kwargs["metadata"]["execution_mode"] == (
+        "bootstrap_only"
+    )
+    assert control.created_kwargs["metadata"]["bootstrap_only"] is True
+    assert control.created_kwargs["metadata"]["publication_eligible"] is False
     assert uuid.UUID(run_id)
 
 

@@ -98,6 +98,19 @@ FBREF_PRODUCTION_BYTE_LIMIT_MB = 100
 FBREF_CANARY_REQUEST_LIMIT = 100
 FBREF_CANARY_BYTE_LIMIT_MB = 50
 FBREF_MAX_WARM_SESSION_TARGETS = 25
+FBREF_BOOTSTRAP_DAG_ID = "dag_bootstrap_fbref"
+FBREF_BOOTSTRAP_REQUIRED_TASK_IDS = (
+    "validate_production_readiness",
+    "initialize_run",
+    "acquire_publication_lock",
+    "seed_competition_index",
+    "capture_raw_baseline",
+    "recover_raw_before_fetch",
+    "run_live_waves",
+    "audit_raw_integrity",
+    "validate_bootstrap_run",
+    "release_bootstrap_publication_lock",
+)
 FBREF_PUBLICATION_SCOPE_TABLE = "fbref_target_scope"
 FBREF_PUBLICATION_LOCK_TTL_SECONDS = 8 * 24 * 60 * 60
 FBREF_LIVE_BUDGET_PROFILES = {
@@ -256,6 +269,8 @@ def validate_fbref_production_readiness(
     request_limit,
     byte_limit_mb,
     shard_size,
+    bootstrap_only=False,
+    dag_run_type=None,
 ) -> dict:
     """Fail closed on every production dependency before creating a run."""
 
@@ -271,13 +286,31 @@ def validate_fbref_production_readiness(
         validate_raw_store_uri,
     )
 
-    alert = validate_alert_environment("prod")
     limits = validate_fbref_runtime_limits(
         run_type=run_type,
         request_limit=request_limit,
         byte_limit_mb=byte_limit_mb,
         shard_size=shard_size,
     )
+    if limits["run_type"] == "current":
+        execution = validate_fbref_current_execution_mode(
+            bootstrap_only=bootstrap_only,
+            dag_run_type=dag_run_type,
+            request_limit=request_limit,
+            byte_limit_mb=byte_limit_mb,
+            shard_size=shard_size,
+        )
+    else:
+        if _boolean_parameter(bootstrap_only, name="bootstrap_only"):
+            raise ValueError(
+                "FBref bootstrap_only is supported only for current runs"
+            )
+        execution = {
+            "bootstrap_only": False,
+            "execution_mode": limits["run_type"],
+            "publication_eligible": True,
+        }
+    alert = validate_alert_environment("prod")
     raw_uri = validate_raw_store_uri(os.environ.get("FBREF_RAW_STORE_URI"))
     migrations = _control_store().validate_migrations()
     raw_store = RawPageStore.from_uri(raw_uri)
@@ -298,6 +331,7 @@ def validate_fbref_production_readiness(
     return {
         **alert,
         **limits,
+        **execution,
         **proxy,
         "dependencies": {
             "control_migrations": migrations,
@@ -318,6 +352,64 @@ def _boolean_parameter(value, *, name: str) -> bool:
     if normalized in {"false", "0", "no"}:
         return False
     raise ValueError(f"{name} must be a boolean")
+
+
+def validate_fbref_current_execution_mode(
+    *,
+    bootstrap_only=False,
+    dag_run_type=None,
+    request_limit=FBREF_PRODUCTION_REQUEST_LIMIT,
+    byte_limit_mb=FBREF_PRODUCTION_BYTE_LIMIT_MB,
+    shard_size=FBREF_MAX_WARM_SESSION_TARGETS,
+) -> dict:
+    """Resolve publishing, canary, or explicit manual bootstrap mode.
+
+    ``bootstrap_only`` is deliberately stricter than the existing canary: it
+    may run only from a manual DagRun and only with the exact measured
+    production profile.  This check is repeated at every Airflow branch that
+    could otherwise select a publishing task.
+    """
+
+    limits = validate_fbref_runtime_limits(
+        run_type="current",
+        request_limit=request_limit,
+        byte_limit_mb=byte_limit_mb,
+        shard_size=shard_size,
+    )
+    enabled = _boolean_parameter(bootstrap_only, name="bootstrap_only")
+    normalized_dag_run_type = (
+        None
+        if dag_run_type is None
+        else str(dag_run_type).strip().casefold()
+    )
+    if enabled:
+        if normalized_dag_run_type != "manual":
+            raise ValueError(
+                "FBref bootstrap_only requires a manual DagRun"
+            )
+        if (
+            limits["profile"] != "production"
+            or limits["shard_size"] != FBREF_MAX_WARM_SESSION_TARGETS
+        ):
+            raise ValueError(
+                "FBref bootstrap_only requires exactly 200 requests, "
+                "100 MiB, and shard_size 25"
+            )
+        execution_mode = "bootstrap_only"
+        publication_eligible = False
+    elif limits["profile"] == "canary":
+        execution_mode = "canary_nonpublishing"
+        publication_eligible = False
+    else:
+        execution_mode = "publishing"
+        publication_eligible = True
+    return {
+        **limits,
+        "bootstrap_only": enabled,
+        "dag_run_type": normalized_dag_run_type,
+        "execution_mode": execution_mode,
+        "publication_eligible": publication_eligible,
+    }
 
 
 def choose_fbref_backfill_mode(*, dry_run) -> str:
@@ -380,6 +472,30 @@ def plan_fbref_backfill(
     return result
 
 
+def _require_fbref_publication_mode(run: Mapping[str, object]) -> None:
+    """Physically fence explicit non-publishing runs from publication."""
+
+    metadata = run.get("metadata")
+    if not isinstance(metadata, Mapping):
+        # Runs created before execution-mode evidence was introduced have no
+        # such marker. Their existing publication contract remains unchanged.
+        return
+    execution_mode = str(metadata.get("execution_mode") or "").casefold()
+    explicitly_ineligible = (
+        "publication_eligible" in metadata
+        and metadata.get("publication_eligible") is not True
+    )
+    if (
+        explicitly_ineligible
+        or metadata.get("bootstrap_only") is True
+        or execution_mode in {"bootstrap_only", "canary_nonpublishing"}
+    ):
+        raise RuntimeError(
+            "FBref control run is explicitly non-publishing "
+            f"(execution_mode={execution_mode or 'unknown'})"
+        )
+
+
 def export_fbref_publication_scope(
     *, airflow_run_id: str, dag_id: str
 ) -> dict:
@@ -389,6 +505,10 @@ def export_fbref_publication_scope(
         airflow_run_id=airflow_run_id, dag_id=dag_id
     )
     control = _control_store()
+    run = control.get_run(control_run_id)
+    if run is None:
+        raise RuntimeError("FBref publication control run is missing")
+    _require_fbref_publication_mode(run)
     with control.guard_publication_lock(control_run_id, source="fbref"):
         return _export_fbref_publication_scope_under_guard(
             control=control,
@@ -591,6 +711,7 @@ def validate_fbref_publication_scope(*, control_run_id: str) -> dict:
         raise RuntimeError(
             "FBref publication scope requires a succeeded control run"
         )
+    _require_fbref_publication_mode(run)
     rows = TrinoTableManager().execute_query(
         "SELECT count(*), count_if(eligible_male), "
         "count(DISTINCT scope_hash), min(scope_hash), "
@@ -656,6 +777,7 @@ def validate_fbref_current_scope_freshness(
     )
     if summary is None:
         raise RuntimeError("FBref freshness gate cannot find its control run")
+    _require_fbref_publication_mode(summary)
 
     aggregate = summary.get("publication_scope_freshness")
     if not isinstance(aggregate, Mapping):
@@ -1140,6 +1262,8 @@ def initialize_fbref_run(
     shard_size=DEFAULT_SHARD_SIZE,
     reservation_mb=DEFAULT_REQUEST_RESERVATION_BYTES // MIB,
     domain_interval_seconds=3.0,
+    bootstrap_only=False,
+    dag_run_type=None,
 ) -> str:
     settings = _settings(
         run_type=run_type,
@@ -1149,12 +1273,49 @@ def initialize_fbref_run(
         reservation_mb=reservation_mb,
         domain_interval_seconds=domain_interval_seconds,
     )
+    normalized_run_type = str(run_type).strip().casefold()
+    if normalized_run_type == "current":
+        execution = validate_fbref_current_execution_mode(
+            bootstrap_only=bootstrap_only,
+            dag_run_type=dag_run_type,
+            request_limit=request_limit,
+            byte_limit_mb=byte_limit_mb,
+            shard_size=shard_size,
+        )
+    else:
+        if _boolean_parameter(bootstrap_only, name="bootstrap_only"):
+            raise ValueError(
+                "FBref bootstrap_only is supported only for current runs"
+            )
+        execution = {
+            "bootstrap_only": False,
+            "dag_run_type": (
+                None
+                if dag_run_type is None
+                else str(dag_run_type).strip().casefold()
+            ),
+            "execution_mode": normalized_run_type,
+            "publication_eligible": True,
+        }
+    control_execution = {
+        "bootstrap_only": execution["bootstrap_only"],
+        "dag_run_type": execution.get("dag_run_type"),
+        "execution_mode": execution["execution_mode"],
+        "publication_eligible": execution["publication_eligible"],
+        "runtime_profile": execution.get("profile", normalized_run_type),
+    }
     run_id = _pipeline().initialize_run(
         airflow_run_id=airflow_run_id,
         dag_id=dag_id,
         settings=settings,
+        execution_metadata=control_execution,
     )
-    logger.info("FBref control run initialized: %s (%s)", run_id, run_type)
+    logger.info(
+        "FBref control run initialized: %s (%s, mode=%s)",
+        run_id,
+        run_type,
+        execution["execution_mode"],
+    )
     return run_id
 
 
@@ -1210,9 +1371,13 @@ def release_fbref_publication_lock(
 
 
 def finalize_fbref_publication_lock(
-    *, airflow_run_id: str, dag_id: str, **context
+    *,
+    airflow_run_id: str,
+    dag_id: str,
+    bootstrap_only=False,
+    **context,
 ) -> dict:
-    """Release after terminal canary or Silver success; fail closed otherwise."""
+    """Release exact locks while preserving an honest terminal DAG verdict."""
 
     from airflow.exceptions import AirflowException
 
@@ -1228,6 +1393,35 @@ def finalize_fbref_publication_lock(
     }
     acquire_state = states.get("acquire_publication_lock", "missing")
     plan_state = states.get("plan_backfill", "missing")
+    bootstrap_mode = _boolean_parameter(
+        bootstrap_only, name="bootstrap_only"
+    )
+    if bootstrap_mode:
+        if str(dag_id) != FBREF_BOOTSTRAP_DAG_ID:
+            raise AirflowException(
+                "FBref bootstrap finalizer is allowed only for "
+                f"{FBREF_BOOTSTRAP_DAG_ID}"
+            )
+        released = release_fbref_publication_lock(
+            airflow_run_id=airflow_run_id, dag_id=dag_id
+        )
+        failed_states = {
+            task_id: states.get(task_id, "missing")
+            for task_id in FBREF_BOOTSTRAP_REQUIRED_TASK_IDS
+            if states.get(task_id, "missing") != "success"
+        }
+        if failed_states:
+            raise AirflowException(
+                "FBref bootstrap lock was released, but its source verdict "
+                "is red: "
+                + json.dumps(failed_states, sort_keys=True)
+            )
+        return {
+            **released,
+            "bootstrap_only": True,
+            "status": "released_after_successful_bootstrap",
+        }
+
     canary_release_state = states.get(
         "release_canary_publication_lock", "missing"
     )
@@ -1236,21 +1430,23 @@ def finalize_fbref_publication_lock(
         acquire_state == "success"
         and canary_validation_state in {"success", "failed"}
     ):
-        if canary_release_state == "success":
+        if (
+            canary_validation_state == "success"
+            and canary_release_state == "success"
+        ):
             return {
                 "released": True,
                 "canary": True,
                 "status": "released_by_canary_path",
             }
-        released = release_fbref_publication_lock(
+        release_fbref_publication_lock(
             airflow_run_id=airflow_run_id, dag_id=dag_id
         )
-        return {
-            **released,
-            "canary": True,
-            "validation_state": canary_validation_state,
-            "status": "released_after_canary",
-        }
+        raise AirflowException(
+            "FBref canary lock was released, but its source verdict is red "
+            f"(validation={canary_validation_state}, "
+            f"release={canary_release_state})"
+        )
     if acquire_state == "skipped" and plan_state == "success":
         return {
             "released": False,
@@ -1796,6 +1992,96 @@ def validate_fbref_run(
     return summary
 
 
+def validate_fbref_bootstrap_run(
+    *,
+    airflow_run_id: str,
+    dag_id: str,
+    bootstrap_only,
+    dag_run_type,
+    request_limit,
+    byte_limit_mb,
+    shard_size,
+) -> dict:
+    """Validate and finish a bootstrap run without making it publishable."""
+
+    execution = validate_fbref_current_execution_mode(
+        bootstrap_only=bootstrap_only,
+        dag_run_type=dag_run_type,
+        request_limit=request_limit,
+        byte_limit_mb=byte_limit_mb,
+        shard_size=shard_size,
+    )
+    if execution["execution_mode"] != "bootstrap_only":
+        raise ValueError(
+            "validate_fbref_bootstrap_run requires bootstrap_only=true"
+        )
+    control_run_id = _control_run_id(
+        airflow_run_id=airflow_run_id, dag_id=dag_id
+    )
+    control = _control_store()
+    control_run = control.get_run(control_run_id)
+    _validate_fbref_bootstrap_control_evidence(
+        control_run, expected_status="running"
+    )
+    summary = validate_fbref_run(
+        airflow_run_id=airflow_run_id,
+        dag_id=dag_id,
+        publication_eligible=False,
+    )
+    control_run = control.get_run(control_run_id)
+    _validate_fbref_bootstrap_control_evidence(
+        control_run, expected_status="succeeded"
+    )
+    evidence = {
+        "control_run_id": control_run_id,
+        "control_status": "succeeded",
+        "execution_mode": "bootstrap_only",
+        "publication_eligible": False,
+        "runtime_profile": "production_200_requests_100_mib_shard_25",
+        "validation_summary": summary,
+    }
+    logger.info("FBref bootstrap evidence: %s", json.dumps(evidence, default=str))
+    return evidence
+
+
+def _validate_fbref_bootstrap_control_evidence(
+    control_run: Optional[Mapping[str, object]], *, expected_status: str
+) -> None:
+    """Prove bootstrap mode before finish and prove its terminal result."""
+
+    if control_run is None:
+        raise RuntimeError("FBref bootstrap control run evidence is missing")
+    metadata = control_run.get("metadata")
+    if not isinstance(metadata, Mapping):
+        raise RuntimeError("FBref bootstrap control metadata is missing")
+    try:
+        exact_profile = (
+            str(control_run.get("run_type") or "").casefold() == "current"
+            and int(control_run.get("request_limit"))
+            == FBREF_PRODUCTION_REQUEST_LIMIT
+            and int(control_run.get("byte_limit"))
+            == FBREF_PRODUCTION_BYTE_LIMIT_MB * MIB
+            and int(metadata.get("shard_size"))
+            == FBREF_MAX_WARM_SESSION_TARGETS
+        )
+    except (TypeError, ValueError):
+        exact_profile = False
+    if (
+        str(metadata.get("execution_mode") or "") != "bootstrap_only"
+        or metadata.get("bootstrap_only") is not True
+        or metadata.get("publication_eligible") is not False
+        or str(metadata.get("dag_run_type") or "") != "manual"
+        or str(metadata.get("runtime_profile") or "") != "production"
+        or not exact_profile
+        or str(control_run.get("status") or "").casefold()
+        != str(expected_status).casefold()
+    ):
+        raise RuntimeError(
+            "FBref bootstrap control evidence does not prove a "
+            f"non-publishing {expected_status} run"
+        )
+
+
 def choose_fbref_publication_path(
     *, request_limit: int, byte_limit_mb: int
 ) -> str:
@@ -1889,6 +2175,7 @@ __all__ = [
     "abort_fbref_run",
     "capture_fbref_raw_baseline",
     "choose_fbref_backfill_mode",
+    "choose_fbref_publication_path",
     "export_fbref_publication_scope",
     "finalize_fbref_publication_lock",
     "fbref_dag_failure_callback",
@@ -1900,6 +2187,8 @@ __all__ = [
     "run_recovery_wave",
     "seed_fbref_competition_index",
     "seed_fbref_historical_seasons",
+    "validate_fbref_bootstrap_run",
+    "validate_fbref_current_execution_mode",
     "validate_fbref_current_scope_freshness",
     "validate_fbref_production_readiness",
     "validate_fbref_publication_scope",

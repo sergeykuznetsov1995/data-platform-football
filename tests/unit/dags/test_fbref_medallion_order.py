@@ -12,9 +12,16 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
 
+# The scheduled ingest DAG is intentionally a thin Airflow discovery wrapper.
+# Its concrete operators live in the shared scheduled/bootstrap factory.
+_OPERATOR_SOURCE_BY_DAG_FILE = {
+    "dag_ingest_fbref.py": "utils/fbref_current_dag_factory.py",
+}
+
 
 def _operator_calls(filename: str, operator_name: str) -> list[dict[str, ast.AST]]:
-    tree = ast.parse((ROOT / "dags" / filename).read_text(encoding="utf-8"))
+    source = _OPERATOR_SOURCE_BY_DAG_FILE.get(filename, filename)
+    tree = ast.parse((ROOT / "dags" / source).read_text(encoding="utf-8"))
     calls = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
