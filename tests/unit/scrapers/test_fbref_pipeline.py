@@ -659,6 +659,51 @@ class FakeControl:
         self.events.append(f"finish:{succeeded}")
 
 
+class BudgetAwareFakeControl(FakeControl):
+    """Small in-memory copy of the control store's atomic budget ceiling."""
+
+    def __init__(self, raw_store=None):
+        super().__init__(raw_store)
+        self._open_budget_reservations = {}
+
+    def reserve_budget(self, *args, **kwargs):
+        requests = int(kwargs["requests"])
+        bytes_ = int(kwargs["bytes_"])
+        if (
+            self.run["requests_used"]
+            + self.run["requests_reserved"]
+            + requests
+            > self.run["request_limit"]
+            or self.run["bytes_used"]
+            + self.run["bytes_reserved"]
+            + bytes_
+            > self.run["byte_limit"]
+        ):
+            raise BudgetExceeded("fake run budget exhausted")
+        reservation_id = str(
+            uuid.UUID(int=500 + len(self.reservations))
+        )
+        self.events.append("reserve")
+        self.reservations.append((args, kwargs))
+        self.run["requests_reserved"] += requests
+        self.run["bytes_reserved"] += bytes_
+        self._open_budget_reservations[reservation_id] = (requests, bytes_)
+        return BudgetReservation(
+            reservation_id=reservation_id,
+            run_id=args[0],
+            logical_refresh_id=args[1],
+            requests_reserved=requests,
+            bytes_reserved=bytes_,
+            status="reserved",
+        )
+
+    def settle_budget(self, reservation_id, **kwargs):
+        requests, bytes_ = self._open_budget_reservations.pop(reservation_id)
+        self.run["requests_reserved"] -= requests
+        self.run["bytes_reserved"] -= bytes_
+        super().settle_budget(reservation_id, **kwargs)
+
+
 class FakeFetcher:
     def __init__(self, events, body, *, http_requests=1):
         self.events = events
@@ -3181,11 +3226,19 @@ def test_initialize_run_reaps_leases_left_by_dead_workers(tmp_path):
 class FakeClearanceRejectedFetcher:
     """A poisoned warm session that always rejects its target."""
 
-    def __init__(self, events, *, error_class="http_status", http_status=403):
+    def __init__(
+        self,
+        events,
+        *,
+        error_class="http_status",
+        http_status=403,
+        browser_requests=1,
+    ):
         self.events = events
         self.calls = 0
         self.error_class = error_class
         self.http_status = http_status
+        self.browser_requests = browser_requests
 
     def __enter__(self):
         self.events.append("fetcher_enter")
@@ -3204,7 +3257,7 @@ class FakeClearanceRejectedFetcher:
             wire_bytes=200,
             browser_document_bytes=500,
             browser_asset_bytes=100,
-            browser_requests=1,
+            browser_requests=self.browser_requests,
             browser_bootstrap_attempts=1,
             target_requests=1,
             http_status_history=(
@@ -3231,6 +3284,7 @@ def test_a_rejected_clearance_is_burned_instead_of_failing_every_target(
     proxy instead."""
     raw = _raw_store(tmp_path)
     control = FakeControl(raw)
+    control.run.update(request_limit=100, byte_limit=50 * 1024 * 1024)
     run_id = str(uuid.UUID(int=1))
 
     def lease(number, target_id, page_kind, canonical_url, source_ids):
@@ -3309,7 +3363,14 @@ def test_a_rejected_clearance_is_burned_instead_of_failing_every_target(
         run_id,
         worker_id="worker-1",
         page_kinds=["competition"],
-        settings=_settings(),
+        settings=PipelineSettings(
+            run_type="current",
+            request_limit=100,
+            byte_limit=50 * 1024 * 1024,
+            shard_size=4,
+            request_reservation_bytes=4 * 1024 * 1024,
+            domain_interval_seconds=0.01,
+        ),
     )
 
     # The exact first logical refresh is retried twice before the untouched
@@ -3624,7 +3685,12 @@ def test_session_refresh_exhaustion_requeues_untouched_without_false_failures(
     tmp_path,
 ):
     raw = _raw_store(tmp_path)
-    control = FakeControl(raw)
+    control = BudgetAwareFakeControl(raw)
+    control.run.update(
+        request_limit=120,
+        requests_used=35,
+        byte_limit=100 * 1024 * 1024,
+    )
     run_id = str(uuid.UUID(int=1))
 
     def make_lease(attempt, target, refresh, epoch):
@@ -3654,7 +3720,10 @@ def test_session_refresh_exhaustion_requeues_untouched_without_false_failures(
     def factory(*_):
         nonlocal factories
         factories += 1
-        return FakeClearanceRejectedFetcher(control.events)
+        return FakeClearanceRejectedFetcher(
+            control.events,
+            browser_requests=20,
+        )
 
     pipeline = FBrefPipeline(
         control,
@@ -3673,10 +3742,20 @@ def test_session_refresh_exhaustion_requeues_untouched_without_false_failures(
             run_id,
             worker_id="worker-1",
             page_kinds=["competition"],
-            settings=_settings(),
+            settings=PipelineSettings(
+                run_type="current",
+                request_limit=120,
+                byte_limit=100 * 1024 * 1024,
+                shard_size=4,
+                request_reservation_bytes=4 * 1024 * 1024,
+                domain_interval_seconds=0.01,
+            ),
         )
 
     assert factories == 3
+    assert control.run["requests_used"] == 98
+    assert control.run["requests_reserved"] == 0
+    assert len(control.reservations) == 3
     assert len(control.failed) == 3
     assert all(
         lease.logical_refresh_id == first.logical_refresh_id
@@ -3687,6 +3766,96 @@ def test_session_refresh_exhaustion_requeues_untouched_without_false_failures(
         lease.target_id == untouched.target_id
         for lease, _ in control.failed
     )
+
+
+@pytest.mark.parametrize("request_limit", [100, 119])
+def test_dead_clearance_at_budget_boundary_stops_cleanly(
+    tmp_path, request_limit
+):
+    """The live canary had 50 good pages, then a third 403 with only two
+    requests left. That is a clean budget boundary, not permission to open a
+    fourth browser and not a false refresh-exhaustion failure."""
+
+    raw = _raw_store(tmp_path)
+    control = BudgetAwareFakeControl(raw)
+    control.run.update(
+        request_limit=request_limit,
+        requests_used=35,
+        byte_limit=100 * 1024 * 1024,
+    )
+    run_id = str(uuid.UUID(int=1))
+
+    def make_lease(attempt, target, refresh, epoch):
+        return TargetLease(
+            attempt_id=str(uuid.UUID(int=attempt)),
+            run_id=run_id,
+            target_id=target,
+            logical_refresh_id=str(uuid.UUID(int=refresh)),
+            canonical_url="https://fbref.com/en/comps/9/history/x-Seasons",
+            page_kind="competition",
+            source_ids={"competition_id": "9"},
+            claim_token=str(uuid.UUID(int=attempt + 100)),
+            lease_epoch=epoch,
+            attempt_number=epoch,
+            leased_by="worker-1",
+            lease_expires_at=NOW + timedelta(minutes=10),
+        )
+
+    first = make_lease(171, "fbref:competition:9", 181, 1)
+    untouched = make_lease(172, "fbref:competition:12", 182, 1)
+    retry_one = make_lease(173, first.target_id, 181, 2)
+    retry_two = make_lease(174, first.target_id, 181, 3)
+    claims = iter(([first, untouched], [retry_one], [retry_two]))
+    control.claim_targets = lambda *args, **kwargs: next(claims)
+    factories = 0
+
+    def factory(*_):
+        nonlocal factories
+        factories += 1
+        return FakeClearanceRejectedFetcher(
+            control.events,
+            browser_requests=20,
+        )
+
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=factory,
+        sleep=lambda _: None,
+        clock=lambda: NOW,
+    )
+
+    result = pipeline.fetch_wave(
+        run_id,
+        worker_id="worker-1",
+        page_kinds=["competition"],
+        settings=PipelineSettings(
+            run_type="current",
+            request_limit=request_limit,
+            byte_limit=100 * 1024 * 1024,
+            shard_size=4,
+            request_reservation_bytes=4 * 1024 * 1024,
+            domain_interval_seconds=0.01,
+        ),
+    )
+
+    assert factories == 3
+    assert control.run["requests_used"] == 98
+    assert control.run["requests_reserved"] == 0
+    assert len(control.reservations) == 3
+    assert result.failures == []
+    assert result.budget_exhausted is True
+    assert result.requeued_at_budget == 2
+    assert result.requeued_session_exhaustion == 0
+    assert result.requeued_dead_clearance == 3
+    assert len(control.failed) == 3
+    assert control.failed[-1][1]["requeue"] is True
+    assert all(
+        lease.logical_refresh_id == first.logical_refresh_id
+        for lease, _ in control.failed
+    )
+    assert control.events.count(f"requeue:{untouched.target_id}") == 1
 
 
 def test_a_run_that_hits_its_budget_requeues_its_targets_and_ends_clean(tmp_path):

@@ -1316,11 +1316,11 @@ class FBrefPipeline:
                         break
                     if _session_failure(exc):
                         # The attempt is real traffic evidence, but the page
-                        # itself was never judged. Keep the same immutable
-                        # logical refresh claimable in this run and retry it
-                        # before any untouched member of the shard.
-                        self.control.retry_session_fetch(
-                            lease,
+                        # itself was never judged. Retry the same immutable
+                        # logical refresh when a full browser+HTTP reservation
+                        # still fits; otherwise return it at the clean budget
+                        # boundary before another paid session can start.
+                        retry_evidence = dict(
                             error_class=exc.error_class,
                             error_message=str(exc),
                             http_status=exc.http_status,
@@ -1334,6 +1334,78 @@ class FBrefPipeline:
                         )
                         live_session.clearance_refreshes += 1
                         result.requeued_dead_clearance += 1
+                        run_after_failure = self.control.get_run(run_id)
+                        if run_after_failure is None:
+                            raise PipelineError(
+                                f"Unknown control run {run_id}"
+                            )
+                        request_remaining = max(
+                            0,
+                            int(run_after_failure["request_limit"])
+                            - int(
+                                run_after_failure.get("requests_used") or 0
+                            )
+                            - int(
+                                run_after_failure.get("requests_reserved")
+                                or 0
+                            ),
+                        )
+                        byte_remaining = max(
+                            0,
+                            int(run_after_failure["byte_limit"])
+                            - int(run_after_failure.get("bytes_used") or 0)
+                            - int(
+                                run_after_failure.get("bytes_reserved") or 0
+                            ),
+                        )
+                        retry_fits_budget = wave_target_capacity(
+                            settings,
+                            request_remaining=request_remaining,
+                            byte_remaining=byte_remaining,
+                            bootstrap_required=True,
+                        ) > 0
+                        if retry_fits_budget:
+                            self.control.retry_session_fetch(
+                                lease,
+                                **retry_evidence,
+                            )
+                        else:
+                            # The rejected request is real evidence, but a new
+                            # browser+HTTP reservation no longer fits. This is
+                            # the same clean ceiling as reserve_budget raising
+                            # on an untouched target: return the page now,
+                            # before another proxy or browser can start.
+                            self.control.fail_fetch(
+                                lease,
+                                retry_delay_seconds=0,
+                                permanent=False,
+                                requeue=True,
+                                **retry_evidence,
+                            )
+                        if live_session.session_id is not None:
+                            self.control.close_clearance_session(
+                                live_session.session_id,
+                                status="failed",
+                            )
+                            live_session.session_id = None
+                        live_session.needs_clearance = True
+                        if not retry_fits_budget:
+                            untouched = leases[lease_index + 1:]
+                            returned = self.control.requeue_unfetched_targets(
+                                untouched
+                            )
+                            result.requeued_at_budget += 1 + returned
+                            result.budget_exhausted = True
+                            logger.warning(
+                                "FBref clearance failed (%s, HTTP %s), but "
+                                "the remaining run budget cannot fund another "
+                                "browser solve — %d target(s) returned for the "
+                                "next run",
+                                exc.error_class,
+                                exc.http_status,
+                                1 + returned,
+                            )
+                            break
                         logger.warning(
                             "FBref clearance failed (%s, HTTP %s) — "
                             "%s stays in this run and the session is being "
@@ -1344,12 +1416,6 @@ class FBrefPipeline:
                             live_session.clearance_refreshes,
                             MAX_CLEARANCE_REFRESHES,
                         )
-                        if live_session.session_id is not None:
-                            self.control.close_clearance_session(
-                                live_session.session_id,
-                                status="failed",
-                            )
-                            live_session.session_id = None
                         if (
                             live_session.clearance_refreshes
                             > MAX_CLEARANCE_REFRESHES
@@ -1377,7 +1443,6 @@ class FBrefPipeline:
                             live_session.stack.close()
                             live_session.stack = ExitStack()
                             live_session.fetcher = None
-                        live_session.needs_clearance = True
 
                         retry_leases = self.control.claim_targets(
                             run_id,
