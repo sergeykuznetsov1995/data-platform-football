@@ -20,7 +20,7 @@ This module wraps a warm Camoufox session:
 - rx+tx byte accounting from ``request.sizes()`` for the traffic guard
 
 Requirements (already in the image, do NOT bump):
-- camoufox 0.4.11 + ``python -m camoufox fetch``
+- camoufox 0.4.11 + pinned Camoufox 152.0.4-beta.26 binary
 - playwright < 1.60 (1.60 crashes Camoufox on page errors — camoufox#617)
 - a residential proxy (Turnstile 403s on a datacenter IP)
 """
@@ -28,16 +28,19 @@ Requirements (already in the image, do NOT bump):
 import asyncio
 import base64
 import ipaddress
-import json
 import logging
 import os
 import threading
 import time
 from collections import Counter
 from contextlib import contextmanager
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Literal, Optional, Union
 from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 
+from scrapers.fbref.browser_runtime import (
+    CAMOUFOX_FIREFOX_MAJOR,
+    EXECUTABLE_PATH,
+)
 from scrapers.fbref.constants import FBREF_UNCOMMENT_TABLES_JS
 
 logger = logging.getLogger(__name__)
@@ -78,6 +81,15 @@ _BLOCK_URL_SUBSTRINGS = (
 _CF_MARKERS = (
     "just a moment", "checking your browser", "cf-browser-verification",
     "challenge-running", "cf_chl_opt",
+)
+
+_HTTP_HANDOFF_HEADER_NAMES = (
+    "accept",
+    "accept-language",
+    "accept-encoding",
+    "sec-fetch-dest",
+    "sec-fetch-mode",
+    "sec-fetch-site",
 )
 
 # Every request reserves its full body ceiling in route() before transport.
@@ -128,6 +140,10 @@ FIREFOX_METERED_NETWORK_PREFS = {
     # static clearance page does not need it, so disable it before any source
     # document can run.
     "media.peerconnection.enabled": False,
+    # WebTransport/HTTP3 can open QUIC sockets below context.route(). The
+    # static FBref challenge does not need either transport.
+    "network.webtransport.enabled": False,
+    "network.http.http3.enable": False,
     "network.http.redirection-limit": 0,
     # Never send origin traffic (or its context headers) directly when the
     # explicit paid proxy is unavailable.
@@ -140,111 +156,6 @@ FIREFOX_METERED_NETWORK_PREFS = {
     "network.dns.disablePrefetch": True,
     "network.predictor.enabled": False,
 }
-
-# Network constructors that can open sockets outside context.route(). Keep the
-# Python tuple as the exact, testable contract and derive the injected source
-# from it so a new browser API cannot be added to one side only.
-NETWORK_API_BLOCKED_CONSTRUCTORS = (
-    "WebSocket",
-    "WebTransport",
-    "Worker",
-    "SharedWorker",
-    "RTCPeerConnection",
-)
-
-# Camoufox runs Playwright init scripts in an isolated world, so changing its
-# ``globalThis.WebSocket`` does not affect page JavaScript.  This wrapper adds a
-# short privileged script element at document start; ``bypass_csp=True`` on the
-# browser context makes the guard deterministic even on a strict source CSP.
-# The element reports synchronous installation through a temporary data
-# attribute and is removed before source scripts run.
-_NETWORK_API_DENY_MAIN_WORLD = r"""
-(() => {
-  const sentinel = "__fbrefNetworkApiGuard_v1_7bb0a73d";
-  const markReady = () => {
-    if (document.currentScript) {
-      document.currentScript.dataset.fbrefNetworkGuard = "ready";
-    }
-  };
-  if (globalThis[sentinel] === true) {
-    markReady();
-    return;
-  }
-  const deny = (name) => {
-    throw new DOMException(`${name} is disabled`, "SecurityError");
-  };
-  for (const name of __FBREF_BLOCKED_NETWORK_CONSTRUCTORS__) {
-    const nativeConstructor = globalThis[name];
-    if (typeof nativeConstructor === "function") {
-      const blockedConstructor = new Proxy(nativeConstructor, {
-        apply() {
-          deny(name);
-        },
-        construct() {
-          deny(name);
-        },
-      });
-      Object.defineProperty(globalThis, name, {
-        value: blockedConstructor,
-        writable: false,
-        configurable: false,
-      });
-      // A Proxy forwards ``prototype``. Without replacing this link, page
-      // code can recover the unguarded target with
-      // ``new WebSocket.prototype.constructor(url)`` and open a socket before
-      // Playwright can meter it.
-      Object.defineProperty(nativeConstructor.prototype, "constructor", {
-        value: blockedConstructor,
-        writable: false,
-        configurable: false,
-      });
-    }
-  }
-  const serviceWorkerContainer = navigator.serviceWorker;
-  const serviceWorkerPrototype = serviceWorkerContainer
-    ? Object.getPrototypeOf(serviceWorkerContainer)
-    : null;
-  const nativeRegister = serviceWorkerPrototype?.register;
-  if (typeof nativeRegister === "function") {
-    const blockedRegister = new Proxy(nativeRegister, {
-      apply() {
-        return Promise.reject(
-          new DOMException("ServiceWorker is disabled", "SecurityError")
-        );
-      },
-    });
-    Object.defineProperty(serviceWorkerPrototype, "register", {
-      value: blockedRegister,
-      writable: false,
-      configurable: false,
-    });
-  }
-  Object.defineProperty(globalThis, sentinel, {
-    value: true,
-    enumerable: false,
-    writable: false,
-    configurable: false,
-  });
-  markReady();
-})();
-""".replace(
-    "__FBREF_BLOCKED_NETWORK_CONSTRUCTORS__",
-    json.dumps(NETWORK_API_BLOCKED_CONSTRUCTORS),
-)
-NETWORK_API_BLOCK_INIT_SCRIPT = """
-(() => {
-  const guard = document.createElement("script");
-  guard.textContent = %s;
-  (document.documentElement || document).appendChild(guard);
-  const ready = guard.dataset.fbrefNetworkGuard === "ready";
-  guard.remove();
-  if (!ready) {
-    throw new Error("FBref main-world network guard did not install");
-  }
-  return ready;
-})();
-""" % json.dumps(_NETWORK_API_DENY_MAIN_WORLD)
-
 
 def _proxy_url_with_credentials(proxy: Optional[dict]) -> Optional[str]:
     if not proxy or not str(proxy.get("server") or "").strip():
@@ -451,7 +362,7 @@ class CamoufoxFbrefTransport:
             Callable[[bool, Optional[str]], None]
         ] = None,
         geoip: bool = True,
-        headless: bool = True,
+        headless: Union[bool, Literal["virtual"]] = True,
         humanize: bool = True,
         block_resources: bool = True,
         nav_timeout_ms: int = 90000,
@@ -558,6 +469,7 @@ class CamoufoxFbrefTransport:
         self._responded_request_guids: Dict[int, str] = {}
         self._navigation_source_url: Optional[str] = None
         self._pending_manual_redirect_url: Optional[str] = None
+        self._browser_navigation_headers: Dict[str, str] = {}
         # An __exit__ failure is a permanent phase-boundary failure. The
         # Camoufox context-manager handle stays available for a cleanup retry,
         # but this transport may never start another browser afterwards.
@@ -635,6 +547,9 @@ class CamoufoxFbrefTransport:
         return f"Basic {encoded}"
 
     def _start(self) -> None:
+        # Headers are fingerprint facts from one exact browser/proxy session.
+        # Never let a restart hand an old session's headers to a fresh cookie.
+        self._browser_navigation_headers = {}
         if self._browser_finalize_error is not None:
             raise RuntimeError(
                 "Camoufox browser finalization previously failed; reuse disabled"
@@ -728,9 +643,17 @@ class CamoufoxFbrefTransport:
                 self._geoip_lookup_failed = True
                 raise
 
+        from camoufox.addons import DefaultAddons
         from camoufox.sync_api import Camoufox  # lazy: heavy (Firefox)
 
-        kwargs = {"headless": self._headless, "humanize": self._humanize}
+        kwargs = {
+            "headless": self._headless,
+            "humanize": self._humanize,
+            # The default UBO addon is downloaded from a moving "latest" URL
+            # and can perform background traffic outside page routing. FBref's
+            # explicit resource policy replaces it.
+            "exclude_addons": list(DefaultAddons),
+        }
         if self._proxy:
             kwargs["proxy"] = self._proxy
             kwargs["geoip"] = geoip  # locale/timezone matched to exit IP
@@ -748,15 +671,25 @@ class CamoufoxFbrefTransport:
         # the browser it spawned if it overruns: Playwright then raises out of
         # the launch and the caller rotates onto a fresh exit IP.
         with self._browser_deadline(self.BROWSER_START_TIMEOUT_S, "start"):
+            kwargs["executable_path"] = EXECUTABLE_PATH
+            # The Python package otherwise reads SofaScore's separate v135
+            # version document while generating FBref's browser fingerprint.
+            kwargs["ff_version"] = CAMOUFOX_FIREFOX_MAJOR
+            # This is not version rotation: the executable and readiness
+            # document above are both hard-pinned to that exact major.
+            kwargs["i_know_what_im_doing"] = True
             self._cm = Camoufox(**kwargs)
             self._browser = self._cm.__enter__()
-            # Service-worker script fetches and WebSocket handshakes bypass
-            # ordinary Playwright routing. Install the main-world deny guard
-            # before creating any page; bypass_csp is needed only so this
-            # browser-owned guard cannot be suppressed by a source CSP.
+            # Service workers bypass ordinary Playwright routing, so disable
+            # them at the context boundary. Do not use ``bypass_csp`` or inject
+            # main-world constructor shims: FBref's current managed challenge
+            # refuses to initialize when its CSP is disabled or native browser
+            # constructors are replaced. Dedicated-worker fetches still pass
+            # through ``context.route``; WebSocket handshakes are rejected by
+            # ``route_web_socket`` below; WebRTC/preconnect/direct failover are
+            # disabled by the Firefox preferences above.
             context_options = {
                 "service_workers": "block",
-                "bypass_csp": True,
             }
             if proxy_authorization is not None:
                 # Firefox otherwise waits for a 407 and retries below
@@ -769,9 +702,6 @@ class CamoufoxFbrefTransport:
             self._context = self._browser.new_context(
                 **context_options,
             )
-            self._context.add_init_script(
-                script=NETWORK_API_BLOCK_INIT_SCRIPT
-            )
             if (
                 self._block_resources
                 or self._max_network_requests is not None
@@ -781,9 +711,9 @@ class CamoufoxFbrefTransport:
                 # Native redirects are disabled above, so every allowed HTTP
                 # request must pass admission before transport.
                 self._context.route("**/*", self._maybe_block)
-            # Playwright's WebSocket close happens after the handshake on
-            # Firefox 135; retain it only as defense after the main-world
-            # constructor guard has already prevented content sockets.
+            # A WebSocket is not part of FBref's static clearance contract.
+            # Reject it explicitly and latch the session before any target
+            # HTTP fetch can begin.
             self._context.route_web_socket(
                 "**/*",
                 self._on_unexpected_websocket,
@@ -794,10 +724,6 @@ class CamoufoxFbrefTransport:
             self._context.on("requestfinished", self._on_request_finished)
             self._context.on("requestfailed", self._on_request_failed)
             self._page = self._context.new_page()
-            if self._page.evaluate(NETWORK_API_BLOCK_INIT_SCRIPT) is not True:
-                raise RuntimeError(
-                    "FBref main-world network guard is unavailable"
-                )
         self._pages_this_session = 0
         server = (self._proxy or {}).get("server", "direct")
         logger.info("Camoufox session started (proxy=%s, humanize=%s)",
@@ -1462,7 +1388,7 @@ class CamoufoxFbrefTransport:
         # while the flag is set, and `fetch()` closes the session on its way out.
 
     def _on_unexpected_websocket(self, websocket) -> None:
-        """Fail closed if content bypassed the main-world WebSocket guard.
+        """Fail closed if content requests a WebSocket connection.
 
         Firefox reports this callback after the handshake may have reached the
         proxy. Treat it as an accounting tripwire, not as a free blocker: one
@@ -1500,10 +1426,41 @@ class CamoufoxFbrefTransport:
             or self._network_policy_failed
         )
 
+    def _capture_browser_navigation_headers(self, request) -> None:
+        """Retain exact Firefox headers needed by the warm HTTP handoff."""
+
+        if str(getattr(request, "resource_type", "")) != "document":
+            return
+        try:
+            host = (urlsplit(str(request.url)).hostname or "").casefold()
+        except (TypeError, ValueError, UnicodeError):
+            return
+        if host != "fbref.com" and not host.endswith(".fbref.com"):
+            return
+        try:
+            source = request.all_headers()
+        except Exception:  # noqa: BLE001 - request can detach during routing
+            source = getattr(request, "headers", {})
+        if not isinstance(source, dict):
+            return
+        normalized = {
+            str(name).casefold(): str(value)
+            for name, value in source.items()
+            if str(value).strip()
+        }
+        selected = {
+            name: normalized[name]
+            for name in _HTTP_HANDOFF_HEADER_NAMES
+            if name in normalized
+        }
+        if len(selected) == len(_HTTP_HANDOFF_HEADER_NAMES):
+            self._browser_navigation_headers = selected
+
     def _maybe_block(self, route) -> None:
         req = None
         try:
             req = route.request
+            self._capture_browser_navigation_headers(req)
             if (
                 self._block_resources
                 and should_block_request(
@@ -1986,6 +1943,30 @@ class CamoufoxFbrefTransport:
         except Exception:  # noqa: BLE001 — frames can detach mid-nav
             return False
 
+    def _challenge_shell_present(self) -> bool:
+        """Recognize the managed shell before its iframe has been created."""
+
+        if self._challenge_frame_present():
+            return True
+        try:
+            return bool(
+                self._page.evaluate(
+                    """() => {
+                      const title = (document.title || '').toLowerCase();
+                      return title.includes('just a moment') ||
+                        title.includes('checking your browser') ||
+                        typeof globalThis._cf_chl_opt === 'object' ||
+                        document.documentElement?.classList.contains(
+                          'no-js'
+                        ) && !!document.querySelector(
+                          'script[src*="/cdn-cgi/challenge-platform/"]'
+                        );
+                    }"""
+                )
+            )
+        except Exception:  # noqa: BLE001 — page may be navigating
+            return False
+
     def _click_turnstile(self) -> bool:
         """Click the Turnstile checkbox inside the CF iframe. Returns True if a
         click was dispatched."""
@@ -2027,7 +2008,7 @@ class CamoufoxFbrefTransport:
         while time.time() < deadline:
             time.sleep(self.POLL_INTERVAL_S)
             polls += 1
-            if not challenge_seen and self._challenge_frame_present():
+            if not challenge_seen and self._challenge_shell_present():
                 challenge_seen = True
                 self.cf_challenge_attempts += 1
             try:
@@ -2257,9 +2238,13 @@ class CamoufoxFbrefTransport:
             if "cf_clearance" not in cookies:
                 return None
             user_agent = self._page.evaluate("navigator.userAgent")
+            browser_headers = dict(self._browser_navigation_headers)
+            if len(browser_headers) != len(_HTTP_HANDOFF_HEADER_NAMES):
+                return None
             return {
                 "cookies": cookies,
                 "user_agent": user_agent,
+                "browser_headers": browser_headers,
                 "proxy": self._proxy,
             }
         except Exception as e:  # noqa: BLE001 — session may be tearing down

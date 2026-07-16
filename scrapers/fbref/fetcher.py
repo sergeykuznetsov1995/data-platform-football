@@ -9,6 +9,7 @@ import time
 from dataclasses import dataclass, field, replace
 from typing import Mapping, Optional, Sequence
 
+from scrapers.fbref.browser_runtime import HTTP_IMPERSONATE_TARGET
 from scrapers.fbref.camoufox_fetch import CamoufoxFbrefTransport
 from scrapers.fbref.proxy_lease import (
     DEFAULT_LEASE_TTL_SECONDS,
@@ -26,7 +27,7 @@ from scrapers.fbref.settings import (
 from scrapers.utils.proxy_manager import classify_error
 
 
-FETCHER_VERSION = "fbref-camoufox-metered-warm-http-v5"
+FETCHER_VERSION = "fbref-camoufox-metered-warm-http-v6"
 DEFAULT_BOOTSTRAP_URL = "https://fbref.com/en/"
 MAX_HTML_BYTES = DEFAULT_HTTP_BODY_LIMIT_BYTES
 # The browser cap bounds ONE clearance attempt; the run's reservation covers
@@ -347,7 +348,10 @@ class FBrefFetcher:
         return CamoufoxFbrefTransport(
             proxy_provider=self._next_proxy,
             geoip=True,
-            headless=True,
+            # A real Xvfb display preserves the native browser fingerprint;
+            # FBref's managed challenge rejects Firefox headless mode often
+            # enough that it is not a production transport.
+            headless="virtual",
             humanize=True,
             block_resources=True,
             max_network_requests=self._max_browser_requests,
@@ -579,8 +583,14 @@ class FBrefFetcher:
         proxy = clearance.get("proxy")
         proxy_url = FBrefFetcher._proxy_url(proxy)
         proxy_auth = FBrefFetcher._proxy_auth(proxy)
+        browser_headers = clearance.get("browser_headers")
+        if not isinstance(browser_headers, Mapping):
+            browser_headers = {}
         session = Session(
-            impersonate=os.environ.get("FBREF_HTTP_IMPERSONATE", "firefox135"),
+            # Firefox 147 is curl_cffi's nearest supported TLS fingerprint for
+            # the isolated Firefox 152 browser. The exported 152 User-Agent is
+            # retained below, as recommended for skipped browser versions.
+            impersonate=HTTP_IMPERSONATE_TARGET,
             proxy=proxy_url,
             proxy_auth=proxy_auth,
             # Never allow container HTTP(S)_PROXY variables to break the
@@ -593,15 +603,28 @@ class FBrefFetcher:
         session.cookies.update(dict(clearance["cookies"]))
         session.headers.update({
             "User-Agent": str(clearance.get("user_agent") or ""),
-            "Accept": (
-                "text/html,application/xhtml+xml,application/xml;q=0.9,"
-                "image/avif,image/webp,*/*;q=0.8"
+            "Accept": str(
+                browser_headers.get("accept")
+                or "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                "*/*;q=0.8"
             ),
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "same-origin",
+            "Accept-Language": str(
+                browser_headers.get("accept-language")
+                or "en-US,en;q=0.9"
+            ),
+            "Accept-Encoding": str(
+                browser_headers.get("accept-encoding")
+                or "gzip, deflate, br, zstd"
+            ),
+            "Sec-Fetch-Dest": str(
+                browser_headers.get("sec-fetch-dest") or "document"
+            ),
+            "Sec-Fetch-Mode": str(
+                browser_headers.get("sec-fetch-mode") or "navigate"
+            ),
+            "Sec-Fetch-Site": str(
+                browser_headers.get("sec-fetch-site") or "none"
+            ),
         })
         return session
 

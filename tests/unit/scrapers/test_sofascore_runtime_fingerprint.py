@@ -139,16 +139,17 @@ def test_proxy_filter_compose_exposes_every_fingerprint_runtime_path():
         "/opt/airflow/configs/sofascore",
     } <= targets
 
-    dockerfile = (root / "docker/images/airflow/Dockerfile").read_text(
-        encoding="utf-8"
-    )
-    for filename in (
-        "Dockerfile",
-        "requirements-airflow.txt",
-        "requirements-scraping.txt",
-        "requirements.txt",
-    ):
-        assert (
-            f"/opt/airflow/runtime-contract/docker/images/airflow/{filename}"
-            in dockerfile
-        )
+    for dockerfile_name in ("Dockerfile", "Dockerfile.scheduler-runtime"):
+        dockerfile = (
+            root / "docker/images/airflow" / dockerfile_name
+        ).read_text(encoding="utf-8")
+        for filename in (
+            "Dockerfile",
+            "requirements-airflow.txt",
+            "requirements-scraping.txt",
+            "requirements.txt",
+        ):
+            assert (
+                "/opt/airflow/runtime-contract/docker/images/airflow/"
+                f"{filename}" in dockerfile
+            )

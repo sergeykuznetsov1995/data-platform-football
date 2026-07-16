@@ -8,7 +8,7 @@ import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-DOCKERFILE = REPO_ROOT / "docker/images/airflow/Dockerfile.transfermarkt-runtime"
+DOCKERFILE = REPO_ROOT / "docker/images/airflow/Dockerfile.scheduler-runtime"
 LEGACY_DOCKERFILE = REPO_ROOT / "docker/images/airflow/Dockerfile"
 SCRAPING_REQUIREMENTS = (
     REPO_ROOT / "docker/images/airflow/requirements-scraping.txt"
@@ -66,8 +66,34 @@ def test_compose_cannot_clear_the_image_level_tls_library_path():
     compose = COMPOSE_FILE.read_text(encoding="utf-8")
     assert "TLS_LIBRARY_PATH:" not in compose
     assert "TLS_LIBRARY_PATH=" not in compose
-    assert compose.count("dockerfile: Dockerfile.transfermarkt-runtime") == 1
+    assert compose.count("dockerfile: Dockerfile.scheduler-runtime") == 1
     assert "AIRFLOW_RUNTIME_BASE:" in compose
+
+
+@pytest.mark.unit
+def test_fbref_browser_is_checksum_pinned_and_isolated_from_sofascore():
+    from scrapers.fbref import browser_runtime
+
+    dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+    version = browser_runtime.CAMOUFOX_BROWSER_VERSION
+    release = browser_runtime.CAMOUFOX_BROWSER_RELEASE
+    install_dir = str(browser_runtime.INSTALL_DIR)
+    sha256 = (
+        "a03872a221ab766f58d04fdaf0d7f3431c2662d5086844c67d2fc01154ebc1f8"
+    )
+
+    assert f"FBREF_CAMOUFOX_VERSION={version}" in dockerfile
+    assert f"FBREF_CAMOUFOX_RELEASE={release}" in dockerfile
+    assert f"FBREF_CAMOUFOX_SHA256={sha256}" in dockerfile
+    assert "releases/download/v${FBREF_CAMOUFOX_VERSION}-" in dockerfile
+    assert 'echo "${FBREF_CAMOUFOX_SHA256}  /tmp/' in dockerfile
+    assert f"test -x {install_dir}/camoufox-bin" in dockerfile
+    assert "/home/airflow/.cache/camoufox" not in dockerfile
+    assert "download_mmdb" not in dockerfile
+    assert "maybe_download_addons" not in dockerfile
+    assert "python -m camoufox fetch" not in dockerfile
+    assert "exclude_addons=list(DefaultAddons)" in dockerfile
+    assert "browser.new_page().evaluate('navigator.userAgent')" in dockerfile
 
 
 @pytest.mark.unit

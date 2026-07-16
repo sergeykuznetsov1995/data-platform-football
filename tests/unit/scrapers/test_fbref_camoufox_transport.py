@@ -2,6 +2,7 @@
 
 import base64
 import threading
+from types import SimpleNamespace
 from unittest.mock import MagicMock, call as mock_call
 
 import pytest
@@ -14,14 +15,26 @@ from scrapers.fbref.camoufox_fetch import (
     GEOIP_BYTE_RESERVATION_BYTES,
     GEOIP_LOOKUP_URL,
     GEOIP_REQUEST_RESERVATION,
-    NETWORK_API_BLOCK_INIT_SCRIPT,
-    NETWORK_API_BLOCKED_CONSTRUCTORS,
     UNEXPECTED_BROWSER_NETWORK_RESERVATION_BYTES,
     _navigation_error_type,
     is_cloudflare_blocked,
     resolve_geoip_without_redirects,
     should_block_request,
 )
+
+
+def _install_camoufox_mocks(monkeypatch, camoufox):
+    modules = __import__("sys").modules
+    monkeypatch.setitem(
+        modules,
+        "camoufox.sync_api",
+        MagicMock(Camoufox=camoufox),
+    )
+    monkeypatch.setitem(
+        modules,
+        "camoufox.addons",
+        MagicMock(DefaultAddons=(SimpleNamespace(name="UBO"),)),
+    )
 
 
 @pytest.mark.unit
@@ -67,9 +80,11 @@ def test_budget_arguments_must_be_positive():
 
 
 @pytest.mark.unit
-def test_metered_browser_disables_every_pre_route_network_api():
+def test_metered_browser_disables_every_pre_route_browser_transport():
     assert FIREFOX_METERED_NETWORK_PREFS == {
         "media.peerconnection.enabled": False,
+        "network.webtransport.enabled": False,
+        "network.http.http3.enable": False,
         "network.http.redirection-limit": 0,
         "network.proxy.failover_direct": False,
         "network.http.speculative-parallel-limit": 0,
@@ -80,19 +95,6 @@ def test_metered_browser_disables_every_pre_route_network_api():
         "network.dns.disablePrefetch": True,
         "network.predictor.enabled": False,
     }
-    assert NETWORK_API_BLOCKED_CONSTRUCTORS == (
-        "WebSocket",
-        "WebTransport",
-        "Worker",
-        "SharedWorker",
-        "RTCPeerConnection",
-    )
-    assert 'globalThis, name' in NETWORK_API_BLOCK_INIT_SCRIPT
-    assert 'nativeConstructor.prototype, \\"constructor\\"' in (
-        NETWORK_API_BLOCK_INIT_SCRIPT
-    )
-    for constructor in NETWORK_API_BLOCKED_CONSTRUCTORS:
-        assert f'\\"{constructor}\\"' in NETWORK_API_BLOCK_INIT_SCRIPT
 
 
 class _Route:
@@ -1276,13 +1278,31 @@ def test_clearance_exports_cookie_fingerprint_and_bound_proxy():
         {"name": "cf_clearance", "value": "token"},
         {"name": "other", "value": "value"},
     ]
-    page.evaluate.return_value = "Mozilla/5.0 Firefox/135.0"
+    page.evaluate.return_value = "Mozilla/5.0 Firefox/152.0"
     transport._page = page
+    route = _Route()
+    route.request.all_headers.return_value = {
+        "accept": "browser-accept",
+        "accept-language": "en-DE,en;q=0.9",
+        "accept-encoding": "gzip, deflate, br, zstd",
+        "sec-fetch-dest": "document",
+        "sec-fetch-mode": "navigate",
+        "sec-fetch-site": "none",
+    }
+    transport._maybe_block(route)
 
     clearance = transport.get_clearance()
 
     assert clearance["cookies"]["cf_clearance"] == "token"
-    assert clearance["user_agent"] == "Mozilla/5.0 Firefox/135.0"
+    assert clearance["user_agent"] == "Mozilla/5.0 Firefox/152.0"
+    assert clearance["browser_headers"] == {
+        "accept": "browser-accept",
+        "accept-language": "en-DE,en;q=0.9",
+        "accept-encoding": "gzip, deflate, br, zstd",
+        "sec-fetch-dest": "document",
+        "sec-fetch-mode": "navigate",
+        "sec-fetch-site": "none",
+    }
     assert clearance["proxy"] == transport._proxy
 
 
@@ -1293,6 +1313,42 @@ def test_clearance_requires_cf_cookie():
     page.context.cookies.return_value = [{"name": "other", "value": "value"}]
     transport._page = page
 
+    assert transport.get_clearance() is None
+
+
+@pytest.mark.unit
+def test_restart_drops_previous_session_navigation_headers(monkeypatch):
+    page = MagicMock()
+    context = MagicMock()
+    context.new_page.return_value = page
+    browser = MagicMock()
+    browser.new_context.return_value = context
+    camoufox = MagicMock()
+    camoufox.return_value.__enter__.return_value = browser
+    _install_camoufox_mocks(monkeypatch, camoufox)
+    transport = CamoufoxFbrefTransport(
+        proxy={"server": "http://proxy.example:8000"},
+        geoip=False,
+    )
+
+    transport._start()
+    old_route = _Route()
+    old_route.request.all_headers.return_value = {
+        "accept": "old-accept",
+        "accept-language": "old-language",
+        "accept-encoding": "old-encoding",
+        "sec-fetch-dest": "document",
+        "sec-fetch-mode": "navigate",
+        "sec-fetch-site": "none",
+    }
+    transport._maybe_block(old_route)
+    transport._restart()
+    page.context.cookies.return_value = [
+        {"name": "cf_clearance", "value": "new-token"},
+    ]
+    page.evaluate.return_value = "Mozilla/5.0 Firefox/152.0"
+
+    assert transport._browser_navigation_headers == {}
     assert transport.get_clearance() is None
 
 
@@ -1363,11 +1419,7 @@ def test_browser_start_watchdog_is_disarmed_once_the_browser_is_up(monkeypatch):
     browser.new_context.return_value = context
     camoufox = MagicMock()
     camoufox.return_value.__enter__.return_value = browser
-    monkeypatch.setitem(
-        __import__("sys").modules,
-        "camoufox.sync_api",
-        MagicMock(Camoufox=camoufox),
-    )
+    _install_camoufox_mocks(monkeypatch, camoufox)
 
     transport = CamoufoxFbrefTransport(
         proxy={"server": "http://p:1"}, geoip=False
@@ -1623,11 +1675,7 @@ def test_each_start_preadmits_geoip_and_disables_automatic_redirects(
     browser.new_context.return_value = context
     camoufox = MagicMock()
     camoufox.return_value.__enter__.return_value = browser
-    monkeypatch.setitem(
-        __import__("sys").modules,
-        "camoufox.sync_api",
-        MagicMock(Camoufox=camoufox),
-    )
+    _install_camoufox_mocks(monkeypatch, camoufox)
     resolver = MagicMock(return_value="203.0.113.9")
     transport = CamoufoxFbrefTransport(
         proxy={
@@ -1655,6 +1703,14 @@ def test_each_start_preadmits_geoip_and_disables_automatic_redirects(
     assert camoufox.call_count == 2
     for call in camoufox.call_args_list:
         assert call.kwargs["geoip"] == "203.0.113.9"
+        assert str(call.kwargs["executable_path"]) == (
+            "/opt/fbref-camoufox/camoufox-bin"
+        )
+        assert call.kwargs["ff_version"] == 152
+        assert call.kwargs["i_know_what_im_doing"] is True
+        assert [addon.name for addon in call.kwargs["exclude_addons"]] == [
+            "UBO"
+        ]
         assert call.kwargs["firefox_user_prefs"] == (
             FIREFOX_METERED_NETWORK_PREFS
         )
@@ -1664,7 +1720,6 @@ def test_each_start_preadmits_geoip_and_disables_automatic_redirects(
     assert all(
         call.kwargs == {
             "service_workers": "block",
-            "bypass_csp": True,
             "extra_http_headers": {
                 "Proxy-Authorization": expected_proxy_authorization,
             },
@@ -1672,11 +1727,7 @@ def test_each_start_preadmits_geoip_and_disables_automatic_redirects(
         for call in browser.new_context.call_args_list
     )
     assert "lease-token" not in repr(browser.new_context.call_args_list)
-    assert context.add_init_script.call_count == 2
-    assert all(
-        call.kwargs == {"script": NETWORK_API_BLOCK_INIT_SCRIPT}
-        for call in context.add_init_script.call_args_list
-    )
+    context.add_init_script.assert_not_called()
     assert context.new_page.call_count == 2
     assert context.route.call_count == 2
     assert context.route_web_socket.call_count == 2
@@ -1690,6 +1741,26 @@ def test_each_start_preadmits_geoip_and_disables_automatic_redirects(
     )
 
 
+def test_managed_shell_is_counted_before_turnstile_iframe(monkeypatch):
+    transport = CamoufoxFbrefTransport(geoip=False)
+    transport.CF_SOLVE_TIMEOUT_S = 1
+    transport.POLL_INTERVAL_S = 0
+    transport._page = MagicMock()
+    transport._page.evaluate.side_effect = [True, False]
+    transport._page.frames = []
+    transport._click_turnstile = MagicMock(return_value=False)
+    clock = MagicMock(side_effect=[0, 0, 2])
+    monkeypatch.setattr("scrapers.fbref.camoufox_fetch.time.time", clock)
+    monkeypatch.setattr(
+        "scrapers.fbref.camoufox_fetch.time.sleep", MagicMock()
+    )
+
+    assert transport._solve_current_page() is None
+    assert transport._last_solve_failure == "cloudflare"
+    assert transport.cf_challenge_attempts == 1
+    assert transport.cf_challenges_failed == 1
+
+
 def test_popup_and_subresource_share_context_admission(monkeypatch):
     page = MagicMock()
     page.evaluate.return_value = True
@@ -1699,11 +1770,7 @@ def test_popup_and_subresource_share_context_admission(monkeypatch):
     browser.new_context.return_value = context
     camoufox = MagicMock()
     camoufox.return_value.__enter__.return_value = browser
-    monkeypatch.setitem(
-        __import__("sys").modules,
-        "camoufox.sync_api",
-        MagicMock(Camoufox=camoufox),
-    )
+    _install_camoufox_mocks(monkeypatch, camoufox)
     admission = (
         BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
         + BROWSER_UNDECLARED_BODY_RESERVATION_BYTES

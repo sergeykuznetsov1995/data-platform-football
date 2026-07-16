@@ -430,6 +430,8 @@ def test_constructor_passes_hard_browser_budget(monkeypatch):
     assert constructor.call_args.kwargs["max_network_bytes"] == (
         DEFAULT_BROWSER_BYTE_LIMIT
     )
+    assert constructor.call_args.kwargs["headless"] == "virtual"
+    assert constructor.call_args.kwargs["humanize"] is True
     fetcher.close()
 
 
@@ -523,7 +525,15 @@ def test_warm_session_reuses_explicit_proxy_auth_and_ignores_environment(
 
     session = FBrefFetcher._create_http_session({
         "cookies": {"cf_clearance": "cookie-value"},
-        "user_agent": "Mozilla/5.0 Firefox/135",
+        "user_agent": "Mozilla/5.0 Firefox/152",
+        "browser_headers": {
+            "accept": "browser-accept",
+            "accept-language": "en-DE,en;q=0.9",
+            "accept-encoding": "gzip, deflate, br, zstd",
+            "sec-fetch-dest": "document",
+            "sec-fetch-mode": "navigate",
+            "sec-fetch-site": "none",
+        },
         "proxy": {
             "server": "http://proxy.example:8080",
             "username": "proxy-user",
@@ -532,7 +542,7 @@ def test_warm_session_reuses_explicit_proxy_auth_and_ignores_environment(
     })
 
     assert created == [{
-        "impersonate": "firefox135",
+        "impersonate": "firefox147",
         "proxy": "http://proxy.example:8080",
         "proxy_auth": ("proxy-user", "proxy-password"),
         "trust_env": False,
@@ -541,7 +551,13 @@ def test_warm_session_reuses_explicit_proxy_auth_and_ignores_environment(
     assert "proxy-user" not in created[0]["proxy"]
     assert "proxy-password" not in created[0]["proxy"]
     assert session.cookies == {"cf_clearance": "cookie-value"}
-    assert session.headers["User-Agent"] == "Mozilla/5.0 Firefox/135"
+    assert session.headers["User-Agent"] == "Mozilla/5.0 Firefox/152"
+    assert session.headers["Accept"] == "browser-accept"
+    assert session.headers["Accept-Language"] == "en-DE,en;q=0.9"
+    assert session.headers["Accept-Encoding"] == "gzip, deflate, br, zstd"
+    assert session.headers["Sec-Fetch-Dest"] == "document"
+    assert session.headers["Sec-Fetch-Mode"] == "navigate"
+    assert session.headers["Sec-Fetch-Site"] == "none"
 
 
 def test_retryable_500_retries_once_and_accounts_both_requests(monkeypatch):

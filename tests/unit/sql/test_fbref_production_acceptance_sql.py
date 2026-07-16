@@ -237,6 +237,18 @@ def test_postgres_companion_proves_explicit_empty_season_manifests():
     assert "frontier.page_kind IN ('season', 'season_stats')" in CONTROL_SQL
     assert "frontier.page_kind = 'season' THEN 'standard'" in CONTROL_SQL
     assert "match_control_manifest_matrix" in CONTROL_SQL
+    assert "backfill/200/100" in CONTROL_SQL
+    assert "reviewed_live_transport" in CONTROL_SQL
+    assert "fbref-camoufox-metered-warm-http-v6" in CONTROL_SQL
+    assert "successful_warm_http_attempts > 0" in CONTROL_SQL
+    assert "attempt.session_version = session.session_id::text" in CONTROL_SQL
+    assert "linked_successful_warm_http_attempts > 0" in CONTROL_SQL
+    assert "unlinked_successful_warm_http_attempts = 0" in CONTROL_SQL
+    assert "session.browser_bootstrap_attempts > 0" in CONTROL_SQL
+    assert "session.browser_bootstrap_requests > 0" in CONTROL_SQL
+    assert "session.http_requests > 0" in CONTROL_SQL
+    assert "all_fetch_attempts = 0" in CONTROL_SQL
+    assert "clearance_sessions = 0" in CONTROL_SQL
     assert not re.search(
         r"\b(CREATE|ALTER|DROP|INSERT|UPDATE|DELETE|MERGE|CALL)\b",
         executable,

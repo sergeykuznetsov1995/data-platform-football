@@ -2,8 +2,9 @@
 -- Set :control_run_id to the same UUID used by the Trino acceptance script.
 -- Bind :expected_run_type, :expected_request_limit, and
 -- :expected_byte_limit_mb to the exact Airflow profile. Supported acceptance
--- bindings are current/100/50 for canary, current/200/100 for production, and
--- replay/0/0 for offline replay.
+-- bindings are current/100/50 for canary, current/200/100 for production,
+-- backfill/200/100 for a live historical batch, and replay/0/0 for offline
+-- replay.
 -- This control-plane evidence is required because a legitimate empty typed
 -- dataset intentionally does not create an Iceberg table.
 
@@ -43,6 +44,102 @@ SELECT
     metadata -> 'raw_audit' AS raw_audit_anchor
 FROM fbref_control.crawl_run
 WHERE run_id = CAST(:control_run_id AS uuid);
+
+-- Prove that a live run crossed the Firefox-152 -> warm-HTTP handoff with the
+-- reviewed v6 transport. Replay must remain completely network-free.
+WITH attempts AS (
+    SELECT
+        count(*) AS all_fetch_attempts,
+        count(*) FILTER (
+            WHERE reservation_id IS NOT NULL
+        ) AS network_attempts,
+        count(*) FILTER (
+            WHERE reservation_id IS NOT NULL
+              AND status = 'succeeded'
+              AND http_status IN (200, 304)
+        ) AS successful_warm_http_attempts,
+        count(*) FILTER (
+            WHERE reservation_id IS NOT NULL
+              AND transport_version IS DISTINCT FROM
+                  'fbref-camoufox-metered-warm-http-v6'
+        ) AS unexpected_transport_versions
+    FROM fbref_control.fetch_attempt
+    WHERE run_id = CAST(:control_run_id AS uuid)
+), sessions AS (
+    SELECT
+        count(*) AS clearance_sessions,
+        count(*) FILTER (WHERE status = 'closed') AS closed_sessions,
+        count(*) FILTER (WHERE status = 'active') AS active_sessions,
+        count(*) FILTER (
+            WHERE session_version IS DISTINCT FROM
+                'fbref-camoufox-metered-warm-http-v6'
+        ) AS unexpected_session_versions
+    FROM fbref_control.clearance_session
+    WHERE run_id = CAST(:control_run_id AS uuid)
+), handoffs AS (
+    SELECT
+        count(*) FILTER (
+            WHERE attempt.reservation_id IS NOT NULL
+              AND attempt.status = 'succeeded'
+              AND attempt.http_status IN (200, 304)
+              AND attempt.transport_version =
+                  'fbref-camoufox-metered-warm-http-v6'
+              AND session.session_id IS NOT NULL
+              AND session.session_version =
+                  'fbref-camoufox-metered-warm-http-v6'
+              AND session.status = 'closed'
+              AND session.browser_bootstrap_attempts > 0
+              AND session.browser_bootstrap_requests > 0
+              AND session.http_requests > 0
+        ) AS linked_successful_warm_http_attempts,
+        count(*) FILTER (
+            WHERE attempt.reservation_id IS NOT NULL
+              AND attempt.status = 'succeeded'
+              AND attempt.http_status IN (200, 304)
+              AND (
+                  session.session_id IS NULL
+                  OR attempt.transport_version IS DISTINCT FROM
+                      'fbref-camoufox-metered-warm-http-v6'
+                  OR session.session_version IS DISTINCT FROM
+                      'fbref-camoufox-metered-warm-http-v6'
+                  OR session.status IS DISTINCT FROM 'closed'
+                  OR session.browser_bootstrap_attempts <= 0
+                  OR session.browser_bootstrap_requests <= 0
+                  OR session.http_requests <= 0
+              )
+        ) AS unlinked_successful_warm_http_attempts
+    FROM fbref_control.fetch_attempt AS attempt
+    LEFT JOIN fbref_control.clearance_session AS session
+      ON session.run_id = attempt.run_id
+     AND attempt.session_version = session.session_id::text
+    WHERE attempt.run_id = CAST(:control_run_id AS uuid)
+)
+SELECT
+    'reviewed_live_transport' AS check_name,
+    CASE
+        WHEN CAST(:expected_run_type AS text) = 'replay'
+         AND all_fetch_attempts = 0
+         AND clearance_sessions = 0
+        THEN 'PASS'
+        WHEN CAST(:expected_run_type AS text) <> 'replay'
+         AND network_attempts > 0
+         AND successful_warm_http_attempts > 0
+         AND linked_successful_warm_http_attempts > 0
+         AND unlinked_successful_warm_http_attempts = 0
+         AND unexpected_transport_versions = 0
+         AND clearance_sessions > 0
+         AND closed_sessions > 0
+         AND active_sessions = 0
+         AND unexpected_session_versions = 0
+        THEN 'PASS'
+        ELSE 'FAIL'
+    END AS verdict,
+    attempts.*,
+    sessions.*,
+    handoffs.*
+FROM attempts
+CROSS JOIN sessions
+CROSS JOIN handoffs;
 
 WITH route_targets AS (
     SELECT

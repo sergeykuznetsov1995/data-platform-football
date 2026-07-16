@@ -9,7 +9,9 @@ always removed in ``finally`` blocks.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
+import subprocess
 import uuid
 from pathlib import Path
 from typing import Any, Mapping, Optional
@@ -17,6 +19,14 @@ from urllib.parse import urlsplit
 
 from pyarrow import fs
 
+from scrapers.fbref.browser_runtime import (
+    CAMOUFOX_BROWSER_RELEASE,
+    CAMOUFOX_BROWSER_VERSION,
+    CAMOUFOX_PACKAGE_VERSION,
+    CURL_CFFI_PACKAGE_VERSION,
+    INSTALL_DIR,
+    PLAYWRIGHT_PACKAGE_VERSION,
+)
 from scrapers.fbref.proxy_lease import FBREF_DAG_IDS, METER_ID
 
 
@@ -43,6 +53,79 @@ def validate_raw_store_uri(uri: object) -> str:
             f"{EXPECTED_RAW_STORE_URI!r}, got {normalized or '<missing>'!r}"
         )
     return normalized
+
+
+def validate_camoufox_runtime(
+    *,
+    package_version: Optional[str] = None,
+    playwright_version: Optional[str] = None,
+    curl_cffi_version: Optional[str] = None,
+    install_dir: Optional[object] = None,
+) -> dict[str, Any]:
+    """Require the reviewed browser stack before any paid lease is opened."""
+
+    try:
+        if (
+            package_version is None
+            or playwright_version is None
+            or curl_cffi_version is None
+        ):
+            from importlib.metadata import version
+
+            package_version = package_version or version("camoufox")
+            playwright_version = playwright_version or version("playwright")
+            curl_cffi_version = curl_cffi_version or version("curl_cffi")
+        if install_dir is None:
+            install_dir = INSTALL_DIR
+        root = Path(install_dir)
+        document = json.loads((root / "version.json").read_text("utf-8"))
+    except Exception as exc:  # noqa: BLE001 - local runtime boundary
+        raise ReadinessError(
+            f"FBref Camoufox runtime is unavailable: {type(exc).__name__}"
+        ) from exc
+    if not isinstance(document, Mapping):
+        raise ReadinessError("FBref Camoufox version document is invalid")
+    browser_version = str(document.get("version") or "")
+    browser_release = str(document.get("release") or "")
+    executable = root / "camoufox-bin"
+    if (
+        str(package_version) != CAMOUFOX_PACKAGE_VERSION
+        or str(playwright_version) != PLAYWRIGHT_PACKAGE_VERSION
+        or str(curl_cffi_version) != CURL_CFFI_PACKAGE_VERSION
+        or browser_version != CAMOUFOX_BROWSER_VERSION
+        or browser_release != CAMOUFOX_BROWSER_RELEASE
+        or not executable.is_file()
+        or not os.access(executable, os.X_OK)
+    ):
+        raise ReadinessError(
+            "FBref Camoufox runtime differs from the reviewed production pin"
+        )
+    try:
+        probe = subprocess.run(
+            [str(executable), "--version"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=10,
+            check=True,
+        )
+    except Exception as exc:  # noqa: BLE001 - local executable boundary
+        raise ReadinessError(
+            f"FBref Camoufox executable probe failed: {type(exc).__name__}"
+        ) from exc
+    expected_probe = f"Camoufox {browser_version}-{browser_release}"
+    if expected_probe not in str(probe.stdout or ""):
+        raise ReadinessError("FBref Camoufox executable version is invalid")
+    return {
+        "status": "passed",
+        "camoufox_package": str(package_version),
+        "camoufox_browser": f"{browser_version}-{browser_release}",
+        "playwright": str(playwright_version),
+        "curl_cffi": str(curl_cffi_version),
+        "executable_verified": True,
+        "executable_probe_verified": True,
+    }
 
 
 def validate_fbref_proxy_meter(
@@ -239,6 +322,7 @@ __all__ = [
     "ReadinessError",
     "check_raw_store_roundtrip",
     "check_trino_roundtrip",
+    "validate_camoufox_runtime",
     "validate_fbref_proxy_meter",
     "validate_raw_store_uri",
 ]
