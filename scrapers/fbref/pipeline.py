@@ -119,9 +119,12 @@ REPLAY_SOURCE_BYTE_LIMIT = 100 * MIB
 # clearance is dead — so the wave re-solves instead of failing every remaining
 # target against it.
 CLEARANCE_REJECTED_STATUSES = frozenset({401, 403, 429})
-# Each refresh costs one browser solve, so a source that rejects clearances
-# outright must still fail the wave rather than launch browsers in a loop.
-MAX_CLEARANCE_REFRESHES = 2
+# Each consecutive refresh costs one browser solve, so a source that rejects
+# fresh clearances outright must still fail the wave rather than launch
+# browsers in a loop. A productive warm session resets this streak: later
+# expiry is independent transport churn, not evidence that the source rejects
+# every fresh clearance.
+MAX_CONSECUTIVE_CLEARANCE_REFRESHES = 2
 
 logger = logging.getLogger(__name__)
 
@@ -362,7 +365,7 @@ class _LiveFetchSession:
     stack: ExitStack = field(default_factory=ExitStack)
     fetcher: Optional[object] = None
     session_id: Optional[str] = None
-    clearance_refreshes: int = 0
+    consecutive_clearance_refreshes: int = 0
     needs_clearance: bool = True
 
     def close(self, control, *, status: str) -> None:
@@ -1205,6 +1208,7 @@ class FBrefPipeline:
                     self._complete_from_record(
                         lease, record, historical=historical
                     )
+                    live_session.consecutive_clearance_refreshes = 0
                     result.fetched += 1
                     result.requests += (
                         response.http_requests + response.browser_requests
@@ -1332,7 +1336,7 @@ class FBrefPipeline:
                             transport_version=FETCHER_VERSION,
                             session_version=live_session.session_id,
                         )
-                        live_session.clearance_refreshes += 1
+                        live_session.consecutive_clearance_refreshes += 1
                         result.requeued_dead_clearance += 1
                         run_after_failure = self.control.get_run(run_id)
                         if run_after_failure is None:
@@ -1409,16 +1413,17 @@ class FBrefPipeline:
                         logger.warning(
                             "FBref clearance failed (%s, HTTP %s) — "
                             "%s stays in this run and the session is being "
-                            "re-solved on a fresh proxy (refresh %d/%d)",
+                            "re-solved on a fresh proxy "
+                            "(consecutive refresh %d/%d)",
                             exc.error_class,
                             exc.http_status,
                             lease.target_id,
-                            live_session.clearance_refreshes,
-                            MAX_CLEARANCE_REFRESHES,
+                            live_session.consecutive_clearance_refreshes,
+                            MAX_CONSECUTIVE_CLEARANCE_REFRESHES,
                         )
                         if (
-                            live_session.clearance_refreshes
-                            > MAX_CLEARANCE_REFRESHES
+                            live_session.consecutive_clearance_refreshes
+                            > MAX_CONSECUTIVE_CLEARANCE_REFRESHES
                         ):
                             untouched = leases[lease_index + 1:]
                             result.requeued_session_exhaustion += (
@@ -1428,7 +1433,7 @@ class FBrefPipeline:
                             )
                             result.failures.append(
                                 "clearance_session_refreshes_exhausted="
-                                f"{MAX_CLEARANCE_REFRESHES}"
+                                f"{MAX_CONSECUTIVE_CLEARANCE_REFRESHES}"
                             )
                             break
 
