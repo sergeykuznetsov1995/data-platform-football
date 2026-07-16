@@ -53,6 +53,13 @@
           "cohort_path": "proxy_canary_cohort.json",
           "cohort_name": "enabled_epl_2526_shape",
           "representative_season_id": 76986
+        },
+        {
+          "source_tournament_id": 8,
+          "tournament_slug": "laliga",
+          "cohort_path": "proxy_canary_cohort_laliga.json",
+          "cohort_name": "enabled_laliga_2526_shape",
+          "representative_season_id": 77559
         }
       ]
     },

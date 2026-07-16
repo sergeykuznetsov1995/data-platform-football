@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "cohort": "season_shape_only",
+  "source_tournament_id": 8,
+  "source_season_id": 77559,
+  "canonical_competition": "ESP-La Liga",
+  "canonical_season": "2526",
+  "selected_at": "2026-07-16",
+  "selection": "Season-shape target only: second measured tournament of the split_year/16_20 season class so the class transfers to unmeasured club leagues (>= 2 measured tournaments). La Liga has no production Bronze yet, so no frozen match/player cohort can be selected.",
+  "match_ids": [],
+  "match_collection_blocker": "no production Bronze for ESP-La Liga yet; match class stays measured on t16/t17",
+  "player_ids": [],
+  "player_collection_blocker": "no production Bronze for ESP-La Liga yet; player class stays measured on t16/t17"
+}
