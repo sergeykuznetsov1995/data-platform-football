@@ -35,12 +35,14 @@ logger = logging.getLogger(__name__)
 
 
 # Bronze DAGs actively triggered by this master run.
+# SofaScore moved to its own daily orchestrator ``dag_sofascore_pipeline``
+# (#951, master paused); re-adding it here without pausing that DAG would
+# double the ingest run and the xref/e3/e4 publication triggers.
 TRIGGERED_INGESTION_DAGS = [
     'dag_ingest_fotmob',
     'dag_ingest_matchhistory',
     'dag_ingest_understat',
     'dag_ingest_whoscored',
-    'dag_ingest_sofascore',
     'dag_ingest_espn',
     'dag_ingest_clubelo',
 ]
@@ -590,11 +592,9 @@ with DAG(
                 # Keep independent later sources running after a required
                 # source failure. The explicit gate below blocks transforms.
                 trigger_rule=('all_done' if prev_task else 'all_success'),
-                conf=(
-                    {"master_data_interval_end": "{{ data_interval_end }}"}
-                    if dag_id == "dag_ingest_sofascore"
-                    else {}
-                ),
+                # master_data_interval_end went to dag_sofascore_pipeline
+                # together with the sofascore trigger (#951).
+                conf={},
             )
 
             if prev_task:

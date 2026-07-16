@@ -39,6 +39,9 @@ WORLD_CUP_SEASON_SHAPE = production_season_shape(
 )
 EPL_SEASON_CLASS = season_workload_class(EPL_SEASON_SHAPE)
 WORLD_CUP_SEASON_CLASS = season_workload_class(WORLD_CUP_SEASON_SHAPE)
+# The paid canary measures these two tournaments; every other enabled league is
+# authorized through the by-shape transfer rule, never through its own samples.
+MEASURED_TOURNAMENT_IDS = {16, 17}
 
 
 @pytest.fixture
@@ -281,9 +284,12 @@ def test_workload_classes_are_derived_from_the_class_manifest():
     # shape is bound to the league sizes/formats it was actually measured on.
     assert _spec(MATCH_CLASS).measured_tournament_ids == (16, 17)
     assert _spec(PLAYER_CLASS).measured_tournament_ids == (16, 17)
-    assert _spec(EPL_SEASON_CLASS).measured_tournament_ids == (17,)
+    # #951+: t8 (La Liga) is the second measured tournament of the split_year
+    # season shape, so the class can transfer to the unmeasured club leagues.
+    assert _spec(EPL_SEASON_CLASS).measured_tournament_ids == (8, 17)
     assert _spec(WORLD_CUP_SEASON_CLASS).measured_tournament_ids == (16,)
     assert _target(EPL_SEASON_CLASS, 17).representative_season_id == 76986
+    assert _target(EPL_SEASON_CLASS, 8).representative_season_id == 77559
     assert _target(WORLD_CUP_SEASON_CLASS, 16).representative_season_id == 58210
     for spec in manifest.classes.values():
         for target in spec.targets:
@@ -376,11 +382,19 @@ def test_shipped_candidate_has_exact_required_v3_classes_and_shapes():
         for item in registry["tournaments"]
         if item["enabled"]
     }
-    assert enabled_ids == {16, 17}
+    # Wave 1 (#951): the top-5 club leagues plus the two measured tournaments,
+    # extended with the Russian Premier League (t203) by the owner's decision.
+    assert enabled_ids == {8, 16, 17, 23, 34, 35, 203}
+    # Only t16/t17 carry paid canary samples; the other enabled leagues rely on
+    # the by-shape transfer rule, which needs at least two measured tournaments.
+    assert len(MEASURED_TOURNAMENT_IDS) >= MIN_MEASURED_TOURNAMENTS_FOR_TRANSFER
+    assert MEASURED_TOURNAMENT_IDS <= enabled_ids
     for name in (MATCH_CLASS, PLAYER_CLASS):
         stored = payload["workload_classes"][name]
-        assert stored["measured_tournament_ids"] == sorted(enabled_ids)
-        assert set(stored["cohorts"]) == {str(value) for value in enabled_ids}
+        assert stored["measured_tournament_ids"] == sorted(MEASURED_TOURNAMENT_IDS)
+        assert set(stored["cohorts"]) == {
+            str(value) for value in MEASURED_TOURNAMENT_IDS
+        }
         assert "source_tournament_id" not in stored
         assert "source_tournament_id" not in stored["shape"]
     for name, shape in (
@@ -393,7 +407,7 @@ def test_shipped_candidate_has_exact_required_v3_classes_and_shapes():
         assert set(stored["required_endpoints"]) == set(canary.SEASON_ENDPOINTS)
     assert payload["workload_classes"][EPL_SEASON_CLASS][
         "representative_season_ids"
-    ] == {"17": 76986}
+    ] == {"17": 76986, "8": 77559}
 
 
 def test_fixed_cohort_splits_into_exact_match_and_player_classes(cohort):
@@ -488,8 +502,10 @@ def test_artifact_and_sample_reject_another_runtime_fingerprint(cohort):
 
 
 def test_sample_of_an_unmeasured_tournament_is_rejected(cohort):
+    # 23 (Serie A) transfers into the split_year shape but is never a measured
+    # target of the class (measured: t17 EPL + t8 La Liga since #951+).
     sample = _sample(EPL_SEASON_CLASS, "foreign", "cold", tournament_id=17)
-    sample["source_tournament_id"] = 8
+    sample["source_tournament_id"] = 23
 
     with pytest.raises(canary.CanaryPolicyError, match="not a measured target"):
         canary.validate_sample(sample, cohort=cohort, cap=CAP)
