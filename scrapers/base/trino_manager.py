@@ -14,7 +14,7 @@ import os
 import time
 import uuid
 from datetime import date, datetime
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -492,6 +492,7 @@ WITH (
         table: str,
         df: pd.DataFrame,
         batch_size: int = 1000,
+        column_types: Optional[Mapping[str, str]] = None,
     ) -> int:
         """
         Insert DataFrame rows into Iceberg table via VALUES clause.
@@ -505,6 +506,9 @@ WITH (
             table: Table name
             df: Pandas DataFrame to insert
             batch_size: Number of rows per INSERT statement (default 1000)
+            column_types: Optional already-verified target column types.  The
+                caller may supply these when the staging table was copied from
+                a target whose schema it just inspected.
 
         Returns:
             Number of rows inserted
@@ -515,11 +519,17 @@ WITH (
 
         # Fetch actual table column types for type-safe casting
         table_col_types: Dict[str, str] = {}
-        try:
-            raw_types = self.get_table_columns(schema, table)
-            table_col_types = {k.lower(): v for k, v in raw_types.items()}
-        except Exception as e:
-            logger.debug(f"Could not fetch table column types: {e}")
+        if column_types is not None:
+            table_col_types = {
+                str(name).lower(): str(column_type)
+                for name, column_type in column_types.items()
+            }
+        else:
+            try:
+                raw_types = self.get_table_columns(schema, table)
+                table_col_types = {k.lower(): v for k, v in raw_types.items()}
+            except Exception as e:
+                logger.debug(f"Could not fetch table column types: {e}")
 
         qualified = validate_catalog_qualified_name(self.catalog, schema, table)
 
@@ -585,6 +595,7 @@ WITH (
         staging_id: Optional[str] = None,
         merge_keys: Optional[Sequence[str]] = None,
         single_statement_replace: bool = False,
+        target_column_types: Optional[Mapping[str, str]] = None,
     ) -> int:
         """
         Insert a DataFrame so the target table receives exactly ONE snapshot.
@@ -626,6 +637,9 @@ WITH (
                 tombstones copied from the current target, eliminating the
                 committed-empty window between DELETE and INSERT.
             staging_id: Optional caller-owned unique staging suffix.
+            target_column_types: Optional already-verified target schema used
+                to render type-safe stage literals without DESCRIBE on the
+                unique staging table.
 
         Returns:
             Number of rows inserted into the target
@@ -714,8 +728,24 @@ WITH (
         # --- Phase 1: stage every row (all the slow, flaky network I/O). The
         # target is NOT touched yet, so any failure here leaves it intact (#314).
         try:
+            stage_column_types = (
+                None
+                if target_column_types is None
+                else dict(target_column_types)
+            )
+            if stage_column_types is not None and single_statement_replace:
+                stage_column_types[replace_op] = "VARCHAR"
+            insert_options = (
+                {}
+                if stage_column_types is None
+                else {"column_types": stage_column_types}
+            )
             inserted = self.insert_dataframe(
-                schema, stage, staged_frame, batch_size
+                schema,
+                stage,
+                staged_frame,
+                batch_size,
+                **insert_options,
             )
             staged = self._execute(
                 f"SELECT count(*) FROM {qualified_stage}"

@@ -233,6 +233,7 @@ class _TrinoManager(Protocol):
         delete_filter: Optional[str] = None,
         staging_id: Optional[str] = None,
         single_statement_replace: bool = False,
+        target_column_types: Optional[Mapping[str, str]] = None,
     ) -> int: ...
 
 
@@ -662,13 +663,44 @@ class FBrefTypedBronzeWriter:
             manager = TrinoTableManager()
         self.manager = manager
         self.schema = schema
+        # A writer lives for one bounded raw-first runner process.  Cache only
+        # affirmative target metadata: another observation may introduce an
+        # additive parser column, while a transient failed existence probe must
+        # never become a cached "table is absent" decision.
+        self._known_tables: set[str] = set()
+        self._table_columns: Dict[str, Dict[str, str]] = {}
 
-    def _ensure_table(self, table: str, frame: pd.DataFrame) -> None:
+    @staticmethod
+    def _normalized_columns(
+        columns: Mapping[str, str],
+    ) -> Dict[str, str]:
+        return {
+            str(name).casefold(): str(column_type)
+            for name, column_type in columns.items()
+        }
+
+    def _cached_table_columns(self, table: str) -> Dict[str, str]:
+        cached = self._table_columns.get(table)
+        if cached is not None:
+            return cached
+        columns = self._normalized_columns(
+            self.manager.get_table_columns(self.schema, table)
+        )
+        # Publish the cache only after DESCRIBE completed successfully.
+        self._table_columns[table] = columns
+        self._known_tables.add(table)
+        return columns
+
+    def _ensure_table(
+        self, table: str, frame: pd.DataFrame
+    ) -> Dict[str, str]:
         arrow_schema = pa.Table.from_pandas(
             frame, preserve_index=False
         ).schema
         columns = self.manager.arrow_schema_to_trino(arrow_schema)
-        if not self.manager.table_exists(self.schema, table):
+        if table not in self._known_tables and not self.manager.table_exists(
+            self.schema, table
+        ):
             partitions = [
                 column
                 for column in ("league", "season")
@@ -680,19 +712,21 @@ class FBrefTypedBronzeWriter:
                 columns,
                 partition_columns=partitions or None,
             )
-            return
-
-        existing = {
-            name.casefold()
-            for name in self.manager.get_table_columns(
-                self.schema, table
-            )
-        }
+            # ``table_exists`` is intentionally fail-closed and can return
+            # False after a transient Trino error.  CREATE IF NOT EXISTS may
+            # therefore be a no-op for an existing table: always DESCRIBE the
+            # installed schema instead of trusting parser-inferred types.
+        existing = self._cached_table_columns(table)
         for name, column_type in columns.items():
             if name.casefold() not in existing:
                 self.manager.add_column(
                     self.schema, table, name, column_type
                 )
+                # Additive schema evolution is visible to every later frame in
+                # this writer.  Update only after ALTER succeeds so a retry
+                # still attempts the missing column after any failure.
+                existing[name.casefold()] = column_type
+        return dict(existing)
 
     @staticmethod
     def _decorate(
@@ -729,7 +763,7 @@ class FBrefTypedBronzeWriter:
             run_id=run_id,
             ingested_at=ingested_at,
         )
-        self._ensure_table(table, decorated)
+        target_column_types = self._ensure_table(table, decorated)
         staging_id = _staging_identity(
             run_id, target_identity, dataset, table
         )
@@ -740,6 +774,7 @@ class FBrefTypedBronzeWriter:
             delete_filter=delete_filter,
             staging_id=staging_id,
             single_statement_replace=True,
+            target_column_types=target_column_types,
         )
         if inserted != len(decorated):
             raise TypedBronzePersistenceError(
@@ -757,19 +792,16 @@ class FBrefTypedBronzeWriter:
     ) -> int:
         # A never-created typed table is already the desired empty state. Do
         # not invent a schema from a zero-row frame merely to record success.
-        if not self.manager.table_exists(self.schema, table):
-            return 0
+        if table not in self._known_tables:
+            if not self.manager.table_exists(self.schema, table):
+                return 0
+            self._known_tables.add(table)
         if source_partition:
             # Legacy typed tables predate source-native identity. The empty
             # replacement filter uses these columns, so migrate them before
             # issuing its DELETE just as the non-empty path does in
             # ``_ensure_table``.
-            existing = {
-                name.casefold()
-                for name in self.manager.get_table_columns(
-                    self.schema, table
-                )
-            }
+            existing = self._cached_table_columns(table)
             for column in (
                 "source_competition_id",
                 "source_season_id",
@@ -778,6 +810,7 @@ class FBrefTypedBronzeWriter:
                     self.manager.add_column(
                         self.schema, table, column, "VARCHAR"
                     )
+                    existing[column.casefold()] = "VARCHAR"
         deleted = self.manager.insert_dataframe_atomic(
             self.schema,
             table,

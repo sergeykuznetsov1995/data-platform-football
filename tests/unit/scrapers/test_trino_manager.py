@@ -340,6 +340,35 @@ class TestTrinoTableManagerInsertDataFrame:
             assert 'Arsenal' in call_sql
             assert 'Liverpool' in call_sql
 
+    def test_verified_column_types_skip_stage_describe(self):
+        """A caller-owned schema removes only the redundant metadata query."""
+        import pandas as pd
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.trino_manager import TrinoTableManager
+
+            manager = TrinoTableManager()
+            mock_cursor = MagicMock()
+            mock_cursor.execute.return_value = None
+            mock_conn = MagicMock()
+            mock_conn.cursor.return_value = mock_cursor
+            manager._conn = mock_conn
+
+            result = manager.insert_dataframe(
+                'bronze',
+                'typed_stage',
+                pd.DataFrame({'match_id': ['m1'], 'goals': [2]}),
+                column_types={
+                    'match_id': 'VARCHAR',
+                    'goals': 'BIGINT',
+                },
+            )
+
+            assert result == 1
+            assert mock_cursor.execute.call_count == 1
+            sql = mock_cursor.execute.call_args.args[0]
+            assert 'INSERT INTO iceberg.bronze.typed_stage' in sql
+            assert 'CAST(2 AS BIGINT)' in sql
+
     def test_insert_dataframe_empty(self):
         """Test empty DataFrame insertion returns 0."""
         import pandas as pd
@@ -616,6 +645,37 @@ class TestTrinoTableManagerInsertDataFrameAtomic:
             staged_frame = insert.call_args.args[2]
             assert staged_frame['__dpf_replace_op'].tolist() == ['insert']
             drop.assert_called_once()
+
+    def test_atomic_stage_reuses_verified_target_column_types(self):
+        """A unique stage needs no DESCRIBE when its target was just checked."""
+        import pandas as pd
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.trino_manager import TrinoTableManager
+
+            manager = TrinoTableManager()
+            df = pd.DataFrame({'match_id': ['m1'], 'goals': [2]})
+            with patch.object(
+                manager, '_execute', side_effect=self._exec_ok(1)
+            ), patch.object(
+                manager, 'insert_dataframe', return_value=1
+            ) as insert, patch.object(manager, 'drop_table'):
+                manager.insert_dataframe_atomic(
+                    'bronze',
+                    'fbref_match_team_stats',
+                    df,
+                    delete_filter="match_id = 'm1'",
+                    single_statement_replace=True,
+                    target_column_types={
+                        'match_id': 'VARCHAR',
+                        'goals': 'BIGINT',
+                    },
+                )
+
+            assert insert.call_args.kwargs['column_types'] == {
+                'match_id': 'VARCHAR',
+                'goals': 'BIGINT',
+                '__dpf_replace_op': 'VARCHAR',
+            }
 
     def test_deterministic_stage_is_cleared_before_retry_and_after_success(self):
         """A retained phase-two stage cannot make an Airflow retry collide."""
