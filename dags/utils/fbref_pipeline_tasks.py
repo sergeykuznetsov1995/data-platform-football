@@ -266,6 +266,7 @@ def validate_fbref_production_readiness(
     from scrapers.fbref.readiness import (
         check_raw_store_roundtrip,
         check_trino_roundtrip,
+        validate_camoufox_runtime,
         validate_fbref_proxy_meter,
         validate_raw_store_uri,
     )
@@ -283,7 +284,9 @@ def validate_fbref_production_readiness(
     raw_health = check_raw_store_roundtrip(raw_store)
     trino_health = check_trino_roundtrip(TrinoTableManager())
     proxy = {}
+    browser = {}
     if limits["run_type"] != "replay":
+        browser = validate_camoufox_runtime()
         proxy = validate_fbref_proxy_meter(
             os.environ.get("FBREF_PROXY_CONTROL_URL"),
             control_token=os.environ.get("FBREF_PROXY_CONTROL_TOKEN"),
@@ -300,6 +303,7 @@ def validate_fbref_production_readiness(
             "control_migrations": migrations,
             "raw_store": raw_health,
             "trino": trino_health,
+            "camoufox": browser or {"status": "not_required"},
             "proxy_meter": proxy or {"status": "not_required"},
         },
     }

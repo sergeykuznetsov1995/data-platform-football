@@ -110,6 +110,13 @@ def test_production_readiness_combines_alert_env_and_runtime_limits(monkeypatch)
         "minimum_configured": 4,
         "probe": "authenticated_control_only_zero_paid_bytes",
     })
+    browser_check = MagicMock(return_value={
+        "status": "passed",
+        "camoufox_browser": "152.0.4-beta.26",
+    })
+    monkeypatch.setattr(
+        "scrapers.fbref.readiness.validate_camoufox_runtime", browser_check
+    )
     monkeypatch.setattr(
         "scrapers.fbref.readiness.validate_fbref_proxy_meter", proxy_check
     )
@@ -157,16 +164,48 @@ def test_production_readiness_combines_alert_env_and_runtime_limits(monkeypatch)
     assert result["dependencies"]["control_migrations"]["read_only"] is True
     assert result["dependencies"]["raw_store"] == {"status": "passed"}
     assert result["dependencies"]["trino"] == {"status": "passed"}
+    assert result["dependencies"]["camoufox"] == {
+        "status": "passed",
+        "camoufox_browser": "152.0.4-beta.26",
+    }
     control.validate_migrations.assert_called_once_with()
     raw_from_uri.assert_called_once_with("s3://football/raw/fbref")
     raw_health.assert_called_once_with(raw_store)
     trino_health.assert_called_once_with(trino)
+    browser_check.assert_called_once_with()
     proxy_check.assert_called_once_with(
         "http://fbref_proxy_filter:8899",
         control_token="t" * 32,
         required_bytes=100 * fbref_pipeline_tasks.MIB,
         minimum_configured_exits=4,
     )
+
+    replay = fbref_pipeline_tasks.validate_fbref_production_readiness(
+        run_type="replay",
+        request_limit=0,
+        byte_limit_mb=0,
+        shard_size=25,
+    )
+
+    assert replay["dependencies"]["camoufox"] == {
+        "status": "not_required"
+    }
+    assert replay["dependencies"]["proxy_meter"] == {
+        "status": "not_required"
+    }
+    browser_check.assert_called_once_with()
+    proxy_check.assert_called_once()
+
+    browser_check.side_effect = RuntimeError("broken browser")
+    with pytest.raises(RuntimeError, match="broken browser"):
+        fbref_pipeline_tasks.validate_fbref_production_readiness(
+            run_type="current",
+            request_limit=200,
+            byte_limit_mb=100,
+            shard_size=25,
+        )
+    # A broken local browser must stop the run before the paid proxy is probed.
+    proxy_check.assert_called_once()
 
 
 @pytest.mark.unit

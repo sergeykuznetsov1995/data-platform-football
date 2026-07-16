@@ -10,6 +10,7 @@ from scrapers.fbref.readiness import (
     ReadinessError,
     check_raw_store_roundtrip,
     check_trino_roundtrip,
+    validate_camoufox_runtime,
     validate_fbref_proxy_meter,
     validate_raw_store_uri,
 )
@@ -22,6 +23,82 @@ def test_raw_store_uri_is_exact_and_fail_closed():
     )
     with pytest.raises(ReadinessError, match="FBREF_RAW_STORE_URI"):
         validate_raw_store_uri("/tmp/fbref")
+
+
+def _camoufox_install(tmp_path, *, version="152.0.4", release="beta.26"):
+    root = tmp_path / "camoufox"
+    root.mkdir()
+    (root / "version.json").write_text(
+        '{"version":"%s","release":"%s"}' % (version, release),
+        encoding="utf-8",
+    )
+    executable = root / "camoufox-bin"
+    executable.write_text(
+        f"#!/bin/sh\nprintf '%s\\n' "
+        f"'Camoufox Camoufox {version}-{release}'\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    return root
+
+
+def test_camoufox_runtime_requires_the_reviewed_exact_stack(tmp_path):
+    result = validate_camoufox_runtime(
+        package_version="0.4.11",
+        playwright_version="1.59.0",
+        curl_cffi_version="0.15.0",
+        install_dir=_camoufox_install(tmp_path),
+    )
+
+    assert result == {
+        "status": "passed",
+        "camoufox_package": "0.4.11",
+        "camoufox_browser": "152.0.4-beta.26",
+        "playwright": "1.59.0",
+        "curl_cffi": "0.15.0",
+        "executable_verified": True,
+        "executable_probe_verified": True,
+    }
+
+
+@pytest.mark.parametrize(
+    ("package", "playwright", "curl_cffi", "browser", "release"),
+    [
+        ("0.4.10", "1.59.0", "0.15.0", "152.0.4", "beta.26"),
+        ("0.4.11", "1.60.0", "0.15.0", "152.0.4", "beta.26"),
+        ("0.4.11", "1.59.0", "0.14.0", "152.0.4", "beta.26"),
+        ("0.4.11", "1.59.0", "0.15.0", "135.0.1", "beta.24"),
+        ("0.4.11", "1.59.0", "0.15.0", "152.0.4", "beta.25"),
+    ],
+)
+def test_camoufox_runtime_rejects_unreviewed_drift(
+    tmp_path, package, playwright, curl_cffi, browser, release
+):
+    with pytest.raises(ReadinessError, match="reviewed production pin"):
+        validate_camoufox_runtime(
+            package_version=package,
+            playwright_version=playwright,
+            curl_cffi_version=curl_cffi,
+            install_dir=_camoufox_install(
+                tmp_path, version=browser, release=release
+            ),
+        )
+
+
+def test_camoufox_runtime_rejects_a_broken_executable(tmp_path):
+    root = _camoufox_install(tmp_path)
+    (root / "camoufox-bin").write_text(
+        "#!/bin/sh\nprintf '%s\\n' 'wrong browser'\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ReadinessError, match="version is invalid"):
+        validate_camoufox_runtime(
+            package_version="0.4.11",
+            playwright_version="1.59.0",
+            curl_cffi_version="0.15.0",
+            install_dir=root,
+        )
 
 
 def _meter_payload(**changes):

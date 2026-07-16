@@ -113,6 +113,8 @@ x-airflow-common: &airflow-common
     # Airflow: discovery writes the host-side versioned registry, never a
     # scheduler/worker checkout at runtime.
     - ./configs/sofascore:/opt/airflow/configs/sofascore:ro
+    # Shared paid-canary runtime fingerprint input. Airflow only reads it.
+    - ./configs/proxy_filter:/opt/airflow/configs/proxy_filter:ro
     # SSO-конфиг: читает только webserver, scheduler игнорирует (фаза 6)
     - ./configs/airflow/webserver_config.py:/opt/airflow/webserver_config.py:ro
     - ./scrapers:/opt/airflow/scrapers
@@ -423,11 +425,11 @@ services:
   airflow-scheduler:
     <<: *airflow-common
     # The live scheduler runtime is Airflow 2.11.2.  Use the narrow
-    # Transfermarkt overlay so a future `compose build airflow-scheduler`
+    # scheduler overlay so a future `compose build airflow-scheduler`
     # cannot fall back to the repository's older full-image Dockerfile.
     build:
       context: ./docker/images/airflow
-      dockerfile: Dockerfile.transfermarkt-runtime
+      dockerfile: Dockerfile.scheduler-runtime
       args:
         AIRFLOW_RUNTIME_BASE: ${AIRFLOW_RUNTIME_BASE:-data-platform-airflow-webserver:latest}
     container_name: airflow-scheduler
