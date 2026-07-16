@@ -39,6 +39,10 @@ from scrapers.fbref.policy import (
     OTHER_PUBLICATION_CRITICAL_PAGE_KINDS,
     PUBLICATION_FRESHNESS_PAGE_KINDS,
 )
+from scrapers.fbref.settings import (
+    DEFAULT_DOMAIN_INTERVAL_SECONDS,
+    MIN_DOMAIN_INTERVAL_SECONDS,
+)
 
 
 class ControlStoreError(RuntimeError):
@@ -6388,13 +6392,16 @@ class ControlStore:
         self,
         domain: object = "fbref.com",
         *,
-        interval_seconds: float = 3.0,
+        interval_seconds: float = DEFAULT_DOMAIN_INTERVAL_SECONDS,
     ) -> ThrottleSlot:
         """Atomically reserve one globally spaced request time for a domain."""
         normalized_domain = _text(domain, "domain").lower()
         interval = float(interval_seconds)
-        if interval <= 0:
-            raise ValueError("interval_seconds must be positive")
+        if interval < MIN_DOMAIN_INTERVAL_SECONDS:
+            raise ValueError(
+                "interval_seconds must respect the FBref "
+                f"{MIN_DOMAIN_INTERVAL_SECONDS:g}-second source minimum"
+            )
         token = str(uuid.uuid4())
         with self._transaction() as cursor:
             cursor.execute(

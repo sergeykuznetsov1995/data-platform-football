@@ -239,7 +239,7 @@ def test_postgres_companion_proves_explicit_empty_season_manifests():
     assert "match_control_manifest_matrix" in CONTROL_SQL
     assert "backfill/200/100" in CONTROL_SQL
     assert "reviewed_live_transport" in CONTROL_SQL
-    assert "fbref-camoufox-metered-warm-http-v6" in CONTROL_SQL
+    assert "fbref-camoufox-metered-warm-http-v7" in CONTROL_SQL
     assert "successful_warm_http_attempts > 0" in CONTROL_SQL
     assert "attempt.session_version = session.session_id::text" in CONTROL_SQL
     assert "status IN ('closed', 'failed', 'expired')" in CONTROL_SQL

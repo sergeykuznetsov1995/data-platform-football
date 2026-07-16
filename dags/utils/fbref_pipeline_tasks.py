@@ -25,6 +25,7 @@ from scrapers.fbref.policy import (
 )
 from scrapers.fbref.settings import (
     DEFAULT_BYTE_LIMIT,
+    DEFAULT_DOMAIN_INTERVAL_SECONDS,
     DEFAULT_REQUEST_LIMIT,
     DEFAULT_REQUEST_RESERVATION_BYTES,
     DEFAULT_SHARD_SIZE,
@@ -196,7 +197,7 @@ def _settings(
     byte_limit_mb=DEFAULT_BYTE_LIMIT // MIB,
     shard_size=DEFAULT_SHARD_SIZE,
     reservation_mb=DEFAULT_REQUEST_RESERVATION_BYTES // MIB,
-    domain_interval_seconds=3.0,
+    domain_interval_seconds=DEFAULT_DOMAIN_INTERVAL_SECONDS,
 ) -> object:
     from scrapers.fbref.pipeline import PipelineSettings
 
@@ -1261,7 +1262,7 @@ def initialize_fbref_run(
     byte_limit_mb=DEFAULT_BYTE_LIMIT // MIB,
     shard_size=DEFAULT_SHARD_SIZE,
     reservation_mb=DEFAULT_REQUEST_RESERVATION_BYTES // MIB,
-    domain_interval_seconds=3.0,
+    domain_interval_seconds=DEFAULT_DOMAIN_INTERVAL_SECONDS,
     bootstrap_only=False,
     dag_run_type=None,
 ) -> str:
@@ -1723,7 +1724,7 @@ def run_fbref_live_waves(
     byte_limit_mb=DEFAULT_BYTE_LIMIT // MIB,
     shard_size=DEFAULT_SHARD_SIZE,
     reservation_mb=DEFAULT_REQUEST_RESERVATION_BYTES // MIB,
-    domain_interval_seconds=3.0,
+    domain_interval_seconds=DEFAULT_DOMAIN_INTERVAL_SECONDS,
     max_batches: int = FBREF_MAX_LIVE_BATCHES,
 ) -> dict:
     """Run all bounded live batches in one warm, unforked subprocess."""

@@ -225,7 +225,8 @@ Hard defaults and caps:
   late in-flight traffic cannot continue after reservation settlement;
 - shard size is at most 25 for current and backfill; the live runner drains at
   most 16 batches under the single shared run budget;
-- domain interval: three seconds.
+- domain interval: 6.1 seconds (the published FBref ceiling is ten page
+  requests per minute).
 
 The control budget is reserved before transport and fails validation on an
 overspend. The transport also fails closed before an individual response can

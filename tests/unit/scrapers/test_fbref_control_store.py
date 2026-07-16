@@ -25,6 +25,10 @@ from scrapers.fbref.policy import (
     PUBLICATION_FRESHNESS_PAGE_KINDS,
     PUBLICATION_REQUIRED_PAGE_KINDS,
 )
+from scrapers.fbref.settings import (
+    DEFAULT_DOMAIN_INTERVAL_SECONDS,
+    MIN_DOMAIN_INTERVAL_SECONDS,
+)
 
 
 class FakeCursor:
@@ -81,6 +85,18 @@ class FakeFactory:
         connection = FakeConnection(self.handler)
         self.connections.append(connection)
         return connection
+
+
+def test_domain_throttle_default_cannot_bypass_the_source_minimum():
+    default = inspect.signature(ControlStore.reserve_domain_slot).parameters[
+        "interval_seconds"
+    ].default
+    assert default == DEFAULT_DOMAIN_INTERVAL_SECONDS
+    store = ControlStore("postgresql://airflow:pw@postgres/airflow")
+    with pytest.raises(ValueError, match="source minimum"):
+        store.reserve_domain_slot(
+            interval_seconds=MIN_DOMAIN_INTERVAL_SECONDS - 0.001
+        )
 
 
 def test_control_uri_prefers_explicit_and_normalizes_airflow_driver():

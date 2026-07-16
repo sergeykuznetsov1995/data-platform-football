@@ -12,6 +12,7 @@ import pytest
 
 from dags.scripts import run_fbref_live_waves as runner
 from dags.scripts.run_fbref_live_waves import _arm_parent_death_containment
+from scrapers.fbref.settings import DEFAULT_DOMAIN_INTERVAL_SECONDS
 
 
 def test_parent_death_signal_is_armed_before_parent_identity_is_checked():
@@ -72,7 +73,7 @@ def test_bootstrap_control_run_is_allowed_through_live_transport(
         byte_limit_mb=100,
         shard_size=25,
         reservation_mb=3,
-        domain_interval_seconds=3.0,
+        domain_interval_seconds=DEFAULT_DOMAIN_INTERVAL_SECONDS,
         max_batches=16,
     )
 

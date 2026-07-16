@@ -86,7 +86,7 @@ SELECT
 FROM selected_run;
 
 -- Prove that a live run crossed the Firefox-152 -> warm-HTTP handoff with the
--- reviewed v6 transport. Replay must remain completely network-free.
+-- reviewed v7 transport. Replay must remain completely network-free.
 WITH attempts AS (
     SELECT
         count(*) AS all_fetch_attempts,
@@ -101,7 +101,7 @@ WITH attempts AS (
         count(*) FILTER (
             WHERE reservation_id IS NOT NULL
               AND transport_version IS DISTINCT FROM
-                  'fbref-camoufox-metered-warm-http-v6'
+                  'fbref-camoufox-metered-warm-http-v7'
         ) AS unexpected_transport_versions
     FROM fbref_control.fetch_attempt
     WHERE run_id = CAST(:control_run_id AS uuid)
@@ -114,7 +114,7 @@ WITH attempts AS (
         count(*) FILTER (WHERE status = 'active') AS active_sessions,
         count(*) FILTER (
             WHERE session_version IS DISTINCT FROM
-                'fbref-camoufox-metered-warm-http-v6'
+                'fbref-camoufox-metered-warm-http-v7'
         ) AS unexpected_session_versions
     FROM fbref_control.clearance_session
     WHERE run_id = CAST(:control_run_id AS uuid)
@@ -125,10 +125,10 @@ WITH attempts AS (
               AND attempt.status = 'succeeded'
               AND attempt.http_status IN (200, 304)
               AND attempt.transport_version =
-                  'fbref-camoufox-metered-warm-http-v6'
+                  'fbref-camoufox-metered-warm-http-v7'
               AND session.session_id IS NOT NULL
               AND session.session_version =
-                  'fbref-camoufox-metered-warm-http-v6'
+                  'fbref-camoufox-metered-warm-http-v7'
               AND session.status IN ('closed', 'failed', 'expired')
               AND session.browser_bootstrap_attempts > 0
               AND session.browser_bootstrap_requests > 0
@@ -141,9 +141,9 @@ WITH attempts AS (
               AND (
                   session.session_id IS NULL
                   OR attempt.transport_version IS DISTINCT FROM
-                      'fbref-camoufox-metered-warm-http-v6'
+                      'fbref-camoufox-metered-warm-http-v7'
                   OR session.session_version IS DISTINCT FROM
-                      'fbref-camoufox-metered-warm-http-v6'
+                      'fbref-camoufox-metered-warm-http-v7'
                   OR session.status NOT IN ('closed', 'failed', 'expired')
                   OR session.browser_bootstrap_attempts <= 0
                   OR session.browser_bootstrap_requests <= 0
