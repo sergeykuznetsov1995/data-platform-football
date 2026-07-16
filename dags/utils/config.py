@@ -95,8 +95,12 @@ SCHEDULES: Dict[str, Optional[str]] = {
     'dag_ingest_understat': '0 9 * * *',     # 9:00 UTC daily
     'dag_ingest_whoscored': '0 10 * * *',    # 10:00 UTC daily
     # Daily ingestion (including the Saturday player branch) is orchestrated by
-    # dag_master_pipeline. A second source cron duplicated billable proxy traffic.
+    # dag_sofascore_pipeline (#951; the paused master no longer triggers this
+    # source). A second source cron duplicated billable proxy traffic.
     'dag_ingest_sofascore': None,
+    # Master's own 14:00 slot: resolve_scheduled_fbref_control_run subtracts
+    # 8h from logical_date to pin the 06:00 FBref generation for xref.
+    'dag_sofascore_pipeline': '0 14 * * *',
     'dag_ingest_espn': '0 12 * * *',         # 12:00 UTC daily
     'dag_ingest_clubelo': '0 13 * * *',      # 13:00 UTC daily
     'dag_ingest_sofifa': '0 6 * * 0',        # 6:00 UTC Sunday (weekly)

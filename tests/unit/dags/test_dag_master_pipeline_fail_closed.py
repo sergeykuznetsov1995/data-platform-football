@@ -78,17 +78,21 @@ def test_required_source_gate_waits_for_all_ingestion_and_blocks_transforms():
 
     # #933: FBref is externally scheduled at 06:00 and only sensed here — it
     # must not appear among the master-triggered ingestion tasks.
+    # #951: SofaScore moved to dag_sofascore_pipeline — re-triggering it here
+    # would double the ingest run and the publication slot.
     expected_ingestion = {
         "ingestion_triggers.trigger_fotmob",
         "ingestion_triggers.trigger_matchhistory",
         "ingestion_triggers.trigger_understat",
         "ingestion_triggers.trigger_whoscored",
-        "ingestion_triggers.trigger_sofascore",
         "ingestion_triggers.trigger_espn",
         "ingestion_triggers.trigger_clubelo",
     }
     assert expected_ingestion <= gate.upstream_task_ids
     assert "ingestion_triggers.trigger_fbref" not in gate.upstream_task_ids
+    assert (
+        "ingestion_triggers.trigger_sofascore" not in gate.upstream_task_ids
+    )
     assert gate._init_kwargs["trigger_rule"] == "all_done"
     assert fbref_sensor.upstream_task_ids == set()
     assert gate.task_id in scope.upstream_task_ids
