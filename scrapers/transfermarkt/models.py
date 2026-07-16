@@ -51,23 +51,23 @@ Sized at 1.2x the measured upper estimate of a cold big-league scope
 SCOPE_SOFT_PROVIDER_BYTE_STOP = 23_068_672
 """Graceful per-scope stop (22 MiB): no new paid request starts past it."""
 
-PARENT_DAILY_HARD_PROVIDER_BYTE_CAP = 88_080_384
-"""Hard provider-metered cap for one parent (daily) cycle (84 MiB).
+PARENT_DAILY_HARD_PROVIDER_BYTE_CAP = 352_321_536
+"""Hard provider-metered cap for one parent (daily) cycle (336 MiB).
 
-The external proxy-filter allowance is 100 MB/day (~95.4 MiB); this keeps a
-~12% reserve under it.  Raising the external allowance (e.g. to 400 MB/day)
-means editing this pair AND ``EXTERNAL_DAILY_PROVIDER_BYTE_LIMIT`` (the
-import-time canon assert bounds the pair by it), plus the proxy-filter's own
-per-DagRun cap in the deployment.  Evidence already committed under an older,
-smaller pair stays valid: readiness reads the persisted ledger caps as a
-ceiling, not as an equality.
+The external proxy-filter allowance is 400 MB/day (~381.5 MiB); this keeps a
+~12% reserve under it.  Raising the external allowance further means editing
+this pair AND ``EXTERNAL_DAILY_PROVIDER_BYTE_LIMIT`` (the import-time canon
+assert bounds the pair by it), plus the proxy-filter's own per-DagRun cap in
+the deployment.  Evidence already committed under an older, smaller pair
+stays valid: readiness reads the persisted ledger caps as a ceiling, not as
+an equality.
 """
 
-PARENT_DAILY_SOFT_PROVIDER_BYTE_STOP = 83_886_080
-"""Graceful parent-cycle stop (80 MiB) before the daily hard cap."""
+PARENT_DAILY_SOFT_PROVIDER_BYTE_STOP = 335_544_320
+"""Graceful parent-cycle stop (320 MiB) before the daily hard cap."""
 
-EXTERNAL_DAILY_PROVIDER_BYTE_LIMIT = 100_000_000
-"""Documented external proxy-filter allowance (100 MB/day)."""
+EXTERNAL_DAILY_PROVIDER_BYTE_LIMIT = 400_000_000
+"""Documented external proxy-filter allowance (400 MB/day)."""
 
 SCOPE_REQUEST_LIMIT = 1_610
 """Attempt ceiling for one scope cycle (150 + 650 + 650 + 160)."""

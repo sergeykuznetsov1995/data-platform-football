@@ -1356,25 +1356,25 @@ def _update_daily_ledger(identity, manifest):
     )
 
 
-def test_parent_daily_ledger_admits_four_full_scopes_and_stops_the_next_byte(
+def test_parent_daily_ledger_admits_sixteen_full_scopes_and_stops_the_next_byte(
     tmp_path,
 ):
-    # A cold big-league scope costs ~18-21 MiB; four of them at 21 MiB land
-    # exactly on the 84 MiB daily budget and every one must be admitted.
+    # A cold big-league scope costs ~18-21 MiB; sixteen of them at 21 MiB land
+    # exactly on the 336 MiB daily budget and every one must be admitted.
     per_scope = 21 * cycle.MIB
-    assert 4 * per_scope == cycle.PARENT_BYTE_BUDGET
+    assert 16 * per_scope == cycle.PARENT_BYTE_BUDGET
     payload = None
-    for index in range(4):
+    for index in range(16):
         identity, manifest = _daily_scope_fixture(tmp_path, index, per_scope)
         payload = _update_daily_ledger(identity, manifest)
 
-    assert payload['manifest_count'] == 4
+    assert payload['manifest_count'] == 16
     assert payload['provider_metered_bytes'] == cycle.PARENT_BYTE_BUDGET
     assert payload['hard_provider_byte_budget'] == cycle.PARENT_BYTE_BUDGET
     assert payload['soft_provider_byte_stop'] == cycle.PARENT_SOFT_BYTE_STOP
 
     # One more byte anywhere in the day pierces the parent budget.
-    identity, manifest = _daily_scope_fixture(tmp_path, 4, 1)
+    identity, manifest = _daily_scope_fixture(tmp_path, 16, 1)
     with pytest.raises(
         cycle.ScopeCycleError, match='parent provider byte budget exceeded',
     ):
@@ -1437,14 +1437,14 @@ def _write_sibling_scope_ledger(
     )
 
 
-def test_daily_admission_accepts_the_fourth_scope_at_sixty_mib(tmp_path):
+def test_daily_admission_accepts_the_last_scope_the_day_can_hold(tmp_path):
     payload = _payload(tmp_path)
     argv, _ = _approved_args(tmp_path, payload)
     args = _parse_args(argv)
-    for index in range(3):
+    for index in range(13):
         _write_sibling_scope_ledger(
             payload, f'{index:024x}', run_key=f'other-child-{index}',
-            consumed=20 * cycle.MIB,
+            consumed=24 * cycle.MIB,
         )
 
     manifest = cycle.run_scope_cycle(
@@ -1456,17 +1456,17 @@ def test_daily_admission_accepts_the_fourth_scope_at_sixty_mib(tmp_path):
         monotonic_ns=itertools.count(start=0, step=1_000_000).__next__,
     )
 
-    # 60 MiB committed + one full 24 MiB scope cap == exactly the 84 MiB day.
+    # 312 MiB committed + one full 24 MiB scope cap == exactly the 336 MiB day.
     assert manifest['status'] == 'complete'
 
 
-def test_daily_admission_refuses_one_byte_past_sixty_mib(tmp_path):
+def test_daily_admission_refuses_one_byte_past_the_last_full_slot(tmp_path):
     payload = _payload(tmp_path)
     argv, _ = _approved_args(tmp_path, payload)
     args = _parse_args(argv)
     _write_sibling_scope_ledger(
         payload, 'a' * 24, run_key='other-child-a',
-        consumed=60 * cycle.MIB + 1,
+        consumed=312 * cycle.MIB + 1,
     )
 
     with pytest.raises(
@@ -1489,7 +1489,7 @@ def test_daily_admission_counts_a_failed_scope_without_a_manifest(tmp_path):
     args = _parse_args(argv)
     _write_sibling_scope_ledger(
         payload, 'b' * 24, run_key='crashed-child',
-        consumed=40 * cycle.MIB, reserved=20 * cycle.MIB + 1,
+        consumed=280 * cycle.MIB, reserved=32 * cycle.MIB + 1,
     )
 
     with pytest.raises(
@@ -1516,7 +1516,7 @@ def test_daily_admission_ignores_this_scopes_own_resumed_ledger(tmp_path):
     )
     _write_sibling_scope_ledger(
         payload, 'd' * 24, run_key='other-child-d',
-        consumed=60 * cycle.MIB,
+        consumed=312 * cycle.MIB,
     )
 
     manifest = cycle.run_scope_cycle(

@@ -175,8 +175,8 @@ class TestDagShape:
         assert params['proxy_lease_ttl_seconds']._kw['maximum'] == 3600
         assert dag_module.PROVIDER_HARD_CAP_BYTES == 24 * 1024 * 1024
         assert dag_module.PROVIDER_SOFT_STOP_BYTES == 22 * 1024 * 1024
-        assert dag_module.PARENT_BYTE_BUDGET == 84 * 1024 * 1024
-        assert dag_module.PARENT_SOFT_BYTE_STOP == 80 * 1024 * 1024
+        assert dag_module.PARENT_BYTE_BUDGET == 336 * 1024 * 1024
+        assert dag_module.PARENT_SOFT_BYTE_STOP == 320 * 1024 * 1024
         assert dag_module.PARENT_REQUEST_LIMIT == 8 * 1610
         assert dag_module.PARENT_RETRY_LIMIT == 8 * 800
         assert dag_module.PROXY_CONCURRENCY == 1
@@ -284,8 +284,8 @@ class TestPlanningGate:
         assert json.loads(env['TM_SCOPE_PAYLOAD_JSON'])['scope_id'] == 'GB1__2025'
         assert env['TM_READER_REVISION'] == '7'
         assert env['TM_PROVIDER_HARD_CAP_BYTES'] == str(24 * 1024 * 1024)
-        assert env['TM_PARENT_BYTE_BUDGET'] == str(84 * 1024 * 1024)
-        assert env['TM_PARENT_SOFT_BYTE_STOP'] == str(80 * 1024 * 1024)
+        assert env['TM_PARENT_BYTE_BUDGET'] == str(336 * 1024 * 1024)
+        assert env['TM_PARENT_SOFT_BYTE_STOP'] == str(320 * 1024 * 1024)
         assert env['TM_PARENT_REQUEST_LIMIT'] == str(8 * 1610)
         assert env['TM_PARENT_RETRY_LIMIT'] == str(8 * 800)
         assert env['TM_REFRESH_MODE'] == 'current'

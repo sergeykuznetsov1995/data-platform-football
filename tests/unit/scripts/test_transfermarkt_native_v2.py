@@ -799,8 +799,8 @@ def test_scope_set_readiness_ceilings_come_from_the_daily_canon():
     mod = _load()
     control = mod.control
 
-    assert control.SCOPE_SET_HARD_BYTE_CAP == 88_080_384
-    assert control.SCOPE_SET_SOFT_BYTE_STOP == 83_886_080
+    assert control.SCOPE_SET_HARD_BYTE_CAP == 352_321_536
+    assert control.SCOPE_SET_SOFT_BYTE_STOP == 335_544_320
     assert control.SCOPE_SET_REQUEST_LIMIT == 12_880
     assert control.SCOPE_SET_RETRY_LIMIT == 6_400
 
@@ -809,8 +809,8 @@ def test_scope_set_readiness_ceilings_come_from_the_daily_canon():
 
     assert report['passed'] is True
     parent_report = report['parent_cycles']['parent-1']
-    assert parent_report['hard_provider_byte_cap'] == 88_080_384
-    assert parent_report['soft_provider_byte_stop'] == 83_886_080
+    assert parent_report['hard_provider_byte_cap'] == 352_321_536
+    assert parent_report['soft_provider_byte_stop'] == 335_544_320
     assert parent_report['proxy_ledger_exact'] is True
 
 
@@ -852,9 +852,9 @@ def test_a_cycle_over_its_own_epoch_cap_is_still_rejected():
 @pytest.mark.parametrize(
     ('hard', 'soft'),
     [
-        (100 * 1024 * 1024, 14_680_064),  # above today's ceiling
+        (500 * 1024 * 1024, 14_680_064),  # above today's ceiling
         (15_728_640, 16_000_000),         # soft above hard
-        (15_728_640, 90_000_000),         # soft above today's soft ceiling
+        (352_321_536, 340_000_000),       # soft above today's soft ceiling
         (0, 0),                           # meaningless caps
     ],
 )
@@ -1118,9 +1118,10 @@ def test_a_stale_write_manifest_of_a_current_child_blocks_the_cutover():
 
 
 def test_the_freshness_horizon_is_what_the_paid_budget_can_deliver():
-    # 684 current editions at three scopes a day cannot all be under a week old
-    # — a flat 7-day rule would block every cutover forever.  The gate asks the
-    # only question the crawl can answer: is it keeping up with its own cadence?
+    # 684 current editions at fourteen scopes a day cannot all be under a week
+    # old — a flat 7-day rule would block every cutover forever.  The gate asks
+    # the only question the crawl can answer: is it keeping up with its own
+    # cadence?
     mod = _load()
     control = mod.control
 
@@ -1139,7 +1140,7 @@ def test_the_freshness_horizon_is_what_the_paid_budget_can_deliver():
         f'scope-{index}': {
             'edition_current': True,
             'fresh': False,
-            'age_days': 100,
+            'age_days': 90,
         }
         for index in range(684)
     }
@@ -1149,7 +1150,7 @@ def test_the_freshness_horizon_is_what_the_paid_budget_can_deliver():
         registry_snapshot_id='registry-1',
         applicable=True,
     )
-    assert report['refresh_horizon_days'] > 100
+    assert report['refresh_horizon_days'] > 90
     assert report['passed'] is True
 
     scopes['scope-0']['age_days'] = report['refresh_horizon_days'] + 1
