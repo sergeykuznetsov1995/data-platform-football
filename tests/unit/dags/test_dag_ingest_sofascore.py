@@ -901,6 +901,7 @@ class TestRegistryActivation:
             "ITA-Serie A",  # 23
             "FRA-Ligue 1",  # 34
             "GER-Bundesliga",  # 35
+            "RUS-Premier League",  # 203 (#951+, решение владельца 2026-07-16)
         }
         # EPL stays the primary club (legacy task ids / result paths); the rest
         # follow the registry's canonical-id sort order.
@@ -910,6 +911,7 @@ class TestRegistryActivation:
             "FRA-Ligue 1",
             "GER-Bundesliga",
             "ITA-Serie A",
+            "RUS-Premier League",
         ]
         assert dag_module.TOURNAMENT_LEAGUES == ["INT-World Cup"]
 
@@ -918,8 +920,6 @@ class TestRegistryActivation:
         [
             "scrape_sofascore_data_uefa_champions_league",
             "scrape_match_capture_uefa_champions_league",
-            "scrape_sofascore_data_rus_premier_league",
-            "scrape_match_capture_rus_premier_league",
             "scrape_sofascore_data_int_africa_cup_of_nations",
             "scrape_match_capture_int_africa_cup_of_nations",
         ],

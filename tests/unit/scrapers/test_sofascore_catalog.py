@@ -64,6 +64,7 @@ def test_shipped_registry_preserves_current_activation_and_legacy_views():
         "GER-Bundesliga",
         "INT-World Cup",
         "ITA-Serie A",
+        "RUS-Premier League",
     )
     assert catalog.tournament_map()["ENG-Premier League"] == 17
     assert catalog.slug_map()["INT-World Cup"] == (

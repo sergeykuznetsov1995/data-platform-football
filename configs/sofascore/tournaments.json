@@ -9294,25 +9294,43 @@
     },
     {
       "unique_tournament_id": 203,
-      "name": "Premier Liga",
+      "name": "Russian Premier League",
       "slug": "premier-liga",
       "category": {
-        "id": null,
+        "id": 21,
         "name": "Russia",
         "slug": "russia"
       },
       "sport_slug": "football",
       "page_path": "football/russia/premier-liga",
-      "canonical_id": null,
-      "enabled": false,
+      "canonical_id": "RUS-Premier League",
+      "enabled": true,
       "classification": {
         "sport": "football",
-        "gender": "unknown",
+        "gender": "male",
         "age_group": "unknown",
         "team_level": "unknown",
-        "status": "unknown",
+        "status": "review_required",
         "exclusion_reasons": [],
         "evidence": [
+          {
+            "type": "source_field",
+            "endpoint": "/unique-tournament/203",
+            "field": "category.sport.slug",
+            "value": "football"
+          },
+          {
+            "type": "source_field",
+            "endpoint": "/unique-tournament/203",
+            "field": "gender",
+            "value": "M"
+          },
+          {
+            "type": "source_field",
+            "endpoint": "/unique-tournament/203",
+            "field": "name",
+            "value": "Russian Premier League"
+          },
           {
             "type": "registry_migration",
             "endpoint": "configs/sofascore/tournaments.json@schema-v1",
@@ -9322,19 +9340,592 @@
         ]
       },
       "review": {
-        "status": "pending",
+        "status": "approved",
         "confirmed": {
-          "sport": null,
-          "gender": null,
-          "age_group": null,
-          "team_level": null
+          "sport": "football",
+          "gender": "male",
+          "age_group": "adult",
+          "team_level": "first_team"
         },
-        "reviewed_by": null,
-        "reviewed_at": null,
-        "evidence": [],
-        "notes": null
+        "reviewed_by": "sergeykuznetsov1995",
+        "reviewed_at": "2026-07-16T15:20:09+00:00",
+        "evidence": [
+          {
+            "type": "operator_reference",
+            "reference": "https://premierliga.ru/ — официальный сайт Мир Российской Премьер-Лиги: взрослый мужской чемпионат России (первая команда), подтверждение adult/first-team"
+          }
+        ],
+        "notes": "#951+: волна 1 расширена РПЛ по решению владельца (интервью 2026-07-16); gender=male подтверждён живым targeted discovery"
       },
-      "seasons": []
+      "seasons": [
+        {
+          "season_id": 1252,
+          "name": "Premier League 2008",
+          "source_name": "Premier League 2008",
+          "year": "2008",
+          "format": "calendar_year",
+          "season_format": "single_year",
+          "canonical_season": "2008",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "2008",
+            "Premier League 2008"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/203/seasons",
+              "field": "name",
+              "value": "Premier League 2008"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/203/seasons",
+              "field": "year",
+              "value": "2008"
+            }
+          ]
+        },
+        {
+          "season_id": 1978,
+          "name": "Premier League 2009",
+          "source_name": "Premier League 2009",
+          "year": "2009",
+          "format": "calendar_year",
+          "season_format": "single_year",
+          "canonical_season": "2009",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "2009",
+            "Premier League 2009"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/203/seasons",
+              "field": "name",
+              "value": "Premier League 2009"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/203/seasons",
+              "field": "year",
+              "value": "2009"
+            }
+          ]
+        },
+        {
+          "season_id": 2630,
+          "name": "Premier League 2010",
+          "source_name": "Premier League 2010",
+          "year": "2010",
+          "format": "calendar_year",
+          "season_format": "single_year",
+          "canonical_season": "2010",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "2010",
+            "Premier League 2010"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/203/seasons",
+              "field": "name",
+              "value": "Premier League 2010"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/203/seasons",
+              "field": "year",
+              "value": "2010"
+            }
+          ]
+        },
+        {
+          "season_id": 3288,
+          "name": "Premier League 11/12",
+          "source_name": "Premier League 11/12",
+          "year": "11/12",
+          "format": "split_year",
+          "season_format": "split_year",
+          "canonical_season": "1112",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "11/12",
+            "Premier League 11/12",
+            "1112"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/203/seasons",
+              "field": "name",
+              "value": "Premier League 11/12"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/203/seasons",
+              "field": "year",
+              "value": "11/12"
+            }
+          ]
+        },
+        {
+          "season_id": 4596,
+          "name": "Premier League 12/13",
+          "source_name": "Premier League 12/13",
+          "year": "12/13",
+          "format": "split_year",
+          "season_format": "split_year",
+          "canonical_season": "1213",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "12/13",
+            "Premier League 12/13",
+            "1213"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/203/seasons",
+              "field": "name",
+              "value": "Premier League 12/13"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/203/seasons",
+              "field": "year",
+              "value": "12/13"
+            }
+          ]
+        },
+        {
+          "season_id": 6325,
+          "name": "Premier League 13/14",
+          "source_name": "Premier League 13/14",
+          "year": "13/14",
+          "format": "split_year",
+          "season_format": "split_year",
+          "canonical_season": "1314",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "13/14",
+            "Premier League 13/14",
+            "1314"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/203/seasons",
+              "field": "name",
+              "value": "Premier League 13/14"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/203/seasons",
+              "field": "year",
+              "value": "13/14"
+            }
+          ]
+        },
+        {
+          "season_id": 8318,
+          "name": "Premier League 14/15",
+          "source_name": "Premier League 14/15",
+          "year": "14/15",
+          "format": "split_year",
+          "season_format": "split_year",
+          "canonical_season": "1415",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "14/15",
+            "Premier League 14/15",
+            "1415"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/203/seasons",
+              "field": "name",
+              "value": "Premier League 14/15"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/203/seasons",
+              "field": "year",
+              "value": "14/15"
+            }
+          ]
+        },
+        {
+          "season_id": 10407,
+          "name": "Premier League 15/16",
+          "source_name": "Premier League 15/16",
+          "year": "15/16",
+          "format": "split_year",
+          "season_format": "split_year",
+          "canonical_season": "1516",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "15/16",
+            "Premier League 15/16",
+            "1516"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/203/seasons",
+              "field": "name",
+              "value": "Premier League 15/16"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/203/seasons",
+              "field": "year",
+              "value": "15/16"
+            }
+          ]
+        },
+        {
+          "season_id": 11868,
+          "name": "Premier League 16/17",
+          "source_name": "Premier League 16/17",
+          "year": "16/17",
+          "format": "split_year",
+          "season_format": "split_year",
+          "canonical_season": "1617",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "16/17",
+            "Premier League 16/17",
+            "1617"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/203/seasons",
+              "field": "name",
+              "value": "Premier League 16/17"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/203/seasons",
+              "field": "year",
+              "value": "16/17"
+            }
+          ]
+        },
+        {
+          "season_id": 13387,
+          "name": "Premier League 17/18",
+          "source_name": "Premier League 17/18",
+          "year": "17/18",
+          "format": "split_year",
+          "season_format": "split_year",
+          "canonical_season": "1718",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "17/18",
+            "Premier League 17/18",
+            "1718"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/203/seasons",
+              "field": "name",
+              "value": "Premier League 17/18"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/203/seasons",
+              "field": "year",
+              "value": "17/18"
+            }
+          ]
+        },
+        {
+          "season_id": 17753,
+          "name": "Premier League 18/19",
+          "source_name": "Premier League 18/19",
+          "year": "18/19",
+          "format": "split_year",
+          "season_format": "split_year",
+          "canonical_season": "1819",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "18/19",
+            "Premier League 18/19",
+            "1819"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/203/seasons",
+              "field": "name",
+              "value": "Premier League 18/19"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/203/seasons",
+              "field": "year",
+              "value": "18/19"
+            }
+          ]
+        },
+        {
+          "season_id": 23682,
+          "name": "Premier League 19/20",
+          "source_name": "Premier League 19/20",
+          "year": "19/20",
+          "format": "split_year",
+          "season_format": "split_year",
+          "canonical_season": "1920",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "19/20",
+            "Premier League 19/20",
+            "1920"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/203/seasons",
+              "field": "name",
+              "value": "Premier League 19/20"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/203/seasons",
+              "field": "year",
+              "value": "19/20"
+            }
+          ]
+        },
+        {
+          "season_id": 29200,
+          "name": "Premier League 20/21",
+          "source_name": "Premier League 20/21",
+          "year": "20/21",
+          "format": "split_year",
+          "season_format": "split_year",
+          "canonical_season": "2021",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "20/21",
+            "Premier League 20/21",
+            "2021"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/203/seasons",
+              "field": "name",
+              "value": "Premier League 20/21"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/203/seasons",
+              "field": "year",
+              "value": "20/21"
+            }
+          ]
+        },
+        {
+          "season_id": 37038,
+          "name": "Premier League 21/22",
+          "source_name": "Premier League 21/22",
+          "year": "21/22",
+          "format": "split_year",
+          "season_format": "split_year",
+          "canonical_season": "2122",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "21/22",
+            "Premier League 21/22",
+            "2122"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/203/seasons",
+              "field": "name",
+              "value": "Premier League 21/22"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/203/seasons",
+              "field": "year",
+              "value": "21/22"
+            }
+          ]
+        },
+        {
+          "season_id": 42388,
+          "name": "Premier League 22/23",
+          "source_name": "Premier League 22/23",
+          "year": "22/23",
+          "format": "split_year",
+          "season_format": "split_year",
+          "canonical_season": "2223",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "22/23",
+            "Premier League 22/23",
+            "2223"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/203/seasons",
+              "field": "name",
+              "value": "Premier League 22/23"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/203/seasons",
+              "field": "year",
+              "value": "22/23"
+            }
+          ]
+        },
+        {
+          "season_id": 52470,
+          "name": "Premier League 23/24",
+          "source_name": "Premier League 23/24",
+          "year": "23/24",
+          "format": "split_year",
+          "season_format": "split_year",
+          "canonical_season": "2324",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "23/24",
+            "Premier League 23/24",
+            "2324"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/203/seasons",
+              "field": "name",
+              "value": "Premier League 23/24"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/203/seasons",
+              "field": "year",
+              "value": "23/24"
+            }
+          ]
+        },
+        {
+          "season_id": 61712,
+          "name": "Premier League 24/25",
+          "source_name": "Premier League 24/25",
+          "year": "24/25",
+          "format": "split_year",
+          "season_format": "split_year",
+          "canonical_season": "2425",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "24/25",
+            "Premier League 24/25",
+            "2425"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/203/seasons",
+              "field": "name",
+              "value": "Premier League 24/25"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/203/seasons",
+              "field": "year",
+              "value": "24/25"
+            }
+          ]
+        },
+        {
+          "season_id": 77142,
+          "name": "Premier League 25/26",
+          "source_name": "Premier League 25/26",
+          "year": "25/26",
+          "format": "split_year",
+          "season_format": "split_year",
+          "canonical_season": "2526",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "25/26",
+            "Premier League 25/26",
+            "2526"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/203/seasons",
+              "field": "name",
+              "value": "Premier League 25/26"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/203/seasons",
+              "field": "year",
+              "value": "25/26"
+            }
+          ]
+        },
+        {
+          "season_id": 97023,
+          "name": "Premier League 26/27",
+          "source_name": "Premier League 26/27",
+          "year": "26/27",
+          "format": "split_year",
+          "season_format": "split_year",
+          "canonical_season": "2627",
+          "start_date": null,
+          "end_date": null,
+          "aliases": [
+            "26/27",
+            "Premier League 26/27",
+            "2627"
+          ],
+          "evidence": [
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/203/seasons",
+              "field": "name",
+              "value": "Premier League 26/27"
+            },
+            {
+              "type": "source_field",
+              "endpoint": "/unique-tournament/203/seasons",
+              "field": "year",
+              "value": "26/27"
+            }
+          ]
+        }
+      ]
     },
     {
       "unique_tournament_id": 270,
