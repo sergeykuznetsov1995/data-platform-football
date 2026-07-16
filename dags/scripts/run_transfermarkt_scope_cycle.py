@@ -17,7 +17,9 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -27,6 +29,8 @@ from dags.utils.transfermarkt_approval import (
     ApprovalJournal,
     ApprovalPacket,
     ApprovalStateError,
+    StandingPolicy,
+    load_standing_policy,
 )
 from dags.utils.transfermarkt_dq_contracts import (
     ScopeDQError,
@@ -42,6 +46,21 @@ from dags.utils.transfermarkt_scope_state import (
     ScopeManifest,
     stable_hash,
 )
+from scrapers.transfermarkt.models import (
+    CAREER_ENTITY_TIMEOUT_SECONDS,
+    DEFAULT_ENTITY_TIMEOUT_SECONDS,
+    ENTITY_TIMEOUT_SECONDS,
+    MAX_ROSTER_WINDOW,
+    PARENT_DAILY_HARD_PROVIDER_BYTE_CAP,
+    PARENT_DAILY_SOFT_PROVIDER_BYTE_STOP,
+    PARENT_REQUEST_LIMIT,
+    PARENT_RETRY_LIMIT,
+    PRODUCTION_ENTITY_BUDGETS,
+    SCOPE_HARD_PROVIDER_BYTE_CAP,
+    SCOPE_REQUEST_LIMIT,
+    SCOPE_RETRY_LIMIT,
+    SCOPE_SOFT_PROVIDER_BYTE_STOP,
+)
 from scrapers.transfermarkt.registry import (
     CompetitionRecord,
     EditionRecord,
@@ -54,14 +73,14 @@ from scrapers.transfermarkt.registry import (
 MIB = 1024 * 1024
 RESPONSE_CACHE_ROOT = Path('/opt/airflow/logs/transfermarkt-native-v2/cache')
 RESPONSE_CACHE_TTL_SECONDS = 24 * 60 * 60
-HARD_BYTE_CAP = 15_728_640
-SOFT_BYTE_STOP = 14_680_064
-# The cycle-wide retry ledger, not a per-page cap. A cold big league fetches
-# ~360 pages across its four entities, and the source answers 502/504 for a
-# third to a half of the attempts in a wave, so it needs retries of that order —
-# measured: 37 retries for 83 market-value pages alone. A failed attempt costs
-# ~10 KiB of the 15 MiB byte cap, which is what actually bounds the traffic.
-PARENT_RETRY_LIMIT = 400
+# Per-scope caps: what this wrapper and its four child runners enforce on ONE
+# exact competition x edition cycle.  The parent (daily) aggregate below is a
+# separate ledger; both pairs come from the budget canon in models.py.
+HARD_BYTE_CAP = SCOPE_HARD_PROVIDER_BYTE_CAP
+SOFT_BYTE_STOP = SCOPE_SOFT_PROVIDER_BYTE_STOP
+# Parent (daily) aggregate caps across every scope cycle of one parent run.
+PARENT_BYTE_BUDGET = PARENT_DAILY_HARD_PROVIDER_BYTE_CAP
+PARENT_SOFT_BYTE_STOP = PARENT_DAILY_SOFT_PROVIDER_BYTE_STOP
 ENTITY_ORDER = (
     'players',
     'market_value_history',
@@ -108,13 +127,13 @@ OPS_WRITE_TABLES = {
     PROXY_LEDGER_TABLE,
 }
 # 'requests' counts attempts, not pages: a squad page that answers 504 twice
-# costs three. A 20-club league already needs ~21 pages, so 26 attempts left no
-# room for the source's failure waves and the entity died mid-league.
+# costs three.  Both columns derive from the budget canon in models.py.
 DEFAULT_ENTITY_LIMITS = {
-    'players': {'decoded_bytes': 16 * MIB, 'requests': 150},
-    'market_value_history': {'decoded_bytes': 4 * MIB, 'requests': 200},
-    'transfers': {'decoded_bytes': 8 * MIB, 'requests': 200},
-    'coaches': {'decoded_bytes': 14 * MIB, 'requests': 160},
+    name: {
+        'decoded_bytes': int(budget['decoded_mb'] * MIB),
+        'requests': int(budget['requests']),
+    }
+    for name, budget in PRODUCTION_ENTITY_BUDGETS.items()
 }
 _APPROVAL_FLAGS = {
     '--approval-journal',
@@ -125,7 +144,11 @@ _APPROVAL_FLAGS = {
     '--paid-proxy-approval-packet-hash',
     '--production-write-approval-packet-id',
     '--production-write-approval-packet-hash',
+    '--standing-policy',
+    '--standing-policy-sha256',
 }
+STANDING_POLICY_DAG_ID = 'dag_ingest_transfermarkt'
+STANDING_POLICY_ENV_GATE = 'TM_STANDING_POLICY_ENABLED'
 
 
 class ScopeCycleError(RuntimeError):
@@ -156,6 +179,15 @@ class ScopeIdentity:
 class ApprovalRef:
     packet_id: str
     packet_hash: str
+
+
+@dataclass(frozen=True)
+class PolicyGrant:
+    """Standing-policy stand-in for a consumed one-shot approval packet."""
+
+    packet_id: str
+    packet_hash: str
+    policy_version: int
 
 
 @dataclass(frozen=True)
@@ -512,6 +544,111 @@ def _approval_refs(args: argparse.Namespace) -> Mapping[str, ApprovalRef]:
     }
 
 
+def _approval_mode(args: argparse.Namespace) -> str:
+    standing = bool(args.standing_policy or args.standing_policy_sha256)
+    one_shot = bool(
+        args.approval_journal
+        or args.approval_bundle_json
+        or args.approval_packet_id
+        or args.approval_packet_hash
+        or args.paid_proxy_approval_packet_id
+        or args.paid_proxy_approval_packet_hash
+        or args.production_write_approval_packet_id
+        or args.production_write_approval_packet_hash
+    )
+    if standing and one_shot:
+        raise ScopeCycleError(
+            'standing-policy and one-shot approval flags are mutually exclusive'
+        )
+    if standing:
+        return 'standing_policy'
+    if one_shot:
+        return 'one_shot'
+    raise ScopeCycleError(
+        'approval mode is required: pass --standing-policy/'
+        '--standing-policy-sha256 or the one-shot approval flags'
+    )
+
+
+def validate_standing_policy_for_scope_cycle(
+    policy: StandingPolicy,
+    *,
+    write_mode: str,
+    cycle_budget_bytes: int,
+    request_limit: int,
+    retry_limit: int,
+) -> None:
+    """Check one standing policy against this wrapper's exact pinned limits."""
+
+    if policy.dag_id != STANDING_POLICY_DAG_ID:
+        raise ScopeCycleError(
+            f'standing policy dag_id mismatch: {policy.dag_id!r}'
+        )
+    policy.assert_not_expired(datetime.now(timezone.utc))
+    paid = policy.paid_proxy
+    if (
+        paid.byte_cap_bytes != int(cycle_budget_bytes)
+        or paid.request_limit != int(request_limit)
+        or paid.retry_limit != int(retry_limit)
+        or paid.concurrency != 1
+    ):
+        raise ScopeCycleError(
+            'standing policy paid_proxy caps differ from wrapper limits'
+        )
+    write = policy.production_write
+    if (
+        write.byte_cap_bytes != 0
+        or write.request_limit != 0
+        or write.retry_limit != 0
+        or write.concurrency != 1
+    ):
+        raise ScopeCycleError('standing policy production_write caps are unsafe')
+    required_tables = {
+        value.split('.')[-1] for value in required_write_tables(write_mode)
+    }
+    allowed_tables = {
+        str(value).split('.')[-1] for value in policy.allowed_write_tables
+    }
+    if not required_tables.issubset(allowed_tables):
+        missing = sorted(required_tables - allowed_tables)
+        raise ScopeCycleError(f'standing policy omits write tables: {missing}')
+
+
+def _enforce_standing_policy(
+    args: argparse.Namespace,
+) -> Mapping[str, PolicyGrant]:
+    if os.environ.get(STANDING_POLICY_ENV_GATE, '').strip().lower() not in {
+        '1', 'true', 'yes', 'on',
+    }:
+        raise ScopeCycleError(
+            f'{STANDING_POLICY_ENV_GATE} must be true before a '
+            'standing-policy cycle'
+        )
+    policy = load_standing_policy(
+        _required(args.standing_policy, 'standing_policy'),
+    )
+    expected_hash = _required(
+        args.standing_policy_sha256, 'standing_policy_sha256',
+    )
+    if policy.policy_hash != expected_hash:
+        raise ApprovalDriftError(
+            'standing policy content differs from the pinned sha256'
+        )
+    validate_standing_policy_for_scope_cycle(
+        policy,
+        write_mode=args.write_mode,
+        cycle_budget_bytes=int(args.cycle_budget_bytes),
+        request_limit=int(args.request_limit),
+        retry_limit=int(args.retry_limit),
+    )
+    grant = PolicyGrant(
+        packet_id=f'standing-policy-v{policy.policy_version}',
+        packet_hash=policy.policy_hash,
+        policy_version=int(policy.policy_version),
+    )
+    return {'paid_proxy': grant, 'production_write': grant}
+
+
 def _packet_from_record(
     journal: ApprovalJournal,
     ref: ApprovalRef,
@@ -536,7 +673,12 @@ def _consume_approvals(
     *,
     operation_argv: Sequence[str],
     entity_limits: Mapping[str, Mapping[str, int]],
-) -> Mapping[str, ApprovalPacket]:
+) -> Mapping[str, Any]:
+    expected_requests = int(args.request_limit)
+    if sum(item['requests'] for item in entity_limits.values()) > expected_requests:
+        raise ScopeCycleError('entity request budgets exceed the cycle request limit')
+    if _approval_mode(args) == 'standing_policy':
+        return _enforce_standing_policy(args)
     refs = _approval_refs(args)
     journal = ApprovalJournal(_required(args.approval_journal, 'approval_journal'))
     packets = {
@@ -545,9 +687,6 @@ def _consume_approvals(
     }
     paid = packets['paid_proxy']
     write = packets['production_write']
-    expected_requests = int(args.request_limit)
-    if sum(item['requests'] for item in entity_limits.values()) > expected_requests:
-        raise ScopeCycleError('entity request budgets exceed the cycle request limit')
     if (
         paid.byte_cap_bytes != int(args.cycle_budget_bytes)
         or paid.request_limit != expected_requests
@@ -621,6 +760,36 @@ def _entity_limits(args: argparse.Namespace) -> Mapping[str, Mapping[str, int]]:
     return limits
 
 
+def _entity_timeout_seconds(
+    args: argparse.Namespace,
+    parser_entity: str,
+) -> int:
+    """Per-entity subprocess timeout derived from the budget canon.
+
+    A full 650-attempt career budget cannot finish inside the caller's
+    3600 s (see CAREER_ENTITY_TIMEOUT_SECONDS for the arithmetic), and a
+    TimeoutExpired burns attempt-guard budget without result evidence — so
+    the career entities get the canon timeout while players/coaches keep the
+    caller-supplied one.  The worst-case sum of the four subprocess timeouts
+    (3600 + 5400 + 5400 + 3600 = 18000 s) is what the mapped task's own
+    execution timeout is derived from: SCOPE_WALL_CLOCK_TIMEOUT_SECONDS =
+    18900 s (5 h 15 m), which adds SCOPE_OPS_OVERHEAD_SECONDS for the scope's
+    approval consumption and ops MERGEs.  A realistic full-budget scope
+    finishes in ~10300 s (~2 h 52 m); the ceiling only has to be worst-case
+    compatible.
+    """
+
+    # The caller may only shorten a small entity's timeout (_validate_args
+    # bounds it by DEFAULT_ENTITY_TIMEOUT_SECONDS), so the worst-case sum of
+    # the four subprocess timeouts can never exceed the canon's
+    # SCOPE_WALL_CLOCK_TIMEOUT_SECONDS the mapped task is given.
+    timeout = int(args.entity_timeout_seconds)
+    canon = int(ENTITY_TIMEOUT_SECONDS[parser_entity])
+    if canon > DEFAULT_ENTITY_TIMEOUT_SECONDS:
+        return max(timeout, canon)
+    return min(timeout, canon)
+
+
 def _runner_argv(
     identity: ScopeIdentity,
     args: argparse.Namespace,
@@ -643,8 +812,11 @@ def _runner_argv(
         temporary_output,
         '--run-key',
         identity.child_cycle_id,
+        # The runner's file ledger caps ONE exact scope cycle, so its identity
+        # is the child cycle; the parent (daily) aggregate is this wrapper's
+        # own JSON ledger.
         '--cycle-ledger-key',
-        identity.parent_cycle_id,
+        identity.child_cycle_id,
         '--cycle-budget-bytes',
         str(args.cycle_budget_bytes),
         '--decoded-body-budget-mb',
@@ -672,7 +844,7 @@ def _runner_argv(
 def _runner_environment(
     identity: ScopeIdentity,
     args: argparse.Namespace,
-    packets: Mapping[str, ApprovalPacket],
+    packets: Mapping[str, Any],
     parser_entity: str,
     retry_budget: int,
 ) -> Mapping[str, str]:
@@ -778,7 +950,7 @@ def _validate_result_identity(
     expected = {
         'entity': parser_entity,
         'run_key': identity.child_cycle_id,
-        'cycle_ledger_key': identity.parent_cycle_id,
+        'cycle_ledger_key': identity.child_cycle_id,
         'competition_id': identity.competition_id,
         'edition_id': identity.edition_id,
         'canonical_season': identity.canonical_season,
@@ -803,7 +975,6 @@ def _traffic_metrics(
     run: EntityRun,
     *,
     hard_cap: int,
-    soft_stop: int,
 ) -> Mapping[str, int]:
     result = run.result
     traffic = result.get('traffic') or {}
@@ -813,9 +984,23 @@ def _traffic_metrics(
         raise ScopeCycleError(
             f'{run.parser_entity} provider metering is not authoritative'
         )
-    if int(traffic.get('hard_provider_byte_budget', -1)) != hard_cap:
+    # Each entity runs under its own provider grant (its scope-ledger
+    # reservation), so the exact value varies; the invariants are that the
+    # client ledger was sized to exactly min(grant, scope cap), keeps a
+    # graceful soft stop inside, and was never pierced.
+    try:
+        grant = int(result.get('provider_byte_grant', -1))
+    except (TypeError, ValueError):
+        grant = -1
+    if grant <= 0:
+        raise ScopeCycleError(
+            f'{run.parser_entity} provider byte grant evidence is absent'
+        )
+    grant_hard = int(traffic.get('hard_provider_byte_budget', -1))
+    grant_soft = int(traffic.get('soft_provider_byte_stop', -1))
+    if grant_hard != min(grant, hard_cap):
         raise ScopeCycleError(f'{run.parser_entity} hard provider cap drift')
-    if int(traffic.get('soft_provider_byte_stop', -1)) != soft_stop:
+    if not 0 < grant_soft < grant_hard:
         raise ScopeCycleError(f'{run.parser_entity} soft provider stop drift')
     fields = {
         'decoded_bytes': result.get('decoded_response_body_bytes'),
@@ -834,6 +1019,10 @@ def _traffic_metrics(
         metrics[field] = int(value)
         if metrics[field] < 0:
             raise ScopeCycleError(f'{run.parser_entity} has negative {field}')
+    if metrics['provider_metered_bytes'] > grant_hard:
+        raise ScopeCycleError(
+            f'{run.parser_entity} provider traffic exceeds its grant ledger'
+        )
     metrics['duration_ms'] = int(run.wall_clock_duration_ms)
     return metrics
 
@@ -922,7 +1111,6 @@ def _validate_run_contract(
     _traffic_metrics(
         run,
         hard_cap=int(args.cycle_budget_bytes),
-        soft_stop=int(args.soft_byte_stop_bytes),
     )
     manifest_rows = _manifest_rows(run.result, args.write_mode)
     outputs = run.result.get('outputs') or {}
@@ -977,7 +1165,6 @@ def _build_scope_manifest(
         metrics = _traffic_metrics(
             run,
             hard_cap=int(args.cycle_budget_bytes),
-            soft_stop=int(args.soft_byte_stop_bytes),
         )
         for field, value in metrics.items():
             total_metrics[field] += int(value)
@@ -1129,6 +1316,13 @@ def _build_scope_manifest(
         'roster_coverage': roster_coverage,
         'career_fetches_pending': pending_total,
     }
+    if _approval_mode(args) == 'standing_policy':
+        # The autonomous schedule authorizes this paid scope from the standing
+        # policy instead of a one-shot packet, so the policy is the only
+        # authorization left to trace.  Its sha256 was already verified against
+        # the committed file bit-for-bit; putting it inside the manifest hash
+        # makes that authorization immutable evidence rather than a log line.
+        dq_evidence['standing_policy_hash'] = str(args.standing_policy_sha256)
     scope = ScopeManifest(
         parent_cycle_id=identity.parent_cycle_id,
         child_cycle_id=identity.child_cycle_id,
@@ -1284,9 +1478,13 @@ def persist_scope_manifest(
 def proxy_ledger_merge_sql(parent_ledger: Mapping[str, Any]) -> str:
     """Build one cumulative seven-row parent-cycle proxy ledger MERGE."""
 
-    if int(parent_ledger.get('hard_provider_byte_budget', -1)) != HARD_BYTE_CAP:
+    if int(
+        parent_ledger.get('hard_provider_byte_budget', -1)
+    ) != PARENT_BYTE_BUDGET:
         raise ScopeCycleError('parent proxy ledger hard cap is not production cap')
-    if int(parent_ledger.get('soft_provider_byte_stop', -1)) != SOFT_BYTE_STOP:
+    if int(
+        parent_ledger.get('soft_provider_byte_stop', -1)
+    ) != PARENT_SOFT_BYTE_STOP:
         raise ScopeCycleError('parent proxy ledger soft stop is not production stop')
     parent_cycle_id = _required(
         parent_ledger.get('parent_cycle_id'), 'parent ledger cycle id',
@@ -1324,8 +1522,8 @@ def proxy_ledger_merge_sql(parent_ledger: Mapping[str, Any]) -> str:
             quoted(parent_cycle_id),
             quoted(entity),
             *(str(value) for value in values),
-            str(HARD_BYTE_CAP),
-            str(SOFT_BYTE_STOP),
+            str(PARENT_BYTE_BUDGET),
+            str(PARENT_SOFT_BYTE_STOP),
         ])
         + ')'
         for entity, values in rows
@@ -1519,7 +1717,9 @@ def _parent_committed_totals(
         fcntl.flock(lock.fileno(), fcntl.LOCK_SH)
         try:
             if not path.exists():
-                return {'requests': 0, 'retries': 0}
+                return {
+                    'requests': 0, 'retries': 0, 'provider_metered_bytes': 0,
+                }
             current = _load_json_file(path)
             if (
                 current.get('parent_cycle_id') != identity.parent_cycle_id
@@ -1532,9 +1732,58 @@ def _parent_committed_totals(
             return {
                 'requests': int(current.get('requests', 0)),
                 'retries': int(current.get('retries', 0)),
+                'provider_metered_bytes': int(
+                    current.get('provider_metered_bytes', 0)
+                ),
             }
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def _sibling_scope_ledger_bytes(identity: ScopeIdentity) -> int:
+    """Provider bytes accounted by every OTHER scope of this parent run.
+
+    The entity runners keep one file ledger per scope cycle under the parent
+    run's ledger directory.  Unlike the committed parent ledger, those files
+    also carry the bytes of scopes that FAILED before producing a manifest
+    (settled events plus still-active reservations of crashed entities), so
+    they are the fail-closed source for daily admission.  An unreadable file
+    refuses paid I/O rather than being treated as zero spend.
+    """
+
+    total = 0
+    for path in sorted(
+        Path(identity.parent_ledger_path).parent.glob(
+            'transfermarkt_cycle_*.json'
+        )
+    ):
+        try:
+            with path.open(encoding='utf-8') as handle:
+                payload = json.load(handle)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ScopeCycleError(
+                f'sibling scope ledger is unreadable: {path}'
+            ) from exc
+        if not isinstance(payload, Mapping):
+            raise ScopeCycleError(f'sibling scope ledger is invalid: {path}')
+        if str(payload.get('run_key') or '') == identity.child_cycle_id:
+            # This scope's own past spend is bounded by its own file ledger
+            # and is covered by the full SCOPE reservation the admission gate
+            # adds on top of the sibling total.
+            continue
+        consumed = sum(
+            int(item.get('decoded_response_body_bytes') or 0)
+            for item in payload.get('events') or []
+        )
+        reserved = sum(
+            int(item.get('reserved_bytes') or 0)
+            for item in payload.get('reservations') or []
+            if isinstance(item, Mapping) and item.get('status') == 'active'
+        )
+        if consumed < 0 or reserved < 0:
+            raise ScopeCycleError(f'sibling scope ledger is invalid: {path}')
+        total += consumed + reserved
+    return total
 
 
 def _attempt_guard_path(identity: ScopeIdentity) -> Path:
@@ -1629,6 +1878,12 @@ def _checkpoint_identity(
         'soft_byte_stop_bytes': int(args.soft_byte_stop_bytes),
         'request_limit': int(args.request_limit),
         'retry_limit': int(args.retry_limit),
+        # Parent caps join the identity: a checkpoint taken under different
+        # daily budgets must not resume silently under the new ones.
+        'parent_byte_budget': int(args.parent_byte_budget),
+        'parent_soft_byte_stop': int(args.parent_soft_byte_stop),
+        'parent_request_limit': int(args.parent_request_limit),
+        'parent_retry_limit': int(args.parent_retry_limit),
         'career_window_limit': int(args.career_window_limit),
         'coach_history_ttl_days': int(args.coach_history_ttl_days),
         'lease_ttl_seconds': int(args.lease_ttl_seconds),
@@ -1675,6 +1930,38 @@ def _resume_runs(
     return runs
 
 
+def _record_standing_policy_authorization(
+    identity: ScopeIdentity,
+    manifest: Mapping[str, Any],
+    grant: PolicyGrant,
+) -> None:
+    """Persist which standing policy authorized this committed scope cycle.
+
+    The scope manifest's dq_evidence key set is validator-bound, so until the
+    manifest schema itself grows an approval field the durable authorization
+    record lives in its own file next to the manifest.  Deliberately not
+    scope-status.json: that is the CLI failure envelope, which a later failed
+    rerun of the same scope overwrites.
+    """
+
+    _atomic_json(
+        Path(identity.result_base_dir) / 'standing-authorization.json',
+        {
+            'status': 'complete',
+            'parent_cycle_id': identity.parent_cycle_id,
+            'child_cycle_id': identity.child_cycle_id,
+            'scope_id': identity.scope_id,
+            'manifest_digest': manifest['manifest_digest'],
+            'approval_mode': 'standing_policy',
+            'standing_policy': {
+                'policy_hash': grant.packet_hash,
+                'policy_version': grant.policy_version,
+            },
+        },
+        immutable=False,
+    )
+
+
 def run_scope_cycle(
     args: argparse.Namespace,
     *,
@@ -1705,18 +1992,24 @@ def run_scope_cycle(
             checkpoint.get('status') == 'complete'
             and checkpoint.get('manifest_digest') == manifest['manifest_digest']
         )
+        approvals: Mapping[str, Any] = {}
         if not checkpoint_complete:
-            _consume_approvals(
+            approvals = _consume_approvals(
                 args, operation_argv=operation_argv, entity_limits=limits,
             )
             manifest_writer(manifest)
+        elif _approval_mode(args) == 'standing_policy':
+            # A cycle that died between the complete checkpoint and the
+            # authorization record must still leave the record behind, so the
+            # no-op resume re-proves the standing policy and rewrites it.
+            approvals = _enforce_standing_policy(args)
         parent_ledger = _update_parent_ledger(
             identity,
             manifest,
-            hard_cap=int(args.cycle_budget_bytes),
-            soft_stop=int(args.soft_byte_stop_bytes),
-            request_limit=int(args.request_limit),
-            retry_limit=int(args.retry_limit),
+            hard_cap=int(args.parent_byte_budget),
+            soft_stop=int(args.parent_soft_byte_stop),
+            request_limit=int(args.parent_request_limit),
+            retry_limit=int(args.parent_retry_limit),
         )
         if not checkpoint_complete:
             parent_ledger_writer(parent_ledger)
@@ -1731,30 +2024,53 @@ def run_scope_cycle(
                     (_stable_json(parent_ledger) + '\n').encode('utf-8')
                 ),
             }, immutable=False)
+        grant = approvals.get('paid_proxy')
+        if isinstance(grant, PolicyGrant):
+            _record_standing_policy_authorization(identity, manifest, grant)
         return manifest
 
-    packets: Mapping[str, ApprovalPacket] = {}
+    packets: Mapping[str, Any] = {}
     if len(runs) < len(ENTITY_ORDER):
         committed_preflight = _parent_committed_totals(
             identity,
-            hard_cap=int(args.cycle_budget_bytes),
-            soft_stop=int(args.soft_byte_stop_bytes),
-            request_limit=int(args.request_limit),
-            retry_limit=int(args.retry_limit),
+            hard_cap=int(args.parent_byte_budget),
+            soft_stop=int(args.parent_soft_byte_stop),
+            request_limit=int(args.parent_request_limit),
+            retry_limit=int(args.parent_retry_limit),
         )
         attempts_preflight = _attempt_guard_totals(
             identity,
-            request_limit=int(args.request_limit),
-            retry_limit=int(args.retry_limit),
+            request_limit=int(args.parent_request_limit),
+            retry_limit=int(args.parent_retry_limit),
         )
         if max(
             committed_preflight['requests'], attempts_preflight['requests'],
-        ) >= int(args.request_limit):
+        ) >= int(args.parent_request_limit):
             raise ScopeCycleError('parent request limit exhausted before approval')
         if max(
             committed_preflight['retries'], attempts_preflight['retries'],
-        ) >= int(args.retry_limit):
+        ) >= int(args.parent_retry_limit):
             raise ScopeCycleError('parent retry limit exhausted before approval')
+        # Daily byte admission, before any paid I/O: every admitted scope may
+        # spend up to its full scope cap (its own file ledger guarantees no
+        # more), so a scope is admitted only while the bytes already accounted
+        # to the day — committed manifests OR sibling scope ledgers, whichever
+        # is larger (the latter also carries failed scopes) — still leave one
+        # whole scope cap inside the parent daily budget.  This bounds the
+        # daily aggregate mathematically instead of post factum.
+        committed_bytes = max(
+            int(committed_preflight['provider_metered_bytes']),
+            _sibling_scope_ledger_bytes(identity),
+        )
+        if (
+            committed_bytes + int(args.cycle_budget_bytes)
+            > int(args.parent_byte_budget)
+        ):
+            raise ScopeCycleError(
+                'parent daily byte budget cannot admit another scope '
+                f'({committed_bytes} committed + {int(args.cycle_budget_bytes)} '
+                f'scope cap > {int(args.parent_byte_budget)})'
+            )
     # Even a fully resumed capture still has one production ops MERGE ahead.
     packets = _consume_approvals(
         args, operation_argv=operation_argv, entity_limits=limits,
@@ -1762,10 +2078,10 @@ def run_scope_cycle(
     entity_checkpoint = dict(checkpoint.get('entities') or {})
     parent_totals = _parent_committed_totals(
         identity,
-        hard_cap=int(args.cycle_budget_bytes),
-        soft_stop=int(args.soft_byte_stop_bytes),
-        request_limit=int(args.request_limit),
-        retry_limit=int(args.retry_limit),
+        hard_cap=int(args.parent_byte_budget),
+        soft_stop=int(args.parent_soft_byte_stop),
+        request_limit=int(args.parent_request_limit),
+        retry_limit=int(args.parent_retry_limit),
     )
     current_requests = 0
     current_retries = 0
@@ -1773,7 +2089,6 @@ def run_scope_cycle(
         metrics = _traffic_metrics(
             run,
             hard_cap=int(args.cycle_budget_bytes),
-            soft_stop=int(args.soft_byte_stop_bytes),
         )
         current_requests += metrics['requests']
         current_retries += metrics['retries']
@@ -1784,15 +2099,14 @@ def run_scope_cycle(
             metrics = _traffic_metrics(
                 run,
                 hard_cap=int(args.cycle_budget_bytes),
-                soft_stop=int(args.soft_byte_stop_bytes),
             )
             _record_attempt_guard(
                 identity,
                 attempt_id=attempt_id,
                 requests=metrics['requests'],
                 retries=metrics['retries'],
-                request_limit=int(args.request_limit),
-                retry_limit=int(args.retry_limit),
+                request_limit=int(args.parent_request_limit),
+                retry_limit=int(args.parent_retry_limit),
             )
     for parser_entity in ENTITY_ORDER[len(runs):]:
         final_path = Path(identity.entity_dir) / f'{parser_entity}.json'
@@ -1808,8 +2122,8 @@ def run_scope_cycle(
         temporary_path = Path(temporary)
         guard_totals = _attempt_guard_totals(
             identity,
-            request_limit=int(args.request_limit),
-            retry_limit=int(args.retry_limit),
+            request_limit=int(args.parent_request_limit),
+            retry_limit=int(args.parent_retry_limit),
         )
         used_requests = max(
             int(parent_totals['requests']) + current_requests,
@@ -1819,49 +2133,67 @@ def run_scope_cycle(
             int(parent_totals['retries']) + current_retries,
             int(guard_totals['retries']),
         )
-        remaining_requests = int(args.request_limit) - used_requests
-        remaining_retries = int(args.retry_limit) - used_retries
+        remaining_requests = int(args.parent_request_limit) - used_requests
+        remaining_retries = int(args.parent_retry_limit) - used_retries
         if remaining_requests <= 0:
             raise ScopeCycleError('parent request limit exhausted before paid I/O')
         if remaining_retries <= 0:
             raise ScopeCycleError('parent retry limit exhausted before paid I/O')
+        # The scope's own attempt/retry pins bound this exact child cycle
+        # inside the parent (daily) remainder.
+        scope_remaining_requests = int(args.request_limit) - current_requests
+        scope_remaining_retries = int(args.retry_limit) - current_retries
+        if scope_remaining_requests <= 0:
+            raise ScopeCycleError('scope request limit exhausted before paid I/O')
+        if scope_remaining_retries <= 0:
+            raise ScopeCycleError('scope retry limit exhausted before paid I/O')
+        child_retry_budget = min(remaining_retries, scope_remaining_retries)
         process_limits = dict(limits[parser_entity])
         process_limits['requests'] = min(
-            int(process_limits['requests']), remaining_requests,
+            int(process_limits['requests']),
+            remaining_requests,
+            scope_remaining_requests,
         )
         command = _runner_argv(
             identity, args, parser_entity, temporary, process_limits,
-            remaining_retries,
+            child_retry_budget,
         )
-        attempt_id = stable_hash({
+        entity_timeout = _entity_timeout_seconds(args, parser_entity)
+        attempt_seed = {
             'paid_proxy_packet_hash': packets['paid_proxy'].packet_hash,
             'child_cycle_id': identity.child_cycle_id,
             'parser_entity': parser_entity,
-        })
+        }
+        if _approval_mode(args) == 'standing_policy':
+            # A standing policy keeps its hash across cleared attempts, so the
+            # attempt id needs its own nonce or a rerun with different actual
+            # traffic would trip the attempt-guard evidence-drift check.
+            attempt_seed['attempt_nonce'] = uuid.uuid4().hex
+        attempt_id = stable_hash(attempt_seed)
         started = monotonic_ns()
         try:
             completed = subprocess_runner(
                 command,
                 env=_runner_environment(
-                    identity, args, packets, parser_entity, remaining_retries,
+                    identity, args, packets, parser_entity, child_retry_budget,
                 ),
                 shell=False,
                 check=False,
                 capture_output=True,
                 text=True,
-                timeout=int(args.entity_timeout_seconds),
+                timeout=entity_timeout,
             )
         except subprocess.TimeoutExpired as exc:
             _record_attempt_guard(
                 identity,
                 attempt_id=attempt_id,
                 requests=process_limits['requests'],
-                retries=max(0, int(args.retry_limit) - used_retries),
-                request_limit=int(args.request_limit),
-                retry_limit=int(args.retry_limit),
+                retries=child_retry_budget,
+                request_limit=int(args.parent_request_limit),
+                retry_limit=int(args.parent_retry_limit),
             )
             raise ScopeCycleError(
-                f'{parser_entity} exceeded {args.entity_timeout_seconds}s timeout'
+                f'{parser_entity} exceeded {entity_timeout}s timeout'
             ) from exc
         duration_ms = max(0, (monotonic_ns() - started) // 1_000_000)
         if int(completed.returncode) != 0:
@@ -1875,14 +2207,14 @@ def run_scope_cycle(
                     raise ValueError('negative/missing failed traffic')
             except (ScopeCycleError, TypeError, ValueError):
                 failed_requests = process_limits['requests']
-                failed_retries = max(0, int(args.retry_limit) - used_retries)
+                failed_retries = child_retry_budget
             _record_attempt_guard(
                 identity,
                 attempt_id=attempt_id,
                 requests=failed_requests,
                 retries=failed_retries,
-                request_limit=int(args.request_limit),
-                retry_limit=int(args.retry_limit),
+                request_limit=int(args.parent_request_limit),
+                retry_limit=int(args.parent_retry_limit),
             )
             # The runner's captured output is the only account of why it failed,
             # and it is otherwise discarded with the subprocess.
@@ -1914,14 +2246,14 @@ def run_scope_cycle(
         result_retries = int(result.get('retries', -1))
         if result_requests < 0 or result_retries < 0:
             result_requests = process_limits['requests']
-            result_retries = max(0, int(args.retry_limit) - used_retries)
+            result_retries = child_retry_budget
         attempt_totals = _record_attempt_guard(
             identity,
             attempt_id=attempt_id,
             requests=result_requests,
             retries=result_retries,
-            request_limit=int(args.request_limit),
-            retry_limit=int(args.retry_limit),
+            request_limit=int(args.parent_request_limit),
+            retry_limit=int(args.parent_retry_limit),
         )
         _validate_result_identity(result, identity, parser_entity)
         digest = _sha256_file(temporary_path)
@@ -1941,20 +2273,26 @@ def run_scope_cycle(
         run_metrics = _traffic_metrics(
             run,
             hard_cap=int(args.cycle_budget_bytes),
-            soft_stop=int(args.soft_byte_stop_bytes),
         )
         current_requests += run_metrics['requests']
         current_retries += run_metrics['retries']
+        if current_requests > int(args.request_limit):
+            raise ScopeCycleError('scope request limit exceeded')
+        if current_retries > int(args.retry_limit):
+            raise ScopeCycleError('scope retry limit exceeded')
         if (
             int(parent_totals['requests']) + current_requests
-            > int(args.request_limit)
+            > int(args.parent_request_limit)
         ):
             raise ScopeCycleError('parent request limit exceeded')
-        if int(parent_totals['retries']) + current_retries > int(args.retry_limit):
+        if (
+            int(parent_totals['retries']) + current_retries
+            > int(args.parent_retry_limit)
+        ):
             raise ScopeCycleError('parent retry limit exceeded')
-        if attempt_totals['requests'] > int(args.request_limit):
+        if attempt_totals['requests'] > int(args.parent_request_limit):
             raise ScopeCycleError('parent attempt request limit exceeded')
-        if attempt_totals['retries'] > int(args.retry_limit):
+        if attempt_totals['retries'] > int(args.parent_retry_limit):
             raise ScopeCycleError('parent attempt retry limit exceeded')
         entity_checkpoint[parser_entity] = {
             'status': 'success',
@@ -1981,10 +2319,10 @@ def run_scope_cycle(
     parent_ledger = _update_parent_ledger(
         identity,
         manifest,
-        hard_cap=int(args.cycle_budget_bytes),
-        soft_stop=int(args.soft_byte_stop_bytes),
-        request_limit=int(args.request_limit),
-        retry_limit=int(args.retry_limit),
+        hard_cap=int(args.parent_byte_budget),
+        soft_stop=int(args.parent_soft_byte_stop),
+        request_limit=int(args.parent_request_limit),
+        retry_limit=int(args.parent_retry_limit),
     )
     parent_ledger_writer(parent_ledger)
     _atomic_json(checkpoint_path, {
@@ -1998,6 +2336,9 @@ def run_scope_cycle(
             (_stable_json(parent_ledger) + '\n').encode('utf-8')
         ),
     }, immutable=False)
+    grant = packets.get('paid_proxy')
+    if isinstance(grant, PolicyGrant):
+        _record_standing_policy_authorization(identity, manifest, grant)
     return manifest
 
 
@@ -2020,7 +2361,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         '--write-mode', choices=('dual', 'native-only'), required=True,
     )
-    parser.add_argument('--approval-journal', required=True)
+    parser.add_argument('--approval-journal')
     parser.add_argument('--approval-bundle-json')
     parser.add_argument('--approval-packet-id')
     parser.add_argument('--approval-packet-hash')
@@ -2028,15 +2369,30 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument('--paid-proxy-approval-packet-hash')
     parser.add_argument('--production-write-approval-packet-id')
     parser.add_argument('--production-write-approval-packet-hash')
+    parser.add_argument('--standing-policy')
+    parser.add_argument('--standing-policy-sha256')
     parser.add_argument('--cycle-budget-bytes', type=int, default=HARD_BYTE_CAP)
     parser.add_argument('--soft-byte-stop-bytes', type=int, default=SOFT_BYTE_STOP)
     parser.add_argument(
-        '--request-limit', type=int,
-        default=sum(item['requests'] for item in DEFAULT_ENTITY_LIMITS.values()),
+        '--request-limit', type=int, default=SCOPE_REQUEST_LIMIT,
     )
-    parser.add_argument('--retry-limit', type=int, default=PARENT_RETRY_LIMIT)
+    parser.add_argument('--retry-limit', type=int, default=SCOPE_RETRY_LIMIT)
+    parser.add_argument(
+        '--parent-byte-budget', type=int, default=PARENT_BYTE_BUDGET,
+    )
+    parser.add_argument(
+        '--parent-soft-byte-stop', type=int, default=PARENT_SOFT_BYTE_STOP,
+    )
+    parser.add_argument(
+        '--parent-request-limit', type=int, default=PARENT_REQUEST_LIMIT,
+    )
+    parser.add_argument(
+        '--parent-retry-limit', type=int, default=PARENT_RETRY_LIMIT,
+    )
     parser.add_argument('--entity-limits-json')
-    parser.add_argument('--career-window-limit', type=int, default=100)
+    parser.add_argument(
+        '--career-window-limit', type=int, default=MAX_ROSTER_WINDOW,
+    )
     parser.add_argument('--coach-history-ttl-days', type=int, default=28)
     parser.add_argument('--checkpoint-ttl-days', type=int, default=35)
     parser.add_argument('--lease-ttl-seconds', type=int, default=3600)
@@ -2049,31 +2405,58 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _validate_args(args: argparse.Namespace) -> None:
+    _approval_mode(args)
     if args.reader_revision < 0:
         raise ScopeCycleError('reader_revision must be non-negative')
+    # Every paid cap is pinned to the budget canon: any drifted number, higher
+    # or lower, is a different operation than the one that was approved.
     if args.cycle_budget_bytes != HARD_BYTE_CAP:
-        raise ScopeCycleError(f'cycle byte cap must equal {HARD_BYTE_CAP}')
+        raise ScopeCycleError(f'scope byte cap must equal {HARD_BYTE_CAP}')
     if args.soft_byte_stop_bytes != SOFT_BYTE_STOP:
-        raise ScopeCycleError(f'soft byte stop must equal {SOFT_BYTE_STOP}')
-    production_requests = sum(
-        item['requests'] for item in DEFAULT_ENTITY_LIMITS.values()
-    )
+        raise ScopeCycleError(f'scope soft byte stop must equal {SOFT_BYTE_STOP}')
     if (
-        args.request_limit != production_requests
-        or args.retry_limit != PARENT_RETRY_LIMIT
+        args.request_limit != SCOPE_REQUEST_LIMIT
+        or args.retry_limit != SCOPE_RETRY_LIMIT
+    ):
+        raise ScopeCycleError(
+            'scope request/retry limits must equal '
+            f'{SCOPE_REQUEST_LIMIT}/{SCOPE_RETRY_LIMIT}'
+        )
+    if args.parent_byte_budget != PARENT_BYTE_BUDGET:
+        raise ScopeCycleError(
+            f'parent byte budget must equal {PARENT_BYTE_BUDGET}'
+        )
+    if args.parent_soft_byte_stop != PARENT_SOFT_BYTE_STOP:
+        raise ScopeCycleError(
+            f'parent soft byte stop must equal {PARENT_SOFT_BYTE_STOP}'
+        )
+    if (
+        args.parent_request_limit != PARENT_REQUEST_LIMIT
+        or args.parent_retry_limit != PARENT_RETRY_LIMIT
     ):
         raise ScopeCycleError(
             'parent request/retry limits must equal '
-            f'{production_requests}/{PARENT_RETRY_LIMIT}'
+            f'{PARENT_REQUEST_LIMIT}/{PARENT_RETRY_LIMIT}'
         )
-    if not 1 <= args.career_window_limit <= 100:
-        raise ScopeCycleError('career window limit must be between 1 and 100')
+    if not 1 <= args.career_window_limit <= MAX_ROSTER_WINDOW:
+        raise ScopeCycleError(
+            f'career window limit must be between 1 and {MAX_ROSTER_WINDOW}'
+        )
     for field in (
         'coach_history_ttl_days', 'checkpoint_ttl_days',
         'lease_ttl_seconds', 'entity_timeout_seconds',
     ):
         if int(getattr(args, field)) <= 0:
             raise ScopeCycleError(f'{field} must be positive')
+    # A caller-supplied entity timeout may only be shorter than the canon's
+    # small-entity timeout; anything longer could push the worst-case sum of
+    # the four subprocesses past the mapped task's execution timeout, and a
+    # SIGKILL mid-crawl loses the attempt guard and the entity's evidence.
+    if int(args.entity_timeout_seconds) > DEFAULT_ENTITY_TIMEOUT_SECONDS:
+        raise ScopeCycleError(
+            'entity timeout cannot exceed '
+            f'{DEFAULT_ENTITY_TIMEOUT_SECONDS}s'
+        )
     if args.lease_ttl_seconds > args.entity_timeout_seconds:
         raise ScopeCycleError('lease TTL cannot exceed the entity timeout')
 

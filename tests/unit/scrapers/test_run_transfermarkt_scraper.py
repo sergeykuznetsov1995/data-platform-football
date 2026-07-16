@@ -27,6 +27,8 @@ import json
 import os
 import sys
 import tempfile
+from datetime import date, datetime
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -50,6 +52,74 @@ REAL_SEASON_HELPERS = {
 
 def _players_df(n: int) -> pd.DataFrame:
     return pd.DataFrame({'player_id': [str(i) for i in range(n)]})
+
+
+_OBSERVED_AT = datetime(2026, 7, 10, 12, 0, 0, 123456)
+_STORED_OBSERVED_AT = datetime(2026, 7, 3, 9, 30, 0, 654321)
+
+
+# One squad-page observation, stated once. ``_observations_df`` renders it the
+# way the scraper builds a frame (nullable Int64 for the integer columns, dates
+# as ``datetime.date``); ``_stored_row`` renders the SAME fact the way Trino
+# hands the stored Bronze row back (SQL NULL → None, plain ints). The two sides
+# stay type-independent on purpose: the carry-forward has to see them as equal.
+_OBSERVATION = {
+    'competition_id': 'GB1', 'edition_id': '2025',
+    'league': 'ENG-Premier League', 'season': '2526',
+    'club_id': '1', 'club_name': 'Club',
+    'player_id': '7', 'player_slug': 'player', 'name': 'Player',
+    'position': 'Forward', 'dob': date(2000, 1, 1), 'age': 26,
+    'height_cm': 180, 'foot': 'right', 'nationality': 'England',
+    'contract_until': date(2028, 6, 30), 'market_value_eur': 10_000_000,
+}
+_NULLABLE_INTS = ('age', 'height_cm', 'market_value_eur')
+
+
+def _observations_df(*rows, **overrides) -> pd.DataFrame:
+    """Squad-page observations carrying the full native Bronze contract.
+
+    The runner compares the canonical content projection, so a frame missing a
+    contract column is rejected — the stub is as complete as the real frame.
+    """
+    rows = rows or ({},)
+    frame = pd.DataFrame([
+        {**_OBSERVATION, 'observed_at': _OBSERVED_AT, **overrides, **row}
+        for row in rows
+    ])
+    for column in _NULLABLE_INTS:            # exactly what the scraper applies
+        frame[column] = pd.to_numeric(
+            frame[column], errors='coerce',
+        ).astype('Int64')
+    return frame
+
+
+def _stored_row(mod, observed_at=_STORED_OBSERVED_AT, **overrides) -> tuple:
+    """The Bronze row Trino returns for the latest stored observation."""
+    columns = (
+        list(mod._CARRY_FORWARD_SCOPE_COLUMNS)
+        + list(mod._CARRY_FORWARD_KEY_COLUMNS['attribute_observations'])
+        + list(mod._carry_forward_content_columns('attribute_observations'))
+    )
+    values = {**_OBSERVATION, **overrides}
+    return tuple(values[column] for column in columns) + (observed_at,)
+
+
+def _carry_forward_conn(rows, *, error: Exception = None):
+    """Connection stub answering only the carry-forward lookup."""
+    cursor = MagicMock()
+    state = {'rows': []}
+
+    def execute(sql, params=()):
+        lookup = 'ROW_NUMBER' in sql and 'observed_at DESC' in sql
+        if lookup and error is not None:
+            raise error
+        state['rows'] = list(rows) if lookup else []
+
+    cursor.execute.side_effect = execute
+    cursor.fetchall.side_effect = lambda: state['rows']
+    conn = MagicMock()
+    conn.cursor.return_value = cursor
+    return conn
 
 
 def _build_scraper(*, df: pd.DataFrame, guard_blocks: bool = False):
@@ -288,7 +358,7 @@ class TestProductionTrafficCeilings:
              '--decoded-body-budget-mb cannot exceed 16.0'),
             (['--request-budget', '151'],
              '--request-budget cannot exceed 150'),
-            (['--cycle-budget-bytes', str(15 * 1024 * 1024 + 1)],
+            (['--cycle-budget-bytes', str(24 * 1024 * 1024 + 1)],
              '--cycle-budget-bytes cannot exceed production cap'),
         ],
     )
@@ -615,9 +685,7 @@ class TestRunnerFlags:
             'league': ['ENG-Premier League'], 'season': ['2526'],
             'club_id': ['1'], 'player_id': ['7'],
         })
-        observations = memberships.assign(
-            name='Player', observed_at='2026-07-10',
-        )
+        observations = _observations_df()
 
         class NativeOnlyScraper:
             _batch_id = 'native-cycle'
@@ -633,6 +701,9 @@ class TestRunnerFlags:
                     side_effect=AssertionError(
                         'legacy materialization is forbidden after cleanup'
                     ),
+                )
+                self._bronze_connection = MagicMock(
+                    return_value=_carry_forward_conn([]),
                 )
 
             def __enter__(self):
@@ -788,8 +859,8 @@ class TestArgparseHardFail:
         assert rc == 1
         scraper.read_players.assert_not_called()
 
-    @pytest.mark.parametrize('limit', ['0', '101'])
-    def test_paid_window_must_be_bounded_1_to_100(self, temp_output, limit):
+    @pytest.mark.parametrize('limit', ['0', '501'])
+    def test_paid_window_must_be_bounded_1_to_500(self, temp_output, limit):
         scraper = _build_scraper(df=_players_df(3))
         rc = _run_main(
             ['--entity', 'transfers', '--limit', limit, '--output', temp_output],
@@ -1777,9 +1848,11 @@ class TestNativeV2RecoverySafety:
             for error in results['errors']
         )
         assert results['cycle_budget']['remaining_after_bytes'] == 0
+        # The full 24 MiB scope cap ends up reserved: the entity's own
+        # provider reserve plus the fail-closed remainder reservation.
         assert (
             results['cycle_budget']['telemetry_unknown_reservation_bytes']
-            == 15 * 1024 * 1024
+            == 24 * 1024 * 1024
         )
 
     def test_telemetry_exception_exhausts_cycle_after_successful_read(
@@ -1983,7 +2056,129 @@ class TestNativeV2RecoverySafety:
             assert not hasattr(mod, name)
 
 
-def test_cli_keeps_child_run_key_but_uses_explicit_parent_cycle_ledger(
+class TestProviderByteGrant:
+    def test_every_entity_reserve_fits_inside_one_scope_cap(self):
+        mod = _import_runner()
+        for budget in mod.PRODUCTION_ENTITY_BUDGETS.values():
+            reserve = int(budget['provider_reserve_bytes'])
+            assert 0 < reserve < mod.PRODUCTION_CYCLE_BUDGET_BYTES
+
+    def test_scope_ledger_mins_each_reserve_and_caps_the_settled_sum(
+        self, tmp_path, monkeypatch,
+    ):
+        mod = _import_runner()
+        monkeypatch.setenv('TM_CYCLE_BUDGET_DIR', str(tmp_path))
+        cap = mod.PRODUCTION_CYCLE_BUDGET_BYTES
+        settled = 0
+        # The first three entities reserve their full canonical amount and
+        # settle at a measured cost (9 + 5 + 6 = 20 MiB)…
+        for entity, actual in (
+            ('players', 9 * 1024 * 1024),
+            ('market_value_history', 5 * 1024 * 1024),
+            ('transfers', 6 * 1024 * 1024),
+        ):
+            reserve = int(
+                mod.PRODUCTION_ENTITY_BUDGETS[entity]['provider_reserve_bytes']
+            )
+            reservation = mod._prepare_cycle_budget(
+                'scope-ledger', cap, entity=entity, reserve_bytes=reserve,
+            )
+            assert reservation['reserved_bytes'] == reserve
+            after = mod._record_cycle_traffic(
+                'scope-ledger', cap, entity, actual,
+                reservation_id=reservation['reservation_id'],
+            )
+            settled += actual
+            assert after['consumed_after_bytes'] == settled
+        # …so the last reserve is min'ed to the exact remainder, and the
+        # settled sum can never pierce the scope cap.
+        coaches = mod._prepare_cycle_budget(
+            'scope-ledger', cap, entity='coaches',
+            reserve_bytes=int(
+                mod.PRODUCTION_ENTITY_BUDGETS['coaches']['provider_reserve_bytes']
+            ),
+        )
+        assert coaches['reserved_bytes'] == cap - settled
+        after = mod._record_cycle_traffic(
+            'scope-ledger', cap, 'coaches', coaches['reserved_bytes'],
+            reservation_id=coaches['reservation_id'],
+        )
+        assert after['accounted_after_bytes'] == cap
+        assert after['exhausted'] is False
+        with pytest.raises(RuntimeError, match='budget exhausted'):
+            mod._prepare_cycle_budget(
+                'scope-ledger', cap, entity='players', reserve_bytes=1,
+            )
+
+    def test_runner_reserves_provider_bytes_and_exports_the_exact_grant(
+        self, temp_output, tmp_path,
+    ):
+        mod = _import_runner()
+        scraper = _build_scraper(df=_players_df(3))
+        captured = {}
+
+        def construct(**kwargs):
+            captured['grant_env'] = os.environ.get(mod.PROVIDER_GRANT_ENV_VAR)
+            return scraper
+
+        stub_pkg = MagicMock()
+        stub_pkg.TransfermarktScraper = MagicMock(side_effect=construct)
+        stub_scraper_mod = MagicMock(
+            R0_2B_FALLBACK_MARKER='TM_FALLBACK', **REAL_SEASON_HELPERS,
+        )
+        with (
+            patch.dict(sys.modules, {
+                'scrapers.transfermarkt': stub_pkg,
+                'scrapers.transfermarkt.scraper': stub_scraper_mod,
+                'scrapers.transfermarkt.registry': REAL_TM_REGISTRY,
+            }),
+            patch.dict(os.environ, {'TM_CYCLE_BUDGET_DIR': str(tmp_path)}),
+            patch.object(mod, '_write_results') as write_results,
+        ):
+            os.environ.pop(mod.PROVIDER_GRANT_ENV_VAR, None)
+            rc = mod._run_entity(
+                mod.ENTITY_SPECS['players'], ['GB1'], 2025, None,
+                temp_output, dry_run=True,
+                cycle_budget_bytes=mod.PRODUCTION_CYCLE_BUDGET_BYTES,
+                cycle_ledger_key='grant-cycle',
+            )
+
+        assert rc == 0
+        expected = str(
+            mod.PRODUCTION_ENTITY_BUDGETS['players']['provider_reserve_bytes']
+        )
+        assert captured['grant_env'] == expected
+        results = write_results.call_args.args[1]
+        assert results['provider_byte_grant'] == int(expected)
+        assert results['cycle_budget']['reserved_bytes'] == int(expected)
+
+    def test_career_window_coverage_reports_the_roster_remainder(self):
+        mod = _import_runner()
+
+        class RosterScraper:
+            def _resolve_player_ids_from_bronze(self, *_args, **_kwargs):
+                return [str(value) for value in range(1, 2200)]
+
+        with (
+            patch.object(mod, '_load_fetch_state', return_value={}),
+            patch.object(
+                mod, '_load_pending_checkpoint', return_value=({}, None),
+            ),
+            patch.object(mod, '_load_data_derived_state', return_value={}),
+        ):
+            selected, _hits, _seeded, _hydrate, coverage = mod._select_player_ids(
+                RosterScraper(), mod.ENTITY_SPECS['market_value_history'],
+                'ENG-Premier League', 2025, mod.MAX_ROSTER_WINDOW, 0,
+                'current', 'run-1', allow_state_writes=False,
+            )
+
+        assert len(selected) == 500
+        assert coverage == {
+            'roster_size': 2199, 'selected': 500, 'pending': 1699,
+        }
+
+
+def test_cli_keeps_child_run_key_and_accepts_explicit_scope_ledger_key(
     monkeypatch,
 ):
     mod = _import_runner()
@@ -2151,3 +2346,414 @@ class TestCoachIdentityFromCachedStints:
         assert profiles.loc['10', 'dob'] == date(1980, 5, 1)
         # Both projections now name the same coaches — which is all parity asks.
         assert set(frames['legacy_coaches']['coach_id']) == set(profiles.index)
+
+
+# ---------------------------------------------------------------------------
+# observed_at carry-forward — content-idempotent append (#948 F5)
+# ---------------------------------------------------------------------------
+
+class TestObservedAtCarryForward:
+    """``attribute_observations`` is the only append-only native output.
+
+    Its natural key embeds ``observed_at``, so a re-scan that stamps a fresh
+    timestamp on unchanged content invents a new observation per player and
+    multiplies the Silver grain. These tests pin the write-spec: which rows
+    would reach Iceberg, and with which ``observed_at``.
+    """
+
+    def _carry(self, mod, frame, stored_rows, *, error=None):
+        scraper = MagicMock()
+        scraper._bronze_connection.return_value = _carry_forward_conn(
+            stored_rows, error=error,
+        )
+        results: dict = {}
+        frames = mod._carry_forward_observed_at(
+            scraper,
+            mod._spec_for_write_mode(
+                mod.ENTITY_SPECS['players'], 'native-only',
+            ),
+            {'attribute_observations': frame},
+            results,
+        )
+        return frames['attribute_observations'], results, scraper
+
+    def test_warm_repeat_carries_every_observed_at(self):
+        mod = _import_runner()
+        frame = _observations_df(
+            {},
+            {'player_id': '8', 'player_slug': 'other', 'name': 'Other'},
+        )
+        stored = [
+            _stored_row(mod),
+            _stored_row(mod, player_id='8', player_slug='other', name='Other'),
+        ]
+
+        written, results, _ = self._carry(mod, frame, stored)
+
+        assert list(written['observed_at']) == [
+            pd.Timestamp(_STORED_OBSERVED_AT), pd.Timestamp(_STORED_OBSERVED_AT),
+        ]
+        assert results['observed_at_carry_forward'] == {
+            'attribute_observations': {'carried': 2, 'fresh': 0},
+        }
+        # Silver grain: the repeat introduces no new natural key.
+        natural_key = ['competition_id', 'edition_id', 'club_id', 'player_id',
+                       'observed_at']
+        assert set(
+            written[natural_key].itertuples(index=False, name=None)
+        ) == {
+            ('GB1', '2025', '1', '7', pd.Timestamp(_STORED_OBSERVED_AT)),
+            ('GB1', '2025', '1', '8', pd.Timestamp(_STORED_OBSERVED_AT)),
+        }
+
+    def test_loan_return_refuses_a_stamp_the_left_club_would_outrank(self):
+        mod = _import_runner()
+        # Aug: player 7 at club A. Jan: on loan at club B (same scope). Mar: back
+        # at A with byte-identical attributes. Carrying A's pre-loan stamp would
+        # leave B — the club he LEFT — ranked first for good, because
+        # transfermarkt_player_attributes_v2 ranks a player's rows by
+        # observed_at DESC before _bronze_ingested_at.
+        august = datetime(2025, 8, 20, 10, 0, 0)
+        january = datetime(2026, 1, 25, 10, 0, 0)
+        stored = [
+            _stored_row(
+                mod, observed_at=august, club_id='A', club_name='Club A',
+            ),
+            _stored_row(
+                mod, observed_at=january, club_id='B', club_name='Club B',
+            ),
+        ]
+        frame = _observations_df({'club_id': 'A', 'club_name': 'Club A'})
+
+        written, results, _ = self._carry(mod, frame, stored)
+
+        assert list(written['observed_at']) == [_OBSERVED_AT]   # > january
+        assert results['observed_at_carry_forward'] == {
+            'attribute_observations': {'carried': 0, 'fresh': 1},
+        }
+
+    def test_parallel_multi_club_player_still_carries_every_club(self):
+        mod = _import_runner()
+        # Two clubs of the same player inside one scope, observed by the same
+        # crawl and both unchanged: no club outranks the other, so both stamps
+        # are carryable and the repeat adds no new natural key.
+        stored = [
+            _stored_row(mod, club_id='A', club_name='Club A'),
+            _stored_row(mod, club_id='B', club_name='Club B'),
+        ]
+        frame = _observations_df(
+            {'club_id': 'A', 'club_name': 'Club A'},
+            {'club_id': 'B', 'club_name': 'Club B'},
+        )
+
+        written, results, _ = self._carry(mod, frame, stored)
+
+        assert list(written['observed_at']) == [
+            pd.Timestamp(_STORED_OBSERVED_AT), pd.Timestamp(_STORED_OBSERVED_AT),
+        ]
+        assert results['observed_at_carry_forward'] == {
+            'attribute_observations': {'carried': 2, 'fresh': 0},
+        }
+
+    def test_silver_ranks_a_players_clubs_by_observed_at_first(self):
+        # The carry-forward recency guard exists ONLY because observed_at
+        # outranks _bronze_ingested_at here. If that ORDER BY ever changes, this
+        # pin fails and the guard must be re-derived — a silent drift would
+        # resurrect the stale-club bug.
+        silver = (
+            Path(__file__).resolve().parents[3]
+            / 'dags/sql/silver/transfermarkt_player_attributes_v2.sql'
+        ).read_text()
+        ranked = silver.split('ranked AS (')[1].split('latest AS (')[0]
+
+        assert 'PARTITION BY player_id' in ranked
+        assert ranked.index('observed_at DESC') < ranked.index(
+            '_bronze_ingested_at DESC',
+        )
+
+    def test_changed_attribute_mints_fresh_observed_at_only_for_that_row(self):
+        mod = _import_runner()
+        frame = _observations_df(
+            {'market_value_eur': 12_000_000},                  # value changed
+            {'player_id': '8', 'player_slug': 'other', 'name': 'Other'},
+            {'player_id': '9', 'player_slug': 'new', 'name': 'New'},
+        )
+        stored = [
+            _stored_row(mod),   # player 7 still stored with the old value
+            _stored_row(mod, player_id='8', player_slug='other', name='Other'),
+            # player 9 has never been observed in this scope
+        ]
+
+        written, results, _ = self._carry(mod, frame, stored)
+
+        assert list(written['observed_at']) == [
+            _OBSERVED_AT,                       # changed → new SCD row
+            pd.Timestamp(_STORED_OBSERVED_AT),  # unchanged → carried
+            _OBSERVED_AT,                       # never seen → fresh
+        ]
+        assert results['observed_at_carry_forward'] == {
+            'attribute_observations': {'carried': 1, 'fresh': 2},
+        }
+
+    def test_missing_values_normalise_across_pandas_and_trino(self):
+        mod = _import_runner()
+        # Trino returns SQL NULL as None; the same missing cell reaches the
+        # frame as pd.NA (nullable Int64) or None. Both must read as the same
+        # missing value, or an unchanged player would be re-observed forever.
+        frame = _observations_df(
+            contract_until=None, market_value_eur=None, foot=None,
+        )
+        stored = [_stored_row(
+            mod, contract_until=None, market_value_eur=None, foot=None,
+        )]
+
+        written, results, _ = self._carry(mod, frame, stored)
+
+        assert frame['market_value_eur'].isna().all()   # pd.NA, not None
+        assert list(written['observed_at']) == [pd.Timestamp(_STORED_OBSERVED_AT)]
+        assert results['observed_at_carry_forward'][
+            'attribute_observations'
+        ]['carried'] == 1
+
+    def test_widened_numeric_and_date_columns_are_not_a_content_change(self):
+        mod = _import_runner()
+        # Defensive: any caller (or pandas itself) that widens an int column to
+        # float or a date column to datetime64 must not silently disable the
+        # carry-forward — 26.0 is still 26 and Timestamp('2000-01-01') is still
+        # that date.
+        frame = _observations_df()
+        frame['age'] = frame['age'].astype('float64')
+        frame['dob'] = pd.to_datetime(frame['dob'])
+        stored = [_stored_row(mod)]        # Trino: int 26, datetime.date
+
+        written, _, _ = self._carry(mod, frame, stored)
+
+        assert list(written['observed_at']) == [pd.Timestamp(_STORED_OBSERVED_AT)]
+
+    def test_missing_value_is_distinguishable_from_a_present_one(self):
+        mod = _import_runner()
+        frame = _observations_df(contract_until=date(2028, 6, 30))
+        stored = [_stored_row(mod, contract_until=None)]
+
+        written, _, _ = self._carry(mod, frame, stored)
+
+        assert list(written['observed_at']) == [_OBSERVED_AT]
+
+    def test_cold_bronze_table_keeps_the_fresh_observation(self):
+        mod = _import_runner()
+        frame = _observations_df()
+        missing = Exception("line 1:15: Table 'x' does not exist")
+
+        written, results, _ = self._carry(mod, frame, [], error=missing)
+
+        assert list(written['observed_at']) == [_OBSERVED_AT]
+        assert results['observed_at_carry_forward'] == {
+            'attribute_observations': {'carried': 0, 'fresh': 1},
+        }
+
+    def test_lookup_failure_fails_closed_before_any_write(self):
+        mod = _import_runner()
+        frame = _observations_df()
+
+        with pytest.raises(RuntimeError, match='carry-forward lookup failed'):
+            self._carry(mod, frame, [], error=RuntimeError('trino unavailable'))
+
+    def test_lookup_failure_writes_nothing_end_to_end(self, temp_output):
+        mod_frame = _observations_df()
+        memberships = pd.DataFrame({
+            'competition_id': ['GB1'], 'edition_id': ['2025'],
+            'league': ['ENG-Premier League'], 'season': ['2526'],
+            'club_id': ['1'], 'player_id': ['7'],
+        })
+
+        class BrokenLookupScraper:
+            _batch_id = 'native-cycle'
+            _last_endpoint_error = None
+
+            def __init__(self):
+                self.save_to_iceberg = MagicMock()
+                self._bronze_connection = MagicMock(
+                    return_value=_carry_forward_conn(
+                        [], error=RuntimeError('trino unavailable'),
+                    ),
+                )
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read_squad_data(self, **kwargs):
+                return {
+                    'memberships': memberships,
+                    'attribute_observations': mod_frame,
+                }
+
+            def get_traffic_stats(self):
+                return {
+                    'decoded_response_body_bytes': 10,
+                    'decoded_response_body_mb': 0.0,
+                    'network_fetches': 1,
+                }
+
+            def get_stats(self):
+                return {'requests': 1}
+
+            def get_fetch_outcomes(self):
+                return {}
+
+        scraper = BrokenLookupScraper()
+        rc = _run_main([
+            '--entity', 'players', '--write-mode', 'native-only',
+            '--output', temp_output,
+        ], scraper)
+
+        assert rc == 1
+        scraper.save_to_iceberg.assert_not_called()
+        assert any(
+            'carry-forward lookup failed' in error
+            for error in _load_results(temp_output)['errors']
+        )
+
+    def test_warm_repeat_write_spec_end_to_end(self, temp_output):
+        mod = _import_runner()
+        observations = _observations_df()
+        stored = [_stored_row(mod)]
+        memberships = pd.DataFrame({
+            'competition_id': ['GB1'], 'edition_id': ['2025'],
+            'league': ['ENG-Premier League'], 'season': ['2526'],
+            'club_id': ['1'], 'player_id': ['7'],
+        })
+
+        class WarmRepeatScraper:
+            _batch_id = 'native-cycle-2'
+            _last_endpoint_error = None
+
+            def __init__(self):
+                self.save_to_iceberg = MagicMock(
+                    side_effect=lambda **kw: 'iceberg.bronze.' + kw['table_name'],
+                )
+                self._bronze_connection = MagicMock(
+                    return_value=_carry_forward_conn(stored),
+                )
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read_squad_data(self, **kwargs):
+                return {
+                    'memberships': memberships,
+                    'attribute_observations': observations,
+                }
+
+            def get_traffic_stats(self):
+                return {
+                    'decoded_response_body_bytes': 10,
+                    'decoded_response_body_mb': 0.0,
+                    'network_fetches': 1,
+                }
+
+            def get_stats(self):
+                return {'requests': 1}
+
+            def get_fetch_outcomes(self):
+                return {}
+
+        scraper = WarmRepeatScraper()
+        rc = _run_main([
+            '--entity', 'players', '--write-mode', 'native-only',
+            '--output', temp_output,
+        ], scraper)
+
+        assert rc == 0
+        written = {
+            call.kwargs['table_name']: call.kwargs['df']
+            for call in scraper.save_to_iceberg.call_args_list
+        }
+        observation_write = written[
+            'transfermarkt_player_attribute_observations'
+        ]
+        # Exactly the row that is already in Bronze: same natural key, so the
+        # Silver dedup collapses the repeat instead of growing the grain.
+        assert list(observation_write['observed_at']) == [
+            pd.Timestamp(_STORED_OBSERVED_AT),
+        ]
+        results = _load_results(temp_output)
+        assert results['observed_at_carry_forward'] == {
+            'attribute_observations': {'carried': 1, 'fresh': 0},
+        }
+        assert results['outputs']['attribute_observations']['rows'] == 1
+
+    def test_lookup_reads_the_latest_row_of_the_frames_scope_only(self):
+        mod = _import_runner()
+        frame = _observations_df()
+        scraper = MagicMock()
+        conn = _carry_forward_conn([_stored_row(mod)])
+        scraper._bronze_connection.return_value = conn
+
+        mod._carry_forward_observed_at(
+            scraper,
+            mod._spec_for_write_mode(
+                mod.ENTITY_SPECS['players'], 'native-only',
+            ),
+            {'attribute_observations': frame},
+            {},
+        )
+
+        sql, params = conn.cursor().execute.call_args.args
+        assert 'iceberg.bronze.transfermarkt_player_attribute_observations' in sql
+        assert 'PARTITION BY competition_id, edition_id, club_id, player_id' in sql
+        assert 'ORDER BY observed_at DESC' in sql
+        assert 'WHERE rn = 1' in sql
+        assert params == ('GB1', '2025')
+
+    def test_carry_forward_projection_is_the_manifest_projection(self):
+        mod = _import_runner()
+        contract = mod._MANIFEST_COMPATIBILITY['attribute_observations']
+        identity = (
+            mod._CARRY_FORWARD_SCOPE_COLUMNS
+            + mod._CARRY_FORWARD_KEY_COLUMNS['attribute_observations']
+        )
+
+        content = mod._carry_forward_content_columns('attribute_observations')
+
+        assert 'observed_at' not in content
+        assert set(content) == set(contract['native']) - set(identity)
+        # …and the Bronze DQ payload contract must not drift from it.
+        dq = importlib.import_module('utils.transfermarkt_bronze_dq')
+        assert set(content) == set(dq.NATIVE_PAYLOAD_COLUMNS[
+            'iceberg.bronze.transfermarkt_player_attribute_observations'
+        ])
+
+    def test_only_append_only_native_outputs_carry_forward(self):
+        mod = _import_runner()
+        append_only = {
+            output.key
+            for spec in mod.ENTITY_SPECS.values()
+            for output in spec.outputs
+            if not output.is_legacy and not output.replace_keys
+        }
+
+        assert set(mod._CARRY_FORWARD_KEY_COLUMNS) == append_only
+
+    def test_silver_natural_key_still_embeds_observed_at(self):
+        mod = _import_runner()
+        dq = importlib.import_module('utils.transfermarkt_bronze_dq')
+        table = 'iceberg.bronze.transfermarkt_player_attribute_observations'
+        key = (
+            mod._CARRY_FORWARD_SCOPE_COLUMNS
+            + mod._CARRY_FORWARD_KEY_COLUMNS['attribute_observations']
+            + ('observed_at',)
+        )
+
+        assert dq.NATIVE_BRONZE_KEYS[table] == key
+        silver = (
+            Path(__file__).resolve().parents[3]
+            / 'dags/sql/silver'
+            / 'transfermarkt_player_attribute_observations_v2.sql'
+        ).read_text()
+        assert f"PARTITION BY {', '.join(key)}" in silver
