@@ -1212,7 +1212,7 @@ def release_fbref_publication_lock(
 def finalize_fbref_publication_lock(
     *, airflow_run_id: str, dag_id: str, **context
 ) -> dict:
-    """Release after Silver success; otherwise retain the fence and fail."""
+    """Release after terminal canary or Silver success; fail closed otherwise."""
 
     from airflow.exceptions import AirflowException
 
@@ -1231,11 +1231,25 @@ def finalize_fbref_publication_lock(
     canary_release_state = states.get(
         "release_canary_publication_lock", "missing"
     )
-    if canary_release_state == "success" and acquire_state == "success":
+    canary_validation_state = states.get("validate_canary_run", "missing")
+    if (
+        acquire_state == "success"
+        and canary_validation_state in {"success", "failed"}
+    ):
+        if canary_release_state == "success":
+            return {
+                "released": True,
+                "canary": True,
+                "status": "released_by_canary_path",
+            }
+        released = release_fbref_publication_lock(
+            airflow_run_id=airflow_run_id, dag_id=dag_id
+        )
         return {
-            "released": True,
+            **released,
             "canary": True,
-            "status": "released_by_canary_path",
+            "validation_state": canary_validation_state,
+            "status": "released_after_canary",
         }
     if acquire_state == "skipped" and plan_state == "success":
         return {

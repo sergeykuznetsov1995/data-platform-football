@@ -144,6 +144,7 @@ class TestFBrefCurrentTopology:
         assert tasks["validate_canary_run"].upstream_task_ids == {
             "choose_publication_path"
         }
+        assert tasks["validate_canary_run"]._captured_kwargs["retries"] == 0
         assert tasks["validate_canary_run"].downstream_task_ids == {
             "release_canary_publication_lock"
         }

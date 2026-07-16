@@ -238,6 +238,7 @@ with DAG(
             "dag_id": DAG_ID,
             "publication_eligible": False,
         },
+        retries=0,
         trigger_rule="all_success",
     )
 
