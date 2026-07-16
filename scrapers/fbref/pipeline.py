@@ -79,6 +79,7 @@ from scrapers.fbref.settings import (
     DEFAULT_SHARD_SIZE,
     MAX_CLEARANCE_SOLVE_ATTEMPTS,
     MAX_SHARD_SIZE,
+    MIN_DOMAIN_INTERVAL_SECONDS,
     MIB,
     bootstrap_byte_reservation_for,
     bootstrap_reservation_for,
@@ -186,8 +187,11 @@ class PipelineSettings:
             raise ValueError("shard_size must be between 1 and 25")
         if self.request_reservation_bytes <= 0:
             raise ValueError("request_reservation_bytes must be positive")
-        if self.domain_interval_seconds <= 0:
-            raise ValueError("domain_interval_seconds must be positive")
+        if self.domain_interval_seconds < MIN_DOMAIN_INTERVAL_SECONDS:
+            raise ValueError(
+                "domain_interval_seconds must respect the FBref "
+                f"{MIN_DOMAIN_INTERVAL_SECONDS:g}-second source minimum"
+            )
         if self.bootstrap_request_reservation < 1:
             raise ValueError("bootstrap_request_reservation must be positive")
         if self.bootstrap_byte_reservation < 1:
@@ -1169,7 +1173,32 @@ class FBrefPipeline:
                                     )
                                 )
                             )
+                        prepare_clearance = getattr(
+                            live_session.fetcher,
+                            "ensure_clearance",
+                            None,
+                        )
+                        if not callable(prepare_clearance):
+                            raise PipelineError(
+                                "FBref fetcher must expose ensure_clearance"
+                            )
+                        browser_navigated = bool(prepare_clearance())
                         live_session.needs_clearance = False
+                        if browser_navigated:
+                            # The first slot admitted the browser bootstrap.
+                            # Wait after it is fully closed, then reserve a
+                            # second durable slot for the first warm target.
+                            # Otherwise the old slot expires while Camoufox
+                            # solves Cloudflare and two page requests can leave
+                            # almost back-to-back.
+                            self.sleep(settings.domain_interval_seconds)
+                            target_slot = self.control.reserve_domain_slot(
+                                "fbref.com",
+                                interval_seconds=(
+                                    settings.domain_interval_seconds
+                                ),
+                            )
+                            self._wait_for_slot(target_slot.scheduled_at)
                     response = live_session.fetcher.fetch(
                         lease.canonical_url,
                         page_kind=lease.page_kind,

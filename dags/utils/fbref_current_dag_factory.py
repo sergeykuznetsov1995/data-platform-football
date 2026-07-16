@@ -9,6 +9,8 @@ from airflow.models.param import Param
 from airflow.operators.python import BranchPythonOperator, PythonOperator
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 
+from scrapers.fbref.settings import DEFAULT_DOMAIN_INTERVAL_SECONDS
+
 from utils.default_args import DEFAULT_ARGS, INGEST_SCRAPER_POOL
 from utils.fbref_pipeline_tasks import (
     FBREF_CANARY_BYTE_LIMIT_MB,
@@ -178,7 +180,7 @@ def build_fbref_current_dag(*, bootstrap_only: bool) -> DAG:
             "byte_limit_mb": byte_limit_mb,
             "shard_size": shard_size,
             "reservation_mb": 3,
-            "domain_interval_seconds": 3.0,
+            "domain_interval_seconds": DEFAULT_DOMAIN_INTERVAL_SECONDS,
         }
         if bootstrap_only:
             readiness_kwargs.update(
@@ -255,7 +257,7 @@ def build_fbref_current_dag(*, bootstrap_only: bool) -> DAG:
                 "byte_limit_mb": byte_limit_mb,
                 "shard_size": shard_size,
                 "reservation_mb": 3,
-                "domain_interval_seconds": 3.0,
+                "domain_interval_seconds": DEFAULT_DOMAIN_INTERVAL_SECONDS,
                 "max_batches": CURRENT_MAX_BATCHES,
             },
             pool=INGEST_SCRAPER_POOL,

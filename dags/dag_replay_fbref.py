@@ -14,6 +14,8 @@ from airflow.models.param import Param
 from airflow.operators.python import PythonOperator
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 
+from scrapers.fbref.settings import DEFAULT_DOMAIN_INTERVAL_SECONDS
+
 from utils.default_args import DEFAULT_ARGS
 from utils.fbref_pipeline_tasks import (
     acquire_fbref_publication_lock,
@@ -117,7 +119,7 @@ with DAG(
             "byte_limit_mb": 0,
             "shard_size": REPLAY_SHARD_SIZE,
             "reservation_mb": 3,
-            "domain_interval_seconds": 3.0,
+            "domain_interval_seconds": DEFAULT_DOMAIN_INTERVAL_SECONDS,
         },
         trigger_rule="all_success",
     )

@@ -27,7 +27,7 @@ from scrapers.fbref.settings import (
 from scrapers.utils.proxy_manager import classify_error
 
 
-FETCHER_VERSION = "fbref-camoufox-metered-warm-http-v6"
+FETCHER_VERSION = "fbref-camoufox-metered-warm-http-v7"
 DEFAULT_BOOTSTRAP_URL = "https://fbref.com/en/"
 MAX_HTML_BYTES = DEFAULT_HTTP_BODY_LIMIT_BYTES
 # The browser cap bounds ONE clearance attempt; the run's reservation covers
@@ -407,6 +407,16 @@ class FBrefFetcher:
         self._clearance = None
         self._transport = self._create_transport()
 
+    def ensure_clearance(self) -> bool:
+        """Prepare warm HTTP and report whether a browser page was fetched.
+
+        The pipeline uses the boolean to reserve a new domain-throttle slot
+        between the browser bootstrap page and the first warm target. A
+        retained cookie only recreates the HTTP adapter and returns ``False``.
+        """
+
+        return self._ensure_clearance()
+
     def _next_proxy(self) -> Optional[dict]:
         if self._lease_client is not None:
             if self._provider_http_ready:
@@ -669,9 +679,9 @@ class FBrefFetcher:
             return {}, close_error or exc
         return stats, close_error
 
-    def _ensure_clearance(self) -> None:
+    def _ensure_clearance(self) -> bool:
         if self._http_session is not None:
-            return
+            return False
         retained_clearance = getattr(self, "_clearance", None)
         if retained_clearance is not None:
             if (
@@ -683,7 +693,7 @@ class FBrefFetcher:
                     error_class="hard_transport_policy",
                 )
             self._http_session = self._create_http_session(retained_clearance)
-            return
+            return False
         transport = self._transport
         html = None
         bootstrap_error = None
@@ -833,6 +843,7 @@ class FBrefFetcher:
         self._http_session = http_session
         self._clearance = dict(clearance)
         self._bootstrap_stats = bootstrap_stats
+        return True
 
     @staticmethod
     def _hard_transport_policy_reason(stats: Optional[dict]) -> Optional[str]:

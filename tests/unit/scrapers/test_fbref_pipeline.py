@@ -47,6 +47,10 @@ from scrapers.fbref.raw_store import (
     match_page_target,
     season_page_target,
 )
+from scrapers.fbref.settings import (
+    DEFAULT_DOMAIN_INTERVAL_SECONDS,
+    MIN_DOMAIN_INTERVAL_SECONDS,
+)
 from scrapers.fbref.typed_bronze import TYPED_BRONZE_PARSER_VERSION
 
 
@@ -727,6 +731,7 @@ class FakeFetcher:
         self.events = events
         self.body = body
         self.http_requests = http_requests
+        self.clearance_ready = False
 
     def __enter__(self):
         self.events.append("fetcher_enter")
@@ -734,6 +739,13 @@ class FakeFetcher:
 
     def __exit__(self, *args):
         self.events.append("fetcher_exit")
+
+    def ensure_clearance(self):
+        if self.clearance_ready:
+            return False
+        self.clearance_ready = True
+        self.events.append("browser")
+        return True
 
     def fetch(self, url, **kwargs):
         self.events.append("http")
@@ -769,6 +781,10 @@ class FakeFailingFetcher:
     def __exit__(self, *args):
         self.events.append("fetcher_exit")
 
+    def ensure_clearance(self):
+        self.events.append("browser")
+        return True
+
     def fetch(self, url, **kwargs):
         self.events.append("http")
         raise FetchError(
@@ -798,13 +814,23 @@ def _settings(run_type="current"):
         byte_limit=25 * 1024 * 1024,
         shard_size=4,
         request_reservation_bytes=4 * 1024 * 1024,
-        domain_interval_seconds=0.01,
+        domain_interval_seconds=DEFAULT_DOMAIN_INTERVAL_SECONDS,
     )
 
 
 def test_settings_cannot_underreserve_bounded_status_retry_requests():
     with pytest.raises(ValueError, match="cover both HTTP attempts"):
         PipelineSettings(target_request_reservation=1)
+
+
+def test_settings_enforce_the_published_fbref_page_rate():
+    assert PipelineSettings().domain_interval_seconds == (
+        DEFAULT_DOMAIN_INTERVAL_SECONDS
+    )
+    with pytest.raises(ValueError, match="source minimum"):
+        PipelineSettings(
+            domain_interval_seconds=MIN_DOMAIN_INTERVAL_SECONDS - 0.001
+        )
 
 
 def _commit_for_parse(store, target, html):
@@ -1342,6 +1368,71 @@ def test_fetch_wave_reserves_budget_and_commits_raw_before_control(tmp_path):
     assert control.claim_calls[0]["lease_seconds"] == FETCH_LEASE_SECONDS
 
 
+def test_browser_bootstrap_and_warm_targets_have_separate_rate_slots(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    run_id = str(uuid.UUID(int=1))
+
+    def lease(number):
+        return TargetLease(
+            attempt_id=str(uuid.UUID(int=20 + number)),
+            run_id=run_id,
+            target_id=f"fbref:competition:{number}",
+            logical_refresh_id=str(uuid.UUID(int=30 + number)),
+            canonical_url=(
+                f"https://fbref.com/en/comps/{number}/history/x-Seasons"
+            ),
+            page_kind="competition",
+            source_ids={"competition_id": str(number)},
+            claim_token=str(uuid.UUID(int=40 + number)),
+            lease_epoch=1,
+            attempt_number=1,
+            leased_by="worker-1",
+            lease_expires_at=NOW + timedelta(minutes=10),
+        )
+
+    control.claim_targets = lambda *args, **kwargs: [lease(9), lease(12)]
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=lambda *_: FakeFetcher(
+            control.events, b"<html>ok</html>"
+        ),
+        sleep=lambda seconds: control.events.append(f"sleep:{seconds}"),
+        clock=lambda: NOW,
+    )
+
+    result = pipeline.fetch_wave(
+        run_id,
+        worker_id="worker-1",
+        page_kinds=["competition"],
+        settings=_settings(),
+    )
+
+    assert result.fetched == 2
+    throttles = [
+        index
+        for index, event in enumerate(control.events)
+        if event == "throttle"
+    ]
+    requests = [
+        index for index, event in enumerate(control.events) if event == "http"
+    ]
+    browser = control.events.index("browser")
+    delay = control.events.index(
+        f"sleep:{DEFAULT_DOMAIN_INTERVAL_SECONDS}"
+    )
+    assert len(throttles) == 3
+    assert len(requests) == 2
+    assert throttles[0] < browser < delay < throttles[1] < requests[0]
+    assert requests[0] < throttles[2] < requests[1]
+    assert control.events.count("browser") == 1
+    assert control.events.count(
+        f"sleep:{DEFAULT_DOMAIN_INTERVAL_SECONDS}"
+    ) == 1
+
+
 def test_fetch_wave_settles_exact_provider_bytes_not_geoip_reserve(tmp_path):
     raw = _raw_store(tmp_path)
     control = FakeControl(raw)
@@ -1435,6 +1526,9 @@ def test_generic_fetch_exception_settles_and_terminates_attempt(tmp_path):
 
         def __exit__(self, *args):
             return False
+
+        def ensure_clearance(self):
+            return True
 
         def fetch(self, *args, **kwargs):
             raise RuntimeError("driver exploded")
@@ -3541,6 +3635,10 @@ class FakeClearanceRejectedFetcher:
     def __exit__(self, *args):
         self.events.append("fetcher_exit")
 
+    def ensure_clearance(self):
+        self.events.append("browser")
+        return True
+
     def fetch(self, url, **kwargs):
         self.calls += 1
         self.events.append("http")
@@ -3663,7 +3761,7 @@ def test_a_rejected_clearance_is_burned_instead_of_failing_every_target(
             byte_limit=50 * 1024 * 1024,
             shard_size=4,
             request_reservation_bytes=4 * 1024 * 1024,
-            domain_interval_seconds=0.01,
+            domain_interval_seconds=DEFAULT_DOMAIN_INTERVAL_SECONDS,
         ),
     )
 
@@ -3788,6 +3886,10 @@ def test_unknown_paid_counter_stops_wave_and_requeues_untouched_target(
 
         def __exit__(self, *args):
             control.events.append("fetcher_exit")
+
+        def ensure_clearance(self):
+            control.events.append("browser")
+            return True
 
         def fetch(self, *args, **kwargs):
             self.fetch_calls += 1
@@ -3982,6 +4084,10 @@ def test_productive_refreshes_do_not_accumulate_into_session_exhaustion(
         def __exit__(self, *args):
             control.events.append("fetcher_exit")
 
+        def ensure_clearance(self):
+            control.events.append("browser")
+            return True
+
         def reset_clearance(self):
             self.reset_calls += 1
             self.session_number += 1
@@ -4044,7 +4150,7 @@ def test_productive_refreshes_do_not_accumulate_into_session_exhaustion(
             byte_limit=100 * 1024 * 1024,
             shard_size=5,
             request_reservation_bytes=4 * 1024 * 1024,
-            domain_interval_seconds=0.01,
+            domain_interval_seconds=DEFAULT_DOMAIN_INTERVAL_SECONDS,
         ),
     )
 
@@ -4183,7 +4289,7 @@ def test_session_refresh_exhaustion_requeues_untouched_without_false_failures(
                 byte_limit=100 * 1024 * 1024,
                 shard_size=4,
                 request_reservation_bytes=4 * 1024 * 1024,
-                domain_interval_seconds=0.01,
+                domain_interval_seconds=DEFAULT_DOMAIN_INTERVAL_SECONDS,
             ),
         )
 
@@ -4271,7 +4377,7 @@ def test_dead_clearance_at_budget_boundary_stops_cleanly(
             byte_limit=100 * 1024 * 1024,
             shard_size=4,
             request_reservation_bytes=4 * 1024 * 1024,
-            domain_interval_seconds=0.01,
+            domain_interval_seconds=DEFAULT_DOMAIN_INTERVAL_SECONDS,
         ),
     )
 
@@ -4385,7 +4491,7 @@ def test_the_browser_may_only_spend_the_requests_the_run_reserved(tmp_path):
         byte_limit=100 * 1024 * 1024,
         shard_size=4,
         request_reservation_bytes=7 * 1024 * 1024,
-        domain_interval_seconds=0.01,
+        domain_interval_seconds=DEFAULT_DOMAIN_INTERVAL_SECONDS,
         bootstrap_request_reservation=80,
         proxy_file="/opt/airflow/proxys.txt",
     )

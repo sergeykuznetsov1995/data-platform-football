@@ -15,7 +15,11 @@ DEFAULT_REQUEST_RESERVATION_BYTES = (
     DEFAULT_HTTP_BODY_LIMIT_BYTES
     + DEFAULT_HTTP_WIRE_OVERHEAD_RESERVATION_BYTES
 )
-DEFAULT_DOMAIN_INTERVAL_SECONDS = 3.0
+# Sports Reference publishes a hard FBref limit of ten page requests per
+# minute. Keep a small scheduling margin instead of sitting exactly on the
+# six-second boundary.
+MIN_DOMAIN_INTERVAL_SECONDS = 6.0
+DEFAULT_DOMAIN_INTERVAL_SECONDS = 6.1
 # One Turnstile solve costs 19 requests (measured in production). The bootstrap
 # reservation is what the browser is allowed to spend in total, so it also
 # decides how many times a bad exit IP may be retried: a run that reserves one
@@ -80,5 +84,6 @@ __all__ = [
     "DEFAULT_REQUEST_RESERVATION_BYTES",
     "DEFAULT_SHARD_SIZE",
     "MAX_SHARD_SIZE",
+    "MIN_DOMAIN_INTERVAL_SECONDS",
     "MIB",
 ]

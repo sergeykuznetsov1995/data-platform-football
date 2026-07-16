@@ -104,7 +104,8 @@ def test_clearance_bootstrap_consumes_transport_delta_not_cumulative_stats(
     fetcher._http_session = None
     fetcher._transport = transport
 
-    fetcher._ensure_clearance()
+    assert fetcher.ensure_clearance() is True
+    assert fetcher.ensure_clearance() is False
 
     transport.traffic_delta.assert_called_once_with()
     transport.traffic_stats.assert_not_called()
