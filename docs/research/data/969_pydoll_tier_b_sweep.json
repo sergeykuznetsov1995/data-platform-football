@@ -1,0 +1,119 @@
+{
+  "mode": "tier_b",
+  "engine": "pydoll (Chrome/CDP)",
+  "event_id": "14023964",
+  "proxy_used": true,
+  "proxy_label": "pool#0 pool.proxys.io:10000",
+  "note": "residential proxy — authoritative transport test",
+  "startup_seconds": 1.017,
+  "browser_version": "{'protocolVersion': '1.3', 'product': 'Chrome/150.0.7871.46', 'revision': '@5b586c06e0d27582900f17e2d59c5370d8d6e0bb', 'userAgent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/150.0.0.0 Safari/537.36', 'jsVersion': '15.0.245.13'}",
+  "landing": {
+    "step": "landing",
+    "url": "https://www.sofascore.com",
+    "nav_seconds": 4.751,
+    "title": "Football Live Scores, Fixtures & Odds | Sofascore | Championship League, Premier League",
+    "is_challenge": false,
+    "reached_spa": true
+  },
+  "rss_kib_after_landing": 1368216,
+  "landing_wire_down_bytes": 2336526,
+  "probes": [
+    {
+      "method": "navigation",
+      "url": "https://www.sofascore.com/api/v1/event/14023964",
+      "content_type": "application/json",
+      "body_len": 9417,
+      "looks_like_json": true,
+      "is_challenge": false,
+      "head": "{\"event\":{\"eventState\":{},\"tournament\":{\"name\":\"Premier League\",\"slug\":\"premier-league\",\"category\":{\"name\":\"England\",\"slug\":\"england\",\"sport\":{\"name\":\"Football\",\"slug\":\"football\",\""
+    },
+    {
+      "method": "in_page_fetch",
+      "url": "https://www.sofascore.com/api/v1/event/14023964",
+      "status": 200,
+      "body_len": 9417,
+      "looks_like_json": true,
+      "head": "{\"event\":{\"eventState\":{},\"tournament\":{\"name\":\"Premier League\",\"slug\":\"premier-league\",\"category\":{\"name\":\"England\",\"slug\":\"england\",\"sport\":{\"name\":\"Football\",\"slug\":\"football\",\"",
+      "fetch_error": null
+    },
+    {
+      "method": "navigation",
+      "url": "https://www.sofascore.com/api/v1/event/14023964/shotmap",
+      "content_type": "application/json",
+      "body_len": 69306,
+      "looks_like_json": true,
+      "is_challenge": false,
+      "head": "{\"shotmap\":[{\"player\":{\"name\":\"Enes \\u00dcnal\",\"slug\":\"enes-unal\",\"shortName\":\"E. \\u00dcnal\",\"position\":\"F\",\"jerseyNumber\":\"26\",\"userCount\":3929,\"gender\":\"M\",\"sofascoreId\":\"EnesUna"
+    },
+    {
+      "method": "in_page_fetch",
+      "url": "https://www.sofascore.com/api/v1/event/14023964/shotmap",
+      "status": 200,
+      "body_len": 69306,
+      "looks_like_json": true,
+      "head": "{\"shotmap\":[{\"player\":{\"name\":\"Enes \\u00dcnal\",\"slug\":\"enes-unal\",\"shortName\":\"E. \\u00dcnal\",\"position\":\"F\",\"jerseyNumber\":\"26\",\"userCount\":3929,\"gender\":\"M\",\"sofascoreId\":\"EnesUna",
+      "fetch_error": null
+    }
+  ],
+  "fetch_sweep": [
+    {
+      "method": "in_page_fetch",
+      "url": "https://www.sofascore.com/api/v1/event/14023964",
+      "status": 200,
+      "body_len": 9417,
+      "looks_like_json": true,
+      "head": "{\"event\":{\"eventState\":{},\"tournament\":{\"name\":\"Premier League\",\"slug\":\"premier-league\",\"category\":{\"name\":\"England\",\"slug\":\"england\",\"sport\":{\"name\":\"Football\",\"slug\":\"football\",\"",
+      "fetch_error": null,
+      "endpoint": "event",
+      "seconds": 0.008
+    },
+    {
+      "method": "in_page_fetch",
+      "url": "https://www.sofascore.com/api/v1/event/14023964/incidents",
+      "status": 200,
+      "body_len": 39798,
+      "looks_like_json": true,
+      "head": "{\"incidents\":[{\"text\":\"FT\",\"homeScore\":1,\"awayScore\":1,\"isLive\":false,\"time\":90,\"addedTime\":999,\"timeSeconds\":5400,\"incidentType\":\"period\",\"reversedPeriodTime\":1,\"reversedPeriodTim",
+      "fetch_error": null,
+      "endpoint": "incidents",
+      "seconds": 0.299
+    },
+    {
+      "method": "in_page_fetch",
+      "url": "https://www.sofascore.com/api/v1/event/14023964/lineups",
+      "status": 200,
+      "body_len": 86034,
+      "looks_like_json": true,
+      "head": "{\"confirmed\":true,\"home\":{\"players\":[{\"player\":{\"name\":\"Matz Sels\",\"slug\":\"matz-sels\",\"shortName\":\"M. Sels\",\"position\":\"G\",\"jerseyNumber\":\"26\",\"height\":188,\"userCount\":2603,\"gender",
+      "fetch_error": null,
+      "endpoint": "lineups",
+      "seconds": 0.111
+    },
+    {
+      "method": "in_page_fetch",
+      "url": "https://www.sofascore.com/api/v1/event/14023964/shotmap",
+      "status": 200,
+      "body_len": 69306,
+      "looks_like_json": true,
+      "head": "{\"shotmap\":[{\"player\":{\"name\":\"Enes \\u00dcnal\",\"slug\":\"enes-unal\",\"shortName\":\"E. \\u00dcnal\",\"position\":\"F\",\"jerseyNumber\":\"26\",\"userCount\":3929,\"gender\":\"M\",\"sofascoreId\":\"EnesUna",
+      "fetch_error": null,
+      "endpoint": "shotmap",
+      "seconds": 0.005
+    },
+    {
+      "method": "in_page_fetch",
+      "url": "https://www.sofascore.com/api/v1/event/14023964/statistics",
+      "status": 200,
+      "body_len": 23853,
+      "looks_like_json": true,
+      "head": "{\"statistics\":[{\"period\":\"ALL\",\"groups\":[{\"groupName\":\"Match overview\",\"statisticsItems\":[{\"name\":\"Ball possession\",\"home\":\"45%\",\"away\":\"55%\",\"compareCode\":2,\"statisticsType\":\"posi",
+      "fetch_error": null,
+      "endpoint": "statistics",
+      "seconds": 0.061
+    }
+  ],
+  "wire_down_bytes_total": 2382802,
+  "data_wire_down_bytes": 46276,
+  "wire_response_count": 144,
+  "total_seconds": 7.22
+}

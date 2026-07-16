@@ -1,0 +1,37 @@
+{
+  "pages": 10,
+  "iterations": 15,
+  "engines": {
+    "bs4_html.parser": {
+      "mean_total_seconds": 0.822,
+      "mean_seconds_per_page": 0.0822,
+      "tables": 70,
+      "data_rows": 949,
+      "cells": 9177,
+      "text_checksum": 24990,
+      "speedup_vs_html_parser": 1.0,
+      "structural_match": true
+    },
+    "bs4_lxml": {
+      "mean_total_seconds": 0.6222,
+      "mean_seconds_per_page": 0.06222,
+      "tables": 70,
+      "data_rows": 949,
+      "cells": 9177,
+      "text_checksum": 24990,
+      "speedup_vs_html_parser": 1.32,
+      "structural_match": true
+    },
+    "selectolax": {
+      "mean_total_seconds": 0.1012,
+      "mean_seconds_per_page": 0.01012,
+      "tables": 70,
+      "data_rows": 949,
+      "cells": 9177,
+      "text_checksum": 24990,
+      "speedup_vs_html_parser": 8.12,
+      "structural_match": true
+    }
+  },
+  "note": "FBref parsing is proxy-bound in normal ingest; parser speed only matters for the offline replay of ~18k saved pages. text_checksum may differ across engines due to whitespace handling — tables/data_rows/cells is the structural equivalence signal."
+}
