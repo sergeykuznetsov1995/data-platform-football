@@ -14,6 +14,7 @@ on:
       - "scrapers/fbref/**"
       - "scrapers/__init__.py"
       - "scrapers/utils/proxy_manager.py"
+      - "scripts/proxy_filter/**"
       - "scripts/**/*fbref*"
       - "tests/**/*fbref*"
       - "tests/integration/scrapers/conftest.py"
@@ -57,10 +58,12 @@ jobs:
             scrapers/fbref \
             scrapers/utils/proxy_manager.py \
             dags/scripts/*fbref*.py \
+            dags/utils/fbref_current_dag_factory.py \
             dags/utils/fbref_pipeline_tasks.py \
             dags/utils/maintenance_tasks.py \
             dags/dag_*fbref.py \
             dags/dag_iceberg_maintenance_daily.py \
+            scripts/proxy_filter/filter_proxy.py \
             scripts/audit_fbref_production.py
           python -m compileall -q \
             scrapers/fbref scrapers/utils/proxy_manager.py \
@@ -77,6 +80,7 @@ jobs:
             "${tests[@]}" \
             tests/unit/dags/test_dag_iceberg_maintenance_daily.py \
             tests/unit/dags/test_maintenance_tasks.py \
+            tests/unit/scripts/test_filter_proxy.py \
             tests/unit/scrapers/test_proxy_manager.py \
             tests/unit/scrapers/test_scrapers_lazy_import.py
 
@@ -114,6 +118,10 @@ jobs:
           root = Path.cwd()
           expected = {
               "dag_ingest_fbref": (root / "dags/dag_ingest_fbref.py", 16),
+              "dag_bootstrap_fbref": (
+                  root / "dags/dag_bootstrap_fbref.py",
+                  11,
+              ),
               "dag_backfill_fbref": (root / "dags/dag_backfill_fbref.py", 16),
               "dag_replay_fbref": (root / "dags/dag_replay_fbref.py", 17),
           }

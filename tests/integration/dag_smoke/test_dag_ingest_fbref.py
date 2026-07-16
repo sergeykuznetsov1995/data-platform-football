@@ -28,6 +28,7 @@ def fbref_dags():
     bag = DagBag(dag_folder=str(DAGS_FOLDER), include_examples=False)
     expected = {
         "dag_ingest_fbref",
+        "dag_bootstrap_fbref",
         "dag_backfill_fbref",
         "dag_replay_fbref",
     }
@@ -58,8 +59,17 @@ class TestFBrefDagBag:
 
     def test_backfill_and_replay_are_manual(self, fbref_dags):
         backfill = fbref_dags["dag_backfill_fbref"]
+        bootstrap = fbref_dags["dag_bootstrap_fbref"]
         replay = fbref_dags["dag_replay_fbref"]
         assert backfill.schedule_interval is None
+        assert bootstrap.schedule_interval is None
+        assert bootstrap.is_paused_upon_creation is False
+        assert len(bootstrap.task_dict) == 11
+        assert {
+            "validate_current_scope_freshness",
+            "export_publication_scope",
+            "trigger_silver_transform",
+        }.isdisjoint(bootstrap.task_dict)
         assert replay.schedule_interval is None
         assert "run_live_waves" in backfill.task_dict
         assert not any(

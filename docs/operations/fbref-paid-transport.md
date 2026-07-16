@@ -98,15 +98,16 @@ recovery, paid fetch, parse, and raw-integrity audit, but it cannot run the
 freshness gate, export a publication scope, or trigger Silver.
 
 ```bash
-airflow dags trigger dag_ingest_fbref \
-  --conf '{"bootstrap_only":true,"request_limit":200,"byte_limit_mb":100,"shard_size":25}'
+airflow dags unpause dag_bootstrap_fbref
+airflow dags trigger dag_bootstrap_fbref
 ```
 
-The mode fails before a control run or paid request if the DagRun is not
-manual, if `bootstrap_only` is not a recognized boolean value, or if the
-limits are not exactly `200 requests / 100 MiB / shard 25`. The scheduled DAG
-keeps `bootstrap_only=false`, so its normal production path is unchanged. The
-existing `100/50` canary remains a separate non-publishing path.
+`dag_bootstrap_fbref` has `schedule=None`, so it is safe to leave unpaused: it
+can create only an explicitly triggered manual DagRun. Its tasks contain
+literal `200 requests / 100 MiB / shard 25` limits and literal
+`bootstrap_only=true`; DagRun conf cannot change them. The scheduled
+`dag_ingest_fbref` keeps its original daily schedule, parameters, and
+publishing default. The existing `100/50` canary remains a separate path.
 
 A successful bootstrap has these three pieces of evidence:
 
@@ -119,9 +120,10 @@ A successful bootstrap has these three pieces of evidence:
    `release_publication_lock` finalizer. No `export_publication_scope` or
    `trigger_silver_transform` task may run.
 
-If bootstrap validation fails, the common finalizer releases the lock and
-keeps the DagRun failed. Never clear skipped publication tasks to force them
-to run: the control-run mode also blocks freshness, publication-scope export,
-replay-source selection, and the first Silver preflight before any Silver-DAG
-transform write. Start a new normal production DagRun after
-freshness is complete.
+The finalizer always attempts an exact idempotent lock release, then requires
+all ten earlier bootstrap tasks (including the direct release task) to be
+`success`. If live fetch, audit, validation, or release failed, the lock is
+cleaned but the finalizer raises, so Airflow keeps the DagRun red. The
+control-run mode also blocks publication-scope export, replay-source
+selection, and the first Silver preflight. Start a normal production DagRun
+after freshness is complete.

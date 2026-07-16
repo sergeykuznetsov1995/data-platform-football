@@ -98,6 +98,19 @@ FBREF_PRODUCTION_BYTE_LIMIT_MB = 100
 FBREF_CANARY_REQUEST_LIMIT = 100
 FBREF_CANARY_BYTE_LIMIT_MB = 50
 FBREF_MAX_WARM_SESSION_TARGETS = 25
+FBREF_BOOTSTRAP_DAG_ID = "dag_bootstrap_fbref"
+FBREF_BOOTSTRAP_REQUIRED_TASK_IDS = (
+    "validate_production_readiness",
+    "initialize_run",
+    "acquire_publication_lock",
+    "seed_competition_index",
+    "capture_raw_baseline",
+    "recover_raw_before_fetch",
+    "run_live_waves",
+    "audit_raw_integrity",
+    "validate_bootstrap_run",
+    "release_bootstrap_publication_lock",
+)
 FBREF_PUBLICATION_SCOPE_TABLE = "fbref_target_scope"
 FBREF_PUBLICATION_LOCK_TTL_SECONDS = 8 * 24 * 60 * 60
 FBREF_LIVE_BUDGET_PROFILES = {
@@ -1358,9 +1371,13 @@ def release_fbref_publication_lock(
 
 
 def finalize_fbref_publication_lock(
-    *, airflow_run_id: str, dag_id: str, **context
+    *,
+    airflow_run_id: str,
+    dag_id: str,
+    bootstrap_only=False,
+    **context,
 ) -> dict:
-    """Release after terminal canary or Silver success; fail closed otherwise."""
+    """Release exact locks while preserving an honest terminal DAG verdict."""
 
     from airflow.exceptions import AirflowException
 
@@ -1376,54 +1393,60 @@ def finalize_fbref_publication_lock(
     }
     acquire_state = states.get("acquire_publication_lock", "missing")
     plan_state = states.get("plan_backfill", "missing")
+    bootstrap_mode = _boolean_parameter(
+        bootstrap_only, name="bootstrap_only"
+    )
+    if bootstrap_mode:
+        if str(dag_id) != FBREF_BOOTSTRAP_DAG_ID:
+            raise AirflowException(
+                "FBref bootstrap finalizer is allowed only for "
+                f"{FBREF_BOOTSTRAP_DAG_ID}"
+            )
+        released = release_fbref_publication_lock(
+            airflow_run_id=airflow_run_id, dag_id=dag_id
+        )
+        failed_states = {
+            task_id: states.get(task_id, "missing")
+            for task_id in FBREF_BOOTSTRAP_REQUIRED_TASK_IDS
+            if states.get(task_id, "missing") != "success"
+        }
+        if failed_states:
+            raise AirflowException(
+                "FBref bootstrap lock was released, but its source verdict "
+                "is red: "
+                + json.dumps(failed_states, sort_keys=True)
+            )
+        return {
+            **released,
+            "bootstrap_only": True,
+            "status": "released_after_successful_bootstrap",
+        }
+
     canary_release_state = states.get(
         "release_canary_publication_lock", "missing"
     )
     canary_validation_state = states.get("validate_canary_run", "missing")
-    bootstrap_release_state = states.get(
-        "release_bootstrap_publication_lock", "missing"
-    )
-    bootstrap_validation_state = states.get(
-        "validate_bootstrap_run", "missing"
-    )
-    if (
-        acquire_state == "success"
-        and bootstrap_validation_state in {"success", "failed"}
-    ):
-        if bootstrap_release_state == "success":
-            return {
-                "released": True,
-                "bootstrap_only": True,
-                "status": "released_by_bootstrap_path",
-            }
-        released = release_fbref_publication_lock(
-            airflow_run_id=airflow_run_id, dag_id=dag_id
-        )
-        return {
-            **released,
-            "bootstrap_only": True,
-            "validation_state": bootstrap_validation_state,
-            "status": "released_after_bootstrap",
-        }
     if (
         acquire_state == "success"
         and canary_validation_state in {"success", "failed"}
     ):
-        if canary_release_state == "success":
+        if (
+            canary_validation_state == "success"
+            and canary_release_state == "success"
+        ):
             return {
                 "released": True,
                 "canary": True,
                 "status": "released_by_canary_path",
             }
-        released = release_fbref_publication_lock(
+        release_fbref_publication_lock(
             airflow_run_id=airflow_run_id, dag_id=dag_id
         )
-        return {
-            **released,
-            "canary": True,
-            "validation_state": canary_validation_state,
-            "status": "released_after_canary",
-        }
+        raise AirflowException(
+            "FBref canary lock was released, but its source verdict is red "
+            f"(validation={canary_validation_state}, "
+            f"release={canary_release_state})"
+        )
     if acquire_state == "skipped" and plan_state == "success":
         return {
             "released": False,
@@ -2060,27 +2083,19 @@ def _validate_fbref_bootstrap_control_evidence(
 
 
 def choose_fbref_publication_path(
-    *,
-    request_limit: int,
-    byte_limit_mb: int,
-    shard_size=FBREF_MAX_WARM_SESSION_TARGETS,
-    bootstrap_only=False,
-    dag_run_type=None,
+    *, request_limit: int, byte_limit_mb: int
 ) -> str:
-    """Route canary/bootstrap runs away from publication tasks."""
+    """Route the bounded canary away from publication tasks."""
 
-    execution = validate_fbref_current_execution_mode(
-        bootstrap_only=bootstrap_only,
-        dag_run_type=dag_run_type,
+    profile = validate_fbref_runtime_limits(
+        run_type="current",
         request_limit=request_limit,
         byte_limit_mb=byte_limit_mb,
-        shard_size=shard_size,
-    )
-    if execution["execution_mode"] == "bootstrap_only":
-        return "validate_bootstrap_run"
+        shard_size=FBREF_MAX_WARM_SESSION_TARGETS,
+    )["profile"]
     return (
         "validate_canary_run"
-        if execution["profile"] == "canary"
+        if profile == "canary"
         else "validate_current_scope_freshness"
     )
 

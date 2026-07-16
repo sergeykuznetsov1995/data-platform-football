@@ -165,17 +165,6 @@ def test_bootstrap_mode_is_manual_exact_and_non_publishing():
 
 
 @pytest.mark.unit
-def test_bootstrap_publication_path_is_separate_from_canary_and_silver():
-    assert fbref_pipeline_tasks.choose_fbref_publication_path(
-        request_limit=200,
-        byte_limit_mb=100,
-        shard_size=25,
-        bootstrap_only=True,
-        dag_run_type="manual",
-    ) == "validate_bootstrap_run"
-
-
-@pytest.mark.unit
 def test_readiness_rejects_scheduled_bootstrap_before_dependency_checks(
     monkeypatch,
 ):
@@ -953,6 +942,8 @@ def test_publication_lock_finalizer_preserves_successful_canary(monkeypatch):
 
 @pytest.mark.unit
 def test_publication_lock_finalizer_cleans_up_failed_canary(monkeypatch):
+    from airflow.exceptions import AirflowException
+
     release = MagicMock(return_value={"released": True})
     monkeypatch.setattr(
         fbref_pipeline_tasks, "release_fbref_publication_lock", release
@@ -973,91 +964,142 @@ def test_publication_lock_finalizer_cleans_up_failed_canary(monkeypatch):
         ]
     )
 
-    assert fbref_pipeline_tasks.finalize_fbref_publication_lock(
-        airflow_run_id="manual__failed_canary",
-        dag_id="dag_ingest_fbref",
-        dag_run=canary_run,
-    ) == {
-        "released": True,
-        "canary": True,
-        "validation_state": "failed",
-        "status": "released_after_canary",
-    }
+    with pytest.raises(AirflowException, match="source verdict is red"):
+        fbref_pipeline_tasks.finalize_fbref_publication_lock(
+            airflow_run_id="manual__failed_canary",
+            dag_id="dag_ingest_fbref",
+            dag_run=canary_run,
+        )
     release.assert_called_once_with(
         airflow_run_id="manual__failed_canary",
+        dag_id="dag_ingest_fbref",
+    )
+
+
+@pytest.mark.unit
+def test_publication_lock_finalizer_keeps_failed_canary_release_red(monkeypatch):
+    from airflow.exceptions import AirflowException
+
+    release = MagicMock(return_value={"released": True, "idempotent": True})
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "release_fbref_publication_lock", release
+    )
+    canary_run = SimpleNamespace(
+        get_task_instances=lambda: [
+            SimpleNamespace(
+                task_id="acquire_publication_lock", state="success"
+            ),
+            SimpleNamespace(task_id="validate_canary_run", state="success"),
+            SimpleNamespace(
+                task_id="release_canary_publication_lock", state="failed"
+            ),
+        ]
+    )
+
+    with pytest.raises(AirflowException, match="source verdict is red"):
+        fbref_pipeline_tasks.finalize_fbref_publication_lock(
+            airflow_run_id="manual__failed-canary-release",
+            dag_id="dag_ingest_fbref",
+            dag_run=canary_run,
+        )
+    release.assert_called_once_with(
+        airflow_run_id="manual__failed-canary-release",
         dag_id="dag_ingest_fbref",
     )
 
 
 @pytest.mark.unit
 def test_publication_lock_finalizer_preserves_successful_bootstrap(monkeypatch):
-    release = MagicMock(return_value={"released": True})
+    release = MagicMock(return_value={"released": True, "idempotent": True})
     monkeypatch.setattr(
         fbref_pipeline_tasks, "release_fbref_publication_lock", release
     )
     bootstrap_run = SimpleNamespace(
         get_task_instances=lambda: [
-            SimpleNamespace(
-                task_id="acquire_publication_lock", state="success"
-            ),
-            SimpleNamespace(task_id="validate_bootstrap_run", state="success"),
-            SimpleNamespace(
-                task_id="release_bootstrap_publication_lock", state="success"
-            ),
-            SimpleNamespace(
-                task_id="trigger_silver_transform", state="upstream_failed"
-            ),
+            SimpleNamespace(task_id=task_id, state="success")
+            for task_id in (
+                fbref_pipeline_tasks.FBREF_BOOTSTRAP_REQUIRED_TASK_IDS
+            )
         ]
     )
 
     assert fbref_pipeline_tasks.finalize_fbref_publication_lock(
         airflow_run_id="manual__bootstrap",
-        dag_id="dag_ingest_fbref",
+        dag_id="dag_bootstrap_fbref",
+        bootstrap_only=True,
         dag_run=bootstrap_run,
     ) == {
         "released": True,
+        "idempotent": True,
         "bootstrap_only": True,
-        "status": "released_by_bootstrap_path",
+        "status": "released_after_successful_bootstrap",
     }
-    release.assert_not_called()
+    release.assert_called_once_with(
+        airflow_run_id="manual__bootstrap",
+        dag_id="dag_bootstrap_fbref",
+    )
 
 
 @pytest.mark.unit
-def test_publication_lock_finalizer_cleans_up_failed_bootstrap(monkeypatch):
+@pytest.mark.parametrize(
+    ("failed_task_id", "failed_state"),
+    [
+        ("run_live_waves", "failed"),
+        ("acquire_publication_lock", "failed"),
+        ("release_bootstrap_publication_lock", "failed"),
+    ],
+)
+def test_publication_lock_finalizer_releases_but_keeps_bootstrap_red(
+    monkeypatch, failed_task_id, failed_state
+):
+    from airflow.exceptions import AirflowException
+
+    release = MagicMock(return_value={"released": True, "idempotent": True})
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "release_fbref_publication_lock", release
+    )
+    states = {
+        task_id: "success"
+        for task_id in fbref_pipeline_tasks.FBREF_BOOTSTRAP_REQUIRED_TASK_IDS
+    }
+    states[failed_task_id] = failed_state
+    failed = SimpleNamespace(
+        get_task_instances=lambda: [
+            SimpleNamespace(task_id=task_id, state=state)
+            for task_id, state in states.items()
+        ]
+    )
+
+    with pytest.raises(AirflowException, match="lock was released"):
+        fbref_pipeline_tasks.finalize_fbref_publication_lock(
+            airflow_run_id="manual__failed-bootstrap",
+            dag_id="dag_bootstrap_fbref",
+            bootstrap_only=True,
+            dag_run=failed,
+        )
+    release.assert_called_once_with(
+        airflow_run_id="manual__failed-bootstrap",
+        dag_id="dag_bootstrap_fbref",
+    )
+
+
+@pytest.mark.unit
+def test_bootstrap_finalizer_rejects_wrong_dag_id_before_release(monkeypatch):
+    from airflow.exceptions import AirflowException
+
     release = MagicMock(return_value={"released": True})
     monkeypatch.setattr(
         fbref_pipeline_tasks, "release_fbref_publication_lock", release
     )
-    failed = SimpleNamespace(
-        get_task_instances=lambda: [
-            SimpleNamespace(
-                task_id="acquire_publication_lock", state="success"
-            ),
-            SimpleNamespace(task_id="validate_bootstrap_run", state="failed"),
-            SimpleNamespace(
-                task_id="release_bootstrap_publication_lock",
-                state="upstream_failed",
-            ),
-            SimpleNamespace(
-                task_id="trigger_silver_transform", state="skipped"
-            ),
-        ]
-    )
 
-    assert fbref_pipeline_tasks.finalize_fbref_publication_lock(
-        airflow_run_id="manual__failed-bootstrap",
-        dag_id="dag_ingest_fbref",
-        dag_run=failed,
-    ) == {
-        "released": True,
-        "bootstrap_only": True,
-        "validation_state": "failed",
-        "status": "released_after_bootstrap",
-    }
-    release.assert_called_once_with(
-        airflow_run_id="manual__failed-bootstrap",
-        dag_id="dag_ingest_fbref",
-    )
+    with pytest.raises(AirflowException, match="allowed only"):
+        fbref_pipeline_tasks.finalize_fbref_publication_lock(
+            airflow_run_id="manual__wrong-bootstrap",
+            dag_id="dag_ingest_fbref",
+            bootstrap_only=True,
+            dag_run=SimpleNamespace(get_task_instances=lambda: []),
+        )
+    release.assert_not_called()
 
 
 @pytest.mark.unit

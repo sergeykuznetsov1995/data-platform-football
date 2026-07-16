@@ -15,7 +15,13 @@ from urllib.parse import urlsplit
 
 
 METER_ID = "proxy_filter_provider_path_v2"
-FBREF_DAG_IDS = frozenset({"dag_ingest_fbref", "dag_backfill_fbref"})
+FBREF_DAG_IDS = frozenset(
+    {
+        "dag_ingest_fbref",
+        "dag_bootstrap_fbref",
+        "dag_backfill_fbref",
+    }
+)
 DEFAULT_CONTROL_TIMEOUT_SECONDS = 5.0
 DEFAULT_DRAIN_TIMEOUT_SECONDS = 10.0
 DEFAULT_LEASE_TTL_SECONDS = 7200
