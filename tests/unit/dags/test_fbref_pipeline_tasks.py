@@ -95,6 +95,307 @@ def test_canary_publication_path_is_non_publishing():
         == "validate_current_scope_freshness"
     )
 
+
+@pytest.mark.unit
+def test_bootstrap_mode_is_manual_exact_and_non_publishing():
+    scheduled = fbref_pipeline_tasks.validate_fbref_current_execution_mode(
+        bootstrap_only=False,
+        dag_run_type="scheduled",
+        request_limit=200,
+        byte_limit_mb=100,
+        shard_size=25,
+    )
+    bootstrap = fbref_pipeline_tasks.validate_fbref_current_execution_mode(
+        bootstrap_only=True,
+        dag_run_type="manual",
+        request_limit=200,
+        byte_limit_mb=100,
+        shard_size=25,
+    )
+    canary = fbref_pipeline_tasks.validate_fbref_current_execution_mode(
+        bootstrap_only=False,
+        dag_run_type="manual",
+        request_limit=100,
+        byte_limit_mb=50,
+        shard_size=7,
+    )
+
+    assert scheduled["execution_mode"] == "publishing"
+    assert scheduled["publication_eligible"] is True
+    assert bootstrap["execution_mode"] == "bootstrap_only"
+    assert bootstrap["publication_eligible"] is False
+    assert canary["execution_mode"] == "canary_nonpublishing"
+
+    invalid = (
+        {
+            "bootstrap_only": True,
+            "dag_run_type": "scheduled",
+            "request_limit": 200,
+            "byte_limit_mb": 100,
+            "shard_size": 25,
+        },
+        {
+            "bootstrap_only": True,
+            "dag_run_type": "manual",
+            "request_limit": 100,
+            "byte_limit_mb": 50,
+            "shard_size": 25,
+        },
+        {
+            "bootstrap_only": True,
+            "dag_run_type": "manual",
+            "request_limit": 200,
+            "byte_limit_mb": 100,
+            "shard_size": 24,
+        },
+    )
+    for kwargs in invalid:
+        with pytest.raises(ValueError, match="bootstrap_only"):
+            fbref_pipeline_tasks.validate_fbref_current_execution_mode(
+                **kwargs
+            )
+    with pytest.raises(ValueError, match="must be a boolean"):
+        fbref_pipeline_tasks.validate_fbref_current_execution_mode(
+            bootstrap_only="sometimes",
+            dag_run_type="manual",
+            request_limit=200,
+            byte_limit_mb=100,
+            shard_size=25,
+        )
+
+
+@pytest.mark.unit
+def test_bootstrap_publication_path_is_separate_from_canary_and_silver():
+    assert fbref_pipeline_tasks.choose_fbref_publication_path(
+        request_limit=200,
+        byte_limit_mb=100,
+        shard_size=25,
+        bootstrap_only=True,
+        dag_run_type="manual",
+    ) == "validate_bootstrap_run"
+
+
+@pytest.mark.unit
+def test_readiness_rejects_scheduled_bootstrap_before_dependency_checks(
+    monkeypatch,
+):
+    import utils.alerts as alerts
+
+    alert_check = MagicMock()
+    monkeypatch.setattr(alerts, "validate_alert_environment", alert_check)
+
+    with pytest.raises(ValueError, match="requires a manual DagRun"):
+        fbref_pipeline_tasks.validate_fbref_production_readiness(
+            run_type="current",
+            request_limit=200,
+            byte_limit_mb=100,
+            shard_size=25,
+            bootstrap_only=True,
+            dag_run_type="scheduled",
+        )
+
+    alert_check.assert_not_called()
+
+
+@pytest.mark.unit
+def test_initialize_bootstrap_records_control_execution_evidence(monkeypatch):
+    pipeline = MagicMock()
+    pipeline.initialize_run.return_value = (
+        "11111111-1111-4111-8111-111111111111"
+    )
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "_pipeline", MagicMock(return_value=pipeline)
+    )
+
+    fbref_pipeline_tasks.initialize_fbref_run(
+        airflow_run_id="manual__bootstrap",
+        dag_id="dag_ingest_fbref",
+        run_type="current",
+        request_limit=200,
+        byte_limit_mb=100,
+        shard_size=25,
+        bootstrap_only=True,
+        dag_run_type="manual",
+    )
+
+    evidence = pipeline.initialize_run.call_args.kwargs[
+        "execution_metadata"
+    ]
+    assert evidence["execution_mode"] == "bootstrap_only"
+    assert evidence["bootstrap_only"] is True
+    assert evidence["publication_eligible"] is False
+    assert evidence["runtime_profile"] == "production"
+    assert "shard_size" not in evidence
+
+
+@pytest.mark.unit
+def test_bootstrap_validation_proves_succeeded_non_publishing_control_run(
+    monkeypatch,
+):
+    validate = MagicMock(return_value={"requests_used": 12, "bytes_used": 34})
+    monkeypatch.setattr(fbref_pipeline_tasks, "validate_fbref_run", validate)
+    control = MagicMock()
+    metadata = {
+        "execution_mode": "bootstrap_only",
+        "bootstrap_only": True,
+        "publication_eligible": False,
+        "dag_run_type": "manual",
+        "runtime_profile": "production",
+        "shard_size": 25,
+    }
+    control.get_run.side_effect = [
+        {
+            "status": "running",
+            "run_type": "current",
+            "request_limit": 200,
+            "byte_limit": 100 * 1024 * 1024,
+            "metadata": metadata,
+        },
+        {
+            "status": "succeeded",
+            "run_type": "current",
+            "request_limit": 200,
+            "byte_limit": 100 * 1024 * 1024,
+            "metadata": metadata,
+        },
+    ]
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "_control_store", MagicMock(return_value=control)
+    )
+
+    evidence = fbref_pipeline_tasks.validate_fbref_bootstrap_run(
+        airflow_run_id="manual__bootstrap",
+        dag_id="dag_ingest_fbref",
+        bootstrap_only=True,
+        dag_run_type="manual",
+        request_limit=200,
+        byte_limit_mb=100,
+        shard_size=25,
+    )
+
+    assert evidence["control_status"] == "succeeded"
+    assert evidence["publication_eligible"] is False
+    validate.assert_called_once_with(
+        airflow_run_id="manual__bootstrap",
+        dag_id="dag_ingest_fbref",
+        publication_eligible=False,
+    )
+
+
+@pytest.mark.unit
+def test_bootstrap_validation_checks_control_mode_before_finishing(monkeypatch):
+    validate = MagicMock()
+    monkeypatch.setattr(fbref_pipeline_tasks, "validate_fbref_run", validate)
+    control = MagicMock()
+    control.get_run.return_value = {
+        "status": "running",
+        "run_type": "current",
+        "request_limit": 200,
+        "byte_limit": 100 * 1024 * 1024,
+        "metadata": {
+            "execution_mode": "publishing",
+            "bootstrap_only": False,
+            "publication_eligible": True,
+            "dag_run_type": "manual",
+            "runtime_profile": "production",
+            "shard_size": 25,
+        },
+    }
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "_control_store", MagicMock(return_value=control)
+    )
+
+    with pytest.raises(RuntimeError, match="non-publishing running run"):
+        fbref_pipeline_tasks.validate_fbref_bootstrap_run(
+            airflow_run_id="manual__bootstrap",
+            dag_id="dag_ingest_fbref",
+            bootstrap_only=True,
+            dag_run_type="manual",
+            request_limit=200,
+            byte_limit_mb=100,
+            shard_size=25,
+        )
+
+    validate.assert_not_called()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("run_field", "bad_value"),
+    [
+        ("run_type", "backfill"),
+        ("request_limit", 199),
+        ("byte_limit", 99 * 1024 * 1024),
+        ("shard_size", 24),
+    ],
+)
+def test_bootstrap_validation_proves_persisted_exact_profile_before_finish(
+    monkeypatch, run_field, bad_value
+):
+    validate = MagicMock()
+    monkeypatch.setattr(fbref_pipeline_tasks, "validate_fbref_run", validate)
+    metadata = {
+        "execution_mode": "bootstrap_only",
+        "bootstrap_only": True,
+        "publication_eligible": False,
+        "dag_run_type": "manual",
+        "runtime_profile": "production",
+        "shard_size": 25,
+    }
+    control_run = {
+        "status": "running",
+        "run_type": "current",
+        "request_limit": 200,
+        "byte_limit": 100 * 1024 * 1024,
+        "metadata": metadata,
+    }
+    if run_field == "shard_size":
+        metadata[run_field] = bad_value
+    else:
+        control_run[run_field] = bad_value
+    control = MagicMock()
+    control.get_run.return_value = control_run
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "_control_store", MagicMock(return_value=control)
+    )
+
+    with pytest.raises(RuntimeError, match="non-publishing running run"):
+        fbref_pipeline_tasks.validate_fbref_bootstrap_run(
+            airflow_run_id="manual__bootstrap",
+            dag_id="dag_ingest_fbref",
+            bootstrap_only=True,
+            dag_run_type="manual",
+            request_limit=200,
+            byte_limit_mb=100,
+            shard_size=25,
+        )
+
+    validate.assert_not_called()
+
+
+@pytest.mark.unit
+def test_bootstrap_control_evidence_physically_blocks_publication(monkeypatch):
+    control = MagicMock()
+    control.get_run.return_value = {
+        "status": "succeeded",
+        "metadata": {
+            "execution_mode": "bootstrap_only",
+            "bootstrap_only": True,
+            "publication_eligible": False,
+        },
+    }
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "_control_store", MagicMock(return_value=control)
+    )
+
+    with pytest.raises(RuntimeError, match="explicitly non-publishing"):
+        fbref_pipeline_tasks.export_fbref_publication_scope(
+            airflow_run_id="manual__bootstrap",
+            dag_id="dag_ingest_fbref",
+        )
+
+    control.guard_publication_lock.assert_not_called()
+
 @pytest.mark.unit
 def test_production_readiness_combines_alert_env_and_runtime_limits(monkeypatch):
     monkeypatch.setenv("ALERT_ENV", "prod")
@@ -684,6 +985,77 @@ def test_publication_lock_finalizer_cleans_up_failed_canary(monkeypatch):
     }
     release.assert_called_once_with(
         airflow_run_id="manual__failed_canary",
+        dag_id="dag_ingest_fbref",
+    )
+
+
+@pytest.mark.unit
+def test_publication_lock_finalizer_preserves_successful_bootstrap(monkeypatch):
+    release = MagicMock(return_value={"released": True})
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "release_fbref_publication_lock", release
+    )
+    bootstrap_run = SimpleNamespace(
+        get_task_instances=lambda: [
+            SimpleNamespace(
+                task_id="acquire_publication_lock", state="success"
+            ),
+            SimpleNamespace(task_id="validate_bootstrap_run", state="success"),
+            SimpleNamespace(
+                task_id="release_bootstrap_publication_lock", state="success"
+            ),
+            SimpleNamespace(
+                task_id="trigger_silver_transform", state="upstream_failed"
+            ),
+        ]
+    )
+
+    assert fbref_pipeline_tasks.finalize_fbref_publication_lock(
+        airflow_run_id="manual__bootstrap",
+        dag_id="dag_ingest_fbref",
+        dag_run=bootstrap_run,
+    ) == {
+        "released": True,
+        "bootstrap_only": True,
+        "status": "released_by_bootstrap_path",
+    }
+    release.assert_not_called()
+
+
+@pytest.mark.unit
+def test_publication_lock_finalizer_cleans_up_failed_bootstrap(monkeypatch):
+    release = MagicMock(return_value={"released": True})
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "release_fbref_publication_lock", release
+    )
+    failed = SimpleNamespace(
+        get_task_instances=lambda: [
+            SimpleNamespace(
+                task_id="acquire_publication_lock", state="success"
+            ),
+            SimpleNamespace(task_id="validate_bootstrap_run", state="failed"),
+            SimpleNamespace(
+                task_id="release_bootstrap_publication_lock",
+                state="upstream_failed",
+            ),
+            SimpleNamespace(
+                task_id="trigger_silver_transform", state="skipped"
+            ),
+        ]
+    )
+
+    assert fbref_pipeline_tasks.finalize_fbref_publication_lock(
+        airflow_run_id="manual__failed-bootstrap",
+        dag_id="dag_ingest_fbref",
+        dag_run=failed,
+    ) == {
+        "released": True,
+        "bootstrap_only": True,
+        "validation_state": "failed",
+        "status": "released_after_bootstrap",
+    }
+    release.assert_called_once_with(
+        airflow_run_id="manual__failed-bootstrap",
         dag_id="dag_ingest_fbref",
     )
 

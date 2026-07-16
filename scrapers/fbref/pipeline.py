@@ -706,6 +706,7 @@ class FBrefPipeline:
         airflow_run_id: object,
         dag_id: object,
         settings: PipelineSettings,
+        execution_metadata: Optional[Mapping[str, object]] = None,
     ) -> str:
         self.control.migrate()
         # A worker that dies mid-wave (OOM, kill, hung browser) leaves fenced
@@ -719,22 +720,30 @@ class FBrefPipeline:
                 "Reaped %d expired FBref lease(s) left by earlier runs", reaped
             )
         run_id = make_control_run_id(airflow_run_id, dag_id=dag_id)
+        base_metadata = {
+            "airflow_run_id": str(airflow_run_id),
+            "dag_id": str(dag_id),
+            "shard_size": settings.shard_size,
+            "request_reservation_bytes": (
+                settings.request_reservation_bytes
+            ),
+            "target_request_reservation": (
+                settings.target_request_reservation
+            ),
+        }
+        extra_metadata = dict(execution_metadata or {})
+        reserved = sorted(set(base_metadata) & set(extra_metadata))
+        if reserved:
+            raise ValueError(
+                "FBref execution metadata cannot replace reserved keys: "
+                + ", ".join(reserved)
+            )
         self.control.create_run(
             settings.run_type,
             run_id=run_id,
             request_limit=settings.request_limit,
             byte_limit=settings.byte_limit,
-            metadata={
-                "airflow_run_id": str(airflow_run_id),
-                "dag_id": str(dag_id),
-                "shard_size": settings.shard_size,
-                "request_reservation_bytes": (
-                    settings.request_reservation_bytes
-                ),
-                "target_request_reservation": (
-                    settings.target_request_reservation
-                ),
-            },
+            metadata={**base_metadata, **extra_metadata},
         )
         self.control.start_run(run_id)
         return run_id
@@ -773,6 +782,22 @@ class FBrefPipeline:
         metadata = source_run.get("metadata")
         if not isinstance(metadata, Mapping):
             return "replay_source_raw_audit_missing"
+        execution_mode = str(
+            metadata.get("execution_mode") or ""
+        ).casefold()
+        explicitly_ineligible = (
+            "publication_eligible" in metadata
+            and metadata.get("publication_eligible") is not True
+        )
+        if (
+            explicitly_ineligible
+            or metadata.get("bootstrap_only") is True
+            or execution_mode in {
+                "bootstrap_only",
+                "canary_nonpublishing",
+            }
+        ):
+            return "replay_source_run_not_publication_eligible"
         raw_audit = metadata.get("raw_audit")
         if not isinstance(raw_audit, Mapping):
             return "replay_source_raw_audit_missing"

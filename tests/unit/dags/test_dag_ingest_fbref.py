@@ -50,6 +50,7 @@ class TestFBrefCurrentTopology:
             "request_limit",
             "byte_limit_mb",
             "shard_size",
+            "bootstrap_only",
         }
         source = Path(module.__file__).read_text(encoding="utf-8")
         assert "LEAGUES" not in source
@@ -65,6 +66,8 @@ class TestFBrefCurrentTopology:
         assert params["shard_size"].default == 25
         assert params["shard_size"]._kw["minimum"] == 1
         assert params["shard_size"]._kw["maximum"] == 25
+        assert params["bootstrap_only"].default is False
+        assert params["bootstrap_only"]._kw["type"] == "boolean"
 
         initialize = tasks["initialize_run"]
         assert initialize.python_callable.__name__ == "initialize_fbref_run"
@@ -81,7 +84,7 @@ class TestFBrefCurrentTopology:
     def test_one_warm_live_runner_replaces_cold_wave_tasks(self, loaded_dag):
         module, tasks = loaded_dag
         assert module.CURRENT_MAX_BATCHES == 16
-        assert len(tasks) == 16
+        assert len(tasks) == 18
         assert tasks["validate_production_readiness"].downstream_task_ids == {
             "initialize_run"
         }
@@ -141,6 +144,11 @@ class TestFBrefCurrentTopology:
         )
         assert freshness.op_kwargs["fail_fast"] is True
         assert freshness.upstream_task_ids == {"choose_publication_path"}
+        assert tasks["choose_publication_path"].downstream_task_ids == {
+            "validate_canary_run",
+            "validate_bootstrap_run",
+            "validate_current_scope_freshness",
+        }
         assert tasks["validate_canary_run"].upstream_task_ids == {
             "choose_publication_path"
         }
@@ -151,6 +159,19 @@ class TestFBrefCurrentTopology:
         assert tasks["release_canary_publication_lock"].upstream_task_ids == {
             "validate_canary_run"
         }
+        assert tasks["validate_bootstrap_run"].upstream_task_ids == {
+            "choose_publication_path"
+        }
+        assert tasks["validate_bootstrap_run"].python_callable.__name__ == (
+            "validate_fbref_bootstrap_run"
+        )
+        assert tasks["validate_bootstrap_run"]._captured_kwargs["retries"] == 0
+        assert tasks["validate_bootstrap_run"].downstream_task_ids == {
+            "release_bootstrap_publication_lock"
+        }
+        assert tasks[
+            "release_bootstrap_publication_lock"
+        ].upstream_task_ids == {"validate_bootstrap_run"}
         assert tasks["validate_run"].upstream_task_ids == {
             "validate_current_scope_freshness"
         }
@@ -169,9 +190,13 @@ class TestFBrefCurrentTopology:
         assert tasks["release_canary_publication_lock"].downstream_task_ids == {
             "release_publication_lock"
         }
+        assert tasks[
+            "release_bootstrap_publication_lock"
+        ].downstream_task_ids == {"release_publication_lock"}
         assert release.upstream_task_ids == {
             "trigger_silver_transform",
             "release_canary_publication_lock",
+            "release_bootstrap_publication_lock",
         }
 
     def test_silver_waits_and_propagates_child_failure(self, loaded_dag):

@@ -89,3 +89,39 @@ The durable provider ledger is
 `logs/fbref/proxy_filter/paid_requests.jsonl`; the aggregate report is
 `logs/fbref/proxy_filter/bytes.json`. These files contain counters and hashed
 upstream identifiers, not proxy credentials.
+
+## Manual non-publishing bootstrap
+
+Use this mode only to advance the durable current-scope queue while production
+freshness is still being established. It performs the normal raw-first
+recovery, paid fetch, parse, and raw-integrity audit, but it cannot run the
+freshness gate, export a publication scope, or trigger Silver.
+
+```bash
+airflow dags trigger dag_ingest_fbref \
+  --conf '{"bootstrap_only":true,"request_limit":200,"byte_limit_mb":100,"shard_size":25}'
+```
+
+The mode fails before a control run or paid request if the DagRun is not
+manual, if `bootstrap_only` is not a recognized boolean value, or if the
+limits are not exactly `200 requests / 100 MiB / shard 25`. The scheduled DAG
+keeps `bootstrap_only=false`, so its normal production path is unchanged. The
+existing `100/50` canary remains a separate non-publishing path.
+
+A successful bootstrap has these three pieces of evidence:
+
+1. Airflow task `validate_bootstrap_run` returns the deterministic control run
+   ID, `execution_mode=bootstrap_only`, `publication_eligible=false`, and the
+   validation summary.
+2. `fbref_control.crawl_run.metadata` stores the same mode and publication
+   flag, and the control run status is `succeeded`.
+3. `release_bootstrap_publication_lock` succeeds, followed by the common
+   `release_publication_lock` finalizer. No `export_publication_scope` or
+   `trigger_silver_transform` task may run.
+
+If bootstrap validation fails, the common finalizer releases the lock and
+keeps the DagRun failed. Never clear skipped publication tasks to force them
+to run: the control-run mode also blocks freshness, publication-scope export,
+replay-source selection, and the first Silver preflight before any Silver-DAG
+transform write. Start a new normal production DagRun after
+freshness is complete.

@@ -29,6 +29,7 @@ from utils.fbref_pipeline_tasks import (
     run_recovery_wave,
     release_fbref_publication_lock,
     seed_fbref_competition_index,
+    validate_fbref_bootstrap_run,
     validate_fbref_current_scope_freshness,
     validate_fbref_production_readiness,
     validate_fbref_run,
@@ -58,6 +59,7 @@ MAX_SHARD_SIZE = FBREF_MAX_WARM_SESSION_TARGETS
 
 AIRFLOW_RUN_ID = "{{ run_id }}"
 DAG_ID = "{{ dag.dag_id }}"
+DAG_RUN_TYPE = "{{ dag_run.run_type }}"
 REQUEST_LIMIT = (
     "{{ dag_run.conf.get('request_limit', params.request_limit) }}"
 )
@@ -65,6 +67,9 @@ BYTE_LIMIT_MB = (
     "{{ dag_run.conf.get('byte_limit_mb', params.byte_limit_mb) }}"
 )
 SHARD_SIZE = "{{ dag_run.conf.get('shard_size', params.shard_size) }}"
+BOOTSTRAP_ONLY = (
+    "{{ dag_run.conf.get('bootstrap_only', params.bootstrap_only) }}"
+)
 
 
 with DAG(
@@ -100,6 +105,13 @@ with DAG(
             maximum=MAX_SHARD_SIZE,
             description="Maximum frontier targets claimed by one task",
         ),
+        "bootstrap_only": Param(
+            False,
+            type="boolean",
+            description=(
+                "Manual production-budget bootstrap without publication"
+            ),
+        ),
     },
     doc_md="""
     ## FBref current refresh
@@ -113,7 +125,10 @@ with DAG(
     default `200/100` production profile; every warm session claims at most 25
     targets. A content-hashed raw inventory is captured before recovery/fetch,
     and publication is gated by a persisted integrity artifact. ALERT_ENV must
-    be `prod` before the control run is created.
+    be `prod` before the control run is created. Scheduled runs publish by
+    default. A manual run may set `bootstrap_only=true` only with exact
+    `200/100/25` limits; it validates raw/control evidence and releases the
+    lock without freshness, export, or Silver tasks.
     """,
 ) as dag:
     validate_production_readiness = PythonOperator(
@@ -124,6 +139,8 @@ with DAG(
             "request_limit": REQUEST_LIMIT,
             "byte_limit_mb": BYTE_LIMIT_MB,
             "shard_size": SHARD_SIZE,
+            "bootstrap_only": BOOTSTRAP_ONLY,
+            "dag_run_type": DAG_RUN_TYPE,
         },
         trigger_rule="all_success",
     )
@@ -140,6 +157,8 @@ with DAG(
             "shard_size": SHARD_SIZE,
             "reservation_mb": 3,
             "domain_interval_seconds": 3.0,
+            "bootstrap_only": BOOTSTRAP_ONLY,
+            "dag_run_type": DAG_RUN_TYPE,
         },
         trigger_rule="all_success",
     )
@@ -226,6 +245,9 @@ with DAG(
         op_kwargs={
             "request_limit": REQUEST_LIMIT,
             "byte_limit_mb": BYTE_LIMIT_MB,
+            "shard_size": SHARD_SIZE,
+            "bootstrap_only": BOOTSTRAP_ONLY,
+            "dag_run_type": DAG_RUN_TYPE,
         },
         trigger_rule="all_success",
     )
@@ -244,6 +266,32 @@ with DAG(
 
     release_canary_lock = PythonOperator(
         task_id="release_canary_publication_lock",
+        python_callable=release_fbref_publication_lock,
+        op_kwargs={
+            "airflow_run_id": AIRFLOW_RUN_ID,
+            "dag_id": DAG_ID,
+        },
+        trigger_rule="all_success",
+    )
+
+    validate_bootstrap = PythonOperator(
+        task_id="validate_bootstrap_run",
+        python_callable=validate_fbref_bootstrap_run,
+        op_kwargs={
+            "airflow_run_id": AIRFLOW_RUN_ID,
+            "dag_id": DAG_ID,
+            "bootstrap_only": BOOTSTRAP_ONLY,
+            "dag_run_type": DAG_RUN_TYPE,
+            "request_limit": REQUEST_LIMIT,
+            "byte_limit_mb": BYTE_LIMIT_MB,
+            "shard_size": SHARD_SIZE,
+        },
+        retries=0,
+        trigger_rule="all_success",
+    )
+
+    release_bootstrap_lock = PythonOperator(
+        task_id="release_bootstrap_publication_lock",
         python_callable=release_fbref_publication_lock,
         op_kwargs={
             "airflow_run_id": AIRFLOW_RUN_ID,
@@ -312,10 +360,12 @@ with DAG(
 
     previous >> choose_path
     choose_path >> validate_canary >> release_canary_lock
+    choose_path >> validate_bootstrap >> release_bootstrap_lock
     choose_path >> validate_freshness >> validate_run
     validate_run >> export_publication_scope >> trigger_silver
     trigger_silver >> release_publication_lock
     release_canary_lock >> release_publication_lock
+    release_bootstrap_lock >> release_publication_lock
 
 
 __all__ = ["dag"]
