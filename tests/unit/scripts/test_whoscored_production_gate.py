@@ -64,7 +64,9 @@ def _ready_manifest():
                 "release_sha256": "5" * 64,
             }
         ],
-        "apt_packages": [{"name": "curl", "version": "7.88.1-10+deb12u14"}],
+        "apt_packages": [
+            {"name": "chromium", "version": "143.0.7499.169-1~deb12u1"}
+        ],
         "downloaded_artifacts": [
             {
                 "name": "apache-spark",
@@ -220,6 +222,44 @@ def test_ready_attestation_requires_exact_root_owned_manifest_bytes(tmp_path):
 
     manifest.chmod(0o644)
     with pytest.raises(gate.ProductionGateError, match="owner, mode"):
+        gate.validate_production_attestation(
+            attestation,
+            manifest,
+            expected_uid=tmp_path.stat().st_uid,
+            enforce_immutable_parents=False,
+        )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "version",
+    ["143.0.*", "143.0.?", "143.0.[12]", ">=143.0", "<143.0"],
+)
+def test_ready_attestation_rejects_apt_wildcards_and_ranges(tmp_path, version):
+    gate = _load_gate()
+    payload = _ready_manifest()
+    payload["apt_packages"][0]["version"] = version
+    manifest_raw = _canonical(payload)
+    manifest = tmp_path / "manifest.json"
+    _write_evidence(manifest, manifest_raw)
+    attestation = tmp_path / "attestation.json"
+    _write_evidence(
+        attestation,
+        _canonical(
+            {
+                "schema_version": 1,
+                "status": "ready-v1",
+                "provenance_manifest_sha256": hashlib.sha256(
+                    manifest_raw
+                ).hexdigest(),
+            }
+        ),
+    )
+
+    with pytest.raises(
+        gate.ProductionGateError,
+        match="APT package provenance is invalid",
+    ):
         gate.validate_production_attestation(
             attestation,
             manifest,

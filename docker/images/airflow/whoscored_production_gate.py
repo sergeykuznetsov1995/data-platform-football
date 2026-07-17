@@ -297,7 +297,7 @@ def _validate_provenance_manifest(manifest: dict[str, Any]) -> None:
         or not item["name"]
         or not isinstance(item["version"], str)
         or not item["version"]
-        or any(token in item["version"] for token in ("*", ">", "<", "~"))
+        or any(character in item["version"] for character in "*?[]<>")
         for item in apt_packages
     ):
         raise ProductionGateError("APT package provenance is invalid")
