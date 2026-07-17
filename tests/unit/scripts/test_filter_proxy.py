@@ -43,6 +43,11 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 _SCRIPT_PATH = REPO_ROOT / "scripts" / "proxy_filter" / "filter_proxy.py"
 _BLOCKLIST_PATH = REPO_ROOT / "configs" / "proxy_filter" / "blocklist.txt"
 _COMPOSE_PATH = REPO_ROOT / "compose.yaml"
+# #951 (инцидент 2026-07-17): выделенный SofaScore-шлюз вынесен в СВОЙ
+# compose-проект, чтобы чужой `docker compose up` его не пересоздавал.
+_SOFASCORE_GATEWAY_COMPOSE_PATH = (
+    REPO_ROOT / "deploy/sofascore/gateway.compose.yaml"
+)
 
 
 def _load_module():
@@ -278,10 +283,11 @@ def test_malformed_env_never_silently_falls_back_to_file(mod, tmp_path):
 
 def test_proxy_filter_compose_is_env_only_by_default():
     compose = _COMPOSE_PATH.read_text()
-    # The dedicated sofascore_proxy_filter service (#951) now sits between the
-    # shared proxy_filter and caddy — bound the slice on that neighbour.
+    # The dedicated sofascore_proxy_filter service (#951) was moved into its own
+    # compose project; a breadcrumb comment now marks its old spot between the
+    # shared proxy_filter and caddy — bound the slice on that breadcrumb.
     service = compose.split("  proxy_filter:\n", 1)[1].split(
-        "\n  sofascore_proxy_filter:\n", 1
+        "\n  # sofascore_proxy_filter ВЫНЕСЕН", 1
     )[0]
 
     assert "PROXY_POOL_JSON: ${PROXY_POOL_JSON:-}" in service
@@ -293,9 +299,11 @@ def test_proxy_filter_compose_is_env_only_by_default():
 
 
 def test_sofascore_has_a_dedicated_production_metered_proxy_service():
-    compose = _COMPOSE_PATH.read_text()
-    service = compose.split("  sofascore_proxy_filter:\n", 1)[1].split(
-        "\n  caddy:\n", 1
+    # The gateway lives in its OWN compose project (#951, инцидент 2026-07-17):
+    # a foreign `docker compose up` on the shared project must not recreate it.
+    gateway = _SOFASCORE_GATEWAY_COMPOSE_PATH.read_text()
+    service = gateway.split("  sofascore_proxy_filter:\n", 1)[1].split(
+        "\nnetworks:\n", 1
     )[0]
 
     # Dedicated pool secret + file fallback until the purchased pool lands.
@@ -312,6 +320,12 @@ def test_sofascore_has_a_dedicated_production_metered_proxy_service():
         "/logs/sofascore_proxy_filter/sofascore_allocation_claims.jsonl"
         in service
     )
+    # Isolation contract: joins the shared dp-backend network as EXTERNAL (own
+    # project) and is ABSENT from the shared compose.yaml, so foreign deploys
+    # can't sweep it.
+    assert "external: true" in gateway
+    assert "name: dp-backend" in gateway
+    assert "\n  sofascore_proxy_filter:\n" not in _COMPOSE_PATH.read_text()
     assert (
         "SOFASCORE_PROXY_BUDGET_ARTIFACT:"
         "-/opt/airflow/configs/sofascore/proxy_budget_canary.json"
