@@ -621,7 +621,7 @@ def _create_argv(
         "--cap-drop",
         "ALL",
         "--security-opt",
-        "no-new-privileges=true",
+        "no-new-privileges:true",
         "--security-opt",
         "apparmor=docker-default",
         "--security-opt",

@@ -199,6 +199,11 @@ class FakeDocker:
             sources[pieces["dst"]] = pieces["src"]
         image_position = args.index(IMAGE_ID)
         command = list(args[image_position + 1 :])
+        security_options = [
+            args[pos + 1]
+            for pos, value in enumerate(args)
+            if value == "--security-opt"
+        ]
         control_path = Path(sources[runtime.CONTAINER_CONTROL_JSON])
         metadata = control_path.stat()
         assert metadata.st_mode & 0o777 == 0o444
@@ -216,6 +221,7 @@ class FakeDocker:
             status="created",
             command=command,
             mounts=parsed_mounts,
+            security_options=security_options,
         )
         self.containers[container_id] = payload
         self.names[name] = container_id
@@ -234,6 +240,7 @@ class FakeDocker:
         status: str,
         command: list[str] | None = None,
         mounts: list[dict[str, object]] | None = None,
+        security_options: list[str] | None = None,
     ) -> dict[str, object]:
         return {
             "Id": container_id,
@@ -258,11 +265,15 @@ class FakeDocker:
                 "ReadonlyRootfs": True,
                 "Privileged": False,
                 "CapDrop": ["ALL"],
-                "SecurityOpt": [
-                    "no-new-privileges:true",
-                    "apparmor=docker-default",
-                    "seccomp=builtin",
-                ],
+                "SecurityOpt": (
+                    security_options
+                    if security_options is not None
+                    else [
+                        "no-new-privileges:true",
+                        "apparmor=docker-default",
+                        "seccomp=builtin",
+                    ]
+                ),
                 "NetworkMode": "container:" + FLARE_ID,
                 "Memory": runtime.MEMORY_BYTES,
                 "MemorySwap": runtime.MEMORY_BYTES,
@@ -540,7 +551,7 @@ def test_success_uses_exact_hardening_and_one_atomic_release(
             "--read-only",
             "--no-healthcheck",
             "ALL",
-            "no-new-privileges=true",
+            "no-new-privileges:true",
             "apparmor=docker-default",
             "seccomp=builtin",
             "2g",
