@@ -1200,102 +1200,12 @@ services:
       - backend
 
   # ---------------------------------------------------------------------------
-  # sofascore_proxy_filter: выделенный платный шлюз SofaScore (#951).
-  #
-  # Отдельный от общего proxy_filter, чтобы прод-сбор SofaScore не делил один
-  # метринг/леджер с TM/whoscored/discovery и чтобы владелец мог подключить
-  # купленный под источник пул (PROXY_POOL_JSON) рестартом ТОЛЬКО этого шлюза,
-  # не трогая остальные и не сбивая runtime fingerprint (пул в него не входит).
-  #
-  # hard-cap-bytes=0 => это ПРОДАКШН-подписант (>0 был бы эксперимент-канарейка,
-  # которая никогда не авторизует прод). Верифицированный артефакт бюджета
-  # монтируется по SOFASCORE_PROXY_BUDGET_ARTIFACT (в деплое — стабильный
-  # runtime-путь вне чекаута, чтобы git pull / ротация релиза его не затирали).
-  # Ledger/WAL на персистентном logs-руте — переживают пересоздание контейнера.
-  sofascore_proxy_filter:
-    build:
-      context: ./docker/images/airflow
-      dockerfile: Dockerfile
-    container_name: sofascore_proxy_filter
-    restart: unless-stopped
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
-    environment:
-      PYTHONPATH: /opt/airflow
-      PROXY_FILTER_CONTROL_TOKEN: ${SOFASCORE_PROXY_CONTROL_TOKEN:-}
-      # Купленный под SofaScore пул подставляется сюда; пусто => fail-closed на
-      # платный путь, разрешён только --proxy-file fallback ниже.
-      PROXY_POOL_JSON: ${SOFASCORE_PROXY_POOL_JSON:-}
-      PROXY_FILTER_ALLOW_FILE_FALLBACK: "true"
-    command:
-      - python
-      - /opt/airflow/scripts/proxy_filter/filter_proxy.py
-      - --listen
-      - 0.0.0.0:8899
-      - --lease-listen
-      - 0.0.0.0:8900
-      - --lease-proxy-url
-      - http://sofascore_proxy_filter:8900
-      - --proxy-file
-      - /opt/airflow/proxys.txt
-      - --allow-proxy-file-fallback
-      - --blocklist
-      - /opt/airflow/configs/proxy_filter/blocklist.txt
-      - --out
-      - /opt/airflow/logs/sofascore_proxy_filter/bytes.json
-      - --daily-budget-mb
-      - ${SOFASCORE_PROXY_DAILY_BUDGET_MB:-300}
-      - --max-lease-mb
-      - ${SOFASCORE_PROXY_MAX_LEASE_MB:-46}
-      - --max-lease-ttl-seconds
-      - ${SOFASCORE_PROXY_MAX_LEASE_TTL_SECONDS:-3600}
-      - --dagrun-budget-bytes
-      - ${SOFASCORE_PROXY_DAGRUN_BUDGET_BYTES:-8000000}
-      - --url-budget-bytes
-      - ${SOFASCORE_PROXY_URL_BUDGET_BYTES:-2000000}
-      # SofaScore = один активный лиз за раз (сериализация источника).
-      - --max-active-leases
-      - "1"
-      - --sofascore-budget-artifact
-      - ${SOFASCORE_PROXY_BUDGET_ARTIFACT:-/opt/airflow/configs/sofascore/proxy_budget_canary.json}
-      # 0 = боевой подписант (не эксперимент-канарейка).
-      - --sofascore-canary-hard-cap-bytes
-      - "0"
-      - --sofascore-discovery-dagrun-budget-bytes
-      - ${PROXY_FILTER_SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES:-0}
-      - --ledger
-      - /opt/airflow/logs/sofascore_proxy_filter/paid_requests.jsonl
-      - --sofascore-allocation-ledger
-      - /opt/airflow/logs/sofascore_proxy_filter/sofascore_allocations.json
-      - --sofascore-allocation-wal
-      - /opt/airflow/logs/sofascore_proxy_filter/sofascore_allocation_claims.jsonl
-    volumes:
-      # Runtime-fingerprint входы: контрольная плоскость независимо
-      # пересчитывает тот же digest, что и продюсер в Airflow.
-      - ./dags:/opt/airflow/dags:ro
-      - ./scripts:/opt/airflow/scripts
-      - ./scrapers:/opt/airflow/scrapers
-      - ./configs/medallion:/opt/airflow/configs/medallion:ro
-      - ./configs/proxy_filter:/opt/airflow/configs/proxy_filter:ro
-      - ./configs/sofascore:/opt/airflow/configs/sofascore:ro
-      - ./proxys.txt:/opt/airflow/proxys.txt:ro
-      - ./logs:/opt/airflow/logs
-    healthcheck:
-      test: ["CMD", "curl", "--fail", "--silent", "http://localhost:8899/health"]
-      interval: 10s
-      timeout: 3s
-      retries: 5
-      start_period: 5s
-    deploy:
-      resources:
-        limits:
-          memory: 256M
-        reservations:
-          memory: 64M
-    networks:
-      - backend
+  # sofascore_proxy_filter ВЫНЕСЕН в отдельный compose-проект (#951, инцидент
+  # 2026-07-17): deploy/sofascore/gateway.compose.yaml. Здесь его НЕТ намеренно —
+  # общий `docker compose up` не должен пересоздавать/сносить выделенный шлюз
+  # источника. Запуск: docker compose -p sofascore-gw -f
+  # deploy/sofascore/gateway.compose.yaml --project-directory . up -d.
+  # Routing scheduler → SOFASCORE_PROXY_CONTROL_URL (см. x-airflow-common выше).
 
   # ---------------------------------------------------------------------------
   # Caddy: публичный вход платформы (docs/design/analyst-access.md).
