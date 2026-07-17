@@ -33,7 +33,7 @@ from scrapers.transfermarkt.models import (
 
 # The manifest module owns the scope-set size canon; readiness must not carry a
 # second copy of it that can silently drift from the builder's own limit.
-from .transfermarkt_scope_state import MAX_SCOPE_SET_SIZE
+from utils.transfermarkt_scope_state import MAX_SCOPE_SET_SIZE
 
 
 STATE_KEY = 'canonical'
