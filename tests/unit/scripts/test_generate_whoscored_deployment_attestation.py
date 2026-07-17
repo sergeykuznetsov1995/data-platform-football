@@ -181,6 +181,7 @@ def _buildx_metadata(
                         "localdir:context": context_localdir,
                         "localdir:dockerfile": dockerfile_localdir,
                         "revision": revision,
+                        "source": f"{generator.EXPECTED_VCS_SOURCE}.git",
                     },
                 },
                 "reproducible": False,
@@ -794,7 +795,10 @@ def test_ambiguous_layer_member_names_fail_closed(mutation: str) -> None:
         )
 
 
-def test_buildkit_max_provenance_binds_digest_target_dockerfile_and_gate() -> None:
+@pytest.mark.parametrize("vcs_source", sorted(generator.EXPECTED_VCS_SOURCES))
+def test_buildkit_max_provenance_binds_digest_target_dockerfile_and_gate(
+    vcs_source: str,
+) -> None:
     _, finals, _ = _image_fixture()
     group = "airflow-scheduler"
     dockerfile_raw = (ROOT / "docker/images/airflow/Dockerfile").read_bytes()
@@ -805,6 +809,9 @@ def test_buildkit_max_provenance_binds_digest_target_dockerfile_and_gate() -> No
         revision=revision,
         dockerfile_raw=dockerfile_raw,
     )
+    document["buildx.build.provenance"]["metadata"][
+        "https://mobyproject.org/buildkit@v1#metadata"
+    ]["vcs"]["source"] = vcs_source
 
     evidence = generator._validate_build_provenance_value(
         group=group,
@@ -826,7 +833,17 @@ def test_buildkit_max_provenance_binds_digest_target_dockerfile_and_gate() -> No
 
 @pytest.mark.parametrize(
     "mutation",
-    ["digest", "target", "dockerfile", "gate-input", "dirty-revision"],
+    [
+        "digest",
+        "target",
+        "dockerfile",
+        "gate-input",
+        "dirty-revision",
+        "source",
+        "malformed-source",
+        "missing-source",
+        "extra-vcs-key",
+    ],
 )
 def test_buildkit_provenance_rejects_hostile_final_build(mutation: str) -> None:
     _, finals, _ = _image_fixture()
@@ -856,6 +873,22 @@ def test_buildkit_provenance_rejects_hostile_final_build(mutation: str) -> None:
         document["buildx.build.provenance"]["metadata"][
             "https://mobyproject.org/buildkit@v1#metadata"
         ]["vcs"]["revision"] = revision + "-dirty"
+    elif mutation == "source":
+        document["buildx.build.provenance"]["metadata"][
+            "https://mobyproject.org/buildkit@v1#metadata"
+        ]["vcs"]["source"] = "https://attacker.invalid/repository.git"
+    elif mutation == "malformed-source":
+        document["buildx.build.provenance"]["metadata"][
+            "https://mobyproject.org/buildkit@v1#metadata"
+        ]["vcs"]["source"] = {}
+    elif mutation == "missing-source":
+        document["buildx.build.provenance"]["metadata"][
+            "https://mobyproject.org/buildkit@v1#metadata"
+        ]["vcs"].pop("source")
+    elif mutation == "extra-vcs-key":
+        document["buildx.build.provenance"]["metadata"][
+            "https://mobyproject.org/buildkit@v1#metadata"
+        ]["vcs"]["dirty"] = False
 
     with pytest.raises(generator.DeploymentAttestationError, match="BuildKit"):
         generator._validate_build_provenance_value(

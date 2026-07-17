@@ -135,6 +135,10 @@ IMAGE_GROUP_CONTEXT_SPECS = MappingProxyType(
         "superset": ("docker/images/superset", "docker/images/superset"),
     }
 )
+EXPECTED_VCS_SOURCE = "https://github.com/sergeykuznetsov1995/data-platform-football"
+EXPECTED_VCS_SOURCES = frozenset(
+    {EXPECTED_VCS_SOURCE, f"{EXPECTED_VCS_SOURCE}.git"}
+)
 GATE_CONTEXT_INPUTS = frozenset(
     {
         "whoscored-build-provenance-attestation.json",
@@ -907,12 +911,13 @@ def _validate_build_provenance_value(
         completeness
         != {"environment": True, "materials": False, "parameters": True}
         or metadata.get("reproducible") is not False
-        or vcs
-        != {
-            "localdir:context": context_localdir,
-            "localdir:dockerfile": dockerfile_localdir,
-            "revision": expected_revision,
-        }
+        or set(vcs)
+        != {"localdir:context", "localdir:dockerfile", "revision", "source"}
+        or vcs["localdir:context"] != context_localdir
+        or vcs["localdir:dockerfile"] != dockerfile_localdir
+        or vcs["revision"] != expected_revision
+        or not isinstance(vcs["source"], str)
+        or vcs["source"] not in EXPECTED_VCS_SOURCES
     ):
         raise DeploymentAttestationError(
             f"BuildKit provenance is incomplete or dirty for group {group}"

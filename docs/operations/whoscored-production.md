@@ -478,6 +478,8 @@ test -z "$(/usr/bin/find "$RELEASE" -path "$RELEASE/.git" -prune -o \
   -name .gitattributes -print -quit)"
 test ! -e "$("${CLEAN_GIT[@]}" rev-parse --git-path info/attributes)"
 test -z "$("${CLEAN_GIT[@]}" status --porcelain=v1 --untracked-files=all)"
+test "$("${CLEAN_GIT[@]}" remote get-url origin)" = \
+  https://github.com/sergeykuznetsov1995/data-platform-football.git
 PAYLOAD_REVISION="$("${CLEAN_GIT[@]}" rev-parse HEAD)"
 test "${#PAYLOAD_REVISION}" = 40
 for metadata in airflow-base airflow-scheduler-payload \
