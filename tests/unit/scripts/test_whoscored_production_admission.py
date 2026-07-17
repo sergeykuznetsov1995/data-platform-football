@@ -1612,6 +1612,19 @@ def test_post_create_verifies_container_and_digest_selected_image_identity() -> 
     )
 
 
+def test_engine_29_default_memory_swap_normalization_is_pinned() -> None:
+    assert {
+        service: resources["MemorySwap"]
+        for service, resources in admission._EXPECTED_CONTAINER_RESOURCES.items()
+    } == {
+        "airflow-scheduler": 17_179_869_184,
+        "flaresolverr": 8_589_934_592,
+        "flaresolverr_whoscored_paid": 4_294_967_296,
+        "whoscored_paid_gateway": 536_870_912,
+        "whoscored_proxy_filter": 536_870_912,
+    }
+
+
 def test_running_admission_reuses_complete_container_contract() -> None:
     def running(
         _service: str,

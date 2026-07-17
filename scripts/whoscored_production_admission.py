@@ -830,22 +830,25 @@ _EXPECTED_CONTAINER_RESOURCES = {
     "flaresolverr": {
         "Memory": 4_294_967_296,
         "MemoryReservation": 536_870_912,
-        "MemorySwap": 0,
+        # Compose leaves memswap_limit unset for this service. Engine 29
+        # normalizes that request to memory + an equal swap allowance in the
+        # inspected HostConfig, even when the host currently has no swap.
+        "MemorySwap": 8_589_934_592,
     },
     "flaresolverr_whoscored_paid": {
         "Memory": 2_147_483_648,
         "MemoryReservation": 536_870_912,
-        "MemorySwap": 0,
+        "MemorySwap": 4_294_967_296,
     },
     "whoscored_paid_gateway": {
         "Memory": 268_435_456,
         "MemoryReservation": 67_108_864,
-        "MemorySwap": 0,
+        "MemorySwap": 536_870_912,
     },
     "whoscored_proxy_filter": {
         "Memory": 268_435_456,
         "MemoryReservation": 67_108_864,
-        "MemorySwap": 0,
+        "MemorySwap": 536_870_912,
     },
 }
 _SCHEDULER_ENVIRONMENT_NAMES = frozenset(
