@@ -68,7 +68,7 @@
     "scrapers/whoscored/profile_policy.py": "1ac7f2aadd2c8edd52989a6f1af3a04d56200e7c0a7aecf24feeaae28eb8f1d6",
     "scrapers/whoscored/proxy_campaign.py": "202d6a4e1a099ad1d60d8e230077f0feb858d1af49b4f1acf11dd005b520a1df",
     "scrapers/whoscored/raw_store.py": "249bfd67bab0e6e531769b0128cc08f2bb621652380848ee45fe1dd28e2fb2e2",
-    "scrapers/whoscored/repository.py": "5fb10ce40cb76c41b2f12c2daca38c41829f1ac486b99552c79e9613d1166057",
+    "scrapers/whoscored/repository.py": "6779f85a77737c5c7be1eeb729c53ad8b9df8cae3c1e1b43178ec6abdfa1719e",
     "scrapers/whoscored/runtime_contract.py": "b7fe5b500b4e7e1ffb330e79d08a66ef8634bacd70bf911b8fc8add3c0470e49",
     "scrapers/whoscored/runtime_limits.py": "896ec16834d6c9ca9924ed9feeab77ca5ebf1f8975f81e9f4fe3a21af717005d",
     "scrapers/whoscored/service.py": "58ff7daeff83634fda08499122839a3937ef741a8e535a06907964e531fe5836",

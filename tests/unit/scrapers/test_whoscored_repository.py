@@ -2492,7 +2492,7 @@ def test_scope_row_spool_preserves_sqlite_full_error_after_auto_rollback(tmp_pat
         configured_max = int(
             spool._connection.execute("PRAGMA max_page_count").fetchone()[0]
         )
-        assert page_size * configured_max == 1024**3
+        assert page_size * configured_max == 2 * 1024**3
         page_count = int(spool._connection.execute("PRAGMA page_count").fetchone()[0])
         spool._connection.execute(f"PRAGMA max_page_count={page_count}")
         spool.begin_stage()
@@ -2517,6 +2517,35 @@ def test_scope_row_spool_preserves_sqlite_full_error_after_auto_rollback(tmp_pat
         assert len(spool) == 0
         assert spool.columns == frozenset()
         assert spool._stage_snapshot is None
+    finally:
+        spool.close()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("table", "expected_max_bytes"),
+    [
+        ("whoscored_team_stage_stats", 2 * 1024**3),
+        ("whoscored_player_stage_stats", 4 * 1024**3),
+        ("whoscored_referee_stage_stats", 1024**3),
+        ("whoscored_schedule", 1024**3),
+    ],
+)
+def test_scope_row_spool_applies_bounded_table_ceiling(
+    tmp_path, table, expected_max_bytes
+):
+    spool = WhoScoredScopeRowSpool(
+        table=table,
+        league="INT-World Cup",
+        season="2026",
+        directory=str(tmp_path),
+    )
+    try:
+        page_size = int(spool._connection.execute("PRAGMA page_size").fetchone()[0])
+        configured_max = int(
+            spool._connection.execute("PRAGMA max_page_count").fetchone()[0]
+        )
+        assert page_size * configured_max == expected_max_bytes
     finally:
         spool.close()
 

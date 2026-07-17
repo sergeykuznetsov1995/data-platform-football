@@ -23,6 +23,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from functools import wraps
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
 import fcntl
@@ -126,7 +127,23 @@ SCOPE_SHRINKABLE_DATASET_TABLES = {"whoscored_match_bets"}
 DEFAULT_SCOPE_WRITE_CHUNK_ROWS = 20_000
 MAX_SCOPE_WRITE_CHUNK_ROWS = 100_000
 _SPOOL_INSERT_BATCH_ROWS = 256
-_SCOPE_SPOOL_DB_MAX_BYTES = 1024**3
+# ``sync_schedule`` opens exactly these three SQLite spools at once.  Player
+# and team stage statistics are the two high-cardinality datasets: a complete
+# World Cup season can legitimately exceed 1 GiB before the rows are streamed
+# to Iceberg (1,659,822 measured player rows project to about 1.7 GiB).  The
+# table-specific ceilings keep that workload bounded to
+# 7 GiB of main databases per task (28 GiB at the hard four-task pool limit).
+# DELETE journals can temporarily require about 56 GiB for four tasks, plus
+# small SQLite/filesystem framing overhead, and every task removes its private
+# spool tree during cleanup.
+_SCOPE_SPOOL_DB_DEFAULT_MAX_BYTES = 1024**3
+_SCOPE_SPOOL_DB_MAX_BYTES_BY_TABLE = MappingProxyType(
+    {
+        "whoscored_team_stage_stats": 2 * 1024**3,
+        "whoscored_player_stage_stats": 4 * 1024**3,
+        "whoscored_referee_stage_stats": 1024**3,
+    }
+)
 
 
 def scope_write_chunk_rows_from_env(
@@ -197,7 +214,10 @@ class WhoScoredScopeRowSpool:
         self.path = Path(self._temporary.name) / "rows.sqlite3"
         self._connection = sqlite3.connect(str(self.path))
         page_size = int(self._connection.execute("PRAGMA page_size").fetchone()[0])
-        max_page_count = _SCOPE_SPOOL_DB_MAX_BYTES // page_size
+        max_bytes = _SCOPE_SPOOL_DB_MAX_BYTES_BY_TABLE.get(
+            table, _SCOPE_SPOOL_DB_DEFAULT_MAX_BYTES
+        )
+        max_page_count = max_bytes // page_size
         applied_max = int(
             self._connection.execute(
                 f"PRAGMA max_page_count={max_page_count}"
