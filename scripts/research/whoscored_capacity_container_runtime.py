@@ -904,7 +904,7 @@ def _resource_stats(
             or not _CONTAINER_ID_RE.fullmatch(container_id)
             or container_id not in expected
             or container_id in observed
-            or payload.get("Container") != container_id[:12]
+            or payload.get("Container") not in (container_id, container_id[:12])
             or payload.get("Name") != expected[container_id]
         ):
             raise ContainerRuntimeError("docker stats worker identity changed")

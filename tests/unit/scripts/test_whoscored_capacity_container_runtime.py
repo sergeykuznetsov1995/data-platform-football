@@ -48,6 +48,7 @@ class FakeDocker:
         stale: bool = False,
         complete_after_stats_call: int | None = None,
         omit_completed_stats_rows: bool = False,
+        stats_container_full_id: bool = True,
     ) -> None:
         self.calls: list[tuple[tuple[str, ...], float | None]] = []
         self.attach_calls: list[tuple[str, ...]] = []
@@ -59,6 +60,7 @@ class FakeDocker:
         self.stale = stale
         self.complete_after_stats_call = complete_after_stats_call
         self.omit_completed_stats_rows = omit_completed_stats_rows
+        self.stats_container_full_id = stats_container_full_id
         self.stats_calls = 0
         self.next_container_number = 1
         self.liveness_writers: list[int] = []
@@ -101,7 +103,11 @@ class FakeDocker:
                 name = item["Name"]
                 assert isinstance(name, str)
                 payload = {
-                    "Container": container_id[:12],
+                    "Container": (
+                        container_id
+                        if self.stats_container_full_id
+                        else container_id[:12]
+                    ),
                     "ID": container_id,
                     "Name": name.removeprefix("/"),
                     "MemUsage": "16MiB / 2GiB",
@@ -643,6 +649,39 @@ def test_normal_exit_during_stats_is_reconciled_with_fresh_exact_inspect(
     assert outcome.status == "completed"
     assert fake.stats_calls == 3
     assert all(not item.running for item in samples[-1].containers)
+
+
+def test_stats_accepts_legacy_short_container_display_id(
+    binds: tuple[Path, Path],
+) -> None:
+    fake = FakeDocker(
+        complete_after_stats_call=3,
+        omit_completed_stats_rows=True,
+        stats_container_full_id=False,
+    )
+    runtime_root, source_circuit = binds
+    try:
+        outcome = runtime.run_capacity_containers(
+            scheduler_image_id=IMAGE_ID,
+            flaresolverr_container_id=FLARE_ID,
+            owner=OWNER,
+            workers=_workers(),
+            runtime_root=runtime_root,
+            source_circuit_root=source_circuit,
+            before_release=lambda: None,
+            on_sample=lambda _: None,
+            stop_requested=lambda: False,
+            deadline_reached=lambda: False,
+            on_outcome=lambda _: None,
+            runner=fake,
+            attach_factory=fake.attach,
+            sample_interval_seconds=0.001,
+        )
+    finally:
+        fake.close()
+
+    assert outcome.status == "completed"
+    assert outcome.cleanup_complete is True
 
 
 @pytest.mark.parametrize("field", ["ID", "Container", "Name"])
