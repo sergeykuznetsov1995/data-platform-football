@@ -39,6 +39,9 @@ def _camoufox_install(tmp_path, *, version="152.0.4", release="beta.26"):
         encoding="utf-8",
     )
     executable.chmod(0o755)
+    fontconfig = root / "fontconfig" / "windows" / "fonts.conf"
+    fontconfig.parent.mkdir(parents=True)
+    fontconfig.write_text("<fontconfig/>\n", encoding="utf-8")
     return root
 
 
@@ -58,6 +61,7 @@ def test_camoufox_runtime_requires_the_reviewed_exact_stack(tmp_path):
         "curl_cffi": "0.15.0",
         "executable_verified": True,
         "executable_probe_verified": True,
+        "fontconfig_verified": True,
     }
 
 

@@ -339,6 +339,7 @@ RUN --network=none rm -rf /opt/fbref-camoufox \
     && chown -R root:root /opt/fbref-camoufox \
     && chmod -R 0755 /opt/fbref-camoufox \
     && test -x /opt/fbref-camoufox/camoufox-bin \
+    && test -r /opt/fbref-camoufox/fontconfig/windows/fonts.conf \
     && rm -f /tmp/fbref-camoufox.zip
 RUN --network=none install -d -o root -g root -m 0755 /opt/tls-client
 RUN curl --proto '=https' --tlsv1.2 --proto-redir '=https' -fsSL https://github.com/bogdanfinn/tls-client/releases/download/v1.13.1/tls-client-linux-ubuntu-amd64-1.13.1.so -o /opt/tls-client/tls-client.so \

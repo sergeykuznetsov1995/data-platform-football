@@ -1,6 +1,8 @@
 """Network-free tests for the single FBref Camoufox clearance transport."""
 
 import base64
+import os
+from pathlib import Path
 import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call as mock_call
@@ -1429,6 +1431,78 @@ def test_browser_start_watchdog_is_disarmed_once_the_browser_is_up(monkeypatch):
     assert len(timers) == 1
     assert timers[0].cancelled is True
     assert timers[0].interval == transport.BROWSER_START_TIMEOUT_S
+
+
+def test_browser_gets_private_writable_home_and_exact_fontconfig(monkeypatch):
+    page = MagicMock()
+    context = MagicMock()
+    context.new_page.return_value = page
+    browser = MagicMock()
+    browser.new_context.return_value = context
+    camoufox = MagicMock()
+    camoufox.return_value.__enter__.return_value = browser
+    _install_camoufox_mocks(monkeypatch, camoufox)
+    monkeypatch.setenv("UNRELATED_PARENT_VALUE", "must-not-reach-firefox")
+    original_home = os.environ.get("HOME")
+    transport = CamoufoxFbrefTransport(geoip=False)
+
+    transport._start()
+
+    environment = camoufox.call_args.kwargs["env"]
+    runtime_home = Path(environment["HOME"])
+    assert runtime_home.parent == Path("/tmp")
+    assert runtime_home.name.startswith("fbref-camoufox-home-")
+    assert runtime_home.is_dir()
+    assert Path(environment["XDG_CACHE_HOME"]) == runtime_home / ".cache"
+    assert Path(environment["XDG_CACHE_HOME"]).is_dir()
+    assert environment["FONTCONFIG_PATH"] == (
+        "/opt/fbref-camoufox/fontconfig/windows"
+    )
+    assert environment["FONTCONFIG_FILE"] == "fonts.conf"
+    assert camoufox.call_args.kwargs["os"] == "windows"
+    assert "UNRELATED_PARENT_VALUE" not in environment
+    assert os.environ.get("HOME") == original_home
+
+    transport._stop()
+
+    assert not runtime_home.exists()
+
+
+def test_failed_browser_enter_rolls_back_private_home(monkeypatch):
+    camoufox = MagicMock()
+    camoufox.return_value.__enter__.side_effect = RuntimeError("launch failed")
+    _install_camoufox_mocks(monkeypatch, camoufox)
+    transport = CamoufoxFbrefTransport(geoip=False)
+
+    with pytest.raises(RuntimeError, match="launch failed"):
+        transport.__enter__()
+
+    runtime_home = Path(camoufox.call_args.kwargs["env"]["HOME"])
+    assert not runtime_home.exists()
+    camoufox.return_value.__exit__.assert_called_once_with(None, None, None)
+    assert transport._cm is None
+    assert transport._browser_runtime_home is None
+
+
+def test_failed_post_enter_setup_rolls_back_browser_and_private_home(monkeypatch):
+    browser = MagicMock()
+    browser.new_context.side_effect = RuntimeError("context failed")
+    camoufox = MagicMock()
+    camoufox.return_value.__enter__.return_value = browser
+    _install_camoufox_mocks(monkeypatch, camoufox)
+    transport = CamoufoxFbrefTransport(geoip=False)
+
+    with pytest.raises(RuntimeError, match="context failed"):
+        transport.__enter__()
+
+    runtime_home = Path(camoufox.call_args.kwargs["env"]["HOME"])
+    assert not runtime_home.exists()
+    camoufox.return_value.__exit__.assert_called_once_with(None, None, None)
+    assert transport._cm is None
+    assert transport._browser is None
+    assert transport._context is None
+    assert transport._page is None
+    assert transport._browser_runtime_home is None
 
 
 def test_proxy_authorization_header_requires_explicit_lease_client_flag():

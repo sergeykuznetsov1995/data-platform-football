@@ -202,7 +202,17 @@ jobs:
             --load \
             -t data-platform-airflow-scheduler:ci \
             docker/images/airflow
-          timeout 45 docker run --rm \
+          scheduler_smoke_tmpdir="$(mktemp -d)"
+          scheduler_smoke_cidfile="$scheduler_smoke_tmpdir/cid"
+          cleanup_scheduler_smoke() {
+            if test -s "$scheduler_smoke_cidfile"; then
+              docker rm -f "$(cat "$scheduler_smoke_cidfile")" >/dev/null 2>&1 || true
+            fi
+            rm -rf -- "$scheduler_smoke_tmpdir"
+          }
+          trap cleanup_scheduler_smoke EXIT
+          timeout --kill-after=5s 45s docker run --rm \
+            --cidfile "$scheduler_smoke_cidfile" \
             --network none \
             --user 50000:0 \
             --read-only \
@@ -214,7 +224,9 @@ jobs:
             --security-opt seccomp=builtin \
             --entrypoint /opt/legacy-scraper-venv/bin/python \
             data-platform-airflow-scheduler:ci -I -c \
-            "from camoufox.addons import DefaultAddons; from camoufox.sync_api import Camoufox; cm = Camoufox(headless='virtual', executable_path='/opt/fbref-camoufox/camoufox-bin', ff_version=152, i_know_what_im_doing=True, exclude_addons=list(DefaultAddons)); browser = cm.__enter__(); ua = browser.new_page().evaluate('navigator.userAgent'); cm.__exit__(None, None, None); assert 'Firefox/152.0' in ua, ua"
+            "import os, tempfile; home = tempfile.TemporaryDirectory(prefix='fbref-camoufox-home-', dir='/tmp'); cache = os.path.join(home.name, '.cache'); os.mkdir(cache, 0o700); env = {'FONTCONFIG_FILE': 'fonts.conf', 'FONTCONFIG_PATH': '/opt/fbref-camoufox/fontconfig/windows', 'HOME': home.name, 'XDG_CACHE_HOME': cache}; from camoufox.addons import DefaultAddons; from camoufox.sync_api import Camoufox; cm = Camoufox(headless='virtual', executable_path='/opt/fbref-camoufox/camoufox-bin', ff_version=152, os='windows', i_know_what_im_doing=True, exclude_addons=list(DefaultAddons), env=env); browser = cm.__enter__(); ua, platform = browser.new_page().evaluate('[navigator.userAgent, navigator.platform]'); cm.__exit__(None, None, None); home.cleanup(); assert 'Firefox/152.0' in ua and 'Windows NT 10.0' in ua, ua; assert platform == 'Win32', platform"
+          cleanup_scheduler_smoke
+          trap - EXIT
           docker run --rm \
             --cap-drop ALL \
             --security-opt no-new-privileges:true \

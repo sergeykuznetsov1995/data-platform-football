@@ -191,6 +191,7 @@ def test_browser_assets_are_checksum_pinned_and_source_isolated():
     assert 'stat -c %s /tmp/fbref-camoufox.zip)" -eq 663773735' in fbref_block
     assert "-e /tmp/fbref-camoufox.zip /opt/fbref-camoufox" in fbref_block
     assert f"test -x {install_dir}/camoufox-bin" in fbref_block
+    assert "test -r /opt/fbref-camoufox/fontconfig/windows/fonts.conf" in fbref_block
     assert "/home/airflow/.cache/camoufox" not in fbref_block
     assert "SOFASCORE_CAMOUFOX" not in fbref_block
     assert "download_mmdb" not in dockerfile
@@ -211,7 +212,15 @@ def test_browser_assets_are_checksum_pinned_and_source_isolated():
     assert "Camoufox(headless='virtual'" in scheduler_smoke
     assert f"executable_path='{install_dir}/camoufox-bin'" in scheduler_smoke
     assert "exclude_addons=list(DefaultAddons)" in scheduler_smoke
-    assert "browser.new_page().evaluate('navigator.userAgent')" in scheduler_smoke
+    assert (
+        "browser.new_page().evaluate('[navigator.userAgent, navigator.platform]')"
+        in scheduler_smoke
+    )
+    assert "'FONTCONFIG_PATH': '/opt/fbref-camoufox/fontconfig/windows'" in scheduler_smoke
+    assert "'XDG_CACHE_HOME': cache" in scheduler_smoke
+    assert "'HOME': home.name" in scheduler_smoke
+    assert "os='windows'" in scheduler_smoke
+    assert "platform == 'Win32'" in scheduler_smoke
     assert "assert 'Firefox/152.0' in ua" in scheduler_smoke
 
 

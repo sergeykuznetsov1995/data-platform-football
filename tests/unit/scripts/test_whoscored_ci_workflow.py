@@ -97,6 +97,16 @@ def test_ci_uses_test_runtime_and_smokes_immutable_flaresolverr():
     assert (
         "--tmpfs /tmp:rw,noexec,nosuid,nodev,size=256m,uid=50000,gid=0,mode=0700"
     ) in scheduler_smoke
+    assert "timeout --kill-after=5s 45s docker run --rm" in scheduler_smoke
+    assert '--cidfile "$scheduler_smoke_cidfile"' in scheduler_smoke
+    assert 'scheduler_smoke_tmpdir="$(mktemp -d)"' in scheduler_smoke
+    assert 'scheduler_smoke_cidfile="$scheduler_smoke_tmpdir/cid"' in scheduler_smoke
+    assert "trap cleanup_scheduler_smoke EXIT" in scheduler_smoke
+    assert "'FONTCONFIG_PATH': '/opt/fbref-camoufox/fontconfig/windows'" in scheduler_smoke
+    assert "'HOME': home.name" in scheduler_smoke
+    assert "dict(os.environ)" not in scheduler_smoke
+    assert "os='windows'" in scheduler_smoke
+    assert "platform == 'Win32'" in scheduler_smoke
     assert "/v1/whoscored/runtime-identity" in text
     assert 'assert response["extension_sha256"] == identity["extension_sha256"]' in text
 
