@@ -472,8 +472,42 @@ class TestTrinoTableManagerInsertDataFrameAtomic:
             return None
         return _exec
 
-    def test_insert_dataframe_atomic_stages_and_merges(self):
-        """Staged batches collapse into a single INSERT...SELECT on the target."""
+    def test_single_batch_append_skips_staging(self):
+        """A plain append that fits one INSERT needs no stage (#930).
+
+        The stage exists to collapse multi-batch writes into one snapshot
+        (#269). One INSERT is already one snapshot, so staging it would only
+        add a CREATE TABLE + DROP TABLE catalog round-trip per write.
+        """
+        import pandas as pd
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.trino_manager import TrinoTableManager
+
+            manager = TrinoTableManager()
+            df = pd.DataFrame({'team': ['A', 'B', 'C'], 'goals': [1, 2, 3]})
+
+            with patch.object(manager, '_execute', side_effect=self._exec_ok(3)) as mock_execute, \
+                 patch.object(manager, 'get_table_columns', return_value={}), \
+                 patch.object(manager, 'insert_dataframe') as mock_insert, \
+                 patch.object(manager, 'drop_table') as mock_drop:
+                result = manager.insert_dataframe_atomic('bronze', 'test_table', df)
+
+            assert result == 3
+            mock_insert.assert_not_called()
+            mock_drop.assert_not_called()
+
+            executed = [c[0][0] for c in mock_execute.call_args_list]
+            assert not any('CREATE TABLE' in sql for sql in executed)
+            assert not any('DELETE FROM' in sql for sql in executed)
+            target_inserts = [
+                sql for sql in executed
+                if sql.startswith('INSERT INTO iceberg.bronze.test_table ')
+            ]
+            assert len(target_inserts) == 1
+            assert 'VALUES' in target_inserts[0]
+
+    def test_oversized_append_still_stages_and_merges(self):
+        """A write too big for one INSERT still collapses to one snapshot."""
         import pandas as pd
         with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
             from scrapers.base.trino_manager import TrinoTableManager
@@ -483,6 +517,7 @@ class TestTrinoTableManagerInsertDataFrameAtomic:
             df = pd.DataFrame({'team': ['A', 'B', 'C'], 'goals': [1, 2, 3]})
 
             with patch.object(manager, '_execute', side_effect=self._exec_ok(3)) as mock_execute, \
+                 patch.object(manager, '_insert_single_batch', return_value=None), \
                  patch.object(manager, 'insert_dataframe', return_value=3) as mock_insert, \
                  patch.object(manager, 'drop_table') as mock_drop:
                 result = manager.insert_dataframe_atomic('bronze', 'test_table', df)
@@ -514,6 +549,48 @@ class TestTrinoTableManagerInsertDataFrameAtomic:
             assert f'FROM iceberg.bronze.{stage}' in target_inserts[0]
             # Plain append → no DELETE issued.
             assert not any('DELETE FROM' in sql for sql in executed)
+
+    def test_single_batch_fit_is_measured_not_estimated(self):
+        """The fast path renders real SQL and declines when it exceeds the budget."""
+        import pandas as pd
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.trino_manager import SQL_BYTE_BUDGET, TrinoTableManager
+
+            manager = TrinoTableManager()
+            with patch.object(manager, 'get_table_columns', return_value={}), \
+                 patch.object(manager, '_execute') as mock_execute:
+                fits = manager._insert_single_batch(
+                    'bronze', 't', pd.DataFrame({'blob': ['x' * 10]}), batch_size=1000
+                )
+                assert fits == 1
+                assert mock_execute.call_count == 1
+
+                # One row wider than the whole statement budget cannot fit.
+                oversized = manager._insert_single_batch(
+                    'bronze',
+                    't',
+                    pd.DataFrame({'blob': ['x' * (SQL_BYTE_BUDGET + 1)]}),
+                    batch_size=1000,
+                )
+                assert oversized is None
+                assert mock_execute.call_count == 1  # nothing executed
+
+                # Trino limits UTF-8 bytes, not Python character count.
+                multibyte = manager._insert_single_batch(
+                    'bronze',
+                    't',
+                    pd.DataFrame({'blob': ['⚽' * (SQL_BYTE_BUDGET // 2)]}),
+                    batch_size=1000,
+                )
+                assert multibyte is None
+                assert mock_execute.call_count == 1
+
+                # More rows than the batch size also fall back to staging.
+                too_many = manager._insert_single_batch(
+                    'bronze', 't', pd.DataFrame({'blob': ['x', 'y', 'z']}), batch_size=2
+                )
+                assert too_many is None
+                assert mock_execute.call_count == 1
 
     def test_insert_dataframe_atomic_empty(self):
         """Empty DataFrame is a no-op (no staging)."""
@@ -1446,3 +1523,91 @@ class TestTrinoManagerRestartResilience:
             # Assert — reconnected once, statement re-ran on the new connection.
             reconnect.assert_called_once()
             ok_cursor.execute.assert_called_once_with('SELECT 1')
+
+
+class TestMetadataCaching:
+    """Every write asked SHOW TABLES twice, DESCRIBE once and CREATE SCHEMA
+    once. Those round-trips dominated a batched write run (#930), so they are
+    cached — but only facts this process itself invalidates."""
+
+    def _manager(self):
+        from scrapers.base.trino_manager import TrinoTableManager
+        TrinoTableManager._trino_unreachable = False
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            return TrinoTableManager()
+
+    def test_repeated_existence_and_column_lookups_hit_trino_once(self):
+        manager = self._manager()
+        calls = []
+
+        def _execute(sql, fetch=False, params=None):
+            calls.append(sql)
+            if sql.startswith("SHOW TABLES"):
+                return [("fotmob_matches",)]
+            if sql.startswith("DESCRIBE"):
+                return [("match_id", "varchar", "", "")]
+            return None
+
+        manager._execute = _execute
+
+        for _ in range(3):
+            assert manager.table_exists("bronze", "fotmob_matches") is True
+            assert manager.get_table_columns("bronze", "fotmob_matches") == {
+                "match_id": "varchar"
+            }
+            manager.create_schema("bronze")
+
+        assert sum(1 for sql in calls if sql.startswith("SHOW TABLES")) == 1
+        assert sum(1 for sql in calls if sql.startswith("DESCRIBE")) == 1
+        assert sum(1 for sql in calls if sql.startswith("CREATE SCHEMA")) == 1
+
+    def test_a_missing_table_is_never_cached_as_missing(self):
+        # The very next call is usually the CREATE; caching absence would make
+        # the writer skip the create and INSERT into a table that isn't there.
+        manager = self._manager()
+        calls = []
+
+        def _execute(sql, fetch=False, params=None):
+            calls.append(sql)
+            return []
+
+        manager._execute = _execute
+
+        assert manager.table_exists("bronze", "later") is False
+        assert manager.table_exists("bronze", "later") is False
+
+        assert sum(1 for sql in calls if sql.startswith("SHOW TABLES")) == 2
+
+    def test_dropping_a_table_forgets_it(self):
+        manager = self._manager()
+        seen = {"exists": True}
+
+        def _execute(sql, fetch=False, params=None):
+            if sql.startswith("SHOW TABLES"):
+                return [("stage",)] if seen["exists"] else []
+            return None
+
+        manager._execute = _execute
+
+        assert manager.table_exists("bronze", "stage") is True
+        manager.drop_table("bronze", "stage")
+        seen["exists"] = False
+
+        assert manager.table_exists("bronze", "stage") is False
+
+    def test_added_column_invalidates_the_cached_schema(self):
+        manager = self._manager()
+        columns = [("a", "varchar", "", "")]
+
+        def _execute(sql, fetch=False, params=None):
+            if sql.startswith("DESCRIBE"):
+                return list(columns)
+            return None
+
+        manager._execute = _execute
+
+        assert manager.get_table_columns("bronze", "t") == {"a": "varchar"}
+        columns.append(("b", "bigint", "", ""))
+        manager.add_column("bronze", "t", "b", "BIGINT")
+
+        assert manager.get_table_columns("bronze", "t") == {"a": "varchar", "b": "bigint"}

@@ -24,6 +24,12 @@ from scrapers.base.sql_validator import validate_identifier, validate_catalog_qu
 
 logger = logging.getLogger(__name__)
 
+# Trino's `query.max-length` defaults to 1,000,000 bytes.  The Python client
+# may wrap a statement in EXECUTE IMMEDIATE and escape embedded quotes, so the
+# server-side query can be materially larger than the UTF-8 payload rendered
+# here.  Keep enough headroom for that wrapper and for wide source rows.
+SQL_BYTE_BUDGET = 300_000
+
 # Trino client import with graceful fallback
 try:
     import trino
@@ -79,6 +85,15 @@ class TrinoTableManager:
             self.port = port or int(os.environ.get('TRINO_PORT', 8080))
             logger.info("TRINO_PASSWORD not set, connecting via HTTP (no auth)")
         self._conn = None
+        # Metadata round-trips dominate a write-heavy run: every write asked
+        # SHOW TABLES twice, DESCRIBE once and CREATE SCHEMA once. Only facts
+        # this process cannot invalidate behind its own back are cached — a
+        # table that exists stays existing (drops/creates update the cache),
+        # a missing table is never cached, and column sets are dropped whenever
+        # this manager evolves or recreates the table.
+        self._known_schemas: set[str] = set()
+        self._known_tables: set[tuple[str, str]] = set()
+        self._column_cache: dict[tuple[str, str], Dict[str, str]] = {}
 
     # Retry settings for connection. A Trino container restart takes ~30-60s
     # (SERVER STARTED ~13s + authenticator warm-up), so the cumulative window
@@ -240,6 +255,8 @@ class TrinoTableManager:
             schema: Schema name (e.g., 'bronze', 'silver', 'gold')
         """
         qualified = validate_catalog_qualified_name(self.catalog, schema)
+        if schema in self._known_schemas:
+            return
         sql = f"CREATE SCHEMA IF NOT EXISTS {qualified}"
 
         try:
@@ -248,6 +265,7 @@ class TrinoTableManager:
         except TrinoError:
             # Schema might already exist
             logger.debug(f"Schema {schema} may already exist")
+        self._known_schemas.add(schema)
 
     def schema_exists(self, schema: str) -> bool:
         """Check if schema exists."""
@@ -269,13 +287,18 @@ class TrinoTableManager:
         """
         qualified = validate_catalog_qualified_name(self.catalog, schema)
         validate_identifier(table, "table")
+        if (schema, table) in self._known_tables:
+            return True
         sql = f"SHOW TABLES FROM {qualified} LIKE '{table}'"
 
         try:
             result = self._execute(sql, fetch=True)
-            return len(result) > 0
         except TrinoError:
             return False
+        # Absence is never cached: the very next call may be the CREATE.
+        if result:
+            self._known_tables.add((schema, table))
+        return len(result) > 0
 
     def create_external_table(
         self,
@@ -370,6 +393,8 @@ WITH (
 ){partition_clause}"""
 
         self._execute(sql)
+        self._known_tables.add((schema, table))
+        self._column_cache.pop((schema, table), None)
         logger.info(f"Created Iceberg table: {self.catalog}.{schema}.{table}")
 
     def _format_sql_value(self, val, target_type: str = '') -> str:
@@ -491,7 +516,7 @@ WITH (
         schema: str,
         table: str,
         df: pd.DataFrame,
-        batch_size: int = 1000,
+        batch_size: int = 5000,
         column_types: Optional[Mapping[str, str]] = None,
     ) -> int:
         """
@@ -505,7 +530,8 @@ WITH (
             schema: Schema name
             table: Table name
             df: Pandas DataFrame to insert
-            batch_size: Number of rows per INSERT statement (default 1000)
+            batch_size: Number of rows per INSERT statement (default 5000;
+                the SQL byte budget still splits wide rows earlier)
             column_types: Optional already-verified target column types.  The
                 caller may supply these when the staging table was copied from
                 a target whose schema it just inspected.
@@ -537,12 +563,10 @@ WITH (
         columns = ', '.join(f'"{c}"' for c in df.columns)
         header = f"INSERT INTO {qualified} ({columns})\nVALUES\n"
 
-        # Trino's `query.max-length` defaults to 1,000,000 bytes; leave headroom
-        # for wide schemas (e.g. sofascore_player_season_stats ~150 cols).
-        sql_byte_budget = 900_000
+        sql_byte_budget = SQL_BYTE_BUDGET
 
         pending_rows: List[str] = []
-        pending_bytes = len(header)
+        pending_bytes = len(header.encode("utf-8"))
         batch_num = 0
 
         def _flush() -> None:
@@ -558,7 +582,7 @@ WITH (
                 f"{self.catalog}.{schema}.{table}"
             )
             pending_rows = []
-            pending_bytes = len(header)
+            pending_bytes = len(header.encode("utf-8"))
 
         # ``iterrows`` boxes every scalar into a Series and can silently
         # coerce integer identifiers to float.  Tuple iteration preserves the
@@ -572,25 +596,72 @@ WITH (
                 values.append(self._format_sql_value(val, target_type))
             row_sql = f"({', '.join(values)})"
             # +2 accounts for the ",\n" separator before the next row.
+            row_bytes = len(row_sql.encode("utf-8"))
             if pending_rows and (
-                pending_bytes + len(row_sql) + 2 > sql_byte_budget
+                pending_bytes + row_bytes + 2 > sql_byte_budget
                 or len(pending_rows) >= batch_size
             ):
                 _flush()
             pending_rows.append(row_sql)
-            pending_bytes += len(row_sql) + 2
+            pending_bytes += row_bytes + 2
 
         _flush()
 
         logger.info(f"Inserted {total_inserted} rows into {self.catalog}.{schema}.{table}")
         return total_inserted
 
+    def _insert_single_batch(
+        self,
+        schema: str,
+        table: str,
+        df: pd.DataFrame,
+        batch_size: int,
+    ) -> Optional[int]:
+        """Append ``df`` in one INSERT, or return None if it does not fit.
+
+        The caller must have ruled out DELETE/MERGE semantics: this is a plain
+        append. Returning None means "too big for a single statement" — the
+        caller then stages, which is what keeps a multi-batch write down to one
+        snapshot (#269). The row SQL is rendered exactly as ``insert_dataframe``
+        renders it, so the fit is measured, never estimated.
+        """
+        if len(df) > batch_size:
+            return None
+
+        table_col_types: Dict[str, str] = {}
+        try:
+            raw_types = self.get_table_columns(schema, table)
+            table_col_types = {k.lower(): v for k, v in raw_types.items()}
+        except Exception as e:
+            logger.debug(f"Could not fetch table column types: {e}")
+
+        qualified = validate_catalog_qualified_name(self.catalog, schema, table)
+        columns = ', '.join(f'"{c}"' for c in df.columns)
+        header = f"INSERT INTO {qualified} ({columns})\nVALUES\n"
+
+        rendered: List[str] = []
+        total = len(header.encode("utf-8"))
+        for source_values in df.itertuples(index=False, name=None):
+            values = [
+                self._format_sql_value(val, table_col_types.get(col.lower(), ''))
+                for col, val in zip(df.columns, source_values)
+            ]
+            row_sql = f"({', '.join(values)})"
+            # +2 accounts for the ",\n" separator before the next row.
+            total += len(row_sql.encode("utf-8")) + 2
+            if total > SQL_BYTE_BUDGET:
+                return None
+            rendered.append(row_sql)
+
+        self._execute(header + ",\n".join(rendered))
+        return len(rendered)
+
     def insert_dataframe_atomic(
         self,
         schema: str,
         table: str,
         df: pd.DataFrame,
-        batch_size: int = 1000,
+        batch_size: int = 5000,
         delete_filter: Optional[str] = None,
         staging_id: Optional[str] = None,
         merge_keys: Optional[Sequence[str]] = None,
@@ -682,6 +753,24 @@ WITH (
                 raise ValueError(f"merge key {key!r} contains null values")
         if keys and df.duplicated(subset=list(keys)).any():
             raise ValueError(f"duplicate rows for merge keys {list(keys)!r}")
+
+        # Fast path: a plain append that fits in ONE ``INSERT ... VALUES``
+        # already produces exactly one snapshot, which is the entire reason the
+        # stage exists (#269). Staging it anyway would add a CREATE TABLE and a
+        # DROP TABLE — two Iceberg catalog round-trips per write. Sources that
+        # commit per target (FotMob native: manifest + inventory + entity rows
+        # for every payload) paid ~5 statements where 1 suffices, which made the
+        # backfill catalog-bound (#930) and drove the catalog into memcg-OOM.
+        # No DELETE and no MERGE happen here, so #314/#283 do not apply: the
+        # INSERT either commits whole or leaves the target untouched.
+        if not delete_filter and not keys:
+            single = self._insert_single_batch(schema, table, df, batch_size)
+            if single is not None:
+                logger.info(
+                    f"Inserted {single} rows into "
+                    f"{self.catalog}.{schema}.{table} (direct, 1 snapshot)"
+                )
+                return single
 
         # Parallel ingestion shards must never share a predictable staging
         # table. Distributed callers pass a run/task/map/try/UUID-qualified
@@ -862,6 +951,8 @@ WITH (
         sql = f"DROP TABLE {exists_clause}{qualified}"
 
         self._execute(sql)
+        self._known_tables.discard((schema, table))
+        self._column_cache.pop((schema, table), None)
         logger.info(f"Dropped table: {self.catalog}.{schema}.{table}")
 
     def add_column(self, schema: str, table: str, column: str, column_type: str) -> None:
@@ -877,6 +968,7 @@ WITH (
         qualified = validate_catalog_qualified_name(self.catalog, schema, table)
         sql = f'ALTER TABLE {qualified} ADD COLUMN "{column}" {column_type}'
         self._execute(sql)
+        self._column_cache.pop((schema, table), None)
         logger.info(f'Added column "{column}" {column_type} to {self.catalog}.{schema}.{table}')
 
     def get_table_columns(self, schema: str, table: str) -> Dict[str, str]:
@@ -891,6 +983,9 @@ WITH (
             Dict of column_name -> type
         """
         qualified = validate_catalog_qualified_name(self.catalog, schema, table)
+        cached = self._column_cache.get((schema, table))
+        if cached is not None:
+            return dict(cached)
         sql = f"DESCRIBE {qualified}"
         result = self._execute(sql, fetch=True)
 
@@ -901,6 +996,7 @@ WITH (
             col_type = row[1]
             columns[col_name] = col_type
 
+        self._column_cache[(schema, table)] = dict(columns)
         return columns
 
     def execute_query(self, sql: str, params: Optional[tuple] = None) -> List[Any]:
