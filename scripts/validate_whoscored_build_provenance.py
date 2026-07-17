@@ -190,11 +190,11 @@ PROTECTED_SERVICE_BUILDS = {
     ),
 }
 PROTECTED_STAGE_RECIPE_SHA256 = {
-    "airflow-scheduler": "7e44dca7a2b5f014dda09ae39e9552132cd620f2f879a382d0e78d8d8e1a5f0d",
+    "airflow-scheduler": "0c993fd9466bfa25e324df332f7b0e9bf387e6e24ff8a3abadd9bd6d56365da7",
     "flaresolverr": "e4e28b69572d38f4f877154e6bc7a6f8fae0906edb624b62860fff53d0bcab20",
     "flaresolverr_whoscored_paid": "e4e28b69572d38f4f877154e6bc7a6f8fae0906edb624b62860fff53d0bcab20",
-    "whoscored_paid_gateway": "c8c2de1dec3e691e11a0f9734a6c865eb0020a63ece161088618f906f8733ee9",
-    "whoscored_proxy_filter": "c8c2de1dec3e691e11a0f9734a6c865eb0020a63ece161088618f906f8733ee9",
+    "whoscored_paid_gateway": "f28250e8d40fa7ca152a82c65bd38e7d9354a6c3c0d452dde3b345cdb1333651",
+    "whoscored_proxy_filter": "f28250e8d40fa7ca152a82c65bd38e7d9354a6c3c0d452dde3b345cdb1333651",
 }
 WHOSCORED_PROXY_COMMAND = (
     "python",
