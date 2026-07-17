@@ -1464,6 +1464,177 @@ def test_post_create_verifies_container_and_digest_selected_image_identity() -> 
     )
 
 
+def test_post_create_accepts_engine_29_empty_bind_mode_with_exact_request() -> None:
+    def use_engine_29_mount_metadata(
+        _service: str,
+        _ids: list[str],
+        container: dict[str, Any],
+        _image: dict[str, Any],
+    ) -> None:
+        if not container:
+            return
+        requested = []
+        for mount in container["Mounts"]:
+            if mount["Type"] != "bind":
+                continue
+            mount["Mode"] = ""
+            record = {
+                "Type": "bind",
+                "Source": mount["Source"],
+                "Target": mount["Destination"],
+                "BindOptions": {},
+            }
+            if mount["RW"] is False:
+                record["ReadOnly"] = True
+            requested.append(record)
+        container["HostConfig"]["Mounts"] = requested
+
+    projections = admission.verify_rendered_compose(_rendered(), BINDINGS)
+    report = admission.verify_created_containers(
+        BINDINGS,
+        project="data-platform",
+        selected_services=admission.PROTECTED_SERVICES,
+        projections=projections,
+        config_hashes=CONFIG_HASHES,
+        config_files=CONFIG_FILES,
+        env_files=ENV_FILES,
+        runner=_docker_runner(use_engine_29_mount_metadata),
+    )
+    assert report["status"] == "admitted-v1"
+
+
+@pytest.mark.parametrize(
+    "drift",
+    (
+        "missing",
+        "writable",
+        "missing-options",
+        "nonempty-options",
+        "wrong-source",
+        "wrong-target",
+        "wrong-type",
+        "noncanonical-mode",
+    ),
+)
+def test_post_create_rejects_unproven_engine_29_empty_bind_mode(
+    drift: str,
+) -> None:
+    def use_unproven_empty_mode(
+        service: str,
+        _ids: list[str],
+        container: dict[str, Any],
+        _image: dict[str, Any],
+    ) -> None:
+        if service != "airflow-scheduler" or not container:
+            return
+        mount = next(
+            item
+            for item in container["Mounts"]
+            if item["Type"] == "bind" and item["RW"] is False
+        )
+        mount["Mode"] = ""
+        if drift == "missing":
+            return
+        requested: dict[str, Any] = {
+            "Type": "bind",
+            "Source": mount["Source"],
+            "Target": mount["Destination"],
+            "ReadOnly": drift != "writable",
+        }
+        if drift != "missing-options":
+            requested["BindOptions"] = {}
+        if drift == "nonempty-options":
+            requested["BindOptions"] = {"ReadOnlyNonRecursive": True}
+        elif drift == "wrong-source":
+            requested["Source"] += "-drift"
+        elif drift == "wrong-target":
+            requested["Target"] += "-drift"
+        elif drift == "wrong-type":
+            requested["Type"] = "volume"
+        elif drift == "noncanonical-mode":
+            mount["Mode"] = "readonly"
+        container["HostConfig"]["Mounts"] = [requested]
+
+    projections = admission.verify_rendered_compose(_rendered(), BINDINGS)
+    with pytest.raises(admission.AdmissionError, match="mount mode differs"):
+        admission.verify_created_containers(
+            BINDINGS,
+            project="data-platform",
+            selected_services=("airflow-scheduler",),
+            projections=projections,
+            config_hashes=CONFIG_HASHES,
+            config_files=CONFIG_FILES,
+            env_files=ENV_FILES,
+            runner=_docker_runner(use_unproven_empty_mode),
+        )
+
+
+def test_post_create_rejects_duplicate_requested_mount_target() -> None:
+    def duplicate_requested_target(
+        service: str,
+        _ids: list[str],
+        container: dict[str, Any],
+        _image: dict[str, Any],
+    ) -> None:
+        if service != "airflow-scheduler" or not container:
+            return
+        mount = next(item for item in container["Mounts"] if item["Type"] == "bind")
+        requested = {
+            "Type": "bind",
+            "Source": mount["Source"],
+            "Target": mount["Destination"],
+            "BindOptions": {},
+        }
+        container["HostConfig"]["Mounts"] = [requested, requested.copy()]
+
+    projections = admission.verify_rendered_compose(_rendered(), BINDINGS)
+    with pytest.raises(admission.AdmissionError, match="requested-mount identity"):
+        admission.verify_created_containers(
+            BINDINGS,
+            project="data-platform",
+            selected_services=("airflow-scheduler",),
+            projections=projections,
+            config_hashes=CONFIG_HASHES,
+            config_files=CONFIG_FILES,
+            env_files=ENV_FILES,
+            runner=_docker_runner(duplicate_requested_target),
+        )
+
+
+def test_post_create_rejects_empty_volume_mode() -> None:
+    def empty_volume_mode(
+        service: str,
+        _ids: list[str],
+        container: dict[str, Any],
+        _image: dict[str, Any],
+    ) -> None:
+        if service != "airflow-scheduler" or not container:
+            return
+        mount = next(item for item in container["Mounts"] if item["Type"] == "volume")
+        mount["Mode"] = ""
+        container["HostConfig"]["Mounts"] = [
+            {
+                "Type": "volume",
+                "Source": mount["Name"],
+                "Target": mount["Destination"],
+                "VolumeOptions": {},
+            }
+        ]
+
+    projections = admission.verify_rendered_compose(_rendered(), BINDINGS)
+    with pytest.raises(admission.AdmissionError, match="mount mode differs"):
+        admission.verify_created_containers(
+            BINDINGS,
+            project="data-platform",
+            selected_services=("airflow-scheduler",),
+            projections=projections,
+            config_hashes=CONFIG_HASHES,
+            config_files=CONFIG_FILES,
+            env_files=ENV_FILES,
+            runner=_docker_runner(empty_volume_mode),
+        )
+
+
 @pytest.mark.parametrize(
     ("name", "mutation", "message"),
     [

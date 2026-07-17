@@ -2847,6 +2847,27 @@ def verify_created_containers(
         actual_mounts = container.get("Mounts")
         if not isinstance(actual_mounts, list):
             raise AdmissionError(f"container mount metadata is invalid: {service}")
+        requested_mounts = host_config.get("Mounts")
+        if requested_mounts is None:
+            requested_mounts = []
+        if not isinstance(requested_mounts, list) or any(
+            not isinstance(item, dict) for item in requested_mounts
+        ):
+            raise AdmissionError(
+                f"container requested-mount metadata is invalid: {service}"
+            )
+        requested_by_target: dict[str, dict[str, Any]] = {}
+        for requested in requested_mounts:
+            requested_target = requested.get("Target")
+            if (
+                not isinstance(requested_target, str)
+                or not requested_target.startswith("/")
+                or requested_target in requested_by_target
+            ):
+                raise AdmissionError(
+                    f"container requested-mount identity is invalid: {service}"
+                )
+            requested_by_target[requested_target] = requested
         effective: list[tuple[Any, ...]] = []
         actual_tmpfs_targets: set[str] = set()
         seen_targets: set[str] = set()
@@ -2880,8 +2901,26 @@ def verify_created_containers(
             ):
                 raise AdmissionError(f"container mount identity is invalid: {service}")
             expected_mode = "ro" if read_only else "rw"
-            if mount.get("Mode") != expected_mode:
-                raise AdmissionError(f"container mount mode differs: {service}")
+            mount_mode = mount.get("Mode")
+            if mount_mode != expected_mode:
+                requested = requested_by_target.get(target)
+                requested_read_only = (
+                    requested.get("ReadOnly", False)
+                    if isinstance(requested, dict)
+                    else None
+                )
+                if (
+                    mount_mode != ""
+                    or mount_type != "bind"
+                    or not isinstance(requested, dict)
+                    or requested.get("Type") != "bind"
+                    or requested.get("Source") != source
+                    or requested.get("Target") != target
+                    or not isinstance(requested_read_only, bool)
+                    or requested_read_only is not read_only
+                    or requested.get("BindOptions") != {}
+                ):
+                    raise AdmissionError(f"container mount mode differs: {service}")
             if mount_type == "bind":
                 if mount.get("Propagation") != "rprivate":
                     raise AdmissionError(
