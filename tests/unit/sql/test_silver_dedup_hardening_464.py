@@ -52,8 +52,12 @@ pytestmark = pytest.mark.unit
 _ICEBERG_TO_LOCAL = {
     "iceberg.bronze.understat_player_match_stats": "understat_player_match_stats",
     "iceberg.bronze.understat_shots":              "understat_shots",
-    "iceberg.bronze.fotmob_player_details":        "fotmob_player_details",
-    "iceberg.bronze.fotmob_player_stats":          "fotmob_player_stats",
+    # native fotmob bronze (#930 cutover: player_season_profile, keeper_profile)
+    "iceberg.bronze.fotmob_competition_seasons_current": "fotmob_competition_seasons_current",
+    "iceberg.bronze.fotmob_season_teams_current":        "fotmob_season_teams_current",
+    "iceberg.bronze.fotmob_squad_snapshots_current":     "fotmob_squad_snapshots_current",
+    "iceberg.bronze.fotmob_player_snapshots_current":    "fotmob_player_snapshots_current",
+    "iceberg.bronze.fotmob_leaderboards_current":        "fotmob_leaderboards_current",
 }
 
 
@@ -183,17 +187,37 @@ class TestUnderstatShotPenaltyDedup:
 # fotmob profiles — stats_pivoted must take the LATEST snapshot, not MAX
 # ---------------------------------------------------------------------------
 
-_FOTMOB_DETAILS_COLS = {
-    "player_id": "VARCHAR", "name": "VARCHAR", "position_description": "VARCHAR",
-    "is_coach": "BOOLEAN", "primary_team_id": "BIGINT",
-    "primary_team_name": "VARCHAR", "league": "VARCHAR", "season": "BIGINT",
-    "_ingested_at": "TIMESTAMP", "_batch_id": "VARCHAR",
+# --- native fotmob bronze (#930 cutover): минимальные схемы под scope-каркас ---
+
+_FOTMOB_NATIVE_SEASONS_COLS = {
+    "competition_id": "VARCHAR", "source_season_key": "VARCHAR",
+    "is_selected": "BOOLEAN", "is_latest": "BOOLEAN",
 }
 
-_FOTMOB_STATS_COLS = {
-    "participant_id": "BIGINT", "stat_name": "VARCHAR", "stat_value": "DOUBLE",
-    "matches_played": "BIGINT", "league": "VARCHAR", "season": "BIGINT",
-    "_ingested_at": "TIMESTAMP", "_batch_id": "VARCHAR",
+_FOTMOB_NATIVE_SEASON_TEAMS_COLS = {
+    "competition_id": "BIGINT", "source_season_key": "VARCHAR",
+    "team_id": "BIGINT", "team_name": "VARCHAR",
+}
+
+_FOTMOB_NATIVE_SQUAD_COLS = {
+    "team_id": "VARCHAR", "member_id": "VARCHAR", "member_type": "VARCHAR",
+}
+
+_FOTMOB_NATIVE_SNAPSHOTS_COLS = {
+    "player_id": "VARCHAR", "name": "VARCHAR", "position_description": "VARCHAR",
+    "is_coach": "BOOLEAN", "primary_team_id": "BIGINT",
+    "primary_team_name": "VARCHAR",
+    "_observed_at": "TIMESTAMP", "_target_batch_id": "VARCHAR",
+    "_ingested_at": "TIMESTAMP",
+}
+
+_FOTMOB_NATIVE_LEADERBOARDS_COLS = {
+    "competition_id": "BIGINT", "source_season_key": "VARCHAR",
+    "participant_type": "VARCHAR", "participant_id": "BIGINT",
+    "team_id": "BIGINT", "stat_name": "VARCHAR", "stat_value": "DOUBLE",
+    "matches_played": "BIGINT",
+    "_observed_at": "TIMESTAMP", "_target_batch_id": "VARCHAR",
+    "_ingested_at": "TIMESTAMP",
 }
 
 
@@ -201,19 +225,28 @@ _FOTMOB_STATS_COLS = {
 def duck_fotmob():
     duckdb = pytest.importorskip("duckdb")
     con = duckdb.connect()
-    con.execute(_ddl("fotmob_player_details", _FOTMOB_DETAILS_COLS))
-    con.execute(_ddl("fotmob_player_stats", _FOTMOB_STATS_COLS))
+    # native bronze (#930): player_season_profile / keeper_profile читают *_current
+    con.execute(_ddl("fotmob_competition_seasons_current", _FOTMOB_NATIVE_SEASONS_COLS))
+    con.execute(_ddl("fotmob_season_teams_current", _FOTMOB_NATIVE_SEASON_TEAMS_COLS))
+    con.execute(_ddl("fotmob_squad_snapshots_current", _FOTMOB_NATIVE_SQUAD_COLS))
+    con.execute(_ddl("fotmob_player_snapshots_current", _FOTMOB_NATIVE_SNAPSHOTS_COLS))
+    con.execute(_ddl("fotmob_leaderboards_current", _FOTMOB_NATIVE_LEADERBOARDS_COLS))
     yield con
     con.close()
 
 
-def _seed_fotmob_stat(con, stat_name, old_value, new_value):
-    """Same stat re-scraped: old snapshot (T1) then corrected snapshot (T2)."""
+def _seed_fotmob_native_stat(con, stat_name, old_value, new_value):
+    """Native (#930): same stat re-scraped into fotmob_leaderboards_current.
+
+    _current-view даёт обе строки (его natural key содержит team_id/rank/
+    top_list_index — мельче silver-ключа дедупа), поэтому silver обязан сам
+    выбрать последний снапшот по (_observed_at, _target_batch_id)."""
     for ts, batch, val in [(T1, "b1", old_value), (T2, "b2", new_value)]:
-        _insert(con, "fotmob_player_stats",
-                participant_id=1, stat_name=stat_name, stat_value=val,
-                matches_played=10, league="ENG-Premier League", season=2024,
-                _ingested_at=ts, _batch_id=batch)
+        _insert(con, "fotmob_leaderboards_current",
+                competition_id=47, source_season_key="2024/2025",
+                participant_type="player", participant_id=1, team_id=99,
+                stat_name=stat_name, stat_value=val, matches_played=10,
+                _observed_at=ts, _target_batch_id=batch, _ingested_at=ts)
 
 
 class TestFotmobPivotLatestSnapshot:
@@ -222,13 +255,17 @@ class TestFotmobPivotLatestSnapshot:
     high; the dedup must surface the latest snapshot instead."""
 
     def test_player_rating_takes_latest_not_max(self, duck_fotmob):
-        # Arrange: rating corrected DOWN 7.5 → 6.0 on re-scrape
-        _insert(duck_fotmob, "fotmob_player_details",
+        # Arrange (native #930): season-ось + глобальный снапшот игрока;
+        # членство в (лиге, сезоне) придёт из лидербордов (lb_player_scope).
+        _insert(duck_fotmob, "fotmob_competition_seasons_current",
+                competition_id="47", source_season_key="2024/2025",
+                is_selected=True, is_latest=True)
+        _insert(duck_fotmob, "fotmob_player_snapshots_current",
                 player_id="1", name="Out Field", position_description="forward",
                 is_coach=False, primary_team_id=99, primary_team_name="Test FC",
-                league="ENG-Premier League", season=2024,
-                _ingested_at=T1, _batch_id="b1")
-        _seed_fotmob_stat(duck_fotmob, "rating", old_value=7.5, new_value=6.0)
+                _observed_at=T1, _target_batch_id="b1", _ingested_at=T1)
+        # rating corrected DOWN 7.5 → 6.0 on re-scrape
+        _seed_fotmob_native_stat(duck_fotmob, "rating", old_value=7.5, new_value=6.0)
 
         # Act
         df = _run(duck_fotmob, FOTMOB_PLAYER_SQL)
@@ -238,15 +275,23 @@ class TestFotmobPivotLatestSnapshot:
         assert df.iloc[0]["fotmob_rating"] == pytest.approx(6.0), (
             "MAX(stat_value) over snapshots returned stale high instead of latest"
         )
+        # season-слаг обязан прийти из season_axis каркаса ('2024/2025' → '2425')
+        assert df.iloc[0]["season"] == "2425"
+        assert df.iloc[0]["league"] == "ENG-Premier League"
 
     def test_keeper_save_percentage_takes_latest_not_max(self, duck_fotmob):
-        # Arrange: save% corrected DOWN 80.0 → 72.0 on re-scrape
-        _insert(duck_fotmob, "fotmob_player_details",
+        # Arrange (native #930): season-ось + глобальный снапшот вратаря;
+        # членство в (лиге, сезоне) придёт из лидербордов (lb_player_scope).
+        _insert(duck_fotmob, "fotmob_competition_seasons_current",
+                competition_id="47", source_season_key="2024/2025",
+                is_selected=True, is_latest=True)
+        _insert(duck_fotmob, "fotmob_player_snapshots_current",
                 player_id="1", name="The Keeper", position_description="keeper",
                 is_coach=False, primary_team_id=99, primary_team_name="Test FC",
-                league="ENG-Premier League", season=2024,
-                _ingested_at=T1, _batch_id="b1")
-        _seed_fotmob_stat(duck_fotmob, "_save_percentage", old_value=80.0, new_value=72.0)
+                _observed_at=T1, _target_batch_id="b1", _ingested_at=T1)
+        # save% corrected DOWN 80.0 → 72.0 on re-scrape
+        _seed_fotmob_native_stat(duck_fotmob, "_save_percentage",
+                                 old_value=80.0, new_value=72.0)
 
         # Act
         df = _run(duck_fotmob, FOTMOB_KEEPER_SQL)
@@ -256,6 +301,9 @@ class TestFotmobPivotLatestSnapshot:
         assert df.iloc[0]["save_percentage"] == pytest.approx(72.0), (
             "MAX(stat_value) over snapshots returned stale high instead of latest"
         )
+        # season-слаг обязан прийти из season_axis каркаса ('2024/2025' → '2425')
+        assert df.iloc[0]["season"] == "2425"
+        assert df.iloc[0]["league"] == "ENG-Premier League"
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +312,10 @@ class TestFotmobPivotLatestSnapshot:
 # ---------------------------------------------------------------------------
 
 _TIEBREAKER = re.compile(r"_ingested_at\s+DESC\s*,\s*_batch_id\s+DESC", re.IGNORECASE)
+# native *_current (#930): _batch_id не существует — детерминированный
+# тайбрейкер там (_observed_at DESC, _target_batch_id DESC)
+_TIEBREAKER_NATIVE = re.compile(
+    r"_observed_at\s+DESC\s*,\s*(?:\w+\.)?_target_batch_id\s+DESC", re.IGNORECASE)
 
 
 def _windows(sql: str) -> list[tuple[str, str]]:
@@ -356,6 +408,8 @@ class TestFotmobPivotDedupStructure:
                         if "stat_name" in p.lower()]
         assert stat_windows, f"{path.name}: no PARTITION BY ... stat_name dedup window (#464)"
         for _, order in stat_windows:
-            assert _TIEBREAKER.search(order), (
+            # legacy bronze: (_ingested_at, _batch_id); native *_current (#930):
+            # (_observed_at, _target_batch_id) — _batch_id там не существует.
+            assert _TIEBREAKER.search(order) or _TIEBREAKER_NATIVE.search(order), (
                 f"{path.name}: stats dedup lacks deterministic tiebreaker (#464): {order!r}"
             )

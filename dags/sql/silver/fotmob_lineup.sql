@@ -2,11 +2,12 @@
 -- Silver: fotmob_lineup
 -- =============================================================================
 -- One row per (match_id, player_id) — per-match lineup parsed from FotMob
--- bronze.fotmob_match_details.lineup_json. Feeds the FotMob branch of
+-- bronze.fotmob_match_payloads_current.lineup_json. Feeds the FotMob branch of
 -- gold.fct_lineup (#693); grain mirrors silver.espn_lineup.
 --
--- Source:
---   bronze.fotmob_match_details.lineup_json
+-- Source (native cutover #930, was bronze.fotmob_match_details):
+--   bronze.fotmob_match_payloads_current.lineup_json (content.lineup verbatim,
+--   same JSON paths as legacy — probed live 2026-07-17)
 --
 -- lineup_json shape (probed live 2026-06-20, ENG-Premier League):
 --   { matchId, lineupType, source, availableFilters,
@@ -21,26 +22,43 @@
 --     so FotMob lineup ⊇ SofaScore (which only carries players who played).
 --   * Use the bronze `match_id` COLUMN downstream for xref_match, NOT
 --     lineup_json.matchId — they differ (bronze 4813664 vs json 5186383); the
---     xref_match bridge is keyed on the bronze id.
---   * NO isCaptain on lineup players (only the player_details endpoint has it)
+--     xref_match bridge is keyed on the bronze id. Native match_id is bigint →
+--     CAST to varchar to keep the Silver contract (fct_lineup/xref join on it).
+--   * NO isCaptain on lineup players (only the player endpoint has it)
 --     → is_captain = NULL. gold.fct_lineup enriches captaincy via SofaScore.
 --   * positionId is an int code (11=GK, ...) with no string label → store as
 --     varchar (raw passthrough; dim_position mapping deferred, as for FBref/ESPN).
 --   * shirtNumber is a string ('31') → TRY_CAST to integer for jersey_number.
---   * Season is bigint year-start (2025) at bronze level → emit slug '2526' to
---     match xref / other Silver (same conversion as fotmob_player_match_aggregate).
+--   * league: native carries competition_id (varchar in payloads) instead of a
+--     league string → INNER JOIN league_map (also scopes output to the legacy
+--     14-league surface; widening scope is a separate decision, not cutover).
+--   * season: native source_season_key is the exact source string ('2025/2026'
+--     club, '2026' single-year) → year = substr(key,1,4), then the SAME legacy
+--     slug CASE ('2526', WC '2026') — do NOT derive the slug from the key form.
+--   * dedup: *_current view is already one row per match (manifest identity
+--     entity_id = match_id) → legacy ROW_NUMBER dedup dropped.
 -- =============================================================================
 
-WITH match_dedup AS (
-    SELECT *,
-           ROW_NUMBER() OVER (
-               PARTITION BY match_id, league, season
-               ORDER BY _ingested_at DESC
-           ) AS rn
-    FROM iceberg.bronze.fotmob_match_details
-    WHERE lineup_json IS NOT NULL
-      AND lineup_json <> 'null'
-      AND lineup_json <> '{}'
+WITH league_map(competition_id, league) AS (
+    VALUES (47, 'ENG-Premier League'), (48, 'ENG-Championship'), (87, 'ESP-La Liga'),
+           (54, 'GER-Bundesliga'), (55, 'ITA-Serie A'), (53, 'FRA-Ligue 1'),
+           (57, 'NED-Eredivisie'), (61, 'POR-Primeira Liga'), (42, 'UEFA-Champions League'),
+           (73, 'UEFA-Europa League'), (77, 'INT-World Cup'), (50, 'INT-European Championship'),
+           (289, 'INT-Africa Cup of Nations'), (44, 'INT-Copa America')
+),
+
+match_scoped AS (
+    SELECT
+        CAST(p.match_id AS varchar) AS match_id,
+        lm.league,
+        TRY_CAST(substr(p.source_season_key, 1, 4) AS integer) AS season_year,
+        p._observed_at AS _ingested_at,
+        p.lineup_json
+    FROM iceberg.bronze.fotmob_match_payloads_current p
+    JOIN league_map lm ON lm.competition_id = CAST(p.competition_id AS bigint)
+    WHERE p.lineup_json IS NOT NULL
+      AND p.lineup_json <> 'null'
+      AND p.lineup_json <> '{}'
 ),
 
 base AS (
@@ -49,14 +67,13 @@ base AS (
         league,
         -- #913 Phase 2
         CASE WHEN league = 'INT-World Cup'
-             THEN LPAD(CAST(season AS varchar), 4, '0')
-             ELSE LPAD(CAST(MOD(season, 100) AS varchar), 2, '0')
-                  || LPAD(CAST(MOD(season + 1, 100) AS varchar), 2, '0')
+             THEN LPAD(CAST(season_year AS varchar), 4, '0')
+             ELSE LPAD(CAST(MOD(season_year, 100) AS varchar), 2, '0')
+                  || LPAD(CAST(MOD(season_year + 1, 100) AS varchar), 2, '0')
         END AS season,
         _ingested_at,
         lineup_json
-    FROM match_dedup
-    WHERE rn = 1
+    FROM match_scoped
 ),
 
 -- One row per (team-side × starter/sub × player). Four UNNEST branches because

@@ -3,9 +3,10 @@
 -- =============================================================================
 --
 -- Time-invariant snapshot per (player_id, league, season) для ТРЕНЕРОВ (coaches).
--- Зеркало silver.fotmob_player_profile, но `WHERE is_coach` (вместо NOT is_coach):
--- FotMob отдаёт тренеров в тех же двух bronze-таблицах, что и игроков, помечая их
--- `is_coach=true` (player_details) / `role='coach'` (team_squad).
+-- Зеркало silver.fotmob_player_profile, но для тренеров (`is_coach` /
+-- `member_type='coach'`): FotMob отдаёт тренеров в тех же native-снапшотах, что
+-- и игроков, помечая их `is_coach=true` (player_snapshots) /
+-- `member_type='coach'` (squad_snapshots).
 --
 -- Назначение — обогатить gold.dim_manager атрибутами nationality / dob (issue #434).
 -- xref_manager уже несёт coachId в source_id (source='fotmob'); dim_manager
@@ -13,77 +14,265 @@
 --
 -- Zerno: (player_id, league, season). `player_id` = FotMob coachId — СОВПАДАЕТ с
 -- silver.xref_manager.source_id (source='fotmob'), который берётся из того же
--- bronze.fotmob_player_details. Live APL 2025: 18 coaches, 100% country + dob.
+-- bronze.fotmob_player_snapshots_current.
+--
+-- Cutover #930: legacy bronze.fotmob_player_details / fotmob_team_squad →
+-- native fotmob_player_snapshots_current / fotmob_squad_snapshots_current.
+-- Native-снапшоты ГЛОБАЛЬНЫ (без league/season) → сезонный скоуп тренера
+-- реконструируется каркасом [CUTOVER-FRAMEWORK] ниже: клуб текущего сезона
+-- (season_teams × squad, member_type='coach'). Исторической глубины тренеров
+-- в native нет — как и в legacy (squad был снапшотом «сейчас»).
 --
 -- Sources (all from iceberg.bronze):
---   fotmob_player_details (d) — driver: WHERE is_coach. Несёт coachId (player_id),
---                                name, birth_date. Тот же источник coachId, что и
---                                xref_manager — гарантирует совпадение ключей.
---   fotmob_team_squad     (s) — role='coach': country (=nationality),
---                                date_of_birth (структурированные поля, не JSON).
---                                JOIN-ключ CAST(s.player_id AS VARCHAR) = d.player_id
---                                (team_squad.player_id — bigint, details — varchar).
+--   fotmob_player_snapshots_current (ps) — WHERE is_coach. Несёт coachId
+--                                (player_id, varchar), name, birth_date.
+--                                Тот же источник coachId, что и xref_manager —
+--                                гарантирует совпадение ключей.
+--   fotmob_squad_snapshots_current (sq) — member_type='coach':
+--                                country ← member_json $.cname (=nationality),
+--                                date_of_birth (structured). JOIN-ключ
+--                                member_id (varchar) = coach_id; team_id
+--                                varchar → CAST AS bigint к coach_scope.
+--   fotmob_season_teams_current / fotmob_competition_seasons_current —
+--                                каркас сезонного скоупа (см. блок ниже).
 --
 -- Pipeline (симметрично fotmob_player_profile):
---   1. details_dedup — ROW_NUMBER dedup на (player_id, league, season), is_coach.
---   2. squad_dedup   — то же для team_squad, role='coach'.
---   3. Final SELECT  — dob = COALESCE(squad.date_of_birth, details.birth_date);
+--   1. [CUTOVER-FRAMEWORK] league_map → season_axis → … → coach_scope.
+--   2. details_dedup — coach_scope × player_snapshots_current (is_coach),
+--      defensive ROW_NUMBER на (player_id, league, season).
+--   3. squad_dedup   — coach_scope × squad_snapshots_current (member_type='coach').
+--   4. Final SELECT  — dob = COALESCE(squad.date_of_birth, details.birth_date);
 --      nationality = squad.country. dob/nationality остаются varchar passthrough
 --      (bronze хранит ISO-строки) — gold.dim_manager делает TRY_CAST(.. AS DATE).
+--      season — ТОЛЬКО из season_axis (слаг считается в одном месте каркаса).
 -- =============================================================================
 
-WITH details_dedup AS (
-    SELECT
-        CAST(player_id AS VARCHAR) AS player_id,
-        name,
-        birth_date,
-        league,
-        season,
-        ROW_NUMBER() OVER (
-            PARTITION BY player_id, league, season
-            ORDER BY _ingested_at DESC
-        ) AS rn
-    FROM iceberg.bronze.fotmob_player_details
-    WHERE is_coach
+WITH
+-- ============================================================================
+-- [CUTOVER-FRAMEWORK #930] Сезонный скоуп для глобальных native-снапшотов.
+-- Синхронизируемая копия: НЕ менять имена CTE и выражение season-слага.
+-- Источник истины: /root/fotmob-runtime/cutover-framework.md
+-- ============================================================================
+
+-- 1) Обратная карта competition_id -> legacy league. INNER JOIN к ней — это
+--    ОДНОВРЕМЕННО скоуп-фильтр 14 лиг (native-каталог шире; см. пределы).
+league_map (competition_id, league) AS (
+    VALUES
+        (47,  'ENG-Premier League'),
+        (48,  'ENG-Championship'),
+        (87,  'ESP-La Liga'),
+        (54,  'GER-Bundesliga'),
+        (55,  'ITA-Serie A'),
+        (53,  'FRA-Ligue 1'),
+        (57,  'NED-Eredivisie'),
+        (61,  'POR-Primeira Liga'),
+        (42,  'UEFA-Champions League'),
+        (73,  'UEFA-Europa League'),
+        (77,  'INT-World Cup'),
+        (50,  'INT-European Championship'),
+        (289, 'INT-Africa Cup of Nations'),
+        (44,  'INT-Copa America')
 ),
 
-squad_dedup AS (
+-- 2) Ось сезонов: (competition_id, source_season_key) -> (league, season)
+--    + флаг текущего сезона. ЕДИНСТВЕННОЕ место вычисления season-слага.
+--    Правило season-ключа:
+--      * season_year = TRY_CAST(substr(source_season_key, 1, 4) AS integer) —
+--        корректно для обеих форм ключа ('2025/2026' -> 2025, '2025' -> 2025);
+--      * слаг — СУЩЕСТВУЮЩИЙ legacy-CASE по league, НИКОГДА не по форме ключа
+--        (single-year ключ AFCON обязан дать '2526', а не '2025' — иначе
+--        битовое расхождение с legacy silver и разрыв JOIN'ов xref);
+--      * is_current_season = is_selected OR is_latest (то, что источник сейчас
+--        показывает по умолчанию; live: comp 47 -> '2026/2027').
+season_axis AS (
     SELECT
-        CAST(player_id AS VARCHAR) AS player_id,
+        CAST(cs.competition_id AS bigint)  AS competition_id,   -- в этой таблице varchar
+        cs.source_season_key,
+        lm.league,
+        TRY_CAST(substr(cs.source_season_key, 1, 4) AS integer) AS season_year,
+        CASE WHEN lm.league = 'INT-World Cup'
+             THEN LPAD(CAST(TRY_CAST(substr(cs.source_season_key, 1, 4) AS integer)
+                            AS varchar), 4, '0')
+             ELSE LPAD(CAST(MOD(TRY_CAST(substr(cs.source_season_key, 1, 4) AS integer),
+                                100) AS varchar), 2, '0')
+               || LPAD(CAST(MOD(TRY_CAST(substr(cs.source_season_key, 1, 4) AS integer) + 1,
+                                100) AS varchar), 2, '0')
+        END                                AS season,
+        (cs.is_selected OR cs.is_latest)   AS is_current_season
+    FROM iceberg.bronze.fotmob_competition_seasons_current cs
+    JOIN league_map lm
+      ON lm.competition_id = CAST(cs.competition_id AS bigint)
+),
+
+-- 3) Вселенная команд сезона (season_teams УЖЕ per-season, скоуп не нужен —
+--    только league/season-атрибуция). team_id здесь bigint.
+team_scope AS (
+    SELECT
+        sa.league,
+        sa.season,
+        sa.competition_id,
+        sa.source_season_key,
+        sa.is_current_season,
+        st.team_id,                        -- bigint
+        st.team_name
+    FROM iceberg.bronze.fotmob_season_teams_current st
+    JOIN season_axis sa
+      ON  sa.competition_id    = st.competition_id
+      AND sa.source_season_key = st.source_season_key
+),
+
+-- 4) ТЕКУЩИЙ сезон: членство из живого ростера. squad_snapshots — глобальный
+--    снапшот «сейчас» (field_map: observed roster, never historical), поэтому
+--    клеится ТОЛЬКО к is_current_season — иначе сегодняшний состав налипнет
+--    на прошлые сезоны (легаси-баг seasonless_source_snapshot_replicated_as_
+--    _historical, который migrate_fotmob_native.py карантинит).
+squad_scope AS (
+    SELECT DISTINCT
+        ts.league,
+        ts.season,
+        ts.competition_id,
+        ts.source_season_key,
+        ts.team_id,                        -- bigint
+        sq.member_id,                      -- varchar (= legacy player_id в varchar)
+        sq.member_type                     -- 'player' | 'coach' (live: только эти два)
+    FROM team_scope ts
+    JOIN iceberg.bronze.fotmob_squad_snapshots_current sq
+      ON CAST(sq.team_id AS bigint) = ts.team_id   -- squad.team_id -- varchar!
+    WHERE ts.is_current_season
+),
+
+-- 5) ИСТОРИЯ (и текущий сезон тоже): членство игроков из per-season
+--    лидербордов — ровно та вселенная, по которой legacy silver реально
+--    отдавал статистику (LEFT JOIN stats). competition_id здесь bigint.
+lb_player_scope AS (
+    SELECT DISTINCT
+        sa.league,
+        sa.season,
+        sa.competition_id,
+        sa.source_season_key,
+        lb.team_id,                            -- bigint: клуб игрока в сезоне
+        CAST(lb.participant_id AS varchar)     AS member_id
+    FROM iceberg.bronze.fotmob_leaderboards_current lb
+    JOIN season_axis sa
+      ON  sa.competition_id    = lb.competition_id
+      AND sa.source_season_key = lb.source_season_key
+    WHERE lb.participant_type = 'player'
+),
+
+-- 6) Итоговое членство ИГРОКА в (лиге, сезоне): текущий сезон — ростер,
+--    история — лидерборды. UNION дедупит пересечение. team_id намеренно НЕ
+--    выносится (между ветками может отличаться при переходе внутри сезона) —
+--    клуб потребители берут из своей ветки (squad_scope / lb_player_scope).
+player_scope AS (
+    SELECT DISTINCT league, season, competition_id, source_season_key, player_id
+    FROM (
+        SELECT league, season, competition_id, source_season_key,
+               member_id AS player_id
+        FROM squad_scope
+        WHERE member_type = 'player'
+        UNION ALL
+        SELECT league, season, competition_id, source_season_key, member_id
+        FROM lb_player_scope
+    )
+),
+
+-- 7) Членство ТРЕНЕРА: только текущий сезон через клуб (в лидербордах
+--    тренеров нет; исторической глубины тренеров в native НЕТ — как и в
+--    legacy, где squad тоже был снапшотом «сейчас»).
+coach_scope AS (
+    SELECT
         league,
         season,
-        country,
-        date_of_birth,
-        _ingested_at,
+        competition_id,
+        source_season_key,
+        team_id,                           -- bigint
+        member_id AS coach_id              -- varchar (= coachId = player_id)
+    FROM squad_scope
+    WHERE member_type = 'coach'
+),
+
+-- ОПЦИОНАЛЬНО (НЕ включать в cutover без решения владельца): расширение
+-- исторической вселенной всеми, кто попал в player-статистику матчей.
+-- Живьём шире лидербордов (comp 289 сезон '2023': 653 vs 510 игроков).
+-- , match_player_scope AS (
+--     SELECT DISTINCT
+--         sa.league, sa.season, sa.competition_id, sa.source_season_key,
+--         t.pid AS member_id                 -- varchar (ключи player_stats_json)
+--     FROM iceberg.bronze.fotmob_match_payloads_current p
+--     JOIN season_axis sa
+--       ON  sa.competition_id    = CAST(p.competition_id AS bigint)  -- payloads: varchar!
+--       AND sa.source_season_key = p.source_season_key
+--     CROSS JOIN UNNEST(
+--         map_keys(CAST(json_parse(p.player_stats_json) AS map(varchar, json)))
+--     ) AS t(pid)
+--     WHERE p.player_stats_json IS NOT NULL
+--       AND p.player_stats_json <> 'null'
+--       AND p.player_stats_json <> '{}'
+-- )
+-- ============================================================================
+-- [/CUTOVER-FRAMEWORK]
+-- ============================================================================
+
+-- details_dedup: драйвер — coach_scope (даёт league/season), снапшот тренера
+-- подклеивается по id. player_id в native уже varchar — CAST не нужен.
+-- ROW_NUMBER defensive: `_current` даёт одну строку на player_id, но тренер,
+-- сменивший клуб в сезоне, даст 2 строки в coach_scope — дедуп схлопывает.
+details_dedup AS (
+    SELECT
+        cs.league,
+        cs.season,
+        ps.player_id,
+        ps.name,
+        ps.birth_date,
         ROW_NUMBER() OVER (
-            PARTITION BY player_id, league, season
-            ORDER BY _ingested_at DESC
+            PARTITION BY ps.player_id, cs.league, cs.season
+            ORDER BY ps._observed_at DESC, ps._target_batch_id DESC
         ) AS rn
-    FROM iceberg.bronze.fotmob_team_squad
-    WHERE role = 'coach'
+    FROM coach_scope cs
+    JOIN iceberg.bronze.fotmob_player_snapshots_current ps
+      ON ps.player_id = cs.coach_id
+    WHERE ps.is_coach
+),
+
+-- squad_dedup: атрибуты тренера из ростера клуба сезона.
+-- member_type='coach' — замена legacy role='coach' (cutover-mapping §3.4);
+-- country ← member_json $.cname (типизированной колонки в native нет).
+squad_dedup AS (
+    SELECT
+        sq.member_id AS player_id,         -- varchar (= legacy CAST(player_id AS VARCHAR))
+        cs.league,
+        cs.season,
+        json_extract_scalar(sq.member_json, '$.cname') AS country,
+        sq.date_of_birth,
+        sq._observed_at,
+        ROW_NUMBER() OVER (
+            PARTITION BY sq.member_id, cs.league, cs.season
+            ORDER BY sq._observed_at DESC, sq._target_batch_id DESC
+        ) AS rn
+    FROM coach_scope cs
+    JOIN iceberg.bronze.fotmob_squad_snapshots_current sq
+      ON  sq.member_id = cs.coach_id
+      AND CAST(sq.team_id AS bigint) = cs.team_id
+      AND sq.member_type = 'coach'
 )
 
 SELECT
     d.player_id,
     d.name,
 
-    -- dob: team_squad — основной источник (structured), birth_date из
-    -- player_details — fallback. Оба varchar (ISO) → gold делает TRY_CAST.
+    -- dob: squad_snapshots — основной источник (structured), birth_date из
+    -- player_snapshots — fallback. Оба varchar (ISO) → gold делает TRY_CAST.
     COALESCE(s.date_of_birth, d.birth_date)          AS date_of_birth,
     s.country                                        AS nationality,
 
     -- ========= Lineage =========
-    s._ingested_at                                   AS _bronze_ingested_at,
+    -- _batch_id/_ingested_at в native нет — lineage-замена _observed_at.
+    s._observed_at                                   AS _bronze_ingested_at,
 
     -- ========= Partition Keys =========
-    -- season → slug ('2425'); FotMob bronze stores year-start bigint (2024).
+    -- season — слаг из season_axis каркаса (ЕДИНСТВЕННОЕ место вычисления).
     d.league,
-    -- #913 Phase 2
-    CASE WHEN d.league = 'INT-World Cup'
-         THEN LPAD(CAST(d.season AS varchar), 4, '0')
-         ELSE LPAD(CAST(MOD(d.season, 100) AS varchar), 2, '0')
-              || LPAD(CAST(MOD(d.season + 1, 100) AS varchar), 2, '0')
-    END AS season
+    d.season
 
 FROM details_dedup d
 LEFT JOIN squad_dedup s
