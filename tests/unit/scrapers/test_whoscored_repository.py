@@ -4,6 +4,7 @@ from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 import json
 import re
+import sqlite3
 import tracemalloc
 from unittest.mock import MagicMock
 
@@ -2474,6 +2475,48 @@ def test_scope_row_spool_rolls_back_a_partial_stage_atomically(tmp_path):
         assert [row["stage_id"] for row in spool] == [23752]
         assert "partial_only_column" not in spool.columns
         assert spool.content_fingerprint() == committed_fingerprint
+    finally:
+        spool.close()
+
+
+@pytest.mark.unit
+def test_scope_row_spool_preserves_sqlite_full_error_after_auto_rollback(tmp_path):
+    spool = WhoScoredScopeRowSpool(
+        table="whoscored_team_stage_stats",
+        league="INT-World Cup",
+        season="2026",
+        directory=str(tmp_path),
+    )
+    try:
+        page_size = int(spool._connection.execute("PRAGMA page_size").fetchone()[0])
+        configured_max = int(
+            spool._connection.execute("PRAGMA max_page_count").fetchone()[0]
+        )
+        assert page_size * configured_max == 1024**3
+        page_count = int(spool._connection.execute("PRAGMA page_count").fetchone()[0])
+        spool._connection.execute(f"PRAGMA max_page_count={page_count}")
+        spool.begin_stage()
+
+        with pytest.raises(sqlite3.OperationalError, match="database or disk is full"):
+            try:
+                spool.append_entity_rows(
+                    [
+                        {
+                            "league": "INT-World Cup",
+                            "season": "2026",
+                            "stage_id": 23752,
+                            "large_value": "x" * (1024 * 1024),
+                        }
+                    ]
+                )
+            except sqlite3.OperationalError:
+                assert spool._connection.in_transaction is False
+                spool.rollback_stage()
+                raise
+
+        assert len(spool) == 0
+        assert spool.columns == frozenset()
+        assert spool._stage_snapshot is None
     finally:
         spool.close()
 

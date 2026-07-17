@@ -388,6 +388,7 @@ def test_workflow_gets_protected_capacity_control_pipe(monkeypatch):
     monkeypatch.setenv("LD_LIBRARY_PATH", "/tmp/libs")
     monkeypatch.setenv("WHOSCORED_SOURCE_CIRCUIT_PATH", "/tmp/attacker.json")
     monkeypatch.setenv("WHOSCORED_SOURCE_CIRCUIT_WAIT", "0")
+    monkeypatch.setenv("WHOSCORED_SCOPE_SPOOL_DIR", "/tmp/attacker-spool")
 
     class Workflow:
         pass
@@ -425,6 +426,9 @@ def test_workflow_gets_protected_capacity_control_pipe(monkeypatch):
         "/run/whoscored-source/source-circuit-v1.json"
     )
     assert captured["kwargs"]["env"]["WHOSCORED_SOURCE_CIRCUIT_WAIT"] == "1"
+    assert captured["kwargs"]["env"]["WHOSCORED_SCOPE_SPOOL_DIR"] == (
+        "/run/whoscored-source"
+    )
 
 
 @pytest.mark.unit

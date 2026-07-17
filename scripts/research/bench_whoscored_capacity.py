@@ -111,6 +111,7 @@ REQUIRED_UNSHARE_SHA256 = (
     "51bcc77ba5db162c80028f861f0a2770d728c1de80773816d863f28d7a817adb"
 )
 WORKER_COUNT = 4
+_CAPACITY_BOOTSTRAP_LIVENESS_EXIT_CODE = 70
 DEFAULT_DURATION_SECONDS = 6 * 60 * 60
 DEFAULT_SAMPLE_INTERVAL_SECONDS = 30.0
 DEFAULT_SCOPES = ("INT-World Cup=2026", "ENG-Premier League=2526")
@@ -2314,7 +2315,7 @@ def _accept_outcome(accumulator: CapacityAccumulator, outcome: WorkerOutcome) ->
     if summary["status"] == "deadline_terminated":
         accumulator.deadline_truncations += 1
         return
-    if summary["status"] == "aborted_by_gate":
+    if summary["status"] in {"aborted_by_gate", "aborted_by_peer_failure"}:
         return
     if summary["traffic_evidence_valid"] is not True:
         accumulator.traffic_evidence_violations.append(
@@ -2342,6 +2343,30 @@ def _accept_outcome(accumulator: CapacityAccumulator, outcome: WorkerOutcome) ->
     accumulator.max_source_stage_count = max(
         accumulator.max_source_stage_count,
         int(summary["source_stage_count"]),
+    )
+
+
+def _is_reportable_container_worker_failure(
+    lifecycle_outcome: Any,
+    worker_result: Any,
+    returncode: object,
+) -> bool:
+    """Accept child evidence only for one fully captured worker exit."""
+
+    return (
+        getattr(lifecycle_outcome, "status", None) == "failed"
+        and getattr(lifecycle_outcome, "reason", None)
+        == "a worker exited unsuccessfully"
+        and getattr(lifecycle_outcome, "released", None) is True
+        and type(returncode) is int
+        and returncode not in (0, _CAPACITY_BOOTSTRAP_LIVENESS_EXIT_CODE)
+        and worker_result is not None
+        and getattr(worker_result, "output_complete", None) is True
+        and type(getattr(worker_result, "attach_returncode", None)) is int
+        and worker_result.attach_returncode == returncode
+        and isinstance(getattr(worker_result, "stdout_json", None), Mapping)
+        and type(getattr(worker_result, "stderr_bytes", None)) is int
+        and worker_result.stderr_bytes >= 0
     )
 
 
@@ -4020,14 +4045,71 @@ def _run_container_round(
             )
         return
 
+    reportable_failures = {
+        (command.worker_id, command.iteration)
+        for command in pending_commands
+        if _is_reportable_container_worker_failure(
+            outcome,
+            terminal_results.get((command.worker_id, command.iteration)),
+            outcome.exit_codes[command.worker_id],
+        )
+    }
     for command in pending_commands:
         key = (command.worker_id, command.iteration)
+        result = terminal_results.get(key)
+        returncode = outcome.exit_codes[command.worker_id]
+        if key in reportable_failures:
+            on_outcome(
+                WorkerOutcome(
+                    worker_id=command.worker_id,
+                    iteration=command.iteration,
+                    scope=command.scope,
+                    returncode=returncode,
+                    report=result.stdout_json,
+                    elapsed_seconds=max(
+                        0.0, monotonic() - worker_started_at[key]
+                    ),
+                    stderr_bytes=result.stderr_bytes,
+                    stderr_sha256=result.stderr_sha256,
+                )
+            )
+            continue
+        if (
+            reportable_failures
+            and returncode == _CAPACITY_BOOTSTRAP_LIVENESS_EXIT_CODE
+        ):
+            on_outcome(
+                WorkerOutcome(
+                    worker_id=command.worker_id,
+                    iteration=command.iteration,
+                    scope=command.scope,
+                    returncode=returncode,
+                    report=None,
+                    elapsed_seconds=max(
+                        0.0, monotonic() - worker_started_at[key]
+                    ),
+                    stderr_bytes=(
+                        result.stderr_bytes
+                        if result is not None
+                        and type(result.stderr_bytes) is int
+                        and result.stderr_bytes >= 0
+                        else 0
+                    ),
+                    stderr_sha256=(
+                        result.stderr_sha256
+                        if result is not None
+                        else hashlib.sha256(b"").hexdigest()
+                    ),
+                    termination_reason="aborted_by_peer_failure",
+                )
+            )
+            continue
         on_outcome(
             WorkerOutcome(
                 worker_id=command.worker_id,
                 iteration=command.iteration,
                 scope=command.scope,
-                returncode=outcome.exit_codes[command.worker_id],
+                returncode=returncode,
                 report=None,
                 elapsed_seconds=max(
                     0.0, monotonic() - worker_started_at[key]

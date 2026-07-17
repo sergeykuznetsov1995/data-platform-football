@@ -126,6 +126,7 @@ SCOPE_SHRINKABLE_DATASET_TABLES = {"whoscored_match_bets"}
 DEFAULT_SCOPE_WRITE_CHUNK_ROWS = 20_000
 MAX_SCOPE_WRITE_CHUNK_ROWS = 100_000
 _SPOOL_INSERT_BATCH_ROWS = 256
+_SCOPE_SPOOL_DB_MAX_BYTES = 1024**3
 
 
 def scope_write_chunk_rows_from_env(
@@ -195,6 +196,15 @@ class WhoScoredScopeRowSpool:
         os.chmod(self._temporary.name, 0o700)
         self.path = Path(self._temporary.name) / "rows.sqlite3"
         self._connection = sqlite3.connect(str(self.path))
+        page_size = int(self._connection.execute("PRAGMA page_size").fetchone()[0])
+        max_page_count = _SCOPE_SPOOL_DB_MAX_BYTES // page_size
+        applied_max = int(
+            self._connection.execute(
+                f"PRAGMA max_page_count={max_page_count}"
+            ).fetchone()[0]
+        )
+        if applied_max != max_page_count:
+            raise RuntimeError("WhoScored scope spool disk ceiling was not applied")
         # A disk journal keeps per-stage rollback bounded by disk rather than
         # retaining the undo log in Python/SQLite heap memory.
         self._connection.execute("PRAGMA journal_mode=DELETE")
@@ -239,8 +249,13 @@ class WhoScoredScopeRowSpool:
         if self._stage_snapshot is None:
             return
         count, columns = self._stage_snapshot
-        self._connection.execute("ROLLBACK TO SAVEPOINT source_stage")
-        self._connection.execute("RELEASE SAVEPOINT source_stage")
+        # SQLITE_FULL/IOERR can roll back the whole transaction itself.  In
+        # that case the savepoint is already gone even though our Python
+        # snapshot still exists; attempting ROLLBACK TO would replace the
+        # useful primary error with ``no such savepoint``.
+        if self._connection.in_transaction:
+            self._connection.execute("ROLLBACK TO SAVEPOINT source_stage")
+            self._connection.execute("RELEASE SAVEPOINT source_stage")
         self._count = count
         self._columns = columns
         self._stage_snapshot = None

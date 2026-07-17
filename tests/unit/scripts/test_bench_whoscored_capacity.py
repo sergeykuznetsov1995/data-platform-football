@@ -3594,6 +3594,9 @@ def test_container_runtime_tree_is_materialized_at_exact_owner_path():
         assert runtime.session_owner == owner
         assert runtime.pending_runtime_tree_files is None
         assert (runtime.runtime_root / "payload.py").read_bytes() == b"VALUE = 1\n"
+        leftover_spool = runtime.source_circuit_root / "whoscored-scope-leftover"
+        leftover_spool.mkdir(mode=0o700)
+        (leftover_spool / "rows.sqlite3").write_bytes(b"temporary spool")
     finally:
         runtime.close()
     assert not expected_owner_root.exists()
@@ -3830,6 +3833,140 @@ def test_container_round_streams_result_then_advances_only_that_slot(tmp_path):
     ]
     assert outcomes[0].report == {"worker": 0}
     assert all(item.termination_reason == "aborted_by_gate" for item in outcomes[1:])
+
+
+def test_container_round_keeps_primary_failure_and_marks_peer_aborts(tmp_path):
+    deployment = _production_deployment(tmp_path)
+    owner = "a" * 24
+    commands = capacity._build_commands(
+        _args(catalog=str(capacity.REPO_ROOT / "configs/medallion/competitions.yaml")),
+        7,
+        browser_session_owner=owner,
+    )
+    report = _workflow_report(page_units=9, source_request_attempts=12)
+    report.update(status="failed", error="OperationalError: no such savepoint")
+
+    class WorkerSpec:
+        def __init__(self, *, worker_index, workload_argv, iteration):
+            self.worker_index = worker_index
+            self.workload_argv = workload_argv
+            self.iteration = iteration
+
+    def result(worker_index, worker_report, *, stderr_bytes=0):
+        return SimpleNamespace(
+            worker_index=worker_index,
+            iteration=7,
+            stdout_json=worker_report,
+            stderr_bytes=stderr_bytes,
+            stderr_sha256=hashlib.sha256(b"stderr"[:stderr_bytes]).hexdigest(),
+            attach_returncode=(1 if worker_index == 3 else 70),
+            output_complete=True,
+        )
+
+    def run_capacity_containers(**kwargs):
+        outcome = SimpleNamespace(
+            status="failed",
+            reason="a worker exited unsuccessfully",
+            released=True,
+            cleanup_complete=True,
+            exit_codes=(70, 70, 70, 1),
+            worker_results=(
+                result(0, None),
+                result(1, None),
+                result(2, None),
+                result(3, report, stderr_bytes=6),
+            ),
+        )
+        kwargs["on_outcome"](outcome)
+        return outcome
+
+    worker_runtime = capacity.AdmittedWorkerRuntime(
+        bundle_fd=-1,
+        helper_fd=-1,
+        catalog_fd=-1,
+        python_fd=-1,
+        unshare_fd=-1,
+        site_packages=Path("/nonexistent"),
+        file_sha256={},
+        bundle_sha256="0" * 64,
+        runtime_root=tmp_path / "runtime",
+        source_circuit_root=tmp_path / "source",
+        execution_mode="exact-scheduler-image-v1",
+        container_runtime_module=SimpleNamespace(
+            WorkerSpec=WorkerSpec,
+            run_capacity_containers=run_capacity_containers,
+        ),
+    )
+    outcomes = []
+
+    capacity._run_container_round(
+        commands,
+        deployment=deployment,
+        worker_runtime=worker_runtime,
+        deadline=time.monotonic() + 60,
+        on_sample=lambda _force: None,
+        on_outcome=outcomes.append,
+        should_stop=lambda: False,
+        before_launch=lambda: None,
+        monotonic=time.monotonic,
+        sleep=lambda _seconds: None,
+    )
+
+    assert [item.termination_reason for item in outcomes] == [
+        "aborted_by_peer_failure",
+        "aborted_by_peer_failure",
+        "aborted_by_peer_failure",
+        None,
+    ]
+    assert outcomes[3].report == report
+    assert outcomes[3].returncode == 1
+    assert outcomes[3].stderr_bytes == 6
+
+    accumulator = capacity.CapacityAccumulator()
+    for outcome in outcomes:
+        capacity._accept_outcome(accumulator, outcome)
+
+    assert accumulator.source_request_attempts == 12
+    assert accumulator.paid_bytes == 0
+    assert accumulator.paid_route_requests == 0
+    assert accumulator.traffic_evidence_violations == []
+    assert accumulator.safety_violations == []
+    assert len(accumulator.worker_errors) == 1
+    assert [item["status"] for item in accumulator.run_summaries] == [
+        "aborted_by_peer_failure",
+        "aborted_by_peer_failure",
+        "aborted_by_peer_failure",
+        "failed",
+    ]
+
+
+def test_reportable_container_failure_requires_exact_lifecycle_evidence():
+    outcome = SimpleNamespace(
+        status="failed",
+        reason="a worker exited unsuccessfully",
+        released=True,
+    )
+    result = SimpleNamespace(
+        output_complete=True,
+        attach_returncode=1,
+        stdout_json={"status": "failed"},
+        stderr_bytes=0,
+    )
+
+    assert capacity._is_reportable_container_worker_failure(outcome, result, 1)
+
+    for changed_outcome, changed_result, returncode in (
+        (SimpleNamespace(**{**vars(outcome), "reason": "capture failed"}), result, 1),
+        (SimpleNamespace(**{**vars(outcome), "released": False}), result, 1),
+        (outcome, SimpleNamespace(**{**vars(result), "output_complete": False}), 1),
+        (outcome, SimpleNamespace(**{**vars(result), "attach_returncode": 2}), 1),
+        (outcome, result, 70),
+    ):
+        assert not capacity._is_reportable_container_worker_failure(
+            changed_outcome,
+            changed_result,
+            returncode,
+        )
 
 
 def test_stale_container_cleanup_uses_persisted_image_and_blocks_legacy():

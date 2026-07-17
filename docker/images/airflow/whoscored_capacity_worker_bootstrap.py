@@ -50,7 +50,8 @@ MAX_ARGV_ITEMS = 64
 MAX_ARG_BYTES = 4096
 MAX_ARGV_BYTES = 32 * 1024
 CAPACITY_FLARESOLVERR_ENDPOINT = "http://127.0.0.1:8191"
-SOURCE_CIRCUIT_PATH = "/run/whoscored-source/source-circuit-v1.json"
+SOURCE_CIRCUIT_ROOT = "/run/whoscored-source"
+SOURCE_CIRCUIT_PATH = f"{SOURCE_CIRCUIT_ROOT}/source-circuit-v1.json"
 
 _OWNER = re.compile(r"\A[a-z0-9]{16,32}\Z")
 _CONTROL_FIELDS = {
@@ -321,6 +322,10 @@ def _child_environment() -> dict[str, str]:
     environment["LD_LIBRARY_PATH"] = ""
     environment["WHOSCORED_SOURCE_CIRCUIT_PATH"] = SOURCE_CIRCUIT_PATH
     environment["WHOSCORED_SOURCE_CIRCUIT_WAIT"] = "1"
+    # Scope rows can exceed the deliberately small /tmp tmpfs.  Keep their
+    # SQLite spools on the already admitted, owner-private host-disk bind;
+    # the supervisor removes the whole owner tree after every cohort.
+    environment["WHOSCORED_SCOPE_SPOOL_DIR"] = SOURCE_CIRCUIT_ROOT
     return environment
 
 
