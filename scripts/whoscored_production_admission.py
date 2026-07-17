@@ -41,6 +41,10 @@ sys = _bootstrap_sys
 
 _SCRIPT_PATH = Path(os.path.abspath(__file__))
 _REPOSITORY_ROOT = _SCRIPT_PATH.parents[1]
+_WHOSCORED_APPROVAL_PATH_RE = re.compile(
+    r"/opt/airflow/secure/whoscored-approvals/"
+    r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\.json"
+)
 
 
 def _load_exact_provenance_validator() -> types.ModuleType:
@@ -968,7 +972,6 @@ _FIXED_ENVIRONMENT = {
         "WHOSCORED_LOCK_DIR": "/opt/airflow/logs/whoscored/commit_locks",
         "WHOSCORED_OPS_STORE_URI": "s3://warehouse/ops/whoscored",
         "WHOSCORED_PAID_GATEWAY_URL": "http://whoscored_paid_gateway:8898",
-        "WHOSCORED_PROXY_APPROVAL_PATH": "",
         "WHOSCORED_PROXY_APPROVAL_ROOT": ("/opt/airflow/secure/whoscored-approvals"),
         "WHOSCORED_PROXY_CAMPAIGN_LEDGER_PATH": (
             "/opt/airflow/state/whoscored-proxy-filter/whoscored_campaigns.json"
@@ -1499,6 +1502,9 @@ def _validate_rendered_environment(
     ) not in {"2", "3", "4"}:
         raise AdmissionError("rendered WhoScored source-pool size differs")
     if service == "airflow-scheduler":
+        approval_path = environment.get("WHOSCORED_PROXY_APPROVAL_PATH", "")
+        if approval_path and _WHOSCORED_APPROVAL_PATH_RE.fullmatch(approval_path) is None:
+            raise AdmissionError("rendered WhoScored approval path differs")
         if len(environment.get("FBREF_PROXY_CONTROL_TOKEN", "").strip()) < 32:
             raise AdmissionError("rendered FBref proxy-control token is invalid")
         tm_boolean_names = (

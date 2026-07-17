@@ -924,6 +924,65 @@ def test_scheduler_admission_requires_gateway_token_and_forbids_raw_origins():
             )
 
 
+def test_scheduler_admission_accepts_exact_selected_approval_path():
+    environment = _rendered_environment("airflow-scheduler")
+    environment["WHOSCORED_PROXY_APPROVAL_PATH"] = (
+        "/opt/airflow/secure/whoscored-approvals/"
+        "ws-measurement-20260717-v1.json"
+    )
+
+    admission._validate_rendered_environment(
+        environment,
+        service="airflow-scheduler",
+    )
+
+
+@pytest.mark.parametrize(
+    "approval_path",
+    (
+        "/tmp/approval.json",
+        "/opt/airflow/secure/whoscored-approvals/.json",
+        "/opt/airflow/secure/whoscored-approvals/../approval.json",
+        "/opt/airflow/secure/whoscored-approvals/nested/approval.json",
+        "/opt/airflow/secure/whoscored-approvals/approval",
+        "/opt/airflow/secure/whoscored-approvals/approval.json.bak",
+        "/opt/airflow/secure/whoscored-approvals/approval.json/extra",
+        "/opt/airflow/secure/whoscored-approvals/-approval.json",
+        "/opt/airflow/secure/whoscored-approvals/approval id.json",
+        "/opt/airflow/secure/whoscored-approvals/" + "a" * 129 + ".json",
+    ),
+)
+def test_scheduler_admission_rejects_unowned_approval_path(
+    approval_path: str,
+):
+    environment = _rendered_environment("airflow-scheduler")
+    environment["WHOSCORED_PROXY_APPROVAL_PATH"] = approval_path
+
+    with pytest.raises(admission.AdmissionError, match="approval path"):
+        admission._validate_rendered_environment(
+            environment,
+            service="airflow-scheduler",
+        )
+
+
+def test_rendered_compose_accepts_exact_selected_approval_path():
+    rendered = _rendered()
+    scheduler = rendered["services"]["airflow-scheduler"]
+    scheduler["environment"]["WHOSCORED_PROXY_APPROVAL_PATH"] = (
+        "/opt/airflow/secure/whoscored-approvals/"
+        "ws-measurement-20260717-v1.json"
+    )
+
+    projections = admission.verify_rendered_compose(rendered, BINDINGS)
+
+    assert dict(projections["airflow-scheduler"]["environment"])[
+        "WHOSCORED_PROXY_APPROVAL_PATH"
+    ] == (
+        "/opt/airflow/secure/whoscored-approvals/"
+        "ws-measurement-20260717-v1.json"
+    )
+
+
 def test_scheduler_admission_preserves_metered_transfermarkt_controls():
     environment = _rendered_environment("airflow-scheduler")
     _enable_metered_transfermarkt(environment)

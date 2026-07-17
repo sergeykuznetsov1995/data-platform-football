@@ -285,23 +285,32 @@ file after signing.
 Verify the mounted bytes and current validity:
 
 ```bash
-approval_digest="$(docker exec -i airflow-scheduler python - <<'PY'
-import hashlib, os, stat
+read -r mounted_file_sha256 mounted_approval_sha256 <<EOF
+$(docker exec -i airflow-scheduler python - <<'PY'
+import hashlib, json, os, stat
 from pathlib import Path
+
+from scrapers.whoscored.proxy_campaign import ProxyCampaignApproval
 
 path = Path(os.environ["WHOSCORED_PROXY_APPROVAL_PATH"])
 metadata = path.stat(follow_symlinks=False)
 assert metadata.st_uid == os.geteuid() == 50000
 assert stat.S_IMODE(metadata.st_mode) == 0o600
 assert path.name == "ws-measurement-YYYYMMDD-v1.json"
-print(hashlib.sha256(path.read_bytes()).hexdigest())
+payload = path.read_bytes()
+approval = ProxyCampaignApproval.from_dict(json.loads(payload))
+approval.verify_digest()
+approval.verify_validity()
+print(hashlib.sha256(payload).hexdigest(), approval.approval_sha256)
 PY
-)"
-test -n "$approval_digest"
-test "$approval_digest" = '<approval_sha256 from sign/verify>'
+)
+EOF
+test "$mounted_file_sha256" = '<SHA-256 of the reviewed signed JSON file>'
+test "$mounted_approval_sha256" = '<approval_sha256 from sign/verify>'
 ```
 
-Compare the printed digest with the reviewed signing output. This scheduler
+Compare the whole-file digest with `sha256sum` of the reviewed signed JSON and
+compare the embedded approval digest with the signing output. This scheduler
 check proves only the selected bytes and structural identity. Runtime HMAC
 verification happens in the gateway and filter before campaign mutation or
 lease creation. The offline signing workspace and key file are never mounted
