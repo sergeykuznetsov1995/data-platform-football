@@ -300,13 +300,10 @@ RUN PIP_FIND_LINKS=/tmp/whoscored-wheelhouse \
 # verify its digest and byte size before offline extraction. SofaScore's paid
 # runtime remains on the measured v135 browser in its package-default cache;
 # FBref's v152 browser lives only in its explicit /opt tree.
-ARG SOFASCORE_CAMOUFOX_VERSION=135.0.1
-ARG SOFASCORE_CAMOUFOX_RELEASE=beta.24
-ARG SOFASCORE_CAMOUFOX_SHA256=61e1ec455e021720af38a5cc5ff7566121363cb5b82b72f24e381ba2676a4888
 RUN curl --proto '=https' --tlsv1.2 --proto-redir '=https' -fsSL \
-      "https://github.com/daijro/camoufox/releases/download/v${SOFASCORE_CAMOUFOX_VERSION}-${SOFASCORE_CAMOUFOX_RELEASE}/camoufox-${SOFASCORE_CAMOUFOX_VERSION}-${SOFASCORE_CAMOUFOX_RELEASE}-lin.x86_64.zip" \
+      "https://github.com/daijro/camoufox/releases/download/v135.0.1-beta.24/camoufox-135.0.1-beta.24-lin.x86_64.zip" \
       -o /tmp/sofascore-camoufox.zip \
-    && echo "${SOFASCORE_CAMOUFOX_SHA256}  /tmp/sofascore-camoufox.zip" \
+    && echo "61e1ec455e021720af38a5cc5ff7566121363cb5b82b72f24e381ba2676a4888  /tmp/sofascore-camoufox.zip" \
         | sha256sum -c - \
     && test "$(stat -c %s /tmp/sofascore-camoufox.zip)" -eq 712711368
 RUN --network=none rm -rf /home/airflow/.cache/camoufox \
@@ -315,19 +312,16 @@ RUN --network=none rm -rf /home/airflow/.cache/camoufox \
       -e /tmp/sofascore-camoufox.zip \
       /home/airflow/.cache/camoufox \
     && printf '%s\n' \
-      "{\"version\":\"${SOFASCORE_CAMOUFOX_VERSION}\",\"release\":\"${SOFASCORE_CAMOUFOX_RELEASE}\"}" \
+      "{\"version\":\"135.0.1\",\"release\":\"beta.24\"}" \
       > /home/airflow/.cache/camoufox/version.json \
     && chmod -R 0755 /home/airflow/.cache/camoufox \
     && test -x /home/airflow/.cache/camoufox/camoufox-bin \
     && rm -f /tmp/sofascore-camoufox.zip
 
-ARG FBREF_CAMOUFOX_VERSION=152.0.4
-ARG FBREF_CAMOUFOX_RELEASE=beta.26
-ARG FBREF_CAMOUFOX_SHA256=a03872a221ab766f58d04fdaf0d7f3431c2662d5086844c67d2fc01154ebc1f8
 RUN curl --proto '=https' --tlsv1.2 --proto-redir '=https' -fsSL \
-      "https://github.com/daijro/camoufox/releases/download/v${FBREF_CAMOUFOX_VERSION}-${FBREF_CAMOUFOX_RELEASE}/camoufox-${FBREF_CAMOUFOX_VERSION}-${FBREF_CAMOUFOX_RELEASE}-lin.x86_64.zip" \
+      "https://github.com/daijro/camoufox/releases/download/v152.0.4-beta.26/camoufox-152.0.4-beta.26-lin.x86_64.zip" \
       -o /tmp/fbref-camoufox.zip \
-    && echo "${FBREF_CAMOUFOX_SHA256}  /tmp/fbref-camoufox.zip" \
+    && echo "a03872a221ab766f58d04fdaf0d7f3431c2662d5086844c67d2fc01154ebc1f8  /tmp/fbref-camoufox.zip" \
         | sha256sum -c - \
     && test "$(stat -c %s /tmp/fbref-camoufox.zip)" -eq 663773735
 RUN --network=none rm -rf \
@@ -340,7 +334,7 @@ RUN --network=none rm -rf /opt/fbref-camoufox \
     && /usr/local/bin/python -S -m zipfile \
       -e /tmp/fbref-camoufox.zip /opt/fbref-camoufox \
     && printf '%s\n' \
-      "{\"version\":\"${FBREF_CAMOUFOX_VERSION}\",\"release\":\"${FBREF_CAMOUFOX_RELEASE}\"}" \
+      "{\"version\":\"152.0.4\",\"release\":\"beta.26\"}" \
       > /opt/fbref-camoufox/version.json \
     && chown -R root:root /opt/fbref-camoufox \
     && chmod -R 0755 /opt/fbref-camoufox \
@@ -355,11 +349,11 @@ RUN --network=none chmod 0444 /opt/tls-client/tls-client.so
 ENV TLS_LIBRARY_PATH=/opt/tls-client/tls-client.so
 
 USER airflow
-# BuildKit's default RUN sandbox cannot provide the X11 runtime that Camoufox's
-# virtual-headless mode owns.  Keep this as a real offline browser launch, but
-# use Firefox's native headless mode here; CI launches the same pinned binary in
-# virtual-headless mode from the finished, production-shaped container.
-RUN --network=none /opt/legacy-scraper-venv/bin/python -I -c "from camoufox.addons import DefaultAddons; from camoufox.sync_api import Camoufox; cm = Camoufox(headless=True, executable_path='/opt/fbref-camoufox/camoufox-bin', ff_version=152, i_know_what_im_doing=True, exclude_addons=list(DefaultAddons)); browser = cm.__enter__(); ua = browser.new_page().evaluate('navigator.userAgent'); cm.__exit__(None, None, None); assert 'Firefox/152.0' in ua, ua"
+# BuildKit's RUN sandbox cannot provide the user namespaces and graphics
+# runtime needed by this Firefox build, even in native headless mode.  The
+# downloaded asset is still digest-, size-, version-, and executable-checked
+# above. CI launches that exact binary in virtual-headless mode from the
+# finished, production-shaped container before any image can be promoted.
 RUN --network=none PYTHONPATH=/usr/local/lib/python3.11/site-packages:/home/airflow/.local/lib/python3.11/site-packages \
     /usr/local/bin/python -S -c "import tls_requests; client = tls_requests.Client(proxy='http://127.0.0.1:9'); client.close()"
 RUN --network=none PYTHONPATH=/usr/local/lib/python3.11/site-packages:/home/airflow/.local/lib/python3.11/site-packages \

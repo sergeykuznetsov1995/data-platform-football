@@ -159,20 +159,19 @@ def test_browser_assets_are_checksum_pinned_and_source_isolated():
     install_dir = str(browser_runtime.INSTALL_DIR)
     sha256 = "a03872a221ab766f58d04fdaf0d7f3431c2662d5086844c67d2fc01154ebc1f8"
 
-    sofascore_block = dockerfile.split("ARG SOFASCORE_CAMOUFOX_VERSION=", 1)[1].split(
-        "ARG FBREF_CAMOUFOX_VERSION=", 1
-    )[0]
-    fbref_block = dockerfile.split("ARG FBREF_CAMOUFOX_VERSION=", 1)[1].split(
+    sofascore_block = dockerfile.split(
+        "camoufox/releases/download/v135.0.1-beta.24/", 1
+    )[1].split("camoufox/releases/download/v152.0.4-beta.26/", 1)[0]
+    fbref_block = dockerfile.split(
+        "camoufox/releases/download/v152.0.4-beta.26/", 1
+    )[1].split(
         "RUN --network=none install -d -o root -g root -m 0755 /opt/tls-client",
         1,
     )[0]
 
-    assert f"ARG SOFASCORE_CAMOUFOX_VERSION={sofascore_version}" in dockerfile
-    assert f"ARG SOFASCORE_CAMOUFOX_RELEASE={sofascore_release}" in dockerfile
-    assert f"ARG SOFASCORE_CAMOUFOX_SHA256={sofascore_sha256}" in dockerfile
-    assert "releases/download/v${SOFASCORE_CAMOUFOX_VERSION}-" in sofascore_block
+    assert f"camoufox-{sofascore_version}-{sofascore_release}-lin.x86_64.zip" in sofascore_block
     assert (
-        'echo "${SOFASCORE_CAMOUFOX_SHA256}  /tmp/sofascore-camoufox.zip"'
+        f'echo "{sofascore_sha256}  /tmp/sofascore-camoufox.zip"'
         in sofascore_block
     )
     assert 'stat -c %s /tmp/sofascore-camoufox.zip)" -eq 712711368' in sofascore_block
@@ -180,34 +179,28 @@ def test_browser_assets_are_checksum_pinned_and_source_isolated():
         "-e /tmp/sofascore-camoufox.zip \\\n      /home/airflow/.cache/camoufox"
     ) in sofascore_block
     assert (
-        '"{\\"version\\":\\"${SOFASCORE_CAMOUFOX_VERSION}\\",'
-        '\\"release\\":\\"${SOFASCORE_CAMOUFOX_RELEASE}\\"}"' in sofascore_block
+        f'"{{\\"version\\":\\"{sofascore_version}\\",'
+        f'\\"release\\":\\"{sofascore_release}\\"}}"' in sofascore_block
     )
     assert "test -x /home/airflow/.cache/camoufox/camoufox-bin" in sofascore_block
     assert "FBREF_CAMOUFOX" not in sofascore_block
     assert "/opt/fbref-camoufox" not in sofascore_block
 
-    assert f"ARG FBREF_CAMOUFOX_VERSION={version}" in dockerfile
-    assert f"ARG FBREF_CAMOUFOX_RELEASE={release}" in dockerfile
-    assert f"ARG FBREF_CAMOUFOX_SHA256={sha256}" in dockerfile
-    assert "releases/download/v${FBREF_CAMOUFOX_VERSION}-" in fbref_block
-    assert 'echo "${FBREF_CAMOUFOX_SHA256}  /tmp/fbref-camoufox.zip"' in fbref_block
+    assert f"camoufox-{version}-{release}-lin.x86_64.zip" in fbref_block
+    assert f'echo "{sha256}  /tmp/fbref-camoufox.zip"' in fbref_block
     assert 'stat -c %s /tmp/fbref-camoufox.zip)" -eq 663773735' in fbref_block
     assert "-e /tmp/fbref-camoufox.zip /opt/fbref-camoufox" in fbref_block
     assert f"test -x {install_dir}/camoufox-bin" in fbref_block
     assert "/home/airflow/.cache/camoufox" not in fbref_block
     assert "SOFASCORE_CAMOUFOX" not in fbref_block
-    assert "/opt/legacy-scraper-venv/bin/python -I -c" in dockerfile
     assert "download_mmdb" not in dockerfile
     assert "maybe_download_addons" not in dockerfile
     assert "python -m camoufox fetch" not in dockerfile
-    assert "exclude_addons=list(DefaultAddons)" in dockerfile
-    assert "browser.new_page().evaluate('navigator.userAgent')" in dockerfile
     scheduler_payload = dockerfile.split(
         "FROM airflow-base AS airflow-scheduler-payload", 1
     )[1].split("FROM airflow-scheduler-payload AS airflow-scheduler-test", 1)[0]
-    assert "Camoufox(headless=True" in scheduler_payload
-    assert "Camoufox(headless='virtual'" not in scheduler_payload
+    assert "Camoufox(" not in scheduler_payload
+    assert "BuildKit's RUN sandbox cannot provide" in scheduler_payload
 
     workflow = (REPO_ROOT / ".github/workflows/whoscored-ci.yml").read_text(
         encoding="utf-8"
@@ -217,6 +210,8 @@ def test_browser_assets_are_checksum_pinned_and_source_isolated():
     )[1].split("- name: Build production targets", 1)[0]
     assert "Camoufox(headless='virtual'" in scheduler_smoke
     assert f"executable_path='{install_dir}/camoufox-bin'" in scheduler_smoke
+    assert "exclude_addons=list(DefaultAddons)" in scheduler_smoke
+    assert "browser.new_page().evaluate('navigator.userAgent')" in scheduler_smoke
     assert "assert 'Firefox/152.0' in ua" in scheduler_smoke
 
 
