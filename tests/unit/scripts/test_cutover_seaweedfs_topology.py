@@ -274,6 +274,10 @@ def test_routine_compose_and_make_preserve_supervised_topology_mode() -> None:
     ) == 3
     assert '{{.Type}}\\t{{.Source}}\\t{{.RW}}' not in wrapper
     assert wrapper.count("| sed '/^$/d' | LC_ALL=C sort") == 3
+    assert 'set(payload) != {"/data"}' in wrapper
+    assert "/data:rw,noexec,nosuid,nodev,size=16m,mode=0700" in (
+        ROOT / "compose.yaml"
+    ).read_text(encoding="utf-8")
 
 
 def _run_stateless_compose(
@@ -395,6 +399,7 @@ def _run_stateless_compose(
                         ;;
                       *'.HostConfig.ReadonlyRootfs'*) printf '%s\n' false ;;
                       *'.Config.User'*) printf '\n' ;;
+                      *'.HostConfig.Tmpfs'*) printf '%s\n' '{}' ;;
                       *'.Config.StopSignal'*)
                         if [[ "${FAKE_DOCKER_MODE}" == legacy-container-stop-drift ]]; then
                           printf '%s\n' '"SIGKILL"'
@@ -625,6 +630,7 @@ def _run_stateless_compose(
                     "-concurrentUploadLimitMB=512",
                 ],
                 "entrypoint": ["/usr/local/bin/seaweedfs-legacy-entrypoint"],
+                "tmpfs": ["/data:rw,noexec,nosuid,nodev,size=16m,mode=0700"],
                 "volumes": [config_mount, entrypoint_mount],
             },
             "airflow-init": {"environment": airflow_environment},
