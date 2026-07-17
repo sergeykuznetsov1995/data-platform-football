@@ -54,7 +54,7 @@ x-airflow-common: &airflow-common
     # FBref has a dedicated meter and dedicated residential pool.  The worker
     # receives only a short-lived lease token, never an upstream credential.
     FBREF_PROXY_CONTROL_URL: ${FBREF_PROXY_CONTROL_URL:-http://fbref_proxy_filter:8899}
-    FBREF_PROXY_CONTROL_TOKEN: ${SOFASCORE_PROXY_CONTROL_TOKEN:-}
+    FBREF_PROXY_CONTROL_TOKEN: ${FBREF_PROXY_CONTROL_TOKEN:-}
     FBREF_PROXY_LEASE_TTL_SECONDS: ${FBREF_PROXY_LEASE_TTL_SECONDS:-7200}
     SOFASCORE_PLAYER_ROTATION_MODULUS: ${SOFASCORE_PLAYER_ROTATION_MODULUS:-4}
     SOFASCORE_PLAYER_ROTATION_MIN_LEAGUES: ${SOFASCORE_PLAYER_ROTATION_MIN_LEAGUES:-10}
@@ -1048,7 +1048,7 @@ services:
       - ALL
     environment:
       PYTHONPATH: /opt/airflow
-      PROXY_FILTER_CONTROL_TOKEN: ${SOFASCORE_PROXY_CONTROL_TOKEN:-}
+      PROXY_FILTER_CONTROL_TOKEN: ${FBREF_PROXY_CONTROL_TOKEN:-}
       # Deliberately separate from the shared paid pool below.
       PROXY_POOL_JSON: ""
       PROXY_FILTER_ALLOW_FILE_FALLBACK: "true"
@@ -1092,7 +1092,7 @@ services:
       - ./scripts:/opt/airflow/scripts:ro
       - ./scrapers:/opt/airflow/scrapers:ro
       - ./configs/proxy_filter:/opt/airflow/configs/proxy_filter:ro
-      - ./proxys.txt:/opt/airflow/proxys.txt:ro
+      - ${FBREF_PROXY_POOL_FILE:-./proxys.txt}:/opt/airflow/proxys.txt:ro
       - ./logs:/opt/airflow/logs
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "http://localhost:8899/health"]

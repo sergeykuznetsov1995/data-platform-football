@@ -48,6 +48,19 @@ _COMPOSE_PATH = REPO_ROOT / "compose.yaml"
 _SOFASCORE_GATEWAY_COMPOSE_PATH = (
     REPO_ROOT / "deploy/sofascore/gateway.compose.yaml"
 )
+_FBREF_ACCEPTANCE_COMPOSE_PATH = (
+    REPO_ROOT / "deploy/fbref/acceptance.compose.yaml"
+)
+_ENV_EXAMPLE_PATH = REPO_ROOT / ".env.example"
+_SCHEDULER_DOCKERFILE_PATH = (
+    REPO_ROOT / "docker/images/airflow/Dockerfile.scheduler-runtime"
+)
+_ACCEPTANCE_DOCKERFILE_PATH = (
+    REPO_ROOT / "docker/images/airflow/Dockerfile.fbref-acceptance"
+)
+_ACCEPTANCE_BUILD_SCRIPT_PATH = (
+    REPO_ROOT / "scripts/build_fbref_acceptance_image.sh"
+)
 
 
 def _load_module():
@@ -340,7 +353,12 @@ def test_fbref_has_an_isolated_metered_proxy_service():
 
     assert "PROXY_POOL_JSON: \"\"" in service
     assert "PROXY_FILTER_ALLOW_FILE_FALLBACK: \"true\"" in service
-    assert "./proxys.txt:/opt/airflow/proxys.txt:ro" in service
+    assert (
+        "${FBREF_PROXY_POOL_FILE:-./proxys.txt}:"
+        "/opt/airflow/proxys.txt:ro"
+    ) in service
+    assert "PROXY_FILTER_CONTROL_TOKEN: ${FBREF_PROXY_CONTROL_TOKEN:-}" in service
+    assert "SOFASCORE_PROXY_CONTROL_TOKEN" not in service
     assert "http://fbref_proxy_filter:8900" in service
     assert "${FBREF_PROXY_DAGRUN_BUDGET_BYTES:-104857600}" in service
     assert "${FBREF_PROXY_URL_BUDGET_BYTES:-104857600}" in service
@@ -349,17 +367,123 @@ def test_fbref_has_an_isolated_metered_proxy_service():
     assert "/logs/proxy_filter/sofascore_allocation_claims.jsonl" not in service
 
 
+def test_fbref_control_secret_is_explicit_in_airflow_and_example_env():
+    compose = _COMPOSE_PATH.read_text()
+    common = compose.split("x-airflow-common: &airflow-common", 1)[1].split(
+        "services:", 1
+    )[0]
+    assert "FBREF_PROXY_CONTROL_TOKEN: ${FBREF_PROXY_CONTROL_TOKEN:-}" in common
+    assert "FBREF_PROXY_CONTROL_TOKEN: ${SOFASCORE_PROXY_CONTROL_TOKEN:-}" not in (
+        compose
+    )
+
+    example = _ENV_EXAMPLE_PATH.read_text()
+    assert "\nFBREF_PROXY_CONTROL_TOKEN=\n" in example
+    assert (
+        "FBREF_PROXY_POOL_FILE=/root/fbref-949-runtime/proxys.txt" in example
+    )
+
+
+def test_fbref_acceptance_compose_is_a_separate_project_scoped_stack():
+    acceptance = _FBREF_ACCEPTANCE_COMPOSE_PATH.read_text()
+    proxy = acceptance.split("  fbref_acceptance_proxy_filter:\n", 1)[1].split(
+        "\n  fbref_acceptance_runner:\n", 1
+    )[0]
+    runner = acceptance.split("  fbref_acceptance_runner:\n", 1)[1].split(
+        "\nnetworks:\n", 1
+    )[0]
+
+    assert "-p fbref-acceptance-949" in acceptance
+    assert "container_name:" not in acceptance
+    assert "ports:" not in acceptance
+    assert "build:" not in acceptance
+    assert acceptance.count(
+        "image: ${FBREF_ACCEPTANCE_AIRFLOW_IMAGE:?"
+    ) == 2
+    assert acceptance.count(
+        "/opt/airflow/scripts/fbref_acceptance_entrypoint.sh"
+    ) == 2
+    assert acceptance.count("user: ${AIRFLOW_UID:-50000}:0") == 2
+    assert "FBREF_EXPECTED_GIT_SHA: ${FBREF_ACCEPTANCE_GIT_SHA:?" in proxy
+    assert (
+        "FBREF_EXPECTED_IMAGE_DIGEST: ${FBREF_ACCEPTANCE_AIRFLOW_IMAGE:?"
+        in proxy
+    )
+    assert "FBREF_IMAGE_DIGEST: ${FBREF_ACCEPTANCE_AIRFLOW_IMAGE:?" in runner
+    assert (
+        "FBREF_ACCEPTANCE_OUTPUT_ROOT: /opt/airflow/logs/fbref_acceptance"
+        in runner
+    )
+    assert acceptance.count(
+        ":/opt/airflow/logs/fbref_acceptance"
+    ) == 2
+    assert (
+        "PROXY_FILTER_CONTROL_TOKEN: ${FBREF_PROXY_CONTROL_TOKEN:?" in proxy
+    )
+    assert "SOFASCORE_PROXY_CONTROL_TOKEN" not in acceptance
+    assert "${FBREF_PROXY_POOL_FILE:?" in proxy
+    assert ":/run/secrets/fbref-proxys.txt:ro" in proxy
+    assert "./proxys.txt" not in proxy
+    assert "http://fbref_acceptance_proxy_filter:8900" in proxy
+    assert "\n      - acceptance_proxy\n" in proxy
+    assert "production_backend" not in proxy
+    assert "production_storage" not in proxy
+    assert "FBREF_PROXY_CONTROL_URL: http://fbref_acceptance_proxy_filter:8899" in (
+        runner
+    )
+    assert "\n      - production_backend\n" in runner
+    assert "\n      - production_storage\n" in runner
+    assert "/var/lib/postgresql/data:rw,noexec,nosuid,size=1g" in acceptance
+    assert "name: dp-backend" in acceptance
+    assert "name: dp-storage" in acceptance
+
+
+def test_fbref_acceptance_image_is_built_from_one_exact_git_archive():
+    dockerfile = _ACCEPTANCE_DOCKERFILE_PATH.read_text()
+    builder = _ACCEPTANCE_BUILD_SCRIPT_PATH.read_text()
+
+    assert "COPY source.tar /tmp/fbref-acceptance-source.tar" in dockerfile
+    assert "sha256sum -c -" in dockerfile
+    assert "rm -rf /opt/airflow/dags /opt/airflow/scrapers" in dockerfile
+    assert "verify_fbref_acceptance_image.py" in dockerfile
+    assert "filter_proxy.py --help" in dockerfile
+    assert "org.opencontainers.image.revision" in dockerfile
+    assert "COPY dags" not in dockerfile
+    assert "git -C \"$repo_root\" archive --format=tar \"$git_sha\"" in builder
+    assert "dags scrapers scripts configs" in builder
+    assert "${git_sha}:docker/images/airflow/Dockerfile.fbref-acceptance" in (
+        builder
+    )
+    assert "runtime_base_id=" in builder
+    assert "local/fbref-acceptance-base:" in builder
+    assert "docker image tag \"$runtime_base_id\" \"$base_build_ref\"" in builder
+    assert "docker image rm \"$base_build_ref\"" in builder
+    assert "docker image inspect" in builder
+    assert "FBREF_ACCEPTANCE_AIRFLOW_IMAGE=%s" in builder
+
+
+def test_fbref_scheduler_image_requires_the_pinned_fontconfig():
+    dockerfile = _SCHEDULER_DOCKERFILE_PATH.read_text()
+    assert (
+        "test -r /opt/fbref-camoufox/fontconfig/windows/fonts.conf"
+        in dockerfile
+    )
+
+
 def test_fbref_lease_is_scoped_metered_and_host_restricted(mod):
     assert mod.FBREF_DAG_IDS == frozenset(
         {
             "dag_ingest_fbref",
             "dag_bootstrap_fbref",
             "dag_backfill_fbref",
+            "dag_accept_fbref_bronze",
         }
     )
     assert mod._source_for_dag("dag_ingest_fbref") == "fbref"
     assert mod._source_for_dag("dag_bootstrap_fbref") == "fbref"
     assert mod._source_for_dag("dag_backfill_fbref") == "fbref"
+    assert mod._source_for_dag("dag_accept_fbref_bronze") == "fbref"
+    assert mod._source_for_dag("dag_replay_fbref_bronze") == ""
     lease = mod.Lease(
         lease_id="fbref-lease",
         token="secret",

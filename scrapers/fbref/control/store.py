@@ -438,6 +438,136 @@ def _raw_audit_evidence(value: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _ordered_texts(value: object, name: str) -> list[str]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise ValueError(f"{name} must be a sequence")
+    rendered = [_text(item, name) for item in value]
+    if len(rendered) != len(set(rendered)):
+        raise ValueError(f"{name} contains duplicates")
+    return rendered
+
+
+def _acceptance_cohort_evidence(value: Mapping[str, Any]) -> dict[str, Any]:
+    evidence = dict(value)
+    if evidence.get("schema_version") != "fbref-acceptance-cohort-v1":
+        raise StateConflict("acceptance cohort schema is unsupported")
+    if str(evidence.get("status") or "").casefold() != "frozen":
+        raise StateConflict("acceptance cohort must have frozen status")
+    scope = str(evidence.get("scope") or "").strip().casefold()
+    if scope not in {"current", "history"}:
+        raise ValueError("acceptance cohort scope must be current or history")
+    target_ids = _ordered_texts(evidence.get("target_ids"), "target_ids")
+    if not 1 <= len(target_ids) <= 25:
+        raise ValueError("acceptance cohort must contain between 1 and 25 targets")
+    cohort_size = _non_negative(evidence.get("cohort_size"), "cohort_size")
+    if cohort_size != len(target_ids):
+        raise StateConflict("acceptance cohort size does not match target_ids")
+    encoded = json.dumps(
+        target_ids, ensure_ascii=True, separators=(",", ":")
+    ).encode("ascii")
+    cohort_sha256 = hashlib.sha256(encoded).hexdigest()
+    supplied_hash = _sha256_hex(
+        evidence.get("cohort_sha256"), "cohort_sha256"
+    )
+    if supplied_hash != cohort_sha256:
+        raise StateConflict("acceptance cohort hash does not match target_ids")
+    required_page_kinds = _ordered_texts(
+        evidence.get("required_page_kinds"), "required_page_kinds"
+    )
+    if not required_page_kinds:
+        raise ValueError("required_page_kinds must not be empty")
+    required_routes = _ordered_texts(
+        evidence.get("required_routes", ()), "required_routes"
+    )
+    slots = evidence.get("coverage_slots")
+    if not isinstance(slots, Mapping) or not slots:
+        raise ValueError("coverage_slots must be a non-empty mapping")
+    coverage_slots = {
+        _text(slot, "coverage slot"): _text(target, "coverage target")
+        for slot, target in sorted(slots.items(), key=lambda item: str(item[0]))
+    }
+    if len(set(coverage_slots.values())) != len(coverage_slots):
+        raise ValueError("coverage_slots must select distinct targets")
+    if set(coverage_slots.values()) != set(target_ids):
+        raise StateConflict("coverage_slots must cover the exact cohort")
+    return {
+        "schema_version": "fbref-acceptance-cohort-v1",
+        "status": "frozen",
+        "scope": scope,
+        "cohort_size": cohort_size,
+        "cohort_sha256": cohort_sha256,
+        "target_ids": target_ids,
+        "required_page_kinds": required_page_kinds,
+        "required_routes": required_routes,
+        "coverage_slots": coverage_slots,
+    }
+
+
+def _count_mapping(value: object, name: str) -> dict[str, int]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{name} must be a mapping")
+    return {
+        _text(key, name): _non_negative(count, name)
+        for key, count in sorted(value.items(), key=lambda item: str(item[0]))
+    }
+
+
+def _bronze_acceptance_evidence(
+    value: Mapping[str, Any], *, replay: bool
+) -> dict[str, Any]:
+    evidence = dict(value)
+    schema = (
+        "fbref-bronze-acceptance-replay-v1"
+        if replay
+        else "fbref-bronze-acceptance-v1"
+    )
+    if evidence.get("schema_version") != schema:
+        raise StateConflict("bronze acceptance schema is unsupported")
+    if str(evidence.get("status") or "").casefold() != "passed":
+        raise StateConflict("bronze acceptance evidence must have passed status")
+    strict_gates = evidence.get("strict_gates")
+    if not isinstance(strict_gates, Mapping) or not strict_gates:
+        raise ValueError("strict_gates must be a non-empty mapping")
+    # JSON round-tripping rejects unserializable objects and detaches caller
+    # owned dictionaries before they become immutable run metadata.
+    normalized_gates = json.loads(_json(dict(strict_gates)))
+    normalized = {
+        "schema_version": schema,
+        "status": "passed",
+        "processing_control_run_id": _uuid(
+            evidence.get("processing_control_run_id"),
+            "processing_control_run_id",
+        ),
+        "scope": _text(evidence.get("scope"), "scope").casefold(),
+        "cohort_size": _non_negative(
+            evidence.get("cohort_size"), "cohort_size"
+        ),
+        "cohort_sha256": _sha256_hex(
+            evidence.get("cohort_sha256"), "cohort_sha256"
+        ),
+        "page_kind_counts": _count_mapping(
+            evidence.get("page_kind_counts"), "page_kind_counts"
+        ),
+        "route_counts": _count_mapping(
+            evidence.get("route_counts"), "route_counts"
+        ),
+        "strict_gates": normalized_gates,
+    }
+    if replay:
+        normalized["source_control_run_id"] = _uuid(
+            evidence.get("source_control_run_id"), "source_control_run_id"
+        )
+    if normalized["scope"] not in {"current", "history"}:
+        raise ValueError("bronze acceptance scope must be current or history")
+    if normalized["cohort_size"] <= 0:
+        raise ValueError("bronze acceptance cohort must not be empty")
+    if sum(normalized["page_kind_counts"].values()) != normalized["cohort_size"]:
+        raise StateConflict("page_kind_counts do not match acceptance cohort")
+    if sum(normalized["route_counts"].values()) != normalized["cohort_size"]:
+        raise StateConflict("route_counts do not match acceptance cohort")
+    return normalized
+
+
 def _row_dict(cursor: Any, row: Any) -> Optional[dict]:
     if row is None:
         return None
@@ -1204,6 +1334,177 @@ class ControlStore:
         if value is None:
             return None
         return _raw_audit_evidence(_json_mapping(value, "raw_audit"))
+
+    def record_acceptance_cohort(
+        self,
+        run_id: object,
+        evidence: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Create-once anchor for the exact ordered acceptance cohort."""
+
+        run = _uuid(run_id, "run_id")
+        normalized = _acceptance_cohort_evidence(evidence)
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                SELECT status, run_type, request_limit, byte_limit, metadata
+                FROM fbref_control.crawl_run
+                WHERE run_id = %s
+                FOR UPDATE
+                """,
+                (run,),
+            )
+            row = _fetchone(cursor)
+            if row is None or row["status"] != "running":
+                raise StateConflict(
+                    f"Run {run} cannot anchor an acceptance cohort"
+                )
+            expected_scope = (
+                "current" if row["run_type"] == "current" else "history"
+                if row["run_type"] == "backfill"
+                else None
+            )
+            metadata = _json_mapping(
+                row.get("metadata") or {}, "crawl run metadata"
+            )
+            if (
+                expected_scope != normalized["scope"]
+                or int(row["request_limit"]) != 100
+                or int(row["byte_limit"]) != 50 * 1024 * 1024
+                or metadata.get("acceptance_profile") is not True
+                or metadata.get("publication_eligible") is not False
+                or int(metadata.get("shard_size") or 0) != 25
+            ):
+                raise StateConflict(
+                    f"Run {run} is not the bounded nonpublishing acceptance profile"
+                )
+            cursor.execute(
+                """
+                SELECT target_id
+                FROM fbref_control.run_target
+                WHERE run_id = %s
+                ORDER BY ordinal
+                """,
+                (run,),
+            )
+            installed_targets = [
+                str(item["target_id"]) for item in _fetchall(cursor)
+            ]
+            if installed_targets != normalized["target_ids"]:
+                raise StateConflict(
+                    "acceptance cohort anchor differs from immutable run targets"
+                )
+            installed_value = metadata.get("acceptance_cohort")
+            if installed_value is not None:
+                installed = _acceptance_cohort_evidence(
+                    _json_mapping(installed_value, "acceptance_cohort")
+                )
+                if installed != normalized:
+                    raise StateConflict(
+                        f"Run {run} already has different acceptance cohort evidence"
+                    )
+                return {**normalized, "idempotent": True}
+            cursor.execute(
+                """
+                UPDATE fbref_control.crawl_run
+                SET metadata = metadata || %s::jsonb,
+                    updated_at = clock_timestamp()
+                WHERE run_id = %s
+                """,
+                (_json({"acceptance_cohort": normalized}), run),
+            )
+            if cursor.rowcount != 1:
+                raise StateConflict(f"Acceptance run {run} disappeared")
+        return {**normalized, "idempotent": False}
+
+    def record_bronze_acceptance(
+        self,
+        run_id: object,
+        evidence: Mapping[str, Any],
+        *,
+        replay: bool = False,
+    ) -> dict[str, Any]:
+        """Create-once passed strict-gate evidence before terminal success."""
+
+        run = _uuid(run_id, "run_id")
+        normalized = _bronze_acceptance_evidence(evidence, replay=replay)
+        if normalized["processing_control_run_id"] != run:
+            raise StateConflict(
+                "bronze acceptance processing_control_run_id does not match run"
+            )
+        key = "bronze_acceptance_replay" if replay else "bronze_acceptance"
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                SELECT status, metadata
+                FROM fbref_control.crawl_run
+                WHERE run_id = %s
+                FOR UPDATE
+                """,
+                (run,),
+            )
+            row = _fetchone(cursor)
+            if row is None or row["status"] != "running":
+                raise StateConflict(
+                    f"Run {run} cannot record first bronze acceptance evidence"
+                )
+            metadata = _json_mapping(
+                row.get("metadata") or {}, "crawl run metadata"
+            )
+            if replay:
+                raw_audit = metadata.get("raw_audit")
+                if (
+                    metadata.get("acceptance_replay") is not True
+                    or metadata.get("publication_eligible") is not False
+                    or str(
+                        metadata.get("acceptance_replay_source_run_id") or ""
+                    )
+                    != normalized["source_control_run_id"]
+                    or not isinstance(raw_audit, Mapping)
+                    or str(raw_audit.get("status") or "").casefold()
+                    != "passed"
+                    or raw_audit.get("zero_delta_required") is not True
+                ):
+                    raise StateConflict(
+                        f"Run {run} lacks strict acceptance replay prerequisites"
+                    )
+            else:
+                cohort_value = metadata.get("acceptance_cohort")
+                if not isinstance(cohort_value, Mapping):
+                    raise StateConflict(
+                        f"Run {run} has no frozen acceptance cohort"
+                    )
+                cohort = _acceptance_cohort_evidence(cohort_value)
+                if (
+                    cohort["scope"] != normalized["scope"]
+                    or cohort["cohort_size"] != normalized["cohort_size"]
+                    or cohort["cohort_sha256"] != normalized["cohort_sha256"]
+                ):
+                    raise StateConflict(
+                        "bronze acceptance marker differs from frozen cohort"
+                    )
+            installed_value = metadata.get(key)
+            if installed_value is not None:
+                installed = _bronze_acceptance_evidence(
+                    _json_mapping(installed_value, key), replay=replay
+                )
+                if installed != normalized:
+                    raise StateConflict(
+                        f"Run {run} already has different {key} evidence"
+                    )
+                return {**normalized, "idempotent": True}
+            cursor.execute(
+                """
+                UPDATE fbref_control.crawl_run
+                SET metadata = metadata || %s::jsonb,
+                    updated_at = clock_timestamp()
+                WHERE run_id = %s
+                """,
+                (_json({key: normalized}), run),
+            )
+            if cursor.rowcount != 1:
+                raise StateConflict(f"Acceptance run {run} disappeared")
+        return {**normalized, "idempotent": False}
 
     def seal_raw_fetch_attempts(self, run_id: object) -> dict[str, Any]:
         """Freeze and fingerprint the successful-attempt set before audit.
@@ -2956,6 +3257,617 @@ class ControlStore:
         """Compatibility alias for full frontier scope reconciliation."""
         return self.reconcile_frontier_scope(source=source)
 
+    def list_acceptance_candidates(
+        self,
+        *,
+        scope: str,
+        limit: int = 1000,
+    ) -> list[dict]:
+        """List deterministic, evidence-backed candidates for manual sampling.
+
+        The query never invents scope or an evidence class.  Player and match
+        classifications exist only when the newest successful raw content has
+        complete successful generic/typed manifests; ambiguous or conflicting
+        evidence remains ``NULL`` and therefore cannot fill a strict slot.
+        """
+
+        normalized_scope = str(scope).strip().casefold()
+        if normalized_scope not in {"current", "history"}:
+            raise ValueError("acceptance scope must be current or history")
+        normalized_limit = int(limit)
+        if not 1 <= normalized_limit <= 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        from scrapers.fbref.page_document import PAGE_DOCUMENT_VERSION
+        from scrapers.fbref.typed_bronze import TYPED_BRONZE_PARSER_VERSION
+
+        match_datasets = [
+            "typed:shot_events",
+            "typed:match_events",
+            "typed:lineups",
+            "typed:match_team_stats",
+            "typed:match_managers",
+            "typed:match_officials",
+            "typed:match_keeper_stats",
+            "typed:match_player_stats",
+        ]
+        with self._transaction() as cursor:
+            cursor.execute(
+                _FRONTIER_SCOPE_CTE
+                + """
+                , latest_success AS MATERIALIZED (
+                    SELECT DISTINCT ON (attempt.target_id)
+                           attempt.target_id, attempt.content_hash
+                    FROM fbref_control.fetch_attempt AS attempt
+                    WHERE attempt.status = 'succeeded'
+                      AND attempt.content_hash IS NOT NULL
+                      AND attempt.raw_manifest_key IS NOT NULL
+                    ORDER BY attempt.target_id, attempt.finished_at DESC,
+                             attempt.attempt_number DESC, attempt.attempt_id DESC
+                ), page_evidence AS MATERIALIZED (
+                    SELECT latest.target_id,
+                           bool_and(
+                             manifest.availability = 'available'
+                             AND manifest.row_count > 0
+                           ) AS all_populated,
+                           bool_and(
+                             manifest.availability = 'empty'
+                             AND manifest.row_count = 0
+                             AND NULLIF(trim(manifest.error_message), '')
+                                 IS NOT NULL
+                           ) AS all_empty
+                    FROM latest_success AS latest
+                    JOIN fbref_control.dataset_manifest AS manifest
+                      ON manifest.target_id = latest.target_id
+                     AND manifest.content_hash = latest.content_hash
+                     AND manifest.dataset = '__page__'
+                    WHERE manifest.parse_status = 'succeeded'
+                      AND manifest.persistence_status = 'succeeded'
+                      AND manifest.validation_status = 'succeeded'
+                      AND manifest.parser_version = %s
+                    GROUP BY latest.target_id
+                ), match_evidence AS MATERIALIZED (
+                    SELECT latest.target_id,
+                           count(DISTINCT manifest.dataset) FILTER (
+                             WHERE manifest.dataset = ANY(%s::text[])
+                           ) AS dataset_count,
+                           bool_and(
+                             manifest.parse_status = 'succeeded'
+                             AND manifest.persistence_status IN (
+                               'succeeded', 'skipped'
+                             )
+                             AND manifest.validation_status IN (
+                               'succeeded', 'skipped'
+                             )
+                             AND manifest.availability NOT IN ('unknown', 'error')
+                             AND (
+                               manifest.availability NOT IN (
+                                 'empty', 'restricted', 'not_applicable'
+                               )
+                               OR NULLIF(trim(manifest.error_message), '')
+                                  IS NOT NULL
+                             )
+                           ) FILTER (
+                             WHERE manifest.dataset = ANY(%s::text[])
+                           ) AS all_safe,
+                           bool_or(
+                             manifest.dataset = 'typed:__complete__'
+                             AND manifest.parse_status = 'succeeded'
+                             AND manifest.persistence_status = 'succeeded'
+                             AND manifest.validation_status = 'succeeded'
+                           ) AS completed,
+                           bool_and(
+                             manifest.availability = 'available'
+                             AND manifest.row_count > 0
+                           ) FILTER (
+                             WHERE manifest.dataset = 'typed:match_player_stats'
+                           ) AS player_stats_populated,
+                           bool_and(
+                             manifest.availability IN (
+                               'empty', 'restricted', 'not_applicable'
+                             )
+                             AND manifest.row_count = 0
+                             AND NULLIF(trim(manifest.error_message), '')
+                                 IS NOT NULL
+                           ) FILTER (
+                             WHERE manifest.dataset = 'typed:match_player_stats'
+                           ) AS player_stats_sparse
+                    FROM latest_success AS latest
+                    JOIN fbref_control.dataset_manifest AS manifest
+                      ON manifest.target_id = latest.target_id
+                     AND manifest.content_hash = latest.content_hash
+                    WHERE (
+                      manifest.dataset = 'typed:__complete__'
+                      OR manifest.dataset = ANY(%s::text[])
+                    )
+                      AND manifest.parser_version = %s
+                    GROUP BY latest.target_id
+                ), eligible AS MATERIALIZED (
+                    SELECT frontier.target_id, frontier.page_kind,
+                           frontier.canonical_url, frontier.source_ids,
+                           frontier.refresh_policy, frontier.state,
+                           selected.gender, selected.competition_id,
+                           selected.season_id, selected.is_current,
+                           CASE
+                             WHEN frontier.page_kind = 'player'
+                              AND page_evidence.all_populated
+                               THEN 'populated_player'
+                             WHEN frontier.page_kind = 'player'
+                              AND page_evidence.all_empty
+                               THEN 'empty_player'
+                             WHEN frontier.page_kind = 'match'
+                              AND match_evidence.dataset_count = 8
+                              AND match_evidence.all_safe
+                              AND match_evidence.completed
+                              AND match_evidence.player_stats_populated
+                               THEN 'full_match'
+                             WHEN frontier.page_kind = 'match'
+                              AND match_evidence.dataset_count = 8
+                              AND match_evidence.all_safe
+                              AND match_evidence.completed
+                              AND match_evidence.player_stats_sparse
+                               THEN 'sparse_match'
+                             ELSE NULL
+                           END AS evidence_class,
+                           row_number() OVER (
+                             PARTITION BY
+                               selected.competition_id,
+                               selected.season_id,
+                               frontier.page_kind,
+                               COALESCE(frontier.source_ids ->> 'stat_route', ''),
+                               CASE
+                                 WHEN frontier.page_kind = 'player'
+                                  AND page_evidence.all_populated
+                                   THEN 'populated_player'
+                                 WHEN frontier.page_kind = 'player'
+                                  AND page_evidence.all_empty
+                                   THEN 'empty_player'
+                                 WHEN frontier.page_kind = 'match'
+                                  AND match_evidence.dataset_count = 8
+                                  AND match_evidence.all_safe
+                                  AND match_evidence.completed
+                                  AND match_evidence.player_stats_populated
+                                   THEN 'full_match'
+                                 WHEN frontier.page_kind = 'match'
+                                  AND match_evidence.dataset_count = 8
+                                  AND match_evidence.all_safe
+                                  AND match_evidence.completed
+                                  AND match_evidence.player_stats_sparse
+                                   THEN 'sparse_match'
+                                 ELSE ''
+                               END
+                             ORDER BY frontier.priority DESC,
+                                      frontier.target_id
+                           ) AS bucket_rank
+                    FROM fbref_control.page_frontier AS frontier
+                    LEFT JOIN scope_rollup AS scope_rollup
+                      ON scope_rollup.target_id = frontier.target_id
+                    LEFT JOIN LATERAL (
+                      SELECT competition.gender,
+                             canonical.competition_id,
+                             canonical.season_id,
+                             season.is_current
+                      FROM canonical_scope AS canonical
+                      JOIN fbref_control.competition_registry AS competition
+                        ON competition.source = canonical.source
+                       AND competition.competition_id = canonical.competition_id
+                      LEFT JOIN fbref_control.season_registry AS season
+                        ON season.source = canonical.source
+                       AND season.competition_id = canonical.competition_id
+                       AND season.season_id = canonical.season_id
+                      WHERE canonical.target_id = frontier.target_id
+                        AND (
+                          canonical.season_id IS NULL
+                          OR (
+                            season.lifecycle_state = 'present'
+                            AND season.present
+                            AND (
+                              (%s = 'current' AND season.is_current)
+                              OR (%s = 'history' AND NOT season.is_current)
+                            )
+                          )
+                        )
+                      ORDER BY COALESCE(season.is_current, false) DESC,
+                               canonical.competition_id, canonical.season_id
+                      LIMIT 1
+                    ) AS selected ON true
+                    LEFT JOIN page_evidence
+                      ON page_evidence.target_id = frontier.target_id
+                    LEFT JOIN match_evidence
+                      ON match_evidence.target_id = frontier.target_id
+                    WHERE frontier.source = 'fbref'
+                      AND (
+                        frontier.state IN ('queued', 'fetched')
+                        OR (
+                          frontier.state = 'retry'
+                          AND (
+                            frontier.retry_after IS NULL
+                            OR frontier.retry_after <= clock_timestamp()
+                          )
+                        )
+                      )
+                      AND (
+                        frontier.page_kind = 'competition_index'
+                        OR (
+                          selected.gender = 'male'
+                          AND scope_rollup.scope_count > 0
+                          AND NOT COALESCE(
+                            scope_rollup.competition_missing, true
+                          )
+                          AND NOT COALESCE(scope_rollup.has_female, false)
+                          AND NOT COALESCE(scope_rollup.has_unknown, true)
+                          AND NOT COALESCE(
+                            scope_rollup.inactive_competition, true
+                          )
+                          AND NOT COALESCE(scope_rollup.invalid_season, true)
+                        )
+                      )
+                      AND (
+                        (
+                          %s = 'current'
+                          AND frontier.refresh_policy <> 'historical_once'
+                          AND (
+                            frontier.page_kind = 'competition_index'
+                            OR selected.season_id IS NULL
+                            OR selected.is_current
+                          )
+                        )
+                        OR (
+                          %s = 'history'
+                          AND frontier.page_kind <> 'competition_index'
+                          AND frontier.refresh_policy = 'historical_once'
+                          AND selected.season_id IS NOT NULL
+                          AND NOT selected.is_current
+                        )
+                      )
+                ), representatives AS (
+                    SELECT eligible.*,
+                           CASE
+                             WHEN page_kind = 'season_stats'
+                              AND source_ids ->> 'stat_route' IN (
+                                'standard', 'shooting', 'playingtime',
+                                'misc', 'keepers'
+                              )
+                               THEN 'season_stats_' ||
+                                    (source_ids ->> 'stat_route')
+                             WHEN evidence_class = 'populated_player'
+                               THEN 'player_populated'
+                             WHEN evidence_class = 'empty_player'
+                               THEN 'player_empty'
+                             WHEN evidence_class = 'full_match'
+                               THEN 'match_full'
+                             WHEN evidence_class = 'sparse_match'
+                               THEN 'match_sparse'
+                             WHEN page_kind IN (
+                               'competition_index', 'competition', 'season',
+                               'schedule', 'standings', 'squad', 'matchlog'
+                             ) THEN page_kind
+                             ELSE NULL
+                           END AS coverage_slot,
+                           row_number() OVER (
+                             PARTITION BY page_kind,
+                               COALESCE(source_ids ->> 'stat_route', ''),
+                               COALESCE(evidence_class, '')
+                             ORDER BY target_id
+                           ) AS coverage_rank
+                    FROM eligible
+                ), history_season_coverage AS (
+                    SELECT competition_id, season_id,
+                           count(DISTINCT coverage_slot) AS slot_count
+                    FROM representatives
+                    WHERE competition_id IS NOT NULL
+                      AND season_id IS NOT NULL
+                      AND is_current = false
+                      AND coverage_slot IS NOT NULL
+                    GROUP BY competition_id, season_id
+                ), ranked_history_seasons AS (
+                    SELECT competition_id, season_id, slot_count,
+                           row_number() OVER (
+                             ORDER BY (slot_count >= 14) DESC,
+                                      slot_count DESC,
+                                      competition_id, season_id
+                           ) AS season_rank
+                    FROM history_season_coverage
+                )
+                SELECT target_id, page_kind, canonical_url, source_ids,
+                       refresh_policy, state, gender, competition_id,
+                       season_id, is_current, evidence_class
+                FROM representatives
+                LEFT JOIN ranked_history_seasons AS history
+                  USING (competition_id, season_id)
+                WHERE (%s = 'current' AND coverage_rank <= 10)
+                   OR (
+                     %s = 'history'
+                     AND history.season_rank <= 5
+                     AND bucket_rank <= 3
+                   )
+                ORDER BY CASE WHEN %s = 'current' THEN page_kind ELSE '' END,
+                         CASE WHEN %s = 'current'
+                           THEN COALESCE(source_ids ->> 'stat_route', '')
+                           ELSE ''
+                         END,
+                         CASE WHEN %s = 'current'
+                           THEN COALESCE(evidence_class, '') ELSE '' END,
+                         history.season_rank NULLS FIRST,
+                         competition_id NULLS FIRST, season_id NULLS FIRST,
+                         page_kind,
+                         COALESCE(source_ids ->> 'stat_route', ''),
+                         evidence_class NULLS LAST, bucket_rank, target_id
+                LIMIT %s
+                """,
+                (
+                    PAGE_DOCUMENT_VERSION,
+                    match_datasets,
+                    match_datasets,
+                    match_datasets,
+                    TYPED_BRONZE_PARSER_VERSION,
+                    normalized_scope,
+                    normalized_scope,
+                    normalized_scope,
+                    normalized_scope,
+                    normalized_scope,
+                    normalized_scope,
+                    normalized_scope,
+                    normalized_scope,
+                    normalized_scope,
+                    normalized_limit,
+                ),
+            )
+            rows = _fetchall(cursor)
+        candidates = []
+        for row in rows:
+            source_ids = row.get("source_ids") or {}
+            if isinstance(source_ids, str):
+                source_ids = json.loads(source_ids)
+            if not isinstance(source_ids, Mapping):
+                raise StateConflict(
+                    f"Acceptance candidate {row.get('target_id')} has invalid source_ids"
+                )
+            candidates.append(
+                {
+                    "target_id": str(row["target_id"]),
+                    "page_kind": str(row["page_kind"]),
+                    "canonical_url": str(row["canonical_url"]),
+                    "source_ids": dict(source_ids),
+                    "refresh_policy": str(row["refresh_policy"]),
+                    "state": str(row["state"]),
+                    "gender": (
+                        None if row.get("gender") is None else str(row["gender"])
+                    ),
+                    "competition_id": (
+                        None
+                        if row.get("competition_id") is None
+                        else str(row["competition_id"])
+                    ),
+                    "season_id": (
+                        None
+                        if row.get("season_id") is None
+                        else str(row["season_id"])
+                    ),
+                    "is_current": (
+                        None
+                        if row.get("is_current") is None
+                        else bool(row["is_current"])
+                    ),
+                    "evidence_class": (
+                        None
+                        if row.get("evidence_class") is None
+                        else str(row["evidence_class"])
+                    ),
+                }
+            )
+        return candidates
+
+    def create_explicit_run_cohort(
+        self,
+        run_id: object,
+        target_ids: Sequence[object],
+    ) -> list[CohortTarget]:
+        """Atomically freeze an exact, ordered, already-crawlable cohort.
+
+        Unlike due-frontier admission this method never chooses targets.  The
+        caller supplies every identity and PostgreSQL either installs that
+        exact sequence or installs nothing.  A retry is idempotent only when
+        the complete immutable membership is byte-for-byte equivalent.
+        """
+
+        run = _uuid(run_id, "run_id")
+        normalized_ids = [_text(item, "target_id") for item in target_ids]
+        if not 1 <= len(normalized_ids) <= 25:
+            raise ValueError("explicit cohort must contain between 1 and 25 targets")
+        if len(normalized_ids) != len(set(normalized_ids)):
+            raise ValueError("explicit cohort contains duplicate target IDs")
+        cohort = [
+            CohortTarget(
+                target_id=target_id,
+                logical_refresh_id=make_logical_refresh_id(run, target_id),
+                ordinal=ordinal,
+            )
+            for ordinal, target_id in enumerate(normalized_ids)
+        ]
+
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                SELECT status, run_type, request_limit, byte_limit, metadata
+                FROM fbref_control.crawl_run
+                WHERE run_id = %s
+                FOR UPDATE
+                """,
+                (run,),
+            )
+            crawl_run = _fetchone(cursor)
+            if crawl_run is None or crawl_run["status"] != "running":
+                raise StateConflict(f"Run {run} cannot accept an explicit cohort")
+            metadata = _json_mapping(
+                crawl_run.get("metadata") or {}, "crawl run metadata"
+            )
+            scope = str(metadata.get("acceptance_scope") or "").casefold()
+            if (
+                scope not in {"current", "history"}
+                or metadata.get("acceptance_profile") is not True
+                or metadata.get("publication_eligible") is not False
+                or int(metadata.get("shard_size") or 0) != 25
+                or int(crawl_run["request_limit"]) != 100
+                or int(crawl_run["byte_limit"]) != 50 * 1024 * 1024
+                or (
+                    scope == "current" and crawl_run["run_type"] != "current"
+                )
+                or (
+                    scope == "history" and crawl_run["run_type"] != "backfill"
+                )
+            ):
+                raise StateConflict(
+                    f"Run {run} is not the bounded nonpublishing acceptance profile"
+                )
+            cursor.execute(
+                """
+                SELECT target_id, logical_refresh_id, ordinal
+                FROM fbref_control.run_target
+                WHERE run_id = %s
+                ORDER BY ordinal
+                """,
+                (run,),
+            )
+            installed = _fetchall(cursor)
+            if installed:
+                installed_cohort = [
+                    CohortTarget(
+                        target_id=str(item["target_id"]),
+                        logical_refresh_id=str(item["logical_refresh_id"]),
+                        ordinal=int(item["ordinal"]),
+                    )
+                    for item in installed
+                ]
+                if installed_cohort != cohort:
+                    raise StateConflict(
+                        f"Run {run} already has a different immutable cohort"
+                    )
+                return cohort
+
+            cursor.execute(
+                _FRONTIER_SCOPE_CTE
+                + """
+                , requested(target_id, ordinal) AS (
+                    SELECT requested.target_id, requested.ordinality - 1
+                    FROM unnest(%s::text[]) WITH ORDINALITY
+                         AS requested(target_id, ordinality)
+                )
+                SELECT requested.target_id
+                FROM requested
+                JOIN fbref_control.page_frontier AS frontier
+                  ON frontier.target_id = requested.target_id
+                LEFT JOIN scope_rollup AS scope
+                  ON scope.target_id = frontier.target_id
+                WHERE frontier.source = 'fbref'
+                  AND (
+                    frontier.state IN ('queued', 'fetched')
+                    OR (
+                      frontier.state = 'retry'
+                      AND (
+                        frontier.retry_after IS NULL
+                        OR frontier.retry_after <= clock_timestamp()
+                      )
+                    )
+                  )
+                  AND (
+                    frontier.page_kind = 'competition_index'
+                    OR (
+                      scope.scope_count > 0
+                      AND NOT COALESCE(scope.competition_missing, true)
+                      AND NOT COALESCE(scope.has_female, false)
+                      AND NOT COALESCE(scope.has_unknown, true)
+                      AND NOT COALESCE(scope.inactive_competition, true)
+                      AND NOT COALESCE(scope.invalid_season, true)
+                    )
+                  )
+                  AND (
+                    (
+                      %s = 'current'
+                      AND (
+                        frontier.page_kind = 'competition_index'
+                        OR (
+                          frontier.refresh_policy <> 'historical_once'
+                          AND (
+                            COALESCE(scope.has_competition_scope, false)
+                            OR COALESCE(scope.has_current_season, false)
+                          )
+                        )
+                      )
+                    )
+                    OR (
+                      %s = 'history'
+                      AND frontier.page_kind <> 'competition_index'
+                      AND frontier.refresh_policy = 'historical_once'
+                      AND NOT COALESCE(scope.has_current_season, false)
+                      AND NOT COALESCE(scope.has_competition_scope, false)
+                    )
+                  )
+                ORDER BY requested.ordinal
+                FOR UPDATE OF frontier
+                """,
+                (normalized_ids, scope, scope),
+            )
+            crawlable_ids = [
+                str(item["target_id"]) for item in _fetchall(cursor)
+            ]
+            if crawlable_ids != normalized_ids:
+                unavailable = [
+                    target_id
+                    for target_id in normalized_ids
+                    if target_id not in set(crawlable_ids)
+                ]
+                raise StateConflict(
+                    "Explicit cohort contains absent, leased, out-of-scope, "
+                    "or non-crawlable targets: " + ", ".join(unavailable)
+                )
+            cursor.execute(
+                """
+                SELECT outstanding.target_id, outstanding.run_id
+                FROM fbref_control.run_target AS outstanding
+                JOIN fbref_control.crawl_run AS outstanding_run
+                  ON outstanding_run.run_id = outstanding.run_id
+                WHERE outstanding.target_id = ANY(%s::text[])
+                  AND outstanding.run_id <> %s
+                  AND outstanding.status IN ('pending', 'leased', 'retry')
+                  AND outstanding_run.status IN ('pending', 'running')
+                ORDER BY outstanding.target_id
+                LIMIT 1
+                """,
+                (normalized_ids, run),
+            )
+            outstanding = _fetchone(cursor)
+            if outstanding is not None:
+                raise StateConflict(
+                    f"Target {outstanding['target_id']} already belongs to active "
+                    f"run {outstanding['run_id']}"
+                )
+            for item in cohort:
+                cursor.execute(
+                    """
+                    INSERT INTO fbref_control.run_target (
+                        run_id, target_id, logical_refresh_id, ordinal
+                    ) VALUES (%s, %s, %s, %s)
+                    """,
+                    (
+                        run,
+                        item.target_id,
+                        item.logical_refresh_id,
+                        item.ordinal,
+                    ),
+                )
+                cursor.execute(
+                    """
+                    UPDATE fbref_control.page_frontier
+                    SET state = 'queued', next_fetch_at = clock_timestamp(),
+                        retry_after = NULL, updated_at = clock_timestamp()
+                    WHERE target_id = %s
+                    """,
+                    (item.target_id,),
+                )
+                if cursor.rowcount != 1:
+                    raise StateConflict(f"Target {item.target_id} was lost")
+        return cohort
+
     def create_run_cohort(
         self,
         run_id: object,
@@ -3353,6 +4265,45 @@ class ControlStore:
             )
             summary["target_counts"] = {
                 str(row["status"]): int(row["count"])
+                for row in _fetchall(cursor)
+            }
+            cursor.execute(
+                """
+                SELECT frontier.page_kind, count(*) AS count
+                FROM fbref_control.run_target AS target
+                JOIN fbref_control.page_frontier AS frontier
+                  ON frontier.target_id = target.target_id
+                WHERE target.run_id = %s
+                GROUP BY frontier.page_kind
+                ORDER BY frontier.page_kind
+                """,
+                (run,),
+            )
+            summary["cohort_page_kind_counts"] = {
+                str(row["page_kind"]): int(row["count"])
+                for row in _fetchall(cursor)
+            }
+            cursor.execute(
+                """
+                SELECT CASE
+                         WHEN frontier.page_kind = 'season_stats'
+                           THEN 'season_stats:' || COALESCE(
+                             frontier.source_ids ->> 'stat_route', 'unknown'
+                           )
+                         ELSE frontier.page_kind
+                       END AS route,
+                       count(*) AS count
+                FROM fbref_control.run_target AS target
+                JOIN fbref_control.page_frontier AS frontier
+                  ON frontier.target_id = target.target_id
+                WHERE target.run_id = %s
+                GROUP BY route
+                ORDER BY route
+                """,
+                (run,),
+            )
+            summary["cohort_route_counts"] = {
+                str(row["route"]): int(row["count"])
                 for row in _fetchall(cursor)
             }
             cursor.execute(
@@ -4311,6 +5262,296 @@ class ControlStore:
                 else dict(snapshot.get("metadata") or {}).get("sentinels", {})
             )
             return summary
+
+    def get_acceptance_run_evidence(self, run_id: object) -> Optional[dict]:
+        """Return stable target/dataset proof for live or no-op replay.
+
+        A replay run owns no fetch attempts.  When it was initialized through
+        the acceptance replay API, its metadata identifies the frozen source;
+        target and dataset evidence therefore comes from that source while the
+        returned summary (including zero traffic) remains the replay run's.
+        """
+
+        from scrapers.fbref.discovery import DISCOVERY_PARSER_VERSION
+        from scrapers.fbref.page_document import PAGE_DOCUMENT_VERSION
+        from scrapers.fbref.typed_bronze import TYPED_BRONZE_PARSER_VERSION
+
+        run = _uuid(run_id, "run_id")
+        summary = self.get_run_summary(
+            run,
+            parser_version=PAGE_DOCUMENT_VERSION,
+            typed_parser_version=TYPED_BRONZE_PARSER_VERSION,
+            stateful_parser_version=DISCOVERY_PARSER_VERSION,
+        )
+        if summary is None:
+            return None
+        metadata = summary.get("metadata")
+        evidence_run = run
+        if (
+            str(summary.get("run_type") or "").casefold() == "replay"
+            and isinstance(metadata, Mapping)
+            and metadata.get("acceptance_replay") is True
+        ):
+            evidence_run = _uuid(
+                metadata.get("acceptance_replay_source_run_id"),
+                "acceptance_replay_source_run_id",
+            )
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                SELECT target.ordinal, target.target_id,
+                       target.logical_refresh_id, target.status,
+                       frontier.page_kind, frontier.canonical_url,
+                       frontier.source_ids, attempt.attempt_id,
+                       attempt.attempt_number, attempt.http_status,
+                       attempt.raw_manifest_key, attempt.content_hash,
+                       attempt.http_request_count, attempt.wire_bytes,
+                       attempt.decoded_bytes, attempt.compressed_bytes,
+                       attempt.provider_billed_bytes, attempt.finished_at
+                FROM fbref_control.run_target AS target
+                JOIN fbref_control.page_frontier AS frontier
+                  ON frontier.target_id = target.target_id
+                LEFT JOIN LATERAL (
+                  SELECT candidate.*
+                  FROM fbref_control.fetch_attempt AS candidate
+                  WHERE candidate.logical_refresh_id = target.logical_refresh_id
+                  ORDER BY candidate.attempt_number DESC,
+                           candidate.attempt_id DESC
+                  LIMIT 1
+                ) AS attempt ON true
+                WHERE target.run_id = %s
+                ORDER BY target.ordinal
+                """,
+                (evidence_run,),
+            )
+            targets = []
+            for row in _fetchall(cursor):
+                source_ids = row.get("source_ids") or {}
+                if isinstance(source_ids, str):
+                    source_ids = json.loads(source_ids)
+                targets.append(
+                    {
+                        "ordinal": int(row["ordinal"]),
+                        "target_id": str(row["target_id"]),
+                        "logical_refresh_id": str(row["logical_refresh_id"]),
+                        "status": str(row["status"]),
+                        "page_kind": str(row["page_kind"]),
+                        "canonical_url": str(row["canonical_url"]),
+                        "source_ids": dict(source_ids),
+                        "attempt_id": (
+                            None
+                            if row.get("attempt_id") is None
+                            else str(row["attempt_id"])
+                        ),
+                        "attempt_number": (
+                            None
+                            if row.get("attempt_number") is None
+                            else int(row["attempt_number"])
+                        ),
+                        "http_status": (
+                            None
+                            if row.get("http_status") is None
+                            else int(row["http_status"])
+                        ),
+                        "raw_manifest_key": row.get("raw_manifest_key"),
+                        "content_hash": row.get("content_hash"),
+                        "http_request_count": int(
+                            row.get("http_request_count") or 0
+                        ),
+                        "wire_bytes": int(row.get("wire_bytes") or 0),
+                        "decoded_bytes": int(row.get("decoded_bytes") or 0),
+                        "compressed_bytes": int(
+                            row.get("compressed_bytes") or 0
+                        ),
+                        "provider_billed_bytes": (
+                            None
+                            if row.get("provider_billed_bytes") is None
+                            else int(row["provider_billed_bytes"])
+                        ),
+                        "finished_at": row.get("finished_at"),
+                        "evidence_class": None,
+                    }
+                )
+            cursor.execute(
+                """
+                WITH latest_success AS (
+                  SELECT DISTINCT ON (target.logical_refresh_id)
+                         target.ordinal, target.target_id,
+                         frontier.page_kind, attempt.content_hash,
+                         target.logical_refresh_id
+                  FROM fbref_control.run_target AS target
+                  JOIN fbref_control.page_frontier AS frontier
+                    ON frontier.target_id = target.target_id
+                  JOIN fbref_control.fetch_attempt AS attempt
+                    ON attempt.logical_refresh_id = target.logical_refresh_id
+                  WHERE target.run_id = %s
+                    AND attempt.status = 'succeeded'
+                    AND attempt.content_hash IS NOT NULL
+                  ORDER BY target.logical_refresh_id,
+                           attempt.attempt_number DESC, attempt.attempt_id DESC
+                )
+                SELECT latest.ordinal, latest.target_id, latest.page_kind,
+                       manifest.parser_version, manifest.dataset,
+                       manifest.availability, manifest.parse_status,
+                       manifest.persistence_status,
+                       manifest.validation_status, manifest.row_count,
+                       manifest.manifest_key, manifest.error_class,
+                       manifest.error_message, manifest.completed_at
+                FROM latest_success AS latest
+                JOIN fbref_control.dataset_manifest AS manifest
+                  ON manifest.target_id = latest.target_id
+                 AND manifest.content_hash = latest.content_hash
+                WHERE manifest.parser_version IN (%s, %s)
+                  AND EXISTS (
+                    SELECT 1
+                    FROM fbref_control.observation_processing AS observed
+                    WHERE observed.logical_refresh_id = latest.logical_refresh_id
+                      AND observed.parser_version = %s
+                      AND observed.typed_parser_version = %s
+                      AND observed.stateful_parser_version = %s
+                      AND observed.status = 'succeeded'
+                      AND observed.generic_status = 'succeeded'
+                      AND observed.typed_status IN ('succeeded', 'skipped')
+                      AND observed.stateful_status IN ('succeeded', 'skipped')
+                      AND observed.validation_status = 'succeeded'
+                  )
+                ORDER BY latest.ordinal, manifest.parser_version,
+                         manifest.dataset
+                """,
+                (
+                    evidence_run,
+                    PAGE_DOCUMENT_VERSION,
+                    TYPED_BRONZE_PARSER_VERSION,
+                    PAGE_DOCUMENT_VERSION,
+                    TYPED_BRONZE_PARSER_VERSION,
+                    DISCOVERY_PARSER_VERSION,
+                ),
+            )
+            datasets = [
+                {
+                    "ordinal": int(row["ordinal"]),
+                    "target_id": str(row["target_id"]),
+                    "page_kind": str(row["page_kind"]),
+                    "parser_version": str(row["parser_version"]),
+                    "dataset": str(row["dataset"]),
+                    "availability": str(row["availability"]),
+                    "parse_status": str(row["parse_status"]),
+                    "persistence_status": str(row["persistence_status"]),
+                    "validation_status": str(row["validation_status"]),
+                    "row_count": int(row["row_count"]),
+                    "manifest_key": row.get("manifest_key"),
+                    "error_class": row.get("error_class"),
+                    "error_message": row.get("error_message"),
+                    "empty_reason": (
+                        row.get("error_message")
+                        if str(row["availability"]) in {
+                            "empty", "restricted", "not_applicable"
+                        }
+                        else None
+                    ),
+                    "completed_at": row.get("completed_at"),
+                }
+                for row in _fetchall(cursor)
+            ]
+        datasets_by_target: dict[str, list[dict]] = {}
+        for dataset in datasets:
+            datasets_by_target.setdefault(dataset["target_id"], []).append(
+                dataset
+            )
+        required_match_datasets = {
+            "typed:shot_events",
+            "typed:match_events",
+            "typed:lineups",
+            "typed:match_team_stats",
+            "typed:match_managers",
+            "typed:match_officials",
+            "typed:match_keeper_stats",
+            "typed:match_player_stats",
+        }
+        explicit_empty = {"empty", "restricted", "not_applicable"}
+        for target in targets:
+            manifests = datasets_by_target.get(target["target_id"], [])
+            if target["page_kind"] == "player":
+                pages = [
+                    item for item in manifests if item["dataset"] == "__page__"
+                ]
+                if pages and all(
+                    item["availability"] == "available"
+                    and item["row_count"] > 0
+                    and item["parse_status"] == "succeeded"
+                    and item["persistence_status"] == "succeeded"
+                    and item["validation_status"] == "succeeded"
+                    for item in pages
+                ):
+                    target["evidence_class"] = "populated_player"
+                elif pages and all(
+                    item["availability"] == "empty"
+                    and item["row_count"] == 0
+                    and bool(str(item.get("empty_reason") or "").strip())
+                    and item["parse_status"] == "succeeded"
+                    and item["persistence_status"] == "succeeded"
+                    and item["validation_status"] == "succeeded"
+                    for item in pages
+                ):
+                    target["evidence_class"] = "empty_player"
+            elif target["page_kind"] == "match":
+                typed = {
+                    item["dataset"]: item
+                    for item in manifests
+                    if item["dataset"] in required_match_datasets
+                }
+                complete = next(
+                    (
+                        item
+                        for item in manifests
+                        if item["dataset"] == "typed:__complete__"
+                    ),
+                    None,
+                )
+                safe = (
+                    set(typed) == required_match_datasets
+                    and complete is not None
+                    and all(
+                        item["availability"] not in {"unknown", "error"}
+                        and item["parse_status"] == "succeeded"
+                        and item["persistence_status"]
+                        in {"succeeded", "skipped"}
+                        and item["validation_status"]
+                        in {"succeeded", "skipped"}
+                        and (
+                            item["availability"] not in explicit_empty
+                            or bool(
+                                str(item.get("empty_reason") or "").strip()
+                            )
+                        )
+                        for item in typed.values()
+                    )
+                    and complete["parse_status"] == "succeeded"
+                    and complete["persistence_status"] == "succeeded"
+                    and complete["validation_status"] == "succeeded"
+                )
+                player_stats = typed.get("typed:match_player_stats")
+                if safe and player_stats is not None:
+                    if (
+                        player_stats["availability"] == "available"
+                        and player_stats["row_count"] > 0
+                    ):
+                        target["evidence_class"] = "full_match"
+                    elif (
+                        player_stats["availability"] in explicit_empty
+                        and player_stats["row_count"] == 0
+                        and bool(
+                            str(player_stats.get("empty_reason") or "").strip()
+                        )
+                    ):
+                        target["evidence_class"] = "sparse_match"
+        return {
+            "summary": summary,
+            "targets": targets,
+            "datasets": datasets,
+            "processing_control_run_id": run,
+            "evidence_control_run_id": evidence_run,
+        }
 
     def list_successful_fetch_attempts(
         self,

@@ -105,8 +105,19 @@ def test_paid_fbref_dag_allowlist_is_exact_and_bootstrap_can_acquire():
             "dag_ingest_fbref",
             "dag_bootstrap_fbref",
             "dag_backfill_fbref",
+            "dag_accept_fbref_bronze",
         }
     )
+
+
+@pytest.mark.parametrize(
+    "dag_id",
+    [
+        "dag_bootstrap_fbref",
+        "dag_accept_fbref_bronze",
+    ],
+)
+def test_additional_fbref_dags_can_acquire_from_the_isolated_meter(dag_id):
     session = _Session([_Response(201, _lease_body())])
     client = FBrefProxyLeaseClient(
         "http://fbref_proxy_filter:8899",
@@ -114,10 +125,32 @@ def test_paid_fbref_dag_allowlist_is_exact_and_bootstrap_can_acquire():
         session=session,
     )
 
-    context = {**CONTEXT, "dag_id": "dag_bootstrap_fbref"}
+    context = {**CONTEXT, "dag_id": dag_id}
     client.acquire(max_bytes=1000, ttl_seconds=7200, metadata=context)
 
-    assert session.calls[0][2]["json"]["dag_id"] == "dag_bootstrap_fbref"
+    assert session.calls[0][2]["json"]["dag_id"] == dag_id
+
+
+def test_control_token_never_falls_back_to_another_sources_secret(monkeypatch):
+    monkeypatch.delenv("FBREF_PROXY_CONTROL_TOKEN", raising=False)
+    monkeypatch.setenv("PROXY_FILTER_CONTROL_TOKEN", "p" * 32)
+    monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", "s" * 32)
+
+    with pytest.raises(
+        FBrefProxyLeaseError,
+        match="FBREF_PROXY_CONTROL_TOKEN",
+    ):
+        FBrefProxyLeaseClient("http://fbref_proxy_filter:8899")
+
+
+def test_control_token_uses_only_the_dedicated_fbref_secret(monkeypatch):
+    monkeypatch.setenv("FBREF_PROXY_CONTROL_TOKEN", TOKEN)
+    monkeypatch.setenv("PROXY_FILTER_CONTROL_TOKEN", "p" * 32)
+    monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", "s" * 32)
+
+    client = FBrefProxyLeaseClient("http://fbref_proxy_filter:8899")
+
+    assert client._control_token == TOKEN
 
 
 def test_internal_control_session_ignores_ambient_http_proxy():

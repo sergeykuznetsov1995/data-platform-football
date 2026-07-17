@@ -24,6 +24,7 @@ from scrapers.fbref.browser_runtime import (
     CAMOUFOX_BROWSER_VERSION,
     CAMOUFOX_PACKAGE_VERSION,
     CURL_CFFI_PACKAGE_VERSION,
+    FONTCONFIG_FILE,
     INSTALL_DIR,
     PLAYWRIGHT_PACKAGE_VERSION,
 )
@@ -88,6 +89,7 @@ def validate_camoufox_runtime(
     browser_version = str(document.get("version") or "")
     browser_release = str(document.get("release") or "")
     executable = root / "camoufox-bin"
+    fontconfig_file = root / FONTCONFIG_FILE.relative_to(INSTALL_DIR)
     if (
         str(package_version) != CAMOUFOX_PACKAGE_VERSION
         or str(playwright_version) != PLAYWRIGHT_PACKAGE_VERSION
@@ -96,6 +98,7 @@ def validate_camoufox_runtime(
         or browser_release != CAMOUFOX_BROWSER_RELEASE
         or not executable.is_file()
         or not os.access(executable, os.X_OK)
+        or not fontconfig_file.is_file()
     ):
         raise ReadinessError(
             "FBref Camoufox runtime differs from the reviewed production pin"
@@ -125,6 +128,7 @@ def validate_camoufox_runtime(
         "curl_cffi": str(curl_cffi_version),
         "executable_verified": True,
         "executable_probe_verified": True,
+        "fontconfig_verified": True,
     }
 
 
@@ -283,6 +287,36 @@ def check_raw_store_roundtrip(raw_store, *, token: Optional[object] = None) -> d
     }
 
 
+def check_raw_store_read_access(raw_store) -> dict:
+    """Prove the replay raw root is listable without mutating it.
+
+    Acceptance replay captures its zero-delta baseline after readiness.  A
+    write/delete health probe before that baseline could therefore hide a
+    mutation if the cleanup were only eventually visible.  Listing the exact
+    configured root exercises the S3 credentials while preserving the raw
+    namespace byte-for-byte.
+    """
+
+    root = raw_store._path("")
+    try:
+        entries = raw_store.filesystem.get_file_info(
+            fs.FileSelector(
+                root,
+                allow_not_found=False,
+                recursive=False,
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 - storage dependency boundary
+        raise ReadinessError(
+            f"FBref raw root is not readable: {type(exc).__name__}"
+        ) from exc
+    return {
+        "status": "passed",
+        "probe": "read_only_root_listing",
+        "visible_entries": len(entries),
+    }
+
+
 def check_trino_roundtrip(manager, *, token: Optional[object] = None) -> dict:
     """Prove Iceberg write/read/drop capability with a unique health table."""
 
@@ -317,10 +351,32 @@ def check_trino_roundtrip(manager, *, token: Optional[object] = None) -> dict:
     return {"status": "passed", "cleanup_verified": True}
 
 
+def check_trino_read_access(manager) -> dict:
+    """Prove the Bronze Iceberg schema is readable using SELECT only."""
+
+    rows = manager._execute(
+        "SELECT schema_name "
+        "FROM iceberg.information_schema.schemata "
+        "WHERE schema_name = 'bronze'",
+        fetch=True,
+    )
+    if (
+        not isinstance(rows, list)
+        or len(rows) != 1
+        or not isinstance(rows[0], (list, tuple))
+        or len(rows[0]) != 1
+        or str(rows[0][0]).casefold() != "bronze"
+    ):
+        raise ReadinessError("FBref Bronze schema is not readable in Trino")
+    return {"status": "passed", "probe": "read_only_bronze_schema_select"}
+
+
 __all__ = [
     "EXPECTED_RAW_STORE_URI",
     "ReadinessError",
+    "check_raw_store_read_access",
     "check_raw_store_roundtrip",
+    "check_trino_read_access",
     "check_trino_roundtrip",
     "validate_camoufox_runtime",
     "validate_fbref_proxy_meter",

@@ -8,7 +8,9 @@ from pyarrow import fs
 
 from scrapers.fbref.readiness import (
     ReadinessError,
+    check_raw_store_read_access,
     check_raw_store_roundtrip,
+    check_trino_read_access,
     check_trino_roundtrip,
     validate_camoufox_runtime,
     validate_fbref_proxy_meter,
@@ -39,6 +41,9 @@ def _camoufox_install(tmp_path, *, version="152.0.4", release="beta.26"):
         encoding="utf-8",
     )
     executable.chmod(0o755)
+    fontconfig = root / "fontconfig" / "windows" / "fonts.conf"
+    fontconfig.parent.mkdir(parents=True)
+    fontconfig.write_text("<fontconfig/>\n", encoding="utf-8")
     return root
 
 
@@ -58,6 +63,7 @@ def test_camoufox_runtime_requires_the_reviewed_exact_stack(tmp_path):
         "curl_cffi": "0.15.0",
         "executable_verified": True,
         "executable_probe_verified": True,
+        "fontconfig_verified": True,
     }
 
 
@@ -101,6 +107,19 @@ def test_camoufox_runtime_rejects_a_broken_executable(tmp_path):
         )
 
 
+def test_camoufox_runtime_rejects_missing_fontconfig(tmp_path):
+    root = _camoufox_install(tmp_path)
+    (root / "fontconfig" / "windows" / "fonts.conf").unlink()
+
+    with pytest.raises(ReadinessError, match="reviewed production pin"):
+        validate_camoufox_runtime(
+            package_version="0.4.11",
+            playwright_version="1.59.0",
+            curl_cffi_version="0.15.0",
+            install_dir=root,
+        )
+
+
 def _meter_payload(**changes):
     payload = {
         "status": "ok",
@@ -117,6 +136,7 @@ def _meter_payload(**changes):
         "configured_pool_count": 4,
         "fbref_source_ready": True,
         "fbref_dag_ids": [
+            "dag_accept_fbref_bronze",
             "dag_backfill_fbref",
             "dag_bootstrap_fbref",
             "dag_ingest_fbref",
@@ -223,6 +243,32 @@ def test_raw_health_roundtrip_deletes_after_readback_failure(tmp_path):
     assert not list((tmp_path / "raw" / "_health").glob("*.bin"))
 
 
+def test_raw_read_probe_lists_without_mutating(tmp_path):
+    root = tmp_path / "raw"
+    root.mkdir()
+    existing = root / "immutable.json"
+    existing.write_bytes(b"unchanged")
+    store = RawPageStore(fs.LocalFileSystem(), str(root))
+
+    before = {path.name: path.read_bytes() for path in root.iterdir()}
+    result = check_raw_store_read_access(store)
+    after = {path.name: path.read_bytes() for path in root.iterdir()}
+
+    assert result == {
+        "status": "passed",
+        "probe": "read_only_root_listing",
+        "visible_entries": 1,
+    }
+    assert after == before
+
+
+def test_raw_read_probe_fails_when_root_is_unreadable(tmp_path):
+    store = RawPageStore(fs.LocalFileSystem(), str(tmp_path / "missing"))
+
+    with pytest.raises(ReadinessError, match="raw root is not readable"):
+        check_raw_store_read_access(store)
+
+
 def test_trino_health_roundtrip_always_drops_table():
     class Manager:
         def __init__(self):
@@ -249,6 +295,32 @@ def test_trino_health_roundtrip_always_drops_table():
 
     assert result == {"status": "passed", "cleanup_verified": True}
     assert manager.dropped
+
+
+def test_trino_read_probe_uses_select_only_and_requires_bronze():
+    class Manager:
+        def __init__(self, rows):
+            self.rows = rows
+            self.calls = []
+
+        def _execute(self, sql, fetch=False):
+            self.calls.append((sql, fetch))
+            return self.rows
+
+    manager = Manager([("bronze",)])
+    assert check_trino_read_access(manager) == {
+        "status": "passed",
+        "probe": "read_only_bronze_schema_select",
+    }
+    sql, fetch = manager.calls[0]
+    assert fetch is True
+    assert sql.lstrip().upper().startswith("SELECT ")
+    assert not {"CREATE", "INSERT", "UPDATE", "DELETE", "DROP"} & set(
+        sql.upper().split()
+    )
+
+    with pytest.raises(ReadinessError, match="Bronze schema"):
+        check_trino_read_access(Manager([]))
 
 
 def test_trino_health_accepts_driver_list_rows():

@@ -879,6 +879,105 @@ def test_explicit_cohort_cannot_steal_target_from_active_run_or_canary():
     assert list(memberships) == [(first_run, target_id)]
 
 
+def test_acceptance_explicit_cohort_freezes_exact_order_idempotently():
+    run_id = str(uuid.uuid4())
+    target_ids = ["fbref:competition_index:all", "fbref:competition:9"]
+    memberships = []
+    executions = []
+
+    def handler(sql, params):
+        executions.append((sql, params))
+        if "SELECT status, run_type, request_limit" in sql:
+            return [{
+                "status": "running",
+                "run_type": "current",
+                "request_limit": 100,
+                "byte_limit": 50 * 1024 * 1024,
+                "metadata": {
+                    "acceptance_scope": "current",
+                    "acceptance_profile": True,
+                    "publication_eligible": False,
+                    "shard_size": 25,
+                },
+            }], 1
+        if (
+            "SELECT target_id, logical_refresh_id, ordinal" in sql
+            and "WHERE run_id" in sql
+        ):
+            return [dict(item) for item in memberships], len(memberships)
+        if "requested(target_id, ordinal)" in sql:
+            return [{"target_id": item} for item in params[0]], len(params[0])
+        if "SELECT outstanding.target_id" in sql:
+            return [], 0
+        if "INSERT INTO fbref_control.run_target" in sql:
+            memberships.append({
+                "target_id": params[1],
+                "logical_refresh_id": params[2],
+                "ordinal": params[3],
+            })
+            return [], 1
+        if "UPDATE fbref_control.page_frontier" in sql:
+            return [], 1
+        raise AssertionError(sql)
+
+    store = ControlStore(
+        "postgresql://airflow:pw@postgres/airflow",
+        connection_factory=FakeFactory(handler),
+    )
+
+    first = store.create_explicit_run_cohort(run_id, target_ids)
+    repeated = store.create_explicit_run_cohort(run_id, target_ids)
+
+    assert repeated == first
+    assert [item.target_id for item in first] == target_ids
+    assert [item.ordinal for item in first] == [0, 1]
+    assert all(uuid.UUID(item.logical_refresh_id).version == 5 for item in first)
+    with pytest.raises(StateConflict, match="different immutable cohort"):
+        store.create_explicit_run_cohort(run_id, list(reversed(target_ids)))
+    selection_sql = next(
+        sql for sql, _ in executions if "requested(target_id, ordinal)" in sql
+    )
+    assert "scope.has_unknown" in selection_sql
+    assert "frontier.refresh_policy <> 'historical_once'" in selection_sql
+
+
+def test_acceptance_candidate_list_is_slot_bounded_and_fail_closed():
+    executions = []
+
+    def handler(sql, params):
+        executions.append((sql, params))
+        return [{
+            "target_id": "fbref:player:deadbeef",
+            "page_kind": "player",
+            "canonical_url": "https://fbref.com/en/players/deadbeef/example",
+            "source_ids": {"player_id": "deadbeef"},
+            "refresh_policy": "weekly",
+            "state": "fetched",
+            "gender": "male",
+            "competition_id": "9",
+            "season_id": "2025-2026",
+            "is_current": True,
+            "evidence_class": "empty_player",
+        }], 1
+
+    store = ControlStore(
+        "postgresql://airflow:pw@postgres/airflow",
+        connection_factory=FakeFactory(handler),
+    )
+
+    rows = store.list_acceptance_candidates(scope="current", limit=1000)
+
+    assert rows[0]["source_ids"] == {"player_id": "deadbeef"}
+    assert rows[0]["evidence_class"] == "empty_player"
+    sql, params = executions[0]
+    assert "coverage_rank <= 10" in sql
+    assert "NULLIF(trim(manifest.error_message), '')" in sql
+    assert "manifest.availability NOT IN ('unknown', 'error')" in sql
+    assert params[-1] == 1000
+    with pytest.raises(ValueError, match="current or history"):
+        store.list_acceptance_candidates(scope="all")
+
+
 def test_recurring_frontier_policy_dominates_one_shot_and_requeues_upgrade():
     source = inspect.getsource(ControlStore.upsert_frontier_target)
 

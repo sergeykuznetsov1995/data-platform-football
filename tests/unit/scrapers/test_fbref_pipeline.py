@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import uuid
 from contextlib import contextmanager
 from dataclasses import replace
@@ -121,6 +123,29 @@ def test_live_wave_capacity_uses_sequential_byte_reservations(
     assert live_wave_target_capacity(
         settings, request_remaining=100, byte_remaining=6 * 1024 * 1024
     ) == 0
+
+
+def test_acceptance_settings_are_fixed_live_and_zero_network_profiles():
+    current = PipelineSettings.acceptance(scope="current")
+    history = PipelineSettings.acceptance(scope="history")
+    replay = PipelineSettings.acceptance_replay()
+
+    assert (current.run_type, current.request_limit, current.byte_limit) == (
+        "current",
+        100,
+        50 * 1024 * 1024,
+    )
+    assert current.shard_size == history.shard_size == 25
+    assert history.run_type == "backfill"
+    assert (replay.run_type, replay.request_limit, replay.byte_limit) == (
+        "replay",
+        0,
+        0,
+    )
+    with pytest.raises(ValueError, match="current or history"):
+        PipelineSettings.acceptance(scope="all")
+    with pytest.raises(ValueError, match="exactly 25"):
+        PipelineSettings.acceptance_replay(shard_size=24)
 
 
 def _complete_sentinel_coverage():
@@ -655,6 +680,37 @@ class FakeControl:
     def create_run_cohort(self, run_id, cohort):
         self.events.append(f"explicit_cohort:{len(cohort)}")
         return len(cohort)
+
+    def create_explicit_run_cohort(self, run_id, target_ids):
+        cohort = [
+            CohortTarget(
+                target_id=str(target_id),
+                logical_refresh_id=str(
+                    uuid.uuid5(
+                        uuid.NAMESPACE_URL,
+                        f"fbref:{run_id}:{target_id}",
+                    )
+                ),
+                ordinal=ordinal,
+            )
+            for ordinal, target_id in enumerate(target_ids)
+        ]
+        self.events.append(f"acceptance_cohort:{len(cohort)}")
+        return cohort
+
+    def record_acceptance_cohort(self, run_id, evidence):
+        self.run.setdefault("metadata", {})["acceptance_cohort"] = dict(evidence)
+        self.events.append("acceptance_cohort_anchored")
+        return {**dict(evidence), "idempotent": False}
+
+    def record_bronze_acceptance(self, run_id, evidence, *, replay=False):
+        key = "bronze_acceptance_replay" if replay else "bronze_acceptance"
+        self.run.setdefault("metadata", {})[key] = dict(evidence)
+        self.events.append(f"{key}_anchored")
+        return {**dict(evidence), "idempotent": False}
+
+    def get_acceptance_run_evidence(self, run_id):
+        return getattr(self, "acceptance_evidence", None)
 
     def get_run_summary(self, run_id, **_versions):
         return {
@@ -2533,6 +2589,312 @@ def test_source_season_ids_win_over_shifted_display_labels(tmp_path):
     )
 
 
+def _strict_acceptance_summary(control, run_id):
+    target_id = "fbref:competition_index:all"
+    target_ids = [target_id]
+    cohort_hash = hashlib.sha256(
+        json.dumps(
+            target_ids, ensure_ascii=True, separators=(",", ":")
+        ).encode("ascii")
+    ).hexdigest()
+    raw_audit = {
+        "schema_version": "fbref-raw-audit-anchor-v1",
+        "status": "passed",
+        "run_type": "current",
+        "audited_control_run_id": run_id,
+        "processing_control_run_id": run_id,
+        "successful_attempt_count": 1,
+        "audited_attempt_count": 1,
+        "zero_delta_required": False,
+    }
+    cohort = {
+        "schema_version": "fbref-acceptance-cohort-v1",
+        "status": "frozen",
+        "scope": "current",
+        "cohort_size": 1,
+        "cohort_sha256": cohort_hash,
+        "target_ids": target_ids,
+        "required_page_kinds": ["competition_index"],
+        "required_routes": [],
+        "coverage_slots": {"competition_index": target_id},
+    }
+    control.run.update(
+        run_type="current",
+        status="running",
+        request_limit=100,
+        byte_limit=50 * 1024 * 1024,
+        requests_used=1,
+        bytes_used=128,
+        metadata={
+            "execution_mode": "acceptance_nonpublishing",
+            "acceptance_profile": True,
+            "acceptance_scope": "current",
+            "shard_size": 25,
+            "publication_eligible": False,
+            "bootstrap_only": False,
+            "raw_audit": raw_audit,
+            "acceptance_cohort": cohort,
+        },
+    )
+    summary = control.get_run_summary(run_id)
+    summary.update(
+        control.run,
+        target_counts={"succeeded": 1},
+        dataset_validation_counts={"succeeded": 2, "skipped": 1},
+        unvalidated_target_count=0,
+        unprocessed_raw_count=0,
+        budget_exceeded=False,
+        traffic_totals={
+            "network_attempts": 1,
+            "warm_http_successes": 1,
+            "warm_http_success_rate": 1.0,
+            "unclassified_failures": 0,
+            "unclassified_failure_rate": 0.0,
+            "duplicate_fetch_violations": 0,
+        },
+        table_availability={
+            "available": 1,
+            "empty": 1,
+            "restricted": 1,
+            "not_applicable": 1,
+        },
+        cohort_page_kind_counts={"competition_index": 1},
+        cohort_route_counts={"competition_index": 1},
+        session_metrics={"max_bootstraps_per_session": 1},
+    )
+    control.acceptance_evidence = {
+        "summary": summary,
+        "targets": [
+            {
+                "target_id": target_id,
+                "status": "succeeded",
+                "page_kind": "competition_index",
+                "source_ids": {"competition_index": "all"},
+                "http_status": 200,
+                "raw_manifest_key": "raw/manifest.json",
+                "content_hash": "a" * 64,
+                "evidence_class": None,
+            }
+        ],
+        "datasets": [
+            {
+                "target_id": target_id,
+                "dataset": "__page__",
+                "availability": "empty",
+                "parse_status": "succeeded",
+                "persistence_status": "succeeded",
+                "validation_status": "succeeded",
+                "row_count": 0,
+                "empty_reason": "verified_zero_table_page",
+            }
+        ],
+    }
+    return summary
+
+
+def test_strict_acceptance_passes_explicit_absence_and_ignores_global_backlog(
+    tmp_path,
+):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    run_id = str(uuid.uuid4())
+    summary = _strict_acceptance_summary(control, run_id)
+    summary.update(
+        unknown_gender_registry_count=99,
+        female_downstream_targets=99,
+        global_unprocessed_raw_sla_overdue_count=99,
+        crawlable_frontier_scope_counts={"female_gender": 99},
+        sentinel_coverage={},
+    )
+    control.get_run_summary = lambda _, **__: summary
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    pipeline.validate_and_finish(run_id, acceptance=True)
+
+    assert "bronze_acceptance_anchored" in control.events
+    assert "finish:True" in control.events
+    marker = control.run["metadata"]["bronze_acceptance"]
+    assert marker["strict_gates"]["warm_http_success_rate"] == 1.0
+
+
+@pytest.mark.parametrize(
+    ("mutation", "error"),
+    [
+        (
+            lambda summary, evidence: summary.update(
+                target_counts={"succeeded": 0, "skipped": 1}
+            ),
+            "cohort_targets_not_succeeded",
+        ),
+        (
+            lambda summary, evidence: summary["traffic_totals"].update(
+                warm_http_successes=0, warm_http_success_rate=0.0
+            ),
+            "warm_http_successes=0!=1",
+        ),
+        (
+            lambda summary, evidence: summary["traffic_totals"].update(
+                unclassified_failures=1
+            ),
+            "unclassified_failures=1",
+        ),
+        (
+            lambda summary, evidence: summary["traffic_totals"].update(
+                duplicate_fetch_violations=1
+            ),
+            "duplicate_fetch_violations=1",
+        ),
+        (
+            lambda summary, evidence: summary.update(budget_exceeded=True),
+            "budget_exceeded=true",
+        ),
+        (
+            lambda summary, evidence: summary.update(
+                table_availability={"unknown": 1}
+            ),
+            "unsafe_table_availability",
+        ),
+        (
+            lambda summary, evidence: evidence["datasets"][0].update(
+                empty_reason=None
+            ),
+            "acceptance_dataset_evidence_invalid",
+        ),
+    ],
+)
+def test_strict_acceptance_fails_closed_on_every_strict_gate(
+    tmp_path, mutation, error
+):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    run_id = str(uuid.uuid4())
+    summary = _strict_acceptance_summary(control, run_id)
+    mutation(summary, control.acceptance_evidence)
+    control.get_run_summary = lambda _, **__: summary
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    with pytest.raises(RunValidationError, match=error):
+        pipeline.validate_and_finish(run_id, acceptance=True)
+
+    assert "bronze_acceptance_anchored" not in control.events
+    assert "finish:True" not in control.events
+
+
+def test_strict_acceptance_requires_generic_completion_for_each_target(
+    tmp_path,
+):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    run_id = str(uuid.uuid4())
+    summary = _strict_acceptance_summary(control, run_id)
+    second_target_id = "fbref:competition:9"
+    target_ids = [
+        "fbref:competition_index:all",
+        second_target_id,
+    ]
+    cohort = summary["metadata"]["acceptance_cohort"]
+    cohort.update(
+        cohort_size=2,
+        cohort_sha256=hashlib.sha256(
+            json.dumps(
+                target_ids, ensure_ascii=True, separators=(",", ":")
+            ).encode("ascii")
+        ).hexdigest(),
+        target_ids=target_ids,
+        required_page_kinds=["competition_index", "competition"],
+        coverage_slots={
+            "competition_index": target_ids[0],
+            "competition": second_target_id,
+        },
+    )
+    summary.update(
+        target_counts={"succeeded": 2},
+        cohort_page_kind_counts={
+            "competition_index": 1,
+            "competition": 1,
+        },
+        cohort_route_counts={"competition_index": 1, "competition": 1},
+    )
+    summary["metadata"]["raw_audit"].update(
+        successful_attempt_count=2,
+        audited_attempt_count=2,
+    )
+    summary["traffic_totals"].update(
+        network_attempts=2,
+        warm_http_successes=2,
+    )
+    control.acceptance_evidence["targets"].append(
+        {
+            "target_id": second_target_id,
+            "status": "succeeded",
+            "page_kind": "competition",
+            "source_ids": {"competition_id": "9"},
+            "http_status": 200,
+            "raw_manifest_key": "raw/competition-manifest.json",
+            "content_hash": "b" * 64,
+            "evidence_class": None,
+        }
+    )
+    control.get_run_summary = lambda _, **__: summary
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    with pytest.raises(
+        RunValidationError,
+        match=f"acceptance_page_completion_missing={second_target_id}",
+    ):
+        pipeline.validate_and_finish(run_id, acceptance=True)
+
+    assert "bronze_acceptance_anchored" not in control.events
+    assert "finish:True" not in control.events
+
+
+def test_strict_acceptance_rejects_stale_marker_without_typed_completion(
+    tmp_path,
+):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    run_id = str(uuid.uuid4())
+    summary = _strict_acceptance_summary(control, run_id)
+    target_id = "fbref:competition_index:all"
+    cohort = summary["metadata"]["acceptance_cohort"]
+    cohort.update(
+        required_page_kinds=["schedule"],
+        coverage_slots={"schedule": target_id},
+    )
+    summary.update(
+        cohort_page_kind_counts={"schedule": 1},
+        cohort_route_counts={"schedule": 1},
+    )
+    target = control.acceptance_evidence["targets"][0]
+    target.update(
+        page_kind="schedule",
+        source_ids={"competition_id": "9", "season_id": "2025-2026"},
+    )
+    control.acceptance_evidence["datasets"].append(
+        {
+            "target_id": target_id,
+            "dataset": "typed:__stale_observation__",
+            "availability": "duplicate",
+            "parse_status": "succeeded",
+            "persistence_status": "skipped",
+            "validation_status": "skipped",
+            "row_count": 0,
+            "empty_reason": None,
+        }
+    )
+    control.get_run_summary = lambda _, **__: summary
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    with pytest.raises(
+        RunValidationError,
+        match=f"acceptance_typed_completion_missing={target_id}",
+    ):
+        pipeline.validate_and_finish(run_id, acceptance=True)
+
+    assert "bronze_acceptance_anchored" not in control.events
+    assert "finish:True" not in control.events
+
+
 def test_validation_fails_closed_on_partial_target_state(tmp_path):
     raw = _raw_store(tmp_path)
     control = FakeControl(raw)
@@ -2998,6 +3360,62 @@ def _accepted_replay_source(source_run_id, *, run_type="current"):
     }
 
 
+def _accepted_nonpublishing_source(source_run_id):
+    target_ids = ["fbref:competition_index:all"]
+    cohort_hash = hashlib.sha256(
+        json.dumps(
+            target_ids, ensure_ascii=True, separators=(",", ":")
+        ).encode("ascii")
+    ).hexdigest()
+    cohort = {
+        "schema_version": "fbref-acceptance-cohort-v1",
+        "status": "frozen",
+        "scope": "current",
+        "cohort_size": 1,
+        "cohort_sha256": cohort_hash,
+        "target_ids": target_ids,
+        "required_page_kinds": ["competition_index"],
+        "required_routes": [],
+        "coverage_slots": {"competition_index": target_ids[0]},
+    }
+    return {
+        "run_type": "current",
+        "status": "succeeded",
+        "request_limit": 100,
+        "byte_limit": 50 * 1024 * 1024,
+        "metadata": {
+            "execution_mode": "acceptance_nonpublishing",
+            "acceptance_profile": True,
+            "acceptance_scope": "current",
+            "shard_size": 25,
+            "bootstrap_only": False,
+            "publication_eligible": False,
+            "acceptance_cohort": cohort,
+            "raw_audit": {
+                "schema_version": "fbref-raw-audit-anchor-v1",
+                "status": "passed",
+                "run_type": "current",
+                "audited_control_run_id": source_run_id,
+                "processing_control_run_id": source_run_id,
+                "successful_attempt_count": 1,
+                "audited_attempt_count": 1,
+                "zero_delta_required": False,
+            },
+            "bronze_acceptance": {
+                "schema_version": "fbref-bronze-acceptance-v1",
+                "status": "passed",
+                "processing_control_run_id": source_run_id,
+                "scope": "current",
+                "cohort_size": 1,
+                "cohort_sha256": cohort_hash,
+                "page_kind_counts": {"competition_index": 1},
+                "route_counts": {"competition_index": 1},
+                "strict_gates": {"all_cohort_targets_succeeded": True},
+            },
+        },
+    }
+
+
 @pytest.mark.parametrize(
     ("mutate", "error"),
     [
@@ -3090,6 +3508,79 @@ def test_replay_validation_accepts_audited_production_source_run(tmp_path):
         str(uuid.uuid4()), replay_source_run_id=source_run_id
     )
 
+    assert "finish:True" in control.events
+
+
+def test_acceptance_replay_accepts_only_separate_strict_nonpublishing_source(
+    tmp_path,
+):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    source_run_id = str(uuid.uuid4())
+    replay_run_id = str(uuid.uuid4())
+    source = _accepted_nonpublishing_source(source_run_id)
+    replay_summary = control.get_run_summary(replay_run_id)
+    replay_summary.update(
+        run_type="replay",
+        status="running",
+        request_limit=0,
+        byte_limit=0,
+        requests_used=0,
+        bytes_used=0,
+        target_counts={},
+        dataset_validation_counts={},
+        unvalidated_target_count=0,
+        unprocessed_raw_count=0,
+        budget_exceeded=False,
+        traffic_totals={
+            "network_attempts": 0,
+            "warm_http_successes": 0,
+            "warm_http_success_rate": None,
+            "unclassified_failures": 0,
+            "unclassified_failure_rate": 0.0,
+            "duplicate_fetch_violations": 0,
+        },
+        session_metrics={"max_bootstraps_per_session": 0},
+        metadata={
+            "execution_mode": "acceptance_replay_nonpublishing",
+            "acceptance_replay": True,
+            "acceptance_replay_source_run_id": source_run_id,
+            "publication_eligible": False,
+            "bootstrap_only": False,
+            "raw_audit": {
+                "schema_version": "fbref-raw-audit-anchor-v1",
+                "status": "passed",
+                "run_type": "replay",
+                "audited_control_run_id": source_run_id,
+                "processing_control_run_id": replay_run_id,
+                "successful_attempt_count": 1,
+                "audited_attempt_count": 1,
+                "zero_delta_required": True,
+                "artifact_sha256": "b" * 64,
+            },
+        },
+    )
+    control.run = replay_summary
+    control.get_run = lambda run_id: (
+        source if str(run_id) == source_run_id else replay_summary
+    )
+    control.get_run_summary = lambda run_id, **__: (
+        source if str(run_id) == source_run_id else replay_summary
+    )
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    assert pipeline._replay_source_error(source_run_id) == (
+        "replay_source_run_not_production_profile"
+    )
+    assert pipeline._acceptance_replay_source_error(source_run_id) is None
+    pipeline.validate_and_finish(
+        replay_run_id,
+        replay_source_run_id=source_run_id,
+        acceptance=True,
+        acceptance_replay=True,
+    )
+
+    assert "bronze_acceptance_replay_anchored" in control.events
     assert "finish:True" in control.events
 
 
@@ -3664,6 +4155,66 @@ def test_initialize_run_reaps_leases_left_by_dead_workers(tmp_path):
     assert control.created_kwargs["metadata"]["bootstrap_only"] is True
     assert control.created_kwargs["metadata"]["publication_eligible"] is False
     assert uuid.UUID(run_id)
+
+
+def test_acceptance_initialization_and_seed_anchor_exact_nonpublishing_profile(
+    tmp_path,
+):
+    class AcceptanceControl(FakeControl):
+        def migrate(self):
+            self.events.append("migrate")
+
+        def reap_expired_leases(self):
+            return 0
+
+        def create_run(self, run_type, **kwargs):
+            self.run = {
+                "run_type": run_type,
+                "status": "pending",
+                "request_limit": kwargs["request_limit"],
+                "byte_limit": kwargs["byte_limit"],
+                "requests_used": 0,
+                "bytes_used": 0,
+                "metadata": dict(kwargs["metadata"]),
+            }
+
+        def start_run(self, run_id):
+            self.run["status"] = "running"
+
+    raw = _raw_store(tmp_path)
+    control = AcceptanceControl(raw)
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+    settings = PipelineSettings.acceptance(scope="current")
+    run_id = pipeline.initialize_acceptance_run(
+        airflow_run_id="manual__acceptance",
+        dag_id="dag_accept_fbref_bronze",
+        settings=settings,
+        execution_metadata={"candidate_sha": "abc123"},
+    )
+    target_ids = ["fbref:competition_index:all", "fbref:competition:9"]
+
+    result = pipeline.seed_acceptance_cohort(
+        run_id,
+        target_ids,
+        settings=settings,
+        required_page_kinds=["competition_index", "competition"],
+        coverage_slots={
+            "competition_index": target_ids[0],
+            "competition": target_ids[1],
+        },
+    )
+
+    assert control.run["metadata"]["execution_mode"] == (
+        "acceptance_nonpublishing"
+    )
+    assert control.run["metadata"]["publication_eligible"] is False
+    assert control.run["metadata"]["acceptance_profile"] is True
+    assert result["target_ids"] == target_ids
+    assert result["cohort_size"] == 2
+    assert len(result["cohort_sha256"]) == 64
+    assert control.run["metadata"]["acceptance_cohort"]["target_ids"] == (
+        target_ids
+    )
 
 
 class FakeClearanceRejectedFetcher:

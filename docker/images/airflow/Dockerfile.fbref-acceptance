@@ -1,0 +1,55 @@
+# Exact-source overlay for isolated FBref Bronze acceptance (#949).
+#
+# Build only through scripts/build_fbref_acceptance_image.sh. That helper feeds
+# this Dockerfile and source.tar from one `git archive <full commit>`, so neither
+# dirty worktree files nor production bind mounts can replace the reviewed code.
+ARG FBREF_RUNTIME_BASE=fbref-acceptance-base:required
+FROM ${FBREF_RUNTIME_BASE}
+
+ARG FBREF_ACCEPTANCE_GIT_SHA
+ARG FBREF_ACCEPTANCE_GIT_TREE
+ARG FBREF_ACCEPTANCE_SOURCE_SHA256
+
+USER root
+COPY source.tar /tmp/fbref-acceptance-source.tar
+RUN test -n "${FBREF_ACCEPTANCE_GIT_SHA}" \
+    && test -n "${FBREF_ACCEPTANCE_GIT_TREE}" \
+    && test -n "${FBREF_ACCEPTANCE_SOURCE_SHA256}" \
+    && echo "${FBREF_ACCEPTANCE_SOURCE_SHA256}  /tmp/fbref-acceptance-source.tar" \
+        | sha256sum -c - \
+    && rm -rf /opt/airflow/dags /opt/airflow/scrapers \
+        /opt/airflow/scripts /opt/airflow/configs \
+    && tar --extract --file /tmp/fbref-acceptance-source.tar \
+        --directory /opt/airflow --no-same-owner \
+    && chown root:root /opt/airflow \
+    && chmod 0755 /opt/airflow \
+    && chown -R root:root /opt/airflow/dags /opt/airflow/scrapers \
+        /opt/airflow/scripts /opt/airflow/configs \
+    && chmod -R a-w /opt/airflow/dags /opt/airflow/scrapers \
+        /opt/airflow/scripts /opt/airflow/configs \
+    && install -d -o root -g root -m 0755 \
+        /opt/airflow/runtime-contract/fbref-acceptance \
+    && PYTHONDONTWRITEBYTECODE=1 \
+        python /opt/airflow/scripts/verify_fbref_acceptance_image.py \
+        --write-manifest \
+        --git-sha "${FBREF_ACCEPTANCE_GIT_SHA}" \
+        --git-tree "${FBREF_ACCEPTANCE_GIT_TREE}" \
+        --source-archive-sha256 "${FBREF_ACCEPTANCE_SOURCE_SHA256}" \
+    && chown root:root \
+        /opt/airflow/runtime-contract/fbref-acceptance/source-manifest.json \
+    && chmod 0444 \
+        /opt/airflow/runtime-contract/fbref-acceptance/source-manifest.json \
+    && PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/opt/airflow \
+        python /opt/airflow/scripts/proxy_filter/filter_proxy.py --help \
+        >/dev/null \
+    && rm -f /tmp/fbref-acceptance-source.tar
+
+ENV GIT_SHA=${FBREF_ACCEPTANCE_GIT_SHA} \
+    FBREF_ACCEPTANCE_SOURCE_SHA256=${FBREF_ACCEPTANCE_SOURCE_SHA256} \
+    PYTHONDONTWRITEBYTECODE=1
+LABEL org.opencontainers.image.revision=${FBREF_ACCEPTANCE_GIT_SHA} \
+      org.opencontainers.image.source-tree=${FBREF_ACCEPTANCE_GIT_TREE} \
+      org.opencontainers.image.fbref-source-sha256=${FBREF_ACCEPTANCE_SOURCE_SHA256}
+
+USER airflow
+WORKDIR /opt/airflow

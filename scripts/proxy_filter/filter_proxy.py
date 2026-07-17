@@ -114,6 +114,7 @@ FBREF_DAG_IDS = frozenset(
         "dag_ingest_fbref",
         "dag_bootstrap_fbref",
         "dag_backfill_fbref",
+        "dag_accept_fbref_bronze",
     }
 )
 SOFASCORE_DAG_IDS = frozenset({"dag_ingest_sofascore"})

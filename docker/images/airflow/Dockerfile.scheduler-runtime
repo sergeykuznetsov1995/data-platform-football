@@ -62,6 +62,7 @@ RUN curl --proto '=https' --tlsv1.2 -fsSL \
     && chown -R root:root /opt/fbref-camoufox \
     && chmod -R 0755 /opt/fbref-camoufox \
     && test -x /opt/fbref-camoufox/camoufox-bin \
+    && test -r /opt/fbref-camoufox/fontconfig/windows/fonts.conf \
     && rm -f /tmp/fbref-camoufox.zip
 
 USER airflow
