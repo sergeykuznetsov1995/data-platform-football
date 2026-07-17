@@ -153,6 +153,7 @@ COPY --chown=root:root whoscored-production-entrypoint /opt/airflow/runtime-cont
 COPY --chown=root:root whoscored-production-gate /opt/airflow/runtime-contract/docker/images/airflow/whoscored-production-gate
 COPY --chown=root:root whoscored-production-python /opt/airflow/runtime-contract/docker/images/airflow/whoscored-production-python
 COPY --chown=root:root whoscored_production_gate.py /opt/airflow/runtime-contract/docker/images/airflow/whoscored_production_gate.py
+COPY --chown=root:root whoscored_capacity_worker_bootstrap.py /opt/airflow/runtime-contract/docker/images/airflow/whoscored_capacity_worker_bootstrap.py
 COPY --chown=root:root whoscored_runtime_pth.py /opt/airflow/runtime-contract/docker/images/airflow/whoscored_runtime_pth.py
 COPY --chown=root:root whoscored_runtime_startup.py /opt/airflow/runtime-contract/docker/images/airflow/whoscored_runtime_startup.py
 COPY --chown=root:root whoscored-flaresolverr-runtime.root.dockerignore /opt/airflow/runtime-contract/.dockerignore

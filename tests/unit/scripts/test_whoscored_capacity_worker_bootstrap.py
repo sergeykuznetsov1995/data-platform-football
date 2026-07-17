@@ -514,14 +514,23 @@ def test_orchestration_signals_ready_only_after_preflight(monkeypatch):
 
 
 @pytest.mark.unit
-def test_docker_bakes_helper_only_into_scheduler_payload():
+def test_docker_bakes_helper_into_runtime_mirror_and_scheduler_payload():
     dockerfile = (ROOT / "docker/images/airflow/Dockerfile").read_text(
         encoding="utf-8"
     )
+    airflow_base = dockerfile.split(
+        "FROM airflow-base AS airflow-scheduler-payload", 1
+    )[0]
     scheduler_payload = dockerfile.split(
         "FROM airflow-base AS airflow-scheduler-payload", 1
     )[1].split("FROM airflow-base AS airflow-whoscored-proxy-payload", 1)[0]
 
+    assert (
+        "COPY --chown=root:root whoscored_capacity_worker_bootstrap.py "
+        "/opt/airflow/runtime-contract/docker/images/airflow/"
+        "whoscored_capacity_worker_bootstrap.py"
+        in airflow_base
+    )
     assert (
         "COPY --chown=root:root whoscored_capacity_worker_bootstrap.py "
         "/usr/local/libexec/whoscored_capacity_worker_bootstrap.py"

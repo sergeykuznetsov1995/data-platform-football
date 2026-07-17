@@ -762,10 +762,19 @@ services and that external evidence pass:
   --output "$WHOSCORED_RENDERED_COMPOSE" \
   > "$WHOSCORED_ADMISSION_DIR/rendered-receipt.json"
 
-# This is the only lifecycle command prefix permitted after admission. It is
-# intentionally independent of the caller environment and repeats the exact
-# helper-owned model. The whoscored-paid profile renders the protected proxy;
-# it does not authorize creating or starting it.
+# These are the only lifecycle command prefixes permitted after admission.
+# Both are intentionally independent of the caller environment. COMPOSE
+# repeats the exact helper-owned model for create-without-start. DOCKER starts
+# only the already admitted container ID, without traversing Compose
+# dependencies. The whoscored-paid profile renders the protected proxy; it
+# does not authorize creating or starting it.
+DOCKER=(
+  /usr/bin/env -i
+  HOME=/nonexistent PATH=/usr/bin:/bin
+  LANG=C.UTF-8 LC_ALL=C.UTF-8
+  DOCKER_HOST=unix:///run/docker.sock
+  /usr/bin/docker
+)
 COMPOSE=(
   /usr/bin/env -i
   HOME=/nonexistent PATH=/usr/bin:/bin
@@ -815,6 +824,11 @@ only permitted create-without-start operation is the exact
 `up --no-start --no-deps` form below. Both flags are mandatory: `--no-start`
 keeps post-create admission before first start, while `--no-deps` prevents the
 scheduler's Airflow dependencies from being created or replaced.
+Its `start` subcommand likewise has no `--no-deps` and can traverse the
+dependency graph. After post-create admission, use only exact target-only
+`docker start` through `DOCKER`, addressed by the full container ID extracted
+from that service's protected post-create receipt. A mutable container name is
+not start authority.
 Post-create admission is mandatory before the first start and names the exact
 one-service rollout wave. It repeats the daemon security-options proof, runs
 the constrained digest-attested AppArmor probe, and requires both the explicit
@@ -846,7 +860,15 @@ SEAWEED_BEFORE=$(/usr/bin/docker inspect seaweedfs | /usr/bin/jq -c '.[0] | {
   --service airflow-scheduler \
   > "$WHOSCORED_ADMISSION_DIR/post-create-scheduler-receipt.json"
 
-"${COMPOSE[@]}" start airflow-scheduler
+SCHEDULER_CONTAINER_ID=$(/usr/bin/jq -er '
+  select(.status == "admitted-v1") |
+  [.images[] | select(.service == "airflow-scheduler") | .container_id] |
+  select(length == 1) | .[0] |
+  select(type == "string" and test("^[0-9a-f]{64}$"))
+' "$WHOSCORED_ADMISSION_DIR/post-create-scheduler-receipt.json")
+test "$("${DOCKER[@]}" inspect --format '{{.Id}}' \
+  "$SCHEDULER_CONTAINER_ID")" = "$SCHEDULER_CONTAINER_ID"
+"${DOCKER[@]}" start "$SCHEDULER_CONTAINER_ID"
 
 SEAWEED_AFTER=$(/usr/bin/docker inspect seaweedfs | /usr/bin/jq -c '.[0] | {
   id: .Id, command: .Config.Cmd,
@@ -883,7 +905,15 @@ SEAWEED_BEFORE=$(/usr/bin/docker inspect seaweedfs | /usr/bin/jq -c '.[0] | {
   --service flaresolverr \
   > "$WHOSCORED_ADMISSION_DIR/post-create-flaresolverr-receipt.json"
 
-"${COMPOSE[@]}" start flaresolverr
+FLARESOLVERR_CONTAINER_ID=$(/usr/bin/jq -er '
+  select(.status == "admitted-v1") |
+  [.images[] | select(.service == "flaresolverr") | .container_id] |
+  select(length == 1) | .[0] |
+  select(type == "string" and test("^[0-9a-f]{64}$"))
+' "$WHOSCORED_ADMISSION_DIR/post-create-flaresolverr-receipt.json")
+test "$("${DOCKER[@]}" inspect --format '{{.Id}}' \
+  "$FLARESOLVERR_CONTAINER_ID")" = "$FLARESOLVERR_CONTAINER_ID"
+"${DOCKER[@]}" start "$FLARESOLVERR_CONTAINER_ID"
 
 SEAWEED_AFTER=$(/usr/bin/docker inspect seaweedfs | /usr/bin/jq -c '.[0] | {
   id: .Id, command: .Config.Cmd,
@@ -1006,7 +1036,9 @@ have both been approved. After that separate approval, create and attest
 `whoscored_proxy_filter` and `flaresolverr_whoscored_paid` first, start both,
 then create, attest and start `whoscored_paid_gateway`. Use the same exact
 `up --no-start --no-deps --no-build --pull always SERVICE` operation and a
-separate `post-create --service ...` receipt
+separate `post-create --service ...` receipt, then use exact target-only
+`"${DOCKER[@]}" start "$ADMITTED_CONTAINER_ID"` after extracting and
+validating the one full service-bound ID from that receipt
 for each service. The paid browser has no host port/direct egress, the filter
 has only provider egress, and the gateway alone spans the API, browser and
 direct-egress networks. Rendering the `whoscored-paid` profile is never
