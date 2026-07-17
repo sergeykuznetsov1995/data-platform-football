@@ -751,3 +751,25 @@ def test_release_build_rejects_local_tool_caches() -> None:
 
     for cache_name in ("__pycache__", ".pytest_cache", ".ruff_cache"):
         assert f"-name {cache_name}" in promotion
+
+
+def test_targeted_rollout_creates_only_one_stopped_service_before_admission() -> None:
+    runbook = (ROOT / "docs" / "operations" / "whoscored-production.md").read_text(
+        encoding="utf-8"
+    )
+    rollout = runbook.split("### Targeted runtime deployment", 1)[1].split(
+        "##### Initialize the paid-filter state exactly once", 1
+    )[0]
+    for service in ("airflow-scheduler", "flaresolverr"):
+        create = (
+            '"${COMPOSE[@]}" up --no-start --no-deps --no-build --pull always '
+            f"\\\n  {service}"
+        )
+        admission = f"--service {service} \\\n"
+        start = f'"${{COMPOSE[@]}}" start {service}'
+
+        assert create in rollout
+        assert rollout.index(create) < rollout.index(admission)
+        assert rollout.index(admission) < rollout.index(start)
+
+    assert '"${COMPOSE[@]}" create' not in rollout

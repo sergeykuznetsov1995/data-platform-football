@@ -810,6 +810,11 @@ identity and create the scheduler without starting it. The fingerprint binds
 container ID, command and `/data` mount and must remain identical. `--no-build`
 is mandatory even though the verified model has no remaining protected build;
 `--pull always` resolves the attested registry digest, never a mutable tag.
+Compose 2.40 does not expose `--no-deps` on its `create` subcommand, so the
+only permitted create-without-start operation is the exact
+`up --no-start --no-deps` form below. Both flags are mandatory: `--no-start`
+keeps post-create admission before first start, while `--no-deps` prevents the
+scheduler's Airflow dependencies from being created or replaced.
 Post-create admission is mandatory before the first start and names the exact
 one-service rollout wave. It repeats the daemon security-options proof, runs
 the constrained digest-attested AppArmor probe, and requires both the explicit
@@ -825,7 +830,7 @@ SEAWEED_BEFORE=$(/usr/bin/docker inspect seaweedfs | /usr/bin/jq -c '.[0] | {
     {name: .Name, source: .Source, destination: .Destination}]
 }' | /usr/bin/sha256sum | /usr/bin/cut -d" " -f1)
 
-"${COMPOSE[@]}" create --no-deps --no-build --pull always \
+"${COMPOSE[@]}" up --no-start --no-deps --no-build --pull always \
   airflow-scheduler
 
 "${ADMISSION_PYTHON[@]}" \
@@ -852,10 +857,43 @@ test "$SEAWEED_AFTER" = "$SEAWEED_BEFORE"
 ```
 
 FlareSolverr is a separate rollout wave. Re-run the same storage fingerprint,
-then create only `flaresolverr`, run the same post-create command with
-`--service flaresolverr` and a fresh receipt path, and only then run
-`"${COMPOSE[@]}" start flaresolverr`. Do not combine its receipt with the
-scheduler receipt.
+then repeat the exact create-without-start, post-create and start sequence for
+only `flaresolverr` with a fresh receipt path:
+
+```bash
+SEAWEED_BEFORE=$(/usr/bin/docker inspect seaweedfs | /usr/bin/jq -c '.[0] | {
+  id: .Id, command: .Config.Cmd,
+  data_mounts: [.Mounts[] | select(.Destination == "/data") |
+    {name: .Name, source: .Source, destination: .Destination}]
+}' | /usr/bin/sha256sum | /usr/bin/cut -d" " -f1)
+
+"${COMPOSE[@]}" up --no-start --no-deps --no-build --pull always \
+  flaresolverr
+
+"${ADMISSION_PYTHON[@]}" \
+  "$RELEASE/scripts/whoscored_production_admission.py" post-create \
+  --root "$RELEASE" \
+  --deployment-attestation "$WHOSCORED_DEPLOYMENT_ATTESTATION" \
+  --override "$WHOSCORED_DIGEST_OVERRIDE" \
+  --env-file "$COMPOSE_ENV_FILE" \
+  --env-file "$WHOSCORED_ENV_FILE" \
+  --env-file "$PROXY_POOL_ENV_FILE" \
+  --project data-platform \
+  --provider-quota-receipt "$WHOSCORED_PROVIDER_QUOTA_RECEIPT" \
+  --service flaresolverr \
+  > "$WHOSCORED_ADMISSION_DIR/post-create-flaresolverr-receipt.json"
+
+"${COMPOSE[@]}" start flaresolverr
+
+SEAWEED_AFTER=$(/usr/bin/docker inspect seaweedfs | /usr/bin/jq -c '.[0] | {
+  id: .Id, command: .Config.Cmd,
+  data_mounts: [.Mounts[] | select(.Destination == "/data") |
+    {name: .Name, source: .Source, destination: .Destination}]
+}' | /usr/bin/sha256sum | /usr/bin/cut -d" " -f1)
+test "$SEAWEED_AFTER" = "$SEAWEED_BEFORE"
+```
+
+Do not combine its receipt with the scheduler receipt.
 
 ##### Initialize the paid-filter state exactly once
 
@@ -966,8 +1004,9 @@ The three paid-boundary services remain forbidden to create or start until the
 dedicated provider quota/usage receipt and the reviewed exact-origin release
 have both been approved. After that separate approval, create and attest
 `whoscored_proxy_filter` and `flaresolverr_whoscored_paid` first, start both,
-then create, attest and start `whoscored_paid_gateway`. Use `--no-deps
---no-build --pull always` and a separate `post-create --service ...` receipt
+then create, attest and start `whoscored_paid_gateway`. Use the same exact
+`up --no-start --no-deps --no-build --pull always SERVICE` operation and a
+separate `post-create --service ...` receipt
 for each service. The paid browser has no host port/direct egress, the filter
 has only provider egress, and the gateway alone spans the API, browser and
 direct-egress networks. Rendering the `whoscored-paid` profile is never
