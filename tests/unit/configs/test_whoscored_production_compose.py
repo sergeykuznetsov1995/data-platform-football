@@ -739,3 +739,15 @@ def test_ready_promotion_names_every_local_build_service() -> None:
     }
 
     assert documented == local_builds
+
+
+def test_release_build_rejects_local_tool_caches() -> None:
+    runbook = (ROOT / "docs" / "operations" / "whoscored-production.md").read_text(
+        encoding="utf-8"
+    )
+    promotion = runbook.split("#### Future ready-v1 promotion", 1)[1].split(
+        "Deploy that exact reviewed promotion SHA", 1
+    )[0]
+
+    for cache_name in ("__pycache__", ".pytest_cache", ".ruff_cache"):
+        assert f"-name {cache_name}" in promotion

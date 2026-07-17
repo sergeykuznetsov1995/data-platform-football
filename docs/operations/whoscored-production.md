@@ -476,6 +476,9 @@ DOCKER_CMD=(
 
 test -z "$(/usr/bin/find "$RELEASE" -path "$RELEASE/.git" -prune -o \
   -name .gitattributes -print -quit)"
+test -z "$(/usr/bin/find "$RELEASE" -path "$RELEASE/.git" -prune -o \
+  -type d \( -name __pycache__ -o -name .pytest_cache -o -name .ruff_cache \) \
+  -print -quit)"
 test ! -e "$("${CLEAN_GIT[@]}" rev-parse --git-path info/attributes)"
 test -z "$("${CLEAN_GIT[@]}" status --porcelain=v1 --untracked-files=all)"
 test "$("${CLEAN_GIT[@]}" remote get-url origin)" = \
