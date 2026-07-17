@@ -16,10 +16,11 @@ Benefits of Iceberg:
 """
 
 import logging
+import math
 import os
 import uuid
 from datetime import datetime
-from typing import List, Optional, Sequence, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
 
 import pandas as pd
 import pyarrow as pa
@@ -108,6 +109,12 @@ class IcebergWriter:
             logger.warning(f"Could not check table existence: {e}")
             return False
 
+    @staticmethod
+    def _is_null_scalar(value: Any) -> bool:
+        if value is None or value is pd.NaT:
+            return True
+        return isinstance(value, float) and math.isnan(value)
+
     def _pandas_to_arrow(self, df: pd.DataFrame) -> pa.Table:
         """Convert pandas DataFrame to PyArrow Table.
 
@@ -124,7 +131,30 @@ class IcebergWriter:
                 # Convert to datetime64[us] which Iceberg supports
                 df[col] = df[col].astype('datetime64[us]')
 
-        return pa.Table.from_pandas(df, preserve_index=False)
+        try:
+            return pa.Table.from_pandas(df, preserve_index=False)
+        except (pa.ArrowInvalid, pa.ArrowTypeError):
+            # A source that answers with a number for one row and a word for the
+            # next (FotMob roundName: 12 vs "Round of 16") produces a mixed
+            # object column that Arrow cannot type — and this schema inference
+            # runs on EVERY write, so it fails even when the live column is
+            # already varchar. Such a column is textual by nature: the number is
+            # a label, not a measure. Stringify exactly the columns Arrow
+            # rejects and leave every other dtype untouched.
+            for col in df.columns:
+                if df[col].dtype != object:
+                    continue
+                try:
+                    pa.array(df[col])
+                except (pa.ArrowInvalid, pa.ArrowTypeError):
+                    logger.warning(
+                        f"Column '{col}' mixes incompatible types; writing it as "
+                        "text so the heterogeneous source values survive"
+                    )
+                    df[col] = df[col].map(
+                        lambda v: None if self._is_null_scalar(v) else str(v)
+                    )
+            return pa.Table.from_pandas(df, preserve_index=False)
 
     def _add_metadata_columns(
         self,
@@ -263,6 +293,7 @@ class IcebergWriter:
         source: Optional[str] = None,
         delete_filter: Optional[str] = None,
         merge_keys: Optional[Sequence[str]] = None,
+        bulk_arrow: bool = False,
     ) -> str:
         """
         Write DataFrame to Iceberg table via Trino INSERT.
@@ -296,6 +327,7 @@ class IcebergWriter:
             return self._write_to_iceberg(
                 df, database, table, partition_spec, mode=mode,
                 delete_filter=delete_filter, merge_keys=merge_keys,
+                bulk_arrow=bulk_arrow,
             )
         except Exception as e:
             logger.error(f"Error writing to {database}.{table}: {e}")
@@ -310,6 +342,7 @@ class IcebergWriter:
         mode: str = 'append',
         delete_filter: Optional[str] = None,
         merge_keys: Optional[Sequence[str]] = None,
+        bulk_arrow: bool = False,
     ) -> str:
         """
         Write DataFrame directly to Iceberg via Trino INSERT.
@@ -381,16 +414,74 @@ class IcebergWriter:
         # insert_dataframe_atomic so it runs AFTER the data is safely staged and
         # back-to-back with the merge INSERT — a failed INSERT can no longer
         # leave the table empty behind a committed DELETE (#314 / #283).
-        rows_inserted = trino.insert_dataframe_atomic(
-            database,
-            table,
-            df,
-            delete_filter=delete_filter,
-            merge_keys=merge_keys,
-        )
+        if bulk_arrow:
+            if delete_filter or merge_keys:
+                raise ValueError("bulk Arrow append does not support replace or merge")
+            rows_inserted = self._append_dataframe_pyiceberg(
+                arrow_table, database=database, table=table
+            )
+        else:
+            rows_inserted = trino.insert_dataframe_atomic(
+                database,
+                table,
+                df,
+                delete_filter=delete_filter,
+                merge_keys=merge_keys,
+            )
         logger.info(f"Inserted {rows_inserted} rows into {full_table}")
 
         return full_table
+
+    def _append_dataframe_pyiceberg(
+        self, arrow_table: pa.Table, *, database: str, table: str
+    ) -> int:
+        """Append a large frame as Parquet in one Iceberg transaction.
+
+        Trino ``VALUES`` is intentionally bounded to a 900 KB query.  That is
+        safe for normal batches but turns million-row long-form statistics into
+        thousands of queries.  PyIceberg writes the same Arrow frame to Parquet
+        and commits it as one snapshot, without changing the manifest-based
+        publication protocol used by the source repository.
+        """
+        from pyiceberg.catalog import load_catalog
+        from pyiceberg.io.pyarrow import PyArrowFileIO, schema_to_pyarrow
+
+        required = ("S3_ACCESS_KEY", "S3_SECRET_KEY")
+        missing = [name for name in required if not os.environ.get(name)]
+        if missing:
+            raise RuntimeError(
+                "bulk Iceberg append requires environment variables: "
+                + ", ".join(missing)
+            )
+        properties = {
+            "s3.endpoint": os.environ.get("S3_ENDPOINT", "http://seaweedfs:8333"),
+            "s3.region": os.environ.get("S3_REGION", "us-east-1"),
+            "s3.access-key-id": os.environ["S3_ACCESS_KEY"],
+            "s3.secret-access-key": os.environ["S3_SECRET_KEY"],
+        }
+        catalog = load_catalog(
+            "football_bulk_writer",
+            type="rest",
+            uri=os.environ.get(
+                "ICEBERG_REST_URI", "http://lakekeeper:8181/catalog"
+            ),
+            warehouse=os.environ.get("ICEBERG_WAREHOUSE", "football"),
+        )
+        target = catalog.load_table(f"{database}.{table}")
+        target.io = PyArrowFileIO(properties)
+        target_schema = schema_to_pyarrow(target.schema())
+        source = {name: arrow_table[name] for name in arrow_table.column_names}
+        arrays = []
+        for field in target_schema:
+            column = source.get(field.name)
+            if column is None:
+                column = pa.nulls(len(arrow_table), type=field.type)
+            elif column.type != field.type:
+                column = column.cast(field.type, safe=False)
+            arrays.append(column)
+        aligned = pa.Table.from_arrays(arrays, schema=target_schema)
+        target.append(aligned)
+        return len(aligned)
 
     def create_table_if_not_exists(
         self,
