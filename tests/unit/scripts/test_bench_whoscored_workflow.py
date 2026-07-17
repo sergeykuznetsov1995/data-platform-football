@@ -37,6 +37,79 @@ sys.modules[SPEC.name] = bench
 SPEC.loader.exec_module(bench)
 
 
+def test_production_bootstrap_attests_before_application_import(monkeypatch):
+    source = SCRIPT.read_text(encoding="utf-8")
+    prefix, separator, _remainder = source.partition("\nimport argparse\n")
+    assert separator
+    calls: list[str] = []
+    contract = object()
+    monkeypatch.delenv("WHOSCORED_CAPACITY_BUNDLE_PATH", raising=False)
+    monkeypatch.delenv("WHOSCORED_CAPACITY_SITE_PACKAGES", raising=False)
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    monkeypatch.setattr(sys, "_whoscored_runtime_startup_schema", 2, raising=False)
+    monkeypatch.setattr(
+        sys,
+        "_load_whoscored_runtime_contract",
+        lambda root: calls.append(root) or contract,
+        raising=False,
+    )
+
+    namespace = {
+        "__file__": "/opt/airflow/scripts/research/bench_whoscored_workflow.py",
+        "__name__": "whoscored_capacity_bootstrap_test",
+    }
+    exec(compile(prefix, str(SCRIPT), "exec"), namespace)
+
+    assert calls == ["/opt/airflow"]
+    assert namespace["_WHOSCORED_RUNTIME_CONTRACT"] is contract
+
+
+@pytest.mark.parametrize("missing", ["schema", "loader"])
+def test_production_bootstrap_requires_image_anchor(monkeypatch, missing):
+    source = SCRIPT.read_text(encoding="utf-8")
+    prefix, separator, _remainder = source.partition("\nimport argparse\n")
+    assert separator
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    if missing == "schema":
+        monkeypatch.delattr(sys, "_whoscored_runtime_startup_schema", raising=False)
+    else:
+        monkeypatch.setattr(
+            sys, "_whoscored_runtime_startup_schema", 2, raising=False
+        )
+        monkeypatch.delattr(sys, "_load_whoscored_runtime_contract", raising=False)
+
+    with pytest.raises(RuntimeError, match="startup anchor|runtime loader"):
+        exec(
+            compile(prefix, str(SCRIPT), "exec"),
+            {
+                "__file__": (
+                    "/opt/airflow/scripts/research/bench_whoscored_workflow.py"
+                ),
+                "__name__": "whoscored_capacity_bootstrap_failure_test",
+            },
+        )
+
+
+def test_run_rechecks_production_runtime_class(monkeypatch):
+    operations: list[str] = []
+    monkeypatch.setattr(
+        bench,
+        "_WHOSCORED_RUNTIME_CONTRACT",
+        SimpleNamespace(
+            require_production_runtime_class=lambda *, operation: operations.append(
+                operation
+            )
+        ),
+    )
+    monkeypatch.setattr(bench, "_validate_args", lambda _args: "stop after check")
+
+    code, report = bench.run(Namespace())
+
+    assert code == 2
+    assert report["status"] == "configuration_error"
+    assert operations == ["WhoScored capacity workflow"]
+
+
 @pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGHUP])
 def test_cli_termination_handler_is_one_shot_system_exit(signum):
     previous = bench._install_cli_termination_handlers()

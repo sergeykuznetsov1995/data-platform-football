@@ -83,7 +83,7 @@
     "scripts/proxy_filter/budget.py": "3bc5f80272ddca2bab0cff5d461864b68828b2772d84054af11ce345160adeaf",
     "scripts/proxy_filter/filter_proxy.py": "aac489909850b2cacb37989d2535e52f09b8b399924d3c21587ae9c44cafea20",
     "scripts/research/bench_whoscored_capacity.py": "cc267de1c26d9ce26e2d5bb19c4c69842a593a9c5b61db5dfd7ccdcad2662983",
-    "scripts/research/bench_whoscored_workflow.py": "a0d9abfc55bedac3cf86ed7e4d014d683cd8933235fcc830d621085773cc32ad",
+    "scripts/research/bench_whoscored_workflow.py": "71b77bbe5541a213579732954b52f044b9ac31bf8b3568576f9b9254107cb746",
     "scripts/research/whoscored_capacity_container_runtime.py": "c434c5ba31de8fa49f651dcc9c36d03773d40631c60925d067e0c01c85401b22",
     "scripts/research/whoscored_capacity_worker_exec.py": "56e1e498c8773ef7b422912e1acb8e498552ce42d547727dd2b5a58595868273",
     "scripts/validate_whoscored_build_provenance.py": "abd196849a2d15b2b297bee8ee202ede743ecbfa941f3047031152815608aa3d",

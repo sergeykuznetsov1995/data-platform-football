@@ -13,7 +13,29 @@ Any paid-route use, partial entity result, unexpected warm network request, or
 incremental fetch of more than the invalidated target fails the process.
 """
 
+# ruff: noqa: E402 -- production attestation must precede every later import
+
 from __future__ import annotations
+
+import sys as _whoscored_bootstrap_sys
+
+_whoscored_source = __file__
+if not _whoscored_source.startswith("/"):
+    raise RuntimeError("WhoScored capacity workflow requires an absolute source path")
+_whoscored_production = _whoscored_source.startswith("/opt/airflow/")
+_WHOSCORED_RUNTIME_CONTRACT = None
+if _whoscored_production:
+    if (
+        getattr(_whoscored_bootstrap_sys, "_whoscored_runtime_startup_schema", None)
+        != 2
+    ):
+        raise RuntimeError("image-baked WhoScored startup anchor is required")
+    _whoscored_runtime_loader = getattr(
+        _whoscored_bootstrap_sys, "_load_whoscored_runtime_contract", None
+    )
+    if not callable(_whoscored_runtime_loader):
+        raise RuntimeError("image-owned WhoScored runtime loader is required")
+    _WHOSCORED_RUNTIME_CONTRACT = _whoscored_runtime_loader("/opt/airflow")
 
 import argparse
 from contextlib import ExitStack
@@ -1216,6 +1238,10 @@ def run(
     factories: Optional[BenchmarkFactories] = None,
 ) -> tuple[int, dict[str, Any]]:
     """Execute the benchmark and return an exit code plus JSON-safe report."""
+    if _WHOSCORED_RUNTIME_CONTRACT is not None:
+        _WHOSCORED_RUNTIME_CONTRACT.require_production_runtime_class(
+            operation="WhoScored capacity workflow"
+        )
     validation_error = _validate_args(args)
     if validation_error:
         return 2, {
