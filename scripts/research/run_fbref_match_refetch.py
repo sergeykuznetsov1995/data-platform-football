@@ -66,6 +66,7 @@ from scrapers.fbref.raw_store import (  # noqa: E402
 )
 from scrapers.fbref.settings import (  # noqa: E402
     DEFAULT_BOOTSTRAP_REQUEST_RESERVATION,
+    DEFAULT_BROWSER_BYTE_LIMIT_BYTES,
     DEFAULT_DOMAIN_INTERVAL_SECONDS,
     DEFAULT_REQUEST_RESERVATION_BYTES,
     MIB,
@@ -115,7 +116,16 @@ MAX_BYTE_LIMIT_MB = 25
 MIN_REQUEST_LIMIT = (
     DEFAULT_BOOTSTRAP_REQUEST_RESERVATION + MAX_TARGET_HTTP_ATTEMPTS
 )
-MIN_BYTE_LIMIT_MB = max(1, DEFAULT_REQUEST_RESERVATION_BYTES // MIB)
+MIN_BYTE_LIMIT_MB = max(
+    1,
+    (
+        DEFAULT_BROWSER_BYTE_LIMIT_BYTES
+        + DEFAULT_REQUEST_RESERVATION_BYTES
+        + MIB
+        - 1
+    )
+    // MIB,
+)
 MAX_TARGETS_PER_INVOCATION = 25
 REGISTRY_MISSING_HINT = "registry_missing"
 _FETCH_STAGE = "fetch_matches"
@@ -444,6 +454,13 @@ def run_refetch(
         if initialized_run_id != expected_run_id:
             raise RefetchInvariantError("pipeline returned an unexpected run id")
 
+        stage = "acquire_publication_lock"
+        active_pipeline.control.acquire_publication_lock(
+            expected_run_id,
+            dag_id=REFETCH_DAG_ID,
+            ttl_seconds=2 * 60 * 60,
+        )
+
         stage = "force_due_targets"
         due_at = (clock or (lambda: datetime.now(timezone.utc)))()
         if due_at.tzinfo is None:
@@ -514,6 +531,9 @@ def run_refetch(
 
         stage = "validate"
         validation = active_pipeline.validate_and_finish(expected_run_id)
+
+        stage = "release_publication_lock"
+        active_pipeline.control.release_publication_lock(expected_run_id)
     except Exception as exc:  # noqa: BLE001 - return a redacted JSON failure
         finish_attempted = False
         hint = None
@@ -524,6 +544,12 @@ def run_refetch(
                 )
             finish_attempted = True
             _best_effort_fail_run(active_pipeline, expected_run_id)
+            try:
+                active_pipeline.control.release_publication_lock(
+                    expected_run_id
+                )
+            except Exception:  # noqa: BLE001 - preserve original failure
+                pass
         raise RefetchExecutionError(
             stage=stage,
             error_class=type(exc).__name__,

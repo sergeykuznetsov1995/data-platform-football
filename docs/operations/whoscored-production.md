@@ -1231,8 +1231,9 @@ not satisfy throughput or representative-workload gates.
 
 Final focused validation passed 403 tests. Independent FlareSolverr and
 capacity reviews passed 175 and 333 tests respectively and both returned
-READY. The full unit suite reported 5,723 passed, 46 skipped, and one known
-unrelated SofaScore fingerprint failure.
+READY. That historical full unit run reported 5,723 passed, 46 skipped, and a
+SofaScore fingerprint failure that was fixed later; it is not a release
+exception.
 
 The replacement six-hour canary retained at
 `/root/fbref-949-runtime/whoscored-capacity-20260714T234235Z.json` (SHA-256

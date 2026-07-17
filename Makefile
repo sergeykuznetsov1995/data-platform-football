@@ -210,24 +210,15 @@ urls:
 # Deterministic FBref verification. Live traffic requires an explicit bounded
 # canary; this target never opens the production transport.
 test-fbref-offline:
-	$(COMPOSE) exec airflow-scheduler python -m pytest -q \
-		tests/unit/scrapers/test_fbref_control_store.py \
-		tests/unit/scrapers/test_fbref_raw_store_v2.py \
-		tests/unit/scrapers/test_fbref_page_document.py \
-		tests/unit/scrapers/test_fbref_discovery.py \
-		tests/unit/scrapers/test_fbref_camoufox_transport.py \
-		tests/unit/scrapers/test_fbref_fetcher.py \
-		tests/unit/scrapers/test_fbref_pipeline.py \
-		tests/unit/scrapers/test_fbref_generic_bronze.py \
-		tests/unit/scrapers/test_fbref_typed_bronze.py \
-		tests/unit/dags/test_dag_ingest_fbref.py \
-		tests/unit/dags/test_dag_backfill_fbref.py \
-		tests/unit/dags/test_dag_replay_fbref.py \
-		tests/unit/dags/test_fbref_medallion_order.py \
-		tests/unit/dags/test_fbref_pipeline_tasks.py \
-		tests/unit/scripts/test_fbref_offline_remediation.py \
-		tests/unit/scripts/test_fbref_standalone_tools.py \
-		tests/unit/scripts/test_run_fbref_canary.py
+	@$(COMPOSE) exec airflow-scheduler bash -ec '\
+		tests="$$(find tests/unit -type f -name "*fbref*.py" -print | sort)"; \
+		test -n "$$tests"; \
+		python -m pytest -q $$tests \
+			tests/unit/dags/test_dag_iceberg_maintenance_daily.py \
+			tests/unit/dags/test_maintenance_tasks.py \
+			tests/unit/scripts/test_filter_proxy.py \
+			tests/unit/scrapers/test_proxy_manager.py \
+			tests/unit/scrapers/test_scrapers_lazy_import.py'
 
 # Test proxy pool statistics
 test-proxy-stats:
@@ -242,7 +233,7 @@ stats = pm.get_stats(); \
 print(json.dumps({k: v for k, v in stats.items() if k != 'proxies'}, indent=2)); \
 print(f'\\nFirst 5 proxies:'); \
 for p in stats['proxies'][:5]: \
-    print(f'  {p[\"host\"]}:{p[\"port\"]} - success_rate={p[\"success_rate\"]}'); \
+    print(f'  {p[\"proxy\"]} - success_rate={p[\"success_rate\"]}'); \
 "
 
 # =============================================================================

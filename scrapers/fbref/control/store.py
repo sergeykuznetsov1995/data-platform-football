@@ -8,6 +8,7 @@ lease epoch.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import uuid
@@ -32,6 +33,15 @@ from scrapers.fbref.control.models import (
     SeasonRegistryEntry,
     TargetLease,
     ThrottleSlot,
+)
+from scrapers.fbref.policy import (
+    DISCOVERY_SPINE_PAGE_KINDS,
+    OTHER_PUBLICATION_CRITICAL_PAGE_KINDS,
+    PUBLICATION_FRESHNESS_PAGE_KINDS,
+)
+from scrapers.fbref.settings import (
+    DEFAULT_DOMAIN_INTERVAL_SECONDS,
+    MIN_DOMAIN_INTERVAL_SECONDS,
 )
 
 
@@ -90,6 +100,9 @@ _PAGE_KIND_SLA_VALUES = ", ".join(
     f"('{page_kind}', {seconds})"
     for page_kind, seconds in sorted(_PAGE_KIND_SLA_SECONDS.items())
 )
+_PENDING_MATCH_SAMPLE_LIMIT = 10
+_MAX_FRONTIER_DISCOVERY_TARGETS = 1000
+_MAX_FRONTIER_DISCOVERY_EDGES = 5000
 _FRONTIER_SCOPE_CTE = """
     WITH declared_scope AS (
         SELECT frontier.target_id, frontier.source,
@@ -293,6 +306,138 @@ def _json(value: Optional[Mapping[str, Any]]) -> str:
     return json.dumps(dict(value or {}), sort_keys=True, separators=(",", ":"))
 
 
+def _json_mapping(value: object, name: str) -> dict[str, Any]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise StateConflict(f"{name} is not valid JSON") from exc
+    if not isinstance(value, Mapping):
+        raise StateConflict(f"{name} must be a JSON object")
+    return dict(value)
+
+
+def _sha256_hex(value: object, name: str) -> str:
+    normalized = str(value).strip().lower()
+    if len(normalized) != 64 or any(
+        character not in "0123456789abcdef" for character in normalized
+    ):
+        raise ValueError(f"{name} must be a SHA256 hex digest")
+    return normalized
+
+
+def _raw_baseline_evidence(value: Mapping[str, Any]) -> dict[str, Any]:
+    evidence = dict(value)
+    schema_version = _text(
+        evidence.get("schema_version"), "raw baseline schema_version"
+    )
+    if not schema_version.startswith("fbref-raw-inventory-v"):
+        raise ValueError("raw baseline schema_version is unsupported")
+    return {
+        "schema_version": schema_version,
+        "raw_root_sha256": _sha256_hex(
+            evidence.get("raw_root_sha256"), "raw baseline raw_root_sha256"
+        ),
+        "object_count": _non_negative(
+            evidence.get("object_count"), "raw baseline object_count"
+        ),
+        "encoded_bytes": _non_negative(
+            evidence.get("encoded_bytes"), "raw baseline encoded_bytes"
+        ),
+        "fingerprint_sha256": _sha256_hex(
+            evidence.get("fingerprint_sha256"),
+            "raw baseline fingerprint_sha256",
+        ),
+        "baseline_sha256": _sha256_hex(
+            evidence.get("baseline_sha256"), "raw baseline baseline_sha256"
+        ),
+    }
+
+
+def _attempt_snapshot(attempt_ids: Iterable[object]) -> dict[str, Any]:
+    normalized_ids = sorted(_uuid(item, "attempt_id") for item in attempt_ids)
+    encoded = json.dumps(
+        normalized_ids, sort_keys=True, separators=(",", ":")
+    ).encode("ascii")
+    return {
+        "schema_version": "fbref-raw-attempt-snapshot-v1",
+        "successful_attempt_count": len(normalized_ids),
+        "successful_attempt_ids_sha256": hashlib.sha256(encoded).hexdigest(),
+    }
+
+
+def _validated_attempt_snapshot(value: Mapping[str, Any]) -> dict[str, Any]:
+    snapshot = dict(value)
+    if snapshot.get("schema_version") != "fbref-raw-attempt-snapshot-v1":
+        raise StateConflict("raw fetch attempt snapshot schema is unsupported")
+    return {
+        "schema_version": "fbref-raw-attempt-snapshot-v1",
+        "successful_attempt_count": _non_negative(
+            snapshot.get("successful_attempt_count"),
+            "successful_attempt_count",
+        ),
+        "successful_attempt_ids_sha256": _sha256_hex(
+            snapshot.get("successful_attempt_ids_sha256"),
+            "successful_attempt_ids_sha256",
+        ),
+    }
+
+
+def _raw_audit_evidence(value: Mapping[str, Any]) -> dict[str, Any]:
+    evidence = dict(value)
+    if evidence.get("schema_version") != "fbref-raw-audit-anchor-v1":
+        raise StateConflict("raw audit anchor schema is unsupported")
+    if str(evidence.get("status") or "").casefold() != "passed":
+        raise StateConflict("raw audit anchor must have passed status")
+    run_type = str(evidence.get("run_type") or "").strip().casefold()
+    if run_type not in {"current", "backfill", "replay"}:
+        raise StateConflict("raw audit anchor run_type is unsupported")
+    failure_count = _non_negative(
+        evidence.get("failure_count"), "raw audit failure_count"
+    )
+    if failure_count:
+        raise StateConflict("passed raw audit anchor has failures")
+    zero_delta_required = evidence.get("zero_delta_required")
+    if not isinstance(zero_delta_required, bool):
+        raise StateConflict("raw audit zero_delta_required must be boolean")
+    successful_attempt_count = _non_negative(
+        evidence.get("successful_attempt_count"),
+        "raw audit successful_attempt_count",
+    )
+    audited_attempt_count = _non_negative(
+        evidence.get("audited_attempt_count"),
+        "raw audit audited_attempt_count",
+    )
+    if audited_attempt_count != successful_attempt_count:
+        raise StateConflict("raw audit did not audit every successful attempt")
+    return {
+        "schema_version": "fbref-raw-audit-anchor-v1",
+        "status": "passed",
+        "run_type": run_type,
+        "audited_control_run_id": _uuid(
+            evidence.get("audited_control_run_id"),
+            "audited_control_run_id",
+        ),
+        "processing_control_run_id": _uuid(
+            evidence.get("processing_control_run_id"),
+            "processing_control_run_id",
+        ),
+        "successful_attempt_count": successful_attempt_count,
+        "audited_attempt_count": audited_attempt_count,
+        "failure_count": 0,
+        "zero_delta_required": zero_delta_required,
+        "attempt_snapshot_sha256": _sha256_hex(
+            evidence.get("attempt_snapshot_sha256"),
+            "raw audit attempt_snapshot_sha256",
+        ),
+        "artifact_sha256": _sha256_hex(
+            evidence.get("artifact_sha256"),
+            "raw audit artifact_sha256",
+        ),
+        "artifact": _text(evidence.get("artifact"), "raw audit artifact"),
+    }
+
+
 def _row_dict(cursor: Any, row: Any) -> Optional[dict]:
     if row is None:
         return None
@@ -377,7 +522,10 @@ class ControlStore:
             return connection.cursor()
 
     @contextmanager
-    def _transaction(self):
+    def _transaction(self, existing_cursor: Any = None):
+        if existing_cursor is not None:
+            yield existing_cursor
+            return
         connection = self._connect()
         cursor = self._cursor(connection)
         try:
@@ -435,6 +583,53 @@ class ControlStore:
                 )
                 applied_now.append(migration.version)
         return tuple(applied_now)
+
+    def validate_migrations(self) -> dict[str, Any]:
+        """Verify the complete installed migration history without mutating it.
+
+        Runtime workers must never silently bootstrap or upgrade the control
+        schema.  Deployment owns ``migrate()``; this read-only preflight proves
+        that the database has exactly the versions, names, and checksums known
+        to the running code before an Airflow control run is created.
+        """
+
+        with self._transaction() as cursor:
+            cursor.execute("SET TRANSACTION READ ONLY")
+            cursor.execute(
+                """
+                SELECT version, name, checksum
+                FROM fbref_control.schema_migration
+                ORDER BY version
+                """
+            )
+            installed = {
+                int(row["version"]): row for row in _fetchall(cursor)
+            }
+
+        expected = {migration.version: migration for migration in MIGRATIONS}
+        missing = sorted(set(expected) - set(installed))
+        unexpected = sorted(set(installed) - set(expected))
+        if missing or unexpected:
+            raise MigrationError(
+                "FBref control migration history is incomplete: "
+                f"missing={missing}, unexpected={unexpected}"
+            )
+        for version, migration in expected.items():
+            row = installed[version]
+            if (
+                row.get("name") != migration.name
+                or row.get("checksum") != migration.checksum
+            ):
+                raise MigrationError(
+                    "FBref migration history checksum mismatch at "
+                    f"version {version}"
+                )
+        return {
+            "status": "passed",
+            "versions": sorted(expected),
+            "checksum_verified": True,
+            "read_only": True,
+        }
 
     def create_run(
         self,
@@ -728,6 +923,84 @@ class ControlStore:
             )
             return _fetchone(cursor)
 
+    def assert_publication_lock_owner(
+        self,
+        run_id: object,
+        *,
+        source: str = "fbref",
+    ) -> dict:
+        """Fail unless ``run_id`` owns the active publication generation."""
+        normalized_run_id = _uuid(run_id, "run_id")
+        normalized_source = _text(source, "source")
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                SELECT source, owner_run_id, owner_dag_id, acquired_at,
+                       expires_at, released_at,
+                       (released_at IS NULL
+                        AND expires_at > clock_timestamp()) AS active
+                FROM fbref_control.publication_lock
+                WHERE source = %s
+                """,
+                (normalized_source,),
+            )
+            lock = _fetchone(cursor)
+        if (
+            lock is None
+            or str(lock["owner_run_id"]) != normalized_run_id
+            or lock["released_at"] is not None
+            or not bool(lock["active"])
+        ):
+            raise StateConflict(
+                "Active publication lock is not owned by this control run"
+            )
+        lock["owner_run_id"] = str(lock["owner_run_id"])
+        lock["active"] = True
+        return lock
+
+    @contextmanager
+    def guard_publication_lock(
+        self,
+        run_id: object,
+        *,
+        source: str = "fbref",
+    ):
+        """Fence one external publication while its owner is still active.
+
+        The row lock is deliberately held across the caller's Trino/Iceberg
+        writes.  A release, expiry takeover, or reassignment therefore cannot
+        commit between the ownership check and the external publication.
+        """
+
+        normalized_run_id = _uuid(run_id, "run_id")
+        normalized_source = _text(source, "source")
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                SELECT source, owner_run_id, owner_dag_id, acquired_at,
+                       expires_at, released_at,
+                       (released_at IS NULL
+                        AND expires_at > clock_timestamp()) AS active
+                FROM fbref_control.publication_lock
+                WHERE source = %s
+                FOR UPDATE
+                """,
+                (normalized_source,),
+            )
+            lock = _fetchone(cursor)
+            if (
+                lock is None
+                or str(lock["owner_run_id"]) != normalized_run_id
+                or lock["released_at"] is not None
+                or not bool(lock["active"])
+            ):
+                raise StateConflict(
+                    "Active publication lock is not owned by this control run"
+                )
+            lock["owner_run_id"] = str(lock["owner_run_id"])
+            lock["active"] = True
+            yield lock
+
     def finish_run(self, run_id: object, *, succeeded: bool) -> None:
         normalized = _uuid(run_id, "run_id")
         status = "succeeded" if succeeded else "failed"
@@ -757,6 +1030,284 @@ class ControlStore:
                 (_uuid(run_id, "run_id"),),
             )
             return _fetchone(cursor)
+
+    def record_raw_baseline(
+        self,
+        run_id: object,
+        evidence: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Anchor one create-once raw inventory digest in control state."""
+
+        run = _uuid(run_id, "run_id")
+        normalized = _raw_baseline_evidence(evidence)
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                SELECT status, metadata
+                FROM fbref_control.crawl_run
+                WHERE run_id = %s
+                FOR UPDATE
+                """,
+                (run,),
+            )
+            row = _fetchone(cursor)
+            if row is None:
+                raise StateConflict(f"Raw baseline run {run} does not exist")
+            metadata = _json_mapping(
+                row.get("metadata") or {}, "crawl run metadata"
+            )
+            installed_value = metadata.get("raw_baseline")
+            if installed_value is not None:
+                installed = _raw_baseline_evidence(
+                    _json_mapping(installed_value, "raw_baseline")
+                )
+                if installed != normalized:
+                    raise StateConflict(
+                        f"Run {run} already has a different raw baseline"
+                    )
+                return {**normalized, "idempotent": True}
+            if row["status"] != "running":
+                raise StateConflict(
+                    f"Run {run} cannot anchor its first raw baseline after "
+                    f"leaving running state ({row['status']})"
+                )
+            cursor.execute(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM fbref_control.fetch_attempt
+                    WHERE run_id = %s
+                ) AS source_started
+                """,
+                (run,),
+            )
+            progress = _fetchone(cursor) or {}
+            if bool(progress.get("source_started")):
+                raise StateConflict(
+                    f"Run {run} cannot anchor its first raw baseline after "
+                    "fetch processing started"
+                )
+            cursor.execute(
+                """
+                UPDATE fbref_control.crawl_run
+                SET metadata = metadata || %s::jsonb,
+                    updated_at = clock_timestamp()
+                WHERE run_id = %s
+                """,
+                (_json({"raw_baseline": normalized}), run),
+            )
+            if cursor.rowcount != 1:
+                raise StateConflict(f"Raw baseline run {run} disappeared")
+        return {**normalized, "idempotent": False}
+
+    def get_raw_baseline(self, run_id: object) -> Optional[dict[str, Any]]:
+        """Read the immutable control-plane baseline anchor for one run."""
+
+        run = _uuid(run_id, "run_id")
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                SELECT metadata -> 'raw_baseline' AS raw_baseline
+                FROM fbref_control.crawl_run
+                WHERE run_id = %s
+                """,
+                (run,),
+            )
+            row = _fetchone(cursor)
+        if row is None:
+            raise StateConflict(f"Raw baseline run {run} does not exist")
+        value = row.get("raw_baseline")
+        if value is None:
+            return None
+        return _raw_baseline_evidence(
+            _json_mapping(value, "raw_baseline")
+        )
+
+    def record_raw_audit(
+        self,
+        run_id: object,
+        evidence: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Anchor one passed final raw audit before run validation."""
+
+        run = _uuid(run_id, "run_id")
+        normalized = _raw_audit_evidence(evidence)
+        if normalized["processing_control_run_id"] != run:
+            raise StateConflict(
+                "Raw audit processing_control_run_id does not match its run"
+            )
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                SELECT status, metadata
+                FROM fbref_control.crawl_run
+                WHERE run_id = %s
+                FOR UPDATE
+                """,
+                (run,),
+            )
+            row = _fetchone(cursor)
+            if row is None:
+                raise StateConflict(f"Raw audit run {run} does not exist")
+            metadata = _json_mapping(
+                row.get("metadata") or {}, "crawl run metadata"
+            )
+            installed_value = metadata.get("raw_audit")
+            if installed_value is not None:
+                installed = _raw_audit_evidence(
+                    _json_mapping(installed_value, "raw_audit")
+                )
+                if installed != normalized:
+                    raise StateConflict(
+                        f"Run {run} already has a different raw audit anchor"
+                    )
+                return {**normalized, "idempotent": True}
+            if row["status"] != "running":
+                raise StateConflict(
+                    f"Run {run} cannot anchor its first raw audit after "
+                    f"leaving running state ({row['status']})"
+                )
+            if metadata.get("raw_baseline") is None:
+                raise StateConflict(
+                    f"Run {run} cannot anchor raw audit without a baseline"
+                )
+            cursor.execute(
+                """
+                UPDATE fbref_control.crawl_run
+                SET metadata = metadata || %s::jsonb,
+                    updated_at = clock_timestamp()
+                WHERE run_id = %s
+                """,
+                (_json({"raw_audit": normalized}), run),
+            )
+            if cursor.rowcount != 1:
+                raise StateConflict(f"Raw audit run {run} disappeared")
+        return {**normalized, "idempotent": False}
+
+    def get_raw_audit(self, run_id: object) -> Optional[dict[str, Any]]:
+        """Read one create-once passed final raw-audit anchor."""
+
+        run = _uuid(run_id, "run_id")
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                SELECT metadata -> 'raw_audit' AS raw_audit
+                FROM fbref_control.crawl_run
+                WHERE run_id = %s
+                """,
+                (run,),
+            )
+            row = _fetchone(cursor)
+        if row is None:
+            raise StateConflict(f"Raw audit run {run} does not exist")
+        value = row.get("raw_audit")
+        if value is None:
+            return None
+        return _raw_audit_evidence(_json_mapping(value, "raw_audit"))
+
+    def seal_raw_fetch_attempts(self, run_id: object) -> dict[str, Any]:
+        """Freeze and fingerprint the successful-attempt set before audit.
+
+        ``claim_targets`` holds the same crawl-run row lock, so no new worker
+        can enter after the marker is installed.  The active-work checks make
+        an in-flight completion lose this race safely: the audit retries only
+        after that transaction has reached a terminal attempt state.
+        """
+
+        run = _uuid(run_id, "run_id")
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                SELECT status, metadata
+                FROM fbref_control.crawl_run
+                WHERE run_id = %s
+                FOR UPDATE
+                """,
+                (run,),
+            )
+            row = _fetchone(cursor)
+            if row is None:
+                raise StateConflict(f"Raw audit run {run} does not exist")
+            if row["status"] not in {
+                "running",
+                "succeeded",
+                "failed",
+                "cancelled",
+            }:
+                raise StateConflict(
+                    f"Raw audit run {run} is not sealable ({row['status']})"
+                )
+            cursor.execute(
+                """
+                SELECT
+                    (SELECT count(*)
+                     FROM fbref_control.fetch_attempt
+                     WHERE run_id = %s AND status = 'claimed')
+                        AS claimed_attempts,
+                    (SELECT count(*)
+                     FROM fbref_control.page_frontier
+                     WHERE lease_run_id = %s AND state = 'leased')
+                        AS active_leases,
+                    (SELECT count(*)
+                     FROM fbref_control.budget_reservation
+                     WHERE run_id = %s AND status = 'reserved')
+                        AS active_reservations
+                """,
+                (run, run, run),
+            )
+            active = _fetchone(cursor) or {}
+            active_counts = {
+                key: int(active.get(key) or 0)
+                for key in (
+                    "claimed_attempts",
+                    "active_leases",
+                    "active_reservations",
+                )
+            }
+            if any(active_counts.values()):
+                raise StateConflict(
+                    f"Raw audit run {run} still has active fetch work: "
+                    f"{active_counts}"
+                )
+            cursor.execute(
+                """
+                SELECT attempt_id
+                FROM fbref_control.fetch_attempt
+                WHERE run_id = %s AND status = 'succeeded'
+                ORDER BY attempt_id
+                """,
+                (run,),
+            )
+            snapshot = _attempt_snapshot(
+                item["attempt_id"] for item in _fetchall(cursor)
+            )
+            metadata = _json_mapping(
+                row.get("metadata") or {}, "crawl run metadata"
+            )
+            installed_value = metadata.get("raw_fetch_attempt_snapshot")
+            if installed_value is not None:
+                installed = _validated_attempt_snapshot(
+                    _json_mapping(
+                        installed_value, "raw_fetch_attempt_snapshot"
+                    )
+                )
+                if installed != snapshot:
+                    raise StateConflict(
+                        f"Run {run} successful fetch attempts changed after seal"
+                    )
+                return {**snapshot, "idempotent": True}
+            cursor.execute(
+                """
+                UPDATE fbref_control.crawl_run
+                SET metadata = metadata || %s::jsonb,
+                    updated_at = clock_timestamp()
+                WHERE run_id = %s
+                """,
+                (_json({"raw_fetch_attempt_snapshot": snapshot}), run),
+            )
+            if cursor.rowcount != 1:
+                raise StateConflict(f"Raw audit run {run} disappeared")
+        return {**snapshot, "idempotent": False}
 
     def reserve_budget(
         self,
@@ -1086,11 +1637,10 @@ class ControlStore:
     ) -> dict[str, int]:
         """Reconcile an accepted index snapshot without deleting history.
 
-        An unknown-gender row blocks the entire snapshot.  A drop of more than
-        ten percent from the live registry likewise fails closed unless an
-        explicit, durable operator reason accompanies the reconciliation.
-        Because both checks happen in the reconciliation transaction, rejected
-        snapshots never advance disappearance counters.
+        Unknown-gender rows are durably stored as quarantined and then fail the
+        caller, so operators can see and classify them without any downstream
+        crawl. A drop of more than ten percent from the live registry fails
+        closed unless an explicit, durable operator reason accompanies it.
         """
         snapshot = _uuid(snapshot_id, "snapshot_id")
         competitions = self._validated_competitions(entries)
@@ -1099,11 +1649,6 @@ class ControlStore:
             for entry in competitions
             if entry.gender == "unknown"
         )
-        if unknown_ids:
-            raise StateConflict(
-                "Competition snapshot contains unknown gender: "
-                + ", ".join(unknown_ids)
-            )
         override_reason = (
             None
             if shrink_override_reason is None
@@ -1321,7 +1866,12 @@ class ControlStore:
                 """
             )
             counts["frontier_scope_closed"] = cursor.rowcount
-            return counts
+        if unknown_ids:
+            raise StateConflict(
+                "Competition snapshot durably quarantined unknown gender: "
+                + ", ".join(unknown_ids)
+            )
+        return counts
 
     def eligible_competitions(self, *, source: str = "fbref") -> list[dict]:
         """Return only current male rows eligible to create downstream targets."""
@@ -1869,19 +2419,25 @@ class ControlStore:
             )
             return _fetchall(cursor)
 
-    def upsert_frontier_target(self, target: FrontierTarget) -> None:
+    def upsert_frontier_target(
+        self,
+        target: FrontierTarget,
+        *,
+        _cursor: Any = None,
+    ) -> None:
         """Create/update one canonical identity before any network request."""
         target_id = _text(target.target_id, "target_id")
         canonical_url = _text(target.canonical_url, "canonical_url")
         if urlsplit(canonical_url).scheme not in {"http", "https"}:
             raise ValueError("canonical_url must be absolute HTTP(S)")
-        with self._transaction() as cursor:
+        with self._transaction(_cursor) as cursor:
             cursor.execute(
                 """
                 SELECT target_id, source, page_kind, canonical_url,
                        source_ids, state
                 FROM fbref_control.page_frontier
                 WHERE target_id = %s OR canonical_url = %s
+                ORDER BY target_id, canonical_url
                 FOR UPDATE
                 """,
                 (target_id, canonical_url),
@@ -1991,6 +2547,8 @@ class ControlStore:
     def record_frontier_provenance(
         self,
         provenance: FrontierProvenance,
+        *,
+        _cursor: Any = None,
     ) -> str:
         """Append one idempotent, content-addressed discovery edge."""
         parent = _text(provenance.parent_target_id, "parent_target_id")
@@ -2032,7 +2590,7 @@ class ControlStore:
             parser_version=parser_version,
         )
         expected_metadata = dict(provenance.metadata)
-        with self._transaction() as cursor:
+        with self._transaction(_cursor) as cursor:
             cursor.execute(
                 """
                 INSERT INTO fbref_control.frontier_provenance (
@@ -2100,6 +2658,72 @@ class ControlStore:
                     "different immutable evidence"
                 )
             return str(row["provenance_id"])
+
+    def upsert_frontier_discovery_batch(
+        self,
+        *,
+        targets: Sequence[FrontierTarget],
+        provenance: Sequence[FrontierProvenance],
+    ) -> dict[str, int]:
+        """Atomically persist one bounded observation's discovery output."""
+        raw_targets = list(targets)
+        raw_provenance = list(provenance)
+        if len(raw_targets) > _MAX_FRONTIER_DISCOVERY_TARGETS:
+            raise ValueError(
+                "frontier discovery target batch exceeds "
+                f"{_MAX_FRONTIER_DISCOVERY_TARGETS}"
+            )
+        if len(raw_provenance) > _MAX_FRONTIER_DISCOVERY_EDGES:
+            raise ValueError(
+                "frontier discovery provenance batch exceeds "
+                f"{_MAX_FRONTIER_DISCOVERY_EDGES}"
+            )
+        ordered_targets = sorted(
+            raw_targets,
+            key=lambda target: (
+                _text(target.target_id, "target_id"),
+                _text(target.canonical_url, "canonical_url"),
+            ),
+        )
+        ordered_provenance = sorted(
+            raw_provenance,
+            key=lambda edge: make_frontier_provenance_id(
+                parent_target_id=edge.parent_target_id,
+                child_target_id=edge.child_target_id,
+                relation=edge.relation,
+                carried_competition_id=edge.carried_competition_id,
+                carried_season_id=edge.carried_season_id,
+                parent_content_hash=edge.parent_content_hash,
+                parser_version=edge.parser_version,
+            ),
+        )
+        observation_keys = {
+            (
+                _text(edge.parent_target_id, "parent_target_id"),
+                _text(edge.parent_content_hash, "parent_content_hash"),
+                _text(edge.parser_version, "parser_version"),
+                None
+                if edge.logical_refresh_id is None
+                else _uuid(edge.logical_refresh_id, "logical_refresh_id"),
+            )
+            for edge in ordered_provenance
+        }
+        if len(observation_keys) > 1:
+            raise ValueError(
+                "frontier discovery batch must belong to one observation"
+            )
+        if not ordered_targets and not ordered_provenance:
+            return {"target_count": 0, "provenance_count": 0}
+
+        with self._transaction() as cursor:
+            for target in ordered_targets:
+                self.upsert_frontier_target(target, _cursor=cursor)
+            for edge in ordered_provenance:
+                self.record_frontier_provenance(edge, _cursor=cursor)
+        return {
+            "target_count": len(ordered_targets),
+            "provenance_count": len(ordered_provenance),
+        }
 
     def list_frontier_provenance(
         self,
@@ -2487,7 +3111,9 @@ class ControlStore:
             )
             if not policies:
                 return []
-        control_quota = max(1, normalized_limit // 5)
+        # Admission tiers keep the publication spine ahead of an arbitrarily
+        # old enrichment backlog.  In particular, a newly discovered current
+        # match must not need a previous fetch before it becomes critical.
         cohort = []
         with self._transaction() as cursor:
             cursor.execute(
@@ -2507,14 +3133,27 @@ class ControlStore:
                   SELECT frontier.target_id, frontier.page_kind,
                          frontier.last_fetched_at, frontier.created_at,
                          frontier.priority, frontier.next_fetch_at,
-                         (
-                           frontier.last_fetched_at IS NOT NULL
-                           AND frontier.refresh_policy <> 'historical_once'
-                           AND frontier.page_kind = ANY(ARRAY[
-                               'competition_index', 'competition',
-                               'season', 'schedule'
-                           ]::text[])
-                         ) AS control_lane
+                         COALESCE(
+                           frontier.retry_after,
+                           frontier.next_fetch_at,
+                           frontier.last_fetched_at,
+                           frontier.created_at
+                         ) AS due_at,
+                         CASE
+                           WHEN frontier.page_kind = 'competition_index'
+                             THEN 0
+                           WHEN frontier.page_kind = 'match'
+                            AND frontier.refresh_policy <> 'historical_once'
+                            AND COALESCE(scope.has_current_season, false)
+                             THEN 1
+                           WHEN frontier.page_kind = ANY(%s::text[])
+                            AND frontier.refresh_policy <> 'historical_once'
+                             THEN 2
+                           WHEN frontier.page_kind = ANY(%s::text[])
+                            AND frontier.refresh_policy <> 'historical_once'
+                             THEN 3
+                           ELSE 4
+                         END AS admission_tier
                   FROM fbref_control.page_frontier AS frontier
                   LEFT JOIN scope_rollup AS scope
                     ON scope.target_id = frontier.target_id
@@ -2566,52 +3205,27 @@ class ControlStore:
                         )
                         AND outstanding_run.status IN ('pending', 'running')
                   )
-                ), ranked AS (
-                  SELECT eligible.*,
-                         row_number() OVER (
-                           PARTITION BY eligible.control_lane
-                           ORDER BY eligible.last_fetched_at ASC NULLS LAST,
-                                    eligible.created_at,
-                                    eligible.target_id
-                         ) AS control_lane_rank
-                  FROM eligible
                 )
                 SELECT frontier.target_id
-                FROM ranked
+                FROM eligible
                 JOIN fbref_control.page_frontier AS frontier
-                  ON frontier.target_id = ranked.target_id
-                -- Reserve a small lane for overdue control pages.  The rest
-                -- remains FIFO: never-fetched first, then oldest refresh.
-                ORDER BY CASE
-                           WHEN ranked.control_lane
-                            AND ranked.control_lane_rank <= %s
-                           THEN 0 ELSE 1
-                         END,
-                         CASE
-                           WHEN ranked.control_lane
-                            AND ranked.control_lane_rank <= %s
-                           THEN frontier.last_fetched_at
-                         END ASC NULLS LAST,
-                         (frontier.last_fetched_at IS NOT NULL) ASC,
-                         CASE
-                             WHEN frontier.last_fetched_at IS NULL
-                             THEN frontier.created_at
-                             ELSE frontier.last_fetched_at
-                         END ASC,
+                  ON frontier.target_id = eligible.target_id
+                ORDER BY eligible.admission_tier,
+                         eligible.due_at,
                          frontier.priority DESC,
-                         frontier.next_fetch_at NULLS FIRST,
+                         frontier.created_at,
                          frontier.target_id
                 LIMIT %s
                 FOR UPDATE OF frontier SKIP LOCKED
                 """,
                 (
+                    list(DISCOVERY_SPINE_PAGE_KINDS),
+                    list(OTHER_PUBLICATION_CRITICAL_PAGE_KINDS),
                     kinds,
                     kinds,
                     policies,
                     policies,
                     run,
-                    control_quota,
-                    control_quota,
                     normalized_limit,
                 ),
             )
@@ -2624,12 +3238,34 @@ class ControlStore:
                 (run,),
             )
             next_ordinal = int(_fetchone(cursor)["next_ordinal"])
-            for offset, candidate in enumerate(candidates):
+            accepted_offset = 0
+            for candidate in candidates:
                 target_id = str(candidate["target_id"])
+                # The candidate CTE is evaluated before its frontier row is
+                # locked.  A competing run may have committed membership in
+                # that narrow interval, so recheck while this transaction now
+                # owns the target's frontier fence.
+                cursor.execute(
+                    """
+                    SELECT outstanding.run_id
+                    FROM fbref_control.run_target AS outstanding
+                    JOIN fbref_control.crawl_run AS outstanding_run
+                      ON outstanding_run.run_id = outstanding.run_id
+                    WHERE outstanding.target_id = %s
+                      AND outstanding.status IN (
+                          'pending', 'leased', 'retry'
+                      )
+                      AND outstanding_run.status IN ('pending', 'running')
+                    LIMIT 1
+                    """,
+                    (target_id,),
+                )
+                if _fetchone(cursor) is not None:
+                    continue
                 item = CohortTarget(
                     target_id=target_id,
                     logical_refresh_id=make_logical_refresh_id(run, target_id),
-                    ordinal=next_ordinal + offset,
+                    ordinal=next_ordinal + accepted_offset,
                 )
                 cursor.execute(
                     """
@@ -2653,6 +3289,7 @@ class ControlStore:
                     (item.target_id,),
                 )
                 cohort.append(item)
+                accepted_offset += 1
         return cohort
 
     def get_run_summary(
@@ -2721,7 +3358,10 @@ class ControlStore:
             cursor.execute(
                 """
                 SELECT
-                    count(*) FILTER (WHERE season.is_current)
+                    count(*) FILTER (
+                        WHERE season.is_current
+                          AND frontier.refresh_policy <> 'historical_once'
+                    )
                         AS current_pending_match_count,
                     count(*) FILTER (
                         WHERE NOT season.is_current
@@ -2773,6 +3413,67 @@ class ControlStore:
             summary["promotion_pending_match_count"] = current_pending
             summary["current_pending_match_count"] = current_pending
             summary["historical_pending_match_count"] = historical_pending
+            cursor.execute(
+                """
+                SELECT frontier.target_id,
+                       frontier.source_ids ->> 'competition_id'
+                           AS competition_id,
+                       frontier.source_ids ->> 'season_id' AS season_id,
+                       frontier.state, frontier.last_error_class,
+                       left(frontier.last_error_message, 500)
+                           AS last_error_message
+                FROM fbref_control.page_frontier AS frontier
+                JOIN fbref_control.competition_registry AS competition
+                  ON competition.source = frontier.source
+                 AND competition.competition_id =
+                     frontier.source_ids ->> 'competition_id'
+                JOIN fbref_control.season_registry AS season
+                  ON season.source = frontier.source
+                 AND season.competition_id = competition.competition_id
+                 AND season.season_id =
+                     frontier.source_ids ->> 'season_id'
+                WHERE frontier.source = 'fbref'
+                  AND frontier.page_kind = 'match'
+                  AND (
+                    frontier.state IN ('queued', 'retry', 'leased')
+                    OR (
+                      frontier.state = 'fetched'
+                      AND frontier.next_fetch_at IS NOT NULL
+                      AND frontier.next_fetch_at <= clock_timestamp()
+                    )
+                  )
+                  AND competition.gender = 'male'
+                  AND competition.crawl_state = 'active'
+                  AND competition.lifecycle_state IN (
+                      'present', 'missing_once'
+                  )
+                  AND competition.present
+                  AND season.lifecycle_state = 'present'
+                  AND season.present
+                  AND season.is_current
+                  AND frontier.refresh_policy <> 'historical_once'
+                ORDER BY frontier.priority DESC,
+                         COALESCE(
+                           frontier.retry_after,
+                           frontier.next_fetch_at,
+                           frontier.created_at
+                         ),
+                         frontier.target_id
+                LIMIT %s
+                """,
+                (_PENDING_MATCH_SAMPLE_LIMIT,),
+            )
+            summary["current_pending_match_sample"] = [
+                {
+                    "target_id": str(row["target_id"]),
+                    "competition_id": str(row["competition_id"]),
+                    "season_id": str(row["season_id"]),
+                    "state": str(row["state"]),
+                    "last_error_class": row.get("last_error_class"),
+                    "last_error_message": row.get("last_error_message"),
+                }
+                for row in _fetchall(cursor)
+            ]
             cursor.execute(
                 """
                 SELECT status, count(*) AS count
@@ -2889,6 +3590,7 @@ class ControlStore:
                 "budget_exhausted",
                 "clearance_failed",
                 "clearance_export_failed",
+                "hard_transport_policy",
                 "http_exception",
                 "http_status",
                 "empty_body",
@@ -3221,6 +3923,11 @@ class ControlStore:
                     LEFT JOIN scope_rollup AS scope
                       ON scope.target_id = frontier.target_id
                     WHERE frontier.source = 'fbref'
+                      -- Current runs cannot claim historical one-shot matches.
+                      AND NOT (
+                        frontier.page_kind = 'match'
+                        AND frontier.refresh_policy = 'historical_once'
+                      )
                       AND (
                         frontier.page_kind = 'competition_index'
                         OR (
@@ -3258,9 +3965,16 @@ class ControlStore:
                                    - (sla_seconds * interval '1 second')
                                )
                              )
-                             ELSE last_fetched_at IS NOT NULL
-                               AND last_fetched_at >= clock_timestamp()
-                                 - (sla_seconds * interval '1 second')
+                            ELSE (
+                              last_fetched_at IS NOT NULL
+                              AND last_fetched_at >= clock_timestamp()
+                                - (sla_seconds * interval '1 second')
+                            ) OR (
+                              last_fetched_at IS NULL
+                              AND state IN ('queued', 'retry', 'leased')
+                              AND created_at >= clock_timestamp()
+                                - (sla_seconds * interval '1 second')
+                            )
                            END AS within_sla
                     FROM current_scope
                 )
@@ -3317,6 +4031,29 @@ class ControlStore:
                 freshness_totals["stale_targets"] == 0
             )
             summary["current_scope_freshness"] = freshness_totals
+            publication_rows = [
+                row
+                for kind, row in freshness_by_kind.items()
+                if kind in PUBLICATION_FRESHNESS_PAGE_KINDS
+            ]
+            publication_freshness = {
+                "total_targets": sum(
+                    row["total_targets"] for row in publication_rows
+                ),
+                "fresh_targets": sum(
+                    row["fresh_targets"] for row in publication_rows
+                ),
+                "stale_targets": sum(
+                    row["stale_targets"] for row in publication_rows
+                ),
+                "never_fetched_targets": sum(
+                    row["never_fetched_targets"] for row in publication_rows
+                ),
+            }
+            publication_freshness["all_within_sla"] = (
+                publication_freshness["stale_targets"] == 0
+            )
+            summary["publication_scope_freshness"] = publication_freshness
 
             cursor.execute(
                 """
@@ -3574,6 +4311,184 @@ class ControlStore:
                 else dict(snapshot.get("metadata") or {}).get("sentinels", {})
             )
             return summary
+
+    def list_successful_fetch_attempts(
+        self,
+        run_id: object,
+        *,
+        limit: int = 250,
+        after: Optional[tuple[int, int, str]] = None,
+    ) -> list[dict]:
+        """Page successful raw evidence in stable run-cohort order."""
+        run = _uuid(run_id, "run_id")
+        normalized_limit = int(limit)
+        if not 1 <= normalized_limit <= 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        if after is None:
+            after_ordinal = None
+            after_attempt_number = None
+            after_attempt_id = None
+        else:
+            if len(after) != 3:
+                raise ValueError(
+                    "after must be (ordinal, attempt_number, attempt_id)"
+                )
+            after_ordinal = _non_negative(after[0], "after ordinal")
+            after_attempt_number = int(after[1])
+            if after_attempt_number <= 0:
+                raise ValueError("after attempt_number must be positive")
+            after_attempt_id = _uuid(after[2], "after attempt_id")
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                SELECT attempt.attempt_id, attempt.run_id,
+                       attempt.target_id, attempt.logical_refresh_id,
+                       attempt.attempt_number, target.ordinal,
+                       frontier.page_kind, frontier.canonical_url,
+                       frontier.source_ids, attempt.http_status,
+                       attempt.content_hash, attempt.raw_manifest_key,
+                       attempt.decoded_bytes, attempt.compressed_bytes,
+                       attempt.wire_bytes, attempt.provider_billed_bytes,
+                       attempt.http_request_count,
+                       attempt.http_status_history, attempt.etag,
+                       attempt.last_modified, attempt.transport_version,
+                       attempt.session_version, attempt.latency_ms,
+                       attempt.started_at, attempt.finished_at
+                FROM fbref_control.fetch_attempt AS attempt
+                JOIN fbref_control.run_target AS target
+                  ON target.run_id = attempt.run_id
+                 AND target.target_id = attempt.target_id
+                 AND target.logical_refresh_id = attempt.logical_refresh_id
+                JOIN fbref_control.page_frontier AS frontier
+                  ON frontier.target_id = attempt.target_id
+                WHERE attempt.run_id = %s
+                  AND attempt.status = 'succeeded'
+                  AND (
+                    %s::bigint IS NULL
+                    OR (
+                      target.ordinal, attempt.attempt_number,
+                      attempt.attempt_id
+                    ) > (%s::bigint, %s::integer, %s::uuid)
+                  )
+                ORDER BY target.ordinal, attempt.attempt_number,
+                         attempt.attempt_id
+                LIMIT %s
+                """,
+                (
+                    run,
+                    after_ordinal,
+                    after_ordinal,
+                    after_attempt_number,
+                    after_attempt_id,
+                    normalized_limit,
+                ),
+            )
+            rows = _fetchall(cursor)
+        for row in rows:
+            for key in (
+                "attempt_id",
+                "run_id",
+                "logical_refresh_id",
+            ):
+                row[key] = str(row[key])
+            source_ids = row.get("source_ids") or {}
+            if isinstance(source_ids, str):
+                source_ids = json.loads(source_ids)
+            row["source_ids"] = dict(source_ids)
+        return rows
+
+    def list_fetch_attempts_for_refresh(
+        self,
+        run_id: object,
+        logical_refresh_id: object,
+    ) -> list[dict]:
+        """Return raw-evidence lineage for one run-local logical refresh.
+
+        A zero-network ``raw-recovery`` success intentionally has no network
+        counters of its own.  Raw acceptance uses this bounded lineage to
+        match the immutable manifest's original attempt and audit the counters
+        that were reattributed to it transactionally by ``complete_fetch``.
+        """
+
+        run = _uuid(run_id, "run_id")
+        refresh = _uuid(logical_refresh_id, "logical_refresh_id")
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                SELECT attempt_id, run_id, target_id, logical_refresh_id,
+                       attempt_number, status, http_status, content_hash,
+                       raw_manifest_key, decoded_bytes, compressed_bytes,
+                       wire_bytes, provider_billed_bytes, http_request_count,
+                       http_status_history, etag, last_modified,
+                       transport_version, session_version, latency_ms,
+                       started_at, finished_at
+                FROM fbref_control.fetch_attempt
+                WHERE run_id = %s AND logical_refresh_id = %s
+                ORDER BY attempt_number, attempt_id
+                """,
+                (run, refresh),
+            )
+            rows = _fetchall(cursor)
+        for row in rows:
+            for key in ("attempt_id", "run_id", "logical_refresh_id"):
+                row[key] = str(row[key])
+        return rows
+
+    def get_observation_cleanup_evidence(
+        self,
+        logical_refresh_id: object,
+    ) -> Optional[dict]:
+        """Return DB-clock ownership evidence for safe staging cleanup."""
+        refresh = _uuid(logical_refresh_id, "logical_refresh_id")
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                SELECT target.run_id, run.status AS run_status,
+                       EXISTS (
+                         SELECT 1
+                         FROM fbref_control.page_frontier AS frontier
+                         WHERE frontier.target_id = target.target_id
+                           AND frontier.lease_run_id = target.run_id
+                           AND frontier.lease_refresh_id =
+                               target.logical_refresh_id
+                           AND frontier.state = 'leased'
+                           AND frontier.claim_token IS NOT NULL
+                           AND frontier.lease_expires_at > clock_timestamp()
+                       ) AS active_fetch_lease,
+                       EXISTS (
+                         SELECT 1
+                         FROM fbref_control.budget_reservation AS reservation
+                         WHERE reservation.run_id = target.run_id
+                           AND reservation.logical_refresh_id =
+                               target.logical_refresh_id
+                           AND reservation.status = 'reserved'
+                       ) AS active_budget_reservation,
+                       EXISTS (
+                         SELECT 1
+                         FROM fbref_control.observation_processing
+                              AS processing
+                         WHERE processing.logical_refresh_id =
+                               target.logical_refresh_id
+                           AND processing.status = 'processing'
+                           AND processing.claim_token IS NOT NULL
+                       ) AS active_observation_processing
+                FROM fbref_control.run_target AS target
+                JOIN fbref_control.crawl_run AS run
+                  ON run.run_id = target.run_id
+                WHERE target.logical_refresh_id = %s
+                """,
+                (refresh,),
+            )
+            row = _fetchone(cursor)
+        if row is not None:
+            row["run_id"] = str(row["run_id"])
+            for key in (
+                "active_fetch_lease",
+                "active_budget_reservation",
+                "active_observation_processing",
+            ):
+                row[key] = bool(row[key])
+        return row
 
     def list_unprocessed_fetches(
         self,
@@ -4475,13 +5390,18 @@ class ControlStore:
         with self._transaction() as cursor:
             cursor.execute(
                 """
-                SELECT status FROM fbref_control.crawl_run
+                SELECT status, metadata FROM fbref_control.crawl_run
                 WHERE run_id = %s FOR UPDATE
                 """,
                 (run,),
             )
             crawl_run = _fetchone(cursor)
             if crawl_run is None or crawl_run["status"] != "running":
+                return []
+            run_metadata = _json_mapping(
+                crawl_run.get("metadata") or {}, "crawl run metadata"
+            )
+            if "raw_fetch_attempt_snapshot" in run_metadata:
                 return []
             self._reap_expired(
                 cursor,
@@ -5161,6 +6081,45 @@ class ControlStore:
             if cursor.rowcount != 1:
                 raise LeaseLost(f"Attempt lease lost for {lease.target_id}")
 
+    def retry_session_fetch(
+        self,
+        lease: TargetLease,
+        *,
+        error_class: object,
+        error_message: object,
+        http_status: Optional[int] = None,
+        wire_bytes: int = 0,
+        provider_billed_bytes: Optional[int] = None,
+        http_request_count: int = 0,
+        http_status_history: Optional[Sequence[int]] = None,
+        latency_ms: Optional[int] = None,
+        transport_version: Optional[str] = None,
+        session_version: Optional[str] = None,
+    ) -> None:
+        """Close a bad session attempt and retry its target in this run.
+
+        Budget reservation settlement is intentionally caller-owned: the
+        runner has the authoritative request/byte counters.  The transition
+        is immediate and preserves the immutable run target and logical
+        refresh identity; ``claim_targets`` creates a fresh fenced attempt.
+        """
+        self.fail_fetch(
+            lease,
+            error_class=error_class,
+            error_message=error_message,
+            retry_delay_seconds=0,
+            permanent=False,
+            requeue=False,
+            http_status=http_status,
+            wire_bytes=wire_bytes,
+            provider_billed_bytes=provider_billed_bytes,
+            http_request_count=http_request_count,
+            http_status_history=http_status_history,
+            latency_ms=latency_ms,
+            transport_version=transport_version,
+            session_version=session_version,
+        )
+
     def record_dataset_manifest(
         self,
         *,
@@ -5433,13 +6392,16 @@ class ControlStore:
         self,
         domain: object = "fbref.com",
         *,
-        interval_seconds: float = 3.0,
+        interval_seconds: float = DEFAULT_DOMAIN_INTERVAL_SECONDS,
     ) -> ThrottleSlot:
         """Atomically reserve one globally spaced request time for a domain."""
         normalized_domain = _text(domain, "domain").lower()
         interval = float(interval_seconds)
-        if interval <= 0:
-            raise ValueError("interval_seconds must be positive")
+        if interval < MIN_DOMAIN_INTERVAL_SECONDS:
+            raise ValueError(
+                "interval_seconds must respect the FBref "
+                f"{MIN_DOMAIN_INTERVAL_SECONDS:g}-second source minimum"
+            )
         token = str(uuid.uuid4())
         with self._transaction() as cursor:
             cursor.execute(

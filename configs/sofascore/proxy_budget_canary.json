@@ -2,7 +2,7 @@
   "benchmark_samples": [],
   "bootstrap_authorizes_production": false,
   "budget_derivation": "max_observed_task_bytes_per_workload_class_v2",
-  "class_manifest_sha256": "a0a45fd80c8cbe228511739f84c4d8d13dc3172ee600edf71cfb6b5212d60a9a",
+  "class_manifest_sha256": "b2d2e36e5023ca4abe52041296be6e10b7e4fe0aa58c63a6aac672749b920318",
   "cohort_sha256": "eab8540e7a82b95d762fbdba5b30796d964da4c1c0a850fe1322f5e4bc14c1a4",
   "collection_source": "sofascore_canary",
   "collector_version": "sofascore-paid-canary-v3",
@@ -37,7 +37,7 @@
       "camoufox": "0.4.11",
       "playwright": "1.59.0"
     },
-    "digest": "5fb2e08be099f08fd6d395f3d4acd2a9853b976ca60e81e1e4ad73c4888172e1",
+    "digest": "7d1316f10c0a5f87adb49c595f84797900c592bbf7fd291aa6e1c1c9ae1b206a",
     "files": [
       "configs/medallion/competitions.yaml",
       "configs/proxy_filter/blocklist.txt",
@@ -225,16 +225,22 @@
         "17": {
           "cohort_sha256": "eab8540e7a82b95d762fbdba5b30796d964da4c1c0a850fe1322f5e4bc14c1a4",
           "name": "enabled_epl_2526_shape"
+        },
+        "8": {
+          "cohort_sha256": "7491c3b001eec0865b1e3ff38cbee160ec09750aa38df19d79b6b9400a45622c",
+          "name": "enabled_laliga_2526_shape"
         }
       },
       "collection_blocker": "",
       "hard_task_bytes": null,
       "max_units": 1,
       "measured_tournament_ids": [
+        8,
         17
       ],
       "representative_season_ids": {
-        "17": 76986
+        "17": 76986,
+        "8": 77559
       },
       "required_endpoints": [
         "cup_trees",

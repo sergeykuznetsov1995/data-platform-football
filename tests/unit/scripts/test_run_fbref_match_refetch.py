@@ -113,6 +113,12 @@ class FakeControl:
         self.cohort = []
         self.summary_target_counts = None
 
+    def acquire_publication_lock(self, run_id, **kwargs):
+        return {"owner_run_id": run_id, "active": True}
+
+    def release_publication_lock(self, run_id):
+        return {"owner_run_id": run_id, "released": True}
+
     def upsert_frontier_target(self, target) -> None:
         self.events.append("force_due")
         self.frontier.append(target)
@@ -485,7 +491,7 @@ def test_load_targets_rejects_unsafe_target_lists(tmp_path, payload) -> None:
         ("request_limit", 20),
         ("request_limit", 21),
         ("request_limit", 26),
-        ("byte_limit_mb", 6),
+        ("byte_limit_mb", refetch.MIN_BYTE_LIMIT_MB - 1),
         ("byte_limit_mb", 26),
     ],
 )
@@ -518,7 +524,7 @@ def test_config_rejects_relative_missing_or_empty_input_files(tmp_path) -> None:
         ("--request-limit", "20"),
         ("--request-limit", "21"),
         ("--request-limit", "26"),
-        ("--byte-limit-mb", "6"),
+        ("--byte-limit-mb", str(refetch.MIN_BYTE_LIMIT_MB - 1)),
         ("--byte-limit-mb", "26"),
     ],
 )

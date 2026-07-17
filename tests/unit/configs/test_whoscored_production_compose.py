@@ -517,16 +517,25 @@ def test_paid_approval_is_mounted_read_only_into_scheduler_alone() -> None:
 
 def test_proxy_control_plane_is_lease_only_and_secrets_are_not_hardcoded() -> None:
     raw = (ROOT / "compose.yaml").read_text(encoding="utf-8")
-    services = _compose()["services"]
+    compose = _compose()
+    services = compose["services"]
+    transfermarkt_token = (
+        "${TM_PROXY_CONTROL_TOKEN:-${PROXY_FILTER_CONTROL_TOKEN:-"
+        "${SOFASCORE_PROXY_CONTROL_TOKEN:-}}}"
+    )
 
     assert "${PROXY_FILTER_CONTROL_TOKEN:-${SOFASCORE_PROXY_CONTROL_TOKEN:-}}" in raw
     assert services["proxy_filter"]["environment"]["PROXY_FILTER_CONTROL_TOKEN"] == (
         "${PROXY_FILTER_CONTROL_TOKEN:-${SOFASCORE_PROXY_CONTROL_TOKEN:-}}"
     )
     assert services["proxy_filter"]["environment"]["TM_PROXY_CONTROL_TOKEN"] == (
-        "${TM_PROXY_CONTROL_TOKEN:-}"
+        transfermarkt_token
     )
-    assert "TM_PROXY_CONTROL_TOKEN" not in _compose()["x-airflow-common"]["environment"]
+    assert compose["x-airflow-common"]["environment"][
+        "TM_PROXY_CONTROL_TOKEN"
+    ] == (
+        transfermarkt_token
+    )
     assert (
         services["proxy_filter"]["environment"]["PROXY_FILTER_ALLOW_FILE_FALLBACK"]
         == "false"

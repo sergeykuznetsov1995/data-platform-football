@@ -298,22 +298,40 @@ RUN PIP_FIND_LINKS=/tmp/whoscored-wheelhouse \
 # The Python package's `fetch` command selects a mutable "latest compatible"
 # GitHub release. Fetch the exact supported browser asset instead and verify
 # the GitHub-published digest and billed byte size before offline extraction.
-RUN curl -fsSL https://github.com/daijro/camoufox/releases/download/v152.0.4-beta.26/camoufox-152.0.4-beta.26-lin.x86_64.zip -o /tmp/camoufox-152.0.4-beta.26-lin.x86_64.zip \
-    && echo "a03872a221ab766f58d04fdaf0d7f3431c2662d5086844c67d2fc01154ebc1f8  /tmp/camoufox-152.0.4-beta.26-lin.x86_64.zip" \
+# SofaScore and FBref receive separate root-owned trees so either source can
+# validate its own version document without consulting the other's cache.
+ARG FBREF_CAMOUFOX_VERSION=152.0.4
+ARG FBREF_CAMOUFOX_RELEASE=beta.26
+ARG FBREF_CAMOUFOX_SHA256=a03872a221ab766f58d04fdaf0d7f3431c2662d5086844c67d2fc01154ebc1f8
+RUN curl --proto '=https' --tlsv1.2 --proto-redir '=https' -fsSL \
+      "https://github.com/daijro/camoufox/releases/download/v${FBREF_CAMOUFOX_VERSION}-${FBREF_CAMOUFOX_RELEASE}/camoufox-${FBREF_CAMOUFOX_VERSION}-${FBREF_CAMOUFOX_RELEASE}-lin.x86_64.zip" \
+      -o /tmp/fbref-camoufox.zip \
+    && echo "${FBREF_CAMOUFOX_SHA256}  /tmp/fbref-camoufox.zip" \
         | sha256sum -c - \
-    && test "$(stat -c %s /tmp/camoufox-152.0.4-beta.26-lin.x86_64.zip)" -eq 663773735
+    && test "$(stat -c %s /tmp/fbref-camoufox.zip)" -eq 663773735
 RUN --network=none /usr/local/bin/python -S -m zipfile \
-      -e /tmp/camoufox-152.0.4-beta.26-lin.x86_64.zip \
+      -e /tmp/fbref-camoufox.zip \
       /home/airflow/.cache/camoufox \
-    && printf '%s\n' '{"version":"152.0.4","release":"beta.26"}' \
+    && printf '%s\n' \
+      "{\"version\":\"${FBREF_CAMOUFOX_VERSION}\",\"release\":\"${FBREF_CAMOUFOX_RELEASE}\"}" \
       > /home/airflow/.cache/camoufox/version.json \
-    && chmod -R 755 /home/airflow/.cache/camoufox \
-    && rm -f /tmp/camoufox-152.0.4-beta.26-lin.x86_64.zip
+    && chmod -R 755 /home/airflow/.cache/camoufox
 RUN --network=none rm -rf \
       /tmp/undetected-chromedriver-3.5.5.tar.gz \
       /tmp/whoscored-wheelhouse
 
 USER root
+RUN --network=none rm -rf /opt/fbref-camoufox \
+    && install -d -o root -g root -m 0755 /opt/fbref-camoufox \
+    && /usr/local/bin/python -S -m zipfile \
+      -e /tmp/fbref-camoufox.zip /opt/fbref-camoufox \
+    && printf '%s\n' \
+      "{\"version\":\"${FBREF_CAMOUFOX_VERSION}\",\"release\":\"${FBREF_CAMOUFOX_RELEASE}\"}" \
+      > /opt/fbref-camoufox/version.json \
+    && chown -R root:root /opt/fbref-camoufox \
+    && chmod -R 0755 /opt/fbref-camoufox \
+    && test -x /opt/fbref-camoufox/camoufox-bin \
+    && rm -f /tmp/fbref-camoufox.zip
 RUN --network=none install -d -o root -g root -m 0755 /opt/tls-client
 RUN curl --proto '=https' --tlsv1.2 --proto-redir '=https' -fsSL https://github.com/bogdanfinn/tls-client/releases/download/v1.13.1/tls-client-linux-ubuntu-amd64-1.13.1.so -o /opt/tls-client/tls-client.so \
     && echo "e4a4a5d771d1bd1558186a5ee46af1dfa1318bd31950d68ccd81ed30bad078fc  /opt/tls-client/tls-client.so" \
@@ -323,6 +341,7 @@ RUN --network=none chmod 0444 /opt/tls-client/tls-client.so
 ENV TLS_LIBRARY_PATH=/opt/tls-client/tls-client.so
 
 USER airflow
+RUN --network=none /opt/legacy-scraper-venv/bin/python -I -c "from camoufox.addons import DefaultAddons; from camoufox.sync_api import Camoufox; cm = Camoufox(headless='virtual', executable_path='/opt/fbref-camoufox/camoufox-bin', ff_version=152, i_know_what_im_doing=True, exclude_addons=list(DefaultAddons)); browser = cm.__enter__(); ua = browser.new_page().evaluate('navigator.userAgent'); cm.__exit__(None, None, None); assert 'Firefox/152.0' in ua, ua"
 RUN --network=none PYTHONPATH=/usr/local/lib/python3.11/site-packages:/home/airflow/.local/lib/python3.11/site-packages \
     /usr/local/bin/python -S -c "import tls_requests; client = tls_requests.Client(proxy='http://127.0.0.1:9'); client.close()"
 RUN --network=none PYTHONPATH=/usr/local/lib/python3.11/site-packages:/home/airflow/.local/lib/python3.11/site-packages \

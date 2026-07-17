@@ -1,0 +1,61 @@
+{
+  "mode": "tier_a",
+  "engine": "pydoll (Chrome/CDP)",
+  "event_id": "14023964",
+  "proxy_used": false,
+  "note": "datacenter egress, no residential proxy — transport verdict is PROVISIONAL (403 cannot be split from IP block)",
+  "startup_seconds": 1.016,
+  "browser_version": "{'protocolVersion': '1.3', 'product': 'Chrome/150.0.7871.46', 'revision': '@5b586c06e0d27582900f17e2d59c5370d8d6e0bb', 'userAgent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/150.0.0.0 Safari/537.36', 'jsVersion': '15.0.245.13'}",
+  "landing": {
+    "step": "landing",
+    "url": "https://www.sofascore.com",
+    "nav_seconds": 0.05,
+    "title": "",
+    "is_challenge": false,
+    "reached_spa": false
+  },
+  "rss_kib_after_landing": 1012728,
+  "probes": [
+    {
+      "method": "navigation",
+      "url": "https://www.sofascore.com/api/v1/event/14023964",
+      "content_type": "application/json",
+      "body_len": 48,
+      "looks_like_json": true,
+      "is_challenge": false,
+      "head": "{\"error\": {\"code\": 403, \"reason\": \"Forbidden\" }}"
+    },
+    {
+      "method": "in_page_fetch",
+      "url": "https://www.sofascore.com/api/v1/event/14023964",
+      "status": 403,
+      "body_len": 48,
+      "looks_like_json": true,
+      "head": "{\"error\": {\"code\": 403, \"reason\": \"Forbidden\" }}",
+      "fetch_error": null
+    },
+    {
+      "method": "navigation",
+      "url": "https://www.sofascore.com/api/v1/event/14023964/shotmap",
+      "content_type": "application/json",
+      "body_len": 48,
+      "looks_like_json": true,
+      "is_challenge": false,
+      "head": "{\"error\": {\"code\": 403, \"reason\": \"Forbidden\" }}"
+    },
+    {
+      "method": "in_page_fetch",
+      "url": "https://www.sofascore.com/api/v1/event/14023964/shotmap",
+      "status": 403,
+      "body_len": 48,
+      "looks_like_json": true,
+      "head": "{\"error\": {\"code\": 403, \"reason\": \"Forbidden\" }}",
+      "fetch_error": null
+    }
+  ],
+  "total_seconds": 1.343,
+  "curl_cffi_chrome133": {
+    "status": 403,
+    "len": 48
+  }
+}

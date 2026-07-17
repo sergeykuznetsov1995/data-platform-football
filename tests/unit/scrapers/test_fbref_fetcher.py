@@ -104,13 +104,141 @@ def test_clearance_bootstrap_consumes_transport_delta_not_cumulative_stats(
     fetcher._http_session = None
     fetcher._transport = transport
 
-    fetcher._ensure_clearance()
+    assert fetcher.ensure_clearance() is True
+    assert fetcher.ensure_clearance() is False
 
     transport.traffic_delta.assert_called_once_with()
     transport.traffic_stats.assert_not_called()
+    calls = [call[0] for call in transport.method_calls]
+    assert calls.index("close") < calls.index("traffic_delta")
     create_session.assert_called_once_with(clearance)
     assert fetcher._http_session is session
     assert fetcher._bootstrap_stats == transport.traffic_delta.return_value
+
+
+def test_clearance_closes_browser_before_counting_background_traffic(
+    monkeypatch,
+):
+    events = []
+    final_stats = {
+        "real_bytes_downloaded": 350,
+        "real_requests_count": 4,
+        "browser_bootstrap_attempts": 1,
+        "budget_unobserved_bytes": 100,
+        "real_bytes_by_resource_type": {"document": 100, "script": 250},
+    }
+    transport = MagicMock()
+    transport.fetch.return_value = "<html><body>source</body></html>"
+    transport.get_clearance.return_value = {
+        "cookies": {"cf_clearance": "test"},
+        "user_agent": "test-agent",
+        "proxy": None,
+    }
+    transport.close.side_effect = lambda: events.append("closed")
+
+    def final_delta():
+        assert events == ["closed"]
+        events.append("accounted")
+        return final_stats
+
+    transport.traffic_delta.side_effect = final_delta
+    session = MagicMock()
+    create_http_session = MagicMock(return_value=session)
+    monkeypatch.setattr(
+        FBrefFetcher,
+        "_create_http_session",
+        create_http_session,
+    )
+    fetcher = FBrefFetcher.__new__(FBrefFetcher)
+    fetcher.bootstrap_url = "https://fbref.com/en/"
+    fetcher._http_session = None
+    fetcher._transport = transport
+
+    fetcher._ensure_clearance()
+
+    assert events == ["closed", "accounted"]
+    assert fetcher._http_session is session
+    assert fetcher._bootstrap_stats == final_stats
+
+
+def test_late_hard_policy_callback_rejects_exported_clearance(monkeypatch):
+    transport = MagicMock()
+    transport.fetch.return_value = "<html><body>source</body></html>"
+    transport.get_clearance.return_value = {
+        "cookies": {"cf_clearance": "test"},
+        "user_agent": "test-agent",
+        "proxy": None,
+    }
+    transport.traffic_delta.return_value = {
+        "real_bytes_downloaded": 0,
+        "real_requests_count": 1,
+        "budget_unobserved_bytes": 589824,
+        "network_policy_failed": True,
+        "network_policy_failure": "unexpected_websocket_handshake",
+    }
+    create_http_session = MagicMock()
+    monkeypatch.setattr(
+        FBrefFetcher,
+        "_create_http_session",
+        create_http_session,
+    )
+    fetcher = FBrefFetcher.__new__(FBrefFetcher)
+    fetcher.bootstrap_url = "https://fbref.com/en/"
+    fetcher._http_session = None
+    fetcher._transport = transport
+
+    with pytest.raises(FetchError) as raised:
+        fetcher._ensure_clearance()
+
+    assert raised.value.error_class == "hard_transport_policy"
+    assert "unexpected_websocket_handshake" in str(raised.value)
+    create_http_session.assert_not_called()
+
+
+def test_clearance_traffic_export_failure_charges_full_reserved_ceiling():
+    transport = MagicMock()
+    transport.fetch.return_value = "<html><body>source</body></html>"
+    transport.traffic_delta.side_effect = RuntimeError("metrics unavailable")
+    fetcher = FBrefFetcher.__new__(FBrefFetcher)
+    fetcher.bootstrap_url = "https://fbref.com/en/"
+    fetcher._http_session = None
+    fetcher._transport = transport
+    fetcher._max_browser_requests = 80
+    fetcher._max_browser_bytes = 16 * 1024 * 1024
+
+    with pytest.raises(FetchError) as raised:
+        fetcher._ensure_clearance()
+
+    assert raised.value.error_class == "hard_transport_policy"
+    assert raised.value.browser_requests == 80
+    assert raised.value.browser_bootstrap_attempts == 4
+    assert raised.value.browser_unobserved_bytes == 16 * 1024 * 1024
+
+
+def test_clearance_export_exception_keeps_observed_traffic():
+    transport = MagicMock()
+    transport.fetch.return_value = "<html><body>source</body></html>"
+    transport.traffic_delta.return_value = {
+        "real_bytes_downloaded": 150,
+        "real_requests_count": 3,
+        "browser_bootstrap_attempts": 1,
+        "budget_unobserved_bytes": 7,
+        "real_bytes_by_resource_type": {"document": 100, "script": 50},
+    }
+    transport.get_clearance.side_effect = RuntimeError("export unavailable")
+    fetcher = FBrefFetcher.__new__(FBrefFetcher)
+    fetcher.bootstrap_url = "https://fbref.com/en/"
+    fetcher._http_session = None
+    fetcher._transport = transport
+
+    with pytest.raises(FetchError) as raised:
+        fetcher._ensure_clearance()
+
+    assert raised.value.error_class == "clearance_export_failed"
+    assert raised.value.browser_requests == 3
+    assert raised.value.browser_document_bytes == 100
+    assert raised.value.browser_asset_bytes == 50
+    assert raised.value.browser_unobserved_bytes == 7
 
 
 def test_target_fetch_uses_warm_http_bytes_and_emits_bootstrap_once(monkeypatch):
@@ -171,6 +299,44 @@ def test_raw_contract_and_response_ceiling_fail_closed(monkeypatch):
     with pytest.raises(FetchError, match="exceeded") as caught:
         too_large.fetch("https://fbref.com/x", page_kind="season")
     assert caught.value.error_class == "response_too_large"
+
+
+def test_http_200_cloudflare_challenge_poison_is_session_scoped(monkeypatch):
+    monkeypatch.setattr(
+        "scrapers.fbref.fetcher._response_wire_size", lambda _response: 42
+    )
+    fetcher = _fetcher(
+        _response(body=b"<html><body>Just a moment...</body></html>")
+    )
+
+    with pytest.raises(FetchError) as caught:
+        fetcher.fetch("https://fbref.com/en/comps", page_kind="competition_index")
+
+    assert caught.value.error_class == "raw_contract_cloudflare_challenge"
+    assert caught.value.http_status == 200
+
+
+def test_warm_transport_error_has_structured_session_classification():
+    fetcher = _fetcher(_response())
+    fetcher._http_session.get.side_effect = RuntimeError(
+        "Connection reset by proxy"
+    )
+
+    with pytest.raises(FetchError) as caught:
+        fetcher.fetch("https://fbref.com/en/comps", page_kind="competition_index")
+
+    assert caught.value.error_class == "warm_session_connection"
+    assert caught.value.http_requests == 1
+
+
+def test_unknown_warm_error_remains_target_scoped_http_exception():
+    fetcher = _fetcher(_response())
+    fetcher._http_session.get.side_effect = RuntimeError("decoder exploded")
+
+    with pytest.raises(FetchError) as caught:
+        fetcher.fetch("https://fbref.com/en/comps", page_kind="competition_index")
+
+    assert caught.value.error_class == "http_exception"
 
 
 def test_streaming_ceiling_aborts_on_oversized_chunk_before_buffering_rest(
@@ -265,17 +431,79 @@ def test_constructor_passes_hard_browser_budget(monkeypatch):
     assert constructor.call_args.kwargs["max_network_bytes"] == (
         DEFAULT_BROWSER_BYTE_LIMIT
     )
+    assert constructor.call_args.kwargs["headless"] == "virtual"
+    assert constructor.call_args.kwargs["humanize"] is True
     fetcher.close()
 
 
-def test_default_reservation_covers_transport_worst_case():
-    worst_case_accounting = (
-        DEFAULT_BROWSER_BYTE_LIMIT
-        + MAX_HTML_BYTES
-        + DEFAULT_HTTP_WIRE_OVERHEAD_RESERVATION_BYTES
-    )
+def test_bootstrap_provider_exception_is_session_scoped_fetch_error():
+    fetcher = FBrefFetcher.__new__(FBrefFetcher)
+    transport = MagicMock()
+    transport.fetch.side_effect = RuntimeError("fbref_proxy_pool_unavailable")
+    transport.traffic_delta.return_value = {
+        "real_requests_count": 0,
+        "real_bytes_downloaded": 0,
+    }
+    fetcher._http_session = None
+    fetcher._transport = transport
+    fetcher.bootstrap_url = "https://fbref.com/en/"
 
-    assert worst_case_accounting <= DEFAULT_REQUEST_RESERVATION_BYTES
+    with pytest.raises(FetchError) as raised:
+        fetcher._ensure_clearance()
+
+    assert raised.value.error_class == "clearance_failed"
+    assert "RuntimeError" in str(raised.value)
+
+
+def test_failed_geoip_is_a_non_refreshable_hard_transport_error():
+    fetcher = FBrefFetcher.__new__(FBrefFetcher)
+    transport = MagicMock()
+    transport.fetch.return_value = None
+    transport.traffic_delta.return_value = {
+        "real_requests_count": 1,
+        "real_bytes_downloaded": 0,
+        "geoip_lookup_failed": True,
+    }
+    fetcher._http_session = None
+    fetcher._transport = transport
+    fetcher.bootstrap_url = "https://fbref.com/en/"
+
+    with pytest.raises(FetchError) as raised:
+        fetcher._ensure_clearance()
+
+    assert raised.value.error_class == "hard_transport_policy"
+    assert "geoip_lookup_failed" in str(raised.value)
+
+
+def test_reset_clearance_drops_session_transport_and_metered_lease():
+    fetcher = FBrefFetcher.__new__(FBrefFetcher)
+    old_transport = MagicMock()
+    old_session = MagicMock()
+    new_transport = MagicMock()
+    close_lease = MagicMock()
+    fetcher._transport = old_transport
+    fetcher._http_session = old_session
+    fetcher._bootstrap_stats = {"old": True}
+    fetcher._clearance = {"old": True}
+    fetcher._close_provider_lease = close_lease
+    fetcher._create_transport = MagicMock(return_value=new_transport)
+
+    fetcher.reset_clearance()
+
+    old_session.close.assert_called_once_with()
+    old_transport.close.assert_called_once_with()
+    close_lease.assert_called_once_with()
+    assert fetcher._transport is new_transport
+    assert fetcher._bootstrap_stats is None
+    assert fetcher._clearance is None
+
+
+def test_target_and_bootstrap_have_independent_byte_reservations():
+    assert (
+        MAX_HTML_BYTES + DEFAULT_HTTP_WIRE_OVERHEAD_RESERVATION_BYTES
+        <= DEFAULT_REQUEST_RESERVATION_BYTES
+    )
+    assert DEFAULT_BROWSER_BYTE_LIMIT == 4 * 1024 * 1024
 
 
 def test_warm_session_reuses_explicit_proxy_auth_and_ignores_environment(
@@ -298,7 +526,15 @@ def test_warm_session_reuses_explicit_proxy_auth_and_ignores_environment(
 
     session = FBrefFetcher._create_http_session({
         "cookies": {"cf_clearance": "cookie-value"},
-        "user_agent": "Mozilla/5.0 Firefox/135",
+        "user_agent": "Mozilla/5.0 Firefox/152",
+        "browser_headers": {
+            "accept": "browser-accept",
+            "accept-language": "en-DE,en;q=0.9",
+            "accept-encoding": "gzip, deflate, br, zstd",
+            "sec-fetch-dest": "document",
+            "sec-fetch-mode": "navigate",
+            "sec-fetch-site": "none",
+        },
         "proxy": {
             "server": "http://proxy.example:8080",
             "username": "proxy-user",
@@ -307,7 +543,7 @@ def test_warm_session_reuses_explicit_proxy_auth_and_ignores_environment(
     })
 
     assert created == [{
-        "impersonate": "firefox135",
+        "impersonate": "firefox147",
         "proxy": "http://proxy.example:8080",
         "proxy_auth": ("proxy-user", "proxy-password"),
         "trust_env": False,
@@ -316,7 +552,13 @@ def test_warm_session_reuses_explicit_proxy_auth_and_ignores_environment(
     assert "proxy-user" not in created[0]["proxy"]
     assert "proxy-password" not in created[0]["proxy"]
     assert session.cookies == {"cf_clearance": "cookie-value"}
-    assert session.headers["User-Agent"] == "Mozilla/5.0 Firefox/135"
+    assert session.headers["User-Agent"] == "Mozilla/5.0 Firefox/152"
+    assert session.headers["Accept"] == "browser-accept"
+    assert session.headers["Accept-Language"] == "en-DE,en;q=0.9"
+    assert session.headers["Accept-Encoding"] == "gzip, deflate, br, zstd"
+    assert session.headers["Sec-Fetch-Dest"] == "document"
+    assert session.headers["Sec-Fetch-Mode"] == "navigate"
+    assert session.headers["Sec-Fetch-Site"] == "none"
 
 
 def test_retryable_500_retries_once_and_accounts_both_requests(monkeypatch):

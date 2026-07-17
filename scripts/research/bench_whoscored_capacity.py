@@ -2013,11 +2013,25 @@ def _run_subprocess_round(
         raise RuntimeError(worker_exec_error)
     running: list[_RunningProcess] = []
     with TemporaryDirectory(prefix="whoscored-capacity-round-") as temp_root:
+        stop_latched = False
+
+        def stop_is_requested() -> bool:
+            """Make a fail-fast stop request sticky across outcome callbacks."""
+
+            nonlocal stop_latched
+            if not stop_latched and should_stop():
+                stop_latched = True
+            return stop_latched
+
+        def emit_outcome(outcome: WorkerOutcome) -> None:
+            on_outcome(outcome)
+            stop_is_requested()
+
         def launch(command: WorkerCommand) -> bool:
-            if should_stop():
+            if stop_is_requested():
                 return False
             before_launch()
-            if should_stop():
+            if stop_is_requested():
                 return False
             stem = f"worker-{command.worker_id}-iteration-{command.iteration}"
             stdout_handle = open(
@@ -2069,7 +2083,7 @@ def _run_subprocess_round(
             except (OSError, ValueError, subprocess.SubprocessError) as exc:
                 stdout_handle.close()
                 stderr_handle.close()
-                on_outcome(
+                emit_outcome(
                     WorkerOutcome(
                         worker_id=command.worker_id,
                         iteration=command.iteration,
@@ -2104,7 +2118,7 @@ def _run_subprocess_round(
             for command in commands:
                 if not launch(command):
                     break
-                if should_stop():
+                if stop_is_requested():
                     break
 
             while running:
@@ -2119,7 +2133,7 @@ def _run_subprocess_round(
                             [item], monotonic=monotonic, sleep=sleep
                         )
                         termination_reason = "orphan_process_group"
-                    on_outcome(
+                    emit_outcome(
                         _finish_process(
                             item,
                             monotonic=monotonic,
@@ -2131,7 +2145,7 @@ def _run_subprocess_round(
                     item.stderr_handle.close()
                     running.remove(item)
 
-                stop_requested = should_stop()
+                stop_requested = stop_is_requested()
                 deadline_reached = monotonic() >= deadline
                 if stop_requested or deadline_reached:
                     reason = (
@@ -2141,7 +2155,7 @@ def _run_subprocess_round(
                     )
                     _stop_processes(running, monotonic=monotonic, sleep=sleep)
                     for item in list(running):
-                        on_outcome(
+                        emit_outcome(
                             _finish_process(
                                 item,
                                 monotonic=monotonic,
@@ -2154,7 +2168,7 @@ def _run_subprocess_round(
                     break
 
                 for command in completed:
-                    if should_stop():
+                    if stop_is_requested():
                         break
                     replacement = WorkerCommand(
                         worker_id=command.worker_id,
@@ -2166,7 +2180,7 @@ def _run_subprocess_round(
                     )
                     if not launch(replacement):
                         break
-                if should_stop():
+                if stop_is_requested():
                     continue
                 if len(running) != WORKER_COUNT:
                     raise RuntimeError(

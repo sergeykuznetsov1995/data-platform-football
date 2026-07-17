@@ -12,9 +12,16 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
 
+# The scheduled ingest DAG is intentionally a thin Airflow discovery wrapper.
+# Its concrete operators live in the shared scheduled/bootstrap factory.
+_OPERATOR_SOURCE_BY_DAG_FILE = {
+    "dag_ingest_fbref.py": "utils/fbref_current_dag_factory.py",
+}
+
 
 def _operator_calls(filename: str, operator_name: str) -> list[dict[str, ast.AST]]:
-    tree = ast.parse((ROOT / "dags" / filename).read_text(encoding="utf-8"))
+    source = _OPERATOR_SOURCE_BY_DAG_FILE.get(filename, filename)
+    tree = ast.parse((ROOT / "dags" / source).read_text(encoding="utf-8"))
     calls = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
@@ -100,8 +107,10 @@ def test_fbref_child_runs_have_parent_unique_identity_and_never_share_ds():
         template = _literal(trigger["trigger_run_id"])
         assert "{{ dag.dag_id }}" in template
         assert "{{ run_id }}" in template
-        assert _literal(trigger["logical_date"]) == "{{ ti.start_date }}"
-        assert "execution_date" not in trigger
+        # Airflow 2.7 names this TriggerDagRunOperator argument
+        # ``execution_date``; Airflow 2.11 keeps it as a compatible alias.
+        assert _literal(trigger["execution_date"]) == "{{ ti.start_date }}"
+        assert "logical_date" not in trigger
         rendered_ids.add(
             template.replace("{{ dag.dag_id }}", parent_dag_id).replace(
                 "{{ run_id }}", "same-day-run"

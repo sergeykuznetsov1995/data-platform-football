@@ -173,6 +173,7 @@ Thumbs.db
 *.csv
 *.json
 !configs/**/*.json
+!dags/configs/**/*.json
 !tests/fixtures/**/*.json
 !docker/images/airflow/whoscored-build-provenance-attestation.json
 !docker/images/airflow/whoscored-build-provenance-manifest.json
@@ -206,11 +207,19 @@ configs/openmetadata/jwtkeys/
 # Documentation (local only)
 CLAUDE.md
 PLAN.md
+docs/
+# Production runbooks and reviewed, read-only acceptance queries are versioned
+# even though local/scratch docs remain ignored by default.
+!docs/
 docs/*
-# Production runbooks must be versioned even though local/scratch docs remain
-# ignored by default.
 !docs/operations/
+docs/operations/*
 !docs/operations/*.md
+!docs/operations/sql/
+docs/operations/sql/*
+!docs/operations/sql/fbref_production_acceptance.sql
+!docs/operations/sql/fbref_control_dataset_acceptance.sql
+!docs/operations/sql/fbref_canary_acceptance.sql
 scrapers/README.md
 
 # Local ad-hoc SQL (not part of pipeline; only dags/sql/ is tracked)

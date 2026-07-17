@@ -13,6 +13,11 @@ from scrapers.transfermarkt.client import (
 )
 from scrapers.transfermarkt.models import (
     HARD_PROVIDER_BYTE_BUDGET,
+    PROVIDER_GRANT_ENV_VAR,
+    PROVIDER_GRANT_FLOOR_BYTES,
+    PROVIDER_GRANT_SOFT_MARGIN_BYTES,
+    SCOPE_HARD_PROVIDER_BYTE_CAP,
+    SCOPE_SOFT_PROVIDER_BYTE_STOP,
     SOFT_PROVIDER_BYTE_STOP,
     FetchOutcome,
     FetchStatus,
@@ -21,6 +26,7 @@ from scrapers.transfermarkt.models import (
     ProxyRequiredError,
     SharedTrafficLedger,
     TrafficBudgetExceeded,
+    TrafficMeterError,
 )
 
 
@@ -140,10 +146,137 @@ def _metadata():
 def test_default_shared_provider_budget_constants_are_exact():
     ledger = SharedTrafficLedger()
 
+    # Production per-scope pair: the default ledger of one exact scope cycle.
+    assert SCOPE_HARD_PROVIDER_BYTE_CAP == 25_165_824
+    assert SCOPE_SOFT_PROVIDER_BYTE_STOP == 23_068_672
+    assert ledger.snapshot()["hard_provider_byte_budget"] == 25_165_824
+    assert ledger.snapshot()["soft_provider_byte_stop"] == 23_068_672
+    # The discovery contour keeps its own explicitly-pinned 15/14 MiB pair.
     assert HARD_PROVIDER_BYTE_BUDGET == 15_728_640
     assert SOFT_PROVIDER_BYTE_STOP == 14_680_064
-    assert ledger.snapshot()["hard_provider_byte_budget"] == 15_728_640
-    assert ledger.snapshot()["soft_provider_byte_stop"] == 14_680_064
+
+
+@pytest.mark.unit
+def test_provider_grant_and_entity_reserve_literals_are_pinned():
+    from scrapers.transfermarkt.models import PRODUCTION_ENTITY_BUDGETS
+
+    # These are paid-traffic literals: a silent edit changes what production
+    # is allowed to spend, so they are pinned by value, not by derivation.
+    assert PROVIDER_GRANT_FLOOR_BYTES == 65_536
+    assert PROVIDER_GRANT_SOFT_MARGIN_BYTES == 1_048_576
+    assert {
+        name: budget["provider_reserve_bytes"]
+        for name, budget in PRODUCTION_ENTITY_BUDGETS.items()
+    } == {
+        "players": 10_485_760,
+        "market_value_history": 6_291_456,
+        "transfers": 8_388_608,
+        "coaches": 8_388_608,
+    }
+
+
+@pytest.mark.unit
+def test_provider_grant_sizes_the_metered_client_ledger(monkeypatch):
+    grant = 10 * 1024 * 1024
+    monkeypatch.setenv(PROVIDER_GRANT_ENV_VAR, str(grant))
+    client = TransfermarktHttpClient(
+        lease_provider=_FakeLeaseProvider([]),
+        lease_metadata=_metadata(),
+        client_factory=_TlsFactory([]),
+    )
+
+    snapshot = client._traffic_ledger.snapshot()
+    assert snapshot["hard_provider_byte_budget"] == grant
+    assert snapshot["soft_provider_byte_stop"] == (
+        grant - PROVIDER_GRANT_SOFT_MARGIN_BYTES
+    )
+
+
+@pytest.mark.unit
+def test_provider_grant_never_exceeds_the_scope_cap(monkeypatch):
+    monkeypatch.setenv(
+        PROVIDER_GRANT_ENV_VAR, str(SCOPE_HARD_PROVIDER_BYTE_CAP * 4),
+    )
+    client = TransfermarktHttpClient(
+        lease_provider=_FakeLeaseProvider([]),
+        lease_metadata=_metadata(),
+        client_factory=_TlsFactory([]),
+    )
+
+    snapshot = client._traffic_ledger.snapshot()
+    assert snapshot["hard_provider_byte_budget"] == SCOPE_HARD_PROVIDER_BYTE_CAP
+
+
+@pytest.mark.unit
+def test_provider_grant_below_the_floor_is_refused_before_any_io(monkeypatch):
+    monkeypatch.setenv(
+        PROVIDER_GRANT_ENV_VAR, str(PROVIDER_GRANT_FLOOR_BYTES - 1),
+    )
+    provider = _FakeLeaseProvider([])
+    factory = _TlsFactory([])
+
+    with pytest.raises(TrafficMeterError, match="floor"):
+        TransfermarktHttpClient(
+            lease_provider=provider,
+            lease_metadata=_metadata(),
+            client_factory=factory,
+        )
+
+    assert provider.acquired == []
+    assert factory.calls == []
+
+
+@pytest.mark.unit
+def test_small_grants_keep_a_proportional_soft_stop(monkeypatch):
+    monkeypatch.setenv(
+        PROVIDER_GRANT_ENV_VAR, str(PROVIDER_GRANT_FLOOR_BYTES),
+    )
+    client = TransfermarktHttpClient(
+        lease_provider=_FakeLeaseProvider([]),
+        lease_metadata=_metadata(),
+        client_factory=_TlsFactory([]),
+    )
+
+    snapshot = client._traffic_ledger.snapshot()
+    assert snapshot["hard_provider_byte_budget"] == PROVIDER_GRANT_FLOOR_BYTES
+    assert snapshot["soft_provider_byte_stop"] == PROVIDER_GRANT_FLOOR_BYTES // 2
+
+
+@pytest.mark.unit
+def test_unreadable_provider_grant_fails_closed_before_any_io(monkeypatch):
+    monkeypatch.setenv(PROVIDER_GRANT_ENV_VAR, "ten megabytes")
+    provider = _FakeLeaseProvider([])
+    factory = _TlsFactory([])
+
+    with pytest.raises(TrafficMeterError, match="unreadable"):
+        TransfermarktHttpClient(
+            lease_provider=provider,
+            lease_metadata=_metadata(),
+            client_factory=factory,
+        )
+
+    assert provider.acquired == []
+    assert factory.calls == []
+
+
+@pytest.mark.unit
+def test_a_metered_run_refuses_to_start_without_a_grant(monkeypatch):
+    # Even without TM_REQUIRE_METERED_PROXY: a lease-backed client that found
+    # no grant would silently inherit the full per-scope default ledger.
+    monkeypatch.delenv(PROVIDER_GRANT_ENV_VAR, raising=False)
+    monkeypatch.delenv("TM_REQUIRE_METERED_PROXY", raising=False)
+    provider = _FakeLeaseProvider([])
+    factory = _TlsFactory([])
+
+    with pytest.raises(ProxyRequiredError, match=PROVIDER_GRANT_ENV_VAR):
+        TransfermarktHttpClient(
+            lease_provider=provider,
+            lease_metadata=_metadata(),
+            client_factory=factory,
+        )
+
+    assert provider.acquired == []
+    assert factory.calls == []
 
 
 @pytest.mark.unit
@@ -395,7 +528,8 @@ def test_shared_retry_cap_blocks_paid_retry_n_plus_one_before_io():
 
 
 @pytest.mark.unit
-def test_blocked_lease_rotates_once_and_never_direct_falls_back():
+def test_blocked_lease_rotates_once_and_never_direct_falls_back(monkeypatch):
+    monkeypatch.setenv(PROVIDER_GRANT_ENV_VAR, str(8 * 1024 * 1024))
     provider = _FakeLeaseProvider([
         LeaseTrafficSnapshot(up_bytes=10, down_bytes=40),
         LeaseTrafficSnapshot(up_bytes=5, down_bytes=25),

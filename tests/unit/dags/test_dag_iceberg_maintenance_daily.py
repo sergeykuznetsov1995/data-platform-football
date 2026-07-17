@@ -22,6 +22,7 @@ def test_daily_maintenance_is_split_serial_and_fail_closed() -> None:
     assert mod.dag._dag_kwargs["max_active_runs"] == 1
     assert mod.dag._dag_kwargs["max_active_tasks"] == 1
     assert set(tasks) == {
+        "janitor_fbref_generic_stages",
         "cleanup_whoscored_dq_stage_partitions",
         "maintain_whoscored_bronze",
         "maintain_other_high_churn_bronze",
@@ -29,6 +30,16 @@ def test_daily_maintenance_is_split_serial_and_fail_closed() -> None:
     assert tasks["maintain_whoscored_bronze"].upstream_task_ids == {
         "cleanup_whoscored_dq_stage_partitions"
     }
+    assert tasks["janitor_fbref_generic_stages"].downstream_task_ids == {
+        "cleanup_whoscored_dq_stage_partitions",
+        "maintain_other_high_churn_bronze",
+    }
+    assert tasks["cleanup_whoscored_dq_stage_partitions"]._init_kwargs[
+        "trigger_rule"
+    ] == "all_done"
+    assert tasks["maintain_other_high_churn_bronze"]._init_kwargs[
+        "trigger_rule"
+    ] == "all_done"
 
     with pytest.raises(Exception, match="WhoScored had 1 table failure"):
         mod._fail_on_partial_maintenance(

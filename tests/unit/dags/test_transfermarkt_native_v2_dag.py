@@ -128,6 +128,67 @@ def _scope_set(mod, *manifests, reader_revision=None):
     )
 
 
+def _target_row(manifest, **overrides):
+    """One promoted-registry target row as the transform gate reads it."""
+
+    capture = manifest.dq_evidence['scope_capture']
+    row = {
+        'competition_id': manifest.competition_id,
+        'edition_id': manifest.edition_id,
+        'canonical_competition_id': manifest.canonical_competition_id,
+        'canonical_season': manifest.canonical_season,
+        'competition_type': capture['competition_type'],
+        'team_type': capture['team_type'],
+        'gender': capture['gender'],
+        'age_category': capture['age_category'],
+    }
+    row.update(overrides)
+    return tuple(row.values())
+
+
+class _RegistryCursor:
+    """Answers the transform entry gate: registry state, target, Silver witness."""
+
+    def __init__(
+        self,
+        mod,
+        *,
+        manifests=(),
+        target_rows=None,
+        promoted_snapshot='registry-1',
+        materialized=(),
+        existing_tables=(),
+    ):
+        self.mod = mod
+        self.sql = ''
+        self.promoted_snapshot = promoted_snapshot
+        self.target_rows = (
+            [_target_row(item) for item in manifests]
+            if target_rows is None else list(target_rows)
+        )
+        self.materialized = list(materialized)
+        self.existing_tables = list(existing_tables)
+        self.manifest_rows = [_manifest_row(item) for item in manifests]
+
+    def execute(self, sql):
+        self.sql = sql
+
+    def fetchall(self):
+        mod = self.mod
+        if f'FROM {mod.tm_planner.REGISTRY_STATE_TABLE}' in self.sql:
+            return [('canonical', self.promoted_snapshot, 'promoted', 0)]
+        if f'FROM {mod.tm_planner.COMPETITIONS_TABLE}' in self.sql:
+            return self.target_rows
+        if 'information_schema.tables' in self.sql:
+            return [(name,) for name in self.existing_tables]
+        if 'SELECT DISTINCT competition_id, edition_id FROM' in self.sql:
+            return list(self.materialized)
+        return self.manifest_rows
+
+    def close(self):
+        pass
+
+
 def _scope_conf(scope_set, *, slot='b'):
     return {
         'transfermarkt_parent_cycle_id': 'parent-cycle',
@@ -218,7 +279,8 @@ def test_shadow_gold_is_built_and_ready_marker_is_a_leaf():
     persisted = _task('persist_scope_set_manifest')
     assert capture.upstream_task_ids == {'validate_transform_scope_set'}
     assert pins.upstream_task_ids == {'capture_reader_state'}
-    assert approval.upstream_task_ids == {'pin_transform_input_snapshots'}
+    # #948: the Bronze DQ gate sits between the pins and the write approval.
+    assert approval.upstream_task_ids == {'validate_bronze_quality'}
     assert persisted.upstream_task_ids == {'authorize_silver_writes'}
     assert gold_approval.upstream_task_ids == {'validate_native_v2_quality'}
     for task_id, _, _, _ in mod.NATIVE_V2_GOLD_TRANSFORMS:
@@ -406,28 +468,9 @@ def test_transform_preflight_returns_exact_scopes_and_traffic(monkeypatch):
     second = _manifest(mod, '2')
     scope_set = _scope_set(mod, first, second)
 
-    class Cursor:
-        sql = ''
-
-        def execute(self, sql):
-            self.sql = sql
-
-        def fetchall(self):
-            if f'FROM {mod.tm_planner.REGISTRY_STATE_TABLE}' in self.sql:
-                return [('registry-1', 'promoted', 0)]
-            if f'FROM {mod.tm_planner.COMPETITIONS_TABLE}' in self.sql:
-                return [
-                    (first.competition_id, first.edition_id),
-                    (second.competition_id, second.edition_id),
-                ]
-            return [_manifest_row(first), _manifest_row(second)]
-
-        def close(self):
-            pass
-
     class Conn:
         def cursor(self):
-            return Cursor()
+            return _RegistryCursor(mod, manifests=(first, second))
 
         def close(self):
             pass
@@ -446,34 +489,226 @@ def test_transform_preflight_returns_exact_scopes_and_traffic(monkeypatch):
     assert result['traffic']['provider_metered_bytes'] == 140
     assert result['registry_coverage'] == {
         'registry_snapshot_id': 'registry-1',
+        'promoted_registry_snapshot_id': 'registry-1',
         'target_scope_count': 2,
+        'covered_scope_count': 2,
+        'missing_scope_count': 0,
+        'coverage_ratio': 1.0,
+        'missing_scopes': [],
         'complete': True,
     }
+    assert result['silver_coverage']['dropped_scope_count'] == 0
 
 
-def test_transform_prewrite_rejects_partial_promoted_registry_target():
+def test_transform_reports_a_partial_promoted_registry_target():
+    # A slot short of the target is what a months-long bounded crawl produces;
+    # it must still reach Silver and Gold.  The shortfall is reported here and
+    # gates the reader cutover in readiness, not the build.
+    mod = _reload()
+    manifest = _manifest(mod, '1')
+    other = _manifest(mod, '2', competition_id='CL')
+    scope_set = _scope_set(mod, manifest)
+
+    coverage = mod._assert_promoted_registry_subset(
+        _RegistryCursor(mod, target_rows=[
+            _target_row(manifest), _target_row(other),
+        ]),
+        scope_set=scope_set,
+        manifests=(manifest,),
+    )
+
+    assert coverage['complete'] is False
+    assert coverage['target_scope_count'] == 2
+    assert coverage['covered_scope_count'] == 1
+    assert coverage['coverage_ratio'] == 0.5
+    assert coverage['missing_scopes'] == [['CL', '2025']]
+
+
+def test_transform_prewrite_rejects_a_scope_outside_the_registry_target():
+    # The other direction stays a hard failure: a scope the promoted registry
+    # does not target is a foreign scope, and no amount of coverage debt
+    # explains it.
     mod = _reload()
     manifest = _manifest(mod, '1')
     scope_set = _scope_set(mod, manifest)
 
-    class Cursor:
-        sql = ''
+    with pytest.raises(Exception, match='outside the promoted registry target'):
+        mod._assert_promoted_registry_subset(
+            _RegistryCursor(mod, target_rows=[
+                _target_row(_manifest(mod, '2', competition_id='CL')),
+            ]),
+            scope_set=scope_set,
+            manifests=(manifest,),
+        )
 
-        def execute(self, sql):
-            self.sql = sql
+
+def test_a_slot_frozen_under_an_earlier_promoted_snapshot_still_builds():
+    # Discovery re-reads the registry on its own schedule and mints a new
+    # snapshot id from every page of the source.  A slot bought under the
+    # previous promoted snapshot is not thereby invalid — what it captured did
+    # not change.  What must still hold is that the registry means the same
+    # thing by each of its scopes.
+    mod = _reload()
+    manifest = _manifest(mod, '1')
+    scope_set = _scope_set(mod, manifest)
+
+    class Cursor(_RegistryCursor):
+        def fetchall(self):
+            if f'FROM {self.mod.tm_planner.REGISTRY_STATE_TABLE}' in self.sql:
+                return [
+                    ('canonical', 'registry-2', 'promoted', 0),
+                    ('history:1', 'registry-1', 'promoted', 0),
+                ]
+            return super().fetchall()
+
+    coverage = mod._assert_promoted_registry_subset(
+        Cursor(mod, manifests=(manifest,)),
+        scope_set=scope_set,
+        manifests=(manifest,),
+    )
+    assert coverage['registry_snapshot_id'] == 'registry-1'
+    assert coverage['promoted_registry_snapshot_id'] == 'registry-2'
+    assert coverage['complete'] is True
+
+    renamed = _RegistryCursor(mod, target_rows=[
+        _target_row(manifest, canonical_competition_id='ENG-Renamed'),
+    ])
+    with pytest.raises(Exception, match='no longer means'):
+        mod._assert_promoted_registry_subset(
+            renamed, scope_set=scope_set, manifests=(manifest,),
+        )
+
+
+def test_a_slot_narrower_than_its_native_silver_may_not_replace_it():
+    # Native Silver is written CREATE OR REPLACE over exactly the slot's scopes.
+    # A slot that lost scopes would not refresh that table — it would delete the
+    # difference, and Gold would break behind it.
+    mod = _reload()
+    manifest = _manifest(mod, '1')
+    cursor = _RegistryCursor(
+        mod,
+        manifests=(manifest,),
+        existing_tables=['transfermarkt_squad_memberships_v2_b'],
+        materialized=[
+            (manifest.competition_id, manifest.edition_id),
+            ('CL', '2025'),
+        ],
+    )
+
+    with pytest.raises(Exception, match='narrower than the models'):
+        mod._assert_no_served_model_shrinks(
+            cursor, candidate_slot='b', manifests=(manifest,),
+        )
+
+    kept = _RegistryCursor(
+        mod,
+        manifests=(manifest,),
+        existing_tables=['transfermarkt_squad_memberships_v2_b'],
+        materialized=[(manifest.competition_id, manifest.edition_id)],
+    )
+    report = mod._assert_no_served_model_shrinks(
+        kept, candidate_slot='b', manifests=(manifest,),
+    )
+    assert report['materialized_scope_counts'] == {
+        'iceberg.silver.transfermarkt_squad_memberships_v2_b': 1,
+    }
+    assert report['dropped_scope_count'] == 0
+
+    # Nothing materialized yet (first ever build) is not a shrink.
+    empty = _RegistryCursor(mod, manifests=(manifest,))
+    assert mod._assert_no_served_model_shrinks(
+        empty, candidate_slot='b', manifests=(manifest,),
+    )['checked_relations'] == []
+
+
+def test_the_served_legacy_silver_is_guarded_against_its_own_bronze():
+    # The legacy Silver tables are the contour being SERVED today and are also
+    # rewritten whole by this DAG.  They are rebuilt from the full legacy Bronze
+    # (never from the slot — a two-scope slot would otherwise delete the top-5),
+    # so Bronze is their yardstick: whatever Bronze can no longer produce would
+    # vanish from a served table on the next build.
+    mod = _reload()
+    manifest = _manifest(mod, '1')
+
+    class Cursor(_RegistryCursor):
+        def __init__(self, *args, bronze=(), silver=(), **kwargs):
+            super().__init__(*args, **kwargs)
+            self.bronze = list(bronze)
+            self.silver = list(silver)
 
         def fetchall(self):
-            if f'FROM {mod.tm_planner.REGISTRY_STATE_TABLE}' in self.sql:
-                return [('registry-1', 'promoted', 0)]
-            return [
-                (manifest.competition_id, manifest.edition_id),
-                ('CL', '2025'),
-            ]
+            if 'iceberg.bronze.transfermarkt' in self.sql:
+                return self.bronze
+            if 'SELECT DISTINCT league, season FROM' in self.sql:
+                return self.silver
+            return super().fetchall()
 
-    with pytest.raises(Exception, match='complete promoted registry target'):
-        mod._assert_complete_promoted_registry_target(
-            Cursor(), scope_set=scope_set, manifests=(manifest,),
+    intact = Cursor(
+        mod,
+        manifests=(manifest,),
+        existing_tables=['transfermarkt_market_value_history'],
+        bronze=[('ENG-Premier League', '2425')],
+        silver=[('ENG-Premier League', '2425')],
+    )
+    report = mod._assert_no_served_model_shrinks(
+        intact, candidate_slot='b', manifests=(manifest,),
+    )
+    assert report['legacy_source_scope_count'] == 1
+    assert report['dropped_scope_count'] == 0
+
+    shrinking = Cursor(
+        mod,
+        manifests=(manifest,),
+        existing_tables=['transfermarkt_market_value_history'],
+        bronze=[('ENG-Premier League', '2425')],
+        silver=[('ENG-Premier League', '2425'), ('ITA-Serie A', '2425')],
+    )
+    with pytest.raises(Exception, match='narrower than the models'):
+        mod._assert_no_served_model_shrinks(
+            shrinking, candidate_slot='b', manifests=(manifest,),
         )
+
+
+def test_dq_checks_carry_their_own_membership_and_never_the_model_cte():
+    # utils.data_quality builds a bare `SELECT … WHERE <where>`: a predicate
+    # referencing the model's CTE would fail at analysis, and run_checks turns an
+    # exception into a WARNING — silently disarming a gate that must escalate to
+    # ERROR.  DQ predicates therefore carry their own VALUES relation.
+    mod = _reload()
+    scopes = [
+        {'competition_id': 'GB1', 'edition_id': '2025'},
+        {'competition_id': 'CL', 'edition_id': '2025'},
+    ]
+
+    predicate = mod._inline_scope_membership(
+        ((item['competition_id'], item['edition_id']) for item in scopes),
+        left_column='competition_id',
+        right_column='edition_id',
+    )
+    assert predicate == (
+        "(competition_id, edition_id) IN (VALUES ('GB1', '2025'), "
+        "('CL', '2025'))"
+    )
+    assert mod.NATIVE_SCOPE_CTE not in predicate
+
+    source = Path(mod.__file__).read_text(encoding='utf-8')
+    for name in ('_validate_native_v2_quality', '_validate_native_v2_gold'):
+        body = source[source.index(f'def {name}'):]
+        body = body[:body.index('\ndef ', 1)]
+        assert '_scope_predicate(' not in body
+        assert mod.NATIVE_SCOPE_CTE not in body
+        assert "' OR '.join(" not in body
+        assert '_inline_scope_membership(' in body
+
+
+def test_the_legacy_silver_rebuild_is_never_narrowed_to_the_slot():
+    # The slot may hold two scopes out of ~9.7k.  If the legacy rebuild were
+    # restricted to it, the first scheduled transform would have replaced the
+    # served top-5 Silver with two competitions.
+    mod = _reload()
+    assert not hasattr(mod, '_scope_legacy_sql')
+    source = Path(mod.__file__).read_text(encoding='utf-8')
+    assert '_scope_legacy_sql' not in source
 
 
 def test_transform_treats_cross_parent_aggregate_traffic_as_metric_only():
@@ -540,9 +775,20 @@ def test_sql_is_scope_filtered_time_travel_pinned_and_lineage_bound():
         'iceberg.bronze.transfermarkt_squad_memberships': 101,
         'iceberg.silver.xref_player': 202,
     })
-    assert 'competition_id = \'GB1\'' in pinned
-    assert 'edition_id = \'2025\'' in pinned
-    assert 'competition_id = \'CL\'' in pinned
+    # Membership is one CTE, not an OR chain and not a list inlined per
+    # relation: Trino overflows its parser stack on a long OR chain
+    # (STACK_OVERFLOW at ~12k terms) and rejects a statement over 1 MB, and a
+    # full slot (~9.7k scopes) reaches both.
+    assert pinned.startswith(
+        "WITH _tm_scope_set (competition_id, edition_id) AS "
+        "(VALUES ('GB1', '2025'), ('CL', '2025'))"
+    )
+    assert pinned.count("('GB1', '2025')") == 1
+    assert (
+        '(competition_id, edition_id) IN '
+        '(SELECT competition_id, edition_id FROM _tm_scope_set)'
+    ) in pinned
+    assert ' OR ' not in pinned
     assert (
         'iceberg.bronze.transfermarkt_squad_memberships '
         'FOR VERSION AS OF 101'
@@ -699,6 +945,10 @@ def test_ready_marker_returns_exact_scope_set_for_cutover(monkeypatch):
         'scope_set_id': 'a' * 64,
         'parent_cycle_id': 'parent-cycle',
         'candidate_slot_override': 'b',
+        # Building the inactive slot must not demand what only a reader flip
+        # demands: a cumulative slot legitimately carries career debt and
+        # legitimately still misses part of the target.
+        'cutover_gates': False,
     }
 
 

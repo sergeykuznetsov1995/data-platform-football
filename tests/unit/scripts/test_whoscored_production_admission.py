@@ -68,6 +68,14 @@ def _rendered_environment(service: str) -> dict[str, str]:
     environment = {name: "" for name in admission._EXPECTED_ENVIRONMENT_NAMES[service]}
     environment.update(admission._FIXED_ENVIRONMENT[service])
     if service == "airflow-scheduler":
+        environment.update(
+            {
+                "FBREF_PROXY_CONTROL_TOKEN": "b" * 64,
+                "TM_NATIVE_V2_ENABLED": "false",
+                "TM_STANDING_POLICY_ENABLED": "false",
+                "TM_REQUIRE_METERED_PROXY": "false",
+            }
+        )
         environment["WHOSCORED_SOURCE_POOL_SLOTS"] = "2"
         environment["WHOSCORED_PAID_GATEWAY_TOKEN"] = "g" * 32
     elif service == "flaresolverr_whoscored_paid":
@@ -89,6 +97,18 @@ def _rendered_environment(service: str) -> dict[str, str]:
         environment["WHOSCORED_PROXY_APPROVAL_HMAC_SECRET"] = "a" * 32
         environment["WHOSCORED_PROXY_LEDGER_HMAC_SECRET"] = "l" * 32
     return environment
+
+
+def _enable_metered_transfermarkt(environment: dict[str, str]) -> None:
+    environment.update(
+        {
+            "TM_NATIVE_V2_ENABLED": "true",
+            "TM_STANDING_POLICY_ENABLED": "true",
+            "TM_PROXY_CONTROL_TOKEN": "t" * 64,
+            "TM_PROXY_CONTROL_URL": "http://proxy_filter:8899",
+            "TM_REQUIRE_METERED_PROXY": "true",
+        }
+    )
 
 
 def _canonical(path: Path, value: object) -> None:
@@ -904,6 +924,40 @@ def test_scheduler_admission_requires_gateway_token_and_forbids_raw_origins():
             )
 
 
+def test_scheduler_admission_preserves_metered_transfermarkt_controls():
+    environment = _rendered_environment("airflow-scheduler")
+    _enable_metered_transfermarkt(environment)
+
+    admission._validate_rendered_environment(
+        environment,
+        service="airflow-scheduler",
+    )
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("TM_STANDING_POLICY_ENABLED", "false"),
+        ("TM_REQUIRE_METERED_PROXY", "false"),
+        ("TM_PROXY_CONTROL_URL", "http://attacker:8899"),
+        ("TM_PROXY_CONTROL_TOKEN", "short"),
+    ],
+)
+def test_scheduler_admission_rejects_unsafe_enabled_transfermarkt_controls(
+    name: str,
+    value: str,
+):
+    environment = _rendered_environment("airflow-scheduler")
+    _enable_metered_transfermarkt(environment)
+    environment[name] = value
+
+    with pytest.raises(admission.AdmissionError, match="paid controls"):
+        admission._validate_rendered_environment(
+            environment,
+            service="airflow-scheduler",
+        )
+
+
 def test_paid_boundary_is_five_service_isolated_and_credential_bound():
     rendered = _rendered()
     projections = admission.verify_rendered_compose(rendered, BINDINGS)
@@ -1053,6 +1107,7 @@ def test_checked_in_compose_model_matches_admission_policy(tmp_path: Path) -> No
         "PUBLIC_IP": "127.0.0.1",
         "SEAWEEDFS_DATA_VOLUME_NAME": "seaweedfs_data",
         "SEAWEEDFS_VOLUME_SIZE_LIMIT_MB": "1024",
+        "SOFASCORE_PROXY_CONTROL_TOKEN": "b" * 64,
         "TRINO_PUBLIC_HOST": "trino.ci.invalid",
         "WHOSCORED_PROXY_APPROVAL_HOST_DIR": (
             "/var/lib/data-platform-football/whoscored-approvals"

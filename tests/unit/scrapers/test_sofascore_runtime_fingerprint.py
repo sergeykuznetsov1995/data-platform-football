@@ -10,7 +10,10 @@ ENTRIES = (
     "scrapers/sofascore/capture.py",
     "docker/images/airflow/requirements-scraping.txt",
 )
-REQUIREMENTS = "camoufox[geoip]==0.4.11\nplaywright==1.59.0\n"
+REQUIREMENTS = (
+    "camoufox[geoip]==0.4.11 --hash=sha256:" + ("0" * 64) + "\n"
+    "playwright==1.59.0 --hash=sha256:" + ("1" * 64) + "\n"
+)
 
 
 def _runtime_tree(root: Path, *, source: str = "value = 1\n") -> None:
@@ -75,7 +78,10 @@ def test_missing_pinned_browser_dependency_is_rejected(tmp_path):
     capture.write_text("value = 1\n", encoding="utf-8")
     requirements = tmp_path / "docker/images/airflow/requirements-scraping.txt"
     requirements.parent.mkdir(parents=True)
-    requirements.write_text("camoufox==0.4.11\n", encoding="utf-8")
+    requirements.write_text(
+        "camoufox==0.4.11 --hash=sha256:" + ("0" * 64) + "\n",
+        encoding="utf-8",
+    )
 
     with pytest.raises(runtime.RuntimeFingerprintError, match="playwright"):
         runtime.runtime_fingerprint(tmp_path, entries=ENTRIES)
@@ -149,6 +155,6 @@ def test_proxy_filter_compose_exposes_every_fingerprint_runtime_path():
         "requirements.txt",
     ):
         assert (
-            f"/opt/airflow/runtime-contract/docker/images/airflow/{filename}"
-            in dockerfile
+            "/opt/airflow/runtime-contract/docker/images/airflow/"
+            f"{filename}" in dockerfile
         )

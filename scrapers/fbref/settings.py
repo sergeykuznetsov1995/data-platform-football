@@ -4,18 +4,22 @@ MIB = 1024 * 1024
 DEFAULT_REQUEST_LIMIT = 200
 DEFAULT_BYTE_LIMIT = 100 * MIB
 DEFAULT_SHARD_SIZE = 8
-# One target can consume the complete 4 MiB browser clearance budget, the
-# cumulative 2 MiB HTTP body cap, and a conservative 1 MiB HTTP wire envelope
-# for request/response headers across both bounded HTTP attempts.
+# One clearance solve may consume 4 MiB.  Camoufox can rotate across four
+# exits, so the browser cap and the control reservation must scale together.
 DEFAULT_BROWSER_BYTE_LIMIT_BYTES = 4 * MIB
 DEFAULT_HTTP_BODY_LIMIT_BYTES = 2 * MIB
 DEFAULT_HTTP_WIRE_OVERHEAD_RESERVATION_BYTES = MIB
+# Compatibility name used by DAG parameters and older callers.  It now means
+# one warm target reservation only; bootstrap traffic has its own reservation.
 DEFAULT_REQUEST_RESERVATION_BYTES = (
-    DEFAULT_BROWSER_BYTE_LIMIT_BYTES
-    + DEFAULT_HTTP_BODY_LIMIT_BYTES
+    DEFAULT_HTTP_BODY_LIMIT_BYTES
     + DEFAULT_HTTP_WIRE_OVERHEAD_RESERVATION_BYTES
 )
-DEFAULT_DOMAIN_INTERVAL_SECONDS = 3.0
+# Sports Reference publishes a hard FBref limit of ten page requests per
+# minute. Keep a small scheduling margin instead of sitting exactly on the
+# six-second boundary.
+MIN_DOMAIN_INTERVAL_SECONDS = 6.0
+DEFAULT_DOMAIN_INTERVAL_SECONDS = 6.1
 # One Turnstile solve costs 19 requests (measured in production). The bootstrap
 # reservation is what the browser is allowed to spend in total, so it also
 # decides how many times a bad exit IP may be retried: a run that reserves one
@@ -48,6 +52,19 @@ def bootstrap_reservation_for(request_limit: int) -> int:
         if int(request_limit) >= INGEST_BOOTSTRAP_REQUEST_RESERVATION * 2
         else DEFAULT_BOOTSTRAP_REQUEST_RESERVATION
     )
+
+
+def bootstrap_byte_reservation_for(request_limit: int) -> int:
+    """Byte ceiling matching every clearance solve the request cap permits."""
+
+    solve_attempts = max(
+        1,
+        bootstrap_reservation_for(request_limit)
+        // DEFAULT_BROWSER_REQUESTS_PER_SOLVE,
+    )
+    return DEFAULT_BROWSER_BYTE_LIMIT_BYTES * solve_attempts
+
+
 MAX_SHARD_SIZE = 25
 
 
@@ -56,6 +73,7 @@ __all__ = [
     "DEFAULT_BROWSER_REQUESTS_PER_SOLVE",
     "INGEST_BOOTSTRAP_REQUEST_RESERVATION",
     "MAX_CLEARANCE_SOLVE_ATTEMPTS",
+    "bootstrap_byte_reservation_for",
     "bootstrap_reservation_for",
     "DEFAULT_BROWSER_BYTE_LIMIT_BYTES",
     "DEFAULT_BYTE_LIMIT",
@@ -66,5 +84,6 @@ __all__ = [
     "DEFAULT_REQUEST_RESERVATION_BYTES",
     "DEFAULT_SHARD_SIZE",
     "MAX_SHARD_SIZE",
+    "MIN_DOMAIN_INTERVAL_SECONDS",
     "MIB",
 ]

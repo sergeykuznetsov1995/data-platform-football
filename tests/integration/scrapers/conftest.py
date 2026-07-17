@@ -263,25 +263,6 @@ def clubelo_scraper(soccerdata_available, minimal_leagues):
 # =============================================================================
 
 @pytest.fixture
-def fbref_scraper_with_tor(soccerdata_available, tor_available, minimal_leagues, minimal_seasons):
-    """FBref scraper with Tor proxy."""
-    if not soccerdata_available:
-        pytest.skip("soccerdata library not installed")
-    if not tor_available:
-        pytest.skip("Tor not available on port 9050")
-
-    from scrapers.fbref import FBrefScraper
-
-    scraper = FBrefScraper(
-        leagues=minimal_leagues,
-        seasons=minimal_seasons,
-        proxy='socks5://127.0.0.1:9050',
-    )
-    yield scraper
-    scraper.close()
-
-
-@pytest.fixture
 def sofifa_scraper_with_tor(soccerdata_available, tor_available, minimal_versions):
     """SoFIFA scraper with Tor proxy."""
     if not soccerdata_available:

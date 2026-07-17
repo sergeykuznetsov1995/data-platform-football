@@ -848,8 +848,10 @@ _SCHEDULER_ENVIRONMENT_NAMES = frozenset(
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION AIRFLOW__CORE__EXECUTOR
     AIRFLOW__CORE__FERNET_KEY AIRFLOW__CORE__LOAD_EXAMPLES
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN AIRFLOW__WEBSERVER__EXPOSE_CONFIG
-    AIRFLOW__WEBSERVER__SECRET_KEY ALERT_ENV FBREF_RAW_S3_ENDPOINT
-    FBREF_RAW_S3_SCHEME FBREF_RAW_STORE_URI FOTMOB_RAW_S3_ENDPOINT
+    AIRFLOW__WEBSERVER__SECRET_KEY ALERT_ENV FBREF_PROXY_CONTROL_TOKEN
+    FBREF_PROXY_CONTROL_URL FBREF_PROXY_LEASE_TTL_SECONDS FBREF_RAW_S3_ENDPOINT
+    FBREF_RAW_S3_SCHEME FBREF_RAW_STORE_URI FBREF_STAGE_JANITOR_MODE
+    FOTMOB_RAW_S3_ENDPOINT
     FOTMOB_RAW_S3_SCHEME FOTMOB_RAW_STORE_URI ICEBERG_REST_WAREHOUSE
     ICEBERG_WAREHOUSE JAVA_HOME LEGACY_SCRAPER_PYTHON
     PROXY_FILTER_CONTROL_TOKEN PROXY_FILTER_LEDGER_PATH
@@ -863,9 +865,11 @@ _SCHEDULER_ENVIRONMENT_NAMES = frozenset(
     SOFASCORE_PROXY_BUDGET_ARTIFACT SOFASCORE_PROXY_BUDGET_LEDGER
     SOFASCORE_PROXY_CONTROL_TOKEN SOFASCORE_PROXY_CONTROL_URL
     SOFASCORE_PROXY_LEASE_TTL_SECONDS SOFASCORE_RAW_STORE_URI
-    SOFASCORE_REGISTRY_PATH SOFASCORE_WORKLOAD_PLAN_DIR TELEGRAM_BOT_TOKEN
-    TELEGRAM_CHAT_ID TM_NATIVE_V2_ENABLED TM_PROXY_CONTROL_URL
-    TM_PROXY_LEASE_TTL_SECONDS TM_REQUIRE_METERED_PROXY TRINO_HOST
+    SOFASCORE_REGISTRY_PATH SOFASCORE_PLAYER_ROTATION_MIN_LEAGUES
+    SOFASCORE_PLAYER_ROTATION_MODULUS SOFASCORE_WORKLOAD_PLAN_DIR TELEGRAM_BOT_TOKEN
+    TELEGRAM_CHAT_ID TM_NATIVE_V2_ENABLED TM_STANDING_POLICY_ENABLED
+    TM_PROXY_CONTROL_TOKEN TM_PROXY_CONTROL_URL TM_PROXY_LEASE_TTL_SECONDS
+    TM_REQUIRE_METERED_PROXY TRINO_HOST
     TRINO_PASSWORD TRINO_PORT WHOSCORED_BACKFILL_ASSUMED_REQUEST_UNITS_PER_DAY
     WHOSCORED_BACKFILL_MAX_NO_PROGRESS_RUNS WHOSCORED_BACKFILL_POOL
     WHOSCORED_BACKFILL_REQUEST_UNITS_PER_RUN
@@ -950,14 +954,14 @@ _FIXED_ENVIRONMENT = {
         "AIRFLOW__CORE__EXECUTOR": "LocalExecutor",
         "AIRFLOW__CORE__LOAD_EXAMPLES": "false",
         "AIRFLOW__WEBSERVER__EXPOSE_CONFIG": "false",
+        "FBREF_PROXY_CONTROL_URL": "http://fbref_proxy_filter:8899",
+        "FBREF_PROXY_LEASE_TTL_SECONDS": "7200",
+        "FBREF_STAGE_JANITOR_MODE": "apply",
         "LEGACY_SCRAPER_PYTHON": "/opt/legacy-scraper-venv/bin/python",
         "PROXY_FILTER_LEDGER_PATH": (
             "/opt/airflow/state/whoscored-proxy-filter/paid_requests.jsonl"
         ),
         "PROXY_FILTER_URL": "",
-        "TM_NATIVE_V2_ENABLED": "false",
-        "TM_PROXY_CONTROL_URL": "",
-        "TM_REQUIRE_METERED_PROXY": "false",
         "WHOSCORED_BACKFILL_POOL": "whoscored_direct_pool",
         "WHOSCORED_DIRECT_POOL": "whoscored_direct_pool",
         "WHOSCORED_DQ_POOL": "whoscored_dq_pool",
@@ -1494,6 +1498,26 @@ def _validate_rendered_environment(
         "WHOSCORED_SOURCE_POOL_SLOTS"
     ) not in {"2", "3", "4"}:
         raise AdmissionError("rendered WhoScored source-pool size differs")
+    if service == "airflow-scheduler":
+        if len(environment.get("FBREF_PROXY_CONTROL_TOKEN", "").strip()) < 32:
+            raise AdmissionError("rendered FBref proxy-control token is invalid")
+        tm_boolean_names = (
+            "TM_NATIVE_V2_ENABLED",
+            "TM_STANDING_POLICY_ENABLED",
+            "TM_REQUIRE_METERED_PROXY",
+        )
+        if any(environment.get(name) not in {"true", "false"} for name in tm_boolean_names):
+            raise AdmissionError("rendered Transfermarkt boolean controls differ")
+        if environment.get("TM_NATIVE_V2_ENABLED") == "true" and (
+            environment.get("TM_STANDING_POLICY_ENABLED") != "true"
+            or environment.get("TM_REQUIRE_METERED_PROXY") != "true"
+            or environment.get("TM_PROXY_CONTROL_URL")
+            != "http://proxy_filter:8899"
+            or len(environment.get("TM_PROXY_CONTROL_TOKEN", "").strip()) < 32
+        ):
+            raise AdmissionError(
+                "rendered Transfermarkt paid controls are not fail-closed"
+            )
     if (
         service == "airflow-scheduler"
         and len(environment.get("WHOSCORED_PAID_GATEWAY_TOKEN", "").strip()) < 32

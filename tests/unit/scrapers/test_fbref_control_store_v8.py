@@ -1,3 +1,4 @@
+import inspect
 import json
 import uuid
 from datetime import datetime, timezone
@@ -8,6 +9,7 @@ from scrapers.fbref.control import (
     CompetitionRegistryEntry,
     ControlStore,
     FrontierProvenance,
+    FrontierTarget,
     SeasonRegistryEntry,
     StateConflict,
     TargetLease,
@@ -271,6 +273,117 @@ def test_publication_lock_renew_requires_the_active_exact_owner():
     assert renewed["owner_run_id"] == owner
 
 
+def test_publication_writer_assertion_requires_active_exact_owner():
+    owner = str(uuid.uuid4())
+    now = datetime.now(timezone.utc)
+    captured = {}
+
+    def handler(sql, params):
+        captured["sql"] = sql
+        captured["params"] = params
+        return (
+            [
+                {
+                    "source": "fbref",
+                    "owner_run_id": uuid.UUID(owner),
+                    "owner_dag_id": "dag_ingest_fbref",
+                    "acquired_at": now,
+                    "expires_at": now,
+                    "released_at": None,
+                    "active": True,
+                }
+            ],
+            1,
+        )
+
+    store, _ = make_store(handler)
+    lock = store.assert_publication_lock_owner(owner)
+
+    assert lock["owner_run_id"] == owner
+    assert lock["active"] is True
+    assert captured["params"] == ("fbref",)
+    assert "expires_at > clock_timestamp()" in captured["sql"]
+    assert "released_at IS NULL" in captured["sql"]
+
+
+def test_publication_guard_holds_row_fence_through_external_write():
+    owner = str(uuid.uuid4())
+    now = datetime.now(timezone.utc)
+    captured = {}
+
+    def handler(sql, params):
+        captured["sql"] = sql
+        captured["params"] = params
+        return (
+            [
+                {
+                    "source": "fbref",
+                    "owner_run_id": uuid.UUID(owner),
+                    "owner_dag_id": "dag_ingest_fbref",
+                    "acquired_at": now,
+                    "expires_at": now,
+                    "released_at": None,
+                    "active": True,
+                }
+            ],
+            1,
+        )
+
+    store, factory = make_store(handler)
+    external_write_completed = False
+    with store.guard_publication_lock(owner) as lock:
+        assert lock["owner_run_id"] == owner
+        assert factory.connections[0].committed is False
+        external_write_completed = True
+
+    assert external_write_completed is True
+    assert factory.connections[0].committed is True
+    assert captured["params"] == ("fbref",)
+    assert "FOR UPDATE" in captured["sql"]
+    assert "expires_at > clock_timestamp()" in captured["sql"]
+
+
+@pytest.mark.parametrize(
+    ("lock", "run_id"),
+    [
+        (None, str(uuid.uuid4())),
+        (
+            {
+                "owner_run_id": uuid.uuid4(),
+                "released_at": None,
+                "active": True,
+            },
+            str(uuid.uuid4()),
+        ),
+        (
+            {
+                "owner_run_id": uuid.uuid4(),
+                "released_at": datetime.now(timezone.utc),
+                "active": False,
+            },
+            None,
+        ),
+        (
+            {
+                "owner_run_id": uuid.uuid4(),
+                "released_at": None,
+                "active": False,
+            },
+            None,
+        ),
+    ],
+)
+def test_publication_writer_assertion_fails_closed(lock, run_id):
+    owner = str(lock["owner_run_id"]) if run_id is None else run_id
+
+    def handler(_sql, _params):
+        return ([] if lock is None else [lock]), int(lock is not None)
+
+    store, _ = make_store(handler)
+    with pytest.raises(StateConflict, match="not owned"):
+        store.assert_publication_lock_owner(owner)
+
+
 def test_publication_scope_exports_aliases_and_fail_closed_male_eligibility():
     captured = {}
 
@@ -388,6 +501,160 @@ def test_provenance_identity_preserves_many_scopes_for_same_edge():
     )
 
 
+def test_frontier_discovery_batch_reuses_one_transaction_and_is_idempotent():
+    installed_targets = {}
+    installed_edges = {}
+
+    def handler(sql, params):
+        if "FROM fbref_control.page_frontier" in sql and "FOR UPDATE" in sql:
+            target_id, canonical_url = params
+            rows = [
+                dict(row)
+                for row in installed_targets.values()
+                if row["target_id"] == target_id
+                or row["canonical_url"] == canonical_url
+            ]
+            return rows, len(rows)
+        if "INSERT INTO fbref_control.page_frontier" in sql:
+            installed_targets[params[0]] = {
+                "target_id": params[0],
+                "source": params[1],
+                "page_kind": params[2],
+                "canonical_url": params[3],
+                "source_ids": json.loads(params[4]),
+                "state": "queued",
+            }
+            return [], 1
+        if "INSERT INTO fbref_control.frontier_provenance" in sql:
+            key = tuple(params[1:8])
+            installed_edges.setdefault(key, {
+                "provenance_id": params[0],
+                "carried_competition_id": params[4],
+                "carried_season_id": params[5],
+                "logical_refresh_id": params[8],
+                "metadata": json.loads(params[9]),
+            })
+            return [], 1
+        if "SELECT provenance_id, carried_competition_id" in sql:
+            return [dict(installed_edges[tuple(params)])], 1
+        raise AssertionError(sql)
+
+    store, factory = make_store(handler)
+    refresh_id = str(uuid.uuid4())
+    targets = [
+        FrontierTarget(
+            target_id=f"fbref:player:{index:08d}",
+            page_kind="player",
+            canonical_url=f"https://fbref.com/en/players/{index:08d}/x",
+            source_ids={"player_id": f"{index:08d}"},
+            refresh_policy="monthly",
+        )
+        for index in reversed(range(50))
+    ]
+    edges = [
+        FrontierProvenance(
+            parent_target_id="fbref:match:parent",
+            child_target_id=target.target_id,
+            relation="page_link:player",
+            carried_competition_id="9",
+            carried_season_id="2025-2026",
+            parent_content_hash="a" * 64,
+            parser_version="discovery-v8",
+            logical_refresh_id=refresh_id,
+            metadata={"child_page_kind": "player"},
+        )
+        for target in reversed(targets)
+    ]
+
+    first = store.upsert_frontier_discovery_batch(
+        targets=targets, provenance=edges
+    )
+    repeated = store.upsert_frontier_discovery_batch(
+        targets=targets, provenance=edges
+    )
+
+    assert first == repeated == {"target_count": 50, "provenance_count": 50}
+    assert len(factory.connections) == 2
+    assert all(connection.committed for connection in factory.connections)
+    assert len(installed_targets) == 50
+    assert len(installed_edges) == 50
+    for connection in factory.connections:
+        executions = connection.fake_cursor.executions
+        assert len(executions) == 200
+        target_ids = [
+            params[0]
+            for sql, params in executions
+            if "INSERT INTO fbref_control.page_frontier" in sql
+        ]
+        provenance_ids = [
+            params[0]
+            for sql, params in executions
+            if "INSERT INTO fbref_control.frontier_provenance" in sql
+        ]
+        assert target_ids == sorted(target_ids)
+        assert provenance_ids == sorted(provenance_ids)
+
+
+def test_frontier_discovery_batch_rolls_back_a_late_identity_conflict():
+    inserted = []
+
+    def handler(sql, params):
+        if "FROM fbref_control.page_frontier" in sql and "FOR UPDATE" in sql:
+            if params[0] == "fbref:player:b":
+                return [{
+                    "target_id": "fbref:player:someone-else",
+                    "source": "fbref",
+                    "page_kind": "player",
+                    "canonical_url": params[1],
+                    "source_ids": {"player_id": "someone-else"},
+                    "state": "queued",
+                }], 1
+            return [], 0
+        if "INSERT INTO fbref_control.page_frontier" in sql:
+            inserted.append(params[0])
+            return [], 1
+        raise AssertionError(sql)
+
+    store, factory = make_store(handler)
+    targets = [
+        FrontierTarget(
+            target_id=f"fbref:player:{suffix}",
+            page_kind="player",
+            canonical_url=f"https://fbref.com/en/players/{suffix}/x",
+            source_ids={"player_id": suffix},
+            refresh_policy="monthly",
+        )
+        for suffix in ("b", "a")
+    ]
+
+    with pytest.raises(StateConflict, match="Canonical URL already belongs"):
+        store.upsert_frontier_discovery_batch(targets=targets, provenance=[])
+
+    assert inserted == ["fbref:player:a"]
+    assert len(factory.connections) == 1
+    assert factory.connections[0].rolled_back is True
+    assert factory.connections[0].committed is False
+
+
+def test_frontier_discovery_batch_rejects_unbounded_input_before_connecting():
+    store, factory = make_store(lambda sql, params: ([], 0))
+    target = FrontierTarget(
+        target_id="fbref:player:a",
+        page_kind="player",
+        canonical_url="https://fbref.com/en/players/a/x",
+        source_ids={"player_id": "a"},
+        refresh_policy="monthly",
+    )
+
+    with pytest.raises(ValueError, match="target batch exceeds 1000"):
+        store.upsert_frontier_discovery_batch(
+            targets=[target] * 1001,
+            provenance=[],
+        )
+
+    assert factory.connections == []
+
+
 def test_global_unprocessed_raw_includes_failed_source_runs_oldest_first():
     captured = {}
     raw = {
@@ -436,18 +703,45 @@ def test_global_unprocessed_raw_includes_failed_source_runs_oldest_first():
     )
 
 
-def test_registry_unknown_gender_blocks_snapshot_before_database_mutation():
-    store, factory = make_store(
-        lambda sql, _params: (_ for _ in ()).throw(AssertionError(sql))
-    )
+def test_registry_unknown_gender_is_durably_quarantined_then_blocks_caller():
+    fetched_at = datetime(2026, 7, 14, tzinfo=timezone.utc)
+    persisted = {}
 
-    with pytest.raises(StateConflict, match="unknown gender: 99"):
+    def handler(sql, params):
+        if "SELECT * FROM fbref_control.registry_snapshot" in sql:
+            return [{
+                "successful": True,
+                "source": "fbref",
+                "fetched_at": fetched_at,
+            }], 1
+        if "SELECT max(last_seen_at) AS latest" in sql:
+            return [{"latest": None}], 1
+        if "SELECT count(*) AS count" in sql:
+            return [{"count": 0}], 1
+        if "INSERT INTO fbref_control.competition_registry" in sql:
+            persisted["competition_id"] = params[1]
+            persisted["gender"] = params[4]
+            persisted["crawl_state"] = params[7]
+            return [], 1
+        return [], 0
+
+    store, factory = make_store(handler)
+
+    with pytest.raises(
+        StateConflict, match="durably quarantined unknown gender: 99"
+    ):
         store.reconcile_competitions(
             str(uuid.uuid4()),
             [competition_entry(99, gender="unknown")],
         )
 
-    assert factory.connections == []
+    assert persisted == {
+        "competition_id": "99",
+        "gender": "unknown",
+        "crawl_state": "quarantined",
+    }
+    assert factory.connections[0].committed is True
+    assert factory.connections[0].rolled_back is False
 
 
 def test_registry_shrink_over_ten_percent_rolls_back_without_override():
@@ -617,8 +911,8 @@ def test_claim_sql_is_provenance_aware_and_has_no_unscoped_fail_open():
     captured = {}
 
     def handler(sql, _params):
-        if "SELECT status FROM fbref_control.crawl_run" in sql:
-            return [{"status": "running"}], 1
+        if "SELECT status, metadata FROM fbref_control.crawl_run" in sql:
+            return [{"status": "running", "metadata": {}}], 1
         if "SELECT DISTINCT lease_run_id AS run_id" in sql:
             return [], 0
         if "SELECT target_id, claim_token, lease_epoch" in sql:
@@ -690,8 +984,8 @@ def test_run_summary_splits_current_historical_and_crawlable_scope_metrics():
     run_id = str(uuid.uuid4())
     executions = []
 
-    def handler(sql, _params):
-        executions.append(sql)
+    def handler(sql, params):
+        executions.append((sql, params))
         if "SELECT * FROM fbref_control.crawl_run" in sql:
             return [{"run_id": run_id, "run_type": "current"}], 1
         if "AS current_pending_match_count" in sql:
@@ -699,6 +993,25 @@ def test_run_summary_splits_current_historical_and_crawlable_scope_metrics():
                 "current_pending_match_count": 2,
                 "historical_pending_match_count": 400,
             }], 1
+        if sql.startswith("SELECT frontier.target_id"):
+            return [
+                {
+                    "target_id": "fbref:match:096e63eb",
+                    "competition_id": "602",
+                    "season_id": "2025",
+                    "state": "queued",
+                    "last_error_class": None,
+                    "last_error_message": None,
+                },
+                {
+                    "target_id": "fbref:match:7eef879c",
+                    "competition_id": "122",
+                    "season_id": "2025",
+                    "state": "retry",
+                    "last_error_class": "ClearanceFailed",
+                    "last_error_message": "session lost",
+                },
+            ], 2
         if ") AS missing" in sql:
             return [{"count": 0}], 1
         if "SELECT gender, count(*) AS count" in sql:
@@ -736,6 +1049,24 @@ def test_run_summary_splits_current_historical_and_crawlable_scope_metrics():
     assert summary["promotion_pending_match_count"] == 2
     assert summary["current_pending_match_count"] == 2
     assert summary["historical_pending_match_count"] == 400
+    assert summary["current_pending_match_sample"] == [
+        {
+            "target_id": "fbref:match:096e63eb",
+            "competition_id": "602",
+            "season_id": "2025",
+            "state": "queued",
+            "last_error_class": None,
+            "last_error_message": None,
+        },
+        {
+            "target_id": "fbref:match:7eef879c",
+            "competition_id": "122",
+            "season_id": "2025",
+            "state": "retry",
+            "last_error_class": "ClearanceFailed",
+            "last_error_message": "session lost",
+        },
+    ]
     assert summary["registry_gender_counts"] == {
         "male": 10,
         "female": 3,
@@ -751,7 +1082,33 @@ def test_run_summary_splits_current_historical_and_crawlable_scope_metrics():
         "female_gender": 7,
     }
     assert summary["current_scope_freshness"]["all_within_sla"] is True
-    freshness_sql = next(sql for sql in executions if "FROM evaluated_scope" in sql)
+    pending_sql = next(
+        sql for sql, _ in executions if "AS current_pending_match_count" in sql
+    )
+    assert "season.is_current" in pending_sql
+    assert "frontier.refresh_policy <> 'historical_once'" in pending_sql
+    sample_sql, sample_params = next(
+        (sql, params)
+        for sql, params in executions
+        if sql.startswith("SELECT frontier.target_id")
+    )
+    assert "ORDER BY frontier.priority DESC" in sample_sql
+    assert "frontier.refresh_policy <> 'historical_once'" in sample_sql
+    assert "left(frontier.last_error_message, 500)" in sample_sql
+    assert "LIMIT %s" in sample_sql
+    assert sample_params == (10,)
+    freshness_sql = next(
+        sql for sql, _ in executions if "FROM evaluated_scope" in sql
+    )
+    current_scope_sql = freshness_sql.split(
+        "), current_scope AS (", 1
+    )[1].split("), evaluated_scope AS (", 1)[0]
+    normalized_current_scope_sql = " ".join(current_scope_sql.split())
+    assert (
+        "AND NOT ( frontier.page_kind = 'match' "
+        "AND frontier.refresh_policy = 'historical_once' )"
+        in normalized_current_scope_sql
+    )
     assert "refresh_policy = 'current_completed_once'" in freshness_sql
     assert "state = 'fetched'" in freshness_sql
     assert "state IN ('queued', 'retry', 'leased')" in freshness_sql
@@ -837,4 +1194,83 @@ def test_requeue_closes_claimed_attempt_as_cancelled():
     assert "error_class = 'UnfetchedRequeue'" in captured["sql"]
     assert "finished_at = clock_timestamp()" in captured["sql"]
     assert captured["params"][0] == lease.attempt_id
+    assert factory.connections[0].committed is True
+
+
+def test_session_failure_retries_same_run_and_logical_refresh_immediately():
+    lease = TargetLease(
+        attempt_id=str(uuid.uuid4()),
+        run_id=str(uuid.uuid4()),
+        target_id="fbref:match:7eef879c",
+        logical_refresh_id=str(uuid.uuid4()),
+        canonical_url="https://fbref.com/en/matches/7eef879c",
+        page_kind="match",
+        source_ids={"competition_id": "122", "season_id": "2025"},
+        claim_token=str(uuid.uuid4()),
+        lease_epoch=2,
+        attempt_number=1,
+        leased_by="live-waves",
+        lease_expires_at=datetime(2026, 7, 15, tzinfo=timezone.utc),
+    )
+    transitions = {}
+
+    def handler(sql, params):
+        if "UPDATE fbref_control.page_frontier" in sql:
+            transitions["frontier"] = (sql, params)
+            return [{"target_id": lease.target_id}], 1
+        if "UPDATE fbref_control.run_target" in sql:
+            transitions["run_target"] = (sql, params)
+            return [], 1
+        if "UPDATE fbref_control.fetch_attempt" in sql:
+            transitions["attempt"] = (sql, params)
+            return [], 1
+        raise AssertionError(sql)
+
+    store, factory = make_store(handler)
+    store.retry_session_fetch(
+        lease,
+        error_class="ClearanceFailed",
+        error_message="warm session rejected",
+        http_status=403,
+        wire_bytes=1234,
+        http_request_count=1,
+        http_status_history=[403],
+        transport_version="http-v2",
+        session_version="clearance-v3",
+    )
+
+    frontier_sql, frontier_params = transitions["frontier"]
+    assert "SET state = %s" in frontier_sql
+    assert "retry_after = CASE WHEN %s THEN NULL ELSE" in frontier_sql
+    assert frontier_params[:6] == (
+        "retry",
+        False,
+        0,
+        403,
+        "ClearanceFailed",
+        "warm session rejected",
+    )
+    run_target_sql, run_target_params = transitions["run_target"]
+    assert "SET status = %s" in run_target_sql
+    assert run_target_params == (
+        "retry",
+        lease.run_id,
+        lease.target_id,
+        lease.logical_refresh_id,
+    )
+    attempt_sql, attempt_params = transitions["attempt"]
+    assert "SET status = 'failed'" in attempt_sql
+    assert attempt_params[:7] == (
+        403,
+        1234,
+        None,
+        1,
+        [403],
+        "ClearanceFailed",
+        "warm session rejected",
+    )
+    claim_source = inspect.getsource(ControlStore.claim_targets)
+    assert "target.status IN ('pending', 'retry')" in claim_source
+    assert "frontier.state IN ('queued', 'retry')" in claim_source
+    assert "WHERE logical_refresh_id = %s" in claim_source
     assert factory.connections[0].committed is True

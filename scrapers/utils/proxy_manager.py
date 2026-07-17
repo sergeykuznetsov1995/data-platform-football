@@ -473,7 +473,13 @@ class ProxyManager:
                     f"{cooldown:.0f}s cooldown"
                 )
 
-    def get_proxy(self, respect_cooldown: bool = True) -> Optional[Proxy]:
+    def get_proxy(
+        self,
+        respect_cooldown: bool = True,
+        *,
+        max_cooldown_wait_seconds: Optional[float] = None,
+        sleep=None,
+    ) -> Optional[Proxy]:
         """
         Get next available proxy based on rotation strategy.
 
@@ -481,7 +487,8 @@ class ProxyManager:
             respect_cooldown: Whether to respect cooldown period between uses
 
         Returns:
-            Proxy instance or None if no proxies available
+            Proxy instance or None if no proxy can become available within the
+            optional bounded wait.
         """
         self._reactivate_expired_bans()
         available = [p for p in self._proxies if not p.is_banned]
@@ -501,12 +508,43 @@ class ProxyManager:
             if cooled_down:
                 available = cooled_down
             else:
-                # All proxies in cooldown - find one with shortest remaining cooldown
-                logger.debug(
-                    f"All {len(available)} proxies in cooldown, "
-                    f"selecting one with shortest wait"
-                )
+                # Legacy callers keep the old immediate-fallback behaviour.
+                # Paid browser sessions pass a bound: silently reusing a hot
+                # exit defeats quarantine and commonly produces another 403.
                 available = sorted(available, key=lambda p: p.last_used)
+                wait_seconds = max(
+                    0.0,
+                    self.config.cooldown_seconds
+                    - (now - available[0].last_used),
+                )
+                if max_cooldown_wait_seconds is not None:
+                    maximum = max(0.0, float(max_cooldown_wait_seconds))
+                    if wait_seconds > maximum:
+                        logger.warning(
+                            "No proxy leaves cooldown within %.1fs "
+                            "(earliest %.1fs)",
+                            maximum,
+                            wait_seconds,
+                        )
+                        return None
+                    logger.info(
+                        "All %d proxies are cooling down; waiting %.1fs",
+                        len(available),
+                        wait_seconds,
+                    )
+                    (sleep or time.sleep)(wait_seconds)
+                    earliest = available[0].last_used
+                    available = [
+                        proxy
+                        for proxy in available
+                        if proxy.last_used == earliest
+                    ]
+                else:
+                    logger.debug(
+                        "All %d proxies in cooldown; selecting the one with "
+                        "the shortest remaining wait",
+                        len(available),
+                    )
 
         if self.config.rotation_strategy == 'random':
             return random.choice(available)

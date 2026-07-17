@@ -237,7 +237,7 @@ jobs:
               do
                 /opt/legacy-scraper-venv/bin/python "/opt/airflow/dags/scripts/${runner}" --help >/dev/null
               done
-              /opt/legacy-scraper-venv/bin/python /opt/airflow/dags/scripts/run_fbref_fetch_wave.py --help >/dev/null
+              /opt/legacy-scraper-venv/bin/python /opt/airflow/dags/scripts/run_fbref_live_waves.py --help >/dev/null
               /opt/legacy-scraper-venv/bin/python /opt/airflow/dags/scripts/run_matchhistory_scraper.py --help >/dev/null
               /usr/local/bin/python -c "from airflow.models import DagBag; bag=DagBag(\"/opt/airflow/dags\", include_examples=False, safe_mode=False); assert not bag.import_errors, bag.import_errors"
             '
@@ -417,6 +417,8 @@ jobs:
             tests/unit/dags/test_dag_iceberg_maintenance.py \
             tests/unit/dags/test_dag_iceberg_maintenance_daily.py \
             tests/unit/dags/test_fbref_pipeline_tasks.py \
+            tests/unit/dags/test_alerts_telegram_message.py \
+            tests/unit/dags/test_dag_master_pipeline_fail_closed.py \
             tests/unit/dags/test_dag_ingest_matchhistory.py \
             tests/unit/configs/test_tls_requests_runtime.py \
             tests/unit/dags/test_dag_ingest_clubelo.py \
@@ -427,7 +429,8 @@ jobs:
             tests/unit/scrapers/test_run_espn_scraper.py \
             tests/unit/scrapers/test_run_sofascore_scraper.py \
             tests/unit/scrapers/test_run_sofifa_scraper.py \
-            tests/unit/scrapers/test_run_understat_scraper.py
+            tests/unit/scrapers/test_run_understat_scraper.py \
+            tests/unit/scripts/test_inventory_bronze_orphans.py
 
   real-airflow-dag-import:
     runs-on: ubuntu-latest

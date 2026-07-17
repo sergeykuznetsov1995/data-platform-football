@@ -150,6 +150,7 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s filter_proxy: %(message)s"
 )
 log = logging.getLogger("filter_proxy")
+PROVIDER_METER_ID = "proxy_filter_provider_path_v2"
 
 # billable residential bytes, per target host (sum of both tunnel directions)
 up_bytes: dict[str, int] = defaultdict(int)
@@ -184,6 +185,13 @@ TRANSFERMARKT_DAG_IDS = frozenset(
 )
 TRANSFERMARKT_PROXY_ALLOWED_HOSTS = frozenset(
     {"www.transfermarkt.com", "www.transfermarkt.us"}
+)
+FBREF_DAG_IDS = frozenset(
+    {
+        "dag_ingest_fbref",
+        "dag_bootstrap_fbref",
+        "dag_backfill_fbref",
+    }
 )
 SOFASCORE_DAG_IDS = frozenset({"dag_ingest_sofascore"})
 SOFASCORE_CANARY_DAG_IDS = frozenset({"dag_canary_sofascore_proxy"})
@@ -295,6 +303,14 @@ _PAID_LEDGER_CHAIN_TAIL = ""
 SOURCE_MODE = "shared-no-whoscored"
 SOFASCORE_CHALLENGE_HOSTS = frozenset(
     {"challenges.cloudflare.com", "turnstile.cloudflare.com"}
+)
+FBREF_ALLOWED_HOSTS = frozenset(
+    {
+        "api.ipify.org",
+        "challenges.cloudflare.com",
+        "fbref.com",
+        "turnstile.cloudflare.com",
+    }
 )
 _SENSITIVE_QUERY_KEYS = frozenset(
     {
@@ -421,6 +437,8 @@ def _source_for_dag(dag_id: str) -> str:
         return "sofascore"
     if dag_id in TRANSFERMARKT_DAG_IDS:
         return "transfermarkt"
+    if dag_id in FBREF_DAG_IDS:
+        return "fbref"
     if dag_id in WHOSCORED_PAID_DAG_IDS:
         return "whoscored"
     return ""
@@ -551,6 +569,7 @@ class Lease:
             else self.total_bytes
         )
         return {
+            "meter": PROVIDER_METER_ID,
             "id": self.lease_id,
             "created_at": self.created_at,
             "expires_at": self.expires_at,
@@ -784,10 +803,19 @@ def _proxy_target_host_port(method: str, target: str) -> tuple[str, int]:
 def _lease_host_allowed(lease: Lease | None, host: str, port: int = 443) -> bool:
     """Enforce exact source host/port scope before a residential dial."""
     normalized = host.lower().rstrip(".")
+    if lease is not None and lease.source == "fbref":
+        # FBref's browser bootstrap still sends absolute-form HTTP requests;
+        # keep that route while rejecting every other port and host.
+        return port in {80, 443} and (
+            normalized in FBREF_ALLOWED_HOSTS or normalized.endswith(".fbref.com")
+        )
     if port != 443:
         return False
     if normalized == SOFASCORE_CANARY_EXIT_PROBE_HOST:
-        return lease is not None and lease.source == "sofascore_canary"
+        return lease is not None and lease.source in {
+            "fbref",
+            "sofascore_canary",
+        }
     if lease is not None and lease.source in ("sofascore", "sofascore_canary"):
         return (
             normalized == "sofascore.com"
@@ -1137,6 +1165,7 @@ def _lease_url_budget_bytes(lease: Lease) -> int:
     # Registry discovery has the same shape: thousands of JSON reads against
     # one canonical API origin, so the 2 MB per-URL ceiling would strangle it.
     if lease.source in (
+        "fbref",
         "sofascore",
         "sofascore_canary",
         "sofascore_discovery",
@@ -2429,6 +2458,8 @@ def _create_lease(
         item.source == "sofascore_discovery" for item in active_leases
     ):
         raise RuntimeError("SofaScore discovery paid-proxy concurrency limit reached")
+    if source == "fbref" and any(item.source == "fbref" for item in active_leases):
+        raise RuntimeError("FBref paid-proxy concurrency limit reached")
     # Canary deltas must not overlap any other paid traffic on this provider
     # process.  Conversely, no normal lease starts while a canary is active.
     if (source == "sofascore_canary" and active_leases) or any(
@@ -2484,6 +2515,7 @@ def _create_lease(
         dagrun_budget
         if source
         in (
+            "fbref",
             "sofascore",
             "sofascore_canary",
             "sofascore_discovery",
@@ -2721,6 +2753,77 @@ def _authorized_control_lease(lease_id: str, authorization: str | None) -> Lease
         return None
     token = authorization.split(None, 1)[1]
     return lease if secrets.compare_digest(token, lease.token) else None
+
+
+def _fbref_lease_extension_ceiling(lease: Lease) -> int:
+    """Largest safe absolute cap for one drained FBref lease.
+
+    Shared counters already contain this lease's spend.  Add that spend back to
+    the remaining shared allowance because ``max_bytes`` is an absolute cap for
+    this lease, not a delta.  Reservations from every lease stay subtracted.
+    """
+
+    _refresh_daily_counter()
+    run_key = lease.dagrun_key
+    url_key = (run_key, lease.canonical_url)
+    daily_remaining = max(
+        0,
+        DAILY_BUDGET_BYTES - _daily_total_bytes() - _daily_reserved_bytes,
+    )
+    run_remaining = max(
+        0,
+        _lease_dagrun_budget_bytes(lease)
+        - _run_total_bytes(run_key)
+        - _run_reserved_bytes[run_key],
+    )
+    url_remaining = max(
+        0,
+        _lease_url_budget_bytes(lease)
+        - _url_total_bytes(run_key, lease.canonical_url)
+        - _url_reserved_bytes[url_key],
+    )
+    return min(
+        MAX_LEASE_BYTES,
+        lease.total_bytes + min(daily_remaining, run_remaining, url_remaining),
+    )
+
+
+def _extend_fbref_lease(lease: Lease, new_max_bytes: int) -> dict[str, Any]:
+    """Durably raise one idle FBref lease cap without changing its identity."""
+
+    if isinstance(new_max_bytes, bool) or not isinstance(new_max_bytes, int):
+        raise ValueError("max_bytes must be an integer")
+    if lease.source != "fbref":
+        raise RuntimeError("only FBref leases may be extended")
+    if lease.closed or lease.expired or lease.budget_exceeded:
+        raise RuntimeError("FBref lease is not open and usable")
+    if (
+        lease.active_tunnels != 0
+        or lease.reserved_bytes != 0
+        or bool(lease.current_request_id)
+        or bool(lease.current_endpoint)
+    ):
+        raise RuntimeError("FBref lease still has active provider work")
+    if new_max_bytes <= lease.max_bytes:
+        raise ValueError("max_bytes must increase the current lease cap")
+    if new_max_bytes > MAX_LEASE_BYTES:
+        raise ValueError(f"max_bytes must not exceed {MAX_LEASE_BYTES}")
+    ceiling = _fbref_lease_extension_ceiling(lease)
+    if new_max_bytes > ceiling:
+        raise RuntimeError("FBref lease extension exceeds remaining shared budget")
+
+    previous_max_bytes = lease.max_bytes
+    # The event is the commit point.  A write/fsync failure leaves the live
+    # data-plane cap unchanged and no success response is emitted.
+    _append_budget_event(
+        "lease_extended",
+        lease,
+        previous_max_bytes=previous_max_bytes,
+        max_bytes=new_max_bytes,
+        lease_total_bytes=lease.total_bytes,
+    )
+    lease.max_bytes = new_max_bytes
+    return _control_report(lease)
 
 
 def _lease_remaining(lease: Lease) -> int:
@@ -4063,6 +4166,62 @@ def _control_report(lease: Lease) -> dict[str, Any]:
     return report
 
 
+def _service_health_report(mgr) -> dict[str, Any]:
+    """Credential-free configuration and counters, never pool identities."""
+
+    remaining = max(0, DAILY_BUDGET_BYTES - _daily_total_bytes())
+    return {
+        "status": "ok",
+        "meter": PROVIDER_METER_ID,
+        "daily_total_bytes": _daily_total_bytes(),
+        "daily_budget_bytes": DAILY_BUDGET_BYTES,
+        "daily_remaining_bytes": remaining,
+        "max_lease_bytes": MAX_LEASE_BYTES,
+        "max_lease_ttl_seconds": MAX_LEASE_TTL_SECONDS,
+        "max_active_leases": MAX_ACTIVE_LEASES,
+        "dagrun_budget_bytes": DAGRUN_BUDGET_BYTES,
+        "url_budget_bytes": URL_BUDGET_BYTES,
+        "lease_proxy_url": LEASE_PROXY_URL,
+        "configured_pool_count": int(mgr.total_count),
+        "fbref_source_ready": bool(
+            FBREF_DAG_IDS
+            and DAGRUN_BUDGET_BYTES > 0
+            and URL_BUDGET_BYTES > 0
+            and MAX_LEASE_BYTES > 0
+            and int(mgr.total_count) > 0
+        ),
+        "fbref_dag_ids": sorted(FBREF_DAG_IDS),
+        "sofascore_paid_enabled": SOFASCORE_DAGRUN_BUDGET_BYTES > 0,
+        "sofascore_dagrun_budget_bytes": SOFASCORE_DAGRUN_BUDGET_BYTES,
+        "sofascore_budget_artifact_id": SOFASCORE_BUDGET_ARTIFACT_ID,
+        "sofascore_canary_enabled": SOFASCORE_CANARY_HARD_CAP_BYTES > 0,
+        "sofascore_canary_hard_cap_bytes": SOFASCORE_CANARY_HARD_CAP_BYTES,
+        "sofascore_canary_policy_id": SOFASCORE_CANARY_POLICY_ID,
+        "sofascore_discovery_enabled": (SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES > 0),
+        "sofascore_discovery_dagrun_budget_bytes": (
+            SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES
+        ),
+        "transfermarkt_paid_enabled": (
+            TRANSFERMARKT_DAGRUN_BUDGET_BYTES > 0 and bool(TRANSFERMARKT_CONTROL_TOKEN)
+        ),
+        "transfermarkt_dagrun_budget_bytes": TRANSFERMARKT_DAGRUN_BUDGET_BYTES,
+        "whoscored_default_paid_cap_bytes": DEFAULT_WHOSCORED_PAID_CAP_BYTES,
+        "whoscored_signed_campaigns_required": True,
+        "whoscored_provider_invoice_hard_cap_available": (
+            WHOSCORED_PROVIDER_INVOICE_HARD_CAP_AVAILABLE
+        ),
+        "whoscored_paid_application_gateway_available": (
+            WHOSCORED_PAID_APPLICATION_GATEWAY_AVAILABLE
+        ),
+        "whoscored_paid_enabled": (
+            WHOSCORED_PROVIDER_INVOICE_HARD_CAP_AVAILABLE
+            and WHOSCORED_PAID_APPLICATION_GATEWAY_AVAILABLE
+            and SOURCE_MODE == "whoscored-only"
+        ),
+        "source_mode": SOURCE_MODE,
+    }
+
+
 async def _handle_control(
     method: str,
     target: str,
@@ -4074,48 +4233,14 @@ async def _handle_control(
     """Serve the lease API on the proxy listener; return False for proxy traffic."""
     path = urlsplit(target).path
     if method == "GET" and path == "/health":
-        await _send_json(
-            writer,
-            200,
-            {
-                "status": "ok",
-                "daily_total_bytes": _daily_total_bytes(),
-                "daily_budget_bytes": DAILY_BUDGET_BYTES,
-                "sofascore_paid_enabled": SOFASCORE_DAGRUN_BUDGET_BYTES > 0,
-                "sofascore_dagrun_budget_bytes": SOFASCORE_DAGRUN_BUDGET_BYTES,
-                "sofascore_budget_artifact_id": SOFASCORE_BUDGET_ARTIFACT_ID,
-                "sofascore_canary_enabled": SOFASCORE_CANARY_HARD_CAP_BYTES > 0,
-                "sofascore_canary_hard_cap_bytes": SOFASCORE_CANARY_HARD_CAP_BYTES,
-                "sofascore_canary_policy_id": SOFASCORE_CANARY_POLICY_ID,
-                "sofascore_discovery_enabled": (
-                    SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES > 0
-                ),
-                "sofascore_discovery_dagrun_budget_bytes": (
-                    SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES
-                ),
-                "transfermarkt_paid_enabled": (
-                    TRANSFERMARKT_DAGRUN_BUDGET_BYTES > 0
-                    and bool(TRANSFERMARKT_CONTROL_TOKEN)
-                ),
-                "transfermarkt_dagrun_budget_bytes": (
-                    TRANSFERMARKT_DAGRUN_BUDGET_BYTES
-                ),
-                "whoscored_default_paid_cap_bytes": (DEFAULT_WHOSCORED_PAID_CAP_BYTES),
-                "whoscored_signed_campaigns_required": True,
-                "whoscored_provider_invoice_hard_cap_available": (
-                    WHOSCORED_PROVIDER_INVOICE_HARD_CAP_AVAILABLE
-                ),
-                "whoscored_paid_application_gateway_available": (
-                    WHOSCORED_PAID_APPLICATION_GATEWAY_AVAILABLE
-                ),
-                "whoscored_paid_enabled": (
-                    WHOSCORED_PROVIDER_INVOICE_HARD_CAP_AVAILABLE
-                    and WHOSCORED_PAID_APPLICATION_GATEWAY_AVAILABLE
-                    and SOURCE_MODE == "whoscored-only"
-                ),
-                "source_mode": SOURCE_MODE,
-            },
-        )
+        await _send_json(writer, 200, _service_health_report(mgr))
+        return True
+
+    if method == "GET" and path == "/v1/auth-check":
+        if not _control_token_valid(headers):
+            await _send_json(writer, 401, {"error": "invalid control token"})
+            return True
+        await _send_json(writer, 200, _service_health_report(mgr))
         return True
 
     if path == "/v1/whoscored/campaign-control":
@@ -4428,6 +4553,32 @@ async def _handle_control(
     if lease is None or not _control_token_valid(headers, source=lease.source):
         await _send_json(writer, 401, {"error": "invalid control or lease token"})
         return True
+    if method == "POST" and action == "extend":
+        try:
+            length = int(headers.get("content-length", "0"))
+            if length <= 0 or length > MAX_CONTROL_BODY_BYTES:
+                raise ValueError(
+                    f"lease extension body must be in 1..{MAX_CONTROL_BODY_BYTES} bytes"
+                )
+            request = json.loads((await reader.readexactly(length)).decode("utf-8"))
+            if not isinstance(request, dict):
+                raise ValueError("lease extension body must be an object")
+            requested_max = request.get("max_bytes")
+            if isinstance(requested_max, bool) or not isinstance(requested_max, int):
+                raise ValueError("max_bytes must be an integer")
+            report = _extend_fbref_lease(lease, requested_max)
+        except (ValueError, TypeError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+            await _send_json(writer, 400, {"error": str(exc)})
+            return True
+        except RuntimeError as exc:
+            await _send_json(
+                writer,
+                409,
+                {"code": "lease_extend_rejected", "error": str(exc)},
+            )
+            return True
+        await _send_json(writer, 200, report)
+        return True
     if method == "GET" and action == "stats":
         await _send_json(writer, 200, _control_report(lease))
         return True
@@ -4588,12 +4739,13 @@ async def _open_lease_upstream_tunnel(
     Each attempt dials the lease's currently-pinned exit, sends the CONNECT head
     (its up-bytes are metered even against a dead exit) and reads the metered
     response head under a deadline.  A connect failure or an immediate empty
-    EOF may be re-pinned before the first down byte.  A head timeout is never
-    retryable: transport read-ahead makes its provider-byte total unknowable, so
-    the reader latches accounting uncertainty and makes the lease unusable.
-    Every failed attempt closes its socket and unregisters it from
-    ``tunnel_writers``. Credentials and ``host:port`` are never logged — only
-    non-reversible fingerprint hashes.
+    EOF may be re-pinned before the first down byte, except that FBref's
+    one-attempt contract never re-pins even after a zero-byte TCP failure.  A
+    head timeout is never retryable for any source: transport read-ahead makes
+    its provider-byte total unknowable, so the reader latches accounting
+    uncertainty and makes the lease unusable.  Every failed attempt closes its
+    socket and unregisters it from ``tunnel_writers``. Credentials and
+    ``host:port`` are never logged — only non-reversible fingerprint hashes.
     """
     last_error: BaseException | None = None
     for _attempt in range(1 + LEASE_UPSTREAM_FAILOVER_ATTEMPTS):
@@ -4654,10 +4806,11 @@ async def _open_lease_upstream_tunnel(
                 # not dead-exit signals: never failover, surface them as before.
                 raise
             last_error = exc
-        # Reached only on a connect/write/head failure: re-pin a fresh exit
-        # while no provider byte has yet been received on this lease, and retry.
+        # FBref must never spend a second paid CONNECT attempt. SofaScore's
+        # separately bounded dead-exit policy remains response-byte based.
+        failover_allowed = False if lease.source == "fbref" else lease.down_bytes == 0
         if (
-            lease.down_bytes == 0
+            failover_allowed
             and lease.usable
             and _attempt < LEASE_UPSTREAM_FAILOVER_ATTEMPTS
         ):

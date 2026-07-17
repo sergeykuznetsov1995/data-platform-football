@@ -78,9 +78,10 @@ class TestFBrefCurrentTopology:
         )
         assert readiness.downstream_task_ids == {"initialize_run"}
 
-    def test_fixed_fetch_parse_waves_are_strictly_sequential(self, loaded_dag):
+    def test_one_warm_live_runner_replaces_cold_wave_tasks(self, loaded_dag):
         module, tasks = loaded_dag
-        assert len(tasks) == 2 * module.CURRENT_WAVE_COUNT + 9
+        assert module.CURRENT_MAX_BATCHES == 16
+        assert len(tasks) == 16
         assert tasks["validate_production_readiness"].downstream_task_ids == {
             "initialize_run"
         }
@@ -91,44 +92,68 @@ class TestFBrefCurrentTopology:
             "seed_competition_index"
         }
         assert tasks["seed_competition_index"].downstream_task_ids == {
+            "capture_raw_baseline"
+        }
+        assert tasks["capture_raw_baseline"].downstream_task_ids == {
             "recover_raw_before_fetch"
         }
         recovery = tasks["recover_raw_before_fetch"]
         assert recovery.python_callable.__name__ == "run_recovery_wave"
         assert recovery.downstream_task_ids == {
-            "fetch_wave_01"
+            "run_live_waves"
         }
-
-        for number in range(1, module.CURRENT_WAVE_COUNT + 1):
-            fetch_id = f"fetch_wave_{number:02d}"
-            parse_id = f"parse_wave_{number:02d}"
-            fetch = tasks[fetch_id]
-            parse = tasks[parse_id]
-            assert fetch.python_callable.__name__ == "fetch_fbref_wave"
-            assert parse.python_callable.__name__ == "parse_fbref_wave"
-            assert fetch._captured_kwargs["retries"] == 0
-            assert fetch.op_kwargs["page_kinds"] == module.PAGE_KINDS
-            assert parse.op_kwargs["page_kinds"] == module.PAGE_KINDS
-            assert fetch.downstream_task_ids == {parse_id}
-            expected_next = (
-                f"fetch_wave_{number + 1:02d}"
-                if number < module.CURRENT_WAVE_COUNT
-                else "validate_current_scope_freshness"
-            )
-            assert parse.downstream_task_ids == {expected_next}
+        live = tasks["run_live_waves"]
+        assert live.python_callable.__name__ == "run_fbref_live_waves"
+        assert live._captured_kwargs["retries"] == 0
+        assert live._captured_kwargs["execution_timeout"].total_seconds() == (
+            120 * 60
+        )
+        assert live.op_kwargs["page_kinds"] == module.PAGE_KINDS
+        assert live.op_kwargs["max_batches"] == 16
+        assert live.op_kwargs["reservation_mb"] == 3
+        assert live.downstream_task_ids == {"audit_raw_integrity"}
+        raw_audit = tasks["audit_raw_integrity"]
+        assert raw_audit.python_callable.__name__ == (
+            "audit_fbref_raw_integrity"
+        )
+        assert raw_audit.downstream_task_ids == {"choose_publication_path"}
+        assert not any(
+            task_id.startswith(("fetch_wave_", "parse_wave_"))
+            for task_id in tasks
+        )
 
     def test_failure_edges_cannot_be_masked(self, loaded_dag):
-        module, tasks = loaded_dag
+        _, tasks = loaded_dag
         assert all(
             task._captured_kwargs.get("trigger_rule") == "all_success"
-            for task in tasks.values()
+            for task_id, task in tasks.items()
+            if task_id != "release_publication_lock"
+        )
+        release = tasks["release_publication_lock"]
+        assert release._captured_kwargs["trigger_rule"] == "all_done"
+        assert release._captured_kwargs["retries"] == 0
+        assert release.python_callable.__name__ == (
+            "finalize_fbref_publication_lock"
         )
         freshness = tasks["validate_current_scope_freshness"]
         assert freshness.python_callable.__name__ == (
             "validate_fbref_current_scope_freshness"
         )
-        assert freshness.upstream_task_ids == {
-            f"parse_wave_{module.CURRENT_WAVE_COUNT:02d}"
+        assert freshness.op_kwargs["fail_fast"] is True
+        assert freshness.upstream_task_ids == {"choose_publication_path"}
+        assert tasks["choose_publication_path"].downstream_task_ids == {
+            "validate_canary_run",
+            "validate_current_scope_freshness",
+        }
+        assert tasks["validate_canary_run"].upstream_task_ids == {
+            "choose_publication_path"
+        }
+        assert tasks["validate_canary_run"]._captured_kwargs["retries"] == 0
+        assert tasks["validate_canary_run"].downstream_task_ids == {
+            "release_canary_publication_lock"
+        }
+        assert tasks["release_canary_publication_lock"].upstream_task_ids == {
+            "validate_canary_run"
         }
         assert tasks["validate_run"].upstream_task_ids == {
             "validate_current_scope_freshness"
@@ -142,8 +167,16 @@ class TestFBrefCurrentTopology:
         assert tasks["trigger_silver_transform"].upstream_task_ids == {
             "export_publication_scope"
         }
-        source = Path(module.__file__).read_text(encoding="utf-8")
-        assert "all_done" not in source
+        assert tasks["trigger_silver_transform"].downstream_task_ids == {
+            "release_publication_lock"
+        }
+        assert tasks["release_canary_publication_lock"].downstream_task_ids == {
+            "release_publication_lock"
+        }
+        assert release.upstream_task_ids == {
+            "trigger_silver_transform",
+            "release_canary_publication_lock",
+        }
 
     def test_silver_waits_and_propagates_child_failure(self, loaded_dag):
         _, tasks = loaded_dag
@@ -158,7 +191,7 @@ class TestFBrefCurrentTopology:
         assert kwargs["trigger_run_id"] == (
             "fbref_silver__{{ dag.dag_id }}__{{ run_id }}"
         )
-        assert kwargs["logical_date"] == "{{ ti.start_date }}"
+        assert kwargs["execution_date"] == "{{ ti.start_date }}"
         assert kwargs["conf"]["publication_scope"] == "fbref_silver_only"
         assert kwargs["conf"]["trigger_xref"] is False
 

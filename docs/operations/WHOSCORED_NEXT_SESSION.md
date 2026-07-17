@@ -131,10 +131,11 @@ canary с exit 0 source pool остаётся 2, DAG-и paused, а `all_catalog`
   fail-closed проверка FlareSolverr runtime.
 - Финальная focused-проверка прошла: 403 tests. Независимые проверки:
   FlareSolverr — 175 tests/READY, capacity supervisor — 333 tests/READY.
-  Полный unit suite: 5,723 passed, 46 skipped, 1 failed за 285.60 s.
-  Единственная ошибка — известный несвязанный SofaScore fingerprint:
+  Исторический полный unit suite дал 5,723 passed, 46 skipped и одну
+  SofaScore fingerprint-ошибку, которая позже была исправлена; это не
+  исключение для релиза. Тест теперь называется:
   `tests/unit/scripts/test_bench_sofascore_paid_canary.py::`
-  `test_shipped_candidate_has_exact_required_v2_classes_and_shapes`.
+  `test_shipped_candidate_has_exact_required_v3_classes_and_shapes`.
 - Развёрнут FlareSolverr container
   `34de7c325464e6af7a2a1641107baf497efc0f78f6739464a2aad42dba61828a`,
   image

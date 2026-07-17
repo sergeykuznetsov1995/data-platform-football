@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import dis
 import inspect
+import json
 import sys
 import uuid
 from types import SimpleNamespace
@@ -87,10 +89,363 @@ def test_runtime_limits_allow_only_hard_production_canary_and_replay_profiles():
 
 
 @pytest.mark.unit
+def test_canary_publication_path_is_non_publishing():
+    assert (
+        fbref_pipeline_tasks.choose_fbref_publication_path(
+            request_limit=100, byte_limit_mb=50
+        )
+        == "validate_canary_run"
+    )
+    assert (
+        fbref_pipeline_tasks.choose_fbref_publication_path(
+            request_limit=200, byte_limit_mb=100
+        )
+        == "validate_current_scope_freshness"
+    )
+
+
+@pytest.mark.unit
+def test_bootstrap_mode_is_manual_exact_and_non_publishing():
+    scheduled = fbref_pipeline_tasks.validate_fbref_current_execution_mode(
+        bootstrap_only=False,
+        dag_run_type="scheduled",
+        request_limit=200,
+        byte_limit_mb=100,
+        shard_size=25,
+    )
+    bootstrap = fbref_pipeline_tasks.validate_fbref_current_execution_mode(
+        bootstrap_only=True,
+        dag_run_type="manual",
+        request_limit=200,
+        byte_limit_mb=100,
+        shard_size=25,
+    )
+    canary = fbref_pipeline_tasks.validate_fbref_current_execution_mode(
+        bootstrap_only=False,
+        dag_run_type="manual",
+        request_limit=100,
+        byte_limit_mb=50,
+        shard_size=7,
+    )
+
+    assert scheduled["execution_mode"] == "publishing"
+    assert scheduled["publication_eligible"] is True
+    assert bootstrap["execution_mode"] == "bootstrap_only"
+    assert bootstrap["publication_eligible"] is False
+    assert canary["execution_mode"] == "canary_nonpublishing"
+
+    invalid = (
+        {
+            "bootstrap_only": True,
+            "dag_run_type": "scheduled",
+            "request_limit": 200,
+            "byte_limit_mb": 100,
+            "shard_size": 25,
+        },
+        {
+            "bootstrap_only": True,
+            "dag_run_type": "manual",
+            "request_limit": 100,
+            "byte_limit_mb": 50,
+            "shard_size": 25,
+        },
+        {
+            "bootstrap_only": True,
+            "dag_run_type": "manual",
+            "request_limit": 200,
+            "byte_limit_mb": 100,
+            "shard_size": 24,
+        },
+    )
+    for kwargs in invalid:
+        with pytest.raises(ValueError, match="bootstrap_only"):
+            fbref_pipeline_tasks.validate_fbref_current_execution_mode(
+                **kwargs
+            )
+    with pytest.raises(ValueError, match="must be a boolean"):
+        fbref_pipeline_tasks.validate_fbref_current_execution_mode(
+            bootstrap_only="sometimes",
+            dag_run_type="manual",
+            request_limit=200,
+            byte_limit_mb=100,
+            shard_size=25,
+        )
+
+
+@pytest.mark.unit
+def test_readiness_rejects_scheduled_bootstrap_before_dependency_checks(
+    monkeypatch,
+):
+    import utils.alerts as alerts
+
+    alert_check = MagicMock()
+    monkeypatch.setattr(alerts, "validate_alert_environment", alert_check)
+
+    with pytest.raises(ValueError, match="requires a manual DagRun"):
+        fbref_pipeline_tasks.validate_fbref_production_readiness(
+            run_type="current",
+            request_limit=200,
+            byte_limit_mb=100,
+            shard_size=25,
+            bootstrap_only=True,
+            dag_run_type="scheduled",
+        )
+
+    alert_check.assert_not_called()
+
+
+@pytest.mark.unit
+def test_initialize_bootstrap_records_control_execution_evidence(monkeypatch):
+    pipeline = MagicMock()
+    pipeline.initialize_run.return_value = (
+        "11111111-1111-4111-8111-111111111111"
+    )
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "_pipeline", MagicMock(return_value=pipeline)
+    )
+
+    fbref_pipeline_tasks.initialize_fbref_run(
+        airflow_run_id="manual__bootstrap",
+        dag_id="dag_ingest_fbref",
+        run_type="current",
+        request_limit=200,
+        byte_limit_mb=100,
+        shard_size=25,
+        bootstrap_only=True,
+        dag_run_type="manual",
+    )
+
+    evidence = pipeline.initialize_run.call_args.kwargs[
+        "execution_metadata"
+    ]
+    assert evidence["execution_mode"] == "bootstrap_only"
+    assert evidence["bootstrap_only"] is True
+    assert evidence["publication_eligible"] is False
+    assert evidence["runtime_profile"] == "production"
+    assert "shard_size" not in evidence
+
+
+@pytest.mark.unit
+def test_bootstrap_validation_proves_succeeded_non_publishing_control_run(
+    monkeypatch,
+):
+    validate = MagicMock(return_value={"requests_used": 12, "bytes_used": 34})
+    monkeypatch.setattr(fbref_pipeline_tasks, "validate_fbref_run", validate)
+    control = MagicMock()
+    metadata = {
+        "execution_mode": "bootstrap_only",
+        "bootstrap_only": True,
+        "publication_eligible": False,
+        "dag_run_type": "manual",
+        "runtime_profile": "production",
+        "shard_size": 25,
+    }
+    control.get_run.side_effect = [
+        {
+            "status": "running",
+            "run_type": "current",
+            "request_limit": 200,
+            "byte_limit": 100 * 1024 * 1024,
+            "metadata": metadata,
+        },
+        {
+            "status": "succeeded",
+            "run_type": "current",
+            "request_limit": 200,
+            "byte_limit": 100 * 1024 * 1024,
+            "metadata": metadata,
+        },
+    ]
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "_control_store", MagicMock(return_value=control)
+    )
+
+    evidence = fbref_pipeline_tasks.validate_fbref_bootstrap_run(
+        airflow_run_id="manual__bootstrap",
+        dag_id="dag_ingest_fbref",
+        bootstrap_only=True,
+        dag_run_type="manual",
+        request_limit=200,
+        byte_limit_mb=100,
+        shard_size=25,
+    )
+
+    assert evidence["control_status"] == "succeeded"
+    assert evidence["publication_eligible"] is False
+    validate.assert_called_once_with(
+        airflow_run_id="manual__bootstrap",
+        dag_id="dag_ingest_fbref",
+        publication_eligible=False,
+    )
+
+
+@pytest.mark.unit
+def test_bootstrap_validation_checks_control_mode_before_finishing(monkeypatch):
+    validate = MagicMock()
+    monkeypatch.setattr(fbref_pipeline_tasks, "validate_fbref_run", validate)
+    control = MagicMock()
+    control.get_run.return_value = {
+        "status": "running",
+        "run_type": "current",
+        "request_limit": 200,
+        "byte_limit": 100 * 1024 * 1024,
+        "metadata": {
+            "execution_mode": "publishing",
+            "bootstrap_only": False,
+            "publication_eligible": True,
+            "dag_run_type": "manual",
+            "runtime_profile": "production",
+            "shard_size": 25,
+        },
+    }
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "_control_store", MagicMock(return_value=control)
+    )
+
+    with pytest.raises(RuntimeError, match="non-publishing running run"):
+        fbref_pipeline_tasks.validate_fbref_bootstrap_run(
+            airflow_run_id="manual__bootstrap",
+            dag_id="dag_ingest_fbref",
+            bootstrap_only=True,
+            dag_run_type="manual",
+            request_limit=200,
+            byte_limit_mb=100,
+            shard_size=25,
+        )
+
+    validate.assert_not_called()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("run_field", "bad_value"),
+    [
+        ("run_type", "backfill"),
+        ("request_limit", 199),
+        ("byte_limit", 99 * 1024 * 1024),
+        ("shard_size", 24),
+    ],
+)
+def test_bootstrap_validation_proves_persisted_exact_profile_before_finish(
+    monkeypatch, run_field, bad_value
+):
+    validate = MagicMock()
+    monkeypatch.setattr(fbref_pipeline_tasks, "validate_fbref_run", validate)
+    metadata = {
+        "execution_mode": "bootstrap_only",
+        "bootstrap_only": True,
+        "publication_eligible": False,
+        "dag_run_type": "manual",
+        "runtime_profile": "production",
+        "shard_size": 25,
+    }
+    control_run = {
+        "status": "running",
+        "run_type": "current",
+        "request_limit": 200,
+        "byte_limit": 100 * 1024 * 1024,
+        "metadata": metadata,
+    }
+    if run_field == "shard_size":
+        metadata[run_field] = bad_value
+    else:
+        control_run[run_field] = bad_value
+    control = MagicMock()
+    control.get_run.return_value = control_run
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "_control_store", MagicMock(return_value=control)
+    )
+
+    with pytest.raises(RuntimeError, match="non-publishing running run"):
+        fbref_pipeline_tasks.validate_fbref_bootstrap_run(
+            airflow_run_id="manual__bootstrap",
+            dag_id="dag_ingest_fbref",
+            bootstrap_only=True,
+            dag_run_type="manual",
+            request_limit=200,
+            byte_limit_mb=100,
+            shard_size=25,
+        )
+
+    validate.assert_not_called()
+
+
+@pytest.mark.unit
+def test_bootstrap_control_evidence_physically_blocks_publication(monkeypatch):
+    control = MagicMock()
+    control.get_run.return_value = {
+        "status": "succeeded",
+        "metadata": {
+            "execution_mode": "bootstrap_only",
+            "bootstrap_only": True,
+            "publication_eligible": False,
+        },
+    }
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "_control_store", MagicMock(return_value=control)
+    )
+
+    with pytest.raises(RuntimeError, match="explicitly non-publishing"):
+        fbref_pipeline_tasks.export_fbref_publication_scope(
+            airflow_run_id="manual__bootstrap",
+            dag_id="dag_ingest_fbref",
+        )
+
+    control.guard_publication_lock.assert_not_called()
+
+@pytest.mark.unit
 def test_production_readiness_combines_alert_env_and_runtime_limits(monkeypatch):
     monkeypatch.setenv("ALERT_ENV", "prod")
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "token")
     monkeypatch.setenv("TELEGRAM_CHAT_ID", "123")
+    monkeypatch.setenv("FBREF_RAW_STORE_URI", "s3://football/raw/fbref")
+    monkeypatch.setenv(
+        "FBREF_PROXY_CONTROL_URL", "http://fbref_proxy_filter:8899"
+    )
+    monkeypatch.setenv("FBREF_PROXY_CONTROL_TOKEN", "t" * 32)
+    proxy_check = MagicMock(return_value={
+        "configured": 1000,
+        "minimum_configured": 4,
+        "probe": "authenticated_control_only_zero_paid_bytes",
+    })
+    browser_check = MagicMock(return_value={
+        "status": "passed",
+        "camoufox_browser": "152.0.4-beta.26",
+    })
+    monkeypatch.setattr(
+        "scrapers.fbref.readiness.validate_camoufox_runtime", browser_check
+    )
+    monkeypatch.setattr(
+        "scrapers.fbref.readiness.validate_fbref_proxy_meter", proxy_check
+    )
+    control = MagicMock()
+    control.validate_migrations.return_value = {
+        "status": "passed",
+        "versions": [1],
+        "checksum_verified": True,
+        "read_only": True,
+    }
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "_control_store", MagicMock(return_value=control)
+    )
+    raw_store = object()
+    raw_from_uri = MagicMock(return_value=raw_store)
+    raw_health = MagicMock(return_value={"status": "passed"})
+    trino = object()
+    trino_factory = MagicMock(return_value=trino)
+    trino_health = MagicMock(return_value={"status": "passed"})
+    monkeypatch.setattr(
+        "scrapers.fbref.raw_store.RawPageStore.from_uri", raw_from_uri
+    )
+    monkeypatch.setattr(
+        "scrapers.fbref.readiness.check_raw_store_roundtrip", raw_health
+    )
+    monkeypatch.setattr(
+        "scrapers.base.trino_manager.TrinoTableManager", trino_factory
+    )
+    monkeypatch.setattr(
+        "scrapers.fbref.readiness.check_trino_roundtrip", trino_health
+    )
 
     result = fbref_pipeline_tasks.validate_fbref_production_readiness(
         run_type="current",
@@ -103,6 +458,308 @@ def test_production_readiness_combines_alert_env_and_runtime_limits(monkeypatch)
     assert result["alert_env"] == "prod"
     assert result["alert_delivery"] == "telegram"
     assert result["profile"] == "production"
+    assert result["configured"] == 1000
+    assert result["dependencies"]["control_migrations"]["read_only"] is True
+    assert result["dependencies"]["raw_store"] == {"status": "passed"}
+    assert result["dependencies"]["trino"] == {"status": "passed"}
+    assert result["dependencies"]["camoufox"] == {
+        "status": "passed",
+        "camoufox_browser": "152.0.4-beta.26",
+    }
+    control.validate_migrations.assert_called_once_with()
+    raw_from_uri.assert_called_once_with("s3://football/raw/fbref")
+    raw_health.assert_called_once_with(raw_store)
+    trino_health.assert_called_once_with(trino)
+    browser_check.assert_called_once_with()
+    proxy_check.assert_called_once_with(
+        "http://fbref_proxy_filter:8899",
+        control_token="t" * 32,
+        required_bytes=100 * fbref_pipeline_tasks.MIB,
+        minimum_configured_exits=4,
+    )
+
+    replay = fbref_pipeline_tasks.validate_fbref_production_readiness(
+        run_type="replay",
+        request_limit=0,
+        byte_limit_mb=0,
+        shard_size=25,
+    )
+
+    assert replay["dependencies"]["camoufox"] == {
+        "status": "not_required"
+    }
+    assert replay["dependencies"]["proxy_meter"] == {
+        "status": "not_required"
+    }
+    browser_check.assert_called_once_with()
+    proxy_check.assert_called_once()
+
+    browser_check.side_effect = RuntimeError("broken browser")
+    with pytest.raises(RuntimeError, match="broken browser"):
+        fbref_pipeline_tasks.validate_fbref_production_readiness(
+            run_type="current",
+            request_limit=200,
+            byte_limit_mb=100,
+            shard_size=25,
+        )
+    # A broken local browser must stop the run before the paid proxy is probed.
+    proxy_check.assert_called_once()
+
+
+@pytest.mark.unit
+def test_raw_baseline_is_persistent_idempotent_and_never_overwritten(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv(
+        fbref_pipeline_tasks.FBREF_ACCEPTANCE_OUTPUT_ROOT_ENV,
+        str(tmp_path / "acceptance"),
+    )
+    from scrapers.fbref.raw_store import RawPageStore
+
+    raw_store = RawPageStore.from_uri((tmp_path / "raw").as_uri())
+    raw_store._write_bytes("immutable/one.bin", b"one")
+    monkeypatch.setattr(
+        "scrapers.fbref.raw_store.RawPageStore.from_env",
+        MagicMock(return_value=raw_store),
+    )
+    control = MagicMock()
+    control.record_raw_baseline.side_effect = [
+        {"idempotent": False},
+        {"idempotent": True},
+        {"idempotent": True},
+    ]
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "_control_store", MagicMock(return_value=control)
+    )
+
+    kwargs = {
+        "airflow_run_id": "scheduled__2026-07-15T06:00:00+00:00",
+        "dag_id": "dag_ingest_fbref",
+    }
+    first = fbref_pipeline_tasks.capture_fbref_raw_baseline(**kwargs)
+    second = fbref_pipeline_tasks.capture_fbref_raw_baseline(**kwargs)
+
+    assert first["idempotent"] is False
+    assert second["idempotent"] is True
+    assert first["baseline_sha256"] == second["baseline_sha256"]
+    baseline_path = (
+        tmp_path
+        / "acceptance"
+        / first["control_run_id"]
+        / fbref_pipeline_tasks.FBREF_RAW_BASELINE_FILENAME
+    )
+    assert json.loads(baseline_path.read_text())["object_count"] == 1
+    assert baseline_path.with_name(
+        f"{baseline_path.name}.sqlite3"
+    ).is_file()
+
+    # A retry after source progress returns the original anchored evidence;
+    # it must not recapture the now-mutated raw store.
+    raw_store._write_bytes("immutable/two.bin", b"two")
+    retried = fbref_pipeline_tasks.capture_fbref_raw_baseline(**kwargs)
+    assert retried["fingerprint_sha256"] == first["fingerprint_sha256"]
+    assert retried["object_count"] == 1
+    assert retried["idempotent"] is True
+    assert control.record_raw_baseline.call_count == 3
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("run_type", ["current", "replay"])
+def test_airflow_raw_audit_is_a_persisted_publication_gate(
+    monkeypatch, tmp_path, run_type
+):
+    monkeypatch.setenv(
+        fbref_pipeline_tasks.FBREF_ACCEPTANCE_OUTPUT_ROOT_ENV,
+        str(tmp_path / "acceptance"),
+    )
+    airflow_run_id = "manual__raw-audit"
+    dag_id = (
+        "dag_replay_fbref" if run_type == "replay" else "dag_ingest_fbref"
+    )
+    processing_run_id = fbref_pipeline_tasks._control_run_id(
+        airflow_run_id=airflow_run_id, dag_id=dag_id
+    )
+    baseline_path = fbref_pipeline_tasks._fbref_raw_baseline_path(
+        processing_run_id
+    )
+    baseline_path.parent.mkdir(parents=True)
+    from scrapers.fbref.raw_audit import (
+        capture_and_write_raw_inventory,
+        raw_baseline_anchor,
+        successful_attempt_snapshot,
+    )
+    from scrapers.fbref.raw_store import RawPageStore
+
+    baseline_store = RawPageStore.from_uri(
+        (tmp_path / "baseline-raw").as_uri()
+    )
+    _, baseline, _ = capture_and_write_raw_inventory(
+        baseline_store, baseline_path
+    )
+    source_run_id = "11111111-1111-4111-8111-111111111111"
+    audited_run_id = source_run_id if run_type == "replay" else processing_run_id
+    attempts = [
+        {
+            "attempt_id": str(uuid.uuid4()),
+            "logical_refresh_id": str(uuid.uuid4()),
+        }
+    ]
+    attempt_snapshot = successful_attempt_snapshot(attempts)
+    load = MagicMock(return_value=attempts)
+    monkeypatch.setattr(
+        "scrapers.fbref.raw_audit.load_successful_run_attempts", load
+    )
+    audit = MagicMock(
+        return_value={
+            "control_run_id": audited_run_id,
+            "status": "passed",
+            "successful_attempt_count": 1,
+            "audited_attempt_count": 1,
+            "failures": [],
+            "metadata": {
+                "processing_control_run_id": processing_run_id,
+                "raw_attempt_snapshot_sha256": attempt_snapshot[
+                    "successful_attempt_ids_sha256"
+                ],
+            },
+        }
+    )
+    monkeypatch.setattr("scrapers.fbref.raw_audit.audit_raw_fetches", audit)
+    raw_store = object()
+    monkeypatch.setattr(
+        "scrapers.fbref.raw_store.RawPageStore.from_env",
+        MagicMock(return_value=raw_store),
+    )
+    control = MagicMock()
+    control.get_raw_baseline.return_value = raw_baseline_anchor(
+        baseline.summary, baseline.baseline_sha256
+    )
+    installed_raw_audit = None
+
+    def get_raw_audit(_run_id):
+        return installed_raw_audit
+
+    def record_raw_audit(_run_id, evidence):
+        nonlocal installed_raw_audit
+        installed_raw_audit = dict(evidence)
+        return {**installed_raw_audit, "idempotent": False}
+
+    control.get_raw_audit.side_effect = get_raw_audit
+    control.seal_raw_fetch_attempts.return_value = attempt_snapshot
+    control.record_raw_audit.side_effect = record_raw_audit
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "_control_store", MagicMock(return_value=control)
+    )
+
+    summary = fbref_pipeline_tasks.audit_fbref_raw_integrity(
+        airflow_run_id=airflow_run_id,
+        dag_id=dag_id,
+        run_type=run_type,
+        source_control_run_id=(
+            source_run_id if run_type == "replay" else None
+        ),
+    )
+
+    load.assert_called_once_with(control, audited_run_id)
+    assert audit.call_args.args == (raw_store, attempts)
+    assert audit.call_args.kwargs["baseline_inventory"].summary == (
+        baseline.summary
+    )
+    assert audit.call_args.kwargs["require_baseline"] is True
+    assert audit.call_args.kwargs["require_nonempty"] is True
+    assert audit.call_args.kwargs["require_zero_delta"] is (
+        run_type == "replay"
+    )
+    assert summary["status"] == "passed"
+    assert summary["zero_delta_required"] is (run_type == "replay")
+    assert summary["processing_control_run_id"] == processing_run_id
+    assert summary["artifact_sha256"]
+    assert summary["artifact"].startswith(str(tmp_path / "acceptance"))
+    assert summary["attempt_snapshot_sha256"] == (
+        attempt_snapshot["successful_attempt_ids_sha256"]
+    )
+    assert summary["control_anchored"] is True
+    assert summary["idempotent"] is False
+    assert control.seal_raw_fetch_attempts.call_count == 2
+    assert control.record_raw_audit.call_count == 1
+    anchored_run_id, anchored = control.record_raw_audit.call_args.args
+    assert anchored_run_id == processing_run_id
+    assert anchored["audited_control_run_id"] == audited_run_id
+    assert anchored["artifact_sha256"] == summary["artifact_sha256"]
+
+    # Simulate a worker crash after the database anchor committed but before
+    # Airflow recorded task success. The retry verifies and reuses that exact
+    # artifact instead of generating a timestamp-dependent conflicting one.
+    retried = fbref_pipeline_tasks.audit_fbref_raw_integrity(
+        airflow_run_id=airflow_run_id,
+        dag_id=dag_id,
+        run_type=run_type,
+        source_control_run_id=(
+            source_run_id if run_type == "replay" else None
+        ),
+    )
+
+    assert retried["idempotent"] is True
+    assert retried["artifact_sha256"] == summary["artifact_sha256"]
+    assert audit.call_count == 1
+    assert load.call_count == 1
+    assert control.record_raw_audit.call_count == 1
+    assert control.seal_raw_fetch_attempts.call_count == 3
+
+
+@pytest.mark.unit
+def test_airflow_raw_audit_rejects_a_replaced_baseline_file(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv(
+        fbref_pipeline_tasks.FBREF_ACCEPTANCE_OUTPUT_ROOT_ENV,
+        str(tmp_path / "acceptance"),
+    )
+    airflow_run_id = "manual__replaced-baseline"
+    dag_id = "dag_ingest_fbref"
+    run_id = fbref_pipeline_tasks._control_run_id(
+        airflow_run_id=airflow_run_id, dag_id=dag_id
+    )
+    path = fbref_pipeline_tasks._fbref_raw_baseline_path(run_id)
+    path.parent.mkdir(parents=True)
+    from scrapers.fbref.raw_audit import (
+        DiskBackedRawInventory,
+        capture_and_write_raw_inventory,
+        raw_baseline_anchor,
+    )
+    from scrapers.fbref.raw_store import RawPageStore
+
+    baseline_store = RawPageStore.from_uri(
+        (tmp_path / "baseline-raw").as_uri()
+    )
+    _, installed, _ = capture_and_write_raw_inventory(baseline_store, path)
+    anchor = raw_baseline_anchor(
+        installed.summary, installed.baseline_sha256
+    )
+    replaced = DiskBackedRawInventory(
+        summary={**installed.summary, "fingerprint_sha256": "c" * 64},
+        baseline_sha256="d" * 64,
+        index_path=installed.index_path,
+    )
+    control = MagicMock()
+    control.get_raw_baseline.return_value = anchor
+    control.get_raw_audit.return_value = None
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "_control_store", MagicMock(return_value=control)
+    )
+    monkeypatch.setattr(
+        "scrapers.fbref.raw_audit.open_disk_backed_inventory",
+        MagicMock(return_value=replaced),
+    )
+
+    with pytest.raises(RuntimeError, match="control-plane anchor"):
+        fbref_pipeline_tasks.audit_fbref_raw_integrity(
+            airflow_run_id=airflow_run_id,
+            dag_id=dag_id,
+            run_type="current",
+        )
+
+    control.seal_raw_fetch_attempts.assert_not_called()
 
 
 @pytest.mark.unit
@@ -143,9 +800,7 @@ def test_publication_lock_task_uses_exact_control_generation(monkeypatch):
 
 
 @pytest.mark.unit
-def test_publication_lock_finalizer_propagates_failure_and_allows_dry_run(
-    monkeypatch,
-):
+def test_publication_lock_finalizer_releases_after_silver_success(monkeypatch):
     release = MagicMock(return_value={"released": True})
     monkeypatch.setattr(
         fbref_pipeline_tasks, "release_fbref_publication_lock", release
@@ -168,11 +823,23 @@ def test_publication_lock_finalizer_propagates_failure_and_allows_dry_run(
     assert result == {"released": True}
     release.assert_called_once()
 
-    release.reset_mock()
+
+@pytest.mark.unit
+def test_publication_lock_finalizer_retains_failed_production_silver(
+    monkeypatch,
+):
+    release = MagicMock(return_value={"released": True})
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "release_fbref_publication_lock", release
+    )
     failed_run = SimpleNamespace(
         get_task_instances=lambda: [
             SimpleNamespace(
                 task_id="acquire_publication_lock", state="success"
+            ),
+            SimpleNamespace(task_id="validate_canary_run", state="skipped"),
+            SimpleNamespace(
+                task_id="release_canary_publication_lock", state="skipped"
             ),
             SimpleNamespace(
                 task_id="trigger_silver_transform", state="failed"
@@ -189,6 +856,17 @@ def test_publication_lock_finalizer_propagates_failure_and_allows_dry_run(
         )
     release.assert_not_called()
 
+
+@pytest.mark.unit
+def test_publication_lock_finalizer_releases_when_silver_never_started(
+    monkeypatch,
+):
+    from airflow.exceptions import AirflowException
+
+    release = MagicMock(return_value={"released": True})
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "release_fbref_publication_lock", release
+    )
     never_started = SimpleNamespace(
         get_task_instances=lambda: [
             SimpleNamespace(
@@ -208,7 +886,13 @@ def test_publication_lock_finalizer_propagates_failure_and_allows_dry_run(
         )
     release.assert_called_once()
 
-    release.reset_mock()
+
+@pytest.mark.unit
+def test_publication_lock_finalizer_allows_dry_run(monkeypatch):
+    release = MagicMock(return_value={"released": True})
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "release_fbref_publication_lock", release
+    )
     dry_run = SimpleNamespace(
         get_task_instances=lambda: [
             SimpleNamespace(
@@ -229,6 +913,201 @@ def test_publication_lock_finalizer_propagates_failure_and_allows_dry_run(
         "dry_run": True,
         "status": "not_acquired",
     }
+    release.assert_not_called()
+
+
+@pytest.mark.unit
+def test_publication_lock_finalizer_preserves_successful_canary(monkeypatch):
+    release = MagicMock(return_value={"released": True})
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "release_fbref_publication_lock", release
+    )
+    canary_run = SimpleNamespace(
+        get_task_instances=lambda: [
+            SimpleNamespace(
+                task_id="acquire_publication_lock", state="success"
+            ),
+            SimpleNamespace(task_id="validate_canary_run", state="success"),
+            SimpleNamespace(
+                task_id="release_canary_publication_lock", state="success"
+            ),
+            SimpleNamespace(
+                task_id="trigger_silver_transform", state="upstream_failed"
+            ),
+        ]
+    )
+    assert fbref_pipeline_tasks.finalize_fbref_publication_lock(
+        airflow_run_id="manual__canary",
+        dag_id="dag_ingest_fbref",
+        dag_run=canary_run,
+    ) == {
+        "released": True,
+        "canary": True,
+        "status": "released_by_canary_path",
+    }
+    release.assert_not_called()
+
+
+@pytest.mark.unit
+def test_publication_lock_finalizer_cleans_up_failed_canary(monkeypatch):
+    from airflow.exceptions import AirflowException
+
+    release = MagicMock(return_value={"released": True})
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "release_fbref_publication_lock", release
+    )
+    canary_run = SimpleNamespace(
+        get_task_instances=lambda: [
+            SimpleNamespace(
+                task_id="acquire_publication_lock", state="success"
+            ),
+            SimpleNamespace(task_id="validate_canary_run", state="failed"),
+            SimpleNamespace(
+                task_id="release_canary_publication_lock",
+                state="upstream_failed",
+            ),
+            SimpleNamespace(
+                task_id="trigger_silver_transform", state="skipped"
+            ),
+        ]
+    )
+
+    with pytest.raises(AirflowException, match="source verdict is red"):
+        fbref_pipeline_tasks.finalize_fbref_publication_lock(
+            airflow_run_id="manual__failed_canary",
+            dag_id="dag_ingest_fbref",
+            dag_run=canary_run,
+        )
+    release.assert_called_once_with(
+        airflow_run_id="manual__failed_canary",
+        dag_id="dag_ingest_fbref",
+    )
+
+
+@pytest.mark.unit
+def test_publication_lock_finalizer_keeps_failed_canary_release_red(monkeypatch):
+    from airflow.exceptions import AirflowException
+
+    release = MagicMock(return_value={"released": True, "idempotent": True})
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "release_fbref_publication_lock", release
+    )
+    canary_run = SimpleNamespace(
+        get_task_instances=lambda: [
+            SimpleNamespace(
+                task_id="acquire_publication_lock", state="success"
+            ),
+            SimpleNamespace(task_id="validate_canary_run", state="success"),
+            SimpleNamespace(
+                task_id="release_canary_publication_lock", state="failed"
+            ),
+        ]
+    )
+
+    with pytest.raises(AirflowException, match="source verdict is red"):
+        fbref_pipeline_tasks.finalize_fbref_publication_lock(
+            airflow_run_id="manual__failed-canary-release",
+            dag_id="dag_ingest_fbref",
+            dag_run=canary_run,
+        )
+    release.assert_called_once_with(
+        airflow_run_id="manual__failed-canary-release",
+        dag_id="dag_ingest_fbref",
+    )
+
+
+@pytest.mark.unit
+def test_publication_lock_finalizer_preserves_successful_bootstrap(monkeypatch):
+    release = MagicMock(return_value={"released": True, "idempotent": True})
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "release_fbref_publication_lock", release
+    )
+    bootstrap_run = SimpleNamespace(
+        get_task_instances=lambda: [
+            SimpleNamespace(task_id=task_id, state="success")
+            for task_id in (
+                fbref_pipeline_tasks.FBREF_BOOTSTRAP_REQUIRED_TASK_IDS
+            )
+        ]
+    )
+
+    assert fbref_pipeline_tasks.finalize_fbref_publication_lock(
+        airflow_run_id="manual__bootstrap",
+        dag_id="dag_bootstrap_fbref",
+        bootstrap_only=True,
+        dag_run=bootstrap_run,
+    ) == {
+        "released": True,
+        "idempotent": True,
+        "bootstrap_only": True,
+        "status": "released_after_successful_bootstrap",
+    }
+    release.assert_called_once_with(
+        airflow_run_id="manual__bootstrap",
+        dag_id="dag_bootstrap_fbref",
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("failed_task_id", "failed_state"),
+    [
+        ("run_live_waves", "failed"),
+        ("acquire_publication_lock", "failed"),
+        ("release_bootstrap_publication_lock", "failed"),
+    ],
+)
+def test_publication_lock_finalizer_releases_but_keeps_bootstrap_red(
+    monkeypatch, failed_task_id, failed_state
+):
+    from airflow.exceptions import AirflowException
+
+    release = MagicMock(return_value={"released": True, "idempotent": True})
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "release_fbref_publication_lock", release
+    )
+    states = {
+        task_id: "success"
+        for task_id in fbref_pipeline_tasks.FBREF_BOOTSTRAP_REQUIRED_TASK_IDS
+    }
+    states[failed_task_id] = failed_state
+    failed = SimpleNamespace(
+        get_task_instances=lambda: [
+            SimpleNamespace(task_id=task_id, state=state)
+            for task_id, state in states.items()
+        ]
+    )
+
+    with pytest.raises(AirflowException, match="lock was released"):
+        fbref_pipeline_tasks.finalize_fbref_publication_lock(
+            airflow_run_id="manual__failed-bootstrap",
+            dag_id="dag_bootstrap_fbref",
+            bootstrap_only=True,
+            dag_run=failed,
+        )
+    release.assert_called_once_with(
+        airflow_run_id="manual__failed-bootstrap",
+        dag_id="dag_bootstrap_fbref",
+    )
+
+
+@pytest.mark.unit
+def test_bootstrap_finalizer_rejects_wrong_dag_id_before_release(monkeypatch):
+    from airflow.exceptions import AirflowException
+
+    release = MagicMock(return_value={"released": True})
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "release_fbref_publication_lock", release
+    )
+
+    with pytest.raises(AirflowException, match="allowed only"):
+        fbref_pipeline_tasks.finalize_fbref_publication_lock(
+            airflow_run_id="manual__wrong-bootstrap",
+            dag_id="dag_ingest_fbref",
+            bootstrap_only=True,
+            dag_run=SimpleNamespace(get_task_instances=lambda: []),
+        )
+    release.assert_not_called()
 
 
 @pytest.mark.unit
@@ -365,6 +1244,9 @@ def test_publication_scope_export_is_atomic_and_keeps_quarantine_evidence(
 
     assert result["eligible_male_rows"] == 1
     assert result["quarantined_rows"] == 1
+    control.guard_publication_lock.assert_called_once_with(
+        result["control_run_id"], source="fbref"
+    )
     control.list_publication_scope.assert_called_once_with(source="fbref")
     write = manager.insert_dataframe_atomic.call_args
     assert write.args[:2] == ("bronze", "fbref_target_scope")
@@ -397,6 +1279,7 @@ def test_publication_scope_export_is_atomic_and_keeps_quarantine_evidence(
         dag_id="dag_ingest_fbref",
     )
     assert replayed["idempotent"] is True
+    assert control.guard_publication_lock.call_count == 2
     manager.insert_dataframe_atomic.assert_not_called()
 
     manager.execute_query.return_value = [(2, 1, "different-scope-hash")]
@@ -507,6 +1390,28 @@ def test_current_scope_freshness_accepts_complete_per_kind_evidence(monkeypatch)
 
 
 @pytest.mark.unit
+def test_backfill_freshness_preflight_blocks_pending_current_matches(monkeypatch):
+    from airflow.exceptions import AirflowFailException
+
+    control = MagicMock()
+    summary = _freshness_summary()
+    summary["promotion_pending_match_count"] = 4
+    control.get_run_summary.return_value = summary
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "_control_store", MagicMock(return_value=control)
+    )
+
+    with pytest.raises(
+        AirflowFailException, match="promotion_pending_match_count=4"
+    ):
+        fbref_pipeline_tasks.validate_fbref_current_scope_freshness(
+            airflow_run_id="manual__backfill",
+            dag_id="dag_backfill_fbref",
+            run_type="backfill",
+        )
+
+
+@pytest.mark.unit
 def test_current_scope_freshness_allows_new_final_match_inside_24h_sla(
     monkeypatch,
 ):
@@ -535,7 +1440,7 @@ def test_current_scope_freshness_allows_new_final_match_inside_24h_sla(
 def test_current_scope_freshness_fails_closed_for_stale_or_missing_evidence(
     monkeypatch,
 ):
-    from airflow.exceptions import AirflowException
+    from airflow.exceptions import AirflowFailException
 
     control = MagicMock()
     monkeypatch.setattr(
@@ -544,12 +1449,23 @@ def test_current_scope_freshness_fails_closed_for_stale_or_missing_evidence(
     control.get_run_summary.return_value = _freshness_summary(
         stale_kind="schedule"
     )
-    with pytest.raises(AirflowException, match="schedule:stale=1"):
+    with pytest.raises(AirflowFailException, match="schedule:stale=1"):
         fbref_pipeline_tasks.validate_fbref_current_scope_freshness(
             airflow_run_id="manual__stale",
             dag_id="dag_backfill_fbref",
             run_type="backfill",
         )
+
+    from airflow.exceptions import AirflowException
+
+    with pytest.raises(AirflowException) as retryable:
+        fbref_pipeline_tasks.validate_fbref_current_scope_freshness(
+            airflow_run_id="manual__stale",
+            dag_id="dag_backfill_fbref",
+            run_type="backfill",
+            fail_fast=False,
+        )
+    assert not isinstance(retryable.value, AirflowFailException)
 
     control.get_run_summary.return_value = {"target_counts": {}}
     with pytest.raises(RuntimeError, match="no current-scope freshness"):
@@ -770,33 +1686,32 @@ def test_dag_failure_callback_is_best_effort(monkeypatch):
 
 
 @pytest.mark.unit
-def test_fetch_wave_runs_in_an_unforked_subprocess(monkeypatch):
-    """Playwright's sync API deadlocks in a process forked from the scheduler,
-    so the browser wave must never be driven inside the Airflow task itself."""
+def test_live_waves_use_one_process_group_for_all_batches(monkeypatch):
     captured = {}
 
-    def fake_run(command, **kwargs):
+    class Process:
+        pid = 1234
+        returncode = 0
+
+        def communicate(self, *, timeout=None):
+            assert timeout == fbref_pipeline_tasks.LIVE_WAVES_TIMEOUT_SECONDS
+            return (
+                'FBREF_LIVE_WAVES_RESULT:{"batches": 3, '
+                '"frontier_closed": true}\n',
+                "",
+            )
+
+    def popen(command, **kwargs):
         captured["command"] = command
         captured["kwargs"] = kwargs
-        return SimpleNamespace(
-            returncode=0,
-            stdout=(
-                "camoufox noise\n"
-                'FBREF_FETCH_WAVE_RESULT:{"claimed": 2, "fetched": 2}\n'
-            ),
-            stderr="",
-        )
+        return Process()
 
-    monkeypatch.setattr(fbref_pipeline_tasks.subprocess, "run", fake_run)
-    pipeline = MagicMock()
-    monkeypatch.setattr(
-        fbref_pipeline_tasks, "_pipeline", MagicMock(return_value=pipeline)
-    )
+    monkeypatch.setattr(fbref_pipeline_tasks.subprocess, "Popen", popen)
 
-    result = fbref_pipeline_tasks.fetch_fbref_wave(
+    result = fbref_pipeline_tasks.run_fbref_live_waves(
         airflow_run_id="scheduled__2026-07-12T06:00:00+00:00",
         dag_id="dag_ingest_fbref",
-        worker_id="current-wave-01",
+        worker_id="current-live",
         page_kinds=["competition", "season"],
         run_type="current",
         request_limit=200,
@@ -804,92 +1719,759 @@ def test_fetch_wave_runs_in_an_unforked_subprocess(monkeypatch):
         shard_size=25,
     )
 
-    assert result == {"claimed": 2, "fetched": 2}
-    pipeline.fetch_wave.assert_not_called()
+    assert result == {"batches": 3, "frontier_closed": True}
+    assert captured["kwargs"]["start_new_session"] is True
     command = captured["command"]
     assert command[0] == sys.executable
-    assert command[1] == fbref_pipeline_tasks.FETCH_WAVE_RUNNER
+    assert command[1] == fbref_pipeline_tasks.LIVE_WAVES_RUNNER
     assert "--page-kinds" in command
     assert command[command.index("--page-kinds") + 1] == "competition,season"
     assert command[command.index("--request-limit") + 1] == "200"
-    assert command[command.index("--proxy-file") + 1] == (
-        fbref_pipeline_tasks.DEFAULT_PROXY_FILE
+    assert command[command.index("--parent-pid") + 1] == str(
+        fbref_pipeline_tasks.os.getpid()
     )
+    assert command[command.index("--max-batches") + 1] == "16"
+    assert command[command.index("--reservation-mb") + 1] == "3"
 
 
 @pytest.mark.unit
-def test_fetch_wave_fails_closed_when_the_subprocess_fails(monkeypatch):
-    abort = MagicMock()
-    monkeypatch.setattr(fbref_pipeline_tasks, "abort_fbref_run", abort)
+def test_live_waves_reject_success_with_a_surviving_descendant(monkeypatch):
+    calls = 0
+
+    class Process:
+        pid = 3210
+        returncode = 0
+
+        def communicate(self, *, timeout=None):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return 'FBREF_LIVE_WAVES_RESULT:{"batches": 1}\n', ""
+            return "cleanup stdout", "cleanup stderr"
+
     monkeypatch.setattr(
         fbref_pipeline_tasks.subprocess,
-        "run",
-        lambda command, **kwargs: SimpleNamespace(
-            returncode=1, stdout="", stderr="clearance failed"
-        ),
+        "Popen",
+        lambda *args, **kwargs: Process(),
+    )
+    monkeypatch.setattr(
+        fbref_pipeline_tasks,
+        "_process_group_exists",
+        lambda process_group_id: True,
+    )
+    monkeypatch.setattr(
+        fbref_pipeline_tasks,
+        "_wait_for_process_group_exit",
+        lambda *args, **kwargs: True,
+    )
+    killed = []
+    monkeypatch.setattr(
+        fbref_pipeline_tasks.os,
+        "killpg",
+        lambda pid, sig: killed.append((pid, sig)),
     )
 
-    with pytest.raises(RuntimeError, match="exit code 1"):
-        fbref_pipeline_tasks.fetch_fbref_wave(
-            airflow_run_id="scheduled__2026-07-12T06:00:00+00:00",
+    with pytest.raises(RuntimeError, match="descendants remained"):
+        fbref_pipeline_tasks.run_fbref_live_waves(
+            airflow_run_id="manual__surviving-descendant",
             dag_id="dag_ingest_fbref",
-            worker_id="current-wave-01",
+            worker_id="current-live",
             page_kinds=["competition"],
             run_type="current",
+            request_limit=200,
+            byte_limit_mb=100,
+            shard_size=25,
         )
+
+    assert calls == 2
+    assert killed == [(3210, fbref_pipeline_tasks.signal.SIGTERM)]
+
+
+@pytest.mark.unit
+def test_live_waves_timeout_terminates_the_complete_process_group(monkeypatch):
+    calls = 0
+
+    class Process:
+        pid = 4321
+        returncode = None
+
+        def communicate(self, *, timeout=None):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                assert timeout == fbref_pipeline_tasks.LIVE_WAVES_TIMEOUT_SECONDS
+                raise fbref_pipeline_tasks.subprocess.TimeoutExpired(
+                    cmd=["runner"], timeout=timeout
+                )
+            assert timeout == (
+                fbref_pipeline_tasks.LIVE_WAVES_TERMINATION_GRACE_SECONDS
+            )
+            return "partial stdout", "partial stderr"
+
+    monkeypatch.setattr(
+        fbref_pipeline_tasks.subprocess,
+        "Popen",
+        lambda *args, **kwargs: Process(),
+    )
+    killed = []
+    monkeypatch.setattr(
+        fbref_pipeline_tasks.os,
+        "killpg",
+        lambda pid, sig: killed.append((pid, sig)),
+    )
+    monkeypatch.setattr(
+        fbref_pipeline_tasks,
+        "_wait_for_process_group_exit",
+        lambda *args, **kwargs: True,
+    )
+    abort = MagicMock()
+    monkeypatch.setattr(fbref_pipeline_tasks, "abort_fbref_run", abort)
+
+    with pytest.raises(RuntimeError, match="process group was killed"):
+        fbref_pipeline_tasks.run_fbref_live_waves(
+            airflow_run_id="scheduled__2026-07-12T06:00:00+00:00",
+            dag_id="dag_ingest_fbref",
+            worker_id="current-live",
+            page_kinds=["competition"],
+            run_type="current",
+            request_limit=200,
+            byte_limit_mb=100,
+            shard_size=25,
+        )
+
+    assert killed == [(4321, fbref_pipeline_tasks.signal.SIGTERM)]
     abort.assert_called_once_with(
         airflow_run_id="scheduled__2026-07-12T06:00:00+00:00",
         dag_id="dag_ingest_fbref",
-        error_class="FetchWaveSubprocessFailure",
-        error_message="FBref fetch wave subprocess failed with exit code 1",
+        error_class="LiveWavesSubprocessTimeout",
+        error_message="FBref live runner exceeded 6600s",
     )
 
 
 @pytest.mark.unit
-def test_fetch_wave_fails_closed_without_a_result_document(monkeypatch):
+def test_live_waves_external_interruption_terminates_process_group(monkeypatch):
+    calls = 0
+
+    class Process:
+        pid = 5432
+        returncode = None
+
+        def communicate(self, *, timeout=None):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                assert timeout == fbref_pipeline_tasks.LIVE_WAVES_TIMEOUT_SECONDS
+                raise KeyboardInterrupt
+            assert timeout == (
+                fbref_pipeline_tasks.LIVE_WAVES_TERMINATION_GRACE_SECONDS
+            )
+            return "interrupted stdout", "interrupted stderr"
+
     monkeypatch.setattr(
         fbref_pipeline_tasks.subprocess,
-        "run",
-        lambda command, **kwargs: SimpleNamespace(
-            returncode=0, stdout="browser noise only\n", stderr=""
-        ),
+        "Popen",
+        lambda *args, **kwargs: Process(),
+    )
+    killed = []
+    monkeypatch.setattr(
+        fbref_pipeline_tasks.os,
+        "killpg",
+        lambda pid, sig: killed.append((pid, sig)),
+    )
+    monkeypatch.setattr(
+        fbref_pipeline_tasks,
+        "_wait_for_process_group_exit",
+        lambda *args, **kwargs: True,
     )
 
-    with pytest.raises(RuntimeError, match="no result document"):
-        fbref_pipeline_tasks.fetch_fbref_wave(
+    with pytest.raises(KeyboardInterrupt):
+        fbref_pipeline_tasks.run_fbref_live_waves(
             airflow_run_id="scheduled__2026-07-12T06:00:00+00:00",
             dag_id="dag_ingest_fbref",
-            worker_id="current-wave-01",
+            worker_id="current-live",
             page_kinds=["competition"],
             run_type="current",
+            request_limit=200,
+            byte_limit_mb=100,
+            shard_size=25,
         )
+
+    assert calls == 2
+    assert killed == [(5432, fbref_pipeline_tasks.signal.SIGTERM)]
 
 
 @pytest.mark.unit
-def test_fetch_wave_fails_closed_when_the_subprocess_hangs(monkeypatch):
-    """A hung clearance must not hold this wave's leases until they expire."""
+def test_live_waves_sigterm_reaps_child_and_restores_signal_handlers(
+    monkeypatch,
+):
+    calls = 0
+    previous_sigterm = fbref_pipeline_tasks.signal.getsignal(
+        fbref_pipeline_tasks.signal.SIGTERM
+    )
+    previous_sigalrm = fbref_pipeline_tasks.signal.getsignal(
+        fbref_pipeline_tasks.signal.SIGALRM
+    )
 
-    def fake_run(command, **kwargs):
-        assert kwargs["timeout"] == fbref_pipeline_tasks.FETCH_WAVE_TIMEOUT_SECONDS
-        raise fbref_pipeline_tasks.subprocess.TimeoutExpired(
-            cmd=command, timeout=kwargs["timeout"]
-        )
+    class Process:
+        pid = 7654
+        returncode = None
 
-    monkeypatch.setattr(fbref_pipeline_tasks.subprocess, "run", fake_run)
-    abort = MagicMock()
-    monkeypatch.setattr(fbref_pipeline_tasks, "abort_fbref_run", abort)
+        def communicate(self, *, timeout=None):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                assert timeout == fbref_pipeline_tasks.LIVE_WAVES_TIMEOUT_SECONDS
+                fbref_pipeline_tasks.os.kill(
+                    fbref_pipeline_tasks.os.getpid(),
+                    fbref_pipeline_tasks.signal.SIGTERM,
+                )
+                raise AssertionError("SIGTERM handler did not interrupt wait")
+            assert timeout == (
+                fbref_pipeline_tasks.LIVE_WAVES_TERMINATION_GRACE_SECONDS
+            )
+            return "terminated stdout", "terminated stderr"
 
-    with pytest.raises(RuntimeError, match="exceeded 1800s"):
-        fbref_pipeline_tasks.fetch_fbref_wave(
+    monkeypatch.setattr(
+        fbref_pipeline_tasks.subprocess,
+        "Popen",
+        lambda *args, **kwargs: Process(),
+    )
+    killed = []
+    monkeypatch.setattr(
+        fbref_pipeline_tasks.os,
+        "killpg",
+        lambda pid, sig: killed.append((pid, sig)),
+    )
+    monkeypatch.setattr(
+        fbref_pipeline_tasks,
+        "_wait_for_process_group_exit",
+        lambda *args, **kwargs: True,
+    )
+
+    with pytest.raises(
+        fbref_pipeline_tasks._LiveRunnerTermination
+    ) as terminated:
+        fbref_pipeline_tasks.run_fbref_live_waves(
             airflow_run_id="scheduled__2026-07-12T06:00:00+00:00",
             dag_id="dag_ingest_fbref",
-            worker_id="current-wave-01",
+            worker_id="current-live",
             page_kinds=["competition"],
             run_type="current",
+            request_limit=200,
+            byte_limit_mb=100,
+            shard_size=25,
         )
-    abort.assert_called_once_with(
-        airflow_run_id="scheduled__2026-07-12T06:00:00+00:00",
-        dag_id="dag_ingest_fbref",
-        error_class="FetchWaveSubprocessTimeout",
-        error_message="FBref fetch wave subprocess exceeded 1800s",
+
+    assert terminated.value.code == 128 + fbref_pipeline_tasks.signal.SIGTERM
+    assert calls == 2
+    assert killed == [(7654, fbref_pipeline_tasks.signal.SIGTERM)]
+    assert (
+        fbref_pipeline_tasks.signal.getsignal(
+            fbref_pipeline_tasks.signal.SIGTERM
+        )
+        is previous_sigterm
     )
+    assert (
+        fbref_pipeline_tasks.signal.getsignal(
+            fbref_pipeline_tasks.signal.SIGALRM
+        )
+        is previous_sigalrm
+    )
+
+
+@pytest.mark.unit
+def test_live_waves_repeated_sigterm_cannot_interrupt_group_cleanup(
+    monkeypatch,
+):
+    calls = 0
+    previous_sigterm = fbref_pipeline_tasks.signal.getsignal(
+        fbref_pipeline_tasks.signal.SIGTERM
+    )
+
+    class Process:
+        pid = 7755
+        returncode = None
+
+        def communicate(self, *, timeout=None):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                fbref_pipeline_tasks.os.kill(
+                    fbref_pipeline_tasks.os.getpid(),
+                    fbref_pipeline_tasks.signal.SIGTERM,
+                )
+                raise AssertionError("first SIGTERM did not interrupt wait")
+            return "terminated stdout", "terminated stderr"
+
+    monkeypatch.setattr(
+        fbref_pipeline_tasks.subprocess,
+        "Popen",
+        lambda *args, **kwargs: Process(),
+    )
+    killed = []
+
+    def killpg(pid, sig):
+        killed.append((pid, sig))
+        if sig == fbref_pipeline_tasks.signal.SIGTERM:
+            fbref_pipeline_tasks.os.kill(
+                fbref_pipeline_tasks.os.getpid(),
+                fbref_pipeline_tasks.signal.SIGTERM,
+            )
+
+    monkeypatch.setattr(fbref_pipeline_tasks.os, "killpg", killpg)
+    monkeypatch.setattr(
+        fbref_pipeline_tasks,
+        "_wait_for_process_group_exit",
+        lambda *args, **kwargs: True,
+    )
+
+    with pytest.raises(
+        fbref_pipeline_tasks._LiveRunnerTermination
+    ) as terminated:
+        fbref_pipeline_tasks.run_fbref_live_waves(
+            airflow_run_id="scheduled__repeated-sigterm",
+            dag_id="dag_ingest_fbref",
+            worker_id="current-live",
+            page_kinds=["competition"],
+            run_type="current",
+            request_limit=200,
+            byte_limit_mb=100,
+            shard_size=25,
+        )
+
+    assert terminated.value.code == 128 + fbref_pipeline_tasks.signal.SIGTERM
+    assert calls == 2
+    assert killed == [(7755, fbref_pipeline_tasks.signal.SIGTERM)]
+    assert (
+        fbref_pipeline_tasks.signal.getsignal(
+            fbref_pipeline_tasks.signal.SIGTERM
+        )
+        is previous_sigterm
+    )
+
+
+@pytest.mark.unit
+def test_live_waves_sigterm_on_timeout_handler_boundary_still_reaps_group(
+    monkeypatch,
+):
+    calls = 0
+
+    class Process:
+        pid = 7766
+        returncode = None
+
+        def communicate(self, *, timeout=None):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise fbref_pipeline_tasks.subprocess.TimeoutExpired(
+                    cmd=["runner"], timeout=timeout
+                )
+            return "terminated stdout", "terminated stderr"
+
+    monkeypatch.setattr(
+        fbref_pipeline_tasks.subprocess,
+        "Popen",
+        lambda *args, **kwargs: Process(),
+    )
+    killed = []
+    monkeypatch.setattr(
+        fbref_pipeline_tasks.os,
+        "killpg",
+        lambda pid, sig: killed.append((pid, sig)),
+    )
+    monkeypatch.setattr(
+        fbref_pipeline_tasks,
+        "_wait_for_process_group_exit",
+        lambda *args, **kwargs: True,
+    )
+
+    function = fbref_pipeline_tasks.run_fbref_live_waves
+    source, first_line = inspect.getsourcelines(function)
+    timeout_index = next(
+        index
+        for index, line in enumerate(source)
+        if "except subprocess.TimeoutExpired as exc:" in line
+    )
+    boundary_line = first_line + timeout_index + 1
+    fired = False
+
+    def trace_timeout_boundary(frame, event, _arg):
+        nonlocal fired
+        if (
+            frame.f_code is function.__code__
+            and event == "line"
+            and frame.f_lineno == boundary_line
+            and not fired
+        ):
+            fired = True
+            fbref_pipeline_tasks.os.kill(
+                fbref_pipeline_tasks.os.getpid(),
+                fbref_pipeline_tasks.signal.SIGTERM,
+            )
+        return trace_timeout_boundary
+
+    previous_trace = sys.gettrace()
+    sys.settrace(trace_timeout_boundary)
+    try:
+        with pytest.raises(
+            fbref_pipeline_tasks._LiveRunnerTermination
+        ) as terminated:
+            function(
+                airflow_run_id="scheduled__timeout-boundary",
+                dag_id="dag_ingest_fbref",
+                worker_id="current-live",
+                page_kinds=["competition"],
+                run_type="current",
+                request_limit=200,
+                byte_limit_mb=100,
+                shard_size=25,
+            )
+    finally:
+        sys.settrace(previous_trace)
+
+    assert fired is True
+    assert terminated.value.code == 128 + fbref_pipeline_tasks.signal.SIGTERM
+    assert calls == 2
+    assert killed == [(7766, fbref_pipeline_tasks.signal.SIGTERM)]
+
+
+@pytest.mark.unit
+def test_live_waves_sigterm_during_handler_restore_is_not_lost(monkeypatch):
+    previous_sigterm = fbref_pipeline_tasks.signal.getsignal(
+        fbref_pipeline_tasks.signal.SIGTERM
+    )
+
+    class Process:
+        pid = 7777
+        returncode = 0
+
+        def communicate(self, *, timeout=None):
+            return 'FBREF_LIVE_WAVES_RESULT:{"batches": 1}\n', ""
+
+    monkeypatch.setattr(
+        fbref_pipeline_tasks.subprocess,
+        "Popen",
+        lambda *args, **kwargs: Process(),
+    )
+    monkeypatch.setattr(
+        fbref_pipeline_tasks,
+        "_process_group_exists",
+        lambda _process_group_id: False,
+    )
+    real_signal = fbref_pipeline_tasks.signal.signal
+    restore_hook_fired = False
+
+    def signal_with_restore_hook(signum, handler):
+        nonlocal restore_hook_fired
+        if (
+            signum == fbref_pipeline_tasks.signal.SIGTERM
+            and handler is previous_sigterm
+            and not restore_hook_fired
+        ):
+            restore_hook_fired = True
+            installed = fbref_pipeline_tasks.signal.getsignal(signum)
+            installed(signum, None)
+        return real_signal(signum, handler)
+
+    monkeypatch.setattr(
+        fbref_pipeline_tasks.signal, "signal", signal_with_restore_hook
+    )
+
+    with pytest.raises(
+        fbref_pipeline_tasks._LiveRunnerTermination
+    ) as terminated:
+        fbref_pipeline_tasks.run_fbref_live_waves(
+            airflow_run_id="scheduled__restore-boundary",
+            dag_id="dag_ingest_fbref",
+            worker_id="current-live",
+            page_kinds=["competition"],
+            run_type="current",
+            request_limit=200,
+            byte_limit_mb=100,
+            shard_size=25,
+        )
+
+    assert restore_hook_fired is True
+    assert terminated.value.code == 128 + fbref_pipeline_tasks.signal.SIGTERM
+    assert (
+        fbref_pipeline_tasks.signal.getsignal(
+            fbref_pipeline_tasks.signal.SIGTERM
+        )
+        is previous_sigterm
+    )
+
+
+@pytest.mark.unit
+def test_live_waves_sigterm_during_spawn_reaps_the_returned_group(monkeypatch):
+    previous_sigterm = fbref_pipeline_tasks.signal.getsignal(
+        fbref_pipeline_tasks.signal.SIGTERM
+    )
+
+    class Process:
+        pid = 8765
+        returncode = None
+
+        def communicate(self, *, timeout=None):
+            assert timeout == (
+                fbref_pipeline_tasks.LIVE_WAVES_TERMINATION_GRACE_SECONDS
+            )
+            return "spawn stdout", "spawn stderr"
+
+    def popen(*args, **kwargs):
+        fbref_pipeline_tasks.os.kill(
+            fbref_pipeline_tasks.os.getpid(),
+            fbref_pipeline_tasks.signal.SIGTERM,
+        )
+        return Process()
+
+    monkeypatch.setattr(fbref_pipeline_tasks.subprocess, "Popen", popen)
+    killed = []
+    monkeypatch.setattr(
+        fbref_pipeline_tasks.os,
+        "killpg",
+        lambda pid, sig: killed.append((pid, sig)),
+    )
+    monkeypatch.setattr(
+        fbref_pipeline_tasks,
+        "_wait_for_process_group_exit",
+        lambda *args, **kwargs: True,
+    )
+
+    with pytest.raises(
+        fbref_pipeline_tasks._LiveRunnerTermination
+    ) as terminated:
+        fbref_pipeline_tasks.run_fbref_live_waves(
+            airflow_run_id="scheduled__2026-07-12T06:00:00+00:00",
+            dag_id="dag_ingest_fbref",
+            worker_id="current-live",
+            page_kinds=["competition"],
+            run_type="current",
+            request_limit=200,
+            byte_limit_mb=100,
+            shard_size=25,
+        )
+
+    assert terminated.value.code == 128 + fbref_pipeline_tasks.signal.SIGTERM
+    assert killed == [(8765, fbref_pipeline_tasks.signal.SIGTERM)]
+    assert (
+        fbref_pipeline_tasks.signal.getsignal(
+            fbref_pipeline_tasks.signal.SIGTERM
+        )
+        is previous_sigterm
+    )
+
+
+@pytest.mark.unit
+def test_live_waves_sigterm_on_spawn_return_bytecode_reaps_group(monkeypatch):
+    previous_sigterm = fbref_pipeline_tasks.signal.getsignal(
+        fbref_pipeline_tasks.signal.SIGTERM
+    )
+
+    class Process:
+        pid = 8790
+        returncode = None
+
+        def communicate(self, *, timeout=None):
+            assert timeout == (
+                fbref_pipeline_tasks.LIVE_WAVES_TERMINATION_GRACE_SECONDS
+            )
+            return "boundary stdout", "boundary stderr"
+
+    monkeypatch.setattr(
+        fbref_pipeline_tasks.subprocess,
+        "Popen",
+        lambda *args, **kwargs: Process(),
+    )
+    killed = []
+    monkeypatch.setattr(
+        fbref_pipeline_tasks.os,
+        "killpg",
+        lambda pid, sig: killed.append((pid, sig)),
+    )
+    monkeypatch.setattr(
+        fbref_pipeline_tasks,
+        "_wait_for_process_group_exit",
+        lambda *args, **kwargs: True,
+    )
+
+    function = fbref_pipeline_tasks.run_fbref_live_waves
+    instructions = list(dis.get_instructions(function))
+    spawn_load_index = next(
+        index
+        for index, instruction in enumerate(instructions)
+        if instruction.argval == "_spawn_live_runner"
+    )
+    boundary_instruction = next(
+        instruction
+        for instruction in instructions[spawn_load_index + 1 :]
+        if instruction.starts_line is not None
+    )
+    boundary_offset = boundary_instruction.offset
+    boundary_line = boundary_instruction.starts_line
+    assert any(
+        entry.start <= boundary_offset < entry.end
+        for entry in dis.Bytecode(function).exception_entries
+    )
+
+    fired = False
+
+    def trace_boundary(frame, event, _arg):
+        nonlocal fired
+        if frame.f_code is function.__code__:
+            if (
+                event == "line"
+                and frame.f_lineno == boundary_line
+                and not fired
+            ):
+                fired = True
+                fbref_pipeline_tasks.os.kill(
+                    fbref_pipeline_tasks.os.getpid(),
+                    fbref_pipeline_tasks.signal.SIGTERM,
+                )
+            return trace_boundary
+        return None
+
+    previous_trace = sys.gettrace()
+    sys.settrace(trace_boundary)
+    try:
+        with pytest.raises(
+            fbref_pipeline_tasks._LiveRunnerTermination
+        ) as terminated:
+            function(
+                airflow_run_id="scheduled__2026-07-12T06:00:00+00:00",
+                dag_id="dag_ingest_fbref",
+                worker_id="current-live",
+                page_kinds=["competition"],
+                run_type="current",
+                request_limit=200,
+                byte_limit_mb=100,
+                shard_size=25,
+            )
+    finally:
+        sys.settrace(previous_trace)
+
+    assert fired is True
+    assert terminated.value.code == 128 + fbref_pipeline_tasks.signal.SIGTERM
+    assert killed == [(8790, fbref_pipeline_tasks.signal.SIGTERM)]
+    assert (
+        fbref_pipeline_tasks.signal.getsignal(
+            fbref_pipeline_tasks.signal.SIGTERM
+        )
+        is previous_sigterm
+    )
+
+
+@pytest.mark.unit
+def test_process_group_cleanup_kills_descendants_after_leader_exit(monkeypatch):
+    class Process:
+        pid = 8876
+        returncode = 0
+
+        def poll(self):
+            return 0
+
+        def communicate(self, *, timeout=None):
+            return "leader exited", ""
+
+    killed = []
+    monkeypatch.setattr(
+        fbref_pipeline_tasks.os,
+        "killpg",
+        lambda pid, sig: killed.append((pid, sig)),
+    )
+    group_waits = iter((False, True))
+    monkeypatch.setattr(
+        fbref_pipeline_tasks,
+        "_wait_for_process_group_exit",
+        lambda *args, **kwargs: next(group_waits),
+    )
+
+    output = fbref_pipeline_tasks._terminate_process_group(Process(), 8876)
+
+    assert output == ("leader exited", "")
+    assert killed == [
+        (8876, fbref_pipeline_tasks.signal.SIGTERM),
+        (8876, fbref_pipeline_tasks.signal.SIGKILL),
+    ]
+
+
+@pytest.mark.unit
+def test_process_group_cleanup_fails_if_group_survives_sigkill(monkeypatch):
+    class Process:
+        pid = 8987
+        returncode = 0
+
+        def communicate(self, *, timeout=None):
+            return "", ""
+
+    monkeypatch.setattr(fbref_pipeline_tasks.os, "killpg", lambda *args: None)
+    monkeypatch.setattr(
+        fbref_pipeline_tasks,
+        "_wait_for_process_group_exit",
+        lambda *args, **kwargs: False,
+    )
+
+    with pytest.raises(RuntimeError, match="survived SIGKILL grace"):
+        fbref_pipeline_tasks._terminate_process_group(Process())
+
+
+@pytest.mark.unit
+def test_process_group_cleanup_does_not_hide_signal_permission_failure(
+    monkeypatch,
+):
+    process = MagicMock(pid=9098)
+    monkeypatch.setattr(
+        fbref_pipeline_tasks.os,
+        "killpg",
+        MagicMock(side_effect=PermissionError("denied")),
+    )
+
+    with pytest.raises(RuntimeError, match="could not signal"):
+        fbref_pipeline_tasks._terminate_process_group(process)
+
+    process.communicate.assert_not_called()
+
+
+@pytest.mark.unit
+def test_process_group_cleanup_bounds_term_and_kill_waits(monkeypatch):
+    timeouts = []
+
+    class Process:
+        pid = 6543
+        returncode = None
+
+        def communicate(self, *, timeout=None):
+            timeouts.append(timeout)
+            raise fbref_pipeline_tasks.subprocess.TimeoutExpired(
+                cmd=["runner"],
+                timeout=timeout,
+                output=f"stdout-{timeout}",
+                stderr=f"stderr-{timeout}",
+            )
+
+    killed = []
+    monkeypatch.setattr(
+        fbref_pipeline_tasks.os,
+        "killpg",
+        lambda pid, sig: killed.append((pid, sig)),
+    )
+    group_waits = iter((False, True))
+    monkeypatch.setattr(
+        fbref_pipeline_tasks,
+        "_wait_for_process_group_exit",
+        lambda *args, **kwargs: next(group_waits),
+    )
+
+    stdout, stderr = fbref_pipeline_tasks._terminate_process_group(Process())
+
+    assert timeouts == [
+        fbref_pipeline_tasks.LIVE_WAVES_TERMINATION_GRACE_SECONDS,
+        fbref_pipeline_tasks.LIVE_WAVES_KILL_GRACE_SECONDS,
+    ]
+    assert killed == [
+        (6543, fbref_pipeline_tasks.signal.SIGTERM),
+        (6543, fbref_pipeline_tasks.signal.SIGKILL),
+    ]
+    assert stdout == "stdout-10"
+    assert stderr == "stderr-10"

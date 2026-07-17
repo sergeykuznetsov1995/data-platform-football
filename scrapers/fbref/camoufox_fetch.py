@@ -20,20 +20,27 @@ This module wraps a warm Camoufox session:
 - rx+tx byte accounting from ``request.sizes()`` for the traffic guard
 
 Requirements (already in the image, do NOT bump):
-- camoufox 0.4.11 + ``python -m camoufox fetch``
+- camoufox 0.4.11 + pinned Camoufox 152.0.4-beta.26 binary
 - playwright < 1.60 (1.60 crashes Camoufox on page errors — camoufox#617)
 - a residential proxy (Turnstile 403s on a datacenter IP)
 """
 
 import asyncio
+import base64
+import ipaddress
 import logging
 import os
 import threading
 import time
 from collections import Counter
 from contextlib import contextmanager
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Literal, Optional, Union
+from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 
+from scrapers.fbref.browser_runtime import (
+    CAMOUFOX_FIREFOX_MAJOR,
+    EXECUTABLE_PATH,
+)
 from scrapers.fbref.constants import FBREF_UNCOMMENT_TABLES_JS
 
 logger = logging.getLogger(__name__)
@@ -76,19 +83,184 @@ _CF_MARKERS = (
     "challenge-running", "cf_chl_opt",
 )
 
-# A response body is reserved from Content-Length before the browser may read
-# it.  This fixed allowance covers request/response headers and framing, which
+_HTTP_HANDOFF_HEADER_NAMES = (
+    "accept",
+    "accept-language",
+    "accept-encoding",
+    "sec-fetch-dest",
+    "sec-fetch-mode",
+    "sec-fetch-site",
+)
+
+# Every request reserves its full body ceiling in route() before transport.
+# This fixed allowance covers request/response headers and framing, which
 # Playwright only reports exactly after completion.  The allowance is per
 # in-flight request and is released when that request finishes or fails.
 BROWSER_REQUEST_FIXED_OVERHEAD_BYTES = 64 * 1024
 
 # Cloudflare answers over HTTP/2, and chunked HTTP/1.1 responses carry no
 # Content-Length at all, so an undeclared body is the norm on the clearance
-# path rather than an attack.  Such a response reserves this ceiling before the
-# browser may read it and settles to the observed size on completion; a body
-# that outgrows the reservation still aborts the session at completion, and a
-# reservation that does not fit the remaining budget aborts it before transport.
+# path rather than an attack. A declared smaller body shrinks the reservation
+# after response headers; an undeclared body keeps the ceiling. A body that
+# outgrows it aborts the session, and a ceiling that does not fit the remaining
+# budget aborts in route() before any socket is opened.
 BROWSER_UNDECLARED_BODY_RESERVATION_BYTES = 512 * 1024
+UNEXPECTED_BROWSER_NETWORK_RESERVATION_BYTES = (
+    BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
+    + BROWSER_UNDECLARED_BODY_RESERVATION_BYTES
+)
+
+# Firefox is kept at zero automatic redirects because it does not re-enter
+# context.route() for server-redirect hops. The bootstrap may still follow one
+# proved same-origin HTTPS Location by issuing a second explicit page.goto();
+# that request passes the normal request/byte admission guard before transport.
+MANUAL_SERVER_REDIRECT_HOPS = 1
+_SERVER_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+
+# Camoufox 0.4.11 resolves ``geoip=True`` before Playwright exists.  Its helper
+# follows redirects and can try six public-IP services, so routing cannot admit
+# those paid requests.  Production performs exactly one bounded request through
+# the sticky lease, with redirects and transport retries disabled, and charges
+# it before opening the socket.  A failed lookup is still one spent request.
+GEOIP_REQUEST_RESERVATION = 1
+GEOIP_LOOKUP_URL = "https://api.ipify.org"
+GEOIP_RESPONSE_LIMIT_BYTES = 64
+GEOIP_CONNECT_TIMEOUT_SECONDS = 3.0
+GEOIP_READ_TIMEOUT_SECONDS = 3.0
+GEOIP_BYTE_RESERVATION_BYTES = (
+    BROWSER_REQUEST_FIXED_OVERHEAD_BYTES + GEOIP_RESPONSE_LIMIT_BYTES
+)
+
+# These Firefox transports can create a proxy connection without producing a
+# Playwright Request (for example ``<link rel=preconnect>`` or a 103 Early
+# Hints preconnect). A metered session disables them at the browser boundary;
+# normal document/fetch/script traffic continues through context.route().
+FIREFOX_METERED_NETWORK_PREFS = {
+    # WebRTC creates ICE/STUN/DTLS sockets below Playwright routing. FBref's
+    # static clearance page does not need it, so disable it before any source
+    # document can run.
+    "media.peerconnection.enabled": False,
+    # WebTransport/HTTP3 can open QUIC sockets below context.route(). The
+    # static FBref challenge does not need either transport.
+    "network.webtransport.enabled": False,
+    "network.http.http3.enable": False,
+    "network.http.redirection-limit": 0,
+    # Never send origin traffic (or its context headers) directly when the
+    # explicit paid proxy is unavailable.
+    "network.proxy.failover_direct": False,
+    "network.http.speculative-parallel-limit": 0,
+    "network.preconnect": False,
+    "network.early-hints.enabled": False,
+    "network.early-hints.preconnect.enabled": False,
+    "network.prefetch-next": False,
+    "network.dns.disablePrefetch": True,
+    "network.predictor.enabled": False,
+}
+
+def _proxy_url_with_credentials(proxy: Optional[dict]) -> Optional[str]:
+    if not proxy or not str(proxy.get("server") or "").strip():
+        return None
+    parsed = urlsplit(str(proxy["server"]).strip())
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("Camoufox geo-IP proxy URL is invalid")
+    username = str(proxy.get("username") or "")
+    password = str(proxy.get("password") or "")
+    if username != "lease" or not password:
+        raise ValueError("Camoufox geo-IP requires its authenticated lease proxy")
+    credentials = ""
+    if username:
+        credentials = quote(username, safe="")
+        if password:
+            credentials += ":" + quote(password, safe="")
+        credentials += "@"
+    host = parsed.hostname
+    if ":" in host:
+        host = f"[{host}]"
+    netloc = credentials + host
+    if parsed.port is not None:
+        netloc += f":{parsed.port}"
+    return urlunsplit((parsed.scheme, netloc, "", "", ""))
+
+
+def resolve_geoip_without_redirects(proxy: Optional[dict]) -> str:
+    """Resolve one exit IP using exactly one bounded, non-redirecting attempt."""
+
+    import requests
+    from requests.adapters import HTTPAdapter
+
+    proxy_url = _proxy_url_with_credentials(proxy)
+    if proxy_url is None:
+        raise RuntimeError("Camoufox paid geo-IP lookup requires its lease proxy")
+    proxies = {"http": proxy_url, "https": proxy_url}
+    session = requests.Session()
+    session.trust_env = False
+    session.mount("http://", HTTPAdapter(max_retries=0))
+    session.mount("https://", HTTPAdapter(max_retries=0))
+    try:
+        response = session.get(
+            GEOIP_LOOKUP_URL,
+            proxies=proxies,
+            timeout=(
+                GEOIP_CONNECT_TIMEOUT_SECONDS,
+                GEOIP_READ_TIMEOUT_SECONDS,
+            ),
+            allow_redirects=False,
+            headers={"Connection": "close", "Accept": "text/plain"},
+            stream=True,
+        )
+        try:
+            if int(response.status_code) != 200:
+                raise RuntimeError("Camoufox geo-IP lookup returned non-200")
+            raw_length = str(response.headers.get("content-length") or "").strip()
+            if raw_length and (
+                not raw_length.isascii()
+                or not raw_length.isdigit()
+                or int(raw_length) > GEOIP_RESPONSE_LIMIT_BYTES
+            ):
+                raise RuntimeError("Camoufox geo-IP response is oversized")
+            payload = response.raw.read(
+                GEOIP_RESPONSE_LIMIT_BYTES + 1,
+                decode_content=True,
+            )
+            if len(payload) > GEOIP_RESPONSE_LIMIT_BYTES:
+                raise RuntimeError("Camoufox geo-IP response is oversized")
+            try:
+                value = payload.decode("ascii").strip()
+            except UnicodeDecodeError as exc:
+                raise RuntimeError("Camoufox geo-IP response is not ASCII") from exc
+            try:
+                return str(ipaddress.ip_address(value))
+            except ValueError as exc:
+                raise RuntimeError("Camoufox geo-IP response is invalid") from exc
+        finally:
+            response.close()
+    except requests.RequestException as exc:
+        raise RuntimeError("Camoufox geo-IP lookup failed") from exc
+    finally:
+        session.close()
+
+
+def require_camoufox_geoip_database() -> None:
+    """Prove Camoufox will use its local GeoLite DB, never download at runtime."""
+
+    try:
+        from camoufox.locale import MMDB_FILE
+    except (ImportError, AttributeError) as exc:
+        raise RuntimeError("Camoufox local GeoLite database is unavailable") from exc
+    try:
+        ready = MMDB_FILE.is_file() and MMDB_FILE.stat().st_size > 0
+    except OSError as exc:
+        raise RuntimeError("Camoufox local GeoLite database is unavailable") from exc
+    if not ready:
+        raise RuntimeError("Camoufox local GeoLite database is unavailable")
 
 
 def should_block_request(
@@ -124,6 +296,10 @@ def is_cloudflare_blocked(html: str, title: str = "") -> bool:
 def _navigation_error_type(exc: Exception) -> str:
     """Classify page.goto failures without immediately banning good proxies."""
     message = f"{type(exc).__name__}: {exc}".lower()
+    if "ns_error_redirect_loop" in message:
+        # Native redirects are deliberately disabled so they cannot skip the
+        # request-admission route. This is a policy stop, not a bad proxy.
+        return "redirect_blocked"
     hard_proxy_markers = (
         'err_proxy_connection_failed', 'err_tunnel_connection_failed',
     )
@@ -131,7 +307,7 @@ def _navigation_error_type(exc: Exception) -> str:
         return 'timeout'
     transient_network_markers = (
         'timeout', 'timed out', 'err_connection_reset',
-        'err_connection_timed_out',
+        'err_connection_timed_out', 'ns_error_proxy_bad_gateway',
     )
     if any(marker in message for marker in transient_network_markers):
         return 'network'
@@ -186,12 +362,19 @@ class CamoufoxFbrefTransport:
             Callable[[bool, Optional[str]], None]
         ] = None,
         geoip: bool = True,
-        headless: bool = True,
+        headless: Union[bool, Literal["virtual"]] = True,
         humanize: bool = True,
         block_resources: bool = True,
         nav_timeout_ms: int = 90000,
         max_network_requests: Optional[int] = None,
         max_network_bytes: Optional[int] = None,
+        geoip_resolver: Callable[[Optional[dict]], str] = (
+            resolve_geoip_without_redirects
+        ),
+        geoip_database_check: Callable[[], None] = (
+            require_camoufox_geoip_database
+        ),
+        preemptive_proxy_auth: bool = False,
     ):
         # Either a rotating provider or a single fixed proxy dict.
         if proxy_provider is None and proxy is not None:
@@ -213,9 +396,13 @@ class CamoufoxFbrefTransport:
         self._max_network_bytes = (
             None if max_network_bytes is None else int(max_network_bytes)
         )
+        self._geoip_resolver = geoip_resolver
+        self._geoip_database_check = geoip_database_check
+        self._preemptive_proxy_auth = bool(preemptive_proxy_auth)
 
         self._cm = None
         self._browser = None
+        self._context = None
         self._page = None
         self._proxy = None
 
@@ -231,15 +418,71 @@ class CamoufoxFbrefTransport:
         self._navigation_attempts = 0
         self._budget_blocked_count = 0
         self._inflight_byte_reservations: Dict[int, int] = {}
-        # Playwright/Firefox may hand a *different* Request wrapper to the
-        # response/finished callbacks than the one seen by route(), so the
-        # reservation is also indexed by request URL to survive re-wrapping.
+        # Playwright/Firefox may hand a *different* Request wrapper to later
+        # callbacks. Stable Playwright GUID is the primary identity; URL is a
+        # fail-closed compatibility fallback only when neither side has one.
         self._inflight_request_urls: Dict[int, str] = {}
         self._inflight_ids_by_url: Dict[str, list] = {}
+        self._inflight_request_guids: Dict[int, str] = {}
+        self._inflight_ids_by_guid: Dict[str, list] = {}
+        # route.abort() produces a normal Playwright requestfailed event. Keep
+        # those request identities so that callback is not mistaken for HTTP
+        # traffic that bypassed route admission. URL queues cover Playwright
+        # re-wrapping and preserve multiplicity for duplicate URLs.
+        self._intentional_abort_request_urls: Dict[int, Optional[str]] = {}
+        self._intentional_abort_ids_by_url: Dict[str, list] = {}
+        # An unrouted response is charged immediately; remember it until its
+        # terminal callback so requestfinished/requestfailed cannot charge the
+        # same escaped request a second time.
+        self._unrouted_response_request_urls: Dict[int, Optional[str]] = {}
+        self._unrouted_response_ids_by_url: Dict[str, list] = {}
+        # Firefox can emit requestfailed just before the response callback for
+        # the same routed request. Keep that settled identity until the late
+        # response arrives so it cannot be mistaken for a routing bypass.
+        self._settled_failed_request_urls: Dict[int, Optional[str]] = {}
+        self._settled_failed_ids_by_url: Dict[str, list] = {}
+        self._settled_failed_request_guids: Dict[int, str] = {}
+        self._settled_failed_request_objects: Dict[int, object] = {}
+        self._settled_failed_reserved_bytes: Dict[int, int] = {}
+        self._settled_failed_charged_bytes: Dict[int, int] = {}
+        self._settled_failed_response_seen: Dict[int, bool] = {}
+        # Firefox may also dispatch requestfinished before its response event.
+        # Keep the admitted identity so that only that exact late response is
+        # accepted; another request for the same URL must still fail closed.
+        self._settled_finished_request_urls: Dict[int, Optional[str]] = {}
+        self._settled_finished_ids_by_url: Dict[str, list] = {}
+        self._settled_finished_request_guids: Dict[int, str] = {}
+        self._settled_finished_request_objects: Dict[int, object] = {}
+        self._settled_finished_reserved_bytes: Dict[int, int] = {}
+        self._settled_finished_charged_bytes: Dict[int, int] = {}
+        self._settled_finished_response_seen: Dict[int, bool] = {}
+        self._routed_failed_request_guids: set[str] = set()
+        self._late_response_request_guids: set[str] = set()
+        self._late_response_request_urls_by_guid: Dict[
+            str, Optional[str]
+        ] = {}
+        self._late_response_accounting_by_guid: Dict[
+            str, tuple[int, bool, int]
+        ] = {}
+        self._responded_request_urls: Dict[int, Optional[str]] = {}
+        self._responded_ids_by_url: Dict[str, list] = {}
+        self._responded_request_guids: Dict[int, str] = {}
+        self._navigation_source_url: Optional[str] = None
+        self._pending_manual_redirect_url: Optional[str] = None
+        self._browser_navigation_headers: Dict[str, str] = {}
+        # An __exit__ failure is a permanent phase-boundary failure. The
+        # Camoufox context-manager handle stays available for a cleanup retry,
+        # but this transport may never start another browser afterwards.
+        self._browser_finalize_error: Optional[Exception] = None
         self._inflight_reserved_bytes = 0
         self._unobserved_reserved_bytes = 0
         self._byte_budget_exhausted = False
         self._byte_budget_failure: Optional[str] = None
+        self._request_budget_exhausted = False
+        self._redirect_blocked = False
+        self._geoip_lookup_failed = False
+        self._network_policy_failed = False
+        self._network_policy_failure: Optional[str] = None
         # CF solve counters (feed the traffic guard / diagnostics).
         self.cf_challenge_attempts = 0
         self.cf_challenges_passed = 0
@@ -269,9 +512,53 @@ class CamoufoxFbrefTransport:
             logger.debug("proxy result callback failed", exc_info=True)
 
     # -- lifecycle -------------------------------------------------------- #
+    def _proxy_authorization_header(self) -> Optional[str]:
+        """Build the lease proxy header without exposing it to logs."""
+
+        if not self._preemptive_proxy_auth:
+            return None
+        proxy = self._proxy or {}
+        username = str(proxy.get("username") or "")
+        password = str(proxy.get("password") or "")
+        invalid = False
+        try:
+            invalid = _proxy_url_with_credentials(proxy) is None
+        except (TypeError, ValueError, UnicodeError):
+            invalid = True
+        invalid = bool(
+            invalid
+            or username != "lease"
+            or not password
+            or len(password) > 512
+            or not password.isascii()
+            or any(
+                ord(character) < 32 or ord(character) == 127
+                for character in password
+            )
+        )
+        if invalid:
+            self._network_policy_failed = True
+            self._network_policy_failure = "invalid_proxy_credential"
+            self._last_solve_failure = "network_policy"
+            raise RuntimeError("Camoufox paid proxy credential is invalid")
+        encoded = base64.b64encode(
+            f"{username}:{password}".encode("ascii")
+        ).decode("ascii")
+        return f"Basic {encoded}"
+
     def _start(self) -> None:
+        # Headers are fingerprint facts from one exact browser/proxy session.
+        # Never let a restart hand an old session's headers to a fresh cookie.
+        self._browser_navigation_headers = {}
+        if self._browser_finalize_error is not None:
+            raise RuntimeError(
+                "Camoufox browser finalization previously failed; reuse disabled"
+            ) from self._browser_finalize_error
+        if self._geoip_lookup_failed:
+            raise RuntimeError(
+                "Camoufox geo-IP lookup already failed; automatic retry disabled"
+            )
         self._browser_start_attempts += 1
-        from camoufox.sync_api import Camoufox  # lazy: heavy (Firefox)
 
         # Recover from a poisoned thread. camoufox's ``Camoufox.__exit__`` calls
         # an UNGUARDED ``browser.close()`` before playwright's event-loop
@@ -296,32 +583,147 @@ class CamoufoxFbrefTransport:
             )
             asyncio.events._set_running_loop(None)
 
+        if self._geoip is True:
+            # Prove this before acquiring a paid lease. Passing an explicit IP
+            # later makes Camoufox skip public_ip() and use this local DB only.
+            self._geoip_database_check()
+
         self._proxy = self._proxy_provider() if self._proxy_provider else None
+        proxy_authorization = self._proxy_authorization_header()
         if not self._proxy:
             logger.warning(
                 "CamoufoxFbrefTransport starting WITHOUT a proxy — Turnstile "
                 "403s on a datacenter IP; the fetch will not solve."
             )
-        kwargs = {"headless": self._headless, "humanize": self._humanize}
+        geoip = self._geoip
+        if geoip is True:
+            if self._max_network_requests is not None and not self._proxy:
+                self._request_budget_exhausted = True
+                self._budget_blocked_count += 1
+                raise RuntimeError(
+                    "Camoufox bounded geo-IP requires its paid lease proxy"
+                )
+            projected = (
+                self._network_requests_started + GEOIP_REQUEST_RESERVATION
+            )
+            projected_bytes = (
+                self._bytes_total
+                + self._unobserved_reserved_bytes
+                + self._inflight_reserved_bytes
+                + GEOIP_BYTE_RESERVATION_BYTES
+            )
+            if (
+                self._max_network_requests is not None
+                and projected > self._max_network_requests
+            ):
+                self._request_budget_exhausted = True
+                self._budget_blocked_count += 1
+                raise RuntimeError(
+                    "Camoufox geo-IP request admission exceeds request cap"
+                )
+            if (
+                self._max_network_bytes is not None
+                and projected_bytes > self._max_network_bytes
+            ):
+                self._byte_budget_exhausted = True
+                self._byte_budget_failure = "geoip_admission_exceeds_byte_cap"
+                self._budget_blocked_count += 1
+                raise RuntimeError(
+                    "Camoufox geo-IP byte admission exceeds byte cap"
+                )
+            # Charge the one allowed lookup and its bounded response before the
+            # resolver can open its paid socket. Failed lookups are not refunded.
+            self._network_requests_started = projected
+            self._unobserved_reserved_bytes += GEOIP_BYTE_RESERVATION_BYTES
+            try:
+                geoip = self._geoip_resolver(self._proxy)
+            except Exception:
+                # A lookup failure already spent its one paid request. Do not
+                # rotate leases and silently repeat it inside this transport.
+                self._geoip_lookup_failed = True
+                raise
+
+        from camoufox.addons import DefaultAddons
+        from camoufox.sync_api import Camoufox  # lazy: heavy (Firefox)
+
+        kwargs = {
+            "headless": self._headless,
+            "humanize": self._humanize,
+            # The default UBO addon is downloaded from a moving "latest" URL
+            # and can perform background traffic outside page routing. FBref's
+            # explicit resource policy replaces it.
+            "exclude_addons": list(DefaultAddons),
+        }
         if self._proxy:
             kwargs["proxy"] = self._proxy
-            kwargs["geoip"] = self._geoip  # locale/timezone matched to exit IP
+            kwargs["geoip"] = geoip  # locale/timezone matched to exit IP
+        elif geoip:
+            kwargs["geoip"] = geoip
+        if (
+            self._max_network_requests is not None
+            or self._max_network_bytes is not None
+        ):
+            # Firefox otherwise follows an HTTP 3xx without re-entering the
+            # route handler.  Zero makes that navigation fail closed; JS/meta
+            # navigations are new requests and are admitted by _maybe_block.
+            kwargs["firefox_user_prefs"] = FIREFOX_METERED_NETWORK_PREFS.copy()
         # The launch itself is unbounded (see BROWSER_START_TIMEOUT_S), so kill
         # the browser it spawned if it overruns: Playwright then raises out of
         # the launch and the caller rotates onto a fresh exit IP.
         with self._browser_deadline(self.BROWSER_START_TIMEOUT_S, "start"):
+            kwargs["executable_path"] = EXECUTABLE_PATH
+            # The Python package otherwise reads SofaScore's separate v135
+            # version document while generating FBref's browser fingerprint.
+            kwargs["ff_version"] = CAMOUFOX_FIREFOX_MAJOR
+            # This is not version rotation: the executable and readiness
+            # document above are both hard-pinned to that exact major.
+            kwargs["i_know_what_im_doing"] = True
             self._cm = Camoufox(**kwargs)
             self._browser = self._cm.__enter__()
-            self._page = self._browser.new_page()
-        if (
-            self._block_resources
-            or self._max_network_requests is not None
-            or self._max_network_bytes is not None
-        ):
-            self._page.route("**/*", self._maybe_block)
-        self._page.on("response", self._on_response)
-        self._page.on("requestfinished", self._on_request_finished)
-        self._page.on("requestfailed", self._on_request_failed)
+            # Service workers bypass ordinary Playwright routing, so disable
+            # them at the context boundary. Do not use ``bypass_csp`` or inject
+            # main-world constructor shims: FBref's current managed challenge
+            # refuses to initialize when its CSP is disabled or native browser
+            # constructors are replaced. Dedicated-worker fetches still pass
+            # through ``context.route``; WebSocket handshakes are rejected by
+            # ``route_web_socket`` below; WebRTC/preconnect/direct failover are
+            # disabled by the Firefox preferences above.
+            context_options = {
+                "service_workers": "block",
+            }
+            if proxy_authorization is not None:
+                # Firefox otherwise waits for a 407 and retries below
+                # context.route(). Proxy-Authorization is hop-by-hop: the
+                # lease filter consumes it on CONNECT and strips it from HTTP
+                # forwarding, so the FBref origin never receives the token.
+                context_options["extra_http_headers"] = {
+                    "Proxy-Authorization": proxy_authorization,
+                }
+            self._context = self._browser.new_context(
+                **context_options,
+            )
+            if (
+                self._block_resources
+                or self._max_network_requests is not None
+                or self._max_network_bytes is not None
+            ):
+                # Context routing covers every page in the browser context.
+                # Native redirects are disabled above, so every allowed HTTP
+                # request must pass admission before transport.
+                self._context.route("**/*", self._maybe_block)
+            # A WebSocket is not part of FBref's static clearance contract.
+            # Reject it explicitly and latch the session before any target
+            # HTTP fetch can begin.
+            self._context.route_web_socket(
+                "**/*",
+                self._on_unexpected_websocket,
+            )
+            # Context events account popups and every other page in this
+            # context; page-only callbacks leave their traffic unobserved.
+            self._context.on("response", self._on_response)
+            self._context.on("requestfinished", self._on_request_finished)
+            self._context.on("requestfailed", self._on_request_failed)
+            self._page = self._context.new_page()
         self._pages_this_session = 0
         server = (self._proxy or {}).get("server", "direct")
         logger.info("Camoufox session started (proxy=%s, humanize=%s)",
@@ -379,16 +781,40 @@ class CamoufoxFbrefTransport:
             )
 
     def _stop(self) -> None:
-        if self._cm is not None:
+        cm = self._cm
+        prior_finalize_error = self._browser_finalize_error
+        if cm is not None:
+            # A browser close cancels admitted requests. Remember their
+            # identities before __exit__ so its requestfailed callbacks remain
+            # distinguishable from routing bypasses.
+            self._remember_all_inflight_as_intentional_aborts()
             try:
-                self._cm.__exit__(None, None, None)
-            except Exception:  # noqa: BLE001 — teardown is best-effort
-                logger.warning("Camoufox teardown failed", exc_info=True)
+                cm.__exit__(None, None, None)
+            except Exception as exc:  # noqa: BLE001 — lifecycle boundary
+                # Never turn a failed lifecycle boundary into success. Retain
+                # the context-manager handle so a later close can retry its
+                # cleanup, but make the browser/page unusable immediately.
+                if self._browser_finalize_error is None:
+                    self._browser_finalize_error = exc
+                logger.error("Camoufox teardown failed", exc_info=True)
+                try:
+                    self._kill_browser_processes("teardown", None)
+                except Exception:  # noqa: BLE001 — preserve __exit__ failure
+                    logger.exception("Camoufox emergency teardown kill failed")
+                self._clear_inflight_tracking(charge_unobserved=True)
+                self._browser = self._context = self._page = None
+                raise self._browser_finalize_error
         # Any request that produced no finished/failed callback may have
         # crossed an unknown fraction of its reservation. Charge the full
         # remainder before allowing a restart to reuse capacity.
         self._clear_inflight_tracking(charge_unobserved=True)
-        self._cm = self._browser = self._page = None
+        self._cm = self._browser = self._context = self._page = None
+        self._clear_request_callback_tracking()
+        # A retry may finish the physical cleanup, but the original failed
+        # boundary must still reach FBrefFetcher. It is what prevents lease
+        # extension and construction of the unmetered HTTP phase.
+        if prior_finalize_error is not None:
+            raise prior_finalize_error
 
     def _restart(self) -> None:
         """Tear down and start fresh on the next proxy (rotation on failure)."""
@@ -419,14 +845,400 @@ class CamoufoxFbrefTransport:
             return None
         return str(url) if url else None
 
+    def _remember_intentional_abort(self, req) -> None:
+        """Remember one pre-network route abort until requestfailed arrives."""
+
+        self._remember_request_marker(
+            req,
+            self._intentional_abort_request_urls,
+            self._intentional_abort_ids_by_url,
+        )
+
+    def _remember_request_marker(
+        self,
+        req,
+        request_urls: Dict[int, Optional[str]],
+        ids_by_url: Dict[str, list],
+        request_guids: Optional[Dict[int, str]] = None,
+        request_objects: Optional[Dict[int, object]] = None,
+    ) -> None:
+        key = id(req)
+        if key in request_urls:
+            return
+        url = self._request_url(req)
+        # ``None`` is a real marker value: an exact wrapper callback can still
+        # be recognized when a detached Request no longer exposes its URL.
+        request_urls[key] = url
+        if url is not None:
+            ids_by_url.setdefault(url, []).append(key)
+        guid = self._request_guid(req)
+        if request_guids is not None:
+            if guid is not None:
+                request_guids[key] = guid
+        # Retaining settled wrappers prevents id() reuse from overwriting a
+        # still-live tombstone. The set is bounded by the browser session (and
+        # by the hard request cap in production) and is cleared on _stop().
+        if request_objects is not None:
+            request_objects[key] = req
+
+    def _remember_all_inflight_as_intentional_aborts(self) -> None:
+        for key in self._inflight_byte_reservations:
+            if key in self._intentional_abort_request_urls:
+                continue
+            url = self._inflight_request_urls.get(key)
+            self._intentional_abort_request_urls[key] = url
+            if url is not None:
+                self._intentional_abort_ids_by_url.setdefault(url, []).append(key)
+
+    @staticmethod
+    def _forget_request_marker(
+        key: int,
+        request_urls: Dict[int, Optional[str]],
+        ids_by_url: Dict[str, list],
+        request_guids: Optional[Dict[int, str]] = None,
+        request_objects: Optional[Dict[int, object]] = None,
+    ) -> None:
+        if request_guids is not None:
+            request_guids.pop(key, None)
+        if request_objects is not None:
+            request_objects.pop(key, None)
+        url = request_urls.pop(key, None)
+        if url is None:
+            return
+        keys = ids_by_url.get(url)
+        if keys:
+            try:
+                keys.remove(key)
+            except ValueError:
+                pass
+            if not keys:
+                ids_by_url.pop(url, None)
+
+    def _consume_request_marker(
+        self,
+        req,
+        request_urls: Dict[int, Optional[str]],
+        ids_by_url: Dict[str, list],
+        request_guids: Optional[Dict[int, str]] = None,
+        request_objects: Optional[Dict[int, object]] = None,
+        allow_url_fallback: bool = True,
+    ) -> bool:
+        if request_guids is None:
+            key = id(req)
+            if key not in request_urls:
+                url = self._request_url(req)
+                keys = ids_by_url.get(url or "")
+                if not keys:
+                    return False
+                key = keys[0]
+        else:
+            key = self._request_marker_key(
+                req,
+                request_urls,
+                ids_by_url,
+                request_guids,
+                request_objects=request_objects,
+                allow_url_fallback=allow_url_fallback,
+            )
+        if key is None:
+            return False
+        self._forget_request_marker(
+            key,
+            request_urls,
+            ids_by_url,
+            request_guids,
+            request_objects,
+        )
+        return True
+
+    def _request_marker_key(
+        self,
+        req,
+        request_urls: Dict[int, Optional[str]],
+        ids_by_url: Dict[str, list],
+        request_guids: Dict[int, str],
+        *,
+        request_objects: Optional[Dict[int, object]] = None,
+        allow_url_fallback: bool = True,
+    ) -> Optional[int]:
+        """Match by GUID or exact wrapper; optionally fall back to URL."""
+
+        key = id(req)
+        guid = self._request_guid(req)
+        current_url = self._request_url(req)
+        if key in request_urls:
+            if request_guids.get(key) != guid:
+                return None
+            if (
+                guid is None
+                and request_objects is not None
+                and request_objects.get(key) is not req
+            ):
+                return None
+            known_url = request_urls.get(key)
+            if known_url is not None and current_url != known_url:
+                return None
+            return key
+        if guid is not None:
+            for known_key, known_guid in request_guids.items():
+                if known_guid != guid:
+                    continue
+                known_url = request_urls.get(known_key)
+                if known_url is not None and current_url != known_url:
+                    return None
+                return known_key
+            return None
+        if not allow_url_fallback:
+            return None
+        if current_url is None:
+            return None
+        for known_key in ids_by_url.get(current_url, ()):
+            if known_key not in request_guids:
+                return known_key
+        return None
+
+    def _consume_intentional_abort(self, req) -> bool:
+        """Consume an abort marker, tolerating a re-wrapped Request object."""
+
+        return self._consume_request_marker(
+            req,
+            self._intentional_abort_request_urls,
+            self._intentional_abort_ids_by_url,
+        )
+
+    def _remember_unrouted_response(self, req) -> None:
+        self._remember_request_marker(
+            req,
+            self._unrouted_response_request_urls,
+            self._unrouted_response_ids_by_url,
+        )
+
+    def _consume_unrouted_response(self, req) -> bool:
+        return self._consume_request_marker(
+            req,
+            self._unrouted_response_request_urls,
+            self._unrouted_response_ids_by_url,
+        )
+
+    def _remember_settled_failed_request(
+        self,
+        req,
+        *,
+        reserved: int,
+        charged: int,
+        response_seen: bool,
+    ) -> None:
+        self._remember_request_marker(
+            req,
+            self._settled_failed_request_urls,
+            self._settled_failed_ids_by_url,
+            self._settled_failed_request_guids,
+            self._settled_failed_request_objects,
+        )
+        key = id(req)
+        self._settled_failed_reserved_bytes[key] = max(0, int(reserved))
+        self._settled_failed_charged_bytes[key] = max(0, int(charged))
+        self._settled_failed_response_seen[key] = bool(response_seen)
+
+    @staticmethod
+    def _request_guid(req) -> Optional[str]:
+        """Return Playwright's stable request identity when it is available."""
+
+        try:
+            guid = getattr(getattr(req, "_impl_obj", None), "_guid", None)
+        except Exception:  # noqa: BLE001 — detached request diagnostics
+            return None
+        if not isinstance(guid, str) or not guid.startswith("request@"):
+            return None
+        return guid
+
+    def _settled_failed_marker_key(
+        self,
+        req,
+    ) -> Optional[int]:
+        return self._request_marker_key(
+            req,
+            self._settled_failed_request_urls,
+            self._settled_failed_ids_by_url,
+            self._settled_failed_request_guids,
+            request_objects=self._settled_failed_request_objects,
+            allow_url_fallback=False,
+        )
+
+    def _forget_settled_failed_marker(self, key: int) -> None:
+        self._settled_failed_reserved_bytes.pop(key, None)
+        self._settled_failed_charged_bytes.pop(key, None)
+        self._settled_failed_response_seen.pop(key, None)
+        self._forget_request_marker(
+            key,
+            self._settled_failed_request_urls,
+            self._settled_failed_ids_by_url,
+            self._settled_failed_request_guids,
+            self._settled_failed_request_objects,
+        )
+
+    def _consume_settled_failed_request(
+        self,
+        req,
+    ) -> Optional[tuple[int, bool, int]]:
+        key = self._settled_failed_marker_key(req)
+        if key is None:
+            return None
+        accounting = (
+            self._settled_failed_reserved_bytes.get(key, 0),
+            self._settled_failed_response_seen.get(key, False),
+            self._settled_failed_charged_bytes.get(key, 0),
+        )
+        guid = self._settled_failed_request_guids.get(key)
+        if guid is not None:
+            self._late_response_request_guids.add(guid)
+            self._late_response_request_urls_by_guid[guid] = (
+                self._settled_failed_request_urls.get(key)
+            )
+            self._late_response_accounting_by_guid[guid] = accounting
+        if guid is not None:
+            self._forget_settled_failed_marker(key)
+        return accounting
+
+    def _is_duplicate_settled_failure(self, req) -> bool:
+        """Recognize only the same routed request, never merely the same URL."""
+
+        return self._settled_failed_marker_key(req) is not None
+
+    def _remember_settled_finished_request(
+        self,
+        req,
+        *,
+        reserved: int,
+        charged: int,
+        response_seen: bool,
+    ) -> None:
+        self._remember_request_marker(
+            req,
+            self._settled_finished_request_urls,
+            self._settled_finished_ids_by_url,
+            self._settled_finished_request_guids,
+            self._settled_finished_request_objects,
+        )
+        key = id(req)
+        self._settled_finished_reserved_bytes[key] = max(0, int(reserved))
+        self._settled_finished_charged_bytes[key] = max(0, int(charged))
+        self._settled_finished_response_seen[key] = bool(response_seen)
+
+    def _settled_finished_marker_key(self, req) -> Optional[int]:
+        return self._request_marker_key(
+            req,
+            self._settled_finished_request_urls,
+            self._settled_finished_ids_by_url,
+            self._settled_finished_request_guids,
+            request_objects=self._settled_finished_request_objects,
+            allow_url_fallback=False,
+        )
+
+    def _consume_settled_finished_request(
+        self,
+        req,
+    ) -> Optional[tuple[int, bool, int]]:
+        key = self._settled_finished_marker_key(req)
+        if key is None:
+            return None
+        accounting = (
+            self._settled_finished_reserved_bytes.get(key, 0),
+            self._settled_finished_response_seen.get(key, False),
+            self._settled_finished_charged_bytes.get(key, 0),
+        )
+        guid = self._settled_finished_request_guids.get(key)
+        if guid is not None:
+            self._late_response_request_guids.add(guid)
+            self._late_response_request_urls_by_guid[guid] = (
+                self._settled_finished_request_urls.get(key)
+            )
+            self._late_response_accounting_by_guid[guid] = accounting
+        if guid is not None:
+            self._settled_finished_reserved_bytes.pop(key, None)
+            self._settled_finished_charged_bytes.pop(key, None)
+            self._settled_finished_response_seen.pop(key, None)
+            self._forget_request_marker(
+                key,
+                self._settled_finished_request_urls,
+                self._settled_finished_ids_by_url,
+                self._settled_finished_request_guids,
+                self._settled_finished_request_objects,
+            )
+        return accounting
+
+    def _is_duplicate_settled_finish(self, req) -> bool:
+        return self._settled_finished_marker_key(req) is not None
+
+    def _is_known_late_response_request(self, req) -> bool:
+        guid = self._request_guid(req)
+        if (
+            guid is None
+            or guid not in self._late_response_request_guids
+            or guid not in self._late_response_accounting_by_guid
+        ):
+            return False
+        known_url = self._late_response_request_urls_by_guid.get(guid)
+        return known_url is None or self._request_url(req) == known_url
+
+    def _remember_responded_request(self, req) -> None:
+        self._remember_request_marker(
+            req,
+            self._responded_request_urls,
+            self._responded_ids_by_url,
+            self._responded_request_guids,
+        )
+
+    def _consume_responded_request(self, req) -> bool:
+        return self._consume_request_marker(
+            req,
+            self._responded_request_urls,
+            self._responded_ids_by_url,
+            self._responded_request_guids,
+        )
+
+    def _clear_request_callback_tracking(self) -> None:
+        self._intentional_abort_request_urls.clear()
+        self._intentional_abort_ids_by_url.clear()
+        self._unrouted_response_request_urls.clear()
+        self._unrouted_response_ids_by_url.clear()
+        self._settled_failed_request_urls.clear()
+        self._settled_failed_ids_by_url.clear()
+        self._settled_failed_request_guids.clear()
+        self._settled_failed_request_objects.clear()
+        self._settled_failed_reserved_bytes.clear()
+        self._settled_failed_charged_bytes.clear()
+        self._settled_failed_response_seen.clear()
+        self._settled_finished_request_urls.clear()
+        self._settled_finished_ids_by_url.clear()
+        self._settled_finished_request_guids.clear()
+        self._settled_finished_request_objects.clear()
+        self._settled_finished_reserved_bytes.clear()
+        self._settled_finished_charged_bytes.clear()
+        self._settled_finished_response_seen.clear()
+        self._routed_failed_request_guids.clear()
+        self._late_response_request_guids.clear()
+        self._late_response_request_urls_by_guid.clear()
+        self._late_response_accounting_by_guid.clear()
+        self._responded_request_urls.clear()
+        self._responded_ids_by_url.clear()
+        self._responded_request_guids.clear()
+
     def _track_reservation(self, req, reservation: int) -> None:
         key = id(req)
         self._inflight_byte_reservations[key] = reservation
         self._inflight_reserved_bytes += reservation
+        self._index_inflight_request(key, req)
+
+    def _index_inflight_request(self, key: int, req) -> None:
         url = self._request_url(req)
         if url is not None:
             self._inflight_request_urls[key] = url
             self._inflight_ids_by_url.setdefault(url, []).append(key)
+        guid = self._request_guid(req)
+        if guid is not None:
+            self._inflight_request_guids[key] = guid
+            self._inflight_ids_by_guid.setdefault(guid, []).append(key)
 
     def _clear_inflight_tracking(self, *, charge_unobserved: bool) -> None:
         """Atomically discard every index for the current in-flight set."""
@@ -436,6 +1248,8 @@ class CamoufoxFbrefTransport:
         self._inflight_byte_reservations.clear()
         self._inflight_request_urls.clear()
         self._inflight_ids_by_url.clear()
+        self._inflight_request_guids.clear()
+        self._inflight_ids_by_guid.clear()
         self._inflight_reserved_bytes = 0
 
     def _forget_reservation(self, key: int) -> int:
@@ -450,33 +1264,54 @@ class CamoufoxFbrefTransport:
                     pass
                 if not keys:
                     self._inflight_ids_by_url.pop(url, None)
+        guid = self._inflight_request_guids.pop(key, None)
+        if guid is not None:
+            keys = self._inflight_ids_by_guid.get(guid)
+            if keys:
+                try:
+                    keys.remove(key)
+                except ValueError:
+                    pass
+                if not keys:
+                    self._inflight_ids_by_guid.pop(guid, None)
         return reserved
 
     def _reservation_key(self, req) -> Optional[int]:
-        """Reservation key for ``req``, re-keying a re-wrapped request by URL.
+        """Reservation key for ``req``, re-keying a re-wrapped request.
 
-        The route callback and the response/finished callbacks can receive
-        different Python wrappers for the same in-flight request, so identity
-        alone loses the reservation and would fail the session closed.
+        Different Python wrappers for the same in-flight request share a
+        Playwright GUID. URL fallback is allowed only for legacy/detached
+        wrappers where the admitted request also had no stable GUID.
         """
         key = id(req)
+        guid = self._request_guid(req)
         if key in self._inflight_byte_reservations:
+            known_guid = self._inflight_request_guids.get(key)
+            if known_guid != guid:
+                return None
+            if guid is None and self._inflight_request_urls.get(key) != (
+                self._request_url(req)
+            ):
+                return None
             return key
-        url = self._request_url(req)
-        if url is None:
-            return None
-        keys = self._inflight_ids_by_url.get(url)
-        if not keys:
-            return None
-        stale_key = keys[0]
-        reserved = self._inflight_byte_reservations.pop(stale_key, 0)
-        self._inflight_request_urls.pop(stale_key, None)
-        keys.pop(0)
-        if not keys:
-            self._inflight_ids_by_url.pop(url, None)
+        if guid is not None:
+            keys = self._inflight_ids_by_guid.get(guid)
+            if not keys:
+                return None
+            stale_key = keys[0]
+        else:
+            url = self._request_url(req)
+            if url is None:
+                return None
+            keys = self._inflight_ids_by_url.get(url)
+            if not keys:
+                return None
+            stale_key = keys[0]
+            if stale_key in self._inflight_request_guids:
+                return None
+        reserved = self._forget_reservation(stale_key)
         self._inflight_byte_reservations[key] = reserved
-        self._inflight_request_urls[key] = url
-        self._inflight_ids_by_url.setdefault(url, []).append(key)
+        self._index_inflight_request(key, req)
         return key
 
     def _release_byte_reservation(self, req) -> int:
@@ -508,15 +1343,17 @@ class CamoufoxFbrefTransport:
         self._bytes_by_type[req.resource_type] += observed
         self._bytes_total += observed
 
-    def _charge_failed_request(self, req, reserved: int) -> None:
+    def _charge_failed_request(self, req, reserved: int) -> int:
         try:
             observed = self._observed_request_bytes(req)
         except Exception:  # noqa: BLE001 — failed requests often lack sizes
             observed = 0
         if observed > 0:
             self._record_observed_request_bytes(req, observed)
+            charged = observed
         else:
             self._unobserved_reserved_bytes += max(0, int(reserved))
+            charged = max(0, int(reserved))
 
         if (
             self._max_network_bytes is not None
@@ -528,6 +1365,7 @@ class CamoufoxFbrefTransport:
             self._abort_session_for_byte_budget(
                 "failed_request_consumed_byte_cap"
             )
+        return charged
 
     def _abort_session_for_byte_budget(self, reason: str) -> None:
         if self._byte_budget_exhausted:
@@ -540,6 +1378,7 @@ class CamoufoxFbrefTransport:
         # Charge every in-flight reservation in full: those requests may have
         # crossed an unknown fraction of the wire, and the cap must stay
         # conservative even though the browser is still up for a moment.
+        self._remember_all_inflight_as_intentional_aborts()
         self._clear_inflight_tracking(charge_unobserved=True)
         # The browser is NOT closed here.  This runs inside a Playwright event
         # callback (`response` / `requestfinished`), and the sync API deadlocks
@@ -548,10 +1387,80 @@ class CamoufoxFbrefTransport:
         # forever holding its leases.  `route()` refuses every further request
         # while the flag is set, and `fetch()` closes the session on its way out.
 
+    def _on_unexpected_websocket(self, websocket) -> None:
+        """Fail closed if content requests a WebSocket connection.
+
+        Firefox reports this callback after the handshake may have reached the
+        proxy. Treat it as an accounting tripwire, not as a free blocker: one
+        request and a conservative unknown-body ceiling stay permanently spent.
+        """
+
+        self._latch_unexpected_network("unexpected_websocket_handshake")
+        logger.error(
+            "Camoufox unexpected WebSocket handshake aborted the session"
+        )
+        try:
+            websocket.close(
+                code=1008, reason="FBref websocket traffic is disabled"
+            )
+        except Exception:  # noqa: BLE001 — the tripwire stays latched
+            logger.debug("WebSocket tripwire close failed", exc_info=True)
+
+    def _latch_unexpected_network(self, reason: str) -> None:
+        """Permanently charge and reject traffic outside context routing."""
+
+        self._network_requests_started += 1
+        self._unobserved_reserved_bytes += (
+            UNEXPECTED_BROWSER_NETWORK_RESERVATION_BYTES
+        )
+        self._network_policy_failed = True
+        self._network_policy_failure = reason
+        self._last_solve_failure = "network_policy"
+        self._blocked_count += 1
+        self._budget_blocked_count += 1
+
+    def _hard_network_failure_latched(self) -> bool:
+        return bool(
+            self._byte_budget_exhausted
+            or self._request_budget_exhausted
+            or self._network_policy_failed
+        )
+
+    def _capture_browser_navigation_headers(self, request) -> None:
+        """Retain exact Firefox headers needed by the warm HTTP handoff."""
+
+        if str(getattr(request, "resource_type", "")) != "document":
+            return
+        try:
+            host = (urlsplit(str(request.url)).hostname or "").casefold()
+        except (TypeError, ValueError, UnicodeError):
+            return
+        if host != "fbref.com" and not host.endswith(".fbref.com"):
+            return
+        try:
+            source = request.all_headers()
+        except Exception:  # noqa: BLE001 - request can detach during routing
+            source = getattr(request, "headers", {})
+        if not isinstance(source, dict):
+            return
+        normalized = {
+            str(name).casefold(): str(value)
+            for name, value in source.items()
+            if str(value).strip()
+        }
+        selected = {
+            name: normalized[name]
+            for name in _HTTP_HANDOFF_HEADER_NAMES
+            if name in normalized
+        }
+        if len(selected) == len(_HTTP_HANDOFF_HEADER_NAMES):
+            self._browser_navigation_headers = selected
+
     def _maybe_block(self, route) -> None:
         req = None
         try:
             req = route.request
+            self._capture_browser_navigation_headers(req)
             if (
                 self._block_resources
                 and should_block_request(
@@ -559,11 +1468,16 @@ class CamoufoxFbrefTransport:
                 )
             ):
                 self._blocked_count += 1
+                self._remember_intentional_abort(req)
                 route.abort()
                 return
             request_cap_reached = (
                 self._max_network_requests is not None
                 and self._network_requests_started >= self._max_network_requests
+            )
+            admission_reservation = (
+                BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
+                + BROWSER_UNDECLARED_BODY_RESERVATION_BYTES
             )
             byte_cap_reached = (
                 self._max_network_bytes is not None
@@ -572,33 +1486,122 @@ class CamoufoxFbrefTransport:
                     or self._bytes_total
                     + self._unobserved_reserved_bytes
                     + self._inflight_reserved_bytes
-                    + BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
+                    + admission_reservation
                     > self._max_network_bytes
                 )
             )
-            if request_cap_reached or byte_cap_reached:
+            if (
+                request_cap_reached
+                or byte_cap_reached
+                or self._network_policy_failed
+            ):
                 self._blocked_count += 1
-                self._budget_blocked_count += 1
+                byte_was_exhausted = self._byte_budget_exhausted
+                if byte_cap_reached:
+                    self._abort_session_for_byte_budget(
+                        "request_admission_exceeds_byte_cap"
+                    )
+                if not byte_cap_reached or byte_was_exhausted:
+                    self._budget_blocked_count += 1
+                if request_cap_reached:
+                    self._request_budget_exhausted = True
+                self._remember_intentional_abort(req)
                 route.abort()
                 return
             # Count before handing the request to Playwright. Failed and
             # interrupted requests still consumed one global network attempt.
             self._network_requests_started += 1
-            if self._max_network_bytes is not None:
-                self._track_reservation(
-                    req, BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
-                )
+            self._track_reservation(
+                req,
+                admission_reservation
+                if self._max_network_bytes is not None
+                else 0,
+            )
             route.continue_()
         except Exception:  # noqa: BLE001 — fail closed at the proxy boundary
             if req is not None:
                 reserved = self._release_byte_reservation(req)
                 if reserved:
                     self._charge_failed_request(req, reserved)
+                self._remember_intentional_abort(req)
             try:
                 self._blocked_count += 1
                 route.abort()
             except Exception:
                 pass
+
+    @staticmethod
+    def _response_status(response) -> Optional[int]:
+        try:
+            raw = response.status
+            raw = raw() if callable(raw) else raw
+            status = int(raw)
+        except Exception:  # noqa: BLE001 — detached response is not proof
+            return None
+        return status if 100 <= status <= 599 else None
+
+    @staticmethod
+    def _is_navigation_request(req) -> bool:
+        try:
+            value = req.is_navigation_request
+            value = value() if callable(value) else value
+        except Exception:  # noqa: BLE001 — detached request is not navigation
+            return False
+        return value is True
+
+    @staticmethod
+    def _normalized_https_url(value: object) -> Optional[str]:
+        try:
+            parsed = urlsplit(str(value or ""))
+            port = parsed.port
+        except (TypeError, ValueError):
+            return None
+        if (
+            parsed.scheme.casefold() != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or port not in (None, 443)
+        ):
+            return None
+        host = parsed.hostname.casefold()
+        return urlunsplit(
+            ("https", host, parsed.path or "/", parsed.query, "")
+        )
+
+    def _manual_redirect_target(
+        self,
+        source_url: object,
+        location: object,
+    ) -> Optional[str]:
+        source = self._normalized_https_url(source_url)
+        raw_location = str(location or "").strip()
+        if source is None or not raw_location:
+            return None
+        target = self._normalized_https_url(urljoin(source, raw_location))
+        if target is None:
+            return None
+        if urlsplit(source).netloc != urlsplit(target).netloc:
+            return None
+        return target
+
+    def _capture_manual_redirect(
+        self,
+        response,
+        req,
+        headers: Dict[str, str],
+    ) -> None:
+        source = self._navigation_source_url
+        if source is None or not self._is_navigation_request(req):
+            return
+        if self._normalized_https_url(self._request_url(req)) != source:
+            return
+        if self._response_status(response) not in _SERVER_REDIRECT_STATUSES:
+            return
+        self._pending_manual_redirect_url = self._manual_redirect_target(
+            source,
+            headers.get("location"),
+        )
 
     @staticmethod
     def _response_headers(response) -> Dict[str, str]:
@@ -613,119 +1616,321 @@ class CamoufoxFbrefTransport:
         except Exception:  # noqa: BLE001 — fail closed in _on_response
             return {}
 
-    def _adopt_unrouted_request(self, req) -> Optional[int]:
-        """Charge an in-flight request that ``route()`` never reserved.
-
-        Server redirects are not re-routed by Playwright, and Firefox can hand
-        the response callbacks a request the route callback never saw. Such a
-        request is still real proxy traffic, so it consumes a request slot and
-        the same fixed overhead as a routed one, enforced against the same
-        caps. Only a cap breach aborts the session — unlike ``route()`` there
-        is no way to refuse the transfer before transport.
-        """
-        if (
-            self._max_network_requests is not None
-            and self._network_requests_started >= self._max_network_requests
-        ):
-            self._abort_session_for_byte_budget("unrouted_request_over_request_cap")
-            return None
-        reservation = BROWSER_REQUEST_FIXED_OVERHEAD_BYTES
-        projected = (
-            self._bytes_total
-            + self._unobserved_reserved_bytes
-            + self._inflight_reserved_bytes
-            + reservation
-        )
-        if projected > self._max_network_bytes:
-            self._abort_session_for_byte_budget("unrouted_request_over_byte_cap")
-            return None
-        self._network_requests_started += 1
-        self._track_reservation(req, reservation)
-        return reservation
-
-    def _on_response(self, response) -> None:
-        """Reserve the declared body before any response can cross the cap."""
-
-        if self._max_network_bytes is None or self._byte_budget_exhausted:
-            return
-        req = getattr(response, "request", None)
-        if req is None:
-            self._abort_session_for_byte_budget("response_without_request")
-            return
-        reservation_key = self._reservation_key(req)
-        if reservation_key is None:
-            fixed = self._adopt_unrouted_request(req)
-            if fixed is None:
-                return  # a cap breach already aborted the session
-            reservation_key = id(req)
-        else:
-            fixed = self._inflight_byte_reservations[reservation_key]
-
-        headers = self._response_headers(response)
+    @staticmethod
+    def _declared_response_body_bytes(
+        headers: Dict[str, str],
+    ) -> Optional[int]:
         transfer_encoding = headers.get("transfer-encoding", "")
         chunked = "chunked" in {
             token.strip().casefold()
             for token in transfer_encoding.split(",")
         }
         raw_length = headers.get("content-length", "").strip()
-        declared = (
+        if not (
             not chunked
             and raw_length
             and raw_length.isascii()
             and raw_length.isdigit()
-        )
+        ):
+            return None
+        return int(raw_length)
+
+    @classmethod
+    def _desired_response_reservation(cls, headers: Dict[str, str]) -> int:
+        declared = cls._declared_response_body_bytes(headers)
         body_reservation = (
-            int(raw_length)
-            if declared
+            declared
+            if declared is not None
             else BROWSER_UNDECLARED_BODY_RESERVATION_BYTES
         )
-        projected = (
-            self._bytes_total
-            + self._unobserved_reserved_bytes
-            + self._inflight_reserved_bytes
-            + body_reservation
+        return BROWSER_REQUEST_FIXED_OVERHEAD_BYTES + body_reservation
+
+    def _handle_settled_response(
+        self,
+        response,
+        req,
+        accounting: tuple[int, bool, int],
+    ) -> None:
+        """Validate an exact late/duplicate response without double counting."""
+
+        reserved, response_seen, charged = accounting
+        headers = self._response_headers(response)
+        self._capture_manual_redirect(response, req, headers)
+        if (
+            response_seen
+            or self._max_network_bytes is None
+            or self._byte_budget_exhausted
+        ):
+            validated = True
+        else:
+            desired = self._desired_response_reservation(headers)
+            fits_reservation = desired <= reserved
+            # Missing/undeclared headers keep the tombstone open: a later
+            # duplicate may expose a Content-Length that this callback lacked.
+            validated = bool(
+                fits_reservation
+                and self._declared_response_body_bytes(headers) is not None
+            )
+            if not fits_reservation:
+                # Bring total accounting up to the newly proven response size.
+                # ``sizes()`` may have charged an observed value smaller than
+                # the reservation, while an unknown request charged it all.
+                self._unobserved_reserved_bytes += max(0, desired - charged)
+                self._abort_session_for_byte_budget(
+                    "late_declared_body_exceeds_settled_reservation:"
+                    f"{desired}>{reserved}"
+                )
+        guid = self._request_guid(req)
+        if validated and guid in self._late_response_accounting_by_guid:
+            self._late_response_accounting_by_guid[guid] = (
+                reserved,
+                True,
+                charged,
+            )
+
+    def _reject_unrouted_request(self) -> None:
+        """Reject a response that appeared without route admission.
+
+        Native redirects are disabled and every context page is routed before
+        creation. A missing reservation is therefore a transport-policy bypass,
+        never an HTTP request that may be silently adopted.
+        """
+
+        self._latch_unexpected_network("unrouted_http_response")
+
+    def _log_unrouted_response(self, response, req) -> None:
+        """Log safe callback facts without exposing URLs or challenge tokens."""
+
+        url = self._request_url(req)
+        guid = self._request_guid(req)
+        try:
+            resource_type = str(req.resource_type or "unknown")[:32]
+        except Exception:  # noqa: BLE001 — detached request diagnostics
+            resource_type = "unknown"
+        try:
+            redirected_from = req.redirected_from
+        except Exception:  # noqa: BLE001 — detached request diagnostics
+            redirected_from = None
+        source = self._navigation_source_url
+        headers = self._response_headers(response)
+        logger.error(
+            "Camoufox response missed route admission "
+            "(status=%s resource=%s navigation=%s "
+            "same_url_inflight=%d same_url_settled=%d "
+            "same_guid_inflight=%s same_guid_settled=%s "
+            "same_guid_routed_failure=%s same_guid_late_response=%s "
+            "source_active=%s source_match=%s "
+            "redirected_from_present=%s redirected_from_source=%s "
+            "redirect_blocked=%s "
+            "location_present=%s location_safe=%s)",
+            self._response_status(response),
+            resource_type,
+            self._is_navigation_request(req),
+            len(self._inflight_ids_by_url.get(url or "", ())),
+            len(self._settled_failed_ids_by_url.get(url or "", ())),
+            bool(
+                guid is not None
+                and guid in self._inflight_request_guids.values()
+            ),
+            bool(
+                guid is not None
+                and guid in self._settled_failed_request_guids.values()
+            ),
+            bool(
+                guid is not None
+                and guid in self._routed_failed_request_guids
+            ),
+            bool(
+                guid is not None
+                and guid in self._late_response_request_guids
+            ),
+            source is not None,
+            self._normalized_https_url(url) == source,
+            redirected_from is not None,
+            self._normalized_https_url(
+                self._request_url(redirected_from)
+                if redirected_from is not None
+                else None
+            )
+            == source,
+            self._redirect_blocked,
+            bool(headers.get("location")),
+            bool(
+                source is not None
+                and self._manual_redirect_target(
+                    source,
+                    headers.get("location"),
+                )
+            ),
         )
-        if projected > self._max_network_bytes:
+
+    def _on_response(self, response) -> None:
+        """Reserve the declared body before any response can cross the cap."""
+
+        if self._byte_budget_exhausted:
+            # A prior hard abort charged and cleared every known in-flight
+            # reservation. Late callbacks belong to those requests and must
+            # not be misclassified or counted a second time as unrouted.
+            return
+        req = getattr(response, "request", None)
+        if req is None:
+            self._latch_unexpected_network("response_without_request")
+            return
+        reservation_key = self._reservation_key(req)
+        if reservation_key is None:
+            accounting = self._consume_settled_failed_request(req)
+            if accounting is not None:
+                self._handle_settled_response(response, req, accounting)
+                return
+            accounting = self._consume_settled_finished_request(req)
+            if accounting is not None:
+                self._handle_settled_response(response, req, accounting)
+                return
+            if self._is_known_late_response_request(req):
+                guid = self._request_guid(req)
+                self._handle_settled_response(
+                    response,
+                    req,
+                    self._late_response_accounting_by_guid[guid],
+                )
+                return
+            self._remember_unrouted_response(req)
+            self._reject_unrouted_request()
+            try:
+                self._log_unrouted_response(response, req)
+            except Exception:  # noqa: BLE001 — policy latch must survive logs
+                logger.error("Camoufox unrouted response diagnostic failed")
+            return
+        headers = self._response_headers(response)
+        self._remember_responded_request(req)
+        self._capture_manual_redirect(response, req, headers)
+        if (
+            self._network_policy_failed
+            or self._max_network_bytes is None
+            or self._byte_budget_exhausted
+        ):
+            return
+        admitted = self._inflight_byte_reservations[reservation_key]
+
+        desired = self._desired_response_reservation(headers)
+        if desired > admitted:
             self._abort_session_for_byte_budget(
-                f"declared_content_length_exceeds_cap:{body_reservation}"
-                if declared
-                else f"undeclared_body_exceeds_cap:{body_reservation}"
+                "declared_body_exceeds_admission_reservation:"
+                f"{desired - BROWSER_REQUEST_FIXED_OVERHEAD_BYTES}"
             )
             return
-
-        self._inflight_byte_reservations[reservation_key] = (
-            fixed + body_reservation
-        )
-        self._inflight_reserved_bytes += body_reservation
+        self._inflight_byte_reservations[reservation_key] = desired
+        self._inflight_reserved_bytes -= admitted - desired
 
     def _on_request_finished(self, req) -> None:
+        if self._byte_budget_exhausted:
+            self._consume_intentional_abort(req)
+            self._consume_unrouted_response(req)
+            return
+        reservation_key = self._reservation_key(req)
+        if reservation_key is None:
+            if (
+                self._consume_intentional_abort(req)
+                or self._consume_unrouted_response(req)
+                or self._is_duplicate_settled_failure(req)
+                or self._is_duplicate_settled_finish(req)
+                or self._is_known_late_response_request(req)
+            ):
+                return
+            self._latch_unexpected_network("unrouted_http_completion")
+            return
+        response_seen = self._consume_responded_request(req)
         reserved = self._release_byte_reservation(req)
+        self._consume_intentional_abort(req)
+        charged = max(0, int(reserved))
         try:
             n = self._observed_request_bytes(req)
             self._requests_count += 1
             if self._max_network_bytes is not None and n == 0:
                 self._unobserved_reserved_bytes += max(0, int(reserved))
-                return
-            self._record_observed_request_bytes(req, n)
-            if (
-                self._max_network_bytes is not None
-                and (
-                    n > reserved
-                    or self._bytes_total
-                    + self._unobserved_reserved_bytes
-                    + self._inflight_reserved_bytes
-                    > self._max_network_bytes
-                )
-            ):
-                self._abort_session_for_byte_budget(
-                    f"completed_size_exceeded_reservation:{n}>{reserved}"
-                )
+            else:
+                charged = n
+                self._record_observed_request_bytes(req, n)
+                if (
+                    self._max_network_bytes is not None
+                    and (
+                        n > reserved
+                        or self._bytes_total
+                        + self._unobserved_reserved_bytes
+                        + self._inflight_reserved_bytes
+                        > self._max_network_bytes
+                    )
+                ):
+                    self._abort_session_for_byte_budget(
+                        f"completed_size_exceeded_reservation:{n}>{reserved}"
+                    )
         except Exception:  # noqa: BLE001 — sizes() can race on teardown
             self._unobserved_reserved_bytes += max(0, int(reserved))
+        finally:
+            self._remember_settled_finished_request(
+                req,
+                reserved=reserved,
+                charged=charged,
+                response_seen=response_seen,
+            )
 
     def _on_request_failed(self, req) -> None:
-        reserved = self._release_byte_reservation(req)
-        self._charge_failed_request(req, reserved)
+        try:
+            failure = getattr(req, "failure", None)
+            failure = failure() if callable(failure) else failure
+        except Exception:  # noqa: BLE001 — detached request diagnostics
+            failure = None
+        redirect_blocked = (
+            "ns_error_redirect_loop" in str(failure or "").casefold()
+        )
+        if redirect_blocked:
+            self._redirect_blocked = True
+        if self._byte_budget_exhausted:
+            # The hard abort already charged and cleared every admitted
+            # reservation. Its late cancellation callbacks are not new traffic.
+            self._consume_intentional_abort(req)
+            self._consume_unrouted_response(req)
+            return
+        reservation_key = self._reservation_key(req)
+        if reservation_key is not None:
+            guid = self._request_guid(req)
+            if guid is not None:
+                self._routed_failed_request_guids.add(guid)
+            response_seen = self._consume_responded_request(req)
+            reserved = self._release_byte_reservation(req)
+            self._consume_intentional_abort(req)
+            charged = self._charge_failed_request(req, reserved)
+            self._remember_settled_failed_request(
+                req,
+                reserved=reserved,
+                charged=charged,
+                response_seen=response_seen,
+            )
+            return
+        if self._consume_intentional_abort(req):
+            # Browser-owned cancellation happened before another socket could
+            # be opened. Any original routed request was counted at admission.
+            return
+        if self._consume_unrouted_response(req):
+            return
+        if self._is_duplicate_settled_failure(req):
+            # Firefox can report the same routed transport failure twice. The
+            # first callback already charged and settled its reservation. Keep
+            # the marker for a possible late response (notably a blocked 3xx)
+            # instead of misclassifying the duplicate as a routing bypass.
+            return
+        if self._is_duplicate_settled_finish(req):
+            # A duplicate terminal callback for an admitted request cannot be
+            # a new socket. Keep its marker for a possible late response.
+            return
+        if self._is_known_late_response_request(req):
+            return
+        if redirect_blocked:
+            return
+        # A requestfailed event with no route reservation and no intentional
+        # abort marker proves that an HTTP transport escaped context.route().
+        # Charge it once, conservatively, and make the session terminal.
+        self._latch_unexpected_network("unrouted_http_failure")
 
     # -- Turnstile solve -------------------------------------------------- #
     def _challenge_frame_present(self) -> bool:
@@ -736,6 +1941,30 @@ class CamoufoxFbrefTransport:
                 for f in self._page.frames
             )
         except Exception:  # noqa: BLE001 — frames can detach mid-nav
+            return False
+
+    def _challenge_shell_present(self) -> bool:
+        """Recognize the managed shell before its iframe has been created."""
+
+        if self._challenge_frame_present():
+            return True
+        try:
+            return bool(
+                self._page.evaluate(
+                    """() => {
+                      const title = (document.title || '').toLowerCase();
+                      return title.includes('just a moment') ||
+                        title.includes('checking your browser') ||
+                        typeof globalThis._cf_chl_opt === 'object' ||
+                        document.documentElement?.classList.contains(
+                          'no-js'
+                        ) && !!document.querySelector(
+                          'script[src*="/cdn-cgi/challenge-platform/"]'
+                        );
+                    }"""
+                )
+            )
+        except Exception:  # noqa: BLE001 — page may be navigating
             return False
 
     def _click_turnstile(self) -> bool:
@@ -779,7 +2008,7 @@ class CamoufoxFbrefTransport:
         while time.time() < deadline:
             time.sleep(self.POLL_INTERVAL_S)
             polls += 1
-            if not challenge_seen and self._challenge_frame_present():
+            if not challenge_seen and self._challenge_shell_present():
                 challenge_seen = True
                 self.cf_challenge_attempts += 1
             try:
@@ -823,12 +2052,58 @@ class CamoufoxFbrefTransport:
         except Exception as exc:  # noqa: BLE001 — browser process boundary
             error_type = _navigation_error_type(exc)
             logger.warning("Camoufox %s failed: %s", label, exc)
+            if self._browser_finalize_error is not None:
+                # A failed __exit__ is not a rotatable proxy problem. Let the
+                # fetcher observe the phase-boundary failure and refuse HTTP.
+                raise
             # Only failures with a network/proxy signature affect proxy
             # health. Local browser crashes must not burn a healthy exit IP.
             if error_type in {'timeout', 'network'}:
                 self._record_proxy_result(False, error_type)
             self._stop()
             return False
+
+    def _navigate_with_one_manual_redirect(self, url: str) -> None:
+        """Navigate with one explicit, routed server-redirect continuation."""
+
+        current_url = url
+        for hop in range(MANUAL_SERVER_REDIRECT_HOPS + 1):
+            self._pending_manual_redirect_url = None
+            self._navigation_source_url = self._normalized_https_url(
+                current_url
+            )
+            self._navigation_attempts += 1
+            try:
+                with self._browser_deadline(
+                    self.BROWSER_ATTEMPT_TIMEOUT_S, "navigation"
+                ):
+                    self._page.goto(
+                        current_url,
+                        wait_until="domcontentloaded",
+                        timeout=self._nav_timeout_ms,
+                    )
+            except Exception as exc:
+                error_type = _navigation_error_type(exc)
+                redirect_url = self._pending_manual_redirect_url
+                self._pending_manual_redirect_url = None
+                if (
+                    (self._redirect_blocked or error_type == "redirect_blocked")
+                    and redirect_url is not None
+                    and hop < MANUAL_SERVER_REDIRECT_HOPS
+                    and not self._hard_network_failure_latched()
+                ):
+                    # network.http.redirection-limit=0 stopped Firefox before
+                    # the hop. The explicit continuation is a fresh route(),
+                    # so its request and byte caps are checked before transport.
+                    self._redirect_blocked = False
+                    current_url = redirect_url
+                    logger.info("Camoufox following one admitted server redirect")
+                    continue
+                raise
+            finally:
+                self._navigation_source_url = None
+            self._pending_manual_redirect_url = None
+            return
 
     # -- public fetch ----------------------------------------------------- #
     def fetch(self, url: str) -> Optional[str]:
@@ -837,8 +2112,11 @@ class CamoufoxFbrefTransport:
         Reuses the warm session (cf_clearance) across calls; on a solve-timeout
         it restarts on a fresh proxy up to ``MAX_PROXY_ROTATIONS`` times.
         """
-        if self._byte_budget_exhausted:
+        if self._hard_network_failure_latched():
             return None
+        if self._geoip_lookup_failed:
+            return None
+        self._redirect_blocked = False
         if (
             self._page is not None
             and self._pages_this_session >= self._max_pages_per_session
@@ -851,25 +2129,26 @@ class CamoufoxFbrefTransport:
         for attempt in range(self.MAX_PROXY_ROTATIONS + 1):
             if self._page is None:
                 if not self._lifecycle_action(self._start, 'start'):
+                    if (
+                        self._hard_network_failure_latched()
+                        or self._geoip_lookup_failed
+                    ):
+                        break
                     continue
             try:
                 # FBrefFetcher uses Camoufox only for its clearance bootstrap,
-                # so every navigation here is one exact bootstrap attempt.
-                # Count before goto: timeouts and interrupted navigations still
-                # consumed a browser/proxy attempt.
-                self._navigation_attempts += 1
-                with self._browser_deadline(
-                    self.BROWSER_ATTEMPT_TIMEOUT_S, "navigation"
-                ):
-                    self._page.goto(
-                        url, wait_until="domcontentloaded",
-                        timeout=self._nav_timeout_ms,
-                    )
+                # so this is one bootstrap plus at most one explicit, routed
+                # same-origin server-redirect continuation.
+                self._navigate_with_one_manual_redirect(url)
             except Exception as e:  # noqa: BLE001 — browser/network boundary
                 logger.warning("Camoufox goto failed (attempt %d): %s",
                                attempt + 1, e)
                 error_type = _navigation_error_type(e)
-                if self._byte_budget_exhausted:
+                if self._hard_network_failure_latched():
+                    break
+                if self._redirect_blocked or error_type == "redirect_blocked":
+                    self._redirect_blocked = True
+                    self._last_solve_failure = "redirect_blocked"
                     break
                 if error_type in {'timeout', 'network'}:
                     self._record_proxy_result(False, error_type)
@@ -877,7 +2156,10 @@ class CamoufoxFbrefTransport:
                     self._lifecycle_action(self._restart, 'restart')
                 continue
 
-            if self._byte_budget_exhausted:
+            if self._hard_network_failure_latched():
+                break
+            if self._redirect_blocked:
+                self._last_solve_failure = "redirect_blocked"
                 break
 
             # CF challenge counters live in _solve_current_page — only navs
@@ -890,11 +2172,19 @@ class CamoufoxFbrefTransport:
             except Exception as e:  # noqa: BLE001 — killed browser raises here
                 logger.warning("Camoufox solve failed (attempt %d): %s",
                                attempt + 1, e)
-                if self._byte_budget_exhausted:
+                if self._redirect_blocked:
+                    self._last_solve_failure = "redirect_blocked"
+                    break
+                if self._hard_network_failure_latched():
                     break
                 if attempt < self.MAX_PROXY_ROTATIONS:
                     self._lifecycle_action(self._restart, 'restart')
                 continue
+            if self._hard_network_failure_latched():
+                break
+            if self._redirect_blocked:
+                self._last_solve_failure = "redirect_blocked"
+                break
             if html is not None:
                 self._pages_this_session += 1
                 self._record_proxy_result(True)
@@ -906,12 +2196,15 @@ class CamoufoxFbrefTransport:
                 "Camoufox page did not satisfy %s for %s (attempt %d/%d)",
                 failure_type, url, attempt + 1,
                 self.MAX_PROXY_ROTATIONS + 1)
+            if self._redirect_blocked:
+                self._last_solve_failure = "redirect_blocked"
+                break
             if failure_type == 'cloudflare':
                 self._record_proxy_result(False, failure_type)
             if attempt < self.MAX_PROXY_ROTATIONS:
                 self._lifecycle_action(self._restart, 'restart')
 
-        if self._byte_budget_exhausted and self._cm is not None:
+        if self._hard_network_failure_latched() and self._cm is not None:
             # The cap fired inside a Playwright callback, which may not close
             # the browser (see _abort_session_for_byte_budget).  Do it here,
             # back on the main thread, so no parallel response keeps spending
@@ -929,7 +2222,12 @@ class CamoufoxFbrefTransport:
         cf_clearance is bound to the exit IP and the browser fingerprint —
         the caller must reuse the same proxy and a Firefox impersonation.
         """
-        if self._page is None:
+        if (
+            self._page is None
+            or self._hard_network_failure_latched()
+            or self._redirect_blocked
+            or self._geoip_lookup_failed
+        ):
             return None
         try:
             cookies = {
@@ -940,9 +2238,13 @@ class CamoufoxFbrefTransport:
             if "cf_clearance" not in cookies:
                 return None
             user_agent = self._page.evaluate("navigator.userAgent")
+            browser_headers = dict(self._browser_navigation_headers)
+            if len(browser_headers) != len(_HTTP_HANDOFF_HEADER_NAMES):
+                return None
             return {
                 "cookies": cookies,
                 "user_agent": user_agent,
+                "browser_headers": browser_headers,
                 "proxy": self._proxy,
             }
         except Exception as e:  # noqa: BLE001 — session may be tearing down
@@ -1007,6 +2309,11 @@ class CamoufoxFbrefTransport:
             ),
             "byte_budget_exhausted": self._byte_budget_exhausted,
             "byte_budget_failure": self._byte_budget_failure,
+            "request_budget_exhausted": self._request_budget_exhausted,
+            "network_policy_failed": self._network_policy_failed,
+            "network_policy_failure": self._network_policy_failure,
+            "geoip_lookup_failed": self._geoip_lookup_failed,
+            "redirect_blocked": self._redirect_blocked,
             "real_bytes_by_resource_type": dict(self._bytes_by_type),
             "blocked_count": self._blocked_count,
             "cf_challenge_attempts": self.cf_challenge_attempts,

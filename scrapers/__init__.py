@@ -9,8 +9,6 @@ _EXPORTS = {
     "SeleniumScraper": ("scrapers.base.base_scraper", "SeleniumScraper"),
     "SoccerdataScraper": ("scrapers.base.base_scraper", "SoccerdataScraper"),
     "IcebergWriter": ("scrapers.base.iceberg_writer", "IcebergWriter"),
-    "FBrefScraper": ("scrapers.fbref", "FBrefScraper"),
-    "NodriverFBrefScraper": ("scrapers.nodriver_fbref", "NodriverFBrefScraper"),
     "FotMobScraper": ("scrapers.fotmob", "FotMobScraper"),
     "MatchHistoryScraper": ("scrapers.matchhistory", "MatchHistoryScraper"),
     "WhoScoredIngestService": ("scrapers.whoscored", "WhoScoredIngestService"),

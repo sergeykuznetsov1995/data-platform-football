@@ -18,7 +18,7 @@ All data is written to Iceberg Bronze layer tables (via Parquet fallback).
 """
 
 from datetime import datetime, timedelta
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 from airflow import DAG
 from airflow.exceptions import AirflowException

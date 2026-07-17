@@ -15,6 +15,7 @@ from dags.scripts import run_transfermarkt_scope_cycle as cycle
 from dags.utils.transfermarkt_approval import (
     ApprovalJournal,
     ApprovalPacket,
+    load_standing_policy,
 )
 from scrapers.transfermarkt.registry import (
     EditionRecord,
@@ -144,11 +145,11 @@ def _approved_args(tmp_path: Path, payload: dict) -> tuple[list[str], Path]:
         packet_id='tm-paid-scope-001',
         action='paid_proxy',
         byte_cap_bytes=cycle.HARD_BYTE_CAP,
-        byte_cap_mib=Decimal('15'),
+        byte_cap_mib=Decimal('24'),
         request_limit=sum(
             item['requests'] for item in cycle.DEFAULT_ENTITY_LIMITS.values()
         ),
-        retry_limit=cycle.PARENT_RETRY_LIMIT,
+        retry_limit=cycle.SCOPE_RETRY_LIMIT,
         **values,
     )
     write = ApprovalPacket(
@@ -223,6 +224,7 @@ def _fake_result(command: tuple[str, ...], *, retries: int = 0) -> dict:
         'wire_response_bytes': 120,
         'provider_metered_bytes': 125,
         'provider_metering_available': True,
+        'provider_byte_grant': cycle.HARD_BYTE_CAP,
         'network_fetches': 2,
         'retries': retries,
         'cache_hits': 1,
@@ -326,7 +328,7 @@ def test_exact_cycle_runs_sequentially_without_shell_and_commits_manifest(tmp_pa
     )
     assert all(
         command[command.index('--cycle-ledger-key') + 1]
-        == payload['parent_cycle_id']
+        == payload['child_cycle_id']
         for command, _ in calls
     )
     assert all(
@@ -334,7 +336,7 @@ def test_exact_cycle_runs_sequentially_without_shell_and_commits_manifest(tmp_pa
         and options['env']['TM_SCOPE_ID'] == payload['scope_id']
         for _, options in calls
     )
-    budget = str(cycle.PARENT_RETRY_LIMIT)
+    budget = str(cycle.SCOPE_RETRY_LIMIT)
     assert all(
         command[command.index('--retry-budget') + 1] == budget
         and options['env']['TM_RETRY_BUDGET'] == budget
@@ -379,10 +381,8 @@ def test_exact_cycle_runs_sequentially_without_shell_and_commits_manifest(tmp_pa
     assert ledger['requests'] == 8
     assert ledger['retries'] == 0
     assert ledger['manifest_count'] == 1
-    assert ledger['hard_provider_byte_budget'] == cycle.HARD_BYTE_CAP
-    assert ledger['request_limit'] == sum(
-        item['requests'] for item in cycle.DEFAULT_ENTITY_LIMITS.values()
-    )
+    assert ledger['hard_provider_byte_budget'] == cycle.PARENT_BYTE_BUDGET
+    assert ledger['request_limit'] == cycle.PARENT_REQUEST_LIMIT
     assert ledger['retry_limit'] == cycle.PARENT_RETRY_LIMIT
     for field in (
         'decoded_bytes', 'wire_bytes', 'provider_metered_bytes',
@@ -544,7 +544,7 @@ def test_retry_limit_stops_next_entity_before_paid_io(tmp_path):
             args,
             operation_argv=cycle.approved_operation_argv(argv),
             subprocess_runner=_fake_subprocess(
-                calls, first_retries=cycle.PARENT_RETRY_LIMIT,
+                calls, first_retries=cycle.SCOPE_RETRY_LIMIT,
             ),
             manifest_writer=lambda manifest: pytest.fail('manifest persisted'),
             parent_ledger_writer=lambda ledger: pytest.fail('ledger persisted'),
@@ -556,7 +556,7 @@ def test_retry_limit_stops_next_entity_before_paid_io(tmp_path):
     attempts = json.loads(
         Path(payload['parent_ledger']['path'] + '.attempts').read_text()
     )
-    assert attempts['retries'] == cycle.PARENT_RETRY_LIMIT
+    assert attempts['retries'] == cycle.SCOPE_RETRY_LIMIT
 
 
 def test_remaining_parent_retry_budget_is_pinned_in_argv_and_env(tmp_path):
@@ -575,8 +575,8 @@ def test_remaining_parent_retry_budget_is_pinned_in_argv_and_env(tmp_path):
         monotonic_ns=ticks.__next__,
     )
 
-    full = str(cycle.PARENT_RETRY_LIMIT)
-    after_one_retry = str(cycle.PARENT_RETRY_LIMIT - 1)
+    full = str(cycle.SCOPE_RETRY_LIMIT)
+    after_one_retry = str(cycle.SCOPE_RETRY_LIMIT - 1)
     assert calls[0][0][calls[0][0].index('--retry-budget') + 1] == full
     assert calls[0][1]['env']['TM_RETRY_BUDGET'] == full
     for command, options in calls[1:]:
@@ -698,8 +698,8 @@ def test_scope_manifest_sql_is_exact_idempotent_complete_merge(tmp_path):
     assert 't.parent_cycle_id = s.parent_cycle_id' in proxy_sql
     assert 't.entity = s.entity' in proxy_sql
     assert proxy_sql.count("'scheduled__2026-07-11'") == 7
-    assert str(cycle.HARD_BYTE_CAP) in proxy_sql
-    assert str(cycle.SOFT_BYTE_STOP) in proxy_sql
+    assert str(cycle.PARENT_BYTE_BUDGET) in proxy_sql
+    assert str(cycle.PARENT_SOFT_BYTE_STOP) in proxy_sql
 
 
 def test_a_calendar_league_edition_is_read_as_the_season_it_is_labelled(tmp_path):
@@ -782,3 +782,938 @@ def test_the_approved_interpreter_is_the_one_behind_the_alias(tmp_path):
     )
 
     assert argv[0] == str(real)
+
+
+def _standing_policy_file(tmp_path: Path, **overrides) -> Path:
+    now = datetime.now(timezone.utc)
+    value = {
+        'policy_version': 1,
+        'dag_id': 'dag_ingest_transfermarkt',
+        'approved_by': 'sergeykuznetsov1995',
+        'approved_at': (now - timedelta(days=1)).isoformat(),
+        'expires_at': (now + timedelta(days=30)).isoformat(),
+        'paid_proxy': {
+            'byte_cap_bytes': cycle.HARD_BYTE_CAP,
+            'request_limit': sum(
+                item['requests'] for item in cycle.DEFAULT_ENTITY_LIMITS.values()
+            ),
+            'retry_limit': cycle.SCOPE_RETRY_LIMIT,
+            'concurrency': 1,
+        },
+        'production_write': {
+            'byte_cap_bytes': 0,
+            'request_limit': 0,
+            'retry_limit': 0,
+            'concurrency': 1,
+        },
+        'allowed_write_tables': sorted(
+            cycle.required_write_tables('dual')
+            | cycle.required_write_tables('native-only')
+        ),
+    }
+    value.update(overrides)
+    path = tmp_path / 'standing-approval-policy.json'
+    path.write_text(json.dumps(value), encoding='utf-8')
+    return path
+
+
+def _standing_args(
+    tmp_path: Path, payload: dict, **policy_overrides,
+) -> list[str]:
+    policy_path = _standing_policy_file(tmp_path, **policy_overrides)
+    policy = load_standing_policy(policy_path)
+    return [
+        '--payload-json', json.dumps(payload, sort_keys=True),
+        '--reader-revision', '7',
+        '--candidate-slot', 'b',
+        '--write-mode', 'dual',
+        '--standing-policy', str(policy_path),
+        '--standing-policy-sha256', policy.policy_hash,
+    ]
+
+
+def test_standing_policy_cycle_commits_manifest_and_parent_ledger(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv('TM_STANDING_POLICY_ENABLED', 'true')
+    payload = _payload(tmp_path)
+    argv = _standing_args(tmp_path, payload)
+    args = _parse_args(argv)
+    calls = []
+    persisted = []
+    persisted_ledgers = []
+    ticks = itertools.count(start=0, step=1_000_000)
+
+    manifest = cycle.run_scope_cycle(
+        args,
+        operation_argv=cycle.approved_operation_argv(argv),
+        subprocess_runner=_fake_subprocess(calls),
+        manifest_writer=persisted.append,
+        parent_ledger_writer=persisted_ledgers.append,
+        monotonic_ns=ticks.__next__,
+    )
+
+    assert manifest['status'] == 'complete'
+    assert persisted == [manifest]
+    assert len(persisted_ledgers) == 1
+    assert [
+        command[command.index('--entity') + 1] for command, _ in calls
+    ] == list(cycle.ENTITY_ORDER)
+    policy = load_standing_policy(argv[argv.index('--standing-policy') + 1])
+    assert all(
+        options['env']['TM_PAID_PROXY_APPROVAL_PACKET_ID']
+        == 'standing-policy-v1'
+        and options['env']['TM_PAID_PROXY_APPROVAL_PACKET_HASH']
+        == policy.policy_hash
+        and options['env']['TM_PRODUCTION_WRITE_APPROVAL_PACKET_ID']
+        == 'standing-policy-v1'
+        for _, options in calls
+    )
+    assert Path(payload['parent_ledger']['path'] + '.attempts').is_file()
+    assert Path(payload['parent_ledger']['path']).is_file()
+    assert not (tmp_path / 'approvals.json').exists()
+    assert not list(tmp_path.glob('**/journal*.json'))
+
+
+def test_standing_policy_signs_the_manifest_it_authorized(tmp_path, monkeypatch):
+    # A scheduled paid scope is authorized by the standing policy instead of a
+    # one-shot packet, so the policy hash is the only authorization trace left.
+    # It rides inside the manifest hash, where it cannot be edited afterwards;
+    # a one-shot cycle keeps its journal and omits the key entirely.
+    monkeypatch.setenv('TM_STANDING_POLICY_ENABLED', 'true')
+    payload = _payload(tmp_path)
+    argv = _standing_args(tmp_path, payload)
+    args = _parse_args(argv)
+    ticks = itertools.count(start=0, step=1_000_000)
+
+    manifest = cycle.run_scope_cycle(
+        args,
+        operation_argv=cycle.approved_operation_argv(argv),
+        subprocess_runner=_fake_subprocess([]),
+        manifest_writer=lambda manifest: None,
+        parent_ledger_writer=lambda ledger: None,
+        monotonic_ns=ticks.__next__,
+    )
+
+    policy = load_standing_policy(argv[argv.index('--standing-policy') + 1])
+    assert manifest['dq_evidence']['standing_policy_hash'] == policy.policy_hash
+    assert manifest['manifest_digest'] == cycle.stable_hash({
+        key: manifest[key] for key in cycle.ScopeManifest.__dataclass_fields__
+    })
+    cycle.ScopeManifest.from_mapping({
+        key: manifest[key]
+        for key in cycle.ScopeManifest.__dataclass_fields__
+    }).validate(cycle.EXPECTED_ENTITIES)
+
+
+def test_standing_policy_records_authorization_in_own_file(
+    tmp_path, monkeypatch,
+):
+    # The manifest hash carries the policy hash; this separate file additionally
+    # survives a failed CLI rerun (which overwrites scope-status.json) and names
+    # the policy version.
+    monkeypatch.setenv('TM_STANDING_POLICY_ENABLED', 'true')
+    payload = _payload(tmp_path)
+    argv = _standing_args(tmp_path, payload)
+    args = _parse_args(argv)
+    ticks = itertools.count(start=0, step=1_000_000)
+
+    manifest = cycle.run_scope_cycle(
+        args,
+        operation_argv=cycle.approved_operation_argv(argv),
+        subprocess_runner=_fake_subprocess([]),
+        manifest_writer=lambda manifest: None,
+        parent_ledger_writer=lambda ledger: None,
+        monotonic_ns=ticks.__next__,
+    )
+
+    policy = load_standing_policy(argv[argv.index('--standing-policy') + 1])
+    base = Path(payload['result_paths']['base_dir'])
+    record = json.loads((base / 'standing-authorization.json').read_text())
+    assert record == {
+        'status': 'complete',
+        'parent_cycle_id': payload['parent_cycle_id'],
+        'child_cycle_id': payload['child_cycle_id'],
+        'scope_id': payload['scope_id'],
+        'manifest_digest': manifest['manifest_digest'],
+        'approval_mode': 'standing_policy',
+        'standing_policy': {
+            'policy_hash': policy.policy_hash,
+            'policy_version': 1,
+        },
+    }
+    assert not (base / 'scope-status.json').exists()
+
+
+def test_one_shot_cycle_writes_no_standing_authorization_file(tmp_path):
+    payload = _payload(tmp_path)
+    argv, _ = _approved_args(tmp_path, payload)
+    args = _parse_args(argv)
+    ticks = itertools.count(start=0, step=1_000_000)
+
+    cycle.run_scope_cycle(
+        args,
+        operation_argv=cycle.approved_operation_argv(argv),
+        subprocess_runner=_fake_subprocess([]),
+        manifest_writer=lambda manifest: None,
+        parent_ledger_writer=lambda ledger: None,
+        monotonic_ns=ticks.__next__,
+    )
+
+    base = Path(payload['result_paths']['base_dir'])
+    assert not (base / 'standing-authorization.json').exists()
+    assert not (base / 'scope-status.json').exists()
+
+
+def test_standing_resume_rewrites_missing_authorization_record(
+    tmp_path, monkeypatch,
+):
+    # A cycle that died between the complete checkpoint and the authorization
+    # record must still leave the record behind after the no-op resume.
+    monkeypatch.setenv('TM_STANDING_POLICY_ENABLED', 'true')
+    payload = _payload(tmp_path)
+    argv = _standing_args(tmp_path, payload)
+    args = _parse_args(argv)
+    ticks = itertools.count(start=0, step=1_000_000)
+    first = cycle.run_scope_cycle(
+        args,
+        operation_argv=cycle.approved_operation_argv(argv),
+        subprocess_runner=_fake_subprocess([]),
+        manifest_writer=lambda manifest: None,
+        parent_ledger_writer=lambda ledger: None,
+        monotonic_ns=ticks.__next__,
+    )
+    base = Path(payload['result_paths']['base_dir'])
+    record_path = base / 'standing-authorization.json'
+    original = record_path.read_text()
+    record_path.unlink()
+
+    second = cycle.run_scope_cycle(
+        args,
+        operation_argv=cycle.approved_operation_argv(argv),
+        subprocess_runner=lambda *a, **kw: pytest.fail('subprocess ran'),
+        manifest_writer=lambda manifest: pytest.fail('manifest persisted'),
+        parent_ledger_writer=lambda ledger: pytest.fail('ledger persisted'),
+    )
+
+    assert second == first
+    assert record_path.read_text() == original
+
+
+def test_failed_cli_rerun_does_not_clobber_standing_authorization(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv('TM_STANDING_POLICY_ENABLED', 'true')
+    payload = _payload(tmp_path)
+    argv = _standing_args(tmp_path, payload)
+    args = _parse_args(argv)
+    ticks = itertools.count(start=0, step=1_000_000)
+    cycle.run_scope_cycle(
+        args,
+        operation_argv=cycle.approved_operation_argv(argv),
+        subprocess_runner=_fake_subprocess([]),
+        manifest_writer=lambda manifest: None,
+        parent_ledger_writer=lambda ledger: None,
+        monotonic_ns=ticks.__next__,
+    )
+    base = Path(payload['result_paths']['base_dir'])
+    record_path = base / 'standing-authorization.json'
+    original = record_path.read_text()
+
+    drifted = list(argv)
+    drifted[drifted.index('--standing-policy-sha256') + 1] = '0' * 64
+
+    assert cycle.main(drifted) == 1
+
+    failure = json.loads((base / 'scope-status.json').read_text())
+    assert failure['status'] == 'failed'
+    assert failure['error_type'] == 'ApprovalDriftError'
+    assert record_path.read_text() == original
+
+
+def test_standing_policy_flag_without_sha_fails_before_subprocess(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv('TM_STANDING_POLICY_ENABLED', 'true')
+    payload = _payload(tmp_path)
+    argv = _standing_args(tmp_path, payload)
+    index = argv.index('--standing-policy-sha256')
+    del argv[index:index + 2]
+    args = _parse_args(argv)
+
+    with pytest.raises(
+        cycle.ScopeCycleError, match='standing_policy_sha256 is required',
+    ):
+        cycle.run_scope_cycle(
+            args,
+            operation_argv=cycle.approved_operation_argv(argv),
+            subprocess_runner=lambda *a, **kw: pytest.fail('subprocess ran'),
+            manifest_writer=lambda manifest: pytest.fail('manifest persisted'),
+            parent_ledger_writer=lambda ledger: pytest.fail('ledger persisted'),
+        )
+
+
+def test_standing_sha_without_policy_path_fails_before_subprocess(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv('TM_STANDING_POLICY_ENABLED', 'true')
+    payload = _payload(tmp_path)
+    argv = _standing_args(tmp_path, payload)
+    index = argv.index('--standing-policy')
+    del argv[index:index + 2]
+    args = _parse_args(argv)
+
+    with pytest.raises(
+        cycle.ScopeCycleError, match='standing_policy is required',
+    ):
+        cycle.run_scope_cycle(
+            args,
+            operation_argv=cycle.approved_operation_argv(argv),
+            subprocess_runner=lambda *a, **kw: pytest.fail('subprocess ran'),
+            manifest_writer=lambda manifest: pytest.fail('manifest persisted'),
+            parent_ledger_writer=lambda ledger: pytest.fail('ledger persisted'),
+        )
+
+
+def test_one_shot_without_journal_fails_before_subprocess(tmp_path):
+    payload = _payload(tmp_path)
+    argv = [
+        '--payload-json', json.dumps(payload, sort_keys=True),
+        '--reader-revision', '7',
+        '--candidate-slot', 'b',
+        '--write-mode', 'dual',
+        '--paid-proxy-approval-packet-id', 'paid-1',
+        '--paid-proxy-approval-packet-hash', 'a' * 64,
+        '--production-write-approval-packet-id', 'write-1',
+        '--production-write-approval-packet-hash', 'b' * 64,
+    ]
+    args = _parse_args(argv)
+
+    with pytest.raises(
+        cycle.ScopeCycleError, match='approval_journal is required',
+    ):
+        cycle.run_scope_cycle(
+            args,
+            operation_argv=cycle.approved_operation_argv(argv),
+            subprocess_runner=lambda *a, **kw: pytest.fail('subprocess ran'),
+            manifest_writer=lambda manifest: pytest.fail('manifest persisted'),
+            parent_ledger_writer=lambda ledger: pytest.fail('ledger persisted'),
+        )
+
+
+def test_standing_policy_requires_env_gate(tmp_path, monkeypatch):
+    monkeypatch.delenv('TM_STANDING_POLICY_ENABLED', raising=False)
+    payload = _payload(tmp_path)
+    argv = _standing_args(tmp_path, payload)
+    args = _parse_args(argv)
+
+    with pytest.raises(
+        cycle.ScopeCycleError, match='TM_STANDING_POLICY_ENABLED must be true',
+    ):
+        cycle.run_scope_cycle(
+            args,
+            operation_argv=cycle.approved_operation_argv(argv),
+            subprocess_runner=lambda *a, **kw: pytest.fail('subprocess ran'),
+            manifest_writer=lambda manifest: pytest.fail('manifest persisted'),
+            parent_ledger_writer=lambda ledger: pytest.fail('ledger persisted'),
+        )
+
+
+def test_standing_policy_content_drift_fails_before_subprocess(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv('TM_STANDING_POLICY_ENABLED', 'true')
+    payload = _payload(tmp_path)
+    argv = _standing_args(tmp_path, payload)
+    argv[argv.index('--standing-policy-sha256') + 1] = '0' * 64
+    args = _parse_args(argv)
+
+    with pytest.raises(Exception, match='differs from the pinned sha256'):
+        cycle.run_scope_cycle(
+            args,
+            operation_argv=cycle.approved_operation_argv(argv),
+            subprocess_runner=lambda *a, **kw: pytest.fail('subprocess ran'),
+            manifest_writer=lambda manifest: pytest.fail('manifest persisted'),
+            parent_ledger_writer=lambda ledger: pytest.fail('ledger persisted'),
+        )
+
+
+def test_standing_and_one_shot_flags_are_mutually_exclusive(tmp_path):
+    payload = _payload(tmp_path)
+    argv = _standing_args(tmp_path, payload) + [
+        '--approval-journal', str(tmp_path / 'approvals.json'),
+    ]
+
+    with pytest.raises(cycle.ScopeCycleError, match='mutually exclusive'):
+        _parse_args(argv)
+
+    bare = [
+        '--payload-json', json.dumps(payload, sort_keys=True),
+        '--reader-revision', '7',
+        '--candidate-slot', 'b',
+        '--write-mode', 'dual',
+    ]
+    with pytest.raises(cycle.ScopeCycleError, match='approval mode is required'):
+        _parse_args(bare)
+
+
+@pytest.mark.parametrize(
+    'paid_override',
+    [
+        {'byte_cap_bytes': 16 * 1024 * 1024},
+        {'request_limit': 1609},
+        {'retry_limit': 799},
+        {'concurrency': 2},
+    ],
+)
+def test_standing_policy_limits_must_match_wrapper_argv(
+    tmp_path, monkeypatch, paid_override,
+):
+    monkeypatch.setenv('TM_STANDING_POLICY_ENABLED', 'true')
+    payload = _payload(tmp_path)
+    paid = {
+        'byte_cap_bytes': cycle.HARD_BYTE_CAP,
+        'request_limit': sum(
+            item['requests'] for item in cycle.DEFAULT_ENTITY_LIMITS.values()
+        ),
+        'retry_limit': cycle.SCOPE_RETRY_LIMIT,
+        'concurrency': 1,
+    }
+    paid.update(paid_override)
+    argv = _standing_args(tmp_path, payload, paid_proxy=paid)
+    args = _parse_args(argv)
+
+    with pytest.raises(
+        cycle.ScopeCycleError, match='caps differ from wrapper limits',
+    ):
+        cycle.run_scope_cycle(
+            args,
+            operation_argv=cycle.approved_operation_argv(argv),
+            subprocess_runner=lambda *a, **kw: pytest.fail('subprocess ran'),
+            manifest_writer=lambda manifest: pytest.fail('manifest persisted'),
+            parent_ledger_writer=lambda ledger: pytest.fail('ledger persisted'),
+        )
+
+
+def test_standing_policy_expired_fails_before_subprocess(tmp_path, monkeypatch):
+    monkeypatch.setenv('TM_STANDING_POLICY_ENABLED', 'true')
+    payload = _payload(tmp_path)
+    now = datetime.now(timezone.utc)
+    argv = _standing_args(
+        tmp_path,
+        payload,
+        approved_at=(now - timedelta(days=2)).isoformat(),
+        expires_at=(now - timedelta(days=1)).isoformat(),
+    )
+    args = _parse_args(argv)
+
+    with pytest.raises(Exception, match='expired'):
+        cycle.run_scope_cycle(
+            args,
+            operation_argv=cycle.approved_operation_argv(argv),
+            subprocess_runner=lambda *a, **kw: pytest.fail('subprocess ran'),
+            manifest_writer=lambda manifest: pytest.fail('manifest persisted'),
+            parent_ledger_writer=lambda ledger: pytest.fail('ledger persisted'),
+        )
+
+
+def test_standing_policy_resume_uses_no_subprocess(tmp_path, monkeypatch):
+    monkeypatch.setenv('TM_STANDING_POLICY_ENABLED', 'true')
+    payload = _payload(tmp_path)
+    argv = _standing_args(tmp_path, payload)
+    args = _parse_args(argv)
+    ticks = itertools.count(start=0, step=1_000_000)
+    first = cycle.run_scope_cycle(
+        args,
+        operation_argv=cycle.approved_operation_argv(argv),
+        subprocess_runner=_fake_subprocess([]),
+        manifest_writer=lambda manifest: None,
+        parent_ledger_writer=lambda ledger: None,
+        monotonic_ns=ticks.__next__,
+    )
+
+    second = cycle.run_scope_cycle(
+        args,
+        operation_argv=cycle.approved_operation_argv(argv),
+        subprocess_runner=lambda *a, **kw: pytest.fail('subprocess ran'),
+        manifest_writer=lambda manifest: pytest.fail('manifest persisted'),
+        parent_ledger_writer=lambda ledger: pytest.fail('ledger persisted'),
+    )
+
+    assert second == first
+
+
+def test_standing_cycle_retry_limit_still_stops_before_paid_io(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv('TM_STANDING_POLICY_ENABLED', 'true')
+    payload = _payload(tmp_path)
+    argv = _standing_args(tmp_path, payload)
+    args = _parse_args(argv)
+    calls = []
+    ticks = itertools.count(start=0, step=1_000_000)
+
+    with pytest.raises(cycle.ScopeCycleError, match='retry limit exhausted'):
+        cycle.run_scope_cycle(
+            args,
+            operation_argv=cycle.approved_operation_argv(argv),
+            subprocess_runner=_fake_subprocess(
+                calls, first_retries=cycle.SCOPE_RETRY_LIMIT,
+            ),
+            manifest_writer=lambda manifest: pytest.fail('manifest persisted'),
+            parent_ledger_writer=lambda ledger: pytest.fail('ledger persisted'),
+            monotonic_ns=ticks.__next__,
+        )
+
+    assert len(calls) == 1
+    assert not Path(payload['result_paths']['scope_manifest']).exists()
+    attempts = json.loads(
+        Path(payload['parent_ledger']['path'] + '.attempts').read_text()
+    )
+    assert attempts['retries'] == cycle.SCOPE_RETRY_LIMIT
+
+
+# ---------------------------------------------------------------------------
+# Budget canon pinning: scope caps vs the parent (daily) aggregate
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    ('flag', 'value', 'message'),
+    [
+        ('--cycle-budget-bytes', cycle.HARD_BYTE_CAP + 1,
+         'scope byte cap must equal'),
+        ('--soft-byte-stop-bytes', cycle.SOFT_BYTE_STOP - 1,
+         'scope soft byte stop must equal'),
+        ('--request-limit', cycle.SCOPE_REQUEST_LIMIT - 1,
+         'scope request/retry limits must equal'),
+        ('--retry-limit', cycle.SCOPE_RETRY_LIMIT + 1,
+         'scope request/retry limits must equal'),
+        ('--parent-byte-budget', cycle.PARENT_BYTE_BUDGET - 1,
+         'parent byte budget must equal'),
+        ('--parent-soft-byte-stop', cycle.PARENT_SOFT_BYTE_STOP + 1,
+         'parent soft byte stop must equal'),
+        ('--parent-request-limit', cycle.PARENT_REQUEST_LIMIT + 1,
+         'parent request/retry limits must equal'),
+        ('--parent-retry-limit', cycle.PARENT_RETRY_LIMIT - 1,
+         'parent request/retry limits must equal'),
+    ],
+)
+def test_any_drifted_paid_cap_is_refused_at_argv_validation(
+    tmp_path, flag, value, message,
+):
+    payload = _payload(tmp_path)
+    argv, _ = _approved_args(tmp_path, payload)
+
+    with pytest.raises(cycle.ScopeCycleError, match=message):
+        _parse_args(argv + [flag, str(value)])
+
+
+def _daily_scope_fixture(tmp_path: Path, index: int, provider_bytes: int):
+    """One committed scope manifest worth ``provider_bytes`` for the parent."""
+
+    identity = SimpleNamespace(
+        parent_cycle_id='scheduled__daily',
+        child_cycle_id=f'tm-child-{index}',
+        scope_id=f'SC{index}__2025',
+        parent_ledger_path=str(tmp_path / 'proxy-ledger.json'),
+    )
+    fields = (
+        'decoded_bytes', 'wire_bytes', 'provider_metered_bytes',
+        'requests', 'retries', 'cache_hits', 'duration_ms',
+    )
+    entities = []
+    for position, entity in enumerate(cycle.EXPECTED_ENTITIES):
+        share = provider_bytes if position == 0 else 0
+        entities.append({
+            'entity': entity,
+            'decoded_bytes': share,
+            'wire_bytes': share,
+            'provider_metered_bytes': share,
+            'requests': 1 if position == 0 else 0,
+            'retries': 0,
+            'cache_hits': 0,
+            'duration_ms': 1 if position == 0 else 0,
+        })
+    totals = {
+        field: sum(int(item[field]) for item in entities) for field in fields
+    }
+    manifest = {
+        'manifest_digest': f'{index:064x}',
+        'entities': entities,
+        'traffic': {'totals': totals},
+    }
+    return identity, manifest
+
+
+def _update_daily_ledger(identity, manifest):
+    return cycle._update_parent_ledger(
+        identity,
+        manifest,
+        hard_cap=cycle.PARENT_BYTE_BUDGET,
+        soft_stop=cycle.PARENT_SOFT_BYTE_STOP,
+        request_limit=cycle.PARENT_REQUEST_LIMIT,
+        retry_limit=cycle.PARENT_RETRY_LIMIT,
+    )
+
+
+def test_parent_daily_ledger_admits_sixteen_full_scopes_and_stops_the_next_byte(
+    tmp_path,
+):
+    # A cold big-league scope costs ~18-21 MiB; sixteen of them at 21 MiB land
+    # exactly on the 336 MiB daily budget and every one must be admitted.
+    per_scope = 21 * cycle.MIB
+    assert 16 * per_scope == cycle.PARENT_BYTE_BUDGET
+    payload = None
+    for index in range(16):
+        identity, manifest = _daily_scope_fixture(tmp_path, index, per_scope)
+        payload = _update_daily_ledger(identity, manifest)
+
+    assert payload['manifest_count'] == 16
+    assert payload['provider_metered_bytes'] == cycle.PARENT_BYTE_BUDGET
+    assert payload['hard_provider_byte_budget'] == cycle.PARENT_BYTE_BUDGET
+    assert payload['soft_provider_byte_stop'] == cycle.PARENT_SOFT_BYTE_STOP
+
+    # One more byte anywhere in the day pierces the parent budget.
+    identity, manifest = _daily_scope_fixture(tmp_path, 16, 1)
+    with pytest.raises(
+        cycle.ScopeCycleError, match='parent provider byte budget exceeded',
+    ):
+        _update_daily_ledger(identity, manifest)
+
+
+def test_scope_above_its_own_cap_fails_even_with_an_empty_parent_ledger(
+    tmp_path,
+):
+    payload = _payload(tmp_path)
+    argv, _ = _approved_args(tmp_path, payload)
+    args = _parse_args(argv)
+
+    def mutate(command, result):
+        # 4 x 7 MiB = 28 MiB provider-metered: over the 24 MiB scope cap while
+        # the parent (daily) ledger is still completely empty.
+        result['provider_metered_bytes'] = 7 * cycle.MIB
+        return result
+
+    with pytest.raises(
+        cycle.ScopeCycleError, match='scope provider traffic exceeds',
+    ):
+        cycle.run_scope_cycle(
+            args,
+            operation_argv=cycle.approved_operation_argv(argv),
+            subprocess_runner=_fake_subprocess([], mutate=mutate),
+            manifest_writer=lambda manifest: pytest.fail('manifest persisted'),
+            parent_ledger_writer=lambda ledger: pytest.fail('ledger persisted'),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Daily byte admission before any paid I/O
+# ---------------------------------------------------------------------------
+
+def _write_sibling_scope_ledger(
+    payload: dict, name: str, *, run_key: str,
+    consumed: int = 0, reserved: int = 0,
+):
+    """One runner-side scope file ledger left behind by another scope."""
+
+    ledger_dir = Path(payload['parent_ledger']['path']).parent
+    ledger_dir.mkdir(parents=True, exist_ok=True)
+    events = [{'entity': 'players', 'decoded_response_body_bytes': consumed}]
+    reservations = (
+        [{
+            'reservation_id': 'r-1', 'entity': 'players',
+            'reserved_bytes': reserved, 'status': 'active',
+        }]
+        if reserved else []
+    )
+    (ledger_dir / f'transfermarkt_cycle_{name}.json').write_text(
+        json.dumps({
+            'run_key': run_key,
+            'limit_bytes': cycle.HARD_BYTE_CAP,
+            'events': events,
+            'reservations': reservations,
+        }),
+        encoding='utf-8',
+    )
+
+
+def test_daily_admission_accepts_the_last_scope_the_day_can_hold(tmp_path):
+    payload = _payload(tmp_path)
+    argv, _ = _approved_args(tmp_path, payload)
+    args = _parse_args(argv)
+    for index in range(13):
+        _write_sibling_scope_ledger(
+            payload, f'{index:024x}', run_key=f'other-child-{index}',
+            consumed=24 * cycle.MIB,
+        )
+
+    manifest = cycle.run_scope_cycle(
+        args,
+        operation_argv=cycle.approved_operation_argv(argv),
+        subprocess_runner=_fake_subprocess([]),
+        manifest_writer=lambda manifest: None,
+        parent_ledger_writer=lambda ledger: None,
+        monotonic_ns=itertools.count(start=0, step=1_000_000).__next__,
+    )
+
+    # 312 MiB committed + one full 24 MiB scope cap == exactly the 336 MiB day.
+    assert manifest['status'] == 'complete'
+
+
+def test_daily_admission_refuses_one_byte_past_the_last_full_slot(tmp_path):
+    payload = _payload(tmp_path)
+    argv, _ = _approved_args(tmp_path, payload)
+    args = _parse_args(argv)
+    _write_sibling_scope_ledger(
+        payload, 'a' * 24, run_key='other-child-a',
+        consumed=312 * cycle.MIB + 1,
+    )
+
+    with pytest.raises(
+        cycle.ScopeCycleError, match='cannot admit another scope',
+    ):
+        cycle.run_scope_cycle(
+            args,
+            operation_argv=cycle.approved_operation_argv(argv),
+            subprocess_runner=lambda *a, **kw: pytest.fail('subprocess ran'),
+            manifest_writer=lambda manifest: pytest.fail('manifest persisted'),
+            parent_ledger_writer=lambda ledger: pytest.fail('ledger persisted'),
+        )
+
+
+def test_daily_admission_counts_a_failed_scope_without_a_manifest(tmp_path):
+    # A crashed sibling left only an active reservation (no manifest, no
+    # parent-ledger entry) — its bytes still count against the day.
+    payload = _payload(tmp_path)
+    argv, _ = _approved_args(tmp_path, payload)
+    args = _parse_args(argv)
+    _write_sibling_scope_ledger(
+        payload, 'b' * 24, run_key='crashed-child',
+        consumed=280 * cycle.MIB, reserved=32 * cycle.MIB + 1,
+    )
+
+    with pytest.raises(
+        cycle.ScopeCycleError, match='cannot admit another scope',
+    ):
+        cycle.run_scope_cycle(
+            args,
+            operation_argv=cycle.approved_operation_argv(argv),
+            subprocess_runner=lambda *a, **kw: pytest.fail('subprocess ran'),
+            manifest_writer=lambda manifest: pytest.fail('manifest persisted'),
+            parent_ledger_writer=lambda ledger: pytest.fail('ledger persisted'),
+        )
+
+
+def test_daily_admission_ignores_this_scopes_own_resumed_ledger(tmp_path):
+    # The current scope's own earlier attempt is bounded by its own file
+    # ledger; the gate adds a full scope cap for it instead of double-counting.
+    payload = _payload(tmp_path)
+    argv, _ = _approved_args(tmp_path, payload)
+    args = _parse_args(argv)
+    _write_sibling_scope_ledger(
+        payload, 'c' * 24, run_key=payload['child_cycle_id'],
+        consumed=61 * cycle.MIB,
+    )
+    _write_sibling_scope_ledger(
+        payload, 'd' * 24, run_key='other-child-d',
+        consumed=312 * cycle.MIB,
+    )
+
+    manifest = cycle.run_scope_cycle(
+        args,
+        operation_argv=cycle.approved_operation_argv(argv),
+        subprocess_runner=_fake_subprocess([]),
+        manifest_writer=lambda manifest: None,
+        parent_ledger_writer=lambda ledger: None,
+        monotonic_ns=itertools.count(start=0, step=1_000_000).__next__,
+    )
+
+    assert manifest['status'] == 'complete'
+
+
+def test_career_entities_get_the_canon_timeout(tmp_path):
+    payload = _payload(tmp_path)
+    argv, _ = _approved_args(tmp_path, payload)
+    args = _parse_args(argv)
+    calls = []
+
+    cycle.run_scope_cycle(
+        args,
+        operation_argv=cycle.approved_operation_argv(argv),
+        subprocess_runner=_fake_subprocess(calls),
+        manifest_writer=lambda manifest: None,
+        parent_ledger_writer=lambda ledger: None,
+        monotonic_ns=itertools.count(start=0, step=1_000_000).__next__,
+    )
+
+    timeouts = {
+        command[command.index('--entity') + 1]: options['timeout']
+        for command, options in calls
+    }
+    assert timeouts == {
+        'players': 3600,
+        'market_value_history': cycle.CAREER_ENTITY_TIMEOUT_SECONDS,
+        'transfers': cycle.CAREER_ENTITY_TIMEOUT_SECONDS,
+        'coaches': 3600,
+    }
+    assert cycle.CAREER_ENTITY_TIMEOUT_SECONDS == 5_400
+
+
+# ---------------------------------------------------------------------------
+# Grant cross-checks in _traffic_metrics
+# ---------------------------------------------------------------------------
+
+def _grant_metrics_run(
+    *, grant, hard, soft, provider_bytes=1,
+) -> cycle.EntityRun:
+    result = {
+        'traffic': {
+            'telemetry_available': True,
+            'hard_provider_byte_budget': hard,
+            'soft_provider_byte_stop': soft,
+        },
+        'provider_metering_available': True,
+        'decoded_response_body_bytes': 1,
+        'wire_response_bytes': 1,
+        'provider_metered_bytes': provider_bytes,
+        'network_fetches': 1,
+        'retries': 0,
+        'cache_hits': 0,
+    }
+    if grant is not None:
+        result['provider_byte_grant'] = grant
+    return cycle.EntityRun(
+        parser_entity='players',
+        result_path='ignored',
+        result_sha256='0' * 64,
+        result=result,
+        wall_clock_duration_ms=1,
+        resumed=False,
+    )
+
+
+@pytest.mark.parametrize(
+    ('run_kwargs', 'message'),
+    [
+        # Client ledger above the pinned scope cap.
+        (dict(grant=cycle.HARD_BYTE_CAP + 1, hard=cycle.HARD_BYTE_CAP + 1,
+              soft=cycle.SOFT_BYTE_STOP), 'hard provider cap drift'),
+        # Ledger does not equal min(grant, scope cap).
+        (dict(grant=10 * cycle.MIB, hard=cycle.HARD_BYTE_CAP,
+              soft=cycle.SOFT_BYTE_STOP), 'hard provider cap drift'),
+        # Degenerate soft stop.
+        (dict(grant=10 * cycle.MIB, hard=10 * cycle.MIB,
+              soft=10 * cycle.MIB), 'soft provider stop drift'),
+        # No grant evidence at all.
+        (dict(grant=None, hard=cycle.HARD_BYTE_CAP,
+              soft=cycle.SOFT_BYTE_STOP), 'grant evidence is absent'),
+        # The ledger was pierced.
+        (dict(grant=10 * cycle.MIB, hard=10 * cycle.MIB,
+              soft=9 * cycle.MIB, provider_bytes=10 * cycle.MIB + 1),
+         'exceeds its grant ledger'),
+    ],
+)
+def test_traffic_metrics_rejects_grant_boundary_violations(
+    run_kwargs, message,
+):
+    run = _grant_metrics_run(**run_kwargs)
+
+    with pytest.raises(cycle.ScopeCycleError, match=message):
+        cycle._traffic_metrics(run, hard_cap=cycle.HARD_BYTE_CAP)
+
+
+def test_traffic_metrics_accepts_a_partial_grant_ledger():
+    run = _grant_metrics_run(
+        grant=10 * cycle.MIB, hard=10 * cycle.MIB, soft=9 * cycle.MIB,
+        provider_bytes=10 * cycle.MIB,
+    )
+
+    metrics = cycle._traffic_metrics(run, hard_cap=cycle.HARD_BYTE_CAP)
+
+    assert metrics['provider_metered_bytes'] == 10 * cycle.MIB
+
+
+# ---------------------------------------------------------------------------
+# Sibling scope-ledger contract (cross-process, so pinned explicitly)
+# ---------------------------------------------------------------------------
+
+def test_sibling_scope_ledger_contract_is_pinned(tmp_path):
+    payload = _payload(tmp_path)
+    identity = cycle._scope_identity(_parse_args(_approved_args(tmp_path, payload)[0]))
+    ledger_dir = Path(payload['parent_ledger']['path']).parent
+    ledger_dir.mkdir(parents=True, exist_ok=True)
+
+    # The runner writes exactly this shape, under exactly this name, into
+    # exactly this directory (its TM_CYCLE_BUDGET_DIR is the parent ledger's
+    # own directory — see _runner_environment).
+    from dags.scripts import run_transfermarkt_scraper as runner
+
+    assert runner._cycle_budget_path(
+        'other-child', root_override=str(ledger_dir),
+    ) == str(
+        ledger_dir
+        / f'transfermarkt_cycle_'
+          f'{hashlib.sha256(b"other-child").hexdigest()[:24]}.json'
+    )
+
+    (ledger_dir / 'transfermarkt_cycle_deadbeef.json').write_text(
+        json.dumps({
+            'run_key': 'other-child',
+            'limit_bytes': cycle.HARD_BYTE_CAP,
+            'events': [
+                {'entity': 'players', 'decoded_response_body_bytes': 7},
+                {'entity': 'transfers', 'decoded_response_body_bytes': 3},
+            ],
+            'reservations': [
+                {'reservation_id': 'a', 'reserved_bytes': 11, 'status': 'active'},
+                {'reservation_id': 'b', 'reserved_bytes': 99, 'status': 'settled'},
+            ],
+        }),
+        encoding='utf-8',
+    )
+    # Settled events + still-active reservations; settled reservations are
+    # already represented by their event.
+    assert cycle._sibling_scope_ledger_bytes(identity) == 7 + 3 + 11
+
+    # A file that does not match the runner's name is not a scope ledger.
+    (ledger_dir / 'unrelated.json').write_text('{"events": [{"a": 1}]}')
+    assert cycle._sibling_scope_ledger_bytes(identity) == 21
+
+
+@pytest.mark.parametrize('body', ['{not json', '[]'])
+def test_unreadable_sibling_scope_ledger_refuses_paid_io(tmp_path, body):
+    payload = _payload(tmp_path)
+    argv, _ = _approved_args(tmp_path, payload)
+    args = _parse_args(argv)
+    ledger_dir = Path(payload['parent_ledger']['path']).parent
+    ledger_dir.mkdir(parents=True, exist_ok=True)
+    (ledger_dir / 'transfermarkt_cycle_broken.json').write_text(
+        body, encoding='utf-8',
+    )
+
+    with pytest.raises(cycle.ScopeCycleError, match='sibling scope ledger'):
+        cycle.run_scope_cycle(
+            args,
+            operation_argv=cycle.approved_operation_argv(argv),
+            subprocess_runner=lambda *a, **kw: pytest.fail('subprocess ran'),
+            manifest_writer=lambda manifest: pytest.fail('manifest persisted'),
+            parent_ledger_writer=lambda ledger: pytest.fail('ledger persisted'),
+        )
+
+
+def test_the_scope_task_timeout_covers_every_entity_timeout(tmp_path):
+    from scrapers.transfermarkt import models
+
+    payload = _payload(tmp_path)
+    argv, _ = _approved_args(tmp_path, payload)
+    args = _parse_args(argv)
+    worst_case = sum(
+        cycle._entity_timeout_seconds(args, entity)
+        for entity in cycle.ENTITY_ORDER
+    )
+
+    assert worst_case == 18_000
+    assert worst_case <= models.SCOPE_WALL_CLOCK_TIMEOUT_SECONDS == 18_900
+    # A caller may only shorten a small entity's timeout, never lengthen it.
+    with pytest.raises(cycle.ScopeCycleError, match='entity timeout cannot exceed'):
+        _parse_args(argv + ['--entity-timeout-seconds', '3601'])

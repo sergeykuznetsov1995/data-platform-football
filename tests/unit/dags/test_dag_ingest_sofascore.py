@@ -216,6 +216,17 @@ class TestValidateDataIncrementalNoop:
     the capture row-floors must not WARN; schedule/table freshness still runs.
     A genuinely-low non-noop run still WARNs (incl. the new venue floor)."""
 
+    @pytest.fixture
+    def dag_module(self, monkeypatch, real_medallion_config_dir):
+        # These cases assert #842 no-op semantics, not the shipped registry's
+        # composition (that invariant lives in TestRegistryActivation). The row
+        # counts below are EPL-shaped while the club floors are summed over
+        # CLUB_LEAGUES, so reading the production registry made them silently
+        # depend on how many leagues happen to be enabled. Pin a synthetic
+        # single-club + single-tournament scope instead.
+        _patch_active_catalog(monkeypatch, ("ENG-Premier League", "INT-World Cup"))
+        return _reload_dag_module()
+
     SCHEDULE_OK = {
         "schedule_rows": 381,
         "league_table_rows": 20,
@@ -363,6 +374,17 @@ class TestValidateDataTournamentLegs:
     competitions.yaml and must equal the historical literals for
     CLUB_LEAGUES == ['ENG-Premier League']."""
 
+    @pytest.fixture
+    def dag_module(self, monkeypatch, real_medallion_config_dir):
+        # Leg-observation semantics and the floor-derivation anchor below are
+        # registry-independent: they need *a* club + *a* tournament, not the
+        # shipped set. Pin the historical EPL/World-Cup scope so the legacy
+        # floor literals stay a real calibration anchor (a summed multi-club
+        # scope would only re-state what _scale() computes) and so the leg
+        # fixtures keep covering exactly the legs this class stubs out.
+        _patch_active_catalog(monkeypatch, ("ENG-Premier League", "INT-World Cup"))
+        return _reload_dag_module()
+
     SCHEDULE_OK = {
         "schedule_rows": 381,
         "league_table_rows": 20,
@@ -402,8 +424,8 @@ class TestValidateDataTournamentLegs:
 
     def test_club_floors_equal_legacy_literals(self, dag_module):
         # The pre-#920-Phase-2 inline literals, now derived — exact match for
-        # the current single-club scope (no silent recalibration).
-        assert dag_module._summed_club_floors() == {
+        # the primary club league (no silent recalibration).
+        assert dag_module._competition_floors("ENG-Premier League") == {
             "schedule_rows": 100,
             "league_table_rows": 10,
             "player_ratings_rows": 300,
@@ -866,11 +888,31 @@ class TestRegistryActivation:
     """Discovery is broad; only explicit registry activation shapes the DAG."""
 
     def test_bootstrap_scope_preserves_epl_and_world_cup(self, dag_module):
+        # This reads the SHIPPED registry on purpose: it is the invariant "the
+        # DAG's paid scope is exactly what we approved and enabled". #951 wave 1
+        # activated the four remaining top-5 leagues on top of the bootstrap
+        # pair, so the expected set is now SofaScore ids {8,16,17,23,34,35}.
+        # Any further activation must land here as a deliberate registry edit,
+        # never as a side effect of discovery.
         assert set(dag_module.SOFASCORE_LEAGUES) == {
-            "ENG-Premier League",
-            "INT-World Cup",
+            "ENG-Premier League",  # 17 (bootstrap)
+            "INT-World Cup",  # 16 (bootstrap)
+            "ESP-La Liga",  # 8
+            "ITA-Serie A",  # 23
+            "FRA-Ligue 1",  # 34
+            "GER-Bundesliga",  # 35
+            "RUS-Premier League",  # 203 (#951+, решение владельца 2026-07-16)
         }
-        assert dag_module.CLUB_LEAGUES == ["ENG-Premier League"]
+        # EPL stays the primary club (legacy task ids / result paths); the rest
+        # follow the registry's canonical-id sort order.
+        assert dag_module.CLUB_LEAGUES == [
+            "ENG-Premier League",
+            "ESP-La Liga",
+            "FRA-Ligue 1",
+            "GER-Bundesliga",
+            "ITA-Serie A",
+            "RUS-Premier League",
+        ]
         assert dag_module.TOURNAMENT_LEAGUES == ["INT-World Cup"]
 
     @pytest.mark.parametrize(
@@ -878,8 +920,6 @@ class TestRegistryActivation:
         [
             "scrape_sofascore_data_uefa_champions_league",
             "scrape_match_capture_uefa_champions_league",
-            "scrape_sofascore_data_rus_premier_league",
-            "scrape_match_capture_rus_premier_league",
             "scrape_sofascore_data_int_africa_cup_of_nations",
             "scrape_match_capture_int_africa_cup_of_nations",
         ],
@@ -973,6 +1013,65 @@ class TestRegistryActivation:
         monkeypatch.setattr(module, "_load_result", load)
         with pytest.raises(Exception, match="ESP-La Liga: schedule result file"):
             module.validate_data()
+
+    def test_primary_floors_do_not_scale_with_the_club_scope(
+        self,
+        monkeypatch,
+        real_medallion_config_dir,
+    ):
+        # #951 wave 1: the primary result file holds PRIMARY_CLUB_LEAGUE alone
+        # (the scrape task runs with --league PRIMARY_CLUB_LEAGUE), so its
+        # floors must stay per-competition. Summing them across CLUB_LEAGUES
+        # made every healthy EPL run WARN once the other four clubs went live,
+        # which silently retires the schedule/league_table DQ signal.
+        _patch_active_catalog(
+            monkeypatch,
+            (
+                "ENG-Premier League",
+                "ESP-La Liga",
+                "ITA-Serie A",
+                "FRA-Ligue 1",
+                "GER-Bundesliga",
+                "INT-World Cup",
+            ),
+        )
+        module = _reload_dag_module()
+        assert len(module.CLUB_LEAGUES) == 5
+        healthy_schedule = {
+            "schedule_rows": 381,
+            "league_table_rows": 20,
+            "tables": [],
+            "errors": [],
+        }
+        healthy_capture = {
+            "rows": 300,
+            "shotmap_rows": 300,
+            "eps_rows": 10_000,
+            "match_stats_rows": 10_000,
+            "venue_rows": 300,
+            "fallback": False,
+            "errors": [],
+            "tables": [],
+        }
+
+        def load(path, logger):
+            if path == module.SCHEDULE_RESULT_PATH:
+                return dict(healthy_schedule)
+            if path == module.MATCH_CAPTURE_RESULT_PATH:
+                return dict(healthy_capture)
+            if "int_world_cup" in path:
+                return {"skipped": "out_of_window", "errors": [], "tables": []}
+            if "match_capture_result_" in path:
+                return dict(healthy_capture)
+            return dict(healthy_schedule)
+
+        monkeypatch.setattr(module, "_load_result", load)
+        result = module.validate_data()
+        assert not [
+            warning
+            for warning in result["warnings"]
+            if "schedule row count" in warning or "league_table row count" in warning
+        ]
 
     def test_empty_active_scope_fails_closed(self, monkeypatch):
         _patch_active_catalog(monkeypatch, ())

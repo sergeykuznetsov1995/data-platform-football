@@ -395,6 +395,25 @@ competitions:
     in_scope: true
     notes: "E8b spine-минимум: clubelo не заскрейплен для этой лиги (нет fct_team_elo)"
 
+  - id: "RUS-Premier League"
+    name: "Russian Premier League"
+    country: "Russia"
+    tier: 1
+    seasons:
+      # #951 волна 1+: РПЛ собирается только SofaScore'ом; даты — календарь
+      # источника (спайна fbref нет и не будет), уточняются при первом сборе.
+      - id: 2526
+        format: "league_round_robin"
+        team_count: 16
+        start: "2025-07-18"
+        end: "2026-05-24"
+    sources:
+      primary: []
+      fallback:
+        - "sofascore"
+    in_scope: false
+    notes: "#951: onboarded for SofaScore Bronze capture; not in Gold spine (in_scope=false, не сдвигает спайн-окно xref DQ)"
+
   - id: "NED-Eredivisie"
     name: "Dutch Eredivisie"
     country: "Netherlands"

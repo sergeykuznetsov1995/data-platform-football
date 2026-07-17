@@ -148,7 +148,7 @@ PROTECTED_SERVICE_BUILDS = {
     ),
 }
 PROTECTED_STAGE_RECIPE_SHA256 = {
-    "airflow-scheduler": "71822c3353b59574a8b653495f7749a100ce5d3b8c716d150a1e0cce42544152",
+    "airflow-scheduler": "ad3ff5158cd07fc30052973290ca31d8f75a937016a90df8d7d81cd8fedb4a01",
     "flaresolverr": "e4e28b69572d38f4f877154e6bc7a6f8fae0906edb624b62860fff53d0bcab20",
     "flaresolverr_whoscored_paid": "e4e28b69572d38f4f877154e6bc7a6f8fae0906edb624b62860fff53d0bcab20",
     "whoscored_paid_gateway": "c5c5b80f5b28431c0ecdc133a909268f3db2340993473ff700599eb1cce4d5fa",

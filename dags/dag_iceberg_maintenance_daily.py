@@ -90,6 +90,12 @@ def _maintain_other_high_churn(**_ctx) -> Dict[str, Any]:
     return _fail_on_partial_maintenance(result, group="other high-churn feeds")
 
 
+def _maintain_fbref_stages(**_ctx) -> Dict[str, Any]:
+    from utils.maintenance_tasks import maintain_fbref_generic_stages
+
+    return maintain_fbref_generic_stages()
+
+
 with DAG(
     dag_id="dag_iceberg_maintenance_daily",
     default_args=SILVER_ARGS,
@@ -105,6 +111,9 @@ with DAG(
     cleanup_whoscored_dq_stage = PythonOperator(
         task_id="cleanup_whoscored_dq_stage_partitions",
         python_callable=_cleanup_whoscored_dq_stage,
+        # Retained FBref stages need attention, but must not suppress this
+        # unrelated cleanup wave.
+        trigger_rule="all_done",
     )
 
     maintain_whoscored = PythonOperator(
@@ -112,9 +121,19 @@ with DAG(
         python_callable=_maintain_whoscored,
     )
 
-    PythonOperator(
+    maintain_other_high_churn = PythonOperator(
         task_id="maintain_other_high_churn_bronze",
         python_callable=_maintain_other_high_churn,
+        # A retained FBref stage needs attention, but must not suppress
+        # unrelated snapshot/orphan maintenance.
+        trigger_rule="all_done",
     )
 
+    fbref_stage_janitor = PythonOperator(
+        task_id="janitor_fbref_generic_stages",
+        python_callable=_maintain_fbref_stages,
+    )
+
+    fbref_stage_janitor >> cleanup_whoscored_dq_stage
+    fbref_stage_janitor >> maintain_other_high_churn
     cleanup_whoscored_dq_stage >> maintain_whoscored

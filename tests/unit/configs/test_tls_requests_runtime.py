@@ -49,6 +49,15 @@ def test_tls_wrapper_and_native_library_are_pinned_in_the_image():
     ]
     assert len(chardet_locks) == 1
     assert "--hash=sha256:" in chardet_locks[0]
+    boto3_locks = [
+        line
+        for line in core_requirements.splitlines()
+        if line.startswith("boto3==1.42.61 ")
+    ]
+    assert boto3_locks == [
+        "boto3==1.42.61 "
+        "--hash=sha256:156efcc298a33206be6dfd220815c64aa8b09424017534cabe717636961fc306"
+    ]
     assert "AS airflow-base" in dockerfile
     assert "FROM airflow-base AS airflow-scheduler" in dockerfile
     assert "apache/airflow:2.11.2-python3.11@sha256:" in dockerfile
@@ -140,6 +149,34 @@ def test_fresh_and_existing_soccerdata_volumes_are_owned_before_airflow_starts()
     assert "soccerdata_cache:/home/airflow/soccerdata" in log_init
     assert "chown -R --no-dereference 50000:0 /home/airflow/soccerdata" in log_init
     assert "chmod -R u+rwX,g+rwX,o-rwx /home/airflow/soccerdata" in log_init
+
+
+@pytest.mark.unit
+def test_fbref_browser_is_checksum_pinned_and_isolated_from_sofascore():
+    from scrapers.fbref import browser_runtime
+
+    dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+    version = browser_runtime.CAMOUFOX_BROWSER_VERSION
+    release = browser_runtime.CAMOUFOX_BROWSER_RELEASE
+    install_dir = str(browser_runtime.INSTALL_DIR)
+    sha256 = (
+        "a03872a221ab766f58d04fdaf0d7f3431c2662d5086844c67d2fc01154ebc1f8"
+    )
+
+    assert f"FBREF_CAMOUFOX_VERSION={version}" in dockerfile
+    assert f"FBREF_CAMOUFOX_RELEASE={release}" in dockerfile
+    assert f"FBREF_CAMOUFOX_SHA256={sha256}" in dockerfile
+    assert "releases/download/v${FBREF_CAMOUFOX_VERSION}-" in dockerfile
+    assert 'echo "${FBREF_CAMOUFOX_SHA256}  /tmp/' in dockerfile
+    assert 'stat -c %s /tmp/fbref-camoufox.zip)" -eq 663773735' in dockerfile
+    assert f"test -x {install_dir}/camoufox-bin" in dockerfile
+    assert "/home/airflow/.cache/camoufox" in dockerfile
+    assert "/opt/legacy-scraper-venv/bin/python -I -c" in dockerfile
+    assert "download_mmdb" not in dockerfile
+    assert "maybe_download_addons" not in dockerfile
+    assert "python -m camoufox fetch" not in dockerfile
+    assert "exclude_addons=list(DefaultAddons)" in dockerfile
+    assert "browser.new_page().evaluate('navigator.userAgent')" in dockerfile
 
 
 @pytest.mark.unit

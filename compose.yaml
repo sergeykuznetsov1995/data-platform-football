@@ -45,18 +45,28 @@ x-airflow-common: &airflow-common
     S3_ENDPOINT: seaweedfs:8333
     S3_SCHEME: http
     FBREF_RAW_STORE_URI: s3://${ICEBERG_WAREHOUSE}/raw/fbref
+    # Production maintenance must delete only fenced, proven-stale FBref
+    # staging tables; audit mode is reserved for explicit diagnostics.
+    FBREF_STAGE_JANITOR_MODE: ${FBREF_STAGE_JANITOR_MODE:-apply}
     SOFASCORE_RAW_STORE_URI: s3://${ICEBERG_WAREHOUSE}/raw/sofascore
     SOFASCORE_MANIFEST_BACKEND: trino
     SOFASCORE_PROXY_BUDGET_ARTIFACT: /opt/airflow/configs/sofascore/proxy_budget_canary.json
     SOFASCORE_PROXY_BUDGET_LEDGER: /opt/airflow/logs/sofascore/proxy-budget-ledger.json
     SOFASCORE_WORKLOAD_PLAN_DIR: /opt/airflow/logs/sofascore/workload-plans
-    SOFASCORE_PROXY_CONTROL_URL: ${SOFASCORE_PROXY_CONTROL_URL:-http://proxy_filter:8899}
+    # #951: прод-сбор идёт через выделенный шлюз sofascore_proxy_filter, а не
+    # общий proxy_filter (свой метринг/леджер, свой пул рестартом одного шлюза).
+    SOFASCORE_PROXY_CONTROL_URL: ${SOFASCORE_PROXY_CONTROL_URL:-http://sofascore_proxy_filter:8899}
     SOFASCORE_PROXY_CONTROL_TOKEN: ${SOFASCORE_PROXY_CONTROL_TOKEN:-}
     # Shared authenticated lease control plane for signed/approved sources.
-    # Transfermarkt deliberately uses a separate token and is disabled by
-    # default because its requests do not carry a signed workload plan.
     PROXY_FILTER_CONTROL_TOKEN: ${PROXY_FILTER_CONTROL_TOKEN:-${SOFASCORE_PROXY_CONTROL_TOKEN:-}}
     SOFASCORE_PROXY_LEASE_TTL_SECONDS: ${SOFASCORE_PROXY_LEASE_TTL_SECONDS:-3600}
+    # FBref has a dedicated meter and dedicated residential pool.  The worker
+    # receives only a short-lived lease token, never an upstream credential.
+    FBREF_PROXY_CONTROL_URL: ${FBREF_PROXY_CONTROL_URL:-http://fbref_proxy_filter:8899}
+    FBREF_PROXY_CONTROL_TOKEN: ${SOFASCORE_PROXY_CONTROL_TOKEN:-}
+    FBREF_PROXY_LEASE_TTL_SECONDS: ${FBREF_PROXY_LEASE_TTL_SECONDS:-7200}
+    SOFASCORE_PLAYER_ROTATION_MODULUS: ${SOFASCORE_PLAYER_ROTATION_MODULUS:-4}
+    SOFASCORE_PLAYER_ROTATION_MIN_LEAGUES: ${SOFASCORE_PLAYER_ROTATION_MIN_LEAGUES:-10}
     PROXY_FILTER_SOFASCORE_CANARY_HARD_CAP_BYTES: ${PROXY_FILTER_SOFASCORE_CANARY_HARD_CAP_BYTES:-0}
     WHOSCORED_RAW_STORE_URI: s3://${ICEBERG_WAREHOUSE}/raw/whoscored
     WHOSCORED_OPS_STORE_URI: s3://${ICEBERG_WAREHOUSE}/ops/whoscored
@@ -138,7 +148,13 @@ x-airflow-common: &airflow-common
     # Transfermarkt stays disabled and cannot acquire an unmanaged proxy until
     # an operator supplies the separately approved paid/write packet.
     TM_NATIVE_V2_ENABLED: ${TM_NATIVE_V2_ENABLED:-false}
+    # Second activation key: scheduled runs accept the standing approval
+    # policies only when this is true (see dags/configs/transfermarkt/).
+    TM_STANDING_POLICY_ENABLED: ${TM_STANDING_POLICY_ENABLED:-false}
     TM_PROXY_CONTROL_URL: ${TM_PROXY_CONTROL_URL:-}
+    # A dedicated source token wins. The nested fallback preserves the existing
+    # production Transfermarkt control plane during credential migration.
+    TM_PROXY_CONTROL_TOKEN: ${TM_PROXY_CONTROL_TOKEN:-${PROXY_FILTER_CONTROL_TOKEN:-${SOFASCORE_PROXY_CONTROL_TOKEN:-}}}
     TM_REQUIRE_METERED_PROXY: ${TM_REQUIRE_METERED_PROXY:-false}
     TM_PROXY_LEASE_TTL_SECONDS: ${TM_PROXY_LEASE_TTL_SECONDS:-3600}
     FBREF_RAW_S3_ENDPOINT: seaweedfs:8333
@@ -175,10 +191,14 @@ x-airflow-common: &airflow-common
     # Airflow: discovery writes the host-side versioned registry, never a
     # scheduler/worker checkout at runtime.
     - ./configs/sofascore:/opt/airflow/configs/sofascore:ro
+    # Shared paid-canary runtime fingerprint input. Airflow only reads it.
+    - ./configs/proxy_filter:/opt/airflow/configs/proxy_filter:ro
     # SSO-конфиг: читает только webserver, scheduler игнорирует (фаза 6)
     - ./configs/airflow/webserver_config.py:/opt/airflow/webserver_config.py:ro
     - ./scrapers:/opt/airflow/scrapers:ro
     - ./scripts:/opt/airflow/scripts:ro
+    # Compatibility for non-FBref DAGs that still use the shared proxy pool.
+    # The FBref runner does not receive this path and only uses its lease API.
     - ./proxys.txt:/opt/airflow/proxys.txt:ro
     # Tier-2 dbt pilot: dbt project rendered/run by Cosmos (dag_dbt_fbref_silver).
     # rw so `dbt deps`/`dbt` can write dbt_packages/ + target/ (both gitignored).
@@ -1414,6 +1434,85 @@ services:
       - whoscored-paid-browser
 
   # ===========================================================================
+  # fbref_proxy_filter - isolated, byte-metered residential path for FBref.
+  # It is the only process that reads the dedicated proxy pool.  Airflow gets
+  # an authenticated lease URL whose hard byte caps are enforced before each
+  # provider read/write, including Camoufox bootstrap and redirects.
+  # ===========================================================================
+  fbref_proxy_filter:
+    build:
+      context: ./docker/images/airflow
+      dockerfile: Dockerfile
+    container_name: fbref_proxy_filter
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    environment:
+      PYTHONPATH: /opt/airflow
+      PROXY_FILTER_CONTROL_TOKEN: ${SOFASCORE_PROXY_CONTROL_TOKEN:-}
+      # Deliberately separate from the shared paid pool below.
+      PROXY_POOL_JSON: ""
+      PROXY_FILTER_ALLOW_FILE_FALLBACK: "true"
+    command:
+      - python
+      - /opt/airflow/scripts/proxy_filter/filter_proxy.py
+      - --listen
+      - 0.0.0.0:8899
+      - --lease-listen
+      - 0.0.0.0:8900
+      - --lease-proxy-url
+      - http://fbref_proxy_filter:8900
+      - --proxy-file
+      - /opt/airflow/proxys.txt
+      - --allow-proxy-file-fallback
+      - --blocklist
+      - /opt/airflow/configs/proxy_filter/blocklist.txt
+      - --out
+      - /opt/airflow/logs/fbref/proxy_filter/bytes.json
+      - --daily-budget-mb
+      - ${FBREF_PROXY_DAILY_BUDGET_MB:-300}
+      - --max-lease-mb
+      - ${FBREF_PROXY_MAX_LEASE_MB:-100}
+      - --max-lease-ttl-seconds
+      - ${FBREF_PROXY_MAX_LEASE_TTL_SECONDS:-7200}
+      - --dagrun-budget-bytes
+      - ${FBREF_PROXY_DAGRUN_BUDGET_BYTES:-104857600}
+      - --url-budget-bytes
+      - ${FBREF_PROXY_URL_BUDGET_BYTES:-104857600}
+      - --max-active-leases
+      - "1"
+      - --ledger
+      - /opt/airflow/logs/fbref/proxy_filter/paid_requests.jsonl
+      - --sofascore-allocation-ledger
+      - /opt/airflow/logs/fbref/proxy_filter/unused_sofascore_allocations.json
+      - --sofascore-allocation-wal
+      - /opt/airflow/logs/fbref/proxy_filter/unused_sofascore_claims.jsonl
+      - --sofascore-parent-envelope
+      - /opt/airflow/logs/fbref/proxy_filter/unused_sofascore_envelopes.json
+    volumes:
+      - ./scripts:/opt/airflow/scripts:ro
+      - ./scrapers:/opt/airflow/scrapers:ro
+      - ./configs/proxy_filter:/opt/airflow/configs/proxy_filter:ro
+      - ./proxys.txt:/opt/airflow/proxys.txt:ro
+      - ./logs:/opt/airflow/logs
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://localhost:8899/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 64M
+    networks:
+      - backend
+
+  # ===========================================================================
   # proxy_filter - ad-tech filtering proxy between FlareSolverr and the
   # residential pool (#652). Cuts billable residential traffic by refusing
   # ad-tech CONNECT hosts (no MITM — preserves Chrome's TLS fingerprint).
@@ -1434,9 +1533,9 @@ services:
       - ALL
     environment:
       PROXY_FILTER_CONTROL_TOKEN: ${PROXY_FILTER_CONTROL_TOKEN:-${SOFASCORE_PROXY_CONTROL_TOKEN:-}}
-      # Separate source credential: the common Airflow token cannot impersonate
-      # a Transfermarkt DAG. Its paid cap is zero unless explicitly enabled.
-      TM_PROXY_CONTROL_TOKEN: ${TM_PROXY_CONTROL_TOKEN:-}
+      # Prefer a source credential, but keep the current production shared token
+      # usable until the ordinary proxy and scheduler rotate together.
+      TM_PROXY_CONTROL_TOKEN: ${TM_PROXY_CONTROL_TOKEN:-${PROXY_FILTER_CONTROL_TOKEN:-${SOFASCORE_PROXY_CONTROL_TOKEN:-}}}
       WHOSCORED_PROXY_CAMPAIGN_LEDGER_PATH: ${WHOSCORED_PROXY_CAMPAIGN_LEDGER_PATH:-/opt/airflow/logs/proxy_filter/whoscored_campaigns.json}
       # Secret JSON is injected at runtime. The service fails closed when it is
       # blank; the legacy file is intentionally not mounted into this container.
@@ -1753,6 +1852,104 @@ services:
       - whoscored-paid-api
       - whoscored-paid-browser
       - whoscored-paid-direct-egress
+
+  # ---------------------------------------------------------------------------
+  # sofascore_proxy_filter: выделенный платный шлюз SofaScore (#951).
+  #
+  # Отдельный от общего proxy_filter, чтобы прод-сбор SofaScore не делил один
+  # метринг/леджер с TM/whoscored/discovery и чтобы владелец мог подключить
+  # купленный под источник пул (PROXY_POOL_JSON) рестартом ТОЛЬКО этого шлюза,
+  # не трогая остальные и не сбивая runtime fingerprint (пул в него не входит).
+  #
+  # hard-cap-bytes=0 => это ПРОДАКШН-подписант (>0 был бы эксперимент-канарейка,
+  # которая никогда не авторизует прод). Верифицированный артефакт бюджета
+  # монтируется по SOFASCORE_PROXY_BUDGET_ARTIFACT (в деплое — стабильный
+  # runtime-путь вне чекаута, чтобы git pull / ротация релиза его не затирали).
+  # Ledger/WAL на персистентном logs-руте — переживают пересоздание контейнера.
+  sofascore_proxy_filter:
+    build:
+      context: ./docker/images/airflow
+      dockerfile: Dockerfile
+    container_name: sofascore_proxy_filter
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    environment:
+      PYTHONPATH: /opt/airflow
+      PROXY_FILTER_CONTROL_TOKEN: ${SOFASCORE_PROXY_CONTROL_TOKEN:-}
+      # Купленный под SofaScore пул подставляется сюда; пусто => fail-closed на
+      # платный путь, разрешён только --proxy-file fallback ниже.
+      PROXY_POOL_JSON: ${SOFASCORE_PROXY_POOL_JSON:-}
+      PROXY_FILTER_ALLOW_FILE_FALLBACK: "true"
+    command:
+      - python
+      - /opt/airflow/scripts/proxy_filter/filter_proxy.py
+      - --listen
+      - 0.0.0.0:8899
+      - --lease-listen
+      - 0.0.0.0:8900
+      - --lease-proxy-url
+      - http://sofascore_proxy_filter:8900
+      - --proxy-file
+      - /opt/airflow/proxys.txt
+      - --allow-proxy-file-fallback
+      - --blocklist
+      - /opt/airflow/configs/proxy_filter/blocklist.txt
+      - --out
+      - /opt/airflow/logs/sofascore_proxy_filter/bytes.json
+      - --daily-budget-mb
+      - ${SOFASCORE_PROXY_DAILY_BUDGET_MB:-300}
+      - --max-lease-mb
+      - ${SOFASCORE_PROXY_MAX_LEASE_MB:-46}
+      - --max-lease-ttl-seconds
+      - ${SOFASCORE_PROXY_MAX_LEASE_TTL_SECONDS:-3600}
+      - --dagrun-budget-bytes
+      - ${SOFASCORE_PROXY_DAGRUN_BUDGET_BYTES:-8000000}
+      - --url-budget-bytes
+      - ${SOFASCORE_PROXY_URL_BUDGET_BYTES:-2000000}
+      # SofaScore = один активный лиз за раз (сериализация источника).
+      - --max-active-leases
+      - "1"
+      - --sofascore-budget-artifact
+      - ${SOFASCORE_PROXY_BUDGET_ARTIFACT:-/opt/airflow/configs/sofascore/proxy_budget_canary.json}
+      # 0 = боевой подписант (не эксперимент-канарейка).
+      - --sofascore-canary-hard-cap-bytes
+      - "0"
+      - --sofascore-discovery-dagrun-budget-bytes
+      - ${PROXY_FILTER_SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES:-0}
+      - --ledger
+      - /opt/airflow/logs/sofascore_proxy_filter/paid_requests.jsonl
+      - --sofascore-allocation-ledger
+      - /opt/airflow/logs/sofascore_proxy_filter/sofascore_allocations.json
+      - --sofascore-allocation-wal
+      - /opt/airflow/logs/sofascore_proxy_filter/sofascore_allocation_claims.jsonl
+    volumes:
+      # Runtime-fingerprint входы: контрольная плоскость независимо
+      # пересчитывает тот же digest, что и продюсер в Airflow.
+      - ./dags:/opt/airflow/dags:ro
+      - ./scripts:/opt/airflow/scripts
+      - ./scrapers:/opt/airflow/scrapers
+      - ./configs/medallion:/opt/airflow/configs/medallion:ro
+      - ./configs/proxy_filter:/opt/airflow/configs/proxy_filter:ro
+      - ./configs/sofascore:/opt/airflow/configs/sofascore:ro
+      - ./proxys.txt:/opt/airflow/proxys.txt:ro
+      - ./logs:/opt/airflow/logs
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://localhost:8899/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 64M
+    networks:
+      - backend
 
   # ---------------------------------------------------------------------------
   # Caddy: публичный вход платформы (docs/design/analyst-access.md).

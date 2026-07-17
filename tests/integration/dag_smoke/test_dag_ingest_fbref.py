@@ -28,6 +28,7 @@ def fbref_dags():
     bag = DagBag(dag_folder=str(DAGS_FOLDER), include_examples=False)
     expected = {
         "dag_ingest_fbref",
+        "dag_bootstrap_fbref",
         "dag_backfill_fbref",
         "dag_replay_fbref",
     }
@@ -50,24 +51,31 @@ class TestFBrefDagBag:
         assert str(dag.schedule_interval) == "0 6 * * *"
         assert dag.max_active_runs == 1
         assert dag.max_active_tasks == 1
-        fetch_tasks = [
-            task_id for task_id in dag.task_dict if task_id.startswith("fetch_wave_")
-        ]
-        assert len(fetch_tasks) == 8
-        assert len(dag.task_dict) == 2 * len(fetch_tasks) + 4
+        assert "run_live_waves" in dag.task_dict
+        assert not any(
+            task_id.startswith(("fetch_wave_", "parse_wave_"))
+            for task_id in dag.task_dict
+        )
 
     def test_backfill_and_replay_are_manual(self, fbref_dags):
         backfill = fbref_dags["dag_backfill_fbref"]
+        bootstrap = fbref_dags["dag_bootstrap_fbref"]
         replay = fbref_dags["dag_replay_fbref"]
         assert backfill.schedule_interval is None
+        assert bootstrap.schedule_interval is None
+        assert bootstrap.is_paused_upon_creation is False
+        assert len(bootstrap.task_dict) == 11
+        assert {
+            "validate_current_scope_freshness",
+            "export_publication_scope",
+            "trigger_silver_transform",
+        }.isdisjoint(bootstrap.task_dict)
         assert replay.schedule_interval is None
-        backfill_waves = [
-            task_id
+        assert "run_live_waves" in backfill.task_dict
+        assert not any(
+            task_id.startswith(("fetch_wave_", "parse_wave_"))
             for task_id in backfill.task_dict
-            if task_id.startswith("fetch_wave_")
-        ]
-        assert len(backfill_waves) == 25
-        assert len(backfill.task_dict) == 2 * len(backfill_waves) + 4
+        )
         replay_waves = [
             task_id
             for task_id in replay.task_dict
@@ -79,36 +87,28 @@ class TestFBrefDagBag:
 
 @pytest.mark.integration
 class TestFBrefCurrentFailureEdges:
-    def test_each_fetch_is_immediately_followed_by_parse(self, fbref_dags):
+    def test_one_live_runner_owns_fetch_parse_batches(self, fbref_dags):
         dag = fbref_dags["dag_ingest_fbref"]
         assert dag.task_dict["seed_competition_index"].downstream_task_ids == {
-            "fetch_wave_01"
+            "recover_raw_before_fetch"
         }
-        wave_count = len(
-            [
-                task_id
-                for task_id in dag.task_dict
-                if task_id.startswith("fetch_wave_")
-            ]
-        )
-        for number in range(1, wave_count + 1):
-            fetch = dag.task_dict[f"fetch_wave_{number:02d}"]
-            parse = dag.task_dict[f"parse_wave_{number:02d}"]
-            assert fetch.downstream_task_ids == {parse.task_id}
-            expected = (
-                f"fetch_wave_{number + 1:02d}"
-                if number < wave_count
-                else "validate_run"
-            )
-            assert parse.downstream_task_ids == {expected}
+        assert dag.task_dict["recover_raw_before_fetch"].downstream_task_ids == {
+            "run_live_waves"
+        }
+        live = dag.task_dict["run_live_waves"]
+        assert live.python_callable.__name__ == "run_fbref_live_waves"
+        assert live.op_kwargs["max_batches"] == 16
+        assert live.downstream_task_ids == {"choose_publication_path"}
 
     def test_validation_is_the_only_silver_parent(self, fbref_dags):
         dag = fbref_dags["dag_ingest_fbref"]
         validate = dag.task_dict["validate_run"]
+        export = dag.task_dict["export_publication_scope"]
         trigger = dag.task_dict["trigger_silver_transform"]
         assert validate.trigger_rule == "all_success"
         assert trigger.trigger_rule == "all_success"
-        assert trigger.upstream_task_ids == {"validate_run"}
+        assert export.upstream_task_ids == {"validate_run"}
+        assert trigger.upstream_task_ids == {"export_publication_scope"}
         assert trigger.wait_for_completion is True
         assert _states(trigger.allowed_states) == ["success"]
         assert _states(trigger.failed_states) == ["failed"]
@@ -116,7 +116,7 @@ class TestFBrefCurrentFailureEdges:
 
 @pytest.mark.integration
 class TestFBrefBoundedModes:
-    def test_backfill_has_25_request_cap(self, fbref_dags):
+    def test_backfill_uses_supported_profile_and_one_live_runner(self, fbref_dags):
         dag = fbref_dags["dag_backfill_fbref"]
         initialize = dag.task_dict["initialize_run"]
         assert initialize.op_kwargs["run_type"] == "backfill"
@@ -124,7 +124,10 @@ class TestFBrefBoundedModes:
             "{{ params.request_limit }}"
         )
         assert dag.task_dict["seed_historical_seasons"].downstream_task_ids == {
-            "fetch_wave_01"
+            "recover_raw_before_fetch"
+        }
+        assert dag.task_dict["recover_raw_before_fetch"].downstream_task_ids == {
+            "run_live_waves"
         }
 
     def test_replay_has_no_network_task_and_zero_budget(self, fbref_dags):
@@ -144,7 +147,9 @@ class TestFBrefBoundedModes:
     def test_all_three_modes_validate_before_silver(self, fbref_dags):
         for dag in fbref_dags.values():
             validate = dag.task_dict["validate_run"]
+            export = dag.task_dict["export_publication_scope"]
             trigger = dag.task_dict["trigger_silver_transform"]
-            assert trigger.upstream_task_ids == {validate.task_id}
+            assert export.upstream_task_ids == {validate.task_id}
+            assert trigger.upstream_task_ids == {export.task_id}
             assert validate.trigger_rule == "all_success"
             assert trigger.trigger_rule == "all_success"

@@ -13,6 +13,9 @@ from dags.utils.transfermarkt_approval import (
     ApprovalPacket,
     ApprovalStateError,
     ApprovalValidationError,
+    StandingPolicy,
+    StandingPolicyBudget,
+    load_standing_policy,
 )
 
 
@@ -236,3 +239,124 @@ def test_approval_api_never_executes_declared_commands(monkeypatch):
         presented_hash=packet.packet_hash,
         execution_argv=packet.argv,
     )
+
+
+def _standing_policy(**changes) -> StandingPolicy:
+    values = {
+        'policy_version': 1,
+        'dag_id': 'dag_ingest_transfermarkt',
+        'approved_by': 'sergeykuznetsov1995',
+        'approved_at': '2026-07-14T00:00:00Z',
+        'expires_at': '2027-01-14T00:00:00Z',
+        'paid_proxy': {
+            'byte_cap_bytes': 15 * 1024 * 1024,
+            'request_limit': 710,
+            'retry_limit': 400,
+            'concurrency': 1,
+        },
+        'production_write': {
+            'byte_cap_bytes': 0,
+            'request_limit': 0,
+            'retry_limit': 0,
+            'concurrency': 1,
+        },
+        'allowed_write_tables': (
+            'iceberg.bronze.transfermarkt_squad_memberships',
+            'iceberg.ops.transfermarkt_scope_manifest_v2',
+        ),
+    }
+    values.update(changes)
+    return StandingPolicy(**values)
+
+
+def test_standing_policy_canonical_hash_is_stable():
+    first = _standing_policy()
+    second = _standing_policy(
+        approved_at=datetime(2026, 7, 14, tzinfo=timezone.utc),
+        expires_at=datetime(2027, 1, 14, tzinfo=timezone.utc),
+        paid_proxy=StandingPolicyBudget(
+            byte_cap_bytes=15 * 1024 * 1024,
+            request_limit=710,
+            retry_limit=400,
+            concurrency=1,
+        ),
+    )
+
+    assert first.canonical_json == second.canonical_json
+    assert first.policy_hash == second.policy_hash
+    assert len(first.policy_hash) == 64
+    assert ': ' not in first.canonical_json
+    assert ', ' not in first.canonical_json
+    assert first.policy_hash != _standing_policy(policy_version=2).policy_hash
+
+
+def test_standing_policy_rejects_nonzero_write_budget():
+    for field in ('byte_cap_bytes', 'request_limit', 'retry_limit'):
+        write = {
+            'byte_cap_bytes': 0,
+            'request_limit': 0,
+            'retry_limit': 0,
+            'concurrency': 1,
+            field: 1,
+        }
+        with pytest.raises(ApprovalValidationError, match='must be zero'):
+            _standing_policy(production_write=write)
+
+
+def test_standing_policy_rejects_invalid_validity_window():
+    with pytest.raises(ApprovalValidationError, match='after approved_at'):
+        _standing_policy(expires_at='2026-07-14T00:00:00Z')
+    with pytest.raises(ApprovalValidationError, match='after approved_at'):
+        _standing_policy(expires_at='2026-01-01T00:00:00Z')
+    with pytest.raises(ApprovalValidationError, match='timezone-aware'):
+        _standing_policy(expires_at=datetime(2027, 1, 14))
+    # A naive string must not inherit the parsing host's local zone: that
+    # would make the policy hash depend on where the file is read.
+    with pytest.raises(ApprovalValidationError, match='timezone-aware'):
+        _standing_policy(approved_at='2026-07-14T00:00:00')
+    with pytest.raises(ApprovalValidationError, match='timezone-aware'):
+        _standing_policy(expires_at='2027-01-14T00:00:00')
+    policy = _standing_policy()
+    with pytest.raises(ApprovalExpiredError):
+        policy.assert_not_expired(datetime(2027, 1, 14, tzinfo=timezone.utc))
+    policy.assert_not_expired(datetime(2026, 8, 1, tzinfo=timezone.utc))
+
+
+def test_standing_policy_rejects_blank_provenance():
+    with pytest.raises(ApprovalValidationError, match='non-blank'):
+        _standing_policy(approved_by='   ')
+    with pytest.raises(ApprovalValidationError, match='non-blank'):
+        _standing_policy(dag_id='')
+    with pytest.raises(ApprovalValidationError, match='positive integer'):
+        _standing_policy(policy_version=0)
+    with pytest.raises(ApprovalValidationError, match='cannot be empty'):
+        _standing_policy(allowed_write_tables=())
+
+
+def test_load_standing_policy_fails_closed(tmp_path):
+    with pytest.raises(ApprovalStateError, match='unreadable'):
+        load_standing_policy(tmp_path / 'absent.json')
+
+    broken = tmp_path / 'broken.json'
+    broken.write_text('{not json', encoding='utf-8')
+    with pytest.raises(ApprovalStateError, match='not valid JSON'):
+        load_standing_policy(broken)
+
+    array = tmp_path / 'array.json'
+    array.write_text('[]', encoding='utf-8')
+    with pytest.raises(ApprovalStateError, match='JSON object'):
+        load_standing_policy(array)
+
+    unknown = tmp_path / 'unknown.json'
+    unknown.write_text(
+        _standing_policy().canonical_json.replace(
+            '"policy_version"', '"unexpected_field"',
+        ),
+        encoding='utf-8',
+    )
+    with pytest.raises(ApprovalValidationError, match='schema'):
+        load_standing_policy(unknown)
+
+    good = tmp_path / 'good.json'
+    good.write_text(_standing_policy().canonical_json, encoding='utf-8')
+    assert load_standing_policy(good).policy_hash == _standing_policy().policy_hash

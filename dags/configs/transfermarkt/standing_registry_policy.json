@@ -1,0 +1,26 @@
+{
+  "policy_version": 1,
+  "dag_id": "dag_discover_transfermarkt_registry",
+  "approved_by": "sergeykuznetsov1995",
+  "approved_at": "2026-07-14T00:00:00Z",
+  "expires_at": "2027-01-14T00:00:00Z",
+  "paid_proxy": {
+    "byte_cap_bytes": 15728640,
+    "request_limit": 1024,
+    "retry_limit": 96,
+    "concurrency": 1
+  },
+  "production_write": {
+    "byte_cap_bytes": 0,
+    "request_limit": 0,
+    "retry_limit": 0,
+    "concurrency": 1
+  },
+  "allowed_write_tables": [
+    "iceberg.bronze.transfermarkt_competition_editions",
+    "iceberg.bronze.transfermarkt_competitions",
+    "iceberg.ops.transfermarkt_registry_state_v2",
+    "iceberg.silver.transfermarkt_competition_editions_v2",
+    "iceberg.silver.transfermarkt_competitions_v2"
+  ]
+}

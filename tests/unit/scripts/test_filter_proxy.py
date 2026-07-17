@@ -1714,7 +1714,11 @@ def test_malformed_env_never_silently_falls_back_to_file(mod, tmp_path):
 
 def test_proxy_filter_compose_is_env_only_by_default():
     compose = _COMPOSE_PATH.read_text()
-    service = compose.split("  proxy_filter:\n", 1)[1].split("\n  caddy:\n", 1)[0]
+    # The dedicated sofascore_proxy_filter service (#951) now sits between the
+    # shared proxy_filter and caddy — bound the slice on that neighbour.
+    service = compose.split("  proxy_filter:\n", 1)[1].split(
+        "\n  sofascore_proxy_filter:\n", 1
+    )[0]
 
     assert "PROXY_POOL_JSON: ${PROXY_POOL_JSON:-}" in service
     assert 'PROXY_FILTER_ALLOW_FILE_FALLBACK: "false"' in service
@@ -1722,6 +1726,86 @@ def test_proxy_filter_compose_is_env_only_by_default():
     # The lease concurrency limit is operator-tunable; the serial guarantees
     # that matter are per source (SofaScore production/canary), not global.
     assert "${PROXY_FILTER_MAX_ACTIVE_LEASES:-4}" in service
+
+
+def test_sofascore_has_a_dedicated_production_metered_proxy_service():
+    compose = _COMPOSE_PATH.read_text()
+    service = compose.split("  sofascore_proxy_filter:\n", 1)[1].split(
+        "\n  caddy:\n", 1
+    )[0]
+
+    # Dedicated pool secret + file fallback until the purchased pool lands.
+    assert "PROXY_POOL_JSON: ${SOFASCORE_PROXY_POOL_JSON:-}" in service
+    assert 'PROXY_FILTER_ALLOW_FILE_FALLBACK: "true"' in service
+    assert "./proxys.txt:/opt/airflow/proxys.txt:ro" in service
+    assert "http://sofascore_proxy_filter:8900" in service
+    # hard-cap 0 => production signer (a >0 cap is the never-authorized canary).
+    assert '\n      - --sofascore-canary-hard-cap-bytes\n      - "0"' in service
+    # One active SofaScore lease at a time.
+    assert '\n      - --max-active-leases\n      - "1"' in service
+    # Ledger/WAL on the persistent log root, isolated from the shared gateway.
+    assert "/logs/sofascore_proxy_filter/sofascore_allocation_claims.jsonl" in service
+    assert (
+        "SOFASCORE_PROXY_BUDGET_ARTIFACT:"
+        "-/opt/airflow/configs/sofascore/proxy_budget_canary.json"
+    ) in service
+
+
+def test_fbref_has_an_isolated_metered_proxy_service():
+    compose = _COMPOSE_PATH.read_text()
+    service = compose.split("  fbref_proxy_filter:\n", 1)[1].split(
+        "\n  proxy_filter:\n", 1
+    )[0]
+
+    assert 'PROXY_POOL_JSON: ""' in service
+    assert 'PROXY_FILTER_ALLOW_FILE_FALLBACK: "true"' in service
+    assert "./proxys.txt:/opt/airflow/proxys.txt:ro" in service
+    assert "http://fbref_proxy_filter:8900" in service
+    assert "${FBREF_PROXY_DAGRUN_BUDGET_BYTES:-104857600}" in service
+    assert "${FBREF_PROXY_URL_BUDGET_BYTES:-104857600}" in service
+    assert '\n      - "1"' in service
+    assert "/logs/fbref/proxy_filter/unused_sofascore_claims.jsonl" in service
+    assert "/logs/proxy_filter/sofascore_allocation_claims.jsonl" not in service
+
+
+def test_fbref_lease_is_scoped_metered_and_host_restricted(mod):
+    assert mod.FBREF_DAG_IDS == frozenset(
+        {
+            "dag_ingest_fbref",
+            "dag_bootstrap_fbref",
+            "dag_backfill_fbref",
+        }
+    )
+    assert mod._source_for_dag("dag_ingest_fbref") == "fbref"
+    assert mod._source_for_dag("dag_bootstrap_fbref") == "fbref"
+    assert mod._source_for_dag("dag_backfill_fbref") == "fbref"
+    lease = mod.Lease(
+        lease_id="fbref-lease",
+        token="secret",
+        upstream=("proxy.example", 10000, "user", "password"),
+        created_at=0.0,
+        expires_at=9999999999.0,
+        max_bytes=1000,
+        dag_id="dag_ingest_fbref",
+        run_id="run",
+        source="fbref",
+    )
+
+    assert lease.report()["meter"] == "proxy_filter_provider_path_v2"
+    assert mod._lease_host_allowed(lease, "fbref.com") is True
+    assert mod._lease_host_allowed(lease, "www.fbref.com") is True
+    assert mod._lease_host_allowed(lease, "challenges.cloudflare.com") is True
+    assert mod._lease_host_allowed(lease, "api.ipify.org") is True
+    assert mod._lease_host_allowed(lease, "ipinfo.io") is False
+    assert mod._lease_host_allowed(lease, "example.com") is False
+    assert mod._lease_url_budget_bytes(lease) == mod.DAGRUN_BUDGET_BYTES
+
+
+def test_production_airflow_enables_safe_fbref_stage_janitor():
+    compose = _COMPOSE_PATH.read_text()
+    common = compose.split("x-airflow-common:", 1)[1].split("\nservices:", 1)[0]
+
+    assert "FBREF_STAGE_JANITOR_MODE: ${FBREF_STAGE_JANITOR_MODE:-apply}" in common
 
 
 # --- _dump --------------------------------------------------------------------
@@ -2065,6 +2149,10 @@ class _FakeManager:
         url = self._urls[self.calls % len(self._urls)]
         self.calls += 1
         return _FakeProxy(url)
+
+    @property
+    def total_count(self):
+        return len(self._urls)
 
 
 def test_pick_upstream_parses_creds_from_url(mod):
@@ -3366,6 +3454,62 @@ def test_common_control_token_cannot_impersonate_a_transfermarkt_dag(mod):
 
     assert b"401 Unauthorized" in head
     assert json.loads(body)["error"] == "invalid control token"
+    assert mod.LEASES == {}
+    assert mgr.calls == 0
+
+
+def test_fbref_auth_check_proves_meter_config_without_paid_lease(mod):
+    mgr = _FakeManager(
+        [
+            "http://u:p@pool.invalid:10000",
+            "http://u:p@pool.invalid:10001",
+        ]
+    )
+    mod.DAILY_BUDGET_BYTES = 300_000_000
+    mod.DAGRUN_BUDGET_BYTES = 104_857_600
+    mod.URL_BUDGET_BYTES = 104_857_600
+    mod.MAX_LEASE_BYTES = 104_857_600
+    mod.MAX_LEASE_TTL_SECONDS = 7200
+    mod.MAX_ACTIVE_LEASES = 1
+    mod.LEASE_PROXY_URL = "http://fbref_proxy_filter:8900"
+
+    class Reader:
+        async def readexactly(self, _length):
+            raise AssertionError("auth check must not read a request body")
+
+    class Writer:
+        def __init__(self):
+            self.payload = bytearray()
+
+        def write(self, value):
+            self.payload.extend(value)
+
+        async def drain(self):
+            return None
+
+        def close(self):
+            return None
+
+    writer = Writer()
+    handled = asyncio.run(
+        mod._handle_control(
+            "GET",
+            "/v1/auth-check",
+            {"x-proxy-control-token": mod.CONTROL_TOKEN},
+            Reader(),
+            writer,
+            mgr,
+        )
+    )
+    head, body = bytes(writer.payload).split(b"\r\n\r\n", 1)
+    report = json.loads(body)
+
+    assert handled is True
+    assert b"200 OK" in head
+    assert report["meter"] == "proxy_filter_provider_path_v2"
+    assert report["fbref_source_ready"] is True
+    assert report["configured_pool_count"] == 2
+    assert report["max_active_leases"] == 1
     assert mod.LEASES == {}
     assert mgr.calls == 0
 
@@ -5141,6 +5285,93 @@ def test_lease_connect_failover_repins_immediate_eof_and_tunnels(mod, monkeypatc
     assert lease.tunnel_writers == set()
 
 
+def test_fbref_never_repins_after_paid_connect_upload(mod, monkeypatch):
+    mgr = _FakeManager(["http://u:p@pool.invalid:10001"])
+    now = mod._wall_time()
+    lease = mod.Lease(
+        lease_id="fbref-one-attempt",
+        token="secret",
+        upstream=("pool.invalid", 10000, "u", "p"),
+        created_at=now,
+        expires_at=now + 30,
+        max_bytes=4096,
+        dag_id="dag_ingest_fbref",
+        run_id="run",
+        source="fbref",
+    )
+    _shrink_failover_timeouts(mod, monkeypatch)
+    dead_writer = _FakeUpstreamWriter()
+
+    async def fake_open(host, port):
+        return _FakeUpstreamReader(b"", block_when_empty=True), dead_writer
+
+    _patch_upstream_opener(mod, monkeypatch, fake_open)
+
+    with pytest.raises(mod.UpstreamHeadTimeout):
+        asyncio.run(
+            mod._open_lease_upstream_tunnel(
+                lease,
+                mgr,
+                target="www.fbref.com:443",
+                host="www.fbref.com",
+            )
+        )
+
+    auth = base64.b64encode(b"u:p").decode()
+    expected = (
+        b"CONNECT www.fbref.com:443 HTTP/1.1\r\n"
+        b"Host: www.fbref.com:443\r\n"
+        + f"Proxy-Authorization: Basic {auth}\r\n\r\n".encode()
+    )
+    assert dead_writer.data == expected
+    assert dead_writer.closed is True
+    assert lease.up_bytes == len(expected)
+    assert lease.down_bytes == 0
+    assert lease.upstream_repins == 0
+    assert lease.upstream == ("pool.invalid", 10000, "u", "p")
+    assert mgr.calls == 0
+
+
+def test_fbref_never_retries_zero_byte_tcp_dial_failure(mod, monkeypatch):
+    mgr = _FakeManager(["http://u:p@pool.invalid:10001"])
+    now = mod._wall_time()
+    lease = mod.Lease(
+        lease_id="fbref-one-dial",
+        token="secret",
+        upstream=("pool.invalid", 10000, "u", "p"),
+        created_at=now,
+        expires_at=now + 30,
+        max_bytes=4096,
+        dag_id="dag_ingest_fbref",
+        run_id="run",
+        source="fbref",
+    )
+    _shrink_failover_timeouts(mod, monkeypatch)
+    opens = []
+
+    async def fake_open(host, port):
+        opens.append((host, port))
+        raise OSError("TCP dial failed")
+
+    _patch_upstream_opener(mod, monkeypatch, fake_open)
+
+    with pytest.raises(OSError, match="TCP dial failed"):
+        asyncio.run(
+            mod._open_lease_upstream_tunnel(
+                lease,
+                mgr,
+                target="www.fbref.com:443",
+                host="www.fbref.com",
+            )
+        )
+
+    assert opens == [("pool.invalid", 10000)]
+    assert lease.total_bytes == 0
+    assert lease.upstream_repins == 0
+    assert lease.upstream == ("pool.invalid", 10000, "u", "p")
+    assert mgr.calls == 0
+
+
 def test_lease_connect_failover_is_refused_after_first_provider_payload_byte(
     mod, monkeypatch
 ):
@@ -5673,3 +5904,268 @@ def test_missing_protected_state_stops_before_pool_or_listener(
         asyncio.run(mod.main())
 
     assert pool_calls == []
+
+
+# --- FBref browser-phase lease cap extension ---------------------------------
+
+
+def _fbref_context(**values):
+    context = {
+        "source": "fbref",
+        "dag_id": "dag_ingest_fbref",
+        "run_id": "manual__fbref-cap",
+        "task_id": "run_live_waves",
+        "canonical_url": "https://fbref.com/en/",
+    }
+    context.update(values)
+    return context
+
+
+def _make_fbref_lease(mod, mgr, *, max_bytes=1000):
+    mod.DAILY_BUDGET_BYTES = 5000
+    mod.DAGRUN_BUDGET_BYTES = 5000
+    mod.URL_BUDGET_BYTES = 5000
+    mod.MAX_LEASE_BYTES = 5000
+    return mod._create_lease(
+        mgr,
+        max_bytes=max_bytes,
+        ttl_seconds=30,
+        metadata=_fbref_context(),
+        require_context=True,
+    )
+
+
+def test_fbref_absolute_http_replaces_browser_lease_auth_with_provider_auth(
+    mod, monkeypatch
+):
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+    lease = _make_fbref_lease(mod, mgr)
+    client_auth = base64.b64encode(f"lease:{lease.token}".encode()).decode()
+    provider_auth = base64.b64encode(b"u:p").decode()
+    target = "http://www.fbref.com/en/"
+    upstream_reader = _FakeUpstreamReader(
+        b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n"
+    )
+    upstream_writer = _FakeUpstreamWriter()
+
+    async def fake_open(host, port):
+        assert (host, port) == ("pool.invalid", 10000)
+        return upstream_reader, upstream_writer
+
+    monkeypatch.setattr(mod, "_open_upstream_connection", fake_open)
+    client_writer = _ClientWriter()
+    asyncio.run(
+        mod.handle(
+            _ClientConnectReader(
+                [
+                    f"GET {target} HTTP/1.1\r\n".encode(),
+                    b"Host: www.fbref.com\r\n",
+                    b"User-Agent: browser-test\r\n",
+                    f"Proxy-Authorization: Basic {client_auth}\r\n".encode(),
+                    b"\r\n",
+                ]
+            ),
+            client_writer,
+            mgr,
+            require_lease=True,
+        )
+    )
+
+    forwarded = bytes(upstream_writer.data)
+    assert forwarded == (
+        f"GET {target} HTTP/1.1\r\n".encode()
+        + b"Host: www.fbref.com\r\n"
+        + b"User-Agent: browser-test\r\n"
+        + f"Proxy-Authorization: Basic {provider_auth}\r\n\r\n".encode()
+    )
+    assert forwarded.count(b"Proxy-Authorization:") == 1
+    assert client_auth.encode() not in forwarded
+    assert lease.token.encode() not in forwarded
+    assert b"lease:" not in forwarded
+    assert lease.active_tunnels == 0
+    assert lease.tunnel_writers == set()
+
+
+def test_fbref_drained_lease_extension_is_durable_before_cap_mutation(mod):
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+    lease = _make_fbref_lease(mod, mgr)
+    mod._account_lease_bytes(lease, "www.fbref.com", "down", 200)
+
+    report = mod._extend_fbref_lease(lease, 3000)
+
+    assert lease.max_bytes == 3000
+    assert report["max_bytes"] == 3000
+    events = [
+        json.loads(line) for line in Path(mod.LEDGER_PATH).read_text().splitlines()
+    ]
+    extended = events[-1]
+    assert extended["event_type"] == "lease_extended"
+    assert extended["previous_max_bytes"] == 1000
+    assert extended["max_bytes"] == 3000
+    assert extended["lease_total_bytes"] == 200
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        "active_tunnels",
+        "reserved_bytes",
+        "current_request_id",
+        "current_endpoint",
+        "closed",
+        "expired",
+    ],
+)
+def test_fbref_lease_extension_refuses_non_idle_or_closed_state(mod, state):
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+    lease = _make_fbref_lease(mod, mgr)
+    if state == "expired":
+        lease.expires_at = 0
+    elif state in {"current_request_id", "current_endpoint"}:
+        setattr(lease, state, "request-1")
+    else:
+        setattr(lease, state, 1 if state != "closed" else True)
+
+    with pytest.raises(RuntimeError):
+        mod._extend_fbref_lease(lease, 2000)
+
+    assert lease.max_bytes == 1000
+
+
+def test_fbref_lease_extension_rejects_shared_budget_overcommit(mod):
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+    lease = _make_fbref_lease(mod, mgr)
+    mod._account_lease_bytes(lease, "www.fbref.com", "down", 200)
+    mod._run_down_bytes[lease.dagrun_key] += 3500
+
+    with pytest.raises(RuntimeError, match="remaining shared budget"):
+        mod._extend_fbref_lease(lease, 1600)
+
+    assert mod._fbref_lease_extension_ceiling(lease) == 1500
+    assert lease.max_bytes == 1000
+
+
+def test_fbref_lease_extension_ledger_failure_leaves_old_hard_cap(mod, monkeypatch):
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+    lease = _make_fbref_lease(mod, mgr)
+
+    def fail_ledger(*_args, **_kwargs):
+        raise OSError("fsync failed")
+
+    monkeypatch.setattr(mod, "_append_budget_event", fail_ledger)
+
+    with pytest.raises(OSError, match="fsync failed"):
+        mod._extend_fbref_lease(lease, 2000)
+
+    assert lease.max_bytes == 1000
+
+
+def test_fbref_extend_control_requires_both_control_and_lease_tokens(mod):
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+    lease = _make_fbref_lease(mod, mgr)
+    request = json.dumps({"max_bytes": 2000}).encode()
+
+    class Reader:
+        async def readexactly(self, length):
+            assert length == len(request)
+            return request
+
+    class Writer:
+        def __init__(self):
+            self.payload = bytearray()
+
+        def write(self, value):
+            self.payload.extend(value)
+
+        async def drain(self):
+            return None
+
+        def close(self):
+            return None
+
+    for headers in (
+        {"authorization": f"Bearer {lease.token}"},
+        {"x-proxy-control-token": mod.CONTROL_TOKEN, "authorization": "Bearer bad"},
+    ):
+        writer = Writer()
+        asyncio.run(
+            mod._handle_control(
+                "POST",
+                f"/v1/leases/{lease.lease_id}/extend",
+                {"content-length": str(len(request)), **headers},
+                Reader(),
+                writer,
+                mgr,
+            )
+        )
+        assert b"401 Unauthorized" in writer.payload
+        assert lease.max_bytes == 1000
+
+    writer = Writer()
+    asyncio.run(
+        mod._handle_control(
+            "POST",
+            f"/v1/leases/{lease.lease_id}/extend",
+            {
+                "content-length": str(len(request)),
+                "x-proxy-control-token": mod.CONTROL_TOKEN,
+                "authorization": f"Bearer {lease.token}",
+            },
+            Reader(),
+            writer,
+            mgr,
+        )
+    )
+    head, body = bytes(writer.payload).split(b"\r\n\r\n", 1)
+    assert b"200 OK" in head
+    assert json.loads(body)["max_bytes"] == 2000
+    assert lease.max_bytes == 2000
+
+
+def test_fbref_proxy_hard_stops_an_oversized_browser_phase_transfer(mod):
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+    lease = _make_fbref_lease(mod, mgr, max_bytes=12)
+
+    class Reader:
+        def __init__(self):
+            self.payload = b"x" * 20
+            self.read_sizes = []
+
+        async def read(self, size):
+            self.read_sizes.append(size)
+            chunk, self.payload = self.payload[:size], self.payload[size:]
+            return chunk
+
+    class Writer:
+        def __init__(self):
+            self.writes = []
+            self.closed = False
+
+        def write(self, chunk):
+            self.writes.append(chunk)
+
+        async def drain(self):
+            return None
+
+        def close(self):
+            self.closed = True
+
+    reader = Reader()
+    writer = Writer()
+    asyncio.run(
+        mod._pump(
+            reader,
+            writer,
+            "www.fbref.com",
+            defaultdict(int),
+            lease=lease,
+            direction="down",
+        )
+    )
+
+    assert reader.read_sizes == [12]
+    assert reader.payload == b"x" * 8
+    assert b"".join(writer.writes) == b"x" * 12
+    assert lease.total_bytes == lease.max_bytes == 12
+    assert lease.budget_exceeded is True
+    assert writer.closed is True

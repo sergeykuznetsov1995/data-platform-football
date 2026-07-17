@@ -1,0 +1,222 @@
+name: FBref production CI
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/fbref-ci.yml"
+      - "configs/fbref/**"
+      - "dags/**/*fbref*"
+      - "dags/dag_iceberg_maintenance_daily.py"
+      - "dags/utils/maintenance_tasks.py"
+      - "docker/images/airflow/Dockerfile"
+      - "docker/images/airflow/requirements*.txt"
+      - "docs/operations/sql/fbref_production_acceptance.sql"
+      - "docs/operations/sql/fbref_control_dataset_acceptance.sql"
+      - "scrapers/fbref/**"
+      - "scrapers/__init__.py"
+      - "scrapers/utils/proxy_manager.py"
+      - "scripts/proxy_filter/**"
+      - "scripts/**/*fbref*"
+      - "tests/**/*fbref*"
+      - "tests/integration/scrapers/conftest.py"
+      - "tests/integration/scrapers/test_real_requests.py"
+      - "tests/unit/dags/test_dag_iceberg_maintenance_daily.py"
+      - "tests/unit/dags/test_maintenance_tasks.py"
+      - "tests/unit/scrapers/test_proxy_manager.py"
+      - "tests/unit/scrapers/test_scrapers_lazy_import.py"
+      - "Makefile"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fbref-ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install import-light runtime
+        run: |
+          python -m pip install --disable-pip-version-check \
+            pytest ruff pandas numpy pyarrow boto3==1.42.61 trino requests beautifulsoup4 lxml \
+            psycopg2-binary python-dotenv tenacity pybreaker rapidfuzz \
+            Unidecode nicknames PyYAML jsonschema psutil
+      - name: Static checks
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          ruff check \
+            scrapers/fbref \
+            scrapers/utils/proxy_manager.py \
+            dags/scripts/*fbref*.py \
+            dags/utils/fbref_current_dag_factory.py \
+            dags/utils/fbref_pipeline_tasks.py \
+            dags/utils/maintenance_tasks.py \
+            dags/dag_*fbref.py \
+            dags/dag_iceberg_maintenance_daily.py \
+            scripts/proxy_filter/filter_proxy.py \
+            scripts/audit_fbref_production.py
+          python -m compileall -q \
+            scrapers/fbref scrapers/utils/proxy_manager.py \
+            dags/scripts dags/utils scripts/audit_fbref_production.py
+          git diff --check "$BASE_SHA"...HEAD
+      - name: Complete offline FBref suite
+        env:
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+        shell: bash
+        run: |
+          mapfile -t tests < <(find tests/unit -type f -name '*fbref*.py' -print | sort)
+          test "${#tests[@]}" -gt 0
+          pytest -q \
+            "${tests[@]}" \
+            tests/unit/dags/test_dag_iceberg_maintenance_daily.py \
+            tests/unit/dags/test_maintenance_tasks.py \
+            tests/unit/scripts/test_filter_proxy.py \
+            tests/unit/scrapers/test_proxy_manager.py \
+            tests/unit/scrapers/test_scrapers_lazy_import.py
+
+  airflow-dagbag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        airflow-version: ["2.7.3", "2.11.2"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install the production Airflow runtime
+        env:
+          AIRFLOW_VERSION: ${{ matrix.airflow-version }}
+        run: |
+          python -m pip install --disable-pip-version-check \
+            "apache-airflow==$AIRFLOW_VERSION" \
+            --constraint \
+            "https://raw.githubusercontent.com/apache/airflow/constraints-$AIRFLOW_VERSION/constraints-3.11.txt"
+      - name: Import production FBref DAGs
+        env:
+          AIRFLOW_HOME: ${{ runner.temp }}/airflow
+          PYTHONPATH: ${{ github.workspace }}/dags:${{ github.workspace }}
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          from airflow.models import DagBag
+
+          root = Path.cwd()
+          expected = {
+              "dag_ingest_fbref": (root / "dags/dag_ingest_fbref.py", 16),
+              "dag_bootstrap_fbref": (
+                  root / "dags/dag_bootstrap_fbref.py",
+                  11,
+              ),
+              "dag_backfill_fbref": (root / "dags/dag_backfill_fbref.py", 16),
+              "dag_replay_fbref": (root / "dags/dag_replay_fbref.py", 17),
+          }
+          errors = {}
+          counts = {}
+          for dag_id, (path, expected_count) in expected.items():
+              bag = DagBag(
+                  dag_folder=str(path),
+                  include_examples=False,
+                  safe_mode=False,
+              )
+              errors.update(bag.import_errors)
+              # ``get_dag`` consults Airflow's metadata DB. This job tests
+              # import only and deliberately has no initialized DB.
+              dag = bag.dags.get(dag_id)
+              if dag is None:
+                  raise AssertionError((dag_id, bag.import_errors))
+              counts[dag_id] = len(dag.tasks)
+              if counts[dag_id] != expected_count:
+                  raise AssertionError((dag_id, counts[dag_id], expected_count))
+          if errors:
+              raise AssertionError(errors)
+          print(f"dag_task_counts={counts}")
+          print("import_errors={}")
+          PY
+
+  postgres-semantics:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: fbref_test
+          POSTGRES_USER: fbref
+          POSTGRES_PASSWORD: fbref
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U fbref -d fbref_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: python -m pip install pytest psycopg2-binary
+      - name: Migrate and verify real PostgreSQL semantics
+        env:
+          FBREF_CONTROL_DB_URI: postgresql://fbref:fbref@localhost:5432/fbref_test
+          FBREF_TEST_POSTGRES_URI: postgresql://fbref:fbref@localhost:5432/fbref_test
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+        run: |
+          python -m scrapers.fbref.control migrate
+          pytest -q tests/integration/scrapers/test_fbref_control_admission.py
+
+  seaweedfs-raw-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Start ephemeral SeaweedFS S3
+        run: |
+          mkdir -p "$RUNNER_TEMP/seaweed"
+          sed \
+            -e 's/<S3_ACCESS_KEY>/fbref-ci-access/' \
+            -e 's/<S3_SECRET_KEY>/fbref-ci-secret/' \
+            configs/seaweedfs/s3.config.json.example \
+            > "$RUNNER_TEMP/seaweed/s3.config.json"
+          docker run -d --name fbref-seaweed -p 8333:8333 \
+            -v "$RUNNER_TEMP/seaweed:/config:ro" \
+            chrislusf/seaweedfs:4.36 \
+            mini -dir=/data -bucket=football \
+            -s3.config=/config/s3.config.json
+          for attempt in $(seq 1 30); do
+            curl -fsS http://localhost:8333/status && exit 0
+            sleep 2
+          done
+          docker logs fbref-seaweed
+          exit 1
+      - run: python -m pip install pytest pyarrow boto3==1.42.61 psycopg2-binary
+      - name: Raw-first S3 and read-only audit smoke
+        env:
+          S3_ACCESS_KEY: fbref-ci-access
+          S3_SECRET_KEY: fbref-ci-secret
+          FBREF_RAW_S3_ENDPOINT: localhost:8333
+          FBREF_RAW_S3_SCHEME: http
+          FBREF_TEST_RAW_S3_URI: s3://football/raw/fbref-ci
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+        run: pytest -q tests/integration/scrapers/test_fbref_raw_store_s3.py
