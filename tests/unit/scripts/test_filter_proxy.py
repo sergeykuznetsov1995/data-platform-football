@@ -1795,7 +1795,16 @@ def test_sofascore_lease_host_scope_is_fail_closed(mod):
     assert mod._lease_host_allowed(production, "api.sofascore.com") is True
     assert mod._lease_host_allowed(production, "challenges.cloudflare.com") is True
     assert mod._lease_host_allowed(production, "evil.example") is False
-    assert mod._lease_host_allowed(production, "api.ipify.org") is False
+    # Production leases MUST reach the geoip exit-probe host (#951): Camoufox's
+    # geoip=True resolves the residential exit IP via api.ipify.org at browser
+    # startup; blocking it aborted every production capture with InvalidProxy
+    # before any data flowed. The canary lease already reaches it, so the
+    # measured budget already carries the probe cost.
+    assert mod._lease_host_allowed(production, "api.ipify.org") is True
+    # Scope stays fail-closed: only the single exit-probe host is opened — the
+    # other IP-echo fallbacks and arbitrary hosts remain blocked.
+    assert mod._lease_host_allowed(production, "ipinfo.io") is False
+    assert mod._lease_host_allowed(production, "checkip.amazonaws.com") is False
 
 
 def test_authenticated_proxy_listener_rejects_missing_lease_before_dial(mod):
@@ -1935,7 +1944,7 @@ def test_sofascore_production_and_canary_are_each_serial(mod):
     assert canary.source == "sofascore_canary"
 
 
-def test_exit_probe_host_is_available_only_inside_canary_lease(mod):
+def test_exit_probe_host_is_available_to_sofascore_leases_not_anonymous(mod):
     mgr = _FakeManager(
         [
             "http://u:p@pool.invalid:10000",
@@ -1961,8 +1970,11 @@ def test_exit_probe_host_is_available_only_inside_canary_lease(mod):
         require_context=True,
     )
 
+    # The geoip exit-probe host is reachable by BOTH sofascore lease kinds
+    # (#951): canary measured it, and production needs it for Camoufox
+    # geoip=True at browser startup. An anonymous (no-lease) caller stays blocked.
     assert mod._lease_host_allowed(canary, "api.ipify.org") is True
-    assert mod._lease_host_allowed(production, "api.ipify.org") is False
+    assert mod._lease_host_allowed(production, "api.ipify.org") is True
     assert mod._lease_host_allowed(None, "api.ipify.org") is False
     assert mod._lease_host_allowed(production, "www.sofascore.com") is True
 
