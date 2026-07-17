@@ -72,6 +72,9 @@ def test_ci_runs_public_writer_and_capacity_contracts():
 
 def test_ci_uses_test_runtime_and_smokes_immutable_flaresolverr():
     text = _workflow_text()
+    scheduler_smoke = text.split(
+        "- name: Build and smoke the hardened scheduler test image", 1
+    )[1].split("- name: Build production targets", 1)[0]
 
     assert "--target airflow-scheduler-test" in text
     assert "docker/images/flaresolverr-whoscored/Dockerfile" in text
@@ -84,6 +87,16 @@ def test_ci_uses_test_runtime_and_smokes_immutable_flaresolverr():
     assert "whoscored-zero-cap-smoke" in text
     assert "--headless --no-sandbox --disable-setuid-sandbox" in text
     assert "-e PYTHONPATH=/opt/airflow:/opt/airflow/dags" in text
+    assert "Camoufox(headless='virtual'" in scheduler_smoke
+    assert "executable_path='/opt/fbref-camoufox/camoufox-bin'" in scheduler_smoke
+    assert "assert 'Firefox/152.0' in ua" in scheduler_smoke
+    assert "--network none" in scheduler_smoke
+    assert "--user 50000:0" in scheduler_smoke
+    assert "--read-only" in scheduler_smoke
+    assert "--shm-size 1g" in scheduler_smoke
+    assert (
+        "--tmpfs /tmp:rw,noexec,nosuid,nodev,size=256m,uid=50000,gid=0,mode=0700"
+    ) in scheduler_smoke
     assert "/v1/whoscored/runtime-identity" in text
     assert 'assert response["extension_sha256"] == identity["extension_sha256"]' in text
 

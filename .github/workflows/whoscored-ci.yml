@@ -202,6 +202,19 @@ jobs:
             --load \
             -t data-platform-airflow-scheduler:ci \
             docker/images/airflow
+          timeout 45 docker run --rm \
+            --network none \
+            --user 50000:0 \
+            --read-only \
+            --shm-size 1g \
+            --tmpfs /tmp:rw,noexec,nosuid,nodev,size=256m,uid=50000,gid=0,mode=0700 \
+            --cap-drop ALL \
+            --security-opt no-new-privileges:true \
+            --security-opt apparmor=docker-default \
+            --security-opt seccomp=builtin \
+            --entrypoint /opt/legacy-scraper-venv/bin/python \
+            data-platform-airflow-scheduler:ci -I -c \
+            "from camoufox.addons import DefaultAddons; from camoufox.sync_api import Camoufox; cm = Camoufox(headless='virtual', executable_path='/opt/fbref-camoufox/camoufox-bin', ff_version=152, i_know_what_im_doing=True, exclude_addons=list(DefaultAddons)); browser = cm.__enter__(); ua = browser.new_page().evaluate('navigator.userAgent'); cm.__exit__(None, None, None); assert 'Firefox/152.0' in ua, ua"
           docker run --rm \
             --cap-drop ALL \
             --security-opt no-new-privileges:true \

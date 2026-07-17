@@ -9,9 +9,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DOCKERFILE = REPO_ROOT / "docker/images/airflow/Dockerfile"
-SCRAPING_REQUIREMENTS = (
-    REPO_ROOT / "docker/images/airflow/requirements-scraping.txt"
-)
+SCRAPING_REQUIREMENTS = REPO_ROOT / "docker/images/airflow/requirements-scraping.txt"
 RUNNER_REQUIREMENTS = (
     REPO_ROOT / "docker/images/airflow/requirements-scraper-runner.txt"
 )
@@ -19,9 +17,7 @@ CORE_REQUIREMENTS = REPO_ROOT / "docker/images/airflow/requirements.txt"
 COMPOSE_FILE = REPO_ROOT / "compose.yaml"
 
 EXPECTED_VERSION = "1.13.1"
-EXPECTED_SHA256 = (
-    "e4a4a5d771d1bd1558186a5ee46af1dfa1318bd31950d68ccd81ed30bad078fc"
-)
+EXPECTED_SHA256 = "e4a4a5d771d1bd1558186a5ee46af1dfa1318bd31950d68ccd81ed30bad078fc"
 EXPECTED_PATH = "/opt/tls-client/tls-client.so"
 
 
@@ -66,8 +62,7 @@ def test_tls_wrapper_and_native_library_are_pinned_in_the_image():
     assert "--no-deps --require-hashes --only-binary=:all:" in dockerfile
     assert (
         f"releases/download/v{EXPECTED_VERSION}/"
-        f"tls-client-linux-ubuntu-amd64-{EXPECTED_VERSION}.so"
-        in dockerfile
+        f"tls-client-linux-ubuntu-amd64-{EXPECTED_VERSION}.so" in dockerfile
     )
     assert f'echo "{EXPECTED_SHA256}  {EXPECTED_PATH}"' in dockerfile
     assert "--proto-redir '=https'" in dockerfile
@@ -118,8 +113,7 @@ def test_legacy_browser_jobs_use_only_the_isolated_runner():
     assert "/opt/legacy-scraper-venv/bin/python -I -m pip install" in dockerfile
     assert "--no-cache-dir --no-deps --require-hashes --only-binary=:all:" in dockerfile
     assert (
-        "/opt/legacy-scraper-venv/bin/python -I -m pip install "
-        "--no-cache-dir --user"
+        "/opt/legacy-scraper-venv/bin/python -I -m pip install --no-cache-dir --user"
     ) not in dockerfile
     commands = {
         "dags/dag_ingest_sofifa.py": "run_sofifa_scraper.py",
@@ -138,45 +132,92 @@ def test_fresh_and_existing_soccerdata_volumes_are_owned_before_airflow_starts()
     dockerfile = DOCKERFILE.read_text(encoding="utf-8")
     compose = COMPOSE_FILE.read_text(encoding="utf-8")
 
-    base_stage = dockerfile.split("FROM airflow-base AS airflow-scheduler-payload", 1)[0]
-    assert (
-        "install -d -o 50000 -g 0 -m 0755 /home/airflow/soccerdata"
-        in base_stage
-    )
-    log_init = compose.split("  airflow-log-init:", 1)[1].split(
-        "\n  airflow-init:", 1
-    )[0]
+    base_stage = dockerfile.split("FROM airflow-base AS airflow-scheduler-payload", 1)[
+        0
+    ]
+    assert "install -d -o 50000 -g 0 -m 0755 /home/airflow/soccerdata" in base_stage
+    log_init = compose.split("  airflow-log-init:", 1)[1].split("\n  airflow-init:", 1)[
+        0
+    ]
     assert "soccerdata_cache:/home/airflow/soccerdata" in log_init
     assert "chown -R --no-dereference 50000:0 /home/airflow/soccerdata" in log_init
     assert "chmod -R u+rwX,g+rwX,o-rwx /home/airflow/soccerdata" in log_init
 
 
 @pytest.mark.unit
-def test_fbref_browser_is_checksum_pinned_and_isolated_from_sofascore():
+def test_browser_assets_are_checksum_pinned_and_source_isolated():
     from scrapers.fbref import browser_runtime
 
     dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+    sofascore_version = "135.0.1"
+    sofascore_release = "beta.24"
+    sofascore_sha256 = (
+        "61e1ec455e021720af38a5cc5ff7566121363cb5b82b72f24e381ba2676a4888"
+    )
     version = browser_runtime.CAMOUFOX_BROWSER_VERSION
     release = browser_runtime.CAMOUFOX_BROWSER_RELEASE
     install_dir = str(browser_runtime.INSTALL_DIR)
-    sha256 = (
-        "a03872a221ab766f58d04fdaf0d7f3431c2662d5086844c67d2fc01154ebc1f8"
-    )
+    sha256 = "a03872a221ab766f58d04fdaf0d7f3431c2662d5086844c67d2fc01154ebc1f8"
 
-    assert f"FBREF_CAMOUFOX_VERSION={version}" in dockerfile
-    assert f"FBREF_CAMOUFOX_RELEASE={release}" in dockerfile
-    assert f"FBREF_CAMOUFOX_SHA256={sha256}" in dockerfile
-    assert "releases/download/v${FBREF_CAMOUFOX_VERSION}-" in dockerfile
-    assert 'echo "${FBREF_CAMOUFOX_SHA256}  /tmp/' in dockerfile
-    assert 'stat -c %s /tmp/fbref-camoufox.zip)" -eq 663773735' in dockerfile
-    assert f"test -x {install_dir}/camoufox-bin" in dockerfile
-    assert "/home/airflow/.cache/camoufox" in dockerfile
+    sofascore_block = dockerfile.split("ARG SOFASCORE_CAMOUFOX_VERSION=", 1)[1].split(
+        "ARG FBREF_CAMOUFOX_VERSION=", 1
+    )[0]
+    fbref_block = dockerfile.split("ARG FBREF_CAMOUFOX_VERSION=", 1)[1].split(
+        "RUN --network=none install -d -o root -g root -m 0755 /opt/tls-client",
+        1,
+    )[0]
+
+    assert f"ARG SOFASCORE_CAMOUFOX_VERSION={sofascore_version}" in dockerfile
+    assert f"ARG SOFASCORE_CAMOUFOX_RELEASE={sofascore_release}" in dockerfile
+    assert f"ARG SOFASCORE_CAMOUFOX_SHA256={sofascore_sha256}" in dockerfile
+    assert "releases/download/v${SOFASCORE_CAMOUFOX_VERSION}-" in sofascore_block
+    assert (
+        'echo "${SOFASCORE_CAMOUFOX_SHA256}  /tmp/sofascore-camoufox.zip"'
+        in sofascore_block
+    )
+    assert 'stat -c %s /tmp/sofascore-camoufox.zip)" -eq 712711368' in sofascore_block
+    assert (
+        "-e /tmp/sofascore-camoufox.zip \\\n      /home/airflow/.cache/camoufox"
+    ) in sofascore_block
+    assert (
+        '"{\\"version\\":\\"${SOFASCORE_CAMOUFOX_VERSION}\\",'
+        '\\"release\\":\\"${SOFASCORE_CAMOUFOX_RELEASE}\\"}"' in sofascore_block
+    )
+    assert "test -x /home/airflow/.cache/camoufox/camoufox-bin" in sofascore_block
+    assert "FBREF_CAMOUFOX" not in sofascore_block
+    assert "/opt/fbref-camoufox" not in sofascore_block
+
+    assert f"ARG FBREF_CAMOUFOX_VERSION={version}" in dockerfile
+    assert f"ARG FBREF_CAMOUFOX_RELEASE={release}" in dockerfile
+    assert f"ARG FBREF_CAMOUFOX_SHA256={sha256}" in dockerfile
+    assert "releases/download/v${FBREF_CAMOUFOX_VERSION}-" in fbref_block
+    assert 'echo "${FBREF_CAMOUFOX_SHA256}  /tmp/fbref-camoufox.zip"' in fbref_block
+    assert 'stat -c %s /tmp/fbref-camoufox.zip)" -eq 663773735' in fbref_block
+    assert "-e /tmp/fbref-camoufox.zip /opt/fbref-camoufox" in fbref_block
+    assert f"test -x {install_dir}/camoufox-bin" in fbref_block
+    assert "/home/airflow/.cache/camoufox" not in fbref_block
+    assert "SOFASCORE_CAMOUFOX" not in fbref_block
     assert "/opt/legacy-scraper-venv/bin/python -I -c" in dockerfile
     assert "download_mmdb" not in dockerfile
     assert "maybe_download_addons" not in dockerfile
     assert "python -m camoufox fetch" not in dockerfile
     assert "exclude_addons=list(DefaultAddons)" in dockerfile
     assert "browser.new_page().evaluate('navigator.userAgent')" in dockerfile
+    scheduler_payload = dockerfile.split(
+        "FROM airflow-base AS airflow-scheduler-payload", 1
+    )[1].split("FROM airflow-scheduler-payload AS airflow-scheduler-test", 1)[0]
+    assert "Camoufox(headless=True" in scheduler_payload
+    assert "Camoufox(headless='virtual'" not in scheduler_payload
+
+    workflow = (REPO_ROOT / ".github/workflows/whoscored-ci.yml").read_text(
+        encoding="utf-8"
+    )
+    scheduler_smoke = workflow.split(
+        "- name: Build and smoke the hardened scheduler test image", 1
+    )[1].split("- name: Build production targets", 1)[0]
+    assert "Camoufox(headless='virtual'" in scheduler_smoke
+    assert f"executable_path='{install_dir}/camoufox-bin'" in scheduler_smoke
+    assert "assert 'Firefox/152.0' in ua" in scheduler_smoke
 
 
 @pytest.mark.unit

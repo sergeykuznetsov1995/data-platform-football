@@ -296,10 +296,31 @@ RUN PIP_FIND_LINKS=/tmp/whoscored-wheelhouse \
       -r /tmp/requirements-scraper-runner.txt
 
 # The Python package's `fetch` command selects a mutable "latest compatible"
-# GitHub release. Fetch the exact supported browser asset instead and verify
-# the GitHub-published digest and billed byte size before offline extraction.
-# SofaScore and FBref receive separate root-owned trees so either source can
-# validate its own version document without consulting the other's cache.
+# GitHub release. Fetch each source's exact supported browser asset instead and
+# verify its digest and byte size before offline extraction. SofaScore's paid
+# runtime remains on the measured v135 browser in its package-default cache;
+# FBref's v152 browser lives only in its explicit /opt tree.
+ARG SOFASCORE_CAMOUFOX_VERSION=135.0.1
+ARG SOFASCORE_CAMOUFOX_RELEASE=beta.24
+ARG SOFASCORE_CAMOUFOX_SHA256=61e1ec455e021720af38a5cc5ff7566121363cb5b82b72f24e381ba2676a4888
+RUN curl --proto '=https' --tlsv1.2 --proto-redir '=https' -fsSL \
+      "https://github.com/daijro/camoufox/releases/download/v${SOFASCORE_CAMOUFOX_VERSION}-${SOFASCORE_CAMOUFOX_RELEASE}/camoufox-${SOFASCORE_CAMOUFOX_VERSION}-${SOFASCORE_CAMOUFOX_RELEASE}-lin.x86_64.zip" \
+      -o /tmp/sofascore-camoufox.zip \
+    && echo "${SOFASCORE_CAMOUFOX_SHA256}  /tmp/sofascore-camoufox.zip" \
+        | sha256sum -c - \
+    && test "$(stat -c %s /tmp/sofascore-camoufox.zip)" -eq 712711368
+RUN --network=none rm -rf /home/airflow/.cache/camoufox \
+    && install -d -m 0755 /home/airflow/.cache/camoufox \
+    && /usr/local/bin/python -S -m zipfile \
+      -e /tmp/sofascore-camoufox.zip \
+      /home/airflow/.cache/camoufox \
+    && printf '%s\n' \
+      "{\"version\":\"${SOFASCORE_CAMOUFOX_VERSION}\",\"release\":\"${SOFASCORE_CAMOUFOX_RELEASE}\"}" \
+      > /home/airflow/.cache/camoufox/version.json \
+    && chmod -R 0755 /home/airflow/.cache/camoufox \
+    && test -x /home/airflow/.cache/camoufox/camoufox-bin \
+    && rm -f /tmp/sofascore-camoufox.zip
+
 ARG FBREF_CAMOUFOX_VERSION=152.0.4
 ARG FBREF_CAMOUFOX_RELEASE=beta.26
 ARG FBREF_CAMOUFOX_SHA256=a03872a221ab766f58d04fdaf0d7f3431c2662d5086844c67d2fc01154ebc1f8
@@ -309,13 +330,6 @@ RUN curl --proto '=https' --tlsv1.2 --proto-redir '=https' -fsSL \
     && echo "${FBREF_CAMOUFOX_SHA256}  /tmp/fbref-camoufox.zip" \
         | sha256sum -c - \
     && test "$(stat -c %s /tmp/fbref-camoufox.zip)" -eq 663773735
-RUN --network=none /usr/local/bin/python -S -m zipfile \
-      -e /tmp/fbref-camoufox.zip \
-      /home/airflow/.cache/camoufox \
-    && printf '%s\n' \
-      "{\"version\":\"${FBREF_CAMOUFOX_VERSION}\",\"release\":\"${FBREF_CAMOUFOX_RELEASE}\"}" \
-      > /home/airflow/.cache/camoufox/version.json \
-    && chmod -R 755 /home/airflow/.cache/camoufox
 RUN --network=none rm -rf \
       /tmp/undetected-chromedriver-3.5.5.tar.gz \
       /tmp/whoscored-wheelhouse
@@ -341,7 +355,11 @@ RUN --network=none chmod 0444 /opt/tls-client/tls-client.so
 ENV TLS_LIBRARY_PATH=/opt/tls-client/tls-client.so
 
 USER airflow
-RUN --network=none /opt/legacy-scraper-venv/bin/python -I -c "from camoufox.addons import DefaultAddons; from camoufox.sync_api import Camoufox; cm = Camoufox(headless='virtual', executable_path='/opt/fbref-camoufox/camoufox-bin', ff_version=152, i_know_what_im_doing=True, exclude_addons=list(DefaultAddons)); browser = cm.__enter__(); ua = browser.new_page().evaluate('navigator.userAgent'); cm.__exit__(None, None, None); assert 'Firefox/152.0' in ua, ua"
+# BuildKit's default RUN sandbox cannot provide the X11 runtime that Camoufox's
+# virtual-headless mode owns.  Keep this as a real offline browser launch, but
+# use Firefox's native headless mode here; CI launches the same pinned binary in
+# virtual-headless mode from the finished, production-shaped container.
+RUN --network=none /opt/legacy-scraper-venv/bin/python -I -c "from camoufox.addons import DefaultAddons; from camoufox.sync_api import Camoufox; cm = Camoufox(headless=True, executable_path='/opt/fbref-camoufox/camoufox-bin', ff_version=152, i_know_what_im_doing=True, exclude_addons=list(DefaultAddons)); browser = cm.__enter__(); ua = browser.new_page().evaluate('navigator.userAgent'); cm.__exit__(None, None, None); assert 'Firefox/152.0' in ua, ua"
 RUN --network=none PYTHONPATH=/usr/local/lib/python3.11/site-packages:/home/airflow/.local/lib/python3.11/site-packages \
     /usr/local/bin/python -S -c "import tls_requests; client = tls_requests.Client(proxy='http://127.0.0.1:9'); client.close()"
 RUN --network=none PYTHONPATH=/usr/local/lib/python3.11/site-packages:/home/airflow/.local/lib/python3.11/site-packages \
