@@ -119,6 +119,10 @@ FIELD_RULES: Mapping[str, tuple[FieldRule, ...]] = {
         FieldRule("pageSize", FieldDisposition.TYPED, "transfer_events", "source page size"),
         FieldRule("transfers[].*", FieldDisposition.TYPED, "transfer_events", "global transfer event including feeText/localizedFeeText/value"),
         FieldRule("transfers.*", FieldDisposition.RAW_ONLY, "transfers_raw", "transfer list/container metadata"),
+        # Appeared live on 2026-07-17 (isolated-contour acceptance run): a
+        # top-level fee-filter bound for the page's slider UI, not a transfer
+        # event attribute.
+        FieldRule("maxFee", FieldDisposition.RAW_ONLY, "transfers_raw", "fee filter bound; page chrome around the transfer stream"),
     ),
     "match": (
         FieldRule("", FieldDisposition.RAW_ONLY, "match_raw", "JSON document root"),

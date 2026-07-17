@@ -47,6 +47,11 @@ def test_production_page_chrome_paths_are_classified_not_drift():
     # around the data payloads must classify as raw_only, not schema drift.
     cases = {
         "leaderboard": ["LeagueName"],
+        "transfers": [
+            # Appeared live 2026-07-17 (acceptance run in the isolated
+            # contour): top-level fee-filter bound of the page's slider.
+            "maxFee",
+        ],
         "match": [
             "seo.eventJSONLD.homeTeam.name",
             "seo.breadcrumbJSONLD[].itemListElement[].item",
