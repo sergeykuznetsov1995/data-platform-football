@@ -36,6 +36,8 @@ jobs:
 
       - name: Validate declared WhoScored build-provenance state
         run: |
+          python -I -S scripts/generate_whoscored_runtime_evidence.py \
+            --root . --check
           provenance_status="$(python -I -S -c \
             'import json; print(json.load(open("docker/images/airflow/whoscored-build-provenance-attestation.json"))["status"])')"
           case "$provenance_status" in
@@ -80,6 +82,7 @@ jobs:
             dags/scripts/whoscored_proxy_runtime.py \
             dags/utils/maintenance_tasks.py \
             dags/utils/fbref_pipeline_tasks.py \
+            docker/images/airflow/whoscored_capacity_worker_bootstrap.py \
             scripts/init_seaweedfs_bucket.py \
             scripts/audit_seaweedfs_control_network.py \
             scripts/audit_seaweedfs_runtime_container.py \
@@ -87,10 +90,13 @@ jobs:
             scripts/proxy_filter/filter_proxy.py \
             scripts/transition_seaweedfs_recovery_state.py \
             scripts/validate_seaweedfs_s3_identity_config.py \
+            scripts/generate_whoscored_deployment_attestation.py \
+            scripts/generate_whoscored_runtime_evidence.py \
             scripts/validate_whoscored_build_provenance.py \
             scripts/whoscored_production_admission.py \
             scripts/whoscored_proxy_campaign.py \
             scripts/research/bench_whoscored_workflow.py \
+            scripts/research/whoscored_capacity_container_runtime.py \
             $(rg --files scripts tests | rg '(whoscored|test_proxy_traffic|test_filter_proxy).*\.py$')
           python -m compileall -q \
             scrapers/whoscored \
@@ -108,6 +114,7 @@ jobs:
             dags/scripts/whoscored_identity.py \
             dags/scripts/whoscored_proxy_runtime.py \
             dags/utils/fbref_pipeline_tasks.py \
+            docker/images/airflow/whoscored_capacity_worker_bootstrap.py \
             scripts/init_seaweedfs_bucket.py \
             scripts/audit_seaweedfs_control_network.py \
             scripts/audit_seaweedfs_runtime_container.py \
@@ -115,11 +122,15 @@ jobs:
             scripts/proxy_filter/filter_proxy.py \
             scripts/transition_seaweedfs_recovery_state.py \
             scripts/validate_seaweedfs_s3_identity_config.py \
+            scripts/generate_whoscored_deployment_attestation.py \
+            scripts/generate_whoscored_runtime_evidence.py \
             scripts/validate_whoscored_build_provenance.py \
             scripts/whoscored_production_admission.py \
             scripts/whoscored_proxy_campaign.py \
             scripts/research/bench_whoscored_workflow.py \
-            scripts/research/bench_whoscored_capacity.py
+            scripts/research/bench_whoscored_capacity.py \
+            scripts/research/whoscored_capacity_container_runtime.py \
+            scripts/research/whoscored_capacity_worker_exec.py
           bash -n scripts/cutover_seaweedfs_topology.sh
           bash -n scripts/compose.sh
           bash -n scripts/seaweedfs_legacy_entrypoint.sh
@@ -247,6 +258,36 @@ jobs:
                 --dump-dom "data:text/html,whoscored-zero-cap-smoke" \
                 | grep -q whoscored-zero-cap-smoke
               test "$(airflow version)" = 2.11.2
+              test ! -e /opt/airflow/airflow.cfg
+              test ! -e /opt/airflow/gunicorn.ctl
+              airflow_root_ctime="$(stat -c %Z /opt/airflow)"
+              sleep 1
+              /usr/local/bin/python -c \
+                "from airflow.utils.serve_logs import serve_logs; serve_logs(port=18793)" \
+                >/tmp/whoscored-serve-logs-smoke.log 2>&1 &
+              serve_logs_pid="$!"
+              serve_logs_ready=0
+              for _ in $(seq 1 20); do
+                if kill -0 "$serve_logs_pid" 2>/dev/null && \
+                    grep -q "Listening at:" /tmp/whoscored-serve-logs-smoke.log; then
+                  serve_logs_ready=1
+                  break
+                fi
+                if ! kill -0 "$serve_logs_pid" 2>/dev/null; then
+                  cat /tmp/whoscored-serve-logs-smoke.log >&2
+                  exit 1
+                fi
+                sleep 1
+              done
+              test "$serve_logs_ready" = 1
+              test ! -e /opt/airflow/airflow.cfg
+              test ! -e /opt/airflow/gunicorn.ctl
+              test "$(stat -c %Z /opt/airflow)" = "$airflow_root_ctime"
+              ! grep -q "Control socket listening" \
+                /tmp/whoscored-serve-logs-smoke.log
+              kill "$serve_logs_pid"
+              wait "$serve_logs_pid" || test "$?" -eq 143
+              test "$(stat -c %Z /opt/airflow)" = "$airflow_root_ctime"
               /usr/local/bin/python -m pip check
               /opt/legacy-scraper-venv/bin/python -m pip check
               PYTHONWARNINGS=error /usr/local/bin/python -c "import importlib.metadata as m; import requests; assert m.version(\"chardet\") == \"5.2.0\""
@@ -268,15 +309,58 @@ jobs:
             '
 
       - name: Build production targets and prove the declared gate state
+        env:
+          GIT_ATTR_NOSYSTEM: "1"
+          GIT_CONFIG_GLOBAL: /dev/null
+          GIT_CONFIG_NOSYSTEM: "1"
+          GIT_EXTERNAL_DIFF: /bin/false
+          GIT_NO_REPLACE_OBJECTS: "1"
+          GIT_CONFIG_COUNT: "9"
+          GIT_CONFIG_KEY_0: core.fsmonitor
+          GIT_CONFIG_VALUE_0: "false"
+          GIT_CONFIG_KEY_1: core.hooksPath
+          GIT_CONFIG_VALUE_1: /dev/null
+          GIT_CONFIG_KEY_2: core.attributesFile
+          GIT_CONFIG_VALUE_2: /dev/null
+          GIT_CONFIG_KEY_3: filter.lfs.process
+          GIT_CONFIG_VALUE_3: ""
+          GIT_CONFIG_KEY_4: filter.lfs.clean
+          GIT_CONFIG_VALUE_4: ""
+          GIT_CONFIG_KEY_5: filter.lfs.smudge
+          GIT_CONFIG_VALUE_5: ""
+          GIT_CONFIG_KEY_6: filter.lfs.required
+          GIT_CONFIG_VALUE_6: "false"
+          GIT_CONFIG_KEY_7: diff.external
+          GIT_CONFIG_VALUE_7: /bin/false
+          GIT_CONFIG_KEY_8: core.worktree
+          GIT_CONFIG_VALUE_8: ${{ github.workspace }}
         run: |
+          umask 077
+          install -d -m 0700 /tmp/whoscored-build-metadata
+          BUILDX_GIT_CHECK_DIRTY=1 \
+          docker buildx build \
+            --target airflow-scheduler-payload \
+            --platform linux/amd64 \
+            --cache-from type=gha,scope=whoscored-airflow \
+            --load \
+            -t data-platform-airflow-scheduler-payload:provenance-ci \
+            docker/images/airflow
+          BUILDX_GIT_CHECK_DIRTY=1 BUILDX_METADATA_PROVENANCE=max \
           docker buildx build \
             --target airflow-scheduler \
+            --platform linux/amd64 \
+            --provenance=mode=max,version=v1 \
+            --metadata-file /tmp/whoscored-build-metadata/airflow-scheduler.json \
             --cache-from type=gha,scope=whoscored-airflow \
             --load \
             -t data-platform-airflow-scheduler:provenance-ci \
             docker/images/airflow
+          BUILDX_GIT_CHECK_DIRTY=1 BUILDX_METADATA_PROVENANCE=max \
           docker buildx build \
             --target airflow-whoscored-proxy \
+            --platform linux/amd64 \
+            --provenance=mode=max,version=v1 \
+            --metadata-file /tmp/whoscored-build-metadata/airflow-whoscored-proxy.json \
             --cache-from type=gha,scope=whoscored-airflow \
             --load \
             -t data-platform-airflow-whoscored-proxy:provenance-ci \
@@ -421,6 +505,10 @@ jobs:
       - name: WhoScored unit, DAG and storage contract
         env:
           PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+          WHOSCORED_REAL_DOCKER_TEST: "1"
+          WHOSCORED_SCHEDULER_BUILD_METADATA: /tmp/whoscored-build-metadata/airflow-scheduler.json
+          WHOSCORED_SCHEDULER_IMAGE: data-platform-airflow-scheduler:provenance-ci
+          WHOSCORED_SCHEDULER_PAYLOAD_IMAGE: data-platform-airflow-scheduler-payload:provenance-ci
         run: |
           pytest -q \
             $(rg --files tests | rg '/test_.*whoscored.*\.py$|/test_whoscored.*\.py$') \

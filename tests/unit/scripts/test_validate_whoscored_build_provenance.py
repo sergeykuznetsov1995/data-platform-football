@@ -548,7 +548,7 @@ def test_generate_ready_is_manifest_first_resumable_and_idempotent(
     receipt = provenance.generate_ready_evidence(
         root,
         payload_image_ids={"scheduler": f"sha256:{SHA_B}"},
-        generated_at="2026-07-16T12:00:00Z",
+        generated_at="2026-07-17T09:30:00Z",
     )
     assert receipt["status"] == "ready-generated-v1"
     assert json.loads(attestation_path.read_text(encoding="utf-8"))["status"] == (
@@ -558,7 +558,7 @@ def test_generate_ready_is_manifest_first_resumable_and_idempotent(
     assert provenance.generate_ready_evidence(
         root,
         payload_image_ids={"scheduler": f"sha256:{SHA_B}"},
-        generated_at="2026-07-16T12:00:00Z",
+        generated_at="2026-07-18T10:45:00Z",
     ) == receipt
     assert (manifest_path.read_bytes(), attestation_path.read_bytes()) == before
 
@@ -803,6 +803,174 @@ def test_generate_ready_cli_rejects_output_override_and_duplicate_binding(
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)["status"] == "ready-generated-v1"
     assert result.stderr == ""
+
+
+def test_standalone_generate_ready_disables_hostile_local_fsmonitor(
+    tmp_path: Path,
+) -> None:
+    root, _, _, _ = _ready_repository(tmp_path, commit_promotion=False)
+    hook = tmp_path / "hostile-fsmonitor"
+    marker = Path(f"{hook}.ran")
+    _write(hook, '#!/bin/sh\ntouch "$0.ran"\nprintf "\\n"\n')
+    hook.chmod(0o755)
+    _git(root, "config", "core.fsmonitor", str(hook))
+
+    subprocess.run(
+        ("/usr/bin/git", "-C", str(root), "ls-files", "-v", "-z", "--"),
+        check=True,
+        stdout=subprocess.DEVNULL,
+    )
+    assert marker.is_file()
+    marker.unlink()
+
+    result = subprocess.run(
+        (
+            sys.executable,
+            "-I",
+            "-S",
+            str(MODULE_PATH),
+            "--root",
+            str(root),
+            "--generate-ready",
+            "--generated-at",
+            "2026-07-16T12:00:00Z",
+            "--payload-image-id",
+            f"scheduler=sha256:{SHA_B}",
+        ),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not marker.exists()
+    assert json.loads(result.stdout)["status"] == "ready-generated-v1"
+
+
+def test_empty_attribute_tree_never_writes_a_fresh_repository_object(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "empty-repository"
+    root.mkdir()
+    _git(root, "init", "-q")
+    objects = root / ".git/objects"
+    before = {
+        path.relative_to(objects)
+        for path in objects.rglob("*")
+        if path.is_file()
+    }
+    assert before == set()
+
+    result = provenance._run_git(
+        root, "ls-files", "-z", "--", stdout=provenance._SUBPROCESS_PIPE
+    )
+
+    after = {
+        path.relative_to(objects)
+        for path in objects.rglob("*")
+        if path.is_file()
+    }
+    assert result.returncode == 0
+    assert result.stdout == b""
+    assert after == before
+
+
+def test_material_revision_compares_raw_bytes_despite_local_autocrlf(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "autocrlf-repository"
+    payload = root / "payload.txt"
+    _write(payload, b"line\n")
+    _git(root, "init", "-q")
+    _git(root, "config", "user.email", "provenance@example.invalid")
+    _git(root, "config", "user.name", "Provenance Test")
+    _git(root, "add", "payload.txt")
+    _git(root, "commit", "-qm", "base")
+    revision = _git(root, "rev-parse", "HEAD")
+    _git(root, "config", "core.autocrlf", "true")
+    _write(payload, b"line\r\n")
+
+    unprotected = subprocess.run(
+        (
+            "/usr/bin/git",
+            "-C",
+            str(root),
+            "diff",
+            "--quiet",
+            revision,
+            "--",
+            "payload.txt",
+        ),
+        check=False,
+    )
+    assert unprotected.returncode == 0
+    assert payload.read_bytes() == b"line\r\n"
+    assert provenance._git_blob(root, revision, payload) == b"line\n"
+
+    assert not provenance._git_evidence_is_checked_against(
+        root, "payload.txt", revision
+    )
+    with pytest.raises(provenance.ProvenanceError, match="differs"):
+        provenance._validate_material_revision(root, revision, [payload])
+
+
+@pytest.mark.parametrize("filter_kind", ["clean", "process"])
+@pytest.mark.parametrize("attribute_source", ["tracked", "untracked", "info"])
+def test_pinned_git_never_runs_repository_selected_filter(
+    tmp_path: Path, filter_kind: str, attribute_source: str
+) -> None:
+    root = tmp_path / "filter-repository"
+    payload = root / "payload.txt"
+    attributes = root / ".gitattributes"
+    _write(payload, "base\n")
+    if attribute_source == "tracked":
+        _write(attributes, "* filter=demo\n")
+    _git(root, "init", "-q")
+    _git(root, "config", "user.email", "provenance@example.invalid")
+    _git(root, "config", "user.name", "Provenance Test")
+    _git(root, "add", ".")
+    _git(root, "commit", "-qm", "base")
+    if attribute_source == "untracked":
+        _write(attributes, "* filter=demo\n")
+    elif attribute_source == "info":
+        _write(root / ".git/info/attributes", "* filter=demo\n")
+
+    hook = tmp_path / f"hostile-{filter_kind}-{attribute_source}"
+    marker = Path(f"{hook}.ran")
+    _write(hook, '#!/bin/sh\ntouch "$0.ran"\nexit 1\n')
+    hook.chmod(0o755)
+    _git(root, "config", f"filter.demo.{filter_kind}", str(hook))
+    _write(payload, "changed\n")
+
+    subprocess.run(
+        (
+            "/usr/bin/git",
+            "-C",
+            str(root),
+            "diff",
+            "--quiet",
+            "HEAD",
+            "--",
+            "payload.txt",
+        ),
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    assert marker.is_file()
+    marker.unlink()
+
+    if attribute_source == "info":
+        with pytest.raises(provenance.ProvenanceError, match="info attributes"):
+            provenance._run_git(
+                root, "diff", "--quiet", "HEAD", "--", "payload.txt"
+            )
+    else:
+        result = provenance._run_git(
+            root, "diff", "--quiet", "HEAD", "--", "payload.txt"
+        )
+        assert result.returncode == 1
+    assert not marker.exists()
 
 
 @pytest.mark.parametrize("mutation", ["duplicate", "extra", "missing"])
@@ -2208,22 +2376,47 @@ def test_external_deployment_result_reuses_exact_fd_pinned_bytes(
     tmp_path: Path,
 ) -> None:
     root, manifest_path, deployment_path, _ = _ready_repository(tmp_path)
+    attestation_path = root / provenance.ATTESTATION_RELATIVE
 
     discovery = provenance.validate(
         root,
-        attestation_path=root / provenance.ATTESTATION_RELATIVE,
+        attestation_path=attestation_path,
         manifest_path=manifest_path,
         deployment_attestation_path=deployment_path,
         expect_blocked=False,
     )
 
+    assert discovery.build_attestation_raw == attestation_path.read_bytes()
+    assert discovery.build_attestation_identity == provenance._stat_identity(
+        attestation_path.stat()
+    )
+    assert discovery.build_manifest_raw == manifest_path.read_bytes()
+    assert discovery.build_manifest_identity == provenance._stat_identity(
+        manifest_path.stat()
+    )
     assert discovery.deployment_attestation_raw == deployment_path.read_bytes()
+    assert discovery.deployment_attestation_identity == provenance._stat_identity(
+        deployment_path.stat()
+    )
     assert discovery.deployment_final_images == {
         "scheduler": f"registry.example/whoscored@sha256:{SHA_C}"
     }
+    assert discovery.validated_release_revision == _git(root, "rev-parse", "HEAD")
+    assert discovery.validated_payload_revision == discovery.revision
+    assert (
+        discovery.validated_manifest_sha256
+        == hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    )
+    assert (
+        discovery.validated_source_tree_sha256 == discovery.report["source_tree_sha256"]
+    )
+    assert discovery.validated_payload_image_ids == {"scheduler": f"sha256:{SHA_B}"}
     with pytest.raises(TypeError):
         assert discovery.deployment_final_images is not None
         discovery.deployment_final_images["scheduler"] = "mutable"  # type: ignore[index]
+    with pytest.raises(TypeError):
+        assert discovery.validated_payload_image_ids is not None
+        discovery.validated_payload_image_ids["scheduler"] = "mutable"  # type: ignore[index]
 
 
 @pytest.mark.parametrize("unsafe", ["symlink", "hardlink", "writable-parent"])

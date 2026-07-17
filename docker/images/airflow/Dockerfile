@@ -107,21 +107,33 @@ RUN --network=none mkdir -p /opt/airflow/spark_jobs /opt/airflow/dags /opt/airfl
 # build-time child with exit 78.
 COPY whoscored_runtime_startup.py /usr/local/lib/whoscored_runtime_startup.py
 COPY whoscored_runtime_pth.py /usr/local/lib/python3.11/site-packages/whoscored_runtime_pth.py
-RUN --network=none install -d -o root -g root -m 0755 /usr/local/share/whoscored
+RUN --network=none install -d -o root -g root -m 0755 /usr/local/share/whoscored \
+    && install -o root -g root -m 0444 /dev/null \
+      /usr/local/share/whoscored/airflow.cfg
 COPY --chown=root:root whoscored-runtime-trust-root-generic /usr/local/share/whoscored/runtime-trust-root
 RUN --network=none chmod 0444 \
       /usr/local/lib/whoscored_runtime_startup.py \
       /usr/local/lib/python3.11/site-packages/whoscored_runtime_pth.py \
-      /usr/local/share/whoscored/runtime-trust-root
+      /usr/local/share/whoscored/airflow.cfg \
+      /usr/local/share/whoscored/runtime-trust-root \
+    && test "$(stat -c '%u:%g:%a:%s' /usr/local/share/whoscored/airflow.cfg)" \
+      = "0:0:444:0"
 
 # Keep the attested application package root ahead of Airflow's bare ``utils``
 # compatibility path.  Adding ``/opt/airflow/scrapers`` exposes unintended
 # top-level packages, while putting ``dags`` first lets dags/scripts shadow the
 # canonical root scripts package.
+ENV AIRFLOW_CONFIG=/usr/local/share/whoscored/airflow.cfg
 ENV PYTHONPATH="" \
     LD_LIBRARY_PATH="" \
     PYTHONNOUSERSITE=1 \
     PYTHONSAFEPATH=1
+
+# Gunicorn 25.1 enables a control socket by default and otherwise creates
+# gunicorn.ctl in AIRFLOW_HOME after the attested runtime tree is pinned.
+# Airflow does not use that new control interface, so keep the release tree
+# immutable and retain the existing worker tmp directory setting.
+ENV GUNICORN_CMD_ARGS="--worker-tmp-dir /dev/shm --no-control-socket"
 
 # Switch to airflow user for pip installs
 USER airflow
@@ -191,9 +203,33 @@ USER airflow
 RUN --network=none PYTHONPATH=/usr/local/lib/python3.11/site-packages:/home/airflow/.local/lib/python3.11/site-packages \
     /usr/local/bin/python -S -m pip check
 
+# Airflow 2.11's embedded task-log server bypasses GUNICORN_CMD_ARGS. Gunicorn
+# 25.1 therefore creates a new control socket in AIRFLOW_HOME unless the
+# standalone application opts out explicitly. Patch only the exact upstream
+# file and its wheel RECORD entry, and fail the build if any reviewed byte
+# differs on either side of the patch.
+USER root
+RUN --network=none echo \
+      "e1ab5ba5f4c4f02313e9559e113dfbcdbf0c7ed91aae48ea69c799c57623e0a4  /home/airflow/.local/lib/python3.11/site-packages/airflow/utils/serve_logs.py" \
+      | sha256sum -c - \
+    && echo \
+      "fb02e1fae51fdcf4e1d8f5b232f3608ec0bcd88247d48da55eacb91ef5b107a4  /home/airflow/.local/lib/python3.11/site-packages/apache_airflow-2.11.2.dist-info/RECORD" \
+      | sha256sum -c - \
+    && sed -i \
+      's@    options = \[bind_option, GunicornOption("workers", 2)\]@    options = [bind_option, GunicornOption("workers", 2), GunicornOption("control_socket_disable", True)]@' \
+      /home/airflow/.local/lib/python3.11/site-packages/airflow/utils/serve_logs.py \
+    && sed -i \
+      's@airflow/utils/serve_logs.py,sha256=4atbpfTE8CMT6VWeET37zb8MftkarkjqaceZxXYj4KQ,7185@airflow/utils/serve_logs.py,sha256=NwdZuAeO3QAkcKDd-w4wMDZaCEWfKESz4QI2f_oWbis,7233@' \
+      /home/airflow/.local/lib/python3.11/site-packages/apache_airflow-2.11.2.dist-info/RECORD \
+    && echo \
+      "370759b8078edd002470a0ddfb0e3030365a08459f2844b3e102367ffa166e2b  /home/airflow/.local/lib/python3.11/site-packages/airflow/utils/serve_logs.py" \
+      | sha256sum -c - \
+    && echo \
+      "cbeb35f3979408ad5997cb5bc10f9733a7d4b42d2d28174126536271f2fbe083  /home/airflow/.local/lib/python3.11/site-packages/apache_airflow-2.11.2.dist-info/RECORD" \
+      | sha256sum -c -
+
 # Generic services may import the image dependency tree but cannot modify it
 # or replace it through a writable parent directory.
-USER root
 RUN --network=none chown -R root:root /home/airflow/.local \
     && chown root:root /home/airflow \
     && chmod 0755 /home/airflow \
@@ -238,6 +274,11 @@ USER airflow
 FROM airflow-base AS airflow-scheduler-payload
 
 USER root
+# One-shot capacity workers run this image-owned coordinator under ``-I -S``.
+# Only its child production interpreter activates the attested image site.
+COPY --chown=root:root whoscored_capacity_worker_bootstrap.py /usr/local/libexec/whoscored_capacity_worker_bootstrap.py
+RUN --network=none chmod 0444 /usr/local/libexec/whoscored_capacity_worker_bootstrap.py \
+    && test "$(stat -c '%u:%g:%a:%h' /usr/local/libexec/whoscored_capacity_worker_bootstrap.py)" = "0:0:444:1"
 # The generic parent is already runtime-sealed. Keep its root-owned hooks out
 # of site-packages only for this build stage while scheduler-only dependencies
 # are installed: pip source builds can start a child interpreter without ``-S``.
@@ -479,6 +520,7 @@ COPY --chown=root:root whoscored-build-provenance-attestation.json /usr/local/sh
 COPY --chown=root:root whoscored-build-provenance-manifest.json /usr/local/share/whoscored/build-provenance-manifest.json
 RUN --network=none cp --dereference /opt/legacy-scraper-venv/bin/python3.11 \
         /tmp/whoscored-legacy-python3.11 \
+    && test "$(stat -c '%u:%g:%a:%h' /usr/local/libexec/whoscored_capacity_worker_bootstrap.py)" = "0:0:444:1" \
     && rm -f \
         /opt/legacy-scraper-venv/bin/python \
         /opt/legacy-scraper-venv/bin/python3 \

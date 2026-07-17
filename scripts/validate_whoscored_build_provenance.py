@@ -59,6 +59,48 @@ from typing import Any, Iterable, Mapping, Sequence
 EXIT_CONFIG = 78
 SCHEMA_VERSION = 1
 MAX_EVIDENCE_BYTES = 4 * 1024 * 1024
+GIT_CLI = Path("/usr/bin/git")
+# Canonical SHA-1 empty tree.  Pinned Git resolves it without materializing an
+# object; a Git build that cannot do so makes every provenance command fail closed.
+_EMPTY_GIT_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+_SUBPROCESS_RUN = subprocess.run
+_SUBPROCESS_DEVNULL = subprocess.DEVNULL
+_SUBPROCESS_PIPE = subprocess.PIPE
+_GIT_SAFE_CONFIG = (
+    ("core.attributesFile", "/dev/null"),
+    ("core.autocrlf", "false"),
+    ("core.bare", "false"),
+    ("core.checkStat", "default"),
+    ("core.excludesFile", "/dev/null"),
+    ("core.fileMode", "true"),
+    ("core.fsmonitor", "false"),
+    ("core.hooksPath", "/dev/null"),
+    ("core.ignoreCase", "false"),
+    ("core.ignoreStat", "false"),
+    ("core.preloadIndex", "false"),
+    ("core.sparseCheckout", "false"),
+    ("core.sparseCheckoutCone", "false"),
+    ("core.trustctime", "true"),
+    ("credential.helper", ""),
+    ("diff.external", "/bin/false"),
+    ("diff.ignoreSubmodules", "none"),
+    ("filter.lfs.clean", ""),
+    ("filter.lfs.process", ""),
+    ("filter.lfs.required", "false"),
+    ("filter.lfs.smudge", ""),
+    ("submodule.recurse", "false"),
+)
+REGULAR_FILE_IDENTITY_FIELDS = (
+    "st_dev",
+    "st_ino",
+    "st_mode",
+    "st_uid",
+    "st_gid",
+    "st_nlink",
+    "st_size",
+    "st_mtime_ns",
+    "st_ctime_ns",
+)
 ATTESTATION_RELATIVE = Path(
     "docker/images/airflow/whoscored-build-provenance-attestation.json"
 )
@@ -148,11 +190,11 @@ PROTECTED_SERVICE_BUILDS = {
     ),
 }
 PROTECTED_STAGE_RECIPE_SHA256 = {
-    "airflow-scheduler": "97454207d9ff3e55b13171a04814a437680627d16cc31dc29d8d7001bd8465e6",
+    "airflow-scheduler": "7e44dca7a2b5f014dda09ae39e9552132cd620f2f879a382d0e78d8d8e1a5f0d",
     "flaresolverr": "e4e28b69572d38f4f877154e6bc7a6f8fae0906edb624b62860fff53d0bcab20",
     "flaresolverr_whoscored_paid": "e4e28b69572d38f4f877154e6bc7a6f8fae0906edb624b62860fff53d0bcab20",
-    "whoscored_paid_gateway": "c5c5b80f5b28431c0ecdc133a909268f3db2340993473ff700599eb1cce4d5fa",
-    "whoscored_proxy_filter": "c5c5b80f5b28431c0ecdc133a909268f3db2340993473ff700599eb1cce4d5fa",
+    "whoscored_paid_gateway": "c8c2de1dec3e691e11a0f9734a6c865eb0020a63ece161088618f906f8733ee9",
+    "whoscored_proxy_filter": "c8c2de1dec3e691e11a0f9734a6c865eb0020a63ece161088618f906f8733ee9",
 }
 WHOSCORED_PROXY_COMMAND = (
     "python",
@@ -293,9 +335,15 @@ def open_protected_parent(path: Path, *, label: str) -> tuple[int, str]:
     return _open_parent_directory(path, label=label, require_protected_parents=True)
 
 
-def _read_fd_regular_file(
+def _stat_identity(value: os.stat_result) -> tuple[int, ...]:
+    """Return the immutable metadata identity captured around one fd read."""
+
+    return tuple(getattr(value, field) for field in REGULAR_FILE_IDENTITY_FIELDS)
+
+
+def _read_fd_regular_file_snapshot(
     path: Path, *, label: str, require_protected_parents: bool
-) -> bytes:
+) -> tuple[bytes, tuple[int, ...]]:
     file_flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
     directory_fd = -1
     file_fd = -1
@@ -328,33 +376,55 @@ def _read_fd_regular_file(
             os.close(file_fd)
         if directory_fd >= 0:
             os.close(directory_fd)
-    stable_fields = (
-        "st_dev",
-        "st_ino",
-        "st_mode",
-        "st_uid",
-        "st_nlink",
-        "st_size",
-        "st_mtime_ns",
-        "st_ctime_ns",
-    )
-    if any(
-        getattr(before, field) != getattr(candidate, field)
-        for candidate in (after, entry)
-        for field in stable_fields
-    ):
+    identity = _stat_identity(after)
+    if _stat_identity(before) != identity or _stat_identity(entry) != identity:
         raise ProvenanceError(f"{label} changed while it was read: {path}")
+    return raw, identity
+
+
+def _read_fd_regular_file(
+    path: Path, *, label: str, require_protected_parents: bool
+) -> bytes:
+    """Compatibility wrapper returning only bytes from one stable fd read."""
+
+    raw, _ = _read_fd_regular_file_snapshot(
+        path,
+        label=label,
+        require_protected_parents=require_protected_parents,
+    )
     return raw
 
 
+def read_stable_regular_file_snapshot(
+    path: Path, *, label: str
+) -> tuple[bytes, tuple[int, ...]]:
+    """Read one stable regular file and return bytes plus its fd identity."""
+
+    return _read_fd_regular_file_snapshot(
+        path, label=label, require_protected_parents=False
+    )
+
+
 def _read_stable_regular_file(path: Path, *, label: str) -> bytes:
-    return _read_fd_regular_file(path, label=label, require_protected_parents=False)
+    raw, _ = read_stable_regular_file_snapshot(path, label=label)
+    return raw
+
+
+def read_protected_regular_file_snapshot(
+    path: Path, *, label: str
+) -> tuple[bytes, tuple[int, ...]]:
+    """Read one protected file and return bytes plus its fd identity."""
+
+    return _read_fd_regular_file_snapshot(
+        path, label=label, require_protected_parents=True
+    )
 
 
 def read_protected_regular_file(path: Path, *, label: str) -> bytes:
     """Read one root-owned file through a no-symlink, fd-pinned path walk."""
 
-    return _read_fd_regular_file(path, label=label, require_protected_parents=True)
+    raw, _ = read_protected_regular_file_snapshot(path, label=label)
+    return raw
 
 
 def _replace_regular_file(path: Path, raw: bytes, *, label: str) -> None:
@@ -412,13 +482,13 @@ def _replace_regular_file(path: Path, raw: bytes, *, label: str) -> None:
             os.close(directory_fd)
 
 
-def _load_canonical_object(
+def _load_canonical_object_snapshot(
     path: Path, *, label: str, protected: bool = False
-) -> tuple[dict[str, Any], bytes]:
-    raw = (
-        read_protected_regular_file(path, label=label)
+) -> tuple[dict[str, Any], bytes, tuple[int, ...]]:
+    raw, identity = (
+        read_protected_regular_file_snapshot(path, label=label)
         if protected
-        else _read_stable_regular_file(path, label=label)
+        else read_stable_regular_file_snapshot(path, label=label)
     )
     try:
         value = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_object)
@@ -426,6 +496,15 @@ def _load_canonical_object(
         raise ProvenanceError(f"{label} is not canonical JSON: {path}") from exc
     if not isinstance(value, dict) or raw != canonical_bytes(value):
         raise ProvenanceError(f"{label} is not canonical JSON: {path}")
+    return value, raw, identity
+
+
+def _load_canonical_object(
+    path: Path, *, label: str, protected: bool = False
+) -> tuple[dict[str, Any], bytes]:
+    value, raw, _ = _load_canonical_object_snapshot(
+        path, label=label, protected=protected
+    )
     return value, raw
 
 
@@ -486,6 +565,136 @@ def _is_ignored(root: Path, path: Path) -> bool:
     return ignored
 
 
+def _open_trusted_git() -> int:
+    """Open the exact protected Git executable used for provenance reads."""
+
+    directory_fd = -1
+    executable_fd = -1
+    admitted = False
+    try:
+        directory_fd, name = open_protected_parent(GIT_CLI, label="Git CLI")
+        executable_fd = os.open(
+            name,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=directory_fd,
+        )
+        metadata = os.fstat(executable_fd)
+        entry = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != 0
+            or metadata.st_nlink != 1
+            or metadata.st_mode & 0o022
+            or metadata.st_mode & 0o111 == 0
+            or _stat_identity(metadata) != _stat_identity(entry)
+        ):
+            raise ProvenanceError("Git CLI is not a protected executable")
+        admitted = True
+        return executable_fd
+    except OSError as exc:
+        raise ProvenanceError("Git provenance is unavailable") from exc
+    finally:
+        if directory_fd >= 0:
+            os.close(directory_fd)
+        if executable_fd >= 0 and not admitted:
+            os.close(executable_fd)
+
+
+def _require_no_git_info_attributes(root: Path) -> None:
+    """Reject the one repository attribute source that --attr-source cannot mask."""
+
+    try:
+        git_dir = _resolve_git_dir(root)
+        candidates = [git_dir / "info/attributes"]
+        common_marker = git_dir / "commondir"
+        if common_marker.exists() or common_marker.is_symlink():
+            if not common_marker.is_file() or common_marker.is_symlink():
+                raise ProvenanceError("Git common metadata is unsafe")
+            common_value = common_marker.read_text(encoding="utf-8").strip()
+            if not common_value or "\0" in common_value:
+                raise ProvenanceError("Git common metadata is unsafe")
+            common = Path(common_value)
+            if not common.is_absolute():
+                common = git_dir / common
+            candidates.append(common.resolve() / "info/attributes")
+        if any(candidate.exists() or candidate.is_symlink() for candidate in candidates):
+            raise ProvenanceError(
+                "Git info attributes are unsupported for protected source validation"
+            )
+    except ProvenanceError:
+        raise
+    except (OSError, UnicodeError) as exc:
+        raise ProvenanceError("Git attributes cannot be validated safely") from exc
+
+
+def _run_git(
+    root: Path,
+    *arguments: str,
+    stdout: int = _SUBPROCESS_DEVNULL,
+) -> subprocess.CompletedProcess[bytes]:
+    """Run fd-pinned Git with no inherited process or repository executors."""
+
+    if (
+        not arguments
+        or any(not isinstance(argument, str) or "\0" in argument for argument in arguments)
+        or stdout not in {_SUBPROCESS_DEVNULL, _SUBPROCESS_PIPE}
+    ):
+        raise ProvenanceError("Git provenance command is invalid")
+    canonical_root = root.resolve()
+    _require_no_git_info_attributes(canonical_root)
+    git_arguments = list(arguments)
+    if git_arguments[0] == "diff":
+        git_arguments[1:1] = ["--no-ext-diff", "--no-textconv"]
+    safe_config = (*_GIT_SAFE_CONFIG, ("core.worktree", str(canonical_root)))
+    config_arguments = tuple(
+        argument
+        for key, value in safe_config
+        for argument in ("-c", f"{key}={value}")
+    )
+    environment = {
+        "GIT_ATTR_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_SYSTEM": "/dev/null",
+        "GIT_EDITOR": "/bin/false",
+        "GIT_EXTERNAL_DIFF": "/bin/false",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_PAGER": "/bin/false",
+        "GIT_SEQUENCE_EDITOR": "/bin/false",
+        "GIT_SSH_COMMAND": "/bin/false",
+        "GIT_TERMINAL_PROMPT": "0",
+        "HOME": "/nonexistent",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/usr/bin:/bin",
+    }
+    git_fd = _open_trusted_git()
+    try:
+        return _SUBPROCESS_RUN(
+            (
+                f"/proc/self/fd/{git_fd}",
+                "--no-pager",
+                "--no-optional-locks",
+                f"--attr-source={_EMPTY_GIT_TREE}",
+                *config_arguments,
+                "-C",
+                str(canonical_root),
+                *git_arguments,
+            ),
+            stdin=_SUBPROCESS_DEVNULL,
+            stdout=stdout,
+            stderr=_SUBPROCESS_DEVNULL,
+            env=environment,
+            pass_fds=(git_fd,),
+            check=False,
+        )
+    except OSError as exc:
+        raise ProvenanceError("Git provenance is unavailable") from exc
+    finally:
+        os.close(git_fd)
+
+
 def _git_evidence_is_checked(root: Path, path: Path) -> bool:
     relative = _relative(root, path)
     commands = (
@@ -494,14 +703,8 @@ def _git_evidence_is_checked(root: Path, path: Path) -> bool:
     )
     for arguments in commands:
         try:
-            result = subprocess.run(
-                ("git", "-C", str(root), *arguments),
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-            )
-        except OSError:
+            result = _run_git(root, *arguments)
+        except ProvenanceError:
             return False
         if result.returncode != 0:
             return False
@@ -509,16 +712,7 @@ def _git_evidence_is_checked(root: Path, path: Path) -> bool:
 
 
 def _git_output(root: Path, *arguments: str) -> str:
-    try:
-        result = subprocess.run(
-            ("git", "-C", str(root), *arguments),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-    except OSError as exc:
-        raise ProvenanceError("Git provenance is unavailable") from exc
+    result = _run_git(root, *arguments, stdout=_SUBPROCESS_PIPE)
     if result.returncode != 0:
         raise ProvenanceError(f"Git provenance command failed: {' '.join(arguments)}")
     try:
@@ -528,16 +722,7 @@ def _git_output(root: Path, *arguments: str) -> str:
 
 
 def _git_nul_paths(root: Path, *arguments: str) -> set[str]:
-    try:
-        result = subprocess.run(
-            ("git", "-C", str(root), *arguments),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-    except OSError as exc:
-        raise ProvenanceError("Git provenance is unavailable") from exc
+    result = _run_git(root, *arguments, stdout=_SUBPROCESS_PIPE)
     if result.returncode != 0:
         raise ProvenanceError(f"Git provenance command failed: {' '.join(arguments)}")
     try:
@@ -570,16 +755,9 @@ def _validate_default_index_flags(root: Path) -> None:
             raise ProvenanceError(
                 "Git index contains skip-worktree or assume-unchanged entries"
             )
-    try:
-        debug = subprocess.run(
-            ("git", "-C", str(root), "ls-files", "--debug", "-z", "--"),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-    except OSError as exc:
-        raise ProvenanceError("Git provenance is unavailable") from exc
+    debug = _run_git(
+        root, "ls-files", "--debug", "-z", "--", stdout=_SUBPROCESS_PIPE
+    )
     if debug.returncode != 0:
         raise ProvenanceError("Git index flags are unavailable")
     flags = re.findall(rb"\tflags: ([0-9a-fA-F]+)\n", debug.stdout)
@@ -590,14 +768,8 @@ def _validate_default_index_flags(root: Path) -> None:
 def _git_path_is_tracked(root: Path, path: Path) -> bool:
     relative = _relative(root, path)
     try:
-        result = subprocess.run(
-            ("git", "-C", str(root), "ls-files", "--error-unmatch", "--", relative),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-    except OSError:
+        result = _run_git(root, "ls-files", "--error-unmatch", "--", relative)
+    except ProvenanceError:
         return False
     return result.returncode == 0
 
@@ -606,16 +778,9 @@ def _git_blob(root: Path, revision: str, path: Path) -> bytes:
     if _COMMIT.fullmatch(revision) is None:
         raise ProvenanceError("Git blob revision is not a full commit")
     relative = _relative(root, path)
-    try:
-        tree = subprocess.run(
-            ("git", "-C", str(root), "ls-tree", "-z", revision, "--", relative),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-    except OSError as exc:
-        raise ProvenanceError("Git provenance is unavailable") from exc
+    tree = _run_git(
+        root, "ls-tree", "-z", revision, "--", relative, stdout=_SUBPROCESS_PIPE
+    )
     records = tree.stdout.split(b"\0") if tree.returncode == 0 else []
     if len(records) != 2 or records[1] or b"\t" not in records[0]:
         raise ProvenanceError(
@@ -632,14 +797,14 @@ def _git_blob(root: Path, revision: str, path: Path) -> bytes:
             f"payload evidence is not a regular non-executable file: {relative}"
         )
     try:
-        result = subprocess.run(
-            ("git", "-C", str(root), "cat-file", "blob", fields[2].decode("ascii")),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            check=False,
+        result = _run_git(
+            root,
+            "cat-file",
+            "blob",
+            fields[2].decode("ascii"),
+            stdout=_SUBPROCESS_PIPE,
         )
-    except (OSError, UnicodeDecodeError) as exc:
+    except UnicodeDecodeError as exc:
         raise ProvenanceError("Git provenance is unavailable") from exc
     if result.returncode != 0:
         raise ProvenanceError(f"cannot read payload evidence blob: {relative}")
@@ -735,14 +900,8 @@ def _git_evidence_is_checked_against(root: Path, relative: str, revision: str) -
     )
     for arguments in commands:
         try:
-            result = subprocess.run(
-                ("git", "-C", str(root), *arguments),
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-            )
-        except OSError:
+            result = _run_git(root, *arguments)
+        except ProvenanceError:
             return False
         if result.returncode != 0:
             return False
@@ -864,9 +1023,19 @@ class Discovery:
     issues: list[dict[str, str]] = field(default_factory=list)
     material_paths: set[Path] = field(default_factory=set)
     report: dict[str, Any] = field(default_factory=dict)
+    build_attestation_raw: bytes | None = None
+    build_attestation_identity: tuple[int, ...] | None = None
+    build_manifest_raw: bytes | None = None
+    build_manifest_identity: tuple[int, ...] | None = None
     deployment_attestation: Mapping[str, Any] | None = None
     deployment_attestation_raw: bytes | None = None
+    deployment_attestation_identity: tuple[int, ...] | None = None
     deployment_final_images: Mapping[str, str] | None = None
+    validated_release_revision: str | None = None
+    validated_payload_revision: str | None = None
+    validated_manifest_sha256: str | None = None
+    validated_source_tree_sha256: str | None = None
+    validated_payload_image_ids: Mapping[str, str] | None = None
 
     def issue(self, category: str, input_name: str, detail: str) -> None:
         self.issues.append(
@@ -3408,6 +3577,25 @@ def generate_ready_evidence(
         "status": "blocked-v1",
     }
     blocked_manifest = {"schema_version": SCHEMA_VERSION, "status": "blocked-v1"}
+    ready_manifest_fields = {
+        "closure_report_sha256",
+        "generated_at",
+        *RECORD_KEYS,
+        "schema_version",
+        "source_revision",
+        "source_tree_sha256",
+    }
+    # A crash may publish the manifest while the attestation remains blocked.
+    # Reuse that create-once timestamp so a normal rerun with a fresh shell
+    # clock can finish the exact interrupted decision instead of deadlocking.
+    current_generated_at = current_manifest.get("generated_at")
+    if (
+        set(current_manifest) == ready_manifest_fields
+        and current_manifest.get("schema_version") == SCHEMA_VERSION
+        and isinstance(current_generated_at, str)
+        and _UTC_TIMESTAMP.fullmatch(current_generated_at) is not None
+    ):
+        generated_at = current_generated_at
 
     revision = source_revision(root)
     _validate_payload_blocked_evidence(root, revision)
@@ -3503,8 +3691,8 @@ def _validate_deployment_attestation(
     *,
     manifest_digest: str,
     local_images: Sequence[Mapping[str, Any]],
-) -> tuple[dict[str, Any], bytes, dict[str, str]]:
-    deployment, raw = _load_canonical_object(
+) -> tuple[dict[str, Any], bytes, tuple[int, ...], dict[str, str]]:
+    deployment, raw, identity = _load_canonical_object_snapshot(
         path, label="deployment attestation", protected=True
     )
     expected_fields = {
@@ -3559,7 +3747,7 @@ def _validate_deployment_attestation(
         raise ProvenanceError(
             "deployment images have duplicate, extra, missing, or changed payload bindings"
         )
-    return deployment, raw, final_images
+    return deployment, raw, identity, final_images
 
 
 def _freeze_json(value: Any) -> Any:
@@ -3595,17 +3783,18 @@ def validate_ready_build_evidence(
     _require_tracked_evidence(
         root, attestation_path, label="build attestation", require_checked=True
     )
-    attestation, attestation_raw = _load_canonical_object(
-        attestation_path, label="build attestation"
+    attestation, attestation_raw, attestation_identity = (
+        _load_canonical_object_snapshot(attestation_path, label="build attestation")
     )
     manifest_digest = _validate_attestation(attestation, expected_status="ready-v1")
     _require_tracked_evidence(
         root, manifest_path, label="build manifest", require_checked=True
     )
-    manifest, manifest_raw = _load_canonical_object(
+    manifest, manifest_raw, manifest_identity = _load_canonical_object_snapshot(
         manifest_path, label="build manifest"
     )
-    evidence_revision = release_revision or source_revision(root)
+    checkout_revision = source_revision(root)
+    evidence_revision = release_revision or checkout_revision
     if not hmac.compare_digest(
         attestation_raw,
         _git_blob(root, evidence_revision, canonical_attestation),
@@ -3620,7 +3809,7 @@ def validate_ready_build_evidence(
     if not isinstance(payload_revision, str):
         raise ProvenanceError("manifest source_revision is missing")
     _validate_promotion_revision(
-        root, payload_revision, release_revision=release_revision
+        root, payload_revision, release_revision=evidence_revision
     )
     payload_ids = _manifest_payload_ids(manifest)
     discovery = discover_repository(
@@ -3628,6 +3817,20 @@ def validate_ready_build_evidence(
     )
     _validate_material_revision(root, payload_revision, discovery.material_paths)
     _validate_ready_manifest(manifest, manifest_raw, discovery, manifest_digest)
+    source_tree_digest = manifest.get("source_tree_sha256")
+    if not isinstance(source_tree_digest, str):
+        raise ProvenanceError("manifest source_tree_sha256 is missing")
+    discovery.build_attestation_raw = attestation_raw
+    discovery.build_attestation_identity = attestation_identity
+    discovery.build_manifest_raw = manifest_raw
+    discovery.build_manifest_identity = manifest_identity
+    discovery.validated_release_revision = evidence_revision
+    discovery.validated_payload_revision = payload_revision
+    discovery.validated_manifest_sha256 = manifest_digest
+    discovery.validated_source_tree_sha256 = source_tree_digest
+    discovery.validated_payload_image_ids = MappingProxyType(dict(payload_ids))
+    if source_revision(root) != checkout_revision:
+        raise ProvenanceError("checkout revision changed during ready validation")
     return discovery
 
 
@@ -3640,14 +3843,16 @@ def validate(
     expect_blocked: bool,
 ) -> Discovery:
     root = root.resolve()
-    _require_tracked_evidence(
-        root,
-        attestation_path,
-        label="build attestation",
-        require_checked=not expect_blocked,
-    )
-    attestation, _ = _load_canonical_object(attestation_path, label="build attestation")
     if expect_blocked:
+        _require_tracked_evidence(
+            root,
+            attestation_path,
+            label="build attestation",
+            require_checked=False,
+        )
+        attestation, _ = _load_canonical_object(
+            attestation_path, label="build attestation"
+        )
         _validate_attestation(attestation, expected_status="blocked-v1")
         discovery = discover_repository(root)
         if not discovery.issues:
@@ -3665,15 +3870,22 @@ def validate(
         raise ProvenanceError(
             "external deployment attestation is required for final image promotion"
         )
-    attestation, _ = _load_canonical_object(attestation_path, label="build attestation")
-    manifest_digest = _validate_attestation(attestation, expected_status="ready-v1")
-    deployment, deployment_raw, final_images = _validate_deployment_attestation(
-        deployment_attestation_path,
-        manifest_digest=manifest_digest,
-        local_images=discovery.records["local_images"],
+    manifest_digest = discovery.validated_manifest_sha256
+    if (
+        not isinstance(manifest_digest, str)
+        or _DIGEST.fullmatch(manifest_digest) is None
+    ):
+        raise ProvenanceError("ready validation did not preserve the manifest digest")
+    deployment, deployment_raw, deployment_identity, final_images = (
+        _validate_deployment_attestation(
+            deployment_attestation_path,
+            manifest_digest=manifest_digest,
+            local_images=discovery.records["local_images"],
+        )
     )
     discovery.deployment_attestation = _freeze_json(deployment)
     discovery.deployment_attestation_raw = deployment_raw
+    discovery.deployment_attestation_identity = deployment_identity
     discovery.deployment_final_images = MappingProxyType(dict(final_images))
     return discovery
 

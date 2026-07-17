@@ -149,8 +149,8 @@ Set the rollout paths once before running any command in this section:
 
 ```bash
 export COMPOSE_ENV_FILE=/root/data-platform-football/.env
-export WHOSCORED_ENV_FILE=/root/data-platform-football/.env.whoscored-rollout
-export PROXY_POOL_ENV_FILE=/root/data-platform-football/.env.proxy-pool.whoscored-v2
+export WHOSCORED_ENV_FILE=/root/.secrets/whoscored-runtime-v2.env
+export PROXY_POOL_ENV_FILE=/root/.secrets/whoscored-proxy-v2.env
 export RELEASE=/absolute/path/to/the-reviewed-release
 
 # Clear host loader controls before starting even `/usr/bin/env`; a shell that
@@ -372,13 +372,164 @@ evidence is additionally required before the paid proxy service itself may be
 created.
 
 Do not edit either provenance JSON by hand. First resolve every source-closure
-issue, leave the checked-in `blocked-v1` pair in place, and create one clean,
-reviewed payload commit. Build the six payload images from that exact commit
+issue, refresh the generated runtime evidence below, leave the checked-in
+`blocked-v1` pair in place, and create one clean, reviewed payload commit.
+Build the six payload images from that exact commit
 (`airflow-base`, `airflow-scheduler-payload`,
 `airflow-whoscored-proxy-payload`, FlareSolverr, JupyterHub and Superset), then
 capture each exact `docker image inspect --format '{{.Id}}'` value. The four
 Airflow base services share one ID and the three Superset services share one
 ID, but every Compose service must be named explicitly:
+
+The runtime lock and its three image trust roots are generated files too; do
+not edit them by hand. Before the payload commit, refresh and then verify all
+four files with the isolated deterministic generator. It publishes the
+production trust root last, so an interrupted refresh remains blocked:
+
+```bash
+"${ADMISSION_PYTHON[@]}" \
+  "$RELEASE/scripts/generate_whoscored_runtime_evidence.py" \
+  --root "$RELEASE" --write
+"${ADMISSION_PYTHON[@]}" \
+  "$RELEASE/scripts/generate_whoscored_runtime_evidence.py" \
+  --root "$RELEASE" --check
+git -C "$RELEASE" diff -- \
+  scrapers/whoscored/runtime_contract.lock \
+  docker/images/airflow/whoscored-runtime-trust-root-generic \
+  docker/images/airflow/whoscored-runtime-trust-root-test \
+  docker/images/airflow/whoscored-runtime-trust-root-production
+```
+
+Use one protected Buildx state and evidence directory outside the checkout.
+The metadata files are part of promotion evidence: keep them root-owned mode
+`0600`, and never regenerate one after recording its payload image ID. These
+commands intentionally invoke the reviewed Buildx plugin and Docker CLI by
+absolute path under empty environments:
+
+```bash
+test "$(id -u)" = 0
+cd "$RELEASE"
+test "$(pwd -P)" = "$RELEASE"
+BUILDX=/root/.docker/cli-plugins/docker-buildx
+BUILD_HOME=/absolute/protected/whoscored-build-home
+BUILDX_STATE=/absolute/protected/whoscored-buildx-state
+DOCKER_AUTH=/absolute/protected/whoscored-docker-config
+BUILD_EVIDENCE=/absolute/protected/whoscored-build-evidence
+REGISTRY=registry.example.invalid/data-platform
+test "$REGISTRY" != registry.example.invalid/data-platform
+test -x "$BUILDX"
+test "$(/usr/bin/stat -c '%u:%h' "$BUILDX")" = 0:1
+test $((8#$(/usr/bin/stat -c %a "$BUILDX") & 8#022)) = 0
+/usr/bin/install -d -o root -g root -m 0700 \
+  "$BUILD_HOME" "$BUILDX_STATE" "$DOCKER_AUTH" "$BUILD_EVIDENCE"
+umask 077
+
+CLEAN_GIT=(
+  /usr/bin/env -i HOME=/nonexistent PATH=/usr/bin:/bin
+  LANG=C.UTF-8 LC_ALL=C.UTF-8
+  GIT_ATTR_NOSYSTEM=1 GIT_EXTERNAL_DIFF=/bin/false
+  GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+  GIT_NO_REPLACE_OBJECTS=1 GIT_OPTIONAL_LOCKS=0
+  GIT_PAGER=/bin/false GIT_TERMINAL_PROMPT=0
+  /usr/bin/git --no-pager --no-optional-locks
+  -c core.attributesFile=/dev/null -c core.excludesFile=/dev/null
+  -c core.fsmonitor=false -c core.hooksPath=/dev/null
+  -c core.ignoreStat=false -c core.trustctime=true
+  -c core.worktree="$RELEASE" -c credential.helper=
+  -c diff.external=/bin/false -c filter.lfs.clean=
+  -c filter.lfs.process= -c filter.lfs.required=false
+  -c filter.lfs.smudge= -c submodule.recurse=false
+  -C "$RELEASE"
+)
+BUILDX_CMD=(
+  /usr/bin/env -i HOME="$BUILD_HOME" PATH=/usr/bin:/bin
+  LANG=C.UTF-8 LC_ALL=C.UTF-8
+  DOCKER_CONFIG="$DOCKER_AUTH" DOCKER_HOST=unix:///run/docker.sock
+  BUILDX_CONFIG="$BUILDX_STATE" BUILDX_GIT_CHECK_DIRTY=1
+  BUILDX_METADATA_PROVENANCE=max
+  GIT_ATTR_NOSYSTEM=1 GIT_EXTERNAL_DIFF=/bin/false
+  GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+  GIT_NO_REPLACE_OBJECTS=1 GIT_OPTIONAL_LOCKS=0
+  GIT_CONFIG_COUNT=14
+  GIT_CONFIG_KEY_0=core.fsmonitor GIT_CONFIG_VALUE_0=false
+  GIT_CONFIG_KEY_1=core.hooksPath GIT_CONFIG_VALUE_1=/dev/null
+  GIT_CONFIG_KEY_2=core.attributesFile GIT_CONFIG_VALUE_2=/dev/null
+  GIT_CONFIG_KEY_3=core.excludesFile GIT_CONFIG_VALUE_3=/dev/null
+  GIT_CONFIG_KEY_4=core.ignoreStat GIT_CONFIG_VALUE_4=false
+  GIT_CONFIG_KEY_5=core.trustctime GIT_CONFIG_VALUE_5=true
+  GIT_CONFIG_KEY_6=filter.lfs.process GIT_CONFIG_VALUE_6=
+  GIT_CONFIG_KEY_7=filter.lfs.clean GIT_CONFIG_VALUE_7=
+  GIT_CONFIG_KEY_8=filter.lfs.smudge GIT_CONFIG_VALUE_8=
+  GIT_CONFIG_KEY_9=filter.lfs.required GIT_CONFIG_VALUE_9=false
+  GIT_CONFIG_KEY_10=diff.external GIT_CONFIG_VALUE_10=/bin/false
+  GIT_CONFIG_KEY_11=credential.helper GIT_CONFIG_VALUE_11=
+  GIT_CONFIG_KEY_12=submodule.recurse GIT_CONFIG_VALUE_12=false
+  GIT_CONFIG_KEY_13=core.worktree GIT_CONFIG_VALUE_13="$RELEASE"
+  "$BUILDX"
+)
+DOCKER_CMD=(
+  /usr/bin/env -i HOME="$BUILD_HOME" PATH=/usr/bin:/bin
+  LANG=C.UTF-8 LC_ALL=C.UTF-8
+  DOCKER_CONFIG="$DOCKER_AUTH" DOCKER_HOST=unix:///run/docker.sock
+  /usr/bin/docker
+)
+
+test -z "$(/usr/bin/find "$RELEASE" -path "$RELEASE/.git" -prune -o \
+  -name .gitattributes -print -quit)"
+test ! -e "$("${CLEAN_GIT[@]}" rev-parse --git-path info/attributes)"
+test -z "$("${CLEAN_GIT[@]}" status --porcelain=v1 --untracked-files=all)"
+PAYLOAD_REVISION="$("${CLEAN_GIT[@]}" rev-parse HEAD)"
+test "${#PAYLOAD_REVISION}" = 40
+for metadata in airflow-base airflow-scheduler-payload \
+  airflow-whoscored-proxy-payload airflow-scheduler \
+  airflow-whoscored-proxy flaresolverr jupyterhub superset; do
+  test ! -e "$BUILD_EVIDENCE/$metadata.json"
+done
+AIRFLOW_BASE_TAG="$REGISTRY/airflow-base:payload-$PAYLOAD_REVISION"
+SCHEDULER_PAYLOAD_TAG="$REGISTRY/airflow-scheduler:payload-$PAYLOAD_REVISION"
+PROXY_PAYLOAD_TAG="$REGISTRY/airflow-whoscored-proxy:payload-$PAYLOAD_REVISION"
+FLARESOLVERR_TAG="$REGISTRY/flaresolverr-whoscored:payload-$PAYLOAD_REVISION"
+JUPYTERHUB_TAG="$REGISTRY/jupyterhub:payload-$PAYLOAD_REVISION"
+SUPERSET_TAG="$REGISTRY/superset:payload-$PAYLOAD_REVISION"
+
+"${BUILDX_CMD[@]}" build --platform linux/amd64 \
+  --provenance=mode=max,version=v1 --load --target airflow-base \
+  --metadata-file "$BUILD_EVIDENCE/airflow-base.json" \
+  --tag "$AIRFLOW_BASE_TAG" docker/images/airflow
+"${BUILDX_CMD[@]}" build --platform linux/amd64 \
+  --provenance=mode=max,version=v1 --load --target airflow-scheduler-payload \
+  --metadata-file "$BUILD_EVIDENCE/airflow-scheduler-payload.json" \
+  --tag "$SCHEDULER_PAYLOAD_TAG" docker/images/airflow
+"${BUILDX_CMD[@]}" build --platform linux/amd64 \
+  --provenance=mode=max,version=v1 --load --target airflow-whoscored-proxy-payload \
+  --metadata-file "$BUILD_EVIDENCE/airflow-whoscored-proxy-payload.json" \
+  --tag "$PROXY_PAYLOAD_TAG" docker/images/airflow
+"${BUILDX_CMD[@]}" build --platform linux/amd64 \
+  --provenance=mode=max,version=v1 --load \
+  --file docker/images/flaresolverr-whoscored/Dockerfile \
+  --metadata-file "$BUILD_EVIDENCE/flaresolverr.json" \
+  --tag "$FLARESOLVERR_TAG" .
+"${BUILDX_CMD[@]}" build --platform linux/amd64 \
+  --provenance=mode=max,version=v1 --load \
+  --metadata-file "$BUILD_EVIDENCE/jupyterhub.json" \
+  --tag "$JUPYTERHUB_TAG" docker/images/jupyterhub
+"${BUILDX_CMD[@]}" build --platform linux/amd64 \
+  --provenance=mode=max,version=v1 --load \
+  --metadata-file "$BUILD_EVIDENCE/superset.json" \
+  --tag "$SUPERSET_TAG" docker/images/superset
+
+AIRFLOW_BASE_ID="$("${DOCKER_CMD[@]}" image inspect --format '{{.Id}}' "$AIRFLOW_BASE_TAG")"
+AIRFLOW_SCHEDULER_PAYLOAD_ID="$("${DOCKER_CMD[@]}" image inspect --format '{{.Id}}' "$SCHEDULER_PAYLOAD_TAG")"
+WHOSCORED_PROXY_PAYLOAD_ID="$("${DOCKER_CMD[@]}" image inspect --format '{{.Id}}' "$PROXY_PAYLOAD_TAG")"
+FLARESOLVERR_PAYLOAD_ID="$("${DOCKER_CMD[@]}" image inspect --format '{{.Id}}' "$FLARESOLVERR_TAG")"
+JUPYTERHUB_PAYLOAD_ID="$("${DOCKER_CMD[@]}" image inspect --format '{{.Id}}' "$JUPYTERHUB_TAG")"
+SUPERSET_PAYLOAD_ID="$("${DOCKER_CMD[@]}" image inspect --format '{{.Id}}' "$SUPERSET_TAG")"
+for image_id in "$AIRFLOW_BASE_ID" "$AIRFLOW_SCHEDULER_PAYLOAD_ID" \
+  "$WHOSCORED_PROXY_PAYLOAD_ID" "$FLARESOLVERR_PAYLOAD_ID" \
+  "$JUPYTERHUB_PAYLOAD_ID" "$SUPERSET_PAYLOAD_ID"; do
+  case "$image_id" in sha256:????????????????????????????????????????????????????????????????) ;; *) exit 1 ;; esac
+done
+```
 
 ```bash
 GENERATED_AT="$(/usr/bin/date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -389,10 +540,12 @@ GENERATED_AT="$(/usr/bin/date -u +%Y-%m-%dT%H:%M:%SZ)"
   --payload-image-id "airflow-log-init=$AIRFLOW_BASE_ID" \
   --payload-image-id "airflow-scheduler=$AIRFLOW_SCHEDULER_PAYLOAD_ID" \
   --payload-image-id "airflow-webserver=$AIRFLOW_BASE_ID" \
+  --payload-image-id "fbref_proxy_filter=$AIRFLOW_SCHEDULER_PAYLOAD_ID" \
   --payload-image-id "flaresolverr=$FLARESOLVERR_PAYLOAD_ID" \
   --payload-image-id "flaresolverr_whoscored_paid=$FLARESOLVERR_PAYLOAD_ID" \
   --payload-image-id "jupyterhub=$JUPYTERHUB_PAYLOAD_ID" \
   --payload-image-id "proxy_filter=$AIRFLOW_BASE_ID" \
+  --payload-image-id "sofascore_proxy_filter=$AIRFLOW_SCHEDULER_PAYLOAD_ID" \
   --payload-image-id "superset=$SUPERSET_PAYLOAD_ID" \
   --payload-image-id "superset-beat=$SUPERSET_PAYLOAD_ID" \
   --payload-image-id "superset-worker=$SUPERSET_PAYLOAD_ID" \
@@ -416,6 +569,105 @@ the release SHA itself must still be the single-parent promotion child. This
 CI mode is build verification only: ordinary validation and production
 admission still require the separate external deployment attestation and final
 registry digests.
+
+After reviewing and committing exactly the two generated provenance files,
+finish from that clean, single-parent promotion child. Do not rebuild the four
+non-derived images: push the exact local objects whose IDs were recorded. Build
+the scheduler and dedicated proxy final targets once from the promotion child,
+and capture Buildx maximum provenance during those two builds:
+
+```bash
+test -z "$("${CLEAN_GIT[@]}" status --porcelain=v1 --untracked-files=all)"
+RELEASE_REVISION="$("${CLEAN_GIT[@]}" rev-parse HEAD)"
+test "${#RELEASE_REVISION}" = 40
+test "$("${CLEAN_GIT[@]}" rev-parse HEAD^)" = "$PAYLOAD_REVISION"
+
+test "$("${DOCKER_CMD[@]}" image inspect --format '{{.Id}}' "$AIRFLOW_BASE_TAG")" = "$AIRFLOW_BASE_ID"
+test "$("${DOCKER_CMD[@]}" image inspect --format '{{.Id}}' "$FLARESOLVERR_TAG")" = "$FLARESOLVERR_PAYLOAD_ID"
+test "$("${DOCKER_CMD[@]}" image inspect --format '{{.Id}}' "$JUPYTERHUB_TAG")" = "$JUPYTERHUB_PAYLOAD_ID"
+test "$("${DOCKER_CMD[@]}" image inspect --format '{{.Id}}' "$SUPERSET_TAG")" = "$SUPERSET_PAYLOAD_ID"
+"${DOCKER_CMD[@]}" image push "$AIRFLOW_BASE_TAG"
+"${DOCKER_CMD[@]}" image push "$FLARESOLVERR_TAG"
+"${DOCKER_CMD[@]}" image push "$JUPYTERHUB_TAG"
+"${DOCKER_CMD[@]}" image push "$SUPERSET_TAG"
+
+SCHEDULER_FINAL_TAG="$REGISTRY/airflow-scheduler:ready-$RELEASE_REVISION"
+PROXY_FINAL_TAG="$REGISTRY/airflow-whoscored-proxy:ready-$RELEASE_REVISION"
+"${BUILDX_CMD[@]}" build --platform linux/amd64 \
+  --provenance=mode=max,version=v1 --push --target airflow-scheduler \
+  --metadata-file "$BUILD_EVIDENCE/airflow-scheduler.json" \
+  --tag "$SCHEDULER_FINAL_TAG" docker/images/airflow
+"${BUILDX_CMD[@]}" build --platform linux/amd64 \
+  --provenance=mode=max,version=v1 --push --target airflow-whoscored-proxy \
+  --metadata-file "$BUILD_EVIDENCE/airflow-whoscored-proxy.json" \
+  --tag "$PROXY_FINAL_TAG" docker/images/airflow
+
+AIRFLOW_BASE_FINAL_IMAGE="${AIRFLOW_BASE_TAG%:*}@$(/usr/bin/jq -er '."containerimage.digest"' "$BUILD_EVIDENCE/airflow-base.json")"
+AIRFLOW_SCHEDULER_FINAL_IMAGE="${SCHEDULER_FINAL_TAG%:*}@$(/usr/bin/jq -er '."containerimage.digest"' "$BUILD_EVIDENCE/airflow-scheduler.json")"
+AIRFLOW_WHOSCORED_PROXY_FINAL_IMAGE="${PROXY_FINAL_TAG%:*}@$(/usr/bin/jq -er '."containerimage.digest"' "$BUILD_EVIDENCE/airflow-whoscored-proxy.json")"
+FLARESOLVERR_FINAL_IMAGE="${FLARESOLVERR_TAG%:*}@$(/usr/bin/jq -er '."containerimage.digest"' "$BUILD_EVIDENCE/flaresolverr.json")"
+JUPYTERHUB_FINAL_IMAGE="${JUPYTERHUB_TAG%:*}@$(/usr/bin/jq -er '."containerimage.digest"' "$BUILD_EVIDENCE/jupyterhub.json")"
+SUPERSET_FINAL_IMAGE="${SUPERSET_TAG%:*}@$(/usr/bin/jq -er '."containerimage.digest"' "$BUILD_EVIDENCE/superset.json")"
+
+"${DOCKER_CMD[@]}" image pull "$AIRFLOW_BASE_FINAL_IMAGE"
+"${DOCKER_CMD[@]}" image pull "$AIRFLOW_SCHEDULER_FINAL_IMAGE"
+"${DOCKER_CMD[@]}" image pull "$AIRFLOW_WHOSCORED_PROXY_FINAL_IMAGE"
+"${DOCKER_CMD[@]}" image pull "$FLARESOLVERR_FINAL_IMAGE"
+"${DOCKER_CMD[@]}" image pull "$JUPYTERHUB_FINAL_IMAGE"
+"${DOCKER_CMD[@]}" image pull "$SUPERSET_FINAL_IMAGE"
+"${DOCKER_CMD[@]}" image inspect --format '{{json .Id}} {{json .RepoDigests}} {{json .Config}}' "$AIRFLOW_BASE_FINAL_IMAGE"
+"${DOCKER_CMD[@]}" image inspect --format '{{json .Id}} {{json .RepoDigests}} {{json .Config}}' "$AIRFLOW_SCHEDULER_FINAL_IMAGE"
+"${DOCKER_CMD[@]}" image inspect --format '{{json .Id}} {{json .RepoDigests}} {{json .Config}}' "$AIRFLOW_WHOSCORED_PROXY_FINAL_IMAGE"
+"${DOCKER_CMD[@]}" image inspect --format '{{json .Id}} {{json .RepoDigests}} {{json .Config}}' "$FLARESOLVERR_FINAL_IMAGE"
+"${DOCKER_CMD[@]}" image inspect --format '{{json .Id}} {{json .RepoDigests}} {{json .Config}}' "$JUPYTERHUB_FINAL_IMAGE"
+"${DOCKER_CMD[@]}" image inspect --format '{{json .Id}} {{json .RepoDigests}} {{json .Config}}' "$SUPERSET_FINAL_IMAGE"
+for metadata in airflow-base airflow-scheduler airflow-whoscored-proxy \
+  flaresolverr jupyterhub superset; do
+  test "$(/usr/bin/stat -c '%u:%g:%a:%h' "$BUILD_EVIDENCE/$metadata.json")" = \
+    0:0:600:1
+done
+```
+
+Create the external evidence with the fail-closed generator. Every value below
+is the exact pushed
+`repository@sha256:<64 hex>` reference, never a tag. The generator performs
+read-only Docker image inspection, binds each digest to its protected Buildx
+maximum-provenance file and exact clean Git revision, checks the final target,
+Dockerfile and runtime config, then streams `docker image save` to reconstruct
+and compare the exact bytes, owner and mode of all seven gate files inside each
+digest-addressed final image. For the two derived Airflow targets it also
+rejects every final-layer addition, removal, whiteout or extended attribute
+outside the reviewed gate and Python-alias delta. It never creates or starts a
+container, expands the six groups to all 15 local services, refuses an existing
+output and creates a canonical root-owned mode-0600 file:
+
+```bash
+export WHOSCORED_DEPLOYMENT_ATTESTATION=/absolute/protected/deployment-attestation.json
+test ! -e "$WHOSCORED_DEPLOYMENT_ATTESTATION"
+"${ADMISSION_PYTHON[@]}" \
+  "$RELEASE/scripts/generate_whoscored_deployment_attestation.py" \
+  --root "$RELEASE" \
+  --output "$WHOSCORED_DEPLOYMENT_ATTESTATION" \
+  --final-image "airflow-base=$AIRFLOW_BASE_FINAL_IMAGE" \
+  --final-image "airflow-scheduler=$AIRFLOW_SCHEDULER_FINAL_IMAGE" \
+  --final-image "airflow-whoscored-proxy=$AIRFLOW_WHOSCORED_PROXY_FINAL_IMAGE" \
+  --final-image "flaresolverr=$FLARESOLVERR_FINAL_IMAGE" \
+  --final-image "jupyterhub=$JUPYTERHUB_FINAL_IMAGE" \
+  --final-image "superset=$SUPERSET_FINAL_IMAGE" \
+  --build-metadata "airflow-base=$BUILD_EVIDENCE/airflow-base.json" \
+  --build-metadata "airflow-scheduler=$BUILD_EVIDENCE/airflow-scheduler.json" \
+  --build-metadata "airflow-whoscored-proxy=$BUILD_EVIDENCE/airflow-whoscored-proxy.json" \
+  --build-metadata "flaresolverr=$BUILD_EVIDENCE/flaresolverr.json" \
+  --build-metadata "jupyterhub=$BUILD_EVIDENCE/jupyterhub.json" \
+  --build-metadata "superset=$BUILD_EVIDENCE/superset.json"
+test "$(/usr/bin/stat -c '%u:%g:%a:%h' \
+  "$WHOSCORED_DEPLOYMENT_ATTESTATION")" = "0:0:600:1"
+```
+
+Do not create this JSON by hand. A missing/extra service, changed payload ID,
+mutable tag, absent `RepoDigests` entry, wrong final target/config/gate input,
+dirty Git revision, unsafe metadata path or Docker/repository change during the
+two validation passes leaves deployment blocked.
 
 Deploy that exact reviewed promotion SHA. A GitHub merge commit, squash or
 rebased copy has a different ancestry/identity and is rejected even when its
@@ -952,28 +1204,37 @@ process-tree RSS plus monitored-container cgroup memory <=12 GiB, and no
 container restart/OOM evidence. Use the exact invocation printed by
 `--help`; keep the normal short duration only for CI and operator rehearsal.
 
-The v2 supervisor resolves the local ID behind the exact derived image reference
-`data-platform-flaresolverr-whoscored:3.4.6` on every sample. The running
-container must keep that ID and the current checkout's Compose hash/labels,
+The v3 supervisor validates the exact external `ready-v1` deployment
+attestation and its protected digest-only Compose override before it starts a
+worker. It resolves the local ID behind the attested
+`repository@sha256:<64 hex>` FlareSolverr reference on every sample. The running
+container must keep that ID and the current checkout's three-file Compose
+hash/labels,
 use the image-baked root-owned launcher and extension with no bind/volume
 mounts and only the four exact reviewed tmpfs paths, keep a read-only root
 filesystem, numeric UID/GID, dropped capabilities and the exact AppArmor/seccomp
 options. Retagging the reference, using the old upstream image with an extension
 bind, shadowing the payload with tmpfs, or starting the service from another
 checkout stops the canary fail-closed.
-It renders that hash through the current checkout's `scripts/compose.sh` and
-all three protected environment files, so the selected SeaweedFS topology state
-and `WHOSCORED_PROXY_APPROVAL_HOST_DIR` prerequisite must already pass even
-though this canary itself is direct-only.
+It renders that hash through `/usr/bin/docker compose`, the base, supervised
+and exact digest-only files in admission order, and all three protected
+environment files. The selected SeaweedFS topology state and
+`WHOSCORED_PROXY_APPROVAL_HOST_DIR` prerequisite must already pass even though
+this canary itself is direct-only. Replacement or mutation of any attestation,
+Compose or environment input stops the supervisor fail-closed.
 
-For the current issue-954 candidate, set `RELEASE=/root/dpf-whoscored-merge`.
-The evidence directory is outside the checkout and create-once output remains
-mode `0600`:
+Use the exact checkout whose ready revision and payloads are named by the
+deployment attestation. The evidence directory is outside the checkout and
+create-once output remains mode `0600`:
 
 ```bash
-RELEASE=/root/dpf-whoscored-merge
+RELEASE=/absolute/path/to/the-ready-release
 cd "$RELEASE"
 test "$(pwd -P)" = "$RELEASE"
+: "${WHOSCORED_DEPLOYMENT_ATTESTATION:?set the protected ready-v1 deployment attestation}"
+: "${WHOSCORED_DIGEST_OVERRIDE:?set the protected digest-only Compose file}"
+test -f "$WHOSCORED_DEPLOYMENT_ATTESTATION"
+test -f "$WHOSCORED_DIGEST_OVERRIDE"
 : "${WHOSCORED_PROXY_APPROVAL_HOST_DIR:?set the protected approval directory used by the admitted Compose model}"
 test -d "$WHOSCORED_PROXY_APPROVAL_HOST_DIR"
 export WHOSCORED_PROXY_APPROVAL_HOST_DIR
@@ -987,17 +1248,21 @@ CANARY_OUTPUT="$CANARY_EVIDENCE_DIR/whoscored-capacity-$(date -u +%Y%m%dT%H%M%SZ
   --scope 'INT-World Cup=2026' \
   --match-limit 3 --profile-limit 3 \
   --flaresolverr-url http://127.0.0.1:8191 \
+  --deployment-attestation "$WHOSCORED_DEPLOYMENT_ATTESTATION" \
+  --digest-override "$WHOSCORED_DIGEST_OVERRIDE" \
   --container airflow-scheduler \
   --container flaresolverr \
-  --container proxy_filter \
   --output "$CANARY_OUTPUT"
 ```
 
 Run this supervisor on the host: it reads its own four child process trees from
 `/proc`, reads required-container cgroup memory through `docker stats`, and
-uses `docker inspect` for restart/recreate/OOM evidence. The three listed
-containers are mandatory even when `--container` is omitted; that option can
-only add extra monitored containers. The output path is create-once mode 0600.
+uses `docker inspect` for restart/recreate/OOM evidence. Scheduler and the
+WhoScored FlareSolverr are mandatory even when `--container` is omitted and
+are linked to the exact running production-admission receipt. That option can
+only add extra monitoring-only containers (for example the shared
+`proxy_filter`) and never expands WhoScored deployment authority. The output
+path is create-once mode 0600.
 
 Only one capacity supervisor may run at a time. It holds a host flock and
 stores the exact owner and endpoint in a mode-0600 state file. On normal

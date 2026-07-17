@@ -716,3 +716,26 @@ def test_one_time_storage_isolation_covers_heavy_without_paid_profile() -> None:
     assert rollout.rindex("docker volume inspect seaweedfs_data") < rollout.index(
         '"${COMPOSE[@]}" up -d --no-recreate'
     )
+
+
+def test_ready_promotion_names_every_local_build_service() -> None:
+    runbook = (ROOT / "docs" / "operations" / "whoscored-production.md").read_text(
+        encoding="utf-8"
+    )
+    promotion = runbook.split("#### Future ready-v1 promotion", 1)[1].split(
+        "Deploy that exact reviewed promotion SHA", 1
+    )[0]
+    documented = set(re.findall(r'--payload-image-id "([^=]+)=', promotion))
+    services = _compose()["services"]
+    locally_built_images = {
+        service.get("image")
+        for service in services.values()
+        if "build" in service and service.get("image")
+    }
+    local_builds = {
+        name
+        for name, service in services.items()
+        if "build" in service or service.get("image") in locally_built_images
+    }
+
+    assert documented == local_builds

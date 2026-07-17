@@ -67,6 +67,8 @@ def test_ci_runs_public_writer_and_capacity_contracts():
 
     assert "tests/unit/scrapers/test_iceberg_writer.py" in text
     assert "bench_whoscored_capacity.py" in text
+    assert "whoscored_capacity_container_runtime.py" in text
+    assert "docker/images/airflow/whoscored_capacity_worker_bootstrap.py" in text
     assert "rg --files tests" in text
 
 
@@ -98,6 +100,11 @@ def test_ci_uses_test_runtime_and_smokes_immutable_flaresolverr():
         "--tmpfs /tmp:rw,noexec,nosuid,nodev,size=256m,uid=50000,gid=0,mode=0700"
     ) in scheduler_smoke
     assert "timeout --kill-after=5s 45s docker run --rm" in scheduler_smoke
+    assert "serve_logs(port=18793)" in scheduler_smoke
+    assert "airflow_root_ctime" in scheduler_smoke
+    assert "test ! -e /opt/airflow/airflow.cfg" in scheduler_smoke
+    assert "test ! -e /opt/airflow/gunicorn.ctl" in scheduler_smoke
+    assert "Control socket listening" in scheduler_smoke
     assert '--cidfile "$scheduler_smoke_cidfile"' in scheduler_smoke
     assert 'scheduler_smoke_tmpdir="$(mktemp -d)"' in scheduler_smoke
     assert 'scheduler_smoke_cidfile="$scheduler_smoke_tmpdir/cid"' in scheduler_smoke

@@ -33,9 +33,41 @@ import time
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+_SEALED_BUNDLE_PATH = os.environ.pop("WHOSCORED_CAPACITY_BUNDLE_PATH", "")
+_SEALED_SITE_PACKAGES = os.environ.pop(
+    "WHOSCORED_CAPACITY_SITE_PACKAGES", ""
+)
+if _SEALED_BUNDLE_PATH:
+    if (
+        not sys.flags.isolated
+        or not sys.flags.no_site
+        or not sys.flags.ignore_environment
+        or not sys.dont_write_bytecode
+        or re.fullmatch(r"/proc/self/fd/[0-9]+", _SEALED_BUNDLE_PATH) is None
+        or not _SEALED_SITE_PACKAGES.startswith("/")
+        or Path(os.path.abspath(_SEALED_SITE_PACKAGES))
+        != Path(_SEALED_SITE_PACKAGES)
+    ):
+        raise RuntimeError("capacity sealed-runtime bootstrap is not isolated")
+    trusted_stdlib = [
+        value
+        for value in sys.path
+        if isinstance(value, str)
+        and value.startswith("/")
+        and value != _SEALED_BUNDLE_PATH
+    ]
+    sys.path[:] = [
+        _SEALED_BUNDLE_PATH,
+        *trusted_stdlib,
+        _SEALED_SITE_PACKAGES,
+    ]
+    REPO_ROOT = Path(_SEALED_BUNDLE_PATH)
+else:
+    if _SEALED_SITE_PACKAGES:
+        raise RuntimeError("capacity site path requires a sealed runtime bundle")
+    REPO_ROOT = Path(__file__).resolve().parents[2]
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
 
 from scrapers.whoscored.catalog import (  # noqa: E402
     DEFAULT_COMPETITIONS_PATH,
@@ -1195,7 +1227,13 @@ def run(
 
     dependencies = factories or _default_factories()
     try:
-        catalog_path = Path(str(args.catalog)).resolve()
+        raw_catalog_path = str(args.catalog)
+        if _SEALED_BUNDLE_PATH:
+            if re.fullmatch(r"/proc/self/fd/[0-9]+", raw_catalog_path) is None:
+                raise ValueError("sealed capacity catalog must be fd-backed")
+            catalog_path = Path(raw_catalog_path)
+        else:
+            catalog_path = Path(raw_catalog_path).resolve()
         catalog = dependencies.load_catalog(catalog_path)
         catalog_season = catalog.parse_scope_spec(str(args.scope))
         competition = catalog.competition(catalog_season.scope.competition_id)

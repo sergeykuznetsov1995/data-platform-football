@@ -9,11 +9,13 @@ import json
 import os
 from pathlib import Path
 import signal
+import stat
 import subprocess
 import sys
 import time
 from types import SimpleNamespace
 from typing import Any
+import zipfile
 
 import pytest
 
@@ -31,9 +33,143 @@ sys.modules[SPEC.name] = capacity
 SPEC.loader.exec_module(capacity)
 
 DERIVED_FLARESOLVERR_IMAGE_ID = "sha256:" + "f" * 64
+FLARESOLVERR_FINAL_IMAGE = (
+    "registry.example/ws954/flaresolverr-whoscored@sha256:" + "f" * 64
+)
+PROTECTED_BINDINGS = {
+    "airflow-scheduler": "registry.example/ws954/airflow@sha256:" + "a" * 64,
+    "flaresolverr": FLARESOLVERR_FINAL_IMAGE,
+    "flaresolverr_whoscored_paid": (
+        "registry.example/ws954/flaresolverr-paid@sha256:" + "b" * 64
+    ),
+    "whoscored_paid_gateway": (
+        "registry.example/ws954/proxy@sha256:" + "c" * 64
+    ),
+    "whoscored_proxy_filter": (
+        "registry.example/ws954/proxy@sha256:" + "c" * 64
+    ),
+}
+PROTECTED_PAYLOADS = {
+    service: "sha256:" + token * 64
+    for service, token in zip(PROTECTED_BINDINGS, "defab")
+}
+PROTECTED_CONFIG_HASHES = {
+    service: token * 64
+    for service, token in zip(PROTECTED_BINDINGS, "12345")
+}
+RUNNING_IMAGE_IDS = {
+    "airflow-scheduler": "sha256:" + "c" * 64,
+    "flaresolverr": DERIVED_FLARESOLVERR_IMAGE_ID,
+}
+RUNNING_CONTAINER_IDS = {
+    "airflow-scheduler": "a" * 64,
+    "flaresolverr": "b" * 64,
+}
 EXPECTED_CURL_CFFI_SHA256 = (
     "2b6c847d86283b07ae69bb72c82eb8a59242277142aa35b89850f89e792a02fc"
 )
+
+
+def _production_deployment(tmp_path: Path) -> capacity.ProductionDeployment:
+    deployment_attestation = tmp_path / "deployment-attestation.json"
+    deployment_attestation.write_text('{"status":"ready-v1"}\n')
+    deployment_attestation.chmod(0o600)
+    digest_override = tmp_path / "digest-only.yaml"
+    digest_override.write_text("services: {}\n")
+    digest_override.chmod(0o600)
+    attestation_snapshot = capacity._protected_input_snapshot(
+        deployment_attestation,
+        label="deployment-attestation",
+        private=True,
+    )
+    override_snapshot = capacity._protected_input_snapshot(
+        digest_override,
+        label=f"compose:{digest_override.name}",
+        private=True,
+    )
+    return capacity.ProductionDeployment(
+        deployment_attestation_path=deployment_attestation,
+        deployment_attestation_sha256=attestation_snapshot.sha256,
+        deployment_attestation_identity=attestation_snapshot.identity,
+        digest_override_path=digest_override,
+        digest_override_sha256=override_snapshot.sha256,
+        digest_override_identity=override_snapshot.identity,
+        release_revision="a" * 40,
+        payload_revision="c" * 40,
+        provenance_manifest_sha256="b" * 64,
+        source_tree_sha256="d" * 64,
+        protected_bindings=dict(PROTECTED_BINDINGS),
+        protected_payload_image_ids=dict(PROTECTED_PAYLOADS),
+        protected_config_hashes=dict(PROTECTED_CONFIG_HASHES),
+        running_admission={
+            "apparmor_profile": "docker-default (enforce)",
+            "docker_security_options": [
+                "name=apparmor",
+                "name=cgroupns",
+                "name=seccomp,profile=builtin",
+            ],
+            "images": [
+                {
+                    "container_id": RUNNING_CONTAINER_IDS[service],
+                    "final_image": PROTECTED_BINDINGS[service],
+                    "image_id": RUNNING_IMAGE_IDS[service],
+                    "service": service,
+                }
+                for service in capacity.ADMITTED_RUNNING_SERVICES
+            ],
+            "networks": [],
+            "project": capacity.REQUIRED_COMPOSE_PROJECT,
+            "schema_version": 1,
+            "status": "admitted-running-v1",
+            "volumes": [],
+        },
+        protected_inputs=(attestation_snapshot, override_snapshot),
+    )
+
+
+def _deployment_bridge_document(
+    deployment: capacity.ProductionDeployment,
+) -> dict[str, Any]:
+    build_attestation = capacity._protected_input_snapshot(
+        capacity.PRODUCTION_BUILD_ATTESTATION,
+        label="build-attestation",
+        private=False,
+    )
+    build_manifest = capacity._protected_input_snapshot(
+        capacity.PRODUCTION_BUILD_MANIFEST,
+        label="build-manifest",
+        private=False,
+    )
+    attestation = capacity._protected_input_snapshot(
+        deployment.deployment_attestation_path,
+        label="deployment-attestation",
+        private=True,
+    )
+    override = capacity._protected_input_snapshot(
+        deployment.digest_override_path,
+        label=f"compose:{deployment.digest_override_path.name}",
+        private=True,
+    )
+    return {
+        "build_attestation_identity": list(build_attestation.identity),
+        "build_attestation_sha256": build_attestation.sha256,
+        "build_manifest_identity": list(build_manifest.identity),
+        "build_manifest_sha256": build_manifest.sha256,
+        "deployment_attestation_identity": list(attestation.identity),
+        "deployment_attestation_sha256": attestation.sha256,
+        "digest_override_identity": list(override.identity),
+        "digest_override_sha256": override.sha256,
+        "protected_bindings": dict(deployment.protected_bindings),
+        "protected_config_hashes": dict(deployment.protected_config_hashes),
+        "protected_payload_image_ids": dict(
+            deployment.protected_payload_image_ids
+        ),
+        "running_admission": dict(deployment.running_admission),
+        "payload_revision": deployment.payload_revision,
+        "provenance_manifest_sha256": build_manifest.sha256,
+        "release_revision": deployment.release_revision,
+        "source_tree_sha256": deployment.source_tree_sha256,
+    }
 
 
 def _args(**overrides: Any) -> Namespace:
@@ -43,13 +179,29 @@ def _args(**overrides: Any) -> Namespace:
         "scopes": ["INT-World Cup=2026"],
         "match_limit": 3,
         "profile_limit": 3,
-        "catalog": "/tmp/competitions.yaml",
+        "catalog": str(
+            capacity.REPO_ROOT / "configs/medallion/competitions.yaml"
+        ),
         "flaresolverr_url": "http://127.0.0.1:8191",
         "containers": ["flaresolverr", "proxy_filter"],
+        "deployment_attestation": Path("/evidence/deployment-attestation.json"),
+        "digest_override": Path("/evidence/digest-only.yaml"),
         "output": None,
     }
     values.update(overrides)
     return Namespace(**values)
+
+
+def _parse_cli(*arguments: str) -> Namespace:
+    return capacity._parser().parse_args(
+        [
+            "--deployment-attestation",
+            "/evidence/deployment-attestation.json",
+            "--digest-override",
+            "/evidence/digest-only.yaml",
+            *arguments,
+        ]
+    )
 
 
 def _workflow_report(
@@ -128,6 +280,10 @@ def _container_state(
         "published_endpoint_contract_ok": name == "flaresolverr",
         "status": "running" if running else "exited",
         "running": running,
+        "healthy": running,
+        "production_admission_contract_ok": (
+            name in capacity.ADMITTED_RUNNING_SERVICES
+        ),
         "oom_killed": oom_killed,
         "restart_count": restart_count,
         "pid": 100 if name == "flaresolverr" else 200,
@@ -167,6 +323,7 @@ class FakeCapacityRuntime:
         mutate_runtime_identity: bool = False,
         runtime_identity_mutation_call: int | None = None,
         curl_cffi_version: str = capacity.REQUIRED_CURL_CFFI_VERSION,
+        production_deployment: dict[str, Any] | None = None,
     ) -> None:
         self.clock = FakeClock()
         self.report = report or _workflow_report()
@@ -180,6 +337,9 @@ class FakeCapacityRuntime:
             else (2 if mutate_runtime_identity else None)
         )
         self.curl_cffi_version = curl_cffi_version
+        self.production_deployment = production_deployment or {
+            "test_binding": "production"
+        }
         self.inspect_calls = 0
         self.identity_calls = 0
         self.commands: list[Any] = []
@@ -217,18 +377,32 @@ class FakeCapacityRuntime:
             and self.identity_calls >= self.runtime_identity_mutation_call
             else "b"
         )
+        running_admission = self.production_deployment.get("running_admission")
+        production_scheduler = None
+        if isinstance(running_admission, dict):
+            records = [
+                record
+                for record in running_admission.get("images", [])
+                if record.get("service") == "airflow-scheduler"
+            ]
+            if len(records) == 1:
+                production_scheduler = records[0]["image_id"]
         return {
             "git_revision": "a" * 40,
-            "git_clean": False,
+            "git_clean": True,
             "manifest_sha256": manifest_token * 64,
             "file_sha256": {
                 "runtime.py": "c" * 64,
                 "external:unshare": capacity.REQUIRED_UNSHARE_SHA256,
             },
-            "python_executable": sys.executable,
-            "python_prefix": sys.prefix,
-            "python_version": sys.version.split()[0],
+            "python_executable": (
+                "/usr/local/bin/python" if production_scheduler else sys.executable
+            ),
+            "python_prefix": "/usr/local" if production_scheduler else sys.prefix,
+            "python_version": "3.11" if production_scheduler else sys.version.split()[0],
             "dependency_versions": {"curl_cffi": self.curl_cffi_version},
+            "worker_image_id": production_scheduler,
+            "production_deployment": self.production_deployment,
         }
 
     def run_round(
@@ -242,8 +416,9 @@ class FakeCapacityRuntime:
         before_launch,
         monotonic,
         sleep,
+        worker_runtime=None,
     ):
-        del sleep
+        del sleep, worker_runtime
         assert monotonic is self.clock.monotonic or callable(monotonic)
         assert len(commands) == capacity.WORKER_COUNT
         self.commands.extend(commands)
@@ -306,7 +481,7 @@ def test_four_process_capacity_run_passes_exact_gates_without_publish_sinks():
     assert all("phases" not in summary for summary in report["runs"])
     assert runtime.identity_calls >= 6
     assert _gate(report, "runtime_identity")["passed"] is True
-    assert _gate(report, "runtime_identity")["git_clean"] is False
+    assert _gate(report, "runtime_identity")["git_clean"] is True
     assert json.loads(json.dumps(report)) == report
 
 
@@ -718,16 +893,18 @@ def test_preflight_pin_matches_production_scraping_requirements():
     ]
 
 
-def test_real_run_stops_before_host_monitoring_when_preflight_fails(monkeypatch):
+def test_real_run_uses_exact_image_admission_not_host_dependency_preflight(
+    monkeypatch,
+):
     monkeypatch.setattr(
         capacity,
         "_workflow_runtime_preflight",
-        lambda: "host Python dependency unavailable: curl_cffi==0.15.0 is required",
+        lambda: (_ for _ in ()).throw(AssertionError("host preflight called")),
     )
     monkeypatch.setattr(
         capacity,
-        "_default_dependencies",
-        lambda: (_ for _ in ()).throw(AssertionError("monitoring initialized")),
+        "_validate_production_deployment",
+        lambda _args: (_ for _ in ()).throw(RuntimeError("DEPLOYMENT_SENTINEL")),
     )
 
     code, report = capacity.run(_args())
@@ -735,7 +912,7 @@ def test_real_run_stops_before_host_monitoring_when_preflight_fails(monkeypatch)
     assert code == 2
     assert report["status"] == "configuration_error"
     assert report["error"] == (
-        "host Python dependency unavailable: curl_cffi==0.15.0 is required"
+        "production deployment validation failed: DEPLOYMENT_SENTINEL"
     )
     assert report["publishes"] is False
 
@@ -799,7 +976,7 @@ def test_wrong_flaresolverr_image_digest_stops_before_worker_launch():
     container_gate = _gate(report, "container_restart_oom")
     assert container_gate["passed"] is False
     assert any(
-        "derived image ID" in violation
+        "final image identity" in violation
         for violation in container_gate["violations"]
     )
 
@@ -807,15 +984,35 @@ def test_wrong_flaresolverr_image_digest_stops_before_worker_launch():
 def test_host_docker_inspector_binds_restart_oom_and_pid_evidence(
     monkeypatch, tmp_path
 ):
+    deployment = _production_deployment(tmp_path)
     environment_files = tuple(
         tmp_path / name
-        for name in (".env", ".env.whoscored-rollout", ".env.proxy-pool")
+        for name in (
+            ".env",
+            "whoscored-runtime-v2.env",
+            "whoscored-proxy-v2.env",
+        )
     )
     for environment_file in environment_files:
         environment_file.write_text("SAFE_TEST_VALUE=1\n")
         environment_file.chmod(0o600)
     monkeypatch.setattr(
         capacity, "PRODUCTION_COMPOSE_ENV_FILES", environment_files
+    )
+    deployment = replace(
+        deployment,
+        protected_inputs=(
+            deployment.protected_inputs[0],
+            *(
+                capacity._protected_input_snapshot(
+                    path,
+                    label=f"compose:{path.name}",
+                    private=path == deployment.digest_override_path
+                    or path in environment_files,
+                )
+                for path in (*deployment.compose_files, *environment_files)
+            ),
+        ),
     )
     docker_payload = [
         {
@@ -830,18 +1027,20 @@ def test_host_docker_inspector_binds_restart_oom_and_pid_evidence(
                 {
                     "Cmd": list(capacity.REQUIRED_FLARESOLVERR_COMMAND),
                     "Entrypoint": list(capacity.REQUIRED_FLARESOLVERR_ENTRYPOINT),
-                    "Image": capacity.REQUIRED_FLARESOLVERR_IMAGE_REFERENCE,
+                    "Image": deployment.flaresolverr_image_reference,
                     "User": "1000:1000",
                     "Labels": {
                         "com.docker.compose.project": "data-platform",
                         "com.docker.compose.service": "flaresolverr",
                         "com.docker.compose.config-hash": "d" * 64,
+                        "com.docker.compose.container-number": "1",
+                        "com.docker.compose.depends_on": "",
                         "com.docker.compose.image": (
                             DERIVED_FLARESOLVERR_IMAGE_ID
                         ),
                         "com.docker.compose.oneoff": "False",
-                        "com.docker.compose.project.config_files": str(
-                            (capacity.REPO_ROOT / "compose.yaml").resolve()
+                        "com.docker.compose.project.config_files": ",".join(
+                            str(path) for path in deployment.compose_files
                         ),
                         "com.docker.compose.project.environment_file": str(
                             ",".join(str(path) for path in environment_files)
@@ -849,6 +1048,7 @@ def test_host_docker_inspector_binds_restart_oom_and_pid_evidence(
                         "com.docker.compose.project.working_dir": str(
                             capacity.REPO_ROOT.resolve()
                         ),
+                        "com.docker.compose.version": "2.30.0",
                     },
                 }
                 if name == "flaresolverr"
@@ -887,6 +1087,7 @@ def test_host_docker_inspector_binds_restart_oom_and_pid_evidence(
             "State": {
                 "Status": "running",
                 "Running": True,
+                "Health": {"Status": "healthy"},
                 "OOMKilled": False,
                 "Pid": 1000 + index,
             },
@@ -899,13 +1100,22 @@ def test_host_docker_inspector_binds_restart_oom_and_pid_evidence(
         observed["calls"].append((argv, kwargs))
         if argv[1] == "inspect":
             return SimpleNamespace(returncode=0, stdout=json.dumps(docker_payload))
-        if argv[0] == str(capacity.PRODUCTION_COMPOSE_WRAPPER):
+        if argv[:2] == ["/usr/bin/docker", "compose"]:
             return SimpleNamespace(
                 returncode=0, stdout=f"flaresolverr {'d' * 64}\n"
             )
         if argv[1] == "image":
             return SimpleNamespace(
-                returncode=0, stdout=DERIVED_FLARESOLVERR_IMAGE_ID + "\n"
+                returncode=0,
+                stdout=json.dumps(
+                    [
+                        {
+                            "Id": DERIVED_FLARESOLVERR_IMAGE_ID,
+                            "RepoDigests": [deployment.flaresolverr_image_reference],
+                            "Config": {"Labels": {}},
+                        }
+                    ]
+                ),
             )
         stats = "\n".join(
             json.dumps(
@@ -924,38 +1134,44 @@ def test_host_docker_inspector_binds_restart_oom_and_pid_evidence(
     monkeypatch.setattr(capacity.subprocess, "run", fake_run)
 
     result = capacity._inspect_containers(
-        ("airflow-scheduler", "flaresolverr")
+        ("airflow-scheduler", "flaresolverr"), deployment
     )
 
     assert observed["calls"][0][0] == [
-        "docker",
+        "/usr/bin/docker",
         "inspect",
         "airflow-scheduler",
         "flaresolverr",
     ]
     assert observed["calls"][1][0] == [
-        str(capacity.PRODUCTION_COMPOSE_WRAPPER),
+        "/usr/bin/docker",
+        "compose",
+        "--project-name",
+        capacity.REQUIRED_COMPOSE_PROJECT,
         *[
             argument
             for path in environment_files
             for argument in ("--env-file", str(path))
         ],
-        "-p",
-        capacity.REQUIRED_COMPOSE_PROJECT,
+        "--profile",
+        "whoscored-paid",
+        *[
+            argument
+            for path in deployment.compose_files
+            for argument in ("--file", str(path))
+        ],
         "config",
         "--hash",
         "flaresolverr",
     ]
     assert observed["calls"][2][0] == [
-        "docker",
+        "/usr/bin/docker",
         "image",
         "inspect",
-        "--format",
-        "{{.Id}}",
-        capacity.REQUIRED_FLARESOLVERR_IMAGE_REFERENCE,
+        deployment.flaresolverr_image_reference,
     ]
     assert observed["calls"][3][0] == [
-        "docker",
+        "/usr/bin/docker",
         "stats",
         "--no-stream",
         "--format",
@@ -963,9 +1179,24 @@ def test_host_docker_inspector_binds_restart_oom_and_pid_evidence(
         "airflow-scheduler",
         "flaresolverr",
     ]
-    assert all(call[1]["timeout"] == 15 for call in observed["calls"])
+    assert observed["calls"][4][0] == observed["calls"][0][0]
+    assert [call[1]["timeout"] for call in observed["calls"]] == [
+        15,
+        30,
+        15,
+        15,
+        15,
+    ]
+    assert all(
+        call[1]["env"] == capacity._LOCAL_DOCKER_ENVIRONMENT
+        and call[1]["cwd"] == capacity.REPO_ROOT
+        and call[1]["stdin"] is subprocess.DEVNULL
+        for call in observed["calls"]
+    )
     assert result["airflow-scheduler"]["restart_count"] == 0
     assert result["flaresolverr"]["restart_count"] == 1
+    assert result["airflow-scheduler"]["production_admission_contract_ok"] is True
+    assert result["flaresolverr"]["production_admission_contract_ok"] is True
     assert result["flaresolverr"]["pid"] == 1001
     assert (
         result["flaresolverr"]["image_id"] == DERIVED_FLARESOLVERR_IMAGE_ID
@@ -978,6 +1209,72 @@ def test_host_docker_inspector_binds_restart_oom_and_pid_evidence(
     assert result["flaresolverr"]["published_endpoint_contract_ok"] is True
     assert result["flaresolverr"]["memory_usage_bytes"] == int(
         65.5 * 1024**2
+    )
+
+
+@pytest.mark.parametrize(
+    ("cli_mode", "cli_uid", "socket_mode", "socket_uid"),
+    (
+        (stat.S_IFREG | 0o644, 0, stat.S_IFSOCK | 0o660, 0),
+        (stat.S_IFREG | 0o755, 1, stat.S_IFSOCK | 0o660, 0),
+        (stat.S_IFREG | 0o775, 0, stat.S_IFSOCK | 0o660, 0),
+        (stat.S_IFREG | 0o755, 0, stat.S_IFREG | 0o660, 0),
+        (stat.S_IFREG | 0o755, 0, stat.S_IFSOCK | 0o660, 1),
+        (stat.S_IFREG | 0o755, 0, stat.S_IFSOCK | 0o662, 0),
+    ),
+)
+def test_local_docker_rejects_untrusted_cli_or_socket_metadata(
+    monkeypatch,
+    cli_mode: int,
+    cli_uid: int,
+    socket_mode: int,
+    socket_uid: int,
+) -> None:
+    class FakePath:
+        def __init__(self, value: str, *, mode: int, uid: int) -> None:
+            self.value = value
+            self.metadata = SimpleNamespace(st_mode=mode, st_uid=uid)
+
+        def lstat(self) -> SimpleNamespace:
+            return self.metadata
+
+        def __str__(self) -> str:
+            return self.value
+
+    monkeypatch.setattr(
+        capacity,
+        "_LOCAL_DOCKER_CLI",
+        FakePath("/usr/bin/docker", mode=cli_mode, uid=cli_uid),
+    )
+    monkeypatch.setattr(
+        capacity,
+        "_LOCAL_DOCKER_SOCKET",
+        FakePath("/run/docker.sock", mode=socket_mode, uid=socket_uid),
+    )
+    monkeypatch.setattr(
+        capacity.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("untrusted Docker endpoint was used"),
+    )
+
+    with pytest.raises(RuntimeError, match="endpoint metadata is invalid"):
+        capacity._run_local_docker(("version",), timeout=1)
+
+
+@pytest.mark.parametrize("service", capacity.ADMITTED_RUNNING_SERVICES)
+def test_container_gate_requires_each_running_admission_identity(service: str) -> None:
+    current = {
+        name: _container_state(name)
+        for name in capacity.ADMITTED_RUNNING_SERVICES
+    }
+    current[service]["production_admission_contract_ok"] = False
+
+    violations = capacity._container_admission_violations(
+        current, capacity.ADMITTED_RUNNING_SERVICES
+    )
+
+    assert f"{service}: running identity differs from production admission" in (
+        violations
     )
 
 
@@ -996,12 +1293,13 @@ def test_derived_image_resolution_fails_closed(monkeypatch, returncode, stdout):
     )
 
     with pytest.raises(RuntimeError, match="image ID is unavailable"):
-        capacity._resolved_flaresolverr_image_id()
+        capacity._resolved_flaresolverr_image_id(FLARESOLVERR_FINAL_IMAGE)
 
 
 def test_compose_hash_resolution_rejects_insecure_environment_file(
     monkeypatch, tmp_path
 ):
+    deployment = _production_deployment(tmp_path)
     environment_files = tuple(tmp_path / f"env-{index}" for index in range(3))
     for environment_file in environment_files:
         environment_file.write_text("SAFE_TEST_VALUE=1\n")
@@ -1018,11 +1316,193 @@ def test_compose_hash_resolution_rejects_insecure_environment_file(
         ),
     )
 
-    with pytest.raises(RuntimeError, match="environment metadata is invalid"):
-        capacity._resolved_flaresolverr_compose_hash()
+    with pytest.raises(RuntimeError, match="Compose input metadata is invalid"):
+        capacity._resolved_flaresolverr_compose_hash(deployment)
 
 
-def test_flaresolverr_inspect_contract_fails_each_runtime_binding():
+def test_production_deployment_validation_uses_exact_admission_bridge(
+    monkeypatch, tmp_path
+):
+    expected = _production_deployment(tmp_path)
+    args = _args(
+        deployment_attestation=expected.deployment_attestation_path,
+        digest_override=expected.digest_override_path,
+    )
+    observed = {}
+
+    def fake_run(argv, **kwargs):
+        observed["argv"] = argv
+        observed["kwargs"] = kwargs
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(_deployment_bridge_document(expected)),
+            stderr="",
+        )
+
+    monkeypatch.setattr(capacity.subprocess, "run", fake_run)
+
+    actual = capacity._validate_production_deployment(args)
+
+    assert actual.deployment_attestation_path == expected.deployment_attestation_path
+    assert actual.digest_override_path == expected.digest_override_path
+    assert actual.release_revision == expected.release_revision
+    assert actual.payload_revision == expected.payload_revision
+    assert actual.flaresolverr_image_reference == (
+        expected.flaresolverr_image_reference
+    )
+    assert actual.protected_bindings == expected.protected_bindings
+    assert actual.protected_payload_image_ids == expected.protected_payload_image_ids
+    assert actual.protected_config_hashes == expected.protected_config_hashes
+    assert actual.running_admission == expected.running_admission
+    assert len(actual.protected_inputs) == 9
+    assert observed["argv"][:4] == ["/usr/bin/python3", "-I", "-S", "-c"]
+    assert observed["argv"][5:] == [
+        str(capacity.PRODUCTION_ADMISSION_SCRIPT),
+        str(capacity.REPO_ROOT),
+        str(capacity.PRODUCTION_BUILD_ATTESTATION),
+        str(capacity.PRODUCTION_BUILD_MANIFEST),
+        str(expected.deployment_attestation_path),
+        str(expected.digest_override_path),
+        *(str(path) for path in capacity.PRODUCTION_COMPOSE_ENV_FILES),
+    ]
+    assert "validate_bindings_with_evidence" in observed["argv"][4]
+    assert "verify_override_snapshot" in observed["argv"][4]
+    assert "_assert_protected_compose_inputs" in observed["argv"][4]
+    assert "render_attested_compose" in observed["argv"][4]
+    assert "verify_created_containers" in observed["argv"][4]
+    assert 'selected_services=("airflow-scheduler", "flaresolverr")' in (
+        observed["argv"][4]
+    )
+    assert 'expected_state="running"' in observed["argv"][4]
+    assert observed["kwargs"] == {
+        "cwd": capacity.REPO_ROOT,
+        "env": {
+            "HOME": "/nonexistent",
+            "PATH": "/usr/bin:/bin",
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+        },
+        "check": False,
+        "capture_output": True,
+        "text": True,
+        "timeout": 180,
+    }
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stdout", "stderr", "error"),
+    [
+        (78, "", "bad provenance", "production deployment is invalid"),
+        (
+            0,
+            json.dumps(
+                {
+                    "deployment_attestation_sha256": "a" * 64,
+                    "digest_override_sha256": "b" * 64,
+                    "flaresolverr_image_reference": "mutable:latest",
+                }
+            ),
+            "",
+            "invalid shape",
+        ),
+    ],
+)
+def test_production_deployment_validation_fails_closed(
+    monkeypatch, tmp_path, returncode, stdout, stderr, error
+):
+    expected = _production_deployment(tmp_path)
+    args = _args(
+        deployment_attestation=expected.deployment_attestation_path,
+        digest_override=expected.digest_override_path,
+    )
+    monkeypatch.setattr(
+        capacity.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=returncode,
+            stdout=stdout,
+            stderr=stderr,
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match=error):
+        capacity._validate_production_deployment(args)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "missing_scheduler_binding",
+        "mutable_scheduler_binding",
+        "missing_scheduler_receipt",
+        "paid_service_receipt",
+        "wrong_running_status",
+        "wrong_final_image",
+    ),
+)
+def test_production_deployment_bridge_rejects_incomplete_running_identity(
+    monkeypatch, tmp_path, mutation: str
+) -> None:
+    expected = _production_deployment(tmp_path)
+    document = _deployment_bridge_document(expected)
+    if mutation == "missing_scheduler_binding":
+        document["protected_bindings"].pop("airflow-scheduler")
+    elif mutation == "mutable_scheduler_binding":
+        document["protected_bindings"]["airflow-scheduler"] = "mutable:latest"
+    elif mutation == "missing_scheduler_receipt":
+        document["running_admission"]["images"] = document[
+            "running_admission"
+        ]["images"][1:]
+    elif mutation == "paid_service_receipt":
+        document["running_admission"]["images"].append(
+            {
+                "container_id": "d" * 64,
+                "final_image": PROTECTED_BINDINGS[
+                    "flaresolverr_whoscored_paid"
+                ],
+                "image_id": "sha256:" + "d" * 64,
+                "service": "flaresolverr_whoscored_paid",
+            }
+        )
+    elif mutation == "wrong_running_status":
+        document["running_admission"]["status"] = "admitted-v1"
+    else:
+        document["running_admission"]["images"][0]["final_image"] = (
+            PROTECTED_BINDINGS["flaresolverr"]
+        )
+    monkeypatch.setattr(
+        capacity.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(document),
+            stderr="",
+        ),
+    )
+    args = _args(
+        deployment_attestation=expected.deployment_attestation_path,
+        digest_override=expected.digest_override_path,
+    )
+
+    with pytest.raises(RuntimeError, match="running admission|invalid bindings"):
+        capacity._validate_production_deployment(args)
+
+
+def test_mutable_flaresolverr_image_is_rejected_before_docker(monkeypatch):
+    monkeypatch.setattr(
+        capacity.subprocess,
+        "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("Docker reached")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="reference is mutable"):
+        capacity._resolved_flaresolverr_image_id("mutable:latest")
+
+
+def test_flaresolverr_inspect_contract_fails_each_runtime_binding(tmp_path):
+    deployment = _production_deployment(tmp_path)
     expected_hash = "d" * 64
     raw = {
         "Name": "/flaresolverr",
@@ -1039,16 +1519,18 @@ def test_flaresolverr_inspect_contract_fails_each_runtime_binding():
         "Config": {
             "Cmd": list(capacity.REQUIRED_FLARESOLVERR_COMMAND),
             "Entrypoint": list(capacity.REQUIRED_FLARESOLVERR_ENTRYPOINT),
-            "Image": capacity.REQUIRED_FLARESOLVERR_IMAGE_REFERENCE,
+            "Image": deployment.flaresolverr_image_reference,
             "User": "1000:1000",
             "Labels": {
                 "com.docker.compose.project": capacity.REQUIRED_COMPOSE_PROJECT,
                 "com.docker.compose.service": "flaresolverr",
                 "com.docker.compose.config-hash": expected_hash,
+                "com.docker.compose.container-number": "1",
+                "com.docker.compose.depends_on": "",
                 "com.docker.compose.image": DERIVED_FLARESOLVERR_IMAGE_ID,
                 "com.docker.compose.oneoff": "False",
-                "com.docker.compose.project.config_files": str(
-                    (capacity.REPO_ROOT / "compose.yaml").resolve()
+                "com.docker.compose.project.config_files": ",".join(
+                    str(path) for path in deployment.compose_files
                 ),
                 "com.docker.compose.project.environment_file": str(
                     ",".join(
@@ -1058,6 +1540,7 @@ def test_flaresolverr_inspect_contract_fails_each_runtime_binding():
                 "com.docker.compose.project.working_dir": str(
                     capacity.REPO_ROOT.resolve()
                 ),
+                "com.docker.compose.version": "2.30.0",
             },
         },
         "HostConfig": {
@@ -1083,8 +1566,10 @@ def test_flaresolverr_inspect_contract_fails_each_runtime_binding():
     def normalise(document):
         return capacity._normalise_container(
             document,
+            production_deployment=deployment,
             expected_flaresolverr_config_hash=expected_hash,
             expected_flaresolverr_image_id=DERIVED_FLARESOLVERR_IMAGE_ID,
+            expected_flaresolverr_image_labels={},
         )
 
     valid = normalise(raw)
@@ -1099,6 +1584,13 @@ def test_flaresolverr_inspect_contract_fails_each_runtime_binding():
             "published_endpoint_contract_ok",
         )
     )
+    no_deployment = capacity._normalise_container(
+        raw,
+        expected_flaresolverr_config_hash=expected_hash,
+        expected_flaresolverr_image_id=DERIVED_FLARESOLVERR_IMAGE_ID,
+    )
+    assert no_deployment["compose_identity_ok"] is False
+    assert no_deployment["image_identity_contract_ok"] is False
 
     wrong_command = deepcopy(raw)
     wrong_command["Config"]["Cmd"] = ["python", "stock.py"]
@@ -1151,11 +1643,11 @@ def test_flaresolverr_inspect_contract_fails_each_runtime_binding():
     wrong_image_reference = deepcopy(raw)
     wrong_image_reference["Config"]["Image"] = "unreviewed:latest"
     assert normalise(wrong_image_reference)["image_identity_contract_ok"] is False
-    supervised_compose = deepcopy(raw)
-    supervised_compose["Config"]["Labels"][
+    missing_digest_override = deepcopy(raw)
+    missing_digest_override["Config"]["Labels"][
         "com.docker.compose.project.config_files"
     ] = ",".join(str(path.resolve()) for path in capacity.PRODUCTION_COMPOSE_FILES)
-    assert normalise(supervised_compose)["compose_identity_ok"] is True
+    assert normalise(missing_digest_override)["compose_identity_ok"] is False
     unreviewed_overlay = deepcopy(raw)
     unreviewed_overlay["Config"]["Labels"][
         "com.docker.compose.project.config_files"
@@ -1286,23 +1778,39 @@ def test_worker_control_is_absent_from_proc_cmdline_and_parent_fds_close(
             os.fstat(control_fd)
 
 
-def test_subprocess_round_checks_runtime_identity_before_any_popen(monkeypatch):
+def test_subprocess_round_rechecks_identity_after_all_workers_are_blocked(
+    monkeypatch, tmp_path
+):
+    marker = tmp_path / "worker-started"
     commands = [
         capacity.WorkerCommand(
             worker_id=worker_id,
             iteration=0,
             scope="INT-World Cup=2026",
-            argv=(sys.executable, "-c", "raise SystemExit(0)"),
+            argv=(
+                sys.executable,
+                "-c",
+                f"from pathlib import Path; Path({str(marker)!r}).touch()",
+            ),
         )
         for worker_id in range(capacity.WORKER_COUNT)
     ]
-    popen_calls = []
+    launched = []
     monkeypatch.setattr(capacity, "_worker_exec_preflight", lambda: None)
-    monkeypatch.setattr(
-        capacity.subprocess,
-        "Popen",
-        lambda *args, **kwargs: popen_calls.append((args, kwargs)),
-    )
+    real_popen = capacity.subprocess.Popen
+
+    def track_popen(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        launched.append(process)
+        return process
+
+    monkeypatch.setattr(capacity.subprocess, "Popen", track_popen)
+
+    def reject_release() -> None:
+        assert len(launched) == capacity.WORKER_COUNT
+        assert all(process.poll() is None for process in launched)
+        assert not marker.exists()
+        raise RuntimeError("runtime identity changed before worker release")
 
     with pytest.raises(RuntimeError, match="runtime identity changed"):
         capacity._run_subprocess_round(
@@ -1311,14 +1819,150 @@ def test_subprocess_round_checks_runtime_identity_before_any_popen(monkeypatch):
             on_sample=lambda force: None,
             on_outcome=lambda outcome: None,
             should_stop=lambda: False,
-            before_launch=lambda: (_ for _ in ()).throw(
-                RuntimeError("runtime identity changed before worker launch")
-            ),
+            before_launch=reject_release,
             monotonic=time.monotonic,
             sleep=time.sleep,
         )
 
-    assert popen_calls == []
+    assert len(launched) == capacity.WORKER_COUNT
+    assert not marker.exists()
+    assert all(_pid_is_dead(process.pid) for process in launched)
+
+
+def test_subprocess_round_atomic_release_failure_starts_no_worker(
+    monkeypatch, tmp_path
+):
+    markers = [tmp_path / f"worker-{index}-started" for index in range(4)]
+    commands = [
+        capacity.WorkerCommand(
+            worker_id=worker_id,
+            iteration=0,
+            scope="INT-World Cup=2026",
+            argv=(
+                sys.executable,
+                "-c",
+                f"from pathlib import Path; Path({str(marker)!r}).touch()",
+            ),
+        )
+        for worker_id, marker in enumerate(markers)
+    ]
+    launched = []
+    real_popen = capacity.subprocess.Popen
+
+    def track_popen(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        launched.append(process)
+        return process
+
+    monkeypatch.setattr(capacity, "_worker_exec_preflight", lambda: None)
+    monkeypatch.setattr(capacity.subprocess, "Popen", track_popen)
+    monkeypatch.setattr(
+        capacity,
+        "_atomic_release_cohort",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("release failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="release failed"):
+        capacity._run_subprocess_round(
+            commands,
+            deadline=time.monotonic() + 10,
+            on_sample=lambda force: None,
+            on_outcome=lambda outcome: None,
+            should_stop=lambda: False,
+            before_launch=lambda: None,
+            monotonic=time.monotonic,
+            sleep=time.sleep,
+        )
+
+    assert len(launched) == capacity.WORKER_COUNT
+    assert not any(marker.exists() for marker in markers)
+    assert all(_pid_is_dead(process.pid) for process in launched)
+
+
+def test_subprocess_round_rechecks_deadline_after_slow_release_gate(
+    monkeypatch, tmp_path
+):
+    marker = tmp_path / "worker-started-after-deadline"
+    commands = [
+        capacity.WorkerCommand(
+            worker_id=worker_id,
+            iteration=0,
+            scope="INT-World Cup=2026",
+            argv=(
+                sys.executable,
+                "-c",
+                f"from pathlib import Path; Path({str(marker)!r}).touch()",
+            ),
+        )
+        for worker_id in range(capacity.WORKER_COUNT)
+    ]
+    monkeypatch.setattr(capacity, "_worker_exec_preflight", lambda: None)
+
+    with pytest.raises(RuntimeError, match="missed the deadline"):
+        capacity._run_subprocess_round(
+            commands,
+            deadline=time.monotonic() + 0.1,
+            on_sample=lambda force: None,
+            on_outcome=lambda outcome: None,
+            should_stop=lambda: False,
+            before_launch=lambda: time.sleep(0.2),
+            monotonic=time.monotonic,
+            sleep=time.sleep,
+        )
+
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize(
+    "release_payload",
+    (b"", b"B"),
+)
+def test_worker_barrier_rejects_eof_or_wrong_release_byte(
+    tmp_path, release_payload: bytes
+) -> None:
+    marker = tmp_path / "released"
+    ready_read, ready_write = os.pipe()
+    release_read, release_write = os.pipe()
+    process = subprocess.Popen(
+        (
+            sys.executable,
+            "-I",
+            "-S",
+            "-B",
+            str(capacity.WORKER_EXEC_SCRIPT),
+            "--expected-parent-pid",
+            str(os.getpid()),
+            "--ready-fd",
+            str(ready_write),
+            "--release-fd",
+            str(release_read),
+            "--",
+            sys.executable,
+            "-c",
+            f"from pathlib import Path; Path({str(marker)!r}).touch()",
+        ),
+        pass_fds=(ready_write, release_read),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    os.close(ready_write)
+    os.close(release_read)
+    try:
+        assert os.read(ready_read, 16) == b"READY\n"
+        assert os.read(ready_read, 1) == b""
+        if release_payload:
+            os.write(release_write, release_payload)
+        os.close(release_write)
+        release_write = -1
+        assert process.wait(timeout=5) != 0
+        assert not marker.exists()
+    finally:
+        os.close(ready_read)
+        if release_write >= 0:
+            os.close(release_write)
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
 
 
 def test_subprocess_supervisor_refills_fast_slot_without_waiting_for_slowest():
@@ -1461,14 +2105,23 @@ def test_real_parent_sigkill_kills_pid_namespace_worker_subtree(tmp_path):
     parent_code = "\n".join(
         [
             "import os, subprocess, sys, time",
+            "ready_read, ready_write = os.pipe()",
+            "release_read, release_write = os.pipe()",
             "subprocess.Popen([",
             f"    {sys.executable!r},",
             f"    {str(capacity.WORKER_EXEC_SCRIPT)!r},",
-            "    '--expected-parent-pid', str(os.getpid()), '--',",
+            "    '--expected-parent-pid', str(os.getpid()),",
+            "    '--ready-fd', str(ready_write),",
+            "    '--release-fd', str(release_read),",
+            "    '--',",
             f"    {str(capacity.WORKER_NAMESPACE_EXECUTABLE)!r},",
             "    '--pid', '--fork', '--kill-child=SIGKILL', '--',",
             f"    {sys.executable!r}, '-c', {worker_code!r},",
-            "])",
+            "], pass_fds=(ready_write, release_read))",
+            "os.close(ready_write); os.close(release_read)",
+            "assert os.read(ready_read, 16) == b'READY\\n'",
+            "assert os.read(ready_read, 1) == b''; os.close(ready_read)",
+            "os.write(release_write, b'G'); os.close(release_write)",
             "time.sleep(60)",
         ]
     )
@@ -1614,13 +2267,10 @@ def test_stop_processes_kills_term_ignoring_descendant_after_leader_exit(
         stderr_handle.close()
 
 
-def test_normal_leader_exit_cleans_old_group_before_slot_replacement(
+def test_pid_namespace_cleans_descendants_before_slot_replacement(
     monkeypatch, tmp_path
 ):
     monkeypatch.setattr(capacity, "_worker_exec_preflight", lambda: None)
-    monkeypatch.setattr(
-        capacity, "_worker_exec_argv", lambda argv: tuple(argv)
-    )
     monkeypatch.setattr(capacity, "_TERMINATE_GRACE_SECONDS", 0.05)
     monkeypatch.setattr(capacity, "_KILL_CONFIRM_SECONDS", 2.0)
     descendant_paths = [tmp_path / f"orphan-{index}.pid" for index in range(4)]
@@ -1630,7 +2280,10 @@ def test_normal_leader_exit_cleans_old_group_before_slot_replacement(
         descendant_code = (
             "import os,signal,time; from pathlib import Path; "
             "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-            f"Path({str(descendant_path)!r}).write_text(str(os.getpid())); "
+            "host_pid=next(line for line in "
+            "Path('/proc/self/status').read_text().splitlines() "
+            "if line.startswith('NSpid:')).split()[1]; "
+            f"Path({str(descendant_path)!r}).write_text(host_pid); "
             "time.sleep(60)"
         )
         leader_code = "\n".join(
@@ -1667,10 +2320,7 @@ def test_normal_leader_exit_cleans_old_group_before_slot_replacement(
     )
 
     assert len(outcomes) == 4
-    assert all(
-        outcome.termination_reason == "orphan_process_group"
-        for outcome in outcomes
-    )
+    assert all(outcome.termination_reason is None for outcome in outcomes)
     assert all(
         _pid_is_dead(int(path.read_text())) for path in descendant_paths
     )
@@ -1735,37 +2385,42 @@ def test_gate_abort_allows_four_real_children_to_run_cleanup(tmp_path):
 
 
 def test_default_cli_is_six_hours_four_workers_and_requires_container_evidence():
-    args = capacity._parser().parse_args([])
+    with pytest.raises(SystemExit) as missing_evidence:
+        capacity._parser().parse_args([])
+    assert missing_evidence.value.code == 2
+
+    args = _parse_cli()
 
     assert args.duration_seconds == 21_600
     assert capacity.WORKER_COUNT == 4
     assert capacity._container_values(args) == (
         "airflow-scheduler",
         "flaresolverr",
-        "proxy_filter",
     )
     assert capacity._scope_values(args) == (
         "INT-World Cup=2026",
         "ENG-Premier League=2526",
     )
     assert args.flaresolverr_url == "http://127.0.0.1:8191"
+    assert args.deployment_attestation == Path(
+        "/evidence/deployment-attestation.json"
+    )
+    assert args.digest_override == Path("/evidence/digest-only.yaml")
     assert capacity._validate_args(args) is None
 
 
 def test_host_cli_accepts_representative_scopes_and_all_runtime_containers():
-    args = capacity._parser().parse_args(
-        [
-            "--scope",
-            "INT-World Cup=2026",
-            "--scope",
-            "ENG-Premier League=2526",
-            "--container",
-            "airflow-scheduler",
-            "--container",
-            "flaresolverr",
-            "--container",
-            "proxy_filter",
-        ]
+    args = _parse_cli(
+        "--scope",
+        "INT-World Cup=2026",
+        "--scope",
+        "ENG-Premier League=2526",
+        "--container",
+        "airflow-scheduler",
+        "--container",
+        "flaresolverr",
+        "--container",
+        "proxy_filter",
     )
 
     assert capacity._scope_values(args) == (
@@ -1798,12 +2453,11 @@ def test_host_cli_accepts_representative_scopes_and_all_runtime_containers():
 
 
 def test_container_arguments_can_only_add_to_mandatory_runtime_set():
-    args = capacity._parser().parse_args(["--container", "trino"])
+    args = _parse_cli("--container", "trino")
 
     assert capacity._container_values(args) == (
         "airflow-scheduler",
         "flaresolverr",
-        "proxy_filter",
         "trino",
     )
 
@@ -1814,6 +2468,12 @@ def test_nonfinite_duration_and_sampling_interval_are_rejected():
     )
     assert "sample-interval-seconds" in capacity._validate_args(
         _args(sample_interval_seconds=float("nan"))
+    )
+
+
+def test_capacity_rejects_catalog_outside_canonical_runtime() -> None:
+    assert capacity._validate_args(_args(catalog="/tmp/alternate.yaml")) == (
+        "capacity catalog must be the canonical production catalog"
     )
 
 
@@ -2234,6 +2894,7 @@ def test_owner_state_is_atomic_0600_and_removed_only_after_verified_cleanup(
             "schema_version": capacity._OWNER_STATE_SCHEMA_VERSION,
             "owner": "a" * 24,
             "flaresolverr_endpoint": "http://127.0.0.1:8191",
+            "worker_image_id": None,
         }
         assert state_path.stat().st_mode & 0o777 == 0o600
         assert not list(tmp_path.glob(".owner.json.*.tmp"))
@@ -2245,6 +2906,45 @@ def test_owner_state_is_atomic_0600_and_removed_only_after_verified_cleanup(
         assert not state_path.exists()
     finally:
         lease.close()
+
+
+def test_owner_lock_and_state_reject_hardlinked_files(tmp_path):
+    lock_target = tmp_path / "lock-target"
+    lock_target.write_bytes(b"")
+    lock_path = tmp_path / "capacity.lock"
+    os.link(lock_target, lock_path)
+    with pytest.raises(RuntimeError, match="lock metadata"):
+        capacity._acquire_supervisor_lock(lock_path)
+
+    state_path = tmp_path / "owner.json"
+    capacity._write_owner_state(
+        state_path, "a" * 24, "http://127.0.0.1:8191"
+    )
+    os.link(state_path, tmp_path / "owner-hardlink")
+    with pytest.raises(ValueError, match="ownership state metadata"):
+        capacity._read_owner_state(state_path)
+
+
+def test_legacy_owner_state_is_read_only_without_an_image_identity(tmp_path):
+    state_path = tmp_path / "owner-v1.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "owner": "a" * 24,
+                "flaresolverr_endpoint": "http://127.0.0.1:8191",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    state_path.chmod(0o600)
+
+    assert capacity._read_owner_state(state_path) == (
+        "a" * 24,
+        "http://127.0.0.1:8191",
+        None,
+    )
 
 
 def test_failed_final_cleanup_keeps_owner_state_for_next_preflight(
@@ -2275,6 +2975,44 @@ def test_failed_final_cleanup_keeps_owner_state_for_next_preflight(
     try:
         evidence = lease.finalize()
 
+        assert evidence["final_verified_zero"] is False
+        assert evidence["state_file_removed"] is False
+        assert state_path.exists()
+    finally:
+        lease.close()
+
+
+@pytest.mark.parametrize("method", ["finalize", "abort_before_workers"])
+def test_failed_worker_artifact_cleanup_keeps_owner_state(
+    monkeypatch, tmp_path, method
+):
+    state_path = tmp_path / "owner.json"
+    monkeypatch.setattr(
+        capacity, "_DEFAULT_SUPERVISOR_LOCK_PATH", tmp_path / "capacity.lock"
+    )
+    monkeypatch.setattr(capacity, "_DEFAULT_SESSION_OWNER_PATH", state_path)
+    monkeypatch.setattr(capacity.secrets, "token_hex", lambda size: "a" * 24)
+    monkeypatch.setattr(
+        capacity,
+        "_sweep_owned_browser_sessions",
+        lambda **kwargs: _successful_cleanup_result(),
+    )
+    monkeypatch.setattr(
+        capacity,
+        "_probe_fresh_session_owner",
+        lambda **kwargs: _successful_fresh_probe_result(),
+    )
+
+    lease = capacity._prepare_session_ownership(
+        _args(),
+        monotonic=time.monotonic,
+        sleep=lambda seconds: None,
+        finalize_worker_artifacts=lambda owner: False,
+    )
+    try:
+        evidence = getattr(lease, method)()
+        assert evidence["worker_artifact_cleanup_required"] is True
+        assert evidence["worker_artifact_cleanup_verified"] is False
         assert evidence["final_verified_zero"] is False
         assert evidence["state_file_removed"] is False
         assert state_path.exists()
@@ -2322,6 +3060,72 @@ def test_stale_owner_is_cleaned_before_new_owner_is_persisted(
             (stale_owner, stale_endpoint, True),
             ("a" * 24, current_endpoint, False),
         ]
+    finally:
+        lease.close()
+
+
+def test_stale_worker_containers_are_cleaned_under_owner_lock(
+    monkeypatch, tmp_path
+):
+    state_path = tmp_path / "owner.json"
+    monkeypatch.setattr(
+        capacity, "_DEFAULT_SUPERVISOR_LOCK_PATH", tmp_path / "capacity.lock"
+    )
+    monkeypatch.setattr(capacity, "_DEFAULT_SESSION_OWNER_PATH", state_path)
+    stale_owner = "b" * 24
+    stale_image_id = "sha256:" + "d" * 64
+    current_image_id = "sha256:" + "e" * 64
+    capacity._write_owner_state(
+        state_path,
+        stale_owner,
+        "http://127.0.0.1:8191",
+        stale_image_id,
+    )
+    events = []
+
+    def sweep(**kwargs):
+        events.append(("browser", kwargs["owner"]))
+        return _successful_cleanup_result()
+
+    monkeypatch.setattr(
+        capacity,
+        "_sweep_owned_browser_sessions",
+        sweep,
+    )
+    monkeypatch.setattr(
+        capacity,
+        "_probe_fresh_session_owner",
+        lambda **kwargs: _successful_fresh_probe_result(),
+    )
+    monkeypatch.setattr(capacity.secrets, "token_hex", lambda size: "a" * 24)
+    observed = []
+
+    def cleanup(owner: str, worker_image_id: str | None):
+        observed.append((owner, worker_image_id, state_path.exists()))
+        events.append(("worker", owner))
+        return ("c" * 64,)
+
+    lease = capacity._prepare_session_ownership(
+        _args(),
+        monotonic=time.monotonic,
+        sleep=lambda seconds: None,
+        worker_image_id=current_image_id,
+        cleanup_stale_workers=cleanup,
+    )
+    try:
+        persisted_worker_image_id = json.loads(state_path.read_text())[
+            "worker_image_id"
+        ]
+        evidence = lease.finalize()
+        assert observed == [(stale_owner, stale_image_id, True)]
+        assert events[:2] == [
+            ("worker", stale_owner),
+            ("browser", stale_owner),
+        ]
+        assert persisted_worker_image_id == current_image_id
+        assert evidence["stale_worker_cleanup_required"] is True
+        assert evidence["stale_worker_cleanup_verified"] is True
+        assert evidence["stale_worker_containers_removed"] == 1
     finally:
         lease.close()
 
@@ -2731,8 +3535,353 @@ def test_deferred_cleanup_handler_records_only_first_signal(monkeypatch):
     assert signal.SIGINT in installed
 
 
-def test_real_run_restores_host_signal_handlers_before_report_build(monkeypatch):
-    runtime = FakeCapacityRuntime()
+def test_admitted_container_runtime_is_loaded_from_captured_bytes():
+    source_path = (
+        capacity.REPO_ROOT
+        / "scripts"
+        / "research"
+        / "whoscored_capacity_container_runtime.py"
+    )
+    module, module_name = capacity._load_admitted_container_runtime(
+        source_path.read_bytes(), source_path=source_path
+    )
+    runtime = capacity.AdmittedWorkerRuntime(
+        bundle_fd=-1,
+        helper_fd=-1,
+        catalog_fd=-1,
+        python_fd=-1,
+        unshare_fd=-1,
+        site_packages=Path("/nonexistent"),
+        file_sha256={},
+        bundle_sha256="0" * 64,
+        container_runtime_module=module,
+        container_runtime_module_name=module_name,
+    )
+    try:
+        assert sys.modules[module_name] is module
+        assert module.WORKLOAD_PATH == capacity._CONTAINER_WORKFLOW_PATH
+        assert callable(module.run_capacity_containers)
+    finally:
+        runtime.close()
+    assert module_name not in sys.modules
+
+
+def test_container_runtime_tree_is_materialized_at_exact_owner_path():
+    owner = f"{os.getpid():024x}"[-24:]
+    expected_owner_root = Path("/tmp") / (
+        capacity._HOST_RUNTIME_OWNER_PREFIX + owner
+    )
+    runtime = capacity.AdmittedWorkerRuntime(
+        bundle_fd=-1,
+        helper_fd=-1,
+        catalog_fd=-1,
+        python_fd=-1,
+        unshare_fd=-1,
+        site_packages=Path("/nonexistent"),
+        file_sha256={},
+        bundle_sha256="0" * 64,
+        execution_mode="exact-scheduler-image-v1",
+        container_runtime_module=SimpleNamespace(),
+        pending_runtime_tree_files={"payload.py": b"VALUE = 1\n"},
+    )
+
+    capacity._materialize_admitted_container_runtime(
+        runtime, session_owner=owner
+    )
+    try:
+        assert runtime.runtime_root == expected_owner_root / "root"
+        assert runtime.source_circuit_root == expected_owner_root / "source-circuit"
+        assert runtime.session_owner == owner
+        assert runtime.pending_runtime_tree_files is None
+        assert (runtime.runtime_root / "payload.py").read_bytes() == b"VALUE = 1\n"
+    finally:
+        runtime.close()
+    assert not expected_owner_root.exists()
+
+
+def test_container_runtime_evidence_names_the_real_execution_mode():
+    runtime = capacity.AdmittedWorkerRuntime(
+        bundle_fd=-1,
+        helper_fd=-1,
+        catalog_fd=-1,
+        python_fd=-1,
+        unshare_fd=-1,
+        site_packages=Path("/nonexistent"),
+        file_sha256={"runtime.py": "a" * 64},
+        bundle_sha256="b" * 64,
+        runtime_tree_sha256="c" * 64,
+        execution_mode="exact-scheduler-image-v1",
+    )
+
+    evidence = capacity._worker_runtime_evidence(
+        runtime, {"worker_image_id": "sha256:" + "d" * 64}
+    )
+
+    assert evidence == {
+        "bundle_sha256": None,
+        "execution_mode": "exact-scheduler-image-v1",
+        "file_count": 1,
+        "runtime_cleanup_complete": True,
+        "runtime_tree_sha256": "c" * 64,
+        "worker_image_id": "sha256:" + "d" * 64,
+    }
+
+
+def test_container_round_binds_exact_images_resources_and_reports(tmp_path):
+    deployment = _production_deployment(tmp_path)
+    owner = "a" * 24
+    commands = capacity._build_commands(
+        _args(catalog=str(capacity.REPO_ROOT / "configs/medallion/competitions.yaml")),
+        2,
+        browser_session_owner=owner,
+    )
+    observed = {}
+
+    class WorkerSpec:
+        def __init__(self, *, worker_index, workload_argv, iteration):
+            self.worker_index = worker_index
+            self.workload_argv = workload_argv
+            self.iteration = iteration
+
+    def run_capacity_containers(**kwargs):
+        observed.update(kwargs)
+        kwargs["before_release"]()
+        kwargs["on_sample"](
+            SimpleNamespace(
+                containers=tuple(
+                        SimpleNamespace(
+                            worker_index=index,
+                            iteration=2,
+                            container_id=str(index + 1) * 64,
+                        status="running",
+                        running=True,
+                        exit_code=0,
+                        oom_killed=False,
+                        memory_usage_bytes=(index + 1) * 100,
+                        pids_current=index + 2,
+                    )
+                    for index in range(capacity.WORKER_COUNT)
+                )
+            )
+        )
+        outcome = SimpleNamespace(
+            status="completed",
+            reason="ok",
+            cleanup_complete=True,
+            exit_codes=(0, 0, 0, 0),
+            worker_results=tuple(
+                    SimpleNamespace(
+                        worker_index=index,
+                        iteration=2,
+                        stdout_json={"worker": index},
+                    stderr_bytes=0,
+                    stderr_sha256=hashlib.sha256(b"").hexdigest(),
+                )
+                for index in range(capacity.WORKER_COUNT)
+            ),
+        )
+        kwargs["on_outcome"](outcome)
+        return outcome
+
+    module = SimpleNamespace(
+        WorkerSpec=WorkerSpec,
+        run_capacity_containers=run_capacity_containers,
+    )
+    runtime = capacity.AdmittedWorkerRuntime(
+        bundle_fd=-1,
+        helper_fd=-1,
+        catalog_fd=-1,
+        python_fd=-1,
+        unshare_fd=-1,
+        site_packages=Path("/nonexistent"),
+        file_sha256={},
+        bundle_sha256="0" * 64,
+        runtime_root=tmp_path / "runtime",
+        source_circuit_root=tmp_path / "source",
+        execution_mode="exact-scheduler-image-v1",
+        container_runtime_module=module,
+    )
+    samples = []
+    outcomes = []
+    releases = []
+
+    capacity._run_container_round(
+        commands,
+        deployment=deployment,
+        worker_runtime=runtime,
+        deadline=time.monotonic() + 60,
+        on_sample=lambda force: samples.append(
+            (
+                force,
+                runtime.worker_container_memory_bytes,
+                runtime.worker_container_pids,
+            )
+        ),
+        on_outcome=outcomes.append,
+        should_stop=lambda: False,
+        before_launch=lambda: releases.append(True),
+        monotonic=time.monotonic,
+        sleep=lambda seconds: None,
+    )
+
+    assert observed["scheduler_image_id"] == RUNNING_IMAGE_IDS["airflow-scheduler"]
+    assert observed["flaresolverr_container_id"] == RUNNING_CONTAINER_IDS[
+        "flaresolverr"
+    ]
+    assert [worker.workload_argv[0] for worker in observed["workers"]] == [
+        capacity._CONTAINER_WORKFLOW_PATH
+    ] * capacity.WORKER_COUNT
+    assert all(
+        capacity._CONTAINER_CATALOG_PATH in worker.workload_argv
+        for worker in observed["workers"]
+    )
+    assert releases == [True]
+    assert samples == [(False, 1000, 14)]
+    assert [outcome.report for outcome in outcomes] == [
+        {"worker": index} for index in range(capacity.WORKER_COUNT)
+    ]
+    assert runtime.worker_container_memory_bytes == 0
+    assert runtime.worker_container_evidence == ()
+
+
+def test_container_round_streams_result_then_advances_only_that_slot(tmp_path):
+    deployment = _production_deployment(tmp_path)
+    owner = "a" * 24
+    commands = capacity._build_commands(
+        _args(catalog=str(capacity.REPO_ROOT / "configs/medallion/competitions.yaml")),
+        4,
+        browser_session_owner=owner,
+    )
+    observed_replacement = []
+
+    class WorkerSpec:
+        def __init__(self, *, worker_index, workload_argv, iteration):
+            self.worker_index = worker_index
+            self.workload_argv = workload_argv
+            self.iteration = iteration
+
+    def result(worker_index, iteration, report):
+        return SimpleNamespace(
+            worker_index=worker_index,
+            iteration=iteration,
+            stdout_json=report,
+            stderr_bytes=0,
+            stderr_sha256=hashlib.sha256(b"").hexdigest(),
+        )
+
+    def run_capacity_containers(**kwargs):
+        kwargs["on_worker_result"](result(0, 4, {"worker": 0}))
+        replacement = kwargs["replacement_worker"](kwargs["workers"][0])
+        observed_replacement.append(replacement)
+        outcome = SimpleNamespace(
+            status="stopped",
+            reason="gate stopped",
+            cleanup_complete=True,
+            exit_codes=(143, 143, 143, 143),
+            worker_results=(
+                result(0, 5, None),
+                *(result(index, 4, None) for index in range(1, 4)),
+            ),
+        )
+        kwargs["on_outcome"](outcome)
+        return outcome
+
+    worker_runtime = capacity.AdmittedWorkerRuntime(
+        bundle_fd=-1,
+        helper_fd=-1,
+        catalog_fd=-1,
+        python_fd=-1,
+        unshare_fd=-1,
+        site_packages=Path("/nonexistent"),
+        file_sha256={},
+        bundle_sha256="0" * 64,
+        runtime_root=tmp_path / "runtime",
+        source_circuit_root=tmp_path / "source",
+        execution_mode="exact-scheduler-image-v1",
+        container_runtime_module=SimpleNamespace(
+            WorkerSpec=WorkerSpec,
+            run_capacity_containers=run_capacity_containers,
+        ),
+    )
+    outcomes = []
+
+    capacity._run_container_round(
+        commands,
+        deployment=deployment,
+        worker_runtime=worker_runtime,
+        deadline=time.monotonic() + 60,
+        on_sample=lambda _force: None,
+        on_outcome=outcomes.append,
+        should_stop=lambda: False,
+        before_launch=lambda: None,
+        monotonic=time.monotonic,
+        sleep=lambda _seconds: None,
+    )
+
+    assert [(item.worker_index, item.iteration) for item in observed_replacement] == [
+        (0, 5)
+    ]
+    assert [(item.worker_id, item.iteration) for item in outcomes] == [
+        (0, 4),
+        (0, 5),
+        (1, 4),
+        (2, 4),
+        (3, 4),
+    ]
+    assert outcomes[0].report == {"worker": 0}
+    assert all(item.termination_reason == "aborted_by_gate" for item in outcomes[1:])
+
+
+def test_stale_container_cleanup_uses_persisted_image_and_blocks_legacy():
+    observed = []
+    module = SimpleNamespace(
+        cleanup_stale_owner_containers=lambda **kwargs: (
+            observed.append(kwargs) or ("c" * 64,)
+        ),
+        find_stale_owner_containers=lambda owner: (),
+    )
+    runtime = capacity.AdmittedWorkerRuntime(
+        bundle_fd=-1,
+        helper_fd=-1,
+        catalog_fd=-1,
+        python_fd=-1,
+        unshare_fd=-1,
+        site_packages=Path("/nonexistent"),
+        file_sha256={},
+        bundle_sha256="0" * 64,
+        execution_mode="exact-scheduler-image-v1",
+        container_runtime_module=module,
+    )
+    stale_image_id = "sha256:" + "d" * 64
+
+    assert capacity._cleanup_stale_capacity_workers(
+        worker_runtime=runtime,
+        owner="a" * 24,
+        stale_worker_image_id=stale_image_id,
+    ) == ("c" * 64,)
+    assert observed == [
+        {"owner": "a" * 24, "scheduler_image_id": stale_image_id}
+    ]
+    assert capacity._cleanup_stale_capacity_workers(
+        worker_runtime=runtime,
+        owner="a" * 24,
+        stale_worker_image_id=None,
+    ) == ()
+
+    module.find_stale_owner_containers = lambda owner: ("e" * 64,)
+    with pytest.raises(RuntimeError, match="legacy owner state"):
+        capacity._cleanup_stale_capacity_workers(
+            worker_runtime=runtime,
+            owner="a" * 24,
+            stale_worker_image_id=None,
+        )
+
+
+def test_real_run_restores_host_signal_handlers_before_report_build(
+    monkeypatch, tmp_path
+):
+    deployment = _production_deployment(tmp_path)
+    runtime = FakeCapacityRuntime(production_deployment=deployment.evidence())
     previous_term = signal.getsignal(signal.SIGTERM)
     previous_hup = signal.getsignal(signal.SIGHUP)
     previous_int = signal.getsignal(signal.SIGINT)
@@ -2749,13 +3898,35 @@ def test_real_run_restores_host_signal_handlers_before_report_build(monkeypatch)
         return json.loads(json.dumps(report, sort_keys=True, default=str))
 
     monkeypatch.setattr(capacity, "_workflow_runtime_preflight", lambda: None)
-    monkeypatch.setattr(capacity, "_default_dependencies", runtime.dependencies)
+    monkeypatch.setattr(
+        capacity, "_validate_production_deployment", lambda args: deployment
+    )
+    monkeypatch.setattr(
+        capacity,
+        "_default_dependencies",
+        lambda _deployment: runtime.dependencies(),
+    )
+    monkeypatch.setattr(
+        capacity,
+        "_admit_worker_runtime",
+        lambda args, expected_identity, **_kwargs: capacity.AdmittedWorkerRuntime(
+            bundle_fd=-1,
+            helper_fd=-1,
+            catalog_fd=-1,
+            python_fd=-1,
+            unshare_fd=-1,
+            site_packages=Path(sys.prefix),
+            file_sha256={},
+            bundle_sha256="0" * 64,
+        ),
+    )
     monkeypatch.setattr(capacity, "_json_safe_document", json_safe_document)
 
     code, report = capacity.run(_args())
 
     assert code == 0
     assert report["status"] == "success"
+    assert report["production_deployment"] == deployment.evidence()
     assert report_build_observations == [(True, True, True)]
     assert signal.getsignal(signal.SIGTERM) is previous_term
     assert signal.getsignal(signal.SIGHUP) is previous_hup
@@ -2768,12 +3939,12 @@ def test_procfs_sampler_fails_when_a_required_root_is_not_visible():
 
 
 def test_runtime_identity_covers_canary_parser_transport_and_container_helpers():
-    identity = capacity._runtime_identity(capacity._parser().parse_args([]))
+    identity = capacity._runtime_identity(_parse_cli())
 
-    assert capacity.CANARY_VERSION == "whoscored-capacity-canary-v2"
+    assert capacity.CANARY_VERSION == "whoscored-capacity-canary-v3"
     assert len(identity["git_revision"]) == 40
     assert len(identity["manifest_sha256"]) == 64
-    assert identity["python_executable"] == sys.executable
+    assert identity["python_executable"] == str(Path(sys.executable).resolve())
     assert identity["python_prefix"] == sys.prefix
     assert identity["dependency_versions"] == {
         "curl_cffi": capacity._installed_curl_cffi_version()
@@ -2786,6 +3957,8 @@ def test_runtime_identity_covers_canary_parser_transport_and_container_helpers()
         "docker/images/flaresolverr-whoscored/Dockerfile",
         "docker/images/flaresolverr-whoscored/Dockerfile.dockerignore",
         "docker/images/flaresolverr-whoscored/entrypoint.sh",
+        "docker/images/airflow/whoscored-build-provenance-attestation.json",
+        "docker/images/airflow/whoscored-build-provenance-manifest.json",
         "scripts/research/bench_whoscored_capacity.py",
         "scripts/research/bench_whoscored_workflow.py",
         "scripts/research/whoscored_capacity_worker_exec.py",
@@ -2796,29 +3969,259 @@ def test_runtime_identity_covers_canary_parser_transport_and_container_helpers()
         "scripts/seaweedfs_legacy_entrypoint.sh",
         "scripts/seaweedfs_lifecycle_lock.sh",
         "scripts/validate_seaweedfs_s3_identity_config.py",
+        "scripts/validate_whoscored_build_provenance.py",
+        "scripts/whoscored_production_admission.py",
         "scripts/proxy_filter/filter_proxy.py",
         "docker/images/airflow/requirements-scraping.txt",
         "scrapers/utils/rate_limiter.py",
+        "scrapers/__init__.py",
+        "scrapers/base/__init__.py",
+        "scrapers/utils/__init__.py",
         "scrapers/whoscored/parsers.py",
         "scrapers/whoscored/repository.py",
         "scrapers/whoscored/service.py",
         "scrapers/whoscored/transport.py",
         "scrapers/whoscored/raw_store.py",
         "scrapers/whoscored/runtime_contract.py",
+        "scrapers/whoscored/runtime_contract.lock",
         "configs/medallion/competitions.yaml",
     }.issubset(identity["file_sha256"])
     assert (
         identity["file_sha256"]["external:unshare"]
         == capacity.REQUIRED_UNSHARE_SHA256
     )
+    assert (
+        f"external:{Path(sys.executable).resolve().name}"
+        in identity["file_sha256"]
+    )
 
 
-def test_runtime_manifest_binds_unresolved_venv_and_curl_cffi_version(
+def test_worker_runtime_tree_is_deterministic_private_and_read_only():
+    files = {
+        "configs/medallion/competitions.yaml": b"competitions: []\n",
+        "scrapers/whoscored/runtime_contract.py": b"VALUE = 1\n",
+    }
+    first_owner, first_root, first_source_root, first_sha256 = (
+        capacity._materialize_worker_runtime_tree(files)
+    )
+    second_owner, second_root, second_source_root, second_sha256 = (
+        capacity._materialize_worker_runtime_tree(dict(reversed(tuple(files.items()))))
+    )
+    try:
+        assert first_sha256 == second_sha256
+        assert first_sha256 != "0" * 64
+        for root in (first_root, second_root):
+            assert stat.S_IMODE(root.stat().st_mode) == 0o555
+            for relative, payload in files.items():
+                target = root / relative
+                assert target.read_bytes() == payload
+                assert target.stat().st_uid == 0
+                assert stat.S_IMODE(target.stat().st_mode) == 0o444
+        for source_root in (first_source_root, second_source_root):
+            assert source_root.stat().st_uid == 0
+            assert source_root.stat().st_gid == 0
+            assert stat.S_IMODE(source_root.stat().st_mode) == 0o770
+    finally:
+        first_owner.cleanup()
+        second_owner.cleanup()
+
+
+@pytest.mark.parametrize("relative", ("../escape", "/absolute", "a/../b", ""))
+def test_worker_runtime_tree_rejects_unsafe_members(relative):
+    with pytest.raises(RuntimeError, match="member is invalid"):
+        capacity._materialize_worker_runtime_tree({relative: b"payload"})
+
+
+def test_worker_runtime_bundle_is_deterministic_sealed_and_checkout_free():
+    assert capacity._WORKER_BUNDLE_PATHS == tuple(
+        sorted(capacity._WORKER_BUNDLE_PATHS)
+    )
+    assert len(capacity._WORKER_BUNDLE_PATHS) == len(
+        set(capacity._WORKER_BUNDLE_PATHS)
+    )
+    args = _parse_cli()
+    identity = capacity._runtime_identity(args)
+    first = capacity._admit_worker_runtime(args, expected_identity=identity)
+    second = capacity._admit_worker_runtime(args, expected_identity=identity)
+    try:
+        first_payload = os.pread(
+            first.bundle_fd, os.fstat(first.bundle_fd).st_size, 0
+        )
+        second_payload = os.pread(
+            second.bundle_fd, os.fstat(second.bundle_fd).st_size, 0
+        )
+        assert first_payload == second_payload
+        assert first.bundle_sha256 == second.bundle_sha256
+        required_seals = (
+            capacity.fcntl.F_SEAL_WRITE
+            | capacity.fcntl.F_SEAL_GROW
+            | capacity.fcntl.F_SEAL_SHRINK
+            | capacity.fcntl.F_SEAL_SEAL
+        )
+        for descriptor in (
+            first.bundle_fd,
+            first.helper_fd,
+            first.catalog_fd,
+            first.python_fd,
+            first.unshare_fd,
+        ):
+            assert capacity.fcntl.fcntl(
+                descriptor, capacity.fcntl.F_GET_SEALS
+            ) == required_seals
+        with zipfile.ZipFile(f"/proc/self/fd/{first.bundle_fd}") as archive:
+            assert set(archive.namelist()) == {
+                "__main__.py",
+                *capacity._WORKER_BUNDLE_PATHS,
+            }
+            assert archive.testzip() is None
+            assert all(
+                info.compress_type == zipfile.ZIP_STORED
+                and info.date_time == (1980, 1, 1, 0, 0, 0)
+                for info in archive.infolist()
+            )
+
+        original = (
+            sys.executable,
+            str(capacity.WORKFLOW_SCRIPT),
+            "--catalog",
+            str(args.catalog),
+            "--help",
+        )
+        command = capacity._sealed_worker_argv(original, first)
+        environment = capacity._worker_environment()
+        environment.update(
+            {
+                "WHOSCORED_CAPACITY_BUNDLE_PATH": (
+                    f"/proc/self/fd/{first.bundle_fd}"
+                ),
+                "WHOSCORED_CAPACITY_SITE_PACKAGES": str(first.site_packages),
+            }
+        )
+        assert not {
+            "PYTHONPATH",
+            "PYTHONHOME",
+            "PYTHONSTARTUP",
+            "LD_PRELOAD",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+        }.intersection(environment)
+        result = subprocess.run(
+            command,
+            env=environment,
+            pass_fds=(first.bundle_fd, first.catalog_fd, first.python_fd),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert result.returncode == 0
+        assert "WhoScored" in result.stdout
+        assert str(capacity.REPO_ROOT) not in result.stderr
+
+        invalid_scope = (
+            sys.executable,
+            str(capacity.WORKFLOW_SCRIPT),
+            "--catalog",
+            str(args.catalog),
+            "--scope",
+            "UNKNOWN=x",
+        )
+        inner = capacity._sealed_worker_argv(invalid_scope, first)
+        ready_read, ready_write = os.pipe()
+        release_read, release_write = os.pipe()
+        process = subprocess.Popen(
+            capacity._worker_exec_argv(
+                inner,
+                python_path=f"/proc/self/fd/{first.python_fd}",
+                namespace_path=f"/proc/self/fd/{first.unshare_fd}",
+                helper_path=f"/proc/self/fd/{first.helper_fd}",
+                close_fds=(first.helper_fd,),
+                ready_fd=ready_write,
+                release_fd=release_read,
+            ),
+            env=environment,
+            pass_fds=(
+                first.bundle_fd,
+                first.helper_fd,
+                first.catalog_fd,
+                first.python_fd,
+                first.unshare_fd,
+                ready_write,
+                release_read,
+            ),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        os.close(ready_write)
+        os.close(release_read)
+        try:
+            assert os.read(ready_read, 16) == b"READY\n"
+            assert os.read(ready_read, 1) == b""
+            capacity._atomic_release_cohort(release_write, 1)
+            os.close(release_write)
+            release_write = -1
+            stdout, stderr = process.communicate(timeout=15)
+        finally:
+            os.close(ready_read)
+            if release_write >= 0:
+                os.close(release_write)
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+        assert process.returncode == 2, stderr
+        invalid_report = json.loads(stdout)
+        assert invalid_report["status"] == "configuration_error"
+        assert invalid_report["scope"] == "UNKNOWN=x"
+        assert invalid_report["publishes"] is False
+    finally:
+        first.close()
+        second.close()
+
+
+def test_runtime_identity_binds_external_deployment_evidence(monkeypatch, tmp_path):
+    deployment = _production_deployment(tmp_path)
+    runtime_file = tmp_path / "runtime.py"
+    runtime_file.write_text("VALUE = 1\n")
+    monkeypatch.setattr(
+        capacity, "_runtime_files", lambda args, **_kwargs: (runtime_file,)
+    )
+
+    def fake_git(argv, **kwargs):
+        del kwargs
+        stdout = "a" * 40 + "\n" if argv[1:3] == ["rev-parse", "HEAD"] else ""
+        return SimpleNamespace(stdout=stdout)
+
+    monkeypatch.setattr(capacity.subprocess, "run", fake_git)
+    args = _args(
+        deployment_attestation=deployment.deployment_attestation_path,
+        digest_override=deployment.digest_override_path,
+    )
+
+    identity = capacity._runtime_identity(args, deployment=deployment)
+
+    assert identity["production_deployment"] == deployment.evidence()
+    assert identity["file_sha256"]["external:deployment-attestation"] == (
+        deployment.deployment_attestation_sha256
+    )
+    assert identity["file_sha256"][
+        f"external:compose:{deployment.digest_override_path.name}"
+    ] == (
+        deployment.digest_override_sha256
+    )
+    deployment.digest_override_path.write_text("services: {changed: true}\n")
+    with pytest.raises(RuntimeError, match="deployment evidence changed"):
+        capacity._runtime_identity(args, deployment=deployment)
+
+
+def test_runtime_manifest_binds_resolved_python_and_curl_cffi_version(
     monkeypatch, tmp_path
 ):
     runtime_file = tmp_path / "runtime.py"
     runtime_file.write_text("VALUE = 1\n")
-    monkeypatch.setattr(capacity, "_runtime_files", lambda args: (runtime_file,))
+    monkeypatch.setattr(
+        capacity, "_runtime_files", lambda args, **_kwargs: (runtime_file,)
+    )
 
     def fake_git(argv, **kwargs):
         del kwargs
@@ -2838,14 +4241,13 @@ def test_runtime_manifest_binds_unresolved_venv_and_curl_cffi_version(
     monkeypatch.setattr(
         capacity, "_installed_curl_cffi_version", lambda: installed_version
     )
-    args = capacity._parser().parse_args([])
+    args = _parse_cli()
 
     before = capacity._runtime_identity(args)
     installed_version = "0.15.1"
     after = capacity._runtime_identity(args)
 
-    assert before["python_executable"] == str(executable)
-    assert before["python_executable"] != str(executable.resolve())
+    assert before["python_executable"] == str(executable.resolve())
     assert before["python_prefix"] == str(venv)
     assert before["dependency_versions"] == {"curl_cffi": "0.15.0"}
     assert after["dependency_versions"] == {"curl_cffi": "0.15.1"}
@@ -2858,7 +4260,7 @@ def test_runtime_identity_changes_when_rate_limiter_input_changes(
     runtime_file = tmp_path / "rate_limiter.py"
     runtime_file.write_text("RATE = 30\n")
     monkeypatch.setattr(
-        capacity, "_runtime_files", lambda args: (runtime_file,)
+        capacity, "_runtime_files", lambda args, **_kwargs: (runtime_file,)
     )
 
     def fake_git(argv, **kwargs):
@@ -2867,7 +4269,7 @@ def test_runtime_identity_changes_when_rate_limiter_input_changes(
         return SimpleNamespace(stdout=stdout)
 
     monkeypatch.setattr(capacity.subprocess, "run", fake_git)
-    args = capacity._parser().parse_args([])
+    args = _parse_cli()
 
     before = capacity._runtime_identity(args)
     runtime_file.write_text("RATE = 60\n")

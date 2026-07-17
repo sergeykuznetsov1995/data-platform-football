@@ -74,6 +74,7 @@ RUNTIME_STATIC_FILES = frozenset(
         "docker/images/airflow/whoscored-production-entrypoint",
         "docker/images/airflow/whoscored-production-gate",
         "docker/images/airflow/whoscored-production-python",
+        "docker/images/airflow/whoscored_capacity_worker_bootstrap.py",
         "docker/images/airflow/whoscored_production_gate.py",
         "docker/images/airflow/whoscored_runtime_pth.py",
         "docker/images/airflow/whoscored_runtime_startup.py",
@@ -83,6 +84,13 @@ RUNTIME_STATIC_FILES = frozenset(
         "dags/utils/maintenance_tasks.py",
         "scrapers/whoscored/runtime_contract.py",
         "scripts/flaresolverr_extended.py",
+        # The host-side capacity supervisor seals these path-loaded helpers
+        # into the worker bundle; ordinary Python imports cannot expose those
+        # edges to the fixed-point walker below.
+        "scripts/research/bench_whoscored_capacity.py",
+        "scripts/research/bench_whoscored_workflow.py",
+        "scripts/research/whoscored_capacity_container_runtime.py",
+        "scripts/research/whoscored_capacity_worker_exec.py",
         # These two host-side admission sources are loaded through an exact
         # fd-relative protected path, so no ordinary Python import edge can
         # make them visible to the AST fixed-point walker.
@@ -262,6 +270,22 @@ def test_image_trust_root_matches_mounted_attestor_and_lock():
 def test_docker_installs_last_ordered_root_owned_runtime_trust_anchor():
     dockerfile = (ROOT / "docker/images/airflow/Dockerfile").read_text(encoding="utf-8")
 
+    assert (
+        'ENV GUNICORN_CMD_ARGS="--worker-tmp-dir /dev/shm --no-control-socket"'
+        in dockerfile
+    )
+    assert "AIRFLOW_CONFIG=/usr/local/share/whoscored/airflow.cfg" in dockerfile
+    assert "= \"0:0:444:0\"" in dockerfile
+    assert 'GunicornOption("control_socket_disable", True)' in dockerfile
+    assert (
+        "370759b8078edd002470a0ddfb0e3030365a08459f2844b3e102367ffa166e2b"
+        in dockerfile
+    )
+    assert "NwdZuAeO3QAkcKDd-w4wMDZaCEWfKESz4QI2f_oWbis,7233" in dockerfile
+    assert (
+        "cbeb35f3979408ad5997cb5bc10f9733a7d4b42d2d28174126536271f2fbe083"
+        in dockerfile
+    )
     assert "whoscored-runtime-trust-root-generic" in dockerfile
     assert "whoscored-runtime-trust-root-production" in dockerfile
     assert "whoscored-runtime-trust-root-test" in dockerfile
@@ -756,7 +780,7 @@ def test_checked_in_whoscored_runtime_contract_matches_release_tree():
     assert EXPECTED_RUNTIME_FILES == tuple(sorted(EXPECTED_RUNTIME_FILES))
     assert len(EXPECTED_RUNTIME_FILES) == len(set(EXPECTED_RUNTIME_FILES))
     assert tuple(contract["files"]) == EXPECTED_RUNTIME_FILES
-    assert result["file_count"] == len(EXPECTED_RUNTIME_FILES) == 83
+    assert result["file_count"] == len(EXPECTED_RUNTIME_FILES) == 88
     assert len(result["code_tree_sha256"]) == 64
     assert len(result["manifest_sha256"]) == 64
 

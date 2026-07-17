@@ -214,12 +214,24 @@ def _discovery(
     selected = dict(deployment or _deployment(payloads=payloads))
     images = selected["images"]
     assert isinstance(images, list)
+    deployment_raw = admission._canonical_bytes(selected)
+    identity = (1, 2, 0o100600, 0, 0, 1, len(deployment_raw), 3, 4)
     return SimpleNamespace(
+        build_attestation_raw=b"validated build attestation\n",
+        build_attestation_identity=identity,
+        build_manifest_raw=b"validated build manifest\n",
+        build_manifest_identity=identity,
         deployment_attestation=selected,
-        deployment_attestation_raw=admission._canonical_bytes(selected),
+        deployment_attestation_raw=deployment_raw,
+        deployment_attestation_identity=identity,
         deployment_final_images={
             str(record["service"]): str(record["final_image"]) for record in images
         },
+        validated_release_revision="1" * 40,
+        validated_payload_revision="2" * 40,
+        validated_manifest_sha256=SHA_D,
+        validated_source_tree_sha256=SHA_A,
+        validated_payload_image_ids=dict(payloads),
         records={
             "local_images": [
                 {"payload_image_id": payloads[service], "service": service}
@@ -252,6 +264,66 @@ def _validated_bindings(
         deployment_attestation_path=deployment_path,
     )
     return deployment_path, bindings
+
+
+def test_binding_evidence_reuses_validator_snapshots(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    discovery = _discovery()
+    monkeypatch.setattr(
+        admission.provenance,
+        "validate",
+        lambda *_args, **_kwargs: discovery,
+    )
+
+    result = admission.validate_bindings_with_evidence(
+        root=tmp_path,
+        attestation_path=tmp_path / "attestation.json",
+        manifest_path=tmp_path / "manifest.json",
+        deployment_attestation_path=tmp_path / "deployment.json",
+    )
+
+    assert result.bindings == BINDINGS
+    assert result.build_attestation_raw is discovery.build_attestation_raw
+    assert result.build_manifest_raw is discovery.build_manifest_raw
+    assert result.deployment_attestation_raw is discovery.deployment_attestation_raw
+    assert result.deployment_attestation_identity == (
+        discovery.deployment_attestation_identity
+    )
+    assert result.validated_release_revision == "1" * 40
+    assert result.validated_payload_revision == "2" * 40
+    assert result.validated_manifest_sha256 == SHA_D
+    assert result.validated_source_tree_sha256 == SHA_A
+    assert result.validated_payload_image_ids == PAYLOADS
+    with pytest.raises(TypeError):
+        result.bindings["airflow-scheduler"] = "mutable"  # type: ignore[index]
+    with pytest.raises(TypeError):
+        result.validated_payload_image_ids["airflow-scheduler"] = "mutable"  # type: ignore[index]
+
+
+def test_override_snapshot_is_verified_from_one_protected_read(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    expected = admission.compose_override_bytes(BINDINGS)
+    identity = (1, 2, 0o100600, 0, 0, 1, len(expected), 3, 4)
+    calls: list[Path] = []
+
+    def read_once(path: Path, *, label: str) -> tuple[bytes, tuple[int, ...]]:
+        assert label == "production Compose override"
+        calls.append(path)
+        return expected, identity
+
+    monkeypatch.setattr(
+        admission.provenance,
+        "read_protected_regular_file_snapshot",
+        read_once,
+    )
+
+    assert admission.verify_override_snapshot(tmp_path / "override.yaml", BINDINGS) == (
+        expected,
+        identity,
+    )
+    assert calls == [tmp_path / "override.yaml"]
 
 
 def test_generate_override_is_digest_only_atomic_and_never_overwrites(
@@ -983,6 +1055,23 @@ def test_rendered_compose_accepts_exact_selected_approval_path():
     )
 
 
+def test_scheduler_healthcheck_allows_attested_python_startup_time():
+    projections = admission.verify_rendered_compose(_rendered(), BINDINGS)
+
+    assert projections["airflow-scheduler"]["healthcheck"]["Timeout"] == (
+        30_000_000_000
+    )
+
+
+@pytest.mark.parametrize("timeout", ("10s", "31s", "1m0s"))
+def test_scheduler_healthcheck_rejects_unreviewed_timeout(timeout):
+    rendered = _rendered()
+    rendered["services"]["airflow-scheduler"]["healthcheck"]["timeout"] = timeout
+
+    with pytest.raises(admission.AdmissionError, match="healthcheck policy differs"):
+        admission.verify_rendered_compose(rendered, BINDINGS)
+
+
 def test_scheduler_admission_preserves_metered_transfermarkt_controls():
     environment = _rendered_environment("airflow-scheduler")
     _enable_metered_transfermarkt(environment)
@@ -1521,6 +1610,188 @@ def test_post_create_verifies_container_and_digest_selected_image_identity() -> 
     assert [record["service"] for record in report["images"]] == list(
         admission.PROTECTED_SERVICES
     )
+
+
+def test_running_admission_reuses_complete_container_contract() -> None:
+    def running(
+        _service: str,
+        _ids: list[str],
+        container: dict[str, Any],
+        _image: dict[str, Any],
+    ) -> None:
+        if container:
+            container["State"] = {
+                "Dead": False,
+                "Health": {"Status": "healthy"},
+                "OOMKilled": False,
+                "Paused": False,
+                "Restarting": False,
+                "Running": True,
+                "Status": "running",
+            }
+
+    projections = admission.verify_rendered_compose(_rendered(), BINDINGS)
+    report = admission.verify_created_containers(
+        BINDINGS,
+        project="data-platform",
+        selected_services=admission.PROTECTED_SERVICES,
+        projections=projections,
+        config_hashes=CONFIG_HASHES,
+        config_files=CONFIG_FILES,
+        env_files=ENV_FILES,
+        runner=_docker_runner(running),
+        expected_state="running",
+    )
+
+    assert report["status"] == "admitted-running-v1"
+
+
+def test_running_admission_rejects_unhealthy_container() -> None:
+    def unhealthy(
+        _service: str,
+        _ids: list[str],
+        container: dict[str, Any],
+        _image: dict[str, Any],
+    ) -> None:
+        if container:
+            container["State"] = {
+                "Dead": False,
+                "Health": {"Status": "unhealthy"},
+                "OOMKilled": False,
+                "Paused": False,
+                "Restarting": False,
+                "Running": True,
+                "Status": "running",
+            }
+
+    projections = admission.verify_rendered_compose(_rendered(), BINDINGS)
+    with pytest.raises(admission.AdmissionError, match="healthy and running"):
+        admission.verify_created_containers(
+            BINDINGS,
+            project="data-platform",
+            selected_services=("airflow-scheduler",),
+            projections=projections,
+            config_hashes=CONFIG_HASHES,
+            config_files=CONFIG_FILES,
+            env_files=ENV_FILES,
+            runner=_docker_runner(unhealthy),
+            expected_state="running",
+        )
+
+
+@pytest.mark.parametrize(
+    "health",
+    (
+        None,
+        "healthy",
+        {},
+        {"Status": "starting"},
+    ),
+)
+def test_running_admission_requires_explicit_healthy_state(health: object) -> None:
+    def missing_or_invalid_health(
+        _service: str,
+        _ids: list[str],
+        container: dict[str, Any],
+        _image: dict[str, Any],
+    ) -> None:
+        if container:
+            container["State"] = {
+                "Dead": False,
+                "Health": health,
+                "OOMKilled": False,
+                "Paused": False,
+                "Restarting": False,
+                "Running": True,
+                "Status": "running",
+            }
+
+    projections = admission.verify_rendered_compose(_rendered(), BINDINGS)
+    with pytest.raises(admission.AdmissionError, match="healthy and running"):
+        admission.verify_created_containers(
+            BINDINGS,
+            project="data-platform",
+            selected_services=("airflow-scheduler",),
+            projections=projections,
+            config_hashes=CONFIG_HASHES,
+            config_files=CONFIG_FILES,
+            env_files=ENV_FILES,
+            runner=_docker_runner(missing_or_invalid_health),
+            expected_state="running",
+        )
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    (
+        ("AIRFLOW_CONFIG", None),
+        ("AIRFLOW_CONFIG", "/opt/airflow/airflow.cfg"),
+        ("GUNICORN_CMD_ARGS", None),
+        (
+            "GUNICORN_CMD_ARGS",
+            "--worker-tmp-dir /dev/shm --control-socket /opt/airflow/gunicorn.ctl",
+        ),
+    ),
+)
+@pytest.mark.parametrize(
+    "image_service", ("airflow-scheduler", "whoscored_paid_gateway")
+)
+def test_post_create_rejects_mutable_airflow_runtime_controls(
+    name: str, value: str | None, image_service: str
+) -> None:
+    def mutate_image_environment(
+        service: str,
+        _ids: list[str],
+        _container: dict[str, Any],
+        image: dict[str, Any],
+    ) -> None:
+        # Gateway and filter deliberately share one exact proxy image binding,
+        # so mutating that image covers both protected services.
+        if service != image_service or not image:
+            return
+        environment = [
+            item for item in image["Config"]["Env"] if not item.startswith(f"{name}=")
+        ]
+        if value is not None:
+            environment.append(f"{name}={value}")
+        image["Config"]["Env"] = environment
+
+    projections = admission.verify_rendered_compose(_rendered(), BINDINGS)
+    with pytest.raises(admission.AdmissionError, match="hardening environment differs"):
+        admission.verify_created_containers(
+            BINDINGS,
+            project="data-platform",
+            selected_services=admission.PROTECTED_SERVICES,
+            projections=projections,
+            config_hashes=CONFIG_HASHES,
+            config_files=CONFIG_FILES,
+            env_files=ENV_FILES,
+            runner=_docker_runner(mutate_image_environment),
+        )
+
+
+@pytest.mark.parametrize(
+    "service",
+    ("airflow-scheduler", "whoscored_paid_gateway", "whoscored_proxy_filter"),
+)
+@pytest.mark.parametrize(
+    ("name", "value"),
+    (
+        ("AIRFLOW_CONFIG", "/opt/airflow/airflow.cfg"),
+        (
+            "GUNICORN_CMD_ARGS",
+            "--worker-tmp-dir /dev/shm --control-socket /opt/airflow/gunicorn.ctl",
+        ),
+    ),
+)
+def test_rendered_compose_rejects_airflow_image_policy_overrides(
+    service: str, name: str, value: str
+) -> None:
+    rendered = _rendered()
+    rendered["services"][service]["environment"][name] = value
+
+    with pytest.raises(admission.AdmissionError, match="environment names differ"):
+        admission.verify_rendered_compose(rendered, BINDINGS)
 
 
 def test_post_create_accepts_engine_29_empty_bind_mode_with_exact_request() -> None:

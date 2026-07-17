@@ -31,6 +31,7 @@ import secrets
 import stat
 import subprocess
 import types
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -160,6 +161,7 @@ PROTECTED_SERVICES = (
 )
 _PROTECTED_SERVICE_SET = frozenset(PROTECTED_SERVICES)
 _DIGEST = re.compile(r"\A[0-9a-f]{64}\Z")
+_COMMIT = re.compile(r"\A[0-9a-f]{40}\Z")
 _PINNED_IMAGE = re.compile(r"\A[^\s@]+@sha256:[0-9a-f]{64}\Z")
 _IMAGE_ID = re.compile(r"\Asha256:[0-9a-f]{64}\Z")
 _CONTAINER_ID = re.compile(r"\A[0-9a-f]{64}\Z")
@@ -560,7 +562,7 @@ _EXPECTED_HEALTHCHECKS = {
             "CMD-SHELL",
             'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"',
         ),
-        "Timeout": 10_000_000_000,
+        "Timeout": 30_000_000_000,
     },
     "flaresolverr": {
         "Interval": 30_000_000_000,
@@ -1022,6 +1024,8 @@ _FIXED_ENVIRONMENT = {
     },
 }
 _AIRFLOW_IMAGE_ENVIRONMENT = {
+    "AIRFLOW_CONFIG": "/usr/local/share/whoscored/airflow.cfg",
+    "GUNICORN_CMD_ARGS": "--worker-tmp-dir /dev/shm --no-control-socket",
     "LD_LIBRARY_PATH": "",
     "PATH": (
         "/opt/spark/bin:/usr/lib/jvm/java-17-openjdk-amd64/bin:/root/bin:"
@@ -1088,6 +1092,24 @@ _EXPECTED_PORT_BINDINGS = {
 
 class AdmissionError(RuntimeError):
     """Raised when immutable deployment admission cannot be proven."""
+
+
+@dataclass(frozen=True)
+class ValidatedBindingsEvidence:
+    """Exact snapshots and identities used to admit one release binding."""
+
+    bindings: Mapping[str, str]
+    build_attestation_raw: bytes
+    build_attestation_identity: tuple[int, ...]
+    build_manifest_raw: bytes
+    build_manifest_identity: tuple[int, ...]
+    deployment_attestation_raw: bytes
+    deployment_attestation_identity: tuple[int, ...]
+    validated_release_revision: str
+    validated_payload_revision: str
+    validated_manifest_sha256: str
+    validated_source_tree_sha256: str
+    validated_payload_image_ids: Mapping[str, str]
 
 
 class _DuplicateKey(ValueError):
@@ -1242,14 +1264,13 @@ def _final_image_bindings(
     return protected
 
 
-def validate_bindings(
+def _validate_bindings_and_discovery(
     *,
     root: Path,
     attestation_path: Path,
     manifest_path: Path,
     deployment_attestation_path: Path,
-) -> dict[str, str]:
-    """Validate provenance and return every immutable protected image ref."""
+) -> tuple[dict[str, str], Any]:
 
     if frozenset(provenance.PROTECTED_PRODUCTION_SERVICES) != _PROTECTED_SERVICE_SET:
         raise AdmissionError("validator and admission protected-service sets differ")
@@ -1308,7 +1329,136 @@ def validate_bindings(
     }
     if observed_final_images != parsed_final_images:
         raise AdmissionError("validator final-image bindings differ from attestation")
+    return bindings, discovery
+
+
+def validate_bindings(
+    *,
+    root: Path,
+    attestation_path: Path,
+    manifest_path: Path,
+    deployment_attestation_path: Path,
+) -> dict[str, str]:
+    """Validate provenance and return every immutable protected image ref."""
+
+    bindings, _ = _validate_bindings_and_discovery(
+        root=root,
+        attestation_path=attestation_path,
+        manifest_path=manifest_path,
+        deployment_attestation_path=deployment_attestation_path,
+    )
     return bindings
+
+
+def _evidence_identity(value: object, *, label: str) -> tuple[int, ...]:
+    if (
+        not isinstance(value, tuple)
+        or len(value) != 9
+        or any(type(item) is not int for item in value)
+    ):
+        raise AdmissionError(f"validator returned an invalid {label} identity")
+    return value
+
+
+def _evidence_raw(value: object, *, label: str) -> bytes:
+    if not isinstance(value, bytes) or not value:
+        raise AdmissionError(f"validator did not return its fd-pinned {label}")
+    return value
+
+
+def validate_bindings_with_evidence(
+    *,
+    root: Path,
+    attestation_path: Path,
+    manifest_path: Path,
+    deployment_attestation_path: Path,
+) -> ValidatedBindingsEvidence:
+    """Return bindings and the exact fd snapshots used to validate them."""
+
+    bindings, discovery = _validate_bindings_and_discovery(
+        root=root,
+        attestation_path=attestation_path,
+        manifest_path=manifest_path,
+        deployment_attestation_path=deployment_attestation_path,
+    )
+    release_revision = getattr(discovery, "validated_release_revision", None)
+    payload_revision = getattr(discovery, "validated_payload_revision", None)
+    manifest_digest = getattr(discovery, "validated_manifest_sha256", None)
+    source_tree_digest = getattr(discovery, "validated_source_tree_sha256", None)
+    payload_image_ids = getattr(discovery, "validated_payload_image_ids", None)
+    if (
+        not isinstance(release_revision, str)
+        or _COMMIT.fullmatch(release_revision) is None
+    ):
+        raise AdmissionError("validator did not preserve the release revision")
+    if (
+        not isinstance(payload_revision, str)
+        or _COMMIT.fullmatch(payload_revision) is None
+    ):
+        raise AdmissionError("validator did not preserve the payload revision")
+    if (
+        not isinstance(manifest_digest, str)
+        or _DIGEST.fullmatch(manifest_digest) is None
+    ):
+        raise AdmissionError("validator did not preserve the manifest digest")
+    if (
+        not isinstance(source_tree_digest, str)
+        or _DIGEST.fullmatch(source_tree_digest) is None
+    ):
+        raise AdmissionError("validator did not preserve the source-tree digest")
+    if not isinstance(payload_image_ids, Mapping):
+        raise AdmissionError("validator did not preserve payload image bindings")
+    normalized_payloads: dict[str, str] = {}
+    for service, image_id in payload_image_ids.items():
+        if (
+            not isinstance(service, str)
+            or not service
+            or service in normalized_payloads
+            or not isinstance(image_id, str)
+            or _IMAGE_ID.fullmatch(image_id) is None
+        ):
+            raise AdmissionError("validator returned invalid payload image bindings")
+        normalized_payloads[service] = image_id
+    local_images = discovery.records.get("local_images")
+    expected_payloads = {
+        str(record["service"]): str(record["payload_image_id"])
+        for record in local_images
+        if isinstance(record, Mapping)
+    }
+    if normalized_payloads != expected_payloads:
+        raise AdmissionError("validator payload image bindings differ from manifest")
+    return ValidatedBindingsEvidence(
+        bindings=types.MappingProxyType(dict(bindings)),
+        build_attestation_raw=_evidence_raw(
+            getattr(discovery, "build_attestation_raw", None),
+            label="build attestation",
+        ),
+        build_attestation_identity=_evidence_identity(
+            getattr(discovery, "build_attestation_identity", None),
+            label="build attestation",
+        ),
+        build_manifest_raw=_evidence_raw(
+            getattr(discovery, "build_manifest_raw", None),
+            label="build manifest",
+        ),
+        build_manifest_identity=_evidence_identity(
+            getattr(discovery, "build_manifest_identity", None),
+            label="build manifest",
+        ),
+        deployment_attestation_raw=_evidence_raw(
+            getattr(discovery, "deployment_attestation_raw", None),
+            label="deployment attestation",
+        ),
+        deployment_attestation_identity=_evidence_identity(
+            getattr(discovery, "deployment_attestation_identity", None),
+            label="deployment attestation",
+        ),
+        validated_release_revision=release_revision,
+        validated_payload_revision=payload_revision,
+        validated_manifest_sha256=manifest_digest,
+        validated_source_tree_sha256=source_tree_digest,
+        validated_payload_image_ids=types.MappingProxyType(normalized_payloads),
+    )
 
 
 def compose_override_bytes(bindings: Mapping[str, str]) -> bytes:
@@ -1411,13 +1561,27 @@ def write_new_regular_file(path: Path, payload: bytes) -> None:
         raise AdmissionError("published admission output differs from requested bytes")
 
 
-def verify_override(path: Path, bindings: Mapping[str, str]) -> None:
-    actual, _ = _read_regular_file(path, label="production Compose override")
+def verify_override_snapshot(
+    path: Path, bindings: Mapping[str, str]
+) -> tuple[bytes, tuple[int, ...]]:
+    """Verify one protected override read and return that exact snapshot."""
+
+    try:
+        actual, identity = provenance.read_protected_regular_file_snapshot(
+            path, label="production Compose override"
+        )
+    except provenance.ProvenanceError as exc:
+        raise AdmissionError(str(exc)) from exc
     expected = compose_override_bytes(bindings)
     if not hmac.compare_digest(actual, expected):
         raise AdmissionError(
             "production Compose override differs from the attested digest-only model"
         )
+    return actual, identity
+
+
+def verify_override(path: Path, bindings: Mapping[str, str]) -> None:
+    verify_override_snapshot(path, bindings)
 
 
 def _string_sequence(value: object, *, label: str) -> tuple[str, ...] | None:
@@ -2488,11 +2652,14 @@ def verify_created_containers(
     config_files: Sequence[Path],
     env_files: Sequence[Path],
     runner: DockerRunner = _run_docker,
+    expected_state: str = "created",
 ) -> dict[str, Any]:
     if set(bindings) != _PROTECTED_SERVICE_SET:
         raise AdmissionError("post-create bindings omit a protected service")
     if _PROJECT_NAME.fullmatch(project) is None:
         raise AdmissionError("Compose project name is invalid")
+    if expected_state not in {"created", "running"}:
+        raise AdmissionError("container admission state must be created or running")
     selected = tuple(selected_services)
     if (
         not selected
@@ -2636,10 +2803,25 @@ def verify_created_containers(
             raise AdmissionError(
                 f"container .Image is not an immutable image ID: {service}"
             )
-        if state.get("Status") != "created" or state.get("Running") is not False:
-            raise AdmissionError(
-                f"protected container was started before post-create admission: {service}"
-            )
+        if expected_state == "created":
+            if state.get("Status") != "created" or state.get("Running") is not False:
+                raise AdmissionError(
+                    "protected container was started before post-create admission: "
+                    f"{service}"
+                )
+        else:
+            unhealthy_flags = ("Paused", "Restarting", "Dead", "OOMKilled")
+            health = state.get("Health")
+            if (
+                state.get("Status") != "running"
+                or state.get("Running") is not True
+                or any(state.get(field) is not False for field in unhealthy_flags)
+                or not isinstance(health, dict)
+                or health.get("Status") != "healthy"
+            ):
+                raise AdmissionError(
+                    f"protected container is not healthy and running: {service}"
+                )
         image = _docker_object(
             runner(("image", "inspect", bindings[service])),
             label=f"image inspect for {service}",
@@ -2974,7 +3156,9 @@ def verify_created_containers(
         "networks": list(verified_networks.values()),
         "project": project,
         "schema_version": 1,
-        "status": "admitted-v1",
+        "status": (
+            "admitted-running-v1" if expected_state == "running" else "admitted-v1"
+        ),
         "volumes": verified_volumes,
     }
 
