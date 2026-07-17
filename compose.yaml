@@ -311,6 +311,11 @@ services:
     volumes:
       - ${SEAWEEDFS_S3_CONFIG_FILE:-./configs/seaweedfs/s3.config.json}:/etc/seaweedfs/s3.config.json:ro
       - ./scripts/seaweedfs_legacy_entrypoint.sh:/usr/local/bin/seaweedfs-legacy-entrypoint:ro
+    # The upstream image declares VOLUME /data. Override that implicit,
+    # persistent anonymous volume with a bounded ephemeral mount: this gateway
+    # talks to the filer and must never own storage state.
+    tmpfs:
+      - /data:rw,noexec,nosuid,nodev,size=16m,mode=0700
     networks:
       seaweedfs-control:
         aliases:

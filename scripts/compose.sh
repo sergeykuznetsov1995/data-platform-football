@@ -546,7 +546,7 @@ audit_protected_volume_consumers() {
 
 audit_legacy_storage_host_boundary() {
   local container kind expected_mount_count expected_config_mount expected_entrypoint_mount
-  local port_bindings cap_drop cap_add security_options read_only user mount_count
+  local port_bindings cap_drop cap_add security_options read_only user mount_count tmpfs
   container="${1}"
   kind="${2}"
   if [[ "${kind}" == mini ]]; then
@@ -563,6 +563,7 @@ audit_legacy_storage_host_boundary() {
      ! read_only="$(docker inspect --format '{{.HostConfig.ReadonlyRootfs}}' "${container}")" ||
      ! user="$(docker inspect --format '{{.Config.User}}' "${container}")" ||
      ! mount_count="$(docker inspect --format '{{len .Mounts}}' "${container}")" ||
+     ! tmpfs="$(docker inspect --format '{{json .HostConfig.Tmpfs}}' "${container}")" ||
      ! expected_config_mount="$(
        docker inspect --format '{{range .Mounts}}{{if eq .Destination "/etc/seaweedfs/s3.config.json"}}{{printf "%s\t%s\t%t" .Type .Source .RW}}{{end}}{{end}}' "${container}"
      )" ||
@@ -601,6 +602,28 @@ if normalised != expected:
 PY
   then
     echo "Existing ${kind} SeaweedFS capabilities differ from its reviewed identity" >&2
+    exit 78
+  fi
+  if ! python3 - "${kind}" "${tmpfs}" <<'PY'
+import json
+import sys
+
+kind = sys.argv[1]
+payload = json.loads(sys.argv[2]) or {}
+if kind == "mini":
+    if payload:
+        raise SystemExit(1)
+else:
+    if set(payload) != {"/data"}:
+        raise SystemExit(1)
+    required = {
+        "rw", "noexec", "nosuid", "nodev", "size=16m", "mode=0700"
+    }
+    if set(payload["/data"].split(",")) != required:
+        raise SystemExit(1)
+PY
+  then
+    echo "Existing ${kind} SeaweedFS tmpfs boundary differs from its reviewed identity" >&2
     exit 78
   fi
 }
@@ -1041,6 +1064,7 @@ pre_isolation_command = [item for item in command if item not in hardening_flags
 gateway = payload.get("services", {}).get("seaweedfs-s3", {})
 gateway_command = gateway.get("command")
 gateway_entrypoint = gateway.get("entrypoint")
+gateway_tmpfs = gateway.get("tmpfs")
 if (
     not isinstance(gateway_command, list)
     or not gateway_command
@@ -1052,6 +1076,8 @@ if (
     raise SystemExit("rendered legacy SeaweedFS S3 gateway is invalid")
 if gateway_entrypoint != ["/usr/local/bin/seaweedfs-legacy-entrypoint"]:
     raise SystemExit("rendered legacy SeaweedFS S3 entrypoint is invalid")
+if gateway_tmpfs != ["/data:rw,noexec,nosuid,nodev,size=16m,mode=0700"]:
+    raise SystemExit("rendered legacy SeaweedFS S3 tmpfs is invalid")
 print(value)
 print(json.dumps(command, separators=(",", ":")))
 print(json.dumps(entrypoint, separators=(",", ":")))
