@@ -778,8 +778,12 @@ WITH (
                 update_columns = [column for column in df.columns if column not in keys]
                 update_clause = ""
                 if update_columns:
+                    # Trino MERGE forbids qualifying the SET target column with
+                    # the target alias: `SET t."col" = ...` raises SYNTAX_ERROR
+                    # ("mismatched input '.'. Expecting: '='"). Only the source
+                    # reference stays qualified — same shape fbref/bronze.py uses.
                     assignments = ", ".join(
-                        f't."{column}" = s."{column}"'
+                        f'"{column}" = s."{column}"'
                         for column in update_columns
                     )
                     update_clause = f"WHEN MATCHED THEN UPDATE SET {assignments} "
