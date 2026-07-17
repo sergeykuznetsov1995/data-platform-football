@@ -545,7 +545,6 @@ GENERATED_AT="$(/usr/bin/date -u +%Y-%m-%dT%H:%M:%SZ)"
   --payload-image-id "flaresolverr_whoscored_paid=$FLARESOLVERR_PAYLOAD_ID" \
   --payload-image-id "jupyterhub=$JUPYTERHUB_PAYLOAD_ID" \
   --payload-image-id "proxy_filter=$AIRFLOW_BASE_ID" \
-  --payload-image-id "sofascore_proxy_filter=$AIRFLOW_SCHEDULER_PAYLOAD_ID" \
   --payload-image-id "superset=$SUPERSET_PAYLOAD_ID" \
   --payload-image-id "superset-beat=$SUPERSET_PAYLOAD_ID" \
   --payload-image-id "superset-worker=$SUPERSET_PAYLOAD_ID" \
@@ -638,7 +637,7 @@ and compare the exact bytes, owner and mode of all seven gate files inside each
 digest-addressed final image. For the two derived Airflow targets it also
 rejects every final-layer addition, removal, whiteout or extended attribute
 outside the reviewed gate and Python-alias delta. It never creates or starts a
-container, expands the six groups to all 15 local services, refuses an existing
+container, expands the six groups to all 14 local services, refuses an existing
 output and creates a canonical root-owned mode-0600 file:
 
 ```bash

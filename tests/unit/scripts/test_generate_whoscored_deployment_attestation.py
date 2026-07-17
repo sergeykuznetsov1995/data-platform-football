@@ -429,7 +429,7 @@ def _gate_docker_archive(
     return outer_stream, expected, payload_layer_count, len(layer_raws)
 
 
-def test_render_expands_six_images_to_exact_fifteen_validator_records() -> None:
+def test_render_expands_six_images_to_exact_fourteen_validator_records() -> None:
     payloads, finals, inspected = _image_fixture()
     manifest_digest = "9" * 64
 
@@ -458,7 +458,7 @@ def test_render_expands_six_images_to_exact_fifteen_validator_records() -> None:
         "status",
     }
     assert document["status"] == "ready-v1"
-    assert len(document["images"]) == 15
+    assert len(document["images"]) == 14
     assert [item["service"] for item in document["images"]] == sorted(
         generator.EXPECTED_SERVICES
     )
@@ -469,7 +469,7 @@ def test_render_expands_six_images_to_exact_fifteen_validator_records() -> None:
     } == {finals["superset"]}
 
 
-def test_ready_evidence_preserves_all_fifteen_service_bindings(
+def test_ready_evidence_preserves_all_fourteen_service_bindings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     payloads, _, _ = _image_fixture()
@@ -499,7 +499,7 @@ def test_ready_evidence_preserves_all_fifteen_service_bindings(
     evidence = generator._validated_ready_evidence(ROOT)
 
     assert evidence.payloads == payloads
-    assert len(evidence.payload_image_ids) == 15
+    assert len(evidence.payload_image_ids) == 14
 
 
 def test_published_document_is_accepted_by_existing_validator(tmp_path: Path) -> None:
@@ -527,7 +527,7 @@ def test_published_document_is_accepted_by_existing_validator(tmp_path: Path) ->
     )
 
     assert observed == raw
-    assert len(document["images"]) == 15
+    assert len(document["images"]) == 14
     assert final_images["airflow-scheduler"] == finals["airflow-scheduler"]
     assert stat.S_IMODE(output.stat().st_mode) == 0o600
 
@@ -542,7 +542,7 @@ def test_payload_service_set_and_shared_groups_are_exact(mutation: str) -> None:
     else:
         payloads["superset-worker"] = "sha256:" + "0" * 64
 
-    with pytest.raises(generator.DeploymentAttestationError, match="fifteen|differ"):
+    with pytest.raises(generator.DeploymentAttestationError, match="fourteen|differ"):
         generator.render_deployment_attestation(
             manifest_sha256="9" * 64,
             payloads=payloads,
@@ -1307,7 +1307,7 @@ def test_generate_validates_twice_before_create_once_publish(
 
     assert evidence_calls == [ROOT, ROOT]
     assert len(inspect_calls) == 24
-    assert receipt["service_count"] == 15
+    assert receipt["service_count"] == 14
     assert receipt["image_group_count"] == 6
     assert output.exists()
     with pytest.raises(generator.DeploymentAttestationError, match="already exists"):

@@ -66,6 +66,11 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 _SCRIPT_PATH = REPO_ROOT / "scripts" / "proxy_filter" / "filter_proxy.py"
 _BLOCKLIST_PATH = REPO_ROOT / "configs" / "proxy_filter" / "blocklist.txt"
 _COMPOSE_PATH = REPO_ROOT / "compose.yaml"
+# #951 (инцидент 2026-07-17): выделенный SofaScore-шлюз вынесен в СВОЙ
+# compose-проект, чтобы чужой `docker compose up` его не пересоздавал.
+_SOFASCORE_GATEWAY_COMPOSE_PATH = (
+    REPO_ROOT / "deploy/sofascore/gateway.compose.yaml"
+)
 
 
 def _load_module():
@@ -1714,10 +1719,11 @@ def test_malformed_env_never_silently_falls_back_to_file(mod, tmp_path):
 
 def test_proxy_filter_compose_is_env_only_by_default():
     compose = _COMPOSE_PATH.read_text()
-    # The dedicated sofascore_proxy_filter service (#951) now sits between the
-    # shared proxy_filter and caddy — bound the slice on that neighbour.
+    # The dedicated sofascore_proxy_filter service (#951) was moved into its own
+    # compose project; a breadcrumb comment now marks its old spot between the
+    # shared proxy_filter and caddy — bound the slice on that breadcrumb.
     service = compose.split("  proxy_filter:\n", 1)[1].split(
-        "\n  sofascore_proxy_filter:\n", 1
+        "\n  # sofascore_proxy_filter ВЫНЕСЕН", 1
     )[0]
 
     assert "PROXY_POOL_JSON: ${PROXY_POOL_JSON:-}" in service
@@ -1729,9 +1735,11 @@ def test_proxy_filter_compose_is_env_only_by_default():
 
 
 def test_sofascore_has_a_dedicated_production_metered_proxy_service():
-    compose = _COMPOSE_PATH.read_text()
-    service = compose.split("  sofascore_proxy_filter:\n", 1)[1].split(
-        "\n  caddy:\n", 1
+    # The gateway lives in its OWN compose project (#951, инцидент 2026-07-17):
+    # a foreign `docker compose up` on the shared project must not recreate it.
+    gateway = _SOFASCORE_GATEWAY_COMPOSE_PATH.read_text()
+    service = gateway.split("  sofascore_proxy_filter:\n", 1)[1].split(
+        "\nnetworks:\n", 1
     )[0]
 
     # Dedicated pool secret + file fallback until the purchased pool lands.
@@ -1744,7 +1752,16 @@ def test_sofascore_has_a_dedicated_production_metered_proxy_service():
     # One active SofaScore lease at a time.
     assert '\n      - --max-active-leases\n      - "1"' in service
     # Ledger/WAL on the persistent log root, isolated from the shared gateway.
-    assert "/logs/sofascore_proxy_filter/sofascore_allocation_claims.jsonl" in service
+    assert (
+        "/logs/sofascore_proxy_filter/sofascore_allocation_claims.jsonl"
+        in service
+    )
+    # Isolation contract: joins the shared dp-backend network as EXTERNAL (own
+    # project) and is ABSENT from the shared compose.yaml, so foreign deploys
+    # can't sweep it.
+    assert "external: true" in gateway
+    assert "name: dp-backend" in gateway
+    assert "\n  sofascore_proxy_filter:\n" not in _COMPOSE_PATH.read_text()
     assert (
         "SOFASCORE_PROXY_BUDGET_ARTIFACT:"
         "-/opt/airflow/configs/sofascore/proxy_budget_canary.json"
@@ -3561,7 +3578,16 @@ def test_sofascore_lease_host_scope_is_fail_closed(mod):
     assert mod._lease_host_allowed(production, "api.sofascore.com") is True
     assert mod._lease_host_allowed(production, "challenges.cloudflare.com") is True
     assert mod._lease_host_allowed(production, "evil.example") is False
-    assert mod._lease_host_allowed(production, "api.ipify.org") is False
+    # Production leases MUST reach the geoip exit-probe host (#951): Camoufox's
+    # geoip=True resolves the residential exit IP via api.ipify.org at browser
+    # startup; blocking it aborted every production capture with InvalidProxy
+    # before any data flowed. The canary lease already reaches it, so the
+    # measured budget already carries the probe cost.
+    assert mod._lease_host_allowed(production, "api.ipify.org") is True
+    # Scope stays fail-closed: only the single exit-probe host is opened — the
+    # other IP-echo fallbacks and arbitrary hosts remain blocked.
+    assert mod._lease_host_allowed(production, "ipinfo.io") is False
+    assert mod._lease_host_allowed(production, "checkip.amazonaws.com") is False
 
 
 def test_authenticated_proxy_listener_rejects_missing_lease_before_dial(mod):
@@ -3809,7 +3835,7 @@ def test_sofascore_production_and_canary_are_each_serial(mod):
     assert canary.source == "sofascore_canary"
 
 
-def test_exit_probe_host_is_available_only_inside_canary_lease(mod):
+def test_exit_probe_host_is_available_to_sofascore_leases_not_anonymous(mod):
     mgr = _FakeManager(
         [
             "http://u:p@pool.invalid:10000",
@@ -3835,8 +3861,11 @@ def test_exit_probe_host_is_available_only_inside_canary_lease(mod):
         require_context=True,
     )
 
+    # The geoip exit-probe host is reachable by BOTH sofascore lease kinds
+    # (#951): canary measured it, and production needs it for Camoufox
+    # geoip=True at browser startup. An anonymous (no-lease) caller stays blocked.
     assert mod._lease_host_allowed(canary, "api.ipify.org") is True
-    assert mod._lease_host_allowed(production, "api.ipify.org") is False
+    assert mod._lease_host_allowed(production, "api.ipify.org") is True
     assert mod._lease_host_allowed(None, "api.ipify.org") is False
     assert mod._lease_host_allowed(production, "www.sofascore.com") is True
 

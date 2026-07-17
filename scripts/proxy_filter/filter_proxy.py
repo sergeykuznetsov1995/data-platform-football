@@ -812,8 +812,15 @@ def _lease_host_allowed(lease: Lease | None, host: str, port: int = 443) -> bool
     if port != 443:
         return False
     if normalized == SOFASCORE_CANARY_EXIT_PROBE_HOST:
+        # Production SofaScore leases need the exit-probe host too. Camoufox's
+        # geoip=True resolves the residential exit IP via api.ipify.org at browser
+        # startup (camoufox/ip.py:public_ip, tried first and cached per proxy);
+        # blocking it aborts the browser with InvalidProxy before any capture.
+        # The canary lease already reaches it, so measured hard_task_bytes already
+        # carry the probe cost — production matches the measured configuration.
         return lease is not None and lease.source in {
             "fbref",
+            "sofascore",
             "sofascore_canary",
         }
     if lease is not None and lease.source in ("sofascore", "sofascore_canary"):

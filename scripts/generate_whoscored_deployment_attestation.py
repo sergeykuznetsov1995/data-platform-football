@@ -5,7 +5,7 @@ The generator accepts exactly six immutable registry references and six
 protected Buildx maximum-provenance files.  It reuses the repository validator,
 binds the exact clean source revision, target, Dockerfile, gate inputs and image
 config without creating or starting containers, and expands those six images
-to every one of the fifteen locally built Compose services.
+to every one of the fourteen locally built Compose services.
 
 The output is canonical JSON, is created once with mode 0600, and is never
 overwritten.  Run this script only through an isolated system Python
@@ -62,7 +62,6 @@ IMAGE_GROUP_SERVICES = MappingProxyType(
         "airflow-scheduler": (
             "airflow-scheduler",
             "fbref_proxy_filter",
-            "sofascore_proxy_filter",
         ),
         "airflow-whoscored-proxy": (
             "whoscored_paid_gateway",
@@ -560,7 +559,7 @@ def _validate_payload_groups(payloads: Mapping[str, str]) -> dict[str, str]:
         if extra:
             detail.append("extra=" + ",".join(extra))
         raise DeploymentAttestationError(
-            "ready manifest must bind exactly fifteen local services"
+            "ready manifest must bind exactly fourteen local services"
             + (": " + " ".join(detail) if detail else "")
         )
     grouped: dict[str, str] = {}
@@ -1162,9 +1161,9 @@ def render_deployment_attestation(
             for service in IMAGE_GROUP_SERVICES[group]
         )
     records.sort(key=lambda record: record["service"])
-    if len(records) != 15 or {record["service"] for record in records} != EXPECTED_SERVICES:
+    if len(records) != 14 or {record["service"] for record in records} != EXPECTED_SERVICES:
         raise DeploymentAttestationError(
-            "internal service expansion did not produce exactly fifteen services"
+            "internal service expansion did not produce exactly fourteen services"
         )
     return canonical_bytes(
         {
