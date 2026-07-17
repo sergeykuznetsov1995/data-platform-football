@@ -269,6 +269,11 @@ def test_routine_compose_and_make_preserve_supervised_topology_mode() -> None:
     assert ".supervised-topology-cutover-approved" in legacy_guard
     assert '"${1:-}" = "mini"' in legacy_guard
     assert "docker inspect seaweedfs-s3" in wrapper
+    assert wrapper.count(
+        '{{printf "%s\\t%s\\t%t" .Type .Source .RW}}'
+    ) == 3
+    assert '{{.Type}}\\t{{.Source}}\\t{{.RW}}' not in wrapper
+    assert wrapper.count("| sed '/^$/d' | LC_ALL=C sort") == 3
 
 
 def _run_stateless_compose(

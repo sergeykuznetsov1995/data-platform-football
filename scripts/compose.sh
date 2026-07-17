@@ -368,9 +368,9 @@ audit_s3_proxy_container() {
      ! proxy_read_only="$(docker inspect --format '{{.HostConfig.ReadonlyRootfs}}' seaweedfs-s3-proxy)" ||
      ! proxy_cap_drop="$(docker inspect --format '{{json .HostConfig.CapDrop}}' seaweedfs-s3-proxy)" ||
      ! proxy_cap_add="$(docker inspect --format '{{json .HostConfig.CapAdd}}' seaweedfs-s3-proxy)" ||
-     ! proxy_networks="$(docker inspect --format '{{range $name, $_ := .NetworkSettings.Networks}}{{println $name}}{{end}}' seaweedfs-s3-proxy | sort)" ||
+     ! proxy_networks="$(docker inspect --format '{{range $name, $_ := .NetworkSettings.Networks}}{{println $name}}{{end}}' seaweedfs-s3-proxy | sed '/^$/d' | LC_ALL=C sort)" ||
      ! proxy_ports="$(docker inspect --format '{{json .HostConfig.PortBindings}}' seaweedfs-s3-proxy)" ||
-     ! proxy_mount="$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/etc/caddy/S3ProxyCaddyfile"}}{{.Type}}\t{{.Source}}\t{{.RW}}{{end}}{{end}}' seaweedfs-s3-proxy)" ||
+     ! proxy_mount="$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/etc/caddy/S3ProxyCaddyfile"}}{{printf "%s\t%s\t%t" .Type .Source .RW}}{{end}}{{end}}' seaweedfs-s3-proxy)" ||
      ! proxy_mount_count="$(docker inspect --format '{{len .Mounts}}' seaweedfs-s3-proxy)" ||
      ! proxy_tmpfs="$(docker inspect --format '{{json .HostConfig.Tmpfs}}' seaweedfs-s3-proxy)" ||
      ! proxy_security="$(docker inspect --format '{{json .HostConfig.SecurityOpt}}' seaweedfs-s3-proxy)" ||
@@ -564,10 +564,10 @@ audit_legacy_storage_host_boundary() {
      ! user="$(docker inspect --format '{{.Config.User}}' "${container}")" ||
      ! mount_count="$(docker inspect --format '{{len .Mounts}}' "${container}")" ||
      ! expected_config_mount="$(
-       docker inspect --format '{{range .Mounts}}{{if eq .Destination "/etc/seaweedfs/s3.config.json"}}{{.Type}}\t{{.Source}}\t{{.RW}}{{end}}{{end}}' "${container}"
+       docker inspect --format '{{range .Mounts}}{{if eq .Destination "/etc/seaweedfs/s3.config.json"}}{{printf "%s\t%s\t%t" .Type .Source .RW}}{{end}}{{end}}' "${container}"
      )" ||
      ! expected_entrypoint_mount="$(
-       docker inspect --format '{{range .Mounts}}{{if eq .Destination "/usr/local/bin/seaweedfs-legacy-entrypoint"}}{{.Type}}\t{{.Source}}\t{{.RW}}{{end}}{{end}}' "${container}"
+       docker inspect --format '{{range .Mounts}}{{if eq .Destination "/usr/local/bin/seaweedfs-legacy-entrypoint"}}{{printf "%s\t%s\t%t" .Type .Source .RW}}{{end}}{{end}}' "${container}"
      )"; then
     echo "Cannot inspect the ${kind} SeaweedFS host boundary" >&2
     exit 78
@@ -1104,7 +1104,7 @@ print(json.dumps(gateway_command, separators=(",", ":")))
     )" || ! existing_legacy_image_ref="$(
       docker inspect --format '{{.Config.Image}}' seaweedfs
     )" || ! existing_legacy_networks="$(
-      docker inspect --format '{{range $name, $_ := .NetworkSettings.Networks}}{{println $name}}{{end}}' seaweedfs | sort
+      docker inspect --format '{{range $name, $_ := .NetworkSettings.Networks}}{{println $name}}{{end}}' seaweedfs | sed '/^$/d' | LC_ALL=C sort
     )"; then
       echo "Cannot inspect the existing legacy SeaweedFS identity" >&2
       exit 78
@@ -1166,7 +1166,7 @@ print(json.dumps(gateway_command, separators=(",", ":")))
     )" || ! existing_gateway_data_mount="$(
       docker inspect --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Name}}{{end}}{{end}}' seaweedfs-s3
     )" || ! existing_gateway_networks="$(
-      docker inspect --format '{{range $name, $_ := .NetworkSettings.Networks}}{{println $name}}{{end}}' seaweedfs-s3 | sort
+      docker inspect --format '{{range $name, $_ := .NetworkSettings.Networks}}{{println $name}}{{end}}' seaweedfs-s3 | sed '/^$/d' | LC_ALL=C sort
     )"; then
       echo "Cannot inspect the existing legacy SeaweedFS S3 gateway identity" >&2
       exit 78
