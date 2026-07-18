@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import signal
 import sys
 import tempfile
 from datetime import datetime, timezone
@@ -216,6 +217,27 @@ def _native_output_payload(report) -> dict[str, Any]:
     return payload
 
 
+# Buffered repository of the running native service. finish() is the normal
+# flush point, but an exception escaping _run_native (or the driver's SIGTERM
+# at unit timeout) would otherwise drop up to batch_size-1 already-paid-for
+# targets; main() salvage-flushes through this handle before reporting failure.
+_ACTIVE_NATIVE_SERVICE = None
+
+
+def _salvage_flush() -> None:
+    """Best-effort durability for buffered commits on an abnormal exit."""
+
+    service = _ACTIVE_NATIVE_SERVICE
+    if service is None:
+        return
+    try:
+        tables = service.repository.flush()
+        if tables:
+            logger.warning("salvage flush persisted buffered commits: %s", tables)
+    except Exception:
+        logger.exception("salvage flush after runner failure also failed")
+
+
 def _build_native_service(args, run_id: str):
     """Construct production dependencies lazily; legacy unit tests stay isolated."""
 
@@ -256,6 +278,8 @@ def _build_native_service(args, run_id: str):
         run_id=run_id,
         max_workers=args.workers,
     )
+    global _ACTIVE_NATIVE_SERVICE
+    _ACTIVE_NATIVE_SERVICE = service
     return service, raw_store
 
 
@@ -973,6 +997,14 @@ def _validate_args(parser: argparse.ArgumentParser, args) -> None:
         parser.error("--workers must be <= 16")
 
 
+def _sigterm_to_exception(signum, frame):
+    """The driver's unit timeout sends TERM (then KILL after 30s). Raising here
+    routes shutdown through main()'s failure path: salvage flush + a real
+    report instead of a silent NO_REPORT kill."""
+
+    raise RuntimeError(f"terminated by signal {signum}")
+
+
 def main():
     parser = _argument_parser()
     args = parser.parse_args()
@@ -981,12 +1013,17 @@ def main():
     output = args.output or f"/tmp/fotmob_result_{_safe_run_id(run_id)}.json"
     args.run_id = run_id
     try:
+        signal.signal(signal.SIGTERM, _sigterm_to_exception)
+    except ValueError:
+        pass  # not in the main thread (unit-test harness) — keep default
+    try:
         if args.mode:
             rc, payload = _run_native(args)
         else:
             rc, payload = _run_legacy(args)
     except (ValueError, RuntimeError) as exc:
         logger.error("FotMob runner configuration/runtime failure: %s", exc)
+        _salvage_flush()
         payload = {
             "run_id": run_id,
             "mode": args.mode or "legacy",
@@ -999,6 +1036,7 @@ def main():
         rc = 1
     except Exception as exc:
         logger.exception("Unexpected FotMob runner failure")
+        _salvage_flush()
         payload = {
             "run_id": run_id,
             "mode": args.mode or "legacy",

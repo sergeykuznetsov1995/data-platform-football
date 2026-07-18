@@ -730,14 +730,16 @@ def test_infrastructure_faults_are_retryable_not_schema_drift():
     # backfill driver stops and the canary's drift signal becomes meaningless.
     import requests
 
+    from scrapers.base.trino_manager import TrinoError
     from scrapers.fotmob.repository import ManifestStatus
     from scrapers.fotmob.service import _failure_status
 
-    class TrinoError(Exception):
-        pass
+    class WrappedTrinoError(TrinoError):
+        """Subclasses of the platform error must still classify as infra."""
 
     retryable = [
         TrinoError("SQL execution failed"),
+        WrappedTrinoError("SQL execution failed inside a batch"),
         requests.exceptions.ConnectionError("connection refused"),
         ConnectionResetError("peer reset"),
         TimeoutError("catalog timeout"),

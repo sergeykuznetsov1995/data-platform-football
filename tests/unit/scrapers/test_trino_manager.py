@@ -1611,3 +1611,34 @@ class TestMetadataCaching:
         manager.add_column("bronze", "t", "b", "BIGINT")
 
         assert manager.get_table_columns("bronze", "t") == {"a": "varchar", "b": "bigint"}
+
+    def test_add_column_is_idempotent_and_drops_cache_even_on_error(self):
+        """Concurrent schema evolution: another process may add the column
+        first. ALTER must carry IF NOT EXISTS, and a failed ALTER must still
+        drop the cached schema — otherwise a stale cache re-issues the same
+        ALTER on every subsequent write for the life of the process."""
+        manager = self._manager()
+        columns = [("a", "varchar", "", "")]
+        statements = []
+
+        def _execute(sql, fetch=False, params=None):
+            statements.append(sql)
+            if sql.startswith("DESCRIBE"):
+                return list(columns)
+            if sql.startswith("ALTER"):
+                raise RuntimeError("transient Trino failure")
+            return None
+
+        manager._execute = _execute
+
+        assert manager.get_table_columns("bronze", "t") == {"a": "varchar"}
+        # Simulate the other process having evolved the live table already.
+        columns.append(("b", "bigint", "", ""))
+        with pytest.raises(RuntimeError):
+            manager.add_column("bronze", "t", "b", "BIGINT")
+
+        alters = [s for s in statements if s.startswith("ALTER")]
+        assert alters and all("IF NOT EXISTS" in s for s in alters)
+        # The failed ALTER must not leave a poisoned cache: the next read has
+        # to see the live schema (fresh DESCRIBE), not the stale snapshot.
+        assert manager.get_table_columns("bronze", "t") == {"a": "varchar", "b": "bigint"}

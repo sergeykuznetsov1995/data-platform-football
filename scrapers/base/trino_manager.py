@@ -1006,9 +1006,13 @@ WITH (
             column_type: Trino type (e.g., 'VARCHAR', 'BIGINT', 'DOUBLE')
         """
         qualified = validate_catalog_qualified_name(self.catalog, schema, table)
-        sql = f'ALTER TABLE {qualified} ADD COLUMN "{column}" {column_type}'
-        self._execute(sql)
+        # IF NOT EXISTS + eager cache drop: with the column cache a stale
+        # process would otherwise re-issue the same ADD COLUMN forever after a
+        # concurrent writer evolved the table first (COLUMN_ALREADY_EXISTS on
+        # every subsequent write — the pop below was unreachable on error).
+        sql = f'ALTER TABLE {qualified} ADD COLUMN IF NOT EXISTS "{column}" {column_type}'
         self._column_cache.pop((schema, table), None)
+        self._execute(sql)
         logger.info(f'Added column "{column}" {column_type} to {self.catalog}.{schema}.{table}')
 
     def get_table_columns(self, schema: str, table: str) -> Dict[str, str]:

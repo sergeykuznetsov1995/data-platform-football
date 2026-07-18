@@ -80,7 +80,11 @@ def _failure_status(exc: BaseException) -> ManifestStatus:
     root_module = type(exc).__module__.split(".", 1)[0]
     if root_module in _INFRA_EXCEPTION_MODULES:
         return ManifestStatus.RETRYABLE_FAILURE
-    if type(exc).__name__ == "TrinoError":
+    # Name matched against the whole MRO (not just the leaf class), so
+    # subclasses of the platform's TrinoError still classify as infrastructure.
+    # The name check (rather than an import) avoids coupling this module to
+    # trino_manager, but must not silently regress when the error is wrapped.
+    if any(base.__name__ == "TrinoError" for base in type(exc).__mro__):
         return ManifestStatus.RETRYABLE_FAILURE
     return ManifestStatus.SCHEMA_DRIFT
 
