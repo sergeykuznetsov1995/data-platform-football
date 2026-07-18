@@ -1974,6 +1974,32 @@ def _load_cached_career_frames(
     return {key: frame}
 
 
+def _align_ingested_at_units(frames):
+    """Give every part's ``_ingested_at`` one datetime unit before concat.
+
+    Bronze reads infer the column as nanoseconds while scraper frames built
+    before the #982 fix carried microseconds, and pandas 2.1 cannot concat
+    datetime64 columns of mixed units — the merge of a partially reused scope
+    died on exactly that (#982).
+    """
+    import pandas as pd
+
+    aligned = []
+    for frame in frames:
+        if (
+            frame is not None and len(frame)
+            and '_ingested_at' in frame.columns
+            and str(frame['_ingested_at'].dtype) != 'datetime64[ns]'
+        ):
+            frame = frame.assign(
+                _ingested_at=pd.to_datetime(
+                    frame['_ingested_at']
+                ).astype('datetime64[ns]'),
+            )
+        aligned.append(frame)
+    return aligned
+
+
 def _merge_career_cache_frames(
     scraper,
     spec: EntitySpec,
@@ -1986,10 +2012,10 @@ def _merge_career_cache_frames(
     import pandas as pd
 
     key, _, _, columns, natural_key = _CAREER_CACHE_COLUMNS[spec.name]
-    parts = [
+    parts = _align_ingested_at_units([
         frame for frame in (cached.get(key), fetched.get(key))
         if frame is not None
-    ]
+    ])
     native = (
         pd.concat(parts, ignore_index=True)
         if parts else pd.DataFrame(columns=columns)
@@ -2114,10 +2140,14 @@ def _merge_coach_cache_frames(
     import pandas as pd
 
     profiles = pd.concat(
-        [cached.get('profiles'), fetched.get('profiles')], ignore_index=True,
+        _align_ingested_at_units(
+            [cached.get('profiles'), fetched.get('profiles')]
+        ),
+        ignore_index=True,
     ).drop_duplicates('coach_id', keep='last')
     stints = pd.concat(
-        [cached.get('stints'), fetched.get('stints')], ignore_index=True,
+        _align_ingested_at_units([cached.get('stints'), fetched.get('stints')]),
+        ignore_index=True,
     ).drop_duplicates(
         ['club_id', 'coach_id', 'appointed_date', 'left_date'], keep='last',
     )
@@ -2135,7 +2165,8 @@ def _merge_coach_cache_frames(
             len(identities),
         )
         profiles = pd.concat(
-            [profiles, pd.DataFrame(identities)], ignore_index=True,
+            _align_ingested_at_units([profiles, pd.DataFrame(identities)]),
+            ignore_index=True,
         ).drop_duplicates('coach_id', keep='first')
     legacy = scraper.materialize_legacy_coaches(
         profiles, stints, league, scope['season_year'], scope['season_format'],
@@ -3809,6 +3840,7 @@ def _run_entity(
         logger.error(
             '%s scrape failed hard: %s: %s',
             spec.name, type(exc).__name__, safe_error,
+            exc_info=True,
         )
         results['errors'].append(safe_error)
         if (
