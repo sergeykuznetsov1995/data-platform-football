@@ -6198,3 +6198,4 @@ def test_fbref_proxy_hard_stops_an_oversized_browser_phase_transfer(mod):
     assert lease.total_bytes == lease.max_bytes == 12
     assert lease.budget_exceeded is True
     assert writer.closed is True
+
