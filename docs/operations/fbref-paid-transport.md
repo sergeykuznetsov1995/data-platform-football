@@ -39,22 +39,17 @@ control secret.
 
 FBref uses the checksum-pinned browser in `/opt/fbref-camoufox`. SofaScore uses
 its own reviewed browser in `/home/airflow/.cache/camoufox`; never replace that
-directory during an FBref deploy. The durable scheduler build is
-`docker/images/airflow/Dockerfile.scheduler-runtime` and `compose.yaml` points
-the scheduler at it.
+directory during an FBref deploy. The durable scheduler build is the
+`airflow-scheduler` target in `docker/images/airflow/Dockerfile`, and
+`compose.yaml` points the scheduler at that target.
 
-For a release, build from an explicitly tagged, already verified webserver
-base and label the result with the merge SHA:
+For a release, build the pinned unified target and label it with the merge SHA:
 
 ```bash
-BASE_IMAGE_ID=<sha256-of-verified-running-webserver-image>
-BASE_IMAGE=data-platform-airflow-webserver:verified-fbref-base
 MERGE_SHA=<full-merge-sha>
-docker tag "$BASE_IMAGE_ID" "$BASE_IMAGE"
-test "$(docker image inspect -f '{{.Id}}' "$BASE_IMAGE")" = "$BASE_IMAGE_ID"
 docker build --pull=false \
-  -f docker/images/airflow/Dockerfile.scheduler-runtime \
-  --build-arg AIRFLOW_RUNTIME_BASE="$BASE_IMAGE" \
+  -f docker/images/airflow/Dockerfile \
+  --target airflow-scheduler \
   --label org.opencontainers.image.revision="$MERGE_SHA" \
   -t "data-platform-airflow-scheduler:fbref-$MERGE_SHA" \
   docker/images/airflow
@@ -62,8 +57,7 @@ docker build --pull=false \
 
 The release override must set that exact scheduler image and use
 `build: !reset null`; deploy only the scheduler with
-`up -d --no-deps --no-build --pull never`. Do not rebuild the webserver from
-the legacy full Dockerfile. Before any live run, execute
+`up -d --no-deps --no-build --pull never`. Before any live run, execute
 `validate_camoufox_runtime()` inside the scheduler. It checks the browser,
 Camoufox, Playwright, and curl_cffi pins without opening a paid lease.
 

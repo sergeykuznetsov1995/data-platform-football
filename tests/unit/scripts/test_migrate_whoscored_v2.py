@@ -225,6 +225,41 @@ def test_object_contract_fails_closed_on_scope_manifest_drift():
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    "missing_column",
+    (
+        "raw_provenance_sha256",
+        "discovery_mode",
+        "as_of_date",
+        "parent_catalog_batch_id",
+        "parent_catalog_payload_sha256",
+        "parent_catalog_raw_provenance_sha256",
+    ),
+)
+def test_object_contract_rejects_stale_catalog_manifest_without_lineage(
+    missing_column,
+):
+    objects = set(migration.REQUIRED_BRONZE_OBJECTS) | set(
+        migration.REQUIRED_SILVER_OBJECTS
+    )
+    columns = {
+        table: set(required)
+        for table, required in {
+            **migration.BUSINESS_REQUIRED_COLUMNS,
+            **migration.MANIFEST_REQUIRED_COLUMNS,
+        }.items()
+    }
+    columns["whoscored_catalog_manifest"].remove(missing_column)
+
+    result = migration.inspect_object_contract(_TableTrino(objects, columns=columns))
+
+    assert result["passed"] is False
+    assert result["missing_commit_columns"] == {
+        "whoscored_catalog_manifest": [missing_column]
+    }
+
+
+@pytest.mark.unit
 def test_incomplete_existing_v2_manifest_fails_integrity_preflight():
     table = "whoscored_match_ingest_manifest"
     trino = _TableTrino(

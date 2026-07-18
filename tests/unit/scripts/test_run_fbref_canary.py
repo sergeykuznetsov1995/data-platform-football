@@ -566,3 +566,8 @@ def test_live_wrapper_enforces_separate_kernel_quotas() -> None:
     assert source.count("-m quota --quota") == 2
     assert "--request-limit \"$REQUEST_LIMIT\"" in source
     assert "--byte-limit-mb \"$BYTE_LIMIT_MB\"" in source
+    assert '"$REPO_ROOT/scripts/compose.sh"' in source
+    assert "docker compose" not in source
+    assert "--volume" not in source
+    assert 'docker cp "$PROXY_FILE"' in source
+    assert "COMPOSE_PID=$!" in source

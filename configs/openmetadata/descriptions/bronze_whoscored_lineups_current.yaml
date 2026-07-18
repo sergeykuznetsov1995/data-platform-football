@@ -1,7 +1,7 @@
 table:
   fullyQualifiedName: trino_iceberg.iceberg.bronze.whoscored_lineups_current
   description: |
-    Канонические составы WhoScored parser v7. Представление публикует строки
+    Канонические составы WhoScored parser v8. Представление публикует строки
     только для последнего успешного match manifest по game_id. Grain — один
     игрок одной команды в матче.
   tags:

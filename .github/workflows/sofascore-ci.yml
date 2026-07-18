@@ -7,6 +7,7 @@ on:
       - "configs/sofascore/**"
       - "dags/dag_ingest_sofascore.py"
       - "dags/dag_canary_sofascore_proxy.py"
+      - "dags/dag_sofascore_pipeline.py"
       - "dags/dag_transform_e3.py"
       - "dags/scripts/*sofascore*"
       - "dags/sql/**/*sofascore*"
@@ -56,6 +57,7 @@ jobs:
             scrapers/sofascore \
             dags/dag_ingest_sofascore.py \
             dags/dag_canary_sofascore_proxy.py \
+            dags/dag_sofascore_pipeline.py \
             dags/scripts/run_sofascore_scraper.py \
             dags/scripts/prepare_sofascore_workload.py \
             dags/scripts/run_sofascore_discovery.py \
@@ -67,6 +69,7 @@ jobs:
           python -m compileall -q \
             scrapers/sofascore dags/scripts dags/utils scripts/proxy_filter \
             dags/dag_ingest_sofascore.py dags/dag_canary_sofascore_proxy.py \
+            dags/dag_sofascore_pipeline.py \
             scripts/migrate_sofascore_production.py \
             scripts/research/bench_sofascore_paid_canary.py
 
@@ -79,11 +82,13 @@ jobs:
             tests/unit/configs/test_sofascore_proxy_canary_cohort.py \
             tests/unit/dags/test_dag_ingest_sofascore.py \
             tests/unit/dags/test_dag_canary_sofascore_proxy.py \
+            tests/unit/dags/test_dag_sofascore_pipeline.py \
             tests/unit/dags/test_dag_transform_e3_sofascore_dq.py \
             tests/unit/dq/test_sofascore_dq.py \
             tests/unit/scrapers/test_run_sofascore_discovery.py \
             tests/unit/scrapers/test_run_sofascore_scraper.py \
             tests/unit/scrapers/test_sofascore_camoufox_capture.py \
+            tests/unit/scrapers/test_sofascore_catalog.py \
             tests/unit/scrapers/test_sofascore_capture_adapters.py \
             tests/unit/scrapers/test_sofascore_capture_engine.py \
             tests/unit/scrapers/test_sofascore_discovery.py \

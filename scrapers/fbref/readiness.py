@@ -24,6 +24,7 @@ from scrapers.fbref.browser_runtime import (
     CAMOUFOX_BROWSER_VERSION,
     CAMOUFOX_PACKAGE_VERSION,
     CURL_CFFI_PACKAGE_VERSION,
+    FONTCONFIG_FILE,
     INSTALL_DIR,
     PLAYWRIGHT_PACKAGE_VERSION,
 )
@@ -88,6 +89,7 @@ def validate_camoufox_runtime(
     browser_version = str(document.get("version") or "")
     browser_release = str(document.get("release") or "")
     executable = root / "camoufox-bin"
+    fontconfig_file = root / FONTCONFIG_FILE.relative_to(INSTALL_DIR)
     if (
         str(package_version) != CAMOUFOX_PACKAGE_VERSION
         or str(playwright_version) != PLAYWRIGHT_PACKAGE_VERSION
@@ -96,6 +98,7 @@ def validate_camoufox_runtime(
         or browser_release != CAMOUFOX_BROWSER_RELEASE
         or not executable.is_file()
         or not os.access(executable, os.X_OK)
+        or not fontconfig_file.is_file()
     ):
         raise ReadinessError(
             "FBref Camoufox runtime differs from the reviewed production pin"
@@ -125,6 +128,7 @@ def validate_camoufox_runtime(
         "curl_cffi": str(curl_cffi_version),
         "executable_verified": True,
         "executable_probe_verified": True,
+        "fontconfig_verified": True,
     }
 
 

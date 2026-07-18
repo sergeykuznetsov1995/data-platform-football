@@ -39,6 +39,46 @@ except ImportError:
     logger.warning("trino package not installed. TrinoTableManager will not work.")
 
 
+def get_trino_connection(
+    host: str = None,
+    port: int = None,
+    catalog: str = 'iceberg',
+    session_properties: Optional[Dict[str, str]] = None,
+):
+    """Create the runtime-pinned Trino DBAPI connection used by WhoScored."""
+    if not TRINO_AVAILABLE:
+        raise RuntimeError("trino package not installed. Run: pip install trino")
+    resolved_host = host or os.environ.get('TRINO_HOST', 'trino')
+    user = os.environ.get('TRINO_USER', 'airflow')
+    password = os.environ.get('TRINO_PASSWORD')
+    effective_session_properties = {'enable_dynamic_filtering': 'false'}
+    if session_properties:
+        effective_session_properties.update(session_properties)
+
+    if password:
+        resolved_port = port or int(os.environ.get('TRINO_PORT', 8443))
+        return trino.dbapi.connect(
+            host=resolved_host,
+            port=resolved_port,
+            user=user,
+            catalog=catalog,
+            http_scheme='https',
+            auth=trino.auth.BasicAuthentication(user, password),
+            verify=False,
+            session_properties=effective_session_properties,
+        )
+
+    resolved_port = port or int(os.environ.get('TRINO_PORT', 8080))
+    logger.info("TRINO_PASSWORD not set, connecting via HTTP (no auth)")
+    return trino.dbapi.connect(
+        host=resolved_host,
+        port=resolved_port,
+        user=user,
+        catalog=catalog,
+        session_properties=effective_session_properties,
+    )
+
+
 class TrinoTableManager:
     """
     Manages Iceberg tables via Trino SQL.

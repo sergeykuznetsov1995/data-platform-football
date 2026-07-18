@@ -8,6 +8,7 @@ on:
       - "dags/**/*fbref*"
       - "dags/dag_iceberg_maintenance_daily.py"
       - "dags/utils/maintenance_tasks.py"
+      - "docker/images/airflow/Dockerfile"
       - "docker/images/airflow/requirements*.txt"
       - "docs/operations/sql/fbref_production_acceptance.sql"
       - "docs/operations/sql/fbref_control_dataset_acceptance.sql"

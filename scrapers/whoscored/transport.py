@@ -19,12 +19,19 @@ turns a proxy on.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
+import hmac
 import fcntl
 import json
 import logging
+import math
 import os
+import random
 import re
+import stat
+import sys
 import threading
 import time
 import uuid
@@ -52,13 +59,100 @@ from scrapers.base.flaresolverr_client import (
     FlareSolverrError,
     FlareSolverrErrorPage,
     FlareSolverrResponseTooLarge,
+    FlareSolverrRuntimeIdentityError,
     FlareSolverrTabCrashed,
     FlareSolverrTimeout,
     MAX_XHR_BATCH_URLS,
     is_chromium_error_page,
 )
+from scrapers.whoscored.proxy_campaign import (
+    PROXY_CAMPAIGN_AUTHORITY_CONTEXT_FIELDS,
+    PROXY_CAMPAIGN_CONTROL_ARGUMENT_FIELDS,
+    PROXY_CAMPAIGN_CONTROL_RESULT_FIELDS,
+    PROXY_CAMPAIGN_CONTROL_SCHEMA_VERSION,
+    ProxyCampaignApproval,
+    ProxyCampaignValidationError,
+    approval_from_campaign_authority_context,
+    assert_paid_runtime_available,
+    canonical_json_bytes,
+    proxy_campaign_authority_context,
+    strict_json_loads,
+)
+from scrapers.whoscored.runtime_contract import (
+    RuntimeContractError,
+    attested_runtime_file_sha256,
+    require_production_runtime_class,
+)
+from scrapers.whoscored.source_circuit import (
+    CircuitPermit,
+    SharedSourceCircuit,
+    SourceCircuitError,
+    SourceCircuitOpen,
+)
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_DIRECT_BROWSER_ATTEMPTS = 4
+DEFAULT_DIRECT_HTTP_RETRY_BACKOFF_SECONDS = 2.0
+DEFAULT_BROWSER_RETRY_BACKOFF_SECONDS = 2.0
+DEFAULT_BROWSER_RETRY_JITTER_SECONDS = 2.0
+MAX_BROWSER_RETRY_BACKOFF_SECONDS = 30.0
+SOURCE_CIRCUIT_PATH_ENV = "WHOSCORED_SOURCE_CIRCUIT_PATH"
+SOURCE_CIRCUIT_WAIT_ENV = "WHOSCORED_SOURCE_CIRCUIT_WAIT"
+SUPERVISOR_SESSION_OWNER_ENV = "WHOSCORED_SUPERVISOR_SESSION_OWNER"
+SUPERVISOR_RESOURCE_LEDGER_ENV = "WHOSCORED_SUPERVISOR_RESOURCE_LEDGER_PATH"
+PINNED_FLARESOLVERR_VERSION = "3.4.6"
+FLARESOLVERR_EXTENSION_RUNTIME_PATH = "scripts/flaresolverr_extended.py"
+CAPACITY_BROWSER_SESSION_OWNER_PATTERN = r"[a-z0-9]{16,32}"
+_CAPACITY_BROWSER_SESSION_OWNER_RE = re.compile(
+    rf"\A{CAPACITY_BROWSER_SESSION_OWNER_PATTERN}\Z",
+    re.ASCII,
+)
+
+
+def _attested_flaresolverr_identity() -> Optional[tuple[str, str]]:
+    """Resolve the browser runtime only from the completed production barrier."""
+
+    try:
+        extension_sha256 = attested_runtime_file_sha256(
+            FLARESOLVERR_EXTENSION_RUNTIME_PATH
+        )
+    except RuntimeContractError:
+        # Unit/development callers do not install the image-baked production
+        # barrier.  A production marker, however, is emitted only after that
+        # barrier succeeds, so losing its cached hash is a hard configuration
+        # failure and can never silently disable response attestation.
+        if getattr(sys, "_whoscored_runtime_class", None) == "production-v1":
+            raise RuntimeContractError(
+                "production WhoScored runtime has no attested FlareSolverr "
+                "extension identity"
+            ) from None
+        return None
+    return PINNED_FLARESOLVERR_VERSION, extension_sha256
+
+
+def assert_paid_alert_runtime_available(context: "TransportContext") -> None:
+    """Compatibility no-op: alert authority now lives only in the gateway.
+
+    Source runners deliberately receive neither receipt-state mounts nor alert
+    HMAC/bot secrets.  ``/v1/fetch`` independently checks gateway-owned state.
+    """
+
+    del context
+
+
+def capacity_browser_session_prefix(owner: str) -> str:
+    """Return the isolated capacity-session prefix for one validated owner."""
+
+    if (
+        type(owner) is not str
+        or _CAPACITY_BROWSER_SESSION_OWNER_RE.fullmatch(owner) is None
+    ):
+        raise ValueError(
+            "browser_session_owner must be an exact str of 16..32 "
+            "lowercase ASCII letters or digits"
+        )
+    return f"ws-cap-{owner}-"
 
 
 class TransportRoute(str, Enum):
@@ -68,6 +162,15 @@ class TransportRoute(str, Enum):
     PAID_HTTP = "paid_http"
     PAID_FLARESOLVERR = "paid_flaresolverr"
     PAID_LEASE = "paid_lease"
+
+
+_PAID_ROUTES = frozenset(
+    {
+        TransportRoute.PAID_HTTP,
+        TransportRoute.PAID_FLARESOLVERR,
+        TransportRoute.PAID_LEASE,
+    }
+)
 
 
 class FailureKind(str, Enum):
@@ -80,6 +183,23 @@ class FailureKind(str, Enum):
     PROXY = "proxy"
     CACHE = "cache"
     CONFIG = "config"
+
+
+class TransportPolicy(str, Enum):
+    """Explicit authority boundary for routes that can incur paid traffic."""
+
+    DIRECT_ONLY = "direct_only"
+    DIRECT_THEN_PAID = "direct_then_paid"
+
+    @classmethod
+    def parse(cls, value: object) -> "TransportPolicy":
+        if isinstance(value, cls):
+            return value
+        try:
+            return cls(str(value).strip())
+        except ValueError as exc:
+            choices = ", ".join(policy.value for policy in cls)
+            raise ValueError(f"transport_policy must be one of: {choices}") from exc
 
 
 class WhoScoredTransportError(RuntimeError):
@@ -111,6 +231,7 @@ class CloudflareChallenge(WhoScoredTransportError):
         url: str,
         route: TransportRoute,
         status_code: Optional[int] = None,
+        source_wide: bool = False,
     ) -> None:
         super().__init__(
             message,
@@ -120,6 +241,7 @@ class CloudflareChallenge(WhoScoredTransportError):
             status_code=status_code,
             retryable=True,
         )
+        self.source_wide = bool(source_wide)
 
 
 class TransportBudgetExceeded(WhoScoredTransportError):
@@ -135,6 +257,52 @@ class TransportBudgetExceeded(WhoScoredTransportError):
 
 DEFAULT_PAID_BYTES_PER_DAGRUN = 8_000_000
 DEFAULT_PAID_BYTES_PER_URL = 2_000_000
+PAID_GATEWAY_SCHEMA_VERSION = 1
+PAID_GATEWAY_TOKEN_ENV = "WHOSCORED_PAID_GATEWAY_TOKEN"
+MAX_PAID_GATEWAY_RESPONSE_BYTES = 4 * 1024 * 1024
+MAX_PAID_GATEWAY_RESPONSE_DOCUMENT_BYTES = (
+    (MAX_PAID_GATEWAY_RESPONSE_BYTES * 4 // 3) + 128 * 1024
+)
+MAX_PAID_GATEWAY_CONTROL_DOCUMENT_BYTES = 5 * 1024 * 1024
+PAID_GATEWAY_CLEANUP_GRACE_SECONDS = 15.0
+PAID_GATEWAY_CAMPAIGN_OPERATIONS = frozenset(
+    PROXY_CAMPAIGN_CONTROL_ARGUMENT_FIELDS
+)
+_PAID_GATEWAY_RESPONSE_FIELDS = frozenset(
+    {
+        "schema_version",
+        "url",
+        "status_code",
+        "headers",
+        "body_base64",
+        "body_sha256",
+        "route",
+        "receipt",
+    }
+)
+_PAID_GATEWAY_RECEIPT_FIELDS = frozenset(
+    {
+        "schema_version",
+        "campaign_id",
+        "approval_id",
+        "approval_sha256",
+        "allocation_id",
+        "attempt_id_hash",
+        "canonical_url_sha256",
+        "lease_id_hash",
+        "route",
+        "up_bytes",
+        "down_bytes",
+        "total_bytes",
+        "provider_billed_bytes",
+        "close_complete",
+        "cleanup_complete",
+    }
+)
+_PAID_GATEWAY_ERROR_FIELDS = frozenset({"schema_version", "error"})
+_PAID_GATEWAY_SETTLED_ERROR_FIELDS = _PAID_GATEWAY_ERROR_FIELDS | {"receipt"}
+_LOWER_SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z", re.ASCII)
+_PAID_GATEWAY_ERROR_CODE_RE = re.compile(r"\A[a-z][a-z0-9_]{0,63}\Z", re.ASCII)
 
 
 @dataclass(frozen=True)
@@ -148,15 +316,37 @@ class TransportContext:
     try_number: int = 0
     scope: str = ""
     entity: str = ""
+    transport_policy: str = TransportPolicy.DIRECT_ONLY.value
+    proxy_campaign: Mapping[str, object] = field(default_factory=dict, repr=False)
 
     @classmethod
     def from_env(cls) -> "TransportContext":
+        from scrapers.whoscored.proxy_campaign import (
+            load_proxy_campaign_context_from_env,
+        )
+
         def _integer(name: str, default: int) -> int:
             try:
                 return int(os.environ.get(name, default))
             except (TypeError, ValueError):
                 return default
 
+        campaign = load_proxy_campaign_context_from_env()
+        configured_policy = os.environ.get("WHOSCORED_TRANSPORT_POLICY", "").strip()
+        campaign_policy = str(campaign.get("transport_policy", "")).strip()
+        if campaign_policy:
+            if configured_policy and configured_policy != campaign_policy:
+                raise ValueError(
+                    "WHOSCORED_TRANSPORT_POLICY differs from the signed approval"
+                )
+            resolved_policy = campaign_policy
+        else:
+            resolved_policy = configured_policy or TransportPolicy.DIRECT_ONLY.value
+            if resolved_policy != TransportPolicy.DIRECT_ONLY.value:
+                raise ValueError(
+                    "direct_then_paid requires a complete signed proxy campaign"
+                )
+        TransportPolicy.parse(resolved_policy)
         return cls(
             dag_id=os.environ.get("AIRFLOW_CTX_DAG_ID", ""),
             run_id=os.environ.get("AIRFLOW_CTX_DAG_RUN_ID", ""),
@@ -165,6 +355,8 @@ class TransportContext:
             try_number=_integer("AIRFLOW_CTX_TRY_NUMBER", 0),
             scope=os.environ.get("WHOSCORED_SCOPE", ""),
             entity=os.environ.get("WHOSCORED_ENTITY", ""),
+            transport_policy=resolved_policy,
+            proxy_campaign=campaign,
         )
 
     def request_context(
@@ -178,6 +370,8 @@ class TransportContext:
             try_number=self.try_number,
             scope=self.scope if scope is None else scope,
             entity=self.entity if entity is None else entity,
+            transport_policy=self.transport_policy,
+            proxy_campaign=self.proxy_campaign,
         )
 
     @property
@@ -187,7 +381,7 @@ class TransportContext:
         return ""
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        result: dict[str, Any] = {
             "dag_id": self.dag_id,
             "run_id": self.run_id,
             "task_id": self.task_id,
@@ -195,7 +389,47 @@ class TransportContext:
             "try_number": self.try_number,
             "scope": self.scope,
             "entity": self.entity,
+            "transport_policy": self.transport_policy,
         }
+        result.update(dict(self.proxy_campaign))
+        return result
+
+
+@dataclass(frozen=True)
+class PaidCampaignContext:
+    """Allocation-free signed identity for alert and campaign-control RPCs."""
+
+    document: Mapping[str, object] = field(repr=False)
+
+    def __post_init__(self) -> None:
+        normalized = dict(self.document)
+        approval_from_campaign_authority_context(
+            normalized,
+            secret=None,
+            require_active=False,
+        )
+        object.__setattr__(self, "document", normalized)
+
+    @classmethod
+    def from_transport_context(
+        cls, context: TransportContext
+    ) -> "PaidCampaignContext":
+        full = context.as_dict()
+        return cls(
+            {
+                name: full[name]
+                for name in PROXY_CAMPAIGN_AUTHORITY_CONTEXT_FIELDS
+            }
+        )
+
+    @classmethod
+    def from_approval(
+        cls, approval: ProxyCampaignApproval
+    ) -> "PaidCampaignContext":
+        return cls(proxy_campaign_authority_context(approval))
+
+    def as_dict(self) -> dict[str, object]:
+        return dict(self.document)
 
 
 @runtime_checkable
@@ -223,10 +457,19 @@ class JsonlRequestLedger:
             + b"\n"
         )
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY
+        flags = (
+            os.O_APPEND
+            | os.O_CREAT
+            | os.O_WRONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
         with self._lock:
             descriptor = os.open(self.path, flags, 0o600)
             try:
+                metadata = os.fstat(descriptor)
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise OSError("request ledger is not a regular file")
                 os.fchmod(descriptor, 0o600)
                 fcntl.flock(descriptor, fcntl.LOCK_EX)
                 pending = memoryview(rendered)
@@ -249,6 +492,10 @@ class ProxyConcurrencyLimited(RuntimeError):
     """The single paid slot is in use by another task in the DagRun."""
 
 
+class ProxyCampaignControlRejected(RuntimeError):
+    """The filter rejected a bounded campaign-ledger control operation."""
+
+
 @dataclass(frozen=True)
 class CachedPayload:
     """Raw cache value.  ``content`` must be the source response, not parsed data."""
@@ -256,6 +503,7 @@ class CachedPayload:
     content: bytes
     status_code: int = 200
     headers: Mapping[str, str] = field(default_factory=dict)
+    observed_at: Optional[str] = None
 
 
 @runtime_checkable
@@ -281,6 +529,7 @@ class TransportResponse:
     request_bytes: int = 0
     response_bytes: int = 0
     resource_bytes: int = 0
+    observed_at: str = ""
 
     @property
     def text(self) -> str:
@@ -353,8 +602,8 @@ class TransportStats:
 @dataclass(frozen=True)
 class ProxyLease:
     lease_id: str
-    token: str
-    proxy_url: str
+    token: str = field(repr=False)
+    proxy_url: str = field(repr=False)
     max_bytes: int
     expires_at: float
 
@@ -371,11 +620,31 @@ class ProxyFilterClient:
         proxy_url: str,
         *,
         control_url: Optional[str] = None,
+        control_token: Optional[str] = None,
         timeout: float = 5.0,
         session: Optional[requests.Session] = None,
     ) -> None:
-        self.proxy_url = proxy_url.rstrip("/")
-        self.control_url = (control_url or proxy_url).rstrip("/")
+        # These endpoints cross a secret boundary: lease credentials are
+        # added by this client and must never arrive embedded in configuration.
+        # Normalize only credential-free HTTP(S) origins so downstream
+        # exceptions cannot echo a configured username/password.
+        self.proxy_url = _credential_free_proxy_origin(
+            proxy_url, label="filtering proxy URL"
+        )
+        self.control_url = _credential_free_proxy_origin(
+            control_url or proxy_url, label="filtering proxy control URL"
+        )
+        resolved_token = str(
+            control_token
+            if control_token is not None
+            else _proxy_control_token_from_environment()
+        ).strip()
+        if len(resolved_token) < 32:
+            raise ValueError(
+                "WHOSCORED_PROXY_CONTROL_TOKEN must contain at least 32 characters "
+                "when the paid WhoScored proxy is configured"
+            )
+        self._control_token = resolved_token
         self.timeout = timeout
         self.session = session or requests.Session()
         self.session.trust_env = False
@@ -398,6 +667,7 @@ class ProxyFilterClient:
         response = self.session.post(
             f"{self.control_url}/v1/leases",
             json=request,
+            headers={"X-Proxy-Control-Token": self._control_token},
             timeout=self.timeout,
         )
         if int(getattr(response, "status_code", 0) or 0) == 429:
@@ -426,7 +696,10 @@ class ProxyFilterClient:
     def stats(self, lease: ProxyLease) -> dict[str, Any]:
         response = self.session.get(
             f"{self.control_url}/v1/leases/{lease.lease_id}/stats",
-            headers={"Authorization": f"Bearer {lease.token}"},
+            headers={
+                "X-Proxy-Control-Token": self._control_token,
+                "Authorization": f"Bearer {lease.token}",
+            },
             timeout=self.timeout,
         )
         response.raise_for_status()
@@ -435,11 +708,133 @@ class ProxyFilterClient:
     def close(self, lease: ProxyLease) -> dict[str, Any]:
         response = self.session.delete(
             f"{self.control_url}/v1/leases/{lease.lease_id}",
-            headers={"Authorization": f"Bearer {lease.token}"},
+            headers={
+                "X-Proxy-Control-Token": self._control_token,
+                "Authorization": f"Bearer {lease.token}",
+            },
             timeout=self.timeout,
         )
         response.raise_for_status()
         return dict(response.json())
+
+    def campaign_control(
+        self,
+        operation: str,
+        *,
+        context: Any,
+        arguments: Mapping[str, object],
+    ) -> Mapping[str, object]:
+        """Execute one exact WhoScored ledger operation through the filter."""
+
+        expected_arguments = PROXY_CAMPAIGN_CONTROL_ARGUMENT_FIELDS.get(operation)
+        if expected_arguments is None or frozenset(arguments) != expected_arguments:
+            raise ValueError("campaign control operation or arguments are invalid")
+        context_document = context.as_dict()
+        approval_from_campaign_authority_context(
+            context_document,
+            secret=None,
+            require_active=False,
+        )
+        request = {
+            "schema_version": PROXY_CAMPAIGN_CONTROL_SCHEMA_VERSION,
+            "operation": operation,
+            "context": context_document,
+            "arguments": dict(arguments),
+        }
+        response: object
+        try:
+            response = self.session.post(
+                f"{self.control_url}/v1/whoscored/campaign-control",
+                data=canonical_json_bytes(request),
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Proxy-Control-Token": self._control_token,
+                },
+                timeout=self.timeout,
+                stream=True,
+            )
+        except Exception as exc:
+            raise ProxyCampaignControlRejected(
+                f"campaign control request failed: {type(exc).__name__}"
+            ) from None
+        try:
+            chunks: list[bytes] = []
+            size = 0
+            for raw in response.iter_content(chunk_size=64 * 1024):
+                chunk = bytes(raw or b"")
+                size += len(chunk)
+                if size > MAX_PAID_GATEWAY_CONTROL_DOCUMENT_BYTES:
+                    raise ProxyCampaignControlRejected(
+                        "campaign control response is oversized"
+                    )
+                chunks.append(chunk)
+            body = b"".join(chunks)
+            try:
+                decoded = strict_json_loads(body.decode("utf-8"))
+            except (
+                UnicodeDecodeError,
+                json.JSONDecodeError,
+                ProxyCampaignValidationError,
+            ):
+                raise ProxyCampaignControlRejected(
+                    "campaign control response is not strict JSON"
+                ) from None
+            status = int(getattr(response, "status_code", 0) or 0)
+            if status != 200:
+                raise ProxyCampaignControlRejected("campaign control was rejected")
+            if (
+                not isinstance(decoded, Mapping)
+                or frozenset(decoded) != {
+                    "schema_version",
+                    "operation",
+                    "result",
+                }
+                or decoded.get("schema_version")
+                != PROXY_CAMPAIGN_CONTROL_SCHEMA_VERSION
+                or decoded.get("operation") != operation
+                or canonical_json_bytes(dict(decoded)) != body
+            ):
+                raise ProxyCampaignControlRejected(
+                    "campaign control response envelope is invalid"
+                )
+            result = decoded.get("result")
+            if (
+                not isinstance(result, Mapping)
+                or frozenset(result)
+                != PROXY_CAMPAIGN_CONTROL_RESULT_FIELDS[operation]
+            ):
+                raise ProxyCampaignControlRejected(
+                    "campaign control result fields are invalid"
+                )
+            if operation == "assert_exact_accounting":
+                billed = result.get("provider_billed_bytes")
+                if isinstance(billed, bool) or not isinstance(billed, int) or billed < 0:
+                    raise ProxyCampaignControlRejected(
+                        "campaign control accounting result is invalid"
+                    )
+            elif not isinstance(
+                result.get(
+                    "allocation" if operation == "complete_allocation" else "campaign"
+                ),
+                Mapping,
+            ):
+                raise ProxyCampaignControlRejected(
+                    "campaign control snapshot result is invalid"
+                )
+            return dict(result)
+        except ProxyCampaignControlRejected:
+            raise
+        except Exception as exc:
+            raise ProxyCampaignControlRejected(
+                f"campaign control response failed: {type(exc).__name__}"
+            ) from None
+        finally:
+            close_response = getattr(response, "close", None)
+            if callable(close_response):
+                try:
+                    close_response()
+                except Exception:
+                    pass
 
     def close_session(self) -> None:
         """Release the control-plane HTTP connection pool."""
@@ -447,17 +842,787 @@ class ProxyFilterClient:
         self.session.close()
 
 
+class PaidGatewayError(RuntimeError):
+    """A paid application-gateway request failed without exposing secrets."""
+
+
+class PaidGatewayRejected(PaidGatewayError):
+    """The gateway rejected signed authority or a bounded spend request."""
+
+    def __init__(
+        self,
+        code: str,
+        *,
+        receipt: Optional["PaidGatewayReceipt"] = None,
+    ) -> None:
+        super().__init__(f"paid gateway rejected fetch: {code}")
+        self.code = code
+        self.receipt = receipt
+
+
+class PaidGatewayProtocolError(PaidGatewayError):
+    """The gateway returned a malformed or incomplete cleanup receipt."""
+
+
+@dataclass(frozen=True)
+class PaidGatewayReceipt:
+    """Credential-free accounting returned only after gateway cleanup."""
+
+    campaign_id: str
+    approval_id: str
+    approval_sha256: str
+    allocation_id: str
+    attempt_id_hash: str
+    canonical_url_sha256: str
+    lease_id_hash: str
+    route: TransportRoute
+    up_bytes: int
+    down_bytes: int
+    total_bytes: int
+    provider_billed_bytes: int
+    close_complete: bool
+    cleanup_complete: bool
+
+    @classmethod
+    def from_dict(
+        cls,
+        value: object,
+        *,
+        context: TransportContext,
+        url: str,
+        max_provider_bytes: Optional[int] = None,
+    ) -> "PaidGatewayReceipt":
+        if not isinstance(value, Mapping) or frozenset(value) != (
+            _PAID_GATEWAY_RECEIPT_FIELDS
+        ):
+            raise PaidGatewayProtocolError("paid gateway receipt fields are invalid")
+        if value.get("schema_version") != PAID_GATEWAY_SCHEMA_VERSION:
+            raise PaidGatewayProtocolError("paid gateway receipt schema is invalid")
+
+        def digest(field: str) -> str:
+            item = value.get(field)
+            if type(item) is not str or _LOWER_SHA256_RE.fullmatch(item) is None:
+                raise PaidGatewayProtocolError(
+                    f"paid gateway receipt {field} is invalid"
+                )
+            return item
+
+        def counter(field: str) -> int:
+            item = value.get(field)
+            if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+                raise PaidGatewayProtocolError(
+                    f"paid gateway receipt {field} is invalid"
+                )
+            return item
+
+        campaign = context.proxy_campaign
+        expected_campaign_id = campaign.get("proxy_campaign_id")
+        expected_approval_id = campaign.get("proxy_approval_id")
+        expected_approval_sha256 = campaign.get("proxy_approval_sha256")
+        expected_allocation_id = campaign.get("proxy_allocation_id")
+        route_value = value.get("route")
+        try:
+            route = TransportRoute(str(route_value))
+        except ValueError as exc:
+            raise PaidGatewayProtocolError(
+                "paid gateway receipt route is invalid"
+            ) from exc
+        if route not in {
+            TransportRoute.PAID_HTTP,
+            TransportRoute.PAID_FLARESOLVERR,
+        }:
+            raise PaidGatewayProtocolError("paid gateway receipt route is not paid")
+
+        up = counter("up_bytes")
+        down = counter("down_bytes")
+        total = counter("total_bytes")
+        provider_billed = counter("provider_billed_bytes")
+        if total != up + down or provider_billed != total:
+            raise PaidGatewayProtocolError(
+                "paid gateway receipt byte accounting is inconsistent"
+            )
+        if (
+            max_provider_bytes is not None
+            and (
+                isinstance(max_provider_bytes, bool)
+                or not isinstance(max_provider_bytes, int)
+                or max_provider_bytes <= 0
+                or total > max_provider_bytes
+            )
+        ):
+            raise PaidGatewayProtocolError(
+                "paid gateway receipt exceeds the requested provider-byte cap"
+            )
+        if (
+            value.get("close_complete") is not True
+            or value.get("cleanup_complete") is not True
+        ):
+            raise PaidGatewayProtocolError(
+                "paid gateway did not complete lease and browser cleanup"
+            )
+        canonical_url_sha256 = digest("canonical_url_sha256")
+        if canonical_url_sha256 != hashlib.sha256(
+            _canonical_url_key(url).encode("utf-8")
+        ).hexdigest():
+            raise PaidGatewayProtocolError(
+                "paid gateway receipt belongs to another URL"
+            )
+        attempt_id = campaign.get("proxy_attempt_id")
+        attempt_id_hash = digest("attempt_id_hash")
+        if type(attempt_id) is not str or attempt_id_hash != hashlib.sha256(
+            attempt_id.encode("utf-8")
+        ).hexdigest():
+            raise PaidGatewayProtocolError(
+                "paid gateway receipt belongs to another task attempt"
+            )
+        if (
+            value.get("campaign_id") != expected_campaign_id
+            or value.get("approval_id") != expected_approval_id
+            or digest("approval_sha256") != expected_approval_sha256
+            or value.get("allocation_id") != expected_allocation_id
+        ):
+            raise PaidGatewayProtocolError(
+                "paid gateway receipt belongs to another signed campaign"
+            )
+        return cls(
+            campaign_id=str(expected_campaign_id),
+            approval_id=str(expected_approval_id),
+            approval_sha256=str(expected_approval_sha256),
+            allocation_id=str(expected_allocation_id),
+            attempt_id_hash=attempt_id_hash,
+            canonical_url_sha256=canonical_url_sha256,
+            lease_id_hash=digest("lease_id_hash"),
+            route=route,
+            up_bytes=up,
+            down_bytes=down,
+            total_bytes=total,
+            provider_billed_bytes=provider_billed,
+            close_complete=True,
+            cleanup_complete=True,
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": PAID_GATEWAY_SCHEMA_VERSION,
+            "campaign_id": self.campaign_id,
+            "approval_id": self.approval_id,
+            "approval_sha256": self.approval_sha256,
+            "allocation_id": self.allocation_id,
+            "attempt_id_hash": self.attempt_id_hash,
+            "canonical_url_sha256": self.canonical_url_sha256,
+            "lease_id_hash": self.lease_id_hash,
+            "route": self.route.value,
+            "up_bytes": self.up_bytes,
+            "down_bytes": self.down_bytes,
+            "total_bytes": self.total_bytes,
+            "provider_billed_bytes": self.provider_billed_bytes,
+            "close_complete": self.close_complete,
+            "cleanup_complete": self.cleanup_complete,
+        }
+
+
+@dataclass(frozen=True)
+class PaidGatewayResponse:
+    """One high-level paid fetch result; contains no reusable capability."""
+
+    url: str
+    content: bytes
+    status_code: int
+    headers: Mapping[str, str]
+    route: TransportRoute
+    receipt: PaidGatewayReceipt
+
+
+class PaidGatewayClient:
+    """Runner-side client exposing exactly one bounded ``fetch`` operation.
+
+    The request has no proxy URL, lease token, browser session identifier,
+    method, arbitrary headers, cookies or JavaScript.  Those capabilities live
+    only inside the isolated application gateway.
+    """
+
+    def __init__(
+        self,
+        gateway_url: str,
+        *,
+        token: Optional[str] = None,
+        timeout: float = 75.0,
+        session: Optional[requests.Session] = None,
+    ) -> None:
+        self.gateway_url = _credential_free_proxy_origin(
+            gateway_url, label="paid gateway URL"
+        )
+        resolved_token = str(
+            token if token is not None else os.environ.get(PAID_GATEWAY_TOKEN_ENV, "")
+        ).strip()
+        if len(resolved_token) < 32:
+            raise ValueError(
+                f"{PAID_GATEWAY_TOKEN_ENV} must contain at least 32 characters"
+            )
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not math.isfinite(float(timeout))
+            or timeout <= 0
+        ):
+            raise ValueError("paid gateway timeout must be finite and positive")
+        self._token = resolved_token
+        self.timeout = float(timeout)
+        self.session = session or requests.Session()
+        self.session.trust_env = False
+
+    @staticmethod
+    def _bounded_response_body(response: object, limit: int) -> bytes:
+        iterator = getattr(response, "iter_content", None)
+        if callable(iterator):
+            chunks: list[bytes] = []
+            size = 0
+            for raw_chunk in iterator(chunk_size=64 * 1024):
+                chunk = bytes(raw_chunk or b"")
+                size += len(chunk)
+                if size > limit:
+                    raise PaidGatewayProtocolError(
+                        "paid gateway response document is oversized"
+                    )
+                chunks.append(chunk)
+            return b"".join(chunks)
+        body = bytes(getattr(response, "content", b"") or b"")
+        if len(body) > limit:
+            raise PaidGatewayProtocolError(
+                "paid gateway response document is oversized"
+            )
+        return body
+
+    def _request_timeout(self, timeout_ms: int) -> float:
+        required = timeout_ms / 1000.0 + PAID_GATEWAY_CLEANUP_GRACE_SECONDS
+        if self.timeout < required:
+            raise ValueError(
+                "paid gateway client timeout is shorter than operation deadline "
+                "plus cleanup grace"
+            )
+        return required
+
+    @staticmethod
+    def _campaign_context_document(
+        context: PaidCampaignContext | TransportContext,
+    ) -> dict[str, object]:
+        if isinstance(context, TransportContext):
+            return PaidCampaignContext.from_transport_context(context).as_dict()
+        if isinstance(context, PaidCampaignContext):
+            return context.as_dict()
+        raise TypeError("campaign context must be a PaidCampaignContext")
+
+    def _post_gateway_control(
+        self,
+        *,
+        path: str,
+        document: Mapping[str, object],
+        limit: int,
+    ) -> Mapping[str, object]:
+        response: object
+        try:
+            response = self.session.post(
+                f"{self.gateway_url}{path}",
+                data=canonical_json_bytes(dict(document)),
+                headers={
+                    "Authorization": f"Bearer {self._token}",
+                    "Content-Type": "application/json",
+                },
+                timeout=self._request_timeout(60_000),
+                stream=True,
+            )
+        except Exception as exc:
+            raise PaidGatewayError(
+                f"paid gateway control request failed: {type(exc).__name__}"
+            ) from None
+        try:
+            body = self._bounded_response_body(response, limit)
+            try:
+                decoded = strict_json_loads(body.decode("utf-8"))
+            except (
+                UnicodeDecodeError,
+                json.JSONDecodeError,
+                ProxyCampaignValidationError,
+            ):
+                raise PaidGatewayProtocolError(
+                    "paid gateway control response is not strict JSON"
+                ) from None
+            if not isinstance(decoded, Mapping):
+                raise PaidGatewayProtocolError(
+                    "paid gateway control response is not an object"
+                )
+            if canonical_json_bytes(dict(decoded)) != body:
+                raise PaidGatewayProtocolError(
+                    "paid gateway control response is not canonical JSON"
+                )
+            status = int(getattr(response, "status_code", 0) or 0)
+            if status != 200:
+                error = decoded.get("error")
+                code = error.get("code") if isinstance(error, Mapping) else None
+                if (
+                    frozenset(decoded) != _PAID_GATEWAY_ERROR_FIELDS
+                    or decoded.get("schema_version") != PAID_GATEWAY_SCHEMA_VERSION
+                    or not isinstance(error, Mapping)
+                    or frozenset(error) != {"code"}
+                    or type(code) is not str
+                    or _PAID_GATEWAY_ERROR_CODE_RE.fullmatch(code) is None
+                ):
+                    raise PaidGatewayProtocolError(
+                        "paid gateway control rejection is invalid"
+                    )
+                raise PaidGatewayRejected(code)
+            return dict(decoded)
+        except (PaidGatewayRejected, PaidGatewayProtocolError):
+            raise
+        except Exception as exc:
+            raise PaidGatewayError(
+                f"paid gateway control response failed: {type(exc).__name__}"
+            ) from None
+        finally:
+            close_response = getattr(response, "close", None)
+            if callable(close_response):
+                try:
+                    close_response()
+                except Exception:
+                    pass
+
+    def fetch(
+        self,
+        url: str,
+        *,
+        context: TransportContext,
+        max_response_bytes: int,
+        max_provider_bytes: int,
+        timeout_ms: int,
+        browser_bootstrap_url: Optional[str] = None,
+    ) -> PaidGatewayResponse:
+        for name, value, ceiling in (
+            ("max_response_bytes", max_response_bytes, MAX_PAID_GATEWAY_RESPONSE_BYTES),
+            ("max_provider_bytes", max_provider_bytes, 2_000_000),
+            ("timeout_ms", timeout_ms, 60_000),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or not 1 <= value <= ceiling
+            ):
+                raise ValueError(f"{name} must be in 1..{ceiling}")
+        request_document = {
+            "schema_version": PAID_GATEWAY_SCHEMA_VERSION,
+            "url": url,
+            "browser_bootstrap_url": browser_bootstrap_url,
+            "max_response_bytes": max_response_bytes,
+            "max_provider_bytes": max_provider_bytes,
+            "timeout_ms": timeout_ms,
+            "context": context.as_dict(),
+        }
+        try:
+            response = self.session.post(
+                f"{self.gateway_url}/v1/fetch",
+                json=request_document,
+                headers={"Authorization": f"Bearer {self._token}"},
+                timeout=self._request_timeout(timeout_ms),
+                stream=True,
+            )
+        except Exception as exc:
+            raise PaidGatewayError(
+                f"paid gateway request failed: {type(exc).__name__}"
+            ) from None
+        try:
+            return self._decode_fetch_response(
+                response,
+                url=url,
+                context=context,
+                max_response_bytes=max_response_bytes,
+                max_provider_bytes=max_provider_bytes,
+            )
+        except (PaidGatewayRejected, PaidGatewayProtocolError):
+            raise
+        except Exception as exc:
+            raise PaidGatewayError(
+                f"paid gateway response failed: {type(exc).__name__}"
+            ) from None
+        finally:
+            close_response = getattr(response, "close", None)
+            if callable(close_response):
+                try:
+                    close_response()
+                except Exception:
+                    pass
+
+    @classmethod
+    def _decode_fetch_response(
+        cls,
+        response: object,
+        *,
+        url: str,
+        context: TransportContext,
+        max_response_bytes: int,
+        max_provider_bytes: int,
+    ) -> PaidGatewayResponse:
+        status = int(getattr(response, "status_code", 0) or 0)
+        document_limit = max(
+            64 * 1024,
+            min(
+                MAX_PAID_GATEWAY_RESPONSE_DOCUMENT_BYTES,
+                (max_response_bytes * 4 // 3) + 128 * 1024,
+            ),
+        )
+        body = cls._bounded_response_body(response, document_limit)
+        try:
+            decoded = strict_json_loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError, ProxyCampaignValidationError):
+            raise PaidGatewayProtocolError(
+                "paid gateway response is not strict JSON"
+            ) from None
+        if status != 200:
+            if not isinstance(decoded, Mapping) or frozenset(decoded) not in {
+                _PAID_GATEWAY_ERROR_FIELDS,
+                _PAID_GATEWAY_SETTLED_ERROR_FIELDS,
+            } or decoded.get("schema_version") != PAID_GATEWAY_SCHEMA_VERSION:
+                raise PaidGatewayProtocolError(
+                    "paid gateway error response fields are invalid"
+                )
+            error = decoded.get("error")
+            code = error.get("code") if isinstance(error, Mapping) else None
+            if (
+                not isinstance(error, Mapping)
+                or frozenset(error) != {"code"}
+                or type(code) is not str
+                or _PAID_GATEWAY_ERROR_CODE_RE.fullmatch(code) is None
+            ):
+                raise PaidGatewayProtocolError(
+                    "paid gateway error response is invalid"
+                )
+            receipt = (
+                PaidGatewayReceipt.from_dict(
+                    decoded.get("receipt"),
+                    context=context,
+                    url=url,
+                    max_provider_bytes=max_provider_bytes,
+                )
+                if "receipt" in decoded
+                else None
+            )
+            raise PaidGatewayRejected(code, receipt=receipt)
+        if not isinstance(decoded, Mapping) or frozenset(decoded) != (
+            _PAID_GATEWAY_RESPONSE_FIELDS
+        ):
+            raise PaidGatewayProtocolError("paid gateway response fields are invalid")
+        if decoded.get("schema_version") != PAID_GATEWAY_SCHEMA_VERSION:
+            raise PaidGatewayProtocolError("paid gateway response schema is invalid")
+        if decoded.get("url") != url:
+            raise PaidGatewayProtocolError("paid gateway returned another URL")
+        status_code = decoded.get("status_code")
+        if (
+            isinstance(status_code, bool)
+            or not isinstance(status_code, int)
+            or not 100 <= status_code <= 599
+        ):
+            raise PaidGatewayProtocolError(
+                "paid gateway source status is invalid"
+            )
+        encoded = decoded.get("body_base64")
+        if type(encoded) is not str:
+            raise PaidGatewayProtocolError("paid gateway body is missing")
+        try:
+            content = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError):
+            raise PaidGatewayProtocolError(
+                "paid gateway body is not valid base64"
+            ) from None
+        if len(content) > max_response_bytes:
+            raise PaidGatewayProtocolError("paid gateway source body is oversized")
+        body_sha256 = decoded.get("body_sha256")
+        if (
+            type(body_sha256) is not str
+            or _LOWER_SHA256_RE.fullmatch(body_sha256) is None
+            or not hmac.compare_digest(
+                body_sha256, hashlib.sha256(content).hexdigest()
+            )
+        ):
+            raise PaidGatewayProtocolError("paid gateway body digest is invalid")
+        raw_headers = decoded.get("headers")
+        if not isinstance(raw_headers, Mapping) or len(raw_headers) > 32:
+            raise PaidGatewayProtocolError("paid gateway headers are invalid")
+        headers: dict[str, str] = {}
+        for key, value in raw_headers.items():
+            if (
+                type(key) is not str
+                or type(value) is not str
+                or not key
+                or len(key) > 128
+                or len(value) > 4096
+                or "\r" in key
+                or "\n" in key
+                or "\r" in value
+                or "\n" in value
+            ):
+                raise PaidGatewayProtocolError("paid gateway headers are invalid")
+            headers[key] = value
+        receipt = PaidGatewayReceipt.from_dict(
+            decoded.get("receipt"),
+            context=context,
+            url=url,
+            max_provider_bytes=max_provider_bytes,
+        )
+        route_value = decoded.get("route")
+        if route_value != receipt.route.value:
+            raise PaidGatewayProtocolError(
+                "paid gateway response and receipt routes differ"
+            )
+        return PaidGatewayResponse(
+            url=url,
+            content=content,
+            status_code=status_code,
+            headers=headers,
+            route=receipt.route,
+            receipt=receipt,
+        )
+
+    def preflight_alert(
+        self, *, context: PaidCampaignContext | TransportContext
+    ) -> Mapping[str, str]:
+        """Ask the gateway to deliver/deduplicate its own paid-alert proof."""
+
+        campaign = self._campaign_context_document(context)
+        document = {
+            "schema_version": PAID_GATEWAY_SCHEMA_VERSION,
+            "context": campaign,
+        }
+        decoded = self._post_gateway_control(
+            path="/v1/preflight-alert",
+            document=document,
+            limit=64 * 1024,
+        )
+        expected = {
+            "schema_version",
+            "status",
+            "campaign_id",
+            "approval_id",
+            "approval_sha256",
+        }
+        if (
+            frozenset(decoded) != expected
+            or decoded.get("schema_version") != PAID_GATEWAY_SCHEMA_VERSION
+            or decoded.get("status") != "delivered"
+            or decoded.get("campaign_id") != campaign.get("proxy_campaign_id")
+            or decoded.get("approval_id") != campaign.get("proxy_approval_id")
+            or decoded.get("approval_sha256")
+            != campaign.get("proxy_approval_sha256")
+        ):
+            raise PaidGatewayProtocolError(
+                "paid gateway alert response is invalid"
+            )
+        return {key: str(decoded[key]) for key in expected if key != "schema_version"}
+
+    def _campaign_control(
+        self,
+        operation: str,
+        *,
+        context: PaidCampaignContext | TransportContext,
+        arguments: Mapping[str, object],
+    ) -> Mapping[str, object]:
+        expected_arguments = PROXY_CAMPAIGN_CONTROL_ARGUMENT_FIELDS.get(operation)
+        if expected_arguments is None or frozenset(arguments) != expected_arguments:
+            raise ValueError("campaign control operation or arguments are invalid")
+        document = {
+            "schema_version": PROXY_CAMPAIGN_CONTROL_SCHEMA_VERSION,
+            "operation": operation,
+            "context": self._campaign_context_document(context),
+            "arguments": dict(arguments),
+        }
+        decoded = self._post_gateway_control(
+            path="/v1/campaign-control",
+            document=document,
+            limit=MAX_PAID_GATEWAY_CONTROL_DOCUMENT_BYTES,
+        )
+        if (
+            frozenset(decoded) != {"schema_version", "operation", "result"}
+            or decoded.get("schema_version")
+            != PROXY_CAMPAIGN_CONTROL_SCHEMA_VERSION
+            or decoded.get("operation") != operation
+        ):
+            raise PaidGatewayProtocolError(
+                "paid gateway campaign control envelope is invalid"
+            )
+        result = decoded.get("result")
+        if (
+            not isinstance(result, Mapping)
+            or frozenset(result) != PROXY_CAMPAIGN_CONTROL_RESULT_FIELDS[operation]
+        ):
+            raise PaidGatewayProtocolError(
+                "paid gateway campaign control result is invalid"
+            )
+        return dict(result)
+
+    def snapshot(
+        self, *, context: PaidCampaignContext | TransportContext
+    ) -> Mapping[str, object]:
+        result = self._campaign_control("snapshot", context=context, arguments={})
+        campaign = result.get("campaign")
+        if not isinstance(campaign, Mapping):
+            raise PaidGatewayProtocolError("campaign snapshot is invalid")
+        return dict(campaign)
+
+    def complete_allocation(
+        self,
+        *,
+        context: PaidCampaignContext | TransportContext,
+        allocation_id: str,
+        dag_id: str,
+        run_id: str,
+        task_id: str,
+        attempt_id: str,
+        report_sha256: str,
+        request_ledger_sha256: str,
+    ) -> Mapping[str, object]:
+        result = self._campaign_control(
+            "complete_allocation",
+            context=context,
+            arguments={
+                "allocation_id": allocation_id,
+                "dag_id": dag_id,
+                "run_id": run_id,
+                "task_id": task_id,
+                "attempt_id": attempt_id,
+                "report_sha256": report_sha256,
+                "request_ledger_sha256": request_ledger_sha256,
+            },
+        )
+        allocation = result.get("allocation")
+        if not isinstance(allocation, Mapping):
+            raise PaidGatewayProtocolError("campaign allocation result is invalid")
+        return dict(allocation)
+
+    def assert_exact_accounting(
+        self,
+        *,
+        context: PaidCampaignContext | TransportContext,
+        task_report_provider_bytes: int,
+        request_ledger_provider_bytes: int,
+        proxy_ledger_provider_bytes: int,
+        require_complete: bool = False,
+    ) -> int:
+        result = self._campaign_control(
+            "assert_exact_accounting",
+            context=context,
+            arguments={
+                "task_report_provider_bytes": task_report_provider_bytes,
+                "request_ledger_provider_bytes": request_ledger_provider_bytes,
+                "proxy_ledger_provider_bytes": proxy_ledger_provider_bytes,
+                "require_complete": require_complete,
+            },
+        )
+        billed = result.get("provider_billed_bytes")
+        if isinstance(billed, bool) or not isinstance(billed, int) or billed < 0:
+            raise PaidGatewayProtocolError("campaign accounting result is invalid")
+        return billed
+
+    def seal_for_reconciliation(
+        self,
+        *,
+        context: PaidCampaignContext | TransportContext,
+        dag_id: str,
+        run_id: str,
+        provider_billed_bytes: int,
+        attempt_accounting_sha256: str,
+    ) -> Mapping[str, object]:
+        result = self._campaign_control(
+            "seal_for_reconciliation",
+            context=context,
+            arguments={
+                "dag_id": dag_id,
+                "run_id": run_id,
+                "provider_billed_bytes": provider_billed_bytes,
+                "attempt_accounting_sha256": attempt_accounting_sha256,
+            },
+        )
+        campaign = result.get("campaign")
+        if not isinstance(campaign, Mapping):
+            raise PaidGatewayProtocolError("campaign seal result is invalid")
+        return dict(campaign)
+
+    def sealed_snapshot(
+        self, *, context: PaidCampaignContext | TransportContext
+    ) -> Mapping[str, object]:
+        result = self._campaign_control(
+            "sealed_snapshot", context=context, arguments={}
+        )
+        campaign = result.get("campaign")
+        if not isinstance(campaign, Mapping):
+            raise PaidGatewayProtocolError("sealed campaign snapshot is invalid")
+        return dict(campaign)
+
+    def close(self) -> None:
+        self.session.close()
+
+
+def _proxy_control_token_from_environment() -> str:
+    """Resolve only the dedicated WhoScored lease/HMAC runtime secret."""
+
+    return str(os.environ.get("WHOSCORED_PROXY_CONTROL_TOKEN", "")).strip()
+
+
+def _credential_free_proxy_origin(value: object, *, label: str) -> str:
+    """Return one safe HTTP(S) proxy origin without ever reflecting its input."""
+
+    error = f"invalid {label}"
+    if type(value) is not str or not value or value != value.strip():
+        raise ValueError(error)
+    try:
+        parts = urlsplit(value)
+        hostname = parts.hostname
+        port = parts.port
+        username = parts.username
+        password = parts.password
+    except (TypeError, ValueError):
+        raise ValueError(error) from None
+    if (
+        parts.scheme.lower() not in {"http", "https"}
+        or not hostname
+        or username is not None
+        or password is not None
+        or "@" in parts.netloc
+        or "%" in parts.netloc
+        or parts.path not in {"", "/"}
+        or bool(parts.query)
+        or bool(parts.fragment)
+        or port is not None
+        and not 1 <= port <= 65535
+    ):
+        raise ValueError(error)
+    host = hostname
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    if port is not None:
+        host = f"{host}:{port}"
+    return urlunsplit((parts.scheme.lower(), host, "", "", ""))
+
+
 def _proxy_url_with_lease(proxy_url: str, token: str) -> str:
-    parts = urlsplit(proxy_url)
-    if not parts.scheme or not parts.hostname:
-        raise ValueError(f"invalid filtering proxy URL: {proxy_url!r}")
+    origin = _credential_free_proxy_origin(
+        proxy_url, label="filtering proxy lease URL"
+    )
+    parts = urlsplit(origin)
     host = parts.hostname
+    assert host is not None
     if ":" in host and not host.startswith("["):
         host = f"[{host}]"
     if parts.port:
         host = f"{host}:{parts.port}"
     netloc = f"lease:{quote(token, safe='')}@{host}"
     return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+
+
+def _safe_route_exception_text(
+    exc: BaseException, *, route: TransportRoute
+) -> str:
+    """Keep credentials out of every paid-route error string."""
+
+    if route in _PAID_ROUTES:
+        return type(exc).__name__
+    return str(exc)
 
 
 _CF_STRONG_BODY_MARKERS = (
@@ -477,7 +1642,6 @@ _CF_ORIGIN_ERROR_TITLE = re.compile(
 _WHOSCORED_STRUCTURED_FEED_PATHS = (
     re.compile(r"\A/statisticsfeed/1/get(?:team|player)statistics\Z"),
     re.compile(r"\A/stagestatfeed/[1-9][0-9]*/stageteams/\Z"),
-    re.compile(r"\A/stageplayerstatfeed/[1-9][0-9]*/playerstats/\Z"),
 )
 _WHOSCORED_STAGE_BOOTSTRAP_PATH = re.compile(
     r"\A/Regions/[1-9][0-9]*/Tournaments/[1-9][0-9]*/"
@@ -669,51 +1833,209 @@ class WhoScoredTransport:
         flaresolverr_url: str = "http://flaresolverr:8191",
         paid_proxy_url: Optional[str] = None,
         proxy_control_url: Optional[str] = None,
+        paid_gateway_url: Optional[str] = None,
         raw_cache: Optional[RawCacheHook] = None,
         budgets: Optional[TransportBudgets] = None,
         request_timeout: float = 30.0,
         browser_timeout_ms: int = 60_000,
         direct_http_attempts: int = 3,
-        direct_browser_attempts: int = 2,
+        direct_http_retry_backoff_seconds: float = (
+            DEFAULT_DIRECT_HTTP_RETRY_BACKOFF_SECONDS
+        ),
+        direct_browser_attempts: int = DEFAULT_DIRECT_BROWSER_ATTEMPTS,
+        browser_retry_backoff_seconds: float = (DEFAULT_BROWSER_RETRY_BACKOFF_SECONDS),
+        browser_retry_jitter_seconds: float = DEFAULT_BROWSER_RETRY_JITTER_SECONDS,
         impersonate: str = "chrome120",
         direct_http_session: Any = None,
         direct_fs_client: Optional[FlareSolverrClient] = None,
         paid_fs_client: Optional[FlareSolverrClient] = None,
         proxy_client: Optional[ProxyFilterClient] = None,
+        paid_gateway_client: Optional[PaidGatewayClient] = None,
         http_session_factory: Optional[Callable[[Optional[str]], Any]] = None,
         context: Optional[TransportContext] = None,
         request_ledger: Optional[RequestLedger] = None,
         browser_session_ttl_seconds: int = 300,
         browser_session_max_requests: int = 96,
+        browser_session_owner: Optional[str] = None,
+        source_circuit: Optional[SharedSourceCircuit] = None,
+        source_circuit_wait: Optional[bool] = None,
+        transport_policy: Optional[TransportPolicy | str] = None,
     ) -> None:
+        require_production_runtime_class(operation="WhoScored source transport")
         if direct_http_attempts < 1:
             raise ValueError("direct_http_attempts must be >= 1")
         if direct_browser_attempts < 1:
             raise ValueError("direct_browser_attempts must be >= 1")
+        if (
+            isinstance(direct_http_retry_backoff_seconds, bool)
+            or not isinstance(direct_http_retry_backoff_seconds, (int, float))
+            or not math.isfinite(float(direct_http_retry_backoff_seconds))
+            or direct_http_retry_backoff_seconds < 0
+        ):
+            raise ValueError(
+                "direct_http_retry_backoff_seconds must be finite and >= 0"
+            )
+        if (
+            isinstance(browser_retry_backoff_seconds, bool)
+            or not isinstance(browser_retry_backoff_seconds, (int, float))
+            or not math.isfinite(float(browser_retry_backoff_seconds))
+            or browser_retry_backoff_seconds < 0
+        ):
+            raise ValueError("browser_retry_backoff_seconds must be finite and >= 0")
+        if (
+            isinstance(browser_retry_jitter_seconds, bool)
+            or not isinstance(browser_retry_jitter_seconds, (int, float))
+            or not math.isfinite(float(browser_retry_jitter_seconds))
+            or browser_retry_jitter_seconds < 0
+        ):
+            raise ValueError("browser_retry_jitter_seconds must be finite and >= 0")
+        supervisor_owner = os.environ.get(SUPERVISOR_SESSION_OWNER_ENV, "").strip()
+        supervisor_ledger_path = os.environ.get(
+            SUPERVISOR_RESOURCE_LEDGER_ENV, ""
+        ).strip()
+        if bool(supervisor_owner) != bool(supervisor_ledger_path):
+            raise ValueError(
+                "supervised browser session owner and resource ledger must be "
+                "configured together"
+            )
+        if supervisor_owner and browser_session_owner is not None:
+            raise ValueError(
+                "supervised and capacity browser session ownership cannot be mixed"
+            )
+        resolved_session_owner = supervisor_owner or browser_session_owner
+        browser_session_prefix = (
+            capacity_browser_session_prefix(resolved_session_owner)
+            if resolved_session_owner is not None
+            else None
+        )
+        if source_circuit_wait is None:
+            wait_value = os.environ.get(SOURCE_CIRCUIT_WAIT_ENV, "0").strip()
+            if wait_value not in {"0", "1"}:
+                raise ValueError(f"{SOURCE_CIRCUIT_WAIT_ENV} must be 0 or 1")
+            source_circuit_wait = wait_value == "1"
+        elif type(source_circuit_wait) is not bool:
+            raise ValueError("source_circuit_wait must be a boolean")
+        circuit_path = os.environ.get(SOURCE_CIRCUIT_PATH_ENV, "").strip()
+        if source_circuit is None and circuit_path:
+            source_circuit = SharedSourceCircuit(circuit_path)
+        if source_circuit_wait and source_circuit is None:
+            raise ValueError(
+                f"{SOURCE_CIRCUIT_WAIT_ENV}=1 requires {SOURCE_CIRCUIT_PATH_ENV}"
+            )
+        self.context = context or TransportContext.from_env()
+        context_policy = TransportPolicy.parse(self.context.transport_policy)
+        if transport_policy is not None:
+            requested_policy = TransportPolicy.parse(transport_policy)
+            if requested_policy is not context_policy:
+                raise ValueError(
+                    "transport_policy differs from the authenticated TransportContext"
+                )
+        resolved_policy = context_policy
+        if resolved_policy is TransportPolicy.DIRECT_THEN_PAID:
+            assert_paid_runtime_available(self.context.as_dict())
+            if any(
+                value is not None
+                for value in (
+                    paid_proxy_url,
+                    proxy_control_url,
+                    paid_fs_client,
+                    proxy_client,
+                )
+            ):
+                raise ValueError(
+                    "WhoScored paid runners may configure only the isolated "
+                    "paid application gateway"
+                )
+            if paid_gateway_client is None and not paid_gateway_url:
+                raise ValueError(
+                    "transport_policy=direct_then_paid requires the isolated "
+                    "paid application gateway"
+                )
+        self.transport_policy = resolved_policy
         self.raw_cache = raw_cache
         self.budgets = budgets or TransportBudgets()
+        signed_allocation = self.context.proxy_campaign.get("proxy_allocation")
+        if budgets is None and isinstance(signed_allocation, Mapping):
+            allocation_budget = signed_allocation.get("budget_bytes")
+            request_limit = signed_allocation.get("request_limit")
+            lease_limit = signed_allocation.get("lease_limit")
+            if any(
+                isinstance(value, bool) or not isinstance(value, int) or value <= 0
+                for value in (allocation_budget, request_limit, lease_limit)
+            ):
+                raise ValueError("signed proxy allocation limits are invalid")
+            assert isinstance(allocation_budget, int)
+            assert isinstance(request_limit, int)
+            assert isinstance(lease_limit, int)
+            self.budgets = TransportBudgets(
+                max_response_bytes=self.budgets.max_response_bytes,
+                max_paid_bytes_per_url=self.budgets.max_paid_bytes_per_url,
+                max_paid_bytes_per_lease=self.budgets.max_paid_bytes_per_lease,
+                max_paid_bytes_per_task=allocation_budget,
+                max_paid_urls=request_limit,
+                max_paid_browser_bootstraps=lease_limit,
+                lease_ttl_seconds=self.budgets.lease_ttl_seconds,
+            )
         self.request_timeout = request_timeout
         self.browser_timeout_ms = browser_timeout_ms
         self.direct_http_attempts = direct_http_attempts
+        self.direct_http_retry_backoff_seconds = float(
+            direct_http_retry_backoff_seconds
+        )
         self.direct_browser_attempts = direct_browser_attempts
+        self.browser_retry_backoff_seconds = float(browser_retry_backoff_seconds)
+        self.browser_retry_jitter_seconds = float(browser_retry_jitter_seconds)
         self.impersonate = impersonate
-        self.paid_proxy_url = paid_proxy_url
-        self.context = context or TransportContext.from_env()
+        # Runner processes never receive a filtering-proxy origin or any
+        # short-lived lease/session capability.  The legacy constructor values
+        # remain accepted for direct-only compatibility but cannot authorize a
+        # WhoScored paid route.
+        self.paid_proxy_url = None
         ledger_path = os.environ.get("WHOSCORED_REQUEST_LEDGER_PATH", "").strip()
         self.request_ledger = request_ledger or (
             JsonlRequestLedger(ledger_path) if ledger_path else None
         )
         self.browser_session_ttl_seconds = max(1, browser_session_ttl_seconds)
         self.browser_session_max_requests = max(1, browser_session_max_requests)
-        self._http_session_factory = http_session_factory
-        self._direct_http = direct_http_session or self._new_http_session(None)
-        self._direct_fs = direct_fs_client or FlareSolverrClient(url=flaresolverr_url)
-        self._paid_fs = paid_fs_client or FlareSolverrClient(url=flaresolverr_url)
-        self._proxy_client = proxy_client or (
-            ProxyFilterClient(paid_proxy_url, control_url=proxy_control_url)
-            if paid_proxy_url
+        self._capacity_browser_session_prefix = browser_session_prefix
+        self._supervisor_session_owner = supervisor_owner
+        self._supervisor_resource_ledger = (
+            JsonlRequestLedger(supervisor_ledger_path)
+            if supervisor_ledger_path
             else None
         )
+        self._source_circuit = source_circuit
+        self._source_circuit_wait = source_circuit_wait
+        self._source_circuit_permit: Optional[CircuitPermit] = None
+        self._http_session_factory = http_session_factory
+        self._direct_http = direct_http_session or self._new_http_session(None)
+        flaresolverr_identity = _attested_flaresolverr_identity()
+        identity_kwargs = (
+            {
+                "expected_version": flaresolverr_identity[0],
+                "expected_extension_sha256": flaresolverr_identity[1],
+            }
+            if flaresolverr_identity is not None
+            else {}
+        )
+        self._direct_fs = direct_fs_client or FlareSolverrClient(
+            url=flaresolverr_url,
+            **identity_kwargs,
+        )
+        self._paid_fs = (
+            paid_fs_client or FlareSolverrClient(
+                url=flaresolverr_url,
+                **identity_kwargs,
+            )
+            if resolved_policy is TransportPolicy.DIRECT_ONLY
+            else None
+        )
+        self._proxy_client = None
+        self._paid_gateway: Optional[PaidGatewayClient] = None
+        if resolved_policy is TransportPolicy.DIRECT_THEN_PAID:
+            self._paid_gateway = paid_gateway_client or PaidGatewayClient(
+                str(paid_gateway_url)
+            )
         self.stats = TransportStats()
         self._paid_browser_bootstraps = 0
         self._browser_sessions: dict[TransportRoute, _BrowserSession] = {}
@@ -726,6 +2048,170 @@ class WhoScoredTransport:
         self._active_context = self.context
         self._active_cache_key = ""
         self._active_request_id = ""
+        self._source_circuit_browser_blocked = False
+
+    def _paid_fallback_enabled(self) -> bool:
+        return bool(
+            self.transport_policy is TransportPolicy.DIRECT_THEN_PAID
+            and self._paid_gateway is not None
+        )
+
+    def _begin_source_operation(self) -> None:
+        """Finish an unresolved prior probe before a new public operation."""
+
+        self._source_circuit_browser_blocked = False
+        if self._source_circuit is None or self._source_circuit_permit is None:
+            return
+        permit = self._source_circuit_permit
+        self._source_circuit_permit = None
+        try:
+            self._source_circuit.inconclusive(permit)
+        except SourceCircuitError as exc:
+            raise WhoScoredTransportError(
+                "WhoScored source circuit could not preserve an uncertain probe",
+                kind=FailureKind.CONFIG,
+                url="https://www.whoscored.com/",
+                route=TransportRoute.DIRECT_FLARESOLVERR,
+            ) from exc
+
+    def _admit_structured_source(self, url: str) -> bool:
+        if (
+            self._source_circuit is None
+            or self._source_circuit_permit is not None
+            or not _is_whoscored_structured_feed_url(url)
+        ):
+            return True
+        try:
+            self._source_circuit_permit = self._source_circuit.admit(
+                wait=self._source_circuit_wait
+            )
+        except SourceCircuitOpen as exc:
+            if self._paid_fallback_enabled():
+                # The shared circuit contains authoritative browser CF evidence.
+                # Raw cache has already missed; allow only a fresh direct HTTP
+                # recheck before the signed paid route, never another browser
+                # stampede while the circuit is open.
+                self._source_circuit_browser_blocked = True
+                return False
+            raise CloudflareChallenge(
+                "WhoScored source cooldown is active",
+                url=url,
+                route=TransportRoute.DIRECT_FLARESOLVERR,
+                source_wide=True,
+            ) from exc
+        except SourceCircuitError as exc:
+            raise WhoScoredTransportError(
+                "WhoScored source circuit state is unavailable",
+                kind=FailureKind.CONFIG,
+                url=url,
+                route=TransportRoute.DIRECT_FLARESOLVERR,
+            ) from exc
+        return True
+
+    def _source_probe_active(self) -> bool:
+        return bool(
+            self._source_circuit_permit is not None
+            and self._source_circuit_permit.is_probe
+        )
+
+    def _source_succeeded(self, url: str) -> None:
+        if (
+            self._source_circuit is None
+            or self._source_circuit_permit is None
+            or not _is_whoscored_structured_feed_url(url)
+        ):
+            return
+        permit = self._source_circuit_permit
+        self._source_circuit_permit = None
+        try:
+            self._source_circuit.succeed(permit)
+        except SourceCircuitError as exc:
+            raise WhoScoredTransportError(
+                "WhoScored source circuit could not record a successful probe",
+                kind=FailureKind.CONFIG,
+                url=url,
+                route=TransportRoute.DIRECT_FLARESOLVERR,
+            ) from exc
+
+    def _source_tripped(self, exc: CloudflareChallenge) -> None:
+        if (
+            not exc.source_wide
+            or self._source_circuit is None
+            or self._source_circuit_permit is None
+        ):
+            return
+        permit = self._source_circuit_permit
+        self._source_circuit_permit = None
+        try:
+            self._source_circuit.trip(permit)
+            if self._paid_fallback_enabled():
+                self._source_circuit_browser_blocked = True
+        except SourceCircuitError as circuit_exc:
+            raise WhoScoredTransportError(
+                "WhoScored source circuit could not record a source block",
+                kind=FailureKind.CONFIG,
+                url=exc.url,
+                route=TransportRoute.DIRECT_FLARESOLVERR,
+            ) from circuit_exc
+
+    def _source_inconclusive(self, url: str) -> bool:
+        """Reopen one uncertain half-open probe without escalating it."""
+
+        if (
+            self._source_circuit is None
+            or self._source_circuit_permit is None
+            or not self._source_circuit_permit.is_probe
+            or not _is_whoscored_structured_feed_url(url)
+        ):
+            return False
+        permit = self._source_circuit_permit
+        self._source_circuit_permit = None
+        try:
+            self._source_circuit.inconclusive(permit)
+        except SourceCircuitError as exc:
+            raise WhoScoredTransportError(
+                "WhoScored source circuit could not preserve an uncertain probe",
+                kind=FailureKind.CONFIG,
+                url=url,
+                route=TransportRoute.DIRECT_FLARESOLVERR,
+            ) from exc
+        return True
+
+    def _wait_before_browser_retry(self, attempt: int) -> None:
+        """Apply one bounded exponential delay before a physical retry."""
+
+        if self.browser_retry_backoff_seconds == 0:
+            return
+        multiplier = 2 ** min(max(0, int(attempt)), 10)
+        base_delay = min(
+            self.browser_retry_backoff_seconds * multiplier,
+            MAX_BROWSER_RETRY_BACKOFF_SECONDS,
+        )
+        jitter = (
+            random.uniform(
+                0.0,
+                min(
+                    self.browser_retry_jitter_seconds,
+                    MAX_BROWSER_RETRY_BACKOFF_SECONDS,
+                ),
+            )
+            if self.browser_retry_jitter_seconds
+            else 0.0
+        )
+        delay = min(base_delay + jitter, MAX_BROWSER_RETRY_BACKOFF_SECONDS)
+        time.sleep(delay)
+
+    def _wait_before_direct_http_retry(self, attempt: int) -> None:
+        """Space transient origin retries so one short 5xx wave can clear."""
+
+        if self.direct_http_retry_backoff_seconds == 0:
+            return
+        multiplier = 2 ** min(max(0, int(attempt)), 10)
+        delay = min(
+            self.direct_http_retry_backoff_seconds * multiplier,
+            MAX_BROWSER_RETRY_BACKOFF_SECONDS,
+        )
+        time.sleep(delay)
 
     def _new_http_session(self, proxy_url: Optional[str]) -> Any:
         if self._http_session_factory is not None:
@@ -753,6 +2239,28 @@ class WhoScoredTransport:
             session.proxies = {"http": proxy_url, "https": proxy_url}
         return session
 
+    def _record_supervisor_session(self, event: str, session_id: str) -> None:
+        ledger = self._supervisor_resource_ledger
+        if ledger is None:
+            return
+        prefix = capacity_browser_session_prefix(self._supervisor_session_owner)
+        if event not in {"owned", "released"} or not session_id.startswith(prefix):
+            raise RuntimeError("invalid supervised browser session lifecycle event")
+        ledger.append(
+            {
+                "schema_version": 1,
+                "event": event,
+                "resource": "flaresolverr_session",
+                "owner": self._supervisor_session_owner,
+                "session_id": session_id,
+                "dag_id": self.context.dag_id,
+                "run_id": self.context.run_id,
+                "task_id": self.context.task_id,
+                "try_number": self.context.try_number,
+                "recorded_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+
     def _browser_session(
         self,
         client: FlareSolverrClient,
@@ -776,44 +2284,73 @@ class WhoScoredTransport:
             existing = None
         if existing is not None:
             return existing
-        session_id = f"ws-{route.value}-{uuid.uuid4().hex[:10]}"
-        try:
-            client.create_session(session_id, proxy_url=proxy_url)
-        except Exception:
-            # The POST may have reached FlareSolverr even when the response was
-            # lost.  Destroy the deterministic id so a retry cannot leak an
-            # orphan Chromium process outside ``_browser_sessions``.
-            try:
-                client.destroy_session(session_id)
-            except Exception:
-                logger.debug(
-                    "Could not destroy possibly-created WhoScored browser session %s",
-                    session_id,
-                    exc_info=True,
-                )
-            raise
-        self.stats.browser_sessions += 1
+        suffix = f"{route.value}-{uuid.uuid4().hex[:10]}"
+        session_id = (
+            f"{self._capacity_browser_session_prefix}{suffix}"
+            if self._capacity_browser_session_prefix is not None
+            else f"ws-{suffix}"
+        )
         created = _BrowserSession(
             session_id=session_id,
             proxy_url=proxy_url,
             created_at=now,
         )
+        # Track ownership before the external side effect.  A signal can then
+        # interrupt create or local accounting without losing the only id that
+        # close() needs for an idempotent server-side destroy.
         self._browser_sessions[route] = created
+        try:
+            self._record_supervisor_session("owned", session_id)
+        except BaseException:
+            self._browser_sessions.pop(route, None)
+            raise
+        try:
+            client.create_session(session_id, proxy_url=proxy_url)
+            self.stats.browser_sessions += 1
+        except BaseException:
+            # Destroy even when create never reached the server; the endpoint
+            # is idempotent.  A BaseException from cleanup deliberately keeps
+            # tracking intact so the outer termination close can retry it.
+            self._drop_browser_session(client, route)
+            raise
         return created
 
     def _drop_browser_session(
         self, client: FlareSolverrClient, route: TransportRoute
     ) -> None:
-        existing = self._browser_sessions.pop(route, None)
+        existing = self._browser_sessions.get(route)
         if existing is not None:
+            if self._supervisor_resource_ledger is not None:
+                try:
+                    strict_destroy = getattr(client, "destroy_session_strict")
+                    strict_destroy(existing.session_id)
+                    self._record_supervisor_session("released", existing.session_id)
+                except Exception as exc:
+                    # Keep ownership durable and locally tracked. The parent
+                    # process-group supervisor retries exact cleanup after the
+                    # runner exits or is killed.
+                    logger.error(
+                        "Could not release supervised WhoScored browser session "
+                        "for route %s (%s)",
+                        route.value,
+                        type(exc).__name__,
+                    )
+                    return
+                self._browser_sessions.pop(route, None)
+                return
             try:
                 client.destroy_session(existing.session_id)
-            except Exception:  # destroy is best-effort and idempotent
+            except Exception as exc:  # destroy is best-effort and idempotent
                 logger.debug(
-                    "Could not destroy WhoScored browser session %s",
-                    existing.session_id,
-                    exc_info=True,
+                    "Could not destroy WhoScored browser session for route %s (%s)",
+                    route.value,
+                    type(exc).__name__,
                 )
+            # An ordinary destroy failure remains best-effort, but a
+            # BaseException skips this line and keeps the id tracked so the
+            # termination unwind can retry the idempotent destroy in close().
+            if self._browser_sessions.get(route) is existing:
+                self._browser_sessions.pop(route, None)
 
     def _replay_browser_identity(self, solution: Mapping[str, Any]) -> None:
         """Replay solved CF cookies into direct HTTP when the session supports it."""
@@ -889,6 +2426,8 @@ class WhoScoredTransport:
         if cached is not None:
             return cached
         cache_entry_was_invalid = self.stats.cache_invalid > cache_invalid_before
+        self._begin_source_operation()
+        source_browser_admitted = self._admit_structured_source(url)
         if before_network is not None:
             # The gate belongs after cache validation, not before ``has``.
             # A parser-invalid but integrity-valid raw object intentionally
@@ -920,8 +2459,10 @@ class WhoScoredTransport:
         def _direct_with_retries(
             *, acquire_first_token: bool = False
         ) -> TransportResponse:
-            if acquire_first_token and before_network is not None:
-                before_network()
+            if acquire_first_token:
+                self._admit_structured_source(url)
+                if before_network is not None:
+                    before_network()
             for attempt in range(self.direct_http_attempts):
                 try:
                     return _direct_once()
@@ -930,12 +2471,15 @@ class WhoScoredTransport:
                     # HTTP failure. Move to the direct browser immediately.
                     raise
                 except WhoScoredTransportError as exc:
+                    if self._source_inconclusive(url):
+                        raise
                     retryable_direct = exc.retryable and exc.kind in {
                         FailureKind.HTTP_STATUS,
                         FailureKind.TIMEOUT,
                     }
                     if not retryable_direct or attempt + 1 >= self.direct_http_attempts:
                         raise
+                    self._wait_before_direct_http_retry(attempt)
                     if before_network is not None:
                         # Every physical retry consumes a source-rate token.
                         before_network()
@@ -947,11 +2491,14 @@ class WhoScoredTransport:
             direct_gate_key
             and not cache_entry_was_invalid
             and direct_gate_key in self._direct_gate_circuits
+            and source_browser_admitted
         )
+        initial_direct_cf: Optional[CloudflareChallenge] = None
         if not skip_direct:
             try:
                 direct = _direct_with_retries()
-            except CloudflareChallenge:
+            except CloudflareChallenge as exc:
+                initial_direct_cf = exc
                 self.stats.failures[FailureKind.CLOUDFLARE.value] += 1
                 if direct_gate_key is not None:
                     self._direct_gate_circuits.add(direct_gate_key)
@@ -962,11 +2509,19 @@ class WhoScoredTransport:
             else:
                 if direct_gate_key is not None:
                     self._direct_gate_circuits.discard(direct_gate_key)
-                return self._store_and_return(key, direct)
+                stored = self._store_and_return(key, direct)
+                self._source_succeeded(url)
+                return stored
 
         direct_cf_failures = 0
         last_cf: Optional[CloudflareChallenge] = None
         last_transient: Optional[WhoScoredTransportError] = None
+        # Shared circuit state is writable by ordinary Airflow tasks. It may
+        # suppress a probe, but can never stand in for browser CF evidence when
+        # authorising paid traffic.
+        if not source_browser_admitted:
+            assert initial_direct_cf is not None
+            raise initial_direct_cf
         for attempt in range(self.direct_browser_attempts):
             try:
                 browser = self._browser_fetch(
@@ -984,55 +2539,98 @@ class WhoScoredTransport:
                 direct_cf_failures += 1
                 last_cf = exc
                 self.stats.failures[FailureKind.CLOUDFLARE.value] += 1
+                self._source_tripped(exc)
+                if not exc.source_wide and self._source_inconclusive(url):
+                    raise
+                if (
+                    exc.source_wide
+                    and self._source_circuit is not None
+                    and not self._paid_fallback_enabled()
+                    and not self._source_circuit_wait
+                ):
+                    raise
+                if attempt + 1 < self.direct_browser_attempts:
+                    if (
+                        exc.source_wide
+                        and self._source_circuit is not None
+                        and self._source_circuit_wait
+                    ):
+                        self._admit_structured_source(url)
+                    else:
+                        self._wait_before_browser_retry(attempt)
+                    if before_network is not None:
+                        before_network()
                 continue
             except WhoScoredTransportError as exc:
                 # A tab crash, timeout, ordinary browser error or parser
                 # rejection must never silently buy residential bandwidth.
                 if direct_gate_key is not None:
                     self._direct_gate_circuits.discard(direct_gate_key)
+                if self._source_inconclusive(url):
+                    self._drop_browser_session(
+                        self._direct_fs, TransportRoute.DIRECT_FLARESOLVERR
+                    )
+                    if exc.kind is FailureKind.CONTENT:
+                        self._store_response(key, browser)
+                    raise
                 if (
                     exc.retryable
-                    and exc.kind is FailureKind.HTTP_STATUS
+                    and exc.kind
+                    in {
+                        FailureKind.HTTP_STATUS,
+                        FailureKind.TIMEOUT,
+                        FailureKind.BROWSER,
+                    }
                     and attempt + 1 < self.direct_browser_attempts
                 ):
                     last_transient = exc
                     self._drop_browser_session(
                         self._direct_fs, TransportRoute.DIRECT_FLARESOLVERR
                     )
+                    self._wait_before_browser_retry(attempt)
                     if before_network is not None:
                         before_network()
                     continue
                 if exc.kind is FailureKind.CONTENT:
                     self._store_response(key, browser)
                 raise
-            return self._store_and_return(key, browser)
+            stored = self._store_and_return(key, browser)
+            self._source_succeeded(url)
+            return stored
 
-        if last_transient is not None and direct_cf_failures == 0:
+        # Any non-CF browser outcome makes the evidence mixed.  A later
+        # source-wide challenge may still trip the shared cooldown, but it
+        # cannot erase that earlier timeout/error and authorize paid traffic.
+        if last_transient is not None:
             raise last_transient
         if direct_cf_failures != self.direct_browser_attempts:
             assert last_cf is not None
             raise last_cf
-        if self._proxy_client is None:
+        if self._paid_gateway is None:
             assert last_cf is not None
             raise last_cf
 
+        # Circuit evidence is an optimisation, never authority to spend.
+        # Browser CF failures invalidate the earlier direct observation: every
+        # serial page and structured feed rechecks direct HTTP immediately
+        # before creating a paid lease.
         if direct_gate_key is not None:
-            # Circuit evidence is an optimisation, never authority to spend.
-            # A browser CF failure invalidates the old evidence: clear it and
-            # recheck direct HTTP immediately before creating a paid lease.
             self._direct_gate_circuits.discard(direct_gate_key)
-            try:
-                direct = _direct_with_retries(acquire_first_token=True)
-            except CloudflareChallenge:
-                self.stats.failures[FailureKind.CLOUDFLARE.value] += 1
-                # The paid transition is now backed by fresh direct evidence.
+        try:
+            direct = _direct_with_retries(acquire_first_token=True)
+        except CloudflareChallenge:
+            self.stats.failures[FailureKind.CLOUDFLARE.value] += 1
+            # The paid transition is now backed by fresh direct evidence.
+            if direct_gate_key is not None:
                 self._direct_gate_circuits.add(direct_gate_key)
-            except WhoScoredTransportError:
-                # Timeout, status and content failures are not CF evidence and
-                # therefore stop before paid traffic with the circuit clear.
-                raise
-            else:
-                return self._store_and_return(key, direct)
+        except WhoScoredTransportError:
+            # Timeout, status and content failures are not CF evidence and
+            # therefore stop before paid traffic with the circuit clear.
+            raise
+        else:
+            stored = self._store_and_return(key, direct)
+            self._source_succeeded(url)
+            return stored
 
         paid = self._paid_fetch(
             url,
@@ -1099,6 +2697,7 @@ class WhoScoredTransport:
         # bootstrap-scoped circuit as the serial path; later raw misses avoid
         # known-useless duplicate direct requests. Paid still requires a fresh
         # direct recheck below.
+        misses: list[tuple[int, FetchRequest, bool]] = []
         for index, item in enumerate(items):
             self._activate_request(
                 cache_key=item.cache_key,
@@ -1112,40 +2711,101 @@ class WhoScoredTransport:
                 results[index] = cached
                 continue
             cache_entry_was_invalid = self.stats.cache_invalid > cache_invalid_before
-            if not cache_entry_was_invalid and gate_key in self._direct_gate_circuits:
+            misses.append((index, item, cache_entry_was_invalid))
+
+        if not misses:
+            return [response for response in results if response is not None]
+
+        # An unresolved prior half-open probe is settled only after every raw
+        # object has had its chance to satisfy this logical batch.  Circuit
+        # state can therefore never block a complete warm-cache replay.
+        self._begin_source_operation()
+        for index, item, cache_entry_was_invalid in misses:
+            self._activate_request(
+                cache_key=item.cache_key,
+                scope=item.scope,
+                entity=item.entity,
+                request_id=request_ids[item.cache_key],
+            )
+            source_browser_admitted = self._admit_structured_source(item.url)
+            if (
+                source_browser_admitted
+                and not cache_entry_was_invalid
+                and gate_key in self._direct_gate_circuits
+            ):
                 gated.append((index, item, False))
                 continue
             if item.before_network is not None:
                 item.before_network()
-            direct = self._http_fetch(
-                item.url,
-                session=self._direct_http,
-                route=TransportRoute.DIRECT_HTTP,
-                referer=bootstrap_url,
-            )
-            try:
-                self._validate(direct, item.validator)
-            except CloudflareChallenge:
-                self.stats.failures[FailureKind.CLOUDFLARE.value] += 1
-                self._direct_gate_circuits.add(gate_key)
-                gated.append((index, item, True))
-            except WhoScoredTransportError as exc:
-                self._direct_gate_circuits.discard(gate_key)
-                if exc.kind is FailureKind.CONTENT:
+            for attempt in range(self.direct_http_attempts):
+                direct: Optional[TransportResponse] = None
+                try:
+                    direct = self._http_fetch(
+                        item.url,
+                        session=self._direct_http,
+                        route=TransportRoute.DIRECT_HTTP,
+                        referer=bootstrap_url,
+                    )
+                    self._validate(direct, item.validator)
+                except CloudflareChallenge:
+                    self.stats.failures[FailureKind.CLOUDFLARE.value] += 1
+                    self._direct_gate_circuits.add(gate_key)
+                    if source_browser_admitted:
+                        gated.append((index, item, True))
+                    else:
+                        # Shared circuit state is mutable scheduling metadata,
+                        # never current-request browser evidence. A fresh
+                        # direct CF response alone cannot authorise paid bytes.
+                        raise
+                    break
+                except WhoScoredTransportError as exc:
+                    if exc.kind is FailureKind.CONTENT:
+                        assert direct is not None
+                        self._store_response(item.cache_key, direct)
+                    if self._source_inconclusive(item.url):
+                        self._direct_gate_circuits.discard(gate_key)
+                        raise
+                    retryable_direct = exc.retryable and exc.kind in {
+                        FailureKind.HTTP_STATUS,
+                        FailureKind.TIMEOUT,
+                    }
+                    if retryable_direct and attempt + 1 < self.direct_http_attempts:
+                        self._wait_before_direct_http_retry(attempt)
+                        if item.before_network is not None:
+                            item.before_network()
+                        continue
+                    self._direct_gate_circuits.discard(gate_key)
+                    raise
+                else:
+                    assert direct is not None
+                    self._direct_gate_circuits.discard(gate_key)
                     self._store_response(item.cache_key, direct)
-                raise
-            else:
-                self._direct_gate_circuits.discard(gate_key)
-                self._store_response(item.cache_key, direct)
-                results[index] = direct
+                    results[index] = direct
+                    self._source_succeeded(item.url)
+                    break
 
-        for offset in range(0, len(gated), MAX_XHR_BATCH_URLS):
-            pending = gated[offset : offset + MAX_XHR_BATCH_URLS]
+        offset = 0
+        while offset < len(gated):
+            if (
+                self._source_circuit_permit is None
+                and not self._admit_structured_source(gated[offset][1].url)
+            ):
+                raise CloudflareChallenge(
+                    "WhoScored source cooldown is active",
+                    url=gated[offset][1].url,
+                    route=TransportRoute.DIRECT_FLARESOLVERR,
+                    source_wide=True,
+                )
+            batch_size = 1 if self._source_probe_active() else MAX_XHR_BATCH_URLS
+            pending = gated[offset : offset + batch_size]
+            offset += len(pending)
             last_cf: Optional[CloudflareChallenge] = None
             last_item_errors: dict[str, WhoScoredTransportError] = {}
             non_cf_evidence: dict[str, WhoScoredTransportError] = {}
             cf_failure_counts: Counter[str] = Counter()
-            for _ in range(self.direct_browser_attempts):
+            rechunk_after_cooldown: list[tuple[int, FetchRequest, bool]] = []
+            browser_attempts = range(self.direct_browser_attempts)
+            for attempt in browser_attempts:
                 if not pending:
                     break
                 rate_limited_pending: list[tuple[int, FetchRequest, bool]] = []
@@ -1172,6 +2832,34 @@ class WhoScoredTransport:
                     for _, item, _ in pending:
                         last_item_errors[item.cache_key] = exc
                         cf_failure_counts[item.cache_key] += 1
+                    pending = [(index, item, False) for index, item, _ in pending]
+                    self._source_tripped(exc)
+                    if not exc.source_wide and self._source_inconclusive(
+                        pending[0][1].url
+                    ):
+                        raise
+                    if (
+                        exc.source_wide
+                        and self._source_circuit is not None
+                        and not self._paid_fallback_enabled()
+                        and not self._source_circuit_wait
+                    ):
+                        raise
+                    if (
+                        exc.source_wide
+                        and self._source_circuit is not None
+                        and self._source_circuit_wait
+                    ):
+                        rechunk_after_cooldown = list(pending)
+                        pending = []
+                        break
+                    if attempt + 1 < self.direct_browser_attempts:
+                        if not (
+                            exc.source_wide
+                            and self._source_circuit is not None
+                            and self._source_circuit_wait
+                        ):
+                            self._wait_before_browser_retry(attempt)
                     continue
                 except WhoScoredTransportError as exc:
                     # Endpoint-level timeout/protocol failures do not produce
@@ -1179,18 +2867,25 @@ class WhoScoredTransport:
                     # browser/bootstrap failures; retain them as non-CF
                     # evidence so a later challenge can never authorize paid.
                     self._direct_gate_circuits.discard(gate_key)
-                    if not exc.retryable:
-                        raise
                     self._drop_browser_session(
                         self._direct_fs, TransportRoute.DIRECT_FLARESOLVERR
                     )
+                    if not exc.retryable:
+                        self._source_inconclusive(pending[0][1].url)
+                        raise
                     for _, item, _ in pending:
                         last_item_errors[item.cache_key] = exc
                         non_cf_evidence[item.cache_key] = exc
+                    pending = [(index, item, False) for index, item, _ in pending]
+                    if self._source_inconclusive(pending[0][1].url):
+                        raise
+                    if attempt + 1 < self.direct_browser_attempts:
+                        self._wait_before_browser_retry(attempt)
                     continue
 
                 retry: list[tuple[int, FetchRequest, bool]] = []
                 terminal_error: Optional[WhoScoredTransportError] = None
+                source_wide_cf: Optional[CloudflareChallenge] = None
                 for (index, item, network_gate_acquired), outcome in zip(
                     pending, browser_outcomes
                 ):
@@ -1198,7 +2893,7 @@ class WhoScoredTransport:
                         last_item_errors[item.cache_key] = outcome.error
                         non_cf_evidence[item.cache_key] = outcome.error
                         if outcome.error.retryable:
-                            retry.append((index, item, network_gate_acquired))
+                            retry.append((index, item, False))
                         else:
                             terminal_error = terminal_error or outcome.error
                         continue
@@ -1217,16 +2912,54 @@ class WhoScoredTransport:
                         last_cf = exc
                         last_item_errors[item.cache_key] = exc
                         cf_failure_counts[item.cache_key] += 1
-                        retry.append((index, item, network_gate_acquired))
+                        retry.append((index, item, False))
+                        if exc.source_wide:
+                            source_wide_cf = source_wide_cf or exc
                     except WhoScoredTransportError as exc:
                         if exc.kind is FailureKind.CONTENT:
                             self._store_response(item.cache_key, browser)
-                        terminal_error = terminal_error or exc
+                        last_item_errors[item.cache_key] = exc
+                        non_cf_evidence[item.cache_key] = exc
+                        if exc.retryable:
+                            retry.append((index, item, False))
+                        else:
+                            terminal_error = terminal_error or exc
                     else:
                         self._store_response(item.cache_key, browser)
                         results[index] = browser
                         last_item_errors.pop(item.cache_key, None)
                         non_cf_evidence.pop(item.cache_key, None)
+                if source_wide_cf is not None:
+                    # Record authoritative source evidence before any sibling
+                    # item error can win exception precedence.  The blocked
+                    # browser session is never reused after that evidence.
+                    self._drop_browser_session(
+                        self._direct_fs, TransportRoute.DIRECT_FLARESOLVERR
+                    )
+                    self._source_tripped(source_wide_cf)
+                    if (
+                        self._source_circuit is not None
+                        and not self._paid_fallback_enabled()
+                        and not self._source_circuit_wait
+                    ):
+                        raise source_wide_cf
+                    if self._source_circuit is not None and self._source_circuit_wait:
+                        if terminal_error is not None:
+                            self._direct_gate_circuits.discard(gate_key)
+                            raise terminal_error
+                        rechunk_after_cooldown = list(retry)
+                        pending = []
+                        break
+                if self._source_probe_active() and (terminal_error or retry):
+                    uncertain = (
+                        terminal_error or last_item_errors[retry[0][1].cache_key]
+                    )
+                    self._drop_browser_session(
+                        self._direct_fs, TransportRoute.DIRECT_FLARESOLVERR
+                    )
+                    self._direct_gate_circuits.discard(gate_key)
+                    self._source_inconclusive(pending[0][1].url)
+                    raise uncertain
                 if terminal_error is not None:
                     self._direct_gate_circuits.discard(gate_key)
                     raise terminal_error
@@ -1235,7 +2968,21 @@ class WhoScoredTransport:
                     self._drop_browser_session(
                         self._direct_fs, TransportRoute.DIRECT_FLARESOLVERR
                     )
+                    if attempt + 1 < self.direct_browser_attempts:
+                        if not (
+                            source_wide_cf is not None
+                            and self._source_circuit is not None
+                        ):
+                            self._wait_before_browser_retry(attempt)
+                else:
+                    self._source_succeeded(items[0].url)
 
+            if rechunk_after_cooldown:
+                # Re-enter the outer chunker only after shared admission.  The
+                # half-open permit then forces exactly one XHR, never the old
+                # multi-item batch that observed the block.
+                gated[offset:offset] = rechunk_after_cooldown
+                continue
             if not pending:
                 continue
             non_cf_errors: list[WhoScoredTransportError] = []
@@ -1253,7 +3000,7 @@ class WhoScoredTransport:
             if non_cf_errors:
                 self._direct_gate_circuits.discard(gate_key)
                 raise non_cf_errors[0]
-            if self._proxy_client is None:
+            if self._paid_gateway is None:
                 assert last_cf is not None
                 raise last_cf
 
@@ -1268,23 +3015,45 @@ class WhoScoredTransport:
                     entity=item.entity,
                     request_id=request_ids[item.cache_key],
                 )
-                fresh_direct = self._http_fetch(
-                    item.url,
-                    session=self._direct_http,
-                    route=TransportRoute.DIRECT_HTTP,
-                    referer=bootstrap_url,
-                )
-                try:
-                    self._validate(fresh_direct, item.validator)
-                except CloudflareChallenge:
-                    self.stats.failures[FailureKind.CLOUDFLARE.value] += 1
-                except WhoScoredTransportError as exc:
-                    if exc.kind is FailureKind.CONTENT:
+                self._admit_structured_source(item.url)
+                if item.before_network is not None:
+                    item.before_network()
+                fresh_cloudflare = False
+                for attempt in range(self.direct_http_attempts):
+                    fresh_direct: Optional[TransportResponse] = None
+                    try:
+                        fresh_direct = self._http_fetch(
+                            item.url,
+                            session=self._direct_http,
+                            route=TransportRoute.DIRECT_HTTP,
+                            referer=bootstrap_url,
+                        )
+                        self._validate(fresh_direct, item.validator)
+                    except CloudflareChallenge:
+                        self.stats.failures[FailureKind.CLOUDFLARE.value] += 1
+                        fresh_cloudflare = True
+                        break
+                    except WhoScoredTransportError as exc:
+                        retryable_direct = exc.retryable and exc.kind in {
+                            FailureKind.HTTP_STATUS,
+                            FailureKind.TIMEOUT,
+                        }
+                        if retryable_direct and attempt + 1 < self.direct_http_attempts:
+                            self._wait_before_direct_http_retry(attempt)
+                            if item.before_network is not None:
+                                item.before_network()
+                            continue
+                        if exc.kind is FailureKind.CONTENT:
+                            assert fresh_direct is not None
+                            self._store_response(item.cache_key, fresh_direct)
+                        raise
+                    else:
+                        assert fresh_direct is not None
                         self._store_response(item.cache_key, fresh_direct)
-                    raise
-                else:
-                    self._store_response(item.cache_key, fresh_direct)
-                    results[index] = fresh_direct
+                        results[index] = fresh_direct
+                        self._source_succeeded(item.url)
+                        break
+                if not fresh_cloudflare:
                     continue
                 paid = self._paid_fetch(
                     item.url,
@@ -1302,6 +3071,7 @@ class WhoScoredTransport:
                 url=items[0].url,
                 route=TransportRoute.DIRECT_FLARESOLVERR,
             )
+        self._source_succeeded(items[0].url)
         return [response for response in results if response is not None]
 
     def _load_cached(
@@ -1376,12 +3146,14 @@ class WhoScoredTransport:
                 content=response.content,
                 status_code=response.status_code,
                 headers=response.headers,
+                observed_at=response.observed_at,
             )
             try:
                 self.raw_cache.store(key, payload, response.sha256)
             except Exception as exc:
                 raise WhoScoredTransportError(
-                    f"raw cache store failed: {exc}",
+                    "raw cache store failed: "
+                    f"{_safe_route_exception_text(exc, route=response.route)}",
                     kind=FailureKind.CACHE,
                     url=response.url,
                     route=response.route,
@@ -1421,8 +3193,15 @@ class WhoScoredTransport:
                 failure_kind=FailureKind.TIMEOUT,
                 error=exc,
             )
+            detail = _safe_route_exception_text(exc, route=route)
+            if route not in {
+                TransportRoute.PAID_HTTP,
+                TransportRoute.PAID_FLARESOLVERR,
+                TransportRoute.PAID_LEASE,
+            }:
+                detail = f"{type(exc).__name__}: {detail}"
             raise WhoScoredTransportError(
-                f"HTTP request failed: {type(exc).__name__}: {exc}",
+                f"HTTP request failed: {detail}",
                 kind=FailureKind.TIMEOUT,
                 url=url,
                 route=route,
@@ -1462,6 +3241,21 @@ class WhoScoredTransport:
                 proxy_url=proxy_url,
                 required_requests=2 if needs_bootstrap else 1,
             )
+        except FlareSolverrRuntimeIdentityError as exc:
+            self._record_ledger(
+                url=url,
+                route=route,
+                status="error",
+                failure_kind=FailureKind.CONFIG,
+                error=exc,
+            )
+            raise WhoScoredTransportError(
+                _safe_route_exception_text(exc, route=route),
+                kind=FailureKind.CONFIG,
+                url=url,
+                route=route,
+                retryable=False,
+            ) from exc
         except FlareSolverrCFChallengeFailed as exc:
             self._record_ledger(
                 url=url,
@@ -1470,7 +3264,12 @@ class WhoScoredTransport:
                 failure_kind=FailureKind.CLOUDFLARE,
                 error=exc,
             )
-            raise CloudflareChallenge(str(exc), url=url, route=route) from exc
+            raise CloudflareChallenge(
+                _safe_route_exception_text(exc, route=route),
+                url=url,
+                route=route,
+                source_wide=route is TransportRoute.DIRECT_FLARESOLVERR,
+            ) from exc
         except FlareSolverrResponseTooLarge as exc:
             self._record_ledger(
                 url=url,
@@ -1479,7 +3278,9 @@ class WhoScoredTransport:
                 failure_kind=FailureKind.BUDGET,
                 error=exc,
             )
-            raise TransportBudgetExceeded(str(exc), url=url, route=route) from exc
+            raise TransportBudgetExceeded(
+                _safe_route_exception_text(exc, route=route), url=url, route=route
+            ) from exc
         except FlareSolverrTimeout as exc:
             self._record_ledger(
                 url=url,
@@ -1489,7 +3290,7 @@ class WhoScoredTransport:
                 error=exc,
             )
             raise WhoScoredTransportError(
-                str(exc),
+                _safe_route_exception_text(exc, route=route),
                 kind=FailureKind.TIMEOUT,
                 url=url,
                 route=route,
@@ -1504,7 +3305,7 @@ class WhoScoredTransport:
                 error=exc,
             )
             raise WhoScoredTransportError(
-                str(exc),
+                _safe_route_exception_text(exc, route=route),
                 kind=FailureKind.BROWSER,
                 url=url,
                 route=route,
@@ -1584,6 +3385,22 @@ class WhoScoredTransport:
                 status = int(solution.get("status") or 0)
                 response_bytes = len(content)
             session.requests += 1
+        except FlareSolverrRuntimeIdentityError as exc:
+            self._drop_browser_session(client, route)
+            self._record_ledger(
+                url=url,
+                route=route,
+                status="error",
+                failure_kind=FailureKind.CONFIG,
+                error=exc,
+            )
+            raise WhoScoredTransportError(
+                _safe_route_exception_text(exc, route=route),
+                kind=FailureKind.CONFIG,
+                url=url,
+                route=route,
+                retryable=False,
+            ) from exc
         except FlareSolverrCFChallengeFailed as exc:
             self._drop_browser_session(client, route)
             self._record_ledger(
@@ -1593,7 +3410,12 @@ class WhoScoredTransport:
                 failure_kind=FailureKind.CLOUDFLARE,
                 error=exc,
             )
-            raise CloudflareChallenge(str(exc), url=url, route=route) from exc
+            raise CloudflareChallenge(
+                _safe_route_exception_text(exc, route=route),
+                url=url,
+                route=route,
+                source_wide=route is TransportRoute.DIRECT_FLARESOLVERR,
+            ) from exc
         except FlareSolverrResponseTooLarge as exc:
             self._drop_browser_session(client, route)
             self._record_ledger(
@@ -1603,7 +3425,9 @@ class WhoScoredTransport:
                 failure_kind=FailureKind.BUDGET,
                 error=exc,
             )
-            raise TransportBudgetExceeded(str(exc), url=url, route=route) from exc
+            raise TransportBudgetExceeded(
+                _safe_route_exception_text(exc, route=route), url=url, route=route
+            ) from exc
         except FlareSolverrTimeout as exc:
             self._drop_browser_session(client, route)
             self._record_ledger(
@@ -1614,7 +3438,7 @@ class WhoScoredTransport:
                 error=exc,
             )
             raise WhoScoredTransportError(
-                str(exc),
+                _safe_route_exception_text(exc, route=route),
                 kind=FailureKind.TIMEOUT,
                 url=url,
                 route=route,
@@ -1630,7 +3454,7 @@ class WhoScoredTransport:
                 error=exc,
             )
             raise WhoScoredTransportError(
-                str(exc),
+                _safe_route_exception_text(exc, route=route),
                 kind=FailureKind.BROWSER,
                 url=url,
                 route=route,
@@ -1646,7 +3470,7 @@ class WhoScoredTransport:
                 error=exc,
             )
             raise WhoScoredTransportError(
-                str(exc),
+                _safe_route_exception_text(exc, route=route),
                 kind=FailureKind.BROWSER,
                 url=url,
                 route=route,
@@ -1718,18 +3542,34 @@ class WhoScoredTransport:
                 proxy_url=proxy_url,
                 required_requests=len(items) + (1 if needs_bootstrap else 0),
             )
+        except FlareSolverrRuntimeIdentityError as exc:
+            record_error(FailureKind.CONFIG, exc)
+            raise WhoScoredTransportError(
+                _safe_route_exception_text(exc, route=route),
+                kind=FailureKind.CONFIG,
+                url=items[0].url,
+                route=route,
+                retryable=False,
+            ) from exc
         except FlareSolverrCFChallengeFailed as exc:
             record_error(FailureKind.CLOUDFLARE, exc)
-            raise CloudflareChallenge(str(exc), url=items[0].url, route=route) from exc
+            raise CloudflareChallenge(
+                _safe_route_exception_text(exc, route=route),
+                url=items[0].url,
+                route=route,
+                source_wide=route is TransportRoute.DIRECT_FLARESOLVERR,
+            ) from exc
         except FlareSolverrResponseTooLarge as exc:
             record_error(FailureKind.BUDGET, exc)
             raise TransportBudgetExceeded(
-                str(exc), url=items[0].url, route=route
+                _safe_route_exception_text(exc, route=route),
+                url=items[0].url,
+                route=route,
             ) from exc
         except FlareSolverrTimeout as exc:
             record_error(FailureKind.TIMEOUT, exc)
             raise WhoScoredTransportError(
-                str(exc),
+                _safe_route_exception_text(exc, route=route),
                 kind=FailureKind.TIMEOUT,
                 url=items[0].url,
                 route=route,
@@ -1738,7 +3578,7 @@ class WhoScoredTransport:
         except FlareSolverrError as exc:
             record_error(FailureKind.BROWSER, exc)
             raise WhoScoredTransportError(
-                str(exc),
+                _safe_route_exception_text(exc, route=route),
                 kind=FailureKind.BROWSER,
                 url=items[0].url,
                 route=route,
@@ -1808,21 +3648,38 @@ class WhoScoredTransport:
             if len(solutions) != len(items):
                 raise FlareSolverrError("FlareSolverr XHR batch is incomplete")
             session.requests += len(items)
+        except FlareSolverrRuntimeIdentityError as exc:
+            self._drop_browser_session(client, route)
+            record_error(FailureKind.CONFIG, exc)
+            raise WhoScoredTransportError(
+                _safe_route_exception_text(exc, route=route),
+                kind=FailureKind.CONFIG,
+                url=items[0].url,
+                route=route,
+                retryable=False,
+            ) from exc
         except FlareSolverrCFChallengeFailed as exc:
             self._drop_browser_session(client, route)
             record_error(FailureKind.CLOUDFLARE, exc)
-            raise CloudflareChallenge(str(exc), url=items[0].url, route=route) from exc
+            raise CloudflareChallenge(
+                _safe_route_exception_text(exc, route=route),
+                url=items[0].url,
+                route=route,
+                source_wide=route is TransportRoute.DIRECT_FLARESOLVERR,
+            ) from exc
         except FlareSolverrResponseTooLarge as exc:
             self._drop_browser_session(client, route)
             record_error(FailureKind.BUDGET, exc)
             raise TransportBudgetExceeded(
-                str(exc), url=items[0].url, route=route
+                _safe_route_exception_text(exc, route=route),
+                url=items[0].url,
+                route=route,
             ) from exc
         except FlareSolverrTimeout as exc:
             self._drop_browser_session(client, route)
             record_error(FailureKind.TIMEOUT, exc)
             raise WhoScoredTransportError(
-                str(exc),
+                _safe_route_exception_text(exc, route=route),
                 kind=FailureKind.TIMEOUT,
                 url=items[0].url,
                 route=route,
@@ -1832,7 +3689,7 @@ class WhoScoredTransport:
             self._drop_browser_session(client, route)
             record_error(FailureKind.BROWSER, exc)
             raise WhoScoredTransportError(
-                str(exc),
+                _safe_route_exception_text(exc, route=route),
                 kind=FailureKind.BROWSER,
                 url=items[0].url,
                 route=route,
@@ -1842,7 +3699,7 @@ class WhoScoredTransport:
             self._drop_browser_session(client, route)
             record_error(FailureKind.BROWSER, exc)
             raise WhoScoredTransportError(
-                str(exc),
+                _safe_route_exception_text(exc, route=route),
                 kind=FailureKind.BROWSER,
                 url=items[0].url,
                 route=route,
@@ -1983,142 +3840,134 @@ class WhoScoredTransport:
                 url=url,
                 route=TransportRoute.PAID_HTTP,
             )
-        assert self._proxy_client is not None
-        try:
-            lease = self._proxy_client.create_lease(
-                max_bytes=lease_budget,
-                ttl_seconds=budgets.lease_ttl_seconds,
-                context=self._active_context,
-                canonical_url=_canonical_url_key(url),
-            )
-        except ProxyBudgetRejected as exc:
-            raise TransportBudgetExceeded(
-                str(exc), url=url, route=TransportRoute.PAID_HTTP
-            ) from exc
-        except Exception as exc:
+        gateway = self._paid_gateway
+        if gateway is None:
             raise WhoScoredTransportError(
-                f"filtering proxy lease creation failed: {exc}",
+                "paid application gateway is unavailable",
+                kind=FailureKind.CONFIG,
+                url=url,
+                route=TransportRoute.PAID_LEASE,
+                retryable=False,
+            )
+        try:
+            paid = gateway.fetch(
+                url,
+                context=self._active_context,
+                max_response_bytes=budgets.max_response_bytes,
+                max_provider_bytes=lease_budget,
+                timeout_ms=min(60_000, max(1, int(self.browser_timeout_ms))),
+                browser_bootstrap_url=browser_bootstrap_url,
+            )
+        except PaidGatewayRejected as exc:
+            if exc.receipt is not None:
+                self.stats.paid_urls.add(logical_url)
+                self._record_paid_gateway_receipt(logical_url, exc.receipt)
+                if (
+                    self.stats.paid_proxy_bytes > budgets.max_paid_bytes_per_task
+                    or self.stats.paid_proxy_bytes_by_url.get(logical_url, 0)
+                    > budgets.max_paid_bytes_per_url
+                ):
+                    raise TransportBudgetExceeded(
+                        "paid gateway receipt exceeded a local byte ceiling",
+                        url=url,
+                        route=exc.receipt.route,
+                    ) from None
+            if exc.code == "budget_rejected":
+                raise TransportBudgetExceeded(
+                    str(exc),
+                    url=url,
+                    route=(
+                        exc.receipt.route
+                        if exc.receipt is not None
+                        else TransportRoute.PAID_HTTP
+                    ),
+                ) from None
+            raise WhoScoredTransportError(
+                f"paid application gateway rejected fetch: {exc.code}",
                 kind=FailureKind.PROXY,
                 url=url,
-                route=TransportRoute.PAID_HTTP,
+                route=(
+                    exc.receipt.route
+                    if exc.receipt is not None
+                    else TransportRoute.PAID_LEASE
+                ),
+                retryable=exc.code not in {"authority_rejected", "target_not_allowed"},
+            ) from None
+        except (PaidGatewayError, PaidGatewayProtocolError) as exc:
+            raise WhoScoredTransportError(
+                "paid application gateway fetch failed: "
+                f"{type(exc).__name__}",
+                kind=FailureKind.PROXY,
+                url=url,
+                route=TransportRoute.PAID_LEASE,
                 retryable=True,
-            ) from exc
-
+            ) from None
         self.stats.paid_urls.add(logical_url)
-        paid_http: Any = None
-        result: Optional[TransportResponse] = None
-        pending_error: Optional[BaseException] = None
-        paid_routes_attempted: list[TransportRoute] = []
-        try:
-            try:
-                try:
-                    paid_http = self._new_http_session(lease.proxy_url)
-                except Exception as exc:
-                    raise WhoScoredTransportError(
-                        f"paid HTTP session creation failed: {type(exc).__name__}",
-                        kind=FailureKind.PROXY,
-                        url=url,
-                        route=TransportRoute.PAID_HTTP,
-                        retryable=True,
-                    ) from exc
-                paid_routes_attempted.append(TransportRoute.PAID_HTTP)
-                result = self._http_fetch(
-                    url,
-                    session=paid_http,
-                    route=TransportRoute.PAID_HTTP,
-                    referer=browser_bootstrap_url,
-                )
-                self._validate(result, validator)
-            except CloudflareChallenge:
-                self.stats.failures[FailureKind.CLOUDFLARE.value] += 1
-                if self._paid_browser_bootstraps >= budgets.max_paid_browser_bootstraps:
-                    raise TransportBudgetExceeded(
-                        "paid browser bootstrap budget exhausted",
-                        url=url,
-                        route=TransportRoute.PAID_FLARESOLVERR,
-                    )
-                self._paid_browser_bootstraps += 1
-                paid_routes_attempted.append(TransportRoute.PAID_FLARESOLVERR)
-                result = self._browser_fetch(
-                    url,
-                    client=self._paid_fs,
-                    route=TransportRoute.PAID_FLARESOLVERR,
-                    proxy_url=lease.proxy_url,
-                    bootstrap_url=browser_bootstrap_url,
-                )
-                self._validate(result, validator)
-        except Exception as exc:  # retain while lease stats are finalized
-            pending_error = exc
-        finally:
-            close = getattr(paid_http, "close", None) if paid_http is not None else None
-            if callable(close):
-                try:
-                    close()
-                except Exception as exc:
-                    if pending_error is None:
-                        pending_error = WhoScoredTransportError(
-                            f"could not close paid HTTP session: {type(exc).__name__}",
-                            kind=FailureKind.PROXY,
-                            url=url,
-                            route=TransportRoute.PAID_HTTP,
-                            retryable=True,
-                        )
-            self._drop_browser_session(self._paid_fs, TransportRoute.PAID_FLARESOLVERR)
-            try:
-                lease_stats = self._proxy_client.close(lease)
-                self._record_paid_lease(
-                    logical_url,
-                    lease_stats,
-                    expected_lease_id=lease.lease_id,
-                    routes_attempted=paid_routes_attempted,
-                    final_route=result.route if result is not None else None,
-                )
-            except Exception as exc:
-                prior = pending_error
-                detail = f"could not finalize filtering proxy lease: {exc}"
-                if prior is not None:
-                    detail += f"; prior source error: {type(prior).__name__}: {prior}"
-                accounting_error = WhoScoredTransportError(
-                    detail,
-                    kind=FailureKind.PROXY,
-                    url=url,
-                    route=TransportRoute.PAID_LEASE,
-                    retryable=True,
-                )
-                if prior is not None:
-                    accounting_error.__cause__ = prior
-                # Exact paid accounting is a fail-closed invariant and takes
-                # precedence over a source/parser error from the same lease.
-                pending_error = accounting_error
+        receipt = paid.receipt
+        self._record_paid_gateway_receipt(logical_url, receipt)
+        result = self._response(
+            url=url,
+            content=paid.content,
+            status_code=paid.status_code,
+            headers=paid.headers,
+            route=paid.route,
+            wire_bytes=len(paid.content),
+            request_bytes=receipt.up_bytes,
+            response_bytes=len(paid.content),
+            resource_bytes=receipt.total_bytes,
+        )
+        self._record_response(result)
+        self._validate(result, validator)
         if self.stats.paid_proxy_bytes > budgets.max_paid_bytes_per_task:
-            pending_error = TransportBudgetExceeded(
+            raise TransportBudgetExceeded(
                 "paid task byte budget exceeded",
                 url=url,
-                route=result.route if result else TransportRoute.PAID_HTTP,
+                route=result.route,
             )
         if (
             self.stats.paid_proxy_bytes_by_url.get(logical_url, 0)
             > budgets.max_paid_bytes_per_url
         ):
-            pending_error = TransportBudgetExceeded(
+            raise TransportBudgetExceeded(
                 "paid per-URL byte budget exceeded",
                 url=url,
-                route=result.route if result else TransportRoute.PAID_HTTP,
+                route=result.route,
             )
-        if pending_error is not None:
-            if result is not None:
-                try:
-                    # A valid source document remains worth persisting when
-                    # lease finalisation or an aggregate byte ceiling fails.
-                    # The retry can then finish without another paid request.
-                    self._validate(result, validator=None, record=False)
-                except WhoScoredTransportError:
-                    pass
-                else:
-                    self._store_response(cache_key, result)
-            raise pending_error
-        assert result is not None
         return result
+
+    def _record_paid_gateway_receipt(
+        self,
+        url: str,
+        receipt: PaidGatewayReceipt,
+    ) -> None:
+        """Account only a credential-free receipt from a fully cleaned fetch."""
+
+        if not receipt.close_complete or not receipt.cleanup_complete:
+            raise PaidGatewayProtocolError(
+                "paid gateway cleanup receipt is incomplete"
+            )
+        self.stats.paid_proxy_up_bytes += receipt.up_bytes
+        self.stats.paid_proxy_down_bytes += receipt.down_bytes
+        self.stats.paid_proxy_bytes_by_url[url] = (
+            self.stats.paid_proxy_bytes_by_url.get(url, 0) + receipt.total_bytes
+        )
+        if receipt.route is TransportRoute.PAID_FLARESOLVERR:
+            self._paid_browser_bootstraps += 1
+        self._record_ledger(
+            url=url,
+            route=TransportRoute.PAID_LEASE,
+            status="accounted",
+            request_bytes=receipt.up_bytes,
+            response_bytes=receipt.down_bytes,
+            resource_bytes=receipt.total_bytes,
+            paid_proxy_bytes=receipt.provider_billed_bytes,
+            extra={
+                "lease_id_hash": receipt.lease_id_hash,
+                "paid_routes_attempted": [receipt.route.value],
+                "final_paid_route": receipt.route.value,
+                "gateway_cleanup_complete": True,
+            },
+        )
 
     def _record_paid_lease(
         self,
@@ -2150,13 +3999,22 @@ class WhoScoredTransport:
             raise ValueError(
                 "filtering proxy lease canonical_url does not match the request"
             )
+        if stats.get("close_complete") is not True:
+            raise ValueError(
+                "filtering proxy lease did not durably complete close accounting"
+            )
 
         up = exact_nonnegative_integer("up_bytes")
         down = exact_nonnegative_integer("down_bytes")
         total = exact_nonnegative_integer("total_bytes")
+        provider_billed = exact_nonnegative_integer("provider_billed_bytes")
         if total != up + down:
             raise ValueError(
                 "filtering proxy lease total_bytes does not equal up_bytes + down_bytes"
+            )
+        if provider_billed != total:
+            raise ValueError(
+                "filtering proxy provider_billed_bytes does not equal total_bytes"
             )
         self.stats.paid_proxy_up_bytes += up
         self.stats.paid_proxy_down_bytes += down
@@ -2209,6 +4067,11 @@ class WhoScoredTransport:
                 else max(0, int(wire_bytes))
             ),
             resource_bytes=max(0, int(resource_bytes)),
+            # Bind raw ordering before parser and S3 commit work.  Supported
+            # production uses one LocalExecutor host and a per-target lock;
+            # this timestamp also prevents a slow commit from being mistaken
+            # for a newer source observation.
+            observed_at=datetime.now(timezone.utc).isoformat(),
         )
 
     def _record_response(self, response: TransportResponse) -> None:
@@ -2268,23 +4131,50 @@ class WhoScoredTransport:
             and response.status_code in (403, 429, 503)
             and _has_cloudflare_challenge_markup(response.content)
         )
-        if (
-            browser_challenge
-            or is_cloudflare_response(
-                response.status_code, response.headers, response.content
+        structured_access_gate = is_whoscored_structured_feed_access_gate(
+            response.url,
+            response.status_code,
+            response.content,
+            response.headers,
+        )
+        if structured_access_gate and not browser_challenge:
+            if response.route in {
+                TransportRoute.DIRECT_HTTP,
+                TransportRoute.PAID_HTTP,
+            }:
+                # This stable origin mask is only route-selection evidence:
+                # the same feed may succeed inside its official stage page.
+                # On PAID_HTTP the lease was already authorised by independent
+                # direct-browser CF evidence plus a fresh direct recheck; this
+                # exception only advances that same lease to paid browser XHR.
+                raise CloudflareChallenge(
+                    "WhoScored structured-feed HTTP access gate",
+                    url=response.url,
+                    route=response.route,
+                    status_code=response.status_code,
+                    source_wide=False,
+                )
+            # Seeing the mask in a browser is not a Cloudflare challenge and
+            # must never count toward paid-route authority or shared cooldown.
+            raise WhoScoredTransportError(
+                "WhoScored structured-feed access gate rendered in browser",
+                kind=FailureKind.CONTENT,
+                url=response.url,
+                route=response.route,
+                status_code=response.status_code,
             )
-            or is_whoscored_structured_feed_access_gate(
-                response.url,
-                response.status_code,
-                response.content,
-                response.headers,
-            )
+        if browser_challenge or is_cloudflare_response(
+            response.status_code, response.headers, response.content
         ):
             raise CloudflareChallenge(
                 "Cloudflare challenge response",
                 url=response.url,
                 route=response.route,
                 status_code=response.status_code,
+                source_wide=bool(
+                    response.route is TransportRoute.DIRECT_FLARESOLVERR
+                    and browser_challenge
+                ),
             )
         if not 200 <= response.status_code < 300:
             raise WhoScoredTransportError(
@@ -2310,7 +4200,8 @@ class WhoScoredTransport:
             raise
         except Exception as exc:
             raise WhoScoredTransportError(
-                f"content validator failed: {exc}",
+                "content validator failed: "
+                f"{_safe_route_exception_text(exc, route=response.route)}",
                 kind=FailureKind.CONTENT,
                 url=response.url,
                 route=response.route,
@@ -2391,7 +4282,8 @@ class WhoScoredTransport:
             # Missing telemetry means paid limits cannot be audited. Fail the
             # request instead of silently serving unaccounted production data.
             raise WhoScoredTransportError(
-                f"request ledger append failed: {exc}",
+                "request ledger append failed: "
+                f"{_safe_route_exception_text(exc, route=route)}",
                 kind=FailureKind.CONFIG,
                 url=url,
                 route=route,
@@ -2402,8 +4294,18 @@ class WhoScoredTransport:
         return self.stats.as_dict()
 
     def close(self) -> None:
+        if self._source_circuit is not None and self._source_circuit_permit is not None:
+            permit = self._source_circuit_permit
+            self._source_circuit_permit = None
+            try:
+                self._source_circuit.abandon(permit)
+            except SourceCircuitError:
+                logger.error("WhoScored source circuit probe cleanup failed")
         self._drop_browser_session(self._direct_fs, TransportRoute.DIRECT_FLARESOLVERR)
-        self._drop_browser_session(self._paid_fs, TransportRoute.PAID_FLARESOLVERR)
+        if self._paid_fs is not None:
+            self._drop_browser_session(
+                self._paid_fs, TransportRoute.PAID_FLARESOLVERR
+            )
         self._direct_gate_circuits.clear()
         resources = [self._direct_http, self._direct_fs, self._paid_fs]
         seen: set[int] = set()
@@ -2414,6 +4316,9 @@ class WhoScoredTransport:
             close = getattr(resource, "close", None)
             if callable(close):
                 close()
+        gateway_close = getattr(self._paid_gateway, "close", None)
+        if callable(gateway_close):
+            gateway_close()
         proxy_close = getattr(self._proxy_client, "close_session", None)
         if callable(proxy_close):
             proxy_close()
@@ -2494,9 +4399,15 @@ __all__ = [
     "CloudflareChallenge",
     "FailureKind",
     "JsonlRequestLedger",
+    "PaidCampaignContext",
+    "PaidGatewayClient",
+    "PaidGatewayError",
+    "PaidGatewayProtocolError",
+    "PaidGatewayRejected",
     "ProxyFilterClient",
     "ProxyBudgetRejected",
     "ProxyConcurrencyLimited",
+    "ProxyCampaignControlRejected",
     "ProxyLease",
     "RawCacheHook",
     "RequestLedger",

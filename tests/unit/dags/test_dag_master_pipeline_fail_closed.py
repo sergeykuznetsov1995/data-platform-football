@@ -35,12 +35,15 @@ def _dag_run(**states: str):
     )
 
 
-def test_whoscored_child_failure_is_not_an_allowed_success_state():
+def test_whoscored_scheduled_failure_is_not_an_allowed_success_state():
     _reload_master()
-    whoscored = _task("ingestion_triggers.trigger_whoscored")
+    whoscored = _task("wait_for_scheduled_whoscored")
 
     assert whoscored._init_kwargs["allowed_states"] == ["success"]
     assert whoscored._init_kwargs["failed_states"] == ["failed"]
+    assert whoscored._init_kwargs["execution_delta"].total_seconds() == 4 * 3600
+    assert whoscored._init_kwargs["mode"] == "reschedule"
+    assert whoscored._init_kwargs["check_existence"] is True
 
 
 def test_fotmob_child_failure_is_not_an_allowed_success_state():
@@ -84,11 +87,12 @@ def test_required_source_gate_waits_for_all_ingestion_and_blocks_transforms():
         "ingestion_triggers.trigger_fotmob",
         "ingestion_triggers.trigger_matchhistory",
         "ingestion_triggers.trigger_understat",
-        "ingestion_triggers.trigger_whoscored",
         "ingestion_triggers.trigger_espn",
         "ingestion_triggers.trigger_clubelo",
     }
     assert expected_ingestion <= gate.upstream_task_ids
+    assert "wait_for_scheduled_whoscored" in gate.upstream_task_ids
+    assert "ingestion_triggers.trigger_whoscored" not in gate.upstream_task_ids
     assert "ingestion_triggers.trigger_fbref" not in gate.upstream_task_ids
     assert (
         "ingestion_triggers.trigger_sofascore" not in gate.upstream_task_ids
@@ -282,7 +286,7 @@ def test_required_source_gate_rejects_every_non_success_state(state):
     run = _dag_run(
         **{
             "ingestion_triggers.trigger_fotmob": "success",
-            "ingestion_triggers.trigger_whoscored": state,
+            "wait_for_scheduled_whoscored": state,
         }
     )
     with pytest.raises(AirflowException, match="downstream transforms are blocked"):
@@ -302,7 +306,7 @@ def test_required_source_gate_accepts_exact_current_master_success():
     run = _dag_run(
         **{
             "ingestion_triggers.trigger_fotmob": "success",
-            "ingestion_triggers.trigger_whoscored": "success",
+            "wait_for_scheduled_whoscored": "success",
         }
     )
 
@@ -423,7 +427,7 @@ def test_terminal_check_reuses_required_source_gate():
     run = _dag_run(
         **{
             "ingestion_triggers.trigger_fotmob": "success",
-            "ingestion_triggers.trigger_whoscored": "failed",
+            "wait_for_scheduled_whoscored": "failed",
         }
     )
     with pytest.raises(AirflowException, match="downstream transforms are blocked"):
@@ -437,7 +441,7 @@ def test_terminal_check_rejects_failed_downstream_publication():
     run = _dag_run(
         **{
             "ingestion_triggers.trigger_fotmob": "success",
-            "ingestion_triggers.trigger_whoscored": "success",
+            "wait_for_scheduled_whoscored": "success",
             "wait_for_scheduled_fbref": "success",
             "trigger_xref_transforms": "success",
             "trigger_e3_transforms": "failed",

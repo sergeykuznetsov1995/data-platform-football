@@ -30,6 +30,7 @@ import base64
 import ipaddress
 import logging
 import os
+from tempfile import TemporaryDirectory
 import threading
 import time
 from collections import Counter
@@ -39,7 +40,10 @@ from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 
 from scrapers.fbref.browser_runtime import (
     CAMOUFOX_FIREFOX_MAJOR,
+    CAMOUFOX_TARGET_OS,
     EXECUTABLE_PATH,
+    FONTCONFIG_FILE,
+    FONTCONFIG_PATH,
 )
 from scrapers.fbref.constants import FBREF_UNCOMMENT_TABLES_JS
 
@@ -405,6 +409,7 @@ class CamoufoxFbrefTransport:
         self._context = None
         self._page = None
         self._proxy = None
+        self._browser_runtime_home: Optional[TemporaryDirectory] = None
 
         # rx+tx byte accounting (#842 pattern) — survives restarts.
         self._bytes_total = 0
@@ -512,6 +517,45 @@ class CamoufoxFbrefTransport:
             logger.debug("proxy result callback failed", exc_info=True)
 
     # -- lifecycle -------------------------------------------------------- #
+    def _new_browser_environment(self) -> Dict[str, str]:
+        """Give Firefox a private writable home without weakening the image.
+
+        The scheduler image deliberately seals ``/home/airflow`` read-only.
+        Firefox 152 otherwise waits for Playwright's full launch timeout while
+        fontconfig and desktop helpers try to create caches there. Keep the
+        parent process immutable and give only this browser session a private
+        mode-0700 directory under ``/tmp``.
+        """
+
+        if self._browser_runtime_home is not None:
+            raise RuntimeError("Camoufox browser runtime home is already active")
+        runtime_home = TemporaryDirectory(
+            prefix="fbref-camoufox-home-",
+            dir="/tmp",
+        )
+        cache_home = os.path.join(runtime_home.name, ".cache")
+        try:
+            os.mkdir(cache_home, mode=0o700)
+        except BaseException:
+            runtime_home.cleanup()
+            raise
+        self._browser_runtime_home = runtime_home
+        # Keep the direct child environment narrow as launch hygiene. This is
+        # not process isolation: Firefox, Playwright, and the task share the
+        # scheduler UID/PID namespace, which remains the trusted boundary.
+        return {
+            "FONTCONFIG_FILE": FONTCONFIG_FILE.name,
+            "FONTCONFIG_PATH": str(FONTCONFIG_PATH),
+            "HOME": runtime_home.name,
+            "XDG_CACHE_HOME": cache_home,
+        }
+
+    def _cleanup_browser_environment(self) -> None:
+        runtime_home = self._browser_runtime_home
+        self._browser_runtime_home = None
+        if runtime_home is not None:
+            runtime_home.cleanup()
+
     def _proxy_authorization_header(self) -> Optional[str]:
         """Build the lease proxy header without exposing it to logs."""
 
@@ -675,55 +719,74 @@ class CamoufoxFbrefTransport:
             # The Python package otherwise reads SofaScore's separate v135
             # version document while generating FBref's browser fingerprint.
             kwargs["ff_version"] = CAMOUFOX_FIREFOX_MAJOR
+            # Keep the spoofed browser OS and its bundled font set together.
+            # A random OS fingerprint with another OS's fonts is detectable.
+            kwargs["os"] = CAMOUFOX_TARGET_OS
             # This is not version rotation: the executable and readiness
             # document above are both hard-pinned to that exact major.
             kwargs["i_know_what_im_doing"] = True
-            self._cm = Camoufox(**kwargs)
-            self._browser = self._cm.__enter__()
-            # Service workers bypass ordinary Playwright routing, so disable
-            # them at the context boundary. Do not use ``bypass_csp`` or inject
-            # main-world constructor shims: FBref's current managed challenge
-            # refuses to initialize when its CSP is disabled or native browser
-            # constructors are replaced. Dedicated-worker fetches still pass
-            # through ``context.route``; WebSocket handshakes are rejected by
-            # ``route_web_socket`` below; WebRTC/preconnect/direct failover are
-            # disabled by the Firefox preferences above.
-            context_options = {
-                "service_workers": "block",
-            }
-            if proxy_authorization is not None:
-                # Firefox otherwise waits for a 407 and retries below
-                # context.route(). Proxy-Authorization is hop-by-hop: the
-                # lease filter consumes it on CONNECT and strips it from HTTP
-                # forwarding, so the FBref origin never receives the token.
-                context_options["extra_http_headers"] = {
-                    "Proxy-Authorization": proxy_authorization,
+            kwargs["env"] = self._new_browser_environment()
+            try:
+                self._cm = Camoufox(**kwargs)
+                self._browser = self._cm.__enter__()
+                # Service workers bypass ordinary Playwright routing, so
+                # disable them at the context boundary. Do not use
+                # ``bypass_csp`` or inject main-world constructor shims:
+                # FBref's current managed challenge refuses to initialize
+                # when its CSP is disabled or native browser constructors are
+                # replaced. Dedicated-worker fetches still pass through
+                # ``context.route``; WebSocket handshakes are rejected by
+                # ``route_web_socket`` below; WebRTC/preconnect/direct
+                # failover are disabled by the Firefox preferences above.
+                context_options = {
+                    "service_workers": "block",
                 }
-            self._context = self._browser.new_context(
-                **context_options,
-            )
-            if (
-                self._block_resources
-                or self._max_network_requests is not None
-                or self._max_network_bytes is not None
-            ):
-                # Context routing covers every page in the browser context.
-                # Native redirects are disabled above, so every allowed HTTP
-                # request must pass admission before transport.
-                self._context.route("**/*", self._maybe_block)
-            # A WebSocket is not part of FBref's static clearance contract.
-            # Reject it explicitly and latch the session before any target
-            # HTTP fetch can begin.
-            self._context.route_web_socket(
-                "**/*",
-                self._on_unexpected_websocket,
-            )
-            # Context events account popups and every other page in this
-            # context; page-only callbacks leave their traffic unobserved.
-            self._context.on("response", self._on_response)
-            self._context.on("requestfinished", self._on_request_finished)
-            self._context.on("requestfailed", self._on_request_failed)
-            self._page = self._context.new_page()
+                if proxy_authorization is not None:
+                    # Firefox otherwise waits for a 407 and retries below
+                    # context.route(). Proxy-Authorization is hop-by-hop: the
+                    # lease filter consumes it on CONNECT and strips it from
+                    # HTTP forwarding, so the FBref origin never receives the
+                    # token.
+                    context_options["extra_http_headers"] = {
+                        "Proxy-Authorization": proxy_authorization,
+                    }
+                self._context = self._browser.new_context(
+                    **context_options,
+                )
+                if (
+                    self._block_resources
+                    or self._max_network_requests is not None
+                    or self._max_network_bytes is not None
+                ):
+                    # Context routing covers every page in the browser
+                    # context. Native redirects are disabled above, so every
+                    # allowed HTTP request must pass admission before
+                    # transport.
+                    self._context.route("**/*", self._maybe_block)
+                # A WebSocket is not part of FBref's static clearance
+                # contract. Reject it explicitly and latch the session before
+                # any target HTTP fetch can begin.
+                self._context.route_web_socket(
+                    "**/*",
+                    self._on_unexpected_websocket,
+                )
+                # Context events account popups and every other page in this
+                # context; page-only callbacks leave their traffic
+                # unobserved.
+                self._context.on("response", self._on_response)
+                self._context.on(
+                    "requestfinished",
+                    self._on_request_finished,
+                )
+                self._context.on("requestfailed", self._on_request_failed)
+                self._page = self._context.new_page()
+            except BaseException:
+                # ``__enter__`` is not followed by ``__exit__`` when it
+                # raises. Roll back every partially-created browser object and
+                # its private HOME here, including failures after the browser
+                # itself started but before the first page became usable.
+                self._stop()
+                raise
         self._pages_this_session = 0
         server = (self._proxy or {}).get("server", "direct")
         logger.info("Camoufox session started (proxy=%s, humanize=%s)",
@@ -809,6 +872,7 @@ class CamoufoxFbrefTransport:
         # remainder before allowing a restart to reuse capacity.
         self._clear_inflight_tracking(charge_unobserved=True)
         self._cm = self._browser = self._context = self._page = None
+        self._cleanup_browser_environment()
         self._clear_request_callback_tracking()
         # A retry may finish the physical cleanup, but the original failed
         # boundary must still reach FBrefFetcher. It is what prevents lease
