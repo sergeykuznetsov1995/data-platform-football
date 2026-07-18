@@ -314,6 +314,29 @@ class TestIcebergWriterWriteToIceberg:
             mock_trino.create_iceberg_table.assert_not_called()
             mock_trino.insert_dataframe_atomic.assert_called_once()
 
+    def test_write_to_iceberg_bulk_arrow_bypasses_values_inserts(self):
+        """Large append-only frames use one Parquet/Iceberg commit."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.iceberg_writer import IcebergWriter
+            writer = IcebergWriter()
+
+            mock_trino = MagicMock()
+            mock_trino.table_exists.return_value = True
+            writer._trino_manager = mock_trino
+            writer._append_dataframe_pyiceberg = MagicMock(return_value=3)
+
+            result = writer._write_to_iceberg(
+                pd.DataFrame({'col1': [1, 2, 3]}),
+                'bronze',
+                'test_table',
+                None,
+                bulk_arrow=True,
+            )
+
+            writer._append_dataframe_pyiceberg.assert_called_once()
+            mock_trino.insert_dataframe_atomic.assert_not_called()
+            assert result == 'iceberg.bronze.test_table'
+
     def test_write_to_iceberg_overwrite_mode(self):
         """Full overwrite is staged and never performs an eager delete."""
         with patch.dict(
@@ -536,6 +559,35 @@ class TestIcebergWriterArrowConversion:
 
             assert arrow_table.num_rows == 3
             assert len(arrow_table.schema) == 3
+
+    def test_pandas_to_arrow_writes_mixed_type_column_as_text(self):
+        """A number-or-word column is text, not a failed write (#930).
+
+        FotMob answers roundName with 12 in a league and "Round of 16" in a cup.
+        Arrow cannot type that column, and the schema is re-inferred on every
+        write — so one cup match used to break an entire season's write.
+        """
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.iceberg_writer import IcebergWriter
+            writer = IcebergWriter()
+
+            df = pd.DataFrame({
+                'round_name': [12, 'Round of 16', None],
+                'goals': [1, 2, 3],
+            })
+
+            arrow_table = writer._pandas_to_arrow(df)
+
+            assert arrow_table.num_rows == 3
+            round_name_type = arrow_table.schema.field('round_name').type
+            assert pa.types.is_string(round_name_type) or pa.types.is_large_string(
+                round_name_type
+            )
+            assert arrow_table.column('round_name').to_pylist() == [
+                '12', 'Round of 16', None
+            ]
+            # Untouched columns keep their inferred type.
+            assert pa.types.is_integer(arrow_table.schema.field('goals').type)
 
     def test_pandas_to_arrow_handles_timestamps(self):
         """Test pandas to arrow conversion handles timestamps."""
