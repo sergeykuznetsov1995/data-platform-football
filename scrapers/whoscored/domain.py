@@ -60,6 +60,8 @@ class TournamentEligibility(str, Enum):
     INCLUDED = "included"
     EXCLUDED_WOMEN = "excluded_women"
     EXCLUDED_YOUTH = "excluded_youth"
+    EXCLUDED_RESERVE = "excluded_reserve"
+    EXCLUDED_TECHNICAL = "excluded_technical"
     SOURCE_UNAVAILABLE = "source_unavailable"
     QUARANTINED = "quarantined"
 

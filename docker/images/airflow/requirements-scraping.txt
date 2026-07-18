@@ -1,85 +1,19 @@
-# =============================================================================
-# Web Scraping Dependencies (installed separately to avoid pip backtracking)
-# =============================================================================
-#
-# ⚠️  PINNING POLICY (#758)
-# Все версии ниже ЗАПИННЕНЫ (==). curl_cffi/DrissionPage/camoufox — ядро
-# CF-байпаса; молчаливый bump при `make up-build` уже ломал нас (см.
-# historical browser parser-regression notes).
-# BUMP ТОЛЬКО ОСОЗНАННО: после изменения версии — ОБЯЗАТЕЛЬНО live-прогон
-# FBref + WhoScored в контейнере (CF-байпас) до мержа. Хост держать в синхроне.
-# =============================================================================
-
-# -----------------------------------------------------------------------------
-# [rich] Rich library upgrade (required by soccerdata>=1.8.8)
-# Base Airflow image has rich 13.x, but soccerdata requires >=14.0.0
-# Must be installed FIRST to upgrade rich before soccerdata installation
-# -----------------------------------------------------------------------------
-rich==14.3.4
-
-# -----------------------------------------------------------------------------
-# [soccerdata] Football data scraping library
-# Brings seleniumbase as dependency
-#
-# Pinned to 1.8.8 (issue #67): 1.9.0 migrated FBref to BaseSeleniumReader,
-# которая в нашем airflow image не пробивает CF на fbref.com (требует
-# python3-tk для uc_gui_click_captcha + ломается с residential proxies
-# через host_resolver_rules). Decision: HOLD до появления overridable
-# _validate_page timeout / passive Turnstile bypass в seleniumbase.
-# Research-doc: docs/research/issue_67_soccerdata_19_fbref_migration.md
-# -----------------------------------------------------------------------------
-soccerdata==1.8.8
-
-# -----------------------------------------------------------------------------
-# [selenium] Selenium tools (for Cloudflare bypass)
-# selenium приходит транзитивно через seleniumbase (soccerdata>=1.8.8 → seleniumbase),
-# но seleniumbase сам не запиннен → selenium может "уплыть". Пиним обе строки явно,
-# чтобы полностью зафиксировать ветку. seleniumbase==4.38.3 сам требует selenium==4.32.0.
-# -----------------------------------------------------------------------------
-selenium==4.32.0
-seleniumbase==4.38.3
-undetected-chromedriver==3.5.5
-cloudscraper==1.2.71
-
-# -----------------------------------------------------------------------------
-# [curl_cffi] Chrome TLS fingerprint impersonation (patches soccerdata)
-# Used for bypassing Cloudflare by impersonating real browser TLS fingerprint
-# -----------------------------------------------------------------------------
-curl_cffi==0.15.0
-# Direct SofaScore discovery only: exact Chrome-133 TLS/HTTP2 fingerprint,
-# never configured with a proxy and never used by paid capture.
-tls-client-python==1.15.1
-typing-extensions==4.15.0
-
-# Pin markdown-it-py to reduce backtracking with rich>=14
-markdown-it-py==3.0.0
-mdit-py-plugins==0.4.2
-
-# -----------------------------------------------------------------------------
-# [display] Xvfb wrapper for Cloudflare bypass
-# -----------------------------------------------------------------------------
-pyvirtualdisplay==3.0
-
-# -----------------------------------------------------------------------------
-# [proxy] SOCKS proxy support
-# -----------------------------------------------------------------------------
-PySocks==1.7.1
-
-# -----------------------------------------------------------------------------
-# [DrissionPage] CDP-based browser automation WITHOUT WebDriver protocol
-# Key advantage: No WebDriver signature that Cloudflare detects
-# Retained for the bounded SofaScore token research probe.
-# -----------------------------------------------------------------------------
-DrissionPage==4.1.1.4
-
-# -----------------------------------------------------------------------------
-# [camoufox] Anti-detect Firefox for SofaScore Cloudflare-Turnstile bypass (#757)
-# SofaScore's data API is Turnstile-gated; only a real Firefox (Camoufox) through
-# a residential proxy passes it invisibly. Driven via Playwright; we passively
-# capture the SPA's same-origin /api/v1 XHRs (scrapers/sofascore/camoufox_capture.py).
-# playwright MUST stay <1.60 — 1.60 crashes Camoufox on page errors (camoufox#617).
-# The Firefox binary is fetched at image-build time via `python -m camoufox fetch`
-# (see Dockerfile). Runs under Xvfb (headless="virtual"), already provisioned.
-# -----------------------------------------------------------------------------
-camoufox[geoip]==0.4.11
-playwright==1.59.0
+# Browser stack fingerprint lock
+# Generated from the already smoke-tested linux/amd64 Python 3.11 image.
+# Every install uses --require-hashes --only-binary=:all: --no-deps.
+camoufox==0.4.11 --hash=sha256:83864d434d159a7566990aa6524429a8d1a859cbf84d2f64ef4a9f29e7d2e5ff
+cloudscraper==1.2.71 --hash=sha256:76f50ca529ed2279e220837befdec892626f9511708e200d48d5bb76ded679b0
+curl-cffi==0.15.0 --hash=sha256:2b6c847d86283b07ae69bb72c82eb8a59242277142aa35b89850f89e792a02fc
+drissionpage==4.1.1.4 --hash=sha256:d1d066e732031c16b00bdc88a2f450e8400da46362597a23c8c6144e4cbb768d
+markdown-it-py==3.0.0 --hash=sha256:355216845c60bd96232cd8d8c40e8f9765cc86f46880e43a8fd22dc1a1a8cab1
+mdit-py-plugins==0.4.2 --hash=sha256:0c673c3f889399a33b95e88d2f0d111b4447bdfea7f237dab2d488f459835636
+playwright==1.59.0 --hash=sha256:c5792aad9e22b91a09264b9edbc18553cf05ea5a39404d65dc19a012c6b2e51d
+pysocks==1.7.1 --hash=sha256:2725bd0a9925919b9b51739eea5f9e2bae91e83288108a9ad338b2e3a4435ee5
+pyvirtualdisplay==3.0 --hash=sha256:40d4b8dfe4b8de8552e28eb367647f311f88a130bf837fe910e7f180d5477f0e
+rich==14.3.4 --hash=sha256:07e7adb4690f68864777b1450859253bed81a99a31ac321ac1817b2313558952
+selenium==4.32.0 --hash=sha256:c4d9613f8a45693d61530c9660560fadb52db7d730237bc788ddedf442391f97
+seleniumbase==4.38.3 --hash=sha256:5bfa931983c78cf20e5973b3d36ee7f4602bc9ee3f16b38feb0a8f25932def9f
+soccerdata==1.8.8 --hash=sha256:2604ea5ea28034c51f87c1512fe62dda9759f0fcfcb48d4c57fd7927c26ff631
+tls-client-python==1.15.1 --hash=sha256:a5749913b37938f18d8689fedbb455fd55b11ab49661811436c61893866e4fde
+typing-extensions==4.15.0 --hash=sha256:f0fa19c6845758ab08074a0cfa8b7aecb71c999ca73d62883bc25cc018c4e548
+undetected-chromedriver==3.5.5 --hash=sha256:3f3843d0ae6e26ad12df5296293c863595edc4a62f348348ccb698433da44960

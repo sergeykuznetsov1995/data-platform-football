@@ -158,6 +158,7 @@ def _install_airflow_stubs() -> None:
     exceptions_mod.AirflowException = _AirflowException
     exceptions_mod.AirflowFailException = _AirflowFailException
     exceptions_mod.AirflowSkipException = _AirflowSkipException
+    exceptions_mod.AirflowFailException = _AirflowFailException
 
     # ---- airflow.operators.python.PythonOperator (for completeness) -----
     class _PythonOperator:

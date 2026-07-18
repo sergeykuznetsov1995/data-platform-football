@@ -40,13 +40,17 @@ RUNTIME_FILE_ENTRIES = (
     "configs/medallion/competitions.yaml",
     "docker/images/airflow/Dockerfile",
     "docker/images/airflow/requirements-airflow.txt",
+    "docker/images/airflow/requirements-build-tools.txt",
+    "docker/images/airflow/requirements-scheduler.txt",
+    "docker/images/airflow/requirements-scraper-runner.txt",
     "docker/images/airflow/requirements-scraping.txt",
     "docker/images/airflow/requirements.txt",
 )
 _RUNTIME_SOURCE_SUFFIXES = frozenset({".py"})
 _BROWSER_PACKAGES = ("camoufox", "playwright")
 _PIN_RE = re.compile(
-    r"^\s*([A-Za-z0-9_.-]+)(?:\[[^\]]+\])?==([^;\s]+)(?:\s*;.*)?$"
+    r"^\s*([A-Za-z0-9_.-]+)(?:\[[^\]]+\])?==([^;\s]+)"
+    r"(?:\s+--hash=sha256:[0-9a-f]{64})+(?:\s*;.*)?$"
 )
 
 

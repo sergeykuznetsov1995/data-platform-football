@@ -18,8 +18,10 @@ Benefits of Iceberg:
 import logging
 import os
 import uuid
+from collections.abc import Mapping
 from datetime import datetime
 from typing import List, Optional, Sequence, Tuple
+from urllib.parse import urlparse
 
 import pandas as pd
 import pyarrow as pa
@@ -31,6 +33,53 @@ from scrapers.base.sql_validator import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _pyiceberg_s3_properties(values: Mapping[str, str]) -> dict[str, str]:
+    """Build explicit HTTP(S) FileIO properties from the platform S3 env."""
+
+    missing = [
+        name for name in ("S3_ACCESS_KEY", "S3_SECRET_KEY") if not values.get(name)
+    ]
+    if missing:
+        raise RuntimeError(
+            "bulk Iceberg append requires environment variables: " + ", ".join(missing)
+        )
+    endpoint = values.get("S3_ENDPOINT", "seaweedfs:8333").strip()
+    scheme = values.get("S3_SCHEME", "http").strip().lower()
+    if scheme not in {"http", "https"}:
+        raise RuntimeError("S3_SCHEME must be http or https for bulk Iceberg append")
+    if "://" not in endpoint:
+        endpoint = f"{scheme}://{endpoint}"
+    parsed = urlparse(endpoint)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.username
+        or parsed.password
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise RuntimeError(
+            "S3_ENDPOINT must be an HTTP(S) authority without credentials"
+        )
+    return {
+        "s3.endpoint": endpoint.rstrip("/"),
+        "s3.region": values.get("S3_REGION", "us-east-1"),
+        "s3.access-key-id": values["S3_ACCESS_KEY"],
+        "s3.secret-access-key": values["S3_SECRET_KEY"],
+    }
+
+
+class IcebergMetadataCorruptionError(RuntimeError):
+    """Fail-closed signal for an Iceberg table that needs operator recovery.
+
+    A scraper must never turn a metadata-read failure into ``DROP TABLE``.
+    Append-only Bronze tables can contain source history that is impossible or
+    expensive to recapture, so recovery is deliberately kept outside the
+    writer and must start from a verified catalog/object-store backup.
+    """
 
 
 class IcebergWriter:
@@ -57,7 +106,7 @@ class IcebergWriter:
         self,
         trino_host: str = None,
         trino_port: int = None,
-        catalog: str = 'iceberg',
+        catalog: str = "iceberg",
     ):
         """
         Initialize Iceberg writer.
@@ -67,8 +116,10 @@ class IcebergWriter:
             trino_port: Trino coordinator port (default from env or 8443)
             catalog: Iceberg catalog name
         """
-        self.trino_host = trino_host or os.environ.get('TRINO_HOST', 'trino')
-        self.trino_port = trino_port  # None = let TrinoTableManager decide based on auth mode
+        self.trino_host = trino_host or os.environ.get("TRINO_HOST", "trino")
+        self.trino_port = (
+            trino_port  # None = let TrinoTableManager decide based on auth mode
+        )
         self.catalog = catalog
         self._trino_manager = None
 
@@ -103,7 +154,11 @@ class IcebergWriter:
             return trino.table_exists(database, table)
         except Exception as e:
             err_msg = str(e).lower()
-            if 'connection' in err_msg or 'unreachable' in err_msg or 'refused' in err_msg:
+            if (
+                "connection" in err_msg
+                or "unreachable" in err_msg
+                or "refused" in err_msg
+            ):
                 raise
             logger.warning(f"Could not check table existence: {e}")
             return False
@@ -119,24 +174,21 @@ class IcebergWriter:
         for col in df.columns:
             if pd.api.types.is_datetime64_any_dtype(df[col]):
                 # Handle timezone-aware datetimes by converting to UTC and removing timezone
-                if hasattr(df[col], 'dt') and df[col].dt.tz is not None:
-                    df[col] = df[col].dt.tz_convert('UTC').dt.tz_localize(None)
+                if hasattr(df[col], "dt") and df[col].dt.tz is not None:
+                    df[col] = df[col].dt.tz_convert("UTC").dt.tz_localize(None)
                 # Convert to datetime64[us] which Iceberg supports
-                df[col] = df[col].astype('datetime64[us]')
+                df[col] = df[col].astype("datetime64[us]")
 
         return pa.Table.from_pandas(df, preserve_index=False)
 
     def _add_metadata_columns(
-        self,
-        df: pd.DataFrame,
-        source: str,
-        batch_id: Optional[str] = None
+        self, df: pd.DataFrame, source: str, batch_id: Optional[str] = None
     ) -> pd.DataFrame:
         """Add standard metadata columns to DataFrame."""
         df = df.copy()
-        df['_source'] = source
-        df['_ingested_at'] = datetime.utcnow()
-        df['_batch_id'] = batch_id or str(uuid.uuid4())
+        df["_source"] = source
+        df["_ingested_at"] = datetime.utcnow()
+        df["_batch_id"] = batch_id or str(uuid.uuid4())
         return df
 
     def _evolve_schema(self, trino, database: str, table: str, arrow_schema) -> None:
@@ -164,93 +216,27 @@ class IcebergWriter:
                 logger.info(f'Schema evolution: added column "{col_name}" {col_type}')
 
     def _recover_corrupted_table(
-        self, trino, database: str, table: str,
-        columns: dict, partition_cols: list = None,
+        self,
+        trino,
+        database: str,
+        table: str,
+        columns: dict,
+        partition_cols: list = None,
     ) -> None:
+        """Refuse destructive automatic recovery from corrupt metadata.
+
+        The unused arguments remain in the private method signature so older
+        callers receive the safer behaviour without a compatibility break.
         """
-        Recover from ICEBERG_INVALID_METADATA by dropping and recreating the table.
-
-        Bronze tables are idempotent — data is reloaded on every scrape,
-        so dropping the table is safe.
-
-        After DROP TABLE with corrupt metadata, Iceberg may leave orphaned
-        files on HDFS that prevent CREATE TABLE (ICEBERG_COMMIT_ERROR:
-        "Failed to write manifest list file"). We clean the HDFS directory
-        between DROP and CREATE to ensure a clean state.
-
-        Args:
-            trino: TrinoTableManager instance
-            database: Database/schema name
-            table: Table name
-            columns: Dict of column_name -> trino_type for CREATE TABLE
-            partition_cols: Optional list of partition column names
-        """
+        del trino, columns, partition_cols
         full_table = f"{self.catalog}.{database}.{table}"
-        logger.warning(
-            f"ICEBERG_INVALID_METADATA detected for {full_table}. "
-            f"Dropping and recreating table..."
+        message = (
+            f"ICEBERG metadata is invalid for {full_table}; automatic DROP/CREATE "
+            "is disabled. Stop writers and restore the table/catalog from a "
+            "verified backup before retrying."
         )
-        try:
-            trino.drop_table(database, table, if_exists=True)
-        except Exception as drop_err:
-            logger.error(
-                f"Failed to DROP corrupted table {full_table}: {drop_err}. "
-                f"Manual intervention required: connect to Trino and run "
-                f"DROP TABLE IF EXISTS {full_table}"
-            )
-            raise
-
-        # Clean orphaned HDFS files left after DROP TABLE with corrupt metadata
-        self._clean_hdfs_table_dir(database, table)
-
-        trino.create_iceberg_table(
-            schema=database,
-            table=table,
-            columns=columns,
-            partition_columns=partition_cols,
-        )
-        logger.info(f"Recreated table {full_table} after metadata recovery")
-
-    def _clean_hdfs_table_dir(self, database: str, table: str) -> None:
-        """
-        Remove orphaned HDFS directories for a dropped Iceberg table.
-
-        After DROP TABLE with corrupt metadata, Iceberg may leave behind
-        orphaned files on HDFS that prevent CREATE TABLE from succeeding
-        with ICEBERG_COMMIT_ERROR: "Failed to write manifest list file".
-
-        Iceberg creates directories with UUID suffix:
-          /user/hive/warehouse/{schema}.db/{table}-{uuid}
-        We match all directories starting with the table name.
-        """
-        schema_dir = f"/user/hive/warehouse/{database}.db"
-        try:
-            from scrapers.base.hdfs_client import HDFSClient
-            hdfs = HDFSClient()
-            if not hdfs.exists(schema_dir):
-                logger.debug(f"HDFS schema directory does not exist: {schema_dir}")
-                return
-
-            entries = hdfs.list_dir(schema_dir)
-            # Match exact name or name-{uuid} pattern
-            prefix = f"{table}-"
-            orphaned = [
-                e['name'] for e in entries
-                if e['name'] == table or e['name'].startswith(prefix)
-            ]
-
-            for dirname in orphaned:
-                hdfs_path = f"{schema_dir}/{dirname}"
-                hdfs.delete(hdfs_path, recursive=True)
-                logger.info(f"Cleaned orphaned HDFS directory: {hdfs_path}")
-
-            if not orphaned:
-                logger.debug(f"No orphaned HDFS directories for {table}")
-        except Exception as e:
-            logger.warning(
-                f"Could not clean HDFS directories for {table}: {e}. "
-                f"CREATE TABLE may fail if orphaned files remain."
-            )
+        logger.critical(message)
+        raise IcebergMetadataCorruptionError(message)
 
     def write_dataframe(
         self,
@@ -258,11 +244,12 @@ class IcebergWriter:
         database: str,
         table: str,
         partition_spec: Optional[List[Tuple[str, str]]] = None,
-        mode: str = 'append',
+        mode: str = "append",
         add_metadata: bool = True,
         source: Optional[str] = None,
         delete_filter: Optional[str] = None,
         merge_keys: Optional[Sequence[str]] = None,
+        bulk_arrow: bool = False,
     ) -> str:
         """
         Write DataFrame to Iceberg table via Trino INSERT.
@@ -284,7 +271,14 @@ class IcebergWriter:
         Returns:
             Full table identifier (e.g., 'iceberg.bronze.fbref_schedule')
         """
+        if mode not in {"append", "overwrite"}:
+            raise ValueError("mode must be 'append' or 'overwrite'")
         if df.empty:
+            if mode == "overwrite":
+                raise ValueError(
+                    "empty full-table overwrite is ambiguous; use an explicit "
+                    "delete_filter replacement"
+                )
             logger.warning(f"Empty DataFrame, skipping write to {database}.{table}")
             return f"{self.catalog}.{database}.{table}"
 
@@ -294,8 +288,14 @@ class IcebergWriter:
 
         try:
             return self._write_to_iceberg(
-                df, database, table, partition_spec, mode=mode,
-                delete_filter=delete_filter, merge_keys=merge_keys,
+                df,
+                database,
+                table,
+                partition_spec,
+                mode=mode,
+                delete_filter=delete_filter,
+                merge_keys=merge_keys,
+                bulk_arrow=bulk_arrow,
             )
         except Exception as e:
             logger.error(f"Error writing to {database}.{table}: {e}")
@@ -307,9 +307,10 @@ class IcebergWriter:
         database: str,
         table: str,
         partition_spec: Optional[List[Tuple[str, str]]],
-        mode: str = 'append',
+        mode: str = "append",
         delete_filter: Optional[str] = None,
         merge_keys: Optional[Sequence[str]] = None,
+        bulk_arrow: bool = False,
     ) -> str:
         """
         Write DataFrame directly to Iceberg via Trino INSERT.
@@ -330,6 +331,20 @@ class IcebergWriter:
             Full table identifier (e.g., 'iceberg.bronze.clubelo_ratings')
         """
         from scrapers.base.trino_manager import TrinoError, _is_iceberg_invalid_metadata
+
+        if mode not in {"append", "overwrite"}:
+            raise ValueError("mode must be 'append' or 'overwrite'")
+        if mode == "overwrite":
+            if delete_filter or merge_keys:
+                raise ValueError(
+                    "full-table overwrite cannot be combined with delete_filter "
+                    "or merge_keys"
+                )
+            # Stage the complete replacement before deleting live rows. The
+            # Trino manager retains the verified stage if the final swap fails,
+            # so overwrite can never silently degrade into an append and the
+            # replacement remains recoverable.
+            delete_filter = "TRUE"
 
         trino = self._get_trino_manager()
         full_table = f"{self.catalog}.{database}.{table}"
@@ -358,19 +373,14 @@ class IcebergWriter:
             except TrinoError as e:
                 if _is_iceberg_invalid_metadata(e):
                     self._recover_corrupted_table(
-                        trino, database, table, columns, partition_cols,
+                        trino,
+                        database,
+                        table,
+                        columns,
+                        partition_cols,
                     )
                 else:
                     raise
-
-        # Handle overwrite mode by deleting existing data
-        if mode == 'overwrite':
-            try:
-                trino._execute(f"DELETE FROM {full_table}")
-                logger.info(f"Deleted existing data from {full_table}")
-            except TrinoError as e:
-                # Table might be empty or not support DELETE
-                logger.warning(f"Could not delete existing data: {e}")
 
         # Insert data — atomic stage+merge so the target gets ONE snapshot
         # regardless of how many byte-budget VALUES batches the rows need (#269).
@@ -381,16 +391,187 @@ class IcebergWriter:
         # insert_dataframe_atomic so it runs AFTER the data is safely staged and
         # back-to-back with the merge INSERT — a failed INSERT can no longer
         # leave the table empty behind a committed DELETE (#314 / #283).
-        rows_inserted = trino.insert_dataframe_atomic(
-            database,
-            table,
-            df,
-            delete_filter=delete_filter,
-            merge_keys=merge_keys,
-        )
+        if bulk_arrow:
+            if delete_filter or merge_keys:
+                raise ValueError("bulk Arrow append does not support replace or merge")
+            rows_inserted = self._append_dataframe_pyiceberg(
+                arrow_table, database=database, table=table
+            )
+        else:
+            rows_inserted = trino.insert_dataframe_atomic(
+                database,
+                table,
+                df,
+                delete_filter=delete_filter,
+                merge_keys=merge_keys,
+            )
         logger.info(f"Inserted {rows_inserted} rows into {full_table}")
 
         return full_table
+
+    def _append_dataframe_pyiceberg(
+        self, arrow_table: pa.Table, *, database: str, table: str
+    ) -> int:
+        """Append a bounded Arrow frame as Parquet in one Iceberg snapshot.
+
+        Long-form WhoScored player statistics cannot be sent as thousands of
+        Trino ``VALUES`` statements within the daily SLO.  The repository
+        bounds each frame before this method; PyIceberg writes that frame as
+        Parquet and commits it without changing the source manifest protocol.
+        """
+
+        target = self._load_pyiceberg_table(database=database, table=table)
+        aligned = self._align_pyiceberg_arrow_table(arrow_table, target=target)
+        target.append(aligned)
+        return len(aligned)
+
+    @staticmethod
+    def _align_pyiceberg_arrow_table(arrow_table: pa.Table, *, target) -> pa.Table:
+        """Align a bounded Arrow relation to an existing Iceberg schema."""
+
+        from pyiceberg.io.pyarrow import schema_to_pyarrow
+
+        target_schema = schema_to_pyarrow(target.schema())
+        source = {name: arrow_table[name] for name in arrow_table.column_names}
+        arrays = []
+        for field in target_schema:
+            column = source.get(field.name)
+            if column is None:
+                column = pa.nulls(len(arrow_table), type=field.type)
+            elif column.type != field.type:
+                column = column.cast(field.type, safe=False)
+            arrays.append(column)
+        return pa.Table.from_arrays(arrays, schema=target_schema)
+
+    @staticmethod
+    def _load_pyiceberg_table(*, database: str, table: str):
+        """Load one REST-catalog table with the platform's explicit S3 FileIO."""
+
+        from pyiceberg.catalog import load_catalog
+        from pyiceberg.io.pyarrow import PyArrowFileIO
+
+        properties = _pyiceberg_s3_properties(os.environ)
+        rest_warehouse = os.environ.get("ICEBERG_REST_WAREHOUSE", "football").strip()
+        if not rest_warehouse:
+            raise RuntimeError("ICEBERG_REST_WAREHOUSE is required")
+        catalog = load_catalog(
+            "football_bulk_writer",
+            type="rest",
+            uri=os.environ.get("ICEBERG_REST_URI", "http://lakekeeper:8181/catalog"),
+            warehouse=rest_warehouse,
+        )
+        target = catalog.load_table(f"{database}.{table}")
+        target.io = PyArrowFileIO(properties)
+        return target
+
+    def replace_identity_partition_arrow_batches(
+        self,
+        arrow_tables,
+        *,
+        database: str,
+        table: str,
+        partition_column: str,
+        partition_value: str,
+    ) -> int:
+        """Atomically replace one identity partition from bounded Arrow batches.
+
+        Data files are produced batch by batch, while every delete/append is
+        committed through one Iceberg metadata transaction. Readers therefore
+        observe either the old complete partition or the new complete one.
+        """
+
+        import pyarrow.compute as pc
+        from pyiceberg.expressions import EqualTo
+
+        target = self._load_pyiceberg_table(database=database, table=table)
+        self._require_exact_identity_partition(
+            target,
+            database=database,
+            table=table,
+            partition_column=partition_column,
+        )
+        rows = 0
+        batches = 0
+        with target.transaction() as transaction:
+            transaction.delete(EqualTo(partition_column, partition_value))
+            for arrow_table in arrow_tables:
+                if not isinstance(arrow_table, pa.Table) or not arrow_table.num_rows:
+                    raise ValueError(
+                        "identity partition replacement batches must be non-empty "
+                        "Arrow tables"
+                    )
+                if partition_column not in arrow_table.column_names:
+                    raise ValueError(
+                        "partition column is absent from Arrow relation: "
+                        + partition_column
+                    )
+                partition_values = arrow_table[partition_column]
+                if partition_values.null_count or bool(
+                    pc.any(pc.not_equal(partition_values, partition_value)).as_py()
+                ):
+                    raise ValueError(
+                        "Arrow relation contains rows outside the replacement partition"
+                    )
+                aligned = self._align_pyiceberg_arrow_table(arrow_table, target=target)
+                transaction.append(
+                    aligned,
+                    snapshot_properties={
+                        "operation": "replace-identity-partition-batch",
+                        "partition-column": partition_column,
+                        "partition-value": partition_value,
+                    },
+                )
+                batches += 1
+                rows += len(aligned)
+            if not batches:
+                raise ValueError("identity partition replacement has no batches")
+        return rows
+
+    @staticmethod
+    def _require_exact_identity_partition(
+        target,
+        *,
+        database: str,
+        table: str,
+        partition_column: str,
+    ) -> None:
+        fields = tuple(target.spec().fields)
+        if (
+            len(fields) != 1
+            or fields[0].name != partition_column
+            or str(fields[0].transform) != "identity"
+        ):
+            raise RuntimeError(
+                f"{database}.{table} must be partitioned only by identity("
+                f"{partition_column})"
+            )
+
+    def require_exact_identity_partition(
+        self,
+        *,
+        database: str,
+        table: str,
+        partition_column: str,
+    ) -> None:
+        """Fail closed if an existing operational table has unsafe layout."""
+
+        target = self._load_pyiceberg_table(database=database, table=table)
+        self._require_exact_identity_partition(
+            target,
+            database=database,
+            table=table,
+            partition_column=partition_column,
+        )
+
+    def current_snapshot_id(self, *, database: str, table: str) -> int:
+        """Return the catalog's current main snapshot, never a timestamp guess."""
+
+        target = self._load_pyiceberg_table(database=database, table=table)
+        snapshot = target.current_snapshot()
+        snapshot_id = int(snapshot.snapshot_id) if snapshot is not None else 0
+        if snapshot_id <= 0:
+            raise RuntimeError(f"{database}.{table} has no current Iceberg snapshot")
+        return snapshot_id
 
     def create_table_if_not_exists(
         self,
@@ -414,7 +595,9 @@ class IcebergWriter:
 
         if not trino.table_exists(database, table):
             columns = trino.arrow_schema_to_trino(schema)
-            partition_cols = [col for col, _ in partition_spec] if partition_spec else None
+            partition_cols = (
+                [col for col, _ in partition_spec] if partition_spec else None
+            )
 
             trino.create_iceberg_table(
                 schema=database,
@@ -475,11 +658,7 @@ class IcebergWriter:
 
         return pd.DataFrame()
 
-    def get_table_history(
-        self,
-        database: str,
-        table: str
-    ) -> pd.DataFrame:
+    def get_table_history(self, database: str, table: str) -> pd.DataFrame:
         """Get table snapshot history for time travel via Trino."""
         trino = self._get_trino_manager()
         validate_catalog_qualified_name(self.catalog, database, table)
@@ -510,21 +689,8 @@ class IcebergWriter:
             return pd.DataFrame(result)
         return pd.DataFrame()
 
-    def compact_table(self, database: str, table: str) -> None:
-        """Run compaction on table to merge small files via Trino."""
-        trino = self._get_trino_manager()
-        full_table = validate_catalog_qualified_name(self.catalog, database, table)
-
-        # Trino Iceberg optimize procedure
-        sql = f"ALTER TABLE {full_table} EXECUTE optimize"
-        trino._execute(sql)
-        logger.info(f"Compacted table: {full_table}")
-
     def expire_snapshots(
-        self,
-        database: str,
-        table: str,
-        retention_days: int = 7
+        self, database: str, table: str, retention_days: int = 7
     ) -> None:
         """Expire old snapshots to reclaim storage via Trino."""
         trino = self._get_trino_manager()
@@ -534,4 +700,6 @@ class IcebergWriter:
         # Trino Iceberg expire_snapshots procedure
         sql = f"ALTER TABLE {full_table} EXECUTE expire_snapshots(retention_threshold => '{retention_days}d')"
         trino._execute(sql)
-        logger.info(f"Expired snapshots older than {retention_days} days for {full_table}")
+        logger.info(
+            f"Expired snapshots older than {retention_days} days for {full_table}"
+        )

@@ -6,6 +6,7 @@
 # сознательно НЕ добавлена — это пересоздало бы контейнер postgres на проде.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+COMPOSE=(./scripts/compose.sh --env-file .env)
 
 KEYCLOAK_DB_PASSWORD=$(grep '^KEYCLOAK_DB_PASSWORD=' .env | cut -d= -f2-)
 if [ -z "${KEYCLOAK_DB_PASSWORD}" ] || [[ "${KEYCLOAK_DB_PASSWORD}" == \<* ]]; then
@@ -13,7 +14,7 @@ if [ -z "${KEYCLOAK_DB_PASSWORD}" ] || [[ "${KEYCLOAK_DB_PASSWORD}" == \<* ]]; t
     exit 1
 fi
 
-docker compose exec -T postgres sh -c 'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' <<EOSQL
+"${COMPOSE[@]}" exec -T postgres sh -c 'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' <<EOSQL
     DO \$\$
     BEGIN
         IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'keycloak') THEN
@@ -26,7 +27,7 @@ docker compose exec -T postgres sh -c 'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USE
     GRANT ALL PRIVILEGES ON DATABASE keycloak TO keycloak;
 EOSQL
 
-docker compose exec -T postgres sh -c 'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d keycloak' <<'EOSQL'
+"${COMPOSE[@]}" exec -T postgres sh -c 'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d keycloak' <<'EOSQL'
     GRANT ALL ON SCHEMA public TO keycloak;
     ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO keycloak;
     ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO keycloak;

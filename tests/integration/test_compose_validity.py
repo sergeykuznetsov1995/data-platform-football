@@ -16,6 +16,7 @@ forks without docker still pass the rest of the suite).
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -26,9 +27,21 @@ import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 COMPOSE_FILE = PROJECT_ROOT / "compose.yaml"
+SUPERVISED_OVERLAY = PROJECT_ROOT / "compose.seaweedfs-supervised.yaml"
 SUPERSET_DIR = PROJECT_ROOT / "configs" / "superset"
 OPENMETADATA_DIR = PROJECT_ROOT / "configs" / "openmetadata"
 DESCRIPTIONS_DIR = OPENMETADATA_DIR / "descriptions"
+COMPOSE_TEST_ENV = {
+    **os.environ,
+    "OIDC_ISSUER": "https://ci.invalid",
+    "PUBLIC_IP": "127.0.0.1",
+    "KC_PUBLIC_URL": "https://auth.ci.invalid",
+    "TRINO_PUBLIC_HOST": "trino.ci.invalid",
+    "JUPYTER_PUBLIC_HOST": "jupyter.ci.invalid",
+    "LAKEKEEPER_DB_PASSWORD": "ci-not-a-secret",
+    "LAKEKEEPER_PG_ENCRYPTION_KEY": "0" * 32,
+    "SEAWEEDFS_VOLUME_SIZE_LIMIT_MB": "1024",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -40,7 +53,7 @@ def _docker_available() -> bool:
     return shutil.which("docker") is not None
 
 
-def _compose_config_json() -> dict:
+def _compose_config_json(*extra_files: Path) -> dict:
     """Run `docker compose config --format json` and return parsed dict.
 
     Skips the test if docker is missing or compose is unavailable.
@@ -48,9 +61,24 @@ def _compose_config_json() -> dict:
     if not _docker_available():
         pytest.skip("docker CLI not available on this host")
 
+    command = ["docker", "compose", "-f", str(COMPOSE_FILE)]
+    for path in extra_files:
+        command.extend(("-f", str(path)))
+    command.extend(
+        (
+            "--env-file",
+            str(PROJECT_ROOT / ".env.example"),
+            "--profile",
+            "*",
+            "config",
+            "--format",
+            "json",
+        )
+    )
     proc = subprocess.run(
-        ["docker", "compose", "-f", str(COMPOSE_FILE), "config", "--format", "json"],
+        command,
         cwd=str(PROJECT_ROOT),
+        env=COMPOSE_TEST_ENV,
         capture_output=True,
         text=True,
         timeout=60,
@@ -73,8 +101,18 @@ class TestComposeFile:
         if not _docker_available():
             pytest.skip("docker CLI not available")
         proc = subprocess.run(
-            ["docker", "compose", "-f", str(COMPOSE_FILE), "config", "--quiet"],
+            [
+                "docker",
+                "compose",
+                "-f",
+                str(COMPOSE_FILE),
+                "--env-file",
+                str(PROJECT_ROOT / ".env.example"),
+                "config",
+                "--quiet",
+            ],
             cwd=str(PROJECT_ROOT),
+            env=COMPOSE_TEST_ENV,
             capture_output=True,
             text=True,
             timeout=60,
@@ -90,12 +128,99 @@ class TestComposeFile:
             "superset",
             "superset-worker",
             "superset-beat",
-            "elasticsearch",
+            "opensearch",
             "openmetadata-server",
             "openmetadata-ingestion",
         }
         missing = required - set(services.keys())
         assert not missing, f"Missing services in compose: {missing}"
+
+    def test_supervised_seaweedfs_overlay_renders_with_real_compose(self):
+        cfg = _compose_config_json(SUPERVISED_OVERLAY)
+        services = cfg["services"]
+
+        assert services["seaweedfs"]["command"][0] == "s3"
+        assert all(
+            mount.get("target") != "/data"
+            for mount in services["seaweedfs"]["volumes"]
+        )
+        for name in ("seaweedfs-master", "seaweedfs-volume", "seaweedfs-filer"):
+            assert services[name]["environment"][
+                "SEAWEEDFS_VOLUME_SIZE_LIMIT_MB"
+            ] == "1024"
+            assert any(
+                mount.get("target") == "/data"
+                for mount in services[name]["volumes"]
+            )
+
+    def test_heavy_profile_includes_rollout_services_without_paid_proxy(self):
+        if not _docker_available():
+            pytest.skip("docker CLI not available")
+        proc = subprocess.run(
+            [
+                "docker",
+                "compose",
+                "-f",
+                str(COMPOSE_FILE),
+                "--env-file",
+                str(PROJECT_ROOT / ".env.example"),
+                "--profile",
+                "heavy",
+                "config",
+                "--services",
+            ],
+            cwd=str(PROJECT_ROOT),
+            env=COMPOSE_TEST_ENV,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert proc.returncode == 0, proc.stderr
+        services = set(proc.stdout.splitlines())
+        assert {
+            "tor",
+            "superset-worker",
+            "superset-beat",
+            "opensearch",
+            "openmetadata-migrate",
+            "openmetadata-server",
+            "openmetadata-ingestion",
+        } <= services
+        assert {
+            "whoscored_proxy_filter",
+            "whoscored_paid_gateway",
+            "flaresolverr_whoscored_paid",
+        }.isdisjoint(services)
+
+    def test_paid_profile_contains_only_explicit_whoscored_boundary_services(self):
+        if not _docker_available():
+            pytest.skip("docker CLI not available")
+        proc = subprocess.run(
+            [
+                "docker",
+                "compose",
+                "-f",
+                str(COMPOSE_FILE),
+                "--env-file",
+                str(PROJECT_ROOT / ".env.example"),
+                "--profile",
+                "whoscored-paid",
+                "config",
+                "--services",
+            ],
+            cwd=str(PROJECT_ROOT),
+            env=COMPOSE_TEST_ENV,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert proc.returncode == 0, proc.stderr
+        services = set(proc.stdout.splitlines())
+        assert {
+            "whoscored_proxy_filter",
+            "whoscored_paid_gateway",
+            "flaresolverr_whoscored_paid",
+        } <= services
 
     def test_superset_exposes_8088(self):
         cfg = _compose_config_json()
@@ -115,14 +240,14 @@ class TestComposeFile:
                 f"superset must depend_on '{required}' (got {sorted(dep_names)})"
             )
 
-    def test_elasticsearch_no_published_ports(self):
-        """Security: ES must NOT expose 9200 to the host (HDFS-like internal only)."""
+    def test_opensearch_no_published_ports(self):
+        """Security: OpenSearch must not expose 9200 to the host."""
         cfg = _compose_config_json()
-        es = cfg["services"]["elasticsearch"]
-        ports = es.get("ports") or []
+        opensearch = cfg["services"]["opensearch"]
+        ports = opensearch.get("ports") or []
         # Allow empty list or absent key. Anything else is a leak.
         assert ports == [] or ports is None, (
-            f"elasticsearch must NOT publish ports (got {ports})"
+            f"opensearch must NOT publish ports (got {ports})"
         )
 
     @pytest.mark.parametrize(
@@ -131,7 +256,7 @@ class TestComposeFile:
             "superset",
             "superset-worker",
             "superset-beat",
-            "elasticsearch",
+            "opensearch",
             "openmetadata-server",
             "openmetadata-ingestion",
         ],
@@ -169,10 +294,18 @@ class TestSofaScoreRegistryMount:
 
     def test_registry_directory_is_mounted_read_only(self):
         for service in self._airflow_services():
-            assert (
-                "./configs/sofascore:/opt/airflow/configs/sofascore:ro"
-                in service["volumes"]
-            )
+            matches = []
+            for volume in service["volumes"]:
+                if isinstance(volume, str):
+                    parts = volume.split(":")
+                    if len(parts) >= 2 and parts[1] == (
+                        "/opt/airflow/configs/sofascore"
+                    ):
+                        matches.append(parts[-1] == "ro")
+                elif volume.get("target") == "/opt/airflow/configs/sofascore":
+                    matches.append(volume.get("read_only") is True)
+
+            assert matches == [True]
 
 
 # ---------------------------------------------------------------------------
@@ -276,8 +409,6 @@ class TestOpenMetadataIngestionYaml:
         cfg = data["source"]["serviceConnection"]["config"]
         assert cfg["catalog"] == "iceberg"
         # Filters must include bronze/silver/gold; do not assume order.
-        includes = cfg.get("__unused__")  # we'll look further down
-        # Real path is under sourceConfig
         schema_inc = data["source"]["sourceConfig"]["config"]["schemaFilterPattern"][
             "includes"
         ]

@@ -8,6 +8,7 @@
 # Существующий username = громкая ошибка kcadm (скрипт не идемпотентен намеренно).
 set -euo pipefail
 cd "$(dirname "$0")/.."
+COMPOSE=(./scripts/compose.sh --env-file .env)
 
 USAGE="usage: onboard_user.sh <username> <email> [viewers|analysts|platform-admins]"
 USERNAME=${1:?${USAGE}}
@@ -28,7 +29,7 @@ fi
 TEMP_PASSWORD=$(openssl rand -base64 12)
 
 kcadm() {
-    docker compose exec -T keycloak /opt/keycloak/bin/kcadm.sh "$@"
+    "${COMPOSE[@]}" exec -T keycloak /opt/keycloak/bin/kcadm.sh "$@"
 }
 
 kcadm config credentials --server http://localhost:8080 --realm master \

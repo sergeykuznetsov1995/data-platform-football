@@ -1,0 +1,9 @@
+FROM apache/airflow:2.11.2-python3.11@sha256:aac8468234dfa802c5ac4d6318bbf3b620793b55569ac230f584dc3c1f0ca49d AS python3.11-runtime
+
+USER airflow
+COPY requirements-ci-dag-import-2.11.2.lock /tmp/requirements-ci-dag-import.lock
+RUN python -m pip install \
+      --no-cache-dir --no-deps --require-hashes --only-binary=:all: \
+      -r /tmp/requirements-ci-dag-import.lock
+RUN --network=none python -m pip check \
+    && test "$(airflow version)" = "2.11.2"

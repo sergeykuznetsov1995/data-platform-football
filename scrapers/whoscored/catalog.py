@@ -4,12 +4,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
+from decimal import Decimal
+import math
+import os
 from pathlib import Path
 import re
+import unicodedata
 from typing import Any, Mapping, Optional, Sequence
+from urllib.parse import urlsplit
 
 import yaml
 
+from . import runtime_contract as _runtime_contract
 from .domain import (
     SeasonFormat,
     TournamentClassification,
@@ -63,8 +69,9 @@ class CatalogCompetition:
     schema_fingerprint: Optional[str] = None
 
 
-CATALOG_CLASSIFIER_VERSION = "senior-men-v2"
+CATALOG_CLASSIFIER_VERSION = "senior-men-v3"
 DEFAULT_OVERRIDE_VERSION = "2026-07-11-v1"
+TECHNICAL_EXCLUSION_AUDIT_SCHEMA_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -81,6 +88,50 @@ class TournamentOverride:
     reason: str
     version: str = DEFAULT_OVERRIDE_VERSION
     canonical_competition_id: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if isinstance(self.tournament_id, bool):
+            raise CatalogError("Tournament override id must be a positive integer")
+        try:
+            source_id = int(self.tournament_id)
+        except (TypeError, ValueError) as exc:
+            raise CatalogError(
+                f"Tournament override id must be an integer, got {self.tournament_id!r}"
+            ) from exc
+        if source_id <= 0:
+            raise CatalogError("Tournament override id must be a positive integer")
+
+        try:
+            eligibility = TournamentEligibility.coerce(self.eligibility)
+        except ValueError as exc:
+            raise CatalogError(str(exc)) from exc
+        reason = "" if self.reason is None else str(self.reason).strip()
+        version = "" if self.version is None else str(self.version).strip()
+        if not reason:
+            raise CatalogError(f"Tournament override {source_id} has no reason")
+        if not version:
+            raise CatalogError(f"Tournament override {source_id} has no version")
+
+        canonical_competition_id = self.canonical_competition_id
+        if canonical_competition_id is not None:
+            canonical_competition_id = str(canonical_competition_id).strip()
+            if not canonical_competition_id:
+                raise CatalogError(
+                    f"Tournament override {source_id} has an empty competition id"
+                )
+        if (
+            eligibility is TournamentEligibility.EXCLUDED_TECHNICAL
+            and canonical_competition_id is None
+        ):
+            raise CatalogError(
+                f"Tournament override {source_id} has no canonical competition id"
+            )
+
+        object.__setattr__(self, "tournament_id", source_id)
+        object.__setattr__(self, "eligibility", eligibility)
+        object.__setattr__(self, "reason", reason)
+        object.__setattr__(self, "version", version)
+        object.__setattr__(self, "canonical_competition_id", canonical_competition_id)
 
 
 # These five source ids were audited against their source tournament/stage
@@ -120,6 +171,256 @@ DEFAULT_TOURNAMENT_OVERRIDES: tuple[TournamentOverride, ...] = (
 )
 
 
+def _technical_name_key(value: object) -> str:
+    normalized = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    return " ".join(re.sub(r"[^\w]+", " ", normalized).split())
+
+
+def _technical_link_key(value: object) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    parsed = urlsplit(raw)
+    path = re.sub(r"/+", "/", parsed.path).rstrip("/").casefold()
+    return path
+
+
+def build_technical_exclusion_audit(
+    rows: Mapping[str, Sequence[Mapping[str, Any]]],
+    *,
+    source_snapshot_sha256: str,
+    overrides: Sequence[TournamentOverride] = DEFAULT_TOURNAMENT_OVERRIDES,
+) -> dict[str, Any]:
+    """Build a reproducible duplicate-candidate review for one source snapshot.
+
+    The detector never silently classifies a tournament as technical.  A
+    candidate is considered reviewed only when a versioned immutable source-ID
+    override excludes every duplicate shell while leaving exactly one canonical
+    tournament.  Every other candidate blocks catalog publication upstream.
+    """
+
+    source_sha256 = str(source_snapshot_sha256 or "").strip().lower()
+    if re.fullmatch(r"[0-9a-f]{64}", source_sha256) is None:
+        raise CatalogError("technical audit requires a source snapshot SHA-256")
+    technical_overrides = {
+        int(item.tournament_id): item
+        for item in overrides
+        if item.eligibility is TournamentEligibility.EXCLUDED_TECHNICAL
+    }
+    competition_rows = [dict(item) for item in rows.get("competitions", ())]
+    competition_by_id = {
+        int(item["tournament_id"]): item
+        for item in competition_rows
+        if item.get("tournament_id") is not None
+        and not isinstance(item.get("tournament_id"), bool)
+    }
+    candidate_groups: list[tuple[str, str, set[int]]] = []
+
+    def collect(
+        candidate_type: str,
+        keyed_ids: Mapping[str, set[int]],
+    ) -> None:
+        for key, source_ids in sorted(keyed_ids.items()):
+            if key and len(source_ids) > 1:
+                candidate_groups.append((candidate_type, key, set(source_ids)))
+
+    names: dict[str, set[int]] = {}
+    links: dict[str, set[int]] = {}
+    for source_id, row in competition_by_id.items():
+        region_id = row.get("region_id")
+        name_key = _technical_name_key(row.get("tournament_name"))
+        if region_id is not None and name_key:
+            names.setdefault(f"{region_id}:{name_key}", set()).add(source_id)
+        link_key = _technical_link_key(row.get("tournament_url"))
+        if link_key:
+            links.setdefault(link_key, set()).add(source_id)
+    collect("normalized_name_within_region", names)
+    collect("canonical_tournament_link", links)
+
+    stages: dict[str, set[int]] = {}
+    competition_id_to_source_id = {
+        str(row.get("competition_id")): source_id
+        for source_id, row in competition_by_id.items()
+        if row.get("competition_id")
+    }
+    for row in rows.get("stages", ()):
+        stage_id = row.get("stage_id")
+        source_id = row.get("tournament_id")
+        if source_id is None:
+            source_id = competition_id_to_source_id.get(
+                str(row.get("competition_id") or "")
+            )
+        if (
+            stage_id is None
+            or isinstance(stage_id, bool)
+            or source_id is None
+            or isinstance(source_id, bool)
+        ):
+            continue
+        stages.setdefault(str(int(stage_id)), set()).add(int(source_id))
+    collect("stage_id_overlap", stages)
+
+    parent: dict[int, int] = {}
+
+    def find(source_id: int) -> int:
+        parent.setdefault(source_id, source_id)
+        while parent[source_id] != source_id:
+            parent[source_id] = parent[parent[source_id]]
+            source_id = parent[source_id]
+        return source_id
+
+    def union(source_ids: set[int]) -> None:
+        ordered = sorted(source_ids)
+        if not ordered:
+            return
+        root = find(ordered[0])
+        for source_id in ordered[1:]:
+            other = find(source_id)
+            if other != root:
+                parent[other] = root
+
+    for _candidate_type, _key, source_ids in candidate_groups:
+        union(source_ids)
+
+    present_override_ids = set(competition_by_id) & technical_overrides.keys()
+    orphan_override_ids = sorted(present_override_ids - parent.keys())
+    for source_id in orphan_override_ids:
+        candidate_groups.append(
+            (
+                "technical_override_without_duplicate_evidence",
+                str(source_id),
+                {source_id},
+            )
+        )
+        union({source_id})
+
+    component_ids: dict[int, str] = {}
+    component_members: dict[int, set[int]] = {}
+    for source_id in sorted(parent):
+        root = find(source_id)
+        component_members.setdefault(root, set()).add(source_id)
+    for index, (root, _members) in enumerate(
+        sorted(component_members.items(), key=lambda item: sorted(item[1])),
+        start=1,
+    ):
+        component_ids[root] = f"component-{index:04d}"
+
+    component_state: dict[int, dict[str, Any]] = {}
+    components: list[dict[str, Any]] = []
+    for root, source_ids in sorted(
+        component_members.items(), key=lambda item: sorted(item[1])
+    ):
+        excluded_ids = sorted(source_ids & technical_overrides.keys())
+        canonical_ids = sorted(source_ids - technical_overrides.keys())
+        failures: list[str] = []
+        if not excluded_ids:
+            failures.append("component_has_no_technical_override")
+        if len(canonical_ids) != 1:
+            failures.append(
+                f"component_has_{len(canonical_ids)}_canonical_tournaments"
+            )
+            canonical_competition_id = None
+        else:
+            canonical_row = competition_by_id[canonical_ids[0]]
+            canonical_competition_id = str(
+                canonical_row.get("competition_id") or ""
+            )
+            if not canonical_competition_id:
+                failures.append("canonical_tournament_has_no_competition_id")
+            if canonical_row.get("eligibility") != TournamentEligibility.INCLUDED.value:
+                failures.append("canonical_tournament_is_not_included")
+        for source_id in excluded_ids:
+            if (
+                canonical_competition_id is None
+                or technical_overrides[source_id].canonical_competition_id
+                != canonical_competition_id
+            ):
+                failures.append(
+                    f"override_{source_id}_canonical_competition_mismatch"
+                )
+        resolved = not failures
+        signals = [
+            {"candidate_type": candidate_type, "candidate_key": key}
+            for candidate_type, key, candidate_ids in sorted(candidate_groups)
+            if candidate_ids <= source_ids
+        ]
+        state = {
+            "component_id": component_ids[root],
+            "source_tournament_ids": sorted(source_ids),
+            "technical_override_ids": excluded_ids,
+            "canonical_tournament_ids": canonical_ids,
+            "canonical_competition_id": canonical_competition_id,
+            "signals": signals,
+            "review_disposition": (
+                "resolved_by_versioned_source_id_override"
+                if resolved
+                else "requires_versioned_source_id_review"
+            ),
+            "validation_failures": sorted(set(failures)),
+        }
+        component_state[root] = state
+        components.append(state)
+
+    candidates: list[dict[str, Any]] = []
+    unresolved = 0
+    for candidate_type, key, source_ids in sorted(candidate_groups):
+        root = find(min(source_ids))
+        state = component_state[root]
+        if state["review_disposition"] != "resolved_by_versioned_source_id_override":
+            unresolved += 1
+        ordered_ids = sorted(source_ids)
+        candidates.append(
+            {
+                "candidate_type": candidate_type,
+                "candidate_key": key,
+                "source_tournament_ids": ordered_ids,
+                "competition_ids": sorted(
+                    str(competition_by_id[source_id].get("competition_id") or "")
+                    for source_id in ordered_ids
+                ),
+                "component_id": state["component_id"],
+                "component_source_tournament_ids": state[
+                    "source_tournament_ids"
+                ],
+                "technical_override_ids": state["technical_override_ids"],
+                "canonical_tournament_ids": state["canonical_tournament_ids"],
+                "canonical_competition_id": state["canonical_competition_id"],
+                "review_disposition": state["review_disposition"],
+                "validation_failures": state["validation_failures"],
+            }
+        )
+
+    return {
+        "schema_version": TECHNICAL_EXCLUSION_AUDIT_SCHEMA_VERSION,
+        "audit_type": "whoscored_technical_exclusion_audit",
+        "source_snapshot_sha256": source_sha256,
+        "classifier_version": CATALOG_CLASSIFIER_VERSION,
+        "technical_override_registry": [
+            {
+                "tournament_id": source_id,
+                "reason": item.reason,
+                "version": item.version,
+                "canonical_competition_id": item.canonical_competition_id,
+                "present_in_source_snapshot": source_id in competition_by_id,
+                "component_id": (
+                    component_ids[find(source_id)] if source_id in parent else None
+                ),
+            }
+            for source_id, item in sorted(technical_overrides.items())
+        ],
+        "candidate_count": len(candidates),
+        "unresolved_candidate_count": unresolved,
+        "component_count": len(components),
+        "unresolved_component_count": sum(
+            item["review_disposition"]
+            != "resolved_by_versioned_source_id_override"
+            for item in components
+        ),
+        "candidates": candidates,
+        "components": components,
+    }
+
+
 _WOMEN_MARKERS = re.compile(
     r"(?:\bwomen(?:'s)?\b|\bwoman\b|\bf[ée]min(?:ine|ino|ina|in)?\b|"
     r"\bfemminile\b|\bfrauen\b|\bdamen\b|\bfemale\b|\bladies\b|"
@@ -129,9 +430,13 @@ _WOMEN_MARKERS = re.compile(
 _YOUTH_MARKERS = re.compile(
     r"(?:\b(?:u|under)[ -]?(?:[5-9]|1[0-9]|2[0-3])\b|\byouth\b|\bjunior(?:s)?\b|"
     r"\bacademy\b|\bprimavera\b|\bjuvenil\b|\bsub[ -]?(?:[5-9]|1[0-9]|2[0-3])\b|"
-    r"\breserves?\b|\bb[ -]?team\b|\bdevelopment league\b|"
-    r"\bpremier league 2\b|\bolympic(?:s| games)?\b|\bcolts?\b|"
+    r"\bolympic(?:s| games)?\b|\bcolts?\b|"
     r"молод[её]ж|юнош|青年)",
+    re.IGNORECASE,
+)
+_RESERVE_MARKERS = re.compile(
+    r"(?:\breserves?\b|\bb[ -]?team\b|\bdevelopment league\b|"
+    r"\bpremier league 2\b)",
     re.IGNORECASE,
 )
 
@@ -147,9 +452,20 @@ def _coerce_source_sex(value: Any) -> tuple[Optional[int], Optional[str]]:
             return 1, None
         if token in {"female", "women", "woman", "f"}:
             return 0, None
-    try:
+        if token in {"0", "1"}:
+            return int(token), None
+        return None, "source_sex_is_unknown"
+    if isinstance(value, int):
+        numeric = value
+    elif isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            return None, "source_sex_is_unknown"
         numeric = int(value)
-    except (TypeError, ValueError):
+    elif isinstance(value, Decimal):
+        if not value.is_finite() or value != value.to_integral_value():
+            return None, "source_sex_is_unknown"
+        numeric = int(value)
+    else:
         return None, "source_sex_is_unknown"
     if numeric not in {0, 1}:
         return None, "source_sex_is_unknown"
@@ -167,8 +483,10 @@ def classify_tournament(
     """Classify one discovered tournament without ever defaulting to men.
 
     Source ``sex`` is authoritative when present.  Name markers still exclude
-    youth tournaments and detect contradictory metadata.  Missing sex without
-    an explicit marker is quarantined until schedule metadata resolves it.
+    youth and reserve tournaments and detect contradictory metadata.  Missing
+    sex without an explicit marker is quarantined until schedule metadata
+    resolves it.  Technical exclusions are never inferred from a display name;
+    they require a versioned override keyed by immutable source id.
     """
 
     source_id = _optional_int(tournament_id, "tournament_id")
@@ -186,12 +504,27 @@ def classify_tournament(
     )
     women_marker = bool(_WOMEN_MARKERS.search(label))
     youth_marker = bool(_YOUTH_MARKERS.search(label))
+    reserve_marker = bool(_RESERVE_MARKERS.search(label))
     sex, sex_error = _coerce_source_sex(source_sex)
     if sex_error:
         return TournamentClassification(
             TournamentEligibility.QUARANTINED,
             sex_error,
             CATALOG_CLASSIFIER_VERSION,
+        )
+    if reserve_marker:
+        reason = "name_marks_reserve"
+        if women_marker and youth_marker:
+            reason = "name_marks_women_youth_and_reserve"
+        elif women_marker:
+            reason = "name_marks_women_and_reserve"
+        elif youth_marker:
+            reason = "name_marks_youth_and_reserve"
+        return TournamentClassification(
+            TournamentEligibility.EXCLUDED_RESERVE,
+            reason,
+            CATALOG_CLASSIFIER_VERSION,
+            sex,
         )
     if women_marker and youth_marker:
         return TournamentClassification(
@@ -229,12 +562,9 @@ def classify_tournament(
             sex,
         )
     if override is not None:
-        reason = str(override.reason).strip()
-        if not reason:
-            raise CatalogError(f"Tournament override {source_id} has no reason")
         return TournamentClassification(
-            TournamentEligibility.coerce(override.eligibility),
-            f"explicit_override:{reason}",
+            override.eligibility,
+            f"explicit_override:{override.reason}",
             CATALOG_CLASSIFIER_VERSION,
             sex,
             override.version,
@@ -470,6 +800,22 @@ def _row_eligibility(row: Mapping[str, Any]) -> TournamentEligibility:
         raise CatalogError(str(exc)) from exc
 
 
+def _technical_override_provenance_error(
+    row: Mapping[str, Any],
+) -> Optional[str]:
+    if _row_eligibility(row) is not TournamentEligibility.EXCLUDED_TECHNICAL:
+        return None
+    tournament_id = _optional_int(row.get("tournament_id"), "tournament_id")
+    if tournament_id is None or tournament_id <= 0:
+        return "excluded_technical_without_source_tournament_id"
+    reason = str(row.get("classification_reason") or "").strip()
+    if not reason.startswith("explicit_override:") or not reason.partition(":")[2]:
+        return "excluded_technical_without_override_reason"
+    if _optional_text(row.get("override_version")) is None:
+        return "excluded_technical_without_override_version"
+    return None
+
+
 class WhoScoredCatalog:
     """Strict read-only projection of ``competitions.yaml``.
 
@@ -518,6 +864,15 @@ class WhoScoredCatalog:
     def from_file(
         cls, path: str | Path = DEFAULT_COMPETITIONS_PATH
     ) -> "WhoScoredCatalog":
+        if Path(os.path.abspath(path)) == Path(os.path.abspath(DEFAULT_COMPETITIONS_PATH)):
+            payload = _runtime_contract.read_attested_static_runtime_file(
+                "configs/medallion/competitions.yaml"
+            )
+            try:
+                document = yaml.safe_load(payload.decode("utf-8")) or {}
+            except UnicodeDecodeError as exc:
+                raise CatalogError("Competition catalog must be UTF-8") from exc
+            return cls.from_mapping(document)
         with Path(path).open("r", encoding="utf-8") as handle:
             document = yaml.safe_load(handle) or {}
         return cls.from_mapping(document)
@@ -730,6 +1085,9 @@ class WhoScoredCatalog:
                 raise CatalogError(f"Duplicate competition id {competition_id!r}")
             seen_ids.add(competition_id)
             eligibility = _row_eligibility(row)
+            technical_provenance_error = _technical_override_provenance_error(row)
+            if technical_provenance_error is not None:
+                eligibility = TournamentEligibility.QUARANTINED
             competitions.append(
                 CatalogCompetition(
                     competition_id=competition_id,
@@ -749,7 +1107,8 @@ class WhoScoredCatalog:
                     source_sex=_optional_int(row.get("source_sex"), "source_sex"),
                     eligibility=eligibility,
                     classification_reason=str(
-                        row.get("classification_reason")
+                        technical_provenance_error
+                        or row.get("classification_reason")
                         or "missing_classification_reason"
                     ),
                     classifier_version=str(
@@ -885,10 +1244,27 @@ class WhoScoredCatalog:
             for source in self._discovery_rows.get(kind, ()):
                 try:
                     eligibility = _row_eligibility(source)
+                    technical_provenance_error = (
+                        _technical_override_provenance_error(source)
+                        if kind == "competitions"
+                        else None
+                    )
                 except CatalogError:
                     eligibility = TournamentEligibility.QUARANTINED
-                if eligibility is TournamentEligibility.QUARANTINED:
-                    rows.append({"record_type": kind[:-1], **dict(source)})
+                    technical_provenance_error = None
+                if (
+                    eligibility is TournamentEligibility.QUARANTINED
+                    or technical_provenance_error is not None
+                ):
+                    record = {"record_type": kind[:-1], **dict(source)}
+                    if technical_provenance_error is not None:
+                        record.update(
+                            {
+                                "eligibility": TournamentEligibility.QUARANTINED.value,
+                                "classification_reason": technical_provenance_error,
+                            }
+                        )
+                    rows.append(record)
         return tuple(rows)
 
     def to_rows(self) -> dict[str, tuple[dict[str, Any], ...]]:

@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+
+/usr/local/bin/whoscored-production-gate
+exec /usr/local/libexec/whoscored-python-real "$@"

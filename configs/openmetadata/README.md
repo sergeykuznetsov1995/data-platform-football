@@ -15,7 +15,7 @@ build ER diagrams).
 ```
 
 Cadence:
-- `om-bootstrap`: one-time per OM instance (and after `docker compose down openmetadata-server -v`); idempotent, safe to re-run.
+- `om-bootstrap`: one-time per OM instance (and after an approved metadata-database reinitialisation); idempotent, safe to re-run. Never use raw `docker compose down -v` on this platform.
 - `om-ingest-trino`: ad-hoc after a schema change in Gold.
 - `om-apply-descriptions`: after editing any YAML here (idempotent, safe to re-run).
 - `om-lineage-trino`: nightly (Trino query history rolls up the latest day).
@@ -51,7 +51,7 @@ Cadence:
 `HTTP 404: tag instance for X not found` on every YAML = classifications not bootstrapped → run `make om-bootstrap`.
 `HTTP 401` = bad / expired JWT → re-issue. Токен также инвалидируется ротацией
 RSA-ключей (`make gen-om-jwt-keys`) — после неё перевыпустить и обновить
-`OM_JWT_TOKEN` в `.env` + `docker compose --profile heavy up -d openmetadata-ingestion`.
+`OM_JWT_TOKEN` в `.env` + `./scripts/compose.sh --profile heavy up -d --no-deps openmetadata-ingestion`.
 
 ## SSO cutover (prod, #866)
 
@@ -127,7 +127,7 @@ RSA-ключей (`make gen-om-jwt-keys`) — после неё перевыпу
 
 3. `make gen-om-jwt-keys` + раскомментировать `OM_RSA_*`/`OM_JWT_*` в `.env`
    (свои ключи подписи бот-JWT вместо публично известных ключей образа) →
-   `docker compose --profile heavy up -d openmetadata-server`. Смена ключей
+   `./scripts/compose.sh --profile heavy up -d --no-deps openmetadata-server`. Смена ключей
    инвалидирует старые бот-токены — перевыпуск в п.6.
 4. Раскомментировать блок `OM_AUTH_*` + `OPENMETADATA_OIDC_CLIENT_SECRET`
    в `.env` (для чистых стендов и отката) и **применить конфиг на живом
@@ -140,7 +140,7 @@ RSA-ключей (`make gen-om-jwt-keys`) — после неё перевыпу
    ```
 
 5. Раскомментировать meta-блок в `configs/caddy/Caddyfile` →
-   `docker compose exec caddy caddy reload --config /etc/caddy/Caddyfile`.
+   `./scripts/compose.sh --env-file .env exec caddy caddy reload --config /etc/caddy/Caddyfile`.
 6. Первый вход админа из `OM_ADMIN_PRINCIPALS` через браузер; перевыпустить
    токен `ingestion-bot` (Settings → Bots) → `OM_JWT_TOKEN` в `.env` →
    `up -d openmetadata-ingestion` → `make om-ingest-trino && make om-lineage-trino`.
@@ -153,14 +153,16 @@ RSA-ключей (`make gen-om-jwt-keys`) — после неё перевыпу
 ```bash
 # 1) meta наружу больше не отдаём (basic-OM публиковать нельзя)
 #    закомментировать блок meta в configs/caddy/Caddyfile, затем:
-docker compose exec caddy caddy reload --config /etc/caddy/Caddyfile
+./scripts/compose.sh --env-file .env exec caddy \
+  caddy reload --config /etc/caddy/Caddyfile
 # 2) закомментировать блок OM_AUTH_* в .env
 #    (OM_RSA_*/OM_JWT_*/OM_JWT_TOKEN НЕ трогать — на них живут бот-токены!)
 # 3) снять сохранённый в БД конфиг и пересоздать сервер
-docker compose exec -T postgres psql -U openmetadata -d openmetadata -c \
+./scripts/compose.sh --env-file .env exec -T postgres \
+  psql -U openmetadata -d openmetadata -c \
   "DELETE FROM openmetadata_settings WHERE configtype IN
    ('authenticationConfiguration','authorizerConfiguration');"
-docker compose --profile heavy up -d --force-recreate openmetadata-server
+./scripts/compose.sh --profile heavy up -d --no-deps --force-recreate openmetadata-server
 ```
 
 Вход — локальный `admin` со СМЕНЁННЫМ паролем (п.2) через SSH-туннель
@@ -240,7 +242,7 @@ Lineage edges are removed when the entity is **hard-deleted** with `recursive=tr
 ```bash
 make om-cleanup-lineage          # DRY-RUN: prints the tables it would hard-delete
 # review the list, then actually delete (entity + its lineage edges):
-docker compose exec openmetadata-ingestion python /opt/configs/cleanup_lineage.py --apply
+./scripts/compose.sh exec openmetadata-ingestion python /opt/configs/cleanup_lineage.py --apply
 ```
 
 The script targets a curated list of the 19 derived-gold tables dropped in epic

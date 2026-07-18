@@ -28,10 +28,12 @@ security/config`; он применяется на лету, без рестар
 запрещён (403), а Keycloak может лежать. Откат — чистка БД + рестарт,
 env-дефолты compose вернут basic:
 
-  docker compose exec -T postgres psql -U openmetadata -d openmetadata -c \\
+  ./scripts/compose.sh --env-file .env exec -T postgres \\
+    psql -U openmetadata -d openmetadata -c \\
     "DELETE FROM openmetadata_settings WHERE configtype IN
      ('authenticationConfiguration','authorizerConfiguration');"
-  docker compose --profile heavy up -d --force-recreate openmetadata-server
+  ./scripts/compose.sh --env-file .env --profile heavy up -d --no-deps \\
+    --force-recreate openmetadata-server
 """
 
 from __future__ import annotations

@@ -214,7 +214,7 @@ rate-limited. The candidate remains `verified=false`: these are the first cold
 observations, not a production budget.
 
 The current runtime fingerprint is
-`cc82ae9ad526544cc827b3e0ab9baa48242a5f376c0b5232bbc2960b6a4fbe72`.
+`0c9d2746532bfe9a60c6ae1943cd30d55abf4268b780ee3ac8405a367396f40b`.
 The earlier fingerprint
 `960283608cb8d5b6602e7d82236c862ade96f30591dd8497704bc32d388498f1` produced one
 accepted EPL season-shape sample (38/38 planned payloads, one browser session,

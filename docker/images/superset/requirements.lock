@@ -1,0 +1,9 @@
+# superset immutable linux/amd64 CPython 3.10 wheel lock
+# Reproduces the already smoke-tested image delta over the pinned base.
+authlib==1.6.9 --hash=sha256:f08b4c14e08f0861dc18a32357b33fbcfd2ea86cfe3fe149484b4d764c4a0ac3
+lz4==4.4.5 --hash=sha256:2a2b7504d2dffed3fd19d4085fe1cc30cf221263fd01030819bdd8d2bb101cf1
+orjson==3.11.9 --hash=sha256:71f3db16e69b667b132e0f305a833d5497da302d801508cbb051ed9a9819da47
+psycopg2-binary==2.9.12 --hash=sha256:c5ee5213445dd45312459029b8c4c0a695461eb517b753d2582315bd07995f5e
+requests==2.34.2 --hash=sha256:2a0d60c172f83ac6ab31e4554906c0f3b3588d37b5cb939b1c061f4907e278e0
+trino==0.338.0 --hash=sha256:093952f8a53b6f47ab357b77cbe92f1d66453290f7d8bcc4b74bd662e5ff2704
+tzlocal==5.4.4 --hash=sha256:aae09f0126a8a86fa736be266eb4a471380d26a0de3bc14844e7821fee3e2a15

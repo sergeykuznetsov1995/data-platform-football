@@ -1,0 +1,228 @@
+# Explicitly opt-in SeaweedFS four-plane topology.
+#
+# Never pass this overlay to routine deployment commands.  The approved
+# scripts/cutover_seaweedfs_topology.sh workflow is responsible for quiescing
+# writers, verifying an off-host backup, stopping `weed mini`, and only then
+# starting these services in order.
+services:
+  seaweedfs-master:
+    image: chrislusf/seaweedfs:4.36@sha256:800b2115c63236e8bd0e5d572dc25dd493dc2feed08b54a2a269dc0101c9d94a
+    container_name: seaweedfs-master
+    hostname: seaweedfs-master
+    environment:
+      SEAWEEDFS_EXPECTED_INVENTORY_SHA256: ${SEAWEEDFS_EXPECTED_INVENTORY_SHA256:-}
+      SEAWEEDFS_ALLOW_FRESH_TRANSITION: ${SEAWEEDFS_ALLOW_FRESH_TRANSITION:-}
+      SEAWEEDFS_VOLUME_SIZE_LIMIT_MB: ${SEAWEEDFS_VOLUME_SIZE_LIMIT_MB:?protected mini volume size is required}
+    restart: unless-stopped
+    stop_grace_period: 60s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+      - DAC_OVERRIDE
+      - FOWNER
+    entrypoint: ["/usr/local/bin/seaweedfs-plane-entrypoint"]
+    command:
+      - master
+      - -ip=seaweedfs-master
+      - -ip.bind=0.0.0.0
+      - -port=9333
+      # `weed master` appends its own `m9333` directory. Point at the volume
+      # root to recover the existing `weed mini -dir=/data` Raft state.
+      - -mdir=/data
+      - -peers=none
+      # The cutover reads the effective value persisted by `weed mini` in
+      # /data/mini.options and pins it in host-protected topology state.
+      - -volumeSizeLimitMB=${SEAWEEDFS_VOLUME_SIZE_LIMIT_MB:?protected mini volume size is required}
+      - -defaultReplication=000
+    volumes:
+      - type: volume
+        source: seaweedfs_data
+        target: /data
+        volume:
+          nocopy: true
+      - ./scripts/seaweedfs_plane_entrypoint.sh:/usr/local/bin/seaweedfs-plane-entrypoint:ro
+    networks:
+      - seaweedfs-control
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9333/cluster/status"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 128M
+
+  seaweedfs-volume:
+    image: chrislusf/seaweedfs:4.36@sha256:800b2115c63236e8bd0e5d572dc25dd493dc2feed08b54a2a269dc0101c9d94a
+    container_name: seaweedfs-volume
+    hostname: seaweedfs-volume
+    environment:
+      SEAWEEDFS_EXPECTED_INVENTORY_SHA256: ${SEAWEEDFS_EXPECTED_INVENTORY_SHA256:-}
+      SEAWEEDFS_ALLOW_FRESH_TRANSITION: ${SEAWEEDFS_ALLOW_FRESH_TRANSITION:-}
+      SEAWEEDFS_VOLUME_SIZE_LIMIT_MB: ${SEAWEEDFS_VOLUME_SIZE_LIMIT_MB:?protected mini volume size is required}
+    restart: unless-stopped
+    stop_grace_period: 90s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+      - DAC_OVERRIDE
+      - FOWNER
+    entrypoint: ["/usr/local/bin/seaweedfs-plane-entrypoint"]
+    command:
+      - volume
+      - -ip=seaweedfs-volume
+      - -ip.bind=0.0.0.0
+      - -port=8080
+      - -dir=/data
+      - -master=seaweedfs-master:9333
+      - -max=0
+      - -minFreeSpace=5
+      - -preStopSeconds=30
+    volumes:
+      - type: volume
+        source: seaweedfs_data
+        target: /data
+        volume:
+          nocopy: true
+      - ./scripts/seaweedfs_plane_entrypoint.sh:/usr/local/bin/seaweedfs-plane-entrypoint:ro
+    networks:
+      - seaweedfs-control
+    depends_on:
+      seaweedfs-master:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/status"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 256M
+
+  seaweedfs-filer:
+    image: chrislusf/seaweedfs:4.36@sha256:800b2115c63236e8bd0e5d572dc25dd493dc2feed08b54a2a269dc0101c9d94a
+    container_name: seaweedfs-filer
+    hostname: seaweedfs-filer
+    environment:
+      SEAWEEDFS_EXPECTED_INVENTORY_SHA256: ${SEAWEEDFS_EXPECTED_INVENTORY_SHA256:-}
+      SEAWEEDFS_ALLOW_FRESH_TRANSITION: ${SEAWEEDFS_ALLOW_FRESH_TRANSITION:-}
+      SEAWEEDFS_VOLUME_SIZE_LIMIT_MB: ${SEAWEEDFS_VOLUME_SIZE_LIMIT_MB:?protected mini volume size is required}
+    restart: unless-stopped
+    stop_grace_period: 60s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+      - DAC_OVERRIDE
+      - FOWNER
+    entrypoint: ["/usr/local/bin/seaweedfs-plane-entrypoint"]
+    command:
+      - filer
+      - -ip=seaweedfs-filer
+      - -ip.bind=0.0.0.0
+      - -port=8888
+      - -master=seaweedfs-master:9333
+      - -defaultStoreDir=/data
+      - -disableDirListing
+    volumes:
+      - type: volume
+        source: seaweedfs_data
+        target: /data
+        volume:
+          nocopy: true
+      - ./scripts/seaweedfs_plane_entrypoint.sh:/usr/local/bin/seaweedfs-plane-entrypoint:ro
+    networks:
+      - seaweedfs-control
+    depends_on:
+      seaweedfs-master:
+        condition: service_healthy
+      seaweedfs-volume:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8888/"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 128M
+
+  seaweedfs:
+    stop_grace_period: 60s
+    # Compose 2.24.4+ `!override` prevents the legacy mini command, data mount,
+    # and filesystem capabilities from leaking into the S3 gateway model.
+    cap_add: !override []
+    command: !override
+      - s3
+      - -ip.bind=0.0.0.0
+      - -port=8333
+      - -filer=seaweedfs-filer:8888
+      - -config=/etc/seaweedfs/s3.config.json
+      - -port.iceberg=0
+      - -iam=false
+      - -allowDeleteBucketNotEmpty=false
+      - -concurrentFileUploadLimit=16
+      - -concurrentUploadLimitMB=512
+    volumes: !override
+      - ${SEAWEEDFS_S3_CONFIG_FILE:-./configs/seaweedfs/s3.config.json}:/etc/seaweedfs/s3.config.json:ro
+      - ./scripts/seaweedfs_legacy_entrypoint.sh:/usr/local/bin/seaweedfs-legacy-entrypoint:ro
+    depends_on:
+      seaweedfs-filer:
+        condition: service_healthy
+    networks: !override
+      seaweedfs-control:
+        aliases:
+          - seaweedfs-s3-internal
+    ports: !reset []
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8333/status"]
+      retries: 12
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 128M
+
+  # The supervised overlay reuses `seaweedfs` itself as the S3 gateway, so the
+  # legacy split gateway must not survive the topology transition.
+  seaweedfs-s3: !reset null
+
+  seaweedfs-s3-proxy:
+    depends_on:
+      seaweedfs-s3: !reset null
+      seaweedfs:
+        condition: service_healthy
+
+volumes:
+  seaweedfs_data:
+    # Recovery can point every supervised plane at a new empty named volume
+    # while preserving the failed volume byte-for-byte for forensics/rollback.
+    name: ${SEAWEEDFS_DATA_VOLUME_NAME:?SEAWEEDFS_DATA_VOLUME_NAME is required}
+    external: true

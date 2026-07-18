@@ -119,7 +119,7 @@ with DAG(
         task_id='scrape_current_ratings',
         bash_command=f"""
 cd /opt/airflow && \
-python dags/scripts/run_clubelo_scraper.py \
+/opt/legacy-scraper-venv/bin/python dags/scripts/run_clubelo_scraper.py \
     --leagues "{leagues_str}" \
     --output /tmp/clubelo_result.json
 """,
@@ -155,7 +155,7 @@ python dags/scripts/run_clubelo_scraper.py \
         bash_command="""
 cd /opt/airflow && \
 rm -f /tmp/clubelo_full_result.json && \
-python dags/scripts/run_clubelo_scraper.py \
+/opt/legacy-scraper-venv/bin/python dags/scripts/run_clubelo_scraper.py \
     --leagues "{{ params.leagues | join(',') }}" \
     --mode full \
     --days-back {{ params.days_back }} \

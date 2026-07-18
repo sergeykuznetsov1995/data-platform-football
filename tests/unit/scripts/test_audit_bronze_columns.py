@@ -3,10 +3,10 @@ Unit tests for scripts/audit_bronze_columns.py — contract-diff + EXPECTED_ABSE
 
 Strategy
 --------
-``audit_bronze_columns`` is a top-level script (not a package) that imports
-``utils.silver_tasks._get_trino_connection`` at module load. That import only
-resolves inside the airflow container, so we inject a stub ``utils.silver_tasks``
-into ``sys.modules`` before loading the script via ``importlib.util``. No network.
+``audit_bronze_columns`` is a top-level script (not a package), so we load it
+via ``importlib.util``.  The root ``conftest.py`` exposes ``dags/`` and the test
+runtime provides Trino, allowing its real ``utils.silver_tasks`` dependency to
+load without opening a connection. No network.
 
 What we cover
 -------------
@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import importlib.util
 import sys
-import types
 from pathlib import Path
 
 import pytest
@@ -32,32 +31,12 @@ _SCRIPT_PATH = REPO_ROOT / 'scripts' / 'audit_bronze_columns.py'
 
 
 def _load_module():
-    # Stub the container-only import so exec_module succeeds on the host.
-    # The stub must NOT leak into sys.modules past load — otherwise later tests
-    # that import the REAL utils.silver_tasks (e.g. test_silver_tasks,
-    # test_dag_transform_sofifa_silver_fallback) pick up this stub and fail with
-    # ImportError. Restore sys.modules in a finally so loading is side-effect-free.
-    stub = types.ModuleType('utils.silver_tasks')
-    stub._get_trino_connection = lambda *a, **k: None  # noqa: E731 — never called here
-    _sentinel = object()
-    _prev_utils = sys.modules.get('utils', _sentinel)
-    _prev_silver = sys.modules.get('utils.silver_tasks', _sentinel)
-    sys.modules.setdefault('utils', types.ModuleType('utils'))
-    sys.modules['utils.silver_tasks'] = stub
-
-    try:
-        spec = importlib.util.spec_from_file_location('audit_bronze_columns', _SCRIPT_PATH)
-        assert spec is not None and spec.loader is not None, f'cannot load {_SCRIPT_PATH}'
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules['audit_bronze_columns'] = mod
-        spec.loader.exec_module(mod)
-        return mod
-    finally:
-        for _name, _prev in (('utils.silver_tasks', _prev_silver), ('utils', _prev_utils)):
-            if _prev is _sentinel:
-                sys.modules.pop(_name, None)
-            else:
-                sys.modules[_name] = _prev
+    spec = importlib.util.spec_from_file_location('audit_bronze_columns', _SCRIPT_PATH)
+    assert spec is not None and spec.loader is not None, f'cannot load {_SCRIPT_PATH}'
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules['audit_bronze_columns'] = mod
+    spec.loader.exec_module(mod)
+    return mod
 
 
 mod = _load_module()

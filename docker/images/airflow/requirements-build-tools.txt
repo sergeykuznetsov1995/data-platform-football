@@ -1,0 +1,4 @@
+# Build-tool immutable wheel lock
+# Generated from the already smoke-tested linux/amd64 Python 3.11 image.
+# Every install uses --require-hashes --only-binary=:all: --no-deps.
+setuptools==80.9.0 --hash=sha256:062d34222ad13e0cc312a4c02d73f059e86a4acbfbdea8f8f76b28c99f306922

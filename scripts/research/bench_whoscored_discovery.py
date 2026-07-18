@@ -14,6 +14,7 @@ import json
 import os
 import time
 from dataclasses import asdict, dataclass
+from datetime import date
 from typing import Any
 
 from scrapers.whoscored.raw_store import WhoScoredRawStore
@@ -40,7 +41,7 @@ class DryRunRepository:
         self.captured = CapturedCatalog()
 
     @staticmethod
-    def load_discovered_catalog() -> Any:
+    def load_catalog_generation_snapshot(**_kwargs: Any) -> Any:
         raise LookupError("dry-run repository has no previous snapshot")
 
     def persist_discovered_catalog(
@@ -51,6 +52,8 @@ class DryRunRepository:
         raw_uri: str,
         payload_sha256: str,
         raw_inputs: list[dict[str, str]],
+        as_of_date: date,
+        **_metadata: Any,
     ) -> None:
         if not raw_uri or len(payload_sha256) != 64:
             raise RuntimeError("catalog commit lacks raw provenance")
@@ -60,7 +63,9 @@ class DryRunRepository:
             seasons=len(rows["seasons"]),
             stages=len(rows["stages"]),
             eligible_scopes=len(catalog.eligible_scopes()),
-            active_scopes=len(catalog.active_scopes()),
+            active_scopes=len(
+                catalog.eligible_scopes(active_only=True, on=as_of_date)
+            ),
             quarantined=len(catalog.quarantined),
             discovery_batch_id=discovery_batch_id,
             raw_inputs=len(raw_inputs),
@@ -73,6 +78,13 @@ def _parser() -> argparse.ArgumentParser:
         "--full-history",
         action="store_true",
         help="discover every season instead of only each tournament's latest season",
+    )
+    parser.add_argument(
+        "--as-of-date",
+        required=True,
+        type=date.fromisoformat,
+        metavar="YYYY-MM-DD",
+        help="immutable source-observation date",
     )
     return parser
 
@@ -96,6 +108,7 @@ def main() -> int:
             transport=transport,
             raw_store=raw_store,
             full_history=args.full_history,
+            as_of_date=args.as_of_date,
         )
     finally:
         transport.close()

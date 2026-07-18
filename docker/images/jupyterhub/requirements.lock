@@ -1,0 +1,9 @@
+# jupyterhub immutable linux/amd64 CPython 3.10 wheel lock
+# Reproduces the already smoke-tested image delta over the pinned base.
+docker==7.1.0 --hash=sha256:c96b93b7f0a746f9e77d325bcfb87422a3d8bd4f03136ae8a85b37f1898d5fc0
+dockerspawner==14.0.0 --hash=sha256:eca73b7e24405eb17760dcfb54ef31390d7d3a929d6b811172318a4704f878ae
+escapism==1.1.0 --hash=sha256:f35bf68009704cbd55dd834add47cc964c12e760cf08749f7cbe60ed882963a0
+jupyterhub-idle-culler==1.4.0 --hash=sha256:0355eacc7ddda89a77a37fac550d1e6b2e92dd108179576a426c6ccf37656792
+oauthenticator==17.3.0 --hash=sha256:1aaa7e21996bb6d53d303ac5362cc26a40812c0dbb722e7bffa24edd813390a1
+pyjwt==2.13.0 --hash=sha256:66adcc2aff09b3f1bbd95fc1e1577df8ac8723c978552fd43304c8a290ac5728
+ruamel.yaml==0.19.1 --hash=sha256:27592957fedf6e0b62f281e96effd28043345e0e66001f97683aa9a40c667c93

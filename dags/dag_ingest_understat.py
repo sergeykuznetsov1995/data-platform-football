@@ -193,7 +193,7 @@ with DAG(
         task_id='scrape_understat_data',
         bash_command=f"""
 cd /opt/airflow && \\
-python dags/scripts/run_understat_scraper.py \\
+/opt/legacy-scraper-venv/bin/python dags/scripts/run_understat_scraper.py \\
     --leagues "{leagues_str}" \\
     --season {{{{ params.season }}}} \\
     --output /tmp/understat_result.json
