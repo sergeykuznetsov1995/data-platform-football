@@ -164,6 +164,19 @@ def _event_year(value: Any, fallback: int) -> int:
     return int(match.group(0)) if match else fallback
 
 
+def _is_source_missing_match_payload(data: Any) -> bool:
+    """FotMob answers HTTP 200 with this exact error body when a match has no
+    stored details (deep history, abandoned fixtures). Anything looser — extra
+    keys, another message — must keep falling through to schema drift."""
+
+    return (
+        isinstance(data, Mapping)
+        and data.get("error") is True
+        and str(data.get("message", "")).strip().lower() == "data not found"
+        and set(data) <= {"error", "matchId", "message"}
+    )
+
+
 def _fetch_manifest_status(fetch: FetchResult) -> ManifestStatus:
     if fetch.outcome in {FetchOutcome.SUCCESS, FetchOutcome.STALE_REPLAY}:
         return ManifestStatus.SUCCESS
@@ -1501,6 +1514,22 @@ class FotMobIngestService:
                     entity_id=key,
                 )
                 self._record_failure(result, key, fetch)
+                continue
+            if _is_source_missing_match_payload(fetch.data):
+                self._commit_for_fetch(
+                    fetch,
+                    target_type="match",
+                    status=ManifestStatus.NOT_AVAILABLE,
+                    competition_id=bundle.scope.competition_id,
+                    source_season_key=bundle.scope.source_season_key,
+                    entity_id=key,
+                    error_code="source_data_not_found",
+                    error=f"matchDetails error payload: {fetch.data.get('message')}",
+                )
+                result.not_available += 1
+                result.metadata["intentional_not_available"] = (
+                    int(result.metadata.get("intentional_not_available", 0)) + 1
+                )
                 continue
             try:
                 row, coverage = self._match_payload_row(match, fetch.data)

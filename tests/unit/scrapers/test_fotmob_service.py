@@ -581,6 +581,39 @@ def test_match_payload_uses_one_request_and_second_call_skips_success():
     )
 
 
+def test_match_payload_data_not_found_body_is_intentional_not_available():
+    bundle = parse_season_bundle(_league_payload(), ScopeRef(47, "2025/2026"))
+    match_url = canonicalize_target("matchDetails", {"matchId": "100"}).canonical_url
+    payload = {"error": True, "message": "Data not found", "matchId": "100"}
+    service, transport, repository = _service({match_url: payload})
+
+    result = service.sync_match_payloads(bundle)
+
+    assert result.ok
+    assert result.not_available == 1
+    assert result.metadata["intentional_not_available"] == 1
+    assert not result.errors
+    assert "fotmob_match_payloads" not in repository.tables
+    commit = next(c for c in repository.commits if c.target_type == "match")
+    assert commit.status == ManifestStatus.NOT_AVAILABLE
+    assert commit.error_code == "source_data_not_found"
+
+
+def test_match_payload_unfamiliar_error_body_stays_schema_drift():
+    bundle = parse_season_bundle(_league_payload(), ScopeRef(47, "2025/2026"))
+    match_url = canonicalize_target("matchDetails", {"matchId": "100"}).canonical_url
+    payload = {"error": True, "message": "Internal error", "matchId": "100"}
+    service, transport, repository = _service({match_url: payload})
+
+    result = service.sync_match_payloads(bundle)
+
+    assert result.not_available == 0
+    assert "intentional_not_available" not in result.metadata
+    assert any("incomplete" in error for error in result.errors)
+    commit = next(c for c in repository.commits if c.target_type == "match")
+    assert commit.status == ManifestStatus.SCHEMA_DRIFT
+
+
 def test_team_snapshots_are_global_observations_not_historical_season_rows():
     bundle = parse_season_bundle(_league_payload(), ScopeRef(47, "2025/2026"))
     team1 = canonicalize_target("teams", {"id": "1"}).canonical_url
