@@ -230,6 +230,9 @@ def test_whoscored_paid_canary_boundaries_are_code_owned_and_available():
     assert loaded.WHOSCORED_PROVIDER_INVOICE_HARD_CAP_AVAILABLE is True
     assert loaded.WHOSCORED_PAID_APPLICATION_GATEWAY_AVAILABLE is True
     assert loaded.WHOSCORED_FULL_PAID_CRAWL_AVAILABLE is False
+    # Daily ingest has its own code-owned gate; backfill stays behind full crawl.
+    assert loaded.daily_ingest_paid_crawl_allowed("dag_ingest_whoscored") is True
+    assert loaded.daily_ingest_paid_crawl_allowed("dag_backfill_whoscored") is False
 
 
 def _whoscored_campaign_context(

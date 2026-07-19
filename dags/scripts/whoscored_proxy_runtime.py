@@ -77,6 +77,7 @@ from scrapers.whoscored.proxy_campaign import (
     ProxyCampaignValidationError,
     ProxyWorkAllocation,
     canonical_json_bytes,
+    daily_ingest_paid_crawl_allowed,
     deterministic_proxy_attempt_id,
     load_proxy_campaign_approval_structure,
 )
@@ -448,7 +449,10 @@ def resolve_paid_runtime(
                 raise ProxyCampaignValidationError(
                     "WhoScored canary approval must match the exact 1 GB contract"
                 )
-        elif not WHOSCORED_FULL_PAID_CRAWL_AVAILABLE:
+        elif not (
+            daily_ingest_paid_crawl_allowed(dag_id)
+            or WHOSCORED_FULL_PAID_CRAWL_AVAILABLE
+        ):
             raise ProxyCampaignValidationError(
                 "WhoScored full paid crawl is disabled pending exact reconciliation"
             )

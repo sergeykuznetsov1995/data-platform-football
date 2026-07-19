@@ -25,11 +25,11 @@ def _mounted_approval_root(monkeypatch, tmp_path):
     monkeypatch.setenv("WHOSCORED_PROXY_APPROVAL_ROOT", str(tmp_path))
 
 
-def _context(conf=None, *, task_id="ingest_active_scope"):
+def _context(conf=None, *, task_id="ingest_active_scope", dag_id="dag_ingest_whoscored"):
     return {
-        "dag": SimpleNamespace(dag_id="dag_ingest_whoscored"),
+        "dag": SimpleNamespace(dag_id=dag_id),
         "dag_run": SimpleNamespace(
-            dag_id="dag_ingest_whoscored",
+            dag_id=dag_id,
             run_id="manual__paid-1",
             conf=dict(conf or {}),
         ),
@@ -39,7 +39,7 @@ def _context(conf=None, *, task_id="ingest_active_scope"):
     }
 
 
-def _signed_approval(*, scope_work_item: str):
+def _signed_approval(*, scope_work_item: str, dag_id: str = "dag_ingest_whoscored"):
     now = datetime.now(timezone.utc)
     unsigned = {
         "schema_version": 2,
@@ -59,7 +59,7 @@ def _signed_approval(*, scope_work_item: str):
             "daily_provider_bytes": 100,
         },
         "limits": {"requests": 4, "leases": 4, "concurrency": 1},
-        "allowed_dag_ids": ["dag_ingest_whoscored"],
+        "allowed_dag_ids": [dag_id],
         "allowed_hosts": sorted(WHOSCORED_PROXY_ALLOWED_HOSTS),
         "allowed_path_families": ["/Matches", "/api"],
         "allocations": [
@@ -287,9 +287,12 @@ def test_direct_projection_removes_and_restores_every_paid_authority(monkeypatch
 
 
 @pytest.mark.unit
-def test_normal_paid_crawl_gate_is_code_owned(monkeypatch, tmp_path):
+def test_backfill_paid_crawl_gate_is_code_owned(monkeypatch, tmp_path):
+    # Backfill stays behind the full-crawl gate; an env var cannot enlarge it.
     work_item = runtime.stable_scope_work_item("WS-252-2=2526")
-    signed = _signed_approval(scope_work_item=work_item)
+    signed = _signed_approval(
+        scope_work_item=work_item, dag_id="dag_backfill_whoscored"
+    )
     approval_path = tmp_path / f"{signed['approval_id']}.json"
     approval_path.write_text(json.dumps(signed), encoding="utf-8")
     approval_path.chmod(0o600)
@@ -307,7 +310,33 @@ def test_normal_paid_crawl_gate_is_code_owned(monkeypatch, tmp_path):
         runtime.WhoScoredProxyRuntimeError,
         match="full paid crawl is disabled",
     ):
-        runtime.resolve_paid_runtime(_context(conf))
+        runtime.resolve_paid_runtime(
+            _context(conf, dag_id="dag_backfill_whoscored")
+        )
+
+
+@pytest.mark.unit
+def test_daily_ingest_paid_crawl_is_admitted_by_code(monkeypatch, tmp_path):
+    # Daily ingest is admitted by its own code-owned gate, without flipping the
+    # full-crawl sentinel (which stays False and keeps backfill locked).
+    assert runtime.WHOSCORED_FULL_PAID_CRAWL_AVAILABLE is False
+    work_item = runtime.stable_scope_work_item("WS-252-2=2526")
+    signed = _signed_approval(scope_work_item=work_item)
+    approval_path = tmp_path / f"{signed['approval_id']}.json"
+    approval_path.write_text(json.dumps(signed), encoding="utf-8")
+    approval_path.chmod(0o600)
+    monkeypatch.setenv("WHOSCORED_PROXY_CONTROL_TOKEN", SECRET)
+    monkeypatch.setenv("WHOSCORED_PROXY_APPROVAL_PATH", str(approval_path))
+    monkeypatch.setattr(runtime, "_verify_release_pins", lambda _approval: None)
+    conf = {
+        "transport_policy": "direct_then_paid",
+        "paid_approval_id": signed["approval_id"],
+        "paid_approval_sha256": signed["approval_sha256"],
+    }
+
+    base = runtime.resolve_paid_runtime(_context(conf))
+    paid = base.for_allocation(task_id="ingest_active_scope", work_item_id=work_item)
+    assert paid.is_paid
 
 
 @pytest.mark.unit

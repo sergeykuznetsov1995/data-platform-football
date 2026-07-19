@@ -317,3 +317,34 @@ throwaway, а не в хрупком общем scheduler.
 - Как реально запустить daily: прод по коду direct-only → либо чистый direct-IP хосту
   (прокси доказал, что дело в host-IP), либо снять sentinel + бюджет ≫1 GiB (для полного
   каталога нереально на 1 GiB).
+
+## Сессия 2026-07-19 — Path A: ежедневный сбор через прокси, «детский замок» на бэкфилл
+
+Решение владельца: «Путь А — гнать daily через прокси» + «пока только код, без покупки».
+Подготовлен ревью-PR (ветка `ops/ws954-production`), живого включения НЕ делалось.
+
+### Код-изменение (детский замок)
+Введён отдельный третий release-гейт для ежедневного сбора, по образцу раздельных гейтов
+канарейки/полного crawl. `dag_ingest_whoscored` допущен к платному пути;
+`dag_backfill_whoscored` остаётся закрыт (`WHOSCORED_FULL_PAID_CRAWL_AVAILABLE` = `False`).
+- `scrapers/whoscored/proxy_campaign.py`: `WHOSCORED_DAILY_INGEST_PAID_CRAWL_AVAILABLE=True`,
+  `WHOSCORED_DAILY_INGEST_PAID_CRAWL_DAG_IDS={dag_ingest_whoscored}`, хелпер
+  `daily_ingest_paid_crawl_allowed(dag_id)`.
+- Три места-энфорсера обновлены: `_assert_paid_release_gates` (runner),
+  `whoscored_proxy_runtime.resolve_paid_runtime` (scheduler),
+  `filter_proxy.create_lease` (filtering-proxy).
+- Тесты: `test_daily_ingest_paid_crawl_gate_admits_ingest_but_not_backfill`,
+  `test_daily_ingest_paid_crawl_is_admitted_by_code`,
+  `test_backfill_paid_crawl_gate_is_code_owned` + boundary в `test_filter_proxy.py`.
+
+### Runbook и цифры
+Полный порядок живого включения, сайзинг тарифа и оговорки —
+[`whoscored-proxy-daily.md`](whoscored-proxy-daily.md).
+Тариф: ~50 GB/мес (полный активный каталог) или ~20–25 GB/мес (скромный старт топ-лиг);
+текущий 1 GB order 38950 — только пробы/канарейки. Бэкфилл (~1–5 TB) — отдельно, не с daily.
+
+### Что осталось за владельцем (для живого daily)
+Одобрить код-релиз → купить тариф → пересборка образа `ready-v1` → свежая (<24 ч) provider
+receipt под новый заказ + admission → подписать non-canary approval на `dag_ingest_whoscored` →
+deployment env + изолированный gateway/filter → триггер daily с
+`conf {transport_policy: direct_then_paid, …}`. Плановый запуск остаётся `direct_only`.
