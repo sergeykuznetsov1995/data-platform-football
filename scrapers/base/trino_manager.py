@@ -90,6 +90,16 @@ class TrinoTableManager:
             self.port = port or int(os.environ.get('TRINO_PORT', 8080))
             logger.info("TRINO_PASSWORD not set, connecting via HTTP (no auth)")
         self._conn = None
+        # The Trino DBAPI connection is NOT thread-safe: one cursor's result
+        # frames interleave with another's on the shared socket. capture_many
+        # fans this manager out across SOFASCORE_MAX_CONCURRENCY publisher
+        # threads (reads via get(), stage inserts, MERGE commits all on this one
+        # connection), which corrupts the client protocol and surfaces as
+        # ICEBERG_CATALOG_ERROR "Failed to load table ..." on unrelated
+        # statements (#951). Serialize every statement on this connection; the
+        # network fetch upstream is already single-session, so this costs no
+        # real throughput. Reentrant so a future nested _execute cannot deadlock.
+        self._conn_lock = threading.RLock()
 
     # Retry settings for connection. A Trino container restart takes ~30-60s
     # (SERVER STARTED ~13s + authenticator warm-up), so the cumulative window
@@ -220,39 +230,42 @@ class TrinoTableManager:
         ``params`` binds ``?`` placeholders in ``sql`` (Trino prepared
         statement) — prefer it over interpolating values into the string.
         """
-        for attempt in range(2):
-            cursor = self.connection.cursor()
-            try:
-                logger.debug(f"Executing SQL: {sql[:200]}...")
-                if params:
-                    cursor.execute(sql, params)
-                else:
-                    cursor.execute(sql)
+        # Serialize the whole cursor lifecycle: concurrent publisher threads
+        # sharing this connection would otherwise interleave frames on the wire.
+        with self._conn_lock:
+            for attempt in range(2):
+                cursor = self.connection.cursor()
+                try:
+                    logger.debug(f"Executing SQL: {sql[:200]}...")
+                    if params:
+                        cursor.execute(sql, params)
+                    else:
+                        cursor.execute(sql)
 
-                if fetch:
-                    return cursor.fetchall()
+                    if fetch:
+                        return cursor.fetchall()
 
-                # Consume results even for DDL/DML to ensure query completes
-                cursor.fetchall()
-                return None
+                    # Consume results even for DDL/DML to ensure query completes
+                    cursor.fetchall()
+                    return None
 
-            except Exception as e:
-                error_str = str(e)
-                is_conn_error = any(msg in error_str for msg in self._CONNECTION_ERRORS)
+                except Exception as e:
+                    error_str = str(e)
+                    is_conn_error = any(msg in error_str for msg in self._CONNECTION_ERRORS)
 
-                if is_conn_error and attempt == 0:
-                    logger.warning(
-                        f"Connection error during SQL execution: {e}. "
-                        f"Resetting connection and retrying..."
-                    )
-                    self._reset_connection()
-                    continue
+                    if is_conn_error and attempt == 0:
+                        logger.warning(
+                            f"Connection error during SQL execution: {e}. "
+                            f"Resetting connection and retrying..."
+                        )
+                        self._reset_connection()
+                        continue
 
-                logger.error(f"SQL execution error: {e}\nSQL (truncated): {sql[:500]}")
-                raise TrinoError(f"SQL execution failed: {e}") from e
+                    logger.error(f"SQL execution error: {e}\nSQL (truncated): {sql[:500]}")
+                    raise TrinoError(f"SQL execution failed: {e}") from e
 
-            finally:
-                cursor.close()
+                finally:
+                    cursor.close()
 
     def _execute_committing(self, sql: str) -> None:
         """Execute an idempotent MERGE, retrying Iceberg commit conflicts.
