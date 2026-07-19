@@ -2650,7 +2650,13 @@ def _compatibility_keys(frame, columns: Sequence[str]) -> List[Tuple[str, ...]]:
             pass
         if str(value) in {'nan', 'NaT', '<NA>'}:
             return '__NULL__'
-        return str(value)
+        # Canonicalise by value, not representation: both native and legacy are
+        # in-process pandas frames but a cache-served scope leaves the native
+        # money column float64 (50000.0) against the legacy Int64 (50000). Bare
+        # str() reported every such row as a mismatch and failed the gate; the
+        # shared helper folds 50000.0 and 50000 to one text while still
+        # distinguishing genuinely different amounts.
+        return _canonical_cell(value)
 
     if frame is None:
         values: List[Tuple[str, ...]] = []
