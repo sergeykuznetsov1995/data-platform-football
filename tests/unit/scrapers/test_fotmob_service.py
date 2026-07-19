@@ -673,6 +673,40 @@ def test_player_next_snapshot_is_global_and_fresh_entity_is_skipped():
     assert row["snapshot_date"] == "2026-07-11"
 
 
+def test_player_null_pageprops_data_is_intentional_not_available():
+    player_url = "https://www.fotmob.com/_next/data/build-1/players/2090857.json"
+    payload = {
+        "pageProps": {"data": None, "fallback": {}, "translations": {}},
+        "__N_SSP": True,
+    }
+    service, _, repository = _service({player_url: payload})
+
+    result = service.sync_player_snapshots([2090857], build_id="build-1")
+
+    assert result.ok
+    assert result.not_available == 1
+    assert result.metadata["intentional_not_available"] == 1
+    assert not result.errors
+    assert "fotmob_player_snapshots" not in repository.tables
+    commit = next(c for c in repository.commits if c.target_type == "player")
+    assert commit.status == ManifestStatus.NOT_AVAILABLE
+    assert commit.error_code == "source_player_no_data"
+
+
+def test_player_payload_without_pageprops_container_stays_parse_failure():
+    player_url = "https://www.fotmob.com/_next/data/build-1/players/10.json"
+    payload = {"unexpected": True}
+    service, _, repository = _service({player_url: payload})
+
+    result = service.sync_player_snapshots([10], build_id="build-1")
+
+    assert result.not_available == 0
+    assert "intentional_not_available" not in result.metadata
+    assert any("parse" in error for error in result.errors)
+    commit = next(c for c in repository.commits if c.target_type == "player")
+    assert commit.status != ManifestStatus.NOT_AVAILABLE
+
+
 def test_player_limit_applies_after_freshness_filter_without_prefix_starvation():
     url10 = "https://www.fotmob.com/_next/data/build-1/players/10.json"
     url20 = "https://www.fotmob.com/_next/data/build-1/players/20.json"
