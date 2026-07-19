@@ -11,6 +11,8 @@ Storage Pipeline:
 
 import logging
 import os
+import random
+import threading
 import time
 import uuid
 from datetime import date, datetime
@@ -23,6 +25,15 @@ import pyarrow as pa
 from scrapers.base.sql_validator import validate_identifier, validate_catalog_qualified_name
 
 logger = logging.getLogger(__name__)
+
+# Serialize idempotent MERGE commits within this process: capture_many fans
+# out up to SOFASCORE_MAX_CONCURRENCY publisher threads whose MERGEs hit the
+# same Iceberg partition and lose the snapshot race to each other faster than
+# a bounded retry can absorb (#951 — EPL manifest burst exhausted 5 retries).
+# All contenders live in this process (cross-task writers are serialized by
+# the Airflow pool), so one process-wide lock removes the conflict entirely;
+# the retry in _execute_committing stays as a guard for external writers.
+_COMMIT_LOCK = threading.Lock()
 
 # Trino client import with graceful fallback
 try:
@@ -181,6 +192,17 @@ class TrinoTableManager:
     _CONNECTION_ERRORS = ('Connection refused', 'Connection reset',
                           'Connection aborted', 'authenticators were not loaded')
 
+    # Optimistic-concurrency retry for idempotent MERGE commits. Concurrent
+    # MERGEs into the same Iceberg partition (e.g. capture_many publishing many
+    # manifest endpoints from one task, up to SOFASCORE_MAX_CONCURRENCY threads)
+    # lose the snapshot race with ICEBERG_COMMIT_ERROR "Found conflicting
+    # files" (#951). The conflict is metadata-only and resolves in ms — retry
+    # with jitter (in-process contenders retry in lockstep without it), much
+    # shorter than the container-restart _CONNECT_BACKOFF window.
+    _COMMIT_RETRIES = 5
+    _COMMIT_BASE = 0.5
+    _COMMIT_CAP = 8.0
+
     def _execute(self, sql: str, fetch: bool = False,
                  params: Optional[tuple] = None) -> Optional[List[Any]]:
         """Execute SQL statement.
@@ -231,6 +253,33 @@ class TrinoTableManager:
 
             finally:
                 cursor.close()
+
+    def _execute_committing(self, sql: str) -> None:
+        """Execute an idempotent MERGE, retrying Iceberg commit conflicts.
+
+        Only safe for statements whose re-execution converges to the same
+        final state (natural-key MERGE upsert, tombstone replace-MERGE): Trino
+        re-plans against the latest committed snapshot on each run. The
+        legacy DELETE+INSERT path must NOT go through here — after the DELETE
+        commits it is no longer idempotent as a unit.
+        """
+        for attempt in range(self._COMMIT_RETRIES):
+            try:
+                with _COMMIT_LOCK:
+                    self._execute(sql)
+                return
+            except TrinoError as e:
+                if (attempt < self._COMMIT_RETRIES - 1
+                        and _is_iceberg_commit_conflict(e)):
+                    delay = min(self._COMMIT_CAP, self._COMMIT_BASE * (2 ** attempt))
+                    delay += random.uniform(0, self._COMMIT_BASE)
+                    logger.warning(
+                        f"Iceberg commit conflict (attempt {attempt + 1}/"
+                        f"{self._COMMIT_RETRIES}), retrying in {delay:.1f}s"
+                    )
+                    time.sleep(delay)
+                    continue
+                raise
 
     def create_schema(self, schema: str) -> None:
         """
@@ -788,7 +837,7 @@ WITH (
                     )
                     update_clause = f"WHEN MATCHED THEN UPDATE SET {assignments} "
                 values = ", ".join(f's."{column}"' for column in df.columns)
-                self._execute(
+                self._execute_committing(
                     f"MERGE INTO {qualified_target} t USING {qualified_stage} s "
                     f"ON {on_clause} {update_clause}"
                     f"WHEN NOT MATCHED THEN INSERT ({cols}) VALUES ({values})"
@@ -811,7 +860,7 @@ WITH (
                 values = ", ".join(
                     f's.\"{column}\"' for column in df.columns
                 )
-                self._execute(
+                self._execute_committing(
                     f"MERGE INTO {qualified_target} t USING {qualified_stage} s "
                     f"ON s.\"{replace_op}\" = 'delete' AND ({equality}) "
                     f"WHEN MATCHED THEN DELETE "
@@ -1089,6 +1138,28 @@ def _is_iceberg_invalid_metadata(error: Exception) -> bool:
     cause = error
     while cause is not None:
         if getattr(cause, 'error_name', None) in _ICEBERG_METADATA_ERRORS:
+            return True
+        cause = getattr(cause, '__cause__', None)
+    return False
+
+
+def _is_iceberg_commit_conflict(error: Exception) -> bool:
+    """
+    Check if error is an Iceberg optimistic-concurrency commit conflict.
+
+    Matches ICEBERG_COMMIT_ERROR by error_name, with a message fallback
+    ("conflicting files" / "Failed to commit the transaction") because
+    _execute() wraps the original TrinoExternalError via 'raise ... from e'
+    and str() flattening can lose the name. Walks the __cause__ chain like
+    _is_iceberg_invalid_metadata.
+    """
+    cause: Optional[BaseException] = error
+    while cause is not None:
+        if getattr(cause, 'error_name', None) == 'ICEBERG_COMMIT_ERROR':
+            return True
+        message = str(cause)
+        if ('conflicting files' in message
+                or 'Failed to commit the transaction' in message):
             return True
         cause = getattr(cause, '__cause__', None)
     return False
