@@ -2746,6 +2746,26 @@ class ControlStore:
             rows = _fetchall(cursor)
             for row in rows:
                 if row["target_id"] != target_id:
+                    if str(row["state"]) == "quarantined":
+                        # A quarantined, mis-classified target still holds this
+                        # canonical URL (e.g. pre-#949 discovery minted the
+                        # /stats/ player-standard page as a season target with
+                        # season_id='stats').  Release the URL onto a dead
+                        # sentinel so the correctly classified target can claim
+                        # it; the quarantined row and its append-only provenance
+                        # are preserved for audit.  This self-heals the mint on
+                        # the next discovery pass, in acceptance and in prod.
+                        cursor.execute(
+                            """
+                            UPDATE fbref_control.page_frontier
+                            SET canonical_url =
+                                    canonical_url || '#superseded:' || %s,
+                                updated_at = clock_timestamp()
+                            WHERE target_id = %s
+                            """,
+                            (target_id, row["target_id"]),
+                        )
+                        continue
                     raise StateConflict(
                         f"Canonical URL already belongs to {row['target_id']}"
                     )

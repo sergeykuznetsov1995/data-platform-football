@@ -991,6 +991,20 @@ def test_recurring_frontier_policy_dominates_one_shot_and_requeues_upgrade():
     assert "THEN clock_timestamp()" in source
 
 
+def test_upsert_supersedes_quarantined_canonical_url_squatter():
+    # A quarantined, mis-classified target holding a canonical URL must not
+    # permanently block the correctly classified target from claiming it
+    # (the #949 /stats/ player-standard mis-mint).  The URL is released onto a
+    # dead sentinel; append-only provenance is never deleted.
+    source = inspect.getsource(ControlStore.upsert_frontier_target)
+
+    assert 'str(row["state"]) == "quarantined"' in source
+    assert "#superseded:" in source
+    assert "UPDATE fbref_control.page_frontier" in source
+    # Non-quarantined squatters must still be a hard conflict.
+    assert "Canonical URL already belongs to" in source
+
+
 def test_registry_transitions_close_out_of_scope_frontier_without_deletion():
     competition_source = inspect.getsource(ControlStore.reconcile_competitions)
     season_source = inspect.getsource(ControlStore.reconcile_seasons)
