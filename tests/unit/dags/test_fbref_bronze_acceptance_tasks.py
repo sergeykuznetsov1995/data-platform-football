@@ -273,7 +273,12 @@ def test_prepare_persists_exact_hash_routes_kinds_and_coverage(monkeypatch):
     kwargs = pipeline.seed_acceptance_cohort.call_args.kwargs
     assert kwargs["run_id"] == "control-run"
     assert kwargs["target_ids"] == selected["target_ids"]
-    assert kwargs["required_page_kinds"] == acceptance.ACCEPTANCE_PAGE_KINDS
+    # 'standings' is intentionally excluded from required coverage (FBref serves
+    # no standalone standings page; 0 targets in the frontier) while remaining in
+    # the ACCEPTANCE_PAGE_KINDS candidate universe (#949).
+    assert kwargs["required_page_kinds"] == tuple(
+        kind for kind in acceptance.ACCEPTANCE_PAGE_KINDS if kind != "standings"
+    )
     assert kwargs["required_routes"] == acceptance.SEASON_STAT_ROUTES
     assert kwargs["coverage_slots"] == {
         item["slot"]: item["target_id"] for item in selected["members"]

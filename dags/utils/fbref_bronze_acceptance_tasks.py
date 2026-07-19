@@ -479,8 +479,17 @@ def prepare_fbref_acceptance_cohort(
         required_page_kinds=tuple(
             kind
             for kind in ACCEPTANCE_PAGE_KINDS
-            if normalized_scope == "current"
-            or kind not in {"competition_index", "competition"}
+            # 'standings' stays in the candidate universe (ACCEPTANCE_PAGE_KINDS)
+            # but is never a required coverage kind: FBref serves no standalone
+            # standings page, so discovery mints 0 standings targets under any
+            # code and no run can ever cover it.  Requiring it would make the
+            # acceptance page-kind coverage gate unsatisfiable (#949), the same
+            # phantom already dropped from _CURRENT_SIMPLE_SLOTS.
+            if kind != "standings"
+            and (
+                normalized_scope == "current"
+                or kind not in {"competition_index", "competition"}
+            )
         ),
         required_routes=SEASON_STAT_ROUTES,
         coverage_slots={
