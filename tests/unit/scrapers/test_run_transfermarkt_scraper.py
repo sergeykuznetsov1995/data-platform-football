@@ -906,6 +906,35 @@ class TestRunnerInternals:
             right, ('player_id', 'mv_date'),
         )
 
+    def test_compatibility_fingerprint_folds_float_and_int_money(self):
+        """A cache-served scope leaves the native money column float64
+        (50000.0) while the legacy projection is Int64 (50000). The parity
+        fingerprint must treat them as one amount, or the dual-write gate
+        fails on every such scope (transfers day-3 regression)."""
+        mod = _import_runner()
+        native = pd.DataFrame({
+            'player_id': ['100553'],
+            'market_value_eur': pd.Series([50000.0], dtype='float64'),
+        })
+        legacy = pd.DataFrame({
+            'player_id': ['100553'],
+            'market_value_eur': pd.Series([50000], dtype='Int64'),
+        })
+
+        assert mod._compatibility_fingerprint(
+            native, ('player_id', 'market_value_eur'),
+        ) == mod._compatibility_fingerprint(
+            legacy, ('player_id', 'market_value_eur'),
+        )
+        # A genuinely different amount must still be caught.
+        other = legacy.copy()
+        other.loc[0, 'market_value_eur'] = 50001
+        assert mod._compatibility_fingerprint(
+            native, ('player_id', 'market_value_eur'),
+        ) != mod._compatibility_fingerprint(
+            other, ('player_id', 'market_value_eur'),
+        )
+
     def test_manifest_requires_compatible_committed_pairs(self):
         mod = _import_runner()
         native_base = {
