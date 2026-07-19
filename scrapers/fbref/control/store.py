@@ -5209,6 +5209,7 @@ class ControlStore:
                   ON attempt.target_id = manifest.target_id
                  AND attempt.content_hash = manifest.content_hash
                 WHERE attempt.run_id = %s AND manifest.dataset <> '__page__'
+                  AND manifest.dataset NOT LIKE 'table:%%'
                   AND (
                     %s::text IS NULL
                     OR (

@@ -787,6 +787,13 @@ def _acceptance_coverage_errors(
         if not isinstance(item, Mapping):
             unsafe_datasets.append("non_mapping")
             continue
+        if str(item.get("dataset") or "").startswith("table:"):
+            # Raw per-table inventory is diagnostic, not the typed bronze
+            # contract (#949).  Typed completeness is enforced by the per-target
+            # __page__/typed:* manifest checks below.  Skip inventory here so an
+            # unclassified auxiliary table (availability='unknown' + reason)
+            # cannot fail the acceptance dataset gate.
+            continue
         availability = str(item.get("availability") or "").casefold()
         statuses = {
             str(item.get(name) or "").casefold()

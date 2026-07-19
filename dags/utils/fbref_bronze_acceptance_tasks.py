@@ -619,6 +619,14 @@ def _validate_dataset_evidence(evidence: Mapping[str, Any]) -> None:
         raise FBrefAcceptanceError("Acceptance dataset evidence is missing")
     failures = []
     for item in datasets:
+        if str(item.get("dataset") or "").startswith("table:"):
+            # Raw per-table inventory (one manifest per source <table>, e.g.
+            # an unclassified auxiliary table carrying availability='unknown'
+            # with reason 'unclassified_source_table') is diagnostic, not part
+            # of the typed bronze contract.  Typed completeness is proven per
+            # slot by _validate_fresh_coverage; skip raw inventory here so a
+            # legitimately-unclassified source table cannot fail this gate (#949).
+            continue
         availability = str(item.get("availability") or "").casefold()
         statuses = {
             str(item.get(name) or "").casefold()
