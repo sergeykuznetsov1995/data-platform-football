@@ -30,7 +30,7 @@ RUN test -n "${FBREF_ACCEPTANCE_GIT_SHA}" \
     && install -d -o root -g root -m 0755 \
         /opt/airflow/runtime-contract/fbref-acceptance \
     && PYTHONDONTWRITEBYTECODE=1 \
-        /usr/local/libexec/whoscored-python-real -I -S \
+        /usr/local/bin/python -I -S \
         /opt/airflow/scripts/verify_fbref_acceptance_image.py \
         --write-manifest \
         --git-sha "${FBREF_ACCEPTANCE_GIT_SHA}" \
