@@ -759,19 +759,29 @@ WITH (
         # Empty copy of the target schema (column names/types incl. metadata).
         # Single-statement replacements carry an operation marker used by the
         # final MERGE; ordinary append/upsert stages remain schema-identical.
+        # ``CREATE TABLE stg AS SELECT * FROM target WHERE false`` READS the
+        # target's metadata to copy its schema. Under capture_many's thread pool
+        # this read races a sibling thread's in-flight MERGE commit on the same
+        # target and aborts with ICEBERG_CATALOG_ERROR "Failed to load table
+        # <target> in ops namespace" (#951). The MERGE already holds _COMMIT_LOCK
+        # (via _execute_committing); serialize the schema-copy read under the same
+        # lock so it never observes the target mid-commit. The slow phase-1 data
+        # insert below stays OUTSIDE the lock — only the fast metadata op is gated.
         if single_statement_replace:
-            self._execute(
-                f"CREATE TABLE {qualified_stage} AS SELECT *, "
-                f"CAST(NULL AS VARCHAR) AS \"{replace_op}\" "
-                f"FROM {qualified_target} WHERE false"
-            )
+            with _COMMIT_LOCK:
+                self._execute(
+                    f"CREATE TABLE {qualified_stage} AS SELECT *, "
+                    f"CAST(NULL AS VARCHAR) AS \"{replace_op}\" "
+                    f"FROM {qualified_target} WHERE false"
+                )
             staged_frame = df.copy()
             staged_frame[replace_op] = "insert"
         else:
-            self._execute(
-                f"CREATE TABLE {qualified_stage} AS SELECT * "
-                f"FROM {qualified_target} WHERE false"
-            )
+            with _COMMIT_LOCK:
+                self._execute(
+                    f"CREATE TABLE {qualified_stage} AS SELECT * "
+                    f"FROM {qualified_target} WHERE false"
+                )
             staged_frame = df
 
         # --- Phase 1: stage every row (all the slow, flaky network I/O). The
@@ -888,7 +898,11 @@ WITH (
             raise
 
         # Swap succeeded — discard the throwaway stage and its snapshot churn.
-        self.drop_table(schema, stage, if_exists=True)
+        # Serialized under the same lock: a concurrent DROP mutates the ops
+        # namespace listing that a sibling thread's target load walks, so an
+        # un-gated drop reintroduces the same ICEBERG_CATALOG_ERROR (#951).
+        with _COMMIT_LOCK:
+            self.drop_table(schema, stage, if_exists=True)
 
         operation = "Merged" if keys else "Inserted"
         logger.info(
