@@ -80,7 +80,10 @@ _CURRENT_SIMPLE_SLOTS = (
     ("competition", "competition"),
     ("season", "season"),
     ("schedule", "schedule"),
-    ("standings", "standings"),
+    # 'standings' is intentionally excluded from the required slots: FBref serves
+    # no standalone standings page, so discovery never mints a standings target
+    # (0 in the frontier under any code) and no typed:standings dataset exists.
+    # Requiring it made the cohort permanently un-assemblable.  See #949.
     ("squad", "squad"),
     ("matchlog", "matchlog"),
 )

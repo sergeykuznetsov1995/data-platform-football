@@ -59,7 +59,6 @@ def _current_candidates() -> list[dict]:
         _candidate("competition", "competition", season_id=None),
         _candidate("season", "season"),
         _candidate("schedule", "schedule"),
-        _candidate("standings", "standings"),
         _candidate("squad", "squad"),
         _candidate("matchlog", "matchlog"),
         _candidate(
@@ -94,7 +93,7 @@ def test_current_cohort_is_deterministic_and_covers_every_required_slot():
     )
 
     assert first == second
-    assert first["cohort_size"] == 16
+    assert first["cohort_size"] == 15
     assert len(first["target_ids"]) == len(set(first["target_ids"]))
     assert set(item["slot"] for item in first["members"]) == set(
         acceptance._required_slots("current")
@@ -176,7 +175,7 @@ def test_history_cohort_uses_exactly_one_complete_male_season():
         [*later, *earlier], scope="history"
     )
 
-    assert result["cohort_size"] == 14
+    assert result["cohort_size"] == 13
     assert result["season"] == {
         "competition_id": "20",
         "season_id": "2023-2024",
