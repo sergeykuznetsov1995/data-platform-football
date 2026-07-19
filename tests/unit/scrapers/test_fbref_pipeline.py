@@ -1072,7 +1072,7 @@ def test_page_v3_recovers_verified_tableless_player_from_v2_raw_offline(
         settings=_settings("current"),
     )
 
-    assert PAGE_DOCUMENT_VERSION == "fbref-page-document-v3"
+    assert PAGE_DOCUMENT_VERSION == "fbref-page-document-v4"
     assert result.parsed == 1
     assert writer.pages[0][0].tables == ()
     assert writer.pages[0][0].errors == ()
