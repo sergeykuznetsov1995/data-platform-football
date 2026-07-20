@@ -548,3 +548,151 @@ def test_paid_source_guard_revalidates_receipt_and_emits_in_task_guard(monkeypat
     assert "WHOSCORED_PAID_ALERT_RECEIPT_SHA256=" + "c" * 64 in command
     assert "unset " + " ".join(runtime._RUNNER_FORBIDDEN_AUTHORITY_ENV_NAMES) in command
     assert command.endswith(" && ")
+
+
+# --- Scheduled paid pointer + catalog-drift resilience (#954 automation) ------
+
+_SCHEDULED_RUN_ID = "scheduled__2026-07-19T10:00:00+00:00"
+
+
+def _scheduled_context(*, dag_id="dag_ingest_whoscored", run_type="scheduled",
+                       run_id=_SCHEDULED_RUN_ID, conf=None):
+    return {
+        "dag": SimpleNamespace(dag_id=dag_id),
+        "dag_run": SimpleNamespace(
+            dag_id=dag_id, run_id=run_id, run_type=run_type, conf=dict(conf or {})
+        ),
+        "run_id": run_id,
+        "ti": SimpleNamespace(task_id="ingest_active_scope", map_index=0, try_number=1),
+        "params": {"direct_only": True, "require_zero_paid": True},
+    }
+
+
+def _write_pointer(tmp_path, *, run_id=_SCHEDULED_RUN_ID, dag_id="dag_ingest_whoscored",
+                   approval_id="wsdaily-approval-x", approval_sha256="c" * 64,
+                   mode=0o600, schema_version=1):
+    root = tmp_path / "pointers"
+    root.mkdir(exist_ok=True)
+    name = hashlib.sha256(run_id.encode("utf-8")).hexdigest() + ".json"
+    path = root / name
+    path.write_text(json.dumps({
+        "schema_version": schema_version,
+        "dag_id": dag_id,
+        "run_id": run_id,
+        "approval_id": approval_id,
+        "approval_sha256": approval_sha256,
+    }))
+    path.chmod(mode)
+    return root, path
+
+
+@pytest.mark.unit
+def test_scheduled_pointer_injects_signed_pins_for_ingest(monkeypatch, tmp_path):
+    root, _ = _write_pointer(tmp_path)
+    monkeypatch.setenv(runtime.SCHEDULED_PAID_POINTER_ROOT_ENV, str(root))
+    conf = runtime._effective_transport_conf(_scheduled_context())
+    assert conf["transport_policy"] == runtime.TRANSPORT_POLICY_DIRECT_THEN_PAID
+    assert conf[runtime.PAID_APPROVAL_ID_CONF] == "wsdaily-approval-x"
+    assert conf[runtime.PAID_APPROVAL_SHA256_CONF] == "c" * 64
+    assert runtime.resolve_transport_policy(_scheduled_context()) == (
+        runtime.TRANSPORT_POLICY_DIRECT_THEN_PAID
+    )
+
+
+@pytest.mark.unit
+def test_manual_run_ignores_scheduled_pointer(monkeypatch, tmp_path):
+    root, _ = _write_pointer(tmp_path)
+    monkeypatch.setenv(runtime.SCHEDULED_PAID_POINTER_ROOT_ENV, str(root))
+    conf = runtime._effective_transport_conf(
+        _scheduled_context(run_type="manual", run_id="manual__x")
+    )
+    assert "transport_policy" not in conf
+
+
+@pytest.mark.unit
+def test_backfill_never_reads_pointer_child_lock(monkeypatch, tmp_path):
+    root, _ = _write_pointer(tmp_path, dag_id="dag_backfill_whoscored")
+    monkeypatch.setenv(runtime.SCHEDULED_PAID_POINTER_ROOT_ENV, str(root))
+    conf = runtime._effective_transport_conf(
+        _scheduled_context(dag_id="dag_backfill_whoscored")
+    )
+    assert "transport_policy" not in conf
+
+
+@pytest.mark.unit
+def test_missing_pointer_stays_direct(monkeypatch, tmp_path):
+    (tmp_path / "pointers").mkdir()
+    monkeypatch.setenv(
+        runtime.SCHEDULED_PAID_POINTER_ROOT_ENV, str(tmp_path / "pointers")
+    )
+    conf = runtime._effective_transport_conf(_scheduled_context())
+    assert "transport_policy" not in conf
+
+
+@pytest.mark.unit
+def test_explicit_conf_wins_over_pointer(monkeypatch, tmp_path):
+    root, _ = _write_pointer(tmp_path)
+    monkeypatch.setenv(runtime.SCHEDULED_PAID_POINTER_ROOT_ENV, str(root))
+    conf = runtime._effective_transport_conf(
+        _scheduled_context(conf={"transport_policy": "direct_only"})
+    )
+    assert conf["transport_policy"] == "direct_only"
+    assert runtime.PAID_APPROVAL_ID_CONF not in conf
+
+
+@pytest.mark.unit
+def test_pointer_run_id_mismatch_raises(monkeypatch, tmp_path):
+    # Pointer keyed by this run_id but declaring a different one inside.
+    root, _ = _write_pointer(tmp_path, run_id=_SCHEDULED_RUN_ID)
+    # Rewrite the body to carry a mismatched run_id.
+    name = hashlib.sha256(_SCHEDULED_RUN_ID.encode()).hexdigest() + ".json"
+    (root / name).write_text(json.dumps({
+        "schema_version": 1, "dag_id": "dag_ingest_whoscored",
+        "run_id": "scheduled__2000-01-01T00:00:00+00:00",
+        "approval_id": "x", "approval_sha256": "c" * 64,
+    }))
+    (root / name).chmod(0o600)
+    monkeypatch.setenv(runtime.SCHEDULED_PAID_POINTER_ROOT_ENV, str(root))
+    with pytest.raises(runtime.WhoScoredProxyRuntimeError):
+        runtime._effective_transport_conf(_scheduled_context())
+
+
+@pytest.mark.unit
+def test_pointer_wrong_mode_raises(monkeypatch, tmp_path):
+    root, _ = _write_pointer(tmp_path, mode=0o644)
+    monkeypatch.setenv(runtime.SCHEDULED_PAID_POINTER_ROOT_ENV, str(root))
+    with pytest.raises(runtime.WhoScoredProxyRuntimeError):
+        runtime._effective_transport_conf(_scheduled_context())
+
+
+@pytest.mark.unit
+def test_for_allocation_missing_ok_degrades_to_direct():
+    from scrapers.whoscored.proxy_campaign import ProxyCampaignApproval
+    approval = ProxyCampaignApproval.from_dict(
+        _signed_approval(scope_work_item="scope-present")
+    )
+    base = runtime.PaidRuntime(
+        policy=runtime.TRANSPORT_POLICY_DIRECT_THEN_PAID,
+        approval_path="/tmp/x.json",
+        approval=approval,
+    )
+    # Unknown scope + missing_ok -> direct-only, never paid.
+    degraded = base.for_allocation(
+        task_id="ingest_active_scope", work_item_id="scope-unknown", missing_ok=True
+    )
+    assert not degraded.is_paid
+    # Unknown scope without missing_ok -> hard error.
+    with pytest.raises(runtime.WhoScoredProxyRuntimeError):
+        base.for_allocation(
+            task_id="ingest_active_scope", work_item_id="scope-unknown"
+        )
+    # Exact match still binds.
+    bound = base.for_allocation(
+        task_id="ingest_active_scope", work_item_id="scope-present", missing_ok=True
+    )
+    assert bound.is_paid and bound.allocation is not None
+
+
+@pytest.mark.unit
+def test_stable_profiles_work_item_is_constant():
+    assert runtime.stable_profiles_work_item() == "profiles-daily"

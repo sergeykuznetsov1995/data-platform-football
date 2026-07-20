@@ -320,3 +320,125 @@ def test_discovery_allocation_cannot_expand_into_capture_paths(tmp_path):
         "https://www.whoscored.com/Matches/123/Live",
         allocation_id=cli.CANARY_DISCOVERY_ALLOCATION_ID,
     )
+
+
+# --- Daily-ingest standing approval issuance (#954 automation) ----------------
+
+import hashlib as _hashlib  # noqa: E402
+
+from scrapers.whoscored.proxy_campaign import (  # noqa: E402
+    WHOSCORED_INGEST_DAG_ID,
+    sign_proxy_campaign_approval as _sign,
+)
+
+
+def _secret_file(tmp_path):
+    path = tmp_path / "secret"
+    path.write_text("k" * 40)
+    path.chmod(0o600)
+    return path
+
+
+def _charter(tmp_path, *, daily_mb=300, days=25, order_id="proxysio-38950"):
+    path = tmp_path / f"charter_{daily_mb}_{days}.json"
+    valid_until = (datetime.now(timezone.utc) + timedelta(days=days)).replace(
+        microsecond=0
+    ).isoformat()
+    path.write_text(json.dumps({
+        "schema_version": 1, "order_id": order_id,
+        "valid_until": valid_until, "daily_mb": daily_mb, "monthly_mb": daily_mb * 30,
+    }))
+    path.chmod(0o600)
+    return path
+
+
+def _scopes_file(tmp_path, scopes=("ENG-Premier League=2526", "INT-World Cup=2026")):
+    path = tmp_path / "scopes.json"
+    path.write_text(json.dumps(list(scopes)))
+    return path
+
+
+_RUN_ID = "scheduled__2026-07-19T10:00:00+00:00"
+
+
+def _issue_args(tmp_path, **overrides):
+    args = {
+        "run_id": _RUN_ID,
+        "scopes_file": str(_scopes_file(tmp_path)),
+        "charter": str(_charter(tmp_path)),
+        "runtime_sha256": "a" * 64,
+        "classifier_sha256": "b" * 64,
+        "total_mb": "150",
+        "approval_root": str(tmp_path / "appr"),
+        "pointer_root": str(tmp_path / "ptr"),
+        "secret_file": str(_secret_file(tmp_path)),
+    }
+    args.update(overrides)
+    argv = [
+        "issue-daily-ingest",
+        "--run-id", args["run_id"],
+        "--scopes-file", args["scopes_file"],
+        "--charter", args["charter"],
+        "--runtime-sha256", args["runtime_sha256"],
+        "--classifier-sha256", args["classifier_sha256"],
+        "--total-mb", str(args["total_mb"]),
+        "--approval-root", args["approval_root"],
+        "--pointer-root", args["pointer_root"],
+        "--secret-file", args["secret_file"],
+    ]
+    return argv
+
+
+@pytest.mark.unit
+def test_issue_daily_ingest_writes_valid_approval_and_pointer(tmp_path):
+    assert cli.main(_issue_args(tmp_path)) == 0
+
+    digest = _hashlib.sha256(_RUN_ID.encode()).hexdigest()
+    pointer = json.loads((tmp_path / "ptr" / f"{digest}.json").read_text())
+    assert stat.S_IMODE((tmp_path / "ptr" / f"{digest}.json").stat().st_mode) == 0o600
+    assert pointer["dag_id"] == WHOSCORED_INGEST_DAG_ID
+    assert pointer["run_id"] == _RUN_ID
+    assert pointer["schema_version"] == 1
+
+    approval_path = tmp_path / "appr" / f"{pointer['approval_id']}.json"
+    assert stat.S_IMODE(approval_path.stat().st_mode) == 0o600
+    approval = ProxyCampaignApproval.from_dict(json.loads(approval_path.read_text()))
+    approval.verify("k" * 40)
+    assert approval.run_id == _RUN_ID
+    assert approval.allowed_dag_ids == (WHOSCORED_INGEST_DAG_ID,)
+    assert not approval.is_exact_canary
+    assert approval.approval_sha256 == pointer["approval_sha256"]
+    # discovery + profiles + 2 scopes = 4 allocations; budgets sum exactly.
+    assert len(approval.allocations) == 4
+    assert sum(a.budget_bytes for a in approval.allocations) == 150_000_000
+
+
+@pytest.mark.unit
+def test_issue_daily_ingest_rejects_expired_charter(tmp_path):
+    argv = _issue_args(tmp_path, charter=str(_charter(tmp_path, days=-1)))
+    with pytest.raises(SystemExit):
+        cli.main(argv)
+
+
+@pytest.mark.unit
+def test_issue_daily_ingest_rejects_budget_over_charter(tmp_path):
+    argv = _issue_args(tmp_path, charter=str(_charter(tmp_path, daily_mb=50)),
+                       total_mb="150")
+    with pytest.raises(SystemExit):
+        cli.main(argv)
+
+
+@pytest.mark.unit
+def test_issue_daily_ingest_rejects_non_scheduled_run_id(tmp_path):
+    argv = _issue_args(tmp_path, run_id="manual__nope")
+    with pytest.raises(SystemExit):
+        cli.main(argv)
+
+
+@pytest.mark.unit
+def test_issue_daily_ingest_rejects_duplicate_scopes(tmp_path):
+    dup = tmp_path / "dups.json"
+    dup.write_text(json.dumps(["A=2526", "A=2526"]))
+    argv = _issue_args(tmp_path, scopes_file=str(dup))
+    with pytest.raises(SystemExit):
+        cli.main(argv)
