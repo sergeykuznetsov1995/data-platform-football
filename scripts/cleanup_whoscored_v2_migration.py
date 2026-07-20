@@ -18,33 +18,58 @@ removed last, only after all guards and suffix-bound backup cleanup pass.
 
 from __future__ import annotations
 
+# ruff: noqa: E402 -- the trust anchor must run before every non-built-in import
+
+import sys as _whoscored_bootstrap_sys
+
+_whoscored_source = __file__
+if not _whoscored_source.startswith("/"):
+    raise RuntimeError("WhoScored entrypoint requires an absolute source path")
+_whoscored_production = _whoscored_source.startswith("/opt/airflow/")
+_whoscored_root = (
+    "/opt/airflow"
+    if _whoscored_production
+    else _whoscored_source.rsplit("/scripts/", 1)[0]
+)
+if _whoscored_production:
+    if getattr(
+        _whoscored_bootstrap_sys, "_whoscored_runtime_startup_schema", None
+    ) != 2:
+        raise RuntimeError("image-baked WhoScored startup anchor is required")
+elif (
+    getattr(_whoscored_bootstrap_sys, "_whoscored_runtime_startup_root", None)
+    != _whoscored_root
+):
+    _whoscored_anchor_path = (
+        _whoscored_root + "/docker/images/airflow/whoscored_runtime_startup.py"
+    )
+    _whoscored_anchor_globals = {
+        "__builtins__": __builtins__,
+        "sys": _whoscored_bootstrap_sys,
+        "_WHOSCORED_RUNTIME_ROOT": _whoscored_root,
+        "_WHOSCORED_REQUIRE_FULL_ATTESTATION": False,
+    }
+    with open(_whoscored_anchor_path, "rb") as _whoscored_anchor_handle:
+        _whoscored_anchor_source = _whoscored_anchor_handle.read()
+    exec(
+        compile(_whoscored_anchor_source, _whoscored_anchor_path, "exec"),
+        _whoscored_anchor_globals,
+    )
+_WHOSCORED_RUNTIME_CONTRACT = (
+    _whoscored_bootstrap_sys._load_whoscored_runtime_contract(_whoscored_root)
+)
+_WHOSCORED_RUNTIME_CONTRACT.require_production_runtime_class(
+    operation="WhoScored V2 migration cleanup"
+)
+
 import argparse
-import importlib.util
 import json
 import re
-import sys
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-while str(PROJECT_ROOT) in sys.path:
-    sys.path.remove(str(PROJECT_ROOT))
-sys.path.insert(0, str(PROJECT_ROOT))
-
-_CONTRACT_NAME = "_dpf_whoscored_v2_object_contract"
-_CONTRACT_PATH = PROJECT_ROOT / "scripts" / "whoscored_v2_object_contract.py"
-_contract = sys.modules.get(_CONTRACT_NAME)
-if _contract is None:
-    _contract_spec = importlib.util.spec_from_file_location(
-        _CONTRACT_NAME, _CONTRACT_PATH
-    )
-    if _contract_spec is None or _contract_spec.loader is None:
-        raise ImportError(f"cannot load WhoScored object contract: {_CONTRACT_PATH}")
-    _contract = importlib.util.module_from_spec(_contract_spec)
-    sys.modules[_CONTRACT_NAME] = _contract
-    _contract_spec.loader.exec_module(_contract)
-
 from scrapers.base.trino_manager import TrinoTableManager  # noqa: E402
+from scripts import whoscored_v2_object_contract as _contract  # noqa: E402
 
 BATCH_COLUMN_BY_TABLE = _contract.BATCH_COLUMN_BY_TABLE
 BUSINESS_REQUIRED_COLUMNS = _contract.BUSINESS_REQUIRED_COLUMNS

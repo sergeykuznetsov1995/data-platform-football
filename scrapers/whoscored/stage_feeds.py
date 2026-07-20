@@ -7,8 +7,10 @@ page as ``touchChannels``, ``goalTypes`` and ``teamsPlayed``.  This module
 normalizes both representations without evaluating source JavaScript.
 
 Only dimensions demonstrated by the current official browser bundle are
-named.  Opaque tuple positions remain positional in ``source_path`` and the
-complete source tuple is retained in ``source_raw_json``.
+named. Opaque tuple positions remain positional in ``source_path``. The exact
+team tuple is retained once per team/feed in ``source_raw_json``; repeating it
+on every flattened scalar row would multiply one source response hundreds of
+times in memory and Iceberg without adding evidence.
 """
 
 from __future__ import annotations
@@ -395,10 +397,10 @@ def _base_row(
     source_path: str,
     stat: str,
     value: Any,
+    source_raw_json: Optional[str],
+    source_record_fingerprint: str,
     subcategory: Optional[str] = None,
 ) -> dict[str, Any]:
-    source_raw_json = canonical_json(team)
-    source_record_fingerprint = schema_fingerprint(team)
     return {
         "league": scope.competition_id,
         "season": scope.season_id,
@@ -672,6 +674,9 @@ def parse_stage_team_feed(
                 f"stagestatfeed contains duplicate team identity {team_id}"
             )
         seen_team_ids.add(team_id)
+        source_raw_json = canonical_json(team)
+        source_record_fingerprint = schema_fingerprint(team)
+        raw_json_pending = True
 
         def add(
             source_path: str,
@@ -679,6 +684,7 @@ def parse_stage_team_feed(
             value: Any,
             subcategory: Optional[str] = None,
         ) -> None:
+            nonlocal raw_json_pending
             key = (team_id, source_path)
             if key in seen_entity_paths:
                 raise WhoScoredParseError(
@@ -698,9 +704,12 @@ def parse_stage_team_feed(
                     source_path=source_path,
                     stat=stat,
                     value=value,
+                    source_raw_json=(source_raw_json if raw_json_pending else None),
+                    source_record_fingerprint=source_record_fingerprint,
                     subcategory=subcategory,
                 )
             )
+            raw_json_pending = False
 
         if spec.shape is StageTeamFeedShape.VECTOR:
             _vector_rows(team=team, team_index=team_index, spec=spec, add=add)

@@ -5,7 +5,8 @@
 # иначе                       -> обычная форма логина (AUTH_DB, локальный админ)
 #
 # Break-glass: если Keycloak лежит, поставь AIRFLOW_OAUTH_ENABLED=false в .env
-# и пересоздай ТОЛЬКО webserver: docker compose up -d --no-deps airflow-webserver
+# и пересоздай ТОЛЬКО webserver:
+# ./scripts/compose.sh --env-file .env up -d --no-deps --force-recreate airflow-webserver
 #
 # Читает только webserver; scheduler этот файл игнорирует.
 # FAB >= 4.3 нативно знает провайдера "keycloak": берёт preferred_username,

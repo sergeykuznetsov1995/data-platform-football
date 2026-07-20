@@ -3,8 +3,8 @@ Master Pipeline DAG
 ===================
 
 Airflow DAG for orchestrating all data ingestion DAGs.
-Uses TriggerDagRunOperator for child DAGs and a fail-closed sensor for the
-independently scheduled 06:00 FBref run.
+Uses TriggerDagRunOperator for trigger-owned child DAGs and fail-closed sensors
+for the independently scheduled 06:00 FBref and 10:00 WhoScored runs.
 
 Schedules daily at 2 PM UTC and is the sole schedule owner for trigger-only
 sources such as FotMob.
@@ -42,15 +42,14 @@ TRIGGERED_INGESTION_DAGS = [
     'dag_ingest_fotmob',
     'dag_ingest_matchhistory',
     'dag_ingest_understat',
-    'dag_ingest_whoscored',
     'dag_ingest_espn',
     'dag_ingest_clubelo',
 ]
 
-# FBref owns its 06:00 schedule and its daily request/byte budget.  Master only
-# waits for that run; triggering it again at 14:00 would create a second
-# control run and could double paid proxy traffic.
-SCHEDULED_INGESTION_DAGS = ['dag_ingest_fbref']
+# FBref and WhoScored own their 06:00/10:00 schedules and request/byte budgets.
+# Master only waits for those exact runs; triggering them again at 14:00 would
+# create duplicate crawls and traffic accounting generations.
+SCHEDULED_INGESTION_DAGS = ['dag_ingest_fbref', 'dag_ingest_whoscored']
 
 # Complete reporting scope (both master-triggered and externally scheduled).
 INGESTION_DAGS = [*TRIGGERED_INGESTION_DAGS, *SCHEDULED_INGESTION_DAGS]
@@ -61,7 +60,7 @@ INGESTION_DAGS = [*TRIGGERED_INGESTION_DAGS, *SCHEDULED_INGESTION_DAGS]
 # downstream from a failed or partial required source would mix generations.
 REQUIRED_SOURCE_TASKS = {
     'dag_ingest_fotmob': 'ingestion_triggers.trigger_fotmob',
-    'dag_ingest_whoscored': 'ingestion_triggers.trigger_whoscored',
+    'dag_ingest_whoscored': 'wait_for_scheduled_whoscored',
 }
 
 # Publication evidence whose failure must make the current master DagRun fail.
@@ -228,9 +227,9 @@ def enforce_required_source_success(**context) -> Dict[str, str]:
 
     The check deliberately reads task instances from *this* master DagRun.
     Looking up the latest child DagRun is racy because a separately scheduled
-    child run can finish while the master is still executing. The
-    TriggerDagRunOperator is configured to fail when its WhoScored child fails,
-    so its task-instance state is the exact publication evidence we need.
+    child run can finish while the master is still executing. Trigger-owned
+    sources and the exact-date WhoScored sensor both expose their publication
+    evidence as task-instance state in this master DagRun.
     """
     from airflow.exceptions import AirflowException
 
@@ -612,6 +611,24 @@ with DAG(
         retries=0,
     )
     trigger_tasks >> required_sources_gate
+
+    # WhoScored is the sole owner of its 10:00 schedule. The 14:00 master run
+    # senses the exact logical date four hours earlier and fails closed on a
+    # missing or failed source generation. ``reschedule`` releases the worker
+    # slot while the source is still running.
+    wait_for_scheduled_whoscored = ExternalTaskSensor(
+        task_id='wait_for_scheduled_whoscored',
+        external_dag_id='dag_ingest_whoscored',
+        external_task_id=None,
+        allowed_states=['success'],
+        failed_states=['failed'],
+        execution_delta=timedelta(hours=4),
+        mode='reschedule',
+        poke_interval=60,
+        timeout=timedelta(hours=8).total_seconds(),
+        check_existence=True,
+    )
+    wait_for_scheduled_whoscored >> required_sources_gate
 
     # FBref runs once per day on its own 06:00 schedule.  The master DAG's
     # 14:00 logical date is eight hours later, so execution_delta maps to the

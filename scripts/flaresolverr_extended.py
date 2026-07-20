@@ -46,15 +46,19 @@ import base64
 import binascii
 import functools
 import hashlib
+import hmac
 import inspect
+import json
 import logging
 import os
 import re
+import secrets
 import sys
 import threading
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import urlsplit
 
@@ -64,13 +68,24 @@ MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 MAX_BATCH_URLS = 8
 MAX_BATCH_RESPONSE_BYTES = 8 * 1024 * 1024
 BATCH_CONCURRENCY = 4
+# All WhoScored browser XHRs share this process.  Pace their *actual browser
+# starts* here, after the caller-side token bucket, so four capacity workers
+# cannot turn independently safe batches into a 16-request source burst.  A
+# 546 ms interval is 109.89 starts/minute; the measured useful/attempt ratio
+# still leaves the 144k page-units/day production gate with bounded headroom.
+GLOBAL_XHR_MIN_START_INTERVAL_MS = 546
+# A paced launch must still have this much of the caller's absolute deadline
+# available at the instant the fixed browser script invokes ``fetch``.  This
+# prevents a queued request from touching the source when it has no realistic
+# chance to finish inside its end-to-end budget.
+XHR_MIN_EXECUTION_MARGIN_MS = 500
+WAITRESS_THREADS = 8
 DEFAULT_TIMEOUT_MS = 60_000
 MAX_TIMEOUT_MS = 120_000
 MIN_TIMEOUT_MS = 1_000
 ALLOWED_PATH_PATTERNS = (
     re.compile(r"\A/statisticsfeed/1/get(?:team|player)statistics\Z"),
     re.compile(r"\A/stagestatfeed/[1-9][0-9]*/stageteams/\Z"),
-    re.compile(r"\A/stageplayerstatfeed/[1-9][0-9]*/playerstats/\Z"),
 )
 _PAYLOAD_FIELDS = frozenset({"url", "session", "maxTimeout"})
 _BATCH_PAYLOAD_FIELDS = frozenset({"urls", "session", "maxTimeout"})
@@ -80,7 +95,464 @@ _FEED_PATH_RE = re.compile(r"\A/[A-Za-z0-9_/-]+\Z")
 _HEADER_NAME_RE = re.compile(r"\A[!#$%&'*+.^_`|~0-9A-Za-z-]+\Z")
 _HEADER_VALUE_CONTROL_RE = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
 
+# The normal shared FlareSolverr remains backward compatible.  A separate paid
+# instance opts into this boundary with the exact value ``1`` and then fails at
+# startup unless it has a strong gateway-only secret.  The secret itself never
+# crosses HTTP: callers send a short-lived HMAC capability bound to the exact
+# method, path, query and request-body bytes.
+PAID_EXCLUSIVE_MODE_ENV = "WHOSCORED_FLARESOLVERR_PAID_EXCLUSIVE"
+PAID_GATEWAY_SECRET_ENV = "WHOSCORED_FLARESOLVERR_GATEWAY_SECRET"
+PAID_GATEWAY_CAPABILITY_SCHEMA = "whoscored-flaresolverr-paid-v1"
+PAID_GATEWAY_INSTANCE_HEADER = "X-Whoscored-Gateway-Instance"
+PAID_GATEWAY_TIMESTAMP_HEADER = "X-Whoscored-Gateway-Timestamp"
+PAID_GATEWAY_NONCE_HEADER = "X-Whoscored-Gateway-Nonce"
+PAID_GATEWAY_CAPABILITY_HEADER = "X-Whoscored-Gateway-Capability"
+PAID_GATEWAY_MAX_CLOCK_SKEW_SECONDS = 30
+PAID_GATEWAY_MAX_REPLAY_ENTRIES = 4096
+_PAID_GATEWAY_INSTANCE_RE = re.compile(r"\A[0-9a-f]{32}\Z")
+_PAID_GATEWAY_NONCE_RE = re.compile(r"\A[0-9a-f]{32}\Z")
+_PAID_GATEWAY_CAPABILITY_RE = re.compile(r"\A[0-9a-f]{64}\Z")
+_PAID_GATEWAY_ENV_UNSET = object()
+
+
+class PaidGatewayConfigurationError(RuntimeError):
+    """The optional paid-exclusive FlareSolverr boundary is unsafe."""
+
+
+def _paid_gateway_secret_bytes(value: object) -> bytes:
+    """Validate a gateway secret without ever rendering it in an error."""
+
+    if isinstance(value, str):
+        encoding_failed = False
+        try:
+            encoded = value.encode("utf-8")
+        except UnicodeEncodeError:
+            encoded = b""
+            encoding_failed = True
+        if encoding_failed:
+            raise PaidGatewayConfigurationError(
+                "paid gateway secret is not valid UTF-8"
+            ) from None
+    elif isinstance(value, bytes):
+        encoded = value
+    else:
+        raise PaidGatewayConfigurationError("paid gateway secret must be text or bytes")
+    if not 32 <= len(encoded) <= 4096 or any(
+        byte <= 0x20 or byte == 0x7F for byte in encoded
+    ):
+        raise PaidGatewayConfigurationError(
+            "paid gateway secret must contain 32..4096 non-whitespace bytes"
+        )
+    return encoded
+
+
+def _paid_gateway_capability_message(
+    *,
+    instance_id: str,
+    method: str,
+    path: str,
+    query_string: str,
+    timestamp: str,
+    nonce: str,
+    body: bytes,
+) -> bytes:
+    """Return one unambiguous HMAC message containing no request body."""
+
+    return json.dumps(
+        {
+            "body_sha256": hashlib.sha256(body).hexdigest(),
+            "instance_id": instance_id,
+            "method": method,
+            "nonce": nonce,
+            "path": path,
+            "query_string": query_string,
+            "schema": PAID_GATEWAY_CAPABILITY_SCHEMA,
+            "timestamp": timestamp,
+        },
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+
+
+def build_paid_gateway_capability_headers(
+    secret: str | bytes,
+    *,
+    instance_id: str,
+    method: str,
+    path: str,
+    body: bytes,
+    query_string: str = "",
+    timestamp: int | None = None,
+    nonce: str | None = None,
+) -> dict[str, str]:
+    """Build one request-scoped, single-use paid-gateway capability.
+
+    This helper defines the wire contract for the future isolated gateway.  It
+    does not read the service environment and never returns the gateway secret.
+    The body digest binds stock ``sessions.*`` and ``request.*`` commands to the
+    exact session named in their JSON payload.
+    """
+
+    key = _paid_gateway_secret_bytes(secret)
+    if _PAID_GATEWAY_INSTANCE_RE.fullmatch(instance_id) is None:
+        raise ValueError("paid gateway instance ID must be lowercase hex")
+    if (
+        not isinstance(method, str)
+        or not method
+        or method != method.upper()
+        or len(method) > 16
+        or not method.isascii()
+    ):
+        raise ValueError("paid gateway method is invalid")
+    if (
+        not isinstance(path, str)
+        or not path.startswith("/")
+        or len(path) > 512
+        or any(ord(character) < 0x20 or ord(character) == 0x7F for character in path)
+    ):
+        raise ValueError("paid gateway path is invalid")
+    if (
+        not isinstance(query_string, str)
+        or len(query_string) > 2048
+        or any(
+            ord(character) < 0x20 or ord(character) == 0x7F
+            for character in query_string
+        )
+    ):
+        raise ValueError("paid gateway query string is invalid")
+    if not isinstance(body, bytes) or len(body) > MAX_REQUEST_BYTES:
+        raise ValueError("paid gateway body is invalid")
+    issued_at = int(time.time()) if timestamp is None else timestamp
+    if isinstance(issued_at, bool) or not isinstance(issued_at, int) or issued_at < 1:
+        raise ValueError("paid gateway timestamp is invalid")
+    request_nonce = secrets.token_hex(16) if nonce is None else nonce
+    if (
+        not isinstance(request_nonce, str)
+        or _PAID_GATEWAY_NONCE_RE.fullmatch(request_nonce) is None
+    ):
+        raise ValueError("paid gateway nonce must be lowercase hex")
+    timestamp_text = str(issued_at)
+    capability = hmac.new(
+        key,
+        _paid_gateway_capability_message(
+            instance_id=instance_id,
+            method=method,
+            path=path,
+            query_string=query_string,
+            timestamp=timestamp_text,
+            nonce=request_nonce,
+            body=body,
+        ),
+        hashlib.sha256,
+    ).hexdigest()
+    return {
+        PAID_GATEWAY_INSTANCE_HEADER: instance_id,
+        PAID_GATEWAY_TIMESTAMP_HEADER: timestamp_text,
+        PAID_GATEWAY_NONCE_HEADER: request_nonce,
+        PAID_GATEWAY_CAPABILITY_HEADER: capability,
+    }
+
+
+class _PaidGatewayAuthorizer:
+    """Verify single-use HMAC capabilities for one FlareSolverr process."""
+
+    def __init__(
+        self,
+        secret: str | bytes,
+        *,
+        instance_id: str | None = None,
+        clock: Any = time.time,
+    ) -> None:
+        self._secret = _paid_gateway_secret_bytes(secret)
+        resolved_instance = instance_id or secrets.token_hex(16)
+        if _PAID_GATEWAY_INSTANCE_RE.fullmatch(resolved_instance) is None:
+            raise PaidGatewayConfigurationError(
+                "paid gateway instance ID must be lowercase hex"
+            )
+        if not callable(clock):
+            raise PaidGatewayConfigurationError("paid gateway clock is invalid")
+        self.instance_id = resolved_instance
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._used_nonces: dict[str, int] = {}
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}(instance_id={self.instance_id!r})"
+
+    def authorize(
+        self,
+        *,
+        method: object,
+        path: object,
+        query_string: object,
+        body: object,
+        headers: Mapping[str, object],
+    ) -> bool:
+        """Authenticate once, atomically consuming a valid nonce."""
+
+        actual_method = method if isinstance(method, str) else ""
+        actual_path = path if isinstance(path, str) else ""
+        actual_query = query_string if isinstance(query_string, str) else ""
+        actual_body = body if isinstance(body, bytes) else b""
+        provided_instance = str(headers.get(PAID_GATEWAY_INSTANCE_HEADER) or "")
+        provided_timestamp = str(headers.get(PAID_GATEWAY_TIMESTAMP_HEADER) or "")
+        provided_nonce = str(headers.get(PAID_GATEWAY_NONCE_HEADER) or "")
+        provided_capability = str(headers.get(PAID_GATEWAY_CAPABILITY_HEADER) or "")
+
+        # Bound attacker-controlled values before including them in the HMAC
+        # message.  A malformed request still performs one compare_digest with
+        # fixed-length values; error handling never depends on secret bytes.
+        message_timestamp = (
+            provided_timestamp if len(provided_timestamp) <= 20 else "<invalid>"
+        )
+        message_nonce = provided_nonce if len(provided_nonce) <= 64 else "<invalid>"
+        expected_capability = hmac.new(
+            self._secret,
+            _paid_gateway_capability_message(
+                instance_id=self.instance_id,
+                method=actual_method[:16],
+                path=actual_path[:512],
+                query_string=actual_query[:2048],
+                timestamp=message_timestamp,
+                nonce=message_nonce,
+                body=actual_body[: MAX_REQUEST_BYTES + 1],
+            ),
+            hashlib.sha256,
+        ).hexdigest()
+        comparable_capability = (
+            provided_capability
+            if _PAID_GATEWAY_CAPABILITY_RE.fullmatch(provided_capability)
+            else "0" * 64
+        )
+        comparable_instance = (
+            provided_instance
+            if _PAID_GATEWAY_INSTANCE_RE.fullmatch(provided_instance)
+            else "0" * 32
+        )
+        capability_matches = secrets.compare_digest(
+            comparable_capability, expected_capability
+        )
+        instance_matches = secrets.compare_digest(comparable_instance, self.instance_id)
+
+        timestamp_shape_valid = bool(
+            1 <= len(provided_timestamp) <= 20
+            and provided_timestamp.isascii()
+            and provided_timestamp.isdecimal()
+        )
+        parsed_timestamp = int(provided_timestamp) if timestamp_shape_valid else 0
+        now = int(self._clock())
+        request_shape_valid = bool(
+            actual_method
+            and actual_method == actual_method.upper()
+            and len(actual_method) <= 16
+            and actual_method.isascii()
+            and actual_path.startswith("/")
+            and len(actual_path) <= 512
+            and len(actual_query) <= 2048
+            and isinstance(body, bytes)
+            and len(actual_body) <= MAX_REQUEST_BYTES
+            and _PAID_GATEWAY_NONCE_RE.fullmatch(provided_nonce) is not None
+            and timestamp_shape_valid
+            and provided_timestamp == str(parsed_timestamp)
+            and parsed_timestamp >= 1
+            and abs(now - parsed_timestamp) <= PAID_GATEWAY_MAX_CLOCK_SKEW_SECONDS
+        )
+        if not (request_shape_valid and capability_matches and instance_matches):
+            return False
+
+        with self._lock:
+            self._used_nonces = {
+                nonce: expires_at
+                for nonce, expires_at in self._used_nonces.items()
+                if expires_at >= now
+            }
+            if (
+                provided_nonce in self._used_nonces
+                or len(self._used_nonces) >= PAID_GATEWAY_MAX_REPLAY_ENTRIES
+            ):
+                return False
+            self._used_nonces[provided_nonce] = (
+                parsed_timestamp + PAID_GATEWAY_MAX_CLOCK_SKEW_SECONDS
+            )
+        return True
+
+
+def _paid_gateway_authorizer_from_environment(
+    environ: Mapping[str, str] | None = None,
+) -> _PaidGatewayAuthorizer | None:
+    source = os.environ if environ is None else environ
+    mode = str(source.get(PAID_EXCLUSIVE_MODE_ENV, ""))
+    if mode in {"", "0"}:
+        return None
+    if mode != "1":
+        raise PaidGatewayConfigurationError(f"{PAID_EXCLUSIVE_MODE_ENV} must be 0 or 1")
+    return _PaidGatewayAuthorizer(source.get(PAID_GATEWAY_SECRET_ENV, ""))
+
+
+def _paid_gateway_request_body(request: Any) -> bytes:
+    """Read and rewind one bounded Bottle body before any route side effect."""
+
+    stream = getattr(request, "body", None)
+    if stream is None:
+        raise ValueError("paid gateway request body is unavailable")
+    try:
+        stream.seek(0)
+        payload = stream.read(MAX_REQUEST_BYTES + 1)
+        stream.seek(0)
+    except (AttributeError, OSError, ValueError) as exc:
+        raise ValueError("paid gateway request body is unreadable") from exc
+    if not isinstance(payload, bytes) or len(payload) > MAX_REQUEST_BYTES:
+        raise ValueError("paid gateway request body is invalid")
+    return payload
+
+
+def _install_paid_gateway_hook(
+    app: Any,
+    *,
+    request: Any,
+    abort: Any,
+    authorizer: _PaidGatewayAuthorizer,
+) -> Any:
+    """Protect every paid-instance ``/v1`` operation before route dispatch."""
+
+    @app.hook("before_request")
+    def paid_gateway_authorization_hook() -> None:
+        method = str(getattr(request, "method", "") or "").upper()
+        path = str(getattr(request, "path", "") or "")
+        if method == "GET" and path in {
+            "/health",
+            "/v1/whoscored/runtime-identity",
+        }:
+            return
+        if path != "/v1" and not path.startswith("/v1/"):
+            return
+        try:
+            body = _paid_gateway_request_body(request)
+            capability_accepted = authorizer.authorize(
+                method=method,
+                path=path,
+                query_string=str(getattr(request, "query_string", "") or ""),
+                body=body,
+                headers=getattr(request, "headers", {}),
+            )
+            content_type = str(getattr(request, "content_type", "") or "")
+            accepted = bool(
+                capability_accepted
+                and method == "POST"
+                and content_type.split(";", 1)[0].lower() == "application/json"
+            )
+        except (TypeError, ValueError):
+            accepted = False
+        if not accepted:
+            # Keep the response deliberately generic.  In particular, never
+            # expose whether timestamp, nonce, body binding or HMAC was wrong.
+            abort(401, "Paid FlareSolverr capability required.")
+
+    return paid_gateway_authorization_hook
+
+
+class _XhrStartPacer:
+    """Arbitrate the real browser ``fetch`` invocation process-wide.
+
+    The lock stays held while the fixed synchronous launch script crosses the
+    WebDriver boundary and invokes ``fetch``.  The next launch is paced from
+    the *completion* of that command, which is conservatively later than its
+    fetch invocation.  Delayed commands therefore reduce throughput instead
+    of turning old absolute reservations into burst credit.
+    """
+
+    def __init__(
+        self,
+        *,
+        interval_ms: int = GLOBAL_XHR_MIN_START_INTERVAL_MS,
+        execution_margin_ms: int = XHR_MIN_EXECUTION_MARGIN_MS,
+        monotonic: Any = time.monotonic,
+        sleep: Any = time.sleep,
+    ) -> None:
+        if isinstance(interval_ms, bool) or not isinstance(interval_ms, int):
+            raise ValueError("XHR pacing interval must be an integer")
+        if interval_ms < 1:
+            raise ValueError("XHR pacing interval must be positive")
+        if (
+            isinstance(execution_margin_ms, bool)
+            or not isinstance(execution_margin_ms, int)
+            or execution_margin_ms < 1
+        ):
+            raise ValueError("XHR execution margin must be a positive integer")
+        self.interval_ms = interval_ms
+        self.execution_margin_ms = execution_margin_ms
+        self._interval_seconds = interval_ms / 1_000.0
+        self._execution_margin_seconds = execution_margin_ms / 1_000.0
+        self._monotonic = monotonic
+        self._sleep = sleep
+        self._lock = threading.Lock()
+        self._last_launch_completed: float | None = None
+
+    def launch(self, *, deadline: float, starter: Any) -> Any:
+        """Run one fixed browser starter at a globally safe actual-start point."""
+
+        if isinstance(deadline, bool) or not isinstance(deadline, (int, float)):
+            raise ValueError("XHR pacing deadline must be numeric")
+        if not callable(starter):
+            raise ValueError("XHR pacing starter must be callable")
+
+        latest_safe_start = float(deadline) - self._execution_margin_seconds
+        lock_wait = latest_safe_start - float(self._monotonic())
+        if lock_wait <= 0 or not self._lock.acquire(timeout=lock_wait):
+            raise XhrEndpointError(
+                "Timed out waiting for the global WhoScored source pace.",
+                http_status=504,
+            )
+
+        attempted = False
+        try:
+            while True:
+                now = float(self._monotonic())
+                safe_start = now
+                if self._last_launch_completed is not None:
+                    safe_start = max(
+                        safe_start,
+                        self._last_launch_completed + self._interval_seconds,
+                    )
+                if safe_start > latest_safe_start:
+                    raise XhrEndpointError(
+                        "Timed out waiting for the global WhoScored source pace.",
+                        http_status=504,
+                    )
+                delay = safe_start - now
+                if delay <= 0:
+                    break
+                self._sleep(delay)
+
+            # Recheck after sleep: scheduler delay must fail closed rather than
+            # launching without the fixed execution margin.
+            if float(self._monotonic()) > latest_safe_start:
+                raise XhrEndpointError(
+                    "Timed out waiting for the global WhoScored source pace.",
+                    http_status=504,
+                )
+            attempted = True
+            return starter()
+        finally:
+            if attempted:
+                # This conservative anchor is later than the synchronous JS
+                # fetch invocation, so every subsequent actual start is at
+                # least the fixed interval apart even if this command was late.
+                self._last_launch_completed = float(self._monotonic())
+            self._lock.release()
+
+
+_XHR_START_PACER = _XhrStartPacer()
+
 PINNED_FLARESOLVERR_VERSION = "3.4.6"
+# Read once and fail startup if the exact mounted helper cannot identify
+# itself. Capacity clients compare this frozen process identity with the host
+# file on every cleanup poll, catching a changed mount without a restart.
+EXTENSION_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+if re.fullmatch(r"[0-9a-f]{64}", EXTENSION_SHA256) is None:
+    raise RuntimeError("Could not establish the FlareSolverr extension identity.")
 # Exact ``inspect.getsource(flaresolverr_service._evil_logic)`` digest from
 # ghcr.io/flaresolverr/flaresolverr:v3.4.6.  The wrapper relies on navigation
 # going through ``driver.get`` after the stock CDP blocklist call, so source
@@ -88,7 +560,27 @@ PINNED_FLARESOLVERR_VERSION = "3.4.6"
 _UPSTREAM_EVIL_LOGIC_SHA256 = (
     "b638d94bad18e6d67022865d9bcecfe07aa4bb4e03cb6129b2157dda9462e24b"
 )
+# Exact ``inspect.getsource(sessions.SessionsStorage)`` digest from the same
+# image.  The lifecycle proxy below depends on create registering only after
+# ``get_webdriver`` and destroy removing the session before ``driver.quit``.
+_UPSTREAM_SESSIONS_STORAGE_SHA256 = (
+    "c1818d4525aa0642820311a636b996baa6004c2ab9464b22081c0b1a71afc5cd"
+)
+# The safe controller preserves this exact v3.4.6 response/error contract while
+# removing request and response DTOs from logs.
+_UPSTREAM_CONTROLLER_V1_SHA256 = (
+    "343f1dcf39ef7fcd684a6cc152e828469d8e25e7ec94faa463cf1ee4edcba69d"
+)
 _MEDIA_PATCH_MARKER = "_whoscored_disable_media_extension"
+_STORAGE_PROXY_MARKER = "_whoscored_capacity_lifecycle_proxy"
+_SAFE_CONTROLLER_MARKER = "_whoscored_safe_v1_controller"
+_SAFE_LOG_FACTORY_MARKER = "_whoscored_safe_log_factory"
+_SENSITIVE_VARIANT_DEPTH = 2
+_MAX_SENSITIVE_VARIANTS_PER_VALUE = 64
+_CAPACITY_OWNER_RE = re.compile(r"\A[a-z0-9]{16,32}\Z")
+_CAPACITY_SESSION_RE = re.compile(r"\Aws-cap-([a-z0-9]{16,32})-(?=.)")
+_LOG_URL_RE = re.compile(r"(?:https?|socks[45]?)://\S+")
+_LOG_SESSION_RE = re.compile(r"\bws-[A-Za-z0-9][A-Za-z0-9_-]{0,96}\b")
 _AUDIO_VIDEO_EXTENSIONS = (
     "mp4",
     "webm",
@@ -257,6 +749,624 @@ def _install_disable_media_extension(
     upstream_service._evil_logic = extended_evil_logic
 
 
+class CapacitySessionLifecycleError(RuntimeError):
+    """The pinned capacity-session lifecycle contract cannot be guaranteed."""
+
+
+@dataclass
+class _OwnerLifecycleState:
+    active: set[str] = field(default_factory=set)
+    pending_create: set[str] = field(default_factory=set)
+    pending_destroy: set[str] = field(default_factory=set)
+    failed_create: set[str] = field(default_factory=set)
+    failed_destroy: set[str] = field(default_factory=set)
+    failure_generation: int = 0
+
+
+class _SensitiveLogValues:
+    """Reference-count secrets only while their request is being handled."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._counts: dict[str, int] = {}
+        self._pattern: re.Pattern[str] | None = None
+
+    @contextmanager
+    def scope(self, *values: Any):
+        variants = {
+            variant
+            for value in values
+            if isinstance(value, str) and value
+            for variant in _sensitive_log_variants(value)
+        }
+        if variants:
+            with self._lock:
+                for variant in variants:
+                    self._counts[variant] = self._counts.get(variant, 0) + 1
+                self._pattern = None
+        try:
+            yield
+        finally:
+            if variants:
+                with self._lock:
+                    for variant in variants:
+                        remaining = self._counts[variant] - 1
+                        if remaining:
+                            self._counts[variant] = remaining
+                        else:
+                            self._counts.pop(variant)
+                    self._pattern = None
+
+    def snapshot(self) -> tuple[str, ...]:
+        with self._lock:
+            return tuple(sorted(self._counts, key=len, reverse=True))
+
+    def redact(self, text: str) -> str:
+        with self._lock:
+            if not self._counts:
+                return text
+            if self._pattern is None:
+                self._pattern = re.compile(
+                    "|".join(
+                        re.escape(variant)
+                        for variant in sorted(self._counts, key=len, reverse=True)
+                    )
+                )
+            pattern = self._pattern
+        return pattern.sub("<redacted>", text)
+
+
+_SENSITIVE_LOG_VALUES = _SensitiveLogValues()
+
+
+def _capacity_owner(session_id: Any) -> str | None:
+    if not isinstance(session_id, str):
+        return None
+    match = _CAPACITY_SESSION_RE.match(session_id)
+    return match.group(1) if match is not None else None
+
+
+def _sensitive_log_variants(value: str) -> set[str]:
+    """Return a bounded two-level closure of common log serialisations."""
+
+    def render_once(item: str) -> set[str]:
+        rendered = (
+            json.dumps(item, ensure_ascii=True),
+            repr(item),
+            repr(item.encode("utf-8")),
+        )
+        variants: set[str] = set()
+        for candidate in rendered:
+            variants.add(candidate)
+            if (
+                len(candidate) >= 2
+                and candidate[0] in {'"', "'"}
+                and candidate[-1] == candidate[0]
+            ):
+                variants.add(candidate[1:-1])
+            elif (
+                len(candidate) >= 3
+                and candidate[0] == "b"
+                and candidate[1] in {'"', "'"}
+                and candidate[-1] == candidate[1]
+            ):
+                variants.add(candidate[2:-1])
+        return {variant for variant in variants if variant}
+
+    variants = {value}
+    frontier = {value}
+    for _ in range(_SENSITIVE_VARIANT_DEPTH):
+        expanded = {
+            rendered
+            for item in frontier
+            for rendered in render_once(item)
+            if rendered not in variants
+        }
+        remaining = _MAX_SENSITIVE_VARIANTS_PER_VALUE - len(variants)
+        if remaining <= 0:
+            break
+        if len(expanded) > remaining:
+            expanded = set(
+                sorted(expanded, key=lambda item: (len(item), item))[:remaining]
+            )
+        variants.update(expanded)
+        frontier = expanded
+        if not frontier:
+            break
+    return variants
+
+
+@contextmanager
+def _sensitive_request_scope(req: Any):
+    """Keep every request-controlled secret redacted for this request only."""
+
+    values = [getattr(req, "session", None), getattr(req, "url", None)]
+    proxy = getattr(req, "proxy", None)
+    if isinstance(proxy, Mapping):
+        values.extend(proxy.get(key) for key in ("url", "username", "password"))
+    with _SENSITIVE_LOG_VALUES.scope(*values):
+        yield
+
+
+def _redact_log_text(value: Any) -> str:
+    try:
+        text = str(value)
+    except Exception:
+        return "<unavailable-log-message>"
+    text = _SENSITIVE_LOG_VALUES.redact(text)
+    text = _LOG_URL_RE.sub("<redacted-url>", text)
+    text = _LOG_SESSION_RE.sub("<redacted-session>", text)
+    return text
+
+
+def _install_safe_logging() -> None:
+    """Sanitise every future LogRecord, including records from dependencies."""
+
+    original_factory = logging.getLogRecordFactory()
+    marker = getattr(original_factory, _SAFE_LOG_FACTORY_MARKER, None)
+    expected_marker = (PINNED_FLARESOLVERR_VERSION,)
+    if marker is not None:
+        if marker != expected_marker:
+            raise CapacitySessionLifecycleError(
+                "An incompatible safe logging factory is already installed."
+            )
+        return
+
+    def safe_factory(*args: Any, **kwargs: Any) -> logging.LogRecord:
+        record = original_factory(*args, **kwargs)
+        try:
+            rendered = record.getMessage()
+        except Exception:
+            rendered = "<unavailable-log-message>"
+        record.msg = _redact_log_text(rendered)
+        record.args = ()
+        # Tracebacks and stack strings can repeat exception messages containing
+        # URLs or credentials after the message itself has been sanitised.
+        record.exc_info = None
+        record.exc_text = None
+        record.stack_info = None
+        return record
+
+    setattr(safe_factory, _SAFE_LOG_FACTORY_MARKER, expected_marker)
+    logging.setLogRecordFactory(safe_factory)
+
+
+def _install_safe_v1_controller(upstream_service: Any, *, version: str) -> None:
+    """Replace the pinned upstream controller's unsafe DTO logging."""
+
+    if version != PINNED_FLARESOLVERR_VERSION:
+        raise CapacitySessionLifecycleError(
+            f"Unsupported FlareSolverr version {version!r}; expected "
+            f"{PINNED_FLARESOLVERR_VERSION!r}."
+        )
+    original = getattr(upstream_service, "controller_v1_endpoint", None)
+    if not callable(original):
+        raise CapacitySessionLifecycleError("Upstream /v1 controller is unavailable.")
+    marker = getattr(original, _SAFE_CONTROLLER_MARKER, None)
+    expected_marker = (
+        PINNED_FLARESOLVERR_VERSION,
+        _UPSTREAM_CONTROLLER_V1_SHA256,
+    )
+    if marker is not None:
+        if marker != expected_marker:
+            raise CapacitySessionLifecycleError(
+                "An incompatible safe /v1 controller is already installed."
+            )
+        return
+
+    try:
+        source = inspect.getsource(original)
+        signature = inspect.signature(original)
+    except (OSError, TypeError, ValueError) as exc:
+        raise CapacitySessionLifecycleError(
+            "Could not inspect upstream /v1 controller."
+        ) from exc
+    if hashlib.sha256(source.encode("utf-8")).hexdigest() != (
+        _UPSTREAM_CONTROLLER_V1_SHA256
+    ):
+        raise CapacitySessionLifecycleError(
+            "Upstream /v1 controller does not match pinned FlareSolverr 3.4.6."
+        )
+    parameters = tuple(signature.parameters.values())
+    if len(parameters) != 1 or parameters[0].name != "req":
+        raise CapacitySessionLifecycleError(
+            "Upstream /v1 controller signature does not match the pinned contract."
+        )
+    handler = getattr(upstream_service, "_controller_v1_handler", None)
+    response_type = getattr(upstream_service, "V1ResponseBase", None)
+    status_error = getattr(upstream_service, "STATUS_ERROR", None)
+    utils_module = getattr(upstream_service, "utils", None)
+    if (
+        not callable(handler)
+        or not callable(response_type)
+        or status_error is None
+        or not callable(getattr(utils_module, "get_flaresolverr_version", None))
+    ):
+        raise CapacitySessionLifecycleError(
+            "Pinned upstream /v1 controller dependencies are unavailable."
+        )
+
+    @functools.wraps(original)
+    def safe_controller(req: Any) -> Any:
+        with _sensitive_request_scope(req):
+            start_ts = int(time.time() * 1_000)
+            logging.info("Incoming request => POST /v1")
+            try:
+                result = handler(req)
+            except Exception as exc:
+                result = response_type({})
+                result.__error_500__ = True
+                result.status = status_error
+                # Preserve the exact upstream API response while keeping the
+                # value out of every server log record.
+                result.message = "Error: " + str(exc)
+                logging.error("FlareSolverr /v1 request failed")
+            result.startTimestamp = start_ts
+            result.endTimestamp = int(time.time() * 1_000)
+            result.version = utils_module.get_flaresolverr_version()
+            # Every stock /v1 response is also a runtime-identity receipt.  The
+            # WhoScored client verifies this before it accepts browser output,
+            # creates a paid session, or attributes any response bytes.
+            result.extension_sha256 = EXTENSION_SHA256
+            logging.info(
+                "Response in %s s",
+                (result.endTimestamp - result.startTimestamp) / 1_000,
+            )
+            return result
+
+    setattr(safe_controller, _SAFE_CONTROLLER_MARKER, expected_marker)
+    upstream_service.controller_v1_endpoint = safe_controller
+
+
+class _TrackingSessionsStorage:
+    """Thread-safe owner lifecycle tracking around pinned SessionsStorage."""
+
+    def __init__(
+        self,
+        delegate: Any,
+        *,
+        platform_version_getter: Any,
+        execution_locks: Any | None = None,
+    ) -> None:
+        self._delegate = delegate
+        self._platform_version_getter = platform_version_getter
+        # Resolve the process registry at construction time (after module
+        # import) so lifecycle cleanup and paced XHR execution use the exact
+        # same per-session lease.
+        self._execution_locks = execution_locks or _SESSION_LOCKS
+        self._state_lock = threading.RLock()
+        self._session_locks_guard = threading.Lock()
+        self._session_locks: dict[str, threading.RLock] = {}
+        self._states: dict[str, _OwnerLifecycleState] = {}
+        self._retained_destroy: dict[str, Any] = {}
+        self._scheduled_destroy: set[str] = set()
+        setattr(
+            self,
+            _STORAGE_PROXY_MARKER,
+            (PINNED_FLARESOLVERR_VERSION, _UPSTREAM_SESSIONS_STORAGE_SHA256),
+        )
+        for session_id in delegate.session_ids():
+            owner = _capacity_owner(session_id)
+            if owner is not None:
+                self._state(owner).active.add(session_id)
+
+    @property
+    def sessions(self) -> Any:
+        return self._delegate.sessions
+
+    @property
+    def execution_locks(self) -> Any:
+        return self._execution_locks
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._delegate, name)
+
+    def _state(self, owner: str) -> _OwnerLifecycleState:
+        with self._state_lock:
+            return self._states.setdefault(owner, _OwnerLifecycleState())
+
+    def _session_lock(self, session_id: str) -> threading.RLock:
+        with self._session_locks_guard:
+            return self._session_locks.setdefault(session_id, threading.RLock())
+
+    def exists(self, session_id: str) -> bool:
+        return self._delegate.exists(session_id)
+
+    def session_ids(self) -> list[str]:
+        return self._delegate.session_ids()
+
+    def create(
+        self,
+        session_id: str | None = None,
+        proxy: dict[str, Any] | None = None,
+        force_new: bool | None = False,
+    ) -> tuple[Any, bool]:
+        owner = _capacity_owner(session_id)
+        if session_id is None:
+            return self._delegate.create(session_id, proxy, force_new)
+        if owner is None:
+            # Named ordinary sessions use the same re-entrant lifecycle lock.
+            # In particular, never let delegate.create(force_new=True) call
+            # delegate.destroy directly and bypass the active-XHR lease.
+            with self._session_lock(session_id):
+                if force_new:
+                    self.destroy(session_id)
+                if self._delegate.exists(session_id):
+                    return self._delegate.sessions[session_id], False
+                return self._delegate.create(session_id, proxy, False)
+        with self._session_lock(session_id):
+            if force_new:
+                self.destroy(session_id)
+            if self._delegate.exists(session_id):
+                session = self._delegate.sessions[session_id]
+                with self._state_lock:
+                    self._state(owner).active.add(session_id)
+                return session, False
+            with self._state_lock:
+                state = self._state(owner)
+                if session_id in state.failed_destroy:
+                    state.failed_create.add(session_id)
+                    state.failure_generation += 1
+                    raise CapacitySessionLifecycleError(
+                        "A capacity session is still waiting for destroy retry."
+                    )
+                state.pending_create.add(session_id)
+            try:
+                session, fresh = self._delegate.create(session_id, proxy, False)
+                if self._delegate.sessions.get(session_id) is not session:
+                    raise CapacitySessionLifecycleError(
+                        "Upstream create returned before session registration."
+                    )
+            except BaseException:
+                with self._state_lock:
+                    state = self._state(owner)
+                    state.pending_create.discard(session_id)
+                    state.failed_create.add(session_id)
+                    if self._delegate.sessions.get(session_id) is not None:
+                        state.active.add(session_id)
+                    state.failure_generation += 1
+                raise
+            with self._state_lock:
+                state = self._state(owner)
+                state.pending_create.discard(session_id)
+                state.failed_create.discard(session_id)
+                state.active.add(session_id)
+            return session, fresh
+
+    def destroy(self, session_id: str) -> bool:
+        owner = _capacity_owner(session_id)
+        if owner is None:
+            with self._session_lock(session_id):
+                with self._execution_locks.acquire(session_id, self, None):
+                    return self._delegate.destroy(session_id)
+        with self._session_lock(session_id):
+            # Wait for any active launch/collection before removing the
+            # session from upstream storage or calling close/quit.  Cleanup is
+            # scheduled on a daemon thread, so this does not block its HTTP
+            # acknowledgement.
+            with self._execution_locks.acquire(session_id, self, None):
+                with self._state_lock:
+                    state = self._state(owner)
+                    session = self._retained_destroy.get(session_id)
+                    if session is None:
+                        session = self._delegate.sessions.pop(session_id, None)
+                    if session is None:
+                        state.active.discard(session_id)
+                        state.pending_destroy.discard(session_id)
+                        return False
+                    state.active.discard(session_id)
+                    state.failed_destroy.discard(session_id)
+                    state.pending_destroy.add(session_id)
+                    self._retained_destroy[session_id] = session
+                try:
+                    if self._platform_version_getter() == "nt":
+                        session.driver.close()
+                    session.driver.quit()
+                except BaseException:
+                    with self._state_lock:
+                        state = self._state(owner)
+                        state.pending_destroy.discard(session_id)
+                        state.failed_destroy.add(session_id)
+                        state.failure_generation += 1
+                    raise
+                with self._state_lock:
+                    state = self._state(owner)
+                    state.pending_destroy.discard(session_id)
+                    state.failed_destroy.discard(session_id)
+                    self._retained_destroy.pop(session_id, None)
+                return True
+
+    def get(self, session_id: str, ttl: Any = None) -> tuple[Any, bool]:
+        session, fresh = self.create(session_id)
+        if ttl is not None and not fresh and session.lifetime() > ttl:
+            session, fresh = self.create(session_id, force_new=True)
+        return session, fresh
+
+    def _start_cleanup_threads(self, targets: list[str]) -> None:
+        def destroy_one(session_id: str) -> None:
+            try:
+                self.destroy(session_id)
+            except BaseException:
+                logging.warning("Capacity browser session cleanup failed")
+            finally:
+                with self._state_lock:
+                    self._scheduled_destroy.discard(session_id)
+
+        for session_id in targets:
+            threading.Thread(
+                target=destroy_one,
+                args=(session_id,),
+                name="capacity-session-cleanup",
+                daemon=True,
+            ).start()
+
+    def schedule_owner_cleanup(self, owner: str) -> bool:
+        """Start daemon retries without waiting for WebDriver close/quit."""
+
+        with self._state_lock:
+            state = self._state(owner)
+            targets = sorted(
+                (state.active | state.failed_destroy) - self._scheduled_destroy
+            )
+            self._scheduled_destroy.update(targets)
+        self._start_cleanup_threads(targets)
+        with self._state_lock:
+            return bool(targets or self._scheduled_destroy)
+
+    def snapshot_then_schedule_owner_cleanup(self, owner: str) -> dict[str, int | bool]:
+        """Freeze evidence before any cleanup attempt can change generation."""
+
+        with self._state_lock:
+            state = self._state(owner)
+            snapshot = self._owner_snapshot_locked(owner, state)
+            targets = sorted(
+                (state.active | state.failed_destroy) - self._scheduled_destroy
+            )
+            self._scheduled_destroy.update(targets)
+        self._start_cleanup_threads(targets)
+        return snapshot
+
+    def _owner_snapshot_locked(
+        self, owner: str, state: _OwnerLifecycleState
+    ) -> dict[str, int | bool]:
+        scheduled = any(
+            _capacity_owner(session_id) == owner
+            for session_id in self._scheduled_destroy
+        )
+        return {
+            "active": len(state.active),
+            "pending_create": len(state.pending_create),
+            "pending_destroy": len(state.pending_destroy),
+            "failed_create": len(state.failed_create),
+            "failed_destroy": len(state.failed_destroy),
+            "failure_generation": state.failure_generation,
+            "cleanup_scheduled": scheduled,
+        }
+
+    def owner_snapshot(self, owner: str) -> dict[str, int | bool]:
+        with self._state_lock:
+            state = self._state(owner)
+            return self._owner_snapshot_locked(owner, state)
+
+
+def _install_capacity_session_tracking(
+    upstream_service: Any,
+    *,
+    version: str,
+) -> _TrackingSessionsStorage:
+    """Install the exact v3.4.6 storage lifecycle proxy idempotently."""
+
+    if version != PINNED_FLARESOLVERR_VERSION:
+        raise CapacitySessionLifecycleError(
+            f"Unsupported FlareSolverr version {version!r}; expected "
+            f"{PINNED_FLARESOLVERR_VERSION!r}."
+        )
+    storage = getattr(upstream_service, "SESSIONS_STORAGE", None)
+    marker = getattr(storage, _STORAGE_PROXY_MARKER, None)
+    expected_marker = (
+        PINNED_FLARESOLVERR_VERSION,
+        _UPSTREAM_SESSIONS_STORAGE_SHA256,
+    )
+    if marker is not None:
+        if marker != expected_marker or not isinstance(
+            storage, _TrackingSessionsStorage
+        ):
+            raise CapacitySessionLifecycleError(
+                "An incompatible capacity lifecycle proxy is already installed."
+            )
+        return storage
+    if storage is None:
+        raise CapacitySessionLifecycleError("Upstream session storage is unavailable.")
+    try:
+        source = inspect.getsource(type(storage))
+    except (OSError, TypeError) as exc:
+        raise CapacitySessionLifecycleError(
+            "Could not inspect upstream SessionsStorage."
+        ) from exc
+    if hashlib.sha256(source.encode("utf-8")).hexdigest() != (
+        _UPSTREAM_SESSIONS_STORAGE_SHA256
+    ):
+        raise CapacitySessionLifecycleError(
+            "Upstream SessionsStorage does not match pinned FlareSolverr 3.4.6."
+        )
+    required = ("sessions", "exists", "session_ids", "get", "create", "destroy")
+    if any(not hasattr(storage, name) for name in required):
+        raise CapacitySessionLifecycleError(
+            "Pinned upstream SessionsStorage interface is incomplete."
+        )
+    utils_module = getattr(upstream_service, "utils", None)
+    if utils_module is None or not hasattr(utils_module, "PLATFORM_VERSION"):
+        raise CapacitySessionLifecycleError(
+            "Upstream platform state is unavailable for safe session destroy."
+        )
+    proxy = _TrackingSessionsStorage(
+        storage,
+        platform_version_getter=lambda: utils_module.PLATFORM_VERSION,
+    )
+    upstream_service.SESSIONS_STORAGE = proxy
+    return proxy
+
+
+_CAPACITY_CLEANUP_RESPONSE_FIELDS = frozenset(
+    {
+        "status",
+        "version",
+        "extension_sha256",
+        "active",
+        "pending_create",
+        "pending_destroy",
+        "failed_create",
+        "failed_destroy",
+        "failure_generation",
+        "cleanup_scheduled",
+    }
+)
+
+
+def _capacity_cleanup_response(
+    *, status: str, snapshot: Mapping[str, int | bool] | None = None
+) -> dict[str, Any]:
+    state = snapshot or {}
+    return {
+        "status": status,
+        "version": PINNED_FLARESOLVERR_VERSION,
+        "extension_sha256": EXTENSION_SHA256,
+        "active": int(state.get("active", 0)),
+        "pending_create": int(state.get("pending_create", 0)),
+        "pending_destroy": int(state.get("pending_destroy", 0)),
+        "failed_create": int(state.get("failed_create", 0)),
+        "failed_destroy": int(state.get("failed_destroy", 0)),
+        "failure_generation": int(state.get("failure_generation", 0)),
+        "cleanup_scheduled": bool(state.get("cleanup_scheduled", False)),
+    }
+
+
+def handle_capacity_session_cleanup(
+    payload: Any,
+    *,
+    storage: Any,
+) -> tuple[dict[str, Any], int]:
+    """Validate, schedule exact-owner cleanup, and return a secret-free snapshot."""
+
+    if type(payload) is not dict or set(payload) != {"owner"}:
+        return _capacity_cleanup_response(status="error"), 400
+    owner = payload.get("owner")
+    if type(owner) is not str or _CAPACITY_OWNER_RE.fullmatch(owner) is None:
+        return _capacity_cleanup_response(status="error"), 400
+    if not isinstance(storage, _TrackingSessionsStorage):
+        return _capacity_cleanup_response(status="error"), 503
+    try:
+        snapshot = storage.snapshot_then_schedule_owner_cleanup(owner)
+        # Protocol acknowledgement, not a count of live worker threads.  A
+        # valid cleanup poll is successfully scheduled even when the exact
+        # owner already has zero sessions.
+        snapshot["cleanup_scheduled"] = True
+    except Exception:
+        logging.error("Capacity browser session cleanup scheduling failed")
+        return _capacity_cleanup_response(status="error"), 500
+    return _capacity_cleanup_response(status="ok", snapshot=snapshot), 200
+
+
 class XhrEndpointError(Exception):
     """A safe error that can be returned by the HTTP endpoint."""
 
@@ -397,49 +1507,111 @@ def _validate_batch_payload(value: Any) -> XhrBatchRequest:
     return XhrBatchRequest(urls=urls, session=session, timeout_ms=timeout_ms)
 
 
-# URL and limits are execute_async_script arguments, never interpolated into
-# this source.  No caller-controlled script, method, headers, or fetch options
-# exist in the endpoint contract.
+# URL, limits, deadline, and opaque operation identifiers are trusted server
+# arguments, never interpolated source and never HTTP fields.  This synchronous
+# fixed script invokes ``fetch`` before returning its acknowledgement, allowing
+# Python to hold the process-global pacing lock across the actual browser start.
+# The response Promise remains in a per-page private registry for collection by
+# a second fixed script after the global lock has been released.
 XHR_SCRIPT = r"""
 const targetUrl = arguments[0];
-const maxBytes = arguments[1];
-const timeoutMs = arguments[2];
-const done = arguments[arguments.length - 1];
+const maxBytesPerResponse = arguments[1];
+const maxAggregateBytes = arguments[2];
+const deadlineEpochMs = arguments[3];
+const minimumExecutionMarginMs = arguments[4];
+const operationKey = arguments[5];
+const itemIndex = arguments[6];
+const registryProperty = "__whoscoredRestrictedXhrV1";
+const allowedPaths = [
+  /^\/statisticsfeed\/1\/get(?:team|player)statistics$/,
+  /^\/stagestatfeed\/[1-9][0-9]*\/stageteams\/$/
+];
+const failure = (kind, started = false) => ({
+  ok: false,
+  started,
+  kind,
+  error: kind === "timeout" ? "fetch_timeout" : kind
+});
 
-(async () => {
+try {
+  const requested = new URL(targetUrl);
+  if (requested.origin !== "https://www.whoscored.com") {
+    throw new Error("forbidden_origin");
+  }
+  if (!allowedPaths.some((pattern) => pattern.test(requested.pathname))) {
+    throw new Error("forbidden_path");
+  }
+  const siteConfig = window.require && window.require.config &&
+    window.require.config.params && window.require.config.params.site;
+  if (!siteConfig || siteConfig.gSiteHeaderName !== "Model-last-Mode" ||
+      typeof siteConfig.gSiteHeaderValue !== "string" ||
+      !/^[A-Za-z0-9+/]{43}=$/.test(siteConfig.gSiteHeaderValue)) {
+    return failure("source_header_unavailable");
+  }
+  if (!Number.isSafeInteger(deadlineEpochMs) ||
+      !Number.isSafeInteger(minimumExecutionMarginMs) ||
+      deadlineEpochMs - Date.now() < minimumExecutionMarginMs) {
+    return failure("timeout");
+  }
+  if (typeof operationKey !== "string" ||
+      !/^xhr-[a-f0-9]{32}$/.test(operationKey) ||
+      !Number.isSafeInteger(itemIndex) || itemIndex < 0 || itemIndex >= 8) {
+    throw new Error("invalid_operation");
+  }
+
+  let registry = window[registryProperty];
+  if (registry === undefined) {
+    registry = Object.create(null);
+    Object.defineProperty(window, registryProperty, {
+      value: registry,
+      configurable: true
+    });
+  }
+  if (!registry || Object.getPrototypeOf(registry) !== null) {
+    throw new Error("invalid_registry");
+  }
+  let operation = registry[operationKey];
+  if (operation === undefined) {
+    operation = {
+      consumedBytes: 0,
+      aggregateTooLarge: false,
+      controllers: new Set(),
+      entries: Object.create(null),
+      maxAggregateBytes
+    };
+    registry[operationKey] = operation;
+  }
+  if (operation.maxAggregateBytes !== maxAggregateBytes ||
+      operation.entries[itemIndex] !== undefined) {
+    throw new Error("invalid_operation");
+  }
+
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let deadlineExpired = false;
   let reader = null;
+  let itemBytes = 0;
+  const timer = setTimeout(() => {
+    deadlineExpired = true;
+    controller.abort();
+  }, Math.max(1, deadlineEpochMs - Date.now()));
+  operation.controllers.add(controller);
+
+  // This is the globally arbitrated event.  There is no await, timer, queue,
+  // or caller-controlled pacing value between the final deadline check and
+  // the fixed fetch invocation.
+  let responsePromise;
   try {
-    const requested = new URL(targetUrl);
-    if (requested.origin !== "https://www.whoscored.com") {
-      throw new Error("forbidden_origin");
+    if (deadlineEpochMs - Date.now() < minimumExecutionMarginMs) {
+      clearTimeout(timer);
+      operation.controllers.delete(controller);
+      return failure("timeout");
     }
-    const allowedPaths = [
-      /^\/statisticsfeed\/1\/get(?:team|player)statistics$/,
-      /^\/stagestatfeed\/[1-9][0-9]*\/stageteams\/$/,
-      /^\/stageplayerstatfeed\/[1-9][0-9]*\/playerstats\/$/
-    ];
-    if (!allowedPaths.some((pattern) => pattern.test(requested.pathname))) {
-      throw new Error("forbidden_path");
-    }
-    // WhoScored publishes a per-page request token in a fixed RequireJS config
-    // and its own statistics XHR adds it as Model-last-Mode.  Read only that
-    // exact server-provided field; callers cannot supply a name or value.
-    const siteConfig = window.require && window.require.config &&
-      window.require.config.params && window.require.config.params.site;
-    if (!siteConfig || siteConfig.gSiteHeaderName !== "Model-last-Mode" ||
-        typeof siteConfig.gSiteHeaderValue !== "string" ||
-        !/^[A-Za-z0-9+/]{43}=$/.test(siteConfig.gSiteHeaderValue)) {
-      throw new Error("source_header_unavailable");
-    }
-    const response = await fetch(requested.href, {
+    responsePromise = fetch(requested.href, {
       method: "GET",
       credentials: "same-origin",
       mode: "cors",
-      // Never follow redirects: final-URL validation after a follow is too
-      // late to prevent browser egress to a hostile redirect target.  Exact
-      // source URL migrations must be mapped by trusted Python code instead.
+      // Never follow redirects: an allow-list check after following is too
+      // late to prevent browser egress outside the fixed source origin.
       redirect: "error",
       headers: {
         "Accept": "application/json, text/javascript, */*; q=0.01",
@@ -448,255 +1620,126 @@ const done = arguments[arguments.length - 1];
       },
       signal: controller.signal
     });
-
-    const finalUrl = new URL(response.url);
-    if (finalUrl.origin !== "https://www.whoscored.com") {
-      throw new Error("forbidden_final_origin");
-    }
-    if (!allowedPaths.some((pattern) => pattern.test(finalUrl.pathname))) {
-      throw new Error("forbidden_final_path");
-    }
-
-    const chunks = [];
-    let total = 0;
-    if (response.body && response.body.getReader) {
-      reader = response.body.getReader();
-      while (true) {
-        const item = await reader.read();
-        if (item.done) break;
-        total += item.value.byteLength;
-        if (total > maxBytes) {
-          await reader.cancel("response_too_large");
-          done({ok: false, kind: "response_too_large", error: "response_too_large"});
-          return;
-        }
-        chunks.push(item.value);
-      }
-    } else {
-      // arrayBuffer() cannot enforce the hard ceiling while downloading.
-      throw new Error("response_stream_unavailable");
-    }
-
-    const body = new Uint8Array(total);
-    let offset = 0;
-    for (const chunk of chunks) {
-      body.set(chunk, offset);
-      offset += chunk.byteLength;
-    }
-    let binary = "";
-    const encodeChunk = 0x8000;
-    for (let index = 0; index < body.length; index += encodeChunk) {
-      binary += String.fromCharCode.apply(
-        null, body.subarray(index, Math.min(index + encodeChunk, body.length))
-      );
-    }
-
-    done({
-      ok: true,
-      finalUrl: finalUrl.href,
-      status: response.status,
-      headers: Object.fromEntries(response.headers.entries()),
-      bodyBase64: btoa(binary),
-      responseBytes: total
-    });
   } catch (error) {
-    const aborted = error && error.name === "AbortError";
-    const sourceHeaderMissing = error && error.message === "source_header_unavailable";
-    const sourceRedirectRejected = error &&
-      (error.message === "forbidden_final_origin" ||
-       error.message === "forbidden_final_path");
-    done({
-      ok: false,
-      kind: aborted ? "timeout" :
-        (sourceHeaderMissing ? "source_header_unavailable" :
-         (sourceRedirectRejected ? "source_redirect_rejected" : "fetch_failed")),
-      error: aborted ? "fetch_timeout" :
-        (sourceHeaderMissing ? "source_header_unavailable" :
-         (sourceRedirectRejected ? "source_redirect_rejected" : "fetch_failed"))
-    });
-  } finally {
-    clearTimeout(timer);
-    if (reader) {
-      try { reader.releaseLock(); } catch (_) {}
-    }
+    responsePromise = Promise.reject(error);
   }
-})();
+
+  operation.entries[itemIndex] = (async () => {
+    try {
+      const response = await responsePromise;
+      const finalUrl = new URL(response.url);
+      if (finalUrl.origin !== "https://www.whoscored.com") {
+        throw new Error("forbidden_final_origin");
+      }
+      if (!allowedPaths.some((pattern) => pattern.test(finalUrl.pathname))) {
+        throw new Error("forbidden_final_path");
+      }
+
+      const chunks = [];
+      if (response.body && response.body.getReader) {
+        reader = response.body.getReader();
+        while (true) {
+          const item = await reader.read();
+          if (item.done) break;
+          itemBytes += item.value.byteLength;
+          operation.consumedBytes += item.value.byteLength;
+          if (operation.consumedBytes > maxAggregateBytes) {
+            operation.aggregateTooLarge = true;
+            for (const activeController of operation.controllers) {
+              activeController.abort();
+            }
+            throw new Error("aggregate_too_large");
+          }
+          if (itemBytes > maxBytesPerResponse) {
+            await reader.cancel("response_too_large");
+            throw new Error("response_too_large");
+          }
+          chunks.push(item.value);
+        }
+      } else {
+        throw new Error("response_stream_unavailable");
+      }
+
+      const body = new Uint8Array(itemBytes);
+      let offset = 0;
+      for (const chunk of chunks) {
+        body.set(chunk, offset);
+        offset += chunk.byteLength;
+      }
+      let binary = "";
+      const encodeChunk = 0x8000;
+      for (let position = 0; position < body.length; position += encodeChunk) {
+        binary += String.fromCharCode.apply(
+          null,
+          body.subarray(position, Math.min(position + encodeChunk, body.length))
+        );
+      }
+      return {
+        ok: true,
+        requestedUrl: targetUrl,
+        finalUrl: finalUrl.href,
+        status: response.status,
+        headers: Object.fromEntries(response.headers.entries()),
+        bodyBase64: btoa(binary),
+        responseBytes: itemBytes
+      };
+    } catch (error) {
+      const message = error && error.message;
+      const aborted = error && error.name === "AbortError";
+      const kind = operation.aggregateTooLarge || message === "aggregate_too_large" ?
+        "aggregate_too_large" :
+        (message === "response_too_large" ? "response_too_large" :
+        ((message === "forbidden_final_origin" ||
+          message === "forbidden_final_path") ? "source_redirect_rejected" :
+         (aborted && deadlineExpired ? "timeout" : "fetch_failed")));
+      return {
+        ok: false,
+        requestedUrl: targetUrl,
+        kind,
+        error: kind === "timeout" ? "fetch_timeout" : kind
+      };
+    } finally {
+      clearTimeout(timer);
+      operation.controllers.delete(controller);
+      if (reader) {
+        try { reader.releaseLock(); } catch (_) {}
+      }
+    }
+  })();
+  return {ok: true, started: true, itemIndex};
+} catch (error) {
+  return failure("fetch_failed");
+}
 """.strip()
 
 
-# This is intentionally a second fixed script rather than caller-provided
-# JavaScript.  URL, count, concurrency and byte limits are positional values
-# supplied by the trusted server implementation.  The HTTP API exposes only
-# ``urls``, the existing session ID and the bounded overall timeout.
-BATCH_XHR_SCRIPT = r"""
-const targetUrls = arguments[0];
-const maxBytesPerResponse = arguments[1];
-const maxAggregateBytes = arguments[2];
-const timeoutMs = arguments[3];
-const concurrency = arguments[4];
+# Batch launches use the same immutable start script.  Python sends at most
+# four starts before collecting that wave, preserving the documented browser
+# concurrency ceiling while independent sessions can overlap their I/O.
+BATCH_XHR_SCRIPT = XHR_SCRIPT
+
+
+XHR_COLLECT_SCRIPT = r"""
+const operationKey = arguments[0];
+const itemIndexes = arguments[1];
+const finishOperation = arguments[2];
 const done = arguments[arguments.length - 1];
+const registryProperty = "__whoscoredRestrictedXhrV1";
 
 (async () => {
-  const allowedPaths = [
-    /^\/statisticsfeed\/1\/get(?:team|player)statistics$/,
-    /^\/stagestatfeed\/[1-9][0-9]*\/stageteams\/$/,
-    /^\/stageplayerstatfeed\/[1-9][0-9]*\/playerstats\/$/
-  ];
-  // consumedBytes is monotonic across successes and failures. This bounds
-  // actual source bytes read by the whole batch, not merely returned bodies.
-  let consumedBytes = 0;
-  let successBytes = 0;
-  let aggregateTooLarge = false;
-  let nextIndex = 0;
-  const results = new Array(targetUrls.length);
-  const controllers = new Set();
-  let deadlineExpired = false;
-  const timer = setTimeout(() => {
-    deadlineExpired = true;
-    for (const controller of controllers) controller.abort();
-  }, timeoutMs);
-
   try {
-    const siteConfig = window.require && window.require.config &&
-      window.require.config.params && window.require.config.params.site;
-    if (!siteConfig || siteConfig.gSiteHeaderName !== "Model-last-Mode" ||
-        typeof siteConfig.gSiteHeaderValue !== "string" ||
-        !/^[A-Za-z0-9+/]{43}=$/.test(siteConfig.gSiteHeaderValue)) {
-      throw new Error("source_header_unavailable");
+    const registry = window[registryProperty];
+    const operation = registry && registry[operationKey];
+    if (!operation || !Array.isArray(itemIndexes)) {
+      throw new Error("missing_operation");
     }
-
-    const fetchOne = async (index) => {
-      const targetUrl = targetUrls[index];
-      if (aggregateTooLarge) return;
-      if (deadlineExpired) {
-        results[index] = {
-          ok: false,
-          requestedUrl: targetUrl,
-          kind: "timeout",
-          error: "fetch_timeout"
-        };
-        return;
-      }
-      const controller = new AbortController();
-      controllers.add(controller);
-      let reader = null;
-      let itemBytes = 0;
-      try {
-        const requested = new URL(targetUrl);
-        if (requested.origin !== "https://www.whoscored.com") {
-          throw new Error("forbidden_origin");
-        }
-        if (!allowedPaths.some((pattern) => pattern.test(requested.pathname))) {
-          throw new Error("forbidden_path");
-        }
-        const response = await fetch(requested.href, {
-          method: "GET",
-          credentials: "same-origin",
-          mode: "cors",
-          // Reject before following any redirect; see the single-fetch
-          // contract above. A rejected fetch returns no source body.
-          redirect: "error",
-          headers: {
-            "Accept": "application/json, text/javascript, */*; q=0.01",
-            "X-Requested-With": "XMLHttpRequest",
-            "Model-last-Mode": siteConfig.gSiteHeaderValue
-          },
-          signal: controller.signal
-        });
-
-        const finalUrl = new URL(response.url);
-        if (finalUrl.origin !== "https://www.whoscored.com") {
-          throw new Error("forbidden_final_origin");
-        }
-        if (!allowedPaths.some((pattern) => pattern.test(finalUrl.pathname))) {
-          throw new Error("forbidden_final_path");
-        }
-
-        const chunks = [];
-        if (response.body && response.body.getReader) {
-          reader = response.body.getReader();
-          while (true) {
-            const item = await reader.read();
-            if (item.done) break;
-            itemBytes += item.value.byteLength;
-            consumedBytes += item.value.byteLength;
-            if (consumedBytes > maxAggregateBytes) {
-              aggregateTooLarge = true;
-              for (const activeController of controllers) activeController.abort();
-              throw new Error("aggregate_too_large");
-            }
-            if (itemBytes > maxBytesPerResponse) {
-              await reader.cancel("response_too_large");
-              throw new Error("response_too_large");
-            }
-            chunks.push(item.value);
-          }
-        } else {
-          throw new Error("response_stream_unavailable");
-        }
-
-        const body = new Uint8Array(itemBytes);
-        let offset = 0;
-        for (const chunk of chunks) {
-          body.set(chunk, offset);
-          offset += chunk.byteLength;
-        }
-        let binary = "";
-        const encodeChunk = 0x8000;
-        for (let position = 0; position < body.length; position += encodeChunk) {
-          binary += String.fromCharCode.apply(
-            null,
-            body.subarray(position, Math.min(position + encodeChunk, body.length))
-          );
-        }
-        results[index] = {
-          ok: true,
-          requestedUrl: targetUrl,
-          finalUrl: finalUrl.href,
-          status: response.status,
-          headers: Object.fromEntries(response.headers.entries()),
-          bodyBase64: btoa(binary),
-          responseBytes: itemBytes
-        };
-        successBytes += itemBytes;
-      } catch (error) {
-        const message = error && error.message;
-        const aborted = error && error.name === "AbortError";
-        const kind = aggregateTooLarge || message === "aggregate_too_large" ?
-          "aggregate_too_large" :
-          (message === "response_too_large" ? "response_too_large" :
-          ((message === "forbidden_final_origin" ||
-            message === "forbidden_final_path") ? "source_redirect_rejected" :
-           (aborted && deadlineExpired ? "timeout" : "fetch_failed")));
-        results[index] = {
-          ok: false,
-          requestedUrl: targetUrl,
-          kind,
-          error: kind === "timeout" ? "fetch_timeout" : kind
-        };
-      } finally {
-        controllers.delete(controller);
-        if (reader) {
-          try { reader.releaseLock(); } catch (_) {}
-        }
-      }
-    };
-
-    const worker = async () => {
-      while (true) {
-        if (aggregateTooLarge) return;
-        const index = nextIndex++;
-        if (index >= targetUrls.length) return;
-        await fetchOne(index);
-      }
-    };
-    await Promise.all(
-      Array.from(
-        {length: Math.min(concurrency, targetUrls.length)},
-        () => worker()
-      )
-    );
-    if (aggregateTooLarge) {
+    const entries = itemIndexes.map((itemIndex) => operation.entries[itemIndex]);
+    if (entries.some((entry) => !entry || typeof entry.then !== "function")) {
+      throw new Error("missing_operation_item");
+    }
+    const responses = await Promise.all(entries);
+    for (const itemIndex of itemIndexes) delete operation.entries[itemIndex];
+    if (operation.aggregateTooLarge) {
       done({
         ok: false,
         kind: "aggregate_too_large",
@@ -704,26 +1747,34 @@ const done = arguments[arguments.length - 1];
       });
       return;
     }
-    done({
-      ok: true,
-      responses: results,
-      responseBytes: successBytes
-    });
+    const responseBytes = responses.reduce(
+      (total, response) => total +
+        (response && response.ok === true ? response.responseBytes : 0),
+      0
+    );
+    done({ok: true, responses, responseBytes});
   } catch (error) {
-    const aborted = error && error.name === "AbortError";
-    const sourceHeaderMissing = error && error.message === "source_header_unavailable";
-    done({
-      ok: false,
-      kind: aborted ? "timeout" :
-        (sourceHeaderMissing ? "source_header_unavailable" : "fetch_failed"),
-      error: aborted ? "fetch_timeout" :
-        (sourceHeaderMissing ? "source_header_unavailable" : "fetch_failed")
-    });
+    done({ok: false, kind: "fetch_failed", error: "fetch_failed"});
   } finally {
-    clearTimeout(timer);
-    for (const controller of controllers) controller.abort();
+    if (finishOperation) {
+      const registry = window[registryProperty];
+      if (registry) delete registry[operationKey];
+    }
   }
 })();
+""".strip()
+
+
+XHR_ABORT_SCRIPT = r"""
+const operationKey = arguments[0];
+const registryProperty = "__whoscoredRestrictedXhrV1";
+const registry = window[registryProperty];
+const operation = registry && registry[operationKey];
+if (operation) {
+  for (const controller of operation.controllers) controller.abort();
+  delete registry[operationKey];
+}
+return true;
 """.strip()
 
 
@@ -735,7 +1786,12 @@ class _SessionLocks:
         self._locks: dict[str, threading.Lock] = {}
 
     @contextmanager
-    def acquire(self, session_id: str, storage: Any, timeout_s: float):
+    def acquire(
+        self,
+        session_id: str,
+        storage: Any,
+        timeout_s: float | None,
+    ):
         with self._guard:
             # Do not retain locks for sessions the upstream storage destroyed.
             for stale_id, stale_lock in tuple(self._locks.items()):
@@ -747,7 +1803,12 @@ class _SessionLocks:
                     self._locks.pop(stale_id, None)
             lock = self._locks.setdefault(session_id, threading.Lock())
 
-        if not lock.acquire(timeout=max(timeout_s, 0.0)):
+        acquired = (
+            lock.acquire()
+            if timeout_s is None
+            else lock.acquire(timeout=max(timeout_s, 0.0))
+        )
+        if not acquired:
             raise XhrEndpointError(
                 "Timed out waiting for the WhoScored browser session.",
                 http_status=504,
@@ -764,29 +1825,52 @@ class _SessionLocks:
 _SESSION_LOCKS = _SessionLocks()
 
 
-def _execute_browser_fetch(driver: Any, request_data: XhrRequest) -> Mapping[str, Any]:
-    """Execute the fixed fetch and restore the session's prior script timeout."""
+def _execute_browser_fetch(
+    driver: Any,
+    request_data: XhrRequest,
+    *,
+    deadline: float,
+    deadline_epoch_ms: int,
+    pacer: _XhrStartPacer,
+) -> Mapping[str, Any]:
+    """Launch one paced fixed fetch, then collect its stored Promise."""
 
     old_timeout = driver.timeouts.script
-    # Give Selenium a small delivery margin after the in-page AbortController.
-    driver.set_script_timeout(request_data.timeout_ms / 1_000.0 + 2.0)
+    operation_key = f"xhr-{secrets.token_hex(16)}"
+    finished = False
     try:
-        try:
-            result = driver.execute_async_script(
-                XHR_SCRIPT,
-                request_data.url,
-                MAX_RESPONSE_BYTES,
-                request_data.timeout_ms,
-            )
-        except Exception as exc:
-            if "timeout" in type(exc).__name__.lower():
-                raise XhrEndpointError(
-                    "WhoScored browser fetch timed out.", http_status=504
-                ) from exc
+        acknowledgement = _launch_browser_fetch(
+            driver,
+            url=request_data.url,
+            max_aggregate_bytes=MAX_RESPONSE_BYTES,
+            deadline=deadline,
+            deadline_epoch_ms=deadline_epoch_ms,
+            operation_key=operation_key,
+            item_index=0,
+            pacer=pacer,
+        )
+        if acknowledgement.get("ok") is not True:
+            return acknowledgement
+        collected = _collect_browser_fetches(
+            driver,
+            operation_key=operation_key,
+            item_indexes=(0,),
+            finish_operation=True,
+            deadline=deadline,
+            timeout_message="WhoScored browser fetch timed out.",
+        )
+        finished = True
+        if collected.get("ok") is not True:
+            return collected
+        responses = collected.get("responses")
+        if not isinstance(responses, list) or len(responses) != 1:
             raise XhrEndpointError(
-                "WhoScored browser fetch could not be executed.", http_status=502
-            ) from exc
+                "Browser returned an invalid XHR result.", http_status=502
+            )
+        result = responses[0]
     finally:
+        if not finished:
+            _abort_browser_fetches(driver, operation_key)
         try:
             driver.set_script_timeout(old_timeout)
         except Exception:
@@ -800,31 +1884,72 @@ def _execute_browser_fetch(driver: Any, request_data: XhrRequest) -> Mapping[str
 
 
 def _execute_browser_batch_fetch(
-    driver: Any, request_data: XhrBatchRequest
+    driver: Any,
+    request_data: XhrBatchRequest,
+    *,
+    deadline: float,
+    deadline_epoch_ms: int,
+    pacer: _XhrStartPacer,
 ) -> Mapping[str, Any]:
-    """Execute one bounded concurrent batch under the existing session lock."""
+    """Launch fixed paced fetches in waves capped at four active requests."""
 
     old_timeout = driver.timeouts.script
-    driver.set_script_timeout(request_data.timeout_ms / 1_000.0 + 2.0)
+    operation_key = f"xhr-{secrets.token_hex(16)}"
+    finished = False
     try:
-        try:
-            result = driver.execute_async_script(
-                BATCH_XHR_SCRIPT,
-                list(request_data.urls),
-                MAX_RESPONSE_BYTES,
-                MAX_BATCH_RESPONSE_BYTES,
-                request_data.timeout_ms,
-                BATCH_CONCURRENCY,
+        responses: list[Any] = []
+        response_bytes = 0
+        for wave_start in range(0, len(request_data.urls), BATCH_CONCURRENCY):
+            wave_urls = request_data.urls[wave_start : wave_start + BATCH_CONCURRENCY]
+            wave_indexes = tuple(range(wave_start, wave_start + len(wave_urls)))
+            for item_index, url in zip(wave_indexes, wave_urls):
+                acknowledgement = _launch_browser_fetch(
+                    driver,
+                    url=url,
+                    max_aggregate_bytes=MAX_BATCH_RESPONSE_BYTES,
+                    deadline=deadline,
+                    deadline_epoch_ms=deadline_epoch_ms,
+                    operation_key=operation_key,
+                    item_index=item_index,
+                    pacer=pacer,
+                )
+                if acknowledgement.get("ok") is not True:
+                    return acknowledgement
+
+            final_wave = wave_start + len(wave_urls) == len(request_data.urls)
+            collected = _collect_browser_fetches(
+                driver,
+                operation_key=operation_key,
+                item_indexes=wave_indexes,
+                finish_operation=final_wave,
+                deadline=deadline,
+                timeout_message="WhoScored browser batch timed out.",
             )
-        except Exception as exc:
-            if "timeout" in type(exc).__name__.lower():
+            if collected.get("ok") is not True:
+                return collected
+            wave_responses = collected.get("responses")
+            wave_bytes = collected.get("responseBytes")
+            if (
+                not isinstance(wave_responses, list)
+                or len(wave_responses) != len(wave_indexes)
+                or isinstance(wave_bytes, bool)
+                or not isinstance(wave_bytes, int)
+                or wave_bytes < 0
+            ):
                 raise XhrEndpointError(
-                    "WhoScored browser batch timed out.", http_status=504
-                ) from exc
-            raise XhrEndpointError(
-                "WhoScored browser batch could not be executed.", http_status=502
-            ) from exc
+                    "Browser returned an invalid XHR batch result.", http_status=502
+                )
+            responses.extend(wave_responses)
+            response_bytes += wave_bytes
+        result = {
+            "ok": True,
+            "responses": responses,
+            "responseBytes": response_bytes,
+        }
+        finished = True
     finally:
+        if not finished:
+            _abort_browser_fetches(driver, operation_key)
         try:
             driver.set_script_timeout(old_timeout)
         except Exception:
@@ -835,6 +1960,104 @@ def _execute_browser_batch_fetch(
             "Browser returned an invalid XHR batch result.", http_status=502
         )
     return result
+
+
+def _launch_browser_fetch(
+    driver: Any,
+    *,
+    url: str,
+    max_aggregate_bytes: int,
+    deadline: float,
+    deadline_epoch_ms: int,
+    operation_key: str,
+    item_index: int,
+    pacer: _XhrStartPacer,
+) -> Mapping[str, Any]:
+    """Invoke the fixed synchronous launch while holding global arbitration."""
+
+    try:
+        acknowledgement = pacer.launch(
+            deadline=deadline,
+            starter=lambda: driver.execute_script(
+                XHR_SCRIPT,
+                url,
+                MAX_RESPONSE_BYTES,
+                max_aggregate_bytes,
+                deadline_epoch_ms,
+                XHR_MIN_EXECUTION_MARGIN_MS,
+                operation_key,
+                item_index,
+            ),
+        )
+    except XhrEndpointError:
+        raise
+    except Exception as exc:
+        if "timeout" in type(exc).__name__.lower():
+            raise XhrEndpointError(
+                "WhoScored browser fetch timed out.", http_status=504
+            ) from exc
+        raise XhrEndpointError(
+            "WhoScored browser fetch could not be started.", http_status=502
+        ) from exc
+    if not isinstance(acknowledgement, Mapping):
+        raise XhrEndpointError(
+            "Browser returned an invalid XHR launch result.", http_status=502
+        )
+    if acknowledgement.get("ok") is True and (
+        acknowledgement.get("started") is not True
+        or acknowledgement.get("itemIndex") != item_index
+    ):
+        raise XhrEndpointError(
+            "Browser returned an invalid XHR launch result.", http_status=502
+        )
+    return acknowledgement
+
+
+def _collect_browser_fetches(
+    driver: Any,
+    *,
+    operation_key: str,
+    item_indexes: tuple[int, ...],
+    finish_operation: bool,
+    deadline: float,
+    timeout_message: str,
+) -> Mapping[str, Any]:
+    """Await already-started browser Promises within the absolute deadline."""
+
+    remaining_seconds = deadline - time.monotonic()
+    if remaining_seconds <= 0:
+        raise XhrEndpointError(timeout_message, http_status=504)
+    # Do not reset or extend the request budget at the collection phase. Every
+    # underlying fetch and Selenium's callback wait share the same unchanged
+    # absolute end-to-end deadline.
+    driver.set_script_timeout(remaining_seconds)
+    try:
+        result = driver.execute_async_script(
+            XHR_COLLECT_SCRIPT,
+            operation_key,
+            list(item_indexes),
+            finish_operation,
+        )
+    except Exception as exc:
+        if "timeout" in type(exc).__name__.lower():
+            raise XhrEndpointError(timeout_message, http_status=504) from exc
+        raise XhrEndpointError(
+            "WhoScored browser fetch could not be collected.", http_status=502
+        ) from exc
+    if not isinstance(result, Mapping):
+        raise XhrEndpointError(
+            "Browser returned an invalid XHR collection result.", http_status=502
+        )
+    return result
+
+
+def _abort_browser_fetches(driver: Any, operation_key: str) -> None:
+    """Best-effort removal and abort of a failed fixed browser operation."""
+
+    try:
+        driver.execute_script(XHR_ABORT_SCRIPT, operation_key)
+    except Exception:
+        logging.warning("Could not abort failed WhoScored browser fetch operation")
 
 
 def _normalise_browser_result(
@@ -1025,18 +2248,49 @@ def _version(version_getter: Any) -> str:
         return "unknown"
 
 
+def runtime_identity_response(
+    *,
+    paid_gateway_authorizer: _PaidGatewayAuthorizer | None = None,
+) -> dict[str, Any]:
+    """Return the side-effect-free identity of the image-baked extension."""
+
+    response: dict[str, Any] = {
+        "status": "ok",
+        "version": PINNED_FLARESOLVERR_VERSION,
+        "extension_sha256": EXTENSION_SHA256,
+    }
+    if paid_gateway_authorizer is not None:
+        # This random, non-secret process identity makes every capability die
+        # across a restart even while its short wall-clock window remains open.
+        response.update(
+            {
+                "paid_exclusive": True,
+                "capability_schema": PAID_GATEWAY_CAPABILITY_SCHEMA,
+                "capability_instance_id": paid_gateway_authorizer.instance_id,
+            }
+        )
+    return response
+
+
 def handle_xhr_request(
     payload: Any,
     *,
     storage: Any,
     version_getter: Any,
     locks: _SessionLocks | None = None,
+    pacer: _XhrStartPacer | None = None,
 ) -> tuple[dict[str, Any], int]:
     """Validate and execute one endpoint request; returns JSON body and HTTP status."""
 
+    request_started = time.monotonic()
     start_ms = int(time.time() * 1_000)
     api_version = _version(version_getter)
-    lock_registry = locks or _SESSION_LOCKS
+    lock_registry = (
+        locks
+        if locks is not None
+        else getattr(storage, "execution_locks", _SESSION_LOCKS)
+    )
+    start_pacer = pacer if pacer is not None else _XHR_START_PACER
     try:
         request_data = _validate_payload(payload)
         if not storage.exists(request_data.session):
@@ -1045,11 +2299,15 @@ def handle_xhr_request(
                 http_status=404,
             )
 
-        deadline = time.monotonic() + request_data.timeout_ms / 1_000.0
+        # Both clocks are captured at handler entry. Queueing for the session,
+        # global source pace, browser launch, and response collection therefore
+        # consume one unchanged end-to-end deadline.
+        deadline = request_started + request_data.timeout_ms / 1_000.0
+        deadline_epoch_ms = start_ms + request_data.timeout_ms
         with lock_registry.acquire(
             request_data.session,
             storage,
-            request_data.timeout_ms / 1_000.0,
+            max(0.0, deadline - time.monotonic()),
         ):
             if not storage.exists(request_data.session):
                 raise XhrEndpointError(
@@ -1074,7 +2332,13 @@ def handle_xhr_request(
                 timeout_ms=remaining_ms,
             )
             solution = _normalise_browser_result(
-                _execute_browser_fetch(session.driver, browser_request),
+                _execute_browser_fetch(
+                    session.driver,
+                    browser_request,
+                    deadline=deadline,
+                    deadline_epoch_ms=deadline_epoch_ms,
+                    pacer=start_pacer,
+                ),
                 expected_url=request_data.url,
             )
 
@@ -1087,6 +2351,7 @@ def handle_xhr_request(
                 "startTimestamp": start_ms,
                 "endTimestamp": end_ms,
                 "version": api_version,
+                "extension_sha256": EXTENSION_SHA256,
             },
             200,
         )
@@ -1098,6 +2363,7 @@ def handle_xhr_request(
                 "startTimestamp": start_ms,
                 "endTimestamp": int(time.time() * 1_000),
                 "version": api_version,
+                "extension_sha256": EXTENSION_SHA256,
             },
             exc.http_status,
         )
@@ -1110,6 +2376,7 @@ def handle_xhr_request(
                 "startTimestamp": start_ms,
                 "endTimestamp": int(time.time() * 1_000),
                 "version": api_version,
+                "extension_sha256": EXTENSION_SHA256,
             },
             500,
         )
@@ -1121,12 +2388,19 @@ def handle_xhr_batch_request(
     storage: Any,
     version_getter: Any,
     locks: _SessionLocks | None = None,
+    pacer: _XhrStartPacer | None = None,
 ) -> tuple[dict[str, Any], int]:
     """Validate a bounded batch and return explicit per-item runtime outcomes."""
 
+    request_started = time.monotonic()
     start_ms = int(time.time() * 1_000)
     api_version = _version(version_getter)
-    lock_registry = locks or _SESSION_LOCKS
+    lock_registry = (
+        locks
+        if locks is not None
+        else getattr(storage, "execution_locks", _SESSION_LOCKS)
+    )
+    start_pacer = pacer if pacer is not None else _XHR_START_PACER
     try:
         request_data = _validate_batch_payload(payload)
         if not storage.exists(request_data.session):
@@ -1135,11 +2409,12 @@ def handle_xhr_batch_request(
                 http_status=404,
             )
 
-        deadline = time.monotonic() + request_data.timeout_ms / 1_000.0
+        deadline = request_started + request_data.timeout_ms / 1_000.0
+        deadline_epoch_ms = start_ms + request_data.timeout_ms
         with lock_registry.acquire(
             request_data.session,
             storage,
-            request_data.timeout_ms / 1_000.0,
+            max(0.0, deadline - time.monotonic()),
         ):
             if not storage.exists(request_data.session):
                 raise XhrEndpointError(
@@ -1164,7 +2439,13 @@ def handle_xhr_batch_request(
                 timeout_ms=remaining_ms,
             )
             solution = _normalise_browser_batch_result(
-                _execute_browser_batch_fetch(session.driver, browser_request),
+                _execute_browser_batch_fetch(
+                    session.driver,
+                    browser_request,
+                    deadline=deadline,
+                    deadline_epoch_ms=deadline_epoch_ms,
+                    pacer=start_pacer,
+                ),
                 request_data.urls,
             )
 
@@ -1177,6 +2458,7 @@ def handle_xhr_batch_request(
                 "startTimestamp": start_ms,
                 "endTimestamp": end_ms,
                 "version": api_version,
+                "extension_sha256": EXTENSION_SHA256,
             },
             200,
         )
@@ -1188,6 +2470,7 @@ def handle_xhr_batch_request(
                 "startTimestamp": start_ms,
                 "endTimestamp": int(time.time() * 1_000),
                 "version": api_version,
+                "extension_sha256": EXTENSION_SHA256,
             },
             exc.http_status,
         )
@@ -1200,24 +2483,65 @@ def handle_xhr_batch_request(
                 "startTimestamp": start_ms,
                 "endTimestamp": int(time.time() * 1_000),
                 "version": api_version,
+                "extension_sha256": EXTENSION_SHA256,
             },
             500,
         )
 
 
-def create_app() -> Any:
+def create_app(
+    *,
+    paid_gateway_authorizer: _PaidGatewayAuthorizer | None | object = (
+        _PAID_GATEWAY_ENV_UNSET
+    ),
+) -> Any:
     """Import the upstream app lazily and register the restricted route."""
 
     from bottle import request, response
+
+    if paid_gateway_authorizer is _PAID_GATEWAY_ENV_UNSET:
+        resolved_paid_gateway_authorizer = _paid_gateway_authorizer_from_environment()
+    elif paid_gateway_authorizer is None or isinstance(
+        paid_gateway_authorizer, _PaidGatewayAuthorizer
+    ):
+        resolved_paid_gateway_authorizer = paid_gateway_authorizer
+    else:
+        raise PaidGatewayConfigurationError("paid gateway authorizer is invalid")
 
     import flaresolverr as upstream
     import flaresolverr_service
     import utils
 
+    if resolved_paid_gateway_authorizer is not None:
+        from bottle import abort
+
+        _install_paid_gateway_hook(
+            upstream.app,
+            request=request,
+            abort=abort,
+            authorizer=resolved_paid_gateway_authorizer,
+        )
+
+    upstream_version = str(utils.get_flaresolverr_version())
+    _install_safe_logging()
+    _install_safe_v1_controller(
+        flaresolverr_service,
+        version=upstream_version,
+    )
+    _install_capacity_session_tracking(
+        flaresolverr_service,
+        version=upstream_version,
+    )
     _install_disable_media_extension(
         flaresolverr_service,
-        version=str(utils.get_flaresolverr_version()),
+        version=upstream_version,
     )
+
+    @upstream.app.get("/v1/whoscored/runtime-identity")
+    def controller_runtime_identity() -> dict[str, Any]:
+        return runtime_identity_response(
+            paid_gateway_authorizer=resolved_paid_gateway_authorizer
+        )
 
     @upstream.app.post("/v1/xhr")
     def controller_xhr() -> dict[str, Any]:
@@ -1303,6 +2627,41 @@ def create_app() -> Any:
         response.status = status
         return body
 
+    @upstream.app.post("/v1/whoscored/capacity-sessions/cleanup")
+    def controller_capacity_session_cleanup() -> dict[str, Any]:
+        content_type = (request.content_type or "").split(";", 1)[0].lower()
+        if content_type != "application/json":
+            body, _ = handle_capacity_session_cleanup(
+                None,
+                storage=flaresolverr_service.SESSIONS_STORAGE,
+            )
+            response.status = 415
+            return body
+        if request.content_length is None or request.content_length < 1:
+            body, _ = handle_capacity_session_cleanup(
+                None,
+                storage=flaresolverr_service.SESSIONS_STORAGE,
+            )
+            response.status = 411
+            return body
+        if request.content_length > MAX_REQUEST_BYTES:
+            body, _ = handle_capacity_session_cleanup(
+                None,
+                storage=flaresolverr_service.SESSIONS_STORAGE,
+            )
+            response.status = 413
+            return body
+        try:
+            payload = request.json
+        except Exception:
+            payload = None
+        body, status = handle_capacity_session_cleanup(
+            payload,
+            storage=flaresolverr_service.SESSIONS_STORAGE,
+        )
+        response.status = status
+        return body
+
     return upstream.app
 
 
@@ -1311,6 +2670,11 @@ def main() -> None:
 
     if sys.version_info < (3, 9):
         raise RuntimeError("Python 3.9 or newer is required.")
+
+    # Validate paid-exclusive authority before importing the container app or
+    # running its browser self-test.  A missing/weak secret must cause a clean
+    # startup failure before any browser or source side effect.
+    paid_gateway_authorizer = _paid_gateway_authorizer_from_environment()
 
     # All container-only imports remain below this point.
     import certifi
@@ -1348,6 +2712,8 @@ def main() -> None:
         os.makedirs(os.path.dirname(log_file), exist_ok=True)
         logging.getLogger().addHandler(logging.FileHandler(log_file))
 
+    _install_safe_logging()
+
     logging.getLogger("urllib3").setLevel(logging.ERROR)
     logging.getLogger("selenium.webdriver.remote.remote_connection").setLevel(
         logging.WARNING
@@ -1355,20 +2721,29 @@ def main() -> None:
     logging.getLogger("undetected_chromedriver").setLevel(logging.WARNING)
     upstream_version = str(utils.get_flaresolverr_version())
     logging.info(
-        "FlareSolverr %s with restricted WhoScored XHR",
+        "FlareSolverr %s with restricted WhoScored XHR (%s mode)",
         upstream_version,
+        "paid-exclusive" if paid_gateway_authorizer is not None else "direct",
     )
 
     # Install before the upstream browser self-test or any request handling.
     # ``create_app`` repeats this idempotently so embedding the app without
     # ``main`` is protected by the same startup contract.
+    _install_safe_v1_controller(
+        flaresolverr_service,
+        version=upstream_version,
+    )
+    _install_capacity_session_tracking(
+        flaresolverr_service,
+        version=upstream_version,
+    )
     _install_disable_media_extension(
         flaresolverr_service,
         version=upstream_version,
     )
     utils.get_current_platform()
     flaresolverr_service.test_browser_installation()
-    app = create_app()
+    app = create_app(paid_gateway_authorizer=paid_gateway_authorizer)
     app.install(logger_plugin)
     app.install(error_plugin)
     prometheus_plugin.setup()
@@ -1383,6 +2758,7 @@ def main() -> None:
                 host=self.host,
                 port=self.port,
                 asyncore_use_poll=True,
+                threads=WAITRESS_THREADS,
             )
 
     run(

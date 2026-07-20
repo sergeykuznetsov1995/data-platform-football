@@ -36,18 +36,18 @@ Headscale ── https://hs.<домен> (вход в VPN через тот же
 ```bash
 make render-headscale-config
 # клиент headscale в живом realm (import существующий realm не обновляет):
-docker compose exec -T keycloak /opt/keycloak/bin/kcadm.sh config credentials \
+./scripts/compose.sh --env-file .env exec -T keycloak /opt/keycloak/bin/kcadm.sh config credentials \
   --server http://localhost:8080 --realm master --user admin --password "$KC_BOOTSTRAP_ADMIN_PASSWORD"
-docker compose exec -T keycloak /opt/keycloak/bin/kcadm.sh create clients -r football \
+./scripts/compose.sh --env-file .env exec -T keycloak /opt/keycloak/bin/kcadm.sh create clients -r football \
   -s clientId=headscale -s enabled=true -s publicClient=false \
   -s clientAuthenticatorType=client-secret -s "secret=$HEADSCALE_OIDC_CLIENT_SECRET" \
   -s standardFlowEnabled=true -s 'redirectUris=["https://hs.<домен>/oidc/callback"]' \
   -s 'defaultClientScopes=["profile","email","basic","groups"]'
-docker compose --profile headscale up -d headscale
-docker compose up -d caddy   # подхватит PUBLIC_IP-порты; серты для bi/auth/hs
+./scripts/compose.sh --env-file .env --profile headscale up -d --no-deps --force-recreate headscale
+./scripts/compose.sh --env-file .env up -d --no-deps --force-recreate caddy
 # юзер платформы в headscale появится при первом OIDC-логине; для VM нужен свой:
-docker compose exec headscale headscale users create platform
-docker compose exec headscale headscale preauthkeys create --user platform --expiration 1h
+./scripts/compose.sh --env-file .env exec headscale headscale users create platform
+./scripts/compose.sh --env-file .env exec headscale headscale preauthkeys create --user platform --expiration 1h
 ```
 
 Проверка: `https://hs.<домен>/health` отвечает из интернета с валидным сертом.
@@ -67,7 +67,7 @@ docker compose exec headscale headscale preauthkeys create --user platform --exp
    `JUPYTER_PUBLIC_HOST`, `TRINO_PUBLIC_HOST`, `TRINO_PUBLIC_PORT=443`).
 3. Split-DNS: в `configs/headscale/config.yaml.example` раскомментировать
    `extra_records` (jupyter/airflow/trino/meta → новый 100.x VM),
-   `make render-headscale-config && docker compose restart headscale`.
+   `make render-headscale-config && ./scripts/compose.sh --env-file .env restart headscale`.
 4. Caddy на гибридный роутинг:
 
    ```bash
@@ -82,7 +82,7 @@ docker compose exec headscale headscale preauthkeys create --user platform --exp
 
    ```bash
    # id клиента: kcadm get clients -r football -q clientId=superset --fields id
-   docker compose exec -T keycloak /opt/keycloak/bin/kcadm.sh update clients/<id> -r football \
+   ./scripts/compose.sh --env-file .env exec -T keycloak /opt/keycloak/bin/kcadm.sh update clients/<id> -r football \
      -s 'redirectUris=["https://bi.<домен>/oauth-authorized/keycloak"]' \
      -s 'webOrigins=["https://bi.<домен>"]'
    ```
@@ -90,8 +90,8 @@ docker compose exec headscale headscale preauthkeys create --user platform --exp
 6. Пересоздать сервисы (порядок важен: сначала keycloak и caddy):
 
    ```bash
-   docker compose up -d keycloak caddy
-   docker compose up -d trino superset airflow-webserver jupyterhub
+   ./scripts/compose.sh --env-file .env up -d --no-deps --force-recreate keycloak caddy
+   ./scripts/compose.sh --env-file .env up -d --no-deps --force-recreate trino superset airflow-webserver jupyterhub
    ```
 
 7. Проверки:
@@ -120,7 +120,7 @@ docker compose exec headscale headscale preauthkeys create --user platform --exp
    (аккаунт decoy10215400@gmail), `tailscale ip -4` → вернуть старые
    `TS_IP`/`TS_HOSTNAME` в `.env`.
 3. Вернуть redirect-URI клиентов в Keycloak (kcadm, старые ts.net-значения).
-4. `docker compose up -d keycloak caddy trino superset airflow-webserver jupyterhub`.
+4. `./scripts/compose.sh --env-file .env up -d --no-deps --force-recreate keycloak caddy trino superset airflow-webserver jupyterhub`.
 
 Пайплайны всё это время работают: машинные аккаунты не зависят ни от VPN,
 ни от issuer.

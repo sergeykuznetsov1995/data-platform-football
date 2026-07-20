@@ -94,6 +94,7 @@ SCHEDULES: Dict[str, Optional[str]] = {
     'dag_ingest_matchhistory': '0 8 * * *',  # 8:00 UTC daily
     'dag_ingest_understat': '0 9 * * *',     # 9:00 UTC daily
     'dag_ingest_whoscored': '0 10 * * *',    # 10:00 UTC daily
+    'dag_backup_whoscored_storage': '0 3 * * *',  # prior completed run backup
     # Daily ingestion (including the Saturday player branch) is orchestrated by
     # dag_sofascore_pipeline (#951; the paused master no longer triggers this
     # source). A second source cron duplicated billable proxy traffic.

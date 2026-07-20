@@ -172,6 +172,60 @@ def test_season_bundle_parses_all_contexts_once_without_collapsing_groups(tourna
     assert bundle.playoffs[0]["match_ids"] == (101,)
 
 
+def test_source_stage_id_is_numeric_only_so_arrow_can_write_it(tournament_payload):
+    """Stage ids are numbers or words; one column cannot hold both.
+
+    A word stage ("final") mixed with numeric ids yields a pandas object column
+    that Arrow refuses to write ("Expected bytes, got a 'int' object"), which
+    the #930 canary hit on UCL and AFCON. The numeric column keeps only numbers
+    and the verbatim source key stays in stage_id.
+    """
+    bundle = parse_season_bundle(tournament_payload, ScopeRef(289, "2025"))
+
+    stage_rows = list(bundle.stages) + list(bundle.playoffs)
+    assert stage_rows
+    for row in stage_rows:
+        assert isinstance(row["source_stage_id"], (int, type(None))), row
+        assert not isinstance(row["source_stage_id"], bool), row
+
+    by_stage = {row["stage_id"]: row for row in bundle.stages}
+    # Numeric identities survive…
+    assert by_stage["table:895039"]["source_stage_id"] == 895039
+    assert by_stage["fixture:1"]["source_stage_id"] == 1
+    # …and a word stage drops to NULL without losing the raw key.
+    assert by_stage["fixture:final"]["source_stage_id"] is None
+    assert by_stage["playoff:final"]["source_stage_id"] is None
+
+
+def test_round_and_stage_labels_are_text_even_when_numeric(tournament_payload):
+    """A league numbers its rounds; a cup names them. The column is text.
+
+    Arrow cannot type a column holding both 12 and "Round of 16", and the
+    schema is re-inferred on every write — so a single cup match used to break
+    the whole season write (#930 canary: UCL, AFCON).
+    """
+    # League leg: the round is a number.
+    tournament_payload["fixtures"]["allMatches"][0]["round"] = 12
+    tournament_payload["fixtures"]["allMatches"][0]["roundName"] = 12
+    # Cup leg: the round is a word. Both land in one column.
+    playoff_match = (
+        tournament_payload["playoff"]["rounds"][0]["matchups"][0]["matches"][0]
+    )
+    playoff_match["roundName"] = "Round of 16"
+
+    bundle = parse_season_bundle(tournament_payload, ScopeRef(289, "2025"))
+
+    labels = {
+        row["match_id"]: (row["round_id"], row["round_name"]) for row in bundle.matches
+    }
+    assert labels[100] == ("12", "12")
+    assert labels[101][1] == "Round of 16"
+    # One column cannot hold both forms unless it is text.
+    for row in bundle.matches:
+        for column in ("round_id", "round_name", "stage_id", "group_name"):
+            assert isinstance(row[column], (str, type(None))), (column, row[column])
+
+
 def test_bundle_retains_advertised_categories_capabilities_and_full_path_inventory(tournament_payload):
     tournament_payload["fixtures"]["allMatches"][1]["lateOptionalField"] = {"nested": 7}
     bundle = parse_season_bundle(tournament_payload, ScopeRef(289, "2025"))

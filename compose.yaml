@@ -6,9 +6,11 @@
 name: data-platform
 
 x-airflow-common: &airflow-common
+  image: data-platform-airflow-base:2.11.2-whoscored
   build:
     context: ./docker/images/airflow
     dockerfile: Dockerfile
+    target: airflow-base
   shm_size: '512m'  # Chrome uses /dev/shm for IPC; Docker default 64MB causes crashes
   security_opt:
     - no-new-privileges:true
@@ -37,6 +39,11 @@ x-airflow-common: &airflow-common
     # outside Iceberg table prefixes. The parser uses pyarrow.fs directly.
     S3_ACCESS_KEY: ${S3_ACCESS_KEY}
     S3_SECRET_KEY: ${S3_SECRET_KEY}
+    ICEBERG_WAREHOUSE: ${ICEBERG_WAREHOUSE}
+    # Lakekeeper REST warehouse identifier is not the S3 bucket name above.
+    ICEBERG_REST_WAREHOUSE: ${ICEBERG_REST_WAREHOUSE:-football}
+    S3_ENDPOINT: seaweedfs:8333
+    S3_SCHEME: http
     FBREF_RAW_STORE_URI: s3://${ICEBERG_WAREHOUSE}/raw/fbref
     # Production maintenance must delete only fenced, proven-stale FBref
     # staging tables; audit mode is reserved for explicit diagnostics.
@@ -50,6 +57,8 @@ x-airflow-common: &airflow-common
     # общий proxy_filter (свой метринг/леджер, свой пул рестартом одного шлюза).
     SOFASCORE_PROXY_CONTROL_URL: ${SOFASCORE_PROXY_CONTROL_URL:-http://sofascore_proxy_filter:8899}
     SOFASCORE_PROXY_CONTROL_TOKEN: ${SOFASCORE_PROXY_CONTROL_TOKEN:-}
+    # Shared authenticated lease control plane for signed/approved sources.
+    PROXY_FILTER_CONTROL_TOKEN: ${PROXY_FILTER_CONTROL_TOKEN:-${SOFASCORE_PROXY_CONTROL_TOKEN:-}}
     SOFASCORE_PROXY_LEASE_TTL_SECONDS: ${SOFASCORE_PROXY_LEASE_TTL_SECONDS:-3600}
     # FBref has a dedicated meter and dedicated residential pool.  The worker
     # receives only a short-lived lease token, never an upstream credential.
@@ -60,21 +69,80 @@ x-airflow-common: &airflow-common
     SOFASCORE_PLAYER_ROTATION_MIN_LEAGUES: ${SOFASCORE_PLAYER_ROTATION_MIN_LEAGUES:-10}
     PROXY_FILTER_SOFASCORE_CANARY_HARD_CAP_BYTES: ${PROXY_FILTER_SOFASCORE_CANARY_HARD_CAP_BYTES:-0}
     WHOSCORED_RAW_STORE_URI: s3://${ICEBERG_WAREHOUSE}/raw/whoscored
+    WHOSCORED_OPS_STORE_URI: s3://${ICEBERG_WAREHOUSE}/ops/whoscored
+    WHOSCORED_BACKUP_DESTINATION_URI: ${WHOSCORED_BACKUP_DESTINATION_URI:-}
+    WHOSCORED_BACKUP_SOURCE_SITE_ID: ${WHOSCORED_BACKUP_SOURCE_SITE_ID:-local-seaweedfs}
+    WHOSCORED_BACKUP_DESTINATION_SITE_ID: ${WHOSCORED_BACKUP_DESTINATION_SITE_ID:-}
+    WHOSCORED_BACKUP_DESTINATION_RETENTION_MODE: ${WHOSCORED_BACKUP_DESTINATION_RETENTION_MODE:-}
+    WHOSCORED_BACKUP_SOURCE_S3_ENDPOINT: seaweedfs:8333
+    WHOSCORED_BACKUP_SOURCE_S3_SCHEME: http
+    WHOSCORED_BACKUP_SOURCE_S3_REGION: ${WHOSCORED_RAW_S3_REGION:-us-east-1}
+    WHOSCORED_BACKUP_DESTINATION_S3_ENDPOINT: ${WHOSCORED_BACKUP_DESTINATION_S3_ENDPOINT:-}
+    WHOSCORED_BACKUP_DESTINATION_S3_SCHEME: ${WHOSCORED_BACKUP_DESTINATION_S3_SCHEME:-https}
+    WHOSCORED_BACKUP_DESTINATION_S3_REGION: ${WHOSCORED_BACKUP_DESTINATION_S3_REGION:-us-east-1}
+    WHOSCORED_BACKUP_RESTORE_S3_ENDPOINT: ${WHOSCORED_BACKUP_RESTORE_S3_ENDPOINT:-}
+    WHOSCORED_BACKUP_RESTORE_S3_SCHEME: ${WHOSCORED_BACKUP_RESTORE_S3_SCHEME:-https}
+    WHOSCORED_BACKUP_RESTORE_S3_REGION: ${WHOSCORED_BACKUP_RESTORE_S3_REGION:-us-east-1}
     WHOSCORED_RAW_S3_ENDPOINT: seaweedfs:8333
     WHOSCORED_RAW_S3_SCHEME: http
-    # WhoScored V2 uses this endpoint only after two classified direct
-    # Cloudflare failures.  PROXY_FILTER_URL remains the legacy always-proxy
-    # toggle and is deliberately not reused here.
-    # The authenticated data plane is separate from the lease control plane.
-    # Keeping the fallback URL on 8900 makes a missing/malformed control-plane
-    # response fail closed instead of falling back to the legacy no-auth port.
-    WHOSCORED_PAID_PROXY_URL: ${WHOSCORED_PAID_PROXY_URL:-http://proxy_filter:8900}
-    WHOSCORED_PROXY_CONTROL_URL: ${WHOSCORED_PROXY_CONTROL_URL:-http://proxy_filter:8899}
+    # Keep dedicated pairs unexpanded so Python can reject a partial pair
+    # instead of silently mixing one dedicated value with one platform value.
+    WHOSCORED_RAW_S3_ACCESS_KEY: ${WHOSCORED_RAW_S3_ACCESS_KEY:-}
+    WHOSCORED_RAW_S3_SECRET_KEY: ${WHOSCORED_RAW_S3_SECRET_KEY:-}
+    # Paid WhoScored runners receive no proxy origin, lease token or browser
+    # session capability.  Only the scheduler-scoped L7 gateway endpoint below
+    # can cross into the isolated paid networks.
+    # The paid filter is the only writer for these authoritative files.  Airflow
+    # receives a separate read-only bind at this path for terminal reconciliation.
+    PROXY_FILTER_LEDGER_PATH: /opt/airflow/state/whoscored-proxy-filter/paid_requests.jsonl
+    WHOSCORED_PROXY_CAMPAIGN_LEDGER_PATH: /opt/airflow/state/whoscored-proxy-filter/whoscored_campaigns.json
     WHOSCORED_REQUEST_LEDGER_PATH: /opt/airflow/logs/whoscored/request_ledger.jsonl
+    # All LocalExecutor children share one durable direct-source cooldown.
+    # Production fails fast while the circuit is open; the capacity harness
+    # alone opts into waiting so its six-hour wall clock remains honest.
+    WHOSCORED_SOURCE_CIRCUIT_PATH: /opt/airflow/logs/whoscored/source-circuit-v1.json
+    WHOSCORED_SOURCE_CIRCUIT_WAIT: "0"
     WHOSCORED_LOCK_DIR: /opt/airflow/logs/whoscored/commit_locks
     WHOSCORED_RAW_LOCK_DIR: /opt/airflow/logs/whoscored/raw_locks
+    # Keep every documented WhoScored runtime control in the Airflow process
+    # environment.  Docker Compose does not automatically forward values from
+    # .env into containers, so omitting one here would silently select the
+    # Python fallback even when an operator changed .env.
+    WHOSCORED_DIRECT_POOL: ${WHOSCORED_DIRECT_POOL:-whoscored_direct_pool}
+    WHOSCORED_BACKFILL_POOL: ${WHOSCORED_BACKFILL_POOL:-whoscored_direct_pool}
+    WHOSCORED_DQ_POOL: ${WHOSCORED_DQ_POOL:-whoscored_dq_pool}
+    # Safe default is two. Promote to four only after the sustained direct-only
+    # canary passes; runtime_limits.py rejects every value outside 2..4.
+    WHOSCORED_SOURCE_POOL_SLOTS: ${WHOSCORED_SOURCE_POOL_SLOTS:-2}
+    WHOSCORED_DAILY_SLO_WINDOW: ${WHOSCORED_DAILY_SLO_WINDOW:-30}
+    WHOSCORED_DAILY_SLO_MIN_SAMPLES: ${WHOSCORED_DAILY_SLO_MIN_SAMPLES:-20}
+    WHOSCORED_DAILY_P95_LIMIT_HOURS: ${WHOSCORED_DAILY_P95_LIMIT_HOURS:-4}
+    WHOSCORED_BACKFILL_REQUEST_UNITS_PER_RUN: ${WHOSCORED_BACKFILL_REQUEST_UNITS_PER_RUN:-3000}
+    # SLO planning assumption only; it may never exceed the independently
+    # derived source-pool-slots x 30 rpm x 1,440 hard ceiling.
+    WHOSCORED_BACKFILL_ASSUMED_REQUEST_UNITS_PER_DAY: ${WHOSCORED_BACKFILL_ASSUMED_REQUEST_UNITS_PER_DAY:-86400}
+    WHOSCORED_BACKFILL_MAX_NO_PROGRESS_RUNS: ${WHOSCORED_BACKFILL_MAX_NO_PROGRESS_RUNS:-3}
+    WHOSCORED_RUN_RETENTION_DAYS: ${WHOSCORED_RUN_RETENTION_DAYS:-90}
+    WHOSCORED_OPS_IO_ATTEMPTS: ${WHOSCORED_OPS_IO_ATTEMPTS:-4}
+    WHOSCORED_OPS_RETRY_BASE_SECONDS: ${WHOSCORED_OPS_RETRY_BASE_SECONDS:-0.2}
+    WHOSCORED_RAW_IO_ATTEMPTS: ${WHOSCORED_RAW_IO_ATTEMPTS:-4}
+    WHOSCORED_RAW_RETRY_BASE_SECONDS: ${WHOSCORED_RAW_RETRY_BASE_SECONDS:-0.2}
     WHOSCORED_RAW_LOCK_TIMEOUT_SECONDS: ${WHOSCORED_RAW_LOCK_TIMEOUT_SECONDS:-55}
+    WHOSCORED_RAW_SNAPSHOT_LOCK_TIMEOUT_SECONDS: ${WHOSCORED_RAW_SNAPSHOT_LOCK_TIMEOUT_SECONDS:-300}
+    WHOSCORED_DAILY_PROFILE_MAX_LIMIT: ${WHOSCORED_DAILY_PROFILE_MAX_LIMIT:-3000}
+    WHOSCORED_BACKUP_WORKERS: ${WHOSCORED_BACKUP_WORKERS:-16}
+    WHOSCORED_BACKUP_LOCAL_RETENTION_DAYS: ${WHOSCORED_BACKUP_LOCAL_RETENTION_DAYS:-14}
+    # Non-secret, measured end-to-end recovery rehearsal inputs. The cutover
+    # script requires all of them before it stops a single writer.
+    SEAWEEDFS_CUTOVER_REHEARSAL_INVENTORY: ${SEAWEEDFS_CUTOVER_REHEARSAL_INVENTORY:-}
+    SEAWEEDFS_CUTOVER_REHEARSAL_MAX_AGE_HOURS: ${SEAWEEDFS_CUTOVER_REHEARSAL_MAX_AGE_HOURS:-24}
+    SEAWEEDFS_CUTOVER_INVENTORY_MIBPS: ${SEAWEEDFS_CUTOVER_INVENTORY_MIBPS:-}
+    SEAWEEDFS_CUTOVER_BACKUP_MIBPS: ${SEAWEEDFS_CUTOVER_BACKUP_MIBPS:-}
+    SEAWEEDFS_CUTOVER_VERIFY_MIBPS: ${SEAWEEDFS_CUTOVER_VERIFY_MIBPS:-}
+    SEAWEEDFS_CUTOVER_FIXED_OVERHEAD_SECONDS: ${SEAWEEDFS_CUTOVER_FIXED_OVERHEAD_SECONDS:-}
+    SEAWEEDFS_CUTOVER_MAX_DOWNTIME_SECONDS: ${SEAWEEDFS_CUTOVER_MAX_DOWNTIME_SECONDS:-}
     WHOSCORED_STRUCTURED_REQUESTS_PER_MINUTE: ${WHOSCORED_STRUCTURED_REQUESTS_PER_MINUTE:-60}
+    WHOSCORED_SCOPE_WRITE_CHUNK_ROWS: ${WHOSCORED_SCOPE_WRITE_CHUNK_ROWS:-20000}
     # Single catalog task, source requests only; hard-capped to 60 with burst 4.
     WHOSCORED_CATALOG_REQUESTS_PER_MINUTE: ${WHOSCORED_CATALOG_REQUESTS_PER_MINUTE:-60}
     # Transfermarkt stays disabled and cannot acquire an unmanaged proxy until
@@ -84,6 +152,9 @@ x-airflow-common: &airflow-common
     # policies only when this is true (see dags/configs/transfermarkt/).
     TM_STANDING_POLICY_ENABLED: ${TM_STANDING_POLICY_ENABLED:-false}
     TM_PROXY_CONTROL_URL: ${TM_PROXY_CONTROL_URL:-}
+    # A dedicated source token wins. The nested fallback preserves the existing
+    # production Transfermarkt control plane during credential migration.
+    TM_PROXY_CONTROL_TOKEN: ${TM_PROXY_CONTROL_TOKEN:-${PROXY_FILTER_CONTROL_TOKEN:-${SOFASCORE_PROXY_CONTROL_TOKEN:-}}}
     TM_REQUIRE_METERED_PROXY: ${TM_REQUIRE_METERED_PROXY:-false}
     TM_PROXY_LEASE_TTL_SECONDS: ${TM_PROXY_LEASE_TTL_SECONDS:-3600}
     FBREF_RAW_S3_ENDPOINT: seaweedfs:8333
@@ -97,15 +168,15 @@ x-airflow-common: &airflow-common
     FOTMOB_RAW_STORE_URI: s3://${ICEBERG_WAREHOUSE}/raw/fotmob
     FOTMOB_RAW_S3_ENDPOINT: seaweedfs:8333
     FOTMOB_RAW_S3_SCHEME: http
-    # Route FlareSolverr scrapers (WhoScored/SoFIFA) through the ad-tech filter (#652).
-    # Off by default — set to http://proxy_filter:8899 to cut residential traffic.
+    # Development-only legacy FlareSolverr proxy URL. Production keeps this
+    # blank: port 8899 requires a lease unless --allow-legacy-noauth is added.
     PROXY_FILTER_URL: ${PROXY_FILTER_URL:-}
     TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
     TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
     ALERT_ENV: ${ALERT_ENV:-dev}
     JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
   volumes:
-    - ./dags:/opt/airflow/dags
+    - ./dags:/opt/airflow/dags:ro
     - ./logs:/opt/airflow/logs
     # E1 medallion config: team_aliases.yaml + competitions.yaml — read-only
     # for utils/medallion_config.py (default CONFIG_DIR=/opt/airflow/configs/medallion)
@@ -124,8 +195,8 @@ x-airflow-common: &airflow-common
     - ./configs/proxy_filter:/opt/airflow/configs/proxy_filter:ro
     # SSO-конфиг: читает только webserver, scheduler игнорирует (фаза 6)
     - ./configs/airflow/webserver_config.py:/opt/airflow/webserver_config.py:ro
-    - ./scrapers:/opt/airflow/scrapers
-    - ./scripts:/opt/airflow/scripts
+    - ./scrapers:/opt/airflow/scrapers:ro
+    - ./scripts:/opt/airflow/scripts:ro
     # Compatibility for non-FBref DAGs that still use the shared proxy pool.
     # The FBref runner does not receive this path and only uses its lease API.
     - ./proxys.txt:/opt/airflow/proxys.txt:ro
@@ -151,15 +222,22 @@ x-airflow-common: &airflow-common
 
 services:
   # ===========================================================================
-  # SeaweedFS - S3-compatible object storage (replaces HDFS)
-  # `mini` = single-process dev mode (master+volume+filer+S3). -bucket pre-creates
-  # the warehouse bucket; -s3.config supplies static credentials (no STS/vending).
+  # SeaweedFS - S3-compatible object storage (replaces HDFS).
+  # Keep the production-compatible legacy `weed mini` data topology in the
+  # default Compose model, but never attach its unauthenticated master, filer,
+  # volume, WebDAV or admin listeners to an application network. Only the
+  # separately sandboxed S3 gateway below spans the private control network and
+  # `storage`. The reviewed four-plane migration remains separately gated.
   # ===========================================================================
   seaweedfs:
-    image: chrislusf/seaweedfs:4.36
+    image: chrislusf/seaweedfs:4.36@sha256:800b2115c63236e8bd0e5d572dc25dd493dc2feed08b54a2a269dc0101c9d94a
+    entrypoint: ["/usr/local/bin/seaweedfs-legacy-entrypoint"]
     container_name: seaweedfs
     hostname: seaweedfs
     restart: unless-stopped
+    # Keep routine Compose reconciliation from escalating to SIGKILL while the
+    # embedded master/filer/volume services flush metadata and object writes.
+    stop_grace_period: 120s
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -175,15 +253,21 @@ services:
       - -dir=/data
       - -bucket=${ICEBERG_WAREHOUSE}
       - -s3.config=/etc/seaweedfs/s3.config.json
-    ports:
-      - "127.0.0.1:8333:8333"  # S3 API
+      - -s3=false
+      - -s3.port.iceberg=0
+      - -s3.iam=false
+      - -webdav=false
+      - -admin.ui=false
+      - -filer.disableDirListing=true
+      - -filer.ui.deleteDir=false
     volumes:
       - seaweedfs_data:/data
-      - ./configs/seaweedfs/s3.config.json:/etc/seaweedfs/s3.config.json:ro
+      - ./scripts/seaweedfs_legacy_entrypoint.sh:/usr/local/bin/seaweedfs-legacy-entrypoint:ro
+      - ${SEAWEEDFS_S3_CONFIG_FILE:-./configs/seaweedfs/s3.config.json}:/etc/seaweedfs/s3.config.json:ro
     networks:
-      - storage
+      - seaweedfs-control
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8333/status"]
+      test: ["CMD", "curl", "-f", "http://localhost:9333/cluster/status"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -199,6 +283,116 @@ services:
         reservations:
           memory: 256M
 
+  # The only SeaweedFS process reachable from application containers. It has
+  # no data volume or filesystem capabilities and talks to the legacy filer on
+  # the isolated control network.
+  seaweedfs-s3:
+    image: chrislusf/seaweedfs:4.36@sha256:800b2115c63236e8bd0e5d572dc25dd493dc2feed08b54a2a269dc0101c9d94a
+    entrypoint: ["/usr/local/bin/seaweedfs-legacy-entrypoint"]
+    container_name: seaweedfs-s3
+    hostname: seaweedfs-s3
+    restart: unless-stopped
+    stop_grace_period: 60s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    command:
+      - s3
+      - -ip.bind=0.0.0.0
+      - -port=8333
+      - -filer=seaweedfs:8888
+      - -config=/etc/seaweedfs/s3.config.json
+      - -port.iceberg=0
+      - -iam=false
+      - -allowDeleteBucketNotEmpty=false
+      - -concurrentFileUploadLimit=16
+      - -concurrentUploadLimitMB=512
+    volumes:
+      - ${SEAWEEDFS_S3_CONFIG_FILE:-./configs/seaweedfs/s3.config.json}:/etc/seaweedfs/s3.config.json:ro
+      - ./scripts/seaweedfs_legacy_entrypoint.sh:/usr/local/bin/seaweedfs-legacy-entrypoint:ro
+    # The upstream image declares VOLUME /data. Override that implicit,
+    # persistent anonymous volume with a bounded ephemeral mount: this gateway
+    # talks to the filer and must never own storage state.
+    tmpfs:
+      - /data:rw,noexec,nosuid,nodev,size=16m,mode=0700
+    networks:
+      seaweedfs-control:
+        aliases:
+          - seaweedfs-s3-internal
+    depends_on:
+      seaweedfs:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8333/status"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 128M
+
+  # SeaweedFS 4.36 always opens an unauthenticated S3 gRPC listener at
+  # HTTP-port+10000. Keep that process private and expose only its authenticated
+  # HTTP listener through this credential-free, volume-free L7 boundary.
+  seaweedfs-s3-proxy:
+    image: caddy:2.10-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d
+    container_name: seaweedfs-s3-proxy
+    hostname: seaweedfs-s3-proxy
+    user: "65534:65534"
+    read_only: true
+    restart: unless-stopped
+    stop_grace_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # The official binary carries cap_net_bind_service as a file capability;
+    # Docker must retain it in the bounding set even though this listener is
+    # on the unprivileged port 8333.
+    cap_add:
+      - NET_BIND_SERVICE
+    command:
+      - caddy
+      - run
+      - --config
+      - /etc/caddy/S3ProxyCaddyfile
+      - --adapter
+      - caddyfile
+    environment:
+      XDG_CONFIG_HOME: /tmp/caddy/config
+      XDG_DATA_HOME: /tmp/caddy/data
+    ports:
+      - "127.0.0.1:8333:8333"
+    volumes:
+      - ./configs/seaweedfs/S3ProxyCaddyfile:/etc/caddy/S3ProxyCaddyfile:ro
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=0700,uid=65534,gid=65534
+    networks:
+      seaweedfs-control:
+      storage:
+        aliases:
+          - seaweedfs
+    depends_on:
+      seaweedfs-s3:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8333/status"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+        reservations:
+          memory: 32M
+
   # ===========================================================================
   # Lakekeeper - Iceberg REST Catalog (replaces Hive Metastore)
   # Rust single binary backed by Postgres. `migrate` runs schema migrations once;
@@ -206,7 +400,7 @@ services:
   # `make bootstrap-catalog` (curl to the management API).
   # ===========================================================================
   lakekeeper-migrate:
-    image: quay.io/lakekeeper/catalog:v0.13.0
+    image: quay.io/lakekeeper/catalog:v0.13.0@sha256:197461260d442a57971f60f663a5550c1113a8c3b21c68e47456e3607182a941
     container_name: lakekeeper-migrate
     command: ["migrate"]
     restart: "no"
@@ -225,7 +419,7 @@ services:
       - backend
 
   lakekeeper:
-    image: quay.io/lakekeeper/catalog:v0.13.0
+    image: quay.io/lakekeeper/catalog:v0.13.0@sha256:197461260d442a57971f60f663a5550c1113a8c3b21c68e47456e3607182a941
     container_name: lakekeeper
     hostname: lakekeeper
     restart: unless-stopped
@@ -248,7 +442,7 @@ services:
         condition: service_completed_successfully
       postgres:
         condition: service_healthy
-      seaweedfs:
+      seaweedfs-s3-proxy:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/home/nonroot/lakekeeper", "healthcheck"]
@@ -259,7 +453,12 @@ services:
     deploy:
       resources:
         limits:
-          memory: 512M
+          # Lakekeeper's RSS climbs ~430 MB/h under sustained per-target Iceberg
+          # commits and is memcg-OOM-killed mid-commit at whatever ceiling it is
+          # given (512M died in 20 min, 1G in 2.4 h — FotMob #930 canary). The
+          # headroom buys hours, not immunity: long backfills must also restart
+          # it between work units (see fotmob_canary_backfill/driver.sh).
+          memory: 3G
         reservations:
           memory: 128M
 
@@ -267,7 +466,7 @@ services:
   # PostgreSQL - Metadata Storage
   # ===========================================================================
   postgres:
-    image: postgres:16-alpine
+    image: postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
     container_name: postgres
     hostname: postgres
     restart: unless-stopped
@@ -316,7 +515,7 @@ services:
   # Redis - Celery Broker for Airflow
   # ===========================================================================
   redis:
-    image: redis:7-alpine
+    image: redis:7-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
     container_name: redis
     hostname: redis
     security_opt:
@@ -351,7 +550,10 @@ services:
   # ===========================================================================
   tor:
     profiles: ["heavy"]
-    image: dperson/torproxy:0.3.1
+    # Registry proof on 2026-07-16: the published 0.3.1 tag is absent (404).
+    # The immutable latest index keeps the same torproxy.sh entrypoint and the
+    # required 9050/9051 ports; the digest, not the display tag, selects bytes.
+    image: dperson/torproxy:latest@sha256:d8b5f1cf24f1b7a0aa334929a264b2606a107223dd0d51eb1cda8aae6fbeec53
     container_name: tor
     hostname: tor
     security_opt:
@@ -390,6 +592,39 @@ services:
   # ===========================================================================
   # Airflow
   # ===========================================================================
+  airflow-log-init:
+    image: data-platform-airflow-base:2.11.2-whoscored
+    build:
+      context: ./docker/images/airflow
+      dockerfile: Dockerfile
+      target: airflow-base
+    container_name: airflow-log-init
+    user: "0:0"
+    entrypoint: ["/bin/bash", "-euc"]
+    command:
+      - |
+        chown -R --no-dereference 50000:0 /opt/airflow/logs
+        chmod 0770 /opt/airflow/logs
+        test "$$(stat -c '%u:%g' /opt/airflow/logs)" = '50000:0'
+        test -w /opt/airflow/logs
+        # Repair volumes created by an older image before any non-root Airflow
+        # service imports soccerdata or tries to populate its cache.
+        chown -R --no-dereference 50000:0 /home/airflow/soccerdata
+        chmod -R u+rwX,g+rwX,o-rwx /home/airflow/soccerdata
+        test "$$(stat -c '%u:%g' /home/airflow/soccerdata)" = '50000:0'
+    volumes:
+      - ./logs:/opt/airflow/logs
+      - soccerdata_cache:/home/airflow/soccerdata
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+    restart: "no"
+
   airflow-init:
     <<: *airflow-common
     container_name: airflow-init
@@ -398,6 +633,7 @@ services:
       - -c
       - |
         set -euo pipefail
+        python /opt/airflow/scripts/init_seaweedfs_bucket.py
         airflow db migrate
         # Durable FBref registry/frontier shares Airflow's PostgreSQL server
         # in an isolated schema.  The migration is advisory-lock protected and
@@ -417,30 +653,151 @@ services:
         # FotMob is lightweight direct HTTP.  A separate bounded pool prevents
         # browser scrapers from serializing it while limiting source fan-out.
         airflow pools set 'fotmob_http_pool' 4 'Bounded direct FotMob HTTP work'
-        # WhoScored daily scopes use one slot each; the resumable backfill
-        # deliberately consumes both slots so it cannot overlap a daily run.
+        # WhoScored daily scopes use one slot each; exclusive controller/DQ
+        # tasks consume every configured slot so they cannot overlap writers.
         # `pools set` is an idempotent create/update operation on fresh and
         # already-initialised Airflow metadata databases.
-        airflow pools set 'whoscored_direct_pool' 2 'WhoScored direct-only scopes; backfill consumes both slots'
+        case "$${WHOSCORED_SOURCE_POOL_SLOTS}" in
+          2|3|4) ;;
+          *) echo 'WHOSCORED_SOURCE_POOL_SLOTS must be 2, 3, or 4' >&2; exit 1 ;;
+        esac
+        if [[ "$${WHOSCORED_BACKFILL_POOL}" != "$${WHOSCORED_DIRECT_POOL}" ]]; then
+          echo 'WhoScored daily and backfill must share one source pool' >&2
+          exit 1
+        fi
+        airflow pools set "$${WHOSCORED_DIRECT_POOL}" "$${WHOSCORED_SOURCE_POOL_SLOTS}" 'WhoScored bounded direct-only source concurrency'
+        airflow pools set "$${WHOSCORED_DQ_POOL}" 2 'WhoScored bounded Iceberg data-quality queries'
+        airflow pools set 'whoscored_storage_pool' 1 'WhoScored serialized backup and restore verification'
         echo "Airflow initialization complete"
     environment:
       <<: *airflow-common-env
       _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME}
       _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD}
+    depends_on:
+      airflow-log-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      trino:
+        condition: service_healthy
     restart: "no"
 
   airflow-scheduler:
     <<: *airflow-common
-    # The live scheduler runtime is Airflow 2.11.2.  Use the narrow
-    # scheduler overlay so a future `compose build airflow-scheduler`
-    # cannot fall back to the repository's older full-image Dockerfile.
+    # The production service is numeric non-root. Do not inherit the common
+    # CHOWN/SETUID/SETGID/SYS_PTRACE set: Chromium already runs without its
+    # setuid sandbox and a non-root exec cannot retain these non-ambient caps.
+    cap_add: []
+    security_opt:
+      - no-new-privileges:true
+      - apparmor=docker-default
+      - seccomp=builtin
+    # Build the scheduler-only native TLS target from the same Dockerfile.
+    # This is a real multi-stage dependency and works from a cold build cache.
     build:
       context: ./docker/images/airflow
-      dockerfile: Dockerfile.scheduler-runtime
-      args:
-        AIRFLOW_RUNTIME_BASE: ${AIRFLOW_RUNTIME_BASE:-data-platform-airflow-webserver:latest}
+      dockerfile: Dockerfile
+      target: airflow-scheduler
+    image: data-platform-airflow-scheduler:2.11.2-whoscored
     container_name: airflow-scheduler
     command: scheduler
+    environment:
+      <<: *airflow-common-env
+      # LocalExecutor runs backup/restore tasks in this process. Keep the
+      # off-host credentials out of webserver/init and use a read-only source
+      # identity when one is configured.
+      WHOSCORED_BACKUP_SOURCE_S3_ACCESS_KEY: ${WHOSCORED_BACKUP_SOURCE_S3_ACCESS_KEY:-}
+      WHOSCORED_BACKUP_SOURCE_S3_SECRET_KEY: ${WHOSCORED_BACKUP_SOURCE_S3_SECRET_KEY:-}
+      WHOSCORED_BACKUP_DESTINATION_S3_ACCESS_KEY: ${WHOSCORED_BACKUP_DESTINATION_S3_ACCESS_KEY:-}
+      WHOSCORED_BACKUP_DESTINATION_S3_SECRET_KEY: ${WHOSCORED_BACKUP_DESTINATION_S3_SECRET_KEY:-}
+      WHOSCORED_BACKUP_RESTORE_S3_ACCESS_KEY: ${WHOSCORED_BACKUP_RESTORE_S3_ACCESS_KEY:-}
+      WHOSCORED_BACKUP_RESTORE_S3_SECRET_KEY: ${WHOSCORED_BACKUP_RESTORE_S3_SECRET_KEY:-}
+      # LocalExecutor children can read only signed approval documents.  The
+      # approval/control/ledger HMAC keys live in the isolated paid boundary and
+      # DagRun.conf must still pin the selected file by approval ID and SHA-256.
+      WHOSCORED_PROXY_APPROVAL_ROOT: /opt/airflow/secure/whoscored-approvals
+      WHOSCORED_PROXY_APPROVAL_PATH: ${WHOSCORED_PROXY_APPROVAL_PATH:-}
+      WHOSCORED_PAID_GATEWAY_URL: ${WHOSCORED_PAID_GATEWAY_URL:-http://whoscored_paid_gateway:8898}
+      WHOSCORED_PAID_GATEWAY_TOKEN: ${WHOSCORED_PAID_GATEWAY_TOKEN:-}
+      WHOSCORED_SCRAPER_PYTHON: /usr/local/bin/python
+      LEGACY_SCRAPER_PYTHON: /opt/legacy-scraper-venv/bin/python
+    # YAML merge keys replace sequences, so repeat the common mounts before
+    # appending the scheduler-only, deployment-owned approval directory.
+    volumes:
+      - type: bind
+        source: ./dags
+        target: /opt/airflow/dags
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${AIRFLOW_LOGS_HOST_DIR:-./logs}
+        target: /opt/airflow/logs
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./configs/medallion
+        target: /opt/airflow/configs/medallion
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./configs/soccerdata
+        target: /opt/airflow/configs/soccerdata
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./configs/sofascore
+        target: /opt/airflow/configs/sofascore
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./configs/airflow/webserver_config.py
+        target: /opt/airflow/webserver_config.py
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./scrapers
+        target: /opt/airflow/scrapers
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./scripts
+        target: /opt/airflow/scripts
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${PLATFORM_PROXY_FILE_HOST_PATH:-./proxys.txt}
+        target: /opt/airflow/proxys.txt
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./transform
+        target: /opt/airflow/transform
+        read_only: true
+        bind:
+          create_host_path: false
+      - soccerdata_cache:/home/airflow/soccerdata
+      - type: bind
+        source: ${WHOSCORED_PROXY_APPROVAL_HOST_DIR:?set an absolute protected approval directory}
+        target: /opt/airflow/secure/whoscored-approvals
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${WHOSCORED_PROXY_FILTER_STATE_HOST_DIR:?set an absolute protected paid-filter state directory}
+        target: /opt/airflow/state/whoscored-proxy-filter
+        read_only: true
+        bind:
+          create_host_path: false
     depends_on:
       airflow-init:
         condition: service_completed_successfully
@@ -449,7 +806,7 @@ services:
     healthcheck:
       test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --hostname \"$${HOSTNAME}\""]
       interval: 30s
-      timeout: 10s
+      timeout: 30s
       retries: 5
       start_period: 60s
     restart: unless-stopped
@@ -469,6 +826,11 @@ services:
     # on it as a buffer beyond the limit (#847 review). Must stay >= the memory
     # limit above — docker rejects memswap < memory at container create.
     memswap_limit: 16G
+    networks:
+      - frontend
+      - backend
+      - storage
+      - whoscored-paid-api
 
   airflow-webserver:
     <<: *airflow-common
@@ -509,7 +871,7 @@ services:
   # Trino - Distributed SQL Query Engine
   # ===========================================================================
   trino:
-    image: trinodb/trino:482
+    image: trinodb/trino:482@sha256:90b35b7c603eaa1f889bf03981a62b75f998ee6c0f851d9f4e341b49a57022b6
     container_name: trino
     hostname: trino
     restart: unless-stopped
@@ -544,7 +906,7 @@ services:
     depends_on:
       lakekeeper:
         condition: service_healthy
-      seaweedfs:
+      seaweedfs-s3-proxy:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "-k", "https://localhost:8443/v1/info"]
@@ -730,7 +1092,7 @@ services:
   # ===========================================================================
   opensearch:
     profiles: ["heavy"]
-    image: opensearchproject/opensearch:3.4.0
+    image: opensearchproject/opensearch:3.4.0@sha256:1647ce2e07371f1ac8bbad28890a64ef77c5a694a61f656120f0ace09e66bf48
     container_name: opensearch
     hostname: opensearch
     security_opt:
@@ -785,7 +1147,7 @@ services:
   # boots. The server depends on it completing successfully.
   openmetadata-migrate:
     profiles: ["heavy"]
-    image: openmetadata/server:1.13.1
+    image: openmetadata/server:1.13.1@sha256:eaa318584c52d4a492a2c56c95818b5564c6ea28b2e9695ac532c856b2c61bc9
     container_name: openmetadata-migrate
     command: ["./bootstrap/openmetadata-ops.sh", "migrate"]
     depends_on:
@@ -888,7 +1250,7 @@ services:
 
   openmetadata-server:
     profiles: ["heavy"]
-    image: openmetadata/server:1.13.1
+    image: openmetadata/server:1.13.1@sha256:eaa318584c52d4a492a2c56c95818b5564c6ea28b2e9695ac532c856b2c61bc9
     container_name: openmetadata-server
     hostname: openmetadata-server
     security_opt:
@@ -934,7 +1296,7 @@ services:
 
   openmetadata-ingestion:
     profiles: ["heavy"]
-    image: openmetadata/ingestion:1.13.1
+    image: openmetadata/ingestion:1.13.1@sha256:12e0cde89ecebdfa046bfbbb54d22c841f24e502159f82ece0062bf176f4088d
     container_name: openmetadata-ingestion
     hostname: openmetadata-ingestion
     security_opt:
@@ -980,24 +1342,28 @@ services:
   # Used by WhoScored events scraper via HTTP at port 8191
   # ===========================================================================
   flaresolverr:
-    image: ghcr.io/flaresolverr/flaresolverr:v3.4.6
+    image: data-platform-flaresolverr-whoscored:3.4.6
+    build:
+      context: .
+      dockerfile: docker/images/flaresolverr-whoscored/Dockerfile
     container_name: flaresolverr
-    # Stock FlareSolverr cannot issue WhoScored's same-origin statistics XHR.
-    # This entrypoint preserves the upstream API and adds fixed, allow-listed
-    # /v1/xhr and bounded /v1/xhr/batch routes; neither exposes arbitrary
-    # browser automation.
-    command: ["/usr/local/bin/python", "-u", "/app/flaresolverr_extended.py"]
-    volumes:
-      - ./scripts/flaresolverr_extended.py:/app/flaresolverr_extended.py:ro
+    # The derived image uses the exact digest-pinned upstream image and bakes
+    # the extension root-owned. Never replace this with an application bind:
+    # client preflight must precede every browser/session side effect.
+    read_only: true
+    tmpfs:
+      - /tmp:rw,exec,nosuid,nodev,size=2g,uid=1000,gid=1000,mode=1770
+      - /config:rw,noexec,nosuid,nodev,size=16m,uid=1000,gid=1000,mode=0700
+      - /app/.config:rw,noexec,nosuid,nodev,size=64m,uid=1000,gid=1000,mode=0700
+      - /app/.local:rw,noexec,nosuid,nodev,size=64m,uid=1000,gid=1000,mode=0700
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
+      - apparmor=docker-default
+      - seccomp=builtin
     cap_drop:
       - ALL
-    cap_add:
-      - CHOWN
-      - SETGID
-      - SETUID
+    cap_add: []
     ports:
       - "127.0.0.1:8191:8191"
     environment:
@@ -1029,6 +1395,53 @@ services:
           memory: 512M
     networks:
       - backend
+
+  # Paid Chromium is a separate, authenticated process.  It has no host port,
+  # no backend attachment and no direct internet route; every /v1 side effect
+  # requires a one-use gateway capability.
+  flaresolverr_whoscored_paid:
+    profiles: ["whoscored-paid"]
+    image: data-platform-flaresolverr-whoscored:3.4.6
+    build:
+      context: .
+      dockerfile: docker/images/flaresolverr-whoscored/Dockerfile
+    container_name: flaresolverr_whoscored_paid
+    read_only: true
+    tmpfs:
+      - /tmp:rw,exec,nosuid,nodev,size=2g,uid=1000,gid=1000,mode=1770
+      - /config:rw,noexec,nosuid,nodev,size=16m,uid=1000,gid=1000,mode=0700
+      - /app/.config:rw,noexec,nosuid,nodev,size=64m,uid=1000,gid=1000,mode=0700
+      - /app/.local:rw,noexec,nosuid,nodev,size=64m,uid=1000,gid=1000,mode=0700
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+      - apparmor=docker-default
+      - seccomp=builtin
+    cap_drop:
+      - ALL
+    cap_add: []
+    environment:
+      LOG_LEVEL: info
+      LOG_HTML: "false"
+      CAPTCHA_SOLVER: none
+      TZ: UTC
+      WHOSCORED_FLARESOLVERR_PAID_EXCLUSIVE: "1"
+      WHOSCORED_FLARESOLVERR_GATEWAY_SECRET: ${WHOSCORED_FLARESOLVERR_GATEWAY_SECRET:-}
+    shm_size: "1g"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8191/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 512M
+    networks:
+      - whoscored-paid-browser
 
   # ===========================================================================
   # fbref_proxy_filter - isolated, byte-metered residential path for FBref.
@@ -1113,14 +1526,15 @@ services:
   # proxy_filter - ad-tech filtering proxy between FlareSolverr and the
   # residential pool (#652). Cuts billable residential traffic by refusing
   # ad-tech CONNECT hosts (no MITM — preserves Chrome's TLS fingerprint).
-  # Port 8899 keeps the compatible lease control API and legacy FlareSolverr
-  # route. Port 8900 accepts proxy traffic only with a short-lived lease token;
-  # each lease pins one upstream and is charged before every provider read.
+  # Port 8899 serves the lease control API and also requires a lease for proxy
+  # traffic by default. Port 8900 is lease-only; each lease pins one upstream
+  # and is charged before every provider read.
   # ===========================================================================
   proxy_filter:
     build:
       context: ./docker/images/airflow
       dockerfile: Dockerfile
+      target: airflow-base
     container_name: proxy_filter
     restart: unless-stopped
     security_opt:
@@ -1128,15 +1542,22 @@ services:
     cap_drop:
       - ALL
     environment:
-      PYTHONPATH: /opt/airflow
-      PROXY_FILTER_CONTROL_TOKEN: ${SOFASCORE_PROXY_CONTROL_TOKEN:-}
+      PROXY_FILTER_CONTROL_TOKEN: ${PROXY_FILTER_CONTROL_TOKEN:-${SOFASCORE_PROXY_CONTROL_TOKEN:-}}
+      # Prefer a source credential, but keep the current production shared token
+      # usable until the ordinary proxy and scheduler rotate together.
+      TM_PROXY_CONTROL_TOKEN: ${TM_PROXY_CONTROL_TOKEN:-${PROXY_FILTER_CONTROL_TOKEN:-${SOFASCORE_PROXY_CONTROL_TOKEN:-}}}
+      WHOSCORED_PROXY_CAMPAIGN_LEDGER_PATH: ${WHOSCORED_PROXY_CAMPAIGN_LEDGER_PATH:-/opt/airflow/logs/proxy_filter/whoscored_campaigns.json}
       # Secret JSON is injected at runtime. The service fails closed when it is
       # blank; the legacy file is intentionally not mounted into this container.
       PROXY_POOL_JSON: ${PROXY_POOL_JSON:-}
-      PROXY_FILTER_ALLOW_FILE_FALLBACK: ${PROXY_FILTER_ALLOW_FILE_FALLBACK:-false}
+      # Production is structurally env-only. Development file fallback, when
+      # needed, must use a separate explicit service definition.
+      PROXY_FILTER_ALLOW_FILE_FALLBACK: "false"
     command:
       - python
       - /opt/airflow/scripts/proxy_filter/filter_proxy.py
+      - --source-mode
+      - shared-no-whoscored
       - --listen
       - 0.0.0.0:8899
       - --lease-listen
@@ -1156,7 +1577,7 @@ services:
       - --dagrun-budget-bytes
       - ${PROXY_FILTER_DAGRUN_BUDGET_BYTES:-8000000}
       - --transfermarkt-dagrun-budget-bytes
-      - ${PROXY_FILTER_TRANSFERMARKT_DAGRUN_BUDGET_BYTES:-15728640}
+      - ${PROXY_FILTER_TRANSFERMARKT_DAGRUN_BUDGET_BYTES:-0}
       - --url-budget-bytes
       - ${PROXY_FILTER_URL_BUDGET_BYTES:-2000000}
       - --max-active-leases
@@ -1169,12 +1590,14 @@ services:
       - ${PROXY_FILTER_SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES:-0}
       - --ledger
       - /opt/airflow/logs/proxy_filter/paid_requests.jsonl
+      - --whoscored-campaign-ledger
+      - ${WHOSCORED_PROXY_CAMPAIGN_LEDGER_PATH:-/opt/airflow/logs/proxy_filter/whoscored_campaigns.json}
     volumes:
       # Paid-canary runtime fingerprint inputs.  The proxy control plane
       # independently recomputes the same digest as the Airflow producer.
       - ./dags:/opt/airflow/dags:ro
-      - ./scripts:/opt/airflow/scripts
-      - ./scrapers:/opt/airflow/scrapers
+      - ./scripts:/opt/airflow/scripts:ro
+      - ./scrapers:/opt/airflow/scrapers:ro
       - ./configs/medallion:/opt/airflow/configs/medallion:ro
       - ./configs/proxy_filter:/opt/airflow/configs/proxy_filter:ro
       - ./configs/sofascore:/opt/airflow/configs/sofascore:ro
@@ -1195,9 +1618,250 @@ services:
         reservations:
           memory: 64M
     depends_on:
-      - flaresolverr
+      airflow-log-init:
+        condition: service_completed_successfully
+      flaresolverr:
+        condition: service_started
     networks:
       - backend
+
+  # Dedicated paid boundary for WhoScored. It has a separate provider pool,
+  # control credential and ledgers, and is opt-in until a provider subaccount
+  # exposes an authoritative server-side invoice quota/usage receipt.
+  whoscored_proxy_filter:
+    profiles: ["whoscored-paid"]
+    image: data-platform-airflow-whoscored-proxy:2.11.2-whoscored
+    build:
+      context: ./docker/images/airflow
+      dockerfile: Dockerfile
+      target: airflow-whoscored-proxy
+    container_name: whoscored_proxy_filter
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m,uid=50000,gid=0,mode=0700
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+      - apparmor=docker-default
+      - seccomp=builtin
+    cap_drop:
+      - ALL
+    cap_add: []
+    environment:
+      CONNECTION_CHECK_MAX_COUNT: "0"
+      PROXY_FILTER_CONTROL_TOKEN: ${WHOSCORED_PROXY_FILTER_CONTROL_TOKEN:-}
+      WHOSCORED_PROXY_APPROVAL_HMAC_SECRET: ${WHOSCORED_PROXY_APPROVAL_HMAC_SECRET:-}
+      WHOSCORED_PROXY_LEDGER_HMAC_SECRET: ${WHOSCORED_PROXY_LEDGER_HMAC_SECRET:-}
+      TM_PROXY_CONTROL_TOKEN: ""
+      WHOSCORED_PROXY_CAMPAIGN_LEDGER_PATH: /opt/airflow/state/whoscored-proxy-filter/whoscored_campaigns.json
+      PROXY_POOL_JSON: ${WHOSCORED_PROXY_POOL_JSON:-}
+      PROXY_FILTER_ALLOW_FILE_FALLBACK: "false"
+    command:
+      - python
+      - /opt/airflow/scripts/proxy_filter/filter_proxy.py
+      - --source-mode
+      - whoscored-only
+      - --listen
+      - 0.0.0.0:8899
+      - --lease-listen
+      - 0.0.0.0:8900
+      - --lease-proxy-url
+      - http://whoscored_proxy_filter:8900
+      - --blocklist
+      - /opt/airflow/configs/proxy_filter/blocklist.txt
+      - --out
+      - /opt/airflow/state/whoscored-proxy-filter/bytes.json
+      - --daily-budget-mb
+      - ${WHOSCORED_PROXY_FILTER_DAILY_BUDGET_MB:-850}
+      - --max-lease-mb
+      - ${WHOSCORED_PROXY_FILTER_MAX_LEASE_MB:-2}
+      - --max-lease-ttl-seconds
+      - ${WHOSCORED_PROXY_FILTER_MAX_LEASE_TTL_SECONDS:-3600}
+      - --dagrun-budget-bytes
+      - ${WHOSCORED_PROXY_FILTER_DAGRUN_BUDGET_BYTES:-1000000000}
+      - --transfermarkt-dagrun-budget-bytes
+      - "0"
+      - --url-budget-bytes
+      - ${WHOSCORED_PROXY_FILTER_URL_BUDGET_BYTES:-2000000}
+      - --max-active-leases
+      - ${WHOSCORED_PROXY_FILTER_MAX_ACTIVE_LEASES:-2}
+      - --sofascore-budget-artifact
+      - /opt/airflow/configs/sofascore/proxy_budget_canary.json
+      - --sofascore-canary-hard-cap-bytes
+      - "0"
+      - --sofascore-discovery-dagrun-budget-bytes
+      - "0"
+      - --ledger
+      - /opt/airflow/state/whoscored-proxy-filter/paid_requests.jsonl
+      - --whoscored-campaign-ledger
+      - /opt/airflow/state/whoscored-proxy-filter/whoscored_campaigns.json
+      - --whoscored-state-marker
+      - /opt/airflow/state/whoscored-proxy-filter/.whoscored_state_initialized.json
+    volumes:
+      - type: bind
+        source: ./dags
+        target: /opt/airflow/dags
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./scripts
+        target: /opt/airflow/scripts
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./scrapers
+        target: /opt/airflow/scrapers
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./configs/medallion
+        target: /opt/airflow/configs/medallion
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./configs/proxy_filter
+        target: /opt/airflow/configs/proxy_filter
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./configs/sofascore
+        target: /opt/airflow/configs/sofascore
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${WHOSCORED_PROXY_FILTER_STATE_HOST_DIR:?set an absolute protected paid-filter state directory}
+        target: /opt/airflow/state/whoscored-proxy-filter
+        bind:
+          create_host_path: false
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://localhost:8899/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 64M
+    depends_on:
+      airflow-log-init:
+        condition: service_completed_successfully
+    networks:
+      - whoscored-paid-browser
+      - whoscored-paid-provider-egress
+
+  # The runner can ask for exactly one bounded fetch.  This gateway owns and
+  # destroys proxy leases and browser sessions before returning content plus a
+  # credential-free accounting receipt.
+  whoscored_paid_gateway:
+    profiles: ["whoscored-paid"]
+    image: data-platform-airflow-whoscored-proxy:2.11.2-whoscored
+    build:
+      context: ./docker/images/airflow
+      dockerfile: Dockerfile
+      target: airflow-whoscored-proxy
+    container_name: whoscored_paid_gateway
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m,uid=50000,gid=0,mode=0700
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+      - apparmor=docker-default
+      - seccomp=builtin
+    cap_drop:
+      - ALL
+    cap_add: []
+    environment:
+      CONNECTION_CHECK_MAX_COUNT: "0"
+      ALERT_ENV: ${ALERT_ENV:-}
+      WHOSCORED_PAID_GATEWAY_TOKEN: ${WHOSCORED_PAID_GATEWAY_TOKEN:-}
+      WHOSCORED_PROXY_CONTROL_TOKEN: ${WHOSCORED_PROXY_FILTER_CONTROL_TOKEN:-}
+      WHOSCORED_PROXY_APPROVAL_HMAC_SECRET: ${WHOSCORED_PROXY_APPROVAL_HMAC_SECRET:-}
+      WHOSCORED_PAID_ALERT_HMAC_SECRET: ${WHOSCORED_PAID_ALERT_HMAC_SECRET:-}
+      WHOSCORED_PAID_ALERT_AUTHORITY_ROOT: /opt/airflow/secure/whoscored-alert-authority
+      WHOSCORED_PAID_ALERT_SECRET_PATH: /opt/airflow/secure/whoscored-alert-authority/telegram.json
+      WHOSCORED_PAID_ALERT_BINDING_PATH: /opt/airflow/secure/whoscored-alert-authority/binding.json
+      WHOSCORED_PAID_ALERT_RECEIPT_ROOT: /opt/airflow/state/whoscored-paid-gateway/alert-receipts
+      WHOSCORED_FLARESOLVERR_GATEWAY_SECRET: ${WHOSCORED_FLARESOLVERR_GATEWAY_SECRET:-}
+    command:
+      - python
+      - /opt/airflow/scripts/whoscored_paid_gateway.py
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8898"
+      - --proxy-url
+      - http://whoscored_proxy_filter:8900
+      - --proxy-control-url
+      - http://whoscored_proxy_filter:8899
+      - --flaresolverr-url
+      - http://flaresolverr_whoscored_paid:8191
+    volumes:
+      - type: bind
+        source: ./dags
+        target: /opt/airflow/dags
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./scripts
+        target: /opt/airflow/scripts
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./scrapers
+        target: /opt/airflow/scrapers
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./configs/medallion
+        target: /opt/airflow/configs/medallion
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${WHOSCORED_PAID_GATEWAY_STATE_HOST_DIR:?set an absolute protected paid-gateway state directory}
+        target: /opt/airflow/state/whoscored-paid-gateway
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${WHOSCORED_PAID_ALERT_AUTHORITY_HOST_DIR:?set an absolute protected paid-alert authority directory}
+        target: /opt/airflow/secure/whoscored-alert-authority
+        read_only: true
+        bind:
+          create_host_path: false
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://localhost:8898/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 64M
+    depends_on:
+      whoscored_proxy_filter:
+        condition: service_healthy
+      flaresolverr_whoscored_paid:
+        condition: service_healthy
+    networks:
+      - whoscored-paid-api
+      - whoscored-paid-browser
+      - whoscored-paid-direct-egress
 
   # ---------------------------------------------------------------------------
   # sofascore_proxy_filter ВЫНЕСЕН в отдельный compose-проект (#951, инцидент
@@ -1215,7 +1879,7 @@ services:
   # резолвят публичные имена прямо в Caddy без hairpin через интернет.
   # ---------------------------------------------------------------------------
   caddy:
-    image: caddy:2.10-alpine
+    image: caddy:2.10-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d
     container_name: caddy
     hostname: caddy
     security_opt:
@@ -1274,7 +1938,7 @@ services:
   # ПАПКУ вместо файла realm-football.json и импорт сломается).
   # ---------------------------------------------------------------------------
   keycloak:
-    image: quay.io/keycloak/keycloak:26.3
+    image: quay.io/keycloak/keycloak:26.3@sha256:357829ec7c4693397533035092ad13b0644bcc95ded311f33a3738c4d9e9bdba
     container_name: keycloak
     hostname: keycloak
     command: ["start", "--import-realm"]
@@ -1387,11 +2051,37 @@ networks:
   storage:
     driver: bridge
     name: dp-storage
+  # Only SeaweedFS storage planes and the credential-enforcing S3 gateway may
+  # join this network. Docker `internal` isolates container/external routing;
+  # it does NOT block host-to-container-IP traffic. Production therefore
+  # requires the dedicated-host trust boundary documented in the runbook.
+  seaweedfs-control:
+    driver: bridge
+    internal: true
+    name: dp-seaweedfs-control
   # Analyst: JupyterHub + юзер-контейнеры + Caddy (alias). Изолирована от
   # postgres/redis/lakekeeper/seaweedfs — ноутбуки ходят только через Caddy.
   analyst:
     driver: bridge
     name: dp-analyst
+  # Scheduler <-> L7 gateway only.  No proxy or browser capability is visible.
+  whoscored-paid-api:
+    driver: bridge
+    internal: true
+    name: dp-whoscored-paid-api
+  # Gateway, authenticated Chromium and filtering proxy only.
+  whoscored-paid-browser:
+    driver: bridge
+    internal: true
+    name: dp-whoscored-paid-browser
+  # Deliberately separate egress planes prevent Chromium from bypassing the
+  # filter and prevent the filter from becoming a general direct web client.
+  whoscored-paid-direct-egress:
+    driver: bridge
+    name: dp-whoscored-paid-direct-egress
+  whoscored-paid-provider-egress:
+    driver: bridge
+    name: dp-whoscored-paid-provider-egress
 
 # =============================================================================
 # Volumes
@@ -1400,7 +2090,8 @@ volumes:
   soccerdata_cache:
     name: soccerdata_cache
   seaweedfs_data:
-    name: seaweedfs_data
+    name: ${SEAWEEDFS_DATA_VOLUME_NAME:?SEAWEEDFS_DATA_VOLUME_NAME is required}
+    external: true
   postgres_data:
     name: postgres_data
   redis_data:
