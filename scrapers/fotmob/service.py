@@ -487,7 +487,16 @@ class FotMobIngestService:
     @staticmethod
     def _record_failure(result: OperationResult, key: str, fetch: FetchResult) -> None:
         if fetch.outcome == FetchOutcome.NOT_AVAILABLE:
+            # A transport NOT_AVAILABLE is terminal by construction (204/404 or a
+            # 200 ``null`` body — distinct from the retryable class), so the
+            # target is definitively absent at source (e.g. delisted deep-history
+            # teams whose /api/data/teams?id=… returns ``null``). Count it as an
+            # intentional absence so its scope can close instead of re-requesting
+            # the same empty target every iteration and stalling the plan.
             result.not_available += 1
+            result.metadata["intentional_not_available"] = (
+                int(result.metadata.get("intentional_not_available", 0)) + 1
+            )
         elif fetch.outcome == FetchOutcome.RETRYABLE_FAILURE:
             result.retryable.append(key)
         else:

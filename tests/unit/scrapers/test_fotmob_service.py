@@ -9,7 +9,7 @@ from scrapers.fotmob.repository import (
     MemoryFotMobRepository,
     TargetCommit,
 )
-from scrapers.fotmob.service import FotMobIngestService
+from scrapers.fotmob.service import FotMobIngestService, OperationResult
 from scrapers.fotmob.transport import (
     FetchOutcome,
     FetchResult,
@@ -671,6 +671,53 @@ def test_player_next_snapshot_is_global_and_fresh_entity_is_skipped():
     assert row["primary_team_id"] == 1
     assert "source_season_key" not in row
     assert row["snapshot_date"] == "2026-07-11"
+
+
+def _absent_team_fetch(outcome):
+    target = canonicalize_target("teams", {"id": "2222"})
+    return FetchResult(
+        outcome=outcome,
+        target_key=target.target_key,
+        url=target.canonical_url,
+        http_status=200,
+        json_data=None,
+        body=b"null",
+        attempts=1,
+        retries=0,
+        cache_hit=False,
+        stale=False,
+        terminal=False,
+        etag=None,
+        last_modified=None,
+        raw_uri=None,
+        content_hash=None,
+        fetched_at=None,
+        encoded_bytes=4,
+        decoded_bytes=4,
+        direct_bytes=4,
+        proxy_bytes=0,
+    )
+
+
+def test_record_failure_marks_transport_not_available_as_intentional_absence():
+    # Delisted deep-history teams return HTTP 200 with a `null` body, which the
+    # transport reports as NOT_AVAILABLE. That must close the scope, not stall it.
+    result = OperationResult("team_snapshots")
+    FotMobIngestService._record_failure(
+        result, "2222", _absent_team_fetch(FetchOutcome.NOT_AVAILABLE)
+    )
+    assert result.not_available == 1
+    assert result.metadata["intentional_not_available"] == 1
+
+
+def test_record_failure_leaves_retryable_failure_open_and_not_intentional():
+    result = OperationResult("team_snapshots")
+    FotMobIngestService._record_failure(
+        result, "3333", _absent_team_fetch(FetchOutcome.RETRYABLE_FAILURE)
+    )
+    assert result.not_available == 0
+    assert "intentional_not_available" not in result.metadata
+    assert result.retryable == ["3333"]
 
 
 def test_player_null_pageprops_data_is_intentional_not_available():
