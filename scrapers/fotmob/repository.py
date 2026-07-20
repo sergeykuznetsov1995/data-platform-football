@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -27,6 +28,8 @@ import pandas as pd
 
 from scrapers.base.iceberg_writer import IcebergWriter
 
+
+logger = logging.getLogger(__name__)
 
 PARSER_VERSION = "fotmob-native-v1"
 MANIFEST_TABLE = "fotmob_ingest_manifest"
@@ -138,6 +141,27 @@ DEDUP_KEYS: dict[str, tuple[str, ...]] = {
         "disposition",
     ),
 }
+
+# Player inventory keys carry no scope columns, so one preload would pull the
+# whole ~3.8M-key population for rows the run-level dedup already collapses.
+INVENTORY_PRELOAD_SKIP: frozenset[str] = frozenset({"player"})
+
+
+def _dedup_key_value(value: Any) -> Optional[str]:
+    """Normalize a dedup key value to its canonical string spelling.
+
+    Live rows carry ints while the table column is VARCHAR holding both '53'
+    and '53.0' spellings (pandas floats int columns in frames that mix scoped
+    and scope-less rows); comparing un-normalized values would silently never
+    match across that boundary.
+    """
+
+    if value is None:
+        return None
+    text = str(value)
+    if text.endswith(".0") and text[:-2].isdigit():
+        text = text[:-2]
+    return text
 
 
 def _completed_at_key(view: Mapping[str, Any]) -> str:
@@ -462,6 +486,7 @@ class FotMobRepository:
         # matches of one season share almost every json_path, and re-emitting
         # them each flush wrote ~2.4M rows per iteration where ~200k were new.
         self._seen_keys: dict[str, set[tuple[Any, ...]]] = {}
+        self._seeded_scopes: set[tuple[Any, ...]] = set()
         self._pending_targets: dict[str, dict[str, Any]] = {}
         self._pending_entities: dict[tuple[str, str], dict[str, Any]] = {}
         self._pending_rows = 0
@@ -636,12 +661,66 @@ class FotMobRepository:
         seen = self._seen_keys.setdefault(table, set())
         output: list[dict[str, Any]] = []
         for row in rows:
-            key = tuple(row.get(column) for column in key_columns)
+            key = tuple(_dedup_key_value(row.get(column)) for column in key_columns)
+            self._seed_scope_keys(table, key_columns, key)
             if key in seen:
                 continue
             seen.add(key)
             output.append(row)
         return output
+
+    def _seed_scope_keys(
+        self,
+        table: str,
+        key_columns: tuple[str, ...],
+        key: tuple[Optional[str], ...],
+    ) -> None:
+        """Lazily fold a scope's already-written dedup keys into the seen-set.
+
+        Iterations resume mid-scope, so the json paths a season's matches
+        share were usually written by an earlier run already — re-learning
+        them re-writes ~150k inventory rows per scope.  One ``SELECT
+        DISTINCT`` per (target_type, competition, season) replaces that.  Any
+        failure degrades to run-local dedup and never blocks the write path.
+        """
+
+        scope = (table,) + key[:3]
+        if key[0] in INVENTORY_PRELOAD_SKIP or scope in self._seeded_scopes:
+            return
+        # Mark first: a failing query must not retry once per row.
+        self._seeded_scopes.add(scope)
+        manager_getter = getattr(self.writer, "_get_trino_manager", None)
+        if manager_getter is None:
+            return
+        try:
+            trino = manager_getter()
+            if not trino.table_exists(self.schema, table):
+                return
+            conditions = []
+            for column, value in zip(key_columns[:3], key[:3]):
+                if value is None:
+                    conditions.append(f"{column} IS NULL")
+                    continue
+                safe = value.replace("'", "''")
+                variants = {safe}
+                if safe.isdigit():
+                    variants.add(f"{safe}.0")  # historical pandas spelling
+                in_list = ", ".join(f"'{v}'" for v in sorted(variants))
+                conditions.append(f"{column} IN ({in_list})")
+            tail_columns = ", ".join(key_columns[3:])
+            rows = trino.execute_query(
+                f"""
+                SELECT DISTINCT {tail_columns}
+                FROM {self.catalog}.{self.schema}.{table}
+                WHERE {" AND ".join(conditions)}
+                """
+            )
+        except Exception as exc:
+            logger.warning("Inventory key preload failed for %s: %s", scope, exc)
+            return
+        seen = self._seen_keys.setdefault(table, set())
+        for row in rows:
+            seen.add(key[:3] + tuple(_dedup_key_value(value) for value in row))
 
     def _index_pending(self, manifest_row: Mapping[str, Any]) -> None:
         """Make a buffered commit visible to this run's incremental reads."""

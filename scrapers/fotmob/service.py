@@ -521,7 +521,11 @@ class FotMobIngestService:
             rows.extend(
                 {
                     "target_type": target_type,
-                    "competition_id": competition_id,
+                    # str() keeps the column object-typed: an int column with
+                    # NaN gaps floats to '53.0' spellings on write.
+                    "competition_id": (
+                        None if competition_id is None else str(competition_id)
+                    ),
                     "source_season_key": source_season_key,
                     "json_path": path,
                     "disposition": disposition,
