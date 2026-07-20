@@ -2720,6 +2720,63 @@ def test_non_opta_match_without_matchcentre_is_explicitly_unavailable(tmp_path):
     assert raw_store.has(match_page_target(123))
 
 
+def test_sync_matches_reports_the_unfetched_daily_backlog(tmp_path):
+    service, repository, raw_store = _service(tmp_path)
+    # One returned candidate out of an exact backlog of 5 -> 4 left un-fetched.
+    repository.list_match_candidates = lambda *_args, **_kwargs: [
+        MatchCandidate(
+            game_id=123,
+            league="INT-World Cup",
+            season="2026",
+            game="Home-Away",
+            kickoff=datetime(2026, 6, 12),
+            status=6,
+            match_is_opta=False,
+            exact_candidate_count=5,
+        )
+    ]
+    service.transport = _RawPersistingContentFailureTransport(
+        b"""
+        <html><head><title>Home 1-0 Away - League 2026 Live</title></head>
+        <body>
+        <script>require.config.params['matchheader'] = {
+          input: [1, 2, 'Home', 'Away'], matchId: 123
+        };</script>
+        <script>require.config.params[\"args\"] = {
+          matchId: 123, initialMatchDataForScrappers: [[[1, 2]]]
+        };</script>
+        </body></html>
+        """
+    )
+
+    result = service.sync_matches()
+
+    assert result.attempted_snapshots["match"]["count"] == 1
+    assert result.metadata["match_candidates"] == {
+        "schema_version": 1,
+        "count": 5,
+        "attempted": 1,
+        "remaining": 4,
+    }
+
+
+def test_sync_matches_reports_zero_backlog_when_no_matches_are_due(tmp_path):
+    service, repository, _ = _service(tmp_path)
+    # The common steady-state case: a scope with no due matches.
+    repository.list_match_candidates = lambda *_args, **_kwargs: []
+
+    result = service.sync_matches()
+
+    assert result.status == "success"
+    assert result.attempted == 0
+    assert result.metadata["match_candidates"] == {
+        "schema_version": 1,
+        "count": 0,
+        "attempted": 0,
+        "remaining": 0,
+    }
+
+
 def test_match_not_available_rejects_a_foreign_valid_outcome_id(tmp_path):
     service, repository, _ = _service(tmp_path)
     repository.list_match_candidates = lambda *_args, **_kwargs: [

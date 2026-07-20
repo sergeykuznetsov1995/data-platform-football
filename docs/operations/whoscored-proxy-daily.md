@@ -54,6 +54,60 @@ else:                             raise "full paid crawl is disabled …"
 
 ---
 
+## 1a. Автоматический плановый сбор (issuer + pointer, #954)
+
+До этого изменения даже допущенный к платному пути `dag_ingest_whoscored` мог тратить
+прокси **только при ручном триггере** DagRun с `conf {transport_policy: direct_then_paid, …}`:
+`resolve_transport_policy` читает политику исключительно из `dag_run.conf`, а плановый
+(`scheduled`) запуск идёт с пустым conf → `direct_only`. Владельцу нужен полный автомат
+(«даг сам каждый день всё обновляет»). Реализовано без ослабления ни одного wire-гейта
+(24 ч validity, привязка к одному `run_id`, release-пины, замок бэкфилла):
+
+- **Суточный issuer** — `scripts/whoscored_proxy_campaign.py issue-daily-ingest`. По
+  owner-signed **charter** (месячный «стоячий ордер»: `order_id`, `valid_until ≤ 62 дн`,
+  `daily_mb`, `monthly_mb`, файл 0600) он раз в сутки строит и **подписывает** обычный ≤24 ч
+  approval на `dag_ingest_whoscored` для КОНКРЕТНОГО планового `run_id`, с аллокациями
+  `catalog-discovery` (phase discovery) + по одной `scope-<sha>` на активный скоуп + одной
+  `profiles-daily` (phase capture). Без валидного charter'а issuer не подписывает; запрошенный
+  бюджет не может превысить `charter.daily_mb`.
+- **Pointer-резолюция** — `dags/scripts/whoscored_proxy_runtime.py`. Issuer кладёт рядом с
+  approval маленький pointer `POINTER_ROOT/<sha256(run_id)>.json` (0600) с
+  `{dag_id, run_id, approval_id, approval_sha256}`. На запуске
+  `_scheduled_paid_pins` подхватывает его **только** если `run_type == "scheduled"` И
+  `daily_ingest_paid_crawl_allowed(dag_id)` (т.е. только ingest — бэкфилл **никогда**, замок
+  цел) И conf пуст. Явный conf всегда приоритетнее (ручной флоу не меняется). Отсутствие
+  pointer'а → `direct_only` (fail-closed, день просто идёт бесплатно). Испорченный/
+  несовпадающий pointer (неверный владелец, режим ≠ 0600, симлинк, mismatch run_id/dag_id) →
+  ошибка (fail loud).
+- **Устойчивость к дрейфу каталога.** Скоуп, который discovery открыл ВНУТРИ запуска (после
+  выпуска approval), не имеет подписанной аллокации → идёт `direct_only` через одну этот
+  скоуп (`PaidRuntime.for_allocation(missing_ok=True)`), обычно challenge'ится → retryable →
+  накрывается approval'ом СЛЕДУЮЩЕГО дня (лаг 1 день). Work item профилей теперь **константа**
+  `profiles-daily` (catalog batch выводится внутри рана и не может быть предсказан заранее —
+  это чинит блокер даже ручного платного флоу).
+
+**Развёртывание автомата (за владельцем, в деплой-окно):**
+1. env на scheduler: `WHOSCORED_PROXY_APPROVAL_ROOT` (где лежат approval'ы),
+   `WHOSCORED_SCHEDULED_PAID_POINTER_ROOT` (где лежат pointer'ы), плюс существующие
+   gateway/approval-path env из §3.6. HMAC-секрет approval'а виден issuer'у/filter'у/gateway,
+   но **не** scheduler-раннеру (он в `_RUNNER_FORBIDDEN_AUTHORITY_ENV_NAMES`).
+2. host systemd-timer, 09:00–09:30 UTC (schedule DAG'а `0 10 * * *` → до задач остаётся ≥ 6 ч
+   минимума validity). Timer делает `docker exec <scheduler>`:
+   - получить список активных скоупов (`--scopes-file`): читается из персистентного каталога
+     (тот же запрос, что `_active_scope_specs`; для смоука — hand-authored файл из 3–5 лиг);
+   - `python scripts/whoscored_proxy_campaign.py issue-daily-ingest --run-id
+     scheduled__<data_interval_start ISO+00:00> --scopes-file … --charter … --runtime-sha256 …
+     --classifier-sha256 … --total-mb … --secret-file … --approval-root … --pointer-root …`.
+   Пины (`runtime_sha256`/`classifier_sha256`) меняются только при пересборке образа — деплой
+   пишет их в конфиг, который читает wrapper.
+3. **run_id.** Плановый `run_id = "scheduled__" + data_interval_start.isoformat()` (для cron
+   `0 10 * * *` это (D−1) 10:00 UTC у запуска, стартующего в D 10:00). Если issuer посчитает
+   run_id неверно — pointer ляжет под чужой ключ и запуск просто пойдёт `direct_only`
+   (**fail-closed, без ошибочного расхода**). Точную дату-смещение подтверждаем на смоуке
+   (сверить фактический `run_id` первого планового прогона с тем, что писал issuer).
+
+---
+
 ## 2. Сколько покупать (провайдерский тариф)
 
 Замер основан на GREEN-канарейке (`canary-curlcffi-20260718T062208Z.json`): один матч ≈
@@ -103,13 +157,27 @@ daily не годится.
    `conf {transport_policy: direct_then_paid, paid_approval_id: <id>, paid_approval_sha256: <lowercase hex>}`.
    Плановый/обычный запуск остаётся `direct_only` и не тратит ничего (fail-closed по умолчанию).
 
-### Условный код-шаг (только для полного активного каталога)
+### Условный код-шаг: поднять потолок под тариф (в паре, на пересборке образа)
 
-Эффективный серверный дневной потолок WhoScored =
-`min(DAILY_BUDGET_BYTES, WHOSCORED_PROVIDER_ORDER_SAFETY_CAP_BYTES=850 MiB)`
-(`scripts/proxy_filter/filter_proxy.py`). При полном каталоге пики выходных (~1.5–2.5 GB/сут)
-превысят 850 MiB и fail-closed'нутся → нужно поднять `WHOSCORED_PROVIDER_ORDER_SAFETY_CAP_BYTES`
-под тариф (и провайдерский invoice hard cap). **Для скромного старта (≤0.3 GB/сут) НЕ нужно.**
+`WHOSCORED_PROVIDER_ORDER_SAFETY_CAP_BYTES = 850 MiB` (`scripts/proxy_filter/filter_proxy.py`)
+— это **пожизненный** потолок расхода на ЗАКАЗ: `order_remaining = cap − exposure_provider_bytes`,
+где `exposure` копится за всё время текущего заказа (сбрасывается при переходе на новый
+заказ). Эффективный потолок = `min(DAILY_BUDGET_BYTES, cap) − exposure`.
+
+**Осознанно оставлен 850 MiB в этом PR** (НЕ поднят «на будущее»): на текущем 1 GB заказе
+(order 38950) и во время смоука это независимый backstop реальных денег. Поднять его заранее
+до размера тарифа = снять этот backstop с живого 1 GB смоука. Поэтому:
+
+- Смоук идёт на 850 MiB backstop'е + низком `--daily-budget-mb` (≈300) + caps approval'а — три
+  независимых бортика.
+- При покупке тарифа (§3.2) поднять **в паре, в тот же rebuild** (пересборка образа под новый
+  receipt всё равно требуется — это НЕ лишняя пересборка):
+  `WHOSCORED_PROVIDER_ORDER_SAFETY_CAP_BYTES` (код) ≈ размер заказа (напр. ~48 GiB под 50 GB)
+  **и** `WHOSCORED_PROXY_FILTER_DAILY_BUDGET_MB` (env, default 850). Держать их согласованными:
+  пики выходных полного каталога (~1.5–2.5 GB/сут) превысят 850 MiB и fail-closed'нутся.
+- При смене заказа сбросить order-exposure state-marker/ledger фильтра (новый заказ = новый
+  пожизненный счётчик).
+
 Per-request потолок 2 MB (`PaidGatewayClient`, `DEFAULT_PAID_BYTES_PER_URL`) для матч-центра
 1.26 MB достаточен и не трогается.
 

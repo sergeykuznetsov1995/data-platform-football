@@ -47,6 +47,12 @@ CATALOG_MANIFEST_TABLE = "whoscored_catalog_manifest"
 SCOPE_MANIFEST_TABLE = "whoscored_scope_ingest_manifest"
 MATCH_COMPLETION_GRACE = timedelta(hours=3)
 MATCH_REFRESH_DAYS = 7
+# A match that keeps failing transiently must not silently fall out of the daily
+# window the moment it ages past ``kickoff_from``: it stays a candidate while it
+# is still ``retryable`` and under this attempt cap.  The cap bounds paid-retry
+# churn on a permanently-stuck match (there is no attempt->terminal transition);
+# once exhausted it leaves the daily window and only backfill/manual re-attempts.
+DAILY_RETRYABLE_MAX_ATTEMPTS = 8
 PREVIEW_REFRESH_HOURS = 6
 PROFILE_REFRESH_DAYS = 90
 
@@ -1317,6 +1323,7 @@ class MatchCandidate:
     status: int
     match_is_opta: bool
     attempt_no: int = 1
+    exact_candidate_count: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -3579,8 +3586,13 @@ class WhoScoredRepository:
         include_failed: bool = False,
         include_all_completed: bool = False,
         kickoff_from: Optional[datetime] = None,
+        include_exact_count: bool = False,
     ) -> list[MatchCandidate]:
         """Return completed games without a successful manifest commit.
+
+        ``include_exact_count`` adds the exact pre-``LIMIT`` backlog size to
+        every returned candidate (``exact_candidate_count``), so a bounded
+        daily run can report how many due matches it left un-fetched.
 
         ``match_is_opta`` is metadata, not an availability gate.  WhoScored
         exposes valid matchCentre payloads for some rows where that schedule
@@ -3602,10 +3614,25 @@ class WhoScoredRepository:
             value = kickoff_from.replace(tzinfo=None).isoformat(
                 sep=" ", timespec="seconds"
             )
-            kickoff_filter = f" AND s.date >= TIMESTAMP {_sql_string(value)}"
+            # A still-retryable match under the attempt cap is never aged out of
+            # the daily window: otherwise a match that keeps failing past the
+            # kickoff window is silently dropped and never re-attempted.
+            kickoff_filter = (
+                " AND (s.date >= TIMESTAMP {value}"
+                " OR (m.state = 'retryable'"
+                " AND COALESCE(m.attempt_no, 0) < {cap}))"
+            ).format(
+                value=_sql_string(value),
+                cap=int(DAILY_RETRYABLE_MAX_ATTEMPTS),
+            )
         if limit is not None and int(limit) < 0:
             raise ValueError("match candidate limit must be non-negative")
         limit_sql = f" LIMIT {int(limit)}" if limit is not None else ""
+        # ``COUNT(*) OVER ()`` evaluates before ``LIMIT``, so every returned row
+        # carries the exact pre-truncation backlog size (identical on each row).
+        count_projection = (
+            ", COUNT(*) OVER () AS exact_candidate_count" if include_exact_count else ""
+        )
         failed_filter = (
             " OR m.state IN ('terminal', 'parse_failed')" if include_failed else ""
         )
@@ -3673,7 +3700,7 @@ class WhoScoredRepository:
                        WHEN m.state = 'retryable'
                        THEN COALESCE(m.attempt_no, 0) + 1
                        ELSE 1
-                   END AS attempt_no
+                   END AS attempt_no{count_projection}
             FROM schedule s
             LEFT JOIN {latest} m
               ON m.league = s.league
@@ -3709,6 +3736,7 @@ class WhoScoredRepository:
                 status=int(row[5]),
                 match_is_opta=_coerce_bool(row[6]),
                 attempt_no=int(row[7]),
+                exact_candidate_count=(int(row[8]) if include_exact_count else None),
             )
             for row in rows
         ]

@@ -1138,3 +1138,25 @@ def test_http_health_endpoint_is_side_effect_free():
 def test_declared_http_body_must_be_read_exactly():
     assert _read_exact_body(BytesIO(b"abc"), 3) == b"abc"
     assert _read_exact_body(BytesIO(b"ab"), 3) is None
+
+
+@pytest.mark.unit
+def test_paid_http_session_impersonates_a_browser_through_the_lease_proxy():
+    # The paid fetch must present a browser TLS/HTTP fingerprint (curl_cffi) so
+    # Cloudflare challenges it less and libcurl negotiates br/zstd, and it must
+    # route through the lease proxy (never a bare direct connection).
+    from scripts import whoscored_paid_gateway as gw
+
+    session = gw._new_paid_http_session("http://proxy_filter:8900")
+    try:
+        assert type(session).__module__.startswith("curl_cffi")
+        proxies = dict(getattr(session, "proxies", {}) or {})
+        assert proxies.get("https") == "http://proxy_filter:8900"
+        assert proxies.get("http") == "http://proxy_filter:8900"
+        # Response contract _bounded_content / the fetch path relies on.
+        for attr in ("get", "close"):
+            assert callable(getattr(session, attr, None))
+    finally:
+        close = getattr(session, "close", None)
+        if callable(close):
+            close()

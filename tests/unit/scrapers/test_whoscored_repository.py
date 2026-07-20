@@ -1709,6 +1709,39 @@ def test_backfill_match_candidates_explicitly_include_failed_manifest_states():
 
 
 @pytest.mark.unit
+def test_match_candidates_expose_exact_backlog_count_when_requested():
+    trino = MagicMock()
+    # Both returned rows carry the exact pre-LIMIT backlog (5) on every row.
+    trino.execute_query.return_value = [
+        (123, "INT-World Cup", "2026", "A-B", datetime(2026, 7, 11), 6, True, 1, 5),
+        (124, "INT-World Cup", "2026", "C-D", datetime(2026, 7, 12), 6, True, 1, 5),
+    ]
+    repository = WhoScoredRepository(writer=MagicMock(), trino=trino)
+
+    candidates = repository.list_match_candidates(
+        "INT-World Cup", "2026", limit=2, include_exact_count=True
+    )
+
+    sql = trino.execute_query.call_args.args[0]
+    assert "COUNT(*) OVER () AS exact_candidate_count" in sql
+    assert [candidate.game_id for candidate in candidates] == [123, 124]
+    assert [candidate.exact_candidate_count for candidate in candidates] == [5, 5]
+
+
+@pytest.mark.unit
+def test_match_candidates_omit_the_exact_count_projection_by_default():
+    trino = MagicMock()
+    trino.execute_query.return_value = []
+    repository = WhoScoredRepository(writer=MagicMock(), trino=trino)
+
+    candidates = repository.list_match_candidates("INT-World Cup", "2026")
+
+    sql = trino.execute_query.call_args.args[0]
+    assert "exact_candidate_count" not in sql
+    assert candidates == []
+
+
+@pytest.mark.unit
 def test_backfill_freeze_includes_every_completed_match_regardless_manifest():
     trino = MagicMock()
     trino.execute_query.return_value = []
@@ -2619,3 +2652,25 @@ def test_scope_bundle_recovers_only_its_unpublished_partial_batch(monkeypatch):
     assert "DELETE FROM iceberg.bronze.whoscored_schedule" in delete_sql
     assert "_scope_batch_id = 'wss2-" in delete_sql
     assert len(writer.write_dataframe.call_args_list) == 3
+
+
+@pytest.mark.unit
+def test_match_candidates_keep_retryable_under_cap_past_the_kickoff_window():
+    from scrapers.whoscored.repository import DAILY_RETRYABLE_MAX_ATTEMPTS
+
+    trino = MagicMock()
+    trino.execute_query.return_value = []
+    repository = WhoScoredRepository(writer=MagicMock(), trino=trino)
+
+    repository.list_match_candidates(
+        "ENG-Premier League",
+        "2526",
+        limit=100,
+        kickoff_from=datetime(2026, 7, 13, 10, 0, 0, tzinfo=timezone.utc),
+    )
+
+    sql = trino.execute_query.call_args.args[0]
+    # The kickoff lower bound never sheds a still-retryable match under the cap.
+    assert "s.date >= TIMESTAMP" in sql
+    assert "m.state = 'retryable'" in sql
+    assert f"COALESCE(m.attempt_no, 0) < {DAILY_RETRYABLE_MAX_ATTEMPTS}" in sql

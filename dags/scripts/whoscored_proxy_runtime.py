@@ -80,6 +80,7 @@ from scrapers.whoscored.proxy_campaign import (
     daily_ingest_paid_crawl_allowed,
     deterministic_proxy_attempt_id,
     load_proxy_campaign_approval_structure,
+    strict_json_loads,
 )
 
 
@@ -90,6 +91,16 @@ TRANSPORT_POLICIES = frozenset(
 PAID_APPROVAL_ID_CONF = "paid_approval_id"
 PAID_APPROVAL_SHA256_CONF = "paid_approval_sha256"
 PROXY_APPROVAL_ROOT_ENV = "WHOSCORED_PROXY_APPROVAL_ROOT"
+# Deployment-owned directory of per-run pointers that let a *scheduled* daily
+# ingest run reach the signed paid approval issued for it out of band, without
+# ever accepting authority from DagRun input.  Absent env or file -> the run
+# stays direct-only (fail-closed).
+SCHEDULED_PAID_POINTER_ROOT_ENV = "WHOSCORED_SCHEDULED_PAID_POINTER_ROOT"
+SCHEDULED_PAID_POINTER_SCHEMA_VERSION = 1
+_MAX_POINTER_BYTES = 4096
+_POINTER_FIELDS = frozenset(
+    {"schema_version", "dag_id", "run_id", "approval_id", "approval_sha256"}
+)
 PAID_ALERT_PREFLIGHT_TASK_ID = "validate_whoscored_paid_alert_delivery"
 PAID_GATEWAY_URL_ENV = "WHOSCORED_PAID_GATEWAY_URL"
 PAID_GATEWAY_TOKEN_ENV = "WHOSCORED_PAID_GATEWAY_TOKEN"
@@ -162,10 +173,158 @@ def _run_id(context: Mapping[str, Any]) -> str:
     return str(value or "")
 
 
-def resolve_transport_policy(context: Mapping[str, Any]) -> str:
-    """Resolve policy only from DagRun conf; booleans can never enable paid."""
+def _run_type(context: Mapping[str, Any]) -> str:
+    dag_run = context.get("dag_run")
+    return str(getattr(dag_run, "run_type", "") or "")
+
+
+def _scheduled_pointer_path(raw_root: str, run_id: str) -> Path | None:
+    """Resolve one deployment-owned pointer without following any link.
+
+    Returns ``None`` when the pointer does not exist (the scheduled run then
+    stays direct-only, fail-closed).  A present-but-unsafe pointer -- wrong
+    owner, mode, a symlink, or one escaping its mounted root -- raises.
+    """
+
+    root_path = Path(raw_root)
+    if not root_path.is_absolute():
+        raise WhoScoredProxyRuntimeError(
+            "scheduled paid pointer root must be absolute"
+        )
+    if root_path.is_symlink():
+        raise WhoScoredProxyRuntimeError(
+            "scheduled paid pointer root must not be a symlink"
+        )
+    name = hashlib.sha256(run_id.encode("utf-8")).hexdigest() + ".json"
+    path = root_path / name
+    try:
+        metadata = path.stat(follow_symlinks=False)
+    except OSError:
+        # The pointer is an optional upgrade: its absence means "run free".  A
+        # transient stat failure (ENOENT, but also ESTALE/EIO/ETIMEDOUT on a
+        # flaky config mount) must degrade this scheduled run to direct-only,
+        # not crash the whole free run.  This is strictly money-safe -- a failed
+        # stat yields no file to trust, so it can only make the run go free,
+        # never paid -- and cannot weaken the integrity checks below, which only
+        # run on a file that already stat'd successfully (i.e. exists).
+        return None
+    if stat.S_ISLNK(metadata.st_mode):
+        raise WhoScoredProxyRuntimeError(
+            "scheduled paid pointer must not be a symlink"
+        )
+    if not stat.S_ISREG(metadata.st_mode):
+        raise WhoScoredProxyRuntimeError("scheduled paid pointer must be a file")
+    if metadata.st_uid != os.geteuid():
+        raise WhoScoredProxyRuntimeError(
+            "scheduled paid pointer must be owned by the Airflow runtime UID"
+        )
+    if stat.S_IMODE(metadata.st_mode) != 0o600:
+        raise WhoScoredProxyRuntimeError(
+            "scheduled paid pointer must have mode 0600"
+        )
+    try:
+        root = root_path.resolve(strict=True)
+        resolved = path.resolve(strict=True)
+        resolved.relative_to(root)
+    except (OSError, ValueError) as exc:
+        raise WhoScoredProxyRuntimeError(
+            "scheduled paid pointer escapes its mounted root"
+        ) from exc
+    return resolved
+
+
+def _scheduled_paid_pins(context: Mapping[str, Any]) -> dict[str, str] | None:
+    """Return signed-approval pins for an eligible scheduled paid run, if any.
+
+    Only a ``scheduled`` DagRun of a DAG admitted to the daily paid path can be
+    upgraded here.  The backfill DAG is never admitted (``daily_ingest_paid_
+    crawl_allowed`` is False for it), so the historical crawl child-lock is
+    untouched.  A missing env or pointer yields ``None`` (direct-only); a
+    tampered or mismatched pointer raises.
+    """
+
+    if _run_type(context) != "scheduled":
+        return None
+    dag_id = _dag_id(context)
+    if not daily_ingest_paid_crawl_allowed(dag_id):
+        return None
+    raw_root = str(os.environ.get(SCHEDULED_PAID_POINTER_ROOT_ENV) or "").strip()
+    if not raw_root:
+        return None
+    run_id = _run_id(context)
+    if not run_id:
+        return None
+    path = _scheduled_pointer_path(raw_root, run_id)
+    if path is None:
+        return None
+    try:
+        size = path.stat().st_size
+        if size <= 0 or size > _MAX_POINTER_BYTES:
+            raise WhoScoredProxyRuntimeError(
+                "scheduled paid pointer has an invalid size"
+            )
+        data = strict_json_loads(path.read_bytes().decode("utf-8"))
+    except WhoScoredProxyRuntimeError:
+        raise
+    except (OSError, UnicodeDecodeError, ProxyCampaignError, ValueError) as exc:
+        raise WhoScoredProxyRuntimeError(
+            "scheduled paid pointer is unreadable"
+        ) from exc
+    if not isinstance(data, Mapping) or frozenset(data) != _POINTER_FIELDS:
+        raise WhoScoredProxyRuntimeError("scheduled paid pointer schema is invalid")
+    if data.get("schema_version") != SCHEDULED_PAID_POINTER_SCHEMA_VERSION:
+        raise WhoScoredProxyRuntimeError(
+            "unsupported scheduled paid pointer schema"
+        )
+    if data.get("dag_id") != dag_id or data.get("run_id") != run_id:
+        raise WhoScoredProxyRuntimeError(
+            "scheduled paid pointer identity does not match this DagRun"
+        )
+    approval_id = data.get("approval_id")
+    approval_sha256 = data.get("approval_sha256")
+    if (
+        not isinstance(approval_id, str)
+        or not approval_id
+        or not isinstance(approval_sha256, str)
+        or _SHA256_RE.fullmatch(approval_sha256) is None
+    ):
+        raise WhoScoredProxyRuntimeError("scheduled paid pointer pins are malformed")
+    return {"approval_id": approval_id, "approval_sha256": approval_sha256}
+
+
+def _effective_transport_conf(context: Mapping[str, Any]) -> Mapping[str, Any]:
+    """DagRun conf, or the signed pins a scheduled run's pointer provides.
+
+    Explicit DagRun conf always wins, so the manual paid flow and any explicit
+    ``direct_only`` request are never overridden.  The pointer only fills in the
+    pins for an eligible scheduled run whose conf carries no transport intent.
+    """
 
     conf = _dag_run_conf(context)
+    if (
+        conf.get("transport_policy")
+        or conf.get(PAID_APPROVAL_ID_CONF)
+        or conf.get(PAID_APPROVAL_SHA256_CONF)
+    ):
+        return conf
+    pins = _scheduled_paid_pins(context)
+    if pins is None:
+        return conf
+    effective = dict(conf)
+    effective["transport_policy"] = TRANSPORT_POLICY_DIRECT_THEN_PAID
+    effective[PAID_APPROVAL_ID_CONF] = pins["approval_id"]
+    effective[PAID_APPROVAL_SHA256_CONF] = pins["approval_sha256"]
+    return effective
+
+
+def resolve_transport_policy(context: Mapping[str, Any]) -> str:
+    """Resolve policy from DagRun conf or a scheduled run's signed pointer.
+
+    Booleans can never enable paid; only a signed approval id + SHA-256 (from
+    conf or a deployment-owned pointer) does.
+    """
+
+    conf = _effective_transport_conf(context)
     policy = str(conf.get("transport_policy") or TRANSPORT_POLICY_DIRECT_ONLY).strip()
     if policy not in TRANSPORT_POLICIES:
         raise WhoScoredProxyRuntimeError(
@@ -283,8 +442,20 @@ class PaidRuntime:
         )
         return " ".join(f"{name} {shlex.quote(str(value))}" for name, value in values)
 
-    def for_allocation(self, *, task_id: str, work_item_id: str) -> "PaidRuntime":
-        """Bind an already verified approval to one exact work allocation."""
+    def for_allocation(
+        self, *, task_id: str, work_item_id: str, missing_ok: bool = False
+    ) -> "PaidRuntime":
+        """Bind an already verified approval to one exact work allocation.
+
+        ``missing_ok`` handles catalog drift within a paid DagRun: a scope that
+        discovery opened *after* the standing approval was issued has no signed
+        allocation.  Rather than failing the whole run, that one scope degrades
+        to direct-only transport (it is normally Cloudflare-challenged, becomes
+        retryable, and is covered by the next day's approval).  Two or more
+        matches always remain a hard error, and direct binding never touches the
+        paid path.  Discovery and the constant profile work item never pass
+        ``missing_ok`` because their allocations are always present.
+        """
 
         if not self.is_paid:
             return self
@@ -298,7 +469,13 @@ class PaidRuntime:
             for item in self.approval.allocations
             if item.task_id == str(task_id) and item.work_item_id == str(work_item_id)
         )
-        if len(matches) != 1:
+        if len(matches) > 1:
+            raise WhoScoredProxyRuntimeError(
+                "approval must contain exactly one allocation for task_id/work_item_id"
+            )
+        if not matches:
+            if missing_ok:
+                return PaidRuntime(policy=TRANSPORT_POLICY_DIRECT_ONLY)
             raise WhoScoredProxyRuntimeError(
                 "approval must contain exactly one allocation for task_id/work_item_id"
             )
@@ -407,6 +584,7 @@ def resolve_paid_runtime(
     *,
     task_id: str | None = None,
     work_item_id: str | None = None,
+    missing_ok: bool = False,
 ) -> PaidRuntime:
     """Validate policy, approval, DAG/release pins and optionally allocation."""
 
@@ -417,7 +595,7 @@ def resolve_paid_runtime(
         raise WhoScoredProxyRuntimeError(
             "paid allocation lookup requires both task_id and work_item_id"
         )
-    conf = _dag_run_conf(context)
+    conf = _effective_transport_conf(context)
     raw_approval_path = str(os.environ.get(PROXY_APPROVAL_PATH_ENV) or "").strip()
     if not raw_approval_path:
         raise WhoScoredProxyRuntimeError(
@@ -480,7 +658,9 @@ def resolve_paid_runtime(
         allocation=None,
     )
     if task_id is not None and work_item_id is not None:
-        runtime = runtime.for_allocation(task_id=task_id, work_item_id=work_item_id)
+        runtime = runtime.for_allocation(
+            task_id=task_id, work_item_id=work_item_id, missing_ok=missing_ok
+        )
     return runtime
 
 
@@ -488,12 +668,16 @@ def stable_scope_work_item(scope: str) -> str:
     return "scope-" + hashlib.sha256(str(scope).encode("utf-8")).hexdigest()
 
 
-def stable_profiles_work_item(scope_plan: Mapping[str, Any]) -> str:
-    identity = {
-        "catalog_batch_id": scope_plan.get("catalog_batch_id"),
-        "active_scopes_sha256": scope_plan.get("active_scopes_sha256"),
-    }
-    return "profiles-" + hashlib.sha256(canonical_json_bytes(identity)).hexdigest()
+# The profile refresh binds to a single constant work item.  The catalog batch
+# is content-derived *inside* the DagRun, so a pre-issued standing approval can
+# never predict a batch-scoped work item id; a constant one lets the daily
+# issuer sign exactly one profiles allocation.  Per-URL and allocation byte caps
+# still bound the work.
+PROFILES_DAILY_WORK_ITEM = "profiles-daily"
+
+
+def stable_profiles_work_item() -> str:
+    return PROFILES_DAILY_WORK_ITEM
 
 
 def paid_campaign_gateway_call(

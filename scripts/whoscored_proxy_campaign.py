@@ -77,6 +77,7 @@ from scrapers.whoscored.proxy_campaign import (
     WHOSCORED_CANARY_DISCOVERY_REQUEST_LIMIT,
     WHOSCORED_CANARY_DISCOVERY_WORK_ITEM_ID,
     WHOSCORED_CANARY_TASK_ID,
+    WHOSCORED_INGEST_DAG_ID,
     WHOSCORED_PROXY_ALLOWED_HOSTS,
     ProxyCampaignApproval,
     ProxyCampaignLedger,
@@ -102,6 +103,46 @@ CANARY_CAPTURE_CAP_BYTES = WHOSCORED_CANARY_CAPTURE_CAP_BYTES
 CANARY_DISCOVERY_PATH_FAMILIES = WHOSCORED_CANARY_DISCOVERY_PATH_FAMILIES
 CANARY_ALLOWED_PATH_FAMILIES = WHOSCORED_CANARY_ALLOWED_PATH_FAMILIES
 _VALIDATION_SECRET = b"unsigned-template-validation-key-000000000000000000"
+
+# --- Daily ingest standing-approval issuance (Path A automation, #954) --------
+# These identities mirror the runtime task/work-item ids exactly so each signed
+# allocation binds one runtime task.  Discovery + profiles are single fixed work
+# items; every active scope gets one capture allocation keyed by the same hash
+# the DAG uses (dags.scripts.whoscored_proxy_runtime.stable_scope_work_item).
+DAILY_DISCOVERY_TASK_ID = "discover_whoscored_catalog"
+DAILY_DISCOVERY_WORK_ITEM_ID = "catalog-discovery"
+DAILY_DISCOVERY_ALLOCATION_ID = "catalog-discovery"
+DAILY_SCOPE_TASK_ID = "ingest_active_scope"
+DAILY_PROFILES_TASK_ID = "refresh_whoscored_profiles"
+DAILY_PROFILES_WORK_ITEM_ID = "profiles-daily"
+DAILY_PROFILES_ALLOCATION_ID = "profiles-daily"
+DAILY_DISCOVERY_WORKLOAD_CLASS = "daily_catalog_refresh"
+DAILY_SCOPE_WORKLOAD_CLASS = "daily_active_scope"
+DAILY_PROFILES_WORKLOAD_CLASS = "daily_profile_refresh"
+# Ceilings for the sub-budgets carved from the daily total before the remainder
+# is split evenly across active scopes.  For small totals (a smoke) each is
+# clamped to a fraction of the total so the scope pool stays positive; for a full
+# active catalog they cap discovery/profiles well below the match-capture spend.
+DAILY_DISCOVERY_BUDGET_CEILING_BYTES = 128 * 1024 * 1024
+DAILY_PROFILES_BUDGET_CEILING_BYTES = 256 * 1024 * 1024
+DAILY_DISCOVERY_BUDGET_DIVISOR = 10
+DAILY_PROFILES_BUDGET_DIVISOR = 8
+# Per-allocation dial ceilings.  A lease is one source URL; the request ceiling
+# permits at most one provider failover dial per lease on average.  Byte caps,
+# not these, are the primary spend bound.
+DAILY_DISCOVERY_REQUEST_LIMIT = 512
+DAILY_DISCOVERY_LEASE_LIMIT = 256
+DAILY_PROFILES_REQUEST_LIMIT = 512
+DAILY_PROFILES_LEASE_LIMIT = 256
+DAILY_SCOPE_REQUEST_LIMIT = 64
+DAILY_SCOPE_LEASE_LIMIT = 32
+DAILY_CONCURRENCY = 4
+MAX_DAILY_ACTIVE_SCOPES = 2000
+# A charter must not authorise an unbounded horizon; the owner refreshes it.
+MAX_CHARTER_HORIZON = timedelta(days=62)
+CHARTER_SCHEMA_VERSION = 1
+SCHEDULED_PAID_POINTER_SCHEMA_VERSION = 1
+DEFAULT_SCHEDULED_PAID_POINTER_ROOT = "/opt/airflow/config/whoscored_paid_pointers"
 
 
 class CampaignCliError(RuntimeError):
@@ -359,6 +400,282 @@ def command_template(args: argparse.Namespace) -> None:
     )
 
 
+def _scope_work_item_id(scope: str) -> str:
+    """Mirror dags.scripts.whoscored_proxy_runtime.stable_scope_work_item."""
+
+    return "scope-" + hashlib.sha256(str(scope).encode("utf-8")).hexdigest()
+
+
+def _read_scopes(path: Path) -> list[str]:
+    value = _read_json_document(path)
+    if isinstance(value, Mapping):
+        value = value.get("active_scopes")
+    if not isinstance(value, list) or not value:
+        raise CampaignCliError("scopes file must be a non-empty JSON array")
+    scopes: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip() or len(item) > 512:
+            raise CampaignCliError("each scope must be a bounded non-empty string")
+        scopes.append(item)
+    unique = sorted(set(scopes))
+    if len(unique) != len(scopes):
+        raise CampaignCliError("scopes file contains duplicates")
+    if len(unique) > MAX_DAILY_ACTIVE_SCOPES:
+        raise CampaignCliError(
+            f"scopes file exceeds {MAX_DAILY_ACTIVE_SCOPES} active scopes"
+        )
+    return unique
+
+
+def _read_json_document(path: Path) -> object:
+    if path.is_symlink():
+        raise CampaignCliError(f"refusing symlink input: {path}")
+    try:
+        size = path.stat().st_size
+        if size <= 0 or size > MAX_DOCUMENT_BYTES:
+            raise CampaignCliError(f"document has an invalid size: {path}")
+        return strict_json_loads(path.read_bytes().decode("utf-8"))
+    except CampaignCliError:
+        raise
+    except (OSError, UnicodeDecodeError, ProxyCampaignValidationError) as exc:
+        raise CampaignCliError(f"cannot read JSON document: {path}: {exc}") from exc
+
+
+def _read_charter(path: Path, *, now: datetime) -> Mapping[str, object]:
+    """Load the owner's monthly standing order that gates daily issuance."""
+
+    _require_private_file(path)
+    value = _read_json_document(path)
+    if not isinstance(value, Mapping):
+        raise CampaignCliError("charter must be a JSON object")
+    expected = {"schema_version", "order_id", "valid_until", "daily_mb", "monthly_mb"}
+    if set(value) != expected:
+        raise CampaignCliError("charter fields are invalid")
+    if value.get("schema_version") != CHARTER_SCHEMA_VERSION:
+        raise CampaignCliError("unsupported charter schema")
+    order_id = value.get("order_id")
+    if not isinstance(order_id, str) or not order_id.strip() or len(order_id) > 128:
+        raise CampaignCliError("charter order_id is invalid")
+    daily_mb = value.get("daily_mb")
+    monthly_mb = value.get("monthly_mb")
+    for name, number in (("daily_mb", daily_mb), ("monthly_mb", monthly_mb)):
+        if isinstance(number, bool) or not isinstance(number, int) or number <= 0:
+            raise CampaignCliError(f"charter {name} must be a positive integer")
+    valid_until = _utc(str(value.get("valid_until")), "charter.valid_until")
+    if valid_until <= now:
+        raise CampaignCliError("charter has expired")
+    if valid_until - now > MAX_CHARTER_HORIZON:
+        raise CampaignCliError("charter valid_until is beyond the allowed horizon")
+    return value
+
+
+def _split_scope_budgets(scope_pool_bytes: int, count: int) -> list[int]:
+    """Split the capture scope pool into exact, near-equal positive shares."""
+
+    if count <= 0 or scope_pool_bytes < count:
+        raise CampaignCliError(
+            "daily total is too small to allocate one byte per active scope"
+        )
+    base, remainder = divmod(scope_pool_bytes, count)
+    return [base + (1 if index < remainder else 0) for index in range(count)]
+
+
+def _daily_ingest_unsigned(
+    *,
+    run_id: str,
+    scopes: Sequence[str],
+    runtime_sha256: str,
+    classifier_sha256: str,
+    issued: datetime,
+    expires: datetime,
+    total_bytes: int,
+    daily_bytes: int,
+    campaign_id: str,
+    approval_id: str,
+) -> dict[str, object]:
+    """Build one unsigned standing daily-ingest approval for a scheduled run."""
+
+    if not scopes:
+        raise CampaignCliError("daily ingest approval needs at least one active scope")
+    discovery_bytes = min(
+        DAILY_DISCOVERY_BUDGET_CEILING_BYTES,
+        max(1, total_bytes // DAILY_DISCOVERY_BUDGET_DIVISOR),
+    )
+    profiles_bytes = min(
+        DAILY_PROFILES_BUDGET_CEILING_BYTES,
+        max(1, total_bytes // DAILY_PROFILES_BUDGET_DIVISOR),
+    )
+    scope_pool = total_bytes - discovery_bytes - profiles_bytes
+    scope_budgets = _split_scope_budgets(scope_pool, len(scopes))
+    capture_bytes = scope_pool + profiles_bytes
+    capture_paths = list(CANARY_ALLOWED_PATH_FAMILIES)
+    discovery_paths = list(CANARY_DISCOVERY_PATH_FAMILIES)
+    campaign_paths = sorted(set(capture_paths) | set(discovery_paths))
+
+    allocations: list[dict[str, object]] = [
+        {
+            "allocation_id": DAILY_DISCOVERY_ALLOCATION_ID,
+            "phase": "discovery",
+            "workload_class": DAILY_DISCOVERY_WORKLOAD_CLASS,
+            "work_item_id": DAILY_DISCOVERY_WORK_ITEM_ID,
+            "task_id": DAILY_DISCOVERY_TASK_ID,
+            "budget_bytes": discovery_bytes,
+            "request_limit": DAILY_DISCOVERY_REQUEST_LIMIT,
+            "lease_limit": DAILY_DISCOVERY_LEASE_LIMIT,
+            "allowed_path_families": discovery_paths,
+        },
+        {
+            "allocation_id": DAILY_PROFILES_ALLOCATION_ID,
+            "phase": "capture",
+            "workload_class": DAILY_PROFILES_WORKLOAD_CLASS,
+            "work_item_id": DAILY_PROFILES_WORK_ITEM_ID,
+            "task_id": DAILY_PROFILES_TASK_ID,
+            "budget_bytes": profiles_bytes,
+            "request_limit": DAILY_PROFILES_REQUEST_LIMIT,
+            "lease_limit": DAILY_PROFILES_LEASE_LIMIT,
+            "allowed_path_families": capture_paths,
+        },
+    ]
+    for scope, budget in zip(scopes, scope_budgets):
+        work_item_id = _scope_work_item_id(scope)
+        allocations.append(
+            {
+                "allocation_id": work_item_id,
+                "phase": "capture",
+                "workload_class": DAILY_SCOPE_WORKLOAD_CLASS,
+                "work_item_id": work_item_id,
+                "task_id": DAILY_SCOPE_TASK_ID,
+                "budget_bytes": budget,
+                "request_limit": DAILY_SCOPE_REQUEST_LIMIT,
+                "lease_limit": DAILY_SCOPE_LEASE_LIMIT,
+                "allowed_path_families": capture_paths,
+            }
+        )
+    allocations.sort(key=lambda item: item["allocation_id"])
+
+    request_limit = sum(int(item["request_limit"]) for item in allocations)
+    lease_limit = sum(int(item["lease_limit"]) for item in allocations)
+    unsigned: dict[str, object] = {
+        "schema_version": PROXY_CAMPAIGN_SCHEMA_VERSION,
+        "source": PROXY_CAMPAIGN_SOURCE,
+        "approval_id": approval_id,
+        "campaign_id": campaign_id,
+        "run_id": run_id,
+        "issued_at": issued.isoformat(),
+        "expires_at": expires.isoformat(),
+        "transport_policy": TRANSPORT_POLICY_DIRECT_THEN_PAID,
+        "runtime_sha256": runtime_sha256,
+        "classifier_sha256": classifier_sha256,
+        "caps": {
+            "total_provider_bytes": total_bytes,
+            "discovery_provider_bytes": discovery_bytes,
+            "capture_provider_bytes": capture_bytes,
+            "daily_provider_bytes": daily_bytes,
+        },
+        "limits": {
+            "requests": request_limit,
+            "leases": lease_limit,
+            "concurrency": DAILY_CONCURRENCY,
+        },
+        "allowed_dag_ids": [WHOSCORED_INGEST_DAG_ID],
+        "allowed_hosts": sorted(WHOSCORED_PROXY_ALLOWED_HOSTS),
+        "allowed_path_families": campaign_paths,
+        "allocations": allocations,
+        "meter": PROXY_CAMPAIGN_METER,
+        "signature_algorithm": PROXY_CAMPAIGN_SIGNATURE_ALGORITHM,
+    }
+    return unsigned
+
+
+def _pointer_document(*, run_id: str, approval: ProxyCampaignApproval) -> dict[str, object]:
+    return {
+        "schema_version": SCHEDULED_PAID_POINTER_SCHEMA_VERSION,
+        "dag_id": WHOSCORED_INGEST_DAG_ID,
+        "run_id": run_id,
+        "approval_id": approval.approval_id,
+        "approval_sha256": approval.approval_sha256,
+    }
+
+
+def command_issue_daily_ingest(args: argparse.Namespace) -> None:
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    issued = _utc(args.issued_at, "issued_at") if args.issued_at else now
+    expires = (
+        _utc(args.expires_at, "expires_at")
+        if args.expires_at
+        else issued + timedelta(hours=23)
+    )
+    if expires <= issued:
+        raise CampaignCliError("expires_at must be after issued_at")
+    if expires - issued > MAX_PROXY_CAMPAIGN_VALIDITY:
+        raise CampaignCliError("daily approval validity may not exceed 24 hours")
+    run_id = str(args.run_id)
+    if not run_id.startswith("scheduled__"):
+        raise CampaignCliError("daily ingest run_id must be a scheduled DagRun id")
+    charter = _read_charter(Path(args.charter), now=now)
+    charter_daily_bytes = int(charter["daily_mb"]) * 1000 * 1000
+    total_bytes = int(args.total_mb) * 1000 * 1000
+    daily_bytes = int(args.daily_mb) * 1000 * 1000 if args.daily_mb else total_bytes
+    if total_bytes > charter_daily_bytes or daily_bytes > charter_daily_bytes:
+        raise CampaignCliError("requested budget exceeds the charter daily allowance")
+    if daily_bytes > total_bytes:
+        raise CampaignCliError("daily_mb cannot exceed total_mb")
+    scopes = _read_scopes(Path(args.scopes_file))
+    run_digest = hashlib.sha256(run_id.encode("utf-8")).hexdigest()
+    campaign_id = f"wsdaily-{run_digest[:32]}"
+    approval_id = f"wsdaily-approval-{run_digest[:32]}"
+
+    unsigned = _daily_ingest_unsigned(
+        run_id=run_id,
+        scopes=scopes,
+        runtime_sha256=args.runtime_sha256,
+        classifier_sha256=args.classifier_sha256,
+        issued=issued,
+        expires=expires,
+        total_bytes=total_bytes,
+        daily_bytes=daily_bytes,
+        campaign_id=campaign_id,
+        approval_id=approval_id,
+    )
+    secret = _secret(args)
+    signed = sign_proxy_campaign_approval(unsigned, secret)
+    approval = ProxyCampaignApproval.from_dict(signed)
+    approval.verify(secret, now=issued)
+    if approval.is_exact_canary:
+        raise CampaignCliError("daily ingest approval must not be an exact canary")
+    if approval.run_id != run_id or approval.allowed_dag_ids != (
+        WHOSCORED_INGEST_DAG_ID,
+    ):
+        raise CampaignCliError("signed daily approval identity is inconsistent")
+
+    approval_root = Path(args.approval_root)
+    approval_path = approval_root / f"{approval_id}.json"
+    _atomic_write_json(approval_path, signed, replace=args.force)
+    pointer_root = Path(args.pointer_root)
+    pointer_path = pointer_root / f"{run_digest}.json"
+    _atomic_write_json(
+        pointer_path,
+        _pointer_document(run_id=run_id, approval=approval),
+        replace=args.force,
+    )
+    _print_summary(
+        {
+            "status": "daily_ingest_approval_issued",
+            "run_id": run_id,
+            "approval_id": approval_id,
+            "campaign_id": campaign_id,
+            "approval_sha256": approval.approval_sha256,
+            "approval_path": str(approval_path),
+            "pointer_path": str(pointer_path),
+            "order_id": charter["order_id"],
+            "active_scope_count": len(scopes),
+            "total_provider_bytes": total_bytes,
+            "daily_provider_bytes": daily_bytes,
+            "expires_at": expires.isoformat(),
+        }
+    )
+
+
 def command_sign(args: argparse.Namespace) -> None:
     unsigned = _read_json(Path(args.input))
     secret = _secret(args)
@@ -482,6 +799,29 @@ def build_parser() -> argparse.ArgumentParser:
     template.add_argument("--concurrency", type=int, default=1)
     _output_arguments(template)
     template.set_defaults(handler=command_template)
+
+    issue_daily = subparsers.add_parser(
+        "issue-daily-ingest",
+        help="issue and sign one standing daily-ingest approval for a scheduled run",
+    )
+    issue_daily.add_argument("--run-id", required=True)
+    issue_daily.add_argument("--scopes-file", required=True)
+    issue_daily.add_argument("--charter", required=True)
+    issue_daily.add_argument("--runtime-sha256", required=True)
+    issue_daily.add_argument("--classifier-sha256", required=True)
+    issue_daily.add_argument("--total-mb", type=int, required=True)
+    issue_daily.add_argument("--daily-mb", type=int, default=0)
+    issue_daily.add_argument("--issued-at", default="")
+    issue_daily.add_argument("--expires-at", default="")
+    issue_daily.add_argument(
+        "--approval-root", default=DEFAULT_APPROVAL_ROOT
+    )
+    issue_daily.add_argument(
+        "--pointer-root", default=DEFAULT_SCHEDULED_PAID_POINTER_ROOT
+    )
+    issue_daily.add_argument("--force", action="store_true")
+    _secret_arguments(issue_daily)
+    issue_daily.set_defaults(handler=command_issue_daily_ingest)
 
     sign = subparsers.add_parser("sign", help="sign one unsigned template")
     sign.add_argument("--input", required=True)
