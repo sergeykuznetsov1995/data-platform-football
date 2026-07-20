@@ -578,3 +578,130 @@ class TestFotmobNativeRunner:
         assert rc == 1
         assert report["status"] == "incomplete"
         assert any("not advertised" in error for error in report["errors"])
+
+    @pytest.mark.unit
+    def test_every_exit_path_flushes_buffered_commits(self):
+        # Batched commits live in memory until flushed. finish() is the single
+        # exit of _run_native, so a missing flush there silently drops the
+        # last targets of every run — including budget-cut runs.
+        from scrapers.fotmob.transport import canonicalize_target
+        from tests.unit.scrapers.test_fotmob_service import (
+            _league_payload,
+            _service,
+        )
+
+        mod = self._module()
+        responses = {
+            canonicalize_target("allLeagues").canonical_url: {
+                "countries": [{"leagues": [{"id": 47, "name": "Premier League"}]}]
+            },
+            canonicalize_target("leagues", {"id": 47}).canonical_url: _league_payload(),
+            canonicalize_target(
+                "leagues", {"id": 47, "season": "2025/2026"}
+            ).canonical_url: _league_payload(),
+        }
+        service, _, repository = _service(responses)
+        repository.ensure_current_views = MagicMock(return_value=[])
+        repository.flush = MagicMock(return_value=["iceberg.bronze.fotmob_matches"])
+        args = mod._argument_parser().parse_args(
+            ["--mode", "daily", "--scope", "47=2025/2026", "--entities", "season"]
+        )
+
+        rc, report = mod._run_native(args, service=service)
+
+        assert rc == 0
+        repository.flush.assert_called_once_with()
+
+    @pytest.mark.unit
+    def test_failed_flush_turns_the_run_red_instead_of_losing_targets(self):
+        from scrapers.fotmob.transport import canonicalize_target
+        from tests.unit.scrapers.test_fotmob_service import (
+            _league_payload,
+            _service,
+        )
+
+        mod = self._module()
+        responses = {
+            canonicalize_target("allLeagues").canonical_url: {
+                "countries": [{"leagues": [{"id": 47, "name": "Premier League"}]}]
+            },
+            canonicalize_target("leagues", {"id": 47}).canonical_url: _league_payload(),
+            canonicalize_target(
+                "leagues", {"id": 47, "season": "2025/2026"}
+            ).canonical_url: _league_payload(),
+        }
+        service, _, repository = _service(responses)
+        repository.ensure_current_views = MagicMock(return_value=[])
+        repository.flush = MagicMock(side_effect=RuntimeError("catalog down"))
+        args = mod._argument_parser().parse_args(
+            ["--mode", "daily", "--scope", "47=2025/2026", "--entities", "season"]
+        )
+
+        rc, report = mod._run_native(args, service=service)
+
+        assert rc == 1
+        assert any("commit flush" in error for error in report["errors"])
+
+    @pytest.mark.unit
+    def test_escaped_failure_salvages_buffered_commits(self, monkeypatch, tmp_path):
+        # finish() covers control-flow exits, but an exception escaping
+        # _run_native mid-scope (or SIGTERM converted by the handler) used to
+        # drop up to batch_size-1 already-paid-for targets. main() must
+        # salvage-flush through the module holder and still write the report.
+        mod = self._module()
+        service = MagicMock()
+        service.repository.flush = MagicMock(
+            return_value=["iceberg.bronze.fotmob_matches"]
+        )
+
+        def fake_run_native(args, **kwargs):
+            mod._ACTIVE_NATIVE_SERVICE = service
+            raise RuntimeError("mid-scope Trino failure")
+
+        monkeypatch.setattr(mod, "_run_native", fake_run_native)
+        out = tmp_path / "report.json"
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["run_fotmob_scraper.py", "--mode", "daily", "--output", str(out)],
+        )
+
+        rc = mod.main()
+
+        assert rc == 1
+        service.repository.flush.assert_called_once_with()
+        assert json.loads(out.read_text())["complete"] is False
+
+    @pytest.mark.unit
+    def test_sigterm_routes_through_failure_report(self, monkeypatch, tmp_path):
+        # The driver's unit timeout sends TERM then KILL(+30s): the handler
+        # must convert TERM into the ordinary failure path so the unit leaves
+        # a report (no more NO_REPORT kills) and flushes its buffer.
+        import signal as signal_module
+
+        mod = self._module()
+        service = MagicMock()
+        service.repository.flush = MagicMock(return_value=[])
+
+        def fake_run_native(args, **kwargs):
+            mod._ACTIVE_NATIVE_SERVICE = service
+            handler = signal_module.getsignal(signal_module.SIGTERM)
+            handler(signal_module.SIGTERM, None)
+
+        monkeypatch.setattr(mod, "_run_native", fake_run_native)
+        out = tmp_path / "report.json"
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["run_fotmob_scraper.py", "--mode", "daily", "--output", str(out)],
+        )
+
+        try:
+            rc = mod.main()
+        finally:
+            signal_module.signal(signal_module.SIGTERM, signal_module.SIG_DFL)
+
+        assert rc == 1
+        service.repository.flush.assert_called_once_with()
+        payload = json.loads(out.read_text())
+        assert any("terminated by signal" in e for e in payload["errors"])

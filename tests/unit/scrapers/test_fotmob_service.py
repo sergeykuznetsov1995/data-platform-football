@@ -721,3 +721,32 @@ def test_next_build_fetch_is_not_started_without_full_retry_reservation():
     assert "Next build discovery" in result.errors[0]
     assert "cannot cover Next build" in result.errors[0]
     assert document_calls == []
+
+
+def test_infrastructure_faults_are_retryable_not_schema_drift():
+    # A Trino restart used to be committed as schema_drift with an empty
+    # unknown-path list (observed 2026-07-14). Drift is a claim about the
+    # source payload; it must not fire when our own catalog blinks, or the
+    # backfill driver stops and the canary's drift signal becomes meaningless.
+    import requests
+
+    from scrapers.base.trino_manager import TrinoError
+    from scrapers.fotmob.repository import ManifestStatus
+    from scrapers.fotmob.service import _failure_status
+
+    class WrappedTrinoError(TrinoError):
+        """Subclasses of the platform error must still classify as infra."""
+
+    retryable = [
+        TrinoError("SQL execution failed"),
+        WrappedTrinoError("SQL execution failed inside a batch"),
+        requests.exceptions.ConnectionError("connection refused"),
+        ConnectionResetError("peer reset"),
+        TimeoutError("catalog timeout"),
+    ]
+    for exc in retryable:
+        assert _failure_status(exc) == ManifestStatus.RETRYABLE_FAILURE, exc
+
+    drift = [KeyError("matchFacts"), ValueError("unexpected shape"), TypeError("int")]
+    for exc in drift:
+        assert _failure_status(exc) == ManifestStatus.SCHEMA_DRIFT, exc

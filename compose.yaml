@@ -453,7 +453,12 @@ services:
     deploy:
       resources:
         limits:
-          memory: 512M
+          # Lakekeeper's RSS climbs ~430 MB/h under sustained per-target Iceberg
+          # commits and is memcg-OOM-killed mid-commit at whatever ceiling it is
+          # given (512M died in 20 min, 1G in 2.4 h — FotMob #930 canary). The
+          # headroom buys hours, not immunity: long backfills must also restart
+          # it between work units (see fotmob_canary_backfill/driver.sh).
+          memory: 3G
         reservations:
           memory: 128M
 

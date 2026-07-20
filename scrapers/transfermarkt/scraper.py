@@ -1089,7 +1089,12 @@ def _with_metadata(
         now = ingested_at or datetime.utcnow()
         frame['_source'] = 'transfermarkt'
         frame['_entity_type'] = entity_type
-        frame['_ingested_at'] = now
+        # A scalar datetime becomes a microsecond column on pandas>=2.1 while
+        # every inferred datetime column (bronze reads, fetched_at) is
+        # nanosecond; pandas 2.1 cannot concat the two units (#982).
+        frame['_ingested_at'] = pd.Series(
+            now, index=frame.index, dtype='datetime64[ns]',
+        )
         frame['_batch_id'] = batch_id
     return _apply_nullable_dtypes(
         frame.reindex(columns=columns + _METADATA_COLUMNS)

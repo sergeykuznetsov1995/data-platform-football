@@ -906,6 +906,35 @@ class TestRunnerInternals:
             right, ('player_id', 'mv_date'),
         )
 
+    def test_compatibility_fingerprint_folds_float_and_int_money(self):
+        """A cache-served scope leaves the native money column float64
+        (50000.0) while the legacy projection is Int64 (50000). The parity
+        fingerprint must treat them as one amount, or the dual-write gate
+        fails on every such scope (transfers day-3 regression)."""
+        mod = _import_runner()
+        native = pd.DataFrame({
+            'player_id': ['100553'],
+            'market_value_eur': pd.Series([50000.0], dtype='float64'),
+        })
+        legacy = pd.DataFrame({
+            'player_id': ['100553'],
+            'market_value_eur': pd.Series([50000], dtype='Int64'),
+        })
+
+        assert mod._compatibility_fingerprint(
+            native, ('player_id', 'market_value_eur'),
+        ) == mod._compatibility_fingerprint(
+            legacy, ('player_id', 'market_value_eur'),
+        )
+        # A genuinely different amount must still be caught.
+        other = legacy.copy()
+        other.loc[0, 'market_value_eur'] = 50001
+        assert mod._compatibility_fingerprint(
+            native, ('player_id', 'market_value_eur'),
+        ) != mod._compatibility_fingerprint(
+            other, ('player_id', 'market_value_eur'),
+        )
+
     def test_manifest_requires_compatible_committed_pairs(self):
         mod = _import_runner()
         native_base = {
@@ -2346,6 +2375,135 @@ class TestCoachIdentityFromCachedStints:
         assert profiles.loc['10', 'dob'] == date(1980, 5, 1)
         # Both projections now name the same coaches — which is all parity asks.
         assert set(frames['legacy_coaches']['coach_id']) == set(profiles.index)
+
+
+class TestCoachCacheMergeMixedDatetimeUnits:
+    def test_partial_reuse_merges_mixed_ingested_at_units(self, monkeypatch):
+        """Bronze reads infer ``_ingested_at`` as nanoseconds while frames the
+        scraper stamped with a scalar datetime carried microseconds, and
+        pandas 2.1 cannot concat datetime64 columns of mixed units — the first
+        retry of a partially collected scope died on the profiles concat
+        (#982). The merge must align the units instead of crashing.
+        """
+        import pandas as pd
+        from datetime import date, datetime
+        from scrapers.transfermarkt.registry import (
+            CompetitionType, SeasonFormat, TeamType, _bootstrap_record,
+        )
+        from scrapers.transfermarkt.scraper import (
+            COACH_PROFILE_COLUMNS, COACH_STINT_COLUMNS,
+            _with_metadata, materialize_legacy_coaches,
+        )
+
+        mod = _import_runner()
+        record = _bootstrap_record(
+            competition_id='2DVB',
+            slug='2-division-b',
+            name='Second League Division B',
+            country='Russia',
+            confederation='UEFA',
+            competition_type=CompetitionType.DOMESTIC_LEAGUE,
+            team_type=TeamType.CLUB,
+            season_format=SeasonFormat.SINGLE_YEAR,
+            source_url=(
+                'https://www.transfermarkt.com/2-division-b/startseite/'
+                'wettbewerb/2DVB'
+            ),
+            canonical_competition_id='TM-2DVB',
+        )
+        monkeypatch.setattr(mod, '_competition_record', lambda value: record)
+        monkeypatch.setenv('TM_CANONICAL_SEASON', '2024')
+
+        class _Scraper:
+            _batch_id = 'batch-982'
+
+        _Scraper.materialize_legacy_coaches = staticmethod(
+            materialize_legacy_coaches,
+        )
+
+        # Bronze reads: the 9/12-column SELECT shape, nanosecond unit.
+        cached_profiles = pd.DataFrame([{
+            'coach_id': '77', 'coach_slug': 'old-hand', 'name': 'Old Hand',
+            'dob': date(1970, 1, 1), 'nationality': 'Russia',
+            '_source': 'transfermarkt', '_entity_type': 'coach_profiles',
+            '_ingested_at': datetime(2026, 7, 1, 3, 0, 0),
+            '_batch_id': 'batch-old',
+        }])
+        cached_profiles['_ingested_at'] = (
+            cached_profiles['_ingested_at'].astype('datetime64[ns]')
+        )
+        cached_stints = pd.DataFrame([{
+            'club_id': '1', 'club_name': 'Old FC', 'coach_id': '77',
+            'coach_slug': 'old-hand', 'name': 'Old Hand', 'role': 'Manager',
+            'appointed_date': date(2024, 3, 1), 'left_date': None,
+            '_source': 'transfermarkt', '_entity_type': 'coach_stints',
+            '_ingested_at': datetime(2026, 7, 1, 3, 0, 0),
+            '_batch_id': 'batch-old',
+        }])
+        cached_stints['_ingested_at'] = (
+            cached_stints['_ingested_at'].astype('datetime64[ns]')
+        )
+
+        # Fresh frames through the real builder, then forced back to the
+        # microsecond unit pre-fix scrapers produced.
+        fetched_profiles = _with_metadata(
+            [{
+                'coach_id': '10', 'coach_slug': 'fresh', 'name': 'Fresh',
+                'dob': date(1980, 5, 1), 'nationality': 'Russia',
+            }],
+            COACH_PROFILE_COLUMNS,
+            entity_type='coach_profiles', batch_id='batch-982',
+        )
+        fetched_profiles['_ingested_at'] = (
+            fetched_profiles['_ingested_at'].astype('datetime64[us]')
+        )
+        fetched_stints = _with_metadata(
+            [{
+                'club_id': '2', 'club_name': 'Fresh FC', 'coach_id': '10',
+                'coach_slug': 'fresh', 'name': 'Fresh', 'role': 'Manager',
+                'appointed_date': date(2024, 2, 1), 'left_date': None,
+            }],
+            COACH_STINT_COLUMNS,
+            entity_type='coach_stints', batch_id='batch-982',
+        )
+        fetched_stints['_ingested_at'] = (
+            fetched_stints['_ingested_at'].astype('datetime64[us]')
+        )
+
+        frames = mod._merge_coach_cache_frames(
+            _Scraper(),
+            {'profiles': fetched_profiles, 'stints': fetched_stints},
+            {'profiles': cached_profiles, 'stints': cached_stints},
+            'TM-2DVB',
+            2024,
+        )
+
+        assert set(frames['profiles']['coach_id']) == {'10', '77'}
+        assert set(frames['stints']['coach_id']) == {'10', '77'}
+        assert str(frames['profiles']['_ingested_at'].dtype) == 'datetime64[ns]'
+        assert str(frames['stints']['_ingested_at'].dtype) == 'datetime64[ns]'
+        assert set(frames['legacy_coaches']['coach_id']) == {'10', '77'}
+
+    def test_align_ingested_at_units_is_surgical(self):
+        """None parts and already-aligned frames pass through untouched, a
+        microsecond frame comes back nanosecond, and the input frame itself
+        is not mutated."""
+        import pandas as pd
+
+        mod = _import_runner()
+        micro = pd.DataFrame({
+            '_ingested_at': pd.to_datetime(
+                ['2026-07-17T12:00:00']
+            ).astype('datetime64[us]'),
+        })
+        empty = pd.DataFrame(columns=['_ingested_at'])
+
+        aligned = mod._align_ingested_at_units([None, micro, empty])
+
+        assert aligned[0] is None
+        assert str(aligned[1]['_ingested_at'].dtype) == 'datetime64[ns]'
+        assert aligned[2] is empty
+        assert str(micro['_ingested_at'].dtype) == 'datetime64[us]'
 
 
 # ---------------------------------------------------------------------------
