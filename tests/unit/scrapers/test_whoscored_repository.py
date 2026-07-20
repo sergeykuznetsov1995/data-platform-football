@@ -1709,6 +1709,39 @@ def test_backfill_match_candidates_explicitly_include_failed_manifest_states():
 
 
 @pytest.mark.unit
+def test_match_candidates_expose_exact_backlog_count_when_requested():
+    trino = MagicMock()
+    # Both returned rows carry the exact pre-LIMIT backlog (5) on every row.
+    trino.execute_query.return_value = [
+        (123, "INT-World Cup", "2026", "A-B", datetime(2026, 7, 11), 6, True, 1, 5),
+        (124, "INT-World Cup", "2026", "C-D", datetime(2026, 7, 12), 6, True, 1, 5),
+    ]
+    repository = WhoScoredRepository(writer=MagicMock(), trino=trino)
+
+    candidates = repository.list_match_candidates(
+        "INT-World Cup", "2026", limit=2, include_exact_count=True
+    )
+
+    sql = trino.execute_query.call_args.args[0]
+    assert "COUNT(*) OVER () AS exact_candidate_count" in sql
+    assert [candidate.game_id for candidate in candidates] == [123, 124]
+    assert [candidate.exact_candidate_count for candidate in candidates] == [5, 5]
+
+
+@pytest.mark.unit
+def test_match_candidates_omit_the_exact_count_projection_by_default():
+    trino = MagicMock()
+    trino.execute_query.return_value = []
+    repository = WhoScoredRepository(writer=MagicMock(), trino=trino)
+
+    candidates = repository.list_match_candidates("INT-World Cup", "2026")
+
+    sql = trino.execute_query.call_args.args[0]
+    assert "exact_candidate_count" not in sql
+    assert candidates == []
+
+
+@pytest.mark.unit
 def test_backfill_freeze_includes_every_completed_match_regardless_manifest():
     trino = MagicMock()
     trino.execute_query.return_value = []

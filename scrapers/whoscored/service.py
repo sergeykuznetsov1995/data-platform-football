@@ -2643,6 +2643,7 @@ class WhoScoredIngestService:
             limit=limit,
             include_success=force_replay,
             kickoff_from=kickoff_from,
+            include_exact_count=True,
         )
         result.attempted = len(candidates)
         result.attempted_snapshots["match"] = {
@@ -2651,6 +2652,19 @@ class WhoScoredIngestService:
             "payload_sha256": entity_id_payload_sha256(
                 int(candidate.game_id) for candidate in candidates
             ),
+        }
+        # Backlog visibility: how many due matches this bounded run left
+        # un-fetched (``limit`` per scope). Pure observability — no gate.
+        total_candidates = (
+            candidates[0].exact_candidate_count
+            if candidates and candidates[0].exact_candidate_count is not None
+            else result.attempted
+        )
+        result.metadata["match_candidates"] = {
+            "schema_version": 1,
+            "count": int(total_candidates),
+            "attempted": result.attempted,
+            "remaining": max(0, int(total_candidates) - result.attempted),
         }
         self._bound_paid_fallback(len(candidates))
         pending: list[tuple[MatchCommit, Any]] = []
