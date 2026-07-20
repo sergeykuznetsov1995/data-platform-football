@@ -622,24 +622,76 @@ def test_deduplication_never_collapses_rows_that_carry_identity():
     assert len(matches[0][0]) == 2
 
 
-def test_a_new_batch_re_emits_inventory_rows_after_a_flush():
-    # Dedup state lives with the buffer: the next flush must write the rows
-    # again (their batch id belongs to targets committed in *that* flush).
-    writer = RecordingWriter()
-    repository = FotMobRepository(writer=writer, batch_size=1)
-
-    row = {
+def _inventory_row(json_path="content.stats"):
+    return {
         "target_type": "match",
         "competition_id": "47",
         "source_season_key": "2025/2026",
-        "json_path": "content.stats",
+        "json_path": json_path,
         "disposition": "typed",
     }
+
+
+def _inventory_commit(repository, index, rows):
+    repository.commit(
+        _commit(target_key=f"https://example/m/{index}", content_hash=str(index % 10) * 64),
+        [TableRows("fotmob_field_inventory", rows, "field_inventory", ("target_type",))],
+    )
+
+
+def test_inventory_dedup_survives_flush():
+    # Inventory rows carry no target identity, so a key seen once needs no
+    # second row this run: matches of one season share almost every json_path,
+    # and re-emitting them each flush wrote ~2.4M rows per iteration.
+    writer = RecordingWriter()
+    repository = FotMobRepository(writer=writer, batch_size=2)
+
+    for index in range(4):  # two flushes of two targets, identical rows
+        _inventory_commit(repository, index, [_inventory_row()])
+
+    inventory = [call for call in writer.calls if call[1]["table"] == "fotmob_field_inventory"]
+    assert len(inventory) == 1, "the second flush must not re-write a seen key"
+    assert len(inventory[0][0]) == 1
+
+
+def test_inventory_dedup_still_writes_new_keys_after_flush():
+    writer = RecordingWriter()
+    repository = FotMobRepository(writer=writer, batch_size=2)
+
     for index in range(2):
-        repository.commit(
-            _commit(target_key=f"https://example/m/{index}", content_hash=str(index) * 64),
-            [TableRows("fotmob_field_inventory", [dict(row)], "field_inventory", ("target_type",))],
+        _inventory_commit(repository, index, [_inventory_row()])
+    for index in range(2, 4):
+        _inventory_commit(
+            repository, index, [_inventory_row(), _inventory_row("content.lineup")]
         )
 
     inventory = [call for call in writer.calls if call[1]["table"] == "fotmob_field_inventory"]
-    assert len(inventory) == 2
+    assert [len(frame) for frame, _ in inventory] == [1, 1]
+    assert set(inventory[1][0]["json_path"]) == {"content.lineup"}
+
+
+def test_failed_flush_retry_writes_inventory_rows_exactly_once():
+    # A failed flush keeps both the buffer and the seen keys: the retry must
+    # re-append the very same rows, not lose them to the dedup set.
+    class FlakyWriter(RecordingWriter):
+        def __init__(self):
+            super().__init__()
+            self.failures = 1
+
+        def write_dataframe(self, df, **kwargs):
+            if self.failures:
+                self.failures -= 1
+                raise RuntimeError("iceberg commit failed")
+            return super().write_dataframe(df, **kwargs)
+
+    writer = FlakyWriter()
+    repository = FotMobRepository(writer=writer, batch_size=2)
+
+    _inventory_commit(repository, 0, [_inventory_row()])
+    with pytest.raises(RuntimeError):
+        _inventory_commit(repository, 1, [_inventory_row("content.lineup")])
+    repository.flush()
+
+    inventory = [call for call in writer.calls if call[1]["table"] == "fotmob_field_inventory"]
+    assert len(inventory) == 1
+    assert set(inventory[0][0]["json_path"]) == {"content.stats", "content.lineup"}

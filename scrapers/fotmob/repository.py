@@ -457,7 +457,11 @@ class FotMobRepository:
             tuple[str, str, Optional[tuple[str, ...]]], list[dict[str, Any]]
         ] = {}
         self._pending_manifest: list[dict[str, Any]] = []
-        self._pending_keys: dict[str, set[tuple[Any, ...]]] = {}
+        # Dedup keys deliberately outlive flush(): inventory rows carry no
+        # target identity, so a key seen once needs no second row this run —
+        # matches of one season share almost every json_path, and re-emitting
+        # them each flush wrote ~2.4M rows per iteration where ~200k were new.
+        self._seen_keys: dict[str, set[tuple[Any, ...]]] = {}
         self._pending_targets: dict[str, dict[str, Any]] = {}
         self._pending_entities: dict[tuple[str, str], dict[str, Any]] = {}
         self._pending_rows = 0
@@ -614,17 +618,22 @@ class FotMobRepository:
     def _deduplicate(
         self, table: str, rows: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
-        """Drop rows a buffered batch already holds under the same logical key.
+        """Drop rows this run already emitted under the same logical key.
 
         Only tables whose rows carry no target identity are deduplicated (see
-        ``DEDUP_KEYS``); the surviving row keeps a batch id that this same flush
-        commits, so manifest gating is unaffected.
+        ``DEDUP_KEYS``); the surviving row keeps a batch id that this run has
+        already committed (or commits in the same flush), so manifest gating
+        is unaffected.  The seen-set survives flush() on purpose: a failed
+        flush keeps both the buffer and the keys, so a retry re-appends the
+        very same rows.  Note that manifest ``actual_counts`` for these tables
+        mean "observed by the parser", not "physically written" — counts are
+        derived before deduplication.
         """
 
         key_columns = DEDUP_KEYS.get(table)
         if not key_columns:
             return rows
-        seen = self._pending_keys.setdefault(table, set())
+        seen = self._seen_keys.setdefault(table, set())
         output: list[dict[str, Any]] = []
         for row in rows:
             key = tuple(row.get(column) for column in key_columns)
@@ -738,7 +747,6 @@ class FotMobRepository:
         for manifest_row in self._pending_manifest:
             self._index_committed(manifest_row)
         self._pending = {}
-        self._pending_keys = {}
         self._pending_manifest = []
         self._pending_targets = {}
         self._pending_entities = {}
