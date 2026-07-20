@@ -26,7 +26,7 @@ from bs4 import BeautifulSoup, Comment, Tag
 # reason-carrying manifests instead of colliding with the reason-less v3 rows
 # written by the pre-c75879b production parser (whose evidence stands under the
 # same v3 label and cannot be overwritten).
-PAGE_DOCUMENT_VERSION = "fbref-page-document-v4"
+from scrapers.fbref.policy import PAGE_DOCUMENT_VERSION  # canonical definition
 BRONZE_TABLE_CONTRACT_VERSION = "fbref-bronze-contract-v1"
 
 # High-confidence source containers only. Page kinds whose table inventory is

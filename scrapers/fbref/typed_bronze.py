@@ -53,7 +53,7 @@ from scrapers.fbref.match_parser import (
 # version, so reason-less v3 typed manifests (restricted shot_events, empty
 # match_player_stats, not_applicable player_stats) block acceptance evidence
 # classification and cannot be overwritten.  A fresh version re-materialises them.
-TYPED_BRONZE_PARSER_VERSION = "fbref-typed-bronze-v4"
+from scrapers.fbref.policy import TYPED_BRONZE_PARSER_VERSION  # canonical definition
 
 # Output compatibility only.  This mapping is intentionally derived from the
 # legacy aliases instead of being duplicated as another source of crawl scope.

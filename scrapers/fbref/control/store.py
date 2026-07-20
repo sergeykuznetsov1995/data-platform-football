@@ -3297,8 +3297,10 @@ class ControlStore:
         normalized_limit = int(limit)
         if not 1 <= normalized_limit <= 1000:
             raise ValueError("limit must be between 1 and 1000")
-        from scrapers.fbref.page_document import PAGE_DOCUMENT_VERSION
-        from scrapers.fbref.typed_bronze import TYPED_BRONZE_PARSER_VERSION
+        from scrapers.fbref.policy import (
+            PAGE_DOCUMENT_VERSION,
+            TYPED_BRONZE_PARSER_VERSION,
+        )
 
         match_datasets = [
             "typed:shot_events",
@@ -5293,9 +5295,11 @@ class ControlStore:
         returned summary (including zero traffic) remains the replay run's.
         """
 
-        from scrapers.fbref.discovery import DISCOVERY_PARSER_VERSION
-        from scrapers.fbref.page_document import PAGE_DOCUMENT_VERSION
-        from scrapers.fbref.typed_bronze import TYPED_BRONZE_PARSER_VERSION
+        from scrapers.fbref.policy import (
+            DISCOVERY_PARSER_VERSION,
+            PAGE_DOCUMENT_VERSION,
+            TYPED_BRONZE_PARSER_VERSION,
+        )
 
         run = _uuid(run_id, "run_id")
         summary = self.get_run_summary(
