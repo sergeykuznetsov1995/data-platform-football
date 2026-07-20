@@ -280,10 +280,10 @@ def test_postgres_dataset_matrices_use_only_exact_run_fetches():
         )
         assert "processing.content_hash = run_fetch.content_hash" in matrix
         assert (
-            "processing.parser_version = 'fbref-page-document-v3'" in matrix
+            "processing.parser_version = 'fbref-page-document-v4'" in matrix
         )
         assert (
-            "processing.typed_parser_version = 'fbref-typed-bronze-v3'"
+            "processing.typed_parser_version = 'fbref-typed-bronze-v4'"
             in matrix
         )
         assert (

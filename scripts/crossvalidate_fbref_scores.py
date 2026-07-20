@@ -73,7 +73,7 @@ _YEAR_TO_SLUG = (
 
 # A tie decided on penalties reads '(4) 1–(2) 1'; strip the shoot-out counts so
 # only the 90-minute score remains — that is what every other feed stores.
-_FBREF_SCORE = f"regexp_replace(score, '\\(\\d+\\)\\s*', '')"
+_FBREF_SCORE = "regexp_replace(score, '\\(\\d+\\)\\s*', '')"
 
 FBREF_SQL = f"""
     SELECT league,
