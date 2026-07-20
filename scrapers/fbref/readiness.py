@@ -56,6 +56,63 @@ def validate_raw_store_uri(uri: object) -> str:
     return normalized
 
 
+_SCRAPER_RUNNER_PYTHON = Path("/opt/legacy-scraper-venv/bin/python")
+
+
+def _resolve_browser_stack_versions() -> dict[str, str]:
+    """Resolve browser-stack versions from the interpreter that runs them.
+
+    The production scheduler image deliberately keeps the conflicting browser
+    dependency set out of the Airflow interpreter (it lives in the isolated
+    scraper-runner venv), so fall back to probing that interpreter when the
+    packages are not importable in-process. The unified acceptance image
+    resolves in-process and never reaches the fallback.
+    """
+
+    try:
+        from importlib.metadata import version
+
+        return {
+            "camoufox": version("camoufox"),
+            "playwright": version("playwright"),
+            "curl_cffi": version("curl_cffi"),
+        }
+    except Exception:
+        if not _SCRAPER_RUNNER_PYTHON.is_file():
+            raise
+        probe = subprocess.run(
+            [
+                str(_SCRAPER_RUNNER_PYTHON),
+                "-I",
+                "-c",
+                (
+                    "from importlib.metadata import version;"
+                    "print(version('camoufox'));"
+                    "print(version('playwright'));"
+                    "print(version('curl_cffi'))"
+                ),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30,
+            check=True,
+        )
+        lines = [
+            line.strip()
+            for line in str(probe.stdout or "").splitlines()
+            if line.strip()
+        ]
+        if len(lines) != 3:
+            raise RuntimeError("browser stack probe returned an invalid version set")
+        return {
+            "camoufox": lines[0],
+            "playwright": lines[1],
+            "curl_cffi": lines[2],
+        }
+
+
 def validate_camoufox_runtime(
     *,
     package_version: Optional[str] = None,
@@ -71,11 +128,11 @@ def validate_camoufox_runtime(
             or playwright_version is None
             or curl_cffi_version is None
         ):
-            from importlib.metadata import version
+            resolved = _resolve_browser_stack_versions()
 
-            package_version = package_version or version("camoufox")
-            playwright_version = playwright_version or version("playwright")
-            curl_cffi_version = curl_cffi_version or version("curl_cffi")
+            package_version = package_version or resolved["camoufox"]
+            playwright_version = playwright_version or resolved["playwright"]
+            curl_cffi_version = curl_cffi_version or resolved["curl_cffi"]
         if install_dir is None:
             install_dir = INSTALL_DIR
         root = Path(install_dir)
