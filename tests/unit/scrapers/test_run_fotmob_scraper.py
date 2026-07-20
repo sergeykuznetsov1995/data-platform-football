@@ -235,6 +235,20 @@ class TestFotmobNativeRunner:
             mod._parse_scopes(["47="])
 
     @pytest.mark.unit
+    def test_max_buffered_rows_defaults_high_and_rejects_non_positive(self):
+        # The repository's 20k default flushed every ~4 matches once
+        # field-inventory rows piled up, defeating --commit-batch-size (#930).
+        mod = self._module()
+
+        parser = mod._argument_parser()
+        assert parser.parse_args(["--mode", "daily"]).max_buffered_rows == 100_000
+        with pytest.raises(SystemExit):
+            mod._validate_args(
+                parser,
+                parser.parse_args(["--mode", "daily", "--max-buffered-rows", "0"]),
+            )
+
+    @pytest.mark.unit
     def test_players_entity_automatically_includes_team_squad_discovery(self):
         mod = self._module()
 
