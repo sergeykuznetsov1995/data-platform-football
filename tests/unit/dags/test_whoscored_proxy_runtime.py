@@ -696,3 +696,14 @@ def test_for_allocation_missing_ok_degrades_to_direct():
 @pytest.mark.unit
 def test_stable_profiles_work_item_is_constant():
     assert runtime.stable_profiles_work_item() == "profiles-daily"
+
+
+@pytest.mark.unit
+def test_pointer_transient_stat_error_degrades_to_direct(monkeypatch, tmp_path):
+    # A non-ENOENT stat failure (here NotADirectoryError: the pointer "root" is a
+    # regular file) must degrade the optional upgrade to direct, not crash.
+    fake_root = tmp_path / "not-a-dir"
+    fake_root.write_text("x")
+    monkeypatch.setenv(runtime.SCHEDULED_PAID_POINTER_ROOT_ENV, str(fake_root))
+    conf = runtime._effective_transport_conf(_scheduled_context())
+    assert "transport_policy" not in conf

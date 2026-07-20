@@ -200,12 +200,15 @@ def _scheduled_pointer_path(raw_root: str, run_id: str) -> Path | None:
     path = root_path / name
     try:
         metadata = path.stat(follow_symlinks=False)
-    except FileNotFoundError:
+    except OSError:
+        # The pointer is an optional upgrade: its absence means "run free".  A
+        # transient stat failure (ENOENT, but also ESTALE/EIO/ETIMEDOUT on a
+        # flaky config mount) must degrade this scheduled run to direct-only,
+        # not crash the whole free run.  This is strictly money-safe -- a failed
+        # stat yields no file to trust, so it can only make the run go free,
+        # never paid -- and cannot weaken the integrity checks below, which only
+        # run on a file that already stat'd successfully (i.e. exists).
         return None
-    except OSError as exc:
-        raise WhoScoredProxyRuntimeError(
-            "scheduled paid pointer is not mounted"
-        ) from exc
     if stat.S_ISLNK(metadata.st_mode):
         raise WhoScoredProxyRuntimeError(
             "scheduled paid pointer must not be a symlink"
