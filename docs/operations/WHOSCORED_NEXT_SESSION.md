@@ -236,3 +236,115 @@ plan с завершением и historical DQ не позднее 30 дней.
 
 Операционные команды и критерии DQ приведены в
 [`whoscored-production.md`](whoscored-production.md).
+
+## Сессия 2026-07-18 — offline-верификация, изоляция шлюза, CF-egress проб
+
+Работа велась в отдельном worktree `/root/dpf-ws954-work` (ветка
+`ops/ws954-production` от `origin/master` `dc52465`), общий стек НЕ пересоздавался.
+Evidence: `/root/whoscored-954-runtime/` (`verify-*.log`, `cf-egress-probe*.json`,
+`PROBE-CONCLUSION-20260718.md`).
+
+### Зелёное офлайн (без живого эгресса)
+- Юнит-сьют whoscored+смежные: **2351 passed, 3 skipped, 1 flaky** —
+  `test_whoscored_capacity_container_runtime::test_normal_exit_during_stats_is_reconciled_with_fresh_exact_inspect`
+  падает ТОЛЬКО в общем прогоне, изолированно и файлом — зелёный (межтестовое
+  загрязнение состояния на master, не продакшен-баг).
+- `py_compile` всех whoscored dags/scripts: OK. `git diff --check`: чисто.
+- Структурная валидация `docker compose config --no-interpolate`: shared compose OK
+  (2745 стр.), новый gateway-файл OK (298 стр.). Полный интерполированный рендер
+  shared-compose требует рантайм-секрет-путей (`:?`), что и есть fail-closed by design.
+- Runtime preflight: parser `whoscored-parser-v8`, report schema 3, 25 datasets,
+  classifier `senior-men-v3`; `test_whoscored_runtime_contract` — 44 passed.
+- Silver charter `--check`: whoscored **чист** (3 находки — transfermarkt v2, чужие).
+- DAG-import: `airflow dags list-import-errors` вернул **0** (снято с работающего
+  scheduler'а в 05:34, когда он был функционален).
+
+### Изоляция шлюза (закрыт SHARED-STACK-PROTOCOL gap)
+- Создан `deploy/whoscored/gateway.compose.yaml` по образцу sofascore: платный трио
+  (`whoscored_paid_gateway` + `flaresolverr_whoscored_paid` + `whoscored_proxy_filter`)
+  + сети `dp-whoscored-paid-*` в собственном проекте `-p whoscored-gw`. Коммит на
+  ветке (НЕ запушен). **Живой cutover НЕ делался** — процедура (флип сетей в external,
+  удаление трио из общего compose, репойнт scheduler) описана в шапке файла, ждёт
+  координированного окна. Запуск изолированно:
+  `docker compose -p whoscored-gw -f deploy/whoscored/gateway.compose.yaml --project-directory . --env-file /root/data-platform-football/.env up -d`.
+
+### CF-egress проб (ключевой результат, ~1 MB прокси-трафика)
+Диагностик curl_cffi (browser-TLS, без JS), ≤512 KiB/запрос. НЕ production paid-run.
+- **direct/host-IP реально Cloudflare-challenge'ится на EPL-странице**
+  (`/Regions/252/Tournaments/2/…` → 403 `cf-mitigated: challenge`); homepage и
+  `/Regions/` отдаются 200 — воспроизводит блокер.
+- **резидентный прокси (order 38950) ту же EPL-страницу ПРОХОДИТ** → 200, 211 KB
+  реального контента, без challenge. Пул живой, CF-репутация хорошая.
+- feed `getteamstatistics`: 403 (нужен browser-derived `cf_clearance`); через прокси —
+  challenge, НЕ hard-block → браузер (FlareSolverr) на этом IP фиды дотянет.
+- Вывод: **прокси = рабочий чистый эгресс**; проблема — репутация именно host-IP
+  (и хост, и прокси через FRA-эдж, но challenge'ится только хост).
+
+### Рекомендация к продакшену
+Самый дешёвый путь, совместимый с текущим кодом (`WHOSCORED_FULL_PAID_CRAWL_AVAILABLE=False`,
+1 GiB прокси-бюджета, canary direct-only): **дать хосту чистый DIRECT-эгресс** (новый IP /
+clean VPN-exit с CF-репутацией как у прокси). Тогда direct-only production (6h canary → daily →
+backfill) работает как задумано, без per-byte затрат. Альтернатива (прокси для production) —
+нереальна на 1 GiB + требует правки safety-кода.
+Полное подтверждение data-пути = санкционированная `dag_canary_whoscored_proxy`
+(browser+proxy) — gated свежим receipt (владелец даст) + `ready-v1` attestation
+(сейчас `blocked-v1`).
+
+### ⚠️ Замечание по общему стеку (не мой контейнер)
+Общий `airflow-scheduler` (образ `ws954/*`, владелец — прошлая/другая whoscored-сессия)
+на старте был UNHEALTHY (Up 8h) и в моё окно перемежающе крэш-лупил на entrypoint
+`airflow db check` (exit 0, НЕ OOM; restart 0→7, затем стабилизировался). postgres
+(66/100 conn), webserver, изолированные sofascore/fotmob scheduler'ы, trino — **все
+healthy, платформа не задета**. Я поднял 0 контейнеров и общий стек не пересоздавал.
+Оговорка: dag-import я снимал `airflow dags list-import-errors` ВНУТРИ этого общего
+scheduler'а (read-only, успешно) — впредь такую валидацию делать в изолированном
+throwaway, а не в хрупком общем scheduler.
+
+### 🟢 Live-канарейка через прокси — GREEN (по решению владельца «гнать через прокси»)
+Артефакт: `/root/whoscored-954-runtime/canary-curlcffi-20260718T062208Z.json` +
+`CANARY-GREEN-20260718.md`; раннер `ws_canary_curlcffi.py`. Non-publishing, ~1.4 MB прокси.
+- Хост-IP (IPv4 `159.195.193.250` И IPv6 `2a0a:4cc0:…`) оба Cloudflare-challenge'атся на
+  EPL-поверхности; резидентный прокси (order 38950) её проходит → блокер = репутация host-IP.
+- Сквозной прогон через прокси: `/Regions/252/Tournaments/2` → 200 →
+  `find_source_season_id`=10743; `/Matches/1903117/Live` → 200 (matchCentreData) →
+  боевой `parse_match_html` (parser-v8) → датасеты AVAILABLE: events 1543, lineups 40,
+  substitutions 18, formations 10, team_match_stats 1954, player_match_stats 4903, matches 1.
+- **Вывод:** production-конвейер (egress→CF→parser→типизированные датасеты) работает через
+  чистый эгресс. Формальная admission-gated 6h/144k capacity-канарейка остаётся отдельно
+  (direct-only by code + compose-профиль `whoscored-paid` + `ready-v1` + provider-receipt).
+  XHR-стат-фиды (нужен браузер/FlareSolverr) здесь не гонялись — запуск контейнера заблокирован
+  auto-классификатором; но матч-центр уже покрывает team/player stats из matchCentreData.
+- Как реально запустить daily: прод по коду direct-only → либо чистый direct-IP хосту
+  (прокси доказал, что дело в host-IP), либо снять sentinel + бюджет ≫1 GiB (для полного
+  каталога нереально на 1 GiB).
+
+## Сессия 2026-07-19 — Path A: ежедневный сбор через прокси, «детский замок» на бэкфилл
+
+Решение владельца: «Путь А — гнать daily через прокси» + «пока только код, без покупки».
+Подготовлен ревью-PR (ветка `ops/ws954-production`), живого включения НЕ делалось.
+
+### Код-изменение (детский замок)
+Введён отдельный третий release-гейт для ежедневного сбора, по образцу раздельных гейтов
+канарейки/полного crawl. `dag_ingest_whoscored` допущен к платному пути;
+`dag_backfill_whoscored` остаётся закрыт (`WHOSCORED_FULL_PAID_CRAWL_AVAILABLE` = `False`).
+- `scrapers/whoscored/proxy_campaign.py`: `WHOSCORED_DAILY_INGEST_PAID_CRAWL_AVAILABLE=True`,
+  `WHOSCORED_DAILY_INGEST_PAID_CRAWL_DAG_IDS={dag_ingest_whoscored}`, хелпер
+  `daily_ingest_paid_crawl_allowed(dag_id)`.
+- Три места-энфорсера обновлены: `_assert_paid_release_gates` (runner),
+  `whoscored_proxy_runtime.resolve_paid_runtime` (scheduler),
+  `filter_proxy.create_lease` (filtering-proxy).
+- Тесты: `test_daily_ingest_paid_crawl_gate_admits_ingest_but_not_backfill`,
+  `test_daily_ingest_paid_crawl_is_admitted_by_code`,
+  `test_backfill_paid_crawl_gate_is_code_owned` + boundary в `test_filter_proxy.py`.
+
+### Runbook и цифры
+Полный порядок живого включения, сайзинг тарифа и оговорки —
+[`whoscored-proxy-daily.md`](whoscored-proxy-daily.md).
+Тариф: ~50 GB/мес (полный активный каталог) или ~20–25 GB/мес (скромный старт топ-лиг);
+текущий 1 GB order 38950 — только пробы/канарейки. Бэкфилл (~1–5 TB) — отдельно, не с daily.
+
+### Что осталось за владельцем (для живого daily)
+Одобрить код-релиз → купить тариф → пересборка образа `ready-v1` → свежая (<24 ч) provider
+receipt под новый заказ + admission → подписать non-canary approval на `dag_ingest_whoscored` →
+deployment env + изолированный gateway/filter → триггер daily с
+`conf {transport_policy: direct_then_paid, …}`. Плановый запуск остаётся `direct_only`.
