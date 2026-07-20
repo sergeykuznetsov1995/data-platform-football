@@ -20,7 +20,13 @@ from urllib.parse import urlparse
 from bs4 import BeautifulSoup, Comment, Tag
 
 
-PAGE_DOCUMENT_VERSION = "fbref-page-document-v3"
+# v4 (#949): the v3 label was reused across c75879b, which began emitting an
+# absence reason on empty/restricted/not_applicable page tables and on the
+# __page__ manifest.  Bumping the version lets a re-parse lay down fresh
+# reason-carrying manifests instead of colliding with the reason-less v3 rows
+# written by the pre-c75879b production parser (whose evidence stands under the
+# same v3 label and cannot be overwritten).
+from scrapers.fbref.policy import PAGE_DOCUMENT_VERSION  # canonical definition
 BRONZE_TABLE_CONTRACT_VERSION = "fbref-bronze-contract-v1"
 
 # High-confidence source containers only. Page kinds whose table inventory is

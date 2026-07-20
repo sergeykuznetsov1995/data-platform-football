@@ -48,7 +48,12 @@ from scrapers.fbref.match_parser import (
 )
 
 
-TYPED_BRONZE_PARSER_VERSION = "fbref-typed-bronze-v3"
+# v4 (#949): paired with PAGE_DOCUMENT_VERSION v4.  c75879b started propagating
+# the dataset absence reason into manifest.error_message without bumping the
+# version, so reason-less v3 typed manifests (restricted shot_events, empty
+# match_player_stats, not_applicable player_stats) block acceptance evidence
+# classification and cannot be overwritten.  A fresh version re-materialises them.
+from scrapers.fbref.policy import TYPED_BRONZE_PARSER_VERSION  # canonical definition
 
 # Output compatibility only.  This mapping is intentionally derived from the
 # legacy aliases instead of being duplicated as another source of crawl scope.

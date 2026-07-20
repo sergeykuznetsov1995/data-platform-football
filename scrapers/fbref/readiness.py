@@ -287,6 +287,36 @@ def check_raw_store_roundtrip(raw_store, *, token: Optional[object] = None) -> d
     }
 
 
+def check_raw_store_read_access(raw_store) -> dict:
+    """Prove the replay raw root is listable without mutating it.
+
+    Acceptance replay captures its zero-delta baseline after readiness.  A
+    write/delete health probe before that baseline could therefore hide a
+    mutation if the cleanup were only eventually visible.  Listing the exact
+    configured root exercises the S3 credentials while preserving the raw
+    namespace byte-for-byte.
+    """
+
+    root = raw_store._path("")
+    try:
+        entries = raw_store.filesystem.get_file_info(
+            fs.FileSelector(
+                root,
+                allow_not_found=False,
+                recursive=False,
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 - storage dependency boundary
+        raise ReadinessError(
+            f"FBref raw root is not readable: {type(exc).__name__}"
+        ) from exc
+    return {
+        "status": "passed",
+        "probe": "read_only_root_listing",
+        "visible_entries": len(entries),
+    }
+
+
 def check_trino_roundtrip(manager, *, token: Optional[object] = None) -> dict:
     """Prove Iceberg write/read/drop capability with a unique health table."""
 
@@ -321,10 +351,32 @@ def check_trino_roundtrip(manager, *, token: Optional[object] = None) -> dict:
     return {"status": "passed", "cleanup_verified": True}
 
 
+def check_trino_read_access(manager) -> dict:
+    """Prove the Bronze Iceberg schema is readable using SELECT only."""
+
+    rows = manager._execute(
+        "SELECT schema_name "
+        "FROM iceberg.information_schema.schemata "
+        "WHERE schema_name = 'bronze'",
+        fetch=True,
+    )
+    if (
+        not isinstance(rows, list)
+        or len(rows) != 1
+        or not isinstance(rows[0], (list, tuple))
+        or len(rows[0]) != 1
+        or str(rows[0][0]).casefold() != "bronze"
+    ):
+        raise ReadinessError("FBref Bronze schema is not readable in Trino")
+    return {"status": "passed", "probe": "read_only_bronze_schema_select"}
+
+
 __all__ = [
     "EXPECTED_RAW_STORE_URI",
     "ReadinessError",
+    "check_raw_store_read_access",
     "check_raw_store_roundtrip",
+    "check_trino_read_access",
     "check_trino_roundtrip",
     "validate_camoufox_runtime",
     "validate_fbref_proxy_meter",
