@@ -60,6 +60,10 @@ from .raw_store import (
     schedule_month_target,
     stage_page_target,
 )
+from .proxy_campaign import (
+    SCHEDULED_SCOPE_PLAYER_PAGINATION_TARGET_LIMIT_ENV,
+    WHOSCORED_CANARY_CAPTURE_LEASE_LIMIT,
+)
 from .runtime_limits import SOURCE_PAGE_REQUESTS_PER_MINUTE
 from .stage_feeds import (
     STAGE_TEAM_FEED_CATALOG,
@@ -395,6 +399,25 @@ class WhoScoredIngestService:
             ),
             context=TransportContext.from_env().request_context(scope=self.scope.spec),
         )
+        raw_pagination_limit = os.environ.get(
+            SCHEDULED_SCOPE_PLAYER_PAGINATION_TARGET_LIMIT_ENV
+        )
+        if raw_pagination_limit is None:
+            self._player_pagination_target_limit: Optional[int] = None
+        else:
+            try:
+                pagination_limit = int(raw_pagination_limit)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "invalid signed WhoScored player pagination target limit"
+                ) from exc
+            if not 0 <= pagination_limit <= WHOSCORED_CANARY_CAPTURE_LEASE_LIMIT:
+                raise ValueError(
+                    "signed WhoScored player pagination target limit exceeds "
+                    "the reviewed capture ceiling"
+                )
+            self._player_pagination_target_limit = pagination_limit
+        self._player_pagination_targets_consumed = 0
         from scrapers.utils.rate_limiter import RateLimiter
 
         self._rate_limiter = RateLimiter(
@@ -677,6 +700,23 @@ class WhoScoredIngestService:
 
         if len(specs) != len(results):
             raise WhoScoredParseError("structured feed result/spec count mismatch")
+        additional_target_count = sum(
+            parsed.total_pages - 1
+            for _response, _uri, parsed in results
+            if isinstance(parsed, PlayerStageStatisticsPage)
+        )
+        if self._player_pagination_target_limit is not None:
+            next_consumed = (
+                self._player_pagination_targets_consumed + additional_target_count
+            )
+            if next_consumed > self._player_pagination_target_limit:
+                raise WhoScoredParseError(
+                    "player statistics pagination exceeds the signed paid target "
+                    "limit before additional pages are fetched"
+                )
+            # Reserve the complete batch before its first page-2 dial.  A partial
+            # transport failure aborts the task and cannot reuse this allowance.
+            self._player_pagination_targets_consumed = next_consumed
         completed = list(results)
         additional_raw: list[tuple[TransportResponse, str]] = []
         for index, (spec, result) in enumerate(zip(specs, results)):
@@ -2103,6 +2143,14 @@ class WhoScoredIngestService:
                     "source_stage_count": len(source_stage_ids),
                 }
             )
+            expected_stage_ids = sorted(
+                {int(stage_id) for stage_id in self.catalog_season.stage_ids}
+            )
+            if source_stage_ids != expected_stage_ids:
+                raise WhoScoredParseError(
+                    "source schedule stages differ from the frozen catalog: "
+                    f"expected={expected_stage_ids}, observed={source_stage_ids}"
+                )
             schedule_by_id: dict[int, dict[str, Any]] = {}
             incident_by_key: dict[str, dict[str, Any]] = {}
             bet_by_key: dict[str, dict[str, Any]] = {}

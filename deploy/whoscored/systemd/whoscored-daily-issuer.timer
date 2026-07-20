@@ -1,0 +1,12 @@
+[Unit]
+Description=Issue the next bounded WhoScored scheduled paid approval
+
+[Timer]
+OnCalendar=*-*-* 09:15:00 UTC
+AccuracySec=1min
+RandomizedDelaySec=0
+Persistent=false
+Unit=whoscored-daily-issuer.service
+
+[Install]
+WantedBy=timers.target

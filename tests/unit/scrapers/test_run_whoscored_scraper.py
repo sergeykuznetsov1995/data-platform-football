@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from datetime import date
 from types import SimpleNamespace
 
 import pytest
@@ -443,6 +444,49 @@ def _run(
     output = tmp_path / "result.json"
     rc = runner.main([*args, "--output", str(output)])
     return rc, json.loads(output.read_text(encoding="utf-8")), runtime, catalog
+
+
+def _scheduled_scope_binding(scope, *, match_ids, preview_ids):
+    from scrapers.whoscored.proxy_campaign import (
+        scheduled_scope_player_pagination_target_limit,
+        scheduled_scope_schedule_target_limit,
+        scheduled_target_ids_sha256,
+    )
+
+    stage_ids = (23752,)
+    start = date(2025, 8, 1)
+    end = date(2026, 5, 31)
+    month_count = (end.year - start.year) * 12 + end.month - start.month + 1
+    schedule_limit = scheduled_scope_schedule_target_limit(
+        stage_count=len(stage_ids), season_month_count=month_count
+    )
+    pagination_limit = scheduled_scope_player_pagination_target_limit(
+        stage_count=len(stage_ids),
+        non_pagination_target_count=(
+            schedule_limit + len(match_ids) + len(preview_ids)
+        ),
+    )
+    work_item_id = "scope-" + hashlib.sha256(scope.spec.encode("utf-8")).hexdigest()
+    return (
+        SimpleNamespace(stage_ids=stage_ids, start=start, end=end),
+        work_item_id,
+        {
+            "scope": scope.spec,
+            "work_item_id": work_item_id,
+            "schedule_target_limit": schedule_limit,
+            "schedule_targets_sha256": scheduled_target_ids_sha256(
+                [
+                    f"season:{scope.spec}",
+                    *(f"stage:{value}" for value in stage_ids),
+                ]
+            ),
+            "player_pagination_target_limit": pagination_limit,
+            "match_target_count": len(match_ids),
+            "match_targets_sha256": scheduled_target_ids_sha256(match_ids),
+            "preview_target_count": len(preview_ids),
+            "preview_targets_sha256": scheduled_target_ids_sha256(preview_ids),
+        },
+    )
 
 
 @pytest.mark.unit
@@ -1428,6 +1472,209 @@ def test_paid_runner_derives_work_item_and_rejects_allocation_selector(monkeypat
 
 
 @pytest.mark.unit
+def test_paid_zero_profile_cli_binds_stable_scheduled_work_item(monkeypatch):
+    monkeypatch.setenv("AIRFLOW_CTX_TASK_ID", "refresh_whoscored_profiles")
+    empty_sha256 = profile_candidate_payload_sha256([])
+    base = [
+        "daily",
+        "--profiles-only",
+        "--scope",
+        "ENG-Premier League=2526",
+        "--catalog-batch-id",
+        "catalog-1",
+        "--profiles-limit",
+        "0",
+        "--expected-profile-candidate-count",
+        "0",
+        "--expected-profile-candidate-sha256",
+        empty_sha256,
+        "--transport-policy",
+        "direct_then_paid",
+        "--proxy-approval-path",
+        "/run/approval.json",
+        "--proxy-approval-id",
+        "approval-1",
+        "--proxy-approval-sha256",
+        "a" * 64,
+        "--proxy-work-item-id",
+        "profiles-daily",
+    ]
+    parser = runner._build_parser()
+    args = parser.parse_args(base)
+    scopes = runner._validate_args(parser, args)
+    assert [item.spec for item in scopes] == ["ENG-Premier League=2526"]
+    assert args.expected_proxy_work_item_id == "profiles-daily"
+
+    wrong = list(base)
+    wrong[-1] = "profiles-attacker-selected"
+    parser = runner._build_parser()
+    with pytest.raises(SystemExit):
+        args = parser.parse_args(wrong)
+        runner._validate_args(parser, args)
+
+
+@pytest.mark.unit
+def test_scheduled_scope_freezes_signed_targets_across_schedule_mutation():
+    scope = runner.RunnerScope("ENG-Premier League", "2526")
+    runtime_scope, work_item_id, workload = _scheduled_scope_binding(
+        scope, match_ids=[11, 12], preview_ids=[21]
+    )
+
+    class Repository:
+        match_ids = [11, 12]
+        preview_ids = [21]
+
+        def list_match_candidates(
+            self,
+            competition_id,
+            season_id,
+            *,
+            limit,
+            include_exact_count,
+        ):
+            assert (competition_id, season_id, limit, include_exact_count) == (
+                "ENG-Premier League",
+                "2526",
+                101,
+                True,
+            )
+            return [
+                SimpleNamespace(
+                    game_id=value,
+                    exact_candidate_count=len(self.match_ids),
+                )
+                for value in self.match_ids
+            ]
+
+        def list_preview_candidates(self, competition_id, season_id, *, limit):
+            assert (competition_id, season_id, limit) == (
+                "ENG-Premier League",
+                "2526",
+                257,
+            )
+            return [{"game_id": value} for value in self.preview_ids]
+
+    repository = Repository()
+    args = SimpleNamespace(
+        command="daily",
+        max_matches=None,
+        proxy_work_item_id=work_item_id,
+        scheduled_scope_workload=workload,
+    )
+
+    runner._freeze_scheduled_scope_targets(
+        repository,
+        [(scope, runtime_scope)],
+        args,
+    )
+    repository.match_ids[:] = [99]
+    repository.preview_ids[:] = [98]
+
+    class Service:
+        calls = []
+
+        def sync_previews(self, **kwargs):
+            self.calls.append(("preview", kwargs))
+            return object()
+
+        def sync_matches(self, **kwargs):
+            self.calls.append(("match", kwargs))
+            return object()
+
+    service = Service()
+    runner._invoke(service, "previews", args)
+    runner._invoke(service, "matches", args)
+
+    assert service.calls[0] == (
+        "preview",
+        {"match_ids": (21,), "force_replay": False},
+    )
+    assert service.calls[1][0] == "match"
+    assert service.calls[1][1]["match_ids"] == (11, 12)
+    assert service.calls[1][1]["limit"] is None
+    assert service.calls[1][1]["kickoff_from"] is None
+
+    attempts = args._scheduled_scope_attempts
+    report = {
+        "producer_attempts": {
+            "match": [attempts["match"]],
+            "preview": [attempts["preview"]],
+        }
+    }
+    runner._validate_scheduled_scope_attempts(report, args)
+    report["producer_attempts"]["preview"][0] = {
+        **attempts["preview"],
+        "count": 0,
+    }
+    with pytest.raises(ValueError, match="preview attempts differ"):
+        runner._validate_scheduled_scope_attempts(report, args)
+
+
+@pytest.mark.unit
+def test_scheduled_scope_preserves_explicit_empty_target_sets():
+    scope = runner.RunnerScope("ENG-Premier League", "2526")
+    runtime_scope, work_item_id, workload = _scheduled_scope_binding(
+        scope, match_ids=[], preview_ids=[]
+    )
+
+    class EmptyRepository:
+        def list_match_candidates(self, *_args, **_kwargs):
+            return []
+
+        def list_preview_candidates(self, *_args, **_kwargs):
+            return []
+
+    args = SimpleNamespace(
+        command="daily",
+        max_matches=None,
+        proxy_work_item_id=work_item_id,
+        scheduled_scope_workload=workload,
+    )
+    runner._freeze_scheduled_scope_targets(
+        EmptyRepository(),
+        [(scope, runtime_scope)],
+        args,
+    )
+
+    class Service:
+        def sync_matches(self, **kwargs):
+            return kwargs
+
+    kwargs = runner._invoke(Service(), "matches", args)
+    assert kwargs["match_ids"] == ()
+    assert kwargs["limit"] is None
+    assert kwargs["kickoff_from"] is None
+
+
+@pytest.mark.unit
+def test_scheduled_scope_rejects_target_drift_before_network():
+    scope = runner.RunnerScope("ENG-Premier League", "2526")
+    runtime_scope, work_item_id, workload = _scheduled_scope_binding(
+        scope, match_ids=[11], preview_ids=[]
+    )
+
+    class DriftedRepository:
+        def list_match_candidates(self, *_args, **_kwargs):
+            return [SimpleNamespace(game_id=12, exact_candidate_count=1)]
+
+        def list_preview_candidates(self, *_args, **_kwargs):
+            return []
+
+    args = SimpleNamespace(
+        command="daily",
+        proxy_work_item_id=work_item_id,
+        scheduled_scope_workload=workload,
+    )
+    with pytest.raises(ValueError, match="drifted before network"):
+        runner._freeze_scheduled_scope_targets(
+            DriftedRepository(),
+            [(scope, runtime_scope)],
+            args,
+        )
+    assert not hasattr(args, "_match_ids")
+
+
+@pytest.mark.unit
 def test_standalone_paid_runner_enforces_code_owned_runtime_gates(monkeypatch):
     import scrapers.whoscored.proxy_campaign as proxy_campaign_module
     from scrapers.whoscored.transport import TransportContext
@@ -1437,6 +1684,7 @@ def test_standalone_paid_runner_enforces_code_owned_runtime_gates(monkeypatch):
     # the failed startup path instead of leaking paid authority to later tests.
     for name in (
         "WHOSCORED_TRANSPORT_POLICY",
+        "WHOSCORED_PLAYER_PAGINATION_TARGET_LIMIT",
         *runner.PROXY_CAMPAIGN_CLI_ENV.values(),
     ):
         monkeypatch.setenv(name, "")
@@ -1473,6 +1721,14 @@ def test_standalone_paid_runner_enforces_code_owned_runtime_gates(monkeypatch):
         "proxy_campaign_approval": {
             "runtime_sha256": "a" * 64,
             "classifier_sha256": "b" * 64,
+            "scheduled_authority": {
+                "scope_workloads": [
+                    {
+                        "work_item_id": "scope-work",
+                        "player_pagination_target_limit": 1,
+                    }
+                ]
+            },
         },
         "proxy_campaign_id": "campaign-1",
         "proxy_allocation": allocation,

@@ -35,7 +35,7 @@ import sys
 import threading
 import time
 import uuid
-from collections import Counter
+from collections import Counter, OrderedDict
 from dataclasses import dataclass, field
 from enum import Enum
 from datetime import datetime, timezone
@@ -260,8 +260,13 @@ DEFAULT_PAID_BYTES_PER_URL = 2_000_000
 PAID_GATEWAY_SCHEMA_VERSION = 1
 PAID_GATEWAY_TOKEN_ENV = "WHOSCORED_PAID_GATEWAY_TOKEN"
 MAX_PAID_GATEWAY_RESPONSE_BYTES = 4 * 1024 * 1024
+MAX_PAID_GATEWAY_BATCH_URLS = 8
 MAX_PAID_GATEWAY_RESPONSE_DOCUMENT_BYTES = (
     (MAX_PAID_GATEWAY_RESPONSE_BYTES * 4 // 3) + 128 * 1024
+)
+MAX_PAID_GATEWAY_BATCH_RESPONSE_DOCUMENT_BYTES = (
+    MAX_PAID_GATEWAY_BATCH_URLS * MAX_PAID_GATEWAY_RESPONSE_DOCUMENT_BYTES
+    + 256 * 1024
 )
 MAX_PAID_GATEWAY_CONTROL_DOCUMENT_BYTES = 5 * 1024 * 1024
 PAID_GATEWAY_CLEANUP_GRACE_SECONDS = 15.0
@@ -279,6 +284,12 @@ _PAID_GATEWAY_RESPONSE_FIELDS = frozenset(
         "route",
         "receipt",
     }
+)
+_PAID_GATEWAY_BATCH_RESPONSE_FIELDS = frozenset(
+    {"schema_version", "target_manifest_sha256", "results", "route", "receipt"}
+)
+_PAID_GATEWAY_BATCH_ITEM_FIELDS = frozenset(
+    {"url", "status_code", "headers", "body_base64", "body_sha256"}
 )
 _PAID_GATEWAY_RECEIPT_FIELDS = frozenset(
     {
@@ -299,10 +310,46 @@ _PAID_GATEWAY_RECEIPT_FIELDS = frozenset(
         "cleanup_complete",
     }
 )
+_PAID_GATEWAY_BATCH_RECEIPT_FIELDS = frozenset(
+    {
+        "schema_version",
+        "campaign_id",
+        "approval_id",
+        "approval_sha256",
+        "allocation_id",
+        "attempt_id_hash",
+        "target_manifest_sha256",
+        "lease_id_hash",
+        "route",
+        "up_bytes",
+        "down_bytes",
+        "total_bytes",
+        "provider_billed_bytes",
+        "bootstrap_provider_billed_bytes",
+        "endpoint_provider_billed_bytes",
+        "close_complete",
+        "cleanup_complete",
+    }
+)
 _PAID_GATEWAY_ERROR_FIELDS = frozenset({"schema_version", "error"})
 _PAID_GATEWAY_SETTLED_ERROR_FIELDS = _PAID_GATEWAY_ERROR_FIELDS | {"receipt"}
 _LOWER_SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z", re.ASCII)
 _PAID_GATEWAY_ERROR_CODE_RE = re.compile(r"\A[a-z][a-z0-9_]{0,63}\Z", re.ASCII)
+
+
+def _paid_gateway_target_manifest_sha256(
+    urls: Sequence[str], *, browser_bootstrap_url: Optional[str] = None
+) -> str:
+    canonical_urls = [_canonical_url_key(url) for url in urls]
+    document: dict[str, object] = {
+        "schema_version": PAID_GATEWAY_SCHEMA_VERSION,
+        "urls": canonical_urls,
+    }
+    if browser_bootstrap_url is not None:
+        document["browser_bootstrap_url"] = _canonical_url_key(browser_bootstrap_url)
+    return hashlib.sha256(
+        canonical_json_bytes(document)
+    ).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -656,6 +703,9 @@ class ProxyFilterClient:
         ttl_seconds: int,
         context: Optional[TransportContext] = None,
         canonical_url: str = "",
+        target_manifest_sha256: str = "",
+        logical_target_units: int = 1,
+        expected_endpoint_labels: Sequence[str] = (),
     ) -> ProxyLease:
         request: dict[str, Any] = {
             "max_bytes": max_bytes,
@@ -664,6 +714,27 @@ class ProxyFilterClient:
         }
         if context is not None:
             request.update(context.as_dict())
+        if not target_manifest_sha256 and (
+            logical_target_units != 1 or expected_endpoint_labels
+        ):
+            raise ValueError(
+                "multi-target lease requires a target manifest and endpoint labels"
+            )
+        if target_manifest_sha256:
+            if (
+                type(target_manifest_sha256) is not str
+                or not re.fullmatch(r"[0-9a-f]{64}", target_manifest_sha256)
+                or isinstance(logical_target_units, bool)
+                or not isinstance(logical_target_units, int)
+                or logical_target_units <= 0
+                or len(expected_endpoint_labels) != logical_target_units + 1
+            ):
+                raise ValueError("batch lease binding is invalid")
+            request.update(
+                target_manifest_sha256=target_manifest_sha256,
+                logical_target_units=logical_target_units,
+                expected_endpoint_labels=list(expected_endpoint_labels),
+            )
         response = self.session.post(
             f"{self.control_url}/v1/leases",
             json=request,
@@ -716,6 +787,73 @@ class ProxyFilterClient:
         )
         response.raise_for_status()
         return dict(response.json())
+
+    def begin_endpoint(self, lease: ProxyLease, endpoint: str) -> str:
+        """Open one provider-byte attribution boundary for an active lease."""
+
+        if type(endpoint) is not str or not endpoint or len(endpoint) > 200:
+            raise ValueError("lease endpoint must be a non-empty bounded string")
+        response = self.session.post(
+            f"{self.control_url}/v1/leases/{lease.lease_id}/endpoints",
+            json={"endpoint": endpoint},
+            headers={
+                "X-Proxy-Control-Token": self._control_token,
+                "Authorization": f"Bearer {lease.token}",
+            },
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+        data = response.json()
+        request_id = data.get("request_id") if isinstance(data, Mapping) else None
+        if type(request_id) is not str or not request_id:
+            raise ValueError("filtering proxy endpoint receipt is invalid")
+        return request_id
+
+    def end_endpoint(self, lease: ProxyLease, request_id: str) -> dict[str, Any]:
+        """Durably close the exact endpoint boundary opened above."""
+
+        if type(request_id) is not str or not request_id:
+            raise ValueError("lease endpoint request id is invalid")
+        response = self.session.delete(
+            f"{self.control_url}/v1/leases/{lease.lease_id}/endpoints/{request_id}",
+            headers={
+                "X-Proxy-Control-Token": self._control_token,
+                "Authorization": f"Bearer {lease.token}",
+            },
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+        data = response.json()
+        if not isinstance(data, Mapping) or data.get("id") != lease.lease_id:
+            raise ValueError("filtering proxy endpoint accounting is invalid")
+        return dict(data)
+
+    def switch_endpoint(
+        self, lease: ProxyLease, request_id: str, endpoint: str
+    ) -> str:
+        """Atomically close one owner and install the next while the browser lives."""
+
+        if type(request_id) is not str or not request_id:
+            raise ValueError("lease endpoint request id is invalid")
+        if type(endpoint) is not str or not endpoint or len(endpoint) > 200:
+            raise ValueError("lease endpoint must be a non-empty bounded string")
+        response = self.session.post(
+            f"{self.control_url}/v1/leases/{lease.lease_id}/endpoints/{request_id}/switch",
+            json={"endpoint": endpoint},
+            headers={
+                "X-Proxy-Control-Token": self._control_token,
+                "Authorization": f"Bearer {lease.token}",
+            },
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+        data = response.json()
+        next_request_id = (
+            data.get("request_id") if isinstance(data, Mapping) else None
+        )
+        if type(next_request_id) is not str or not next_request_id:
+            raise ValueError("filtering proxy endpoint switch receipt is invalid")
+        return next_request_id
 
     def campaign_control(
         self,
@@ -853,7 +991,7 @@ class PaidGatewayRejected(PaidGatewayError):
         self,
         code: str,
         *,
-        receipt: Optional["PaidGatewayReceipt"] = None,
+        receipt: Optional["PaidGatewayReceipt | PaidGatewayBatchReceipt"] = None,
     ) -> None:
         super().__init__(f"paid gateway rejected fetch: {code}")
         self.code = code
@@ -1033,6 +1171,193 @@ class PaidGatewayResponse:
     receipt: PaidGatewayReceipt
 
 
+@dataclass(frozen=True)
+class PaidGatewayBatchItem:
+    """One credential-free body inside an atomic paid batch response."""
+
+    url: str
+    content: bytes
+    status_code: int
+    headers: Mapping[str, str]
+
+
+@dataclass(frozen=True)
+class PaidGatewayBatchReceipt:
+    """Aggregate and per-endpoint accounting for one cleaned batch lease."""
+
+    campaign_id: str
+    approval_id: str
+    approval_sha256: str
+    allocation_id: str
+    attempt_id_hash: str
+    target_manifest_sha256: str
+    lease_id_hash: str
+    route: TransportRoute
+    up_bytes: int
+    down_bytes: int
+    total_bytes: int
+    provider_billed_bytes: int
+    bootstrap_provider_billed_bytes: int
+    endpoint_provider_billed_bytes: Mapping[str, int]
+    close_complete: bool
+    cleanup_complete: bool
+
+    @classmethod
+    def from_dict(
+        cls,
+        value: object,
+        *,
+        context: TransportContext,
+        urls: Sequence[str],
+        browser_bootstrap_url: str,
+        max_provider_bytes: int,
+    ) -> "PaidGatewayBatchReceipt":
+        if not isinstance(value, Mapping) or frozenset(value) != (
+            _PAID_GATEWAY_BATCH_RECEIPT_FIELDS
+        ):
+            raise PaidGatewayProtocolError(
+                "paid gateway batch receipt fields are invalid"
+            )
+        if value.get("schema_version") != PAID_GATEWAY_SCHEMA_VERSION:
+            raise PaidGatewayProtocolError(
+                "paid gateway batch receipt schema is invalid"
+            )
+
+        def digest(field: str) -> str:
+            item = value.get(field)
+            if type(item) is not str or _LOWER_SHA256_RE.fullmatch(item) is None:
+                raise PaidGatewayProtocolError(
+                    f"paid gateway batch receipt {field} is invalid"
+                )
+            return item
+
+        def counter(field: str) -> int:
+            item = value.get(field)
+            if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+                raise PaidGatewayProtocolError(
+                    f"paid gateway batch receipt {field} is invalid"
+                )
+            return item
+
+        campaign = context.proxy_campaign
+        attempt_id = campaign.get("proxy_attempt_id")
+        attempt_hash = digest("attempt_id_hash")
+        if type(attempt_id) is not str or attempt_hash != hashlib.sha256(
+            attempt_id.encode("utf-8")
+        ).hexdigest():
+            raise PaidGatewayProtocolError(
+                "paid gateway batch receipt belongs to another task attempt"
+            )
+        manifest = digest("target_manifest_sha256")
+        if manifest != _paid_gateway_target_manifest_sha256(
+            urls, browser_bootstrap_url=browser_bootstrap_url
+        ):
+            raise PaidGatewayProtocolError(
+                "paid gateway batch receipt belongs to another target manifest"
+            )
+        route_value = value.get("route")
+        if route_value != TransportRoute.PAID_FLARESOLVERR.value:
+            raise PaidGatewayProtocolError(
+                "paid gateway batch receipt route is invalid"
+            )
+        up = counter("up_bytes")
+        down = counter("down_bytes")
+        total = counter("total_bytes")
+        billed = counter("provider_billed_bytes")
+        bootstrap = counter("bootstrap_provider_billed_bytes")
+        if total != up + down or billed != total or total > max_provider_bytes:
+            raise PaidGatewayProtocolError(
+                "paid gateway batch receipt byte accounting is inconsistent"
+            )
+        raw_endpoints = value.get("endpoint_provider_billed_bytes")
+        expected_digests = {
+            hashlib.sha256(_canonical_url_key(url).encode("utf-8")).hexdigest()
+            for url in urls
+        }
+        if not isinstance(raw_endpoints, Mapping) or set(raw_endpoints) != expected_digests:
+            raise PaidGatewayProtocolError(
+                "paid gateway batch endpoint accounting is incomplete"
+            )
+        endpoints: dict[str, int] = {}
+        for endpoint_digest, raw_amount in raw_endpoints.items():
+            if (
+                type(endpoint_digest) is not str
+                or _LOWER_SHA256_RE.fullmatch(endpoint_digest) is None
+                or isinstance(raw_amount, bool)
+                or not isinstance(raw_amount, int)
+                or raw_amount < 0
+            ):
+                raise PaidGatewayProtocolError(
+                    "paid gateway batch endpoint accounting is invalid"
+                )
+            endpoints[endpoint_digest] = raw_amount
+        if bootstrap + sum(endpoints.values()) != total:
+            raise PaidGatewayProtocolError(
+                "paid gateway batch attribution does not equal aggregate bytes"
+            )
+        if (
+            value.get("campaign_id") != campaign.get("proxy_campaign_id")
+            or value.get("approval_id") != campaign.get("proxy_approval_id")
+            or digest("approval_sha256")
+            != campaign.get("proxy_approval_sha256")
+            or value.get("allocation_id") != campaign.get("proxy_allocation_id")
+            or value.get("close_complete") is not True
+            or value.get("cleanup_complete") is not True
+        ):
+            raise PaidGatewayProtocolError(
+                "paid gateway batch receipt authority or cleanup is invalid"
+            )
+        return cls(
+            campaign_id=str(value["campaign_id"]),
+            approval_id=str(value["approval_id"]),
+            approval_sha256=digest("approval_sha256"),
+            allocation_id=str(value["allocation_id"]),
+            attempt_id_hash=attempt_hash,
+            target_manifest_sha256=manifest,
+            lease_id_hash=digest("lease_id_hash"),
+            route=TransportRoute.PAID_FLARESOLVERR,
+            up_bytes=up,
+            down_bytes=down,
+            total_bytes=total,
+            provider_billed_bytes=billed,
+            bootstrap_provider_billed_bytes=bootstrap,
+            endpoint_provider_billed_bytes=endpoints,
+            close_complete=True,
+            cleanup_complete=True,
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": PAID_GATEWAY_SCHEMA_VERSION,
+            "campaign_id": self.campaign_id,
+            "approval_id": self.approval_id,
+            "approval_sha256": self.approval_sha256,
+            "allocation_id": self.allocation_id,
+            "attempt_id_hash": self.attempt_id_hash,
+            "target_manifest_sha256": self.target_manifest_sha256,
+            "lease_id_hash": self.lease_id_hash,
+            "route": self.route.value,
+            "up_bytes": self.up_bytes,
+            "down_bytes": self.down_bytes,
+            "total_bytes": self.total_bytes,
+            "provider_billed_bytes": self.provider_billed_bytes,
+            "bootstrap_provider_billed_bytes": self.bootstrap_provider_billed_bytes,
+            "endpoint_provider_billed_bytes": dict(
+                self.endpoint_provider_billed_bytes
+            ),
+            "close_complete": self.close_complete,
+            "cleanup_complete": self.cleanup_complete,
+        }
+
+
+@dataclass(frozen=True)
+class PaidGatewayBatchResponse:
+    target_manifest_sha256: str
+    results: tuple[PaidGatewayBatchItem, ...]
+    route: TransportRoute
+    receipt: PaidGatewayBatchReceipt
+
+
 class PaidGatewayClient:
     """Runner-side client exposing exactly one bounded ``fetch`` operation.
 
@@ -1070,6 +1395,58 @@ class PaidGatewayClient:
         self.timeout = float(timeout)
         self.session = session or requests.Session()
         self.session.trust_env = False
+        self._receipt_lock = threading.Lock()
+        self._receipt_bindings: OrderedDict[str, tuple[str, ...]] = OrderedDict()
+
+    def _accept_receipt_once(self, receipt: PaidGatewayReceipt) -> None:
+        """Reject replay or cross-context rebinding before local accounting."""
+
+        binding = (
+            "single",
+            receipt.campaign_id,
+            receipt.approval_id,
+            receipt.approval_sha256,
+            receipt.allocation_id,
+            receipt.attempt_id_hash,
+            receipt.canonical_url_sha256,
+        )
+        with self._receipt_lock:
+            previous = self._receipt_bindings.get(receipt.lease_id_hash)
+            if previous is not None:
+                if previous == binding:
+                    raise PaidGatewayProtocolError(
+                        "paid gateway receipt was replayed"
+                    )
+                raise PaidGatewayProtocolError(
+                    "paid gateway lease receipt was rebound"
+                )
+            self._receipt_bindings[receipt.lease_id_hash] = binding
+            if len(self._receipt_bindings) > 4096:
+                self._receipt_bindings.popitem(last=False)
+
+    def _accept_batch_receipt_once(self, receipt: PaidGatewayBatchReceipt) -> None:
+        binding = (
+            "batch",
+            receipt.campaign_id,
+            receipt.approval_id,
+            receipt.approval_sha256,
+            receipt.allocation_id,
+            receipt.attempt_id_hash,
+            receipt.target_manifest_sha256,
+        )
+        with self._receipt_lock:
+            previous = self._receipt_bindings.get(receipt.lease_id_hash)
+            if previous is not None:
+                if previous == binding:
+                    raise PaidGatewayProtocolError(
+                        "paid gateway batch receipt was replayed"
+                    )
+                raise PaidGatewayProtocolError(
+                    "paid gateway lease receipt was rebound"
+                )
+            self._receipt_bindings[receipt.lease_id_hash] = binding
+            if len(self._receipt_bindings) > 4096:
+                self._receipt_bindings.popitem(last=False)
 
     @staticmethod
     def _bounded_response_body(response: object, limit: int) -> bytes:
@@ -1250,9 +1627,247 @@ class PaidGatewayClient:
                 except Exception:
                     pass
 
-    @classmethod
+    def fetch_batch(
+        self,
+        urls: Sequence[str],
+        *,
+        context: TransportContext,
+        max_response_bytes: int,
+        max_provider_bytes: int,
+        timeout_ms: int,
+        browser_bootstrap_url: str,
+    ) -> PaidGatewayBatchResponse:
+        """Fetch one atomic structured-feed manifest through one paid lease."""
+
+        items = tuple(urls)
+        if not 1 <= len(items) <= MAX_PAID_GATEWAY_BATCH_URLS:
+            raise ValueError(
+                f"paid gateway batch must contain 1..{MAX_PAID_GATEWAY_BATCH_URLS} URLs"
+            )
+        if any(
+            type(url) is not str
+            or url != _canonical_url_key(url)
+            or not _is_whoscored_structured_feed_url(url)
+            for url in items
+        ) or len(set(items)) != len(items):
+            raise ValueError(
+                "paid gateway batch URLs must be unique canonical structured feeds"
+            )
+        if not _is_whoscored_stage_bootstrap_url(browser_bootstrap_url):
+            raise ValueError("paid gateway batch bootstrap URL is invalid")
+        for name, value, ceiling in (
+            ("max_response_bytes", max_response_bytes, MAX_PAID_GATEWAY_RESPONSE_BYTES),
+            (
+                "max_provider_bytes",
+                max_provider_bytes,
+                2_000_000,
+            ),
+            ("timeout_ms", timeout_ms, 60_000),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or not 1 <= value <= ceiling
+            ):
+                raise ValueError(f"{name} must be in 1..{ceiling}")
+        manifest = _paid_gateway_target_manifest_sha256(
+            items, browser_bootstrap_url=browser_bootstrap_url
+        )
+        document = {
+            "schema_version": PAID_GATEWAY_SCHEMA_VERSION,
+            "urls": list(items),
+            "browser_bootstrap_url": browser_bootstrap_url,
+            "target_manifest_sha256": manifest,
+            "max_response_bytes": max_response_bytes,
+            "max_provider_bytes": max_provider_bytes,
+            "timeout_ms": timeout_ms,
+            "context": context.as_dict(),
+        }
+        try:
+            response = self.session.post(
+                f"{self.gateway_url}/v1/fetch-batch",
+                json=document,
+                headers={"Authorization": f"Bearer {self._token}"},
+                timeout=self._request_timeout(timeout_ms),
+                stream=True,
+            )
+        except Exception as exc:
+            raise PaidGatewayError(
+                f"paid gateway batch request failed: {type(exc).__name__}"
+            ) from None
+        try:
+            return self._decode_fetch_batch_response(
+                response,
+                urls=items,
+                context=context,
+                max_response_bytes=max_response_bytes,
+                max_provider_bytes=max_provider_bytes,
+                target_manifest_sha256=manifest,
+                browser_bootstrap_url=browser_bootstrap_url,
+            )
+        except (PaidGatewayRejected, PaidGatewayProtocolError):
+            raise
+        except Exception as exc:
+            raise PaidGatewayError(
+                f"paid gateway batch response failed: {type(exc).__name__}"
+            ) from None
+        finally:
+            close_response = getattr(response, "close", None)
+            if callable(close_response):
+                try:
+                    close_response()
+                except Exception:
+                    pass
+
+    def _decode_fetch_batch_response(
+        self,
+        response: object,
+        *,
+        urls: Sequence[str],
+        context: TransportContext,
+        max_response_bytes: int,
+        max_provider_bytes: int,
+        target_manifest_sha256: str,
+        browser_bootstrap_url: str,
+    ) -> PaidGatewayBatchResponse:
+        status = int(getattr(response, "status_code", 0) or 0)
+        body = self._bounded_response_body(
+            response, MAX_PAID_GATEWAY_BATCH_RESPONSE_DOCUMENT_BYTES
+        )
+        try:
+            decoded = strict_json_loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError, ProxyCampaignValidationError):
+            raise PaidGatewayProtocolError(
+                "paid gateway batch response is not strict JSON"
+            ) from None
+        if status != 200:
+            if not isinstance(decoded, Mapping) or frozenset(decoded) not in {
+                _PAID_GATEWAY_ERROR_FIELDS,
+                _PAID_GATEWAY_SETTLED_ERROR_FIELDS,
+            } or decoded.get("schema_version") != PAID_GATEWAY_SCHEMA_VERSION:
+                raise PaidGatewayProtocolError(
+                    "paid gateway batch error response fields are invalid"
+                )
+            error = decoded.get("error")
+            code = error.get("code") if isinstance(error, Mapping) else None
+            if (
+                not isinstance(error, Mapping)
+                or frozenset(error) != {"code"}
+                or type(code) is not str
+                or _PAID_GATEWAY_ERROR_CODE_RE.fullmatch(code) is None
+            ):
+                raise PaidGatewayProtocolError(
+                    "paid gateway batch error response is invalid"
+                )
+            receipt = (
+                PaidGatewayBatchReceipt.from_dict(
+                    decoded.get("receipt"),
+                    context=context,
+                    urls=urls,
+                    browser_bootstrap_url=browser_bootstrap_url,
+                    max_provider_bytes=max_provider_bytes,
+                )
+                if "receipt" in decoded
+                else None
+            )
+            if receipt is not None:
+                self._accept_batch_receipt_once(receipt)
+            raise PaidGatewayRejected(code, receipt=receipt)
+        if (
+            not isinstance(decoded, Mapping)
+            or frozenset(decoded) != _PAID_GATEWAY_BATCH_RESPONSE_FIELDS
+            or decoded.get("schema_version") != PAID_GATEWAY_SCHEMA_VERSION
+            or decoded.get("target_manifest_sha256") != target_manifest_sha256
+            or decoded.get("route") != TransportRoute.PAID_FLARESOLVERR.value
+        ):
+            raise PaidGatewayProtocolError(
+                "paid gateway batch response envelope is invalid"
+            )
+        raw_results = decoded.get("results")
+        if not isinstance(raw_results, list) or len(raw_results) != len(urls):
+            raise PaidGatewayProtocolError(
+                "paid gateway batch result count is invalid"
+            )
+        results: list[PaidGatewayBatchItem] = []
+        for expected_url, raw in zip(urls, raw_results):
+            if (
+                not isinstance(raw, Mapping)
+                or frozenset(raw) != _PAID_GATEWAY_BATCH_ITEM_FIELDS
+                or raw.get("url") != expected_url
+            ):
+                raise PaidGatewayProtocolError(
+                    "paid gateway batch item identity is invalid"
+                )
+            status_code = raw.get("status_code")
+            if (
+                isinstance(status_code, bool)
+                or not isinstance(status_code, int)
+                or not 100 <= status_code <= 599
+            ):
+                raise PaidGatewayProtocolError(
+                    "paid gateway batch item status is invalid"
+                )
+            encoded = raw.get("body_base64")
+            try:
+                content = base64.b64decode(encoded, validate=True)
+            except (TypeError, binascii.Error, ValueError):
+                raise PaidGatewayProtocolError(
+                    "paid gateway batch item body is invalid"
+                ) from None
+            if len(content) > max_response_bytes or raw.get(
+                "body_sha256"
+            ) != hashlib.sha256(content).hexdigest():
+                raise PaidGatewayProtocolError(
+                    "paid gateway batch item body integrity is invalid"
+                )
+            raw_headers = raw.get("headers")
+            if not isinstance(raw_headers, Mapping) or len(raw_headers) > 32:
+                raise PaidGatewayProtocolError(
+                    "paid gateway batch item headers are invalid"
+                )
+            headers: dict[str, str] = {}
+            for key, value in raw_headers.items():
+                if (
+                    type(key) is not str
+                    or type(value) is not str
+                    or not key
+                    or len(key) > 128
+                    or len(value) > 4096
+                    or any(character in key + value for character in "\r\n")
+                ):
+                    raise PaidGatewayProtocolError(
+                        "paid gateway batch item headers are invalid"
+                    )
+                headers[key] = value
+            results.append(
+                PaidGatewayBatchItem(
+                    url=expected_url,
+                    content=content,
+                    status_code=status_code,
+                    headers=headers,
+                )
+            )
+        receipt = PaidGatewayBatchReceipt.from_dict(
+            decoded.get("receipt"),
+            context=context,
+            urls=urls,
+            browser_bootstrap_url=browser_bootstrap_url,
+            max_provider_bytes=max_provider_bytes,
+        )
+        if receipt.target_manifest_sha256 != target_manifest_sha256:
+            raise PaidGatewayProtocolError(
+                "paid gateway batch receipt and response manifest differ"
+            )
+        self._accept_batch_receipt_once(receipt)
+        return PaidGatewayBatchResponse(
+            target_manifest_sha256=target_manifest_sha256,
+            results=tuple(results),
+            route=TransportRoute.PAID_FLARESOLVERR,
+            receipt=receipt,
+        )
+
     def _decode_fetch_response(
-        cls,
+        self,
         response: object,
         *,
         url: str,
@@ -1268,7 +1883,7 @@ class PaidGatewayClient:
                 (max_response_bytes * 4 // 3) + 128 * 1024,
             ),
         )
-        body = cls._bounded_response_body(response, document_limit)
+        body = self._bounded_response_body(response, document_limit)
         try:
             decoded = strict_json_loads(body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError, ProxyCampaignValidationError):
@@ -1304,6 +1919,8 @@ class PaidGatewayClient:
                 if "receipt" in decoded
                 else None
             )
+            if receipt is not None:
+                self._accept_receipt_once(receipt)
             raise PaidGatewayRejected(code, receipt=receipt)
         if not isinstance(decoded, Mapping) or frozenset(decoded) != (
             _PAID_GATEWAY_RESPONSE_FIELDS
@@ -1371,6 +1988,7 @@ class PaidGatewayClient:
             raise PaidGatewayProtocolError(
                 "paid gateway response and receipt routes differ"
             )
+        self._accept_receipt_once(receipt)
         return PaidGatewayResponse(
             url=url,
             content=content,
@@ -1860,6 +2478,7 @@ class WhoScoredTransport:
         source_circuit: Optional[SharedSourceCircuit] = None,
         source_circuit_wait: Optional[bool] = None,
         transport_policy: Optional[TransportPolicy | str] = None,
+        paid_batch_enabled: Optional[bool] = None,
     ) -> None:
         require_production_runtime_class(operation="WhoScored source transport")
         if direct_http_attempts < 1:
@@ -1922,6 +2541,15 @@ class WhoScoredTransport:
             raise ValueError(
                 f"{SOURCE_CIRCUIT_WAIT_ENV}=1 requires {SOURCE_CIRCUIT_PATH_ENV}"
             )
+        if paid_batch_enabled is None:
+            paid_batch_value = os.environ.get(
+                "WHOSCORED_PAID_BATCH_ENABLED", "0"
+            ).strip()
+            if paid_batch_value not in {"0", "1"}:
+                raise ValueError("WHOSCORED_PAID_BATCH_ENABLED must be 0 or 1")
+            paid_batch_enabled = paid_batch_value == "1"
+        elif type(paid_batch_enabled) is not bool:
+            raise ValueError("paid_batch_enabled must be a boolean")
         self.context = context or TransportContext.from_env()
         context_policy = TransportPolicy.parse(self.context.transport_policy)
         if transport_policy is not None:
@@ -2006,6 +2634,7 @@ class WhoScoredTransport:
         )
         self._source_circuit = source_circuit
         self._source_circuit_wait = source_circuit_wait
+        self._paid_batch_enabled = paid_batch_enabled
         self._source_circuit_permit: Optional[CircuitPermit] = None
         self._http_session_factory = http_session_factory
         self._direct_http = direct_http_session or self._new_http_session(None)
@@ -3008,6 +3637,7 @@ class WhoScoredTransport:
             # each URL through direct HTTP immediately before its bounded paid
             # lease, exactly like the serial state machine.
             self._direct_gate_circuits.discard(gate_key)
+            paid_pending: list[tuple[int, FetchRequest]] = []
             for index, item, _ in pending:
                 self._activate_request(
                     cache_key=item.cache_key,
@@ -3055,14 +3685,33 @@ class WhoScoredTransport:
                         break
                 if not fresh_cloudflare:
                     continue
-                paid = self._paid_fetch(
-                    item.url,
-                    item.validator,
-                    cache_key=item.cache_key,
+                paid_pending.append((index, item))
+
+            if paid_pending and self._paid_batch_enabled:
+                paid_batch = self._paid_fetch_many(
+                    [item for _, item in paid_pending],
                     browser_bootstrap_url=bootstrap_url,
+                    request_ids=request_ids,
                 )
-                self._store_response(item.cache_key, paid)
-                results[index] = paid
+                for (index, item), paid in zip(paid_pending, paid_batch):
+                    self._store_response(item.cache_key, paid)
+                    results[index] = paid
+            else:
+                for index, item in paid_pending:
+                    self._activate_request(
+                        cache_key=item.cache_key,
+                        scope=item.scope,
+                        entity=item.entity,
+                        request_id=request_ids[item.cache_key],
+                    )
+                    paid = self._paid_fetch(
+                        item.url,
+                        item.validator,
+                        cache_key=item.cache_key,
+                        browser_bootstrap_url=bootstrap_url,
+                    )
+                    self._store_response(item.cache_key, paid)
+                    results[index] = paid
 
         if any(response is None for response in results):
             raise WhoScoredTransportError(
@@ -3805,6 +4454,201 @@ class WhoScoredTransport:
             self._drop_browser_session(client, route)
         return outcomes
 
+    def _paid_fetch_many(
+        self,
+        items: Sequence[FetchRequest],
+        *,
+        browser_bootstrap_url: str,
+        request_ids: Mapping[str, str],
+    ) -> list[TransportResponse]:
+        """Use the opt-in atomic gateway batch after all direct prechecks."""
+
+        batch = tuple(items)
+        if not 1 <= len(batch) <= MAX_PAID_GATEWAY_BATCH_URLS:
+            raise WhoScoredTransportError(
+                "paid gateway batch size is invalid",
+                kind=FailureKind.CONFIG,
+                url=batch[0].url if batch else "",
+                route=TransportRoute.PAID_LEASE,
+            )
+        budgets = self.budgets
+        logical_urls = [_logical_url_key(item.url) for item in batch]
+        prospective = self.stats.paid_urls | set(logical_urls)
+        if len(prospective) > budgets.max_paid_urls:
+            raise TransportBudgetExceeded(
+                f"paid URL limit reached ({budgets.max_paid_urls})",
+                url=batch[0].url,
+                route=TransportRoute.PAID_FLARESOLVERR,
+            )
+        remaining = budgets.max_paid_bytes_per_task - self.stats.paid_proxy_bytes
+        per_url_remaining = sum(
+            max(
+                0,
+                budgets.max_paid_bytes_per_url
+                - self.stats.paid_proxy_bytes_by_url.get(logical_url, 0),
+            )
+            for logical_url in logical_urls
+        )
+        lease_budget = min(
+            remaining,
+            budgets.max_paid_bytes_per_lease,
+            per_url_remaining,
+        )
+        if lease_budget <= 0:
+            raise TransportBudgetExceeded(
+                "paid task byte budget exhausted",
+                url=batch[0].url,
+                route=TransportRoute.PAID_FLARESOLVERR,
+            )
+        gateway = self._paid_gateway
+        if gateway is None:
+            raise WhoScoredTransportError(
+                "paid application gateway is unavailable",
+                kind=FailureKind.CONFIG,
+                url=batch[0].url,
+                route=TransportRoute.PAID_LEASE,
+            )
+        first = batch[0]
+        self._activate_request(
+            cache_key=first.cache_key,
+            scope=first.scope,
+            entity=first.entity,
+            request_id=request_ids[first.cache_key],
+        )
+        try:
+            paid = gateway.fetch_batch(
+                [item.url for item in batch],
+                context=self._active_context,
+                max_response_bytes=budgets.max_response_bytes,
+                max_provider_bytes=lease_budget,
+                timeout_ms=min(60_000, max(1, int(self.browser_timeout_ms))),
+                browser_bootstrap_url=browser_bootstrap_url,
+            )
+        except PaidGatewayRejected as exc:
+            if isinstance(exc.receipt, PaidGatewayBatchReceipt):
+                self._record_paid_gateway_batch_receipt(
+                    batch, exc.receipt, request_ids=request_ids
+                )
+            raise WhoScoredTransportError(
+                f"paid application gateway rejected batch: {exc.code}",
+                kind=(
+                    FailureKind.BUDGET
+                    if exc.code == "budget_rejected"
+                    else FailureKind.PROXY
+                ),
+                url=batch[0].url,
+                route=TransportRoute.PAID_FLARESOLVERR,
+                retryable=exc.code
+                not in {"authority_rejected", "target_not_allowed"},
+            ) from None
+        except (PaidGatewayError, PaidGatewayProtocolError) as exc:
+            raise WhoScoredTransportError(
+                "paid application gateway batch failed: "
+                f"{type(exc).__name__}",
+                kind=FailureKind.PROXY,
+                url=batch[0].url,
+                route=TransportRoute.PAID_LEASE,
+                retryable=True,
+            ) from None
+        self._record_paid_gateway_batch_receipt(
+            batch, paid.receipt, request_ids=request_ids
+        )
+        responses: list[TransportResponse] = []
+        for item, gateway_item in zip(batch, paid.results):
+            endpoint_digest = hashlib.sha256(
+                _canonical_url_key(item.url).encode("utf-8")
+            ).hexdigest()
+            attributed = paid.receipt.endpoint_provider_billed_bytes[endpoint_digest]
+            if item is first:
+                attributed += paid.receipt.bootstrap_provider_billed_bytes
+            response = self._response(
+                url=item.url,
+                content=gateway_item.content,
+                status_code=gateway_item.status_code,
+                headers=gateway_item.headers,
+                route=paid.route,
+                wire_bytes=len(gateway_item.content),
+                response_bytes=len(gateway_item.content),
+                resource_bytes=attributed,
+            )
+            self._record_response(response)
+            self._activate_request(
+                cache_key=item.cache_key,
+                scope=item.scope,
+                entity=item.entity,
+                request_id=request_ids[item.cache_key],
+            )
+            self._validate(response, item.validator)
+            responses.append(response)
+        if self.stats.paid_proxy_bytes > budgets.max_paid_bytes_per_task or any(
+            self.stats.paid_proxy_bytes_by_url.get(logical_url, 0)
+            > budgets.max_paid_bytes_per_url
+            for logical_url in logical_urls
+        ):
+            raise TransportBudgetExceeded(
+                "paid batch receipt exceeded a local byte ceiling",
+                url=batch[0].url,
+                route=TransportRoute.PAID_FLARESOLVERR,
+            )
+        return responses
+
+    def _record_paid_gateway_batch_receipt(
+        self,
+        items: Sequence[FetchRequest],
+        receipt: PaidGatewayBatchReceipt,
+        *,
+        request_ids: Mapping[str, str],
+    ) -> None:
+        if not receipt.close_complete or not receipt.cleanup_complete:
+            raise PaidGatewayProtocolError(
+                "paid gateway batch cleanup receipt is incomplete"
+            )
+        self.stats.paid_proxy_up_bytes += receipt.up_bytes
+        self.stats.paid_proxy_down_bytes += receipt.down_bytes
+        self._paid_browser_bootstraps += 1
+        for index, item in enumerate(items):
+            logical_url = _logical_url_key(item.url)
+            digest = hashlib.sha256(
+                _canonical_url_key(item.url).encode("utf-8")
+            ).hexdigest()
+            endpoint_bytes = receipt.endpoint_provider_billed_bytes[digest]
+            attributed = endpoint_bytes + (
+                receipt.bootstrap_provider_billed_bytes if index == 0 else 0
+            )
+            self.stats.paid_urls.add(logical_url)
+            self.stats.paid_proxy_bytes_by_url[logical_url] = (
+                self.stats.paid_proxy_bytes_by_url.get(logical_url, 0) + attributed
+            )
+        first = items[0]
+        self._activate_request(
+            cache_key=first.cache_key,
+            scope=first.scope,
+            entity=first.entity,
+            request_id=request_ids[first.cache_key],
+        )
+        self._record_ledger(
+            url=first.url,
+            route=TransportRoute.PAID_LEASE,
+            status="accounted",
+            request_bytes=receipt.up_bytes,
+            response_bytes=receipt.down_bytes,
+            resource_bytes=receipt.total_bytes,
+            paid_proxy_bytes=receipt.provider_billed_bytes,
+            extra={
+                "lease_id_hash": receipt.lease_id_hash,
+                "paid_routes_attempted": [receipt.route.value],
+                "final_paid_route": receipt.route.value,
+                "gateway_cleanup_complete": True,
+                "gateway_target_manifest_sha256": receipt.target_manifest_sha256,
+                "gateway_endpoint_provider_bytes": dict(
+                    receipt.endpoint_provider_billed_bytes
+                ),
+                "gateway_bootstrap_provider_bytes": (
+                    receipt.bootstrap_provider_billed_bytes
+                ),
+            },
+        )
+
     def _paid_fetch(
         self,
         url: str,
@@ -4033,7 +4877,9 @@ class WhoScoredTransport:
             resource_bytes=up + down,
             paid_proxy_bytes=up + down,
             extra={
-                "lease_id": expected_lease_id,
+                "lease_id_hash": hashlib.sha256(
+                    expected_lease_id.encode("utf-8")
+                ).hexdigest(),
                 "paid_routes_attempted": [route.value for route in routes_attempted],
                 "final_paid_route": final_route.value if final_route else "",
             },

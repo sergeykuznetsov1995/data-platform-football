@@ -32,6 +32,7 @@ import stat
 import subprocess
 import types
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -46,8 +47,6 @@ _WHOSCORED_APPROVAL_PATH_RE = re.compile(
     r"/opt/airflow/secure/whoscored-approvals/"
     r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\.json"
 )
-
-
 def _load_exact_provenance_validator() -> types.ModuleType:
     """Execute the exact sibling validator without consulting import paths."""
 
@@ -152,6 +151,28 @@ _PROVIDER_QUOTA_RECEIPT_FIELDS = frozenset(
         "screenshot_sha256",
     }
 )
+_PROVIDER_POLICY_UNSIGNED_FIELDS = frozenset(
+    {
+        "schema_version",
+        "source",
+        "provider_id",
+        "order_id",
+        "plan_id",
+        "valid_from",
+        "valid_until",
+        "receipt_sha256",
+        "provider_quota_bytes",
+        "safety_cap_bytes",
+        "daily_cap_bytes",
+        "monthly_cap_bytes",
+        "order_cap_bytes",
+        "signature_algorithm",
+    }
+)
+_PROVIDER_POLICY_FIELDS = _PROVIDER_POLICY_UNSIGNED_FIELDS | {
+    "document_sha256",
+    "signature",
+}
 PROTECTED_SERVICES = (
     "airflow-scheduler",
     "flaresolverr",
@@ -160,6 +181,34 @@ PROTECTED_SERVICES = (
     "whoscored_proxy_filter",
 )
 _PROTECTED_SERVICE_SET = frozenset(PROTECTED_SERVICES)
+COMMON_PROTECTED_SERVICES = ("airflow-scheduler", "flaresolverr")
+GATEWAY_PROTECTED_SERVICES = (
+    "flaresolverr_whoscored_paid",
+    "whoscored_paid_gateway",
+    "whoscored_proxy_filter",
+)
+COMMON_PROJECT = "data-platform"
+GATEWAY_PROJECT = "whoscored-gw"
+_SERVICE_PROJECT = {
+    **{service: COMMON_PROJECT for service in COMMON_PROTECTED_SERVICES},
+    **{service: GATEWAY_PROJECT for service in GATEWAY_PROTECTED_SERVICES},
+}
+_COMMON_EXTERNAL_NETWORKS = {
+    "whoscored-paid-api": {
+        "external": True,
+        "ipam": {},
+        "name": "dp-whoscored-paid-api",
+    }
+}
+_NETWORK_PROJECT = {
+    "backend": COMMON_PROJECT,
+    "frontend": COMMON_PROJECT,
+    "storage": COMMON_PROJECT,
+    "whoscored-paid-api": GATEWAY_PROJECT,
+    "whoscored-paid-browser": GATEWAY_PROJECT,
+    "whoscored-paid-direct-egress": GATEWAY_PROJECT,
+    "whoscored-paid-provider-egress": GATEWAY_PROJECT,
+}
 _DIGEST = re.compile(r"\A[0-9a-f]{64}\Z")
 _COMMIT = re.compile(r"\A[0-9a-f]{40}\Z")
 _PINNED_IMAGE = re.compile(r"\A[^\s@]+@sha256:[0-9a-f]{64}\Z")
@@ -346,6 +395,7 @@ _ALLOWED_VOLUME_TARGETS = {
         "/opt/airflow/scrapers": ("bind", True),
         "/opt/airflow/scripts": ("bind", True),
         "/opt/airflow/secure/whoscored-approvals": ("bind", True),
+        "/opt/airflow/secure/whoscored-scheduled-pointers": ("bind", True),
         "/opt/airflow/state/whoscored-proxy-filter": ("bind", True),
         "/opt/airflow/transform": ("bind", True),
         "/opt/airflow/webserver_config.py": ("bind", True),
@@ -363,7 +413,6 @@ _ALLOWED_VOLUME_TARGETS = {
     "whoscored_proxy_filter": {
         "/opt/airflow/configs/medallion": ("bind", True),
         "/opt/airflow/configs/proxy_filter": ("bind", True),
-        "/opt/airflow/configs/sofascore": ("bind", True),
         "/opt/airflow/dags": ("bind", True),
         "/opt/airflow/scrapers": ("bind", True),
         "/opt/airflow/scripts": ("bind", True),
@@ -392,7 +441,6 @@ _RELEASE_BIND_TARGETS = {
     "whoscored_proxy_filter": {
         "/opt/airflow/configs/medallion": "configs/medallion",
         "/opt/airflow/configs/proxy_filter": "configs/proxy_filter",
-        "/opt/airflow/configs/sofascore": "configs/sofascore",
         "/opt/airflow/dags": "dags",
         "/opt/airflow/scrapers": "scrapers",
         "/opt/airflow/scripts": "scripts",
@@ -404,7 +452,11 @@ _RUNTIME_HOST_BIND_TARGETS = {
     (
         "airflow-scheduler",
         "/opt/airflow/secure/whoscored-approvals",
-    ): "protected-directory",
+    ): "airflow-authority-directory",
+    (
+        "airflow-scheduler",
+        "/opt/airflow/secure/whoscored-scheduled-pointers",
+    ): "airflow-authority-directory",
     (
         "airflow-scheduler",
         "/opt/airflow/state/whoscored-proxy-filter",
@@ -422,6 +474,7 @@ _RUNTIME_HOST_BIND_TARGETS = {
         "/opt/airflow/state/whoscored-proxy-filter",
     ): "writable-directory",
 }
+_AIRFLOW_RUNTIME_UID = 50_000
 _ALLOWED_TMPFS = {
     "airflow-scheduler": {},
     "flaresolverr": {
@@ -655,7 +708,6 @@ _ALLOWED_RENDERED_KEYS = {
             "healthcheck",
             "image",
             "networks",
-            "profiles",
             "read_only",
             "restart",
             "security_opt",
@@ -675,7 +727,6 @@ _ALLOWED_RENDERED_KEYS = {
             "healthcheck",
             "image",
             "networks",
-            "profiles",
             "read_only",
             "restart",
             "security_opt",
@@ -688,14 +739,12 @@ _ALLOWED_RENDERED_KEYS = {
             "cap_drop",
             "command",
             "container_name",
-            "depends_on",
             "deploy",
             "entrypoint",
             "environment",
             "healthcheck",
             "image",
             "networks",
-            "profiles",
             "read_only",
             "restart",
             "security_opt",
@@ -777,12 +826,7 @@ _EXPECTED_DEPENDS_ON = {
             "required": True,
         },
     },
-    "whoscored_proxy_filter": {
-        "airflow-log-init": {
-            "condition": "service_completed_successfully",
-            "required": True,
-        },
-    },
+    "whoscored_proxy_filter": None,
 }
 _EXPECTED_DEPLOY = {
     "airflow-scheduler": {
@@ -902,9 +946,10 @@ _SCHEDULER_ENVIRONMENT_NAMES = frozenset(
     WHOSCORED_DIRECT_POOL WHOSCORED_DQ_POOL WHOSCORED_LOCK_DIR
     WHOSCORED_OPS_IO_ATTEMPTS WHOSCORED_OPS_RETRY_BASE_SECONDS
     WHOSCORED_OPS_STORE_URI
-    WHOSCORED_PAID_GATEWAY_TOKEN WHOSCORED_PAID_GATEWAY_URL
-    WHOSCORED_PROXY_APPROVAL_PATH
+    WHOSCORED_PAID_BATCH_ENABLED WHOSCORED_PAID_GATEWAY_TOKEN
+    WHOSCORED_PAID_GATEWAY_URL
     WHOSCORED_PROXY_APPROVAL_ROOT WHOSCORED_PROXY_CAMPAIGN_LEDGER_PATH
+    WHOSCORED_SCHEDULED_PAID_MODE WHOSCORED_SCHEDULED_PAID_POINTER_ROOT
     WHOSCORED_RAW_IO_ATTEMPTS WHOSCORED_RAW_LOCK_DIR
     WHOSCORED_RAW_LOCK_TIMEOUT_SECONDS WHOSCORED_RAW_RETRY_BASE_SECONDS
     WHOSCORED_RAW_S3_ACCESS_KEY WHOSCORED_RAW_S3_ENDPOINT
@@ -939,6 +984,7 @@ _EXPECTED_ENVIRONMENT_NAMES = {
             "WHOSCORED_PAID_ALERT_RECEIPT_ROOT",
             "WHOSCORED_PAID_ALERT_AUTHORITY_ROOT",
             "WHOSCORED_PAID_ALERT_SECRET_PATH",
+            "WHOSCORED_PAID_BATCH_ENABLED",
             "WHOSCORED_PAID_GATEWAY_TOKEN",
             "WHOSCORED_PROXY_APPROVAL_HMAC_SECRET",
             "WHOSCORED_PROXY_CONTROL_TOKEN",
@@ -951,8 +997,12 @@ _EXPECTED_ENVIRONMENT_NAMES = {
             "PROXY_FILTER_CONTROL_TOKEN",
             "PROXY_POOL_JSON",
             "TM_PROXY_CONTROL_TOKEN",
+            "WHOSCORED_PROVIDER_ORDER_ID",
+            "WHOSCORED_PROVIDER_POLICY_SHA256",
             "WHOSCORED_PROXY_APPROVAL_HMAC_SECRET",
             "WHOSCORED_PROXY_CAMPAIGN_LEDGER_PATH",
+            "WHOSCORED_PROXY_FILTER_DAILY_BUDGET_BYTES",
+            "WHOSCORED_PROXY_FILTER_MAX_LEASE_BYTES",
             "WHOSCORED_PROXY_LEDGER_HMAC_SECRET",
         }
     ),
@@ -978,6 +1028,10 @@ _FIXED_ENVIRONMENT = {
         "WHOSCORED_OPS_STORE_URI": "s3://warehouse/ops/whoscored",
         "WHOSCORED_PAID_GATEWAY_URL": "http://whoscored_paid_gateway:8898",
         "WHOSCORED_PROXY_APPROVAL_ROOT": ("/opt/airflow/secure/whoscored-approvals"),
+        "WHOSCORED_SCHEDULED_PAID_POINTER_ROOT": (
+            "/opt/airflow/secure/whoscored-scheduled-pointers"
+        ),
+        "WHOSCORED_SCHEDULED_PAID_MODE": "required",
         "WHOSCORED_PROXY_CAMPAIGN_LEDGER_PATH": (
             "/opt/airflow/state/whoscored-proxy-filter/whoscored_campaigns.json"
         ),
@@ -1464,11 +1518,21 @@ def validate_bindings_with_evidence(
     )
 
 
-def compose_override_bytes(bindings: Mapping[str, str]) -> bytes:
+def compose_override_bytes(
+    bindings: Mapping[str, str],
+    services: Sequence[str] = PROTECTED_SERVICES,
+) -> bytes:
     if set(bindings) != _PROTECTED_SERVICE_SET:
         raise AdmissionError("override bindings must name every protected service")
+    selected = tuple(services)
+    if (
+        not selected
+        or len(selected) != len(set(selected))
+        or any(service not in _PROTECTED_SERVICE_SET for service in selected)
+    ):
+        raise AdmissionError("override services must be a unique protected subset")
     lines = ["services:"]
-    for service in PROTECTED_SERVICES:
+    for service in selected:
         image = bindings[service]
         if not isinstance(image, str) or _PINNED_IMAGE.fullmatch(image) is None:
             raise AdmissionError(f"protected service has a mutable image: {service}")
@@ -1565,7 +1629,9 @@ def write_new_regular_file(path: Path, payload: bytes) -> None:
 
 
 def verify_override_snapshot(
-    path: Path, bindings: Mapping[str, str]
+    path: Path,
+    bindings: Mapping[str, str],
+    services: Sequence[str] = PROTECTED_SERVICES,
 ) -> tuple[bytes, tuple[int, ...]]:
     """Verify one protected override read and return that exact snapshot."""
 
@@ -1575,7 +1641,7 @@ def verify_override_snapshot(
         )
     except provenance.ProvenanceError as exc:
         raise AdmissionError(str(exc)) from exc
-    expected = compose_override_bytes(bindings)
+    expected = compose_override_bytes(bindings, services)
     if not hmac.compare_digest(actual, expected):
         raise AdmissionError(
             "production Compose override differs from the attested digest-only model"
@@ -1583,8 +1649,12 @@ def verify_override_snapshot(
     return actual, identity
 
 
-def verify_override(path: Path, bindings: Mapping[str, str]) -> None:
-    verify_override_snapshot(path, bindings)
+def verify_override(
+    path: Path,
+    bindings: Mapping[str, str],
+    services: Sequence[str] = PROTECTED_SERVICES,
+) -> None:
+    verify_override_snapshot(path, bindings, services)
 
 
 def _string_sequence(value: object, *, label: str) -> tuple[str, ...] | None:
@@ -1657,20 +1727,46 @@ def _forbidden_environment_names(
 def _validate_rendered_environment(
     environment: Mapping[str, str], *, service: str
 ) -> None:
-    if set(environment) != _EXPECTED_ENVIRONMENT_NAMES[service]:
+    expected_names = _EXPECTED_ENVIRONMENT_NAMES[service]
+    legacy_scheduler_names = (
+        expected_names
+        - {
+            "WHOSCORED_SCHEDULED_PAID_MODE",
+            "WHOSCORED_SCHEDULED_PAID_POINTER_ROOT",
+        }
+    ) | {"WHOSCORED_PROXY_APPROVAL_PATH"}
+    legacy_scheduler = (
+        service == "airflow-scheduler"
+        and set(environment) == legacy_scheduler_names
+    )
+    if set(environment) != expected_names and not legacy_scheduler:
         raise AdmissionError(f"rendered environment names differ: {service}")
     if any(
         environment.get(name) != value
         for name, value in _FIXED_ENVIRONMENT[service].items()
+        if not legacy_scheduler
+        or name
+        not in {
+            "WHOSCORED_SCHEDULED_PAID_MODE",
+            "WHOSCORED_SCHEDULED_PAID_POINTER_ROOT",
+        }
     ):
         raise AdmissionError(f"rendered security environment differs: {service}")
     if service == "airflow-scheduler" and environment.get(
         "WHOSCORED_SOURCE_POOL_SLOTS"
     ) not in {"2", "3", "4"}:
         raise AdmissionError("rendered WhoScored source-pool size differs")
+    if service in {"airflow-scheduler", "whoscored_paid_gateway"} and environment.get(
+        "WHOSCORED_PAID_BATCH_ENABLED"
+    ) not in {"0", "1"}:
+        raise AdmissionError("rendered WhoScored paid-batch control differs")
     if service == "airflow-scheduler":
         approval_path = environment.get("WHOSCORED_PROXY_APPROVAL_PATH", "")
-        if approval_path and _WHOSCORED_APPROVAL_PATH_RE.fullmatch(approval_path) is None:
+        if (
+            legacy_scheduler
+            and approval_path
+            and _WHOSCORED_APPROVAL_PATH_RE.fullmatch(approval_path) is None
+        ):
             raise AdmissionError("rendered WhoScored approval path differs")
         if len(environment.get("FBREF_PROXY_CONTROL_TOKEN", "").strip()) < 32:
             raise AdmissionError("rendered FBref proxy-control token is invalid")
@@ -1691,6 +1787,26 @@ def _validate_rendered_environment(
             raise AdmissionError(
                 "rendered Transfermarkt paid controls are not fail-closed"
             )
+    if service == "whoscored_proxy_filter":
+        if (
+            re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}",
+                environment.get("WHOSCORED_PROVIDER_ORDER_ID", ""),
+            )
+            is None
+            or _DIGEST.fullmatch(
+                environment.get("WHOSCORED_PROVIDER_POLICY_SHA256", "")
+            )
+            is None
+        ):
+            raise AdmissionError("rendered WhoScored provider-policy identity differs")
+        _positive_capped_decimal(
+            environment.get("WHOSCORED_PROXY_FILTER_DAILY_BUDGET_BYTES", ""),
+            flag="daily-budget-bytes",
+            maximum=300_000_000,
+        )
+        if environment.get("WHOSCORED_PROXY_FILTER_MAX_LEASE_BYTES") != "2000000":
+            raise AdmissionError("rendered max-lease-bytes differs from policy")
     if (
         service == "airflow-scheduler"
         and len(environment.get("WHOSCORED_PAID_GATEWAY_TOKEN", "").strip()) < 32
@@ -1910,11 +2026,14 @@ def _command_projection(
     if command is None or len(command) != len(template):
         raise AdmissionError("rendered WhoScored proxy command differs")
     variable_limits = {
-        "${WHOSCORED_PROXY_FILTER_DAILY_BUDGET_MB:-850}": (
-            "--daily-budget-mb",
-            850,
+        "${WHOSCORED_PROXY_FILTER_DAILY_BUDGET_BYTES:?set exact provider-policy daily cap in decimal bytes}": (
+            "--daily-budget-bytes",
+            300_000_000,
         ),
-        "${WHOSCORED_PROXY_FILTER_MAX_LEASE_MB:-2}": ("--max-lease-mb", 2),
+        "${WHOSCORED_PROXY_FILTER_MAX_LEASE_BYTES:-2000000}": (
+            "--max-lease-bytes",
+            2_000_000,
+        ),
         "${WHOSCORED_PROXY_FILTER_MAX_LEASE_TTL_SECONDS:-3600}": (
             "--max-lease-ttl-seconds",
             3_600,
@@ -1979,7 +2098,21 @@ def verify_rendered_compose(
             raise AdmissionError(
                 f"rendered protected service still has a build: {service}"
             )
-        if set(model) != _ALLOWED_RENDERED_KEYS[service]:
+        modeled_keys = set(model)
+        if model.get("profiles") == ["whoscored-paid"]:
+            modeled_keys.discard("profiles")
+        if (
+            service == "whoscored_proxy_filter"
+            and model.get("depends_on")
+            == {
+                "airflow-log-init": {
+                    "condition": "service_completed_successfully",
+                    "required": True,
+                }
+            }
+        ):
+            modeled_keys.discard("depends_on")
+        if modeled_keys != _ALLOWED_RENDERED_KEYS[service]:
             raise AdmissionError(
                 f"rendered protected service has unmodeled fields: {service}"
             )
@@ -1993,7 +2126,17 @@ def verify_rendered_compose(
             )
         if model.get("container_name") != service:
             raise AdmissionError(f"rendered container name differs: {service}")
-        if model.get("depends_on") != _EXPECTED_DEPENDS_ON[service]:
+        observed_depends_on = model.get("depends_on")
+        legacy_filter_depends_on = {
+            "airflow-log-init": {
+                "condition": "service_completed_successfully",
+                "required": True,
+            }
+        }
+        if observed_depends_on != _EXPECTED_DEPENDS_ON[service] and not (
+            service == "whoscored_proxy_filter"
+            and observed_depends_on == legacy_filter_depends_on
+        ):
             raise AdmissionError(f"rendered dependency policy differs: {service}")
         if model.get("deploy") != _EXPECTED_DEPLOY[service]:
             raise AdmissionError(f"rendered resource policy differs: {service}")
@@ -2012,14 +2155,7 @@ def verify_rendered_compose(
         if _forbidden_environment_names(environment, include_empty=True):
             raise AdmissionError(f"rendered environment has loader controls: {service}")
         _validate_rendered_environment(environment, service=service)
-        if service in {
-            "flaresolverr_whoscored_paid",
-            "whoscored_paid_gateway",
-            "whoscored_proxy_filter",
-        }:
-            if model.get("profiles") != ["whoscored-paid"]:
-                raise AdmissionError(f"rendered paid profile differs: {service}")
-        elif model.get("profiles") is not None:
+        if model.get("profiles") not in (None, ["whoscored-paid"]):
             raise AdmissionError(f"rendered protected profile differs: {service}")
         raw_shm_size = model.get("shm_size")
         if service in {"whoscored_paid_gateway", "whoscored_proxy_filter"}:
@@ -2093,7 +2229,13 @@ def verify_rendered_compose(
         volume_policy = {
             target: (kind, read_only) for kind, _source, target, read_only in volumes
         }
-        if volume_policy != _ALLOWED_VOLUME_TARGETS[service]:
+        expected_volume_policy = _ALLOWED_VOLUME_TARGETS[service]
+        legacy_volume_policy = dict(expected_volume_policy)
+        if service == "airflow-scheduler":
+            legacy_volume_policy.pop(
+                "/opt/airflow/secure/whoscored-scheduled-pointers", None
+            )
+        if volume_policy != expected_volume_policy and volume_policy != legacy_volume_policy:
             raise AdmissionError(f"rendered mount-target policy differs: {service}")
         if tmpfs != _ALLOWED_TMPFS[service]:
             raise AdmissionError(f"rendered tmpfs policy differs: {service}")
@@ -2121,6 +2263,8 @@ def verify_rendered_compose(
     if (
         scheduler_environment["WHOSCORED_PAID_GATEWAY_TOKEN"]
         != gateway_environment["WHOSCORED_PAID_GATEWAY_TOKEN"]
+        or scheduler_environment["WHOSCORED_PAID_BATCH_ENABLED"]
+        != gateway_environment["WHOSCORED_PAID_BATCH_ENABLED"]
         or gateway_environment["WHOSCORED_FLARESOLVERR_GATEWAY_SECRET"]
         != paid_browser_environment["WHOSCORED_FLARESOLVERR_GATEWAY_SECRET"]
         or gateway_environment["WHOSCORED_PROXY_CONTROL_TOKEN"]
@@ -2344,6 +2488,225 @@ def render_attested_compose(
             raise AdmissionError(f"Compose config hash is invalid: {service}")
         config_hashes[service] = fields[1]
     return projections, config_hashes, config_files, rendered
+
+
+def _fixed_project_arguments(
+    *,
+    root: Path,
+    project: str,
+    override_path: Path,
+    env_files: Sequence[Path],
+) -> tuple[tuple[str, ...], tuple[Path, ...]]:
+    if project == COMMON_PROJECT:
+        config_files = (
+            root / "compose.yaml",
+            root / "compose.seaweedfs-supervised.yaml",
+            override_path,
+        )
+    elif project == GATEWAY_PROJECT:
+        config_files = (
+            root / "deploy/whoscored/gateway.compose.yaml",
+            override_path,
+        )
+    else:
+        raise AdmissionError("Compose project is not a fixed WhoScored project")
+    all_paths = (*config_files, *env_files)
+    if any(not path.is_absolute() or "," in str(path) for path in all_paths):
+        raise AdmissionError("Compose evidence paths must be absolute and comma-free")
+    if (
+        not env_files
+        or len(env_files) != len(set(env_files))
+        or len(all_paths) != len(set(all_paths))
+    ):
+        raise AdmissionError("Compose env files must be a non-empty unique sequence")
+    for path in all_paths:
+        _read_regular_file(path, label="Compose admission input")
+    arguments: list[str] = [
+        "compose",
+        "--project-name",
+        project,
+        "--project-directory",
+        str(root),
+    ]
+    for env_file in env_files:
+        arguments.extend(("--env-file", str(env_file)))
+    for config_file in config_files:
+        arguments.extend(("--file", str(config_file)))
+    return tuple(arguments), config_files
+
+
+def render_attested_projects(
+    bindings: Mapping[str, str],
+    *,
+    root: Path,
+    common_override_path: Path,
+    gateway_override_path: Path,
+    env_files: Sequence[Path],
+    provider_authority: Mapping[str, object],
+    runner: DockerRunner = _run_docker,
+    protected_inputs: Mapping[Path, bytes] | None = None,
+) -> tuple[
+    dict[str, dict[str, Any]],
+    dict[str, str],
+    dict[str, tuple[Path, ...]],
+    dict[str, dict[str, Any]],
+]:
+    """Render and cross-check the fixed common and paid-gateway projects."""
+
+    verify_override(common_override_path, bindings, COMMON_PROTECTED_SERVICES)
+    verify_override(gateway_override_path, bindings, GATEWAY_PROTECTED_SERVICES)
+    project_specs = {
+        COMMON_PROJECT: (common_override_path, COMMON_PROTECTED_SERVICES),
+        GATEWAY_PROJECT: (gateway_override_path, GATEWAY_PROTECTED_SERVICES),
+    }
+    rendered_projects: dict[str, dict[str, Any]] = {}
+    config_hashes: dict[str, str] = {}
+    config_files_by_project: dict[str, tuple[Path, ...]] = {}
+    snapshots: dict[Path, tuple[bytes, tuple[int, ...]]] = {}
+    for project, (override_path, services) in project_specs.items():
+        prefix, config_files = _fixed_project_arguments(
+            root=root,
+            project=project,
+            override_path=override_path,
+            env_files=env_files,
+        )
+        config_files_by_project[project] = config_files
+        for path in (*config_files, *env_files):
+            snapshots.setdefault(
+                path, _read_regular_file(path, label="Compose admission input")
+            )
+        raw = runner((*prefix, "config", "--format", "json"))
+        try:
+            rendered = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_object)
+        except (_DuplicateKey, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise AdmissionError(
+                f"Docker Compose returned ambiguous rendered JSON: {project}"
+            ) from exc
+        if not isinstance(rendered, dict) or rendered.get("name") != project:
+            raise AdmissionError(f"rendered Compose project identity differs: {project}")
+        rendered_projects[project] = rendered
+        for service in services:
+            raw_hash = runner((*prefix, "config", "--hash", service))
+            try:
+                line = raw_hash.decode("ascii").strip()
+            except UnicodeDecodeError as exc:
+                raise AdmissionError(
+                    f"Compose config hash is non-ASCII: {service}"
+                ) from exc
+            fields = line.split()
+            if (
+                len(fields) != 2
+                or fields[0] != service
+                or _CONFIG_HASH.fullmatch(fields[1]) is None
+            ):
+                raise AdmissionError(f"Compose config hash is invalid: {service}")
+            config_hashes[service] = fields[1]
+    if protected_inputs is not None and (
+        set(protected_inputs) != set(snapshots)
+        or any(
+            not hmac.compare_digest(protected_inputs[path], snapshot[0])
+            for path, snapshot in snapshots.items()
+        )
+    ):
+        raise AdmissionError("protected Compose inputs differ from render snapshots")
+    for path, (expected_raw, expected_identity) in snapshots.items():
+        actual_raw, actual_identity = _read_regular_file(
+            path, label="Compose admission input"
+        )
+        if actual_identity != expected_identity or not hmac.compare_digest(
+            actual_raw, expected_raw
+        ):
+            raise AdmissionError(f"Compose admission input changed: {path}")
+
+    common = rendered_projects[COMMON_PROJECT]
+    gateway = rendered_projects[GATEWAY_PROJECT]
+    common_services = common.get("services")
+    gateway_services = gateway.get("services")
+    if not isinstance(common_services, dict) or not isinstance(gateway_services, dict):
+        raise AdmissionError("rendered split Compose service models differ")
+    if any(service in common_services for service in GATEWAY_PROTECTED_SERVICES):
+        raise AdmissionError("common project owns a paid-gateway service")
+    if set(gateway_services) != set(GATEWAY_PROTECTED_SERVICES):
+        raise AdmissionError("paid-gateway project service boundary differs")
+    if any(service not in common_services for service in COMMON_PROTECTED_SERVICES):
+        raise AdmissionError("common project omits a protected common service")
+    if any(
+        gateway_services[service].get("profiles") is not None
+        for service in GATEWAY_PROTECTED_SERVICES
+    ):
+        raise AdmissionError("paid-gateway project retains an opt-in profile")
+    if gateway_services["whoscored_proxy_filter"].get("depends_on") is not None:
+        raise AdmissionError("paid filter depends on a common-project service")
+    filter_environment = gateway_services["whoscored_proxy_filter"].get("environment")
+    if not isinstance(filter_environment, dict) or any(
+        filter_environment.get(name) != str(provider_authority.get(authority_name))
+        for name, authority_name in (
+            ("WHOSCORED_PROVIDER_ORDER_ID", "order_id"),
+            ("WHOSCORED_PROVIDER_POLICY_SHA256", "provider_policy_sha256"),
+            ("WHOSCORED_PROXY_FILTER_DAILY_BUDGET_BYTES", "daily_cap_bytes"),
+        )
+    ):
+        raise AdmissionError("paid filter does not bind the admitted provider policy")
+    scheduler_model = common_services["airflow-scheduler"]
+    scheduler_environment = scheduler_model.get("environment")
+    if (
+        not isinstance(scheduler_environment, dict)
+        or set(scheduler_environment) != _EXPECTED_ENVIRONMENT_NAMES["airflow-scheduler"]
+        or scheduler_environment.get("WHOSCORED_SCHEDULED_PAID_MODE") != "required"
+        or "WHOSCORED_PROXY_APPROVAL_PATH" in scheduler_environment
+    ):
+        raise AdmissionError("common scheduler paid authority differs")
+    scheduler_volumes = scheduler_model.get("volumes")
+    if not isinstance(scheduler_volumes, list) or not any(
+        isinstance(volume, dict)
+        and volume.get("target")
+        == "/opt/airflow/secure/whoscored-scheduled-pointers"
+        and volume.get("read_only") is True
+        for volume in scheduler_volumes
+    ):
+        raise AdmissionError("common scheduler pointer authority mount differs")
+    common_networks = common.get("networks")
+    gateway_networks = gateway.get("networks")
+    if not isinstance(common_networks, dict) or not isinstance(gateway_networks, dict):
+        raise AdmissionError("rendered split Compose network models differ")
+    if common_networks.get("whoscored-paid-api") != _COMMON_EXTERNAL_NETWORKS[
+        "whoscored-paid-api"
+    ]:
+        raise AdmissionError("common project does not use external paid API network")
+    if set(gateway_networks) != {
+        "whoscored-paid-api",
+        "whoscored-paid-browser",
+        "whoscored-paid-direct-egress",
+        "whoscored-paid-provider-egress",
+    } or any(
+        gateway_networks.get(name) != _EXPECTED_NETWORK_DEFINITIONS[name]
+        for name in gateway_networks
+    ):
+        raise AdmissionError("paid-gateway project network ownership differs")
+    combined = {
+        "services": {
+            **{
+                service: common_services[service]
+                for service in COMMON_PROTECTED_SERVICES
+            },
+            **{
+                service: gateway_services[service]
+                for service in GATEWAY_PROTECTED_SERVICES
+            },
+        },
+        "networks": {
+            **{
+                name: common_networks[name]
+                for name in ("backend", "frontend", "storage")
+            },
+            **{name: gateway_networks[name] for name in gateway_networks},
+        },
+        "volumes": common.get("volumes"),
+    }
+    projections = verify_rendered_compose(combined, bindings)
+    if protected_inputs is not None:
+        _validate_bind_source_policy(projections, root=root)
+    return projections, config_hashes, config_files_by_project, rendered_projects
 
 
 def _docker_object(raw: bytes, *, label: str) -> dict[str, Any]:
@@ -2648,19 +3011,39 @@ def _verify_soccerdata_volume(*, project: str, runner: DockerRunner) -> dict[str
 def verify_created_containers(
     bindings: Mapping[str, str],
     *,
-    project: str,
+    project: str | Mapping[str, str],
     selected_services: Sequence[str],
     projections: Mapping[str, Mapping[str, Any]],
     config_hashes: Mapping[str, str],
-    config_files: Sequence[Path],
+    config_files: Sequence[Path] | Mapping[str, Sequence[Path]],
     env_files: Sequence[Path],
     runner: DockerRunner = _run_docker,
     expected_state: str = "created",
 ) -> dict[str, Any]:
     if set(bindings) != _PROTECTED_SERVICE_SET:
         raise AdmissionError("post-create bindings omit a protected service")
-    if _PROJECT_NAME.fullmatch(project) is None:
-        raise AdmissionError("Compose project name is invalid")
+    split_projects = isinstance(project, Mapping)
+    if split_projects:
+        service_projects = dict(project)
+        if service_projects != _SERVICE_PROJECT:
+            raise AdmissionError("split Compose project ownership differs")
+        if not isinstance(config_files, Mapping) or set(config_files) != {
+            COMMON_PROJECT,
+            GATEWAY_PROJECT,
+        }:
+            raise AdmissionError("split Compose file ownership differs")
+        project_config_files = {
+            name: tuple(paths) for name, paths in config_files.items()
+        }
+        project_directory = project_config_files[COMMON_PROJECT][0].parent
+    else:
+        if not isinstance(project, str) or _PROJECT_NAME.fullmatch(project) is None:
+            raise AdmissionError("Compose project name is invalid")
+        if isinstance(config_files, Mapping):
+            raise AdmissionError("single-project Compose files are invalid")
+        service_projects = {service: project for service in PROTECTED_SERVICES}
+        project_config_files = {project: tuple(config_files)}
+        project_directory = tuple(config_files)[0].parent
     if expected_state not in {"created", "running"}:
         raise AdmissionError("container admission state must be created or running")
     selected = tuple(selected_services)
@@ -2682,7 +3065,6 @@ def verify_created_containers(
         runner=runner,
         image=bindings["airflow-scheduler"],
     )
-    expected_config_files = ",".join(str(path) for path in config_files)
     expected_env_files = ",".join(str(path) for path in env_files)
     logical_networks = sorted(
         {
@@ -2697,18 +3079,25 @@ def verify_created_containers(
         for record in (
             _verify_docker_network(
                 logical_name=logical_name,
-                project=project,
+                project=(
+                    _NETWORK_PROJECT[logical_name]
+                    if split_projects
+                    else service_projects[selected[0]]
+                ),
                 runner=runner,
             ),
         )
     }
     verified_volumes = (
-        [_verify_soccerdata_volume(project=project, runner=runner)]
+        [_verify_soccerdata_volume(project=COMMON_PROJECT, runner=runner)]
         if "airflow-scheduler" in selected
         else []
     )
     verified: list[dict[str, str]] = []
     for service in selected:
+        service_project = service_projects[service]
+        service_config_files = project_config_files[service_project]
+        expected_config_files = ",".join(str(path) for path in service_config_files)
         raw_ids = runner(
             (
                 "container",
@@ -2716,7 +3105,7 @@ def verify_created_containers(
                 "--all",
                 "--no-trunc",
                 "--filter",
-                f"label=com.docker.compose.project={project}",
+                f"label=com.docker.compose.project={service_project}",
                 "--filter",
                 f"label=com.docker.compose.service={service}",
                 "--format",
@@ -2748,7 +3137,7 @@ def verify_created_containers(
         labels = config.get("Labels")
         if (
             not isinstance(labels, dict)
-            or labels.get("com.docker.compose.project") != project
+            or labels.get("com.docker.compose.project") != service_project
             or labels.get("com.docker.compose.service") != service
         ):
             raise AdmissionError(f"container Compose identity differs: {service}")
@@ -2767,7 +3156,7 @@ def verify_created_containers(
         ):
             raise AdmissionError(f"container Compose env-file set differs: {service}")
         if labels.get("com.docker.compose.project.working_dir") != str(
-            config_files[0].parent
+            project_directory
         ):
             raise AdmissionError(
                 f"container Compose working directory differs: {service}"
@@ -2863,12 +3252,12 @@ def verify_created_containers(
             labels,
             image_config.get("Labels"),
             service=service,
-            project=project,
+            project=service_project,
             config_hash=config_hashes[service],
             image_id=image_id,
             config_files=expected_config_files,
             env_files=expected_env_files,
-            working_dir=str(config_files[0].parent),
+            working_dir=str(project_directory),
         )
         expected_environment = _environment_mapping(
             image_config.get("Env"), label=f"image environment for {service}"
@@ -3157,8 +3546,12 @@ def verify_created_containers(
         "docker_security_options": list(docker_security_options),
         "images": verified,
         "networks": list(verified_networks.values()),
-        "project": project,
-        "schema_version": 1,
+        "projects": (
+            {COMMON_PROJECT: list(COMMON_PROTECTED_SERVICES), GATEWAY_PROJECT: list(GATEWAY_PROTECTED_SERVICES)}
+            if split_projects
+            else {str(project): list(selected)}
+        ),
+        "schema_version": 2 if split_projects else 1,
         "status": (
             "admitted-running-v1" if expected_state == "running" else "admitted-v1"
         ),
@@ -3258,11 +3651,175 @@ def _assert_protected_regular_file(path: Path, *, label: str) -> os.stat_result:
     return metadata
 
 
+def _assert_airflow_authority_directory(
+    path: Path, *, label: str
+) -> os.stat_result:
+    """Require one UID-50000 directory writable only by its container owner."""
+
+    if not path.is_absolute() or not path.name:
+        raise AdmissionError(f"{label} must be an absolute directory")
+    parent = -1
+    descriptor = -1
+    try:
+        parent, name = provenance.open_protected_parent(path, label=label)
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=parent,
+        )
+        before = os.fstat(descriptor)
+        entry = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    except (OSError, provenance.ProvenanceError) as exc:
+        raise AdmissionError(
+            f"{label} is missing, unsafe, or symlinked: {path}"
+        ) from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if parent >= 0:
+            os.close(parent)
+    identity = (
+        "st_dev",
+        "st_ino",
+        "st_mode",
+        "st_uid",
+        "st_gid",
+        "st_mtime_ns",
+        "st_ctime_ns",
+    )
+    if (
+        before.st_uid != _AIRFLOW_RUNTIME_UID
+        or before.st_gid != 0
+        or stat.S_IMODE(before.st_mode) not in {0o700, 0o750}
+        or any(getattr(before, field) != getattr(entry, field) for field in identity)
+    ):
+        raise AdmissionError(
+            f"{label} must be owned by {_AIRFLOW_RUNTIME_UID}:0 with mode "
+            f"0700 or 0750: {path}"
+        )
+    return before
+
+
 def _provider_receipt_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def validate_provider_quota_receipt(path: Path) -> dict[str, str | int]:
+def _provider_policy_utc(value: object, *, field: str) -> datetime:
+    if not isinstance(value, str):
+        raise AdmissionError(f"provider policy {field} is invalid")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise AdmissionError(f"provider policy {field} is invalid") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
+        raise AdmissionError(f"provider policy {field} is not UTC")
+    return parsed.astimezone(timezone.utc)
+
+
+def validate_provider_policy(
+    path: Path, *, owner_secret_path: Path
+) -> dict[str, str | int]:
+    """Verify one owner-signed provider-policy-v1 without projecting its key."""
+
+    _canonical_existing_path(path, label="provider policy")
+    _canonical_existing_path(owner_secret_path, label="provider-policy owner key")
+    try:
+        raw = provenance.read_protected_regular_file(path, label="provider policy")
+        secret_raw = provenance.read_protected_regular_file(
+            owner_secret_path, label="provider-policy owner key"
+        )
+        secret = secret_raw.decode("utf-8").strip()
+        value = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_object)
+    except (
+        _DuplicateKey,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        provenance.ProvenanceError,
+    ) as exc:
+        raise AdmissionError("provider policy/key is not protected strict data") from exc
+    if len(secret.encode("utf-8")) < 32:
+        raise AdmissionError("provider-policy owner key is too short")
+    if (
+        not isinstance(value, dict)
+        or frozenset(value) != _PROVIDER_POLICY_FIELDS
+        or raw != _canonical_bytes(value)
+    ):
+        raise AdmissionError("provider policy is not canonical provider-policy-v1")
+    unsigned = {field: value[field] for field in _PROVIDER_POLICY_UNSIGNED_FIELDS}
+    digest = hashlib.sha256(_canonical_bytes(unsigned)).hexdigest()
+    signed_body = {**unsigned, "document_sha256": digest}
+    signature = hmac.new(
+        secret.encode("utf-8"), _canonical_bytes(signed_body), hashlib.sha256
+    ).hexdigest()
+    if (
+        value.get("schema_version") != 1
+        or value.get("source") != "whoscored"
+        or value.get("signature_algorithm") != "hmac-sha256"
+        or not isinstance(value.get("document_sha256"), str)
+        or not hmac.compare_digest(str(value["document_sha256"]), digest)
+        or not isinstance(value.get("signature"), str)
+        or not hmac.compare_digest(str(value["signature"]), signature)
+    ):
+        raise AdmissionError("provider policy digest/signature is invalid")
+    token = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+    for field in ("provider_id", "order_id", "plan_id"):
+        if not isinstance(value.get(field), str) or token.fullmatch(str(value[field])) is None:
+            raise AdmissionError(f"provider policy {field} is invalid")
+    valid_from = _provider_policy_utc(value.get("valid_from"), field="valid_from")
+    valid_until = _provider_policy_utc(value.get("valid_until"), field="valid_until")
+    now = _provider_receipt_now()
+    if not valid_from <= now < valid_until:
+        raise AdmissionError("provider policy is not active")
+    caps: list[int] = []
+    for field in (
+        "daily_cap_bytes",
+        "monthly_cap_bytes",
+        "order_cap_bytes",
+        "safety_cap_bytes",
+        "provider_quota_bytes",
+    ):
+        item = value.get(field)
+        if isinstance(item, bool) or not isinstance(item, int) or item <= 0:
+            raise AdmissionError(f"provider policy {field} is invalid")
+        caps.append(item)
+    if caps != sorted(caps):
+        raise AdmissionError("provider policy quota/safety caps are inconsistent")
+    receipt_sha256 = value.get("receipt_sha256")
+    if not isinstance(receipt_sha256, str) or _DIGEST.fullmatch(receipt_sha256) is None:
+        raise AdmissionError("provider policy receipt digest is invalid")
+    return {
+        "daily_cap_bytes": int(value["daily_cap_bytes"]),
+        "document_sha256": digest,
+        "monthly_cap_bytes": int(value["monthly_cap_bytes"]),
+        "order_cap_bytes": int(value["order_cap_bytes"]),
+        "order_id": str(value["order_id"]),
+        "plan_id": str(value["plan_id"]),
+        "policy_path": str(path),
+        "provider_id": str(value["provider_id"]),
+        "provider_quota_bytes": int(value["provider_quota_bytes"]),
+        "receipt_sha256": receipt_sha256,
+        "safety_cap_bytes": int(value["safety_cap_bytes"]),
+    }
+
+
+def _decimal_gigabytes_to_bytes(value: object, *, field: str) -> int:
+    if not isinstance(value, str) or re.fullmatch(r"[0-9]+\.[0-9]{2}", value) is None:
+        raise AdmissionError(f"provider quota receipt {field} is invalid")
+    try:
+        result = Decimal(value) * Decimal(1_000_000_000)
+    except InvalidOperation as exc:
+        raise AdmissionError(f"provider quota receipt {field} is invalid") from exc
+    if result != result.to_integral_value() or result < 0:
+        raise AdmissionError(f"provider quota receipt {field} is invalid")
+    return int(result)
+
+
+def validate_provider_quota_receipt(
+    path: Path,
+    *,
+    provider_policy_path: Path | None = None,
+    owner_secret_path: Path | None = None,
+) -> dict[str, str | int]:
     """Bind admission to fresh, credential-free provider quota evidence."""
 
     _canonical_existing_path(path, label="provider quota receipt")
@@ -3284,17 +3841,50 @@ def validate_provider_quota_receipt(path: Path) -> dict[str, str | int]:
         or raw != _canonical_bytes(document)
     ):
         raise AdmissionError("provider quota receipt is not canonical JSON")
-    expected = {
-        "schema_version": 1,
-        "status": "active",
-        "provider": "PROXYS.IO",
-        "order_id": "38950",
-        "plan": "Bronze",
-        "quota_decimal_gb": "1.00",
-        "remaining_decimal_gb": "1.00",
-    }
+    if (provider_policy_path is None) != (owner_secret_path is None):
+        raise AdmissionError("provider policy and owner key must be supplied together")
+    policy = (
+        validate_provider_policy(
+            provider_policy_path, owner_secret_path=owner_secret_path
+        )
+        if provider_policy_path is not None and owner_secret_path is not None
+        else None
+    )
+    if policy is None:
+        expected = {
+            "schema_version": 1,
+            "status": "active",
+            "provider": "PROXYS.IO",
+            "order_id": "38950",
+            "plan": "Bronze",
+            "quota_decimal_gb": "1.00",
+            "remaining_decimal_gb": "1.00",
+        }
+    else:
+        expected = {
+            "schema_version": 1,
+            "status": "active",
+            "provider": policy["provider_id"],
+            "order_id": policy["order_id"],
+            "plan": policy["plan_id"],
+        }
     if any(document.get(name) != value for name, value in expected.items()):
         raise AdmissionError("provider quota receipt does not prove the exact order")
+    receipt_digest = hashlib.sha256(raw).hexdigest()
+    if policy is not None:
+        quota_bytes = _decimal_gigabytes_to_bytes(
+            document.get("quota_decimal_gb"), field="quota_decimal_gb"
+        )
+        remaining_bytes = _decimal_gigabytes_to_bytes(
+            document.get("remaining_decimal_gb"), field="remaining_decimal_gb"
+        )
+        if (
+            not hmac.compare_digest(str(policy["receipt_sha256"]), receipt_digest)
+            or quota_bytes != policy["provider_quota_bytes"]
+            or remaining_bytes > quota_bytes
+            or remaining_bytes < policy["safety_cap_bytes"]
+        ):
+            raise AdmissionError("provider quota receipt differs from signed policy")
     observed_raw = document.get("observed_at")
     if (
         type(observed_raw) is not str
@@ -3335,13 +3925,86 @@ def validate_provider_quota_receipt(path: Path) -> dict[str, str | int]:
     ).replace(microsecond=0)
     if screenshot_time != observed_at:
         raise AdmissionError("provider quota screenshot time differs from receipt")
-    return {
+    projection: dict[str, str | int] = {
         **expected,
         "observed_at": observed_raw,
         "receipt_path": str(path),
-        "receipt_sha256": hashlib.sha256(raw).hexdigest(),
+        "receipt_sha256": receipt_digest,
         "screenshot_path": str(screenshot),
         "screenshot_sha256": screenshot_sha256,
+    }
+    if policy is not None:
+        projection.update(
+            {
+                "provider_policy_path": str(policy["policy_path"]),
+                "provider_policy_sha256": str(policy["document_sha256"]),
+                "daily_cap_bytes": int(policy["daily_cap_bytes"]),
+                "monthly_cap_bytes": int(policy["monthly_cap_bytes"]),
+                "order_cap_bytes": int(policy["order_cap_bytes"]),
+                "provider_quota_bytes": int(policy["provider_quota_bytes"]),
+                "safety_cap_bytes": int(policy["safety_cap_bytes"]),
+            }
+        )
+    return projection
+
+
+def validate_deployment_admission_receipt(
+    path: Path,
+    *,
+    deployment_attestation_path: Path,
+    provider_policy: Mapping[str, str | int],
+) -> dict[str, str]:
+    """Bind unattended running checks to the deploy-time fresh-receipt gate."""
+
+    _canonical_existing_path(path, label="deployment admission receipt")
+    try:
+        raw = provenance.read_protected_regular_file(
+            path, label="deployment admission receipt"
+        )
+        value = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_object)
+        deployment_raw = provenance.read_protected_regular_file(
+            deployment_attestation_path, label="deployment attestation"
+        )
+    except (
+        _DuplicateKey,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        provenance.ProvenanceError,
+    ) as exc:
+        raise AdmissionError(
+            "deployment admission receipt is not protected strict data"
+        ) from exc
+    if not isinstance(value, dict) or raw != _canonical_bytes(value):
+        raise AdmissionError("deployment admission receipt is not canonical JSON")
+    attestation = value.get("deployment_attestation")
+    quota = value.get("provider_quota_receipt")
+    if (
+        value.get("schema_version") != 2
+        or value.get("status") != "rendered-admitted-v2"
+        or value.get("projects")
+        != {
+            COMMON_PROJECT: list(COMMON_PROTECTED_SERVICES),
+            GATEWAY_PROJECT: list(GATEWAY_PROTECTED_SERVICES),
+        }
+        or not isinstance(attestation, dict)
+        or attestation
+        != {
+            "path": str(deployment_attestation_path),
+            "sha256": hashlib.sha256(deployment_raw).hexdigest(),
+        }
+        or not isinstance(quota, dict)
+        or quota.get("provider_policy_sha256")
+        != provider_policy.get("document_sha256")
+        or quota.get("receipt_sha256") != provider_policy.get("receipt_sha256")
+        or quota.get("order_id") != provider_policy.get("order_id")
+        or quota.get("daily_cap_bytes") != provider_policy.get("daily_cap_bytes")
+    ):
+        raise AdmissionError(
+            "deployment admission receipt differs from attestation/provider policy"
+        )
+    return {
+        "path": str(path),
+        "sha256": hashlib.sha256(raw).hexdigest(),
     }
 
 
@@ -3433,6 +4096,12 @@ def _validate_bind_source_policy(
         for service, targets in _RELEASE_BIND_TARGETS.items()
         for target in targets
     } | set(_RUNTIME_HOST_BIND_TARGETS)
+    pointer_identity = (
+        "airflow-scheduler",
+        "/opt/airflow/secure/whoscored-scheduled-pointers",
+    )
+    if pointer_identity not in sources:
+        expected.discard(pointer_identity)
     if set(sources) != expected:
         raise AdmissionError("rendered bind-source policy differs")
     for service, targets in _RELEASE_BIND_TARGETS.items():
@@ -3452,6 +4121,8 @@ def _validate_bind_source_policy(
                     source, label=f"release code file for {service} {target}"
                 )
     for identity, policy in _RUNTIME_HOST_BIND_TARGETS.items():
+        if identity == pointer_identity and identity not in sources:
+            continue
         source = sources[identity]
         _canonical_existing_path(
             source, label=f"runtime bind {identity[0]} {identity[1]}"
@@ -3459,6 +4130,11 @@ def _validate_bind_source_policy(
         if policy == "writable-directory":
             _assert_writable_runtime_directory(
                 source, label=f"runtime state directory for {identity[0]} {identity[1]}"
+            )
+        elif policy == "airflow-authority-directory":
+            _assert_airflow_authority_directory(
+                source,
+                label=f"Airflow authority directory for {identity[0]} {identity[1]}",
             )
         elif policy == "protected-directory":
             _assert_protected_directory(
@@ -3496,8 +4172,7 @@ def _validate_bind_source_policy(
         },
         label="WhoScored writable state",
     )
-    _assert_separate_mounts(
-        {
+    authority_mounts = {
             "scheduler-approvals": sources[
                 ("airflow-scheduler", "/opt/airflow/secure/whoscored-approvals")
             ],
@@ -3507,9 +4182,10 @@ def _validate_bind_source_policy(
                     "/opt/airflow/secure/whoscored-alert-authority",
                 )
             ],
-        },
-        label="WhoScored authority",
-    )
+    }
+    if pointer_identity in sources:
+        authority_mounts["scheduler-pointers"] = sources[pointer_identity]
+    _assert_separate_mounts(authority_mounts, label="WhoScored authority")
 
 
 def _common_parser() -> argparse.ArgumentParser:
@@ -3526,19 +4202,34 @@ def _parser() -> argparse.ArgumentParser:
     common = _common_parser()
     commands = parser.add_subparsers(dest="command", required=True)
     generate = commands.add_parser("generate-override", parents=[common])
-    generate.add_argument("--output", type=Path, required=True)
+    generate.add_argument("--common-output", type=Path, required=True)
+    generate.add_argument("--gateway-output", type=Path, required=True)
     rendered = commands.add_parser("verify-rendered", parents=[common])
-    rendered.add_argument("--override", type=Path, required=True)
+    rendered.add_argument("--common-override", type=Path, required=True)
+    rendered.add_argument("--gateway-override", type=Path, required=True)
     rendered.add_argument("--env-file", type=Path, action="append", required=True)
-    rendered.add_argument("--project", required=True)
+    rendered.add_argument("--provider-policy", type=Path, required=True)
+    rendered.add_argument("--owner-secret-file", type=Path, required=True)
     rendered.add_argument("--provider-quota-receipt", type=Path, required=True)
     rendered.add_argument("--output", type=Path, required=True)
     created = commands.add_parser("post-create", parents=[common])
-    created.add_argument("--override", type=Path, required=True)
+    created.add_argument("--common-override", type=Path, required=True)
+    created.add_argument("--gateway-override", type=Path, required=True)
     created.add_argument("--env-file", type=Path, action="append", required=True)
-    created.add_argument("--project", required=True)
+    created.add_argument("--provider-policy", type=Path, required=True)
+    created.add_argument("--owner-secret-file", type=Path, required=True)
     created.add_argument("--provider-quota-receipt", type=Path, required=True)
     created.add_argument("--service", action="append", required=True)
+    running = commands.add_parser("verify-running", parents=[common])
+    running.add_argument("--common-override", type=Path, required=True)
+    running.add_argument("--gateway-override", type=Path, required=True)
+    running.add_argument("--env-file", type=Path, action="append", required=True)
+    running.add_argument("--provider-policy", type=Path, required=True)
+    running.add_argument("--owner-secret-file", type=Path, required=True)
+    running.add_argument(
+        "--deployment-admission-receipt", type=Path, required=True
+    )
+    running.add_argument("--service", action="append", required=True)
     return parser
 
 
@@ -3578,61 +4269,127 @@ def main(argv: Sequence[str] | None = None) -> int:
             deployment_attestation_path=deployment,
         )
         if args.command == "generate-override":
+            common_output = _absolute(args.common_output)
+            gateway_output = _absolute(args.gateway_output)
+            if common_output == gateway_output:
+                raise AdmissionError("split Compose overrides must be distinct")
             write_new_regular_file(
-                _absolute(args.output), compose_override_bytes(bindings)
+                common_output,
+                compose_override_bytes(bindings, COMMON_PROTECTED_SERVICES),
+            )
+            write_new_regular_file(
+                gateway_output,
+                compose_override_bytes(bindings, GATEWAY_PROTECTED_SERVICES),
             )
             report: dict[str, Any] = {
-                "output": str(_absolute(args.output)),
-                "schema_version": 1,
-                "services": list(PROTECTED_SERVICES),
-                "status": "override-created-v1",
+                "outputs": {
+                    COMMON_PROJECT: str(common_output),
+                    GATEWAY_PROJECT: str(gateway_output),
+                },
+                "projects": {
+                    COMMON_PROJECT: list(COMMON_PROTECTED_SERVICES),
+                    GATEWAY_PROJECT: list(GATEWAY_PROTECTED_SERVICES),
+                },
+                "schema_version": 2,
+                "status": "overrides-created-v2",
             }
         else:
-            provider_quota_receipt = validate_provider_quota_receipt(
-                _absolute(args.provider_quota_receipt)
+            provider_policy = validate_provider_policy(
+                _absolute(args.provider_policy),
+                owner_secret_path=_absolute(args.owner_secret_file),
             )
-            override = _absolute(args.override)
+            provider_authority: dict[str, str | int] = {
+                **provider_policy,
+                "provider_policy_sha256": str(provider_policy["document_sha256"]),
+            }
+            provider_quota_receipt: dict[str, str | int] | None = None
+            deployment_admission_receipt: dict[str, str] | None = None
+            if args.command == "verify-running":
+                deployment_admission_receipt = (
+                    validate_deployment_admission_receipt(
+                        _absolute(args.deployment_admission_receipt),
+                        deployment_attestation_path=deployment,
+                        provider_policy=provider_policy,
+                    )
+                )
+            else:
+                provider_quota_receipt = validate_provider_quota_receipt(
+                    _absolute(args.provider_quota_receipt),
+                    provider_policy_path=_absolute(args.provider_policy),
+                    owner_secret_path=_absolute(args.owner_secret_file),
+                )
+                provider_authority = provider_quota_receipt
+            common_override = _absolute(args.common_override)
+            gateway_override = _absolute(args.gateway_override)
+            if common_override == gateway_override:
+                raise AdmissionError("split Compose overrides must be distinct")
             env_files = tuple(_absolute(path) for path in args.env_file)
             protected_inputs = _assert_protected_compose_inputs(
                 (
                     root / "compose.yaml",
                     root / "compose.seaweedfs-supervised.yaml",
-                    override,
+                    root / "deploy/whoscored/gateway.compose.yaml",
+                    common_override,
+                    gateway_override,
                     *env_files,
                 )
             )
             projections, config_hashes, config_files, rendered = (
-                render_attested_compose(
+                render_attested_projects(
                     bindings,
                     root=root,
-                    override_path=override,
+                    common_override_path=common_override,
+                    gateway_override_path=gateway_override,
                     env_files=env_files,
-                    project=args.project,
+                    provider_authority=provider_authority,
                     protected_inputs=protected_inputs,
                 )
             )
             if args.command == "verify-rendered":
+                assert provider_quota_receipt is not None
                 output = _absolute(args.output)
                 write_new_regular_file(output, _canonical_bytes(rendered))
                 report = {
                     "config_hashes": config_hashes,
+                    "deployment_attestation": {
+                        "path": str(deployment),
+                        "sha256": hashlib.sha256(
+                            provenance.read_protected_regular_file(
+                                deployment, label="deployment attestation"
+                            )
+                        ).hexdigest(),
+                    },
                     "output": str(output),
                     "provider_quota_receipt": provider_quota_receipt,
-                    "schema_version": 1,
-                    "services": list(PROTECTED_SERVICES),
-                    "status": "rendered-admitted-v1",
+                    "projects": {
+                        COMMON_PROJECT: list(COMMON_PROTECTED_SERVICES),
+                        GATEWAY_PROJECT: list(GATEWAY_PROTECTED_SERVICES),
+                    },
+                    "schema_version": 2,
+                    "status": "rendered-admitted-v2",
                 }
             else:
                 report = verify_created_containers(
                     bindings,
-                    project=args.project,
+                    project=_SERVICE_PROJECT,
                     selected_services=args.service,
                     projections=projections,
                     config_hashes=config_hashes,
                     config_files=config_files,
                     env_files=env_files,
+                    expected_state=(
+                        "running" if args.command == "verify-running" else "created"
+                    ),
                 )
-                report["provider_quota_receipt"] = provider_quota_receipt
+                if args.command == "verify-running":
+                    assert deployment_admission_receipt is not None
+                    report["deployment_admission_receipt"] = (
+                        deployment_admission_receipt
+                    )
+                    report["provider_policy"] = provider_policy
+                else:
+                    assert provider_quota_receipt is not None
+                    report["provider_quota_receipt"] = provider_quota_receipt
     except AdmissionError as exc:
         print(f"WhoScored production admission blocked: {exc}", file=sys.stderr)
         return EXIT_CONFIG

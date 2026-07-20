@@ -74,26 +74,55 @@ def _production_deployment(tmp_path: Path) -> capacity.ProductionDeployment:
     deployment_attestation = tmp_path / "deployment-attestation.json"
     deployment_attestation.write_text('{"status":"ready-v1"}\n')
     deployment_attestation.chmod(0o600)
-    digest_override = tmp_path / "digest-only.yaml"
-    digest_override.write_text("services: {}\n")
-    digest_override.chmod(0o600)
+    common_override = tmp_path / "common-digest-only.yaml"
+    gateway_override = tmp_path / "gateway-digest-only.yaml"
+    provider_policy = tmp_path / "provider-policy.json"
+    owner_secret = tmp_path / "owner-hmac"
+    deployment_admission_receipt = tmp_path / "rendered-receipt.json"
+    for path, payload in (
+        (common_override, "services: {}\n"),
+        (gateway_override, "services: {}\n"),
+        (provider_policy, '{"document_sha256":"' + "e" * 64 + '"}\n'),
+        (owner_secret, "o" * 64 + "\n"),
+        (deployment_admission_receipt, '{"status":"rendered-admitted-v2"}\n'),
+    ):
+        path.write_text(payload)
+        path.chmod(0o600)
     attestation_snapshot = capacity._protected_input_snapshot(
         deployment_attestation,
         label="deployment-attestation",
         private=True,
     )
-    override_snapshot = capacity._protected_input_snapshot(
-        digest_override,
-        label=f"compose:{digest_override.name}",
+    common_override_snapshot = capacity._protected_input_snapshot(
+        common_override, label="common-digest-override", private=True
+    )
+    gateway_override_snapshot = capacity._protected_input_snapshot(
+        gateway_override, label="gateway-digest-override", private=True
+    )
+    policy_snapshot = capacity._protected_input_snapshot(
+        provider_policy, label="provider-policy", private=True
+    )
+    owner_snapshot = capacity._protected_input_snapshot(
+        owner_secret, label="provider-policy-owner-key", private=True
+    )
+    deployment_admission_snapshot = capacity._protected_input_snapshot(
+        deployment_admission_receipt,
+        label="deployment-admission-receipt",
         private=True,
     )
     return capacity.ProductionDeployment(
         deployment_attestation_path=deployment_attestation,
         deployment_attestation_sha256=attestation_snapshot.sha256,
         deployment_attestation_identity=attestation_snapshot.identity,
-        digest_override_path=digest_override,
-        digest_override_sha256=override_snapshot.sha256,
-        digest_override_identity=override_snapshot.identity,
+        common_digest_override_path=common_override,
+        common_digest_override_sha256=common_override_snapshot.sha256,
+        common_digest_override_identity=common_override_snapshot.identity,
+        gateway_digest_override_path=gateway_override,
+        gateway_digest_override_sha256=gateway_override_snapshot.sha256,
+        gateway_digest_override_identity=gateway_override_snapshot.identity,
+        provider_policy_path=provider_policy,
+        owner_secret_file_path=owner_secret,
+        deployment_admission_receipt_path=deployment_admission_receipt,
         release_revision="a" * 40,
         payload_revision="c" * 40,
         provenance_manifest_sha256="b" * 64,
@@ -118,12 +147,26 @@ def _production_deployment(tmp_path: Path) -> capacity.ProductionDeployment:
                 for service in capacity.ADMITTED_RUNNING_SERVICES
             ],
             "networks": [],
-            "project": capacity.REQUIRED_COMPOSE_PROJECT,
-            "schema_version": 1,
+            "projects": {
+                "data-platform": ["airflow-scheduler", "flaresolverr"],
+                "whoscored-gw": [
+                    "flaresolverr_whoscored_paid",
+                    "whoscored_paid_gateway",
+                    "whoscored_proxy_filter",
+                ],
+            },
+            "schema_version": 2,
             "status": "admitted-running-v1",
             "volumes": [],
         },
-        protected_inputs=(attestation_snapshot, override_snapshot),
+        protected_inputs=(
+            attestation_snapshot,
+            common_override_snapshot,
+            gateway_override_snapshot,
+            policy_snapshot,
+            owner_snapshot,
+            deployment_admission_snapshot,
+        ),
     )
 
 
@@ -145,9 +188,19 @@ def _deployment_bridge_document(
         label="deployment-attestation",
         private=True,
     )
-    override = capacity._protected_input_snapshot(
-        deployment.digest_override_path,
-        label=f"compose:{deployment.digest_override_path.name}",
+    common_override = capacity._protected_input_snapshot(
+        deployment.common_digest_override_path,
+        label="common-digest-override",
+        private=True,
+    )
+    gateway_override = capacity._protected_input_snapshot(
+        deployment.gateway_digest_override_path,
+        label="gateway-digest-override",
+        private=True,
+    )
+    deployment_admission = capacity._protected_input_snapshot(
+        deployment.deployment_admission_receipt_path,
+        label="deployment-admission-receipt",
         private=True,
     )
     return {
@@ -157,8 +210,18 @@ def _deployment_bridge_document(
         "build_manifest_sha256": build_manifest.sha256,
         "deployment_attestation_identity": list(attestation.identity),
         "deployment_attestation_sha256": attestation.sha256,
-        "digest_override_identity": list(override.identity),
-        "digest_override_sha256": override.sha256,
+        "common_digest_override_identity": list(common_override.identity),
+        "common_digest_override_sha256": common_override.sha256,
+        "gateway_digest_override_identity": list(gateway_override.identity),
+        "gateway_digest_override_sha256": gateway_override.sha256,
+        "deployment_admission_receipt": {
+            "path": str(deployment.deployment_admission_receipt_path),
+            "sha256": deployment_admission.sha256,
+        },
+        "provider_policy": {
+            "document_sha256": "e" * 64,
+            "policy_path": str(deployment.provider_policy_path),
+        },
         "protected_bindings": dict(deployment.protected_bindings),
         "protected_config_hashes": dict(deployment.protected_config_hashes),
         "protected_payload_image_ids": dict(
@@ -185,11 +248,31 @@ def _args(**overrides: Any) -> Namespace:
         "flaresolverr_url": "http://127.0.0.1:8191",
         "containers": ["flaresolverr", "proxy_filter"],
         "deployment_attestation": Path("/evidence/deployment-attestation.json"),
-        "digest_override": Path("/evidence/digest-only.yaml"),
+        "common_digest_override": Path("/evidence/common-digest-only.yaml"),
+        "gateway_digest_override": Path("/evidence/gateway-digest-only.yaml"),
+        "provider_policy": Path("/evidence/provider-policy.json"),
+        "owner_secret_file": Path("/evidence/owner-hmac"),
+        "deployment_admission_receipt": Path("/evidence/rendered-receipt.json"),
         "output": None,
     }
     values.update(overrides)
     return Namespace(**values)
+
+
+def _args_for_deployment(
+    deployment: capacity.ProductionDeployment, **overrides: Any
+) -> Namespace:
+    return _args(
+        deployment_attestation=deployment.deployment_attestation_path,
+        common_digest_override=deployment.common_digest_override_path,
+        gateway_digest_override=deployment.gateway_digest_override_path,
+        provider_policy=deployment.provider_policy_path,
+        owner_secret_file=deployment.owner_secret_file_path,
+        deployment_admission_receipt=(
+            deployment.deployment_admission_receipt_path
+        ),
+        **overrides,
+    )
 
 
 def _parse_cli(*arguments: str) -> Namespace:
@@ -197,8 +280,16 @@ def _parse_cli(*arguments: str) -> Namespace:
         [
             "--deployment-attestation",
             "/evidence/deployment-attestation.json",
-            "--digest-override",
-            "/evidence/digest-only.yaml",
+            "--common-digest-override",
+            "/evidence/common-digest-only.yaml",
+            "--gateway-digest-override",
+            "/evidence/gateway-digest-only.yaml",
+            "--provider-policy",
+            "/evidence/provider-policy.json",
+            "--owner-secret-file",
+            "/evidence/owner-hmac",
+            "--deployment-admission-receipt",
+            "/evidence/rendered-receipt.json",
             *arguments,
         ]
     )
@@ -1007,7 +1098,7 @@ def test_host_docker_inspector_binds_restart_oom_and_pid_evidence(
                 capacity._protected_input_snapshot(
                     path,
                     label=f"compose:{path.name}",
-                    private=path == deployment.digest_override_path
+                    private=path == deployment.common_digest_override_path
                     or path in environment_files,
                 )
                 for path in (*deployment.compose_files, *environment_files)
@@ -1146,15 +1237,15 @@ def test_host_docker_inspector_binds_restart_oom_and_pid_evidence(
     assert observed["calls"][1][0] == [
         "/usr/bin/docker",
         "compose",
-        "--project-name",
-        capacity.REQUIRED_COMPOSE_PROJECT,
+            "--project-name",
+            capacity.REQUIRED_COMPOSE_PROJECT,
+            "--project-directory",
+            str(capacity.REPO_ROOT),
         *[
             argument
             for path in environment_files
             for argument in ("--env-file", str(path))
         ],
-        "--profile",
-        "whoscored-paid",
         *[
             argument
             for path in deployment.compose_files
@@ -1324,10 +1415,7 @@ def test_production_deployment_validation_uses_exact_admission_bridge(
     monkeypatch, tmp_path
 ):
     expected = _production_deployment(tmp_path)
-    args = _args(
-        deployment_attestation=expected.deployment_attestation_path,
-        digest_override=expected.digest_override_path,
-    )
+    args = _args_for_deployment(expected)
     observed = {}
 
     def fake_run(argv, **kwargs):
@@ -1344,7 +1432,14 @@ def test_production_deployment_validation_uses_exact_admission_bridge(
     actual = capacity._validate_production_deployment(args)
 
     assert actual.deployment_attestation_path == expected.deployment_attestation_path
-    assert actual.digest_override_path == expected.digest_override_path
+    assert (
+        actual.common_digest_override_path
+        == expected.common_digest_override_path
+    )
+    assert (
+        actual.gateway_digest_override_path
+        == expected.gateway_digest_override_path
+    )
     assert actual.release_revision == expected.release_revision
     assert actual.payload_revision == expected.payload_revision
     assert actual.flaresolverr_image_reference == (
@@ -1354,7 +1449,7 @@ def test_production_deployment_validation_uses_exact_admission_bridge(
     assert actual.protected_payload_image_ids == expected.protected_payload_image_ids
     assert actual.protected_config_hashes == expected.protected_config_hashes
     assert actual.running_admission == expected.running_admission
-    assert len(actual.protected_inputs) == 9
+    assert len(actual.protected_inputs) == 14
     assert observed["argv"][:4] == ["/usr/bin/python3", "-I", "-S", "-c"]
     assert observed["argv"][5:] == [
         str(capacity.PRODUCTION_ADMISSION_SCRIPT),
@@ -1362,13 +1457,17 @@ def test_production_deployment_validation_uses_exact_admission_bridge(
         str(capacity.PRODUCTION_BUILD_ATTESTATION),
         str(capacity.PRODUCTION_BUILD_MANIFEST),
         str(expected.deployment_attestation_path),
-        str(expected.digest_override_path),
+        str(expected.common_digest_override_path),
+        str(expected.gateway_digest_override_path),
+        str(expected.provider_policy_path),
+        str(expected.owner_secret_file_path),
+        str(expected.deployment_admission_receipt_path),
         *(str(path) for path in capacity.PRODUCTION_COMPOSE_ENV_FILES),
     ]
     assert "validate_bindings_with_evidence" in observed["argv"][4]
     assert "verify_override_snapshot" in observed["argv"][4]
     assert "_assert_protected_compose_inputs" in observed["argv"][4]
-    assert "render_attested_compose" in observed["argv"][4]
+    assert "render_attested_projects" in observed["argv"][4]
     assert "verify_created_containers" in observed["argv"][4]
     assert 'selected_services=("airflow-scheduler", "flaresolverr")' in (
         observed["argv"][4]
@@ -1398,7 +1497,7 @@ def test_production_deployment_validation_uses_exact_admission_bridge(
             json.dumps(
                 {
                     "deployment_attestation_sha256": "a" * 64,
-                    "digest_override_sha256": "b" * 64,
+                    "common_digest_override_sha256": "b" * 64,
                     "flaresolverr_image_reference": "mutable:latest",
                 }
             ),
@@ -1411,10 +1510,7 @@ def test_production_deployment_validation_fails_closed(
     monkeypatch, tmp_path, returncode, stdout, stderr, error
 ):
     expected = _production_deployment(tmp_path)
-    args = _args(
-        deployment_attestation=expected.deployment_attestation_path,
-        digest_override=expected.digest_override_path,
-    )
+    args = _args_for_deployment(expected)
     monkeypatch.setattr(
         capacity.subprocess,
         "run",
@@ -1479,10 +1575,7 @@ def test_production_deployment_bridge_rejects_incomplete_running_identity(
             stderr="",
         ),
     )
-    args = _args(
-        deployment_attestation=expected.deployment_attestation_path,
-        digest_override=expected.digest_override_path,
-    )
+    args = _args_for_deployment(expected)
 
     with pytest.raises(RuntimeError, match="running admission|invalid bindings"):
         capacity._validate_production_deployment(args)
@@ -2405,7 +2498,16 @@ def test_default_cli_is_six_hours_four_workers_and_requires_container_evidence()
     assert args.deployment_attestation == Path(
         "/evidence/deployment-attestation.json"
     )
-    assert args.digest_override == Path("/evidence/digest-only.yaml")
+    assert args.common_digest_override == Path(
+        "/evidence/common-digest-only.yaml"
+    )
+    assert args.gateway_digest_override == Path(
+        "/evidence/gateway-digest-only.yaml"
+    )
+    assert args.provider_policy == Path("/evidence/provider-policy.json")
+    assert args.deployment_admission_receipt == Path(
+        "/evidence/rendered-receipt.json"
+    )
     assert capacity._validate_args(args) is None
 
 
@@ -4330,10 +4432,7 @@ def test_runtime_identity_binds_external_deployment_evidence(monkeypatch, tmp_pa
         return SimpleNamespace(stdout=stdout)
 
     monkeypatch.setattr(capacity.subprocess, "run", fake_git)
-    args = _args(
-        deployment_attestation=deployment.deployment_attestation_path,
-        digest_override=deployment.digest_override_path,
-    )
+    args = _args_for_deployment(deployment)
 
     identity = capacity._runtime_identity(args, deployment=deployment)
 
@@ -4341,12 +4440,15 @@ def test_runtime_identity_binds_external_deployment_evidence(monkeypatch, tmp_pa
     assert identity["file_sha256"]["external:deployment-attestation"] == (
         deployment.deployment_attestation_sha256
     )
-    assert identity["file_sha256"][
-        f"external:compose:{deployment.digest_override_path.name}"
-    ] == (
-        deployment.digest_override_sha256
+    assert identity["file_sha256"]["external:common-digest-override"] == (
+        deployment.common_digest_override_sha256
     )
-    deployment.digest_override_path.write_text("services: {changed: true}\n")
+    assert identity["file_sha256"]["external:gateway-digest-override"] == (
+        deployment.gateway_digest_override_sha256
+    )
+    deployment.common_digest_override_path.write_text(
+        "services: {changed: true}\n"
+    )
     with pytest.raises(RuntimeError, match="deployment evidence changed"):
         capacity._runtime_identity(args, deployment=deployment)
 

@@ -28,7 +28,11 @@ from typing import Any, Mapping, Sequence
 from urllib.parse import urlsplit
 
 
+# Schema v2 is retained for the explicit manual/canary flow.  A scheduled
+# approval must use v3, whose extra body binds the provider order, owner
+# charter, frozen cohort and exact per-scope workload before any paid dial.
 PROXY_CAMPAIGN_SCHEMA_VERSION = 2
+SCHEDULED_PROXY_CAMPAIGN_SCHEMA_VERSION = 3
 PROXY_CAMPAIGN_LEDGER_SCHEMA_VERSION = 1
 PROXY_CAMPAIGN_ATTEMPT_JOURNAL_SCHEMA_VERSION = 1
 PROXY_CAMPAIGN_RECONCILIATION_SEAL_SCHEMA_VERSION = 2
@@ -36,7 +40,68 @@ PROXY_CAMPAIGN_SOURCE = "whoscored"
 PROXY_CAMPAIGN_SIGNATURE_ALGORITHM = "hmac-sha256"
 PROXY_CAMPAIGN_METER = "proxy_filter_provider_billed_bytes_v1"
 MAX_PROXY_CAMPAIGN_VALIDITY = timedelta(hours=24)
+# The daily runtime refuses authority that cannot cover its complete six-hour
+# DagRun window.  Keep this shared with the offline issuer so it cannot publish
+# and consume an immutable issuance for an approval that is already unusable
+# at the nominal scheduled start.
+DAILY_INGEST_MINIMUM_APPROVAL_VALIDITY = timedelta(hours=6)
+# Runtime revalidates that minimum when each task resolves paid authority.  A
+# scheduled approval therefore needs the complete six-hour DagRun window plus
+# another six hours remaining at its tail.  Five minutes absorbs clock/task
+# boundary jitter; the normal 23-hour approval remains comfortably above it.
+DAILY_INGEST_SCHEDULED_APPROVAL_HORIZON = timedelta(hours=12, minutes=5)
 DEFAULT_WHOSCORED_PAID_CAP_BYTES = 0
+WHOSCORED_PROVIDER_POLICY_SCHEMA_VERSION = 1
+SCHEDULED_DISCOVERY_TARGET_LIMIT_MAX = 2_500
+SCHEDULED_DISCOVERY_EXPANSION_HEADROOM = 128
+SCHEDULED_SCOPE_MAX_MONTHS = 24
+SCHEDULED_SCOPE_STRUCTURED_TARGETS_PER_STAGE = 68
+# Five primary and twenty-five Detailed player feeds can each advertise up to
+# 100 source pages.  Page one is already included in the 68 structured targets;
+# this contract reserves only the additional pages and can never exceed the
+# reviewed 5,000-lease capture ceiling.
+SCHEDULED_SCOPE_PLAYER_FEEDS_PER_STAGE = 30
+SCHEDULED_SCOPE_PLAYER_ADDITIONAL_PAGES_PER_FEED = 99
+SCHEDULED_SCOPE_PLAYER_PAGINATION_TARGET_LIMIT_ENV = (
+    "WHOSCORED_PLAYER_PAGINATION_TARGET_LIMIT"
+)
+WHOSCORED_CHARTER_SCHEMA_VERSION = 2
+WHOSCORED_PROVIDER_POLICY_UNSIGNED_FIELDS = frozenset(
+    {
+        "schema_version",
+        "source",
+        "provider_id",
+        "order_id",
+        "plan_id",
+        "valid_from",
+        "valid_until",
+        "receipt_sha256",
+        "provider_quota_bytes",
+        "safety_cap_bytes",
+        "daily_cap_bytes",
+        "monthly_cap_bytes",
+        "order_cap_bytes",
+        "signature_algorithm",
+    }
+)
+WHOSCORED_CHARTER_UNSIGNED_FIELDS = frozenset(
+    {
+        "schema_version",
+        "source",
+        "provider_policy_sha256",
+        "order_id",
+        "billing_month",
+        "cohort_id",
+        "cohort_sha256",
+        "valid_from",
+        "valid_until",
+        "daily_cap_bytes",
+        "monthly_cap_bytes",
+        "order_cap_bytes",
+        "max_issuances",
+        "signature_algorithm",
+    }
+)
 # These release sentinels are deliberately code-owned rather than
 # environment-controlled.  The exact 1 GB canary now has both an external
 # provider traffic ceiling and durable provider-byte reconciliation.
@@ -200,6 +265,14 @@ _ATTEMPT_FIELDS = frozenset(
 _ATTEMPT_WITH_RESERVATION_FIELDS = _ATTEMPT_FIELDS | {
     "unsettled_provider_reservation_bytes"
 }
+_ATTEMPT_BATCH_BINDING_FIELDS = _ATTEMPT_FIELDS | {
+    "target_manifest_sha256",
+    "logical_target_units",
+    "expected_endpoint_labels",
+}
+_ATTEMPT_BATCH_WITH_RESERVATION_FIELDS = _ATTEMPT_BATCH_BINDING_FIELDS | {
+    "unsettled_provider_reservation_bytes"
+}
 _ATTEMPT_JOURNAL_STATE_FIELDS = frozenset(
     {"schema_version", "count", "offset", "tail_sha256"}
 )
@@ -220,7 +293,7 @@ _ATTEMPT_JOURNAL_RECORD_FIELDS = _ATTEMPT_JOURNAL_RECORD_BODY_FIELDS | {
     "signature",
 }
 
-_APPROVAL_FIELDS = frozenset(
+_APPROVAL_V2_FIELDS = frozenset(
     {
         "schema_version",
         "source",
@@ -244,7 +317,15 @@ _APPROVAL_FIELDS = frozenset(
         "signature",
     }
 )
-_UNSIGNED_APPROVAL_FIELDS = _APPROVAL_FIELDS - {"approval_sha256", "signature"}
+_APPROVAL_V3_FIELDS = _APPROVAL_V2_FIELDS | {"scheduled_authority"}
+_UNSIGNED_APPROVAL_V2_FIELDS = _APPROVAL_V2_FIELDS - {
+    "approval_sha256",
+    "signature",
+}
+_UNSIGNED_APPROVAL_V3_FIELDS = _APPROVAL_V3_FIELDS - {
+    "approval_sha256",
+    "signature",
+}
 _CAP_FIELDS = frozenset(
     {
         "total_provider_bytes",
@@ -267,8 +348,47 @@ _ALLOCATION_FIELDS = frozenset(
         "allowed_path_families",
     }
 )
+_SCHEDULED_AUTHORITY_FIELDS = frozenset(
+    {
+        "provider_policy_sha256",
+        "charter_sha256",
+        "provider_id",
+        "order_id",
+        "billing_month",
+        "cohort_id",
+        "cohort_sha256",
+        "catalog_batch_id",
+        "catalog_payload_sha256",
+        "workload_sha256",
+        "scope_workloads",
+        "discovery_parent_target_count",
+        "discovery_expansion_headroom",
+        "discovery_target_limit",
+        "profile_target_count",
+        "profile_targets_sha256",
+        "daily_cap_bytes",
+        "monthly_cap_bytes",
+        "order_cap_bytes",
+        "max_issuances",
+    }
+)
+_SCOPE_WORKLOAD_FIELDS = frozenset(
+    {
+        "scope",
+        "work_item_id",
+        "schedule_target_limit",
+        "schedule_targets_sha256",
+        "player_pagination_target_limit",
+        "match_target_count",
+        "match_targets_sha256",
+        "preview_target_count",
+        "preview_targets_sha256",
+        "paid_target_count",
+    }
+)
 _TOKEN_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z", re.ASCII)
 _SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z", re.ASCII)
+_BILLING_MONTH_RE = re.compile(r"\A[0-9]{4}-(?:0[1-9]|1[0-2])\Z", re.ASCII)
 
 
 class ProxyCampaignError(RuntimeError):
@@ -340,6 +460,59 @@ def canonical_json_bytes(value: object) -> bytes:
         raise ProxyCampaignValidationError(
             "proxy campaign values must be canonical JSON"
         ) from exc
+
+
+def scheduled_target_ids_sha256(values: Sequence[int | str]) -> str:
+    """Hash one canonical set of planned source-owned target identities."""
+
+    normalized = sorted({str(value) for value in values})
+    return hashlib.sha256(canonical_json_bytes(normalized)).hexdigest()
+
+
+def scheduled_scope_schedule_target_limit(
+    *, stage_count: int, season_month_count: int
+) -> int:
+    """Bound season/calendar/month/statistics URLs before a paid scope starts."""
+
+    if (
+        isinstance(stage_count, bool)
+        or not isinstance(stage_count, int)
+        or stage_count <= 0
+        or isinstance(season_month_count, bool)
+        or not isinstance(season_month_count, int)
+        or not 1 <= season_month_count <= SCHEDULED_SCOPE_MAX_MONTHS
+    ):
+        raise ProxyCampaignValidationError(
+            "scheduled scope stage/month target bounds are invalid"
+        )
+    return 1 + stage_count * (
+        1 + season_month_count + SCHEDULED_SCOPE_STRUCTURED_TARGETS_PER_STAGE
+    )
+
+
+def scheduled_scope_player_pagination_target_limit(
+    *, stage_count: int, non_pagination_target_count: int
+) -> int:
+    """Reserve bounded pages 2..100 without crossing the reviewed lease cap."""
+
+    if (
+        isinstance(stage_count, bool)
+        or not isinstance(stage_count, int)
+        or stage_count <= 0
+        or isinstance(non_pagination_target_count, bool)
+        or not isinstance(non_pagination_target_count, int)
+        or not 1 <= non_pagination_target_count <= WHOSCORED_CANARY_CAPTURE_LEASE_LIMIT
+    ):
+        raise ProxyCampaignValidationError(
+            "scheduled scope pagination target inputs are invalid"
+        )
+    available = WHOSCORED_CANARY_CAPTURE_LEASE_LIMIT - non_pagination_target_count
+    theoretical = (
+        stage_count
+        * SCHEDULED_SCOPE_PLAYER_FEEDS_PER_STAGE
+        * SCHEDULED_SCOPE_PLAYER_ADDITIONAL_PAGES_PER_FEED
+    )
+    return min(theoretical, available)
 
 
 def _secret_bytes(secret: str | bytes) -> bytes:
@@ -434,6 +607,79 @@ def _now(value: datetime | None = None) -> datetime:
     return result.astimezone(timezone.utc)
 
 
+def _verify_owner_document(
+    value: object,
+    *,
+    unsigned_fields: frozenset[str],
+    secret: str | bytes,
+    label: str,
+) -> dict[str, object]:
+    expected_fields = unsigned_fields | {"document_sha256", "signature"}
+    if not isinstance(value, Mapping) or frozenset(value) != expected_fields:
+        raise ProxyCampaignValidationError(f"{label} fields are invalid")
+    unsigned = {field: value[field] for field in unsigned_fields}
+    digest = _digest(value.get("document_sha256"), f"{label}.document_sha256")
+    signature = _digest(value.get("signature"), f"{label}.signature")
+    expected_digest = hashlib.sha256(canonical_json_bytes(unsigned)).hexdigest()
+    signed_body = {**unsigned, "document_sha256": digest}
+    expected_signature = hmac.new(
+        _secret_bytes(secret), canonical_json_bytes(signed_body), hashlib.sha256
+    ).hexdigest()
+    if not hmac.compare_digest(digest, expected_digest) or not hmac.compare_digest(
+        signature, expected_signature
+    ):
+        raise ProxyCampaignSignatureError(f"{label} digest/signature is invalid")
+    return dict(value)
+
+
+def verify_whoscored_provider_policy(
+    value: object,
+    *,
+    secret: str | bytes,
+    now: datetime | None = None,
+) -> dict[str, object]:
+    """Authenticate one provider-policy-v1 and its invoice safety envelope."""
+
+    policy = _verify_owner_document(
+        value,
+        unsigned_fields=WHOSCORED_PROVIDER_POLICY_UNSIGNED_FIELDS,
+        secret=secret,
+        label="provider policy",
+    )
+    if (
+        policy.get("schema_version") != WHOSCORED_PROVIDER_POLICY_SCHEMA_VERSION
+        or policy.get("source") != PROXY_CAMPAIGN_SOURCE
+        or policy.get("signature_algorithm")
+        != PROXY_CAMPAIGN_SIGNATURE_ALGORITHM
+    ):
+        raise ProxyCampaignValidationError("provider policy identity is invalid")
+    _token(policy.get("provider_id"), "provider_policy.provider_id")
+    _token(policy.get("order_id"), "provider_policy.order_id")
+    _token(policy.get("plan_id"), "provider_policy.plan_id")
+    _digest(policy.get("receipt_sha256"), "provider_policy.receipt_sha256")
+    current = _now(now)
+    if not (
+        _utc_timestamp(policy.get("valid_from"), "provider_policy.valid_from")
+        <= current
+        < _utc_timestamp(policy.get("valid_until"), "provider_policy.valid_until")
+    ):
+        raise ProxyCampaignExpired("provider policy is not active")
+    daily = _integer(policy.get("daily_cap_bytes"), "provider_policy.daily_cap_bytes")
+    monthly = _integer(
+        policy.get("monthly_cap_bytes"), "provider_policy.monthly_cap_bytes"
+    )
+    order = _integer(policy.get("order_cap_bytes"), "provider_policy.order_cap_bytes")
+    safety = _integer(policy.get("safety_cap_bytes"), "provider_policy.safety_cap_bytes")
+    quota = _integer(
+        policy.get("provider_quota_bytes"), "provider_policy.provider_quota_bytes"
+    )
+    if not daily <= monthly <= order <= safety <= quota:
+        raise ProxyCampaignValidationError(
+            "provider policy quota/safety caps are inconsistent"
+        )
+    return policy
+
+
 def _sorted_unique_tokens(
     value: object,
     field: str,
@@ -525,7 +771,10 @@ class ProxyWorkAllocation:
     allowed_path_families: tuple[str, ...]
 
     @classmethod
-    def from_dict(cls, value: object) -> "ProxyWorkAllocation":
+    def from_dict(
+        cls,
+        value: object,
+    ) -> "ProxyWorkAllocation":
         if not isinstance(value, Mapping):
             raise ProxyCampaignValidationError("proxy allocation must be an object")
         _strict_fields(value, _ALLOCATION_FIELDS, "proxy allocation")
@@ -539,8 +788,14 @@ class ProxyWorkAllocation:
             work_item_id=_token(value.get("work_item_id"), "work_item_id"),
             task_id=_token(value.get("task_id"), "task_id"),
             budget_bytes=_integer(value.get("budget_bytes"), "budget_bytes"),
-            request_limit=_integer(value.get("request_limit"), "request_limit"),
-            lease_limit=_integer(value.get("lease_limit"), "lease_limit"),
+            request_limit=_integer(
+                value.get("request_limit"),
+                "request_limit",
+            ),
+            lease_limit=_integer(
+                value.get("lease_limit"),
+                "lease_limit",
+            ),
             allowed_path_families=_path_families(
                 value.get("allowed_path_families"),
                 "allocation.allowed_path_families",
@@ -674,9 +929,283 @@ class ProxyCampaignLimits:
 
 
 @dataclass(frozen=True)
+class ScheduledScopeWorkload:
+    """One exact paid daily scope and its pre-issuance demand."""
+
+    scope: str
+    work_item_id: str
+    schedule_target_limit: int
+    schedule_targets_sha256: str
+    player_pagination_target_limit: int
+    match_target_count: int
+    match_targets_sha256: str
+    preview_target_count: int
+    preview_targets_sha256: str
+    paid_target_count: int
+
+    @classmethod
+    def from_dict(cls, value: object) -> "ScheduledScopeWorkload":
+        if not isinstance(value, Mapping):
+            raise ProxyCampaignValidationError("scheduled scope workload must be an object")
+        _strict_fields(value, _SCOPE_WORKLOAD_FIELDS, "scheduled scope workload")
+        scope = _identity(value.get("scope"), "scope_workloads[].scope")
+        expected_work_item = "scope-" + hashlib.sha256(scope.encode("utf-8")).hexdigest()
+        work_item = _token(
+            value.get("work_item_id"), "scope_workloads[].work_item_id"
+        )
+        if work_item != expected_work_item:
+            raise ProxyCampaignValidationError(
+                "scheduled scope workload work_item_id is not content-derived"
+            )
+        schedule_target_limit = _integer(
+            value.get("schedule_target_limit"),
+            "scope_workloads[].schedule_target_limit",
+        )
+        match_target_count = _integer(
+            value.get("match_target_count"),
+            "scope_workloads[].match_target_count",
+            allow_zero=True,
+        )
+        preview_target_count = _integer(
+            value.get("preview_target_count"),
+            "scope_workloads[].preview_target_count",
+            allow_zero=True,
+        )
+        player_pagination_target_limit = _integer(
+            value.get("player_pagination_target_limit"),
+            "scope_workloads[].player_pagination_target_limit",
+            allow_zero=True,
+        )
+        demand = _integer(
+            value.get("paid_target_count"),
+            "scope_workloads[].paid_target_count",
+        )
+        if (
+            match_target_count > 100
+            or preview_target_count > 256
+            or demand > WHOSCORED_CANARY_CAPTURE_LEASE_LIMIT
+            or demand
+            != (
+                schedule_target_limit
+                + player_pagination_target_limit
+                + match_target_count
+                + preview_target_count
+            )
+        ):
+            raise ProxyCampaignValidationError(
+                "scheduled scope target counts violate the exact release ceiling"
+            )
+        return cls(
+            scope=scope,
+            work_item_id=work_item,
+            schedule_target_limit=schedule_target_limit,
+            schedule_targets_sha256=_digest(
+                value.get("schedule_targets_sha256"),
+                "scope_workloads[].schedule_targets_sha256",
+            ),
+            player_pagination_target_limit=player_pagination_target_limit,
+            match_target_count=match_target_count,
+            match_targets_sha256=_digest(
+                value.get("match_targets_sha256"),
+                "scope_workloads[].match_targets_sha256",
+            ),
+            preview_target_count=preview_target_count,
+            preview_targets_sha256=_digest(
+                value.get("preview_targets_sha256"),
+                "scope_workloads[].preview_targets_sha256",
+            ),
+            paid_target_count=demand,
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "scope": self.scope,
+            "work_item_id": self.work_item_id,
+            "schedule_target_limit": self.schedule_target_limit,
+            "schedule_targets_sha256": self.schedule_targets_sha256,
+            "player_pagination_target_limit": self.player_pagination_target_limit,
+            "match_target_count": self.match_target_count,
+            "match_targets_sha256": self.match_targets_sha256,
+            "preview_target_count": self.preview_target_count,
+            "preview_targets_sha256": self.preview_targets_sha256,
+            "paid_target_count": self.paid_target_count,
+        }
+
+
+@dataclass(frozen=True)
+class ScheduledProxyAuthority:
+    """Owner-approved order/cohort envelope carried by a schema-v3 approval."""
+
+    provider_policy_sha256: str
+    charter_sha256: str
+    provider_id: str
+    order_id: str
+    billing_month: str
+    cohort_id: str
+    cohort_sha256: str
+    catalog_batch_id: str
+    catalog_payload_sha256: str
+    workload_sha256: str
+    scope_workloads: tuple[ScheduledScopeWorkload, ...]
+    discovery_parent_target_count: int
+    discovery_expansion_headroom: int
+    discovery_target_limit: int
+    profile_target_count: int
+    profile_targets_sha256: str
+    daily_cap_bytes: int
+    monthly_cap_bytes: int
+    order_cap_bytes: int
+    max_issuances: int
+
+    @classmethod
+    def from_dict(cls, value: object) -> "ScheduledProxyAuthority":
+        if not isinstance(value, Mapping):
+            raise ProxyCampaignValidationError("scheduled_authority must be an object")
+        _strict_fields(value, _SCHEDULED_AUTHORITY_FIELDS, "scheduled_authority")
+        raw_workloads = value.get("scope_workloads")
+        if not isinstance(raw_workloads, list) or not raw_workloads:
+            raise ProxyCampaignValidationError(
+                "scheduled_authority.scope_workloads must be non-empty"
+            )
+        workloads = tuple(ScheduledScopeWorkload.from_dict(item) for item in raw_workloads)
+        scopes = tuple(item.scope for item in workloads)
+        if len(scopes) != len(set(scopes)):
+            raise ProxyCampaignValidationError(
+                "scheduled scope workloads must have unique scopes"
+            )
+        expected_workload_sha256 = hashlib.sha256(
+            canonical_json_bytes([item.to_dict() for item in workloads])
+        ).hexdigest()
+        workload_sha256 = _digest(
+            value.get("workload_sha256"), "scheduled_authority.workload_sha256"
+        )
+        if not hmac.compare_digest(workload_sha256, expected_workload_sha256):
+            raise ProxyCampaignValidationError(
+                "scheduled workload digest does not match scope_workloads"
+            )
+        billing_month = str(value.get("billing_month") or "")
+        if _BILLING_MONTH_RE.fullmatch(billing_month) is None:
+            raise ProxyCampaignValidationError(
+                "scheduled_authority.billing_month must be YYYY-MM"
+            )
+        result = cls(
+            provider_policy_sha256=_digest(
+                value.get("provider_policy_sha256"),
+                "scheduled_authority.provider_policy_sha256",
+            ),
+            charter_sha256=_digest(
+                value.get("charter_sha256"), "scheduled_authority.charter_sha256"
+            ),
+            provider_id=_token(
+                value.get("provider_id"), "scheduled_authority.provider_id"
+            ),
+            order_id=_token(value.get("order_id"), "scheduled_authority.order_id"),
+            billing_month=billing_month,
+            cohort_id=_token(value.get("cohort_id"), "scheduled_authority.cohort_id"),
+            cohort_sha256=_digest(
+                value.get("cohort_sha256"), "scheduled_authority.cohort_sha256"
+            ),
+            catalog_batch_id=_token(
+                value.get("catalog_batch_id"),
+                "scheduled_authority.catalog_batch_id",
+            ),
+            catalog_payload_sha256=_digest(
+                value.get("catalog_payload_sha256"),
+                "scheduled_authority.catalog_payload_sha256",
+            ),
+            workload_sha256=workload_sha256,
+            scope_workloads=workloads,
+            discovery_parent_target_count=_integer(
+                value.get("discovery_parent_target_count"),
+                "scheduled_authority.discovery_parent_target_count",
+            ),
+            discovery_expansion_headroom=_integer(
+                value.get("discovery_expansion_headroom"),
+                "scheduled_authority.discovery_expansion_headroom",
+            ),
+            discovery_target_limit=_integer(
+                value.get("discovery_target_limit"),
+                "scheduled_authority.discovery_target_limit",
+            ),
+            profile_target_count=_integer(
+                value.get("profile_target_count"),
+                "scheduled_authority.profile_target_count",
+                allow_zero=True,
+            ),
+            profile_targets_sha256=_digest(
+                value.get("profile_targets_sha256"),
+                "scheduled_authority.profile_targets_sha256",
+            ),
+            daily_cap_bytes=_integer(
+                value.get("daily_cap_bytes"),
+                "scheduled_authority.daily_cap_bytes",
+            ),
+            monthly_cap_bytes=_integer(
+                value.get("monthly_cap_bytes"),
+                "scheduled_authority.monthly_cap_bytes",
+            ),
+            order_cap_bytes=_integer(
+                value.get("order_cap_bytes"),
+                "scheduled_authority.order_cap_bytes",
+            ),
+            max_issuances=_integer(
+                value.get("max_issuances"), "scheduled_authority.max_issuances"
+            ),
+        )
+        if not (
+            result.daily_cap_bytes
+            <= result.monthly_cap_bytes
+            <= result.order_cap_bytes
+        ):
+            raise ProxyCampaignValidationError(
+                "scheduled daily/monthly/order caps are inconsistent"
+            )
+        if (
+            result.discovery_expansion_headroom
+            != SCHEDULED_DISCOVERY_EXPANSION_HEADROOM
+            or result.discovery_target_limit
+            != min(
+                SCHEDULED_DISCOVERY_TARGET_LIMIT_MAX,
+                result.discovery_parent_target_count
+                + result.discovery_expansion_headroom,
+            )
+            or result.profile_target_count > 256
+        ):
+            raise ProxyCampaignValidationError(
+                "scheduled discovery/profile target authority is invalid"
+            )
+        return result
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "provider_policy_sha256": self.provider_policy_sha256,
+            "charter_sha256": self.charter_sha256,
+            "provider_id": self.provider_id,
+            "order_id": self.order_id,
+            "billing_month": self.billing_month,
+            "cohort_id": self.cohort_id,
+            "cohort_sha256": self.cohort_sha256,
+            "catalog_batch_id": self.catalog_batch_id,
+            "catalog_payload_sha256": self.catalog_payload_sha256,
+            "workload_sha256": self.workload_sha256,
+            "scope_workloads": [item.to_dict() for item in self.scope_workloads],
+            "discovery_parent_target_count": self.discovery_parent_target_count,
+            "discovery_expansion_headroom": self.discovery_expansion_headroom,
+            "discovery_target_limit": self.discovery_target_limit,
+            "profile_target_count": self.profile_target_count,
+            "profile_targets_sha256": self.profile_targets_sha256,
+            "daily_cap_bytes": self.daily_cap_bytes,
+            "monthly_cap_bytes": self.monthly_cap_bytes,
+            "order_cap_bytes": self.order_cap_bytes,
+            "max_issuances": self.max_issuances,
+        }
+
+
+@dataclass(frozen=True)
 class ProxyCampaignApproval:
     """Canonical signed authority for one WhoScored paid campaign."""
 
+    schema_version: int
     approval_id: str
     campaign_id: str
     run_id: str
@@ -691,6 +1220,7 @@ class ProxyCampaignApproval:
     allowed_hosts: tuple[str, ...]
     allowed_path_families: tuple[str, ...]
     allocations: tuple[ProxyWorkAllocation, ...]
+    scheduled_authority: ScheduledProxyAuthority | None
     approval_sha256: str
     signature: str
 
@@ -700,8 +1230,12 @@ class ProxyCampaignApproval:
             raise ProxyCampaignValidationError(
                 "proxy campaign approval must be an object"
             )
-        _strict_fields(value, _APPROVAL_FIELDS, "proxy campaign approval")
-        if value.get("schema_version") != PROXY_CAMPAIGN_SCHEMA_VERSION:
+        schema_version = value.get("schema_version")
+        if schema_version == PROXY_CAMPAIGN_SCHEMA_VERSION:
+            _strict_fields(value, _APPROVAL_V2_FIELDS, "proxy campaign approval")
+        elif schema_version == SCHEDULED_PROXY_CAMPAIGN_SCHEMA_VERSION:
+            _strict_fields(value, _APPROVAL_V3_FIELDS, "proxy campaign approval")
+        else:
             raise ProxyCampaignValidationError("unsupported campaign approval schema")
         if value.get("source") != PROXY_CAMPAIGN_SOURCE:
             raise ProxyCampaignValidationError("campaign source must be whoscored")
@@ -726,9 +1260,7 @@ class ProxyCampaignApproval:
         raw_allocations = value.get("allocations")
         if not isinstance(raw_allocations, list) or not raw_allocations:
             raise ProxyCampaignValidationError("allocations must be a non-empty array")
-        allocations = tuple(
-            ProxyWorkAllocation.from_dict(item) for item in raw_allocations
-        )
+        allocations = tuple(ProxyWorkAllocation.from_dict(item) for item in raw_allocations)
         allocation_ids = tuple(item.allocation_id for item in allocations)
         if allocation_ids != tuple(sorted(set(allocation_ids))):
             raise ProxyCampaignValidationError(
@@ -782,7 +1314,90 @@ class ProxyCampaignApproval:
             raise ProxyCampaignValidationError(
                 "allocation lease limits exceed the campaign lease cap"
             )
+        scheduled_authority = (
+            ScheduledProxyAuthority.from_dict(value.get("scheduled_authority"))
+            if schema_version == SCHEDULED_PROXY_CAMPAIGN_SCHEMA_VERSION
+            else None
+        )
+        if schema_version == SCHEDULED_PROXY_CAMPAIGN_SCHEMA_VERSION:
+            if not str(value.get("run_id") or "").startswith("scheduled__"):
+                raise ProxyCampaignValidationError(
+                    "scheduled campaign approval requires a scheduled DagRun id"
+                )
+            if allowed_dags != (WHOSCORED_INGEST_DAG_ID,):
+                raise ProxyCampaignValidationError(
+                    "scheduled campaign approval must bind daily ingest only"
+                )
+            assert scheduled_authority is not None
+            if caps.total_provider_bytes > scheduled_authority.daily_cap_bytes:
+                raise ProxyCampaignValidationError(
+                    "scheduled approval exceeds its signed daily cap"
+                )
+            scope_allocations = {
+                item.work_item_id: item
+                for item in allocations
+                if item.task_id == "ingest_active_scope"
+            }
+            expected_work_items = {
+                item.work_item_id for item in scheduled_authority.scope_workloads
+            }
+            if set(scope_allocations) != expected_work_items:
+                raise ProxyCampaignValidationError(
+                    "scheduled scope workloads and allocations differ"
+                )
+            fixed_allocations = [
+                item for item in allocations if item.task_id != "ingest_active_scope"
+            ]
+            fixed_by_id = {item.allocation_id: item for item in fixed_allocations}
+            if set(fixed_by_id) != {"catalog-discovery", "profiles-daily"}:
+                raise ProxyCampaignValidationError(
+                    "scheduled approval must contain exact discovery/profile allocations"
+                )
+            discovery = fixed_by_id["catalog-discovery"]
+            profiles = fixed_by_id["profiles-daily"]
+            profile_allocation_target_count = max(
+                1, scheduled_authority.profile_target_count
+            )
+            if (
+                discovery.phase != "discovery"
+                or discovery.workload_class != "daily_catalog_refresh"
+                or discovery.work_item_id != "catalog-discovery"
+                or discovery.task_id != "discover_whoscored_catalog"
+                or discovery.budget_bytes > 128 * 1024 * 1024
+                or discovery.request_limit
+                != 2 * scheduled_authority.discovery_target_limit
+                or discovery.lease_limit
+                != scheduled_authority.discovery_target_limit
+                or profiles.phase != "capture"
+                or profiles.workload_class != "daily_profile_refresh"
+                or profiles.work_item_id != "profiles-daily"
+                or profiles.task_id != "refresh_whoscored_profiles"
+                or profiles.budget_bytes > 256 * 1024 * 1024
+                or profiles.request_limit
+                != 2 * profile_allocation_target_count
+                or profiles.lease_limit
+                != profile_allocation_target_count
+            ):
+                raise ProxyCampaignValidationError(
+                    "scheduled discovery/profile allocation contract is invalid"
+                )
+            for workload in scheduled_authority.scope_workloads:
+                allocation = scope_allocations[workload.work_item_id]
+                demand = workload.paid_target_count
+                if (
+                    allocation.allocation_id != workload.work_item_id
+                    or allocation.phase != "capture"
+                    or allocation.workload_class != "daily_active_scope"
+                    or allocation.budget_bytes < 1_000_000
+                    or allocation.budget_bytes > 2_000_000 * demand
+                    or allocation.lease_limit != demand
+                    or allocation.request_limit != 2 * demand
+                ):
+                    raise ProxyCampaignValidationError(
+                        "scheduled scope allocation violates workload-aware ceilings"
+                    )
         result = cls(
+            schema_version=int(schema_version),
             approval_id=_token(value.get("approval_id"), "approval_id"),
             campaign_id=_token(value.get("campaign_id"), "campaign_id"),
             run_id=_identity(value.get("run_id"), "run_id"),
@@ -799,14 +1414,15 @@ class ProxyCampaignApproval:
             allowed_hosts=allowed_hosts,
             allowed_path_families=allowed_paths,
             allocations=allocations,
+            scheduled_authority=scheduled_authority,
             approval_sha256=_digest(value.get("approval_sha256"), "approval_sha256"),
             signature=_digest(value.get("signature"), "signature"),
         )
         return result
 
     def unsigned_dict(self) -> dict[str, object]:
-        return {
-            "schema_version": PROXY_CAMPAIGN_SCHEMA_VERSION,
+        result: dict[str, object] = {
+            "schema_version": self.schema_version,
             "source": PROXY_CAMPAIGN_SOURCE,
             "approval_id": self.approval_id,
             "campaign_id": self.campaign_id,
@@ -825,6 +1441,9 @@ class ProxyCampaignApproval:
             "meter": PROXY_CAMPAIGN_METER,
             "signature_algorithm": PROXY_CAMPAIGN_SIGNATURE_ALGORITHM,
         }
+        if self.scheduled_authority is not None:
+            result["scheduled_authority"] = self.scheduled_authority.to_dict()
+        return result
 
     def to_dict(self) -> dict[str, object]:
         result = self.unsigned_dict()
@@ -961,7 +1580,15 @@ def compute_approval_signature(
 ) -> str:
     """HMAC a body that contains ``approval_sha256`` but no signature."""
 
-    if frozenset(signed_body) != _UNSIGNED_APPROVAL_FIELDS | {"approval_sha256"}:
+    schema_version = signed_body.get("schema_version")
+    expected = (
+        _UNSIGNED_APPROVAL_V2_FIELDS
+        if schema_version == PROXY_CAMPAIGN_SCHEMA_VERSION
+        else _UNSIGNED_APPROVAL_V3_FIELDS
+        if schema_version == SCHEDULED_PROXY_CAMPAIGN_SCHEMA_VERSION
+        else frozenset()
+    )
+    if frozenset(signed_body) != expected | {"approval_sha256"}:
         raise ProxyCampaignSignatureError(
             "campaign signature body has missing or unknown fields"
         )
@@ -977,7 +1604,15 @@ def sign_proxy_campaign_approval(
 ) -> dict[str, object]:
     """Return a canonical signed approval from its exact unsigned wire body."""
 
-    if frozenset(unsigned_approval) != _UNSIGNED_APPROVAL_FIELDS:
+    schema_version = unsigned_approval.get("schema_version")
+    expected = (
+        _UNSIGNED_APPROVAL_V2_FIELDS
+        if schema_version == PROXY_CAMPAIGN_SCHEMA_VERSION
+        else _UNSIGNED_APPROVAL_V3_FIELDS
+        if schema_version == SCHEDULED_PROXY_CAMPAIGN_SCHEMA_VERSION
+        else frozenset()
+    )
+    if frozenset(unsigned_approval) != expected:
         raise ProxyCampaignValidationError(
             "unsigned campaign approval has missing or unknown fields"
         )
@@ -1008,6 +1643,12 @@ class ProxyCampaignClaim:
     total_remaining_provider_bytes: int
     phase_remaining_provider_bytes: int
     daily_remaining_provider_bytes: int
+    # ``lease_limit`` is the signed logical-target allowance. A legacy/single
+    # lease consumes one unit; one batch lease consumes exactly N units while
+    # ``request_limit`` independently bounds physical provider dials.
+    target_manifest_sha256: str = ""
+    logical_target_units: int = 1
+    expected_endpoint_labels: tuple[str, ...] = ()
 
     def __repr__(self) -> str:
         return (
@@ -1020,6 +1661,48 @@ class ProxyCampaignClaim:
 
 def _state_token_hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _batch_claim_binding(
+    target_manifest_sha256: str | None,
+    logical_target_units: int,
+    expected_endpoint_labels: Sequence[str],
+) -> tuple[str, int, tuple[str, ...]]:
+    """Validate the optional one-lease/many-logical-target claim contract."""
+
+    units = _integer(logical_target_units, "logical_target_units")
+    if isinstance(expected_endpoint_labels, (str, bytes, bytearray)) or not isinstance(
+        expected_endpoint_labels, Sequence
+    ):
+        raise ProxyCampaignValidationError(
+            "expected_endpoint_labels must be an ordered sequence"
+        )
+    labels = tuple(expected_endpoint_labels)
+    if any(type(label) is not str for label in labels):
+        raise ProxyCampaignValidationError(
+            "expected_endpoint_labels must contain strings"
+        )
+    if not target_manifest_sha256:
+        if units != 1 or labels:
+            raise ProxyCampaignValidationError(
+                "multi-target claim requires a target manifest and endpoint labels"
+            )
+        return "", 1, ()
+    manifest = _digest(target_manifest_sha256, "target_manifest_sha256")
+    if len(labels) != units + 1 or len(set(labels)) != len(labels):
+        raise ProxyCampaignValidationError(
+            "batch claim endpoint labels must bind one bootstrap and N targets"
+        )
+    label_pattern = re.compile(r"(?:bootstrap|target):[0-9a-f]{64}")
+    if (
+        not labels[0].startswith("bootstrap:")
+        or any(not label_pattern.fullmatch(label) for label in labels)
+        or any(not label.startswith("target:") for label in labels[1:])
+    ):
+        raise ProxyCampaignValidationError(
+            "batch claim endpoint labels are not canonical"
+        )
+    return manifest, units, labels
 
 
 class ProxyCampaignLedger:
@@ -1232,6 +1915,8 @@ class ProxyCampaignLedger:
         if not isinstance(value, dict) or frozenset(value) not in {
             _ATTEMPT_FIELDS,
             _ATTEMPT_WITH_RESERVATION_FIELDS,
+            _ATTEMPT_BATCH_BINDING_FIELDS,
+            _ATTEMPT_BATCH_WITH_RESERVATION_FIELDS,
         }:
             raise ProxyCampaignAccountingError(
                 "campaign attempt journal record is malformed"
@@ -1257,6 +1942,18 @@ class ProxyCampaignLedger:
             raise ProxyCampaignAccountingError(
                 "campaign attempt journal record is malformed"
             )
+        has_batch_binding = "target_manifest_sha256" in value
+        if has_batch_binding:
+            try:
+                _batch_claim_binding(
+                    value.get("target_manifest_sha256"),
+                    value.get("logical_target_units"),
+                    value.get("expected_endpoint_labels"),
+                )
+            except (ProxyCampaignValidationError, TypeError) as exc:
+                raise ProxyCampaignAccountingError(
+                    "campaign attempt journal batch binding is malformed"
+                ) from exc
         reservation = value.get("unsettled_provider_reservation_bytes", 0)
         if (
             isinstance(reservation, bool)
@@ -1462,6 +2159,8 @@ class ProxyCampaignLedger:
         expected_expired = _utc_timestamp(
             attempts.get("finished_at"), "finished_at"
         ) >= _utc_timestamp(active.get("expires_at"), "claim.expires_at")
+        attempt_has_batch_binding = "target_manifest_sha256" in attempts
+        active_has_batch_binding = "target_manifest_sha256" in active
         if (
             not isinstance(allocation, dict)
             or active.get("allocation_id") != allocation_id
@@ -1472,6 +2171,18 @@ class ProxyCampaignLedger:
             != attempts.get("provider_billed_bytes")
             or int(active.get("requests_used", -1)) != attempts.get("provider_requests")
             or int(active.get("reserved_provider_bytes", -1)) != reservation
+            or attempt_has_batch_binding != active_has_batch_binding
+            or (
+                attempt_has_batch_binding
+                and (
+                    attempts.get("target_manifest_sha256")
+                    != active.get("target_manifest_sha256")
+                    or attempts.get("logical_target_units")
+                    != active.get("logical_target_units")
+                    or attempts.get("expected_endpoint_labels")
+                    != active.get("expected_endpoint_labels")
+                )
+            )
             or attempts.get("expired") is not expected_expired
             or (
                 record.get("retain_active_claim") is True
@@ -2021,6 +2732,16 @@ class ProxyCampaignLedger:
                     "expired": True,
                     "finished_at": now.isoformat(),
                 }
+                if "target_manifest_sha256" in claim:
+                    attempt.update(
+                        target_manifest_sha256=claim.get(
+                            "target_manifest_sha256"
+                        ),
+                        logical_target_units=claim.get("logical_target_units"),
+                        expected_endpoint_labels=claim.get(
+                            "expected_endpoint_labels"
+                        ),
+                    )
                 self._append_attempt_record(
                     body,
                     campaign,
@@ -2129,6 +2850,9 @@ class ProxyCampaignLedger:
         lease_id: str,
         expires_at: datetime,
         canonical_url: str,
+        target_manifest_sha256: str | None = None,
+        logical_target_units: int = 1,
+        expected_endpoint_labels: Sequence[str] = (),
         claim_token: str | None = None,
         now: datetime | None = None,
     ) -> ProxyCampaignClaim:
@@ -2166,6 +2890,15 @@ class ProxyCampaignLedger:
             raise ProxyCampaignValidationError(
                 "canonical_url is outside the signed host/path families"
             )
+        (
+            normalized_manifest,
+            normalized_target_units,
+            normalized_endpoint_labels,
+        ) = _batch_claim_binding(
+            target_manifest_sha256,
+            logical_target_units,
+            expected_endpoint_labels,
+        )
         token = claim_token or uuid.uuid4().hex
         if not isinstance(token, str) or len(token) < 32:
             raise ProxyCampaignAccountingError(
@@ -2207,7 +2940,10 @@ class ProxyCampaignLedger:
                 raise ProxyCampaignConcurrencyLimited(
                     "proxy campaign concurrency limit reached"
                 )
-            if int(campaign.get("leases_used", 0)) >= approval.limits.leases:
+            if (
+                int(campaign.get("leases_used", 0)) + normalized_target_units
+                > approval.limits.leases
+            ):
                 campaign["status"] = "awaiting_approval"
                 campaign["awaiting_reason"] = "lease_limit"
                 self._write(body)
@@ -2224,7 +2960,10 @@ class ProxyCampaignLedger:
                 raise ProxyCampaignAccountingError(
                     "work allocation is already complete"
                 )
-            if int(allocation.get("leases_used", 0)) >= allocation_spec.lease_limit:
+            if (
+                int(allocation.get("leases_used", 0)) + normalized_target_units
+                > allocation_spec.lease_limit
+            ):
                 raise ProxyCampaignBudgetExceeded("allocation lease limit exhausted")
             if int(allocation.get("requests_used", 0)) >= allocation_spec.request_limit:
                 raise ProxyCampaignBudgetExceeded("allocation request limit exhausted")
@@ -2238,7 +2977,7 @@ class ProxyCampaignLedger:
                 raise ProxyCampaignBudgetExceeded(
                     "campaign/allocation provider byte cap exhausted"
                 )
-            claims[lease_id] = {
+            active_claim: dict[str, object] = {
                 "allocation_id": allocation_id,
                 "approval_id": approval.approval_id,
                 "approval_sha256": approval.approval_sha256,
@@ -2259,8 +2998,23 @@ class ProxyCampaignLedger:
                 "reservation_day": current.date().isoformat(),
                 "requests_used": 0,
             }
-            campaign["leases_used"] = int(campaign.get("leases_used", 0)) + 1
-            allocation["leases_used"] = int(allocation.get("leases_used", 0)) + 1
+            if normalized_manifest:
+                active_claim.update(
+                    target_manifest_sha256=normalized_manifest,
+                    logical_target_units=normalized_target_units,
+                    expected_endpoint_labels=list(normalized_endpoint_labels),
+                )
+            claims[lease_id] = active_claim
+            # Historical field name retained for state compatibility: it is
+            # the signed logical-target counter, not the number of physical
+            # proxy lease objects. This makes a batch of N consume N exactly
+            # once under the same fsync-protected ledger lock.
+            campaign["leases_used"] = (
+                int(campaign.get("leases_used", 0)) + normalized_target_units
+            )
+            allocation["leases_used"] = (
+                int(allocation.get("leases_used", 0)) + normalized_target_units
+            )
             campaign["status"] = "active"
             campaign["awaiting_reason"] = ""
             campaign["updated_at"] = current.isoformat()
@@ -2281,6 +3035,9 @@ class ProxyCampaignLedger:
                 total_remaining_provider_bytes=remaining[1],
                 phase_remaining_provider_bytes=remaining[2],
                 daily_remaining_provider_bytes=remaining[3],
+                target_manifest_sha256=normalized_manifest,
+                logical_target_units=normalized_target_units,
+                expected_endpoint_labels=normalized_endpoint_labels,
             )
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
@@ -2702,6 +3459,14 @@ class ProxyCampaignLedger:
                 >= _utc_timestamp(active.get("expires_at"), "claim.expires_at"),
                 "finished_at": current.isoformat(),
             }
+            if "target_manifest_sha256" in active:
+                attempt.update(
+                    target_manifest_sha256=active.get("target_manifest_sha256"),
+                    logical_target_units=active.get("logical_target_units"),
+                    expected_endpoint_labels=active.get(
+                        "expected_endpoint_labels"
+                    ),
+                )
             self._append_attempt_record(
                 body,
                 campaign,
@@ -2830,6 +3595,32 @@ class ProxyCampaignLedger:
             )
         return value
 
+    @staticmethod
+    def _logical_target_units(value: Mapping[str, Any], field: str) -> int:
+        batch_fields = {
+            "target_manifest_sha256",
+            "logical_target_units",
+            "expected_endpoint_labels",
+        }
+        present = batch_fields.intersection(value)
+        if not present:
+            return 1
+        if present != batch_fields:
+            raise ProxyCampaignAccountingError(
+                f"persisted campaign {field} batch binding is incomplete"
+            )
+        try:
+            _manifest, units, _labels = _batch_claim_binding(
+                value.get("target_manifest_sha256"),
+                value.get("logical_target_units"),
+                value.get("expected_endpoint_labels"),
+            )
+        except (ProxyCampaignValidationError, TypeError) as exc:
+            raise ProxyCampaignAccountingError(
+                f"persisted campaign {field} batch binding is malformed"
+            ) from exc
+        return units
+
     def _validate_journal_accounting(
         self,
         campaign: Mapping[str, Any],
@@ -2862,10 +3653,11 @@ class ProxyCampaignLedger:
             requests = self._counter(
                 attempt.get("provider_requests"), "attempt requests"
             )
-            totals["leases"] += 1
+            logical_units = self._logical_target_units(attempt, "attempt")
+            totals["leases"] += logical_units
             totals["requests"] += requests
             totals["bytes"] += billed
-            values["leases"] += 1
+            values["leases"] += logical_units
             values["requests"] += requests
             values["bytes"] += billed
             sequence = int(record["sequence"])
@@ -2916,10 +3708,11 @@ class ProxyCampaignLedger:
             requests = self._counter(
                 claim.get("requests_used"), "active claim requests"
             )
-            totals["leases"] += 1
+            logical_units = self._logical_target_units(claim, "active claim")
+            totals["leases"] += logical_units
             totals["requests"] += requests
             totals["bytes"] += billed
-            values["leases"] += 1
+            values["leases"] += logical_units
             values["requests"] += requests
             values["bytes"] += billed
         if matched_retained != retained_sequences:
@@ -3021,15 +3814,28 @@ class ProxyCampaignLedger:
                     raise ProxyCampaignAccountingError(
                         "persisted campaign attempt is malformed"
                     )
-                values.append(
-                    {
-                        "allocation_id": allocation_id,
-                        "attempt_id_hash": attempt.get("attempt_id_hash"),
-                        "lease_id_hash": attempt.get("lease_id_hash"),
-                        "canonical_url_sha256": attempt.get("canonical_url_sha256"),
-                        "provider_billed_bytes": attempt.get("provider_billed_bytes"),
-                    }
-                )
+                value: dict[str, object] = {
+                    "allocation_id": allocation_id,
+                    "attempt_id_hash": attempt.get("attempt_id_hash"),
+                    "lease_id_hash": attempt.get("lease_id_hash"),
+                    "canonical_url_sha256": attempt.get("canonical_url_sha256"),
+                    "provider_billed_bytes": attempt.get("provider_billed_bytes"),
+                }
+                # Preserve the schema-v2/single-target reconciliation digest,
+                # while making every batch seal commit to its durable binding.
+                if "target_manifest_sha256" in attempt:
+                    value.update(
+                        target_manifest_sha256=attempt.get(
+                            "target_manifest_sha256"
+                        ),
+                        logical_target_units=attempt.get(
+                            "logical_target_units"
+                        ),
+                        expected_endpoint_labels=attempt.get(
+                            "expected_endpoint_labels"
+                        ),
+                    )
+                values.append(value)
         values.sort(
             key=lambda item: (
                 str(item["allocation_id"]),
@@ -3496,6 +4302,52 @@ def _assert_paid_release_gates(
         )
 
 
+def _read_private_approval_bytes(path: Path) -> bytes:
+    """Read one immutable private artifact from its already selected path.
+
+    ``Path.stat`` followed by ``Path.read_bytes`` is vulnerable to a pathname
+    swap between the two operations.  Opening once with ``O_NOFOLLOW`` and
+    validating that exact descriptor keeps the scheduler/filter on one inode.
+    """
+
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise ProxyCampaignValidationError(
+            "campaign approval document cannot be opened safely"
+        ) from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_nlink != 1
+            or metadata.st_size <= 0
+            or metadata.st_size > MAX_APPROVAL_DOCUMENT_BYTES
+        ):
+            raise ProxyCampaignValidationError(
+                "campaign approval document ownership, mode or size is unsafe"
+            )
+        chunks: list[bytes] = []
+        remaining = metadata.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 64 * 1024))
+            if not chunk:
+                raise ProxyCampaignValidationError(
+                    "campaign approval document was truncated while reading"
+                )
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise ProxyCampaignValidationError(
+                "campaign approval document grew while reading"
+            )
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
 def assert_paid_runtime_available(
     metadata: Mapping[str, object],
     *,
@@ -3582,12 +4434,7 @@ def load_proxy_campaign_approval(
 
     approval_path = Path(path)
     try:
-        size = approval_path.stat().st_size
-        if size <= 0 or size > MAX_APPROVAL_DOCUMENT_BYTES:
-            raise ProxyCampaignValidationError(
-                "campaign approval document has an invalid size"
-            )
-        raw = approval_path.read_bytes()
+        raw = _read_private_approval_bytes(approval_path)
         value = strict_json_loads(raw.decode("utf-8"))
     except ProxyCampaignValidationError:
         raise
@@ -3619,17 +4466,40 @@ def load_proxy_campaign_approval_structure(
 
     approval_path = Path(path)
     try:
-        size = approval_path.stat().st_size
-        if size <= 0 or size > MAX_APPROVAL_DOCUMENT_BYTES:
-            raise ProxyCampaignValidationError(
-                "campaign approval document has an invalid size"
-            )
-        approval = ProxyCampaignApproval.from_dict(
-            strict_json_loads(approval_path.read_bytes().decode("utf-8"))
+        return parse_proxy_campaign_approval_structure_bytes(
+            _read_private_approval_bytes(approval_path),
+            expected_approval_id=expected_approval_id,
+            expected_approval_sha256=expected_approval_sha256,
+            now=now,
         )
     except ProxyCampaignValidationError:
         raise
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ProxyCampaignValidationError(
+            "campaign approval document is unreadable"
+        ) from exc
+
+
+def parse_proxy_campaign_approval_structure_bytes(
+    raw: bytes,
+    *,
+    expected_approval_id: str,
+    expected_approval_sha256: str,
+    now: datetime | None = None,
+) -> ProxyCampaignApproval:
+    """Validate one already fd-pinned approval payload without reopening a path."""
+
+    if not isinstance(raw, bytes) or not 0 < len(raw) <= MAX_APPROVAL_DOCUMENT_BYTES:
+        raise ProxyCampaignValidationError(
+            "campaign approval document size is unsafe"
+        )
+    try:
+        approval = ProxyCampaignApproval.from_dict(
+            strict_json_loads(raw.decode("utf-8"))
+        )
+    except ProxyCampaignValidationError:
+        raise
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ProxyCampaignValidationError(
             "campaign approval document is unreadable"
         ) from exc

@@ -6,9 +6,10 @@ import importlib
 import hashlib
 import json
 import os
+import stat
 import sys
 import types
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -162,6 +163,16 @@ def _producer_attempts(
         "match": records(match),
         "preview": records(preview),
         "profile": records(profile),
+    }
+
+
+def _match_backlog(match_ids=()):
+    count = len(tuple(match_ids))
+    return {
+        "schema_version": 1,
+        "count": count,
+        "attempted": count,
+        "remaining": 0,
     }
 
 
@@ -407,6 +418,147 @@ def test_daily_scope_plan_rejects_exact_manifest_identity_drift(monkeypatch):
                 "catalog_identity": identity,
             }
         )
+
+
+@pytest.mark.unit
+def test_scheduled_scope_workload_rechecks_exact_ids_and_pagination_headroom():
+    mod = _load_dag_module()
+    from scrapers.whoscored.proxy_campaign import (
+        scheduled_scope_player_pagination_target_limit,
+        scheduled_scope_schedule_target_limit,
+        scheduled_target_ids_sha256,
+    )
+
+    scope = SimpleNamespace(spec="WS-1=2026", competition_id="WS-1", season_id="2026")
+    runtime_scope = SimpleNamespace(
+        stage_ids=(700,), start=date(2026, 1, 1), end=date(2026, 2, 28)
+    )
+    matches = [
+        SimpleNamespace(game_id=11, exact_candidate_count=2),
+        SimpleNamespace(game_id=12, exact_candidate_count=None),
+    ]
+    previews = [{"game_id": 21}]
+    repository = SimpleNamespace(
+        list_match_candidates=lambda *_args, **_kwargs: matches,
+        list_preview_candidates=lambda *_args, **_kwargs: previews,
+    )
+    schedule_limit = scheduled_scope_schedule_target_limit(
+        stage_count=1, season_month_count=2
+    )
+    pagination_limit = scheduled_scope_player_pagination_target_limit(
+        stage_count=1,
+        non_pagination_target_count=schedule_limit + len(matches) + len(previews),
+    )
+    workload = SimpleNamespace(
+        scope=scope.spec,
+        schedule_target_limit=schedule_limit,
+        schedule_targets_sha256=scheduled_target_ids_sha256(
+            [f"season:{scope.spec}", "stage:700"]
+        ),
+        player_pagination_target_limit=pagination_limit,
+        match_target_count=2,
+        match_targets_sha256=scheduled_target_ids_sha256([11, 12]),
+        preview_target_count=1,
+        preview_targets_sha256=scheduled_target_ids_sha256([21]),
+    )
+
+    mod._validate_scheduled_scope_workloads(
+        repository, [(scope, runtime_scope)], [workload]
+    )
+    drifted = SimpleNamespace(
+        **{**vars(workload), "player_pagination_target_limit": pagination_limit - 1}
+    )
+    with pytest.raises(mod.AirflowException, match="target identity drifted"):
+        mod._validate_scheduled_scope_workloads(
+            repository, [(scope, runtime_scope)], [drifted]
+        )
+
+
+@pytest.mark.unit
+def test_quarantine_disappearance_writes_private_audit_and_explicit_failure(
+    monkeypatch, tmp_path
+):
+    mod = _load_dag_module()
+    from dags.scripts import run_whoscored_scraper as runner
+
+    monkeypatch.setattr(mod, "RUN_ROOT", str(tmp_path / "runs"))
+    identity = _catalog_identity(batch_id="wsc2-candidate")
+    signed_scope = "WS-1=2026"
+    catalog = SimpleNamespace(
+        quarantined=(
+            {
+                "record_type": "season",
+                "competition_id": "WS-1",
+                "season_id": "2026",
+                "source_season_id": 9001,
+                "stage_id": None,
+                "eligibility": "quarantined",
+                "classification_reason": "source_contract_drift",
+            },
+        )
+    )
+    repository = SimpleNamespace(
+        load_catalog_generation_snapshot=lambda *, batch_id: (
+            ({}, catalog)
+            if batch_id == "wsc2-candidate"
+            else pytest.fail("wrong candidate generation")
+        )
+    )
+    monkeypatch.setattr(runner, "_new_repository", lambda: repository)
+    monkeypatch.setattr(
+        runner,
+        "_select_catalog_snapshot_scopes",
+        lambda *_args, **_kwargs: [(SimpleNamespace(spec="WS-2=2026"), object())],
+    )
+    authority = SimpleNamespace(
+        catalog_batch_id="wsc2-parent",
+        scope_workloads=(SimpleNamespace(scope=signed_scope),),
+    )
+    monkeypatch.setattr(
+        mod,
+        "_transport_runtime",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            is_paid=True,
+            approval=SimpleNamespace(scheduled_authority=authority),
+        ),
+    )
+    monkeypatch.setattr(
+        mod,
+        "_load_result",
+        lambda _path: {"status": "success", **identity},
+    )
+    monkeypatch.setattr(
+        mod,
+        "_catalog_integrity_summary",
+        lambda _identity: {
+            "manifest_competitions": 100,
+            "physical_competitions": 100,
+            "distinct_competitions": 100,
+            "manifest_seasons": 1,
+            "physical_seasons": 1,
+            "distinct_seasons": 1,
+            "manifest_stages": 1,
+            "physical_stages": 1,
+            "distinct_stages": 1,
+            "quarantined": 1,
+            "eligible_seasons_without_stages": 0,
+            "manifest_identity_valid": 1,
+            "active_scopes": 1,
+        },
+    )
+
+    with pytest.raises(mod.AirflowException, match="WHOSCORED_QUARANTINE"):
+        mod.validate_catalog_result(**_context())
+
+    audit_path = mod._run_dir_from_context(_context()) / (
+        "quarantine-disappearance.audit"
+    )
+    assert stat.S_IMODE(audit_path.stat().st_mode) == 0o600
+    audit = json.loads(audit_path.read_text())
+    assert audit["missing_scopes"] == [signed_scope]
+    assert audit["quarantined_scopes"] == [signed_scope]
+    assert audit["disappeared_scopes"] == []
+    assert audit["alert_route"] == "dag_level_failure_callback"
 
 
 @pytest.mark.unit
@@ -978,6 +1130,7 @@ def test_scope_validation_accepts_atomic_manifest_parity(monkeypatch):
             "status": "success",
             "paid_proxy_bytes": 0,
             "scopes": [{"scope": "WS-252-2=2526"}],
+            "match_candidates": _match_backlog(match_ids),
             "producer_commits": commits,
             "producer_attempts": _producer_attempts(
                 match=match_ids, preview=preview_ids
@@ -1067,6 +1220,7 @@ def test_scope_validation_cannot_use_a_newer_latest_batch_for_an_old_report(
             "status": "success",
             "paid_proxy_bytes": 0,
             "scopes": [{"scope": "WS-252-2=2526"}],
+            "match_candidates": _match_backlog(match_ids),
             "producer_commits": commits,
             "producer_attempts": _producer_attempts(match=match_ids),
         },
@@ -1248,6 +1402,7 @@ def test_scope_nonzero_attempts_cannot_be_greened_with_no_exact_outcomes(
             "status": "success",
             "paid_proxy_bytes": 0,
             "scopes": [{"scope": "WS-252-2=2526"}],
+            "match_candidates": _match_backlog((404,)),
             "producer_commits": commits,
             "producer_attempts": _producer_attempts(match=(404,)),
         },
@@ -1315,6 +1470,7 @@ def test_scope_validation_rejects_missing_exact_physical_rows_even_if_latest_is_
             "status": "success",
             "paid_proxy_bytes": 0,
             "scopes": [{"scope": "WS-252-2=2526"}],
+            "match_candidates": _match_backlog(),
             "producer_commits": _producer_commits(scope=(old_scope,)),
             "producer_attempts": _producer_attempts(),
         },
@@ -1363,6 +1519,7 @@ def test_scope_validation_fails_closed_on_partial_publication(
             "status": "success",
             "paid_proxy_bytes": 0,
             "scopes": [{"scope": "WS-252-2=2526"}],
+            "match_candidates": _match_backlog(),
             "producer_commits": commits,
             "producer_attempts": _producer_attempts(),
         },
@@ -2335,7 +2492,7 @@ def test_campaign_ledger_is_reconciled_by_exact_airflow_attempt(monkeypatch):
         "proxy_allocation_id": allocation.allocation_id,
         "proxy_work_item_id": allocation.work_item_id,
         "proxy_attempt_id": attempt_id,
-        "lease_id": lease_id,
+        "lease_id_hash": hashlib.sha256(lease_id.encode()).hexdigest(),
         "url": canonical_url,
         "paid_proxy_bytes": 125,
     }
@@ -2521,11 +2678,160 @@ def _finished_campaign_reconciliation_case(provider_billed_bytes=125):
         "proxy_allocation_id": allocation.allocation_id,
         "proxy_work_item_id": allocation.work_item_id,
         "proxy_attempt_id": attempt_id,
-        "lease_id": lease_id,
+        "lease_id_hash": hashlib.sha256(lease_id.encode()).hexdigest(),
         "url": canonical_url,
         "paid_proxy_bytes": provider_billed_bytes,
     }
     return approval, events, [request_event], snapshot, dag_id, run_id
+
+
+def _finished_batch_campaign_reconciliation_case():
+    from scrapers.whoscored.transport import _paid_gateway_target_manifest_sha256
+
+    approval, _events, request_events, snapshot, dag_id, run_id = (
+        _finished_campaign_reconciliation_case(provider_billed_bytes=1_000)
+    )
+    attempt_id = request_events[0]["proxy_attempt_id"]
+    lease_id = "lease-reconciliation"
+    first_url = request_events[0]["url"]
+    second_url = (
+        "https://www.whoscored.com/statisticsfeed/1/getteamstatistics?"
+        "category=summaryteam&stageId=2"
+    )
+    bootstrap_url = (
+        "https://www.whoscored.com/Regions/252/Tournaments/2/Seasons/10743/"
+        "Stages/23400/TeamStatistics"
+    )
+    target_amounts = {
+        hashlib.sha256(first_url.encode()).hexdigest(): 300,
+        hashlib.sha256(second_url.encode()).hexdigest(): 600,
+    }
+    target_labels = sorted(f"target:{digest}" for digest in target_amounts)
+    bootstrap_label = "bootstrap:" + hashlib.sha256(bootstrap_url.encode()).hexdigest()
+    expected_labels = [bootstrap_label, *target_labels]
+    manifest = _paid_gateway_target_manifest_sha256(
+        [first_url, second_url], browser_bootstrap_url=bootstrap_url
+    )
+    common = {
+        "event_version": "paid-proxy-v2",
+        "dag_id": dag_id,
+        "run_id": run_id,
+        "task_id": approval.allocations[0].task_id,
+        "map_index": 4,
+        "try_number": 2,
+        "allocation_id": approval.allocations[0].allocation_id,
+        "proxy_campaign_id": approval.campaign_id,
+        "proxy_approval_id": approval.approval_id,
+        "proxy_approval_sha256": approval.approval_sha256,
+        "provider_meter": "proxy_filter_provider_billed_bytes_v1",
+        "proxy_work_item_id": approval.allocations[0].work_item_id,
+        "proxy_attempt_id": attempt_id,
+        "lease_id": lease_id,
+        "canonical_url": first_url,
+    }
+    sequence = [
+        {
+            "event_type": "lease_created",
+            "max_bytes": 1_000,
+            "target_manifest_sha256": manifest,
+            "logical_target_units": 2,
+            "expected_endpoint_labels": expected_labels,
+        },
+        {
+            "event_type": "endpoint_started",
+            "request_id": "a" * 24,
+            "endpoint": bootstrap_label,
+            "lease_total_bytes": 0,
+        },
+        {
+            "event_type": "bytes",
+            "direction": "down",
+            "endpoint": bootstrap_label,
+            "bytes": 100,
+            "lease_total_bytes": 100,
+        },
+    ]
+    running_total = 100
+    active_request_id = "a" * 24
+    active_endpoint = bootstrap_label
+    active_amount = 100
+    for index, label in enumerate(target_labels, start=1):
+        amount = target_amounts[label.removeprefix("target:")]
+        request_id = f"{index}" * 24
+        sequence.extend(
+            (
+                {
+                    "event_type": "endpoint_switched",
+                    "request_id": active_request_id,
+                    "endpoint": active_endpoint,
+                    "provider_bytes": active_amount,
+                    "lease_total_bytes": running_total,
+                    "next_request_id": request_id,
+                    "next_endpoint": label,
+                },
+                {
+                    "event_type": "bytes",
+                    "direction": "down",
+                    "endpoint": label,
+                    "bytes": amount,
+                    "lease_total_bytes": running_total + amount,
+                },
+            )
+        )
+        running_total += amount
+        active_request_id = request_id
+        active_endpoint = label
+        active_amount = amount
+    sequence.append(
+        {
+            "event_type": "endpoint_finished",
+            "request_id": active_request_id,
+            "endpoint": active_endpoint,
+            "provider_bytes": active_amount,
+            "lease_total_bytes": running_total,
+        }
+    )
+    sequence.append(
+        {
+            "event_type": "lease_closed",
+            "total_bytes": 1_000,
+            "endpoint_request_provider_bytes": {
+                bootstrap_label: [100],
+                **{
+                    label: [target_amounts[label.removeprefix("target:")]]
+                    for label in target_labels
+                },
+            },
+        }
+    )
+    events = [
+        {**common, **event, "event_id": f"{index + 1:024x}"}
+        for index, event in enumerate(sequence)
+    ]
+    request_events[0].update(
+        {
+            "route": "paid_lease",
+            "final_paid_route": "paid_flaresolverr",
+            "gateway_cleanup_complete": True,
+            "request_bytes": 50,
+            "response_bytes": 950,
+            "resource_bytes": 1_000,
+            "gateway_target_manifest_sha256": manifest,
+            "gateway_endpoint_provider_bytes": target_amounts,
+            "gateway_bootstrap_provider_bytes": 100,
+        }
+    )
+    snapshot["leases_used"] = 2
+    allocation = snapshot["allocations"][approval.allocations[0].allocation_id]
+    allocation["leases_used"] = 2
+    allocation["attempts"][0].update(
+        {
+            "target_manifest_sha256": manifest,
+            "logical_target_units": 2,
+            "expected_endpoint_labels": expected_labels,
+        }
+    )
+    return approval, events, request_events, snapshot, dag_id, run_id
 
 
 @pytest.mark.unit
@@ -2675,7 +2981,10 @@ def test_campaign_ledger_rejects_fake_request_lease_with_same_total(monkeypatch)
     approval, events, request_events, snapshot, dag_id, run_id = (
         _finished_campaign_reconciliation_case()
     )
-    request_events[0] = {**request_events[0], "lease_id": "fake-lease"}
+    request_events[0] = {
+        **request_events[0],
+        "lease_id_hash": hashlib.sha256(b"fake-lease").hexdigest(),
+    }
     monkeypatch.setattr(
         mod, "paid_campaign_gateway_call", _campaign_gateway_stub(snapshot)
     )
@@ -2711,6 +3020,152 @@ def test_campaign_ledger_reconciles_zero_byte_finished_lease(monkeypatch):
         )
         == 0
     )
+
+
+@pytest.mark.unit
+def test_campaign_ledger_reconciles_one_atomic_paid_batch(monkeypatch):
+    mod = _load_dag_module()
+    approval, events, request_events, snapshot, dag_id, run_id = (
+        _finished_batch_campaign_reconciliation_case()
+    )
+    monkeypatch.setattr(
+        mod, "paid_campaign_gateway_call", _campaign_gateway_stub(snapshot)
+    )
+
+    assert (
+        mod._campaign_ledger_paid_bytes(
+            SimpleNamespace(is_paid=True, approval=approval),
+            events,
+            request_events,
+            dag_id=dag_id,
+            run_id=run_id,
+        )
+        == 1_000
+    )
+
+
+@pytest.mark.unit
+def test_campaign_ledger_rejects_batch_endpoint_reattribution(monkeypatch):
+    mod = _load_dag_module()
+    approval, events, request_events, snapshot, dag_id, run_id = (
+        _finished_batch_campaign_reconciliation_case()
+    )
+    endpoint_bytes = request_events[0]["gateway_endpoint_provider_bytes"]
+    first, second = sorted(endpoint_bytes)
+    endpoint_bytes[first] -= 1
+    endpoint_bytes[second] += 1
+    monkeypatch.setattr(
+        mod, "paid_campaign_gateway_call", _campaign_gateway_stub(snapshot)
+    )
+
+    with pytest.raises(mod.AirflowException, match="batch.*attribution differs"):
+        mod._campaign_ledger_paid_bytes(
+            SimpleNamespace(is_paid=True, approval=approval),
+            events,
+            request_events,
+            dag_id=dag_id,
+            run_id=run_id,
+        )
+
+
+@pytest.mark.unit
+def test_campaign_ledger_rejects_batch_bytes_outside_endpoint_boundary(monkeypatch):
+    mod = _load_dag_module()
+    approval, events, request_events, snapshot, dag_id, run_id = (
+        _finished_batch_campaign_reconciliation_case()
+    )
+    events.pop(1)  # Remove bootstrap endpoint_started but retain its billed bytes.
+    monkeypatch.setattr(
+        mod, "paid_campaign_gateway_call", _campaign_gateway_stub(snapshot)
+    )
+
+    with pytest.raises(mod.AirflowException, match="byte event is malformed"):
+        mod._campaign_ledger_paid_bytes(
+            SimpleNamespace(is_paid=True, approval=approval),
+            events,
+            request_events,
+            dag_id=dag_id,
+            run_id=run_id,
+        )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "tamper",
+    ("from_request", "to_endpoint", "provider_bytes", "cumulative_bytes"),
+)
+def test_campaign_ledger_rejects_tampered_atomic_endpoint_switch(
+    monkeypatch, tamper
+):
+    mod = _load_dag_module()
+    approval, events, request_events, snapshot, dag_id, run_id = (
+        _finished_batch_campaign_reconciliation_case()
+    )
+    switch = next(
+        event for event in events if event["event_type"] == "endpoint_switched"
+    )
+    if tamper == "from_request":
+        switch["request_id"] = "f" * 24
+    elif tamper == "to_endpoint":
+        switch["next_endpoint"] = switch["endpoint"]
+    elif tamper == "provider_bytes":
+        switch["provider_bytes"] += 1
+    else:
+        switch["lease_total_bytes"] += 1
+    monkeypatch.setattr(
+        mod, "paid_campaign_gateway_call", _campaign_gateway_stub(snapshot)
+    )
+
+    with pytest.raises(mod.AirflowException, match="endpoint switch is malformed"):
+        mod._campaign_ledger_paid_bytes(
+            SimpleNamespace(is_paid=True, approval=approval),
+            events,
+            request_events,
+            dag_id=dag_id,
+            run_id=run_id,
+        )
+
+
+@pytest.mark.unit
+def test_campaign_ledger_rejects_batch_manifest_witness_drift(monkeypatch):
+    mod = _load_dag_module()
+    approval, events, request_events, snapshot, dag_id, run_id = (
+        _finished_batch_campaign_reconciliation_case()
+    )
+    request_events[0]["gateway_target_manifest_sha256"] = "f" * 64
+    monkeypatch.setattr(
+        mod, "paid_campaign_gateway_call", _campaign_gateway_stub(snapshot)
+    )
+
+    with pytest.raises(mod.AirflowException, match="batch.*attribution differs"):
+        mod._campaign_ledger_paid_bytes(
+            SimpleNamespace(is_paid=True, approval=approval),
+            events,
+            request_events,
+            dag_id=dag_id,
+            run_id=run_id,
+        )
+
+
+@pytest.mark.unit
+def test_campaign_ledger_rejects_batch_logical_target_counter_drift(monkeypatch):
+    mod = _load_dag_module()
+    approval, events, request_events, snapshot, dag_id, run_id = (
+        _finished_batch_campaign_reconciliation_case()
+    )
+    snapshot["leases_used"] = 1
+    monkeypatch.setattr(
+        mod, "paid_campaign_gateway_call", _campaign_gateway_stub(snapshot)
+    )
+
+    with pytest.raises(mod.AirflowException, match="total target counters differ"):
+        mod._campaign_ledger_paid_bytes(
+            SimpleNamespace(is_paid=True, approval=approval),
+            events,
+            request_events,
+            dag_id=dag_id,
+            run_id=run_id,
+        )
 
 
 @pytest.mark.unit

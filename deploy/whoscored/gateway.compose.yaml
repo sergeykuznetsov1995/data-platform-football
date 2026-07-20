@@ -9,11 +9,9 @@
 # сервисов управляется ТОЛЬКО этим файлом. Это закрывает дыру, зафиксированную в
 # /root/SHARED-STACK-PROTOCOL.md («fbref/whoscored — вынести так же, как sofascore»).
 #
-# Что здесь: платный трио WhoScored (L7-шлюз + выделенный FlareSolverr + байт-метрич.
-# фильтр-прокси) и его сегментированные сети. daily/backfill/6h-canary остаются
-# direct-only и этот шлюз НЕ используют (код-sentinel WHOSCORED_FULL_PAID_CRAWL_AVAILABLE=False).
-# Шлюз нужен только для санкционированной измерительной канарейки dag_canary_whoscored_proxy
-# (1 GB, order 38950, при свежем provider-receipt и ready-v1 attestation).
+# Что здесь: платный трио WhoScored (L7-шлюз + выделенный FlareSolverr +
+# байт-метричный фильтр-прокси) и все четыре принадлежащие ему сети. Общий
+# проект подключает только scheduler к external dp-whoscored-paid-api.
 #
 # Запуск (из корня стабильного чекаута, поднимает ТОЛЬКО этот шлюз):
 #   docker compose -p whoscored-gw \
@@ -42,9 +40,7 @@
 #   2) Оставить у airflow-scheduler только внешнюю привязку к dp-whoscored-paid-api
 #      и WHOSCORED_PAID_GATEWAY_URL=http://whoscored_paid_gateway:8898.
 #   3) Поднять этот проект (`-p whoscored-gw up -d`), затем — общий scheduler.
-# Пока cutover не сделан, файл существует как готовый к ревью артефакт и как
-# изолированный egress для измерительной канарейки; routing работающего daily
-# (direct) он не меняет.
+name: whoscored-gw
 
 services:
   # L7-шлюз: единственная точка, куда ходит scheduler. Не видит ни прокси, ни
@@ -72,6 +68,7 @@ services:
       CONNECTION_CHECK_MAX_COUNT: "0"
       ALERT_ENV: ${ALERT_ENV:-}
       WHOSCORED_PAID_GATEWAY_TOKEN: ${WHOSCORED_PAID_GATEWAY_TOKEN:-}
+      WHOSCORED_PAID_BATCH_ENABLED: ${WHOSCORED_PAID_BATCH_ENABLED:-0}
       WHOSCORED_PROXY_CONTROL_TOKEN: ${WHOSCORED_PROXY_FILTER_CONTROL_TOKEN:-}
       WHOSCORED_PROXY_APPROVAL_HMAC_SECRET: ${WHOSCORED_PROXY_APPROVAL_HMAC_SECRET:-}
       WHOSCORED_PAID_ALERT_HMAC_SECRET: ${WHOSCORED_PAID_ALERT_HMAC_SECRET:-}
@@ -223,6 +220,10 @@ services:
       PROXY_FILTER_CONTROL_TOKEN: ${WHOSCORED_PROXY_FILTER_CONTROL_TOKEN:-}
       WHOSCORED_PROXY_APPROVAL_HMAC_SECRET: ${WHOSCORED_PROXY_APPROVAL_HMAC_SECRET:-}
       WHOSCORED_PROXY_LEDGER_HMAC_SECRET: ${WHOSCORED_PROXY_LEDGER_HMAC_SECRET:-}
+      WHOSCORED_PROVIDER_ORDER_ID: ${WHOSCORED_PROVIDER_ORDER_ID:?set exact provider order id}
+      WHOSCORED_PROVIDER_POLICY_SHA256: ${WHOSCORED_PROVIDER_POLICY_SHA256:?set exact signed provider-policy sha256}
+      WHOSCORED_PROXY_FILTER_DAILY_BUDGET_BYTES: ${WHOSCORED_PROXY_FILTER_DAILY_BUDGET_BYTES:?set exact provider-policy daily cap in decimal bytes}
+      WHOSCORED_PROXY_FILTER_MAX_LEASE_BYTES: ${WHOSCORED_PROXY_FILTER_MAX_LEASE_BYTES:-2000000}
       TM_PROXY_CONTROL_TOKEN: ""
       WHOSCORED_PROXY_CAMPAIGN_LEDGER_PATH: /opt/airflow/state/whoscored-proxy-filter/whoscored_campaigns.json
       PROXY_POOL_JSON: ${WHOSCORED_PROXY_POOL_JSON:-}
@@ -242,10 +243,10 @@ services:
       - /opt/airflow/configs/proxy_filter/blocklist.txt
       - --out
       - /opt/airflow/state/whoscored-proxy-filter/bytes.json
-      - --daily-budget-mb
-      - ${WHOSCORED_PROXY_FILTER_DAILY_BUDGET_MB:-850}
-      - --max-lease-mb
-      - ${WHOSCORED_PROXY_FILTER_MAX_LEASE_MB:-2}
+      - --daily-budget-bytes
+      - ${WHOSCORED_PROXY_FILTER_DAILY_BUDGET_BYTES:?set exact provider-policy daily cap in decimal bytes}
+      - --max-lease-bytes
+      - ${WHOSCORED_PROXY_FILTER_MAX_LEASE_BYTES:-2000000}
       - --max-lease-ttl-seconds
       - ${WHOSCORED_PROXY_FILTER_MAX_LEASE_TTL_SECONDS:-3600}
       - --dagrun-budget-bytes
@@ -256,8 +257,6 @@ services:
       - ${WHOSCORED_PROXY_FILTER_URL_BUDGET_BYTES:-2000000}
       - --max-active-leases
       - ${WHOSCORED_PROXY_FILTER_MAX_ACTIVE_LEASES:-2}
-      - --sofascore-budget-artifact
-      - /opt/airflow/configs/sofascore/proxy_budget_canary.json
       - --sofascore-canary-hard-cap-bytes
       - "0"
       - --sofascore-discovery-dagrun-budget-bytes
@@ -296,12 +295,6 @@ services:
       - type: bind
         source: ./configs/proxy_filter
         target: /opt/airflow/configs/proxy_filter
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ./configs/sofascore
-        target: /opt/airflow/configs/sofascore
         read_only: true
         bind:
           create_host_path: false

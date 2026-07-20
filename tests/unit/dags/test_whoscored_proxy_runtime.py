@@ -25,7 +25,9 @@ def _mounted_approval_root(monkeypatch, tmp_path):
     monkeypatch.setenv("WHOSCORED_PROXY_APPROVAL_ROOT", str(tmp_path))
 
 
-def _context(conf=None, *, task_id="ingest_active_scope", dag_id="dag_ingest_whoscored"):
+def _context(
+    conf=None, *, task_id="ingest_active_scope", dag_id="dag_ingest_whoscored"
+):
     return {
         "dag": SimpleNamespace(dag_id=dag_id),
         "dag_run": SimpleNamespace(
@@ -204,7 +206,7 @@ def test_signed_paid_runtime_uses_deployment_path_and_exact_allocation(
     monkeypatch.setattr(runtime, "WHOSCORED_FULL_PAID_CRAWL_AVAILABLE", True)
     monkeypatch.setattr(runtime, "WHOSCORED_PROVIDER_INVOICE_HARD_CAP_AVAILABLE", True)
     monkeypatch.setattr(runtime, "WHOSCORED_PAID_APPLICATION_GATEWAY_AVAILABLE", True)
-    monkeypatch.setenv("WHOSCORED_PROXY_APPROVAL_PATH", str(approval_path))
+    monkeypatch.delenv("WHOSCORED_PROXY_APPROVAL_PATH", raising=False)
     monkeypatch.setattr(runtime, "_verify_release_pins", lambda _approval: None)
     conf = {
         "transport_policy": "direct_then_paid",
@@ -247,6 +249,45 @@ def test_signed_paid_runtime_uses_deployment_path_and_exact_allocation(
     assert runtime.os.environ["WHOSCORED_PROXY_CONTROL_TOKEN"] == SECRET
     assert runtime.os.environ["WHOSCORED_PROXY_APPROVAL_HMAC_SECRET"] == "a" * 32
     assert runtime.os.environ["WHOSCORED_PAID_ALERT_HMAC_SECRET"] == "h" * 32
+
+
+@pytest.mark.unit
+def test_paid_approval_swap_after_fstat_cannot_change_fd_pinned_bytes(
+    monkeypatch, tmp_path
+):
+    work_item = runtime.stable_scope_work_item("WS-252-2=2526")
+    signed = _signed_approval(scope_work_item=work_item)
+    approval_path = tmp_path / f"{signed['approval_id']}.json"
+    approval_path.write_text(json.dumps(signed), encoding="utf-8")
+    approval_path.chmod(0o600)
+    replacement = tmp_path / "replacement.json"
+    replacement.write_text("{}", encoding="utf-8")
+    replacement.chmod(0o600)
+    monkeypatch.setattr(runtime, "_verify_release_pins", lambda _approval: None)
+
+    real_fstat = runtime.os.fstat
+    calls = 0
+
+    def swap_after_file_metadata(descriptor):
+        nonlocal calls
+        metadata = real_fstat(descriptor)
+        calls += 1
+        if calls == 2:
+            runtime.os.replace(replacement, approval_path)
+        return metadata
+
+    monkeypatch.setattr(runtime.os, "fstat", swap_after_file_metadata)
+    conf = {
+        "transport_policy": "direct_then_paid",
+        "paid_approval_id": signed["approval_id"],
+        "paid_approval_sha256": signed["approval_sha256"],
+    }
+
+    resolved = runtime.resolve_paid_runtime(_context(conf))
+
+    assert resolved.approval is not None
+    assert resolved.approval.approval_sha256 == signed["approval_sha256"]
+    assert json.loads(approval_path.read_text(encoding="utf-8")) == {}
 
 
 @pytest.mark.unit
@@ -310,9 +351,7 @@ def test_backfill_paid_crawl_gate_is_code_owned(monkeypatch, tmp_path):
         runtime.WhoScoredProxyRuntimeError,
         match="full paid crawl is disabled",
     ):
-        runtime.resolve_paid_runtime(
-            _context(conf, dag_id="dag_backfill_whoscored")
-        )
+        runtime.resolve_paid_runtime(_context(conf, dag_id="dag_backfill_whoscored"))
 
 
 @pytest.mark.unit
@@ -555,8 +594,13 @@ def test_paid_source_guard_revalidates_receipt_and_emits_in_task_guard(monkeypat
 _SCHEDULED_RUN_ID = "scheduled__2026-07-19T10:00:00+00:00"
 
 
-def _scheduled_context(*, dag_id="dag_ingest_whoscored", run_type="scheduled",
-                       run_id=_SCHEDULED_RUN_ID, conf=None):
+def _scheduled_context(
+    *,
+    dag_id="dag_ingest_whoscored",
+    run_type="scheduled",
+    run_id=_SCHEDULED_RUN_ID,
+    conf=None,
+):
     return {
         "dag": SimpleNamespace(dag_id=dag_id),
         "dag_run": SimpleNamespace(
@@ -568,20 +612,31 @@ def _scheduled_context(*, dag_id="dag_ingest_whoscored", run_type="scheduled",
     }
 
 
-def _write_pointer(tmp_path, *, run_id=_SCHEDULED_RUN_ID, dag_id="dag_ingest_whoscored",
-                   approval_id="wsdaily-approval-x", approval_sha256="c" * 64,
-                   mode=0o600, schema_version=1):
+def _write_pointer(
+    tmp_path,
+    *,
+    run_id=_SCHEDULED_RUN_ID,
+    dag_id="dag_ingest_whoscored",
+    approval_id="wsdaily-approval-x",
+    approval_sha256="c" * 64,
+    mode=0o600,
+    schema_version=1,
+):
     root = tmp_path / "pointers"
     root.mkdir(exist_ok=True)
     name = hashlib.sha256(run_id.encode("utf-8")).hexdigest() + ".json"
     path = root / name
-    path.write_text(json.dumps({
-        "schema_version": schema_version,
-        "dag_id": dag_id,
-        "run_id": run_id,
-        "approval_id": approval_id,
-        "approval_sha256": approval_sha256,
-    }))
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": schema_version,
+                "dag_id": dag_id,
+                "run_id": run_id,
+                "approval_id": approval_id,
+                "approval_sha256": approval_sha256,
+            }
+        )
+    )
     path.chmod(mode)
     return root, path
 
@@ -590,6 +645,9 @@ def _write_pointer(tmp_path, *, run_id=_SCHEDULED_RUN_ID, dag_id="dag_ingest_who
 def test_scheduled_pointer_injects_signed_pins_for_ingest(monkeypatch, tmp_path):
     root, _ = _write_pointer(tmp_path)
     monkeypatch.setenv(runtime.SCHEDULED_PAID_POINTER_ROOT_ENV, str(root))
+    monkeypatch.setenv(
+        runtime.SCHEDULED_PAID_MODE_ENV, runtime.SCHEDULED_PAID_MODE_REQUIRED
+    )
     conf = runtime._effective_transport_conf(_scheduled_context())
     assert conf["transport_policy"] == runtime.TRANSPORT_POLICY_DIRECT_THEN_PAID
     assert conf[runtime.PAID_APPROVAL_ID_CONF] == "wsdaily-approval-x"
@@ -630,14 +688,76 @@ def test_missing_pointer_stays_direct(monkeypatch, tmp_path):
 
 
 @pytest.mark.unit
-def test_explicit_conf_wins_over_pointer(monkeypatch, tmp_path):
+def test_paid_required_missing_pointer_fails_before_transport(monkeypatch, tmp_path):
+    root = tmp_path / "pointers"
+    root.mkdir()
+    monkeypatch.setenv(runtime.SCHEDULED_PAID_POINTER_ROOT_ENV, str(root))
+    monkeypatch.setenv(
+        runtime.SCHEDULED_PAID_MODE_ENV, runtime.SCHEDULED_PAID_MODE_REQUIRED
+    )
+
+    with pytest.raises(
+        runtime.WhoScoredProxyRuntimeError, match="cannot be opened safely"
+    ):
+        runtime.resolve_transport_policy(_scheduled_context())
+
+
+@pytest.mark.unit
+def test_paid_required_rejects_any_dagrun_conf_before_pointer(monkeypatch, tmp_path):
     root, _ = _write_pointer(tmp_path)
     monkeypatch.setenv(runtime.SCHEDULED_PAID_POINTER_ROOT_ENV, str(root))
-    conf = runtime._effective_transport_conf(
-        _scheduled_context(conf={"transport_policy": "direct_only"})
+    monkeypatch.setenv(
+        runtime.SCHEDULED_PAID_MODE_ENV, runtime.SCHEDULED_PAID_MODE_REQUIRED
     )
-    assert conf["transport_policy"] == "direct_only"
-    assert runtime.PAID_APPROVAL_ID_CONF not in conf
+
+    with pytest.raises(
+        runtime.WhoScoredProxyRuntimeError, match="conf must be exactly empty"
+    ):
+        runtime.resolve_transport_policy(
+            _scheduled_context(conf={"unrelated_selector": "mutable"})
+        )
+
+
+@pytest.mark.unit
+def test_manual_default_stays_direct_when_scheduled_paid_is_required(monkeypatch):
+    monkeypatch.setenv(
+        runtime.SCHEDULED_PAID_MODE_ENV, runtime.SCHEDULED_PAID_MODE_REQUIRED
+    )
+    assert (
+        runtime.resolve_transport_policy(
+            _scheduled_context(run_type="manual", run_id="manual__operator")
+        )
+        == runtime.TRANSPORT_POLICY_DIRECT_ONLY
+    )
+
+
+@pytest.mark.unit
+def test_disabled_scheduled_mode_rejects_explicit_paid_conf_without_pointer_read(
+    monkeypatch, tmp_path
+):
+    root, _ = _write_pointer(tmp_path)
+    monkeypatch.setenv(runtime.SCHEDULED_PAID_POINTER_ROOT_ENV, str(root))
+    monkeypatch.setenv(
+        runtime.SCHEDULED_PAID_MODE_ENV, runtime.SCHEDULED_PAID_MODE_DISABLED
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_read_private_root_artifact",
+        lambda *_args, **_kwargs: pytest.fail("disabled mode read a pointer"),
+    )
+    context = _scheduled_context(
+        conf={
+            "transport_policy": runtime.TRANSPORT_POLICY_DIRECT_THEN_PAID,
+            runtime.PAID_APPROVAL_ID_CONF: "attacker-selected",
+            runtime.PAID_APPROVAL_SHA256_CONF: "a" * 64,
+        }
+    )
+
+    with pytest.raises(
+        runtime.WhoScoredProxyRuntimeError,
+        match="paid-disabled mode rejects explicit transport authority",
+    ):
+        runtime.resolve_transport_policy(context)
 
 
 @pytest.mark.unit
@@ -646,13 +766,22 @@ def test_pointer_run_id_mismatch_raises(monkeypatch, tmp_path):
     root, _ = _write_pointer(tmp_path, run_id=_SCHEDULED_RUN_ID)
     # Rewrite the body to carry a mismatched run_id.
     name = hashlib.sha256(_SCHEDULED_RUN_ID.encode()).hexdigest() + ".json"
-    (root / name).write_text(json.dumps({
-        "schema_version": 1, "dag_id": "dag_ingest_whoscored",
-        "run_id": "scheduled__2000-01-01T00:00:00+00:00",
-        "approval_id": "x", "approval_sha256": "c" * 64,
-    }))
+    (root / name).write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "dag_id": "dag_ingest_whoscored",
+                "run_id": "scheduled__2000-01-01T00:00:00+00:00",
+                "approval_id": "x",
+                "approval_sha256": "c" * 64,
+            }
+        )
+    )
     (root / name).chmod(0o600)
     monkeypatch.setenv(runtime.SCHEDULED_PAID_POINTER_ROOT_ENV, str(root))
+    monkeypatch.setenv(
+        runtime.SCHEDULED_PAID_MODE_ENV, runtime.SCHEDULED_PAID_MODE_REQUIRED
+    )
     with pytest.raises(runtime.WhoScoredProxyRuntimeError):
         runtime._effective_transport_conf(_scheduled_context())
 
@@ -661,6 +790,9 @@ def test_pointer_run_id_mismatch_raises(monkeypatch, tmp_path):
 def test_pointer_wrong_mode_raises(monkeypatch, tmp_path):
     root, _ = _write_pointer(tmp_path, mode=0o644)
     monkeypatch.setenv(runtime.SCHEDULED_PAID_POINTER_ROOT_ENV, str(root))
+    monkeypatch.setenv(
+        runtime.SCHEDULED_PAID_MODE_ENV, runtime.SCHEDULED_PAID_MODE_REQUIRED
+    )
     with pytest.raises(runtime.WhoScoredProxyRuntimeError):
         runtime._effective_transport_conf(_scheduled_context())
 
@@ -668,6 +800,7 @@ def test_pointer_wrong_mode_raises(monkeypatch, tmp_path):
 @pytest.mark.unit
 def test_for_allocation_missing_ok_degrades_to_direct():
     from scrapers.whoscored.proxy_campaign import ProxyCampaignApproval
+
     approval = ProxyCampaignApproval.from_dict(
         _signed_approval(scope_work_item="scope-present")
     )
@@ -683,9 +816,7 @@ def test_for_allocation_missing_ok_degrades_to_direct():
     assert not degraded.is_paid
     # Unknown scope without missing_ok -> hard error.
     with pytest.raises(runtime.WhoScoredProxyRuntimeError):
-        base.for_allocation(
-            task_id="ingest_active_scope", work_item_id="scope-unknown"
-        )
+        base.for_allocation(task_id="ingest_active_scope", work_item_id="scope-unknown")
     # Exact match still binds.
     bound = base.for_allocation(
         task_id="ingest_active_scope", work_item_id="scope-present", missing_ok=True
@@ -699,11 +830,19 @@ def test_stable_profiles_work_item_is_constant():
 
 
 @pytest.mark.unit
-def test_pointer_transient_stat_error_degrades_to_direct(monkeypatch, tmp_path):
-    # A non-ENOENT stat failure (here NotADirectoryError: the pointer "root" is a
-    # regular file) must degrade the optional upgrade to direct, not crash.
-    fake_root = tmp_path / "not-a-dir"
-    fake_root.write_text("x")
-    monkeypatch.setenv(runtime.SCHEDULED_PAID_POINTER_ROOT_ENV, str(fake_root))
+@pytest.mark.parametrize("pointer_mode", (0o600, 0o644))
+def test_disabled_mode_never_reads_even_valid_or_tampered_pointer(
+    monkeypatch, tmp_path, pointer_mode
+):
+    root, _ = _write_pointer(tmp_path, mode=pointer_mode)
+    monkeypatch.setenv(runtime.SCHEDULED_PAID_POINTER_ROOT_ENV, str(root))
+    monkeypatch.setenv(
+        runtime.SCHEDULED_PAID_MODE_ENV, runtime.SCHEDULED_PAID_MODE_DISABLED
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_read_private_root_artifact",
+        lambda *_args, **_kwargs: pytest.fail("disabled mode read a pointer"),
+    )
     conf = runtime._effective_transport_conf(_scheduled_context())
     assert "transport_policy" not in conf

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
+import os
 import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -42,10 +44,43 @@ ENV_FILES = (
     Path("/evidence/proxy.env"),
 )
 CONFIG_HASHES = {service: SHA_D for service in admission.PROTECTED_SERVICES}
+PROVIDER_AUTHORITY = {
+    "daily_cap_bytes": 300_000_000,
+    "order_id": "38950",
+    "provider_policy_sha256": "e" * 64,
+}
+
+
+def test_verify_running_cli_requires_split_provenance_inputs() -> None:
+    args = admission._parser().parse_args(
+        [
+            "verify-running",
+            "--deployment-attestation",
+            "/evidence/deployment.json",
+            "--common-override",
+            "/evidence/common.yaml",
+            "--gateway-override",
+            "/evidence/gateway.yaml",
+            "--env-file",
+            "/evidence/production.env",
+            "--provider-policy",
+            "/authority/provider-policy.json",
+            "--owner-secret-file",
+            "/run/credentials/owner-hmac",
+            "--deployment-admission-receipt",
+            "/evidence/rendered-receipt.json",
+            "--service",
+            "airflow-scheduler",
+        ]
+    )
+
+    assert args.command == "verify-running"
+    assert args.common_override == Path("/evidence/common.yaml")
+    assert args.gateway_override == Path("/evidence/gateway.yaml")
 PROXY_COMMAND = tuple(
     {
-        "${WHOSCORED_PROXY_FILTER_DAILY_BUDGET_MB:-850}": "850",
-        "${WHOSCORED_PROXY_FILTER_MAX_LEASE_MB:-2}": "2",
+        "${WHOSCORED_PROXY_FILTER_DAILY_BUDGET_BYTES:?set exact provider-policy daily cap in decimal bytes}": "300000000",
+        "${WHOSCORED_PROXY_FILTER_MAX_LEASE_BYTES:-2000000}": "2000000",
         "${WHOSCORED_PROXY_FILTER_MAX_LEASE_TTL_SECONDS:-3600}": "3600",
         "${WHOSCORED_PROXY_FILTER_DAGRUN_BUDGET_BYTES:-1000000000}": "1000000000",
         "${WHOSCORED_PROXY_FILTER_URL_BUDGET_BYTES:-2000000}": "2000000",
@@ -77,11 +112,13 @@ def _rendered_environment(service: str) -> dict[str, str]:
             }
         )
         environment["WHOSCORED_SOURCE_POOL_SLOTS"] = "2"
+        environment["WHOSCORED_PAID_BATCH_ENABLED"] = "0"
         environment["WHOSCORED_PAID_GATEWAY_TOKEN"] = "g" * 32
     elif service == "flaresolverr_whoscored_paid":
         environment["WHOSCORED_FLARESOLVERR_GATEWAY_SECRET"] = "f" * 32
     elif service == "whoscored_paid_gateway":
         environment["WHOSCORED_FLARESOLVERR_GATEWAY_SECRET"] = "f" * 32
+        environment["WHOSCORED_PAID_BATCH_ENABLED"] = "0"
         environment["WHOSCORED_PAID_ALERT_HMAC_SECRET"] = "h" * 32
         environment["WHOSCORED_PAID_ALERT_SECRET_PATH"] = (
             "/opt/airflow/secure/whoscored-alert-authority/paid-alert-secret.json"
@@ -94,6 +131,10 @@ def _rendered_environment(service: str) -> dict[str, str]:
         environment["WHOSCORED_PROXY_CONTROL_TOKEN"] = "c" * 32
     elif service == "whoscored_proxy_filter":
         environment["PROXY_FILTER_CONTROL_TOKEN"] = "c" * 32
+        environment["WHOSCORED_PROVIDER_ORDER_ID"] = "38950"
+        environment["WHOSCORED_PROVIDER_POLICY_SHA256"] = "e" * 64
+        environment["WHOSCORED_PROXY_FILTER_DAILY_BUDGET_BYTES"] = "300000000"
+        environment["WHOSCORED_PROXY_FILTER_MAX_LEASE_BYTES"] = "2000000"
         environment["WHOSCORED_PROXY_APPROVAL_HMAC_SECRET"] = "a" * 32
         environment["WHOSCORED_PROXY_LEDGER_HMAC_SECRET"] = "l" * 32
     return environment
@@ -159,6 +200,87 @@ def test_provider_quota_receipt_binds_fresh_protected_screenshot(
     assert projection["screenshot_path"] == str(screenshot)
 
 
+def _provider_policy(
+    tmp_path: Path, *, receipt: Path, observed: datetime
+) -> tuple[Path, Path, dict[str, object]]:
+    owner_secret = tmp_path / "owner.key"
+    owner_secret.write_text("o" * 64 + "\n", encoding="utf-8")
+    owner_secret.chmod(0o600)
+    unsigned: dict[str, object] = {
+        "schema_version": 1,
+        "source": "whoscored",
+        "provider_id": "PROXYS.IO",
+        "order_id": "38950",
+        "plan_id": "Bronze",
+        "valid_from": (observed - timedelta(hours=1)).isoformat(),
+        "valid_until": (observed + timedelta(days=2)).isoformat(),
+        "receipt_sha256": hashlib.sha256(receipt.read_bytes()).hexdigest(),
+        "provider_quota_bytes": 1_000_000_000,
+        "safety_cap_bytes": 300_000_000,
+        "daily_cap_bytes": 135_000_000,
+        "monthly_cap_bytes": 300_000_000,
+        "order_cap_bytes": 300_000_000,
+        "signature_algorithm": "hmac-sha256",
+    }
+    digest = hashlib.sha256(admission._canonical_bytes(unsigned)).hexdigest()
+    body = {**unsigned, "document_sha256": digest}
+    value = {
+        **body,
+        "signature": hmac.new(
+            ("o" * 64).encode(),
+            admission._canonical_bytes(body),
+            hashlib.sha256,
+        ).hexdigest(),
+    }
+    policy = tmp_path / "provider-policy.json"
+    _canonical(policy, value)
+    policy.chmod(0o600)
+    return policy, owner_secret, value
+
+
+def test_provider_receipt_is_bound_to_owner_signed_policy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    receipt, _screenshot, document = _provider_quota_receipt(monkeypatch, tmp_path)
+    observed = datetime.fromisoformat(str(document["observed_at"]).replace("Z", "+00:00"))
+    policy, owner_secret, value = _provider_policy(
+        tmp_path, receipt=receipt, observed=observed
+    )
+
+    projection = admission.validate_provider_quota_receipt(
+        receipt,
+        provider_policy_path=policy,
+        owner_secret_path=owner_secret,
+    )
+
+    assert projection["provider_policy_sha256"] == value["document_sha256"]
+    assert projection["safety_cap_bytes"] == 300_000_000
+
+
+@pytest.mark.parametrize("mutation", ("signature", "receipt"))
+def test_provider_policy_or_bound_receipt_tampering_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mutation: str
+) -> None:
+    receipt, _screenshot, document = _provider_quota_receipt(monkeypatch, tmp_path)
+    observed = datetime.fromisoformat(str(document["observed_at"]).replace("Z", "+00:00"))
+    policy, owner_secret, value = _provider_policy(
+        tmp_path, receipt=receipt, observed=observed
+    )
+    if mutation == "signature":
+        value["signature"] = "0" * 64
+        _canonical(policy, value)
+    else:
+        document["remaining_decimal_gb"] = "0.99"
+        _canonical(receipt, document)
+
+    with pytest.raises(admission.AdmissionError, match="signature|signed policy"):
+        admission.validate_provider_quota_receipt(
+            receipt,
+            provider_policy_path=policy,
+            owner_secret_path=owner_secret,
+        )
+
+
 @pytest.mark.parametrize("mutation", ["digest", "stale", "writable"])
 def test_provider_quota_receipt_rejects_unbound_or_stale_evidence(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mutation: str
@@ -185,6 +307,57 @@ def test_provider_quota_receipt_rejects_unbound_or_stale_evidence(
 
     with pytest.raises(admission.AdmissionError, match="digest|stale|protected"):
         admission.validate_provider_quota_receipt(receipt)
+
+
+def test_running_admission_reuses_deploy_gate_without_receipt_freshness(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    receipt, _screenshot, document = _provider_quota_receipt(monkeypatch, tmp_path)
+    observed = datetime.fromisoformat(str(document["observed_at"]).replace("Z", "+00:00"))
+    policy_path, owner_secret, _policy_value = _provider_policy(
+        tmp_path, receipt=receipt, observed=observed
+    )
+    policy = admission.validate_provider_policy(
+        policy_path, owner_secret_path=owner_secret
+    )
+    deployment = tmp_path / "deployment.json"
+    _canonical(deployment, _deployment())
+    deploy_receipt = tmp_path / "rendered-receipt.json"
+    _canonical(
+        deploy_receipt,
+        {
+            "config_hashes": CONFIG_HASHES,
+            "deployment_attestation": {
+                "path": str(deployment),
+                "sha256": hashlib.sha256(deployment.read_bytes()).hexdigest(),
+            },
+            "output": "/evidence/rendered.json",
+            "projects": {
+                admission.COMMON_PROJECT: list(admission.COMMON_PROTECTED_SERVICES),
+                admission.GATEWAY_PROJECT: list(admission.GATEWAY_PROTECTED_SERVICES),
+            },
+            "provider_quota_receipt": {
+                "daily_cap_bytes": policy["daily_cap_bytes"],
+                "order_id": policy["order_id"],
+                "provider_policy_sha256": policy["document_sha256"],
+                "receipt_sha256": policy["receipt_sha256"],
+            },
+            "schema_version": 2,
+            "status": "rendered-admitted-v2",
+        },
+    )
+    monkeypatch.setattr(
+        admission, "_provider_receipt_now", lambda: observed + timedelta(hours=25)
+    )
+
+    projection = admission.validate_deployment_admission_receipt(
+        deploy_receipt,
+        deployment_attestation_path=deployment,
+        provider_policy=policy,
+    )
+
+    assert projection["path"] == str(deploy_receipt)
+    assert projection["sha256"] == hashlib.sha256(deploy_receipt.read_bytes()).hexdigest()
 
 
 def _deployment(
@@ -614,14 +787,7 @@ def _rendered(bindings: Mapping[str, str] = BINDINGS) -> dict[str, object]:
     )
     proxy = services["whoscored_proxy_filter"]
     proxy.pop("cap_add")
-    proxy.update(
-        {
-            "depends_on": json.loads(
-                json.dumps(admission._EXPECTED_DEPENDS_ON["whoscored_proxy_filter"])
-            ),
-            "profiles": ["whoscored-paid"],
-        }
-    )
+    proxy.update({"profiles": ["whoscored-paid"]})
     return rendered
 
 
@@ -668,6 +834,9 @@ def _materialize_bind_sources(rendered: Mapping[str, object], tmp_path: Path) ->
     approvals = host / "approvals"
     approvals.mkdir()
     approvals.chmod(0o700)
+    pointers = host / "scheduled-pointers"
+    pointers.mkdir()
+    pointers.chmod(0o700)
     alert_authority = host / "alert-authority"
     alert_authority.mkdir()
     alert_authority.chmod(0o700)
@@ -681,6 +850,10 @@ def _materialize_bind_sources(rendered: Mapping[str, object], tmp_path: Path) ->
             "airflow-scheduler",
             "/opt/airflow/secure/whoscored-approvals",
         ): approvals,
+        (
+            "airflow-scheduler",
+            "/opt/airflow/secure/whoscored-scheduled-pointers",
+        ): pointers,
         (
             "airflow-scheduler",
             "/opt/airflow/state/whoscored-proxy-filter",
@@ -704,8 +877,9 @@ def _materialize_bind_sources(rendered: Mapping[str, object], tmp_path: Path) ->
 
 
 def test_bind_source_policy_requires_preexisting_separate_protected_paths(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(admission, "_AIRFLOW_RUNTIME_UID", os.geteuid())
     rendered = _rendered()
     root = _materialize_bind_sources(rendered, tmp_path)
     projections = admission.verify_rendered_compose(rendered, BINDINGS)
@@ -728,8 +902,9 @@ def test_bind_source_policy_requires_preexisting_separate_protected_paths(
 
 
 def test_bind_source_policy_rejects_auto_create_and_writable_release_code(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(admission, "_AIRFLOW_RUNTIME_UID", os.geteuid())
     rendered = _rendered()
     root = _materialize_bind_sources(rendered, tmp_path)
     dags = _bind_volume(
@@ -743,6 +918,35 @@ def test_bind_source_policy_rejects_auto_create_and_writable_release_code(
     (root / "dags").chmod(0o775)
     projections = admission.verify_rendered_compose(rendered, BINDINGS)
     with pytest.raises(admission.AdmissionError, match="protected directory"):
+        admission._validate_bind_source_policy(projections, root=root)
+
+
+def test_bind_source_policy_rejects_wrong_airflow_authority_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert admission._AIRFLOW_RUNTIME_UID == 50_000
+    test_uid = os.geteuid()
+    monkeypatch.setattr(admission, "_AIRFLOW_RUNTIME_UID", test_uid)
+    rendered = _rendered()
+    root = _materialize_bind_sources(rendered, tmp_path)
+    approvals = Path(
+        str(
+            _bind_volume(
+                rendered,
+                service="airflow-scheduler",
+                target="/opt/airflow/secure/whoscored-approvals",
+            )["source"]
+        )
+    )
+    projections = admission.verify_rendered_compose(rendered, BINDINGS)
+
+    monkeypatch.setattr(admission, "_AIRFLOW_RUNTIME_UID", test_uid + 1)
+    with pytest.raises(admission.AdmissionError, match="must be owned by"):
+        admission._validate_bind_source_policy(projections, root=root)
+
+    monkeypatch.setattr(admission, "_AIRFLOW_RUNTIME_UID", test_uid)
+    approvals.chmod(0o770)
+    with pytest.raises(admission.AdmissionError, match="mode 0700 or 0750"):
         admission._validate_bind_source_policy(projections, root=root)
 
 
@@ -996,17 +1200,18 @@ def test_scheduler_admission_requires_gateway_token_and_forbids_raw_origins():
             )
 
 
-def test_scheduler_admission_accepts_exact_selected_approval_path():
+def test_scheduler_admission_rejects_static_selected_approval_path():
     environment = _rendered_environment("airflow-scheduler")
     environment["WHOSCORED_PROXY_APPROVAL_PATH"] = (
         "/opt/airflow/secure/whoscored-approvals/"
         "ws-measurement-20260717-v1.json"
     )
 
-    admission._validate_rendered_environment(
-        environment,
-        service="airflow-scheduler",
-    )
+    with pytest.raises(admission.AdmissionError, match="environment names"):
+        admission._validate_rendered_environment(
+            environment,
+            service="airflow-scheduler",
+        )
 
 
 @pytest.mark.parametrize(
@@ -1030,14 +1235,14 @@ def test_scheduler_admission_rejects_unowned_approval_path(
     environment = _rendered_environment("airflow-scheduler")
     environment["WHOSCORED_PROXY_APPROVAL_PATH"] = approval_path
 
-    with pytest.raises(admission.AdmissionError, match="approval path"):
+    with pytest.raises(admission.AdmissionError, match="environment names"):
         admission._validate_rendered_environment(
             environment,
             service="airflow-scheduler",
         )
 
 
-def test_rendered_compose_accepts_exact_selected_approval_path():
+def test_rendered_compose_rejects_static_selected_approval_path():
     rendered = _rendered()
     scheduler = rendered["services"]["airflow-scheduler"]
     scheduler["environment"]["WHOSCORED_PROXY_APPROVAL_PATH"] = (
@@ -1045,14 +1250,8 @@ def test_rendered_compose_accepts_exact_selected_approval_path():
         "ws-measurement-20260717-v1.json"
     )
 
-    projections = admission.verify_rendered_compose(rendered, BINDINGS)
-
-    assert dict(projections["airflow-scheduler"]["environment"])[
-        "WHOSCORED_PROXY_APPROVAL_PATH"
-    ] == (
-        "/opt/airflow/secure/whoscored-approvals/"
-        "ws-measurement-20260717-v1.json"
-    )
+    with pytest.raises(admission.AdmissionError, match="environment names"):
+        admission.verify_rendered_compose(rendered, BINDINGS)
 
 
 def test_scheduler_healthcheck_allows_attested_python_startup_time():
@@ -1142,6 +1341,13 @@ def test_paid_boundary_is_five_service_isolated_and_credential_bound():
     }
     assert gateway_volumes["/opt/airflow/state/whoscored-paid-gateway"][1] is False
     assert gateway_volumes["/opt/airflow/secure/whoscored-alert-authority"][1] is True
+    filter_volume_targets = {
+        target
+        for _kind, _source, target, _read_only in projections[
+            "whoscored_proxy_filter"
+        ]["volumes"]
+    }
+    assert "/opt/airflow/configs/sofascore" not in filter_volume_targets
     services = rendered["services"]
     assert isinstance(services, dict)
     gateway = services["whoscored_paid_gateway"]
@@ -1178,7 +1384,28 @@ def test_paid_gateway_command_endpoints_are_exact():
         admission.verify_rendered_compose(rendered, BINDINGS)
 
 
-def test_rendered_proxy_accepts_850_mib_daily_safety_cap() -> None:
+@pytest.mark.parametrize("value", ["", "true", "2"])
+def test_paid_gateway_rejects_invalid_paid_batch_control(value: str) -> None:
+    rendered = _rendered()
+    rendered["services"]["whoscored_paid_gateway"]["environment"][
+        "WHOSCORED_PAID_BATCH_ENABLED"
+    ] = value
+
+    with pytest.raises(admission.AdmissionError, match="paid-batch control"):
+        admission.verify_rendered_compose(rendered, BINDINGS)
+
+
+def test_paid_batch_control_must_match_across_scheduler_and_gateway() -> None:
+    rendered = _rendered()
+    rendered["services"]["whoscored_paid_gateway"]["environment"][
+        "WHOSCORED_PAID_BATCH_ENABLED"
+    ] = "1"
+
+    with pytest.raises(admission.AdmissionError, match="credentials differ"):
+        admission.verify_rendered_compose(rendered, BINDINGS)
+
+
+def test_rendered_proxy_accepts_300m_decimal_daily_safety_cap() -> None:
     rendered = _rendered()
     services = rendered["services"]
     assert isinstance(services, dict)
@@ -1186,15 +1413,15 @@ def test_rendered_proxy_accepts_850_mib_daily_safety_cap() -> None:
     assert isinstance(proxy, dict)
     command = proxy["command"]
     assert isinstance(command, list)
-    command[command.index("--daily-budget-mb") + 1] = "850"
+    command[command.index("--daily-budget-bytes") + 1] = "300000000"
 
     projection = admission.verify_rendered_compose(rendered, BINDINGS)
 
     assert projection["whoscored_proxy_filter"]["command"] == tuple(command)
 
 
-@pytest.mark.parametrize("value", ["851", "1000"])
-def test_rendered_proxy_rejects_daily_budget_above_850_mib(value: str) -> None:
+@pytest.mark.parametrize("value", ["300000001", "891289600"])
+def test_rendered_proxy_rejects_daily_budget_above_policy_ceiling(value: str) -> None:
     rendered = _rendered()
     services = rendered["services"]
     assert isinstance(services, dict)
@@ -1202,9 +1429,9 @@ def test_rendered_proxy_rejects_daily_budget_above_850_mib(value: str) -> None:
     assert isinstance(proxy, dict)
     command = proxy["command"]
     assert isinstance(command, list)
-    command[command.index("--daily-budget-mb") + 1] = value
+    command[command.index("--daily-budget-bytes") + 1] = value
 
-    with pytest.raises(admission.AdmissionError, match="daily-budget-mb"):
+    with pytest.raises(admission.AdmissionError, match="daily-budget-bytes"):
         admission.verify_rendered_compose(rendered, BINDINGS)
 
 
@@ -1238,8 +1465,18 @@ def test_rendered_proxy_rejects_invalid_dagrun_budget(value: str) -> None:
 
 def test_checked_in_compose_model_matches_admission_policy(tmp_path: Path) -> None:
     root = Path(__file__).absolute().parents[3]
-    override = tmp_path / "digest-only.yaml"
-    override.write_bytes(admission.compose_override_bytes(BINDINGS))
+    common_override = tmp_path / "common-digest-only.yaml"
+    gateway_override = tmp_path / "gateway-digest-only.yaml"
+    common_override.write_bytes(
+        admission.compose_override_bytes(
+            BINDINGS, admission.COMMON_PROTECTED_SERVICES
+        )
+    )
+    gateway_override.write_bytes(
+        admission.compose_override_bytes(
+            BINDINGS, admission.GATEWAY_PROTECTED_SERVICES
+        )
+    )
     environment = {
         "DOCKER_HOST": "unix:///run/docker.sock",
         "HOME": "/nonexistent",
@@ -1293,22 +1530,158 @@ def test_checked_in_compose_model_matches_admission_policy(tmp_path: Path) -> No
         assert result.returncode == 0, result.stderr.decode("utf-8", errors="replace")
         return result.stdout
 
-    projections, hashes, files, rendered = admission.render_attested_compose(
+    projections, hashes, files, rendered = admission.render_attested_projects(
         BINDINGS,
         root=root,
-        override_path=override,
+        common_override_path=common_override,
+        gateway_override_path=gateway_override,
         env_files=(root / ".env.example",),
-        project="data-platform",
+        provider_authority={
+            **PROVIDER_AUTHORITY,
+            "order_id": "replace-with-provider-order-id",
+            "provider_policy_sha256": "0" * 64,
+        },
         runner=runner,
     )
 
     assert set(projections) == set(admission.PROTECTED_SERVICES)
     assert set(hashes) == set(admission.PROTECTED_SERVICES)
-    assert files[-1] == override
-    rendered_services = rendered["services"]
-    assert isinstance(rendered_services, dict)
-    assert all("build" not in rendered_services[service] for service in BINDINGS)
-    assert len(calls) == 1 + len(admission.PROTECTED_SERVICES)
+    assert files[admission.COMMON_PROJECT][-1] == common_override
+    assert files[admission.GATEWAY_PROJECT][-1] == gateway_override
+    assert set(rendered) == {admission.COMMON_PROJECT, admission.GATEWAY_PROJECT}
+    assert len(calls) == 2 + len(admission.PROTECTED_SERVICES)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ("static-approval", "scheduler paid authority"),
+        ("missing-pointer", "pointer authority mount"),
+        ("paid-profile", "opt-in profile"),
+        ("common-dependency", "common-project service"),
+        ("provider-order", "admitted provider policy"),
+        ("provider-policy", "admitted provider policy"),
+        ("provider-budget", "admitted provider policy"),
+    ),
+)
+def test_split_render_rejects_legacy_single_project_controls(
+    tmp_path: Path, mutation: str, message: str
+) -> None:
+    root = tmp_path / "release"
+    (root / "deploy/whoscored").mkdir(parents=True)
+    for relative in (
+        "compose.yaml",
+        "compose.seaweedfs-supervised.yaml",
+        "deploy/whoscored/gateway.compose.yaml",
+    ):
+        (root / relative).write_text("# protected input\n", encoding="utf-8")
+    env_file = tmp_path / "production.env"
+    env_file.write_text("# protected input\n", encoding="utf-8")
+    common_override = tmp_path / "common.yaml"
+    gateway_override = tmp_path / "gateway.yaml"
+    common_override.write_bytes(
+        admission.compose_override_bytes(BINDINGS, admission.COMMON_PROTECTED_SERVICES)
+    )
+    gateway_override.write_bytes(
+        admission.compose_override_bytes(BINDINGS, admission.GATEWAY_PROTECTED_SERVICES)
+    )
+    combined = _rendered()
+    services = combined["services"]
+    common = {
+        "name": admission.COMMON_PROJECT,
+        "services": {
+            service: services[service]
+            for service in admission.COMMON_PROTECTED_SERVICES
+        },
+        "networks": {
+            **{
+                name: combined["networks"][name]
+                for name in ("backend", "frontend", "storage")
+            },
+            "whoscored-paid-api": admission._COMMON_EXTERNAL_NETWORKS[
+                "whoscored-paid-api"
+            ],
+        },
+        "volumes": combined["volumes"],
+    }
+    gateway = {
+        "name": admission.GATEWAY_PROJECT,
+        "services": {
+            service: services[service]
+            for service in admission.GATEWAY_PROTECTED_SERVICES
+        },
+        "networks": {
+            name: combined["networks"][name]
+            for name in (
+                "whoscored-paid-api",
+                "whoscored-paid-browser",
+                "whoscored-paid-direct-egress",
+                "whoscored-paid-provider-egress",
+            )
+        },
+    }
+    for model in gateway["services"].values():
+        model.pop("profiles", None)
+    gateway["services"]["whoscored_proxy_filter"].pop("depends_on", None)
+    if mutation == "static-approval":
+        environment = common["services"]["airflow-scheduler"]["environment"]
+        environment.pop("WHOSCORED_SCHEDULED_PAID_MODE")
+        environment.pop("WHOSCORED_SCHEDULED_PAID_POINTER_ROOT")
+        environment["WHOSCORED_PROXY_APPROVAL_PATH"] = (
+            "/opt/airflow/secure/whoscored-approvals/legacy.json"
+        )
+    elif mutation == "missing-pointer":
+        common["services"]["airflow-scheduler"]["volumes"] = [
+            volume
+            for volume in common["services"]["airflow-scheduler"]["volumes"]
+            if volume.get("target")
+            != "/opt/airflow/secure/whoscored-scheduled-pointers"
+        ]
+    elif mutation == "paid-profile":
+        gateway["services"]["whoscored_paid_gateway"]["profiles"] = [
+            "whoscored-paid"
+        ]
+    elif mutation == "common-dependency":
+        gateway["services"]["whoscored_proxy_filter"]["depends_on"] = {
+            "airflow-log-init": {
+                "condition": "service_completed_successfully",
+                "required": True,
+            }
+        }
+    elif mutation == "provider-order":
+        gateway["services"]["whoscored_proxy_filter"]["environment"][
+            "WHOSCORED_PROVIDER_ORDER_ID"
+        ] = "other-order"
+    elif mutation == "provider-policy":
+        gateway["services"]["whoscored_proxy_filter"]["environment"][
+            "WHOSCORED_PROVIDER_POLICY_SHA256"
+        ] = "f" * 64
+    else:
+        gateway["services"]["whoscored_proxy_filter"]["environment"][
+            "WHOSCORED_PROXY_FILTER_DAILY_BUDGET_BYTES"
+        ] = "299999999"
+
+    def runner(arguments: Sequence[str]) -> bytes:
+        args = tuple(arguments)
+        project = args[args.index("--project-name") + 1]
+        if args[-3:] == ("config", "--format", "json"):
+            return json.dumps(
+                common if project == admission.COMMON_PROJECT else gateway
+            ).encode()
+        if args[-3:-1] == ("config", "--hash"):
+            return f"{args[-1]} {SHA_D}\n".encode()
+        raise AssertionError(args)
+
+    with pytest.raises(admission.AdmissionError, match=message):
+        admission.render_attested_projects(
+            BINDINGS,
+            root=root,
+            common_override_path=common_override,
+            gateway_override_path=gateway_override,
+            env_files=(env_file,),
+            provider_authority=PROVIDER_AUTHORITY,
+            runner=runner,
+        )
 
 
 def _docker_runner(

@@ -26,6 +26,14 @@ def _compose() -> dict:
     return yaml.safe_load((ROOT / "compose.yaml").read_text(encoding="utf-8"))
 
 
+def _gateway_compose() -> dict:
+    return yaml.safe_load(
+        (ROOT / "deploy" / "whoscored" / "gateway.compose.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+
+
 def _volume_for_target(service: dict, target: str) -> dict | str:
     matches = []
     for volume in service.get("volumes", []):
@@ -231,9 +239,10 @@ def test_routine_compose_forbids_production_gate_one_off_bypasses() -> None:
 
 def test_whoscored_services_use_distinct_payload_and_gated_final_targets() -> None:
     services = _compose()["services"]
+    gateway_services = _gateway_compose()["services"]
     scheduler = services["airflow-scheduler"]
-    paid_proxy = services["whoscored_proxy_filter"]
-    paid_gateway = services["whoscored_paid_gateway"]
+    paid_proxy = gateway_services["whoscored_proxy_filter"]
+    paid_gateway = gateway_services["whoscored_paid_gateway"]
     shared_proxy = services["proxy_filter"]
 
     assert scheduler["build"]["target"] == "airflow-scheduler"
@@ -247,14 +256,17 @@ def test_whoscored_services_use_distinct_payload_and_gated_final_targets() -> No
     assert scheduler["security_opt"] == expected_security_options
     assert paid_proxy["build"]["target"] == "airflow-whoscored-proxy"
     assert paid_proxy["image"] == (
-        "data-platform-airflow-whoscored-proxy:2.11.2-whoscored"
+        "${WHOSCORED_PROXY_IMAGE:-"
+        "data-platform-airflow-whoscored-proxy:2.11.2-whoscored}"
     )
     assert paid_proxy["security_opt"] == expected_security_options
     assert paid_gateway["build"]["target"] == "airflow-whoscored-proxy"
-    assert paid_gateway["image"] == paid_proxy["image"]
+    assert paid_gateway["image"] == paid_proxy["image"].replace(
+        "WHOSCORED_PROXY_IMAGE", "WHOSCORED_GATEWAY_IMAGE"
+    )
     assert paid_gateway["security_opt"] == expected_security_options
     assert services["flaresolverr"]["security_opt"] == expected_security_options
-    assert services["flaresolverr_whoscored_paid"]["security_opt"] == (
+    assert gateway_services["flaresolverr_whoscored_paid"]["security_opt"] == (
         expected_security_options
     )
     assert shared_proxy["build"]["target"] == "airflow-base"
@@ -382,7 +394,10 @@ def test_fresh_airflow_deploy_creates_configured_whoscored_pools() -> None:
 
 
 def test_fresh_checkout_prepares_writable_logs_before_airflow_and_proxies() -> None:
-    services = _compose()["services"]
+    services = {
+        **_compose()["services"],
+        **_gateway_compose()["services"],
+    }
     initializer = services["airflow-log-init"]
     command = "\n".join(initializer["command"])
 
@@ -399,10 +414,11 @@ def test_fresh_checkout_prepares_writable_logs_before_airflow_and_proxies() -> N
         "chown -R --no-dereference 50000:0 /home/airflow/soccerdata" in command
     )
     assert "chmod -R u+rwX,g+rwX,o-rwx /home/airflow/soccerdata" in command
-    for name in ("airflow-init", "proxy_filter", "whoscored_proxy_filter"):
+    for name in ("airflow-init", "proxy_filter"):
         assert services[name]["depends_on"]["airflow-log-init"]["condition"] == (
             "service_completed_successfully"
         )
+    assert "depends_on" not in _gateway_compose()["services"]["whoscored_proxy_filter"]
 
 
 def test_daily_profile_hard_cap_is_available_to_airflow_tasks() -> None:
@@ -462,15 +478,13 @@ def test_documented_whoscored_runtime_controls_reach_airflow_tasks() -> None:
         assert environment[name] == f"${{{name}:-{default}}}"
 
 
-def test_paid_approval_is_mounted_read_only_into_scheduler_alone() -> None:
+def test_paid_approval_and_pointer_roots_are_scheduler_read_only() -> None:
     compose = _compose()
     common = compose["x-airflow-common"]
     scheduler = compose["services"]["airflow-scheduler"]
     environment = scheduler["environment"]
     assert "WHOSCORED_PROXY_APPROVAL_PATH" not in common["environment"]
-    assert environment["WHOSCORED_PROXY_APPROVAL_PATH"] == (
-        "${WHOSCORED_PROXY_APPROVAL_PATH:-}"
-    )
+    assert "WHOSCORED_PROXY_APPROVAL_PATH" not in environment
     assert environment["WHOSCORED_PROXY_APPROVAL_ROOT"] == (
         "/opt/airflow/secure/whoscored-approvals"
     )
@@ -493,6 +507,21 @@ def test_paid_approval_is_mounted_read_only_into_scheduler_alone() -> None:
     assert approval_mount["source"].startswith("${WHOSCORED_PROXY_APPROVAL_HOST_DIR:?")
     assert approval_mount["read_only"] is True
     assert approval_mount["bind"]["create_host_path"] is False
+    pointer_mount = _volume_for_target(
+        scheduler, "/opt/airflow/secure/whoscored-scheduled-pointers"
+    )
+    assert isinstance(pointer_mount, dict)
+    assert pointer_mount["source"].startswith(
+        "${WHOSCORED_SCHEDULED_PAID_POINTER_HOST_DIR:?"
+    )
+    assert pointer_mount["read_only"] is True
+    assert pointer_mount["bind"]["create_host_path"] is False
+    assert environment["WHOSCORED_SCHEDULED_PAID_POINTER_ROOT"] == (
+        "/opt/airflow/secure/whoscored-scheduled-pointers"
+    )
+    assert environment["WHOSCORED_PAID_BATCH_ENABLED"] == (
+        "${WHOSCORED_PAID_BATCH_ENABLED:-0}"
+    )
     for target in ("/opt/airflow/dags", "/opt/airflow/scrapers", "/opt/airflow/scripts"):
         code_mount = _volume_for_target(scheduler, target)
         assert isinstance(code_mount, dict)
@@ -510,7 +539,11 @@ def test_paid_approval_is_mounted_read_only_into_scheduler_alone() -> None:
         "WHOSCORED_PROXY_APPROVAL_HOST_DIR="
         "/root/whoscored-954-runtime/proxy-approvals"
     ) in example
-    assert "WHOSCORED_PROXY_APPROVAL_PATH=" in example
+    assert "WHOSCORED_PROXY_APPROVAL_PATH=" not in example
+    assert (
+        "WHOSCORED_SCHEDULED_PAID_POINTER_HOST_DIR="
+        "/root/whoscored-954-runtime/scheduled-pointers"
+    ) in example
     assert "WHOSCORED_PAID_ALERT_SECRET_PATH=" not in example
     assert "WHOSCORED_PAID_ALERT_BINDING_PATH=" not in example
 
@@ -566,15 +599,21 @@ def test_proxy_control_plane_is_lease_only_and_secrets_are_not_hardcoded() -> No
 def test_whoscored_paid_proxy_has_an_isolated_l7_application_boundary() -> None:
     compose = _compose()
     services = compose["services"]
+    gateway_compose = _gateway_compose()
+    gateway_services = gateway_compose["services"]
     common_airflow = compose["x-airflow-common"]["environment"]
     scheduler = services["airflow-scheduler"]["environment"]
-    dedicated = services["whoscored_proxy_filter"]
-    gateway = services["whoscored_paid_gateway"]
-    paid_browser = services["flaresolverr_whoscored_paid"]
+    dedicated = gateway_services["whoscored_proxy_filter"]
+    gateway = gateway_services["whoscored_paid_gateway"]
+    paid_browser = gateway_services["flaresolverr_whoscored_paid"]
 
-    assert dedicated["profiles"] == ["whoscored-paid"]
-    assert gateway["profiles"] == ["whoscored-paid"]
-    assert paid_browser["profiles"] == ["whoscored-paid"]
+    assert gateway_compose["name"] == "whoscored-gw"
+    assert all("profiles" not in service for service in gateway_services.values())
+    assert not {
+        "whoscored_proxy_filter",
+        "whoscored_paid_gateway",
+        "flaresolverr_whoscored_paid",
+    } & services.keys()
     assert dedicated["environment"]["PROXY_POOL_JSON"] == (
         "${WHOSCORED_PROXY_POOL_JSON:-}"
     )
@@ -625,13 +664,17 @@ def test_whoscored_paid_proxy_has_an_isolated_l7_application_boundary() -> None:
     assert "whoscored-paid-api" in services["airflow-scheduler"]["networks"]
     assert "backend" not in gateway["networks"]
     assert "backend" not in dedicated["networks"]
+    assert compose["networks"]["whoscored-paid-api"] == {
+        "name": "dp-whoscored-paid-api",
+        "external": True,
+    }
     for name in ("whoscored-paid-api", "whoscored-paid-browser"):
-        assert compose["networks"][name]["internal"] is True
+        assert gateway_compose["networks"][name]["internal"] is True
     for name in (
         "whoscored-paid-direct-egress",
         "whoscored-paid-provider-egress",
     ):
-        assert compose["networks"][name].get("internal") is not True
+        assert gateway_compose["networks"][name].get("internal") is not True
     assert gateway["command"][-6:] == [
         "--proxy-url",
         "http://whoscored_proxy_filter:8900",
@@ -645,11 +688,11 @@ def test_whoscored_paid_proxy_has_an_isolated_l7_application_boundary() -> None:
         "/opt/airflow/state/whoscored-proxy-filter/"
         ".whoscored_state_initialized.json"
     )
-    assert command[command.index("--daily-budget-mb") + 1] == (
-        "${WHOSCORED_PROXY_FILTER_DAILY_BUDGET_MB:-850}"
+    assert command[command.index("--daily-budget-bytes") + 1] == (
+        "${WHOSCORED_PROXY_FILTER_DAILY_BUDGET_BYTES:?set exact provider-policy daily cap in decimal bytes}"
     )
-    assert command[command.index("--max-lease-mb") + 1] == (
-        "${WHOSCORED_PROXY_FILTER_MAX_LEASE_MB:-2}"
+    assert command[command.index("--max-lease-bytes") + 1] == (
+        "${WHOSCORED_PROXY_FILTER_MAX_LEASE_BYTES:-2000000}"
     )
     assert command[command.index("--url-budget-bytes") + 1] == (
         "${WHOSCORED_PROXY_FILTER_URL_BUDGET_BYTES:-2000000}"
@@ -726,7 +769,10 @@ def test_ready_promotion_names_every_local_build_service() -> None:
         "Deploy that exact reviewed promotion SHA", 1
     )[0]
     documented = set(re.findall(r'--payload-image-id "([^=]+)=', promotion))
-    services = _compose()["services"]
+    services = {
+        **_compose()["services"],
+        **_gateway_compose()["services"],
+    }
     locally_built_images = {
         service.get("image")
         for service in services.values()
