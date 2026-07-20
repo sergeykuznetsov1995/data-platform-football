@@ -328,7 +328,6 @@ import hashlib as _hashlib  # noqa: E402
 
 from scrapers.whoscored.proxy_campaign import (  # noqa: E402
     WHOSCORED_INGEST_DAG_ID,
-    sign_proxy_campaign_approval as _sign,
 )
 
 

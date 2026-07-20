@@ -51,7 +51,6 @@ _WHOSCORED_RUNTIME_CONTRACT = _whoscored_bootstrap_sys._load_whoscored_runtime_c
 )
 
 import hashlib
-import json
 import os
 import re
 import shlex
