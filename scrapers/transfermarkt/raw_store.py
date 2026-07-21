@@ -15,9 +15,9 @@ import re
 import threading
 import uuid
 import zlib
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Mapping, Optional
 from urllib.parse import parse_qsl, urlparse
 
@@ -27,6 +27,11 @@ from pyarrow import fs
 RAW_MANIFEST_VERSION = "transfermarkt-raw-v1"
 RAW_STORE_ENV = "TRANSFERMARKT_RAW_STORE_URI"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_S3_BUCKET_RE = re.compile(
+    r"^[a-z0-9](?:[a-z0-9.-]{1,61}[a-z0-9])$",
+    re.ASCII,
+)
+_TRANSFERMARKT_HOSTS = frozenset({"transfermarkt.com", "www.transfermarkt.com"})
 _SAFE_RESPONSE_HEADERS = frozenset(
     {
         "cache-control",
@@ -42,23 +47,10 @@ _SAFE_RESPONSE_HEADERS = frozenset(
         "vary",
     }
 )
-_CREDENTIAL_QUERY_FIELDS = frozenset(
-    {
-        "access_token",
-        "api_key",
-        "apikey",
-        "auth",
-        "authorization",
-        "credential",
-        "password",
-        "secret",
-        "signature",
-        "token",
-        "x-amz-credential",
-        "x-amz-security-token",
-        "x-amz-signature",
-    }
+_SAFE_TRANSFERMARKT_QUERY_FIELDS = frozenset(
+    {"page", "saison_id", "season_id", "sort"}
 )
+_SAFE_QUERY_VALUE_RE = re.compile(r"^[A-Za-z0-9._~-]{0,128}$")
 
 
 class RawStoreError(RuntimeError):
@@ -82,10 +74,27 @@ def utc_now_iso() -> str:
 
 
 def _required(value: object, name: str) -> str:
-    normalized = str(value).strip()
+    if type(value) is not str:
+        raise TypeError(f"{name} must be a string")
+    normalized = value.strip()
     if not normalized:
         raise ValueError(f"{name} must not be empty")
     return normalized
+
+
+def _utc_iso(value: Optional[str]) -> str:
+    """Return one canonical, timezone-aware UTC timestamp."""
+
+    if value is None:
+        return utc_now_iso()
+    candidate = _required(value, "fetched_at")
+    try:
+        parsed = datetime.fromisoformat(candidate.replace("Z", "+00:00"))
+    except ValueError:
+        raise ValueError("fetched_at must be an ISO-8601 timestamp") from None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("fetched_at must include a timezone")
+    return parsed.astimezone(timezone.utc).isoformat()
 
 
 def _safe_url(value: object) -> str:
@@ -102,7 +111,7 @@ def _safe_url(value: object) -> str:
         raise ValueError(invalid) from None
     if (
         parsed.scheme.lower() not in {"http", "https"}
-        or not parsed.hostname
+        or (parsed.hostname or "").lower() not in _TRANSFERMARKT_HOSTS
         or parsed.username is not None
         or parsed.password is not None
         or "@" in parsed.netloc
@@ -110,25 +119,47 @@ def _safe_url(value: object) -> str:
         or parsed.fragment
     ):
         raise ValueError(invalid)
-    if any(
-        name.strip().lower() in _CREDENTIAL_QUERY_FIELDS
-        for name, _ in parse_qsl(parsed.query, keep_blank_values=True)
-    ):
-        raise ValueError(invalid)
+    try:
+        query = parse_qsl(
+            parsed.query,
+            keep_blank_values=True,
+            strict_parsing=True,
+            max_num_fields=32,
+        )
+    except ValueError:
+        raise ValueError(invalid) from None
+    for name, query_value in query:
+        if (
+            name.strip().lower() not in _SAFE_TRANSFERMARKT_QUERY_FIELDS
+            or _SAFE_QUERY_VALUE_RE.fullmatch(query_value) is None
+        ):
+            raise ValueError(invalid)
     return candidate
 
 
 def _safe_headers(headers: Optional[Mapping[str, object]]) -> dict[str, str]:
+    if headers is None:
+        return {}
+    if not isinstance(headers, Mapping):
+        raise TypeError("headers must be a mapping")
     persisted: dict[str, str] = {}
-    for key, value in (headers or {}).items():
+    for key, value in headers.items():
+        if type(key) is not str or type(value) is not str:
+            raise TypeError("header names and values must be strings")
         name = str(key).strip().lower()
         if name not in _SAFE_RESPONSE_HEADERS:
             continue
-        rendered = str(value).strip()
+        rendered = value.strip()
         if "\r" in rendered or "\n" in rendered or "\x00" in rendered:
             continue
         persisted[name] = rendered
     return persisted
+
+
+def _integer(value: object, name: str, *, minimum: int, maximum: int) -> int:
+    if type(value) is not int or not minimum <= value <= maximum:
+        raise ValueError(f"{name} must be an integer in {minimum}..{maximum}")
+    return value
 
 
 @dataclass(frozen=True)
@@ -149,6 +180,7 @@ class RawCaptureRecord:
     content_hash: str
     hash_algorithm: str
     blob_key: str
+    raw_uri: str
     compression: str
     fetched_at: str
     decoded_bytes: int
@@ -170,7 +202,40 @@ class RawResponseStore:
             raise ValueError("Raw-store root must not be empty")
         self.filesystem = filesystem
         self.root = normalized_root
-        self.uri_prefix = (uri_prefix or normalized_root).rstrip("/")
+        if uri_prefix is None:
+            if isinstance(filesystem, fs.LocalFileSystem):
+                resolved_prefix = Path(normalized_root).resolve().as_uri()
+            elif isinstance(filesystem, fs.S3FileSystem):
+                resolved_prefix = f"s3://{normalized_root}"
+            else:
+                raise ValueError("uri_prefix is required for this filesystem")
+        else:
+            resolved_prefix = uri_prefix.rstrip("/")
+        try:
+            parsed_prefix = urlparse(resolved_prefix)
+        except (TypeError, ValueError):
+            raise ValueError("Invalid credential-free raw-store URI") from None
+        if (
+            parsed_prefix.scheme not in {"file", "s3"}
+            or parsed_prefix.username is not None
+            or parsed_prefix.password is not None
+            or "@" in parsed_prefix.netloc
+            or parsed_prefix.query
+            or parsed_prefix.fragment
+            or parsed_prefix.params
+        ):
+            raise ValueError("Invalid credential-free raw-store URI")
+        if parsed_prefix.scheme == "file" and parsed_prefix.netloc not in {
+            "",
+            "localhost",
+        }:
+            raise ValueError("Invalid credential-free raw-store URI")
+        if parsed_prefix.scheme == "s3" and (
+            _S3_BUCKET_RE.fullmatch(parsed_prefix.hostname or "") is None
+            or parsed_prefix.netloc != parsed_prefix.hostname
+        ):
+            raise ValueError("Invalid credential-free raw-store URI")
+        self.uri_prefix = resolved_prefix
         self._write_lock = threading.RLock()
 
     @classmethod
@@ -202,11 +267,35 @@ class RawResponseStore:
             except ValueError:
                 raise ValueError(invalid) from None
             bucket = parsed.hostname
-            if not bucket or port is not None or parsed.netloc != bucket:
+            if (
+                not bucket
+                or port is not None
+                or parsed.netloc != bucket
+                or _S3_BUCKET_RE.fullmatch(bucket) is None
+            ):
                 raise ValueError(invalid)
+            dedicated_access = os.environ.get(
+                "TRANSFERMARKT_RAW_S3_ACCESS_KEY", ""
+            ).strip()
+            dedicated_secret = os.environ.get(
+                "TRANSFERMARKT_RAW_S3_SECRET_KEY", ""
+            ).strip()
+            if bool(dedicated_access) != bool(dedicated_secret):
+                raise RawStoreError(
+                    "TRANSFERMARKT_RAW_S3_ACCESS_KEY and "
+                    "TRANSFERMARKT_RAW_S3_SECRET_KEY must be set together"
+                )
+            # A dedicated least-privilege raw-store pair wins.  The shared
+            # platform pair remains the documented compatibility fallback.
+            platform_access = os.environ.get("S3_ACCESS_KEY", "").strip()
+            platform_secret = os.environ.get("S3_SECRET_KEY", "").strip()
+            if bool(platform_access) != bool(platform_secret):
+                raise RawStoreError(
+                    "S3_ACCESS_KEY and S3_SECRET_KEY must be set together"
+                )
             filesystem = fs.S3FileSystem(
-                access_key=os.environ.get("S3_ACCESS_KEY"),
-                secret_key=os.environ.get("S3_SECRET_KEY"),
+                access_key=dedicated_access or platform_access or None,
+                secret_key=dedicated_secret or platform_secret or None,
                 endpoint_override=os.environ.get(
                     "TRANSFERMARKT_RAW_S3_ENDPOINT", "seaweedfs:8333"
                 ),
@@ -221,6 +310,8 @@ class RawResponseStore:
                 raise ValueError("S3 raw-store URI must contain a prefix")
             return cls(filesystem, root, uri_prefix=uri.rstrip("/"))
 
+        if parsed.scheme == "file" and parsed.netloc not in {"", "localhost"}:
+            raise ValueError(invalid)
         try:
             filesystem, root = fs.FileSystem.from_uri(uri)
         except (TypeError, ValueError):
@@ -228,7 +319,11 @@ class RawResponseStore:
         root = root.rstrip("/")
         if not root:
             raise ValueError(invalid)
-        prefix = f"file://{root}" if isinstance(filesystem, fs.LocalFileSystem) else uri
+        prefix = (
+            Path(root).resolve().as_uri()
+            if isinstance(filesystem, fs.LocalFileSystem)
+            else uri
+        )
         return cls(filesystem, root, uri_prefix=prefix)
 
     @classmethod
@@ -242,6 +337,9 @@ class RawResponseStore:
 
     def _path(self, relative: str) -> str:
         return str(PurePosixPath(self.root) / relative)
+
+    def _uri(self, relative: str) -> str:
+        return f"{self.uri_prefix}/{relative.lstrip('/')}"
 
     def _exists(self, relative: str) -> bool:
         return self.filesystem.get_file_info(self._path(relative)).type != fs.FileType.NotFound
@@ -271,6 +369,64 @@ class RawResponseStore:
             except FileNotFoundError:
                 pass
 
+    def _publish_immutable_bytes(
+        self,
+        relative: str,
+        payload: bytes,
+        *,
+        require_exact_bytes: bool,
+    ) -> bytes:
+        """Create an object once and return the bytes that won publication.
+
+        Local publication uses an atomic hard-link from a complete temporary
+        file, so another process can win without either writer replacing the
+        other's object.  Arrow's S3 API has no conditional PutObject surface;
+        S3 manifests are therefore keyed by every evidence field and verified
+        byte-for-byte after Put.  Blob contenders may use different valid gzip
+        encodings, but their hash key binds the same decoded response bytes.
+        """
+
+        path = self._path(relative)
+        parent = str(PurePosixPath(path).parent)
+        self.filesystem.create_dir(parent, recursive=True)
+        if isinstance(self.filesystem, fs.LocalFileSystem):
+            temporary = f"{path}.tmp-{os.getpid()}-{uuid.uuid4().hex}"
+            descriptor: Optional[int] = None
+            try:
+                descriptor = os.open(
+                    temporary,
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                    0o600,
+                )
+                with os.fdopen(descriptor, "wb") as stream:
+                    descriptor = None
+                    stream.write(payload)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                try:
+                    os.link(temporary, path)
+                    directory = os.open(parent, os.O_RDONLY)
+                    try:
+                        os.fsync(directory)
+                    finally:
+                        os.close(directory)
+                except FileExistsError:
+                    pass
+            finally:
+                if descriptor is not None:
+                    os.close(descriptor)
+                try:
+                    os.unlink(temporary)
+                except FileNotFoundError:
+                    pass
+        elif not self._exists(relative):
+            self._write_bytes(relative, payload)
+
+        committed = self._read_bytes(relative)
+        if require_exact_bytes and committed != payload:
+            raise RawCaptureConflict(f"Immutable raw object conflict: {relative}")
+        return committed
+
     @staticmethod
     def blob_key(content_hash: str) -> str:
         if _SHA256_RE.fullmatch(content_hash) is None:
@@ -292,15 +448,23 @@ class RawResponseStore:
         attempt: int,
         url: str,
         status_code: int,
+        headers: Mapping[str, object],
+        fetched_at: str,
         content_hash: str,
     ) -> str:
+        if _SHA256_RE.fullmatch(content_hash) is None:
+            raise ValueError("content_hash must be a lowercase SHA-256 digest")
         identity = {
-            "attempt": int(attempt),
+            "attempt": _integer(attempt, "attempt", minimum=0, maximum=1_000_000),
             "content_hash": content_hash,
             "cycle_id": _required(cycle_id, "cycle_id"),
             "endpoint": _required(endpoint, "endpoint"),
+            "fetched_at": _utc_iso(fetched_at),
+            "headers": _safe_headers(headers),
             "scope_id": _required(scope_id, "scope_id"),
-            "status_code": int(status_code),
+            "status_code": _integer(
+                status_code, "status_code", minimum=100, maximum=599
+            ),
             "url": _safe_url(url),
         }
         encoded = json.dumps(
@@ -355,13 +519,12 @@ class RawResponseStore:
         safe_cycle = _required(cycle_id, "cycle_id")
         safe_scope = _required(scope_id, "scope_id")
         safe_endpoint = _required(endpoint, "endpoint")
-        ordinal = int(attempt)
-        if ordinal < 0:
-            raise ValueError("attempt must be non-negative")
-        status = int(status_code)
-        if not 100 <= status <= 599:
-            raise ValueError("status_code must be between 100 and 599")
+        ordinal = _integer(attempt, "attempt", minimum=0, maximum=1_000_000)
+        status = _integer(
+            status_code, "status_code", minimum=100, maximum=599
+        )
         persisted_headers = _safe_headers(headers)
+        observed_at = _utc_iso(fetched_at)
         content_hash = hashlib.sha256(body).hexdigest()
         blob_key = self.blob_key(content_hash)
         encoded = gzip.compress(body, compresslevel=6, mtime=0)
@@ -372,75 +535,59 @@ class RawResponseStore:
             attempt=ordinal,
             url=safe_url,
             status_code=status,
-            content_hash=content_hash,
-        )
-        record = RawCaptureRecord(
-            manifest_version=RAW_MANIFEST_VERSION,
-            capture_id=capture_id,
-            source="transfermarkt",
-            cycle_id=safe_cycle,
-            scope_id=safe_scope,
-            endpoint=safe_endpoint,
-            attempt=ordinal,
-            url=safe_url,
-            status_code=status,
             headers=persisted_headers,
-            content_type=persisted_headers.get("content-type"),
+            fetched_at=observed_at,
             content_hash=content_hash,
-            hash_algorithm="sha256",
-            blob_key=blob_key,
-            compression="gzip",
-            fetched_at=fetched_at or utc_now_iso(),
-            decoded_bytes=len(body),
-            stored_bytes=len(encoded),
         )
         manifest_key = self.capture_manifest_key(capture_id)
-        rendered = json.dumps(
-            asdict(record), ensure_ascii=False, indent=2, sort_keys=True
-        ).encode("utf-8") + b"\n"
 
         with self._write_lock:
-            if self._exists(blob_key):
-                _, stored = self._verify_blob(
-                    blob_key,
-                    expected_body=body,
-                    expected_hash=content_hash,
-                    expected_decoded_bytes=len(body),
-                )
-                if stored != encoded:
-                    raise RawCaptureCorrupt(
-                        f"Non-deterministic content-addressed blob: {blob_key}"
-                    )
-            else:
-                self._write_bytes(blob_key, encoded)
-                _, stored = self._verify_blob(
-                    blob_key,
-                    expected_body=body,
-                    expected_hash=content_hash,
-                    expected_decoded_bytes=len(body),
-                    expected_stored_bytes=len(encoded),
-                )
-                if stored != encoded:
-                    raise RawCaptureCorrupt(f"Blob write mismatch: {blob_key}")
-
-            if self._exists(manifest_key):
-                existing_body, existing = self.load_capture(capture_id)
-                comparable = (
-                    record
-                    if fetched_at is not None
-                    else replace(record, fetched_at=existing.fetched_at)
-                )
-                if existing_body != body or asdict(existing) != asdict(comparable):
-                    raise RawCaptureConflict(
-                        f"Raw capture manifest is immutable: {capture_id}"
-                    )
-                return existing
-            self._write_bytes(manifest_key, rendered)
-            if self._read_bytes(manifest_key) != rendered:
+            self._publish_immutable_bytes(
+                blob_key,
+                encoded,
+                require_exact_bytes=False,
+            )
+            _, stored = self._verify_blob(
+                blob_key,
+                expected_body=body,
+                expected_hash=content_hash,
+                expected_decoded_bytes=len(body),
+            )
+            record = RawCaptureRecord(
+                manifest_version=RAW_MANIFEST_VERSION,
+                capture_id=capture_id,
+                source="transfermarkt",
+                cycle_id=safe_cycle,
+                scope_id=safe_scope,
+                endpoint=safe_endpoint,
+                attempt=ordinal,
+                url=safe_url,
+                status_code=status,
+                headers=persisted_headers,
+                content_type=persisted_headers.get("content-type"),
+                content_hash=content_hash,
+                hash_algorithm="sha256",
+                blob_key=blob_key,
+                raw_uri=self._uri(blob_key),
+                compression="gzip",
+                fetched_at=observed_at,
+                decoded_bytes=len(body),
+                stored_bytes=len(stored),
+            )
+            rendered = json.dumps(
+                asdict(record), ensure_ascii=False, indent=2, sort_keys=True
+            ).encode("utf-8") + b"\n"
+            self._publish_immutable_bytes(
+                manifest_key,
+                rendered,
+                require_exact_bytes=True,
+            )
+            existing_body, existing = self.load_capture(capture_id)
+            if existing_body != body or asdict(existing) != asdict(record):
                 raise RawCaptureConflict(
-                    f"Raw capture manifest write mismatch: {capture_id}"
+                    f"Raw capture manifest is immutable: {capture_id}"
                 )
-        return record
+            return existing
 
     def load_capture(self, capture_id: str) -> tuple[bytes, RawCaptureRecord]:
         """Load and fully verify exact response bytes for offline replay."""
@@ -448,21 +595,69 @@ class RawResponseStore:
         key = self.capture_manifest_key(capture_id)
         try:
             payload = json.loads(self._read_bytes(key).decode("utf-8"))
+            if type(payload) is not dict:
+                raise TypeError("manifest must be an object")
             record = RawCaptureRecord(**payload)
         except (UnicodeDecodeError, json.JSONDecodeError, TypeError) as exc:
             raise RawCaptureCorrupt(f"Invalid raw capture manifest: {key}") from exc
         try:
+            text_fields = (
+                record.manifest_version,
+                record.capture_id,
+                record.source,
+                record.cycle_id,
+                record.scope_id,
+                record.endpoint,
+                record.url,
+                record.content_hash,
+                record.hash_algorithm,
+                record.blob_key,
+                record.raw_uri,
+                record.compression,
+                record.fetched_at,
+            )
+            if any(type(value) is not str or value != value.strip() for value in text_fields):
+                raise TypeError("manifest string field has an invalid type")
+            if type(record.headers) is not dict:
+                raise TypeError("manifest headers must be an object")
+            if record.content_type is not None and type(record.content_type) is not str:
+                raise TypeError("manifest content_type must be a string or null")
+            ordinal = _integer(
+                record.attempt, "attempt", minimum=0, maximum=1_000_000
+            )
+            status = _integer(
+                record.status_code,
+                "status_code",
+                minimum=100,
+                maximum=599,
+            )
+            decoded_bytes = _integer(
+                record.decoded_bytes,
+                "decoded_bytes",
+                minimum=0,
+                maximum=2**63 - 1,
+            )
+            stored_bytes = _integer(
+                record.stored_bytes,
+                "stored_bytes",
+                minimum=1,
+                maximum=2**63 - 1,
+            )
+            normalized_fetched_at = _utc_iso(record.fetched_at)
+            safe_record_url = _safe_url(record.url)
+            persisted_headers = _safe_headers(record.headers)
             expected_capture_id = self.allocate_capture_id(
                 cycle_id=record.cycle_id,
                 scope_id=record.scope_id,
                 endpoint=record.endpoint,
-                attempt=record.attempt,
-                url=record.url,
-                status_code=record.status_code,
+                attempt=ordinal,
+                url=safe_record_url,
+                status_code=status,
+                headers=persisted_headers,
+                fetched_at=normalized_fetched_at,
                 content_hash=record.content_hash,
             )
             expected_blob_key = self.blob_key(record.content_hash)
-            persisted_headers = _safe_headers(record.headers)
         except (AttributeError, TypeError, ValueError) as exc:
             raise RawCaptureCorrupt(f"Invalid capture identity: {key}") from exc
         if (
@@ -473,6 +668,9 @@ class RawResponseStore:
             or record.hash_algorithm != "sha256"
             or record.compression != "gzip"
             or record.blob_key != expected_blob_key
+            or record.raw_uri != self._uri(expected_blob_key)
+            or record.url != safe_record_url
+            or record.fetched_at != normalized_fetched_at
             or dict(record.headers) != persisted_headers
             or record.content_type != record.headers.get("content-type")
         ):
@@ -480,8 +678,8 @@ class RawResponseStore:
         body, _ = self._verify_blob(
             record.blob_key,
             expected_hash=record.content_hash,
-            expected_decoded_bytes=record.decoded_bytes,
-            expected_stored_bytes=record.stored_bytes,
+            expected_decoded_bytes=decoded_bytes,
+            expected_stored_bytes=stored_bytes,
         )
         return body, record
 
