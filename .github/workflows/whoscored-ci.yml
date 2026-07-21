@@ -548,7 +548,7 @@ jobs:
             scripts/validate_whoscored_build_provenance.py \
             scripts/whoscored_production_admission.py \
             "$protected_root/scripts/"
-          test "$(stat -c '%u:%g:%a:%h' \
+          test "$(sudo stat -c '%u:%g:%a:%h' \
             "$protected_root/scripts/validate_whoscored_build_provenance.py")" \
             = "0:0:444:1"
           (
