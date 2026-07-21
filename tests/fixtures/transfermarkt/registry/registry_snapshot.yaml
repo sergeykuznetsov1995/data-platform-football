@@ -219,7 +219,8 @@
           "source_url": "https://www.transfermarkt.com/mystery-league/startseite/wettbewerb/MYSTERY/saison_id/2025",
           "discovered_at": "2026-07-11T00:00:00+00:00"
         }
-      ]
+      ],
+      "participants": []
     },
     {
       "snapshot_id": "fixture-2026-07-11",
@@ -485,7 +486,8 @@
           "source_url": "https://www.transfermarkt.com/premier-reserve-league/startseite/wettbewerb/GB1R/saison_id/2025",
           "discovered_at": "2026-07-11T00:00:00+00:00"
         }
-      ]
+      ],
+      "participants": []
     }
   ]
 }

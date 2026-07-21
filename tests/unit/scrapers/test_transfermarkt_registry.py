@@ -491,6 +491,21 @@ def test_exact_empty_participant_rows_require_the_empty_membership_hash(pages) -
         reconcile_registry_pages((page_one, pages[1]))
 
 
+def test_legacy_page_without_explicit_participant_rows_is_incomplete(
+    raw_registry,
+    pages,
+) -> None:
+    legacy_mapping = dict(raw_registry["pages"][0])
+    legacy_mapping.pop("participants")
+    legacy_page = RegistryPage.from_mapping(legacy_mapping)
+
+    with pytest.raises(
+        IncompleteSnapshotError,
+        match="do not declare exact participant rows",
+    ):
+        reconcile_registry_pages((legacy_page, pages[1]))
+
+
 def test_legacy_name_url_sensitive_participant_hash_is_rejected(pages) -> None:
     edition = next(item for item in pages[0].editions if item.competition_id == "GB1")
     participant = CompetitionParticipant(

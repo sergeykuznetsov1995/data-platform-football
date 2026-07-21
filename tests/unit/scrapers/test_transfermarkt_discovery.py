@@ -329,6 +329,36 @@ def test_discovery_rejects_conflicting_duplicate_link_selector_entries() -> None
         _discover(fetch=FixtureFetch({profile_url: profile}))
 
 
+def test_discovery_rejects_unknown_path_form_selector_values() -> None:
+    profile_url = BASE_URL + "/premier-league/startseite/wettbewerb/GB1"
+    profile = (
+        '<!doctype html><html lang="en"><body data-participants-empty="true">'
+        '<h1 data-competition-id="GB1">Premier League</h1>'
+        '<a class="active" href="/premier-league/startseite/wettbewerb/GB1/'
+        'saison_id/2025">25/26</a>'
+        '<a href="/premier-league/startseite/wettbewerb/GB1/saison_id/all">'
+        'All seasons</a></body></html>'
+    )
+
+    with pytest.raises(DiscoverySchemaError, match="selector value 'all'"):
+        _discover(fetch=FixtureFetch({profile_url: profile}))
+
+
+def test_discovery_rejects_duplicate_selector_metadata_conflicts() -> None:
+    profile_url = BASE_URL + "/premier-league/startseite/wettbewerb/GB1"
+    profile = (
+        '<!doctype html><html lang="en"><body data-participants-empty="true">'
+        '<h1 data-competition-id="GB1">Premier League</h1>'
+        '<select name="saison_id">'
+        '<option value="2025" selected data-start-date="2025-08-01">25/26</option>'
+        '<option value="2025" selected data-start-date="2025-08-02">25/26</option>'
+        '</select></body></html>'
+    )
+
+    with pytest.raises(DiscoverySchemaError, match="conflicting edition selector 2025"):
+        _discover(fetch=FixtureFetch({profile_url: profile}))
+
+
 def test_discovery_reads_a_cups_only_edition_from_its_title() -> None:
     cup = (
         '<!doctype html><html lang="en"><head>'

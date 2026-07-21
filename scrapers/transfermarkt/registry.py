@@ -901,6 +901,7 @@ class RegistryPage:
     competitions: tuple[CompetitionRecord, ...]
     editions: tuple[EditionRecord, ...]
     participants: tuple[CompetitionParticipant, ...] = field(default_factory=tuple)
+    participants_declared: bool = True
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -916,6 +917,9 @@ class RegistryPage:
         )
         if self.page_count < 1 or not 1 <= self.page_number <= self.page_count:
             raise RegistryError("invalid registry pagination")
+        object.__setattr__(
+            self, "participants_declared", bool(self.participants_declared)
+        )
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "RegistryPage":
@@ -960,6 +964,7 @@ class RegistryPage:
                 )
                 for item in value.get("participants", ())
             ),
+            participants_declared="participants" in value,
         )
 
 
@@ -1053,6 +1058,14 @@ def reconcile_registry_pages(
         extra = sorted(actual_pages - expected_pages)
         raise IncompleteSnapshotError(
             f"incomplete pagination: missing={missing}, extra={extra}"
+        )
+    undeclared_participant_pages = sorted(
+        page.page_number for page in materialized if not page.participants_declared
+    )
+    if undeclared_participant_pages:
+        raise IncompleteSnapshotError(
+            "registry pages do not declare exact participant rows: "
+            f"{undeclared_participant_pages}"
         )
 
     competitions: dict[str, CompetitionRecord] = {}

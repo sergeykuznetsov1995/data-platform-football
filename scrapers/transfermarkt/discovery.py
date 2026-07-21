@@ -72,6 +72,9 @@ _SECTION_PRECEDENCE = 1
 _GROUP_PRECEDENCE = 2
 _ENTRANT_PRECEDENCE = 3
 _EDITION_PATH_RE = re.compile(r"/saison_id/(?P<edition_id>\d{4})(?:/|$)")
+_EDITION_SELECTOR_PATH_RE = re.compile(
+    r"/saison_id/(?P<edition_id>[^/?#]+)(?:/|$)"
+)
 _TEAM_ROUTE_RE = re.compile(
     r"^/(?P<slug>[^/?#]+)/(?:[^/?#]+/)*verein/(?P<team_id>\d+)(?:/.*)?$"
 )
@@ -970,6 +973,30 @@ def _selector_options(
     profile_url: str,
 ) -> tuple[tuple[str, str, bool, Mapping[str, Any]], ...]:
     values: dict[str, tuple[str, bool, Mapping[str, Any]]] = {}
+
+    def relevant_value(
+        value: tuple[str, bool, Mapping[str, Any]],
+    ) -> tuple[str, bool, str, str, bool]:
+        label, selected, attrs = value
+        return (
+            label,
+            selected,
+            _normalise_text(attrs.get("data-start-date") or ""),
+            _normalise_text(attrs.get("data-end-date") or ""),
+            "disabled" in attrs,
+        )
+
+    def insert(
+        edition_id: str,
+        value: tuple[str, bool, Mapping[str, Any]],
+    ) -> None:
+        previous = values.get(edition_id)
+        if previous is not None and relevant_value(previous) != relevant_value(value):
+            raise DiscoverySchemaError(
+                f"conflicting edition selector {edition_id}: {profile_url}"
+            )
+        values[edition_id] = value
+
     for option in soup.select('select[name*="saison"] option[value]'):
         edition_id = _normalise_text(option.get("value"))
         if not edition_id:
@@ -981,26 +1008,35 @@ def _selector_options(
         label = _normalise_text(option.get_text(" ", strip=True))
         selected = option.has_attr("selected")
         attrs = dict(option.attrs)
-        previous = values.get(edition_id)
-        current = (label, selected, attrs)
-        if previous is not None and previous[:2] != current[:2]:
-            raise DiscoverySchemaError(
-                f"conflicting edition selector {edition_id}: {profile_url}"
-            )
-        values[edition_id] = current
+        insert(edition_id, (label, selected, attrs))
 
     if not values:
         for anchor in soup.select('a[href*="saison_id"]'):
             canonical = _canonical_url(str(anchor.get("href")), base_url=profile_url)
             if canonical is None:
                 continue
-            path_match = _EDITION_PATH_RE.search(urlsplit(canonical).path)
-            query = dict(parse_qsl(urlsplit(canonical).query))
-            edition_id = (
-                path_match.group("edition_id")
-                if path_match
-                else query.get("saison_id", "")
-            )
+            parsed = urlsplit(canonical)
+            path_match = _EDITION_SELECTOR_PATH_RE.search(parsed.path)
+            query_ids = [
+                value
+                for key, value in parse_qsl(
+                    parsed.query, keep_blank_values=True
+                )
+                if key == "saison_id"
+            ]
+            declared_ids = [
+                value
+                for value in (
+                    path_match.group("edition_id") if path_match else "",
+                    *query_ids,
+                )
+                if value
+            ]
+            if len(set(declared_ids)) > 1:
+                raise DiscoverySchemaError(
+                    f"conflicting edition selector URL: {canonical}"
+                )
+            edition_id = declared_ids[0] if declared_ids else ""
             if not edition_id:
                 continue
             if re.fullmatch(r"\d{4}", edition_id) is None:
@@ -1014,13 +1050,7 @@ def _selector_options(
             selected = "active" in set(anchor.get("class", ())) or str(
                 anchor.get("aria-current", "")
             ).casefold() in {"true", "page"}
-            previous = values.get(edition_id)
-            current = (label, selected, dict(anchor.attrs))
-            if previous is not None and previous[:2] != current[:2]:
-                raise DiscoverySchemaError(
-                    f"conflicting edition selector {edition_id}: {profile_url}"
-                )
-            values[edition_id] = current
+            insert(edition_id, (label, selected, dict(anchor.attrs)))
 
     if not values:
         values = _title_edition(soup, profile_url)
