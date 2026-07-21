@@ -55,7 +55,7 @@ DOWNLOAD_RUN = (
 BOUNDED_CURL_FLAGS = (
     "--proto '=https' --tlsv1.2 --proto-redir '=https' "
     "--connect-timeout 20 --speed-limit 1024 --speed-time 60 "
-    "--max-time 2400 -fsSL"
+    "--max-time 3600 -fsSL"
 )
 
 def _write(path: Path, value: str | bytes) -> None:
@@ -1145,7 +1145,7 @@ def test_download_receipt_accepts_exact_https_only_curl_flags(
         ("--connect-timeout 20", "--connect-timeout 0"),
         ("--speed-limit 1024", "--speed-limit 0"),
         ("--speed-time 60", "--speed-time 0"),
-        ("--max-time 2400", "--max-time 0"),
+        ("--max-time 3600", "--max-time 0"),
     ],
 )
 def test_download_receipt_rejects_relaxed_bounded_curl_flags(

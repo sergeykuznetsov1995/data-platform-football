@@ -190,11 +190,11 @@ PROTECTED_SERVICE_BUILDS = {
     ),
 }
 PROTECTED_STAGE_RECIPE_SHA256 = {
-    "airflow-scheduler": "4a402d6898d3119a6f401fe1da2ea21381075ecb18439c75a848f325c559ff21",
+    "airflow-scheduler": "0ae3d95119fa6aa41ebda5a547dec95c76471c65db16d6d00a33cfa68d1269be",
     "flaresolverr": "e4e28b69572d38f4f877154e6bc7a6f8fae0906edb624b62860fff53d0bcab20",
     "flaresolverr_whoscored_paid": "e4e28b69572d38f4f877154e6bc7a6f8fae0906edb624b62860fff53d0bcab20",
-    "whoscored_paid_gateway": "93aa554b1fbb350da3e9e068400f327f39e596d16ddfe076e286bbeb93009acd",
-    "whoscored_proxy_filter": "93aa554b1fbb350da3e9e068400f327f39e596d16ddfe076e286bbeb93009acd",
+    "whoscored_paid_gateway": "0cb2bdeed26cb9fe7cb33da3f50c1f29124ffcc07d31f9d09f69dc67f1b290b8",
+    "whoscored_proxy_filter": "0cb2bdeed26cb9fe7cb33da3f50c1f29124ffcc07d31f9d09f69dc67f1b290b8",
 }
 WHOSCORED_PROXY_COMMAND = (
     "python",
@@ -2401,7 +2401,7 @@ def _canonical_fetch_receipt(command: str, executable: str) -> bool:
             "--speed-time",
             "60",
             "--max-time",
-            "2400",
+            "3600",
             "-fsSL",
         ],
     ):
