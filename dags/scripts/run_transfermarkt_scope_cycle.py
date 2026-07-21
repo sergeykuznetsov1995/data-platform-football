@@ -13,6 +13,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -43,11 +44,12 @@ from dags.utils.transfermarkt_scope_state import (
     PROXY_LEDGER_TABLE,
     SCOPE_COMPLETION_STATUS,
     SCOPE_MANIFEST_TABLE,
+    SCOPE_PLAYER_CAPTURE_TABLE,
     ScopeManifest,
     stable_hash,
 )
 from scrapers.transfermarkt.models import (
-    CAREER_ENTITY_TIMEOUT_SECONDS,
+    CAREER_ENTITY_TIMEOUT_SECONDS,  # noqa: F401 - compatibility export for ops/tests
     DEFAULT_ENTITY_TIMEOUT_SECONDS,
     ENTITY_TIMEOUT_SECONDS,
     MAX_ROSTER_WINDOW,
@@ -125,6 +127,7 @@ OPS_WRITE_TABLES = {
     'iceberg.ops.transfermarkt_fetch_state',
     'iceberg.ops.proxy_traffic_runs',
     PROXY_LEDGER_TABLE,
+    SCOPE_PLAYER_CAPTURE_TABLE,
 }
 # 'requests' counts attempts, not pages: a squad page that answers 504 twice
 # costs three.  Both columns derive from the budget canon in models.py.
@@ -1240,6 +1243,25 @@ def _build_scope_manifest(
     scope_capture = runs[0].result.get('scope_capture')
     if not isinstance(scope_capture, Mapping):
         raise ScopeCycleError('players scope_capture evidence is missing')
+    player_capture = runs[0].result.get('scope_player_capture_evidence')
+    if (
+        not isinstance(player_capture, Mapping)
+        or set(player_capture) != {
+            'row_count', 'key_hash', 'table', 'reused',
+        }
+        or player_capture.get('table') != SCOPE_PLAYER_CAPTURE_TABLE
+        or not isinstance(player_capture.get('reused'), bool)
+    ):
+        raise ScopeCycleError('scope-player capture evidence is missing or invalid')
+    try:
+        player_capture_count = int(player_capture['row_count'])
+    except (TypeError, ValueError) as exc:
+        raise ScopeCycleError('scope-player capture row count is invalid') from exc
+    player_capture_hash = str(player_capture.get('key_hash') or '')
+    if player_capture_count <= 0 or not re.fullmatch(
+        r'[0-9a-f]{64}', player_capture_hash,
+    ):
+        raise ScopeCycleError('scope-player capture evidence is invalid')
     entity_statuses = {
         item.entity: item.applicability_status for item in evidence
     }
@@ -1313,6 +1335,10 @@ def _build_scope_manifest(
         'entity_contracts': entity_contracts,
         'authoritative_empty_evidence': authoritative_empty_evidence,
         'participant_contract': dict(participant_dq),
+        'scope_player_capture': {
+            'row_count': player_capture_count,
+            'key_hash': player_capture_hash,
+        },
         'roster_coverage': roster_coverage,
         'career_fetches_pending': pending_total,
     }

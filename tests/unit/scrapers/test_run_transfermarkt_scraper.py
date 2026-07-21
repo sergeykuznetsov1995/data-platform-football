@@ -1798,6 +1798,71 @@ class TestRunnerInternals:
         assert results['network_fetches'] == 0
 
 
+class TestScopePlayerCaptureEvidence:
+    @staticmethod
+    def _memberships(*, player_id='1'):
+        return pd.DataFrame([{
+            'cycle_id': 'parent-cycle',
+            'scope_id': 'scope-gb1-2025',
+            'competition_id': 'GB1',
+            'edition_id': '2025',
+            'club_id': '10',
+            'player_id': player_id,
+        }])
+
+    def test_first_capture_appends_then_verifies_exact_rows(self):
+        mod = _import_runner()
+        memberships = self._memberships()
+        scraper = MagicMock()
+        scraper.save_to_iceberg.return_value = mod.SCOPE_PLAYER_CAPTURE_TABLE
+        empty = pd.DataFrame(columns=mod.SCOPE_PLAYER_CAPTURE_GRAIN)
+
+        with patch.object(
+            mod, '_load_scope_player_capture', side_effect=[empty, memberships],
+        ):
+            evidence = mod._persist_scope_player_capture(scraper, memberships)
+
+        assert evidence == {
+            **mod.scope_player_capture_evidence(memberships),
+            'table': mod.SCOPE_PLAYER_CAPTURE_TABLE,
+            'reused': False,
+        }
+        kwargs = scraper.save_to_iceberg.call_args.kwargs
+        assert kwargs['database'] == 'ops'
+        assert kwargs['partition_cols'] == ['cycle_id']
+        assert kwargs['table_name'] == 'transfermarkt_scope_player_capture_v1'
+
+    def test_exact_replay_reuses_capture_without_an_append(self):
+        mod = _import_runner()
+        memberships = self._memberships()
+        scraper = MagicMock()
+
+        with patch.object(
+            mod, '_load_scope_player_capture', return_value=memberships,
+        ):
+            evidence = mod._persist_scope_player_capture(scraper, memberships)
+
+        assert evidence['reused'] is True
+        scraper.save_to_iceberg.assert_not_called()
+
+    def test_same_cycle_scope_cannot_mutate_committed_capture(self):
+        mod = _import_runner()
+        scraper = MagicMock()
+
+        with (
+            patch.object(
+                mod, '_load_scope_player_capture',
+                return_value=self._memberships(player_id='old'),
+            ),
+            pytest.raises(RuntimeError, match='immutable scope-player capture'),
+        ):
+            mod._persist_scope_player_capture(
+                scraper, self._memberships(player_id='new'),
+            )
+
+        scraper.save_to_iceberg.assert_not_called()
+
+
 class TestCredentialRedaction:
     def test_redaction_supports_http_and_socks_proxy_urls(self):
         mod = _import_runner()

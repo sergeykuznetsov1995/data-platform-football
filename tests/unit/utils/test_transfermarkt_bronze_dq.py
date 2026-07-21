@@ -158,9 +158,10 @@ def test_intra_batch_duplicate_sql_appends_batch_and_snapshot_keys():
 
 def test_intra_batch_conflicts_gate_only_on_conflicting_payload():
     mv_table = 'iceberg.bronze.transfermarkt_market_value_history'
-    split_hit = (
-        lambda sql, t=mv_table: f'FROM {t}\n' in sql and '_batch_id' in sql
-    )
+
+    def split_hit(sql, table=mv_table):
+        return f'FROM {table}\n' in sql and '_batch_id' in sql
+
     cur = StubCursor(overrides=[(split_hit, [(3, 41)])])
     results = dq.run_bronze_dq(
         cur, registry_snapshot_id='snap-1', zone='legacy', legacy_allowlist=[],
@@ -265,6 +266,147 @@ def test_coach_stint_orphans_are_warning_only():
     assert all(r.severity == 'ERROR' for r in orphans.values())
     assert len(orphans) == 4
     assert dq.BronzeDqReport(results).errors == []
+
+
+@pytest.mark.parametrize(
+    ('table', 'club_column'),
+    [(ATTR_OBS, 'club_id'), (CONTRACT_OBS, 'team_id')],
+)
+def test_scoped_observations_use_same_cycle_capture_not_mutable_roster(
+    table, club_column,
+):
+    sql = dq.build_membership_orphans_sql(table)
+
+    assert dq.SCOPE_PLAYER_CAPTURE_TABLE in sql
+    assert 'e.cycle_id = b.cycle_id' in sql
+    assert 'e.scope_id = b.scope_id' in sql
+    assert 'e.competition_id = b.competition_id' in sql
+    assert 'e.edition_id = b.edition_id' in sql
+    assert f'e.club_id = b.{club_column}' in sql
+    assert 'e.player_id = b.player_id' in sql
+    assert MEMBERSHIPS not in sql
+
+
+@pytest.mark.parametrize('table', [MV_POINTS, TRANSFER_EVENTS])
+def test_global_career_facts_bind_same_cycle_scope_and_player(table):
+    sql = dq.build_membership_orphans_sql(table)
+
+    assert dq.SCOPE_PLAYER_CAPTURE_TABLE in sql
+    assert 'e.cycle_id = b.cycle_id' in sql
+    assert 'e.scope_id = b.scope_id' in sql
+    assert 'e.player_id = b.player_id' in sql
+    # A player shared by two scopes cannot borrow the other scope's evidence.
+    assert 'e.scope_id = b.scope_id' in sql
+    assert MEMBERSHIPS not in sql
+
+
+def test_roster_a_to_b_is_warning_while_same_cycle_evidence_stays_green():
+    cur = StubCursor(overrides=[
+        (
+            lambda sql: (
+                MEMBERSHIPS in sql
+                and 'transfermarkt_player_attribute_observations' in sql
+                and 'NOT EXISTS' in sql
+            ),
+            [(7,)],
+        ),
+    ])
+    results = dq.run_bronze_dq(
+        cur, registry_snapshot_id='snap-1', zone='full', legacy_allowlist=[],
+    )
+    exact = next(
+        item for item in results
+        if item.name == 'tm_bronze_membership_orphans[player_attribute_observations]'
+    )
+    drift = next(
+        item for item in results
+        if item.name == 'tm_bronze_current_roster_drift[player_attribute_observations]'
+    )
+
+    assert exact.severity == 'ERROR' and exact.passed
+    assert drift.severity == 'WARNING' and not drift.passed and drift.value == 7
+    assert exact not in dq.BronzeDqReport(results).errors
+
+
+def test_fabricated_same_cycle_player_and_wrong_club_remain_errors():
+    cur = StubCursor(overrides=[
+        (
+            lambda sql: (
+                dq.SCOPE_PLAYER_CAPTURE_TABLE in sql
+                and 'transfermarkt_player_attribute_observations' in sql
+            ),
+            [(2,)],
+        ),
+    ])
+    results = dq.run_bronze_dq(
+        cur, registry_snapshot_id='snap-1', zone='full', legacy_allowlist=[],
+    )
+    violation = next(
+        item for item in results
+        if item.name == 'tm_bronze_membership_orphans[player_attribute_observations]'
+    )
+
+    assert 'e.club_id = b.club_id' in dq.build_membership_orphans_sql(ATTR_OBS)
+    assert violation.severity == 'ERROR'
+    assert not violation.passed and violation.value == 2
+    assert violation in dq.BronzeDqReport(results).errors
+
+
+def test_v3_manifest_rehashes_the_exact_immutable_capture():
+    rows = [
+        ('cycle-1', 'scope-1', 'GB1', '2025', '10', '1'),
+        ('cycle-1', 'scope-1', 'GB1', '2025', '20', '2'),
+    ]
+    mappings = [dict(zip(dq.SCOPE_PLAYER_CAPTURE_GRAIN, row)) for row in rows]
+    evidence = dq.scope_player_capture_evidence(mappings)
+    manifest = SimpleNamespace(
+        capture_revision='v3',
+        parent_cycle_id='cycle-1',
+        scope_id='scope-1',
+        competition_id='GB1',
+        edition_id='2025',
+        entities=(),
+        dq_evidence={'scope_player_capture': evidence},
+    )
+    def capture_query(sql):
+        return (
+            f'FROM {dq.SCOPE_PLAYER_CAPTURE_TABLE} e' in sql
+            and 'JOIN (VALUES' in sql
+        )
+
+    cur = StubCursor(overrides=[(capture_query, rows)])
+
+    results = dq.run_bronze_dq(
+        cur,
+        registry_snapshot_id='snap-1',
+        zone='full',
+        manifests=[manifest],
+        legacy_allowlist=[],
+    )
+    check = next(
+        item for item in results
+        if item.name == 'tm_scope_player_capture_manifest'
+    )
+    assert check.passed and check.severity == 'ERROR'
+    sql = next(item for item in cur.sql_log if capture_query(item))
+    assert "('cycle-1', 'scope-1')" in sql
+
+    manifest.dq_evidence = {
+        'scope_player_capture': {**evidence, 'key_hash': '0' * 64},
+    }
+    red = dq.run_bronze_dq(
+        StubCursor(overrides=[(capture_query, rows)]),
+        registry_snapshot_id='snap-1',
+        zone='full',
+        manifests=[manifest],
+        legacy_allowlist=[],
+    )
+    mismatch = next(
+        item for item in red
+        if item.name == 'tm_scope_player_capture_manifest'
+    )
+    assert not mismatch.passed
+    assert mismatch in dq.BronzeDqReport(red).errors
 
 
 def test_partial_scope_rows_fail_closed():
