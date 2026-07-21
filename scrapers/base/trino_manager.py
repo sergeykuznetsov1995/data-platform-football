@@ -35,6 +35,16 @@ logger = logging.getLogger(__name__)
 # the retry in _execute_committing stays as a guard for external writers.
 _COMMIT_LOCK = threading.Lock()
 
+# Scalar Trino types whose literals _format_sql_value renders with an exact
+# target-type CAST — the eligibility set for the single-row MERGE fast path
+# (#951). Complex/exotic types (array, map, row, varbinary, json, uuid, time)
+# force the staged path. Note 'time' is deliberately absent: 'time(3)' must
+# not match, and 'time(3)'.startswith('timestamp') is False.
+_FAST_MERGE_TYPE_PREFIXES = (
+    'varchar', 'char', 'integer', 'bigint', 'smallint', 'tinyint',
+    'double', 'real', 'boolean', 'date', 'decimal', 'timestamp',
+)
+
 # Trino client import with graceful fallback
 try:
     import trino
@@ -100,6 +110,10 @@ class TrinoTableManager:
         # network fetch upstream is already single-session, so this costs no
         # real throughput. Reentrant so a future nested _execute cannot deadlock.
         self._conn_lock = threading.RLock()
+        # (schema, table) -> {lower_col: trino_type}; used only by the
+        # single-row MERGE fast path (#951). Invalidated on fast-path failure
+        # so schema evolution reroutes through the staged path's fresh DESCRIBE.
+        self._merge_type_cache: Dict[tuple, Dict[str, str]] = {}
 
     # Retry settings for connection. A Trino container restart takes ~30-60s
     # (SERVER STARTED ~13s + authenticator warm-up), so the cumulative window
@@ -745,6 +759,44 @@ WITH (
         if keys and df.duplicated(subset=list(keys)).any():
             raise ValueError(f"duplicate rows for merge keys {list(keys)!r}")
 
+        qualified_target = validate_catalog_qualified_name(self.catalog, schema, table)
+
+        # --- Single-row fast path (#951): one idempotent MERGE, no stage. The
+        # staged cycle costs 6 statements per call (CREATE stage, DESCRIBE,
+        # INSERT, count verify, MERGE, DROP); the manifest store issues 10-26k
+        # single-row upserts per backfill, so those extra round-trips dominate
+        # wall-clock. A one-statement MERGE ... USING (SELECT <literals>) is
+        # semantically identical (same ON/UPDATE SET/INSERT clauses) and leaves
+        # nothing behind on failure — no stg orphans. Guarded to scalar target
+        # types; anything unexpected falls back to the staged path below.
+        # ``staging_id`` implies retry-stable stage cleanup semantics a caller
+        # may rely on, so its presence keeps the staged path.
+        if keys and len(df) == 1 and staging_id is None:
+            column_types = self._fast_merge_column_types(
+                schema, table, df.columns, target_column_types
+            )
+            if column_types is not None:
+                merge_sql = self._build_single_row_merge_sql(
+                    qualified_target, df, keys, column_types
+                )
+                try:
+                    self._execute_committing(merge_sql)
+                    logger.info(
+                        f"Merged 1 row into {qualified_target} "
+                        f"(single-row fast path, 1 statement)"
+                    )
+                    return 1
+                except TrinoError as e:
+                    if _is_iceberg_commit_conflict(e):
+                        # The staged MERGE would face the same external-writer
+                        # contention after 6 extra statements — propagate.
+                        raise
+                    self._merge_type_cache.pop((schema, table), None)
+                    logger.warning(
+                        f"Single-row MERGE fast path failed for "
+                        f"{qualified_target}: {e}; falling back to staged path"
+                    )
+
         # Parallel ingestion shards must never share a predictable staging
         # table. Distributed callers pass a run/task/map/try/UUID-qualified
         # token; everyone else gets a random suffix — a deterministic
@@ -755,7 +807,6 @@ WITH (
             stage = f"{table}__stg_{staging_id}"
         else:
             stage = f"{table}__stg_{uuid.uuid4().hex[:12]}"
-        qualified_target = validate_catalog_qualified_name(self.catalog, schema, table)
         qualified_stage = validate_catalog_qualified_name(self.catalog, schema, stage)
 
         replace_op = "__dpf_replace_op"
@@ -923,6 +974,84 @@ WITH (
             f"(via unique stage, 1 snapshot)"
         )
         return inserted
+
+    def _fast_merge_column_types(
+        self,
+        schema: str,
+        table: str,
+        columns: Sequence[str],
+        provided: Optional[Mapping[str, str]],
+    ) -> Optional[Dict[str, str]]:
+        """Target column types for the single-row MERGE fast path (#951).
+
+        Returns None (→ staged path) when the types cannot be fetched or any
+        frame column has a non-scalar/unknown type. The DESCRIBE result is
+        cached per (schema, table): the manifest store holds one long-lived
+        manager, so thousands of upserts amortize to a single metadata read.
+        """
+        if provided is not None:
+            types = {str(k).lower(): str(v) for k, v in provided.items()}
+        else:
+            types = self._merge_type_cache.get((schema, table))
+            if types is None:
+                try:
+                    types = {
+                        k.lower(): v
+                        for k, v in self.get_table_columns(schema, table).items()
+                    }
+                except Exception as e:
+                    logger.debug(f"Could not fetch table column types: {e}")
+                    return None
+                self._merge_type_cache[(schema, table)] = types
+        for column in columns:
+            column_type = types.get(str(column).lower(), '').strip().lower()
+            if not column_type.startswith(_FAST_MERGE_TYPE_PREFIXES):
+                return None
+        return types
+
+    def _build_single_row_merge_sql(
+        self,
+        qualified_target: str,
+        df: pd.DataFrame,
+        keys: Sequence[str],
+        column_types: Mapping[str, str],
+    ) -> str:
+        """One-statement MERGE upsert for a single-row frame (#951).
+
+        Clause shape is identical to the staged MERGE (ON key equality,
+        unqualified UPDATE SET targets — Trino forbids ``SET t."col"``,
+        INSERT list in frame column order); only USING differs: an inline
+        SELECT of typed literals replaces the staging table. Literals are
+        rendered by the same _format_sql_value the staged INSERT uses, so a
+        value can never render differently from what lands in a stage today.
+        """
+        (row_values,) = df.itertuples(index=False, name=None)
+        select_items = []
+        for column, value in zip(df.columns, row_values):
+            target_type = column_types[str(column).lower()]
+            literal = self._format_sql_value(value, target_type)
+            if literal == 'NULL':
+                # Typed NULL keeps every s-column's type exactly equal to the
+                # target column type, like the staging table did.
+                literal = f'CAST(NULL AS {target_type})'
+            select_items.append(f'{literal} AS "{column}"')
+        source = 'SELECT ' + ', '.join(select_items)
+
+        on_clause = ' AND '.join(f't."{key}" = s."{key}"' for key in keys)
+        update_columns = [c for c in df.columns if c not in keys]
+        update_clause = ''
+        if update_columns:
+            assignments = ', '.join(
+                f'"{column}" = s."{column}"' for column in update_columns
+            )
+            update_clause = f'WHEN MATCHED THEN UPDATE SET {assignments} '
+        cols = ', '.join(f'"{c}"' for c in df.columns)
+        values = ', '.join(f's."{c}"' for c in df.columns)
+        return (
+            f'MERGE INTO {qualified_target} t USING ({source}) s '
+            f'ON {on_clause} {update_clause}'
+            f'WHEN NOT MATCHED THEN INSERT ({cols}) VALUES ({values})'
+        )
 
     def drop_table(self, schema: str, table: str, if_exists: bool = True) -> None:
         """

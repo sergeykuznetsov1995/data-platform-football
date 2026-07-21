@@ -807,25 +807,29 @@ class TestTrinoTableManagerInsertDataFrameAtomic:
             assert mock_drop.call_count == 1
 
     def test_merge_keys_emit_incremental_upsert(self):
-        """Natural keys use MERGE and never delete/rewrite a partition."""
+        """Natural keys use MERGE and never delete/rewrite a partition.
+
+        Two rows on purpose: a single-row frame takes the #951 fast path, and
+        this test must keep pinning the STAGED merge shape deterministically.
+        """
         import pandas as pd
         with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
             from scrapers.base.trino_manager import TrinoTableManager
 
             manager = TrinoTableManager()
             df = pd.DataFrame({
-                'league': ['ENG-Premier League'],
-                'season': ['2526'],
-                'match_id': ['123'],
-                'rating': [7.4],
+                'league': ['ENG-Premier League', 'ENG-Premier League'],
+                'season': ['2526', '2526'],
+                'match_id': ['123', '124'],
+                'rating': [7.4, 6.9],
             })
-            with patch.object(manager, '_execute', side_effect=self._exec_ok(1)) as execute, \
-                 patch.object(manager, 'insert_dataframe', return_value=1), \
+            with patch.object(manager, '_execute', side_effect=self._exec_ok(2)) as execute, \
+                 patch.object(manager, 'insert_dataframe', return_value=2), \
                  patch.object(manager, 'drop_table'):
                 assert manager.insert_dataframe_atomic(
                     'bronze', 'sofascore_player_ratings', df,
                     merge_keys=['league', 'season', 'match_id'],
-                ) == 1
+                ) == 2
 
             statements = [call.args[0] for call in execute.call_args_list]
             merge = next(sql for sql in statements if sql.startswith('MERGE INTO'))
@@ -845,6 +849,296 @@ class TestTrinoTableManagerInsertDataFrameAtomic:
             )[1].split(' WHEN NOT MATCHED', 1)[0]
             assert '"rating" = s."rating"' in set_clause
             assert 't."' not in set_clause
+
+    # ------------------------------------------------------------------
+    # Single-row MERGE fast path (#951): one statement, no staging table.
+    # ------------------------------------------------------------------
+
+    _MANIFEST_DESCRIBE = [
+        ('league', 'varchar', '', ''),
+        ('season', 'varchar', '', ''),
+        ('match_id', 'varchar', '', ''),
+        ('rating', 'bigint', '', ''),
+    ]
+
+    @staticmethod
+    def _exec_fast(describe_rows, merge_error=None, staged_count=1):
+        """_execute side_effect for fast-path tests: answers DESCRIBE with
+        real 4-tuples, optionally raises on the fast-path MERGE, and returns
+        a row count for any other fetch (staged count probe)."""
+        def _exec(sql, fetch=False, params=None):
+            if sql.startswith('DESCRIBE'):
+                return describe_rows
+            if (merge_error is not None and sql.startswith('MERGE INTO')
+                    and 'USING (SELECT' in sql):
+                raise merge_error
+            if fetch:
+                return [[staged_count]]
+            return None
+        return _exec
+
+    def _single_row_frame(self):
+        import pandas as pd
+        return pd.DataFrame({
+            'league': ['ENG-Premier League'],
+            'season': ['2526'],
+            'match_id': ['123'],
+            'rating': [7],
+        })
+
+    def test_single_row_merge_keys_uses_one_statement_fast_path(self):
+        """One-row upsert issues DESCRIBE + a single inline MERGE — no stage."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.trino_manager import TrinoTableManager
+
+            manager = TrinoTableManager()
+            with patch.object(
+                    manager, '_execute',
+                    side_effect=self._exec_fast(self._MANIFEST_DESCRIBE)) as execute, \
+                 patch.object(manager, 'insert_dataframe') as insert, \
+                 patch.object(manager, 'drop_table') as drop:
+                assert manager.insert_dataframe_atomic(
+                    'ops', 'sofascore_capture_manifest', self._single_row_frame(),
+                    merge_keys=['league', 'season', 'match_id'],
+                ) == 1
+
+            insert.assert_not_called()
+            drop.assert_not_called()
+            statements = [call.args[0] for call in execute.call_args_list]
+            assert [s.split(None, 1)[0] for s in statements] == ['DESCRIBE', 'MERGE']
+            merge = statements[1]
+            assert 'USING (SELECT' in merge
+            assert '__stg_' not in merge
+            assert 't."league" = s."league"' in merge
+            assert 't."season" = s."season"' in merge
+            assert 't."match_id" = s."match_id"' in merge
+            assert ('WHEN NOT MATCHED THEN INSERT '
+                    '("league", "season", "match_id", "rating") '
+                    'VALUES (s."league", s."season", s."match_id", s."rating")') in merge
+            # Same #951 SET-qualification regression pin as the staged shape.
+            set_clause = merge.split(
+                'WHEN MATCHED THEN UPDATE SET ', 1
+            )[1].split(' WHEN NOT MATCHED', 1)[0]
+            assert '"rating" = s."rating"' in set_clause
+            assert 't."' not in set_clause
+
+    def test_single_row_merge_renders_quotes_none_and_int_types(self):
+        """Literal rendering: quote doubling, typed NULL, exact int CASTs."""
+        import pandas as pd
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.trino_manager import TrinoTableManager
+
+            manager = TrinoTableManager()
+            describe = [
+                ('name', 'varchar', '', ''),
+                ('note', 'varchar', '', ''),
+                ('attempts', 'integer', '', ''),
+                ('row_count', 'bigint', '', ''),
+            ]
+            df = pd.DataFrame([{
+                'name': "O'Brien\nLtd",
+                'note': None,
+                'attempts': 3,
+                'row_count': 40000000000,
+            }])
+            with patch.object(
+                    manager, '_execute',
+                    side_effect=self._exec_fast(describe)) as execute, \
+                 patch.object(manager, 'insert_dataframe'), \
+                 patch.object(manager, 'drop_table'):
+                manager.insert_dataframe_atomic(
+                    'ops', 'scratch', df, merge_keys=['name'],
+                )
+
+            merge = next(
+                call.args[0] for call in execute.call_args_list
+                if call.args[0].startswith('MERGE INTO')
+            )
+            assert "O''Brien" in merge
+            assert 'CAST(NULL AS varchar)' in merge
+            assert 'CAST(3 AS INTEGER)' in merge
+            assert 'CAST(40000000000 AS BIGINT)' in merge
+
+    def test_multi_row_merge_keys_still_uses_staged_path(self):
+        """Two rows keep the staged CREATE/INSERT/MERGE/DROP cycle."""
+        import pandas as pd
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.trino_manager import TrinoTableManager
+
+            manager = TrinoTableManager()
+            df = pd.DataFrame({'k': ['a', 'b'], 'v': [1, 2]})
+            with patch.object(manager, '_execute', side_effect=self._exec_ok(2)) as execute, \
+                 patch.object(manager, 'insert_dataframe', return_value=2) as insert, \
+                 patch.object(manager, 'drop_table') as drop:
+                assert manager.insert_dataframe_atomic(
+                    'bronze', 'test_table', df, merge_keys=['k'],
+                ) == 2
+
+            insert.assert_called_once()
+            stage = insert.call_args[0][1]
+            assert stage.startswith('test_table__stg_')
+            drop.assert_called_once_with('bronze', stage, if_exists=True)
+            statements = [call.args[0] for call in execute.call_args_list]
+            assert any('CREATE TABLE' in s and 'WHERE false' in s for s in statements)
+            assert any(
+                s.startswith('MERGE INTO') and f'USING iceberg.bronze.{stage}' in s
+                for s in statements
+            )
+
+    def test_single_row_fast_path_falls_back_on_unexpected_error(self):
+        """A non-conflict MERGE error degrades to the staged path and
+        invalidates the type cache (next upsert re-DESCRIBEs)."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.trino_manager import TrinoTableManager, TrinoError
+
+            manager = TrinoTableManager()
+            error = TrinoError('TYPE_MISMATCH: cannot cast')
+            with patch.object(
+                    manager, '_execute',
+                    side_effect=self._exec_fast(
+                        self._MANIFEST_DESCRIBE, merge_error=error)) as execute, \
+                 patch.object(manager, 'insert_dataframe', return_value=1) as insert, \
+                 patch.object(manager, 'drop_table') as drop:
+                assert manager.insert_dataframe_atomic(
+                    'ops', 'sofascore_capture_manifest', self._single_row_frame(),
+                    merge_keys=['league', 'season', 'match_id'],
+                ) == 1
+
+            statements = [call.args[0] for call in execute.call_args_list]
+            fast = [s for s in statements
+                    if s.startswith('MERGE INTO') and 'USING (SELECT' in s]
+            staged = [s for s in statements
+                      if s.startswith('MERGE INTO') and '__stg_' in s]
+            assert len(fast) == 1 and len(staged) == 1
+            insert.assert_called_once()
+            drop.assert_called_once()
+            assert ('ops', 'sofascore_capture_manifest') not in manager._merge_type_cache
+
+    def test_single_row_fast_path_propagates_commit_conflict(self):
+        """Commit-conflict exhaustion re-raises — the staged MERGE would face
+        the same contention. Routed through _execute_committing's retry loop."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.trino_manager import TrinoTableManager, TrinoError
+
+            manager = TrinoTableManager()
+            conflict = TrinoError(
+                'Failed to commit the transaction during write: conflicting files'
+            )
+            with patch.object(
+                    manager, '_execute',
+                    side_effect=self._exec_fast(
+                        self._MANIFEST_DESCRIBE, merge_error=conflict)) as execute, \
+                 patch.object(manager, 'insert_dataframe') as insert, \
+                 patch.object(manager, 'drop_table'), \
+                 patch('scrapers.base.trino_manager.time.sleep'):
+                with pytest.raises(TrinoError):
+                    manager.insert_dataframe_atomic(
+                        'ops', 'sofascore_capture_manifest',
+                        self._single_row_frame(),
+                        merge_keys=['league', 'season', 'match_id'],
+                    )
+
+            insert.assert_not_called()
+            merges = [call.args[0] for call in execute.call_args_list
+                      if call.args[0].startswith('MERGE INTO')]
+            assert len(merges) == manager._COMMIT_RETRIES
+
+    def test_single_row_fast_path_holds_commit_lock(self):
+        """The inline MERGE still runs under _COMMIT_LOCK via _execute_committing."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base import trino_manager as tm
+            from scrapers.base.trino_manager import TrinoTableManager
+
+            manager = TrinoTableManager()
+            locked_during_merge = []
+
+            def _exec(sql, fetch=False, params=None):
+                if sql.startswith('DESCRIBE'):
+                    return self._MANIFEST_DESCRIBE
+                if sql.startswith('MERGE INTO'):
+                    locked_during_merge.append(tm._COMMIT_LOCK.locked())
+                return [[1]] if fetch else None
+
+            with patch.object(manager, '_execute', side_effect=_exec), \
+                 patch.object(manager, 'insert_dataframe'), \
+                 patch.object(manager, 'drop_table'):
+                manager.insert_dataframe_atomic(
+                    'ops', 'sofascore_capture_manifest', self._single_row_frame(),
+                    merge_keys=['league', 'season', 'match_id'],
+                )
+
+            assert locked_during_merge == [True]
+
+    def test_single_row_fast_path_skips_unsupported_types(self):
+        """A non-scalar target column forces the staged path."""
+        import pandas as pd
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.trino_manager import TrinoTableManager
+
+            manager = TrinoTableManager()
+            describe = [('k', 'varchar', '', ''), ('payload', 'array(varchar)', '', '')]
+            df = pd.DataFrame([{'k': 'a', 'payload': 'x'}])
+
+            def _exec(sql, fetch=False, params=None):
+                if sql.startswith('DESCRIBE'):
+                    return describe
+                return [[1]] if fetch else None
+
+            with patch.object(manager, '_execute', side_effect=_exec) as execute, \
+                 patch.object(manager, 'insert_dataframe', return_value=1) as insert, \
+                 patch.object(manager, 'drop_table'):
+                assert manager.insert_dataframe_atomic(
+                    'bronze', 'test_table', df, merge_keys=['k'],
+                ) == 1
+
+            insert.assert_called_once()
+            assert not any(
+                'USING (SELECT' in call.args[0] for call in execute.call_args_list
+            )
+
+    def test_single_row_fast_path_respects_staging_id(self):
+        """A caller-owned staging_id keeps retry-stable staged semantics."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.trino_manager import TrinoTableManager
+
+            manager = TrinoTableManager()
+            with patch.object(manager, '_execute', side_effect=self._exec_ok(1)) as execute, \
+                 patch.object(manager, 'insert_dataframe', return_value=1) as insert, \
+                 patch.object(manager, 'drop_table'):
+                assert manager.insert_dataframe_atomic(
+                    'ops', 'sofascore_capture_manifest', self._single_row_frame(),
+                    merge_keys=['league', 'season', 'match_id'],
+                    staging_id='run1_task1_try1',
+                ) == 1
+
+            insert.assert_called_once()
+            assert insert.call_args[0][1] == (
+                'sofascore_capture_manifest__stg_run1_task1_try1'
+            )
+            assert not any(
+                'USING (SELECT' in call.args[0] for call in execute.call_args_list
+            )
+
+    def test_single_row_fast_path_caches_describe_across_calls(self):
+        """Two upserts issue exactly one DESCRIBE and two inline MERGEs."""
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            from scrapers.base.trino_manager import TrinoTableManager
+
+            manager = TrinoTableManager()
+            with patch.object(
+                    manager, '_execute',
+                    side_effect=self._exec_fast(self._MANIFEST_DESCRIBE)) as execute, \
+                 patch.object(manager, 'insert_dataframe'), \
+                 patch.object(manager, 'drop_table'):
+                for _ in range(2):
+                    manager.insert_dataframe_atomic(
+                        'ops', 'sofascore_capture_manifest',
+                        self._single_row_frame(),
+                        merge_keys=['league', 'season', 'match_id'],
+                    )
+
+            heads = [call.args[0].split(None, 1)[0] for call in execute.call_args_list]
+            assert heads == ['DESCRIBE', 'MERGE', 'MERGE']
 
     @pytest.mark.parametrize(
         ('frame', 'keys', 'message'),
