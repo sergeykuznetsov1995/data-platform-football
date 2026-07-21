@@ -327,6 +327,41 @@ def test_only_known_safe_transfermarkt_query_fields_are_allowed(tmp_path):
         _capture(store, url="https://www.transfermarkt.com/page?unknown=value")
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://tmapi.transfermarkt.technology/competition/CL/regulation",
+        "https://tmapi.transfermarkt.technology/competition/CL/club?season=2025",
+        "https://tmapi.transfermarkt.technology/clubs?ids%5B%5D=281&ids%5B%5D=418",
+    ],
+)
+def test_first_party_discovery_api_routes_are_raw_storable(tmp_path, url):
+    record = _capture(
+        _store(tmp_path),
+        body=b'{"success":true,"data":{}}',
+        url=url,
+        headers={"Content-Type": "application/json"},
+    )
+
+    assert record.url == url
+    assert record.content_type == "application/json"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://tmapi.transfermarkt.technology/competition/CL/regulation?season=2025",
+        "https://tmapi.transfermarkt.technology/competition/CL/club",
+        "https://tmapi.transfermarkt.technology/competition/CL/club?season=all",
+        "https://tmapi.transfermarkt.technology/clubs?ids%5B%5D=281&token=secret",
+        "https://tmapi.transfermarkt.technology/players?ids%5B%5D=1",
+    ],
+)
+def test_unknown_discovery_api_routes_and_queries_are_rejected(tmp_path, url):
+    with pytest.raises(ValueError, match="credential-free"):
+        _capture(_store(tmp_path), url=url)
+
+
 def test_naive_fetched_at_and_non_integral_metadata_are_rejected(tmp_path):
     store = _store(tmp_path)
     with pytest.raises(ValueError, match="timezone"):

@@ -138,6 +138,15 @@ def _required_text(name: str, value: Any) -> str:
     return text
 
 
+def _optional_sha256(name: str, value: Any) -> Optional[str]:
+    if value in (None, ""):
+        return None
+    digest = str(value).strip()
+    if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        raise RegistryError(f"{name} must be a lowercase SHA-256 digest")
+    return digest
+
+
 def _compact_json(value: Any) -> str:
     return json.dumps(
         value,
@@ -357,6 +366,7 @@ class CompetitionRecord:
     evidence: tuple[ClassificationEvidence, ...] = field(default_factory=tuple)
     registry_snapshot_id: str = ""
     source_body_hash: str = ""
+    raw_capture_id: Optional[str] = None
     parser_revision: str = "registry-v1"
     schema_revision: str = "1"
     aliases: tuple[str, ...] = field(default_factory=tuple)
@@ -375,6 +385,11 @@ class CompetitionRecord:
             object.__setattr__(self, name, _enum_value(enum_type, getattr(self, name)))
         object.__setattr__(self, "active", bool(self.active))
         object.__setattr__(self, "discovered_at", _aware_datetime(self.discovered_at))
+        object.__setattr__(
+            self,
+            "raw_capture_id",
+            _optional_sha256("raw_capture_id", self.raw_capture_id),
+        )
         evidence = tuple(self.evidence)
         if not all(isinstance(item, ClassificationEvidence) for item in evidence):
             raise RegistryError("evidence must contain ClassificationEvidence")
@@ -437,6 +452,7 @@ class CompetitionRecord:
                 if source_body_hash is not None
                 else value.get("source_body_hash", "")
             ),
+            raw_capture_id=value.get("raw_capture_id"),
             parser_revision=value.get("parser_revision", "registry-v1"),
             schema_revision=value.get("schema_revision", "1"),
             aliases=tuple(value.get("aliases", ())),
@@ -572,6 +588,7 @@ class CompetitionRecord:
             ),
             "registry_snapshot_id": self.registry_snapshot_id,
             "source_body_hash": self.source_body_hash,
+            "raw_capture_id": self.raw_capture_id,
             "parser_revision": self.parser_revision,
             "schema_revision": self.schema_revision,
         }
@@ -596,6 +613,7 @@ class EditionRecord:
     discovered_at: datetime
     registry_snapshot_id: str = ""
     source_body_hash: str = ""
+    raw_capture_id: Optional[str] = None
     parser_revision: str = "registry-v1"
     schema_revision: str = "1"
 
@@ -633,6 +651,11 @@ class EditionRecord:
         object.__setattr__(self, "active", bool(self.active))
         object.__setattr__(self, "current", bool(self.current))
         object.__setattr__(self, "discovered_at", _aware_datetime(self.discovered_at))
+        object.__setattr__(
+            self,
+            "raw_capture_id",
+            _optional_sha256("raw_capture_id", self.raw_capture_id),
+        )
 
     @classmethod
     def from_mapping(
@@ -674,6 +697,7 @@ class EditionRecord:
                 if source_body_hash is not None
                 else value.get("source_body_hash", "")
             ),
+            raw_capture_id=value.get("raw_capture_id"),
             parser_revision=value.get("parser_revision", "registry-v1"),
             schema_revision=value.get("schema_revision", "1"),
         )
@@ -697,6 +721,7 @@ class EditionRecord:
             "discovered_at": self.discovered_at.isoformat(),
             "registry_snapshot_id": self.registry_snapshot_id,
             "source_body_hash": self.source_body_hash,
+            "raw_capture_id": self.raw_capture_id,
             "parser_revision": self.parser_revision,
             "schema_revision": self.schema_revision,
         }
@@ -714,6 +739,7 @@ class CompetitionParticipant:
     discovered_at: datetime
     registry_snapshot_id: str = ""
     source_body_hash: str = ""
+    raw_capture_id: Optional[str] = None
     parser_revision: str = "registry-v1"
     schema_revision: str = "1"
 
@@ -727,6 +753,11 @@ class CompetitionParticipant:
         ):
             object.__setattr__(self, name, _required_text(name, getattr(self, name)))
         object.__setattr__(self, "discovered_at", _aware_datetime(self.discovered_at))
+        object.__setattr__(
+            self,
+            "raw_capture_id",
+            _optional_sha256("raw_capture_id", self.raw_capture_id),
+        )
 
     @classmethod
     def from_mapping(
@@ -753,6 +784,7 @@ class CompetitionParticipant:
                 if source_body_hash is not None
                 else value.get("source_body_hash", "")
             ),
+            raw_capture_id=value.get("raw_capture_id"),
             parser_revision=value.get("parser_revision", "registry-v1"),
             schema_revision=value.get("schema_revision", "1"),
         )
@@ -769,6 +801,7 @@ class CompetitionParticipant:
             "discovered_at": self.discovered_at.isoformat(),
             "registry_snapshot_id": self.registry_snapshot_id,
             "source_body_hash": self.source_body_hash,
+            "raw_capture_id": self.raw_capture_id,
             "parser_revision": self.parser_revision,
             "schema_revision": self.schema_revision,
         }

@@ -28,6 +28,7 @@ from scrapers.transfermarkt.models import (
     TrafficBudgetExceeded,
     TrafficMeterError,
 )
+from scrapers.transfermarkt.raw_store import RawResponseStore, RawStoreError
 
 
 CONTROL_TOKEN = "c" * 32
@@ -612,6 +613,138 @@ def test_checkpoint_migrates_valid_empty_and_rejects_hash_tampering():
     corrupt["value"] = ["unexpected"]
     with pytest.raises(ValueError, match="hash mismatch"):
         FetchOutcome.from_checkpoint(corrupt)
+
+
+@pytest.mark.unit
+def test_checkpoint_preserves_raw_capture_lineage():
+    digest = "a" * 64
+    saved = FetchOutcome(
+        status=FetchStatus.OK,
+        value={"items": []},
+        raw_capture_id=digest,
+        raw_body_hash="b" * 64,
+        raw_uri=f"s3://warehouse/raw/transfermarkt/{digest}.body.gz",
+        raw_fetched_at="2026-07-21T12:00:00+00:00",
+    ).as_checkpoint()
+
+    restored = FetchOutcome.from_checkpoint(saved)
+
+    assert restored.raw_capture_id == digest
+    assert restored.raw_body_hash == "b" * 64
+    assert restored.raw_uri.endswith(f"/{digest}.body.gz")
+    assert restored.raw_fetched_at == "2026-07-21T12:00:00+00:00"
+
+
+@pytest.mark.unit
+def test_response_is_committed_and_reloaded_before_json_parse(tmp_path):
+    raw_store = RawResponseStore.from_uri((tmp_path / "raw").as_uri())
+    body = b'{"items":[1],"source":"stored-bytes"}\n'
+    factory = _TlsFactory([
+        _Response(body, payload=AssertionError("resp.json must not run")),
+    ])
+    client = TransfermarktHttpClient(
+        proxy="http://paid-proxy.invalid:8000",
+        raw_store=raw_store,
+        require_raw_store=True,
+        lease_metadata=_metadata(),
+        client_factory=factory,
+    )
+
+    outcome = client.fetch(
+        "https://www.transfermarkt.com/ceapi/example",
+        as_json=True,
+        label="transfer_events",
+        context={"scope_id": "GB1:2025"},
+    )
+
+    assert outcome.status is FetchStatus.OK
+    assert outcome.value == {"items": [1], "source": "stored-bytes"}
+    assert outcome.raw_capture_id
+    assert outcome.raw_body_hash
+    assert outcome.raw_uri.endswith(".body.gz")
+    replayed, record = raw_store.load_capture(outcome.raw_capture_id)
+    assert replayed == body
+    assert record.content_hash == outcome.raw_body_hash
+    assert client.get_raw_capture_records()[0]["capture_id"] == (
+        outcome.raw_capture_id
+    )
+
+
+@pytest.mark.unit
+def test_raw_store_failure_never_burns_a_second_paid_attempt():
+    class FailingRawStore:
+        def store_attempt(self, **_kwargs):
+            raise RawStoreError("object store unavailable")
+
+    factory = _TlsFactory([_Response(b"first"), _Response(b"must-not-run")])
+    client = TransfermarktHttpClient(
+        proxy="http://paid-proxy.invalid:8000",
+        raw_store=FailingRawStore(),
+        require_raw_store=True,
+        client_factory=factory,
+        sleep_fn=lambda _: None,
+    )
+
+    with pytest.raises(RawStoreError, match="unavailable"):
+        client.fetch(
+            "https://www.transfermarkt.com/page",
+            as_json=False,
+            max_attempts=3,
+        )
+
+    assert len(factory.clients[0].calls) == 1
+    assert client.get_traffic_stats()["requests"] == 1
+
+
+@pytest.mark.unit
+def test_cache_hit_is_replayed_from_verified_raw_without_network(tmp_path):
+    raw_store = RawResponseStore.from_uri((tmp_path / "raw").as_uri())
+    cache = {}
+    url = "https://www.transfermarkt.com/ceapi/cached"
+    first = TransfermarktHttpClient(
+        proxy="http://paid-proxy.invalid:8000",
+        raw_store=raw_store,
+        require_raw_store=True,
+        cache=cache,
+        client_factory=_TlsFactory([_Response(b'{"items":[]}' )]),
+    )
+    paid = first.fetch(
+        url,
+        as_json=True,
+        cache_key=url,
+        cache_ttl_seconds=60,
+    )
+    empty_factory = _TlsFactory([])
+    second = TransfermarktHttpClient(
+        proxy="http://paid-proxy.invalid:8000",
+        raw_store=raw_store,
+        require_raw_store=True,
+        cache=cache,
+        client_factory=empty_factory,
+    )
+
+    reused = second.fetch(
+        url,
+        as_json=True,
+        cache_key=url,
+        cache_ttl_seconds=60,
+    )
+
+    assert reused.cache_hit is True
+    assert reused.raw_capture_id == paid.raw_capture_id
+    assert reused.value == {"items": []}
+    assert empty_factory.calls == []
+
+
+@pytest.mark.unit
+def test_required_raw_store_is_checked_before_transport(monkeypatch):
+    monkeypatch.delenv("TRANSFERMARKT_RAW_STORE_URI", raising=False)
+    with pytest.raises(RawStoreError, match="TRANSFERMARKT_RAW_STORE_URI"):
+        TransfermarktHttpClient(
+            proxy="http://paid-proxy.invalid:8000",
+            require_raw_store=True,
+            client_factory=_TlsFactory([_Response(b"must-not-run")]),
+        )
 
 
 @pytest.mark.unit

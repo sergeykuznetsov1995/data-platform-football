@@ -157,6 +157,12 @@ x-airflow-common: &airflow-common
     TM_PROXY_CONTROL_TOKEN: ${TM_PROXY_CONTROL_TOKEN:-${PROXY_FILTER_CONTROL_TOKEN:-${SOFASCORE_PROXY_CONTROL_TOKEN:-}}}
     TM_REQUIRE_METERED_PROXY: ${TM_REQUIRE_METERED_PROXY:-false}
     TM_PROXY_LEASE_TTL_SECONDS: ${TM_PROXY_LEASE_TTL_SECONDS:-3600}
+    # Every paid Transfermarkt response is committed before parsing.  The
+    # worker must never fall back to ephemeral local bytes in production.
+    TRANSFERMARKT_RAW_STORE_URI: s3://${ICEBERG_WAREHOUSE}/raw/transfermarkt
+    TRANSFERMARKT_RAW_S3_ENDPOINT: seaweedfs:8333
+    TRANSFERMARKT_RAW_S3_SCHEME: http
+    TRANSFERMARKT_REQUIRE_RAW_STORE: ${TRANSFERMARKT_REQUIRE_RAW_STORE:-true}
     FBREF_RAW_S3_ENDPOINT: seaweedfs:8333
     FBREF_RAW_S3_SCHEME: http
     # Versioned SofaScore discovery registry. Discovery runs outside Airflow;

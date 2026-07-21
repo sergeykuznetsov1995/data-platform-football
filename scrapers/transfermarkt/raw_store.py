@@ -31,7 +31,9 @@ _S3_BUCKET_RE = re.compile(
     r"^[a-z0-9](?:[a-z0-9.-]{1,61}[a-z0-9])$",
     re.ASCII,
 )
-_TRANSFERMARKT_HOSTS = frozenset({"transfermarkt.com", "www.transfermarkt.com"})
+_TRANSFERMARKT_HTML_HOSTS = frozenset({"transfermarkt.com", "www.transfermarkt.com"})
+_TRANSFERMARKT_API_HOST = "tmapi.transfermarkt.technology"
+_TRANSFERMARKT_HOSTS = _TRANSFERMARKT_HTML_HOSTS | {_TRANSFERMARKT_API_HOST}
 _SAFE_RESPONSE_HEADERS = frozenset(
     {
         "cache-control",
@@ -51,6 +53,10 @@ _SAFE_TRANSFERMARKT_QUERY_FIELDS = frozenset(
     {"page", "saison_id", "season_id", "sort"}
 )
 _SAFE_QUERY_VALUE_RE = re.compile(r"^[A-Za-z0-9._~-]{0,128}$")
+_API_REGULATION_PATH_RE = re.compile(
+    r"^/competition/[A-Za-z0-9_-]+/regulation$", re.ASCII
+)
+_API_CLUB_PATH_RE = re.compile(r"^/competition/[A-Za-z0-9_-]+/club$", re.ASCII)
 
 
 class RawStoreError(RuntimeError):
@@ -128,12 +134,37 @@ def _safe_url(value: object) -> str:
         )
     except ValueError:
         raise ValueError(invalid) from None
-    for name, query_value in query:
-        if (
-            name.strip().lower() not in _SAFE_TRANSFERMARKT_QUERY_FIELDS
-            or _SAFE_QUERY_VALUE_RE.fullmatch(query_value) is None
-        ):
+    host = (parsed.hostname or "").lower()
+    if host == _TRANSFERMARKT_API_HOST:
+        if _API_REGULATION_PATH_RE.fullmatch(parsed.path):
+            if query:
+                raise ValueError(invalid)
+        elif _API_CLUB_PATH_RE.fullmatch(parsed.path):
+            if (
+                len(query) != 1
+                or query[0][0] != "season"
+                or re.fullmatch(r"\d{4}", query[0][1]) is None
+            ):
+                raise ValueError(invalid)
+        elif parsed.path == "/clubs":
+            if (
+                not query
+                or len(query) > 250
+                or any(
+                    name != "ids[]" or re.fullmatch(r"\d+", query_value) is None
+                    for name, query_value in query
+                )
+            ):
+                raise ValueError(invalid)
+        else:
             raise ValueError(invalid)
+    else:
+        for name, query_value in query:
+            if (
+                name.strip().lower() not in _SAFE_TRANSFERMARKT_QUERY_FIELDS
+                or _SAFE_QUERY_VALUE_RE.fullmatch(query_value) is None
+            ):
+                raise ValueError(invalid)
     return candidate
 
 

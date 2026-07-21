@@ -17,7 +17,7 @@ from scrapers.transfermarkt.discovery import (
     DiscoverySchemaError,
     discover_competition_registry,
 )
-from scrapers.transfermarkt.models import FetchOutcome, FetchStatus
+from scrapers.transfermarkt.models import FetchOutcome, FetchStatus, stable_payload_hash
 from scrapers.transfermarkt.registry import (
     ClassificationStatus,
     CompetitionType,
@@ -324,7 +324,138 @@ def test_discovery_reads_a_cups_only_edition_from_its_title() -> None:
     assert editions[0].current is True
 
 
-def test_discovery_drops_a_competition_the_source_never_staged() -> None:
+def test_live_component_profiles_use_authoritative_json_inventory_and_participants():
+    navigation_url = BASE_URL + "/navigation/wettbewerbe"
+    profile_url = BASE_URL + "/international-cup/startseite/pokalwettbewerb/IC"
+    regulation_url = "https://tmapi.transfermarkt.technology/competition/IC/regulation"
+    participant_urls = {
+        "2025": (
+            "https://tmapi.transfermarkt.technology/competition/IC/club?season=2025"
+        ),
+        "2024": (
+            "https://tmapi.transfermarkt.technology/competition/IC/club?season=2024"
+        ),
+    }
+    clubs_url = (
+        "https://tmapi.transfermarkt.technology/clubs?ids%5B%5D=11&ids%5B%5D=281"
+    )
+    navigation = """<!doctype html><html><head>
+      <meta name="tm-country" content="International">
+      <meta name="tm-confederation" content="UEFA">
+      </head><body><div class="box"><div class="content-box-headline">Cups</div><table class="items"><tr>
+      <td><a href="/international-cup/startseite/pokalwettbewerb/IC">International Cup</a></td>
+      </tr></table></div></body></html>"""
+    profile = """<!doctype html><html><body>
+      <h1 data-competition-id="IC">International Cup</h1>
+      <tm-competition-homepage competition-id="IC" season-id="2025"></tm-competition-homepage>
+      </body></html>"""
+    api_values = {
+        regulation_url: {
+            "success": True,
+            "message": "OK",
+            "data": [
+                {
+                    "competitionId": "IC",
+                    "season": {"id": 2025, "display": "25/26"},
+                    "isCurrentSeason": True,
+                    "tournamentStart": "2025-08-01T00:00:00+02:00",
+                    "tournamentEnd": "2026-05-30T00:00:00+02:00",
+                },
+                {
+                    "competitionId": "IC",
+                    "season": {"id": 2024, "display": "24/25"},
+                    "isCurrentSeason": False,
+                    "tournamentStart": None,
+                    "tournamentEnd": None,
+                },
+            ],
+        },
+        participant_urls["2025"]: {
+            "success": True,
+            "message": "OK",
+            "data": {
+                "competitionId": "IC",
+                "clubIds": ["281", "11"],
+                "seasonId": 2025,
+                "season": {"id": 2025, "display": "25/26"},
+            },
+        },
+        participant_urls["2024"]: {
+            "success": True,
+            "message": "OK",
+            "data": {
+                "competitionId": "IC",
+                "clubIds": ["11"],
+                "seasonId": 2024,
+                "season": {"id": 2024, "display": "24/25"},
+            },
+        },
+        clubs_url: {
+            "success": True,
+            "message": "OK",
+            "data": [
+                {
+                    "id": "11",
+                    "name": "Arsenal FC",
+                    "relativeUrl": "/arsenal/startseite/verein/11",
+                    "baseDetails": {"isNationalTeam": False},
+                },
+                {
+                    "id": "281",
+                    "name": "Manchester City",
+                    "relativeUrl": "/manchester-city/startseite/verein/281",
+                    "baseDetails": {"isNationalTeam": False},
+                },
+            ],
+        },
+    }
+
+    html_fetch = FixtureFetch(
+        {navigation_url: navigation, profile_url: profile}
+    )
+    json_calls: list[tuple[str, str]] = []
+
+    def json_fetch(url: str, endpoint: str) -> FetchOutcome[dict]:
+        json_calls.append((url, endpoint))
+        value = api_values[url]
+        return FetchOutcome(
+            status=FetchStatus.OK,
+            value=value,
+            status_code=200,
+            attempts=1,
+            label=endpoint,
+            payload_hash=stable_payload_hash(value),
+        )
+
+    pages = discover_competition_registry(
+        fetch=html_fetch,
+        fetch_json=json_fetch,
+        checkpoint={},
+        traffic_ledger=LedgerSpy(),
+        clock=lambda: NOW,
+    )
+    snapshot = reconcile_registry_pages(pages)
+
+    competition = next(item for item in snapshot.competitions if item.competition_id == "IC")
+    assert competition.competition_type is CompetitionType.CONTINENTAL_CLUB
+    assert [item.edition_id for item in snapshot.editions if item.competition_id == "IC"] == [
+        "2024",
+        "2025",
+    ]
+    assert {
+        (item.edition_id, item.team_id, item.team_name)
+        for item in snapshot.participants
+        if item.competition_id == "IC"
+    } == {("2025", "11", "Arsenal FC"), ("2025", "281", "Manchester City"), ("2024", "11", "Arsenal FC")}
+    assert [endpoint for _url, endpoint in json_calls] == [
+        "competition_regulation",
+        "competition_participants",
+        "competition_participants",
+        "competition_participant_entities",
+    ]
+
+
+def test_discovery_blocks_when_a_competition_has_no_authoritative_editions() -> None:
     unstaged = (
         '<!doctype html><html lang="en"><head>'
         "<title>J1 100 Year Vision League | Transfermarkt</title>"
@@ -332,15 +463,12 @@ def test_discovery_drops_a_competition_the_source_never_staged() -> None:
         "</body></html>"
     )
 
-    pages, *_ = _discover(
-        fetch=FixtureFetch(
-            {BASE_URL + "/afrika-cup/startseite/pokalwettbewerb/AFCN": unstaged}
+    with pytest.raises(DiscoverySchemaError, match="edition selector missing"):
+        _discover(
+            fetch=FixtureFetch(
+                {BASE_URL + "/afrika-cup/startseite/pokalwettbewerb/AFCN": unstaged}
+            )
         )
-    )
-    snapshot = reconcile_registry_pages(pages)
-
-    assert not [item for item in snapshot.competitions if item.competition_id == "AFCN"]
-    assert snapshot.competitions
 
 
 def test_catalog_table_groups_classify_rows_the_section_only_brackets() -> None:
@@ -744,7 +872,7 @@ def test_a_catalog_whose_profiles_all_lost_their_editions_aborts_snapshot() -> N
         if "wettbewerb/" in url
     }
 
-    with pytest.raises(DiscoverySchemaError, match="no competitions"):
+    with pytest.raises(DiscoverySchemaError, match="edition selector missing"):
         _discover(fetch=FixtureFetch(drift))
 
 

@@ -15,6 +15,7 @@ import re
 import socket
 import time
 from collections import defaultdict
+from dataclasses import asdict, replace
 from typing import Any, Callable, Dict, Mapping, MutableMapping, Optional
 from urllib.parse import quote, urlsplit, urlunsplit
 
@@ -32,6 +33,11 @@ from scrapers.transfermarkt.models import (
     TrafficBudgetExceeded,
     TrafficMeterError,
     stable_payload_hash,
+)
+from scrapers.transfermarkt.raw_store import (
+    RawCaptureRecord,
+    RawResponseStore,
+    RawStoreError,
 )
 from scrapers.utils.proxy_manager import ErrorType
 
@@ -348,6 +354,8 @@ class TransfermarktHttpClient:
         lease_metadata: Optional[Mapping[str, Any]] = None,
         lease_ttl_seconds: int = 300,
         cache: Optional[MutableMapping[str, Mapping[str, Any]]] = None,
+        raw_store: Optional[RawResponseStore] = None,
+        require_raw_store: Optional[bool] = None,
         rate_limiter=None,
         timeout_seconds: float = 12.0,
         circuit_failures: int = 5,
@@ -382,6 +390,17 @@ class TransfermarktHttpClient:
         self._lease_ttl_seconds = max(1, int(lease_ttl_seconds))
         self._lease: Optional[ProxyLease] = None
         self._cache = cache
+        if require_raw_store is None:
+            require_raw_store = os.environ.get(
+                "TRANSFERMARKT_REQUIRE_RAW_STORE", "false"
+            ).strip().lower() in {"1", "true", "yes", "on"}
+        if raw_store is None:
+            raw_store = RawResponseStore.from_env(optional=not require_raw_store)
+        self._raw_store = raw_store
+        self._require_raw_store = bool(require_raw_store)
+        if self._require_raw_store and self._raw_store is None:
+            raise RawStoreError("Transfermarkt raw store is required")
+        self._raw_captures: dict[str, RawCaptureRecord] = {}
         self._rate_limiter = rate_limiter
         self.timeout_seconds = float(timeout_seconds)
         self._circuit_failures = int(circuit_failures)
@@ -845,6 +864,96 @@ class TransfermarktHttpClient:
             return None
 
     @staticmethod
+    def _decode_body(body: bytes, *, as_json: bool) -> Any:
+        """Parse only bytes that have passed raw-store verification."""
+
+        if as_json:
+            return json.loads(body.decode("utf-8-sig", errors="strict"))
+        return body.decode("utf-8", errors="replace")
+
+    def _capture_attempt_ordinal(self) -> int:
+        raw_try = os.environ.get("AIRFLOW_CTX_TRY_NUMBER", "0").strip()
+        try:
+            task_try = max(0, int(raw_try))
+        except ValueError:
+            task_try = 0
+        return task_try * 1_000_000 + self._attempts + 1
+
+    def _commit_raw_response(
+        self,
+        *,
+        url: str,
+        body: bytes,
+        status_code: int,
+        headers: Mapping[str, Any],
+        label: str,
+        context: Mapping[str, Any],
+    ) -> tuple[bytes, RawCaptureRecord | None]:
+        """Commit and reload one response before any parser sees its bytes."""
+
+        if self._raw_store is None:
+            if self._require_raw_store:
+                raise RawStoreError("Transfermarkt raw store is required")
+            return body, None
+        cycle_id = str(
+            context.get("cycle_id")
+            or self._lease_metadata.get("run_id")
+            or os.environ.get("AIRFLOW_CTX_DAG_RUN_ID")
+            or "manual"
+        )
+        scope_id = str(
+            context.get("scope_id")
+            or context.get("scope")
+            or self._lease_metadata.get("scope")
+            or "global"
+        )
+        record = self._raw_store.store_attempt(
+            url=url,
+            body=body,
+            status_code=status_code,
+            headers=headers,
+            # ``None`` lets a retried process recover an identical immutable
+            # attempt instead of conflicting only on wall-clock metadata.
+            fetched_at=None,
+            cycle_id=cycle_id,
+            scope_id=scope_id,
+            endpoint=label,
+            attempt=self._capture_attempt_ordinal(),
+        )
+        verified, loaded = self._raw_store.load_capture(record.capture_id)
+        if loaded != record or verified != body:
+            raise RawStoreError("Transfermarkt raw capture read-after-write drift")
+        self._raw_captures[record.capture_id] = record
+        return verified, record
+
+    def _raw_lineage(self, record: RawCaptureRecord | None) -> dict[str, Any]:
+        if record is None:
+            return {
+                "raw_capture_id": None,
+                "raw_body_hash": None,
+                "raw_uri": None,
+                "raw_fetched_at": None,
+            }
+        assert self._raw_store is not None
+        return {
+            "raw_capture_id": record.capture_id,
+            "raw_body_hash": record.content_hash,
+            "raw_uri": record.raw_uri,
+            "raw_fetched_at": record.fetched_at,
+        }
+
+    def get_raw_capture_records(self) -> tuple[dict[str, Any], ...]:
+        """Return deterministic metadata for every response seen this run."""
+
+        return tuple(
+            {
+                **asdict(record),
+                **self._raw_lineage(record),
+            }
+            for _, record in sorted(self._raw_captures.items())
+        )
+
+    @staticmethod
     def _host(url: str) -> str:
         from urllib.parse import urlsplit
 
@@ -1015,7 +1124,12 @@ class TransfermarktHttpClient:
         self._consecutive_endpoint_failures = self._circuit_failures - 1
         return True
 
-    def _load_cached_outcome(self, cache_key: Optional[str]) -> Optional[FetchOutcome[Any]]:
+    def _load_cached_outcome(
+        self,
+        cache_key: Optional[str],
+        *,
+        as_json: bool,
+    ) -> Optional[FetchOutcome[Any]]:
         if self._cache is None or not cache_key:
             return None
         raw = self._cache.get(cache_key)
@@ -1029,7 +1143,34 @@ class TransfermarktHttpClient:
             outcome_raw = raw["outcome"]
             if not isinstance(outcome_raw, Mapping):
                 raise ValueError("cached outcome is not an object")
-            return FetchOutcome.from_checkpoint(outcome_raw)
+            outcome = FetchOutcome.from_checkpoint(outcome_raw)
+            if self._require_raw_store and not outcome.raw_capture_id:
+                # Pre-raw caches are deliberately retired.  They cannot prove
+                # where their decoded value came from.
+                self._cache.pop(cache_key, None)
+                return None
+            if outcome.raw_capture_id and self._raw_store is not None:
+                try:
+                    body, record = self._raw_store.load_capture(
+                        outcome.raw_capture_id
+                    )
+                    replayed = self._decode_body(body, as_json=as_json)
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise RawStoreError(
+                        "cached Transfermarkt raw capture cannot be replayed"
+                    ) from exc
+                replay_hash = _payload_hash(replayed)
+                if replay_hash != outcome.payload_hash:
+                    raise RawStoreError(
+                        "cached Transfermarkt value differs from raw replay"
+                    )
+                self._raw_captures[record.capture_id] = record
+                outcome = replace(
+                    outcome,
+                    value=replayed,
+                    **self._raw_lineage(record),
+                )
+            return outcome
         except (KeyError, TypeError, ValueError):
             # A corrupt cache is an ordinary miss; it is never returned as an
             # authoritative source result or allowed to poison a checkpoint.
@@ -1077,7 +1218,7 @@ class TransfermarktHttpClient:
 
         context = dict(context or {})
         cache_started = self._monotonic()
-        cached = self._load_cached_outcome(cache_key)
+        cached = self._load_cached_outcome(cache_key, as_json=as_json)
         if cached is not None:
             duration = self._monotonic() - cache_started
             self._record_cache_hit(label=label, duration_seconds=duration)
@@ -1104,6 +1245,7 @@ class TransfermarktHttpClient:
         last_status: Optional[int] = None
         last_error: Optional[str] = None
         terminal_status = FetchStatus.RETRY_EXHAUSTED
+        last_raw_record: RawCaptureRecord | None = None
 
         for attempt in range(1, attempts_cap + 1):
             self._check_request_budget()
@@ -1133,11 +1275,47 @@ class TransfermarktHttpClient:
                 if self._provider_metering_available:
                     wire_for_endpoint += provider_down
                     provider_for_endpoint += provider_up + provider_down
+                response_headers = getattr(resp, "headers", {})
+                if not isinstance(response_headers, Mapping):
+                    response_headers = {}
+                try:
+                    body, raw_record = self._commit_raw_response(
+                        url=url,
+                        body=body,
+                        status_code=status_code,
+                        headers=response_headers,
+                        label=label,
+                        context=context,
+                    )
+                except RawStoreError:
+                    # The source answered and provider traffic was consumed;
+                    # storage failure is not a proxy failure and must not be
+                    # retried as another paid source request.
+                    self._record_proxy(
+                        proxy_obj=proxy_obj,
+                        success=True,
+                        error_type=None,
+                        elapsed=elapsed,
+                    )
+                    self._record_attempt(
+                        label=label,
+                        status_code=status_code,
+                        decoded_bytes=body_n,
+                        wire_bytes=wire_n,
+                        provider_up_bytes=provider_up,
+                        provider_down_bytes=provider_down,
+                        host=self._host(url),
+                        success=False,
+                        retry=attempt > 1,
+                        duration_seconds=elapsed,
+                    )
+                    raise
+                last_raw_record = raw_record
 
                 if status_code == 200:
                     if as_json:
                         try:
-                            value = resp.json()
+                            value = self._decode_body(body, as_json=True)
                         except Exception as exc:  # noqa: BLE001
                             value = None
                             body_text = body.decode("utf-8", errors="replace")
@@ -1210,6 +1388,7 @@ class TransfermarktHttpClient:
                                     ),
                                     duration_seconds=total_duration,
                                     payload_hash=_payload_hash(value),
+                                    **self._raw_lineage(raw_record),
                                 ))
                                 self._store_cached_outcome(
                                     cache_key=cache_key,
@@ -1218,10 +1397,7 @@ class TransfermarktHttpClient:
                                 )
                                 return outcome
                     else:
-                        try:
-                            value = resp.text
-                        except Exception:  # noqa: BLE001
-                            value = body.decode("utf-8", errors="replace")
+                        value = self._decode_body(body, as_json=False)
                         if self._looks_like_html_challenge(value):
                             last_error = "Cloudflare HTML challenge"
                             terminal_status = FetchStatus.BLOCKED
@@ -1273,6 +1449,7 @@ class TransfermarktHttpClient:
                                 ),
                                 duration_seconds=total_duration,
                                 payload_hash=_payload_hash(value),
+                                **self._raw_lineage(raw_record),
                             ))
                             self._store_cached_outcome(
                                 cache_key=cache_key,
@@ -1384,6 +1561,8 @@ class TransfermarktHttpClient:
                         redact_sensitive(close_exc),
                     )
                 raise
+            except RawStoreError:
+                raise
             except ProxyRequiredError as exc:
                 if self._attempts == endpoint_attempt_start:
                     raise
@@ -1468,4 +1647,5 @@ class TransfermarktHttpClient:
                 provider_for_endpoint if self._provider_metering_available else None
             ),
             duration_seconds=total_duration,
+            **self._raw_lineage(last_raw_record),
         ))

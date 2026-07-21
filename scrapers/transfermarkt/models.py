@@ -289,6 +289,10 @@ class FetchOutcome(Generic[T]):
     duration_seconds: float = 0.0
     cache_hit: bool = False
     payload_hash: Optional[str] = None
+    raw_capture_id: Optional[str] = None
+    raw_body_hash: Optional[str] = None
+    raw_uri: Optional[str] = None
+    raw_fetched_at: Optional[str] = None
 
     @property
     def is_success(self) -> bool:
@@ -329,6 +333,10 @@ class FetchOutcome(Generic[T]):
             duration_seconds=self.duration_seconds,
             cache_hit=self.cache_hit,
             payload_hash=self.payload_hash,
+            raw_capture_id=self.raw_capture_id,
+            raw_body_hash=self.raw_body_hash,
+            raw_uri=self.raw_uri,
+            raw_fetched_at=self.raw_fetched_at,
         )
 
     def as_checkpoint(self) -> Dict[str, Any]:
@@ -338,7 +346,7 @@ class FetchOutcome(Generic[T]):
         if self.value is not None and payload_hash is None:
             payload_hash = stable_payload_hash(self.value)
         return {
-            "version": 2,
+            "version": 3,
             "status": self.status.value,
             "value": self.value,
             "status_code": self.status_code,
@@ -351,6 +359,10 @@ class FetchOutcome(Generic[T]):
             "provider_metered_bytes": self.provider_metered_bytes,
             "duration_seconds": self.duration_seconds,
             "payload_hash": payload_hash,
+            "raw_capture_id": self.raw_capture_id,
+            "raw_body_hash": self.raw_body_hash,
+            "raw_uri": self.raw_uri,
+            "raw_fetched_at": self.raw_fetched_at,
         }
 
     @classmethod
@@ -390,6 +402,22 @@ class FetchOutcome(Generic[T]):
             duration_seconds=float(value.get("duration_seconds", 0.0)),
             cache_hit=True,
             payload_hash=expected_hash,
+            raw_capture_id=(
+                str(value["raw_capture_id"])
+                if value.get("raw_capture_id") is not None else None
+            ),
+            raw_body_hash=(
+                str(value["raw_body_hash"])
+                if value.get("raw_body_hash") is not None else None
+            ),
+            raw_uri=(
+                str(value["raw_uri"])
+                if value.get("raw_uri") is not None else None
+            ),
+            raw_fetched_at=(
+                str(value["raw_fetched_at"])
+                if value.get("raw_fetched_at") is not None else None
+            ),
         )
 
     def as_cache_hit(self, *, duration_seconds: float) -> "FetchOutcome[T]":
@@ -413,6 +441,10 @@ class FetchRecord:
     error: Optional[str]
     status_code: Optional[int]
     attempts: int
+    raw_capture_id: Optional[str] = None
+    raw_body_hash: Optional[str] = None
+    raw_uri: Optional[str] = None
+    raw_fetched_at: Optional[str] = None
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -422,6 +454,10 @@ class FetchRecord:
             "error": self.error,
             "status_code": self.status_code,
             "attempts": self.attempts,
+            "raw_capture_id": self.raw_capture_id,
+            "raw_body_hash": self.raw_body_hash,
+            "raw_uri": self.raw_uri,
+            "raw_fetched_at": self.raw_fetched_at,
         }
 
 

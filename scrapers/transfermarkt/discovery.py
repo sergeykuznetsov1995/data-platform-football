@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -18,7 +19,8 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 from bs4 import BeautifulSoup, Tag
 
-from scrapers.transfermarkt.models import FetchOutcome, FetchStatus
+from scrapers.transfermarkt.models import FetchOutcome, FetchStatus, stable_payload_hash
+from scrapers.transfermarkt.raw_store import RawResponseStore, RawStoreError
 from scrapers.transfermarkt.registry import (
     AgeCategory,
     ClassificationEvidence,
@@ -40,6 +42,7 @@ from scrapers.transfermarkt.registry import (
 
 
 BASE_URL = "https://www.transfermarkt.com"
+API_BASE_URL = "https://tmapi.transfermarkt.technology"
 CATALOGUE_ROUTE = "/navigation/wettbewerbe"
 # Compatibility aliases for callers which report the discovery roots.  The
 # canonical catalogue is now the sole authority; every region/country page is
@@ -62,8 +65,8 @@ _CANONICAL_SECTION = "startseite"
 # immutable, so the parser revision is part of the snapshot identity. Bump it
 # whenever parsing or classification changes — otherwise a restated catalogue
 # cannot be published over the snapshot id it would otherwise reuse.
-PARSER_REVISION = "tm-html-discovery-v3"
-SCHEMA_REVISION = "2"
+PARSER_REVISION = "tm-source-discovery-v4"
+SCHEMA_REVISION = "3"
 # The catalogue states a competition's taxonomy at three levels: a broad section
 # heading, a group separator inside the tables, and the "National Team
 # Competitions" section, which names the entrants themselves — a table group can
@@ -75,6 +78,14 @@ _EDITION_PATH_RE = re.compile(r"/saison_id/(?P<edition_id>\d{4})(?:/|$)")
 _TEAM_ROUTE_RE = re.compile(
     r"^/(?P<slug>[^/?#]+)/(?:[^/?#]+/)*verein/(?P<team_id>\d+)(?:/.*)?$"
 )
+_API_REGULATION_ROUTE_RE = re.compile(
+    r"^/competition/(?P<competition_id>[A-Za-z0-9_-]+)/regulation$"
+)
+_API_PARTICIPANTS_ROUTE_RE = re.compile(
+    r"^/competition/(?P<competition_id>[A-Za-z0-9_-]+)/club$"
+)
+_API_CLUBS_ROUTE = "/clubs"
+_API_ENTITY_BATCH_SIZE = 250
 
 
 @dataclass(frozen=True)
@@ -153,7 +164,6 @@ class _CompetitionCandidate:
     country: str
     confederation: str
     owner_url: str
-    listing_hashes: set[str] = field(default_factory=set)
     evidence: list[ClassificationEvidence] = field(default_factory=list)
 
 
@@ -165,10 +175,32 @@ class _ParticipantCandidate:
 
 
 @dataclass(frozen=True)
+class _TeamEntity:
+    team_id: str
+    team_name: str
+    source_url: str
+    is_national_team: bool
+
+
+@dataclass(frozen=True)
 class _Document:
     url: str
     body: str
     payload_hash: str
+    raw_capture_id: Optional[str] = None
+
+    @property
+    def source_body_hash(self) -> str:
+        return self.payload_hash
+
+
+@dataclass(frozen=True)
+class _JsonDocument:
+    url: str
+    value: Mapping[str, Any]
+    payload_hash: str
+    source_body_hash: str
+    raw_capture_id: Optional[str] = None
 
 
 def _payload_hash(body: str) -> str:
@@ -225,6 +257,80 @@ def _canonical_url(value: str, *, base_url: str = BASE_URL) -> Optional[str]:
     query = urlencode(sorted(parse_qsl(parsed.query, keep_blank_values=True)))
     path = re.sub(r"//+", "/", parsed.path).rstrip("/") or "/"
     return urlunsplit(("https", "www.transfermarkt.com", path, query, ""))
+
+
+def _canonical_api_url(value: str) -> Optional[str]:
+    """Allow only the three first-party JSON routes discovery actually uses."""
+
+    parsed = urlsplit(value)
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != "tmapi.transfermarkt.technology"
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is not None
+        or parsed.fragment
+    ):
+        return None
+    query = parse_qsl(parsed.query, keep_blank_values=True)
+    regulation = _API_REGULATION_ROUTE_RE.fullmatch(parsed.path)
+    participants = _API_PARTICIPANTS_ROUTE_RE.fullmatch(parsed.path)
+    if regulation is not None:
+        if query:
+            return None
+    elif participants is not None:
+        if len(query) != 1 or query[0][0] != "season":
+            return None
+        if re.fullmatch(r"\d{4}", query[0][1]) is None:
+            return None
+    elif parsed.path == _API_CLUBS_ROUTE:
+        if not query or any(key != "ids[]" for key, _ in query):
+            return None
+        ids = [value for _, value in query]
+        if len(ids) > _API_ENTITY_BATCH_SIZE or any(
+            re.fullmatch(r"\d+", team_id) is None for team_id in ids
+        ):
+            return None
+        query = [("ids[]", team_id) for team_id in sorted(set(ids), key=int)]
+    else:
+        return None
+    return urlunsplit(
+        ("https", "tmapi.transfermarkt.technology", parsed.path, urlencode(query), "")
+    )
+
+
+def _regulation_url(competition_id: str) -> str:
+    if re.fullmatch(r"[A-Za-z0-9_-]+", competition_id) is None:
+        raise DiscoverySchemaError(f"invalid competition id: {competition_id!r}")
+    return f"{API_BASE_URL}/competition/{competition_id}/regulation"
+
+
+def _participants_url(competition_id: str, edition_id: str) -> str:
+    if re.fullmatch(r"[A-Za-z0-9_-]+", competition_id) is None or re.fullmatch(
+        r"\d{4}", edition_id
+    ) is None:
+        raise DiscoverySchemaError(
+            f"invalid competition edition: {competition_id!r}/{edition_id!r}"
+        )
+    return (
+        f"{API_BASE_URL}/competition/{competition_id}/club?"
+        + urlencode({"season": edition_id})
+    )
+
+
+def _clubs_url(team_ids: Iterable[str]) -> str:
+    ordered = sorted({str(team_id) for team_id in team_ids}, key=int)
+    if not ordered or len(ordered) > _API_ENTITY_BATCH_SIZE or any(
+        re.fullmatch(r"\d+", team_id) is None for team_id in ordered
+    ):
+        raise DiscoverySchemaError("invalid club entity batch")
+    return f"{API_BASE_URL}{_API_CLUBS_ROUTE}?" + urlencode(
+        [("ids[]", team_id) for team_id in ordered]
+    )
 
 
 def _profile_identity(url: str) -> Optional[tuple[str, str, str, str]]:
@@ -356,9 +462,21 @@ def _section_signals(label: str) -> _SectionSignals:
     """Map Transfermarkt section taxonomy; never inspect a competition name."""
 
     normalised = _normalise_text(label).casefold()
+    has_phrase = lambda phrase: re.search(  # noqa: E731 - local taxonomy predicate
+        rf"(?<!\w){re.escape(phrase)}(?!\w)", normalised
+    ) is not None
     gender = (
         Gender.WOMEN
-        if any(token in normalised for token in ("women", "frauen"))
+        if any(
+            token in normalised
+            for token in (
+                "women",
+                "frauen",
+                "femenino",
+                "feminino",
+                "femminile",
+            )
+        )
         else None
     )
     if any(token in normalised for token in ("reserve", "second teams")):
@@ -372,14 +490,45 @@ def _section_signals(label: str) -> _SectionSignals:
         token in normalised for token in ("youth", "under-", "under ", "u21", "u19")
     )
     age_category = AgeCategory.UXX if youth else AgeCategory.SENIOR
-    if any(token in normalised for token in ("national cups", "domestic cups")):
+    if any(token in normalised for token in ("mixed", "co-ed", "coed")):
+        return _SectionSignals(
+            gender=Gender.MIXED,
+            team_type=TeamType.MIXED,
+            age_category=age_category,
+        )
+    if any(
+        has_phrase(token)
+        for token in ("international cups", "international cup competitions")
+    ):
+        return _SectionSignals(
+            competition_type=CompetitionType.NATIONAL_TEAM_TOURNAMENT,
+            gender=gender,
+            team_type=TeamType.NATIONAL_TEAM,
+            age_category=age_category,
+        )
+    if any(
+        has_phrase(token)
+        for token in (
+            "national team competitions",
+            "national-team competitions",
+            "fifa tournaments",
+            "international tournaments",
+        )
+    ):
+        return _SectionSignals(
+            competition_type=CompetitionType.NATIONAL_TEAM_TOURNAMENT,
+            gender=gender,
+            team_type=TeamType.NATIONAL_TEAM,
+            age_category=age_category,
+        )
+    if any(has_phrase(token) for token in ("national cups", "domestic cups")):
         return _SectionSignals(
             competition_type=CompetitionType.DOMESTIC_CUP,
             gender=gender,
             team_type=TeamType.CLUB,
             age_category=age_category,
         )
-    if any(token in normalised for token in ("national leagues", "domestic leagues")):
+    if any(has_phrase(token) for token in ("national leagues", "domestic leagues")):
         return _SectionSignals(
             competition_type=CompetitionType.DOMESTIC_LEAGUE,
             gender=gender,
@@ -387,7 +536,7 @@ def _section_signals(label: str) -> _SectionSignals:
             age_category=age_category,
         )
     if any(
-        token in normalised
+        has_phrase(token)
         for token in (
             "international club competitions",
             "continental club competitions",
@@ -404,21 +553,6 @@ def _section_signals(label: str) -> _SectionSignals:
             competition_type=CompetitionType.CONTINENTAL_CLUB,
             gender=gender,
             team_type=TeamType.CLUB,
-            age_category=age_category,
-        )
-    if any(
-        token in normalised
-        for token in (
-            "national team competitions",
-            "national-team competitions",
-            "fifa tournaments",
-            "international tournaments",
-        )
-    ):
-        return _SectionSignals(
-            competition_type=CompetitionType.NATIONAL_TEAM_TOURNAMENT,
-            gender=gender,
-            team_type=TeamType.NATIONAL_TEAM,
             age_category=age_category,
         )
     return _SectionSignals(
@@ -453,6 +587,12 @@ def _group_signals(label: str) -> _SectionSignals:
     normalised = _normalise_text(label).casefold()
     if not normalised:
         return _SectionSignals()
+    if re.search(r"(?<!\w)international cups?(?!\w)", normalised):
+        return _SectionSignals(
+            competition_type=CompetitionType.NATIONAL_TEAM_TOURNAMENT,
+            team_type=TeamType.NATIONAL_TEAM,
+            age_category=AgeCategory.SENIOR,
+        )
     if "reserve" in normalised:
         return _SectionSignals(
             competition_type=CompetitionType.DOMESTIC_LEAGUE,
@@ -460,7 +600,7 @@ def _group_signals(label: str) -> _SectionSignals:
             age_category=AgeCategory.SENIOR,
         )
     age_category = AgeCategory.UXX if "youth" in normalised else AgeCategory.SENIOR
-    if "cup" in normalised:
+    if re.search(r"(?<!\w)(?:cups?|domestic cups?)(?!\w)", normalised):
         return _SectionSignals(
             competition_type=CompetitionType.DOMESTIC_CUP,
             team_type=TeamType.CLUB,
@@ -607,8 +747,10 @@ def _signal_evidence(
 
 _NAME_AGE_RE = re.compile(r"\b[uU]-?(?:1[4-9]|2[0-3])\b|\byouth\b", re.IGNORECASE)
 _NAME_WOMEN_RE = re.compile(
-    r"\bwomen(?:'s)?\b|\bfrauen\b|\bfeminin\w*\b", re.IGNORECASE
+    r"\bwomen(?:'s)?\b|\bfrauen\b|\bfeminin\w*\b|\bfemenin\w*\b|\bfemminil\w*\b",
+    re.IGNORECASE,
 )
+_NAME_MIXED_RE = re.compile(r"\bmixed\b|\bco[- ]?ed\b", re.IGNORECASE)
 
 
 def _name_exclusion_evidence(
@@ -625,6 +767,8 @@ def _name_exclusion_evidence(
     """
     age = AgeCategory.UXX if _NAME_AGE_RE.search(name) else None
     gender = Gender.WOMEN if _NAME_WOMEN_RE.search(name) else None
+    if gender is None and _NAME_MIXED_RE.search(name):
+        gender = Gender.MIXED
     if age is None and gender is None:
         return None
     return ClassificationEvidence(
@@ -749,11 +893,25 @@ def _listing_candidates(
     soup: BeautifulSoup,
     *,
     page_url: str,
-    page_hash: str,
     pagination_limit: int = DEFAULT_DISCOVERY_LIMITS.listing_pages,
 ) -> tuple[_CompetitionCandidate, ...]:
     context = _listing_context(soup, page_url)
     candidates: list[_CompetitionCandidate] = []
+
+    def source_country(anchor: Tag) -> str:
+        explicit = _normalise_text(anchor.get("data-country") or "")
+        if explicit:
+            return explicit
+        row = anchor.find_parent("tr")
+        if row is not None:
+            for element in row.select("[data-country], .flaggenrahmen[title], img[title]"):
+                value = _normalise_text(
+                    element.get("data-country") or element.get("title") or ""
+                )
+                if value and not _is_metric_label(value):
+                    return value
+        return context.country
+
     seen_links = 0
     for anchor in soup.select("a[href]"):
         if _in_site_chrome(anchor):
@@ -779,7 +937,7 @@ def _listing_candidates(
             ),
             (group_label, _group_signals(group_label), _GROUP_PRECEDENCE),
         )
-        country = _normalise_text(anchor.get("data-country") or context.country)
+        country = _normalise_text(source_country(anchor))
         confederation = _normalise_text(
             anchor.get("data-confederation") or context.confederation
         )
@@ -791,7 +949,10 @@ def _listing_candidates(
         excluded_by_name = _name_exclusion_evidence(name, page_url) if name else None
         if excluded_by_name is not None:
             evidence.append(excluded_by_name)
-        if all(signals.gender is not Gender.WOMEN for _, signals, _p in stated):
+        if all(
+            signals.gender not in {Gender.WOMEN, Gender.MIXED}
+            for _, signals, _p in stated
+        ):
             evidence.append(_taxonomy_evidence(page_url))
         for label, signals, precedence in stated:
             if any(
@@ -820,7 +981,6 @@ def _listing_candidates(
                 country=country,
                 confederation=confederation,
                 owner_url=page_url,
-                listing_hashes={page_hash},
                 evidence=evidence,
             )
         )
@@ -898,7 +1058,6 @@ def _merge_candidate(
                 f"conflicting {name} for {candidate.competition_id}: {old!r}/{new!r}"
             )
     existing.owner_url = min(existing.owner_url, candidate.owner_url)
-    existing.listing_hashes.update(candidate.listing_hashes)
     known_evidence = {
         json.dumps(item.as_dict(), sort_keys=True) for item in existing.evidence
     }
@@ -913,7 +1072,37 @@ def _has_season_markup(soup: BeautifulSoup) -> bool:
     return bool(
         soup.select('select[name*="saison"] option[value]')
         or soup.select('a[href*="saison_id"]')
+        or soup.select("tm-competition-homepage[competition-id][season-id]")
     )
+
+
+def _component_season_id(
+    soup: BeautifulSoup,
+    *,
+    competition_id: str,
+    source_url: str,
+) -> Optional[str]:
+    components = soup.select(
+        "tm-competition-homepage[competition-id][season-id]"
+    )
+    if not components:
+        return None
+    identities = {
+        (
+            _normalise_text(component.get("competition-id") or ""),
+            _normalise_text(component.get("season-id") or ""),
+        )
+        for component in components
+    }
+    if len(identities) != 1:
+        raise DiscoverySchemaError(f"conflicting competition component: {source_url}")
+    declared_competition_id, edition_id = identities.pop()
+    if (
+        declared_competition_id != competition_id
+        or re.fullmatch(r"\d{4}", edition_id) is None
+    ):
+        raise DiscoverySchemaError(f"competition component identity mismatch: {source_url}")
+    return edition_id
 
 
 def _canonical_profile_route(soup: BeautifulSoup, profile_url: str) -> Optional[str]:
@@ -1054,6 +1243,196 @@ def _season_format(
             f"edition selector must mark exactly one current edition: {profile_url}"
         )
     return formats[current[0]]
+
+
+def _api_payload_data(
+    document: _JsonDocument,
+    *,
+    expected_type: type,
+) -> Any:
+    value = document.value
+    if value.get("success") is not True or "data" not in value:
+        raise DiscoverySchemaError(f"unsuccessful discovery API response: {document.url}")
+    data = value["data"]
+    if type(data) is not expected_type:
+        raise DiscoverySchemaError(
+            f"discovery API data must be {expected_type.__name__}: {document.url}"
+        )
+    return data
+
+
+def _api_date(value: Any, *, field_name: str, source_url: str) -> Optional[str]:
+    if value is None:
+        return None
+    if type(value) is not str:
+        raise DiscoverySchemaError(
+            f"{field_name} must be an ISO timestamp: {source_url}"
+        )
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise DiscoverySchemaError(
+            f"{field_name} must be an ISO timestamp: {source_url}"
+        ) from exc
+    return parsed.date().isoformat()
+
+
+def _regulation_options(
+    document: _JsonDocument,
+    *,
+    competition_id: str,
+    profile_url: str,
+) -> tuple[tuple[str, str, bool, Mapping[str, Any]], ...]:
+    rows = _api_payload_data(document, expected_type=list)
+    if not rows:
+        raise DiscoverySchemaError(f"regulation has no editions: {document.url}")
+    values: dict[str, tuple[str, bool, Mapping[str, Any]]] = {}
+    for row in rows:
+        if type(row) is not dict or row.get("competitionId") != competition_id:
+            raise DiscoverySchemaError(
+                f"regulation competition mismatch: {document.url}"
+            )
+        season = row.get("season")
+        if type(season) is not dict:
+            raise DiscoverySchemaError(f"regulation season missing: {document.url}")
+        raw_id = season.get("id")
+        if type(raw_id) is not int or isinstance(raw_id, bool):
+            raise DiscoverySchemaError(f"regulation season id invalid: {document.url}")
+        edition_id = str(raw_id)
+        if re.fullmatch(r"\d{4}", edition_id) is None:
+            raise DiscoverySchemaError(f"regulation season id invalid: {document.url}")
+        label = _normalise_text(season.get("display") or "")
+        _label_season_format(label, profile_url)
+        current = row.get("isCurrentSeason")
+        if type(current) is not bool:
+            raise DiscoverySchemaError(
+                f"regulation current-season flag invalid: {document.url}"
+            )
+        attrs = {
+            "data-start-date": _api_date(
+                row.get("tournamentStart"),
+                field_name="tournamentStart",
+                source_url=document.url,
+            ),
+            "data-end-date": _api_date(
+                row.get("tournamentEnd"),
+                field_name="tournamentEnd",
+                source_url=document.url,
+            ),
+        }
+        attrs = {key: value for key, value in attrs.items() if value is not None}
+        if edition_id in values:
+            raise DiscoverySchemaError(
+                f"duplicate regulation edition {edition_id}: {document.url}"
+            )
+        values[edition_id] = (label, current, attrs)
+    current_ids = [edition_id for edition_id, value in values.items() if value[1]]
+    if len(current_ids) != 1:
+        raise DiscoverySchemaError(
+            f"regulation must mark exactly one current edition: {document.url}"
+        )
+    return tuple(
+        (edition_id, *values[edition_id])
+        for edition_id in sorted(values, reverse=True)
+    )
+
+
+def _api_participant_ids(
+    document: _JsonDocument,
+    *,
+    competition_id: str,
+    edition_id: str,
+    limit: int,
+) -> tuple[str, ...]:
+    data = _api_payload_data(document, expected_type=dict)
+    if data.get("competitionId") != competition_id:
+        raise DiscoverySchemaError(
+            f"participant competition mismatch: {document.url}"
+        )
+    season_id = data.get("seasonId")
+    season = data.get("season")
+    if (
+        type(season_id) is not int
+        or isinstance(season_id, bool)
+        or str(season_id) != edition_id
+        or (
+            season is not None
+            and (
+                type(season) is not dict
+                or type(season.get("id")) is not int
+                or isinstance(season.get("id"), bool)
+                or str(season.get("id")) != edition_id
+            )
+        )
+    ):
+        raise DiscoverySchemaError(f"participant season mismatch: {document.url}")
+    raw_ids = data.get("clubIds")
+    if type(raw_ids) is not list:
+        raise DiscoverySchemaError(f"participant ids missing: {document.url}")
+    team_ids: list[str] = []
+    for raw_id in raw_ids:
+        if type(raw_id) not in {str, int} or isinstance(raw_id, bool):
+            raise DiscoverySchemaError(f"participant id invalid: {document.url}")
+        team_id = str(raw_id)
+        if re.fullmatch(r"\d+", team_id) is None:
+            raise DiscoverySchemaError(f"participant id invalid: {document.url}")
+        team_ids.append(team_id)
+    if len(team_ids) != len(set(team_ids)):
+        raise DiscoverySchemaError(f"duplicate participant id: {document.url}")
+    if len(team_ids) > limit:
+        raise DiscoverySchemaError(
+            f"participant list exceeds bound {limit}: {document.url}"
+        )
+    return tuple(sorted(team_ids, key=int))
+
+
+def _api_team_entities(
+    document: _JsonDocument,
+    *,
+    requested_ids: Iterable[str],
+) -> dict[str, _TeamEntity]:
+    rows = _api_payload_data(document, expected_type=list)
+    requested = {str(team_id) for team_id in requested_ids}
+    entities: dict[str, _TeamEntity] = {}
+    for row in rows:
+        if type(row) is not dict:
+            raise DiscoverySchemaError(f"club entity is not an object: {document.url}")
+        raw_id = row.get("id")
+        if type(raw_id) not in {str, int} or isinstance(raw_id, bool):
+            raise DiscoverySchemaError(f"club entity id invalid: {document.url}")
+        team_id = str(raw_id)
+        name = _normalise_text(row.get("name") or "")
+        relative_url = row.get("relativeUrl")
+        base_details = row.get("baseDetails")
+        if (
+            re.fullmatch(r"\d+", team_id) is None
+            or not name
+            or _is_metric_label(name)
+            or type(relative_url) is not str
+            or type(base_details) is not dict
+            or type(base_details.get("isNationalTeam")) is not bool
+        ):
+            raise DiscoverySchemaError(f"club entity fields invalid: {document.url}")
+        canonical = _canonical_url(relative_url)
+        identity = _team_identity(canonical) if canonical is not None else None
+        if identity is None or identity[0] != team_id:
+            raise DiscoverySchemaError(f"club entity URL mismatch: {document.url}")
+        if team_id in entities:
+            raise DiscoverySchemaError(f"duplicate club entity {team_id}: {document.url}")
+        entities[team_id] = _TeamEntity(
+            team_id=team_id,
+            team_name=name,
+            source_url=canonical,
+            is_national_team=base_details["isNationalTeam"],
+        )
+    if set(entities) != requested:
+        missing = sorted(requested - set(entities), key=int)
+        extra = sorted(set(entities) - requested, key=int)
+        raise DiscoverySchemaError(
+            f"club entity response incomplete: {document.url}; "
+            f"missing={missing[:3]}, extra={extra[:3]}"
+        )
+    return entities
 
 
 def _edition_url(profile_url: str, edition_id: str) -> str:
@@ -1205,19 +1584,31 @@ class TransfermarktCompetitionDiscovery:
         self,
         *,
         fetch: Callable[[str], FetchOutcome[str]],
+        fetch_json: Optional[
+            Callable[[str, str], FetchOutcome[Mapping[str, Any]]]
+        ] = None,
         checkpoint: MutableMapping[str, Any],
         traffic_ledger: TrafficLedger,
         clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
         limits: DiscoveryLimits = DEFAULT_DISCOVERY_LIMITS,
+        raw_store: Optional[RawResponseStore] = None,
     ) -> None:
         if traffic_ledger is None:
             raise TypeError("traffic_ledger is required")
         self._fetch = fetch
+        self._fetch_json = fetch_json
         self._checkpoint = checkpoint
         self._traffic_ledger = traffic_ledger
         self._clock = clock
         self._limits = limits
+        self._raw_required = os.environ.get(
+            "TRANSFERMARKT_REQUIRE_RAW_STORE", "false"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if raw_store is None and self._raw_required:
+            raw_store = RawResponseStore.from_env(optional=False)
+        self._raw_store = raw_store
         self._documents: dict[str, _Document] = {}
+        self._api_documents: dict[str, _JsonDocument] = {}
 
     def _get(self, url: str) -> _Document:
         canonical = _canonical_url(url)
@@ -1226,7 +1617,7 @@ class TransfermarktCompetitionDiscovery:
         existing = self._documents.get(canonical)
         if existing is not None:
             return existing
-        if len(self._documents) >= self._limits.documents:
+        if len(self._documents) + len(self._api_documents) >= self._limits.documents:
             raise DiscoverySchemaError(
                 f"discovery document bound exceeded ({self._limits.documents})"
             )
@@ -1238,12 +1629,31 @@ class TransfermarktCompetitionDiscovery:
                 )
             body = cached.get("body")
             expected_hash = cached.get("payload_hash")
+            raw_capture_id = cached.get("raw_capture_id")
             if cached.get("status") != FetchStatus.OK.value or not isinstance(
                 body, str
             ):
                 raise DiscoveryCheckpointError(
                     f"checkpoint is not an authoritative success: {canonical}"
                 )
+            if self._raw_required and not raw_capture_id:
+                raise DiscoveryCheckpointError(
+                    f"checkpoint has no raw capture lineage: {canonical}"
+                )
+            if raw_capture_id and self._raw_store is not None:
+                try:
+                    raw_body, raw_record = self._raw_store.load_capture(
+                        str(raw_capture_id)
+                    )
+                    body = raw_body.decode("utf-8", errors="replace")
+                except (RawStoreError, UnicodeDecodeError) as exc:
+                    raise DiscoveryCheckpointError(
+                        f"checkpoint raw replay failed: {canonical}"
+                    ) from exc
+                if raw_record.url != canonical:
+                    raise DiscoveryCheckpointError(
+                        f"checkpoint raw URL mismatch: {canonical}"
+                    )
             actual_hash = _payload_hash(body)
             if expected_hash != actual_hash:
                 raise DiscoveryCheckpointError(
@@ -1252,7 +1662,12 @@ class TransfermarktCompetitionDiscovery:
             self._traffic_ledger.record_cache_hit(
                 entity="competition_registry", duration_seconds=0.0
             )
-            document = _Document(canonical, body, actual_hash)
+            document = _Document(
+                canonical,
+                body,
+                actual_hash,
+                str(raw_capture_id) if raw_capture_id else None,
+            )
             self._documents[canonical] = document
             return document
 
@@ -1275,16 +1690,151 @@ class TransfermarktCompetitionDiscovery:
         body_hash = _payload_hash(outcome.value)
         if outcome.payload_hash is not None and outcome.payload_hash != body_hash:
             raise DiscoveryFetchError(f"transport payload hash mismatch: {canonical}")
+        if self._raw_required and (
+            not outcome.raw_capture_id or not outcome.raw_body_hash
+        ):
+            raise DiscoveryFetchError(
+                f"required discovery page has no raw lineage: {canonical}"
+            )
+        if outcome.raw_body_hash and outcome.raw_body_hash != body_hash:
+            raise DiscoveryFetchError(f"raw response hash mismatch: {canonical}")
         self._checkpoint[canonical] = {
             "attempts": outcome.attempts,
             "body": outcome.value,
             "decoded_body_bytes": outcome.decoded_body_bytes,
             "payload_hash": body_hash,
+            "raw_capture_id": outcome.raw_capture_id,
+            "raw_body_hash": outcome.raw_body_hash,
             "status": FetchStatus.OK.value,
             "status_code": 200,
         }
-        document = _Document(canonical, outcome.value, body_hash)
+        document = _Document(
+            canonical, outcome.value, body_hash, outcome.raw_capture_id
+        )
         self._documents[canonical] = document
+        return document
+
+    def _get_json(self, url: str, *, endpoint: str) -> _JsonDocument:
+        canonical = _canonical_api_url(url)
+        if canonical is None:
+            raise DiscoveryFetchError(f"unsupported Transfermarkt API URL: {url!r}")
+        existing = self._api_documents.get(canonical)
+        if existing is not None:
+            return existing
+        if self._fetch_json is None:
+            raise DiscoveryFetchError("Transfermarkt discovery JSON fetcher is required")
+        if len(self._documents) + len(self._api_documents) >= self._limits.documents:
+            raise DiscoverySchemaError(
+                f"discovery document bound exceeded ({self._limits.documents})"
+            )
+        cached = self._checkpoint.get(canonical)
+        if cached is not None:
+            if not isinstance(cached, Mapping):
+                raise DiscoveryCheckpointError(
+                    f"checkpoint entry is not an object: {canonical}"
+                )
+            value = cached.get("value")
+            expected_hash = cached.get("payload_hash")
+            expected_raw_hash = cached.get("raw_body_hash")
+            raw_capture_id = cached.get("raw_capture_id")
+            if (
+                cached.get("status") != FetchStatus.OK.value
+                or type(value) is not dict
+            ):
+                raise DiscoveryCheckpointError(
+                    f"checkpoint is not an authoritative JSON success: {canonical}"
+                )
+            if self._raw_required and not raw_capture_id:
+                raise DiscoveryCheckpointError(
+                    f"checkpoint has no raw capture lineage: {canonical}"
+                )
+            if raw_capture_id and self._raw_store is not None:
+                try:
+                    raw_body, raw_record = self._raw_store.load_capture(
+                        str(raw_capture_id)
+                    )
+                    replayed = json.loads(raw_body.decode("utf-8-sig", errors="strict"))
+                except (RawStoreError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise DiscoveryCheckpointError(
+                        f"checkpoint raw JSON replay failed: {canonical}"
+                    ) from exc
+                if type(replayed) is not dict or raw_record.url != canonical:
+                    raise DiscoveryCheckpointError(
+                        f"checkpoint raw JSON identity mismatch: {canonical}"
+                    )
+                value = replayed
+                actual_raw_hash = hashlib.sha256(raw_body).hexdigest()
+                if (
+                    raw_record.content_hash != actual_raw_hash
+                    or expected_raw_hash != actual_raw_hash
+                ):
+                    raise DiscoveryCheckpointError(
+                        f"checkpoint raw JSON hash mismatch: {canonical}"
+                    )
+            actual_hash = stable_payload_hash(value)
+            if expected_hash != actual_hash:
+                raise DiscoveryCheckpointError(
+                    f"checkpoint JSON payload hash mismatch: {canonical}"
+                )
+            self._traffic_ledger.record_cache_hit(
+                entity=endpoint, duration_seconds=0.0
+            )
+            document = _JsonDocument(
+                url=canonical,
+                value=value,
+                payload_hash=actual_hash,
+                source_body_hash=str(expected_raw_hash or actual_hash),
+                raw_capture_id=str(raw_capture_id) if raw_capture_id else None,
+            )
+            self._api_documents[canonical] = document
+            return document
+
+        self._traffic_ledger.ensure_request_allowed()
+        outcome = self._fetch_json(canonical, endpoint)
+        if not isinstance(outcome, FetchOutcome):
+            raise DiscoveryFetchError(
+                f"JSON fetch returned {type(outcome).__name__}, expected FetchOutcome: "
+                f"{canonical}"
+            )
+        if outcome.status is not FetchStatus.OK or outcome.status_code != 200:
+            raise DiscoveryFetchError(
+                "required discovery API failed: "
+                f"url={canonical}, status={outcome.status.value}, "
+                f"http={outcome.status_code or 0}"
+            )
+        if type(outcome.value) is not dict:
+            raise DiscoveryFetchError(
+                f"required discovery API has no JSON object: {canonical}"
+            )
+        body_hash = stable_payload_hash(outcome.value)
+        if outcome.payload_hash is not None and outcome.payload_hash != body_hash:
+            raise DiscoveryFetchError(
+                f"transport JSON payload hash mismatch: {canonical}"
+            )
+        if self._raw_required and (
+            not outcome.raw_capture_id or not outcome.raw_body_hash
+        ):
+            raise DiscoveryFetchError(
+                f"required discovery API has no raw lineage: {canonical}"
+            )
+        self._checkpoint[canonical] = {
+            "attempts": outcome.attempts,
+            "value": outcome.value,
+            "decoded_body_bytes": outcome.decoded_body_bytes,
+            "payload_hash": body_hash,
+            "raw_capture_id": outcome.raw_capture_id,
+            "raw_body_hash": outcome.raw_body_hash,
+            "status": FetchStatus.OK.value,
+            "status_code": 200,
+        }
+        document = _JsonDocument(
+            url=canonical,
+            value=outcome.value,
+            payload_hash=body_hash,
+            source_body_hash=str(outcome.raw_body_hash or body_hash),
+            raw_capture_id=outcome.raw_capture_id,
+        )
+        self._api_documents[canonical] = document
         return document
 
     @staticmethod
@@ -1317,7 +1867,6 @@ class TransfermarktCompetitionDiscovery:
             for candidate in _listing_candidates(
                 soup,
                 page_url=document.url,
-                page_hash=document.payload_hash,
                 pagination_limit=self._limits.listing_pages,
             ):
                 _merge_candidate(candidates, candidate)
@@ -1390,24 +1939,40 @@ class TransfermarktCompetitionDiscovery:
         options_by_competition: dict[
             str, tuple[tuple[str, str, bool, Mapping[str, Any]], ...]
         ] = {}
-        edition_documents: dict[tuple[str, str], _Document] = {}
+        edition_documents: dict[
+            tuple[str, str], _Document | _JsonDocument
+        ] = {}
         participants_by_edition: dict[
             tuple[str, str], tuple[_ParticipantCandidate, ...]
         ] = {}
-        editionless: list[str] = []
+        participant_ids_by_edition: dict[tuple[str, str], tuple[str, ...]] = {}
+        api_regulation_documents: dict[str, _JsonDocument] = {}
         edition_count = 0
         participant_count = 0
         for competition_id, candidate in sorted(candidates.items()):
             profile_document, profile_soup = profiles[competition_id]
-            try:
+            if self._fetch_json is not None:
+                regulation_document = self._get_json(
+                    _regulation_url(competition_id), endpoint="competition_regulation"
+                )
+                options = _regulation_options(
+                    regulation_document,
+                    competition_id=competition_id,
+                    profile_url=candidate.profile_url,
+                )
+                _component_season_id(
+                    profile_soup,
+                    competition_id=competition_id,
+                    source_url=candidate.profile_url,
+                )
+                # Some national tournaments expose the cyclical display year
+                # in this component (FIWC uses 2026 while the API key is 2025),
+                # so regulation remains the authoritative edition inventory.
+                api_regulation_documents[competition_id] = regulation_document
+            else:
                 options = _selector_options(
                     profile_soup, profile_url=candidate.profile_url
                 )
-            except DiscoverySchemaError as exc:
-                if "edition selector missing" not in str(exc):
-                    raise
-                editionless.append(competition_id)
-                continue
             edition_count += len(options)
             if edition_count > self._limits.editions:
                 raise DiscoverySchemaError(
@@ -1416,42 +1981,82 @@ class TransfermarktCompetitionDiscovery:
             options_by_competition[competition_id] = options
             for edition_id, _label, current, _attrs in options:
                 edition_source_url = _edition_url(candidate.profile_url, edition_id)
-                if current:
-                    edition_document, edition_soup = profile_document, profile_soup
+                if self._fetch_json is not None:
+                    edition_document = api_regulation_documents[competition_id]
+                    exact_ids = _api_participant_ids(
+                        self._get_json(
+                            _participants_url(competition_id, edition_id),
+                            endpoint="competition_participants",
+                        ),
+                        competition_id=competition_id,
+                        edition_id=edition_id,
+                        limit=self._limits.participants_per_edition,
+                    )
+                    participant_ids_by_edition[(competition_id, edition_id)] = exact_ids
+                    participant_count += len(exact_ids)
                 else:
-                    edition_document = self._get(edition_source_url)
-                    edition_soup = self._soup(edition_document)
-                _validate_edition_document(
-                    edition_soup,
-                    competition_id=competition_id,
-                    edition_id=edition_id,
-                    source_url=edition_source_url,
-                )
+                    if current:
+                        edition_document, edition_soup = profile_document, profile_soup
+                    else:
+                        edition_document = self._get(edition_source_url)
+                        edition_soup = self._soup(edition_document)
+                    _validate_edition_document(
+                        edition_soup,
+                        competition_id=competition_id,
+                        edition_id=edition_id,
+                        source_url=edition_source_url,
+                    )
+                    exact_participants = _participant_candidates(
+                        edition_soup,
+                        source_url=edition_source_url,
+                        limit=self._limits.participants_per_edition,
+                    )
+                    participants_by_edition[(competition_id, edition_id)] = (
+                        exact_participants
+                    )
+                    participant_count += len(exact_participants)
                 edition_documents[(competition_id, edition_id)] = edition_document
-                exact_participants = _participant_candidates(
-                    edition_soup,
-                    source_url=edition_source_url,
-                    limit=self._limits.participants_per_edition,
-                )
-                participant_count += len(exact_participants)
                 if participant_count > self._limits.participants:
                     raise DiscoverySchemaError(
                         f"participant bound exceeded ({self._limits.participants})"
                     )
-                participants_by_edition[(competition_id, edition_id)] = (
-                    exact_participants
+        team_national_by_id: dict[str, bool] = {}
+        if self._fetch_json is not None:
+            all_team_ids = {
+                team_id
+                for team_ids in participant_ids_by_edition.values()
+                for team_id in team_ids
+            }
+            teams_by_id: dict[str, _TeamEntity] = {}
+            ordered_ids = sorted(all_team_ids, key=int)
+            for offset in range(0, len(ordered_ids), _API_ENTITY_BATCH_SIZE):
+                batch = tuple(ordered_ids[offset : offset + _API_ENTITY_BATCH_SIZE])
+                entity_document = self._get_json(
+                    _clubs_url(batch), endpoint="competition_participant_entities"
                 )
-
-        for competition_id in editionless:
-            candidates.pop(competition_id, None)
-            profiles.pop(competition_id, None)
-        if not candidates:
-            raise DiscoverySchemaError("complete catalog contains no competitions")
+                entities = _api_team_entities(entity_document, requested_ids=batch)
+                teams_by_id.update(entities)
+                team_national_by_id.update(
+                    {team_id: entity.is_national_team for team_id, entity in entities.items()}
+                )
+            for key, team_ids in participant_ids_by_edition.items():
+                participants_by_edition[key] = tuple(
+                    _ParticipantCandidate(
+                        team_id=team_id,
+                        team_name=teams_by_id[team_id].team_name,
+                        source_url=teams_by_id[team_id].source_url,
+                    )
+                    for team_id in team_ids
+                )
 
         snapshot_material = {
             "pages": {
                 url: document.payload_hash
                 for url, document in sorted(self._documents.items())
+            },
+            "api": {
+                url: document.source_body_hash
+                for url, document in sorted(self._api_documents.items())
             },
             "parser_revision": PARSER_REVISION,
             "schema_revision": SCHEMA_REVISION,
@@ -1495,11 +2100,6 @@ class TransfermarktCompetitionDiscovery:
                 ).canonical_competition_id
             except UnknownCompetitionError:
                 canonical_id = None
-            combined_hash = hashlib.sha256(
-                "|".join(
-                    sorted(candidate.listing_hashes | {profile_document.payload_hash})
-                ).encode()
-            ).hexdigest()
             competition_records[competition_id] = CompetitionRecord(
                 competition_id=competition_id,
                 slug=candidate.slug,
@@ -1517,7 +2117,8 @@ class TransfermarktCompetitionDiscovery:
                 canonical_competition_id=canonical_id,
                 evidence=evidence,
                 registry_snapshot_id=snapshot_id,
-                source_body_hash=combined_hash,
+                source_body_hash=profile_document.source_body_hash,
+                raw_capture_id=profile_document.raw_capture_id,
                 parser_revision=PARSER_REVISION,
                 schema_revision=SCHEMA_REVISION,
             )
@@ -1528,6 +2129,14 @@ class TransfermarktCompetitionDiscovery:
                 edition_source_url = _edition_url(candidate.profile_url, edition_id)
                 edition_document = edition_documents[(competition_id, edition_id)]
                 edition_format = _label_season_format(label, candidate.profile_url)
+                if self._fetch_json is not None:
+                    expected_national = team_type is TeamType.NATIONAL_TEAM
+                    for item in participant_ids_by_edition[(competition_id, edition_id)]:
+                        if team_national_by_id[item] is not expected_national:
+                            raise DiscoverySchemaError(
+                                "participant team taxonomy disagrees with competition: "
+                                f"{competition_id}/{edition_id}/{item}"
+                            )
                 exact_participants = tuple(
                     CompetitionParticipant(
                         competition_id=competition_id,
@@ -1537,7 +2146,8 @@ class TransfermarktCompetitionDiscovery:
                         source_url=item.source_url,
                         discovered_at=discovered_at,
                         registry_snapshot_id=snapshot_id,
-                        source_body_hash=edition_document.payload_hash,
+                        source_body_hash=edition_document.source_body_hash,
+                        raw_capture_id=edition_document.raw_capture_id,
                         parser_revision=PARSER_REVISION,
                         schema_revision=SCHEMA_REVISION,
                     )
@@ -1560,7 +2170,8 @@ class TransfermarktCompetitionDiscovery:
                         source_url=edition_source_url,
                         discovered_at=discovered_at,
                         registry_snapshot_id=snapshot_id,
-                        source_body_hash=edition_document.payload_hash,
+                        source_body_hash=edition_document.source_body_hash,
+                        raw_capture_id=edition_document.raw_capture_id,
                         parser_revision=PARSER_REVISION,
                         schema_revision=SCHEMA_REVISION,
                     )
@@ -1606,6 +2217,9 @@ class TransfermarktCompetitionDiscovery:
 def discover_competition_registry(
     *,
     fetch: Callable[[str], FetchOutcome[str]],
+    fetch_json: Optional[
+        Callable[[str, str], FetchOutcome[Mapping[str, Any]]]
+    ] = None,
     checkpoint: MutableMapping[str, Any],
     traffic_ledger: TrafficLedger,
     clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
@@ -1615,6 +2229,7 @@ def discover_competition_registry(
 
     return TransfermarktCompetitionDiscovery(
         fetch=fetch,
+        fetch_json=fetch_json,
         checkpoint=checkpoint,
         traffic_ledger=traffic_ledger,
         clock=clock,
