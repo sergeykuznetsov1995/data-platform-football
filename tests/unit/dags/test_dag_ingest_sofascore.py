@@ -160,6 +160,47 @@ class TestBronzeFreshnessGate:
         with pytest.raises(Exception, match="canonical endpoint completeness failed"):
             dag_module.run_sofascore_dq()
 
+    def test_manifest_dq_accepts_clean_match_noop(self, dag_module, monkeypatch):
+        """#842/#951: a clean incremental no-op (every resolved match already
+        terminal in bronze) never runs the capture engine and cannot stamp
+        ``endpoint_completeness``. The DQ barrier must accept it — otherwise
+        every quiet-day/replay run fails with a false completeness alarm."""
+
+        def load(path, logger):
+            if "match_capture" in path:
+                return {
+                    "matches_total": 380,
+                    "matches_skipped_existing": 380,
+                    "errors": [],
+                    "fallback": False,
+                }
+            return {"endpoint_completeness": 1.0, "errors": []}
+
+        monkeypatch.setattr(dag_module, "_load_result", load)
+        result = dag_module.run_sofascore_dq()
+        assert result["status"] == "success"
+        assert any(entry.endswith(":noop") for entry in result["checked"])
+
+    def test_manifest_dq_rejects_partial_skip_without_completeness(
+        self, dag_module, monkeypatch
+    ):
+        """A partial skip is NOT a clean no-op: matches were resolved but not
+        all skipped, and the missing completeness stamp must keep failing."""
+
+        def load(path, logger):
+            if "match_capture" in path:
+                return {
+                    "matches_total": 380,
+                    "matches_skipped_existing": 200,
+                    "errors": [],
+                    "fallback": False,
+                }
+            return {"endpoint_completeness": 1.0, "errors": []}
+
+        monkeypatch.setattr(dag_module, "_load_result", load)
+        with pytest.raises(Exception, match="canonical endpoint completeness failed"):
+            dag_module.run_sofascore_dq()
+
     def test_freshness_checks_cover_match_grain_tables_as_warning(
         self,
         dag_module,
