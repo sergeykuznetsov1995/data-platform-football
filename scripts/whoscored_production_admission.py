@@ -337,10 +337,12 @@ _CRITICAL_IMAGE_PATHS = {
 _ALLOWED_VOLUME_TARGETS = {
     "airflow-scheduler": {
         "/home/airflow/soccerdata": ("volume", False),
+        "/opt/airflow/configs/fotmob": ("bind", True),
         "/opt/airflow/configs/medallion": ("bind", True),
         "/opt/airflow/configs/soccerdata": ("bind", True),
         "/opt/airflow/configs/sofascore": ("bind", True),
         "/opt/airflow/dags": ("bind", True),
+        "/opt/airflow/fotmob-admission": ("bind", True),
         "/opt/airflow/logs": ("bind", False),
         "/opt/airflow/proxys.txt": ("bind", True),
         "/opt/airflow/scrapers": ("bind", True),
@@ -372,6 +374,7 @@ _ALLOWED_VOLUME_TARGETS = {
 }
 _RELEASE_BIND_TARGETS = {
     "airflow-scheduler": {
+        "/opt/airflow/configs/fotmob": "configs/fotmob",
         "/opt/airflow/configs/medallion": "configs/medallion",
         "/opt/airflow/configs/soccerdata": "configs/soccerdata",
         "/opt/airflow/configs/sofascore": "configs/sofascore",
@@ -399,6 +402,10 @@ _RELEASE_BIND_TARGETS = {
     },
 }
 _RUNTIME_HOST_BIND_TARGETS = {
+    (
+        "airflow-scheduler",
+        "/opt/airflow/fotmob-admission",
+    ): "protected-directory",
     ("airflow-scheduler", "/opt/airflow/logs"): "writable-directory",
     ("airflow-scheduler", "/opt/airflow/proxys.txt"): "protected-file",
     (
@@ -858,6 +865,8 @@ _SCHEDULER_ENVIRONMENT_NAMES = frozenset(
     AIRFLOW__CORE__FERNET_KEY AIRFLOW__CORE__LOAD_EXAMPLES
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN AIRFLOW__WEBSERVER__EXPOSE_CONFIG
     AIRFLOW__WEBSERVER__SECRET_KEY ALERT_ENV FBREF_PROXY_CONTROL_TOKEN
+    FBREF_CONTROL_DB_URI FOTMOB_DEPLOY_GIT_SHA
+    FOTMOB_SHARED_DEPLOYMENT_REPORT_PATH
     FBREF_PROXY_CONTROL_URL FBREF_PROXY_LEASE_TTL_SECONDS FBREF_RAW_S3_ENDPOINT
     FBREF_RAW_S3_SCHEME FBREF_RAW_STORE_URI FBREF_STAGE_JANITOR_MODE
     FOTMOB_RAW_S3_ENDPOINT
@@ -1670,7 +1679,10 @@ def _validate_rendered_environment(
         raise AdmissionError("rendered WhoScored source-pool size differs")
     if service == "airflow-scheduler":
         approval_path = environment.get("WHOSCORED_PROXY_APPROVAL_PATH", "")
-        if approval_path and _WHOSCORED_APPROVAL_PATH_RE.fullmatch(approval_path) is None:
+        if (
+            approval_path
+            and _WHOSCORED_APPROVAL_PATH_RE.fullmatch(approval_path) is None
+        ):
             raise AdmissionError("rendered WhoScored approval path differs")
         if len(environment.get("FBREF_PROXY_CONTROL_TOKEN", "").strip()) < 32:
             raise AdmissionError("rendered FBref proxy-control token is invalid")
@@ -1679,13 +1691,14 @@ def _validate_rendered_environment(
             "TM_STANDING_POLICY_ENABLED",
             "TM_REQUIRE_METERED_PROXY",
         )
-        if any(environment.get(name) not in {"true", "false"} for name in tm_boolean_names):
+        if any(
+            environment.get(name) not in {"true", "false"} for name in tm_boolean_names
+        ):
             raise AdmissionError("rendered Transfermarkt boolean controls differ")
         if environment.get("TM_NATIVE_V2_ENABLED") == "true" and (
             environment.get("TM_STANDING_POLICY_ENABLED") != "true"
             or environment.get("TM_REQUIRE_METERED_PROXY") != "true"
-            or environment.get("TM_PROXY_CONTROL_URL")
-            != "http://proxy_filter:8899"
+            or environment.get("TM_PROXY_CONTROL_URL") != "http://proxy_filter:8899"
             or len(environment.get("TM_PROXY_CONTROL_TOKEN", "").strip()) < 32
         ):
             raise AdmissionError(
@@ -3480,6 +3493,9 @@ def _validate_bind_source_policy(
         )
     _assert_separate_mounts(
         {
+            "fotmob-admission": sources[
+                ("airflow-scheduler", "/opt/airflow/fotmob-admission")
+            ],
             "scheduler-logs": sources[("airflow-scheduler", "/opt/airflow/logs")],
             "gateway-state": sources[
                 (
@@ -3493,11 +3509,6 @@ def _validate_bind_source_policy(
                     "/opt/airflow/state/whoscored-proxy-filter",
                 )
             ],
-        },
-        label="WhoScored writable state",
-    )
-    _assert_separate_mounts(
-        {
             "scheduler-approvals": sources[
                 ("airflow-scheduler", "/opt/airflow/secure/whoscored-approvals")
             ],
@@ -3508,7 +3519,7 @@ def _validate_bind_source_policy(
                 )
             ],
         },
-        label="WhoScored authority",
+        label="protected runtime",
     )
 
 

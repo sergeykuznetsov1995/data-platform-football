@@ -10,7 +10,8 @@ Architecture
 ------------
 
     Triggered once by dag_master_pipeline after FBref Silver/xref and all
-    direct Gold prerequisites complete (or by an operator manually)
+    direct Gold prerequisites complete. Direct/manual runs fail the mandatory
+    FotMob consumer preflight before the first Gold write.
         |
         v
     dim_competition, dim_season, dim_venue   (config-driven, no dependencies)
@@ -71,6 +72,7 @@ from airflow.operators.python import PythonOperator
 from airflow.utils.task_group import TaskGroup
 
 from utils.default_args import SILVER_ARGS
+from utils.fotmob_publication import validate_fotmob_consumer_fence
 from utils import transfermarkt_native_v2 as tm_v2
 
 # ---------------------------------------------------------------------------
@@ -324,7 +326,7 @@ def _quality(**_ctx) -> Dict[str, Any]:
 
 
 def _tm_reader_precondition(**context) -> Dict[str, Any]:
-    """Gate direct Gold triggers when canonical Transfermarkt readers are v2."""
+    """Gate an admitted Gold run when canonical Transfermarkt readers are v2."""
     from airflow.exceptions import AirflowException
 
     conn = tm_v2.connect()
@@ -412,7 +414,7 @@ def _tm_reader_precondition(**context) -> Dict[str, Any]:
             )
             if not report['ready'] or not views['passed']:
                 raise AirflowException(
-                    f'TM v2 direct Gold precondition failed: '
+                    f'TM v2 Gold precondition failed: '
                     f'readiness={report} views={views}'
                 )
             result['readiness_cycle_id'] = cycle_id
@@ -500,6 +502,12 @@ with DAG(
     dagrun_timeout=timedelta(hours=10),
     doc_md=__doc__,
 ) as dag:
+
+    publication_preflight = PythonOperator(
+        task_id='validate_fotmob_publication_consumer',
+        python_callable=validate_fotmob_consumer_fence,
+        retries=0,
+    )
 
     transfermarkt_reader_precondition = PythonOperator(
         task_id='transfermarkt_reader_precondition',
@@ -610,7 +618,8 @@ with DAG(
         python_callable=_tm_legacy_physical_dq,
     )
 
-    (transfermarkt_reader_precondition >> g2a >> g2b >> g2c >> g2d >> g3
+    (publication_preflight >> transfermarkt_reader_precondition
+     >> g2a >> g2b >> g2c >> g2d >> g3
      >> validate_row_counts >> validate_quality
      >> transfermarkt_legacy_physical_dq
      >> transfermarkt_reader_postcondition)

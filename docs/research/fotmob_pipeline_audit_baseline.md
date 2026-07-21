@@ -245,13 +245,13 @@ reason is exported by `field_map.py` and written to the field inventory.
 - CLI modes: `discover`, `daily`, `backfill`, `replay`; reports are atomic and
   run-specific; incomplete/schema-drift runs exit non-zero.
 
-### Legacy migration and remaining risks
+### Native cutover and remaining risks
 
-Legacy CLI remains additive for current consumers, with corrected traffic,
-season validation, tables, leaderboards, transfer fields and match request
-count. `migrate_fotmob_native.py` is audit-only by default; its explicit
-two-step apply mode copies confirmed season-replicated team/player/transfer
-snapshots into quarantine, validates counts, then deletes exact copied rows.
+The legacy scraper and its one-off migration helpers are no longer production
+entry points. The supported closure path is the fenced native backfill/replay,
+parity acceptance, deployment and cleanup lifecycle documented in the FotMob
+production runbook. Historical quarantine work is deliberately not exposed as
+an operator CLI after the native cutover.
 
 Silver/Gold intentionally remain limited to their existing mapped legacy
 competitions during this rollout; the 555-ID canonical Bronze catalog is not

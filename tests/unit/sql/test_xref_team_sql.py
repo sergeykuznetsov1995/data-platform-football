@@ -221,7 +221,7 @@ class TestXrefTeamTemplateStructure:
         Invariants preserved from the legacy branch:
         * source_id strings are the same source field (``home.name`` /
           ``away.name``) → ``home_team_name``/``away_team_name``;
-        * ``league`` is reconstructed via the static competition_id map whose
+        * ``league`` is reconstructed via the registry-rendered competition_id map whose
           INNER JOIN doubles as the 14-league scope guard;
         * ``season`` derives from ``source_season_key`` — year-start via
           ``substr(key, 1, 4)``, then the SAME legacy slug CASE (#404/#913),
@@ -234,7 +234,7 @@ class TestXrefTeamTemplateStructure:
         assert "iceberg.bronze.fotmob_schedule" not in sql, (
             "legacy iceberg.bronze.fotmob_schedule must be gone (#930 cutover)"
         )
-        # league scope: INNER JOIN to the static competition_id → league map.
+        # league scope: INNER JOIN to the registry-rendered id → league map.
         assert re.search(r"\bJOIN\s+league_map\b", sql, re.IGNORECASE), (
             "fotmob branch must INNER JOIN league_map (14-league scope guard)"
         )

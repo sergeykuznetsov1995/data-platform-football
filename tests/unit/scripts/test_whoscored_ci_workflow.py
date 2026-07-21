@@ -144,6 +144,43 @@ def test_ci_proves_both_production_targets_match_declared_evidence_state():
     assert "--entrypoint /opt/legacy-scraper-venv/bin/python" in text
 
 
+def test_production_provenance_is_pushed_and_smoked_by_digest():
+    text = _workflow_text()
+    production = text.split(
+        "- name: Build production targets and prove the declared gate state", 1
+    )[1].split(
+        "- name: Build and smoke the immutable WhoScored FlareSolverr image", 1
+    )[0]
+
+    assert (
+        "registry:2.8.3@sha256:"
+        "a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373"
+    ) in text
+    assert 'network=host' in text
+    assert text.count("provenance-add-gha=false") == 1
+    assert '[registry."127.0.0.1:5000"]' in text
+    assert production.count("--provenance=mode=max,version=v1") == 2
+    assert production.count("--push") == 2
+    attested_commands = [
+        block.split("docker/images/airflow", 1)[0]
+        for block in production.split("docker buildx build \\\n")[1:]
+        if "--provenance=" in block
+    ]
+    assert len(attested_commands) == 2
+    assert all("--load" not in command for command in attested_commands)
+    assert 'docker pull "$scheduler"' in production
+    assert 'docker pull "$proxy"' in production
+    assert 'docker tag "$scheduler" "$scheduler_tag"' in production
+    assert 'docker tag "$proxy" "$proxy_tag"' in production
+    assert 'scheduler="$scheduler_tag@$scheduler_digest"' in production
+    assert 'proxy="$proxy_tag@$proxy_digest"' in production
+    assert (
+        "WHOSCORED_SCHEDULER_IMAGE: "
+        "127.0.0.1:5000/data-platform-airflow-scheduler:provenance-ci"
+    ) in text
+    assert "WHOSCORED_SCHEDULER_IMAGE: data-platform-airflow-scheduler" not in text
+
+
 def test_ci_exercises_every_runner_moved_to_the_legacy_venv():
     text = _workflow_text()
 

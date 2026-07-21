@@ -3,8 +3,7 @@ Unit tests for scripts/dedup_fbref_schedule.py — all-NULL row purge (#892).
 
 Strategy
 --------
-Same shape as ``test_drop_fotmob_dead_columns.py``: the script is a top-level
-module whose only non-stdlib import (``trino``) lives lazily inside
+The script is a top-level module whose only non-stdlib import (``trino``) lives lazily inside
 ``get_conn``, so it loads on the host with no stubbing. ``purge_null_url_rows``
 runs against a ``FakeCursor`` that records SQL and answers the two COUNT reads.
 

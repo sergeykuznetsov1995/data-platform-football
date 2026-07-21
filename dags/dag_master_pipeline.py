@@ -6,8 +6,9 @@ Airflow DAG for orchestrating all data ingestion DAGs.
 Uses TriggerDagRunOperator for trigger-owned child DAGs and fail-closed sensors
 for the independently scheduled 06:00 FBref and 10:00 WhoScored runs.
 
-Schedules daily at 2 PM UTC and is the sole schedule owner for trigger-only
-sources such as FotMob.
+Schedules daily at 2 PM UTC. It owns FotMob only while the explicit
+``fotmob_schedule_owner`` handoff control is ``shared``; the isolated scheduler
+must never be admitted before that control becomes ``isolated``.
 
 This DAG:
 1. Triggers non-FBref ingestion DAGs in sequence
@@ -17,17 +18,26 @@ This DAG:
 """
 
 import logging
+import os
 from datetime import datetime, timedelta
 from typing import Any, Dict
 
 from airflow import DAG
-from airflow.operators.python import PythonOperator
+from airflow.operators.python import PythonOperator, ShortCircuitOperator
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 from airflow.sensors.external_task import ExternalTaskSensor
+from airflow.sensors.python import PythonSensor
 from airflow.utils.task_group import TaskGroup
 
 from utils.config import SCHEDULES, DAG_TAGS
 from utils.default_args import DEFAULT_ARGS
+from utils.fotmob_publication import (
+    finalize_fotmob_publication_consumer,
+    fotmob_consumer_trigger_conf,
+    fotmob_daily_trigger_conf,
+    initialize_fotmob_publication,
+    wait_and_claim_fotmob_publication,
+)
 from utils import transfermarkt_native_v2 as tm_v2
 
 
@@ -63,6 +73,14 @@ REQUIRED_SOURCE_TASKS = {
     'dag_ingest_whoscored': 'wait_for_scheduled_whoscored',
 }
 
+FOTMOB_SCHEDULE_OWNER_VARIABLE = 'fotmob_schedule_owner'
+FOTMOB_SCHEDULE_OWNER_ENV = 'FOTMOB_SCHEDULE_OWNER'
+FOTMOB_SCHEDULE_OWNERS = frozenset({'shared', 'isolated'})
+FOTMOB_OWNER_GATE_TASK_ID = (
+    'ingestion_triggers.fotmob_shared_schedule_owner'
+)
+FOTMOB_OWNER_XCOM_KEY = 'fotmob_schedule_owner'
+
 # Publication evidence whose failure must make the current master DagRun fail.
 # The scheduled FBref chain (Bronze -> FBref Silver, sensed fail-closed) and the
 # separately triggered xref -> E3 -> Gold path form the published generation;
@@ -70,6 +88,7 @@ REQUIRED_SOURCE_TASKS = {
 # as a successful trigger would publish a mixed generation and let the
 # terminal report turn green despite failed DQ.
 REQUIRED_PUBLICATION_TASKS = {
+    'fotmob_publication': 'wait_for_fotmob_publication',
     'dag_ingest_fbref': 'wait_for_scheduled_fbref',
     'dag_transform_xref': 'trigger_xref_transforms',
     'dag_transform_e3': 'trigger_e3_transforms',
@@ -85,8 +104,14 @@ MASTER_ARGS = {
     'retries': 0,
 }
 
-MASTER_SOURCE_CHAIN_HOURS = len(TRIGGERED_INGESTION_DAGS) * 12
-MASTER_PUBLICATION_CHAIN_HOURS = 12 + 5 + 12 + 12 + 12 + 12
+MASTER_FOTMOB_TRIGGER_TIMEOUT_HOURS = 14
+MASTER_SOURCE_CHAIN_HOURS = MASTER_FOTMOB_TRIGGER_TIMEOUT_HOURS + (
+    len(TRIGGERED_INGESTION_DAGS) - 1
+) * 12
+MASTER_FOTMOB_SENSOR_TIMEOUT_HOURS = 16
+MASTER_PUBLICATION_CHAIN_HOURS = (
+    MASTER_FOTMOB_SENSOR_TIMEOUT_HOURS + 5 + 12 + 12 + 12 + 12
+)
 MASTER_CONTROL_TASK_HOURS = 2
 MASTER_TIMEOUT_SLACK_HOURS = 12
 MASTER_CRITICAL_PATH_HOURS = (
@@ -97,6 +122,80 @@ MASTER_CRITICAL_PATH_HOURS = (
 MASTER_DAGRUN_TIMEOUT_HOURS = (
     MASTER_CRITICAL_PATH_HOURS + MASTER_TIMEOUT_SLACK_HOURS
 )
+
+
+def resolve_fotmob_schedule_owner(value: Any = None) -> str:
+    """Resolve one fail-closed owner for the 14:00 UTC FotMob schedule.
+
+    The Airflow Variable is the live handoff control. A plain environment
+    fallback lets an immutable shared-stack deployment pin the same value;
+    absence remains backwards-compatible and leaves ownership with master.
+    """
+
+    from airflow.exceptions import AirflowException
+    from airflow.models import Variable
+
+    if value is None:
+        fallback = os.environ.get(FOTMOB_SCHEDULE_OWNER_ENV, 'shared')
+        value = Variable.get(
+            FOTMOB_SCHEDULE_OWNER_VARIABLE,
+            default_var=fallback,
+        )
+    owner = str(value or '').strip().casefold()
+    if owner not in FOTMOB_SCHEDULE_OWNERS:
+        raise AirflowException(
+            'Invalid FotMob schedule owner '
+            f'{value!r}; expected one of {sorted(FOTMOB_SCHEDULE_OWNERS)!r}'
+        )
+    return owner
+
+
+def allow_shared_fotmob_schedule(**context) -> bool:
+    """Allow the master trigger only while the shared stack owns FotMob."""
+
+    owner = resolve_fotmob_schedule_owner()
+    task_instance = context.get('ti')
+    if task_instance is not None:
+        task_instance.xcom_push(key=FOTMOB_OWNER_XCOM_KEY, value=owner)
+    logger.info('FotMob 14:00 UTC schedule owner: %s', owner)
+    return owner == 'shared'
+
+
+def _fotmob_owner_for_run(context: Dict[str, Any]) -> str:
+    """Use the owner captured by this DagRun, not a value changed mid-run."""
+
+    explicit = context.get('fotmob_schedule_owner')
+    if explicit is not None:
+        return resolve_fotmob_schedule_owner(explicit)
+    task_instance = context.get('ti')
+    if task_instance is not None:
+        captured = task_instance.xcom_pull(
+            task_ids=FOTMOB_OWNER_GATE_TASK_ID,
+            key=FOTMOB_OWNER_XCOM_KEY,
+        )
+        if captured is not None:
+            return resolve_fotmob_schedule_owner(captured)
+    return resolve_fotmob_schedule_owner()
+
+
+def wait_for_exact_fotmob_publication(**context) -> bool:
+    """Wait for and atomically claim this master's exact FotMob generation."""
+
+    return wait_and_claim_fotmob_publication(
+        publication_owner=_fotmob_owner_for_run(context),
+        **context,
+    )
+
+
+def finalize_exact_fotmob_publication(**context) -> dict:
+    """Publish/release FotMob only after the complete master report."""
+
+    return finalize_fotmob_publication_consumer(
+        publication_owner=_fotmob_owner_for_run(context),
+        report_task_id='generate_pipeline_report',
+        sensor_task_id='wait_for_fotmob_publication',
+        **context,
+    )
 
 
 def resolve_scheduled_fbref_control_run(**context) -> str:
@@ -248,11 +347,22 @@ def enforce_required_source_success(**context) -> Dict[str, str]:
         dag_id: task_states.get(task_id, 'missing')
         for dag_id, task_id in REQUIRED_SOURCE_TASKS.items()
     }
+    fotmob_owner = _fotmob_owner_for_run(context)
+    expected_fotmob_state = 'success' if fotmob_owner == 'shared' else 'skipped'
     invalid = {
         dag_id: state
         for dag_id, state in required_states.items()
-        if state != 'success'
+        if state
+        != (
+            expected_fotmob_state
+            if dag_id == 'dag_ingest_fotmob'
+            else 'success'
+        )
     }
+    if fotmob_owner == 'isolated':
+        owner_gate_state = task_states.get(FOTMOB_OWNER_GATE_TASK_ID, 'missing')
+        if owner_gate_state != 'success':
+            invalid['fotmob_schedule_owner_gate'] = owner_gate_state
     if invalid:
         details = ', '.join(
             f'{dag_id}={state}' for dag_id, state in sorted(invalid.items())
@@ -261,6 +371,11 @@ def enforce_required_source_success(**context) -> Dict[str, str]:
             'Required ingestion source did not publish a complete successful '
             f'run; downstream transforms are blocked: {details}'
         )
+    if fotmob_owner == 'isolated':
+        # A skipped trigger is successful evidence only together with the
+        # captured isolated-owner decision above. Never report it as a source
+        # generation produced by this master DagRun.
+        required_states['dag_ingest_fotmob'] = 'isolated_owner'
     return required_states
 
 
@@ -577,8 +692,68 @@ with DAG(
     with TaskGroup(group_id='ingestion_triggers') as triggers_group:
         prev_task = None
 
+        fotmob_owner_gate = ShortCircuitOperator(
+            task_id='fotmob_shared_schedule_owner',
+            python_callable=allow_shared_fotmob_schedule,
+            # Skip only the direct FotMob trigger. The next sequential source
+            # has trigger_rule=all_done and must still be allowed to run.
+            ignore_downstream_trigger_rules=False,
+            retries=0,
+        )
+
+        initialize_fotmob_publication_task = PythonOperator(
+            task_id='initialize_fotmob_publication',
+            python_callable=initialize_fotmob_publication,
+            op_kwargs={'publication_owner': 'shared'},
+            retries=0,
+        )
+
+        fotmob_generation_template = (
+            "{{ ti.xcom_pull(task_ids='ingestion_triggers."
+            "initialize_fotmob_publication')['generation_id'] }}"
+        )
+        fotmob_binding_template = {
+            field: (
+                "{{ ti.xcom_pull(task_ids='ingestion_triggers."
+                "initialize_fotmob_publication')['binding']['"
+                + field
+                + "'] }}"
+            )
+            for field in (
+                'schema',
+                'source',
+                'owner',
+                'data_interval_start',
+                'data_interval_end',
+                'runtime_fingerprint',
+            )
+        }
+
         for dag_id in TRIGGERED_INGESTION_DAGS:
             required_source = dag_id in REQUIRED_SOURCE_TASKS
+            trigger_kwargs = {
+                'reset_dag_run': True,
+                'execution_date': '{{ ds }}',
+                'conf': {},
+            }
+            if dag_id == 'dag_ingest_fotmob':
+                trigger_kwargs = {
+                    'trigger_run_id': (
+                        'fotmob_ingest__' + fotmob_generation_template
+                    ),
+                    'logical_date': '{{ logical_date.isoformat() }}',
+                    'reset_dag_run': False,
+                    'execution_timeout': timedelta(
+                        hours=MASTER_FOTMOB_TRIGGER_TIMEOUT_HOURS
+                    ),
+                    'conf': {
+                        **fotmob_daily_trigger_conf(),
+                        'fotmob_publication': {
+                            'generation_id': fotmob_generation_template,
+                            'binding': fotmob_binding_template,
+                        },
+                    },
+                }
             trigger_task = TriggerDagRunOperator(
                 task_id=f'trigger_{dag_id.replace("dag_ingest_", "")}',
                 trigger_dag_id=dag_id,
@@ -586,18 +761,22 @@ with DAG(
                 poke_interval=60,  # Check every minute
                 allowed_states=(['success'] if required_source else ['success', 'failed']),
                 failed_states=(['failed'] if required_source else []),
-                reset_dag_run=True,  # Reset if already running
-                execution_date='{{ ds }}',  # Airflow 2.x uses execution_date
                 # Keep independent later sources running after a required
                 # source failure. The explicit gate below blocks transforms.
                 trigger_rule=('all_done' if prev_task else 'all_success'),
                 # master_data_interval_end went to dag_sofascore_pipeline
                 # together with the sofascore trigger (#951).
-                conf={},
+                **trigger_kwargs,
             )
 
             if prev_task:
                 prev_task >> trigger_task
+            elif dag_id == 'dag_ingest_fotmob':
+                (
+                    fotmob_owner_gate
+                    >> initialize_fotmob_publication_task
+                    >> trigger_task
+                )
 
             prev_task = trigger_task
             trigger_tasks.append(trigger_task)
@@ -629,6 +808,20 @@ with DAG(
         check_existence=True,
     )
     wait_for_scheduled_whoscored >> required_sources_gate
+
+    # The isolated scheduler cannot be observed through this Airflow metadata
+    # database.  Poll the shared ControlStore for the exact interval/release/
+    # owner generation and atomically claim it before any xref/Gold consumer.
+    wait_for_fotmob_publication = PythonSensor(
+        task_id='wait_for_fotmob_publication',
+        python_callable=wait_for_exact_fotmob_publication,
+        mode='reschedule',
+        poke_interval=60,
+        timeout=timedelta(hours=MASTER_FOTMOB_SENSOR_TIMEOUT_HOURS).total_seconds(),
+        execution_timeout=timedelta(minutes=5),
+        retries=0,
+    )
+    required_sources_gate >> wait_for_fotmob_publication
 
     # FBref runs once per day on its own 06:00 schedule.  The master DAG's
     # 14:00 logical date is eight hours later, so execution_delta maps to the
@@ -666,8 +859,7 @@ with DAG(
         trigger_run_id='master_xref__{{ dag.dag_id }}__{{ run_id }}',
         logical_date='{{ ti.start_date }}',
         conf={
-            'publication_owner': 'dag_master_pipeline',
-            'master_run_id': '{{ run_id }}',
+            **fotmob_consumer_trigger_conf('dag_master_pipeline'),
             'fbref_source_dag_id': 'dag_ingest_fbref',
             'fbref_control_run_id': (
                 "{{ ti.xcom_pull(task_ids="
@@ -705,6 +897,7 @@ with DAG(
         failed_states=['failed'],
         reset_dag_run=True,
         execution_date='{{ ds }}',
+        conf=fotmob_consumer_trigger_conf('dag_master_pipeline'),
         trigger_rule='all_success',
     )
 
@@ -726,6 +919,7 @@ with DAG(
         failed_states=['failed'],
         reset_dag_run=True,
         execution_date='{{ ds }}',
+        conf=fotmob_consumer_trigger_conf('dag_master_pipeline'),
         trigger_rule='all_success',
     )
 
@@ -796,12 +990,11 @@ with DAG(
         reset_dag_run=True,
         execution_date='{{ ds }}',
         conf={
+            **fotmob_consumer_trigger_conf('dag_master_pipeline'),
             'fbref_control_run_id': (
                 "{{ ti.xcom_pull(task_ids="
                 "'resolve_fbref_publication_scope') }}"
             ),
-            'publication_owner': 'dag_master_pipeline',
-            'master_run_id': '{{ run_id }}',
         },
         execution_timeout=timedelta(hours=12),
         retries=0,
@@ -834,9 +1027,17 @@ with DAG(
         retries=0,
     )
 
+    finalize_fotmob_publication_task = PythonOperator(
+        task_id='finalize_fotmob_publication',
+        python_callable=finalize_exact_fotmob_publication,
+        trigger_rule='all_done',
+        execution_timeout=timedelta(minutes=5),
+        retries=0,
+    )
+
     # Dependencies
     # Source/Silver and cross-source publication have independent verdicts.
-    [required_sources_gate, wait_for_scheduled_fbref] \
+    [wait_for_fotmob_publication, wait_for_scheduled_fbref] \
         >> resolve_fbref_publication_scope
     (resolve_fbref_publication_scope
      >> trigger_xref_transforms >> trigger_e3_transforms
@@ -854,3 +1055,5 @@ with DAG(
     trigger_fbref_gold >> check_success_task >> generate_report_task
     [wait_for_scheduled_fbref, generate_report_task] \
         >> release_fbref_publication
+    [wait_for_fotmob_publication, generate_report_task] \
+        >> finalize_fotmob_publication_task

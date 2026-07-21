@@ -1,3 +1,1 @@
-from scrapers.fotmob.scraper import FotMobScraper
-
-__all__ = ['FotMobScraper']
+"""Source-native, raw-first FotMob ingestion package."""

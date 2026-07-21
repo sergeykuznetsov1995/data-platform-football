@@ -1,0 +1,182 @@
+# Isolated source-native FotMob scheduler.  Every bind source comes from one
+# immutable release checkout; the DAG folder receives exactly three root DAGs.
+# Secrets are supplied by --env-file and are never committed here.
+name: fotmob-airflow
+
+x-airflow-common: &airflow-common
+  image: ${FOTMOB_AIRFLOW_IMAGE:?set an immutable FotMob Airflow image}
+  user: ${AIRFLOW_UID:-50000}:0
+  shm_size: 512m
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  cap_add:
+    - CHOWN
+    - SETGID
+    - SETUID
+  environment: &airflow-environment
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY:?set the Airflow fernet key}
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__DEFAULT_TIMEZONE: utc
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__WEBSERVER__DEFAULT_UI_TIMEZONE: UTC
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:${FOTMOB_AIRFLOW_DB_PASSWORD:?set a dedicated database password}@airflow-metadb:5432/airflow
+    PYTHONPATH: /opt/airflow
+    PYTHONDONTWRITEBYTECODE: "1"
+    TRINO_HOST: trino
+    TRINO_PORT: ${TRINO_PORT:-8443}
+    TRINO_HTTP_SCHEME: ${TRINO_HTTP_SCHEME:-https}
+    TRINO_TLS_VERIFY: ${TRINO_TLS_VERIFY:-false}
+    TRINO_USER: ${TRINO_USER:-airflow}
+    TRINO_PASSWORD: ${TRINO_PASSWORD:?set Trino password}
+    S3_ACCESS_KEY: ${S3_ACCESS_KEY:?set S3 access key}
+    S3_SECRET_KEY: ${S3_SECRET_KEY:?set S3 secret key}
+    FOTMOB_RAW_STORE_URI: s3://${ICEBERG_WAREHOUSE:?set warehouse bucket}/raw/fotmob
+    FOTMOB_RAW_S3_ENDPOINT: seaweedfs:8333
+    FOTMOB_RAW_S3_SCHEME: http
+    FOTMOB_DEPLOY_GIT_SHA: ${FOTMOB_DEPLOY_GIT_SHA:?set exact release Git SHA}
+    FOTMOB_DEPLOYMENT_ID: ${FOTMOB_DEPLOYMENT_ID:?set unique deployment identity}
+    FOTMOB_DEPLOYMENT_REPORT_PATH: ${FOTMOB_DEPLOYMENT_REPORT_PATH:?set mounted deployment report path}
+    FOTMOB_ISOLATED_STACK: "1"
+    # Shared with the primary scheduler: the cross-stack FotMob/FBref
+    # publication fence must never fall back to this stack's Airflow metadata.
+    FBREF_CONTROL_DB_URI: ${FBREF_CONTROL_DB_URI:?set shared production control DB URI}
+    TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?set Telegram delivery token}
+    TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:?set Telegram delivery chat id}
+    ALERT_ENV: fotmob-isolated
+    JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+  volumes:
+    - type: bind
+      # A deploy-generated, hash-checked projection masks every DAG baked into
+      # the image. It contains only three root DAGs plus .airflowignore.
+      source: ${FOTMOB_DAGBAG_ROOT:?set exact generated DagBag projection}
+      target: /opt/airflow/dags
+      read_only: true
+    - type: bind
+      source: ${FOTMOB_RELEASE_ROOT:?set absolute immutable release root}/dags/utils
+      target: /opt/airflow/dags/utils
+      read_only: true
+    - type: bind
+      source: ${FOTMOB_RELEASE_ROOT:?set absolute immutable release root}/dags/sql
+      target: /opt/airflow/dags/sql
+      read_only: true
+    - type: bind
+      source: ${FOTMOB_RELEASE_ROOT:?set absolute immutable release root}/dags/scripts
+      target: /opt/airflow/dags/scripts
+      read_only: true
+    - type: bind
+      source: ${FOTMOB_RELEASE_ROOT:?set absolute immutable release root}/scrapers
+      target: /opt/airflow/scrapers
+      read_only: true
+    - type: bind
+      source: ${FOTMOB_RELEASE_ROOT:?set absolute immutable release root}/scripts
+      target: /opt/airflow/scripts
+      read_only: true
+    - type: bind
+      source: ${FOTMOB_RELEASE_ROOT:?set absolute immutable release root}/configs/medallion
+      target: /opt/airflow/configs/medallion
+      read_only: true
+    - type: bind
+      source: ${FOTMOB_RELEASE_ROOT:?set absolute immutable release root}/configs/fotmob
+      target: /opt/airflow/configs/fotmob
+      read_only: true
+    - type: bind
+      source: ${FOTMOB_EVIDENCE_DIR:?set absolute durable evidence directory}
+      target: /opt/airflow/logs/fotmob
+  networks:
+    - default
+    - storage
+    - backend
+
+services:
+  airflow-metadb:
+    image: ${FOTMOB_POSTGRES_IMAGE:?set PostgreSQL image pinned by sha256 digest}
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+      - FOWNER
+      - DAC_READ_SEARCH
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: ${FOTMOB_AIRFLOW_DB_PASSWORD:?set a dedicated database password}
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow_metadata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow -d airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    networks:
+      - default
+
+  airflow-init:
+    <<: *airflow-common
+    restart: "no"
+    entrypoint: /bin/bash
+    command:
+      - -euc
+      - |
+        airflow db migrate
+        airflow pools set fotmob_http_pool 4 'Bounded direct FotMob HTTP work'
+        airflow pools set ingest_scraper_pool 1 'Serialize heavy ingest scrapers'
+        # Existing DagModel rows survive redeploys, so pause explicitly before
+        # the scheduler is allowed to start. New rows are paused by the core
+        # setting above.
+        airflow dags pause dag_ingest_fotmob || true
+        airflow dags pause dag_transform_fotmob_silver || true
+        airflow dags pause dag_trigger_fotmob_daily || true
+    depends_on:
+      airflow-metadb:
+        condition: service_healthy
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    restart: unless-stopped
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --hostname \"$${HOSTNAME}\""]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 10G
+        reservations:
+          memory: 1G
+
+  airflow-webserver:
+    <<: *airflow-common
+    profiles: ["ui"]
+    command: webserver
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8084:8080"
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+volumes:
+  airflow_metadata: {}
+
+networks:
+  default: {}
+  storage:
+    external: true
+    name: dp-storage
+  backend:
+    external: true
+    name: dp-backend

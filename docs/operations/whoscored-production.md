@@ -404,13 +404,18 @@ Use one protected Buildx state and evidence directory outside the checkout.
 The metadata files are part of promotion evidence: keep them root-owned mode
 `0600`, and never regenerate one after recording its payload image ID. These
 commands intentionally invoke the reviewed Buildx plugin and Docker CLI by
-absolute path under empty environments:
+absolute path under empty environments. Before review, every registry push is
+restricted to the pinned loopback registry; the external-looking payload tags
+created locally are not published:
 
 ```bash
 test "$(id -u)" = 0
 cd "$RELEASE"
 test "$(pwd -P)" = "$RELEASE"
 BUILDX=/root/.docker/cli-plugins/docker-buildx
+BUILDKIT_IMAGE=moby/buildkit:v0.31.2@sha256:2f5adac4ecd194d9f8c10b7b5d7bceb5186853db1b26e5abd3a657af0b7e26ec
+LOOPBACK_REGISTRY=127.0.0.1:5000
+LOOPBACK_REGISTRY_IMAGE=registry:2.8.3@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
 BUILD_HOME=/absolute/protected/whoscored-build-home
 BUILDX_STATE=/absolute/protected/whoscored-buildx-state
 DOCKER_AUTH=/absolute/protected/whoscored-docker-config
@@ -480,11 +485,54 @@ test -z "$(/usr/bin/find "$RELEASE" -path "$RELEASE/.git" -prune -o \
   -type d \( -name __pycache__ -o -name .pytest_cache -o -name .ruff_cache \) \
   -print -quit)"
 test ! -e "$("${CLEAN_GIT[@]}" rev-parse --git-path info/attributes)"
+set -Eeuo pipefail
 test -z "$("${CLEAN_GIT[@]}" status --porcelain=v1 --untracked-files=all)"
 test "$("${CLEAN_GIT[@]}" remote get-url origin)" = \
   https://github.com/sergeykuznetsov1995/data-platform-football.git
 PAYLOAD_REVISION="$("${CLEAN_GIT[@]}" rev-parse HEAD)"
 test "${#PAYLOAD_REVISION}" = 40
+BUILDER="whoscored-prod-${PAYLOAD_REVISION:0:12}"
+LOOPBACK_REGISTRY_CONTAINER="whoscored-prod-registry-${PAYLOAD_REVISION:0:12}"
+BUILDKITD_CONFIG="$BUILD_HOME/buildkitd-$PAYLOAD_REVISION.toml"
+test ! -e "$BUILDKITD_CONFIG"
+! "${BUILDX_CMD[@]}" inspect "$BUILDER" >/dev/null 2>&1
+! "${DOCKER_CMD[@]}" container inspect \
+  "$LOOPBACK_REGISTRY_CONTAINER" >/dev/null 2>&1
+"${DOCKER_CMD[@]}" run --detach --restart always \
+  --name "$LOOPBACK_REGISTRY_CONTAINER" \
+  --publish 127.0.0.1:5000:5000 \
+  "$LOOPBACK_REGISTRY_IMAGE"
+test "$("${DOCKER_CMD[@]}" container inspect --format '{{.Config.Image}}' \
+  "$LOOPBACK_REGISTRY_CONTAINER")" = "$LOOPBACK_REGISTRY_IMAGE"
+test "$("${DOCKER_CMD[@]}" container inspect --format '{{.State.Running}}' \
+  "$LOOPBACK_REGISTRY_CONTAINER")" = true
+test "$("${DOCKER_CMD[@]}" port \
+  "$LOOPBACK_REGISTRY_CONTAINER" 5000/tcp)" = 127.0.0.1:5000
+for attempt in {1..30}; do
+  if "${ADMISSION_PYTHON[@]}" -c \
+    'import sys, urllib.request as u; sys.exit(u.urlopen(sys.argv[1], timeout=1).status != 200)' \
+    "http://$LOOPBACK_REGISTRY/v2/" >/dev/null 2>&1; then
+    break
+  fi
+  test "$attempt" != 30
+  /usr/bin/sleep 1
+done
+/usr/bin/install -o root -g root -m 0600 /dev/null "$BUILDKITD_CONFIG"
+/usr/bin/printf '%s\n' \
+  '[registry."127.0.0.1:5000"]' \
+  '  http = true' \
+  '  insecure = true' > "$BUILDKITD_CONFIG"
+test "$(/usr/bin/stat -c '%u:%g:%a:%h' "$BUILDKITD_CONFIG")" = 0:0:600:1
+"${BUILDX_CMD[@]}" create \
+  --name "$BUILDER" --driver docker-container \
+  --driver-opt "image=$BUILDKIT_IMAGE" \
+  --driver-opt network=host \
+  --driver-opt provenance-add-gha=false \
+  --buildkitd-config "$BUILDKITD_CONFIG" \
+  --bootstrap unix:///run/docker.sock
+"${BUILDX_CMD[@]}" inspect --bootstrap "$BUILDER" | \
+  /usr/bin/grep -F 'BuildKit version: v0.31.2'
+BUILDX_BUILD=("${BUILDX_CMD[@]}" --builder "$BUILDER" build)
 for metadata in airflow-base airflow-scheduler-payload \
   airflow-whoscored-proxy-payload airflow-scheduler \
   airflow-whoscored-proxy flaresolverr jupyterhub superset; do
@@ -496,32 +544,76 @@ PROXY_PAYLOAD_TAG="$REGISTRY/airflow-whoscored-proxy:payload-$PAYLOAD_REVISION"
 FLARESOLVERR_TAG="$REGISTRY/flaresolverr-whoscored:payload-$PAYLOAD_REVISION"
 JUPYTERHUB_TAG="$REGISTRY/jupyterhub:payload-$PAYLOAD_REVISION"
 SUPERSET_TAG="$REGISTRY/superset:payload-$PAYLOAD_REVISION"
+AIRFLOW_BASE_STAGING_TAG="$LOOPBACK_REGISTRY/airflow-base:payload-$PAYLOAD_REVISION"
+SCHEDULER_PAYLOAD_STAGING_TAG="$LOOPBACK_REGISTRY/airflow-scheduler:payload-$PAYLOAD_REVISION"
+PROXY_PAYLOAD_STAGING_TAG="$LOOPBACK_REGISTRY/airflow-whoscored-proxy:payload-$PAYLOAD_REVISION"
+FLARESOLVERR_STAGING_TAG="$LOOPBACK_REGISTRY/flaresolverr-whoscored:payload-$PAYLOAD_REVISION"
+JUPYTERHUB_STAGING_TAG="$LOOPBACK_REGISTRY/jupyterhub:payload-$PAYLOAD_REVISION"
+SUPERSET_STAGING_TAG="$LOOPBACK_REGISTRY/superset:payload-$PAYLOAD_REVISION"
 
-"${BUILDX_CMD[@]}" build --platform linux/amd64 \
-  --provenance=mode=max,version=v1 --load --target airflow-base \
+"${BUILDX_BUILD[@]}" --platform linux/amd64 \
+  --provenance=mode=max,version=v1 --push --target airflow-base \
   --metadata-file "$BUILD_EVIDENCE/airflow-base.json" \
-  --tag "$AIRFLOW_BASE_TAG" docker/images/airflow
-"${BUILDX_CMD[@]}" build --platform linux/amd64 \
-  --provenance=mode=max,version=v1 --load --target airflow-scheduler-payload \
+  --tag "$AIRFLOW_BASE_STAGING_TAG" docker/images/airflow
+"${BUILDX_BUILD[@]}" --platform linux/amd64 \
+  --provenance=mode=max,version=v1 --push --target airflow-scheduler-payload \
   --metadata-file "$BUILD_EVIDENCE/airflow-scheduler-payload.json" \
-  --tag "$SCHEDULER_PAYLOAD_TAG" docker/images/airflow
-"${BUILDX_CMD[@]}" build --platform linux/amd64 \
-  --provenance=mode=max,version=v1 --load --target airflow-whoscored-proxy-payload \
+  --tag "$SCHEDULER_PAYLOAD_STAGING_TAG" docker/images/airflow
+"${BUILDX_BUILD[@]}" --platform linux/amd64 \
+  --provenance=mode=max,version=v1 --push --target airflow-whoscored-proxy-payload \
   --metadata-file "$BUILD_EVIDENCE/airflow-whoscored-proxy-payload.json" \
-  --tag "$PROXY_PAYLOAD_TAG" docker/images/airflow
-"${BUILDX_CMD[@]}" build --platform linux/amd64 \
-  --provenance=mode=max,version=v1 --load \
+  --tag "$PROXY_PAYLOAD_STAGING_TAG" docker/images/airflow
+"${BUILDX_BUILD[@]}" --platform linux/amd64 \
+  --provenance=mode=max,version=v1 --push \
   --file docker/images/flaresolverr-whoscored/Dockerfile \
   --metadata-file "$BUILD_EVIDENCE/flaresolverr.json" \
-  --tag "$FLARESOLVERR_TAG" .
-"${BUILDX_CMD[@]}" build --platform linux/amd64 \
-  --provenance=mode=max,version=v1 --load \
+  --tag "$FLARESOLVERR_STAGING_TAG" .
+"${BUILDX_BUILD[@]}" --platform linux/amd64 \
+  --provenance=mode=max,version=v1 --push \
   --metadata-file "$BUILD_EVIDENCE/jupyterhub.json" \
-  --tag "$JUPYTERHUB_TAG" docker/images/jupyterhub
-"${BUILDX_CMD[@]}" build --platform linux/amd64 \
-  --provenance=mode=max,version=v1 --load \
+  --tag "$JUPYTERHUB_STAGING_TAG" docker/images/jupyterhub
+"${BUILDX_BUILD[@]}" --platform linux/amd64 \
+  --provenance=mode=max,version=v1 --push \
   --metadata-file "$BUILD_EVIDENCE/superset.json" \
-  --tag "$SUPERSET_TAG" docker/images/superset
+  --tag "$SUPERSET_STAGING_TAG" docker/images/superset
+
+AIRFLOW_BASE_DIGEST="$(/usr/bin/jq -er '."containerimage.digest"' \
+  "$BUILD_EVIDENCE/airflow-base.json")"
+SCHEDULER_PAYLOAD_DIGEST="$(/usr/bin/jq -er '."containerimage.digest"' \
+  "$BUILD_EVIDENCE/airflow-scheduler-payload.json")"
+PROXY_PAYLOAD_DIGEST="$(/usr/bin/jq -er '."containerimage.digest"' \
+  "$BUILD_EVIDENCE/airflow-whoscored-proxy-payload.json")"
+FLARESOLVERR_DIGEST="$(/usr/bin/jq -er '."containerimage.digest"' \
+  "$BUILD_EVIDENCE/flaresolverr.json")"
+JUPYTERHUB_DIGEST="$(/usr/bin/jq -er '."containerimage.digest"' \
+  "$BUILD_EVIDENCE/jupyterhub.json")"
+SUPERSET_DIGEST="$(/usr/bin/jq -er '."containerimage.digest"' \
+  "$BUILD_EVIDENCE/superset.json")"
+for digest in "$AIRFLOW_BASE_DIGEST" "$SCHEDULER_PAYLOAD_DIGEST" \
+  "$PROXY_PAYLOAD_DIGEST" "$FLARESOLVERR_DIGEST" \
+  "$JUPYTERHUB_DIGEST" "$SUPERSET_DIGEST"; do
+  case "$digest" in sha256:????????????????????????????????????????????????????????????????) ;; *) exit 1 ;; esac
+done
+AIRFLOW_BASE_STAGING_IMAGE="$AIRFLOW_BASE_STAGING_TAG@$AIRFLOW_BASE_DIGEST"
+SCHEDULER_PAYLOAD_STAGING_IMAGE="$SCHEDULER_PAYLOAD_STAGING_TAG@$SCHEDULER_PAYLOAD_DIGEST"
+PROXY_PAYLOAD_STAGING_IMAGE="$PROXY_PAYLOAD_STAGING_TAG@$PROXY_PAYLOAD_DIGEST"
+FLARESOLVERR_STAGING_IMAGE="$FLARESOLVERR_STAGING_TAG@$FLARESOLVERR_DIGEST"
+JUPYTERHUB_STAGING_IMAGE="$JUPYTERHUB_STAGING_TAG@$JUPYTERHUB_DIGEST"
+SUPERSET_STAGING_IMAGE="$SUPERSET_STAGING_TAG@$SUPERSET_DIGEST"
+for staging_image in "$AIRFLOW_BASE_STAGING_IMAGE" \
+  "$SCHEDULER_PAYLOAD_STAGING_IMAGE" "$PROXY_PAYLOAD_STAGING_IMAGE" \
+  "$FLARESOLVERR_STAGING_IMAGE" "$JUPYTERHUB_STAGING_IMAGE" \
+  "$SUPERSET_STAGING_IMAGE"; do
+  "${DOCKER_CMD[@]}" image pull "$staging_image"
+done
+"${DOCKER_CMD[@]}" image tag "$AIRFLOW_BASE_STAGING_IMAGE" "$AIRFLOW_BASE_TAG"
+"${DOCKER_CMD[@]}" image tag \
+  "$SCHEDULER_PAYLOAD_STAGING_IMAGE" "$SCHEDULER_PAYLOAD_TAG"
+"${DOCKER_CMD[@]}" image tag \
+  "$PROXY_PAYLOAD_STAGING_IMAGE" "$PROXY_PAYLOAD_TAG"
+"${DOCKER_CMD[@]}" image tag "$FLARESOLVERR_STAGING_IMAGE" "$FLARESOLVERR_TAG"
+"${DOCKER_CMD[@]}" image tag "$JUPYTERHUB_STAGING_IMAGE" "$JUPYTERHUB_TAG"
+"${DOCKER_CMD[@]}" image tag "$SUPERSET_STAGING_IMAGE" "$SUPERSET_TAG"
 
 AIRFLOW_BASE_ID="$("${DOCKER_CMD[@]}" image inspect --format '{{.Id}}' "$AIRFLOW_BASE_TAG")"
 AIRFLOW_SCHEDULER_PAYLOAD_ID="$("${DOCKER_CMD[@]}" image inspect --format '{{.Id}}' "$SCHEDULER_PAYLOAD_TAG")"
@@ -576,9 +668,10 @@ registry digests.
 
 After reviewing and committing exactly the two generated provenance files,
 finish from that clean, single-parent promotion child. Do not rebuild the four
-non-derived images: push the exact local objects whose IDs were recorded. Build
-the scheduler and dedicated proxy final targets once from the promotion child,
-and capture Buildx maximum provenance during those two builds:
+non-derived images: copy their exact attested loopback manifest indexes to the
+external registry only after the promotion-child check succeeds. Build the
+scheduler and dedicated proxy final targets once from the promotion child, and
+capture Buildx maximum provenance during those two builds:
 
 ```bash
 test -z "$("${CLEAN_GIT[@]}" status --porcelain=v1 --untracked-files=all)"
@@ -590,28 +683,29 @@ test "$("${DOCKER_CMD[@]}" image inspect --format '{{.Id}}' "$AIRFLOW_BASE_TAG")
 test "$("${DOCKER_CMD[@]}" image inspect --format '{{.Id}}' "$FLARESOLVERR_TAG")" = "$FLARESOLVERR_PAYLOAD_ID"
 test "$("${DOCKER_CMD[@]}" image inspect --format '{{.Id}}' "$JUPYTERHUB_TAG")" = "$JUPYTERHUB_PAYLOAD_ID"
 test "$("${DOCKER_CMD[@]}" image inspect --format '{{.Id}}' "$SUPERSET_TAG")" = "$SUPERSET_PAYLOAD_ID"
-"${DOCKER_CMD[@]}" image push "$AIRFLOW_BASE_TAG"
-"${DOCKER_CMD[@]}" image push "$FLARESOLVERR_TAG"
-"${DOCKER_CMD[@]}" image push "$JUPYTERHUB_TAG"
-"${DOCKER_CMD[@]}" image push "$SUPERSET_TAG"
+command -v skopeo >/dev/null
+skopeo copy --all --preserve-digests "docker://$AIRFLOW_BASE_STAGING_IMAGE" "docker://$AIRFLOW_BASE_TAG"
+skopeo copy --all --preserve-digests "docker://$FLARESOLVERR_STAGING_IMAGE" "docker://$FLARESOLVERR_TAG"
+skopeo copy --all --preserve-digests "docker://$JUPYTERHUB_STAGING_IMAGE" "docker://$JUPYTERHUB_TAG"
+skopeo copy --all --preserve-digests "docker://$SUPERSET_STAGING_IMAGE" "docker://$SUPERSET_TAG"
 
 SCHEDULER_FINAL_TAG="$REGISTRY/airflow-scheduler:ready-$RELEASE_REVISION"
 PROXY_FINAL_TAG="$REGISTRY/airflow-whoscored-proxy:ready-$RELEASE_REVISION"
-"${BUILDX_CMD[@]}" build --platform linux/amd64 \
+"${BUILDX_BUILD[@]}" --platform linux/amd64 \
   --provenance=mode=max,version=v1 --push --target airflow-scheduler \
   --metadata-file "$BUILD_EVIDENCE/airflow-scheduler.json" \
   --tag "$SCHEDULER_FINAL_TAG" docker/images/airflow
-"${BUILDX_CMD[@]}" build --platform linux/amd64 \
+"${BUILDX_BUILD[@]}" --platform linux/amd64 \
   --provenance=mode=max,version=v1 --push --target airflow-whoscored-proxy \
   --metadata-file "$BUILD_EVIDENCE/airflow-whoscored-proxy.json" \
   --tag "$PROXY_FINAL_TAG" docker/images/airflow
 
-AIRFLOW_BASE_FINAL_IMAGE="${AIRFLOW_BASE_TAG%:*}@$(/usr/bin/jq -er '."containerimage.digest"' "$BUILD_EVIDENCE/airflow-base.json")"
+AIRFLOW_BASE_FINAL_IMAGE="${AIRFLOW_BASE_TAG%:*}@$AIRFLOW_BASE_DIGEST"
 AIRFLOW_SCHEDULER_FINAL_IMAGE="${SCHEDULER_FINAL_TAG%:*}@$(/usr/bin/jq -er '."containerimage.digest"' "$BUILD_EVIDENCE/airflow-scheduler.json")"
 AIRFLOW_WHOSCORED_PROXY_FINAL_IMAGE="${PROXY_FINAL_TAG%:*}@$(/usr/bin/jq -er '."containerimage.digest"' "$BUILD_EVIDENCE/airflow-whoscored-proxy.json")"
-FLARESOLVERR_FINAL_IMAGE="${FLARESOLVERR_TAG%:*}@$(/usr/bin/jq -er '."containerimage.digest"' "$BUILD_EVIDENCE/flaresolverr.json")"
-JUPYTERHUB_FINAL_IMAGE="${JUPYTERHUB_TAG%:*}@$(/usr/bin/jq -er '."containerimage.digest"' "$BUILD_EVIDENCE/jupyterhub.json")"
-SUPERSET_FINAL_IMAGE="${SUPERSET_TAG%:*}@$(/usr/bin/jq -er '."containerimage.digest"' "$BUILD_EVIDENCE/superset.json")"
+FLARESOLVERR_FINAL_IMAGE="${FLARESOLVERR_TAG%:*}@$FLARESOLVERR_DIGEST"
+JUPYTERHUB_FINAL_IMAGE="${JUPYTERHUB_TAG%:*}@$JUPYTERHUB_DIGEST"
+SUPERSET_FINAL_IMAGE="${SUPERSET_TAG%:*}@$SUPERSET_DIGEST"
 
 "${DOCKER_CMD[@]}" image pull "$AIRFLOW_BASE_FINAL_IMAGE"
 "${DOCKER_CMD[@]}" image pull "$AIRFLOW_SCHEDULER_FINAL_IMAGE"
@@ -619,6 +713,14 @@ SUPERSET_FINAL_IMAGE="${SUPERSET_TAG%:*}@$(/usr/bin/jq -er '."containerimage.dig
 "${DOCKER_CMD[@]}" image pull "$FLARESOLVERR_FINAL_IMAGE"
 "${DOCKER_CMD[@]}" image pull "$JUPYTERHUB_FINAL_IMAGE"
 "${DOCKER_CMD[@]}" image pull "$SUPERSET_FINAL_IMAGE"
+test "$("${DOCKER_CMD[@]}" image inspect --format '{{.Id}}' \
+  "$AIRFLOW_BASE_FINAL_IMAGE")" = "$AIRFLOW_BASE_ID"
+test "$("${DOCKER_CMD[@]}" image inspect --format '{{.Id}}' \
+  "$FLARESOLVERR_FINAL_IMAGE")" = "$FLARESOLVERR_PAYLOAD_ID"
+test "$("${DOCKER_CMD[@]}" image inspect --format '{{.Id}}' \
+  "$JUPYTERHUB_FINAL_IMAGE")" = "$JUPYTERHUB_PAYLOAD_ID"
+test "$("${DOCKER_CMD[@]}" image inspect --format '{{.Id}}' \
+  "$SUPERSET_FINAL_IMAGE")" = "$SUPERSET_PAYLOAD_ID"
 "${DOCKER_CMD[@]}" image inspect --format '{{json .Id}} {{json .RepoDigests}} {{json .Config}}' "$AIRFLOW_BASE_FINAL_IMAGE"
 "${DOCKER_CMD[@]}" image inspect --format '{{json .Id}} {{json .RepoDigests}} {{json .Config}}' "$AIRFLOW_SCHEDULER_FINAL_IMAGE"
 "${DOCKER_CMD[@]}" image inspect --format '{{json .Id}} {{json .RepoDigests}} {{json .Config}}' "$AIRFLOW_WHOSCORED_PROXY_FINAL_IMAGE"

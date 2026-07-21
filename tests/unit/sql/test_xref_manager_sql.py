@@ -14,10 +14,9 @@ Documented invariants we exercise:
   * canonical_id = LOWER(REGEXP_REPLACE(<name>, '[^a-zA-Z0-9]+', '_')).
   * confidence ∈ {'name_alias', 'name_normalize', 'name_initial', 'orphan'}
     with the cascade precedence alias > exact > initial > orphan.
-  * Reads bronze.fbref_match_managers (spine), native
-    bronze.fotmob_player_snapshots_current (is_coach rows, #930 cutover —
-    (league, season) scope reconstructed via the shared cutover-framework
-    coach_scope CTE) and native Transfermarkt coach stints/profiles.
+  * Reads bronze.fbref_match_managers (spine), native current squad coach rows
+    (#930 cutover; optional LEFT player-snapshot name fallback) and native
+    Transfermarkt coach stints/profiles.
   * name_initial ambiguity guards on both sides (HAVING unique spine key +
     TM-side initial_key_dup window).
   * NULL/empty manager/coach name is filtered out.
@@ -80,14 +79,12 @@ class TestXrefManagerStructure:
             "table populated by parsers/finders.py::parse_match_managers"
         )
 
-    def test_reads_native_fotmob_player_snapshots(self):
-        """FotMob mirror reads from the native
-        iceberg.bronze.fotmob_player_snapshots_current view (#930 cutover) —
-        the legacy fotmob_player_details table must be gone."""
+    def test_reads_native_fotmob_squad_with_optional_player_fallback(self):
+        """FotMob identity is squad-driven; profile is nullable fallback."""
         sql_lower = _read_sql().lower()
+        assert "iceberg.bronze.fotmob_squad_snapshots_current" in sql_lower
         assert "iceberg.bronze.fotmob_player_snapshots_current" in sql_lower, (
-            "xref_manager must read FotMob coaches from native "
-            "bronze.fotmob_player_snapshots_current (is_coach rows)"
+            "xref_manager may use the native player snapshot as a LEFT fallback"
         )
         assert "iceberg.bronze.fotmob_player_details" not in sql_lower, (
             "legacy bronze.fotmob_player_details must not be referenced "
@@ -119,6 +116,11 @@ class TestXrefManagerStructure:
             "(the native replacement of the legacy role='coach' filter)"
         )
 
+    def test_uses_canonical_league_map_placeholder(self):
+        sql = _read_sql()
+        assert sql.count("{{ fotmob_league_map_values_sql }}") == 1
+        assert "(47,  'ENG-Premier League')" not in sql
+
     def test_reads_native_transfermarkt_coach_contract(self):
         """TM bridge scopes global stints through native club memberships."""
         sql_lower = _read_sql().lower()
@@ -140,12 +142,38 @@ class TestXrefManagerStructure:
         assert "try_cast(s.appointed_date as date) <= m.season_end" in sql
         assert "try_cast(s.left_date as date) >= m.season_start" in sql
 
-    def test_fotmob_filters_is_coach(self):
-        """FotMob block keeps only coaches (WHERE ps.is_coach)."""
+    def test_fotmob_filters_squad_coaches_without_null_rejecting_fallback(self):
+        """The coach filter belongs to squad; ps.is_coach stays in LEFT ON."""
         sql_lower = _read_sql().lower()
-        assert re.search(r"where\s+ps\.is_coach\b", sql_lower), (
-            "FotMob mirror must filter `WHERE ps.is_coach` — the snapshot view "
-            "also holds players (filtered out elsewhere via NOT is_coach)"
+        fotmob_cte = sql_lower.split("fotmob_coach as", 1)[1].split(
+            "tm_profile as", 1
+        )[0]
+        assert "sq.member_type = 'coach'" in fotmob_cte
+        assert re.search(
+            r"left\s+join\s+iceberg\.bronze\."
+            r"fotmob_player_snapshots_current\s+ps",
+            fotmob_cte,
+        )
+        assert "and ps.is_coach" in fotmob_cte
+        assert not re.search(r"where\s+ps\.is_coach\b", fotmob_cte)
+
+    def test_fotmob_identity_is_squad_member_id_and_name(self):
+        """Static SQL semantics catch a return to the zero-manager INNER join."""
+        sql = _read_sql()
+        fotmob_cte = sql.split("fotmob_coach AS", 1)[1].split(
+            "tm_profile AS", 1
+        )[0]
+        assert re.search(
+            r"sq\.member_id\s+AS\s+player_id", fotmob_cte, re.IGNORECASE
+        )
+        assert re.search(
+            r"COALESCE\s*\(\s*NULLIF\s*\(\s*TRIM\s*\(sq\.member_name\)",
+            fotmob_cte, re.IGNORECASE,
+        )
+        assert re.search(
+            r"FROM\s+coach_scope\s+cs\s+JOIN\s+"
+            r"iceberg\.bronze\.fotmob_squad_snapshots_current\s+sq",
+            fotmob_cte, re.IGNORECASE | re.DOTALL,
         )
 
     def test_fotmob_source_id_is_stable_coach_id(self):

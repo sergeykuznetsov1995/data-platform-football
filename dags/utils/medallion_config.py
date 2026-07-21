@@ -1700,6 +1700,8 @@ def render_sql_template(sql_path: Path, **context: str) -> str:
             a valid SQL fragment — render_sql_template does no escaping.
             For team alias VALUES the caller should pass the output of
             :func:`get_team_alias_sql_values`.
+            ``fotmob_league_map_values_sql`` is the sole built-in fragment and
+            is loaded from ``configs/fotmob/competitions.json``.
 
     Returns:
         Rendered SQL as string.
@@ -1710,6 +1712,10 @@ def render_sql_template(sql_path: Path, **context: str) -> str:
             (forward-compat with templates that grow new placeholders).
     """
     template = Path(sql_path).read_text()
+    if "{{ fotmob_league_map_values_sql }}" in template:
+        from scrapers.fotmob.constants import render_fotmob_sql
+
+        template = render_fotmob_sql(template)
     missing: List[str] = []
 
     def _sub(match: 're.Match') -> str:

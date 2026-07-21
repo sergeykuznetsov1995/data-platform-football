@@ -16,6 +16,9 @@ Topology
     start_marker
         |
         v
+    validate_fotmob_publication_consumer — exact active consuming generation
+        |
+        v
     TaskGroup: xref_transforms  (4 sequential pure-SQL CTAS)
         ├── xref_team       — render Jinja .sql.j2 + run_silver_transform
         ├── xref_match      — run_silver_transform
@@ -34,8 +37,10 @@ Topology
 Trigger model
 -------------
 ``schedule=None`` — the DAG is triggered synchronously by
-``dag_master_pipeline`` after the independently scheduled FBref source and
-Silver DQ gates pass.
+``dag_master_pipeline`` or ``dag_sofascore_pipeline`` after the independently
+scheduled FBref source and FotMob publication gates pass. Direct/manual runs
+without the full exact FotMob binding and claiming parent identity fail before
+the first CTAS or resolver write.
 ``xref_player`` deliberately consumes the freshly materialised
 ``silver.fbref_player_identity`` universe; the master waits for this entire
 DAG, including ``validate_xref``, before it can proceed to E3 and Gold. xref
@@ -68,6 +73,7 @@ from airflow.operators.python import PythonOperator
 from airflow.utils.task_group import TaskGroup
 
 from utils.default_args import SILVER_ARGS
+from utils.fotmob_publication import validate_fotmob_consumer_fence
 
 logger = logging.getLogger(__name__)
 
@@ -613,7 +619,7 @@ with DAG(
         'Materialise Silver xref_* tables (team/match/referee/manager/player) '
         'from Bronze and FBref Silver identity. Runs after fbref Silver DQ.'
     ),
-    schedule=None,           # Triggered synchronously by the master publisher
+    schedule=None,  # Triggered synchronously by an admitted publication owner
     start_date=datetime(2026, 5, 1),
     catchup=False,
     tags=['silver', 'xref', 'medallion-e1', 'transform'],
@@ -624,6 +630,15 @@ with DAG(
 ) as dag:
 
     start = EmptyOperator(task_id='start_marker')
+
+    # Both production orchestrators must atomically claim the same exact
+    # FotMob generation before this child can touch shared xref tables.  This
+    # also makes a raw UI/CLI trigger fail closed before the first CTAS.
+    validate_fotmob_consumer = PythonOperator(
+        task_id='validate_fotmob_publication_consumer',
+        python_callable=validate_fotmob_consumer_fence,
+        retries=0,
+    )
 
     # =========================================================================
     # TaskGroup: xref CTAS transforms (sequential pure-SQL — max_active_tasks=1)
@@ -686,4 +701,11 @@ with DAG(
     # =========================================================================
     # Dependencies
     # =========================================================================
-    start >> transforms_group >> xref_player_task >> validate_task >> end
+    (
+        start
+        >> validate_fotmob_consumer
+        >> transforms_group
+        >> xref_player_task
+        >> validate_task
+        >> end
+    )

@@ -4,6 +4,9 @@
 table:
   fullyQualifiedName: trino_iceberg.iceberg.bronze.fotmob_match_details
   description: |
+    ЗАМОРОЖЕННЫЙ LEGACY-АРХИВ: запись остановлена 2026-07-21 после #930;
+    рабочая замена — fotmob_match_payloads_current. Таблица сохранена только
+    как rollback-опора и не является выходом текущего dag_ingest_fotmob.
     Сырые детали завершённого матча из FotMob (endpoint /api/data/match →
     /_next/data/<buildId>/matches/... через scrapers/fotmob, dag_ingest_fotmob).
     Grain — один row на завершённый матч. Кроме счёта несёт 8 сырых JSON-блобов

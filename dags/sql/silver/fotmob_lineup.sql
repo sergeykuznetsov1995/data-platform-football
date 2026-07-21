@@ -40,11 +40,8 @@
 -- =============================================================================
 
 WITH league_map(competition_id, league) AS (
-    VALUES (47, 'ENG-Premier League'), (48, 'ENG-Championship'), (87, 'ESP-La Liga'),
-           (54, 'GER-Bundesliga'), (55, 'ITA-Serie A'), (53, 'FRA-Ligue 1'),
-           (57, 'NED-Eredivisie'), (61, 'POR-Primeira Liga'), (42, 'UEFA-Champions League'),
-           (73, 'UEFA-Europa League'), (77, 'INT-World Cup'), (50, 'INT-European Championship'),
-           (289, 'INT-Africa Cup of Nations'), (44, 'INT-Copa America')
+    VALUES
+        {{ fotmob_league_map_values_sql }}
 ),
 
 match_scoped AS (

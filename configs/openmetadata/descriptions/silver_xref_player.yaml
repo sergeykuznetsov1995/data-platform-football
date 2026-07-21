@@ -14,6 +14,10 @@ table:
     ('us_1234', 'ws_5678'). Игроки группируются по канонической команде
     (canonical_team из xref_team), что повышает точность fuzzy-матчинга.
     Помимо 8 общих xref-колонок несёт raw_team_name и canonical_team.
+    Для FotMob identity/team приходит из silver.fotmob_lineup, minutes-сигнал —
+    из native-backed silver.fotmob_player_season_profile (и keeper sibling),
+    DOB-корроборация — из silver.fotmob_player_profile. Эти профили не читают
+    xref_player, поэтому dependency cycle отсутствует.
   tags:
     - Tier.Silver
     - Domain.Football

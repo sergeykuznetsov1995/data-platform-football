@@ -1,0 +1,32 @@
+[
+  {
+    "competition_id": 47,
+    "source_season_key": "2025/2026",
+    "legacy_league": "ENG-Premier League",
+    "legacy_season": 2025
+  },
+  {
+    "competition_id": 87,
+    "source_season_key": "2025/2026",
+    "legacy_league": "ESP-La Liga",
+    "legacy_season": 2025
+  },
+  {
+    "competition_id": 54,
+    "source_season_key": "2025/2026",
+    "legacy_league": "GER-Bundesliga",
+    "legacy_season": 2025
+  },
+  {
+    "competition_id": 55,
+    "source_season_key": "2025/2026",
+    "legacy_league": "ITA-Serie A",
+    "legacy_season": 2025
+  },
+  {
+    "competition_id": 53,
+    "source_season_key": "2025/2026",
+    "legacy_league": "FRA-Ligue 1",
+    "legacy_season": 2025
+  }
+]

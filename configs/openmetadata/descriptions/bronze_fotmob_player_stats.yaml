@@ -4,6 +4,9 @@
 table:
   fullyQualifiedName: trino_iceberg.iceberg.bronze.fotmob_player_stats
   description: |
+    ЗАМОРОЖЕННЫЙ LEGACY-АРХИВ: запись остановлена 2026-07-21 после #930;
+    рабочая замена — fotmob_leaderboards_current. Таблица сохранена только
+    как rollback-опора и не является выходом текущего dag_ingest_fotmob.
     Сырые сезонные лидерборды игроков из FotMob (index /api/data/leagues +
     полные списки data.fotmob.com/stats/.../<category>.json через scrapers/fotmob,
     dag_ingest_fotmob). Long-form: grain — один row на (игрок, статистическая

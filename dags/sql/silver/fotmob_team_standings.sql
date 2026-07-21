@@ -24,7 +24,7 @@
 --     silver прежний — добавление колонок это не cutover. Аналогично НЕ переносим
 --     новые deduction / qualification_* / ongoing.
 --   * league ← competition_id через league_map (обратная карта
---     FotMobScraper.LEAGUE_IDS); INNER JOIN одновременно скоупит выдачу
+--     configs/fotmob/competitions.json); INNER JOIN одновременно скоупит выдачу
 --     прежними 14 лигами — расширение скоупа НЕ входит в cutover.
 --   * season ← year-start = substr(source_season_key, 1, 4); слаг НЕ выводить
 --     из формы ключа (AFCON single-year обязан дать '2526', как legacy).
@@ -46,20 +46,7 @@
 
 WITH league_map(competition_id, league) AS (
     VALUES
-        (47, 'ENG-Premier League'),
-        (48, 'ENG-Championship'),
-        (87, 'ESP-La Liga'),
-        (54, 'GER-Bundesliga'),
-        (55, 'ITA-Serie A'),
-        (53, 'FRA-Ligue 1'),
-        (57, 'NED-Eredivisie'),
-        (61, 'POR-Primeira Liga'),
-        (42, 'UEFA-Champions League'),
-        (73, 'UEFA-Europa League'),
-        (77, 'INT-World Cup'),
-        (50, 'INT-European Championship'),
-        (289, 'INT-Africa Cup of Nations'),
-        (44, 'INT-Copa America')
+        {{ fotmob_league_map_values_sql }}
 ),
 
 native_scoped AS (

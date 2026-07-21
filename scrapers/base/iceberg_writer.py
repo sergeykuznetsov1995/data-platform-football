@@ -138,31 +138,16 @@ class IcebergWriter:
 
     def namespace_exists(self, database: str) -> bool:
         """Check if namespace (database/schema) exists."""
-        try:
-            trino = self._get_trino_manager()
-            return trino.schema_exists(database)
-        except Exception as e:
-            logger.warning(f"Could not check namespace existence: {e}")
-            return False
+        trino = self._get_trino_manager()
+        return trino.schema_exists(database)
 
     def table_exists(self, database: str, table: str) -> bool:
         """Check if Iceberg table exists.
 
-        Raises connection errors instead of swallowing them.
+        Metadata failures propagate: they are not evidence of absence.
         """
-        try:
-            trino = self._get_trino_manager()
-            return trino.table_exists(database, table)
-        except Exception as e:
-            err_msg = str(e).lower()
-            if (
-                "connection" in err_msg
-                or "unreachable" in err_msg
-                or "refused" in err_msg
-            ):
-                raise
-            logger.warning(f"Could not check table existence: {e}")
-            return False
+        trino = self._get_trino_manager()
+        return trino.table_exists(database, table)
 
     @staticmethod
     def _is_null_scalar(value: Any) -> bool:

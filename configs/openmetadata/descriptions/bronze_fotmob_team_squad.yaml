@@ -4,6 +4,9 @@
 table:
   fullyQualifiedName: trino_iceberg.iceberg.bronze.fotmob_team_squad
   description: |
+    ЗАМОРОЖЕННЫЙ LEGACY-АРХИВ: запись остановлена 2026-07-21 после #930;
+    рабочая замена — fotmob_squad_snapshots_current. Таблица сохранена только
+    как rollback-опора и не является выходом текущего dag_ingest_fotmob.
     Сырой состав команды из FotMob (endpoint /api/data/teams, секция squad, через
     scrapers/fotmob, dag_ingest_fotmob). Grain — один row на члена состава (игроки
     + тренерский штаб). Несёт анкету (возраст/рост/ДР/позиция) и сезонные

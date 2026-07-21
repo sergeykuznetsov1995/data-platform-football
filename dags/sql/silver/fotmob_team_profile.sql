@@ -26,7 +26,7 @@
 --   * Снапшотные/низкоценные секции НЕ переносим: next_match / last_match,
 --     overview_season, history_seasons_count (при нужде — overview_json/history_json).
 --   * league — реконструкция из competition_id по статической карте
---     (FotMobScraper.LEAGUE_IDS); INNER JOIN к карте одновременно скоупит
+--     (configs/fotmob/competitions.json); INNER JOIN к карте одновременно скоупит
 --     выдачу прежними 14 лигами (native-каталог шире — расширение скоупа
 --     не входит в cutover).
 --   * season — из source_season_key ('2025/2026' клубный | '2025' single-year):
@@ -46,20 +46,7 @@
 
 WITH league_map (competition_id, league) AS (
     VALUES
-        (47,  'ENG-Premier League'),
-        (48,  'ENG-Championship'),
-        (87,  'ESP-La Liga'),
-        (54,  'GER-Bundesliga'),
-        (55,  'ITA-Serie A'),
-        (53,  'FRA-Ligue 1'),
-        (57,  'NED-Eredivisie'),
-        (61,  'POR-Primeira Liga'),
-        (42,  'UEFA-Champions League'),
-        (73,  'UEFA-Europa League'),
-        (77,  'INT-World Cup'),
-        (50,  'INT-European Championship'),
-        (289, 'INT-Africa Cup of Nations'),
-        (44,  'INT-Copa America')
+        {{ fotmob_league_map_values_sql }}
 ),
 
 -- Сезонный скоуп: команда ∈ (competition, season). Native-снапшот профиля

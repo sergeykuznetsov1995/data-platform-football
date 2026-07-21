@@ -84,6 +84,8 @@ EXPECTED_RUNTIME_FILES = (
     "scrapers/fbref/control/store.py",
     "scrapers/fbref/policy.py",
     "scrapers/fbref/settings.py",
+    "scrapers/fotmob/__init__.py",
+    "scrapers/fotmob/constants.py",
     "scrapers/sofascore/__init__.py",
     "scrapers/sofascore/runtime_fingerprint.py",
     "scrapers/sofascore/workload_plan.py",

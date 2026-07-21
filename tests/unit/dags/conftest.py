@@ -68,6 +68,7 @@ def _install_airflow_stubs() -> None:
     operators_bash_mod = types.ModuleType("airflow.operators.bash")
     sensors_mod = types.ModuleType("airflow.sensors")
     sensors_ext_mod = types.ModuleType("airflow.sensors.external_task")
+    sensors_python_mod = types.ModuleType("airflow.sensors.python")
     utils_mod = types.ModuleType("airflow.utils")
     utils_tg_mod = types.ModuleType("airflow.utils.task_group")
 
@@ -333,6 +334,11 @@ def _install_airflow_stubs() -> None:
 
     sensors_ext_mod.ExternalTaskSensor = _ExternalTaskSensor
 
+    class _PythonSensor(_PythonOperator):
+        pass
+
+    sensors_python_mod.PythonSensor = _PythonSensor
+
     # ---- airflow.utils.task_group.TaskGroup -----------------------------
     class _TaskGroup:
         # Stack of active groups so PythonOperators created inside ``with``
@@ -429,6 +435,7 @@ def _install_airflow_stubs() -> None:
     sys.modules["airflow.operators.empty"] = operators_empty_mod
     sys.modules["airflow.sensors"] = sensors_mod
     sys.modules["airflow.sensors.external_task"] = sensors_ext_mod
+    sys.modules["airflow.sensors.python"] = sensors_python_mod
     sys.modules["airflow.utils"] = utils_mod
     sys.modules["airflow.utils.task_group"] = utils_tg_mod
 
@@ -445,6 +452,7 @@ def _install_airflow_stubs() -> None:
     airflow_mod.sensors = sensors_mod
     airflow_mod.utils = utils_mod
     sensors_mod.external_task = sensors_ext_mod
+    sensors_mod.python = sensors_python_mod
     utils_mod.task_group = utils_tg_mod
 
 

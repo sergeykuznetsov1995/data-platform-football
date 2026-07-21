@@ -6,7 +6,9 @@ table:
   description: |
     Time-series рыночной стоимости игроков из FotMob. Один row per
     (player_id, value_date, league, season) — UNNEST из
-    bronze.fotmob_player_details.market_values_json
+    bronze.fotmob_player_snapshots_current.market_values_json; сезонный scope
+    формируют native leaderboards_current и season_teams_current /
+    squad_snapshots_current
     (`{"values": [{"date", "value", "currency"}, ...]}`).
     Питает gold.fct_player_market_value (issue #11). canonical_id
     резолвится только в Gold (через silver.xref_player WHERE source='fotmob')
@@ -21,7 +23,7 @@ table:
     - PII.Low
 columns:
   - name: player_id
-    description: FotMob player_id (varchar; из bronze.fotmob_player_details).
+    description: FotMob player_id (varchar; из bronze.fotmob_player_snapshots_current).
   - name: value_date
     description: Дата фиксации market_value (historical snapshot, может быть глубоко в прошлом).
   - name: market_value_eur
@@ -29,7 +31,7 @@ columns:
   - name: currency
     description: Валюта (обычно EUR; в редких случаях иная).
   - name: _bronze_ingested_at
-    description: Timestamp Bronze ingest'а (для freshness + cross-source dedup).
+    description: Timestamp native-наблюдения Bronze (для freshness + cross-source dedup).
   - name: league
     description: Лига (partition key, текущая лига ingest'а).
   - name: season

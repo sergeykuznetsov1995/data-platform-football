@@ -694,7 +694,7 @@ def test_bronze_xref_freshness_ok_when_xref_fresher_than_bronze(monkeypatch):
     _patch_freshness_conn(monkeypatch, [
         ('xref_player$snapshots', [(xref_ts,)]),
         ('iceberg.bronze.understat_players', [('2526', us_ts)]),
-        ('iceberg.bronze.fotmob_player_stats', [('2526', fm_ts)]),
+        ('iceberg.silver.fotmob_player_season_profile', [('2526', fm_ts)]),
     ])
 
     res = xref_dq.evaluate_bronze_xref_freshness_gap()
@@ -720,7 +720,7 @@ def test_bronze_xref_freshness_warning_when_bronze_ahead(monkeypatch):
     _patch_freshness_conn(monkeypatch, [
         ('xref_player$snapshots', [(xref_ts,)]),
         ('iceberg.bronze.understat_players', [('2526', us_ts)]),
-        ('iceberg.bronze.fotmob_player_stats', [('2526', fm_ts)]),
+        ('iceberg.silver.fotmob_player_season_profile', [('2526', fm_ts)]),
     ])
 
     res = xref_dq.evaluate_bronze_xref_freshness_gap()
@@ -742,7 +742,7 @@ def test_bronze_xref_freshness_error_when_lag_exceeds_3_days(monkeypatch):
     _patch_freshness_conn(monkeypatch, [
         ('xref_player$snapshots', [(xref_ts,)]),
         ('iceberg.bronze.understat_players', [('2526', us_ts)]),
-        ('iceberg.bronze.fotmob_player_stats', []),
+        ('iceberg.silver.fotmob_player_season_profile', []),
     ])
 
     res = xref_dq.evaluate_bronze_xref_freshness_gap()
@@ -765,7 +765,7 @@ def test_bronze_xref_freshness_handles_empty_xref_snapshots(monkeypatch):
     _patch_freshness_conn(monkeypatch, [
         ('xref_player$snapshots', [(None,)]),
         ('iceberg.bronze.understat_players', [('2526', us_ts)]),
-        ('iceberg.bronze.fotmob_player_stats', []),
+        ('iceberg.silver.fotmob_player_season_profile', []),
     ])
 
     res = xref_dq.evaluate_bronze_xref_freshness_gap()
@@ -845,9 +845,13 @@ def test_xref_player_review_rule_enum_includes_dob_veto():
 
 
 def test_default_player_dob_projections_use_stable_canonical_readers():
-    """DOB inputs are raw or canonical readers and never physical TM v2."""
+    """DOB inputs are native-backed/canonical and never frozen FotMob legacy."""
     for src, proj in xref_dq.DEFAULT_PLAYER_DOB_PROJECTIONS:
-        if src == 'whoscored':
+        if src == 'fotmob':
+            assert 'iceberg.silver.fotmob_player_profile' in proj
+            assert 'fotmob_team_squad' not in proj
+            assert '_bronze_ingested_at' in proj
+        elif src == 'whoscored':
             assert 'iceberg.silver.whoscored_player_profile_current' in proj
         elif src == 'transfermarkt':
             assert 'iceberg.silver.transfermarkt_players' in proj
@@ -859,6 +863,18 @@ def test_default_player_dob_projections_use_stable_canonical_readers():
     assert {s for s, _ in xref_dq.DEFAULT_PLAYER_DOB_PROJECTIONS} == {
         'fotmob', 'sofascore', 'transfermarkt', 'sofifa', 'whoscored',
     }
+
+
+def test_default_freshness_relations_exclude_frozen_fotmob_legacy():
+    relations = dict(xref_dq.DEFAULT_FRESHNESS_BRONZE_TABLES)
+    assert relations['fotmob'] == (
+        'iceberg.silver.fotmob_player_season_profile'
+    )
+    assert all('fotmob_player_stats' not in rel for rel in relations.values())
+    assert (
+        xref_dq._FRESHNESS_TS_COLUMN_BY_RELATION[relations['fotmob']]
+        == '_bronze_ingested_at'
+    )
 
 
 def _seed_dob_conflict_fixture(duck_conn, tm_dob: str):

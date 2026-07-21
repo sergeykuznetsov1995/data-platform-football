@@ -580,6 +580,29 @@ class TestBackwardCompat:
 
 
 class TestNativeTransfermarktReaders:
+    def test_fotmob_minutes_read_native_backed_silver_profile(self, monkeypatch):
+        captured = {}
+
+        def fake_execute(_conn, sql, fetch=False):
+            captured['sql'] = sql
+            assert fetch is True
+            return [('42', 'Player', 'Arsenal', 'ENG-Premier League',
+                     '2526', 1234.0)]
+
+        monkeypatch.setattr(xpr, '_execute', fake_execute)
+
+        rows = xpr._fetch_fotmob_players(
+            object(), 'ENG-Premier League', [2025],
+        )
+
+        assert len(rows) == 1
+        assert rows[0]['bronze_signal'] == 1234.0
+        assert (
+            'iceberg.silver.fotmob_player_season_profile' in captured['sql']
+        )
+        assert 'iceberg.silver.fotmob_keeper_profile' in captured['sql']
+        assert 'iceberg.bronze.fotmob_player_stats' not in captured['sql']
+
     def test_player_anchors_read_squad_membership_grain(self, monkeypatch):
         captured = {}
 
@@ -615,6 +638,23 @@ class TestNativeTransfermarktReaders:
             'iceberg.bronze.transfermarkt_player_attribute_observations' in sql
         )
         assert 'iceberg.bronze.transfermarkt_players' not in sql
+
+    def test_fotmob_dob_map_reads_native_backed_silver_profile(self, monkeypatch):
+        projections = {}
+
+        def fake_fetch(_conn, sql, source):
+            projections[source] = sql
+            return {}
+
+        monkeypatch.setattr(xpr, '_fetch_dob_map', fake_fetch)
+
+        xpr._fetch_dob_maps(object(), 'ENG-Premier League', ['2526'])
+
+        sql = projections['fotmob']
+        assert 'iceberg.silver.fotmob_player_profile' in sql
+        assert 'iceberg.bronze.fotmob_team_squad' not in sql
+        assert "season IN ('2526')" in sql
+        assert '_bronze_ingested_at' in sql
 
 
 # ---------------------------------------------------------------------------

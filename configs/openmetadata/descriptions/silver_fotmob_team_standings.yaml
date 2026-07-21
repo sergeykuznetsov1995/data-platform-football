@@ -5,13 +5,14 @@ table:
   fullyQualifiedName: trino_iceberg.iceberg.silver.fotmob_team_standings
   description: |
     Conform-only турнирная таблица per-season из FotMob (issue #600), из
-    bronze.fotmob_team_stats (endpoint /api/data/leagues, table.all). Один row
+    bronze.fotmob_standings_current (endpoint /api/data/leagues, table.all).
+    Один row
     per (team_id, league, season): место + игры/победы/голы/очки. Season-grain
     SNAPSHOT, который FotMob отдаёт напрямую — НЕ rollup из match-grain, поэтому
     conform (charter §2). `form` (100% NULL) не переносится. Snapshot-семантика:
     при ingest в середине сезона played < полного календаря. canonical_id не
-    резолвится (numeric team_id + team_name, резолв в Gold). Дедуп: ROW_NUMBER
-    per (team_id, league, season) ORDER BY _ingested_at DESC.
+    резолвится (numeric team_id + team_name, резолв в Gold). Native current
+    view выбирает последний успешный manifest batch.
   tags:
     - Tier.Silver
     - Domain.Football
@@ -40,7 +41,7 @@ columns:
   - name: points
     description: Очки.
   - name: _bronze_ingested_at
-    description: Timestamp Bronze ingest'а (для freshness).
+    description: Timestamp native-наблюдения Bronze (для freshness).
   - name: league
     description: Лига (partition key).
   - name: season

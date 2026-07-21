@@ -27,6 +27,9 @@ RUN test -n "${FBREF_ACCEPTANCE_GIT_SHA}" \
         /opt/airflow/scripts /opt/airflow/configs \
     && chmod -R a-w /opt/airflow/dags /opt/airflow/scrapers \
         /opt/airflow/scripts /opt/airflow/configs \
+    && PYTHONDONTWRITEBYTECODE=1 \
+        /usr/local/bin/python \
+        /opt/airflow/scripts/proxy_filter/filter_proxy.py --help >/dev/null \
     && install -d -o root -g root -m 0755 \
         /opt/airflow/runtime-contract/fbref-acceptance \
     && PYTHONDONTWRITEBYTECODE=1 \

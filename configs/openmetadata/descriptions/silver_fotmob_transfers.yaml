@@ -6,10 +6,12 @@ table:
   description: |
     Conform-only трансферные события из FotMob (issue #600), event-grain. Один
     row per (player_id, from_club_id, to_club_id, transfer_date, league, season).
-    Источник: bronze.fotmob_transfers (endpoint /api/data/transfers по лиге).
+    Текущий источник — bronze.fotmob_transfer_events_current (native
+    пагинированная лента). Замороженная bronze.fotmob_transfers читается только
+    как намеренный исторический bridge; при совпадении PK побеждает native.
     `fee_text` (100% NULL) не переносится. player/club identity не резолвится —
-    храним numeric ids + имена клубов, резолв в Gold (charter §5). Дедуп:
-    ROW_NUMBER per PK ORDER BY _ingested_at DESC.
+    храним numeric ids + имена клубов, резолв в Gold (charter §5). Итог
+    дедуплицируется по PK с native-first приоритетом.
   tags:
     - Tier.Silver
     - Domain.Football
@@ -22,7 +24,7 @@ columns:
     tags:
       - PII.Low
   - name: transfer_date
-    description: Дата трансфера (DATE; TRY_CAST из bronze varchar ISO).
+    description: Дата трансфера (DATE; TRY_CAST из native/замороженного Bronze ISO).
   - name: from_club_id
     description: FotMob id клуба-отправителя (bigint; NULL для free agents).
   - name: from_club_full_name
@@ -36,7 +38,7 @@ columns:
   - name: position_key
     description: Машинный ключ позиции игрока.
   - name: fee_eur
-    description: Сумма трансфера в евро (CAST bronze fee_value double → BIGINT; NULL ~63% для free/нераскрытых).
+    description: Сумма трансфера в евро (BIGINT; NULL для free/нераскрытых).
   - name: market_value
     description: Рыночная стоимость игрока (сырой varchar — формат вариативен, парсинг отложен в Gold).
   - name: on_loan

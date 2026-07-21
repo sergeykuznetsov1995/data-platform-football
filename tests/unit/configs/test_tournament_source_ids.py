@@ -92,10 +92,10 @@ def _resolve(source: str, comp_id: str):
         if not entry['comp_id'].isdigit():
             return f"fbref comp_id must be digits (got {entry['comp_id']!r})"
     elif source == 'fotmob':
-        from scrapers.fotmob.scraper import FotMobScraper
-        val = FotMobScraper.LEAGUE_IDS.get(comp_id)
+        from scrapers.fotmob.constants import LEAGUE_IDS
+        val = LEAGUE_IDS.get(comp_id)
         if not val or not str(val).isdigit():
-            return "scrapers/fotmob/scraper.py LEAGUE_IDS: missing/non-numeric entry"
+            return "configs/fotmob/competitions.json: missing/non-numeric entry"
     elif source == 'sofascore':
         from scrapers.sofascore.scraper import (
             SOFASCORE_TOURNAMENT_MAP,

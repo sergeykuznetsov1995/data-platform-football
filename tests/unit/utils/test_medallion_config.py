@@ -620,6 +620,24 @@ def test_render_sql_template_does_not_touch_inline_comment(tmp_path, mock_config
     assert "    ('x', 'y')" in out
 
 
+def test_render_sql_template_supplies_canonical_fotmob_map(
+    tmp_path, mock_config_dir
+):
+    template = tmp_path / "fotmob.sql.j2"
+    template.write_text(
+        "WITH league_map(competition_id, league) AS (\n"
+        "  VALUES\n"
+        "    {{ fotmob_league_map_values_sql }}\n"
+        ") SELECT * FROM league_map\n"
+    )
+
+    out = mock_config_dir.render_sql_template(template)
+
+    assert "(47, 'ENG-Premier League')" in out
+    assert "(44, 'INT-Copa America')" in out
+    assert "{{ fotmob_league_map_values_sql }}" not in out
+
+
 # ---------------------------------------------------------------------------
 # Smoke-test the actual shipped configs/medallion/*.yaml
 # ---------------------------------------------------------------------------

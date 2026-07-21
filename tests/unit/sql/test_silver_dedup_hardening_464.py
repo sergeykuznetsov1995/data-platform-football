@@ -31,6 +31,8 @@ from pathlib import Path
 
 import pytest
 
+from scrapers.fotmob.constants import render_fotmob_sql
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 SILVER_DIR = PROJECT_ROOT / "dags" / "sql" / "silver"
@@ -68,7 +70,7 @@ def _translate(sql: str) -> str:
 
 
 def _read(path: Path) -> str:
-    return path.read_text(encoding="utf-8")
+    return render_fotmob_sql(path.read_text(encoding="utf-8"))
 
 
 def _strip_comments(sql: str) -> str:

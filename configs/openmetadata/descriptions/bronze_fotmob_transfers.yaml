@@ -4,6 +4,10 @@
 table:
   fullyQualifiedName: trino_iceberg.iceberg.bronze.fotmob_transfers
   description: |
+    ЗАМОРОЖЕННАЯ LEGACY-ИСТОРИЯ: запись остановлена 2026-07-21 после #930;
+    текущий поток — fotmob_transfer_events_current. Эта таблица намеренно
+    сохранена и читается silver.fotmob_transfers как исторический bridge для
+    скользящей ленты источника; удалять её нельзя до отдельной миграции истории.
     Сырые трансферы из FotMob (endpoint /api/data/transfers по лиге через
     scrapers/fotmob, dag_ingest_fotmob). Grain — один row на трансферное событие:
     игрок, клубы «из/в», сумма и рыночная стоимость, тип перехода (аренда/выкуп).

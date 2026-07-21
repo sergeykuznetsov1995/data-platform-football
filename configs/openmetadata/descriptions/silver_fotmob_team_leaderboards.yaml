@@ -8,11 +8,11 @@ table:
     Один row per (team_id, stat_category_group, stat_name, league, season):
     место (rank) + значение метрики (stat_value) на команду в каждой статкатегории.
     Грейн bronze сохранён (charter §1) — НЕ PIVOT, НЕ rollup. Источник:
-    bronze.fotmob_team_leaderboards (index /api/data/leagues + полные списки
+    bronze.fotmob_leaderboards_current (index /api/data/leagues + полные списки
     data.fotmob.com/stats). Низкоценные колонки (participant_name/team_color/
     country_code) не переносятся. canonical_id не резолвится (numeric team_id +
-    team_name, резолв в Gold). Дедуп: ROW_NUMBER per (team_id,
-    stat_category_group, stat_name, league, season) ORDER BY _ingested_at DESC.
+    team_name, резолв в Gold). Native current view выбирает последние успешные
+    manifest batches.
   tags:
     - Tier.Silver
     - Domain.Football
@@ -41,7 +41,7 @@ columns:
   - name: stat_category_header
     description: Заголовок категории статистики.
   - name: _bronze_ingested_at
-    description: Timestamp Bronze ingest'а (для freshness).
+    description: Timestamp native-наблюдения Bronze (для freshness).
   - name: league
     description: Лига (partition key).
   - name: season

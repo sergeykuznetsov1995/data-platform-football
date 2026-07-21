@@ -107,6 +107,7 @@ def _buildx_metadata(
     revision: str,
     dockerfile_raw: bytes,
     include_gate_inputs: bool = True,
+    vcs_source: str | None = None,
 ):
     _, entrypoint, target, _ = generator.IMAGE_GROUP_BUILD_SPECS[group]
     context_localdir, dockerfile_localdir = generator.IMAGE_GROUP_CONTEXT_SPECS[group]
@@ -135,6 +136,20 @@ def _buildx_metadata(
     }
     if args:
         parameters["args"] = args
+    source = vcs_source or f"{generator.EXPECTED_VCS_SOURCE}.git"
+    parameters["root"] = {
+        "configSource": {"path": entrypoint},
+        "request": {
+            "args": {
+                **args,
+                "vcs:localdir:context": context_localdir,
+                "vcs:localdir:dockerfile": dockerfile_localdir,
+                "vcs:revision": revision,
+                "vcs:source": source,
+            }
+        },
+    }
+    parameters["compatibilityVersion"] = 30
     return {
         "buildx.build.provenance": {
             "buildConfig": {
@@ -144,7 +159,10 @@ def _buildx_metadata(
             "buildType": "https://mobyproject.org/buildkit@v1",
             "invocation": {
                 "configSource": {"entryPoint": entrypoint},
-                "environment": {"platform": "linux/amd64"},
+                "environment": {
+                    "dockerfileVersion": "1.25.0",
+                    "platform": "linux/amd64",
+                },
                 "parameters": parameters,
             },
             "metadata": {
@@ -181,7 +199,7 @@ def _buildx_metadata(
                         "localdir:context": context_localdir,
                         "localdir:dockerfile": dockerfile_localdir,
                         "revision": revision,
-                        "source": f"{generator.EXPECTED_VCS_SOURCE}.git",
+                        "source": source,
                     },
                 },
                 "reproducible": False,
@@ -808,10 +826,8 @@ def test_buildkit_max_provenance_binds_digest_target_dockerfile_and_gate(
         final_image=finals[group],
         revision=revision,
         dockerfile_raw=dockerfile_raw,
+        vcs_source=vcs_source,
     )
-    document["buildx.build.provenance"]["metadata"][
-        "https://mobyproject.org/buildkit@v1#metadata"
-    ]["vcs"]["source"] = vcs_source
 
     evidence = generator._validate_build_provenance_value(
         group=group,
@@ -843,6 +859,10 @@ def test_buildkit_max_provenance_binds_digest_target_dockerfile_and_gate(
         "malformed-source",
         "missing-source",
         "extra-vcs-key",
+        "compatibility-version",
+        "dockerfile-version",
+        "root-revision",
+        "extra-invocation-key",
     ],
 )
 def test_buildkit_provenance_rejects_hostile_final_build(mutation: str) -> None:
@@ -889,6 +909,20 @@ def test_buildkit_provenance_rejects_hostile_final_build(mutation: str) -> None:
         document["buildx.build.provenance"]["metadata"][
             "https://mobyproject.org/buildkit@v1#metadata"
         ]["vcs"]["dirty"] = False
+    elif mutation == "compatibility-version":
+        document["buildx.build.provenance"]["invocation"]["parameters"][
+            "compatibilityVersion"
+        ] = 29
+    elif mutation == "dockerfile-version":
+        document["buildx.build.provenance"]["invocation"]["environment"][
+            "dockerfileVersion"
+        ] = "latest"
+    elif mutation == "root-revision":
+        document["buildx.build.provenance"]["invocation"]["parameters"]["root"][
+            "request"
+        ]["args"]["vcs:revision"] = revision + "-dirty"
+    elif mutation == "extra-invocation-key":
+        document["buildx.build.provenance"]["invocation"]["cache"] = "unbound"
 
     with pytest.raises(generator.DeploymentAttestationError, match="BuildKit"):
         generator._validate_build_provenance_value(

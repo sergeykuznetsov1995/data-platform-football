@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -51,12 +52,19 @@ def test_out_of_window_tournament_is_clean_noop_before_plan_or_runtime(
         "scrapers.sofascore.catalog.SofaScoreCatalog.load",
         lambda: catalog,
     )
+    # Resolve the live module object explicitly. Another runner test restores
+    # ``sys.modules`` wholesale and can leave the parent-package attribute
+    # pointing at a stale module instance, which makes string-path patching
+    # order-dependent in the full scraper partition.
+    medallion_config = importlib.import_module("utils.medallion_config")
     monkeypatch.setattr(
-        "utils.medallion_config.is_single_year_competition",
+        medallion_config,
+        "is_single_year_competition",
         lambda _league: True,
     )
     monkeypatch.setattr(
-        "utils.medallion_config.get_active_season",
+        medallion_config,
+        "get_active_season",
         lambda _league: None,
     )
     runtime = MagicMock(side_effect=AssertionError("runtime must not be built"))

@@ -7,10 +7,13 @@ table:
     Широкий профиль полевого игрока за сезон из FotMob — один row на
     (player_id, league, season). Содержит per-season идентичность (клуб, позиция)
     и ~34 статистические метрики (голы, ассисты, xG/xA, удары, отборы, дисциплина).
-    Источники: bronze.fotmob_player_details (identity) + bronze.fotmob_player_stats
-    (статы в LONG-формате, развёрнуты в wide через MAX(CASE WHEN stat_name=...) PIVOT).
-    Дедупликация details — ROW_NUMBER PARTITION BY (player_id, league, season)
-    ORDER BY _ingested_at DESC. Фильтры: NOT is_coach AND
+    Источники — manifest-backed native views:
+    bronze.fotmob_player_snapshots_current (identity) +
+    bronze.fotmob_leaderboards_current (статы в LONG-формате, развёрнуты в wide
+    через MAX(CASE WHEN stat_name=...) PIVOT). Сезонный scope реконструируется
+    через competition_seasons_current / season_teams_current / текущий squad.
+    Дедупликация — ROW_NUMBER по native lineage (_observed_at, _target_batch_id).
+    Фильтры: NOT is_coach AND
     LOWER(position_description)<>'keeper' (вратари — в silver.fotmob_keeper_profile).
     primary_position нормализована LOWER() (FotMob отдаёт inconsistent case);
     capitalize — на BI-слое. Время-инвариантные атрибуты (рост/нога/страна/дата

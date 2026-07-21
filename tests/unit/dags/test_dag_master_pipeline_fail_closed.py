@@ -47,11 +47,129 @@ def test_whoscored_scheduled_failure_is_not_an_allowed_success_state():
 
 
 def test_fotmob_child_failure_is_not_an_allowed_success_state():
-    _reload_master()
+    module = _reload_master()
     fotmob = _task("ingestion_triggers.trigger_fotmob")
 
     assert fotmob._init_kwargs["allowed_states"] == ["success"]
     assert fotmob._init_kwargs["failed_states"] == ["failed"]
+    assert fotmob._init_kwargs["execution_timeout"].total_seconds() == 14 * 3600
+    expected_daily = module.fotmob_daily_trigger_conf()
+    assert {
+        key: fotmob._init_kwargs["conf"][key] for key in expected_daily
+    } == expected_daily
+
+
+def test_fotmob_trigger_has_exclusive_runtime_schedule_owner_gate():
+    _reload_master()
+    owner = _task("ingestion_triggers.fotmob_shared_schedule_owner")
+    initializer = _task("ingestion_triggers.initialize_fotmob_publication")
+    fotmob = _task("ingestion_triggers.trigger_fotmob")
+    matchhistory = _task("ingestion_triggers.trigger_matchhistory")
+
+    assert owner._init_kwargs["ignore_downstream_trigger_rules"] is False
+    assert owner.upstream_task_ids == set()
+    assert initializer.upstream_task_ids == {owner.task_id}
+    assert fotmob.upstream_task_ids == {initializer.task_id}
+    assert fotmob._init_kwargs["reset_dag_run"] is False
+    assert fotmob._init_kwargs["logical_date"] == "{{ logical_date.isoformat() }}"
+    assert "execution_date" not in fotmob._init_kwargs
+    assert matchhistory.upstream_task_ids == {fotmob.task_id}
+    assert matchhistory._init_kwargs["trigger_rule"] == "all_done"
+
+
+def test_fotmob_owner_defaults_shared_and_captures_isolated_decision(
+    monkeypatch,
+):
+    module = _reload_master()
+    from airflow.models import Variable
+
+    monkeypatch.delenv(module.FOTMOB_SCHEDULE_OWNER_ENV, raising=False)
+    monkeypatch.setattr(
+        Variable,
+        "get",
+        lambda _key, default_var=None, **_kwargs: default_var,
+    )
+    assert module.resolve_fotmob_schedule_owner() == "shared"
+
+    monkeypatch.setattr(
+        Variable,
+        "get",
+        lambda _key, **_kwargs: "isolated",
+    )
+    task_instance = MagicMock()
+    assert module.allow_shared_fotmob_schedule(ti=task_instance) is False
+    task_instance.xcom_push.assert_called_once_with(
+        key=module.FOTMOB_OWNER_XCOM_KEY,
+        value="isolated",
+    )
+
+
+def test_fotmob_owner_rejects_unknown_value():
+    module = _reload_master()
+    from airflow.exceptions import AirflowException
+
+    with pytest.raises(AirflowException, match="Invalid FotMob schedule owner"):
+        module.resolve_fotmob_schedule_owner("both")
+
+
+def test_isolated_owner_requires_skipped_shared_trigger_and_gate_evidence():
+    module = _reload_master()
+    run = _dag_run(
+        **{
+            module.FOTMOB_OWNER_GATE_TASK_ID: "success",
+            "ingestion_triggers.trigger_fotmob": "skipped",
+            "wait_for_scheduled_whoscored": "success",
+        }
+    )
+
+    assert module.enforce_required_source_success(
+        dag_run=run,
+        fotmob_schedule_owner="isolated",
+    ) == {
+        "dag_ingest_fotmob": "isolated_owner",
+        "dag_ingest_whoscored": "success",
+    }
+
+
+@pytest.mark.parametrize(
+    ("trigger_state", "gate_state"),
+    [("success", "success"), ("skipped", "missing")],
+)
+def test_isolated_owner_rejects_overlap_or_missing_gate(
+    trigger_state,
+    gate_state,
+):
+    module = _reload_master()
+    from airflow.exceptions import AirflowException
+
+    run = _dag_run(
+        **{
+            module.FOTMOB_OWNER_GATE_TASK_ID: gate_state,
+            "ingestion_triggers.trigger_fotmob": trigger_state,
+            "wait_for_scheduled_whoscored": "success",
+        }
+    )
+    with pytest.raises(AirflowException, match="downstream transforms are blocked"):
+        module.enforce_required_source_success(
+            dag_run=run,
+            fotmob_schedule_owner="isolated",
+        )
+
+
+def test_shared_owner_rejects_skipped_fotmob_trigger():
+    module = _reload_master()
+    from airflow.exceptions import AirflowException
+
+    with pytest.raises(AirflowException, match="dag_ingest_fotmob=skipped"):
+        module.enforce_required_source_success(
+            dag_run=_dag_run(
+                **{
+                    "ingestion_triggers.trigger_fotmob": "skipped",
+                    "wait_for_scheduled_whoscored": "success",
+                }
+            ),
+            fotmob_schedule_owner="shared",
+        )
 
 
 @pytest.mark.parametrize(
@@ -60,6 +178,7 @@ def test_fotmob_child_failure_is_not_an_allowed_success_state():
         "wait_for_scheduled_fbref",
         "trigger_xref_transforms",
         "trigger_e3_transforms",
+        "trigger_e4_transforms",
         "trigger_fbref_gold",
     ],
 )
@@ -75,6 +194,7 @@ def test_required_source_gate_waits_for_all_ingestion_and_blocks_transforms():
     _reload_master()
     gate = _task("validate_required_sources")
     fbref_sensor = _task("wait_for_scheduled_fbref")
+    fotmob_sensor = _task("wait_for_fotmob_publication")
     scope = _task("resolve_fbref_publication_scope")
     xref = _task("trigger_xref_transforms")
     e3 = _task("trigger_e3_transforms")
@@ -99,7 +219,10 @@ def test_required_source_gate_waits_for_all_ingestion_and_blocks_transforms():
     )
     assert gate._init_kwargs["trigger_rule"] == "all_done"
     assert fbref_sensor.upstream_task_ids == set()
-    assert gate.task_id in scope.upstream_task_ids
+    assert gate.task_id in fotmob_sensor.upstream_task_ids
+    assert fotmob_sensor._init_kwargs["mode"] == "reschedule"
+    assert fotmob_sensor._init_kwargs["timeout"] == 16 * 60 * 60
+    assert fotmob_sensor.task_id in scope.upstream_task_ids
     assert fbref_sensor.task_id in scope.upstream_task_ids
     assert scope.task_id in xref.upstream_task_ids
     assert xref.task_id in e3.upstream_task_ids
@@ -111,10 +234,12 @@ def test_required_source_gate_waits_for_all_ingestion_and_blocks_transforms():
     assert e3._init_kwargs["trigger_rule"] == "all_success"
 
 
-def test_master_pins_xref_and_gold_to_sensed_fbref_generation():
+def test_master_pins_every_fotmob_child_to_exact_claimed_generation():
     module = _reload_master()
     scope = _task("resolve_fbref_publication_scope")
     xref = _task("trigger_xref_transforms")
+    e3 = _task("trigger_e3_transforms")
+    e4 = _task("trigger_e4_transforms")
     gold = _task("trigger_fbref_gold")
     release = _task("release_fbref_publication_lock")
 
@@ -125,6 +250,27 @@ def test_master_pins_xref_and_gold_to_sensed_fbref_generation():
     assert xref._init_kwargs["conf"]["fbref_control_run_id"] == (
         expected_template
     )
+    for child in (xref, e3, e4, gold):
+        conf = child._init_kwargs["conf"]
+        assert conf["publication_owner"] == "dag_master_pipeline"
+        assert conf["master_run_id"] == "{{ run_id }}"
+        fotmob_conf = conf["fotmob_publication"]
+        assert "wait_for_fotmob_publication" in fotmob_conf["generation_id"]
+        assert fotmob_conf["generation_id"].startswith("{{")
+        assert fotmob_conf["generation_id"].endswith("}}")
+        assert set(fotmob_conf["binding"]) == {
+            "schema",
+            "source",
+            "owner",
+            "data_interval_start",
+            "data_interval_end",
+            "runtime_fingerprint",
+        }
+        assert all(
+            "wait_for_fotmob_publication" in value
+            for value in fotmob_conf["binding"].values()
+        )
+        assert "fotmob_generation_id" not in conf
     assert gold._init_kwargs["conf"]["fbref_control_run_id"] == (
         expected_template
     )
@@ -137,7 +283,8 @@ def test_master_pins_xref_and_gold_to_sensed_fbref_generation():
         module.MASTER_DAGRUN_TIMEOUT_HOURS * 60 * 60
     )
     assert module.MASTER_SOURCE_CHAIN_HOURS == (
-        len(module.TRIGGERED_INGESTION_DAGS) * 12
+        module.MASTER_FOTMOB_TRIGGER_TIMEOUT_HOURS
+        + (len(module.TRIGGERED_INGESTION_DAGS) - 1) * 12
     )
     assert module.MASTER_DAGRUN_TIMEOUT_HOURS - (
         module.MASTER_SOURCE_CHAIN_HOURS
@@ -322,6 +469,7 @@ def test_required_publication_gate_rejects_every_non_success_state(state):
     from airflow.exceptions import AirflowException
 
     run = _dag_run(
+        wait_for_fotmob_publication="success",
         wait_for_scheduled_fbref="success",
         trigger_xref_transforms="success",
         trigger_e3_transforms=state,
@@ -393,6 +541,7 @@ def test_fbref_silver_publication_rejects_missing_current_run_evidence():
 def test_required_publication_gate_accepts_exact_current_master_success():
     module = _reload_master()
     run = _dag_run(
+        wait_for_fotmob_publication="success",
         wait_for_scheduled_fbref="success",
         trigger_xref_transforms="success",
         trigger_e3_transforms="success",
@@ -400,6 +549,7 @@ def test_required_publication_gate_accepts_exact_current_master_success():
     )
 
     assert module.enforce_required_publication_success(dag_run=run) == {
+        "fotmob_publication": "success",
         "dag_ingest_fbref": "success",
         "dag_transform_xref": "success",
         "dag_transform_e3": "success",

@@ -85,7 +85,7 @@ class TestXrefRefereeTemplateStructure:
         the source_season_key year-start."""
         sql = _read_template().lower()
         assert re.search(r"league_map\s*\(\s*competition_id\s*,\s*league\s*\)\s+as", sql), (
-            "league_map CTE (reverse FotMobScraper.LEAGUE_IDS map) must exist"
+            "league_map CTE (canonical FotMob registry map) must exist"
         )
         assert re.search(
             r"cast\s*\(\s*p\.competition_id\s+as\s+bigint\s*\)", sql

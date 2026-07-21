@@ -988,6 +988,26 @@ def _canonical_token(value: object, label: str) -> str:
     return token
 
 
+# Per-page raw-lineage columns attached by _row_with_partition_and_lineage,
+# plus the parser's own page provenance (source_page/source_page_direction).
+# Two schedule rows for the same match fetched from different pages of a live
+# feed differ ONLY in these; the match payload itself is identical. Without
+# the source_page pair here the cross-page dedup never fires: a live feed
+# (e.g. World Cup knockouts) that shifts a settled match between page windows
+# repeats it with a different page number and the identical-payload check
+# reports a false "duplicate schedule natural key" conflict (#951).
+_SCHEDULE_LINEAGE_COLUMNS = frozenset({
+    "raw_content_hash",
+    "raw_blob_key",
+    "raw_request_url",
+    "raw_fetched_at",
+    "raw_endpoint",
+    "raw_target_id",
+    "source_page",
+    "source_page_direction",
+})
+
+
 def _row_with_partition_and_lineage(
     source: Mapping[str, object],
     *,
@@ -1230,15 +1250,31 @@ def materialize_season_partition(
     except Exception as exc:
         raise SeasonMaterializationError(f"schedule skeleton DQ failed: {exc}") from exc
 
-    schedule_keys: set[tuple[str, str, str]] = set()
+    # A live paginated events feed (an in-progress tournament, e.g. the World
+    # Cup during its knockout stage) can return the SAME match on two DIFFERENT
+    # pages when a sibling match settles between page fetches and shifts the
+    # window. Those rows carry identical match payload and differ only in the
+    # per-page raw-lineage columns, so collapse them. A duplicate that repeats
+    # within one page (same raw_blob_key) is a parser defect, and a duplicate
+    # whose match payload disagrees is a data conflict — both stay hard errors.
+    def _schedule_payload(row: Mapping[str, object]) -> dict:
+        return {k: v for k, v in row.items() if k not in _SCHEDULE_LINEAGE_COLUMNS}
+
+    deduped_schedule: dict[tuple[str, str, str], dict] = {}
     for row in schedule_rows:
         event_id = row.get("game_id")
         if event_id in (None, ""):
             raise SeasonMaterializationError("schedule natural key has no game_id")
         key = (league, season, str(event_id))
-        if key in schedule_keys:
+        existing = deduped_schedule.get(key)
+        if existing is not None:
+            same_payload = _schedule_payload(existing) == _schedule_payload(row)
+            cross_page = existing.get("raw_blob_key") != row.get("raw_blob_key")
+            if same_payload and cross_page:
+                continue
             raise SeasonMaterializationError(f"duplicate schedule natural key: {key}")
-        schedule_keys.add(key)
+        deduped_schedule[key] = row
+    schedule_rows = list(deduped_schedule.values())
 
     standings_keys: set[tuple[str, str, str, str]] = set()
     for row in standings_rows:

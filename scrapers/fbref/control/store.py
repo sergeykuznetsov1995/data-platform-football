@@ -103,6 +103,15 @@ _PAGE_KIND_SLA_VALUES = ", ".join(
 _PENDING_MATCH_SAMPLE_LIMIT = 10
 _MAX_FRONTIER_DISCOVERY_TARGETS = 1000
 _MAX_FRONTIER_DISCOVERY_EDGES = 5000
+_PUBLICATION_SCHEMA_VERSION = "publication-generation-v1"
+_PUBLICATION_PHASES = {
+    "writing",
+    "ready",
+    "consuming",
+    "published",
+    "abandoned",
+    "failed",
+}
 _FRONTIER_SCOPE_CTE = """
     WITH declared_scope AS (
         SELECT frontier.target_id, frontier.source,
@@ -315,6 +324,52 @@ def _json_mapping(value: object, name: str) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise StateConflict(f"{name} must be a JSON object")
     return dict(value)
+
+
+def _detached_json_mapping(value: object, name: str) -> dict[str, Any]:
+    """Validate and detach a mapping before persisting it as JSON."""
+
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{name} must be a mapping")
+    try:
+        detached = json.loads(_json(value))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be JSON serializable") from exc
+    if not isinstance(detached, dict):  # pragma: no cover - _json guarantees it
+        raise ValueError(f"{name} must be a JSON object")
+    return detached
+
+
+def _publication_metadata(
+    metadata: object,
+    *,
+    source: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return mutable run metadata and its validated publication envelope."""
+
+    run_metadata = _json_mapping(metadata, "crawl run metadata")
+    publication = _json_mapping(
+        run_metadata.get("publication"), "publication metadata"
+    )
+    if publication.get("schema_version") != _PUBLICATION_SCHEMA_VERSION:
+        raise StateConflict("Publication metadata schema is unsupported")
+    if publication.get("source") != source:
+        raise StateConflict("Publication generation belongs to another source")
+    phase = publication.get("phase")
+    if phase not in _PUBLICATION_PHASES:
+        raise StateConflict("Publication generation phase is invalid")
+    publication["binding"] = _json_mapping(
+        publication.get("binding"), "publication binding"
+    )
+    run_metadata["publication"] = publication
+    return run_metadata, publication
+
+
+def _publication_ttl(value: object) -> int:
+    ttl = int(value)
+    if not 60 <= ttl <= 14 * 24 * 60 * 60:
+        raise ValueError("publication lock ttl_seconds must be 60..1209600")
+    return ttl
 
 
 def _sha256_hex(value: object, name: str) -> str:
@@ -828,6 +883,798 @@ class ControlStore:
             )
             if cursor.rowcount != 1:
                 raise StateConflict(f"Run {normalized} cannot be started")
+
+    @staticmethod
+    def _publication_generation_result(
+        run: Mapping[str, Any],
+        publication: Mapping[str, Any],
+        lock: Optional[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        generation_id = str(run["run_id"])
+        exact_lock = (
+            lock is not None
+            and str(lock.get("owner_run_id")) == generation_id
+        )
+        active = bool(exact_lock and lock.get("active"))
+        result = {
+            "generation_id": generation_id,
+            "source": publication["source"],
+            "status": str(run["status"]),
+            "phase": str(publication["phase"]),
+            "binding": dict(publication["binding"]),
+            "candidate": publication.get("candidate"),
+            "consumer": publication.get("consumer"),
+            "lock_active": active,
+            "active": active,
+        }
+        if exact_lock:
+            result.update(
+                {
+                    "owner_dag_id": lock.get("owner_dag_id"),
+                    "acquired_at": lock.get("acquired_at"),
+                    "expires_at": lock.get("expires_at"),
+                    "released_at": lock.get("released_at"),
+                }
+            )
+        return result
+
+    @staticmethod
+    def _select_publication_run_for_update(
+        cursor: Any,
+        generation_id: str,
+    ) -> dict[str, Any]:
+        cursor.execute(
+            """
+            SELECT run_id, run_type, status, request_limit, byte_limit,
+                   metadata, created_at, started_at, finished_at, updated_at
+            FROM fbref_control.crawl_run
+            WHERE run_id = %s
+            FOR UPDATE
+            """,
+            (generation_id,),
+        )
+        run = _fetchone(cursor)
+        if run is None:
+            raise StateConflict("Publication generation does not exist")
+        return run
+
+    @staticmethod
+    def _select_publication_lock_for_update(
+        cursor: Any,
+        source: str,
+    ) -> Optional[dict[str, Any]]:
+        cursor.execute(
+            """
+            SELECT source, owner_run_id, owner_dag_id, acquired_at,
+                   expires_at, released_at,
+                   (released_at IS NULL
+                    AND expires_at > clock_timestamp()) AS active
+            FROM fbref_control.publication_lock
+            WHERE source = %s
+            FOR UPDATE
+            """,
+            (source,),
+        )
+        return _fetchone(cursor)
+
+    @classmethod
+    def _lock_active_publication_generation(
+        cls,
+        cursor: Any,
+        generation_id: str,
+        source: str,
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
+        run = cls._select_publication_run_for_update(cursor, generation_id)
+        run_metadata, publication = _publication_metadata(
+            run["metadata"], source=source
+        )
+        lock = cls._select_publication_lock_for_update(cursor, source)
+        if (
+            lock is None
+            or str(lock["owner_run_id"]) != generation_id
+            or lock["released_at"] is not None
+            or not bool(lock["active"])
+        ):
+            raise StateConflict(
+                "Active publication lock is not owned by this generation"
+            )
+        return run, run_metadata, publication, lock
+
+    def initialize_publication_generation(
+        self,
+        run_id: object,
+        *,
+        dag_id: object,
+        binding: Mapping[str, Any],
+        source: str = "fbref",
+        ttl_seconds: int = 8 * 24 * 60 * 60,
+    ) -> dict[str, Any]:
+        """Create and acquire one immutable, retry-safe source generation."""
+
+        generation_id = _uuid(run_id, "run_id")
+        normalized_source = _text(source, "source")
+        normalized_dag_id = _text(dag_id, "dag_id")
+        normalized_binding = _detached_json_mapping(binding, "binding")
+        if not normalized_binding:
+            raise ValueError("binding must not be empty")
+        normalized_ttl = _publication_ttl(ttl_seconds)
+        initial_metadata = {
+            "publication": {
+                "schema_version": _PUBLICATION_SCHEMA_VERSION,
+                "source": normalized_source,
+                "phase": "writing",
+                "binding": normalized_binding,
+            }
+        }
+
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO fbref_control.crawl_run (
+                    run_id, run_type, request_limit, byte_limit, metadata
+                ) VALUES (%s, 'publication', 0, 0, %s::jsonb)
+                ON CONFLICT (run_id) DO NOTHING
+                """,
+                (generation_id, _json(initial_metadata)),
+            )
+            inserted_run = cursor.rowcount == 1
+            run = self._select_publication_run_for_update(cursor, generation_id)
+            run_metadata, publication = _publication_metadata(
+                run["metadata"], source=normalized_source
+            )
+            if (
+                str(run["run_type"]) != "publication"
+                or int(run["request_limit"]) != 0
+                or int(run["byte_limit"]) != 0
+                or publication["binding"] != normalized_binding
+            ):
+                raise StateConflict(
+                    "Publication generation id has different immutable data"
+                )
+            if publication["phase"] != "writing" or run["status"] not in {
+                "pending",
+                "running",
+            }:
+                raise StateConflict(
+                    "Terminal publication generation cannot be initialized"
+                )
+            if run["status"] == "pending":
+                cursor.execute(
+                    """
+                    UPDATE fbref_control.crawl_run
+                    SET status = 'running',
+                        started_at = COALESCE(started_at, clock_timestamp()),
+                        updated_at = clock_timestamp()
+                    WHERE run_id = %s AND status = 'pending'
+                    """,
+                    (generation_id,),
+                )
+                if cursor.rowcount != 1:  # pragma: no cover - row is locked
+                    raise StateConflict(
+                        "Publication generation could not be started"
+                    )
+                run["status"] = "running"
+
+            cursor.execute(
+                """
+                INSERT INTO fbref_control.publication_lock (
+                    source, owner_run_id, owner_dag_id, expires_at
+                ) VALUES (
+                    %s, %s, %s,
+                    clock_timestamp() + (%s * interval '1 second')
+                )
+                ON CONFLICT (source) DO NOTHING
+                """,
+                (
+                    normalized_source,
+                    generation_id,
+                    normalized_dag_id,
+                    normalized_ttl,
+                ),
+            )
+            inserted_lock = cursor.rowcount == 1
+            lock = self._select_publication_lock_for_update(
+                cursor, normalized_source
+            )
+            if lock is None:  # pragma: no cover - guarded by INSERT/PK
+                raise ControlStoreError("Publication lock row disappeared")
+            if str(lock["owner_run_id"]) == generation_id:
+                if str(lock["owner_dag_id"]) != normalized_dag_id:
+                    raise StateConflict(
+                        "Publication generation has a different owner DAG"
+                    )
+                if lock["released_at"] is not None or not bool(lock["active"]):
+                    raise StateConflict(
+                        "Released or expired publication generation cannot "
+                        "be reacquired by the same run"
+                    )
+                result = self._publication_generation_result(
+                    run, publication, lock
+                )
+                result.update(
+                    {
+                        "acquired": inserted_lock,
+                        "idempotent": not inserted_run and not inserted_lock,
+                    }
+                )
+                return result
+            if bool(lock["active"]):
+                raise StateConflict(
+                    f"{normalized_source} publication is locked by another "
+                    "generation"
+                )
+            cursor.execute(
+                """
+                UPDATE fbref_control.publication_lock
+                SET owner_run_id = %s,
+                    owner_dag_id = %s,
+                    acquired_at = clock_timestamp(),
+                    expires_at = clock_timestamp()
+                        + (%s * interval '1 second'),
+                    released_at = NULL,
+                    metadata = '{}'::jsonb
+                WHERE source = %s
+                RETURNING source, owner_run_id, owner_dag_id, acquired_at,
+                          expires_at, released_at, true AS active
+                """,
+                (
+                    generation_id,
+                    normalized_dag_id,
+                    normalized_ttl,
+                    normalized_source,
+                ),
+            )
+            replaced = _fetchone(cursor)
+            if replaced is None:  # pragma: no cover - source row is locked
+                raise ControlStoreError("Publication lock takeover lost its row")
+            result = self._publication_generation_result(
+                run, publication, replaced
+            )
+            result.update({"acquired": True, "idempotent": False})
+            return result
+
+    @contextmanager
+    def guard_publication_writer(
+        self,
+        run_id: object,
+        *,
+        source: str = "fbref",
+    ):
+        """Fence an external writer and require the exact writing phase.
+
+        Both the run and singleton lock rows remain locked throughout the
+        caller's external write.  A generation that has been sealed ``ready``
+        is therefore unable to write again even when its lock is still active.
+        """
+
+        generation_id = _uuid(run_id, "run_id")
+        normalized_source = _text(source, "source")
+        with self._transaction() as cursor:
+            run, _metadata, publication, lock = (
+                self._lock_active_publication_generation(
+                    cursor, generation_id, normalized_source
+                )
+            )
+            if run["status"] != "running" or publication["phase"] != "writing":
+                raise StateConflict(
+                    "Publication writers require a running writing generation"
+                )
+            yield self._publication_generation_result(run, publication, lock)
+
+    def record_publication_candidate(
+        self,
+        run_id: object,
+        candidate: Mapping[str, Any],
+        *,
+        source: str = "fbref",
+    ) -> dict[str, Any]:
+        """Attach immutable post-transform and DQ evidence to a writer."""
+
+        generation_id = _uuid(run_id, "run_id")
+        normalized_source = _text(source, "source")
+        normalized_candidate = _detached_json_mapping(candidate, "candidate")
+        if not normalized_candidate:
+            raise ValueError("candidate must not be empty")
+        with self._transaction() as cursor:
+            run, run_metadata, publication, lock = (
+                self._lock_active_publication_generation(
+                    cursor, generation_id, normalized_source
+                )
+            )
+            if run["status"] != "running" or publication["phase"] != "writing":
+                raise StateConflict(
+                    "Candidate requires a running writing generation"
+                )
+            if "candidate" in publication:
+                existing = _json_mapping(
+                    publication["candidate"], "publication candidate"
+                )
+                if existing != normalized_candidate:
+                    raise StateConflict(
+                        "Publication candidate is already recorded differently"
+                    )
+                result = self._publication_generation_result(
+                    run, publication, lock
+                )
+                result["idempotent"] = True
+                return result
+
+            publication["candidate"] = normalized_candidate
+            run_metadata["publication"] = publication
+            cursor.execute(
+                """
+                UPDATE fbref_control.crawl_run
+                SET metadata = %s::jsonb,
+                    updated_at = clock_timestamp()
+                WHERE run_id = %s AND status = 'running'
+                """,
+                (_json(run_metadata), generation_id),
+            )
+            if cursor.rowcount != 1:  # pragma: no cover - run row is locked
+                raise StateConflict("Publication candidate lost its generation")
+            run["metadata"] = run_metadata
+            result = self._publication_generation_result(run, publication, lock)
+            result["idempotent"] = False
+            return result
+
+    def seal_publication_generation(
+        self,
+        run_id: object,
+        *,
+        source: str = "fbref",
+        ttl_seconds: int = 8 * 24 * 60 * 60,
+    ) -> dict[str, Any]:
+        """Seal a candidate as ready while retaining the source lock."""
+
+        generation_id = _uuid(run_id, "run_id")
+        normalized_source = _text(source, "source")
+        normalized_ttl = _publication_ttl(ttl_seconds)
+        with self._transaction() as cursor:
+            run, run_metadata, publication, lock = (
+                self._lock_active_publication_generation(
+                    cursor, generation_id, normalized_source
+                )
+            )
+            if run["status"] == "succeeded" and publication["phase"] == "ready":
+                result = self._publication_generation_result(
+                    run, publication, lock
+                )
+                result["idempotent"] = True
+                return result
+            if run["status"] != "running" or publication["phase"] != "writing":
+                raise StateConflict(
+                    "Only a running writing generation can be sealed ready"
+                )
+            candidate = publication.get("candidate")
+            if not isinstance(candidate, Mapping) or not candidate:
+                raise StateConflict(
+                    "Publication generation cannot be ready without a candidate"
+                )
+
+            publication["phase"] = "ready"
+            run_metadata["publication"] = publication
+            cursor.execute(
+                """
+                UPDATE fbref_control.crawl_run
+                SET status = 'succeeded',
+                    metadata = %s::jsonb,
+                    finished_at = clock_timestamp(),
+                    updated_at = clock_timestamp()
+                WHERE run_id = %s AND status = 'running'
+                """,
+                (_json(run_metadata), generation_id),
+            )
+            if cursor.rowcount != 1:  # pragma: no cover - run row is locked
+                raise StateConflict("Publication generation could not be sealed")
+            cursor.execute(
+                """
+                UPDATE fbref_control.publication_lock
+                SET expires_at = clock_timestamp()
+                    + (%s * interval '1 second')
+                WHERE source = %s AND owner_run_id = %s
+                RETURNING source, owner_run_id, owner_dag_id, acquired_at,
+                          expires_at, released_at, true AS active
+                """,
+                (normalized_ttl, normalized_source, generation_id),
+            )
+            renewed = _fetchone(cursor)
+            if renewed is None:  # pragma: no cover - lock row is held
+                raise ControlStoreError("Ready generation lost its lock")
+            run["status"] = "succeeded"
+            run["metadata"] = run_metadata
+            result = self._publication_generation_result(
+                run, publication, renewed
+            )
+            result["idempotent"] = False
+            return result
+
+    def get_publication_generation(
+        self,
+        run_id: object,
+        *,
+        source: str = "fbref",
+    ) -> Optional[dict[str, Any]]:
+        """Read one exact generation, even after its singleton lock moved."""
+
+        generation_id = _uuid(run_id, "run_id")
+        normalized_source = _text(source, "source")
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                SELECT run.run_id, run.run_type, run.status,
+                       run.request_limit, run.byte_limit, run.metadata,
+                       run.created_at, run.started_at, run.finished_at,
+                       run.updated_at,
+                       publication.owner_run_id, publication.owner_dag_id,
+                       publication.acquired_at, publication.expires_at,
+                       publication.released_at,
+                       (publication.released_at IS NULL
+                        AND publication.expires_at > clock_timestamp()) AS active
+                FROM fbref_control.crawl_run AS run
+                LEFT JOIN fbref_control.publication_lock AS publication
+                  ON publication.source = %s
+                 AND publication.owner_run_id = run.run_id
+                WHERE run.run_id = %s
+                """,
+                (normalized_source, generation_id),
+            )
+            run = _fetchone(cursor)
+        if run is None:
+            return None
+        _run_metadata, publication = _publication_metadata(
+            run["metadata"], source=normalized_source
+        )
+        lock = None
+        if run.get("owner_run_id") is not None:
+            lock = {
+                "owner_run_id": run["owner_run_id"],
+                "owner_dag_id": run.get("owner_dag_id"),
+                "acquired_at": run.get("acquired_at"),
+                "expires_at": run.get("expires_at"),
+                "released_at": run.get("released_at"),
+                "active": bool(run.get("active")),
+            }
+        return self._publication_generation_result(run, publication, lock)
+
+    def claim_publication_generation(
+        self,
+        run_id: object,
+        *,
+        consumer: Mapping[str, Any],
+        binding: Optional[Mapping[str, Any]] = None,
+        source: str = "fbref",
+        ttl_seconds: int = 8 * 24 * 60 * 60,
+    ) -> dict[str, Any]:
+        """Atomically claim an exact ready generation for one consumer."""
+
+        generation_id = _uuid(run_id, "run_id")
+        normalized_source = _text(source, "source")
+        normalized_consumer = _detached_json_mapping(consumer, "consumer")
+        if not normalized_consumer:
+            raise ValueError("consumer must not be empty")
+        normalized_binding = (
+            None
+            if binding is None
+            else _detached_json_mapping(binding, "binding")
+        )
+        normalized_ttl = _publication_ttl(ttl_seconds)
+        with self._transaction() as cursor:
+            run, run_metadata, publication, lock = (
+                self._lock_active_publication_generation(
+                    cursor, generation_id, normalized_source
+                )
+            )
+            if (
+                normalized_binding is not None
+                and publication["binding"] != normalized_binding
+            ):
+                raise StateConflict(
+                    "Publication generation has a different exact binding"
+                )
+            if run["status"] != "succeeded":
+                raise StateConflict("Only a succeeded generation can be claimed")
+            if publication["phase"] == "consuming":
+                existing = _json_mapping(
+                    publication.get("consumer"), "publication consumer"
+                )
+                if existing != normalized_consumer:
+                    raise StateConflict(
+                        "Publication generation is claimed by another consumer"
+                    )
+                result = self._publication_generation_result(
+                    run, publication, lock
+                )
+                result["idempotent"] = True
+                return result
+            if publication["phase"] != "ready":
+                raise StateConflict("Only a ready generation can be claimed")
+
+            publication["phase"] = "consuming"
+            publication["consumer"] = normalized_consumer
+            run_metadata["publication"] = publication
+            cursor.execute(
+                """
+                UPDATE fbref_control.crawl_run
+                SET metadata = %s::jsonb,
+                    updated_at = clock_timestamp()
+                WHERE run_id = %s AND status = 'succeeded'
+                """,
+                (_json(run_metadata), generation_id),
+            )
+            if cursor.rowcount != 1:  # pragma: no cover - run row is locked
+                raise StateConflict("Publication generation claim was lost")
+            cursor.execute(
+                """
+                UPDATE fbref_control.publication_lock
+                SET expires_at = clock_timestamp()
+                    + (%s * interval '1 second')
+                WHERE source = %s AND owner_run_id = %s
+                RETURNING source, owner_run_id, owner_dag_id, acquired_at,
+                          expires_at, released_at, true AS active
+                """,
+                (normalized_ttl, normalized_source, generation_id),
+            )
+            renewed = _fetchone(cursor)
+            if renewed is None:  # pragma: no cover - lock row is held
+                raise ControlStoreError("Claimed generation lost its lock")
+            run["metadata"] = run_metadata
+            result = self._publication_generation_result(
+                run, publication, renewed
+            )
+            result["idempotent"] = False
+            return result
+
+    def complete_publication_generation(
+        self,
+        run_id: object,
+        *,
+        consumer: Optional[Mapping[str, Any]] = None,
+        published: bool = True,
+        source: str = "fbref",
+    ) -> dict[str, Any]:
+        """Publish a claimed generation, or abandon an unclaimed ready one."""
+
+        generation_id = _uuid(run_id, "run_id")
+        normalized_source = _text(source, "source")
+        normalized_consumer = (
+            None
+            if consumer is None
+            else _detached_json_mapping(consumer, "consumer")
+        )
+        if not isinstance(published, bool):
+            raise ValueError("published must be a boolean")
+        target_phase = "published" if published else "abandoned"
+        with self._transaction() as cursor:
+            run = self._select_publication_run_for_update(cursor, generation_id)
+            run_metadata, publication = _publication_metadata(
+                run["metadata"], source=normalized_source
+            )
+            if publication["phase"] == target_phase:
+                if published:
+                    existing = _json_mapping(
+                        publication.get("consumer"), "publication consumer"
+                    )
+                    if normalized_consumer is None or existing != normalized_consumer:
+                        raise StateConflict(
+                            "Published generation belongs to another consumer"
+                        )
+                result = self._publication_generation_result(
+                    run, publication, None
+                )
+                result.update(
+                    {"released": True, "published": published, "idempotent": True}
+                )
+                return result
+            if run["status"] != "succeeded":
+                raise StateConflict(
+                    "Only a succeeded publication generation can complete"
+                )
+            if published:
+                if publication["phase"] != "consuming":
+                    raise StateConflict(
+                        "Only a claimed generation can be published"
+                    )
+                existing = _json_mapping(
+                    publication.get("consumer"), "publication consumer"
+                )
+                if normalized_consumer is None or existing != normalized_consumer:
+                    raise StateConflict(
+                        "Publication generation is claimed by another consumer"
+                    )
+            elif publication["phase"] != "ready" or "consumer" in publication:
+                raise StateConflict(
+                    "Only an unclaimed ready generation can be abandoned"
+                )
+
+            lock = self._select_publication_lock_for_update(
+                cursor, normalized_source
+            )
+            if (
+                lock is None
+                or str(lock["owner_run_id"]) != generation_id
+                or lock["released_at"] is not None
+                or not bool(lock["active"])
+            ):
+                raise StateConflict(
+                    "Active publication lock is not owned by this generation"
+                )
+            publication["phase"] = target_phase
+            run_metadata["publication"] = publication
+            cursor.execute(
+                """
+                UPDATE fbref_control.crawl_run
+                SET metadata = %s::jsonb,
+                    updated_at = clock_timestamp()
+                WHERE run_id = %s AND status = 'succeeded'
+                """,
+                (_json(run_metadata), generation_id),
+            )
+            if cursor.rowcount != 1:  # pragma: no cover - run row is locked
+                raise StateConflict("Publication completion lost its generation")
+            cursor.execute(
+                """
+                UPDATE fbref_control.publication_lock
+                SET released_at = clock_timestamp()
+                WHERE source = %s AND owner_run_id = %s
+                  AND released_at IS NULL
+                RETURNING released_at
+                """,
+                (normalized_source, generation_id),
+            )
+            released = _fetchone(cursor)
+            if released is None:  # pragma: no cover - lock row is held
+                raise ControlStoreError("Publication completion lost its lock")
+            run["metadata"] = run_metadata
+            result = self._publication_generation_result(run, publication, None)
+            result.update(
+                {
+                    "released": True,
+                    "released_at": released["released_at"],
+                    "published": published,
+                    "idempotent": False,
+                }
+            )
+            return result
+
+    def fail_publication_generation(
+        self,
+        run_id: object,
+        *,
+        safe_to_release: bool,
+        source: str = "fbref",
+    ) -> dict[str, Any]:
+        """Fail a writer; release its lock only after writers are terminal."""
+
+        generation_id = _uuid(run_id, "run_id")
+        normalized_source = _text(source, "source")
+        if not isinstance(safe_to_release, bool):
+            raise ValueError("safe_to_release must be a boolean")
+        release = safe_to_release
+        with self._transaction() as cursor:
+            run = self._select_publication_run_for_update(cursor, generation_id)
+            run_metadata, publication = _publication_metadata(
+                run["metadata"], source=normalized_source
+            )
+            terminal_retry = (
+                run["status"] == "failed" and publication["phase"] == "failed"
+            )
+            if not terminal_retry and (
+                run["status"] != "running"
+                or publication["phase"] != "writing"
+            ):
+                raise StateConflict(
+                    "Only a running writing generation can be failed"
+                )
+
+            lock = self._select_publication_lock_for_update(
+                cursor, normalized_source
+            )
+            exact_lock = (
+                lock is not None
+                and str(lock["owner_run_id"]) == generation_id
+            )
+            if not terminal_retry:
+                publication["phase"] = "failed"
+                run_metadata["publication"] = publication
+                cursor.execute(
+                    """
+                    UPDATE fbref_control.crawl_run
+                    SET status = 'failed',
+                        metadata = %s::jsonb,
+                        finished_at = clock_timestamp(),
+                        updated_at = clock_timestamp()
+                    WHERE run_id = %s AND status = 'running'
+                    """,
+                    (_json(run_metadata), generation_id),
+                )
+                if cursor.rowcount != 1:  # pragma: no cover - run row is locked
+                    raise StateConflict("Publication failure lost its generation")
+                run["status"] = "failed"
+                run["metadata"] = run_metadata
+
+            released = bool(exact_lock and lock["released_at"] is not None)
+            released_at = lock["released_at"] if released else None
+            if release and exact_lock and lock["released_at"] is None:
+                cursor.execute(
+                    """
+                    UPDATE fbref_control.publication_lock
+                    SET released_at = clock_timestamp()
+                    WHERE source = %s AND owner_run_id = %s
+                      AND released_at IS NULL
+                    RETURNING released_at
+                    """,
+                    (normalized_source, generation_id),
+                )
+                released_row = _fetchone(cursor)
+                if released_row is None:  # pragma: no cover - lock row is held
+                    raise ControlStoreError("Failed generation lost its lock")
+                released = True
+                released_at = released_row["released_at"]
+            result = self._publication_generation_result(
+                run, publication, lock if exact_lock and not released else None
+            )
+            result.update(
+                {
+                    "released": released,
+                    "released_at": released_at,
+                    "safe_to_release": release,
+                    "idempotent": terminal_retry,
+                }
+            )
+            return result
+
+    def assert_no_active_publication_generation(
+        self,
+        *,
+        source: str = "fbref",
+    ) -> dict[str, Any]:
+        """Fail while any active generation can race an ops mutation."""
+
+        normalized_source = _text(source, "source")
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                SELECT run.run_id, run.run_type, run.status,
+                       run.request_limit, run.byte_limit, run.metadata,
+                       publication.owner_run_id, publication.owner_dag_id,
+                       publication.acquired_at, publication.expires_at,
+                       publication.released_at,
+                       (publication.released_at IS NULL
+                        AND publication.expires_at > clock_timestamp()) AS active
+                FROM fbref_control.publication_lock AS publication
+                JOIN fbref_control.crawl_run AS run
+                  ON run.run_id = publication.owner_run_id
+                WHERE publication.source = %s
+                """,
+                (normalized_source,),
+            )
+            run = _fetchone(cursor)
+        if run is None:
+            return {
+                "source": normalized_source,
+                "safe": True,
+                "active": False,
+                "phase": None,
+            }
+        _run_metadata, publication = _publication_metadata(
+            run["metadata"], source=normalized_source
+        )
+        lock = {
+            "owner_run_id": run["owner_run_id"],
+            "owner_dag_id": run.get("owner_dag_id"),
+            "acquired_at": run.get("acquired_at"),
+            "expires_at": run.get("expires_at"),
+            "released_at": run.get("released_at"),
+            "active": bool(run.get("active")),
+        }
+        result = self._publication_generation_result(run, publication, lock)
+        if result["active"]:
+            raise StateConflict(
+                "Active publication generation makes this operation unsafe: "
+                f"source={normalized_source}, phase={result['phase']}"
+            )
+        result["safe"] = True
+        return result
 
     def acquire_publication_lock(
         self,

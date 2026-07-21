@@ -31,13 +31,15 @@ from pathlib import Path
 
 import pytest
 
+from scrapers.fotmob.constants import render_fotmob_sql
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 SQL_PATH = PROJECT_ROOT / "dags" / "sql" / "silver" / "xref_match.sql"
 
 
 def _read_sql() -> str:
-    return SQL_PATH.read_text(encoding="utf-8")
+    return render_fotmob_sql(SQL_PATH.read_text(encoding="utf-8"))
 
 
 def _strip_comments(sql: str) -> str:
@@ -300,7 +302,7 @@ class TestFotmobNativeSource:
         "INT-Africa Cup of Nations", "INT-Copa America",
     ])
     def test_league_map_covers_legacy_scope(self, league):
-        """The map must reproduce all 14 legacy FotMobScraper.LEAGUE_IDS
+        """The map must reproduce all 14 canonical FotMob registry
         strings — a missing entry silently drops that league from silver."""
         block = re.search(
             r"fotmob_league_map\s*\(competition_id,\s*league\)\s+AS\s*\(.*?\n\),",

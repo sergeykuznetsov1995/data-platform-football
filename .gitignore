@@ -172,6 +172,7 @@ Thumbs.db
 *.parquet
 *.csv
 *.json
+!deploy/fotmob/issue-930-parity-scopes.json
 !configs/**/*.json
 !dags/configs/**/*.json
 !tests/fixtures/**/*.json
@@ -220,6 +221,9 @@ docs/operations/sql/*
 !docs/operations/sql/fbref_production_acceptance.sql
 !docs/operations/sql/fbref_control_dataset_acceptance.sql
 !docs/operations/sql/fbref_canary_acceptance.sql
+!docs/architecture/
+docs/architecture/*
+!docs/architecture/fotmob-native-silver.md
 scrapers/README.md
 
 # Local ad-hoc SQL (not part of pipeline; only dags/sql/ is tracked)
@@ -230,3 +234,6 @@ scrapers/README.md
 /image.png
 /image*.png
 /image\ copy*.png
+# Local non-secret FotMob deployment certificates (production uses a durable
+# absolute host directory mounted read-only into shared Airflow).
+/.fotmob-admission/

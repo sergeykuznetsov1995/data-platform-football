@@ -7,10 +7,11 @@ table:
     Судья матча и его страна из FotMob — один row на (match_id, league, season).
     Issue #290: FotMob — единственный источник, отдающий СТРАНУ судьи (FBref и
     MatchHistory дают только имя). Источник:
-    bronze.fotmob_match_details.match_facts_json (varchar JSON), извлечение через
+    bronze.fotmob_match_payloads_current.match_facts_json (varchar JSON),
+    извлечение через
     json_extract_scalar по путям $.infoBox.Referee.{text,country,countryCode}.
-    Дедупликация: ROW_NUMBER PARTITION BY (match_id, league, season) ORDER BY
-    _ingested_at DESC + фильтр непустого имени судьи. Country — будущий
+    Native current view выбирает последний успешный manifest batch; далее
+    применяется фильтр непустого имени судьи. Country — будущий
     дизамбигуатор тёзок-судей между странами при мульти-лиговом расширении
     (схема xref_referee заморожена на время E1 dual-run, поэтому country вынесена
     в эту match-grain таблицу). Питает матчинг silver.xref_referee → gold.dim_referee.

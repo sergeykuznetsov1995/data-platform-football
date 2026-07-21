@@ -4,6 +4,9 @@
 table:
   fullyQualifiedName: trino_iceberg.iceberg.bronze.fotmob_player_details
   description: |
+    ЗАМОРОЖЕННЫЙ LEGACY-АРХИВ: запись остановлена 2026-07-21 после #930;
+    рабочая замена — fotmob_player_snapshots_current. Таблица сохранена только
+    как rollback-опора и не является выходом текущего dag_ingest_fotmob.
     Сырые анкеты игроков из FotMob (endpoint /_next/data/<buildId>/players/<id>.json
     через scrapers/fotmob, dag_ingest_fotmob). Grain — один row на игрока (snapshot,
     full refresh каждый прогон). Несёт базовую биографию + 11 сырых JSON-блобов

@@ -38,9 +38,9 @@
 --     is NAME ('Liverpool'). Bridge via bronze.whoscored_schedule (numeric+name pair).
 --     R5 (2026-07-03): schedule заполнен для всех сезонов 1617–2526 — WS-блок живой
 --     (~100% заполненность ws-only метрик в gold); старое «only season='2021'» неактуально.
---   * FotMob xref_team/xref_match.season is slug '2526' after #404 (bronze.fotmob_schedule
---     season is still bigint year-start), matching silver.fotmob_team_match.season —
---     bridge JOINs are slug = slug.
+--   * FotMob native source_season_key is converted to the legacy-compatible
+--     slug ('2526') at the Silver/xref boundary, matching
+--     silver.fotmob_team_match.season — bridge JOINs remain slug = slug.
 -- =============================================================================
 
 WITH

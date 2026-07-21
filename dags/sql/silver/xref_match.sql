@@ -203,17 +203,12 @@ ss_resolved AS (
 
 fotmob_league_map (competition_id, league) AS (
     -- #930 cutover: native fotmob tables carry competition_id (BIGINT), not
-    -- the legacy `league` string. Reverse map of FotMobScraper.LEAGUE_IDS
-    -- (scrapers/fotmob/scraper.py). The INNER JOIN below doubles as the
+    -- the legacy `league` string. The reverse map is generated from
+    -- configs/fotmob/competitions.json. The INNER JOIN below doubles as the
     -- legacy 14-league scope guard — native bronze covers the full FotMob
     -- catalogue and MUST NOT leak unknown leagues into silver (cutover map §2.1).
-    VALUES (47, 'ENG-Premier League'), (48, 'ENG-Championship'),
-           (87, 'ESP-La Liga'),        (54, 'GER-Bundesliga'),
-           (55, 'ITA-Serie A'),        (53, 'FRA-Ligue 1'),
-           (57, 'NED-Eredivisie'),     (61, 'POR-Primeira Liga'),
-           (42, 'UEFA-Champions League'), (73, 'UEFA-Europa League'),
-           (77, 'INT-World Cup'),      (50, 'INT-European Championship'),
-           (289, 'INT-Africa Cup of Nations'), (44, 'INT-Copa America')
+    VALUES
+        {{ fotmob_league_map_values_sql }}
 ),
 
 fm_native AS (

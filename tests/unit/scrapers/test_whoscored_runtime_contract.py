@@ -746,7 +746,7 @@ def test_checked_in_whoscored_runtime_contract_matches_release_tree():
     assert EXPECTED_RUNTIME_FILES == tuple(sorted(EXPECTED_RUNTIME_FILES))
     assert len(EXPECTED_RUNTIME_FILES) == len(set(EXPECTED_RUNTIME_FILES))
     assert tuple(contract["files"]) == EXPECTED_RUNTIME_FILES
-    assert result["file_count"] == len(EXPECTED_RUNTIME_FILES) == 86
+    assert result["file_count"] == len(EXPECTED_RUNTIME_FILES) == 88
     assert len(result["code_tree_sha256"]) == 64
     assert len(result["manifest_sha256"]) == 64
 

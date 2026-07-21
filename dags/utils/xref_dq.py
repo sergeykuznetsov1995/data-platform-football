@@ -887,16 +887,17 @@ def report_orphan_teams(
 # Cross-source DOB conflicts (companion to the resolver's name_team_dob tier)
 # ---------------------------------------------------------------------------
 
-#: Source DOB projections: (source, SQL yielding (source_id, dob)). Raw Bronze
-#: is used where it is the stable contract. WhoScored uses its manifest-backed
-#: current view; Transfermarkt uses its state-selected canonical reader. Neither
-#: reader depends on xref_player, so these projections introduce no cycle.
+#: Source DOB projections: (source, SQL yielding (source_id, dob)). FotMob uses
+#: its native-backed Silver profile; WhoScored uses its manifest-backed current
+#: view; Transfermarkt uses its state-selected canonical reader. None of these
+#: readers depends on xref_player, so the projections introduce no cycle.
 #: Trino dialect; tests inject DuckDB-compatible projections instead.
 DEFAULT_PLAYER_DOB_PROJECTIONS = (
     ('fotmob',
      "SELECT CAST(player_id AS varchar) AS source_id, "
-     "max_by(TRY_CAST(date_of_birth AS DATE), _ingested_at) AS dob "
-     "FROM iceberg.bronze.fotmob_team_squad WHERE player_id IS NOT NULL "
+     "max_by(TRY_CAST(date_of_birth AS DATE), _bronze_ingested_at) AS dob "
+     "FROM iceberg.silver.fotmob_player_profile "
+     "WHERE player_id IS NOT NULL AND date_of_birth IS NOT NULL "
      "GROUP BY CAST(player_id AS varchar)"),
     ('sofascore',
      "SELECT CAST(player_id AS varchar) AS source_id, "
@@ -1089,15 +1090,23 @@ def evaluate_manager_dob_collisions(
 
 
 # ---------------------------------------------------------------------------
-# Bronze-vs-xref freshness gap (Issue #15 regression guard)
+# Source-vs-xref freshness gap (Issue #15 regression guard)
 # ---------------------------------------------------------------------------
 
-#: Default Bronze tables consulted by :func:`evaluate_bronze_xref_freshness_gap`.
-#: Each entry: (source_label, fully_qualified_bronze_table).
+#: Default source relations consulted by
+#: :func:`evaluate_bronze_xref_freshness_gap`. FotMob points at the
+#: native-backed Silver relation consumed by the resolver, not the stopped
+#: legacy Bronze feed. Tuple shape is kept for caller compatibility.
 DEFAULT_FRESHNESS_BRONZE_TABLES = (
     ('understat', 'iceberg.bronze.understat_players'),
-    ('fotmob', 'iceberg.bronze.fotmob_player_stats'),
+    ('fotmob', 'iceberg.silver.fotmob_player_season_profile'),
 )
+
+# Timestamp contract differs by layer. Kept outside the public tuple so callers
+# that inject historical two-tuples continue to work unchanged.
+_FRESHNESS_TS_COLUMN_BY_RELATION = {
+    'iceberg.silver.fotmob_player_season_profile': '_bronze_ingested_at',
+}
 
 
 def evaluate_bronze_xref_freshness_gap(
@@ -1106,12 +1115,12 @@ def evaluate_bronze_xref_freshness_gap(
     warning_lag_hours: float = 24.0,
     error_lag_hours: float = 72.0,
 ) -> Dict[str, Any]:
-    """Compare Bronze player-table freshness against xref_player snapshot age.
+    """Compare player-source freshness against xref_player snapshot age.
 
     Issue #15 regression guard. ``silver.xref_player`` is materialised via a
     full DROP+CREATE+INSERT by :mod:`utils.xref_player_resolver`. If the
     resolver DAG (``dag_transform_xref``) is paused or stalls, recently-ingested
-    Bronze players are silently absent from xref → downstream Gold facts get
+    Source players are silently absent from xref → downstream Gold facts get
     NULL canonical_id and orphan-rate metrics look healthy because the row
     never made it into the table at all (not even as an orphan).
 
@@ -1124,13 +1133,14 @@ def evaluate_bronze_xref_freshness_gap(
 
     Methodology
     -----------
-    For each (source, bronze_table) pair we compute MAX(_ingested_at) per
+    For each (source, relation) pair we compute MAX(the relation's lineage
+    timestamp) per
     season and compare against MAX(committed_at) of the xref table's snapshot
     history. A positive lag means Bronze has data the resolver has not yet
     processed.
 
     Args:
-        bronze_tables: Iterable of (source_label, qualified_bronze_table).
+        bronze_tables: Iterable of (source_label, qualified source relation).
             Defaults to Understat + FotMob; WhoScored excluded because the
             resolver reads players from ``bronze.whoscored_events_current`` which is
             too large to scan freshness-per-season cheaply.
@@ -1175,9 +1185,12 @@ def evaluate_bronze_xref_freshness_gap(
             per_partition: List[Dict[str, Any]] = []
             for source_label, bronze_table in bronze_tables:
                 bronze_qualified = _qualify(bronze_table)
+                ts_column = _FRESHNESS_TS_COLUMN_BY_RELATION.get(
+                    bronze_qualified, '_ingested_at'
+                )
                 cur.execute(
                     "SELECT CAST(season AS varchar) AS season_str, "
-                    "       MAX(_ingested_at) AS bronze_max "
+                    f"       MAX({ts_column}) AS bronze_max "
                     f"FROM {bronze_qualified} "
                     "GROUP BY season"
                 )

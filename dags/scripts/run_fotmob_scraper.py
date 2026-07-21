@@ -3,7 +3,7 @@
 FotMob Scraper Runner Script
 ============================
 
-Standalone script to run the FotMob scraper.
+Standalone runner for source-native FotMob ingestion.
 Called from Airflow via BashOperator to avoid memory issues with PythonOperator.
 
 Pure HTTP — FotMob's public ``/api/data`` endpoints require no browser, no
@@ -19,9 +19,14 @@ import re
 import signal
 import sys
 import tempfile
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator, Mapping
+
+from scrapers.fotmob.source_refresh import (
+    REPLAY_MISSING_INPUT_PROOF_SCHEMA as REPLAY_MISSING_INPUT_SCHEMA,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -29,54 +34,6 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
-
-# Replace-partitions completeness guard (#513 → #583): refuse a save that would
-# shrink a bronze.fotmob_* (league, season) partition below this share of its
-# existing rows, so a partial/failed scrape can't wipe a good partition.
-# COUNT(*) (no replace_guard_key) — each (league, season) is scraped full-state.
-# ReplaceGuardError → exit 3; bypass with --force-replace.
-_MIN_REPLACE_RATIO = 0.9
-REPLACE_GUARD_MARKER = "FOTMOB_REPLACE_GUARD"
-
-
-# (results_key, iceberg_table, read_callable) for every Bronze entity.
-# read_callable signature: (scraper, league, season) -> Optional[DataFrame]
-ENTITIES = [
-    ("schedule", "fotmob_schedule", lambda s, lg, se: s.read_schedule(lg, se)),
-    (
-        "team_stats",
-        "fotmob_team_stats",
-        lambda s, lg, se: s.read_team_season_stats(lg, se),
-    ),
-    (
-        "player_stats",
-        "fotmob_player_stats",
-        lambda s, lg, se: s.read_player_season_stats("goals", lg, se),
-    ),
-    (
-        "team_profile",
-        "fotmob_team_profile",
-        lambda s, lg, se: s.read_team_profile(lg, se),
-    ),
-    ("team_squad", "fotmob_team_squad", lambda s, lg, se: s.read_team_squad(lg, se)),
-    (
-        "team_leaderboards",
-        "fotmob_team_leaderboards",
-        lambda s, lg, se: s.read_team_leaderboards(lg, se),
-    ),
-    ("transfers", "fotmob_transfers", lambda s, lg, se: s.read_transfers(lg, se)),
-    (
-        "match_details",
-        "fotmob_match_details",
-        lambda s, lg, se: s.read_match_details(lg, se),
-    ),
-    (
-        "player_details",
-        "fotmob_player_details",
-        lambda s, lg, se: s.read_player_details(lg, se),
-    ),
-]
-
 
 NATIVE_MODES = ("discover", "daily", "backfill", "replay")
 NATIVE_ENTITIES = frozenset(
@@ -96,6 +53,130 @@ NATIVE_PRIMARY_COUNTS = {
     "competition_completion": "competitions",
     "current_views": "views",
 }
+_MISSING_PLAYER_RAW_ERROR = "no raw-bearing v1/v2 player manifest for offline replay"
+
+PUBLICATION_BINDING_ARGUMENTS = {
+    "schema": "publication_schema",
+    "source": "publication_source",
+    "owner": "publication_owner",
+    "data_interval_start": "publication_data_interval_start",
+    "data_interval_end": "publication_data_interval_end",
+    "runtime_fingerprint": "publication_runtime_fingerprint",
+}
+_ACTIVE_PUBLICATION_GENERATION: str | None = None
+
+
+def _publication_from_args(args) -> dict[str, Any]:
+    """Return the canonical generation identity supplied by the owner DAG."""
+
+    from utils.fotmob_publication import publication_from_payload
+
+    return publication_from_payload(
+        {
+            "generation_id": args.publication_generation_id,
+            "binding": {
+                field: getattr(args, argument)
+                for field, argument in PUBLICATION_BINDING_ARGUMENTS.items()
+            },
+        }
+    )
+
+
+def _attest_native_runtime(args, publication: Mapping[str, Any]) -> dict[str, Any]:
+    """Re-attest mutable bind bytes immediately before the Bronze guard."""
+
+    if (publication.get("binding") or {}).get("owner") == "shared":
+        from utils.fotmob_publication import attest_fotmob_shared_runtime
+
+        return attest_fotmob_shared_runtime(require_scheduled_owner=False)
+    from utils.fotmob_publication import attest_fotmob_isolated_runtime
+
+    scopes = [
+        f"{competition_id}={season}"
+        for competition_id, season in _parse_scopes(args.scope)
+    ]
+    source_refresh = getattr(args, "source_refresh_contract", None)
+    return attest_fotmob_isolated_runtime(
+        require_scheduled_owner=False,
+        allow_kept_paused_writer=True,
+        writer_identity={
+            "component": "bronze_runner",
+            "mode": args.mode,
+            "scopes": scopes,
+            "entities": sorted(_selected_native_entities(args)),
+            "competition_limit": args.competition_limit,
+            "season_limit": args.season_limit,
+            "match_limit": args.match_limit,
+            "team_limit": args.team_limit,
+            "player_limit": args.player_limit,
+            "max_requests": args.max_requests,
+            "max_direct_mib": args.max_direct_mib,
+            "max_proxy_mib": args.max_proxy_mib,
+            "requests_per_minute": args.requests_per_minute,
+            "max_attempts": args.max_attempts,
+            "next_build_id": args.next_build_id,
+            "source_refresh_profile": (
+                source_refresh.get("profile")
+                if isinstance(source_refresh, Mapping)
+                else None
+            ),
+            "source_refresh_targets_sha256": (
+                source_refresh.get("sha256")
+                if isinstance(source_refresh, Mapping)
+                else None
+            ),
+            "source_refresh_target_count": (
+                source_refresh.get("target_count")
+                if isinstance(source_refresh, Mapping)
+                else None
+            ),
+            "publication": dict(publication),
+        },
+    )
+
+
+@contextmanager
+def _native_writer_fence(
+    publication: Mapping[str, Any],
+) -> Iterator[dict[str, Any]]:
+    """Hold and verify the exact active ControlStore writer generation."""
+
+    from scrapers.fbref.control import ControlStore
+    from utils.fotmob_publication import FOTMOB_PUBLICATION_SOURCE
+
+    generation_id = publication["generation_id"]
+    with ControlStore.from_env().guard_publication_writer(
+        generation_id,
+        source=FOTMOB_PUBLICATION_SOURCE,
+    ) as state:
+        violations = []
+        if not isinstance(state, Mapping):
+            violations.append("ControlStore returned no generation state")
+        else:
+            if state.get("generation_id") != generation_id:
+                violations.append("generation_id mismatch")
+            if state.get("source") != FOTMOB_PUBLICATION_SOURCE:
+                violations.append("source mismatch")
+            if state.get("binding") != publication["binding"]:
+                violations.append("binding mismatch")
+            if str(state.get("status") or "").casefold() != "running":
+                violations.append(f"status={state.get('status')!r}")
+            if str(state.get("phase") or "").casefold() != "writing":
+                violations.append(f"phase={state.get('phase')!r}")
+            if not bool(state.get("active")):
+                violations.append("publication lock is inactive")
+        if violations:
+            raise RuntimeError(
+                "FotMob native writer fence rejected run: " + "; ".join(violations)
+            )
+        global _ACTIVE_PUBLICATION_GENERATION
+        if _ACTIVE_PUBLICATION_GENERATION is not None:
+            raise RuntimeError("FotMob native writer fence is already active")
+        _ACTIVE_PUBLICATION_GENERATION = generation_id
+        try:
+            yield dict(state)
+        finally:
+            _ACTIVE_PUBLICATION_GENERATION = None
 
 
 def _write_json_atomic(path: str, payload: dict[str, Any]) -> None:
@@ -151,6 +232,39 @@ def _parse_scopes(values: Iterable[str]) -> tuple[tuple[int, str], ...]:
     return tuple(scopes)
 
 
+def _source_refresh_artifact_path() -> Path:
+    return (
+        Path(__file__).resolve().parents[2]
+        / "configs/fotmob/issue-930-player-source-refresh.json"
+    )
+
+
+def _load_source_refresh_contract(args) -> dict[str, Any] | None:
+    profile = str(getattr(args, "source_refresh_profile", "") or "").strip()
+    supplied_sha = (
+        str(getattr(args, "source_refresh_targets_sha256", "") or "").strip().casefold()
+    )
+    if not profile and not supplied_sha:
+        return None
+    from scrapers.fotmob.source_refresh import (
+        PLAYER_SOURCE_REFRESH_PROFILE,
+        load_player_source_refresh_contract,
+    )
+
+    if profile != PLAYER_SOURCE_REFRESH_PROFILE:
+        raise ValueError("unknown FotMob source-refresh profile")
+    contract = load_player_source_refresh_contract(_source_refresh_artifact_path())
+    if supplied_sha != contract["sha256"]:
+        raise ValueError("source-refresh target SHA differs from reviewed artifact")
+    return contract
+
+
+def _selected_native_entities(args) -> frozenset[str]:
+    if getattr(args, "source_refresh_contract", None) is not None:
+        return frozenset({"players"})
+    return _parse_native_entities(args.entities)
+
+
 def _parse_native_entities(value: str) -> frozenset[str]:
     selected = {
         item.strip().lower() for item in str(value or "").split(",") if item.strip()
@@ -181,6 +295,137 @@ def _outstanding_targets(operation) -> int:
         int(operation.succeeded) + int(operation.skipped) + intentional_not_available
     )
     return max(0, int(operation.attempted) - resolved)
+
+
+def _player_replay_missing_raw_ids(operation) -> tuple[int, ...] | None:
+    """Return typed missing IDs only when they explain the whole operation."""
+
+    raw_ids = operation.metadata.get("missing_raw_player_ids")
+    outcomes = operation.metadata.get("terminal_outcomes")
+    if (
+        not isinstance(raw_ids, list)
+        or not raw_ids
+        or any(type(value) is not int or value <= 0 for value in raw_ids)
+        or raw_ids != sorted(set(raw_ids))
+        or not isinstance(outcomes, list)
+        or len(outcomes) != int(operation.attempted)
+        or operation.retryable
+        or operation.terminal
+        or int(operation.skipped) != 0
+        or int(operation.review_required) != 0
+    ):
+        return None
+    outcome_by_id: dict[int, str] = {}
+    for item in outcomes:
+        if (
+            not isinstance(item, Mapping)
+            or set(item) != {"player_id", "status"}
+            or type(item.get("player_id")) is not int
+            or int(item["player_id"]) <= 0
+            or item["player_id"] in outcome_by_id
+            or item.get("status")
+            not in {"success", "not_available", "missing_raw_input"}
+        ):
+            return None
+        outcome_by_id[int(item["player_id"])] = str(item["status"])
+    missing_ids = tuple(raw_ids)
+    if sorted(
+        player_id
+        for player_id, status in outcome_by_id.items()
+        if status == "missing_raw_input"
+    ) != list(missing_ids):
+        return None
+    status_counts = {status: sum(1 for value in outcome_by_id.values() if value == status)
+                     for status in ("success", "not_available", "missing_raw_input")}
+    if (
+        int(operation.succeeded) != status_counts["success"]
+        or int(operation.not_available) != status_counts["not_available"]
+        or int(operation.metadata.get("intentional_not_available") or 0)
+        != status_counts["not_available"]
+    ):
+        return None
+    expected_errors = sorted(
+        f"player {player_id}: {_MISSING_PLAYER_RAW_ERROR}" for player_id in missing_ids
+    )
+    if sorted(operation.errors) != expected_errors:
+        return None
+    if int(operation.succeeded) + int(operation.not_available) + len(
+        missing_ids
+    ) != int(operation.attempted):
+        return None
+    return missing_ids
+
+
+def _replay_missing_raw_evidence(
+    *,
+    operations: list[Any],
+    work_plan: Any,
+    planned_scopes: list[str],
+    completed_scopes: list[str],
+    gap_entries: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Emit evidence only when missing player raw is the sole replay failure."""
+
+    if not gap_entries:
+        return None
+    gap_scopes = [str(entry["scope"]) for entry in gap_entries]
+    if (
+        len(gap_scopes) != len(set(gap_scopes))
+        or len(planned_scopes) != len(set(planned_scopes))
+        or len(completed_scopes) != len(set(completed_scopes))
+        or set(completed_scopes).intersection(gap_scopes)
+        or set(completed_scopes).union(gap_scopes) != set(planned_scopes)
+        or len(completed_scopes) + len(gap_scopes) != len(planned_scopes)
+        or int(work_plan.attempted) != len(planned_scopes)
+        or int(work_plan.succeeded) != len(completed_scopes)
+        or int(work_plan.skipped) != 0
+        or work_plan.errors
+        or work_plan.terminal
+        or work_plan.retryable
+        != [str(entry["work_plan_retryable"]) for entry in gap_entries]
+        or work_plan.metadata.get("incomplete_scopes")
+        != [
+            {"scope": entry["scope"], "outstanding": entry["outstanding"]}
+            for entry in gap_entries
+        ]
+    ):
+        return None
+
+    allowed_failures = {id(work_plan)}
+    missing_player_ids: set[int] = set()
+    for entry in gap_entries:
+        operation = entry["player_operation"]
+        typed_ids = _player_replay_missing_raw_ids(operation)
+        if typed_ids is None or list(typed_ids) != entry["missing_player_ids"]:
+            return None
+        allowed_failures.add(id(operation))
+        missing_player_ids.update(typed_ids)
+    if any(
+        not operation.ok and id(operation) not in allowed_failures
+        for operation in operations
+    ):
+        return None
+    return {
+        "schema": REPLAY_MISSING_INPUT_SCHEMA,
+        "failure_class": "missing_player_raw_inputs_only",
+        "missing_player_ids": sorted(missing_player_ids),
+        "affected_scopes": sorted(gap_scopes),
+    }
+
+
+def _scope_is_historical(source_season_key: str, *, reference_year: int) -> bool:
+    """Identify a source season that ended before the run's UTC year.
+
+    FotMob can keep an old season selected for a discontinued competition, so
+    ``is_latest`` alone is not proof that its globally addressed teams still
+    exist. Unknown season formats stay fail-closed.
+    """
+
+    years = [
+        int(value)
+        for value in re.findall(r"(?<!\d)(?:19|20)\d{2}(?!\d)", str(source_season_key))
+    ]
+    return bool(years) and max(years) < int(reference_year)
 
 
 def _identity_hash(values: Iterable[Any]) -> str:
@@ -224,6 +469,14 @@ def _native_output_payload(report) -> dict[str, Any]:
 _ACTIVE_NATIVE_SERVICE = None
 
 
+def _deactivate_native_service(service=None) -> None:
+    """Clear the signal/salvage handle without clobbering a newer run."""
+
+    global _ACTIVE_NATIVE_SERVICE
+    if service is None or _ACTIVE_NATIVE_SERVICE is service:
+        _ACTIVE_NATIVE_SERVICE = None
+
+
 def _salvage_flush() -> None:
     """Best-effort durability for buffered commits on an abnormal exit."""
 
@@ -239,7 +492,7 @@ def _salvage_flush() -> None:
 
 
 def _build_native_service(args, run_id: str):
-    """Construct production dependencies lazily; legacy unit tests stay isolated."""
+    """Construct production dependencies lazily for fast CLI/unit imports."""
 
     from scrapers.fotmob.planner import RunMode, TransportBudget
     from scrapers.fotmob.raw_store import FotMobRawStore
@@ -262,6 +515,9 @@ def _build_native_service(args, run_id: str):
     transport = FotMobTransport(
         raw_store=raw_store,
         max_attempts=args.max_attempts,
+        # systemd sends KILL 30s after TERM.  A worker already inside requests
+        # must return early enough for buffer reconciliation/reporting.
+        timeout=(5.0, 20.0),
         rate_limiter=limiter,
     )
     repository = FotMobRepository(
@@ -289,6 +545,14 @@ def _build_native_service(args, run_id: str):
 def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, Any]]:
     """Run source-native discovery and a deterministic, budgeted work plan."""
 
+    if _ACTIVE_PUBLICATION_GENERATION != getattr(
+        args, "publication_generation_id", None
+    ):
+        raise RuntimeError(
+            "FotMob native service construction requires its exact active "
+            "publication writer guard"
+        )
+
     from scrapers.fotmob.planner import (
         MANDATORY_COMPETITION_IDS,
         RunMode,
@@ -302,6 +566,8 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
     run_id = args.run_id or (f"fotmob-{datetime.now(timezone.utc):%Y%m%dT%H%M%S.%fZ}")
     if service is None:
         service, raw_store = _build_native_service(args, run_id)
+    global _ACTIVE_NATIVE_SERVICE
+    _ACTIVE_NATIVE_SERVICE = service
     operations = []
 
     def finish() -> tuple[int, dict[str, Any]]:
@@ -314,9 +580,7 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
             flush_operation.tables.extend(service.repository.flush())
             flush_operation.succeeded = 1
         except Exception as exc:
-            flush_operation.errors.append(
-                f"commit flush: {type(exc).__name__}: {exc}"
-            )
+            flush_operation.errors.append(f"commit flush: {type(exc).__name__}: {exc}")
         operations.append(flush_operation)
 
         view_operation = OperationResult("current_views", attempted=1)
@@ -331,11 +595,116 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
             )
         operations.append(view_operation)
         report = service.report(operations, started_at)
-        return (0 if report.ok else 1), _native_output_payload(report)
+        payload = _native_output_payload(report)
+        _deactivate_native_service(service)
+        return (0 if report.ok else 1), payload
+
+    source_refresh = getattr(args, "source_refresh_contract", None)
+    if isinstance(source_refresh, Mapping):
+        player_operation = service.sync_player_snapshots(
+            source_refresh["player_ids"],
+            # A task retry may follow partial durable commits. Force the same
+            # immutable seven identities to be observed again so retries stay
+            # idempotent instead of turning fresh successes into skips.
+            force_refresh=True,
+            capture_terminal_outcomes=True,
+        )
+        operations.append(player_operation)
+
+        raw_outcomes = player_operation.metadata.get("terminal_outcomes")
+        valid_outcome_shape = (
+            isinstance(raw_outcomes, list)
+            and len(raw_outcomes) == source_refresh["target_count"]
+            and all(
+                isinstance(item, Mapping)
+                and set(item) == {"player_id", "status"}
+                and type(item.get("player_id")) is int
+                and isinstance(item.get("status"), str)
+                for item in raw_outcomes
+            )
+        )
+        outcome_by_player = (
+            {int(item["player_id"]): str(item["status"]) for item in raw_outcomes}
+            if valid_outcome_shape
+            else {}
+        )
+        target_outcomes = [
+            {
+                **target,
+                "status": outcome_by_player.get(target["player_id"], "missing"),
+            }
+            for target in source_refresh["targets"]
+        ]
+        profile_validation = OperationResult(
+            "player_source_refresh_contract",
+            attempted=source_refresh["target_count"],
+            metadata={
+                "profile": source_refresh["profile"],
+                "targets_sha256": source_refresh["sha256"],
+                "target_outcomes": target_outcomes,
+            },
+        )
+        accepted = {"success", "not_available"}
+        intentional_not_available = int(
+            player_operation.metadata.get("intentional_not_available") or 0
+        )
+        reported_not_available = sum(
+            item["status"] == "not_available" for item in target_outcomes
+        )
+        if (
+            not valid_outcome_shape
+            or player_operation.attempted != source_refresh["target_count"]
+            or len(outcome_by_player) != source_refresh["target_count"]
+            or set(outcome_by_player) != set(source_refresh["player_ids"])
+            or any(item["status"] not in accepted for item in target_outcomes)
+            or player_operation.skipped != 0
+            or player_operation.not_available != reported_not_available
+            or intentional_not_available != reported_not_available
+        ):
+            profile_validation.errors.append(
+                "source refresh did not produce exactly seven terminal outcomes"
+            )
+        else:
+            profile_validation.succeeded = source_refresh["target_count"]
+            profile_validation.counts["terminal_targets"] = source_refresh[
+                "target_count"
+            ]
+        operations.append(profile_validation)
+
+        rc, payload = finish()
+        payload["selection"] = {
+            "profile": source_refresh["profile"],
+            "entities": ["players"],
+            "explicit_scopes": [],
+            "competition_limit": 0,
+            "season_limit": 0,
+            "scope_plan_signature": source_refresh["plan_signature"],
+            "planned_scopes": [],
+            "completed_scopes": [],
+            "completed_transfer_competition_ids": [],
+            "requests_per_minute": args.requests_per_minute,
+            "source_refresh": {
+                key: source_refresh[key]
+                for key in (
+                    "profile",
+                    "artifact",
+                    "sha256",
+                    "target_count",
+                    "targets",
+                    "plan_signature",
+                )
+            },
+            "target_outcomes": target_outcomes,
+        }
+        return rc, payload
 
     explicit_scopes = _parse_scopes(args.scope)
     explicit_ids = {competition_id for competition_id, _ in explicit_scopes}
-    entities = _parse_native_entities(args.entities)
+    daily_competition_ids = {
+        int(value) for value in getattr(args, "daily_competition_ids", ())
+    }
+    requested_competition_ids = explicit_ids | daily_competition_ids
+    entities = _selected_native_entities(args)
 
     catalog = service.discover_catalog()
     operations.append(catalog.operation)
@@ -346,14 +715,14 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
     classifications = list(catalog.classifications)
     catalog_ids = {item.competition.competition_id for item in classifications}
     scope_validation = OperationResult("scope_validation")
-    unknown_ids = sorted(explicit_ids - catalog_ids)
+    unknown_ids = sorted(requested_competition_ids - catalog_ids)
     if unknown_ids:
         scope_validation.errors.append(
             "requested competition IDs are absent from allLeagues: "
             + ",".join(map(str, unknown_ids))
         )
     by_id = {item.competition.competition_id: item for item in classifications}
-    for competition_id in sorted(explicit_ids & catalog_ids):
+    for competition_id in sorted(requested_competition_ids & catalog_ids):
         classification = by_id[competition_id]
         if classification.decision.value != "included":
             scope_validation.errors.append(
@@ -368,6 +737,10 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         for item in classifications
         if (
             (not explicit_ids or item.competition.competition_id in explicit_ids)
+            and (
+                not daily_competition_ids
+                or item.competition.competition_id in daily_competition_ids
+            )
             and item.decision.value == "included"
         )
     ]
@@ -377,6 +750,7 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
             item.competition.competition_id,
         )
     )
+    all_candidates = list(candidates)
     discovery_plan = OperationResult("competition_discovery_plan")
     if args.competition_limit:
         deferred = candidates[args.competition_limit :]
@@ -437,7 +811,8 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
     previously_complete: set[tuple[int, str]] = set()
     if mode == RunMode.BACKFILL:
         previously_complete = service.repository.completed_scope_keys(
-            scope_plan_signature
+            scope_plan_signature,
+            run_id=service.run_id,
         )
     elif mode == RunMode.REPLAY:
         for season in seasons:
@@ -484,6 +859,17 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         work_plan.errors.append(
             f"{mode.value} discovered no eligible exact season targets"
         )
+    if mode == RunMode.DAILY and daily_competition_ids:
+        planned_competition_ids = {item.competition_id for item in work}
+        missing_current_ids = sorted(daily_competition_ids - planned_competition_ids)
+        if missing_current_ids:
+            work_plan.errors.append(
+                "daily cohort has no selected/latest season for competition IDs: "
+                + ",".join(map(str, missing_current_ids))
+            )
+    planned_scopes = [
+        f"{item.competition_id}={item.source_season_key}" for item in work
+    ]
     if args.season_limit:
         deferred = work[args.season_limit :]
         work = work[: args.season_limit]
@@ -493,6 +879,8 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         ]
     work_plan.counts["planned_scopes"] = len(work)
     operations.append(work_plan)
+    completed_scopes: list[str] = []
+    replay_gap_entries: list[dict[str, Any]] = []
 
     # Complete one exact scope end-to-end before starting the next.  This is
     # the fairness boundary that prevents a season-first pass from consuming
@@ -532,13 +920,31 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                 team_operation, player_ids = service.sync_team_snapshots(
                     bundle,
                     limit=min(per_run_limit, capacity),
+                    # A team advertised only by a historical season can have
+                    # a deliberately removed global endpoint. Resolve that
+                    # absence without tombstoning a last-good global snapshot;
+                    # current or unparseable latest seasons remain fail-closed.
+                    allow_advertised_absence=(
+                        not item.is_latest
+                        or _scope_is_historical(
+                            item.source_season_key,
+                            reference_year=started_at.year,
+                        )
+                    ),
                 )
                 operations.append(team_operation)
                 scope_operations.append(team_operation)
 
             if "players" in entities:
-                capacity = service.ledger.remaining_requests // max_attempts
-                build_reserve = 0 if args.next_build_id else max_attempts
+                if mode == RunMode.REPLAY:
+                    # Raw replay performs no HTTP attempts and resolves each
+                    # rotating Next.js target from its durable manifest.  A
+                    # network request budget must not truncate a large squad.
+                    capacity = len(player_ids)
+                    build_reserve = 0
+                else:
+                    capacity = service.ledger.remaining_requests // max_attempts
+                    build_reserve = 0 if args.next_build_id else max_attempts
                 per_run_limit = args.player_limit or len(player_ids)
                 player_operation = service.sync_player_snapshots(
                     player_ids,
@@ -625,18 +1031,49 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                 completion.succeeded = 1
                 completion.counts["scopes"] = 1
                 work_plan.succeeded += 1
+                completed_scopes.append(scope_key)
             except Exception as exc:
                 completion.errors.append(
                     f"scope {scope_key}: {type(exc).__name__}: {exc}"
                 )
             operations.append(completion)
         else:
-            work_plan.retryable.append(
+            work_plan_retryable = (
                 f"scope {scope_key} incomplete; outstanding={outstanding}"
             )
+            work_plan.retryable.append(work_plan_retryable)
             work_plan.metadata.setdefault("incomplete_scopes", []).append(
                 {"scope": scope_key, "outstanding": outstanding}
             )
+            player_operations = [
+                operation
+                for operation in scope_operations
+                if operation.entity == "player_snapshots"
+            ]
+            missing_player_ids = (
+                _player_replay_missing_raw_ids(player_operations[0])
+                if mode == RunMode.REPLAY and len(player_operations) == 1
+                else None
+            )
+            other_operations = [
+                operation
+                for operation in scope_operations
+                if not player_operations or operation is not player_operations[0]
+            ]
+            if (
+                missing_player_ids is not None
+                and all(operation.ok for operation in other_operations)
+                and outstanding == {"player_snapshots": len(missing_player_ids)}
+            ):
+                replay_gap_entries.append(
+                    {
+                        "scope": scope_key,
+                        "outstanding": outstanding,
+                        "work_plan_retryable": work_plan_retryable,
+                        "player_operation": player_operations[0],
+                        "missing_player_ids": list(missing_player_ids),
+                    }
+                )
 
         if (
             not scope_ok
@@ -664,7 +1101,8 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         transfer_completion_times = {}
         if mode == RunMode.BACKFILL:
             completed_transfer_ids = service.repository.completed_competition_ids(
-                transfer_signature
+                transfer_signature,
+                run_id=service.run_id,
             )
         elif mode == RunMode.DAILY:
             transfer_completion_times = service.repository.competition_completion_times(
@@ -672,7 +1110,7 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
             )
         competition_ids = [
             item.competition.competition_id
-            for item in candidates
+            for item in all_candidates
             if item.competition.competition_id not in completed_transfer_ids
         ]
         if mode == RunMode.DAILY:
@@ -682,6 +1120,11 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                     competition_id,
                 )
             )
+        if args.competition_limit:
+            deferred_by_limit = competition_ids[args.competition_limit :]
+            competition_ids = competition_ids[: args.competition_limit]
+        else:
+            deferred_by_limit = []
         transfer_plan = OperationResult(
             "transfer_work_plan",
             attempted=len(competition_ids),
@@ -690,9 +1133,12 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                 "window": transfer_window,
                 "already_complete_competitions": len(completed_transfer_ids),
                 "daily_completion_timestamps": len(transfer_completion_times),
+                "limit_deferred_competition_ids": deferred_by_limit,
             },
         )
+        transfer_plan.skipped = len(deferred_by_limit)
         operations.append(transfer_plan)
+        completed_transfer_competition_ids: list[int] = []
         for index, competition_id in enumerate(competition_ids):
             capacity = service.ledger.remaining_requests // max_attempts
             max_pages = min(args.transfer_max_pages, capacity)
@@ -742,6 +1188,7 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                     completion.succeeded = 1
                     completion.counts["competitions"] = 1
                     transfer_plan.succeeded += 1
+                    completed_transfer_competition_ids.append(competition_id)
                 except Exception as exc:
                     completion.errors.append(
                         f"competition {competition_id}: {type(exc).__name__}: {exc}"
@@ -751,8 +1198,21 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                 transfer_plan.retryable.append(
                     f"competition {competition_id} transfer stream incomplete"
                 )
+    else:
+        completed_transfer_competition_ids = []
 
     rc, payload = finish()
+    replay_missing_inputs = (
+        _replay_missing_raw_evidence(
+            operations=operations,
+            work_plan=work_plan,
+            planned_scopes=planned_scopes,
+            completed_scopes=completed_scopes,
+            gap_entries=replay_gap_entries,
+        )
+        if mode == RunMode.REPLAY
+        else None
+    )
     payload["selection"] = {
         "entities": sorted(entities),
         "explicit_scopes": [
@@ -761,146 +1221,75 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         "competition_limit": args.competition_limit,
         "season_limit": args.season_limit,
         "scope_plan_signature": scope_plan_signature,
+        "planned_scopes": planned_scopes,
+        "completed_scopes": completed_scopes,
+        "completed_transfer_competition_ids": (completed_transfer_competition_ids),
+        "requests_per_minute": args.requests_per_minute,
     }
+    if replay_missing_inputs is not None:
+        payload["selection"]["replay_missing_player_inputs"] = replay_missing_inputs
+    daily_contract = getattr(args, "daily_competition_contract", None)
+    if daily_contract:
+        payload["selection"]["daily_contract"] = daily_contract["schema"]
+        payload["selection"]["competition_scope"] = daily_contract
     return rc, payload
 
 
-def _run_legacy(args) -> tuple[int, dict[str, Any]]:
-    leagues = [league.strip() for league in args.leagues.split(",")]
-    selected = {e.strip() for e in args.entities.split(",") if e.strip()}
-    entities = [e for e in ENTITIES if not selected or e[0] in selected]
-
-    # #920 bridge (generalized Phase 3: any single_year tournament):
-    # tournaments must never inherit the club-formula season (July 2026 ->
-    # 2025): FotMob answers a season='2025' WC request with CURRENT
-    # tournament data, silently mislabelling the partition. Mixed calls
-    # can't carry two seasons -> tournaments are dropped (dedicated call),
-    # mirroring run_whoscored_scraper / run_fbref_scraper.
-    from utils.medallion_config import (
-        get_active_season,
-        is_single_year_competition,
-    )
-
-    _tournaments = [league for league in leagues if is_single_year_competition(league)]
-    if _tournaments and len(leagues) > 1:
-        logger.warning(
-            f"Single-year tournaments {_tournaments} dropped from mixed call "
-            f"(each needs its own season; leagues={leagues}). Scrape them "
-            f"with dedicated --leagues calls."
-        )
-        leagues = [league for league in leagues if league not in _tournaments]
-        if not leagues:
-            logger.warning("No leagues left after dropping tournaments; exiting 0.")
-            payload = {
-                "tables": [],
-                "rows": {},
-                "errors": [],
-                "skipped": "mixed_tournaments_dropped",
-            }
-            return 0, payload
-    elif _tournaments:
-        _t_league = leagues[0]
-        _t_season = get_active_season(_t_league)
-        if _t_season is None:
-            logger.warning(
-                f"{_t_league} is out of its tournament window — nothing to "
-                "scrape; exiting 0."
-            )
-            payload = {
-                "tables": [],
-                "rows": {},
-                "errors": [],
-                "skipped": "out_of_window",
-            }
-            return 0, payload
-        elif int(args.season) != int(_t_season):
-            logger.info(
-                f"{_t_league}: overriding --season {args.season} -> "
-                f"{_t_season} (active single_year season, #920 bridge)."
-            )
-            args.season = _t_season
-
-    logger.info(f"Starting FotMob scraper: leagues={leagues}, season={args.season}")
-    logger.info(f"Entities: {[e[0] for e in entities]}")
-
-    results = {
-        "tables": [],
-        "rows": {},
-        "errors": [],
-    }
-    guard_refused = False
-
-    try:
-        from scrapers.base.base_scraper import ReplaceGuardError
-        from scrapers.fotmob import FotMobScraper
-
-        with FotMobScraper(
-            leagues=leagues, seasons=[args.season], full_players=args.full_players
-        ) as scraper:
-            for key, table_name, read_fn in entities:
-                row_count = 0
-                for league in leagues:
-                    try:
-                        df = read_fn(scraper, league, args.season)
-                        if df is not None and not df.empty:
-                            table_path = scraper.save_to_iceberg(
-                                df=df,
-                                table_name=table_name,
-                                partition_cols=["league", "season"],
-                                replace_partitions=["league", "season"],
-                                min_replace_ratio=(
-                                    None if args.force_replace else _MIN_REPLACE_RATIO
-                                ),
-                            )
-                            results["tables"].append(table_path)
-                            row_count += len(df)
-                            logger.info(f"Saved {len(df)} {key} rows for {league}")
-                    except ReplaceGuardError as e:
-                        # Guard refused this (entity, league) save — a partial
-                        # scrape would shrink the partition. Record + continue
-                        # other entities/leagues; exit 3 at the end (#583).
-                        msg = f"{REPLACE_GUARD_MARKER}: {key}/{league}: {e}"
-                        logger.error(msg)
-                        results["errors"].append(msg)
-                        guard_refused = True
-                    except Exception as e:
-                        error_msg = f"{key} scraping for {league} failed: {e}"
-                        logger.error(error_msg)
-                        results["errors"].append(error_msg)
-                results["rows"][key] = row_count
-                # Legacy flat keys (kept for backward-compatible consumers)
-                results[f"{key}_rows"] = row_count
-
-    except Exception as e:
-        logger.error(f"Scraper failed: {e}", exc_info=True)
-        results["errors"].append(str(e))
-        return 1, results
-
-    total_rows = sum(results["rows"].values())
-    logger.info(
-        f"Scraper complete: {total_rows} total rows across "
-        f"{len(results['rows'])} entities"
-    )
-    print(json.dumps(results))
-    # Exit 3 when the completeness guard refused any save (distinct from the
-    # exit-0 path) so an operator can spot a refused guard in the BashOperator.
-    return (3 if guard_refused else 0), results
-
-
 def _argument_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run FotMob scraper")
+    parser = argparse.ArgumentParser(
+        description="Run source-native FotMob ingestion",
+        allow_abbrev=False,
+    )
     parser.add_argument(
         "--mode",
         choices=NATIVE_MODES,
-        help="Enable source-native discovery/ingestion. Omit for legacy mode.",
+        required=True,
+        help="Source-native discovery/ingestion mode",
     )
-    parser.add_argument("--run-id", default="", help="Stable external run id")
+    parser.add_argument(
+        "--publication-generation-id",
+        default="",
+        help="Exact ControlStore publication generation UUID",
+    )
+    parser.add_argument("--publication-schema", default="")
+    parser.add_argument("--publication-source", default="")
+    parser.add_argument("--publication-owner", default="")
+    parser.add_argument("--publication-data-interval-start", default="")
+    parser.add_argument("--publication-data-interval-end", default="")
+    parser.add_argument("--publication-runtime-fingerprint", default="")
+    parser.add_argument(
+        "--run-id",
+        default="",
+        help="Must be absent or exactly equal the publication generation UUID",
+    )
     parser.add_argument(
         "--scope",
         action="append",
         default=[],
         metavar="ID=SEASON",
         help="Exact native scope; repeat or comma-separate (e.g. 47=2025/2026)",
+    )
+    parser.add_argument(
+        "--daily-contract",
+        default="",
+        help="Exact admitted daily workload contract schema",
+    )
+    parser.add_argument(
+        "--competition-scope-file",
+        default="",
+        help="Immutable #930 scope artifact used to derive daily competition IDs",
+    )
+    parser.add_argument("--competition-scope-sha256", default="")
+    parser.add_argument("--competition-ids-sha256", default="")
+    parser.add_argument(
+        "--source-refresh-profile",
+        default="",
+        help="Reviewed bounded player source-refresh profile",
+    )
+    parser.add_argument(
+        "--source-refresh-targets-sha256",
+        default="",
+        help="Exact SHA-256 of the reviewed source-refresh target artifact",
     )
     parser.add_argument(
         "--raw-store-uri",
@@ -941,21 +1330,12 @@ def _argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--next-build-id",
         default="",
-        help="Optional exact FotMob Next build id (required for offline player replay)",
+        help=(
+            "Optional exact FotMob Next build id override; offline replay "
+            "normally resolves each player's historical raw target from manifests"
+        ),
     )
     parser.add_argument("--transfer-max-pages", type=int, default=250)
-    parser.add_argument(
-        "--leagues",
-        type=str,
-        default="ENG-Premier League",
-        help="Legacy mode: comma-separated list of leagues",
-    )
-    parser.add_argument(
-        "--season",
-        type=int,
-        default=2025,
-        help="Legacy mode: season start year",
-    )
     parser.add_argument(
         "--output",
         type=str,
@@ -966,28 +1346,19 @@ def _argument_parser() -> argparse.ArgumentParser:
         "--entities",
         type=str,
         default="",
-        help="Comma-separated entity subset (mode-specific)",
-    )
-    parser.add_argument(
-        "--force-replace",
-        action="store_true",
-        help="Legacy mode: bypass the replace completeness guard",
-    )
-    parser.add_argument(
-        "--full-players",
-        action="store_true",
-        help="Legacy mode: refresh all player details",
+        help="Comma-separated source-native entity subset",
     )
     return parser
 
 
-def _validate_args(parser: argparse.ArgumentParser, args) -> None:
+def _validate_args(parser: argparse.ArgumentParser, args) -> dict[str, Any]:
     positive = {
         "--max-requests": args.max_requests,
         "--max-direct-mib": args.max_direct_mib,
         "--requests-per-minute": args.requests_per_minute,
         "--max-attempts": args.max_attempts,
         "--workers": args.workers,
+        "--commit-batch-size": args.commit_batch_size,
         "--transfer-max-pages": args.transfer_max_pages,
         "--max-buffered-rows": args.max_buffered_rows,
     }
@@ -1010,6 +1381,120 @@ def _validate_args(parser: argparse.ArgumentParser, args) -> None:
         parser.error("--next-build-id contains unsupported characters")
     if args.workers > 16:
         parser.error("--workers must be <= 16")
+    try:
+        source_refresh = _load_source_refresh_contract(args)
+    except ValueError as exc:
+        parser.error(f"invalid FotMob source-refresh profile: {exc}")
+    if source_refresh is not None:
+        from scrapers.fotmob.source_refresh import (
+            PLAYER_SOURCE_REFRESH_MAX_DIRECT_MIB,
+            PLAYER_SOURCE_REFRESH_MAX_REQUESTS,
+        )
+
+        literal_entities = frozenset(
+            item.strip().casefold()
+            for item in str(args.entities or "").split(",")
+            if item.strip()
+        )
+        violations = []
+        if args.mode != "backfill":
+            violations.append("mode must be backfill")
+        if _parse_scopes(args.scope):
+            violations.append("exact season scope must be empty")
+        if literal_entities != frozenset({"players"}):
+            violations.append("entities must be exactly players")
+        if any(
+            value != 0
+            for value in (
+                args.competition_limit,
+                args.season_limit,
+                args.match_limit,
+                args.team_limit,
+                args.player_limit,
+            )
+        ):
+            violations.append("all planner limits must be zero")
+        if args.next_build_id:
+            violations.append("Next build override must be empty")
+        if args.max_requests != PLAYER_SOURCE_REFRESH_MAX_REQUESTS:
+            violations.append("request budget")
+        if args.max_direct_mib != PLAYER_SOURCE_REFRESH_MAX_DIRECT_MIB:
+            violations.append("direct-byte budget")
+        if args.max_attempts != 4:
+            violations.append("max attempts")
+        if args.requests_per_minute != 30:
+            violations.append("request rate")
+        if violations:
+            parser.error(
+                "invalid FotMob source-refresh execution: " + ", ".join(violations)
+            )
+    args.source_refresh_contract = source_refresh
+    daily_contract_fields = (
+        args.daily_contract,
+        args.competition_scope_file,
+        args.competition_scope_sha256,
+        args.competition_ids_sha256,
+    )
+    if args.mode == "daily":
+        from utils.fotmob_publication import (
+            FOTMOB_DAILY_COMPETITION_IDS_SHA256,
+            FOTMOB_DAILY_CONTRACT_SCHEMA,
+            FOTMOB_DAILY_ENTITIES,
+            FOTMOB_DAILY_MAX_DIRECT_MIB,
+            FOTMOB_DAILY_MAX_REQUESTS,
+            FOTMOB_DAILY_REQUESTS_PER_MINUTE,
+            FOTMOB_DAILY_SCOPE_FILE,
+            FOTMOB_DAILY_SCOPE_SHA256,
+            load_fotmob_daily_competition_contract,
+        )
+
+        violations = []
+        if args.daily_contract != FOTMOB_DAILY_CONTRACT_SCHEMA:
+            violations.append("daily contract schema")
+        if args.competition_scope_file != FOTMOB_DAILY_SCOPE_FILE:
+            violations.append("daily scope path")
+        if args.competition_scope_sha256 != FOTMOB_DAILY_SCOPE_SHA256:
+            violations.append("daily scope SHA")
+        if args.competition_ids_sha256 != FOTMOB_DAILY_COMPETITION_IDS_SHA256:
+            violations.append("daily competition ID SHA")
+        if _parse_scopes(args.scope):
+            violations.append("daily exact season scope must be empty")
+        if _parse_native_entities(args.entities) != frozenset(FOTMOB_DAILY_ENTITIES):
+            violations.append("daily entities")
+        if args.max_requests != FOTMOB_DAILY_MAX_REQUESTS:
+            violations.append("daily request budget")
+        if args.max_direct_mib != FOTMOB_DAILY_MAX_DIRECT_MIB:
+            violations.append("daily direct-byte budget")
+        if args.requests_per_minute != FOTMOB_DAILY_REQUESTS_PER_MINUTE:
+            violations.append("daily request rate")
+        if args.competition_limit != 0 or args.season_limit != 0:
+            violations.append("daily planner limits")
+        if violations:
+            parser.error(
+                "invalid FotMob production daily profile: " + ", ".join(violations)
+            )
+        try:
+            contract = load_fotmob_daily_competition_contract(
+                args.competition_scope_file,
+                scope_sha256=args.competition_scope_sha256,
+                competition_ids_sha256=args.competition_ids_sha256,
+            )
+        except ValueError as exc:
+            parser.error(f"invalid FotMob production daily scope: {exc}")
+        args.daily_competition_contract = contract
+        args.daily_competition_ids = tuple(contract["competition_ids"])
+    else:
+        if any(daily_contract_fields):
+            parser.error("daily competition contract is valid only in daily mode")
+        args.daily_competition_contract = None
+        args.daily_competition_ids = ()
+    try:
+        publication = _publication_from_args(args)
+    except Exception as exc:
+        parser.error(f"invalid FotMob publication: {exc}")
+    if args.run_id and args.run_id != publication["generation_id"]:
+        parser.error("--run-id must exactly equal --publication-generation-id")
+    return publication
 
 
 def _sigterm_to_exception(signum, frame):
@@ -1017,51 +1502,76 @@ def _sigterm_to_exception(signum, frame):
     routes shutdown through main()'s failure path: salvage flush + a real
     report instead of a silent NO_REPORT kill."""
 
+    service = _ACTIVE_NATIVE_SERVICE
+    if service is not None:
+        cancel = getattr(service, "cancel", None)
+        if cancel is not None:
+            cancel()
     raise RuntimeError(f"terminated by signal {signum}")
 
 
+def _failure_payload(args, exc: Exception) -> dict[str, Any]:
+    return {
+        "run_id": args.run_id,
+        "mode": args.mode,
+        "status": "incomplete",
+        "complete": False,
+        "tables": [],
+        "rows": {},
+        "errors": [f"{type(exc).__name__}: {exc}"],
+    }
+
+
+def _run_native_under_fence(
+    args,
+    publication: Mapping[str, Any],
+) -> tuple[int, dict[str, Any]]:
+    """Run ingestion and every salvage write inside the active DB guard."""
+
+    _attest_native_runtime(args, publication)
+    with _native_writer_fence(publication):
+        try:
+            try:
+                return _run_native(args)
+            except (ValueError, RuntimeError) as exc:
+                logger.error("FotMob runner configuration/runtime failure: %s", exc)
+                _salvage_flush()
+                return 1, _failure_payload(args, exc)
+            except Exception as exc:
+                logger.exception("Unexpected FotMob runner failure")
+                _salvage_flush()
+                return 1, _failure_payload(args, exc)
+        finally:
+            # Every normal and salvage write has finished, but the DB guard is
+            # still held. Drift here turns the run red before publication can
+            # leave the writing phase.
+            _attest_native_runtime(args, publication)
+
+
 def main():
+    # ``main`` is normally one-shot, but tests and embedded invocations can
+    # call it repeatedly in one interpreter. A late TERM must never cancel a
+    # completed prior run.
+    _deactivate_native_service()
     parser = _argument_parser()
     args = parser.parse_args()
-    _validate_args(parser, args)
-    run_id = args.run_id or (f"fotmob-{datetime.now(timezone.utc):%Y%m%dT%H%M%S.%fZ}")
-    output = args.output or f"/tmp/fotmob_result_{_safe_run_id(run_id)}.json"
-    args.run_id = run_id
+    publication = _validate_args(parser, args)
+    args.publication_generation_id = publication["generation_id"]
+    args.run_id = publication["generation_id"]
+    output = args.output or f"/tmp/fotmob_result_{_safe_run_id(args.run_id)}.json"
     try:
         signal.signal(signal.SIGTERM, _sigterm_to_exception)
     except ValueError:
         pass  # not in the main thread (unit-test harness) — keep default
     try:
-        if args.mode:
-            rc, payload = _run_native(args)
-        else:
-            rc, payload = _run_legacy(args)
-    except (ValueError, RuntimeError) as exc:
-        logger.error("FotMob runner configuration/runtime failure: %s", exc)
-        _salvage_flush()
-        payload = {
-            "run_id": run_id,
-            "mode": args.mode or "legacy",
-            "status": "incomplete",
-            "complete": False,
-            "tables": [],
-            "rows": {},
-            "errors": [f"{type(exc).__name__}: {exc}"],
-        }
-        rc = 1
+        rc, payload = _run_native_under_fence(args, publication)
     except Exception as exc:
-        logger.exception("Unexpected FotMob runner failure")
-        _salvage_flush()
-        payload = {
-            "run_id": run_id,
-            "mode": args.mode or "legacy",
-            "status": "incomplete",
-            "complete": False,
-            "tables": [],
-            "rows": {},
-            "errors": [f"{type(exc).__name__}: {exc}"],
-        }
+        # Guard acquisition/validation failed before the service was built.
+        # Do not salvage-flush here: there is no publication authority.
+        logger.error("FotMob native writer fence failed: %s", exc)
+        payload = _failure_payload(args, exc)
         rc = 1
+    _deactivate_native_service()
     _write_json_atomic(output, payload)
     logger.info("FotMob report: %s", output)
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True))

@@ -20,9 +20,9 @@ both default 7d) with `INVALID_PROCEDURE_ARGUMENT`. The daily high-churn DAG
 asks for '3d', so without lowering that minimum every expire silently fails
 and the sweep becomes a no-op. We lower it PER SESSION (`SET SESSION ...`) at
 connection time — scoped to this connection only, no Trino restart, no global
-config change. High-churn tables (e.g. `fotmob_match_details`) also commit
-hundreds of snapshots per run, so the per-session floor must be well under the
-requested threshold.
+config change. Append-only native tables (for example
+`fotmob_ingest_manifest`) also commit many snapshots per run, so the
+per-session floor must be well under the requested threshold.
 
 Uses `_get_trino_connection()` from `silver_tasks` (lightweight `import trino`,
 avoids heavy `scrapers/__init__.py`).
@@ -129,6 +129,30 @@ WHOSCORED_HIGH_CHURN: Tuple[str, ...] = (
     *WHOSCORED_OPERATIONAL_HIGH_CHURN,
 )
 
+# #930 source-native FotMob is append-only and publishes through manifest-gated
+# current views. Every physical write table therefore accumulates Iceberg files
+# and snapshots even when its logical row count is stable. Keep this exact list
+# aligned with scrapers.fotmob.repository.TABLE_PARTITIONS; views are excluded.
+FOTMOB_NATIVE_HIGH_CHURN: Tuple[str, ...] = (
+    "fotmob_competitions",
+    "fotmob_competition_seasons",
+    "fotmob_competition_season_history",
+    "fotmob_season_stages",
+    "fotmob_matches",
+    "fotmob_standings",
+    "fotmob_leaderboard_categories",
+    "fotmob_leaderboards",
+    "fotmob_match_payloads",
+    "fotmob_team_snapshots",
+    "fotmob_squad_snapshots",
+    "fotmob_player_snapshots",
+    "fotmob_transfer_events",
+    "fotmob_playoff_brackets",
+    "fotmob_season_teams",
+    "fotmob_field_inventory",
+    "fotmob_ingest_manifest",
+)
+
 HIGH_CHURN_BRONZE: Tuple[str, ...] = (
     *WHOSCORED_HIGH_CHURN,
     "fbref_match_events",
@@ -141,8 +165,10 @@ HIGH_CHURN_BRONZE: Tuple[str, ...] = (
     "understat_schedule",
     "understat_team_match_stats",
     "matchhistory_results",  # #307: was matchhistory_games (legacy table dropped)
-    # #266: daily fotmob/sofascore/espn writers were never on the list and
-    # bloated to multi-GB metadata (fotmob_match_details hit 7.2G / 154M data).
+    *FOTMOB_NATIVE_HIGH_CHURN,
+    # Frozen FotMob tables retain old snapshots/orphans during the #930 rollback
+    # window. Remove these only through an explicit legacy drain follow-up;
+    # they are no longer writers and must never be added back to that path.
     "fotmob_match_details",
     "fotmob_player_details",
     "fotmob_player_stats",
