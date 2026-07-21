@@ -359,6 +359,7 @@ def test_competition_and_edition_bronze_contract_columns_are_exact(snapshot) -> 
         "classification_evidence",
         "registry_snapshot_id",
         "source_body_hash",
+        "raw_capture_id",
         "parser_revision",
         "schema_revision",
     )
@@ -378,6 +379,7 @@ def test_competition_and_edition_bronze_contract_columns_are_exact(snapshot) -> 
         "discovered_at",
         "registry_snapshot_id",
         "source_body_hash",
+        "raw_capture_id",
         "parser_revision",
         "schema_revision",
     )
@@ -424,6 +426,7 @@ def test_participant_table_contract_and_exact_edition_aggregate(pages) -> None:
         "discovered_at",
         "registry_snapshot_id",
         "source_body_hash",
+        "raw_capture_id",
         "parser_revision",
         "schema_revision",
     )
