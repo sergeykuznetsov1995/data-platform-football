@@ -548,6 +548,48 @@ def test_paid_approval_and_pointer_roots_are_scheduler_read_only() -> None:
     assert "WHOSCORED_PAID_ALERT_BINDING_PATH=" not in example
 
 
+def test_fbref_geoip_database_is_a_scheduler_only_protected_input() -> None:
+    compose = _compose()
+    common = compose["x-airflow-common"]
+    services = compose["services"]
+    scheduler = services["airflow-scheduler"]
+    expected_target = "/opt/airflow/secure/fbref-geoip/GeoLite2-City.mmdb"
+
+    assert "PYTHONPATH" not in common["environment"]
+    assert "PYTHONPATH" not in scheduler["environment"]
+    assert scheduler["environment"]["FBREF_CAMOUFOX_GEOIP_DATABASE_PATH"] == (
+        expected_target
+    )
+    mount = _volume_for_target(scheduler, expected_target)
+    assert isinstance(mount, dict)
+    assert mount == {
+        "type": "bind",
+        "source": (
+            "${FBREF_CAMOUFOX_GEOIP_DATABASE_HOST_PATH:?set the protected "
+            "pinned GeoLite database}"
+        ),
+        "target": expected_target,
+        "read_only": True,
+        "bind": {"create_host_path": False},
+    }
+    for service_name, service in services.items():
+        if service_name == "airflow-scheduler":
+            continue
+        environment = service.get("environment") or {}
+        volumes = service.get("volumes") or []
+        assert "FBREF_CAMOUFOX_GEOIP_DATABASE_PATH" not in environment
+        assert all(
+            not isinstance(item, dict) or item.get("target") != expected_target
+            for item in volumes
+        )
+
+    example = (ROOT / ".env.example").read_text(encoding="utf-8")
+    assert (
+        "FBREF_CAMOUFOX_GEOIP_DATABASE_HOST_PATH="
+        "/protected/path/fbref-geoip/GeoLite2-City.mmdb"
+    ) in example
+
+
 def test_proxy_control_plane_is_lease_only_and_secrets_are_not_hardcoded() -> None:
     raw = (ROOT / "compose.yaml").read_text(encoding="utf-8")
     compose = _compose()

@@ -793,6 +793,14 @@ Python startup, symlinked or writable release ancestors, and Docker/Compose
 control variables inherited from the shell. All three environment files, the
 deployment attestation and the admission directory must likewise be root-owned
 and have only root-owned, non-writable ancestors.
+The scheduler's `FBREF_CAMOUFOX_GEOIP_DATABASE_HOST_PATH` is also a mandatory
+protected input. Provision it exactly as documented in
+[`fbref-paid-transport.md`](fbref-paid-transport.md#isolated-browser-runtime):
+the canonical host file must be `root:root`, mode `0444`, one hard link,
+66,164,133 bytes and SHA-256
+`0772278c513e6ab3c65e9ae53d6861f137ab696f91eec763a2e6fe76befd83b2`.
+Admission rejects a missing path, symlink, different byte identity, writable
+mode, or a mount into the image-owned legacy virtualenv.
 Create a new evidence directory and validate ready mode before any service
 lifecycle command:
 

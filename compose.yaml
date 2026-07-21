@@ -741,6 +741,10 @@ services:
       WHOSCORED_PAID_GATEWAY_TOKEN: ${WHOSCORED_PAID_GATEWAY_TOKEN:-}
       WHOSCORED_SCRAPER_PYTHON: /usr/local/bin/python
       LEGACY_SCRAPER_PYTHON: /opt/legacy-scraper-venv/bin/python
+      # Camoufox locale data is an operator-provisioned, content-pinned input.
+      # Keep it outside the image/venv trust roots and never allow the package
+      # to select or download a mutable default database.
+      FBREF_CAMOUFOX_GEOIP_DATABASE_PATH: /opt/airflow/secure/fbref-geoip/GeoLite2-City.mmdb
     # YAML merge keys replace sequences, so repeat the common mounts before
     # appending the scheduler-only, deployment-owned approval directory.
     volumes:
@@ -825,6 +829,12 @@ services:
       - type: bind
         source: ${WHOSCORED_SCHEDULED_PAID_POINTER_HOST_DIR:?set an absolute protected scheduled-pointer directory}
         target: /opt/airflow/secure/whoscored-scheduled-pointers
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${FBREF_CAMOUFOX_GEOIP_DATABASE_HOST_PATH:?set the protected pinned GeoLite database}
+        target: /opt/airflow/secure/fbref-geoip/GeoLite2-City.mmdb
         read_only: true
         bind:
           create_host_path: false

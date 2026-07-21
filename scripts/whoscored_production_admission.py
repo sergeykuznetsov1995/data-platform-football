@@ -162,6 +162,13 @@ EXIT_CONFIG = 78
 MAX_JSON_BYTES = 16 * 1024 * 1024
 MAX_PROVIDER_QUOTA_RECEIPT_BYTES = 32 * 1024
 MAX_PROVIDER_QUOTA_RECEIPT_AGE = timedelta(hours=24)
+FBREF_CAMOUFOX_GEOIP_DATABASE_CONTAINER_PATH = (
+    "/opt/airflow/secure/fbref-geoip/GeoLite2-City.mmdb"
+)
+FBREF_CAMOUFOX_GEOIP_DATABASE_SHA256 = (
+    "0772278c513e6ab3c65e9ae53d6861f137ab696f91eec763a2e6fe76befd83b2"
+)
+FBREF_CAMOUFOX_GEOIP_DATABASE_SIZE = 66_164_133
 _PROVIDER_QUOTA_RECEIPT_FIELDS = frozenset(
     {
         "schema_version",
@@ -354,6 +361,7 @@ _CRITICAL_IMAGE_PATHS = {
         "/lib",
         "/lib64",
         "/opt/airflow/runtime-contract",
+        "/opt/legacy-scraper-venv",
         "/usr/bin/dumb-init",
         "/usr/local/bin/whoscored-production-entrypoint",
         "/usr/local/bin/whoscored-production-gate",
@@ -421,6 +429,7 @@ _ALLOWED_VOLUME_TARGETS = {
         "/opt/airflow/proxys.txt": ("bind", True),
         "/opt/airflow/scrapers": ("bind", True),
         "/opt/airflow/scripts": ("bind", True),
+        FBREF_CAMOUFOX_GEOIP_DATABASE_CONTAINER_PATH: ("bind", True),
         "/opt/airflow/secure/whoscored-approvals": ("bind", True),
         "/opt/airflow/secure/whoscored-scheduled-pointers": ("bind", True),
         "/opt/airflow/state/whoscored-proxy-filter": ("bind", True),
@@ -479,6 +488,10 @@ _RUNTIME_HOST_BIND_TARGETS = {
         "airflow-scheduler",
         "/opt/airflow/fotmob-admission",
     ): "protected-directory",
+    (
+        "airflow-scheduler",
+        FBREF_CAMOUFOX_GEOIP_DATABASE_CONTAINER_PATH,
+    ): "fbref-geoip-database",
     ("airflow-scheduler", "/opt/airflow/logs"): "writable-directory",
     ("airflow-scheduler", "/opt/airflow/proxys.txt"): "protected-file",
     (
@@ -934,7 +947,7 @@ _SCHEDULER_ENVIRONMENT_NAMES = frozenset(
     AIRFLOW__CORE__FERNET_KEY AIRFLOW__CORE__LOAD_EXAMPLES
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN AIRFLOW__WEBSERVER__EXPOSE_CONFIG
     AIRFLOW__WEBSERVER__SECRET_KEY ALERT_ENV FBREF_PROXY_CONTROL_TOKEN
-    FBREF_CONTROL_DB_URI FOTMOB_DEPLOY_GIT_SHA
+    FBREF_CAMOUFOX_GEOIP_DATABASE_PATH FBREF_CONTROL_DB_URI FOTMOB_DEPLOY_GIT_SHA
     FOTMOB_SHARED_DEPLOYMENT_REPORT_PATH
     FBREF_PROXY_CONTROL_URL FBREF_PROXY_LEASE_TTL_SECONDS FBREF_RAW_S3_ENDPOINT
     FBREF_RAW_S3_SCHEME FBREF_RAW_STORE_URI FBREF_STAGE_JANITOR_MODE
@@ -1050,6 +1063,9 @@ _FIXED_ENVIRONMENT = {
         "FBREF_PROXY_CONTROL_URL": "http://fbref_proxy_filter:8899",
         "FBREF_PROXY_LEASE_TTL_SECONDS": "7200",
         "FBREF_STAGE_JANITOR_MODE": "apply",
+        "FBREF_CAMOUFOX_GEOIP_DATABASE_PATH": (
+            FBREF_CAMOUFOX_GEOIP_DATABASE_CONTAINER_PATH
+        ),
         "LEGACY_SCRAPER_PYTHON": "/opt/legacy-scraper-venv/bin/python",
         "PROXY_FILTER_LEDGER_PATH": (
             "/opt/airflow/state/whoscored-proxy-filter/paid_requests.jsonl"
@@ -3735,6 +3751,46 @@ def _assert_airflow_authority_directory(
     return before
 
 
+def _assert_fbref_geoip_database(path: Path) -> None:
+    """Require the one reviewed external GeoLite byte identity."""
+
+    try:
+        raw, identity = provenance.read_protected_regular_file_snapshot(
+            path, label="FBref Camoufox GeoLite database"
+        )
+    except provenance.ProvenanceError as exc:
+        raise AdmissionError(
+            "FBref Camoufox GeoLite database is missing or unprotected"
+        ) from exc
+    (
+        _device,
+        _inode,
+        mode,
+        uid,
+        gid,
+        link_count,
+        size,
+        _modified_ns,
+        _changed_ns,
+    ) = identity
+    if (
+        not stat.S_ISREG(mode)
+        or uid != 0
+        or gid != 0
+        or link_count != 1
+        or stat.S_IMODE(mode) != 0o444
+        or size != FBREF_CAMOUFOX_GEOIP_DATABASE_SIZE
+        or len(raw) != FBREF_CAMOUFOX_GEOIP_DATABASE_SIZE
+        or not hmac.compare_digest(
+            hashlib.sha256(raw).hexdigest(),
+            FBREF_CAMOUFOX_GEOIP_DATABASE_SHA256,
+        )
+    ):
+        raise AdmissionError(
+            "FBref Camoufox GeoLite database differs from the reviewed bytes"
+        )
+
+
 def _provider_receipt_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -4175,6 +4231,8 @@ def _validate_bind_source_policy(
             _assert_protected_directory(
                 source, label=f"authority directory for {identity[0]} {identity[1]}"
             )
+        elif policy == "fbref-geoip-database":
+            _assert_fbref_geoip_database(source)
         else:
             _assert_protected_regular_file(
                 source, label=f"protected input for {identity[0]} {identity[1]}"
@@ -4192,6 +4250,12 @@ def _validate_bind_source_policy(
     protected_mounts = {
         "fotmob-admission": sources[
             ("airflow-scheduler", "/opt/airflow/fotmob-admission")
+        ],
+        "fbref-geoip-database": sources[
+            (
+                "airflow-scheduler",
+                FBREF_CAMOUFOX_GEOIP_DATABASE_CONTAINER_PATH,
+            )
         ],
         "scheduler-logs": sources[("airflow-scheduler", "/opt/airflow/logs")],
         "gateway-state": sources[

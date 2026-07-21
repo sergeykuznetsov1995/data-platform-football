@@ -27,15 +27,19 @@ Requirements (already in the image, do NOT bump):
 
 import asyncio
 import base64
+import hashlib
+import importlib
 import ipaddress
 import logging
 import os
-from tempfile import TemporaryDirectory
+import stat
 import threading
 import time
 from collections import Counter
 from contextlib import contextmanager
-from typing import Callable, Dict, Literal, Optional, Union
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from typing import Callable, Dict, Literal, NoReturn, Optional, Union
 from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 
 from scrapers.fbref.browser_runtime import (
@@ -134,6 +138,29 @@ GEOIP_READ_TIMEOUT_SECONDS = 3.0
 GEOIP_BYTE_RESERVATION_BYTES = (
     BROWSER_REQUEST_FIXED_OVERHEAD_BYTES + GEOIP_RESPONSE_LIMIT_BYTES
 )
+
+# Camoufox's Python package points at a mutable package-local GeoLite file by
+# default.  Production instead binds one operator-provisioned, content-pinned
+# database outside every image trust path.  The path is fixed so neither an
+# environment override nor Python import precedence can redirect locale reads.
+FBREF_CAMOUFOX_GEOIP_DATABASE_ENV = "FBREF_CAMOUFOX_GEOIP_DATABASE_PATH"
+FBREF_CAMOUFOX_GEOIP_DATABASE_PATH = Path(
+    "/opt/airflow/secure/fbref-geoip/GeoLite2-City.mmdb"
+)
+FBREF_CAMOUFOX_GEOIP_DATABASE_SHA256 = (
+    "0772278c513e6ab3c65e9ae53d6861f137ab696f91eec763a2e6fe76befd83b2"
+)
+FBREF_CAMOUFOX_GEOIP_DATABASE_SIZE = 66_164_133
+FBREF_CAMOUFOX_GEOIP_DATABASE_UID = 0
+FBREF_CAMOUFOX_GEOIP_DATABASE_GID = 0
+FBREF_CAMOUFOX_GEOIP_DATABASE_MODE = 0o444
+
+
+def _reject_camoufox_geoip_download() -> NoReturn:
+    """Keep upstream's mutable release lookup unreachable in production."""
+
+    raise RuntimeError("Camoufox runtime GeoLite download is disabled")
+
 
 # These Firefox transports can create a proxy connection without producing a
 # Playwright Request (for example ``<link rel=preconnect>`` or a 103 Early
@@ -253,18 +280,73 @@ def resolve_geoip_without_redirects(proxy: Optional[dict]) -> str:
 
 
 def require_camoufox_geoip_database() -> None:
-    """Prove Camoufox will use its local GeoLite DB, never download at runtime."""
+    """Attest and select the immutable production GeoLite database.
+
+    This runs before a paid lease is acquired.  The bind is independently
+    admitted on the host, but the runner repeats an fd-pinned byte proof so a
+    missing, replaced, writable, or mis-mounted database fails before Camoufox
+    can resolve locale data or try any package download path.
+    """
+
+    configured = os.environ.get(FBREF_CAMOUFOX_GEOIP_DATABASE_ENV, "")
+    expected_path = FBREF_CAMOUFOX_GEOIP_DATABASE_PATH
+    if configured != str(expected_path):
+        raise RuntimeError("Camoufox production GeoLite database is unavailable")
+
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            expected_path,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != FBREF_CAMOUFOX_GEOIP_DATABASE_UID
+            or before.st_gid != FBREF_CAMOUFOX_GEOIP_DATABASE_GID
+            or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode)
+            != FBREF_CAMOUFOX_GEOIP_DATABASE_MODE
+            or before.st_size != FBREF_CAMOUFOX_GEOIP_DATABASE_SIZE
+        ):
+            raise RuntimeError("Camoufox production GeoLite database is unavailable")
+        digest = hashlib.sha256()
+        while chunk := os.read(descriptor, 1024 * 1024):
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+        entry = os.stat(expected_path, follow_symlinks=False)
+    except OSError as exc:
+        raise RuntimeError(
+            "Camoufox production GeoLite database is unavailable"
+        ) from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+    identity_fields = (
+        "st_dev",
+        "st_ino",
+        "st_mode",
+        "st_uid",
+        "st_gid",
+        "st_nlink",
+        "st_size",
+        "st_mtime_ns",
+        "st_ctime_ns",
+    )
+    if (
+        any(getattr(before, field) != getattr(after, field) for field in identity_fields)
+        or any(getattr(after, field) != getattr(entry, field) for field in identity_fields)
+        or digest.hexdigest() != FBREF_CAMOUFOX_GEOIP_DATABASE_SHA256
+    ):
+        raise RuntimeError("Camoufox production GeoLite database is unavailable")
 
     try:
-        from camoufox.locale import MMDB_FILE
+        locale = importlib.import_module("camoufox.locale")
     except (ImportError, AttributeError) as exc:
-        raise RuntimeError("Camoufox local GeoLite database is unavailable") from exc
-    try:
-        ready = MMDB_FILE.is_file() and MMDB_FILE.stat().st_size > 0
-    except OSError as exc:
-        raise RuntimeError("Camoufox local GeoLite database is unavailable") from exc
-    if not ready:
-        raise RuntimeError("Camoufox local GeoLite database is unavailable")
+        raise RuntimeError("Camoufox production GeoLite database is unavailable") from exc
+    locale.download_mmdb = _reject_camoufox_geoip_download
+    locale.MMDB_FILE = expected_path
 
 
 def should_block_request(
