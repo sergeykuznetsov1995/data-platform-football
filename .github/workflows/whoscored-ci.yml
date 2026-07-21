@@ -24,17 +24,92 @@ jobs:
       PYTHONPYCACHEPREFIX: /tmp/whoscored-ci-pycache
       PYTHONDONTWRITEBYTECODE: "1"
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          # ready-v1 validates the exact PR-head promotion child while the
-          # worktree remains GitHub's synthetic merge result.
-          fetch-depth: 0
-          persist-credentials: false
+      - name: Protect the preinstalled runner Python 3.11
+        run: |
+          test -d /opt/hostedtoolcache/Python
+          test ! -L /opt/hostedtoolcache/Python
+          mapfile -t python_candidates < <(
+            find /opt/hostedtoolcache/Python \
+              -mindepth 4 -maxdepth 4 -path '*/3.11.*/x64/bin/python3.11' \
+              -type f -print | sort
+          )
+          test "${#python_candidates[@]}" = 1
+          source_python="$(readlink -f "${python_candidates[0]}")"
+          source_prefix="$(dirname "$(dirname "$source_python")")"
+          [[ "$source_prefix" =~ ^/opt/hostedtoolcache/Python/3\.11\.[0-9]+/x64$ ]]
+          /usr/bin/sudo /bin/chown root:root /opt/hostedtoolcache
+          /usr/bin/sudo /bin/chmod go-w /opt/hostedtoolcache
+          /usr/bin/sudo /bin/chown -R root:root /opt/hostedtoolcache/Python
+          /usr/bin/sudo /bin/chmod -R go-w /opt/hostedtoolcache/Python
+          protected_prefix="$source_prefix"
+          python_bin="$source_python"
+          python_version_dir="$(dirname "$protected_prefix")"
+          for trusted_dir in \
+            /opt /opt/hostedtoolcache /opt/hostedtoolcache/Python \
+            "$python_version_dir" "$protected_prefix" \
+            "$protected_prefix/bin" "$protected_prefix/lib"
+          do
+            test "$(stat -Lc '%u:%g' "$trusted_dir")" = 0:0
+            test $((8#$(stat -Lc '%a' "$trusted_dir") & 8#022)) = 0
+          done
+          test "$(stat -Lc '%u:%g:%h' "$python_bin")" = 0:0:1
+          test $((8#$(stat -Lc '%a' "$python_bin") & 8#022)) = 0
+          [[ "$("$python_bin" --version)" =~ ^Python\ 3\.11\.[0-9]+$ ]]
+          if ! unexpected_python_path="$(find "$protected_prefix" -xdev \
+              \( -type f -o -type d \) \
+              \( ! -user root -o ! -group root -o -writable \) \
+              -print -quit)"; then
+            echo "protected Python scan failed" >&2
+            exit 1
+          fi
+          test -z "$unexpected_python_path"
+          unexpected_python_link=
+          while IFS= read -r -d '' candidate_link; do
+            resolved_link="$(readlink -f "$candidate_link")"
+            case "$resolved_link" in
+              "$protected_prefix"/*) ;;
+              *) unexpected_python_link="$candidate_link"; break ;;
+            esac
+          done < <(find "$protected_prefix" -xdev -type l -print0)
+          test -z "$unexpected_python_link"
+          echo "WHOSCORED_CI_SETUP_PYTHON=$python_bin" >> "$GITHUB_ENV"
+          dirname "$python_bin" >> "$GITHUB_PATH"
 
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
-        with:
-          python-version: "3.11"
-          cache: pip
+      - name: Fetch the exact pull-request merge without credentials
+        env:
+          GIT_CONFIG_GLOBAL: /dev/null
+          GIT_CONFIG_NOSYSTEM: "1"
+          GIT_CONFIG_COUNT: "5"
+          GIT_CONFIG_KEY_0: core.hooksPath
+          GIT_CONFIG_VALUE_0: /dev/null
+          GIT_CONFIG_KEY_1: filter.lfs.process
+          GIT_CONFIG_VALUE_1: ""
+          GIT_CONFIG_KEY_2: filter.lfs.clean
+          GIT_CONFIG_VALUE_2: ""
+          GIT_CONFIG_KEY_3: filter.lfs.smudge
+          GIT_CONFIG_VALUE_3: ""
+          GIT_CONFIG_KEY_4: filter.lfs.required
+          GIT_CONFIG_VALUE_4: "false"
+          WHOSCORED_CI_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          WHOSCORED_CI_MERGE_SHA: ${{ github.sha }}
+          WHOSCORED_CI_PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          [[ "$WHOSCORED_CI_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$WHOSCORED_CI_MERGE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$WHOSCORED_CI_PR_NUMBER" =~ ^[0-9]+$ ]]
+          export GIT_LFS_SKIP_SMUDGE=1
+          /usr/bin/git init .
+          /usr/bin/git remote add origin \
+            https://github.com/sergeykuznetsov1995/data-platform-football.git
+          /usr/bin/git -c protocol.version=2 fetch --no-tags --depth=3 origin \
+            "+refs/pull/${WHOSCORED_CI_PR_NUMBER}/merge:refs/remotes/pull/${WHOSCORED_CI_PR_NUMBER}/merge"
+          /usr/bin/git checkout --detach \
+            "refs/remotes/pull/${WHOSCORED_CI_PR_NUMBER}/merge"
+          test "$(/usr/bin/git rev-parse HEAD)" = "$WHOSCORED_CI_MERGE_SHA"
+          test "$(/usr/bin/git rev-parse HEAD^2)" = "$WHOSCORED_CI_HEAD_SHA"
+          test -z "$(/usr/bin/git config --local --get-regexp \
+            '^(include|includeIf|http\..*\.extraheader|core\.hooksPath|filter\.)' \
+            || true)"
 
       - name: Verify the immutable system Buildx binary
         run: |
@@ -123,12 +198,20 @@ jobs:
           buildx_exec=/proc/self/fd/9
           echo "d41ece72044243b4f58b343441ae37446d9c29a7d6b5e11c61847bbcf8f7dfda  $buildx_exec" \
             | /usr/bin/sha256sum --check --strict
-          "$buildx_exec" build \
+          buildx_build() {
+            local attempt
+            for attempt in 1 2 3; do
+              if "$buildx_exec" build "$@"; then return 0; fi
+              test "$attempt" -lt 3 || return 1
+              /usr/bin/sleep "$((attempt * 5))"
+            done
+          }
+          buildx_build \
             --builder "$WHOSCORED_CI_BUILDER" \
             --load \
             -t data-platform-superset:ci \
             docker/images/superset
-          "$buildx_exec" build \
+          buildx_build \
             --builder "$WHOSCORED_CI_BUILDER" \
             --load \
             -t data-platform-jupyterhub:ci \
@@ -141,7 +224,15 @@ jobs:
           buildx_exec=/proc/self/fd/9
           echo "d41ece72044243b4f58b343441ae37446d9c29a7d6b5e11c61847bbcf8f7dfda  $buildx_exec" \
             | /usr/bin/sha256sum --check --strict
-          "$buildx_exec" build \
+          buildx_build() {
+            local attempt
+            for attempt in 1 2 3; do
+              if "$buildx_exec" build "$@"; then return 0; fi
+              test "$attempt" -lt 3 || return 1
+              /usr/bin/sleep "$((attempt * 5))"
+            done
+          }
+          buildx_build \
             --builder "$WHOSCORED_CI_BUILDER" \
             --target airflow-scheduler-test \
             --load \
@@ -274,10 +365,18 @@ jobs:
           buildx_exec=/proc/self/fd/9
           echo "d41ece72044243b4f58b343441ae37446d9c29a7d6b5e11c61847bbcf8f7dfda  $buildx_exec" \
             | /usr/bin/sha256sum --check --strict
+          buildx_build() {
+            local attempt
+            for attempt in 1 2 3; do
+              if "$buildx_exec" build "$@"; then return 0; fi
+              test "$attempt" -lt 3 || return 1
+              /usr/bin/sleep "$((attempt * 5))"
+            done
+          }
           umask 077
           install -d -m 0700 /tmp/whoscored-build-metadata
           BUILDX_GIT_CHECK_DIRTY=1 \
-          "$buildx_exec" build \
+          buildx_build \
             --builder "$WHOSCORED_CI_BUILDER" \
             --target airflow-scheduler-payload \
             --platform linux/amd64 \
@@ -287,7 +386,7 @@ jobs:
           scheduler_tag=127.0.0.1:5000/data-platform-airflow-scheduler:provenance-ci
           proxy_tag=127.0.0.1:5000/data-platform-airflow-whoscored-proxy:provenance-ci
           BUILDX_GIT_CHECK_DIRTY=1 BUILDX_METADATA_PROVENANCE=max \
-          "$buildx_exec" build \
+          buildx_build \
             --builder "$WHOSCORED_CI_BUILDER" \
             --target airflow-scheduler \
             --platform linux/amd64 \
@@ -297,7 +396,7 @@ jobs:
             --tag "$scheduler_tag" \
             docker/images/airflow
           BUILDX_GIT_CHECK_DIRTY=1 BUILDX_METADATA_PROVENANCE=max \
-          "$buildx_exec" build \
+          buildx_build \
             --builder "$WHOSCORED_CI_BUILDER" \
             --target airflow-whoscored-proxy \
             --platform linux/amd64 \
@@ -406,7 +505,15 @@ jobs:
           buildx_exec=/proc/self/fd/9
           echo "d41ece72044243b4f58b343441ae37446d9c29a7d6b5e11c61847bbcf8f7dfda  $buildx_exec" \
             | /usr/bin/sha256sum --check --strict
-          "$buildx_exec" build \
+          buildx_build() {
+            local attempt
+            for attempt in 1 2 3; do
+              if "$buildx_exec" build "$@"; then return 0; fi
+              test "$attempt" -lt 3 || return 1
+              /usr/bin/sleep "$((attempt * 5))"
+            done
+          }
+          buildx_build \
             --builder "$WHOSCORED_CI_BUILDER" \
             --file docker/images/flaresolverr-whoscored/Dockerfile \
             --load \
@@ -466,9 +573,10 @@ jobs:
       - name: Install test runtime
         run: |
           test_venv="$(mktemp -d /tmp/whoscored-ci-test-venv.XXXXXXXX)"
-          setup_python_prefix="$(python -I -S -c 'import sys; print(sys.base_prefix)')"
-          python -m venv --copies "$test_venv"
-          "$test_venv/bin/python" -m pip install \
+          setup_python_prefix="$("$WHOSCORED_CI_SETUP_PYTHON" -I -S -c \
+            'import sys; print(sys.base_prefix)')"
+          "$WHOSCORED_CI_SETUP_PYTHON" -I -S -m venv --copies "$test_venv"
+          "$test_venv/bin/python" -I -m pip install \
             --disable-pip-version-check --no-deps \
             --require-hashes --only-binary=:all: \
             -r .github/workflows/whoscored-test.lock
@@ -875,6 +983,10 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
 
       - name: Build the immutable Airflow parser runtime
         run: |

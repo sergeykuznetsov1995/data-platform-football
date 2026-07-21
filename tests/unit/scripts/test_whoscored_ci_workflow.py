@@ -153,8 +153,8 @@ def test_ci_isolates_root_only_contracts_from_the_host_runner():
     assert 'test_venv="$(mktemp -d /tmp/whoscored-ci-test-venv.XXXXXXXX)"' in (
         install_step
     )
-    assert 'python -m venv --copies "$test_venv"' in install_step
-    assert '"$test_venv/bin/python" -m pip install' in install_step
+    assert '"$WHOSCORED_CI_SETUP_PYTHON" -I -S -m venv --copies' in install_step
+    assert '"$test_venv/bin/python" -I -m pip install' in install_step
     assert "WHOSCORED_CI_PYTHON_PREFIX=$setup_python_prefix" in install_step
     assert "--require-hashes --only-binary=:all:" in install_step
     assert '-r .github/workflows/whoscored-test.lock' in install_step
@@ -163,6 +163,9 @@ def test_ci_isolates_root_only_contracts_from_the_host_runner():
 
 def test_ci_uses_test_runtime_and_smokes_immutable_flaresolverr():
     text = _workflow_text()
+    contract_job = text.split("  contract:\n", 1)[1].split(
+        "  real-airflow-dag-import:\n", 1
+    )[0]
     scheduler_smoke = text.split(
         "- name: Build and smoke the hardened scheduler test image", 1
     )[1].split("- name: Build production targets", 1)[0]
@@ -213,7 +216,9 @@ def test_ci_uses_test_runtime_and_smokes_immutable_flaresolverr():
     assert "a319e5b15052cf6557ceb666eb8ff6e32380b782" in text
     assert 'test ! -e "$HOME/.docker/cli-plugins/docker-buildx"' in text
     assert "docker buildx build" not in text
-    assert text.count('"$buildx_exec" build') == 7
+    assert text.count('"$buildx_exec" build "$@"') == 4
+    assert text.count("buildx_build \\\n") == 7
+    assert text.count("for attempt in 1 2 3") == 4
     assert "type=gha" not in text
     assert text.count(
         "exec 9< /usr/libexec/docker/cli-plugins/docker-buildx"
@@ -232,7 +237,21 @@ def test_ci_uses_test_runtime_and_smokes_immutable_flaresolverr():
         "- name: Static and import checks"
     )
     assert "BASH_ENV: /dev/null" in text
-    assert text.count("persist-credentials: false") == 2
+    assert "uses:" not in contract_job
+    assert "refs/pull/${WHOSCORED_CI_PR_NUMBER}/merge" in contract_job
+    assert "fetch --no-tags --depth=3 origin" in contract_job
+    assert "GIT_CONFIG_NOSYSTEM: \"1\"" in contract_job
+    assert "filter.lfs.process" in contract_job
+    assert "WHOSCORED_CI_SETUP_PYTHON=$python_bin" in contract_job
+    assert "/opt/hostedtoolcache/Python" in contract_job
+    assert "x64/bin/python3.11" in contract_job
+    assert "/usr/bin/sudo /bin/chown -R root:root /opt/hostedtoolcache/Python" in (
+        contract_job
+    )
+    assert "source_prefix\" =~ ^/opt/hostedtoolcache/Python/3\\.11" in contract_job
+    assert "unexpected_python_path" in contract_job
+    assert "unexpected_python_link" in contract_job
+    assert text.count("persist-credentials: false") == 1
     assert text.count("if: ${{ !cancelled() }}") == 5
     assert text.index(
         "- name: Prove checked-in evidence and closure report agree"
@@ -264,7 +283,8 @@ def test_ci_proves_both_production_targets_match_declared_evidence_state():
     assert "--expect-ready-build" in text
     assert "--release-revision" in text
     assert "github.event.pull_request.head.sha" in text
-    assert "fetch-depth: 0" in text
+    assert '"refs/remotes/pull/${WHOSCORED_CI_PR_NUMBER}/merge"' in text
+    assert "/usr/bin/git rev-parse HEAD^2" in text
     assert 'case "$provenance_status" in' in text
     assert "blocked-v1)" in text
     assert "ready-v1)" in text
@@ -301,7 +321,7 @@ def test_production_provenance_is_pushed_and_smoked_by_digest() -> None:
     build_commands = [
         block.split("docker/images/airflow", 1)[0]
         for block in production.split(
-            '"$buildx_exec" build \\\n'
+            "buildx_build \\\n"
         )[1:]
     ]
     assert sum("--provenance=" in command for command in build_commands) == 2
