@@ -14,6 +14,7 @@ import os
 import time
 import uuid
 from datetime import date, datetime
+from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 import numpy as np
@@ -299,12 +300,11 @@ class TrinoTableManager:
             return
         sql = f"CREATE SCHEMA IF NOT EXISTS {qualified}"
 
-        try:
-            self._execute(sql)
-            logger.info(f"Created schema: {self.catalog}.{schema}")
-        except TrinoError:
-            # Schema might already exist
-            logger.debug(f"Schema {schema} may already exist")
+        # ``IF NOT EXISTS`` already handles the benign race.  Treating every
+        # metadata/DDL failure as "it probably exists" poisons the process
+        # cache and lets later writes proceed against an unverified catalog.
+        self._execute(sql)
+        logger.info(f"Created schema: {self.catalog}.{schema}")
         self._known_schemas.add(schema)
 
     def schema_exists(self, schema: str) -> bool:
@@ -331,10 +331,10 @@ class TrinoTableManager:
             return True
         sql = f"SHOW TABLES FROM {qualified} LIKE '{table}'"
 
-        try:
-            result = self._execute(sql, fetch=True)
-        except TrinoError:
-            return False
+        # A failed SHOW TABLES is not evidence that a table is absent.  Callers
+        # use this answer to decide whether to CREATE and, in ingestion code,
+        # whether warehouse state is authoritative; fail closed instead.
+        result = self._execute(sql, fetch=True)
         # Absence is never cached: the very next call may be the CREATE.
         if result:
             self._known_tables.add((schema, table))
@@ -452,10 +452,15 @@ WITH (
         Returns:
             SQL literal string
         """
+        tt = target_type.upper()
+        # Decimal NaN/Infinity are values, not missing dataframe cells. Never
+        # silently translate them into SQL NULL via pandas' generic NA check.
+        if isinstance(val, Decimal) and not val.is_finite():
+            raise ValueError(
+                f"non-null value {val!r} is incompatible with {tt or 'DECIMAL'}"
+            )
         if pd.isna(val):
             return "NULL"
-
-        tt = target_type.upper()
 
         # When target type is known, cast value to match table schema
         if tt:
@@ -465,24 +470,70 @@ WITH (
 
             if tt in ('BIGINT', 'INTEGER', 'SMALLINT', 'TINYINT'):
                 try:
-                    return f"CAST({int(val)} AS {tt})"
+                    if isinstance(val, (bool, np.bool_)):
+                        raise TypeError("boolean is not an integer source value")
+                    integer = int(val)
+                    # int(1.5) and int(Decimal("1.5")) silently truncate. Only
+                    # accept a non-string numeric value when it represents the
+                    # exact integer being persisted.
+                    if (
+                        not isinstance(val, str)
+                        and val != integer
+                    ):
+                        raise ValueError("non-integral numeric value")
+                    return f"CAST({integer} AS {tt})"
                 except (ValueError, TypeError, OverflowError):
-                    return "NULL"
+                    raise ValueError(
+                        f"non-null value {val!r} is incompatible with {tt}"
+                    ) from None
 
             if tt in ('DOUBLE', 'REAL'):
                 try:
+                    if isinstance(val, (bool, np.bool_)):
+                        raise TypeError("boolean is not a floating source value")
                     float_val = float(val)
                     if np.isnan(float_val) or np.isinf(float_val):
-                        return "NULL"
+                        raise ValueError("non-finite numeric value")
                     return f"CAST({float_val} AS {tt})"
                 except (ValueError, TypeError):
-                    return "NULL"
+                    raise ValueError(
+                        f"non-null value {val!r} is incompatible with {tt}"
+                    ) from None
 
             if tt.startswith('DECIMAL'):
+                # Parse before interpolation: rendering an arbitrary string
+                # directly inside CAST is both invalid SQL and an injection
+                # primitive. Trino remains responsible for target
+                # precision/scale validation.
                 try:
-                    return f"CAST({val} AS {tt})"
-                except (ValueError, TypeError):
-                    return "NULL"
+                    decimal_value = Decimal(str(val).strip())
+                except (InvalidOperation, ValueError):
+                    raise ValueError(
+                        f"non-null value {val!r} is incompatible with {tt}"
+                    ) from None
+                if not decimal_value.is_finite():
+                    raise ValueError(
+                        f"non-null value {val!r} is incompatible with {tt}"
+                    )
+                if (
+                    abs(decimal_value.adjusted()) > 128
+                    or len(decimal_value.as_tuple().digits) > 128
+                ):
+                    raise ValueError(
+                        f"non-null value {val!r} is incompatible with {tt}"
+                    )
+                rendered = format(decimal_value, 'f')
+                if '.' in rendered:
+                    rendered = rendered.rstrip('0').rstrip('.')
+                if decimal_value.is_zero():
+                    rendered = "0"
+                # Iceberg/Trino DECIMAL precision is bounded; this also avoids
+                # expanding a hostile exponent into an enormous SQL literal.
+                if len(rendered) > 128:
+                    raise ValueError(
+                        f"non-null value {val!r} is incompatible with {tt}"
+                    )
+                return f"CAST({rendered} AS {tt})"
 
             if tt == 'BOOLEAN':
                 # A string like "False" is truthy in Python, so plain
@@ -494,8 +545,14 @@ WITH (
                         return "TRUE"
                     if s in ('false', 'f', '0', ''):
                         return "FALSE"
-                    return "NULL"
-                return "TRUE" if val else "FALSE"
+                    raise ValueError(
+                        f"non-null value {val!r} is incompatible with BOOLEAN"
+                    )
+                if isinstance(val, (bool, np.bool_)):
+                    return "TRUE" if bool(val) else "FALSE"
+                raise ValueError(
+                    f"non-null value {val!r} is incompatible with BOOLEAN"
+                )
 
             if tt == 'DATE':
                 if isinstance(val, (date, datetime, pd.Timestamp)):
@@ -544,8 +601,12 @@ WITH (
         elif isinstance(val, (int, np.integer)):
             return f"CAST({val} AS BIGINT)"
         elif isinstance(val, (float, np.floating)):
-            if np.isnan(val) or np.isinf(val):
+            if np.isnan(val):
                 return "NULL"
+            if np.isinf(val):
+                raise ValueError(
+                    f"non-null value {val!r} is incompatible with DOUBLE"
+                )
             return f"CAST({val} AS DOUBLE)"
         else:
             escaped = str(val).replace("'", "''")
@@ -591,11 +652,11 @@ WITH (
                 for name, column_type in column_types.items()
             }
         else:
-            try:
-                raw_types = self.get_table_columns(schema, table)
-                table_col_types = {k.lower(): v for k, v in raw_types.items()}
-            except Exception as e:
-                logger.debug(f"Could not fetch table column types: {e}")
+            # Rendering with inferred Python types after DESCRIBE failed can
+            # turn a metadata outage into corrupt/coerced data.  The caller
+            # must retry once the target schema is authoritative again.
+            raw_types = self.get_table_columns(schema, table)
+            table_col_types = {k.lower(): v for k, v in raw_types.items()}
 
         qualified = validate_catalog_qualified_name(self.catalog, schema, table)
 
@@ -668,12 +729,10 @@ WITH (
         if len(df) > batch_size:
             return None
 
-        table_col_types: Dict[str, str] = {}
-        try:
-            raw_types = self.get_table_columns(schema, table)
-            table_col_types = {k.lower(): v for k, v in raw_types.items()}
-        except Exception as e:
-            logger.debug(f"Could not fetch table column types: {e}")
+        raw_types = self.get_table_columns(schema, table)
+        table_col_types: Dict[str, str] = {
+            k.lower(): v for k, v in raw_types.items()
+        }
 
         qualified = validate_catalog_qualified_name(self.catalog, schema, table)
         columns = ', '.join(f'"{c}"' for c in df.columns)

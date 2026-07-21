@@ -32,6 +32,13 @@ x-airflow-common: &airflow-common
     AIRFLOW__CELERY__BROKER_URL: ${AIRFLOW__CELERY__BROKER_URL}
     AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW__WEBSERVER__SECRET_KEY}
     AIRFLOW__WEBSERVER__EXPOSE_CONFIG: ${AIRFLOW__WEBSERVER__EXPOSE_CONFIG}
+    # FBref and FotMob coordinate schedule ownership/publication through one
+    # durable control plane.  Every shared Airflow process must receive the
+    # same explicit URI that the isolated FotMob scheduler is admitted with.
+    FBREF_CONTROL_DB_URI: ${FBREF_CONTROL_DB_URI:?set shared production FBref/FotMob control DB URI}
+    # Publication leases are fenced by the exact immutable release.  Recreate
+    # shared Airflow services for each admitted Git revision.
+    FOTMOB_DEPLOY_GIT_SHA: ${FOTMOB_DEPLOY_GIT_SHA:?set exact deployed Git SHA}
     TRINO_PASSWORD: ${TRINO_PASSWORD}
     TRINO_PORT: ${TRINO_PORT}
     TRINO_HOST: ${TRINO_HOST:-trino}
@@ -181,6 +188,10 @@ x-airflow-common: &airflow-common
     # E1 medallion config: team_aliases.yaml + competitions.yaml — read-only
     # for utils/medallion_config.py (default CONFIG_DIR=/opt/airflow/configs/medallion)
     - ./configs/medallion:/opt/airflow/configs/medallion:ro
+    # Canonical native FotMob competition-id mapping used while rendering
+    # FotMob Silver/xref SQL. Keep the shared scheduler on the same reviewed
+    # bytes as the isolated cutover stack.
+    - ./configs/fotmob:/opt/airflow/configs/fotmob:ro
     # #920 Phase 3: versioned soccerdata league_dict fragment (ESPN/WhoScored
     # tournament ids). Read by scrapers/base/soccerdata_config.py, which
     # merges it into ~/soccerdata/config/league_dict.json inside the
@@ -456,8 +467,8 @@ services:
           # Lakekeeper's RSS climbs ~430 MB/h under sustained per-target Iceberg
           # commits and is memcg-OOM-killed mid-commit at whatever ceiling it is
           # given (512M died in 20 min, 1G in 2.4 h — FotMob #930 canary). The
-          # headroom buys hours, not immunity: long backfills must also restart
-          # it between work units (see fotmob_canary_backfill/driver.sh).
+          # headroom buys hours, not immunity: long backfills must use bounded
+          # work units and monitor/restart the service between those units.
           memory: 3G
         reservations:
           memory: 128M

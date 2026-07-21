@@ -4,6 +4,10 @@ import pandas as pd
 import pytest
 
 from scrapers.fotmob.repository import (
+    CURRENT_VIEW_SPECS,
+    LEGACY_PARSER_VERSION,
+    PARSER_VERSION,
+    REPLACE_TARGET_MANIFEST_IDENTITIES,
     FotMobRepository,
     ManifestStatus,
     MemoryFotMobRepository,
@@ -95,6 +99,27 @@ def test_target_batch_id_is_replay_stable_and_parser_sensitive():
     first = deterministic_target_batch_id("target", "hash", "parser-v1")
     assert first == deterministic_target_batch_id("target", "hash", "parser-v1")
     assert first != deterministic_target_batch_id("target", "hash", "parser-v2")
+
+
+def test_catalog_observation_identity_is_separate_from_content_identity():
+    first = deterministic_target_batch_id(
+        "catalog", "same-content", PARSER_VERSION, "run-1"
+    )
+    second = deterministic_target_batch_id(
+        "catalog", "same-content", PARSER_VERSION, "run-2"
+    )
+    assert first != second
+
+
+def test_native_parser_contract_is_v2_and_playoff_key_uses_match_ids():
+    assert PARSER_VERSION == "fotmob-native-v2"
+    assert "match_ids" in CURRENT_VIEW_SPECS["fotmob_playoff_brackets"][1]
+    assert REPLACE_TARGET_MANIFEST_IDENTITIES["fotmob_leaderboards"] == (
+        "target_type",
+        "competition_id",
+        "source_season_key",
+        "entity_id",
+    )
 
 
 def test_repository_writes_physical_rows_before_success_manifest():
@@ -207,11 +232,53 @@ def test_current_view_exposes_only_manifest_commits_and_deduplicates_natural_key
     assert created == ["iceberg.bronze.fotmob_matches_current"]
     sql = writer.trino.sql[0]
     assert "status IN ('success', 'not_modified')" in sql
+    assert "'not_available'" in sql
+    assert f"parser_version = '{PARSER_VERSION}'" in sql
+    assert f"parser_version = '{LEGACY_PARSER_VERSION}'" in sql
+    assert "CASE WHEN parser_version =" in sql
+    assert "CASE WHEN c.parser_version =" in sql
     assert "PARTITION BY target_type, competition_id, source_season_key" in sql
     assert "target_rn = 1" in sql
     assert "c.batch_id = r._target_batch_id" in sql
     assert 'r."competition_id", r."source_season_key", r."match_id"' in sql
     assert "ROW_NUMBER()" in sql
+
+
+def test_current_view_rolls_from_last_good_v1_to_v2_replacement_or_tombstone():
+    writer = ViewWriter()
+    FotMobRepository(writer=writer).ensure_current_views()
+    sql = " ".join(writer.trino.sql[0].split())
+
+    assert (
+        f"parser_version = '{PARSER_VERSION}' AND status IN ( "
+        "'success', 'not_modified', 'not_available' )"
+    ) in sql
+    assert (
+        f"parser_version = '{LEGACY_PARSER_VERSION}' "
+        "AND status IN ('success', 'not_modified')"
+    ) in sql
+    assert (
+        f"ORDER BY CASE WHEN parser_version = '{PARSER_VERSION}' "
+        "THEN 1 ELSE 0 END DESC, completed_at DESC"
+    ) in sql
+    assert "WHERE target_rn = 1 AND status IN ('success', 'not_modified')" in sql
+
+
+def test_entity_tombstone_supersedes_previous_success_for_skip_state():
+    repository = MemoryFotMobRepository()
+    success = _commit(target_type="match", target_key="match-1", entity_id="1")
+    repository.record(success)
+    repository.record(
+        _commit(
+            target_type="match",
+            target_key="match-1",
+            entity_id="1",
+            status=ManifestStatus.NOT_AVAILABLE,
+        )
+    )
+
+    assert repository.latest_success("match-1") is None
+    assert repository.latest_entity_success("match", "1") is None
 
 
 def test_current_view_fails_closed_when_any_natural_key_column_is_missing():
@@ -334,11 +401,44 @@ def test_catalog_absence_logic_ignores_uncommitted_physical_snapshots():
     sql = writer.trino.sql[0]
     assert "target_type = 'all_leagues'" in sql
     assert "status IN ('success', 'not_modified')" in sql
+    assert "attempts > 0" in sql
+    assert "COALESCE(stale, FALSE) = FALSE" in sql
     assert "m.batch_id = c._target_batch_id" in sql
     # Trino forbids table-qualified references to a JOIN..USING column: the
     # coalesced column exists only unqualified (COLUMN_NOT_FOUND otherwise).
     assert "c.discovery_run_id" not in sql
     assert "USING (discovery_run_id)" in sql
+
+
+def test_memory_catalog_history_ignores_offline_replay_observation():
+    repository = MemoryFotMobRepository()
+    repository.tables["fotmob_competitions"] = [
+        {
+            "competition_id": "47",
+            "discovery_run_id": "live-run",
+            "is_tombstoned": False,
+        },
+        {
+            "competition_id": "99",
+            "discovery_run_id": "live-run",
+            "is_tombstoned": False,
+        },
+        {
+            "competition_id": "47",
+            "discovery_run_id": "replay-run",
+            "is_tombstoned": False,
+        },
+    ]
+    repository.commits.append(
+        _commit(
+            run_id="replay-run",
+            target_type="all_leagues",
+            target_key="catalog",
+            attempts=0,
+        )
+    )
+
+    assert repository.previous_catalog_snapshots() == [{47, 99}]
 
 
 def test_batched_commits_write_one_iceberg_commit_per_table_not_per_target():
@@ -405,6 +505,206 @@ def test_flush_writes_rows_before_manifest_so_a_crash_only_loses_visibility():
     ]
     assert [call[1]["table"] for call in writer.calls][-1] == "fotmob_ingest_manifest"
     assert repository.flush() == [], "an empty buffer must not commit"
+
+
+class ReconcileTrino:
+    def __init__(self, writer):
+        self.writer = writer
+        self.queries = []
+
+    def table_exists(self, schema, table):
+        return bool(self.writer.rows.get(table))
+
+    def execute_query(self, sql):
+        self.queries.append(sql)
+        marker = "FROM iceberg.bronze."
+        table = sql.split(marker, 1)[1].split()[0]
+        if "SELECT run_id, batch_id, target_key, content_hash" in sql:
+            return [
+                (
+                    row.get("run_id"),
+                    row.get("batch_id"),
+                    row.get("target_key"),
+                    row.get("content_hash"),
+                    row.get("parser_version"),
+                    row.get("status"),
+                )
+                for row in self.writer.rows.get(table, [])
+            ]
+        batch_column = "_target_batch_id" if "_target_batch_id" in sql else "batch_id"
+        counts = {}
+        for row in self.writer.rows.get(table, []):
+            batch_id = str(row[batch_column])
+            counts[batch_id] = counts.get(batch_id, 0) + 1
+        return sorted(counts.items())
+
+
+class ReconcileWriter(RecordingWriter):
+    def __init__(self, fail_after_commit=None):
+        super().__init__()
+        self.rows = {}
+        self.fail_after_commit = fail_after_commit
+        self.trino = ReconcileTrino(self)
+
+    def _get_trino_manager(self):
+        return self.trino
+
+    def write_dataframe(self, df, **kwargs):
+        table = kwargs["table"]
+        self.calls.append((df.copy(), dict(kwargs)))
+        self.rows.setdefault(table, []).extend(df.to_dict("records"))
+        if self.fail_after_commit == table:
+            self.fail_after_commit = None
+            raise RuntimeError("lost writer response after Iceberg commit")
+        return f"iceberg.{kwargs['database']}.{table}"
+
+
+def test_restart_reconciles_already_committed_target_batch_without_duplicate_rows():
+    writer = ReconcileWriter(fail_after_commit="fotmob_matches")
+    commit = _commit()
+    dataset = TableRows(
+        "fotmob_matches",
+        [
+            {
+                "competition_id": "289",
+                "source_season_key": "2017/2019",
+                "match_id": "1",
+            }
+        ],
+        "matches",
+        ("competition_id", "source_season_key"),
+    )
+    first = FotMobRepository(writer=writer, batch_size=50)
+    first.commit(commit, [dataset])
+    with pytest.raises(RuntimeError, match="lost writer response"):
+        first.flush()
+
+    restarted = FotMobRepository(writer=writer, batch_size=50)
+    restarted.commit(commit, [dataset])
+    restarted.flush()
+
+    assert len(writer.rows["fotmob_matches"]) == 1
+    assert len(writer.rows["fotmob_ingest_manifest"]) == 1
+    assert any("GROUP BY _target_batch_id" in query for query in writer.trino.queries)
+
+
+def test_restart_fails_closed_on_partial_or_duplicate_target_batch_count():
+    writer = ReconcileWriter()
+    commit = _commit()
+    writer.rows["fotmob_matches"] = [
+        {"_target_batch_id": commit.batch_id},
+        {"_target_batch_id": commit.batch_id},
+    ]
+    repository = FotMobRepository(writer=writer, batch_size=50)
+    repository.commit(
+        commit,
+        [
+            TableRows(
+                "fotmob_matches",
+                [
+                    {
+                        "competition_id": "289",
+                        "source_season_key": "2017/2019",
+                        "match_id": "1",
+                    }
+                ],
+                "matches",
+                ("competition_id", "source_season_key"),
+            )
+        ],
+    )
+
+    with pytest.raises(RuntimeError, match="expected either 0 or 1"):
+        repository.flush()
+
+
+def test_prior_failure_manifest_cannot_swallow_later_success_with_same_batch_id():
+    writer = ReconcileWriter()
+    failure = _commit(status=ManifestStatus.SCHEMA_DRIFT)
+    success = _commit(status=ManifestStatus.SUCCESS)
+    assert failure.batch_id == success.batch_id
+    writer.rows["fotmob_ingest_manifest"] = [failure.manifest_row()]
+    dataset = TableRows(
+        "fotmob_matches",
+        [
+            {
+                "competition_id": "289",
+                "source_season_key": "2017/2019",
+                "match_id": "1",
+            }
+        ],
+        "matches",
+        ("competition_id", "source_season_key"),
+    )
+
+    repository = FotMobRepository(writer=writer, batch_size=50)
+    repository.commit(success, [dataset])
+    repository.flush()
+
+    assert [
+        row["status"] for row in writer.rows["fotmob_ingest_manifest"]
+    ] == ["schema_drift", "success"]
+    assert len(writer.rows["fotmob_matches"]) == 1
+
+    restarted = FotMobRepository(writer=writer, batch_size=50)
+    restarted.commit(success, [dataset])
+    restarted.flush()
+
+    assert len(writer.rows["fotmob_ingest_manifest"]) == 2
+    assert len(writer.rows["fotmob_matches"]) == 1
+
+
+def test_restart_reconciles_semantically_identical_manifest_after_lost_response():
+    writer = ReconcileWriter(fail_after_commit="fotmob_ingest_manifest")
+    commit = _commit()
+    first = FotMobRepository(writer=writer, batch_size=50)
+    first.commit(commit)
+    with pytest.raises(RuntimeError, match="lost writer response"):
+        first.flush()
+
+    restarted = FotMobRepository(writer=writer, batch_size=50)
+    restarted.commit(commit)
+    restarted.flush()
+
+    assert len(writer.rows["fotmob_ingest_manifest"]) == 1
+
+
+def test_later_run_appends_fresh_observation_for_unchanged_content():
+    writer = ReconcileWriter()
+    previous = _commit(
+        run_id="daily-old",
+        completed_at=datetime(2026, 7, 1, 14, 0),
+    )
+    current = _commit(
+        run_id="daily-new",
+        status=ManifestStatus.NOT_MODIFIED,
+        fetched_at=datetime(2026, 7, 1, 13, 55),
+        completed_at=datetime(2026, 7, 8, 14, 0),
+    )
+    assert previous.batch_id == current.batch_id
+    writer.rows["fotmob_ingest_manifest"] = [previous.manifest_row()]
+
+    repository = FotMobRepository(writer=writer, batch_size=50)
+    repository.commit(current)
+    repository.flush()
+
+    rows = writer.rows["fotmob_ingest_manifest"]
+    assert len(rows) == 2
+    assert [row["run_id"] for row in rows] == ["daily-old", "daily-new"]
+    assert rows[-1]["status"] == "not_modified"
+    assert rows[-1]["completed_at"] == datetime(2026, 7, 8, 14, 0)
+
+
+def test_restart_fails_closed_on_duplicate_exact_manifest_semantics():
+    writer = ReconcileWriter()
+    commit = _commit()
+    row = commit.manifest_row()
+    writer.rows["fotmob_ingest_manifest"] = [dict(row), dict(row)]
+    repository = FotMobRepository(writer=writer, batch_size=50)
+    repository.commit(commit)
+
+    with pytest.raises(RuntimeError, match="has 2 stored rows; expected either 0 or 1"):
+        repository.flush()
 
 
 def test_buffered_manifest_answers_this_runs_incremental_reads():
@@ -481,14 +781,22 @@ class PreloadWriter(RecordingWriter):
         return self.trino
 
 
-def _manifest_row(target_key, batch_id, target_type="match", entity_id=None, completed="2026-07-10 00:00:00"):
+def _manifest_row(
+    target_key,
+    batch_id,
+    target_type="match",
+    entity_id=None,
+    completed="2026-07-10 00:00:00",
+    parser_version=PARSER_VERSION,
+    status="success",
+):
     return (
         target_key,
         batch_id,
         "c" * 64,
         "file:///raw/x.gz",
-        "fotmob-native-v1",
-        "success",
+        parser_version,
+        status,
         completed,
         completed,
         "{}",
@@ -518,6 +826,23 @@ def test_preloaded_manifest_answers_every_target_read_without_a_query():
     assert repository.latest_success("https://example/match/404") is None
     assert repository.latest_entity_success("player", 404) is None
     assert len(writer.trino.queries) == queries_after_preload
+
+
+def test_v1_manifest_rows_are_ineligible_for_v2_skip_state():
+    writer = PreloadWriter(
+        [
+            _manifest_row(
+                "https://example/match/1",
+                "fm1-old",
+                parser_version="fotmob-native-v1",
+            )
+        ]
+    )
+    repository = FotMobRepository(writer=writer)
+
+    assert repository.preload_manifest_index() == 0
+    assert repository.latest_success("https://example/match/1") is None
+    assert f"parser_version = '{PARSER_VERSION}'" in writer.trino.queries[0]
 
 
 def test_a_flushed_commit_stays_visible_to_later_reads():
@@ -683,6 +1008,10 @@ class SeedTrino:
         self.queries.append(sql)
         if self.fail:
             raise RuntimeError("trino down")
+        if "SELECT run_id, batch_id, target_key, content_hash" in sql:
+            return []
+        if "COUNT(*)" in sql:
+            return []
         return self.rows
 
 
@@ -710,8 +1039,11 @@ def test_inventory_preload_dedups_keys_already_written_by_earlier_runs():
     inventory = [call for call in writer.calls if call[1]["table"] == "fotmob_field_inventory"]
     assert len(inventory) == 1
     assert set(inventory[0][0]["json_path"]) == {"content.lineup"}
-    assert len(trino.queries) == 1, "one seeding query per scope, not per row"
-    assert "IN ('47', '47.0')" in trino.queries[0], "both VARCHAR spellings"
+    preload_queries = [query for query in trino.queries if "SELECT DISTINCT" in query]
+    assert len(preload_queries) == 1, "one seeding query per scope, not per row"
+    assert "IN ('47', '47.0')" in preload_queries[0], "both VARCHAR spellings"
+    assert "m.batch_id = i._target_batch_id" in preload_queries[0]
+    assert f"m.parser_version = '{PARSER_VERSION}'" in preload_queries[0]
 
 
 def test_inventory_preload_normalizes_float_string_spellings():
@@ -742,23 +1074,64 @@ def test_inventory_preload_skips_player_scope():
     _inventory_commit(repository, 0, [row])
     _inventory_commit(repository, 1, [])
 
-    assert trino.queries == []
+    assert not any("SELECT DISTINCT" in query for query in trino.queries)
     inventory = [call for call in writer.calls if call[1]["table"] == "fotmob_field_inventory"]
     assert len(inventory) == 1
 
 
-def test_inventory_preload_failure_degrades_to_run_local_dedup():
+def test_inventory_preload_failure_fails_closed():
     trino = SeedTrino([], fail=True)
     writer = SeedWriter(trino)
     repository = FotMobRepository(writer=writer, batch_size=2)
 
-    for index in range(4):
-        _inventory_commit(repository, index, [_inventory_row()])
+    with pytest.raises(RuntimeError, match="trino down"):
+        _inventory_commit(repository, 0, [_inventory_row()])
 
-    assert len(trino.queries) == 1, "a failing scope query must not retry per row"
-    inventory = [call for call in writer.calls if call[1]["table"] == "fotmob_field_inventory"]
-    assert len(inventory) == 1, "run-local dedup still applies"
-    assert len(inventory[0][0]) == 1
+    assert len(trino.queries) == 1
+    assert writer.calls == []
+
+
+def test_inventory_preload_failure_does_not_leave_half_target_buffered():
+    trino = SeedTrino([], fail=True)
+    writer = SeedWriter(trino)
+    repository = FotMobRepository(writer=writer, batch_size=2)
+    commit = _commit()
+    datasets = [
+        TableRows(
+            "fotmob_matches",
+            [
+                {
+                    "competition_id": "47",
+                    "source_season_key": "2025/2026",
+                    "match_id": "1",
+                }
+            ],
+            "matches",
+            ("competition_id", "source_season_key"),
+        ),
+        TableRows(
+            "fotmob_field_inventory",
+            [_inventory_row()],
+            "field_inventory",
+            ("target_type",),
+        ),
+    ]
+
+    with pytest.raises(RuntimeError, match="trino down"):
+        repository.commit(commit, datasets)
+
+    assert repository.flush() == []
+    assert repository._pending == {}
+    assert repository._pending_manifest == []
+
+    trino.fail = False
+    repository.commit(commit, datasets)
+    repository.flush()
+
+    written_tables = [call[1]["table"] for call in writer.calls]
+    assert written_tables.count("fotmob_matches") == 1
+    assert written_tables.count("fotmob_field_inventory") == 1
+    assert written_tables.count("fotmob_ingest_manifest") == 1
 
 
 def test_failed_flush_retry_writes_inventory_rows_exactly_once():

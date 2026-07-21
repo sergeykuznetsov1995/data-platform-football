@@ -8,6 +8,7 @@ HTTP pool and fail-closed native validation.
 from __future__ import annotations
 
 import importlib
+import hashlib
 import sys
 
 import pytest
@@ -47,6 +48,91 @@ def _reload_dag_module():
     # The DAG file lives in /root/data_platform/dags/ which is on sys.path
     # via the conftest.
     return importlib.import_module("dag_ingest_fotmob")
+
+
+def _daily_report(mod):
+    planned = [
+        f"{competition_id}=selected-{competition_id}"
+        for competition_id in mod.FOTMOB_DAILY_COMPETITION_IDS
+    ]
+    operations = [
+        {
+            "entity": "competition_catalog",
+            "status": "success",
+            "errors": [],
+            "retryable": [],
+            "terminal": [],
+            "counts": {"competitions": 555},
+        },
+        *[
+            {
+                "entity": "scope_completion",
+                "status": "success",
+                "errors": [],
+                "retryable": [],
+                "terminal": [],
+                "metadata": {"scope": scope},
+            }
+            for scope in planned
+        ],
+        *[
+            {
+                "entity": "competition_completion",
+                "status": "success",
+                "errors": [],
+                "retryable": [],
+                "terminal": [],
+                "metadata": {"competition_id": competition_id},
+            }
+            for competition_id in mod.FOTMOB_DAILY_COMPETITION_IDS
+        ],
+    ]
+    return {
+        "run_id": "run-daily",
+        "mode": "daily",
+        "status": "success",
+        "complete": True,
+        "operations": operations,
+        "transport": {
+            "attempts": 7_268,
+            "direct_bytes": 193 * 1024 * 1024,
+            "proxy_bytes": 0,
+        },
+        "budget": {
+            "requests": 7_268,
+            "max_requests": mod.FOTMOB_DAILY_MAX_REQUESTS,
+            "direct_bytes": 193 * 1024 * 1024,
+            "max_direct_bytes": mod.FOTMOB_DAILY_MAX_DIRECT_MIB * 1024 * 1024,
+            "proxy_bytes": 0,
+            "max_proxy_bytes": 0,
+        },
+        "errors": [],
+        "selection": {
+            "daily_contract": mod.FOTMOB_DAILY_CONTRACT_SCHEMA,
+            "competition_scope": {
+                "schema": mod.FOTMOB_DAILY_CONTRACT_SCHEMA,
+                "scope_file": mod.FOTMOB_DAILY_SCOPE_FILE,
+                "scope_sha256": mod.FOTMOB_DAILY_SCOPE_SHA256,
+                "scope_count": mod.FOTMOB_DAILY_SCOPE_COUNT,
+                "competition_ids": list(mod.FOTMOB_DAILY_COMPETITION_IDS),
+                "competition_ids_sha256": (
+                    mod.FOTMOB_DAILY_COMPETITION_IDS_SHA256
+                ),
+                "competition_count": mod.FOTMOB_DAILY_COMPETITION_COUNT,
+            },
+            "entities": sorted(mod.FOTMOB_DAILY_ENTITIES),
+            "explicit_scopes": [],
+            "competition_limit": 0,
+            "season_limit": 0,
+            "scope_plan_signature": "fmplan1-" + "a" * 64,
+            "planned_scopes": planned,
+            "completed_scopes": list(planned),
+            "completed_transfer_competition_ids": list(
+                mod.FOTMOB_DAILY_COMPETITION_IDS
+            ),
+            "requests_per_minute": mod.FOTMOB_DAILY_REQUESTS_PER_MINUTE,
+        },
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +210,9 @@ class TestFotmobNativeParams:
         assert params["mode"].default == "daily"
         assert isinstance(params["scope"], Param)
         assert params["scope"].default == ""
+        assert params["daily_contract"].default == ""
+        assert params["competition_scope_file"].default == ""
+        assert params["requests_per_minute"].default == 30
         assert "season" not in params
 
     @pytest.mark.unit
@@ -138,6 +227,13 @@ class TestFotmobNativeParams:
 
         assert '--mode "{{ params.mode }}"' in task.bash_command
         assert '--scope "{{ params.scope }}"' in task.bash_command
+        assert '--daily-contract "{{ params.daily_contract }}"' in task.bash_command
+        assert "--competition-scope-file" in task.bash_command
+        assert '--requests-per-minute "{{ params.requests_per_minute }}"' in (
+            task.bash_command
+        )
+        assert "--requests-per-minute 30" not in task.bash_command
+        assert "--max-proxy-mib 0" in task.bash_command
         assert "--season " not in task.bash_command
         assert "--leagues " not in task.bash_command
 
@@ -155,8 +251,24 @@ class TestDynamicDiscoveryDag:
             op for op in BashOperator._instances if op.task_id == "scrape_fotmob_data"
         )
         assert "{{ ts_nodash }}_{{ ti.try_number }}" in task.bash_command
+        generation = "{{ dag_run.conf['fotmob_publication']['generation_id'] }}"
+        assert f'--publication-generation-id "{generation}"' in task.bash_command
+        for argument in (
+            "--publication-schema",
+            "--publication-source",
+            "--publication-owner",
+            "--publication-data-interval-start",
+            "--publication-data-interval-end",
+            "--publication-runtime-fingerprint",
+        ):
+            assert argument in task.bash_command
+        assert "--run-id" not in task.bash_command
+        assert "guarded-run" not in task.bash_command
+        assert "python dags/scripts/run_fotmob_scraper.py" in task.bash_command
         assert "/tmp/fotmob_result_" in task.bash_command
         assert task._init_kwargs["pool"] == "fotmob_http_pool"
+        assert task._init_kwargs["execution_timeout"].total_seconds() == 8 * 3600
+        assert task._init_kwargs["retries"] == 0
 
     @pytest.mark.unit
     def test_no_hardcoded_tournament_fanout(self):
@@ -174,6 +286,83 @@ class TestDynamicDiscoveryDag:
 
 
 class TestNativeValidation:
+    @pytest.mark.unit
+    def test_daily_requires_exact_cohort_and_complete_scope_and_transfer_sets(
+        self, tmp_path
+    ):
+        import json
+
+        mod = _reload_dag_module()
+        report = tmp_path / "daily.json"
+        payload = _daily_report(mod)
+        report.write_text(json.dumps(payload), encoding="utf-8")
+
+        summary = mod.validate_data(str(report))
+
+        assert summary["selection"]["daily_contract"] == "fotmob-daily-v1"
+        assert summary["selection"]["competition_scope"][
+            "competition_count"
+        ] == 21
+        assert summary["selection"]["completed_scopes"] == summary[
+            "selection"
+        ]["planned_scopes"]
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        ("mutation", "message"),
+        [
+            (
+                lambda payload: payload["selection"]["competition_scope"][
+                    "competition_ids"
+                ].__setitem__(0, 999999),
+                "competition scope mismatch",
+            ),
+            (
+                lambda payload: payload["selection"][
+                    "completed_scopes"
+                ].pop(),
+                "completed scopes differ",
+            ),
+            (
+                lambda payload: payload["selection"][
+                    "completed_transfer_competition_ids"
+                ].pop(),
+                "transfer completions differ",
+            ),
+            (
+                lambda payload: payload["selection"]["entities"].pop(),
+                "entity set mismatch",
+            ),
+            (
+                lambda payload: payload["budget"].__setitem__(
+                    "max_requests", 2_000
+                ),
+                "transport budget mismatch",
+            ),
+            (
+                lambda payload: payload["budget"].__setitem__(
+                    "proxy_bytes", 1
+                ),
+                "direct-only invariant",
+            ),
+        ],
+    )
+    def test_daily_rejects_partial_or_mutated_contract(
+        self, tmp_path, mutation, message
+    ):
+        import json
+
+        from airflow.exceptions import AirflowException
+
+        mod = _reload_dag_module()
+        payload = _daily_report(mod)
+        mutation(payload)
+        report = tmp_path / "daily-mutated.json"
+        report.write_text(json.dumps(payload), encoding="utf-8")
+
+        with pytest.raises(AirflowException, match=message):
+            mod.validate_data(str(report))
+
     @pytest.mark.unit
     def test_legacy_or_missing_mode_is_rejected(self, tmp_path):
         import json
@@ -201,7 +390,7 @@ class TestNativeValidation:
         report.write_text(
             json.dumps(
                 {
-                    "mode": "daily",
+                    "mode": "backfill",
                     "status": "incomplete",
                     "complete": False,
                     "operations": [],
@@ -226,7 +415,7 @@ class TestNativeValidation:
             json.dumps(
                 {
                     "run_id": "run-1",
-                    "mode": "daily",
+                    "mode": "backfill",
                     "status": "success",
                     "complete": True,
                     "operations": [
@@ -255,6 +444,13 @@ class TestNativeValidation:
                     "errors": [],
                     "rows": {"competition_catalog": 10},
                     "tables": ["iceberg.bronze.fotmob_competitions"],
+                    "selection": {
+                        "entities": ["leaderboards", "season"],
+                        "explicit_scopes": ["47=2025/2026"],
+                        "competition_limit": 0,
+                        "season_limit": 0,
+                        "scope_plan_signature": "fmplan1-" + "a" * 64,
+                    },
                 }
             ),
             encoding="utf-8",
@@ -264,6 +460,58 @@ class TestNativeValidation:
 
         assert validation["status"] == "success"
         assert validation["transport"]["proxy_bytes"] == 0
+        assert validation["selection"] == {
+            "entities": ["leaderboards", "season"],
+            "explicit_scope_count": 1,
+            "explicit_scope_sha256": hashlib.sha256(
+                b"47=2025/2026\n"
+            ).hexdigest(),
+            "scope_plan_signature": "fmplan1-" + "a" * 64,
+            "competition_limit": 0,
+            "season_limit": 0,
+        }
+
+    @pytest.mark.unit
+    def test_native_report_requires_bounded_exact_selection_evidence(self, tmp_path):
+        import json
+
+        from airflow.exceptions import AirflowException
+
+        mod = _reload_dag_module()
+        report = tmp_path / "report.json"
+        report.write_text(
+            json.dumps(
+                {
+                    "mode": "backfill",
+                    "status": "success",
+                    "complete": True,
+                    "operations": [
+                        {
+                            "entity": "competition_catalog",
+                            "counts": {"competitions": 1},
+                        }
+                    ],
+                    "transport": {
+                        "attempts": 1,
+                        "direct_bytes": 1,
+                        "proxy_bytes": 0,
+                    },
+                    "budget": {
+                        "requests": 1,
+                        "max_requests": 2,
+                        "direct_bytes": 1,
+                        "max_direct_bytes": 2,
+                        "proxy_bytes": 0,
+                        "max_proxy_bytes": 0,
+                    },
+                    "errors": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with pytest.raises(AirflowException, match="selection evidence"):
+            mod.validate_data(str(report))
 
 
 class TestSilverDependency:
@@ -273,3 +521,13 @@ class TestSilverDependency:
 
         assert mod.trigger_silver._init_kwargs["wait_for_completion"] is True
         assert mod.trigger_silver._init_kwargs["poke_interval"] == 30
+        assert mod.trigger_silver._init_kwargs["allowed_states"] == ["success"]
+        assert mod.trigger_silver._init_kwargs["failed_states"] == ["failed"]
+        assert mod.trigger_silver._init_kwargs["reset_dag_run"] is False
+        assert mod.trigger_silver._init_kwargs["logical_date"] == (
+            "{{ logical_date.isoformat() }}"
+        )
+        assert mod.seal_publication.upstream_task_ids == {
+            "trigger_silver_transform"
+        }
+        assert mod.finalize_publication._init_kwargs["trigger_rule"] == "all_done"

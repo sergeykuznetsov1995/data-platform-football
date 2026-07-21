@@ -45,6 +45,10 @@ from airflow.operators.python import PythonOperator
 from airflow.utils.task_group import TaskGroup
 
 from utils.default_args import SILVER_ARGS
+from utils.fotmob_publication import (
+    fotmob_publication_writer,
+    record_fotmob_silver_candidate,
+)
 
 # ---------------------------------------------------------------------------
 # Silver transform definitions
@@ -80,7 +84,7 @@ SILVER_TRANSFORMS = [
         'dags/sql/silver/fotmob_player_market_value_history.sql',
         'fotmob_player_market_value_history',
     ),
-    # issue #97 Phase A: team-match stats из bronze.fotmob_match_details
+    # issue #97/#930: team-match stats из native match_payloads_current
     # (stats_json + player_stats_json for xA). Питает gold.fct_team_match
     # (5-source) и audit-таблицу — Phase B после gates DQ.
     (
@@ -88,7 +92,7 @@ SILVER_TRANSFORMS = [
         'dags/sql/silver/fotmob_team_match.sql',
         'fotmob_team_match',
     ),
-    # issue #691: per-(match, player) stats из bronze.fotmob_match_details
+    # issue #691/#930: per-(match, player) stats из native match_payloads_current
     # .player_stats_json. Полный паритет колонок с sofascore_player_match_aggregate.
     # Питает gold.fct_player_match как 5-й источник (FotMob xG/xA + counters).
     (
@@ -96,7 +100,7 @@ SILVER_TRANSFORMS = [
         'dags/sql/silver/fotmob_player_match_aggregate.sql',
         'fotmob_player_match_aggregate',
     ),
-    # issue #693: per-(match, player) lineup из bronze.fotmob_match_details
+    # issue #693/#930: per-(match, player) lineup из native match_payloads_current
     # .lineup_json (starters/subs × home/away). Питает FotMob-ветку
     # gold.fct_lineup (is_starter + jersey + position-code; is_captain=NULL).
     (
@@ -180,11 +184,12 @@ def _run_transform(sql_file: str, table_name: str, **context) -> Dict[str, Any]:
     """Run a single Silver CTAS transform (imports lazy to keep parse-time light)."""
     from utils.silver_tasks import run_silver_transform
 
-    return run_silver_transform(
-        sql_file=sql_file,
-        table_name=table_name,
-        schema='silver',
-    )
+    with fotmob_publication_writer(context):
+        return run_silver_transform(
+            sql_file=sql_file,
+            table_name=table_name,
+            schema='silver',
+        )
 
 
 def _validate_silver(**context) -> Dict[str, Any]:
@@ -196,10 +201,11 @@ def _validate_silver(**context) -> Dict[str, Any]:
 
     logger = logging.getLogger(__name__)
 
-    validation = validate_silver_tables(
-        tables=SILVER_MIN_ROWS,
-        min_rows=1,
-    )
+    with fotmob_publication_writer(context):
+        validation = validate_silver_tables(
+            tables=SILVER_MIN_ROWS,
+            min_rows=1,
+        )
 
     logger.info(f"Silver validation result: {validation['status']}")
     logger.info(f"Table details: {validation['details']}")
@@ -214,7 +220,7 @@ def _validate_silver(**context) -> Dict[str, Any]:
     return validation
 
 
-def _validate_silver_quality(**context) -> Dict[str, Any]:
+def _validate_silver_quality_unfenced(**context) -> Dict[str, Any]:
     """DQ checks: PK uniqueness, no_nulls на PK, row_count, freshness, value_range."""
     import logging
 
@@ -699,6 +705,13 @@ def _validate_silver_quality(**context) -> Dict[str, Any]:
     }
 
 
+def _validate_silver_quality(**context) -> Dict[str, Any]:
+    """Hold the same generation guard across every Silver DQ query."""
+
+    with fotmob_publication_writer(context):
+        return _validate_silver_quality_unfenced(**context)
+
+
 # ---------------------------------------------------------------------------
 # DAG definition
 # ---------------------------------------------------------------------------
@@ -719,7 +732,8 @@ with DAG(
     Materialises Silver tables from raw Bronze FotMob data.
 
     ### Trigger
-    Манульный или из master pipeline / ingest DAG.
+    Только из ``dag_ingest_fotmob`` с точным ``fotmob_publication`` binding и
+    активным writer lock. Прямой ручной trigger намеренно fail-closed до CTAS.
 
     ### Silver Tables
 
@@ -735,7 +749,7 @@ with DAG(
     | `fotmob_team_profile` | Профиль команды per-season (страна, стадион, позиция) | team_snapshots_current — issue #600 |
     | `fotmob_team_standings` | Турнирная таблица per-season (place/W/D/L/GF/GA/pts) | standings_current — issue #600 |
     | `fotmob_team_leaderboards` | Long-form командные лидерборды (rank + value per stat) | leaderboards_current — issue #600 |
-    | `fotmob_transfers` | Трансферные события (player, clubs, fee, loan) | fotmob_transfers — issue #600 |
+    | `fotmob_transfers` | Трансферные события (player, clubs, fee, loan) | transfer_events_current + frozen legacy history bridge — #600/#930 |
 
     ### Transformations
     - **Dedup** на (player_id, league, season) через ROW_NUMBER + native lineage.
@@ -751,10 +765,10 @@ with DAG(
     - freshness 48h — WARNING
     - value_range minutes_played / goals / fotmob_rating — WARNING
 
-    ### Manual Trigger
-    ```bash
-    airflow dags trigger dag_transform_fotmob_silver
-    ```
+    ### Publication fence
+    Все CTAS и DQ выполняются только в фазе ``writing``. После обоих DQ DAG
+    записывает immutable candidate; ingest переводит его в ``ready`` лишь
+    после успешного завершения этого DAG.
     """,
 ) as dag:
 
@@ -772,13 +786,23 @@ with DAG(
     validate_silver = PythonOperator(
         task_id='validate_silver',
         python_callable=_validate_silver,
-        trigger_rule='all_done',
     )
 
     validate_quality = PythonOperator(
         task_id='validate_silver_quality',
         python_callable=_validate_silver_quality,
-        trigger_rule='all_done',
     )
 
-    transforms_group >> validate_silver >> validate_quality
+    record_candidate = PythonOperator(
+        task_id='record_fotmob_silver_candidate',
+        python_callable=record_fotmob_silver_candidate,
+        op_kwargs={
+            'transform_task_ids': [
+                f'silver_transforms.{task_id}'
+                for task_id, _sql_file, _table_name in SILVER_TRANSFORMS
+            ],
+        },
+        retries=0,
+    )
+
+    transforms_group >> validate_silver >> validate_quality >> record_candidate

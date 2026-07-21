@@ -52,25 +52,6 @@ class TestUnderstatIntegration:
 
 
 # =============================================================================
-# FotMob Tests (No Tor Required)
-# =============================================================================
-
-@pytest.mark.integration
-class TestFotMobIntegration:
-    """Integration tests for FotMob scraper."""
-
-    def test_read_schedule(self, fotmob_scraper, skip_if_no_network, integration_delay):
-        """Test reading FotMob schedule with real request."""
-        df = fotmob_scraper.read_schedule()
-
-        assert df is not None, "DataFrame should not be None"
-        assert isinstance(df, pd.DataFrame), "Result should be a DataFrame"
-        assert len(df) > 0, "DataFrame should not be empty"
-        assert '_source' in df.columns, "Should have metadata column"
-        assert df['_source'].iloc[0] == 'fotmob', "Source should be 'fotmob'"
-
-
-# =============================================================================
 # ESPN Tests (No Tor Required)
 # =============================================================================
 

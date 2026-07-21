@@ -72,7 +72,7 @@ class TestFotmobManagerProfileSql:
                     "coach_scope"):
             assert re.search(rf"\b{cte}\b", sql), (
                 f"must contain framework CTE `{cte}` "
-                "(see /root/fotmob-runtime/cutover-framework.md)"
+                "(see docs/architecture/fotmob-native-silver.md)"
             )
         assert "iceberg.bronze.fotmob_season_teams_current" in sql, (
             "season scope must be built from fotmob_season_teams_current"

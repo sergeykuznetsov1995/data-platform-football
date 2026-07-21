@@ -279,13 +279,51 @@ class FotMobTransport:
         self.max_stale_seconds = max_stale_seconds
         self.rate_limiter = rate_limiter
         self.sleep_fn = sleep_fn
+        self._default_sleep = sleep_fn is time.sleep
         self.jitter_fn = jitter_fn
         self.backoff_base = max(0.0, backoff_base)
         self.jitter_seconds = max(0.0, jitter_seconds)
         self.max_retry_delay = max(0.0, max_retry_delay)
         self._stats_lock = threading.Lock()
+        self._cancelled = threading.Event()
         self._stats: dict[str, Any] = {}
         self.reset_stats()
+
+    def cancel(self) -> None:
+        """Interrupt retry/rate-limit waits and close pooled connections."""
+
+        self._cancelled.set()
+        close = getattr(self.session, "close", None)
+        if close is not None:
+            close()
+
+    def _raise_if_cancelled(self) -> None:
+        if self._cancelled.is_set():
+            raise RuntimeError("FotMob transport cancelled")
+
+    def _sleep_interruptibly(self, delay: float) -> None:
+        delay = max(0.0, float(delay))
+        if self._default_sleep:
+            if self._cancelled.wait(delay):
+                self._raise_if_cancelled()
+            return
+        self.sleep_fn(delay)
+        self._raise_if_cancelled()
+
+    def _acquire_rate_limit(self) -> None:
+        if self.rate_limiter is None:
+            return
+        acquire = self.rate_limiter.acquire
+        while True:
+            self._raise_if_cancelled()
+            try:
+                acquired = acquire(timeout=0.25)
+            except TypeError:
+                # Compatibility for small injected limiters. Production's
+                # limiter supports bounded waits and remains cancellable.
+                acquired = acquire()
+            if acquired is not False:
+                return
 
     def reset_stats(self) -> None:
         with self._stats_lock:
@@ -559,6 +597,7 @@ class FotMobTransport:
         params: Optional[Params] = None,
     ) -> FetchResult:
         """Read and validate a target without making a network request."""
+        self._raise_if_cancelled()
         target = canonicalize_target(url_or_endpoint, params)
         self._start_target()
         body, record, cache_error = self._load_cache(target)
@@ -623,6 +662,7 @@ class FotMobTransport:
         """
 
         target = canonicalize_target(url)
+        self._raise_if_cancelled()
         self._start_target()
         attempts = 0
         network_bytes = 0
@@ -630,8 +670,8 @@ class FotMobTransport:
         last_error: Optional[str] = None
         while attempts < self.max_attempts:
             attempts += 1
-            if self.rate_limiter is not None:
-                self.rate_limiter.acquire()
+            self._acquire_rate_limit()
+            self._raise_if_cancelled()
             response: Optional[requests.Response] = None
             try:
                 response = self.session.get(
@@ -669,7 +709,7 @@ class FotMobTransport:
                 if retryable:
                     last_error = f"FotMob returned retryable HTTP {last_status}"
                     if attempts < self.max_attempts:
-                        self.sleep_fn(
+                        self._sleep_interruptibly(
                             self._retry_delay(
                                 attempts, response.headers.get("Retry-After")
                             )
@@ -738,9 +778,10 @@ class FotMobTransport:
                 )
             except (requests.RequestException, Urllib3HTTPError, OSError) as exc:
                 self._record_attempt("exception", 0)
+                self._raise_if_cancelled()
                 last_error = f"request failed: {type(exc).__name__}: {exc}"
                 if attempts < self.max_attempts:
-                    self.sleep_fn(self._retry_delay(attempts, None))
+                    self._sleep_interruptibly(self._retry_delay(attempts, None))
                     continue
                 return self._finish(
                     self._result(
@@ -767,6 +808,7 @@ class FotMobTransport:
         *,
         allow_stale_on_error: bool = True,
     ) -> FetchResult:
+        self._raise_if_cancelled()
         target = canonicalize_target(url_or_endpoint, params)
         self._start_target()
         cached_body, cached_record, cache_error = self._load_cache(target)
@@ -783,8 +825,8 @@ class FotMobTransport:
         last_error = cache_error
         while attempts < self.max_attempts:
             attempts += 1
-            if self.rate_limiter is not None:
-                self.rate_limiter.acquire()
+            self._acquire_rate_limit()
+            self._raise_if_cancelled()
             response: Optional[requests.Response] = None
             try:
                 response = self.session.get(
@@ -896,7 +938,7 @@ class FotMobTransport:
                 if retryable:
                     last_error = f"FotMob returned retryable HTTP {last_status}"
                     if attempts < self.max_attempts:
-                        self.sleep_fn(
+                        self._sleep_interruptibly(
                             self._retry_delay(
                                 attempts,
                                 response.headers.get("Retry-After"),
@@ -1023,9 +1065,10 @@ class FotMobTransport:
                 )
             except (requests.RequestException, Urllib3HTTPError, OSError) as exc:
                 self._record_attempt("exception", 0)
+                self._raise_if_cancelled()
                 last_error = f"request failed: {type(exc).__name__}: {exc}"
                 if attempts < self.max_attempts:
-                    self.sleep_fn(self._retry_delay(attempts, None))
+                    self._sleep_interruptibly(self._retry_delay(attempts, None))
                     continue
                 return self._stale_or_failure(
                     target=target,
@@ -1052,7 +1095,3 @@ class FotMobTransport:
             allow_stale_on_error=allow_stale_on_error,
             error=last_error or "unknown transport failure",
         )
-
-
-# Compact alias for dependency-injected call sites.
-Transport = FotMobTransport

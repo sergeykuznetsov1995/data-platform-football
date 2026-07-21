@@ -164,7 +164,7 @@ def _event_year(value: Any, fallback: int) -> int:
     return int(match.group(0)) if match else fallback
 
 
-def _is_source_missing_match_payload(data: Any) -> bool:
+def _is_source_missing_match_payload(data: Any, requested_match_id: str | int) -> bool:
     """FotMob answers HTTP 200 with this exact error body when a match has no
     stored details (deep history, abandoned fixtures). Anything looser — extra
     keys, another message — must keep falling through to schema drift."""
@@ -173,6 +173,8 @@ def _is_source_missing_match_payload(data: Any) -> bool:
         isinstance(data, Mapping)
         and data.get("error") is True
         and str(data.get("message", "")).strip().lower() == "data not found"
+        and "matchId" in data
+        and str(data.get("matchId")) == str(requested_match_id)
         and set(data) <= {"error", "matchId", "message"}
     )
 
@@ -206,7 +208,10 @@ def _fetch_manifest_status(fetch: FetchResult) -> ManifestStatus:
     if fetch.outcome == FetchOutcome.NOT_MODIFIED:
         return ManifestStatus.NOT_MODIFIED
     if fetch.outcome == FetchOutcome.NOT_AVAILABLE:
-        return ManifestStatus.NOT_AVAILABLE
+        # HTTP 204/404 (and a generic JSON null body) proves only that this URL
+        # did not yield content. It cannot tombstone an advertised source
+        # entity. Entity parsers opt into NOT_AVAILABLE only with scoped proof.
+        return ManifestStatus.TERMINAL_FAILURE
     if fetch.outcome == FetchOutcome.RETRYABLE_FAILURE:
         return ManifestStatus.RETRYABLE_FAILURE
     return ManifestStatus.TERMINAL_FAILURE
@@ -334,6 +339,7 @@ class FotMobIngestService:
         self.ledger = BudgetLedger(budget or TransportBudget())
         self.max_workers = min(int(max_workers), 16)
         self._budget_lock = threading.Lock()
+        self._cancelled = threading.Event()
         self._next_build_id: Optional[str] = None
         self.repository.ensure_schema()
         # One query up front replaces one per target: incremental planning asks
@@ -341,6 +347,18 @@ class FotMobIngestService:
         preload = getattr(self.repository, "preload_manifest_index", None)
         if preload is not None:
             preload()
+
+    def cancel(self) -> None:
+        """Cooperatively stop scheduling/retrying worker requests."""
+
+        self._cancelled.set()
+        cancel_transport = getattr(self.transport, "cancel", None)
+        if cancel_transport is not None:
+            cancel_transport()
+
+    def _raise_if_cancelled(self) -> None:
+        if self._cancelled.is_set():
+            raise RuntimeError("FotMob ingestion cancelled")
 
     def _account(self, fetch: FetchResult) -> None:
         with self._budget_lock:
@@ -357,9 +375,11 @@ class FotMobIngestService:
         *,
         replay: bool = False,
     ) -> FetchResult:
+        self._raise_if_cancelled()
         if replay or self.mode == RunMode.REPLAY:
             fetch = self.transport.replay_json(endpoint, params)
             self._account(fetch)
+            self._raise_if_cancelled()
             return fetch
         with self._budget_lock:
             max_attempts = max(1, int(getattr(self.transport, "max_attempts", 1)))
@@ -370,6 +390,7 @@ class FotMobIngestService:
                 )
         fetch = self.transport.fetch_json(endpoint, params)
         self._account(fetch)
+        self._raise_if_cancelled()
         return fetch
 
     def _fetch_many(
@@ -385,6 +406,7 @@ class FotMobIngestService:
             unique.setdefault(key, (endpoint, params))
         if not unique:
             return {}
+        self._raise_if_cancelled()
         # A single transport call may consume max_attempts.  Do not launch a
         # concurrent wave that could cross the hard request ceiling.
         max_attempts = max(1, int(getattr(self.transport, "max_attempts", 1)))
@@ -408,6 +430,7 @@ class FotMobIngestService:
                 for key, (endpoint, params) in unique.items()
             }
             for future in as_completed(futures):
+                self._raise_if_cancelled()
                 key = futures[future]
                 try:
                     output[key] = future.result()
@@ -444,6 +467,7 @@ class FotMobIngestService:
             source_season_key=source_season_key,
             entity_id=(str(entity_id) if entity_id is not None else None),
             content_hash=fetch.content_hash,
+            observation_id=self.run_id if target_type == "all_leagues" else None,
             raw_uri=fetch.raw_uri,
             fetch_outcome=fetch.status,
             http_status=fetch.http_status,
@@ -487,15 +511,8 @@ class FotMobIngestService:
     @staticmethod
     def _record_failure(result: OperationResult, key: str, fetch: FetchResult) -> None:
         if fetch.outcome == FetchOutcome.NOT_AVAILABLE:
-            # A transport NOT_AVAILABLE is terminal by construction (204/404 or a
-            # 200 ``null`` body — distinct from the retryable class), so the
-            # target is definitively absent at source (e.g. delisted deep-history
-            # teams whose /api/data/teams?id=… returns ``null``). Count it as an
-            # intentional absence so its scope can close instead of re-requesting
-            # the same empty target every iteration and stalling the plan.
-            result.not_available += 1
-            result.metadata["intentional_not_available"] = (
-                int(result.metadata.get("intentional_not_available", 0)) + 1
+            result.terminal.append(
+                f"{key}: unscoped transport absence ({fetch.http_status})"
             )
         elif fetch.outcome == FetchOutcome.RETRYABLE_FAILURE:
             result.retryable.append(key)
@@ -541,6 +558,21 @@ class FotMobIngestService:
         except Exception as exc:
             result.errors.append(f"allLeagues: {type(exc).__name__}: {exc}")
             return CatalogResult(result)
+        # STALE_REPLAY means source validation failed and transport supplied
+        # an older last-good body. Calling it a new complete catalog could
+        # tombstone competitions based only on an old cache, so fail closed.
+        # A real source-validated 304 remains authoritative below.
+        if fetch.outcome == FetchOutcome.STALE_REPLAY:
+            self._commit_for_fetch(
+                fetch,
+                target_type="all_leagues",
+                status=ManifestStatus.RETRYABLE_FAILURE,
+                error_code="stale_catalog_replay",
+                error=fetch.error or "allLeagues source validation failed",
+            )
+            result.retryable.append(fetch.url)
+            result.metadata["stale_replay_rejected"] = True
+            return CatalogResult(result, fetch=fetch)
         if not fetch.ok:
             self._commit_for_fetch(fetch, target_type="all_leagues")
             self._record_failure(result, fetch.url, fetch)
@@ -560,13 +592,30 @@ class FotMobIngestService:
             observed = utc_now()
             rows: list[dict[str, Any]] = []
             current_ids = {item.competition_id for item in discovery.competitions}
-            previous_snapshots = self.repository.previous_catalog_snapshots(2)
+            authoritative_observation = (
+                self.mode != RunMode.REPLAY
+                and fetch.outcome
+                in {FetchOutcome.SUCCESS, FetchOutcome.NOT_MODIFIED}
+                and fetch.attempts > 0
+                and not fetch.stale
+            )
+            # Offline replay reparses cached v2 bytes for migration/validation,
+            # but cannot prove a new source observation and therefore cannot
+            # advance the two-complete-absence tombstone policy.
+            previous_snapshots = (
+                self.repository.previous_catalog_snapshots(2)
+                if authoritative_observation
+                else []
+            )
             tombstoned_ids = (
                 tombstones_after_two_absences(
                     previous_snapshots[0], previous_snapshots[1], current_ids
                 )
                 if len(previous_snapshots) >= 2
                 else set()
+            )
+            result.metadata["authoritative_source_observation"] = (
+                authoritative_observation
             )
             for competition in discovery.competitions:
                 classification = classify_competition(competition)
@@ -1147,6 +1196,58 @@ class FotMobIngestService:
         )
         descriptors = (*bundle.player_categories, *bundle.team_categories)
         result.attempted = len(descriptors)
+        # Manifest replacement uses the advertised category name so a rotated
+        # or removed fetchAllUrl remains the same logical snapshot across v1
+        # and v2. That identity is safe only when it is present and unique
+        # across the combined player/team descriptor set; refuse ambiguous
+        # source metadata before publishing any partial replacements.
+        category_owners: dict[str, tuple[int, str]] = {}
+        identity_errors: list[tuple[int, Any, str]] = []
+        for index, descriptor in enumerate(descriptors):
+            name = descriptor.name
+            normalized_name = name.strip() if isinstance(name, str) else ""
+            if not normalized_name:
+                identity_errors.append(
+                    (index, descriptor, "leaderboard category name is missing")
+                )
+                continue
+            previous = category_owners.get(normalized_name)
+            if previous is not None:
+                identity_errors.append(
+                    (
+                        index,
+                        descriptor,
+                        "duplicate leaderboard category name "
+                        f"{normalized_name!r}; first advertised as "
+                        f"{previous[1]} at index {previous[0]}",
+                    )
+                )
+                continue
+            category_owners[normalized_name] = (index, descriptor.participant_type)
+        if identity_errors:
+            for index, descriptor, error in identity_errors:
+                target_key = hashlib.sha256(
+                    (
+                        f"leaderboard-identity:{bundle.scope.identity}:"
+                        f"{descriptor.participant_type}:{index}:"
+                        f"{descriptor.name!r}"
+                    ).encode("utf-8")
+                ).hexdigest()
+                self.repository.record(
+                    TargetCommit(
+                        run_id=self.run_id,
+                        target_type="leaderboard",
+                        target_key=target_key,
+                        competition_id=str(bundle.scope.competition_id),
+                        source_season_key=bundle.scope.source_season_key,
+                        entity_id=descriptor.name,
+                        status=ManifestStatus.SCHEMA_DRIFT,
+                        error_code="ambiguous_leaderboard_identity",
+                        error=error,
+                    )
+                )
+                result.errors.append(error)
+            return result
         seen_urls: set[tuple[str, str]] = set()
         for index, descriptor in enumerate(descriptors):
             key = (
@@ -1286,11 +1387,12 @@ class FotMobIngestService:
     ) -> OperationResult:
         """Fetch or resume one league-filtered global transfer stream.
 
-        Page one is conditionally revalidated on a resumed backfill.  When its
-        content hash is unchanged, already committed later pages are replayed
-        from raw with zero HTTP before pagination continues at the first
-        missing page.  A changed first-page anchor invalidates that shortcut
-        and refetches the stream, preventing page shifts from creating gaps.
+        ``max_pages`` bounds network pages, not zero-cost raw replays. A
+        resumed backfill reconstructs every contiguous committed page from raw
+        and spends its remaining budget on the first missing page. Page one is
+        revalidated when the bound has room for both the anchor and progress;
+        a one-page bound uses the last validated anchor so it cannot starve the
+        continuation forever.
         """
 
         stream_window = "1year" if recent_only else "all"
@@ -1310,7 +1412,24 @@ class FotMobIngestService:
         fallback_year = datetime.now(timezone.utc).year
         page_one_changed = False
         resumed_pages = 0
-        for page in range(1, max_pages + 1):
+        network_pages = 0
+        page = 1
+        resume_allowed = self.mode == RunMode.BACKFILL
+        page_one_params: dict[str, Any] = {
+            "leagueIds": str(int(competition_id)),
+            "page": 1,
+        }
+        if recent_only:
+            page_one_params["last"] = "1year"
+        page_one_target = canonicalize_target("transfers", page_one_params)
+        page_one_previous = (
+            self.repository.latest_success(page_one_target.target_key)
+            if resume_allowed
+            else None
+        )
+        skip_anchor_revalidation = page_one_previous is not None and max_pages == 1
+
+        while True:
             params: dict[str, Any] = {
                 "leagueIds": str(int(competition_id)),
                 "page": page,
@@ -1320,15 +1439,16 @@ class FotMobIngestService:
             target = canonicalize_target("transfers", params)
             previous = (
                 self.repository.latest_success(target.target_key)
-                if self.mode == RunMode.BACKFILL
+                if resume_allowed
                 else None
             )
             replay_page = bool(
-                page > 1
+                previous is not None
                 and not page_one_changed
-                and previous is not None
-                and previous.get("parser_version") == PARSER_VERSION
+                and (page > 1 or skip_anchor_revalidation)
             )
+            if not replay_page and network_pages >= max_pages:
+                break
             result.attempted += 1
             try:
                 fetch = self._fetch(
@@ -1336,15 +1456,29 @@ class FotMobIngestService:
                     replay=replay_page,
                 )
                 if replay_page and not fetch.ok:
+                    if network_pages >= max_pages:
+                        result.retryable.append(
+                            f"transfers page {page}: raw checkpoint unavailable "
+                            "and network-page bound is exhausted"
+                        )
+                        break
                     fetch = self._fetch(target.canonical_url)
                     replay_page = False
+                    network_pages += 1
+                elif not replay_page:
+                    network_pages += 1
             except Exception as exc:
                 result.errors.append(f"transfers page {page}: {exc}")
                 break
             if replay_page:
                 resumed_pages += 1
-            if page == 1 and previous is not None:
-                page_one_changed = previous.get("content_hash") != fetch.content_hash
+            if page == 1 and page_one_previous is not None and not replay_page:
+                page_one_changed = (
+                    page_one_previous.get("content_hash") != fetch.content_hash
+                )
+                if page_one_changed:
+                    # Later raw pages belong to a shifted pagination anchor.
+                    resume_allowed = False
             if not fetch.ok:
                 self._commit_for_fetch(
                     fetch,
@@ -1378,45 +1512,47 @@ class FotMobIngestService:
                     raise CatalogShapeError(
                         f"unclassified transfer JSON paths: {list(unknown)}"
                     )
-                paths = self._commit_for_fetch(
-                    fetch,
-                    target_type="transfers_page",
-                    competition_id=competition_id,
-                    entity_id=f"{stream_window}:{page}",
-                    datasets=[
-                        TableRows(
-                            "fotmob_transfer_events",
-                            new_rows,
-                            "transfer_events",
-                        ),
-                        TableRows(
-                            "fotmob_field_inventory",
-                            inventory,
-                            "field_inventory",
-                            partition_cols=("target_type",),
-                        ),
-                    ],
-                    expected_counts={"transfer_events": len(new_rows)},
-                    capabilities={
-                        "stream_key": stream_key,
-                        "stream_window": stream_window,
-                        "source_hits": expected_hits,
-                        "source_page": page,
-                        "source_page_rows": len(rows),
-                        "unique_seen": len(unique_ids),
-                        "page_identity_hash": _content_hash(
-                            row["transfer_event_id"] for row in rows
-                        ),
-                    },
-                    unknown_paths=unknown,
-                )
-                result.tables.extend(paths)
+                if not replay_page:
+                    paths = self._commit_for_fetch(
+                        fetch,
+                        target_type="transfers_page",
+                        competition_id=competition_id,
+                        entity_id=f"{stream_window}:{page}",
+                        datasets=[
+                            TableRows(
+                                "fotmob_transfer_events",
+                                new_rows,
+                                "transfer_events",
+                            ),
+                            TableRows(
+                                "fotmob_field_inventory",
+                                inventory,
+                                "field_inventory",
+                                partition_cols=("target_type",),
+                            ),
+                        ],
+                        expected_counts={"transfer_events": len(new_rows)},
+                        capabilities={
+                            "stream_key": stream_key,
+                            "stream_window": stream_window,
+                            "source_hits": expected_hits,
+                            "source_page": page,
+                            "source_page_rows": len(rows),
+                            "unique_seen": len(unique_ids),
+                            "page_identity_hash": _content_hash(
+                                row["transfer_event_id"] for row in rows
+                            ),
+                        },
+                        unknown_paths=unknown,
+                    )
+                    result.tables.extend(paths)
                 result.succeeded += 1
                 result.counts["events"] = len(unique_ids)
                 if expected_hits is not None and len(unique_ids) >= expected_hits:
                     break
                 if not rows:
                     break
+                page += 1
             except Exception as exc:
                 result.errors.append(
                     f"transfers page {page} parse: {type(exc).__name__}: {exc}"
@@ -1443,6 +1579,9 @@ class FotMobIngestService:
         result.metadata["source_hits"] = expected_hits
         result.metadata["page_one_changed"] = page_one_changed
         result.metadata["resumed_raw_pages"] = resumed_pages
+        result.metadata["network_pages"] = network_pages
+        if expected_hits is not None and len(unique_ids) < expected_hits:
+            result.metadata["next_missing_page"] = page
         return result
 
     @staticmethod
@@ -1551,7 +1690,7 @@ class FotMobIngestService:
                 )
                 self._record_failure(result, key, fetch)
                 continue
-            if _is_source_missing_match_payload(fetch.data):
+            if _is_source_missing_match_payload(fetch.data, key):
                 self._commit_for_fetch(
                     fetch,
                     target_type="match",
@@ -1723,6 +1862,7 @@ class FotMobIngestService:
         *,
         refresh_after: timedelta = timedelta(hours=20),
         limit: Optional[int] = None,
+        allow_advertised_absence: bool = False,
     ) -> tuple[OperationResult, set[int]]:
         teams = list(bundle.teams)
         result = OperationResult(
@@ -1771,12 +1911,47 @@ class FotMobIngestService:
                 continue
             fetch = outcome
             if not fetch.ok:
-                self._commit_for_fetch(
-                    fetch,
-                    target_type="team",
-                    entity_id=key,
-                )
-                self._record_failure(result, key, fetch)
+                if (
+                    allow_advertised_absence
+                    and fetch.outcome == FetchOutcome.NOT_AVAILABLE
+                ):
+                    # Historical season payloads can advertise teams whose
+                    # global /teams endpoint has since been removed. Resolve
+                    # that proven deep-history absence without publishing a
+                    # NOT_AVAILABLE tombstone: a last-good global snapshot may
+                    # still be serving a current season and must remain visible.
+                    self._commit_for_fetch(
+                        fetch,
+                        target_type="team",
+                        status=ManifestStatus.EXCLUDED,
+                        competition_id=bundle.scope.competition_id,
+                        source_season_key=bundle.scope.source_season_key,
+                        entity_id=key,
+                        exclusions=(
+                            {
+                                "reason": "advertised_historical_team_unavailable",
+                                "scope": (
+                                    f"{bundle.scope.competition_id}="
+                                    f"{bundle.scope.source_season_key}"
+                                ),
+                            },
+                        ),
+                        error_code="source_historical_team_unavailable",
+                        error=(
+                            "advertised historical team has no global source payload"
+                        ),
+                    )
+                    result.not_available += 1
+                    result.metadata["intentional_not_available"] = (
+                        int(result.metadata.get("intentional_not_available", 0)) + 1
+                    )
+                else:
+                    self._commit_for_fetch(
+                        fetch,
+                        target_type="team",
+                        entity_id=key,
+                    )
+                    self._record_failure(result, key, fetch)
                 continue
             try:
                 observed = _aware_datetime(fetch.fetched_at) or utc_now()
@@ -1882,6 +2057,12 @@ class FotMobIngestService:
             data = nested.get("data") if isinstance(nested, Mapping) else None
         if not isinstance(data, Mapping):
             raise CatalogShapeError("player Next payload lacks pageProps.data")
+        source_player_id = data.get("id") if "id" in data else None
+        if type(source_player_id) is not int or source_player_id != player_id:
+            raise CatalogShapeError(
+                "player Next payload id mismatch: "
+                f"requested {player_id}, received {source_player_id!r}"
+            )
         primary_team = data.get("primaryTeam") or {}
         main_league = data.get("mainLeague") or {}
         position = data.get("positionDescription")
@@ -1895,7 +2076,7 @@ class FotMobIngestService:
         if isinstance(contract_end, Mapping):
             contract_end = contract_end.get("utcTime")
         return {
-            "player_id": str(data.get("id") or player_id),
+            "player_id": str(player_id),
             "name": data.get("name"),
             "birth_date": data.get("birthDate"),
             "is_coach": data.get("isCoach"),

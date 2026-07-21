@@ -1076,17 +1076,14 @@ def _fetch_fotmob_players(
 ) -> List[Dict[str, Any]]:
     """Read FotMob player anchor rows for the resolver cascade.
 
-    Identity (player_id + name + team) comes from ``silver.fotmob_lineup``
-    (per-match lineups parsed from bronze.fotmob_match_details.lineup_json),
-    NOT from ``bronze.fotmob_player_details``. Rationale (#825): the
-    player_details scraper seeds player ids from the *current* team squads
-    (``_get_team_data`` takes no season arg), so its historical partitions
-    carry today's squad members rather than the players who actually appeared
-    that season — only ~41/620 anchors survived for 2016/17. fotmob_lineup is
-    season-accurate (team_name = the team the player lined up for in that
-    match), giving a full anchor per real season participant across all 10
-    seasons. primary_team = the team with the most appearances that season
-    (max_by) so a mid-season transfer maps to its dominant club.
+    Identity (player_id + name + team) comes from ``silver.fotmob_lineup``,
+    parsed from native ``bronze.fotmob_match_payloads_current.lineup_json``.
+    It deliberately does not use global player or current-squad snapshots:
+    those describe observation-time membership, not the club a player
+    represented in a historical season. The lineup contract is season-accurate
+    (team_name = the team the player appeared for in that match), and
+    ``primary_team`` is the team with the most appearances that season
+    (``max_by``), so a mid-season transfer maps to its dominant club (#825).
 
     The minutes-played signal comes from the native-backed
     ``silver.fotmob_player_season_profile`` (outfield) plus its

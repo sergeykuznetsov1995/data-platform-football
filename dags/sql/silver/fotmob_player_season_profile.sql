@@ -52,7 +52,7 @@ WITH
 -- ============================================================================
 -- [CUTOVER-FRAMEWORK #930] Сезонный скоуп для глобальных native-снапшотов.
 -- Синхронизируемая копия: НЕ менять имена CTE и выражение season-слага.
--- Источник истины: /root/fotmob-runtime/cutover-framework.md
+-- Контракт: docs/architecture/fotmob-native-silver.md
 -- ============================================================================
 
 -- 1) Обратная карта competition_id -> legacy league. INNER JOIN к ней — это
@@ -112,8 +112,8 @@ team_scope AS (
 -- 4) ТЕКУЩИЙ сезон: членство из живого ростера. squad_snapshots — глобальный
 --    снапшот «сейчас» (field_map: observed roster, never historical), поэтому
 --    клеится ТОЛЬКО к is_current_season — иначе сегодняшний состав налипнет
---    на прошлые сезоны (легаси-баг seasonless_source_snapshot_replicated_as_
---    _historical, который migrate_fotmob_native.py карантинит).
+--    на прошлые сезоны (класс бага seasonless_source_snapshot_replicated_as_
+--    _historical из замороженного legacy-контура).
 squad_scope AS (
     SELECT DISTINCT
         ts.league,

@@ -5,11 +5,12 @@ table:
   fullyQualifiedName: trino_iceberg.iceberg.silver.fotmob_team_profile
   description: |
     Conform-only профиль команды per-season из FotMob (issue #600).
-    Один row per (team_id, league, season). Источник: bronze.fotmob_team_profile
-    (endpoint /api/data/teams). Снапшотные/JSON-колонки (next_match/last_match/
-    overview_season/history_seasons_count) не переносятся. canonical_id не
+    Один row per (team_id, league, season). Сезонный scope берётся из
+    bronze.fotmob_season_teams_current, глобальный профиль — из
+    team_snapshots_current, позиция — из standings_current. Снапшотные/JSON-
+    колонки не переносятся. canonical_id не
     резолвится — храним numeric team_id + team_name, резолв в Gold (charter §5).
-    Дедуп: ROW_NUMBER per (team_id, league, season) ORDER BY _ingested_at DESC.
+    Native current views выбирают последние успешные manifest batches.
   tags:
     - Tier.Silver
     - Domain.Football
@@ -26,10 +27,10 @@ columns:
   - name: venue
     description: Название домашнего стадиона.
   - name: table_position
-    description: Текущее место в таблице (TRY_CAST из bronze overview_table_position varchar).
+    description: Текущее место в native standings_current (table_type='all').
   - name: _bronze_ingested_at
-    description: Timestamp Bronze ingest'а (для freshness).
+    description: Timestamp native-наблюдения Bronze (для freshness).
   - name: league
     description: Лига (partition key).
   - name: season
-    description: Сезон — slug ('2526'), из bronze season bigint через LPAD(MOD(season,100))||LPAD(MOD(season+1,100)).
+    description: Сезон — slug ('2526'), выведенный из exact source_season_key.

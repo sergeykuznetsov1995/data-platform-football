@@ -870,14 +870,12 @@ EXPECTED_TABLES: dict[str, dict[str, set[str]]] = {
         },
     },
     "fotmob": {
-        # FotMob scraper (scrapers/fotmob/scraper.py, scrape_all). 9 tables, all
-        # partitioned ['league', 'season']. Minimal required = identity keys +
-        # core metrics + META_COLS; extra live cols are NOT errors; 14 100%-NULL
-        # cols (10 dead-legacy + 4 upstream-missing) live in EXPECTED_NULL and are
-        # excluded here. Verified vs live bronze 2026-06-04 (#281): all 9
-        # materialise + non-empty (schedule 760, team_stats 40, player_stats 20227,
-        # team_profile 20, team_squad 607, team_leaderboards 574, transfers 100,
-        # match_details 380, player_details 607 rows) — 0 missing tables/columns.
+        # Frozen legacy archive retained by the owner for rollback evidence;
+        # fotmob_transfers is also an intentional Silver history bridge (#930).
+        # The removed legacy scraper no longer writes these 9 tables. Keep their
+        # last-known contract auditable without treating it as the source-native
+        # ``fotmob_*_current`` contract. All are partitioned by ['league',
+        # 'season']; extra live columns remain informational rather than errors.
         "fotmob_schedule": {
             "league",
             "season",

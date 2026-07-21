@@ -4,9 +4,15 @@ The DAG is trigger-only: ``dag_master_pipeline`` is the single daily schedule
 owner.  One isolated runner performs catalog discovery, exact-season planning,
 raw-first ingestion and emits an atomic, run-specific report.  Validation is
 fail-closed and Silver can only run after a complete native report.
+
+Every production run must be launched by one schedule owner with an exact
+``fotmob_publication`` binding.  An ad-hoc direct trigger has no durable writer
+lock and therefore fails before touching Bronze.
 """
 
-from datetime import datetime
+import hashlib
+import re
+from datetime import datetime, timedelta
 from typing import Any, Dict
 
 from airflow import DAG
@@ -18,10 +24,168 @@ from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 
 from utils.config import DAG_TAGS, FOTMOB_HTTP_POOL, SCHEDULES
 from utils.default_args import SCRAPER_ARGS
+from utils.fotmob_publication import (
+    FOTMOB_DAILY_COMPETITION_COUNT,
+    FOTMOB_DAILY_COMPETITION_IDS,
+    FOTMOB_DAILY_COMPETITION_IDS_SHA256,
+    FOTMOB_DAILY_CONTRACT_SCHEMA,
+    FOTMOB_DAILY_ENTITIES,
+    FOTMOB_DAILY_MAX_DIRECT_MIB,
+    FOTMOB_DAILY_MAX_REQUESTS,
+    FOTMOB_DAILY_REQUESTS_PER_MINUTE,
+    FOTMOB_DAILY_SCOPE_COUNT,
+    FOTMOB_DAILY_SCOPE_FILE,
+    FOTMOB_DAILY_SCOPE_SHA256,
+    fail_unsealed_fotmob_publication,
+    seal_fotmob_publication,
+    validate_fotmob_writer_fence,
+)
 
 
 RESULT_PATH = "/tmp/fotmob_result_{{ ts_nodash }}_{{ ti.try_number }}.json"
 NATIVE_MODES = frozenset({"discover", "daily", "backfill", "replay"})
+PUBLICATION_GENERATION_TEMPLATE = (
+    "{{ dag_run.conf['fotmob_publication']['generation_id'] }}"
+)
+PUBLICATION_BINDING_TEMPLATE = {
+    "schema": "{{ dag_run.conf['fotmob_publication']['binding']['schema'] }}",
+    "source": "{{ dag_run.conf['fotmob_publication']['binding']['source'] }}",
+    "owner": "{{ dag_run.conf['fotmob_publication']['binding']['owner'] }}",
+    "data_interval_start": (
+        "{{ dag_run.conf['fotmob_publication']['binding']"
+        "['data_interval_start'] }}"
+    ),
+    "data_interval_end": (
+        "{{ dag_run.conf['fotmob_publication']['binding']"
+        "['data_interval_end'] }}"
+    ),
+    "runtime_fingerprint": (
+        "{{ dag_run.conf['fotmob_publication']['binding']"
+        "['runtime_fingerprint'] }}"
+    ),
+}
+
+
+def _validate_daily_selection(
+    *,
+    result: Dict[str, Any],
+    selection: Dict[str, Any],
+    entities: list[str],
+    raw_scopes: list[str],
+    budget: Dict[str, Any],
+) -> tuple[list[str], Dict[str, Any]]:
+    """Validate the exact all-entity dynamic-current production workload."""
+
+    violations: list[str] = []
+    expected_ids = list(FOTMOB_DAILY_COMPETITION_IDS)
+    expected_scope = {
+        "schema": FOTMOB_DAILY_CONTRACT_SCHEMA,
+        "scope_file": FOTMOB_DAILY_SCOPE_FILE,
+        "scope_sha256": FOTMOB_DAILY_SCOPE_SHA256,
+        "scope_count": FOTMOB_DAILY_SCOPE_COUNT,
+        "competition_ids": expected_ids,
+        "competition_ids_sha256": FOTMOB_DAILY_COMPETITION_IDS_SHA256,
+        "competition_count": FOTMOB_DAILY_COMPETITION_COUNT,
+    }
+    competition_scope = selection.get("competition_scope")
+    planned_scopes = selection.get("planned_scopes")
+    completed_scopes = selection.get("completed_scopes")
+    completed_transfer_ids = selection.get(
+        "completed_transfer_competition_ids"
+    )
+
+    if selection.get("daily_contract") != FOTMOB_DAILY_CONTRACT_SCHEMA:
+        violations.append("daily contract schema mismatch")
+    if competition_scope != expected_scope:
+        violations.append("daily competition scope mismatch")
+    if raw_scopes:
+        violations.append("daily exact season scope must be empty")
+    if entities != sorted(FOTMOB_DAILY_ENTITIES):
+        violations.append("daily entity set mismatch")
+    if (
+        selection.get("competition_limit") != 0
+        or selection.get("season_limit") != 0
+    ):
+        violations.append("daily planner limits must be zero")
+    if (
+        selection.get("requests_per_minute")
+        != FOTMOB_DAILY_REQUESTS_PER_MINUTE
+    ):
+        violations.append("daily request rate mismatch")
+    if (
+        budget.get("max_requests") != FOTMOB_DAILY_MAX_REQUESTS
+        or budget.get("max_direct_bytes")
+        != FOTMOB_DAILY_MAX_DIRECT_MIB * 1024 * 1024
+        or budget.get("max_proxy_bytes") != 0
+    ):
+        violations.append("daily transport budget mismatch")
+
+    planned_pairs: list[tuple[int, str]] = []
+    if not isinstance(planned_scopes, list) or not planned_scopes:
+        violations.append("missing daily planned scopes")
+    else:
+        for scope in planned_scopes:
+            match = (
+                re.fullmatch(r"([1-9][0-9]*)=(\S+)", scope)
+                if isinstance(scope, str)
+                else None
+            )
+            if match is None:
+                violations.append("invalid daily planned scope evidence")
+                break
+            planned_pairs.append((int(match.group(1)), match.group(2)))
+        if len(planned_pairs) != len(set(planned_pairs)):
+            violations.append("duplicate daily planned scopes")
+        if {
+            competition_id for competition_id, _season in planned_pairs
+        } != set(expected_ids):
+            violations.append("daily planned scopes do not cover exact cohort")
+    if completed_scopes != planned_scopes:
+        violations.append("daily completed scopes differ from exact plan")
+    valid_transfer_ids = (
+        isinstance(completed_transfer_ids, list)
+        and all(
+            isinstance(value, int) and not isinstance(value, bool)
+            for value in completed_transfer_ids
+        )
+    )
+    if not valid_transfer_ids or (
+        len(completed_transfer_ids) != len(set(completed_transfer_ids))
+        or set(completed_transfer_ids) != set(expected_ids)
+    ):
+        violations.append("daily transfer completions differ from exact cohort")
+
+    operation_scopes = [
+        (operation.get("metadata") or {}).get("scope")
+        for operation in result.get("operations") or []
+        if operation.get("entity") == "scope_completion"
+        and operation.get("status") == "success"
+    ]
+    operation_transfer_ids = []
+    for operation in result.get("operations") or []:
+        if (
+            operation.get("entity") != "competition_completion"
+            or operation.get("status") != "success"
+        ):
+            continue
+        raw_id = (operation.get("metadata") or {}).get("competition_id")
+        try:
+            operation_transfer_ids.append(int(raw_id))
+        except (TypeError, ValueError):
+            violations.append("invalid daily transfer completion operation")
+    if operation_scopes != completed_scopes:
+        violations.append("daily scope completion operations mismatch")
+    if operation_transfer_ids != completed_transfer_ids:
+        violations.append("daily transfer completion operations mismatch")
+
+    return violations, {
+        "daily_contract": selection.get("daily_contract"),
+        "competition_scope": competition_scope,
+        "planned_scopes": planned_scopes,
+        "completed_scopes": completed_scopes,
+        "completed_transfer_competition_ids": completed_transfer_ids,
+        "requests_per_minute": selection.get("requests_per_minute"),
+    }
 
 
 def validate_data(
@@ -101,12 +265,21 @@ def validate_data(
             violations.append(
                 f"proxy_bytes={transport.get('proxy_bytes')} (direct-only invariant)"
             )
+        if int(budget.get("proxy_bytes") or 0) != 0:
+            violations.append(
+                "budget proxy_bytes="
+                f"{budget.get('proxy_bytes')} (direct-only invariant)"
+            )
         if int(budget.get("requests") or 0) > int(budget.get("max_requests") or 0):
             violations.append("request budget exceeded")
         if int(budget.get("direct_bytes") or 0) > int(
             budget.get("max_direct_bytes") or 0
         ):
             violations.append("direct-byte budget exceeded")
+        if int(budget.get("proxy_bytes") or 0) > int(
+            budget.get("max_proxy_bytes") or 0
+        ):
+            violations.append("proxy-byte budget exceeded")
         if not result.get("operations"):
             violations.append("no native operations recorded")
         catalog_counts = [
@@ -116,6 +289,61 @@ def validate_data(
         ]
         if not catalog_counts or max(catalog_counts) <= 0:
             violations.append("complete competition catalog was not recorded")
+        selection = result.get("selection")
+        selection_summary = None
+        if mode != "discover":
+            if not isinstance(selection, dict):
+                violations.append("missing exact native selection evidence")
+            else:
+                raw_scopes = selection.get("explicit_scopes")
+                entities = selection.get("entities")
+                signature = str(selection.get("scope_plan_signature") or "")
+                if (
+                    not isinstance(raw_scopes, list)
+                    or any(
+                        not isinstance(scope, str)
+                        or re.fullmatch(r"[1-9][0-9]*=\S+", scope) is None
+                        for scope in raw_scopes
+                    )
+                    or len(raw_scopes) != len(set(raw_scopes))
+                ):
+                    violations.append("invalid exact scope selection evidence")
+                elif (
+                    not isinstance(entities, list)
+                    or any(not isinstance(entity, str) or not entity for entity in entities)
+                    or entities != sorted(set(entities))
+                ):
+                    violations.append("invalid native entity selection evidence")
+                elif re.fullmatch(r"fmplan1-[0-9a-f]{64}", signature) is None:
+                    violations.append("invalid native scope plan signature")
+                else:
+                    scope_bytes = (
+                        ("\n".join(raw_scopes) + "\n").encode("utf-8")
+                        if raw_scopes
+                        else b""
+                    )
+                    selection_summary = {
+                        "entities": entities,
+                        "explicit_scope_count": len(raw_scopes),
+                        "explicit_scope_sha256": hashlib.sha256(
+                            scope_bytes
+                        ).hexdigest(),
+                        "scope_plan_signature": signature,
+                        "competition_limit": selection.get("competition_limit"),
+                        "season_limit": selection.get("season_limit"),
+                    }
+                    if mode == "daily":
+                        daily_violations, daily_summary = (
+                            _validate_daily_selection(
+                                result=result,
+                                selection=selection,
+                                entities=entities,
+                                raw_scopes=raw_scopes,
+                                budget=budget,
+                            )
+                        )
+                        violations.extend(daily_violations)
+                        selection_summary.update(daily_summary)
         if violations:
             raise AirflowException(
                 "Incomplete FotMob native ingest: " + "; ".join(violations)
@@ -128,6 +356,7 @@ def validate_data(
             "tables": result.get("tables") or [],
             "transport": transport,
             "budget": budget,
+            "selection": selection_summary,
         }
         logger.info("FotMob native validation complete: %s", summary)
         return summary
@@ -161,6 +390,10 @@ with DAG(
             title="Exact scopes",
             description="Optional comma-separated FotMob ID=season keys",
         ),
+        "daily_contract": Param(default="", type="string"),
+        "competition_scope_file": Param(default="", type="string"),
+        "competition_scope_sha256": Param(default="", type="string"),
+        "competition_ids_sha256": Param(default="", type="string"),
         "entities": Param(
             default="season,leaderboards,matches,teams,players,transfers",
             type="string",
@@ -174,6 +407,12 @@ with DAG(
         "max_direct_mib": Param(default=256, type="integer", minimum=1),
         "competition_limit": Param(default=0, type="integer", minimum=0),
         "season_limit": Param(default=0, type="integer", minimum=0),
+        "requests_per_minute": Param(
+            default=30,
+            type="integer",
+            minimum=1,
+            maximum=FOTMOB_DAILY_REQUESTS_PER_MINUTE,
+        ),
     },
     doc_md="""
     ## FotMob native ingestion
@@ -188,24 +427,44 @@ with DAG(
     ``discover`` writes catalog/season availability only. ``daily`` refreshes
     selected/latest seasons. ``backfill`` prioritizes required sentinels then
     active/newest and older source seasons. ``replay`` performs no network I/O.
+
+    Production runs are parent-only. The shared master or isolated daily owner
+    supplies the exact interval/release/owner publication generation; direct
+    CLI/UI triggers are intentionally rejected before the Bronze writer.
     """,
 ) as dag:
+    publication_preflight = PythonOperator(
+        task_id="validate_publication_writer_fence",
+        python_callable=validate_fotmob_writer_fence,
+        retries=0,
+    )
+
     scrape_data_task = BashOperator(
         task_id="scrape_fotmob_data",
         bash_command=f"""
 cd /opt/airflow && \\
 python dags/scripts/run_fotmob_scraper.py \\
+    --publication-generation-id "{PUBLICATION_GENERATION_TEMPLATE}" \\
+    --publication-schema "{PUBLICATION_BINDING_TEMPLATE['schema']}" \\
+    --publication-source "{PUBLICATION_BINDING_TEMPLATE['source']}" \\
+    --publication-owner "{PUBLICATION_BINDING_TEMPLATE['owner']}" \\
+    --publication-data-interval-start "{PUBLICATION_BINDING_TEMPLATE['data_interval_start']}" \\
+    --publication-data-interval-end "{PUBLICATION_BINDING_TEMPLATE['data_interval_end']}" \\
+    --publication-runtime-fingerprint "{PUBLICATION_BINDING_TEMPLATE['runtime_fingerprint']}" \\
     --mode "{{{{ params.mode }}}}" \\
     --scope "{{{{ params.scope }}}}" \\
+    --daily-contract "{{{{ params.daily_contract }}}}" \\
+    --competition-scope-file "{{{{ params.competition_scope_file }}}}" \\
+    --competition-scope-sha256 "{{{{ params.competition_scope_sha256 }}}}" \\
+    --competition-ids-sha256 "{{{{ params.competition_ids_sha256 }}}}" \\
     --entities "{{{{ params.entities }}}}" \\
     --max-requests "{{{{ params.max_requests }}}}" \\
     --max-direct-mib "{{{{ params.max_direct_mib }}}}" \\
     --max-proxy-mib 0 \\
     --competition-limit "{{{{ params.competition_limit }}}}" \\
     --season-limit "{{{{ params.season_limit }}}}" \\
-    --requests-per-minute 30 \\
+    --requests-per-minute "{{{{ params.requests_per_minute }}}}" \\
     --workers 4 \\
-    --run-id "dag_ingest_fotmob-{{{{ ts_nodash }}}}-{{{{ ti.try_number }}}}" \\
     --output "{RESULT_PATH}"
 """,
         env={
@@ -215,6 +474,8 @@ python dags/scripts/run_fotmob_scraper.py \\
         },
         append_env=True,
         pool=FOTMOB_HTTP_POOL,
+        execution_timeout=timedelta(hours=8),
+        retries=0,
     )
 
     validate_data_task = PythonOperator(
@@ -232,9 +493,52 @@ python dags/scripts/run_fotmob_scraper.py \\
     trigger_silver = TriggerDagRunOperator(
         task_id="trigger_silver_transform",
         trigger_dag_id="dag_transform_fotmob_silver",
+        trigger_run_id=(
+            "fotmob_silver__"
+            + PUBLICATION_GENERATION_TEMPLATE
+        ),
+        logical_date="{{ logical_date.isoformat() }}",
+        conf={
+            "fotmob_publication": {
+                "generation_id": PUBLICATION_GENERATION_TEMPLATE,
+                "binding": PUBLICATION_BINDING_TEMPLATE,
+            }
+        },
         wait_for_completion=True,
         poke_interval=30,
-        reset_dag_run=True,
+        allowed_states=["success"],
+        failed_states=["failed"],
+        reset_dag_run=False,
+        execution_timeout=timedelta(hours=4),
+        retries=0,
     )
 
-    scrape_data_task >> validate_data_task >> transform_gate >> trigger_silver
+    seal_publication = PythonOperator(
+        task_id="seal_fotmob_publication_ready",
+        python_callable=seal_fotmob_publication,
+        retries=0,
+    )
+
+    finalize_publication = PythonOperator(
+        task_id="finalize_fotmob_publication",
+        python_callable=fail_unsealed_fotmob_publication,
+        op_kwargs={
+            "success_task_id": "seal_fotmob_publication_ready",
+            "writer_task_ids": [
+                "scrape_fotmob_data",
+                "trigger_silver_transform",
+            ],
+        },
+        trigger_rule="all_done",
+        retries=0,
+    )
+
+    (
+        publication_preflight
+        >> scrape_data_task
+        >> validate_data_task
+        >> transform_gate
+        >> trigger_silver
+        >> seal_publication
+        >> finalize_publication
+    )

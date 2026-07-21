@@ -23,6 +23,9 @@ Topology
     start_marker
         |
         v
+    validate_fotmob_publication_consumer
+        |
+        v
     TaskGroup: silver_e4
         |-- matchhistory_match_odds      (run_silver_transform)
         |-- sofascore_player_ratings     (run_silver_transform; skipped
@@ -47,10 +50,11 @@ used by ``dag_transform_e3`` / ``dag_transform_xref``).
 
 Trigger model
 -------------
-``schedule=None`` -- the DAG is triggered by ``dag_master_pipeline`` after
-``dag_transform_e3`` succeeds (E4.10). Re-running E4 standalone is safe --
-``run_silver_transform`` / ``run_gold_transform`` use DROP+CTAS, so each
-rebuild is atomic at the table level and idempotent.
+``schedule=None`` -- the DAG is triggered only by ``dag_master_pipeline`` or
+``dag_sofascore_pipeline`` after ``dag_transform_e3`` succeeds. Direct/manual
+runs have no exact active FotMob consumer binding and fail before the first
+transform. ``run_silver_transform`` / ``run_gold_transform`` use DROP+CTAS,
+so each admitted rebuild is atomic at the table level and idempotent.
 
 Upstream dependencies
 ---------------------
@@ -106,6 +110,7 @@ from airflow.operators.python import PythonOperator
 from airflow.utils.task_group import TaskGroup
 
 from utils.default_args import SILVER_ARGS
+from utils.fotmob_publication import validate_fotmob_consumer_fence
 
 logger = logging.getLogger(__name__)
 
@@ -304,6 +309,12 @@ with DAG(
 
     start = EmptyOperator(task_id='start_marker')
 
+    publication_preflight = PythonOperator(
+        task_id='validate_fotmob_publication_consumer',
+        python_callable=validate_fotmob_consumer_fence,
+        retries=0,
+    )
+
     # =========================================================================
     # TaskGroup: silver_e4 (sequential pure-SQL CTAS, max_active_tasks=1)
     # =========================================================================
@@ -363,4 +374,11 @@ with DAG(
     # =========================================================================
     # Dependencies
     # =========================================================================
-    start >> silver_group >> gold_group >> validate_task >> end
+    (
+        start
+        >> publication_preflight
+        >> silver_group
+        >> gold_group
+        >> validate_task
+        >> end
+    )

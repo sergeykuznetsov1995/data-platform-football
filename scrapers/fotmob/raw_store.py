@@ -355,12 +355,3 @@ class FotMobRawStore:
         with self._write_lock:
             self._verified_blobs.add(record.blob_key)
         return body, record
-
-    def load_metadata(self, target: CanonicalTargetLike) -> RawJsonRecord:
-        """Return validated metadata (and validate the blob) for simplicity."""
-        _, record = self.load(target)
-        return record
-
-
-# Short alias for call sites that prefer the generic name.
-RawStore = FotMobRawStore

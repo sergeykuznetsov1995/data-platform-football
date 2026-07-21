@@ -5,7 +5,9 @@ table:
   fullyQualifiedName: trino_iceberg.iceberg.silver.fotmob_team_match
   description: |
     Per-(match, team) team-level stats из FotMob. Два row per match —
-    home и away стороны отдельно. Источник: bronze.fotmob_match_details:
+    home и away стороны отдельно. Источник:
+    bronze.fotmob_match_payloads_current, связанный с
+    bronze.fotmob_matches_current по exact native scope:
       * stats_json (`Periods.All.stats[group].stats[stat]`) — HARD_FACT
         counters (possession, shots, passes, fouls, cards) + xG family
         (expected_goals / npxg / xGOT).
@@ -13,18 +15,18 @@ table:
         `expected_assists` (FotMob НЕ отдаёт team-grain xA в stats_json,
         только per-player; это raison d'être issue #97 — закрытие
         пробела `expected_assists` в gold.fct_team_match).
-    Goals_for/goals_against — из bronze top-level home_score/away_score.
+    Goals_for/goals_against — из native matches_current.
     Питает gold.fct_team_match (5-source расширение) и audit-таблицу
     — Phase B issue #97.
-    Дедупликация: ROW_NUMBER per (match_id, league, season) ORDER BY
-    _ingested_at DESC; PK (match_id, team_id, league, season).
+    Current views выбирают последние успешные manifest batches; PK
+    (match_id, team_id, league, season).
   tags:
     - Tier.Silver
     - Domain.Football
     - PII.None
 columns:
   - name: match_id
-    description: FotMob match_id (varchar; SCALAR из bronze.fotmob_match_details).
+    description: FotMob match_id (varchar; из native match_payloads_current).
   - name: team_id
     description: |
       FotMob team NAME (varchar, bronze home_team/away_team), напр. 'Manchester
@@ -92,7 +94,7 @@ columns:
   - name: expected_assists
     description: |
       Ожидаемые ассисты (xA) команды — SUM xA всех игроков команды
-      из bronze.fotmob_match_details.player_stats_json. Главная
+      из bronze.fotmob_match_payloads_current.player_stats_json. Главная
       causa creandi для issue #97: ни Understat, ни SofaScore не
       отдают team-grain xA, FotMob единственный источник.
   - name: expected_goals_player_sum

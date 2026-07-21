@@ -101,9 +101,10 @@ xref_ss AS (
       AND confidence <> 'orphan'
 ),
 
--- FotMob xref (#97). season is slug '2526' after #404 (bronze.fotmob_schedule is
--- still bigint year-start), like the other sources. fm_team_season.season
--- is slug '2526' too → bridge + fact JOIN slug = slug. team_id = team NAME (== source_id).
+-- FotMob native xref (#930). source_season_key is converted to the
+-- legacy-compatible slug ('2526') at the Silver boundary, like the other
+-- sources. fm_team_season.season uses the same slug, so bridge + fact JOIN is
+-- slug = slug. team_id = team NAME (== source_id).
 xref_fm AS (
     SELECT DISTINCT
         canonical_id,

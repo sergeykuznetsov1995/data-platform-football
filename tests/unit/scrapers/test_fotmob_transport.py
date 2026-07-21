@@ -93,6 +93,35 @@ def test_canonical_target_sorts_query_and_enforces_https_allowlist():
             canonicalize_target(bad)
 
 
+def test_cancel_interrupts_worker_retry_wait_cooperatively():
+    class NotifyingSession(FakeSession):
+        def __init__(self):
+            super().__init__([requests.ConnectionError("down")])
+            self.called = threading.Event()
+
+        def get(self, url, **kwargs):
+            self.called.set()
+            return super().get(url, **kwargs)
+
+        def close(self):
+            return None
+
+    session = NotifyingSession()
+    transport = FotMobTransport(
+        session=session,
+        max_attempts=4,
+        backoff_base=60,
+        jitter_fn=lambda _low, _high: 0.0,
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(transport.fetch_json, "allLeagues")
+        assert session.called.wait(1)
+        transport.cancel()
+        with pytest.raises(RuntimeError, match="cancelled"):
+            future.result(timeout=1)
+
+
 def test_direct_success_measures_wire_and_decoded_bytes_and_commits_raw(tmp_path):
     decoded = b'{"details":{"name":"Premier League"}}'
     encoded = gzip.compress(decoded, mtime=0)

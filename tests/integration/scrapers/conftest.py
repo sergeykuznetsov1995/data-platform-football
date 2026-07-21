@@ -196,22 +196,6 @@ def understat_scraper(soccerdata_available, minimal_leagues, minimal_seasons):
 
 
 @pytest.fixture
-def fotmob_scraper(soccerdata_available, minimal_leagues, minimal_seasons):
-    """FotMob scraper - no Tor required."""
-    if not soccerdata_available:
-        pytest.skip("soccerdata library not installed")
-
-    from scrapers.fotmob import FotMobScraper
-
-    scraper = FotMobScraper(
-        leagues=minimal_leagues,
-        seasons=minimal_seasons,
-    )
-    yield scraper
-    scraper.close()
-
-
-@pytest.fixture
 def espn_scraper(soccerdata_available, minimal_leagues, minimal_seasons):
     """ESPN scraper - no Tor required."""
     if not soccerdata_available:
