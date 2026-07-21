@@ -87,6 +87,47 @@ def test_scope_player_capture_is_deterministic_and_conflicts_fail():
         manifest.scope_player_evidence([row, conflict])
 
 
+def test_scope_player_mapping_evidence_binds_raw_capture_and_deduplicates():
+    rows = [
+        {
+            'cycle_id': 'cycle', 'scope_id': 'scope',
+            'competition_id': 'GB1', 'edition_id': '2025',
+            'club_id': '20', 'player_id': '2', 'raw_capture_id': 'b' * 64,
+        },
+        {
+            'cycle_id': 'cycle', 'scope_id': 'scope',
+            'competition_id': 'GB1', 'edition_id': '2025',
+            'club_id': '10', 'player_id': '1', 'raw_capture_id': 'a' * 64,
+        },
+    ]
+
+    captures = manifest.scope_player_capture_rows([rows[1], rows[0], rows[0]])
+    assert [item.club_id for item in captures] == ['10', '20']
+    assert manifest.scope_player_capture_evidence(rows) == (
+        manifest.scope_player_capture_evidence([rows[1], rows[0], rows[0]])
+    )
+    assert manifest.scope_player_capture_evidence(rows)['row_count'] == 2
+
+    changed_raw = [{**rows[0], 'raw_capture_id': 'c' * 64}, rows[1]]
+    assert (
+        manifest.scope_player_capture_evidence(changed_raw)['key_hash']
+        != manifest.scope_player_capture_evidence(rows)['key_hash']
+    )
+
+
+@pytest.mark.parametrize('missing', ['player_id', 'raw_capture_id'])
+def test_scope_player_mapping_rejects_incomplete_evidence(missing):
+    row = {
+        'cycle_id': 'cycle', 'scope_id': 'scope',
+        'competition_id': 'GB1', 'edition_id': '2025',
+        'club_id': '10', 'player_id': '1', 'raw_capture_id': 'a' * 64,
+    }
+    row.pop(missing)
+
+    with pytest.raises(manifest.SourceManifestError, match='missing fields'):
+        manifest.scope_player_capture_evidence([row])
+
+
 def test_entity_cannot_claim_terminal_with_pending_debt():
     with pytest.raises(manifest.SourceManifestError, match='terminal status has debt'):
         _entity('transfer_events', pending=1).validate()

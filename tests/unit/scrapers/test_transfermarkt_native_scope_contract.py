@@ -8,7 +8,7 @@ import pytest
 
 import scrapers.transfermarkt.scraper as tm
 from scrapers.transfermarkt.client import TransfermarktHttpClient
-from scrapers.transfermarkt.models import ProxyRequiredError
+from scrapers.transfermarkt.models import FetchOutcome, FetchStatus, ProxyRequiredError
 from scrapers.transfermarkt.registry import (
     CompetitionRecord,
     deterministic_scope_id,
@@ -62,6 +62,16 @@ def _patch_one_squad(monkeypatch, scraper: TransfermarktScraper):
 
     def _fetch(url, label="html", context=None):
         calls.append({"url": url, "label": label, "context": context})
+        if label == 'squad':
+            competition_id = str((context or {}).get('competition_id') or 'GB1')
+            scraper._last_outcome = FetchOutcome(
+                status=FetchStatus.OK,
+                value='<html/>',
+                label=label,
+                context=context or {},
+                payload_hash=resolve_competition(competition_id).source_body_hash,
+                raw_capture_id='a' * 64,
+            )
         return "<html/>"
 
     monkeypatch.setattr(scraper, "_fetch_html", _fetch)
@@ -118,6 +128,7 @@ def test_one_squad_response_materializes_three_stable_native_entities(
         assert row["cycle_id"] == "cycle-fixture"
         assert row["source_url"] == squad_url
         assert row["source_body_hash"] == resolve_competition("GB1").source_body_hash
+        assert row['raw_capture_id'] == 'a' * 64
     assert memberships.iloc[0]["source_competition_id"] == "GB1"
     assert observations.iloc[0]["source_edition_id"] == "2025"
     assert contracts.iloc[0]["applicability_status"] == "ok"

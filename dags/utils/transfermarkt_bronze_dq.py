@@ -69,7 +69,7 @@ observability-only and must never gate.
   rows have no contract identity (their season lives outside the PK) and
   are already counted by ``tm_bronze_legacy_cohort[*]``.
 - Player observation/career parents are resolved against the immutable
-  same-cycle ``ops.transfermarkt_scope_player_capture_v1`` evidence.  The
+  same-cycle ``ops.transfermarkt_scope_player_capture`` evidence.  The
   replace-guarded latest roster is checked separately as WARNING-only drift,
   so roster A -> B does not invalidate facts captured with roster A.
 - ``tm_bronze_membership_orphans[coach_stints]`` is WARNING (not ERROR):
@@ -95,8 +95,10 @@ from utils.transfermarkt_scope_state import (
     REGISTRY_STATE_TABLE,
     SCOPE_COMPLETION_STATUS,
     SCOPE_MANIFEST_TABLE,
-    SCOPE_PLAYER_CAPTURE_GRAIN,
-    SCOPE_PLAYER_CAPTURE_TABLE,
+)
+from utils.transfermarkt_source import SCOPE_PLAYER_CAPTURE_TABLE
+from utils.transfermarkt_source_manifest import (
+    SCOPE_PLAYER_CAPTURE_COLUMNS,
     scope_player_capture_evidence,
 )
 
@@ -669,6 +671,8 @@ def build_membership_orphans_sql(
       FROM {SCOPE_PLAYER_CAPTURE_TABLE} e
       WHERE e.cycle_id = b.cycle_id
         AND e.scope_id = b.scope_id
+        AND e.competition_id = b.{comp}
+        AND e.edition_id = b.{ed}
         AND e.player_id = b.player_id"""
     elif table == COACH_STINTS_BRONZE_TABLE:
         exists = f"""SELECT 1
@@ -733,7 +737,7 @@ def build_scope_player_capture_rows_sql(
         f'({_sql_literal(item[0])}, {_sql_literal(item[1])})'
         for item in identities
     )
-    columns = ', '.join(f'e.{column}' for column in SCOPE_PLAYER_CAPTURE_GRAIN)
+    columns = ', '.join(f'e.{column}' for column in SCOPE_PLAYER_CAPTURE_COLUMNS)
     return f"""SELECT {columns}
 FROM {SCOPE_PLAYER_CAPTURE_TABLE} e
 JOIN (VALUES {values}) requested(cycle_id, scope_id)
@@ -1119,13 +1123,13 @@ def run_bronze_dq(
             ):
                 cur.execute(build_scope_player_capture_rows_sql(chunk))
                 for raw in cur.fetchall():
-                    if len(raw) != len(SCOPE_PLAYER_CAPTURE_GRAIN):
+                    if len(raw) != len(SCOPE_PLAYER_CAPTURE_COLUMNS):
                         raise ValueError(
                             'scope-player capture query returned a malformed row'
                         )
                     row = {
                         column: str(value or '')
-                        for column, value in zip(SCOPE_PLAYER_CAPTURE_GRAIN, raw)
+                        for column, value in zip(SCOPE_PLAYER_CAPTURE_COLUMNS, raw)
                     }
                     identity = (row['cycle_id'], row['scope_id'])
                     if identity not in captured:

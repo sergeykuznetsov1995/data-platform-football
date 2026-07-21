@@ -2180,6 +2180,10 @@ WHERE row_num = 1
                 self._last_outcome.raw_capture_id
                 if self._last_outcome is not None else None
             )
+            raw_capture_id = (
+                self._last_outcome.raw_capture_id
+                if self._last_outcome is not None else None
+            )
             for p in parsed_players:
                 p['current_club_name'] = club['club_name']
                 p['club_slug'] = club['club_slug']
@@ -2226,6 +2230,7 @@ WHERE row_num = 1
         contract_rows: List[Dict] = []
         for sp in squad_players:
             lineage = {
+                'raw_capture_id': sp.get('_raw_capture_id'),
                 'source_competition_id': scope['competition_id'],
                 'source_edition_id': scope['edition_id'],
                 'source_url': sp.get('_source_url') or competition.source_url,
@@ -2284,6 +2289,7 @@ WHERE row_num = 1
                     'contract_until': sp.get('contract_until'),
                     'observed_at': observed_at,
                     'applicability_status': 'ok',
+                    'raw_capture_id': lineage['raw_capture_id'],
                     'source_url': lineage['source_url'],
                     'source_body_hash': lineage['source_body_hash'],
                     'raw_capture_id': lineage['raw_capture_id'],

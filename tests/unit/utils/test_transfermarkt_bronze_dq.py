@@ -277,6 +277,9 @@ def test_scoped_observations_use_same_cycle_capture_not_mutable_roster(
 ):
     sql = dq.build_membership_orphans_sql(table)
 
+    assert dq.SCOPE_PLAYER_CAPTURE_TABLE.endswith(
+        '.transfermarkt_scope_player_capture'
+    )
     assert dq.SCOPE_PLAYER_CAPTURE_TABLE in sql
     assert 'e.cycle_id = b.cycle_id' in sql
     assert 'e.scope_id = b.scope_id' in sql
@@ -294,6 +297,8 @@ def test_global_career_facts_bind_same_cycle_scope_and_player(table):
     assert dq.SCOPE_PLAYER_CAPTURE_TABLE in sql
     assert 'e.cycle_id = b.cycle_id' in sql
     assert 'e.scope_id = b.scope_id' in sql
+    assert 'e.competition_id = b.source_competition_id' in sql
+    assert 'e.edition_id = b.source_edition_id' in sql
     assert 'e.player_id = b.player_id' in sql
     # A player shared by two scopes cannot borrow the other scope's evidence.
     assert 'e.scope_id = b.scope_id' in sql
@@ -354,10 +359,10 @@ def test_fabricated_same_cycle_player_and_wrong_club_remain_errors():
 
 def test_v3_manifest_rehashes_the_exact_immutable_capture():
     rows = [
-        ('cycle-1', 'scope-1', 'GB1', '2025', '10', '1'),
-        ('cycle-1', 'scope-1', 'GB1', '2025', '20', '2'),
+        ('cycle-1', 'scope-1', 'GB1', '2025', '10', '1', 'a' * 64),
+        ('cycle-1', 'scope-1', 'GB1', '2025', '20', '2', 'b' * 64),
     ]
-    mappings = [dict(zip(dq.SCOPE_PLAYER_CAPTURE_GRAIN, row)) for row in rows]
+    mappings = [dict(zip(dq.SCOPE_PLAYER_CAPTURE_COLUMNS, row)) for row in rows]
     evidence = dq.scope_player_capture_evidence(mappings)
     manifest = SimpleNamespace(
         capture_revision='v3',
