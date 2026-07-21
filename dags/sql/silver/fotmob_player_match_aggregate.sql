@@ -3,18 +3,24 @@
 -- =============================================================================
 --
 -- One row per (match_id, player_id, league, season) — per-match player stats
--- parsed from FotMob `bronze.fotmob_match_details.player_stats_json`. Column
+-- parsed from native FotMob `bronze.fotmob_match_payloads_current
+-- .player_stats_json` (#930 cutover from legacy `bronze.fotmob_match_details`;
+-- JSON shape is identical — секции `content.*` кладутся verbatim). Column
 -- shape is a full parity mirror of `sofascore_player_match_aggregate` so the
 -- 5-source Gold `fct_player_match` COALESCE сравнивает одинаково-именованные
 -- колонки. Колонки, которых FotMob НЕ отдаёт на match-grain → CAST(NULL AS ...).
 --
--- Source:
---   bronze.fotmob_match_details.player_stats_json — JSON object keyed by
---   player_id; each value = { "teamId": <int>, "stats": [ { "stats": {
+-- Sources:
+--   bronze.fotmob_match_payloads_current.player_stats_json — JSON object keyed
+--   by player_id; each value = { "teamId": <int>, "stats": [ { "stats": {
 --     "<Display name>": { "stat": { "value": <num>, "total": <num?>,
 --     "type": "integer|double|fractionWithPercentage|..." } }, ... } }, ... ] }.
 --   `stats` is an ARRAY of stat groups (Top stats / Attack / Defense / ...);
 --   we flatten ALL groups, so a stat is found regardless of its group index.
+--   bronze.fotmob_matches_current — team NAMES (payloads carry only team ids);
+--   JOIN by (match_id, competition_id, source_season_key).
+--   league_map (static CTE) — реконструкция legacy-строк `league` из
+--   `competition_id`; INNER JOIN одновременно скоупит выдачу прежними 14 лигами.
 --
 -- Value extraction (probed live 2026-06-20, 360 matches, 62 distinct keys):
 --   * `$.stat.value` is ALWAYS a clean number (numerator for fraction stats),
@@ -27,26 +33,62 @@
 --
 -- Footguns:
 --   * teamId is integer in player_stats_json; home_team_id/away_team_id are
---     varchar in bronze → compare as varchar.
+--     BIGINT in native bronze → CAST both sides to varchar (same varchar=varchar
+--     comparison as legacy).
+--   * match_id is bigint in native (legacy varchar) → CAST AS varchar in the
+--     head CTE, so the Silver output contract (varchar match_id) is unchanged.
 --   * MAX(IF()) pivot collapses the same key appearing in multiple groups
 --     (identical value) — same idiom as fotmob_team_match.sql.
---   * Season is bigint year-start (2025) at bronze level; we emit a slug
---     ('2526') to match xref_player / other Silver player-match tables.
+--   * Season: native `source_season_key` is the exact source varchar
+--     ('2025/2026' club, '2026' single-year) → year-start = substr(key, 1, 4);
+--     the season-slug CASE below is byte-identical to legacy (#913 Phase 2).
+--     НЕ выводить слаг из формы ключа (AFCON single-year разошёлся бы с legacy).
+--   * `*_current` уже отдаёт одну строку на матч (манифест-гейт + natural key);
+--     ROW_NUMBER ниже — defensive. `_batch_id` в native не существует →
+--     tiebreak `_observed_at DESC, _target_batch_id DESC`.
 --   * Cards (yellow/red), total crosses, possession_lost, tackles_won — FotMob
 --     player_stats_json has no key for these → NULL (mirrors SofaScore, which
 --     also NULLs yellow/red on this grain).
 -- =============================================================================
 
-WITH match_details_dedup AS (
+WITH league_map(competition_id, league) AS (
+    VALUES (47, 'ENG-Premier League'), (48, 'ENG-Championship'), (87, 'ESP-La Liga'),
+           (54, 'GER-Bundesliga'), (55, 'ITA-Serie A'), (53, 'FRA-Ligue 1'),
+           (57, 'NED-Eredivisie'), (61, 'POR-Primeira Liga'), (42, 'UEFA-Champions League'),
+           (73, 'UEFA-Europa League'), (77, 'INT-World Cup'), (50, 'INT-European Championship'),
+           (289, 'INT-Africa Cup of Nations'), (44, 'INT-Copa America')
+),
+
+match_details AS (
+    SELECT
+        CAST(p.match_id AS varchar)                              AS match_id,
+        lm.league,
+        TRY_CAST(substr(p.source_season_key, 1, 4) AS integer)   AS season,
+        m.home_team_name                                         AS home_team,
+        m.away_team_name                                         AS away_team,
+        CAST(p.home_team_id AS varchar)                          AS home_team_id,
+        CAST(p.away_team_id AS varchar)                          AS away_team_id,
+        p.player_stats_json,
+        p._observed_at,
+        p._target_batch_id
+    FROM iceberg.bronze.fotmob_match_payloads_current p
+    JOIN iceberg.bronze.fotmob_matches_current m
+      ON m.match_id = p.match_id
+     AND m.competition_id = CAST(p.competition_id AS bigint)
+     AND m.source_season_key = p.source_season_key
+    JOIN league_map lm ON lm.competition_id = m.competition_id
+    WHERE p.player_stats_json IS NOT NULL
+      AND p.player_stats_json <> 'null'
+      AND p.player_stats_json <> '{}'
+),
+
+match_details_dedup AS (
     SELECT *,
            ROW_NUMBER() OVER (
                PARTITION BY match_id, league, season
-               ORDER BY _ingested_at DESC
+               ORDER BY _observed_at DESC, _target_batch_id DESC
            ) AS rn
-    FROM iceberg.bronze.fotmob_match_details
-    WHERE player_stats_json IS NOT NULL
-      AND player_stats_json <> 'null'
-      AND player_stats_json <> '{}'
+    FROM match_details
 ),
 
 -- ===== Explode players × stat groups × stats into long form =====
@@ -55,7 +97,7 @@ stat_flat AS (
         md.match_id,
         md.league,
         md.season,
-        md._ingested_at,
+        md._observed_at,
         md.home_team_id,
         md.away_team_id,
         md.home_team,
@@ -91,7 +133,7 @@ player_pivot AS (
         team_id_numeric,
         league,
         season,
-        MAX(_ingested_at) AS _bronze_ingested_at,
+        MAX(_observed_at) AS _bronze_ingested_at,
         MAX(home_team_id) AS home_team_id,
         MAX(away_team_id) AS away_team_id,
         MAX(home_team)    AS home_team,
