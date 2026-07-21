@@ -13,14 +13,16 @@ Strategy: render the template through the REAL renderer
 set, transpile Trino → DuckDB via sqlglot (NORMALIZE → strip_accents hack as
 in test_dim_venue_logic), bootstrap the 3 bronze fixture tables, execute,
 assert. Also covers the pre-existing contract: cross-source merge via the
-curated dictionary, fotmob latest-snapshot dedup, orphan prefix fallback.
+curated dictionary, orphan prefix fallback, and (since the #930 native
+cutover) the fotmob branch reading fotmob_match_payloads_current — league
+reconstructed via league_map(competition_id), season slug derived from
+source_season_key, out-of-map competitions scoped out.
 """
 
 from __future__ import annotations
 
 import re
 import sys
-from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -76,16 +78,20 @@ def _bootstrap(con) -> None:
     con.execute("CREATE SCHEMA IF NOT EXISTS bronze")
 
     # Only the columns the template reads; season = year-start BIGINT (live
-    # bronze format) → slug '2526' in the output.
+    # bronze format) → slug '2526' in the output. source_season_id (#913
+    # Phase 2) stays NULL → the season CASE falls through to the legacy
+    # year-start slug branch. (The column was missing from this fixture
+    # since #913, silently skipping EVERY test below — restored with #930.)
     con.execute("""
         CREATE TABLE bronze.fbref_schedule (
-            referee VARCHAR, league VARCHAR, season BIGINT
+            referee VARCHAR, league VARCHAR, season BIGINT,
+            source_season_id VARCHAR
         )
     """)
     con.execute(f"""
         INSERT INTO bronze.fbref_schedule VALUES
-        ('Michael Oliver', '{LEAGUE}', 2025),
-        ('Joe Orphan',     '{LEAGUE}', 2025)
+        ('Michael Oliver', '{LEAGUE}', 2025, NULL),
+        ('Joe Orphan',     '{LEAGUE}', 2025, NULL)
     """)
 
     con.execute("""
@@ -100,24 +106,33 @@ def _bootstrap(con) -> None:
         ('A Madley', '{LEAGUE}', 2025)
     """)
 
+    # #930 native cutover: the fotmob branch reads the *_current view — one
+    # committed row per match (manifest identity entity_id = match_id), no
+    # league/season columns (league ← league_map(competition_id), season slug
+    # ← source_season_key). competition_id is VARCHAR in payloads (live schema).
     con.execute("""
-        CREATE TABLE bronze.fotmob_match_details (
-            match_id VARCHAR, match_facts_json VARCHAR,
-            league VARCHAR, season BIGINT, _ingested_at TIMESTAMP
+        CREATE TABLE bronze.fotmob_match_payloads_current (
+            match_id BIGINT, competition_id VARCHAR,
+            source_season_key VARCHAR, match_facts_json VARCHAR
         )
     """)
-    # Two snapshots of one match — the latest (Michael Oliver) must win.
+    # comp 47 = ENG-Premier League, club-style key '2025/2026' → slug '2526'.
     con.execute(
-        "INSERT INTO bronze.fotmob_match_details VALUES (?, ?, ?, ?, ?)",
-        ("4506553",
-         '{"infoBox": {"Referee": {"text": "Stale Snapshot Referee"}}}',
-         LEAGUE, 2025, datetime(2026, 6, 1, 3, 0, 0)),
+        "INSERT INTO bronze.fotmob_match_payloads_current VALUES (?, ?, ?, ?)",
+        (4506553, "47", "2025/2026",
+         '{"infoBox": {"Referee": {"text": "Michael Oliver"}}}'),
     )
+    # comp 77 = INT-World Cup, single-year key '2026' → 4-digit slug '2026'.
     con.execute(
-        "INSERT INTO bronze.fotmob_match_details VALUES (?, ?, ?, ?, ?)",
-        ("4506553",
-         '{"infoBox": {"Referee": {"text": "Michael Oliver"}}}',
-         LEAGUE, 2025, datetime(2026, 6, 2, 3, 0, 0)),
+        "INSERT INTO bronze.fotmob_match_payloads_current VALUES (?, ?, ?, ?)",
+        (9900001, "77", "2026",
+         '{"infoBox": {"Referee": {"text": "Cup Referee"}}}'),
+    )
+    # comp 999 is NOT in league_map — the INNER JOIN must scope it out.
+    con.execute(
+        "INSERT INTO bronze.fotmob_match_payloads_current VALUES (?, ?, ?, ?)",
+        (9900002, "999", "2025/2026",
+         '{"infoBox": {"Referee": {"text": "Out Of Scope Referee"}}}'),
     )
 
 
@@ -189,17 +204,34 @@ class TestXrefRefereeExistingContract:
         }
         assert {r["canonical_id"] for r in oliver} == {"ref_michael_oliver"}
 
-    def test_fotmob_dedup_keeps_latest_snapshot(self, xref_rows):
-        stale = [
-            r for r in xref_rows
-            if r["source_id"] == "Stale Snapshot Referee"
-        ]
-        assert stale == [], "older fotmob snapshot must be deduped away"
-        latest = [
+    def test_fotmob_league_from_competition_id(self, xref_rows):
+        """#930: league is reconstructed via league_map(competition_id) —
+        varchar comp '47' in payloads → 'ENG-Premier League'; the _current
+        view is one row per match, so exactly one fotmob row survives with
+        no in-SQL snapshot dedup."""
+        fm = [
             r for r in xref_rows
             if r["source"] == "fotmob" and r["source_id"] == "Michael Oliver"
         ]
-        assert len(latest) == 1, "latest snapshot referee must survive dedup"
+        assert len(fm) == 1, "one committed payload row → one fotmob xref row"
+        assert fm[0]["league"] == LEAGUE
+
+    def test_fotmob_out_of_map_competition_scoped_out(self, xref_rows):
+        """#930: INNER JOIN to league_map keeps the legacy 14-league scope —
+        comp 999 (not in the map) must not leak into Silver."""
+        assert [
+            r for r in xref_rows if r["source_id"] == "Out Of Scope Referee"
+        ] == [], "competition_id outside league_map must be scoped out"
+
+    def test_fotmob_wc_single_year_season_slug(self, xref_rows):
+        """#930 / cutover map §2.2: INT-World Cup single-year key '2026' →
+        4-digit slug '2026' (WC branch of the legacy season CASE)."""
+        wc = [r for r in xref_rows if r["source_id"] == "Cup Referee"]
+        assert len(wc) == 1
+        assert wc[0]["league"] == "INT-World Cup"
+        assert wc[0]["season"] == "2026"
+        assert wc[0]["canonical_id"] == "fm_ref_cup_referee"
+        assert wc[0]["confidence"] == "orphan"
 
     def test_orphan_prefix_fallback(self, xref_rows):
         orphan = next(r for r in xref_rows if r["source_id"] == "Joe Orphan")
@@ -207,5 +239,8 @@ class TestXrefRefereeExistingContract:
         assert orphan["confidence"] == "orphan"
 
     def test_season_slug_format(self, xref_rows):
-        """Year-start BIGINT 2025 → slug '2526' (#404 idiom)."""
-        assert {r["season"] for r in xref_rows} == {"2526"}
+        """Club season → slug '2526' from BOTH legacy forms (fbref/mh
+        year-start BIGINT 2025) and the native form (fotmob
+        source_season_key '2025/2026') — #404 idiom, single expression."""
+        club = {r["season"] for r in xref_rows if r["league"] == LEAGUE}
+        assert club == {"2526"}

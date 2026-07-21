@@ -2003,12 +2003,11 @@ def _validate_silver_quality(**context) -> Dict[str, Any]:
 def _native_v2_enabled(**context) -> bool:
     """Runtime deployment gate for shadow/native transforms.
 
-    Defaulting to false is intentional: a code deploy can precede creation of
-    the native Bronze tables without breaking the canonical weekly pipeline.
-    Enable only after the dual-writing ingest is deployed.
+    Native Bronze is the production source of truth.  Keep an explicit
+    environment override for emergency rollback in non-production only.
     """
     shadow_enabled = os.environ.get(
-        'TM_NATIVE_V2_ENABLED', 'false',
+        'TM_NATIVE_V2_ENABLED', 'true',
     ).strip().lower() in {
         '1', 'true', 'yes', 'on',
     }

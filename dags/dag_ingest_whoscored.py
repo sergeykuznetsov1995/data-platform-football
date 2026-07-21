@@ -174,12 +174,14 @@ def _transport_runtime(
     *,
     task_id: Optional[str] = None,
     work_item_id: Optional[str] = None,
+    missing_ok: bool = False,
 ) -> PaidRuntime:
     try:
         return resolve_paid_runtime(
             context,
             task_id=task_id,
             work_item_id=work_item_id,
+            missing_ok=missing_ok,
         )
     except WhoScoredProxyRuntimeError as exc:
         raise AirflowException(str(exc)) from exc
@@ -190,11 +192,13 @@ def _bind_transport_allocation(
     *,
     task_id: str,
     work_item_id: str,
+    missing_ok: bool = False,
 ) -> PaidRuntime:
     try:
         return transport.for_allocation(
             task_id=task_id,
             work_item_id=work_item_id,
+            missing_ok=missing_ok,
         )
     except WhoScoredProxyRuntimeError as exc:
         raise AirflowException(str(exc)) from exc
@@ -811,6 +815,7 @@ def build_daily_commands(
             base_transport,
             task_id="ingest_active_scope",
             work_item_id=work_item_id,
+            missing_ok=True,
         )
         alert_guard = paid_alert_source_guard_command(
             transport,
@@ -867,7 +872,7 @@ def build_daily_profile_command(
     )
     output = _run_dir_from_context(context) / "profiles.json"
     scope_args = " ".join(f"--scope {shlex.quote(scope)}" for scope in scopes)
-    work_item_id = stable_profiles_work_item(scope_plan)
+    work_item_id = stable_profiles_work_item()
     transport = _transport_runtime(
         context,
         task_id="refresh_whoscored_profiles",
@@ -1319,6 +1324,27 @@ def _validate_paid_report_identity(
 ) -> None:
     if not transport.is_paid:
         return
+    # Catalog drift: a scope that discovery opened after the standing approval
+    # was issued has no signed allocation and runs direct-only inside an
+    # otherwise paid DagRun (see PaidRuntime.for_allocation missing_ok).  Such a
+    # report is accepted only when it proves it never touched the paid path:
+    # direct-only policy, zero paid bytes and no proxy identity field.  Any paid
+    # byte or proxy field still demands the full signed identity below.
+    if str(report.get("transport_policy") or "") != "direct_then_paid":
+        degraded_paid = report.get("paid_proxy_bytes", 0)
+        proxy_fields = (
+            "proxy_allocation_id",
+            "proxy_approval_id",
+            "proxy_approval_sha256",
+            "proxy_work_item_id",
+            "proxy_attempt_id",
+        )
+        if (
+            type(degraded_paid) is int
+            and degraded_paid == 0
+            and not any(report.get(field) for field in proxy_fields)
+        ):
+            return
     approval = getattr(transport, "approval", None)
     airflow = report.get("airflow")
     if approval is None or not isinstance(airflow, Mapping):
@@ -3316,6 +3342,7 @@ def validate_scope_result(
         _context,
         task_id="ingest_active_scope",
         work_item_id=stable_scope_work_item(scope_spec),
+        missing_ok=True,
     )
     allocation_limit = (
         transport.allocation.budget_bytes if transport.allocation is not None else 0
@@ -3487,7 +3514,7 @@ def validate_profile_result(
         transport = _transport_runtime(
             context,
             task_id="refresh_whoscored_profiles",
-            work_item_id=stable_profiles_work_item(scope_plan),
+            work_item_id=stable_profiles_work_item(),
         )
     allocation_limit = (
         transport.allocation.budget_bytes if transport.allocation is not None else 0

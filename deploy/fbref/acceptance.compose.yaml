@@ -1,0 +1,192 @@
+# Isolated one-off FBref acceptance stack for issue #949.
+#
+# This is a standalone Compose project, not an override of compose.yaml. It
+# intentionally has no fixed container names, published ports, shared volumes,
+# or shared proxy network, so its lifecycle cannot recreate/restart production
+# services. The acceptance runner alone is dual-homed to the existing storage
+# networks; its paid proxy is reachable only on this project's private bridge.
+#
+# Required operator inputs (keep all values outside Git):
+#   FBREF_ACCEPTANCE_AIRFLOW_IMAGE=<sha256 image ID printed by build helper>
+#   FBREF_ACCEPTANCE_GIT_SHA=<full SHA printed by build helper>
+#   FBREF_ACCEPTANCE_ENV_FILE=<absolute path to acceptance env file>
+#   FBREF_ACCEPTANCE_DB_PASSWORD=<hex-only temporary password>
+#   FBREF_PROXY_CONTROL_TOKEN=<dedicated 32+ character FBref secret>
+#   FBREF_PROXY_POOL_FILE=<absolute path to the dedicated FBref pool file>
+#   FBREF_ACCEPTANCE_EVIDENCE_DIR=<absolute durable evidence directory>
+#
+# Start dependencies and run a DAG from the repository root:
+#   docker compose -p fbref-acceptance-949 \
+#     -f deploy/fbref/acceptance.compose.yaml --project-directory . up -d \
+#     fbref_acceptance_postgres fbref_acceptance_proxy_filter
+#   docker compose -p fbref-acceptance-949 \
+#     -f deploy/fbref/acceptance.compose.yaml --project-directory . run --rm \
+#     fbref_acceptance_runner bash -lc \
+#     'airflow db migrate && airflow dags test dag_accept_fbref_bronze "$RUN_AT"'
+#
+# Tear down only this isolated project after evidence has been collected:
+#   docker compose -p fbref-acceptance-949 \
+#     -f deploy/fbref/acceptance.compose.yaml --project-directory . \
+#     down --volumes --remove-orphans
+
+services:
+  fbref_acceptance_postgres:
+    image: postgres:16-alpine
+    restart: "no"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+      - FOWNER
+      - DAC_READ_SEARCH
+    environment:
+      POSTGRES_USER: fbref_acceptance
+      POSTGRES_PASSWORD: ${FBREF_ACCEPTANCE_DB_PASSWORD:?set a temporary hex-only password}
+      POSTGRES_DB: airflow
+    tmpfs:
+      - /var/lib/postgresql/data:rw,noexec,nosuid,size=1g
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fbref_acceptance -d airflow"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks:
+      - acceptance_control
+
+  fbref_acceptance_proxy_filter:
+    image: ${FBREF_ACCEPTANCE_AIRFLOW_IMAGE:?set an immutable FBref runtime image}
+    user: ${AIRFLOW_UID:-50000}:0
+    restart: "no"
+    entrypoint:
+      - /usr/bin/dumb-init
+      - --
+      - bash
+      - /opt/airflow/scripts/fbref_acceptance_entrypoint.sh
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    environment:
+      PYTHONPATH: /opt/airflow
+      FBREF_EXPECTED_GIT_SHA: ${FBREF_ACCEPTANCE_GIT_SHA:?set the exact baked Git SHA}
+      FBREF_EXPECTED_IMAGE_DIGEST: ${FBREF_ACCEPTANCE_AIRFLOW_IMAGE:?set the exact image ID}
+      FBREF_IMAGE_DIGEST: ${FBREF_ACCEPTANCE_AIRFLOW_IMAGE:?set the exact image ID}
+      PROXY_FILTER_CONTROL_TOKEN: ${FBREF_PROXY_CONTROL_TOKEN:?set the dedicated FBref control token}
+      PROXY_POOL_JSON: ""
+      PROXY_FILTER_ALLOW_FILE_FALLBACK: "true"
+    command:
+      - python
+      - /opt/airflow/scripts/proxy_filter/filter_proxy.py
+      - --listen
+      - 0.0.0.0:8899
+      - --lease-listen
+      - 0.0.0.0:8900
+      - --lease-proxy-url
+      - http://fbref_acceptance_proxy_filter:8900
+      - --proxy-file
+      - /run/secrets/fbref-proxys.txt
+      - --allow-proxy-file-fallback
+      - --blocklist
+      - /opt/airflow/configs/proxy_filter/blocklist.txt
+      - --out
+      - /opt/airflow/logs/fbref_acceptance/proxy/bytes.json
+      - --daily-budget-mb
+      - ${FBREF_PROXY_DAILY_BUDGET_MB:-150}
+      - --max-lease-mb
+      - ${FBREF_PROXY_MAX_LEASE_MB:-50}
+      - --max-lease-ttl-seconds
+      - ${FBREF_PROXY_MAX_LEASE_TTL_SECONDS:-7200}
+      - --dagrun-budget-bytes
+      - ${FBREF_PROXY_DAGRUN_BUDGET_BYTES:-52428800}
+      - --url-budget-bytes
+      - ${FBREF_PROXY_URL_BUDGET_BYTES:-52428800}
+      - --max-active-leases
+      - "1"
+      - --ledger
+      - /opt/airflow/logs/fbref_acceptance/proxy/paid_requests.jsonl
+      - --sofascore-allocation-ledger
+      - /opt/airflow/logs/fbref_acceptance/proxy/unused_sofascore_allocations.json
+      - --sofascore-allocation-wal
+      - /opt/airflow/logs/fbref_acceptance/proxy/unused_sofascore_claims.jsonl
+      - --sofascore-parent-envelope
+      - /opt/airflow/logs/fbref_acceptance/proxy/unused_sofascore_envelopes.json
+    volumes:
+      - ${FBREF_PROXY_POOL_FILE:?set the absolute dedicated FBref pool path}:/run/secrets/fbref-proxys.txt:ro
+      - ${FBREF_ACCEPTANCE_EVIDENCE_DIR:?set the absolute evidence directory}:/opt/airflow/logs/fbref_acceptance
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://localhost:8899/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks:
+      - acceptance_proxy
+
+  fbref_acceptance_runner:
+    image: ${FBREF_ACCEPTANCE_AIRFLOW_IMAGE:?set an immutable FBref runtime image}
+    user: ${AIRFLOW_UID:-50000}:0
+    restart: "no"
+    entrypoint:
+      - /usr/bin/dumb-init
+      - --
+      - bash
+      - /opt/airflow/scripts/fbref_acceptance_entrypoint.sh
+    env_file:
+      - ${FBREF_ACCEPTANCE_ENV_FILE:?set the absolute acceptance env path}
+    environment:
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://fbref_acceptance:${FBREF_ACCEPTANCE_DB_PASSWORD:?set a temporary hex-only password}@fbref_acceptance_postgres:5432/airflow
+      AIRFLOW__LOGGING__BASE_LOG_FOLDER: /opt/airflow/logs/fbref_acceptance/airflow
+      ALERT_ENV: acceptance
+      FBREF_EXPECTED_GIT_SHA: ${FBREF_ACCEPTANCE_GIT_SHA:?set the exact baked Git SHA}
+      FBREF_EXPECTED_IMAGE_DIGEST: ${FBREF_ACCEPTANCE_AIRFLOW_IMAGE:?set the exact image ID}
+      FBREF_IMAGE_DIGEST: ${FBREF_ACCEPTANCE_AIRFLOW_IMAGE:?set the exact image ID}
+      FBREF_PROXY_CONTROL_URL: http://fbref_acceptance_proxy_filter:8899
+      FBREF_PROXY_CONTROL_TOKEN: ${FBREF_PROXY_CONTROL_TOKEN:?set the dedicated FBref control token}
+      FBREF_PROXY_LEASE_TTL_SECONDS: ${FBREF_PROXY_LEASE_TTL_SECONDS:-7200}
+      FBREF_ACCEPTANCE_OUTPUT_ROOT: /opt/airflow/logs/fbref_acceptance
+      FBREF_RAW_S3_ENDPOINT: seaweedfs:8333
+      FBREF_RAW_S3_SCHEME: http
+      TRINO_HOST: trino
+      PYTHONDONTWRITEBYTECODE: "1"
+    depends_on:
+      fbref_acceptance_postgres:
+        condition: service_healthy
+      fbref_acceptance_proxy_filter:
+        condition: service_healthy
+    shm_size: 512m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+      - SYS_PTRACE
+    volumes:
+      - ${FBREF_ACCEPTANCE_EVIDENCE_DIR:?set the absolute evidence directory}:/opt/airflow/logs/fbref_acceptance
+    networks:
+      - acceptance_control
+      - acceptance_proxy
+      - production_backend
+      - production_storage
+
+networks:
+  # No explicit names: Compose prefixes both bridges with the acceptance
+  # project name, and `down` can remove them without touching dp-* networks.
+  acceptance_control:
+    driver: bridge
+  acceptance_proxy:
+    driver: bridge
+  production_backend:
+    external: true
+    name: dp-backend
+  production_storage:
+    external: true
+    name: dp-storage

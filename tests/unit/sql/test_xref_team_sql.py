@@ -205,16 +205,60 @@ class TestXrefTeamTemplateStructure:
                 "(#445 — full-name universe from match pages)"
             )
         # Every BIGINT-season branch must keep the year-start→slug expression
-        # (#404): 4 fbref (2 schedule + 2 match-page) + 2 fotmob +
-        # 2 matchhistory = 8 — a branch without it would silently emit
-        # unjoinable season values.
-        assert len(re.findall(r"LPAD\(CAST\(MOD\(season, 100\)", sql)) >= 8, (
+        # (#404): 4 fbref (2 schedule + 2 match-page) + 2 matchhistory = 6 —
+        # a branch without it would silently emit unjoinable season values.
+        # (fotmob moved to native source_season_key — asserted separately in
+        # test_fotmob_reads_native_matches_current, #930 cutover.)
+        assert len(re.findall(r"LPAD\(CAST\(MOD\(season, 100\)", sql)) >= 6, (
             "expected the season-slug expression on all 4 fbref branches "
-            "(schedule + match-page) plus fotmob/matchhistory (#445/#404)"
+            "(schedule + match-page) plus matchhistory (#445/#404)"
         )
 
+    def test_fotmob_reads_native_matches_current(self):
+        """#930 cutover: the fotmob team universe comes from native
+        ``fotmob_matches_current`` (legacy ``bronze.fotmob_schedule`` retired).
+
+        Invariants preserved from the legacy branch:
+        * source_id strings are the same source field (``home.name`` /
+          ``away.name``) → ``home_team_name``/``away_team_name``;
+        * ``league`` is reconstructed via the static competition_id map whose
+          INNER JOIN doubles as the 14-league scope guard;
+        * ``season`` derives from ``source_season_key`` — year-start via
+          ``substr(key, 1, 4)``, then the SAME legacy slug CASE (#404/#913),
+          NOT from the key's shape (AFCON single-year keys would drift).
+        """
+        sql = _read_template()
+        assert "iceberg.bronze.fotmob_matches_current" in sql, (
+            "fotmob branch must read native iceberg.bronze.fotmob_matches_current"
+        )
+        assert "iceberg.bronze.fotmob_schedule" not in sql, (
+            "legacy iceberg.bronze.fotmob_schedule must be gone (#930 cutover)"
+        )
+        # league scope: INNER JOIN to the static competition_id → league map.
+        assert re.search(r"\bJOIN\s+league_map\b", sql, re.IGNORECASE), (
+            "fotmob branch must INNER JOIN league_map (14-league scope guard)"
+        )
+        assert re.search(
+            r"lm\.competition_id\s*=\s*m\.competition_id", sql, re.IGNORECASE
+        ), "league_map JOIN must match on competition_id"
+        # season: year-start from source_season_key, then the legacy slug CASE.
+        assert re.search(
+            r"TRY_CAST\(substr\(m\.source_season_key,\s*1,\s*4\)\s+AS\s+integer\)",
+            sql,
+            re.IGNORECASE,
+        ), "season year-start must come from substr(source_season_key, 1, 4)"
+        assert len(re.findall(r"LPAD\(CAST\(MOD\(season_year, 100\)", sql)) >= 1, (
+            "fotmob season must reuse the legacy year-start→slug CASE "
+            "(bit-compatible with legacy, incl. Euro/AFCON/Copa)"
+        )
+        # home + away UNION branches survive on the native column names.
+        for col in ["home_team_name", "away_team_name"]:
+            assert re.search(
+                rf"{col}\s+AS\s+source_id", sql, re.IGNORECASE
+            ), f"fotmob branch must emit {col} as source_id"
+
     def test_season_cast_to_varchar(self):
-        """FBref/MatchHistory/FotMob seasons are BIGINT in Bronze; need CAST."""
+        """FBref/MatchHistory seasons are BIGINT in Bronze; need CAST."""
         sql = _read_template()
         # Trino tolerates either case; we accept both for editor robustness.
         assert (
@@ -352,6 +396,7 @@ class TestXrefTeamRendered:
             "iceberg.bronze.fbref_schedule",
             "iceberg.bronze.fbref_match_player_stats",
             "iceberg.bronze.fbref_match_events",
+            "iceberg.bronze.fotmob_matches_current",  # #930: native cutover
             "iceberg.bronze.matchhistory_results",
             "iceberg.bronze.clubelo_ratings",
             "iceberg.bronze.clubelo_ratings_historical",  # #589: relegated APL teams

@@ -173,10 +173,9 @@ def _preflight_reader_route_for_paid_cycle() -> dict[str, Any]:
         'candidate_slot': candidate_slot,
         'revision': state.revision,
         'reader_views': views,
-        'write_mode': (
-            'native-only'
-            if state.legacy_writers_disabled_at is not None else 'dual'
-        ),
+        # Native Bronze is the sole production writer.  Legacy/A-B branches
+        # remain unavailable to the scheduler after the cutover.
+        'write_mode': 'native-only',
         'paid_io_allowed': True,
     }
 

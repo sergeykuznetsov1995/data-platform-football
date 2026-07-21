@@ -41,8 +41,6 @@ RUNTIME_ENTRYPOINTS = frozenset(
         "dags/scripts/run_whoscored_scraper.py",
         "dags/scripts/whoscored_proxy_runtime.py",
         "scripts/proxy_filter/filter_proxy.py",
-        "scripts/cleanup_whoscored_v2_migration.py",
-        "scripts/migrate_whoscored_v2.py",
         "scripts/whoscored_proxy_campaign.py",
         "scripts/whoscored_paid_gateway.py",
         "scripts/whoscored_raw_backup.py",
@@ -702,38 +700,6 @@ for label, constructor in (
         assert 'production-v1' in str(exc), (label, exc)
     else:
         raise AssertionError(label + ' accepted non-production runtime')
-import runpy
-import scrapers.base.trino_manager as trino_module
-trino_marker = {str(tmp_path / "forbidden-migration-trino")!r}
-class ForbiddenTrino:
-    def __init__(self, **_kwargs):
-        open(trino_marker, 'w').write('called')
-        raise AssertionError('Trino constructor reached')
-trino_module.TrinoTableManager = ForbiddenTrino
-for relative, arguments in (
-    (
-        'scripts/migrate_whoscored_v2.py',
-        ['--apply', '--confirm-quiescent', '--suffix', 'genericbypass'],
-    ),
-    (
-        'scripts/cleanup_whoscored_v2_migration.py',
-        [
-            '--apply',
-            '--suffix',
-            'genericbypass',
-            '--confirm',
-            'drop-whoscored-migration-artifacts:genericbypass',
-        ],
-    ),
-):
-    sys.argv = [root + '/' + relative, *arguments]
-    try:
-        runpy.run_path(sys.argv[0], run_name='__main__')
-    except contract.RuntimeContractError as exc:
-        assert 'production-v1' in str(exc), (relative, exc)
-    else:
-        raise AssertionError(relative + ' reached generic --apply')
-assert not __import__('os').path.exists(trino_marker)
 try:
     __import__('scripts.whoscored_v2_object_contract', fromlist=('contract',))
 except contract.RuntimeContractError as exc:
@@ -780,7 +746,7 @@ def test_checked_in_whoscored_runtime_contract_matches_release_tree():
     assert EXPECTED_RUNTIME_FILES == tuple(sorted(EXPECTED_RUNTIME_FILES))
     assert len(EXPECTED_RUNTIME_FILES) == len(set(EXPECTED_RUNTIME_FILES))
     assert tuple(contract["files"]) == EXPECTED_RUNTIME_FILES
-    assert result["file_count"] == len(EXPECTED_RUNTIME_FILES) == 88
+    assert result["file_count"] == len(EXPECTED_RUNTIME_FILES) == 86
     assert len(result["code_tree_sha256"]) == 64
     assert len(result["manifest_sha256"]) == 64
 

@@ -114,6 +114,10 @@ FETCH_LEASE_SECONDS = 60 * 60
 PROCESSING_LEASE_SECONDS = 60 * 60
 REPLAY_SOURCE_REQUEST_LIMIT = 200
 REPLAY_SOURCE_BYTE_LIMIT = 100 * MIB
+ACCEPTANCE_REQUEST_LIMIT = 100
+ACCEPTANCE_BYTE_LIMIT = 50 * MIB
+ACCEPTANCE_SHARD_SIZE = 25
+ACCEPTANCE_EXECUTION_MODE = "acceptance_nonpublishing"
 
 # Statuses Cloudflare returns when it no longer honours a cf_clearance for the
 # warm HTTP session. They say nothing about the target page — only that this
@@ -162,6 +166,55 @@ class PipelineSettings:
     bootstrap_byte_reservation: Optional[int] = None
     target_request_reservation: int = MAX_TARGET_HTTP_ATTEMPTS
     proxy_file: Optional[str] = None
+
+    @classmethod
+    def acceptance(
+        cls,
+        *,
+        scope: str = "current",
+        proxy_file: Optional[str] = None,
+        domain_interval_seconds: float = DEFAULT_DOMAIN_INTERVAL_SECONDS,
+    ) -> "PipelineSettings":
+        """Build the one supported bounded live-acceptance profile.
+
+        ``scope`` describes product intent rather than exposing arbitrary run
+        settings: current acceptance is a current run, while the bounded
+        historical sample uses the existing backfill processing semantics.
+        """
+
+        normalized_scope = str(scope).strip().casefold()
+        run_types = {"current": "current", "history": "backfill"}
+        if normalized_scope not in run_types:
+            raise ValueError("acceptance scope must be current or history")
+        return cls(
+            run_type=run_types[normalized_scope],
+            request_limit=ACCEPTANCE_REQUEST_LIMIT,
+            byte_limit=ACCEPTANCE_BYTE_LIMIT,
+            shard_size=ACCEPTANCE_SHARD_SIZE,
+            proxy_file=proxy_file,
+            domain_interval_seconds=domain_interval_seconds,
+        )
+
+    @classmethod
+    def acceptance_replay(
+        cls,
+        *,
+        shard_size: int = ACCEPTANCE_SHARD_SIZE,
+    ) -> "PipelineSettings":
+        """Build the physically zero-network acceptance replay profile."""
+
+        if int(shard_size) != ACCEPTANCE_SHARD_SIZE:
+            raise ValueError("acceptance replay shard_size must be exactly 25")
+        return cls(
+            run_type="replay",
+            request_limit=0,
+            byte_limit=0,
+            shard_size=ACCEPTANCE_SHARD_SIZE,
+            # Replay never constructs a transport, but the generic settings
+            # invariant intentionally keeps reservations positive.
+            bootstrap_request_reservation=1,
+            bootstrap_byte_reservation=1,
+        )
 
     def __post_init__(self) -> None:
         if self.bootstrap_request_reservation is None:
@@ -473,6 +526,603 @@ def _sentinel_gate_errors(coverage: object) -> list[str]:
     return errors
 
 
+def _require_acceptance_settings(settings: PipelineSettings) -> None:
+    if settings.run_type not in {"current", "backfill"}:
+        raise ValueError("acceptance run_type must be current or backfill")
+    if (
+        settings.request_limit != ACCEPTANCE_REQUEST_LIMIT
+        or settings.byte_limit != ACCEPTANCE_BYTE_LIMIT
+        or settings.shard_size != ACCEPTANCE_SHARD_SIZE
+    ):
+        raise ValueError(
+            "acceptance profile must be exactly 100 requests / 50 MiB / "
+            "shard 25"
+        )
+
+
+def _acceptance_run_profile_error(
+    run: object,
+    *,
+    expected_status: str,
+) -> Optional[str]:
+    if not isinstance(run, Mapping):
+        return "run_not_found"
+    status = str(run.get("status") or "unknown").casefold()
+    if status != expected_status:
+        return f"run_status={status}"
+    run_type = str(run.get("run_type") or "unknown").casefold()
+    if run_type not in {"current", "backfill"}:
+        return f"run_type={run_type}"
+    try:
+        request_limit = int(run.get("request_limit"))
+        byte_limit = int(run.get("byte_limit"))
+    except (TypeError, ValueError):
+        return "profile_missing"
+    if (
+        request_limit != ACCEPTANCE_REQUEST_LIMIT
+        or byte_limit != ACCEPTANCE_BYTE_LIMIT
+    ):
+        return "profile_not_100_requests_50_mib"
+    metadata = run.get("metadata")
+    if not isinstance(metadata, Mapping):
+        return "metadata_missing"
+    expected_scope = "current" if run_type == "current" else "history"
+    if (
+        metadata.get("acceptance_profile") is not True
+        or str(metadata.get("execution_mode") or "").casefold()
+        != ACCEPTANCE_EXECUTION_MODE
+        or metadata.get("publication_eligible") is not False
+        or metadata.get("bootstrap_only") is not False
+        or str(metadata.get("acceptance_scope") or "").casefold()
+        != expected_scope
+        or int(metadata.get("shard_size") or 0) != ACCEPTANCE_SHARD_SIZE
+    ):
+        return "metadata_not_nonpublishing_acceptance"
+    return None
+
+
+def _accepted_raw_audit_error(run_id: object, run: Mapping) -> Optional[str]:
+    metadata = run.get("metadata")
+    if not isinstance(metadata, Mapping):
+        return "raw_audit_missing"
+    raw_audit = metadata.get("raw_audit")
+    if not isinstance(raw_audit, Mapping):
+        return "raw_audit_missing"
+    try:
+        successful = int(raw_audit.get("successful_attempt_count"))
+        audited = int(raw_audit.get("audited_attempt_count"))
+    except (TypeError, ValueError):
+        return "raw_audit_not_accepted"
+    if (
+        raw_audit.get("schema_version") != "fbref-raw-audit-anchor-v1"
+        or str(raw_audit.get("status") or "").casefold() != "passed"
+        or str(raw_audit.get("run_type") or "").casefold()
+        != str(run.get("run_type") or "").casefold()
+        or raw_audit.get("zero_delta_required") is not False
+        or successful <= 0
+        or audited != successful
+        or str(raw_audit.get("audited_control_run_id") or "") != str(run_id)
+        or str(raw_audit.get("processing_control_run_id") or "")
+        != str(run_id)
+    ):
+        return "raw_audit_not_accepted"
+    return None
+
+
+def _accepted_replay_raw_audit_error(
+    processing_run_id: object,
+    source_run_id: object,
+    run: Mapping,
+) -> Optional[str]:
+    metadata = run.get("metadata")
+    raw_audit = metadata.get("raw_audit") if isinstance(metadata, Mapping) else None
+    if not isinstance(raw_audit, Mapping):
+        return "acceptance_replay_raw_audit_missing"
+    try:
+        successful = int(raw_audit.get("successful_attempt_count"))
+        audited = int(raw_audit.get("audited_attempt_count"))
+    except (TypeError, ValueError):
+        return "acceptance_replay_raw_audit_not_accepted"
+    if (
+        raw_audit.get("schema_version") != "fbref-raw-audit-anchor-v1"
+        or str(raw_audit.get("status") or "").casefold() != "passed"
+        or str(raw_audit.get("run_type") or "").casefold() != "replay"
+        or raw_audit.get("zero_delta_required") is not True
+        or successful <= 0
+        or audited != successful
+        or str(raw_audit.get("audited_control_run_id") or "")
+        != str(source_run_id)
+        or str(raw_audit.get("processing_control_run_id") or "")
+        != str(processing_run_id)
+    ):
+        return "acceptance_replay_raw_audit_not_accepted"
+    return None
+
+
+def _acceptance_summary_errors(summary: object) -> list[str]:
+    """Return only immutable, run-owned strict acceptance gate failures."""
+
+    if not isinstance(summary, Mapping):
+        return ["summary_missing"]
+    errors: list[str] = []
+    status = str(summary.get("status") or "unknown").casefold()
+    if status not in {"running", "succeeded"}:
+        errors.append(f"run_status={status}")
+    profile_error = _acceptance_run_profile_error(
+        summary, expected_status=status
+    )
+    # The summary is normally still running during validation and succeeded
+    # when it is inspected as a replay source.  The profile helper's caller
+    # supplies that same state so only profile/metadata are checked here.
+    if profile_error is not None:
+        errors.append(profile_error)
+    target_counts = summary.get("target_counts")
+    if not isinstance(target_counts, Mapping):
+        errors.append("target_counts_missing")
+    else:
+        total_targets = sum(int(value or 0) for value in target_counts.values())
+        if total_targets <= 0:
+            errors.append("cohort_empty")
+        nonsuccess = {
+            str(status): int(count or 0)
+            for status, count in target_counts.items()
+            if status != "succeeded" and int(count or 0) > 0
+        }
+        if nonsuccess:
+            errors.append(f"cohort_targets_not_succeeded={nonsuccess}")
+    dataset_counts = summary.get("dataset_validation_counts")
+    if not isinstance(dataset_counts, Mapping):
+        errors.append("dataset_validation_counts_missing")
+    elif any(
+        int(count or 0) > 0
+        for status, count in dataset_counts.items()
+        if status not in {"succeeded", "skipped"}
+    ):
+        errors.append("dataset_validation_failed")
+    if int(summary.get("unvalidated_target_count") or 0) != 0:
+        errors.append(
+            "unvalidated_target_count="
+            f"{int(summary.get('unvalidated_target_count') or 0)}"
+        )
+    if int(summary.get("unprocessed_raw_count") or 0) != 0:
+        errors.append(
+            "unprocessed_raw_count="
+            f"{int(summary.get('unprocessed_raw_count') or 0)}"
+        )
+    if bool(summary.get("budget_exceeded")):
+        errors.append("budget_exceeded=true")
+    if int(summary.get("requests_reserved") or 0) != 0:
+        errors.append(
+            "requests_reserved="
+            f"{int(summary.get('requests_reserved') or 0)}"
+        )
+    if int(summary.get("bytes_reserved") or 0) != 0:
+        errors.append(
+            "bytes_reserved=" f"{int(summary.get('bytes_reserved') or 0)}"
+        )
+    try:
+        if int(summary.get("requests_used") or 0) > ACCEPTANCE_REQUEST_LIMIT:
+            errors.append("request_limit_exceeded")
+        if int(summary.get("bytes_used") or 0) > ACCEPTANCE_BYTE_LIMIT:
+            errors.append("byte_limit_exceeded")
+    except (TypeError, ValueError):
+        errors.append("budget_counters_invalid")
+    traffic = summary.get("traffic_totals")
+    if not isinstance(traffic, Mapping):
+        errors.append("traffic_totals_missing")
+    else:
+        attempts = int(traffic.get("network_attempts") or 0)
+        successes = int(traffic.get("warm_http_successes") or 0)
+        success_rate = traffic.get("warm_http_success_rate")
+        if attempts > 0 and (
+            successes != attempts
+            or success_rate is None
+            or float(success_rate) != 1.0
+        ):
+            errors.append(
+                f"warm_http_successes={successes}!={attempts};"
+                f"rate={success_rate!r}"
+            )
+        if int(traffic.get("unclassified_failures") or 0) != 0:
+            errors.append(
+                "unclassified_failures="
+                f"{int(traffic.get('unclassified_failures') or 0)}"
+            )
+        if int(traffic.get("duplicate_fetch_violations") or 0) != 0:
+            errors.append(
+                "duplicate_fetch_violations="
+                f"{int(traffic.get('duplicate_fetch_violations') or 0)}"
+            )
+    availability = summary.get("table_availability")
+    if not isinstance(availability, Mapping):
+        errors.append("table_availability_missing")
+    else:
+        unsafe = {
+            state: int(availability.get(state) or 0)
+            for state in ("unknown", "error")
+            if int(availability.get(state) or 0) > 0
+        }
+        if unsafe:
+            errors.append(f"unsafe_table_availability={unsafe}")
+    return errors
+
+
+def _acceptance_coverage_errors(
+    cohort_anchor: Mapping[str, object], evidence: object
+) -> list[str]:
+    """Re-prove frozen slots from the just-fetched immutable observations."""
+
+    if not isinstance(evidence, Mapping):
+        return ["acceptance_evidence_missing"]
+    targets = evidence.get("targets")
+    datasets = evidence.get("datasets")
+    if not isinstance(targets, Sequence) or not isinstance(datasets, Sequence):
+        return ["acceptance_evidence_incomplete"]
+    expected_ids = [str(item) for item in cohort_anchor.get("target_ids") or ()]
+    actual_ids = [str(item.get("target_id") or "") for item in targets]
+    errors: list[str] = []
+    if actual_ids != expected_ids:
+        errors.append("acceptance_target_order_mismatch")
+    target_by_id = {
+        str(item.get("target_id") or ""): item
+        for item in targets
+        if isinstance(item, Mapping)
+    }
+    invalid_targets = [
+        target_id
+        for target_id, item in target_by_id.items()
+        if str(item.get("status") or "").casefold() != "succeeded"
+        or int(item.get("http_status") or 0) not in {200, 304}
+        or not item.get("raw_manifest_key")
+        or not item.get("content_hash")
+    ]
+    if invalid_targets:
+        errors.append(
+            "acceptance_target_evidence_invalid=" + ",".join(invalid_targets)
+        )
+    if not datasets:
+        errors.append("acceptance_dataset_evidence_empty")
+    unsafe_datasets = []
+    for item in datasets:
+        if not isinstance(item, Mapping):
+            unsafe_datasets.append("non_mapping")
+            continue
+        if str(item.get("dataset") or "").startswith("table:"):
+            # Raw per-table inventory is diagnostic, not the typed bronze
+            # contract (#949).  Typed completeness is enforced by the per-target
+            # __page__/typed:* manifest checks below.  Skip inventory here so an
+            # unclassified auxiliary table (availability='unknown' + reason)
+            # cannot fail the acceptance dataset gate.
+            continue
+        availability = str(item.get("availability") or "").casefold()
+        statuses = {
+            str(item.get(name) or "").casefold()
+            for name in (
+                "parse_status",
+                "persistence_status",
+                "validation_status",
+            )
+        }
+        if (
+            availability in {"unknown", "error"}
+            or statuses - {"succeeded", "skipped"}
+            or (
+                availability in {"empty", "restricted", "not_applicable"}
+                and not str(item.get("empty_reason") or "").strip()
+            )
+        ):
+            unsafe_datasets.append(
+                f"{item.get('target_id')}:{item.get('dataset')}"
+            )
+    if unsafe_datasets:
+        errors.append(
+            "acceptance_dataset_evidence_invalid="
+            + ",".join(unsafe_datasets[:25])
+        )
+    manifests_by_target: dict[str, dict[str, Mapping[str, object]]] = {}
+    for item in datasets:
+        if not isinstance(item, Mapping):
+            continue
+        target_key = str(item.get("target_id") or "")
+        dataset_key = str(item.get("dataset") or "")
+        if target_key and dataset_key:
+            manifests_by_target.setdefault(target_key, {})[dataset_key] = item
+
+    def _manifest_ok(
+        target_id: str, dataset_name: str, *, allow_skipped: bool = False
+    ) -> bool:
+        item = manifests_by_target.get(target_id, {}).get(dataset_name)
+        if item is None:
+            return False
+        allowed = {"succeeded"}
+        if allow_skipped:
+            allowed.add("skipped")
+        return (
+            str(item.get("parse_status") or "").casefold() == "succeeded"
+            and str(item.get("persistence_status") or "").casefold()
+            in allowed
+            and str(item.get("validation_status") or "").casefold()
+            in allowed
+        )
+
+    missing_target_manifests: list[str] = []
+    for target in targets:
+        if not isinstance(target, Mapping):
+            continue
+        target_id = str(target.get("target_id") or "")
+        page_kind = str(target.get("page_kind") or "").casefold()
+        if not _manifest_ok(target_id, "__page__"):
+            missing_target_manifests.append(f"{target_id}:__page__")
+            continue
+        required_typed: set[str] = set()
+        if page_kind == "schedule":
+            required_typed = {"typed:schedule"}
+        elif page_kind == "season":
+            required_typed = {"typed:player_stats", "typed:team_stats"}
+        elif page_kind == "season_stats":
+            route = str(
+                (target.get("source_ids") or {}).get("stat_route") or ""
+            ).casefold()
+            required_typed = {
+                "standard": {"typed:player_stats", "typed:team_stats"},
+                "shooting": {
+                    "typed:player_shooting", "typed:team_shooting"
+                },
+                "playingtime": {
+                    "typed:player_playingtime", "typed:team_playingtime"
+                },
+                "misc": {"typed:player_misc", "typed:team_misc"},
+                "keepers": {"typed:keeper_keeper"},
+            }.get(route, set())
+        elif page_kind == "match":
+            required_typed = {
+                "typed:shot_events", "typed:match_events", "typed:lineups",
+                "typed:match_team_stats", "typed:match_managers",
+                "typed:match_officials", "typed:match_keeper_stats",
+                "typed:match_player_stats", "typed:__complete__",
+            }
+        for dataset_name in sorted(required_typed):
+            if not _manifest_ok(
+                target_id,
+                dataset_name,
+                allow_skipped=dataset_name != "typed:__complete__",
+            ):
+                missing_target_manifests.append(f"{target_id}:{dataset_name}")
+    if missing_target_manifests:
+        errors.append(
+            "acceptance_target_manifests_missing="
+            + ",".join(missing_target_manifests[:25])
+        )
+    datasets_by_target: dict[str, list[Mapping[str, object]]] = {}
+    unexpected_dataset_targets = set()
+    for item in datasets:
+        if not isinstance(item, Mapping):
+            continue
+        target_id = str(item.get("target_id") or "")
+        if target_id not in target_by_id:
+            unexpected_dataset_targets.add(target_id or "<missing>")
+            continue
+        datasets_by_target.setdefault(target_id, []).append(item)
+    if unexpected_dataset_targets:
+        errors.append(
+            "acceptance_dataset_target_mismatch="
+            + ",".join(sorted(unexpected_dataset_targets))
+        )
+
+    # A successful observation is proved per target, not merely by having at
+    # least one manifest somewhere in the run.  ``__page__`` is written only
+    # after generic persistence and validation complete.  Typed page kinds
+    # additionally require the final completion marker, so a stale-observation
+    # marker or a partial set of typed datasets cannot satisfy acceptance.
+    typed_page_kinds = {"schedule", "season", "season_stats", "match"}
+    missing_page_completions = []
+    missing_typed_completions = []
+    for target_id in expected_ids:
+        target = target_by_id.get(target_id)
+        target_datasets = datasets_by_target.get(target_id, [])
+        page_completions = [
+            item
+            for item in target_datasets
+            if str(item.get("dataset") or "") == "__page__"
+        ]
+        if len(page_completions) != 1 or any(
+            str(page_completions[0].get(name) or "").casefold()
+            != "succeeded"
+            for name in (
+                "parse_status",
+                "persistence_status",
+                "validation_status",
+            )
+        ):
+            missing_page_completions.append(target_id)
+        page_kind = (
+            str(target.get("page_kind") or "").casefold()
+            if isinstance(target, Mapping)
+            else ""
+        )
+        if page_kind not in typed_page_kinds:
+            continue
+        typed_completions = [
+            item
+            for item in target_datasets
+            if str(item.get("dataset") or "") == "typed:__complete__"
+        ]
+        if (
+            len(typed_completions) != 1
+            or str(
+                typed_completions[0].get("availability") or ""
+            ).casefold()
+            != "available"
+            or any(
+                str(typed_completions[0].get(name) or "").casefold()
+                != "succeeded"
+                for name in (
+                    "parse_status",
+                    "persistence_status",
+                    "validation_status",
+                )
+            )
+        ):
+            missing_typed_completions.append(target_id)
+    if missing_page_completions:
+        errors.append(
+            "acceptance_page_completion_missing="
+            + ",".join(missing_page_completions)
+        )
+    if missing_typed_completions:
+        errors.append(
+            "acceptance_typed_completion_missing="
+            + ",".join(missing_typed_completions)
+        )
+    slots = cohort_anchor.get("coverage_slots")
+    if not isinstance(slots, Mapping):
+        errors.append("acceptance_coverage_slots_missing")
+        return errors
+    for slot, target_id_value in slots.items():
+        slot_name = str(slot)
+        target_id = str(target_id_value)
+        target = target_by_id.get(target_id)
+        if target is None:
+            errors.append(f"acceptance_slot_target_missing={slot_name}")
+            continue
+        page_kind = str(target.get("page_kind") or "").casefold()
+        source_ids = target.get("source_ids")
+        source_ids = source_ids if isinstance(source_ids, Mapping) else {}
+        expected_class = {
+            "player_populated": "populated_player",
+            "player_empty": "empty_player",
+            "match_full": "full_match",
+            "match_sparse": "sparse_match",
+        }.get(slot_name)
+        if expected_class is not None:
+            if str(target.get("evidence_class") or "") != expected_class:
+                errors.append(f"acceptance_slot_reclassified={slot_name}")
+        elif slot_name.startswith("season_stats_"):
+            route = slot_name.removeprefix("season_stats_")
+            if page_kind != "season_stats" or (
+                str(source_ids.get("stat_route") or "").casefold() != route
+            ):
+                errors.append(f"acceptance_slot_route_mismatch={slot_name}")
+        elif page_kind != slot_name:
+            errors.append(f"acceptance_slot_page_kind_mismatch={slot_name}")
+    actual_page_kinds = {
+        str(item.get("page_kind") or "").casefold() for item in targets
+    }
+    required_page_kinds = {
+        str(item).casefold()
+        for item in cohort_anchor.get("required_page_kinds") or ()
+    }
+    missing_kinds = sorted(required_page_kinds - actual_page_kinds)
+    if missing_kinds:
+        errors.append("acceptance_page_kinds_missing=" + ",".join(missing_kinds))
+    actual_routes = {
+        str((item.get("source_ids") or {}).get("stat_route") or "").casefold()
+        for item in targets
+        if isinstance(item.get("source_ids"), Mapping)
+        and str(item.get("page_kind") or "").casefold() == "season_stats"
+    }
+    required_routes = {
+        str(item).casefold()
+        for item in cohort_anchor.get("required_routes") or ()
+    }
+    missing_routes = sorted(required_routes - actual_routes)
+    if missing_routes:
+        errors.append("acceptance_routes_missing=" + ",".join(missing_routes))
+    return errors
+
+
+def _bronze_acceptance_marker(
+    run_id: str,
+    summary: Mapping[str, object],
+    *,
+    cohort_anchor: Mapping[str, object],
+) -> dict:
+    traffic = summary.get("traffic_totals")
+    traffic = traffic if isinstance(traffic, Mapping) else {}
+    return {
+        "schema_version": "fbref-bronze-acceptance-v1",
+        "status": "passed",
+        "processing_control_run_id": str(run_id),
+        "scope": str(cohort_anchor["scope"]),
+        "cohort_size": int(cohort_anchor["cohort_size"]),
+        "cohort_sha256": str(cohort_anchor["cohort_sha256"]),
+        "page_kind_counts": dict(summary.get("cohort_page_kind_counts") or {}),
+        "route_counts": dict(summary.get("cohort_route_counts") or {}),
+        "strict_gates": {
+            "all_cohort_targets_succeeded": True,
+            "network_attempts": int(traffic.get("network_attempts") or 0),
+            "warm_http_successes": int(
+                traffic.get("warm_http_successes") or 0
+            ),
+            "warm_http_success_rate": traffic.get("warm_http_success_rate"),
+            "unclassified_failures": int(
+                traffic.get("unclassified_failures") or 0
+            ),
+            "duplicate_fetch_violations": int(
+                traffic.get("duplicate_fetch_violations") or 0
+            ),
+            "budget_exceeded": bool(summary.get("budget_exceeded")),
+            "requests_used": int(summary.get("requests_used") or 0),
+            "bytes_used": int(summary.get("bytes_used") or 0),
+            "requests_reserved": int(
+                summary.get("requests_reserved") or 0
+            ),
+            "bytes_reserved": int(summary.get("bytes_reserved") or 0),
+            "unvalidated_target_count": int(
+                summary.get("unvalidated_target_count") or 0
+            ),
+            "unprocessed_raw_count": int(
+                summary.get("unprocessed_raw_count") or 0
+            ),
+            "table_availability": dict(
+                summary.get("table_availability") or {}
+            ),
+        },
+    }
+
+
+def _bronze_acceptance_replay_marker(
+    run_id: str,
+    summary: Mapping[str, object],
+    *,
+    source_run_id: str,
+    source_marker: Mapping[str, object],
+) -> dict:
+    traffic = summary.get("traffic_totals")
+    traffic = traffic if isinstance(traffic, Mapping) else {}
+    metadata = summary.get("metadata")
+    raw_audit = (
+        metadata.get("raw_audit") if isinstance(metadata, Mapping) else {}
+    )
+    raw_audit = raw_audit if isinstance(raw_audit, Mapping) else {}
+    return {
+        "schema_version": "fbref-bronze-acceptance-replay-v1",
+        "status": "passed",
+        "processing_control_run_id": str(run_id),
+        "source_control_run_id": str(source_run_id),
+        "scope": str(source_marker["scope"]),
+        "cohort_size": int(source_marker["cohort_size"]),
+        "cohort_sha256": str(source_marker["cohort_sha256"]),
+        "page_kind_counts": dict(source_marker.get("page_kind_counts") or {}),
+        "route_counts": dict(source_marker.get("route_counts") or {}),
+        "strict_gates": {
+            "source_acceptance_status": "passed",
+            "network_attempts": int(traffic.get("network_attempts") or 0),
+            "requests_used": int(summary.get("requests_used") or 0),
+            "bytes_used": int(summary.get("bytes_used") or 0),
+            "request_limit": int(summary.get("request_limit") or 0),
+            "byte_limit": int(summary.get("byte_limit") or 0),
+            "replay_candidates_remaining": 0,
+            "raw_audit_status": raw_audit.get("status"),
+            "raw_zero_delta_required": raw_audit.get("zero_delta_required"),
+            "raw_audited_attempt_count": int(
+                raw_audit.get("audited_attempt_count") or 0
+            ),
+            "raw_audit_artifact_sha256": raw_audit.get("artifact_sha256"),
+        },
+    }
+
+
 def page_target_from_link(link: DiscoveredPageLink) -> PageTarget:
     """Build a stable target from an exact source-provided canonical URL."""
 
@@ -752,6 +1402,160 @@ class FBrefPipeline:
         self.control.start_run(run_id)
         return run_id
 
+    def initialize_acceptance_run(
+        self,
+        *,
+        airflow_run_id: object,
+        dag_id: object,
+        settings: PipelineSettings,
+        execution_metadata: Optional[Mapping[str, object]] = None,
+    ) -> str:
+        """Initialize an explicitly nonpublishing bounded acceptance run."""
+
+        _require_acceptance_settings(settings)
+        supplied = dict(execution_metadata or {})
+        protected = {
+            "execution_mode",
+            "acceptance_profile",
+            "acceptance_scope",
+            "bootstrap_only",
+            "publication_eligible",
+        }
+        collisions = sorted(protected & set(supplied))
+        if collisions:
+            raise ValueError(
+                "FBref acceptance metadata cannot replace protected keys: "
+                + ", ".join(collisions)
+            )
+        scope = "current" if settings.run_type == "current" else "history"
+        return self.initialize_run(
+            airflow_run_id=airflow_run_id,
+            dag_id=dag_id,
+            settings=settings,
+            execution_metadata={
+                **supplied,
+                "execution_mode": ACCEPTANCE_EXECUTION_MODE,
+                "acceptance_profile": True,
+                "acceptance_scope": scope,
+                "bootstrap_only": False,
+                "publication_eligible": False,
+            },
+        )
+
+    def initialize_acceptance_replay_run(
+        self,
+        *,
+        airflow_run_id: object,
+        dag_id: object,
+        source_control_run_id: object,
+        settings: PipelineSettings,
+        execution_metadata: Optional[Mapping[str, object]] = None,
+    ) -> str:
+        """Initialize a zero-budget replay of one passed acceptance source."""
+
+        if (
+            settings.run_type != "replay"
+            or settings.request_limit != 0
+            or settings.byte_limit != 0
+            or settings.shard_size != ACCEPTANCE_SHARD_SIZE
+        ):
+            raise ValueError(
+                "acceptance replay profile must be exactly 0 requests / "
+                "0 bytes / shard 25"
+            )
+        source_id = str(uuid.UUID(str(source_control_run_id).strip()))
+        source_error = self._acceptance_replay_source_error(source_id)
+        if source_error is not None:
+            raise PipelineError(source_error)
+        supplied = dict(execution_metadata or {})
+        protected = {
+            "execution_mode",
+            "acceptance_replay",
+            "acceptance_replay_source_run_id",
+            "bootstrap_only",
+            "publication_eligible",
+        }
+        collisions = sorted(protected & set(supplied))
+        if collisions:
+            raise ValueError(
+                "FBref acceptance replay metadata cannot replace protected "
+                "keys: " + ", ".join(collisions)
+            )
+        return self.initialize_run(
+            airflow_run_id=airflow_run_id,
+            dag_id=dag_id,
+            settings=settings,
+            execution_metadata={
+                **supplied,
+                "execution_mode": "acceptance_replay_nonpublishing",
+                "acceptance_replay": True,
+                "acceptance_replay_source_run_id": source_id,
+                "bootstrap_only": False,
+                "publication_eligible": False,
+            },
+        )
+
+    def seed_acceptance_cohort(
+        self,
+        run_id: str,
+        target_ids: Sequence[object],
+        *,
+        settings: PipelineSettings,
+        required_page_kinds: Sequence[str],
+        required_routes: Sequence[str] = (),
+        coverage_slots: Optional[Mapping[str, object]] = None,
+    ) -> dict:
+        """Freeze one operator-selected acceptance cohort in exact order."""
+
+        _require_acceptance_settings(settings)
+        run = self.control.get_run(run_id)
+        error = _acceptance_run_profile_error(run, expected_status="running")
+        if error is not None:
+            raise PipelineError(error)
+        expected_scope = (
+            "current" if settings.run_type == "current" else "history"
+        )
+        metadata = run.get("metadata") if isinstance(run, Mapping) else None
+        if not isinstance(metadata, Mapping) or (
+            str(metadata.get("acceptance_scope") or "").casefold()
+            != expected_scope
+        ):
+            raise PipelineError("acceptance_run_scope_mismatch")
+        requested_ids = [str(item).strip() for item in target_ids]
+        required_kinds = [str(item).strip() for item in required_page_kinds]
+        required_route_names = [str(item).strip() for item in required_routes]
+        slots = {
+            str(slot).strip(): str(target).strip()
+            for slot, target in dict(coverage_slots or {}).items()
+        }
+        if not required_kinds or any(not item for item in required_kinds):
+            raise ValueError("required_page_kinds must not be empty")
+        if not slots or set(slots.values()) != set(requested_ids):
+            raise ValueError("coverage_slots must cover the exact target_ids")
+        cohort = self.control.create_explicit_run_cohort(run_id, target_ids)
+        ordered_ids = [item.target_id for item in cohort]
+        encoded = json.dumps(
+            ordered_ids, ensure_ascii=True, separators=(",", ":")
+        ).encode("ascii")
+        result = {
+            "cohort_size": len(ordered_ids),
+            "target_ids": ordered_ids,
+            "cohort_sha256": hashlib.sha256(encoded).hexdigest(),
+        }
+        anchored = self.control.record_acceptance_cohort(
+            run_id,
+            {
+                "schema_version": "fbref-acceptance-cohort-v1",
+                "status": "frozen",
+                "scope": expected_scope,
+                **result,
+                "required_page_kinds": required_kinds,
+                "required_routes": required_route_names,
+                "coverage_slots": slots,
+            },
+        )
+        return {**result, "acceptance_cohort": anchored}
+
     def seed_competition_index(self) -> str:
         target = competition_index_target()
         self.control.upsert_frontier_target(frontier_target(target))
@@ -826,6 +1630,55 @@ class FBrefPipeline:
             != str(source_run_id)
         ):
             return "replay_source_raw_audit_not_accepted"
+        return None
+
+    def _acceptance_replay_source_error(
+        self, source_run_id: Optional[str]
+    ) -> Optional[str]:
+        """Require a passed bounded nonpublishing acceptance source.
+
+        This deliberately does not relax :meth:`_replay_source_error`; callers
+        must opt into the separate acceptance replay path end to end.
+        """
+
+        if not source_run_id:
+            return "acceptance_replay_source_run_id_missing"
+        try:
+            source_run = self.control.get_run(source_run_id)
+        except (TypeError, ValueError):
+            return "acceptance_replay_source_run_id_invalid"
+        profile_error = _acceptance_run_profile_error(
+            source_run, expected_status="succeeded"
+        )
+        if profile_error is not None:
+            return f"acceptance_replay_source_{profile_error}"
+        raw_error = _accepted_raw_audit_error(source_run_id, source_run)
+        if raw_error is not None:
+            return f"acceptance_replay_source_{raw_error}"
+        metadata = source_run.get("metadata")
+        marker = (
+            metadata.get("bronze_acceptance")
+            if isinstance(metadata, Mapping)
+            else None
+        )
+        cohort = (
+            metadata.get("acceptance_cohort")
+            if isinstance(metadata, Mapping)
+            else None
+        )
+        if not isinstance(marker, Mapping) or not isinstance(cohort, Mapping):
+            return "acceptance_replay_source_strict_evidence_missing"
+        if (
+            marker.get("schema_version") != "fbref-bronze-acceptance-v1"
+            or str(marker.get("status") or "").casefold() != "passed"
+            or str(marker.get("processing_control_run_id") or "")
+            != str(source_run_id)
+            or int(marker.get("cohort_size") or 0) <= 0
+            or str(marker.get("cohort_sha256") or "")
+            != str(cohort.get("cohort_sha256") or "")
+            or marker.get("strict_gates") is None
+        ):
+            return "acceptance_replay_source_strict_evidence_invalid"
         return None
 
     def seed_historical_seasons(
@@ -2258,6 +3111,7 @@ class FBrefPipeline:
                 persistence_status="succeeded",
                 validation_status="succeeded",
                 row_count=table.row_count,
+                error_message=table.reason,
             )
         return page
 
@@ -2313,7 +3167,10 @@ class FBrefPipeline:
                 ),
                 row_count=int(getattr(dataset, "row_count", 0) or 0),
                 error_class=getattr(dataset, "error_type", None),
-                error_message=getattr(dataset, "error_message", None),
+                error_message=(
+                    getattr(dataset, "error_message", None)
+                    or getattr(dataset, "reason", None)
+                ),
             )
 
     def _record_typed_completion(
@@ -2497,7 +3354,13 @@ class FBrefPipeline:
                 else sum(table.row_count for table in page.tables)
             ),
             error_class=None if error is None else type(error).__name__,
-            error_message=None if error is None else str(error),
+            error_message=(
+                str(error)
+                if error is not None
+                else "verified_zero_table_page"
+                if page is not None and not page.tables
+                else None
+            ),
         )
 
     def _apply_stateful_effects(
@@ -2541,6 +3404,7 @@ class FBrefPipeline:
         page_kinds: Sequence[str],
         settings: PipelineSettings,
         source_run_id: Optional[str] = None,
+        acceptance_replay: bool = False,
         _recover_cross_run: bool = False,
     ) -> WaveResult:
         """Parse raw under a database-held publication-generation fence."""
@@ -2551,6 +3415,7 @@ class FBrefPipeline:
                 page_kinds=page_kinds,
                 settings=settings,
                 source_run_id=source_run_id,
+                acceptance_replay=acceptance_replay,
                 _recover_cross_run=_recover_cross_run,
             )
 
@@ -2561,6 +3426,7 @@ class FBrefPipeline:
         page_kinds: Sequence[str],
         settings: PipelineSettings,
         source_run_id: Optional[str] = None,
+        acceptance_replay: bool = False,
         _recover_cross_run: bool = False,
     ) -> WaveResult:
         """Parse and persist a bounded handoff using raw storage only."""
@@ -2568,8 +3434,14 @@ class FBrefPipeline:
         result = WaveResult()
         stateful_run_id = run_id
         stateful_run_type = settings.run_type
+        if acceptance_replay and settings.run_type != "replay":
+            raise ParseWaveError("acceptance_replay_requires_replay_mode")
         if settings.run_type == "replay":
-            source_error = self._replay_source_error(source_run_id)
+            source_error = (
+                self._acceptance_replay_source_error(source_run_id)
+                if acceptance_replay
+                else self._replay_source_error(source_run_id)
+            )
             if source_error:
                 raise ParseWaveError(source_error)
             source_run = self.control.get_run(source_run_id)
@@ -2782,7 +3654,19 @@ class FBrefPipeline:
         *,
         replay_source_run_id: Optional[str] = None,
         publication_eligible: bool = True,
+        acceptance: bool = False,
+        acceptance_replay: bool = False,
     ) -> dict:
+        live_acceptance = bool(acceptance and not acceptance_replay)
+        isolated_acceptance = bool(acceptance or acceptance_replay)
+        if acceptance_replay and replay_source_run_id is None:
+            raise RunValidationError(
+                "acceptance_replay_source_run_id_missing"
+            )
+        if acceptance or acceptance_replay:
+            # Acceptance is physically nonpublishing regardless of a caller's
+            # generic default.  Durable run metadata is checked below too.
+            publication_eligible = False
         summary = self.control.get_run_summary(
             run_id,
             parser_version=PAGE_DOCUMENT_VERSION,
@@ -2807,6 +3691,67 @@ class FBrefPipeline:
             if status not in {"succeeded", "skipped"}
         )
         errors = []
+        if live_acceptance:
+            errors.extend(_acceptance_summary_errors(summary))
+            raw_error = _accepted_raw_audit_error(run_id, summary)
+            if raw_error is not None:
+                errors.append(raw_error)
+            metadata = summary.get("metadata")
+            cohort_anchor = (
+                metadata.get("acceptance_cohort")
+                if isinstance(metadata, Mapping)
+                else None
+            )
+            if not isinstance(cohort_anchor, Mapping):
+                errors.append("acceptance_cohort_missing")
+            else:
+                target_total = sum(
+                    int(count or 0) for count in target_counts.values()
+                )
+                if int(cohort_anchor.get("cohort_size") or 0) != target_total:
+                    errors.append("acceptance_cohort_size_mismatch")
+                page_kind_total = sum(
+                    int(count or 0)
+                    for count in (
+                        summary.get("cohort_page_kind_counts") or {}
+                    ).values()
+                )
+                route_total = sum(
+                    int(count or 0)
+                    for count in (
+                        summary.get("cohort_route_counts") or {}
+                    ).values()
+                )
+                if page_kind_total != target_total:
+                    errors.append("acceptance_page_kind_counts_mismatch")
+                if route_total != target_total:
+                    errors.append("acceptance_route_counts_mismatch")
+                evidence = self.control.get_acceptance_run_evidence(run_id)
+                errors.extend(
+                    _acceptance_coverage_errors(cohort_anchor, evidence)
+                )
+        if acceptance_replay:
+            replay_metadata = summary.get("metadata")
+            if (
+                str(summary.get("run_type") or "").casefold() != "replay"
+                or int(summary.get("request_limit", -1)) != 0
+                or int(summary.get("byte_limit", -1)) != 0
+                or not isinstance(replay_metadata, Mapping)
+                or replay_metadata.get("acceptance_replay") is not True
+                or str(replay_metadata.get("execution_mode") or "").casefold()
+                != "acceptance_replay_nonpublishing"
+                or replay_metadata.get("publication_eligible") is not False
+                or str(
+                    replay_metadata.get("acceptance_replay_source_run_id") or ""
+                )
+                != str(replay_source_run_id)
+            ):
+                errors.append("acceptance_replay_profile_invalid")
+            replay_raw_error = _accepted_replay_raw_audit_error(
+                run_id, replay_source_run_id, summary
+            )
+            if replay_raw_error is not None:
+                errors.append(replay_raw_error)
         if incomplete:
             errors.append(f"incomplete_targets={incomplete}")
         if dataset_failures:
@@ -2875,9 +3820,17 @@ class FBrefPipeline:
                 if replay_source_run_id
                 else None
             )
-            if source_summary and int(source_summary.get("request_limit") or 0) == 100:
+            if (
+                not acceptance_replay
+                and source_summary
+                and int(source_summary.get("request_limit") or 0) == 100
+            ):
                 errors.append("replay_source_canary_not_publication_eligible")
-            source_error = self._replay_source_error(replay_source_run_id)
+            source_error = (
+                self._acceptance_replay_source_error(replay_source_run_id)
+                if acceptance_replay
+                else self._replay_source_error(replay_source_run_id)
+            )
             if source_error:
                 errors.append(source_error)
             elif self.control.list_replay_fetches(
@@ -2888,17 +3841,18 @@ class FBrefPipeline:
                 limit=1,
             ):
                 errors.append("replay_candidates_remaining")
-        if int(summary.get("female_downstream_targets") or 0) != 0:
-            errors.append("female_downstream_targets_nonzero")
-        if int(summary.get("unknown_gender_downstream_targets") or 0) != 0:
-            errors.append("unknown_gender_downstream_targets_nonzero")
-        if "unknown_gender_registry_count" not in summary:
-            errors.append("unknown_gender_registry_count_missing")
-        elif int(summary.get("unknown_gender_registry_count") or 0) != 0:
-            errors.append(
-                "unknown_gender_registry_count="
-                f"{int(summary['unknown_gender_registry_count'])}"
-            )
+        if not isolated_acceptance:
+            if int(summary.get("female_downstream_targets") or 0) != 0:
+                errors.append("female_downstream_targets_nonzero")
+            if int(summary.get("unknown_gender_downstream_targets") or 0) != 0:
+                errors.append("unknown_gender_downstream_targets_nonzero")
+            if "unknown_gender_registry_count" not in summary:
+                errors.append("unknown_gender_registry_count_missing")
+            elif int(summary.get("unknown_gender_registry_count") or 0) != 0:
+                errors.append(
+                    "unknown_gender_registry_count="
+                    f"{int(summary['unknown_gender_registry_count'])}"
+                )
         if "unprocessed_raw_count" not in summary:
             errors.append("unprocessed_raw_count_missing")
         elif int(summary.get("unprocessed_raw_count") or 0) != 0:
@@ -2906,31 +3860,33 @@ class FBrefPipeline:
                 "unprocessed_raw_count="
                 f"{int(summary['unprocessed_raw_count'])}"
             )
-        if "global_unprocessed_raw_sla_overdue_count" not in summary:
-            errors.append("global_unprocessed_raw_sla_overdue_count_missing")
-        elif int(
-            summary.get("global_unprocessed_raw_sla_overdue_count") or 0
-        ) != 0:
-            errors.append(
-                "global_unprocessed_raw_sla_overdue_count="
-                f"{int(summary['global_unprocessed_raw_sla_overdue_count'])}"
-            )
-
-        crawlable_scope = summary.get("crawlable_frontier_scope_counts")
-        if not isinstance(crawlable_scope, Mapping):
-            errors.append("crawlable_frontier_scope_counts_missing")
-        else:
-            invalid_crawlable = {
-                str(status): int(count)
-                for status, count in crawlable_scope.items()
-                if status != "eligible_male" and int(count) > 0
-            }
-            if invalid_crawlable:
+        if not isolated_acceptance:
+            if "global_unprocessed_raw_sla_overdue_count" not in summary:
+                errors.append("global_unprocessed_raw_sla_overdue_count_missing")
+            elif int(
+                summary.get("global_unprocessed_raw_sla_overdue_count") or 0
+            ) != 0:
                 errors.append(
-                    f"crawlable_out_of_scope_targets={invalid_crawlable}"
+                    "global_unprocessed_raw_sla_overdue_count="
+                    f"{int(summary['global_unprocessed_raw_sla_overdue_count'])}"
                 )
-            if int(crawlable_scope.get("eligible_male") or 0) <= 0:
-                errors.append("crawlable_male_scope_empty")
+
+        if not isolated_acceptance:
+            crawlable_scope = summary.get("crawlable_frontier_scope_counts")
+            if not isinstance(crawlable_scope, Mapping):
+                errors.append("crawlable_frontier_scope_counts_missing")
+            else:
+                invalid_crawlable = {
+                    str(status): int(count)
+                    for status, count in crawlable_scope.items()
+                    if status != "eligible_male" and int(count) > 0
+                }
+                if invalid_crawlable:
+                    errors.append(
+                        f"crawlable_out_of_scope_targets={invalid_crawlable}"
+                    )
+                if int(crawlable_scope.get("eligible_male") or 0) <= 0:
+                    errors.append("crawlable_male_scope_empty")
 
         if publication_eligible and str(summary.get("run_type") or "").lower() != "replay":
             freshness = summary.get("publication_scope_freshness")
@@ -2948,7 +3904,10 @@ class FBrefPipeline:
                         f"{freshness_label}_stale_targets="
                         f"{int(freshness.get('stale_targets') or 0)}"
                     )
-        if str(summary.get("run_type") or "").lower() != "replay":
+        if (
+            not isolated_acceptance
+            and str(summary.get("run_type") or "").lower() != "replay"
+        ):
             errors.extend(
                 _sentinel_gate_errors(summary.get("sentinel_coverage"))
             )
@@ -2960,6 +3919,30 @@ class FBrefPipeline:
             # aborts the run when the DAG itself gives up, which is the only
             # point at which the outcome is actually known.
             raise RunValidationError("; ".join(errors))
+        if live_acceptance:
+            cohort_anchor = summary["metadata"]["acceptance_cohort"]
+            self.control.record_bronze_acceptance(
+                run_id,
+                _bronze_acceptance_marker(
+                    run_id,
+                    summary,
+                    cohort_anchor=cohort_anchor,
+                ),
+            )
+        elif acceptance_replay:
+            source_run = self.control.get_run(replay_source_run_id)
+            source_metadata = source_run.get("metadata") or {}
+            source_marker = source_metadata["bronze_acceptance"]
+            self.control.record_bronze_acceptance(
+                run_id,
+                _bronze_acceptance_replay_marker(
+                    run_id,
+                    summary,
+                    source_run_id=str(replay_source_run_id),
+                    source_marker=source_marker,
+                ),
+                replay=True,
+            )
         self.control.finish_run(run_id, succeeded=True)
         return summary
 

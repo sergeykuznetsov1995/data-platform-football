@@ -137,7 +137,8 @@ _BRONZE_COLUMNS: List[str] = [
     "_ingested_at",
 ]
 
-# Must stay byte-for-byte aligned with scripts.migrate_whoscored_v2.EVENT_KEY.
+# Must stay byte-for-byte aligned with the canonical natural key in
+# scripts.whoscored_v2_object_contract.LEGACY_MIGRATION_KEYS["whoscored_events"].
 # The order is part of the JSON-array hash contract, not merely set membership.
 _MIGRATION_EVENT_NATURAL_KEY = (
     "league",
@@ -1117,21 +1118,22 @@ class TestMemorySafeProjection:
         assert legacy_hash_fields == _MIGRATION_EVENT_NATURAL_KEY
         assert "_ingested_at" not in hash_fields
 
-        migration_tree = ast.parse(
-            (PROJECT_ROOT / "scripts" / "migrate_whoscored_v2.py").read_text(
+        contract_tree = ast.parse(
+            (PROJECT_ROOT / "scripts" / "whoscored_v2_object_contract.py").read_text(
                 encoding="utf-8"
             )
         )
-        migration_key = next(
+        legacy_migration_keys = next(
             ast.literal_eval(node.value)
-            for node in migration_tree.body
-            if isinstance(node, ast.Assign)
-            and any(
-                isinstance(target, ast.Name) and target.id == "EVENT_KEY"
-                for target in node.targets
-            )
+            for node in contract_tree.body
+            if isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == "LEGACY_MIGRATION_KEYS"
         )
-        assert tuple(migration_key) == _MIGRATION_EVENT_NATURAL_KEY
+        assert (
+            tuple(legacy_migration_keys["whoscored_events"])
+            == _MIGRATION_EVENT_NATURAL_KEY
+        )
 
     def test_output_columns_remain_frozen(self, duck_conn):
         row = _seed_and_run(duck_conn, [_row()])[0]

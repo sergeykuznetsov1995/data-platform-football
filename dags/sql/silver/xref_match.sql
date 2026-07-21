@@ -46,7 +46,11 @@
 --   whoscored_schedule    : game_id (BIGINT), date (TIMESTAMP), home_team, away_team, league, season (varchar)
 --   understat_schedule    : game_id (BIGINT), date (TIMESTAMP), home_team, away_team (varchar)
 --   sofascore_schedule    : game_id (BIGINT), date (TIMESTAMP), home_team, away_team (varchar)
---   fotmob_schedule       : match_id (varchar! — NOT game_id), date (varchar), home_team, away_team (varchar), season (BIGINT)
+--   fotmob_matches_current: NATIVE (#930 cutover) — match_id (BIGINT! cast to varchar),
+--                           utc_time (ISO varchar — legacy `date`), home_team_name,
+--                           away_team_name (varchar — legacy home_team/away_team),
+--                           competition_id (BIGINT → league via fotmob_league_map),
+--                           source_season_key (varchar '2025/2026' → season slug)
 --   matchhistory_results  : NO native match_id, match_date (TIMESTAMP), home_team, away_team (renamed via COLUMN_MAPPING), season (BIGINT)
 --   espn_schedule         : game_id (BIGINT), NO date column — date prefixed in `game` column (e.g. '2026-01-06 Team-Team'); home_team, away_team (varchar), season (varchar)
 --
@@ -197,47 +201,82 @@ ss_resolved AS (
     WHERE s.game_id IS NOT NULL
 ),
 
-fm_resolved AS (
-    -- FotMob: native id column is `match_id` (varchar), NOT game_id. team
-    -- columns are varchar (team-name strings, same as xref_team source_id).
-    -- season is BIGINT in bronze, cast to varchar for JOIN alignment.
-    -- date is ISO 8601 timestamp ('2026-01-08T20:00:00Z'); Trino's
-    -- TRY_CAST(varchar AS date) only handles 'YYYY-MM-DD' so we slice
-    -- the leading 10 chars before the cast.
+fotmob_league_map (competition_id, league) AS (
+    -- #930 cutover: native fotmob tables carry competition_id (BIGINT), not
+    -- the legacy `league` string. Reverse map of FotMobScraper.LEAGUE_IDS
+    -- (scrapers/fotmob/scraper.py). The INNER JOIN below doubles as the
+    -- legacy 14-league scope guard — native bronze covers the full FotMob
+    -- catalogue and MUST NOT leak unknown leagues into silver (cutover map §2.1).
+    VALUES (47, 'ENG-Premier League'), (48, 'ENG-Championship'),
+           (87, 'ESP-La Liga'),        (54, 'GER-Bundesliga'),
+           (55, 'ITA-Serie A'),        (53, 'FRA-Ligue 1'),
+           (57, 'NED-Eredivisie'),     (61, 'POR-Primeira Liga'),
+           (42, 'UEFA-Champions League'), (73, 'UEFA-Europa League'),
+           (77, 'INT-World Cup'),      (50, 'INT-European Championship'),
+           (289, 'INT-Africa Cup of Nations'), (44, 'INT-Copa America')
+),
+
+fm_native AS (
+    -- FotMob (#930 cutover): legacy bronze.fotmob_schedule → native
+    -- fotmob_matches_current. match_id is BIGINT in native (was varchar) →
+    -- CAST to varchar so source_id stays the exact same string. utc_time is
+    -- the same ISO-8601 `status.utcTime` legacy `date` carried; Trino's
+    -- TRY_CAST(varchar AS date) only handles 'YYYY-MM-DD' so we slice the
+    -- leading 10 chars before the cast. home/away_team_name are the same
+    -- source `home.name`/`away.name` strings legacy home_team/away_team had,
+    -- so the xref_team JOIN and canonical ids are unchanged. season: native
+    -- source_season_key is a source string ('2025/2026' club, '2025'
+    -- single-year) — year-start = substr(key, 1, 4) (NEVER derive the slug
+    -- from the key shape: AFCON single-year keys must still yield '2526'),
+    -- then the SAME legacy CASE (#913 Phase 2) so slugs stay bit-compatible
+    -- with the xref_team fotmob branch (single shared expression, §2.2).
     SELECT
-        s.match_id                                                     AS source_id,
-        TRY_CAST(SUBSTR(s.date, 1, 10) AS date)                        AS match_date,
+        CAST(match_id AS varchar)                      AS source_id,
+        TRY_CAST(SUBSTR(utc_time, 1, 10) AS date)      AS match_date,
+        league,
+        CASE WHEN league = 'INT-World Cup'
+             THEN LPAD(CAST(season_year AS varchar), 4, '0')
+             ELSE LPAD(CAST(MOD(season_year, 100) AS varchar), 2, '0')
+                  || LPAD(CAST(MOD(season_year + 1, 100) AS varchar), 2, '0')
+        END                                            AS season,
+        home_team_name                                 AS home_team,
+        away_team_name                                 AS away_team
+    FROM (
+        SELECT m.match_id,
+               m.utc_time,
+               m.home_team_name,
+               m.away_team_name,
+               lm.league,
+               TRY_CAST(SUBSTR(m.source_season_key, 1, 4) AS integer) AS season_year
+        FROM iceberg.bronze.fotmob_matches_current m
+        JOIN fotmob_league_map lm
+          ON lm.competition_id = m.competition_id
+    )
+    WHERE match_id IS NOT NULL
+),
+
+fm_resolved AS (
+    -- No dedup needed on top of `_current`: the view already collapses to one
+    -- row per natural key (competition_id, source_season_key, match_id).
+    SELECT
+        s.source_id,
+        s.match_date,
         s.league,
-        -- season → slug ('2425'); bronze fotmob_schedule is year-start bigint.
-        -- #913 Phase 2
-        CASE WHEN s.league = 'INT-World Cup'
-             THEN LPAD(CAST(s.season AS varchar), 4, '0')
-             ELSE LPAD(CAST(MOD(s.season, 100) AS varchar), 2, '0')
-                  || LPAD(CAST(MOD(s.season + 1, 100) AS varchar), 2, '0')
-        END   AS season,
+        s.season,
         xt_h.canonical_id                                              AS home_canonical_id,
         xt_a.canonical_id                                              AS away_canonical_id,
         CONCAT(s.home_team, ' vs ', s.away_team)                       AS display_name
-    FROM iceberg.bronze.fotmob_schedule s
+    FROM fm_native s
     LEFT JOIN iceberg.silver.xref_team xt_h
            ON xt_h.source    = 'fotmob'
           AND xt_h.source_id = s.home_team
           AND xt_h.league    = s.league
-          AND xt_h.season    = CASE WHEN s.league = 'INT-World Cup'
-                                     THEN LPAD(CAST(s.season AS varchar), 4, '0')
-                                     ELSE LPAD(CAST(MOD(s.season, 100) AS varchar), 2, '0')
-                                          || LPAD(CAST(MOD(s.season + 1, 100) AS varchar), 2, '0')
-                               END
+          AND xt_h.season    = s.season
     LEFT JOIN iceberg.silver.xref_team xt_a
            ON xt_a.source    = 'fotmob'
           AND xt_a.source_id = s.away_team
           AND xt_a.league    = s.league
-          AND xt_a.season    = CASE WHEN s.league = 'INT-World Cup'
-                                     THEN LPAD(CAST(s.season AS varchar), 4, '0')
-                                     ELSE LPAD(CAST(MOD(s.season, 100) AS varchar), 2, '0')
-                                          || LPAD(CAST(MOD(s.season + 1, 100) AS varchar), 2, '0')
-                               END
-    WHERE s.match_id IS NOT NULL
+          AND xt_a.season    = s.season
 ),
 
 mh_resolved AS (

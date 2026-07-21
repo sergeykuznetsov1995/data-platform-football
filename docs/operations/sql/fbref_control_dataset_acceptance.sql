@@ -335,8 +335,8 @@ WITH selected_run AS (
       ON processing.logical_refresh_id = run_fetch.logical_refresh_id
      AND processing.target_id = run_fetch.target_id
      AND processing.content_hash = run_fetch.content_hash
-     AND processing.parser_version = 'fbref-page-document-v3'
-     AND processing.typed_parser_version = 'fbref-typed-bronze-v3'
+     AND processing.parser_version = 'fbref-page-document-v4'
+     AND processing.typed_parser_version = 'fbref-typed-bronze-v4'
      AND processing.stateful_parser_version = 'fbref-discovery-parser-v6'
     ORDER BY run_fetch.logical_refresh_id,
              COALESCE(processing.completed_at, processing.updated_at) DESC,
@@ -497,8 +497,8 @@ WITH selected_run AS (
       ON processing.logical_refresh_id = run_fetch.logical_refresh_id
      AND processing.target_id = run_fetch.target_id
      AND processing.content_hash = run_fetch.content_hash
-     AND processing.parser_version = 'fbref-page-document-v3'
-     AND processing.typed_parser_version = 'fbref-typed-bronze-v3'
+     AND processing.parser_version = 'fbref-page-document-v4'
+     AND processing.typed_parser_version = 'fbref-typed-bronze-v4'
      AND processing.stateful_parser_version = 'fbref-discovery-parser-v6'
     ORDER BY run_fetch.logical_refresh_id,
              COALESCE(processing.completed_at, processing.updated_at) DESC,

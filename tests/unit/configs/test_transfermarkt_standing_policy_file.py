@@ -29,9 +29,10 @@ def test_committed_policy_parses_into_a_standing_policy():
     assert policy.dag_id == STANDING_POLICY_DAG_ID
     assert policy.dag_id == 'dag_ingest_transfermarkt'
     assert len(policy.policy_hash) == 64
-    # v2 = the daily-throughput caps (24 MiB / 1610 / 800 per scope); the
+    # v4 = v2 daily-throughput caps plus canonical immutable scope-player
+    # evidence; the
     # standing-authorization records key on standing-policy-v{version}.
-    assert policy.policy_version == 2
+    assert policy.policy_version == 4
 
 
 def test_committed_policy_caps_equal_the_child_wrapper_constants():
@@ -60,6 +61,8 @@ def test_committed_policy_covers_both_write_modes():
 
     for write_mode in ('dual', 'native-only'):
         assert required_write_tables(write_mode) <= allowed
+    assert 'iceberg.ops.transfermarkt_scope_player_capture' in allowed
+    assert 'iceberg.ops.transfermarkt_scope_player_capture_v1' not in allowed
 
 
 def test_committed_policy_validity_window_is_well_formed():

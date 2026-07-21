@@ -929,6 +929,7 @@ def _new_report(command: str, scopes: Iterable[RunnerScope]) -> dict[str, Any]:
         "parent_catalog_payload_sha256": None,
         "parent_catalog_raw_provenance_sha256": None,
         "profile_candidates": None,
+        "match_candidates": None,
         "producer_commits": {
             "schema_version": 1,
             "scope": [],
@@ -1149,6 +1150,22 @@ def _merge_result(
         scope_record["entities"][str(entity)] = {
             "table": table,
             "rows_written": rows,
+        }
+
+    # Surface the match backlog metric (set only by ``sync_matches``) at the
+    # top level. Accumulate across scopes so a multi-scope run reports the whole
+    # run's un-fetched backlog, not just the last scope. Pure observability.
+    backlog = getattr(result, "metadata", {}).get("match_candidates")
+    if isinstance(backlog, Mapping):
+        existing = report.get("match_candidates")
+        base = existing if isinstance(existing, Mapping) else {}
+        report["match_candidates"] = {
+            "schema_version": 1,
+            "count": int(base.get("count", 0)) + int(backlog.get("count", 0)),
+            "attempted": int(base.get("attempted", 0))
+            + int(backlog.get("attempted", 0)),
+            "remaining": int(base.get("remaining", 0))
+            + int(backlog.get("remaining", 0)),
         }
 
 
@@ -1433,12 +1450,15 @@ def _finish(report: dict[str, Any], output: str) -> int:
     report["finished_at"] = _utc_now_iso()
     report["paid_proxy_bytes"] = _paid_proxy_bytes(report.get("traffic", {}))
     _write_report(output, report)
+    match_backlog = report.get("match_candidates") or {}
     logger.info(
-        "WhoScored run complete: status=%s scopes=%d rows=%d errors=%d",
+        "WhoScored run complete: status=%s scopes=%d rows=%d errors=%d "
+        "match_backlog_remaining=%s",
         report["status"],
         len(report["scopes"]),
         report["rows"],
         len(report["errors"]),
+        match_backlog.get("remaining"),
     )
     print(json.dumps(report, ensure_ascii=False))
     return exit_code

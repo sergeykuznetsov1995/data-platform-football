@@ -15,7 +15,6 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from typing import Any, Iterable, Mapping, Sequence
 
-
 REGISTRY_STATE_TABLE = 'iceberg.ops.transfermarkt_registry_state_v2'
 SCOPE_MANIFEST_TABLE = 'iceberg.ops.transfermarkt_scope_manifest_v2'
 SCOPE_SET_MANIFEST_TABLE = 'iceberg.ops.transfermarkt_scope_set_manifest_v2'
@@ -30,7 +29,7 @@ MAX_SCOPE_SET_SIZE = 16_384
 # marker, not batch content: manifests captured under the same contract may be
 # accumulated into one scope set across parent cycles.  Bump it whenever the
 # capture payload (scope_capture, entity evidence) changes shape.
-CAPTURE_REVISION = 'v2'
+CAPTURE_REVISION = 'v3'
 
 
 class ScopeManifestError(RuntimeError):
@@ -281,7 +280,8 @@ class ScopeManifest:
         # the policy is the only remaining authorization trace.  One-shot runs
         # keep their journal and simply omit the key.
         provenance = {'standing_policy_hash'}
-        optional = coverage | provenance
+        temporal_evidence = {'scope_player_capture'}
+        optional = coverage | provenance | temporal_evidence
         if not isinstance(value, Mapping):
             raise ScopeManifestError('scope DQ evidence has an unbound field set')
         present = set(value)
@@ -300,6 +300,29 @@ class ScopeManifest:
             raise ScopeManifestError(
                 'standing policy hash is not a lowercase sha256 digest'
             )
+        capture_evidence = value.get('scope_player_capture')
+        if self.capture_revision == 'v3' and capture_evidence is None:
+            raise ScopeManifestError('v3 scope manifest lacks scope-player capture')
+        if capture_evidence is not None:
+            if not isinstance(capture_evidence, Mapping) or set(
+                capture_evidence
+            ) != {'row_count', 'key_hash'}:
+                raise ScopeManifestError('scope-player capture evidence is invalid')
+            row_count = capture_evidence['row_count']
+            if (
+                isinstance(row_count, bool)
+                or not isinstance(row_count, int)
+                or row_count <= 0
+            ):
+                raise ScopeManifestError(
+                    'scope-player capture row count must be positive'
+                )
+            if not re.fullmatch(
+                r'[0-9a-f]{64}', str(capture_evidence['key_hash'] or ''),
+            ):
+                raise ScopeManifestError(
+                    'scope-player capture hash is not a lowercase sha256 digest'
+                )
         if value['status'] != 'passed':
             raise ScopeManifestError('scope DQ evidence is not green')
         if not isinstance(value['edition_current'], bool):

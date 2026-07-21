@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -25,6 +26,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import pandas as pd
 from bs4 import BeautifulSoup
@@ -59,10 +61,16 @@ from scrapers.transfermarkt.registry import (
     deterministic_scope_id,
     reconcile_registry_pages,
 )
+from dags.utils.transfermarkt_source import SUPPORTED_ENDPOINTS
 
 
 ENTITY = "competition_registry"
-EXPECTED_ENTITIES = ("competitions", "competition_editions")
+EXPECTED_ENTITIES = (
+    "raw_responses",
+    "competitions",
+    "competition_editions",
+    "competition_participants",
+)
 MAX_ATTEMPTS = 6
 # A lease is sticky, so an unthrottled crawl hits the source from one exit as
 # fast as it can parse; the catalogue then starts answering 502/504. Pace the
@@ -71,7 +79,14 @@ REQUESTS_PER_MINUTE = 10
 CONCURRENCY = 1
 COMPETITIONS_TABLE = "iceberg.bronze.transfermarkt_competitions"
 EDITIONS_TABLE = "iceberg.bronze.transfermarkt_competition_editions"
-TARGET_TABLES = (COMPETITIONS_TABLE, EDITIONS_TABLE)
+PARTICIPANTS_TABLE = "iceberg.bronze.transfermarkt_competition_participants"
+RAW_RESPONSES_TABLE = "iceberg.bronze.transfermarkt_raw_responses"
+TARGET_TABLES = (
+    RAW_RESPONSES_TABLE,
+    COMPETITIONS_TABLE,
+    EDITIONS_TABLE,
+    PARTICIPANTS_TABLE,
+)
 PAID_PRESENTED_HASH_ENV = "TM_PAID_APPROVAL_PRESENTED_HASH"
 WRITE_PRESENTED_HASH_ENV = "TM_WRITE_APPROVAL_PRESENTED_HASH"
 STANDING_POLICY_DAG_ID = "dag_discover_transfermarkt_registry"
@@ -100,6 +115,7 @@ COMPETITION_COLUMNS = (
     "classification_evidence",
     "registry_snapshot_id",
     "source_body_hash",
+    "raw_capture_id",
     "parser_revision",
     "schema_revision",
     "fetched_at",
@@ -127,11 +143,61 @@ EDITION_COLUMNS = (
     "discovered_at",
     "registry_snapshot_id",
     "source_body_hash",
+    "raw_capture_id",
     "parser_revision",
     "schema_revision",
     "fetched_at",
     "cycle_id",
     "scope_id",
+    "_source",
+    "_entity_type",
+    "_ingested_at",
+    "_batch_id",
+)
+
+PARTICIPANT_COLUMNS = (
+    "competition_id",
+    "edition_id",
+    "team_id",
+    "team_name",
+    "source_url",
+    "discovered_at",
+    "registry_snapshot_id",
+    "source_body_hash",
+    "raw_capture_id",
+    "parser_revision",
+    "schema_revision",
+    "fetched_at",
+    "cycle_id",
+    "scope_id",
+    "_source",
+    "_entity_type",
+    "_ingested_at",
+    "_batch_id",
+)
+
+RAW_RESPONSE_COLUMNS = (
+    "manifest_version",
+    "capture_id",
+    "source",
+    "cycle_id",
+    "scope_id",
+    "endpoint",
+    "attempt",
+    "url",
+    "status_code",
+    "outcome",
+    "headers",
+    "content_type",
+    "content_hash",
+    "hash_algorithm",
+    "blob_key",
+    "raw_uri",
+    "compression",
+    "fetched_at",
+    "decoded_bytes",
+    "stored_bytes",
+    "registry_snapshot_id",
     "_source",
     "_entity_type",
     "_ingested_at",
@@ -610,7 +676,12 @@ def _flatten_snapshot(
     *,
     cycle_id: str,
     fetched_at: datetime,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], tuple[dict[str, Any], ...]]:
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    tuple[dict[str, Any], ...],
+]:
     competition_rows = [
         _metadata_row(
             competition.as_dict(),
@@ -635,16 +706,36 @@ def _flatten_snapshot(
         )
         for edition in snapshot.editions
     ]
+    participant_rows = [
+        _metadata_row(
+            participant.as_dict(),
+            fetched_at=fetched_at,
+            cycle_id=cycle_id,
+            scope_id=deterministic_scope_id(
+                participant.competition_id, participant.edition_id
+            ),
+            batch_id=snapshot.snapshot_id,
+            entity_type="competition_participants",
+        )
+        for participant in snapshot.participants
+    ]
     for row in competition_rows:
         if tuple(row) != COMPETITION_COLUMNS:
             raise DiscoveryRunnerError("competition Bronze schema drift")
     for row in edition_rows:
         if tuple(row) != EDITION_COLUMNS:
             raise DiscoveryRunnerError("edition Bronze schema drift")
+    for row in participant_rows:
+        if tuple(row) != PARTICIPANT_COLUMNS:
+            raise DiscoveryRunnerError("participant Bronze schema drift")
 
     competition_keys = [row["competition_id"] for row in competition_rows]
     edition_keys = [
         (row["competition_id"], row["edition_id"]) for row in edition_rows
+    ]
+    participant_keys = [
+        (row["competition_id"], row["edition_id"], row["team_id"])
+        for row in participant_rows
     ]
     if not competition_keys or not edition_keys:
         raise DiscoveryRunnerError("registry snapshot cannot be empty")
@@ -652,11 +743,15 @@ def _flatten_snapshot(
         raise DiscoveryRunnerError("duplicate competition natural key")
     if len(edition_keys) != len(set(edition_keys)):
         raise DiscoveryRunnerError("duplicate edition natural key")
+    if len(participant_keys) != len(set(participant_keys)):
+        raise DiscoveryRunnerError("duplicate participant natural key")
     edition_parent_ids = {key[0] for key in edition_keys}
     if edition_parent_ids != set(competition_keys):
         raise DiscoveryRunnerError(
             "every discovered competition must have at least one edition"
         )
+    if {key[:2] for key in participant_keys} - set(edition_keys):
+        raise DiscoveryRunnerError("participant references an unknown edition")
     current_counts = Counter(
         row["competition_id"] for row in edition_rows if row["current"]
     )
@@ -664,7 +759,7 @@ def _flatten_snapshot(
         raise DiscoveryRunnerError(
             "every competition must have exactly one current edition"
         )
-    for row in (*competition_rows, *edition_rows):
+    for row in (*competition_rows, *edition_rows, *participant_rows):
         if not re.fullmatch(r"[a-f0-9]{64}", row["source_body_hash"]):
             raise DiscoveryRunnerError("source body hash is not SHA-256")
 
@@ -676,13 +771,173 @@ def _flatten_snapshot(
     }
     if any(scope["competition_id"] not in eligible_ids for scope in scopes):
         raise DiscoveryRunnerError("unknown classification escaped into crawl scopes")
-    return competition_rows, edition_rows, scopes
+    return competition_rows, edition_rows, participant_rows, scopes
+
+
+def _flatten_raw_captures(
+    captures: Sequence[Mapping[str, Any]],
+    *,
+    cycle_id: str,
+    snapshot_id: str,
+    ingested_at: datetime,
+) -> list[dict[str, Any]]:
+    """Validate and flatten client capture metadata for native Bronze."""
+
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for capture in captures:
+        if not isinstance(capture, Mapping):
+            raise DiscoveryRunnerError("raw capture metadata must be an object")
+        capture_id = capture.get("capture_id")
+        content_hash = capture.get("content_hash")
+        if not isinstance(capture_id, str) or not re.fullmatch(
+            r"[a-f0-9]{64}", capture_id
+        ):
+            raise DiscoveryRunnerError("raw capture id is not SHA-256")
+        if capture_id in seen:
+            raise DiscoveryRunnerError("duplicate raw capture id")
+        seen.add(capture_id)
+        if not isinstance(content_hash, str) or not re.fullmatch(
+            r"[a-f0-9]{64}", content_hash
+        ):
+            raise DiscoveryRunnerError("raw content hash is not SHA-256")
+        for alias, expected in (
+            ("raw_capture_id", capture_id),
+            ("raw_body_hash", content_hash),
+        ):
+            if capture.get(alias, expected) != expected:
+                raise DiscoveryRunnerError(f"raw capture {alias} drift")
+
+        headers = capture.get("headers")
+        if not isinstance(headers, Mapping) or any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in headers.items()
+        ):
+            raise DiscoveryRunnerError("raw capture headers are invalid")
+        fetched_raw = capture.get("fetched_at")
+        if not isinstance(fetched_raw, str):
+            raise DiscoveryRunnerError("raw capture fetched_at is invalid")
+        try:
+            fetched_at = datetime.fromisoformat(
+                fetched_raw.replace("Z", "+00:00")
+            )
+        except ValueError:
+            raise DiscoveryRunnerError("raw capture fetched_at is invalid") from None
+        if fetched_at.tzinfo is None or fetched_at.utcoffset() is None:
+            raise DiscoveryRunnerError("raw capture fetched_at must be timezone-aware")
+        raw_fetched_at = capture.get("raw_fetched_at", fetched_raw)
+        try:
+            raw_fetched = datetime.fromisoformat(
+                str(raw_fetched_at).replace("Z", "+00:00")
+            )
+        except ValueError:
+            raise DiscoveryRunnerError("raw capture timestamp alias drift") from None
+        if raw_fetched != fetched_at:
+            raise DiscoveryRunnerError("raw capture timestamp alias drift")
+
+        required_text = (
+            "manifest_version",
+            "source",
+            "cycle_id",
+            "scope_id",
+            "endpoint",
+            "url",
+            "hash_algorithm",
+            "blob_key",
+            "raw_uri",
+            "compression",
+        )
+        if any(
+            not isinstance(capture.get(field), str)
+            or not str(capture[field]).strip()
+            for field in required_text
+        ):
+            raise DiscoveryRunnerError("raw capture text metadata is incomplete")
+        if (
+            capture["source"] != "transfermarkt"
+            or capture["cycle_id"] != cycle_id
+            or capture["scope_id"] != cycle_id
+            or capture["endpoint"] not in SUPPORTED_ENDPOINTS
+            or capture["hash_algorithm"] != "sha256"
+            or capture["compression"] != "gzip"
+        ):
+            raise DiscoveryRunnerError("raw capture identity drift")
+        for field, minimum, maximum in (
+            ("attempt", 0, 10**9),
+            ("status_code", 100, 599),
+            ("decoded_bytes", 0, 2**63 - 1),
+            ("stored_bytes", 1, 2**63 - 1),
+        ):
+            value = capture.get(field)
+            if type(value) is not int or not minimum <= value <= maximum:
+                raise DiscoveryRunnerError(f"raw capture {field} is invalid")
+        content_type = capture.get("content_type")
+        if content_type is not None and not isinstance(content_type, str):
+            raise DiscoveryRunnerError("raw capture content_type is invalid")
+        raw_uri = urlsplit(str(capture["raw_uri"]))
+        if (
+            raw_uri.scheme not in {"file", "s3"}
+            or raw_uri.username is not None
+            or raw_uri.password is not None
+            or "@" in raw_uri.netloc
+            or raw_uri.query
+            or raw_uri.fragment
+        ):
+            raise DiscoveryRunnerError("raw capture URI is unsafe")
+
+        normalized_fetched_at = fetched_at.astimezone(timezone.utc).isoformat()
+        row = {
+            "manifest_version": capture["manifest_version"],
+            "capture_id": capture_id,
+            "source": capture["source"],
+            "cycle_id": capture["cycle_id"],
+            "scope_id": capture["scope_id"],
+            "endpoint": capture["endpoint"],
+            "attempt": capture["attempt"],
+            "url": capture["url"],
+            "status_code": capture["status_code"],
+            "outcome": "ok" if capture["status_code"] == 200 else "failed",
+            "headers": json.dumps(
+                dict(headers),
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+            "content_type": content_type,
+            "content_hash": content_hash,
+            "hash_algorithm": capture["hash_algorithm"],
+            "blob_key": capture["blob_key"],
+            "raw_uri": capture["raw_uri"],
+            "compression": capture["compression"],
+            "fetched_at": normalized_fetched_at,
+            "decoded_bytes": capture["decoded_bytes"],
+            "stored_bytes": capture["stored_bytes"],
+            "registry_snapshot_id": snapshot_id,
+            "_source": "transfermarkt",
+            "_entity_type": "raw_responses",
+            "_ingested_at": ingested_at.astimezone(timezone.utc).isoformat(),
+            "_batch_id": snapshot_id,
+        }
+        if tuple(row) != RAW_RESPONSE_COLUMNS:
+            raise DiscoveryRunnerError("raw response Bronze schema drift")
+        rows.append(row)
+    return sorted(rows, key=lambda row: row["capture_id"])
+
+
+def _raw_response_set(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    capture_ids = tuple(sorted(str(row["capture_id"]) for row in rows))
+    return {
+        "raw_payload_set_id": stable_payload_hash(capture_ids),
+        "response_count": len(capture_ids),
+        "capture_ids": list(capture_ids),
+    }
 
 
 def _dataframe(rows: list[dict[str, Any]], columns: Sequence[str]) -> pd.DataFrame:
     frame = pd.DataFrame(rows, columns=list(columns))
     for field in ("discovered_at", "fetched_at", "_ingested_at"):
-        frame[field] = pd.to_datetime(frame[field], utc=True)
+        if field in frame:
+            frame[field] = pd.to_datetime(frame[field], utc=True)
     if "start_date" in frame:
         frame["start_date"] = pd.to_datetime(frame["start_date"]).dt.date
         frame["end_date"] = pd.to_datetime(frame["end_date"]).dt.date
@@ -700,8 +955,10 @@ def _default_writer_factory():
 
 def _write_snapshot(
     writer: Any,
+    raw_response_rows: list[dict[str, Any]],
     competition_rows: list[dict[str, Any]],
     edition_rows: list[dict[str, Any]],
+    participant_rows: list[dict[str, Any]],
     snapshot_id: str,
 ) -> tuple[dict[str, Any], ...]:
     if not re.fullmatch(r"tm-discovery-[a-f0-9]{24}", snapshot_id):
@@ -709,11 +966,21 @@ def _write_snapshot(
     delete_filter = f"registry_snapshot_id = '{snapshot_id}'"
     outputs = []
     for table, rows, columns in (
+        (
+            "transfermarkt_raw_responses",
+            raw_response_rows,
+            RAW_RESPONSE_COLUMNS,
+        ),
         ("transfermarkt_competitions", competition_rows, COMPETITION_COLUMNS),
         (
             "transfermarkt_competition_editions",
             edition_rows,
             EDITION_COLUMNS,
+        ),
+        (
+            "transfermarkt_competition_participants",
+            participant_rows,
+            PARTICIPANT_COLUMNS,
         ),
     ):
         frame = _dataframe(rows, columns)
@@ -810,8 +1077,10 @@ def _failure_manifest(
     cache: AtomicJsonMapping | None,
     checkpoint_entries_before: int | None,
     cache_entries_before: int | None,
+    raw_response_rows: list[dict[str, Any]] | None,
     competition_rows: list[dict[str, Any]] | None,
     edition_rows: list[dict[str, Any]] | None,
+    participant_rows: list[dict[str, Any]] | None,
     source_started: bool,
     source_validated: bool,
     write_authorized: bool,
@@ -871,17 +1140,31 @@ def _failure_manifest(
         "run_id": str(args.run_id),
         "scope": _scope_manifest(args, cycle_id),
         "expected_entities": list(EXPECTED_ENTITIES),
+        "target_tables": list(TARGET_TABLES),
         # None means unknown because source completeness was not proven.  Zero
         # would incorrectly look like authoritative_empty evidence.
         "rows": {
+            "raw_responses": (
+                len(raw_response_rows)
+                if raw_response_rows is not None
+                else None
+            ),
             "competitions": (
                 len(competition_rows) if competition_rows is not None else None
             ),
             "competition_editions": (
                 len(edition_rows) if edition_rows is not None else None
             ),
+            "competition_participants": (
+                len(participant_rows) if participant_rows is not None else None
+            ),
         },
         "hashes": {
+            "raw_responses": (
+                stable_payload_hash(raw_response_rows)
+                if raw_response_rows is not None
+                else None
+            ),
             "competitions": (
                 stable_payload_hash(competition_rows)
                 if competition_rows is not None
@@ -892,7 +1175,17 @@ def _failure_manifest(
                 if edition_rows is not None
                 else None
             ),
+            "competition_participants": (
+                stable_payload_hash(participant_rows)
+                if participant_rows is not None
+                else None
+            ),
         },
+        "raw_response_set": (
+            _raw_response_set(raw_response_rows)
+            if raw_response_rows is not None
+            else None
+        ),
         # A failed or incomplete source is never evidence of an empty entity.
         "authoritative_empty": False,
         "not_applicable": False,
@@ -1060,8 +1353,10 @@ def _execute_once(
     write_authorized = False
     write_started = False
     write_completed = False
+    raw_response_rows: list[dict[str, Any]] | None = None
     competition_rows: list[dict[str, Any]] | None = None
     edition_rows: list[dict[str, Any]] | None = None
+    participant_rows: list[dict[str, Any]] | None = None
     writes: tuple[dict[str, Any], ...] = ()
 
     def fetch(url: str) -> FetchOutcome[str]:
@@ -1073,7 +1368,11 @@ def _execute_once(
             as_json=False,
             max_attempts=min(MAX_ATTEMPTS, remaining_retries + 1),
             label=ENTITY,
-            context={"scope": cycle_id},
+            context={
+                "cycle_id": cycle_id,
+                "scope_id": cycle_id,
+                "scope": cycle_id,
+            },
             validator=_validate_html,
             cache_key=hashlib.sha256(url.encode("utf-8")).hexdigest(),
             cache_ttl_seconds=args.cache_ttl_seconds,
@@ -1086,23 +1385,79 @@ def _execute_once(
             raise DiscoveryRunnerError("successful response payload hash mismatch")
         return outcome
 
+    def _validate_json(value: Any) -> str | None:
+        if type(value) is not dict:
+            return "JSON response must be an object"
+        if value.get("success") is not True or "data" not in value:
+            return "JSON response is not an authoritative Transfermarkt payload"
+        return None
+
+    def fetch_json(
+        url: str, endpoint: str
+    ) -> FetchOutcome[Mapping[str, Any]]:
+        if endpoint not in SUPPORTED_ENDPOINTS:
+            raise DiscoveryRunnerError(f"unsupported discovery endpoint: {endpoint}")
+        paid_authorization.require()
+        retries_used = int(client.get_traffic_stats().get("retries", 0))
+        remaining_retries = max(0, args.retry_limit - retries_used)
+        outcome = client.fetch(
+            url,
+            as_json=True,
+            max_attempts=min(MAX_ATTEMPTS, remaining_retries + 1),
+            label=endpoint,
+            context={"cycle_id": cycle_id, "scope_id": cycle_id, "scope": cycle_id},
+            validator=_validate_json,
+            cache_key=hashlib.sha256(url.encode("utf-8")).hexdigest(),
+            cache_ttl_seconds=args.cache_ttl_seconds,
+        )
+        if outcome.status is not FetchStatus.OK or outcome.status_code != 200:
+            return outcome
+        if type(outcome.value) is not dict or not outcome.payload_hash:
+            raise DiscoveryRunnerError("successful JSON response has no payload hash")
+        if outcome.payload_hash != stable_payload_hash(outcome.value):
+            raise DiscoveryRunnerError("successful JSON payload hash mismatch")
+        return outcome
+
     try:
         source_started = True
-        pages = discovery_fn(
-            fetch=fetch,
-            checkpoint=checkpoint,
-            traffic_ledger=ledger,
-            clock=utcnow,
-        )
+        discovery_kwargs = {
+            "fetch": fetch,
+            "checkpoint": checkpoint,
+            "traffic_ledger": ledger,
+            "clock": utcnow,
+        }
+        parameters = inspect.signature(discovery_fn).parameters
+        if "fetch_json" in parameters or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        ):
+            discovery_kwargs["fetch_json"] = fetch_json
+        pages = discovery_fn(**discovery_kwargs)
         snapshot = reconcile_registry_pages(pages)
         fetched_at = utcnow()
         if fetched_at.tzinfo is None or fetched_at.utcoffset() is None:
             raise DiscoveryRunnerError("runner clock must be timezone-aware")
-        competition_rows, edition_rows, scopes = _flatten_snapshot(
-            snapshot,
-            cycle_id=cycle_id,
-            fetched_at=fetched_at,
+        competition_rows, edition_rows, participant_rows, scopes = (
+            _flatten_snapshot(
+                snapshot,
+                cycle_id=cycle_id,
+                fetched_at=fetched_at,
+            )
         )
+        raw_response_rows = _flatten_raw_captures(
+            client.get_raw_capture_records(),
+            cycle_id=cycle_id,
+            snapshot_id=snapshot.snapshot_id,
+            ingested_at=fetched_at,
+        )
+        if not args.dry_run and not raw_response_rows:
+            raise DiscoveryRunnerError(
+                "production registry has no raw response evidence"
+            )
+        if not args.dry_run and not participant_rows:
+            raise DiscoveryRunnerError(
+                "production registry has no participant evidence"
+            )
         # Final provider counters and hard-cap enforcement are known before
         # either production table is touched.
         client.close()
@@ -1121,8 +1476,10 @@ def _execute_once(
             write_started = True
             writes = _write_snapshot(
                 writer_factory(),
+                raw_response_rows,
                 competition_rows,
                 edition_rows,
+                participant_rows,
                 snapshot.snapshot_id,
             )
             write_completed = True
@@ -1138,6 +1495,7 @@ def _execute_once(
             "run_id": str(args.run_id),
             "scope": _scope_manifest(args, cycle_id),
             "expected_entities": list(EXPECTED_ENTITIES),
+            "target_tables": list(TARGET_TABLES),
             "snapshot_id": snapshot.snapshot_id,
             "snapshot_hash": snapshot.snapshot_hash,
             # The snapshot's own timezone-aware capture time: standing
@@ -1148,14 +1506,21 @@ def _execute_once(
             "page_count": snapshot.page_count,
             "source_body_hashes": list(snapshot.source_body_hashes),
             "rows": {
+                "raw_responses": len(raw_response_rows),
                 "competitions": len(competition_rows),
                 "competition_editions": len(edition_rows),
+                "competition_participants": len(participant_rows),
             },
             "hashes": {
+                "raw_responses": stable_payload_hash(raw_response_rows),
                 "competitions": stable_payload_hash(competition_rows),
                 "competition_editions": stable_payload_hash(edition_rows),
+                "competition_participants": stable_payload_hash(
+                    participant_rows
+                ),
                 "crawl_scopes": stable_payload_hash(scopes),
             },
+            "raw_response_set": _raw_response_set(raw_response_rows),
             "classification_counts": dict(sorted(classifications.items())),
             "blocked_competition_ids": list(snapshot.blocked_competition_ids),
             "promotable": snapshot.promotable,
@@ -1239,8 +1604,10 @@ def _execute_once(
             cache=cache,
             checkpoint_entries_before=checkpoint_entries_before,
             cache_entries_before=cache_entries_before,
+            raw_response_rows=raw_response_rows,
             competition_rows=competition_rows,
             edition_rows=edition_rows,
+            participant_rows=participant_rows,
             source_started=source_started,
             source_validated=source_validated,
             write_authorized=write_authorized,
@@ -1313,8 +1680,10 @@ def execute(
                 cache=None,
                 checkpoint_entries_before=None,
                 cache_entries_before=None,
+                raw_response_rows=None,
                 competition_rows=None,
                 edition_rows=None,
+                participant_rows=None,
                 source_started=False,
                 source_validated=False,
                 write_authorized=False,

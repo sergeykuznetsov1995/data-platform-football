@@ -366,11 +366,26 @@ def _bounded_content(
     return content
 
 
-def _new_paid_http_session(proxy_url: str) -> requests.Session:
-    session = requests.Session()
-    session.trust_env = False
-    session.proxies = {"http": proxy_url, "https": proxy_url}
-    return session
+# The paid HTTP fetch impersonates a real browser's TLS/HTTP fingerprint via
+# curl_cffi (already pinned in the image, and the fingerprint the direct
+# transport uses).  A browser fingerprint is challenged by Cloudflare far less
+# than plain `requests`, so fewer paid fetches escalate to the expensive
+# FlareSolverr browser bootstrap, and libcurl negotiates br/zstd so the billed
+# wire bytes shrink.  curl_cffi honours session-level proxies (verified: a get()
+# with no per-call proxy still routes through session.proxies), so the lease
+# proxy is never bypassed.  The Response API (url/status_code/headers/content/
+# iter_content/close) matches what the fetch path and _bounded_content read.
+_PAID_HTTP_IMPERSONATE = "chrome120"
+
+
+def _new_paid_http_session(proxy_url: str) -> Any:
+    from curl_cffi.requests import Session as CurlSession
+
+    return CurlSession(
+        impersonate=_PAID_HTTP_IMPERSONATE,
+        trust_env=False,
+        proxies={"http": proxy_url, "https": proxy_url},
+    )
 
 
 def _new_direct_http_session() -> requests.Session:

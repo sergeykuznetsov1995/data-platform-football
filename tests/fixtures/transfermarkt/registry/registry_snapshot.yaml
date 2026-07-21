@@ -176,8 +176,8 @@
           "end_date": "2026-05-24",
           "active": true,
           "current": true,
-          "participant_count": 20,
-          "participant_hash": "gb1-participants-2025",
+          "participant_count": 0,
+          "participant_hash": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
           "source_url": "https://www.transfermarkt.com/premier-league/startseite/wettbewerb/GB1/plus/?saison_id=2025",
           "discovered_at": "2026-07-11T00:00:00+00:00"
         },
@@ -190,8 +190,8 @@
           "end_date": "2026-05-30",
           "active": true,
           "current": true,
-          "participant_count": 36,
-          "participant_hash": "cl-participants-2025",
+          "participant_count": 0,
+          "participant_hash": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
           "source_url": "https://www.transfermarkt.com/uefa-champions-league/startseite/pokalwettbewerb/CL/saison_id/2025",
           "discovered_at": "2026-07-11T00:00:00+00:00"
         },
@@ -202,8 +202,8 @@
           "season_format": "split_year",
           "active": true,
           "current": true,
-          "participant_count": 12,
-          "participant_hash": "gb1w-participants-2025",
+          "participant_count": 0,
+          "participant_hash": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
           "source_url": "https://www.transfermarkt.com/womens-super-league/startseite/wettbewerb/GB1W/saison_id/2025",
           "discovered_at": "2026-07-11T00:00:00+00:00"
         },
@@ -214,12 +214,14 @@
           "season_format": "split_year",
           "active": true,
           "current": true,
-          "participant_count": null,
-          "participant_hash": null,
+          "participant_count": 0,
+          "participant_hash": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
           "source_url": "https://www.transfermarkt.com/mystery-league/startseite/wettbewerb/MYSTERY/saison_id/2025",
           "discovered_at": "2026-07-11T00:00:00+00:00"
         }
-      ]
+      ],
+      "participants": [],
+      "participant_contract_revision": "team-id-v1"
     },
     {
       "snapshot_id": "fixture-2026-07-11",
@@ -430,8 +432,8 @@
           "end_date": "2026-01-18",
           "active": true,
           "current": true,
-          "participant_count": 24,
-          "participant_hash": "afcn-participants-2025",
+          "participant_count": 0,
+          "participant_hash": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
           "source_url": "https://www.transfermarkt.com/afrika-cup/startseite/pokalwettbewerb/AFCN/saison_id/2025",
           "discovered_at": "2026-07-11T00:00:00+00:00"
         },
@@ -442,8 +444,8 @@
           "season_format": "split_year",
           "active": true,
           "current": true,
-          "participant_count": 16,
-          "participant_hash": "unla-participants-2026",
+          "participant_count": 0,
+          "participant_hash": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
           "source_url": "https://www.transfermarkt.com/uefa-nations-league-a/teilnehmer/pokalwettbewerb/UNLA/saison_id/2026",
           "discovered_at": "2026-07-11T00:00:00+00:00"
         },
@@ -456,8 +458,8 @@
           "end_date": "2026-07-19",
           "active": true,
           "current": true,
-          "participant_count": 48,
-          "participant_hash": "fiwc-participants-2026",
+          "participant_count": 0,
+          "participant_hash": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
           "source_url": "https://www.transfermarkt.com/world-cup/startseite/wettbewerb/FIWC/saison_id/2026",
           "discovered_at": "2026-07-11T00:00:00+00:00"
         },
@@ -468,8 +470,8 @@
           "season_format": "single_year",
           "active": true,
           "current": true,
-          "participant_count": 16,
-          "participant_hash": "u21ec-participants-2025",
+          "participant_count": 0,
+          "participant_hash": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
           "source_url": "https://www.transfermarkt.com/uefa-under-21-championship/startseite/pokalwettbewerb/U21EC/saison_id/2025",
           "discovered_at": "2026-07-11T00:00:00+00:00"
         },
@@ -480,12 +482,14 @@
           "season_format": "split_year",
           "active": true,
           "current": true,
-          "participant_count": 20,
-          "participant_hash": "gb1r-participants-2025",
+          "participant_count": 0,
+          "participant_hash": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
           "source_url": "https://www.transfermarkt.com/premier-reserve-league/startseite/wettbewerb/GB1R/saison_id/2025",
           "discovered_at": "2026-07-11T00:00:00+00:00"
         }
-      ]
+      ],
+      "participants": [],
+      "participant_contract_revision": "team-id-v1"
     }
   ]
 }

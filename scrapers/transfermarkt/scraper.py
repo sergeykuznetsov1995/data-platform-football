@@ -984,8 +984,8 @@ def _career_collection_error(
 _METADATA_COLUMNS = ['_source', '_entity_type', '_ingested_at', '_batch_id']
 _SCOPE_LINEAGE_COLUMNS = [
     'source_competition_id', 'source_edition_id', 'source_url',
-    'source_body_hash', 'fetched_at', 'parser_revision', 'schema_revision',
-    'cycle_id', 'scope_id',
+    'source_body_hash', 'raw_capture_id', 'fetched_at', 'parser_revision',
+    'schema_revision', 'cycle_id', 'scope_id',
 ]
 
 # Per-operation defaults derive from the production budget canon so the
@@ -1013,8 +1013,8 @@ PLAYER_ATTRIBUTE_OBSERVATION_COLUMNS = [
 PLAYER_CONTRACT_OBSERVATION_COLUMNS = [
     'competition_id', 'edition_id', 'team_id', 'team_name', 'player_id',
     'contract_until', 'observed_at', 'applicability_status', 'source_url',
-    'source_body_hash', 'fetched_at', 'parser_revision', 'schema_revision',
-    'cycle_id', 'scope_id',
+    'source_body_hash', 'raw_capture_id', 'fetched_at', 'parser_revision',
+    'schema_revision', 'cycle_id', 'scope_id',
 ]
 MARKET_VALUE_POINT_COLUMNS = [
     'player_id', 'mv_date', 'value_eur', 'club_name', 'age', 'mv_raw',
@@ -1089,7 +1089,12 @@ def _with_metadata(
         now = ingested_at or datetime.utcnow()
         frame['_source'] = 'transfermarkt'
         frame['_entity_type'] = entity_type
-        frame['_ingested_at'] = now
+        # A scalar datetime becomes a microsecond column on pandas>=2.1 while
+        # every inferred datetime column (bronze reads, fetched_at) is
+        # nanosecond; pandas 2.1 cannot concat the two units (#982).
+        frame['_ingested_at'] = pd.Series(
+            now, index=frame.index, dtype='datetime64[ns]',
+        )
         frame['_batch_id'] = batch_id
     return _apply_nullable_dtypes(
         frame.reindex(columns=columns + _METADATA_COLUMNS)
@@ -1566,6 +1571,11 @@ class TransfermarktScraper(BaseScraper):
             'outcomes': self.get_fetch_outcomes(),
         }
 
+    def get_raw_capture_records(self) -> tuple[dict, ...]:
+        """Metadata for every exact response committed before parsing."""
+
+        return self._http_client.get_raw_capture_records()
+
     def get_scope_capture(self) -> Optional[Dict]:
         """Return listing/squad participant evidence for the exact scope."""
 
@@ -1600,6 +1610,10 @@ class TransfermarktScraper(BaseScraper):
             error=outcome.error,
             status_code=outcome.status_code,
             attempts=outcome.attempts,
+            raw_capture_id=outcome.raw_capture_id,
+            raw_body_hash=outcome.raw_body_hash,
+            raw_uri=outcome.raw_uri,
+            raw_fetched_at=outcome.raw_fetched_at,
         )
 
     def _record_materialized_rows(
@@ -1618,6 +1632,10 @@ class TransfermarktScraper(BaseScraper):
                 error=record.error,
                 status_code=record.status_code,
                 attempts=record.attempts,
+                raw_capture_id=record.raw_capture_id,
+                raw_body_hash=record.raw_body_hash,
+                raw_uri=record.raw_uri,
+                raw_fetched_at=record.raw_fetched_at,
             )
             if record.status in (FetchStatus.OK, FetchStatus.VALID_EMPTY):
                 self._materialization_failure_streak = 0
@@ -1635,6 +1653,10 @@ class TransfermarktScraper(BaseScraper):
                 error=None,
                 status_code=record.status_code,
                 attempts=record.attempts,
+                raw_capture_id=record.raw_capture_id,
+                raw_body_hash=record.raw_body_hash,
+                raw_uri=record.raw_uri,
+                raw_fetched_at=record.raw_fetched_at,
             )
         self._materialization_failure_streak = 0
 
@@ -1665,6 +1687,10 @@ class TransfermarktScraper(BaseScraper):
                 error=error,
                 status_code=record.status_code,
                 attempts=record.attempts,
+                raw_capture_id=record.raw_capture_id,
+                raw_body_hash=record.raw_body_hash,
+                raw_uri=record.raw_uri,
+                raw_fetched_at=record.raw_fetched_at,
             )
         self._fetch_records[label][source_id] = record
         self._materialization_failure_streak += 1
@@ -1810,31 +1836,14 @@ class TransfermarktScraper(BaseScraper):
     # ---------------------- bronze resolver ----------------------------------
 
     def _bronze_connection(self):
-        """Trino DB-API connection for bronze lookups (env-driven auth)."""
-        import os
+        """Trino DB-API connection with the shared TLS policy."""
 
-        import trino
-        import trino.auth as trino_auth
+        try:
+            from dags.utils.transfermarkt_source import connect
+        except ModuleNotFoundError:  # Airflow adds ``dags`` to sys.path.
+            from utils.transfermarkt_source import connect
 
-        user = os.environ.get('TRINO_USER', 'airflow')
-        password = os.environ.get('TRINO_PASSWORD')
-
-        if password:
-            return trino.dbapi.connect(
-                host=os.environ.get('TRINO_HOST', 'trino'),
-                port=int(os.environ.get('TRINO_PORT', 8443)),
-                user=user,
-                catalog='iceberg',
-                http_scheme='https',
-                auth=trino_auth.BasicAuthentication(user, password),
-                verify=False,
-            )
-        return trino.dbapi.connect(
-            host=os.environ.get('TRINO_HOST', 'trino'),
-            port=int(os.environ.get('TRINO_PORT', 8080)),
-            user=user,
-            catalog='iceberg',
-        )
+        return connect()
 
     def _resolve_player_ids_from_bronze(
         self,
@@ -1906,13 +1915,13 @@ class TransfermarktScraper(BaseScraper):
         return (roster + roster)[start:start + int(limit)]
 
     def _resolve_coach_bios_from_bronze(self) -> Dict[str, Dict]:
-        """``coach_id → {name, dob, nationality}`` from bronze, all seasons.
+        """Return the latest raw-backed coach bio from native Bronze.
 
         Coach bios are immutable, so a profile materialised by ANY earlier
         run can be reused instead of re-fetching ~20-40 profile pages every
-        cycle.  Native profile cache is queried first.  Only an explicit
-        TABLE_NOT_FOUND falls back to the transitional legacy table; other
-        database failures abort rather than triggering a costly mass refetch.
+        cycle.  A cached value carries the capture identity that originally
+        proved it; cache reuse must never mint fresh lineage or silently fall
+        back to a deprecated relation.
         """
         def _rows(sql: str):
             conn = self._bronze_connection()
@@ -1920,18 +1929,24 @@ class TransfermarktScraper(BaseScraper):
             cur.execute(sql)
             return cur.fetchall()
 
-        native_sql = (
-            "SELECT coach_id, max(name), max(dob), max(nationality) "
-            "FROM iceberg.bronze.transfermarkt_coach_profiles "
-            "WHERE dob IS NOT NULL OR nationality IS NOT NULL "
-            "GROUP BY coach_id"
-        )
-        legacy_sql = (
-            "SELECT coach_id, max(name), max(dob), max(nationality) "
-            "FROM iceberg.bronze.transfermarkt_coaches "
-            "WHERE dob IS NOT NULL OR nationality IS NOT NULL "
-            "GROUP BY coach_id"
-        )
+        native_sql = """
+WITH ranked AS (
+    SELECT coach_id, name, dob, nationality, raw_capture_id, source_url,
+           source_body_hash, fetched_at,
+           row_number() OVER (
+               PARTITION BY coach_id
+               ORDER BY fetched_at DESC, _ingested_at DESC,
+                        source_body_hash DESC, raw_capture_id DESC
+           ) AS row_num
+    FROM iceberg.bronze.transfermarkt_coach_profiles
+    WHERE (dob IS NOT NULL OR nationality IS NOT NULL)
+      AND raw_capture_id IS NOT NULL
+)
+SELECT coach_id, name, dob, nationality, raw_capture_id, source_url,
+       source_body_hash, fetched_at
+FROM ranked
+WHERE row_num = 1
+"""
         try:
             rows = _rows(native_sql)
         except Exception as exc:
@@ -1945,23 +1960,16 @@ class TransfermarktScraper(BaseScraper):
                 raise TransfermarktError(
                     f"native coach-profile cache lookup failed: {exc}"
                 ) from exc
-            logger.info("Native coach profile table absent; trying legacy cache")
-            try:
-                rows = _rows(legacy_sql)
-            except Exception as legacy_exc:
-                legacy_rendered = str(legacy_exc).upper()
-                if (
-                    'TABLE_NOT_FOUND' in legacy_rendered
-                    or 'DOES NOT EXIST' in legacy_rendered
-                    or 'NOT FOUND' in legacy_rendered
-                ):
-                    return {}
-                raise TransfermarktError(
-                    f"legacy coach-profile cache lookup failed: {legacy_exc}"
-                ) from legacy_exc
+            return {}
         return {
             str(row[0]): {
-                'name': row[1], 'dob': row[2], 'nationality': row[3],
+                'name': row[1],
+                'dob': row[2],
+                'nationality': row[3],
+                'raw_capture_id': row[4],
+                'source_url': row[5],
+                'source_body_hash': row[6],
+                'fetched_at': row[7],
             }
             for row in rows
             if row and row[0]
@@ -2003,6 +2011,7 @@ class TransfermarktScraper(BaseScraper):
             'listing_status': 'pending',
             'listing_source_url': listing_url,
             'listing_source_body_hash': None,
+            'listing_raw_capture_id': None,
             'expected_team_ids': [],
             'observed_team_ids': [],
             'endpoint_status_by_team': {},
@@ -2069,9 +2078,13 @@ class TransfermarktScraper(BaseScraper):
 
         clubs = _parse_club_listing(listing_html)
         self._scope_capture['listing_source_body_hash'] = (
-            self._last_outcome.payload_hash
+            self._last_outcome.raw_body_hash or self._last_outcome.payload_hash
             if self._last_outcome is not None
             else competition.source_body_hash
+        )
+        self._scope_capture['listing_raw_capture_id'] = (
+            self._last_outcome.raw_capture_id
+            if self._last_outcome is not None else None
         )
         self._record_materialized_rows(
             'listing', {'league': league, 'season': season}, len(clubs),
@@ -2160,7 +2173,15 @@ class TransfermarktScraper(BaseScraper):
                 str(club['club_id'])
             ] = 'ok'
             payload_hash = (
-                self._last_outcome.payload_hash
+                self._last_outcome.raw_body_hash or self._last_outcome.payload_hash
+                if self._last_outcome is not None else None
+            )
+            raw_capture_id = (
+                self._last_outcome.raw_capture_id
+                if self._last_outcome is not None else None
+            )
+            raw_capture_id = (
+                self._last_outcome.raw_capture_id
                 if self._last_outcome is not None else None
             )
             for p in parsed_players:
@@ -2168,6 +2189,7 @@ class TransfermarktScraper(BaseScraper):
                 p['club_slug'] = club['club_slug']
                 p['_source_url'] = squad_url
                 p['_source_body_hash'] = payload_hash
+                p['_raw_capture_id'] = raw_capture_id
                 squad_players.append(p)
             # Smoke/dry-run limits must stop paid traversal as soon as enough
             # rows exist, rather than downloading every remaining club page.
@@ -2208,12 +2230,14 @@ class TransfermarktScraper(BaseScraper):
         contract_rows: List[Dict] = []
         for sp in squad_players:
             lineage = {
+                'raw_capture_id': sp.get('_raw_capture_id'),
                 'source_competition_id': scope['competition_id'],
                 'source_edition_id': scope['edition_id'],
                 'source_url': sp.get('_source_url') or competition.source_url,
                 'source_body_hash': (
                     sp.get('_source_body_hash') or competition.source_body_hash
                 ),
+                'raw_capture_id': sp.get('_raw_capture_id'),
                 'fetched_at': observed_at,
                 'parser_revision': PARSER_REVISION,
                 'schema_revision': SCHEMA_REVISION,
@@ -2265,8 +2289,10 @@ class TransfermarktScraper(BaseScraper):
                     'contract_until': sp.get('contract_until'),
                     'observed_at': observed_at,
                     'applicability_status': 'ok',
+                    'raw_capture_id': lineage['raw_capture_id'],
                     'source_url': lineage['source_url'],
                     'source_body_hash': lineage['source_body_hash'],
+                    'raw_capture_id': lineage['raw_capture_id'],
                     'fetched_at': observed_at,
                     'parser_revision': PARSER_REVISION,
                     'schema_revision': SCHEMA_REVISION,
@@ -2482,7 +2508,11 @@ class TransfermarktScraper(BaseScraper):
                 continue
             parsed_stints = _parse_coach_history(html, club_id=club['club_id'])
             history_hash = (
-                self._last_outcome.payload_hash
+                self._last_outcome.raw_body_hash or self._last_outcome.payload_hash
+                if self._last_outcome is not None else None
+            )
+            history_capture_id = (
+                self._last_outcome.raw_capture_id
                 if self._last_outcome is not None else None
             )
             history_fetched_at = datetime.utcnow()
@@ -2505,6 +2535,7 @@ class TransfermarktScraper(BaseScraper):
                     'source_edition_id': scope['edition_id'],
                     'source_url': history_url,
                     'source_body_hash': history_hash,
+                    'raw_capture_id': history_capture_id,
                     'fetched_at': history_fetched_at,
                     'parser_revision': PARSER_REVISION,
                     'schema_revision': SCHEMA_REVISION,
@@ -2527,6 +2558,8 @@ class TransfermarktScraper(BaseScraper):
                     # here; a profile fetch, when it succeeds, supersedes it.
                     '_source_url': history_url,
                     '_source_body_hash': history_hash,
+                    '_raw_capture_id': history_capture_id,
+                    '_fetched_at': history_fetched_at,
                 })
 
         if not managers:
@@ -2607,7 +2640,16 @@ class TransfermarktScraper(BaseScraper):
                     bio = _parse_coach_profile(payload, mgr['coach_id']) or {}
                     mgr['_source_url'] = profile_url
                     mgr['_source_body_hash'] = (
-                        self._last_outcome.payload_hash
+                        self._last_outcome.raw_body_hash
+                        or self._last_outcome.payload_hash
+                        if self._last_outcome is not None else None
+                    )
+                    mgr['_raw_capture_id'] = (
+                        self._last_outcome.raw_capture_id
+                        if self._last_outcome is not None else None
+                    )
+                    mgr['_fetched_at'] = (
+                        self._last_outcome.raw_fetched_at
                         if self._last_outcome is not None else None
                     )
                     self._record_materialized_rows(
@@ -2624,12 +2666,23 @@ class TransfermarktScraper(BaseScraper):
                 'source_competition_id': scope['competition_id'],
                 'source_edition_id': scope['edition_id'],
                 'source_url': (
-                    mgr.get('_source_url') or competition.source_url
+                    bio.get('source_url')
+                    or mgr.get('_source_url')
+                    or competition.source_url
                 ),
                 'source_body_hash': (
-                    mgr.get('_source_body_hash') or competition.source_body_hash
+                    bio.get('source_body_hash')
+                    or mgr.get('_source_body_hash')
+                    or competition.source_body_hash
                 ),
-                'fetched_at': datetime.utcnow(),
+                'raw_capture_id': (
+                    bio.get('raw_capture_id') or mgr.get('_raw_capture_id')
+                ),
+                'fetched_at': (
+                    bio.get('fetched_at')
+                    or mgr.get('_fetched_at')
+                    or datetime.utcnow()
+                ),
                 'parser_revision': PARSER_REVISION,
                 'schema_revision': SCHEMA_REVISION,
                 'cycle_id': os.environ.get('TM_RUN_ID', self._batch_id),
@@ -2816,7 +2869,12 @@ class TransfermarktScraper(BaseScraper):
                     successes += 1
                     fetched_at = datetime.utcnow()
                     payload_hash = (
-                        self._last_outcome.payload_hash
+                        self._last_outcome.raw_body_hash
+                        or self._last_outcome.payload_hash
+                        if self._last_outcome is not None else None
+                    )
+                    raw_capture_id = (
+                        self._last_outcome.raw_capture_id
                         if self._last_outcome is not None else None
                     )
                     for row in parsed_rows:
@@ -2825,6 +2883,7 @@ class TransfermarktScraper(BaseScraper):
                             'source_edition_id': scope['edition_id'],
                             'source_url': url,
                             'source_body_hash': payload_hash,
+                            'raw_capture_id': raw_capture_id,
                             'fetched_at': fetched_at,
                             'parser_revision': PARSER_REVISION,
                             'schema_revision': SCHEMA_REVISION,

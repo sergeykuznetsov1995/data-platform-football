@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -12,10 +13,11 @@ from scrapers.transfermarkt.discovery import (
     SEED_URLS,
     DiscoveryCheckpointError,
     DiscoveryFetchError,
+    DiscoveryLimits,
     DiscoverySchemaError,
     discover_competition_registry,
 )
-from scrapers.transfermarkt.models import FetchOutcome, FetchStatus
+from scrapers.transfermarkt.models import FetchOutcome, FetchStatus, stable_payload_hash
 from scrapers.transfermarkt.registry import (
     ClassificationStatus,
     CompetitionType,
@@ -23,6 +25,7 @@ from scrapers.transfermarkt.registry import (
     Gender,
     SeasonFormat,
     UnsafeCrawlError,
+    participant_list_hash,
     reconcile_registry_pages,
 )
 
@@ -40,11 +43,9 @@ URL_FIXTURES = {
     BASE_URL + "/wettbewerbe/afrika": "afrika.html",
     BASE_URL + "/wettbewerbe/fifa": "fifa.html",
     BASE_URL + "/wettbewerbe/national/wettbewerbe/189": "england.html",
-    BASE_URL
-    + "/wettbewerbe/national/wettbewerbe/189?page=2": "england_page_2.html",
+    BASE_URL + "/wettbewerbe/national/wettbewerbe/189?page=2": "england_page_2.html",
     BASE_URL + "/premier-league/startseite/wettbewerb/GB1": "profile_gb1.html",
-    BASE_URL
-    + "/womens-super-league/startseite/wettbewerb/GB1W": "profile_gb1w.html",
+    BASE_URL + "/womens-super-league/startseite/wettbewerb/GB1W": "profile_gb1w.html",
     BASE_URL + "/fa-cup/startseite/pokalwettbewerb/FAC": "profile_fac.html",
     BASE_URL
     + "/uefa-champions-league/startseite/pokalwettbewerb/CL": "profile_cl.html",
@@ -55,6 +56,17 @@ URL_FIXTURES = {
     BASE_URL
     + "/mens-senior-mystery-league/startseite/wettbewerb/MYSTERY": "profile_mystery.html",
 }
+
+HISTORICAL_EDITION_URLS = {
+    BASE_URL + "/premier-league/startseite/wettbewerb/GB1/saison_id/2024",
+    BASE_URL + "/womens-super-league/startseite/wettbewerb/GB1W/saison_id/2024",
+    BASE_URL + "/fa-cup/startseite/pokalwettbewerb/FAC/saison_id/2024",
+    BASE_URL + "/uefa-champions-league/startseite/pokalwettbewerb/CL/saison_id/2024",
+    BASE_URL + "/afrika-cup/startseite/pokalwettbewerb/AFCN/saison_id/2023",
+    BASE_URL + "/uefa-nations-league-a/startseite/pokalwettbewerb/UNLA/saison_id/2024",
+    BASE_URL + "/world-cup/startseite/wettbewerb/FIWC/saison_id/2022",
+}
+EXPECTED_URLS = set(URL_FIXTURES) | HISTORICAL_EDITION_URLS
 
 
 class LedgerSpy:
@@ -84,6 +96,19 @@ class FixtureFetch:
             if isinstance(override, FetchOutcome):
                 return override
             body = override
+        elif match := re.search(r"/saison_id/(?P<edition_id>\d{4})$", url):
+            profile_url = url[: match.start()]
+            if profile_url in self.overrides:
+                body = self.overrides[profile_url]
+            else:
+                body = (FIXTURES / URL_FIXTURES[profile_url]).read_text(
+                    encoding="utf-8"
+                )
+            body = body.replace(" selected", "")
+            body = body.replace(
+                f'<option value="{match.group("edition_id")}">',
+                f'<option value="{match.group("edition_id")}" selected>',
+            )
         else:
             body = (FIXTURES / URL_FIXTURES[url]).read_text(encoding="utf-8")
         payload_hash = hashlib.sha256(body.encode()).hexdigest()
@@ -111,15 +136,8 @@ def _discover(fetch=None, checkpoint=None, ledger=None):
     return pages, fetch, checkpoint, ledger
 
 
-def test_official_seed_routes_are_complete_and_fixed() -> None:
-    assert SEED_ROUTES == (
-        "/navigation/wettbewerbe",
-        "/wettbewerbe/europa",
-        "/wettbewerbe/amerika",
-        "/wettbewerbe/asien",
-        "/wettbewerbe/afrika",
-        "/wettbewerbe/fifa",
-    )
+def test_canonical_catalogue_is_the_only_fixed_discovery_root() -> None:
+    assert SEED_ROUTES == ("/navigation/wettbewerbe",)
     assert SEED_URLS == tuple(BASE_URL + route for route in SEED_ROUTES)
 
 
@@ -129,15 +147,11 @@ def test_discovery_prefers_canonical_route_over_legacy_alias_for_same_id() -> No
         '<a href="/weltmeisterschaft/startseite/pokalwettbewerb/FIWC">'
         "World Cup 2026</a>"
     )
-    canonical = (
-        '<a href="/world-cup/startseite/wettbewerb/FIWC">World Cup</a>'
-    )
+    canonical = '<a href="/world-cup/startseite/wettbewerb/FIWC">World Cup</a>'
     navigation = navigation.replace("</body>", alias + canonical + "</body>")
 
     pages, fetch, *_ = _discover(
-        fetch=FixtureFetch(
-            {BASE_URL + "/navigation/wettbewerbe": navigation}
-        )
+        fetch=FixtureFetch({BASE_URL + "/navigation/wettbewerbe": navigation})
     )
     snapshot = reconcile_registry_pages(pages)
     world_cup = next(
@@ -146,9 +160,7 @@ def test_discovery_prefers_canonical_route_over_legacy_alias_for_same_id() -> No
 
     assert world_cup.slug == "world-cup"
     assert world_cup.name == "FIFA World Cup"
-    assert world_cup.source_url == (
-        BASE_URL + "/world-cup/startseite/wettbewerb/FIWC"
-    )
+    assert world_cup.source_url == (BASE_URL + "/world-cup/startseite/wettbewerb/FIWC")
     assert BASE_URL + "/weltmeisterschaft/startseite/pokalwettbewerb/FIWC" not in (
         fetch.calls
     )
@@ -179,9 +191,7 @@ def test_discovery_prefers_profile_section_over_secondary_tab_for_same_id() -> N
 
 def test_discovery_resolves_renamed_slug_aliases_for_same_id() -> None:
     navigation = (FIXTURES / "navigation.html").read_text(encoding="utf-8")
-    historical = (
-        '<a href="/torneo-intermedio/startseite/wettbewerb/GB1">3</a>'
-    )
+    historical = '<a href="/torneo-intermedio/startseite/wettbewerb/GB1">3</a>'
     navigation = navigation.replace("</body>", historical + "</body>")
 
     pages, fetch, *_ = _discover(
@@ -195,6 +205,39 @@ def test_discovery_resolves_renamed_slug_aliases_for_same_id() -> None:
     assert premier_league.slug == "premier-league"
     assert premier_league.name == "Premier League"
     assert BASE_URL + "/torneo-intermedio/startseite/wettbewerb/GB1" not in fetch.calls
+
+
+def test_metric_anchor_text_can_never_replace_the_competition_name() -> None:
+    navigation = (FIXTURES / "navigation.html").read_text(encoding="utf-8")
+    metrics = (
+        '<a href="/premier-league/startseite/wettbewerb/GB1">87.5%</a>'
+        '<a href="/premier-league/startseite/wettbewerb/GB1">3</a>'
+    )
+    navigation = navigation.replace("</body>", metrics + "</body>")
+
+    pages, *_ = _discover(
+        fetch=FixtureFetch({BASE_URL + "/navigation/wettbewerbe": navigation})
+    )
+    snapshot = reconcile_registry_pages(pages)
+
+    premier_league = next(
+        item for item in snapshot.competitions if item.competition_id == "GB1"
+    )
+    assert premier_league.name == "Premier League"
+    assert "%" not in premier_league.name
+
+
+def test_metric_only_competition_label_fails_closed() -> None:
+    navigation = (FIXTURES / "navigation.html").read_text(encoding="utf-8")
+    navigation = navigation.replace(
+        "</body>",
+        '<a href="/metric/startseite/wettbewerb/METRIC">64.2%</a></body>',
+    )
+
+    with pytest.raises(DiscoverySchemaError, match="numeric/metric labels: METRIC"):
+        _discover(
+            fetch=FixtureFetch({BASE_URL + "/navigation/wettbewerbe": navigation})
+        )
 
 
 def test_discovery_follows_the_canonical_route_when_a_profile_has_no_seasons() -> None:
@@ -218,13 +261,9 @@ def test_discovery_follows_the_canonical_route_when_a_profile_has_no_seasons() -
         )
     )
     snapshot = reconcile_registry_pages(pages)
-    afcn = next(
-        item for item in snapshot.competitions if item.competition_id == "AFCN"
-    )
+    afcn = next(item for item in snapshot.competitions if item.competition_id == "AFCN")
 
-    assert afcn.source_url == (
-        BASE_URL + "/afrika-cup/startseite/pokalwettbewerb/AFCN"
-    )
+    assert afcn.source_url == (BASE_URL + "/afrika-cup/startseite/pokalwettbewerb/AFCN")
     assert BASE_URL + "/afrika-cup/startseite/pokalwettbewerb/AFCN" in fetch.calls
     editions = [e for e in snapshot.editions if e.competition_id == "AFCN"]
     assert len(editions) == 2
@@ -232,7 +271,7 @@ def test_discovery_follows_the_canonical_route_when_a_profile_has_no_seasons() -
 
 def test_discovery_keeps_the_format_of_each_edition_when_it_changed() -> None:
     profile = (
-        '<!doctype html><html lang="en"><body>'
+        '<!doctype html><html lang="en"><body data-participants-empty="true">'
         '<h1 data-competition-id="GB1">Premier League</h1>'
         '<select name="saison_id">'
         '<option value="2025" selected>25/26</option>'
@@ -262,12 +301,40 @@ def test_discovery_keeps_the_format_of_each_edition_when_it_changed() -> None:
     assert editions["1977"].season_format is SeasonFormat.SINGLE_YEAR
 
 
+def test_discovery_rejects_unknown_nonempty_edition_selector_values() -> None:
+    profile_url = BASE_URL + "/premier-league/startseite/wettbewerb/GB1"
+    profile = (
+        '<!doctype html><html lang="en"><body data-participants-empty="true">'
+        '<h1 data-competition-id="GB1">Premier League</h1>'
+        '<select name="saison_id"><option value="2025" selected>25/26</option>'
+        '<option value="all">All seasons</option></select></body></html>'
+    )
+
+    with pytest.raises(DiscoverySchemaError, match="selector value 'all'"):
+        _discover(fetch=FixtureFetch({profile_url: profile}))
+
+
+def test_discovery_rejects_conflicting_duplicate_link_selector_entries() -> None:
+    profile_url = BASE_URL + "/premier-league/startseite/wettbewerb/GB1"
+    profile = (
+        '<!doctype html><html lang="en"><body data-participants-empty="true">'
+        '<h1 data-competition-id="GB1">Premier League</h1>'
+        '<a class="active" href="/premier-league/startseite/wettbewerb/GB1/'
+        'saison_id/2025">25/26</a>'
+        '<a href="/premier-league/startseite/wettbewerb/GB1/saison_id/2025">'
+        '2025/26</a></body></html>'
+    )
+
+    with pytest.raises(DiscoverySchemaError, match="conflicting edition selector 2025"):
+        _discover(fetch=FixtureFetch({profile_url: profile}))
+
+
 def test_discovery_reads_a_cups_only_edition_from_its_title() -> None:
-    afrika = (FIXTURES / "afrika.html").read_text(encoding="utf-8")
     cup = (
         '<!doctype html><html lang="en"><head>'
         "<title>CAF Champions League 25/26 | Transfermarkt</title>"
-        '</head><body><h1 data-competition-id="AFCN">CAF Champions League</h1>'
+        '</head><body data-participants-empty="true">'
+        '<h1 data-competition-id="AFCN">CAF Champions League</h1>'
         "</body></html>"
     )
 
@@ -285,8 +352,138 @@ def test_discovery_reads_a_cups_only_edition_from_its_title() -> None:
     assert editions[0].current is True
 
 
-def test_discovery_drops_a_competition_the_source_never_staged() -> None:
-    afrika = (FIXTURES / "afrika.html").read_text(encoding="utf-8")
+def test_live_component_profiles_use_authoritative_json_inventory_and_participants():
+    navigation_url = BASE_URL + "/navigation/wettbewerbe"
+    profile_url = BASE_URL + "/international-cup/startseite/pokalwettbewerb/IC"
+    regulation_url = "https://tmapi.transfermarkt.technology/competition/IC/regulation"
+    participant_urls = {
+        "2025": (
+            "https://tmapi.transfermarkt.technology/competition/IC/club?season=2025"
+        ),
+        "2024": (
+            "https://tmapi.transfermarkt.technology/competition/IC/club?season=2024"
+        ),
+    }
+    clubs_url = (
+        "https://tmapi.transfermarkt.technology/clubs?ids%5B%5D=11&ids%5B%5D=281"
+    )
+    navigation = """<!doctype html><html><head>
+      <meta name="tm-country" content="International">
+      <meta name="tm-confederation" content="UEFA">
+      </head><body><div class="box"><div class="content-box-headline">Cups</div><table class="items"><tr>
+      <td><a href="/international-cup/startseite/pokalwettbewerb/IC">International Cup</a></td>
+      </tr></table></div></body></html>"""
+    profile = """<!doctype html><html><body>
+      <h1 data-competition-id="IC">International Cup</h1>
+      <tm-competition-homepage competition-id="IC" season-id="2025"></tm-competition-homepage>
+      </body></html>"""
+    api_values = {
+        regulation_url: {
+            "success": True,
+            "message": "OK",
+            "data": [
+                {
+                    "competitionId": "IC",
+                    "season": {"id": 2025, "display": "25/26"},
+                    "isCurrentSeason": True,
+                    "tournamentStart": "2025-08-01T00:00:00+02:00",
+                    "tournamentEnd": "2026-05-30T00:00:00+02:00",
+                },
+                {
+                    "competitionId": "IC",
+                    "season": {"id": 2024, "display": "24/25"},
+                    "isCurrentSeason": False,
+                    "tournamentStart": None,
+                    "tournamentEnd": None,
+                },
+            ],
+        },
+        participant_urls["2025"]: {
+            "success": True,
+            "message": "OK",
+            "data": {
+                "competitionId": "IC",
+                "clubIds": ["281", "11"],
+                "seasonId": 2025,
+                "season": {"id": 2025, "display": "25/26"},
+            },
+        },
+        participant_urls["2024"]: {
+            "success": True,
+            "message": "OK",
+            "data": {
+                "competitionId": "IC",
+                "clubIds": ["11"],
+                "seasonId": 2024,
+                "season": {"id": 2024, "display": "24/25"},
+            },
+        },
+        clubs_url: {
+            "success": True,
+            "message": "OK",
+            "data": [
+                {
+                    "id": "11",
+                    "name": "Arsenal FC",
+                    "relativeUrl": "/arsenal/startseite/verein/11",
+                    "baseDetails": {"isNationalTeam": False},
+                },
+                {
+                    "id": "281",
+                    "name": "Manchester City",
+                    "relativeUrl": "/manchester-city/startseite/verein/281",
+                    "baseDetails": {"isNationalTeam": False},
+                },
+            ],
+        },
+    }
+
+    html_fetch = FixtureFetch(
+        {navigation_url: navigation, profile_url: profile}
+    )
+    json_calls: list[tuple[str, str]] = []
+
+    def json_fetch(url: str, endpoint: str) -> FetchOutcome[dict]:
+        json_calls.append((url, endpoint))
+        value = api_values[url]
+        return FetchOutcome(
+            status=FetchStatus.OK,
+            value=value,
+            status_code=200,
+            attempts=1,
+            label=endpoint,
+            payload_hash=stable_payload_hash(value),
+        )
+
+    pages = discover_competition_registry(
+        fetch=html_fetch,
+        fetch_json=json_fetch,
+        checkpoint={},
+        traffic_ledger=LedgerSpy(),
+        clock=lambda: NOW,
+    )
+    snapshot = reconcile_registry_pages(pages)
+
+    competition = next(item for item in snapshot.competitions if item.competition_id == "IC")
+    assert competition.competition_type is CompetitionType.CONTINENTAL_CLUB
+    assert [item.edition_id for item in snapshot.editions if item.competition_id == "IC"] == [
+        "2024",
+        "2025",
+    ]
+    assert {
+        (item.edition_id, item.team_id, item.team_name)
+        for item in snapshot.participants
+        if item.competition_id == "IC"
+    } == {("2025", "11", "Arsenal FC"), ("2025", "281", "Manchester City"), ("2024", "11", "Arsenal FC")}
+    assert [endpoint for _url, endpoint in json_calls] == [
+        "competition_regulation",
+        "competition_participants",
+        "competition_participants",
+        "competition_participant_entities",
+    ]
+
+
+def test_discovery_blocks_when_a_competition_has_no_authoritative_editions() -> None:
     unstaged = (
         '<!doctype html><html lang="en"><head>'
         "<title>J1 100 Year Vision League | Transfermarkt</title>"
@@ -294,17 +491,12 @@ def test_discovery_drops_a_competition_the_source_never_staged() -> None:
         "</body></html>"
     )
 
-    pages, *_ = _discover(
-        fetch=FixtureFetch(
-            {BASE_URL + "/afrika-cup/startseite/pokalwettbewerb/AFCN": unstaged}
+    with pytest.raises(DiscoverySchemaError, match="edition selector missing"):
+        _discover(
+            fetch=FixtureFetch(
+                {BASE_URL + "/afrika-cup/startseite/pokalwettbewerb/AFCN": unstaged}
+            )
         )
-    )
-    snapshot = reconcile_registry_pages(pages)
-
-    assert not [
-        item for item in snapshot.competitions if item.competition_id == "AFCN"
-    ]
-    assert snapshot.competitions
 
 
 def test_catalog_table_groups_classify_rows_the_section_only_brackets() -> None:
@@ -324,7 +516,7 @@ def test_catalog_table_groups_classify_rows_the_section_only_brackets() -> None:
         "</tbody></table></div></body></html>"
     )
     profile = (
-        '<!doctype html><html lang="en"><body>'
+        '<!doctype html><html lang="en"><body data-participants-empty="true">'
         '<h1 data-competition-id="GB18">U18 Premier League</h1>'
         '<select name="saison_id"><option value="2025" selected>25/26</option>'
         "</select></body></html>"
@@ -353,7 +545,7 @@ def test_a_youth_tournament_is_excluded_even_where_the_source_marks_no_age() -> 
     )
     navigation = navigation.replace("</body>", youth_tournament + "</body>")
     profile = (
-        '<!doctype html><html lang="en"><body>'
+        '<!doctype html><html lang="en"><body data-participants-empty="true">'
         '<h1 data-competition-id="17WC">U17 World Cup</h1>'
         '<select name="saison_id"><option value="2026" selected>2026</option>'
         "</select></body></html>"
@@ -410,27 +602,98 @@ def test_discovery_does_not_follow_sort_variants_of_a_listing() -> None:
     assert BASE_URL + "/wettbewerbe/afrika?sort=marktwert" not in fetch.calls
 
 
+def test_catalogue_recursively_discovers_a_new_first_party_region() -> None:
+    navigation = (FIXTURES / "navigation.html").read_text(encoding="utf-8")
+    navigation = navigation.replace(
+        "</body>", '<a href="/wettbewerbe/ozeanien">Oceania</a></body>'
+    )
+    oceania_url = BASE_URL + "/wettbewerbe/ozeanien"
+    empty_region = (
+        '<!doctype html><html><body data-registry-empty="true" '
+        'data-country="Oceania" data-confederation="OFC"></body></html>'
+    )
+
+    _, fetch, *_ = _discover(
+        fetch=FixtureFetch(
+            {
+                BASE_URL + "/navigation/wettbewerbe": navigation,
+                oceania_url: empty_region,
+            }
+        )
+    )
+
+    assert oceania_url in fetch.calls
+
+
+def test_declared_last_page_enumerates_intermediate_pagination_pages() -> None:
+    europa = (FIXTURES / "europa.html").read_text(encoding="utf-8")
+    europa = europa.replace(
+        "</nav>",
+        '<a class="page-link" data-page="3" href="/wettbewerbe/europa?page=3">'
+        "3</a></nav>",
+    )
+    page_three_url = BASE_URL + "/wettbewerbe/europa?page=3"
+    empty_page = (
+        '<!doctype html><html><body data-registry-empty="true" '
+        'data-country="Europe" data-confederation="UEFA"></body></html>'
+    )
+
+    _, fetch, *_ = _discover(
+        fetch=FixtureFetch(
+            {
+                BASE_URL + "/wettbewerbe/europa": europa,
+                page_three_url: empty_page,
+            }
+        )
+    )
+
+    assert BASE_URL + "/wettbewerbe/europa?page=2" in fetch.calls
+    assert page_three_url in fetch.calls
+
+
+def test_pagination_label_url_mismatch_fails_closed() -> None:
+    europa = (FIXTURES / "europa.html").read_text(encoding="utf-8")
+    europa = europa.replace('data-page="2"', 'data-page="3"')
+
+    with pytest.raises(DiscoverySchemaError, match="label/URL mismatch"):
+        _discover(fetch=FixtureFetch({BASE_URL + "/wettbewerbe/europa": europa}))
+
+
+def test_pagination_bound_is_enforced_before_fetching_out_of_range_page() -> None:
+    europa = (FIXTURES / "europa.html").read_text(encoding="utf-8")
+    europa = europa.replace('data-page="2"', 'data-page="13"').replace(
+        "europa?page=2", "europa?page=13"
+    )
+    fetch = FixtureFetch({BASE_URL + "/wettbewerbe/europa": europa})
+
+    with pytest.raises(DiscoverySchemaError, match="out of bounds"):
+        discover_competition_registry(
+            fetch=fetch,
+            checkpoint={},
+            traffic_ledger=LedgerSpy(),
+            clock=lambda: NOW,
+            limits=DiscoveryLimits(listing_pages=12),
+        )
+    assert BASE_URL + "/wettbewerbe/europa?page=13" not in fetch.calls
+
+
 def test_discovery_traverses_every_seed_page_country_pagination_and_profile() -> None:
     pages, fetch, checkpoint, ledger = _discover()
 
-    assert set(fetch.calls) == set(URL_FIXTURES)
-    assert len(fetch.calls) == len(URL_FIXTURES) == 17
+    assert set(fetch.calls) == EXPECTED_URLS
+    assert len(fetch.calls) == len(EXPECTED_URLS) == 24
     assert len(fetch.calls) == len(set(fetch.calls))
-    assert ledger.ensure_calls == 17
+    assert ledger.ensure_calls == 24
     assert ledger.cache_hits == 0
-    assert set(checkpoint) == set(URL_FIXTURES)
+    assert set(checkpoint) == EXPECTED_URLS
     assert len(pages) == 9  # six seeds + Europe page 2 + two England pages
 
     assert BASE_URL + "/wettbewerbe/europa?page=2" in fetch.calls
     assert BASE_URL + "/wettbewerbe/national/wettbewerbe/189" in fetch.calls
-    assert (
-        BASE_URL + "/wettbewerbe/national/wettbewerbe/189?page=2"
-        in fetch.calls
-    )
+    assert BASE_URL + "/wettbewerbe/national/wettbewerbe/189?page=2" in fetch.calls
     assert BASE_URL + "/fa-cup/startseite/pokalwettbewerb/FAC" in fetch.calls
     assert (
-        BASE_URL + "/uefa-champions-league/startseite/pokalwettbewerb/CL"
-        in fetch.calls
+        BASE_URL + "/uefa-champions-league/startseite/pokalwettbewerb/CL" in fetch.calls
     )
     assert (
         BASE_URL + "/uefa-nations-league-a/startseite/pokalwettbewerb/UNLA"
@@ -456,10 +719,7 @@ def test_discovered_records_cover_all_required_competition_types_and_seasons() -
     assert competitions["GB1"].competition_type is CompetitionType.DOMESTIC_LEAGUE
     assert competitions["GB1W"].competition_type is CompetitionType.DOMESTIC_LEAGUE
     assert competitions["GB1W"].gender is Gender.WOMEN
-    assert (
-        competitions["GB1W"].classification_status
-        is ClassificationStatus.EXCLUDED
-    )
+    assert competitions["GB1W"].classification_status is ClassificationStatus.EXCLUDED
     assert competitions["FAC"].competition_type is CompetitionType.DOMESTIC_CUP
     assert competitions["CL"].competition_type is CompetitionType.CONTINENTAL_CLUB
     assert (
@@ -476,22 +736,57 @@ def test_discovered_records_cover_all_required_competition_types_and_seasons() -
     )
 
     editions = {
-        (item.competition_id, item.edition_id): item
-        for item in snapshot.editions
+        (item.competition_id, item.edition_id): item for item in snapshot.editions
     }
     assert editions[("GB1", "2025")].canonical_season == "2526"
     assert editions[("UNLA", "2026")].canonical_season == "2627"
     assert editions[("AFCN", "2025")].canonical_season == "2025"
     assert editions[("FIWC", "2026")].canonical_season == "2026"
-    assert editions[("GB1", "2025")].participant_count == 20
-    assert editions[("FIWC", "2026")].participant_count == 48
+    assert editions[("GB1", "2025")].participant_count == 2
+    assert editions[("FIWC", "2026")].participant_count == 2
+
+
+def test_editions_derive_count_and_hash_from_exact_typed_participant_rows() -> None:
+    pages, *_ = _discover()
+    snapshot = reconcile_registry_pages(pages)
+    edition = next(
+        item
+        for item in snapshot.editions
+        if (item.competition_id, item.edition_id) == ("GB1", "2025")
+    )
+    participants = tuple(
+        item
+        for item in snapshot.participants
+        if (item.competition_id, item.edition_id) == ("GB1", "2025")
+    )
+
+    assert [(item.team_id, item.team_name) for item in participants] == [
+        ("11", "Arsenal FC"),
+        ("631", "Chelsea FC"),
+    ]
+    assert edition.participant_count == len(participants)
+    assert edition.participant_hash == participant_list_hash(participants)
+    assert len(edition.participant_hash) == 64
+    assert all(
+        item.registry_snapshot_id == snapshot.snapshot_id for item in participants
+    )
+    assert all(item.source_body_hash for item in participants)
+
+    historical = {
+        item.edition_id
+        for item in snapshot.participants
+        if item.competition_id == "GB1"
+    }
+    assert historical == {"2024", "2025"}
 
 
 def test_section_taxonomy_and_main_taxonomy_are_source_evidence_not_names() -> None:
     pages, *_ = _discover()
     snapshot = reconcile_registry_pages(pages)
     gb1 = next(item for item in snapshot.competitions if item.competition_id == "GB1")
-    section = next(item for item in gb1.evidence if item.source_field == "section_label")
+    section = next(
+        item for item in gb1.evidence if item.source_field == "section_label"
+    )
     audience = next(
         item for item in gb1.evidence if item.source_field == "transfermarkt_taxonomy"
     )
@@ -502,7 +797,9 @@ def test_section_taxonomy_and_main_taxonomy_are_source_evidence_not_names() -> N
     assert audience.origin is EvidenceOrigin.STRUCTURED
 
 
-def test_womens_section_is_source_backed_exclusion_without_default_mens_signal() -> None:
+def test_womens_section_is_source_backed_exclusion_without_default_mens_signal() -> (
+    None
+):
     pages, *_ = _discover()
     snapshot = reconcile_registry_pages(pages)
     women = next(
@@ -516,9 +813,7 @@ def test_womens_section_is_source_backed_exclusion_without_default_mens_signal()
     )
     assert section.source_value == "Women's national leagues"
     assert section.gender is Gender.WOMEN
-    assert all(
-        item.source_field != "transfermarkt_taxonomy" for item in women.evidence
-    )
+    assert all(item.source_field != "transfermarkt_taxonomy" for item in women.evidence)
     assert snapshot.blocked_competition_ids == ("MYSTERY",)
 
 
@@ -560,7 +855,7 @@ def test_persistent_checkpoint_resume_performs_zero_fetches() -> None:
 
     assert second_pages == first_pages
     assert ledger.ensure_calls == 0
-    assert ledger.cache_hits == len(URL_FIXTURES) == 17
+    assert ledger.cache_hits == len(EXPECTED_URLS) == 24
     assert set(ledger.cache_entities) == {"competition_registry"}
 
 
@@ -597,7 +892,7 @@ def test_listing_schema_drift_aborts_snapshot() -> None:
 def test_a_catalog_whose_profiles_all_lost_their_editions_aborts_snapshot() -> None:
     drift = {
         url: (
-            '<!doctype html><html><body>'
+            "<!doctype html><html><body>"
             f'<h1 data-competition-id="{url.rsplit("/", 1)[-1]}">x</h1>'
             "</body></html>"
         )
@@ -605,7 +900,7 @@ def test_a_catalog_whose_profiles_all_lost_their_editions_aborts_snapshot() -> N
         if "wettbewerb/" in url
     }
 
-    with pytest.raises(DiscoverySchemaError, match="no competitions"):
+    with pytest.raises(DiscoverySchemaError, match="edition selector missing"):
         _discover(fetch=FixtureFetch(drift))
 
 

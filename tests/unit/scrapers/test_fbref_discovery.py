@@ -509,6 +509,50 @@ def test_stat_links_stay_distinct_and_known_empty_routes_are_skipped():
     )
 
 
+def test_stats_segment_mints_standard_season_stats_route():
+    # FBref serves per-player STANDARD season stats under the on-page URL
+    # segment ``stats`` (label "standard").  It must mint season_stats/standard,
+    # not a bogus season target with season_id="stats" (the #949 routing bug
+    # that quarantined it and left player standard stats uncollected).
+    html = """
+    <main>
+      <a href="/en/comps/9/2025-2026/stats/Premier-League-Stats">Standard</a>
+    </main>
+    """
+
+    links = discover_page_links(html)
+    by_kind = {link.page_kind: link for link in links}
+
+    assert set(by_kind) == {"season_stats"}
+    assert by_kind["season_stats"].source_ids == {
+        "competition_id": "9",
+        "season_id": "2025-2026",
+        "stat_route": "standard",
+    }
+
+
+def test_current_season_stats_segment_is_minted_not_quarantined():
+    # The season-less current-season /stats/ link must inherit the parent
+    # competition's current season and mint season_stats/standard (not a
+    # season target with season_id="stats").
+    links = discover_page_links(
+        """
+        <main>
+          <a href="/en/comps/9/stats/Premier-League-Stats">Standard</a>
+        </main>
+        """,
+        parent_source_ids={"competition_id": "9", "season_id": "2026"},
+        parent_url="https://fbref.com/en/comps/9/Premier-League-Stats",
+    )
+
+    assert [link.page_kind for link in links] == ["season_stats"]
+    assert links[0].source_ids == {
+        "competition_id": "9",
+        "season_id": "2026",
+        "stat_route": "standard",
+    }
+
+
 SEASON_LESS_NAV_HTML = """
 <main>
 <a href="/en/comps/8/Champions-League-Stats">Champions League</a>

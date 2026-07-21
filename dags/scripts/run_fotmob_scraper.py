@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import signal
 import sys
 import tempfile
 from datetime import datetime, timezone
@@ -216,6 +217,27 @@ def _native_output_payload(report) -> dict[str, Any]:
     return payload
 
 
+# Buffered repository of the running native service. finish() is the normal
+# flush point, but an exception escaping _run_native (or the driver's SIGTERM
+# at unit timeout) would otherwise drop up to batch_size-1 already-paid-for
+# targets; main() salvage-flushes through this handle before reporting failure.
+_ACTIVE_NATIVE_SERVICE = None
+
+
+def _salvage_flush() -> None:
+    """Best-effort durability for buffered commits on an abnormal exit."""
+
+    service = _ACTIVE_NATIVE_SERVICE
+    if service is None:
+        return
+    try:
+        tables = service.repository.flush()
+        if tables:
+            logger.warning("salvage flush persisted buffered commits: %s", tables)
+    except Exception:
+        logger.exception("salvage flush after runner failure also failed")
+
+
 def _build_native_service(args, run_id: str):
     """Construct production dependencies lazily; legacy unit tests stay isolated."""
 
@@ -242,7 +264,10 @@ def _build_native_service(args, run_id: str):
         max_attempts=args.max_attempts,
         rate_limiter=limiter,
     )
-    repository = FotMobRepository()
+    repository = FotMobRepository(
+        batch_size=args.commit_batch_size,
+        max_buffered_rows=args.max_buffered_rows,
+    )
     budget = TransportBudget(
         max_requests=args.max_requests,
         max_direct_bytes=int(args.max_direct_mib * 1024 * 1024),
@@ -256,6 +281,8 @@ def _build_native_service(args, run_id: str):
         run_id=run_id,
         max_workers=args.workers,
     )
+    global _ACTIVE_NATIVE_SERVICE
+    _ACTIVE_NATIVE_SERVICE = service
     return service, raw_store
 
 
@@ -278,6 +305,20 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
     operations = []
 
     def finish() -> tuple[int, dict[str, Any]]:
+        # Buffered commits are only durable once flushed. Every exit path of
+        # this run — completion, budget cut, empty catalog — goes through
+        # finish(), so the flush belongs here and its failure must turn the
+        # run red instead of silently dropping targets.
+        flush_operation = OperationResult("commit_flush", attempted=1)
+        try:
+            flush_operation.tables.extend(service.repository.flush())
+            flush_operation.succeeded = 1
+        except Exception as exc:
+            flush_operation.errors.append(
+                f"commit flush: {type(exc).__name__}: {exc}"
+            )
+        operations.append(flush_operation)
+
         view_operation = OperationResult("current_views", attempted=1)
         try:
             views = service.repository.ensure_current_views()
@@ -872,6 +913,26 @@ def _argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--requests-per-minute", type=int, default=30)
     parser.add_argument("--max-attempts", type=int, default=4)
     parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument(
+        "--commit-batch-size",
+        type=int,
+        default=50,
+        help=(
+            "Targets buffered into one Iceberg commit per table. 1 commits "
+            "every target separately (one single-row data file per target)."
+        ),
+    )
+    parser.add_argument(
+        "--max-buffered-rows",
+        type=int,
+        default=100_000,
+        help=(
+            "Physical rows buffered before an early flush. The 20k default "
+            "of the repository flushed every ~4 matches once field-inventory "
+            "rows piled up, defeating --commit-batch-size. Only effective "
+            "with --commit-batch-size > 1 (batch size 1 writes unbuffered)."
+        ),
+    )
     parser.add_argument("--competition-limit", type=int, default=0)
     parser.add_argument("--season-limit", type=int, default=0)
     parser.add_argument("--match-limit", type=int, default=0)
@@ -928,6 +989,7 @@ def _validate_args(parser: argparse.ArgumentParser, args) -> None:
         "--max-attempts": args.max_attempts,
         "--workers": args.workers,
         "--transfer-max-pages": args.transfer_max_pages,
+        "--max-buffered-rows": args.max_buffered_rows,
     }
     for name, value in positive.items():
         if value <= 0:
@@ -950,6 +1012,14 @@ def _validate_args(parser: argparse.ArgumentParser, args) -> None:
         parser.error("--workers must be <= 16")
 
 
+def _sigterm_to_exception(signum, frame):
+    """The driver's unit timeout sends TERM (then KILL after 30s). Raising here
+    routes shutdown through main()'s failure path: salvage flush + a real
+    report instead of a silent NO_REPORT kill."""
+
+    raise RuntimeError(f"terminated by signal {signum}")
+
+
 def main():
     parser = _argument_parser()
     args = parser.parse_args()
@@ -958,12 +1028,17 @@ def main():
     output = args.output or f"/tmp/fotmob_result_{_safe_run_id(run_id)}.json"
     args.run_id = run_id
     try:
+        signal.signal(signal.SIGTERM, _sigterm_to_exception)
+    except ValueError:
+        pass  # not in the main thread (unit-test harness) — keep default
+    try:
         if args.mode:
             rc, payload = _run_native(args)
         else:
             rc, payload = _run_legacy(args)
     except (ValueError, RuntimeError) as exc:
         logger.error("FotMob runner configuration/runtime failure: %s", exc)
+        _salvage_flush()
         payload = {
             "run_id": run_id,
             "mode": args.mode or "legacy",
@@ -976,6 +1051,7 @@ def main():
         rc = 1
     except Exception as exc:
         logger.exception("Unexpected FotMob runner failure")
+        _salvage_flush()
         payload = {
             "run_id": run_id,
             "mode": args.mode or "legacy",

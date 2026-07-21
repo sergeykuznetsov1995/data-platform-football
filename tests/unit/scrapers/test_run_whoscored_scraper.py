@@ -502,6 +502,72 @@ def test_report_keeps_the_exact_service_commit_identities():
 
 
 @pytest.mark.unit
+def test_report_surfaces_the_match_backlog_from_service_metadata():
+    scope = runner.RunnerScope.parse("ENG-Premier League=2526")
+    report = runner._new_report("daily", (scope,))
+    assert report["match_candidates"] is None
+    result = _result(
+        "matches",
+        metadata={
+            "match_candidates": {
+                "schema_version": 1,
+                "count": 12,
+                "attempted": 5,
+                "remaining": 7,
+            }
+        },
+    )
+
+    runner._merge_result(report, result, scope_record=report["scopes"][0])
+
+    assert report["match_candidates"] == {
+        "schema_version": 1,
+        "count": 12,
+        "attempted": 5,
+        "remaining": 7,
+    }
+
+
+@pytest.mark.unit
+def test_report_accumulates_match_backlog_across_scopes():
+    scope = runner.RunnerScope.parse("ENG-Premier League=2526")
+    report = runner._new_report("daily", (scope,))
+    first = _result(
+        "matches",
+        metadata={
+            "match_candidates": {
+                "schema_version": 1,
+                "count": 20,
+                "attempted": 5,
+                "remaining": 15,
+            }
+        },
+    )
+    second = _result(
+        "matches",
+        metadata={
+            "match_candidates": {
+                "schema_version": 1,
+                "count": 8,
+                "attempted": 8,
+                "remaining": 0,
+            }
+        },
+    )
+
+    runner._merge_result(report, first, scope_record=report["scopes"][0])
+    runner._merge_result(report, second, scope_record=report["scopes"][0])
+
+    # Whole-run backlog, not just the last scope.
+    assert report["match_candidates"] == {
+        "schema_version": 1,
+        "count": 28,
+        "attempted": 13,
+        "remaining": 15,
+    }
+
+
+@pytest.mark.unit
 def test_report_publishes_content_bound_attempt_sidecar_in_new_directory(tmp_path):
     output = tmp_path / "nested" / "result.json"
     report = {

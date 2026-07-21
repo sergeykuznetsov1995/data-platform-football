@@ -63,7 +63,7 @@ x-airflow-common: &airflow-common
     # FBref has a dedicated meter and dedicated residential pool.  The worker
     # receives only a short-lived lease token, never an upstream credential.
     FBREF_PROXY_CONTROL_URL: ${FBREF_PROXY_CONTROL_URL:-http://fbref_proxy_filter:8899}
-    FBREF_PROXY_CONTROL_TOKEN: ${SOFASCORE_PROXY_CONTROL_TOKEN:-}
+    FBREF_PROXY_CONTROL_TOKEN: ${FBREF_PROXY_CONTROL_TOKEN:-}
     FBREF_PROXY_LEASE_TTL_SECONDS: ${FBREF_PROXY_LEASE_TTL_SECONDS:-7200}
     SOFASCORE_PLAYER_ROTATION_MODULUS: ${SOFASCORE_PLAYER_ROTATION_MODULUS:-4}
     SOFASCORE_PLAYER_ROTATION_MIN_LEAGUES: ${SOFASCORE_PLAYER_ROTATION_MIN_LEAGUES:-10}
@@ -147,7 +147,7 @@ x-airflow-common: &airflow-common
     WHOSCORED_CATALOG_REQUESTS_PER_MINUTE: ${WHOSCORED_CATALOG_REQUESTS_PER_MINUTE:-60}
     # Transfermarkt stays disabled and cannot acquire an unmanaged proxy until
     # an operator supplies the separately approved paid/write packet.
-    TM_NATIVE_V2_ENABLED: ${TM_NATIVE_V2_ENABLED:-false}
+    TM_NATIVE_V2_ENABLED: ${TM_NATIVE_V2_ENABLED:-true}
     # Second activation key: scheduled runs accept the standing approval
     # policies only when this is true (see dags/configs/transfermarkt/).
     TM_STANDING_POLICY_ENABLED: ${TM_STANDING_POLICY_ENABLED:-false}
@@ -157,6 +157,12 @@ x-airflow-common: &airflow-common
     TM_PROXY_CONTROL_TOKEN: ${TM_PROXY_CONTROL_TOKEN:-${PROXY_FILTER_CONTROL_TOKEN:-${SOFASCORE_PROXY_CONTROL_TOKEN:-}}}
     TM_REQUIRE_METERED_PROXY: ${TM_REQUIRE_METERED_PROXY:-false}
     TM_PROXY_LEASE_TTL_SECONDS: ${TM_PROXY_LEASE_TTL_SECONDS:-3600}
+    # Every paid Transfermarkt response is committed before parsing.  The
+    # worker must never fall back to ephemeral local bytes in production.
+    TRANSFERMARKT_RAW_STORE_URI: s3://${ICEBERG_WAREHOUSE}/raw/transfermarkt
+    TRANSFERMARKT_RAW_S3_ENDPOINT: seaweedfs:8333
+    TRANSFERMARKT_RAW_S3_SCHEME: http
+    TRANSFERMARKT_REQUIRE_RAW_STORE: ${TRANSFERMARKT_REQUIRE_RAW_STORE:-true}
     FBREF_RAW_S3_ENDPOINT: seaweedfs:8333
     FBREF_RAW_S3_SCHEME: http
     # Versioned SofaScore discovery registry. Discovery runs outside Airflow;
@@ -453,7 +459,12 @@ services:
     deploy:
       resources:
         limits:
-          memory: 512M
+          # Lakekeeper's RSS climbs ~430 MB/h under sustained per-target Iceberg
+          # commits and is memcg-OOM-killed mid-commit at whatever ceiling it is
+          # given (512M died in 20 min, 1G in 2.4 h — FotMob #930 canary). The
+          # headroom buys hours, not immunity: long backfills must also restart
+          # it between work units (see fotmob_canary_backfill/driver.sh).
+          memory: 3G
         reservations:
           memory: 128M
 
@@ -1456,7 +1467,7 @@ services:
       - ALL
     environment:
       PYTHONPATH: /opt/airflow
-      PROXY_FILTER_CONTROL_TOKEN: ${SOFASCORE_PROXY_CONTROL_TOKEN:-}
+      PROXY_FILTER_CONTROL_TOKEN: ${FBREF_PROXY_CONTROL_TOKEN:-}
       # Deliberately separate from the shared paid pool below.
       PROXY_POOL_JSON: ""
       PROXY_FILTER_ALLOW_FILE_FALLBACK: "true"
@@ -1500,7 +1511,7 @@ services:
       - ./scripts:/opt/airflow/scripts:ro
       - ./scrapers:/opt/airflow/scrapers:ro
       - ./configs/proxy_filter:/opt/airflow/configs/proxy_filter:ro
-      - ./proxys.txt:/opt/airflow/proxys.txt:ro
+      - ${FBREF_PROXY_POOL_FILE:-./proxys.txt}:/opt/airflow/proxys.txt:ro
       - ./logs:/opt/airflow/logs
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "http://localhost:8899/health"]

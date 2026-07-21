@@ -373,6 +373,37 @@ def test_paid_runtime_authority_requires_the_exact_canary_contract(monkeypatch):
         assert_paid_runtime_available(context, secret=SECRET, now=NOW)
 
 
+def test_daily_ingest_paid_crawl_gate_admits_ingest_but_not_backfill(monkeypatch):
+    monkeypatch.setattr(
+        proxy_campaign_module,
+        "WHOSCORED_PROVIDER_INVOICE_HARD_CAP_AVAILABLE",
+        True,
+    )
+    monkeypatch.setattr(
+        proxy_campaign_module,
+        "WHOSCORED_PAID_APPLICATION_GATEWAY_AVAILABLE",
+        True,
+    )
+    # The full-crawl sentinel stays False: the child lock keeps backfill closed
+    # even while daily ingest is admitted via its own code-owned gate.
+    assert proxy_campaign_module.WHOSCORED_FULL_PAID_CRAWL_AVAILABLE is False
+    assert proxy_campaign_module.WHOSCORED_DAILY_INGEST_PAID_CRAWL_AVAILABLE is True
+
+    ingest = _runtime_context(_approval(dags=["dag_ingest_whoscored"]))
+    approval, allocation, _attempt = assert_paid_runtime_available(
+        ingest, secret=SECRET, now=NOW
+    )
+    assert approval.approval_id == "approval-1"
+    assert allocation.allocation_id == "allocation-capture"
+
+    backfill = _runtime_context(_approval())
+    with pytest.raises(
+        ProxyCampaignValidationError,
+        match="full paid crawl is disabled",
+    ):
+        assert_paid_runtime_available(backfill, secret=SECRET, now=NOW)
+
+
 def test_schema_v1_and_first_claim_for_another_run_fail_closed(tmp_path):
     legacy = _unsigned()
     legacy["schema_version"] = 1

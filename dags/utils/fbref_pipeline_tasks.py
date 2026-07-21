@@ -1346,7 +1346,10 @@ def initialize_fbref_run(
 
 
 def acquire_fbref_publication_lock(
-    *, airflow_run_id: str, dag_id: str
+    *,
+    airflow_run_id: str,
+    dag_id: str,
+    ttl_seconds=FBREF_PUBLICATION_LOCK_TTL_SECONDS,
 ) -> dict:
     """Fence every FBref Bronze/Silver writer until publication is terminal."""
 
@@ -1356,7 +1359,7 @@ def acquire_fbref_publication_lock(
     result = _control_store().acquire_publication_lock(
         run_id,
         dag_id=dag_id,
-        ttl_seconds=FBREF_PUBLICATION_LOCK_TTL_SECONDS,
+        ttl_seconds=int(ttl_seconds),
     )
     logger.info(
         "FBref publication lock acquired: owner=%s idempotent=%s",
@@ -1963,6 +1966,7 @@ def parse_fbref_wave(
     byte_limit_mb=DEFAULT_BYTE_LIMIT // MIB,
     shard_size=DEFAULT_SHARD_SIZE,
     reservation_mb=DEFAULT_REQUEST_RESERVATION_BYTES // MIB,
+    acceptance_replay=False,
 ) -> dict:
     settings = _settings(
         run_type=run_type,
@@ -1979,11 +1983,15 @@ def parse_fbref_wave(
     )
     if settings.run_type == "replay" and normalized_source_run_id is None:
         raise ValueError("Replay requires source_control_run_id")
+    normalized_acceptance_replay = _boolean_parameter(
+        acceptance_replay, name="acceptance_replay"
+    )
     result = _pipeline().parse_wave(
         _control_run_id(airflow_run_id=airflow_run_id, dag_id=dag_id),
         page_kinds=list(page_kinds),
         settings=settings,
         source_run_id=normalized_source_run_id,
+        acceptance_replay=normalized_acceptance_replay,
     ).as_dict()
     logger.info("FBref offline parse wave: %s", json.dumps(result, sort_keys=True))
     return result

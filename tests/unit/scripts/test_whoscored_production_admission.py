@@ -1255,6 +1255,7 @@ def test_checked_in_compose_model_matches_admission_policy(tmp_path: Path) -> No
         "PUBLIC_IP": "127.0.0.1",
         "SEAWEEDFS_DATA_VOLUME_NAME": "seaweedfs_data",
         "SEAWEEDFS_VOLUME_SIZE_LIMIT_MB": "1024",
+        "FBREF_PROXY_CONTROL_TOKEN": "b" * 64,
         "SOFASCORE_PROXY_CONTROL_TOKEN": "b" * 64,
         "TRINO_PUBLIC_HOST": "trino.ci.invalid",
         "WHOSCORED_PROXY_APPROVAL_HOST_DIR": (

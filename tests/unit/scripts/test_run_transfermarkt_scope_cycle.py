@@ -257,6 +257,12 @@ def _fake_result(command: tuple[str, ...], *, retries: int = 0) -> dict:
             },
             'fetched_at': datetime.now(timezone.utc).isoformat(),
         }
+        result['scope_player_capture_evidence'] = {
+            'row_count': 2,
+            'key_hash': hashlib.sha256(b'scope-player-capture').hexdigest(),
+            'table': cycle.SCOPE_PLAYER_CAPTURE_TABLE,
+            'reused': False,
+        }
     return result
 
 

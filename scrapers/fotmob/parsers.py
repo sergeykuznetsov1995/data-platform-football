@@ -49,6 +49,31 @@ def _source_id(value: Any) -> Any:
     return value
 
 
+def _text(value: Any) -> Optional[str]:
+    """Render a label as text.
+
+    Round and stage labels are numbers in a league ("12") and words in a cup
+    ("Round of 16", "playoff"). They are labels either way, so the column is
+    text — a mixed number/word column cannot be typed at all.
+    """
+
+    return None if value is None else str(value)
+
+
+def _numeric_source_id(value: Any) -> Optional[int]:
+    """Return the source id only when it is numeric, else None.
+
+    A stage identity can be a number (``roundId``, ``StageId``, table id) or a
+    word (``final``, ``semifinal``). Mixing both in one column yields a pandas
+    object column that Arrow refuses to write ("Expected bytes, got a 'int'").
+    The numeric column keeps only numbers; the verbatim source key is never
+    lost — it is what ``stage_id``/``stage_name`` carry.
+    """
+
+    normalized = _source_id(value)
+    return normalized if isinstance(normalized, int) else None
+
+
 def _scope_columns(scope: Optional[ScopeRef]) -> dict[str, Any]:
     if scope is None:
         return {}
@@ -141,10 +166,10 @@ def _match_row(
         ),
         "home_score": _first_not_none(home.get("score"), match.get("homeScore"), parsed_home),
         "away_score": _first_not_none(away.get("score"), match.get("awayScore"), parsed_away),
-        "round_id": _first_not_none(match.get("round"), inherited_stage),
-        "round_name": match.get("roundName"),
-        "stage_id": _first_not_none(match.get("stage"), inherited_stage),
-        "group_name": match.get("group"),
+        "round_id": _text(_first_not_none(match.get("round"), inherited_stage)),
+        "round_name": _text(match.get("roundName")),
+        "stage_id": _text(_first_not_none(match.get("stage"), inherited_stage)),
+        "group_name": _text(match.get("group")),
         "page_url": match.get("pageUrl"),
         "source_path": source_path,
     }
@@ -302,7 +327,7 @@ def _parse_standings(
         table_stages.append({
             **_scope_columns(scope),
             "stage_id": f"table:{stable_component}",
-            "source_stage_id": table_id,
+            "source_stage_id": _numeric_source_id(table_id),
             "stage_name": table_name,
             "stage_type": "table",
             "source_order": len(table_stages),
@@ -385,7 +410,7 @@ def _parse_playoffs(
         stages.append({
             **_scope_columns(scope),
             "stage_id": stage_id,
-            "source_stage_id": source_stage,
+            "source_stage_id": _numeric_source_id(source_stage),
             "stage_name": round_obj.get("name"),
             "stage_type": "playoff",
             "participant_count": round_obj.get("participantCount"),
@@ -417,7 +442,9 @@ def _parse_playoffs(
             row = {
                 **_scope_columns(scope),
                 "stage_id": stage_id,
-                "source_stage_id": _first_not_none(matchup.get("stage"), source_stage),
+                "source_stage_id": _numeric_source_id(
+                    _first_not_none(matchup.get("stage"), source_stage)
+                ),
                 "round_kind": round_kind,
                 "draw_order": matchup.get("drawOrder"),
                 "participant_count": round_obj.get("participantCount"),
@@ -475,7 +502,7 @@ def _parse_fixture_stages(payload: Mapping[str, Any], scope: ScopeRef) -> tuple[
         rows.append({
             **_scope_columns(scope),
             "stage_id": f"fixture:{source_id}",
-            "source_stage_id": source_id,
+            "source_stage_id": _numeric_source_id(source_id),
             "stage_name": _first_not_none(value.get("name"), value.get("localizedKey")),
             "localized_key": value.get("localizedKey"),
             "stage_type": "fixture_round",
@@ -497,7 +524,7 @@ def _parse_stat_stages(payload: Mapping[str, Any], scope: ScopeRef) -> tuple[dic
         rows.append({
             **_scope_columns(scope),
             "stage_id": f"stats:{source_id}:{tournament_id}",
-            "source_stage_id": source_id,
+            "source_stage_id": _numeric_source_id(source_id),
             "stage_name": value.get("Name"),
             "stage_type": "stats",
             "template_id": _source_id(value.get("TemplateId")),

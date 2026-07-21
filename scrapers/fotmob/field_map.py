@@ -110,6 +110,7 @@ FIELD_RULES: Mapping[str, tuple[FieldRule, ...]] = {
         FieldRule("TopLists[].StatName", FieldDisposition.TYPED, "leaderboards", "stat identity"),
         FieldRule("TopLists[].StatList[].*", FieldDisposition.TYPED, "leaderboards", "all advertised leaderboard rows"),
         FieldRule("TopLists[].Subtitle", FieldDisposition.RAW_ONLY, "leaderboards", "presentation text"),
+        FieldRule("LeagueName", FieldDisposition.RAW_ONLY, "leaderboard_raw", "display label; competition identity comes from the requesting scope"),
     ),
     "transfers": (
         FieldRule("", FieldDisposition.RAW_ONLY, "transfers_raw", "JSON document root"),
@@ -118,6 +119,10 @@ FIELD_RULES: Mapping[str, tuple[FieldRule, ...]] = {
         FieldRule("pageSize", FieldDisposition.TYPED, "transfer_events", "source page size"),
         FieldRule("transfers[].*", FieldDisposition.TYPED, "transfer_events", "global transfer event including feeText/localizedFeeText/value"),
         FieldRule("transfers.*", FieldDisposition.RAW_ONLY, "transfers_raw", "transfer list/container metadata"),
+        # Appeared live on 2026-07-17 (isolated-contour acceptance run): a
+        # top-level fee-filter bound for the page's slider UI, not a transfer
+        # event attribute.
+        FieldRule("maxFee", FieldDisposition.RAW_ONLY, "transfers_raw", "fee filter bound; page chrome around the transfer stream"),
     ),
     "match": (
         FieldRule("", FieldDisposition.RAW_ONLY, "match_raw", "JSON document root"),
@@ -132,6 +137,18 @@ FIELD_RULES: Mapping[str, tuple[FieldRule, ...]] = {
         FieldRule("content.h2h.*", FieldDisposition.RAW_ONLY, "match_payloads", "head-to-head context retained as JSON"),
         FieldRule("content.momentum.*", FieldDisposition.TYPED, "match_payloads", "momentum series"),
         FieldRule("content.buzz.*", FieldDisposition.EXCLUDED, "match_payloads", "ephemeral UI engagement widget; retained in raw object"),
+        FieldRule("content.liveticker.*", FieldDisposition.RAW_ONLY, "match_raw", "live-ticker widget config; matches are ingested finished"),
+        FieldRule("content.superlive.*", FieldDisposition.RAW_ONLY, "match_raw", "SuperLive stream widget config"),
+        FieldRule("content.table.*", FieldDisposition.RAW_ONLY, "match_raw", "embedded league table; duplicate of competition standings ingestion"),
+        FieldRule("content.hasPlayoff", FieldDisposition.RAW_ONLY, "match_raw", "UI flag mirroring competition playoff structure"),
+        FieldRule("content.attackingZones.*", FieldDisposition.RAW_ONLY, "match_raw", "attacking-zones widget retained raw pending explicit modelling"),
+        FieldRule("content.highlightStories.*", FieldDisposition.RAW_ONLY, "match_raw", "video highlight stories widget; assets with viewing restrictions, not match data"),
+        FieldRule("content.heatmapUrl", FieldDisposition.RAW_ONLY, "match_raw", "external heatmap asset link"),
+        FieldRule("content.weather.*", FieldDisposition.RAW_ONLY, "match_raw", "kickoff weather widget retained raw pending explicit modelling"),
+        FieldRule("seo.*", FieldDisposition.RAW_ONLY, "match_raw", "SEO/JSON-LD page markup"),
+        FieldRule("nav.*", FieldDisposition.RAW_ONLY, "match_raw", "UI navigation metadata"),
+        FieldRule("hasPendingVAR", FieldDisposition.RAW_ONLY, "match_raw", "live VAR UI flag; matches are ingested finished"),
+        FieldRule("ongoing", FieldDisposition.RAW_ONLY, "match_raw", "live-state UI flag; matches are ingested finished"),
     ),
     "team": (
         FieldRule("", FieldDisposition.RAW_ONLY, "team_raw", "JSON document root"),
@@ -140,6 +157,13 @@ FIELD_RULES: Mapping[str, tuple[FieldRule, ...]] = {
         FieldRule("squad.*", FieldDisposition.TYPED, "squad_snapshots", "observed roster; never labelled historical"),
         FieldRule("history.*", FieldDisposition.RAW_ONLY, "team_snapshots", "team history retained as JSON"),
         FieldRule("fixtures.*", FieldDisposition.EXCLUDED, "team_snapshots", "duplicate of competition fixture ingestion"),
+        FieldRule("QAData.*", FieldDisposition.RAW_ONLY, "team_raw", "source QA/debug payload retained verbatim"),
+        FieldRule("allAvailableSeasons.*", FieldDisposition.RAW_ONLY, "team_raw", "team-page season list; duplicate of competition season ingestion"),
+        FieldRule("seostr", FieldDisposition.RAW_ONLY, "team_raw", "source presentation slug"),
+        FieldRule("stats.*", FieldDisposition.RAW_ONLY, "team_raw", "team-page leaderboard widgets; duplicate of competition leaderboard ingestion"),
+        FieldRule("table.*", FieldDisposition.RAW_ONLY, "team_raw", "embedded league table; duplicate of competition standings ingestion"),
+        FieldRule("tabs.*", FieldDisposition.RAW_ONLY, "team_raw", "UI navigation metadata"),
+        FieldRule("transfers.*", FieldDisposition.RAW_ONLY, "team_raw", "team-page transfer widget; events come from the paginated endpoint"),
     ),
     "player": (
         FieldRule("", FieldDisposition.RAW_ONLY, "player_raw", "JSON document root"),
@@ -150,6 +174,10 @@ FIELD_RULES: Mapping[str, tuple[FieldRule, ...]] = {
         FieldRule("buildId", FieldDisposition.RAW_ONLY, "player_raw", "Next.js build identity"),
         FieldRule("isFallback", FieldDisposition.RAW_ONLY, "player_raw", "Next.js framework flag"),
         FieldRule("gsp", FieldDisposition.RAW_ONLY, "player_raw", "Next.js framework flag"),
+        FieldRule("context.*", FieldDisposition.RAW_ONLY, "player_raw", "Next.js request context (locale/path/user)"),
+        FieldRule("toggles.*", FieldDisposition.RAW_ONLY, "player_raw", "feature-flag payload"),
+        FieldRule("translations.*", FieldDisposition.RAW_ONLY, "player_raw", "localization string bundle"),
+        FieldRule("url", FieldDisposition.RAW_ONLY, "player_raw", "page route echo"),
     ),
 }
 

@@ -16,11 +16,12 @@ Benefits of Iceberg:
 """
 
 import logging
+import math
 import os
 import uuid
 from collections.abc import Mapping
 from datetime import datetime
-from typing import List, Optional, Sequence, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
 import pandas as pd
@@ -163,6 +164,12 @@ class IcebergWriter:
             logger.warning(f"Could not check table existence: {e}")
             return False
 
+    @staticmethod
+    def _is_null_scalar(value: Any) -> bool:
+        if value is None or value is pd.NaT:
+            return True
+        return isinstance(value, float) and math.isnan(value)
+
     def _pandas_to_arrow(self, df: pd.DataFrame) -> pa.Table:
         """Convert pandas DataFrame to PyArrow Table.
 
@@ -179,7 +186,30 @@ class IcebergWriter:
                 # Convert to datetime64[us] which Iceberg supports
                 df[col] = df[col].astype("datetime64[us]")
 
-        return pa.Table.from_pandas(df, preserve_index=False)
+        try:
+            return pa.Table.from_pandas(df, preserve_index=False)
+        except (pa.ArrowInvalid, pa.ArrowTypeError):
+            # A source that answers with a number for one row and a word for the
+            # next (FotMob roundName: 12 vs "Round of 16") produces a mixed
+            # object column that Arrow cannot type — and this schema inference
+            # runs on EVERY write, so it fails even when the live column is
+            # already varchar. Such a column is textual by nature: the number is
+            # a label, not a measure. Stringify exactly the columns Arrow
+            # rejects and leave every other dtype untouched.
+            for col in df.columns:
+                if df[col].dtype != object:
+                    continue
+                try:
+                    pa.array(df[col])
+                except (pa.ArrowInvalid, pa.ArrowTypeError):
+                    logger.warning(
+                        f"Column '{col}' mixes incompatible types; writing it as "
+                        "text so the heterogeneous source values survive"
+                    )
+                    df[col] = df[col].map(
+                        lambda v: None if self._is_null_scalar(v) else str(v)
+                    )
+            return pa.Table.from_pandas(df, preserve_index=False)
 
     def _add_metadata_columns(
         self, df: pd.DataFrame, source: str, batch_id: Optional[str] = None

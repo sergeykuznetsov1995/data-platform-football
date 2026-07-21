@@ -44,16 +44,33 @@
 --     alias-JOIN fan-out (#465; precedent dim_match.venue_aliases / #425).
 --
 -- =============================================================================
--- Bronze column-name reference (verified via DESCRIBE on 2026-06-03)
+-- Bronze column-name reference (verified via DESCRIBE on 2026-06-03; FotMob
+-- re-verified against native bronze on 2026-07-17, #930 cutover)
 -- =============================================================================
 --   fbref_schedule.referee      : varchar (full name, e.g. 'Michael Oliver')
 --   matchhistory_results.referee : varchar ('Initial Surname', e.g. 'M Oliver')
---   fotmob_match_details.match_facts_json : varchar JSON; referee at
---       $.infoBox.Referee.text — full name, e.g. 'Michael Oliver' (issue #270).
---       Bronze keeps N ingest snapshots per match → dedup to latest below.
+--   fotmob_match_payloads_current.match_facts_json : varchar JSON; referee at
+--       $.infoBox.Referee.text — full name, e.g. 'Michael Oliver' (issue #270;
+--       json path unchanged vs legacy fotmob_match_details — verified live).
+--       The `_current` view already yields ONE committed row per match
+--       (manifest identity entity_id = match_id) → no in-SQL snapshot dedup.
+--       No league/season columns natively: league ← league_map(competition_id),
+--       season slug ← source_season_key year-start ('2025/2026' → 2025).
 -- =============================================================================
 
-WITH aliases AS (
+WITH league_map(competition_id, league) AS (
+    -- #930 cutover: native fotmob_* tables carry competition_id, not the
+    -- legacy `league` string. Reverse map of FotMobScraper.LEAGUE_IDS; the
+    -- INNER JOIN in the fotmob branch below doubles as the scope guard that
+    -- keeps the Silver surface at the same 14 leagues legacy bronze carried.
+    VALUES (47,'ENG-Premier League'),(48,'ENG-Championship'),(87,'ESP-La Liga'),
+           (54,'GER-Bundesliga'),(55,'ITA-Serie A'),(53,'FRA-Ligue 1'),
+           (57,'NED-Eredivisie'),(61,'POR-Primeira Liga'),(42,'UEFA-Champions League'),
+           (73,'UEFA-Europa League'),(77,'INT-World Cup'),(50,'INT-European Championship'),
+           (289,'INT-Africa Cup of Nations'),(44,'INT-Copa America')
+),
+
+aliases AS (
     SELECT
         -- League predicate (issue #148): each alias tagged with the competition
         -- it applies to, so the JOIN can guard on `a.league = rt.league`. APL-
@@ -113,28 +130,34 @@ raw_refs AS (
       FROM iceberg.bronze.matchhistory_results  -- #307: was matchhistory_games (referee col unchanged)
      WHERE referee IS NOT NULL AND referee <> ''
     UNION
-    -- FotMob (issue #270): referee in match_facts_json → $.infoBox.Referee.text.
-    -- Full-name form (== FBref) resolves via the bucket-agnostic alias JOIN with
-    -- zero YAML changes. Bronze keeps N ingest snapshots per match → dedup to the
-    -- latest per (match_id, league, season) before pulling the name.
+    -- FotMob (issue #270; #930 cutover to native bronze): referee in
+    -- match_facts_json → $.infoBox.Referee.text (json path unchanged).
+    -- Full-name form (== FBref) resolves via the bucket-agnostic alias JOIN
+    -- with zero YAML changes. fotmob_match_payloads_current is already ONE
+    -- committed row per match (manifest identity) → the legacy ROW_NUMBER
+    -- latest-snapshot dedup is gone. league via league_map(competition_id)
+    -- (payloads competition_id is varchar → CAST bigint); season year-start
+    -- from source_season_key ('2025/2026'/'2026' → 2025/2026) — slug derived
+    -- by league, NOT by the key's shape (single-year AFCON keys must still
+    -- produce the club-style slug, bit-compatible with legacy).
     SELECT 'fotmob' AS source, referee_name AS source_id, league,
            -- #913 Phase 2
            CASE WHEN league = 'INT-World Cup'
-                THEN LPAD(CAST(season AS varchar), 4, '0')
-                ELSE LPAD(CAST(MOD(season, 100) AS varchar), 2, '0') || LPAD(CAST(MOD(season + 1, 100) AS varchar), 2, '0')
+                THEN LPAD(CAST(season_year AS varchar), 4, '0')
+                ELSE LPAD(CAST(MOD(season_year, 100) AS varchar), 2, '0') || LPAD(CAST(MOD(season_year + 1, 100) AS varchar), 2, '0')
            END AS season  -- year-start / WC → slug (#404 + #913)
       FROM (
-          SELECT json_extract_scalar(match_facts_json, '$.infoBox.Referee.text')
+          SELECT json_extract_scalar(p.match_facts_json, '$.infoBox.Referee.text')
                      AS referee_name,
-                 league, season,
-                 ROW_NUMBER() OVER (
-                     PARTITION BY match_id, league, season
-                     ORDER BY _ingested_at DESC
-                 ) AS rn
-            FROM iceberg.bronze.fotmob_match_details
-           WHERE match_facts_json IS NOT NULL
+                 lm.league,
+                 TRY_CAST(SUBSTR(p.source_season_key, 1, 4) AS integer)
+                     AS season_year
+            FROM iceberg.bronze.fotmob_match_payloads_current p
+            JOIN league_map lm
+              ON lm.competition_id = CAST(p.competition_id AS bigint)
+           WHERE p.match_facts_json IS NOT NULL
       )
-     WHERE rn = 1 AND referee_name IS NOT NULL AND referee_name <> ''
+     WHERE referee_name IS NOT NULL AND referee_name <> ''
 ),
 
 resolved AS (

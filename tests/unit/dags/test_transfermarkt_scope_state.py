@@ -111,6 +111,32 @@ def _manifest(
     )
 
 
+def test_v3_manifest_binds_scope_player_capture_count_and_hash():
+    manifest = _manifest('GB1:2025')
+    v3 = dataclasses.replace(
+        manifest,
+        capture_revision='v3',
+        dq_evidence={
+            **manifest.dq_evidence,
+            'scope_player_capture': {
+                'row_count': 2,
+                'key_hash': 'c' * 64,
+            },
+        },
+    )
+    v3.validate(EXPECTED)
+
+    missing = dataclasses.replace(
+        v3,
+        dq_evidence={
+            key: value for key, value in v3.dq_evidence.items()
+            if key != 'scope_player_capture'
+        },
+    )
+    with pytest.raises(state.ScopeManifestError, match='lacks scope-player'):
+        missing.validate(EXPECTED)
+
+
 def test_scope_set_is_order_independent_and_accepts_older_child_revision():
     one = _manifest(
         'GB1:2025', parent_cycle_id='batch-1', reader_revision=5,

@@ -57,7 +57,11 @@
 --   whoscored_schedule    : home_team, away_team, league, season (varchar)
 --                          (NB: whoscored_events has only `team`, not home/away)
 --   sofascore_schedule    : home_team, away_team, league, season (varchar)
---   fotmob_schedule       : home_team, away_team, league, season (BIGINT)
+--   fotmob_matches_current: home_team_name, away_team_name (same source strings
+--                          as legacy fotmob_schedule home.name/away.name),
+--                          competition_id (BIGINT → league via league_map CTE),
+--                          source_season_key (varchar '2025/2026' | '2026' →
+--                          season slug) — #930 native cutover
 --   matchhistory_results  : home_team, away_team (renamed via COLUMN_MAPPING), league, season (BIGINT)
 --                          (NB: lowercase, single-token — NOT CamelCase)
 --   clubelo_ratings       : team, league (no season — see CAST(NULL AS varchar))
@@ -107,6 +111,56 @@ WITH aliases AS (
             '[^a-z0-9]+', ''
         ),
         league
+),
+
+league_map (competition_id, league) AS (
+    -- #930 cutover: legacy bronze rows carried a `league` literal; native
+    -- fotmob_matches_current carries only competition_id. Reverse map mirrors
+    -- FotMobScraper.LEAGUE_IDS (scrapers/fotmob/scraper.py). The INNER JOIN in
+    -- fotmob_matches below doubles as the scope guard: native covers the whole
+    -- FotMob catalogue, Silver must stay at these 14 leagues.
+    VALUES
+        (47,  'ENG-Premier League'),
+        (48,  'ENG-Championship'),
+        (87,  'ESP-La Liga'),
+        (54,  'GER-Bundesliga'),
+        (55,  'ITA-Serie A'),
+        (53,  'FRA-Ligue 1'),
+        (57,  'NED-Eredivisie'),
+        (61,  'POR-Primeira Liga'),
+        (42,  'UEFA-Champions League'),
+        (73,  'UEFA-Europa League'),
+        (77,  'INT-World Cup'),
+        (50,  'INT-European Championship'),
+        (289, 'INT-Africa Cup of Nations'),
+        (44,  'INT-Copa America')
+),
+
+fotmob_matches AS (
+    -- #930 cutover: native replacement for legacy bronze.fotmob_schedule.
+    -- season: source_season_key is the EXACT source string ('2025/2026' club,
+    -- '2026' single-year) — year-start = substr(key, 1, 4), then the existing
+    -- legacy slug CASE (#404 + #913): WC → 4-digit year, everything else
+    -- (incl. Euro/AFCON/Copa — bit-compatible with legacy) → 'YYyy'. NOT
+    -- derived from the key's shape (AFCON single-year key would drift).
+    -- Same expression as xref_match.sql — the two must stay in lock-step.
+    SELECT
+        home_team_name,
+        away_team_name,
+        league,
+        CASE WHEN league = 'INT-World Cup'
+             THEN LPAD(CAST(season_year AS varchar), 4, '0')
+             ELSE LPAD(CAST(MOD(season_year, 100) AS varchar), 2, '0') || LPAD(CAST(MOD(season_year + 1, 100) AS varchar), 2, '0')
+        END AS season
+    FROM (
+        SELECT
+            m.home_team_name,
+            m.away_team_name,
+            lm.league,
+            TRY_CAST(substr(m.source_season_key, 1, 4) AS integer) AS season_year
+        FROM iceberg.bronze.fotmob_matches_current m
+        JOIN league_map lm ON lm.competition_id = m.competition_id
+    ) AS scoped
 ),
 
 raw_teams AS (
@@ -200,20 +254,15 @@ END AS season  -- year-start / WC direct → slug (#404 + #913)
       FROM iceberg.bronze.sofascore_schedule WHERE COALESCE(away_team, away_team_name) IS NOT NULL
 
     UNION
-    -- ===== fotmob =====
-    SELECT 'fotmob' AS source, home_team AS source_id, league, -- #913 Phase 2: single_year support
-CASE WHEN league = 'INT-World Cup'
-     THEN LPAD(CAST(season AS varchar), 4, '0')
-     ELSE LPAD(CAST(MOD(season, 100) AS varchar), 2, '0') || LPAD(CAST(MOD(season + 1, 100) AS varchar), 2, '0')
-END AS season  -- year-start / WC direct → slug (#404 + #913)
-      FROM iceberg.bronze.fotmob_schedule WHERE home_team IS NOT NULL
+    -- ===== fotmob (#930 cutover: native fotmob_matches_current) =====
+    -- Team-name strings are identical to legacy (same `home.name`/`away.name`
+    -- source field), so alias-YAML matching and canonical_id do not move;
+    -- league/season are reconstructed in the fotmob_matches CTE above.
+    SELECT 'fotmob' AS source, home_team_name AS source_id, league, season
+      FROM fotmob_matches WHERE home_team_name IS NOT NULL
     UNION
-    SELECT 'fotmob' AS source, away_team AS source_id, league, -- #913 Phase 2: single_year support
-CASE WHEN league = 'INT-World Cup'
-     THEN LPAD(CAST(season AS varchar), 4, '0')
-     ELSE LPAD(CAST(MOD(season, 100) AS varchar), 2, '0') || LPAD(CAST(MOD(season + 1, 100) AS varchar), 2, '0')
-END AS season  -- year-start / WC direct → slug (#404 + #913)
-      FROM iceberg.bronze.fotmob_schedule WHERE away_team IS NOT NULL
+    SELECT 'fotmob' AS source, away_team_name AS source_id, league, season
+      FROM fotmob_matches WHERE away_team_name IS NOT NULL
 
     UNION
     -- ===== matchhistory (#307: cols renamed home_team/away_team via COLUMN_MAPPING) =====

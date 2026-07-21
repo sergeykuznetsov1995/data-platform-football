@@ -143,6 +143,7 @@ from scrapers.whoscored.proxy_campaign import (  # noqa: E402 - standalone entry
     approval_from_campaign_authority_context,
     approval_from_context,
     canonical_json_bytes,
+    daily_ingest_paid_crawl_allowed,
     strict_json_loads,
 )
 
@@ -191,6 +192,7 @@ FBREF_DAG_IDS = frozenset(
         "dag_ingest_fbref",
         "dag_bootstrap_fbref",
         "dag_backfill_fbref",
+        "dag_accept_fbref_bronze",
     }
 )
 SOFASCORE_DAG_IDS = frozenset({"dag_ingest_sofascore"})
@@ -2396,7 +2398,16 @@ def _create_lease(
                 raise ProxyCampaignValidationError(
                     "WhoScored canary approval must match the exact 1 GB contract"
                 )
-        elif not WHOSCORED_FULL_PAID_CRAWL_AVAILABLE:
+        elif not (
+            (
+                proxy_campaign_approval.allowed_dag_ids
+                and all(
+                    daily_ingest_paid_crawl_allowed(dag_id)
+                    for dag_id in proxy_campaign_approval.allowed_dag_ids
+                )
+            )
+            or WHOSCORED_FULL_PAID_CRAWL_AVAILABLE
+        ):
             raise ProxyCampaignValidationError(
                 "WhoScored full paid crawl is disabled pending exact reconciliation"
             )

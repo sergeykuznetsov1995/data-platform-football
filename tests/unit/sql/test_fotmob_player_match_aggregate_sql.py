@@ -1,7 +1,10 @@
 """Structural smoke for ``dags/sql/silver/fotmob_player_match_aggregate.sql``.
 
 Issue #691: silver player×match aggregate parsed from
-``bronze.fotmob_match_details.player_stats_json``. Full column-parity mirror of
+``player_stats_json``; #930 cutover: source is native
+``bronze.fotmob_match_payloads_current`` (+ ``fotmob_matches_current`` for team
+names, ``league_map`` for the legacy 14-league scope) instead of legacy
+``bronze.fotmob_match_details``. Full column-parity mirror of
 ``sofascore_player_match_aggregate`` so the 5-source Gold ``fct_player_match``
 COALESCE compares identically-named columns.
 
@@ -48,10 +51,29 @@ def _output_aliases(sql: str) -> set:
 
 class TestFotmobPlayerMatchAggregateSql:
 
-    def test_reads_bronze_match_details(self):
+    def test_reads_native_payloads_with_matches_join(self):
+        """#930: stats come from native match_payloads_current; team names live
+        only in matches_current (payloads carry ids only) → both must be read;
+        legacy bronze.fotmob_match_details must be gone."""
         sql = _strip_comments(_read(SQL_PATH))
-        assert "iceberg.bronze.fotmob_match_details" in sql
+        assert "iceberg.bronze.fotmob_match_payloads_current" in sql
+        assert "iceberg.bronze.fotmob_matches_current" in sql
         assert "player_stats_json" in sql
+        assert "bronze.fotmob_match_details" not in sql
+
+    def test_league_reconstructed_via_league_map(self):
+        """Native has no `league` string — it is rebuilt from competition_id
+        via the static league_map CTE; the INNER JOIN scopes output to the
+        same 14 legacy leagues. payloads.competition_id is varchar vs
+        matches.competition_id bigint → explicit CAST required."""
+        sql = _strip_comments(_read(SQL_PATH))
+        assert re.search(r"league_map\s*\(\s*competition_id\s*,\s*league\s*\)", sql), (
+            "expected static league_map CTE (competition_id → legacy league string)"
+        )
+        assert "'ENG-Premier League'" in sql
+        assert re.search(
+            r"CAST\s*\(\s*p\.competition_id\s+AS\s+bigint\s*\)", sql, re.I
+        ), "payloads.competition_id (varchar) must be CAST to bigint for the matches JOIN"
 
     def test_grain_columns_projected(self):
         """PK grain (match_id, player_id, league, season) must be projected."""
@@ -60,14 +82,21 @@ class TestFotmobPlayerMatchAggregateSql:
             assert re.search(rf"\b{col}\b", sql), f"grain column `{col}` missing"
 
     def test_dedup_row_number_on_match(self):
-        """Defensive bronze dedup on (match_id, league, season)."""
+        """Defensive dedup on (match_id, league, season). `*_current` already
+        yields one row per match, but the guard stays; native has no _batch_id
+        → tiebreak must be _observed_at + _target_batch_id."""
         sql = _read(SQL_PATH)
         assert re.search(r"ROW_NUMBER\s*\(\s*\)\s*OVER", sql, re.I), (
-            "expected ROW_NUMBER dedup of bronze rows"
+            "expected defensive ROW_NUMBER dedup"
         )
         assert re.search(
             r"PARTITION\s+BY\s+match_id\s*,\s*league\s*,\s*season", sql, re.I
         )
+        assert re.search(
+            r"ORDER\s+BY\s+_observed_at\s+DESC\s*,\s*_target_batch_id\s+DESC",
+            sql,
+            re.I,
+        ), "dedup tiebreak must use _target_batch_id (native has no _batch_id)"
 
     def test_two_level_json_flatten(self):
         """player_stats_json is flattened: map_entries over players + UNNEST of
@@ -78,11 +107,17 @@ class TestFotmobPlayerMatchAggregateSql:
         assert "'$.stat.value'" in sql, "stat value path must be $.stat.value"
 
     def test_season_emitted_as_slug(self):
-        """Bronze season = bigint year-start (2025) → emit slug '2526' via
-        LPAD(MOD(...)) (matches xref_player + other Silver tables)."""
+        """Native season = varchar source_season_key ('2025/2026' / '2026') →
+        year-start via substr(key, 1, 4), then emit slug '2526' via
+        LPAD(MOD(...)) (matches xref_player + other Silver tables). The slug
+        must NOT be derived from the key's shape (single-year AFCON keys would
+        diverge from legacy)."""
         sql = _read(SQL_PATH)
+        assert re.search(
+            r"substr\s*\(\s*p\.source_season_key\s*,\s*1\s*,\s*4\s*\)", sql, re.I
+        ), "season year-start must come from substr(source_season_key, 1, 4)"
         assert re.search(r"MOD\s*\(\s*season", sql, re.I), (
-            "season must be converted bigint year-start → slug via MOD(season,100)"
+            "season must be converted year-start → slug via MOD(season,100)"
         )
 
     def test_modeled_xg_xa_zero_filled(self):

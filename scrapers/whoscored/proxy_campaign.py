@@ -45,9 +45,11 @@ WHOSCORED_PROVIDER_INVOICE_HARD_CAP_AVAILABLE = True
 # validates the exact URL/TLS origin, owns browser sessions and receipts, and
 # keeps approval/ledger/alert authorities out of source subprocesses.
 WHOSCORED_PAID_APPLICATION_GATEWAY_AVAILABLE = True
-# The measurement canary and a full paid crawl have intentionally separate
-# release gates. Normal ingest/backfill reconciliation is not yet strong enough
-# to authorize provider spend even after the canary boundary exists.
+# The measurement canary, daily ingest and the full paid crawl have
+# intentionally separate release gates. Daily ingest is admitted to the paid
+# path via WHOSCORED_DAILY_INGEST_PAID_CRAWL_AVAILABLE below -- its incremental,
+# bounded active-scope workload is authorized for provider spend. The immutable
+# all-catalog backfill stays gated here pending exact reconciliation.
 WHOSCORED_FULL_PAID_CRAWL_AVAILABLE = False
 WHOSCORED_CANARY_CAP_BYTES = 1_000_000_000
 WHOSCORED_CANARY_DISCOVERY_CAP_BYTES = 250_000_000
@@ -101,6 +103,14 @@ WHOSCORED_PAID_DAG_IDS = frozenset(
         WHOSCORED_CANARY_DAG_ID,
     }
 )
+
+# Daily ingest has its own paid-crawl release gate, separate from the exact
+# 1 GB measurement canary and from the full paid crawl. Only the incremental
+# daily ingest DAG is admitted here; the immutable all-catalog backfill stays
+# gated behind WHOSCORED_FULL_PAID_CRAWL_AVAILABLE pending exact reconciliation.
+# Membership is code-owned; the signing CLI cannot enlarge it.
+WHOSCORED_DAILY_INGEST_PAID_CRAWL_AVAILABLE = True
+WHOSCORED_DAILY_INGEST_PAID_CRAWL_DAG_IDS = frozenset({WHOSCORED_INGEST_DAG_ID})
 
 WHOSCORED_PROXY_ALLOWED_HOSTS = frozenset(
     {
@@ -3436,6 +3446,23 @@ def _ledger_secret_from_environment(environ: Mapping[str, str]) -> str:
     return str(environ.get(PROXY_LEDGER_HMAC_SECRET_ENV, "")).strip()
 
 
+def daily_ingest_paid_crawl_allowed(dag_id: str) -> bool:
+    """Return whether *dag_id* is admitted to the daily-ingest paid crawl gate.
+
+    Daily ingest is released to the paid path ahead of the full crawl: only the
+    incremental daily ingest DAG is admitted here, while the immutable
+    all-catalog backfill stays gated behind
+    ``WHOSCORED_FULL_PAID_CRAWL_AVAILABLE``.  Membership is code-owned; no
+    environment variable, DagRun conf value or signed-approval field can
+    enlarge it.
+    """
+
+    return (
+        WHOSCORED_DAILY_INGEST_PAID_CRAWL_AVAILABLE
+        and dag_id in WHOSCORED_DAILY_INGEST_PAID_CRAWL_DAG_IDS
+    )
+
+
 def _assert_paid_release_gates(
     approval: ProxyCampaignApproval,
 ) -> None:
@@ -3454,7 +3481,16 @@ def _assert_paid_release_gates(
             raise ProxyCampaignValidationError(
                 "WhoScored canary approval must match the exact 1 GB contract"
             )
-    elif not WHOSCORED_FULL_PAID_CRAWL_AVAILABLE:
+    elif not (
+        (
+            approval.allowed_dag_ids
+            and all(
+                daily_ingest_paid_crawl_allowed(dag_id)
+                for dag_id in approval.allowed_dag_ids
+            )
+        )
+        or WHOSCORED_FULL_PAID_CRAWL_AVAILABLE
+    ):
         raise ProxyCampaignValidationError(
             "WhoScored full paid crawl is disabled pending exact reconciliation"
         )
