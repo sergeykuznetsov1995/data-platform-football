@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 import sys
 from datetime import datetime, timedelta, timezone
@@ -23,6 +24,7 @@ from scrapers.transfermarkt.models import (
 from scrapers.transfermarkt.registry import (
     AgeCategory,
     ClassificationEvidence,
+    CompetitionParticipant,
     CompetitionRecord,
     CompetitionType,
     EditionRecord,
@@ -31,6 +33,7 @@ from scrapers.transfermarkt.registry import (
     RegistryPage,
     SeasonFormat,
     TeamType,
+    participant_list_hash,
 )
 
 
@@ -117,6 +120,23 @@ def _page(*, page_number: int = 1, page_count: int = 1) -> RegistryPage:
         registry_snapshot_id=SNAPSHOT_ID,
         source_body_hash="2" * 64,
     )
+    participants = tuple(
+        CompetitionParticipant(
+            competition_id=competition_id,
+            edition_id="2025",
+            team_id=f"{competition_id}-{team_number}",
+            team_name=f"{competition_id} Team {team_number}",
+            source_url=(
+                "https://www.transfermarkt.com/club/startseite/verein/"
+                f"{competition_id}{team_number}"
+            ),
+            discovered_at=NOW,
+            registry_snapshot_id=SNAPSHOT_ID,
+            source_body_hash=body_hash,
+        )
+        for competition_id, body_hash in (("GB1", "3" * 64), ("UNK", "4" * 64))
+        for team_number in (1, 2)
+    )
     editions = tuple(
         EditionRecord(
             competition_id=competition_id,
@@ -128,16 +148,23 @@ def _page(*, page_number: int = 1, page_count: int = 1) -> RegistryPage:
             end_date="2026-05-31",
             active=True,
             current=True,
-            participant_count=0,
-            participant_hash=(
-                "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+            participant_count=len(exact),
+            participant_hash=participant_list_hash(exact),
+            source_url=(
+                f"https://www.transfermarkt.com/{competition_id}/saison_id/2025"
             ),
-            source_url=f"https://www.transfermarkt.com/{competition_id}/saison_id/2025",
             discovered_at=NOW,
             registry_snapshot_id=SNAPSHOT_ID,
             source_body_hash=body_hash,
         )
         for competition_id, body_hash in (("GB1", "3" * 64), ("UNK", "4" * 64))
+        for exact in (
+            tuple(
+                participant
+                for participant in participants
+                if participant.competition_id == competition_id
+            ),
+        )
     )
     return RegistryPage(
         snapshot_id=SNAPSHOT_ID,
@@ -147,6 +174,7 @@ def _page(*, page_number: int = 1, page_count: int = 1) -> RegistryPage:
         source_body_hash="5" * 64,
         competitions=(eligible, unknown),
         editions=editions,
+        participants=participants,
     )
 
 
@@ -159,6 +187,7 @@ class _FakeClient:
         self.cache = kwargs["cache"]
         self.rate_limiter = kwargs.get("rate_limiter")
         self.fetch_calls: list[dict] = []
+        self.raw_captures: list[dict] = []
         self.retries = 0
         self.request_budget = None
         self.closed = False
@@ -173,6 +202,41 @@ class _FakeClient:
     def fetch(self, url, **kwargs):
         self.fetch_calls.append({"url": url, **kwargs})
         body = "<html><body><main>catalog</main></body></html>"
+        body_bytes = body.encode()
+        content_hash = hashlib.sha256(body_bytes).hexdigest()
+        capture_id = hashlib.sha256(
+            f"{url}\0{len(self.fetch_calls)}".encode()
+        ).hexdigest()
+        context = kwargs["context"]
+        self.raw_captures.append({
+            "manifest_version": "transfermarkt-raw-v1",
+            "capture_id": capture_id,
+            "source": "transfermarkt",
+            "cycle_id": context["cycle_id"],
+            "scope_id": context["scope_id"],
+            "endpoint": kwargs["label"],
+            "attempt": len(self.fetch_calls),
+            "url": url,
+            "status_code": 200,
+            "headers": {"content-type": "text/html; charset=utf-8"},
+            "content_type": "text/html; charset=utf-8",
+            "content_hash": content_hash,
+            "hash_algorithm": "sha256",
+            "blob_key": (
+                f"blobs/sha256/{content_hash[:2]}/{content_hash}.body.gz"
+            ),
+            "raw_uri": (
+                "s3://raw-bucket/transfermarkt/blobs/sha256/"
+                f"{content_hash[:2]}/{content_hash}.body.gz"
+            ),
+            "compression": "gzip",
+            "fetched_at": NOW.isoformat(),
+            "decoded_bytes": len(body_bytes),
+            "stored_bytes": len(body_bytes) + 20,
+            "raw_capture_id": capture_id,
+            "raw_body_hash": content_hash,
+            "raw_fetched_at": NOW.isoformat(),
+        })
         self.ledger.observe_lease(
             "fake-lease",
             LeaseTrafficSnapshot(up_bytes=10, down_bytes=90),
@@ -200,6 +264,9 @@ class _FakeClient:
             provider_metered_bytes=100,
             payload_hash=stable_payload_hash(body),
         )
+
+    def get_raw_capture_records(self):
+        return tuple(self.raw_captures)
 
     def close(self):
         self.closed = True
@@ -398,8 +465,10 @@ def test_cached_dry_run_retains_unknown_but_never_emits_its_scope(tmp_path):
     )
 
     assert result.manifest["rows"] == {
+        "raw_responses": 0,
         "competitions": 2,
         "competition_editions": 2,
+        "competition_participants": 4,
     }
     assert result.manifest["classification_counts"] == {
         "eligible": 1,
@@ -478,17 +547,33 @@ def test_approved_production_is_metered_and_writes_one_batch_per_table(
     assert journal.get(paid_packet.packet_hash).status == "consumed"
     assert write_packet is not None
     assert journal.get(write_packet.packet_hash).status == "consumed"
-    assert len(writer.calls) == 2
+    assert len(writer.calls) == 4
     assert [call["table"] for call in writer.calls] == [
+        "transfermarkt_raw_responses",
         "transfermarkt_competitions",
         "transfermarkt_competition_editions",
+        "transfermarkt_competition_participants",
     ]
     assert all(call["add_metadata"] is False for call in writer.calls)
     assert all(call["mode"] == "append" for call in writer.calls)
     assert all(call["delete_filter"].endswith(f"'{SNAPSHOT_ID}'") for call in writer.calls)
-    assert tuple(writer.calls[0]["frame"].columns) == mod.COMPETITION_COLUMNS
-    assert tuple(writer.calls[1]["frame"].columns) == mod.EDITION_COLUMNS
-    assert set(writer.calls[0]["frame"]["competition_id"]) == {"GB1", "UNK"}
+    assert tuple(writer.calls[0]["frame"].columns) == mod.RAW_RESPONSE_COLUMNS
+    assert tuple(writer.calls[1]["frame"].columns) == mod.COMPETITION_COLUMNS
+    assert tuple(writer.calls[2]["frame"].columns) == mod.EDITION_COLUMNS
+    assert tuple(writer.calls[3]["frame"].columns) == mod.PARTICIPANT_COLUMNS
+    assert set(writer.calls[1]["frame"]["competition_id"]) == {"GB1", "UNK"}
+    assert set(writer.calls[3]["frame"]["team_id"]) == {
+        "GB1-1", "GB1-2", "UNK-1", "UNK-2",
+    }
+    assert result.manifest["rows"] == {
+        "raw_responses": 1,
+        "competitions": 2,
+        "competition_editions": 2,
+        "competition_participants": 4,
+    }
+    assert result.manifest["expected_entities"] == list(mod.EXPECTED_ENTITIES)
+    assert result.manifest["target_tables"] == list(mod.TARGET_TABLES)
+    assert result.manifest["raw_response_set"]["response_count"] == 1
     assert result.manifest["traffic"]["requests"] == 1
     assert result.manifest["traffic"]["provider_metered_bytes"] == 100
     assert result.manifest["traffic"]["by_entity"]["competition_registry"][
@@ -577,17 +662,25 @@ def test_http_zero_writes_atomic_terminal_manifest_and_never_touches_bronze(
         "entity": "competition_registry",
     }
     assert failure["expected_entities"] == [
+        "raw_responses",
         "competitions",
         "competition_editions",
+        "competition_participants",
     ]
+    assert failure["target_tables"] == list(mod.TARGET_TABLES)
     assert failure["rows"] == {
+        "raw_responses": None,
         "competitions": None,
         "competition_editions": None,
+        "competition_participants": None,
     }
     assert failure["hashes"] == {
+        "raw_responses": None,
         "competitions": None,
         "competition_editions": None,
+        "competition_participants": None,
     }
+    assert failure["raw_response_set"] is None
     assert failure["authoritative_empty"] is False
     assert failure["not_applicable"] is False
     assert failure["source_status"] == "failed"
@@ -645,20 +738,33 @@ def test_post_validation_write_failure_keeps_exact_row_hashes(
         )
 
     snapshot = mod.reconcile_registry_pages((_page(),))
-    competition_rows, edition_rows, _ = mod._flatten_snapshot(
+    competition_rows, edition_rows, participant_rows, _ = mod._flatten_snapshot(
         snapshot,
         cycle_id="tm-registry-20260711",
         fetched_at=NOW,
     )
+    raw_response_rows = mod._flatten_raw_captures(
+        _FakeClient.instances[-1].get_raw_capture_records(),
+        cycle_id="tm-registry-20260711",
+        snapshot_id=SNAPSHOT_ID,
+        ingested_at=NOW,
+    )
     failure = raised.value.manifest
     assert failure["rows"] == {
+        "raw_responses": 1,
         "competitions": 2,
         "competition_editions": 2,
+        "competition_participants": 4,
     }
     assert failure["hashes"] == {
+        "raw_responses": mod.stable_payload_hash(raw_response_rows),
         "competitions": mod.stable_payload_hash(competition_rows),
         "competition_editions": mod.stable_payload_hash(edition_rows),
+        "competition_participants": mod.stable_payload_hash(participant_rows),
     }
+    assert failure["raw_response_set"] == mod._raw_response_set(
+        raw_response_rows
+    )
     assert failure["source_status"] == "success"
     assert failure["dq"]["status"] == "passed"
     assert failure["write_status"]["status"] == "failed_or_partial"
@@ -762,8 +868,10 @@ def test_standing_policy_run_writes_bronze_without_journal(
     result = _execute_standing(mod, tmp_path, raw, writer=writer)
 
     assert [call["table"] for call in writer.calls] == [
+        "transfermarkt_raw_responses",
         "transfermarkt_competitions",
         "transfermarkt_competition_editions",
+        "transfermarkt_competition_participants",
     ]
     manifest = result.manifest
     assert manifest["approval_mode"] == "standing_policy"
