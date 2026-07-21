@@ -1399,5 +1399,5 @@ class TestReaderPreflight:
         result = dag_module._preflight_reader_route_for_paid_cycle()
         assert result['revision'] == 9
         assert result['candidate_slot'] == 'b'
-        assert result['write_mode'] == 'dual'
+        assert result['write_mode'] == 'native-only'
         assert result['paid_io_allowed'] is True
