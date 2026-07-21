@@ -17,8 +17,12 @@
 --     (varchar), fee_value (double), market_value (число; legacy — varchar),
 --     on_loan (boolean), transfer_type_key / transfer_type_text (varchar);
 --     плюс competition_id (VARCHAR!) вместо league и event_year вместо season.
---   ⚠ БЛОКЕР ДАННЫХ: entity `transfers` ещё не гонялась — включать таблицу в
---     DAG только после появления fotmob_transfer_events_current в bronze.
+--   ⚠ (снят 2026-07-21) fotmob_transfer_events_current существует и наполнен —
+--     transfers отработали в бэкфилле #930 (158/158).
+--   bronze.fotmob_transfers (замороженная legacy-таблица) — UNION ALL как
+--     история: лента трансферов у источника скользящая, legacy наблюдал окна,
+--     которых native уже не видел (parity #930: overlap ~44/200 на лигу).
+--     Native при совпадении PK побеждает (src_priority в dedup).
 --
 -- Notes:
 --   * `fee_text` НЕ переносим (native его заполняет, но контракт Silver прежний).
@@ -71,15 +75,45 @@ events AS (
         t.position_label,
         t.position_key,
         t.fee_value,
-        t.market_value,
+        CAST(t.market_value AS varchar) AS market_value,
         t.on_loan,
         t.transfer_type_key,
         t.transfer_type_text,
         lm.league,
         t._observed_at,
-        t._target_batch_id
+        t._target_batch_id,
+        1 AS src_priority
     FROM iceberg.bronze.fotmob_transfer_events_current t
     JOIN league_map lm ON lm.competition_id = CAST(t.competition_id AS bigint)
+    WHERE t.player_id IS NOT NULL
+      AND TRY_CAST(SUBSTR(t.transfer_date, 1, 10) AS DATE) IS NOT NULL
+
+    UNION ALL
+
+    -- Замороженная legacy-история (лента скользящая — см. шапку). Скоуп тот же
+    -- league_map; legacy несёт league-слаг напрямую.
+    SELECT
+        t.player_id,
+        t.player_name,
+        t.transfer_date,
+        TRY_CAST(SUBSTR(t.transfer_date, 1, 10) AS DATE) AS transfer_date_parsed,
+        t.from_club_id,
+        t.from_club_full_name,
+        t.to_club_id,
+        t.to_club_full_name,
+        t.position_label,
+        t.position_key,
+        t.fee_value,
+        t.market_value,
+        t.on_loan,
+        t.transfer_type_key,
+        t.transfer_type_text,
+        lm.league,
+        t._ingested_at AS _observed_at,
+        t._batch_id AS _target_batch_id,
+        0 AS src_priority
+    FROM iceberg.bronze.fotmob_transfers t
+    JOIN league_map lm ON lm.league = t.league
     WHERE t.player_id IS NOT NULL
       AND TRY_CAST(SUBSTR(t.transfer_date, 1, 10) AS DATE) IS NOT NULL
 ),
@@ -102,7 +136,7 @@ bronze_dedup AS (
             s.*,
             ROW_NUMBER() OVER (
                 PARTITION BY player_id, from_club_id, to_club_id, transfer_date, league, season_year
-                ORDER BY _observed_at DESC, _target_batch_id DESC
+                ORDER BY src_priority DESC, _observed_at DESC, _target_batch_id DESC
             ) AS rn
         FROM seasoned s
     )
