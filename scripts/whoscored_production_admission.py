@@ -3493,6 +3493,9 @@ def _validate_bind_source_policy(
         )
     _assert_separate_mounts(
         {
+            "fotmob-admission": sources[
+                ("airflow-scheduler", "/opt/airflow/fotmob-admission")
+            ],
             "scheduler-logs": sources[("airflow-scheduler", "/opt/airflow/logs")],
             "gateway-state": sources[
                 (
@@ -3506,14 +3509,6 @@ def _validate_bind_source_policy(
                     "/opt/airflow/state/whoscored-proxy-filter",
                 )
             ],
-        },
-        label="WhoScored writable state",
-    )
-    _assert_separate_mounts(
-        {
-            "fotmob-admission": sources[
-                ("airflow-scheduler", "/opt/airflow/fotmob-admission")
-            ],
             "scheduler-approvals": sources[
                 ("airflow-scheduler", "/opt/airflow/secure/whoscored-approvals")
             ],
@@ -3524,7 +3519,7 @@ def _validate_bind_source_policy(
                 )
             ],
         },
-        label="WhoScored authority",
+        label="protected runtime",
     )
 
 

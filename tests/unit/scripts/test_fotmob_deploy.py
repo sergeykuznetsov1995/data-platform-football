@@ -422,6 +422,7 @@ def _shared_handoff_runner(
     mount_source=None,
     mount_type="bind",
     mount_rw=False,
+    extra_mounts=(),
     report_path="/opt/airflow/fotmob-admission/deployment.json",
 ):
     remote_digests = _shared_runtime_digests(root)
@@ -447,7 +448,8 @@ def _shared_handoff_runner(
                         "Source": str(mount_source or root.resolve()),
                         "Destination": "/opt/airflow/fotmob-admission",
                         "RW": mount_rw,
-                    }
+                    },
+                    *extra_mounts,
                 ]
             )
         elif command[-2:] == ("printenv", "FBREF_CONTROL_DB_URI"):
@@ -593,6 +595,36 @@ def test_shared_handoff_rejects_different_resolved_evidence_source(tmp_path):
     )
 
     with pytest.raises(mod.DeploymentError, match="exact read-only evidence directory"):
+        _validate_shared_handoff(
+            tmp_path,
+            "shared-scheduler",
+            "postgresql://control@postgres/control",
+            run=runner,
+        )
+
+
+@pytest.mark.parametrize("relation", ["parent", "child"])
+def test_shared_handoff_rejects_writable_alias_or_nested_mount(tmp_path, relation):
+    _shared_runtime_digests(tmp_path)
+    if relation == "parent":
+        writable_source = tmp_path.parent
+    else:
+        writable_source = tmp_path / "writable-child"
+        writable_source.mkdir()
+    runner = _shared_handoff_runner(
+        tmp_path,
+        _orchestration_payload(),
+        extra_mounts=(
+            {
+                "Type": "bind",
+                "Source": str(writable_source.resolve()),
+                "Destination": "/opt/airflow/logs",
+                "RW": True,
+            },
+        ),
+    )
+
+    with pytest.raises(mod.DeploymentError, match="aliases or nests"):
         _validate_shared_handoff(
             tmp_path,
             "shared-scheduler",

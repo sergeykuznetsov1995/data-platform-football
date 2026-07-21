@@ -88,7 +88,7 @@
     "scripts/research/whoscored_capacity_worker_exec.py": "56e1e498c8773ef7b422912e1acb8e498552ce42d547727dd2b5a58595868273",
     "scripts/validate_whoscored_build_provenance.py": "abd196849a2d15b2b297bee8ee202ede743ecbfa941f3047031152815608aa3d",
     "scripts/whoscored_paid_gateway.py": "5f55cf1ff31f3f2345ea4d71bb68f0650a0ba35f760ae1292d2a8bfc35c41873",
-    "scripts/whoscored_production_admission.py": "56bdc0906f8f67c15bba14fc67991a90743f8495f3cb57484895a3b47173af58",
+    "scripts/whoscored_production_admission.py": "a6d0214bc38f90dc5b834583deded4b4cc3183a0594b68517efaf4bfe1e90a0c",
     "scripts/whoscored_proxy_campaign.py": "ff791fcb7f2eb98e9a122e099a209df644c26182c09577a4c172d18adbb5bf49",
     "scripts/whoscored_raw_backup.py": "b0b57826a9920f29802681244ecb681c21b7e42ccc77dd062e004bdc68bbd190",
     "scripts/whoscored_v2_object_contract.py": "479585b880163274d0d496b52d04454a0e6331e89cf2a4b984c60a6d40868f9e"

@@ -24,7 +24,9 @@ production `FBREF_CONTROL_DB_URI`: через неё fenced publication generati
    `FOTMOB_SHARED_DEPLOYMENT_REPORT_PATH=/opt/airflow/fotmob-admission/deployment.json`.
    Shared compose монтирует весь каталог отдельно read-only; нельзя использовать
    file bind, потому что atomic replacement отчёта меняет inode, и нельзя
-   давать task-ам второй writable mount того же каталога. Shared scheduler
+   давать task-ам второй writable mount того же каталога или его parent/child.
+   Deploy сверяет inode и canonical paths всех writable bind/volume mounts;
+   вложенность с logs/state fail-closed. Shared scheduler
    должен быть создан с этим mount до admission и не пересоздаваться между
    созданием report и shared fallback: report привязан к его full container ID.
    Каталог обязан существовать до `docker compose up` (`create_host_path=false`

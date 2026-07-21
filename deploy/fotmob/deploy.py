@@ -668,6 +668,34 @@ def validate_shared_admission_mount(
             "evidence directory"
         )
 
+    evidence_stat = observed_source.stat()
+    for other in mounts:
+        if (
+            other is mount
+            or not isinstance(other, Mapping)
+            or other.get("Type") not in {"bind", "volume"}
+            or other.get("RW") is not True
+        ):
+            continue
+        other_source_value = str(other.get("Source", "")).strip()
+        try:
+            other_source = Path(other_source_value).resolve(strict=True)
+            other_stat = other_source.stat()
+        except OSError as exc:
+            raise DeploymentError(
+                "shared scheduler writable mount source is unavailable"
+            ) from exc
+        if (
+            (evidence_stat.st_dev, evidence_stat.st_ino)
+            == (other_stat.st_dev, other_stat.st_ino)
+            or observed_source in other_source.parents
+            or other_source in observed_source.parents
+        ):
+            raise DeploymentError(
+                "shared FotMob evidence aliases or nests with a writable "
+                "scheduler mount"
+            )
+
     observed_report = run(
         (
             "docker",

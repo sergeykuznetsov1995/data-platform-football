@@ -733,6 +733,29 @@ def test_bind_source_policy_requires_preexisting_separate_protected_paths(
     with pytest.raises(admission.AdmissionError, match="alias or nest"):
         admission._validate_bind_source_policy(projections, root=root)
 
+    rendered = _rendered()
+    nested_case = tmp_path / "nested-case"
+    nested_case.mkdir()
+    root = _materialize_bind_sources(rendered, nested_case)
+    scheduler_logs = Path(
+        _bind_volume(
+            rendered,
+            service="airflow-scheduler",
+            target="/opt/airflow/logs",
+        )["source"]
+    )
+    nested_admission = scheduler_logs / "fotmob-admission"
+    nested_admission.mkdir()
+    nested_admission.chmod(0o700)
+    _bind_volume(
+        rendered,
+        service="airflow-scheduler",
+        target="/opt/airflow/fotmob-admission",
+    )["source"] = str(nested_admission)
+    projections = admission.verify_rendered_compose(rendered, BINDINGS)
+    with pytest.raises(admission.AdmissionError, match="unsafe|alias or nest"):
+        admission._validate_bind_source_policy(projections, root=root)
+
 
 def test_bind_source_policy_rejects_auto_create_and_writable_release_code(
     tmp_path: Path,
