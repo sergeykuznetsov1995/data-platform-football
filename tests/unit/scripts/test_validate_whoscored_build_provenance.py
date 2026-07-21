@@ -52,10 +52,10 @@ DOWNLOAD_RUN = (
     f'echo "{SHA_B}  /tmp/Release" | sha256sum -c - && '
     'test "$(stat -c %s /tmp/Release)" -eq 1234'
 )
-BOUNDED_RETRY_CURL_FLAGS = (
+BOUNDED_CURL_FLAGS = (
     "--proto '=https' --tlsv1.2 --proto-redir '=https' "
     "--connect-timeout 20 --speed-limit 1024 --speed-time 60 "
-    "--max-time 600 --retry 2 --retry-delay 5 --retry-max-time 600 -fsSL"
+    "--max-time 2400 -fsSL"
 )
 
 def _write(path: Path, value: str | bytes) -> None:
@@ -1126,7 +1126,7 @@ def test_download_receipt_must_bind_fetch_output_hash_and_size(tmp_path: Path) -
     "curl_flags",
     [
         "--proto '=https' --tlsv1.2 --proto-redir '=https' -fsSL",
-        BOUNDED_RETRY_CURL_FLAGS,
+        BOUNDED_CURL_FLAGS,
     ],
 )
 def test_download_receipt_accepts_exact_https_only_curl_flags(
@@ -1145,17 +1145,15 @@ def test_download_receipt_accepts_exact_https_only_curl_flags(
         ("--connect-timeout 20", "--connect-timeout 0"),
         ("--speed-limit 1024", "--speed-limit 0"),
         ("--speed-time 60", "--speed-time 0"),
-        ("--max-time 600", "--max-time 0"),
-        ("--retry 2", "--retry 20"),
-        ("--retry-max-time 600", "--retry-max-time 0"),
+        ("--max-time 2400", "--max-time 0"),
     ],
 )
-def test_download_receipt_rejects_relaxed_bounded_retry_curl_flags(
+def test_download_receipt_rejects_relaxed_bounded_curl_flags(
     bounded_flag: str, unsafe_value: str
 ) -> None:
     command = DOWNLOAD_RUN.removeprefix("RUN ").replace(
         "curl -fsSL",
-        f"curl {BOUNDED_RETRY_CURL_FLAGS.replace(bounded_flag, unsafe_value)}",
+        f"curl {BOUNDED_CURL_FLAGS.replace(bounded_flag, unsafe_value)}",
         1,
     )
 
