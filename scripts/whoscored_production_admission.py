@@ -47,7 +47,17 @@ _WHOSCORED_APPROVAL_PATH_RE = re.compile(
     r"/opt/airflow/secure/whoscored-approvals/"
     r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\.json"
 )
-def _load_exact_provenance_validator() -> types.ModuleType:
+def _trusted_source_uids(*, require_protected: bool) -> frozenset[int]:
+    """Return owners accepted for the exact sibling source load."""
+
+    if require_protected:
+        return frozenset({0})
+    return frozenset({0, os.geteuid()})
+
+
+def _load_exact_provenance_validator(
+    *, require_protected: bool
+) -> types.ModuleType:
     """Execute the exact sibling validator without consulting import paths."""
 
     module_name = "_whoscored_exact_build_provenance_validator"
@@ -57,6 +67,9 @@ def _load_exact_provenance_validator() -> types.ModuleType:
     components = path.absolute().parts[1:]
     directory_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
     file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    trusted_source_uids = _trusted_source_uids(
+        require_protected=require_protected
+    )
     parent_descriptor = os.open("/", directory_flags)
     descriptor = -1
     try:
@@ -71,13 +84,15 @@ def _load_exact_provenance_validator() -> types.ModuleType:
                 and parent.st_mode & stat.S_ISVTX
                 and parent.st_mode & 0o002
             )
-            if parent.st_uid != 0 or (writable and not sticky_root):
+            if parent.st_uid not in trusted_source_uids or (
+                writable and not sticky_root
+            ):
                 raise RuntimeError("WhoScored validator has an unsafe parent directory")
         descriptor = os.open(components[-1], file_flags, dir_fd=parent_descriptor)
         before = os.fstat(descriptor)
         if (
             not stat.S_ISREG(before.st_mode)
-            or before.st_uid != 0
+            or before.st_uid not in trusted_source_uids
             or before.st_nlink != 1
             or before.st_mode & 0o022
         ):
@@ -130,7 +145,17 @@ def _load_exact_provenance_validator() -> types.ModuleType:
     return module
 
 
-provenance = _load_exact_provenance_validator()
+# Every privileged load stays root-only.  A non-root process may use its
+# owner-protected checkout for offline validation, tests, and ``--help``;
+# ``main`` rejects real admission unless it proves the privileged release.
+try:
+    provenance = _load_exact_provenance_validator(
+        require_protected=os.geteuid() == 0
+    )
+except BaseException:
+    if __name__ == "__main__":
+        _bootstrap_sys.modules["posix"]._exit(78)
+    raise
 
 
 EXIT_CONFIG = 78

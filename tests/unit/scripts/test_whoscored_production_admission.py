@@ -51,6 +51,17 @@ PROVIDER_AUTHORITY = {
 }
 
 
+def test_validator_source_owner_policy_is_strict_for_root_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(admission.os, "geteuid", lambda: 1001)
+
+    assert admission._trusted_source_uids(require_protected=True) == frozenset({0})
+    assert admission._trusted_source_uids(require_protected=False) == frozenset(
+        {0, 1001}
+    )
+
+
 def test_verify_running_cli_requires_split_provenance_inputs() -> None:
     args = admission._parser().parse_args(
         [
@@ -2997,6 +3008,11 @@ def test_canonical_release_binds_loaded_validator_source(
     monkeypatch.setattr(admission.os, "geteuid", lambda: 0)
     monkeypatch.setattr(admission.sys, "executable", "/usr/bin/python3")
     monkeypatch.setattr(
+        admission.provenance,
+        "read_protected_regular_file",
+        lambda path, *, label: path.read_bytes(),
+    )
+    monkeypatch.setattr(
         admission.provenance, "_whoscored_loaded_source_sha256", "0" * 64
     )
     with pytest.raises(admission.AdmissionError, match="changed after loading"):
@@ -3073,14 +3089,40 @@ def test_host_cli_rejects_nonisolated_or_hostile_python_import_environment(
         capture_output=True,
         check=False,
     )
-    assert hostile.returncode == admission.EXIT_CONFIG
-    assert b"PYTHONPATH" in hostile.stderr
-    assert not sentinel.exists()
-
     isolated = subprocess.run(
         ("/usr/bin/python3", "-I", "-S", str(helper), "--help"),
         env=clean_environment,
         capture_output=True,
         check=False,
     )
+    assert hostile.returncode == admission.EXIT_CONFIG
+    assert b"PYTHONPATH" in hostile.stderr
+    assert not sentinel.exists()
     assert isolated.returncode == 0, isolated.stderr.decode()
+
+
+def test_direct_cli_rejects_unprotected_release_before_validator_executes(
+    tmp_path: Path,
+) -> None:
+    release = tmp_path / "unsafe-release"
+    scripts = release / "scripts"
+    scripts.mkdir(parents=True)
+    helper = scripts / "whoscored_production_admission.py"
+    helper.write_bytes(Path(admission.__file__).read_bytes())
+    sentinel = tmp_path / "forged-validator-executed"
+    (scripts / "validate_whoscored_build_provenance.py").write_text(
+        f"from pathlib import Path\nPath({str(sentinel)!r}).write_text('owned')\n",
+        encoding="utf-8",
+    )
+    release.chmod(0o777)
+
+    result = subprocess.run(
+        ("/usr/bin/python3", "-I", "-S", str(helper), "--help"),
+        env={"HOME": "/nonexistent", "LANG": "C.UTF-8", "PATH": "/usr/bin:/bin"},
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == admission.EXIT_CONFIG
+    assert result.stderr == b""
+    assert not sentinel.exists()
