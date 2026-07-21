@@ -74,8 +74,7 @@ def test_canonical_target_sorts_query_and_enforces_https_allowlist():
     )
     assert first == second
     assert first.canonical_url == (
-        "https://www.fotmob.com/api/data/leagues?"
-        "id=42&id=47&season=2025%2F2026"
+        "https://www.fotmob.com/api/data/leagues?id=42&id=47&season=2025%2F2026"
     )
     data_host = canonicalize_target(
         "https://data.fotmob.com/stats/47/season/2025/goals.json"
@@ -418,7 +417,9 @@ def test_offline_replay_and_thread_safe_aggregate_stats(tmp_path):
     responses = [FakeResponse(200, b'{"ok":true}') for _ in range(count)]
     transport, _ = _transport(responses, max_attempts=1)
     with ThreadPoolExecutor(max_workers=8) as pool:
-        results = list(pool.map(lambda _: transport.fetch_json("allLeagues"), range(count)))
+        results = list(
+            pool.map(lambda _: transport.fetch_json("allLeagues"), range(count))
+        )
     assert all(result.outcome == FetchOutcome.SUCCESS for result in results)
     stats = transport.snapshot_stats()
     assert stats.logical_targets == count
@@ -428,12 +429,33 @@ def test_offline_replay_and_thread_safe_aggregate_stats(tmp_path):
     assert stats.decoded_bytes == count * len(b'{"ok":true}')
 
 
+def test_offline_player_replay_uses_recorded_target_key_not_current_build(tmp_path):
+    store = _store(tmp_path)
+    historical = canonicalize_target(
+        "https://www.fotmob.com/_next/data/build-from-original-run/players/10.json"
+    )
+    body = b'{"pageProps":{"data":{"id":10,"name":"Ten"}}}'
+    stored = store.store(historical, body)
+    transport = FotMobTransport(store)
+
+    replay = transport.replay_target_key(historical.target_key)
+
+    assert replay.outcome == FetchOutcome.SUCCESS
+    assert replay.url == historical.canonical_url
+    assert replay.target_key == historical.target_key
+    assert replay.content_hash == stored.content_hash
+    assert replay.body == body
+    assert replay.cache_hit and replay.attempts == 0
+    assert replay.direct_bytes == replay.proxy_bytes == 0
+    missing = transport.replay_target_key("a" * 64)
+    assert missing.outcome == FetchOutcome.TERMINAL_FAILURE
+    assert "target-key replay failed" in missing.error
+
+
 def test_cached_alias_replays_exact_selected_season_without_network(tmp_path):
     store = _store(tmp_path)
     selected = canonicalize_target("leagues", {"id": 47})
-    exact = canonicalize_target(
-        "leagues", {"id": 47, "season": "2025/2026"}
-    )
+    exact = canonicalize_target("leagues", {"id": 47, "season": "2025/2026"})
     body = b'{"details":{"selectedSeason":"2025/2026"}}'
     store.store(selected, body)
     transport = FotMobTransport(store)

@@ -629,6 +629,76 @@ class FotMobTransport:
             )
         )
 
+    def replay_target_key(self, target_key: str) -> FetchResult:
+        """Replay the exact raw target recorded by an ingest manifest.
+
+        This is primarily for Next.js player payloads: their canonical URL
+        contains a rotating build id, while the durable manifest already
+        records the precise raw target used by the original fetch.  Replaying
+        by key avoids guessing a single build id for a multi-day backfill.
+        """
+
+        normalized = str(target_key).strip().casefold()
+        if len(normalized) != 64 or any(
+            character not in "0123456789abcdef" for character in normalized
+        ):
+            raise ValueError("raw replay target_key must be lowercase SHA-256")
+        self._raise_if_cancelled()
+        self._start_target()
+        placeholder = CanonicalTarget(
+            canonical_url=("https://www.fotmob.com/_raw/sha256/" + normalized),
+            target_key=normalized,
+        )
+        if self.raw_store is None:
+            return self._finish(
+                self._result(
+                    outcome=FetchOutcome.TERMINAL_FAILURE,
+                    target=placeholder,
+                    http_status=None,
+                    body=None,
+                    json_data=None,
+                    attempts=0,
+                    network_bytes=0,
+                    terminal=True,
+                    error="raw store is unavailable for target-key replay",
+                )
+            )
+        try:
+            body, record = self.raw_store.load_target_key(normalized)
+            target = canonicalize_target(record.canonical_url)
+            if target.target_key != normalized:
+                raise ValueError("raw target canonical URL digest differs")
+            parsed = self._json(body)
+        except (RawStoreError, OSError, ValueError, json.JSONDecodeError) as exc:
+            return self._finish(
+                self._result(
+                    outcome=FetchOutcome.TERMINAL_FAILURE,
+                    target=placeholder,
+                    http_status=None,
+                    body=None,
+                    json_data=None,
+                    attempts=0,
+                    network_bytes=0,
+                    terminal=True,
+                    error=(
+                        f"raw target-key replay failed: {type(exc).__name__}: {exc}"
+                    ),
+                )
+            )
+        return self._finish(
+            self._result(
+                outcome=FetchOutcome.SUCCESS,
+                target=target,
+                http_status=None,
+                body=body,
+                json_data=parsed,
+                attempts=0,
+                network_bytes=0,
+                cache_hit=True,
+                record=record,
+            )
+        )
+
     def alias_cached_json(
         self,
         source_url_or_endpoint: str,

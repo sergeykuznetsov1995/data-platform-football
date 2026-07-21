@@ -39,8 +39,9 @@ def args(tmp_path, **overrides):
                 "compose_file": str(compose_file.resolve()),
                 "release_root": str(tmp_path.resolve()),
                 "evidence_dir": str((tmp_path / "evidence").resolve()),
-                "container_report_path": (
-                    "/opt/airflow/logs/fotmob/deployment.json"
+                "container_report_path": ("/opt/airflow/logs/fotmob/deployment.json"),
+                "shared_container_report_path": (
+                    "/opt/airflow/fotmob-admission/deployment.json"
                 ),
                 "dagbag_root": str((tmp_path / "dagbag").resolve()),
                 "git_sha": "a" * 40,
@@ -154,16 +155,28 @@ def test_runtime_rejects_v1_or_incomplete_shared_handoff_report(tmp_path):
     missing_topology["shared_handoff_final"].pop("serialized_xref")
     invalid_reports.append((missing_topology, "serialized xref"))
 
+    wrong_report_path = json.loads(json.dumps(original))
+    wrong_report_path["shared_container_report_path"] = (
+        "/opt/airflow/fotmob-admission/other.json"
+    )
+    invalid_reports.append((wrong_report_path, "identify different files"))
+
+    wrong_mount = json.loads(json.dumps(original))
+    wrong_mount["shared_handoff_final"]["shared_admission_mount"]["source"] = (
+        "/other/evidence"
+    )
+    invalid_reports.append((wrong_mount, "exact shared admission mount"))
+
     active_shared_run = json.loads(json.dumps(original))
-    active_shared_run["shared_handoff_final"]["orchestration_state"][
-        "active_runs"
-    ] = [{"dag_id": "dag_transform_xref", "run_id": "active"}]
+    active_shared_run["shared_handoff_final"]["orchestration_state"]["active_runs"] = [
+        {"dag_id": "dag_transform_xref", "run_id": "active"}
+    ]
     invalid_reports.append((active_shared_run, "atomic shared quiescence"))
 
     incomplete_downstream_run_checks = json.loads(json.dumps(original))
-    incomplete_downstream_run_checks["shared_handoff_final"][
-        "active_run_checks"
-    ].pop("dag_transform_e3")
+    incomplete_downstream_run_checks["shared_handoff_final"]["active_run_checks"].pop(
+        "dag_transform_e3"
+    )
     invalid_reports.append(
         (incomplete_downstream_run_checks, "incomplete shared active-run proof")
     )
@@ -353,9 +366,7 @@ def test_legacy_validation_requires_every_table_nonempty():
 
 def test_legacy_validation_rejects_identifier_injection():
     with pytest.raises(mod.RollbackError, match="unsafe SQL identifier"):
-        mod._legacy_counts(
-            LegacyClient(1), catalog='iceberg"."bronze', schema="bronze"
-        )
+        mod._legacy_counts(LegacyClient(1), catalog='iceberg"."bronze', schema="bronze")
 
 
 @pytest.mark.parametrize("active_downstream", [False, True])
@@ -686,7 +697,8 @@ def test_recovery_keeps_lock_until_exact_silver_run_is_terminal(tmp_path, monkey
     report = mod._rollback_publication_report_base(
         arguments,
         publication,
-        silver_run_id="rollback_silver__" + publication["generation_id"].replace("-", ""),
+        silver_run_id="rollback_silver__"
+        + publication["generation_id"].replace("-", ""),
     )
     report.update(
         {"phase": "lock_retained_pending_terminal_proof", "recovery_required": True}
@@ -829,9 +841,7 @@ def test_recovery_seals_and_abandons_exact_successful_silver_candidate(
         publication_report=publication_report,
         output=tmp_path / "recovery.json",
     )
-    silver_run_id = "rollback_silver__" + publication["generation_id"].replace(
-        "-", ""
-    )
+    silver_run_id = "rollback_silver__" + publication["generation_id"].replace("-", "")
     report = mod._rollback_publication_report_base(
         arguments, publication, silver_run_id=silver_run_id
     )
@@ -896,9 +906,7 @@ def test_validate_publication_evidence_requires_exact_abandoned_db_candidate(
 ):
     publication = _rollback_publication()
     publication_report = tmp_path / "publication.json"
-    silver_run_id = "rollback_silver__" + publication["generation_id"].replace(
-        "-", ""
-    )
+    silver_run_id = "rollback_silver__" + publication["generation_id"].replace("-", "")
     arguments = args(
         tmp_path,
         publication_report=publication_report,
@@ -1075,10 +1083,7 @@ def test_live_deployment_identity_binds_container_images_nonce_and_mounts(tmp_pa
         "Config": {
             "Env": [
                 f"FOTMOB_DEPLOYMENT_ID={context['deployment_id']}",
-                (
-                    "FOTMOB_DEPLOYMENT_REPORT_PATH="
-                    + context["container_report_path"]
-                ),
+                ("FOTMOB_DEPLOYMENT_REPORT_PATH=" + context["container_report_path"]),
                 f"FOTMOB_DEPLOY_GIT_SHA={context['git_sha']}",
                 "FOTMOB_ISOLATED_STACK=1",
                 "TELEGRAM_BOT_TOKEN=test-token",
@@ -1131,14 +1136,14 @@ def test_live_deployment_identity_binds_container_images_nonce_and_mounts(tmp_pa
                 else context["metadb_container_id"]
             ) + "\n"
             return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
-        payload = scheduler if command[-1] == context["scheduler_container_id"] else metadb
+        payload = (
+            scheduler if command[-1] == context["scheduler_container_id"] else metadb
+        )
         return subprocess.CompletedProcess(
             command, 0, stdout=json.dumps(payload), stderr=""
         )
 
-    evidence = mod.validate_live_deployment(
-        arguments, require_running=True, run=run
-    )
+    evidence = mod.validate_live_deployment(arguments, require_running=True, run=run)
     assert evidence["mounts_verified"] is True
     scheduler["Mounts"][0]["Source"] = str((tmp_path / "stale-dagbag").resolve())
     with pytest.raises(mod.RollbackError, match="mount source differs"):

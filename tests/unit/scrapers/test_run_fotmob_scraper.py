@@ -179,9 +179,7 @@ class TestFotmobNativeRunner:
 
         publication_args, publication = _publication_cli(monkeypatch)
         daily_args = _daily_cli(monkeypatch)
-        args = parser.parse_args(
-            ["--mode", "daily", *daily_args, *publication_args]
-        )
+        args = parser.parse_args(["--mode", "daily", *daily_args, *publication_args])
         assert mod._validate_args(parser, args) == publication
 
         args = parser.parse_args(
@@ -206,12 +204,11 @@ class TestFotmobNativeRunner:
         daily_args = _daily_cli(monkeypatch)
         alternate = tmp_path / "same-bytes.txt"
         alternate.write_bytes(
-            Path(daily_args[daily_args.index("--competition-scope-file") + 1])
-            .read_bytes()
+            Path(
+                daily_args[daily_args.index("--competition-scope-file") + 1]
+            ).read_bytes()
         )
-        daily_args[daily_args.index("--competition-scope-file") + 1] = str(
-            alternate
-        )
+        daily_args[daily_args.index("--competition-scope-file") + 1] = str(alternate)
         writer = MagicMock()
         service = MagicMock()
         monkeypatch.setattr(mod, "_native_writer_fence", writer)
@@ -258,9 +255,7 @@ class TestFotmobNativeRunner:
             assert service.mock_calls == []
 
     @pytest.mark.unit
-    def test_native_writer_guard_verifies_exact_active_control_state(
-        self, monkeypatch
-    ):
+    def test_native_writer_guard_verifies_exact_active_control_state(self, monkeypatch):
         mod = self._module()
         publication_args, publication = _publication_cli(monkeypatch)
         daily_args = _daily_cli(monkeypatch)
@@ -292,10 +287,7 @@ class TestFotmobNativeRunner:
         )
 
         with mod._native_writer_fence(publication):
-            assert (
-                mod._ACTIVE_PUBLICATION_GENERATION
-                == publication["generation_id"]
-            )
+            assert mod._ACTIVE_PUBLICATION_GENERATION == publication["generation_id"]
             events.append(("write",))
 
         assert mod._ACTIVE_PUBLICATION_GENERATION is None
@@ -391,20 +383,73 @@ class TestFotmobNativeRunner:
             "guard_enter",
             "native_write",
             "salvage",
+            "runtime_attestation",
             "guard_exit",
         ]
 
     @pytest.mark.unit
-    def test_shared_owner_does_not_require_isolated_runtime_report(self):
+    def test_shared_owner_attests_runtime_before_writer_guard(self, monkeypatch):
         mod = self._module()
+        from utils import fotmob_publication
 
-        assert mod._attest_native_runtime(
-            SimpleNamespace(),
-            {"binding": {"owner": "shared"}},
-        ) == {
-            "owner": "shared",
-            "isolated_attestation": "not_applicable",
-        }
+        evidence = {"deployment_id": "e" * 32, "owner": "shared"}
+        attest = MagicMock(return_value=evidence)
+        monkeypatch.setattr(
+            fotmob_publication,
+            "attest_fotmob_shared_runtime",
+            attest,
+        )
+
+        assert (
+            mod._attest_native_runtime(
+                SimpleNamespace(),
+                {"binding": {"owner": "shared"}},
+            )
+            == evidence
+        )
+        attest.assert_called_once_with(require_scheduled_owner=False)
+
+    @pytest.mark.unit
+    def test_post_operation_runtime_drift_fails_before_guard_release(self, monkeypatch):
+        mod = self._module()
+        _publication_args, publication = _publication_cli(monkeypatch)
+        events = []
+
+        @contextmanager
+        def fence(_publication):
+            events.append("guard_enter")
+            try:
+                yield {}
+            finally:
+                events.append("guard_exit")
+
+        def attest(*_args):
+            events.append("runtime_attestation")
+            if events.count("runtime_attestation") == 2:
+                raise RuntimeError("post-operation runtime drift")
+            return {}
+
+        def run(_args):
+            events.append("native_write")
+            return 0, {"status": "success", "complete": True}
+
+        monkeypatch.setattr(mod, "_native_writer_fence", fence)
+        monkeypatch.setattr(mod, "_attest_native_runtime", attest)
+        monkeypatch.setattr(mod, "_run_native", run)
+
+        with pytest.raises(RuntimeError, match="post-operation runtime drift"):
+            mod._run_native_under_fence(
+                SimpleNamespace(run_id=publication["generation_id"], mode="daily"),
+                publication,
+            )
+
+        assert events == [
+            "runtime_attestation",
+            "guard_enter",
+            "native_write",
+            "runtime_attestation",
+            "guard_exit",
+        ]
 
     @pytest.mark.unit
     def test_rejected_writer_guard_never_runs_or_salvages(self, monkeypatch):
@@ -471,6 +516,7 @@ class TestFotmobNativeRunner:
             str(output),
             *publication_args,
         ]
+
         @contextmanager
         def admitted(_publication):
             mod._ACTIVE_PUBLICATION_GENERATION = publication["generation_id"]
@@ -560,7 +606,7 @@ class TestFotmobNativeRunner:
         repository.ensure_current_views.assert_called_once_with()
 
     @pytest.mark.unit
-    def test_backfill_skips_only_fully_completed_scope_plan(self):
+    def test_backfill_skips_only_scope_completed_by_current_publication_run(self):
         from scrapers.fotmob.transport import canonicalize_target
         from tests.unit.scrapers.test_fotmob_service import (
             _league_payload,
@@ -585,9 +631,77 @@ class TestFotmobNativeRunner:
         assert rc == 0
         assert report["status"] == "success"
         repository.completed_scope_keys.assert_called_once_with(
-            report["selection"]["scope_plan_signature"]
+            report["selection"]["scope_plan_signature"],
+            run_id=service.run_id,
         )
         assert not any("season=2025%2F2026" in url for url, _ in transport.calls)
+
+    @pytest.mark.unit
+    def test_new_backfill_generation_reprocesses_prior_generation_completion(self):
+        from scrapers.fotmob.planner import (
+            RunMode,
+            deterministic_plan_signature,
+        )
+        from scrapers.fotmob.repository import ManifestStatus, TargetCommit
+        from scrapers.fotmob.transport import canonicalize_target
+        from tests.unit.scrapers.test_fotmob_service import (
+            _league_payload,
+            _service,
+        )
+
+        mod = self._module()
+        responses = {
+            canonicalize_target("allLeagues").canonical_url: {
+                "countries": [{"leagues": [{"id": 47, "name": "Premier League"}]}]
+            },
+            canonicalize_target("leagues", {"id": 47}).canonical_url: (
+                _league_payload()
+            ),
+            canonicalize_target(
+                "leagues", {"id": 47, "season": "2025/2026"}
+            ).canonical_url: _league_payload(),
+        }
+        service, transport, repository = _service(responses, mode=RunMode.BACKFILL)
+        signature = deterministic_plan_signature(
+            {"season"},
+            policy={
+                "match_policy": "finished_only",
+                "leaderboard_policy": "all_advertised",
+                "team_policy": "global_observed_snapshot",
+                "player_policy": "global_observed_snapshot",
+            },
+        )
+        repository.record(
+            TargetCommit(
+                run_id="prior-generation",
+                target_type="scope_completion",
+                target_key="a" * 64,
+                status=ManifestStatus.SUCCESS,
+                competition_id="47",
+                source_season_key="2025/2026",
+                entity_id=signature,
+                content_hash="b" * 64,
+            )
+        )
+        args = mod._argument_parser().parse_args(
+            [
+                "--mode",
+                "backfill",
+                "--scope",
+                "47=2025/2026",
+                "--entities",
+                "season",
+            ]
+        )
+
+        rc, report = _run_native_admitted(mod, args, service=service)
+
+        assert rc == 0, report["errors"]
+        assert report["selection"]["completed_scopes"] == ["47=2025/2026"]
+        assert repository.completed_scope_keys(signature, run_id=service.run_id) == {
+            (47, "2025/2026")
+        }
+        assert any("leagues?id=47" in url for url, _ in transport.calls)
 
     @pytest.mark.unit
     def test_transfer_competition_limit_applies_after_completion_filter(self):
@@ -637,6 +751,12 @@ class TestFotmobNativeRunner:
                 "transfers", {"leagueIds": "48", "page": 1}
             ).canonical_url
         ]
+        assert repository.completed_scope_keys.call_args.kwargs == {
+            "run_id": service.run_id
+        }
+        assert repository.completed_competition_ids.call_args.kwargs == {
+            "run_id": service.run_id
+        }
 
     @pytest.mark.unit
     def test_players_receive_deduplicated_ids_from_team_snapshots(self):
@@ -683,6 +803,71 @@ class TestFotmobNativeRunner:
         assert report["selection"]["entities"] == ["players", "teams"]
         service.sync_player_snapshots.assert_called_once_with(
             {10, 11}, build_id="build-1", limit=2
+        )
+
+    @pytest.mark.unit
+    def test_replay_player_batch_is_not_truncated_by_network_request_budget(self):
+        from scrapers.fotmob.planner import BudgetLedger, RunMode, TransportBudget
+        from scrapers.fotmob.service import OperationResult
+        from scrapers.fotmob.transport import canonicalize_target
+        from tests.unit.scrapers.test_fotmob_service import (
+            _league_payload,
+            _service,
+        )
+
+        mod = self._module()
+        responses = {
+            canonicalize_target("allLeagues").canonical_url: {
+                "countries": [{"leagues": [{"id": 47, "name": "Premier League"}]}]
+            },
+            canonicalize_target("leagues", {"id": 47}).canonical_url: (
+                _league_payload()
+            ),
+            canonicalize_target(
+                "leagues", {"id": 47, "season": "2025/2026"}
+            ).canonical_url: _league_payload(),
+        }
+        service, _, _ = _service(responses, mode=RunMode.REPLAY)
+        service.ledger = BudgetLedger(
+            TransportBudget(max_requests=1, max_direct_bytes=10_000_000)
+        )
+        player_ids = set(range(10_000, 10_250))
+        service.sync_team_snapshots = MagicMock(
+            return_value=(
+                OperationResult("team_snapshots", attempted=1, succeeded=1),
+                player_ids,
+            )
+        )
+        service.sync_player_snapshots = MagicMock(
+            return_value=OperationResult(
+                "player_snapshots",
+                attempted=len(player_ids),
+                succeeded=len(player_ids),
+            )
+        )
+        args = mod._argument_parser().parse_args(
+            [
+                "--mode",
+                "replay",
+                "--scope",
+                "47=2025/2026",
+                "--entities",
+                "players",
+                "--max-requests",
+                "1",
+            ]
+        )
+        raw_store = SimpleNamespace(has_target=MagicMock(return_value=True))
+
+        rc, report = _run_native_admitted(
+            mod, args, service=service, raw_store=raw_store
+        )
+
+        assert rc == 0, report["errors"]
+        service.sync_player_snapshots.assert_called_once_with(
+            player_ids,
+            build_id=None,
+            limit=len(player_ids),
         )
 
     @pytest.mark.unit
@@ -740,9 +925,7 @@ class TestFotmobNativeRunner:
         )
         first_service, _ = make_service(3, "backfill-1")
 
-        first_rc, first_report = _run_native_admitted(
-            mod, args, service=first_service
-        )
+        first_rc, first_report = _run_native_admitted(mod, args, service=first_service)
 
         assert first_rc == 1
         assert first_report["complete"] is False
@@ -847,8 +1030,7 @@ class TestFotmobNativeRunner:
         mod = self._module()
         cohort = publication.FOTMOB_DAILY_COMPETITION_IDS
         competitions = [
-            CompetitionRef(value, f"Competition {value}")
-            for value in (*cohort, 999999)
+            CompetitionRef(value, f"Competition {value}") for value in (*cohort, 999999)
         ]
         classifications = tuple(
             ScopeClassification(
@@ -908,9 +1090,7 @@ class TestFotmobNativeRunner:
                 CompetitionDiscoveryResult(
                     item.competition,
                     item,
-                    OperationResult(
-                        "competition_seasons", attempted=1, succeeded=1
-                    ),
+                    OperationResult("competition_seasons", attempted=1, succeeded=1),
                     seasons=(seasons[item.competition.competition_id],),
                 )
                 for item in candidates
@@ -925,17 +1105,13 @@ class TestFotmobNativeRunner:
                 )
             )
 
-        service.discover_competitions = MagicMock(
-            side_effect=discover_competitions
-        )
+        service.discover_competitions = MagicMock(side_effect=discover_competitions)
         service.sync_season = MagicMock(side_effect=sync_season)
         service.sync_leaderboards = MagicMock(
             side_effect=lambda _bundle: OperationResult("leaderboards")
         )
         service.sync_match_payloads = MagicMock(
-            side_effect=lambda _bundle, **_kwargs: OperationResult(
-                "match_payloads"
-            )
+            side_effect=lambda _bundle, **_kwargs: OperationResult("match_payloads")
         )
         service.sync_team_snapshots = MagicMock(
             side_effect=lambda _bundle, **_kwargs: (
@@ -944,9 +1120,7 @@ class TestFotmobNativeRunner:
             )
         )
         service.sync_player_snapshots = MagicMock(
-            side_effect=lambda _ids, **_kwargs: OperationResult(
-                "player_snapshots"
-            )
+            side_effect=lambda _ids, **_kwargs: OperationResult("player_snapshots")
         )
         service.record_scope_completion = MagicMock(return_value=[])
         service.sync_transfers = MagicMock(
@@ -1017,12 +1191,11 @@ class TestFotmobNativeRunner:
         assert report["selection"]["planned_scopes"] == [
             f"{value}=dynamic-{value}" for value in expected_scope_order
         ]
-        assert report["selection"]["completed_scopes"] == report[
-            "selection"
-        ]["planned_scopes"]
-        assert report["selection"][
-            "completed_transfer_competition_ids"
-        ] == list(cohort)
+        assert (
+            report["selection"]["completed_scopes"]
+            == report["selection"]["planned_scopes"]
+        )
+        assert report["selection"]["completed_transfer_competition_ids"] == list(cohort)
         assert 999999 not in discovered_ids
 
     @pytest.mark.unit

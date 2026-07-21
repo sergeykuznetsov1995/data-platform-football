@@ -1,6 +1,7 @@
 import json
 import hashlib
 import subprocess
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -62,6 +63,9 @@ def runtime_options(tmp_path):
                 "release_root": str(tmp_path.resolve()),
                 "evidence_dir": str((tmp_path / "evidence").resolve()),
                 "container_report_path": ("/opt/airflow/logs/fotmob/deployment.json"),
+                "shared_container_report_path": (
+                    "/opt/airflow/fotmob-admission/deployment.json"
+                ),
                 "dagbag_root": str((tmp_path / "dagbag").resolve()),
                 "git_sha": "a" * 40,
                 "image": "registry/image@sha256:" + "b" * 64,
@@ -149,6 +153,38 @@ def fake_lineage(**overrides):
     return mod.AcceptanceLineage(**values)
 
 
+def full_live_candidate(generation_id, task_ids=("transform_a", "transform_b")):
+    evidence = {
+        "schema": mod.PUBLICATION_SCHEMA,
+        "generation_id": generation_id,
+        "transform_task_ids": list(task_ids),
+        "transform_results": {
+            task_id: {
+                "status": "success",
+                "table": f"iceberg.silver.{task_id}",
+                "rows": index + 10,
+            }
+            for index, task_id in enumerate(task_ids)
+        },
+        "row_count_gate": {
+            "status": "success",
+            "warnings": [],
+            "details": {task_id: index + 10 for index, task_id in enumerate(task_ids)},
+            "total_rows": 21,
+        },
+        "quality_gate": {
+            "passed": 4,
+            "total": 5,
+            "errors": [],
+            "warnings": ["freshness_warning"],
+        },
+    }
+    evidence["digest"] = hashlib.sha256(
+        json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return evidence
+
+
 def write_lifecycle_report(tmp_path, options, *, mutate=None):
     deployment_path = Path(options[options.index("--deployment-report") + 1])
     deployment = json.loads(deployment_path.read_text(encoding="utf-8"))
@@ -171,10 +207,11 @@ def write_lifecycle_report(tmp_path, options, *, mutate=None):
     compact = generation_id.replace("-", "")
     ingest_run_id = f"issue930_{mode}_a{attempt}__{compact}"
     silver_run_id = f"fotmob_silver__{generation_id}"
+    live_candidate = full_live_candidate(generation_id)
     candidate = {
         "generation_id": generation_id,
-        "digest": "d" * 64,
-        "transform_task_ids": ["transform_a", "transform_b"],
+        "digest": live_candidate["digest"],
+        "transform_task_ids": live_candidate["transform_task_ids"],
     }
     report = {
         "schema_version": mod.LIFECYCLE_SCHEMA_VERSION,
@@ -259,7 +296,10 @@ def live_publication_reader(report):
             "status": "succeeded",
             "phase": "abandoned",
             "binding": report["publication"]["binding"],
-            "candidate": report["candidate"],
+            "candidate": full_live_candidate(
+                report["publication"]["generation_id"],
+                report["candidate"]["transform_task_ids"],
+            ),
             "consumer": None,
             "owner_dag_id": mod.PUBLICATION_OWNER_DAG_ID,
             "active": False,
@@ -658,10 +698,52 @@ def test_live_publication_must_match_report_candidate_and_release(tmp_path):
     state = dict(
         live_publication_reader(report)(context, generation_id=lineage.generation_id)
     )
+    evidence = mod.validate_live_publication_state(state, lineage)
+    assert evidence["candidate"] == {
+        "schema": mod.PUBLICATION_SCHEMA,
+        "generation_id": lineage.generation_id,
+        "digest": lineage.candidate_digest,
+        "transform_task_ids": ["transform_a", "transform_b"],
+        "transform_count": 2,
+        "row_count_status": "success",
+        "row_count_total": 21,
+        "quality_passed": 4,
+        "quality_total": 5,
+    }
     state["candidate"] = {**state["candidate"], "digest": "0" * 64}
 
     with pytest.raises(ValueError, match="differs"):
         mod.validate_live_publication_state(state, lineage)
+
+
+def test_live_candidate_rejects_extra_missing_tamper_and_bad_semantics():
+    lineage = fake_lineage()
+    candidate = full_live_candidate(lineage.generation_id)
+    lineage = replace(lineage, candidate_digest=candidate["digest"])
+
+    extra = {**candidate, "unexpected": True}
+    with pytest.raises(ValueError, match="fields are not exact"):
+        mod._validate_live_candidate(extra, lineage)
+
+    missing = dict(candidate)
+    missing.pop("quality_gate")
+    with pytest.raises(ValueError, match="fields are not exact"):
+        mod._validate_live_candidate(missing, lineage)
+
+    tampered = json.loads(json.dumps(candidate))
+    tampered["transform_results"]["transform_a"]["rows"] = 999
+    with pytest.raises(ValueError, match="digest differs"):
+        mod._validate_live_candidate(tampered, lineage)
+
+    bad_semantics = json.loads(json.dumps(candidate))
+    bad_semantics["quality_gate"]["errors"] = ["broken uniqueness gate"]
+    unsigned = {key: value for key, value in bad_semantics.items() if key != "digest"}
+    bad_semantics["digest"] = hashlib.sha256(
+        json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    bad_lineage = replace(lineage, candidate_digest=bad_semantics["digest"])
+    with pytest.raises(ValueError, match="quality gate is not clean"):
+        mod._validate_live_candidate(bad_semantics, bad_lineage)
 
 
 def test_live_publication_reader_uses_admitted_scheduler(tmp_path):

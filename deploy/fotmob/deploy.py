@@ -32,9 +32,7 @@ EXPECTED_DAGS = frozenset(
 )
 EXPECTED_DAG_FILES = {
     "dag_ingest_fotmob": "/opt/airflow/dags/dag_ingest_fotmob.py",
-    "dag_transform_fotmob_silver": (
-        "/opt/airflow/dags/dag_transform_fotmob_silver.py"
-    ),
+    "dag_transform_fotmob_silver": ("/opt/airflow/dags/dag_transform_fotmob_silver.py"),
     "dag_trigger_fotmob_daily": "/opt/airflow/dags/dag_trigger_fotmob_daily.py",
 }
 EXPECTED_SCHEDULES = {
@@ -75,9 +73,12 @@ ISOLATED_DAG_PREFIXES = (
 )
 ISOLATED_AIRFLOWIGNORE_PATH = "dags/.airflowignore"
 CONTAINER_EVIDENCE_ROOT = Path("/opt/airflow/logs/fotmob")
+SHARED_CONTAINER_EVIDENCE_ROOT = Path("/opt/airflow/fotmob-admission")
+SHARED_DEPLOYMENT_REPORT_PATH_ENV = "FOTMOB_SHARED_DEPLOYMENT_REPORT_PATH"
 SHARED_REQUIRED_RUNTIME_PATHS = {
     "configs/fotmob/competitions.json",
     "configs/fotmob/issue-930-scopes.txt",
+    "dags/.airflowignore",
     "dags/dag_ingest_fotmob.py",
     "dags/dag_master_pipeline.py",
     "dags/dag_sofascore_pipeline.py",
@@ -111,6 +112,14 @@ APPROVED_SCOPE_PATH = "configs/fotmob/issue-930-scopes.txt"
 APPROVED_SCOPE_SHA256 = (
     "f1d95f916c78ed80e5784e2cd5bda7263cece37d9fde6d52fb2a1a4d9e97cb58"
 )
+# The report is a non-secret admission certificate consumed by Airflow uid
+# 50000 from a host bind mount.  Deploy commonly runs as root, so relying on
+# the caller's umask/ownership would leave NamedTemporaryFile's 0600 mode in
+# place and make every scheduled attestation fail.  World-read-only is
+# deliberate: the report contains image/container IDs, hashes and credential
+# presence booleans, never credential values.
+DEPLOYMENT_REPORT_MODE = 0o444
+EVIDENCE_DIRECTORY_MODE = 0o755
 
 
 class DeploymentError(RuntimeError):
@@ -131,6 +140,7 @@ def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
             json.dump(payload, stream, ensure_ascii=False, indent=2)
             stream.write("\n")
             stream.flush()
+            os.fchmod(stream.fileno(), DEPLOYMENT_REPORT_MODE)
             os.fsync(stream.fileno())
             temporary = Path(stream.name)
         temporary.replace(path)
@@ -142,6 +152,24 @@ def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
     finally:
         if temporary is not None and temporary.exists():
             temporary.unlink()
+
+
+def _prepare_evidence_report_path(evidence_dir: Path, report_path: Path) -> None:
+    """Create deterministic traversable directories for a public report."""
+
+    try:
+        relative_parent = report_path.parent.relative_to(evidence_dir)
+    except ValueError as exc:  # defensive; deploy validates this first
+        raise DeploymentError(
+            "deployment report is outside evidence directory"
+        ) from exc
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    evidence_dir.chmod(EVIDENCE_DIRECTORY_MODE)
+    current = evidence_dir
+    for component in relative_parent.parts:
+        current = current / component
+        current.mkdir(exist_ok=True)
+        current.chmod(EVIDENCE_DIRECTORY_MODE)
 
 
 def _commit_trigger_activation(
@@ -176,15 +204,11 @@ def _commit_trigger_activation(
 def validate_image_reference(image: str, *, label: str = "image") -> None:
     value = image.strip()
     if not re.fullmatch(r"[^\s@]+@sha256:[0-9a-fA-F]{64}", value):
-        raise DeploymentError(
-            f"{label} must be pinned by a full sha256 digest"
-        )
+        raise DeploymentError(f"{label} must be pinned by a full sha256 digest")
 
 
 def validate_database_password(env_file: Path, environment: Mapping[str, str]) -> None:
-    value = _configured_env_value(
-        env_file, environment, "FOTMOB_AIRFLOW_DB_PASSWORD"
-    )
+    value = _configured_env_value(env_file, environment, "FOTMOB_AIRFLOW_DB_PASSWORD")
 
     # This secret is interpolated into a SQLAlchemy URI. Requiring the
     # RFC-3986 unreserved alphabet prevents reserved characters from changing
@@ -233,7 +257,9 @@ def validate_delivery_credentials(
         )
 
 
-def release_sha(root: Path, run: Callable[..., subprocess.CompletedProcess[str]]) -> str:
+def release_sha(
+    root: Path, run: Callable[..., subprocess.CompletedProcess[str]]
+) -> str:
     if not root.is_absolute() or not root.is_dir():
         raise DeploymentError("--release-root must be an existing absolute directory")
     result = run(
@@ -296,13 +322,13 @@ def prepare_dagbag(release_root: Path, evidence_dir: Path, sha: str) -> Path:
     destination = evidence_dir / "runtime" / sha / "dags"
 
     def verify_existing() -> None:
-        observed_files = {
-            item.name for item in destination.iterdir() if item.is_file()
-        }
-        observed_dirs = {
-            item.name for item in destination.iterdir() if item.is_dir()
-        }
-        if observed_files != set(sources) or observed_dirs != {"utils", "sql", "scripts"}:
+        observed_files = {item.name for item in destination.iterdir() if item.is_file()}
+        observed_dirs = {item.name for item in destination.iterdir() if item.is_dir()}
+        if observed_files != set(sources) or observed_dirs != {
+            "utils",
+            "sql",
+            "scripts",
+        }:
             raise DeploymentError("existing DagBag projection has unexpected entries")
         for name, source in sources.items():
             if destination.joinpath(name).read_bytes() != source.read_bytes():
@@ -315,9 +341,7 @@ def prepare_dagbag(release_root: Path, evidence_dir: Path, sha: str) -> Path:
         return destination
 
     destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = Path(
-        tempfile.mkdtemp(prefix=".fotmob-dagbag-", dir=destination.parent)
-    )
+    temporary = Path(tempfile.mkdtemp(prefix=".fotmob-dagbag-", dir=destination.parent))
     try:
         for name, source in sources.items():
             shutil.copyfile(source, temporary / name)
@@ -437,7 +461,9 @@ def validate_control_database(
     }
 
 
-def validate_dagbag(dag_rows: Sequence[Mapping[str, Any]], errors: Sequence[Any]) -> None:
+def validate_dagbag(
+    dag_rows: Sequence[Mapping[str, Any]], errors: Sequence[Any]
+) -> None:
     dag_ids = {str(row.get("dag_id")) for row in dag_rows}
     if dag_ids != EXPECTED_DAGS:
         raise DeploymentError(
@@ -497,7 +523,10 @@ def shared_runtime_manifest(release_root: Path) -> dict[str, str]:
             if (
                 path.is_file()
                 and "__pycache__" not in path.parts
-                and path.name.endswith(SHARED_RUNTIME_SUFFIXES)
+                and (
+                    path.name == ".airflowignore"
+                    or path.name.endswith(SHARED_RUNTIME_SUFFIXES)
+                )
             ):
                 relative_path = path.relative_to(release_root).as_posix()
                 manifest[relative_path] = _sha256(path)
@@ -556,12 +585,9 @@ def validate_isolated_runtime_manifest(
         capture_output=True,
         text=True,
     ).stdout
-    observed = parse_marker_json(
-        output, "FOTMOB_ISOLATED_RUNTIME_MANIFEST_JSON="
-    )
+    observed = parse_marker_json(output, "FOTMOB_ISOLATED_RUNTIME_MANIFEST_JSON=")
     if not isinstance(observed, Mapping) or any(
-        not isinstance(path, str)
-        or re.fullmatch(r"[0-9a-f]{64}", str(digest)) is None
+        not isinstance(path, str) or re.fullmatch(r"[0-9a-f]{64}", str(digest)) is None
         for path, digest in observed.items()
     ):
         raise DeploymentError("isolated runtime manifest evidence is invalid")
@@ -573,11 +599,107 @@ def validate_isolated_runtime_manifest(
     return normalized
 
 
+def validate_shared_admission_mount(
+    shared_container: str,
+    evidence_dir: Path,
+    report_relative_path: Path,
+    *,
+    run: Callable[..., subprocess.CompletedProcess[str]],
+) -> dict[str, Any]:
+    """Bind the shared certificate path to one exact read-only host mount."""
+
+    relative_report = Path(report_relative_path)
+    if (
+        relative_report.is_absolute()
+        or not relative_report.parts
+        or ".." in relative_report.parts
+    ):
+        raise DeploymentError("shared deployment report path must be relative")
+    try:
+        expected_source = evidence_dir.resolve(strict=True)
+    except OSError as exc:
+        raise DeploymentError("shared evidence directory is unavailable") from exc
+    expected_destination = str(SHARED_CONTAINER_EVIDENCE_ROOT)
+    expected_report = str(SHARED_CONTAINER_EVIDENCE_ROOT / relative_report)
+
+    mounts_output = run(
+        (
+            "docker",
+            "inspect",
+            "--format",
+            "{{json .Mounts}}",
+            shared_container,
+        ),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    try:
+        mounts = json.loads(mounts_output)
+    except json.JSONDecodeError as exc:
+        raise DeploymentError("shared scheduler mount evidence is invalid") from exc
+    if not isinstance(mounts, list):
+        raise DeploymentError("shared scheduler mount evidence is invalid")
+    matching = [
+        mount
+        for mount in mounts
+        if isinstance(mount, Mapping)
+        and mount.get("Destination") == expected_destination
+    ]
+    if len(matching) != 1:
+        raise DeploymentError(
+            "shared scheduler must have one exact FotMob admission mount"
+        )
+    mount = matching[0]
+    source_value = str(mount.get("Source", "")).strip()
+    try:
+        observed_source = Path(source_value).resolve(strict=True)
+    except OSError as exc:
+        raise DeploymentError(
+            "shared scheduler FotMob admission mount source is unavailable"
+        ) from exc
+    if (
+        mount.get("Type") != "bind"
+        or mount.get("RW") is not False
+        or observed_source != expected_source
+    ):
+        raise DeploymentError(
+            "shared scheduler FotMob admission mount is not the exact read-only "
+            "evidence directory"
+        )
+
+    observed_report = run(
+        (
+            "docker",
+            "exec",
+            shared_container,
+            "printenv",
+            SHARED_DEPLOYMENT_REPORT_PATH_ENV,
+        ),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.rstrip("\n")
+    if observed_report != expected_report:
+        raise DeploymentError(
+            "shared scheduler deployment report path differs from admission mount"
+        )
+    return {
+        "type": "bind",
+        "source": str(expected_source),
+        "destination": expected_destination,
+        "read_only": True,
+        "report_path": expected_report,
+    }
+
+
 def validate_shared_handoff(
     release_root: Path,
     shared_container: str,
     expected_control_uri: str,
     *,
+    evidence_dir: Path,
+    report_relative_path: Path,
     run: Callable[..., subprocess.CompletedProcess[str]],
 ) -> dict[str, Any]:
     """Prove the shared scheduler has surrendered FotMob schedule ownership."""
@@ -591,6 +713,12 @@ def validate_shared_handoff(
     if re.fullmatch(r"[0-9a-f]{64}", shared_container_id) is None:
         raise DeploymentError("cannot resolve full shared scheduler container ID")
     shared_container = shared_container_id
+    shared_admission_mount = validate_shared_admission_mount(
+        shared_container,
+        evidence_dir,
+        report_relative_path,
+        run=run,
+    )
     control_database = validate_control_database(
         shared_container, expected_control_uri, run=run
     )
@@ -609,7 +737,8 @@ def validate_shared_handoff(
         "        if path.is_symlink():\n"
         "            raise RuntimeError('shared runtime symlink: '+str(path))\n"
         "        if (path.is_file() and '__pycache__' not in path.parts "
-        "and path.name.endswith(suffixes)):\n"
+        "and (path.name == '.airflowignore' or "
+        "path.name.endswith(suffixes))):\n"
         "            key=prefix+'/'+path.relative_to(root).as_posix()\n"
         "            manifest[key]=hashlib.sha256(path.read_bytes()).hexdigest()\n"
         "print('FOTMOB_SHARED_RUNTIME_MANIFEST_JSON='+"
@@ -869,7 +998,9 @@ s.close()
     if not isinstance(serialized, Mapping) or not serialized.get("present"):
         raise DeploymentError("shared metadata has no serialized master DAG")
     if serialized.get("fileloc") != "/opt/airflow/dags/dag_master_pipeline.py":
-        raise DeploymentError("shared serialized master DAG has unexpected file location")
+        raise DeploymentError(
+            "shared serialized master DAG has unexpected file location"
+        )
     if serialized.get("gate_present") is not True or gate_id not in set(
         serialized.get("trigger_upstream") or ()
     ):
@@ -878,7 +1009,9 @@ s.close()
         )
     serialized_sofa = orchestration.get("sofascore")
     if not isinstance(serialized_sofa, Mapping) or not serialized_sofa.get("present"):
-        raise DeploymentError("shared metadata has no serialized SofaScore pipeline DAG")
+        raise DeploymentError(
+            "shared metadata has no serialized SofaScore pipeline DAG"
+        )
     if serialized_sofa.get("fileloc") != (
         "/opt/airflow/dags/dag_sofascore_pipeline.py"
     ):
@@ -902,8 +1035,7 @@ s.close()
     if (
         sensor_id not in set(serialized_sofa.get("xref_upstream") or ())
         or xref_id not in set(serialized_sofa.get("sensor_downstream") or ())
-        or set(serialized_sofa.get("finalizer_upstream") or ())
-        != {sensor_id, e4_id}
+        or set(serialized_sofa.get("finalizer_upstream") or ()) != {sensor_id, e4_id}
         or finalizer_id not in set(serialized_sofa.get("e4_downstream") or ())
         or serialized_sofa.get("finalizer_trigger_rule") != "all_done"
     ):
@@ -930,15 +1062,16 @@ s.close()
     if (
         serialized_xref.get("start_present") is not True
         or serialized_xref.get("preflight_present") is not True
-        or set(serialized_xref.get("start_downstream") or ())
-        != {xref_preflight_id}
+        or set(serialized_xref.get("start_downstream") or ()) != {xref_preflight_id}
         or set(serialized_xref.get("preflight_upstream") or ()) != {xref_start_id}
         or serialized_xref.get("preflight_trigger_rule") != "all_success"
         or not xref_writer_ids.issubset(xref_task_ids)
         or not xref_writer_ids.issubset(xref_descendants)
         or xref_task_ids - {xref_start_id, xref_preflight_id} != xref_descendants
         or not isinstance(trigger_rules, Mapping)
-        or any(trigger_rules.get(task_id) != "all_success" for task_id in xref_writer_ids)
+        or any(
+            trigger_rules.get(task_id) != "all_success" for task_id in xref_writer_ids
+        )
     ):
         raise DeploymentError(
             "shared serialized xref DAG does not gate every writer behind "
@@ -1010,9 +1143,11 @@ s.close()
         "dag_ingest_fotmob": True,
         "dag_transform_fotmob_silver": True,
     }
-    if not isinstance(pause_states, Mapping) or {
-        dag_id: pause_states.get(dag_id) for dag_id in expected_pause_states
-    } != expected_pause_states:
+    if (
+        not isinstance(pause_states, Mapping)
+        or {dag_id: pause_states.get(dag_id) for dag_id in expected_pause_states}
+        != expected_pause_states
+    ):
         raise DeploymentError(
             "shared orchestration must have master/ingest/Silver paused and "
             "SofaScore pipeline unpaused"
@@ -1070,6 +1205,7 @@ s.close()
     }
     return {
         "shared_scheduler_container": shared_container_id,
+        "shared_admission_mount": shared_admission_mount,
         "master_dag_sha256": expected_hash,
         "remote_master_dag_sha256": remote_hash,
         "runtime_code_sha256": shared_runtime_hashes,
@@ -1098,6 +1234,7 @@ def validate_stable_shared_handoff(
     if (
         initial.get("shared_scheduler_container")
         != final.get("shared_scheduler_container")
+        or initial.get("shared_admission_mount") != final.get("shared_admission_mount")
         or initial.get("runtime_code_sha256") != final.get("runtime_code_sha256")
     ):
         raise DeploymentError("shared handoff identity changed during admission")
@@ -1158,6 +1295,7 @@ def deploy(
     if not report_relative_path.parts:
         raise DeploymentError("--report must name a file inside --evidence-dir")
     container_report_path = CONTAINER_EVIDENCE_ROOT / report_relative_path
+    _prepare_evidence_report_path(evidence_dir, report_path)
     sha = release_sha(release_root, run)
     if not args.env_file.is_file():
         raise DeploymentError("--env-file does not exist")
@@ -1170,12 +1308,13 @@ def deploy(
         raise DeploymentError("FBREF_CONTROL_DB_URI is required")
     if not compose_file.is_file():
         raise DeploymentError("--compose-file does not exist")
-    evidence_dir.mkdir(parents=True, exist_ok=True)
     dagbag_root = prepare_dagbag(release_root, evidence_dir, sha)
     initial_handoff = validate_shared_handoff(
         release_root,
         args.shared_scheduler_container,
         control_db_uri,
+        evidence_dir=evidence_dir,
+        report_relative_path=report_relative_path,
         run=run,
     )
     deployment_id = secrets.token_hex(16)
@@ -1228,9 +1367,7 @@ def deploy(
         )
 
     def dag_rows() -> list[dict[str, Any]]:
-        return parse_airflow_json(
-            airflow("dags", "list", "--output", "json").stdout
-        )
+        return parse_airflow_json(airflow("dags", "list", "--output", "json").stdout)
 
     def active_runs() -> dict[str, dict[str, list[str]]]:
         active: dict[str, dict[str, list[str]]] = {}
@@ -1252,9 +1389,7 @@ def deploy(
                     if str(row.get("state", "")).lower() == state
                 ]
                 if run_ids:
-                    active.setdefault(dag_id, {})[state] = [
-                        *run_ids
-                    ]
+                    active.setdefault(dag_id, {})[state] = [*run_ids]
         return active
 
     def assert_paused(expected: set[str]) -> list[dict[str, Any]]:
@@ -1301,9 +1436,7 @@ def deploy(
         health_error: str | None = "scheduler health check not attempted"
         while time.monotonic() < deadline:
             try:
-                airflow(
-                    "jobs", "check", "--job-type", "SchedulerJob"
-                )
+                airflow("jobs", "check", "--job-type", "SchedulerJob")
                 health_error = None
                 break
             except subprocess.CalledProcessError as exc:
@@ -1314,9 +1447,7 @@ def deploy(
 
         cli_rows = dag_rows()
         import_errors = parse_airflow_json(
-            airflow(
-                "dags", "list-import-errors", "--output", "json"
-            ).stdout
+            airflow("dags", "list-import-errors", "--output", "json").stdout
         )
         validate_dagbag(cli_rows, import_errors)
 
@@ -1433,9 +1564,7 @@ def deploy(
             marker_code,
             capture=True,
         ).stdout
-        marker_result = parse_marker_json(
-            marker_output, "FOTMOB_RUNTIME_MARKER_JSON="
-        )
+        marker_result = parse_marker_json(marker_output, "FOTMOB_RUNTIME_MARKER_JSON=")
         if not isinstance(marker_result, Mapping) or marker_result.get("count") != 1:
             raise DeploymentError("durable Trino deployment marker was not admitted")
         data_plane_marker = {
@@ -1464,13 +1593,19 @@ def deploy(
                 release_root,
                 args.shared_scheduler_container,
                 control_db_uri,
+                evidence_dir=evidence_dir,
+                report_relative_path=report_relative_path,
                 run=run,
             )
             validate_stable_shared_handoff(initial_handoff, final_handoff)
             if release_sha(release_root, run) != sha:
-                raise DeploymentError("release Git SHA changed before schedule admission")
+                raise DeploymentError(
+                    "release Git SHA changed before schedule admission"
+                )
             if prepare_dagbag(release_root, evidence_dir, sha) != dagbag_root:
-                raise DeploymentError("DagBag projection changed before schedule admission")
+                raise DeploymentError(
+                    "DagBag projection changed before schedule admission"
+                )
         isolated_runtime_hashes = validate_isolated_runtime_manifest(
             container_id,
             expected_isolated_runtime_manifest(release_root, dagbag_root),
@@ -1485,6 +1620,9 @@ def deploy(
             "release_root": str(release_root),
             "evidence_dir": str(evidence_dir),
             "container_report_path": str(container_report_path),
+            "shared_container_report_path": str(
+                SHARED_CONTAINER_EVIDENCE_ROOT / report_relative_path
+            ),
             "dagbag_root": str(dagbag_root),
             "git_sha": sha,
             "deployment_id": deployment_id,

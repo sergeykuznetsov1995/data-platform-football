@@ -1,9 +1,11 @@
 import importlib.util
 import json
+import os
 import subprocess
 from pathlib import Path
 
 import pytest
+import yaml
 
 from scripts import fotmob_runtime
 
@@ -114,6 +116,10 @@ def test_shared_compose_requires_control_db_and_release_sha_contract():
 
     assert "FBREF_CONTROL_DB_URI: ${FBREF_CONTROL_DB_URI:?" in compose
     assert "FOTMOB_DEPLOY_GIT_SHA: ${FOTMOB_DEPLOY_GIT_SHA:?" in compose
+    assert "FOTMOB_SHARED_DEPLOYMENT_REPORT_PATH:" in compose
+    assert "source: ${FOTMOB_SHARED_ADMISSION_HOST_DIR:" in compose
+    assert "target: /opt/airflow/fotmob-admission" in compose
+    assert "read_only: true" in compose
     assert "./configs/fotmob:/opt/airflow/configs/fotmob:ro" in compose
     assert "FOTMOB_ISOLATED_STACK" not in compose
     assert (
@@ -121,6 +127,41 @@ def test_shared_compose_requires_control_db_and_release_sha_contract():
         "%3Cyour-airflow-db-password%3E@postgres:5432/airflow"
     ) in example
     assert "FOTMOB_DEPLOY_GIT_SHA=" + "0" * 40 in example
+    assert "FOTMOB_SHARED_ADMISSION_HOST_DIR=" in example
+    assert (
+        "FOTMOB_SHARED_DEPLOYMENT_REPORT_PATH="
+        "/opt/airflow/fotmob-admission/deployment.json"
+    ) in example
+
+    document = yaml.safe_load(compose)
+    assert document["services"]["airflow-scheduler"]["environment"][
+        "FOTMOB_SHARED_DEPLOYMENT_REPORT_PATH"
+    ] == (
+        "${FOTMOB_SHARED_DEPLOYMENT_REPORT_PATH:?set exact report path "
+        "under /opt/airflow/fotmob-admission}"
+    )
+    scheduler_mounts = {
+        mount["target"]: mount
+        for mount in document["services"]["airflow-scheduler"]["volumes"]
+        if isinstance(mount, dict)
+    }
+    assert scheduler_mounts["/opt/airflow/configs/fotmob"] == {
+        "type": "bind",
+        "source": "./configs/fotmob",
+        "target": "/opt/airflow/configs/fotmob",
+        "read_only": True,
+        "bind": {"create_host_path": False},
+    }
+    assert scheduler_mounts["/opt/airflow/fotmob-admission"] == {
+        "type": "bind",
+        "source": (
+            "${FOTMOB_SHARED_ADMISSION_HOST_DIR:?set the absolute FotMob "
+            "evidence directory}"
+        ),
+        "target": "/opt/airflow/fotmob-admission",
+        "read_only": True,
+        "bind": {"create_host_path": False},
+    }
 
 
 def test_prepare_dagbag_contains_exact_root_files_and_detects_tampering(tmp_path):
@@ -193,16 +234,16 @@ def test_expected_isolated_manifest_is_exact_effective_projection(tmp_path):
 
     manifest = mod.expected_isolated_runtime_manifest(tmp_path, dagbag)
 
-    assert manifest["dags/dag_trigger_fotmob_daily.py"] == shared[
-        "dags/dag_trigger_fotmob_daily.py"
-    ]
-    assert manifest["dags/utils/fotmob_publication.py"] == shared[
-        "dags/utils/fotmob_publication.py"
-    ]
-    assert "dags/dag_master_pipeline.py" not in manifest
-    assert manifest["dags/.airflowignore"] == mod._sha256(
-        dagbag / ".airflowignore"
+    assert (
+        manifest["dags/dag_trigger_fotmob_daily.py"]
+        == shared["dags/dag_trigger_fotmob_daily.py"]
     )
+    assert (
+        manifest["dags/utils/fotmob_publication.py"]
+        == shared["dags/utils/fotmob_publication.py"]
+    )
+    assert "dags/dag_master_pipeline.py" not in manifest
+    assert manifest["dags/.airflowignore"] == mod._sha256(dagbag / ".airflowignore")
 
 
 def test_isolated_container_manifest_must_match_exact_paths_and_bytes():
@@ -218,9 +259,7 @@ def test_isolated_container_manifest_must_match_exact_paths_and_bytes():
             command,
             0,
             stdout=(
-                "FOTMOB_ISOLATED_RUNTIME_MANIFEST_JSON="
-                + json.dumps(expected)
-                + "\n"
+                "FOTMOB_ISOLATED_RUNTIME_MANIFEST_JSON=" + json.dumps(expected) + "\n"
             ),
             stderr="",
         )
@@ -297,9 +336,7 @@ def _orchestration_payload(
             "present": True,
             "fileloc": "/opt/airflow/dags/dag_master_pipeline.py",
             "gate_present": True,
-            "trigger_upstream": [
-                "ingestion_triggers.fotmob_shared_schedule_owner"
-            ],
+            "trigger_upstream": ["ingestion_triggers.fotmob_shared_schedule_owner"],
         },
         "sofascore": {
             "present": True,
@@ -308,12 +345,8 @@ def _orchestration_payload(
             "xref_present": True,
             "e4_present": True,
             "finalizer_present": True,
-            "sensor_downstream": (
-                ["trigger_xref_transforms"] if safe_edges else []
-            ),
-            "xref_upstream": (
-                ["wait_for_fotmob_publication"] if safe_edges else []
-            ),
+            "sensor_downstream": (["trigger_xref_transforms"] if safe_edges else []),
+            "xref_upstream": (["wait_for_fotmob_publication"] if safe_edges else []),
             "e4_downstream": ["finalize_fotmob_publication"],
             "finalizer_upstream": [
                 "trigger_e4_transforms",
@@ -338,9 +371,7 @@ def _orchestration_payload(
                 [*xref_writers, *xref_tail] if safe_xref else xref_tail
             ),
             "preflight_trigger_rule": "all_success",
-            "task_trigger_rules": {
-                task_id: "all_success" for task_id in xref_writers
-            },
+            "task_trigger_rules": {task_id: "all_success" for task_id in xref_writers},
         },
         "fenced_downstream": {
             "dag_transform_e3": downstream_proof(
@@ -383,7 +414,15 @@ def _orchestration_payload(
 
 
 def _shared_handoff_runner(
-    root, orchestration, *, omitted_runtime_path=None, stale_runtime_path=None
+    root,
+    orchestration,
+    *,
+    omitted_runtime_path=None,
+    stale_runtime_path=None,
+    mount_source=None,
+    mount_type="bind",
+    mount_rw=False,
+    report_path="/opt/airflow/fotmob-admission/deployment.json",
 ):
     remote_digests = _shared_runtime_digests(root)
     if omitted_runtime_path is not None:
@@ -395,8 +434,29 @@ def _shared_handoff_runner(
         run.calls.append(command)
         if command[:4] == ("docker", "inspect", "--format", "{{.Id}}"):
             stdout = "9" * 64 + "\n"
+        elif command[:4] == (
+            "docker",
+            "inspect",
+            "--format",
+            "{{json .Mounts}}",
+        ):
+            stdout = json.dumps(
+                [
+                    {
+                        "Type": mount_type,
+                        "Source": str(mount_source or root.resolve()),
+                        "Destination": "/opt/airflow/fotmob-admission",
+                        "RW": mount_rw,
+                    }
+                ]
+            )
         elif command[-2:] == ("printenv", "FBREF_CONTROL_DB_URI"):
             stdout = "postgresql://control@postgres/control\n"
+        elif command[-2:] == (
+            "printenv",
+            "FOTMOB_SHARED_DEPLOYMENT_REPORT_PATH",
+        ):
+            stdout = report_path + "\n"
         elif command[-2:] == ("printenv", "FOTMOB_DEPLOY_GIT_SHA"):
             stdout = "a" * 40 + "\n"
         elif command[:4] == ("git", "-C", str(root), "rev-parse"):
@@ -407,13 +467,9 @@ def _shared_handoff_runner(
                 '"checksum_verified":true}\n'
             )
         elif "FOTMOB_SHARED_RUNTIME_MANIFEST_JSON=" in command[-1]:
-            stdout = "FOTMOB_SHARED_RUNTIME_MANIFEST_JSON=" + json.dumps(
-                remote_digests
-            )
+            stdout = "FOTMOB_SHARED_RUNTIME_MANIFEST_JSON=" + json.dumps(remote_digests)
         elif "FOTMOB_SHARED_ORCHESTRATION_JSON=" in command[-1]:
-            stdout = "FOTMOB_SHARED_ORCHESTRATION_JSON=" + json.dumps(
-                orchestration
-            )
+            stdout = "FOTMOB_SHARED_ORCHESTRATION_JSON=" + json.dumps(orchestration)
         else:
             raise AssertionError(f"unexpected command: {command}")
         return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
@@ -422,9 +478,22 @@ def _shared_handoff_runner(
     return run
 
 
+def _validate_shared_handoff(
+    release_root, shared_container, expected_control_uri, *, run
+):
+    return mod.validate_shared_handoff(
+        release_root,
+        shared_container,
+        expected_control_uri,
+        evidence_dir=release_root,
+        report_relative_path=Path("deployment.json"),
+        run=run,
+    )
+
+
 def test_shared_handoff_proves_production_orchestrator_and_no_running_run(tmp_path):
     runner = _shared_handoff_runner(tmp_path, _orchestration_payload())
-    evidence = mod.validate_shared_handoff(
+    evidence = _validate_shared_handoff(
         tmp_path,
         "shared-scheduler",
         "postgresql://control@postgres/control",
@@ -432,6 +501,13 @@ def test_shared_handoff_proves_production_orchestrator_and_no_running_run(tmp_pa
     )
     assert evidence["passed"] is True
     assert evidence["shared_scheduler_container"] == "9" * 64
+    assert evidence["shared_admission_mount"] == {
+        "type": "bind",
+        "source": str(tmp_path.resolve()),
+        "destination": "/opt/airflow/fotmob-admission",
+        "read_only": True,
+        "report_path": "/opt/airflow/fotmob-admission/deployment.json",
+    }
     assert all(
         command[2] == "9" * 64
         for command in runner.calls
@@ -447,8 +523,7 @@ def test_shared_handoff_proves_production_orchestrator_and_no_running_run(tmp_pa
     assert "configs/fotmob/competitions.json" in evidence["runtime_code_sha256"]
     assert "scrapers/fotmob/service.py" in evidence["runtime_code_sha256"]
     assert (
-        "dags/sql/silver/fotmob_player_profile.sql"
-        in evidence["runtime_code_sha256"]
+        "dags/sql/silver/fotmob_player_profile.sql" in evidence["runtime_code_sha256"]
     )
     assert evidence["runtime_code_sha256"] == mod.shared_runtime_manifest(tmp_path)
     assert mod.SHARED_RUNTIME_ROOTS == fotmob_runtime.SHARED_RUNTIME_ROOTS
@@ -477,9 +552,63 @@ def test_shared_handoff_proves_production_orchestrator_and_no_running_run(tmp_pa
     assert "Variable.key == 'fotmob_schedule_owner'" in proof_code
 
 
+@pytest.mark.parametrize(
+    ("runner_kwargs", "message"),
+    [
+        ({"mount_type": "volume"}, "exact read-only evidence directory"),
+        ({"mount_rw": True}, "exact read-only evidence directory"),
+        (
+            {"report_path": "/opt/airflow/fotmob-admission/other.json"},
+            "report path differs",
+        ),
+    ],
+)
+def test_shared_handoff_rejects_wrong_admission_mount_or_report(
+    tmp_path, runner_kwargs, message
+):
+    _shared_runtime_digests(tmp_path)
+    runner = _shared_handoff_runner(
+        tmp_path,
+        _orchestration_payload(),
+        **runner_kwargs,
+    )
+
+    with pytest.raises(mod.DeploymentError, match=message):
+        _validate_shared_handoff(
+            tmp_path,
+            "shared-scheduler",
+            "postgresql://control@postgres/control",
+            run=runner,
+        )
+
+
+def test_shared_handoff_rejects_different_resolved_evidence_source(tmp_path):
+    _shared_runtime_digests(tmp_path)
+    other = tmp_path / "other-evidence"
+    other.mkdir()
+    runner = _shared_handoff_runner(
+        tmp_path,
+        _orchestration_payload(),
+        mount_source=other,
+    )
+
+    with pytest.raises(mod.DeploymentError, match="exact read-only evidence directory"):
+        _validate_shared_handoff(
+            tmp_path,
+            "shared-scheduler",
+            "postgresql://control@postgres/control",
+            run=runner,
+        )
+
+
 def test_shared_handoff_identity_must_remain_stable_until_activation():
     initial = {
         "shared_scheduler_container": "1" * 64,
+        "shared_admission_mount": {
+            "source": "/evidence",
+            "destination": "/opt/airflow/fotmob-admission",
+            "read_only": True,
+        },
         "runtime_code_sha256": {"dags/example.py": "a" * 64},
     }
     mod.validate_stable_shared_handoff(initial, dict(initial))
@@ -492,6 +621,15 @@ def test_shared_handoff_identity_must_remain_stable_until_activation():
     }
     with pytest.raises(mod.DeploymentError, match="identity changed"):
         mod.validate_stable_shared_handoff(initial, drifted)
+    remounted = {
+        **initial,
+        "shared_admission_mount": {
+            **initial["shared_admission_mount"],
+            "source": "/other-evidence",
+        },
+    }
+    with pytest.raises(mod.DeploymentError, match="identity changed"):
+        mod.validate_stable_shared_handoff(initial, remounted)
 
 
 def test_runtime_manifest_ignores_only_generated_bytecode(tmp_path):
@@ -516,6 +654,7 @@ def test_runtime_manifest_rejects_wrong_approved_scope_bytes(tmp_path):
 @pytest.mark.parametrize(
     "runtime_path",
     [
+        "dags/.airflowignore",
         "configs/fotmob/competitions.json",
         "configs/fotmob/issue-930-scopes.txt",
         "scrapers/fotmob/service.py",
@@ -532,7 +671,7 @@ def test_shared_handoff_rejects_incomplete_or_stale_runtime_manifest(
         stale_runtime_path=runtime_path if failure_mode == "stale" else None,
     )
     with pytest.raises(mod.DeploymentError, match="bind-mounted runtime differs"):
-        mod.validate_shared_handoff(
+        _validate_shared_handoff(
             tmp_path,
             "shared-scheduler",
             "postgresql://control@postgres/control",
@@ -551,7 +690,7 @@ def test_shared_handoff_rejects_running_sofa_master_or_fotmob_run(tmp_path):
         ]
     )
     with pytest.raises(mod.DeploymentError, match="still has active"):
-        mod.validate_shared_handoff(
+        _validate_shared_handoff(
             tmp_path,
             "shared-scheduler",
             "postgresql://control@postgres/control",
@@ -570,7 +709,7 @@ def test_shared_handoff_rejects_running_downstream_consumer(tmp_path):
         ]
     )
     with pytest.raises(mod.DeploymentError, match="E3/E4/Gold"):
-        mod.validate_shared_handoff(
+        _validate_shared_handoff(
             tmp_path,
             "shared-scheduler",
             "postgresql://control@postgres/control",
@@ -588,7 +727,7 @@ def test_shared_handoff_rejects_wrong_production_pause_state(tmp_path):
         }
     )
     with pytest.raises(mod.DeploymentError, match="master/ingest/Silver paused"):
-        mod.validate_shared_handoff(
+        _validate_shared_handoff(
             tmp_path,
             "shared-scheduler",
             "postgresql://control@postgres/control",
@@ -600,7 +739,7 @@ def test_shared_handoff_rejects_wrong_owner_from_atomic_snapshot(tmp_path):
     orchestration = _orchestration_payload()
     orchestration["schedule_owner"] = "shared"
     with pytest.raises(mod.DeploymentError, match="must equal 'isolated'"):
-        mod.validate_shared_handoff(
+        _validate_shared_handoff(
             tmp_path,
             "shared-scheduler",
             "postgresql://control@postgres/control",
@@ -610,19 +749,20 @@ def test_shared_handoff_rejects_wrong_owner_from_atomic_snapshot(tmp_path):
 
 def test_shared_handoff_allows_only_paused_stale_shared_daily_row(tmp_path):
     safe = _orchestration_payload(daily_present=True, daily_paused=True)
-    evidence = mod.validate_shared_handoff(
+    evidence = _validate_shared_handoff(
         tmp_path,
         "shared-scheduler",
         "postgresql://control@postgres/control",
         run=_shared_handoff_runner(tmp_path, safe),
     )
-    assert evidence["orchestration_state"]["shared_daily_trigger"] == (
-        safe["shared_daily_trigger"]
+    assert (
+        evidence["orchestration_state"]["shared_daily_trigger"]
+        == (safe["shared_daily_trigger"])
     )
 
     unsafe = _orchestration_payload(daily_present=True, daily_paused=False)
     with pytest.raises(mod.DeploymentError, match="paused stale row"):
-        mod.validate_shared_handoff(
+        _validate_shared_handoff(
             tmp_path,
             "shared-scheduler",
             "postgresql://control@postgres/control",
@@ -632,7 +772,7 @@ def test_shared_handoff_allows_only_paused_stale_shared_daily_row(tmp_path):
     opted_in = _orchestration_payload()
     opted_in["shared_daily_trigger"]["isolated_stack_env"] = "1"
     with pytest.raises(mod.DeploymentError, match="paused stale row"):
-        mod.validate_shared_handoff(
+        _validate_shared_handoff(
             tmp_path,
             "shared-scheduler",
             "postgresql://control@postgres/control",
@@ -642,7 +782,7 @@ def test_shared_handoff_allows_only_paused_stale_shared_daily_row(tmp_path):
 
 def test_shared_handoff_rejects_unsafe_sofa_publication_edges(tmp_path):
     with pytest.raises(mod.DeploymentError, match="unsafe FotMob publication edges"):
-        mod.validate_shared_handoff(
+        _validate_shared_handoff(
             tmp_path,
             "shared-scheduler",
             "postgresql://control@postgres/control",
@@ -654,7 +794,7 @@ def test_shared_handoff_rejects_unsafe_sofa_publication_edges(tmp_path):
 
 def test_shared_handoff_rejects_xref_writer_outside_publication_preflight(tmp_path):
     with pytest.raises(mod.DeploymentError, match="gate every writer"):
-        mod.validate_shared_handoff(
+        _validate_shared_handoff(
             tmp_path,
             "shared-scheduler",
             "postgresql://control@postgres/control",
@@ -672,7 +812,7 @@ def test_shared_handoff_rejects_unpaused_shared_silver(tmp_path):
         "dag_transform_fotmob_silver": False,
     }
     with pytest.raises(mod.DeploymentError, match="master/ingest/Silver paused"):
-        mod.validate_shared_handoff(
+        _validate_shared_handoff(
             tmp_path,
             "shared-scheduler",
             "postgresql://control@postgres/control",
@@ -684,7 +824,7 @@ def test_shared_handoff_rejects_unpaused_shared_silver(tmp_path):
 
 def test_shared_handoff_rejects_downstream_writer_outside_preflight(tmp_path):
     with pytest.raises(mod.DeploymentError, match="before every downstream task"):
-        mod.validate_shared_handoff(
+        _validate_shared_handoff(
             tmp_path,
             "shared-scheduler",
             "postgresql://control@postgres/control",
@@ -900,7 +1040,9 @@ def test_partial_compose_up_failure_still_stops_scheduler(tmp_path, monkeypatch)
 
     with pytest.raises(subprocess.CalledProcessError):
         mod.deploy(arguments, run=run, sleeper=lambda _: None)
-    assert any("stop" in command and "airflow-scheduler" in command for command in calls)
+    assert any(
+        "stop" in command and "airflow-scheduler" in command for command in calls
+    )
 
 
 def test_trigger_activation_is_active_before_unpause_kill_point(tmp_path):
@@ -933,6 +1075,51 @@ def test_trigger_activation_is_active_before_unpause_kill_point(tmp_path):
     persisted = json.loads(report_path.read_text(encoding="utf-8"))
     assert persisted["passed"] is True
     assert persisted["activation_state"] == "active"
+
+
+def test_atomic_deployment_report_is_scheduler_readable_after_root_style_replace(
+    tmp_path,
+):
+    report_path = tmp_path / "deployment.json"
+    report_path.write_text("stale", encoding="utf-8")
+    report_path.chmod(0o600)
+    payload = {
+        "schema_version": "fotmob-deploy-v2",
+        "passed": True,
+        "delivery_credentials": {
+            "telegram_bot_token_configured": True,
+            "telegram_chat_id_configured": True,
+        },
+    }
+
+    mod._atomic_json(report_path, payload)
+
+    report_stat = report_path.stat()
+    mode = report_stat.st_mode & 0o777
+    assert mode == mod.DEPLOYMENT_REPORT_MODE == 0o444
+    # A scheduler running as uid 50000 can read a report written by a
+    # different host uid (normally root); no credential value is exposed.
+    assert mode & 0o004
+    rendered = report_path.read_text(encoding="utf-8")
+    assert json.loads(rendered) == payload
+    assert "must-not-appear" not in rendered
+    if os.geteuid() == 0:
+        assert report_stat.st_uid == 0
+
+
+def test_evidence_report_directories_ignore_restrictive_root_umask(tmp_path):
+    evidence_dir = tmp_path / "evidence"
+    report_path = evidence_dir / "nested" / "deployment.json"
+    previous_umask = os.umask(0o077)
+    try:
+        mod._prepare_evidence_report_path(evidence_dir, report_path)
+        mod._atomic_json(report_path, {"passed": True})
+    finally:
+        os.umask(previous_umask)
+
+    assert evidence_dir.stat().st_mode & 0o777 == mod.EVIDENCE_DIRECTORY_MODE
+    assert report_path.parent.stat().st_mode & 0o777 == (mod.EVIDENCE_DIRECTORY_MODE)
+    assert report_path.stat().st_mode & 0o777 == mod.DEPLOYMENT_REPORT_MODE
 
 
 def test_trigger_activation_never_unpauses_when_durable_commit_crashes(

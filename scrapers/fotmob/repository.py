@@ -187,6 +187,67 @@ def _completed_at_key(view: Mapping[str, Any]) -> str:
     return str(view.get("completed_at") or "")
 
 
+def _raw_entity_rank(view: Mapping[str, Any]) -> tuple[int, str, str, str]:
+    """Choose the authoritative v2/v1 terminal observation deterministically."""
+
+    version_rank = 1 if view.get("parser_version") == PARSER_VERSION else 0
+    return (
+        version_rank,
+        _completed_at_key(view),
+        str(view.get("batch_id") or ""),
+        str(view.get("target_key") or ""),
+    )
+
+
+def _newer_raw_entity_view(
+    current: Optional[Mapping[str, Any]], candidate: Mapping[str, Any]
+) -> dict[str, Any]:
+    normalized = dict(candidate)
+    if current is None or _raw_entity_rank(normalized) >= _raw_entity_rank(current):
+        return normalized
+    return dict(current)
+
+
+def _is_sha256(value: object) -> bool:
+    text = str(value or "")
+    return len(text) == 64 and all(
+        character in "0123456789abcdef" for character in text
+    )
+
+
+def _raw_entity_result(
+    target_type: str,
+    entity_id: str,
+    view: Optional[Mapping[str, Any]],
+) -> Optional[dict[str, Any]]:
+    if (
+        view is None
+        or view.get("status") not in SUCCESS_STATES
+        or view.get("parser_version") not in {PARSER_VERSION, LEGACY_PARSER_VERSION}
+        or not _is_sha256(view.get("target_key"))
+        or not _is_sha256(view.get("content_hash"))
+        or not str(view.get("raw_uri") or "").strip()
+    ):
+        return None
+    fields = (
+        "target_key",
+        "batch_id",
+        "content_hash",
+        "raw_uri",
+        "parser_version",
+        "status",
+        "fetched_at",
+        "completed_at",
+        "actual_counts_json",
+        "capabilities_json",
+    )
+    return {
+        "target_type": target_type,
+        "entity_id": entity_id,
+        **{field: view.get(field) for field in fields},
+    }
+
+
 def normalize_rows(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """Return rows with homogeneous, Arrow-safe scalar values."""
 
@@ -525,6 +586,11 @@ class FotMobRepository:
         self._seeded_scopes: set[tuple[Any, ...]] = set()
         self._pending_targets: dict[str, dict[str, Any]] = {}
         self._pending_entities: dict[tuple[str, str], dict[str, Any]] = {}
+        # Offline replay needs the exact historical raw target for entities whose
+        # canonical URL rotates (Next.js players).  Keep the newest terminal
+        # observation, including tombstones: an older payload must not be
+        # resurrected after a proven source absence.
+        self._pending_raw_entities: dict[tuple[str, str], dict[str, Any]] = {}
         self._pending_rows = 0
         # Incremental planning asks "did we already ingest this target?" once
         # per target. As a Trino round-trip that was the single most expensive
@@ -533,6 +599,10 @@ class FotMobRepository:
         # free; commits keep the index current so read-your-writes still holds.
         self._manifest_index: dict[str, dict[str, Any]] = {}
         self._entity_index: dict[tuple[str, str], dict[str, Any]] = {}
+        self._run_manifest_index: dict[str, dict[str, Any]] = {}
+        self._run_entity_index: dict[tuple[str, str], dict[str, Any]] = {}
+        self._preloaded_run_id: Optional[str] = None
+        self._raw_entity_index: dict[tuple[str, str], dict[str, Any]] = {}
         self._preloaded = False
 
     def _write(
@@ -721,9 +791,7 @@ class FotMobRepository:
             return rows
         seen = self._seen_keys.setdefault(table, set())
         staged = (
-            staged_seen.setdefault(table, set())
-            if staged_seen is not None
-            else seen
+            staged_seen.setdefault(table, set()) if staged_seen is not None else seen
         )
         output: list[dict[str, Any]] = []
         for row in rows:
@@ -796,17 +864,32 @@ class FotMobRepository:
         """Make a buffered commit visible to this run's incremental reads."""
 
         status = str(manifest_row.get("status"))
+        parser_version = manifest_row.get("parser_version")
+        entity_id = manifest_row.get("entity_id")
         if (
-            manifest_row.get("parser_version") != PARSER_VERSION
+            parser_version in {PARSER_VERSION, LEGACY_PARSER_VERSION}
+            and status in TERMINAL_OBSERVATION_STATES
+            and entity_id is not None
+        ):
+            raw_key = (str(manifest_row.get("target_type")), str(entity_id))
+            raw_view = {
+                column: manifest_row.get(column) for column in self._READ_COLUMNS
+            }
+            raw_view["run_id"] = manifest_row.get("run_id")
+            self._pending_raw_entities[raw_key] = _newer_raw_entity_view(
+                self._pending_raw_entities.get(raw_key), raw_view
+            )
+        if (
+            parser_version != PARSER_VERSION
             or status not in TERMINAL_OBSERVATION_STATES
         ):
             return
         view = {column: manifest_row.get(column) for column in self._READ_COLUMNS}
+        view["run_id"] = manifest_row.get("run_id")
         target_key = str(manifest_row.get("target_key"))
         # Keep tombstones in the pending overlay too: absence must shadow an
         # older durable success until the manifest flush lands.
         self._pending_targets[target_key] = view
-        entity_id = manifest_row.get("entity_id")
         if entity_id is not None:
             key = (str(manifest_row.get("target_type")), str(entity_id))
             self._pending_entities[key] = view
@@ -815,39 +898,77 @@ class FotMobRepository:
         """Fold a durable commit into the preloaded index."""
 
         status = str(manifest_row.get("status"))
+        parser_version = manifest_row.get("parser_version")
+        entity_id = manifest_row.get("entity_id")
+        if (
+            self._preloaded
+            and parser_version in {PARSER_VERSION, LEGACY_PARSER_VERSION}
+            and status in TERMINAL_OBSERVATION_STATES
+            and entity_id is not None
+        ):
+            raw_key = (str(manifest_row.get("target_type")), str(entity_id))
+            raw_view = {
+                column: manifest_row.get(column) for column in self._READ_COLUMNS
+            }
+            raw_view["run_id"] = manifest_row.get("run_id")
+            self._raw_entity_index[raw_key] = _newer_raw_entity_view(
+                self._raw_entity_index.get(raw_key), raw_view
+            )
         if (
             not self._preloaded
-            or manifest_row.get("parser_version") != PARSER_VERSION
+            or parser_version != PARSER_VERSION
             or status not in TERMINAL_OBSERVATION_STATES
         ):
             return
         view = {column: manifest_row.get(column) for column in self._READ_COLUMNS}
+        view["run_id"] = manifest_row.get("run_id")
         target_key = str(manifest_row.get("target_key"))
         if status in SUCCESS_STATES:
             self._manifest_index[target_key] = view
         else:
             self._manifest_index.pop(target_key, None)
-        entity_id = manifest_row.get("entity_id")
         if entity_id is not None:
             key = (str(manifest_row.get("target_type")), str(entity_id))
             if status in SUCCESS_STATES:
                 self._entity_index[key] = view
             else:
                 self._entity_index.pop(key, None)
+        if str(manifest_row.get("run_id") or "") == self._preloaded_run_id:
+            if status in SUCCESS_STATES:
+                self._run_manifest_index[target_key] = view
+            else:
+                self._run_manifest_index.pop(target_key, None)
+            if entity_id is not None:
+                key = (str(manifest_row.get("target_type")), str(entity_id))
+                if status in SUCCESS_STATES:
+                    self._run_entity_index[key] = view
+                else:
+                    self._run_entity_index.pop(key, None)
 
-    def preload_manifest_index(self) -> int:
+    def preload_manifest_index(self, run_id: Optional[str] = None) -> int:
         """Load every committed target once so per-target reads never query.
 
         The index is authoritative afterwards: a key that is absent was never
         committed, so a miss answers ``None`` without a Trino round-trip.
-        Commits update it, which keeps replay/dedup decisions correct.
+        Commits update it, which keeps replay/dedup decisions correct.  When an
+        exact ``run_id`` is supplied, a second bounded index supports
+        publication-local resume without treating an older generation as work
+        completed by the current writer.
         """
+
+        normalized_run_id = str(run_id).strip() if run_id is not None else None
+        if run_id is not None and not normalized_run_id:
+            raise ValueError("run_id must not be empty")
 
         manager_getter = getattr(self.writer, "_get_trino_manager", None)
         if manager_getter is None:
             return 0
         trino = manager_getter()
         if not trino.table_exists(self.schema, MANIFEST_TABLE):
+            self._raw_entity_index = {}
+            self._run_manifest_index = {}
+            self._run_entity_index = {}
+            self._preloaded_run_id = normalized_run_id
             self._preloaded = True
             return 0
         columns = ", ".join(self._READ_COLUMNS)
@@ -892,6 +1013,92 @@ class FotMobRepository:
             for key, view in latest_entities.items()
             if view.get("status") in SUCCESS_STATES
         }
+        self._run_manifest_index = {}
+        self._run_entity_index = {}
+        self._preloaded_run_id = normalized_run_id
+        if normalized_run_id is not None:
+            safe_run_id = normalized_run_id.replace("'", "''")
+            run_rows = trino.execute_query(
+                f"""
+                SELECT {columns}, target_type, entity_id
+                FROM (
+                    SELECT {columns}, target_type, entity_id,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY target_key
+                               ORDER BY completed_at DESC, batch_id DESC
+                           ) AS rn
+                    FROM {self.catalog}.{self.schema}.{MANIFEST_TABLE}
+                    WHERE parser_version = '{safe_version}'
+                      AND run_id = '{safe_run_id}'
+                      AND status IN (
+                          'success', 'not_modified', 'not_available'
+                      )
+                )
+                WHERE rn = 1
+                """
+            )
+            latest_run_entities: dict[tuple[str, str], dict[str, Any]] = {}
+            for row in run_rows:
+                view = dict(zip(self._READ_COLUMNS, row[:width]))
+                view["run_id"] = normalized_run_id
+                target_type, entity_id = row[width], row[width + 1]
+                if (
+                    view.get("parser_version") != PARSER_VERSION
+                    or view.get("status") not in TERMINAL_OBSERVATION_STATES
+                ):
+                    continue
+                if view.get("status") in SUCCESS_STATES:
+                    self._run_manifest_index[str(view["target_key"])] = view
+                if entity_id is not None:
+                    key = (str(target_type), str(entity_id))
+                    previous = latest_run_entities.get(key)
+                    if previous is None or _completed_at_key(view) >= _completed_at_key(
+                        previous
+                    ):
+                        latest_run_entities[key] = view
+            self._run_entity_index = {
+                key: view
+                for key, view in latest_run_entities.items()
+                if view.get("status") in SUCCESS_STATES
+            }
+        safe_legacy_version = LEGACY_PARSER_VERSION.replace("'", "''")
+        raw_rows = trino.execute_query(
+            f"""
+            SELECT {columns}, target_type, entity_id
+            FROM (
+                SELECT {columns}, target_type, entity_id,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY target_type, entity_id
+                           ORDER BY
+                               CASE WHEN parser_version = '{safe_version}'
+                                    THEN 1 ELSE 0 END DESC,
+                               completed_at DESC, batch_id DESC, target_key DESC
+                       ) AS rn
+                FROM {self.catalog}.{self.schema}.{MANIFEST_TABLE}
+                WHERE parser_version IN (
+                          '{safe_version}', '{safe_legacy_version}'
+                      )
+                  AND status IN ('success', 'not_modified', 'not_available')
+                  AND entity_id IS NOT NULL
+            )
+            WHERE rn = 1
+            """
+        )
+        self._raw_entity_index = {}
+        for row in raw_rows:
+            view = dict(zip(self._READ_COLUMNS, row[:width]))
+            target_type, entity_id = row[width], row[width + 1]
+            if (
+                view.get("parser_version")
+                not in {PARSER_VERSION, LEGACY_PARSER_VERSION}
+                or view.get("status") not in TERMINAL_OBSERVATION_STATES
+                or entity_id is None
+            ):
+                continue
+            key = (str(target_type), str(entity_id))
+            self._raw_entity_index[key] = _newer_raw_entity_view(
+                self._raw_entity_index.get(key), view
+            )
         self._preloaded = True
         return len(self._manifest_index)
 
@@ -923,9 +1130,7 @@ class FotMobRepository:
         # thousands of targets at once.
         for offset in range(0, len(resolved), 500):
             chunk = resolved[offset : offset + 500]
-            values = ", ".join(
-                "'" + value.replace("'", "''") + "'" for value in chunk
-            )
+            values = ", ".join("'" + value.replace("'", "''") + "'" for value in chunk)
             rows = trino.execute_query(
                 f"""
                 SELECT {batch_column}, COUNT(*)
@@ -978,9 +1183,7 @@ class FotMobRepository:
         fingerprints: dict[tuple[Any, ...], int] = {}
         for offset in range(0, len(resolved), 500):
             chunk = resolved[offset : offset + 500]
-            values = ", ".join(
-                "'" + value.replace("'", "''") + "'" for value in chunk
-            )
+            values = ", ".join("'" + value.replace("'", "''") + "'" for value in chunk)
             rows = trino.execute_query(
                 f"""
                 SELECT run_id, batch_id, target_key, content_hash,
@@ -1049,9 +1252,7 @@ class FotMobRepository:
                 )
         if confirmed:
             remaining = [
-                row
-                for row in rows
-                if str(row.get("_target_batch_id")) not in confirmed
+                row for row in rows if str(row.get("_target_batch_id")) not in confirmed
             ]
             if remaining:
                 self._pending[key] = remaining
@@ -1099,6 +1300,7 @@ class FotMobRepository:
     def _rebuild_pending_indexes(self) -> None:
         self._pending_targets = {}
         self._pending_entities = {}
+        self._pending_raw_entities = {}
         for row in self._pending_manifest:
             self._index_pending(row)
 
@@ -1156,6 +1358,7 @@ class FotMobRepository:
         self._pending_manifest = []
         self._pending_targets = {}
         self._pending_entities = {}
+        self._pending_raw_entities = {}
         self._pending_rows = 0
         return paths
 
@@ -1344,20 +1547,44 @@ class FotMobRepository:
             created.append(f"{self.catalog}.{self.schema}.{view}")
         return created
 
-    def latest_success(self, target_key: str) -> Optional[dict[str, Any]]:
+    def latest_success(
+        self, target_key: str, *, run_id: Optional[str] = None
+    ) -> Optional[dict[str, Any]]:
         """Return the newest successful manifest for incremental planning."""
 
-        buffered = self._pending_targets.get(str(target_key))
+        normalized_target = str(target_key)
+        normalized_run_id = str(run_id).strip() if run_id is not None else None
+        if run_id is not None and not normalized_run_id:
+            raise ValueError("run_id must not be empty")
+        buffered = self._pending_targets.get(normalized_target)
+        if buffered is not None and normalized_run_id is not None:
+            buffered = (
+                buffered
+                if str(buffered.get("run_id") or "") == normalized_run_id
+                else None
+            )
         if buffered is not None:
             return buffered if buffered.get("status") in SUCCESS_STATES else None
-        if self._preloaded:
-            return self._manifest_index.get(str(target_key))
+        if self._preloaded and normalized_run_id is None:
+            return self._manifest_index.get(normalized_target)
+        if (
+            self._preloaded_run_id == normalized_run_id
+            and normalized_run_id is not None
+        ):
+            return self._run_manifest_index.get(normalized_target)
         manager_getter = getattr(self.writer, "_get_trino_manager", None)
         if manager_getter is None:
             return None
         trino = manager_getter()
-        safe = str(target_key).replace("'", "''")
+        safe = normalized_target.replace("'", "''")
         safe_version = PARSER_VERSION.replace("'", "''")
+        run_filter = (
+            ""
+            if normalized_run_id is None
+            else "\n              AND run_id = '"
+            + normalized_run_id.replace("'", "''")
+            + "'"
+        )
         rows = trino.execute_query(
             f"""
             SELECT target_key, batch_id, content_hash, raw_uri, parser_version,
@@ -1367,6 +1594,7 @@ class FotMobRepository:
             WHERE target_key = '{safe}'
               AND parser_version = '{safe_version}'
               AND status IN ('success', 'not_modified', 'not_available')
+              {run_filter}
             ORDER BY completed_at DESC
             LIMIT 1
             """
@@ -1389,7 +1617,11 @@ class FotMobRepository:
         return view if view.get("status") in SUCCESS_STATES else None
 
     def latest_entity_success(
-        self, target_type: str, entity_id: str | int
+        self,
+        target_type: str,
+        entity_id: str | int,
+        *,
+        run_id: Optional[str] = None,
     ) -> Optional[dict[str, Any]]:
         """Return the latest logical success independent of a rotating URL.
 
@@ -1399,11 +1631,25 @@ class FotMobRepository:
         """
 
         key = (str(target_type), str(entity_id))
+        normalized_run_id = str(run_id).strip() if run_id is not None else None
+        if run_id is not None and not normalized_run_id:
+            raise ValueError("run_id must not be empty")
         buffered = self._pending_entities.get(key)
+        if buffered is not None and normalized_run_id is not None:
+            buffered = (
+                buffered
+                if str(buffered.get("run_id") or "") == normalized_run_id
+                else None
+            )
         if buffered is not None:
             return buffered if buffered.get("status") in SUCCESS_STATES else None
-        if self._preloaded:
+        if self._preloaded and normalized_run_id is None:
             return self._entity_index.get(key)
+        if (
+            self._preloaded_run_id == normalized_run_id
+            and normalized_run_id is not None
+        ):
+            return self._run_entity_index.get(key)
         manager_getter = getattr(self.writer, "_get_trino_manager", None)
         if manager_getter is None:
             return None
@@ -1411,6 +1657,13 @@ class FotMobRepository:
         safe_type = str(target_type).replace("'", "''")
         safe_id = str(entity_id).replace("'", "''")
         safe_version = PARSER_VERSION.replace("'", "''")
+        run_filter = (
+            ""
+            if normalized_run_id is None
+            else "\n              AND run_id = '"
+            + normalized_run_id.replace("'", "''")
+            + "'"
+        )
         rows = trino.execute_query(
             f"""
             SELECT target_key, batch_id, content_hash, raw_uri, parser_version,
@@ -1421,6 +1674,7 @@ class FotMobRepository:
               AND entity_id = '{safe_id}'
               AND parser_version = '{safe_version}'
               AND status IN ('success', 'not_modified', 'not_available')
+              {run_filter}
             ORDER BY completed_at DESC
             LIMIT 1
             """
@@ -1442,13 +1696,71 @@ class FotMobRepository:
         view = dict(zip(columns, rows[0]))
         return view if view.get("status") in SUCCESS_STATES else None
 
+    def latest_entity_raw_target(
+        self, target_type: str, entity_id: str | int
+    ) -> Optional[dict[str, Any]]:
+        """Return the authoritative raw-bearing v2/v1 entity observation.
+
+        Parser v2 is preferred over the rolling-migration v1 fallback.  Within
+        one parser generation the newest terminal observation wins.  A newer
+        ``not_available`` marker intentionally returns ``None`` instead of
+        resurrecting an older raw payload.
+        """
+
+        normalized_type = str(target_type)
+        normalized_id = str(entity_id)
+        key = (normalized_type, normalized_id)
+        durable: Optional[Mapping[str, Any]] = None
+        if self._preloaded:
+            durable = self._raw_entity_index.get(key)
+        else:
+            manager_getter = getattr(self.writer, "_get_trino_manager", None)
+            if manager_getter is None:
+                return None
+            trino = manager_getter()
+            safe_type = normalized_type.replace("'", "''")
+            safe_id = normalized_id.replace("'", "''")
+            safe_version = PARSER_VERSION.replace("'", "''")
+            safe_legacy_version = LEGACY_PARSER_VERSION.replace("'", "''")
+            columns = ", ".join(self._READ_COLUMNS)
+            rows = trino.execute_query(
+                f"""
+                SELECT {columns}
+                FROM {self.catalog}.{self.schema}.{MANIFEST_TABLE}
+                WHERE target_type = '{safe_type}'
+                  AND entity_id = '{safe_id}'
+                  AND parser_version IN (
+                          '{safe_version}', '{safe_legacy_version}'
+                      )
+                  AND status IN ('success', 'not_modified', 'not_available')
+                ORDER BY
+                    CASE WHEN parser_version = '{safe_version}'
+                         THEN 1 ELSE 0 END DESC,
+                    completed_at DESC, batch_id DESC, target_key DESC
+                LIMIT 1
+                """
+            )
+            if rows:
+                durable = dict(zip(self._READ_COLUMNS, rows[0]))
+
+        pending = self._pending_raw_entities.get(key)
+        selected = (
+            _newer_raw_entity_view(durable, pending)
+            if pending is not None
+            else dict(durable)
+            if durable is not None
+            else None
+        )
+        return _raw_entity_result(normalized_type, normalized_id, selected)
+
     def completed_scope_keys(
         self,
         plan_signature: str,
         *,
         parser_version: str = PARSER_VERSION,
+        run_id: Optional[str] = None,
     ) -> set[tuple[int, str]]:
-        """Return scopes fully completed for an exact entity/policy plan."""
+        """Return completed scopes for an exact plan and optional writer run."""
 
         manager_getter = getattr(self.writer, "_get_trino_manager", None)
         if manager_getter is None:
@@ -1456,6 +1768,16 @@ class FotMobRepository:
         trino = manager_getter()
         safe_signature = str(plan_signature).replace("'", "''")
         safe_version = str(parser_version).replace("'", "''")
+        normalized_run_id = str(run_id).strip() if run_id is not None else None
+        if run_id is not None and not normalized_run_id:
+            raise ValueError("run_id must not be empty")
+        run_filter = (
+            ""
+            if normalized_run_id is None
+            else "\n              AND run_id = '"
+            + normalized_run_id.replace("'", "''")
+            + "'"
+        )
         rows = trino.execute_query(
             f"""
             SELECT DISTINCT competition_id, source_season_key
@@ -1464,6 +1786,7 @@ class FotMobRepository:
               AND entity_id = '{safe_signature}'
               AND status IN ('success', 'not_modified')
               AND parser_version = '{safe_version}'
+              {run_filter}
               AND competition_id IS NOT NULL
               AND source_season_key IS NOT NULL
             """
@@ -1519,8 +1842,9 @@ class FotMobRepository:
         plan_signature: str,
         *,
         parser_version: str = PARSER_VERSION,
+        run_id: Optional[str] = None,
     ) -> set[int]:
-        """Return competition-wide streams completed for an exact plan."""
+        """Return completed streams for an exact plan and optional writer run."""
 
         manager_getter = getattr(self.writer, "_get_trino_manager", None)
         if manager_getter is None:
@@ -1528,6 +1852,16 @@ class FotMobRepository:
         trino = manager_getter()
         safe_signature = str(plan_signature).replace("'", "''")
         safe_version = str(parser_version).replace("'", "''")
+        normalized_run_id = str(run_id).strip() if run_id is not None else None
+        if run_id is not None and not normalized_run_id:
+            raise ValueError("run_id must not be empty")
+        run_filter = (
+            ""
+            if normalized_run_id is None
+            else "\n              AND run_id = '"
+            + normalized_run_id.replace("'", "''")
+            + "'"
+        )
         rows = trino.execute_query(
             f"""
             SELECT DISTINCT competition_id
@@ -1536,6 +1870,7 @@ class FotMobRepository:
               AND entity_id = '{safe_signature}'
               AND status IN ('success', 'not_modified')
               AND parser_version = '{safe_version}'
+              {run_filter}
               AND competition_id IS NOT NULL
               AND source_season_key IS NULL
             """
@@ -1745,10 +2080,16 @@ class MemoryFotMobRepository:
         self.commit(commit)
         return f"memory://{MANIFEST_TABLE}"
 
-    def latest_success(self, target_key: str) -> Optional[dict[str, Any]]:
+    def latest_success(
+        self, target_key: str, *, run_id: Optional[str] = None
+    ) -> Optional[dict[str, Any]]:
+        normalized_run_id = str(run_id).strip() if run_id is not None else None
+        if run_id is not None and not normalized_run_id:
+            raise ValueError("run_id must not be empty")
         for commit in reversed(self.commits):
             if (
                 commit.target_key == target_key
+                and (normalized_run_id is None or commit.run_id == normalized_run_id)
                 and commit.parser_version == PARSER_VERSION
                 and commit.status.value in TERMINAL_OBSERVATION_STATES
             ):
@@ -1760,12 +2101,20 @@ class MemoryFotMobRepository:
         return None
 
     def latest_entity_success(
-        self, target_type: str, entity_id: str | int
+        self,
+        target_type: str,
+        entity_id: str | int,
+        *,
+        run_id: Optional[str] = None,
     ) -> Optional[dict[str, Any]]:
+        normalized_run_id = str(run_id).strip() if run_id is not None else None
+        if run_id is not None and not normalized_run_id:
+            raise ValueError("run_id must not be empty")
         for commit in reversed(self.commits):
             if (
                 commit.target_type == str(target_type)
                 and commit.entity_id == str(entity_id)
+                and (normalized_run_id is None or commit.run_id == normalized_run_id)
                 and commit.parser_version == PARSER_VERSION
                 and commit.status.value in TERMINAL_OBSERVATION_STATES
             ):
@@ -1776,12 +2125,33 @@ class MemoryFotMobRepository:
                 )
         return None
 
+    def latest_entity_raw_target(
+        self, target_type: str, entity_id: str | int
+    ) -> Optional[dict[str, Any]]:
+        normalized_type = str(target_type)
+        normalized_id = str(entity_id)
+        selected: Optional[dict[str, Any]] = None
+        for commit in self.commits:
+            if (
+                commit.target_type != normalized_type
+                or commit.entity_id != normalized_id
+                or commit.parser_version not in {PARSER_VERSION, LEGACY_PARSER_VERSION}
+                or commit.status.value not in TERMINAL_OBSERVATION_STATES
+            ):
+                continue
+            selected = _newer_raw_entity_view(selected, commit.manifest_row())
+        return _raw_entity_result(normalized_type, normalized_id, selected)
+
     def completed_scope_keys(
         self,
         plan_signature: str,
         *,
         parser_version: str = PARSER_VERSION,
+        run_id: Optional[str] = None,
     ) -> set[tuple[int, str]]:
+        normalized_run_id = str(run_id).strip() if run_id is not None else None
+        if run_id is not None and not normalized_run_id:
+            raise ValueError("run_id must not be empty")
         return {
             (int(commit.competition_id), str(commit.source_season_key))
             for commit in self.commits
@@ -1789,6 +2159,7 @@ class MemoryFotMobRepository:
             and commit.entity_id == str(plan_signature)
             and commit.status.value in SUCCESS_STATES
             and commit.parser_version == parser_version
+            and (normalized_run_id is None or commit.run_id == normalized_run_id)
             and commit.competition_id is not None
             and commit.source_season_key is not None
         }
@@ -1823,7 +2194,11 @@ class MemoryFotMobRepository:
         plan_signature: str,
         *,
         parser_version: str = PARSER_VERSION,
+        run_id: Optional[str] = None,
     ) -> set[int]:
+        normalized_run_id = str(run_id).strip() if run_id is not None else None
+        if run_id is not None and not normalized_run_id:
+            raise ValueError("run_id must not be empty")
         return {
             int(commit.competition_id)
             for commit in self.commits
@@ -1831,6 +2206,7 @@ class MemoryFotMobRepository:
             and commit.entity_id == str(plan_signature)
             and commit.status.value in SUCCESS_STATES
             and commit.parser_version == parser_version
+            and (normalized_run_id is None or commit.run_id == normalized_run_id)
             and commit.competition_id is not None
             and commit.source_season_key is None
         }

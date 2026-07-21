@@ -50,9 +50,7 @@ FOTMOB_PUBLICATION_BINDING_FIELDS = (
 # dynamically.  This avoids freezing season strings while preventing an
 # accidental ~493-competition crawl from entering the 14:00 publication slot.
 FOTMOB_DAILY_CONTRACT_SCHEMA = "fotmob-daily-v1"
-FOTMOB_DAILY_SCOPE_FILE = (
-    "/opt/airflow/configs/fotmob/issue-930-scopes.txt"
-)
+FOTMOB_DAILY_SCOPE_FILE = "/opt/airflow/configs/fotmob/issue-930-scopes.txt"
 FOTMOB_DAILY_SCOPE_SHA256 = (
     "f1d95f916c78ed80e5784e2cd5bda7263cece37d9fde6d52fb2a1a4d9e97cb58"
 )
@@ -99,7 +97,10 @@ FOTMOB_DAILY_REQUESTS_PER_MINUTE = 60
 FOTMOB_ISOLATED_STACK_ENV = "FOTMOB_ISOLATED_STACK"
 FOTMOB_DEPLOYMENT_ID_ENV = "FOTMOB_DEPLOYMENT_ID"
 FOTMOB_DEPLOYMENT_REPORT_PATH_ENV = "FOTMOB_DEPLOYMENT_REPORT_PATH"
+FOTMOB_SHARED_DEPLOYMENT_REPORT_PATH_ENV = "FOTMOB_SHARED_DEPLOYMENT_REPORT_PATH"
+FOTMOB_SHARED_EVIDENCE_ROOT = "/opt/airflow/fotmob-admission"
 FOTMOB_ISOLATED_DAILY_DAG_ID = "dag_trigger_fotmob_daily"
+FOTMOB_SHARED_MASTER_DAG_ID = "dag_master_pipeline"
 FOTMOB_EXPECTED_ISOLATED_DAGS = frozenset(
     {
         "dag_ingest_fotmob",
@@ -114,6 +115,7 @@ FOTMOB_ISOLATED_RUNTIME_ROOTS = {
     "configs/medallion": "/opt/airflow/configs/medallion",
     "configs/fotmob": "/opt/airflow/configs/fotmob",
 }
+FOTMOB_SHARED_RUNTIME_ROOTS = dict(FOTMOB_ISOLATED_RUNTIME_ROOTS)
 FOTMOB_ISOLATED_RUNTIME_SUFFIXES = (
     ".py",
     ".pyi",
@@ -140,6 +142,40 @@ FOTMOB_ISOLATED_REQUIRED_RUNTIME_PATHS = frozenset(
         "scrapers/fotmob/service.py",
     }
 )
+FOTMOB_SHARED_REQUIRED_RUNTIME_PATHS = frozenset(
+    {
+        "configs/fotmob/competitions.json",
+        "configs/fotmob/issue-930-scopes.txt",
+        "dags/.airflowignore",
+        "dags/dag_ingest_fotmob.py",
+        "dags/dag_master_pipeline.py",
+        "dags/dag_sofascore_pipeline.py",
+        "dags/dag_trigger_fotmob_daily.py",
+        "dags/dag_transform_e3.py",
+        "dags/dag_transform_e4.py",
+        "dags/dag_transform_fbref_gold.py",
+        "dags/dag_transform_fotmob_silver.py",
+        "dags/dag_transform_xref.py",
+        "dags/scripts/run_fotmob_scraper.py",
+        "dags/sql/silver/fotmob_keeper_profile.sql",
+        "dags/sql/silver/fotmob_manager_profile.sql",
+        "dags/sql/silver/fotmob_player_profile.sql",
+        "dags/sql/silver/fotmob_player_season_profile.sql",
+        "dags/sql/silver/xref_manager.sql.j2",
+        "dags/utils/fotmob_publication.py",
+        "dags/utils/maintenance_tasks.py",
+        "dags/utils/silver_tasks.py",
+        "dags/utils/xref_player_resolver.py",
+        "scrapers/base/iceberg_writer.py",
+        "scrapers/base/trino_manager.py",
+        "scrapers/fbref/control/store.py",
+        "scrapers/fotmob/constants.py",
+        "scrapers/fotmob/raw_store.py",
+        "scrapers/fotmob/repository.py",
+        "scrapers/fotmob/service.py",
+        "scrapers/fotmob/transport.py",
+    }
+)
 FOTMOB_ISSUE930_WRITER_ENTITIES = frozenset(
     {"season", "leaderboards", "matches", "teams", "players"}
 )
@@ -150,9 +186,7 @@ _SCOPE_LINE_RE = re.compile(r"([1-9][0-9]*)=(\S+)")
 
 
 def _competition_ids_digest(competition_ids: Sequence[int]) -> str:
-    material = "".join(f"{int(value)}\n" for value in competition_ids).encode(
-        "ascii"
-    )
+    material = "".join(f"{int(value)}\n" for value in competition_ids).encode("ascii")
     return hashlib.sha256(material).hexdigest()
 
 
@@ -290,10 +324,51 @@ def isolated_runtime_manifest(
     return dict(sorted(manifest.items()))
 
 
+def shared_runtime_manifest(
+    *,
+    roots: Mapping[str, str | os.PathLike[str]] | None = None,
+) -> dict[str, str]:
+    """Hash the exact source/config inventory mounted in the shared stack."""
+
+    selected_roots = roots or FOTMOB_SHARED_RUNTIME_ROOTS
+    manifest: dict[str, str] = {}
+    for prefix, raw_root in selected_roots.items():
+        root = Path(raw_root)
+        if not root.is_dir() or root.is_symlink():
+            raise _airflow_exception(f"FotMob shared runtime root is invalid: {prefix}")
+        for path in sorted(root.rglob("*")):
+            if path.is_symlink():
+                raise _airflow_exception(
+                    f"FotMob shared runtime rejects symlink: {prefix}"
+                )
+            if (
+                path.is_file()
+                and "__pycache__" not in path.parts
+                and (
+                    path.name == ".airflowignore"
+                    or path.name.endswith(FOTMOB_ISOLATED_RUNTIME_SUFFIXES)
+                )
+            ):
+                key = f"{prefix}/{path.relative_to(root).as_posix()}"
+                manifest[key] = hashlib.sha256(path.read_bytes()).hexdigest()
+    missing = set(FOTMOB_SHARED_REQUIRED_RUNTIME_PATHS) - set(manifest)
+    if missing:
+        raise _airflow_exception(
+            f"FotMob shared runtime misses required files: {sorted(missing)!r}"
+        )
+    if manifest.get("configs/fotmob/issue-930-scopes.txt") != (
+        FOTMOB_DAILY_SCOPE_SHA256
+    ):
+        raise _airflow_exception(
+            "FotMob shared runtime has an unapproved issue-930 scope artifact"
+        )
+    return dict(sorted(manifest.items()))
+
+
 def _runtime_manifest_digest(manifest: Mapping[str, str]) -> str:
-    payload = json.dumps(
-        dict(manifest), sort_keys=True, separators=(",", ":")
-    ).encode("utf-8")
+    payload = json.dumps(dict(manifest), sort_keys=True, separators=(",", ":")).encode(
+        "utf-8"
+    )
     return hashlib.sha256(payload).hexdigest()
 
 
@@ -386,18 +461,14 @@ def _validate_issue930_kept_paused_writer(
     run_id = str(identity.get("run_id") or "")
     if component == "airflow_task" and dag_id == "dag_transform_fotmob_silver":
         if run_id != f"fotmob_silver__{generation_id}":
-            raise _airflow_exception(
-                "FotMob kept-paused Silver run identity differs"
-            )
+            raise _airflow_exception("FotMob kept-paused Silver run identity differs")
     elif (
         component == "airflow_task" and dag_id == "dag_ingest_fotmob"
     ) or component == "bronze_runner":
         if component == "airflow_task" and run_id != (
             f"issue930_{mode}_a{attempt}__{compact_generation}"
         ):
-            raise _airflow_exception(
-                "FotMob kept-paused ingest run identity differs"
-            )
+            raise _airflow_exception("FotMob kept-paused ingest run identity differs")
         raw_scopes = identity.get("scopes")
         raw_scope_items = (
             [item.strip() for item in raw_scopes.split(",")]
@@ -556,8 +627,7 @@ def attest_fotmob_isolated_runtime(
 
     expected_manifest = report.get("isolated_runtime_sha256")
     if not isinstance(expected_manifest, Mapping) or any(
-        not isinstance(path, str)
-        or re.fullmatch(r"[0-9a-f]{64}", str(digest)) is None
+        not isinstance(path, str) or re.fullmatch(r"[0-9a-f]{64}", str(digest)) is None
         for path, digest in expected_manifest.items()
     ):
         raise _airflow_exception(
@@ -581,14 +651,171 @@ def attest_fotmob_isolated_runtime(
     return result
 
 
+def attest_fotmob_shared_runtime(
+    *,
+    report_path: str | os.PathLike[str] | None = None,
+    environ: Mapping[str, str] | None = None,
+    hostname: str | None = None,
+    roots: Mapping[str, str | os.PathLike[str]] | None = None,
+    require_scheduled_owner: bool = True,
+    **context: Any,
+) -> dict[str, Any]:
+    """Re-attest the shared host bind mounts against isolated admission.
+
+    The isolated deploy report is also the trust certificate for the shared
+    fallback: deploy generated it only after proving the exact shared
+    scheduler container, Git SHA, ControlStore migration and full bind-mount
+    manifest.  The shared compose mounts that evidence directory read-only.
+    A fallback writer therefore cannot rely on the mutable SHA environment
+    label alone.
+    """
+
+    runtime_env = os.environ if environ is None else environ
+    configured_path = str(
+        runtime_env.get(FOTMOB_SHARED_DEPLOYMENT_REPORT_PATH_ENV, "")
+    ).strip()
+    selected_path = Path(report_path or configured_path)
+    if (
+        not configured_path
+        or not selected_path.is_absolute()
+        or str(selected_path) != configured_path
+    ):
+        raise _airflow_exception(
+            "FotMob shared deployment report path is not exactly configured"
+        )
+    try:
+        report = json.loads(selected_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise _airflow_exception(
+            "FotMob shared deployment report is unavailable or invalid"
+        ) from exc
+    if not isinstance(report, Mapping):
+        raise _airflow_exception("FotMob shared deployment report is not an object")
+
+    activation_state = report.get("activation_state")
+    paused = report.get("paused")
+    unpaused = report.get("unpaused")
+    kept_paused_admission = (
+        activation_state == "kept_paused"
+        and report.get("kept_paused") is True
+        and isinstance(paused, list)
+        and set(paused) == FOTMOB_EXPECTED_ISOLATED_DAGS
+        and unpaused == []
+    )
+    deployment_id = str(report.get("deployment_id", "")).strip()
+    git_sha = str(runtime_env.get(FOTMOB_RUNTIME_FINGERPRINT_ENV, "")).strip()
+    if (
+        report.get("schema_version") != "fotmob-deploy-v2"
+        or report.get("passed") is not True
+        or not kept_paused_admission
+        or re.fullmatch(r"[0-9a-f]{32}", deployment_id) is None
+        or report.get("git_sha") != runtime_fingerprint(git_sha)
+        or runtime_env.get(FOTMOB_ISOLATED_STACK_ENV) not in {None, ""}
+    ):
+        raise _airflow_exception(
+            "FotMob shared runtime has no completed deployment admission"
+        )
+
+    control = report.get("control_database")
+    initial = report.get("shared_handoff_initial")
+    final = report.get("shared_handoff_final")
+    if (
+        not isinstance(control, Mapping)
+        or control.get("same_runtime_configuration") is not True
+        or not isinstance(control.get("shared"), Mapping)
+        or not isinstance(initial, Mapping)
+        or not isinstance(final, Mapping)
+    ):
+        raise _airflow_exception(
+            "FotMob shared deployment report has no control-plane admission"
+        )
+    container_id = str(final.get("shared_scheduler_container", "")).strip()
+    expected_manifest = final.get("runtime_code_sha256")
+    initial_mount = initial.get("shared_admission_mount")
+    final_mount = final.get("shared_admission_mount")
+    expected_mount = {
+        "type": "bind",
+        "source": (
+            str(initial_mount.get("source", "")).strip()
+            if isinstance(initial_mount, Mapping)
+            else ""
+        ),
+        "destination": FOTMOB_SHARED_EVIDENCE_ROOT,
+        "read_only": True,
+        "report_path": configured_path,
+    }
+    if (
+        initial.get("passed") is not True
+        or final.get("passed") is not True
+        or initial.get("schedule_owner") != "isolated"
+        or final.get("schedule_owner") != "isolated"
+        or initial.get("runtime_git_sha") != git_sha
+        or final.get("runtime_git_sha") != git_sha
+        or initial.get("shared_scheduler_container") != container_id
+        or initial.get("runtime_code_sha256") != expected_manifest
+        or initial.get("control_database") != control["shared"]
+        or final.get("control_database") != control["shared"]
+        or report.get("shared_container_report_path") != configured_path
+        or not isinstance(initial_mount, Mapping)
+        or dict(initial_mount) != expected_mount
+        or not Path(expected_mount["source"]).is_absolute()
+        or not isinstance(final_mount, Mapping)
+        or dict(final_mount) != expected_mount
+        or re.fullmatch(r"[0-9a-f]{64}", container_id) is None
+        or not isinstance(expected_manifest, Mapping)
+        or any(
+            not isinstance(path, str)
+            or re.fullmatch(r"[0-9a-f]{64}", str(digest)) is None
+            for path, digest in expected_manifest.items()
+        )
+    ):
+        raise _airflow_exception(
+            "FotMob shared deployment report has no exact handoff identity"
+        )
+    observed_hostname = str(hostname or socket.gethostname()).strip().casefold()
+    if re.fullmatch(
+        r"[0-9a-f]{12,64}", observed_hostname
+    ) is None or not container_id.startswith(observed_hostname):
+        raise _airflow_exception(
+            "FotMob shared task container differs from deployment report"
+        )
+    control_uri = str(runtime_env.get("FBREF_CONTROL_DB_URI", "")).strip()
+    if not control_uri or "airflow-metadb" in control_uri.casefold():
+        raise _airflow_exception(
+            "FotMob shared runtime has no production ControlStore binding"
+        )
+
+    if require_scheduled_owner:
+        dag_run = context.get("dag_run")
+        dag_id = getattr(dag_run, "dag_id", None)
+        run_type = getattr(dag_run, "run_type", None)
+        normalized_run_type = str(getattr(run_type, "value", run_type) or "").casefold()
+        if dag_id != FOTMOB_SHARED_MASTER_DAG_ID or normalized_run_type != (
+            "scheduled"
+        ):
+            raise _airflow_exception(
+                "FotMob shared producer requires an exact scheduled master DagRun"
+            )
+
+    observed_manifest = shared_runtime_manifest(roots=roots)
+    if observed_manifest != dict(expected_manifest):
+        raise _airflow_exception(
+            "FotMob shared runtime bytes differ from deployment report"
+        )
+    return {
+        "deployment_id": deployment_id,
+        "git_sha": git_sha,
+        "shared_scheduler_container_id": container_id,
+        "runtime_file_count": len(observed_manifest),
+        "runtime_manifest_sha256": _runtime_manifest_digest(observed_manifest),
+        "control_database_bound": True,
+    }
+
+
 def runtime_fingerprint(value: Any = None) -> str:
     """Return the exact deployed Git SHA; abbreviations fail closed."""
 
-    raw = (
-        os.environ.get(FOTMOB_RUNTIME_FINGERPRINT_ENV, "")
-        if value is None
-        else value
-    )
+    raw = os.environ.get(FOTMOB_RUNTIME_FINGERPRINT_ENV, "") if value is None else value
     normalized = str(raw or "").strip().casefold()
     if _FULL_GIT_SHA_RE.fullmatch(normalized) is None:
         raise _airflow_exception(
@@ -653,9 +880,7 @@ def make_generation_id(binding: Mapping[str, Any]) -> str:
         fingerprint=binding.get("runtime_fingerprint"),
     )
     payload = json.dumps(normalized, sort_keys=True, separators=(",", ":"))
-    return str(
-        uuid.uuid5(uuid.NAMESPACE_URL, f"fotmob-publication:{payload}")
-    )
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"fotmob-publication:{payload}"))
 
 
 def _context_interval(context: Mapping[str, Any]) -> tuple[Any, Any]:
@@ -692,8 +917,11 @@ def initialize_fotmob_publication(
 ) -> dict[str, Any]:
     """Atomically create/acquire the exact generation before any write."""
 
-    if str(publication_owner or "").strip().casefold() == "isolated":
+    normalized_owner = str(publication_owner or "").strip().casefold()
+    if normalized_owner == "isolated":
         attest_fotmob_isolated_runtime(**context)
+    elif normalized_owner == "shared":
+        attest_fotmob_shared_runtime(**context)
     publication = expected_publication(publication_owner, context)
     dag_run = context.get("dag_run")
     dag_id = getattr(dag_run, "dag_id", None) or context.get("dag_id")
@@ -764,9 +992,7 @@ def publication_from_context(context: Mapping[str, Any]) -> dict[str, Any]:
 
     raw = _dag_run_conf(context).get(FOTMOB_PUBLICATION_CONF_KEY)
     if raw is None:
-        raise _airflow_exception(
-            f"DagRun conf requires {FOTMOB_PUBLICATION_CONF_KEY}"
-        )
+        raise _airflow_exception(f"DagRun conf requires {FOTMOB_PUBLICATION_CONF_KEY}")
     return publication_from_payload(raw)
 
 
@@ -801,23 +1027,41 @@ def fotmob_consumer_trigger_conf(
     }
 
 
-@contextmanager
-def fotmob_publication_writer(
-    context: Mapping[str, Any],
-) -> Iterator[dict[str, Any]]:
-    """Hold the DB writer guard for one complete Bronze/Silver mutation."""
+def _attest_fotmob_writer_runtime(
+    publication: Mapping[str, Any], context: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Attest the exact owner runtime at one writer-guard boundary."""
 
-    publication = publication_from_context(context)
     if publication["binding"]["owner"] == "isolated":
-        attest_fotmob_isolated_runtime(
+        return attest_fotmob_isolated_runtime(
             require_scheduled_owner=False,
             allow_kept_paused_writer=True,
             **dict(context),
         )
+    return attest_fotmob_shared_runtime(
+        require_scheduled_owner=False,
+        **dict(context),
+    )
+
+
+@contextmanager
+def fotmob_publication_writer(
+    context: Mapping[str, Any],
+) -> Iterator[dict[str, Any]]:
+    """Hold the DB guard and attest before and after one Silver mutation."""
+
+    publication = publication_from_context(context)
+    _attest_fotmob_writer_runtime(publication, context)
     with _control_store().guard_publication_writer(
         publication["generation_id"], source=FOTMOB_PUBLICATION_SOURCE
     ):
-        yield publication
+        try:
+            yield publication
+        finally:
+            # Bind-mount read-only mode does not prevent host-side replacement.
+            # Re-hash while the generation guard is still held so drift makes
+            # this task fail and the candidate can never be sealed/published.
+            _attest_fotmob_writer_runtime(publication, context)
 
 
 def validate_fotmob_writer_fence(**context: Any) -> dict[str, Any]:
@@ -962,7 +1206,9 @@ def wait_and_claim_fotmob_publication(
         publication["generation_id"], source=FOTMOB_PUBLICATION_SOURCE
     )
     if state is None:
-        logger.info("FotMob generation %s is not created yet", publication["generation_id"])
+        logger.info(
+            "FotMob generation %s is not created yet", publication["generation_id"]
+        )
         return False
     if state.get("binding") != publication["binding"]:
         raise _airflow_exception("FotMob generation binding differs from master")

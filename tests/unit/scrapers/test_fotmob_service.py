@@ -319,8 +319,7 @@ def test_offline_catalog_replay_reparses_without_tombstones():
     assert result.operation.counts["tombstones"] == 0
     assert result.operation.metadata["authoritative_source_observation"] is False
     assert not any(
-        row.get("is_tombstoned")
-        for row in repository.tables["fotmob_competitions"]
+        row.get("is_tombstoned") for row in repository.tables["fotmob_competitions"]
     )
     commit = repository.commits[-1]
     assert commit.fetch_outcome == FetchOutcome.SUCCESS.value
@@ -573,22 +572,16 @@ def test_advertised_leaderboard_without_url_is_explicit_policy_unavailable():
 def test_missing_leaderboard_url_tombstones_the_prior_logical_category():
     url = "https://data.fotmob.com/stats/47/season/goals.json"
     service, _, repository = _service({url: {"TopLists": []}})
-    present_bundle = parse_season_bundle(
-        _league_payload(), ScopeRef(47, "2025/2026")
-    )
+    present_bundle = parse_season_bundle(_league_payload(), ScopeRef(47, "2025/2026"))
     service.sync_leaderboards(present_bundle)
 
     missing_payload = _league_payload()
     missing_payload["stats"]["players"][0].pop("fetchAllUrl")
-    missing_bundle = parse_season_bundle(
-        missing_payload, ScopeRef(47, "2025/2026")
-    )
+    missing_bundle = parse_season_bundle(missing_payload, ScopeRef(47, "2025/2026"))
     service.sync_leaderboards(missing_bundle)
 
     success, tombstone = [
-        commit
-        for commit in repository.commits
-        if commit.target_type == "leaderboard"
+        commit for commit in repository.commits if commit.target_type == "leaderboard"
     ]
     assert success.target_key != tombstone.target_key
     assert (
@@ -912,6 +905,83 @@ def test_player_next_snapshot_is_global_and_fresh_entity_is_skipped():
     assert row["snapshot_date"] == "2026-07-11"
 
 
+def test_backfill_reprocesses_prior_generation_children_for_current_lineage():
+    bundle = parse_season_bundle(_league_payload(), ScopeRef(47, "2025/2026"))
+    leaderboard_url = "https://data.fotmob.com/stats/47/season/goals.json"
+    match_url = canonicalize_target("matchDetails", {"matchId": "100"}).canonical_url
+    team_urls = {
+        team_id: canonicalize_target("teams", {"id": str(team_id)}).canonical_url
+        for team_id in (1, 2)
+    }
+    player_url = "https://www.fotmob.com/_next/data/build-1/players/10.json"
+    team_payload = {
+        "details": {"name": "Alpha"},
+        "overview": {},
+        "squad": {
+            "squad": [
+                {
+                    "title": "Players",
+                    "members": [{"id": 10, "name": "Player"}],
+                }
+            ]
+        },
+    }
+    responses = {
+        leaderboard_url: {"TopLists": []},
+        match_url: {"content": {"matchFacts": {"events": []}, "stats": {}}},
+        team_urls[1]: team_payload,
+        team_urls[2]: team_payload,
+        player_url: {"pageProps": {"data": {"id": 10, "name": "Player"}}},
+    }
+    service, transport, repository = _service(responses, mode=RunMode.BACKFILL)
+    prior_targets = (
+        ("leaderboard", canonicalize_target(leaderboard_url), "goals"),
+        ("match", canonicalize_target(match_url), "100"),
+        ("team", canonicalize_target(team_urls[1]), "1"),
+        ("team", canonicalize_target(team_urls[2]), "2"),
+        ("player", canonicalize_target(player_url), "10"),
+    )
+    for target_type, target, entity_id in prior_targets:
+        repository.record(
+            TargetCommit(
+                run_id="prior-publication-generation",
+                target_type=target_type,
+                target_key=target.target_key,
+                status=ManifestStatus.SUCCESS,
+                entity_id=entity_id,
+                content_hash="a" * 64,
+                raw_uri=f"memory://{target.target_key}.json.gz",
+                completed_at=datetime.now(timezone.utc),
+            )
+        )
+
+    leaderboard = service.sync_leaderboards(bundle)
+    matches = service.sync_match_payloads(bundle)
+    teams, player_ids = service.sync_team_snapshots(bundle)
+    players = service.sync_player_snapshots(player_ids, build_id="build-1")
+
+    assert all(result.ok for result in (leaderboard, matches, teams, players))
+    assert (
+        leaderboard.skipped == matches.skipped == teams.skipped == players.skipped == 0
+    )
+    assert len(transport.calls) == 5
+    current_commits = [
+        commit for commit in repository.commits if commit.run_id == service.run_id
+    ]
+    assert {commit.target_type for commit in current_commits} == {
+        "leaderboard",
+        "match",
+        "team",
+        "player",
+    }
+    assert {
+        commit.entity_id for commit in current_commits if commit.target_type == "team"
+    } == {
+        "1",
+        "2",
+    }
+
+
 def _absent_team_fetch(outcome, team_id="2222"):
     target = canonicalize_target("teams", {"id": str(team_id)})
     return FetchResult(
@@ -1155,6 +1225,58 @@ def test_next_build_fetch_is_not_started_without_full_retry_reservation():
     assert "Next build discovery" in result.errors[0]
     assert "cannot cover Next build" in result.errors[0]
     assert document_calls == []
+
+
+def test_offline_player_replay_uses_each_manifest_target_without_build_id(tmp_path):
+    from scrapers.fotmob.raw_store import FotMobRawStore
+    from scrapers.fotmob.repository import LEGACY_PARSER_VERSION
+    from scrapers.fotmob.transport import FotMobTransport
+
+    raw_store = FotMobRawStore.from_uri(tmp_path.as_uri())
+    historical = canonicalize_target(
+        "https://www.fotmob.com/_next/data/historical-build/players/10.json"
+    )
+    body = b'{"pageProps":{"data":{"id":10,"name":"Ten"}}}'
+    raw = raw_store.store(
+        historical,
+        body,
+        fetched_at="2026-07-20T10:00:00+00:00",
+    )
+    repository = MemoryFotMobRepository()
+    repository.record(
+        TargetCommit(
+            run_id="production-v1",
+            target_type="player",
+            target_key=historical.target_key,
+            status=ManifestStatus.SUCCESS,
+            entity_id="10",
+            content_hash=raw.content_hash,
+            raw_uri=raw.raw_uri,
+            parser_version=LEGACY_PARSER_VERSION,
+            fetched_at=datetime(2026, 7, 20, 10, 0),
+            completed_at=datetime(2026, 7, 20, 10, 0),
+        )
+    )
+    service = FotMobIngestService(
+        transport=FotMobTransport(raw_store),
+        repository=repository,
+        mode=RunMode.REPLAY,
+        budget=TransportBudget(max_requests=1, max_direct_bytes=1),
+        run_id="issue930-v2-replay",
+        max_workers=2,
+    )
+
+    result = service.sync_player_snapshots([10])
+
+    assert result.ok and result.succeeded == 1
+    assert result.errors == []
+    assert repository.tables["fotmob_player_snapshots"][0]["player_id"] == "10"
+    replay = repository.commits[-1]
+    assert replay.run_id == "issue930-v2-replay"
+    assert replay.target_key == historical.target_key
+    assert replay.parser_version != LEGACY_PARSER_VERSION
+    assert replay.attempts == replay.direct_bytes == replay.proxy_bytes == 0
+    assert replay.cache_hit is True
 
 
 def test_infrastructure_faults_are_retryable_not_schema_drift():

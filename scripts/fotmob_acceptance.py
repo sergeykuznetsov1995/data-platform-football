@@ -83,6 +83,17 @@ PUBLICATION_OWNER_DAG_ID = "fotmob_issue_930_backfill"
 INGEST_DAG_ID = "dag_ingest_fotmob"
 SILVER_DAG_ID = "dag_transform_fotmob_silver"
 PUBLICATION_SCHEMA = "fotmob-publication-v1"
+LIVE_CANDIDATE_FIELDS = frozenset(
+    {
+        "schema",
+        "generation_id",
+        "digest",
+        "transform_task_ids",
+        "transform_results",
+        "row_count_gate",
+        "quality_gate",
+    }
+)
 _GENERATION_ID_RE = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
 )
@@ -737,6 +748,7 @@ def load_lifecycle_report(
         or not transform_task_ids
         or any(not isinstance(item, str) or not item for item in transform_task_ids)
         or len(set(transform_task_ids)) != len(transform_task_ids)
+        or transform_task_ids != sorted(transform_task_ids)
     ):
         raise ValueError("lifecycle Silver candidate identity is invalid")
     normalized_candidate = {
@@ -848,11 +860,7 @@ def validate_live_publication_state(
 ) -> Mapping[str, Any]:
     """Reconcile durable ControlStore state with the reviewed lifecycle bytes."""
 
-    candidate = {
-        "generation_id": lineage.generation_id,
-        "digest": lineage.candidate_digest,
-        "transform_task_ids": list(lineage.candidate_transform_task_ids),
-    }
+    candidate = _validate_live_candidate(state.get("candidate"), lineage)
     released_at, released_at_text = _timestamp(
         state.get("released_at"), field="live publication released_at"
     )
@@ -863,7 +871,6 @@ def validate_live_publication_state(
         or state.get("status") != "succeeded"
         or state.get("phase") != "abandoned"
         or state.get("binding") != dict(lineage.publication_binding)
-        or state.get("candidate") != candidate
         or state.get("consumer") is not None
         or state.get("owner_dag_id") != PUBLICATION_OWNER_DAG_ID
         or state.get("active") is not False
@@ -881,6 +888,100 @@ def validate_live_publication_state(
         "released_at": released_at_text,
         "published": False,
         "candidate_digest": lineage.candidate_digest,
+        "candidate": candidate,
+    }
+
+
+def _validate_live_candidate(
+    value: Any, lineage: AcceptanceLineage
+) -> Mapping[str, Any]:
+    """Validate the complete immutable Silver candidate stored in ControlStore."""
+
+    candidate = _mapping(value, field="live publication candidate")
+    if set(candidate) != LIVE_CANDIDATE_FIELDS:
+        raise ValueError("live publication candidate fields are not exact")
+    task_ids = candidate.get("transform_task_ids")
+    expected_task_ids = list(lineage.candidate_transform_task_ids)
+    if (
+        candidate.get("schema") != PUBLICATION_SCHEMA
+        or candidate.get("generation_id") != lineage.generation_id
+        or candidate.get("digest") != lineage.candidate_digest
+        or task_ids != expected_task_ids
+    ):
+        raise ValueError("live publication candidate identity differs from lifecycle")
+
+    transform_results = _mapping(
+        candidate.get("transform_results"),
+        field="live publication candidate.transform_results",
+    )
+    if set(transform_results) != set(expected_task_ids) or any(
+        not isinstance(result, Mapping) or result.get("status") != "success"
+        for result in transform_results.values()
+    ):
+        raise ValueError("live publication candidate transform evidence is not exact")
+
+    row_gate = _mapping(
+        candidate.get("row_count_gate"),
+        field="live publication candidate.row_count_gate",
+    )
+    total_rows = row_gate.get("total_rows")
+    row_details = row_gate.get("details")
+    if (
+        row_gate.get("status") != "success"
+        or row_gate.get("warnings") != []
+        or not isinstance(row_details, Mapping)
+        or not row_details
+        or any(
+            not isinstance(table, str) or not table or type(rows) is not int or rows < 0
+            for table, rows in row_details.items()
+        )
+        or type(total_rows) is not int
+        or total_rows < 0
+        or total_rows != sum(row_details.values())
+    ):
+        raise ValueError("live publication candidate row-count gate is not clean")
+
+    quality_gate = _mapping(
+        candidate.get("quality_gate"),
+        field="live publication candidate.quality_gate",
+    )
+    passed = quality_gate.get("passed")
+    total = quality_gate.get("total")
+    warnings = quality_gate.get("warnings")
+    if (
+        quality_gate.get("errors") != []
+        or not isinstance(warnings, list)
+        or any(not isinstance(item, str) or not item for item in warnings)
+        or type(passed) is not int
+        or type(total) is not int
+        or passed < 0
+        or total <= 0
+        or passed > total
+        or total != passed + len(warnings)
+    ):
+        raise ValueError("live publication candidate quality gate is not clean")
+
+    unsigned = {
+        key: candidate[key] for key in sorted(LIVE_CANDIDATE_FIELDS - {"digest"})
+    }
+    try:
+        observed_digest = hashlib.sha256(
+            json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    except (TypeError, ValueError) as exc:
+        raise ValueError("live publication candidate is not canonical JSON") from exc
+    if observed_digest != lineage.candidate_digest:
+        raise ValueError("live publication candidate digest differs from lifecycle")
+    return {
+        "schema": PUBLICATION_SCHEMA,
+        "generation_id": lineage.generation_id,
+        "digest": observed_digest,
+        "transform_task_ids": expected_task_ids,
+        "transform_count": len(expected_task_ids),
+        "row_count_status": "success",
+        "row_count_total": total_rows,
+        "quality_passed": passed,
+        "quality_total": total,
     }
 
 

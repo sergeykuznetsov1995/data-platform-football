@@ -1,4 +1,5 @@
 from datetime import datetime
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -281,6 +282,87 @@ def test_entity_tombstone_supersedes_previous_success_for_skip_state():
     assert repository.latest_entity_success("match", "1") is None
 
 
+def test_memory_latest_success_can_be_scoped_to_current_writer_run():
+    repository = MemoryFotMobRepository()
+    prior = _commit(
+        run_id="prior-generation",
+        target_type="player",
+        target_key="a" * 64,
+        entity_id="10",
+    )
+    repository.record(prior)
+    repository.record(
+        _commit(
+            run_id="current-generation",
+            target_type="player",
+            target_key="b" * 64,
+            entity_id="10",
+        )
+    )
+
+    assert (
+        repository.latest_success(prior.target_key, run_id="prior-generation")["run_id"]
+        == "prior-generation"
+    )
+    assert (
+        repository.latest_success(prior.target_key, run_id="current-generation") is None
+    )
+    assert (
+        repository.latest_entity_success("player", 10, run_id="current-generation")[
+            "target_key"
+        ]
+        == "b" * 64
+    )
+    assert (
+        repository.latest_entity_success("player", 10, run_id="missing-generation")
+        is None
+    )
+
+
+def test_memory_raw_target_prefers_v2_and_tombstone_blocks_older_payload():
+    repository = MemoryFotMobRepository()
+    repository.record(
+        _commit(
+            run_id="legacy",
+            target_type="player",
+            target_key="a" * 64,
+            entity_id="10",
+            parser_version=LEGACY_PARSER_VERSION,
+            completed_at=datetime(2026, 7, 20, 8, 30),
+        )
+    )
+    repository.record(
+        _commit(
+            run_id="native",
+            target_type="player",
+            target_key="b" * 64,
+            entity_id="10",
+            parser_version=PARSER_VERSION,
+            completed_at=datetime(2026, 7, 19, 8, 30),
+        )
+    )
+
+    raw = repository.latest_entity_raw_target("player", 10)
+    assert raw is not None
+    assert raw["target_key"] == "b" * 64
+    assert raw["parser_version"] == PARSER_VERSION
+
+    repository.record(
+        _commit(
+            run_id="native-tombstone",
+            target_type="player",
+            target_key="c" * 64,
+            entity_id="10",
+            parser_version=PARSER_VERSION,
+            status=ManifestStatus.NOT_AVAILABLE,
+            completed_at=datetime(2026, 7, 21, 8, 30),
+            raw_uri=None,
+        )
+    )
+
+    assert repository.latest_entity_raw_target("player", 10) is None
+
+
 def test_current_view_fails_closed_when_any_natural_key_column_is_missing():
     writer = ViewWriter(
         [
@@ -347,6 +429,97 @@ def test_memory_completion_markers_are_exact_signature_and_season_scoped():
     assert repository.competition_completion_times("fmplan1-a") == {
         289: datetime(2026, 7, 11, 8, 30)
     }
+
+
+def test_memory_completion_resume_is_scoped_to_exact_publication_run_id():
+    repository = MemoryFotMobRepository()
+    repository.record(
+        _commit(
+            run_id="prior-generation",
+            target_type="scope_completion",
+            target_key="scope-prior",
+            entity_id="fmplan1-scope",
+            source_season_key="2017/2019",
+        )
+    )
+    repository.record(
+        _commit(
+            run_id="current-generation",
+            target_type="scope_completion",
+            target_key="scope-current",
+            entity_id="fmplan1-scope",
+            source_season_key="2017/2018",
+        )
+    )
+    repository.record(
+        _commit(
+            run_id="prior-generation",
+            target_type="competition_completion",
+            target_key="transfer-prior",
+            entity_id="fmplan1-transfer",
+            source_season_key=None,
+        )
+    )
+    repository.record(
+        _commit(
+            run_id="current-generation",
+            target_type="competition_completion",
+            target_key="transfer-current",
+            entity_id="fmplan1-transfer",
+            source_season_key=None,
+            competition_id="47",
+        )
+    )
+
+    assert repository.completed_scope_keys("fmplan1-scope") == {
+        (289, "2017/2019"),
+        (289, "2017/2018"),
+    }
+    assert repository.completed_scope_keys(
+        "fmplan1-scope", run_id="current-generation"
+    ) == {(289, "2017/2018")}
+    assert repository.completed_competition_ids(
+        "fmplan1-transfer", run_id="current-generation"
+    ) == {47}
+    assert (
+        repository.completed_competition_ids(
+            "fmplan1-transfer", run_id="missing-generation"
+        )
+        == set()
+    )
+
+
+def test_issue930_resume_does_not_count_any_of_158_prior_generation_scopes():
+    scope_file = (
+        Path(__file__).resolve().parents[3]
+        / "configs"
+        / "fotmob"
+        / "issue-930-scopes.txt"
+    )
+    scopes = [
+        (int(line.split("=", 1)[0]), line.split("=", 1)[1])
+        for line in scope_file.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(scopes) == 158
+    repository = MemoryFotMobRepository()
+    for index, (competition_id, season) in enumerate(scopes):
+        repository.record(
+            _commit(
+                run_id="prior-generation",
+                target_type="scope_completion",
+                target_key=f"{index + 1:064x}",
+                competition_id=str(competition_id),
+                source_season_key=season,
+                entity_id="fmplan1-issue930",
+            )
+        )
+
+    assert len(repository.completed_scope_keys("fmplan1-issue930")) == 158
+    assert (
+        repository.completed_scope_keys("fmplan1-issue930", run_id="current-generation")
+        == set()
+    )
 
 
 def test_memory_current_squad_ids_come_only_from_latest_team_batch():
@@ -641,9 +814,10 @@ def test_prior_failure_manifest_cannot_swallow_later_success_with_same_batch_id(
     repository.commit(success, [dataset])
     repository.flush()
 
-    assert [
-        row["status"] for row in writer.rows["fotmob_ingest_manifest"]
-    ] == ["schema_drift", "success"]
+    assert [row["status"] for row in writer.rows["fotmob_ingest_manifest"]] == [
+        "schema_drift",
+        "success",
+    ]
     assert len(writer.rows["fotmob_matches"]) == 1
 
     restarted = FotMobRepository(writer=writer, batch_size=50)
@@ -845,6 +1019,51 @@ def test_v1_manifest_rows_are_ineligible_for_v2_skip_state():
     assert f"parser_version = '{PARSER_VERSION}'" in writer.trino.queries[0]
 
 
+def test_preload_keeps_v1_raw_target_as_offline_replay_fallback():
+    target_key = "a" * 64
+    writer = PreloadWriter(
+        [
+            _manifest_row(
+                target_key,
+                "fm1-old",
+                target_type="player",
+                entity_id="9",
+                parser_version=LEGACY_PARSER_VERSION,
+            )
+        ]
+    )
+    repository = FotMobRepository(writer=writer)
+
+    repository.preload_manifest_index()
+
+    raw = repository.latest_entity_raw_target("player", 9)
+    assert raw is not None
+    assert raw["target_key"] == target_key
+    assert raw["parser_version"] == LEGACY_PARSER_VERSION
+
+
+def test_preload_builds_exact_run_index_without_per_target_queries():
+    target_key = "b" * 64
+    writer = PreloadWriter([_manifest_row(target_key, "fm1-current", "player", "9")])
+    repository = FotMobRepository(writer=writer)
+
+    repository.preload_manifest_index(run_id="current-generation")
+    queries_after_preload = len(writer.trino.queries)
+
+    assert (
+        repository.latest_success(target_key, run_id="current-generation")["batch_id"]
+        == "fm1-current"
+    )
+    assert (
+        repository.latest_entity_success("player", 9, run_id="current-generation")[
+            "batch_id"
+        ]
+        == "fm1-current"
+    )
+    assert len(writer.trino.queries) == queries_after_preload
+    assert "run_id = 'current-generation'" in writer.trino.queries[1]
+
+
 def test_a_flushed_commit_stays_visible_to_later_reads():
     # The pending buffer is cleared on flush; without folding it into the index
     # a target this run just ingested would look absent and be refetched.
@@ -864,10 +1083,20 @@ def test_entity_index_keeps_the_newest_target_key_of_one_entity():
     # A rotating Next.js build id gives one player several target keys.
     writer = PreloadWriter(
         [
-            _manifest_row("https://example/build-old/p9", "fm1-old", "player", "9",
-                          "2026-07-01 00:00:00"),
-            _manifest_row("https://example/build-new/p9", "fm1-new", "player", "9",
-                          "2026-07-09 00:00:00"),
+            _manifest_row(
+                "https://example/build-old/p9",
+                "fm1-old",
+                "player",
+                "9",
+                "2026-07-01 00:00:00",
+            ),
+            _manifest_row(
+                "https://example/build-new/p9",
+                "fm1-new",
+                "player",
+                "9",
+                "2026-07-09 00:00:00",
+            ),
         ]
     )
     repository = FotMobRepository(writer=writer)
@@ -886,7 +1115,10 @@ def test_field_inventory_rows_are_deduplicated_across_a_buffered_batch():
 
     for index in range(3):
         repository.commit(
-            _commit(target_key=f"https://example/match/{index}", content_hash=str(index) * 64),
+            _commit(
+                target_key=f"https://example/match/{index}",
+                content_hash=str(index) * 64,
+            ),
             [
                 TableRows(
                     "fotmob_field_inventory",
@@ -912,7 +1144,9 @@ def test_field_inventory_rows_are_deduplicated_across_a_buffered_batch():
             ],
         )
 
-    inventory = [call for call in writer.calls if call[1]["table"] == "fotmob_field_inventory"]
+    inventory = [
+        call for call in writer.calls if call[1]["table"] == "fotmob_field_inventory"
+    ]
     assert len(inventory) == 1
     frame = inventory[0][0]
     assert len(frame) == 2, "three identical targets must not write six rows"
@@ -926,7 +1160,9 @@ def test_deduplication_never_collapses_rows_that_carry_identity():
 
     for index in range(2):
         repository.commit(
-            _commit(target_key=f"https://example/m/{index}", content_hash=str(index) * 64),
+            _commit(
+                target_key=f"https://example/m/{index}", content_hash=str(index) * 64
+            ),
             [
                 TableRows(
                     "fotmob_matches",
@@ -959,8 +1195,14 @@ def _inventory_row(json_path="content.stats"):
 
 def _inventory_commit(repository, index, rows):
     repository.commit(
-        _commit(target_key=f"https://example/m/{index}", content_hash=str(index % 10) * 64),
-        [TableRows("fotmob_field_inventory", rows, "field_inventory", ("target_type",))],
+        _commit(
+            target_key=f"https://example/m/{index}", content_hash=str(index % 10) * 64
+        ),
+        [
+            TableRows(
+                "fotmob_field_inventory", rows, "field_inventory", ("target_type",)
+            )
+        ],
     )
 
 
@@ -974,7 +1216,9 @@ def test_inventory_dedup_survives_flush():
     for index in range(4):  # two flushes of two targets, identical rows
         _inventory_commit(repository, index, [_inventory_row()])
 
-    inventory = [call for call in writer.calls if call[1]["table"] == "fotmob_field_inventory"]
+    inventory = [
+        call for call in writer.calls if call[1]["table"] == "fotmob_field_inventory"
+    ]
     assert len(inventory) == 1, "the second flush must not re-write a seen key"
     assert len(inventory[0][0]) == 1
 
@@ -990,7 +1234,9 @@ def test_inventory_dedup_still_writes_new_keys_after_flush():
             repository, index, [_inventory_row(), _inventory_row("content.lineup")]
         )
 
-    inventory = [call for call in writer.calls if call[1]["table"] == "fotmob_field_inventory"]
+    inventory = [
+        call for call in writer.calls if call[1]["table"] == "fotmob_field_inventory"
+    ]
     assert [len(frame) for frame, _ in inventory] == [1, 1]
     assert set(inventory[1][0]["json_path"]) == {"content.lineup"}
 
@@ -1036,7 +1282,9 @@ def test_inventory_preload_dedups_keys_already_written_by_earlier_runs():
             repository, index, [_inventory_row(), _inventory_row("content.lineup")]
         )
 
-    inventory = [call for call in writer.calls if call[1]["table"] == "fotmob_field_inventory"]
+    inventory = [
+        call for call in writer.calls if call[1]["table"] == "fotmob_field_inventory"
+    ]
     assert len(inventory) == 1
     assert set(inventory[0][0]["json_path"]) == {"content.lineup"}
     preload_queries = [query for query in trino.queries if "SELECT DISTINCT" in query]
@@ -1058,7 +1306,9 @@ def test_inventory_preload_normalizes_float_string_spellings():
     _inventory_commit(repository, 0, [row])
     _inventory_commit(repository, 1, [])
 
-    inventory = [call for call in writer.calls if call[1]["table"] == "fotmob_field_inventory"]
+    inventory = [
+        call for call in writer.calls if call[1]["table"] == "fotmob_field_inventory"
+    ]
     assert inventory == [], "preloaded key must drop the live int-keyed row"
 
 
@@ -1075,7 +1325,9 @@ def test_inventory_preload_skips_player_scope():
     _inventory_commit(repository, 1, [])
 
     assert not any("SELECT DISTINCT" in query for query in trino.queries)
-    inventory = [call for call in writer.calls if call[1]["table"] == "fotmob_field_inventory"]
+    inventory = [
+        call for call in writer.calls if call[1]["table"] == "fotmob_field_inventory"
+    ]
     assert len(inventory) == 1
 
 
@@ -1156,6 +1408,8 @@ def test_failed_flush_retry_writes_inventory_rows_exactly_once():
         _inventory_commit(repository, 1, [_inventory_row("content.lineup")])
     repository.flush()
 
-    inventory = [call for call in writer.calls if call[1]["table"] == "fotmob_field_inventory"]
+    inventory = [
+        call for call in writer.calls if call[1]["table"] == "fotmob_field_inventory"
+    ]
     assert len(inventory) == 1
     assert set(inventory[0][0]["json_path"]) == {"content.stats", "content.lineup"}

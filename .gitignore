@@ -234,3 +234,6 @@ scrapers/README.md
 /image.png
 /image*.png
 /image\ copy*.png
+# Local non-secret FotMob deployment certificates (production uses a durable
+# absolute host directory mounted read-only into shared Airflow).
+/.fotmob-admission/

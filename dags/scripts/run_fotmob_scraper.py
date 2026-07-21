@@ -77,13 +77,13 @@ def _publication_from_args(args) -> dict[str, Any]:
     )
 
 
-def _attest_native_runtime(
-    args, publication: Mapping[str, Any]
-) -> dict[str, Any]:
+def _attest_native_runtime(args, publication: Mapping[str, Any]) -> dict[str, Any]:
     """Re-attest mutable bind bytes immediately before the Bronze guard."""
 
-    if (publication.get("binding") or {}).get("owner") != "isolated":
-        return {"owner": "shared", "isolated_attestation": "not_applicable"}
+    if (publication.get("binding") or {}).get("owner") == "shared":
+        from utils.fotmob_publication import attest_fotmob_shared_runtime
+
+        return attest_fotmob_shared_runtime(require_scheduled_owner=False)
     from utils.fotmob_publication import attest_fotmob_isolated_runtime
 
     scopes = [
@@ -137,8 +137,7 @@ def _native_writer_fence(
                 violations.append("publication lock is inactive")
         if violations:
             raise RuntimeError(
-                "FotMob native writer fence rejected run: "
-                + "; ".join(violations)
+                "FotMob native writer fence rejected run: " + "; ".join(violations)
             )
         global _ACTIVE_PUBLICATION_GENERATION
         if _ACTIVE_PUBLICATION_GENERATION is not None:
@@ -402,9 +401,7 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
             flush_operation.tables.extend(service.repository.flush())
             flush_operation.succeeded = 1
         except Exception as exc:
-            flush_operation.errors.append(
-                f"commit flush: {type(exc).__name__}: {exc}"
-            )
+            flush_operation.errors.append(f"commit flush: {type(exc).__name__}: {exc}")
         operations.append(flush_operation)
 
         view_operation = OperationResult("current_views", attempted=1)
@@ -536,7 +533,8 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
     previously_complete: set[tuple[int, str]] = set()
     if mode == RunMode.BACKFILL:
         previously_complete = service.repository.completed_scope_keys(
-            scope_plan_signature
+            scope_plan_signature,
+            run_id=service.run_id,
         )
     elif mode == RunMode.REPLAY:
         for season in seasons:
@@ -585,9 +583,7 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         )
     if mode == RunMode.DAILY and daily_competition_ids:
         planned_competition_ids = {item.competition_id for item in work}
-        missing_current_ids = sorted(
-            daily_competition_ids - planned_competition_ids
-        )
+        missing_current_ids = sorted(daily_competition_ids - planned_competition_ids)
         if missing_current_ids:
             work_plan.errors.append(
                 "daily cohort has no selected/latest season for competition IDs: "
@@ -661,8 +657,15 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                 scope_operations.append(team_operation)
 
             if "players" in entities:
-                capacity = service.ledger.remaining_requests // max_attempts
-                build_reserve = 0 if args.next_build_id else max_attempts
+                if mode == RunMode.REPLAY:
+                    # Raw replay performs no HTTP attempts and resolves each
+                    # rotating Next.js target from its durable manifest.  A
+                    # network request budget must not truncate a large squad.
+                    capacity = len(player_ids)
+                    build_reserve = 0
+                else:
+                    capacity = service.ledger.remaining_requests // max_attempts
+                    build_reserve = 0 if args.next_build_id else max_attempts
                 per_run_limit = args.player_limit or len(player_ids)
                 player_operation = service.sync_player_snapshots(
                     player_ids,
@@ -789,7 +792,8 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         transfer_completion_times = {}
         if mode == RunMode.BACKFILL:
             completed_transfer_ids = service.repository.completed_competition_ids(
-                transfer_signature
+                transfer_signature,
+                run_id=service.run_id,
             )
         elif mode == RunMode.DAILY:
             transfer_completion_times = service.repository.competition_completion_times(
@@ -899,9 +903,7 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         "scope_plan_signature": scope_plan_signature,
         "planned_scopes": planned_scopes,
         "completed_scopes": completed_scopes,
-        "completed_transfer_competition_ids": (
-            completed_transfer_competition_ids
-        ),
+        "completed_transfer_competition_ids": (completed_transfer_competition_ids),
         "requests_per_minute": args.requests_per_minute,
     }
     daily_contract = getattr(args, "daily_competition_contract", None)
@@ -996,7 +998,10 @@ def _argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--next-build-id",
         default="",
-        help="Optional exact FotMob Next build id (required for offline player replay)",
+        help=(
+            "Optional exact FotMob Next build id override; offline replay "
+            "normally resolves each player's historical raw target from manifests"
+        ),
     )
     parser.add_argument("--transfer-max-pages", type=int, default=250)
     parser.add_argument(
@@ -1014,9 +1019,7 @@ def _argument_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _validate_args(
-    parser: argparse.ArgumentParser, args
-) -> dict[str, Any]:
+def _validate_args(parser: argparse.ArgumentParser, args) -> dict[str, Any]:
     positive = {
         "--max-requests": args.max_requests,
         "--max-direct-mib": args.max_direct_mib,
@@ -1076,9 +1079,7 @@ def _validate_args(
             violations.append("daily competition ID SHA")
         if _parse_scopes(args.scope):
             violations.append("daily exact season scope must be empty")
-        if _parse_native_entities(args.entities) != frozenset(
-            FOTMOB_DAILY_ENTITIES
-        ):
+        if _parse_native_entities(args.entities) != frozenset(FOTMOB_DAILY_ENTITIES):
             violations.append("daily entities")
         if args.max_requests != FOTMOB_DAILY_MAX_REQUESTS:
             violations.append("daily request budget")
@@ -1090,8 +1091,7 @@ def _validate_args(
             violations.append("daily planner limits")
         if violations:
             parser.error(
-                "invalid FotMob production daily profile: "
-                + ", ".join(violations)
+                "invalid FotMob production daily profile: " + ", ".join(violations)
             )
         try:
             contract = load_fotmob_daily_competition_contract(
@@ -1151,15 +1151,21 @@ def _run_native_under_fence(
     _attest_native_runtime(args, publication)
     with _native_writer_fence(publication):
         try:
-            return _run_native(args)
-        except (ValueError, RuntimeError) as exc:
-            logger.error("FotMob runner configuration/runtime failure: %s", exc)
-            _salvage_flush()
-            return 1, _failure_payload(args, exc)
-        except Exception as exc:
-            logger.exception("Unexpected FotMob runner failure")
-            _salvage_flush()
-            return 1, _failure_payload(args, exc)
+            try:
+                return _run_native(args)
+            except (ValueError, RuntimeError) as exc:
+                logger.error("FotMob runner configuration/runtime failure: %s", exc)
+                _salvage_flush()
+                return 1, _failure_payload(args, exc)
+            except Exception as exc:
+                logger.exception("Unexpected FotMob runner failure")
+                _salvage_flush()
+                return 1, _failure_payload(args, exc)
+        finally:
+            # Every normal and salvage write has finished, but the DB guard is
+            # still held. Drift here turns the run red before publication can
+            # leave the writing phase.
+            _attest_native_runtime(args, publication)
 
 
 def main():

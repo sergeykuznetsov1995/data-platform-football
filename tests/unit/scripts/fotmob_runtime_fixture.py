@@ -27,9 +27,7 @@ def materialize_shared_runtime(release_root: Path) -> dict[str, str]:
 
 def isolated_runtime_proof(release_root: Path) -> dict[str, str]:
     shared = materialize_shared_runtime(release_root)
-    return fotmob_runtime.expected_isolated_runtime_manifest(
-        release_root, shared
-    )
+    return fotmob_runtime.expected_isolated_runtime_manifest(release_root, shared)
 
 
 def _downstream_proof(dag_id: str, first_task: str, *, has_start: bool) -> dict:
@@ -76,6 +74,15 @@ def shared_handoff_proof(
     hashes = materialize_shared_runtime(release_root)
     return {
         "shared_scheduler_container": shared_container,
+        "shared_admission_mount": {
+            "type": "bind",
+            "source": str((release_root / "evidence").resolve()),
+            "destination": str(fotmob_runtime.SHARED_CONTAINER_EVIDENCE_ROOT),
+            "read_only": True,
+            "report_path": str(
+                fotmob_runtime.SHARED_CONTAINER_EVIDENCE_ROOT / "deployment.json"
+            ),
+        },
         "master_dag_sha256": hashes[fotmob_runtime.MASTER_RUNTIME_PATH],
         "remote_master_dag_sha256": hashes[fotmob_runtime.MASTER_RUNTIME_PATH],
         "runtime_code_sha256": hashes,
@@ -84,9 +91,7 @@ def shared_handoff_proof(
             "present": True,
             "fileloc": "/opt/airflow/dags/dag_master_pipeline.py",
             "gate_present": True,
-            "trigger_upstream": [
-                "ingestion_triggers.fotmob_shared_schedule_owner"
-            ],
+            "trigger_upstream": ["ingestion_triggers.fotmob_shared_schedule_owner"],
         },
         "serialized_sofascore": {
             "present": True,
@@ -119,9 +124,7 @@ def shared_handoff_proof(
             "preflight_upstream": ["start_marker"],
             "preflight_descendants": [*xref_writers, *xref_tail],
             "preflight_trigger_rule": "all_success",
-            "task_trigger_rules": {
-                task_id: "all_success" for task_id in xref_writers
-            },
+            "task_trigger_rules": {task_id: "all_success" for task_id in xref_writers},
         },
         "serialized_downstream": {
             "dag_transform_e3": _downstream_proof(
@@ -142,9 +145,7 @@ def shared_handoff_proof(
         },
         "orchestration_state": {
             "pause_states": dict(fotmob_runtime.EXPECTED_SHARED_PAUSE_STATES),
-            "expected_pause_states": dict(
-                fotmob_runtime.EXPECTED_SHARED_PAUSE_STATES
-            ),
+            "expected_pause_states": dict(fotmob_runtime.EXPECTED_SHARED_PAUSE_STATES),
             "active_runs": [],
             "atomic_metadata_snapshot": True,
             "shared_daily_trigger": {

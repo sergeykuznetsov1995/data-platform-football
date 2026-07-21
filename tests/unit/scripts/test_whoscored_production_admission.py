@@ -671,10 +671,17 @@ def _materialize_bind_sources(rendered: Mapping[str, object], tmp_path: Path) ->
     alert_authority = host / "alert-authority"
     alert_authority.mkdir()
     alert_authority.chmod(0o700)
+    fotmob_admission = host / "fotmob-admission"
+    fotmob_admission.mkdir()
+    fotmob_admission.chmod(0o700)
     proxy_file = host / "proxys.txt"
     proxy_file.write_text("127.0.0.1:8080\n", encoding="utf-8")
     proxy_file.chmod(0o600)
     assignments = {
+        (
+            "airflow-scheduler",
+            "/opt/airflow/fotmob-admission",
+        ): fotmob_admission,
         ("airflow-scheduler", "/opt/airflow/logs"): writable["logs"],
         ("airflow-scheduler", "/opt/airflow/proxys.txt"): proxy_file,
         (
@@ -999,8 +1006,7 @@ def test_scheduler_admission_requires_gateway_token_and_forbids_raw_origins():
 def test_scheduler_admission_accepts_exact_selected_approval_path():
     environment = _rendered_environment("airflow-scheduler")
     environment["WHOSCORED_PROXY_APPROVAL_PATH"] = (
-        "/opt/airflow/secure/whoscored-approvals/"
-        "ws-measurement-20260717-v1.json"
+        "/opt/airflow/secure/whoscored-approvals/ws-measurement-20260717-v1.json"
     )
 
     admission._validate_rendered_environment(
@@ -1041,18 +1047,14 @@ def test_rendered_compose_accepts_exact_selected_approval_path():
     rendered = _rendered()
     scheduler = rendered["services"]["airflow-scheduler"]
     scheduler["environment"]["WHOSCORED_PROXY_APPROVAL_PATH"] = (
-        "/opt/airflow/secure/whoscored-approvals/"
-        "ws-measurement-20260717-v1.json"
+        "/opt/airflow/secure/whoscored-approvals/ws-measurement-20260717-v1.json"
     )
 
     projections = admission.verify_rendered_compose(rendered, BINDINGS)
 
     assert dict(projections["airflow-scheduler"]["environment"])[
         "WHOSCORED_PROXY_APPROVAL_PATH"
-    ] == (
-        "/opt/airflow/secure/whoscored-approvals/"
-        "ws-measurement-20260717-v1.json"
-    )
+    ] == ("/opt/airflow/secure/whoscored-approvals/ws-measurement-20260717-v1.json")
 
 
 def test_scheduler_healthcheck_allows_attested_python_startup_time():

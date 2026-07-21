@@ -39,6 +39,11 @@ x-airflow-common: &airflow-common
     # Publication leases are fenced by the exact immutable release.  Recreate
     # shared Airflow services for each admitted Git revision.
     FOTMOB_DEPLOY_GIT_SHA: ${FOTMOB_DEPLOY_GIT_SHA:?set exact deployed Git SHA}
+    # Shared-owner fallback is admitted by the same non-secret deployment
+    # certificate that proves the shared scheduler container and complete
+    # bind-mounted runtime manifest. The directory has a separate read-only
+    # mount so task code cannot rewrite its own trust proof.
+    FOTMOB_SHARED_DEPLOYMENT_REPORT_PATH: ${FOTMOB_SHARED_DEPLOYMENT_REPORT_PATH:?set exact report path under /opt/airflow/fotmob-admission}
     TRINO_PASSWORD: ${TRINO_PASSWORD}
     TRINO_PORT: ${TRINO_PORT}
     TRINO_HOST: ${TRINO_HOST:-trino}
@@ -755,6 +760,12 @@ services:
         bind:
           create_host_path: false
       - type: bind
+        source: ./configs/fotmob
+        target: /opt/airflow/configs/fotmob
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
         source: ./configs/soccerdata
         target: /opt/airflow/configs/soccerdata
         read_only: true
@@ -781,6 +792,12 @@ services:
       - type: bind
         source: ./scripts
         target: /opt/airflow/scripts
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${FOTMOB_SHARED_ADMISSION_HOST_DIR:?set the absolute FotMob evidence directory}
+        target: /opt/airflow/fotmob-admission
         read_only: true
         bind:
           create_host_path: false

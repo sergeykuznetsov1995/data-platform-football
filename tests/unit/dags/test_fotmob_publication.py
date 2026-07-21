@@ -13,6 +13,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from scripts import fotmob_runtime
 from utils import fotmob_publication as publication
 
 
@@ -82,10 +83,93 @@ def _isolated_runtime_evidence(tmp_path: Path):
     return roots, report_path, report, environment, dag_run
 
 
-def test_scheduled_runtime_attestation_binds_report_container_and_manifest(tmp_path):
-    roots, _path, _report, environment, dag_run = _isolated_runtime_evidence(
-        tmp_path
+def _shared_runtime_evidence(tmp_path: Path):
+    roots = {
+        prefix: tmp_path / ("shared-" + prefix.replace("/", "-"))
+        for prefix in publication.FOTMOB_SHARED_RUNTIME_ROOTS
+    }
+    for root in roots.values():
+        root.mkdir(parents=True)
+    for relative_path in publication.FOTMOB_SHARED_REQUIRED_RUNTIME_PATHS:
+        prefix = next(
+            candidate
+            for candidate in sorted(roots, key=len, reverse=True)
+            if relative_path.startswith(candidate + "/")
+        )
+        path = roots[prefix] / relative_path.removeprefix(prefix + "/")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if relative_path == "configs/fotmob/issue-930-scopes.txt":
+            path.write_bytes(_issue_930_scope_file().read_bytes())
+        else:
+            path.write_text(relative_path, encoding="utf-8")
+    manifest = publication.shared_runtime_manifest(roots=roots)
+    report_path = (tmp_path / "shared-deployment.json").resolve()
+    deployment_id = "e" * 32
+    container_id = "3" * 64
+    control = {
+        "same_runtime_configuration": True,
+        "shared": {
+            "same_shared_database": True,
+            "migrations": {
+                "status": "passed",
+                "checksum_verified": True,
+                "versions": [1],
+            },
+        },
+        "isolated": {
+            "same_shared_database": True,
+            "migrations": {
+                "status": "passed",
+                "checksum_verified": True,
+                "versions": [1],
+            },
+        },
+    }
+    handoff = {
+        "passed": True,
+        "schedule_owner": "isolated",
+        "runtime_git_sha": GIT_SHA,
+        "shared_scheduler_container": container_id,
+        "shared_admission_mount": {
+            "type": "bind",
+            "source": str(tmp_path.resolve()),
+            "destination": publication.FOTMOB_SHARED_EVIDENCE_ROOT,
+            "read_only": True,
+            "report_path": str(report_path),
+        },
+        "runtime_code_sha256": manifest,
+        "control_database": control["shared"],
+    }
+    report = {
+        "schema_version": "fotmob-deploy-v2",
+        "passed": True,
+        "activation_state": "kept_paused",
+        "kept_paused": True,
+        "paused": sorted(publication.FOTMOB_EXPECTED_ISOLATED_DAGS),
+        "unpaused": [],
+        "deployment_id": deployment_id,
+        "git_sha": GIT_SHA,
+        "shared_container_report_path": str(report_path),
+        "control_database": control,
+        "shared_handoff_initial": handoff,
+        "shared_handoff_final": dict(handoff),
+    }
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    environment = {
+        publication.FOTMOB_RUNTIME_FINGERPRINT_ENV: GIT_SHA,
+        publication.FOTMOB_SHARED_DEPLOYMENT_REPORT_PATH_ENV: str(report_path),
+        "FBREF_CONTROL_DB_URI": "postgresql://control.example/airflow",
+        "TRINO_PASSWORD": "must-not-appear",
+    }
+    dag_run = SimpleNamespace(
+        dag_id=publication.FOTMOB_SHARED_MASTER_DAG_ID,
+        run_type="scheduled",
     )
+    return roots, report_path, report, environment, dag_run
+
+
+def test_scheduled_runtime_attestation_binds_report_container_and_manifest(tmp_path):
+    roots, _path, _report, environment, dag_run = _isolated_runtime_evidence(tmp_path)
 
     result = publication.attest_fotmob_isolated_runtime(
         environ=environment,
@@ -134,6 +218,93 @@ def test_scheduled_runtime_attestation_rejects_drift_manual_and_pending(tmp_path
         publication.attest_fotmob_isolated_runtime(
             environ=environment,
             hostname="1" * 12,
+            roots=roots,
+            dag_run=dag_run,
+        )
+
+
+def test_shared_runtime_attestation_binds_report_container_control_and_bytes(
+    tmp_path,
+):
+    roots, _path, _report, environment, dag_run = _shared_runtime_evidence(tmp_path)
+
+    result = publication.attest_fotmob_shared_runtime(
+        environ=environment,
+        hostname="3" * 12,
+        roots=roots,
+        dag_run=dag_run,
+    )
+
+    assert result["deployment_id"] == "e" * 32
+    assert result["shared_scheduler_container_id"] == "3" * 64
+    assert result["runtime_file_count"] == len(
+        publication.FOTMOB_SHARED_REQUIRED_RUNTIME_PATHS
+    )
+    assert result["control_database_bound"] is True
+    assert "must-not-appear" not in json.dumps(result)
+
+
+def test_shared_task_and_host_admission_cover_the_same_required_runtime():
+    assert publication.FOTMOB_SHARED_REQUIRED_RUNTIME_PATHS == frozenset(
+        fotmob_runtime.SHARED_REQUIRED_RUNTIME_PATHS
+    )
+
+
+def test_shared_runtime_attestation_rejects_drift_manual_and_stale_handoff(
+    tmp_path,
+):
+    roots, report_path, report, environment, dag_run = _shared_runtime_evidence(
+        tmp_path
+    )
+    service = roots["scrapers"] / "fotmob/service.py"
+    service.write_text("drift", encoding="utf-8")
+    with pytest.raises(Exception, match="runtime bytes differ"):
+        publication.attest_fotmob_shared_runtime(
+            environ=environment,
+            hostname="3" * 12,
+            roots=roots,
+            dag_run=dag_run,
+        )
+
+    service.write_text("scrapers/fotmob/service.py", encoding="utf-8")
+    with pytest.raises(Exception, match="exact scheduled master DagRun"):
+        publication.attest_fotmob_shared_runtime(
+            environ=environment,
+            hostname="3" * 12,
+            roots=roots,
+            dag_run=SimpleNamespace(
+                dag_id=publication.FOTMOB_SHARED_MASTER_DAG_ID,
+                run_type="manual",
+            ),
+        )
+
+    report["shared_handoff_final"]["shared_scheduler_container"] = "4" * 64
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    with pytest.raises(Exception, match="exact handoff identity"):
+        publication.attest_fotmob_shared_runtime(
+            environ=environment,
+            hostname="3" * 12,
+            roots=roots,
+            dag_run=dag_run,
+        )
+
+
+def test_shared_runtime_attestation_rejects_active_isolated_admission(tmp_path):
+    roots, report_path, report, environment, dag_run = _shared_runtime_evidence(
+        tmp_path
+    )
+    report.update(
+        activation_state="active",
+        kept_paused=False,
+        paused=[],
+        unpaused=sorted(publication.FOTMOB_EXPECTED_ISOLATED_DAGS),
+    )
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    with pytest.raises(Exception, match="no completed deployment admission"):
+        publication.attest_fotmob_shared_runtime(
+            environ=environment,
+            hostname="3" * 12,
             roots=roots,
             dag_run=dag_run,
         )
@@ -217,9 +388,7 @@ def test_kept_paused_attestation_allows_only_exact_issue930_bronze_and_silver(
 
 
 def test_isolated_owner_missing_role_env_never_skips_attestation(tmp_path):
-    roots, _path, _report, environment, dag_run = _isolated_runtime_evidence(
-        tmp_path
-    )
+    roots, _path, _report, environment, dag_run = _isolated_runtime_evidence(tmp_path)
     environment.pop(publication.FOTMOB_ISOLATED_STACK_ENV)
     with pytest.raises(Exception, match="runtime identity differs"):
         publication.attest_fotmob_isolated_runtime(
@@ -234,16 +403,12 @@ def test_daily_contract_derives_exact_competitions_from_immutable_scope_bytes():
     contract = publication.load_fotmob_daily_competition_contract(
         _issue_930_scope_file(),
         scope_sha256=publication.FOTMOB_DAILY_SCOPE_SHA256,
-        competition_ids_sha256=(
-            publication.FOTMOB_DAILY_COMPETITION_IDS_SHA256
-        ),
+        competition_ids_sha256=(publication.FOTMOB_DAILY_COMPETITION_IDS_SHA256),
     )
 
     assert contract["scope_count"] == 158
     assert contract["competition_count"] == 21
-    assert contract["competition_ids"] == list(
-        publication.FOTMOB_DAILY_COMPETITION_IDS
-    )
+    assert contract["competition_ids"] == list(publication.FOTMOB_DAILY_COMPETITION_IDS)
     assert contract["competition_ids_sha256"] == (
         "664f972d5d86002131293bcc8da8382f6b7378cd43a8bd37a247c321decf689a"
     )
@@ -258,9 +423,7 @@ def test_daily_contract_rejects_same_count_identity_substitution(tmp_path):
         publication.load_fotmob_daily_competition_contract(
             mutated,
             scope_sha256=publication.FOTMOB_DAILY_SCOPE_SHA256,
-            competition_ids_sha256=(
-                publication.FOTMOB_DAILY_COMPETITION_IDS_SHA256
-            ),
+            competition_ids_sha256=(publication.FOTMOB_DAILY_COMPETITION_IDS_SHA256),
         )
 
 
@@ -271,9 +434,7 @@ def test_daily_trigger_conf_is_exact_all_entity_profile():
         "daily_contract": "fotmob-daily-v1",
         "competition_scope_file": publication.FOTMOB_DAILY_SCOPE_FILE,
         "competition_scope_sha256": publication.FOTMOB_DAILY_SCOPE_SHA256,
-        "competition_ids_sha256": (
-            publication.FOTMOB_DAILY_COMPETITION_IDS_SHA256
-        ),
+        "competition_ids_sha256": (publication.FOTMOB_DAILY_COMPETITION_IDS_SHA256),
         "entities": "season,leaderboards,matches,teams,players,transfers",
         "max_requests": 10_000,
         "max_direct_mib": 512,
@@ -333,12 +494,12 @@ def test_generation_id_binds_exact_interval_runtime_and_owner(monkeypatch):
         _binding(fingerprint=OTHER_SHA)
     )
     shifted = dict(binding)
-    shifted["data_interval_start"] = (
-        START + timedelta(days=1)
-    ).isoformat(timespec="microseconds")
-    shifted["data_interval_end"] = (
-        END + timedelta(days=1)
-    ).isoformat(timespec="microseconds")
+    shifted["data_interval_start"] = (START + timedelta(days=1)).isoformat(
+        timespec="microseconds"
+    )
+    shifted["data_interval_end"] = (END + timedelta(days=1)).isoformat(
+        timespec="microseconds"
+    )
     assert publication.make_generation_id(binding) != publication.make_generation_id(
         shifted
     )
@@ -388,18 +549,24 @@ def test_master_waits_for_writing_and_claims_only_exact_ready(monkeypatch):
     )
     monkeypatch.setattr(publication, "_control_store", lambda: store)
 
-    assert publication.wait_and_claim_fotmob_publication(
-        publication_owner="isolated", **context
-    ) is False
+    assert (
+        publication.wait_and_claim_fotmob_publication(
+            publication_owner="isolated", **context
+        )
+        is False
+    )
     store.claim_publication_generation.assert_not_called()
 
     store.get_publication_generation.return_value.update(
         phase="ready", status="succeeded"
     )
     store.claim_publication_generation.return_value = {"phase": "consuming"}
-    assert publication.wait_and_claim_fotmob_publication(
-        publication_owner="isolated", **context
-    ) is True
+    assert (
+        publication.wait_and_claim_fotmob_publication(
+            publication_owner="isolated", **context
+        )
+        is True
+    )
     kwargs = store.claim_publication_generation.call_args.kwargs
     assert kwargs["binding"] == binding
     assert kwargs["consumer"] == {
@@ -413,9 +580,7 @@ def test_initializer_acquires_exact_generation_before_return(monkeypatch):
     monkeypatch.setenv(publication.FOTMOB_RUNTIME_FINGERPRINT_ENV, GIT_SHA)
     monkeypatch.setenv(publication.FOTMOB_ISOLATED_STACK_ENV, "1")
     attestation = MagicMock(return_value={"runtime_manifest_sha256": "c" * 64})
-    monkeypatch.setattr(
-        publication, "attest_fotmob_isolated_runtime", attestation
-    )
+    monkeypatch.setattr(publication, "attest_fotmob_isolated_runtime", attestation)
     initialize = MagicMock(return_value={"phase": "writing", "active": True})
     store = SimpleNamespace(initialize_publication_generation=initialize)
     monkeypatch.setattr(publication, "_control_store", lambda: store)
@@ -436,20 +601,47 @@ def test_initializer_acquires_exact_generation_before_return(monkeypatch):
     assert kwargs["ttl_seconds"] == 14 * 24 * 60 * 60
 
 
+def test_shared_initializer_attests_admitted_runtime_before_acquire(monkeypatch):
+    monkeypatch.setenv(publication.FOTMOB_RUNTIME_FINGERPRINT_ENV, GIT_SHA)
+    attestation = MagicMock(return_value={"runtime_manifest_sha256": "c" * 64})
+    monkeypatch.setattr(publication, "attest_fotmob_shared_runtime", attestation)
+    initialize = MagicMock(return_value={"phase": "writing", "active": True})
+    monkeypatch.setattr(
+        publication,
+        "_control_store",
+        lambda: SimpleNamespace(initialize_publication_generation=initialize),
+    )
+    context = _context(binding=_binding(owner="shared"))
+
+    result = publication.initialize_fotmob_publication(
+        publication_owner="shared", **context
+    )
+
+    attestation.assert_called_once()
+    assert result["generation_id"] == publication.make_generation_id(
+        _binding(owner="shared")
+    )
+    assert initialize.call_args.kwargs["binding"] == _binding(owner="shared")
+
+
 def test_writer_preflight_holds_exact_phase_guard(monkeypatch):
     monkeypatch.setenv(publication.FOTMOB_RUNTIME_FINGERPRINT_ENV, GIT_SHA)
     monkeypatch.setenv(publication.FOTMOB_ISOLATED_STACK_ENV, "1")
-    attestation = MagicMock(return_value={"runtime_manifest_sha256": "c" * 64})
-    monkeypatch.setattr(
-        publication, "attest_fotmob_isolated_runtime", attestation
-    )
     events = []
+    attestation = MagicMock(
+        side_effect=lambda **_kwargs: (
+            events.append("attest") or {"runtime_manifest_sha256": "c" * 64}
+        )
+    )
+    monkeypatch.setattr(publication, "attest_fotmob_isolated_runtime", attestation)
 
     @contextmanager
     def guard(run_id, *, source):
         events.append(("enter", run_id, source))
-        yield {"phase": "writing"}
-        events.append(("exit", run_id, source))
+        try:
+            yield {"phase": "writing"}
+        finally:
+            events.append(("exit", run_id, source))
 
     monkeypatch.setattr(
         publication,
@@ -458,15 +650,97 @@ def test_writer_preflight_holds_exact_phase_guard(monkeypatch):
     )
     expected_id = publication.make_generation_id(_binding())
 
-    assert publication.validate_fotmob_writer_fence(**_context())[
-        "generation_id"
-    ] == expected_id
+    assert (
+        publication.validate_fotmob_writer_fence(**_context())["generation_id"]
+        == expected_id
+    )
     assert events == [
+        "attest",
         ("enter", expected_id, "fotmob"),
+        "attest",
         ("exit", expected_id, "fotmob"),
     ]
+    assert attestation.call_count == 2
     assert attestation.call_args.kwargs["require_scheduled_owner"] is False
     assert attestation.call_args.kwargs["allow_kept_paused_writer"] is True
+
+
+def test_shared_writer_attests_bind_bytes_before_and_after_guarded_work(monkeypatch):
+    monkeypatch.setenv(publication.FOTMOB_RUNTIME_FINGERPRINT_ENV, GIT_SHA)
+    events = []
+    attestation = MagicMock(
+        side_effect=lambda **_kwargs: (
+            events.append("attest") or {"runtime_manifest_sha256": "d" * 64}
+        )
+    )
+    monkeypatch.setattr(publication, "attest_fotmob_shared_runtime", attestation)
+
+    @contextmanager
+    def guard(run_id, *, source):
+        events.append(("enter", run_id, source))
+        try:
+            yield {"phase": "writing"}
+        finally:
+            events.append(("exit", run_id, source))
+
+    monkeypatch.setattr(
+        publication,
+        "_control_store",
+        lambda: SimpleNamespace(guard_publication_writer=guard),
+    )
+    binding = _binding(owner="shared")
+
+    result = publication.validate_fotmob_writer_fence(**_context(binding=binding))
+
+    assert result["binding"] == binding
+    assert events == [
+        "attest",
+        ("enter", publication.make_generation_id(binding), "fotmob"),
+        "attest",
+        ("exit", publication.make_generation_id(binding), "fotmob"),
+    ]
+    assert attestation.call_count == 2
+    assert attestation.call_args.kwargs["require_scheduled_owner"] is False
+
+
+def test_writer_post_attestation_drift_fails_before_guard_release(monkeypatch):
+    monkeypatch.setenv(publication.FOTMOB_RUNTIME_FINGERPRINT_ENV, GIT_SHA)
+    monkeypatch.setenv(publication.FOTMOB_ISOLATED_STACK_ENV, "1")
+    events = []
+
+    def attest(**_kwargs):
+        events.append("attest")
+        if events.count("attest") == 2:
+            raise RuntimeError("post-operation runtime drift")
+        return {"runtime_manifest_sha256": "c" * 64}
+
+    @contextmanager
+    def guard(_run_id, *, source):
+        assert source == "fotmob"
+        events.append("guard_enter")
+        try:
+            yield {"phase": "writing"}
+        finally:
+            events.append("guard_exit")
+
+    monkeypatch.setattr(publication, "attest_fotmob_isolated_runtime", attest)
+    monkeypatch.setattr(
+        publication,
+        "_control_store",
+        lambda: SimpleNamespace(guard_publication_writer=guard),
+    )
+
+    with pytest.raises(RuntimeError, match="post-operation runtime drift"):
+        with publication.fotmob_publication_writer(_context()):
+            events.append("silver_write")
+
+    assert events == [
+        "attest",
+        "guard_enter",
+        "silver_write",
+        "attest",
+        "guard_exit",
+    ]
 
 
 def test_isolated_writer_missing_role_cannot_skip_runtime_attestation(monkeypatch):
@@ -570,7 +844,9 @@ def test_raw_manual_xref_has_no_publication_authority(monkeypatch):
         publication.validate_fotmob_consumer_fence(**context)
 
 
-@pytest.mark.parametrize("phase,status", [("failed", "failed"), ("published", "succeeded")])
+@pytest.mark.parametrize(
+    "phase,status", [("failed", "failed"), ("published", "succeeded")]
+)
 def test_master_rejects_failed_or_already_published_generation(
     monkeypatch, phase, status
 ):
@@ -664,9 +940,7 @@ def test_sofascore_failure_retains_ready_or_consuming_lock(monkeypatch, phase):
     )
     monkeypatch.setattr(publication, "_control_store", lambda: store)
     context = _context(
-        wait_for_fotmob_publication=(
-            "failed" if phase == "ready" else "success"
-        ),
+        wait_for_fotmob_publication=("failed" if phase == "ready" else "success"),
         trigger_e4_transforms="failed",
     )
 
@@ -689,12 +963,9 @@ def test_consumer_trigger_conf_is_complete_and_uses_exact_sensor_xcom():
     assert conf["master_run_id"] == "{{ run_id }}"
     payload = conf["fotmob_publication"]
     assert "wait_for_fotmob_publication" in payload["generation_id"]
-    assert set(payload["binding"]) == set(
-        publication.FOTMOB_PUBLICATION_BINDING_FIELDS
-    )
+    assert set(payload["binding"]) == set(publication.FOTMOB_PUBLICATION_BINDING_FIELDS)
     assert all(
-        "wait_for_fotmob_publication" in value
-        for value in payload["binding"].values()
+        "wait_for_fotmob_publication" in value for value in payload["binding"].values()
     )
 
 

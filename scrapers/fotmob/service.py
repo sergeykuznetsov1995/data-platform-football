@@ -346,7 +346,7 @@ class FotMobIngestService:
         # the manifest about every single target it considers.
         preload = getattr(self.repository, "preload_manifest_index", None)
         if preload is not None:
-            preload()
+            preload(run_id=self.run_id if self.mode == RunMode.BACKFILL else None)
 
     def cancel(self) -> None:
         """Cooperatively stop scheduling/retrying worker requests."""
@@ -436,6 +436,40 @@ class FotMobIngestService:
                     output[key] = future.result()
                 except Exception as exc:  # result reports exact target failure
                     output[key] = exc
+        return output
+
+    def _replay_many_target_keys(
+        self,
+        targets: Mapping[str, str],
+    ) -> dict[str, FetchResult | Exception]:
+        """Replay exact raw manifests concurrently without reconstructing URLs."""
+
+        unique = {
+            str(entity_id): str(target_key) for entity_id, target_key in targets.items()
+        }
+        if not unique:
+            return {}
+        self._raise_if_cancelled()
+
+        def replay(target_key: str) -> FetchResult:
+            fetch = self.transport.replay_target_key(target_key)
+            self._account(fetch)
+            self._raise_if_cancelled()
+            return fetch
+
+        output: dict[str, FetchResult | Exception] = {}
+        with ThreadPoolExecutor(max_workers=min(self.max_workers, len(unique))) as pool:
+            futures = {
+                pool.submit(replay, target_key): entity_id
+                for entity_id, target_key in unique.items()
+            }
+            for future in as_completed(futures):
+                self._raise_if_cancelled()
+                entity_id = futures[future]
+                try:
+                    output[entity_id] = future.result()
+                except Exception as exc:
+                    output[entity_id] = exc
         return output
 
     def _commit_for_fetch(
@@ -594,8 +628,7 @@ class FotMobIngestService:
             current_ids = {item.competition_id for item in discovery.competitions}
             authoritative_observation = (
                 self.mode != RunMode.REPLAY
-                and fetch.outcome
-                in {FetchOutcome.SUCCESS, FetchOutcome.NOT_MODIFIED}
+                and fetch.outcome in {FetchOutcome.SUCCESS, FetchOutcome.NOT_MODIFIED}
                 and fetch.attempts > 0
                 and not fetch.stale
             )
@@ -1285,7 +1318,10 @@ class FotMobIngestService:
                 continue
             manifest_target = canonicalize_target(descriptor.fetch_all_url)
             if self.mode == RunMode.BACKFILL:
-                previous = self.repository.latest_success(manifest_target.target_key)
+                previous = self.repository.latest_success(
+                    manifest_target.target_key,
+                    run_id=self.run_id,
+                )
                 if (
                     previous is not None
                     and previous.get("parser_version") == PARSER_VERSION
@@ -1660,7 +1696,10 @@ class FotMobIngestService:
             manifest_target = canonicalize_target(
                 "matchDetails", {"matchId": str(match_id)}
             )
-            previous = self.repository.latest_success(manifest_target.target_key)
+            previous = self.repository.latest_success(
+                manifest_target.target_key,
+                run_id=(self.run_id if self.mode == RunMode.BACKFILL else None),
+            )
             if previous is not None and self.mode != RunMode.REPLAY:
                 result.skipped += 1
                 continue
@@ -1879,7 +1918,11 @@ class FotMobIngestService:
         player_ids: set[int] = set()
         for team in teams:
             team_id = team.get("team_id")
-            previous = self.repository.latest_entity_success("team", team_id)
+            previous = self.repository.latest_entity_success(
+                "team",
+                team_id,
+                run_id=(self.run_id if self.mode == RunMode.BACKFILL else None),
+            )
             validated_at = (
                 _aware_datetime(
                     previous.get("completed_at") or previous.get("fetched_at")
@@ -2115,9 +2158,10 @@ class FotMobIngestService:
     ) -> OperationResult:
         """Refresh global player snapshots without season mislabelling.
 
-        A rotating Next build is resolved once.  If it changes between
-        resolution and the batch, all 404s are retried once under one newly
-        resolved build rather than downloading the homepage per player.
+        In network modes a rotating Next build is resolved once.  If it changes
+        between resolution and the batch, all 404s are retried once under one
+        newly resolved build rather than downloading the homepage per player.
+        Offline replay instead follows each player's exact raw manifest target.
         """
 
         ids = list(dict.fromkeys(int(value) for value in player_ids))
@@ -2129,7 +2173,11 @@ class FotMobIngestService:
         now = utc_now()
         due: list[int] = []
         for player_id in ids:
-            previous = self.repository.latest_entity_success("player", player_id)
+            previous = self.repository.latest_entity_success(
+                "player",
+                player_id,
+                run_id=(self.run_id if self.mode == RunMode.BACKFILL else None),
+            )
             fetched_at = (
                 _aware_datetime(
                     previous.get("completed_at") or previous.get("fetched_at")
@@ -2153,11 +2201,6 @@ class FotMobIngestService:
         result.metadata["deferred_by_limit"] = due_before_limit - len(due)
         if not due:
             return result
-        try:
-            current_build = build_id or self._resolve_next_build_id()
-        except Exception as exc:
-            result.errors.append(f"Next build discovery: {type(exc).__name__}: {exc}")
-            return result
 
         def requests_for(values: Iterable[int], active_build: str):
             return [
@@ -2170,7 +2213,33 @@ class FotMobIngestService:
                 for player_id in values
             ]
 
-        fetched = self._fetch_many(requests_for(due, current_build))
+        if self.mode == RunMode.REPLAY and build_id is None:
+            target_keys: dict[str, str] = {}
+            fetched: dict[str, FetchResult | Exception] = {}
+            for player_id in due:
+                previous = self.repository.latest_entity_raw_target("player", player_id)
+                target_key = (
+                    str(previous.get("target_key") or "")
+                    if isinstance(previous, Mapping)
+                    else ""
+                )
+                if not re.fullmatch(r"[0-9a-f]{64}", target_key):
+                    fetched[str(player_id)] = RuntimeError(
+                        "no raw-bearing v1/v2 player manifest for offline replay"
+                    )
+                else:
+                    target_keys[str(player_id)] = target_key
+            fetched.update(self._replay_many_target_keys(target_keys))
+            current_build = None
+        else:
+            try:
+                current_build = build_id or self._resolve_next_build_id()
+            except Exception as exc:
+                result.errors.append(
+                    f"Next build discovery: {type(exc).__name__}: {exc}"
+                )
+                return result
+            fetched = self._fetch_many(requests_for(due, current_build))
         rotated: list[int] = []
         for key, outcome in fetched.items():
             if (

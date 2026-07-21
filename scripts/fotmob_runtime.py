@@ -37,6 +37,7 @@ PROJECTION_SOURCES = {
 }
 PROJECTION_DIRECTORIES = {"utils", "sql", "scripts"}
 CONTAINER_EVIDENCE_ROOT = Path("/opt/airflow/logs/fotmob")
+SHARED_CONTAINER_EVIDENCE_ROOT = Path("/opt/airflow/fotmob-admission")
 EXPECTED_DAGS = {
     "dag_ingest_fotmob",
     "dag_transform_fotmob_silver",
@@ -75,6 +76,7 @@ ISOLATED_AIRFLOWIGNORE_PATH = "dags/.airflowignore"
 SHARED_REQUIRED_RUNTIME_PATHS = {
     "configs/fotmob/competitions.json",
     "configs/fotmob/issue-930-scopes.txt",
+    "dags/.airflowignore",
     "dags/dag_ingest_fotmob.py",
     "dags/dag_master_pipeline.py",
     "dags/dag_sofascore_pipeline.py",
@@ -143,9 +145,7 @@ def shared_runtime_manifest(release_root: Path) -> dict[str, str]:
     for relative_root in SHARED_RUNTIME_ROOTS:
         root = release_root / relative_root
         if not root.is_dir():
-            raise RuntimeBindingError(
-                f"shared runtime root is absent: {relative_root}"
-            )
+            raise RuntimeBindingError(f"shared runtime root is absent: {relative_root}")
         for path in sorted(root.rglob("*")):
             if path.is_symlink():
                 raise RuntimeBindingError(
@@ -154,7 +154,10 @@ def shared_runtime_manifest(release_root: Path) -> dict[str, str]:
             if (
                 path.is_file()
                 and "__pycache__" not in path.parts
-                and path.name.endswith(SHARED_RUNTIME_SUFFIXES)
+                and (
+                    path.name == ".airflowignore"
+                    or path.name.endswith(SHARED_RUNTIME_SUFFIXES)
+                )
             ):
                 relative_path = path.relative_to(release_root).as_posix()
                 manifest[relative_path] = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -245,6 +248,7 @@ def _validate_shared_handoff_report(
     git_sha: str,
     control_database: Mapping[str, Any],
     expected_runtime_manifest: Mapping[str, str],
+    expected_admission_mount: Mapping[str, Any],
 ) -> None:
     if (
         not isinstance(handoff, Mapping)
@@ -259,6 +263,14 @@ def _validate_shared_handoff_report(
     ):
         raise RuntimeBindingError("deployment report has no valid shared runtime proof")
 
+    admission_mount = handoff.get("shared_admission_mount")
+    if not isinstance(admission_mount, Mapping) or dict(admission_mount) != dict(
+        expected_admission_mount
+    ):
+        raise RuntimeBindingError(
+            "deployment report has no exact shared admission mount"
+        )
+
     hashes = handoff.get("runtime_code_sha256")
     if (
         not isinstance(hashes, Mapping)
@@ -268,8 +280,7 @@ def _validate_shared_handoff_report(
             for value in hashes.values()
         )
         or handoff.get("master_dag_sha256") != hashes.get(MASTER_RUNTIME_PATH)
-        or handoff.get("remote_master_dag_sha256")
-        != hashes.get(MASTER_RUNTIME_PATH)
+        or handoff.get("remote_master_dag_sha256") != hashes.get(MASTER_RUNTIME_PATH)
     ):
         raise RuntimeBindingError("deployment report has no exact shared code hashes")
 
@@ -298,14 +309,11 @@ def _validate_shared_handoff_report(
                 "finalizer_present",
             )
         )
-        or "wait_for_fotmob_publication"
-        not in set(sofa.get("xref_upstream") or ())
-        or "trigger_xref_transforms"
-        not in set(sofa.get("sensor_downstream") or ())
+        or "wait_for_fotmob_publication" not in set(sofa.get("xref_upstream") or ())
+        or "trigger_xref_transforms" not in set(sofa.get("sensor_downstream") or ())
         or set(sofa.get("finalizer_upstream") or ())
         != {"wait_for_fotmob_publication", "trigger_e4_transforms"}
-        or "finalize_fotmob_publication"
-        not in set(sofa.get("e4_downstream") or ())
+        or "finalize_fotmob_publication" not in set(sofa.get("e4_downstream") or ())
         or sofa.get("finalizer_trigger_rule") != "all_done"
     ):
         raise RuntimeBindingError("deployment report has unsafe serialized Sofa DAG")
@@ -333,8 +341,7 @@ def _validate_shared_handoff_report(
         or set(xref.get("preflight_upstream") or ()) != {"start_marker"}
         or xref.get("preflight_trigger_rule") != "all_success"
         or not xref_writers.issubset(xref_task_ids)
-        or xref_task_ids
-        - {"start_marker", "validate_fotmob_publication_consumer"}
+        or xref_task_ids - {"start_marker", "validate_fotmob_publication_consumer"}
         != xref_descendants
         or not isinstance(xref_rules, Mapping)
         or any(xref_rules.get(task_id) != "all_success" for task_id in xref_writers)
@@ -374,12 +381,13 @@ def _validate_shared_handoff_report(
     if (
         not isinstance(orchestration, Mapping)
         or orchestration.get("pause_states") != EXPECTED_SHARED_PAUSE_STATES
-        or orchestration.get("expected_pause_states")
-        != EXPECTED_SHARED_PAUSE_STATES
+        or orchestration.get("expected_pause_states") != EXPECTED_SHARED_PAUSE_STATES
         or orchestration.get("active_runs") != []
         or orchestration.get("atomic_metadata_snapshot") is not True
     ):
-        raise RuntimeBindingError("deployment report has no atomic shared quiescence proof")
+        raise RuntimeBindingError(
+            "deployment report has no atomic shared quiescence proof"
+        )
     shared_daily = orchestration.get("shared_daily_trigger")
     if (
         not isinstance(shared_daily, Mapping)
@@ -405,12 +413,11 @@ def _validate_shared_handoff_report(
     if (
         not isinstance(run_checks, Mapping)
         or set(run_checks) != SHARED_STATE_DAGS
-        or any(
-            check != {"running": [], "queued": []}
-            for check in run_checks.values()
-        )
+        or any(check != {"running": [], "queued": []} for check in run_checks.values())
     ):
-        raise RuntimeBindingError("deployment report has incomplete shared active-run proof")
+        raise RuntimeBindingError(
+            "deployment report has incomplete shared active-run proof"
+        )
 
 
 def _timestamp(value: Any) -> datetime:
@@ -467,6 +474,7 @@ def load_deployment_context(
         "release_root",
         "evidence_dir",
         "container_report_path",
+        "shared_container_report_path",
         "dagbag_root",
         "git_sha",
         "image",
@@ -507,25 +515,33 @@ def load_deployment_context(
         raise RuntimeBindingError(
             "deployment report is not mounted below the container evidence root"
         ) from exc
-    if (
-        not container_report_relative.parts
-        or ".." in container_report_relative.parts
-    ):
+    if not container_report_relative.parts or ".." in container_report_relative.parts:
         raise RuntimeBindingError("deployment container report path is invalid")
+    shared_container_report_path = Path(str(payload["shared_container_report_path"]))
+    try:
+        shared_container_report_relative = shared_container_report_path.relative_to(
+            SHARED_CONTAINER_EVIDENCE_ROOT
+        )
+    except ValueError as exc:
+        raise RuntimeBindingError(
+            "deployment shared report is not mounted below its evidence root"
+        ) from exc
+    if shared_container_report_relative != container_report_relative:
+        raise RuntimeBindingError(
+            "deployment isolated/shared report paths identify different files"
+        )
     if not re.fullmatch(r"[0-9a-f]{40}", str(payload["git_sha"])):
         raise RuntimeBindingError("deployment report has an invalid Git SHA")
     for key in ("image", "postgres_image"):
-        if not re.fullmatch(
-            r"[^\s@]+@sha256:[0-9a-fA-F]{64}", str(payload[key])
-        ):
+        if not re.fullmatch(r"[^\s@]+@sha256:[0-9a-fA-F]{64}", str(payload[key])):
             raise RuntimeBindingError(f"deployment {key} is not digest-pinned")
     for key in ("resolved_image_id", "resolved_postgres_image_id"):
         if not re.fullmatch(r"sha256:[0-9a-fA-F]{64}", str(payload[key])):
-            raise RuntimeBindingError(
-                f"deployment {key} is not an immutable image ID"
-            )
+            raise RuntimeBindingError(f"deployment {key} is not an immutable image ID")
     if not re.fullmatch(r"[0-9a-f]{32}", str(payload["deployment_id"])):
-        raise RuntimeBindingError("deployment report has an invalid deployment identity")
+        raise RuntimeBindingError(
+            "deployment report has an invalid deployment identity"
+        )
     for key in ("scheduler_container_id", "metadb_container_id"):
         if not re.fullmatch(r"[0-9a-f]{64}", str(payload[key])):
             raise RuntimeBindingError(f"deployment {key} is not a full container ID")
@@ -541,16 +557,19 @@ def load_deployment_context(
         "scheduler_image_id": payload["resolved_image_id"],
     }
     if any(marker.get(key) != value for key, value in marker_expected.items()):
-        raise RuntimeBindingError("deployment data-plane marker identity is inconsistent")
+        raise RuntimeBindingError(
+            "deployment data-plane marker identity is inconsistent"
+        )
     if payload.get("delivery_credentials") != {
         "telegram_bot_token_configured": True,
         "telegram_chat_id_configured": True,
     }:
         raise RuntimeBindingError("deployment report has no delivery credential proof")
     control = payload.get("control_database")
-    if not isinstance(control, Mapping) or control.get(
-        "same_runtime_configuration"
-    ) is not True:
+    if (
+        not isinstance(control, Mapping)
+        or control.get("same_runtime_configuration") is not True
+    ):
         raise RuntimeBindingError("deployment report has no shared control DB proof")
     for side in ("shared", "isolated"):
         proof = control.get(side)
@@ -568,23 +587,34 @@ def load_deployment_context(
     expected_runtime_manifest = shared_runtime_manifest(
         Path(str(payload["release_root"]))
     )
+    expected_admission_mount = {
+        "type": "bind",
+        "source": str(Path(str(payload["evidence_dir"])).resolve()),
+        "destination": str(SHARED_CONTAINER_EVIDENCE_ROOT),
+        "read_only": True,
+        "report_path": str(shared_container_report_path),
+    }
     _validate_shared_handoff_report(
         initial_handoff,
         git_sha=str(payload["git_sha"]),
         control_database=control["shared"],
         expected_runtime_manifest=expected_runtime_manifest,
+        expected_admission_mount=expected_admission_mount,
     )
     _validate_shared_handoff_report(
         final_handoff,
         git_sha=str(payload["git_sha"]),
         control_database=control["shared"],
         expected_runtime_manifest=expected_runtime_manifest,
+        expected_admission_mount=expected_admission_mount,
     )
     if (
         initial_handoff["shared_scheduler_container"]
         != final_handoff["shared_scheduler_container"]
         or initial_handoff["runtime_code_sha256"]
         != final_handoff["runtime_code_sha256"]
+        or initial_handoff["shared_admission_mount"]
+        != final_handoff["shared_admission_mount"]
     ):
         raise RuntimeBindingError("shared handoff identity changed during deployment")
     expected_isolated_manifest = expected_isolated_runtime_manifest(
@@ -610,9 +640,7 @@ def compose_environment(context: Mapping[str, Any]) -> dict[str, str]:
             "FOTMOB_AIRFLOW_IMAGE": str(context["image"]),
             "FOTMOB_POSTGRES_IMAGE": str(context["postgres_image"]),
             "FOTMOB_DEPLOYMENT_ID": str(context["deployment_id"]),
-            "FOTMOB_DEPLOYMENT_REPORT_PATH": str(
-                context["container_report_path"]
-            ),
+            "FOTMOB_DEPLOYMENT_REPORT_PATH": str(context["container_report_path"]),
         }
     )
     return environment
@@ -723,14 +751,19 @@ def _attest_release(
         raise RuntimeBindingError("admitted DagBag projection is unavailable")
     observed_files = {item.name for item in projection.iterdir() if item.is_file()}
     observed_dirs = {item.name for item in projection.iterdir() if item.is_dir()}
-    if observed_files != set(PROJECTION_SOURCES) or observed_dirs != PROJECTION_DIRECTORIES:
+    if (
+        observed_files != set(PROJECTION_SOURCES)
+        or observed_dirs != PROJECTION_DIRECTORIES
+    ):
         raise RuntimeBindingError("live DagBag projection has unexpected entries")
     hashes: dict[str, str] = {}
     for name, relative in PROJECTION_SOURCES.items():
         source = release / relative
         projected = projection / name
         if not source.is_file():
-            raise RuntimeBindingError(f"live DagBag projection source is absent: {name}")
+            raise RuntimeBindingError(
+                f"live DagBag projection source is absent: {name}"
+            )
         source_bytes = source.read_bytes()
         projected_bytes = projected.read_bytes()
         if projected_bytes != source_bytes:
@@ -751,9 +784,7 @@ def _current_service_ids(
     env_file: Path,
     run: Callable[..., subprocess.CompletedProcess[str]],
 ) -> None:
-    base = compose_base(
-        project=project, compose_file=compose_file, env_file=env_file
-    )
+    base = compose_base(project=project, compose_file=compose_file, env_file=env_file)
     environment = compose_environment(context)
     for service, key in (
         ("airflow-scheduler", "scheduler_container_id"),
@@ -793,13 +824,19 @@ def validate_live_deployment(
     scheduler = _inspect_container(str(context["scheduler_container_id"]), run=run)
     metadb = _inspect_container(str(context["metadb_container_id"]), run=run)
     if scheduler.get("Id") != context["scheduler_container_id"]:
-        raise RuntimeBindingError("live scheduler container differs from deployment report")
+        raise RuntimeBindingError(
+            "live scheduler container differs from deployment report"
+        )
     if metadb.get("Id") != context["metadb_container_id"]:
-        raise RuntimeBindingError("live metadata DB container differs from deployment report")
+        raise RuntimeBindingError(
+            "live metadata DB container differs from deployment report"
+        )
     if scheduler.get("Image") != context["resolved_image_id"]:
         raise RuntimeBindingError("live scheduler image differs from deployment report")
     if metadb.get("Image") != context["resolved_postgres_image_id"]:
-        raise RuntimeBindingError("live metadata DB image differs from deployment report")
+        raise RuntimeBindingError(
+            "live metadata DB image differs from deployment report"
+        )
     running = bool((scheduler.get("State") or {}).get("Running"))
     if require_running and not running:
         raise RuntimeBindingError("admitted scheduler container is not running")
@@ -807,15 +844,20 @@ def validate_live_deployment(
         raise RuntimeBindingError("admitted metadata DB container is not running")
     parsed_env = _parsed_environment(scheduler)
     if parsed_env.get("FOTMOB_DEPLOYMENT_ID") != context["deployment_id"]:
-        raise RuntimeBindingError("live scheduler deployment identity differs from report")
-    if parsed_env.get("FOTMOB_DEPLOYMENT_REPORT_PATH") != context[
-        "container_report_path"
-    ]:
+        raise RuntimeBindingError(
+            "live scheduler deployment identity differs from report"
+        )
+    if (
+        parsed_env.get("FOTMOB_DEPLOYMENT_REPORT_PATH")
+        != context["container_report_path"]
+    ):
         raise RuntimeBindingError(
             "live scheduler deployment report path differs from report"
         )
     if parsed_env.get("FOTMOB_DEPLOY_GIT_SHA") != context["git_sha"]:
-        raise RuntimeBindingError("live scheduler Git SHA differs from deployment report")
+        raise RuntimeBindingError(
+            "live scheduler Git SHA differs from deployment report"
+        )
     if parsed_env.get("FOTMOB_ISOLATED_STACK") != "1":
         raise RuntimeBindingError("live scheduler is not the explicit isolated stack")
     if any(
@@ -829,8 +871,10 @@ def validate_live_deployment(
             "live scheduler does not use the shared production control DB"
         )
     missing_trino = [key for key in TRINO_ENV_KEYS if key not in parsed_env]
-    if missing_trino or not parsed_env.get("TRINO_HOST") or not parsed_env.get(
-        "TRINO_PASSWORD"
+    if (
+        missing_trino
+        or not parsed_env.get("TRINO_HOST")
+        or not parsed_env.get("TRINO_PASSWORD")
     ):
         raise RuntimeBindingError(
             f"live scheduler misses admitted Trino configuration: {missing_trino!r}"
@@ -854,7 +898,9 @@ def validate_live_deployment(
         if isinstance(item, Mapping)
     }
     if set(mounts) != set(expected_mounts):
-        raise RuntimeBindingError("live scheduler mount destinations differ from report")
+        raise RuntimeBindingError(
+            "live scheduler mount destinations differ from report"
+        )
     for destination, (source, writable) in expected_mounts.items():
         mount = mounts[destination]
         if mount.get("Type") != "bind":
@@ -862,7 +908,9 @@ def validate_live_deployment(
         if Path(str(mount.get("Source"))).resolve() != source.resolve():
             raise RuntimeBindingError(f"live mount source differs for {destination}")
         if bool(mount.get("RW")) is not writable:
-            raise RuntimeBindingError(f"live mount access mode differs for {destination}")
+            raise RuntimeBindingError(
+                f"live mount access mode differs for {destination}"
+            )
     metadb_mounts = [
         item
         for item in metadb.get("Mounts") or ()
@@ -961,9 +1009,13 @@ def assert_no_active_fotmob_publication(
             "shared and isolated schedulers do not use the same production control DB"
         )
     if shared_env.get("FOTMOB_DEPLOY_GIT_SHA") != context["git_sha"]:
-        raise RuntimeBindingError("shared scheduler Git SHA differs from deployment report")
+        raise RuntimeBindingError(
+            "shared scheduler Git SHA differs from deployment report"
+        )
     if shared_env.get("FOTMOB_ISOLATED_STACK", ""):
-        raise RuntimeBindingError("shared scheduler opted into the isolated daily stack")
+        raise RuntimeBindingError(
+            "shared scheduler opted into the isolated daily stack"
+        )
 
     release = Path(str(context["release_root"]))
     code_hashes = shared_runtime_manifest(release)
@@ -983,7 +1035,8 @@ def assert_no_active_fotmob_publication(
         "        if path.is_symlink():\n"
         "            raise RuntimeError('shared runtime symlink: '+str(path))\n"
         "        if (path.is_file() and '__pycache__' not in path.parts "
-        "and path.name.endswith(suffixes)):\n"
+        "and (path.name == '.airflowignore' or "
+        "path.name.endswith(suffixes))):\n"
         "            key=prefix+'/'+path.relative_to(root).as_posix()\n"
         "            manifest[key]=hashlib.sha256(path.read_bytes()).hexdigest()\n"
         "print('FOTMOB_SHARED_RUNTIME_MANIFEST_JSON='+"
@@ -1138,13 +1191,20 @@ def validate_data_plane_marker(
         str(marker["scheduler_container_id"]),
         str(marker["scheduler_image_id"]),
     )
-    patterns = (r"[0-9a-f]{32}", r"[0-9a-f]{40}", r"[0-9a-f]{64}", r"sha256:[0-9a-fA-F]{64}")
-    if any(not re.fullmatch(pattern, value) for pattern, value in zip(patterns, values)):
+    patterns = (
+        r"[0-9a-f]{32}",
+        r"[0-9a-f]{40}",
+        r"[0-9a-f]{64}",
+        r"sha256:[0-9a-fA-F]{64}",
+    )
+    if any(
+        not re.fullmatch(pattern, value) for pattern, value in zip(patterns, values)
+    ):
         raise RuntimeBindingError("unsafe data-plane marker identity")
     rows = client.query(
         "-- runtime-binding:data-plane-marker\n"
-        "SELECT COUNT(*) FROM \"iceberg\".\"bronze\"."
-        "\"fotmob_runtime_deployments\"\n"
+        'SELECT COUNT(*) FROM "iceberg"."bronze".'
+        '"fotmob_runtime_deployments"\n'
         f"WHERE deployment_id = '{values[0]}' AND git_sha = '{values[1]}'\n"
         f"  AND scheduler_container_id = '{values[2]}'\n"
         f"  AND scheduler_image_id = '{values[3]}'"
