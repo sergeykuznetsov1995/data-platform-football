@@ -81,7 +81,7 @@
     "scripts/flaresolverr_extended.py": "6a37011652dbb9e7b7b9edcbac2457b23b7ea2c0fad6d5b913ad3a5b37adc2d5",
     "scripts/proxy_filter/__init__.py": "7146a37770864e5bbd63f6060f89d2615e5606ddab63c8dd017cb5d9b8e0015f",
     "scripts/proxy_filter/budget.py": "3bc5f80272ddca2bab0cff5d461864b68828b2772d84054af11ce345160adeaf",
-    "scripts/proxy_filter/filter_proxy.py": "d5a3cdc89bd455d4f0959f386e97f9b9c2fceb03d569b8c5a17d4cb028aa7d0e",
+    "scripts/proxy_filter/filter_proxy.py": "be4da2c4bbe43c50f7f5bdd58a52951243ff9962a738436808657c9dcff60ace",
     "scripts/research/bench_whoscored_capacity.py": "d3ad896c76407fb8617a20131b557af95c8655db526ebd4ead8fd92a86640863",
     "scripts/research/bench_whoscored_workflow.py": "71b77bbe5541a213579732954b52f044b9ac31bf8b3568576f9b9254107cb746",
     "scripts/research/whoscored_capacity_container_runtime.py": "c434c5ba31de8fa49f651dcc9c36d03773d40631c60925d067e0c01c85401b22",
