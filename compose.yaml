@@ -147,7 +147,7 @@ x-airflow-common: &airflow-common
     WHOSCORED_CATALOG_REQUESTS_PER_MINUTE: ${WHOSCORED_CATALOG_REQUESTS_PER_MINUTE:-60}
     # Transfermarkt stays disabled and cannot acquire an unmanaged proxy until
     # an operator supplies the separately approved paid/write packet.
-    TM_NATIVE_V2_ENABLED: ${TM_NATIVE_V2_ENABLED:-false}
+    TM_NATIVE_V2_ENABLED: ${TM_NATIVE_V2_ENABLED:-true}
     # Second activation key: scheduled runs accept the standing approval
     # policies only when this is true (see dags/configs/transfermarkt/).
     TM_STANDING_POLICY_ENABLED: ${TM_STANDING_POLICY_ENABLED:-false}
