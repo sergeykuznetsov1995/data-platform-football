@@ -94,6 +94,9 @@ class RegistryRowType(str, Enum):
     PARTICIPANT = "participant"
 
 
+PARTICIPANT_CONTRACT_REVISION = "team-id-v1"
+
+
 EnumT = TypeVar("EnumT", bound=Enum)
 
 
@@ -902,6 +905,7 @@ class RegistryPage:
     editions: tuple[EditionRecord, ...]
     participants: tuple[CompetitionParticipant, ...] = field(default_factory=tuple)
     participants_declared: bool = True
+    participant_contract_revision: Optional[str] = PARTICIPANT_CONTRACT_REVISION
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -920,6 +924,15 @@ class RegistryPage:
         object.__setattr__(
             self, "participants_declared", bool(self.participants_declared)
         )
+        if self.participant_contract_revision is not None:
+            object.__setattr__(
+                self,
+                "participant_contract_revision",
+                _required_text(
+                    "participant_contract_revision",
+                    self.participant_contract_revision,
+                ),
+            )
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "RegistryPage":
@@ -965,6 +978,7 @@ class RegistryPage:
                 for item in value.get("participants", ())
             ),
             participants_declared="participants" in value,
+            participant_contract_revision=value.get("participant_contract_revision"),
         )
 
 
@@ -1066,6 +1080,16 @@ def reconcile_registry_pages(
         raise IncompleteSnapshotError(
             "registry pages do not declare exact participant rows: "
             f"{undeclared_participant_pages}"
+        )
+    incompatible_participant_pages = sorted(
+        page.page_number
+        for page in materialized
+        if page.participant_contract_revision != PARTICIPANT_CONTRACT_REVISION
+    )
+    if incompatible_participant_pages:
+        raise IncompleteSnapshotError(
+            "registry pages do not declare the current participant contract "
+            f"{PARTICIPANT_CONTRACT_REVISION}: {incompatible_participant_pages}"
         )
 
     competitions: dict[str, CompetitionRecord] = {}
@@ -1556,6 +1580,7 @@ __all__ = [
     "EvidenceOrigin",
     "Gender",
     "IncompleteSnapshotError",
+    "PARTICIPANT_CONTRACT_REVISION",
     "RegistryConflictError",
     "RegistryError",
     "RegistryPage",

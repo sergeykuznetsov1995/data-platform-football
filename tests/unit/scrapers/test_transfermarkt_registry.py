@@ -506,6 +506,22 @@ def test_legacy_page_without_explicit_participant_rows_is_incomplete(
         reconcile_registry_pages((legacy_page, pages[1]))
 
 
+def test_legacy_explicit_empty_participants_require_current_contract(
+    raw_registry,
+    pages,
+) -> None:
+    legacy_mapping = dict(raw_registry["pages"][0])
+    legacy_mapping.pop("participant_contract_revision")
+    legacy_page = RegistryPage.from_mapping(legacy_mapping)
+    assert legacy_page.participants == ()
+
+    with pytest.raises(
+        IncompleteSnapshotError,
+        match="do not declare the current participant contract",
+    ):
+        reconcile_registry_pages((legacy_page, pages[1]))
+
+
 def test_legacy_name_url_sensitive_participant_hash_is_rejected(pages) -> None:
     edition = next(item for item in pages[0].editions if item.competition_id == "GB1")
     participant = CompetitionParticipant(

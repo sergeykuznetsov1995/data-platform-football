@@ -17,6 +17,7 @@
       "page_count": 2,
       "source_url": "https://www.transfermarkt.com/navigation/wettbewerbe?page=1",
       "source_body_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+      "participant_contract_revision": "team-id-v1",
       "competitions": [
         {
           "competition_id": "GB1",
@@ -228,6 +229,7 @@
       "page_count": 2,
       "source_url": "https://www.transfermarkt.com/navigation/wettbewerbe?page=2",
       "source_body_hash": "2222222222222222222222222222222222222222222222222222222222222222",
+      "participant_contract_revision": "team-id-v1",
       "competitions": [
         {
           "competition_id": "AFCN",
