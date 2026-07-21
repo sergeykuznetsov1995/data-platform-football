@@ -264,7 +264,10 @@ def _build_native_service(args, run_id: str):
         max_attempts=args.max_attempts,
         rate_limiter=limiter,
     )
-    repository = FotMobRepository(batch_size=args.commit_batch_size)
+    repository = FotMobRepository(
+        batch_size=args.commit_batch_size,
+        max_buffered_rows=args.max_buffered_rows,
+    )
     budget = TransportBudget(
         max_requests=args.max_requests,
         max_direct_bytes=int(args.max_direct_mib * 1024 * 1024),
@@ -919,6 +922,17 @@ def _argument_parser() -> argparse.ArgumentParser:
             "every target separately (one single-row data file per target)."
         ),
     )
+    parser.add_argument(
+        "--max-buffered-rows",
+        type=int,
+        default=100_000,
+        help=(
+            "Physical rows buffered before an early flush. The 20k default "
+            "of the repository flushed every ~4 matches once field-inventory "
+            "rows piled up, defeating --commit-batch-size. Only effective "
+            "with --commit-batch-size > 1 (batch size 1 writes unbuffered)."
+        ),
+    )
     parser.add_argument("--competition-limit", type=int, default=0)
     parser.add_argument("--season-limit", type=int, default=0)
     parser.add_argument("--match-limit", type=int, default=0)
@@ -975,6 +989,7 @@ def _validate_args(parser: argparse.ArgumentParser, args) -> None:
         "--max-attempts": args.max_attempts,
         "--workers": args.workers,
         "--transfer-max-pages": args.transfer_max_pages,
+        "--max-buffered-rows": args.max_buffered_rows,
     }
     for name, value in positive.items():
         if value <= 0:

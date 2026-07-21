@@ -14,8 +14,10 @@ Documented invariants we exercise:
   * canonical_id = LOWER(REGEXP_REPLACE(<name>, '[^a-zA-Z0-9]+', '_')).
   * confidence ∈ {'name_alias', 'name_normalize', 'name_initial', 'orphan'}
     with the cascade precedence alias > exact > initial > orphan.
-  * Reads bronze.fbref_match_managers (spine), bronze.fotmob_player_details
-    (is_coach rows) and native Transfermarkt coach stints/profiles.
+  * Reads bronze.fbref_match_managers (spine), native
+    bronze.fotmob_player_snapshots_current (is_coach rows, #930 cutover —
+    (league, season) scope reconstructed via the shared cutover-framework
+    coach_scope CTE) and native Transfermarkt coach stints/profiles.
   * name_initial ambiguity guards on both sides (HAVING unique spine key +
     TM-side initial_key_dup window).
   * NULL/empty manager/coach name is filtered out.
@@ -78,12 +80,43 @@ class TestXrefManagerStructure:
             "table populated by parsers/finders.py::parse_match_managers"
         )
 
-    def test_reads_bronze_fotmob_player_details(self):
-        """FotMob mirror reads from iceberg.bronze.fotmob_player_details."""
+    def test_reads_native_fotmob_player_snapshots(self):
+        """FotMob mirror reads from the native
+        iceberg.bronze.fotmob_player_snapshots_current view (#930 cutover) —
+        the legacy fotmob_player_details table must be gone."""
         sql_lower = _read_sql().lower()
-        assert "iceberg.bronze.fotmob_player_details" in sql_lower, (
-            "xref_manager must read FotMob coaches from "
-            "bronze.fotmob_player_details (is_coach rows)"
+        assert "iceberg.bronze.fotmob_player_snapshots_current" in sql_lower, (
+            "xref_manager must read FotMob coaches from native "
+            "bronze.fotmob_player_snapshots_current (is_coach rows)"
+        )
+        assert "iceberg.bronze.fotmob_player_details" not in sql_lower, (
+            "legacy bronze.fotmob_player_details must not be referenced "
+            "after the #930 cutover"
+        )
+
+    def test_fotmob_scope_via_cutover_framework(self):
+        """The native snapshot is GLOBAL (no league/season) — scope must come
+        from the shared cutover-framework CTEs: season_axis over
+        competition_seasons + season_teams × squad_snapshots → coach_scope."""
+        sql_lower = _read_sql().lower()
+        for relation in (
+            "iceberg.bronze.fotmob_competition_seasons_current",
+            "iceberg.bronze.fotmob_season_teams_current",
+            "iceberg.bronze.fotmob_squad_snapshots_current",
+        ):
+            assert relation in sql_lower, (
+                f"cutover framework relation {relation} missing — the FotMob "
+                "coach (league, season) scope cannot be reconstructed without it"
+            )
+        for cte in ("league_map", "season_axis", "team_scope", "squad_scope",
+                    "coach_scope"):
+            assert re.search(rf"\b{cte}\b", sql_lower), (
+                f"cutover-framework CTE {cte} missing — the framework block "
+                "must be copied verbatim (names are the sync contract)"
+            )
+        assert "member_type = 'coach'" in sql_lower, (
+            "coach_scope must select squad members with member_type = 'coach' "
+            "(the native replacement of the legacy role='coach' filter)"
         )
 
     def test_reads_native_transfermarkt_coach_contract(self):
@@ -108,11 +141,11 @@ class TestXrefManagerStructure:
         assert "try_cast(s.left_date as date) >= m.season_start" in sql
 
     def test_fotmob_filters_is_coach(self):
-        """FotMob block keeps only coaches (is_coach = true)."""
+        """FotMob block keeps only coaches (WHERE ps.is_coach)."""
         sql_lower = _read_sql().lower()
-        assert "is_coach = true" in sql_lower, (
-            "FotMob mirror must filter `is_coach = true` — the table also holds "
-            "players (filtered out elsewhere via NOT is_coach)"
+        assert re.search(r"where\s+ps\.is_coach\b", sql_lower), (
+            "FotMob mirror must filter `WHERE ps.is_coach` — the snapshot view "
+            "also holds players (filtered out elsewhere via NOT is_coach)"
         )
 
     def test_fotmob_source_id_is_stable_coach_id(self):
@@ -232,11 +265,23 @@ class TestXrefManagerStructure:
         ), "match_score must be CAST(NULL AS double) for xref_manager"
 
     def test_season_cast_to_varchar(self):
-        """#404: FBref/FotMob bronze season is year-start bigint → slug varchar
-        ('2425') via LPAD(MOD(...)); TM bronze already stores the slug."""
+        """#404: FBref bronze season is year-start bigint → slug varchar
+        ('2425') via LPAD(MOD(...)); the FotMob slug is derived ONCE inside
+        the framework's season_axis (from source_season_key); TM bronze
+        already stores the slug."""
         sql = _read_sql()
-        assert "LPAD(CAST(MOD(season" in sql or "LPAD(CAST(MOD(d.season" in sql, (
-            "xref_manager must build a slug season via LPAD(MOD(...)) (#404)"
+        assert "LPAD(CAST(MOD(season" in sql, (
+            "FBref branch must build a slug season via LPAD(MOD(...)) (#404)"
+        )
+        assert "LPAD(CAST(MOD(TRY_CAST(substr(cs.source_season_key" in sql, (
+            "season_axis must derive the FotMob slug from source_season_key "
+            "with the legacy LPAD(MOD(...)) CASE (#930 cutover framework)"
+        )
+        # The FotMob output branch must NOT re-derive the slug itself.
+        fotmob_branch = sql.split("-- ===== fotmob")[1].split("UNION ALL")[0]
+        assert "LPAD" not in fotmob_branch, (
+            "the FotMob branch must forward season_axis.season untouched — "
+            "re-deriving the slug outside the framework is forbidden"
         )
 
     def test_pure_select_no_create_table(self):
@@ -337,7 +382,9 @@ class TestFbrefSeasonSlugDedup:
         groups and emitted the same manager twice, which the xref PK gate
         (source, source_id, league, season) refuses — it did, in production."""
         sql = _read_sql()
-        fbref_branch = sql.split("UNION ALL")[0]
+        # NB: the cutover-framework player_scope CTE contains its own
+        # UNION ALL, so locate the fbref output branch by its banner first.
+        fbref_branch = sql.split("-- ===== fbref")[1].split("UNION ALL")[0]
         group_by = fbref_branch.rsplit("GROUP BY", 1)[1]
         keys = "\n".join(
             line for line in group_by.splitlines()

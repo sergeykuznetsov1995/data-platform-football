@@ -622,24 +622,167 @@ def test_deduplication_never_collapses_rows_that_carry_identity():
     assert len(matches[0][0]) == 2
 
 
-def test_a_new_batch_re_emits_inventory_rows_after_a_flush():
-    # Dedup state lives with the buffer: the next flush must write the rows
-    # again (their batch id belongs to targets committed in *that* flush).
-    writer = RecordingWriter()
-    repository = FotMobRepository(writer=writer, batch_size=1)
-
-    row = {
+def _inventory_row(json_path="content.stats"):
+    return {
         "target_type": "match",
         "competition_id": "47",
         "source_season_key": "2025/2026",
-        "json_path": "content.stats",
+        "json_path": json_path,
         "disposition": "typed",
     }
+
+
+def _inventory_commit(repository, index, rows):
+    repository.commit(
+        _commit(target_key=f"https://example/m/{index}", content_hash=str(index % 10) * 64),
+        [TableRows("fotmob_field_inventory", rows, "field_inventory", ("target_type",))],
+    )
+
+
+def test_inventory_dedup_survives_flush():
+    # Inventory rows carry no target identity, so a key seen once needs no
+    # second row this run: matches of one season share almost every json_path,
+    # and re-emitting them each flush wrote ~2.4M rows per iteration.
+    writer = RecordingWriter()
+    repository = FotMobRepository(writer=writer, batch_size=2)
+
+    for index in range(4):  # two flushes of two targets, identical rows
+        _inventory_commit(repository, index, [_inventory_row()])
+
+    inventory = [call for call in writer.calls if call[1]["table"] == "fotmob_field_inventory"]
+    assert len(inventory) == 1, "the second flush must not re-write a seen key"
+    assert len(inventory[0][0]) == 1
+
+
+def test_inventory_dedup_still_writes_new_keys_after_flush():
+    writer = RecordingWriter()
+    repository = FotMobRepository(writer=writer, batch_size=2)
+
     for index in range(2):
-        repository.commit(
-            _commit(target_key=f"https://example/m/{index}", content_hash=str(index) * 64),
-            [TableRows("fotmob_field_inventory", [dict(row)], "field_inventory", ("target_type",))],
+        _inventory_commit(repository, index, [_inventory_row()])
+    for index in range(2, 4):
+        _inventory_commit(
+            repository, index, [_inventory_row(), _inventory_row("content.lineup")]
         )
 
     inventory = [call for call in writer.calls if call[1]["table"] == "fotmob_field_inventory"]
-    assert len(inventory) == 2
+    assert [len(frame) for frame, _ in inventory] == [1, 1]
+    assert set(inventory[1][0]["json_path"]) == {"content.lineup"}
+
+
+class SeedTrino:
+    def __init__(self, rows, fail=False):
+        self.rows = rows
+        self.fail = fail
+        self.queries = []
+
+    def table_exists(self, schema, table):
+        return True
+
+    def execute_query(self, sql):
+        self.queries.append(sql)
+        if self.fail:
+            raise RuntimeError("trino down")
+        return self.rows
+
+
+class SeedWriter(RecordingWriter):
+    def __init__(self, trino):
+        super().__init__()
+        self.trino = trino
+
+    def _get_trino_manager(self):
+        return self.trino
+
+
+def test_inventory_preload_dedups_keys_already_written_by_earlier_runs():
+    # Iterations resume mid-scope: paths a season's matches share were written
+    # by earlier runs; one SELECT DISTINCT per scope replaces re-learning them.
+    trino = SeedTrino([("content.stats", "typed")])
+    writer = SeedWriter(trino)
+    repository = FotMobRepository(writer=writer, batch_size=2)
+
+    for index in range(2):
+        _inventory_commit(
+            repository, index, [_inventory_row(), _inventory_row("content.lineup")]
+        )
+
+    inventory = [call for call in writer.calls if call[1]["table"] == "fotmob_field_inventory"]
+    assert len(inventory) == 1
+    assert set(inventory[0][0]["json_path"]) == {"content.lineup"}
+    assert len(trino.queries) == 1, "one seeding query per scope, not per row"
+    assert "IN ('47', '47.0')" in trino.queries[0], "both VARCHAR spellings"
+
+
+def test_inventory_preload_normalizes_float_string_spellings():
+    # The table answers with whatever spelling it holds; an int 47 live row
+    # must still collide with it after normalization.
+    trino = SeedTrino([("content.stats", "typed")])
+    writer = SeedWriter(trino)
+    repository = FotMobRepository(writer=writer, batch_size=2)
+
+    row = _inventory_row()
+    row["competition_id"] = 47  # live rows carry ints
+    _inventory_commit(repository, 0, [row])
+    _inventory_commit(repository, 1, [])
+
+    inventory = [call for call in writer.calls if call[1]["table"] == "fotmob_field_inventory"]
+    assert inventory == [], "preloaded key must drop the live int-keyed row"
+
+
+def test_inventory_preload_skips_player_scope():
+    trino = SeedTrino([])
+    writer = SeedWriter(trino)
+    repository = FotMobRepository(writer=writer, batch_size=2)
+
+    row = _inventory_row()
+    row["target_type"] = "player"
+    row["competition_id"] = None
+    row["source_season_key"] = None
+    _inventory_commit(repository, 0, [row])
+    _inventory_commit(repository, 1, [])
+
+    assert trino.queries == []
+    inventory = [call for call in writer.calls if call[1]["table"] == "fotmob_field_inventory"]
+    assert len(inventory) == 1
+
+
+def test_inventory_preload_failure_degrades_to_run_local_dedup():
+    trino = SeedTrino([], fail=True)
+    writer = SeedWriter(trino)
+    repository = FotMobRepository(writer=writer, batch_size=2)
+
+    for index in range(4):
+        _inventory_commit(repository, index, [_inventory_row()])
+
+    assert len(trino.queries) == 1, "a failing scope query must not retry per row"
+    inventory = [call for call in writer.calls if call[1]["table"] == "fotmob_field_inventory"]
+    assert len(inventory) == 1, "run-local dedup still applies"
+    assert len(inventory[0][0]) == 1
+
+
+def test_failed_flush_retry_writes_inventory_rows_exactly_once():
+    # A failed flush keeps both the buffer and the seen keys: the retry must
+    # re-append the very same rows, not lose them to the dedup set.
+    class FlakyWriter(RecordingWriter):
+        def __init__(self):
+            super().__init__()
+            self.failures = 1
+
+        def write_dataframe(self, df, **kwargs):
+            if self.failures:
+                self.failures -= 1
+                raise RuntimeError("iceberg commit failed")
+            return super().write_dataframe(df, **kwargs)
+
+    writer = FlakyWriter()
+    repository = FotMobRepository(writer=writer, batch_size=2)
+
+    _inventory_commit(repository, 0, [_inventory_row()])
+    with pytest.raises(RuntimeError):
+        _inventory_commit(repository, 1, [_inventory_row("content.lineup")])
+    repository.flush()
+
+    inventory = [call for call in writer.calls if call[1]["table"] == "fotmob_field_inventory"]
+    assert len(inventory) == 1
+    assert set(inventory[0][0]["json_path"]) == {"content.stats", "content.lineup"}

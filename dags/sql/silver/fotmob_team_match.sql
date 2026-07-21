@@ -5,9 +5,10 @@
 -- One row per (match_id, team_id, league, season) — flattened FotMob team-level
 -- match statistics. Two rows per match (home + away sides).
 --
--- Sources:
---   bronze.fotmob_match_details
---     * top-level: home_team_id / away_team_id (varchar), home_score / away_score
+-- Sources (native FotMob ingest, #930 cutover from legacy bronze.fotmob_match_details):
+--   bronze.fotmob_match_payloads_current
+--     * top-level: home_team_id / away_team_id (bigint), competition_id (varchar),
+--                  source_season_key ('2025/2026' / '2026')
 --     * stats_json: nested JSON `Periods.All.stats[group].stats[stat]`. Each leaf
 --                   stat = {"key": "...", "stats": [home_value, away_value], ...}
 --                   where value is int / numeric string / "N (M%)" fraction string.
@@ -16,6 +17,15 @@
 --                   (and many more). We SUM(xA) per team for `expected_assists`
 --                   (FotMob does NOT expose team-grain xA in `stats_json`, only
 --                   per-player; this is the entire raison d'être of issue #97).
+--   bronze.fotmob_matches_current
+--     * team NAMES (home_team_name / away_team_name) and home_score / away_score —
+--       match_payloads carries neither; JOIN on (match_id, competition_id,
+--       source_season_key). Types: payloads competition_id is varchar, matches
+--       is bigint → CAST.
+--   league_map (inline VALUES)
+--     * competition_id → legacy `league` string. INNER JOIN doubles as the
+--       14-league scope filter (native ingest covers the full FotMob catalogue;
+--       Silver surface must stay the legacy 14 leagues).
 --
 -- Why pivot via MAX(IF):
 --   Same `key` appears in multiple groups (e.g. ShotsOnTarget in "Top stats" AND
@@ -27,31 +37,61 @@
 -- `docs/fotmob_bronze_dq_audit_2026-05-14.md` and #97 history.
 --
 -- Footguns:
---   * Output `team_id` = team NAME (bronze home_team/away_team), to match
---     silver.xref_team.source_id (source='fotmob') for a direct name-based JOIN
---     in Gold. The numeric bronze team_id is kept internally as `team_id_numeric`
---     ONLY to JOIN team_xa (player_stats_json is keyed by numeric teamId).
---   * `home_team_id` / `away_team_id` are varchar in bronze; player_stats_json
---     `teamId` is integer → CAST(... AS varchar) before JOIN.
+--   * Output `team_id` = team NAME (matches_current home/away_team_name — same
+--     source string `home.name` as legacy), to match silver.xref_team.source_id
+--     (source='fotmob') for a direct name-based JOIN in Gold. The numeric
+--     team_id is kept internally as `team_id_numeric` ONLY to JOIN team_xa
+--     (player_stats_json is keyed by numeric teamId).
+--   * `home_team_id` / `away_team_id` are bigint in native; player_stats_json
+--     `teamId` is integer → CAST both AS varchar so the team_xa JOIN stays
+--     varchar = varchar (as legacy).
+--   * `match_id` is bigint in native → CAST AS varchar in the final SELECT
+--     (Gold / xref_match join on the legacy string form).
 --   * Several stats are strings ("3.22"), not numbers — TRY_CAST(... AS DOUBLE).
 --   * Fraction strings "453 (89%)" → regexp_extract for count + pct.
---   * stats_json is ~7% NULL for cancelled / non-finished matches — LEFT-JOIN-ed
---     against schedule-style spine, but here we filter to NOT NULL since silver
---     fotmob_team_match exists for matches WITH a finished stats payload.
---   * Season is bigint year-start (2025) at bronze level; we emit a slug ('2526')
---     to match other Silver team-match tables and downstream xref JOINs.
+--   * stats_json is NULL for cancelled / non-finished matches — we filter to
+--     NOT NULL since silver fotmob_team_match exists for matches WITH a
+--     finished stats payload.
+--   * Season: year-start = substr(source_season_key, 1, 4) (works for both
+--     '2025/2026' and '2025' forms); we emit a slug ('2526') via the unchanged
+--     legacy CASE to match other Silver team-match tables and xref JOINs.
+--   * No ROW_NUMBER dedup: *_current views are already deduped (manifest gate +
+--     natural-key dedup; one row per match via manifest identity).
 -- =============================================================================
 
-WITH match_details_dedup AS (
-    SELECT *,
-           ROW_NUMBER() OVER (
-               PARTITION BY match_id, league, season
-               ORDER BY _ingested_at DESC
-           ) AS rn
-    FROM iceberg.bronze.fotmob_match_details
-    WHERE stats_json IS NOT NULL
-      AND stats_json <> 'null'
-      AND stats_json <> '{}'
+WITH league_map (competition_id, league) AS (
+    VALUES
+        (47, 'ENG-Premier League'), (48, 'ENG-Championship'), (87, 'ESP-La Liga'),
+        (54, 'GER-Bundesliga'), (55, 'ITA-Serie A'), (53, 'FRA-Ligue 1'),
+        (57, 'NED-Eredivisie'), (61, 'POR-Primeira Liga'), (42, 'UEFA-Champions League'),
+        (73, 'UEFA-Europa League'), (77, 'INT-World Cup'), (50, 'INT-European Championship'),
+        (289, 'INT-Africa Cup of Nations'), (44, 'INT-Copa America')
+),
+
+match_details AS (
+    SELECT
+        p.match_id,
+        lm.league,
+        TRY_CAST(substr(p.source_season_key, 1, 4) AS integer) AS season,
+        m.home_team_name AS home_team,
+        m.away_team_name AS away_team,
+        CAST(p.home_team_id AS varchar) AS home_team_id,
+        CAST(p.away_team_id AS varchar) AS away_team_id,
+        m.home_score,
+        m.away_score,
+        p.stats_json,
+        p.player_stats_json,
+        p._observed_at AS _ingested_at
+    FROM iceberg.bronze.fotmob_match_payloads_current p
+    JOIN iceberg.bronze.fotmob_matches_current m
+        ON  m.match_id = p.match_id
+        AND m.competition_id = CAST(p.competition_id AS bigint)
+        AND m.source_season_key = p.source_season_key
+    JOIN league_map lm
+        ON lm.competition_id = m.competition_id
+    WHERE p.stats_json IS NOT NULL
+      AND p.stats_json <> 'null'
+      AND p.stats_json <> '{}'
 ),
 
 -- ===== Step 1: explode stats_json into one row per (match, group, stat) =====
@@ -70,14 +110,13 @@ stats_flat AS (
         json_extract_scalar(stat, '$.key')      AS stat_key,
         json_extract_scalar(stat, '$.stats[0]') AS home_text,
         json_extract_scalar(stat, '$.stats[1]') AS away_text
-    FROM match_details_dedup md
+    FROM match_details md
     CROSS JOIN UNNEST(
         CAST(json_extract(md.stats_json, '$.Periods.All.stats') AS array<json>)
     ) AS gr(grp)
     CROSS JOIN UNNEST(
         CAST(json_extract(grp, '$.stats') AS array<json>)
     ) AS st(stat)
-    WHERE md.rn = 1
 ),
 
 -- ===== Step 2: pivot to wide form (one row per match) =====
@@ -184,12 +223,11 @@ team_xa AS (
                 '$.stats[0].stats["Expected goals (xG)"].stat.value'
             ) AS DOUBLE
         )) AS expected_goals_player_sum
-    FROM match_details_dedup md
+    FROM match_details md
     CROSS JOIN UNNEST(
         map_entries(CAST(json_parse(md.player_stats_json) AS map<varchar, json>))
     ) AS pe(pid, pdata)
-    WHERE md.rn = 1
-      AND md.player_stats_json IS NOT NULL
+    WHERE md.player_stats_json IS NOT NULL
       AND md.player_stats_json <> 'null'
       AND md.player_stats_json <> '{}'
     GROUP BY md.match_id, md.league, md.season,
@@ -285,7 +323,8 @@ unioned AS (
 
 SELECT
     -- ===== Identity =====
-    u.match_id,
+    -- native match_id is bigint; Gold / xref_match expect the legacy varchar form
+    CAST(u.match_id AS varchar) AS match_id,
     u.team_id,
     u.opponent_id,
     u.is_home,

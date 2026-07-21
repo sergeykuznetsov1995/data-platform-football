@@ -1,11 +1,14 @@
 """Render-smoke for ``dags/sql/silver/fotmob_player_profile.sql``.
 
-T4: time-invariant snapshot для FotMob атрибутов. team_squad — основной
-источник для height/dob/country/country_code; player_information_json —
-ТОЛЬКО для `foot` (единственное поле, отсутствующее в team_squad).
+T4: time-invariant snapshot для FotMob атрибутов. После cutover #930 источники —
+native: fotmob_squad_snapshots_current — основной источник для
+height/dob/country/country_code; fotmob_player_snapshots_current
+(player_information_json) — ТОЛЬКО для `foot` (единственное поле,
+отсутствующее в squad-снапшоте). Сезонный скоуп (league, season)
+реконструируется каркасом [CUTOVER-FRAMEWORK #930] (season_axis/player_scope).
 
-Этот файл фиксирует контракт SQL'я (filters, dedup, JSON-extract idiom) на
-случай рефактора.
+Этот файл фиксирует контракт SQL'я (sources, filters, dedup, JSON-extract
+idiom) на случай рефактора.
 """
 
 from __future__ import annotations
@@ -36,20 +39,61 @@ pytestmark = pytest.mark.unit
 
 class TestFotmobPlayerProfileSql:
 
-    def test_reads_team_squad_and_player_details(self):
+    def test_reads_native_squad_and_player_snapshots(self):
         sql = _strip_comments(_read_sql())
-        assert "iceberg.bronze.fotmob_team_squad" in sql, (
-            "fotmob_player_profile.sql must read fotmob_team_squad "
+        assert "iceberg.bronze.fotmob_squad_snapshots_current" in sql, (
+            "fotmob_player_profile.sql must read fotmob_squad_snapshots_current "
             "(primary source for height_cm/dob/country)"
         )
-        assert "iceberg.bronze.fotmob_player_details" in sql, (
-            "fotmob_player_profile.sql must read fotmob_player_details "
+        assert "iceberg.bronze.fotmob_player_snapshots_current" in sql, (
+            "fotmob_player_profile.sql must read fotmob_player_snapshots_current "
             "(needed for `foot` extraction from JSON)"
+        )
+
+    def test_no_legacy_bronze_sources(self):
+        """Cutover #930: legacy bronze.fotmob_* больше не читается."""
+        sql = _strip_comments(_read_sql())
+        assert "iceberg.bronze.fotmob_team_squad" not in sql, (
+            "legacy fotmob_team_squad must be replaced by "
+            "fotmob_squad_snapshots_current (#930 cutover)"
+        )
+        assert "iceberg.bronze.fotmob_player_details" not in sql, (
+            "legacy fotmob_player_details must be replaced by "
+            "fotmob_player_snapshots_current (#930 cutover)"
+        )
+        assert not re.search(r"\b_batch_id\b", sql), (
+            "legacy lineage column _batch_id does not exist in native "
+            "tables (use _target_batch_id)"
+        )
+        assert not re.search(r"\b_ingested_at\b", sql), (
+            "legacy lineage column _ingested_at does not exist in native "
+            "tables (use _observed_at / _target_batch_id)"
+        )
+
+    def test_season_scope_from_cutover_framework(self):
+        """(league, season) реконструируются ТОЛЬКО каркасом #930:
+        season_axis — единственное место вычисления season-слага,
+        player_scope/squad_scope — драйверы членства игрока в сезоне."""
+        sql = _read_sql()
+        assert "[CUTOVER-FRAMEWORK #930]" in sql, (
+            "fotmob_player_profile.sql must embed the shared cutover framework "
+            "block (season scope for global native snapshots)"
+        )
+        stripped = _strip_comments(sql)
+        for cte in ("league_map", "season_axis", "player_scope", "squad_scope"):
+            assert re.search(rf"\b{cte}\b", stripped), (
+                f"cutover framework CTE `{cte}` must be present"
+            )
+        # season-слаг (LPAD/MOD) живёт только в season_axis каркаса — в файле
+        # не должно остаться собственного legacy-CASE по d.season.
+        assert stripped.count("LPAD") == 3, (
+            "season slug must be computed ONLY inside season_axis "
+            "(exactly the 3 LPAD calls of the framework block)"
         )
 
     def test_filters_out_coaches(self):
         sql = _strip_comments(_read_sql())
-        assert re.search(r"NOT\s+is_coach", sql, re.IGNORECASE), (
+        assert re.search(r"NOT\s+(?:ps\.)?is_coach", sql, re.IGNORECASE), (
             "fotmob_player_profile.sql must filter out coaches "
             "(is_coach=true rows pollute the player snapshot)"
         )
@@ -70,9 +114,19 @@ class TestFotmobPlayerProfileSql:
         # Two CTEs (details_dedup + squad_dedup) с ROW_NUMBER на одинаковом
         # ключе (player_id, league, season). Pattern: existing fotmob_*_profile.
         assert re.search(
-            r"ROW_NUMBER\s*\(\s*\)\s*OVER\s*\(\s*PARTITION\s+BY\s+player_id",
+            r"ROW_NUMBER\s*\(\s*\)\s*OVER\s*\(\s*PARTITION\s+BY\s+ps\.player_id",
             sql, re.IGNORECASE,
-        ), "fotmob_player_profile.sql must dedup via ROW_NUMBER OVER (PARTITION BY player_id, ...)"
+        ), (
+            "fotmob_player_profile.sql must dedup via "
+            "ROW_NUMBER OVER (PARTITION BY ps.player_id, <league>, <season>)"
+        )
+        assert re.search(
+            r"ORDER\s+BY\s+\w+\._observed_at\s+DESC\s*,\s*\w+\._target_batch_id\s+DESC",
+            sql, re.IGNORECASE,
+        ), (
+            "dedup ORDER BY must use native lineage "
+            "(_observed_at DESC, _target_batch_id DESC)"
+        )
 
     def test_foot_extracted_from_player_information_json(self):
         """foot выкручивается через element_at(map_from_entries(transform(...)))
@@ -92,16 +146,17 @@ class TestFotmobPlayerProfileSql:
             "(human-readable Right/Left/Both)"
         )
 
-    def test_join_key_includes_cast_for_player_id(self):
-        """fotmob_team_squad.player_id — bigint, fotmob_player_details.player_id
-        — varchar. JOIN-ключ требует CAST на team_squad-стороне."""
+    def test_squad_join_casts_team_id_to_bigint(self):
+        """fotmob_squad_snapshots_current.team_id — varchar, scope-CTE каркаса
+        несут bigint team_id (season_teams). JOIN-ключ требует явный CAST на
+        squad-стороне (native type mismatch; cutover-mapping §2.4)."""
         sql = _strip_comments(_read_sql())
         assert re.search(
-            r"CAST\s*\(\s*player_id\s+AS\s+VARCHAR\s*\)",
+            r"CAST\s*\(\s*sq\.team_id\s+AS\s+bigint\s*\)",
             sql, re.IGNORECASE,
         ), (
-            "fotmob_player_profile.sql must CAST team_squad.player_id "
-            "AS VARCHAR (bronze type mismatch with details.player_id)"
+            "fotmob_player_profile.sql must CAST(sq.team_id AS bigint) "
+            "when joining squad_snapshots to the bigint team_id scope"
         )
 
     def test_outputs_required_attribute_columns(self):
