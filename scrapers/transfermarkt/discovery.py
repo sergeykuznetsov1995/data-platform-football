@@ -1172,7 +1172,7 @@ def _selector_options(
         attrs = dict(option.attrs)
         previous = values.get(edition_id)
         current = (label, selected, attrs)
-        if previous is not None and previous[:2] != current[:2]:
+        if previous is not None and previous != current:
             raise DiscoverySchemaError(
                 f"conflicting edition selector {edition_id}: {profile_url}"
             )
@@ -1205,7 +1205,7 @@ def _selector_options(
             ).casefold() in {"true", "page"}
             previous = values.get(edition_id)
             current = (label, selected, dict(anchor.attrs))
-            if previous is not None and previous[:2] != current[:2]:
+            if previous is not None and previous != current:
                 raise DiscoverySchemaError(
                     f"conflicting edition selector {edition_id}: {profile_url}"
                 )

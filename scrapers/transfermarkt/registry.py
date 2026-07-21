@@ -922,6 +922,17 @@ class RegistryPage:
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "RegistryPage":
+        if "participants" not in value:
+            raise RegistryConflictError(
+                "registry page must declare typed participants; regenerate snapshot"
+            )
+        if (
+            value.get("participants") == []
+            and value.get("participant_contract_revision") != "team-id-v1"
+        ):
+            raise RegistryConflictError(
+                "empty participant evidence requires participant_contract_revision=team-id-v1"
+            )
         snapshot_id = _required_text("snapshot_id", value.get("snapshot_id", ""))
         body_hash = _required_text(
             "source_body_hash", value.get("source_body_hash", "")

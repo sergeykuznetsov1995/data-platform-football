@@ -3832,14 +3832,28 @@ def _run_entity(
             frames = _carry_forward_observed_at(
                 scraper, write_spec, frames, results,
             )
-            _save_frames(
-                scraper, write_spec, frames, force_replace, results,
-            )
+            persisted_capture = None
+            expected_capture = None
             if spec.name == ENTITY_PLAYERS and scope_dq_required:
+                # Commit immutable scope evidence before any Bronze fact write.
+                # A fact write must never be able to outrun the capture that
+                # proves its exact roster and raw lineage.
                 expected_capture = results['scope_player_capture_evidence']
                 persisted_capture = _persist_scope_player_capture(
                     scraper, frames['memberships'],
                 )
+                if {
+                    key: persisted_capture[key] for key in ('row_count', 'key_hash')
+                } != expected_capture:
+                    raise RuntimeError(
+                        'scope-player capture evidence changed during persistence'
+                    )
+            _save_frames(
+                scraper, write_spec, frames, force_replace, results,
+            )
+            if spec.name == ENTITY_PLAYERS and scope_dq_required:
+                assert expected_capture is not None
+                assert persisted_capture is not None
                 if {
                     key: persisted_capture[key] for key in ('row_count', 'key_hash')
                 } != expected_capture:
