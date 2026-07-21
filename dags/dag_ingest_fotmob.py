@@ -14,7 +14,7 @@ import hashlib
 import re
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Mapping
 
 from airflow import DAG
 from airflow.exceptions import AirflowException
@@ -48,12 +48,21 @@ from scrapers.fotmob.source_refresh import (
     PLAYER_SOURCE_REFRESH_PROFILE,
     PLAYER_SOURCE_REFRESH_SHA256,
     PLAYER_SOURCE_REFRESH_TARGET_COUNT,
+    REPLAY_MISSING_INPUT_PROOF_SCHEMA as REPLAY_MISSING_INPUT_SCHEMA,
+    REPLAY_MISSING_INPUT_PROOF_TASK_ID,
     load_player_source_refresh_contract,
 )
 
 
-RESULT_PATH = "/tmp/fotmob_result_{{ ts_nodash }}_{{ ti.try_number }}.json"
+RESULT_PATH = "/tmp/fotmob_result_{{ ts_nodash }}.json"
 NATIVE_MODES = frozenset({"discover", "daily", "backfill", "replay"})
+ISSUE_930_REPLAY_ENTITIES = [
+    "leaderboards",
+    "matches",
+    "players",
+    "season",
+    "teams",
+]
 PUBLICATION_GENERATION_TEMPLATE = (
     "{{ dag_run.conf['fotmob_publication']['generation_id'] }}"
 )
@@ -331,6 +340,215 @@ def _validate_source_refresh_selection(
         "planned_scopes": selection.get("planned_scopes"),
         "completed_scopes": selection.get("completed_scopes"),
         "requests_per_minute": selection.get("requests_per_minute"),
+    }
+
+
+def prove_replay_missing_player_inputs(
+    result_path: str = "/tmp/fotmob_result.json",
+    **context,
+) -> Dict[str, Any] | None:
+    """Return an authorizing proof only for the exact gap-only first replay."""
+
+    import json
+
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        output: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in output:
+                raise AirflowException(f"duplicate FotMob replay JSON key: {key!r}")
+            output[key] = value
+        return output
+
+    dag_run = context.get("dag_run")
+    task_instance_getter = getattr(dag_run, "get_task_instance", None)
+    if not callable(task_instance_getter):
+        raise AirflowException("FotMob replay proof lacks exact task-state access")
+
+    def task_state(task_id: str) -> str:
+        task_instance = task_instance_getter(task_id=task_id)
+        state = getattr(task_instance, "state", None)
+        return str(getattr(state, "value", state) or "").casefold()
+
+    def task_try_number(task_id: str) -> int:
+        task_instance = task_instance_getter(task_id=task_id)
+        try:
+            return int(getattr(task_instance, "try_number"))
+        except (TypeError, ValueError) as exc:
+            raise AirflowException(
+                "FotMob replay proof has invalid task attempt evidence"
+            ) from exc
+
+    current_task_instance = context.get("ti")
+    if (
+        task_state("validate_publication_writer_fence") != "success"
+        or task_state("scrape_fotmob_data") != "failed"
+        or task_try_number("validate_publication_writer_fence") != 1
+        or task_try_number("scrape_fotmob_data") != 1
+        or getattr(current_task_instance, "task_id", None)
+        != REPLAY_MISSING_INPUT_PROOF_TASK_ID
+        or int(getattr(current_task_instance, "try_number", 0) or 0) != 1
+    ):
+        return None
+
+    path = Path(result_path)
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise AirflowException(
+            f"FotMob replay report not found: {result_path}"
+        ) from exc
+    if not raw or len(raw) > 64 * 1024 * 1024:
+        raise AirflowException("FotMob replay report has an unsafe byte size")
+    try:
+        result = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AirflowException(
+            "FotMob replay report is not unique-key UTF-8 JSON"
+        ) from exc
+    if not isinstance(result, Mapping):
+        raise AirflowException("FotMob replay report must be a JSON object")
+    if result.get("mode") != "replay":
+        return None
+
+    conf = getattr(dag_run, "conf", None)
+    publication = conf.get("fotmob_publication") if isinstance(conf, Mapping) else None
+    generation_id = (
+        publication.get("generation_id") if isinstance(publication, Mapping) else None
+    )
+    ingest_run_id = str(getattr(dag_run, "run_id", "") or "")
+    if (
+        not isinstance(generation_id, str)
+        or re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", generation_id)
+        is None
+        or result.get("run_id") != generation_id
+    ):
+        raise AirflowException("FotMob replay gap proof is not generation-bound")
+    if ingest_run_id != f"issue930_replay_a1__{generation_id.replace('-', '')}":
+        return None
+    if result.get("status") == "success" and result.get("complete") is True:
+        return None
+
+    contract = _source_refresh_contract()
+    from scrapers.fotmob.planner import deterministic_plan_signature
+    expected_replay_plan = deterministic_plan_signature(
+        ISSUE_930_REPLAY_ENTITIES,
+        policy={
+            "match_policy": "finished_only",
+            "leaderboard_policy": "all_advertised",
+            "team_policy": "global_observed_snapshot",
+            "player_policy": "global_observed_snapshot",
+        },
+    )
+
+    selection = result.get("selection")
+    transport = result.get("transport")
+    budget = result.get("budget")
+    if not all(isinstance(value, Mapping) for value in (selection, transport, budget)):
+        raise AirflowException("FotMob replay gap proof lacks typed runner evidence")
+    scopes = selection.get("explicit_scopes")
+    entities = selection.get("entities")
+    plan_signature = selection.get("scope_plan_signature")
+    typed = selection.get("replay_missing_player_inputs")
+    required_transport = {"attempts", "direct_bytes", "proxy_bytes"}
+    required_budget = {
+        "requests",
+        "max_requests",
+        "direct_bytes",
+        "max_direct_bytes",
+        "proxy_bytes",
+        "max_proxy_bytes",
+    }
+    if (
+        result.get("status") != "incomplete"
+        or result.get("complete") is not False
+        or not isinstance(result.get("errors"), list)
+        or not result.get("errors")
+        or not isinstance(scopes, list)
+        or not scopes
+        or any(
+            not isinstance(scope, str)
+            or re.fullmatch(r"[1-9][0-9]*=\S+", scope) is None
+            for scope in scopes
+        )
+        or len(scopes) != len(set(scopes))
+        or entities != ISSUE_930_REPLAY_ENTITIES
+        or selection.get("competition_limit") != 0
+        or selection.get("season_limit") != 0
+        or plan_signature != expected_replay_plan
+        or not required_transport.issubset(transport)
+        or any(type(transport[key]) is not int for key in required_transport)
+        or any(transport[key] != 0 for key in required_transport)
+        or not required_budget.issubset(budget)
+        or any(type(budget[key]) is not int for key in required_budget)
+        or any(budget[key] != 0 for key in ("requests", "direct_bytes", "proxy_bytes"))
+        or budget.get("max_requests") != 2_000
+        or budget.get("max_direct_bytes") != 256 * 1024 * 1024
+        or budget.get("max_proxy_bytes") != 0
+        or not isinstance(typed, Mapping)
+        or set(typed)
+        != {
+            "schema",
+            "failure_class",
+            "missing_player_ids",
+            "affected_scopes",
+        }
+        or typed.get("schema") != REPLAY_MISSING_INPUT_SCHEMA
+        or typed.get("failure_class") != "missing_player_raw_inputs_only"
+    ):
+        raise AirflowException("FotMob replay failure is not a typed offline raw gap")
+
+    contract = _source_refresh_contract()
+    affected_scopes = sorted(
+        {
+            f"{target['competition_id']}={target['source_season_key']}"
+            for target in contract["targets"]
+        }
+    )
+    if (
+        typed.get("missing_player_ids") != contract["player_ids"]
+        or typed.get("affected_scopes") != affected_scopes
+    ):
+        raise AirflowException(
+            "FotMob replay missing inputs differ from the reviewed seven targets"
+        )
+    planned = selection.get("planned_scopes")
+    completed = selection.get("completed_scopes")
+    if (
+        not isinstance(planned, list)
+        or not isinstance(completed, list)
+        or len(planned) != len(set(planned))
+        or len(completed) != len(set(completed))
+        or set(planned) != set(scopes)
+        or set(completed).intersection(affected_scopes)
+        or set(completed).union(affected_scopes) != set(planned)
+        or len(completed) + len(affected_scopes) != len(planned)
+    ):
+        raise AirflowException(
+            "FotMob replay gap scopes do not partition the exact plan"
+        )
+
+    scope_bytes = ("\n".join(scopes) + "\n").encode("utf-8")
+    scope_sha256 = hashlib.sha256(scope_bytes).hexdigest()
+    if (
+        len(scopes) != FOTMOB_DAILY_SCOPE_COUNT
+        or scope_sha256 != FOTMOB_DAILY_SCOPE_SHA256
+    ):
+        raise AirflowException(
+            "FotMob replay gap proof is outside exact issue-930 scope"
+        )
+    return {
+        "schema_version": REPLAY_MISSING_INPUT_SCHEMA,
+        "status": "source_refresh_required",
+        "runner_result_sha256": hashlib.sha256(raw).hexdigest(),
+        "run_id": generation_id,
+        "mode": "replay",
+        "scope_count": len(scopes),
+        "scope_sha256": scope_sha256,
+        "entities": list(entities),
+        "plan_signature": plan_signature,
+        "artifact_sha256": contract["sha256"],
+        "target_count": contract["target_count"],
+        "targets": contract["targets"],
     }
 
 
@@ -627,6 +845,7 @@ with DAG(
         task_id="scrape_fotmob_data",
         bash_command=f"""
 cd /opt/airflow && \\
+/usr/bin/rm -f -- "{RESULT_PATH}" && \\
 python dags/scripts/run_fotmob_scraper.py \\
     --publication-generation-id "{PUBLICATION_GENERATION_TEMPLATE}" \\
     --publication-schema "{PUBLICATION_BINDING_TEMPLATE["schema"]}" \\
@@ -673,6 +892,14 @@ python dags/scripts/run_fotmob_scraper.py \\
         task_id="validate_data",
         python_callable=validate_data,
         op_kwargs={"result_path": RESULT_PATH},
+    )
+
+    replay_missing_inputs_proof = PythonOperator(
+        task_id=REPLAY_MISSING_INPUT_PROOF_TASK_ID,
+        python_callable=prove_replay_missing_player_inputs,
+        op_kwargs={"result_path": RESULT_PATH},
+        trigger_rule="all_done",
+        retries=0,
     )
 
     transform_gate = ShortCircuitOperator(
@@ -730,3 +957,4 @@ python dags/scripts/run_fotmob_scraper.py \\
         >> seal_publication
         >> finalize_publication
     )
+    scrape_data_task >> replay_missing_inputs_proof >> finalize_publication

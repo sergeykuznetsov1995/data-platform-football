@@ -20,10 +20,12 @@ import hashlib
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -48,9 +50,12 @@ try:  # package import in tests / ``python -m``
         PLAYER_SOURCE_REFRESH_PROFILE,
         PLAYER_SOURCE_REFRESH_SHA256,
         PLAYER_SOURCE_REFRESH_TARGET_COUNT,
+        REPLAY_MISSING_INPUT_PROOF_SCHEMA,
+        REPLAY_MISSING_INPUT_PROOF_TASK_ID,
         PlayerSourceRefreshContractError,
         load_player_source_refresh_contract,
     )
+    from scrapers.fotmob.planner import deterministic_plan_signature
 except ModuleNotFoundError:  # direct ``python scripts/fotmob_backfill.py``
     if str(REPOSITORY_ROOT) not in sys.path:
         sys.path.insert(0, str(REPOSITORY_ROOT))
@@ -70,12 +75,16 @@ except ModuleNotFoundError:  # direct ``python scripts/fotmob_backfill.py``
         PLAYER_SOURCE_REFRESH_PROFILE,
         PLAYER_SOURCE_REFRESH_SHA256,
         PLAYER_SOURCE_REFRESH_TARGET_COUNT,
+        REPLAY_MISSING_INPUT_PROOF_SCHEMA,
+        REPLAY_MISSING_INPUT_PROOF_TASK_ID,
         PlayerSourceRefreshContractError,
         load_player_source_refresh_contract,
     )
+    from scrapers.fotmob.planner import deterministic_plan_signature
 
 
 SCHEMA_VERSION = "fotmob-issue-930-backfill-v1"
+MAX_PREREQUISITE_REPORT_BYTES = 2 * 1024 * 1024
 CONFIRM_RUN = "RUN_FOTMOB_ISSUE_930_BACKFILL"
 CONFIRM_RECOVER = "RECOVER_FOTMOB_ISSUE_930_BACKFILL"
 PUBLICATION_OWNER_DAG_ID = "fotmob_issue_930_backfill"
@@ -96,6 +105,18 @@ if frozenset(ISSUE_930_SCOPE_ENTITIES) != REQUIRED_SCOPE_ENTITIES:
     raise RuntimeError("issue-930 backfill entities differ from acceptance contract")
 _MODE_INTERVAL_PARITY = {"backfill": 0, "replay": 1}
 _PLAN_SIGNATURE_RE = re.compile(r"fmplan1-[0-9a-f]{64}")
+
+
+def _expected_plan_signature() -> str:
+    return deterministic_plan_signature(
+        ISSUE_930_SCOPE_ENTITIES,
+        policy={
+            "match_policy": "finished_only",
+            "leaderboard_policy": "all_advertised",
+            "team_policy": "global_observed_snapshot",
+            "player_policy": "global_observed_snapshot",
+        },
+    )
 
 
 class BackfillError(RuntimeError):
@@ -318,7 +339,12 @@ def _load_source_refresh_contract(
     supplied_sha = (
         str(getattr(args, "source_refresh_targets_sha256", "") or "").strip().casefold()
     )
+    prerequisite = getattr(args, "prerequisite_replay_report", None)
     if not profile and not supplied_sha:
+        if prerequisite is not None:
+            raise BackfillError(
+                "--prerequisite-replay-report is only valid with source refresh"
+            )
         setattr(args, "_source_refresh_contract", None)
         return None
     if profile != PLAYER_SOURCE_REFRESH_PROFILE:
@@ -327,6 +353,8 @@ def _load_source_refresh_contract(
         raise BackfillError(
             "--source-refresh-targets-sha256 differs from reviewed artifact"
         )
+    if prerequisite is None:
+        raise BackfillError("source refresh requires --prerequisite-replay-report")
     try:
         contract = load_player_source_refresh_contract(
             REPOSITORY_ROOT / PLAYER_SOURCE_REFRESH_ARTIFACT
@@ -335,6 +363,242 @@ def _load_source_refresh_contract(
         raise BackfillError(str(exc)) from exc
     setattr(args, "_source_refresh_contract", contract)
     return contract
+
+
+def _same_file_identity(left: os.stat_result, right: os.stat_result) -> bool:
+    fields = (
+        "st_dev",
+        "st_ino",
+        "st_mode",
+        "st_uid",
+        "st_gid",
+        "st_nlink",
+        "st_size",
+        "st_mtime_ns",
+        "st_ctime_ns",
+    )
+    return all(getattr(left, field) == getattr(right, field) for field in fields)
+
+
+def _read_protected_report(path: Path) -> tuple[bytes, str, dict[str, int]]:
+    """Read one same-owner report through a no-symlink, fd-pinned path walk."""
+
+    absolute = Path(path)
+    if (
+        not absolute.is_absolute()
+        or absolute.name in {"", ".", ".."}
+        or any(component in {".", ".."} for component in absolute.parts[1:])
+    ):
+        raise BackfillError("--prerequisite-replay-report must be an absolute path")
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    file_flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        directory_flags |= os.O_CLOEXEC
+        file_flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        directory_flags |= os.O_NOFOLLOW
+        file_flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_NONBLOCK"):
+        file_flags |= os.O_NONBLOCK
+
+    directory_fd = os.open("/", directory_flags)
+    file_fd: int | None = None
+    try:
+        for component in absolute.parts[1:-1]:
+            next_fd = os.open(component, directory_flags, dir_fd=directory_fd)
+            os.close(directory_fd)
+            directory_fd = next_fd
+        file_fd = os.open(absolute.name, file_flags, dir_fd=directory_fd)
+        before = os.fstat(file_fd)
+        entry_before = os.stat(
+            absolute.name, dir_fd=directory_fd, follow_symlinks=False
+        )
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_uid != os.geteuid()
+            or stat.S_IMODE(before.st_mode) & 0o022
+            or not _same_file_identity(before, entry_before)
+            or before.st_size <= 0
+            or before.st_size > MAX_PREREQUISITE_REPORT_BYTES
+        ):
+            raise BackfillError(
+                "prerequisite replay report is not a protected regular file"
+            )
+        chunks: list[bytes] = []
+        remaining = MAX_PREREQUISITE_REPORT_BYTES + 1
+        while remaining:
+            chunk = os.read(file_fd, min(128 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        after = os.fstat(file_fd)
+        entry_after = os.stat(absolute.name, dir_fd=directory_fd, follow_symlinks=False)
+        if (
+            len(raw) != before.st_size
+            or len(raw) > MAX_PREREQUISITE_REPORT_BYTES
+            or not _same_file_identity(before, after)
+            or not _same_file_identity(before, entry_after)
+        ):
+            raise BackfillError("prerequisite replay report changed while read")
+        identity = {
+            field: int(getattr(before, field))
+            for field in (
+                "st_dev",
+                "st_ino",
+                "st_mode",
+                "st_uid",
+                "st_gid",
+                "st_nlink",
+                "st_size",
+                "st_mtime_ns",
+                "st_ctime_ns",
+            )
+        }
+        return raw, hashlib.sha256(raw).hexdigest(), identity
+    except OSError as exc:
+        raise BackfillError(f"cannot read prerequisite replay report: {exc}") from exc
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+        os.close(directory_fd)
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise BackfillError(f"duplicate prerequisite report JSON key: {key!r}")
+        value[key] = item
+    return value
+
+
+def _load_source_refresh_prerequisite(
+    args: argparse.Namespace,
+    *,
+    source_refresh: Mapping[str, Any] | None,
+    scope_contract: Mapping[str, Any],
+    context: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    if source_refresh is None:
+        setattr(args, "_source_refresh_prerequisite", None)
+        return None
+    path = Path(args.prerequisite_replay_report)
+    raw, digest, identity = _read_protected_report(path)
+    try:
+        report = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_json_object)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise BackfillError(f"invalid prerequisite replay report: {exc}") from exc
+    proof = (
+        report.get("replay_missing_input_proof") if isinstance(report, dict) else None
+    )
+    publication = report.get("publication") if isinstance(report, dict) else None
+    runs = report.get("runs") if isinstance(report, dict) else None
+    publication_state = (
+        report.get("publication_state") if isinstance(report, dict) else None
+    )
+    limits = report.get("limits") if isinstance(report, dict) else None
+    ingest_terminal = (
+        report.get("ingest_terminal") if isinstance(report, dict) else None
+    )
+    expected_scope = {
+        key: scope_contract[key] for key in ("name", "artifact", "sha256", "count")
+    }
+    expected_targets = source_refresh["targets"]
+    expected_publication = _expected_publication_envelope(
+        context, mode="replay", attempt=1
+    )
+    generation_id = expected_publication["generation_id"]
+    expected_runs = _run_ids(expected_publication, "replay", 1)
+    proof_valid = (
+        isinstance(proof, Mapping)
+        and set(proof)
+        == {
+            "schema_version",
+            "status",
+            "run_id",
+            "mode",
+            "scope_count",
+            "scope_sha256",
+            "entities",
+            "plan_signature",
+            "runner_result_sha256",
+            "artifact_sha256",
+            "target_count",
+            "targets",
+        }
+        and proof.get("schema_version") == REPLAY_MISSING_INPUT_PROOF_SCHEMA
+        and proof.get("status") == "source_refresh_required"
+        and proof.get("run_id") == generation_id
+        and proof.get("mode") == "replay"
+        and proof.get("scope_count") == scope_contract["count"]
+        and proof.get("scope_sha256") == scope_contract["sha256"]
+        and proof.get("entities") == sorted(ISSUE_930_SCOPE_ENTITIES)
+        and proof.get("plan_signature") == _expected_plan_signature()
+        and re.fullmatch(r"[0-9a-f]{64}", str(proof.get("runner_result_sha256") or ""))
+        is not None
+        and proof.get("artifact_sha256") == source_refresh["sha256"]
+        and proof.get("target_count") == source_refresh["target_count"]
+        and proof.get("targets") == expected_targets
+    )
+    if (
+        not isinstance(report, dict)
+        or report.get("schema_version") != SCHEMA_VERSION
+        or report.get("command") not in {"run", "recover"}
+        or report.get("passed") is not False
+        or report.get("phase") != "failed_generation_released"
+        or report.get("recovery_required") is not False
+        or report.get("mode") != "replay"
+        or report.get("publication_attempt") != 1
+        or report.get("project") != args.project
+        or report.get("deployment_report") != str(args.deployment_report.resolve())
+        or report.get("deployment_id") != context["deployment_id"]
+        or report.get("git_sha") != context["git_sha"]
+        or report.get("scope") != expected_scope
+        or report.get("entities") != list(ISSUE_930_SCOPE_ENTITIES)
+        or limits
+        != {
+            "max_requests": 2_000,
+            "max_direct_mib": 256,
+            "competition_limit": 0,
+            "season_limit": 0,
+            "executed_scope_count": scope_contract["count"],
+        }
+        or report.get("profile") is not None
+        or report.get("source_refresh") is not None
+        or publication != expected_publication
+        or runs != expected_runs
+        or not isinstance(ingest_terminal, Mapping)
+        or ingest_terminal.get("run_id") != runs.get("ingest_run_id")
+        or str(ingest_terminal.get("state") or "").casefold() != "failed"
+        or report.get("silver_terminal") is not None
+        or not isinstance(publication_state, Mapping)
+        or publication_state.get("generation_id") != generation_id
+        or publication_state.get("active") is not False
+        or publication_state.get("released") is not True
+        or publication_state.get("phase") != "failed"
+        or publication_state.get("status") != "failed"
+        or publication_state.get("published") is not None
+        or publication_state.get("candidate") is not None
+        or report.get("next_publication_attempt") != 2
+        or not proof_valid
+    ):
+        raise BackfillError(
+            "prerequisite replay report does not prove the exact seven missing inputs"
+        )
+    protected_path = str(path)
+    if args.output.resolve() == Path(protected_path).resolve():
+        raise BackfillError("source-refresh output must not overwrite its prerequisite")
+    prerequisite = {
+        "path": protected_path,
+        "sha256": digest,
+        "identity": identity,
+        "proof": dict(proof),
+    }
+    setattr(args, "_source_refresh_prerequisite", prerequisite)
+    return prerequisite
 
 
 def inspect_writer_state(
@@ -413,6 +677,30 @@ def _pause_all(
     return state
 
 
+def _expected_publication_envelope(
+    context: Mapping[str, Any], *, mode: str, attempt: int
+) -> dict[str, Any]:
+    if mode not in MODES or attempt <= 0:
+        raise BackfillError("synthetic publication identity is invalid")
+    start = _timestamp(context["generated_at"]) + timedelta(
+        seconds=86_400 + (attempt - 1) * 2 + _MODE_INTERVAL_PARITY[mode]
+    )
+    end = start + timedelta(seconds=1)
+    binding = {
+        "schema": "fotmob-publication-v1",
+        "source": "fotmob",
+        "owner": "isolated",
+        "data_interval_start": start.isoformat(timespec="microseconds"),
+        "data_interval_end": end.isoformat(timespec="microseconds"),
+        "runtime_fingerprint": str(context["git_sha"]),
+    }
+    material = json.dumps(binding, sort_keys=True, separators=(",", ":"))
+    generation_id = str(
+        uuid.uuid5(uuid.NAMESPACE_URL, f"fotmob-publication:{material}")
+    )
+    return {"generation_id": generation_id, "binding": binding}
+
+
 def _publication_envelope(
     args: argparse.Namespace,
     mode: str,
@@ -423,45 +711,26 @@ def _publication_envelope(
     attempt = int(args.publication_attempt)
     if attempt <= 0:
         raise BackfillError("--publication-attempt must be a positive integer")
+    expected = _expected_publication_envelope(context, mode=mode, attempt=attempt)
+    binding = expected["binding"]
     # Rollback owns generated_at + attempt seconds.  Backfill uses a separate
     # one-day namespace and even/odd mode slots so every (mode, attempt) pair
     # has a distinct deterministic generation on the same deployment.
-    start = _timestamp(context["generated_at"]) + timedelta(
-        seconds=86_400 + (attempt - 1) * 2 + _MODE_INTERVAL_PARITY[mode]
-    )
-    end = start + timedelta(seconds=1)
-    expected_start = start.isoformat(timespec="microseconds")
-    expected_end = end.isoformat(timespec="microseconds")
     marker = "FOTMOB_BACKFILL_BINDING_JSON="
     code = (
         "import json,sys; sys.path.insert(0,'/opt/airflow/dags'); "
         "from utils.fotmob_publication import make_publication_binding,make_generation_id; "
-        f"b=make_publication_binding(owner='isolated',data_interval_start={start.isoformat()!r},"
-        f"data_interval_end={end.isoformat()!r},fingerprint={context['git_sha']!r}); "
+        "b=make_publication_binding("
+        f"owner='isolated',data_interval_start={binding['data_interval_start']!r},"
+        f"data_interval_end={binding['data_interval_end']!r},"
+        f"fingerprint={context['git_sha']!r}); "
         f"print('{marker}'+json.dumps({{'generation_id':make_generation_id(b),'binding':b}},"
         "sort_keys=True))"
     )
     payload = _container_python_json(args, code=code, marker=marker, run=run)
-    binding = payload.get("binding") if isinstance(payload, Mapping) else None
-    generation_id = (
-        str(payload.get("generation_id", "")) if isinstance(payload, Mapping) else ""
-    )
-    if (
-        not isinstance(binding, Mapping)
-        or binding.get("schema") != "fotmob-publication-v1"
-        or binding.get("source") != "fotmob"
-        or binding.get("owner") != "isolated"
-        or binding.get("runtime_fingerprint") != context["git_sha"]
-        or binding.get("data_interval_start") != expected_start
-        or binding.get("data_interval_end") != expected_end
-        or re.fullmatch(
-            r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
-            generation_id,
-        )
-        is None
-    ):
+    if payload != expected:
         raise BackfillError("synthetic publication binding is not exact")
-    return {"generation_id": generation_id, "binding": dict(binding)}
+    return expected
 
 
 def _initialize_publication(
@@ -626,6 +895,112 @@ def _validation_xcom(
     if not isinstance(payload, Mapping):
         raise BackfillError("exact ingest validation XCom is absent")
     return payload
+
+
+def _replay_missing_input_xcom(
+    args: argparse.Namespace,
+    ingest_run_id: str,
+    *,
+    run: Callable[..., subprocess.CompletedProcess[str]],
+) -> Mapping[str, Any]:
+    marker = "FOTMOB_BACKFILL_REPLAY_PROOF_JSON="
+    task_ids = (
+        "validate_publication_writer_fence",
+        "scrape_fotmob_data",
+        REPLAY_MISSING_INPUT_PROOF_TASK_ID,
+    )
+    code = (
+        "import json; from airflow.models.taskinstance import TaskInstance; "
+        "from airflow.models.xcom import XCom; "
+        "from airflow.settings import Session; s=Session(); "
+        "rows=s.query(TaskInstance).filter("
+        f"TaskInstance.dag_id=={INGEST_DAG_ID!r},"
+        f"TaskInstance.run_id=={ingest_run_id!r},"
+        f"TaskInstance.task_id.in_({task_ids!r})).all(); "
+        "tasks=[{'task_id':t.task_id,'state':getattr(t.state,'value',t.state),"
+        "'try_number':t.try_number,'map_index':t.map_index} for t in rows]; "
+        "proof=XCom.get_one("
+        f"run_id={ingest_run_id!r},dag_id={INGEST_DAG_ID!r},"
+        f"task_id={REPLAY_MISSING_INPUT_PROOF_TASK_ID!r},"
+        "key='return_value',session=s); "
+        f"print('{marker}'+json.dumps({{'proof':proof,'tasks':tasks}},"
+        "default=str,sort_keys=True)); s.close()"
+    )
+    payload = _container_python_json(args, code=code, marker=marker, run=run)
+    proof = payload.get("proof") if isinstance(payload, Mapping) else None
+    tasks = payload.get("tasks") if isinstance(payload, Mapping) else None
+    if not isinstance(tasks, list) or len(tasks) != len(task_ids):
+        raise BackfillError("exact replay task-state evidence is absent")
+    observed: dict[str, Mapping[str, Any]] = {}
+    for item in tasks:
+        if (
+            not isinstance(item, Mapping)
+            or item.get("task_id") not in task_ids
+            or item["task_id"] in observed
+        ):
+            raise BackfillError("exact replay task-state evidence is invalid")
+        observed[str(item["task_id"])] = item
+    expected_states = {
+        "validate_publication_writer_fence": "success",
+        "scrape_fotmob_data": "failed",
+        REPLAY_MISSING_INPUT_PROOF_TASK_ID: "success",
+    }
+    if any(
+        str(observed[task_id].get("state") or "").casefold() != expected_state
+        or observed[task_id].get("try_number") != 1
+        or observed[task_id].get("map_index") not in {-1, None}
+        for task_id, expected_state in expected_states.items()
+    ):
+        raise BackfillError("replay task states do not prove exact attempt one")
+    if not isinstance(proof, Mapping):
+        raise BackfillError("exact replay missing-input proof XCom is absent")
+    return proof
+
+
+def _replay_missing_input_summary(
+    payload: Mapping[str, Any],
+    *,
+    generation_id: str,
+    scope_contract: Mapping[str, Any],
+) -> dict[str, Any]:
+    contract = load_player_source_refresh_contract(
+        REPOSITORY_ROOT / PLAYER_SOURCE_REFRESH_ARTIFACT
+    )
+    expected_fields = {
+        "schema_version",
+        "status",
+        "run_id",
+        "mode",
+        "scope_count",
+        "scope_sha256",
+        "entities",
+        "plan_signature",
+        "runner_result_sha256",
+        "artifact_sha256",
+        "target_count",
+        "targets",
+    }
+    if (
+        set(payload) != expected_fields
+        or payload.get("schema_version") != REPLAY_MISSING_INPUT_PROOF_SCHEMA
+        or payload.get("status") != "source_refresh_required"
+        or payload.get("run_id") != generation_id
+        or payload.get("mode") != "replay"
+        or payload.get("scope_count") != scope_contract["count"]
+        or payload.get("scope_sha256") != scope_contract["sha256"]
+        or payload.get("entities") != sorted(ISSUE_930_SCOPE_ENTITIES)
+        or _PLAN_SIGNATURE_RE.fullmatch(str(payload.get("plan_signature") or ""))
+        is None
+        or re.fullmatch(r"[0-9a-f]{64}", str(payload.get("runner_result_sha256") or ""))
+        is None
+        or payload.get("artifact_sha256") != contract["sha256"]
+        or payload.get("target_count") != contract["target_count"]
+        or payload.get("targets") != contract["targets"]
+    ):
+        raise BackfillError(
+            "replay proof does not contain the exact seven missing player inputs"
+        )
+    return dict(payload)
 
 
 def _candidate(
@@ -831,6 +1206,10 @@ def _base_report(
                 "plan_signature",
             )
         }
+        prerequisite = getattr(args, "_source_refresh_prerequisite", None)
+        if not isinstance(prerequisite, Mapping):
+            raise BackfillError("source-refresh prerequisite was not admitted")
+        report["source_refresh_prerequisite"] = dict(prerequisite)
     return report
 
 
@@ -933,6 +1312,19 @@ def _resolve_quiet_generation(
     if ingest_state == "failed":
         if state is None:
             raise BackfillError("failed ingest lost its publication generation")
+        if report.get("mode") == "replay" and int(args.publication_attempt) == 1:
+            try:
+                report["replay_missing_input_proof"] = _replay_missing_input_summary(
+                    _replay_missing_input_xcom(args, ids["ingest_run_id"], run=run),
+                    generation_id=str(publication["generation_id"]),
+                    scope_contract=scope_contract,
+                )
+                report.pop("replay_missing_input_proof_error", None)
+            except Exception as exc:
+                report.pop("replay_missing_input_proof", None)
+                report["replay_missing_input_proof_error"] = (
+                    f"{type(exc).__name__}: {exc}"
+                )
         return _release_failed(args, report, publication, state, run=run)
     if ingest_state != "success":
         raise BackfillError(
@@ -1039,6 +1431,12 @@ def run_backfill(
     context = _deployment_context(args)
     if context.get("kept_paused") is not True or context["git_sha"] != expected_sha:
         raise BackfillError("run requires the exact admitted --keep-paused deployment")
+    _load_source_refresh_prerequisite(
+        args,
+        source_refresh=source_refresh,
+        scope_contract=scope_contract,
+        context=context,
+    )
     validate_live_deployment(args, run=run)
     initial_writers = inspect_writer_state(args, run=run)
     _require_writers_stopped(initial_writers)
@@ -1245,6 +1643,11 @@ def _load_recovery_report(
         if isinstance(source_refresh, Mapping)
         else None
     )
+    expected_prerequisite = (
+        getattr(args, "_source_refresh_prerequisite", None)
+        if isinstance(source_refresh, Mapping)
+        else None
+    )
     if (
         not isinstance(report, dict)
         or report.get("schema_version") != SCHEMA_VERSION
@@ -1262,6 +1665,7 @@ def _load_recovery_report(
             else None
         )
         or report.get("source_refresh") != expected_source
+        or report.get("source_refresh_prerequisite") != expected_prerequisite
         or (isinstance(source_refresh, Mapping) and report.get("mode") != "backfill")
         or report.get("scope")
         != {key: scope_contract[key] for key in ("name", "artifact", "sha256", "count")}
@@ -1298,6 +1702,12 @@ def recover_backfill(
     if int(args.publication_attempt) <= 0:
         raise BackfillError("--publication-attempt must be a positive integer")
     scope_contract = _load_scope_contract(args.scopes, args.scope_sha256)
+    _load_source_refresh_prerequisite(
+        args,
+        source_refresh=source_refresh,
+        scope_contract=scope_contract,
+        context=context,
+    )
     report, publication = _load_recovery_report(args, scope_contract, run=run)
     report = {**report, "command": "recover", "passed": False}
     validate_live_deployment(args, run=run)
@@ -1387,6 +1797,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scope-sha256", required=True)
     parser.add_argument("--source-refresh-profile", default="")
     parser.add_argument("--source-refresh-targets-sha256", default="")
+    parser.add_argument(
+        "--prerequisite-replay-report",
+        type=Path,
+        help=(
+            "Protected terminal attempt-1 replay report proving the exact seven "
+            "missing player raw inputs; required only for source refresh"
+        ),
+    )
     parser.add_argument("--expected-git-sha", required=True)
     parser.add_argument("--max-requests", type=int, default=2_000)
     parser.add_argument("--max-direct-mib", type=int, default=256)

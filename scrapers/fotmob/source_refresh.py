@@ -17,6 +17,8 @@ from typing import Any, Mapping
 
 PLAYER_SOURCE_REFRESH_PROFILE = "issue930-player-source-refresh-v1"
 PLAYER_SOURCE_REFRESH_SCHEMA = "fotmob-issue-930-player-source-refresh-v1"
+REPLAY_MISSING_INPUT_PROOF_SCHEMA = "fotmob-replay-missing-player-inputs-v1"
+REPLAY_MISSING_INPUT_PROOF_TASK_ID = "capture_replay_missing_inputs"
 PLAYER_SOURCE_REFRESH_ARTIFACT = "configs/fotmob/issue-930-player-source-refresh.json"
 PLAYER_SOURCE_REFRESH_SHA256 = (
     "f6cb854c6d60463c899fd9077b61a71d8d0f817741c3a9d6423925b32949045b"

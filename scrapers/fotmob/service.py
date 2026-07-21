@@ -2173,9 +2173,10 @@ class FotMobIngestService:
             metadata={"snapshot_semantics": "global_observed_at_not_historical"},
         )
         terminal_outcomes: dict[str, str] = {}
+        missing_raw_player_ids: set[int] = set()
 
         def attach_terminal_outcomes() -> None:
-            if capture_terminal_outcomes:
+            if capture_terminal_outcomes or self.mode == RunMode.REPLAY:
                 result.metadata["terminal_outcomes"] = [
                     {"player_id": int(player_id), "status": status}
                     for player_id, status in sorted(
@@ -2245,6 +2246,7 @@ class FotMobIngestService:
                     else ""
                 )
                 if not re.fullmatch(r"[0-9a-f]{64}", target_key):
+                    missing_raw_player_ids.add(player_id)
                     fetched[str(player_id)] = RuntimeError(
                         "no raw-bearing v1/v2 player manifest for offline replay"
                     )
@@ -2286,7 +2288,11 @@ class FotMobIngestService:
         for key, outcome in fetched.items():
             if isinstance(outcome, Exception):
                 result.errors.append(f"player {key}: {outcome}")
-                terminal_outcomes[str(key)] = "error"
+                terminal_outcomes[str(key)] = (
+                    "missing_raw_input"
+                    if int(key) in missing_raw_player_ids
+                    else "error"
+                )
                 continue
             fetch = outcome
             if not fetch.ok:
@@ -2359,6 +2365,8 @@ class FotMobIngestService:
                     error=str(exc),
                 )
                 terminal_outcomes[str(key)] = failure_status.value
+        if self.mode == RunMode.REPLAY:
+            result.metadata["missing_raw_player_ids"] = sorted(missing_raw_player_ids)
         attach_terminal_outcomes()
         return result
 

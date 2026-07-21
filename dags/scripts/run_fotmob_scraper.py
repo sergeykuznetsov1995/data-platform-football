@@ -24,6 +24,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping
 
+from scrapers.fotmob.source_refresh import (
+    REPLAY_MISSING_INPUT_PROOF_SCHEMA as REPLAY_MISSING_INPUT_SCHEMA,
+)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -49,6 +53,7 @@ NATIVE_PRIMARY_COUNTS = {
     "competition_completion": "competitions",
     "current_views": "views",
 }
+_MISSING_PLAYER_RAW_ERROR = "no raw-bearing v1/v2 player manifest for offline replay"
 
 PUBLICATION_BINDING_ARGUMENTS = {
     "schema": "publication_schema",
@@ -290,6 +295,122 @@ def _outstanding_targets(operation) -> int:
         int(operation.succeeded) + int(operation.skipped) + intentional_not_available
     )
     return max(0, int(operation.attempted) - resolved)
+
+
+def _player_replay_missing_raw_ids(operation) -> tuple[int, ...] | None:
+    """Return typed missing IDs only when they explain the whole operation."""
+
+    raw_ids = operation.metadata.get("missing_raw_player_ids")
+    outcomes = operation.metadata.get("terminal_outcomes")
+    if (
+        not isinstance(raw_ids, list)
+        or not raw_ids
+        or any(type(value) is not int or value <= 0 for value in raw_ids)
+        or raw_ids != sorted(set(raw_ids))
+        or not isinstance(outcomes, list)
+        or len(outcomes) != int(operation.attempted)
+        or operation.retryable
+        or operation.terminal
+        or int(operation.skipped) != 0
+        or int(operation.review_required) != 0
+    ):
+        return None
+    outcome_by_id: dict[int, str] = {}
+    for item in outcomes:
+        if (
+            not isinstance(item, Mapping)
+            or set(item) != {"player_id", "status"}
+            or type(item.get("player_id")) is not int
+            or int(item["player_id"]) <= 0
+            or item["player_id"] in outcome_by_id
+            or item.get("status")
+            not in {"success", "not_available", "missing_raw_input"}
+        ):
+            return None
+        outcome_by_id[int(item["player_id"])] = str(item["status"])
+    missing_ids = tuple(raw_ids)
+    if sorted(
+        player_id
+        for player_id, status in outcome_by_id.items()
+        if status == "missing_raw_input"
+    ) != list(missing_ids):
+        return None
+    status_counts = {status: sum(1 for value in outcome_by_id.values() if value == status)
+                     for status in ("success", "not_available", "missing_raw_input")}
+    if (
+        int(operation.succeeded) != status_counts["success"]
+        or int(operation.not_available) != status_counts["not_available"]
+        or int(operation.metadata.get("intentional_not_available") or 0)
+        != status_counts["not_available"]
+    ):
+        return None
+    expected_errors = sorted(
+        f"player {player_id}: {_MISSING_PLAYER_RAW_ERROR}" for player_id in missing_ids
+    )
+    if sorted(operation.errors) != expected_errors:
+        return None
+    if int(operation.succeeded) + int(operation.not_available) + len(
+        missing_ids
+    ) != int(operation.attempted):
+        return None
+    return missing_ids
+
+
+def _replay_missing_raw_evidence(
+    *,
+    operations: list[Any],
+    work_plan: Any,
+    planned_scopes: list[str],
+    completed_scopes: list[str],
+    gap_entries: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Emit evidence only when missing player raw is the sole replay failure."""
+
+    if not gap_entries:
+        return None
+    gap_scopes = [str(entry["scope"]) for entry in gap_entries]
+    if (
+        len(gap_scopes) != len(set(gap_scopes))
+        or len(planned_scopes) != len(set(planned_scopes))
+        or len(completed_scopes) != len(set(completed_scopes))
+        or set(completed_scopes).intersection(gap_scopes)
+        or set(completed_scopes).union(gap_scopes) != set(planned_scopes)
+        or len(completed_scopes) + len(gap_scopes) != len(planned_scopes)
+        or int(work_plan.attempted) != len(planned_scopes)
+        or int(work_plan.succeeded) != len(completed_scopes)
+        or int(work_plan.skipped) != 0
+        or work_plan.errors
+        or work_plan.terminal
+        or work_plan.retryable
+        != [str(entry["work_plan_retryable"]) for entry in gap_entries]
+        or work_plan.metadata.get("incomplete_scopes")
+        != [
+            {"scope": entry["scope"], "outstanding": entry["outstanding"]}
+            for entry in gap_entries
+        ]
+    ):
+        return None
+
+    allowed_failures = {id(work_plan)}
+    missing_player_ids: set[int] = set()
+    for entry in gap_entries:
+        operation = entry["player_operation"]
+        typed_ids = _player_replay_missing_raw_ids(operation)
+        if typed_ids is None or list(typed_ids) != entry["missing_player_ids"]:
+            return None
+        allowed_failures.add(id(operation))
+        missing_player_ids.update(typed_ids)
+    if any(
+        not operation.ok and id(operation) not in allowed_failures
+        for operation in operations
+    ):
+        return None
+    return {
+        "schema": REPLAY_MISSING_INPUT_SCHEMA,
+        "failure_class": "missing_player_raw_inputs_only",
+        "missing_player_ids": sorted(missing_player_ids),
+        "affected_scopes": sorted(gap_scopes),
+    }
 
 
 def _scope_is_historical(source_season_key: str, *, reference_year: int) -> bool:
@@ -759,6 +880,7 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
     work_plan.counts["planned_scopes"] = len(work)
     operations.append(work_plan)
     completed_scopes: list[str] = []
+    replay_gap_entries: list[dict[str, Any]] = []
 
     # Complete one exact scope end-to-end before starting the next.  This is
     # the fairness boundary that prevents a season-first pass from consuming
@@ -916,12 +1038,42 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                 )
             operations.append(completion)
         else:
-            work_plan.retryable.append(
+            work_plan_retryable = (
                 f"scope {scope_key} incomplete; outstanding={outstanding}"
             )
+            work_plan.retryable.append(work_plan_retryable)
             work_plan.metadata.setdefault("incomplete_scopes", []).append(
                 {"scope": scope_key, "outstanding": outstanding}
             )
+            player_operations = [
+                operation
+                for operation in scope_operations
+                if operation.entity == "player_snapshots"
+            ]
+            missing_player_ids = (
+                _player_replay_missing_raw_ids(player_operations[0])
+                if mode == RunMode.REPLAY and len(player_operations) == 1
+                else None
+            )
+            other_operations = [
+                operation
+                for operation in scope_operations
+                if not player_operations or operation is not player_operations[0]
+            ]
+            if (
+                missing_player_ids is not None
+                and all(operation.ok for operation in other_operations)
+                and outstanding == {"player_snapshots": len(missing_player_ids)}
+            ):
+                replay_gap_entries.append(
+                    {
+                        "scope": scope_key,
+                        "outstanding": outstanding,
+                        "work_plan_retryable": work_plan_retryable,
+                        "player_operation": player_operations[0],
+                        "missing_player_ids": list(missing_player_ids),
+                    }
+                )
 
         if (
             not scope_ok
@@ -1050,6 +1202,17 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         completed_transfer_competition_ids = []
 
     rc, payload = finish()
+    replay_missing_inputs = (
+        _replay_missing_raw_evidence(
+            operations=operations,
+            work_plan=work_plan,
+            planned_scopes=planned_scopes,
+            completed_scopes=completed_scopes,
+            gap_entries=replay_gap_entries,
+        )
+        if mode == RunMode.REPLAY
+        else None
+    )
     payload["selection"] = {
         "entities": sorted(entities),
         "explicit_scopes": [
@@ -1063,6 +1226,8 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         "completed_transfer_competition_ids": (completed_transfer_competition_ids),
         "requests_per_minute": args.requests_per_minute,
     }
+    if replay_missing_inputs is not None:
+        payload["selection"]["replay_missing_player_inputs"] = replay_missing_inputs
     daily_contract = getattr(args, "daily_competition_contract", None)
     if daily_contract:
         payload["selection"]["daily_contract"] = daily_contract["schema"]

@@ -122,7 +122,7 @@ def _daily_report(mod):
             "explicit_scopes": [],
             "competition_limit": 0,
             "season_limit": 0,
-            "scope_plan_signature": "fmplan1-" + "a" * 64,
+            "scope_plan_signature": "fmplan1-98c9a8f98ba8eaa14bfc8232b9667682e11e4fce27e120eee5ea9572b66e0385",
             "planned_scopes": planned,
             "completed_scopes": list(planned),
             "completed_transfer_competition_ids": list(
@@ -356,7 +356,11 @@ class TestDynamicDiscoveryDag:
         task = next(
             op for op in BashOperator._instances if op.task_id == "scrape_fotmob_data"
         )
-        assert "{{ ts_nodash }}_{{ ti.try_number }}" in task.bash_command
+        assert "/tmp/fotmob_result_{{ ts_nodash }}.json" in task.bash_command
+        assert "ti.try_number" not in task.bash_command
+        assert '/usr/bin/rm -f -- "/tmp/fotmob_result_{{ ts_nodash }}.json"' in (
+            task.bash_command
+        )
         generation = "{{ dag_run.conf['fotmob_publication']['generation_id'] }}"
         assert f'--publication-generation-id "{generation}"' in task.bash_command
         for argument in (
@@ -624,7 +628,7 @@ class TestNativeValidation:
                         "explicit_scopes": ["47=2025/2026"],
                         "competition_limit": 0,
                         "season_limit": 0,
-                        "scope_plan_signature": "fmplan1-" + "a" * 64,
+                        "scope_plan_signature": "fmplan1-98c9a8f98ba8eaa14bfc8232b9667682e11e4fce27e120eee5ea9572b66e0385",
                     },
                 }
             ),
@@ -639,7 +643,7 @@ class TestNativeValidation:
             "entities": ["leaderboards", "season"],
             "explicit_scope_count": 1,
             "explicit_scope_sha256": hashlib.sha256(b"47=2025/2026\n").hexdigest(),
-            "scope_plan_signature": "fmplan1-" + "a" * 64,
+            "scope_plan_signature": "fmplan1-98c9a8f98ba8eaa14bfc8232b9667682e11e4fce27e120eee5ea9572b66e0385",
             "competition_limit": 0,
             "season_limit": 0,
         }

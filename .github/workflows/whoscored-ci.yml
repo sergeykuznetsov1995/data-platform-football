@@ -115,7 +115,7 @@ jobs:
             scripts/whoscored_proxy_campaign.py \
             scripts/research/bench_whoscored_workflow.py \
             scripts/research/whoscored_capacity_container_runtime.py \
-            $(rg --files scripts tests | rg '(whoscored|test_proxy_traffic|test_filter_proxy).*\.py$')
+            $(find scripts tests -type f -name '*.py' -print | grep -E '(whoscored|test_proxy_traffic|test_filter_proxy).*\.py$' | sort)
           python -m compileall -q \
             scrapers/whoscored \
             scrapers/base/iceberg_writer.py \
@@ -542,7 +542,7 @@ jobs:
           WHOSCORED_SCHEDULER_PAYLOAD_IMAGE: data-platform-airflow-scheduler-payload:provenance-ci
         run: |
           pytest -q \
-            $(rg --files tests | rg '/test_.*whoscored.*\.py$|/test_whoscored.*\.py$') \
+            $(find tests -type f -name '*.py' -print | grep -E '/test_.*whoscored.*\.py$|/test_whoscored.*\.py$' | sort) \
             tests/unit/scrapers/test_iceberg_writer.py \
             tests/unit/dags/test_proxy_traffic.py \
             tests/unit/scrapers/test_flaresolverr_client.py \
