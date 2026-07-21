@@ -31,6 +31,9 @@ from scrapers.whoscored.transport import (
     FailureKind,
     FetchRequest,
     JsonlRequestLedger,
+    PaidGatewayBatchItem,
+    PaidGatewayBatchReceipt,
+    PaidGatewayBatchResponse,
     PaidGatewayError,
     PaidGatewayProtocolError,
     PaidGatewayReceipt,
@@ -550,6 +553,145 @@ def test_direct_http_success_never_starts_browser_or_proxy():
     assert proxy.created == []
     assert factory_calls == []
     assert transport.get_traffic_stats()["paid_proxy_bytes"] == 0
+
+
+@pytest.mark.unit
+def test_paid_batch_gate_is_off_by_default_and_requires_exact_boolean_env(monkeypatch):
+    monkeypatch.delenv("WHOSCORED_PAID_BATCH_ENABLED", raising=False)
+    transport, _factory_calls = _transport(
+        FakeHTTPSession(FakeHTTPResponse()),
+        transport_policy=TransportPolicy.DIRECT_ONLY,
+    )
+    try:
+        assert transport._paid_batch_enabled is False
+    finally:
+        transport.close()
+
+    monkeypatch.setenv("WHOSCORED_PAID_BATCH_ENABLED", "yes")
+    with pytest.raises(ValueError, match="must be 0 or 1"):
+        _transport(
+            FakeHTTPSession(FakeHTTPResponse()),
+            transport_policy=TransportPolicy.DIRECT_ONLY,
+        )
+
+
+@pytest.mark.unit
+def test_paid_batch_records_one_hashed_aggregate_receipt_event():
+    second_url = TEAM_STATS_URL + "&category=offensive"
+    urls = (TEAM_STATS_URL, second_url)
+    endpoint_bytes = {
+        hashlib.sha256(
+            transport_module._canonical_url_key(url).encode("utf-8")
+        ).hexdigest(): amount
+        for url, amount in zip(urls, (300, 600))
+    }
+    manifest = transport_module._paid_gateway_target_manifest_sha256(
+        urls, browser_bootstrap_url=TEAM_STATS_BOOTSTRAP
+    )
+    receipt = PaidGatewayBatchReceipt(
+        campaign_id="campaign-one",
+        approval_id="approval-one",
+        approval_sha256="a" * 64,
+        allocation_id="allocation-one",
+        attempt_id_hash="b" * 64,
+        target_manifest_sha256=manifest,
+        lease_id_hash="d" * 64,
+        route=TransportRoute.PAID_FLARESOLVERR,
+        up_bytes=50,
+        down_bytes=950,
+        total_bytes=1_000,
+        provider_billed_bytes=1_000,
+        bootstrap_provider_billed_bytes=100,
+        endpoint_provider_billed_bytes=endpoint_bytes,
+        close_complete=True,
+        cleanup_complete=True,
+    )
+
+    class BatchGateway:
+        def __init__(self):
+            self.calls = []
+
+        def fetch_batch(self, requested_urls, **kwargs):
+            self.calls.append((tuple(requested_urls), kwargs))
+            return PaidGatewayBatchResponse(
+                target_manifest_sha256=manifest,
+                results=tuple(
+                    PaidGatewayBatchItem(
+                        url=url,
+                        content=b'{"teamTableStats":[]}',
+                        status_code=200,
+                        headers={"content-type": "application/json"},
+                    )
+                    for url in urls
+                ),
+                route=TransportRoute.PAID_FLARESOLVERR,
+                receipt=receipt,
+            )
+
+    def cf_solution(url):
+        return {
+            "ok": True,
+            "content": CF_HTML,
+            "headers": {"server": "cloudflare", "cf-ray": "blocked"},
+            "status": 403,
+            "responseBytes": len(CF_HTML),
+            "finalUrl": url,
+        }
+
+    direct = FakeHTTPSession(
+        FakeHTTPResponse(content=MASKED_STATS_HTML),
+        FakeHTTPResponse(content=MASKED_STATS_HTML),
+        FakeHTTPResponse(content=MASKED_STATS_HTML),
+    )
+    direct_fs = FakeFSClient(
+        {"html": "<html>Team Statistics</html>", "status": 200},
+        [cf_solution(url) for url in urls],
+    )
+    gateway = BatchGateway()
+    ledger = MemoryLedger()
+    transport = WhoScoredTransport(
+        direct_http_session=direct,
+        direct_fs_client=direct_fs,
+        paid_gateway_client=gateway,
+        direct_http_attempts=1,
+        direct_browser_attempts=1,
+        browser_retry_backoff_seconds=0,
+        paid_batch_enabled=True,
+        context=TransportContext(transport_policy="direct_then_paid"),
+        transport_policy=TransportPolicy.DIRECT_THEN_PAID,
+        request_ledger=ledger,
+    )
+
+    results = transport.fetch_many(
+        [
+            FetchRequest(
+                url=url,
+                cache_key=f"paid-batch-{index}",
+                browser_bootstrap_url=TEAM_STATS_BOOTSTRAP,
+                validator=lambda response: json.loads(response.content) is not None,
+            )
+            for index, url in enumerate(urls)
+        ]
+    )
+
+    assert [result.route for result in results] == [
+        TransportRoute.PAID_FLARESOLVERR,
+        TransportRoute.PAID_FLARESOLVERR,
+    ]
+    assert [result.resource_bytes for result in results] == [400, 600]
+    assert len(gateway.calls) == 1
+    assert gateway.calls[0][0] == urls
+    accounted = [event for event in ledger.events if event["status"] == "accounted"]
+    assert len(accounted) == 1
+    assert accounted[0]["lease_id_hash"] == "d" * 64
+    assert "lease_id" not in accounted[0]
+    assert accounted[0]["request_bytes"] == 50
+    assert accounted[0]["response_bytes"] == 950
+    assert accounted[0]["paid_proxy_bytes"] == 1_000
+    assert accounted[0]["gateway_target_manifest_sha256"] == manifest
+    assert accounted[0]["gateway_endpoint_provider_bytes"] == endpoint_bytes
+    assert accounted[0]["gateway_bootstrap_provider_bytes"] == 100
+    assert transport.get_traffic_stats()["paid_proxy_bytes"] == 1_000
 
 
 @pytest.mark.unit
@@ -4760,3 +4902,47 @@ class SimpleControlSession:
 
     def close(self):
         self.closed = True
+
+
+@pytest.mark.unit
+def test_proxy_control_client_binds_batch_claim_and_switches_owner_atomically():
+    response = FakeHTTPResponse()
+    response.raise_for_status = lambda: None
+    response.json = lambda: {
+        "id": "lease-batch",
+        "token": "lease-token",
+        "proxy_url": "http://proxy_filter:8900",
+        "max_bytes": 1000,
+    }
+    session = SimpleControlSession(response)
+    client = ProxyFilterClient(
+        "http://proxy_filter:8899",
+        session=session,
+        control_token=CONTROL_TOKEN,
+    )
+    labels = ("bootstrap:" + "a" * 64, "target:" + "b" * 64)
+
+    lease = client.create_lease(
+        max_bytes=1000,
+        ttl_seconds=60,
+        target_manifest_sha256="c" * 64,
+        logical_target_units=1,
+        expected_endpoint_labels=labels,
+    )
+
+    assert session.posts[0][1]["json"] == {
+        "max_bytes": 1000,
+        "ttl_seconds": 60,
+        "canonical_url": "",
+        "target_manifest_sha256": "c" * 64,
+        "logical_target_units": 1,
+        "expected_endpoint_labels": list(labels),
+    }
+    response.json = lambda: {"request_id": "request-next"}
+    assert client.switch_endpoint(lease, "request-current", labels[1]) == (
+        "request-next"
+    )
+    assert session.posts[1][0].endswith(
+        "/v1/leases/lease-batch/endpoints/request-current/switch"
+    )
+    assert session.posts[1][1]["json"] == {"endpoint": labels[1]}

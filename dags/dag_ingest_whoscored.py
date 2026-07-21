@@ -602,7 +602,9 @@ def _logical_as_of_date(context: Mapping[str, Any]) -> str:
     return logical_date.date().isoformat()
 
 
-def freeze_daily_scope_plan(*, validated_catalog: Mapping[str, Any]) -> Dict[str, Any]:
+def freeze_daily_scope_plan(
+    *, validated_catalog: Mapping[str, Any], **context: Any
+) -> Dict[str, Any]:
     """Bind one exact catalog generation for every task in this DagRun."""
 
     from dags.scripts import run_whoscored_scraper as runner
@@ -649,23 +651,324 @@ def freeze_daily_scope_plan(*, validated_catalog: Mapping[str, Any]) -> Dict[str
         [],
         active_only=True,
     )
-    scopes = sorted(scope.spec for scope, _runtime in selected)
-    if not scopes or len(scopes) != len(set(scopes)):
+    catalog_scopes = sorted(scope.spec for scope, _runtime in selected)
+    if not catalog_scopes or len(catalog_scopes) != len(set(catalog_scopes)):
         raise AirflowException("frozen WhoScored catalog has invalid active scopes")
+    transport = _transport_runtime(context)
+    if transport.is_paid:
+        approval = transport.approval
+        authority = approval.scheduled_authority if approval is not None else None
+        if authority is None:
+            raise AirflowException(
+                "scheduled paid scope plan requires schema-v3 authority"
+            )
+        if (
+            authority.catalog_batch_id != identity["parent_catalog_batch_id"]
+            or authority.catalog_payload_sha256
+            != identity["parent_catalog_payload_sha256"]
+        ):
+            raise AirflowException(
+                "signed paid scope plan differs from the candidate catalog parent"
+            )
+        scopes = [item.scope for item in authority.scope_workloads]
+        missing = sorted(set(scopes) - set(catalog_scopes))
+        if missing:
+            audit = _write_quarantine_disappearance_audit(
+                catalog=catalog,
+                missing_scopes=missing,
+                signed_parent_batch_id=authority.catalog_batch_id,
+                candidate_identity=identity,
+                context=context,
+            )
+            raise AirflowException(
+                "WHOSCORED_QUARANTINE_DISAPPEARANCE: signed scopes disappeared "
+                f"or became ineligible: {missing}; audit_sha256="
+                f"{audit['audit_sha256']}"
+            )
+        selected_by_scope = {
+            scope.spec: (scope, runtime) for scope, runtime in selected
+        }
+        _validate_scheduled_scope_workloads(
+            repository,
+            [selected_by_scope[scope] for scope in scopes],
+            authority.scope_workloads,
+        )
+        deferred = sorted(set(catalog_scopes) - set(scopes))
+    else:
+        scopes = catalog_scopes
+        deferred = []
     scopes_sha256 = hashlib.sha256(
         ("\n".join(scopes) + "\n").encode("utf-8")
     ).hexdigest()
-    return {
+    result: Dict[str, Any] = {
         "schema_version": 2,
         **{key: value for key, value in identity.items() if key != "schema_version"},
         "active_scopes": scopes,
         "active_scope_count": len(scopes),
         "active_scopes_sha256": scopes_sha256,
     }
+    if transport.is_paid:
+        assert transport.approval is not None
+        assert transport.approval.scheduled_authority is not None
+        authority = transport.approval.scheduled_authority
+        result.update(
+            {
+                "schema_version": 3,
+                "catalog_active_scope_count": len(catalog_scopes),
+                "deferred_scopes": deferred,
+                "deferred_scope_count": len(deferred),
+                "deferred_scopes_sha256": hashlib.sha256(
+                    ("\n".join(deferred) + ("\n" if deferred else "")).encode("utf-8")
+                ).hexdigest(),
+                "cohort_id": authority.cohort_id,
+                "cohort_sha256": authority.cohort_sha256,
+                "workload_sha256": authority.workload_sha256,
+                "scope_workloads": [
+                    item.to_dict() for item in authority.scope_workloads
+                ],
+                "discovery_parent_target_count": (
+                    authority.discovery_parent_target_count
+                ),
+                "discovery_expansion_headroom": (
+                    authority.discovery_expansion_headroom
+                ),
+                "discovery_target_limit": authority.discovery_target_limit,
+                "profile_target_count": authority.profile_target_count,
+                "profile_targets_sha256": authority.profile_targets_sha256,
+            }
+        )
+    return result
+
+
+def _write_quarantine_disappearance_audit(
+    *,
+    catalog: Any,
+    missing_scopes: Sequence[str],
+    signed_parent_batch_id: str,
+    candidate_identity: Mapping[str, Any],
+    context: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Persist explicit evidence before the DAG-level failure alert fires."""
+
+    from scrapers.whoscored.proxy_campaign import canonical_json_bytes
+
+    quarantined_records = []
+    quarantined_scopes: set[str] = set()
+    missing_parts = {scope: tuple(scope.split("=", 1)) for scope in missing_scopes}
+    for raw in getattr(catalog, "quarantined", ()):
+        if not isinstance(raw, Mapping):
+            continue
+        record = {
+            key: raw.get(key)
+            for key in (
+                "record_type",
+                "competition_id",
+                "season_id",
+                "source_season_id",
+                "stage_id",
+                "eligibility",
+                "classification_reason",
+            )
+        }
+        matches = []
+        for scope, (competition_id, season_id) in missing_parts.items():
+            if str(raw.get("competition_id") or "") != competition_id:
+                continue
+            if (
+                raw.get("record_type") == "competition"
+                or str(raw.get("season_id") or "") == season_id
+            ):
+                matches.append(scope)
+                quarantined_scopes.add(scope)
+        if matches:
+            quarantined_records.append({**record, "affected_scopes": sorted(matches)})
+    quarantined_records.sort(
+        key=lambda item: (
+            str(item.get("record_type") or ""),
+            str(item.get("competition_id") or ""),
+            str(item.get("season_id") or ""),
+            str(item.get("stage_id") or ""),
+        )
+    )
+    body = {
+        "schema_version": 1,
+        "audit_type": "whoscored_quarantine_disappearance",
+        "dag_id": str(_dag_id_from_context(context)),
+        "run_id": str(
+            context.get("run_id") or getattr(context.get("dag_run"), "run_id", "") or ""
+        ),
+        "signed_parent_catalog_batch_id": signed_parent_batch_id,
+        "candidate_catalog_batch_id": candidate_identity["catalog_batch_id"],
+        "candidate_catalog_payload_sha256": candidate_identity[
+            "catalog_payload_sha256"
+        ],
+        "missing_scopes": sorted(missing_scopes),
+        "quarantined_scopes": sorted(quarantined_scopes),
+        "disappeared_scopes": sorted(set(missing_scopes) - quarantined_scopes),
+        "quarantine_records": quarantined_records,
+        "alert_route": "dag_level_failure_callback",
+    }
+    payload = canonical_json_bytes(body) + b"\n"
+    digest = hashlib.sha256(payload).hexdigest()
+    run_dir = _run_dir_from_context(context)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    path = run_dir / "quarantine-disappearance.audit"
+    try:
+        descriptor = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+        )
+    except FileExistsError:
+        try:
+            existing_descriptor = os.open(
+                path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+            )
+            metadata = os.fstat(existing_descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or metadata.st_nlink != 1
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+                or metadata.st_size != len(payload)
+            ):
+                raise AirflowException(
+                    "existing WhoScored quarantine audit metadata is unsafe"
+                )
+            existing = b""
+            while len(existing) < metadata.st_size:
+                chunk = os.read(existing_descriptor, metadata.st_size - len(existing))
+                if not chunk:
+                    break
+                existing += chunk
+        except OSError as exc:
+            raise AirflowException(
+                "cannot reopen WhoScored quarantine-disappearance audit"
+            ) from exc
+        finally:
+            if "existing_descriptor" in locals():
+                os.close(existing_descriptor)
+        if existing != payload:
+            raise AirflowException(
+                "conflicting WhoScored quarantine-disappearance audit"
+            )
+    except OSError as exc:
+        raise AirflowException(
+            "cannot persist WhoScored quarantine-disappearance audit"
+        ) from exc
+    else:
+        try:
+            view = memoryview(payload)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise AirflowException(
+                        "cannot complete WhoScored quarantine audit write"
+                    )
+                view = view[written:]
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    return {"audit_path": str(path), "audit_sha256": digest, **body}
+
+
+def _dag_id_from_context(context: Mapping[str, Any]) -> str:
+    dag = context.get("dag")
+    return str(
+        getattr(dag, "dag_id", None)
+        or context.get("dag_id")
+        or getattr(context.get("dag_run"), "dag_id", "")
+        or ""
+    )
+
+
+def _validate_scheduled_scope_workloads(
+    repository: Any,
+    selected: Sequence[tuple[Any, Any]],
+    signed_workloads: Sequence[Any],
+) -> None:
+    """Recreate signed due identities after discovery and before scope network."""
+
+    from scrapers.whoscored.proxy_campaign import (
+        scheduled_scope_player_pagination_target_limit,
+        scheduled_scope_schedule_target_limit,
+        scheduled_target_ids_sha256,
+    )
+
+    if len(selected) != len(signed_workloads):
+        raise AirflowException("signed WhoScored workload selection is incomplete")
+    for (scope, runtime), workload in zip(selected, signed_workloads):
+        if scope.spec != workload.scope:
+            raise AirflowException("signed WhoScored workload order is invalid")
+        stage_ids = sorted(
+            {int(stage_id) for stage_id in getattr(runtime, "stage_ids", ())}
+        )
+        start = getattr(runtime, "start", None)
+        end = getattr(runtime, "end", None)
+        if not stage_ids or start is None or end is None or end < start:
+            raise AirflowException(
+                f"signed WhoScored scope has no bounded schedule: {scope.spec}"
+            )
+        month_count = (end.year - start.year) * 12 + end.month - start.month + 1
+        try:
+            schedule_limit = scheduled_scope_schedule_target_limit(
+                stage_count=len(stage_ids), season_month_count=month_count
+            )
+        except Exception as exc:
+            raise AirflowException(
+                f"signed WhoScored schedule target bound is invalid: {scope.spec}"
+            ) from exc
+        schedule_sha256 = scheduled_target_ids_sha256(
+            [f"season:{scope.spec}", *(f"stage:{value}" for value in stage_ids)]
+        )
+        matches = repository.list_match_candidates(
+            scope.competition_id,
+            scope.season_id,
+            limit=101,
+            include_exact_count=True,
+        )
+        match_count = (
+            int(matches[0].exact_candidate_count)
+            if matches and matches[0].exact_candidate_count is not None
+            else len(matches)
+        )
+        match_ids = sorted({int(item.game_id) for item in matches})
+        previews = repository.list_preview_candidates(
+            scope.competition_id,
+            scope.season_id,
+            limit=257,
+        )
+        preview_ids = sorted({int(item["game_id"]) for item in previews})
+        non_pagination_count = schedule_limit + match_count + len(preview_ids)
+        try:
+            pagination_limit = scheduled_scope_player_pagination_target_limit(
+                stage_count=len(stage_ids),
+                non_pagination_target_count=non_pagination_count,
+            )
+        except Exception as exc:
+            raise AirflowException(
+                f"signed WhoScored pagination target bound is invalid: {scope.spec}"
+            ) from exc
+        if (
+            match_count > 100
+            or len(match_ids) != match_count
+            or len(preview_ids) != len(previews)
+            or schedule_limit != workload.schedule_target_limit
+            or schedule_sha256 != workload.schedule_targets_sha256
+            or pagination_limit != workload.player_pagination_target_limit
+            or match_count != workload.match_target_count
+            or scheduled_target_ids_sha256(match_ids) != workload.match_targets_sha256
+            or len(preview_ids) != workload.preview_target_count
+            or scheduled_target_ids_sha256(preview_ids)
+            != workload.preview_targets_sha256
+        ):
+            raise AirflowException(
+                f"signed WhoScored due target identity drifted: {scope.spec}"
+            )
 
 
 def _daily_scope_plan_specs(scope_plan: Mapping[str, Any]) -> tuple[str, list[str]]:
-    if set(scope_plan) != {
+    common_fields = {
         "schema_version",
         "catalog_batch_id",
         "catalog_payload_sha256",
@@ -678,7 +981,25 @@ def _daily_scope_plan_specs(scope_plan: Mapping[str, Any]) -> tuple[str, list[st
         "active_scopes",
         "active_scope_count",
         "active_scopes_sha256",
-    }:
+    }
+    paid_fields = {
+        "catalog_active_scope_count",
+        "deferred_scopes",
+        "deferred_scope_count",
+        "deferred_scopes_sha256",
+        "cohort_id",
+        "cohort_sha256",
+        "workload_sha256",
+        "scope_workloads",
+        "discovery_parent_target_count",
+        "discovery_expansion_headroom",
+        "discovery_target_limit",
+        "profile_target_count",
+        "profile_targets_sha256",
+    }
+    schema_version = scope_plan.get("schema_version")
+    expected_fields = common_fields | (paid_fields if schema_version == 3 else set())
+    if set(scope_plan) != expected_fields:
         raise AirflowException("invalid frozen WhoScored daily scope plan schema")
     batch_id = str(scope_plan.get("catalog_batch_id") or "")
     payload_sha256 = str(scope_plan.get("catalog_payload_sha256") or "")
@@ -695,7 +1016,7 @@ def _daily_scope_plan_specs(scope_plan: Mapping[str, Any]) -> tuple[str, list[st
     )
     scopes = scope_plan.get("active_scopes")
     if (
-        scope_plan.get("schema_version") != 2
+        schema_version not in {2, 3}
         or not re.fullmatch(r"[A-Za-z0-9_.-]{1,120}", batch_id)
         or re.fullmatch(r"[0-9a-f]{64}", payload_sha256) is None
         or identity["catalog_batch_id"] != batch_id
@@ -709,6 +1030,75 @@ def _daily_scope_plan_specs(scope_plan: Mapping[str, Any]) -> tuple[str, list[st
         != hashlib.sha256(("\n".join(scopes) + "\n").encode("utf-8")).hexdigest()
     ):
         raise AirflowException("invalid frozen WhoScored daily scope plan identity")
+    if schema_version == 3:
+        from scrapers.whoscored.proxy_campaign import (
+            SCHEDULED_DISCOVERY_EXPANSION_HEADROOM,
+            SCHEDULED_DISCOVERY_TARGET_LIMIT_MAX,
+            ScheduledScopeWorkload,
+            canonical_json_bytes,
+        )
+
+        deferred = scope_plan.get("deferred_scopes")
+        raw_workloads = scope_plan.get("scope_workloads")
+        try:
+            workloads = (
+                [ScheduledScopeWorkload.from_dict(item) for item in raw_workloads]
+                if isinstance(raw_workloads, list)
+                else []
+            )
+        except Exception as exc:
+            raise AirflowException("invalid paid WhoScored scope workloads") from exc
+        discovery_parent_count = scope_plan.get("discovery_parent_target_count")
+        discovery_target_limit = scope_plan.get("discovery_target_limit")
+        profile_target_count = scope_plan.get("profile_target_count")
+        if (
+            not isinstance(deferred, list)
+            or any(not isinstance(value, str) or not value for value in deferred)
+            or deferred != sorted(set(deferred))
+            or set(deferred) & set(scopes)
+            or scope_plan.get("deferred_scope_count") != len(deferred)
+            or scope_plan.get("catalog_active_scope_count")
+            != len(scopes) + len(deferred)
+            or scope_plan.get("deferred_scopes_sha256")
+            != hashlib.sha256(
+                ("\n".join(deferred) + ("\n" if deferred else "")).encode("utf-8")
+            ).hexdigest()
+            or re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}",
+                str(scope_plan.get("cohort_id") or ""),
+            )
+            is None
+            or re.fullmatch(r"[0-9a-f]{64}", str(scope_plan.get("cohort_sha256") or ""))
+            is None
+            or re.fullmatch(
+                r"[0-9a-f]{64}", str(scope_plan.get("workload_sha256") or "")
+            )
+            is None
+            or [item.scope for item in workloads] != scopes
+            or scope_plan.get("workload_sha256")
+            != hashlib.sha256(
+                canonical_json_bytes([item.to_dict() for item in workloads])
+            ).hexdigest()
+            or isinstance(discovery_parent_count, bool)
+            or not isinstance(discovery_parent_count, int)
+            or discovery_parent_count <= 0
+            or scope_plan.get("discovery_expansion_headroom")
+            != SCHEDULED_DISCOVERY_EXPANSION_HEADROOM
+            or discovery_target_limit
+            != min(
+                SCHEDULED_DISCOVERY_TARGET_LIMIT_MAX,
+                discovery_parent_count + SCHEDULED_DISCOVERY_EXPANSION_HEADROOM,
+            )
+            or isinstance(profile_target_count, bool)
+            or not isinstance(profile_target_count, int)
+            or not 0 <= profile_target_count <= 256
+            or re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(scope_plan.get("profile_targets_sha256") or ""),
+            )
+            is None
+        ):
+            raise AirflowException("invalid paid WhoScored cohort/deferred identity")
     return batch_id, list(scopes)
 
 
@@ -815,7 +1205,6 @@ def build_daily_commands(
             base_transport,
             task_id="ingest_active_scope",
             work_item_id=work_item_id,
-            missing_ok=True,
         )
         alert_guard = paid_alert_source_guard_command(
             transport,
@@ -1324,27 +1713,8 @@ def _validate_paid_report_identity(
 ) -> None:
     if not transport.is_paid:
         return
-    # Catalog drift: a scope that discovery opened after the standing approval
-    # was issued has no signed allocation and runs direct-only inside an
-    # otherwise paid DagRun (see PaidRuntime.for_allocation missing_ok).  Such a
-    # report is accepted only when it proves it never touched the paid path:
-    # direct-only policy, zero paid bytes and no proxy identity field.  Any paid
-    # byte or proxy field still demands the full signed identity below.
     if str(report.get("transport_policy") or "") != "direct_then_paid":
-        degraded_paid = report.get("paid_proxy_bytes", 0)
-        proxy_fields = (
-            "proxy_allocation_id",
-            "proxy_approval_id",
-            "proxy_approval_sha256",
-            "proxy_work_item_id",
-            "proxy_attempt_id",
-        )
-        if (
-            type(degraded_paid) is int
-            and degraded_paid == 0
-            and not any(report.get(field) for field in proxy_fields)
-        ):
-            return
+        raise AirflowException("paid WhoScored report lost its transport policy")
     approval = getattr(transport, "approval", None)
     airflow = report.get("airflow")
     if approval is None or not isinstance(airflow, Mapping):
@@ -1415,6 +1785,11 @@ def _campaign_ledger_paid_bytes(
     request_leases: dict[tuple[str, str, str], dict[str, Any]] = {}
     request_event_ids: set[str] = set()
     request_lease_hashes: set[str] = set()
+    request_batch_fields = {
+        "gateway_target_manifest_sha256",
+        "gateway_endpoint_provider_bytes",
+        "gateway_bootstrap_provider_bytes",
+    }
     for event in request_paid_events:
         event_id = event.get("event_id")
         allocation_id = str(event.get("proxy_allocation_id") or "")
@@ -1458,13 +1833,14 @@ def _campaign_ledger_paid_bytes(
             raise AirflowException(
                 "WhoScored paid request attempt identity is malformed"
             ) from exc
-        lease_id = event.get("lease_id")
+        lease_hash = event.get("lease_id_hash")
         canonical_url = event.get("url")
         billed = event.get("paid_proxy_bytes")
         if (
             event.get("proxy_attempt_id") != attempt_id
-            or not isinstance(lease_id, str)
-            or not lease_id
+            or "lease_id" in event
+            or not isinstance(lease_hash, str)
+            or re.fullmatch(r"[0-9a-f]{64}", lease_hash) is None
             or not isinstance(canonical_url, str)
             or not canonical_url
             or type(billed) is not int
@@ -1473,8 +1849,66 @@ def _campaign_ledger_paid_bytes(
             raise AirflowException(
                 "WhoScored paid request lease accounting is malformed"
             )
+        present_batch_fields = request_batch_fields & set(event)
+        batch_accounting: dict[str, Any] | None = None
+        if present_batch_fields:
+            manifest_sha256 = event.get("gateway_target_manifest_sha256")
+            raw_endpoint_bytes = event.get("gateway_endpoint_provider_bytes")
+            bootstrap_bytes = event.get("gateway_bootstrap_provider_bytes")
+            request_bytes = event.get("request_bytes")
+            response_bytes = event.get("response_bytes")
+            resource_bytes = event.get("resource_bytes")
+            if (
+                present_batch_fields != request_batch_fields
+                or event.get("route") != "paid_lease"
+                or event.get("final_paid_route") != "paid_flaresolverr"
+                or event.get("gateway_cleanup_complete") is not True
+                or not isinstance(manifest_sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}", manifest_sha256) is None
+                or not isinstance(raw_endpoint_bytes, Mapping)
+                or not 1 <= len(raw_endpoint_bytes) <= 8
+                or type(bootstrap_bytes) is not int
+                or bootstrap_bytes < 0
+                or type(request_bytes) is not int
+                or request_bytes < 0
+                or type(response_bytes) is not int
+                or response_bytes < 0
+                or type(resource_bytes) is not int
+                or resource_bytes != billed
+                or request_bytes + response_bytes != billed
+            ):
+                raise AirflowException(
+                    "WhoScored paid batch request accounting is malformed"
+                )
+            endpoint_bytes: dict[str, int] = {}
+            for endpoint_digest, raw_amount in raw_endpoint_bytes.items():
+                if (
+                    not isinstance(endpoint_digest, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", endpoint_digest) is None
+                    or type(raw_amount) is not int
+                    or raw_amount < 0
+                ):
+                    raise AirflowException(
+                        "WhoScored paid batch endpoint accounting is malformed"
+                    )
+                endpoint_bytes[endpoint_digest] = raw_amount
+            canonical_url_sha256 = hashlib.sha256(
+                canonical_url.encode("utf-8")
+            ).hexdigest()
+            if (
+                canonical_url_sha256 not in endpoint_bytes
+                or bootstrap_bytes + sum(endpoint_bytes.values()) != billed
+            ):
+                raise AirflowException(
+                    "WhoScored paid batch attribution differs from aggregate bytes"
+                )
+            batch_accounting = {
+                "target_manifest_sha256": manifest_sha256,
+                "logical_target_units": len(endpoint_bytes),
+                "endpoint_provider_bytes": endpoint_bytes,
+                "bootstrap_provider_bytes": bootstrap_bytes,
+            }
         attempt_hash = hashlib.sha256(attempt_id.encode("utf-8")).hexdigest()
-        lease_hash = hashlib.sha256(lease_id.encode("utf-8")).hexdigest()
         if lease_hash in request_lease_hashes:
             raise AirflowException("WhoScored paid request lease is duplicated")
         request_lease_hashes.add(lease_hash)
@@ -1483,6 +1917,7 @@ def _campaign_ledger_paid_bytes(
                 canonical_url.encode("utf-8")
             ).hexdigest(),
             "provider_billed_bytes": billed,
+            "batch_accounting": batch_accounting,
         }
     proxy_leases: dict[tuple[str, str, str], dict[str, Any]] = {}
     proxy_lease_bindings: dict[str, tuple[str, str, str]] = {}
@@ -1497,7 +1932,15 @@ def _campaign_ledger_paid_bytes(
             or not isinstance(event_id, str)
             or re.fullmatch(r"[0-9a-f]{24}", event_id) is None
             or event_id in seen_event_ids
-            or event_type not in {"lease_created", "bytes", "lease_closed"}
+            or event_type
+            not in {
+                "lease_created",
+                "endpoint_started",
+                "bytes",
+                "endpoint_switched",
+                "endpoint_finished",
+                "lease_closed",
+            }
             or event.get("dag_id") != str(dag_id)
             or event.get("run_id") != str(run_id)
             or event.get("proxy_campaign_id") != approval.campaign_id
@@ -1564,6 +2007,49 @@ def _campaign_ledger_paid_bytes(
             raise AirflowException("WhoScored proxy ledger lease changed canonical URL")
         if event_type == "lease_created":
             max_bytes = event.get("max_bytes")
+            binding_fields = {
+                "target_manifest_sha256",
+                "logical_target_units",
+                "expected_endpoint_labels",
+            }
+            present_binding_fields = binding_fields & set(event)
+            batch_binding: dict[str, Any] | None = None
+            if present_binding_fields:
+                manifest_sha256 = event.get("target_manifest_sha256")
+                logical_target_units = event.get("logical_target_units")
+                expected_endpoint_labels = event.get("expected_endpoint_labels")
+                if (
+                    present_binding_fields != binding_fields
+                    or not isinstance(manifest_sha256, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", manifest_sha256) is None
+                    or type(logical_target_units) is not int
+                    or not 1 <= logical_target_units <= 8
+                    or not isinstance(expected_endpoint_labels, list)
+                    or len(expected_endpoint_labels) != logical_target_units + 1
+                    or any(
+                        not isinstance(label, str)
+                        or re.fullmatch(r"(?:bootstrap|target):[0-9a-f]{64}", label)
+                        is None
+                        for label in expected_endpoint_labels
+                    )
+                    or expected_endpoint_labels[0].split(":", 1)[0] != "bootstrap"
+                    or expected_endpoint_labels[1:]
+                    != sorted(expected_endpoint_labels[1:])
+                    or len(set(expected_endpoint_labels))
+                    != len(expected_endpoint_labels)
+                    or any(
+                        not label.startswith("target:")
+                        for label in expected_endpoint_labels[1:]
+                    )
+                ):
+                    raise AirflowException(
+                        "WhoScored proxy batch lease binding is malformed"
+                    )
+                batch_binding = {
+                    "target_manifest_sha256": manifest_sha256,
+                    "logical_target_units": logical_target_units,
+                    "expected_endpoint_labels": tuple(expected_endpoint_labels),
+                }
             if (
                 lease is not None
                 or type(max_bytes) is not int
@@ -1577,31 +2063,191 @@ def _campaign_ledger_paid_bytes(
                 "canonical_url_sha256": canonical_url_hash,
                 "provider_billed_bytes": 0,
                 "closed": False,
+                "batch_binding": batch_binding,
+                "active_endpoint": None,
+                "endpoint_provider_bytes": {},
+                "seen_endpoint_request_ids": set(),
             }
             continue
         if lease is None or lease["closed"] is True:
             raise AirflowException(
                 "WhoScored proxy ledger lease lifecycle is missing or out of order"
             )
+        if event_type == "endpoint_started":
+            request_id = event.get("request_id")
+            endpoint = event.get("endpoint")
+            lease_total = event.get("lease_total_bytes")
+            batch_binding = lease["batch_binding"]
+            expected_labels = (
+                set(batch_binding["expected_endpoint_labels"])
+                if batch_binding is not None
+                else None
+            )
+            endpoint_map = lease["endpoint_provider_bytes"]
+            seen_request_ids = lease["seen_endpoint_request_ids"]
+            if (
+                lease["active_endpoint"] is not None
+                or not isinstance(request_id, str)
+                or re.fullmatch(r"[0-9a-f]{24}", request_id) is None
+                or request_id in seen_request_ids
+                or not isinstance(endpoint, str)
+                or not endpoint
+                or type(lease_total) is not int
+                or lease_total != lease["provider_billed_bytes"]
+                or (expected_labels is not None and endpoint not in expected_labels)
+                or (
+                    batch_binding is not None
+                    and (
+                        endpoint in endpoint_map
+                        or (
+                            not endpoint_map
+                            and endpoint
+                            != batch_binding["expected_endpoint_labels"][0]
+                        )
+                    )
+                )
+            ):
+                raise AirflowException("WhoScored proxy endpoint start is malformed")
+            seen_request_ids.add(request_id)
+            lease["active_endpoint"] = {
+                "request_id": request_id,
+                "endpoint": endpoint,
+                "start_bytes": lease_total,
+            }
+            continue
         if event_type == "bytes":
             billed = event.get("bytes")
+            active_endpoint = lease["active_endpoint"]
             if (
                 event.get("direction") not in {"up", "down"}
                 or type(billed) is not int
                 or billed <= 0
+                or (
+                    active_endpoint is not None
+                    and event.get("endpoint") != active_endpoint["endpoint"]
+                )
+                or (lease["batch_binding"] is not None and active_endpoint is None)
             ):
                 raise AirflowException("WhoScored proxy ledger byte event is malformed")
             lease["provider_billed_bytes"] += billed
+            lease_total = event.get("lease_total_bytes")
+            if lease_total is not None and (
+                type(lease_total) is not int
+                or lease_total != lease["provider_billed_bytes"]
+            ):
+                raise AirflowException("WhoScored proxy byte event total is malformed")
+            continue
+        if event_type == "endpoint_switched":
+            active_endpoint = lease["active_endpoint"]
+            request_id = event.get("request_id")
+            endpoint = event.get("endpoint")
+            provider_bytes = event.get("provider_bytes")
+            lease_total = event.get("lease_total_bytes")
+            next_request_id = event.get("next_request_id")
+            next_endpoint = event.get("next_endpoint")
+            batch_binding = lease["batch_binding"]
+            expected_labels = (
+                set(batch_binding["expected_endpoint_labels"])
+                if batch_binding is not None
+                else None
+            )
+            endpoint_map = lease["endpoint_provider_bytes"]
+            seen_request_ids = lease["seen_endpoint_request_ids"]
+            if (
+                not isinstance(active_endpoint, Mapping)
+                or request_id != active_endpoint.get("request_id")
+                or endpoint != active_endpoint.get("endpoint")
+                or type(provider_bytes) is not int
+                or provider_bytes < 0
+                or provider_bytes
+                != lease["provider_billed_bytes"]
+                - int(active_endpoint.get("start_bytes", -1))
+                or type(lease_total) is not int
+                or lease_total != lease["provider_billed_bytes"]
+                or not isinstance(next_request_id, str)
+                or re.fullmatch(r"[0-9a-f]{24}", next_request_id) is None
+                or next_request_id in seen_request_ids
+                or not isinstance(next_endpoint, str)
+                or not next_endpoint
+                or next_endpoint == endpoint
+                or (
+                    expected_labels is not None
+                    and (
+                        next_endpoint not in expected_labels
+                        or next_endpoint in endpoint_map
+                    )
+                )
+            ):
+                raise AirflowException("WhoScored proxy endpoint switch is malformed")
+            endpoint_map.setdefault(endpoint, []).append(provider_bytes)
+            seen_request_ids.add(next_request_id)
+            lease["active_endpoint"] = {
+                "request_id": next_request_id,
+                "endpoint": next_endpoint,
+                "start_bytes": lease_total,
+            }
+            continue
+        if event_type == "endpoint_finished":
+            active_endpoint = lease["active_endpoint"]
+            request_id = event.get("request_id")
+            endpoint = event.get("endpoint")
+            provider_bytes = event.get("provider_bytes")
+            lease_total = event.get("lease_total_bytes")
+            if (
+                not isinstance(active_endpoint, Mapping)
+                or request_id != active_endpoint.get("request_id")
+                or endpoint != active_endpoint.get("endpoint")
+                or type(provider_bytes) is not int
+                or provider_bytes < 0
+                or provider_bytes
+                != lease["provider_billed_bytes"]
+                - int(active_endpoint.get("start_bytes", -1))
+                or type(lease_total) is not int
+                or lease_total != lease["provider_billed_bytes"]
+            ):
+                raise AirflowException("WhoScored proxy endpoint finish is malformed")
+            endpoint_map = lease["endpoint_provider_bytes"]
+            endpoint_map.setdefault(endpoint, []).append(provider_bytes)
+            lease["active_endpoint"] = None
             continue
         closed_total = event.get("total_bytes")
+        raw_endpoint_map = event.get("endpoint_request_provider_bytes")
         if (
             type(closed_total) is not int
             or closed_total < 0
             or closed_total != lease["provider_billed_bytes"]
+            or lease["active_endpoint"] is not None
         ):
             raise AirflowException(
                 "WhoScored proxy ledger close differs from byte deltas"
             )
+        if raw_endpoint_map is not None:
+            if not isinstance(raw_endpoint_map, Mapping):
+                raise AirflowException(
+                    "WhoScored proxy close endpoint accounting is malformed"
+                )
+            close_endpoint_map: dict[str, list[int]] = {}
+            for endpoint, observations in raw_endpoint_map.items():
+                if (
+                    not isinstance(endpoint, str)
+                    or re.fullmatch(r"(?:bootstrap|target):[0-9a-f]{64}", endpoint)
+                    is None
+                    or not isinstance(observations, list)
+                    or not observations
+                    or any(
+                        type(amount) is not int or amount < 0 for amount in observations
+                    )
+                ):
+                    raise AirflowException(
+                        "WhoScored proxy close endpoint accounting is malformed"
+                    )
+                close_endpoint_map[endpoint] = list(observations)
+            if close_endpoint_map != lease["endpoint_provider_bytes"]:
+                raise AirflowException(
+                    "WhoScored proxy close differs from endpoint WAL events"
+                )
+        elif lease["batch_binding"] is not None or lease["endpoint_provider_bytes"]:
+            raise AirflowException("WhoScored proxy close has no endpoint accounting")
         lease["closed"] = True
 
     try:
@@ -1637,8 +2283,10 @@ def _campaign_ledger_paid_bytes(
         )
 
     campaign_leases: dict[tuple[str, str, str], Mapping[str, Any]] = {}
+    campaign_batch_bindings: dict[tuple[str, str, str], dict[str, Any] | None] = {}
     campaign_lease_bindings: dict[str, tuple[str, str, str]] = {}
     campaign_paid = 0
+    campaign_logical_target_units = 0
     for allocation_id, value in allocations.items():
         attempts = value.get("attempts") if isinstance(value, Mapping) else None
         allocation = approved_allocations.get(str(allocation_id))
@@ -1655,6 +2303,8 @@ def _campaign_ledger_paid_bytes(
         ):
             raise AirflowException("WhoScored campaign allocation ledger is malformed")
         allocation_attempt_bytes = 0
+        allocation_logical_target_units = 0
+        allocation_has_batch = False
         for attempt in attempts:
             if not isinstance(attempt, Mapping):
                 raise AirflowException("WhoScored campaign attempt ledger is malformed")
@@ -1675,6 +2325,49 @@ def _campaign_ledger_paid_bytes(
                 raise AirflowException(
                     "WhoScored campaign attempt accounting is malformed"
                 )
+            binding_fields = {
+                "target_manifest_sha256",
+                "logical_target_units",
+                "expected_endpoint_labels",
+            }
+            present_binding_fields = binding_fields & set(attempt)
+            batch_binding: dict[str, Any] | None = None
+            if present_binding_fields:
+                manifest_sha256 = attempt.get("target_manifest_sha256")
+                logical_target_units = attempt.get("logical_target_units")
+                expected_endpoint_labels = attempt.get("expected_endpoint_labels")
+                if (
+                    present_binding_fields != binding_fields
+                    or not isinstance(manifest_sha256, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", manifest_sha256) is None
+                    or type(logical_target_units) is not int
+                    or not 1 <= logical_target_units <= 8
+                    or not isinstance(expected_endpoint_labels, list)
+                    or len(expected_endpoint_labels) != logical_target_units + 1
+                    or any(
+                        not isinstance(label, str)
+                        or re.fullmatch(r"(?:bootstrap|target):[0-9a-f]{64}", label)
+                        is None
+                        for label in expected_endpoint_labels
+                    )
+                    or not expected_endpoint_labels[0].startswith("bootstrap:")
+                    or expected_endpoint_labels[1:]
+                    != sorted(expected_endpoint_labels[1:])
+                    or any(
+                        not label.startswith("target:")
+                        for label in expected_endpoint_labels[1:]
+                    )
+                    or len(set(expected_endpoint_labels))
+                    != len(expected_endpoint_labels)
+                ):
+                    raise AirflowException(
+                        "WhoScored campaign batch attempt binding is malformed"
+                    )
+                batch_binding = {
+                    "target_manifest_sha256": manifest_sha256,
+                    "logical_target_units": logical_target_units,
+                    "expected_endpoint_labels": tuple(expected_endpoint_labels),
+                }
             lease_key = (str(allocation_id), attempt_hash, lease_hash)
             previous_binding = campaign_lease_bindings.setdefault(lease_hash, lease_key)
             if previous_binding != lease_key or lease_key in campaign_leases:
@@ -1682,17 +2375,48 @@ def _campaign_ledger_paid_bytes(
                     "WhoScored campaign lease accounting is duplicated or rebound"
                 )
             campaign_leases[lease_key] = attempt
+            campaign_batch_bindings[lease_key] = batch_binding
+            allocation_has_batch = allocation_has_batch or batch_binding is not None
             allocation_attempt_bytes += billed
+            allocation_logical_target_units += (
+                batch_binding["logical_target_units"]
+                if batch_binding is not None
+                else 1
+            )
             campaign_paid += billed
+        allocation_leases_used = value.get("leases_used")
         if allocation_attempt_bytes != allocation_spent:
             raise AirflowException("WhoScored campaign allocation byte counters differ")
+        if (allocation_has_batch and type(allocation_leases_used) is not int) or (
+            allocation_leases_used is not None
+            and (
+                type(allocation_leases_used) is not int
+                or allocation_leases_used != allocation_logical_target_units
+            )
+        ):
+            raise AirflowException(
+                "WhoScored campaign allocation target counters differ"
+            )
+        campaign_logical_target_units += allocation_logical_target_units
     snapshot_spent = snapshot.get("spent_provider_bytes")
+    snapshot_leases_used = snapshot.get("leases_used")
     if (
         type(snapshot_spent) is not int
         or snapshot_spent < 0
         or snapshot_spent != campaign_paid
     ):
         raise AirflowException("WhoScored campaign total byte counters differ")
+    campaign_has_batch = any(
+        value is not None for value in campaign_batch_bindings.values()
+    )
+    if (campaign_has_batch and type(snapshot_leases_used) is not int) or (
+        snapshot_leases_used is not None
+        and (
+            type(snapshot_leases_used) is not int
+            or snapshot_leases_used != campaign_logical_target_units
+        )
+    ):
+        raise AirflowException("WhoScored campaign total target counters differ")
     if set(campaign_leases) != set(proxy_leases):
         raise AirflowException(
             "WhoScored campaign/proxy ledger attempt and lease sets differ"
@@ -1704,6 +2428,9 @@ def _campaign_ledger_paid_bytes(
     for lease_key, attempt in campaign_leases.items():
         proxy_lease = proxy_leases[lease_key]
         request_lease = request_leases[lease_key]
+        request_batch = request_lease["batch_accounting"]
+        proxy_batch = proxy_lease["batch_binding"]
+        campaign_batch = campaign_batch_bindings[lease_key]
         if proxy_lease["closed"] is not True:
             raise AirflowException(
                 "WhoScored proxy ledger lease lifecycle is incomplete"
@@ -1723,18 +2450,77 @@ def _campaign_ledger_paid_bytes(
             raise AirflowException(
                 "WhoScored request/proxy ledger lease accounting differs"
             )
-    attempt_accounting = [
-        {
+        if (request_batch is None) != (proxy_batch is None) or (
+            proxy_batch is None
+        ) != (campaign_batch is None):
+            raise AirflowException(
+                "WhoScored batch binding is missing from one accounting witness"
+            )
+        if request_batch is not None:
+            assert proxy_batch is not None
+            assert campaign_batch is not None
+            expected_labels = proxy_batch["expected_endpoint_labels"]
+            target_labels = tuple(
+                sorted(
+                    "target:" + digest
+                    for digest in request_batch["endpoint_provider_bytes"]
+                )
+            )
+            bootstrap_labels = tuple(
+                label for label in expected_labels if label.startswith("bootstrap:")
+            )
+            endpoint_observations = proxy_lease["endpoint_provider_bytes"]
+            if (
+                proxy_batch != campaign_batch
+                or request_batch["target_manifest_sha256"]
+                != proxy_batch["target_manifest_sha256"]
+                or request_batch["logical_target_units"]
+                != proxy_batch["logical_target_units"]
+                or tuple(expected_labels[1:]) != target_labels
+                or len(bootstrap_labels) != 1
+                or set(endpoint_observations) != set(expected_labels)
+                or any(
+                    not isinstance(observations, list) or len(observations) != 1
+                    for observations in endpoint_observations.values()
+                )
+                or endpoint_observations[bootstrap_labels[0]][0]
+                != request_batch["bootstrap_provider_bytes"]
+                or any(
+                    endpoint_observations[label][0]
+                    != request_batch["endpoint_provider_bytes"][
+                        label.removeprefix("target:")
+                    ]
+                    for label in target_labels
+                )
+            ):
+                raise AirflowException(
+                    "WhoScored batch request/proxy/campaign attribution differs"
+                )
+    attempt_accounting: list[dict[str, Any]] = []
+    for (allocation_id, attempt_hash, lease_hash), attempt in sorted(
+        campaign_leases.items()
+    ):
+        item: dict[str, Any] = {
             "allocation_id": allocation_id,
             "attempt_id_hash": attempt_hash,
             "lease_id_hash": lease_hash,
             "canonical_url_sha256": attempt["canonical_url_sha256"],
             "provider_billed_bytes": attempt["provider_billed_bytes"],
         }
-        for (allocation_id, attempt_hash, lease_hash), attempt in sorted(
-            campaign_leases.items()
-        )
-    ]
+        batch_binding = campaign_batch_bindings[
+            (allocation_id, attempt_hash, lease_hash)
+        ]
+        if batch_binding is not None:
+            item.update(
+                {
+                    "target_manifest_sha256": batch_binding["target_manifest_sha256"],
+                    "logical_target_units": batch_binding["logical_target_units"],
+                    "expected_endpoint_labels": list(
+                        batch_binding["expected_endpoint_labels"]
+                    ),
+                }
+            )
+        attempt_accounting.append(item)
     attempt_accounting_sha256 = hashlib.sha256(
         canonical_json_bytes(attempt_accounting)
     ).hexdigest()
@@ -1877,6 +2663,13 @@ def plan_daily_profile_capacity(
         or re.fullmatch(r"[0-9a-f]{64}", str(candidate_sha256 or "")) is None
     ):
         raise AirflowException("invalid exact WhoScored profile candidate snapshot")
+    if scope_plan.get("schema_version") == 3 and (
+        candidate_count != scope_plan.get("profile_target_count")
+        or candidate_sha256 != scope_plan.get("profile_targets_sha256")
+    ):
+        raise AirflowException(
+            "signed WhoScored profile target identity drifted after discovery"
+        )
     summary = {
         "schema_version": 1,
         "status": "success",
@@ -3342,7 +4135,6 @@ def validate_scope_result(
         _context,
         task_id="ingest_active_scope",
         work_item_id=stable_scope_work_item(scope_spec),
-        missing_ok=True,
     )
     allocation_limit = (
         transport.allocation.budget_bytes if transport.allocation is not None else 0
@@ -3360,6 +4152,38 @@ def validate_scope_result(
             f"normal daily run used paid proxy for {scope_spec}: {paid} bytes"
         )
 
+    backlog = result.get("match_candidates")
+    if not isinstance(backlog, Mapping) or set(backlog) != {
+        "schema_version",
+        "count",
+        "attempted",
+        "remaining",
+    }:
+        raise AirflowException(
+            f"WhoScored match backlog contract is missing for {scope_spec}"
+        )
+    count = backlog.get("count")
+    attempted = backlog.get("attempted")
+    remaining = backlog.get("remaining")
+    if (
+        backlog.get("schema_version") != 1
+        or type(count) is not int
+        or type(attempted) is not int
+        or type(remaining) is not int
+        or count < 0
+        or attempted < 0
+        or attempted > 100
+        or remaining < 0
+        or count != attempted + remaining
+    ):
+        raise AirflowException(
+            f"WhoScored match backlog identity is invalid for {scope_spec}: {backlog}"
+        )
+    if remaining:
+        raise AirflowException(
+            f"WhoScored match backlog remains for {scope_spec}: {backlog}"
+        )
+
     commits = _producer_commits_from_report(result)
     attempts = _producer_attempts_from_report(result)
     if (
@@ -3374,6 +4198,10 @@ def validate_scope_result(
     ):
         raise AirflowException(
             f"WhoScored producer commit scope is invalid for {scope_spec}"
+        )
+    if attempts["match"][0]["count"] != attempted:
+        raise AirflowException(
+            f"WhoScored match backlog/attempt identity differs for {scope_spec}"
         )
     exact = _scope_producer_integrity_summary(scope_spec, commits)
     for kind in ("scope", "match", "preview"):
@@ -3640,6 +4468,40 @@ def validate_catalog_result(**context: Any) -> Dict[str, Any]:
             raise AirflowException(
                 f"WhoScored catalog manifest parity failed: {integrity}"
             )
+    if integrity["quarantined"]:
+        transport = _transport_runtime(context)
+        authority = (
+            transport.approval.scheduled_authority
+            if transport.is_paid and transport.approval is not None
+            else None
+        )
+        if authority is not None:
+            from dags.scripts import run_whoscored_scraper as runner
+
+            repository = runner._new_repository()
+            _generation, catalog = repository.load_catalog_generation_snapshot(
+                batch_id=identity["catalog_batch_id"]
+            )
+            selected = runner._select_catalog_snapshot_scopes(
+                catalog, [], active_only=True
+            )
+            active_scopes = {scope.spec for scope, _runtime in selected}
+            missing = sorted(
+                {item.scope for item in authority.scope_workloads} - active_scopes
+            )
+            if missing:
+                audit = _write_quarantine_disappearance_audit(
+                    catalog=catalog,
+                    missing_scopes=missing,
+                    signed_parent_batch_id=authority.catalog_batch_id,
+                    candidate_identity=identity,
+                    context=context,
+                )
+                raise AirflowException(
+                    "WHOSCORED_QUARANTINE_DISAPPEARANCE: signed scopes became "
+                    f"quarantined: {missing}; audit_sha256="
+                    f"{audit['audit_sha256']}"
+                )
     if integrity["quarantined"] or integrity["eligible_seasons_without_stages"]:
         raise AirflowException(f"WhoScored catalog is incomplete: {integrity}")
     if integrity["manifest_identity_valid"] != 1:
@@ -4515,76 +5377,49 @@ with DAG(
         execution_timeout=timedelta(minutes=10),
     )
 
-    dynamic_mapping_available = callable(getattr(BashOperator, "partial", None))
-    if dynamic_mapping_available:
-        build_commands = PythonOperator(
-            task_id="build_active_scope_commands",
-            python_callable=build_daily_commands,
-            op_kwargs={
-                "scope_plan": freeze_scope_plan.output,
-                "alert_metadata": paid_alert_preflight.output,
-            },
-        )
-        build_dq = PythonOperator(
-            task_id="build_scope_dq_inputs",
-            python_callable=build_scope_validation_kwargs,
-            op_kwargs={"scope_plan": freeze_scope_plan.output},
-        )
-        ingest_scopes = BashOperator.partial(
-            task_id="ingest_active_scope",
-            env=_TASK_ENV,
-            append_env=True,
-            pool=DIRECT_POOL,
-            priority_weight=100,
-            # Entity retry_after timestamps are durable in the manifests.
-            # An earlier Airflow retry would see no due candidates and could
-            # overwrite the failed report with a false-green empty run.
-            retries=0,
-            # World Cup qualification exposes many active stages and is the
-            # measured worst case: bounded browser batches plus atomic Iceberg
-            # staging can exceed 45 minutes on a cold scope. Completed table
-            # batches are resumable, but the task needs enough time to publish
-            # the final scope manifest in one attempt.
-            execution_timeout=timedelta(minutes=75),
-            do_xcom_push=False,
-        ).expand(bash_command=build_commands.output)
-        scope_dq = PythonOperator.partial(
-            task_id="validate_active_scope",
-            python_callable=validate_scope_result,
-            trigger_rule="all_done",
-            pool=DQ_POOL,
-            execution_timeout=timedelta(minutes=10),
-        ).expand(op_kwargs=build_dq.output)
-        freeze_scope_plan >> [build_commands, build_dq]
-        build_commands >> ingest_scopes
-        [ingest_scopes, build_dq] >> scope_dq
-    else:
-        # Lightweight host test stubs do not implement dynamic mapping.  This
-        # task exercises the same runtime catalog path without resolving any
-        # scope while the module is imported.
-        ingest_scopes = BashOperator(
-            task_id="ingest_active_scopes",
-            bash_command=(
-                "cd /opt/airflow && "
-                "python dags/scripts/run_whoscored_scraper.py daily --skip-profiles "
-                f"--output {_RUN_DIR_TEMPLATE}/active_scopes.json --direct-only"
-            ),
-            env=_TASK_ENV,
-            append_env=True,
-            pool=DIRECT_POOL,
-            priority_weight=100,
-            retries=0,
-            execution_timeout=timedelta(hours=2),
-            do_xcom_push=False,
-        )
-        scope_dq = PythonOperator(
-            task_id="validate_active_scopes",
-            python_callable=aggregate_traffic_reports,
-            trigger_rule="all_done",
-            pool=DQ_POOL,
-        )
-        catalog_dq >> ingest_scopes >> scope_dq
-
+    if not callable(getattr(BashOperator, "partial", None)):
+        raise RuntimeError("WhoScored daily ingest requires Airflow dynamic mapping")
+    build_commands = PythonOperator(
+        task_id="build_active_scope_commands",
+        python_callable=build_daily_commands,
+        op_kwargs={
+            "scope_plan": freeze_scope_plan.output,
+            "alert_metadata": paid_alert_preflight.output,
+        },
+    )
+    build_dq = PythonOperator(
+        task_id="build_scope_dq_inputs",
+        python_callable=build_scope_validation_kwargs,
+        op_kwargs={"scope_plan": freeze_scope_plan.output},
+    )
+    ingest_scopes = BashOperator.partial(
+        task_id="ingest_active_scope",
+        env=_TASK_ENV,
+        append_env=True,
+        pool=DIRECT_POOL,
+        priority_weight=100,
+        # Entity retry_after timestamps are durable in the manifests.
+        # An earlier Airflow retry would see no due candidates and could
+        # overwrite the failed report with a false-green empty run.
+        retries=0,
+        # World Cup qualification exposes many active stages and is the
+        # measured worst case: bounded browser batches plus atomic Iceberg
+        # staging can exceed 45 minutes on a cold scope. Completed table
+        # batches are resumable, but the task needs enough time to publish
+        # the final scope manifest in one attempt.
+        execution_timeout=timedelta(minutes=75),
+        do_xcom_push=False,
+    ).expand(bash_command=build_commands.output)
+    scope_dq = PythonOperator.partial(
+        task_id="validate_active_scope",
+        python_callable=validate_scope_result,
+        trigger_rule="all_done",
+        pool=DQ_POOL,
+        execution_timeout=timedelta(minutes=10),
+    ).expand(op_kwargs=build_dq.output)
+    freeze_scope_plan >> [build_commands, build_dq]
+    build_commands >> ingest_scopes
+    [ingest_scopes, build_dq] >> scope_dq
     profile_capacity = PythonOperator(
         task_id="plan_daily_profile_capacity",
         python_callable=plan_daily_profile_capacity,
@@ -4649,7 +5484,9 @@ with DAG(
     runtime_preflight >> paid_alert_preflight >> initialize_schema >> build_discovery
     build_discovery >> discover_catalog >> catalog_dq
     catalog_dq >> freeze_scope_plan
-    ingest_scopes >> profile_capacity >> profile_command >> profile_task >> profile_dq
+    freeze_scope_plan >> profile_capacity >> profile_command
+    ingest_scopes >> profile_task
+    profile_command >> profile_task >> profile_dq
     [catalog_dq, scope_dq, profile_dq, traffic_dq] >> daily_slo
     [catalog_dq, scope_dq, profile_dq, traffic_dq, daily_slo] >> final_gate
     # Traffic upload/cleanup runs only after result-consuming DQ tasks, so

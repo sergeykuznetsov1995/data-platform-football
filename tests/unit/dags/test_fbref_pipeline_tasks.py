@@ -1707,6 +1707,11 @@ def test_live_waves_use_one_process_group_for_all_batches(monkeypatch):
         return Process()
 
     monkeypatch.setattr(fbref_pipeline_tasks.subprocess, "Popen", popen)
+    monkeypatch.setattr(
+        fbref_pipeline_tasks,
+        "_process_group_exists",
+        lambda _process_group_id: False,
+    )
 
     result = fbref_pipeline_tasks.run_fbref_live_waves(
         airflow_run_id="scheduled__2026-07-12T06:00:00+00:00",

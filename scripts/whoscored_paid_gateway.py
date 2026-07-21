@@ -97,17 +97,24 @@ from scrapers.whoscored.runtime_contract import (
 )
 from scrapers.whoscored.transport import (
     MAX_PAID_GATEWAY_RESPONSE_BYTES,
+    MAX_PAID_GATEWAY_BATCH_URLS,
     PAID_GATEWAY_SCHEMA_VERSION,
     PAID_GATEWAY_TOKEN_ENV,
     PINNED_FLARESOLVERR_VERSION,
     PaidGatewayReceipt,
     PaidGatewayResponse,
+    PaidGatewayBatchItem,
+    PaidGatewayBatchReceipt,
+    PaidGatewayBatchResponse,
     ProxyBudgetRejected,
     ProxyConcurrencyLimited,
     ProxyFilterClient,
     ProxyLease,
     TransportRoute,
     _canonical_url_key,
+    _is_whoscored_stage_bootstrap_url,
+    _is_whoscored_structured_feed_url,
+    _paid_gateway_target_manifest_sha256,
     is_cloudflare_response,
     is_whoscored_structured_feed_access_gate,
 )
@@ -129,11 +136,24 @@ GATEWAY_CLEANUP_GRACE_SECONDS = 15.0
 MAX_GATEWAY_BODY_READ_SECONDS = 10.0
 MAX_GATEWAY_URL_BYTES = 16 * 1024
 FLARESOLVERR_GATEWAY_SECRET_ENV = "WHOSCORED_FLARESOLVERR_GATEWAY_SECRET"
+PAID_GATEWAY_BATCH_ENABLED_ENV = "WHOSCORED_PAID_BATCH_ENABLED"
 _REQUEST_FIELDS = frozenset(
     {
         "schema_version",
         "url",
         "browser_bootstrap_url",
+        "max_response_bytes",
+        "max_provider_bytes",
+        "timeout_ms",
+        "context",
+    }
+)
+_BATCH_REQUEST_FIELDS = frozenset(
+    {
+        "schema_version",
+        "urls",
+        "browser_bootstrap_url",
+        "target_manifest_sha256",
         "max_response_bytes",
         "max_provider_bytes",
         "timeout_ms",
@@ -189,7 +209,11 @@ class GatewayError(RuntimeError):
 class SettledGatewayError(GatewayError):
     """A failed source fetch whose paid accounting was fully cleaned."""
 
-    def __init__(self, error: GatewayError, receipt: PaidGatewayReceipt) -> None:
+    def __init__(
+        self,
+        error: GatewayError,
+        receipt: PaidGatewayReceipt | PaidGatewayBatchReceipt,
+    ) -> None:
         super().__init__(error.code, http_status=error.http_status)
         self.receipt = receipt
 
@@ -202,9 +226,22 @@ class _LeaseClient(Protocol):
         ttl_seconds: int,
         context: Any,
         canonical_url: str,
+        target_manifest_sha256: str = "",
+        logical_target_units: int = 1,
+        expected_endpoint_labels: tuple[str, ...] = (),
     ) -> ProxyLease: ...
 
     def close(self, lease: ProxyLease) -> dict[str, Any]: ...
+
+    def begin_endpoint(self, lease: ProxyLease, endpoint: str) -> str: ...
+
+    def end_endpoint(
+        self, lease: ProxyLease, request_id: str
+    ) -> dict[str, Any]: ...
+
+    def switch_endpoint(
+        self, lease: ProxyLease, request_id: str, endpoint: str
+    ) -> str: ...
 
     def campaign_control(
         self,
@@ -320,6 +357,80 @@ class GatewayFetchRequest:
 
 
 @dataclass(frozen=True)
+class GatewayBatchFetchRequest:
+    urls: tuple[str, ...]
+    browser_bootstrap_url: str
+    target_manifest_sha256: str
+    max_response_bytes: int
+    max_provider_bytes: int
+    timeout_ms: int
+    context: Mapping[str, object]
+
+    @classmethod
+    def from_dict(cls, value: object) -> "GatewayBatchFetchRequest":
+        if not isinstance(value, Mapping) or frozenset(value) != _BATCH_REQUEST_FIELDS:
+            raise GatewayError("invalid_request", http_status=400)
+        if value.get("schema_version") != PAID_GATEWAY_SCHEMA_VERSION:
+            raise GatewayError("invalid_request", http_status=400)
+        raw_urls = value.get("urls")
+        if (
+            not isinstance(raw_urls, list)
+            or not 1 <= len(raw_urls) <= MAX_PAID_GATEWAY_BATCH_URLS
+        ):
+            raise GatewayError("invalid_target_manifest", http_status=400)
+        urls: list[str] = []
+        for raw_url in raw_urls:
+            url = GatewayFetchRequest._url(raw_url)
+            assert url is not None
+            if (
+                url != _canonical_url_key(url)
+                or not _is_whoscored_structured_feed_url(url)
+            ):
+                raise GatewayError("invalid_target", http_status=400)
+            urls.append(url)
+        if len(set(urls)) != len(urls):
+            raise GatewayError("invalid_target_manifest", http_status=400)
+        bootstrap = GatewayFetchRequest._url(value.get("browser_bootstrap_url"))
+        assert bootstrap is not None
+        if not _is_whoscored_stage_bootstrap_url(bootstrap):
+            raise GatewayError("invalid_target", http_status=400)
+        manifest = value.get("target_manifest_sha256")
+        if (
+            type(manifest) is not str
+            or not re.fullmatch(r"[0-9a-f]{64}", manifest, re.ASCII)
+            or not hmac.compare_digest(
+                manifest,
+                _paid_gateway_target_manifest_sha256(
+                    urls, browser_bootstrap_url=bootstrap
+                ),
+            )
+        ):
+            raise GatewayError("invalid_target_manifest", http_status=400)
+        context = value.get("context")
+        if not isinstance(context, Mapping) or frozenset(context) != _CONTEXT_FIELDS:
+            raise GatewayError("invalid_context", http_status=403)
+        return cls(
+            urls=tuple(urls),
+            browser_bootstrap_url=bootstrap,
+            target_manifest_sha256=manifest,
+            max_response_bytes=GatewayFetchRequest._bounded_integer(
+                value.get("max_response_bytes"),
+                "max_response_bytes",
+                MAX_PAID_GATEWAY_RESPONSE_BYTES,
+            ),
+            max_provider_bytes=GatewayFetchRequest._bounded_integer(
+                value.get("max_provider_bytes"),
+                "max_provider_bytes",
+                MAX_GATEWAY_PROVIDER_BYTES_PER_FETCH,
+            ),
+            timeout_ms=GatewayFetchRequest._bounded_integer(
+                value.get("timeout_ms"), "timeout_ms", MAX_GATEWAY_TIMEOUT_MS
+            ),
+            context=dict(context),
+        )
+
+
+@dataclass(frozen=True)
 class _CampaignContextEnvelope:
     document: Mapping[str, object]
 
@@ -337,6 +448,13 @@ def _safe_headers(value: Mapping[str, object]) -> dict[str, str]:
         if len(rendered) <= 4096 and "\r" not in rendered and "\n" not in rendered:
             result[lowered] = rendered
     return result
+
+
+def _batch_feature_enabled_from_environment() -> bool:
+    value = os.environ.get(PAID_GATEWAY_BATCH_ENABLED_ENV, "0")
+    if value not in {"0", "1"}:
+        raise ValueError(f"{PAID_GATEWAY_BATCH_ENABLED_ENV} must be exactly 0 or 1")
+    return value == "1"
 
 
 def _bounded_content(
@@ -403,6 +521,25 @@ def _source_headers(request: GatewayFetchRequest) -> dict[str, str]:
         "X-Requested-With": "XMLHttpRequest",
         "Referer": request.browser_bootstrap_url,
     }
+
+
+def _endpoint_label(kind: str, url: str) -> str:
+    if kind not in {"bootstrap", "target"}:
+        raise ValueError("unsupported provider endpoint kind")
+    return f"{kind}:{hashlib.sha256(_canonical_url_key(url).encode('utf-8')).hexdigest()}"
+
+
+def _lease_id_hash(lease_id: object) -> str:
+    """Return the sole public lease identity: one SHA-256 of the raw ID."""
+
+    if (
+        type(lease_id) is not str
+        or not lease_id
+        or len(lease_id) > 256
+        or _CONTROL_RE.search(lease_id) is not None
+    ):
+        raise GatewayError("accounting_invalid")
+    return hashlib.sha256(lease_id.encode("utf-8")).hexdigest()
 
 
 class _PaidCapabilitySession(requests.Session):
@@ -742,6 +879,48 @@ class PaidGatewayService:
         if not approval.allows_url(url, allocation_id=allocation.allocation_id):
             raise GatewayError("target_not_allowed", http_status=403)
 
+    def _begin_endpoint(self, lease: ProxyLease, kind: str, url: str) -> Optional[str]:
+        begin = getattr(self.proxy_client, "begin_endpoint", None)
+        if not callable(begin):
+            # Compatibility for injected pre-endpoint unit fakes only. The
+            # production ProxyFilterClient always exposes the durable boundary.
+            return None
+        try:
+            return str(begin(lease, _endpoint_label(kind, url)))
+        except Exception:
+            raise GatewayError("endpoint_accounting_failed") from None
+
+    def _end_endpoint(self, lease: ProxyLease, request_id: Optional[str]) -> None:
+        if request_id is None:
+            return
+        end = getattr(self.proxy_client, "end_endpoint", None)
+        if not callable(end):
+            raise GatewayError("endpoint_accounting_failed")
+        try:
+            end(lease, request_id)
+        except Exception:
+            raise GatewayError("endpoint_accounting_failed") from None
+
+    def _switch_endpoint(
+        self,
+        lease: ProxyLease,
+        request_id: Optional[str],
+        kind: str,
+        url: str,
+    ) -> Optional[str]:
+        if request_id is None:
+            return self._begin_endpoint(lease, kind, url)
+        switch = getattr(self.proxy_client, "switch_endpoint", None)
+        if callable(switch):
+            try:
+                return str(switch(lease, request_id, _endpoint_label(kind, url)))
+            except Exception:
+                raise GatewayError("endpoint_accounting_failed") from None
+        # Ending and beginning through two control requests would create an
+        # unattributed browser window. A client without atomic switch support
+        # is therefore unusable once it has installed an owner.
+        raise GatewayError("endpoint_accounting_failed")
+
     @staticmethod
     def _receipt(
         *,
@@ -782,6 +961,31 @@ class PaidGatewayService:
             or total > lease.max_bytes
         ):
             raise GatewayError("accounting_invalid")
+        endpoint_map = stats.get("endpoint_request_provider_bytes")
+        if endpoint_map is not None:
+            if not isinstance(endpoint_map, Mapping):
+                raise GatewayError("accounting_invalid")
+            allowed_endpoints = {_endpoint_label("target", request.url)}
+            if request.browser_bootstrap_url is not None:
+                allowed_endpoints.add(
+                    _endpoint_label("bootstrap", request.browser_bootstrap_url)
+                )
+            endpoint_total = 0
+            for endpoint, observations in endpoint_map.items():
+                if endpoint not in allowed_endpoints or not isinstance(
+                    observations, list
+                ):
+                    raise GatewayError("accounting_invalid")
+                for amount in observations:
+                    if (
+                        isinstance(amount, bool)
+                        or not isinstance(amount, int)
+                        or amount < 0
+                    ):
+                        raise GatewayError("accounting_invalid")
+                    endpoint_total += amount
+            if endpoint_total != total:
+                raise GatewayError("accounting_invalid")
         return PaidGatewayReceipt(
             campaign_id=approval.campaign_id,
             approval_id=approval.approval_id,
@@ -791,12 +995,106 @@ class PaidGatewayService:
             canonical_url_sha256=hashlib.sha256(
                 _canonical_url_key(request.url).encode("utf-8")
             ).hexdigest(),
-            lease_id_hash=hashlib.sha256(lease.lease_id.encode("utf-8")).hexdigest(),
+            lease_id_hash=_lease_id_hash(lease.lease_id),
             route=route,
             up_bytes=up,
             down_bytes=down,
             total_bytes=total,
             provider_billed_bytes=provider_billed,
+            close_complete=True,
+            cleanup_complete=True,
+        )
+
+    @staticmethod
+    def _batch_receipt(
+        *,
+        request: GatewayBatchFetchRequest,
+        approval: ProxyCampaignApproval,
+        allocation: ProxyWorkAllocation,
+        attempt_id: str,
+        lease: ProxyLease,
+        stats: Mapping[str, object],
+    ) -> PaidGatewayBatchReceipt:
+        def counter(field: str) -> int:
+            value = stats.get(field)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise GatewayError("accounting_invalid")
+            return value
+
+        if stats.get("id") != lease.lease_id or stats.get("close_complete") is not True:
+            raise GatewayError("accounting_invalid")
+        reported_url = stats.get("canonical_url")
+        if (
+            type(reported_url) is not str
+            or _canonical_url_key(reported_url)
+            != _canonical_url_key(request.urls[0])
+        ):
+            raise GatewayError("accounting_invalid")
+        up = counter("up_bytes")
+        down = counter("down_bytes")
+        total = counter("total_bytes")
+        provider_billed = counter("provider_billed_bytes")
+        if (
+            total != up + down
+            or provider_billed != total
+            or total > request.max_provider_bytes
+            or isinstance(lease.max_bytes, bool)
+            or not isinstance(lease.max_bytes, int)
+            or lease.max_bytes <= 0
+            or total > lease.max_bytes
+        ):
+            raise GatewayError("accounting_invalid")
+        raw_map = stats.get("endpoint_request_provider_bytes")
+        if not isinstance(raw_map, Mapping):
+            raise GatewayError("accounting_invalid")
+        bootstrap_label = _endpoint_label("bootstrap", request.browser_bootstrap_url)
+        expected_target_labels = {
+            _endpoint_label("target", url): hashlib.sha256(
+                _canonical_url_key(url).encode("utf-8")
+            ).hexdigest()
+            for url in request.urls
+        }
+        if (
+            stats.get("target_manifest_sha256") != request.target_manifest_sha256
+            or stats.get("logical_target_units") != len(request.urls)
+            or stats.get("expected_endpoint_labels")
+            != [bootstrap_label, *sorted(expected_target_labels)]
+        ):
+            raise GatewayError("accounting_invalid")
+        if set(raw_map) != {bootstrap_label, *expected_target_labels}:
+            raise GatewayError("accounting_invalid")
+
+        def endpoint_total(label: str) -> int:
+            observations = raw_map.get(label)
+            if not isinstance(observations, list) or len(observations) != 1:
+                raise GatewayError("accounting_invalid")
+            amount = observations[0]
+            if isinstance(amount, bool) or not isinstance(amount, int) or amount < 0:
+                raise GatewayError("accounting_invalid")
+            return amount
+
+        bootstrap_bytes = endpoint_total(bootstrap_label)
+        endpoint_bytes = {
+            digest: endpoint_total(label)
+            for label, digest in expected_target_labels.items()
+        }
+        if bootstrap_bytes + sum(endpoint_bytes.values()) != total:
+            raise GatewayError("accounting_invalid")
+        return PaidGatewayBatchReceipt(
+            campaign_id=approval.campaign_id,
+            approval_id=approval.approval_id,
+            approval_sha256=approval.approval_sha256,
+            allocation_id=allocation.allocation_id,
+            attempt_id_hash=hashlib.sha256(attempt_id.encode("utf-8")).hexdigest(),
+            target_manifest_sha256=request.target_manifest_sha256,
+            lease_id_hash=_lease_id_hash(lease.lease_id),
+            route=TransportRoute.PAID_FLARESOLVERR,
+            up_bytes=up,
+            down_bytes=down,
+            total_bytes=total,
+            provider_billed_bytes=provider_billed,
+            bootstrap_provider_billed_bytes=bootstrap_bytes,
+            endpoint_provider_billed_bytes=endpoint_bytes,
             close_complete=True,
             cleanup_complete=True,
         )
@@ -895,6 +1193,17 @@ class PaidGatewayService:
         finally:
             self._operation_lock.release()
 
+    def fetch_batch(
+        self, request: GatewayBatchFetchRequest
+    ) -> PaidGatewayBatchResponse:
+        deadline = time.monotonic() + request.timeout_ms / 1000.0
+        if not self._operation_lock.acquire(timeout=self._remaining_seconds(deadline)):
+            raise GatewayError("operation_deadline_exceeded", http_status=504)
+        try:
+            return self._fetch_batch_locked(request, deadline=deadline)
+        finally:
+            self._operation_lock.release()
+
     def _fetch_locked(
         self, request: GatewayFetchRequest, *, deadline: float
     ) -> PaidGatewayResponse:
@@ -956,10 +1265,12 @@ class PaidGatewayService:
         raw_response: Any = None
         browser_session_id = "ws-gw-" + secrets.token_hex(16)
         browser_session_attempted = False
+        endpoint_request_id: Optional[str] = None
         pending_error: Optional[GatewayError] = None
         cleanup_error = False
         lease_stats: Optional[Mapping[str, object]] = None
         try:
+            endpoint_request_id = self._begin_endpoint(lease, "target", request.url)
             paid_http = self.http_session_factory(lease.proxy_url)
             raw_response = paid_http.get(
                 request.url,
@@ -995,6 +1306,13 @@ class PaidGatewayService:
                     close_http()
                 paid_http = None
                 route = TransportRoute.PAID_FLARESOLVERR
+                if request.browser_bootstrap_url:
+                    endpoint_request_id = self._switch_endpoint(
+                        lease,
+                        endpoint_request_id,
+                        "bootstrap",
+                        request.browser_bootstrap_url,
+                    )
                 browser_session_attempted = True
                 self.browser_client.create_session(
                     browser_session_id,
@@ -1018,6 +1336,9 @@ class PaidGatewayService:
                         or bootstrap.get("finalUrl") != request.browser_bootstrap_url
                     ):
                         raise GatewayError("browser_bootstrap_failed")
+                    endpoint_request_id = self._switch_endpoint(
+                        lease, endpoint_request_id, "target", request.url
+                    )
                     solution = self.browser_client.xhr_get(
                         request.url,
                         browser_session_id,
@@ -1077,6 +1398,7 @@ class PaidGatewayService:
                     close_http()
                 except Exception:
                     cleanup_error = True
+            browser_destroyed = False
             if browser_session_attempted:
                 try:
                     self.browser_client.destroy_session_strict(
@@ -1085,8 +1407,17 @@ class PaidGatewayService:
                             deadline + GATEWAY_CLEANUP_GRACE_SECONDS
                         ),
                     )
+                    browser_destroyed = True
                 except Exception:
                     cleanup_error = True
+            if endpoint_request_id is not None and (
+                not browser_session_attempted or browser_destroyed
+            ):
+                try:
+                    self._end_endpoint(lease, endpoint_request_id)
+                except Exception:
+                    cleanup_error = True
+                endpoint_request_id = None
             close_proxy_timeout = None
             close_timeout_bounded = False
             try:
@@ -1134,6 +1465,230 @@ class PaidGatewayService:
             receipt=receipt,
         )
 
+    def _fetch_batch_locked(
+        self, request: GatewayBatchFetchRequest, *, deadline: float
+    ) -> PaidGatewayBatchResponse:
+        # Resolve and validate every target under one signed authority before
+        # direct probes or any capability-bearing paid side effect.
+        try:
+            approval, allocation, attempt_id = self.authority(request.context)
+        except Exception:
+            raise GatewayError("authority_rejected", http_status=403) from None
+        for url in request.urls:
+            self._validate_target(approval, allocation, url)
+        self._validate_target(approval, allocation, request.browser_bootstrap_url)
+        if (
+            len(request.urls) > allocation.request_limit
+            or len(request.urls) > allocation.lease_limit
+            or request.max_provider_bytes > allocation.budget_bytes
+        ):
+            raise GatewayError("budget_rejected", http_status=429)
+        try:
+            self.alert_requirement(**self._alert_identity(approval, request.context))
+        except Exception:
+            raise GatewayError("alert_preflight_required", http_status=409) from None
+
+        # All direct observations complete before the one paid lease exists.
+        for url in request.urls:
+            self._fresh_direct_recheck(
+                GatewayFetchRequest(
+                    url=url,
+                    browser_bootstrap_url=request.browser_bootstrap_url,
+                    max_response_bytes=request.max_response_bytes,
+                    max_provider_bytes=request.max_provider_bytes,
+                    timeout_ms=request.timeout_ms,
+                    context=request.context,
+                ),
+                deadline=deadline,
+            )
+
+        remaining = self._remaining_seconds(deadline)
+        if remaining < 1.0:
+            raise GatewayError("operation_deadline_exceeded", http_status=504)
+        lease_ttl = min(self.lease_ttl_seconds, int(remaining))
+        original_proxy_timeout = getattr(self.proxy_client, "timeout", None)
+        bounded_proxy_timeout = isinstance(
+            original_proxy_timeout, (int, float)
+        ) and not isinstance(original_proxy_timeout, bool)
+        if bounded_proxy_timeout:
+            self.proxy_client.timeout = min(  # type: ignore[attr-defined]
+                float(original_proxy_timeout), remaining
+            )
+        try:
+            expected_endpoint_labels = (
+                _endpoint_label("bootstrap", request.browser_bootstrap_url),
+                *sorted(_endpoint_label("target", url) for url in request.urls),
+            )
+            lease = self.proxy_client.create_lease(
+                max_bytes=request.max_provider_bytes,
+                ttl_seconds=lease_ttl,
+                context=_CampaignContextEnvelope(request.context),
+                canonical_url=_canonical_url_key(request.urls[0]),
+                target_manifest_sha256=request.target_manifest_sha256,
+                logical_target_units=len(request.urls),
+                expected_endpoint_labels=expected_endpoint_labels,
+            )
+        except (ProxyBudgetRejected, ProxyConcurrencyLimited):
+            raise GatewayError("budget_rejected", http_status=429) from None
+        except Exception:
+            raise GatewayError("lease_create_failed") from None
+        finally:
+            if bounded_proxy_timeout:
+                self.proxy_client.timeout = original_proxy_timeout  # type: ignore[attr-defined]
+
+        browser_session_id = "ws-gw-batch-" + secrets.token_hex(16)
+        browser_session_attempted = False
+        endpoint_request_id: Optional[str] = None
+        pending_error: Optional[GatewayError] = None
+        cleanup_error = False
+        lease_stats: Optional[Mapping[str, object]] = None
+        results: list[PaidGatewayBatchItem] = []
+        attributed_target_urls: set[str] = set()
+        browser_destroyed = False
+        try:
+            endpoint_request_id = self._begin_endpoint(
+                lease, "bootstrap", request.browser_bootstrap_url
+            )
+            browser_session_attempted = True
+            self.browser_client.create_session(
+                browser_session_id,
+                proxy_url=lease.proxy_url,
+                timeout_seconds=self._remaining_seconds(deadline),
+            )
+            bootstrap = self.browser_client.get(
+                request.browser_bootstrap_url,
+                browser_session_id,
+                max_timeout_ms=self._browser_timeout_ms(deadline),
+                disable_media=True,
+            )
+            bootstrap_content = str(bootstrap.get("html") or "").encode("utf-8")
+            if (
+                len(bootstrap_content) > MAX_PAID_GATEWAY_RESPONSE_BYTES
+                or is_chromium_error_page(
+                    bootstrap_content.decode("utf-8", errors="ignore")
+                )
+                or not 200 <= int(bootstrap.get("status") or 0) < 300
+                or bootstrap.get("finalUrl") != request.browser_bootstrap_url
+            ):
+                raise GatewayError("browser_bootstrap_failed")
+
+            for url in request.urls:
+                endpoint_request_id = self._switch_endpoint(
+                    lease, endpoint_request_id, "target", url
+                )
+                attributed_target_urls.add(url)
+                solution = self.browser_client.xhr_get(
+                    url,
+                    browser_session_id,
+                    max_timeout_ms=self._browser_timeout_ms(deadline),
+                )
+                content = bytes(solution.get("content") or b"")
+                status = int(solution.get("status") or 0)
+                headers = _safe_headers(dict(solution.get("headers") or {}))
+                if (
+                    solution.get("finalUrl") != url
+                    or not 100 <= status <= 599
+                    or len(content) > request.max_response_bytes
+                    or is_chromium_error_page(content.decode("utf-8", errors="ignore"))
+                    or is_whoscored_structured_feed_access_gate(
+                        url, status, content, headers
+                    )
+                ):
+                    raise GatewayError("browser_target_failed")
+                results.append(
+                    PaidGatewayBatchItem(
+                        url=url,
+                        content=content,
+                        status_code=status,
+                        headers=headers,
+                    )
+                )
+        except GatewayError as exc:
+            pending_error = exc
+        except FlareSolverrError:
+            pending_error = GatewayError("browser_fetch_failed")
+        except Exception:
+            pending_error = GatewayError("source_fetch_failed")
+        finally:
+            if browser_session_attempted:
+                try:
+                    self.browser_client.destroy_session_strict(
+                        browser_session_id,
+                        timeout_seconds=self._remaining_seconds(
+                            deadline + GATEWAY_CLEANUP_GRACE_SECONDS
+                        ),
+                    )
+                    browser_destroyed = True
+                except Exception:
+                    cleanup_error = True
+            owner_closed_after_destroy = False
+            if browser_destroyed and endpoint_request_id is not None:
+                try:
+                    self._end_endpoint(lease, endpoint_request_id)
+                    endpoint_request_id = None
+                    owner_closed_after_destroy = True
+                except Exception:
+                    cleanup_error = True
+            # A settled failure gets explicit filter-owned zero observations
+            # only after strict browser destruction proves no background byte
+            # producer survives. No zero boundary can overlap a live browser.
+            if browser_destroyed and owner_closed_after_destroy:
+                for unattempted_url in request.urls:
+                    if unattempted_url in attributed_target_urls:
+                        continue
+                    try:
+                        zero_request_id = self._begin_endpoint(
+                            lease, "target", unattempted_url
+                        )
+                        self._end_endpoint(lease, zero_request_id)
+                        attributed_target_urls.add(unattempted_url)
+                    except Exception:
+                        cleanup_error = True
+                        break
+            close_proxy_timeout = None
+            close_timeout_bounded = False
+            try:
+                cleanup_remaining = self._remaining_seconds(
+                    deadline + GATEWAY_CLEANUP_GRACE_SECONDS
+                )
+                close_proxy_timeout = getattr(self.proxy_client, "timeout", None)
+                close_timeout_bounded = isinstance(
+                    close_proxy_timeout, (int, float)
+                ) and not isinstance(close_proxy_timeout, bool)
+                if close_timeout_bounded:
+                    self.proxy_client.timeout = min(  # type: ignore[attr-defined]
+                        float(close_proxy_timeout), cleanup_remaining
+                    )
+                lease_stats = self.proxy_client.close(lease)
+            except Exception:
+                cleanup_error = True
+            finally:
+                if close_timeout_bounded:
+                    self.proxy_client.timeout = close_proxy_timeout  # type: ignore[attr-defined]
+
+        if cleanup_error or lease_stats is None:
+            raise GatewayError("cleanup_failed")
+        receipt = self._batch_receipt(
+            request=request,
+            approval=approval,
+            allocation=allocation,
+            attempt_id=attempt_id,
+            lease=lease,
+            stats=lease_stats,
+        )
+        if pending_error is not None:
+            # A settled error contains accounting only; no partial body crosses
+            # the gateway boundary.
+            raise SettledGatewayError(pending_error, receipt)
+        if len(results) != len(request.urls):
+            raise GatewayError("source_result_missing")
+        return PaidGatewayBatchResponse(
+            target_manifest_sha256=request.target_manifest_sha256,
+            results=tuple(results),
+            route=TransportRoute.PAID_FLARESOLVERR,
+            receipt=receipt,
+        )
+
     def close(self) -> None:
         browser_close = getattr(self.browser_client, "close", None)
         if callable(browser_close):
@@ -1144,7 +1699,13 @@ class PaidGatewayService:
 
 
 class PaidGatewayApplication:
-    def __init__(self, *, token: str, service: PaidGatewayService) -> None:
+    def __init__(
+        self,
+        *,
+        token: str,
+        service: PaidGatewayService,
+        batch_enabled: Optional[bool] = None,
+    ) -> None:
         if (
             type(token) is not str
             or not 32 <= len(token) <= 512
@@ -1157,6 +1718,15 @@ class PaidGatewayApplication:
             )
         self._token = token
         self.service = service
+        if batch_enabled is None:
+            batch_enabled = _batch_feature_enabled_from_environment()
+        if type(batch_enabled) is not bool:
+            raise ValueError("paid gateway batch_enabled must be boolean")
+        self._batch_enabled = batch_enabled
+
+    @property
+    def batch_enabled(self) -> bool:
+        return self._batch_enabled
 
     def _authorized(self, authorization: str) -> bool:
         expected = f"Bearer {self._token}"
@@ -1199,6 +1769,48 @@ class PaidGatewayApplication:
                 exc.code,
                 receipt=exc.receipt,
             )
+        except GatewayError as exc:
+            return self._error(exc.http_status, exc.code)
+        except Exception:
+            return self._error(400, "invalid_request")
+
+    def handle_batch(self, *, authorization: str, body: bytes) -> tuple[int, bytes]:
+        if not self._authorized(authorization):
+            return self._error(401, "authentication_required")
+        if not self._batch_enabled:
+            return self._error(409, "batch_disabled")
+        if not 0 < len(body) <= MAX_GATEWAY_REQUEST_BYTES:
+            return self._error(413, "invalid_request")
+        try:
+            value = strict_json_loads(body.decode("utf-8"))
+            request = GatewayBatchFetchRequest.from_dict(value)
+            response = self.service.fetch_batch(request)
+            results = [
+                {
+                    "url": item.url,
+                    "status_code": item.status_code,
+                    "headers": dict(item.headers),
+                    "body_base64": base64.b64encode(item.content).decode("ascii"),
+                    "body_sha256": hashlib.sha256(item.content).hexdigest(),
+                }
+                for item in response.results
+            ]
+            document = {
+                "schema_version": PAID_GATEWAY_SCHEMA_VERSION,
+                "target_manifest_sha256": response.target_manifest_sha256,
+                "results": results,
+                "route": response.route.value,
+                "receipt": response.receipt.to_dict(),
+            }
+            return 200, json.dumps(
+                document,
+                ensure_ascii=True,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("ascii")
+        except SettledGatewayError as exc:
+            return self._error(exc.http_status, exc.code, receipt=exc.receipt)
         except GatewayError as exc:
             return self._error(exc.http_status, exc.code)
         except Exception:
@@ -1295,7 +1907,7 @@ class PaidGatewayApplication:
         status: int,
         code: str,
         *,
-        receipt: Optional[PaidGatewayReceipt] = None,
+        receipt: Optional[PaidGatewayReceipt | PaidGatewayBatchReceipt] = None,
     ) -> tuple[int, bytes]:
         document = {
             "schema_version": PAID_GATEWAY_SCHEMA_VERSION,
@@ -1384,10 +1996,25 @@ def _handler(application: PaidGatewayApplication) -> type[BaseHTTPRequestHandler
         def do_POST(self) -> None:  # noqa: N802 - stdlib callback name
             if self.path not in {
                 "/v1/fetch",
+                "/v1/fetch-batch",
                 "/v1/preflight-alert",
                 "/v1/campaign-control",
             }:
                 self.send_error(404)
+                return
+            if self.path == "/v1/fetch-batch" and not application.batch_enabled:
+                # The disabled route is rejected before Content-Length,
+                # Transfer-Encoding, or rfile are touched. This keeps a peer
+                # from turning an off-by-default feature into request-body I/O.
+                status, response = application.handle_batch(
+                    authorization=self.headers.get("Authorization", ""), body=b""
+                )
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(response)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(response)
                 return
             if self.headers.get("Transfer-Encoding"):
                 self.send_error(400)
@@ -1416,6 +2043,7 @@ def _handler(application: PaidGatewayApplication) -> type[BaseHTTPRequestHandler
                 return
             handler = {
                 "/v1/fetch": application.handle,
+                "/v1/fetch-batch": application.handle_batch,
                 "/v1/preflight-alert": application.handle_preflight_alert,
                 "/v1/campaign-control": application.handle_campaign_control,
             }[self.path]
@@ -1482,6 +2110,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = _parse_args(argv)
     if not 1 <= args.port <= 65535:
         raise SystemExit("--port must be in 1..65535")
+    batch_enabled = _batch_feature_enabled_from_environment()
     require_production_runtime_class(operation="WhoScored paid application gateway")
     token = os.environ.get(PAID_GATEWAY_TOKEN_ENV, "")
     fs_secret = os.environ.get(FLARESOLVERR_GATEWAY_SECRET_ENV, "")
@@ -1498,7 +2127,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         control_url=args.proxy_control_url,
     )
     service = PaidGatewayService(proxy_client=proxy, browser_client=browser)
-    application = PaidGatewayApplication(token=token, service=service)
+    application = PaidGatewayApplication(
+        token=token, service=service, batch_enabled=batch_enabled
+    )
     server = BoundedGatewayServer(
         (args.host, args.port), _handler(application), max_workers=4
     )

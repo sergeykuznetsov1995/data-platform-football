@@ -16,6 +16,7 @@ RUNNER_REQUIREMENTS = (
     REPO_ROOT / "docker/images/airflow/requirements-scraper-runner.txt"
 )
 CORE_REQUIREMENTS = REPO_ROOT / "docker/images/airflow/requirements.txt"
+CI_REQUIREMENTS = REPO_ROOT / ".github/workflows/whoscored-test.lock"
 COMPOSE_FILE = REPO_ROOT / "compose.yaml"
 
 EXPECTED_VERSION = "1.13.1"
@@ -28,6 +29,7 @@ def test_tls_wrapper_and_native_library_are_pinned_in_the_image():
     requirements = SCRAPING_REQUIREMENTS.read_text(encoding="utf-8")
     runner_requirements = RUNNER_REQUIREMENTS.read_text(encoding="utf-8")
     core_requirements = CORE_REQUIREMENTS.read_text(encoding="utf-8")
+    ci_requirements = CI_REQUIREMENTS.read_text(encoding="utf-8")
     dockerfile = DOCKERFILE.read_text(encoding="utf-8")
 
     # Do not invalidate and re-resolve the large shared scraping layer just to
@@ -40,6 +42,10 @@ def test_tls_wrapper_and_native_library_are_pinned_in_the_image():
     ]
     assert len(wrapper_locks) == 1
     assert "--hash=sha256:" in wrapper_locks[0]
+    assert ci_requirements.splitlines().count(
+        "wrapper-tls-requests==1.2.5 "
+        "--hash=sha256:36f297aff6102fe85bf803c67917c87664ddf1aace056032ab1455aed88fdc44"
+    ) == 1
     chardet_locks = [
         line
         for line in core_requirements.splitlines()

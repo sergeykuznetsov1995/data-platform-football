@@ -83,6 +83,9 @@ PRODUCTION_COMPOSE_FILES = (
     REPO_ROOT / "compose.yaml",
     REPO_ROOT / "compose.seaweedfs-supervised.yaml",
 )
+PRODUCTION_GATEWAY_COMPOSE_FILE = (
+    REPO_ROOT / "deploy/whoscored/gateway.compose.yaml"
+)
 PRODUCTION_COMPOSE_ENV_FILES = (
     Path("/root/data-platform-football/.env"),
     Path("/root/.secrets/whoscored-runtime-v2.env"),
@@ -370,9 +373,15 @@ class ProductionDeployment:
     deployment_attestation_path: Path
     deployment_attestation_sha256: str
     deployment_attestation_identity: tuple[int, ...]
-    digest_override_path: Path
-    digest_override_sha256: str
-    digest_override_identity: tuple[int, ...]
+    common_digest_override_path: Path
+    common_digest_override_sha256: str
+    common_digest_override_identity: tuple[int, ...]
+    gateway_digest_override_path: Path
+    gateway_digest_override_sha256: str
+    gateway_digest_override_identity: tuple[int, ...]
+    provider_policy_path: Path
+    owner_secret_file_path: Path
+    deployment_admission_receipt_path: Path
     release_revision: str
     payload_revision: str
     provenance_manifest_sha256: str
@@ -393,12 +402,20 @@ class ProductionDeployment:
 
     @property
     def compose_files(self) -> tuple[Path, ...]:
-        return (*PRODUCTION_COMPOSE_FILES, self.digest_override_path)
+        return (*PRODUCTION_COMPOSE_FILES, self.common_digest_override_path)
+
+    @property
+    def gateway_compose_files(self) -> tuple[Path, ...]:
+        return (
+            PRODUCTION_GATEWAY_COMPOSE_FILE,
+            self.gateway_digest_override_path,
+        )
 
     def evidence(self) -> dict[str, Any]:
         return {
             "deployment_attestation_sha256": self.deployment_attestation_sha256,
-            "digest_override_sha256": self.digest_override_sha256,
+            "common_digest_override_sha256": self.common_digest_override_sha256,
+            "gateway_digest_override_sha256": self.gateway_digest_override_sha256,
             "release_revision": self.release_revision,
             "payload_revision": self.payload_revision,
             "provenance_manifest_sha256": self.provenance_manifest_sha256,
@@ -594,8 +611,12 @@ admission = runpy.run_path(
     sys.argv[1], run_name="_whoscored_capacity_production_admission"
 )
 root = Path(sys.argv[2])
-override = Path(sys.argv[6])
-env_files = tuple(Path(value) for value in sys.argv[7:])
+common_override = Path(sys.argv[6])
+gateway_override = Path(sys.argv[7])
+provider_policy_path = Path(sys.argv[8])
+owner_secret_path = Path(sys.argv[9])
+deployment_admission_receipt_path = Path(sys.argv[10])
+env_files = tuple(Path(value) for value in sys.argv[11:])
 if len(env_files) != 3 or len(set(env_files)) != 3:
     raise RuntimeError("capacity admission requires exactly three environment files")
 admission["_assert_canonical_release"](root)
@@ -605,31 +626,51 @@ evidence = admission["validate_bindings_with_evidence"](
     manifest_path=Path(sys.argv[4]),
     deployment_attestation_path=Path(sys.argv[5]),
 )
-override_raw, override_identity = admission["verify_override_snapshot"](
-    override, evidence.bindings
+common_override_raw, common_override_identity = admission["verify_override_snapshot"](
+    common_override, evidence.bindings, admission["COMMON_PROTECTED_SERVICES"]
 )
+gateway_override_raw, gateway_override_identity = admission["verify_override_snapshot"](
+    gateway_override, evidence.bindings, admission["GATEWAY_PROTECTED_SERVICES"]
+)
+provider_policy = admission["validate_provider_policy"](
+    provider_policy_path, owner_secret_path=owner_secret_path
+)
+deployment_admission_receipt = admission[
+    "validate_deployment_admission_receipt"
+](
+    deployment_admission_receipt_path,
+    deployment_attestation_path=Path(sys.argv[5]),
+    provider_policy=provider_policy,
+)
+provider_authority = {
+    **provider_policy,
+    "provider_policy_sha256": provider_policy["document_sha256"],
+}
 protected_inputs = admission["_assert_protected_compose_inputs"](
     (
         root / "compose.yaml",
         root / "compose.seaweedfs-supervised.yaml",
-        override,
+        root / "deploy/whoscored/gateway.compose.yaml",
+        common_override,
+        gateway_override,
         *env_files,
     )
 )
 projections, config_hashes, config_files, _rendered = admission[
-    "render_attested_compose"
+    "render_attested_projects"
 ](
     evidence.bindings,
     root=root,
-    override_path=override,
+    common_override_path=common_override,
+    gateway_override_path=gateway_override,
     env_files=env_files,
-    project="data-platform",
+    provider_authority=provider_authority,
     runner=admission["_run_docker"],
     protected_inputs=protected_inputs,
 )
 running_admission = admission["verify_created_containers"](
     evidence.bindings,
-    project="data-platform",
+    project=admission["_SERVICE_PROJECT"],
     selected_services=("airflow-scheduler", "flaresolverr"),
     projections=projections,
     config_hashes=config_hashes,
@@ -651,8 +692,12 @@ document = {
     "deployment_attestation_sha256": hashlib.sha256(
         evidence.deployment_attestation_raw
     ).hexdigest(),
-    "digest_override_identity": list(override_identity),
-    "digest_override_sha256": hashlib.sha256(override_raw).hexdigest(),
+    "common_digest_override_identity": list(common_override_identity),
+    "common_digest_override_sha256": hashlib.sha256(common_override_raw).hexdigest(),
+    "gateway_digest_override_identity": list(gateway_override_identity),
+    "gateway_digest_override_sha256": hashlib.sha256(gateway_override_raw).hexdigest(),
+    "deployment_admission_receipt": deployment_admission_receipt,
+    "provider_policy": provider_policy,
     "protected_bindings": dict(evidence.bindings),
     "protected_config_hashes": dict(config_hashes),
     "protected_payload_image_ids": {
@@ -670,31 +715,59 @@ sys.stdout.write(json.dumps(document, sort_keys=True, separators=(",", ":")))
 
 
 def _validate_production_deployment(args: argparse.Namespace) -> ProductionDeployment:
-    """Validate ready-v1 provenance and its exact digest-only Compose override."""
+    """Validate ready-v1 provenance and both exact Compose projects."""
 
     deployment_attestation = _absolute_evidence_path(
         getattr(args, "deployment_attestation", None),
         label="deployment attestation",
     )
-    digest_override = _absolute_evidence_path(
-        getattr(args, "digest_override", None),
-        label="digest override",
+    common_digest_override = _absolute_evidence_path(
+        getattr(args, "common_digest_override", None),
+        label="common digest override",
+    )
+    gateway_digest_override = _absolute_evidence_path(
+        getattr(args, "gateway_digest_override", None),
+        label="gateway digest override",
+    )
+    provider_policy = _absolute_evidence_path(
+        getattr(args, "provider_policy", None),
+        label="provider policy",
+    )
+    owner_secret_file = _absolute_evidence_path(
+        getattr(args, "owner_secret_file", None),
+        label="provider-policy owner key",
+    )
+    deployment_admission_receipt = _absolute_evidence_path(
+        getattr(args, "deployment_admission_receipt", None),
+        label="deployment admission receipt",
     )
     input_specs = (
         ("build-attestation", PRODUCTION_BUILD_ATTESTATION, False),
         ("build-manifest", PRODUCTION_BUILD_MANIFEST, False),
         ("deployment-attestation", deployment_attestation, True),
+        ("compose:compose.yaml", PRODUCTION_COMPOSE_FILES[0], False),
+        (
+            "compose:compose.seaweedfs-supervised.yaml",
+            PRODUCTION_COMPOSE_FILES[1],
+            False,
+        ),
+        (
+            "compose:gateway.compose.yaml",
+            PRODUCTION_GATEWAY_COMPOSE_FILE,
+            False,
+        ),
+        ("common-digest-override", common_digest_override, True),
+        ("gateway-digest-override", gateway_digest_override, True),
+        ("provider-policy", provider_policy, True),
+        ("provider-policy-owner-key", owner_secret_file, True),
+        (
+            "deployment-admission-receipt",
+            deployment_admission_receipt,
+            True,
+        ),
         *(
-            (
-                f"compose:{path.name}",
-                path,
-                path == digest_override or path in PRODUCTION_COMPOSE_ENV_FILES,
-            )
-            for path in (
-                *PRODUCTION_COMPOSE_FILES,
-                digest_override,
-                *PRODUCTION_COMPOSE_ENV_FILES,
-            )
+            (f"compose-env:{index}", path, True)
+            for index, path in enumerate(PRODUCTION_COMPOSE_ENV_FILES)
         ),
     )
     if (
@@ -717,7 +790,11 @@ def _validate_production_deployment(args: argparse.Namespace) -> ProductionDeplo
         str(PRODUCTION_BUILD_ATTESTATION),
         str(PRODUCTION_BUILD_MANIFEST),
         str(deployment_attestation),
-        str(digest_override),
+        str(common_digest_override),
+        str(gateway_digest_override),
+        str(provider_policy),
+        str(owner_secret_file),
+        str(deployment_admission_receipt),
         *(str(path) for path in PRODUCTION_COMPOSE_ENV_FILES),
     ]
     environment = {
@@ -756,8 +833,12 @@ def _validate_production_deployment(args: argparse.Namespace) -> ProductionDeplo
         "build_manifest_sha256",
         "deployment_attestation_identity",
         "deployment_attestation_sha256",
-        "digest_override_identity",
-        "digest_override_sha256",
+        "common_digest_override_identity",
+        "common_digest_override_sha256",
+        "gateway_digest_override_identity",
+        "gateway_digest_override_sha256",
+        "deployment_admission_receipt",
+        "provider_policy",
         "protected_bindings",
         "protected_config_hashes",
         "protected_payload_image_ids",
@@ -808,9 +889,14 @@ def _validate_production_deployment(args: argparse.Namespace) -> ProductionDeplo
             "deployment_attestation_sha256",
         ),
         (
-            f"compose:{digest_override.name}",
-            "digest_override_identity",
-            "digest_override_sha256",
+            "common-digest-override",
+            "common_digest_override_identity",
+            "common_digest_override_sha256",
+        ),
+        (
+            "gateway-digest-override",
+            "gateway_digest_override_identity",
+            "gateway_digest_override_sha256",
         ),
     )
     for label, identity_field, digest_field in bridge_snapshots:
@@ -823,11 +909,16 @@ def _validate_production_deployment(args: argparse.Namespace) -> ProductionDeplo
                 "ready-v1 validated bytes differ from the admitted snapshot"
             )
     deployment_sha256 = document.get("deployment_attestation_sha256")
-    override_sha256 = document.get("digest_override_sha256")
+    common_override_sha256 = document.get("common_digest_override_sha256")
+    gateway_override_sha256 = document.get("gateway_digest_override_sha256")
     protected_bindings = document.get("protected_bindings")
     protected_payloads = document.get("protected_payload_image_ids")
     protected_config_hashes = document.get("protected_config_hashes")
     running_admission = document.get("running_admission")
+    provider_policy_projection = document.get("provider_policy")
+    deployment_admission_projection = document.get(
+        "deployment_admission_receipt"
+    )
     release_revision = document.get("release_revision")
     payload_revision = document.get("payload_revision")
     manifest_sha256 = document.get("provenance_manifest_sha256")
@@ -835,8 +926,10 @@ def _validate_production_deployment(args: argparse.Namespace) -> ProductionDeplo
     if (
         not isinstance(deployment_sha256, str)
         or re.fullmatch(r"[0-9a-f]{64}", deployment_sha256) is None
-        or not isinstance(override_sha256, str)
-        or re.fullmatch(r"[0-9a-f]{64}", override_sha256) is None
+        or not isinstance(common_override_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", common_override_sha256) is None
+        or not isinstance(gateway_override_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", gateway_override_sha256) is None
         or not isinstance(release_revision, str)
         or re.fullmatch(r"[0-9a-f]{40}", release_revision) is None
         or not isinstance(payload_revision, str)
@@ -846,6 +939,23 @@ def _validate_production_deployment(args: argparse.Namespace) -> ProductionDeplo
         or not isinstance(source_tree_sha256, str)
         or re.fullmatch(r"[0-9a-f]{64}", source_tree_sha256) is None
         or manifest_sha256 != snapshots_by_label["build-manifest"].sha256
+        or not isinstance(provider_policy_projection, dict)
+        or provider_policy_projection.get("policy_path") != str(provider_policy)
+        or not isinstance(
+            provider_policy_projection.get("document_sha256"), str
+        )
+        or re.fullmatch(
+            r"[0-9a-f]{64}",
+            str(provider_policy_projection.get("document_sha256")),
+        )
+        is None
+        or deployment_admission_projection
+        != {
+            "path": str(deployment_admission_receipt),
+            "sha256": snapshots_by_label[
+                "deployment-admission-receipt"
+            ].sha256,
+        }
     ):
         raise RuntimeError("ready-v1 deployment validation returned invalid bindings")
     protected_set = set(PROTECTED_PRODUCTION_SERVICES)
@@ -878,14 +988,22 @@ def _validate_production_deployment(args: argparse.Namespace) -> ProductionDeplo
             "docker_security_options",
             "images",
             "networks",
-            "project",
+            "projects",
             "schema_version",
             "status",
             "volumes",
         }
-        or running_admission.get("schema_version") != 1
+        or running_admission.get("schema_version") != 2
         or running_admission.get("status") != "admitted-running-v1"
-        or running_admission.get("project") != REQUIRED_COMPOSE_PROJECT
+        or running_admission.get("projects")
+        != {
+            "data-platform": ["airflow-scheduler", "flaresolverr"],
+            "whoscored-gw": [
+                "flaresolverr_whoscored_paid",
+                "whoscored_paid_gateway",
+                "whoscored_proxy_filter",
+            ],
+        }
         or running_admission.get("apparmor_profile")
         != "docker-default (enforce)"
         or not isinstance(running_admission.get("docker_security_options"), list)
@@ -919,11 +1037,19 @@ def _validate_production_deployment(args: argparse.Namespace) -> ProductionDeplo
         deployment_attestation_identity=snapshots_by_label[
             "deployment-attestation"
         ].identity,
-        digest_override_path=digest_override,
-        digest_override_sha256=override_sha256,
-        digest_override_identity=snapshots_by_label[
-            f"compose:{digest_override.name}"
+        common_digest_override_path=common_digest_override,
+        common_digest_override_sha256=common_override_sha256,
+        common_digest_override_identity=snapshots_by_label[
+            "common-digest-override"
         ].identity,
+        gateway_digest_override_path=gateway_digest_override,
+        gateway_digest_override_sha256=gateway_override_sha256,
+        gateway_digest_override_identity=snapshots_by_label[
+            "gateway-digest-override"
+        ].identity,
+        provider_policy_path=provider_policy,
+        owner_secret_file_path=owner_secret_file,
+        deployment_admission_receipt_path=deployment_admission_receipt,
         release_revision=release_revision,
         payload_revision=payload_revision,
         provenance_manifest_sha256=manifest_sha256,
@@ -2747,20 +2873,25 @@ def _resolved_flaresolverr_compose_hash(
     input_paths = (*deployment.compose_files, *PRODUCTION_COMPOSE_ENV_FILES)
     if len(input_paths) != len(set(input_paths)):
         raise RuntimeError("production Compose inputs are duplicated")
-    private_paths = {
-        deployment.digest_override_path,
-        *PRODUCTION_COMPOSE_ENV_FILES,
+    admitted_by_path = {
+        snapshot.path: snapshot for snapshot in deployment.protected_inputs
     }
     snapshots = {
         path: _protected_input_snapshot(
             path,
-            label=f"compose:{path.name}",
-            private=path in private_paths,
+            label=(
+                admitted_by_path[path].label
+                if path in admitted_by_path
+                else f"compose:{path.name}"
+            ),
+            private=(
+                admitted_by_path[path].private
+                if path in admitted_by_path
+                else path == deployment.common_digest_override_path
+                or path in PRODUCTION_COMPOSE_ENV_FILES
+            ),
         )
         for path in input_paths
-    }
-    admitted_by_path = {
-        snapshot.path: snapshot for snapshot in deployment.protected_inputs
     }
     if any(
         admitted_by_path.get(path) != snapshot
@@ -2771,10 +2902,11 @@ def _resolved_flaresolverr_compose_hash(
         "compose",
         "--project-name",
         REQUIRED_COMPOSE_PROJECT,
+        "--project-directory",
+        str(REPO_ROOT),
     ]
     for environment_file in PRODUCTION_COMPOSE_ENV_FILES:
         arguments.extend(("--env-file", str(environment_file)))
-    arguments.extend(("--profile", "whoscored-paid"))
     for config_file in deployment.compose_files:
         arguments.extend(("--file", str(config_file)))
     arguments.extend(("config", "--hash", "flaresolverr"))
@@ -2782,8 +2914,8 @@ def _resolved_flaresolverr_compose_hash(
     for path, expected in snapshots.items():
         if _protected_input_snapshot(
             path,
-            label=f"compose:{path.name}",
-            private=path in private_paths,
+            label=expected.label,
+            private=expected.private,
         ) != expected:
             raise RuntimeError("production Compose input changed during render")
     fields = result.stdout.strip().split()
@@ -4925,17 +5057,40 @@ def _runtime_identity(
         hashes[label] = hashlib.sha256(payload).hexdigest()
     deployment_evidence: Optional[dict[str, Any]] = None
     if deployment is not None:
-        if (
+        expected_argument_paths = (
+            (
+                "deployment_attestation",
+                "deployment attestation",
+                deployment.deployment_attestation_path,
+            ),
+            (
+                "common_digest_override",
+                "common digest override",
+                deployment.common_digest_override_path,
+            ),
+            (
+                "gateway_digest_override",
+                "gateway digest override",
+                deployment.gateway_digest_override_path,
+            ),
+            ("provider_policy", "provider policy", deployment.provider_policy_path),
+            (
+                "owner_secret_file",
+                "provider-policy owner key",
+                deployment.owner_secret_file_path,
+            ),
+            (
+                "deployment_admission_receipt",
+                "deployment admission receipt",
+                deployment.deployment_admission_receipt_path,
+            ),
+        )
+        if any(
             _absolute_evidence_path(
-                getattr(args, "deployment_attestation", None),
-                label="deployment attestation",
+                getattr(args, argument, None), label=label
             )
-            != deployment.deployment_attestation_path
-            or _absolute_evidence_path(
-                getattr(args, "digest_override", None),
-                label="digest override",
-            )
-            != deployment.digest_override_path
+            != expected
+            for argument, label, expected in expected_argument_paths
         ):
             raise RuntimeError("production deployment evidence path changed")
         labels = [snapshot.label for snapshot in deployment.protected_inputs]
@@ -5101,14 +5256,33 @@ def _validate_args(args: argparse.Namespace) -> Optional[str]:
             getattr(args, "deployment_attestation", None),
             label="deployment attestation",
         )
-        digest_override = _absolute_evidence_path(
-            getattr(args, "digest_override", None),
-            label="digest override",
+        evidence_paths = (
+            deployment_attestation,
+            _absolute_evidence_path(
+                getattr(args, "common_digest_override", None),
+                label="common digest override",
+            ),
+            _absolute_evidence_path(
+                getattr(args, "gateway_digest_override", None),
+                label="gateway digest override",
+            ),
+            _absolute_evidence_path(
+                getattr(args, "provider_policy", None),
+                label="provider policy",
+            ),
+            _absolute_evidence_path(
+                getattr(args, "owner_secret_file", None),
+                label="provider-policy owner key",
+            ),
+            _absolute_evidence_path(
+                getattr(args, "deployment_admission_receipt", None),
+                label="deployment admission receipt",
+            ),
         )
     except (TypeError, ValueError) as exc:
         return str(exc)
-    if deployment_attestation == digest_override:
-        return "deployment attestation and digest override must be different files"
+    if len(evidence_paths) != len(set(evidence_paths)):
+        return "production deployment evidence files must be distinct"
     output = getattr(args, "output", None)
     if output is not None:
         target = Path(output)
@@ -6061,10 +6235,34 @@ def _parser() -> argparse.ArgumentParser:
         help="root-owned ready-v1 deployment attestation used by admission",
     )
     parser.add_argument(
-        "--digest-override",
+        "--common-digest-override",
         type=Path,
         required=True,
-        help="root-owned digest-only third Compose file used by admission",
+        help="root-owned common-project digest-only Compose file",
+    )
+    parser.add_argument(
+        "--gateway-digest-override",
+        type=Path,
+        required=True,
+        help="root-owned gateway-project digest-only Compose file",
+    )
+    parser.add_argument(
+        "--provider-policy",
+        type=Path,
+        required=True,
+        help="active owner-signed provider-policy-v1 admitted at deployment",
+    )
+    parser.add_argument(
+        "--owner-secret-file",
+        type=Path,
+        required=True,
+        help="root-owned HMAC key used only by isolated admission validation",
+    )
+    parser.add_argument(
+        "--deployment-admission-receipt",
+        type=Path,
+        required=True,
+        help="root-owned schema-v2 deploy-time rendered admission receipt",
     )
     parser.add_argument(
         "--output",

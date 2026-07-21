@@ -14,22 +14,24 @@ Airflow orchestration, historical replay, proxy policy, DQ and recovery.
   candidates plus the versioned source-ID override disposition. Any unresolved
   candidate blocks catalog publication; an empty candidate list is itself
   immutable, reproducible evidence rather than an undocumented assertion.
-- Scheduled daily and historical Airflow runs are structurally `direct_only`.
-  Only the paused manual `dag_canary_whoscored_proxy` may select
-  `direct_then_paid`, and only with an exact signed canary approval pinned by ID
-  and SHA-256. A boolean, environment scalar or the removed
-  `--allow-paid-proxy` flag cannot enable paid traffic. Every canary request
-  remains raw-cache first and direct first; the paid route is available only
-  after authoritative Cloudflare evidence and a fresh direct recheck.
-- The canary's two code-owned invoice-boundary and application-gateway
-  sentinels are enabled only for its exact decimal `1_000_000_000`-byte
-  contract. Execution additionally requires the admitted `ready-v1` release,
-  fresh active order-38950 quota receipt, exact signed approval, active
-  gateway-authenticated campaign and gateway-owned alert proof. The filtering
-  proxy independently caps the lifetime of the initialized provider-order
-  state at `850 MiB` across every campaign, UTC rollover and restart. The
-  independent `WHOSCORED_FULL_PAID_CRAWL_AVAILABLE=False` sentinel keeps normal
-  paid ingest and backfill unavailable regardless of canary evidence.
+- A scheduled `dag_ingest_whoscored` run may select `direct_then_paid` only from
+  an issuer-published pointer bound to its exact run ID, approval ID and
+  approval SHA-256; scheduled DagRun conf must be exactly empty. In required
+  mode a missing or mismatched pointer fails before source work. A manual
+  canary still requires its exact signed approval. Historical backfill remains
+  `direct_only` because `WHOSCORED_FULL_PAID_CRAWL_AVAILABLE=False`; booleans,
+  environment scalars and the removed `--allow-paid-proxy` flag cannot open it.
+  Every paid-capable request remains raw-cache first and direct first; paid
+  routing follows only authoritative Cloudflare evidence and a fresh direct
+  recheck.
+- Daily ingest and measurement canary admission use separate code-owned gates.
+  Execution additionally requires the admitted `ready-v1` release, a fresh
+  active provider-quota receipt, exact signed authority, an active
+  gateway-authenticated campaign and gateway-owned alert proof. Independently
+  of the provider quota and all signed caps, the filtering proxy enforces an
+  exact `300000000` decimal-byte lifetime hard cap for the initialized
+  provider-order state across every campaign, UTC rollover and restart. The
+  full-crawl sentinel remains false, so no paid backfill lease can be issued.
 - Raw source observations are append-only. A successful receipt is published
   only after final-object readback; quarantine invalidates the exact failed
   observation and cannot hide a concurrent healthy writer.
@@ -37,8 +39,11 @@ Airflow orchestration, historical replay, proxy policy, DQ and recovery.
   `queue_id + plan_id`. One DagRun maps at most 100 work items and schedules an
   idempotent continuation until the plan and historical DQ are complete.
 - Daily publication is successful only after dataset/manifests DQ and the
-  zero-paid traffic gate. Backfill success additionally requires historical DQ
-  over all 25 business datasets, exact parser/availability proofs and roster to
+  run's immutable transport gate: a direct-only run requires zero paid bytes,
+  while scheduled paid ingest requires exact approval/gateway/filter-ledger
+  reconciliation and must stay within every signed and code-owned cap.
+  Backfill success additionally requires zero paid bytes, historical DQ over
+  all 25 business datasets, exact parser/availability proofs and roster to
   profile coverage.
 - Daily profile work freezes the exact missing/due-retry/version-stale player
   set after roster ingestion. Its count and SHA-256 are verified again before
@@ -81,9 +86,9 @@ Airflow orchestration, historical replay, proxy policy, DQ and recovery.
 | Backfill checkpoints | Recovery materialized the cumulative receipt history and latest-state lookup grew with generations | Checkpoint v3 keeps a compact frontier snapshot plus at most 63 bounded deltas, a <=64 KiB index, and a 12-level radix lookup; full receipts are materialized only for terminal DQ/recovery |
 | Backfill capacity | Every match was charged for a preview and the configured requests/day value could exceed neither a throttle nor a proven source ceiling | Policy v6 charges exact match plus frozen preview identities; the hard ceiling is always `source slots * 30 * 1,440` (86,400..172,800), reports observed wall-clock throughput, and stops before the next source batch on breach |
 | Daily profiles | Limit estimated as roster/90, so a first run, outage or parser bump could scrape only a prefix and then fail full-coverage DQ | One exact shared candidate predicate; count/set hash pinned through planner, CLI report and DQ; complete repair or pre-source hard-cap failure |
-| Proxy use | Manual/default behavior could select the paid endpoint implicitly | Direct-only by default; only the small signed measurement canary is code-enabled through the quota receipt, authenticated gateway and durable 850 MiB safety cap; every full-crawl paid lease remains code-disabled |
+| Proxy use | Manual/default behavior could select the paid endpoint implicitly | Direct-only by default; scheduled daily ingest requires an exact issuer pointer and the manual measurement canary requires exact signed authority. Both remain behind the quota receipt, authenticated gateway and exact `300000000` decimal-byte provider-order lifetime cap; every paid backfill lease remains code-disabled |
 | Source block handling | Independent workers could retry the same block and browser batches could start together | One fixed process-global 546 ms actual-start governor plus a persistent 15/30/60-minute shared cooldown and one half-open probe; expected origin masks and ordinary 502/timeouts never authorize paid traffic |
-| DQ | Primarily task success and partial current-run checks | Snapshot-pinned frozen scope/match/profile identities, exact stage/feed proof, owner-level parity across 25 datasets, NULL-identity duplicate sentinels, parser/availability proof, profile terminal proof and zero-paid gates; the complete historical read is 33 cardinality-invariant queries |
+| DQ | Primarily task success and partial current-run checks | Snapshot-pinned frozen scope/match/profile identities, exact stage/feed proof, owner-level parity across 25 datasets, NULL-identity duplicate sentinels, parser/availability proof, profile terminal proof and transport reconciliation (zero-paid for direct/backfill, exact authorized bytes for scheduled paid ingest); the complete historical read is 33 cardinality-invariant queries |
 | Iceberg failure handling | Metadata corruption repair could drop/recreate a table; maintenance could return green with partial failures and had no safe live-file compaction | Corruption and partial maintenance fail closed; delete-safe exact-path compaction is bounded to 64 files/512 MiB per table and 4 tables/2 GiB per task; effective retention is 30d weekly, 14d daily for WhoScored and 3d for other high-churn feeds |
 
 ## Deployment prerequisites
@@ -204,16 +209,15 @@ ADMISSION_PYTHON=(
      config --quiet
    ```
 
-5. Leave `WHOSCORED_PROXY_APPROVAL_PATH` empty for ordinary direct-only
-   deployment. The two enabled code-owned sentinels cover only the exact
-   measurement-canary contract; they do not authorize a rollout. Only after
-   admission accepts the exact schema-v1 `ready-v1` deployment attestation, the
-   fresh order-38950 provider receipt and every protected service may one
-   reviewed canary set it to the exact in-container path
-   `/opt/airflow/secure/whoscored-approvals/<approval_id>.json`. Install that
-   file under `WHOSCORED_PROXY_APPROVAL_HOST_DIR` as UID `50000`, mode `0600`;
-   Compose mounts the directory read-only into `airflow-scheduler` alone. Never
-   use a mutable `current` symlink or expose the signing workspace to Airflow.
+5. Do not project a static approval selector into the scheduler. Configure only
+   `WHOSCORED_PROXY_APPROVAL_ROOT`, the read-only scheduled-pointer root and
+   `WHOSCORED_SCHEDULED_PAID_MODE=required`. A manual run pins its approval ID
+   and SHA-256 in `DagRun.conf`; a scheduled run resolves the immutable
+   run-ID-keyed pointer. Missing or invalid pointers fail closed. Install
+   approvals and pointers under their distinct host directories as UID `50000`,
+   mode `0600`; Compose mounts both directories read-only into
+   `airflow-scheduler` alone. Never use a mutable `current` symlink or expose
+   the signing workspace to Airflow.
    The scheduler performs structural approval checks and receives no approval
    HMAC, campaign-ledger HMAC, filter control token or paid-alert authority.
    `whoscored_proxy_filter` alone mounts
@@ -229,8 +233,9 @@ ADMISSION_PYTHON=(
    application import, forced process recreation and the in-memory paid
    FlareSolverr extension-hash attestation. Hashing a current on-disk tree after
    older modules were loaded is not sufficient provenance. The independent
-   `WHOSCORED_FULL_PAID_CRAWL_AVAILABLE=False` sentinel keeps normal paid ingest
-   and backfill unavailable.
+   `WHOSCORED_FULL_PAID_CRAWL_AVAILABLE=False` sentinel keeps paid historical
+   backfill unavailable; scheduled daily ingest remains behind its separate
+   code-owned gate and exact issuer pointer.
 
 The data volume and single `weed mini` storage core remain in scope, but an old
 pre-isolation container identity cannot be left running with this release. The
@@ -807,14 +812,19 @@ umask 077
 
 export WHOSCORED_DEPLOYMENT_ATTESTATION=/absolute/protected/deployment-attestation.json
 export WHOSCORED_PROVIDER_QUOTA_RECEIPT=/absolute/protected/provider-quota-receipt.json
+export WHOSCORED_PROVIDER_POLICY=/absolute/protected/provider-policy.json
+export WHOSCORED_OWNER_SECRET=/absolute/protected/owner-hmac
 test "$WHOSCORED_DEPLOYMENT_ATTESTATION" = \
   "$(/usr/bin/realpath -e -- "$WHOSCORED_DEPLOYMENT_ATTESTATION")"
-test "$WHOSCORED_PROVIDER_QUOTA_RECEIPT" = \
-  "$(/usr/bin/realpath -e -- "$WHOSCORED_PROVIDER_QUOTA_RECEIPT")"
+for file in "$WHOSCORED_PROVIDER_QUOTA_RECEIPT" \
+  "$WHOSCORED_PROVIDER_POLICY" "$WHOSCORED_OWNER_SECRET"; do
+  test "$file" = "$(/usr/bin/realpath -e -- "$file")"
+done
 export WHOSCORED_ADMISSION_DIR="/absolute/protected/admission-$(/usr/bin/date -u +%Y%m%dT%H%M%SZ)"
 test ! -e "$WHOSCORED_ADMISSION_DIR"
 /usr/bin/install -d -o root -g root -m 0700 "$WHOSCORED_ADMISSION_DIR"
-export WHOSCORED_DIGEST_OVERRIDE="$WHOSCORED_ADMISSION_DIR/digest-only.yaml"
+export WHOSCORED_COMMON_DIGEST_OVERRIDE="$WHOSCORED_ADMISSION_DIR/common-digest-only.yaml"
+export WHOSCORED_GATEWAY_DIGEST_OVERRIDE="$WHOSCORED_ADMISSION_DIR/gateway-digest-only.yaml"
 export WHOSCORED_RENDERED_COMPOSE="$WHOSCORED_ADMISSION_DIR/rendered-compose.json"
 
 "${ADMISSION_PYTHON[@]}" \
@@ -827,13 +837,14 @@ export WHOSCORED_RENDERED_COMPOSE="$WHOSCORED_ADMISSION_DIR/rendered-compose.jso
   "$RELEASE/scripts/whoscored_production_admission.py" generate-override \
   --root "$RELEASE" \
   --deployment-attestation "$WHOSCORED_DEPLOYMENT_ATTESTATION" \
-  --output "$WHOSCORED_DIGEST_OVERRIDE" \
+  --common-output "$WHOSCORED_COMMON_DIGEST_OVERRIDE" \
+  --gateway-output "$WHOSCORED_GATEWAY_DIGEST_OVERRIDE" \
   > "$WHOSCORED_ADMISSION_DIR/override-receipt.json"
 ```
 
-The generated file contains exactly `airflow-scheduler`, `flaresolverr`,
-`flaresolverr_whoscored_paid`, `whoscored_paid_gateway`, and
-`whoscored_proxy_filter`. Every `image` is the attested
+The common override contains exactly `airflow-scheduler` and `flaresolverr`;
+the gateway override contains exactly `flaresolverr_whoscored_paid`,
+`whoscored_paid_gateway`, and `whoscored_proxy_filter`. Every `image` is the attested
 `repository@sha256:<64 hex>` value and every inherited local `build` is removed
 with Compose 2.24.4+ `!reset`. The helper rejects an existing output of any
 kind and publishes the mode-0600 file without following symlinks. Mutable local
@@ -842,34 +853,37 @@ tags are not admission evidence.
 The admission helper, not a caller-provided render, now invokes
 `/usr/bin/docker compose config --format json` and `config --hash` for each
 protected service. It fixes the project, profile, environment-file order and
-the exact base, supervised and digest-only file order. Do not append another
+the exact common and gateway digest-only file orders. Do not append another
 Compose file or set a Docker/Compose control variable. The protected canonical
 provider receipt must bind a fresh root-owned screenshot, its SHA-256 and
-mtime, PROXYS.IO order 38950, Bronze, active status, and exact decimal
-quota/remaining values of 1.00 GB without containing proxy credentials. The
-helper publishes a new mode-0600 rendered model only after all five protected
-services and that external evidence pass:
+mtime. The owner-signed provider policy binds that exact receipt digest,
+provider/order/plan identity and the decimal-byte daily, monthly, order, safety
+and quota caps. The filter environment must match the signed order, policy
+digest and daily cap exactly. The helper publishes a new mode-0600 two-project
+rendered model only after all five protected services and that external
+evidence pass:
 
 ```bash
 "${ADMISSION_PYTHON[@]}" \
   "$RELEASE/scripts/whoscored_production_admission.py" verify-rendered \
   --root "$RELEASE" \
   --deployment-attestation "$WHOSCORED_DEPLOYMENT_ATTESTATION" \
-  --override "$WHOSCORED_DIGEST_OVERRIDE" \
+  --common-override "$WHOSCORED_COMMON_DIGEST_OVERRIDE" \
+  --gateway-override "$WHOSCORED_GATEWAY_DIGEST_OVERRIDE" \
   --env-file "$COMPOSE_ENV_FILE" \
   --env-file "$WHOSCORED_ENV_FILE" \
   --env-file "$PROXY_POOL_ENV_FILE" \
-  --project data-platform \
+  --provider-policy "$WHOSCORED_PROVIDER_POLICY" \
+  --owner-secret-file "$WHOSCORED_OWNER_SECRET" \
   --provider-quota-receipt "$WHOSCORED_PROVIDER_QUOTA_RECEIPT" \
   --output "$WHOSCORED_RENDERED_COMPOSE" \
   > "$WHOSCORED_ADMISSION_DIR/rendered-receipt.json"
 
 # These are the only lifecycle command prefixes permitted after admission.
 # Both are intentionally independent of the caller environment. COMPOSE
-# repeats the exact helper-owned model for create-without-start. DOCKER starts
-# only the already admitted container ID, without traversing Compose
-# dependencies. The whoscored-paid profile renders the protected proxy; it
-# does not authorize creating or starting it.
+# repeats each exact helper-owned project model for create-without-start.
+# DOCKER starts only the already admitted container ID, without traversing
+# Compose dependencies.
 DOCKER=(
   /usr/bin/env -i
   HOME=/nonexistent PATH=/usr/bin:/bin
@@ -883,13 +897,26 @@ COMPOSE=(
   LANG=C.UTF-8 LC_ALL=C.UTF-8
   DOCKER_HOST=unix:///run/docker.sock
   /usr/bin/docker compose --project-name data-platform
+  --project-directory "$RELEASE"
   --env-file "$COMPOSE_ENV_FILE"
   --env-file "$WHOSCORED_ENV_FILE"
   --env-file "$PROXY_POOL_ENV_FILE"
-  --profile whoscored-paid
   --file "$RELEASE/compose.yaml"
   --file "$RELEASE/compose.seaweedfs-supervised.yaml"
-  --file "$WHOSCORED_DIGEST_OVERRIDE"
+  --file "$WHOSCORED_COMMON_DIGEST_OVERRIDE"
+)
+GATEWAY_COMPOSE=(
+  /usr/bin/env -i
+  HOME=/nonexistent PATH=/usr/bin:/bin
+  LANG=C.UTF-8 LC_ALL=C.UTF-8
+  DOCKER_HOST=unix:///run/docker.sock
+  /usr/bin/docker compose --project-name whoscored-gw
+  --project-directory "$RELEASE"
+  --env-file "$COMPOSE_ENV_FILE"
+  --env-file "$WHOSCORED_ENV_FILE"
+  --env-file "$PROXY_POOL_ENV_FILE"
+  --file "$RELEASE/deploy/whoscored/gateway.compose.yaml"
+  --file "$WHOSCORED_GATEWAY_DIGEST_OVERRIDE"
 )
 
 # Production requires Engine 23+ support for the explicit builtin seccomp
@@ -915,6 +942,79 @@ ephemeral probe from the already attested scheduler image digest with
 capabilities, no-new-privileges, builtin seccomp and `docker-default`. The exact
 `/proc/self/attr/current` result must be `docker-default (enforce)`; any probe
 failure or different output blocks admission.
+
+##### One-time split-project cutover
+
+The paid trio used to belong to `data-platform`. A gateway `up` cannot adopt
+those containers or their same-named networks. In one quiet window, first
+resolve the exact legacy containers by both project and service label. Stop and
+remove only those three containers plus the scheduler that still holds the old
+paid API network; never run shared-project `down` or `--remove-orphans`:
+
+```bash
+declare -A LEGACY_IDS
+for service in airflow-scheduler flaresolverr_whoscored_paid \
+  whoscored_paid_gateway whoscored_proxy_filter; do
+  mapfile -t ids < <("${DOCKER[@]}" container ls --all --no-trunc \
+    --filter label=com.docker.compose.project=data-platform \
+    --filter "label=com.docker.compose.service=$service" --format '{{.ID}}')
+  test "${#ids[@]}" = 1
+  test "$("${DOCKER[@]}" inspect --format \
+    '{{index .Config.Labels "com.docker.compose.service"}}' "${ids[0]}")" = \
+    "$service"
+  LEGACY_IDS["$service"]="${ids[0]}"
+done
+for service in airflow-scheduler flaresolverr_whoscored_paid \
+  whoscored_paid_gateway whoscored_proxy_filter; do
+  id="${LEGACY_IDS[$service]}"
+  if test "$("${DOCKER[@]}" inspect --format '{{.State.Running}}' "$id")" = true; then
+    "${DOCKER[@]}" stop --time 30 "$id"
+  fi
+  "${DOCKER[@]}" rm "$id"
+done
+for network in dp-whoscored-paid-api dp-whoscored-paid-browser \
+  dp-whoscored-paid-direct-egress dp-whoscored-paid-provider-egress; do
+  test "$("${DOCKER[@]}" network inspect --format \
+    '{{index .Labels "com.docker.compose.project"}}' "$network")" = data-platform
+  "${DOCKER[@]}" network rm "$network"
+done
+```
+
+Bootstrap only the stopped gateway container next. This creates the paid API
+network with `whoscored-gw` ownership so the common scheduler can be recreated;
+it does not spend traffic and must not be started until the filter and paid
+browser are healthy:
+
+```bash
+"${GATEWAY_COMPOSE[@]}" up --no-start --no-deps --no-build --pull always \
+  whoscored_paid_gateway
+"${ADMISSION_PYTHON[@]}" \
+  "$RELEASE/scripts/whoscored_production_admission.py" post-create \
+  --root "$RELEASE" \
+  --deployment-attestation "$WHOSCORED_DEPLOYMENT_ATTESTATION" \
+  --common-override "$WHOSCORED_COMMON_DIGEST_OVERRIDE" \
+  --gateway-override "$WHOSCORED_GATEWAY_DIGEST_OVERRIDE" \
+  --env-file "$COMPOSE_ENV_FILE" \
+  --env-file "$WHOSCORED_ENV_FILE" \
+  --env-file "$PROXY_POOL_ENV_FILE" \
+  --provider-policy "$WHOSCORED_PROVIDER_POLICY" \
+  --owner-secret-file "$WHOSCORED_OWNER_SECRET" \
+  --provider-quota-receipt "$WHOSCORED_PROVIDER_QUOTA_RECEIPT" \
+  --service whoscored_paid_gateway \
+  > "$WHOSCORED_ADMISSION_DIR/post-create-paid-gateway-receipt.json"
+PAID_GATEWAY_CONTAINER_ID=$(/usr/bin/jq -er '
+  [.images[] | select(.service == "whoscored_paid_gateway") | .container_id] |
+  select(length == 1) | .[0]
+' "$WHOSCORED_ADMISSION_DIR/post-create-paid-gateway-receipt.json")
+```
+
+If any cutover gate fails, leave the new state namespace untouched, remove only
+container IDs recorded in the new receipts, and remove only networks whose
+Compose project label is `whoscored-gw`. Re-run admission from the previous
+immutable release and its previous digest override, then recreate the four
+recorded legacy services with that release. Never delete either filter-state
+directory, any ledger, approval, pointer, SeaweedFS volume or another shared
+container during rollback.
 
 Only after those commands succeed may an approved operator capture the storage
 identity and create the scheduler without starting it. The fingerprint binds
@@ -953,11 +1053,13 @@ SEAWEED_BEFORE=$(/usr/bin/docker inspect seaweedfs | /usr/bin/jq -c '.[0] | {
   "$RELEASE/scripts/whoscored_production_admission.py" post-create \
   --root "$RELEASE" \
   --deployment-attestation "$WHOSCORED_DEPLOYMENT_ATTESTATION" \
-  --override "$WHOSCORED_DIGEST_OVERRIDE" \
+  --common-override "$WHOSCORED_COMMON_DIGEST_OVERRIDE" \
+  --gateway-override "$WHOSCORED_GATEWAY_DIGEST_OVERRIDE" \
   --env-file "$COMPOSE_ENV_FILE" \
   --env-file "$WHOSCORED_ENV_FILE" \
   --env-file "$PROXY_POOL_ENV_FILE" \
-  --project data-platform \
+  --provider-policy "$WHOSCORED_PROVIDER_POLICY" \
+  --owner-secret-file "$WHOSCORED_OWNER_SECRET" \
   --provider-quota-receipt "$WHOSCORED_PROVIDER_QUOTA_RECEIPT" \
   --service airflow-scheduler \
   > "$WHOSCORED_ADMISSION_DIR/post-create-scheduler-receipt.json"
@@ -998,11 +1100,13 @@ SEAWEED_BEFORE=$(/usr/bin/docker inspect seaweedfs | /usr/bin/jq -c '.[0] | {
   "$RELEASE/scripts/whoscored_production_admission.py" post-create \
   --root "$RELEASE" \
   --deployment-attestation "$WHOSCORED_DEPLOYMENT_ATTESTATION" \
-  --override "$WHOSCORED_DIGEST_OVERRIDE" \
+  --common-override "$WHOSCORED_COMMON_DIGEST_OVERRIDE" \
+  --gateway-override "$WHOSCORED_GATEWAY_DIGEST_OVERRIDE" \
   --env-file "$COMPOSE_ENV_FILE" \
   --env-file "$WHOSCORED_ENV_FILE" \
   --env-file "$PROXY_POOL_ENV_FILE" \
-  --project data-platform \
+  --provider-policy "$WHOSCORED_PROVIDER_POLICY" \
+  --owner-secret-file "$WHOSCORED_OWNER_SECRET" \
   --provider-quota-receipt "$WHOSCORED_PROVIDER_QUOTA_RECEIPT" \
   --service flaresolverr \
   > "$WHOSCORED_ADMISSION_DIR/post-create-flaresolverr-receipt.json"
@@ -1029,7 +1133,9 @@ Do not combine its receipt with the scheduler receipt.
 
 ##### Initialize the paid-filter state exactly once
 
-The paid filter never auto-creates authoritative state. Before
+The paid filter never auto-creates authoritative state. Every provider order
+and signed provider-policy digest gets a new empty host directory; never point a
+new order at counters from an older namespace. Before
 `verify-rendered`, provision the canonical host directory referenced by
 `WHOSCORED_PROXY_FILTER_STATE_HOST_DIR` as an empty root-owned `root:root`
 directory with mode `0770`; the gateway and alert-authority host directories
@@ -1046,10 +1152,18 @@ test "$(/usr/bin/id -u)" = 0
 : "${WHOSCORED_PROXY_FILTER_CONTROL_TOKEN:?inject the filter control token}"
 : "${WHOSCORED_PROXY_APPROVAL_HMAC_SECRET:?inject the approval HMAC}"
 : "${WHOSCORED_PROXY_LEDGER_HMAC_SECRET:?inject the ledger HMAC}"
+: "${WHOSCORED_PROVIDER_ORDER_ID:?set the exact admitted provider order}"
+: "${WHOSCORED_PROVIDER_POLICY_SHA256:?set the signed provider-policy digest}"
+: "${WHOSCORED_PROXY_FILTER_DAILY_BUDGET_BYTES:?set the exact policy daily cap}"
+: "${WHOSCORED_PROXY_FILTER_MAX_LEASE_BYTES:=2000000}"
 PROXY_FILTER_CONTROL_TOKEN="$WHOSCORED_PROXY_FILTER_CONTROL_TOKEN"
 export PROXY_FILTER_CONTROL_TOKEN \
   WHOSCORED_PROXY_APPROVAL_HMAC_SECRET \
-  WHOSCORED_PROXY_LEDGER_HMAC_SECRET
+  WHOSCORED_PROXY_LEDGER_HMAC_SECRET \
+  WHOSCORED_PROVIDER_ORDER_ID \
+  WHOSCORED_PROVIDER_POLICY_SHA256 \
+  WHOSCORED_PROXY_FILTER_DAILY_BUDGET_BYTES \
+  WHOSCORED_PROXY_FILTER_MAX_LEASE_BYTES
 
 STATE="$WHOSCORED_PROXY_FILTER_STATE_HOST_DIR"
 test "$STATE" = "$(/usr/bin/realpath -e -- "$STATE")"
@@ -1060,7 +1174,8 @@ FILTER_IMAGE="$(/usr/bin/jq -er \
   '.images[] | select(.service == "whoscored_proxy_filter") | .final_image' \
   "$WHOSCORED_DEPLOYMENT_ATTESTATION")"
 test "$FILTER_IMAGE" = "$(/usr/bin/jq -er \
-  '.services.whoscored_proxy_filter.image' "$WHOSCORED_RENDERED_COMPOSE")"
+  '.["whoscored-gw"].services.whoscored_proxy_filter.image' \
+  "$WHOSCORED_RENDERED_COMPOSE")"
 case "$FILTER_IMAGE" in
   *@sha256:????????????????????????????????????????????????????????????????) ;;
   *) echo 'filter image is not digest-qualified' >&2; exit 2 ;;
@@ -1078,6 +1193,10 @@ esac
   --env PROXY_FILTER_CONTROL_TOKEN \
   --env WHOSCORED_PROXY_APPROVAL_HMAC_SECRET \
   --env WHOSCORED_PROXY_LEDGER_HMAC_SECRET \
+  --env WHOSCORED_PROVIDER_ORDER_ID \
+  --env WHOSCORED_PROVIDER_POLICY_SHA256 \
+  --env WHOSCORED_PROXY_FILTER_DAILY_BUDGET_BYTES \
+  --env WHOSCORED_PROXY_FILTER_MAX_LEASE_BYTES \
   --env TM_PROXY_CONTROL_TOKEN= \
   --env PROXY_FILTER_ALLOW_FILE_FALLBACK=false \
   --mount "type=bind,src=$RELEASE/dags,dst=/opt/airflow/dags,readonly" \
@@ -1095,14 +1214,13 @@ esac
   --lease-proxy-url http://whoscored_proxy_filter:8900 \
   --blocklist /opt/airflow/configs/proxy_filter/blocklist.txt \
   --out /opt/airflow/state/whoscored-proxy-filter/bytes.json \
-  --daily-budget-mb 850 \
-  --max-lease-mb 2 \
+  --daily-budget-bytes "$WHOSCORED_PROXY_FILTER_DAILY_BUDGET_BYTES" \
+  --max-lease-bytes "$WHOSCORED_PROXY_FILTER_MAX_LEASE_BYTES" \
   --max-lease-ttl-seconds 3600 \
   --dagrun-budget-bytes 1000000000 \
   --transfermarkt-dagrun-budget-bytes 0 \
   --url-budget-bytes 2000000 \
   --max-active-leases 2 \
-  --sofascore-budget-artifact /opt/airflow/configs/sofascore/proxy_budget_canary.json \
   --sofascore-canary-hard-cap-bytes 0 \
   --sofascore-discovery-dagrun-budget-bytes 0 \
   --ledger /opt/airflow/state/whoscored-proxy-filter/paid_requests.jsonl \
@@ -1120,6 +1238,14 @@ for file in \
   test "$(/usr/bin/stat -c '%u:%g:%a' -- "$STATE/$file")" = '50000:0:600'
 done
 test ! -s "$STATE/paid_requests.jsonl"
+/usr/bin/jq -e \
+  --arg order "$WHOSCORED_PROVIDER_ORDER_ID" \
+  --arg policy "$WHOSCORED_PROVIDER_POLICY_SHA256" '
+    .schema_version == 2 and
+    .order_id == $order and
+    .provider_policy_sha256 == $policy and
+    (.state_id | test("^[0-9a-f]{64}$"))
+  ' "$STATE/.whoscored_state_initialized.json" >/dev/null
 ```
 
 The container has no network, ports, provider credential or proxy-pool input;
@@ -1130,23 +1256,137 @@ pre-existing state file and the service command contains no initialization
 flag. Never add that flag to Compose, use `compose up` for initialization, or
 delete partial/authenticated files to force a rerun. Quarantine a failed state
 directory and repeat the full render/admission review with a new empty canonical
-directory.
+directory. The legacy marker opt-in is forbidden in scheduled production.
 
-The three paid-boundary services remain forbidden to create or start until the
-dedicated provider quota/usage receipt and the reviewed exact-origin release
-have both been approved. After that separate approval, create and attest
-`whoscored_proxy_filter` and `flaresolverr_whoscored_paid` first, start both,
-then create, attest and start `whoscored_paid_gateway`. Use the same exact
-`up --no-start --no-deps --no-build --pull always SERVICE` operation and a
-separate `post-create --service ...` receipt, then use exact target-only
-`"${DOCKER[@]}" start "$ADMITTED_CONTAINER_ID"` after extracting and
-validating the one full service-bound ID from that receipt
-for each service. The paid browser has no host port/direct egress, the filter
-has only provider egress, and the gateway alone spans the API, browser and
-direct-egress networks. Rendering the `whoscored-paid` profile is never
-paid-route authority. The Docker daemon and every principal able to access its
-socket remain part of the trusted single-tenant host boundary; no receipt can
-constrain a Docker-authorized attacker.
+The three paid-boundary services remain forbidden to start until the dedicated
+provider evidence, new empty state namespace and reviewed exact-origin release
+have all passed. The gateway container was already created and admitted during
+network cutover, but remains stopped. Create, attest and start the filter and
+paid browser as separate waves, waiting for each exact container ID to become
+healthy:
+
+```bash
+for service in whoscored_proxy_filter flaresolverr_whoscored_paid; do
+  receipt="$WHOSCORED_ADMISSION_DIR/post-create-$service-receipt.json"
+  "${GATEWAY_COMPOSE[@]}" up --no-start --no-deps --no-build --pull always \
+    "$service"
+  "${ADMISSION_PYTHON[@]}" \
+    "$RELEASE/scripts/whoscored_production_admission.py" post-create \
+    --root "$RELEASE" \
+    --deployment-attestation "$WHOSCORED_DEPLOYMENT_ATTESTATION" \
+    --common-override "$WHOSCORED_COMMON_DIGEST_OVERRIDE" \
+    --gateway-override "$WHOSCORED_GATEWAY_DIGEST_OVERRIDE" \
+    --env-file "$COMPOSE_ENV_FILE" \
+    --env-file "$WHOSCORED_ENV_FILE" \
+    --env-file "$PROXY_POOL_ENV_FILE" \
+    --provider-policy "$WHOSCORED_PROVIDER_POLICY" \
+    --owner-secret-file "$WHOSCORED_OWNER_SECRET" \
+    --provider-quota-receipt "$WHOSCORED_PROVIDER_QUOTA_RECEIPT" \
+    --service "$service" > "$receipt"
+  container_id=$(/usr/bin/jq -er --arg service "$service" '
+    select(.status == "admitted-v1") |
+    [.images[] | select(.service == $service) | .container_id] |
+    select(length == 1) | .[0] |
+    select(type == "string" and test("^[0-9a-f]{64}$"))
+  ' "$receipt")
+  "${DOCKER[@]}" start "$container_id"
+  for attempt in $(/usr/bin/seq 1 60); do
+    test "$("${DOCKER[@]}" inspect --format '{{.State.Health.Status}}' \
+      "$container_id")" = healthy && break
+    test "$attempt" != 60
+    /usr/bin/sleep 2
+  done
+done
+
+test "$("${DOCKER[@]}" inspect --format '{{.State.Status}}' \
+  "$PAID_GATEWAY_CONTAINER_ID")" = created
+"${DOCKER[@]}" start "$PAID_GATEWAY_CONTAINER_ID"
+for attempt in $(/usr/bin/seq 1 60); do
+  test "$("${DOCKER[@]}" inspect --format '{{.State.Health.Status}}' \
+    "$PAID_GATEWAY_CONTAINER_ID")" = healthy && break
+  test "$attempt" != 60
+  /usr/bin/sleep 2
+done
+```
+
+The paid browser has no host port/direct egress, the filter has only provider
+egress, and the gateway alone spans the API, browser and direct-egress
+networks. There is no opt-in paid profile in either production project. The
+Docker daemon and every principal able to access its socket remain part of the
+trusted single-tenant host boundary; no receipt can constrain a
+Docker-authorized attacker.
+
+##### Install the bounded daily issuer
+
+The issuer runs outside Airflow. Its planner gets the scheduler image, data
+environment and `dp-backend`, but no signing key. Its signer gets the exact
+admitted proxy image, frozen plan, exact read-only cohort, three credentials and
+no network. The signer independently canonicalizes the cohort, re-derives its
+SHA-256 and requires the schema-v2 plan workloads to equal the ordered cohort
+prefix selected by the root wrapper's fixed `--max-scopes`; planner-declared
+selection identity is never authority. Before either container
+runs, the wrapper repeats schema-v2 running admission for all five protected
+services and checks the active signed policy against the deploy-time admission
+receipt. Provider screenshot freshness is a deploy/new-policy gate; the daily
+timer intentionally does not require a new screenshot every 24 hours.
+
+Use the exact immutable release directory, never a `current` symlink. Keep the
+three Compose env files, both overrides, deployment attestation, rendered
+admission receipt, cohort, policy, charter and planner env root-owned mode
+`0600`. The planner always writes into a fresh UID-50000 subdirectory beneath
+systemd's root-only `RuntimeDirectory`; the wrapper freezes that exact plan as
+root-owned `0440`, removes the writable copy, and gives only the frozen bind to
+the signer. No persistent/shared plan directory is authority, and a preplanted
+plan is ignored. Keep approval, pointer and issuance-ledger directories owned
+by `50000:0` and private. A new provider order requires a fresh receipt, newly
+signed policy/charter, a new empty state namespace and a complete new admission.
+Every derived approval interval is also contained in both active authority
+windows: `issued_at` cannot precede either `valid_from`, and default expiry is
+clamped to the earlier policy/charter `valid_until`. Because every task repeats
+the six-hour remaining-validity check, the signer rejects that clamp unless it
+covers the nominal 10:00 UTC start, the complete six-hour DagRun, another six
+hours of remaining validity, and five minutes of clock/task-boundary margin.
+This happens before writing the issuance ledger, approval or pointer.
+
+```bash
+/usr/bin/install -d -o root -g root -m 0755 /usr/local/libexec
+/usr/bin/install -o root -g root -m 0755 \
+  "$RELEASE/scripts/whoscored_daily_issuer.sh" \
+  /usr/local/libexec/whoscored-daily-issuer
+/usr/bin/install -o root -g root -m 0644 \
+  "$RELEASE/deploy/whoscored/systemd/whoscored-daily-issuer.service" \
+  "$RELEASE/deploy/whoscored/systemd/whoscored-daily-issuer.timer" \
+  /etc/systemd/system/
+/usr/bin/install -d -o root -g root -m 0700 \
+  /etc/data-platform /etc/data-platform/credentials
+/usr/bin/install -o root -g root -m 0600 \
+  "$RELEASE/deploy/whoscored/systemd/whoscored-daily-issuer.env.example" \
+  /etc/data-platform/whoscored-daily-issuer.env
+# Replace every placeholder in the installed env file, including the exact
+# immutable release path and digest-qualified planner/signer images.
+/usr/bin/systemctl daemon-reload
+/usr/bin/systemctl disable --now whoscored-daily-issuer.timer || true
+```
+
+Install `whoscored-approval-hmac`, `whoscored-owner-hmac` and
+`whoscored-issuance-ledger-hmac` under `/etc/data-platform/credentials` as
+root-owned mode `0400`. The planner env must not contain any of those three key
+names. During 09:00–09:30 UTC, run one manual smoke and inspect the exact
+service journal. Only then enable the non-persistent 09:15 UTC timer:
+
+```bash
+/usr/bin/systemctl start whoscored-daily-issuer.service
+/usr/bin/systemctl --quiet is-failed whoscored-daily-issuer.service && exit 1
+/usr/bin/journalctl --unit whoscored-daily-issuer.service --since today \
+  --no-pager
+/usr/bin/systemctl enable --now whoscored-daily-issuer.timer
+/usr/bin/systemctl list-timers whoscored-daily-issuer.timer --no-pager
+```
+
+`Persistent=false` forbids catch-up after downtime; the wrapper independently
+rejects manual or delayed starts outside 09:00–09:30 UTC, holds a host flock,
+and has a 30-minute systemd timeout. Leave the timer disabled on any admission,
+health, state-binding or signing failure.
 
 ## Idempotent Airflow migration
 
@@ -1382,8 +1622,10 @@ container restart/OOM evidence. Use the exact invocation printed by
 `--help`; keep the normal short duration only for CI and operator rehearsal.
 
 The v3 supervisor validates the exact external `ready-v1` deployment
-attestation and its protected digest-only Compose override before it starts a
-worker. It resolves the local ID behind the attested
+attestation, both protected split-project digest-only Compose overrides, the
+active owner-signed provider policy and the protected deploy-time admission
+receipt before it starts a worker. A legacy combined override is not accepted.
+It resolves the local ID behind the attested
 `repository@sha256:<64 hex>` FlareSolverr reference on every sample. The running
 container must keep that ID and the current checkout's three-file Compose
 hash/labels,
@@ -1393,9 +1635,12 @@ filesystem, numeric UID/GID, dropped capabilities and the exact AppArmor/seccomp
 options. Retagging the reference, using the old upstream image with an extension
 bind, shadowing the payload with tmpfs, or starting the service from another
 checkout stops the canary fail-closed.
-It renders that hash through `/usr/bin/docker compose`, the base, supervised
-and exact digest-only files in admission order, and all three protected
-environment files. The selected SeaweedFS topology state and
+It renders the common-project hash through `/usr/bin/docker compose`, the base,
+supervised and exact common digest-only files in admission order, and all three
+protected environment files. The same isolated admission pass renders the
+separate gateway project from its exact Compose and digest-only files and binds
+its provider order, policy digest and decimal byte caps to the signed policy.
+The selected SeaweedFS topology state and
 `WHOSCORED_PROXY_APPROVAL_HOST_DIR` prerequisite must already pass even though
 this canary itself is direct-only. Replacement or mutation of any attestation,
 Compose or environment input stops the supervisor fail-closed.
@@ -1409,9 +1654,20 @@ RELEASE=/absolute/path/to/the-ready-release
 cd "$RELEASE"
 test "$(pwd -P)" = "$RELEASE"
 : "${WHOSCORED_DEPLOYMENT_ATTESTATION:?set the protected ready-v1 deployment attestation}"
-: "${WHOSCORED_DIGEST_OVERRIDE:?set the protected digest-only Compose file}"
-test -f "$WHOSCORED_DEPLOYMENT_ATTESTATION"
-test -f "$WHOSCORED_DIGEST_OVERRIDE"
+: "${WHOSCORED_COMMON_DIGEST_OVERRIDE:?set the protected common-project digest-only Compose file}"
+: "${WHOSCORED_GATEWAY_DIGEST_OVERRIDE:?set the protected gateway-project digest-only Compose file}"
+: "${WHOSCORED_PROVIDER_POLICY:?set the active owner-signed provider policy}"
+: "${WHOSCORED_OWNER_SECRET:?set the root-owned provider-policy owner key}"
+: "${WHOSCORED_DEPLOYMENT_ADMISSION_RECEIPT:?set the protected deploy-time rendered admission receipt}"
+for evidence in \
+  "$WHOSCORED_DEPLOYMENT_ATTESTATION" \
+  "$WHOSCORED_COMMON_DIGEST_OVERRIDE" \
+  "$WHOSCORED_GATEWAY_DIGEST_OVERRIDE" \
+  "$WHOSCORED_PROVIDER_POLICY" \
+  "$WHOSCORED_OWNER_SECRET" \
+  "$WHOSCORED_DEPLOYMENT_ADMISSION_RECEIPT"; do
+  test -f "$evidence"
+done
 : "${WHOSCORED_PROXY_APPROVAL_HOST_DIR:?set the protected approval directory used by the admitted Compose model}"
 test -d "$WHOSCORED_PROXY_APPROVAL_HOST_DIR"
 export WHOSCORED_PROXY_APPROVAL_HOST_DIR
@@ -1426,7 +1682,11 @@ CANARY_OUTPUT="$CANARY_EVIDENCE_DIR/whoscored-capacity-$(date -u +%Y%m%dT%H%M%SZ
   --match-limit 3 --profile-limit 3 \
   --flaresolverr-url http://127.0.0.1:8191 \
   --deployment-attestation "$WHOSCORED_DEPLOYMENT_ATTESTATION" \
-  --digest-override "$WHOSCORED_DIGEST_OVERRIDE" \
+  --common-digest-override "$WHOSCORED_COMMON_DIGEST_OVERRIDE" \
+  --gateway-digest-override "$WHOSCORED_GATEWAY_DIGEST_OVERRIDE" \
+  --provider-policy "$WHOSCORED_PROVIDER_POLICY" \
+  --owner-secret-file "$WHOSCORED_OWNER_SECRET" \
+  --deployment-admission-receipt "$WHOSCORED_DEPLOYMENT_ADMISSION_RECEIPT" \
   --container airflow-scheduler \
   --container flaresolverr \
   --output "$CANARY_OUTPUT"
@@ -1436,7 +1696,8 @@ Run this supervisor on the host: it reads its own four child process trees from
 `/proc`, reads required-container cgroup memory through `docker stats`, and
 uses `docker inspect` for restart/recreate/OOM evidence. Scheduler and the
 WhoScored FlareSolverr are mandatory even when `--container` is omitted and
-are linked to the exact running production-admission receipt. That option can
+are freshly running-admitted against the exact split deployment model and its
+deploy-time admission receipt. That option can
 only add extra monitoring-only containers (for example the shared
 `proxy_filter`) and never expands WhoScored deployment authority. The output
 path is create-once mode 0600.
@@ -1504,10 +1765,11 @@ Do **not** trigger the all-catalog crawl at two slots. First pass the sustained
 four-worker non-publishing capacity canary, promote the real Airflow pool to
 four, and complete one manual plus one scheduled daily run. The paid-proxy
 measurement is a separate gate described in
-`docs/operations/whoscored-proxy-campaign.md`: run only its exact 1 GB signed
-canary, whose executable provider-order ceiling is the durable `850 MiB`
-safety cap, persist the immutable p95 evidence, and review the proposed full
-cap. That canary does not authorize the full crawl.
+`docs/operations/whoscored-proxy-campaign.md`: run only its exact signed canary;
+the referenced 1 GB is the provider-order quota, while the executable
+provider-order lifetime hard cap remains exactly `300000000` decimal bytes.
+Persist the immutable p95 evidence before any separate cap review. That canary
+does not authorize the full crawl.
 
 The separately reviewed production crawl must remain `direct_only` in this
 release. If paid fallback is still required, stop: the full-crawl sentinel is

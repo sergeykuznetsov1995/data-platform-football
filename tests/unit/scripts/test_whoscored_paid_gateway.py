@@ -23,11 +23,13 @@ from scrapers.whoscored.proxy_campaign import (
     sign_proxy_campaign_approval,
 )
 from scrapers.whoscored.transport import (
+    MAX_PAID_GATEWAY_BATCH_URLS,
     PAID_GATEWAY_SCHEMA_VERSION,
     PaidCampaignContext,
     PaidGatewayClient,
     PaidGatewayError,
     PaidGatewayRejected,
+    PaidGatewayProtocolError,
     PaidGatewayReceipt,
     ProxyLease,
     TransportBudgets,
@@ -37,15 +39,19 @@ from scrapers.whoscored.transport import (
     WhoScoredTransport,
     WhoScoredTransportError,
     _canonical_url_key,
+    _paid_gateway_target_manifest_sha256,
 )
 from scripts.whoscored_paid_gateway import (
     GatewayError,
     GatewayFetchRequest,
+    GatewayBatchFetchRequest,
     BoundedGatewayServer,
     PaidGatewayApplication,
     PaidGatewayService,
     SettledGatewayError,
+    _endpoint_label,
     _handler,
+    _lease_id_hash,
     _read_exact_body,
 )
 
@@ -56,15 +62,23 @@ URL = "https://www.whoscored.com/Matches/1/Live"
 STRUCTURED_URL = (
     "https://www.whoscored.com/statisticsfeed/1/getteamstatistics"
 )
+STRUCTURED_URL_TWO = (
+    "https://www.whoscored.com/statisticsfeed/1/getplayerstatistics"
+)
 BOOTSTRAP_URL = "https://www.whoscored.com/Regions/247/Tournaments/36"
+BATCH_BOOTSTRAP_URL = (
+    "https://www.whoscored.com/Regions/247/Tournaments/36/Seasons/1/"
+    "Stages/1/TeamStatistics"
+)
 CF_HTML = (
     b"<html><title>Just a moment...</title>"
     b"<script src='/cdn-cgi/challenge-platform/x'></script></html>"
 )
 
 
-def _authority_document(*, allowed_paths=None):
+def _authority_document(*, allowed_paths=None, request_limit=2, lease_limit=None):
     paths = allowed_paths or ["/Matches"]
+    resolved_lease_limit = request_limit if lease_limit is None else lease_limit
     allocation = {
         "allocation_id": "capture-1",
         "phase": "capture",
@@ -72,8 +86,8 @@ def _authority_document(*, allowed_paths=None):
         "work_item_id": "match-1",
         "task_id": "capture_matches",
         "budget_bytes": 2_000_000,
-        "request_limit": 2,
-        "lease_limit": 1,
+        "request_limit": request_limit,
+        "lease_limit": resolved_lease_limit,
         "allowed_path_families": list(paths),
     }
     unsigned = {
@@ -93,7 +107,11 @@ def _authority_document(*, allowed_paths=None):
             "capture_provider_bytes": 2_000_000,
             "daily_provider_bytes": 2_000_000,
         },
-        "limits": {"requests": 2, "leases": 1, "concurrency": 1},
+        "limits": {
+            "requests": request_limit,
+            "leases": resolved_lease_limit,
+            "concurrency": 1,
+        },
         "allowed_dag_ids": ["dag_backfill_whoscored"],
         "allowed_hosts": sorted(WHOSCORED_PROXY_ALLOWED_HOSTS),
         "allowed_path_families": list(paths),
@@ -145,6 +163,24 @@ def _request(
             "schema_version": PAID_GATEWAY_SCHEMA_VERSION,
             "url": url,
             "browser_bootstrap_url": browser_bootstrap_url,
+            "max_response_bytes": 1024 * 1024,
+            "max_provider_bytes": max_provider_bytes,
+            "timeout_ms": 30_000,
+            "context": context,
+        }
+    )
+
+
+def _batch_request(context, *, urls=None, max_provider_bytes=1_000_000):
+    items = list(urls or [STRUCTURED_URL, STRUCTURED_URL_TWO])
+    return GatewayBatchFetchRequest.from_dict(
+        {
+            "schema_version": PAID_GATEWAY_SCHEMA_VERSION,
+            "urls": items,
+            "browser_bootstrap_url": BATCH_BOOTSTRAP_URL,
+            "target_manifest_sha256": _paid_gateway_target_manifest_sha256(
+                items, browser_bootstrap_url=BATCH_BOOTSTRAP_URL
+            ),
             "max_response_bytes": 1024 * 1024,
             "max_provider_bytes": max_provider_bytes,
             "timeout_ms": 30_000,
@@ -218,6 +254,58 @@ class FakeProxy:
         }
 
 
+class BatchFakeProxy(FakeProxy):
+    def __init__(self, events=None, *, amounts=None):
+        super().__init__(events)
+        self.amounts = dict(amounts or {})
+        self.active = None
+        self.endpoint_map = {}
+
+    def begin_endpoint(self, lease, endpoint):
+        assert self.active is None
+        request_id = f"endpoint-{len(self.endpoint_map)}"
+        self.events.append(f"endpoint:begin:{endpoint}")
+        self.active = (request_id, endpoint)
+        return request_id
+
+    def end_endpoint(self, lease, request_id):
+        assert self.active is not None and self.active[0] == request_id
+        endpoint = self.active[1]
+        self.events.append(f"endpoint:end:{endpoint}")
+        self.endpoint_map.setdefault(endpoint, []).append(self.amounts.get(endpoint, 0))
+        self.active = None
+        return {"id": lease.lease_id}
+
+    def switch_endpoint(self, lease, request_id, endpoint):
+        assert self.active is not None and self.active[0] == request_id
+        previous = self.active[1]
+        self.endpoint_map.setdefault(previous, []).append(
+            self.amounts.get(previous, 0)
+        )
+        next_request_id = f"endpoint-{len(self.endpoint_map)}"
+        self.events.append(f"endpoint:switch:{previous}->{endpoint}")
+        self.active = (next_request_id, endpoint)
+        return next_request_id
+
+    def close(self, lease):
+        result = super().close(lease)
+        created = self.created[-1]
+        result.update(
+            target_manifest_sha256=created["target_manifest_sha256"],
+            logical_target_units=created["logical_target_units"],
+            expected_endpoint_labels=list(created["expected_endpoint_labels"]),
+        )
+        result["endpoint_request_provider_bytes"] = dict(self.endpoint_map)
+        total = sum(sum(values) for values in self.endpoint_map.values())
+        result.update(
+            up_bytes=total // 10,
+            down_bytes=total - total // 10,
+            total_bytes=total,
+            provider_billed_bytes=total,
+        )
+        return result
+
+
 class FakeBrowser:
     def __init__(self, *, html=b"<html>ok</html>", destroy_error=False, events=None):
         self.html = html
@@ -246,6 +334,25 @@ class FakeBrowser:
         self.destroyed.append(session_id)
         if self.destroy_error:
             raise RuntimeError("cleanup failed")
+
+
+class BatchFakeBrowser(FakeBrowser):
+    def __init__(self, *, fail_url=None, events=None):
+        super().__init__(events=events)
+        self.fail_url = fail_url
+        self.xhr_calls = []
+
+    def xhr_get(self, url, session_id, **kwargs):
+        self.events.append(f"browser:xhr:{url}")
+        self.xhr_calls.append((url, session_id, kwargs))
+        if url == self.fail_url:
+            raise RuntimeError("batch target failed")
+        return {
+            "content": f'{{"url":"{url}"}}'.encode(),
+            "status": 200,
+            "headers": {"content-type": "application/json"},
+            "finalUrl": url,
+        }
 
 
 def _verified_authority(context):
@@ -1160,3 +1267,457 @@ def test_paid_http_session_impersonates_a_browser_through_the_lease_proxy():
         close = getattr(session, "close", None)
         if callable(close):
             close()
+
+
+@pytest.mark.unit
+def test_batch_parser_binds_bootstrap_and_rejects_ambiguous_manifests():
+    _approval, _allocation, _attempt, context = _authority_document(
+        allowed_paths=["/Regions", "/statisticsfeed"]
+    )
+    request = _batch_request(context)
+    assert request.target_manifest_sha256 == _paid_gateway_target_manifest_sha256(
+        request.urls, browser_bootstrap_url=BATCH_BOOTSTRAP_URL
+    )
+    assert request.target_manifest_sha256 != _paid_gateway_target_manifest_sha256(
+        request.urls,
+        browser_bootstrap_url="https://www.whoscored.com/Regions/1/Tournaments/1",
+    )
+    duplicate = {
+        "schema_version": PAID_GATEWAY_SCHEMA_VERSION,
+        "urls": [STRUCTURED_URL, STRUCTURED_URL],
+        "browser_bootstrap_url": BATCH_BOOTSTRAP_URL,
+        "target_manifest_sha256": _paid_gateway_target_manifest_sha256(
+            [STRUCTURED_URL, STRUCTURED_URL],
+            browser_bootstrap_url=BATCH_BOOTSTRAP_URL,
+        ),
+        "max_response_bytes": 1024,
+        "max_provider_bytes": 10_000,
+        "timeout_ms": 30_000,
+        "context": context,
+    }
+    with pytest.raises(GatewayError, match="invalid_target_manifest"):
+        GatewayBatchFetchRequest.from_dict(duplicate)
+    oversized = dict(duplicate)
+    oversized["urls"] = [
+        f"https://www.whoscored.com/statisticsfeed/{index}/getteamstatistics"
+        for index in range(MAX_PAID_GATEWAY_BATCH_URLS + 1)
+    ]
+    with pytest.raises(GatewayError, match="invalid_target_manifest"):
+        GatewayBatchFetchRequest.from_dict(oversized)
+    over_lease_cap = {
+        "schema_version": PAID_GATEWAY_SCHEMA_VERSION,
+        "urls": list(request.urls),
+        "browser_bootstrap_url": request.browser_bootstrap_url,
+        "target_manifest_sha256": request.target_manifest_sha256,
+        "max_response_bytes": request.max_response_bytes,
+        "max_provider_bytes": 2_000_001,
+        "timeout_ms": request.timeout_ms,
+        "context": dict(request.context),
+    }
+    with pytest.raises(GatewayError, match="invalid_request"):
+        GatewayBatchFetchRequest.from_dict(over_lease_cap)
+
+
+@pytest.mark.unit
+def test_batch_uses_one_lease_and_session_after_all_direct_prechecks():
+    approval, allocation, attempt, context = _authority_document(
+        allowed_paths=["/Regions", "/statisticsfeed"]
+    )
+    request = _batch_request(context)
+    bootstrap_label = _endpoint_label("bootstrap", BATCH_BOOTSTRAP_URL)
+    first_label = _endpoint_label("target", STRUCTURED_URL)
+    second_label = _endpoint_label("target", STRUCTURED_URL_TWO)
+    events = []
+    proxy = BatchFakeProxy(
+        events,
+        amounts={bootstrap_label: 100, first_label: 300, second_label: 600},
+    )
+    browser = BatchFakeBrowser(events=events)
+    direct_sessions = iter(
+        [
+            FakeSession(
+                FakeResponse(
+                    CF_HTML,
+                    status=403,
+                    headers={"cf-ray": "one"},
+                    url=STRUCTURED_URL,
+                ),
+                events=events,
+                label="direct-one",
+            ),
+            FakeSession(
+                FakeResponse(
+                    CF_HTML,
+                    status=403,
+                    headers={"cf-ray": "two"},
+                    url=STRUCTURED_URL_TWO,
+                ),
+                events=events,
+                label="direct-two",
+            ),
+        ]
+    )
+    service = PaidGatewayService(
+        proxy_client=proxy,
+        browser_client=browser,
+        authority=lambda _context: (approval, allocation, attempt),
+        direct_session_factory=lambda: next(direct_sessions),
+        alert_requirement=lambda **_kwargs: {},
+    )
+
+    response = service.fetch_batch(request)
+
+    assert [item.url for item in response.results] == list(request.urls)
+    assert len(proxy.created) == len(proxy.closed) == 1
+    assert len(browser.created) == len(browser.destroyed) == 1
+    assert events.index("direct-one:get") < events.index("lease:create")
+    assert events.index("direct-two:get") < events.index("lease:create")
+    assert events.index("browser:destroy") < events.index(
+        f"endpoint:end:{second_label}"
+    )
+    assert proxy.created[0]["target_manifest_sha256"] == (
+        request.target_manifest_sha256
+    )
+    assert proxy.created[0]["logical_target_units"] == 2
+    assert proxy.created[0]["expected_endpoint_labels"] == (
+        bootstrap_label,
+        *sorted((first_label, second_label)),
+    )
+    assert response.receipt.bootstrap_provider_billed_bytes == 100
+    assert response.receipt.endpoint_provider_billed_bytes == {
+        hashlib.sha256(_canonical_url_key(STRUCTURED_URL).encode()).hexdigest(): 300,
+        hashlib.sha256(_canonical_url_key(STRUCTURED_URL_TWO).encode()).hexdigest(): 600,
+    }
+    rendered = json.dumps(response.receipt.to_dict())
+    assert "lease-secret-id" not in rendered
+    assert "lease-secret-token" not in rendered
+
+    document = {
+        "schema_version": PAID_GATEWAY_SCHEMA_VERSION,
+        "target_manifest_sha256": response.target_manifest_sha256,
+        "results": [
+            {
+                "url": item.url,
+                "status_code": item.status_code,
+                "headers": dict(item.headers),
+                "body_base64": base64.b64encode(item.content).decode(),
+                "body_sha256": hashlib.sha256(item.content).hexdigest(),
+            }
+            for item in response.results
+        ],
+        "route": response.route.value,
+        "receipt": response.receipt.to_dict(),
+    }
+    client = PaidGatewayClient(
+        "http://paid-gateway:8080",
+        token="g" * 32,
+        session=FakeGatewayHTTPSession(FakeGatewayHTTPResponse(document)),
+    )
+    decoded = client.fetch_batch(
+        request.urls,
+        context=_transport_context(context),
+        max_response_bytes=request.max_response_bytes,
+        max_provider_bytes=request.max_provider_bytes,
+        timeout_ms=request.timeout_ms,
+        browser_bootstrap_url=request.browser_bootstrap_url,
+    )
+    assert decoded.target_manifest_sha256 == request.target_manifest_sha256
+    with pytest.raises(PaidGatewayProtocolError, match="replayed"):
+        client.fetch_batch(
+            request.urls,
+            context=_transport_context(context),
+            max_response_bytes=request.max_response_bytes,
+            max_provider_bytes=request.max_provider_bytes,
+            timeout_ms=request.timeout_ms,
+            browser_bootstrap_url=request.browser_bootstrap_url,
+        )
+
+
+@pytest.mark.unit
+def test_batch_rejects_allocation_request_overrun_before_any_side_effect():
+    approval, allocation, attempt, context = _authority_document(
+        allowed_paths=["/Regions", "/statisticsfeed"], request_limit=1
+    )
+    proxy = BatchFakeProxy()
+    browser = BatchFakeBrowser()
+    alerts = []
+    service = PaidGatewayService(
+        proxy_client=proxy,
+        browser_client=browser,
+        authority=lambda _context: (approval, allocation, attempt),
+        direct_session_factory=lambda: (_ for _ in ()).throw(
+            AssertionError("direct precheck must not run")
+        ),
+        alert_requirement=lambda **identity: alerts.append(identity),
+    )
+
+    with pytest.raises(GatewayError, match="budget_rejected"):
+        service.fetch_batch(_batch_request(context))
+
+    assert alerts == []
+    assert proxy.created == []
+    assert browser.created == []
+
+
+@pytest.mark.unit
+def test_batch_of_two_rejects_signed_one_logical_target_demand():
+    approval, allocation, attempt, context = _authority_document(
+        allowed_paths=["/Regions", "/statisticsfeed"],
+        request_limit=2,
+        lease_limit=1,
+    )
+    proxy = BatchFakeProxy()
+    service = PaidGatewayService(
+        proxy_client=proxy,
+        browser_client=BatchFakeBrowser(),
+        authority=lambda _context: (approval, allocation, attempt),
+        direct_session_factory=lambda: (_ for _ in ()).throw(
+            AssertionError("logical target overrun must precede direct I/O")
+        ),
+        alert_requirement=lambda **_kwargs: {},
+    )
+
+    with pytest.raises(GatewayError, match="budget_rejected"):
+        service.fetch_batch(_batch_request(context))
+
+    assert proxy.created == []
+
+
+@pytest.mark.unit
+def test_batch_failure_settles_capabilities_and_returns_no_partial_body():
+    approval, allocation, attempt, context = _authority_document(
+        allowed_paths=["/Regions", "/statisticsfeed"]
+    )
+    request = _batch_request(context)
+    events = []
+    proxy = BatchFakeProxy(
+        events,
+        amounts={
+            _endpoint_label("bootstrap", BATCH_BOOTSTRAP_URL): 100,
+            _endpoint_label("target", STRUCTURED_URL): 0,
+            _endpoint_label("target", STRUCTURED_URL_TWO): 0,
+        }
+    )
+    browser = BatchFakeBrowser(fail_url=STRUCTURED_URL, events=events)
+    direct_sessions = iter(
+        [
+            FakeSession(
+                FakeResponse(
+                    CF_HTML,
+                    status=403,
+                    headers={"cf-ray": "one"},
+                    url=STRUCTURED_URL,
+                )
+            ),
+            FakeSession(
+                FakeResponse(
+                    CF_HTML,
+                    status=403,
+                    headers={"cf-ray": "two"},
+                    url=STRUCTURED_URL_TWO,
+                )
+            ),
+        ]
+    )
+    service = PaidGatewayService(
+        proxy_client=proxy,
+        browser_client=browser,
+        authority=lambda _context: (approval, allocation, attempt),
+        direct_session_factory=lambda: next(direct_sessions),
+        alert_requirement=lambda **_kwargs: {},
+    )
+    application = PaidGatewayApplication(
+        token="g" * 32, service=service, batch_enabled=True
+    )
+    document = {
+        "schema_version": PAID_GATEWAY_SCHEMA_VERSION,
+        "urls": list(request.urls),
+        "browser_bootstrap_url": request.browser_bootstrap_url,
+        "target_manifest_sha256": request.target_manifest_sha256,
+        "max_response_bytes": request.max_response_bytes,
+        "max_provider_bytes": request.max_provider_bytes,
+        "timeout_ms": request.timeout_ms,
+        "context": dict(request.context),
+    }
+
+    status, raw = application.handle_batch(
+        authorization=f"Bearer {'g' * 32}", body=json.dumps(document).encode()
+    )
+
+    decoded = json.loads(raw)
+    assert status == 502
+    assert set(decoded) == {"schema_version", "error", "receipt"}
+    assert "results" not in decoded and "body_base64" not in decoded
+    assert len(proxy.closed) == len(browser.destroyed) == 1
+    assert [call[0] for call in browser.xhr_calls] == [STRUCTURED_URL]
+    first_label = _endpoint_label("target", STRUCTURED_URL)
+    second_label = _endpoint_label("target", STRUCTURED_URL_TWO)
+    assert events.index("browser:destroy") < events.index(
+        f"endpoint:end:{first_label}"
+    )
+    assert events.index(f"endpoint:end:{first_label}") < events.index(
+        f"endpoint:begin:{second_label}"
+    )
+    assert decoded["receipt"]["endpoint_provider_billed_bytes"] == {
+        hashlib.sha256(_canonical_url_key(STRUCTURED_URL).encode()).hexdigest(): 0,
+        hashlib.sha256(_canonical_url_key(STRUCTURED_URL_TWO).encode()).hexdigest(): 0,
+    }
+
+
+@pytest.mark.unit
+def test_gateway_batch_endpoint_defaults_off_before_request_or_service_side_effects(
+    monkeypatch,
+):
+    monkeypatch.delenv("WHOSCORED_PAID_BATCH_ENABLED", raising=False)
+
+    class NoBatchService:
+        def fetch_batch(self, _request):
+            raise AssertionError("disabled batch endpoint must not reach authority")
+
+    application = PaidGatewayApplication(
+        token="g" * 32, service=NoBatchService()
+    )
+
+    status, raw = application.handle_batch(
+        authorization=f"Bearer {'g' * 32}", body=b"not-even-json"
+    )
+
+    assert status == 409
+    assert json.loads(raw)["error"]["code"] == "batch_disabled"
+
+
+@pytest.mark.unit
+def test_disabled_batch_http_route_never_reads_headers_length_or_socket_body(
+    monkeypatch,
+):
+    monkeypatch.delenv("WHOSCORED_PAID_BATCH_ENABLED", raising=False)
+
+    class NoBatchService:
+        def fetch_batch(self, _request):
+            raise AssertionError("disabled route must not reach the service")
+
+    class HeaderGuard:
+        def get(self, name, default=None):
+            if name != "Authorization":
+                raise AssertionError(f"disabled route read unexpected header {name}")
+            return f"Bearer {'g' * 32}"
+
+        def get_all(self, *_args, **_kwargs):
+            raise AssertionError("disabled route must not read Content-Length")
+
+    class BodyGuard:
+        def read(self, *_args, **_kwargs):
+            raise AssertionError("disabled route must not read rfile")
+
+        read1 = read
+
+    application = PaidGatewayApplication(
+        token="g" * 32, service=NoBatchService()
+    )
+    handler_type = _handler(application)
+    handler = handler_type.__new__(handler_type)
+    handler.path = "/v1/fetch-batch"
+    handler.headers = HeaderGuard()
+    handler.rfile = BodyGuard()
+    handler.wfile = BytesIO()
+    statuses = []
+    handler.send_response = lambda status: statuses.append(status)
+    handler.send_header = lambda *_args: None
+    handler.end_headers = lambda: None
+    handler.send_error = lambda *_args: pytest.fail("unexpected generic error")
+
+    handler.do_POST()
+
+    assert statuses == [409]
+    assert json.loads(handler.wfile.getvalue())["error"]["code"] == (
+        "batch_disabled"
+    )
+
+
+@pytest.mark.unit
+def test_gateway_batch_feature_gate_exact_one_enables_route(monkeypatch):
+    monkeypatch.setenv("WHOSCORED_PAID_BATCH_ENABLED", "1")
+    application = PaidGatewayApplication(token="g" * 32, service=object())
+
+    assert application.batch_enabled is True
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("value", ["", "true", "01", "2", " 1"])
+def test_gateway_batch_feature_gate_rejects_non_exact_startup_values(
+    monkeypatch, value
+):
+    monkeypatch.setenv("WHOSCORED_PAID_BATCH_ENABLED", value)
+
+    with pytest.raises(ValueError, match="must be exactly 0 or 1"):
+        PaidGatewayApplication(token="g" * 32, service=object())
+
+
+@pytest.mark.unit
+def test_lease_hash_is_exactly_once_and_receipt_cache_rejects_replay_and_rebind():
+    raw_id = "lease-secret-id"
+    once = hashlib.sha256(raw_id.encode()).hexdigest()
+    twice = hashlib.sha256(once.encode()).hexdigest()
+    assert _lease_id_hash(raw_id) == once
+    assert _lease_id_hash(raw_id) != twice
+    client = PaidGatewayClient(
+        "http://paid-gateway:8080",
+        token="g" * 32,
+        session=FakeGatewayHTTPSession(FakeGatewayHTTPResponse({})),
+    )
+    receipt = PaidGatewayReceipt(
+        campaign_id="campaign",
+        approval_id="approval",
+        approval_sha256="a" * 64,
+        allocation_id="allocation",
+        attempt_id_hash="b" * 64,
+        canonical_url_sha256="c" * 64,
+        lease_id_hash=once,
+        route=TransportRoute.PAID_HTTP,
+        up_bytes=1,
+        down_bytes=2,
+        total_bytes=3,
+        provider_billed_bytes=3,
+        close_complete=True,
+        cleanup_complete=True,
+    )
+    client._accept_receipt_once(receipt)
+    with pytest.raises(PaidGatewayProtocolError, match="replayed"):
+        client._accept_receipt_once(receipt)
+    rebound = PaidGatewayReceipt(
+        **{**receipt.__dict__, "canonical_url_sha256": "d" * 64}
+    )
+    with pytest.raises(PaidGatewayProtocolError, match="rebound"):
+        client._accept_receipt_once(rebound)
+
+    _approval, _allocation, _attempt, context = _authority_document()
+    bound_context = _transport_context(context)
+    bound = PaidGatewayReceipt(
+        campaign_id=context["proxy_campaign_id"],
+        approval_id=context["proxy_approval_id"],
+        approval_sha256=context["proxy_approval_sha256"],
+        allocation_id=context["proxy_allocation_id"],
+        attempt_id_hash=hashlib.sha256(
+            context["proxy_attempt_id"].encode()
+        ).hexdigest(),
+        canonical_url_sha256=hashlib.sha256(
+            _canonical_url_key(URL).encode()
+        ).hexdigest(),
+        lease_id_hash=once,
+        route=TransportRoute.PAID_HTTP,
+        up_bytes=1,
+        down_bytes=2,
+        total_bytes=3,
+        provider_billed_bytes=3,
+        close_complete=True,
+        cleanup_complete=True,
+    )
+    for invalid_hash in (raw_id, "f" * 63, "F" * 64, "g" * 64):
+        malformed = {**bound.to_dict(), "lease_id_hash": invalid_hash}
+        with pytest.raises(PaidGatewayProtocolError, match="lease_id_hash"):
+            PaidGatewayReceipt.from_dict(
+                malformed,
+                context=bound_context,
+                url=URL,
+                max_provider_bytes=100,
+            )

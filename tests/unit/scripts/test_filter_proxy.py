@@ -117,6 +117,9 @@ def mod(tmp_path):
     loaded.WHOSCORED_CAMPAIGN_LEDGER = None
     loaded._WHOSCORED_CAMPAIGN_LEDGER_KEY = None
     loaded.WHOSCORED_PROXY_RUNTIME_SHA256 = "a" * 64
+    loaded.WHOSCORED_PROVIDER_ORDER_ID = "proxysio-order-38950"
+    loaded.WHOSCORED_PROVIDER_POLICY_SHA256 = "b" * 64
+    loaded.WHOSCORED_LEGACY_STATE_MARKER_LOADED = False
     # Individual tests cover each production mode; the general accounting
     # fixture exercises both source families without a service boundary.
     loaded.SOURCE_MODE = "test-all"
@@ -259,6 +262,7 @@ def _whoscored_campaign_context(
     attempt_id: str | None = None,
     dag_id: str = "dag_backfill_whoscored",
     requests: int = 10,
+    leases: int = 1,
     approval_id: str = "approval-one",
     campaign_id: str = "campaign-one",
     run_id: str = "manual__campaign-one",
@@ -272,7 +276,7 @@ def _whoscored_campaign_context(
         "task_id": "run_whoscored_proxy_canary",
         "budget_bytes": cap,
         "request_limit": requests,
-        "lease_limit": 1,
+        "lease_limit": leases,
         "allowed_path_families": ["/Matches"],
     }
     unsigned = {
@@ -292,7 +296,7 @@ def _whoscored_campaign_context(
             "capture_provider_bytes": cap,
             "daily_provider_bytes": cap,
         },
-        "limits": {"requests": requests, "leases": 1, "concurrency": 1},
+        "limits": {"requests": requests, "leases": leases, "concurrency": 1},
         "allowed_dag_ids": [dag_id],
         "allowed_hosts": sorted(mod.WHOSCORED_PROXY_ALLOWED_HOSTS),
         "allowed_path_families": ["/Matches"],
@@ -926,7 +930,7 @@ def test_whoscored_accounting_failure_after_provider_write_never_releases_escrow
 
 
 def test_whoscored_order_safety_cap_metering_is_batched_exactly(mod, monkeypatch):
-    """The full 850 MiB safety window must not fsync once per 64 KiB."""
+    """The exact order safety window must not fsync once per 64 KiB."""
 
     total = mod.WHOSCORED_PROVIDER_ORDER_SAFETY_CAP_BYTES
     batch = 4 * 1024 * 1024
@@ -4141,13 +4145,339 @@ def test_lease_pump_pre_reads_only_the_remaining_provider_window(mod):
         )
     )
 
-    assert reader.read_sizes == [12]
+    # A provider read may never reserve the whole bidirectional tail while the
+    # client upload leg is active. The fair window is recomputed after every
+    # exact chunk and converges on the final hard-cap byte.
+    assert reader.read_sizes == [6, 3, 2, 1]
     assert len(reader.payload) == 8
     assert b"".join(writer.writes) == b"x" * 12
     assert lease.down_bytes == 12
     assert lease.total_bytes == lease.max_bytes
     assert lease.budget_exceeded is True
     assert writer.closed is True
+
+
+def test_blocking_client_leg_cannot_hold_provider_read_reservation(mod):
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+    lease = _make_fbref_lease(mod, mgr, max_bytes=64)
+    provider_payload = b"provider-can-progress"
+
+    class BlockingClientReader:
+        def __init__(self, started, release):
+            self.started = started
+            self.release = release
+
+        async def read(self, _size):
+            self.started.set()
+            await self.release.wait()
+            return b""
+
+    class ProviderReader:
+        def __init__(self, eof):
+            self.payload = provider_payload
+            self.eof = eof
+
+        async def read(self, size):
+            if self.payload:
+                chunk, self.payload = self.payload[:size], self.payload[size:]
+                return chunk
+            self.eof.set()
+            return b""
+
+    class Writer:
+        def __init__(self):
+            self.payload = bytearray()
+            self.closed = False
+
+        def write(self, chunk):
+            self.payload.extend(chunk)
+
+        async def drain(self):
+            return None
+
+        def close(self):
+            self.closed = True
+
+    async def scenario():
+        client_started = asyncio.Event()
+        release_client = asyncio.Event()
+        provider_eof = asyncio.Event()
+        client_writer = Writer()
+        provider_writer = Writer()
+        task = asyncio.create_task(
+            mod._run_tunnel_pumps(
+                BlockingClientReader(client_started, release_client),
+                client_writer,
+                ProviderReader(provider_eof),
+                provider_writer,
+                "www.fbref.com",
+                lease=lease,
+            )
+        )
+        await asyncio.wait_for(client_started.wait(), timeout=1)
+        await asyncio.wait_for(provider_eof.wait(), timeout=1)
+        # Let the down pump settle/release its EOF reservation while the local
+        # client remains silent forever from the provider's perspective.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert task.done() is False
+        assert bytes(client_writer.payload) == provider_payload
+        assert lease.down_bytes == len(provider_payload)
+        assert lease.reserved_bytes == 0
+        assert lease.accounting_uncertain is False
+        release_client.set()
+        await asyncio.wait_for(task, timeout=1)
+        return client_writer, provider_writer
+
+    client_writer, provider_writer = asyncio.run(scenario())
+
+    assert client_writer.closed is True
+    assert provider_writer.closed is True
+    assert lease.usable is True
+    assert lease.active_provider_readers == 0
+
+
+def test_concurrent_provider_readers_keep_aggregate_upload_headroom(mod):
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+    lease = _make_fbref_lease(mod, mgr, max_bytes=12)
+
+    class BlockingProviderReader:
+        def __init__(self, index, started, release):
+            self.index = index
+            self.started = started
+            self.release = release
+
+        async def read(self, _size):
+            await self.started.put(self.index)
+            await self.release.wait()
+            return b""
+
+    class Writer:
+        def __init__(self):
+            self.closed = False
+
+        def write(self, _chunk):
+            raise AssertionError("EOF-only provider reader must not write")
+
+        async def drain(self):
+            return None
+
+        def close(self):
+            self.closed = True
+
+    async def scenario():
+        started = asyncio.Queue()
+        releases = [asyncio.Event() for _ in range(3)]
+        writers = [Writer() for _ in range(3)]
+        tasks = [
+            asyncio.create_task(
+                mod._pump(
+                    BlockingProviderReader(index, started, releases[index]),
+                    writers[index],
+                    "www.fbref.com",
+                    defaultdict(int),
+                    lease=lease,
+                    direction="down",
+                )
+            )
+            for index in range(3)
+        ]
+        observed = [
+            await asyncio.wait_for(started.get(), timeout=1) for _ in range(3)
+        ]
+        # Every provider reader may progress, but their aggregate pre-read
+        # escrow leaves the exact N+1 share for an upload on this lease.
+        assert lease.active_provider_readers == 3
+        assert lease.provider_reserved_bytes == 9
+        assert lease.reserved_bytes == 9
+        assert mod._lease_remaining(lease) == 3
+        for index in observed:
+            releases[index].set()
+        await asyncio.wait_for(asyncio.gather(*tasks), timeout=1)
+        return observed, writers
+
+    observed, writers = asyncio.run(scenario())
+
+    assert sorted(observed) == [0, 1, 2]
+    assert all(writer.closed for writer in writers)
+    assert lease.provider_reserved_bytes == 0
+    assert lease.reserved_bytes == 0
+    assert lease.accounting_uncertain is False
+    assert lease.usable is True
+
+
+def test_cross_lease_provider_reservations_leave_shared_upload_headroom(mod):
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+    mod.DAILY_BUDGET_BYTES = 12
+    mod.DAGRUN_BUDGET_BYTES = 12
+    mod.URL_BUDGET_BYTES = 12
+    mod.MAX_LEASE_BYTES = 12
+    mod.MAX_ACTIVE_LEASES = 4
+    mod.TRANSFERMARKT_DAGRUN_BUDGET_BYTES = 12
+    leases = tuple(
+        mod._create_lease(
+            mgr,
+            max_bytes=12,
+            ttl_seconds=30,
+            metadata={
+                "dag_id": "dag_ingest_transfermarkt",
+                "run_id": f"run-{suffix}",
+                "task_id": f"task-{suffix}",
+                "canonical_url": f"https://www.transfermarkt.com/{suffix}",
+            },
+            require_context=True,
+        )
+        for suffix in ("a", "b", "c", "d")
+    )
+    first = leases[0]
+
+    class BlockingProviderReader:
+        def __init__(self, started, release):
+            self.started = started
+            self.release = release
+
+        async def read(self, _size):
+            self.started.set()
+            await self.release.wait()
+            return b""
+
+    class UploadReader:
+        def __init__(self):
+            self.chunks = [b"xy", b""]
+
+        async def read(self, _size):
+            return self.chunks.pop(0)
+
+    class Writer:
+        def __init__(self):
+            self.payload = bytearray()
+            self.closed = False
+
+        def write(self, chunk):
+            self.payload.extend(chunk)
+
+        async def drain(self):
+            return None
+
+        def close(self):
+            self.closed = True
+
+    async def scenario():
+        started = [asyncio.Event() for _ in leases]
+        release = [asyncio.Event() for _ in leases]
+        down_writers = [Writer() for _ in leases]
+        down_tasks = [
+            asyncio.create_task(
+                mod._pump(
+                    BlockingProviderReader(started[index], release[index]),
+                    down_writers[index],
+                    "www.transfermarkt.com",
+                    defaultdict(int),
+                    lease=lease,
+                    direction="down",
+                )
+            )
+            for index, lease in enumerate(leases)
+        ]
+        await asyncio.gather(
+            *(asyncio.wait_for(event.wait(), timeout=1) for event in started)
+        )
+        assert mod._ACTIVE_PROVIDER_READERS == 4
+        assert mod._daily_reserved_bytes == 10
+        assert all(mod._lease_remaining(lease) == 2 for lease in leases)
+
+        upload_writer = Writer()
+        await asyncio.wait_for(
+            mod._pump(
+                UploadReader(),
+                upload_writer,
+                "www.transfermarkt.com",
+                defaultdict(int),
+                lease=first,
+                direction="up",
+            ),
+            timeout=1,
+        )
+        assert bytes(upload_writer.payload) == b"xy"
+        assert all(task.done() is False for task in down_tasks)
+
+        for event in release:
+            event.set()
+        await asyncio.wait_for(asyncio.gather(*down_tasks), timeout=1)
+        return upload_writer, down_writers
+
+    upload_writer, down_writers = asyncio.run(scenario())
+
+    assert upload_writer.closed is True
+    assert all(writer.closed for writer in down_writers)
+    assert first.up_bytes == 2
+    assert all(lease.reserved_bytes == 0 for lease in leases)
+    assert all(lease.provider_reserved_bytes == 0 for lease in leases)
+    assert all(lease.accounting_uncertain is False for lease in leases)
+    assert mod._ACTIVE_PROVIDER_READERS == 0
+
+
+def test_staged_client_upload_waits_for_temporary_shared_reservation(mod):
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+    lease = _make_fbref_lease(mod, mgr, max_bytes=12)
+    external_reservation = mod._reserve_lease_bytes(lease, 8)
+    assert external_reservation == 8
+
+    class Reader:
+        def __init__(self):
+            self.chunks = [b"abcdef", b""]
+
+        async def read(self, _size):
+            return self.chunks.pop(0)
+
+    class Writer:
+        def __init__(self, first_write):
+            self.payload = bytearray()
+            self.first_write = first_write
+            self.closed = False
+
+        def write(self, chunk):
+            self.payload.extend(chunk)
+            self.first_write.set()
+
+        async def drain(self):
+            return None
+
+        def close(self):
+            self.closed = True
+
+    async def scenario():
+        first_write = asyncio.Event()
+        writer = Writer(first_write)
+        task = asyncio.create_task(
+            mod._pump(
+                Reader(),
+                writer,
+                "www.fbref.com",
+                defaultdict(int),
+                lease=lease,
+                direction="up",
+            )
+        )
+        await asyncio.wait_for(first_write.wait(), timeout=1)
+        # Four bytes fit now; the ordered two-byte tail must wait for the
+        # unrelated in-flight reservation instead of poisoning the lease.
+        await asyncio.sleep(0)
+        assert bytes(writer.payload) == b"abcd"
+        assert task.done() is False
+        assert lease.budget_exceeded is False
+        assert lease.accounting_uncertain is False
+        mod._release_lease_reservation(lease, external_reservation)
+        await asyncio.wait_for(task, timeout=1)
+        return writer
+
+    writer = asyncio.run(scenario())
+
+    assert bytes(writer.payload) == b"abcdef"
+    assert writer.closed is True
+    assert lease.up_bytes == 6
+    assert lease.reserved_bytes == 0
+    assert lease.usable is True
 
 
 def test_provider_connect_head_is_bounded_before_read_and_counted_exactly(mod):
@@ -5459,12 +5789,12 @@ def test_reservation_waiter_wakes_when_peer_accounting_becomes_uncertain(mod):
     async def exercise():
         reservation = mod._reserve_lease_bytes(lease, lease.max_bytes)
         assert reservation > 0
-        waiter = asyncio.create_task(mod._reserve_pump_bytes(lease, 1))
+        waiter = asyncio.create_task(mod._wait_for_reservation_turnover(lease))
         await asyncio.sleep(0)
         assert waiter.done() is False
         mod._latch_lease_accounting_uncertainty(lease)
-        assert await asyncio.wait_for(waiter, 0.1) == 0
-        assert lease.reservation_waiters == set()
+        assert await asyncio.wait_for(waiter, 0.1) is None
+        assert mod._RESERVATION_TURNOVER_WAITERS == set()
         assert lease.reserved_bytes == reservation
         assert lease.accounting_uncertain is True
 
@@ -5952,6 +6282,13 @@ def _initialize_protected_whoscored_state(mod, tmp_path):
 
 def test_protected_whoscored_state_initializes_once_and_survives_restart(mod, tmp_path):
     report = _initialize_protected_whoscored_state(mod, tmp_path)
+    marker = json.loads(Path(mod.WHOSCORED_STATE_MARKER_PATH).read_text())
+    assert marker["schema_version"] == mod.WHOSCORED_STATE_MARKER_SCHEMA_VERSION
+    assert marker["order_id"] == mod.WHOSCORED_PROVIDER_ORDER_ID
+    assert (
+        marker["provider_policy_sha256"]
+        == mod.WHOSCORED_PROVIDER_POLICY_SHA256
+    )
 
     mod.WHOSCORED_CAMPAIGN_LEDGER = None
     mod._WHOSCORED_CAMPAIGN_LEDGER_KEY = None
@@ -5970,6 +6307,86 @@ def test_protected_whoscored_state_initializes_once_and_survives_restart(mod, tm
     assert all(path.stat().st_mode & 0o777 == 0o600 for path in protected)
     with pytest.raises(RuntimeError, match="empty state"):
         mod._initialize_whoscored_state(str(report))
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    (
+        ("WHOSCORED_PROVIDER_ORDER_ID", "proxysio-order-another"),
+        ("WHOSCORED_PROVIDER_POLICY_SHA256", "c" * 64),
+    ),
+)
+def test_protected_whoscored_state_rejects_provider_binding_mismatch(
+    mod, tmp_path, field, replacement
+):
+    report = _initialize_protected_whoscored_state(mod, tmp_path)
+    setattr(mod, field, replacement)
+    mod.WHOSCORED_STATE_ID = ""
+
+    with pytest.raises(RuntimeError, match="provider binding differs"):
+        mod._verify_whoscored_state(str(report))
+
+
+def test_legacy_state_marker_is_explicit_and_never_accepts_scheduled_v3(
+    mod, tmp_path
+):
+    report = _initialize_protected_whoscored_state(mod, tmp_path)
+    marker_path = Path(mod.WHOSCORED_STATE_MARKER_PATH)
+    current = json.loads(marker_path.read_text())
+    legacy_body = {
+        "schema_version": mod.WHOSCORED_STATE_SCHEMA_VERSION,
+        "state_id": current["state_id"],
+        "created_at": current["created_at"],
+        "path_sha256": current["path_sha256"],
+    }
+    legacy = {**legacy_body, "signature": mod._state_hmac(legacy_body)}
+    marker_path.write_bytes(mod.canonical_json_bytes(legacy) + b"\n")
+    marker_path.chmod(0o600)
+    mod.WHOSCORED_STATE_ID = ""
+
+    with pytest.raises(RuntimeError, match="marker fields are invalid"):
+        mod._verify_whoscored_state(str(report))
+
+    mod._verify_whoscored_state(str(report), allow_legacy_marker=True)
+    assert mod.WHOSCORED_LEGACY_STATE_MARKER_LOADED is True
+    mod._assert_whoscored_approval_state_binding(SimpleNamespace(schema_version=2))
+    with pytest.raises(
+        ProxyCampaignValidationError, match="provider-bound state marker"
+    ):
+        mod._assert_whoscored_approval_state_binding(
+            SimpleNamespace(schema_version=3)
+        )
+
+
+@pytest.mark.parametrize(
+    ("order_id", "policy_sha256"),
+    (
+        ("proxysio-order-another", "b" * 64),
+        ("proxysio-order-38950", "c" * 64),
+    ),
+)
+def test_scheduled_authority_must_match_current_state_binding(
+    mod, order_id, policy_sha256
+):
+    mod._assert_whoscored_approval_state_binding(
+        SimpleNamespace(
+            schema_version=mod.SCHEDULED_PROXY_CAMPAIGN_SCHEMA_VERSION,
+            scheduled_authority=SimpleNamespace(
+                order_id=mod.WHOSCORED_PROVIDER_ORDER_ID,
+                provider_policy_sha256=mod.WHOSCORED_PROVIDER_POLICY_SHA256,
+            ),
+        )
+    )
+    approval = SimpleNamespace(
+        schema_version=mod.SCHEDULED_PROXY_CAMPAIGN_SCHEMA_VERSION,
+        scheduled_authority=SimpleNamespace(
+            order_id=order_id,
+            provider_policy_sha256=policy_sha256,
+        ),
+    )
+
+    with pytest.raises(ProxyCampaignValidationError, match="state binding"):
+        mod._assert_whoscored_approval_state_binding(approval)
 
 
 def test_protected_whoscored_state_rejects_campaign_lock_symlink(mod, tmp_path):
@@ -6058,6 +6475,14 @@ def test_missing_protected_state_stops_before_pool_or_listener(
         ledger=str(tmp_path / "paid_requests.jsonl"),
         whoscored_campaign_ledger=str(tmp_path / "whoscored_campaigns.json"),
         whoscored_state_marker=str(tmp_path / ".initialized.json"),
+        whoscored_provider_order_id="proxysio-order-38950",
+        whoscored_provider_policy_sha256="b" * 64,
+        daily_budget_bytes=300_000_000,
+        max_lease_bytes=2_000_000,
+        transfermarkt_dagrun_budget_bytes=0,
+        sofascore_canary_hard_cap_bytes=0,
+        sofascore_discovery_dagrun_budget_bytes=0,
+        sofascore_budget_artifact=None,
         initialize_whoscored_state=False,
     )
     monkeypatch.setattr(mod.argparse.ArgumentParser, "parse_args", lambda self: args)
@@ -6088,9 +6513,348 @@ def test_missing_protected_state_stops_before_pool_or_listener(
 
     with pytest.raises(SystemExit, match="protected state rejected"):
         asyncio.run(mod.main())
-
     assert pool_calls == []
 
+
+@pytest.mark.parametrize(
+    ("daily_bytes", "lease_bytes"),
+    (
+        (None, None),
+        (300_000_001, 2_000_000),
+        (300_000_000, 2_000_001),
+    ),
+)
+def test_whoscored_only_requires_exact_decimal_byte_caps_before_state(
+    mod, monkeypatch, daily_bytes, lease_bytes
+):
+    args = SimpleNamespace(
+        source_mode="whoscored-only",
+        allow_legacy_noauth=False,
+        daily_budget_bytes=daily_bytes,
+        max_lease_bytes=lease_bytes,
+    )
+    monkeypatch.setattr(mod.argparse.ArgumentParser, "parse_args", lambda self: args)
+    monkeypatch.setattr(
+        mod._WHOSCORED_RUNTIME_CONTRACT,
+        "require_production_runtime_class",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        mod._WHOSCORED_RUNTIME_CONTRACT,
+        "validate_runtime_contract",
+        lambda **_kwargs: {"code_tree_sha256": "a" * 64},
+    )
+    monkeypatch.setattr(
+        mod,
+        "_verify_whoscored_state",
+        lambda *_args, **_kwargs: pytest.fail("protected state must not be read"),
+    )
+    monkeypatch.setenv("PROXY_FILTER_CONTROL_TOKEN", "c" * 32)
+    monkeypatch.setenv("WHOSCORED_PROXY_APPROVAL_HMAC_SECRET", "a" * 32)
+    monkeypatch.setenv("WHOSCORED_PROXY_LEDGER_HMAC_SECRET", "l" * 32)
+
+    with pytest.raises(SystemExit, match="exact byte caps"):
+        asyncio.run(mod.main())
+
+
+def test_whoscored_only_rejects_cross_source_budget_before_state(mod, monkeypatch):
+    args = SimpleNamespace(
+        source_mode="whoscored-only",
+        allow_legacy_noauth=False,
+        daily_budget_bytes=300_000_000,
+        max_lease_bytes=2_000_000,
+        transfermarkt_dagrun_budget_bytes=0,
+        sofascore_canary_hard_cap_bytes=0,
+        sofascore_discovery_dagrun_budget_bytes=0,
+        sofascore_budget_artifact="/cross-source-policy.json",
+    )
+    monkeypatch.setattr(mod.argparse.ArgumentParser, "parse_args", lambda self: args)
+    monkeypatch.setattr(
+        mod._WHOSCORED_RUNTIME_CONTRACT,
+        "require_production_runtime_class",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        mod._WHOSCORED_RUNTIME_CONTRACT,
+        "validate_runtime_contract",
+        lambda **_kwargs: {"code_tree_sha256": "a" * 64},
+    )
+    monkeypatch.setattr(
+        mod,
+        "_verify_whoscored_state",
+        lambda *_args, **_kwargs: pytest.fail("protected state must not be read"),
+    )
+    monkeypatch.setenv("PROXY_FILTER_CONTROL_TOKEN", "c" * 32)
+    monkeypatch.setenv("WHOSCORED_PROXY_APPROVAL_HMAC_SECRET", "a" * 32)
+    monkeypatch.setenv("WHOSCORED_PROXY_LEDGER_HMAC_SECRET", "l" * 32)
+
+    with pytest.raises(SystemExit, match="cross-source"):
+        asyncio.run(mod.main())
+
+
+def test_whoscored_only_rejects_legacy_noauth_before_runtime_or_state(
+    mod, monkeypatch
+):
+    args = SimpleNamespace(
+        source_mode="whoscored-only",
+        allow_legacy_noauth=True,
+    )
+    monkeypatch.setattr(mod.argparse.ArgumentParser, "parse_args", lambda self: args)
+    monkeypatch.setattr(
+        mod._WHOSCORED_RUNTIME_CONTRACT,
+        "require_production_runtime_class",
+        lambda **_kwargs: pytest.fail("runtime validation must not run"),
+    )
+    monkeypatch.setattr(
+        mod,
+        "_residential_manager",
+        lambda **_kwargs: pytest.fail("pool must not be loaded"),
+    )
+
+    with pytest.raises(SystemExit, match="allow-legacy-noauth is forbidden"):
+        asyncio.run(mod.main())
+
+
+def test_whoscored_endpoint_boundaries_are_durable_and_sum_to_close_receipt(
+    mod, monkeypatch
+):
+    mgr = _FakeManager(["http://u:p@pool.proxys.io:10000"])
+    lease = mod._create_lease(
+        mgr,
+        max_bytes=1_000,
+        ttl_seconds=30,
+        metadata=_whoscored_campaign_context(mod, cap=1_000),
+        require_context=True,
+    )
+    events = []
+    monkeypatch.setattr(
+        mod,
+        "_append_budget_event",
+        lambda event_type, _lease, **values: events.append((event_type, values)),
+    )
+    mod.SOURCE_MODE = "whoscored-only"
+    mod._whoscored_campaign_ledger().record_request(
+        lease.proxy_campaign_approval,
+        lease.proxy_campaign_claim,
+    )
+    request_id = mod._begin_endpoint_request(lease, "target:" + "a" * 64)
+    mod._account_lease_bytes(lease, "www.whoscored.com", "down", 321)
+
+    assert mod._finish_endpoint_request(lease, request_id) == 321
+    report = asyncio.run(mod._close_lease(lease, completed=False))
+
+    assert report["close_complete"] is True
+    assert report["endpoint_request_provider_bytes"] == {
+        "target:" + "a" * 64: [321]
+    }
+    assert [event_type for event_type, _values in events] == [
+        "endpoint_started",
+        "bytes",
+        "endpoint_finished",
+        "lease_closed",
+    ]
+    assert events[1][1]["endpoint"] == "target:" + "a" * 64
+    assert events[2][1]["provider_bytes"] == 321
+    assert events[-1][1]["endpoint_request_provider_bytes"] == {
+        "target:" + "a" * 64: [321]
+    }
+
+
+def test_whoscored_only_background_bytes_revoke_unowned_lease(mod):
+    mgr = _FakeManager(["http://u:p@pool.proxys.io:10000"])
+    lease = mod._create_lease(
+        mgr,
+        max_bytes=1_000,
+        ttl_seconds=30,
+        metadata=_whoscored_campaign_context(mod, cap=1_000),
+        require_context=True,
+    )
+    mod.SOURCE_MODE = "whoscored-only"
+
+    with pytest.raises(RuntimeError, match="no active endpoint owner"):
+        mod._account_lease_bytes(
+            lease, "www.whoscored.com", "down", 1
+        )
+
+    assert lease.accounting_uncertain is True
+    assert lease.global_budget_escrow_bytes == 1_000
+    with pytest.raises(ProxyCampaignError):
+        mod._whoscored_campaign_ledger().record_request(
+            lease.proxy_campaign_approval,
+            lease.proxy_campaign_claim,
+        )
+
+
+def test_whoscored_batch_claim_binds_exact_endpoints_and_atomic_switches(
+    mod, tmp_path
+):
+    report_path = _initialize_protected_whoscored_state(mod, tmp_path)
+    mod._verify_whoscored_state(str(report_path))
+    mgr = _FakeManager(["http://u:p@pool.proxys.io:10000"])
+    bootstrap = "bootstrap:" + "a" * 64
+    first = "target:" + "b" * 64
+    second = "target:" + "c" * 64
+    labels = (bootstrap, *sorted((first, second)))
+    metadata = _whoscored_campaign_context(
+        mod, cap=1_000, requests=4, leases=2
+    )
+    metadata.update(
+        target_manifest_sha256="d" * 64,
+        logical_target_units=2,
+        expected_endpoint_labels=list(labels),
+    )
+    lease = mod._create_lease(
+        mgr,
+        max_bytes=1_000,
+        ttl_seconds=30,
+        metadata=metadata,
+        require_context=True,
+    )
+    lease_created = json.loads(Path(mod.LEDGER_PATH).read_text().splitlines()[-1])
+    assert {
+        field: lease_created[field]
+        for field in (
+            "target_manifest_sha256",
+            "logical_target_units",
+            "expected_endpoint_labels",
+        )
+    } == {
+        "target_manifest_sha256": "d" * 64,
+        "logical_target_units": 2,
+        "expected_endpoint_labels": list(labels),
+    }
+    mod._whoscored_campaign_ledger().record_request(
+        lease.proxy_campaign_approval,
+        lease.proxy_campaign_claim,
+    )
+
+    request_id = mod._begin_endpoint_request(lease, bootstrap)
+    bootstrap_request_id = request_id
+    mod._account_lease_bytes(lease, "www.whoscored.com", "down", 100)
+    request_id = mod._switch_endpoint_request(lease, request_id, first)
+    first_request_id = request_id
+    mod._account_lease_bytes(lease, "www.whoscored.com", "down", 200)
+    request_id = mod._switch_endpoint_request(lease, request_id, second)
+    mod._account_lease_bytes(lease, "www.whoscored.com", "down", 300)
+    assert mod._finish_endpoint_request(lease, request_id) == 300
+    report = asyncio.run(mod._close_lease(lease, completed=False))
+
+    assert report["close_complete"] is True
+    assert report["target_manifest_sha256"] == "d" * 64
+    assert report["logical_target_units"] == 2
+    assert report["expected_endpoint_labels"] == list(labels)
+    assert report["endpoint_request_provider_bytes"] == {
+        bootstrap: [100],
+        first: [200],
+        second: [300],
+    }
+    durable_events = [
+        json.loads(line) for line in Path(mod.LEDGER_PATH).read_text().splitlines()
+    ]
+    switch_events = [
+        {
+            field: event[field]
+            for field in (
+                "request_id",
+                "endpoint",
+                "provider_bytes",
+                "next_request_id",
+                "next_endpoint",
+                "lease_total_bytes",
+            )
+        }
+        for event in durable_events
+        if event["event_type"] == "endpoint_switched"
+    ]
+    assert switch_events == [
+        {
+            "request_id": bootstrap_request_id,
+            "endpoint": bootstrap,
+            "provider_bytes": 100,
+            "next_request_id": first_request_id,
+            "next_endpoint": first,
+            "lease_total_bytes": 100,
+        },
+        {
+            "request_id": first_request_id,
+            "endpoint": first,
+            "provider_bytes": 200,
+            "next_request_id": request_id,
+            "next_endpoint": second,
+            "lease_total_bytes": 300,
+        },
+    ]
+    snapshot = mod._whoscored_campaign_ledger().snapshot(
+        lease.proxy_campaign_approval
+    )
+    assert snapshot["leases_used"] == 2
+    attempt = snapshot["allocations"][lease.allocation_id]["attempts"][0]
+    assert attempt["target_manifest_sha256"] == "d" * 64
+    assert attempt["logical_target_units"] == 2
+    assert attempt["expected_endpoint_labels"] == list(labels)
+
+
+def test_whoscored_batch_units_survive_restart_and_bound_retries_and_dials(mod):
+    metadata = _whoscored_campaign_context(
+        mod, cap=1_000, requests=2, leases=2
+    )
+    approval = ProxyCampaignApproval.from_dict(
+        metadata["proxy_campaign_approval"]
+    )
+    labels = (
+        "bootstrap:" + "a" * 64,
+        "target:" + "b" * 64,
+        "target:" + "c" * 64,
+    )
+    now = datetime.now(timezone.utc)
+    ledger = ProxyCampaignLedger(
+        mod.WHOSCORED_CAMPAIGN_LEDGER_PATH,
+        secret=mod.WHOSCORED_PROXY_LEDGER_HMAC_SECRET,
+        approval_secret=mod.WHOSCORED_PROXY_APPROVAL_HMAC_SECRET,
+    )
+    claim = ledger.claim(
+        approval,
+        metadata["proxy_allocation_id"],
+        dag_id=metadata["dag_id"],
+        run_id=metadata["run_id"],
+        task_id=metadata["task_id"],
+        attempt_id=metadata["proxy_attempt_id"],
+        lease_id="lease-before-restart",
+        expires_at=now + timedelta(seconds=1),
+        canonical_url=metadata["canonical_url"],
+        target_manifest_sha256="d" * 64,
+        logical_target_units=2,
+        expected_endpoint_labels=labels,
+        now=now,
+    )
+    assert ledger.record_request(approval, claim, now=now) == 1
+    assert ledger.record_request(approval, claim, now=now) == 2
+    with pytest.raises(ProxyCampaignBudgetExceeded, match="request limit"):
+        ledger.record_request(approval, claim, now=now)
+
+    restarted = ProxyCampaignLedger(
+        mod.WHOSCORED_CAMPAIGN_LEDGER_PATH,
+        secret=mod.WHOSCORED_PROXY_LEDGER_HMAC_SECRET,
+        approval_secret=mod.WHOSCORED_PROXY_APPROVAL_HMAC_SECRET,
+        require_existing=True,
+    )
+    for index, manifest in enumerate(("d" * 64, "e" * 64), start=1):
+        with pytest.raises(ProxyCampaignBudgetExceeded, match="lease limit"):
+            restarted.claim(
+                approval,
+                metadata["proxy_allocation_id"],
+                dag_id=metadata["dag_id"],
+                run_id=metadata["run_id"],
+                task_id=metadata["task_id"],
+                attempt_id=metadata["proxy_attempt_id"],
+                lease_id=f"lease-retry-{index}",
+                expires_at=now + timedelta(seconds=10 + index),
+                canonical_url=metadata["canonical_url"],
+                target_manifest_sha256=manifest,
+                logical_target_units=2,
+                expected_endpoint_labels=labels,
+                now=now + timedelta(seconds=2),
+            )
 
 # --- FBref browser-phase lease cap extension ---------------------------------
 
@@ -6349,7 +7113,7 @@ def test_fbref_proxy_hard_stops_an_oversized_browser_phase_transfer(mod):
         )
     )
 
-    assert reader.read_sizes == [12]
+    assert reader.read_sizes == [6, 3, 2, 1]
     assert reader.payload == b"x" * 8
     assert b"".join(writer.writes) == b"x" * 12
     assert lease.total_bytes == lease.max_bytes == 12

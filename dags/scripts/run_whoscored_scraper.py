@@ -359,7 +359,6 @@ def _expected_paid_work_item_id(
         WHOSCORED_CANARY_DISCOVERY_WORK_ITEM_ID,
         WHOSCORED_CANARY_FIXED_SCOPES,
         WHOSCORED_CANARY_TASK_ID,
-        canonical_json_bytes,
     )
 
     scope_specs = sorted(scope.spec for scope in scopes)
@@ -392,14 +391,10 @@ def _expected_paid_work_item_id(
             raise ValueError(
                 "paid profile selector differs from its immutable work item"
             )
-        active_scopes_sha256 = hashlib.sha256(
-            ("\n".join(scope_specs) + "\n").encode("utf-8")
-        ).hexdigest()
-        identity = {
-            "catalog_batch_id": args.catalog_batch_id,
-            "active_scopes_sha256": active_scopes_sha256,
-        }
-        return "profiles-" + hashlib.sha256(canonical_json_bytes(identity)).hexdigest()
+        # The signed scheduled authority intentionally gives the single global
+        # profile task one stable work item. Exact catalog/scopes/candidates are
+        # bound separately by the v3 authority and runner arguments.
+        return "profiles-daily"
     if task_id == WHOSCORED_CANARY_TASK_ID:
         if args.command == "discover":
             if not args.full_history or scope_specs:
@@ -614,6 +609,17 @@ def _configure_transport_environment(args: argparse.Namespace) -> None:
     """Project validated CLI authority into the transport's process env."""
 
     os.environ["WHOSCORED_TRANSPORT_POLICY"] = str(args.transport_policy)
+    # Populated only from a verified schema-v3 approval below. Keeping the
+    # binding on the process-local Namespace lets the runner freeze exact due
+    # IDs before the schedule refresh can mutate repository eligibility.
+    args.scheduled_scope_workload = None
+    from scrapers.whoscored.proxy_campaign import (
+        SCHEDULED_SCOPE_PLAYER_PAGINATION_TARGET_LIMIT_ENV,
+    )
+
+    # This value is derived again from the verified scheduled authority below;
+    # a caller-controlled inherited value can never enlarge the scope runtime.
+    os.environ.pop(SCHEDULED_SCOPE_PLAYER_PAGINATION_TARGET_LIMIT_ENV, None)
     # The runner has no filtering-proxy or signing authority.  Remove legacy
     # origins and authority secrets before any mutable runtime module or source
     # transport can observe them.
@@ -669,7 +675,10 @@ def _configure_transport_environment(args: argparse.Namespace) -> None:
         raise ValueError(
             "--proxy-work-item-id differs from the independently derived work item"
         )
-    from scrapers.whoscored.proxy_campaign import load_proxy_campaign_context
+    from scrapers.whoscored.proxy_campaign import (
+        WHOSCORED_CANARY_CAPTURE_LEASE_LIMIT,
+        load_proxy_campaign_context,
+    )
 
     metadata = load_proxy_campaign_context(
         str(args.proxy_approval_path),
@@ -683,6 +692,41 @@ def _configure_transport_environment(args: argparse.Namespace) -> None:
     approval_payload = metadata.get("proxy_campaign_approval")
     if not isinstance(approval_payload, Mapping):
         raise ValueError("paid runner has no verified approval payload")
+    scheduled_authority = approval_payload.get("scheduled_authority")
+    if identity["task_id"] == "ingest_active_scope" and isinstance(
+        scheduled_authority, Mapping
+    ):
+        workloads = scheduled_authority.get("scope_workloads")
+        matching_workloads = (
+            [
+                item
+                for item in workloads
+                if isinstance(item, Mapping)
+                and item.get("work_item_id") == args.proxy_work_item_id
+            ]
+            if isinstance(workloads, list)
+            else []
+        )
+        if len(matching_workloads) != 1:
+            raise ValueError(
+                "paid daily scope has no unique signed pagination authority"
+            )
+        pagination_limit = matching_workloads[0].get("player_pagination_target_limit")
+        if (
+            isinstance(pagination_limit, bool)
+            or not isinstance(pagination_limit, int)
+            or not 0 <= pagination_limit <= WHOSCORED_CANARY_CAPTURE_LEASE_LIMIT
+        ):
+            raise ValueError("paid daily scope pagination authority is invalid")
+        os.environ[SCHEDULED_SCOPE_PLAYER_PAGINATION_TARGET_LIMIT_ENV] = str(
+            pagination_limit
+        )
+        args.scheduled_scope_workload = dict(matching_workloads[0])
+    elif (
+        identity["task_id"] == "ingest_active_scope"
+        and approval_payload.get("schema_version") == 3
+    ):
+        raise ValueError("scheduled paid scope has no pagination authority")
     args.proxy_runtime_sha256 = str(approval_payload.get("runtime_sha256") or "")
     args.proxy_classifier_sha256 = str(approval_payload.get("classifier_sha256") or "")
     if (
@@ -763,6 +807,164 @@ def _new_repository() -> Any:
     from scrapers.whoscored.repository import WhoScoredRepository
 
     return WhoScoredRepository()
+
+
+def _freeze_scheduled_scope_targets(
+    repository: Any,
+    selected: Sequence[tuple[RunnerScope, Any]],
+    args: argparse.Namespace,
+) -> None:
+    """Freeze exact signed match/preview IDs before the first source request.
+
+    ``sync_schedule`` intentionally refreshes Bronze before preview and match
+    ingestion. Without this process-local snapshot, that refresh could make a
+    different candidate set eligible after the signed workload was checked,
+    allowing paid traffic outside the owner-approved target identity.
+    """
+
+    workload = getattr(args, "scheduled_scope_workload", None)
+    if workload is None:
+        return
+    if not isinstance(workload, Mapping):
+        raise ValueError("scheduled paid scope workload is invalid")
+    if args.command != "daily" or len(selected) != 1:
+        raise ValueError("scheduled paid workload requires exactly one daily scope")
+
+    from scrapers.whoscored.proxy_campaign import (
+        scheduled_scope_player_pagination_target_limit,
+        scheduled_scope_schedule_target_limit,
+        scheduled_target_ids_sha256,
+    )
+    from scrapers.whoscored.repository import entity_id_payload_sha256
+
+    scope, runtime_scope = selected[0]
+    expected_work_item_id = (
+        "scope-" + hashlib.sha256(scope.spec.encode("utf-8")).hexdigest()
+    )
+    if (
+        workload.get("scope") != scope.spec
+        or workload.get("work_item_id") != expected_work_item_id
+        or workload.get("work_item_id") != args.proxy_work_item_id
+    ):
+        raise ValueError("scheduled paid workload belongs to another scope")
+
+    match_count = workload.get("match_target_count")
+    preview_count = workload.get("preview_target_count")
+    schedule_limit = workload.get("schedule_target_limit")
+    schedule_sha256 = workload.get("schedule_targets_sha256")
+    pagination_limit = workload.get("player_pagination_target_limit")
+    match_sha256 = workload.get("match_targets_sha256")
+    preview_sha256 = workload.get("preview_targets_sha256")
+    if (
+        type(schedule_limit) is not int
+        or schedule_limit <= 0
+        or not isinstance(schedule_sha256, str)
+        or _SHA256.fullmatch(schedule_sha256) is None
+        or type(pagination_limit) is not int
+        or pagination_limit < 0
+        or type(match_count) is not int
+        or not 0 <= match_count <= 100
+        or type(preview_count) is not int
+        or not 0 <= preview_count <= 256
+        or not isinstance(match_sha256, str)
+        or _SHA256.fullmatch(match_sha256) is None
+        or not isinstance(preview_sha256, str)
+        or _SHA256.fullmatch(preview_sha256) is None
+    ):
+        raise ValueError("scheduled paid target identity is invalid")
+
+    stage_ids = tuple(
+        sorted({int(value) for value in getattr(runtime_scope, "stage_ids", ())})
+    )
+    start = getattr(runtime_scope, "start", None)
+    end = getattr(runtime_scope, "end", None)
+    if not stage_ids or start is None or end is None or end < start:
+        raise ValueError("scheduled paid scope has no bounded frozen schedule")
+    season_month_count = (end.year - start.year) * 12 + end.month - start.month + 1
+    expected_schedule_limit = scheduled_scope_schedule_target_limit(
+        stage_count=len(stage_ids), season_month_count=season_month_count
+    )
+    expected_schedule_sha256 = scheduled_target_ids_sha256(
+        [f"season:{scope.spec}", *(f"stage:{value}" for value in stage_ids)]
+    )
+    expected_pagination_limit = scheduled_scope_player_pagination_target_limit(
+        stage_count=len(stage_ids),
+        non_pagination_target_count=(
+            expected_schedule_limit + match_count + preview_count
+        ),
+    )
+    if (
+        schedule_limit != expected_schedule_limit
+        or schedule_sha256 != expected_schedule_sha256
+        or pagination_limit != expected_pagination_limit
+    ):
+        raise ValueError(
+            "scheduled paid schedule target identity drifted before network"
+        )
+
+    matches = repository.list_match_candidates(
+        scope.competition_id,
+        scope.season_id,
+        limit=101,
+        include_exact_count=True,
+    )
+    observed_match_count = (
+        int(matches[0].exact_candidate_count)
+        if matches and matches[0].exact_candidate_count is not None
+        else len(matches)
+    )
+    match_ids = tuple(sorted({int(candidate.game_id) for candidate in matches}))
+    previews = repository.list_preview_candidates(
+        scope.competition_id,
+        scope.season_id,
+        limit=257,
+    )
+    preview_ids = tuple(sorted({int(candidate["game_id"]) for candidate in previews}))
+    if (
+        observed_match_count != len(match_ids)
+        or observed_match_count != match_count
+        or scheduled_target_ids_sha256(match_ids) != match_sha256
+        or len(previews) != len(preview_ids)
+        or len(preview_ids) != preview_count
+        or scheduled_target_ids_sha256(preview_ids) != preview_sha256
+    ):
+        raise ValueError("scheduled paid due target identity drifted before network")
+
+    args._match_ids = match_ids
+    args._preview_ids = preview_ids
+    args._scheduled_scope_attempts = {
+        "scope": scope.spec,
+        "match": {
+            "schema_version": 1,
+            "scope": scope.spec,
+            "count": len(match_ids),
+            "payload_sha256": entity_id_payload_sha256(match_ids),
+        },
+        "preview": {
+            "schema_version": 1,
+            "scope": scope.spec,
+            "count": len(preview_ids),
+            "payload_sha256": entity_id_payload_sha256(preview_ids),
+        },
+    }
+
+
+def _validate_scheduled_scope_attempts(
+    report: Mapping[str, Any], args: argparse.Namespace
+) -> None:
+    """Require service attempts to equal the immutable pre-schedule snapshot."""
+
+    expected = getattr(args, "_scheduled_scope_attempts", None)
+    if expected is None:
+        return
+    producer_attempts = report.get("producer_attempts")
+    if not isinstance(expected, Mapping) or not isinstance(producer_attempts, Mapping):
+        raise ValueError("scheduled paid attempted-target evidence is unavailable")
+    for kind in ("match", "preview"):
+        if producer_attempts.get(kind) != [expected[kind]]:
+            raise ValueError(
+                f"scheduled paid {kind} attempts differ from the signed target set"
+            )
 
 
 def _scope_value(value: Any) -> RunnerScope:
@@ -1259,16 +1461,22 @@ def _invoke(
     if operation == "schedule":
         return service.sync_schedule()
     if operation == "previews":
+        preview_ids = getattr(
+            args,
+            "_preview_ids",
+            getattr(args, "_match_ids", None),
+        )
         return service.sync_previews(
-            match_ids=getattr(args, "_match_ids", None),
+            match_ids=preview_ids,
             force_replay=bool(getattr(args, "_force_replay", False)),
         )
     if operation == "matches":
-        daily_incremental = args.command == "daily" and not getattr(
-            args, "_match_ids", None
-        )
+        match_ids = getattr(args, "_match_ids", None)
+        # An explicit empty tuple is an exact signed zero-target workload, not
+        # permission to fall back to a fresh mutable candidate query.
+        daily_incremental = args.command == "daily" and match_ids is None
         match_kwargs: dict[str, Any] = {
-            "match_ids": getattr(args, "_match_ids", None),
+            "match_ids": match_ids,
             "limit": (
                 args.max_matches
                 if args.max_matches is not None
@@ -1954,6 +2162,32 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             report["catalog_batch_id"] = str(catalog_generation["catalog_batch_id"])
         if backfill_discovery_result is not None:
             _merge_unscoped_result(report, backfill_discovery_result)
+        try:
+            _freeze_scheduled_scope_targets(repository, selected, args)
+        except Exception as exc:
+            if selected:
+                owner = selected[0][0]
+                record = _scope_record(report, owner)
+                _record_error(
+                    report,
+                    record,
+                    owner,
+                    "scheduled-workload-preflight",
+                    exc,
+                )
+                _set_scope_status(record)
+            else:
+                report["errors"].append(f"scheduled-workload-preflight: {exc}")
+                report["error_details"].append(
+                    {
+                        "scope": None,
+                        "entity": "scheduled-workload-preflight",
+                        "type": type(exc).__name__,
+                        "message": str(exc),
+                        "retryable": False,
+                    }
+                )
+            return _finish(report, args.output)
         logger.info(
             "Starting WhoScored workflow: command=%s scopes=%s",
             args.command,
@@ -2002,6 +2236,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     args=args,
                     operations=_operations("daily"),
                 )
+                try:
+                    _validate_scheduled_scope_attempts(report, args)
+                except Exception as exc:
+                    owner = selected[0][0]
+                    record = _scope_record(report, owner)
+                    _record_error(
+                        report,
+                        record,
+                        owner,
+                        "scheduled-workload-attempts",
+                        exc,
+                    )
+                    _set_scope_status(record)
             if not args.skip_profiles and not report["error_details"]:
                 _run_global_profiles(
                     service_cls=service_cls,

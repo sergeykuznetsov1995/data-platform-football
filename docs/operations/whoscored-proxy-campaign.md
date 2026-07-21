@@ -1,12 +1,14 @@
 # WhoScored paid-proxy measurement campaign
 
-This runbook covers the manual measurement canary only. Its maximum authority is
-`1_000_000_000` decimal provider-billed bytes and it is valid only for
-`dag_canary_whoscored_proxy`. This release does not authorize a full paid crawl.
-The filter applies a stricter executable ceiling of `850 MiB` to the whole
-initialized provider-order state. That durable total includes spent bytes and
-active escrow from every approval/campaign and does not reset at UTC midnight,
-process restart, or approval replacement.
+This runbook covers the manual measurement canary only. Its legacy signed
+envelope is `1_000_000_000` decimal provider-billed bytes and it is valid only
+for `dag_canary_whoscored_proxy`; the provider order also has a 1.00 decimal-GB
+quota. Neither value is executable authority for the whole amount. This release
+enforces the stricter exact `300000000` decimal-byte lifetime ceiling across the
+initialized provider-order state and does not authorize a full paid crawl. That
+durable total includes spent bytes and active escrow from every approval and
+campaign, and does not reset at UTC midnight, process restart, or approval
+replacement.
 
 The two code-owned invoice-boundary and application-gateway sentinels enable
 only the exact canary contract; they are not environment switches or operator
@@ -28,7 +30,7 @@ nor environment variables can enable them.
 
 The ceiling is authority, not a spending target. Raw-cache hits and successful
 direct requests cost zero, and the workflow never manufactures traffic merely
-to consume the whole gigabyte.
+to consume the `300000000`-byte release allowance.
 
 ## Safety properties
 
@@ -169,9 +171,10 @@ The scheduler needs:
 - `WHOSCORED_PROXY_APPROVAL_HOST_DIR`, an absolute directory outside the
   checkout, mounted read-only into the scheduler at
   `/opt/airflow/secure/whoscored-approvals`;
-- `WHOSCORED_PROXY_APPROVAL_PATH`, either empty for direct-only runs or the
-  exact in-container path
-  `/opt/airflow/secure/whoscored-approvals/<approval_id>.json`;
+- `WHOSCORED_PROXY_APPROVAL_ROOT` and the read-only scheduled-pointer root.
+  Manual runs pin `approval_id` plus file SHA-256 in `DagRun.conf`; scheduled
+  runs use only the immutable run-ID-keyed pointer. No static selector is
+  projected into the scheduler;
 - the selected regular file owned by Airflow UID `50000`, named
   `<approval_id>.json`, with mode `0600`;
 - a read-only bind of `WHOSCORED_PROXY_FILTER_STATE_HOST_DIR` at
@@ -239,6 +242,8 @@ existing file. Review the complete unsigned JSON. In particular, prove:
 - `allowed_dag_ids` is exactly `["dag_canary_whoscored_proxy"]`;
 - total and daily budgets are exactly `1_000_000_000`; discovery is exactly
   `250_000_000` and capture is exactly `750_000_000`;
+- those legacy canary-envelope fields do not raise the release's independent
+  exact `300000000` decimal-byte provider-order lifetime cap;
 - request/lease limits are code-owned and exact: discovery permits at most
   `5,000` provider dials across `2,500` URL leases, capture permits at most
   `10,000` dials across `5,000` URL leases, and the signing CLI exposes no
@@ -292,7 +297,8 @@ from pathlib import Path
 
 from scrapers.whoscored.proxy_campaign import ProxyCampaignApproval
 
-path = Path(os.environ["WHOSCORED_PROXY_APPROVAL_PATH"])
+approval_id = os.environ["APPROVAL_ID"]
+path = Path(os.environ["WHOSCORED_PROXY_APPROVAL_ROOT"]) / f"{approval_id}.json"
 metadata = path.stat(follow_symlinks=False)
 assert metadata.st_uid == os.geteuid() == 50000
 assert stat.S_IMODE(metadata.st_mode) == 0o600

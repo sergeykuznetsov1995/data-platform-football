@@ -69,11 +69,132 @@ def test_ci_runs_public_writer_and_capacity_contracts():
     assert "bench_whoscored_capacity.py" in text
     assert "whoscored_capacity_container_runtime.py" in text
     assert "docker/images/airflow/whoscored_capacity_worker_bootstrap.py" in text
-    assert "rg --files tests" in text
+    assert "mapfile -t whoscored_tests" in text
+    assert "find tests -type f -name 'test_*whoscored*.py'" in text
+    assert '"${whoscored_tests[@]}"' in text
+    assert "mapfile -t whoscored_static_paths" in text
+    assert '"${whoscored_static_paths[@]}"' in text
+    assert "rg --files tests" not in text
+
+
+def test_ci_isolates_root_only_contracts_from_the_host_runner():
+    text = _workflow_text()
+    unit_step = text.split(
+        "- name: WhoScored unit, DAG and storage contract", 1
+    )[1].split("- name: Static and import checks", 1)[0]
+    real_docker_step = text.split(
+        "- name: Prove real Buildx metadata and Docker digest last", 1
+    )[1].split("- name: Cleanup test runtime", 1)[0]
+    lock = (ROOT / ".github" / "workflows" / "whoscored-test.lock").read_text(
+        encoding="utf-8"
+    )
+
+    assert "sudo " not in unit_step
+    assert "ubuntu:24.04@sha256:" in unit_step
+    assert "4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90" in (
+        unit_step
+    )
+    assert "--network none" in unit_step
+    assert "--cap-drop ALL" in unit_step
+    assert "--cap-add CHOWN" in unit_step
+    assert "--cap-add DAC_OVERRIDE" in unit_step
+    assert "--cap-add FOWNER" in unit_step
+    assert "--cap-add SYS_ADMIN" in unit_step
+    assert "--security-opt no-new-privileges:true" in unit_step
+    assert "--security-opt apparmor=docker-default" in unit_step
+    assert "--security-opt seccomp=builtin" in unit_step
+    assert "seccomp=unconfined" not in unit_step
+    assert "'{{json .HostConfig.Binds}}'" in unit_step
+    assert "'{{json .HostConfig.Mounts}}'" in unit_step
+    assert "'{{json .Mounts}}'" in unit_step
+    assert 'tar -C "$GITHUB_WORKSPACE" -cf - .' in unit_step
+    assert "tar --no-same-owner -C /root/data-platform-football -xf -" in unit_step
+    assert "ldd " not in unit_step
+    assert "tar -C /usr/lib/x86_64-linux-gnu -cf - ." in unit_step
+    assert "tar -C /usr/share/zoneinfo -cf - ." in unit_step
+    assert "node:22.23.1-bookworm-slim@sha256:" in unit_step
+    assert "8607a9064d4a571140998ae9e52a3b3fcf9cff361d04642d5971e6cd76d39e27" in (
+        unit_step
+    )
+    assert 'docker cp "$node_donor:/usr/local/bin/node" -' in unit_step
+    assert 'docker cp - "$test_container:/usr/local/bin/"' in unit_step
+    assert "/usr/bin/node" not in unit_step
+    assert "/opt/hostedtoolcache/node" not in unit_step
+    assert "actions/setup-node" not in unit_step
+    assert 'docker start "$node_donor"' not in unit_step
+    assert "set -o pipefail" in unit_step
+    assert "isolated_venv=/opt/whoscored-ci-test-venv" in unit_step
+    assert 'tar --no-same-owner -C "$isolated_venv" -xf -' in unit_step
+    assert '"$isolated_venv/bin/python" -m pytest -q' in unit_step
+    assert '"$WHOSCORED_CI_TEST_VENV/bin/python" -m pytest -q' not in unit_step
+    assert '"$WHOSCORED_CI_PYTHON_PREFIX/bin/python3.11" /usr/bin/python3' in (
+        unit_step
+    )
+    assert '"/usr/bin/python3|$WHOSCORED_CI_PYTHON_PREFIX|3.11"' in unit_step
+    assert "node_donor=" in unit_step
+    assert unit_step.count(
+        "93956de2e59480474a7b46571da1651180b1a050cdf32641ebec4ce6e478e068"
+    ) == 1
+    assert "unexpected_runtime_path" in unit_step
+    assert "! -user root -o -writable" in unit_step
+    assert "! -user root -o ! -group root" in unit_step
+    assert 'if ! unexpected_ownership="$(docker exec' in unit_step
+    assert 'test -z "$unexpected_ownership"' in unit_step
+    assert "unexpected_test_runtime_path" in unit_step
+    assert "isolated test runtime scan failed" in unit_step
+    assert "! -group root -o -perm /022" in unit_step
+    assert (
+        '"$isolated_venv/bin/python|$isolated_venv|'
+        '$WHOSCORED_CI_PYTHON_PREFIX"' in unit_step
+    )
+    assert "/usr/libexec/docker/cli-plugins/docker-compose" in unit_step
+    assert "test -S /run/docker.sock" in unit_step
+    assert 'endpoint.connect("/run/docker.sock")' in unit_step
+    assert "GITHUB_WORKSPACE=/root/data-platform-football" in unit_step
+    assert "--workdir /root/data-platform-football" in unit_step
+    assert "/root/.secrets/whoscored-runtime-v2.env" in unit_step
+    assert "/root/.secrets/whoscored-proxy-v2.env" in unit_step
+    assert 'Path("/usr/local/bin/docker")' in unit_step
+    assert 'exec /usr/bin/docker \\"$@\\"' in unit_step
+    assert "unshare from util-linux 2.39.3" in unit_step
+    assert "51bcc77ba5db162c80028f861f0a2770d728c1de80773816d863f28d7a817adb" in (
+        unit_step
+    )
+    assert "--env WHOSCORED_REAL_DOCKER_TEST" not in unit_step
+    assert "WHOSCORED_REAL_DOCKER_TEST=1" not in unit_step
+    assert 'test "$isolated_status" = 0' in unit_step
+    assert "WHOSCORED_REAL_DOCKER_TEST=1" in real_docker_step
+    assert (
+        "test_generate_whoscored_deployment_attestation.py::"
+        "test_real_buildx_metadata_and_docker_digest_path_when_ci_provides_it"
+    ) in real_docker_step
+    assert (
+        lock.splitlines().count(
+            "curl-cffi==0.15.0 "
+            "--hash=sha256:2b6c847d86283b07ae69bb72c82eb8a59242277142aa35b89850f89e792a02fc"
+        )
+        == 1
+    )
+    install_step = text.split("- name: Install test runtime", 1)[1].split(
+        "- name: WhoScored unit, DAG and storage contract", 1
+    )[0]
+    assert "sudo " not in install_step
+    assert 'test_venv="$(mktemp -d /tmp/whoscored-ci-test-venv.XXXXXXXX)"' in (
+        install_step
+    )
+    assert '"$WHOSCORED_CI_SETUP_PYTHON" -I -S -m venv --copies' in install_step
+    assert '"$test_venv/bin/python" -I -m pip install' in install_step
+    assert "WHOSCORED_CI_PYTHON_PREFIX=$setup_python_prefix" in install_step
+    assert "--require-hashes --only-binary=:all:" in install_step
+    assert '-r .github/workflows/whoscored-test.lock' in install_step
+    assert text.count("-m pip install \\") == 1
 
 
 def test_ci_uses_test_runtime_and_smokes_immutable_flaresolverr():
     text = _workflow_text()
+    contract_job = text.split("  contract:\n", 1)[1].split(
+        "  real-airflow-dag-import:\n", 1
+    )[0]
     scheduler_smoke = text.split(
         "- name: Build and smoke the hardened scheduler test image", 1
     )[1].split("- name: Build production targets", 1)[0]
@@ -116,6 +237,76 @@ def test_ci_uses_test_runtime_and_smokes_immutable_flaresolverr():
     assert "platform == 'Win32'" in scheduler_smoke
     assert "/v1/whoscored/runtime-identity" in text
     assert 'assert response["extension_sha256"] == identity["extension_sha256"]' in text
+    assert "docker/setup-buildx-action@" not in text
+    assert "/usr/libexec/docker/cli-plugins/docker-buildx" in text
+    assert "d41ece72044243b4f58b343441ae37446d9c29a7d6b5e11c61847bbcf8f7dfda" in (
+        text
+    )
+    assert "a319e5b15052cf6557ceb666eb8ff6e32380b782" in text
+    assert 'test ! -e "$HOME/.docker/cli-plugins/docker-buildx"' in text
+    assert "docker buildx build" not in text
+    assert text.count('"$buildx_exec" build "$@"') == 4
+    assert text.count("buildx_build \\\n") == 7
+    assert text.count("for attempt in 1 2 3") == 4
+    assert "type=gha" not in text
+    assert text.count(
+        "exec 9< /usr/libexec/docker/cli-plugins/docker-buildx"
+    ) == 4
+    assert text.count('--builder "$WHOSCORED_CI_BUILDER"') == 7
+    early_verification = text.index(
+        "- name: Create an isolated immutable builder before repository code runs"
+    )
+    assert early_verification < text.index(
+        "- name: Build immutable Superset and JupyterHub runtimes"
+    )
+    assert text.index(
+        "- name: Build and smoke the immutable WhoScored FlareSolverr image"
+    ) < text.index("- name: Install test runtime")
+    assert text.index("- name: Install test runtime") < text.index(
+        "- name: Static and import checks"
+    )
+    assert "BASH_ENV: /dev/null" in text
+    assert "uses:" not in contract_job
+    assert "refs/pull/${WHOSCORED_CI_PR_NUMBER}/merge" in contract_job
+    assert "fetch --no-tags --depth=3 origin" in contract_job
+    assert "GIT_CONFIG_NOSYSTEM: \"1\"" in contract_job
+    assert "filter.lfs.process" in contract_job
+    assert "WHOSCORED_CI_SETUP_PYTHON=$python_bin" in contract_job
+    assert "/opt/hostedtoolcache/Python" in contract_job
+    assert "x64/bin/python3.11" in contract_job
+    assert "/usr/bin/sudo /bin/chmod go-w /opt" in contract_job
+    assert "/usr/bin/sudo /bin/chmod go-w /usr/share" in contract_job
+    assert "/usr/bin/sudo /bin/chmod -R go-w /usr/share/zoneinfo" in contract_job
+    assert "/usr/bin/sudo /bin/chown -R root:root /opt/hostedtoolcache/Python" in (
+        contract_job
+    )
+    assert "source_prefix\" =~ ^/opt/hostedtoolcache/Python/3\\.11" in contract_job
+    assert "unexpected_python_path" in contract_job
+    assert "unexpected_python_link" in contract_job
+    assert text.count("persist-credentials: false") == 1
+    assert text.count("if: ${{ !cancelled() }}") == 5
+    assert text.index(
+        "- name: Prove checked-in evidence and closure report agree"
+    ) < text.index("- name: Prove real Buildx metadata and Docker digest last")
+    assert text.index(
+        "- name: Prove real Buildx metadata and Docker digest last"
+    ) < text.index("- name: Cleanup test runtime")
+    assert "- name: Cleanup test runtime" in text
+    assert "if: ${{ always() }}" in text
+    assert "buildx_buildkit_${builder_name}0" in text
+    assert "DOCKER_CONFIG=$docker_config" in text
+    assert "DOCKER_HOST=unix:///var/run/docker.sock" in text
+    assert "BUILDX_CONFIG=$docker_config/buildx" in text
+    assert "BUILDX_HOST BUILDX_CONFIG" in text
+    assert "--buildkitd-config \"$buildkit_config\"" in text
+    assert text.count("--driver-opt provenance-add-gha=false") == 1
+    assert "test ! -e /etc/buildkit/provenance.d/github_actions_context.json" in text
+    assert "PS4='+ whoscored-contract:${LINENO}: '" in text
+    assert "{{.HostConfig.NetworkMode}}" in text
+    assert (
+        "image=moby/buildkit:v0.31.2@sha256:"
+        "2f5adac4ecd194d9f8c10b7b5d7bceb5186853db1b26e5abd3a657af0b7e26ec"
+    ) in text
 
 
 def test_ci_proves_both_production_targets_match_declared_evidence_state():
@@ -127,7 +318,8 @@ def test_ci_proves_both_production_targets_match_declared_evidence_state():
     assert "--expect-ready-build" in text
     assert "--release-revision" in text
     assert "github.event.pull_request.head.sha" in text
-    assert "fetch-depth: 0" in text
+    assert '"refs/remotes/pull/${WHOSCORED_CI_PR_NUMBER}/merge"' in text
+    assert "/usr/bin/git rev-parse HEAD^2" in text
     assert 'case "$provenance_status" in' in text
     assert "blocked-v1)" in text
     assert "ready-v1)" in text
@@ -144,7 +336,7 @@ def test_ci_proves_both_production_targets_match_declared_evidence_state():
     assert "--entrypoint /opt/legacy-scraper-venv/bin/python" in text
 
 
-def test_production_provenance_is_pushed_and_smoked_by_digest():
+def test_production_provenance_is_pushed_and_smoked_by_digest() -> None:
     text = _workflow_text()
     production = text.split(
         "- name: Build production targets and prove the declared gate state", 1
@@ -156,29 +348,34 @@ def test_production_provenance_is_pushed_and_smoked_by_digest():
         "registry:2.8.3@sha256:"
         "a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373"
     ) in text
-    assert 'network=host' in text
-    assert text.count("provenance-add-gha=false") == 1
     assert '[registry."127.0.0.1:5000"]' in text
+    assert "--driver-opt network=host" in text
+    assert "network=host" in text
     assert production.count("--provenance=mode=max,version=v1") == 2
     assert production.count("--push") == 2
-    attested_commands = [
+    build_commands = [
         block.split("docker/images/airflow", 1)[0]
-        for block in production.split("docker buildx build \\\n")[1:]
-        if "--provenance=" in block
+        for block in production.split(
+            "buildx_build \\\n"
+        )[1:]
     ]
-    assert len(attested_commands) == 2
-    assert all("--load" not in command for command in attested_commands)
+    assert sum("--provenance=" in command for command in build_commands) == 2
+    assert all(
+        "--load" not in command
+        for command in build_commands
+        if "--provenance=" in command
+    )
     assert 'docker pull "$scheduler"' in production
     assert 'docker pull "$proxy"' in production
-    assert 'docker tag "$scheduler" "$scheduler_tag"' in production
-    assert 'docker tag "$proxy" "$proxy_tag"' in production
-    assert 'scheduler="$scheduler_tag@$scheduler_digest"' in production
-    assert 'proxy="$proxy_tag@$proxy_digest"' in production
+    assert "docker tag " not in production
     assert (
-        "WHOSCORED_SCHEDULER_IMAGE: "
-        "127.0.0.1:5000/data-platform-airflow-scheduler:provenance-ci"
-    ) in text
-    assert "WHOSCORED_SCHEDULER_IMAGE: data-platform-airflow-scheduler" not in text
+        'scheduler="$scheduler_repository@$scheduler_digest"' in production
+    )
+    assert 'proxy="$proxy_repository@$proxy_digest"' in production
+    assert 'echo "WHOSCORED_SCHEDULER_IMAGE=$scheduler"' in production
+    assert 'echo "WHOSCORED_PROXY_IMAGE=$proxy"' in production
+    assert 'echo "WHOSCORED_SCHEDULER_IMAGE=$scheduler_tag"' not in production
+    assert 'echo "WHOSCORED_PROXY_IMAGE=$proxy_tag"' not in production
 
 
 def test_ci_exercises_every_runner_moved_to_the_legacy_venv():

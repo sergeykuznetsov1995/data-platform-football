@@ -730,11 +730,13 @@ services:
       WHOSCORED_BACKUP_DESTINATION_S3_SECRET_KEY: ${WHOSCORED_BACKUP_DESTINATION_S3_SECRET_KEY:-}
       WHOSCORED_BACKUP_RESTORE_S3_ACCESS_KEY: ${WHOSCORED_BACKUP_RESTORE_S3_ACCESS_KEY:-}
       WHOSCORED_BACKUP_RESTORE_S3_SECRET_KEY: ${WHOSCORED_BACKUP_RESTORE_S3_SECRET_KEY:-}
-      # LocalExecutor children can read only signed approval documents.  The
-      # approval/control/ledger HMAC keys live in the isolated paid boundary and
-      # DagRun.conf must still pin the selected file by approval ID and SHA-256.
+      # LocalExecutor children can read only signed approvals and immutable
+      # run-ID pointers. Approval/control/ledger HMAC keys stay outside Airflow;
+      # scheduled code derives the exact approval ID and SHA from its pointer.
       WHOSCORED_PROXY_APPROVAL_ROOT: /opt/airflow/secure/whoscored-approvals
-      WHOSCORED_PROXY_APPROVAL_PATH: ${WHOSCORED_PROXY_APPROVAL_PATH:-}
+      WHOSCORED_SCHEDULED_PAID_POINTER_ROOT: /opt/airflow/secure/whoscored-scheduled-pointers
+      WHOSCORED_SCHEDULED_PAID_MODE: ${WHOSCORED_SCHEDULED_PAID_MODE:-required}
+      WHOSCORED_PAID_BATCH_ENABLED: ${WHOSCORED_PAID_BATCH_ENABLED:-0}
       WHOSCORED_PAID_GATEWAY_URL: ${WHOSCORED_PAID_GATEWAY_URL:-http://whoscored_paid_gateway:8898}
       WHOSCORED_PAID_GATEWAY_TOKEN: ${WHOSCORED_PAID_GATEWAY_TOKEN:-}
       WHOSCORED_SCRAPER_PYTHON: /usr/local/bin/python
@@ -817,6 +819,12 @@ services:
       - type: bind
         source: ${WHOSCORED_PROXY_APPROVAL_HOST_DIR:?set an absolute protected approval directory}
         target: /opt/airflow/secure/whoscored-approvals
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${WHOSCORED_SCHEDULED_PAID_POINTER_HOST_DIR:?set an absolute protected scheduled-pointer directory}
+        target: /opt/airflow/secure/whoscored-scheduled-pointers
         read_only: true
         bind:
           create_host_path: false
@@ -1424,53 +1432,6 @@ services:
     networks:
       - backend
 
-  # Paid Chromium is a separate, authenticated process.  It has no host port,
-  # no backend attachment and no direct internet route; every /v1 side effect
-  # requires a one-use gateway capability.
-  flaresolverr_whoscored_paid:
-    profiles: ["whoscored-paid"]
-    image: data-platform-flaresolverr-whoscored:3.4.6
-    build:
-      context: .
-      dockerfile: docker/images/flaresolverr-whoscored/Dockerfile
-    container_name: flaresolverr_whoscored_paid
-    read_only: true
-    tmpfs:
-      - /tmp:rw,exec,nosuid,nodev,size=2g,uid=1000,gid=1000,mode=1770
-      - /config:rw,noexec,nosuid,nodev,size=16m,uid=1000,gid=1000,mode=0700
-      - /app/.config:rw,noexec,nosuid,nodev,size=64m,uid=1000,gid=1000,mode=0700
-      - /app/.local:rw,noexec,nosuid,nodev,size=64m,uid=1000,gid=1000,mode=0700
-    restart: unless-stopped
-    security_opt:
-      - no-new-privileges:true
-      - apparmor=docker-default
-      - seccomp=builtin
-    cap_drop:
-      - ALL
-    cap_add: []
-    environment:
-      LOG_LEVEL: info
-      LOG_HTML: "false"
-      CAPTCHA_SOLVER: none
-      TZ: UTC
-      WHOSCORED_FLARESOLVERR_PAID_EXCLUSIVE: "1"
-      WHOSCORED_FLARESOLVERR_GATEWAY_SECRET: ${WHOSCORED_FLARESOLVERR_GATEWAY_SECRET:-}
-    shm_size: "1g"
-    healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:8191/health || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 30s
-    deploy:
-      resources:
-        limits:
-          memory: 2G
-        reservations:
-          memory: 512M
-    networks:
-      - whoscored-paid-browser
-
   # ===========================================================================
   # fbref_proxy_filter - isolated, byte-metered residential path for FBref.
   # It is the only process that reads the dedicated proxy pool.  Airflow gets
@@ -1652,244 +1613,6 @@ services:
         condition: service_started
     networks:
       - backend
-
-  # Dedicated paid boundary for WhoScored. It has a separate provider pool,
-  # control credential and ledgers, and is opt-in until a provider subaccount
-  # exposes an authoritative server-side invoice quota/usage receipt.
-  whoscored_proxy_filter:
-    profiles: ["whoscored-paid"]
-    image: data-platform-airflow-whoscored-proxy:2.11.2-whoscored
-    build:
-      context: ./docker/images/airflow
-      dockerfile: Dockerfile
-      target: airflow-whoscored-proxy
-    container_name: whoscored_proxy_filter
-    read_only: true
-    tmpfs:
-      - /tmp:rw,noexec,nosuid,nodev,size=32m,uid=50000,gid=0,mode=0700
-    restart: unless-stopped
-    security_opt:
-      - no-new-privileges:true
-      - apparmor=docker-default
-      - seccomp=builtin
-    cap_drop:
-      - ALL
-    cap_add: []
-    environment:
-      CONNECTION_CHECK_MAX_COUNT: "0"
-      PROXY_FILTER_CONTROL_TOKEN: ${WHOSCORED_PROXY_FILTER_CONTROL_TOKEN:-}
-      WHOSCORED_PROXY_APPROVAL_HMAC_SECRET: ${WHOSCORED_PROXY_APPROVAL_HMAC_SECRET:-}
-      WHOSCORED_PROXY_LEDGER_HMAC_SECRET: ${WHOSCORED_PROXY_LEDGER_HMAC_SECRET:-}
-      TM_PROXY_CONTROL_TOKEN: ""
-      WHOSCORED_PROXY_CAMPAIGN_LEDGER_PATH: /opt/airflow/state/whoscored-proxy-filter/whoscored_campaigns.json
-      PROXY_POOL_JSON: ${WHOSCORED_PROXY_POOL_JSON:-}
-      PROXY_FILTER_ALLOW_FILE_FALLBACK: "false"
-    command:
-      - python
-      - /opt/airflow/scripts/proxy_filter/filter_proxy.py
-      - --source-mode
-      - whoscored-only
-      - --listen
-      - 0.0.0.0:8899
-      - --lease-listen
-      - 0.0.0.0:8900
-      - --lease-proxy-url
-      - http://whoscored_proxy_filter:8900
-      - --blocklist
-      - /opt/airflow/configs/proxy_filter/blocklist.txt
-      - --out
-      - /opt/airflow/state/whoscored-proxy-filter/bytes.json
-      - --daily-budget-mb
-      - ${WHOSCORED_PROXY_FILTER_DAILY_BUDGET_MB:-850}
-      - --max-lease-mb
-      - ${WHOSCORED_PROXY_FILTER_MAX_LEASE_MB:-2}
-      - --max-lease-ttl-seconds
-      - ${WHOSCORED_PROXY_FILTER_MAX_LEASE_TTL_SECONDS:-3600}
-      - --dagrun-budget-bytes
-      - ${WHOSCORED_PROXY_FILTER_DAGRUN_BUDGET_BYTES:-1000000000}
-      - --transfermarkt-dagrun-budget-bytes
-      - "0"
-      - --url-budget-bytes
-      - ${WHOSCORED_PROXY_FILTER_URL_BUDGET_BYTES:-2000000}
-      - --max-active-leases
-      - ${WHOSCORED_PROXY_FILTER_MAX_ACTIVE_LEASES:-2}
-      - --sofascore-budget-artifact
-      - /opt/airflow/configs/sofascore/proxy_budget_canary.json
-      - --sofascore-canary-hard-cap-bytes
-      - "0"
-      - --sofascore-discovery-dagrun-budget-bytes
-      - "0"
-      - --ledger
-      - /opt/airflow/state/whoscored-proxy-filter/paid_requests.jsonl
-      - --whoscored-campaign-ledger
-      - /opt/airflow/state/whoscored-proxy-filter/whoscored_campaigns.json
-      - --whoscored-state-marker
-      - /opt/airflow/state/whoscored-proxy-filter/.whoscored_state_initialized.json
-    volumes:
-      - type: bind
-        source: ./dags
-        target: /opt/airflow/dags
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ./scripts
-        target: /opt/airflow/scripts
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ./scrapers
-        target: /opt/airflow/scrapers
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ./configs/medallion
-        target: /opt/airflow/configs/medallion
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ./configs/proxy_filter
-        target: /opt/airflow/configs/proxy_filter
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ./configs/sofascore
-        target: /opt/airflow/configs/sofascore
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ${WHOSCORED_PROXY_FILTER_STATE_HOST_DIR:?set an absolute protected paid-filter state directory}
-        target: /opt/airflow/state/whoscored-proxy-filter
-        bind:
-          create_host_path: false
-    healthcheck:
-      test: ["CMD", "curl", "--fail", "--silent", "http://localhost:8899/health"]
-      interval: 10s
-      timeout: 3s
-      retries: 5
-      start_period: 5s
-    deploy:
-      resources:
-        limits:
-          memory: 256M
-        reservations:
-          memory: 64M
-    depends_on:
-      airflow-log-init:
-        condition: service_completed_successfully
-    networks:
-      - whoscored-paid-browser
-      - whoscored-paid-provider-egress
-
-  # The runner can ask for exactly one bounded fetch.  This gateway owns and
-  # destroys proxy leases and browser sessions before returning content plus a
-  # credential-free accounting receipt.
-  whoscored_paid_gateway:
-    profiles: ["whoscored-paid"]
-    image: data-platform-airflow-whoscored-proxy:2.11.2-whoscored
-    build:
-      context: ./docker/images/airflow
-      dockerfile: Dockerfile
-      target: airflow-whoscored-proxy
-    container_name: whoscored_paid_gateway
-    read_only: true
-    tmpfs:
-      - /tmp:rw,noexec,nosuid,nodev,size=32m,uid=50000,gid=0,mode=0700
-    restart: unless-stopped
-    security_opt:
-      - no-new-privileges:true
-      - apparmor=docker-default
-      - seccomp=builtin
-    cap_drop:
-      - ALL
-    cap_add: []
-    environment:
-      CONNECTION_CHECK_MAX_COUNT: "0"
-      ALERT_ENV: ${ALERT_ENV:-}
-      WHOSCORED_PAID_GATEWAY_TOKEN: ${WHOSCORED_PAID_GATEWAY_TOKEN:-}
-      WHOSCORED_PROXY_CONTROL_TOKEN: ${WHOSCORED_PROXY_FILTER_CONTROL_TOKEN:-}
-      WHOSCORED_PROXY_APPROVAL_HMAC_SECRET: ${WHOSCORED_PROXY_APPROVAL_HMAC_SECRET:-}
-      WHOSCORED_PAID_ALERT_HMAC_SECRET: ${WHOSCORED_PAID_ALERT_HMAC_SECRET:-}
-      WHOSCORED_PAID_ALERT_AUTHORITY_ROOT: /opt/airflow/secure/whoscored-alert-authority
-      WHOSCORED_PAID_ALERT_SECRET_PATH: /opt/airflow/secure/whoscored-alert-authority/telegram.json
-      WHOSCORED_PAID_ALERT_BINDING_PATH: /opt/airflow/secure/whoscored-alert-authority/binding.json
-      WHOSCORED_PAID_ALERT_RECEIPT_ROOT: /opt/airflow/state/whoscored-paid-gateway/alert-receipts
-      WHOSCORED_FLARESOLVERR_GATEWAY_SECRET: ${WHOSCORED_FLARESOLVERR_GATEWAY_SECRET:-}
-    command:
-      - python
-      - /opt/airflow/scripts/whoscored_paid_gateway.py
-      - --host
-      - 0.0.0.0
-      - --port
-      - "8898"
-      - --proxy-url
-      - http://whoscored_proxy_filter:8900
-      - --proxy-control-url
-      - http://whoscored_proxy_filter:8899
-      - --flaresolverr-url
-      - http://flaresolverr_whoscored_paid:8191
-    volumes:
-      - type: bind
-        source: ./dags
-        target: /opt/airflow/dags
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ./scripts
-        target: /opt/airflow/scripts
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ./scrapers
-        target: /opt/airflow/scrapers
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ./configs/medallion
-        target: /opt/airflow/configs/medallion
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ${WHOSCORED_PAID_GATEWAY_STATE_HOST_DIR:?set an absolute protected paid-gateway state directory}
-        target: /opt/airflow/state/whoscored-paid-gateway
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ${WHOSCORED_PAID_ALERT_AUTHORITY_HOST_DIR:?set an absolute protected paid-alert authority directory}
-        target: /opt/airflow/secure/whoscored-alert-authority
-        read_only: true
-        bind:
-          create_host_path: false
-    healthcheck:
-      test: ["CMD", "curl", "--fail", "--silent", "http://localhost:8898/health"]
-      interval: 10s
-      timeout: 3s
-      retries: 5
-      start_period: 5s
-    deploy:
-      resources:
-        limits:
-          memory: 256M
-        reservations:
-          memory: 64M
-    depends_on:
-      whoscored_proxy_filter:
-        condition: service_healthy
-      flaresolverr_whoscored_paid:
-        condition: service_healthy
-    networks:
-      - whoscored-paid-api
-      - whoscored-paid-browser
-      - whoscored-paid-direct-egress
 
   # ---------------------------------------------------------------------------
   # sofascore_proxy_filter ВЫНЕСЕН в отдельный compose-проект (#951, инцидент
@@ -2094,22 +1817,8 @@ networks:
     name: dp-analyst
   # Scheduler <-> L7 gateway only.  No proxy or browser capability is visible.
   whoscored-paid-api:
-    driver: bridge
-    internal: true
     name: dp-whoscored-paid-api
-  # Gateway, authenticated Chromium and filtering proxy only.
-  whoscored-paid-browser:
-    driver: bridge
-    internal: true
-    name: dp-whoscored-paid-browser
-  # Deliberately separate egress planes prevent Chromium from bypassing the
-  # filter and prevent the filter from becoming a general direct web client.
-  whoscored-paid-direct-egress:
-    driver: bridge
-    name: dp-whoscored-paid-direct-egress
-  whoscored-paid-provider-egress:
-    driver: bridge
-    name: dp-whoscored-paid-provider-egress
+    external: true
 
 # =============================================================================
 # Volumes

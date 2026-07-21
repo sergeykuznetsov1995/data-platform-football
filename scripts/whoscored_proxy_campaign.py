@@ -43,24 +43,32 @@ _WHOSCORED_RUNTIME_CONTRACT = (
 )
 
 import argparse
+import fcntl
 import hashlib
+import hmac
 import json
 import os
+import re
 import stat
 import sys
 import tempfile
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Mapping, Sequence
 
 from scrapers.whoscored.proxy_campaign import (
+    DAILY_INGEST_SCHEDULED_APPROVAL_HORIZON,
     MAX_PROXY_CAMPAIGN_VALIDITY,
     PROXY_APPROVAL_HMAC_SECRET_ENV,
     PROXY_CAMPAIGN_METER,
     PROXY_CAMPAIGN_SCHEMA_VERSION,
     PROXY_CAMPAIGN_SIGNATURE_ALGORITHM,
     PROXY_CAMPAIGN_SOURCE,
+    SCHEDULED_DISCOVERY_EXPANSION_HEADROOM,
+    SCHEDULED_DISCOVERY_TARGET_LIMIT_MAX,
+    SCHEDULED_SCOPE_MAX_MONTHS,
     PROXY_LEDGER_HMAC_SECRET_ENV,
+    SCHEDULED_PROXY_CAMPAIGN_SCHEMA_VERSION,
     TRANSPORT_POLICY_DIRECT_THEN_PAID,
     WHOSCORED_CANARY_ALLOWED_PATH_FAMILIES,
     WHOSCORED_CANARY_CAP_BYTES,
@@ -85,6 +93,9 @@ from scrapers.whoscored.proxy_campaign import (
     ProxyCampaignValidationError,
     canonical_json_bytes,
     sign_proxy_campaign_approval,
+    scheduled_scope_player_pagination_target_limit,
+    scheduled_scope_schedule_target_limit,
+    scheduled_target_ids_sha256,
     strict_json_loads,
     whoscored_canary_run_id,
 )
@@ -140,9 +151,79 @@ DAILY_CONCURRENCY = 4
 MAX_DAILY_ACTIVE_SCOPES = 2000
 # A charter must not authorise an unbounded horizon; the owner refreshes it.
 MAX_CHARTER_HORIZON = timedelta(days=62)
-CHARTER_SCHEMA_VERSION = 1
+PROVIDER_POLICY_SCHEMA_VERSION = 1
+CHARTER_SCHEMA_VERSION = 2
+DAILY_PLAN_SCHEMA_VERSION = 2
+ISSUANCE_LEDGER_SCHEMA_VERSION = 1
 SCHEDULED_PAID_POINTER_SCHEMA_VERSION = 1
+DAILY_ISSUER_WINDOW_START = time(9, 0, tzinfo=timezone.utc)
+DAILY_ISSUER_WINDOW_END = time(9, 30, tzinfo=timezone.utc)
+DAILY_DAG_LOGICAL_HOUR_UTC = 10
 DEFAULT_SCHEDULED_PAID_POINTER_ROOT = "/opt/airflow/config/whoscored_paid_pointers"
+DEFAULT_ISSUANCE_LEDGER_PATH = (
+    "/opt/airflow/logs/proxy_filter/whoscored_issuance_ledger.json"
+)
+OWNER_HMAC_SECRET_ENV = "WHOSCORED_PROXY_OWNER_HMAC_SECRET"
+ISSUANCE_LEDGER_HMAC_SECRET_ENV = (
+    "WHOSCORED_PROXY_ISSUANCE_LEDGER_HMAC_SECRET"
+)
+_SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z")
+_TOKEN_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+_PROVIDER_POLICY_UNSIGNED_FIELDS = frozenset(
+    {
+        "schema_version",
+        "source",
+        "provider_id",
+        "order_id",
+        "plan_id",
+        "valid_from",
+        "valid_until",
+        "receipt_sha256",
+        "provider_quota_bytes",
+        "safety_cap_bytes",
+        "daily_cap_bytes",
+        "monthly_cap_bytes",
+        "order_cap_bytes",
+        "signature_algorithm",
+    }
+)
+_CHARTER_UNSIGNED_FIELDS = frozenset(
+    {
+        "schema_version",
+        "source",
+        "provider_policy_sha256",
+        "order_id",
+        "billing_month",
+        "cohort_id",
+        "cohort_sha256",
+        "valid_from",
+        "valid_until",
+        "daily_cap_bytes",
+        "monthly_cap_bytes",
+        "order_cap_bytes",
+        "max_issuances",
+        "signature_algorithm",
+    }
+)
+_SIGNED_AUTHORITY_SUFFIX_FIELDS = frozenset({"document_sha256", "signature"})
+_COHORT_FIELDS = frozenset({"schema_version", "cohort_id", "scopes"})
+_DAILY_PLAN_FIELDS = frozenset(
+    {
+        "schema_version",
+        "cohort_id",
+        "cohort_sha256",
+        "max_scopes",
+        "catalog_batch_id",
+        "catalog_payload_sha256",
+        "workload_sha256",
+        "scope_workloads",
+        "discovery_parent_target_count",
+        "discovery_expansion_headroom",
+        "discovery_target_limit",
+        "profile_target_count",
+        "profile_targets_sha256",
+    }
+)
 
 
 class CampaignCliError(RuntimeError):
@@ -159,14 +240,22 @@ def _utc(value: str, field: str) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
+def _issuance_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _expected_daily_logical_date(now: datetime) -> datetime:
+    return (now - timedelta(days=1)).replace(
+        hour=DAILY_DAG_LOGICAL_HOUR_UTC,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+
+
 def _read_json(path: Path) -> Mapping[str, object]:
-    if path.is_symlink():
-        raise CampaignCliError(f"refusing symlink input: {path}")
     try:
-        size = path.stat().st_size
-        if size <= 0 or size > MAX_DOCUMENT_BYTES:
-            raise CampaignCliError(f"document has an invalid size: {path}")
-        value = strict_json_loads(path.read_bytes().decode("utf-8"))
+        value = strict_json_loads(_read_bounded_file(path).decode("utf-8"))
     except CampaignCliError:
         raise
     except ProxyCampaignValidationError as exc:
@@ -222,30 +311,85 @@ def _atomic_write_json(
 
 
 def _require_private_file(path: Path) -> None:
-    if path.is_symlink():
-        raise CampaignCliError(f"refusing symlink approval: {path}")
     try:
-        mode = stat.S_IMODE(path.stat().st_mode)
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
     except OSError as exc:
-        raise CampaignCliError(f"cannot stat approval: {path}") from exc
-    if mode != 0o600:
-        raise CampaignCliError(
-            f"approval must have mode 0600 (found {mode:04o}): {path}"
-        )
+        raise CampaignCliError(f"cannot open private artifact safely: {path}") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        mode = stat.S_IMODE(metadata.st_mode)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+            or mode != 0o600
+        ):
+            raise CampaignCliError(
+                f"private artifact must be owned, regular, single-link mode 0600: {path}"
+            )
+    finally:
+        os.close(descriptor)
+
+
+def _read_bounded_file(
+    path: Path,
+    *,
+    maximum: int = MAX_DOCUMENT_BYTES,
+    require_private: bool = False,
+    require_frozen: bool = False,
+) -> bytes:
+    """Read exactly one validated inode without following the final link."""
+
+    if require_private and require_frozen:
+        raise CampaignCliError("document cannot be both private and frozen")
+
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise CampaignCliError(f"cannot open document safely: {path}") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        mode = stat.S_IMODE(metadata.st_mode)
+        private_metadata = metadata.st_uid == os.geteuid() and mode in {0o400, 0o600}
+        frozen_owner = metadata.st_uid == 0 and metadata.st_gid == 0
+        if not _whoscored_production:
+            frozen_owner = frozen_owner or metadata.st_uid == os.geteuid()
+        frozen_metadata = frozen_owner and mode == 0o440
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_size <= 0
+            or metadata.st_size > maximum
+            or (require_private and not private_metadata)
+            or (require_frozen and not frozen_metadata)
+            or not require_frozen
+            and metadata.st_uid != os.geteuid()
+        ):
+            raise CampaignCliError(f"document metadata is unsafe: {path}")
+        chunks: list[bytes] = []
+        remaining = metadata.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 64 * 1024))
+            if not chunk:
+                raise CampaignCliError(f"document was truncated: {path}")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise CampaignCliError(f"document grew while reading: {path}")
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
 
 
 def _read_secret(*, secret_file: str | None, secret_env: str) -> str:
     if secret_file:
         path = Path(secret_file).expanduser()
-        if path.is_symlink():
-            raise CampaignCliError("refusing symlink HMAC secret file")
         try:
-            mode = stat.S_IMODE(path.stat().st_mode)
-            if mode & 0o077:
-                raise CampaignCliError(
-                    "HMAC secret file must not be group/world readable"
-                )
-            value = path.read_text(encoding="utf-8").strip()
+            value = _read_bounded_file(
+                path,
+                maximum=64 * 1024,
+                require_private=True,
+            ).decode("utf-8").strip()
         except CampaignCliError:
             raise
         except OSError as exc:
@@ -269,6 +413,193 @@ def _ledger_secret(args: argparse.Namespace) -> str:
         secret_file=args.ledger_secret_file,
         secret_env=args.ledger_secret_env,
     )
+
+
+def _owner_secret(args: argparse.Namespace) -> str:
+    return _read_secret(
+        secret_file=args.owner_secret_file,
+        secret_env=args.owner_secret_env,
+    )
+
+
+def _issuance_ledger_secret(args: argparse.Namespace) -> str:
+    return _read_secret(
+        secret_file=args.issuance_ledger_secret_file,
+        secret_env=args.issuance_ledger_secret_env,
+    )
+
+
+def _authority_signature(body: Mapping[str, object], secret: str) -> str:
+    return hmac.new(
+        secret.encode("utf-8"), canonical_json_bytes(dict(body)), hashlib.sha256
+    ).hexdigest()
+
+
+def _sign_authority_document(
+    unsigned: Mapping[str, object],
+    *,
+    expected_fields: frozenset[str],
+    secret: str,
+) -> dict[str, object]:
+    if frozenset(unsigned) != expected_fields:
+        raise CampaignCliError("owner authority fields are invalid")
+    canonical = json.loads(canonical_json_bytes(dict(unsigned)).decode("utf-8"))
+    digest = hashlib.sha256(canonical_json_bytes(canonical)).hexdigest()
+    signed_body = {**canonical, "document_sha256": digest}
+    return {**signed_body, "signature": _authority_signature(signed_body, secret)}
+
+
+def _verify_authority_document(
+    value: object,
+    *,
+    expected_fields: frozenset[str],
+    secret: str,
+    label: str,
+) -> Mapping[str, object]:
+    if not isinstance(value, Mapping) or frozenset(value) != (
+        expected_fields | _SIGNED_AUTHORITY_SUFFIX_FIELDS
+    ):
+        raise CampaignCliError(f"{label} fields are invalid")
+    unsigned = {field: value[field] for field in expected_fields}
+    expected_digest = hashlib.sha256(canonical_json_bytes(unsigned)).hexdigest()
+    digest = value.get("document_sha256")
+    signature = value.get("signature")
+    if (
+        not isinstance(digest, str)
+        or _SHA256_RE.fullmatch(digest) is None
+        or not hmac.compare_digest(digest, expected_digest)
+        or not isinstance(signature, str)
+        or _SHA256_RE.fullmatch(signature) is None
+        or not hmac.compare_digest(
+            signature,
+            _authority_signature({**unsigned, "document_sha256": digest}, secret),
+        )
+    ):
+        raise CampaignCliError(f"{label} digest/signature is invalid")
+    return dict(value)
+
+
+def _positive_bytes(value: object, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise CampaignCliError(f"{field} must be a positive byte count")
+    return value
+
+
+def _token(value: object, field: str) -> str:
+    if not isinstance(value, str) or _TOKEN_RE.fullmatch(value) is None:
+        raise CampaignCliError(f"{field} must be a canonical token")
+    return value
+
+
+def _digest(value: object, field: str) -> str:
+    if not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None:
+        raise CampaignCliError(f"{field} must be a lowercase SHA-256")
+    return value
+
+
+def _signed_provider_policy(
+    path: Path, *, owner_secret: str, now: datetime
+) -> Mapping[str, object]:
+    value = _verify_authority_document(
+        _read_json_document(path, require_private=True),
+        expected_fields=_PROVIDER_POLICY_UNSIGNED_FIELDS,
+        secret=owner_secret,
+        label="provider policy",
+    )
+    if (
+        value.get("schema_version") != PROVIDER_POLICY_SCHEMA_VERSION
+        or value.get("source") != PROXY_CAMPAIGN_SOURCE
+        or value.get("signature_algorithm") != PROXY_CAMPAIGN_SIGNATURE_ALGORITHM
+    ):
+        raise CampaignCliError("provider policy identity is invalid")
+    _token(value.get("provider_id"), "provider policy provider_id")
+    _token(value.get("order_id"), "provider policy order_id")
+    _token(value.get("plan_id"), "provider policy plan_id")
+    valid_from = _utc(str(value.get("valid_from")), "provider policy valid_from")
+    valid_until = _utc(str(value.get("valid_until")), "provider policy valid_until")
+    if not valid_from <= now < valid_until:
+        raise CampaignCliError("provider policy is not active")
+    _digest(value.get("receipt_sha256"), "provider policy receipt_sha256")
+    quota = _positive_bytes(
+        value.get("provider_quota_bytes"), "provider policy provider_quota_bytes"
+    )
+    safety = _positive_bytes(
+        value.get("safety_cap_bytes"), "provider policy safety_cap_bytes"
+    )
+    daily = _positive_bytes(
+        value.get("daily_cap_bytes"), "provider policy daily_cap_bytes"
+    )
+    monthly = _positive_bytes(
+        value.get("monthly_cap_bytes"), "provider policy monthly_cap_bytes"
+    )
+    order = _positive_bytes(
+        value.get("order_cap_bytes"), "provider policy order_cap_bytes"
+    )
+    if not daily <= monthly <= order <= safety <= quota:
+        raise CampaignCliError("provider policy quota/safety caps are inconsistent")
+    return value
+
+
+def _signed_charter(
+    path: Path,
+    *,
+    owner_secret: str,
+    policy: Mapping[str, object],
+    now: datetime,
+) -> Mapping[str, object]:
+    value = _verify_authority_document(
+        _read_json_document(path, require_private=True),
+        expected_fields=_CHARTER_UNSIGNED_FIELDS,
+        secret=owner_secret,
+        label="charter",
+    )
+    if (
+        value.get("schema_version") != CHARTER_SCHEMA_VERSION
+        or value.get("source") != PROXY_CAMPAIGN_SOURCE
+        or value.get("signature_algorithm") != PROXY_CAMPAIGN_SIGNATURE_ALGORITHM
+        or value.get("provider_policy_sha256") != policy.get("document_sha256")
+        or value.get("order_id") != policy.get("order_id")
+    ):
+        raise CampaignCliError("charter identity/policy binding is invalid")
+    valid_from = _utc(str(value.get("valid_from")), "charter.valid_from")
+    valid_until = _utc(str(value.get("valid_until")), "charter.valid_until")
+    policy_valid_from = _utc(
+        str(policy.get("valid_from")), "provider policy valid_from"
+    )
+    policy_valid_until = _utc(
+        str(policy.get("valid_until")), "provider policy valid_until"
+    )
+    if (
+        not valid_from <= now < valid_until
+        or valid_until - now > MAX_CHARTER_HORIZON
+    ):
+        raise CampaignCliError("charter validity is outside the allowed horizon")
+    if valid_from < policy_valid_from or valid_until > policy_valid_until:
+        raise CampaignCliError(
+            "charter validity is outside the provider policy window"
+        )
+    billing_month = str(value.get("billing_month") or "")
+    if billing_month != now.strftime("%Y-%m"):
+        raise CampaignCliError("charter billing_month is not current")
+    _token(value.get("cohort_id"), "charter cohort_id")
+    _digest(value.get("cohort_sha256"), "charter cohort_sha256")
+    daily = _positive_bytes(value.get("daily_cap_bytes"), "charter daily_cap_bytes")
+    monthly = _positive_bytes(
+        value.get("monthly_cap_bytes"), "charter monthly_cap_bytes"
+    )
+    order = _positive_bytes(value.get("order_cap_bytes"), "charter order_cap_bytes")
+    max_issuances = value.get("max_issuances")
+    if (
+        not daily <= monthly <= order
+        or daily > int(policy["daily_cap_bytes"])
+        or monthly > int(policy["monthly_cap_bytes"])
+        or order > int(policy["order_cap_bytes"])
+        or isinstance(max_issuances, bool)
+        or not isinstance(max_issuances, int)
+        or max_issuances <= 0
+    ):
+        raise CampaignCliError("charter caps/max_issuances are invalid")
+    return value
 
 
 def _safe_summary(
@@ -400,90 +731,495 @@ def command_template(args: argparse.Namespace) -> None:
     )
 
 
+def _command_sign_owner_authority(
+    args: argparse.Namespace,
+    *,
+    expected_fields: frozenset[str],
+    label: str,
+) -> None:
+    value = _read_json(Path(args.input))
+    signed = _sign_authority_document(
+        value,
+        expected_fields=expected_fields,
+        secret=_owner_secret(args),
+    )
+    _atomic_write_json(Path(args.output), signed, replace=args.force)
+    _print_summary(
+        {
+            "status": f"{label}_signed",
+            "output": str(Path(args.output)),
+            "document_sha256": signed["document_sha256"],
+        }
+    )
+
+
+def command_sign_provider_policy(args: argparse.Namespace) -> None:
+    _command_sign_owner_authority(
+        args,
+        expected_fields=_PROVIDER_POLICY_UNSIGNED_FIELDS,
+        label="provider_policy",
+    )
+
+
+def command_sign_charter(args: argparse.Namespace) -> None:
+    _command_sign_owner_authority(
+        args,
+        expected_fields=_CHARTER_UNSIGNED_FIELDS,
+        label="charter",
+    )
+
+
 def _scope_work_item_id(scope: str) -> str:
     """Mirror dags.scripts.whoscored_proxy_runtime.stable_scope_work_item."""
 
     return "scope-" + hashlib.sha256(str(scope).encode("utf-8")).hexdigest()
 
 
-def _read_scopes(path: Path) -> list[str]:
-    value = _read_json_document(path)
-    if isinstance(value, Mapping):
-        value = value.get("active_scopes")
-    if not isinstance(value, list) or not value:
-        raise CampaignCliError("scopes file must be a non-empty JSON array")
-    scopes: list[str] = []
-    for item in value:
-        if not isinstance(item, str) or not item.strip() or len(item) > 512:
-            raise CampaignCliError("each scope must be a bounded non-empty string")
-        scopes.append(item)
-    unique = sorted(set(scopes))
-    if len(unique) != len(scopes):
-        raise CampaignCliError("scopes file contains duplicates")
-    if len(unique) > MAX_DAILY_ACTIVE_SCOPES:
+def _catalog_discovery_parent_target_count(catalog: object) -> int:
+    """Return a deterministic known-target baseline for incremental discovery."""
+
+    rows = catalog.to_rows()
+    if not isinstance(rows, Mapping):
+        raise CampaignCliError("parent catalog rows are invalid")
+    competitions = rows.get("competitions", ())
+    seasons = rows.get("seasons", ())
+    stages = rows.get("stages", ())
+    if any(not isinstance(values, Sequence) for values in (competitions, seasons, stages)):
+        raise CampaignCliError("parent catalog target rows are invalid")
+    # Root, tournament menus, season pages, then calendar plus the two bounded
+    # first/last activity probes for every known stage. Newly advertised rows
+    # consume the separately signed expansion headroom.
+    return 1 + len(competitions) + len(seasons) + 3 * len(stages)
+
+
+def _inclusive_season_month_count(runtime: object, *, scope: str) -> int:
+    start = getattr(runtime, "start", None)
+    end = getattr(runtime, "end", None)
+    if start is None or end is None or end < start:
         raise CampaignCliError(
-            f"scopes file exceeds {MAX_DAILY_ACTIVE_SCOPES} active scopes"
+            f"scope {scope} has no bounded season interval for schedule planning"
         )
-    return unique
+    months = (end.year - start.year) * 12 + end.month - start.month + 1
+    if not 1 <= months <= SCHEDULED_SCOPE_MAX_MONTHS:
+        raise CampaignCliError(
+            f"scope {scope} schedule month span is outside "
+            f"1..{SCHEDULED_SCOPE_MAX_MONTHS}: {months}"
+        )
+    return months
 
 
-def _read_json_document(path: Path) -> object:
-    if path.is_symlink():
-        raise CampaignCliError(f"refusing symlink input: {path}")
+def _read_json_document(
+    path: Path,
+    *,
+    require_private: bool = False,
+    require_frozen: bool = False,
+) -> object:
     try:
-        size = path.stat().st_size
-        if size <= 0 or size > MAX_DOCUMENT_BYTES:
-            raise CampaignCliError(f"document has an invalid size: {path}")
-        return strict_json_loads(path.read_bytes().decode("utf-8"))
+        return strict_json_loads(
+            _read_bounded_file(
+                path,
+                require_private=require_private,
+                require_frozen=require_frozen,
+            ).decode("utf-8")
+        )
     except CampaignCliError:
         raise
     except (OSError, UnicodeDecodeError, ProxyCampaignValidationError) as exc:
         raise CampaignCliError(f"cannot read JSON document: {path}: {exc}") from exc
 
 
-def _read_charter(path: Path, *, now: datetime) -> Mapping[str, object]:
-    """Load the owner's monthly standing order that gates daily issuance."""
-
-    _require_private_file(path)
-    value = _read_json_document(path)
-    if not isinstance(value, Mapping):
-        raise CampaignCliError("charter must be a JSON object")
-    expected = {"schema_version", "order_id", "valid_until", "daily_mb", "monthly_mb"}
-    if set(value) != expected:
-        raise CampaignCliError("charter fields are invalid")
-    if value.get("schema_version") != CHARTER_SCHEMA_VERSION:
-        raise CampaignCliError("unsupported charter schema")
-    order_id = value.get("order_id")
-    if not isinstance(order_id, str) or not order_id.strip() or len(order_id) > 128:
-        raise CampaignCliError("charter order_id is invalid")
-    daily_mb = value.get("daily_mb")
-    monthly_mb = value.get("monthly_mb")
-    for name, number in (("daily_mb", daily_mb), ("monthly_mb", monthly_mb)):
-        if isinstance(number, bool) or not isinstance(number, int) or number <= 0:
-            raise CampaignCliError(f"charter {name} must be a positive integer")
-    valid_until = _utc(str(value.get("valid_until")), "charter.valid_until")
-    if valid_until <= now:
-        raise CampaignCliError("charter has expired")
-    if valid_until - now > MAX_CHARTER_HORIZON:
-        raise CampaignCliError("charter valid_until is beyond the allowed horizon")
-    return value
-
-
-def _split_scope_budgets(scope_pool_bytes: int, count: int) -> list[int]:
-    """Split the capture scope pool into exact, near-equal positive shares."""
-
-    if count <= 0 or scope_pool_bytes < count:
-        raise CampaignCliError(
-            "daily total is too small to allocate one byte per active scope"
+def _read_cohort(
+    path: Path, *, require_private: bool = False
+) -> Mapping[str, object]:
+    value = _read_json_document(path, require_private=require_private)
+    if not isinstance(value, Mapping) or frozenset(value) != _COHORT_FIELDS:
+        raise CampaignCliError("cohort manifest fields are invalid")
+    if value.get("schema_version") != 1:
+        raise CampaignCliError("unsupported cohort manifest schema")
+    _token(value.get("cohort_id"), "cohort_id")
+    scopes = value.get("scopes")
+    if (
+        not isinstance(scopes, list)
+        or not scopes
+        or len(scopes) > MAX_DAILY_ACTIVE_SCOPES
+        or any(
+            not isinstance(item, str)
+            or not item
+            or item != item.strip()
+            or len(item) > 512
+            for item in scopes
         )
-    base, remainder = divmod(scope_pool_bytes, count)
-    return [base + (1 if index < remainder else 0) for index in range(count)]
+        or len(scopes) != len(set(scopes))
+    ):
+        raise CampaignCliError("cohort scopes must be a bounded unique ordered list")
+    return dict(value)
+
+
+def command_plan_daily_ingest(args: argparse.Namespace) -> None:
+    """Freeze the current catalog and exact due-workload for one cohort prefix."""
+
+    cohort = _read_cohort(Path(args.cohort_file))
+    maximum = int(args.max_scopes)
+    if not 1 <= maximum <= MAX_DAILY_ACTIVE_SCOPES:
+        raise CampaignCliError("max_scopes is outside the release bound")
+    from dags.scripts import run_whoscored_scraper as runner
+
+    repository = runner._new_repository()
+    generation, catalog = repository.load_catalog_generation_snapshot()
+    selected = runner._select_catalog_snapshot_scopes(catalog, [], active_only=True)
+    active = {scope.spec: (scope, runtime) for scope, runtime in selected}
+    workloads: list[dict[str, object]] = []
+    prefix = list(cohort["scopes"][:maximum])
+    missing = [scope_spec for scope_spec in prefix if scope_spec not in active]
+    if missing:
+        raise CampaignCliError(
+            f"signed cohort prefix contains inactive/missing scopes: {missing}"
+        )
+    for scope_spec in prefix:
+        scope, runtime = active[str(scope_spec)]
+        candidates = repository.list_match_candidates(
+            scope.competition_id,
+            scope.season_id,
+            limit=101,
+            include_exact_count=True,
+        )
+        match_count = (
+            int(candidates[0].exact_candidate_count)
+            if candidates and candidates[0].exact_candidate_count is not None
+            else len(candidates)
+        )
+        if match_count > 100:
+            raise CampaignCliError(
+                f"scope {scope.spec} match backlog exceeds daily runtime cap: "
+                f"{match_count} > 100"
+            )
+        match_ids = sorted({int(candidate.game_id) for candidate in candidates})
+        if len(match_ids) != match_count:
+            raise CampaignCliError(
+                f"scope {scope.spec} match candidate snapshot is incomplete"
+            )
+        preview_candidates = repository.list_preview_candidates(
+            scope.competition_id,
+            scope.season_id,
+            limit=257,
+        )
+        preview_count = len(preview_candidates)
+        if preview_count > 256:
+            raise CampaignCliError(
+                f"scope {scope.spec} preview workload exceeds 256 targets"
+            )
+        preview_ids = sorted(
+            {int(candidate["game_id"]) for candidate in preview_candidates}
+        )
+        if len(preview_ids) != preview_count:
+            raise CampaignCliError(
+                f"scope {scope.spec} preview candidate snapshot is not unique"
+            )
+        stage_ids = sorted(
+            {int(stage_id) for stage_id in getattr(runtime, "stage_ids", ())}
+        )
+        if not stage_ids:
+            raise CampaignCliError(f"scope {scope.spec} has no schedule stages")
+        schedule_months = _inclusive_season_month_count(runtime, scope=scope.spec)
+        # One season page plus, per stage: calendar, every bounded schedule
+        # month, 67 structured first pages and one referee page.
+        schedule_target_limit = scheduled_scope_schedule_target_limit(
+            stage_count=len(stage_ids),
+            season_month_count=schedule_months,
+        )
+        non_pagination_count = schedule_target_limit + match_count + preview_count
+        player_pagination_target_limit = (
+            scheduled_scope_player_pagination_target_limit(
+                stage_count=len(stage_ids),
+                non_pagination_target_count=non_pagination_count,
+            )
+        )
+        count = non_pagination_count + player_pagination_target_limit
+        if not 1 <= count <= WHOSCORED_CANARY_CAPTURE_LEASE_LIMIT:
+            raise CampaignCliError(
+                "scope "
+                f"{scope.spec} paid workload exceeds the reviewed capture target "
+                f"ceiling: {count}"
+            )
+        workloads.append(
+            {
+                "scope": scope.spec,
+                "work_item_id": _scope_work_item_id(scope.spec),
+                "schedule_target_limit": schedule_target_limit,
+                "schedule_targets_sha256": scheduled_target_ids_sha256(
+                    [f"season:{scope.spec}", *(f"stage:{value}" for value in stage_ids)]
+                ),
+                "player_pagination_target_limit": (
+                    player_pagination_target_limit
+                ),
+                "match_target_count": match_count,
+                "match_targets_sha256": scheduled_target_ids_sha256(match_ids),
+                "preview_target_count": preview_count,
+                "preview_targets_sha256": scheduled_target_ids_sha256(preview_ids),
+                "paid_target_count": count,
+            }
+        )
+    from scrapers.whoscored.profile_policy import daily_profile_candidate_hard_cap
+
+    selected_values = [active[str(scope_spec)] for scope_spec in prefix]
+    profile_snapshot = repository.profile_candidate_snapshot(
+        scopes=[
+            getattr(runtime, "scope", runtime)
+            for _scope, runtime in selected_values
+        ],
+        hard_cap=daily_profile_candidate_hard_cap(),
+    )
+    profile_target_count = int(profile_snapshot.count)
+    profile_targets_sha256 = _digest(
+        profile_snapshot.payload_sha256,
+        "profile candidate payload_sha256",
+    )
+    if not 0 <= profile_target_count <= 256:
+        raise CampaignCliError(
+            "exact profile workload is outside the scheduled 0..256 bound"
+        )
+    cohort_sha256 = hashlib.sha256(canonical_json_bytes(cohort)).hexdigest()
+    workload_sha256 = hashlib.sha256(canonical_json_bytes(workloads)).hexdigest()
+    discovery_parent_target_count = _catalog_discovery_parent_target_count(catalog)
+    discovery_target_limit = min(
+        SCHEDULED_DISCOVERY_TARGET_LIMIT_MAX,
+        discovery_parent_target_count + SCHEDULED_DISCOVERY_EXPANSION_HEADROOM,
+    )
+    result = {
+        "schema_version": DAILY_PLAN_SCHEMA_VERSION,
+        "cohort_id": cohort["cohort_id"],
+        "cohort_sha256": cohort_sha256,
+        "max_scopes": maximum,
+        "catalog_batch_id": generation["catalog_batch_id"],
+        "catalog_payload_sha256": generation["catalog_payload_sha256"],
+        "workload_sha256": workload_sha256,
+        "scope_workloads": workloads,
+        "discovery_parent_target_count": discovery_parent_target_count,
+        "discovery_expansion_headroom": SCHEDULED_DISCOVERY_EXPANSION_HEADROOM,
+        "discovery_target_limit": discovery_target_limit,
+        "profile_target_count": profile_target_count,
+        "profile_targets_sha256": profile_targets_sha256,
+    }
+    _atomic_write_json(Path(args.output), result, replace=args.force)
+    _print_summary(
+        {
+            "status": "daily_ingest_plan_frozen",
+            "output": str(Path(args.output)),
+            "cohort_id": cohort["cohort_id"],
+            "catalog_batch_id": generation["catalog_batch_id"],
+            "scope_count": len(workloads),
+            "workload_sha256": workload_sha256,
+        }
+    )
+
+
+def _read_daily_plan(
+    path: Path, *, require_frozen: bool = False
+) -> Mapping[str, object]:
+    value = _read_json_document(
+        path,
+        require_private=not require_frozen,
+        require_frozen=require_frozen,
+    )
+    if not isinstance(value, Mapping) or frozenset(value) != _DAILY_PLAN_FIELDS:
+        raise CampaignCliError("daily plan fields are invalid")
+    if value.get("schema_version") != DAILY_PLAN_SCHEMA_VERSION:
+        raise CampaignCliError("unsupported daily plan schema")
+    _token(value.get("cohort_id"), "plan cohort_id")
+    _digest(value.get("cohort_sha256"), "plan cohort_sha256")
+    max_scopes = value.get("max_scopes")
+    if (
+        isinstance(max_scopes, bool)
+        or not isinstance(max_scopes, int)
+        or not 1 <= max_scopes <= MAX_DAILY_ACTIVE_SCOPES
+    ):
+        raise CampaignCliError("daily plan max_scopes is outside its bound")
+    _token(value.get("catalog_batch_id"), "plan catalog_batch_id")
+    _digest(value.get("catalog_payload_sha256"), "plan catalog_payload_sha256")
+    for field, allow_zero, maximum in (
+        ("discovery_parent_target_count", False, None),
+        ("discovery_expansion_headroom", False, None),
+        ("discovery_target_limit", False, SCHEDULED_DISCOVERY_TARGET_LIMIT_MAX),
+        ("profile_target_count", True, 256),
+    ):
+        count = value.get(field)
+        if (
+            isinstance(count, bool)
+            or not isinstance(count, int)
+            or count < (0 if allow_zero else 1)
+            or (maximum is not None and count > maximum)
+        ):
+            raise CampaignCliError(f"daily plan {field} is outside its bound")
+    if (
+        value.get("discovery_expansion_headroom")
+        != SCHEDULED_DISCOVERY_EXPANSION_HEADROOM
+        or value.get("discovery_target_limit")
+        != min(
+            SCHEDULED_DISCOVERY_TARGET_LIMIT_MAX,
+            int(value["discovery_parent_target_count"])
+            + SCHEDULED_DISCOVERY_EXPANSION_HEADROOM,
+        )
+    ):
+        raise CampaignCliError("daily plan discovery target limit is invalid")
+    _digest(value.get("profile_targets_sha256"), "plan profile_targets_sha256")
+    workloads = value.get("scope_workloads")
+    if not isinstance(workloads, list) or not workloads:
+        raise CampaignCliError("daily plan scope_workloads must be non-empty")
+    normalized: list[dict[str, object]] = []
+    for item in workloads:
+        if not isinstance(item, Mapping) or set(item) != {
+            "scope",
+            "work_item_id",
+            "schedule_target_limit",
+            "schedule_targets_sha256",
+            "player_pagination_target_limit",
+            "match_target_count",
+            "match_targets_sha256",
+            "preview_target_count",
+            "preview_targets_sha256",
+            "paid_target_count",
+        }:
+            raise CampaignCliError("daily plan workload fields are invalid")
+        scope = str(item.get("scope") or "")
+        expected = _scope_work_item_id(scope)
+        count = item.get("paid_target_count")
+        schedule_count = item.get("schedule_target_limit")
+        pagination_count = item.get("player_pagination_target_limit")
+        match_count = item.get("match_target_count")
+        preview_count = item.get("preview_target_count")
+        if (
+            not scope
+            or scope != scope.strip()
+            or len(scope) > 512
+            or item.get("work_item_id") != expected
+            or isinstance(count, bool)
+            or not isinstance(count, int)
+            or not 1 <= count <= WHOSCORED_CANARY_CAPTURE_LEASE_LIMIT
+            or isinstance(schedule_count, bool)
+            or not isinstance(schedule_count, int)
+            or schedule_count <= 0
+            or isinstance(pagination_count, bool)
+            or not isinstance(pagination_count, int)
+            or pagination_count < 0
+            or isinstance(match_count, bool)
+            or not isinstance(match_count, int)
+            or not 0 <= match_count <= 100
+            or isinstance(preview_count, bool)
+            or not isinstance(preview_count, int)
+            or not 0 <= preview_count <= 256
+            or count
+            != schedule_count + pagination_count + match_count + preview_count
+        ):
+            raise CampaignCliError("daily plan workload is invalid")
+        for digest_field in (
+            "schedule_targets_sha256",
+            "match_targets_sha256",
+            "preview_targets_sha256",
+        ):
+            _digest(item.get(digest_field), f"daily plan {digest_field}")
+        normalized.append(dict(item))
+    observed_scopes = [str(item["scope"]) for item in normalized]
+    if len(observed_scopes) != len(set(observed_scopes)):
+        raise CampaignCliError("daily plan workloads must be unique")
+    expected_sha = hashlib.sha256(canonical_json_bytes(normalized)).hexdigest()
+    if value.get("workload_sha256") != expected_sha:
+        raise CampaignCliError("daily plan workload digest is invalid")
+    return dict(value)
+
+
+def _verify_daily_plan_authority(
+    *,
+    plan: Mapping[str, object],
+    cohort: Mapping[str, object],
+    charter: Mapping[str, object],
+    max_scopes: int,
+) -> None:
+    """Re-derive the owner-approved selection inside the offline signer."""
+
+    if not 1 <= max_scopes <= MAX_DAILY_ACTIVE_SCOPES:
+        raise CampaignCliError("max_scopes is outside the release bound")
+    cohort_sha256 = hashlib.sha256(canonical_json_bytes(dict(cohort))).hexdigest()
+    if (
+        plan.get("max_scopes") != max_scopes
+        or plan.get("cohort_id") != cohort.get("cohort_id")
+        or plan.get("cohort_sha256") != cohort_sha256
+        or charter.get("cohort_id") != cohort.get("cohort_id")
+        or charter.get("cohort_sha256") != cohort_sha256
+    ):
+        raise CampaignCliError("daily plan is outside the signed charter cohort")
+    raw_scopes = cohort.get("scopes")
+    workloads = plan.get("scope_workloads")
+    if not isinstance(raw_scopes, list) or not isinstance(workloads, list):
+        raise CampaignCliError("daily plan cohort selection is invalid")
+    expected_scopes = [str(scope) for scope in raw_scopes[:max_scopes]]
+    observed_scopes = [
+        str(workload.get("scope"))
+        for workload in workloads
+        if isinstance(workload, Mapping)
+    ]
+    if observed_scopes != expected_scopes or len(observed_scopes) != len(workloads):
+        raise CampaignCliError(
+            "daily plan workloads are not the exact signed cohort prefix"
+        )
+
+
+def _split_scope_budgets(
+    scope_pool_bytes: int, workloads: Sequence[Mapping[str, object]]
+) -> list[int]:
+    """Deterministic weighted largest-remainder allocation with saturation."""
+
+    demands = [int(item["paid_target_count"]) for item in workloads]
+    floors = [1_000_000 for _item in workloads]
+    ceilings = [2_000_000 * demand for demand in demands]
+    if scope_pool_bytes < sum(floors):
+        raise CampaignCliError(
+            "scope budget does not fit workload-aware floor bounds"
+        )
+    scope_pool_bytes = min(scope_pool_bytes, sum(ceilings))
+    budgets = list(floors)
+    remaining = scope_pool_bytes - sum(budgets)
+    while remaining:
+        active = [
+            index for index, budget in enumerate(budgets) if budget < ceilings[index]
+        ]
+        if not active:
+            raise CampaignCliError("scope budget allocation exhausted all ceilings")
+        weight_sum = sum(demands[index] for index in active)
+        before = remaining
+        additions = [0] * len(workloads)
+        for index in active:
+            additions[index] = min(
+                ceilings[index] - budgets[index],
+                before * demands[index] // weight_sum,
+            )
+        progressed = sum(additions)
+        for index, addition in enumerate(additions):
+            budgets[index] += addition
+        remaining -= progressed
+        if remaining:
+            ranked = sorted(
+                (index for index in active if budgets[index] < ceilings[index]),
+                key=lambda index: (
+                    -(before * demands[index] % weight_sum),
+                    str(workloads[index]["scope"]),
+                ),
+            )
+            if not ranked:
+                raise CampaignCliError("scope budget largest-remainder step stalled")
+            for index in ranked[:remaining]:
+                budgets[index] += 1
+                remaining -= 1
+            if progressed == 0 and remaining and len(ranked) == 0:
+                raise CampaignCliError("scope budget allocation made no progress")
+    return budgets
 
 
 def _daily_ingest_unsigned(
     *,
     run_id: str,
-    scopes: Sequence[str],
+    plan: Mapping[str, object],
+    policy: Mapping[str, object],
+    charter: Mapping[str, object],
     runtime_sha256: str,
     classifier_sha256: str,
     issued: datetime,
@@ -495,7 +1231,8 @@ def _daily_ingest_unsigned(
 ) -> dict[str, object]:
     """Build one unsigned standing daily-ingest approval for a scheduled run."""
 
-    if not scopes:
+    workloads = plan.get("scope_workloads")
+    if not isinstance(workloads, list) or not workloads:
         raise CampaignCliError("daily ingest approval needs at least one active scope")
     discovery_bytes = min(
         DAILY_DISCOVERY_BUDGET_CEILING_BYTES,
@@ -506,11 +1243,16 @@ def _daily_ingest_unsigned(
         max(1, total_bytes // DAILY_PROFILES_BUDGET_DIVISOR),
     )
     scope_pool = total_bytes - discovery_bytes - profiles_bytes
-    scope_budgets = _split_scope_budgets(scope_pool, len(scopes))
-    capture_bytes = scope_pool + profiles_bytes
+    scope_budgets = _split_scope_budgets(scope_pool, workloads)
+    effective_scope_bytes = sum(scope_budgets)
+    effective_total_bytes = discovery_bytes + profiles_bytes + effective_scope_bytes
+    capture_bytes = effective_scope_bytes + profiles_bytes
     capture_paths = list(CANARY_ALLOWED_PATH_FAMILIES)
     discovery_paths = list(CANARY_DISCOVERY_PATH_FAMILIES)
     campaign_paths = sorted(set(capture_paths) | set(discovery_paths))
+    discovery_target_limit = int(plan["discovery_target_limit"])
+    profile_target_count = int(plan["profile_target_count"])
+    profile_allocation_target_count = max(1, profile_target_count)
 
     allocations: list[dict[str, object]] = [
         {
@@ -520,8 +1262,8 @@ def _daily_ingest_unsigned(
             "work_item_id": DAILY_DISCOVERY_WORK_ITEM_ID,
             "task_id": DAILY_DISCOVERY_TASK_ID,
             "budget_bytes": discovery_bytes,
-            "request_limit": DAILY_DISCOVERY_REQUEST_LIMIT,
-            "lease_limit": DAILY_DISCOVERY_LEASE_LIMIT,
+            "request_limit": 2 * discovery_target_limit,
+            "lease_limit": discovery_target_limit,
             "allowed_path_families": discovery_paths,
         },
         {
@@ -531,13 +1273,14 @@ def _daily_ingest_unsigned(
             "work_item_id": DAILY_PROFILES_WORK_ITEM_ID,
             "task_id": DAILY_PROFILES_TASK_ID,
             "budget_bytes": profiles_bytes,
-            "request_limit": DAILY_PROFILES_REQUEST_LIMIT,
-            "lease_limit": DAILY_PROFILES_LEASE_LIMIT,
+            "request_limit": 2 * profile_allocation_target_count,
+            "lease_limit": profile_allocation_target_count,
             "allowed_path_families": capture_paths,
         },
     ]
-    for scope, budget in zip(scopes, scope_budgets):
-        work_item_id = _scope_work_item_id(scope)
+    for workload, budget in zip(workloads, scope_budgets):
+        work_item_id = str(workload["work_item_id"])
+        demand = int(workload["paid_target_count"])
         allocations.append(
             {
                 "allocation_id": work_item_id,
@@ -546,8 +1289,8 @@ def _daily_ingest_unsigned(
                 "work_item_id": work_item_id,
                 "task_id": DAILY_SCOPE_TASK_ID,
                 "budget_bytes": budget,
-                "request_limit": DAILY_SCOPE_REQUEST_LIMIT,
-                "lease_limit": DAILY_SCOPE_LEASE_LIMIT,
+                "request_limit": 2 * demand,
+                "lease_limit": demand,
                 "allowed_path_families": capture_paths,
             }
         )
@@ -556,7 +1299,7 @@ def _daily_ingest_unsigned(
     request_limit = sum(int(item["request_limit"]) for item in allocations)
     lease_limit = sum(int(item["lease_limit"]) for item in allocations)
     unsigned: dict[str, object] = {
-        "schema_version": PROXY_CAMPAIGN_SCHEMA_VERSION,
+        "schema_version": SCHEDULED_PROXY_CAMPAIGN_SCHEMA_VERSION,
         "source": PROXY_CAMPAIGN_SOURCE,
         "approval_id": approval_id,
         "campaign_id": campaign_id,
@@ -567,10 +1310,10 @@ def _daily_ingest_unsigned(
         "runtime_sha256": runtime_sha256,
         "classifier_sha256": classifier_sha256,
         "caps": {
-            "total_provider_bytes": total_bytes,
+            "total_provider_bytes": effective_total_bytes,
             "discovery_provider_bytes": discovery_bytes,
             "capture_provider_bytes": capture_bytes,
-            "daily_provider_bytes": daily_bytes,
+            "daily_provider_bytes": min(daily_bytes, effective_total_bytes),
         },
         "limits": {
             "requests": request_limit,
@@ -581,6 +1324,32 @@ def _daily_ingest_unsigned(
         "allowed_hosts": sorted(WHOSCORED_PROXY_ALLOWED_HOSTS),
         "allowed_path_families": campaign_paths,
         "allocations": allocations,
+        "scheduled_authority": {
+            "provider_policy_sha256": policy["document_sha256"],
+            "charter_sha256": charter["document_sha256"],
+            "provider_id": policy["provider_id"],
+            "order_id": policy["order_id"],
+            "billing_month": charter["billing_month"],
+            "cohort_id": plan["cohort_id"],
+            "cohort_sha256": plan["cohort_sha256"],
+            "catalog_batch_id": plan["catalog_batch_id"],
+            "catalog_payload_sha256": plan["catalog_payload_sha256"],
+            "workload_sha256": plan["workload_sha256"],
+            "scope_workloads": list(workloads),
+            "discovery_parent_target_count": plan[
+                "discovery_parent_target_count"
+            ],
+            "discovery_expansion_headroom": plan[
+                "discovery_expansion_headroom"
+            ],
+            "discovery_target_limit": plan["discovery_target_limit"],
+            "profile_target_count": plan["profile_target_count"],
+            "profile_targets_sha256": plan["profile_targets_sha256"],
+            "daily_cap_bytes": charter["daily_cap_bytes"],
+            "monthly_cap_bytes": charter["monthly_cap_bytes"],
+            "order_cap_bytes": charter["order_cap_bytes"],
+            "max_issuances": charter["max_issuances"],
+        },
         "meter": PROXY_CAMPAIGN_METER,
         "signature_algorithm": PROXY_CAMPAIGN_SIGNATURE_ALGORITHM,
     }
@@ -597,70 +1366,315 @@ def _pointer_document(*, run_id: str, approval: ProxyCampaignApproval) -> dict[s
     }
 
 
+def _issuance_ledger_empty() -> dict[str, object]:
+    return {"schema_version": ISSUANCE_LEDGER_SCHEMA_VERSION, "entries": []}
+
+
+def _seal_issuance_ledger(
+    body: Mapping[str, object], *, secret: str
+) -> dict[str, object]:
+    return {**body, "signature": _authority_signature(body, secret)}
+
+
+def _read_issuance_ledger(path: Path, *, secret: str) -> dict[str, object]:
+    if not path.exists():
+        return _issuance_ledger_empty()
+    value = _read_json_document(path, require_private=True)
+    if not isinstance(value, Mapping) or set(value) != {
+        "schema_version",
+        "entries",
+        "signature",
+    }:
+        raise CampaignCliError("issuance ledger fields are invalid")
+    body = {"schema_version": value.get("schema_version"), "entries": value.get("entries")}
+    signature = value.get("signature")
+    if (
+        body["schema_version"] != ISSUANCE_LEDGER_SCHEMA_VERSION
+        or not isinstance(body["entries"], list)
+        or not isinstance(signature, str)
+        or _SHA256_RE.fullmatch(signature) is None
+        or not hmac.compare_digest(signature, _authority_signature(body, secret))
+    ):
+        raise CampaignCliError("issuance ledger authentication failed")
+    entries = body["entries"]
+    run_ids: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, Mapping) or set(entry) != {
+            "run_id",
+            "request_sha256",
+            "order_id",
+            "billing_month",
+            "day",
+            "charter_sha256",
+            "total_provider_bytes",
+            "approval",
+            "pointer",
+        }:
+            raise CampaignCliError("issuance ledger entry is malformed")
+        run_id = str(entry.get("run_id") or "")
+        if not run_id or run_id in run_ids:
+            raise CampaignCliError("issuance ledger run ids are not unique")
+        run_ids.add(run_id)
+        _digest(entry.get("request_sha256"), "ledger request_sha256")
+        _digest(entry.get("charter_sha256"), "ledger charter_sha256")
+        _positive_bytes(
+            entry.get("total_provider_bytes"), "ledger total_provider_bytes"
+        )
+        if not isinstance(entry.get("approval"), Mapping) or not isinstance(
+            entry.get("pointer"), Mapping
+        ):
+            raise CampaignCliError("issuance ledger artifacts are malformed")
+    return dict(body)
+
+
+def _issuance_lock(path: Path) -> int:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    try:
+        descriptor = os.open(
+            lock_path,
+            os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+        )
+    except OSError as exc:
+        raise CampaignCliError("cannot open issuance ledger lock safely") from exc
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+    ):
+        os.close(descriptor)
+        raise CampaignCliError("issuance ledger lock metadata is unsafe")
+    fcntl.flock(descriptor, fcntl.LOCK_EX)
+    return descriptor
+
+
+def _publish_or_verify(path: Path, value: Mapping[str, object]) -> None:
+    if path.exists() or path.is_symlink():
+        if _read_json_document(path, require_private=True) != value:
+            raise CampaignCliError(f"immutable issued artifact differs: {path}")
+        return
+    _atomic_write_json(path, value, replace=False)
+
+
 def command_issue_daily_ingest(args: argparse.Namespace) -> None:
-    now = datetime.now(timezone.utc).replace(microsecond=0)
+    now = _issuance_now().astimezone(timezone.utc).replace(microsecond=0)
+    wall_time = now.timetz()
+    if not DAILY_ISSUER_WINDOW_START <= wall_time <= DAILY_ISSUER_WINDOW_END:
+        raise CampaignCliError(
+            "daily issuer wall clock must be inside 09:00..09:30 UTC"
+        )
     issued = _utc(args.issued_at, "issued_at") if args.issued_at else now
+    if not now - timedelta(minutes=5) <= issued <= now:
+        raise CampaignCliError("issued_at must be within five minutes of wall clock")
+    run_id = str(args.run_id)
+    if not run_id.startswith("scheduled__"):
+        raise CampaignCliError("daily ingest run_id must be a scheduled DagRun id")
+    try:
+        logical_run = _utc(run_id.removeprefix("scheduled__"), "run_id")
+    except CampaignCliError as exc:
+        raise CampaignCliError("daily ingest run_id timestamp is invalid") from exc
+    if logical_run != _expected_daily_logical_date(now):
+        raise CampaignCliError(
+            "scheduled DagRun id is not the exact daily data-interval start"
+        )
+    owner_secret = _owner_secret(args)
+    policy = _signed_provider_policy(
+        Path(args.provider_policy), owner_secret=owner_secret, now=now
+    )
+    charter = _signed_charter(
+        Path(args.charter), owner_secret=owner_secret, policy=policy, now=now
+    )
+    authority_valid_from = max(
+        _utc(str(policy["valid_from"]), "provider policy valid_from"),
+        _utc(str(charter["valid_from"]), "charter.valid_from"),
+    )
+    authority_valid_until = min(
+        _utc(str(policy["valid_until"]), "provider policy valid_until"),
+        _utc(str(charter["valid_until"]), "charter.valid_until"),
+    )
+    if issued < authority_valid_from:
+        raise CampaignCliError(
+            "issued_at is before the provider policy or charter validity window"
+        )
     expires = (
         _utc(args.expires_at, "expires_at")
         if args.expires_at
-        else issued + timedelta(hours=23)
+        else min(issued + timedelta(hours=23), authority_valid_until)
     )
     if expires <= issued:
         raise CampaignCliError("expires_at must be after issued_at")
     if expires - issued > MAX_PROXY_CAMPAIGN_VALIDITY:
         raise CampaignCliError("daily approval validity may not exceed 24 hours")
-    run_id = str(args.run_id)
-    if not run_id.startswith("scheduled__"):
-        raise CampaignCliError("daily ingest run_id must be a scheduled DagRun id")
-    charter = _read_charter(Path(args.charter), now=now)
-    charter_daily_bytes = int(charter["daily_mb"]) * 1000 * 1000
-    total_bytes = int(args.total_mb) * 1000 * 1000
-    daily_bytes = int(args.daily_mb) * 1000 * 1000 if args.daily_mb else total_bytes
-    if total_bytes > charter_daily_bytes or daily_bytes > charter_daily_bytes:
-        raise CampaignCliError("requested budget exceeds the charter daily allowance")
-    if daily_bytes > total_bytes:
-        raise CampaignCliError("daily_mb cannot exceed total_mb")
-    scopes = _read_scopes(Path(args.scopes_file))
+    if expires > authority_valid_until:
+        raise CampaignCliError(
+            "expires_at exceeds the provider policy or charter validity window"
+        )
+    scheduled_start = logical_run + timedelta(days=1)
+    if expires - scheduled_start < DAILY_INGEST_SCHEDULED_APPROVAL_HORIZON:
+        raise CampaignCliError(
+            "expires_at cannot cover the complete scheduled DagRun timeout window"
+        )
+    cohort = _read_cohort(Path(args.cohort_file), require_private=True)
+    plan = _read_daily_plan(Path(args.plan_file), require_frozen=True)
+    _verify_daily_plan_authority(
+        plan=plan,
+        cohort=cohort,
+        charter=charter,
+        max_scopes=int(args.max_scopes),
+    )
+    total_bytes = int(args.total_bytes)
+    daily_bytes = int(args.daily_bytes) if args.daily_bytes else total_bytes
+    if total_bytes <= 0 or daily_bytes <= 0 or daily_bytes > total_bytes:
+        raise CampaignCliError(
+            "total_bytes/daily_bytes must be positive and daily <= total"
+        )
+    discovery_reservation = min(
+        DAILY_DISCOVERY_BUDGET_CEILING_BYTES,
+        max(1, total_bytes // DAILY_DISCOVERY_BUDGET_DIVISOR),
+    )
+    profiles_reservation = min(
+        DAILY_PROFILES_BUDGET_CEILING_BYTES,
+        max(1, total_bytes // DAILY_PROFILES_BUDGET_DIVISOR),
+    )
+    scope_reservations = _split_scope_budgets(
+        total_bytes - discovery_reservation - profiles_reservation,
+        plan["scope_workloads"],
+    )
+    issued_total_bytes = (
+        discovery_reservation + profiles_reservation + sum(scope_reservations)
+    )
+    if (
+        issued_total_bytes > int(charter["daily_cap_bytes"])
+        or min(daily_bytes, issued_total_bytes) > int(charter["daily_cap_bytes"])
+    ):
+        raise CampaignCliError("effective budget exceeds the charter daily allowance")
     run_digest = hashlib.sha256(run_id.encode("utf-8")).hexdigest()
     campaign_id = f"wsdaily-{run_digest[:32]}"
     approval_id = f"wsdaily-approval-{run_digest[:32]}"
 
-    unsigned = _daily_ingest_unsigned(
-        run_id=run_id,
-        scopes=scopes,
-        runtime_sha256=args.runtime_sha256,
-        classifier_sha256=args.classifier_sha256,
-        issued=issued,
-        expires=expires,
-        total_bytes=total_bytes,
-        daily_bytes=daily_bytes,
-        campaign_id=campaign_id,
-        approval_id=approval_id,
-    )
     secret = _secret(args)
-    signed = sign_proxy_campaign_approval(unsigned, secret)
-    approval = ProxyCampaignApproval.from_dict(signed)
-    approval.verify(secret, now=issued)
-    if approval.is_exact_canary:
-        raise CampaignCliError("daily ingest approval must not be an exact canary")
-    if approval.run_id != run_id or approval.allowed_dag_ids != (
-        WHOSCORED_INGEST_DAG_ID,
-    ):
-        raise CampaignCliError("signed daily approval identity is inconsistent")
-
     approval_root = Path(args.approval_root)
     approval_path = approval_root / f"{approval_id}.json"
-    _atomic_write_json(approval_path, signed, replace=args.force)
     pointer_root = Path(args.pointer_root)
     pointer_path = pointer_root / f"{run_digest}.json"
-    _atomic_write_json(
-        pointer_path,
-        _pointer_document(run_id=run_id, approval=approval),
-        replace=args.force,
-    )
+    request_body = {
+        "run_id": run_id,
+        "provider_policy_sha256": policy["document_sha256"],
+        "charter_sha256": charter["document_sha256"],
+        "plan_sha256": hashlib.sha256(canonical_json_bytes(plan)).hexdigest(),
+        "runtime_sha256": args.runtime_sha256,
+        "classifier_sha256": args.classifier_sha256,
+        "total_provider_bytes": total_bytes,
+        "effective_total_provider_bytes": issued_total_bytes,
+        "daily_provider_bytes": daily_bytes,
+    }
+    request_sha256 = hashlib.sha256(canonical_json_bytes(request_body)).hexdigest()
+    ledger_path = Path(args.issuance_ledger)
+    ledger_secret = _issuance_ledger_secret(args)
+    lock_descriptor = _issuance_lock(ledger_path)
+    try:
+        ledger = _read_issuance_ledger(ledger_path, secret=ledger_secret)
+        entries = list(ledger["entries"])
+        existing = next(
+            (entry for entry in entries if entry.get("run_id") == run_id), None
+        )
+        idempotent = existing is not None
+        if existing is not None:
+            if existing.get("request_sha256") != request_sha256:
+                raise CampaignCliError("existing issuance run_id has request drift")
+            signed = dict(existing["approval"])
+            pointer = dict(existing["pointer"])
+            approval = ProxyCampaignApproval.from_dict(signed)
+            approval.verify(secret, now=now)
+        else:
+            day = now.date().isoformat()
+            month = now.strftime("%Y-%m")
+            order_id = str(charter["order_id"])
+            charter_sha = str(charter["document_sha256"])
+            order_total = sum(
+                int(entry["total_provider_bytes"])
+                for entry in entries
+                if entry.get("order_id") == order_id
+            )
+            month_total = sum(
+                int(entry["total_provider_bytes"])
+                for entry in entries
+                if entry.get("order_id") == order_id
+                and entry.get("billing_month") == month
+            )
+            day_total = sum(
+                int(entry["total_provider_bytes"])
+                for entry in entries
+                if entry.get("order_id") == order_id and entry.get("day") == day
+            )
+            charter_count = sum(
+                1 for entry in entries if entry.get("charter_sha256") == charter_sha
+            )
+            if (
+                month != charter["billing_month"]
+                or day_total + issued_total_bytes > int(charter["daily_cap_bytes"])
+                or month_total + issued_total_bytes > int(charter["monthly_cap_bytes"])
+                or order_total + issued_total_bytes > int(charter["order_cap_bytes"])
+                or charter_count >= int(charter["max_issuances"])
+            ):
+                raise CampaignCliError(
+                    "issuance would exceed signed day/month/order/max_issuances caps"
+                )
+            unsigned = _daily_ingest_unsigned(
+                run_id=run_id,
+                plan=plan,
+                policy=policy,
+                charter=charter,
+                runtime_sha256=args.runtime_sha256,
+                classifier_sha256=args.classifier_sha256,
+                issued=issued,
+                expires=expires,
+                total_bytes=total_bytes,
+                daily_bytes=daily_bytes,
+                campaign_id=campaign_id,
+                approval_id=approval_id,
+            )
+            signed = sign_proxy_campaign_approval(unsigned, secret)
+            approval = ProxyCampaignApproval.from_dict(signed)
+            approval.verify(secret, now=now)
+            pointer = _pointer_document(run_id=run_id, approval=approval)
+            entries.append(
+                {
+                    "run_id": run_id,
+                    "request_sha256": request_sha256,
+                    "order_id": order_id,
+                    "billing_month": month,
+                    "day": day,
+                    "charter_sha256": charter_sha,
+                    "total_provider_bytes": approval.caps.total_provider_bytes,
+                    "approval": signed,
+                    "pointer": pointer,
+                }
+            )
+            body = {
+                "schema_version": ISSUANCE_LEDGER_SCHEMA_VERSION,
+                "entries": entries,
+            }
+            _atomic_write_json(
+                ledger_path,
+                _seal_issuance_ledger(body, secret=ledger_secret),
+                replace=ledger_path.exists(),
+            )
+        _publish_or_verify(approval_path, signed)
+        _publish_or_verify(pointer_path, pointer)
+    finally:
+        fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+        os.close(lock_descriptor)
     _print_summary(
         {
-            "status": "daily_ingest_approval_issued",
+            "status": (
+                "daily_ingest_approval_reused"
+                if idempotent
+                else "daily_ingest_approval_issued"
+            ),
             "run_id": run_id,
             "approval_id": approval_id,
             "campaign_id": campaign_id,
@@ -668,10 +1682,10 @@ def command_issue_daily_ingest(args: argparse.Namespace) -> None:
             "approval_path": str(approval_path),
             "pointer_path": str(pointer_path),
             "order_id": charter["order_id"],
-            "active_scope_count": len(scopes),
-            "total_provider_bytes": total_bytes,
-            "daily_provider_bytes": daily_bytes,
-            "expires_at": expires.isoformat(),
+            "active_scope_count": len(plan["scope_workloads"]),
+            "total_provider_bytes": approval.caps.total_provider_bytes,
+            "daily_provider_bytes": approval.caps.daily_provider_bytes,
+            "expires_at": approval.expires_at,
         }
     )
 
@@ -689,8 +1703,9 @@ def command_sign(args: argparse.Namespace) -> None:
 
 
 def _load_signed(path: Path) -> ProxyCampaignApproval:
-    _require_private_file(path)
-    return ProxyCampaignApproval.from_dict(_read_json(path))
+    return ProxyCampaignApproval.from_dict(
+        _read_json_document(path, require_private=True)
+    )
 
 
 def command_verify(args: argparse.Namespace) -> None:
@@ -773,6 +1788,26 @@ def _ledger_secret_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _owner_secret_arguments(parser: argparse.ArgumentParser) -> None:
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--owner-secret-file")
+    group.add_argument(
+        "--owner-secret-env",
+        default=OWNER_HMAC_SECRET_ENV,
+        help="environment variable containing the owner policy/charter HMAC key",
+    )
+
+
+def _issuance_ledger_secret_arguments(parser: argparse.ArgumentParser) -> None:
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--issuance-ledger-secret-file")
+    group.add_argument(
+        "--issuance-ledger-secret-env",
+        default=ISSUANCE_LEDGER_HMAC_SECRET_ENV,
+        help="environment variable containing the issuance-ledger HMAC key",
+    )
+
+
 def _output_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--output", required=True)
     parser.add_argument("--force", action="store_true")
@@ -800,17 +1835,45 @@ def build_parser() -> argparse.ArgumentParser:
     _output_arguments(template)
     template.set_defaults(handler=command_template)
 
+    sign_policy = subparsers.add_parser(
+        "sign-provider-policy", help="owner-sign one provider-policy-v1 document"
+    )
+    sign_policy.add_argument("--input", required=True)
+    _owner_secret_arguments(sign_policy)
+    _output_arguments(sign_policy)
+    sign_policy.set_defaults(handler=command_sign_provider_policy)
+
+    sign_charter = subparsers.add_parser(
+        "sign-charter", help="owner-sign one scheduled charter-v2 document"
+    )
+    sign_charter.add_argument("--input", required=True)
+    _owner_secret_arguments(sign_charter)
+    _output_arguments(sign_charter)
+    sign_charter.set_defaults(handler=command_sign_charter)
+
+    plan_daily = subparsers.add_parser(
+        "plan-daily-ingest",
+        help="freeze exact catalog/workload for an ordered paid cohort",
+    )
+    plan_daily.add_argument("--cohort-file", required=True)
+    plan_daily.add_argument("--max-scopes", type=int, required=True)
+    _output_arguments(plan_daily)
+    plan_daily.set_defaults(handler=command_plan_daily_ingest)
+
     issue_daily = subparsers.add_parser(
         "issue-daily-ingest",
         help="issue and sign one standing daily-ingest approval for a scheduled run",
     )
     issue_daily.add_argument("--run-id", required=True)
-    issue_daily.add_argument("--scopes-file", required=True)
+    issue_daily.add_argument("--plan-file", required=True)
+    issue_daily.add_argument("--cohort-file", required=True)
+    issue_daily.add_argument("--max-scopes", type=int, required=True)
+    issue_daily.add_argument("--provider-policy", required=True)
     issue_daily.add_argument("--charter", required=True)
     issue_daily.add_argument("--runtime-sha256", required=True)
     issue_daily.add_argument("--classifier-sha256", required=True)
-    issue_daily.add_argument("--total-mb", type=int, required=True)
-    issue_daily.add_argument("--daily-mb", type=int, default=0)
+    issue_daily.add_argument("--total-bytes", type=int, required=True)
+    issue_daily.add_argument("--daily-bytes", type=int, default=0)
     issue_daily.add_argument("--issued-at", default="")
     issue_daily.add_argument("--expires-at", default="")
     issue_daily.add_argument(
@@ -819,8 +1882,13 @@ def build_parser() -> argparse.ArgumentParser:
     issue_daily.add_argument(
         "--pointer-root", default=DEFAULT_SCHEDULED_PAID_POINTER_ROOT
     )
+    issue_daily.add_argument(
+        "--issuance-ledger", default=DEFAULT_ISSUANCE_LEDGER_PATH
+    )
     issue_daily.add_argument("--force", action="store_true")
     _secret_arguments(issue_daily)
+    _owner_secret_arguments(issue_daily)
+    _issuance_ledger_secret_arguments(issue_daily)
     issue_daily.set_defaults(handler=command_issue_daily_ingest)
 
     sign = subparsers.add_parser("sign", help="sign one unsigned template")

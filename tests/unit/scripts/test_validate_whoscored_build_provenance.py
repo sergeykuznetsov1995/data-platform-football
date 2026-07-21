@@ -52,6 +52,11 @@ DOWNLOAD_RUN = (
     f'echo "{SHA_B}  /tmp/Release" | sha256sum -c - && '
     'test "$(stat -c %s /tmp/Release)" -eq 1234'
 )
+BOUNDED_CURL_FLAGS = (
+    "--proto '=https' --tlsv1.2 --proto-redir '=https' "
+    "--connect-timeout 20 --speed-limit 1024 --speed-time 60 "
+    "--max-time 3600 -fsSL"
+)
 
 def _write(path: Path, value: str | bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1117,14 +1122,42 @@ def test_download_receipt_must_bind_fetch_output_hash_and_size(tmp_path: Path) -
     )
 
 
-def test_download_receipt_accepts_exact_https_only_curl_flags() -> None:
+@pytest.mark.parametrize(
+    "curl_flags",
+    [
+        "--proto '=https' --tlsv1.2 --proto-redir '=https' -fsSL",
+        BOUNDED_CURL_FLAGS,
+    ],
+)
+def test_download_receipt_accepts_exact_https_only_curl_flags(
+    curl_flags: str,
+) -> None:
     command = DOWNLOAD_RUN.removeprefix("RUN ").replace(
-        "curl -fsSL",
-        "curl --proto '=https' --tlsv1.2 --proto-redir '=https' -fsSL",
-        1,
+        "curl -fsSL", f"curl {curl_flags}", 1
     )
 
     assert provenance._canonical_fetch_receipt(command, "curl") is True
+
+
+@pytest.mark.parametrize(
+    ("bounded_flag", "unsafe_value"),
+    [
+        ("--connect-timeout 20", "--connect-timeout 0"),
+        ("--speed-limit 1024", "--speed-limit 0"),
+        ("--speed-time 60", "--speed-time 0"),
+        ("--max-time 3600", "--max-time 0"),
+    ],
+)
+def test_download_receipt_rejects_relaxed_bounded_curl_flags(
+    bounded_flag: str, unsafe_value: str
+) -> None:
+    command = DOWNLOAD_RUN.removeprefix("RUN ").replace(
+        "curl -fsSL",
+        f"curl {BOUNDED_CURL_FLAGS.replace(bounded_flag, unsafe_value)}",
+        1,
+    )
+
+    assert provenance._canonical_fetch_receipt(command, "curl") is False
 
 
 @pytest.mark.parametrize(

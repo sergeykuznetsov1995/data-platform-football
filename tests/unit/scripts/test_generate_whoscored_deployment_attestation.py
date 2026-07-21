@@ -1095,13 +1095,13 @@ def test_real_buildx_metadata_and_docker_digest_path_when_ci_provides_it() -> No
     if os.environ.get("WHOSCORED_REAL_DOCKER_TEST") != "1":
         pytest.skip("real Docker evidence is built only by the WhoScored CI job")
     metadata_path = Path(os.environ["WHOSCORED_SCHEDULER_BUILD_METADATA"])
-    image_tag = os.environ["WHOSCORED_SCHEDULER_IMAGE"]
+    final_image = os.environ["WHOSCORED_SCHEDULER_IMAGE"]
     payload_image_tag = os.environ["WHOSCORED_SCHEDULER_PAYLOAD_IMAGE"]
     raw = metadata_path.read_bytes()
     document = json.loads(raw)
     digest = document["containerimage.digest"]
-    repository = image_tag.rsplit(":", 1)[0]
-    final_image = f"{repository}@{digest}"
+    assert generator._PINNED_IMAGE.fullmatch(final_image) is not None
+    assert final_image.rsplit("@", 1)[1] == digest
     revision = subprocess.run(
         ("/usr/bin/git", "-C", str(ROOT), "rev-parse", "HEAD"),
         check=True,
@@ -1134,7 +1134,7 @@ def test_real_buildx_metadata_and_docker_digest_path_when_ci_provides_it() -> No
                 "--format",
                 "{{.Id}}",
                 "--",
-                image_tag,
+                final_image,
             ),
             check=True,
             env={

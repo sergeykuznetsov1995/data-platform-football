@@ -1,9 +1,9 @@
 """Airflow-side authority projection for WhoScored paid proxy campaigns.
 
-Scheduled and legacy DagRuns stay direct-only.  Paid transport is admitted
-only when the DagRun configuration pins one signed approval by ID and SHA-256;
-the approval path itself is deployment-owned and is never accepted from
-DagRun input.
+Manual runs remain direct-only unless their DagRun configuration explicitly
+pins one signed approval. Eligible scheduled daily runs may instead consume a
+deployment-owned per-run pointer; required mode rejects missing authority and
+all mutable DagRun configuration before any source work.
 """
 
 # ruff: noqa: E402 -- the trust anchor must run before every non-built-in import
@@ -62,11 +62,14 @@ from pathlib import Path
 from typing import Any, Iterator, Mapping
 
 from scrapers.whoscored.proxy_campaign import (
+    DAILY_INGEST_MINIMUM_APPROVAL_VALIDITY,
+    MAX_APPROVAL_DOCUMENT_BYTES,
     PROXY_ALLOCATION_ID_ENV,
     PROXY_APPROVAL_ID_ENV,
     PROXY_APPROVAL_PATH_ENV,
     PROXY_APPROVAL_SHA256_ENV,
     PROXY_ATTEMPT_ID_ENV,
+    SCHEDULED_PROXY_CAMPAIGN_SCHEMA_VERSION,
     TRANSPORT_POLICY_DIRECT_THEN_PAID,
     WHOSCORED_CANARY_DAG_ID,
     WHOSCORED_FULL_PAID_CRAWL_AVAILABLE,
@@ -79,7 +82,7 @@ from scrapers.whoscored.proxy_campaign import (
     canonical_json_bytes,
     daily_ingest_paid_crawl_allowed,
     deterministic_proxy_attempt_id,
-    load_proxy_campaign_approval_structure,
+    parse_proxy_campaign_approval_structure_bytes,
     strict_json_loads,
 )
 
@@ -93,9 +96,12 @@ PAID_APPROVAL_SHA256_CONF = "paid_approval_sha256"
 PROXY_APPROVAL_ROOT_ENV = "WHOSCORED_PROXY_APPROVAL_ROOT"
 # Deployment-owned directory of per-run pointers that let a *scheduled* daily
 # ingest run reach the signed paid approval issued for it out of band, without
-# ever accepting authority from DagRun input.  Absent env or file -> the run
-# stays direct-only (fail-closed).
+# ever accepting authority from DagRun input. Disabled mode never reads this
+# root; required mode rejects a missing or unsafe per-run artifact.
 SCHEDULED_PAID_POINTER_ROOT_ENV = "WHOSCORED_SCHEDULED_PAID_POINTER_ROOT"
+SCHEDULED_PAID_MODE_ENV = "WHOSCORED_SCHEDULED_PAID_MODE"
+SCHEDULED_PAID_MODE_DISABLED = "disabled"
+SCHEDULED_PAID_MODE_REQUIRED = "required"
 SCHEDULED_PAID_POINTER_SCHEMA_VERSION = 1
 _MAX_POINTER_BYTES = 4096
 _POINTER_FIELDS = frozenset(
@@ -135,7 +141,7 @@ _CAMPAIGN_ENV_NAMES = (
     PROXY_ATTEMPT_ID_ENV,
 )
 _MINIMUM_APPROVAL_VALIDITY = {
-    "dag_ingest_whoscored": timedelta(hours=6),
+    "dag_ingest_whoscored": DAILY_INGEST_MINIMUM_APPROVAL_VALIDITY,
     "dag_backfill_whoscored": timedelta(hours=12),
     "dag_canary_whoscored_proxy": timedelta(hours=8),
 }
@@ -178,59 +184,98 @@ def _run_type(context: Mapping[str, Any]) -> str:
     return str(getattr(dag_run, "run_type", "") or "")
 
 
-def _scheduled_pointer_path(raw_root: str, run_id: str) -> Path | None:
-    """Resolve one deployment-owned pointer without following any link.
-
-    Returns ``None`` when the pointer does not exist (the scheduled run then
-    stays direct-only, fail-closed).  A present-but-unsafe pointer -- wrong
-    owner, mode, a symlink, or one escaping its mounted root -- raises.
-    """
+def _read_private_root_artifact(
+    raw_root: str,
+    name: str,
+    *,
+    maximum_bytes: int,
+    missing_ok: bool,
+    label: str,
+) -> tuple[Path, bytes] | None:
+    """Open a generated basename with ``openat`` and validate that descriptor."""
 
     root_path = Path(raw_root)
-    if not root_path.is_absolute():
-        raise WhoScoredProxyRuntimeError(
-            "scheduled paid pointer root must be absolute"
-        )
-    if root_path.is_symlink():
-        raise WhoScoredProxyRuntimeError(
-            "scheduled paid pointer root must not be a symlink"
-        )
-    name = hashlib.sha256(run_id.encode("utf-8")).hexdigest() + ".json"
-    path = root_path / name
+    if not root_path.is_absolute() or "/" in name or name in {"", ".", ".."}:
+        raise WhoScoredProxyRuntimeError(f"{label} root/name is not canonical")
     try:
-        metadata = path.stat(follow_symlinks=False)
-    except OSError:
-        # The pointer is an optional upgrade: its absence means "run free".  A
-        # transient stat failure (ENOENT, but also ESTALE/EIO/ETIMEDOUT on a
-        # flaky config mount) must degrade this scheduled run to direct-only,
-        # not crash the whole free run.  This is strictly money-safe -- a failed
-        # stat yields no file to trust, so it can only make the run go free,
-        # never paid -- and cannot weaken the integrity checks below, which only
-        # run on a file that already stat'd successfully (i.e. exists).
-        return None
-    if stat.S_ISLNK(metadata.st_mode):
-        raise WhoScoredProxyRuntimeError(
-            "scheduled paid pointer must not be a symlink"
+        root_descriptor = os.open(
+            root_path,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
         )
-    if not stat.S_ISREG(metadata.st_mode):
-        raise WhoScoredProxyRuntimeError("scheduled paid pointer must be a file")
-    if metadata.st_uid != os.geteuid():
+    except OSError as exc:
+        if missing_ok:
+            return None
         raise WhoScoredProxyRuntimeError(
-            "scheduled paid pointer must be owned by the Airflow runtime UID"
-        )
-    if stat.S_IMODE(metadata.st_mode) != 0o600:
-        raise WhoScoredProxyRuntimeError(
-            "scheduled paid pointer must have mode 0600"
-        )
-    try:
-        root = root_path.resolve(strict=True)
-        resolved = path.resolve(strict=True)
-        resolved.relative_to(root)
-    except (OSError, ValueError) as exc:
-        raise WhoScoredProxyRuntimeError(
-            "scheduled paid pointer escapes its mounted root"
+            f"{label} root cannot be opened safely"
         ) from exc
-    return resolved
+    try:
+        root_metadata = os.fstat(root_descriptor)
+        if (
+            not stat.S_ISDIR(root_metadata.st_mode)
+            or root_metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(root_metadata.st_mode) & 0o022
+        ):
+            raise WhoScoredProxyRuntimeError(
+                f"{label} root ownership or mode is unsafe"
+            )
+        try:
+            descriptor = os.open(
+                name,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=root_descriptor,
+            )
+        except OSError as exc:
+            if missing_ok and isinstance(exc, FileNotFoundError):
+                return None
+            raise WhoScoredProxyRuntimeError(
+                f"{label} cannot be opened safely"
+            ) from exc
+        try:
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+                or metadata.st_nlink != 1
+                or metadata.st_size <= 0
+                or metadata.st_size > maximum_bytes
+            ):
+                raise WhoScoredProxyRuntimeError(
+                    f"{label} ownership, mode or size is unsafe"
+                )
+            chunks: list[bytes] = []
+            remaining = metadata.st_size
+            while remaining:
+                chunk = os.read(descriptor, min(remaining, 64 * 1024))
+                if not chunk:
+                    raise WhoScoredProxyRuntimeError(
+                        f"{label} was truncated while reading"
+                    )
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            if os.read(descriptor, 1):
+                raise WhoScoredProxyRuntimeError(f"{label} grew while reading")
+            return root_path / name, b"".join(chunks)
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(root_descriptor)
+
+
+def _scheduled_paid_mode(context: Mapping[str, Any]) -> str:
+    if _run_type(context) != "scheduled" or not daily_ingest_paid_crawl_allowed(
+        _dag_id(context)
+    ):
+        return SCHEDULED_PAID_MODE_DISABLED
+    value = str(
+        os.environ.get(SCHEDULED_PAID_MODE_ENV, SCHEDULED_PAID_MODE_DISABLED)
+        or SCHEDULED_PAID_MODE_DISABLED
+    ).strip()
+    if value not in {SCHEDULED_PAID_MODE_DISABLED, SCHEDULED_PAID_MODE_REQUIRED}:
+        raise WhoScoredProxyRuntimeError(
+            f"{SCHEDULED_PAID_MODE_ENV} must be disabled or required"
+        )
+    return value
 
 
 def _scheduled_paid_pins(context: Mapping[str, Any]) -> dict[str, str] | None:
@@ -239,8 +284,9 @@ def _scheduled_paid_pins(context: Mapping[str, Any]) -> dict[str, str] | None:
     Only a ``scheduled`` DagRun of a DAG admitted to the daily paid path can be
     upgraded here.  The backfill DAG is never admitted (``daily_ingest_paid_
     crawl_allowed`` is False for it), so the historical crawl child-lock is
-    untouched.  A missing env or pointer yields ``None`` (direct-only); a
-    tampered or mismatched pointer raises.
+    untouched. Disabled mode returns ``None`` without touching the pointer
+    root. Required mode, missing/malformed content and identity mismatches all
+    raise before source work.
     """
 
     if _run_type(context) != "scheduled":
@@ -248,22 +294,35 @@ def _scheduled_paid_pins(context: Mapping[str, Any]) -> dict[str, str] | None:
     dag_id = _dag_id(context)
     if not daily_ingest_paid_crawl_allowed(dag_id):
         return None
+    mode = _scheduled_paid_mode(context)
+    if mode == SCHEDULED_PAID_MODE_DISABLED:
+        return None
     raw_root = str(os.environ.get(SCHEDULED_PAID_POINTER_ROOT_ENV) or "").strip()
     if not raw_root:
+        if mode == SCHEDULED_PAID_MODE_REQUIRED:
+            raise WhoScoredProxyRuntimeError(
+                "scheduled paid-required run has no pointer root"
+            )
         return None
     run_id = _run_id(context)
     if not run_id:
-        return None
-    path = _scheduled_pointer_path(raw_root, run_id)
-    if path is None:
-        return None
-    try:
-        size = path.stat().st_size
-        if size <= 0 or size > _MAX_POINTER_BYTES:
+        if mode == SCHEDULED_PAID_MODE_REQUIRED:
             raise WhoScoredProxyRuntimeError(
-                "scheduled paid pointer has an invalid size"
+                "scheduled paid-required run has no DagRun identity"
             )
-        data = strict_json_loads(path.read_bytes().decode("utf-8"))
+        return None
+    opened = _read_private_root_artifact(
+        raw_root,
+        hashlib.sha256(run_id.encode("utf-8")).hexdigest() + ".json",
+        maximum_bytes=_MAX_POINTER_BYTES,
+        missing_ok=mode != SCHEDULED_PAID_MODE_REQUIRED,
+        label="scheduled paid pointer",
+    )
+    if opened is None:
+        return None
+    _path, raw = opened
+    try:
+        data = strict_json_loads(raw.decode("utf-8"))
     except WhoScoredProxyRuntimeError:
         raise
     except (OSError, UnicodeDecodeError, ProxyCampaignError, ValueError) as exc:
@@ -273,9 +332,7 @@ def _scheduled_paid_pins(context: Mapping[str, Any]) -> dict[str, str] | None:
     if not isinstance(data, Mapping) or frozenset(data) != _POINTER_FIELDS:
         raise WhoScoredProxyRuntimeError("scheduled paid pointer schema is invalid")
     if data.get("schema_version") != SCHEDULED_PAID_POINTER_SCHEMA_VERSION:
-        raise WhoScoredProxyRuntimeError(
-            "unsupported scheduled paid pointer schema"
-        )
+        raise WhoScoredProxyRuntimeError("unsupported scheduled paid pointer schema")
     if data.get("dag_id") != dag_id or data.get("run_id") != run_id:
         raise WhoScoredProxyRuntimeError(
             "scheduled paid pointer identity does not match this DagRun"
@@ -295,17 +352,45 @@ def _scheduled_paid_pins(context: Mapping[str, Any]) -> dict[str, str] | None:
 def _effective_transport_conf(context: Mapping[str, Any]) -> Mapping[str, Any]:
     """DagRun conf, or the signed pins a scheduled run's pointer provides.
 
-    Explicit DagRun conf always wins, so the manual paid flow and any explicit
-    ``direct_only`` request are never overridden.  The pointer only fills in the
-    pins for an eligible scheduled run whose conf carries no transport intent.
+    Manual runs retain their explicit approval flow. For an eligible scheduled
+    run, disabled mode is an unconditional direct-only kill switch and rejects
+    explicit transport authority without reading the pointer; required mode
+    accepts only an exactly empty conf and derives all paid pins from the
+    protected pointer.
     """
 
     conf = _dag_run_conf(context)
+    eligible_scheduled = _run_type(
+        context
+    ) == "scheduled" and daily_ingest_paid_crawl_allowed(_dag_id(context))
+    mode = _scheduled_paid_mode(context)
+    if eligible_scheduled and mode == SCHEDULED_PAID_MODE_DISABLED:
+        if any(
+            key in conf
+            for key in (
+                "transport_policy",
+                PAID_APPROVAL_ID_CONF,
+                PAID_APPROVAL_SHA256_CONF,
+            )
+        ):
+            raise WhoScoredProxyRuntimeError(
+                "scheduled paid-disabled mode rejects explicit transport authority"
+            )
+        return {}
+    required = mode == SCHEDULED_PAID_MODE_REQUIRED
+    if required and conf:
+        raise WhoScoredProxyRuntimeError(
+            "scheduled paid-required DagRun conf must be exactly empty"
+        )
     if (
         conf.get("transport_policy")
         or conf.get(PAID_APPROVAL_ID_CONF)
         or conf.get(PAID_APPROVAL_SHA256_CONF)
     ):
+        if required:
+            raise WhoScoredProxyRuntimeError(
+                "scheduled paid-required authority cannot come from DagRun conf"
+            )
         return conf
     pins = _scheduled_paid_pins(context)
     if pins is None:
@@ -447,14 +532,9 @@ class PaidRuntime:
     ) -> "PaidRuntime":
         """Bind an already verified approval to one exact work allocation.
 
-        ``missing_ok`` handles catalog drift within a paid DagRun: a scope that
-        discovery opened *after* the standing approval was issued has no signed
-        allocation.  Rather than failing the whole run, that one scope degrades
-        to direct-only transport (it is normally Cloudflare-challenged, becomes
-        retryable, and is covered by the next day's approval).  Two or more
-        matches always remain a hard error, and direct binding never touches the
-        paid path.  Discovery and the constant profile work item never pass
-        ``missing_ok`` because their allocations are always present.
+        ``missing_ok`` is retained only for legacy explicit approvals. Schema-v3
+        scheduled runs freeze their exact cohort and fail when an allocation is
+        absent; newly discovered scopes are deferred instead.
         """
 
         if not self.is_paid:
@@ -474,7 +554,11 @@ class PaidRuntime:
                 "approval must contain exactly one allocation for task_id/work_item_id"
             )
         if not matches:
-            if missing_ok:
+            if (
+                missing_ok
+                and self.approval.schema_version
+                != SCHEDULED_PROXY_CAMPAIGN_SCHEMA_VERSION
+            ):
                 return PaidRuntime(policy=TRANSPORT_POLICY_DIRECT_ONLY)
             raise WhoScoredProxyRuntimeError(
                 "approval must contain exactly one allocation for task_id/work_item_id"
@@ -572,6 +656,10 @@ def _private_approval_path(
         )
     if stat.S_IMODE(metadata.st_mode) != 0o600:
         raise WhoScoredProxyRuntimeError("paid approval artifact must have mode 0600")
+    if metadata.st_nlink != 1:
+        raise WhoScoredProxyRuntimeError(
+            "paid approval artifact must have exactly one hard link"
+        )
     if resolved.name != f"{approval_id}.json":
         raise WhoScoredProxyRuntimeError(
             "paid approval filename must equal <paid_approval_id>.json"
@@ -596,24 +684,24 @@ def resolve_paid_runtime(
             "paid allocation lookup requires both task_id and work_item_id"
         )
     conf = _effective_transport_conf(context)
-    raw_approval_path = str(os.environ.get(PROXY_APPROVAL_PATH_ENV) or "").strip()
-    if not raw_approval_path:
-        raise WhoScoredProxyRuntimeError(
-            f"paid transport requires deployment env {PROXY_APPROVAL_PATH_ENV}"
-        )
     raw_approval_root = str(os.environ.get(PROXY_APPROVAL_ROOT_ENV) or "").strip()
     if not raw_approval_root:
         raise WhoScoredProxyRuntimeError(
             f"paid transport requires deployment env {PROXY_APPROVAL_ROOT_ENV}"
         )
     try:
-        approval_path = _private_approval_path(
-            raw_approval_path,
-            approval_id=str(conf[PAID_APPROVAL_ID_CONF]),
-            raw_root=raw_approval_root,
+        approval_id = str(conf[PAID_APPROVAL_ID_CONF])
+        opened_approval = _read_private_root_artifact(
+            raw_approval_root,
+            f"{approval_id}.json",
+            maximum_bytes=MAX_APPROVAL_DOCUMENT_BYTES,
+            missing_ok=False,
+            label="paid approval artifact",
         )
-        approval = load_proxy_campaign_approval_structure(
-            approval_path,
+        assert opened_approval is not None
+        approval_path, approval_bytes = opened_approval
+        approval = parse_proxy_campaign_approval_structure_bytes(
+            approval_bytes,
             expected_approval_id=str(conf[PAID_APPROVAL_ID_CONF]),
             expected_approval_sha256=str(conf[PAID_APPROVAL_SHA256_CONF]),
         )
@@ -647,6 +735,16 @@ def resolve_paid_runtime(
             raise ProxyCampaignValidationError(
                 "DagRun run_id differs from the signed paid approval"
             )
+        if _run_type(context) == "scheduled" and daily_ingest_paid_crawl_allowed(
+            dag_id
+        ):
+            if (
+                approval.schema_version != SCHEDULED_PROXY_CAMPAIGN_SCHEMA_VERSION
+                or approval.scheduled_authority is None
+            ):
+                raise ProxyCampaignValidationError(
+                    "scheduled paid ingest requires approval schema v3"
+                )
         _verify_approval_window(approval, dag_id=dag_id)
         _verify_release_pins(approval)
     except (ProxyCampaignError, OSError, ValueError) as exc:

@@ -50,6 +50,7 @@ from scrapers.whoscored.proxy_campaign import (
     load_proxy_campaign_context_from_env,
     path_matches_family,
     proxy_campaign_ledger_from_env,
+    scheduled_scope_player_pagination_target_limit,
     sign_proxy_campaign_approval,
     strict_json_loads,
     whoscored_canary_run_id,
@@ -59,6 +60,20 @@ from scrapers.whoscored.proxy_campaign import (
 SECRET = "test-campaign-secret-which-is-long-enough"
 NOW = datetime(2026, 7, 15, 12, tzinfo=timezone.utc)
 PATHS = ["/Matches", "/api"]
+
+
+def test_scheduled_player_pagination_headroom_is_conservative_and_hard_capped():
+    assert scheduled_scope_player_pagination_target_limit(
+        stage_count=1, non_pagination_target_count=200
+    ) == 30 * 99
+    assert scheduled_scope_player_pagination_target_limit(
+        stage_count=2, non_pagination_target_count=400
+    ) == WHOSCORED_CANARY_CAPTURE_LEASE_LIMIT - 400
+    with pytest.raises(ProxyCampaignValidationError):
+        scheduled_scope_player_pagination_target_limit(
+            stage_count=1,
+            non_pagination_target_count=WHOSCORED_CANARY_CAPTURE_LEASE_LIMIT + 1,
+        )
 
 
 def _allocation(
@@ -456,6 +471,7 @@ def test_approval_loader_rejects_duplicate_root_and_nested_json_keys(tmp_path):
         '{"approval_id":"benign-review-value",' + canonical[1:],
         encoding="utf-8",
     )
+    path.chmod(0o600)
 
     with pytest.raises(ProxyCampaignValidationError, match="duplicate JSON key"):
         load_proxy_campaign_approval(
@@ -629,6 +645,7 @@ def test_env_loader_is_direct_only_when_absent_and_fails_on_partial(tmp_path):
     approval = _approval()
     path = tmp_path / "approval.json"
     path.write_text(json.dumps(approval.to_dict()))
+    path.chmod(0o600)
     env = {
         "WHOSCORED_PROXY_APPROVAL_PATH": str(path),
         "WHOSCORED_PROXY_APPROVAL_ID": approval.approval_id,
@@ -647,6 +664,7 @@ def test_task_work_item_resolver_selects_exactly_one_signed_allocation(tmp_path)
     approval = _approval()
     path = tmp_path / "approval.json"
     path.write_text(json.dumps(approval.to_dict()))
+    path.chmod(0o600)
     attempt = deterministic_proxy_attempt_id(
         dag_id="dag_backfill_whoscored",
         run_id="scheduled__2026-07-15T00:00:00+00:00",

@@ -3599,7 +3599,10 @@ class WhoScoredRepository:
         flag is false, so filtering on it silently loses finished matches.
         """
         latest = f"{self.catalog}.{self.schema}.whoscored_match_ingest_latest"
+        explicit_ids = match_ids is not None
         ids = [int(value) for value in (match_ids or [])]
+        if explicit_ids and not ids:
+            return []
         if include_success and not ids and not include_all_completed:
             raise ValueError("include_success requires explicit match_ids")
         id_filter = ""
@@ -4130,7 +4133,10 @@ class WhoScoredRepository:
         if limit is not None and int(limit) < 0:
             raise ValueError("preview candidate limit must be non-negative")
         limit_sql = f"LIMIT {int(limit)}" if limit is not None else ""
+        explicit_ids = match_ids is not None
         ids = sorted({int(value) for value in (match_ids or ())})
+        if explicit_ids and not ids:
+            return []
         if force_replay and not ids:
             raise ValueError("preview force_replay requires explicit match_ids")
         id_filter = (

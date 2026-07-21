@@ -1631,6 +1631,30 @@ def test_profile_candidates_require_a_nonempty_scope_and_honor_zero_limit():
 
 
 @pytest.mark.unit
+def test_explicit_empty_match_and_preview_sets_never_fall_back_to_all_candidates():
+    trino = MagicMock()
+    repository = WhoScoredRepository(writer=MagicMock(), trino=trino)
+
+    assert (
+        repository.list_match_candidates(
+            "INT-World Cup",
+            "2026",
+            match_ids=(),
+        )
+        == []
+    )
+    assert (
+        repository.list_preview_candidates(
+            "INT-World Cup",
+            "2026",
+            match_ids=(),
+        )
+        == []
+    )
+    trino.execute_query.assert_not_called()
+
+
+@pytest.mark.unit
 def test_match_candidates_replay_failures_after_parser_or_availability_change():
     trino = MagicMock()
     trino.execute_query.return_value = []

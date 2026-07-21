@@ -23,6 +23,7 @@ from scrapers.whoscored.parsers import (
     DatasetStatus,
     ParsedDataset,
     PlayerStageStatisticsPage,
+    WhoScoredParseError,
 )
 from scrapers.whoscored.raw_store import (
     RawTarget,
@@ -869,6 +870,30 @@ def test_schedule_refuses_invalid_write_chunk_before_source_resolution(
     assert result.succeeded == 0
     assert len(result.errors) == 1
     assert "WHOSCORED_SCOPE_WRITE_CHUNK_ROWS" in result.errors[0]
+
+
+def test_schedule_rejects_source_stage_drift_before_stage_requests(tmp_path):
+    service, _, _ = _service(tmp_path)
+    service.catalog_season = replace(service.catalog_season, stage_ids=(700,))
+    service._source_season_id = lambda: 9001
+    calls = []
+
+    def fake_fetch_parsed(target, **_kwargs):
+        calls.append(target.page_kind)
+        return (
+            SimpleNamespace(sha256="a" * 64),
+            "s3://raw/season",
+            SimpleNamespace(stages=SimpleNamespace(rows=[{"stage_id": 701}])),
+        )
+
+    service._fetch_parsed = fake_fetch_parsed
+
+    result = service.sync_schedule()
+
+    assert result.status == "failed"
+    assert calls == ["season_stages"]
+    assert len(result.errors) == 1
+    assert "source schedule stages differ from the frozen catalog" in result.errors[0]
 
 
 def test_structured_rate_limit_is_wired_into_example_and_airflow_environment():
@@ -2176,7 +2201,11 @@ def test_schedule_cache_policy_ttls_only_mutable_active_targets(tmp_path, monkey
 
     monkeypatch.setattr("scrapers.whoscored.service.date", _FixedDate)
     service, repository, _ = _service(tmp_path)
-    service.catalog_season = replace(service.catalog_season, end=None)
+    service.catalog_season = replace(
+        service.catalog_season,
+        end=None,
+        stage_ids=(700,),
+    )
     service._source_season_id = lambda: 9001
     calls = []
     calendar_urls = []
@@ -2436,7 +2465,8 @@ def test_schedule_cache_policy_ttls_only_mutable_active_targets(tmp_path, monkey
     assert all(kwargs.get("cache_ttl") is None for _, _, kwargs in calls)
 
 
-def test_player_stage_statistics_fetches_every_declared_page(tmp_path):
+def test_player_stage_statistics_fetches_every_declared_page(tmp_path, monkeypatch):
+    monkeypatch.setenv("WHOSCORED_PLAYER_PAGINATION_TARGET_LIMIT", "1")
     service, _, _ = _service(tmp_path)
     spec = service._player_stage_statistics_spec(
         stage_id=700,
@@ -2502,6 +2532,79 @@ def test_player_stage_statistics_fetches_every_declared_page(tmp_path):
     assert {row["player_id"] for row in parsed.rows} == {11, 12}
     assert len(additional_raw) == 1
     assert additional_raw[0][1] == "s3://raw/page-2"
+
+
+def test_paid_player_pagination_limit_blocks_before_page_two_dial(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("WHOSCORED_PLAYER_PAGINATION_TARGET_LIMIT", "0")
+    service, _, _ = _service(tmp_path)
+    spec = service._player_stage_statistics_spec(
+        stage_id=700,
+        source_season_id=9001,
+        active=True,
+        category="summary",
+        subcategory="all",
+        cache_ttl=None,
+        browser_bootstrap_url=(
+            "https://www.whoscored.com/Regions/247/Tournaments/36/Seasons/9001/"
+            "Stages/700/TeamStatistics"
+        ),
+    )
+    page = PlayerStageStatisticsPage(
+        page_number=1,
+        page_index=0,
+        total_pages=2,
+        total_results=2,
+        results_per_page=1,
+        first_record_index=0,
+        last_record_index=0,
+        index_base=0,
+        records=({"playerId": 11, "teamId": 26, "apps": 1},),
+    )
+    response = TransportResponse(
+        url=spec.target.canonical_url,
+        content=b"page-1",
+        status_code=200,
+        headers={},
+        route=TransportRoute.DIRECT_HTTP,
+        wire_bytes=6,
+        sha256=hashlib.sha256(b"page-1").hexdigest(),
+    )
+    dialled = False
+
+    def fetch_next(_specs):
+        nonlocal dialled
+        dialled = True
+        raise AssertionError("page two must not be dialled")
+
+    service._fetch_parsed_many = fetch_next
+    with pytest.raises(WhoScoredParseError, match="signed paid target limit"):
+        service._complete_player_statistics_pages(
+            [spec], [(response, "s3://raw/page-1", page)]
+        )
+    assert dialled is False
+
+
+def test_exact_zero_profile_candidates_perform_no_source_fetch(tmp_path):
+    service, _, _ = _service(tmp_path)
+
+    def unexpected_fetch(*_args, **_kwargs):
+        raise AssertionError("zero exact profile candidates must not fetch a source")
+
+    service._fetch = unexpected_fetch
+    result = service.sync_profiles(
+        limit=0,
+        candidate_scopes=["INT-World Cup=2026"],
+        player_ids=[],
+    )
+
+    assert result.attempted == 0
+    assert result.succeeded == 0
+    assert result.committed_batches == {
+        "profile": [],
+        "profile_not_available": [],
+    }
 
 
 def test_player_stage_pagination_fetches_in_bounded_batches(tmp_path):
