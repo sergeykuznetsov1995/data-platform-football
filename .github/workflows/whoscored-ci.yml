@@ -533,6 +533,43 @@ jobs:
           assert response["sessions"] == []
           PY
 
+      - name: Test production admission from a protected release
+        env:
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+        run: |
+          protected_root=/opt/whoscored-ci-admission
+          test ! -e "$protected_root"
+          sudo install -d -o root -g root -m 0755 \
+            "$protected_root/scripts"
+          sudo install -o root -g root -m 0444 \
+            scripts/__init__.py \
+            scripts/validate_whoscored_build_provenance.py \
+            scripts/whoscored_production_admission.py \
+            "$protected_root/scripts/"
+          test "$(stat -c '%u:%g:%a:%h' \
+            "$protected_root/scripts/validate_whoscored_build_provenance.py")" \
+            = "0:0:444:1"
+          (
+            cd /tmp
+            WHOSCORED_CI_PROTECTED_ROOT="$protected_root" \
+              PYTHONPATH="$protected_root:${GITHUB_WORKSPACE}" \
+              python - <<'PY'
+          import os
+          from pathlib import Path
+
+          from scripts import whoscored_production_admission as admission
+          import pytest
+
+          expected_root = Path(os.environ["WHOSCORED_CI_PROTECTED_ROOT"])
+          assert Path(admission.__file__).absolute().parents[1] == expected_root
+          test_path = (
+              Path(os.environ["GITHUB_WORKSPACE"])
+              / "tests/unit/scripts/test_whoscored_production_admission.py"
+          )
+          raise SystemExit(pytest.main(["-q", str(test_path)]))
+          PY
+          )
+
       - name: WhoScored unit, DAG and storage contract
         env:
           PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
@@ -542,7 +579,7 @@ jobs:
           WHOSCORED_SCHEDULER_PAYLOAD_IMAGE: data-platform-airflow-scheduler-payload:provenance-ci
         run: |
           pytest -q \
-            $(find tests -type f -name '*.py' -print | grep -E '/test_.*whoscored.*\.py$|/test_whoscored.*\.py$' | sort) \
+            $(find tests -type f -name '*.py' -print | grep -E '/test_.*whoscored.*\.py$|/test_whoscored.*\.py$' | grep -v '/test_whoscored_production_admission.py$' | sort) \
             tests/unit/scrapers/test_iceberg_writer.py \
             tests/unit/dags/test_proxy_traffic.py \
             tests/unit/scrapers/test_flaresolverr_client.py \

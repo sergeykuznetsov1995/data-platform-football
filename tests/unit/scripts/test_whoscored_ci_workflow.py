@@ -69,7 +69,27 @@ def test_ci_runs_public_writer_and_capacity_contracts():
     assert "bench_whoscored_capacity.py" in text
     assert "whoscored_capacity_container_runtime.py" in text
     assert "docker/images/airflow/whoscored_capacity_worker_bootstrap.py" in text
-    assert "rg --files tests" in text
+    assert "find tests -type f -name '*.py'" in text
+
+
+def test_production_admission_tests_run_from_a_root_owned_protected_release():
+    text = _workflow_text()
+    protected = text.split(
+        "- name: Test production admission from a protected release", 1
+    )[1].split("- name: WhoScored unit, DAG and storage contract", 1)[0]
+    broad_contract = text.split(
+        "- name: WhoScored unit, DAG and storage contract", 1
+    )[1]
+
+    assert "protected_root=/opt/whoscored-ci-admission" in protected
+    assert "sudo install -d -o root -g root -m 0755" in protected
+    assert "sudo install -o root -g root -m 0444" in protected
+    assert "scripts/whoscored_production_admission.py" in protected
+    assert "scripts/validate_whoscored_build_provenance.py" in protected
+    assert 'PYTHONPATH="$protected_root:${GITHUB_WORKSPACE}"' in protected
+    assert "from scripts import whoscored_production_admission as admission" in protected
+    assert "Path(admission.__file__).absolute().parents[1] == expected_root" in protected
+    assert "grep -v '/test_whoscored_production_admission.py$'" in broad_contract
 
 
 def test_ci_uses_test_runtime_and_smokes_immutable_flaresolverr():
