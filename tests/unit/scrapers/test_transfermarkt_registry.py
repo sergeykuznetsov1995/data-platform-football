@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,7 @@ from scrapers.transfermarkt.registry import (
     AgeCategory,
     ClassificationEvidence,
     ClassificationStatus,
+    CompetitionParticipant,
     CompetitionType,
     CrawlScope,
     EvidenceOrigin,
@@ -19,13 +21,16 @@ from scrapers.transfermarkt.registry import (
     IncompleteSnapshotError,
     RegistryConflictError,
     RegistryPage,
+    RegistryRowType,
     SeasonFormat,
     TeamType,
     UnknownCompetitionError,
     UnsafeCrawlError,
     canonical_season,
     deterministic_scope_id,
+    participant_list_hash,
     reconcile_registry_pages,
+    reconcile_registry_tombstones,
     resolve_competition,
 )
 
@@ -143,7 +148,9 @@ def test_top5_canonical_ids_match_the_legacy_medallion_contour(
 
     assert all(seeded_top5.values()), f"Top-5 canonical id is unset: {seeded_top5}"
     unknown = set(seeded_top5.values()) - legacy_competition_ids
-    assert not unknown, f"canonical ids absent from competitions.yaml: {sorted(unknown)}"
+    assert not unknown, (
+        f"canonical ids absent from competitions.yaml: {sorted(unknown)}"
+    )
 
     # And the seed covers every Top-5 league the legacy contour knows about.
     top5_legacy = {
@@ -248,9 +255,7 @@ def test_conflicting_duplicate_source_identity_blocks_snapshot(
 ) -> None:
     gb1 = next(item for item in pages[0].competitions if item.competition_id == "GB1")
     conflicting = replace(gb1, name="Different Competition")
-    page_two = replace(
-        pages[1], competitions=pages[1].competitions + (conflicting,)
-    )
+    page_two = replace(pages[1], competitions=pages[1].competitions + (conflicting,))
     with pytest.raises(RegistryConflictError, match="conflicting competition"):
         reconcile_registry_pages((pages[0], page_two))
 
@@ -301,9 +306,7 @@ def test_conflicting_source_evidence_blocks_crawl(snapshot) -> None:
         gender=Gender.WOMEN,
     )
     unsafe = replace(gb1, evidence=gb1.evidence + (conflict,))
-    edition = next(
-        item for item in snapshot.editions if item.competition_id == "GB1"
-    )
+    edition = next(item for item in snapshot.editions if item.competition_id == "GB1")
     assert unsafe.classification_status is ClassificationStatus.CONFLICT
     with pytest.raises(UnsafeCrawlError, match="conflicting source evidence"):
         CrawlScope.from_records(unsafe, edition)
@@ -336,9 +339,7 @@ def test_competition_and_edition_bronze_contract_columns_are_exact(snapshot) -> 
     competition = next(
         item for item in snapshot.competitions if item.competition_id == "GB1"
     )
-    edition = next(
-        item for item in snapshot.editions if item.competition_id == "GB1"
-    )
+    edition = next(item for item in snapshot.editions if item.competition_id == "GB1")
     assert tuple(competition.as_dict()) == (
         "competition_id",
         "slug",
@@ -383,6 +384,91 @@ def test_competition_and_edition_bronze_contract_columns_are_exact(snapshot) -> 
     assert json.loads(competition.as_dict()["classification_evidence"])
 
 
+def test_participant_table_contract_and_exact_edition_aggregate(pages) -> None:
+    edition = next(item for item in pages[0].editions if item.competition_id == "GB1")
+    participant = CompetitionParticipant(
+        competition_id="GB1",
+        edition_id=edition.edition_id,
+        team_id="11",
+        team_name="Arsenal FC",
+        source_url="https://www.transfermarkt.com/arsenal/startseite/verein/11",
+        discovered_at=datetime(2026, 7, 11, tzinfo=timezone.utc),
+        registry_snapshot_id=pages[0].snapshot_id,
+        source_body_hash="a" * 64,
+        parser_revision="fixture-v2",
+        schema_revision="2",
+    )
+    exact_edition = replace(
+        edition,
+        participant_count=1,
+        participant_hash=participant_list_hash((participant,)),
+    )
+    page_one = replace(
+        pages[0],
+        editions=tuple(
+            exact_edition if item is edition else item for item in pages[0].editions
+        ),
+        participants=(participant,),
+    )
+
+    exact = reconcile_registry_pages((page_one, pages[1]))
+
+    assert exact.participants == (participant,)
+    assert tuple(participant.as_dict()) == (
+        "competition_id",
+        "edition_id",
+        "team_id",
+        "team_name",
+        "source_url",
+        "discovered_at",
+        "registry_snapshot_id",
+        "source_body_hash",
+        "parser_revision",
+        "schema_revision",
+    )
+
+
+def test_complete_snapshot_reconciliation_emits_explicit_tombstones(snapshot) -> None:
+    participant = CompetitionParticipant(
+        competition_id="GB1",
+        edition_id="2025",
+        team_id="11",
+        team_name="Arsenal FC",
+        source_url="https://www.transfermarkt.com/arsenal/startseite/verein/11",
+        discovered_at=datetime(2026, 7, 11, tzinfo=timezone.utc),
+        registry_snapshot_id=snapshot.snapshot_id,
+        source_body_hash="a" * 64,
+    )
+    previous = replace(snapshot, participants=(participant,))
+    current = replace(
+        snapshot,
+        snapshot_id="fixture-2026-08-11",
+        snapshot_hash="b" * 64,
+        competitions=tuple(
+            item for item in snapshot.competitions if item.competition_id != "GB1"
+        ),
+        editions=tuple(
+            item for item in snapshot.editions if item.competition_id != "GB1"
+        ),
+        participants=(),
+    )
+
+    tombstones = reconcile_registry_tombstones(
+        previous,
+        current,
+        reconciled_at=datetime(2026, 8, 11, tzinfo=timezone.utc),
+    )
+
+    assert [item.row_type for item in tombstones] == [
+        RegistryRowType.COMPETITION,
+        RegistryRowType.EDITION,
+        RegistryRowType.PARTICIPANT,
+    ]
+    assert all(item.competition_id == "GB1" for item in tombstones)
+    assert tombstones[-1].team_id == "11"
+    assert tombstones[-1].missing_from_snapshot_id == current.snapshot_id
+
+
 def test_scope_identity_is_stable_and_sensitive_to_exact_source_identity(
     snapshot,
 ) -> None:
@@ -393,7 +479,9 @@ def test_scope_identity_is_stable_and_sensitive_to_exact_source_identity(
     assert first != deterministic_scope_id("gb1", "2025")
 
     scope = next(
-        item for item in snapshot.crawl_scopes(strict=False) if item.competition_id == "GB1"
+        item
+        for item in snapshot.crawl_scopes(strict=False)
+        if item.competition_id == "GB1"
     )
     assert scope.scope_id == first
     assert scope.registry_snapshot_id == snapshot.snapshot_id

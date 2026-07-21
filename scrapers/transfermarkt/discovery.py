@@ -22,6 +22,7 @@ from scrapers.transfermarkt.models import FetchOutcome, FetchStatus
 from scrapers.transfermarkt.registry import (
     AgeCategory,
     ClassificationEvidence,
+    CompetitionParticipant,
     CompetitionRecord,
     CompetitionType,
     EditionRecord,
@@ -33,24 +34,23 @@ from scrapers.transfermarkt.registry import (
     UnknownCompetitionError,
     canonical_season,
     narrowest_signals,
+    participant_list_hash,
     resolve_competition,
 )
 
 
 BASE_URL = "https://www.transfermarkt.com"
-SEED_ROUTES: tuple[str, ...] = (
-    "/navigation/wettbewerbe",
-    "/wettbewerbe/europa",
-    "/wettbewerbe/amerika",
-    "/wettbewerbe/asien",
-    "/wettbewerbe/afrika",
-    "/wettbewerbe/fifa",
-)
+CATALOGUE_ROUTE = "/navigation/wettbewerbe"
+# Compatibility aliases for callers which report the discovery roots.  The
+# canonical catalogue is now the sole authority; every region/country page is
+# reached through first-party links in that catalogue graph.
+SEED_ROUTES: tuple[str, ...] = (CATALOGUE_ROUTE,)
 SEED_URLS: tuple[str, ...] = tuple(BASE_URL + route for route in SEED_ROUTES)
 
 _COUNTRY_ROUTE_RE = re.compile(
     r"^/wettbewerbe/national/wettbewerbe/[A-Za-z0-9_-]+(?:/.*)?$"
 )
+_REGION_ROUTE_RE = re.compile(r"^/wettbewerbe/(?!national(?:/|$))[A-Za-z0-9_-]+/?$")
 _COMPETITION_ROUTE_RE = re.compile(
     r"^/(?P<slug>[^/?#]+)/(?:[^?#]*/)?(?P<section>[^/?#]+)/"
     r"(?P<kind>pokalwettbewerb|wettbewerb)/"
@@ -62,8 +62,8 @@ _CANONICAL_SECTION = "startseite"
 # immutable, so the parser revision is part of the snapshot identity. Bump it
 # whenever parsing or classification changes — otherwise a restated catalogue
 # cannot be published over the snapshot id it would otherwise reuse.
-PARSER_REVISION = "tm-html-discovery-v2"
-SCHEMA_REVISION = "1"
+PARSER_REVISION = "tm-html-discovery-v3"
+SCHEMA_REVISION = "2"
 # The catalogue states a competition's taxonomy at three levels: a broad section
 # heading, a group separator inside the tables, and the "National Team
 # Competitions" section, which names the entrants themselves — a table group can
@@ -72,6 +72,36 @@ _SECTION_PRECEDENCE = 1
 _GROUP_PRECEDENCE = 2
 _ENTRANT_PRECEDENCE = 3
 _EDITION_PATH_RE = re.compile(r"/saison_id/(?P<edition_id>\d{4})(?:/|$)")
+_TEAM_ROUTE_RE = re.compile(
+    r"^/(?P<slug>[^/?#]+)/(?:[^/?#]+/)*verein/(?P<team_id>\d+)(?:/.*)?$"
+)
+
+
+@dataclass(frozen=True)
+class DiscoveryLimits:
+    """Hard safety bounds for one otherwise source-driven catalogue crawl."""
+
+    listing_pages: int = 4096
+    competitions: int = 8192
+    editions: int = 100_000
+    participants_per_edition: int = 1024
+    participants: int = 1_000_000
+    documents: int = 120_000
+
+    def __post_init__(self) -> None:
+        for name in (
+            "listing_pages",
+            "competitions",
+            "editions",
+            "participants_per_edition",
+            "participants",
+            "documents",
+        ):
+            if int(getattr(self, name)) < 1:
+                raise ValueError(f"{name} must be positive")
+
+
+DEFAULT_DISCOVERY_LIMITS = DiscoveryLimits()
 
 
 class DiscoveryError(RuntimeError):
@@ -128,6 +158,13 @@ class _CompetitionCandidate:
 
 
 @dataclass(frozen=True)
+class _ParticipantCandidate:
+    team_id: str
+    team_name: str
+    source_url: str
+
+
+@dataclass(frozen=True)
 class _Document:
     url: str
     body: str
@@ -140,6 +177,42 @@ def _payload_hash(body: str) -> str:
 
 def _normalise_text(value: Any) -> str:
     return " ".join(str(value).split())
+
+
+def _is_metric_label(value: str) -> bool:
+    """Reject table metrics which share a competition/team profile href."""
+
+    label = _normalise_text(value)
+    if not label or "%" in label:
+        return True
+    if re.fullmatch(r"[\d\s.,:+\-/()]+", label):
+        return True
+    return (
+        re.fullmatch(
+            r"(?:[€$£¥]\s*)?[+-]?\d[\d.,]*\s*(?:k|m|mn|bn|b)?",
+            label,
+            flags=re.IGNORECASE,
+        )
+        is not None
+    )
+
+
+def _anchor_name(anchor: Tag) -> Optional[str]:
+    """Prefer the anchor's real visible label, then accessible image labels."""
+
+    image = anchor.find("img")
+    values = (
+        anchor.get_text(" ", strip=True),
+        anchor.get("title"),
+        anchor.get("aria-label"),
+        image.get("alt") if image else None,
+        image.get("title") if image else None,
+    )
+    for raw in values:
+        label = _normalise_text(raw or "")
+        if label and not _is_metric_label(label):
+            return label
+    return None
 
 
 def _canonical_url(value: str, *, base_url: str = BASE_URL) -> Optional[str]:
@@ -174,8 +247,13 @@ def _preferred_name(existing: str, candidate: str) -> str:
     World Cup``, a bare table figure beside the listing name); a trailing year
     is card context, not part of the name.
     """
+    valid = tuple(
+        value for value in (existing, candidate) if not _is_metric_label(value)
+    )
+    if not valid:
+        raise DiscoverySchemaError("competition has only numeric/metric labels")
     return min(
-        (existing, candidate),
+        valid,
         key=lambda value: (
             bool(re.search(r"\b(?:19|20)\d{2}$", value)),
             -len(value),
@@ -209,10 +287,12 @@ def _profile_url(url: str) -> Optional[str]:
     return urlunsplit((parsed.scheme, parsed.netloc, path, urlencode(query), ""))
 
 
-def _is_seed_listing(url: str) -> bool:
-    parsed = urlsplit(url)
-    path = parsed.path.rstrip("/")
-    return path in SEED_ROUTES
+def _is_catalogue_listing(url: str) -> bool:
+    return urlsplit(url).path.rstrip("/") == CATALOGUE_ROUTE
+
+
+def _is_region_listing(url: str) -> bool:
+    return _REGION_ROUTE_RE.match(urlsplit(url).path) is not None
 
 
 def _in_site_chrome(anchor: Any) -> bool:
@@ -243,8 +323,33 @@ def _is_country_listing(url: str) -> bool:
     return _COUNTRY_ROUTE_RE.match(urlsplit(url).path.rstrip("/")) is not None
 
 
-def _is_listing_url(url: str) -> bool:
-    return _is_seed_listing(url) or _is_country_listing(url)
+def _is_recognised_listing(url: str) -> bool:
+    return (
+        _is_catalogue_listing(url)
+        or _is_region_listing(url)
+        or _is_country_listing(url)
+    )
+
+
+def _listing_page_number(url: str, *, limit: int) -> int:
+    query = parse_qsl(urlsplit(url).query, keep_blank_values=True)
+    if not query:
+        return 1
+    if len(query) != 1 or query[0][0] != "page":
+        raise DiscoverySchemaError(f"invalid listing query: {url}")
+    raw = query[0][1]
+    if re.fullmatch(r"\d+", raw) is None:
+        raise DiscoverySchemaError(f"invalid pagination page {raw!r}: {url}")
+    page = int(raw)
+    if page < 1 or page > limit:
+        raise DiscoverySchemaError(f"pagination page out of bounds (1..{limit}): {url}")
+    return page
+
+
+def _listing_page_url(url: str, page: int) -> str:
+    parsed = urlsplit(url)
+    query = "" if page == 1 else urlencode({"page": page})
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, query, ""))
 
 
 def _section_signals(label: str) -> _SectionSignals:
@@ -264,8 +369,7 @@ def _section_signals(label: str) -> _SectionSignals:
             age_category=AgeCategory.SENIOR,
         )
     youth = any(
-        token in normalised
-        for token in ("youth", "under-", "under ", "u21", "u19")
+        token in normalised for token in ("youth", "under-", "under ", "u21", "u19")
     )
     age_category = AgeCategory.UXX if youth else AgeCategory.SENIOR
     if any(token in normalised for token in ("national cups", "domestic cups")):
@@ -355,9 +459,7 @@ def _group_signals(label: str) -> _SectionSignals:
             team_type=TeamType.RESERVE,
             age_category=AgeCategory.SENIOR,
         )
-    age_category = (
-        AgeCategory.UXX if "youth" in normalised else AgeCategory.SENIOR
-    )
+    age_category = AgeCategory.UXX if "youth" in normalised else AgeCategory.SENIOR
     if "cup" in normalised:
         return _SectionSignals(
             competition_type=CompetitionType.DOMESTIC_CUP,
@@ -432,13 +534,11 @@ def _listing_context(soup: BeautifulSoup, url: str) -> _ListingContext:
     body = soup.body
     country_meta = soup.select_one('meta[name="tm-country"]')
     confed_meta = soup.select_one('meta[name="tm-confederation"]')
-    country = (
-        (country_meta.get("content") if country_meta else None)
-        or (body.get("data-country") if body else None)
+    country = (country_meta.get("content") if country_meta else None) or (
+        body.get("data-country") if body else None
     )
-    confederation = (
-        (confed_meta.get("content") if confed_meta else None)
-        or (body.get("data-confederation") if body else None)
+    confederation = (confed_meta.get("content") if confed_meta else None) or (
+        body.get("data-confederation") if body else None
     )
     path = urlsplit(url).path.rstrip("/")
     defaults = {
@@ -506,7 +606,9 @@ def _signal_evidence(
 
 
 _NAME_AGE_RE = re.compile(r"\b[uU]-?(?:1[4-9]|2[0-3])\b|\byouth\b", re.IGNORECASE)
-_NAME_WOMEN_RE = re.compile(r"\bwomen(?:'s)?\b|\bfrauen\b|\bfeminin\w*\b", re.IGNORECASE)
+_NAME_WOMEN_RE = re.compile(
+    r"\bwomen(?:'s)?\b|\bfrauen\b|\bfeminin\w*\b", re.IGNORECASE
+)
 
 
 def _name_exclusion_evidence(
@@ -545,7 +647,84 @@ def _taxonomy_evidence(source_url: str) -> ClassificationEvidence:
     )
 
 
-def _listing_links(soup: BeautifulSoup, page_url: str) -> tuple[str, ...]:
+def _is_pagination_anchor(anchor: Tag) -> bool:
+    classes = set(anchor.get("class", ()))
+    parent_classes = set(anchor.parent.get("class", ())) if anchor.parent else set()
+    in_pagination_container = any(
+        (
+            any(
+                "pagination" in str(item).casefold() for item in parent.get("class", ())
+            )
+            or "pagination" in str(parent.get("aria-label", "")).casefold()
+        )
+        for parent in anchor.parents
+        if isinstance(parent, Tag)
+    )
+    return bool(
+        anchor.has_attr("data-page")
+        or classes.intersection({"page-link", "tm-pagination-link"})
+        or parent_classes.intersection({"page-item", "tm-pagination"})
+        or in_pagination_container
+        or set(anchor.get("rel", ())).intersection({"next", "prev", "previous"})
+    )
+
+
+def _pagination_urls(
+    soup: BeautifulSoup,
+    page_url: str,
+    *,
+    limit: int,
+) -> tuple[str, ...]:
+    """Expand one listing's declared pagination and reject ambiguous loops."""
+
+    current_page = _listing_page_number(page_url, limit=limit)
+    declared_pages = {current_page}
+    family_path = urlsplit(page_url).path.rstrip("/")
+    for anchor in soup.select("a[href]"):
+        if not _is_pagination_anchor(anchor):
+            continue
+        canonical = _canonical_url(str(anchor.get("href")), base_url=page_url)
+        if canonical is None:
+            raise DiscoverySchemaError(
+                f"pagination leaves Transfermarkt: {page_url} -> {anchor.get('href')}"
+            )
+        if urlsplit(canonical).path.rstrip("/") != family_path:
+            raise DiscoverySchemaError(
+                f"pagination changes listing route: {page_url} -> {canonical}"
+            )
+        target_page = _listing_page_number(canonical, limit=limit)
+        declared = _normalise_text(anchor.get("data-page") or "")
+        if declared:
+            if re.fullmatch(r"\d+", declared) is None or int(declared) != target_page:
+                raise DiscoverySchemaError(
+                    f"pagination label/URL mismatch: {page_url} -> {canonical}"
+                )
+        text_page = _normalise_text(anchor.get_text(" ", strip=True))
+        if re.fullmatch(r"\d+", text_page) and int(text_page) != target_page:
+            raise DiscoverySchemaError(
+                f"pagination text/URL mismatch: {page_url} -> {canonical}"
+            )
+        relations = set(anchor.get("rel", ()))
+        if "next" in relations and target_page <= current_page:
+            raise DiscoverySchemaError(f"pagination next-link loop: {page_url}")
+        if relations.intersection({"prev", "previous"}) and target_page >= current_page:
+            raise DiscoverySchemaError(f"pagination previous-link loop: {page_url}")
+        declared_pages.add(target_page)
+
+    last_page = max(declared_pages)
+    if last_page > limit:
+        raise DiscoverySchemaError(
+            f"pagination page count out of bounds (max={limit}): {page_url}"
+        )
+    return tuple(_listing_page_url(page_url, page) for page in range(1, last_page + 1))
+
+
+def _listing_links(
+    soup: BeautifulSoup,
+    page_url: str,
+    *,
+    pagination_limit: int,
+) -> tuple[str, ...]:
     links: set[str] = set()
     for anchor in soup.select("a[href]"):
         if _in_site_chrome(anchor):
@@ -553,21 +732,16 @@ def _listing_links(soup: BeautifulSoup, page_url: str) -> tuple[str, ...]:
         canonical = _canonical_url(str(anchor.get("href")), base_url=page_url)
         if canonical is None:
             continue
-        if _is_seed_listing(canonical) or _is_country_listing(canonical):
-            if _has_listing_query_only(canonical):
+        if _is_recognised_listing(canonical):
+            if not _has_listing_query_only(canonical):
+                continue
+            page = _listing_page_number(canonical, limit=pagination_limit)
+            if page == 1:
+                links.add(_listing_page_url(canonical, 1))
+            elif _is_pagination_anchor(anchor):
                 links.add(canonical)
             continue
-        classes = set(anchor.get("class", ()))
-        parent_classes = set(anchor.parent.get("class", ())) if anchor.parent else set()
-        if (
-            anchor.has_attr("data-page")
-            or classes.intersection({"page-link", "tm-pagination-link"})
-            or parent_classes.intersection({"page-item", "tm-pagination"})
-        ):
-            parsed = urlsplit(canonical)
-            base_path = urlsplit(page_url).path.rstrip("/")
-            if parsed.path.rstrip("/") == base_path:
-                links.add(canonical)
+    links.update(_pagination_urls(soup, page_url, limit=pagination_limit))
     return tuple(sorted(links))
 
 
@@ -576,6 +750,7 @@ def _listing_candidates(
     *,
     page_url: str,
     page_hash: str,
+    pagination_limit: int = DEFAULT_DISCOVERY_LIMITS.listing_pages,
 ) -> tuple[_CompetitionCandidate, ...]:
     context = _listing_context(soup, page_url)
     candidates: list[_CompetitionCandidate] = []
@@ -591,22 +766,17 @@ def _listing_candidates(
             continue
         seen_links += 1
         competition_id, slug, _kind, _section = identity
-        image = anchor.find("img")
-        name = _normalise_text(
-            anchor.get_text(" ", strip=True)
-            or anchor.get("title")
-            or (image.get("alt") if image else "")
-            or (image.get("title") if image else "")
-        )
-        if not name:
-            raise DiscoverySchemaError(
-                f"competition link has no name: {page_url} -> {profile_url}"
-            )
+        name = _anchor_name(anchor)
+        if name is None:
+            name = ""
         section_label = _section_label(anchor)
         group_label = _row_group_label(anchor)
         stated = (
-            (section_label, _section_signals(section_label),
-             _section_precedence(section_label)),
+            (
+                section_label,
+                _section_signals(section_label),
+                _section_precedence(section_label),
+            ),
             (group_label, _group_signals(group_label), _GROUP_PRECEDENCE),
         )
         country = _normalise_text(anchor.get("data-country") or context.country)
@@ -618,7 +788,7 @@ def _listing_candidates(
         # manufacture a conflict and block the whole registry instead of
         # source-backed exclusion of that competition.
         evidence = []
-        excluded_by_name = _name_exclusion_evidence(name, page_url)
+        excluded_by_name = _name_exclusion_evidence(name, page_url) if name else None
         if excluded_by_name is not None:
             evidence.append(excluded_by_name)
         if all(signals.gender is not Gender.WOMEN for _, signals, _p in stated):
@@ -656,16 +826,26 @@ def _listing_candidates(
         )
 
     body = soup.body
-    explicit_empty = body is not None and str(
-        body.get("data-registry-empty", "")
-    ).casefold() == "true"
-    has_navigation = bool(_listing_links(soup, page_url))
+    explicit_empty = (
+        body is not None
+        and str(body.get("data-registry-empty", "")).casefold() == "true"
+    )
+    canonical_page = _listing_page_url(
+        page_url,
+        _listing_page_number(page_url, limit=pagination_limit),
+    )
+    has_navigation = any(
+        linked != canonical_page
+        for linked in _listing_links(soup, page_url, pagination_limit=pagination_limit)
+    )
     if not seen_links and not has_navigation and not explicit_empty:
         raise DiscoverySchemaError(
             f"listing page has no registry structure: {page_url}"
         )
-    if seen_links and _is_country_listing(page_url) and (
-        context.country == "Unknown" or context.confederation == "Unknown"
+    if (
+        seen_links
+        and _is_country_listing(page_url)
+        and (context.country == "Unknown" or context.confederation == "Unknown")
     ):
         raise DiscoverySchemaError(
             f"country listing lacks country/confederation context: {page_url}"
@@ -848,9 +1028,7 @@ def _label_season_format(label: str, profile_url: str) -> SeasonFormat:
         label,
     ):
         return SeasonFormat.SPLIT_YEAR
-    raise DiscoverySchemaError(
-        f"unrecognised edition label {label!r}: {profile_url}"
-    )
+    raise DiscoverySchemaError(f"unrecognised edition label {label!r}: {profile_url}")
 
 
 def _season_format(
@@ -869,15 +1047,150 @@ def _season_format(
         for edition_id, label, _selected, _attrs in options
     }
     current = [
-        edition_id
-        for edition_id, _label, selected, _attrs in options
-        if selected
+        edition_id for edition_id, _label, selected, _attrs in options if selected
     ]
     if len(current) != 1:
         raise DiscoverySchemaError(
             f"edition selector must mark exactly one current edition: {profile_url}"
         )
     return formats[current[0]]
+
+
+def _edition_url(profile_url: str, edition_id: str) -> str:
+    parsed = urlsplit(profile_url)
+    path = _EDITION_PATH_RE.sub("", parsed.path).rstrip("/")
+    return urlunsplit(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            f"{path}/saison_id/{edition_id}",
+            "",
+            "",
+        )
+    )
+
+
+def _validate_edition_document(
+    soup: BeautifulSoup,
+    *,
+    competition_id: str,
+    edition_id: str,
+    source_url: str,
+) -> None:
+    declared_id = soup.select_one("[data-competition-id]")
+    if (
+        declared_id is not None
+        and str(declared_id.get("data-competition-id")) != competition_id
+    ):
+        raise DiscoverySchemaError(f"edition competition mismatch: {source_url}")
+    selected = {
+        _normalise_text(option.get("value"))
+        for option in soup.select('select[name*="saison"] option[selected][value]')
+    }
+    if selected and selected != {edition_id}:
+        raise DiscoverySchemaError(
+            f"edition page selected {sorted(selected)}, expected {edition_id}: {source_url}"
+        )
+
+
+def _team_identity(url: str) -> Optional[tuple[str, str]]:
+    match = _TEAM_ROUTE_RE.match(urlsplit(url).path)
+    if match is None:
+        return None
+    return match.group("team_id"), match.group("slug")
+
+
+def _participant_candidates(
+    soup: BeautifulSoup,
+    *,
+    source_url: str,
+    limit: int,
+) -> tuple[_ParticipantCandidate, ...]:
+    """Read the exact participant table; never infer it from a displayed count."""
+
+    explicit = soup.select("[data-participant-list], [data-edition-participants]")
+    containers: list[Tag] = [item for item in explicit if isinstance(item, Tag)]
+    if not containers:
+        team_tables = [
+            table
+            for table in soup.select("table.items")
+            if isinstance(table, Tag)
+            and any(
+                _team_identity(canonical) is not None
+                for anchor in table.select("a[href]")
+                if (
+                    canonical := _canonical_url(
+                        str(anchor.get("href")), base_url=source_url
+                    )
+                )
+                is not None
+            )
+        ]
+        participant_prefixes = (
+            "clubs",
+            "participants",
+            "participating teams",
+            "teams",
+            "teilnehmer",
+            "mannschaften",
+            "vereine",
+        )
+        labelled_tables = [
+            table
+            for table in team_tables
+            if _section_label(table).casefold().startswith(participant_prefixes)
+        ]
+        if labelled_tables:
+            containers = labelled_tables
+        elif len(team_tables) == 1:
+            containers = team_tables
+        elif team_tables:
+            raise DiscoverySchemaError(f"participant table is ambiguous: {source_url}")
+    empty_marker = soup.select_one('[data-participants-empty="true"]')
+    if not containers:
+        if empty_marker is not None:
+            return ()
+        raise DiscoverySchemaError(f"participant list missing: {source_url}")
+
+    by_team: dict[str, _ParticipantCandidate] = {}
+    unlabeled: set[str] = set()
+    for container in containers:
+        for anchor in container.select("a[href]"):
+            canonical = _canonical_url(str(anchor.get("href")), base_url=source_url)
+            if canonical is None:
+                continue
+            identity = _team_identity(canonical)
+            if identity is None:
+                continue
+            team_id, _slug = identity
+            team_name = _anchor_name(anchor)
+            if team_name is None:
+                unlabeled.add(team_id)
+                continue
+            unlabeled.discard(team_id)
+            candidate = _ParticipantCandidate(team_id, team_name, canonical)
+            previous = by_team.get(team_id)
+            if previous is None:
+                by_team[team_id] = candidate
+            else:
+                preferred_name = _preferred_name(previous.team_name, team_name)
+                preferred_url = min(previous.source_url, canonical)
+                by_team[team_id] = _ParticipantCandidate(
+                    team_id, preferred_name, preferred_url
+                )
+    unresolved = unlabeled - set(by_team)
+    if unresolved:
+        raise DiscoverySchemaError(
+            f"participant has only numeric/metric labels: {source_url} -> "
+            f"team {sorted(unresolved)[0]}"
+        )
+    if not by_team and empty_marker is None:
+        raise DiscoverySchemaError(f"participant table is empty: {source_url}")
+    if len(by_team) > limit:
+        raise DiscoverySchemaError(
+            f"participant list exceeds bound {limit}: {source_url}"
+        )
+    return tuple(by_team[key] for key in sorted(by_team))
 
 
 def _unique_signal(evidence: Iterable[ClassificationEvidence], name: str, unknown):
@@ -895,6 +1208,7 @@ class TransfermarktCompetitionDiscovery:
         checkpoint: MutableMapping[str, Any],
         traffic_ledger: TrafficLedger,
         clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+        limits: DiscoveryLimits = DEFAULT_DISCOVERY_LIMITS,
     ) -> None:
         if traffic_ledger is None:
             raise TypeError("traffic_ledger is required")
@@ -902,12 +1216,20 @@ class TransfermarktCompetitionDiscovery:
         self._checkpoint = checkpoint
         self._traffic_ledger = traffic_ledger
         self._clock = clock
+        self._limits = limits
         self._documents: dict[str, _Document] = {}
 
     def _get(self, url: str) -> _Document:
         canonical = _canonical_url(url)
         if canonical is None:
             raise DiscoveryFetchError(f"non-Transfermarkt URL: {url!r}")
+        existing = self._documents.get(canonical)
+        if existing is not None:
+            return existing
+        if len(self._documents) >= self._limits.documents:
+            raise DiscoverySchemaError(
+                f"discovery document bound exceeded ({self._limits.documents})"
+            )
         cached = self._checkpoint.get(canonical)
         if cached is not None:
             if not isinstance(cached, Mapping):
@@ -916,7 +1238,9 @@ class TransfermarktCompetitionDiscovery:
                 )
             body = cached.get("body")
             expected_hash = cached.get("payload_hash")
-            if cached.get("status") != FetchStatus.OK.value or not isinstance(body, str):
+            if cached.get("status") != FetchStatus.OK.value or not isinstance(
+                body, str
+            ):
                 raise DiscoveryCheckpointError(
                     f"checkpoint is not an authoritative success: {canonical}"
                 )
@@ -977,26 +1301,67 @@ class TransfermarktCompetitionDiscovery:
         candidates: dict[str, _CompetitionCandidate] = {}
         pending = list(SEED_URLS)
         queued = set(pending)
+        listing_family_pages: dict[str, set[int]] = {}
         while pending:
             url = pending.pop(0)
             document = self._get(url)
             soup = self._soup(document)
-            listing_documents[url] = document
+            listing_documents[document.url] = document
+            family = urlsplit(document.url).path.rstrip("/")
+            listing_family_pages.setdefault(family, set()).add(
+                _listing_page_number(
+                    document.url,
+                    limit=self._limits.listing_pages,
+                )
+            )
             for candidate in _listing_candidates(
-                soup, page_url=url, page_hash=document.payload_hash
+                soup,
+                page_url=document.url,
+                page_hash=document.payload_hash,
+                pagination_limit=self._limits.listing_pages,
             ):
                 _merge_candidate(candidates, candidate)
-            for linked_url in _listing_links(soup, url):
+                if len(candidates) > self._limits.competitions:
+                    raise DiscoverySchemaError(
+                        f"competition bound exceeded ({self._limits.competitions})"
+                    )
+            for linked_url in _listing_links(
+                soup,
+                document.url,
+                pagination_limit=self._limits.listing_pages,
+            ):
                 if linked_url not in queued:
+                    if len(queued) >= self._limits.listing_pages:
+                        raise DiscoverySchemaError(
+                            "listing-page bound exceeded "
+                            f"({self._limits.listing_pages})"
+                        )
                     queued.add(linked_url)
                     pending.append(linked_url)
             pending.sort()
 
         if not candidates:
             raise DiscoverySchemaError("complete catalog contains no competitions")
+        unnamed = sorted(
+            item.competition_id for item in candidates.values() if not item.name
+        )
+        if unnamed:
+            raise DiscoverySchemaError(
+                "competitions have only numeric/metric labels: " + ", ".join(unnamed)
+            )
+        for family, pages in listing_family_pages.items():
+            expected = set(range(1, max(pages) + 1))
+            if pages != expected:
+                raise DiscoverySchemaError(
+                    f"incomplete listing pagination for {family}: "
+                    f"missing={sorted(expected - pages)}, "
+                    f"extra={sorted(pages - expected)}"
+                )
 
         profiles: dict[str, tuple[_Document, BeautifulSoup]] = {}
-        for candidate in sorted(candidates.values(), key=lambda item: item.competition_id):
+        for candidate in sorted(
+            candidates.values(), key=lambda item: item.competition_id
+        ):
             document = self._get(candidate.profile_url)
             soup = self._soup(document)
             if not _has_season_markup(soup):
@@ -1012,13 +1377,76 @@ class TransfermarktCompetitionDiscovery:
                     candidate.slug = identity[1]
                     candidate.profile_url = canonical
             declared_id = soup.select_one("[data-competition-id]")
-            if declared_id is not None and str(
-                declared_id.get("data-competition-id")
-            ) != candidate.competition_id:
+            if (
+                declared_id is not None
+                and str(declared_id.get("data-competition-id"))
+                != candidate.competition_id
+            ):
                 raise DiscoverySchemaError(
                     f"profile identity mismatch: {candidate.profile_url}"
                 )
             profiles[candidate.competition_id] = (document, soup)
+
+        options_by_competition: dict[
+            str, tuple[tuple[str, str, bool, Mapping[str, Any]], ...]
+        ] = {}
+        edition_documents: dict[tuple[str, str], _Document] = {}
+        participants_by_edition: dict[
+            tuple[str, str], tuple[_ParticipantCandidate, ...]
+        ] = {}
+        editionless: list[str] = []
+        edition_count = 0
+        participant_count = 0
+        for competition_id, candidate in sorted(candidates.items()):
+            profile_document, profile_soup = profiles[competition_id]
+            try:
+                options = _selector_options(
+                    profile_soup, profile_url=candidate.profile_url
+                )
+            except DiscoverySchemaError as exc:
+                if "edition selector missing" not in str(exc):
+                    raise
+                editionless.append(competition_id)
+                continue
+            edition_count += len(options)
+            if edition_count > self._limits.editions:
+                raise DiscoverySchemaError(
+                    f"edition bound exceeded ({self._limits.editions})"
+                )
+            options_by_competition[competition_id] = options
+            for edition_id, _label, current, _attrs in options:
+                edition_source_url = _edition_url(candidate.profile_url, edition_id)
+                if current:
+                    edition_document, edition_soup = profile_document, profile_soup
+                else:
+                    edition_document = self._get(edition_source_url)
+                    edition_soup = self._soup(edition_document)
+                _validate_edition_document(
+                    edition_soup,
+                    competition_id=competition_id,
+                    edition_id=edition_id,
+                    source_url=edition_source_url,
+                )
+                edition_documents[(competition_id, edition_id)] = edition_document
+                exact_participants = _participant_candidates(
+                    edition_soup,
+                    source_url=edition_source_url,
+                    limit=self._limits.participants_per_edition,
+                )
+                participant_count += len(exact_participants)
+                if participant_count > self._limits.participants:
+                    raise DiscoverySchemaError(
+                        f"participant bound exceeded ({self._limits.participants})"
+                    )
+                participants_by_edition[(competition_id, edition_id)] = (
+                    exact_participants
+                )
+
+        for competition_id in editionless:
+            candidates.pop(competition_id, None)
+            profiles.pop(competition_id, None)
+        if not candidates:
+            raise DiscoverySchemaError("complete catalog contains no competitions")
 
         snapshot_material = {
             "pages": {
@@ -1029,7 +1457,9 @@ class TransfermarktCompetitionDiscovery:
             "schema_revision": SCHEMA_REVISION,
         }
         snapshot_digest = hashlib.sha256(
-            json.dumps(snapshot_material, separators=(",", ":"), sort_keys=True).encode()
+            json.dumps(
+                snapshot_material, separators=(",", ":"), sort_keys=True
+            ).encode()
         ).hexdigest()
         snapshot_id = "tm-discovery-" + snapshot_digest[:24]
         discovered_at = self._clock()
@@ -1038,21 +1468,10 @@ class TransfermarktCompetitionDiscovery:
 
         competition_records: dict[str, CompetitionRecord] = {}
         edition_records: dict[str, tuple[EditionRecord, ...]] = {}
-        editionless: list[str] = []
+        participant_records: dict[str, tuple[CompetitionParticipant, ...]] = {}
         for competition_id, candidate in sorted(candidates.items()):
-            profile_document, profile_soup = profiles[competition_id]
-            try:
-                options = _selector_options(
-                    profile_soup, profile_url=candidate.profile_url
-                )
-            except DiscoverySchemaError as exc:
-                if "edition selector missing" not in str(exc):
-                    raise
-                # The source publishes no edition at all for these — a Brazilian
-                # relegation play-off, Japan's "100 Year Vision" leagues — so
-                # there is nothing to crawl and nothing to register.
-                editionless.append(competition_id)
-                continue
+            profile_document, _profile_soup = profiles[competition_id]
+            options = options_by_competition[competition_id]
             season_format = _season_format(options, candidate.profile_url)
             season_evidence = ClassificationEvidence(
                 source_field="edition_selector",
@@ -1069,11 +1488,11 @@ class TransfermarktCompetitionDiscovery:
             )
             gender = _unique_signal(evidence, "gender", Gender.UNKNOWN)
             team_type = _unique_signal(evidence, "team_type", TeamType.UNKNOWN)
-            age_category = _unique_signal(
-                evidence, "age_category", AgeCategory.UNKNOWN
-            )
+            age_category = _unique_signal(evidence, "age_category", AgeCategory.UNKNOWN)
             try:
-                canonical_id = resolve_competition(competition_id).canonical_competition_id
+                canonical_id = resolve_competition(
+                    competition_id
+                ).canonical_competition_id
             except UnknownCompetitionError:
                 canonical_id = None
             combined_hash = hashlib.sha256(
@@ -1104,11 +1523,27 @@ class TransfermarktCompetitionDiscovery:
             )
 
             editions = []
+            competition_participants: list[CompetitionParticipant] = []
             for edition_id, label, current, attrs in options:
-                edition_source_url = (
-                    candidate.profile_url.rstrip("/") + f"/saison_id/{edition_id}"
-                )
+                edition_source_url = _edition_url(candidate.profile_url, edition_id)
+                edition_document = edition_documents[(competition_id, edition_id)]
                 edition_format = _label_season_format(label, candidate.profile_url)
+                exact_participants = tuple(
+                    CompetitionParticipant(
+                        competition_id=competition_id,
+                        edition_id=edition_id,
+                        team_id=item.team_id,
+                        team_name=item.team_name,
+                        source_url=item.source_url,
+                        discovered_at=discovered_at,
+                        registry_snapshot_id=snapshot_id,
+                        source_body_hash=edition_document.payload_hash,
+                        parser_revision=PARSER_REVISION,
+                        schema_revision=SCHEMA_REVISION,
+                    )
+                    for item in participants_by_edition[(competition_id, edition_id)]
+                )
+                competition_participants.extend(exact_participants)
                 editions.append(
                     EditionRecord(
                         competition_id=competition_id,
@@ -1120,22 +1555,18 @@ class TransfermarktCompetitionDiscovery:
                         end_date=attrs.get("data-end-date"),
                         active="disabled" not in attrs,
                         current=current,
-                        participant_count=attrs.get("data-participant-count"),
-                        participant_hash=attrs.get("data-participant-hash"),
+                        participant_count=len(exact_participants),
+                        participant_hash=participant_list_hash(exact_participants),
                         source_url=edition_source_url,
                         discovered_at=discovered_at,
                         registry_snapshot_id=snapshot_id,
-                        source_body_hash=profile_document.payload_hash,
+                        source_body_hash=edition_document.payload_hash,
                         parser_revision=PARSER_REVISION,
                         schema_revision=SCHEMA_REVISION,
                     )
                 )
             edition_records[competition_id] = tuple(editions)
-
-        for competition_id in editionless:
-            candidates.pop(competition_id, None)
-        if not candidates:
-            raise DiscoverySchemaError("complete catalog contains no competitions")
+            participant_records[competition_id] = tuple(competition_participants)
 
         listing_urls = tuple(sorted(listing_documents))
         page_number = {url: index + 1 for index, url in enumerate(listing_urls)}
@@ -1162,6 +1593,11 @@ class TransfermarktCompetitionDiscovery:
                         for competition_id in owned_ids
                         for edition in edition_records[competition_id]
                     ),
+                    participants=tuple(
+                        participant
+                        for competition_id in owned_ids
+                        for participant in participant_records[competition_id]
+                    ),
                 )
             )
         return tuple(pages)
@@ -1173,6 +1609,7 @@ def discover_competition_registry(
     checkpoint: MutableMapping[str, Any],
     traffic_ledger: TrafficLedger,
     clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+    limits: DiscoveryLimits = DEFAULT_DISCOVERY_LIMITS,
 ) -> tuple[RegistryPage, ...]:
     """Convenience API for one complete fail-closed discovery snapshot."""
 
@@ -1181,16 +1618,20 @@ def discover_competition_registry(
         checkpoint=checkpoint,
         traffic_ledger=traffic_ledger,
         clock=clock,
+        limits=limits,
     ).discover()
 
 
 __all__ = [
     "BASE_URL",
+    "CATALOGUE_ROUTE",
+    "DEFAULT_DISCOVERY_LIMITS",
     "SEED_ROUTES",
     "SEED_URLS",
     "DiscoveryCheckpointError",
     "DiscoveryError",
     "DiscoveryFetchError",
+    "DiscoveryLimits",
     "DiscoverySchemaError",
     "TrafficLedger",
     "TransfermarktCompetitionDiscovery",
