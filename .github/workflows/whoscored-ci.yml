@@ -608,6 +608,7 @@ jobs:
             "$(python -I -S -c 'import sys; print(sys.base_prefix)')"
 
           set -o pipefail
+          isolated_venv=/opt/whoscored-ci-test-venv
           test_container=
           node_donor=
           cleanup_contract_runtime() {
@@ -649,7 +650,7 @@ jobs:
 
           docker exec "$test_container" mkdir -p \
             "$WHOSCORED_CI_PYTHON_PREFIX" \
-            "$WHOSCORED_CI_TEST_VENV" \
+            "$isolated_venv" \
             /usr/lib/git-core \
             /usr/libexec/docker/cli-plugins \
             /usr/share/zoneinfo \
@@ -660,7 +661,7 @@ jobs:
                 tar --no-same-owner -C "$WHOSCORED_CI_PYTHON_PREFIX" -xf -
           tar -C "$WHOSCORED_CI_TEST_VENV" -cf - . \
             | docker exec -i "$test_container" \
-                tar --no-same-owner -C "$WHOSCORED_CI_TEST_VENV" -xf -
+                tar --no-same-owner -C "$isolated_venv" -xf -
           tar -C "$GITHUB_WORKSPACE" -cf - . \
             | docker exec -i "$test_container" \
                 tar --no-same-owner -C /root/data-platform-football -xf -
@@ -695,6 +696,26 @@ jobs:
           tar -C /usr/share/zoneinfo -cf - . \
             | docker exec -i "$test_container" \
                 tar --no-same-owner -C /usr/share/zoneinfo -xf -
+          docker exec "$test_container" test -f \
+            "$WHOSCORED_CI_PYTHON_PREFIX/bin/python3.11"
+          docker exec "$test_container" test ! -L \
+            "$WHOSCORED_CI_PYTHON_PREFIX/bin/python3.11"
+          test "$(docker exec "$test_container" stat -c '%u:%g:%h' \
+              "$WHOSCORED_CI_PYTHON_PREFIX/bin/python3.11")" = 0:0:1
+          test $((8#$(docker exec "$test_container" stat -c '%a' \
+              "$WHOSCORED_CI_PYTHON_PREFIX/bin/python3.11") & 8#022)) = 0
+          test "$(docker exec "$test_container" stat -c '%u:%g' /usr/bin)" = 0:0
+          test $((8#$(docker exec "$test_container" stat -c '%a' /usr/bin) & 8#022)) = 0
+          docker exec "$test_container" test ! -e /usr/bin/python3
+          docker exec "$test_container" test ! -L /usr/bin/python3
+          docker exec "$test_container" ln -s \
+            "$WHOSCORED_CI_PYTHON_PREFIX/bin/python3.11" /usr/bin/python3
+          test "$(docker exec "$test_container" stat -c '%u:%g' /usr/bin/python3)" = 0:0
+          test "$(docker exec "$test_container" readlink /usr/bin/python3)" = \
+            "$WHOSCORED_CI_PYTHON_PREFIX/bin/python3.11"
+          test "$(docker exec "$test_container" /usr/bin/python3 -I -S -c \
+              'import sys; print(f"{sys.executable}|{sys.base_prefix}|{sys.version_info.major}.{sys.version_info.minor}")')" = \
+            "/usr/bin/python3|$WHOSCORED_CI_PYTHON_PREFIX|3.11"
           node_image='node:22.23.1-bookworm-slim@sha256:8607a9064d4a571140998ae9e52a3b3fcf9cff361d04642d5971e6cd76d39e27'
           node_donor="$(docker create \
             --platform linux/amd64 \
@@ -741,23 +762,41 @@ jobs:
             /root/.secrets/whoscored-runtime-v2.env \
             /root/.secrets/whoscored-proxy-v2.env
           docker exec "$test_container" \
-            "$WHOSCORED_CI_TEST_VENV/bin/python" -I -c \
+            "$isolated_venv/bin/python" -I -c \
             'import os, socket; path="/run/docker.sock"; endpoint=socket.socket(socket.AF_UNIX); endpoint.bind(path); endpoint.close(); os.chmod(path, 0o660)'
           docker exec "$test_container" \
-            "$WHOSCORED_CI_TEST_VENV/bin/python" -I -c \
+            "$isolated_venv/bin/python" -I -c \
             'from pathlib import Path; path=Path("/usr/local/bin/docker"); path.write_text("#!/bin/sh\nif [ \"$1\" = ps ]; then\n  exit 0\nfi\nexec /usr/bin/docker \"$@\"\n", encoding="utf-8"); path.chmod(0o755)'
 
           if ! unexpected_ownership="$(docker exec "$test_container" find \
               /root/data-platform-football /root/.secrets \
-              "$WHOSCORED_CI_PYTHON_PREFIX" "$WHOSCORED_CI_TEST_VENV" \
+              "$WHOSCORED_CI_PYTHON_PREFIX" "$isolated_venv" \
               -xdev \( ! -user root -o ! -group root \) -print -quit)"; then
             echo "isolated ownership scan failed" >&2
             exit 1
           fi
           test -z "$unexpected_ownership"
+          if ! unexpected_test_runtime_path="$(docker exec "$test_container" find \
+              "$isolated_venv" -xdev \( -type f -o -type d \) \
+              \( ! -user root -o ! -group root -o -perm /022 \) -print -quit)"; then
+            echo "isolated test runtime scan failed" >&2
+            exit 1
+          fi
+          test -z "$unexpected_test_runtime_path"
+          for trusted_dir in \
+            /opt "$isolated_venv" "$isolated_venv/lib" \
+            "$isolated_venv/lib/python3.11" \
+            "$isolated_venv/lib/python3.11/site-packages"
+          do
+            test "$(docker exec "$test_container" stat -c '%u:%g' "$trusted_dir")" = 0:0
+            test $((8#$(docker exec "$test_container" stat -c '%a' "$trusted_dir") & 8#022)) = 0
+          done
+          test "$(docker exec "$test_container" "$isolated_venv/bin/python" -I -c \
+              'import sys; print(f"{sys.executable}|{sys.prefix}|{sys.base_prefix}")')" = \
+            "$isolated_venv/bin/python|$isolated_venv|$WHOSCORED_CI_PYTHON_PREFIX"
           docker exec "$test_container" test -S /run/docker.sock
           docker exec "$test_container" \
-            "$WHOSCORED_CI_TEST_VENV/bin/python" -I -c \
+            "$isolated_venv/bin/python" -I -c \
             'import socket; endpoint=socket.socket(socket.AF_UNIX); endpoint.settimeout(0.1); expected=False
           try: endpoint.connect("/run/docker.sock")
           except (ConnectionRefusedError, socket.timeout): expected=True
@@ -770,10 +809,10 @@ jobs:
           docker exec "$test_container" sh -c \
             'echo "51bcc77ba5db162c80028f861f0a2770d728c1de80773816d863f28d7a817adb  /usr/bin/unshare" | sha256sum --check --strict'
           docker exec "$test_container" \
-            "$WHOSCORED_CI_TEST_VENV/bin/python" -I -c \
+            "$isolated_venv/bin/python" -I -c \
             'import importlib.metadata as m; assert m.version("curl-cffi") == "0.15.0"'
           docker exec "$test_container" \
-            "$WHOSCORED_CI_TEST_VENV/bin/python" -I -c \
+            "$isolated_venv/bin/python" -I -c \
             'from zoneinfo import ZoneInfo; assert ZoneInfo("Europe/Berlin").key == "Europe/Berlin"'
           docker exec "$test_container" sh -c \
             'echo "93956de2e59480474a7b46571da1651180b1a050cdf32641ebec4ce6e478e068  /usr/local/bin/node" | sha256sum --check --strict'
@@ -794,7 +833,7 @@ jobs:
             --env PYTHONPYCACHEPREFIX=/tmp/whoscored-ci-pycache-root \
             --workdir /root/data-platform-football \
             "$test_container" \
-            "$WHOSCORED_CI_TEST_VENV/bin/python" -m pytest -q \
+            "$isolated_venv/bin/python" -m pytest -q \
             "${whoscored_tests[@]}" \
             tests/unit/scrapers/test_iceberg_writer.py \
             tests/unit/dags/test_proxy_traffic.py \

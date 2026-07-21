@@ -1892,7 +1892,7 @@ def test_fbref_acceptance_image_is_built_from_one_exact_git_archive():
     assert "sha256sum -c -" in dockerfile
     assert "rm -rf /opt/airflow/dags /opt/airflow/scrapers" in dockerfile
     assert "verify_fbref_acceptance_image.py" in dockerfile
-    assert "filter_proxy.py --help" in dockerfile
+    assert "filter_proxy.py --help" not in dockerfile
     assert "org.opencontainers.image.revision" in dockerfile
     assert "COPY dags" not in dockerfile
     assert "git -C \"$repo_root\" archive --format=tar \"$git_sha\"" in builder

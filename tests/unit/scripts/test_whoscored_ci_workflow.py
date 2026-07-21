@@ -123,6 +123,14 @@ def test_ci_isolates_root_only_contracts_from_the_host_runner():
     assert "actions/setup-node" not in unit_step
     assert 'docker start "$node_donor"' not in unit_step
     assert "set -o pipefail" in unit_step
+    assert "isolated_venv=/opt/whoscored-ci-test-venv" in unit_step
+    assert 'tar --no-same-owner -C "$isolated_venv" -xf -' in unit_step
+    assert '"$isolated_venv/bin/python" -m pytest -q' in unit_step
+    assert '"$WHOSCORED_CI_TEST_VENV/bin/python" -m pytest -q' not in unit_step
+    assert '"$WHOSCORED_CI_PYTHON_PREFIX/bin/python3.11" /usr/bin/python3' in (
+        unit_step
+    )
+    assert '"/usr/bin/python3|$WHOSCORED_CI_PYTHON_PREFIX|3.11"' in unit_step
     assert "node_donor=" in unit_step
     assert unit_step.count(
         "93956de2e59480474a7b46571da1651180b1a050cdf32641ebec4ce6e478e068"
@@ -132,6 +140,13 @@ def test_ci_isolates_root_only_contracts_from_the_host_runner():
     assert "! -user root -o ! -group root" in unit_step
     assert 'if ! unexpected_ownership="$(docker exec' in unit_step
     assert 'test -z "$unexpected_ownership"' in unit_step
+    assert "unexpected_test_runtime_path" in unit_step
+    assert "isolated test runtime scan failed" in unit_step
+    assert "! -group root -o -perm /022" in unit_step
+    assert (
+        '"$isolated_venv/bin/python|$isolated_venv|'
+        '$WHOSCORED_CI_PYTHON_PREFIX"' in unit_step
+    )
     assert "/usr/libexec/docker/cli-plugins/docker-compose" in unit_step
     assert "test -S /run/docker.sock" in unit_step
     assert 'endpoint.connect("/run/docker.sock")' in unit_step
