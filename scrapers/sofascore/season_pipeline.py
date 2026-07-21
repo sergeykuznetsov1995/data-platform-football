@@ -988,9 +988,14 @@ def _canonical_token(value: object, label: str) -> str:
     return token
 
 
-# Per-page raw-lineage columns attached by _row_with_partition_and_lineage.
+# Per-page raw-lineage columns attached by _row_with_partition_and_lineage,
+# plus the parser's own page provenance (source_page/source_page_direction).
 # Two schedule rows for the same match fetched from different pages of a live
-# feed differ ONLY in these; the match payload itself is identical.
+# feed differ ONLY in these; the match payload itself is identical. Without
+# the source_page pair here the cross-page dedup never fires: a live feed
+# (e.g. World Cup knockouts) that shifts a settled match between page windows
+# repeats it with a different page number and the identical-payload check
+# reports a false "duplicate schedule natural key" conflict (#951).
 _SCHEDULE_LINEAGE_COLUMNS = frozenset({
     "raw_content_hash",
     "raw_blob_key",
@@ -998,6 +1003,8 @@ _SCHEDULE_LINEAGE_COLUMNS = frozenset({
     "raw_fetched_at",
     "raw_endpoint",
     "raw_target_id",
+    "source_page",
+    "source_page_direction",
 })
 
 
