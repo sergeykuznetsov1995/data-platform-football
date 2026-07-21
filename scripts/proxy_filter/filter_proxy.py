@@ -538,6 +538,11 @@ class Lease:
     # reduced only by observed provider bytes or a clean durable release.
     global_budget_escrow_bytes: int = 0
     active_tunnels: int = 0
+    # Provider reads must own billed-byte allowance before touching the socket.
+    # Track them separately from tunnels so a silent client->provider leg cannot
+    # monopolise the shared lease reservation and starve the provider reader.
+    active_provider_readers: int = field(default=0, repr=False)
+    provider_reserved_bytes: int = field(default=0, repr=False)
     pending_client_hellos: int = field(default=0, repr=False)
     upstream_repins: int = 0
     closed: bool = False
@@ -726,6 +731,12 @@ _url_reserved_bytes: dict[tuple[str, str], int] = defaultdict(int)
 _campaign_reserved_bytes: dict[str, int] = defaultdict(int)
 _campaign_phase_reserved_bytes: dict[tuple[str, str], int] = defaultdict(int)
 _campaign_allocation_reserved_bytes: dict[tuple[str, str], int] = defaultdict(int)
+_ACTIVE_PROVIDER_READERS = 0
+# Reservations are shared by both directions and, for the daily/run/url caps,
+# by multiple leases.  Waiters are loop-owned Futures rather than one global
+# asyncio.Event so unit tests may exercise a freshly loaded module through more
+# than one ``asyncio.run`` without binding a primitive to a closed loop.
+_RESERVATION_TURNOVER_WAITERS: set[asyncio.Future] = set()
 
 
 def _lease_has_durable_terminal(lease: Lease) -> bool:
@@ -2961,9 +2972,21 @@ def _extend_fbref_lease(lease: Lease, new_max_bytes: int) -> dict[str, Any]:
     return _control_report(lease)
 
 
-def _lease_remaining(lease: Lease) -> int:
+def _lease_budget_capacity(
+    lease: Lease, *, include_reservations: bool
+) -> int:
+    """Return exact spend capacity, optionally subtracting in-flight I/O.
+
+    ``include_reservations=False`` is authoritative capacity after every
+    current reservation either settles or is released.  Comparing it with the
+    immediately available value lets the two tunnel directions distinguish a
+    temporarily busy allowance from a genuinely exhausted signed cap without
+    ever granting bytes outside ``_reserve_lease_bytes``.
+    """
+
     if not lease.usable:
         return 0
+    lease_reserved = lease.reserved_bytes if include_reservations else 0
     if (
         lease.source == "whoscored"
         and lease.proxy_campaign_approval is not None
@@ -2976,43 +2999,84 @@ def _lease_remaining(lease: Lease) -> int:
         # is reduced for every observed provider byte.  Socket concurrency is
         # separately serialized by ``lease.reserved_bytes``.
         return min(
-            max(0, lease.max_bytes - lease.total_bytes - lease.reserved_bytes),
-            max(0, lease.global_budget_escrow_bytes - lease.reserved_bytes),
+            max(0, lease.max_bytes - lease.total_bytes - lease_reserved),
+            max(0, lease.global_budget_escrow_bytes - lease_reserved),
         )
+    daily_reserved = _daily_reserved_bytes if include_reservations else 0
     daily_remaining = max(
-        0, DAILY_BUDGET_BYTES - _daily_total_bytes() - _daily_reserved_bytes
+        0, DAILY_BUDGET_BYTES - _daily_total_bytes() - daily_reserved
     )
     run_key = lease.dagrun_key
     url_key = (run_key, lease.canonical_url)
+    run_reserved = _run_reserved_bytes[run_key] if include_reservations else 0
     run_remaining = max(
         0,
         _lease_dagrun_budget_bytes(lease)
         - _run_total_bytes(run_key)
-        - _run_reserved_bytes[run_key],
+        - run_reserved,
     )
+    url_reserved = _url_reserved_bytes[url_key] if include_reservations else 0
     url_remaining = max(
         0,
         _lease_url_budget_bytes(lease)
         - _url_total_bytes(run_key, lease.canonical_url)
-        - _url_reserved_bytes[url_key],
+        - url_reserved,
     )
     parent_remaining = (
         max(
             0,
             lease.parent_run_cap_bytes
             - lease.parent_run_spent_provider_bytes
-            - lease.reserved_bytes,
+            - lease_reserved,
         )
         if lease.source == "sofascore"
         else daily_remaining
     )
     return min(
-        max(0, lease.max_bytes - lease.total_bytes - lease.reserved_bytes),
+        max(0, lease.max_bytes - lease.total_bytes - lease_reserved),
         daily_remaining,
         run_remaining,
         url_remaining,
         parent_remaining,
     )
+
+
+def _lease_authoritative_remaining(lease: Lease) -> int:
+    return _lease_budget_capacity(lease, include_reservations=False)
+
+
+def _lease_remaining(lease: Lease) -> int:
+    return _lease_budget_capacity(lease, include_reservations=True)
+
+
+def _notify_reservation_turnover() -> None:
+    """Wake every lease whose shared daily/run/url allowance may have moved."""
+
+    waiters = tuple(_RESERVATION_TURNOVER_WAITERS)
+    _RESERVATION_TURNOVER_WAITERS.clear()
+    for waiter in waiters:
+        if not waiter.done():
+            waiter.set_result(None)
+
+
+async def _wait_for_reservation_turnover(lease: Lease) -> None:
+    """Wait no longer than the lease TTL for another exact I/O reservation."""
+
+    waiter = asyncio.get_running_loop().create_future()
+    _RESERVATION_TURNOVER_WAITERS.add(waiter)
+    try:
+        # There is no await between the caller's capacity check and waiter
+        # registration.  Rechecking here also protects future refactors and
+        # makes close/revoke visible before this coroutine suspends.
+        if (
+            not lease.usable
+            or _lease_authoritative_remaining(lease) <= 0
+        ):
+            return
+        async with asyncio.timeout(_lease_operation_timeout(lease)):
+            await waiter
+    finally:
+        _RESERVATION_TURNOVER_WAITERS.discard(waiter)
 
 
 def _reserve_lease_bytes(lease: Lease, wanted: int) -> int:
@@ -3067,6 +3131,8 @@ def _release_lease_reservation(lease: Lease, count: int) -> None:
         _campaign_allocation_reserved_bytes[allocation_key] = max(
             0, _campaign_allocation_reserved_bytes[allocation_key] - count
         )
+    if count:
+        _notify_reservation_turnover()
 
 
 def _pending_whoscored_provider_bytes(lease: Lease) -> int:
@@ -3163,6 +3229,7 @@ def _latch_lease_accounting_uncertainty(lease: Lease) -> None:
     lease.accounting_uncertain = True
     lease.closed = True
     lease.budget_exceeded = True
+    _notify_reservation_turnover()
     for tunnel_writer in tuple(lease.tunnel_writers):
         try:
             tunnel_writer.close()
@@ -3585,30 +3652,93 @@ async def _pump(
     lease: Lease | None = None,
     direction: str | None = None,
 ) -> None:
+    global _ACTIVE_PROVIDER_READERS
     if lease is not None and budget_guard is not None:
         raise ValueError("lease and legacy budget guard are mutually exclusive")
     provider_eof_observed = False
+    provider_reader_registered = lease is not None and direction == "down"
+    if provider_reader_registered:
+        lease.active_provider_readers += 1
+        _ACTIVE_PROVIDER_READERS += 1
+        _notify_reservation_turnover()
     try:
         while True:
             read_size = 65536
             reservation = 0
             precharged = False
             if lease is not None:
-                reservation = _reserve_lease_bytes(lease, read_size)
-                if reservation <= 0:
+                assert direction in ("up", "down")
+                authoritative = _lease_authoritative_remaining(lease)
+                if authoritative <= 0:
                     lease.budget_exceeded = True
+                    _notify_reservation_turnover()
                     break
-                read_size = reservation
+                # Provider reads need pre-I/O escrow.  Bound their aggregate,
+                # not merely each reader: otherwise several concurrent down
+                # pumps can each take a fair-looking slice whose sum still
+                # consumes the whole lease. One share remains available for
+                # staged client uploads, recomputed after every exact chunk.
+                if direction == "down":
+                    while True:
+                        authoritative = _lease_authoritative_remaining(lease)
+                        if authoritative <= 0:
+                            lease.budget_exceeded = True
+                            _notify_reservation_turnover()
+                            break
+                        divisor = max(2, lease.active_provider_readers + 1)
+                        shared_divisor = max(2, _ACTIVE_PROVIDER_READERS + 1)
+                        available = _lease_remaining(lease)
+                        fair_window = max(
+                            1,
+                            (available + shared_divisor - 1) // shared_divisor,
+                        )
+                        provider_ceiling = max(
+                            1,
+                            authoritative - authoritative // divisor,
+                        )
+                        provider_window = max(
+                            0,
+                            provider_ceiling - lease.provider_reserved_bytes,
+                        )
+                        reservation = _reserve_lease_bytes(
+                            lease,
+                            min(65536, fair_window, provider_window),
+                        )
+                        if reservation > 0:
+                            lease.provider_reserved_bytes += reservation
+                            read_size = reservation
+                            break
+                        if not lease.usable:
+                            break
+                        if _lease_authoritative_remaining(lease) <= 0:
+                            lease.budget_exceeded = True
+                            _notify_reservation_turnover()
+                            break
+                        try:
+                            await _wait_for_reservation_turnover(lease)
+                        except (asyncio.TimeoutError, TimeoutError):
+                            _latch_lease_accounting_uncertainty(lease)
+                            raise
+                    if reservation <= 0:
+                        break
+                else:
+                    divisor = max(2, lease.active_provider_readers + 1)
+                    fair_window = max(
+                        1, (authoritative + divisor - 1) // divisor
+                    )
+                    read_size = min(read_size, fair_window)
             try:
                 metered_read = getattr(budget_guard, "read_metered", None)
                 precharged = callable(metered_read)
                 if precharged:
                     chunk = await metered_read(reader, read_size)
                 elif lease is not None:
-                    chunk = await asyncio.wait_for(
-                        reader.read(read_size),
-                        timeout=_lease_operation_timeout(lease),
-                    )
+                    # Direct await inside asyncio.timeout has the same
+                    # scheduling semantics on Python 3.11 and 3.12.  In
+                    # particular an immediate EOF cannot yield between the two
+                    # tunnel pumps and manufacture reservation starvation.
+                    async with asyncio.timeout(_lease_operation_timeout(lease)):
+                        chunk = await reader.read(read_size)
                 else:
                     chunk = await reader.read(read_size)
             except (asyncio.TimeoutError, TimeoutError):
@@ -3639,8 +3769,7 @@ async def _pump(
                 # drained. This is the sole proof that no paid response
                 # read-ahead remains when the downstream pump exits cleanly.
                 provider_eof_observed = True
-            if lease is not None:
-                assert direction in ("up", "down")
+            if lease is not None and direction == "down":
                 _settle_observed_lease_bytes(
                     lease,
                     reservation=reservation,
@@ -3648,10 +3777,49 @@ async def _pump(
                     direction=direction,
                     count=len(chunk),
                 )
+                lease.provider_reserved_bytes = max(
+                    0, lease.provider_reserved_bytes - reservation
+                )
+                _notify_reservation_turnover()
             elif budget_guard is not None and chunk and not precharged:
                 budget_guard.consume(len(chunk))
             if not chunk:
                 break
+            if lease is not None and direction == "up":
+                # Reading the local client leg is free.  Stage one bounded
+                # chunk, then reserve/write exact ordered prefixes only when
+                # allowance is currently available.  A zero available value
+                # with positive authoritative capacity is temporary sibling
+                # contention, not a hard-cap failure.
+                pending = memoryview(chunk)
+                while pending:
+                    available = _lease_remaining(lease)
+                    if available <= 0:
+                        if not lease.usable:
+                            break
+                        if _lease_authoritative_remaining(lease) <= 0:
+                            lease.budget_exceeded = True
+                            _notify_reservation_turnover()
+                            break
+                        try:
+                            await _wait_for_reservation_turnover(lease)
+                        except (asyncio.TimeoutError, TimeoutError):
+                            _latch_lease_accounting_uncertainty(lease)
+                            raise
+                        continue
+                    prefix_size = min(len(pending), available)
+                    if not await _write_upstream(
+                        writer,
+                        bytes(pending[:prefix_size]),
+                        lease=lease,
+                        host=host,
+                        direction=direction,
+                    ):
+                        break
+                    pending = pending[prefix_size:]
+                if pending:
+                    break
+                continue
             try:
                 writer.write(chunk)
                 if lease is None:
@@ -3679,6 +3847,12 @@ async def _pump(
             # errors swallowed by the proxy boundary, and cancellation between
             # chunks. Only an observed provider EOF may release the lifecycle.
             _latch_lease_accounting_uncertainty(lease)
+        if provider_reader_registered:
+            lease.active_provider_readers = max(
+                0, lease.active_provider_readers - 1
+            )
+            _ACTIVE_PROVIDER_READERS = max(0, _ACTIVE_PROVIDER_READERS - 1)
+            _notify_reservation_turnover()
         try:
             writer.close()
         except Exception:  # noqa: BLE001
@@ -4267,6 +4441,7 @@ async def _close_lease(
     if not isinstance(completed, bool):
         raise ValueError("completed must be boolean")
     lease.closed = True
+    _notify_reservation_turnover()
     for tunnel_writer in tuple(lease.tunnel_writers):
         try:
             tunnel_writer.close()

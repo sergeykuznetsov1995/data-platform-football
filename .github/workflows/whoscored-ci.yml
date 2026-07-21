@@ -16,7 +16,7 @@ concurrency:
 jobs:
   contract:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 60
     env:
       PYTHONPYCACHEPREFIX: /tmp/whoscored-ci-pycache
       PYTHONDONTWRITEBYTECODE: "1"

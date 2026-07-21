@@ -4145,13 +4145,339 @@ def test_lease_pump_pre_reads_only_the_remaining_provider_window(mod):
         )
     )
 
-    assert reader.read_sizes == [12]
+    # A provider read may never reserve the whole bidirectional tail while the
+    # client upload leg is active. The fair window is recomputed after every
+    # exact chunk and converges on the final hard-cap byte.
+    assert reader.read_sizes == [6, 3, 2, 1]
     assert len(reader.payload) == 8
     assert b"".join(writer.writes) == b"x" * 12
     assert lease.down_bytes == 12
     assert lease.total_bytes == lease.max_bytes
     assert lease.budget_exceeded is True
     assert writer.closed is True
+
+
+def test_blocking_client_leg_cannot_hold_provider_read_reservation(mod):
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+    lease = _make_fbref_lease(mod, mgr, max_bytes=64)
+    provider_payload = b"provider-can-progress"
+
+    class BlockingClientReader:
+        def __init__(self, started, release):
+            self.started = started
+            self.release = release
+
+        async def read(self, _size):
+            self.started.set()
+            await self.release.wait()
+            return b""
+
+    class ProviderReader:
+        def __init__(self, eof):
+            self.payload = provider_payload
+            self.eof = eof
+
+        async def read(self, size):
+            if self.payload:
+                chunk, self.payload = self.payload[:size], self.payload[size:]
+                return chunk
+            self.eof.set()
+            return b""
+
+    class Writer:
+        def __init__(self):
+            self.payload = bytearray()
+            self.closed = False
+
+        def write(self, chunk):
+            self.payload.extend(chunk)
+
+        async def drain(self):
+            return None
+
+        def close(self):
+            self.closed = True
+
+    async def scenario():
+        client_started = asyncio.Event()
+        release_client = asyncio.Event()
+        provider_eof = asyncio.Event()
+        client_writer = Writer()
+        provider_writer = Writer()
+        task = asyncio.create_task(
+            mod._run_tunnel_pumps(
+                BlockingClientReader(client_started, release_client),
+                client_writer,
+                ProviderReader(provider_eof),
+                provider_writer,
+                "www.fbref.com",
+                lease=lease,
+            )
+        )
+        await asyncio.wait_for(client_started.wait(), timeout=1)
+        await asyncio.wait_for(provider_eof.wait(), timeout=1)
+        # Let the down pump settle/release its EOF reservation while the local
+        # client remains silent forever from the provider's perspective.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert task.done() is False
+        assert bytes(client_writer.payload) == provider_payload
+        assert lease.down_bytes == len(provider_payload)
+        assert lease.reserved_bytes == 0
+        assert lease.accounting_uncertain is False
+        release_client.set()
+        await asyncio.wait_for(task, timeout=1)
+        return client_writer, provider_writer
+
+    client_writer, provider_writer = asyncio.run(scenario())
+
+    assert client_writer.closed is True
+    assert provider_writer.closed is True
+    assert lease.usable is True
+    assert lease.active_provider_readers == 0
+
+
+def test_concurrent_provider_readers_keep_aggregate_upload_headroom(mod):
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+    lease = _make_fbref_lease(mod, mgr, max_bytes=12)
+
+    class BlockingProviderReader:
+        def __init__(self, index, started, release):
+            self.index = index
+            self.started = started
+            self.release = release
+
+        async def read(self, _size):
+            await self.started.put(self.index)
+            await self.release.wait()
+            return b""
+
+    class Writer:
+        def __init__(self):
+            self.closed = False
+
+        def write(self, _chunk):
+            raise AssertionError("EOF-only provider reader must not write")
+
+        async def drain(self):
+            return None
+
+        def close(self):
+            self.closed = True
+
+    async def scenario():
+        started = asyncio.Queue()
+        releases = [asyncio.Event() for _ in range(3)]
+        writers = [Writer() for _ in range(3)]
+        tasks = [
+            asyncio.create_task(
+                mod._pump(
+                    BlockingProviderReader(index, started, releases[index]),
+                    writers[index],
+                    "www.fbref.com",
+                    defaultdict(int),
+                    lease=lease,
+                    direction="down",
+                )
+            )
+            for index in range(3)
+        ]
+        observed = [
+            await asyncio.wait_for(started.get(), timeout=1) for _ in range(3)
+        ]
+        # Every provider reader may progress, but their aggregate pre-read
+        # escrow leaves the exact N+1 share for an upload on this lease.
+        assert lease.active_provider_readers == 3
+        assert lease.provider_reserved_bytes == 9
+        assert lease.reserved_bytes == 9
+        assert mod._lease_remaining(lease) == 3
+        for index in observed:
+            releases[index].set()
+        await asyncio.wait_for(asyncio.gather(*tasks), timeout=1)
+        return observed, writers
+
+    observed, writers = asyncio.run(scenario())
+
+    assert sorted(observed) == [0, 1, 2]
+    assert all(writer.closed for writer in writers)
+    assert lease.provider_reserved_bytes == 0
+    assert lease.reserved_bytes == 0
+    assert lease.accounting_uncertain is False
+    assert lease.usable is True
+
+
+def test_cross_lease_provider_reservations_leave_shared_upload_headroom(mod):
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+    mod.DAILY_BUDGET_BYTES = 12
+    mod.DAGRUN_BUDGET_BYTES = 12
+    mod.URL_BUDGET_BYTES = 12
+    mod.MAX_LEASE_BYTES = 12
+    mod.MAX_ACTIVE_LEASES = 4
+    mod.TRANSFERMARKT_DAGRUN_BUDGET_BYTES = 12
+    leases = tuple(
+        mod._create_lease(
+            mgr,
+            max_bytes=12,
+            ttl_seconds=30,
+            metadata={
+                "dag_id": "dag_ingest_transfermarkt",
+                "run_id": f"run-{suffix}",
+                "task_id": f"task-{suffix}",
+                "canonical_url": f"https://www.transfermarkt.com/{suffix}",
+            },
+            require_context=True,
+        )
+        for suffix in ("a", "b", "c", "d")
+    )
+    first = leases[0]
+
+    class BlockingProviderReader:
+        def __init__(self, started, release):
+            self.started = started
+            self.release = release
+
+        async def read(self, _size):
+            self.started.set()
+            await self.release.wait()
+            return b""
+
+    class UploadReader:
+        def __init__(self):
+            self.chunks = [b"xy", b""]
+
+        async def read(self, _size):
+            return self.chunks.pop(0)
+
+    class Writer:
+        def __init__(self):
+            self.payload = bytearray()
+            self.closed = False
+
+        def write(self, chunk):
+            self.payload.extend(chunk)
+
+        async def drain(self):
+            return None
+
+        def close(self):
+            self.closed = True
+
+    async def scenario():
+        started = [asyncio.Event() for _ in leases]
+        release = [asyncio.Event() for _ in leases]
+        down_writers = [Writer() for _ in leases]
+        down_tasks = [
+            asyncio.create_task(
+                mod._pump(
+                    BlockingProviderReader(started[index], release[index]),
+                    down_writers[index],
+                    "www.transfermarkt.com",
+                    defaultdict(int),
+                    lease=lease,
+                    direction="down",
+                )
+            )
+            for index, lease in enumerate(leases)
+        ]
+        await asyncio.gather(
+            *(asyncio.wait_for(event.wait(), timeout=1) for event in started)
+        )
+        assert mod._ACTIVE_PROVIDER_READERS == 4
+        assert mod._daily_reserved_bytes == 10
+        assert all(mod._lease_remaining(lease) == 2 for lease in leases)
+
+        upload_writer = Writer()
+        await asyncio.wait_for(
+            mod._pump(
+                UploadReader(),
+                upload_writer,
+                "www.transfermarkt.com",
+                defaultdict(int),
+                lease=first,
+                direction="up",
+            ),
+            timeout=1,
+        )
+        assert bytes(upload_writer.payload) == b"xy"
+        assert all(task.done() is False for task in down_tasks)
+
+        for event in release:
+            event.set()
+        await asyncio.wait_for(asyncio.gather(*down_tasks), timeout=1)
+        return upload_writer, down_writers
+
+    upload_writer, down_writers = asyncio.run(scenario())
+
+    assert upload_writer.closed is True
+    assert all(writer.closed for writer in down_writers)
+    assert first.up_bytes == 2
+    assert all(lease.reserved_bytes == 0 for lease in leases)
+    assert all(lease.provider_reserved_bytes == 0 for lease in leases)
+    assert all(lease.accounting_uncertain is False for lease in leases)
+    assert mod._ACTIVE_PROVIDER_READERS == 0
+
+
+def test_staged_client_upload_waits_for_temporary_shared_reservation(mod):
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+    lease = _make_fbref_lease(mod, mgr, max_bytes=12)
+    external_reservation = mod._reserve_lease_bytes(lease, 8)
+    assert external_reservation == 8
+
+    class Reader:
+        def __init__(self):
+            self.chunks = [b"abcdef", b""]
+
+        async def read(self, _size):
+            return self.chunks.pop(0)
+
+    class Writer:
+        def __init__(self, first_write):
+            self.payload = bytearray()
+            self.first_write = first_write
+            self.closed = False
+
+        def write(self, chunk):
+            self.payload.extend(chunk)
+            self.first_write.set()
+
+        async def drain(self):
+            return None
+
+        def close(self):
+            self.closed = True
+
+    async def scenario():
+        first_write = asyncio.Event()
+        writer = Writer(first_write)
+        task = asyncio.create_task(
+            mod._pump(
+                Reader(),
+                writer,
+                "www.fbref.com",
+                defaultdict(int),
+                lease=lease,
+                direction="up",
+            )
+        )
+        await asyncio.wait_for(first_write.wait(), timeout=1)
+        # Four bytes fit now; the ordered two-byte tail must wait for the
+        # unrelated in-flight reservation instead of poisoning the lease.
+        await asyncio.sleep(0)
+        assert bytes(writer.payload) == b"abcd"
+        assert task.done() is False
+        assert lease.budget_exceeded is False
+        assert lease.accounting_uncertain is False
+        mod._release_lease_reservation(lease, external_reservation)
+        await asyncio.wait_for(task, timeout=1)
+        return writer
+
+    writer = asyncio.run(scenario())
+
+    assert bytes(writer.payload) == b"abcdef"
+    assert writer.closed is True
+    assert lease.up_bytes == 6
+    assert lease.reserved_bytes == 0
+    assert lease.usable is True
 
 
 def test_provider_connect_head_is_bounded_before_read_and_counted_exactly(mod):
@@ -6760,7 +7086,7 @@ def test_fbref_proxy_hard_stops_an_oversized_browser_phase_transfer(mod):
         )
     )
 
-    assert reader.read_sizes == [12]
+    assert reader.read_sizes == [6, 3, 2, 1]
     assert reader.payload == b"x" * 8
     assert b"".join(writer.writes) == b"x" * 12
     assert lease.total_bytes == lease.max_bytes == 12

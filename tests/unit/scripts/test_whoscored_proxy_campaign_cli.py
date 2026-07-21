@@ -733,7 +733,7 @@ def test_issue_daily_ingest_writes_valid_approval_and_pointer(tmp_path):
     approval_path = tmp_path / "appr" / f"{pointer['approval_id']}.json"
     assert stat.S_IMODE(approval_path.stat().st_mode) == 0o600
     approval = ProxyCampaignApproval.from_dict(json.loads(approval_path.read_text()))
-    approval.verify("k" * 40)
+    approval.verify("k" * 40, now=_ISSUER_NOW)
     assert approval.run_id == _RUN_ID
     assert approval.allowed_dag_ids == (WHOSCORED_INGEST_DAG_ID,)
     assert not approval.is_exact_canary
@@ -904,7 +904,7 @@ def test_issue_daily_ingest_zero_profile_backlog_keeps_one_safe_binding(tmp_path
             (tmp_path / "appr" / f"{pointer['approval_id']}.json").read_text()
         )
     )
-    approval.verify("k" * 40)
+    approval.verify("k" * 40, now=_ISSUER_NOW)
     assert approval.scheduled_authority is not None
     assert approval.scheduled_authority.profile_target_count == 0
     allocation = approval.allocation("profiles-daily")

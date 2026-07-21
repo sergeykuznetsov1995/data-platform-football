@@ -62,7 +62,10 @@ ENV SPARK_VERSION=3.5.3
 ENV HADOOP_VERSION=3
 ENV SPARK_HOME=/opt/spark
 
-RUN curl -fsSL https://archive.apache.org/dist/spark/spark-3.5.3/spark-3.5.3-bin-hadoop3.tgz -o /tmp/spark-3.5.3-bin-hadoop3.tgz \
+RUN curl --proto '=https' --tlsv1.2 --proto-redir '=https' \
+      --connect-timeout 20 --speed-limit 1024 --speed-time 60 \
+      --max-time 600 --retry 2 --retry-delay 5 --retry-max-time 600 \
+      -fsSL https://archive.apache.org/dist/spark/spark-3.5.3/spark-3.5.3-bin-hadoop3.tgz -o /tmp/spark-3.5.3-bin-hadoop3.tgz \
     && echo "173651a8a00f5bf0ee27b74d817e0e52eed9daa49fd66d59718994974d1d367d  /tmp/spark-3.5.3-bin-hadoop3.tgz" \
         | sha256sum -c - \
     && test "$(stat -c %s /tmp/spark-3.5.3-bin-hadoop3.tgz)" -eq 400864419
