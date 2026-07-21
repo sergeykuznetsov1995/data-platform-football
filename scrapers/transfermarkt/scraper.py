@@ -983,7 +983,7 @@ def _career_collection_error(
 
 _METADATA_COLUMNS = ['_source', '_entity_type', '_ingested_at', '_batch_id']
 _SCOPE_LINEAGE_COLUMNS = [
-    'source_competition_id', 'source_edition_id', 'source_url',
+    'raw_capture_id', 'source_competition_id', 'source_edition_id', 'source_url',
     'source_body_hash', 'fetched_at', 'parser_revision', 'schema_revision',
     'cycle_id', 'scope_id',
 ]
@@ -1012,7 +1012,8 @@ PLAYER_ATTRIBUTE_OBSERVATION_COLUMNS = [
 ]
 PLAYER_CONTRACT_OBSERVATION_COLUMNS = [
     'competition_id', 'edition_id', 'team_id', 'team_name', 'player_id',
-    'contract_until', 'observed_at', 'applicability_status', 'source_url',
+    'contract_until', 'observed_at', 'applicability_status', 'raw_capture_id',
+    'source_url',
     'source_body_hash', 'fetched_at', 'parser_revision', 'schema_revision',
     'cycle_id', 'scope_id',
 ]
@@ -2168,11 +2169,16 @@ class TransfermarktScraper(BaseScraper):
                 self._last_outcome.payload_hash
                 if self._last_outcome is not None else None
             )
+            raw_capture_id = (
+                self._last_outcome.raw_capture_id
+                if self._last_outcome is not None else None
+            )
             for p in parsed_players:
                 p['current_club_name'] = club['club_name']
                 p['club_slug'] = club['club_slug']
                 p['_source_url'] = squad_url
                 p['_source_body_hash'] = payload_hash
+                p['_raw_capture_id'] = raw_capture_id
                 squad_players.append(p)
             # Smoke/dry-run limits must stop paid traversal as soon as enough
             # rows exist, rather than downloading every remaining club page.
@@ -2213,6 +2219,7 @@ class TransfermarktScraper(BaseScraper):
         contract_rows: List[Dict] = []
         for sp in squad_players:
             lineage = {
+                'raw_capture_id': sp.get('_raw_capture_id'),
                 'source_competition_id': scope['competition_id'],
                 'source_edition_id': scope['edition_id'],
                 'source_url': sp.get('_source_url') or competition.source_url,
@@ -2270,6 +2277,7 @@ class TransfermarktScraper(BaseScraper):
                     'contract_until': sp.get('contract_until'),
                     'observed_at': observed_at,
                     'applicability_status': 'ok',
+                    'raw_capture_id': lineage['raw_capture_id'],
                     'source_url': lineage['source_url'],
                     'source_body_hash': lineage['source_body_hash'],
                     'fetched_at': observed_at,

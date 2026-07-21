@@ -31,9 +31,9 @@ from dags.utils.transfermarkt_dq_contracts import (
     input_from_capture,
     validate_scope_capture,
 )
-from dags.utils.transfermarkt_scope_state import (
-    SCOPE_PLAYER_CAPTURE_GRAIN,
-    SCOPE_PLAYER_CAPTURE_TABLE,
+from dags.utils.transfermarkt_source import SCOPE_PLAYER_CAPTURE_TABLE
+from dags.utils.transfermarkt_source_manifest import (
+    SCOPE_PLAYER_CAPTURE_COLUMNS,
     scope_player_capture_evidence,
     scope_player_capture_rows,
 )
@@ -1921,10 +1921,10 @@ def _load_scope_player_capture(scraper, cycle_id: str, scope_id: str):
     table_name = SCOPE_PLAYER_CAPTURE_TABLE.rsplit('.', 1)[-1]
     writer = scraper._iceberg_writer
     if not writer.table_exists('ops', table_name):
-        return pd.DataFrame(columns=SCOPE_PLAYER_CAPTURE_GRAIN)
+        return pd.DataFrame(columns=SCOPE_PLAYER_CAPTURE_COLUMNS)
     return _query_dataframe(
         scraper._bronze_connection(),
-        f"SELECT {', '.join(SCOPE_PLAYER_CAPTURE_GRAIN)} "
+        f"SELECT {', '.join(SCOPE_PLAYER_CAPTURE_COLUMNS)} "
         f"FROM {SCOPE_PLAYER_CAPTURE_TABLE} "
         "WHERE cycle_id = ? AND scope_id = ?",
         (cycle_id, scope_id),
@@ -1944,7 +1944,7 @@ def _persist_scope_player_capture(scraper, memberships) -> Dict[str, Any]:
     rows = scope_player_capture_rows(memberships)
     if not rows:
         raise RuntimeError('scope-player capture cannot be empty')
-    identities = {(row[0], row[1]) for row in rows}
+    identities = {(row.cycle_id, row.scope_id) for row in rows}
     if len(identities) != 1:
         raise RuntimeError('scope-player capture spans multiple cycle/scope identities')
     cycle_id, scope_id = next(iter(identities))
@@ -1962,7 +1962,7 @@ def _persist_scope_player_capture(scraper, memberships) -> Dict[str, Any]:
             'reused': True,
         }
 
-    frame = pd.DataFrame(rows, columns=SCOPE_PLAYER_CAPTURE_GRAIN)
+    frame = pd.DataFrame([row.as_dict() for row in rows])
     scraper.save_to_iceberg(
         df=frame,
         table_name=SCOPE_PLAYER_CAPTURE_TABLE.rsplit('.', 1)[-1],

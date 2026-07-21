@@ -598,11 +598,14 @@ def test_checkpoint_migrates_valid_empty_and_rejects_hash_tampering():
         status=FetchStatus.VALID_EMPTY,
         value=[],
         payload_hash=None,
+        raw_capture_id='a' * 64,
     ).as_checkpoint()
 
     restored = FetchOutcome.from_checkpoint(legacy)
     assert restored.status is FetchStatus.AUTHORITATIVE_EMPTY
     assert restored.is_success is True
+    assert restored.raw_capture_id == 'a' * 64
+    assert restored.with_status(FetchStatus.OK).raw_capture_id == 'a' * 64
     assert FetchOutcome(
         status=FetchStatus.NOT_APPLICABLE,
         value=None,

@@ -44,10 +44,10 @@ from dags.utils.transfermarkt_scope_state import (
     PROXY_LEDGER_TABLE,
     SCOPE_COMPLETION_STATUS,
     SCOPE_MANIFEST_TABLE,
-    SCOPE_PLAYER_CAPTURE_TABLE,
     ScopeManifest,
     stable_hash,
 )
+from dags.utils.transfermarkt_source import SCOPE_PLAYER_CAPTURE_TABLE
 from scrapers.transfermarkt.models import (
     CAREER_ENTITY_TIMEOUT_SECONDS,  # noqa: F401 - compatibility export for ops/tests
     DEFAULT_ENTITY_TIMEOUT_SECONDS,

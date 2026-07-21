@@ -1808,6 +1808,7 @@ class TestScopePlayerCaptureEvidence:
             'edition_id': '2025',
             'club_id': '10',
             'player_id': player_id,
+            'raw_capture_id': 'a' * 64,
         }])
 
     def test_first_capture_appends_then_verifies_exact_rows(self):
@@ -1815,7 +1816,7 @@ class TestScopePlayerCaptureEvidence:
         memberships = self._memberships()
         scraper = MagicMock()
         scraper.save_to_iceberg.return_value = mod.SCOPE_PLAYER_CAPTURE_TABLE
-        empty = pd.DataFrame(columns=mod.SCOPE_PLAYER_CAPTURE_GRAIN)
+        empty = pd.DataFrame(columns=mod.SCOPE_PLAYER_CAPTURE_COLUMNS)
 
         with patch.object(
             mod, '_load_scope_player_capture', side_effect=[empty, memberships],
@@ -1830,7 +1831,7 @@ class TestScopePlayerCaptureEvidence:
         kwargs = scraper.save_to_iceberg.call_args.kwargs
         assert kwargs['database'] == 'ops'
         assert kwargs['partition_cols'] == ['cycle_id']
-        assert kwargs['table_name'] == 'transfermarkt_scope_player_capture_v1'
+        assert kwargs['table_name'] == 'transfermarkt_scope_player_capture'
 
     def test_exact_replay_reuses_capture_without_an_append(self):
         mod = _import_runner()

@@ -289,6 +289,7 @@ class FetchOutcome(Generic[T]):
     duration_seconds: float = 0.0
     cache_hit: bool = False
     payload_hash: Optional[str] = None
+    raw_capture_id: Optional[str] = None
 
     @property
     def is_success(self) -> bool:
@@ -329,6 +330,7 @@ class FetchOutcome(Generic[T]):
             duration_seconds=self.duration_seconds,
             cache_hit=self.cache_hit,
             payload_hash=self.payload_hash,
+            raw_capture_id=self.raw_capture_id,
         )
 
     def as_checkpoint(self) -> Dict[str, Any]:
@@ -351,6 +353,7 @@ class FetchOutcome(Generic[T]):
             "provider_metered_bytes": self.provider_metered_bytes,
             "duration_seconds": self.duration_seconds,
             "payload_hash": payload_hash,
+            "raw_capture_id": self.raw_capture_id,
         }
 
     @classmethod
@@ -390,6 +393,10 @@ class FetchOutcome(Generic[T]):
             duration_seconds=float(value.get("duration_seconds", 0.0)),
             cache_hit=True,
             payload_hash=expected_hash,
+            raw_capture_id=(
+                str(value['raw_capture_id'])
+                if value.get('raw_capture_id') is not None else None
+            ),
         )
 
     def as_cache_hit(self, *, duration_seconds: float) -> "FetchOutcome[T]":
