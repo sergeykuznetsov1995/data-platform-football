@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from argparse import Namespace
 from datetime import datetime, timedelta
@@ -27,6 +28,8 @@ def _args(tmp_path: Path, **overrides) -> Namespace:
         "publication_attempt": 1,
         "scopes": tmp_path / "scopes.txt",
         "scope_sha256": mod.APPROVED_SCOPE_ARTIFACT_SHA256,
+        "source_refresh_profile": "",
+        "source_refresh_targets_sha256": "",
         "expected_git_sha": SHA,
         "max_requests": 2_000,
         "max_direct_mib": 256,
@@ -36,6 +39,17 @@ def _args(tmp_path: Path, **overrides) -> Namespace:
     }
     values.update(overrides)
     return Namespace(**values)
+
+
+def _source_args(tmp_path: Path, **overrides) -> Namespace:
+    values = {
+        "source_refresh_profile": mod.PLAYER_SOURCE_REFRESH_PROFILE,
+        "source_refresh_targets_sha256": mod.PLAYER_SOURCE_REFRESH_SHA256,
+        "max_requests": mod.PLAYER_SOURCE_REFRESH_MAX_REQUESTS,
+        "max_direct_mib": mod.PLAYER_SOURCE_REFRESH_MAX_DIRECT_MIB,
+    }
+    values.update(overrides)
+    return _args(tmp_path, **values)
 
 
 def _context(tmp_path: Path) -> dict:
@@ -48,9 +62,9 @@ def _context(tmp_path: Path) -> dict:
 
 
 def _publication(*, start: str = "2026-07-22T10:00:00.000000+00:00") -> dict:
-    end = (
-        datetime.fromisoformat(start) + timedelta(seconds=1)
-    ).isoformat(timespec="microseconds")
+    end = (datetime.fromisoformat(start) + timedelta(seconds=1)).isoformat(
+        timespec="microseconds"
+    )
     return {
         "generation_id": GENERATION_ID,
         "binding": {
@@ -120,6 +134,52 @@ def _validation() -> dict:
     }
 
 
+def _source_validation() -> dict:
+    contract = mod.load_player_source_refresh_contract(
+        mod.REPOSITORY_ROOT / mod.PLAYER_SOURCE_REFRESH_ARTIFACT
+    )
+    source = {
+        key: contract[key]
+        for key in (
+            "profile",
+            "artifact",
+            "sha256",
+            "target_count",
+            "targets",
+            "plan_signature",
+        )
+    }
+    return {
+        "status": "success",
+        "run_id": GENERATION_ID,
+        "mode": "backfill",
+        "transport": {"attempts": 8, "proxy_bytes": 0},
+        "budget": {
+            "requests": 8,
+            "max_requests": mod.PLAYER_SOURCE_REFRESH_MAX_REQUESTS,
+            "direct_bytes": 1024,
+            "max_direct_bytes": (
+                mod.PLAYER_SOURCE_REFRESH_MAX_DIRECT_MIB * 1024 * 1024
+            ),
+            "proxy_bytes": 0,
+            "max_proxy_bytes": 0,
+        },
+        "selection": {
+            "profile": contract["profile"],
+            "entities": ["players"],
+            "explicit_scope_count": 0,
+            "explicit_scope_sha256": hashlib.sha256(b"").hexdigest(),
+            "scope_plan_signature": contract["plan_signature"],
+            "competition_limit": 0,
+            "season_limit": 0,
+            "source_refresh": source,
+            "target_outcomes": [
+                {**target, "status": "success"} for target in contract["targets"]
+            ],
+        },
+    }
+
+
 def _wire_preflight(monkeypatch, tmp_path: Path, calls: list[tuple]) -> None:
     monkeypatch.setattr(mod, "_deployment_context", lambda _args: _context(tmp_path))
     monkeypatch.setattr(
@@ -132,7 +192,9 @@ def _wire_preflight(monkeypatch, tmp_path: Path, calls: list[tuple]) -> None:
         "require_no_active_publication",
         lambda *_args, **_kw: {"source": "fotmob", "active": False, "safe": True},
     )
-    monkeypatch.setattr(mod, "_publication_envelope", lambda *_args, **_kw: _publication())
+    monkeypatch.setattr(
+        mod, "_publication_envelope", lambda *_args, **_kw: _publication()
+    )
 
     def airflow(_args, *command, **_kwargs):
         calls.append(command)
@@ -147,7 +209,9 @@ def test_success_triggers_only_parent_and_abandons_exact_candidate(
     calls: list[tuple] = []
     transitions: list[str] = []
     _wire_preflight(monkeypatch, tmp_path, calls)
-    monkeypatch.setattr(mod, "_initialize_publication", lambda *_args, **_kw: _state("writing"))
+    monkeypatch.setattr(
+        mod, "_initialize_publication", lambda *_args, **_kw: _state("writing")
+    )
 
     def exact(_args, dag_id, run_id, **_kwargs):
         expected = (
@@ -207,10 +271,70 @@ def test_success_triggers_only_parent_and_abandons_exact_candidate(
     assert json.loads(_args(tmp_path).output.read_text())["phase"] == "abandoned"
 
 
+def test_source_refresh_triggers_exact_seven_player_parent_profile(
+    tmp_path, monkeypatch
+):
+    calls: list[tuple] = []
+    transitions: list[str] = []
+    _wire_preflight(monkeypatch, tmp_path, calls)
+    monkeypatch.setattr(
+        mod, "_initialize_publication", lambda *_args, **_kw: _state("writing")
+    )
+    monkeypatch.setattr(
+        mod,
+        "_exact_run",
+        lambda _args, _dag_id, run_id, **_kw: {
+            "run_id": run_id,
+            "state": "success",
+        },
+    )
+    monkeypatch.setattr(mod, "_get_publication", lambda *_args, **_kw: _state())
+    monkeypatch.setattr(
+        mod, "_validation_xcom", lambda *_args, **_kw: _source_validation()
+    )
+
+    def transition(_args, _generation_id, *, action, **_kwargs):
+        transitions.append(action)
+        return {
+            **_state("abandoned"),
+            "active": False,
+            "released": True,
+            "published": False,
+        }
+
+    monkeypatch.setattr(mod, "_transition_publication", transition)
+    arguments = _source_args(tmp_path)
+
+    report = mod.run_backfill(
+        arguments, sleeper=lambda _value: None, monotonic=lambda: 0
+    )
+
+    assert report["passed"] is True and report["phase"] == "abandoned"
+    assert report["profile"] == mod.PLAYER_SOURCE_REFRESH_PROFILE
+    assert report["entities"] == ["players"]
+    assert report["limits"]["executed_scope_count"] == 0
+    assert report["source_refresh"]["target_count"] == 7
+    assert len(report["validation"]["target_outcomes"]) == 7
+    trigger = next(call for call in calls if call[:2] == ("dags", "trigger"))
+    conf = json.loads(trigger[trigger.index("--conf") + 1])
+    assert conf["mode"] == "backfill"
+    assert conf["scope"] == ""
+    assert conf["entities"] == "players"
+    assert conf["source_refresh_profile"] == mod.PLAYER_SOURCE_REFRESH_PROFILE
+    assert conf["source_refresh_targets_sha256"] == (mod.PLAYER_SOURCE_REFRESH_SHA256)
+    assert conf["source_refresh_target_count"] == 7
+    assert conf["max_requests"] == 64
+    assert conf["max_direct_mib"] == 8
+    assert conf["match_limit"] == conf["team_limit"] == conf["player_limit"] == 0
+    assert transitions == ["abandon"]
+
+
 def test_proven_failed_parent_releases_and_requires_next_attempt(tmp_path, monkeypatch):
     calls: list[tuple] = []
     _wire_preflight(monkeypatch, tmp_path, calls)
-    monkeypatch.setattr(mod, "_initialize_publication", lambda *_args, **_kw: _state("writing"))
+    monkeypatch.setattr(
+        mod, "_initialize_publication", lambda *_args, **_kw: _state("writing")
+    )
     monkeypatch.setattr(
         mod,
         "_exact_run",
@@ -220,7 +344,9 @@ def test_proven_failed_parent_releases_and_requires_next_attempt(tmp_path, monke
             else None
         ),
     )
-    monkeypatch.setattr(mod, "_get_publication", lambda *_args, **_kw: _state("writing"))
+    monkeypatch.setattr(
+        mod, "_get_publication", lambda *_args, **_kw: _state("writing")
+    )
     actions = []
 
     def transition(_args, _generation_id, *, action, **_kwargs):
@@ -248,15 +374,15 @@ def test_proven_failed_parent_releases_and_requires_next_attempt(tmp_path, monke
 def test_timeout_with_active_writer_retains_generation(tmp_path, monkeypatch):
     calls: list[tuple] = []
     _wire_preflight(monkeypatch, tmp_path, calls)
-    monkeypatch.setattr(mod, "_initialize_publication", lambda *_args, **_kw: _state("writing"))
+    monkeypatch.setattr(
+        mod, "_initialize_publication", lambda *_args, **_kw: _state("writing")
+    )
     states = iter(
         [
             _quiet(),
             {
                 "pause_states": {dag_id: True for dag_id in mod.DAGS},
-                "active_runs": {
-                    mod.INGEST_DAG_ID: {"running": ["exact-ingest"]}
-                },
+                "active_runs": {mod.INGEST_DAG_ID: {"running": ["exact-ingest"]}},
             },
         ]
     )
@@ -342,11 +468,11 @@ def test_recovery_releases_pretrigger_acquire_and_keeps_daily_paused(
     tmp_path, monkeypatch
 ):
     calls: list[tuple] = []
-    arguments = _wire_recovery(
-        monkeypatch, tmp_path, calls, "acquired_writers_paused"
-    )
+    arguments = _wire_recovery(monkeypatch, tmp_path, calls, "acquired_writers_paused")
     monkeypatch.setattr(mod, "_exact_run", lambda *_args, **_kw: None)
-    monkeypatch.setattr(mod, "_get_publication", lambda *_args, **_kw: _state("writing"))
+    monkeypatch.setattr(
+        mod, "_get_publication", lambda *_args, **_kw: _state("writing")
+    )
     actions = []
 
     def transition(_args, _generation_id, *, action, **_kwargs):
@@ -368,13 +494,9 @@ def test_recovery_releases_pretrigger_acquire_and_keeps_daily_paused(
     assert all(call[:2] != ("dags", "unpause") for call in calls)
 
 
-def test_recovery_after_committed_abandon_is_idempotently_green(
-    tmp_path, monkeypatch
-):
+def test_recovery_after_committed_abandon_is_idempotently_green(tmp_path, monkeypatch):
     calls: list[tuple] = []
-    arguments = _wire_recovery(
-        monkeypatch, tmp_path, calls, "ready_pending_abandon"
-    )
+    arguments = _wire_recovery(monkeypatch, tmp_path, calls, "ready_pending_abandon")
     monkeypatch.setattr(
         mod,
         "_exact_run",
@@ -383,12 +505,16 @@ def test_recovery_after_committed_abandon_is_idempotently_green(
             "state": "success",
         },
     )
-    monkeypatch.setattr(mod, "_get_publication", lambda *_args, **_kw: _state("abandoned"))
+    monkeypatch.setattr(
+        mod, "_get_publication", lambda *_args, **_kw: _state("abandoned")
+    )
     monkeypatch.setattr(mod, "_validation_xcom", lambda *_args, **_kw: _validation())
     monkeypatch.setattr(
         mod,
         "_transition_publication",
-        lambda *_args, **_kw: pytest.fail("already-abandoned recovery must be read-only"),
+        lambda *_args, **_kw: pytest.fail(
+            "already-abandoned recovery must be read-only"
+        ),
     )
 
     report = mod.recover_backfill(arguments)
@@ -404,7 +530,9 @@ def test_recovery_releases_when_write_ahead_trigger_intent_has_no_exact_run(
     calls: list[tuple] = []
     arguments = _wire_recovery(monkeypatch, tmp_path, calls, "trigger_intent")
     monkeypatch.setattr(mod, "_exact_run", lambda *_args, **_kw: None)
-    monkeypatch.setattr(mod, "_get_publication", lambda *_args, **_kw: _state("writing"))
+    monkeypatch.setattr(
+        mod, "_get_publication", lambda *_args, **_kw: _state("writing")
+    )
     actions = []
 
     def transition(_args, _generation_id, *, action, **_kwargs):
@@ -430,7 +558,9 @@ def test_recovery_retains_when_confirmed_ingest_run_disappears(tmp_path, monkeyp
     calls: list[tuple] = []
     arguments = _wire_recovery(monkeypatch, tmp_path, calls, "ingest_running")
     monkeypatch.setattr(mod, "_exact_run", lambda *_args, **_kw: None)
-    monkeypatch.setattr(mod, "_get_publication", lambda *_args, **_kw: _state("writing"))
+    monkeypatch.setattr(
+        mod, "_get_publication", lambda *_args, **_kw: _state("writing")
+    )
     monkeypatch.setattr(
         mod,
         "_transition_publication",
@@ -466,11 +596,20 @@ def test_publication_attempts_have_distinct_namespace_from_rollback(
         lambda *_args, **_kwargs: responses.pop(0),
     )
 
-    first = mod._publication_envelope(_args(tmp_path, publication_attempt=1), "backfill", run=None)
-    second = mod._publication_envelope(_args(tmp_path, publication_attempt=2), "backfill", run=None)
-    replay = mod._publication_envelope(_args(tmp_path, publication_attempt=1), "replay", run=None)
+    first = mod._publication_envelope(
+        _args(tmp_path, publication_attempt=1), "backfill", run=None
+    )
+    second = mod._publication_envelope(
+        _args(tmp_path, publication_attempt=2), "backfill", run=None
+    )
+    replay = mod._publication_envelope(
+        _args(tmp_path, publication_attempt=1), "replay", run=None
+    )
 
-    assert len({first["generation_id"], second["generation_id"], replay["generation_id"]}) == 3
+    assert (
+        len({first["generation_id"], second["generation_id"], replay["generation_id"]})
+        == 3
+    )
     assert first["binding"]["data_interval_start"] == (
         "2026-07-22T10:00:00.000000+00:00"
     )
@@ -538,6 +677,124 @@ def test_recovery_report_rejects_transfer_entity_contract(tmp_path, monkeypatch)
 
     with pytest.raises(mod.BackfillError, match="stack or scope identity differs"):
         mod._load_recovery_report(arguments, scope_contract, run=None)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"mode": "replay"},
+        {"max_requests": 63},
+        {"max_direct_mib": 9},
+        {"source_refresh_profile": "unreviewed"},
+        {"source_refresh_targets_sha256": "0" * 64},
+    ],
+)
+def test_source_refresh_drift_fails_before_external_action(
+    tmp_path, monkeypatch, overrides
+):
+    called = False
+
+    def context(_args):
+        nonlocal called
+        called = True
+        return _context(tmp_path)
+
+    monkeypatch.setattr(mod, "_deployment_context", context)
+
+    with pytest.raises(mod.BackfillError):
+        mod.run_backfill(_source_args(tmp_path, **overrides))
+
+    assert called is False
+
+
+def test_source_refresh_recovery_requires_same_artifact_identity(tmp_path, monkeypatch):
+    source_arguments = _source_args(tmp_path, command="recover")
+    mod._load_source_refresh_contract(source_arguments)
+    scope_contract = _scope_contract(tmp_path)
+    monkeypatch.setattr(mod, "_deployment_context", lambda _args: _context(tmp_path))
+    report = mod._base_report(
+        source_arguments,
+        mode="backfill",
+        publication=_publication(),
+        scope_contract=scope_contract,
+    )
+    recovery = tmp_path / "source-recovery.json"
+    recovery.write_text(json.dumps(report), encoding="utf-8")
+    normal_arguments = _args(
+        tmp_path,
+        command="recover",
+        recovery_report=recovery,
+        mode=None,
+        confirm=mod.CONFIRM_RECOVER,
+    )
+    mod._load_source_refresh_contract(normal_arguments)
+
+    with pytest.raises(mod.BackfillError, match="stack or scope identity differs"):
+        mod._load_recovery_report(normal_arguments, scope_contract, run=None)
+
+
+def test_source_refresh_recovery_accepts_exact_profile_and_is_idempotent(
+    tmp_path, monkeypatch
+):
+    arguments = _source_args(
+        tmp_path,
+        command="recover",
+        mode="backfill",
+        confirm=mod.CONFIRM_RECOVER,
+    )
+    monkeypatch.setattr(mod, "_deployment_context", lambda _args: _context(tmp_path))
+    scope_contract = _scope_contract(tmp_path)
+    mod._load_source_refresh_contract(arguments)
+    report = mod._base_report(
+        arguments,
+        mode="backfill",
+        publication=_publication(),
+        scope_contract=scope_contract,
+    )
+    report["phase"] = "ready_pending_abandon"
+    recovery = tmp_path / "source-recovery-exact.json"
+    recovery.write_text(json.dumps(report), encoding="utf-8")
+    arguments.recovery_report = recovery
+    monkeypatch.setattr(mod, "_load_scope_contract", lambda *_args: scope_contract)
+    monkeypatch.setattr(
+        mod, "_publication_envelope", lambda *_args, **_kw: _publication()
+    )
+    monkeypatch.setattr(mod, "validate_live_deployment", lambda *_args, **_kw: {})
+    monkeypatch.setattr(mod, "_pause_all", lambda *_args, **_kw: _quiet())
+    monkeypatch.setattr(mod, "inspect_writer_state", lambda *_args, **_kw: _quiet())
+    monkeypatch.setattr(
+        mod,
+        "require_no_active_publication",
+        lambda *_args, **_kw: {"source": "fotmob", "active": False, "safe": True},
+    )
+    monkeypatch.setattr(
+        mod,
+        "_exact_run",
+        lambda _args, _dag_id, run_id, **_kw: {
+            "run_id": run_id,
+            "state": "success",
+        },
+    )
+    monkeypatch.setattr(
+        mod, "_get_publication", lambda *_args, **_kw: _state("abandoned")
+    )
+    monkeypatch.setattr(
+        mod, "_validation_xcom", lambda *_args, **_kw: _source_validation()
+    )
+    monkeypatch.setattr(
+        mod,
+        "_transition_publication",
+        lambda *_args, **_kw: pytest.fail(
+            "already-abandoned source recovery must be read-only"
+        ),
+    )
+
+    resolved = mod.recover_backfill(arguments)
+
+    assert resolved["passed"] is True
+    assert resolved["phase"] == "abandoned"
+    assert resolved["validation"]["profile"] == mod.PLAYER_SOURCE_REFRESH_PROFILE
+    assert len(resolved["validation"]["target_outcomes"]) == 7
 
 
 def test_nonpositive_attempt_fails_before_any_external_action(tmp_path, monkeypatch):

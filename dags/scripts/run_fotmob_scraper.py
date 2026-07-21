@@ -90,6 +90,7 @@ def _attest_native_runtime(args, publication: Mapping[str, Any]) -> dict[str, An
         f"{competition_id}={season}"
         for competition_id, season in _parse_scopes(args.scope)
     ]
+    source_refresh = getattr(args, "source_refresh_contract", None)
     return attest_fotmob_isolated_runtime(
         require_scheduled_owner=False,
         allow_kept_paused_writer=True,
@@ -97,9 +98,33 @@ def _attest_native_runtime(args, publication: Mapping[str, Any]) -> dict[str, An
             "component": "bronze_runner",
             "mode": args.mode,
             "scopes": scopes,
-            "entities": sorted(_parse_native_entities(args.entities)),
+            "entities": sorted(_selected_native_entities(args)),
             "competition_limit": args.competition_limit,
             "season_limit": args.season_limit,
+            "match_limit": args.match_limit,
+            "team_limit": args.team_limit,
+            "player_limit": args.player_limit,
+            "max_requests": args.max_requests,
+            "max_direct_mib": args.max_direct_mib,
+            "max_proxy_mib": args.max_proxy_mib,
+            "requests_per_minute": args.requests_per_minute,
+            "max_attempts": args.max_attempts,
+            "next_build_id": args.next_build_id,
+            "source_refresh_profile": (
+                source_refresh.get("profile")
+                if isinstance(source_refresh, Mapping)
+                else None
+            ),
+            "source_refresh_targets_sha256": (
+                source_refresh.get("sha256")
+                if isinstance(source_refresh, Mapping)
+                else None
+            ),
+            "source_refresh_target_count": (
+                source_refresh.get("target_count")
+                if isinstance(source_refresh, Mapping)
+                else None
+            ),
             "publication": dict(publication),
         },
     )
@@ -200,6 +225,39 @@ def _parse_scopes(values: Iterable[str]) -> tuple[tuple[int, str], ...]:
                 scopes.append(identity)
                 seen.add(identity)
     return tuple(scopes)
+
+
+def _source_refresh_artifact_path() -> Path:
+    return (
+        Path(__file__).resolve().parents[2]
+        / "configs/fotmob/issue-930-player-source-refresh.json"
+    )
+
+
+def _load_source_refresh_contract(args) -> dict[str, Any] | None:
+    profile = str(getattr(args, "source_refresh_profile", "") or "").strip()
+    supplied_sha = (
+        str(getattr(args, "source_refresh_targets_sha256", "") or "").strip().casefold()
+    )
+    if not profile and not supplied_sha:
+        return None
+    from scrapers.fotmob.source_refresh import (
+        PLAYER_SOURCE_REFRESH_PROFILE,
+        load_player_source_refresh_contract,
+    )
+
+    if profile != PLAYER_SOURCE_REFRESH_PROFILE:
+        raise ValueError("unknown FotMob source-refresh profile")
+    contract = load_player_source_refresh_contract(_source_refresh_artifact_path())
+    if supplied_sha != contract["sha256"]:
+        raise ValueError("source-refresh target SHA differs from reviewed artifact")
+    return contract
+
+
+def _selected_native_entities(args) -> frozenset[str]:
+    if getattr(args, "source_refresh_contract", None) is not None:
+        return frozenset({"players"})
+    return _parse_native_entities(args.entities)
 
 
 def _parse_native_entities(value: str) -> frozenset[str]:
@@ -420,13 +478,112 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         _deactivate_native_service(service)
         return (0 if report.ok else 1), payload
 
+    source_refresh = getattr(args, "source_refresh_contract", None)
+    if isinstance(source_refresh, Mapping):
+        player_operation = service.sync_player_snapshots(
+            source_refresh["player_ids"],
+            # A task retry may follow partial durable commits. Force the same
+            # immutable seven identities to be observed again so retries stay
+            # idempotent instead of turning fresh successes into skips.
+            force_refresh=True,
+            capture_terminal_outcomes=True,
+        )
+        operations.append(player_operation)
+
+        raw_outcomes = player_operation.metadata.get("terminal_outcomes")
+        valid_outcome_shape = (
+            isinstance(raw_outcomes, list)
+            and len(raw_outcomes) == source_refresh["target_count"]
+            and all(
+                isinstance(item, Mapping)
+                and set(item) == {"player_id", "status"}
+                and type(item.get("player_id")) is int
+                and isinstance(item.get("status"), str)
+                for item in raw_outcomes
+            )
+        )
+        outcome_by_player = (
+            {int(item["player_id"]): str(item["status"]) for item in raw_outcomes}
+            if valid_outcome_shape
+            else {}
+        )
+        target_outcomes = [
+            {
+                **target,
+                "status": outcome_by_player.get(target["player_id"], "missing"),
+            }
+            for target in source_refresh["targets"]
+        ]
+        profile_validation = OperationResult(
+            "player_source_refresh_contract",
+            attempted=source_refresh["target_count"],
+            metadata={
+                "profile": source_refresh["profile"],
+                "targets_sha256": source_refresh["sha256"],
+                "target_outcomes": target_outcomes,
+            },
+        )
+        accepted = {"success", "not_available"}
+        intentional_not_available = int(
+            player_operation.metadata.get("intentional_not_available") or 0
+        )
+        reported_not_available = sum(
+            item["status"] == "not_available" for item in target_outcomes
+        )
+        if (
+            not valid_outcome_shape
+            or player_operation.attempted != source_refresh["target_count"]
+            or len(outcome_by_player) != source_refresh["target_count"]
+            or set(outcome_by_player) != set(source_refresh["player_ids"])
+            or any(item["status"] not in accepted for item in target_outcomes)
+            or player_operation.skipped != 0
+            or player_operation.not_available != reported_not_available
+            or intentional_not_available != reported_not_available
+        ):
+            profile_validation.errors.append(
+                "source refresh did not produce exactly seven terminal outcomes"
+            )
+        else:
+            profile_validation.succeeded = source_refresh["target_count"]
+            profile_validation.counts["terminal_targets"] = source_refresh[
+                "target_count"
+            ]
+        operations.append(profile_validation)
+
+        rc, payload = finish()
+        payload["selection"] = {
+            "profile": source_refresh["profile"],
+            "entities": ["players"],
+            "explicit_scopes": [],
+            "competition_limit": 0,
+            "season_limit": 0,
+            "scope_plan_signature": source_refresh["plan_signature"],
+            "planned_scopes": [],
+            "completed_scopes": [],
+            "completed_transfer_competition_ids": [],
+            "requests_per_minute": args.requests_per_minute,
+            "source_refresh": {
+                key: source_refresh[key]
+                for key in (
+                    "profile",
+                    "artifact",
+                    "sha256",
+                    "target_count",
+                    "targets",
+                    "plan_signature",
+                )
+            },
+            "target_outcomes": target_outcomes,
+        }
+        return rc, payload
+
     explicit_scopes = _parse_scopes(args.scope)
     explicit_ids = {competition_id for competition_id, _ in explicit_scopes}
     daily_competition_ids = {
         int(value) for value in getattr(args, "daily_competition_ids", ())
     }
     requested_competition_ids = explicit_ids | daily_competition_ids
-    entities = _parse_native_entities(args.entities)
+    entities = _selected_native_entities(args)
 
     catalog = service.discover_catalog()
     operations.append(catalog.operation)
@@ -960,6 +1117,16 @@ def _argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--competition-scope-sha256", default="")
     parser.add_argument("--competition-ids-sha256", default="")
     parser.add_argument(
+        "--source-refresh-profile",
+        default="",
+        help="Reviewed bounded player source-refresh profile",
+    )
+    parser.add_argument(
+        "--source-refresh-targets-sha256",
+        default="",
+        help="Exact SHA-256 of the reviewed source-refresh target artifact",
+    )
+    parser.add_argument(
         "--raw-store-uri",
         default="",
         help="Required in native mode; defaults to FOTMOB_RAW_STORE_URI",
@@ -1049,6 +1216,54 @@ def _validate_args(parser: argparse.ArgumentParser, args) -> dict[str, Any]:
         parser.error("--next-build-id contains unsupported characters")
     if args.workers > 16:
         parser.error("--workers must be <= 16")
+    try:
+        source_refresh = _load_source_refresh_contract(args)
+    except ValueError as exc:
+        parser.error(f"invalid FotMob source-refresh profile: {exc}")
+    if source_refresh is not None:
+        from scrapers.fotmob.source_refresh import (
+            PLAYER_SOURCE_REFRESH_MAX_DIRECT_MIB,
+            PLAYER_SOURCE_REFRESH_MAX_REQUESTS,
+        )
+
+        literal_entities = frozenset(
+            item.strip().casefold()
+            for item in str(args.entities or "").split(",")
+            if item.strip()
+        )
+        violations = []
+        if args.mode != "backfill":
+            violations.append("mode must be backfill")
+        if _parse_scopes(args.scope):
+            violations.append("exact season scope must be empty")
+        if literal_entities != frozenset({"players"}):
+            violations.append("entities must be exactly players")
+        if any(
+            value != 0
+            for value in (
+                args.competition_limit,
+                args.season_limit,
+                args.match_limit,
+                args.team_limit,
+                args.player_limit,
+            )
+        ):
+            violations.append("all planner limits must be zero")
+        if args.next_build_id:
+            violations.append("Next build override must be empty")
+        if args.max_requests != PLAYER_SOURCE_REFRESH_MAX_REQUESTS:
+            violations.append("request budget")
+        if args.max_direct_mib != PLAYER_SOURCE_REFRESH_MAX_DIRECT_MIB:
+            violations.append("direct-byte budget")
+        if args.max_attempts != 4:
+            violations.append("max attempts")
+        if args.requests_per_minute != 30:
+            violations.append("request rate")
+        if violations:
+            parser.error(
+                "invalid FotMob source-refresh execution: " + ", ".join(violations)
+            )
+    args.source_refresh_contract = source_refresh
     daily_contract_fields = (
         args.daily_contract,
         args.competition_scope_file,

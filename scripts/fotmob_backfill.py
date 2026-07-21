@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 sys.dont_write_bytecode = True
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 try:  # package import in tests / ``python -m``
     from scripts import fotmob_runtime as runtime_binding
@@ -40,7 +41,19 @@ try:  # package import in tests / ``python -m``
         load_scopes,
         validate_approved_scope_contract,
     )
+    from scrapers.fotmob.source_refresh import (
+        PLAYER_SOURCE_REFRESH_ARTIFACT,
+        PLAYER_SOURCE_REFRESH_MAX_DIRECT_MIB,
+        PLAYER_SOURCE_REFRESH_MAX_REQUESTS,
+        PLAYER_SOURCE_REFRESH_PROFILE,
+        PLAYER_SOURCE_REFRESH_SHA256,
+        PLAYER_SOURCE_REFRESH_TARGET_COUNT,
+        PlayerSourceRefreshContractError,
+        load_player_source_refresh_contract,
+    )
 except ModuleNotFoundError:  # direct ``python scripts/fotmob_backfill.py``
+    if str(REPOSITORY_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPOSITORY_ROOT))
     import fotmob_runtime as runtime_binding
     from fotmob_acceptance import (
         APPROVED_SCOPE_ARTIFACT,
@@ -49,6 +62,16 @@ except ModuleNotFoundError:  # direct ``python scripts/fotmob_backfill.py``
         REQUIRED_SCOPE_ENTITIES,
         load_scopes,
         validate_approved_scope_contract,
+    )
+    from scrapers.fotmob.source_refresh import (
+        PLAYER_SOURCE_REFRESH_ARTIFACT,
+        PLAYER_SOURCE_REFRESH_MAX_DIRECT_MIB,
+        PLAYER_SOURCE_REFRESH_MAX_REQUESTS,
+        PLAYER_SOURCE_REFRESH_PROFILE,
+        PLAYER_SOURCE_REFRESH_SHA256,
+        PLAYER_SOURCE_REFRESH_TARGET_COUNT,
+        PlayerSourceRefreshContractError,
+        load_player_source_refresh_contract,
     )
 
 
@@ -98,9 +121,7 @@ def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
             os.fsync(stream.fileno())
             temporary = Path(stream.name)
         temporary.replace(path)
-        directory_fd = os.open(
-            path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-        )
+        directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
         try:
             os.fsync(directory_fd)
         finally:
@@ -288,6 +309,34 @@ def _load_scope_contract(path: Path, reviewed_sha256: str) -> dict[str, Any]:
     }
 
 
+def _load_source_refresh_contract(
+    args: argparse.Namespace,
+) -> dict[str, Any] | None:
+    """Admit only the fixed seven-player artifact; no CLI target list exists."""
+
+    profile = str(getattr(args, "source_refresh_profile", "") or "").strip()
+    supplied_sha = (
+        str(getattr(args, "source_refresh_targets_sha256", "") or "").strip().casefold()
+    )
+    if not profile and not supplied_sha:
+        setattr(args, "_source_refresh_contract", None)
+        return None
+    if profile != PLAYER_SOURCE_REFRESH_PROFILE:
+        raise BackfillError("unknown --source-refresh-profile")
+    if supplied_sha != PLAYER_SOURCE_REFRESH_SHA256:
+        raise BackfillError(
+            "--source-refresh-targets-sha256 differs from reviewed artifact"
+        )
+    try:
+        contract = load_player_source_refresh_contract(
+            REPOSITORY_ROOT / PLAYER_SOURCE_REFRESH_ARTIFACT
+        )
+    except PlayerSourceRefreshContractError as exc:
+        raise BackfillError(str(exc)) from exc
+    setattr(args, "_source_refresh_contract", contract)
+    return contract
+
+
 def inspect_writer_state(
     args: argparse.Namespace,
     *,
@@ -337,7 +386,9 @@ def _require_writers_stopped(state: Mapping[str, Any]) -> None:
     if unpaused:
         raise BackfillError(f"FotMob DAGs are not all paused: {unpaused!r}")
     if state.get("active_runs"):
-        raise BackfillError(f"FotMob DAGs still have active runs: {state['active_runs']!r}")
+        raise BackfillError(
+            f"FotMob DAGs still have active runs: {state['active_runs']!r}"
+        )
 
 
 def _pause_all(
@@ -392,9 +443,9 @@ def _publication_envelope(
     )
     payload = _container_python_json(args, code=code, marker=marker, run=run)
     binding = payload.get("binding") if isinstance(payload, Mapping) else None
-    generation_id = str(payload.get("generation_id", "")) if isinstance(
-        payload, Mapping
-    ) else ""
+    generation_id = (
+        str(payload.get("generation_id", "")) if isinstance(payload, Mapping) else ""
+    )
     if (
         not isinstance(binding, Mapping)
         or binding.get("schema") != "fotmob-publication-v1"
@@ -598,8 +649,91 @@ def _validation_summary(
     mode: str,
     generation_id: str,
     scope_contract: Mapping[str, Any],
+    source_refresh_contract: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     selection = payload.get("selection")
+    if source_refresh_contract is not None:
+        budget = payload.get("budget")
+        transport = payload.get("transport")
+        expected_source = {
+            key: source_refresh_contract[key]
+            for key in (
+                "profile",
+                "artifact",
+                "sha256",
+                "target_count",
+                "targets",
+                "plan_signature",
+            )
+        }
+        outcomes = (
+            selection.get("target_outcomes") if isinstance(selection, Mapping) else None
+        )
+        valid_outcomes = (
+            isinstance(outcomes, list)
+            and len(outcomes) == PLAYER_SOURCE_REFRESH_TARGET_COUNT
+            and all(
+                isinstance(item, Mapping)
+                and set(item)
+                == {
+                    "competition_id",
+                    "source_season_key",
+                    "team_id",
+                    "player_id",
+                    "status",
+                }
+                and item.get("status") in {"success", "not_available"}
+                for item in outcomes
+            )
+        )
+        if valid_outcomes:
+            observed_targets = [
+                {key: item[key] for key in source_refresh_contract["targets"][0]}
+                for item in outcomes
+            ]
+            valid_outcomes = observed_targets == source_refresh_contract["targets"]
+        if (
+            payload.get("status") != "success"
+            or payload.get("run_id") != generation_id
+            or payload.get("mode") != "backfill"
+            or mode != "backfill"
+            or not isinstance(selection, Mapping)
+            or selection.get("entities") != ["players"]
+            or selection.get("explicit_scope_count") != 0
+            or selection.get("explicit_scope_sha256") != hashlib.sha256(b"").hexdigest()
+            or selection.get("competition_limit") != 0
+            or selection.get("season_limit") != 0
+            or selection.get("profile") != PLAYER_SOURCE_REFRESH_PROFILE
+            or selection.get("source_refresh") != expected_source
+            or selection.get("scope_plan_signature")
+            != source_refresh_contract["plan_signature"]
+            or not valid_outcomes
+            or not isinstance(budget, Mapping)
+            or budget.get("max_requests") != PLAYER_SOURCE_REFRESH_MAX_REQUESTS
+            or int(budget.get("requests") or 0) > PLAYER_SOURCE_REFRESH_MAX_REQUESTS
+            or budget.get("max_direct_bytes")
+            != PLAYER_SOURCE_REFRESH_MAX_DIRECT_MIB * 1024 * 1024
+            or budget.get("max_proxy_bytes") != 0
+            or not isinstance(transport, Mapping)
+            or int(transport.get("proxy_bytes") or 0) != 0
+        ):
+            raise BackfillError(
+                "ingest XCom is not bound to the exact seven-player source refresh"
+            )
+        return {
+            "run_id": generation_id,
+            "mode": mode,
+            "profile": PLAYER_SOURCE_REFRESH_PROFILE,
+            "scope_count": 0,
+            "scope_sha256": hashlib.sha256(b"").hexdigest(),
+            "entities": ["players"],
+            "plan_signature": source_refresh_contract["plan_signature"],
+            "source_refresh": expected_source,
+            "target_outcomes": outcomes,
+            "transport": dict(transport),
+            "budget": dict(budget),
+        }
+
     expected_entities = sorted(ISSUE_930_SCOPE_ENTITIES)
     if (
         payload.get("status") != "success"
@@ -629,9 +763,7 @@ def _validation_summary(
     }
 
 
-def _run_ids(
-    publication: Mapping[str, Any], mode: str, attempt: int
-) -> dict[str, str]:
+def _run_ids(publication: Mapping[str, Any], mode: str, attempt: int) -> dict[str, str]:
     compact = str(publication["generation_id"]).replace("-", "")
     return {
         "ingest_dag_id": INGEST_DAG_ID,
@@ -650,10 +782,11 @@ def _base_report(
     scope_contract: Mapping[str, Any],
 ) -> dict[str, Any]:
     context = _deployment_context(args)
+    source_refresh = getattr(args, "_source_refresh_contract", None)
     bounded_scope = {
         key: scope_contract[key] for key in ("name", "artifact", "sha256", "count")
     }
-    return {
+    report = {
         "schema_version": SCHEMA_VERSION,
         "generated_at": _now(),
         "passed": False,
@@ -667,7 +800,11 @@ def _base_report(
         "deployment_id": context["deployment_id"],
         "git_sha": context["git_sha"],
         "scope": bounded_scope,
-        "entities": list(ISSUE_930_SCOPE_ENTITIES),
+        "entities": (
+            ["players"]
+            if isinstance(source_refresh, Mapping)
+            else list(ISSUE_930_SCOPE_ENTITIES)
+        ),
         "publication": dict(publication),
         "runs": _run_ids(publication, mode, int(args.publication_attempt)),
         "limits": {
@@ -675,12 +812,31 @@ def _base_report(
             "max_direct_mib": args.max_direct_mib,
             "competition_limit": 0,
             "season_limit": 0,
+            "executed_scope_count": (
+                0 if isinstance(source_refresh, Mapping) else scope_contract["count"]
+            ),
         },
         "publication_action": "abandon_unclaimed_candidate",
     }
+    if isinstance(source_refresh, Mapping):
+        report["profile"] = source_refresh["profile"]
+        report["source_refresh"] = {
+            key: source_refresh[key]
+            for key in (
+                "profile",
+                "artifact",
+                "sha256",
+                "target_count",
+                "targets",
+                "plan_signature",
+            )
+        }
+    return report
 
 
-def _write_phase(report: dict[str, Any], output: Path, phase: str, **values: Any) -> None:
+def _write_phase(
+    report: dict[str, Any], output: Path, phase: str, **values: Any
+) -> None:
     report.update({"generated_at": _now(), "phase": phase, **values})
     _atomic_json(output, report)
 
@@ -795,6 +951,7 @@ def _resolve_quiet_generation(
         mode=report["mode"],
         generation_id=str(publication["generation_id"]),
         scope_contract=scope_contract,
+        source_refresh_contract=getattr(args, "_source_refresh_contract", None),
     )
     phase = str(state.get("phase") or "").casefold()
     if phase == "ready":
@@ -868,12 +1025,20 @@ def run_backfill(
         raise BackfillError("--publication-attempt must be a positive integer")
     if args.max_requests <= 0 or args.max_direct_mib <= 0:
         raise BackfillError("request and direct-byte limits must be positive")
+    source_refresh = _load_source_refresh_contract(args)
+    if source_refresh is not None and (
+        mode != "backfill"
+        or args.max_requests != PLAYER_SOURCE_REFRESH_MAX_REQUESTS
+        or args.max_direct_mib != PLAYER_SOURCE_REFRESH_MAX_DIRECT_MIB
+    ):
+        raise BackfillError(
+            "source refresh requires backfill mode and its exact reviewed budgets"
+        )
     expected_sha = _validate_sha(args.expected_git_sha)
+    scope_contract = _load_scope_contract(args.scopes, args.scope_sha256)
     context = _deployment_context(args)
     if context.get("kept_paused") is not True or context["git_sha"] != expected_sha:
         raise BackfillError("run requires the exact admitted --keep-paused deployment")
-    scope_contract = _load_scope_contract(args.scopes, args.scope_sha256)
-
     validate_live_deployment(args, run=run)
     initial_writers = inspect_writer_state(args, run=run)
     _require_writers_stopped(initial_writers)
@@ -918,12 +1083,36 @@ def run_backfill(
         conf = {
             "fotmob_publication": publication,
             "mode": mode,
-            "scope": ",".join(scope_contract["identities"]),
-            "entities": ",".join(ISSUE_930_SCOPE_ENTITIES),
+            "scope": (
+                ""
+                if source_refresh is not None
+                else ",".join(scope_contract["identities"])
+            ),
+            "entities": (
+                "players"
+                if source_refresh is not None
+                else ",".join(ISSUE_930_SCOPE_ENTITIES)
+            ),
             "max_requests": args.max_requests,
             "max_direct_mib": args.max_direct_mib,
+            "max_proxy_mib": 0,
             "competition_limit": 0,
             "season_limit": 0,
+            "match_limit": 0,
+            "team_limit": 0,
+            "player_limit": 0,
+            "requests_per_minute": 30,
+            "max_attempts": 4,
+            "next_build_id": "",
+            "source_refresh_profile": (
+                source_refresh["profile"] if source_refresh is not None else ""
+            ),
+            "source_refresh_targets_sha256": (
+                source_refresh["sha256"] if source_refresh is not None else ""
+            ),
+            "source_refresh_target_count": (
+                source_refresh["target_count"] if source_refresh is not None else 0
+            ),
         }
         _write_phase(report, args.output, "trigger_intent", trigger_conf=conf)
         _airflow(
@@ -1035,6 +1224,27 @@ def _load_recovery_report(
     except (OSError, json.JSONDecodeError) as exc:
         raise BackfillError(f"invalid recovery report: {exc}") from exc
     context = _deployment_context(args)
+    source_refresh = getattr(args, "_source_refresh_contract", None)
+    expected_entities = (
+        ["players"]
+        if isinstance(source_refresh, Mapping)
+        else list(ISSUE_930_SCOPE_ENTITIES)
+    )
+    expected_source = (
+        {
+            key: source_refresh[key]
+            for key in (
+                "profile",
+                "artifact",
+                "sha256",
+                "target_count",
+                "targets",
+                "plan_signature",
+            )
+        }
+        if isinstance(source_refresh, Mapping)
+        else None
+    )
     if (
         not isinstance(report, dict)
         or report.get("schema_version") != SCHEMA_VERSION
@@ -1044,12 +1254,17 @@ def _load_recovery_report(
         or report.get("git_sha") != context["git_sha"]
         or report.get("mode") not in MODES
         or report.get("publication_attempt") != int(args.publication_attempt)
-        or report.get("entities") != list(ISSUE_930_SCOPE_ENTITIES)
+        or report.get("entities") != expected_entities
+        or report.get("profile")
+        != (
+            PLAYER_SOURCE_REFRESH_PROFILE
+            if isinstance(source_refresh, Mapping)
+            else None
+        )
+        or report.get("source_refresh") != expected_source
+        or (isinstance(source_refresh, Mapping) and report.get("mode") != "backfill")
         or report.get("scope")
-        != {
-            key: scope_contract[key]
-            for key in ("name", "artifact", "sha256", "count")
-        }
+        != {key: scope_contract[key] for key in ("name", "artifact", "sha256", "count")}
     ):
         raise BackfillError("recovery report stack or scope identity differs")
     publication = _publication_envelope(args, report["mode"], run=run)
@@ -1066,19 +1281,24 @@ def recover_backfill(
     run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> dict[str, Any]:
     if not args.execute or args.confirm != CONFIRM_RECOVER:
-        raise BackfillError(
-            f"recover requires --execute --confirm {CONFIRM_RECOVER}"
-        )
+        raise BackfillError(f"recover requires --execute --confirm {CONFIRM_RECOVER}")
+    source_refresh = _load_source_refresh_contract(args)
+    if source_refresh is not None and (
+        getattr(args, "mode", None) not in {None, "backfill"}
+        or args.max_requests != PLAYER_SOURCE_REFRESH_MAX_REQUESTS
+        or args.max_direct_mib != PLAYER_SOURCE_REFRESH_MAX_DIRECT_MIB
+    ):
+        raise BackfillError("source-refresh recovery mode or budgets differ")
     expected_sha = _validate_sha(args.expected_git_sha)
     context = _deployment_context(args)
     if context.get("kept_paused") is not True or context["git_sha"] != expected_sha:
-        raise BackfillError("recover requires the exact admitted --keep-paused deployment")
+        raise BackfillError(
+            "recover requires the exact admitted --keep-paused deployment"
+        )
     if int(args.publication_attempt) <= 0:
         raise BackfillError("--publication-attempt must be a positive integer")
     scope_contract = _load_scope_contract(args.scopes, args.scope_sha256)
-    report, publication = _load_recovery_report(
-        args, scope_contract, run=run
-    )
+    report, publication = _load_recovery_report(args, scope_contract, run=run)
     report = {**report, "command": "recover", "passed": False}
     validate_live_deployment(args, run=run)
     try:
@@ -1165,6 +1385,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--scopes", type=Path, default=APPROVED_SCOPE_ARTIFACT)
     parser.add_argument("--scope-sha256", required=True)
+    parser.add_argument("--source-refresh-profile", default="")
+    parser.add_argument("--source-refresh-targets-sha256", default="")
     parser.add_argument("--expected-git-sha", required=True)
     parser.add_argument("--max-requests", type=int, default=2_000)
     parser.add_argument("--max-direct-mib", type=int, default=256)

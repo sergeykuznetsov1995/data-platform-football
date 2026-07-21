@@ -905,6 +905,37 @@ def test_player_next_snapshot_is_global_and_fresh_entity_is_skipped():
     assert row["snapshot_date"] == "2026-07-11"
 
 
+def test_forced_player_refresh_reobserves_partial_current_run_commits():
+    url10 = "https://www.fotmob.com/_next/data/build-1/players/10.json"
+    url20 = "https://www.fotmob.com/_next/data/build-1/players/20.json"
+    service, transport, _ = _service(
+        {
+            url10: [
+                {"pageProps": {"data": {"id": 10, "name": "Ten"}}},
+                {"pageProps": {"data": {"id": 10, "name": "Ten"}}},
+            ],
+            url20: {"pageProps": {"data": {"id": 20, "name": "Twenty"}}},
+        },
+        mode=RunMode.BACKFILL,
+    )
+    assert service.sync_player_snapshots([10], build_id="build-1").ok
+
+    retried = service.sync_player_snapshots(
+        [10, 20],
+        build_id="build-1",
+        force_refresh=True,
+        capture_terminal_outcomes=True,
+    )
+
+    assert retried.ok and retried.succeeded == 2 and retried.skipped == 0
+    assert retried.metadata["terminal_outcomes"] == [
+        {"player_id": 10, "status": "success"},
+        {"player_id": 20, "status": "success"},
+    ]
+    assert transport.calls[0][0] == url10
+    assert sorted(call[0] for call in transport.calls[1:]) == sorted([url10, url20])
+
+
 def test_backfill_reprocesses_prior_generation_children_for_current_lineage():
     bundle = parse_season_bundle(_league_payload(), ScopeRef(47, "2025/2026"))
     leaderboard_url = "https://data.fotmob.com/stats/47/season/goals.json"
@@ -1227,6 +1258,91 @@ def test_next_build_fetch_is_not_started_without_full_retry_reservation():
     assert document_calls == []
 
 
+def test_rotated_player_build_has_exact_64_request_retry_ceiling():
+    class RotatingBuildTransport:
+        max_attempts = 4
+
+        def __init__(self):
+            self.document_calls = 0
+
+        @staticmethod
+        def _result(url, outcome, *, data=None, body=None, status=200):
+            target = canonicalize_target(url)
+            raw_body = body if body is not None else json.dumps(data).encode()
+            return FetchResult(
+                outcome=outcome,
+                target_key=target.target_key,
+                url=target.canonical_url,
+                http_status=status,
+                json_data=data,
+                body=raw_body,
+                attempts=4,
+                retries=3,
+                cache_hit=False,
+                stale=False,
+                terminal=outcome == FetchOutcome.NOT_AVAILABLE,
+                etag=None,
+                last_modified=None,
+                raw_uri=f"memory://{target.target_key}.json.gz",
+                content_hash=hashlib.sha256(raw_body).hexdigest(),
+                fetched_at="2026-07-21T10:00:00+00:00",
+                encoded_bytes=len(raw_body),
+                decoded_bytes=len(raw_body),
+                direct_bytes=len(raw_body),
+                proxy_bytes=0,
+            )
+
+        def fetch_document(self, url):
+            self.document_calls += 1
+            build = "stale-build" if self.document_calls == 1 else "fresh-build"
+            body = f'{{"buildId":"{build}"}}'.encode()
+            return self._result(
+                url,
+                FetchOutcome.SUCCESS,
+                body=body,
+                data=None,
+            )
+
+        def fetch_json(self, endpoint, params=None):
+            player_id = int(str(endpoint).removesuffix(".json").rsplit("/", 1)[-1])
+            if "/stale-build/" in str(endpoint):
+                return self._result(
+                    endpoint,
+                    FetchOutcome.NOT_AVAILABLE,
+                    data=None,
+                    body=b"not found",
+                    status=404,
+                )
+            return self._result(
+                endpoint,
+                FetchOutcome.SUCCESS,
+                data={
+                    "pageProps": {
+                        "data": {"id": player_id, "name": f"Player {player_id}"}
+                    }
+                },
+            )
+
+    transport = RotatingBuildTransport()
+    service = FotMobIngestService(
+        transport=transport,
+        repository=MemoryFotMobRepository(),
+        mode=RunMode.BACKFILL,
+        budget=TransportBudget(max_requests=64, max_direct_bytes=1_000_000),
+        run_id="source-refresh-rotated-build",
+        max_workers=1,
+    )
+
+    result = service.sync_player_snapshots(range(1, 8), capture_terminal_outcomes=True)
+
+    assert result.ok and result.succeeded == 7 and result.skipped == 0
+    assert transport.document_calls == 2
+    assert service.ledger.requests == 64
+    assert result.metadata["terminal_outcomes"] == [
+        {"player_id": player_id, "status": "success"} for player_id in range(1, 8)
+    ]
+
+
 def test_offline_player_replay_uses_each_manifest_target_without_build_id(tmp_path):
     from scrapers.fotmob.raw_store import FotMobRawStore
     from scrapers.fotmob.repository import LEGACY_PARSER_VERSION
@@ -1275,6 +1391,61 @@ def test_offline_player_replay_uses_each_manifest_target_without_build_id(tmp_pa
     assert replay.run_id == "issue930-v2-replay"
     assert replay.target_key == historical.target_key
     assert replay.parser_version != LEGACY_PARSER_VERSION
+    assert replay.attempts == replay.direct_bytes == replay.proxy_bytes == 0
+    assert replay.cache_hit is True
+
+
+def test_offline_player_replay_migrates_raw_bearing_v1_not_available(tmp_path):
+    from scrapers.fotmob.raw_store import FotMobRawStore
+    from scrapers.fotmob.repository import LEGACY_PARSER_VERSION, PARSER_VERSION
+    from scrapers.fotmob.transport import FotMobTransport
+
+    raw_store = FotMobRawStore.from_uri(tmp_path.as_uri())
+    historical = canonicalize_target(
+        "https://www.fotmob.com/_next/data/historical-build/players/2090857.json"
+    )
+    body = b'{"pageProps":{"data":null,"fallback":{},"translations":{}}}'
+    raw = raw_store.store(
+        historical,
+        body,
+        fetched_at="2026-07-20T10:00:00+00:00",
+    )
+    repository = MemoryFotMobRepository()
+    repository.record(
+        TargetCommit(
+            run_id="production-v1",
+            target_type="player",
+            target_key=historical.target_key,
+            status=ManifestStatus.NOT_AVAILABLE,
+            entity_id="2090857",
+            content_hash=raw.content_hash,
+            raw_uri=raw.raw_uri,
+            parser_version=LEGACY_PARSER_VERSION,
+            fetched_at=datetime(2026, 7, 20, 10, 0),
+            completed_at=datetime(2026, 7, 20, 10, 0),
+            error_code="source_player_no_data",
+        )
+    )
+    service = FotMobIngestService(
+        transport=FotMobTransport(raw_store),
+        repository=repository,
+        mode=RunMode.REPLAY,
+        budget=TransportBudget(max_requests=1, max_direct_bytes=1),
+        run_id="issue930-v2-replay",
+        max_workers=1,
+    )
+
+    result = service.sync_player_snapshots([2090857], capture_terminal_outcomes=True)
+
+    assert result.ok and result.not_available == 1 and result.succeeded == 0
+    assert result.metadata["intentional_not_available"] == 1
+    assert result.metadata["terminal_outcomes"] == [
+        {"player_id": 2090857, "status": "not_available"}
+    ]
+    assert "fotmob_player_snapshots" not in repository.tables
+    replay = repository.commits[-1]
+    assert replay.status == ManifestStatus.NOT_AVAILABLE
+    assert replay.parser_version == PARSER_VERSION
     assert replay.attempts == replay.direct_bytes == replay.proxy_bytes == 0
     assert replay.cache_hit is True
 

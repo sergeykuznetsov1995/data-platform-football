@@ -24,6 +24,15 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
+from scrapers.fotmob.source_refresh import (
+    PLAYER_SOURCE_REFRESH_ARTIFACT,
+    PLAYER_SOURCE_REFRESH_MAX_DIRECT_MIB,
+    PLAYER_SOURCE_REFRESH_MAX_REQUESTS,
+    PLAYER_SOURCE_REFRESH_PROFILE,
+    PLAYER_SOURCE_REFRESH_SHA256,
+    PLAYER_SOURCE_REFRESH_TARGET_COUNT,
+)
+
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +109,42 @@ FOTMOB_DEPLOYMENT_REPORT_PATH_ENV = "FOTMOB_DEPLOYMENT_REPORT_PATH"
 FOTMOB_SHARED_DEPLOYMENT_REPORT_PATH_ENV = "FOTMOB_SHARED_DEPLOYMENT_REPORT_PATH"
 FOTMOB_SHARED_EVIDENCE_ROOT = "/opt/airflow/fotmob-admission"
 FOTMOB_ISOLATED_DAILY_DAG_ID = "dag_trigger_fotmob_daily"
+FOTMOB_SHARED_CONSUMER_DAG_ID = "dag_sofascore_pipeline"
 FOTMOB_SHARED_MASTER_DAG_ID = "dag_master_pipeline"
+FOTMOB_PENDING_BOUNDARY_NAMES = (
+    "shared_initial",
+    "shared_final",
+    "isolated_initial",
+    "isolated_final",
+    "shared_commit",
+    "isolated_commit",
+)
+FOTMOB_SCHEDULE_BOUNDARY_FIELDS = frozenset(
+    {"logical_date", "data_interval_start", "data_interval_end", "run_after"}
+)
+FOTMOB_PENDING_PROOF_FIELDS = frozenset(
+    {
+        "shared_dag_id",
+        "isolated_dag_id",
+        *FOTMOB_PENDING_BOUNDARY_NAMES,
+        "exact_match",
+    }
+)
+FOTMOB_PENDING_ACTIVATION_FIELDS = frozenset(
+    {"status", "producer_dag_id", "consumer_dag_id", "resume_required"}
+)
+FOTMOB_PENDING_SAFETY_FIELDS = frozenset(
+    {
+        "checked_at",
+        "next_boundary",
+        "remaining_seconds",
+        "required_seconds",
+        "timeout_seconds",
+        "passed",
+    }
+)
+FOTMOB_MIN_ACTIVATION_SAFETY_SECONDS = 15 * 60
+FOTMOB_ACTIVATION_TIMEOUT_MARGIN_SECONDS = 5 * 60
 FOTMOB_EXPECTED_ISOLATED_DAGS = frozenset(
     {
         "dag_ingest_fotmob",
@@ -131,6 +175,7 @@ FOTMOB_ISOLATED_RUNTIME_SUFFIXES = (
 FOTMOB_ISOLATED_REQUIRED_RUNTIME_PATHS = frozenset(
     {
         "configs/fotmob/competitions.json",
+        PLAYER_SOURCE_REFRESH_ARTIFACT,
         "configs/fotmob/issue-930-scopes.txt",
         "dags/.airflowignore",
         "dags/dag_ingest_fotmob.py",
@@ -140,11 +185,13 @@ FOTMOB_ISOLATED_REQUIRED_RUNTIME_PATHS = frozenset(
         "dags/utils/fotmob_publication.py",
         "scrapers/fotmob/repository.py",
         "scrapers/fotmob/service.py",
+        "scrapers/fotmob/source_refresh.py",
     }
 )
 FOTMOB_SHARED_REQUIRED_RUNTIME_PATHS = frozenset(
     {
         "configs/fotmob/competitions.json",
+        PLAYER_SOURCE_REFRESH_ARTIFACT,
         "configs/fotmob/issue-930-scopes.txt",
         "dags/.airflowignore",
         "dags/dag_ingest_fotmob.py",
@@ -173,6 +220,7 @@ FOTMOB_SHARED_REQUIRED_RUNTIME_PATHS = frozenset(
         "scrapers/fotmob/raw_store.py",
         "scrapers/fotmob/repository.py",
         "scrapers/fotmob/service.py",
+        "scrapers/fotmob/source_refresh.py",
         "scrapers/fotmob/transport.py",
     }
 )
@@ -321,6 +369,16 @@ def isolated_runtime_manifest(
         raise _airflow_exception(
             f"FotMob isolated runtime misses required files: {sorted(missing)!r}"
         )
+    if manifest.get("configs/fotmob/issue-930-scopes.txt") != (
+        FOTMOB_DAILY_SCOPE_SHA256
+    ):
+        raise _airflow_exception(
+            "FotMob isolated runtime has an unapproved issue-930 scope artifact"
+        )
+    if manifest.get(PLAYER_SOURCE_REFRESH_ARTIFACT) != (PLAYER_SOURCE_REFRESH_SHA256):
+        raise _airflow_exception(
+            "FotMob isolated runtime has an unapproved player source-refresh artifact"
+        )
     return dict(sorted(manifest.items()))
 
 
@@ -362,6 +420,10 @@ def shared_runtime_manifest(
         raise _airflow_exception(
             "FotMob shared runtime has an unapproved issue-930 scope artifact"
         )
+    if manifest.get(PLAYER_SOURCE_REFRESH_ARTIFACT) != (PLAYER_SOURCE_REFRESH_SHA256):
+        raise _airflow_exception(
+            "FotMob shared runtime has an unapproved player source-refresh artifact"
+        )
     return dict(sorted(manifest.items()))
 
 
@@ -388,6 +450,18 @@ def _issue930_writer_identity_from_context(
         "entities": conf.get("entities"),
         "competition_limit": conf.get("competition_limit"),
         "season_limit": conf.get("season_limit"),
+        "match_limit": conf.get("match_limit"),
+        "team_limit": conf.get("team_limit"),
+        "player_limit": conf.get("player_limit"),
+        "max_requests": conf.get("max_requests"),
+        "max_direct_mib": conf.get("max_direct_mib"),
+        "max_proxy_mib": conf.get("max_proxy_mib"),
+        "requests_per_minute": conf.get("requests_per_minute"),
+        "max_attempts": conf.get("max_attempts"),
+        "next_build_id": conf.get("next_build_id"),
+        "source_refresh_profile": conf.get("source_refresh_profile"),
+        "source_refresh_targets_sha256": conf.get("source_refresh_targets_sha256"),
+        "source_refresh_target_count": conf.get("source_refresh_target_count"),
         "publication": conf.get(FOTMOB_PUBLICATION_CONF_KEY),
     }
 
@@ -459,6 +533,7 @@ def _validate_issue930_kept_paused_writer(
     component = str(identity.get("component") or "")
     dag_id = str(identity.get("dag_id") or "")
     run_id = str(identity.get("run_id") or "")
+    source_fields_present = False
     if component == "airflow_task" and dag_id == "dag_transform_fotmob_silver":
         if run_id != f"fotmob_silver__{generation_id}":
             raise _airflow_exception("FotMob kept-paused Silver run identity differs")
@@ -471,7 +546,7 @@ def _validate_issue930_kept_paused_writer(
             raise _airflow_exception("FotMob kept-paused ingest run identity differs")
         raw_scopes = identity.get("scopes")
         raw_scope_items = (
-            [item.strip() for item in raw_scopes.split(",")]
+            [item.strip() for item in raw_scopes.split(",") if item.strip()]
             if isinstance(raw_scopes, str)
             else list(raw_scopes or ())
         )
@@ -496,7 +571,62 @@ def _validate_issue930_kept_paused_writer(
             season_limit = int(identity.get("season_limit", -1))
         except (TypeError, ValueError):
             competition_limit = season_limit = -1
-        if (
+        source_profile = str(identity.get("source_refresh_profile") or "").strip()
+        source_sha = (
+            str(identity.get("source_refresh_targets_sha256") or "").strip().casefold()
+        )
+        raw_source_count = identity.get("source_refresh_target_count")
+        source_fields_present = bool(
+            source_profile or source_sha
+        ) or raw_source_count not in {
+            None,
+            "",
+            0,
+            "0",
+        }
+        if source_fields_present:
+            try:
+                source_count = int(raw_source_count)
+                match_limit = int(identity.get("match_limit", -1))
+                team_limit = int(identity.get("team_limit", -1))
+                player_limit = int(identity.get("player_limit", -1))
+                max_requests = int(identity.get("max_requests", -1))
+                max_direct_mib = float(identity.get("max_direct_mib", -1))
+                max_proxy_mib = float(identity.get("max_proxy_mib", -1))
+                requests_per_minute = int(identity.get("requests_per_minute", -1))
+                max_attempts = int(identity.get("max_attempts", -1))
+            except (TypeError, ValueError):
+                raise _airflow_exception(
+                    "FotMob kept-paused source-refresh contract differs"
+                )
+            if (
+                mode != "backfill"
+                or scope_items
+                or entities != {"players"}
+                or any(
+                    value != 0
+                    for value in (
+                        competition_limit,
+                        season_limit,
+                        match_limit,
+                        team_limit,
+                        player_limit,
+                    )
+                )
+                or source_profile != PLAYER_SOURCE_REFRESH_PROFILE
+                or source_sha != PLAYER_SOURCE_REFRESH_SHA256
+                or source_count != PLAYER_SOURCE_REFRESH_TARGET_COUNT
+                or max_requests != PLAYER_SOURCE_REFRESH_MAX_REQUESTS
+                or max_direct_mib != PLAYER_SOURCE_REFRESH_MAX_DIRECT_MIB
+                or max_proxy_mib != 0
+                or requests_per_minute != 30
+                or max_attempts != 4
+                or str(identity.get("next_build_id") or "")
+            ):
+                raise _airflow_exception(
+                    "FotMob kept-paused source-refresh contract differs"
+                )
+        elif (
             len(scope_items) != FOTMOB_DAILY_SCOPE_COUNT
             or len(set(scope_items)) != FOTMOB_DAILY_SCOPE_COUNT
             or any(_SCOPE_LINE_RE.fullmatch(str(item)) is None for item in scope_items)
@@ -512,7 +642,186 @@ def _validate_issue930_kept_paused_writer(
         raise _airflow_exception(
             "FotMob kept-paused writer component is not coordinator-owned"
         )
-    return {"mode": mode, "attempt": attempt, "generation_id": generation_id}
+    lifecycle = {"mode": mode, "attempt": attempt, "generation_id": generation_id}
+    if source_fields_present:
+        lifecycle["source_refresh_profile"] = PLAYER_SOURCE_REFRESH_PROFILE
+        lifecycle["source_refresh_targets_sha256"] = PLAYER_SOURCE_REFRESH_SHA256
+        lifecycle["source_refresh_target_count"] = PLAYER_SOURCE_REFRESH_TARGET_COUNT
+    return lifecycle
+
+
+def _validate_pending_consumer_runtime(
+    report: Mapping[str, Any],
+    *,
+    require_scheduled_owner: bool,
+    writer_identity: Mapping[str, Any] | None,
+    context: Mapping[str, Any],
+    runtime_fingerprint_value: str,
+) -> dict[str, Any]:
+    """Admit only the exact scheduled producer while consumer proof is pending."""
+
+    proof = report.get("schedule_boundary")
+    activation = report.get("scheduled_activation")
+    safety = report.get("activation_safety_window")
+    activation_fields = set(activation) if isinstance(activation, Mapping) else set()
+    allowed_activation_fields = {
+        FOTMOB_PENDING_ACTIVATION_FIELDS,
+        FOTMOB_PENDING_ACTIVATION_FIELDS | {"last_error"},
+    }
+    if (
+        not isinstance(proof, Mapping)
+        or set(proof) != FOTMOB_PENDING_PROOF_FIELDS
+        or proof.get("shared_dag_id") != FOTMOB_SHARED_CONSUMER_DAG_ID
+        or proof.get("isolated_dag_id") != FOTMOB_ISOLATED_DAILY_DAG_ID
+        or proof.get("exact_match") is not True
+        or not isinstance(activation, Mapping)
+        or frozenset(activation_fields) not in allowed_activation_fields
+        or activation.get("status") != "pending"
+        or activation.get("producer_dag_id") != FOTMOB_ISOLATED_DAILY_DAG_ID
+        or activation.get("consumer_dag_id") != FOTMOB_SHARED_CONSUMER_DAG_ID
+        or activation.get("resume_required") is not True
+        or (
+            "last_error" in activation
+            and (
+                not isinstance(activation.get("last_error"), str)
+                or not activation["last_error"].strip()
+            )
+        )
+        or not isinstance(safety, Mapping)
+        or set(safety) != FOTMOB_PENDING_SAFETY_FIELDS
+        or safety.get("passed") is not True
+        or type(safety.get("timeout_seconds")) is not int
+        or type(safety.get("remaining_seconds")) is not int
+        or type(safety.get("required_seconds")) is not int
+        or safety["timeout_seconds"] < 1
+        or safety["required_seconds"]
+        < max(
+            FOTMOB_MIN_ACTIVATION_SAFETY_SECONDS,
+            safety["timeout_seconds"] + FOTMOB_ACTIVATION_TIMEOUT_MARGIN_SECONDS,
+        )
+        or safety["remaining_seconds"] < safety["required_seconds"]
+    ):
+        raise _airflow_exception("FotMob pending consumer admission is incomplete")
+    try:
+        checked_at = _canonical_instant(safety.get("checked_at"), field="checked_at")
+        next_boundary = _canonical_instant(
+            safety.get("next_boundary"), field="next_boundary"
+        )
+    except Exception as exc:
+        raise _airflow_exception("FotMob pending safety window is invalid") from exc
+    if datetime.fromisoformat(next_boundary) <= datetime.fromisoformat(checked_at):
+        raise _airflow_exception("FotMob pending safety window is invalid")
+    normalized: dict[str, dict[str, str]] = {}
+    for name in FOTMOB_PENDING_BOUNDARY_NAMES:
+        raw = proof.get(name)
+        if not isinstance(raw, Mapping) or set(raw) != FOTMOB_SCHEDULE_BOUNDARY_FIELDS:
+            raise _airflow_exception("FotMob pending schedule boundary is incomplete")
+        try:
+            start = _canonical_instant(
+                raw.get("data_interval_start"), field="data_interval_start"
+            )
+            end = _canonical_instant(
+                raw.get("data_interval_end"), field="data_interval_end"
+            )
+            logical_date = _canonical_instant(
+                raw.get("logical_date"), field="logical_date"
+            )
+            run_after = _canonical_instant(raw.get("run_after"), field="run_after")
+        except Exception as exc:
+            raise _airflow_exception(
+                "FotMob pending schedule boundary is invalid"
+            ) from exc
+        if logical_date != start or run_after != end or end <= start:
+            raise _airflow_exception("FotMob pending schedule boundary is invalid")
+        normalized[name] = {
+            "logical_date": logical_date,
+            "data_interval_start": start,
+            "data_interval_end": end,
+            "run_after": run_after,
+        }
+    expected = normalized["isolated_commit"]
+    if any(boundary != expected for boundary in normalized.values()):
+        raise _airflow_exception("FotMob pending producer/consumer intervals differ")
+
+    if require_scheduled_owner:
+        from airflow.models import DagRun
+        from airflow.utils.types import DagRunType
+
+        start, end = _context_interval(context)
+        observed = make_publication_binding(
+            owner="isolated",
+            data_interval_start=start,
+            data_interval_end=end,
+            fingerprint=runtime_fingerprint_value,
+        )
+        dag_run = context.get("dag_run")
+        run_id = str(getattr(dag_run, "run_id", "") or "")
+        logical_datetime = datetime.fromisoformat(
+            expected["logical_date"].replace("Z", "+00:00")
+        )
+        expected_run_id = DagRun.generate_run_id(DagRunType.SCHEDULED, logical_datetime)
+        if (
+            run_id != expected_run_id
+            or observed["data_interval_start"] != expected["data_interval_start"]
+            or observed["data_interval_end"] != expected["data_interval_end"]
+        ):
+            raise _airflow_exception("FotMob pending producer interval differs")
+        generation_id = make_generation_id(observed)
+    else:
+        identity = writer_identity or _issue930_writer_identity_from_context(context)
+        raw_publication = identity.get("publication")
+        raw_binding = (
+            raw_publication.get("binding")
+            if isinstance(raw_publication, Mapping)
+            else None
+        )
+        if not isinstance(raw_binding, Mapping):
+            raise _airflow_exception("FotMob pending writer publication is missing")
+        binding = make_publication_binding(
+            owner=raw_binding.get("owner"),
+            data_interval_start=raw_binding.get("data_interval_start"),
+            data_interval_end=raw_binding.get("data_interval_end"),
+            fingerprint=raw_binding.get("runtime_fingerprint"),
+        )
+        try:
+            generation_id = str(uuid.UUID(str(raw_publication.get("generation_id"))))
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise _airflow_exception(
+                "FotMob pending writer publication is invalid"
+            ) from exc
+        if (
+            dict(raw_binding) != binding
+            or binding["runtime_fingerprint"] != runtime_fingerprint_value
+            or generation_id != make_generation_id(binding)
+        ):
+            raise _airflow_exception("FotMob pending writer publication differs")
+        if (
+            binding["owner"] != "isolated"
+            or binding["data_interval_start"] != expected["data_interval_start"]
+            or binding["data_interval_end"] != expected["data_interval_end"]
+        ):
+            raise _airflow_exception("FotMob pending writer interval differs")
+        component = str(identity.get("component") or "")
+        dag_id = str(identity.get("dag_id") or "")
+        run_id = str(identity.get("run_id") or "")
+        exact_airflow_run_ids = {
+            "dag_ingest_fotmob": f"fotmob_ingest__{generation_id}",
+            "dag_transform_fotmob_silver": f"fotmob_silver__{generation_id}",
+        }
+        if component == "bronze_runner":
+            if str(identity.get("mode") or "").strip().casefold() != "daily":
+                raise _airflow_exception("FotMob pending Bronze writer is not daily")
+        elif (
+            component != "airflow_task"
+            or dag_id not in exact_airflow_run_ids
+            or run_id != exact_airflow_run_ids[dag_id]
+        ):
+            raise _airflow_exception("FotMob pending writer identity differs")
+    return {
+        "generation_id": generation_id,
+        "data_interval_start": expected["data_interval_start"],
+        "data_interval_end": expected["data_interval_end"],
+    }
 
 
 def attest_fotmob_isolated_runtime(
@@ -568,17 +877,27 @@ def attest_fotmob_isolated_runtime(
         and report.get("activation_state") == "active"
         and report.get("kept_paused") is False
         and report_paused == []
-        and set(report_unpaused) == FOTMOB_EXPECTED_ISOLATED_DAGS
+        and report_unpaused == sorted(FOTMOB_EXPECTED_ISOLATED_DAGS)
+    )
+    pending_consumer_admission = (
+        common_admission
+        and report.get("activation_state") == "pending_consumer"
+        and report.get("kept_paused") is False
+        and report_paused == [FOTMOB_ISOLATED_DAILY_DAG_ID]
+        and report_unpaused
+        == sorted(FOTMOB_EXPECTED_ISOLATED_DAGS - {FOTMOB_ISOLATED_DAILY_DAG_ID})
     )
     kept_paused_admission = (
         common_admission
         and report.get("activation_state") == "kept_paused"
         and report.get("kept_paused") is True
-        and set(report_paused) == FOTMOB_EXPECTED_ISOLATED_DAGS
+        and report_paused == sorted(FOTMOB_EXPECTED_ISOLATED_DAGS)
         and report_unpaused == []
     )
-    if not active_admission and not (
-        kept_paused_admission and allow_kept_paused_writer
+    if (
+        not active_admission
+        and not pending_consumer_admission
+        and not (kept_paused_admission and allow_kept_paused_writer)
     ):
         raise _airflow_exception(
             "FotMob scheduled runtime has no completed active deployment admission"
@@ -619,7 +938,15 @@ def attest_fotmob_isolated_runtime(
                 "FotMob daily producer requires an exact scheduled DagRun"
             )
     lifecycle = None
-    if kept_paused_admission:
+    if pending_consumer_admission:
+        lifecycle = _validate_pending_consumer_runtime(
+            report,
+            require_scheduled_owner=require_scheduled_owner,
+            writer_identity=writer_identity,
+            context=context,
+            runtime_fingerprint_value=git_sha,
+        )
+    elif kept_paused_admission:
         lifecycle = _validate_issue930_kept_paused_writer(
             report,
             writer_identity or _issue930_writer_identity_from_context(context),
@@ -647,7 +974,9 @@ def attest_fotmob_isolated_runtime(
         "runtime_manifest_sha256": _runtime_manifest_digest(observed_manifest),
     }
     if lifecycle is not None:
-        result["issue930_lifecycle"] = lifecycle
+        result[
+            "pending_consumer" if pending_consumer_admission else "issue930_lifecycle"
+        ] = lifecycle
     return result
 
 

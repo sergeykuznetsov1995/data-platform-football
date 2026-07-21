@@ -363,6 +363,26 @@ def test_memory_raw_target_prefers_v2_and_tombstone_blocks_older_payload():
     assert repository.latest_entity_raw_target("player", 10) is None
 
 
+def test_memory_raw_bearing_not_available_is_replayable():
+    repository = MemoryFotMobRepository()
+    repository.record(
+        _commit(
+            run_id="legacy-null-player",
+            target_type="player",
+            target_key="d" * 64,
+            entity_id="10",
+            parser_version=LEGACY_PARSER_VERSION,
+            status=ManifestStatus.NOT_AVAILABLE,
+        )
+    )
+
+    raw = repository.latest_entity_raw_target("player", 10)
+
+    assert raw is not None
+    assert raw["target_key"] == "d" * 64
+    assert raw["status"] == ManifestStatus.NOT_AVAILABLE.value
+
+
 def test_current_view_fails_closed_when_any_natural_key_column_is_missing():
     writer = ViewWriter(
         [
@@ -1040,6 +1060,30 @@ def test_preload_keeps_v1_raw_target_as_offline_replay_fallback():
     assert raw is not None
     assert raw["target_key"] == target_key
     assert raw["parser_version"] == LEGACY_PARSER_VERSION
+
+
+def test_preload_keeps_v1_raw_bearing_not_available_for_offline_replay():
+    target_key = "e" * 64
+    writer = PreloadWriter(
+        [
+            _manifest_row(
+                target_key,
+                "fm1-null-player",
+                target_type="player",
+                entity_id="2090857",
+                parser_version=LEGACY_PARSER_VERSION,
+                status=ManifestStatus.NOT_AVAILABLE.value,
+            )
+        ]
+    )
+    repository = FotMobRepository(writer=writer)
+
+    repository.preload_manifest_index()
+
+    raw = repository.latest_entity_raw_target("player", 2090857)
+    assert raw is not None
+    assert raw["target_key"] == target_key
+    assert raw["status"] == ManifestStatus.NOT_AVAILABLE.value
 
 
 def test_preload_builds_exact_run_index_without_per_target_queries():

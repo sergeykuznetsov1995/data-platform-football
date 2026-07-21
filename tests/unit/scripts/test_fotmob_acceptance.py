@@ -15,6 +15,7 @@ from scrapers.fotmob.repository import (
 )
 from tests.unit.scripts.fotmob_runtime_fixture import (
     isolated_runtime_proof,
+    schedule_boundary_proof,
     shared_handoff_proof,
 )
 
@@ -104,6 +105,7 @@ def runtime_options(tmp_path):
                 "shared_handoff_final": shared_handoff_proof(
                     shared_control, release_root=tmp_path
                 ),
+                "schedule_boundary": schedule_boundary_proof(),
             }
         )
     )
@@ -601,6 +603,98 @@ def test_runtime_binding_rejects_pending_trigger_activation(tmp_path):
         assert "activation is incomplete" in str(exc)
     else:
         raise AssertionError("pending trigger activation was accepted as complete")
+
+
+def test_runtime_binding_rejects_mismatched_scheduled_consumer_interval(tmp_path):
+    options = runtime_options(tmp_path)
+    deployment_path = Path(options[options.index("--deployment-report") + 1])
+    compose_path = Path(options[options.index("--compose-file") + 1])
+    payload = json.loads(deployment_path.read_text(encoding="utf-8"))
+    payload["schedule_boundary"]["isolated_final"] = {
+        "logical_date": "2026-07-21T14:00:00+00:00",
+        "data_interval_start": "2026-07-21T14:00:00+00:00",
+        "data_interval_end": "2026-07-22T14:00:00+00:00",
+        "run_after": "2026-07-22T14:00:00+00:00",
+    }
+    deployment_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(
+        mod.runtime_binding.RuntimeBindingError,
+        match="next scheduled intervals differ",
+    ):
+        mod.runtime_binding.load_deployment_context(
+            deployment_path,
+            project="fotmob-airflow",
+            compose_file=compose_path,
+        )
+
+
+def _active_schedule_report(logical_date: datetime) -> tuple[dict, dict[str, str]]:
+    logical_date = logical_date.astimezone(timezone.utc)
+    interval_end = logical_date + timedelta(days=1)
+    boundary = {
+        "logical_date": logical_date.isoformat(timespec="microseconds"),
+        "data_interval_start": logical_date.isoformat(timespec="microseconds"),
+        "data_interval_end": interval_end.isoformat(timespec="microseconds"),
+        "run_after": interval_end.isoformat(timespec="microseconds"),
+    }
+    run_id = "scheduled__" + logical_date.isoformat()
+    rows = {
+        role: {
+            "dag_id": dag_id,
+            "run_id": run_id,
+            "run_type": "scheduled",
+            "logical_date": boundary["logical_date"],
+            "data_interval_start": boundary["data_interval_start"],
+            "data_interval_end": boundary["data_interval_end"],
+            "state": "queued",
+        }
+        for role, dag_id in {
+            "producer": mod.runtime_binding.ISOLATED_DAILY_DAG_ID,
+            "consumer": mod.runtime_binding.SHARED_CONSUMER_DAG_ID,
+        }.items()
+    }
+    return (
+        {
+            "activation_safety_window": {
+                "checked_at": "2026-07-20T12:00:00+00:00",
+                "next_boundary": "2026-07-20T14:00:00+00:00",
+                "remaining_seconds": 7200,
+                "required_seconds": 900,
+                "timeout_seconds": 300,
+                "passed": True,
+            },
+            "scheduled_activation": {
+                "status": "proved",
+                **rows,
+                "exact_identity_match": True,
+            },
+        },
+        boundary,
+    )
+
+
+@pytest.mark.parametrize("microsecond", (0, 123456))
+def test_active_schedule_proof_accepts_only_airflow_canonical_run_id(microsecond):
+    payload, boundary = _active_schedule_report(
+        datetime(2026, 7, 20, 14, microsecond=microsecond, tzinfo=timezone.utc)
+    )
+
+    mod.runtime_binding._validate_active_schedule_proof(payload, boundary)
+
+
+def test_active_schedule_proof_rejects_equal_but_wrong_scheduled_run_ids():
+    payload, boundary = _active_schedule_report(
+        datetime(2026, 7, 20, 14, tzinfo=timezone.utc)
+    )
+    payload["scheduled_activation"]["producer"]["run_id"] = "scheduled__forged"
+    payload["scheduled_activation"]["consumer"]["run_id"] = "scheduled__forged"
+
+    with pytest.raises(
+        mod.runtime_binding.RuntimeBindingError,
+        match="does not match admitted interval",
+    ):
+        mod.runtime_binding._validate_active_schedule_proof(payload, boundary)
 
 
 def test_lifecycle_report_derives_all_acceptance_lineage(tmp_path):

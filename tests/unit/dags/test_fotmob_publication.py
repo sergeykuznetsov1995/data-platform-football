@@ -8,7 +8,7 @@ import json
 import sys
 from contextlib import contextmanager
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -18,6 +18,13 @@ from utils import fotmob_publication as publication
 
 
 pytestmark = pytest.mark.unit
+DEPLOY_SCRIPT = Path(__file__).resolve().parents[3] / "deploy/fotmob/deploy.py"
+DEPLOY_SPEC = importlib.util.spec_from_file_location(
+    "fotmob_deploy_publication_parity", DEPLOY_SCRIPT
+)
+assert DEPLOY_SPEC is not None and DEPLOY_SPEC.loader is not None
+deploy_validation = importlib.util.module_from_spec(DEPLOY_SPEC)
+DEPLOY_SPEC.loader.exec_module(deploy_validation)
 GIT_SHA = "a" * 40
 OTHER_SHA = "b" * 40
 START = datetime(2026, 7, 20, 14, tzinfo=timezone.utc)
@@ -30,6 +37,15 @@ def _issue_930_scope_file() -> Path:
         / "configs"
         / "fotmob"
         / "issue-930-scopes.txt"
+    )
+
+
+def _issue_930_source_refresh_file() -> Path:
+    return (
+        Path(__file__).resolve().parents[3]
+        / "configs"
+        / "fotmob"
+        / "issue-930-player-source-refresh.json"
     )
 
 
@@ -48,7 +64,12 @@ def _isolated_runtime_evidence(tmp_path: Path):
         )
         path = roots[prefix] / relative_path.removeprefix(prefix + "/")
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(relative_path, encoding="utf-8")
+        if relative_path == "configs/fotmob/issue-930-scopes.txt":
+            path.write_bytes(_issue_930_scope_file().read_bytes())
+        elif relative_path == publication.PLAYER_SOURCE_REFRESH_ARTIFACT:
+            path.write_bytes(_issue_930_source_refresh_file().read_bytes())
+        else:
+            path.write_text(relative_path, encoding="utf-8")
     manifest = publication.isolated_runtime_manifest(roots=roots)
     report_path = (tmp_path / "deployment.json").resolve()
     deployment_id = "f" * 32
@@ -100,6 +121,8 @@ def _shared_runtime_evidence(tmp_path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
         if relative_path == "configs/fotmob/issue-930-scopes.txt":
             path.write_bytes(_issue_930_scope_file().read_bytes())
+        elif relative_path == publication.PLAYER_SOURCE_REFRESH_ARTIFACT:
+            path.write_bytes(_issue_930_source_refresh_file().read_bytes())
         else:
             path.write_text(relative_path, encoding="utf-8")
     manifest = publication.shared_runtime_manifest(roots=roots)
@@ -168,6 +191,163 @@ def _shared_runtime_evidence(tmp_path: Path):
     return roots, report_path, report, environment, dag_run
 
 
+def _pending_consumer_report(report: dict) -> dict[str, str]:
+    boundary = {
+        "logical_date": START.isoformat(timespec="microseconds"),
+        "data_interval_start": START.isoformat(timespec="microseconds"),
+        "data_interval_end": END.isoformat(timespec="microseconds"),
+        "run_after": END.isoformat(timespec="microseconds"),
+    }
+    report.update(
+        activation_state="pending_consumer",
+        kept_paused=False,
+        paused=[publication.FOTMOB_ISOLATED_DAILY_DAG_ID],
+        unpaused=sorted(
+            publication.FOTMOB_EXPECTED_ISOLATED_DAGS
+            - {publication.FOTMOB_ISOLATED_DAILY_DAG_ID}
+        ),
+        schedule_boundary={
+            "shared_dag_id": "dag_sofascore_pipeline",
+            "isolated_dag_id": publication.FOTMOB_ISOLATED_DAILY_DAG_ID,
+            **{
+                name: dict(boundary)
+                for name in (
+                    "shared_initial",
+                    "shared_final",
+                    "isolated_initial",
+                    "isolated_final",
+                    "shared_commit",
+                    "isolated_commit",
+                )
+            },
+            "exact_match": True,
+        },
+        activation_safety_window={
+            "checked_at": (END - timedelta(hours=1)).isoformat(timespec="microseconds"),
+            "next_boundary": END.isoformat(timespec="microseconds"),
+            "remaining_seconds": 3600,
+            "required_seconds": 900,
+            "timeout_seconds": 300,
+            "passed": True,
+        },
+        scheduled_activation={
+            "status": "pending",
+            "producer_dag_id": publication.FOTMOB_ISOLATED_DAILY_DAG_ID,
+            "consumer_dag_id": "dag_sofascore_pipeline",
+            "resume_required": True,
+        },
+    )
+    return boundary
+
+
+def _mutate_pending_consumer_report(report: dict, case: str) -> None:
+    proof = report["schedule_boundary"]
+    activation = report["scheduled_activation"]
+    safety = report["activation_safety_window"]
+    if case == "valid":
+        return
+    if case == "valid_last_error":
+        activation["last_error"] = "TimeoutError: consumer not created yet"
+    elif case == "missing_proof_boundary":
+        del proof["shared_commit"]
+    elif case == "extra_proof_key":
+        proof["forged"] = True
+    elif case == "missing_boundary_field":
+        del proof["shared_initial"]["run_after"]
+    elif case == "extra_boundary_field":
+        proof["shared_initial"]["forged"] = "value"
+    elif case == "wrong_proof_dag":
+        proof["shared_dag_id"] = "dag_master_pipeline"
+    elif case == "wrong_isolated_proof_dag":
+        proof["isolated_dag_id"] = "dag_ingest_fotmob"
+    elif case == "false_exact_match":
+        proof["exact_match"] = False
+    elif case == "wrong_activation_dag":
+        activation["consumer_dag_id"] = "dag_master_pipeline"
+    elif case == "extra_activation_key":
+        activation["forged"] = True
+    elif case == "empty_last_error":
+        activation["last_error"] = " "
+    elif case == "missing_safety_field":
+        del safety["checked_at"]
+    elif case == "extra_safety_key":
+        safety["forged"] = True
+    elif case == "boolean_safety_integer":
+        safety["timeout_seconds"] = True
+    elif case == "bad_safety_formula":
+        safety["timeout_seconds"] = 1200
+        safety["required_seconds"] = 900
+    elif case == "insufficient_remaining":
+        safety["remaining_seconds"] = 899
+    elif case == "inverted_safety_window":
+        safety["next_boundary"] = safety["checked_at"]
+    else:  # pragma: no cover - the parametrized corpus is exhaustive
+        raise AssertionError(f"unknown pending mutation: {case}")
+
+
+@pytest.mark.parametrize(
+    ("case", "accepted"),
+    (
+        ("valid", True),
+        ("valid_last_error", True),
+        ("missing_proof_boundary", False),
+        ("extra_proof_key", False),
+        ("missing_boundary_field", False),
+        ("extra_boundary_field", False),
+        ("wrong_proof_dag", False),
+        ("wrong_isolated_proof_dag", False),
+        ("false_exact_match", False),
+        ("wrong_activation_dag", False),
+        ("extra_activation_key", False),
+        ("empty_last_error", False),
+        ("missing_safety_field", False),
+        ("extra_safety_key", False),
+        ("boolean_safety_integer", False),
+        ("bad_safety_formula", False),
+        ("insufficient_remaining", False),
+        ("inverted_safety_window", False),
+    ),
+)
+def test_pending_consumer_deploy_and_task_runtime_have_adversarial_parity(
+    case, accepted
+):
+    report = {}
+    _pending_consumer_report(report)
+    _mutate_pending_consumer_report(report, case)
+    binding = _binding()
+    generation_id = publication.make_generation_id(binding)
+    writer_identity = {
+        "component": "bronze_runner",
+        "mode": "daily",
+        "publication": {"generation_id": generation_id, "binding": binding},
+    }
+    publication_error = type(publication._airflow_exception("test"))
+    outcomes = []
+    for validator, error in (
+        (
+            lambda: deploy_validation._validate_pending_report(report),
+            deploy_validation.DeploymentError,
+        ),
+        (
+            lambda: publication._validate_pending_consumer_runtime(
+                report,
+                require_scheduled_owner=False,
+                writer_identity=writer_identity,
+                context={},
+                runtime_fingerprint_value=GIT_SHA,
+            ),
+            publication_error,
+        ),
+    ):
+        try:
+            validator()
+            outcomes.append(True)
+        except error:
+            outcomes.append(False)
+
+    assert outcomes == [accepted, accepted]
+
+
 def test_scheduled_runtime_attestation_binds_report_container_and_manifest(tmp_path):
     roots, _path, _report, environment, dag_run = _isolated_runtime_evidence(tmp_path)
 
@@ -184,6 +364,117 @@ def test_scheduled_runtime_attestation_binds_report_container_and_manifest(tmp_p
         publication.FOTMOB_ISOLATED_REQUIRED_RUNTIME_PATHS
     )
     assert "must-not-appear" not in json.dumps(result)
+
+
+def test_pending_runtime_allows_only_the_exact_scheduled_producer(
+    tmp_path, monkeypatch
+):
+    roots, report_path, report, environment, _dag_run = _isolated_runtime_evidence(
+        tmp_path
+    )
+    _pending_consumer_report(report)
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    class DagRun:
+        @staticmethod
+        def generate_run_id(_run_type, logical_date):
+            return "scheduled__" + logical_date.isoformat()
+
+    models = sys.modules["airflow.models"]
+    monkeypatch.setattr(models, "DagRun", DagRun, raising=False)
+    types_module = ModuleType("airflow.utils.types")
+    types_module.DagRunType = SimpleNamespace(SCHEDULED="scheduled")
+    monkeypatch.setitem(sys.modules, "airflow.utils.types", types_module)
+    expected_run_id = "scheduled__" + START.isoformat()
+    dag_run = SimpleNamespace(
+        dag_id=publication.FOTMOB_ISOLATED_DAILY_DAG_ID,
+        run_type="scheduled",
+        run_id=expected_run_id,
+    )
+
+    admitted = publication.attest_fotmob_isolated_runtime(
+        environ=environment,
+        hostname="1" * 12,
+        roots=roots,
+        dag_run=dag_run,
+        data_interval_start=START,
+        data_interval_end=END,
+    )
+    assert admitted["pending_consumer"]["generation_id"] == (
+        publication.make_generation_id(_binding())
+    )
+
+    dag_run.run_id = "scheduled__forged"
+    with pytest.raises(Exception, match="pending producer interval differs"):
+        publication.attest_fotmob_isolated_runtime(
+            environ=environment,
+            hostname="1" * 12,
+            roots=roots,
+            dag_run=dag_run,
+            data_interval_start=START,
+            data_interval_end=END,
+        )
+
+
+def test_pending_runtime_allows_only_exact_daily_child_writers(tmp_path):
+    roots, report_path, report, environment, _dag_run = _isolated_runtime_evidence(
+        tmp_path
+    )
+    _pending_consumer_report(report)
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    binding = _binding()
+    generation_id = publication.make_generation_id(binding)
+    payload = {"generation_id": generation_id, "binding": binding}
+
+    bronze = publication.attest_fotmob_isolated_runtime(
+        environ=environment,
+        hostname="1" * 12,
+        roots=roots,
+        require_scheduled_owner=False,
+        writer_identity={
+            "component": "bronze_runner",
+            "mode": "daily",
+            "publication": payload,
+        },
+    )
+    assert bronze["pending_consumer"]["generation_id"] == generation_id
+
+    silver_run = SimpleNamespace(
+        dag_id="dag_transform_fotmob_silver",
+        run_id=f"fotmob_silver__{generation_id}",
+        conf={publication.FOTMOB_PUBLICATION_CONF_KEY: payload},
+    )
+    silver = publication.attest_fotmob_isolated_runtime(
+        environ=environment,
+        hostname="1" * 12,
+        roots=roots,
+        require_scheduled_owner=False,
+        dag_run=silver_run,
+    )
+    assert silver["pending_consumer"]["generation_id"] == generation_id
+
+    with pytest.raises(Exception, match="pending Bronze writer is not daily"):
+        publication.attest_fotmob_isolated_runtime(
+            environ=environment,
+            hostname="1" * 12,
+            roots=roots,
+            require_scheduled_owner=False,
+            writer_identity={
+                "component": "bronze_runner",
+                "mode": "replay",
+                "publication": payload,
+            },
+        )
+
+    silver_run.run_id = f"manual__{generation_id}"
+    with pytest.raises(Exception, match="pending writer identity differs"):
+        publication.attest_fotmob_isolated_runtime(
+            environ=environment,
+            hostname="1" * 12,
+            roots=roots,
+            require_scheduled_owner=False,
+            dag_run=silver_run,
+        )
 
 
 def test_scheduled_runtime_attestation_rejects_drift_manual_and_pending(tmp_path):
@@ -385,6 +676,87 @@ def test_kept_paused_attestation_allows_only_exact_issue930_bronze_and_silver(
                 "publication": lifecycle_publication,
             },
         )
+
+
+def test_kept_paused_attestation_binds_exact_source_refresh_profile(tmp_path):
+    roots, report_path, report, environment, _dag_run = _isolated_runtime_evidence(
+        tmp_path
+    )
+    report.update(
+        activation_state="kept_paused",
+        kept_paused=True,
+        paused=sorted(publication.FOTMOB_EXPECTED_ISOLATED_DAGS),
+        unpaused=[],
+    )
+    start = datetime(2026, 7, 22, 10, 0, 0, tzinfo=timezone.utc)
+    binding = publication.make_publication_binding(
+        owner="isolated",
+        data_interval_start=start,
+        data_interval_end=start + timedelta(seconds=1),
+        fingerprint=GIT_SHA,
+    )
+    lifecycle_publication = {
+        "generation_id": publication.make_generation_id(binding),
+        "binding": binding,
+    }
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    identity = {
+        "component": "bronze_runner",
+        "mode": "backfill",
+        "scopes": [],
+        "entities": ["players"],
+        "competition_limit": 0,
+        "season_limit": 0,
+        "match_limit": 0,
+        "team_limit": 0,
+        "player_limit": 0,
+        "max_requests": publication.PLAYER_SOURCE_REFRESH_MAX_REQUESTS,
+        "max_direct_mib": publication.PLAYER_SOURCE_REFRESH_MAX_DIRECT_MIB,
+        "max_proxy_mib": 0,
+        "requests_per_minute": 30,
+        "max_attempts": 4,
+        "next_build_id": "",
+        "source_refresh_profile": publication.PLAYER_SOURCE_REFRESH_PROFILE,
+        "source_refresh_targets_sha256": (publication.PLAYER_SOURCE_REFRESH_SHA256),
+        "source_refresh_target_count": (publication.PLAYER_SOURCE_REFRESH_TARGET_COUNT),
+        "publication": lifecycle_publication,
+    }
+
+    admitted = publication.attest_fotmob_isolated_runtime(
+        environ=environment,
+        hostname="1" * 12,
+        roots=roots,
+        require_scheduled_owner=False,
+        allow_kept_paused_writer=True,
+        writer_identity=identity,
+    )
+
+    assert admitted["issue930_lifecycle"] == {
+        "mode": "backfill",
+        "attempt": 1,
+        "generation_id": lifecycle_publication["generation_id"],
+        "source_refresh_profile": publication.PLAYER_SOURCE_REFRESH_PROFILE,
+        "source_refresh_targets_sha256": publication.PLAYER_SOURCE_REFRESH_SHA256,
+        "source_refresh_target_count": publication.PLAYER_SOURCE_REFRESH_TARGET_COUNT,
+    }
+
+    mutations = {
+        "source_refresh_profile": "unreviewed",
+        "source_refresh_targets_sha256": "0" * 64,
+        "source_refresh_target_count": 8,
+        "max_requests": publication.PLAYER_SOURCE_REFRESH_MAX_REQUESTS - 1,
+        "player_limit": 7,
+    }
+    for field, value in mutations.items():
+        with pytest.raises(Exception, match="source-refresh contract differs"):
+            publication.attest_fotmob_isolated_runtime(
+                environ=environment,
+                hostname="1" * 12,
+                roots=roots,
+                require_scheduled_owner=False,
+                allow_kept_paused_writer=True,
+                writer_identity={**identity, field: value},
+            )
 
 
 def test_isolated_owner_missing_role_env_never_skips_attestation(tmp_path):

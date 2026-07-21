@@ -2155,6 +2155,8 @@ class FotMobIngestService:
         build_id: Optional[str] = None,
         refresh_after: timedelta = timedelta(days=7),
         limit: Optional[int] = None,
+        force_refresh: bool = False,
+        capture_terminal_outcomes: bool = False,
     ) -> OperationResult:
         """Refresh global player snapshots without season mislabelling.
 
@@ -2170,6 +2172,17 @@ class FotMobIngestService:
             attempted=len(ids),
             metadata={"snapshot_semantics": "global_observed_at_not_historical"},
         )
+        terminal_outcomes: dict[str, str] = {}
+
+        def attach_terminal_outcomes() -> None:
+            if capture_terminal_outcomes:
+                result.metadata["terminal_outcomes"] = [
+                    {"player_id": int(player_id), "status": status}
+                    for player_id, status in sorted(
+                        terminal_outcomes.items(), key=lambda item: int(item[0])
+                    )
+                ]
+
         now = utc_now()
         due: list[int] = []
         for player_id in ids:
@@ -2190,16 +2203,24 @@ class FotMobIngestService:
                 and fetched_at is not None
                 and now - fetched_at < refresh_after
                 and self.mode != RunMode.REPLAY
+                and not force_refresh
             ):
                 result.skipped += 1
+                terminal_outcomes[str(player_id)] = "skipped"
             else:
                 due.append(player_id)
         due_before_limit = len(due)
+        deferred: list[int] = []
         if limit is not None:
-            due = due[: max(0, int(limit))]
+            requested_limit = max(0, int(limit))
+            deferred = due[requested_limit:]
+            due = due[:requested_limit]
         result.metadata["due_before_limit"] = due_before_limit
         result.metadata["deferred_by_limit"] = due_before_limit - len(due)
+        for player_id in deferred:
+            terminal_outcomes[str(player_id)] = "deferred"
         if not due:
+            attach_terminal_outcomes()
             return result
 
         def requests_for(values: Iterable[int], active_build: str):
@@ -2238,6 +2259,9 @@ class FotMobIngestService:
                 result.errors.append(
                     f"Next build discovery: {type(exc).__name__}: {exc}"
                 )
+                for player_id in due:
+                    terminal_outcomes[str(player_id)] = "build_discovery_failure"
+                attach_terminal_outcomes()
                 return result
             fetched = self._fetch_many(requests_for(due, current_build))
         rotated: list[int] = []
@@ -2262,11 +2286,13 @@ class FotMobIngestService:
         for key, outcome in fetched.items():
             if isinstance(outcome, Exception):
                 result.errors.append(f"player {key}: {outcome}")
+                terminal_outcomes[str(key)] = "error"
                 continue
             fetch = outcome
             if not fetch.ok:
                 self._commit_for_fetch(fetch, target_type="player", entity_id=key)
                 self._record_failure(result, key, fetch)
+                terminal_outcomes[str(key)] = fetch.outcome.value
                 continue
             if _is_source_missing_player(fetch.data):
                 self._commit_for_fetch(
@@ -2281,6 +2307,7 @@ class FotMobIngestService:
                 result.metadata["intentional_not_available"] = (
                     int(result.metadata.get("intentional_not_available", 0)) + 1
                 )
+                terminal_outcomes[str(key)] = ManifestStatus.NOT_AVAILABLE.value
                 continue
             try:
                 observed = _aware_datetime(fetch.fetched_at) or utc_now()
@@ -2319,16 +2346,20 @@ class FotMobIngestService:
                 result.tables.extend(paths)
                 result.succeeded += 1
                 result.counts["players"] = result.counts.get("players", 0) + 1
+                terminal_outcomes[str(key)] = ManifestStatus.SUCCESS.value
             except Exception as exc:
                 result.errors.append(f"player {key} parse: {type(exc).__name__}: {exc}")
+                failure_status = _failure_status(exc)
                 self._commit_for_fetch(
                     fetch,
                     target_type="player",
-                    status=_failure_status(exc),
+                    status=failure_status,
                     entity_id=key,
                     error_code=type(exc).__name__,
                     error=str(exc),
                 )
+                terminal_outcomes[str(key)] = failure_status.value
+        attach_terminal_outcomes()
         return result
 
     @staticmethod

@@ -222,7 +222,7 @@ def _raw_entity_result(
 ) -> Optional[dict[str, Any]]:
     if (
         view is None
-        or view.get("status") not in SUCCESS_STATES
+        or view.get("status") not in TERMINAL_OBSERVATION_STATES
         or view.get("parser_version") not in {PARSER_VERSION, LEGACY_PARSER_VERSION}
         or not _is_sha256(view.get("target_key"))
         or not _is_sha256(view.get("content_hash"))
@@ -1702,9 +1702,10 @@ class FotMobRepository:
         """Return the authoritative raw-bearing v2/v1 entity observation.
 
         Parser v2 is preferred over the rolling-migration v1 fallback.  Within
-        one parser generation the newest terminal observation wins.  A newer
-        ``not_available`` marker intentionally returns ``None`` instead of
-        resurrecting an older raw payload.
+        one parser generation the newest terminal observation wins.  A
+        raw-bearing ``not_available`` marker is replayable so the parser can
+        reproduce the tombstone in v2.  A newer rawless marker still returns
+        ``None`` instead of resurrecting an older payload.
         """
 
         normalized_type = str(target_type)

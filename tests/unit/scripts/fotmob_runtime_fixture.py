@@ -3,6 +3,28 @@ from pathlib import Path
 from scripts import fotmob_runtime
 
 
+def next_schedule_boundary() -> dict[str, str]:
+    return {
+        "logical_date": "2026-07-20T14:00:00.000000+00:00",
+        "data_interval_start": "2026-07-20T14:00:00.000000+00:00",
+        "data_interval_end": "2026-07-21T14:00:00.000000+00:00",
+        "run_after": "2026-07-21T14:00:00.000000+00:00",
+    }
+
+
+def schedule_boundary_proof() -> dict:
+    boundary = next_schedule_boundary()
+    return {
+        "shared_dag_id": fotmob_runtime.SHARED_CONSUMER_DAG_ID,
+        "isolated_dag_id": fotmob_runtime.ISOLATED_DAILY_DAG_ID,
+        "shared_initial": dict(boundary),
+        "shared_final": dict(boundary),
+        "isolated_initial": dict(boundary),
+        "isolated_final": dict(boundary),
+        "exact_match": True,
+    }
+
+
 def materialize_shared_runtime(release_root: Path) -> dict[str, str]:
     runtime_paths = {
         *fotmob_runtime.SHARED_REQUIRED_RUNTIME_PATHS,
@@ -13,7 +35,10 @@ def materialize_shared_runtime(release_root: Path) -> dict[str, str]:
         path = release_root / relative_path
         path.parent.mkdir(parents=True, exist_ok=True)
         if not path.exists():
-            if relative_path == fotmob_runtime.APPROVED_SCOPE_PATH:
+            if relative_path in {
+                fotmob_runtime.APPROVED_SCOPE_PATH,
+                fotmob_runtime.PLAYER_SOURCE_REFRESH_PATH,
+            }:
                 project_root = Path(__file__).resolve().parents[3]
                 path.write_bytes((project_root / relative_path).read_bytes())
             else:
@@ -143,6 +168,7 @@ def shared_handoff_proof(
                 has_start=False,
             ),
         },
+        "next_scheduled_interval": next_schedule_boundary(),
         "orchestration_state": {
             "pause_states": dict(fotmob_runtime.EXPECTED_SHARED_PAUSE_STATES),
             "expected_pause_states": dict(fotmob_runtime.EXPECTED_SHARED_PAUSE_STATES),

@@ -2,6 +2,7 @@ import importlib.util
 import json
 import os
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,45 @@ SPEC = importlib.util.spec_from_file_location("fotmob_deploy", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 mod = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(mod)
+
+NEXT_SCHEDULE_BOUNDARY = {
+    "logical_date": "2026-07-20T14:00:00+00:00",
+    "data_interval_start": "2026-07-20T14:00:00+00:00",
+    "data_interval_end": "2026-07-21T14:00:00+00:00",
+    "run_after": "2026-07-21T14:00:00+00:00",
+}
+ADVANCED_SCHEDULE_BOUNDARY = {
+    "logical_date": "2026-07-21T14:00:00+00:00",
+    "data_interval_start": "2026-07-21T14:00:00+00:00",
+    "data_interval_end": "2026-07-22T14:00:00+00:00",
+    "run_after": "2026-07-22T14:00:00+00:00",
+}
+
+
+def _exact_scheduled_row(dag_id, *, state="queued", run_id=None):
+    boundary = mod.validate_schedule_boundary(NEXT_SCHEDULE_BOUNDARY, label="test")
+    return {
+        "dag_id": dag_id,
+        "run_id": run_id or mod._scheduled_run_id(boundary["logical_date"]),
+        "run_type": "scheduled",
+        "logical_date": boundary["logical_date"],
+        "data_interval_start": boundary["data_interval_start"],
+        "data_interval_end": boundary["data_interval_end"],
+        "state": state,
+    }
+
+
+def _proved_scheduled_activation(*, state="queued", run_id=None):
+    return {
+        "status": "proved",
+        "producer": _exact_scheduled_row(
+            mod.ISOLATED_DAILY_DAG_ID, state=state, run_id=run_id
+        ),
+        "consumer": _exact_scheduled_row(
+            mod.SHARED_CONSUMER_DAG_ID, state=state, run_id=run_id
+        ),
+        "exact_identity_match": True,
+    }
 
 
 def test_image_reference_must_be_versioned():
@@ -55,6 +95,243 @@ def test_parse_airflow_json_tolerates_log_prefix():
         '[2026-07-21T10:06:03] INFO loading\n[{"dag_id":"dag_ingest_fotmob"}]\n'
     )
     assert rows == [{"dag_id": "dag_ingest_fotmob"}]
+
+
+def test_schedule_boundary_requires_exact_matching_automated_interval():
+    proof = mod.validate_matching_schedule_boundaries(
+        shared_initial=NEXT_SCHEDULE_BOUNDARY,
+        shared_final=NEXT_SCHEDULE_BOUNDARY,
+        isolated_initial=NEXT_SCHEDULE_BOUNDARY,
+        isolated_final=NEXT_SCHEDULE_BOUNDARY,
+    )
+    assert proof["exact_match"] is True
+    assert proof["shared_initial"] == proof["isolated_final"]
+
+    different = dict(NEXT_SCHEDULE_BOUNDARY)
+    different["logical_date"] = "2026-07-21T14:00:00+00:00"
+    different["data_interval_start"] = "2026-07-21T14:00:00+00:00"
+    different["data_interval_end"] = "2026-07-22T14:00:00+00:00"
+    different["run_after"] = "2026-07-22T14:00:00+00:00"
+    with pytest.raises(mod.DeploymentError, match="different next scheduled intervals"):
+        mod.validate_matching_schedule_boundaries(
+            shared_initial=NEXT_SCHEDULE_BOUNDARY,
+            shared_final=NEXT_SCHEDULE_BOUNDARY,
+            isolated_initial=different,
+            isolated_final=different,
+        )
+
+
+@pytest.mark.parametrize(
+    ("raw", "accepted"),
+    (
+        (NEXT_SCHEDULE_BOUNDARY, True),
+        (
+            {
+                "logical_date": "2026-07-20T16:00:00+02:00",
+                "data_interval_start": "2026-07-20T16:00:00+02:00",
+                "data_interval_end": "2026-07-21T16:00:00+02:00",
+                "run_after": "2026-07-21T16:00:00+02:00",
+            },
+            True,
+        ),
+        (
+            {
+                key: value
+                for key, value in NEXT_SCHEDULE_BOUNDARY.items()
+                if key != "run_after"
+            },
+            False,
+        ),
+        ({**NEXT_SCHEDULE_BOUNDARY, "extra": "forged"}, False),
+        ({**NEXT_SCHEDULE_BOUNDARY, "logical_date": "2026-07-20T14:00:00"}, False),
+        ({**NEXT_SCHEDULE_BOUNDARY, "logical_date": "not-a-timestamp"}, False),
+        (
+            {
+                **NEXT_SCHEDULE_BOUNDARY,
+                "logical_date": "2026-07-20T13:59:59+00:00",
+            },
+            False,
+        ),
+        (
+            {
+                **NEXT_SCHEDULE_BOUNDARY,
+                "data_interval_end": "2026-07-20T13:00:00+00:00",
+                "run_after": "2026-07-20T13:00:00+00:00",
+            },
+            False,
+        ),
+        (
+            {
+                **NEXT_SCHEDULE_BOUNDARY,
+                "run_after": "2026-07-21T14:00:01+00:00",
+            },
+            False,
+        ),
+        (None, False),
+    ),
+)
+def test_deploy_and_runtime_schedule_validators_have_adversarial_parity(raw, accepted):
+    outcomes = []
+    for validator, error in (
+        (
+            lambda value: mod.validate_schedule_boundary(value, label="parity"),
+            mod.DeploymentError,
+        ),
+        (
+            lambda value: fotmob_runtime._normalize_schedule_boundary(
+                value, label="parity"
+            ),
+            fotmob_runtime.RuntimeBindingError,
+        ),
+    ):
+        try:
+            outcomes.append((True, validator(raw)))
+        except error:
+            outcomes.append((False, None))
+
+    assert outcomes[0][0] is outcomes[1][0] is accepted
+    if accepted:
+        assert outcomes[0][1] == outcomes[1][1]
+
+
+def test_schedule_boundary_reader_uses_exact_paused_dagmodel_fields():
+    calls = []
+
+    def run(command, **_kwargs):
+        calls.append(command)
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=(
+                "log prefix\nFOTMOB_SCHEDULE_BOUNDARY_JSON="
+                + json.dumps({"is_paused": True, "boundary": NEXT_SCHEDULE_BOUNDARY})
+            ),
+            stderr="",
+        )
+
+    result = mod.read_schedule_boundary(
+        "1" * 64,
+        "dag_trigger_fotmob_daily",
+        run=run,
+    )
+    assert result["logical_date"] == "2026-07-20T14:00:00.000000+00:00"
+    assert calls[0][:3] == ("docker", "exec", "1" * 64)
+    code = calls[0][-1]
+    assert "next_dagrun_data_interval_start" in code
+    assert "next_dagrun_data_interval_end" in code
+    compile(code, "<schedule-boundary-proof>", "exec")
+
+
+def test_schedule_boundary_reader_rejects_unpaused_commit_snapshot():
+    def run(command, **_kwargs):
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout="FOTMOB_SCHEDULE_BOUNDARY_JSON="
+            + json.dumps({"is_paused": False, "boundary": NEXT_SCHEDULE_BOUNDARY}),
+            stderr="",
+        )
+
+    with pytest.raises(mod.DeploymentError, match="not paused"):
+        mod.read_schedule_boundary(
+            "1" * 64,
+            mod.ISOLATED_DAILY_DAG_ID,
+            run=run,
+        )
+
+
+@pytest.mark.parametrize(
+    ("timeout_seconds", "safe_now", "unsafe_now", "required_seconds"),
+    (
+        (
+            100,
+            datetime(2026, 7, 21, 13, 44, 59, tzinfo=timezone.utc),
+            datetime(2026, 7, 21, 13, 45, 1, tzinfo=timezone.utc),
+            15 * 60,
+        ),
+        (
+            1_200,
+            datetime(2026, 7, 21, 13, 35, tzinfo=timezone.utc),
+            datetime(2026, 7, 21, 13, 35, 1, tzinfo=timezone.utc),
+            1_200 + 5 * 60,
+        ),
+    ),
+)
+def test_activation_safety_window_uses_larger_floor_or_timeout_margin(
+    timeout_seconds, safe_now, unsafe_now, required_seconds
+):
+    proof = mod.validate_activation_safety_window(
+        NEXT_SCHEDULE_BOUNDARY,
+        timeout_seconds=timeout_seconds,
+        now=safe_now,
+    )
+    assert proof["required_seconds"] == required_seconds
+    assert proof["remaining_seconds"] >= required_seconds
+
+    with pytest.raises(mod.DeploymentError, match="too close"):
+        mod.validate_activation_safety_window(
+            NEXT_SCHEDULE_BOUNDARY,
+            timeout_seconds=timeout_seconds,
+            now=unsafe_now,
+        )
+
+
+def test_exact_scheduled_run_rejects_forged_run_id():
+    forged = {
+        "run_id": "scheduled__forged",
+        "expected_run_id": "scheduled__2026-07-20T14:00:00+00:00",
+        "run_type": "scheduled",
+        "logical_date": NEXT_SCHEDULE_BOUNDARY["logical_date"],
+        "data_interval_start": NEXT_SCHEDULE_BOUNDARY["data_interval_start"],
+        "data_interval_end": NEXT_SCHEDULE_BOUNDARY["data_interval_end"],
+        "state": "queued",
+    }
+    calls = []
+
+    def run(command, **_kwargs):
+        calls.append(command)
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout="FOTMOB_SCHEDULED_RUNS_JSON=" + json.dumps([forged]),
+            stderr="",
+        )
+
+    with pytest.raises(mod.DeploymentError, match="scheduled DagRun identity"):
+        mod.read_exact_scheduled_run(
+            "1" * 64,
+            mod.ISOLATED_DAILY_DAG_ID,
+            NEXT_SCHEDULE_BOUNDARY,
+            run=run,
+        )
+    assert "DagRun.generate_run_id(DagRunType.SCHEDULED,r.logical_date)" in calls[0][-1]
+    compile(calls[0][-1], "<scheduled-run-proof>", "exec")
+
+
+def test_exact_scheduled_run_rejects_unknown_or_empty_state():
+    for state in ("", "up_for_retry", "removed"):
+        row = {
+            **_exact_scheduled_row(mod.ISOLATED_DAILY_DAG_ID, state=state),
+            "expected_run_id": mod._scheduled_run_id(
+                NEXT_SCHEDULE_BOUNDARY["logical_date"]
+            ),
+        }
+
+        def run(command, **_kwargs):
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout="FOTMOB_SCHEDULED_RUNS_JSON=" + json.dumps([row]),
+                stderr="",
+            )
+
+        with pytest.raises(mod.DeploymentError, match="invalid state"):
+            mod.read_exact_scheduled_run(
+                "1" * 64,
+                mod.ISOLATED_DAILY_DAG_ID,
+                NEXT_SCHEDULE_BOUNDARY,
+                run=run,
+            )
 
 
 def test_delivery_runtime_proof_records_only_presence_booleans():
@@ -219,7 +496,10 @@ def _shared_runtime_digests(root):
     for relative_path in relative_paths:
         path = root / relative_path
         path.parent.mkdir(parents=True, exist_ok=True)
-        if relative_path == mod.APPROVED_SCOPE_PATH:
+        if relative_path in {
+            mod.APPROVED_SCOPE_PATH,
+            mod.PLAYER_SOURCE_REFRESH_PATH,
+        }:
             path.write_bytes((SCRIPT.parents[2] / relative_path).read_bytes())
         else:
             path.write_text(str(path.relative_to(root)))
@@ -294,6 +574,7 @@ def _orchestration_payload(
     safe_downstream=True,
     daily_present=False,
     daily_paused=None,
+    schedule_boundary=None,
 ):
     xref_writers = [
         "xref_transforms.xref_team",
@@ -393,10 +674,15 @@ def _orchestration_payload(
         "pause_states": pause_states
         or {
             "dag_master_pipeline": True,
-            "dag_sofascore_pipeline": False,
+            "dag_sofascore_pipeline": True,
             "dag_ingest_fotmob": True,
             "dag_transform_fotmob_silver": True,
         },
+        "sofascore_schedule_boundary": (
+            dict(NEXT_SCHEDULE_BOUNDARY)
+            if schedule_boundary is None
+            else schedule_boundary
+        ),
         "schedule_owner": "isolated",
         "shared_daily_trigger": {
             "isolated_stack_env": None,
@@ -518,9 +804,13 @@ def test_shared_handoff_proves_production_orchestrator_and_no_running_run(tmp_pa
     assert evidence["schedule_owner"] == "isolated"
     assert evidence["orchestration_state"]["pause_states"] == {
         "dag_master_pipeline": True,
-        "dag_sofascore_pipeline": False,
+        "dag_sofascore_pipeline": True,
         "dag_ingest_fotmob": True,
         "dag_transform_fotmob_silver": True,
+    }
+    assert evidence["next_scheduled_interval"] == {
+        key: value.replace("+00:00", ".000000+00:00")
+        for key, value in NEXT_SCHEDULE_BOUNDARY.items()
     }
     assert "configs/fotmob/competitions.json" in evidence["runtime_code_sha256"]
     assert "scrapers/fotmob/service.py" in evidence["runtime_code_sha256"]
@@ -753,12 +1043,41 @@ def test_shared_handoff_rejects_wrong_production_pause_state(tmp_path):
     orchestration = _orchestration_payload(
         pause_states={
             "dag_master_pipeline": False,
-            "dag_sofascore_pipeline": False,
+            "dag_sofascore_pipeline": True,
             "dag_ingest_fotmob": True,
             "dag_transform_fotmob_silver": True,
         }
     )
-    with pytest.raises(mod.DeploymentError, match="master/ingest/Silver paused"):
+    with pytest.raises(mod.DeploymentError, match="master/SofaScore/ingest/Silver"):
+        _validate_shared_handoff(
+            tmp_path,
+            "shared-scheduler",
+            "postgresql://control@postgres/control",
+            run=_shared_handoff_runner(tmp_path, orchestration),
+        )
+
+
+def test_shared_handoff_rejects_unpaused_sofascore_consumer(tmp_path):
+    pause_states = {
+        "dag_master_pipeline": True,
+        "dag_sofascore_pipeline": False,
+        "dag_ingest_fotmob": True,
+        "dag_transform_fotmob_silver": True,
+    }
+    with pytest.raises(mod.DeploymentError, match="master/SofaScore/ingest/Silver"):
+        _validate_shared_handoff(
+            tmp_path,
+            "shared-scheduler",
+            "postgresql://control@postgres/control",
+            run=_shared_handoff_runner(
+                tmp_path, _orchestration_payload(pause_states=pause_states)
+            ),
+        )
+
+
+def test_shared_handoff_rejects_missing_next_sofascore_interval(tmp_path):
+    orchestration = _orchestration_payload(schedule_boundary={})
+    with pytest.raises(mod.DeploymentError, match="next scheduled interval"):
         _validate_shared_handoff(
             tmp_path,
             "shared-scheduler",
@@ -839,11 +1158,11 @@ def test_shared_handoff_rejects_xref_writer_outside_publication_preflight(tmp_pa
 def test_shared_handoff_rejects_unpaused_shared_silver(tmp_path):
     pause_states = {
         "dag_master_pipeline": True,
-        "dag_sofascore_pipeline": False,
+        "dag_sofascore_pipeline": True,
         "dag_ingest_fotmob": True,
         "dag_transform_fotmob_silver": False,
     }
-    with pytest.raises(mod.DeploymentError, match="master/ingest/Silver paused"):
+    with pytest.raises(mod.DeploymentError, match="master/SofaScore/ingest/Silver"):
         _validate_shared_handoff(
             tmp_path,
             "shared-scheduler",
@@ -1077,36 +1396,117 @@ def test_partial_compose_up_failure_still_stops_scheduler(tmp_path, monkeypatch)
     )
 
 
-def test_trigger_activation_is_active_before_unpause_kill_point(tmp_path):
+def test_trigger_activation_commits_pending_then_proves_both_runs(
+    tmp_path, monkeypatch
+):
     report_path = tmp_path / "deployment.json"
     report = {
         "schema_version": "fotmob-deploy-v2",
         "passed": True,
         "deployment_id": "f" * 32,
+        "schedule_boundary": mod.validate_matching_schedule_boundaries(
+            shared_initial=NEXT_SCHEDULE_BOUNDARY,
+            shared_final=NEXT_SCHEDULE_BOUNDARY,
+            isolated_initial=NEXT_SCHEDULE_BOUNDARY,
+            isolated_final=NEXT_SCHEDULE_BOUNDARY,
+        ),
     }
+    calls = []
 
-    class SimulatedProcessKill(BaseException):
-        pass
+    monkeypatch.setattr(
+        mod,
+        "read_schedule_boundary",
+        lambda *_args, **_kwargs: mod.validate_schedule_boundary(
+            NEXT_SCHEDULE_BOUNDARY, label="test"
+        ),
+    )
 
-    def airflow(*command):
-        assert command == ("dags", "unpause", "dag_trigger_fotmob_daily")
+    def unpause(container, dag_id, **_kwargs):
         persisted = json.loads(report_path.read_text(encoding="utf-8"))
-        assert persisted["activation_state"] == "active"
-        assert persisted["paused"] == []
-        assert set(persisted["unpaused"]) == mod.EXPECTED_DAGS
-        raise SimulatedProcessKill
+        assert persisted["activation_state"] == "pending_consumer"
+        assert persisted["paused"] == [mod.ISOLATED_DAILY_DAG_ID]
+        assert set(persisted["unpaused"]) == (
+            mod.EXPECTED_DAGS - {mod.ISOLATED_DAILY_DAG_ID}
+        )
+        calls.append((container, dag_id))
 
-    with pytest.raises(SimulatedProcessKill):
+    monkeypatch.setattr(mod, "_docker_unpause", unpause)
+    scheduled = _proved_scheduled_activation()
+    monkeypatch.setattr(
+        mod, "poll_exact_scheduled_handoff", lambda **_kwargs: scheduled
+    )
+
+    result = mod._commit_trigger_activation(
+        report_path,
+        report,
+        isolated_container="1" * 64,
+        shared_container="2" * 64,
+        timeout_seconds=300,
+        run=lambda *_args, **_kwargs: None,
+        sleeper=lambda _seconds: None,
+        now=datetime(2026, 7, 21, 16, tzinfo=timezone.utc),
+    )
+
+    assert calls[-2:] == [
+        ("1" * 64, mod.ISOLATED_DAILY_DAG_ID),
+        ("2" * 64, mod.SHARED_CONSUMER_DAG_ID),
+    ]
+    assert result["activation_state"] == "active"
+    assert result["paused"] == []
+    assert set(result["unpaused"]) == mod.EXPECTED_DAGS
+    assert result["scheduled_activation"] == scheduled
+    assert json.loads(report_path.read_text(encoding="utf-8")) == result
+
+
+@pytest.mark.parametrize(
+    ("shared_commit", "isolated_commit"),
+    (
+        (NEXT_SCHEDULE_BOUNDARY, ADVANCED_SCHEDULE_BOUNDARY),
+        (ADVANCED_SCHEDULE_BOUNDARY, ADVANCED_SCHEDULE_BOUNDARY),
+    ),
+    ids=("schedulers-disagree", "both-advanced-from-admitted-proof"),
+)
+def test_trigger_activation_rejects_commit_edge_boundary_drift_before_unpause(
+    tmp_path, monkeypatch, shared_commit, isolated_commit
+):
+    report_path = tmp_path / "deployment.json"
+    report = {
+        "schema_version": "fotmob-deploy-v2",
+        "passed": True,
+        "schedule_boundary": mod.validate_matching_schedule_boundaries(
+            shared_initial=NEXT_SCHEDULE_BOUNDARY,
+            shared_final=NEXT_SCHEDULE_BOUNDARY,
+            isolated_initial=NEXT_SCHEDULE_BOUNDARY,
+            isolated_final=NEXT_SCHEDULE_BOUNDARY,
+        ),
+    }
+    observed = []
+    commit_boundaries = iter((shared_commit, isolated_commit))
+
+    def boundary(container, _dag_id, **_kwargs):
+        observed.append(container)
+        return next(commit_boundaries)
+
+    monkeypatch.setattr(mod, "read_schedule_boundary", boundary)
+    monkeypatch.setattr(
+        mod,
+        "_docker_unpause",
+        lambda *_args, **_kwargs: pytest.fail("must not unpause after boundary drift"),
+    )
+
+    with pytest.raises(mod.DeploymentError, match="different next scheduled intervals"):
         mod._commit_trigger_activation(
             report_path,
             report,
-            airflow=airflow,
-            assert_paused=lambda _expected: [],
+            isolated_container="1" * 64,
+            shared_container="2" * 64,
+            timeout_seconds=300,
+            run=lambda *_args, **_kwargs: None,
+            sleeper=lambda _seconds: None,
         )
 
-    persisted = json.loads(report_path.read_text(encoding="utf-8"))
-    assert persisted["passed"] is True
-    assert persisted["activation_state"] == "active"
+    assert observed == ["2" * 64, "1" * 64]
+    assert not report_path.exists()
 
 
 def test_atomic_deployment_report_is_scheduler_readable_after_root_style_replace(
@@ -1162,10 +1562,18 @@ def test_trigger_activation_never_unpauses_when_durable_commit_crashes(
 
     unpause_called = False
 
-    def airflow(*_command):
+    def unpause(*_args, **_kwargs):
         nonlocal unpause_called
         unpause_called = True
 
+    monkeypatch.setattr(
+        mod,
+        "read_schedule_boundary",
+        lambda *_args, **_kwargs: mod.validate_schedule_boundary(
+            NEXT_SCHEDULE_BOUNDARY, label="test"
+        ),
+    )
+    monkeypatch.setattr(mod, "_docker_unpause", unpause)
     monkeypatch.setattr(
         mod,
         "_atomic_json",
@@ -1174,25 +1582,877 @@ def test_trigger_activation_never_unpauses_when_durable_commit_crashes(
     with pytest.raises(SimulatedProcessKill):
         mod._commit_trigger_activation(
             tmp_path / "deployment.json",
-            {"schema_version": "fotmob-deploy-v2", "passed": True},
-            airflow=airflow,
-            assert_paused=lambda _expected: [],
+            {
+                "schema_version": "fotmob-deploy-v2",
+                "passed": True,
+                "schedule_boundary": mod.validate_matching_schedule_boundaries(
+                    shared_initial=NEXT_SCHEDULE_BOUNDARY,
+                    shared_final=NEXT_SCHEDULE_BOUNDARY,
+                    isolated_initial=NEXT_SCHEDULE_BOUNDARY,
+                    isolated_final=NEXT_SCHEDULE_BOUNDARY,
+                ),
+            },
+            isolated_container="1" * 64,
+            shared_container="2" * 64,
+            timeout_seconds=300,
+            run=lambda *_args, **_kwargs: None,
+            sleeper=lambda _seconds: None,
+            now=datetime(2026, 7, 21, 16, tzinfo=timezone.utc),
         )
     assert unpause_called is False
 
 
-def test_trigger_activation_commits_final_active_report(tmp_path):
+def test_pending_consumer_error_preserves_producer_and_resume_state(
+    tmp_path, monkeypatch
+):
     report_path = tmp_path / "deployment.json"
-    observed_pause_assertions = []
-    result = mod._commit_trigger_activation(
-        report_path,
-        {"schema_version": "fotmob-deploy-v2", "passed": True},
-        airflow=lambda *_command: subprocess.CompletedProcess((), 0),
-        assert_paused=lambda expected: observed_pause_assertions.append(expected) or [],
+    monkeypatch.setattr(
+        mod,
+        "read_schedule_boundary",
+        lambda *_args, **_kwargs: mod.validate_schedule_boundary(
+            NEXT_SCHEDULE_BOUNDARY, label="test"
+        ),
+    )
+    calls = []
+
+    def unpause(container, dag_id, **_kwargs):
+        calls.append((container, dag_id))
+        if container == "2" * 64:
+            raise RuntimeError("shared unavailable")
+
+    monkeypatch.setattr(mod, "_docker_unpause", unpause)
+    with pytest.raises(mod.PendingConsumerError):
+        mod._commit_trigger_activation(
+            report_path,
+            {
+                "schema_version": "fotmob-deploy-v2",
+                "passed": True,
+                "schedule_boundary": mod.validate_matching_schedule_boundaries(
+                    shared_initial=NEXT_SCHEDULE_BOUNDARY,
+                    shared_final=NEXT_SCHEDULE_BOUNDARY,
+                    isolated_initial=NEXT_SCHEDULE_BOUNDARY,
+                    isolated_final=NEXT_SCHEDULE_BOUNDARY,
+                ),
+            },
+            isolated_container="1" * 64,
+            shared_container="2" * 64,
+            timeout_seconds=300,
+            run=lambda *_args, **_kwargs: None,
+            sleeper=lambda _seconds: None,
+            now=datetime(2026, 7, 21, 16, tzinfo=timezone.utc),
+        )
+
+    persisted = json.loads(report_path.read_text(encoding="utf-8"))
+    assert persisted["activation_state"] == "pending_consumer"
+    assert persisted["scheduled_activation"]["resume_required"] is True
+    assert "shared unavailable" in persisted["scheduled_activation"]["last_error"]
+    assert ("1" * 64, mod.ISOLATED_DAILY_DAG_ID) in calls
+
+
+def _pending_activation_report():
+    return {
+        "schema_version": "fotmob-deploy-v2",
+        "passed": True,
+        "activation_state": "pending_consumer",
+        "kept_paused": False,
+        "paused": [mod.ISOLATED_DAILY_DAG_ID],
+        "unpaused": sorted(mod.EXPECTED_DAGS - {mod.ISOLATED_DAILY_DAG_ID}),
+        "schedule_boundary": mod.validate_matching_schedule_boundaries(
+            shared_initial=NEXT_SCHEDULE_BOUNDARY,
+            shared_final=NEXT_SCHEDULE_BOUNDARY,
+            isolated_initial=NEXT_SCHEDULE_BOUNDARY,
+            isolated_final=NEXT_SCHEDULE_BOUNDARY,
+            shared_commit=NEXT_SCHEDULE_BOUNDARY,
+            isolated_commit=NEXT_SCHEDULE_BOUNDARY,
+        ),
+        "scheduled_activation": {
+            "status": "pending",
+            "producer_dag_id": mod.ISOLATED_DAILY_DAG_ID,
+            "consumer_dag_id": mod.SHARED_CONSUMER_DAG_ID,
+            "resume_required": True,
+        },
+        "activation_safety_window": {
+            "checked_at": "2026-07-21T12:00:00.000000+00:00",
+            "next_boundary": "2026-07-21T14:00:00.000000+00:00",
+            "remaining_seconds": 7200,
+            "required_seconds": 900,
+            "timeout_seconds": 300,
+            "passed": True,
+        },
+    }
+
+
+def _resume_arguments(report_path, evidence_dir, *, timeout_seconds=300):
+    return type(
+        "Args",
+        (),
+        {
+            "keep_paused": False,
+            "report": report_path,
+            "evidence_dir": evidence_dir,
+            "timeout_seconds": timeout_seconds,
+        },
+    )()
+
+
+def test_resume_identity_rejects_a_copied_report_path(tmp_path, monkeypatch):
+    evidence_dir = (tmp_path / "evidence").resolve()
+    original_report = evidence_dir / "admitted" / "deployment.json"
+    copied_report = evidence_dir / "copied" / "deployment.json"
+    release_root = (tmp_path / "release").resolve()
+    compose_file = (tmp_path / "compose.yaml").resolve()
+    original_report.parent.mkdir(parents=True)
+    copied_report.parent.mkdir(parents=True)
+    release_root.mkdir()
+    compose_file.write_text("services: {}\n", encoding="utf-8")
+    relative = original_report.relative_to(evidence_dir)
+    container_report = str(mod.CONTAINER_EVIDENCE_ROOT / relative)
+    shared_report = str(mod.SHARED_CONTAINER_EVIDENCE_ROOT / relative)
+    shared_mount = {
+        "type": "bind",
+        "source": str(evidence_dir),
+        "destination": str(mod.SHARED_CONTAINER_EVIDENCE_ROOT),
+        "read_only": True,
+        "report_path": shared_report,
+    }
+    payload = {
+        "project": "fotmob-airflow",
+        "compose_file": str(compose_file),
+        "release_root": str(release_root),
+        "evidence_dir": str(evidence_dir),
+        "image": "registry/image@sha256:" + "b" * 64,
+        "postgres_image": "postgres@sha256:" + "c" * 64,
+        "git_sha": "a" * 40,
+        "container_report_path": container_report,
+        "shared_container_report_path": shared_report,
+        "scheduler_container_id": "1" * 64,
+        "shared_handoff_initial": {
+            "shared_scheduler_container": "2" * 64,
+            "shared_admission_mount": dict(shared_mount),
+        },
+        "shared_handoff_final": {
+            "shared_scheduler_container": "2" * 64,
+            "shared_admission_mount": dict(shared_mount),
+        },
+    }
+    args = type(
+        "Args",
+        (),
+        {
+            "report": original_report,
+            "evidence_dir": evidence_dir,
+            "release_root": release_root,
+            "compose_file": compose_file,
+            "project": "fotmob-airflow",
+            "image": payload["image"],
+            "postgres_image": payload["postgres_image"],
+        },
+    )()
+    monkeypatch.setattr(mod, "release_sha", lambda *_args, **_kwargs: "a" * 40)
+
+    def run(command, **_kwargs):
+        return subprocess.CompletedProcess(
+            command, 0, stdout=command[-1] + "\n", stderr=""
+        )
+
+    resolved, isolated, shared = mod._validate_resume_identity(args, payload, run=run)
+    assert resolved == original_report
+    assert isolated == "1" * 64
+    assert shared == "2" * 64
+
+    args.report = copied_report
+    with pytest.raises(mod.DeploymentError, match="host report path differs"):
+        mod._validate_resume_identity(args, payload, run=run)
+
+
+def test_plain_deploy_preserves_existing_green_pending_report(
+    tmp_path, monkeypatch, capsys
+):
+    evidence_dir = tmp_path / "evidence"
+    report_path = evidence_dir / "deployment.json"
+    evidence_dir.mkdir()
+    original = (
+        json.dumps(
+            _pending_activation_report(),
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=False,
+        ).encode("utf-8")
+        + b"\n"
+    )
+    report_path.write_bytes(original)
+    deploy_called = False
+
+    def deploy(*_args, **_kwargs):
+        nonlocal deploy_called
+        deploy_called = True
+        raise AssertionError("plain deploy must not start from pending_consumer")
+
+    monkeypatch.setattr(mod, "deploy", deploy)
+    monkeypatch.setattr(
+        mod,
+        "_atomic_json",
+        lambda *_args, **_kwargs: pytest.fail("pending report must not be overwritten"),
     )
 
-    assert observed_pause_assertions == [set()]
-    assert result["activation_state"] == "active"
-    assert result["paused"] == []
-    assert set(result["unpaused"]) == mod.EXPECTED_DAGS
-    assert json.loads(report_path.read_text(encoding="utf-8")) == result
+    exit_code = mod.main(
+        [
+            "--release-root",
+            str(tmp_path / "release"),
+            "--env-file",
+            str(tmp_path / "fotmob.env"),
+            "--image",
+            "registry/image@sha256:" + "b" * 64,
+            "--postgres-image",
+            "postgres@sha256:" + "c" * 64,
+            "--evidence-dir",
+            str(evidence_dir),
+            "--report",
+            str(report_path),
+        ]
+    )
+
+    assert exit_code == 1
+    assert deploy_called is False
+    assert report_path.read_bytes() == original
+    assert "--resume-pending" in capsys.readouterr().out
+
+
+def test_plain_deploy_preserves_corrupted_green_pending_as_incident(
+    tmp_path, monkeypatch, capsys
+):
+    evidence_dir = tmp_path / "evidence"
+    report_path = evidence_dir / "deployment.json"
+    evidence_dir.mkdir()
+    payload = _pending_activation_report()
+    payload["scheduled_activation"] = {"status": "forged"}
+    original = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8") + b"\n"
+    report_path.write_bytes(original)
+    monkeypatch.setattr(
+        mod,
+        "deploy",
+        lambda *_args, **_kwargs: pytest.fail(
+            "ordinary deploy must never overwrite a green pending incident"
+        ),
+    )
+    monkeypatch.setattr(
+        mod,
+        "_atomic_json",
+        lambda *_args, **_kwargs: pytest.fail(
+            "corrupted pending report must remain byte-for-byte"
+        ),
+    )
+
+    exit_code = mod.main(_main_deploy_arguments(tmp_path, evidence_dir, report_path))
+
+    assert exit_code == 1
+    assert report_path.read_bytes() == original
+    output = json.loads(capsys.readouterr().out)
+    assert "incident" in output["operator_action"]
+    assert "#997" in output["operator_action"]
+
+
+@pytest.mark.parametrize("failure", ("invalid_json", "unreadable"))
+def test_plain_deploy_preserves_unknown_report_before_any_runtime_mutation(
+    tmp_path, monkeypatch, capsys, failure
+):
+    evidence_dir = tmp_path / "evidence"
+    report_path = evidence_dir / "deployment.json"
+    evidence_dir.mkdir()
+    original = b"not-json-and-do-not-overwrite\n"
+    report_path.write_bytes(original)
+    if failure == "unreadable":
+        original_read_text = Path.read_text
+
+        def deny_report_read(path, *args, **kwargs):
+            if path == report_path:
+                raise PermissionError("simulated unreadable report")
+            return original_read_text(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", deny_report_read)
+    monkeypatch.setattr(
+        mod,
+        "deploy",
+        lambda *_args, **_kwargs: pytest.fail(
+            "unknown existing report must block before deploy"
+        ),
+    )
+    monkeypatch.setattr(
+        mod,
+        "_atomic_json",
+        lambda *_args, **_kwargs: pytest.fail(
+            "pre-mutation report must remain byte-for-byte"
+        ),
+    )
+
+    exit_code = mod.main(_main_deploy_arguments(tmp_path, evidence_dir, report_path))
+
+    assert exit_code == 1
+    assert report_path.read_bytes() == original
+    output = json.loads(capsys.readouterr().out)
+    assert output["existing_report_preserved"] is True
+    assert output["previous_activation_state"] is None
+
+
+def _main_deploy_arguments(tmp_path, evidence_dir, report_path, *, image=None):
+    return [
+        "--release-root",
+        str(tmp_path / "release"),
+        "--env-file",
+        str(tmp_path / "fotmob.env"),
+        "--image",
+        image or ("registry/image@sha256:" + "b" * 64),
+        "--postgres-image",
+        "postgres@sha256:" + "c" * 64,
+        "--evidence-dir",
+        str(evidence_dir),
+        "--report",
+        str(report_path),
+    ]
+
+
+@pytest.mark.parametrize("activation_state", ("active", "kept_paused"))
+def test_pre_mutation_upgrade_failure_preserves_completed_certificate(
+    tmp_path, monkeypatch, capsys, activation_state
+):
+    evidence_dir = tmp_path / "evidence"
+    evidence_dir.mkdir()
+    report_path = evidence_dir / "deployment.json"
+    original = (
+        json.dumps(
+            {
+                "schema_version": "fotmob-deploy-v2",
+                "passed": True,
+                "activation_state": activation_state,
+            },
+            indent=2,
+        ).encode("utf-8")
+        + b"\n"
+    )
+    report_path.write_bytes(original)
+    monkeypatch.setattr(
+        mod,
+        "_atomic_json",
+        lambda *_args, **_kwargs: pytest.fail(
+            "pre-mutation failure must not replace the completed certificate"
+        ),
+    )
+
+    exit_code = mod.main(
+        _main_deploy_arguments(
+            tmp_path,
+            evidence_dir,
+            report_path,
+            image="not-a-digest-pinned-image",
+        )
+    )
+
+    assert exit_code == 1
+    assert report_path.read_bytes() == original
+    output = json.loads(capsys.readouterr().out)
+    assert output["existing_report_preserved"] is True
+    assert output["previous_activation_state"] == activation_state
+
+
+def test_post_mutation_upgrade_failure_may_replace_old_certificate(
+    tmp_path, monkeypatch
+):
+    evidence_dir = tmp_path / "evidence"
+    evidence_dir.mkdir()
+    report_path = evidence_dir / "deployment.json"
+    report_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "fotmob-deploy-v2",
+                "passed": True,
+                "activation_state": "active",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def fail_after_mutation(args):
+        mod._mark_runtime_mutation_started(args)
+        raise mod.DeploymentError("compose up changed runtime")
+
+    monkeypatch.setattr(mod, "deploy", fail_after_mutation)
+
+    assert mod.main(_main_deploy_arguments(tmp_path, evidence_dir, report_path)) == 1
+    replaced = json.loads(report_path.read_text(encoding="utf-8"))
+    assert replaced["passed"] is False
+    assert "compose up changed runtime" in replaced["error"]
+
+
+def test_evidence_lock_blocks_a_second_invocation_without_report_or_docker_changes(
+    tmp_path, monkeypatch, capsys
+):
+    evidence_dir = tmp_path / "evidence"
+    evidence_dir.mkdir()
+    report_path = evidence_dir / "deployment.json"
+    original = b'{"sentinel":"unchanged"}\n'
+    report_path.write_bytes(original)
+    monkeypatch.setattr(
+        mod,
+        "_main_locked",
+        lambda *_args, **_kwargs: pytest.fail(
+            "second invocation must stop before report preflight or Docker"
+        ),
+    )
+
+    with mod._deployment_invocation_lock(evidence_dir):
+        exit_code = mod.main(
+            _main_deploy_arguments(tmp_path, evidence_dir, report_path)
+        )
+
+    assert exit_code == 1
+    assert report_path.read_bytes() == original
+    assert "holds the evidence lock" in capsys.readouterr().out
+
+    # Kernel/file-descriptor release makes the same lock immediately reusable.
+    with mod._deployment_invocation_lock(evidence_dir):
+        pass
+
+
+def test_evidence_lock_rejects_symlinked_evidence_directory(tmp_path):
+    real = tmp_path / "real-evidence"
+    real.mkdir()
+    linked = tmp_path / "linked-evidence"
+    linked.symlink_to(real, target_is_directory=True)
+
+    with pytest.raises(mod.DeploymentError, match="must not contain symlinks"):
+        with mod._deployment_invocation_lock(linked):
+            pass
+
+
+def test_evidence_lock_rejects_group_or_world_writable_directory(tmp_path):
+    evidence_dir = tmp_path / "evidence"
+    evidence_dir.mkdir()
+    evidence_dir.chmod(0o777)
+    try:
+        with pytest.raises(mod.DeploymentError, match="not group/world writable"):
+            with mod._deployment_invocation_lock(evidence_dir):
+                pass
+    finally:
+        evidence_dir.chmod(0o700)
+
+
+def test_evidence_lock_rejects_symlink_without_touching_target(tmp_path):
+    evidence_dir = tmp_path / "evidence"
+    evidence_dir.mkdir()
+    target = tmp_path / "target"
+    original = b"do-not-touch\n"
+    target.write_bytes(original)
+    (evidence_dir / ".fotmob-deploy.lock").symlink_to(target)
+
+    with pytest.raises(mod.DeploymentError, match="safe regular file"):
+        with mod._deployment_invocation_lock(evidence_dir):
+            pass
+
+    assert target.read_bytes() == original
+
+
+def test_evidence_lock_rejects_existing_file_with_wrong_mode(tmp_path):
+    evidence_dir = tmp_path / "evidence"
+    evidence_dir.mkdir()
+    lock_path = evidence_dir / ".fotmob-deploy.lock"
+    lock_path.write_text("", encoding="utf-8")
+    lock_path.chmod(0o644)
+
+    with pytest.raises(mod.DeploymentError, match="owner-controlled 0600"):
+        with mod._deployment_invocation_lock(evidence_dir):
+            pass
+
+
+def test_resume_pending_is_idempotent_after_active_commit(tmp_path, monkeypatch):
+    report_path = tmp_path / "deployment.json"
+    report_path.write_text(json.dumps(_pending_activation_report()), encoding="utf-8")
+    args = _resume_arguments(report_path, tmp_path)
+    isolated_container = "1" * 64
+    shared_container = "2" * 64
+    monkeypatch.setattr(
+        mod,
+        "_validate_resume_identity",
+        lambda *_args, **_kwargs: (
+            report_path,
+            isolated_container,
+            shared_container,
+        ),
+    )
+    monkeypatch.setattr(
+        mod,
+        "read_exact_scheduled_run",
+        lambda _container, dag_id, *_args, **_kwargs: _exact_scheduled_row(
+            dag_id, state="success"
+        ),
+    )
+    unpauses = []
+    monkeypatch.setattr(
+        mod,
+        "_docker_unpause",
+        lambda container, dag_id, **_kwargs: unpauses.append((container, dag_id)),
+    )
+    activation = _proved_scheduled_activation(state="queued")
+    monkeypatch.setattr(
+        mod,
+        "poll_exact_scheduled_handoff",
+        lambda **_kwargs: activation,
+    )
+
+    first = mod.resume_pending_activation(
+        args,
+        run=lambda *_args, **_kwargs: None,
+        sleeper=lambda _seconds: None,
+    )
+    second = mod.resume_pending_activation(
+        args,
+        run=lambda *_args, **_kwargs: None,
+        sleeper=lambda _seconds: None,
+    )
+
+    assert first == second
+    assert second["activation_state"] == "active"
+    assert len(unpauses) == 4
+
+
+@pytest.mark.parametrize(
+    ("mutation", "error"),
+    (
+        (
+            lambda payload: payload["scheduled_activation"].__setitem__(
+                "producer", {"run_id": "scheduled__partial"}
+            ),
+            "incomplete",
+        ),
+        (
+            lambda payload: payload.__setitem__(
+                "scheduled_activation",
+                _proved_scheduled_activation(run_id="scheduled__forged"),
+            ),
+            "differs from admitted schedule",
+        ),
+        (
+            lambda payload: payload["scheduled_activation"]["consumer"].__setitem__(
+                "state", "up_for_retry"
+            ),
+            "differs from admitted schedule",
+        ),
+    ),
+)
+def test_active_resume_rejects_incomplete_forged_or_invalid_report_proof(
+    tmp_path, monkeypatch, mutation, error
+):
+    report_path = tmp_path / "deployment.json"
+    payload = _pending_activation_report()
+    payload.update(
+        {
+            "activation_state": "active",
+            "paused": [],
+            "unpaused": sorted(mod.EXPECTED_DAGS),
+            "scheduled_activation": _proved_scheduled_activation(),
+        }
+    )
+    mutation(payload)
+    report_path.write_text(json.dumps(payload), encoding="utf-8")
+    args = _resume_arguments(report_path, tmp_path)
+    monkeypatch.setattr(
+        mod,
+        "_validate_resume_identity",
+        lambda *_args, **_kwargs: pytest.fail(
+            "forged report must fail before live container checks"
+        ),
+    )
+
+    with pytest.raises(mod.DeploymentError, match=error):
+        mod.resume_pending_activation(args, run=lambda *_args, **_kwargs: None)
+
+
+@pytest.mark.parametrize("live_failure", ("producer_absent", "consumer_mismatch"))
+def test_active_resume_rejects_absent_or_mismatched_live_exact_run(
+    tmp_path, monkeypatch, live_failure
+):
+    report_path = tmp_path / "deployment.json"
+    payload = _pending_activation_report()
+    payload.update(
+        {
+            "activation_state": "active",
+            "paused": [],
+            "unpaused": sorted(mod.EXPECTED_DAGS),
+            "scheduled_activation": _proved_scheduled_activation(),
+        }
+    )
+    report_path.write_text(json.dumps(payload), encoding="utf-8")
+    args = _resume_arguments(report_path, tmp_path)
+    monkeypatch.setattr(
+        mod,
+        "_validate_resume_identity",
+        lambda *_args, **_kwargs: (report_path, "1" * 64, "2" * 64),
+    )
+
+    def live_run(_container, dag_id, *_args, **_kwargs):
+        if live_failure == "producer_absent" and dag_id == mod.ISOLATED_DAILY_DAG_ID:
+            return None
+        row = _exact_scheduled_row(dag_id, state="running")
+        if live_failure == "consumer_mismatch" and dag_id == mod.SHARED_CONSUMER_DAG_ID:
+            row["data_interval_end"] = "2026-07-21T14:00:01.000000+00:00"
+        return row
+
+    monkeypatch.setattr(mod, "read_exact_scheduled_run", live_run)
+
+    with pytest.raises(mod.DeploymentError, match="differs from live exact"):
+        mod.resume_pending_activation(args, run=lambda *_args, **_kwargs: None)
+
+
+@pytest.mark.parametrize("state", sorted(mod.EXACT_SCHEDULED_RUN_STATES))
+def test_active_schedule_proof_accepts_every_known_identity_state(state):
+    payload = {"scheduled_activation": _proved_scheduled_activation(state=state)}
+    boundary = mod.validate_schedule_boundary(NEXT_SCHEDULE_BOUNDARY, label="test")
+
+    result = mod._validate_active_scheduled_proof(payload, boundary)
+    fotmob_runtime._validate_active_schedule_proof(
+        {
+            "activation_safety_window": {
+                "checked_at": "2026-07-21T12:00:00+00:00",
+                "next_boundary": "2026-07-21T14:00:00+00:00",
+                "remaining_seconds": 7200,
+                "required_seconds": 900,
+                "timeout_seconds": 300,
+                "passed": True,
+            },
+            "scheduled_activation": _proved_scheduled_activation(state=state),
+        },
+        boundary,
+    )
+
+    assert result["producer"]["state"] == state
+
+
+def test_resume_rechecks_safety_when_only_consumer_run_is_missing(
+    tmp_path, monkeypatch
+):
+    report_path = tmp_path / "deployment.json"
+    report_path.write_text(json.dumps(_pending_activation_report()), encoding="utf-8")
+    args = _resume_arguments(report_path, tmp_path, timeout_seconds=300)
+    monkeypatch.setattr(
+        mod,
+        "_validate_resume_identity",
+        lambda *_args, **_kwargs: (report_path, "1" * 64, "2" * 64),
+    )
+
+    def exact_run(_container, dag_id, *_args, **_kwargs):
+        if dag_id == mod.ISOLATED_DAILY_DAG_ID:
+            return _exact_scheduled_row(dag_id)
+        return None
+
+    monkeypatch.setattr(mod, "read_exact_scheduled_run", exact_run)
+    monkeypatch.setattr(
+        mod,
+        "read_schedule_boundary",
+        lambda *_args, **_kwargs: mod.validate_schedule_boundary(
+            NEXT_SCHEDULE_BOUNDARY, label="test"
+        ),
+    )
+    monkeypatch.setattr(
+        mod,
+        "_continue_pending_consumer_activation",
+        lambda *_args, **_kwargs: pytest.fail("unsafe resume must not unpause"),
+    )
+
+    with pytest.raises(mod.PendingConsumerError, match="pending its exact shared"):
+        mod.resume_pending_activation(
+            args,
+            run=lambda *_args, **_kwargs: None,
+            sleeper=lambda _seconds: None,
+            now=datetime(2026, 7, 21, 13, 45, 1, tzinfo=timezone.utc),
+        )
+
+    persisted = json.loads(report_path.read_text(encoding="utf-8"))
+    assert persisted["activation_state"] == "pending_consumer"
+    assert persisted["scheduled_activation"]["resume_required"] is True
+    assert "too close" in persisted["scheduled_activation"]["last_error"]
+
+
+@pytest.mark.parametrize(
+    "missing_dag_id",
+    (mod.ISOLATED_DAILY_DAG_ID, mod.SHARED_CONSUMER_DAG_ID),
+)
+def test_resume_missing_one_run_reads_live_boundary_without_false_pause_requirement(
+    tmp_path, monkeypatch, missing_dag_id
+):
+    report_path = tmp_path / "deployment.json"
+    report_path.write_text(json.dumps(_pending_activation_report()), encoding="utf-8")
+    args = _resume_arguments(report_path, tmp_path)
+    monkeypatch.setattr(
+        mod,
+        "_validate_resume_identity",
+        lambda *_args, **_kwargs: (report_path, "1" * 64, "2" * 64),
+    )
+    monkeypatch.setattr(
+        mod,
+        "read_exact_scheduled_run",
+        lambda _container, dag_id, *_args, **_kwargs: (
+            None if dag_id == missing_dag_id else _exact_scheduled_row(dag_id)
+        ),
+    )
+    boundary_calls = []
+
+    def read_boundary(_container, dag_id, **kwargs):
+        boundary_calls.append((dag_id, kwargs.get("require_paused")))
+        return mod.validate_schedule_boundary(NEXT_SCHEDULE_BOUNDARY, label="test")
+
+    monkeypatch.setattr(mod, "read_schedule_boundary", read_boundary)
+    expected_result = {"resumed": True}
+    monkeypatch.setattr(
+        mod,
+        "_continue_pending_consumer_activation",
+        lambda *_args, **_kwargs: expected_result,
+    )
+
+    result = mod.resume_pending_activation(
+        args,
+        run=lambda *_args, **_kwargs: None,
+        sleeper=lambda _seconds: None,
+        now=datetime(2026, 7, 21, 12, tzinfo=timezone.utc),
+    )
+
+    assert result == expected_result
+    assert boundary_calls == [(missing_dag_id, False)]
+
+
+def test_keep_paused_deploy_takes_a_real_second_shared_handoff_snapshot(
+    tmp_path, monkeypatch
+):
+    release = tmp_path / "release"
+    release.mkdir()
+    env_file = tmp_path / "fotmob.env"
+    env_file.write_text(
+        "FOTMOB_AIRFLOW_DB_PASSWORD=safe_password\n"
+        "FBREF_CONTROL_DB_URI=postgresql://control@postgres/control\n"
+        "TELEGRAM_BOT_TOKEN=test-token\n"
+        "TELEGRAM_CHAT_ID=test-chat\n",
+        encoding="utf-8",
+    )
+    compose_file = tmp_path / "compose.yaml"
+    compose_file.write_text("services: {}\n", encoding="utf-8")
+    dagbag = tmp_path / "dagbag"
+    dagbag.mkdir()
+    evidence_dir = tmp_path / "evidence"
+    args = type(
+        "Args",
+        (),
+        {
+            "image": "registry/image@sha256:" + "b" * 64,
+            "postgres_image": "postgres@sha256:" + "c" * 64,
+            "release_root": release,
+            "env_file": env_file,
+            "compose_file": compose_file,
+            "evidence_dir": evidence_dir,
+            "project": "fotmob-airflow",
+            "shared_scheduler_container": "shared",
+            "timeout_seconds": 1,
+            "keep_paused": True,
+        },
+    )()
+    events = []
+    monkeypatch.setattr(mod, "release_sha", lambda *_args, **_kwargs: "a" * 40)
+    monkeypatch.setattr(mod, "prepare_dagbag", lambda *_args, **_kwargs: dagbag)
+    monkeypatch.setattr(
+        mod,
+        "validate_control_database",
+        lambda *_args, **_kwargs: {"same_shared_database": True},
+    )
+    monkeypatch.setattr(
+        mod,
+        "validate_delivery_runtime",
+        lambda *_args, **_kwargs: {
+            "telegram_bot_token_configured": True,
+            "telegram_chat_id_configured": True,
+        },
+    )
+    monkeypatch.setattr(
+        mod,
+        "read_schedule_boundary",
+        lambda *_args, **_kwargs: NEXT_SCHEDULE_BOUNDARY,
+    )
+    monkeypatch.setattr(
+        mod, "expected_isolated_runtime_manifest", lambda *_args, **_kwargs: {}
+    )
+
+    def isolated_runtime(*_args, **_kwargs):
+        events.append("isolated_runtime_manifest")
+        return {}
+
+    monkeypatch.setattr(mod, "validate_isolated_runtime_manifest", isolated_runtime)
+    handoff_calls = []
+
+    def shared_handoff(*_args, **_kwargs):
+        handoff_calls.append(len(handoff_calls) + 1)
+        events.append(f"shared_snapshot_{handoff_calls[-1]}")
+        return {
+            "shared_scheduler_container": "9" * 64,
+            "shared_admission_mount": {"read_only": True},
+            "runtime_code_sha256": {"dags/example.py": "e" * 64},
+            "next_scheduled_interval": NEXT_SCHEDULE_BOUNDARY,
+            "control_database": {"same_shared_database": True},
+            "snapshot_number": handoff_calls[-1],
+            "passed": True,
+        }
+
+    monkeypatch.setattr(mod, "validate_shared_handoff", shared_handoff)
+    fresh_dagbag = {
+        "dags": {
+            dag_id: {
+                "fileloc": mod.EXPECTED_DAG_FILES[dag_id],
+                "schedule": mod.EXPECTED_SCHEDULES[dag_id],
+            }
+            for dag_id in mod.EXPECTED_DAGS
+        },
+        "import_errors": {},
+    }
+
+    def run(command, **_kwargs):
+        if command[:3] == ("docker", "inspect", "--format"):
+            stdout = "sha256:" + "d" * 64 + "\n"
+        elif command[:2] == ("docker", "compose"):
+            if "ps" in command:
+                if "--all" not in command:
+                    stdout = ""
+                elif command[-1] == "airflow-scheduler":
+                    stdout = "1" * 64 + "\n"
+                elif command[-1] == "airflow-metadb":
+                    stdout = "2" * 64 + "\n"
+                else:
+                    raise AssertionError(f"unexpected compose ps command: {command}")
+            elif "list-import-errors" in command:
+                stdout = "[]"
+            elif "list-runs" in command:
+                stdout = "[]"
+            elif "FOTMOB_DAGBAG_JSON=" in command[-1]:
+                stdout = "FOTMOB_DAGBAG_JSON=" + json.dumps(fresh_dagbag)
+            elif "FOTMOB_RUNTIME_MARKER_JSON=" in command[-1]:
+                events.append("data_plane_marker")
+                stdout = 'FOTMOB_RUNTIME_MARKER_JSON={"count":1}'
+            elif command[-4:] == ("dags", "list", "--output", "json"):
+                stdout = json.dumps(
+                    [
+                        {"dag_id": dag_id, "is_paused": True}
+                        for dag_id in mod.EXPECTED_DAGS
+                    ]
+                )
+            else:
+                if "up" in command:
+                    events.append("compose_up")
+                stdout = ""
+        else:
+            raise AssertionError(f"unexpected command: {command}")
+        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+    result = mod.deploy(args, run=run, sleeper=lambda _seconds: None)
+
+    assert handoff_calls == [1, 2]
+    assert events.index("shared_snapshot_1") < events.index("compose_up")
+    assert events.index("compose_up") < events.index("data_plane_marker")
+    assert events.index("data_plane_marker") < events.index("isolated_runtime_manifest")
+    assert events.index("isolated_runtime_manifest") < events.index("shared_snapshot_2")
+    assert result["activation_state"] == "kept_paused"
+    assert result["shared_handoff_initial"]["snapshot_number"] == 1
+    assert result["shared_handoff_final"]["snapshot_number"] == 2

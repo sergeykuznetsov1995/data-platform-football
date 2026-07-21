@@ -9,16 +9,19 @@ empty before any DAG is unpaused.  A JSON report is written for every attempt.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
 import re
 import secrets
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
-from datetime import datetime, timezone
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -41,6 +44,50 @@ EXPECTED_SCHEDULES = {
     "dag_trigger_fotmob_daily": "0 14 * * *",
 }
 ACTIVE_STATES = ("running", "queued")
+# This proves a real scheduled DagRun identity, not business/data success.  A
+# failed terminal run still owns the exact admitted interval and must never be
+# mistaken for an absent run that is safe to recreate.
+EXACT_SCHEDULED_RUN_STATES = frozenset({"queued", "running", "success", "failed"})
+SCHEDULE_BOUNDARY_FIELDS = (
+    "logical_date",
+    "data_interval_start",
+    "data_interval_end",
+    "run_after",
+)
+PENDING_BOUNDARY_NAMES = (
+    "shared_initial",
+    "shared_final",
+    "isolated_initial",
+    "isolated_final",
+    "shared_commit",
+    "isolated_commit",
+)
+PENDING_PROOF_FIELDS = frozenset(
+    {
+        "shared_dag_id",
+        "isolated_dag_id",
+        *PENDING_BOUNDARY_NAMES,
+        "exact_match",
+    }
+)
+PENDING_ACTIVATION_FIELDS = frozenset(
+    {"status", "producer_dag_id", "consumer_dag_id", "resume_required"}
+)
+PENDING_SAFETY_FIELDS = frozenset(
+    {
+        "checked_at",
+        "next_boundary",
+        "remaining_seconds",
+        "required_seconds",
+        "timeout_seconds",
+        "passed",
+    }
+)
+SHARED_CONSUMER_DAG_ID = "dag_sofascore_pipeline"
+ISOLATED_DAILY_DAG_ID = "dag_trigger_fotmob_daily"
+MIN_ACTIVATION_SAFETY_SECONDS = 15 * 60
+ACTIVATION_TIMEOUT_MARGIN_SECONDS = 5 * 60
+SCHEDULE_PERIOD = timedelta(days=1)
 RUNTIME_MARKER_TABLE = "iceberg.bronze.fotmob_runtime_deployments"
 SHARED_RUNTIME_ROOTS = {
     "dags": "/opt/airflow/dags",
@@ -77,6 +124,7 @@ SHARED_CONTAINER_EVIDENCE_ROOT = Path("/opt/airflow/fotmob-admission")
 SHARED_DEPLOYMENT_REPORT_PATH_ENV = "FOTMOB_SHARED_DEPLOYMENT_REPORT_PATH"
 SHARED_REQUIRED_RUNTIME_PATHS = {
     "configs/fotmob/competitions.json",
+    "configs/fotmob/issue-930-player-source-refresh.json",
     "configs/fotmob/issue-930-scopes.txt",
     "dags/.airflowignore",
     "dags/dag_ingest_fotmob.py",
@@ -105,12 +153,17 @@ SHARED_REQUIRED_RUNTIME_PATHS = {
     "scrapers/fotmob/raw_store.py",
     "scrapers/fotmob/repository.py",
     "scrapers/fotmob/service.py",
+    "scrapers/fotmob/source_refresh.py",
     "scrapers/fotmob/transport.py",
 }
 MASTER_RUNTIME_PATH = "dags/dag_master_pipeline.py"
 APPROVED_SCOPE_PATH = "configs/fotmob/issue-930-scopes.txt"
 APPROVED_SCOPE_SHA256 = (
     "f1d95f916c78ed80e5784e2cd5bda7263cece37d9fde6d52fb2a1a4d9e97cb58"
+)
+PLAYER_SOURCE_REFRESH_PATH = "configs/fotmob/issue-930-player-source-refresh.json"
+PLAYER_SOURCE_REFRESH_SHA256 = (
+    "f6cb854c6d60463c899fd9077b61a71d8d0f817741c3a9d6423925b32949045b"
 )
 # The report is a non-secret admission certificate consumed by Airflow uid
 # 50000 from a host bind mount.  Deploy commonly runs as root, so relying on
@@ -120,14 +173,117 @@ APPROVED_SCOPE_SHA256 = (
 # presence booleans, never credential values.
 DEPLOYMENT_REPORT_MODE = 0o444
 EVIDENCE_DIRECTORY_MODE = 0o755
+_RUNTIME_MUTATION_STARTED_ATTR = "_fotmob_runtime_mutation_started"
 
 
 class DeploymentError(RuntimeError):
     pass
 
 
+class PendingConsumerError(DeploymentError):
+    """Activation needs an idempotent resume; producer must stay running."""
+
+    def __init__(
+        self,
+        report: Mapping[str, Any],
+        cause: BaseException,
+        *,
+        operator_action: str = ("rerun the exact deploy command with --resume-pending"),
+    ):
+        self.report = dict(report)
+        self.cause = cause
+        self.operator_action = operator_action
+        super().__init__(
+            "FotMob producer activation is pending its exact shared consumer: "
+            f"{type(cause).__name__}: {cause}"
+        )
+
+
+class ConcurrentInvocationError(DeploymentError):
+    pass
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+@contextmanager
+def _deployment_invocation_lock(evidence_dir: Path):
+    """Serialize deploy/resume on one durable evidence directory."""
+
+    absolute = Path(os.path.abspath(evidence_dir))
+    try:
+        absolute.mkdir(parents=True, mode=EVIDENCE_DIRECTORY_MODE, exist_ok=True)
+    except OSError as exc:
+        raise DeploymentError("cannot create or inspect evidence directory") from exc
+    resolved = Path(os.path.realpath(absolute))
+    if resolved != absolute:
+        raise DeploymentError("evidence directory must not contain symlinks")
+    try:
+        directory = os.stat(resolved, follow_symlinks=False)
+    except OSError as exc:
+        raise DeploymentError("cannot inspect evidence directory") from exc
+    trusted_uids = {0, os.geteuid()}
+    if (
+        not stat.S_ISDIR(directory.st_mode)
+        or directory.st_uid not in trusted_uids
+        or stat.S_IMODE(directory.st_mode) & 0o022
+    ):
+        raise DeploymentError(
+            "evidence directory must be owner-controlled and not group/world writable"
+        )
+
+    lock_path = resolved / ".fotmob-deploy.lock"
+    base_flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    created = False
+    try:
+        descriptor = os.open(
+            lock_path,
+            base_flags | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        created = True
+    except FileExistsError:
+        try:
+            descriptor = os.open(lock_path, base_flags)
+        except OSError as exc:
+            raise DeploymentError("deployment lock is not a safe regular file") from exc
+    except OSError as exc:
+        raise DeploymentError("cannot create the deployment lock") from exc
+    try:
+        if created:
+            try:
+                os.fchmod(descriptor, 0o600)
+            except OSError as exc:
+                raise DeploymentError("cannot secure the deployment lock") from exc
+        try:
+            lock_stat = os.fstat(descriptor)
+            path_stat = os.stat(lock_path, follow_symlinks=False)
+        except OSError as exc:
+            raise DeploymentError("cannot attest the deployment lock") from exc
+        if (
+            not stat.S_ISREG(lock_stat.st_mode)
+            or lock_stat.st_nlink != 1
+            or lock_stat.st_uid not in trusted_uids
+            or stat.S_IMODE(lock_stat.st_mode) != 0o600
+            or (lock_stat.st_dev, lock_stat.st_ino)
+            != (path_stat.st_dev, path_stat.st_ino)
+        ):
+            raise DeploymentError(
+                "deployment lock must be one owner-controlled 0600 regular file"
+            )
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ConcurrentInvocationError(
+                "another FotMob deploy/resume invocation holds the evidence lock"
+            ) from exc
+        yield lock_path
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
 
 
 def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
@@ -176,29 +332,66 @@ def _commit_trigger_activation(
     report_path: Path,
     report: Mapping[str, Any],
     *,
-    airflow: Callable[..., subprocess.CompletedProcess[str]],
-    assert_paused: Callable[[set[str]], list[dict[str, Any]]],
+    isolated_container: str,
+    shared_container: str,
+    timeout_seconds: int,
+    run: Callable[..., subprocess.CompletedProcess[str]],
+    sleeper: Callable[[float], None],
+    now: datetime | None = None,
 ) -> dict[str, Any]:
-    """Durably commit the complete admission before making the schedule live.
+    """Commit pending, start producer, prove its consumer, then commit active."""
 
-    ``_atomic_json`` fsyncs both the file and parent directory.  Consequently
-    every crash boundary is fail-safe: before it returns the trigger is still
-    paused; after it returns any successful/ambiguous unpause is backed by the
-    complete active report that the first scheduled task re-attests.
-    """
-
-    active = {
+    shared_commit = read_schedule_boundary(
+        shared_container, SHARED_CONSUMER_DAG_ID, run=run
+    )
+    isolated_commit = read_schedule_boundary(
+        isolated_container, ISOLATED_DAILY_DAG_ID, run=run
+    )
+    previous_boundary = report.get("schedule_boundary")
+    if not isinstance(previous_boundary, Mapping):
+        raise DeploymentError("deployment report has no pre-activation schedule proof")
+    schedule_boundary = validate_matching_schedule_boundaries(
+        shared_initial=previous_boundary.get("shared_initial"),
+        shared_final=previous_boundary.get("shared_final"),
+        isolated_initial=previous_boundary.get("isolated_initial"),
+        isolated_final=previous_boundary.get("isolated_final"),
+        shared_commit=shared_commit,
+        isolated_commit=isolated_commit,
+    )
+    safety_window = validate_activation_safety_window(
+        schedule_boundary["shared_commit"],
+        timeout_seconds=timeout_seconds,
+        now=now,
+    )
+    pending = {
         **report,
         "generated_at": _now(),
-        "activation_state": "active",
+        "activation_state": "pending_consumer",
         "kept_paused": False,
-        "paused": [],
-        "unpaused": sorted(EXPECTED_DAGS),
+        # This is the exact state at the durable transition cut.  Resume owns
+        # the subsequent idempotent unpauses; pending is not a false active
+        # snapshot while the daily trigger is still paused.
+        "paused": [ISOLATED_DAILY_DAG_ID],
+        "unpaused": sorted(EXPECTED_DAGS - {ISOLATED_DAILY_DAG_ID}),
+        "schedule_boundary": schedule_boundary,
+        "activation_safety_window": safety_window,
+        "scheduled_activation": {
+            "status": "pending",
+            "producer_dag_id": ISOLATED_DAILY_DAG_ID,
+            "consumer_dag_id": SHARED_CONSUMER_DAG_ID,
+            "resume_required": True,
+        },
     }
-    _atomic_json(report_path, active)
-    airflow("dags", "unpause", "dag_trigger_fotmob_daily")
-    assert_paused(set())
-    return active
+    _atomic_json(report_path, pending)
+    return _continue_pending_consumer_activation(
+        report_path,
+        pending,
+        isolated_container=isolated_container,
+        shared_container=shared_container,
+        timeout_seconds=timeout_seconds,
+        run=run,
+        sleeper=sleeper,
+    )
 
 
 def validate_image_reference(image: str, *, label: str = "image") -> None:
@@ -383,6 +576,364 @@ def parse_marker_json(output: str, marker: str) -> Any:
     raise DeploymentError(f"command did not emit required {marker} evidence")
 
 
+def validate_schedule_boundary(raw: Any, *, label: str) -> dict[str, str]:
+    """Canonicalize one paused DAG's exact next automated data interval."""
+
+    if not isinstance(raw, Mapping) or set(raw) != set(SCHEDULE_BOUNDARY_FIELDS):
+        raise DeploymentError(f"{label} next scheduled interval is incomplete")
+    parsed: dict[str, datetime] = {}
+    for field in SCHEDULE_BOUNDARY_FIELDS:
+        value = raw.get(field)
+        if not isinstance(value, str) or not value.strip():
+            raise DeploymentError(f"{label} {field} is missing")
+        try:
+            instant = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise DeploymentError(
+                f"{label} {field} is not an ISO-8601 instant"
+            ) from exc
+        if instant.tzinfo is None or instant.utcoffset() is None:
+            raise DeploymentError(f"{label} {field} has no timezone")
+        parsed[field] = instant.astimezone(timezone.utc)
+    if parsed["logical_date"] != parsed["data_interval_start"]:
+        raise DeploymentError(f"{label} logical date differs from interval start")
+    if parsed["data_interval_start"] >= parsed["data_interval_end"]:
+        raise DeploymentError(f"{label} next scheduled interval is empty or inverted")
+    if parsed["run_after"] != parsed["data_interval_end"]:
+        raise DeploymentError(f"{label} run-after differs from interval end")
+    return {
+        field: parsed[field].isoformat(timespec="microseconds")
+        for field in SCHEDULE_BOUNDARY_FIELDS
+    }
+
+
+def _scheduled_run_id(logical_date: Any) -> str:
+    """Mirror Airflow 2.11 ``DagRunType.SCHEDULED.generate_run_id`` exactly."""
+
+    try:
+        instant = datetime.fromisoformat(
+            str(logical_date).strip().replace("Z", "+00:00")
+        )
+    except ValueError as exc:
+        raise DeploymentError(
+            "scheduled logical date is not an ISO-8601 instant"
+        ) from exc
+    if instant.tzinfo is None or instant.utcoffset() is None:
+        raise DeploymentError("scheduled logical date has no timezone")
+    return f"scheduled__{instant.astimezone(timezone.utc).isoformat()}"
+
+
+def read_schedule_boundary(
+    container: str,
+    dag_id: str,
+    *,
+    run: Callable[..., subprocess.CompletedProcess[str]],
+    require_paused: bool = True,
+) -> dict[str, str]:
+    """Read pause state and next interval in one Airflow metadata snapshot."""
+
+    marker = "FOTMOB_SCHEDULE_BOUNDARY_JSON="
+    code = (
+        "import json; from airflow.models import DagModel; "
+        "from airflow.settings import Session; "
+        f"s=Session(); m=s.query(DagModel).filter(DagModel.dag_id=={dag_id!r}).one_or_none(); "
+        "iso=lambda v: v.isoformat() if v is not None else None; "
+        "p=None if m is None else {'is_paused':bool(m.is_paused),'boundary':{"
+        "'logical_date':iso(m.next_dagrun),"
+        "'data_interval_start':iso(m.next_dagrun_data_interval_start),"
+        "'data_interval_end':iso(m.next_dagrun_data_interval_end),"
+        "'run_after':iso(m.next_dagrun_create_after)}}; "
+        f"print('{marker}'+json.dumps(p,sort_keys=True)); s.close()"
+    )
+    output = run(
+        ("docker", "exec", container, "python", "-c", code),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    payload = parse_marker_json(output, marker)
+    if (
+        not isinstance(payload, Mapping)
+        or set(payload) != {"is_paused", "boundary"}
+        or not isinstance(payload.get("is_paused"), bool)
+    ):
+        raise DeploymentError(f"{dag_id} pause/boundary evidence is invalid")
+    if require_paused and payload["is_paused"] is not True:
+        raise DeploymentError(f"{dag_id} is not paused at the schedule commit edge")
+    return validate_schedule_boundary(payload.get("boundary"), label=dag_id)
+
+
+def validate_matching_schedule_boundaries(
+    *,
+    shared_initial: Any,
+    shared_final: Any,
+    isolated_initial: Any,
+    isolated_final: Any,
+    shared_commit: Any = None,
+    isolated_commit: Any = None,
+) -> dict[str, Any]:
+    """Fail closed unless producer and consumer will create the same run."""
+
+    boundaries = {
+        "shared_initial": validate_schedule_boundary(
+            shared_initial, label=f"initial {SHARED_CONSUMER_DAG_ID}"
+        ),
+        "shared_final": validate_schedule_boundary(
+            shared_final, label=f"final {SHARED_CONSUMER_DAG_ID}"
+        ),
+        "isolated_initial": validate_schedule_boundary(
+            isolated_initial, label=f"initial {ISOLATED_DAILY_DAG_ID}"
+        ),
+        "isolated_final": validate_schedule_boundary(
+            isolated_final, label=f"final {ISOLATED_DAILY_DAG_ID}"
+        ),
+    }
+    if (shared_commit is None) != (isolated_commit is None):
+        raise DeploymentError("schedule commit-edge proof is incomplete")
+    if shared_commit is not None:
+        boundaries.update(
+            {
+                "shared_commit": validate_schedule_boundary(
+                    shared_commit, label=f"commit {SHARED_CONSUMER_DAG_ID}"
+                ),
+                "isolated_commit": validate_schedule_boundary(
+                    isolated_commit, label=f"commit {ISOLATED_DAILY_DAG_ID}"
+                ),
+            }
+        )
+    expected = boundaries["shared_initial"]
+    if any(boundary != expected for boundary in boundaries.values()):
+        raise DeploymentError(
+            "shared SofaScore consumer and isolated FotMob producer have "
+            "different next scheduled intervals"
+        )
+    return {
+        "shared_dag_id": SHARED_CONSUMER_DAG_ID,
+        "isolated_dag_id": ISOLATED_DAILY_DAG_ID,
+        **boundaries,
+        "exact_match": True,
+    }
+
+
+def validate_activation_safety_window(
+    boundary: Any,
+    *,
+    timeout_seconds: int,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Require enough time to finish handoff before the next 14:00 boundary."""
+
+    normalized = validate_schedule_boundary(boundary, label="activation commit")
+    checked_at = now or datetime.now(timezone.utc)
+    if checked_at.tzinfo is None or checked_at.utcoffset() is None:
+        raise DeploymentError("activation safety timestamp has no timezone")
+    checked_at = checked_at.astimezone(timezone.utc)
+    next_boundary = datetime.fromisoformat(normalized["run_after"])
+    while next_boundary <= checked_at:
+        next_boundary += SCHEDULE_PERIOD
+    required_seconds = max(
+        MIN_ACTIVATION_SAFETY_SECONDS,
+        max(1, timeout_seconds) + ACTIVATION_TIMEOUT_MARGIN_SECONDS,
+    )
+    remaining_seconds = int((next_boundary - checked_at).total_seconds())
+    if remaining_seconds < required_seconds:
+        raise DeploymentError(
+            "schedule activation is too close to the next 14:00 UTC boundary: "
+            f"remaining={remaining_seconds}s required={required_seconds}s"
+        )
+    return {
+        "checked_at": checked_at.isoformat(timespec="microseconds"),
+        "next_boundary": next_boundary.isoformat(timespec="microseconds"),
+        "remaining_seconds": remaining_seconds,
+        "required_seconds": required_seconds,
+        "timeout_seconds": max(1, timeout_seconds),
+        "passed": True,
+    }
+
+
+def read_exact_scheduled_run(
+    container: str,
+    dag_id: str,
+    expected_boundary: Any,
+    *,
+    run: Callable[..., subprocess.CompletedProcess[str]],
+) -> dict[str, str] | None:
+    """Return the exact scheduled DagRun for one admitted interval, if created."""
+
+    expected = validate_schedule_boundary(expected_boundary, label=dag_id)
+    marker = "FOTMOB_SCHEDULED_RUNS_JSON="
+    code = (
+        "import json; from airflow.models import DagRun; "
+        "from airflow.settings import Session; "
+        "from airflow.utils.types import DagRunType; "
+        f"s=Session(); rows=s.query(DagRun).filter(DagRun.dag_id=={dag_id!r})"
+        ".order_by(DagRun.logical_date.desc()).limit(20).all(); "
+        "iso=lambda v: v.isoformat() if v is not None else None; "
+        "p=[{'run_id':str(r.run_id),'expected_run_id':DagRun.generate_run_id(DagRunType.SCHEDULED,r.logical_date),"
+        "'run_type':str(getattr(r.run_type,'value',r.run_type)),"
+        "'logical_date':iso(r.logical_date),'data_interval_start':iso(r.data_interval_start),"
+        "'data_interval_end':iso(r.data_interval_end),'state':str(getattr(r.state,'value',r.state))} "
+        "for r in rows]; "
+        f"print('{marker}'+json.dumps(p,sort_keys=True)); s.close()"
+    )
+    output = run(
+        ("docker", "exec", container, "python", "-c", code),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    payload = parse_marker_json(output, marker)
+    if not isinstance(payload, list) or any(
+        not isinstance(row, Mapping) for row in payload
+    ):
+        raise DeploymentError(f"{dag_id} scheduled-run evidence is invalid")
+    matches: list[dict[str, str]] = []
+    for row in payload:
+        raw_boundary = {
+            "logical_date": row.get("logical_date"),
+            "data_interval_start": row.get("data_interval_start"),
+            "data_interval_end": row.get("data_interval_end"),
+            "run_after": row.get("data_interval_end"),
+        }
+        try:
+            observed = validate_schedule_boundary(raw_boundary, label=f"{dag_id} run")
+        except DeploymentError:
+            continue
+        if observed != expected:
+            continue
+        run_type = str(row.get("run_type") or "").casefold()
+        run_id = str(row.get("run_id") or "")
+        if (
+            run_type != "scheduled"
+            or run_id != str(row.get("expected_run_id") or "")
+            or run_id != _scheduled_run_id(observed["logical_date"])
+        ):
+            raise DeploymentError(
+                f"{dag_id} exact interval exists without a scheduled DagRun identity"
+            )
+        state = str(row.get("state") or "").casefold()
+        if state not in EXACT_SCHEDULED_RUN_STATES:
+            raise DeploymentError(f"{dag_id} exact scheduled DagRun has invalid state")
+        matches.append(
+            {
+                "dag_id": dag_id,
+                "run_id": run_id,
+                "run_type": run_type,
+                "logical_date": observed["logical_date"],
+                "data_interval_start": observed["data_interval_start"],
+                "data_interval_end": observed["data_interval_end"],
+                "state": state,
+            }
+        )
+    if len(matches) > 1:
+        raise DeploymentError(f"{dag_id} has duplicate exact scheduled DagRuns")
+    return matches[0] if matches else None
+
+
+def poll_exact_scheduled_handoff(
+    *,
+    isolated_container: str,
+    shared_container: str,
+    boundary: Any,
+    timeout_seconds: int,
+    run: Callable[..., subprocess.CompletedProcess[str]],
+    sleeper: Callable[[float], None],
+) -> dict[str, Any]:
+    deadline = time.monotonic() + max(1, timeout_seconds)
+    producer: dict[str, str] | None = None
+    consumer: dict[str, str] | None = None
+    while time.monotonic() < deadline:
+        producer = read_exact_scheduled_run(
+            isolated_container, ISOLATED_DAILY_DAG_ID, boundary, run=run
+        )
+        consumer = read_exact_scheduled_run(
+            shared_container, SHARED_CONSUMER_DAG_ID, boundary, run=run
+        )
+        if producer is not None and consumer is not None:
+            break
+        sleeper(2)
+    if producer is None or consumer is None:
+        raise DeploymentError(
+            "timed out waiting for exact scheduled FotMob producer and SofaScore consumer"
+        )
+    identity_fields = (
+        "run_id",
+        "run_type",
+        "logical_date",
+        "data_interval_start",
+        "data_interval_end",
+    )
+    if any(producer[field] != consumer[field] for field in identity_fields):
+        raise DeploymentError(
+            "producer and consumer scheduled DagRun identities differ"
+        )
+    return {
+        "status": "proved",
+        "producer": producer,
+        "consumer": consumer,
+        "exact_identity_match": True,
+    }
+
+
+def _docker_unpause(
+    container: str,
+    dag_id: str,
+    *,
+    run: Callable[..., subprocess.CompletedProcess[str]],
+) -> None:
+    run(
+        ("docker", "exec", container, "airflow", "dags", "unpause", dag_id),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _continue_pending_consumer_activation(
+    report_path: Path,
+    pending: Mapping[str, Any],
+    *,
+    isolated_container: str,
+    shared_container: str,
+    timeout_seconds: int,
+    run: Callable[..., subprocess.CompletedProcess[str]],
+    sleeper: Callable[[float], None],
+) -> dict[str, Any]:
+    boundary_proof = pending.get("schedule_boundary")
+    if not isinstance(boundary_proof, Mapping):
+        raise DeploymentError("pending activation has no schedule boundary proof")
+    boundary = boundary_proof.get("isolated_commit")
+    try:
+        for dag_id in ("dag_ingest_fotmob", "dag_transform_fotmob_silver"):
+            _docker_unpause(isolated_container, dag_id, run=run)
+        _docker_unpause(isolated_container, ISOLATED_DAILY_DAG_ID, run=run)
+        _docker_unpause(shared_container, SHARED_CONSUMER_DAG_ID, run=run)
+        activation = poll_exact_scheduled_handoff(
+            isolated_container=isolated_container,
+            shared_container=shared_container,
+            boundary=boundary,
+            timeout_seconds=timeout_seconds,
+            run=run,
+            sleeper=sleeper,
+        )
+        active = {
+            **pending,
+            "generated_at": _now(),
+            "activation_state": "active",
+            "paused": [],
+            "unpaused": sorted(EXPECTED_DAGS),
+            "scheduled_activation": activation,
+        }
+        _validate_active_scheduled_proof(
+            active,
+            validate_schedule_boundary(boundary, label="activation commit"),
+        )
+        _atomic_json(report_path, active)
+        return active
+    except Exception as exc:
+        raise _pending_report_error(report_path, pending, exc) from exc
+
+
 def validate_delivery_runtime(
     container: str,
     *,
@@ -537,6 +1088,10 @@ def shared_runtime_manifest(release_root: Path) -> dict[str, str]:
         )
     if manifest[APPROVED_SCOPE_PATH] != APPROVED_SCOPE_SHA256:
         raise DeploymentError("issue-930 scope artifact differs from approved SHA-256")
+    if manifest[PLAYER_SOURCE_REFRESH_PATH] != PLAYER_SOURCE_REFRESH_SHA256:
+        raise DeploymentError(
+            "issue-930 player source-refresh artifact differs from approved SHA-256"
+        )
     return manifest
 
 
@@ -924,6 +1479,9 @@ active_ids = (
 pause_rows = s.query(DagModel.dag_id, DagModel.is_paused).filter(
     DagModel.dag_id.in_(pause_ids)
 ).all()
+sofa_model = s.query(DagModel).filter(
+    DagModel.dag_id == 'dag_sofascore_pipeline'
+).one_or_none()
 daily_model = s.query(DagModel.dag_id, DagModel.is_paused).filter(
     DagModel.dag_id == 'dag_trigger_fotmob_daily'
 ).one_or_none()
@@ -933,6 +1491,10 @@ run_rows = s.query(DagRun.dag_id, DagRun.run_id, DagRun.state).filter(
 owner_row = s.query(Variable).filter(
     Variable.key == 'fotmob_schedule_owner'
 ).one_or_none()
+
+def instant(value):
+    return value.isoformat() if value is not None else None
+
 payload = {
     'master': {
         'present': master is not None,
@@ -983,6 +1545,20 @@ payload = {
         )
     },
     'pause_states': {dag_id: bool(paused) for dag_id, paused in pause_rows},
+    'sofascore_schedule_boundary': (
+        None
+        if sofa_model is None
+        else {
+            'logical_date': instant(sofa_model.next_dagrun),
+            'data_interval_start': instant(
+                sofa_model.next_dagrun_data_interval_start
+            ),
+            'data_interval_end': instant(
+                sofa_model.next_dagrun_data_interval_end
+            ),
+            'run_after': instant(sofa_model.next_dagrun_create_after),
+        }
+    ),
     'schedule_owner': getattr(owner_row, 'val', None),
     'shared_daily_trigger': {
         'isolated_stack_env': os.environ.get('FOTMOB_ISOLATED_STACK'),
@@ -1167,7 +1743,7 @@ s.close()
     pause_states = orchestration.get("pause_states")
     expected_pause_states = {
         "dag_master_pipeline": True,
-        "dag_sofascore_pipeline": False,
+        "dag_sofascore_pipeline": True,
         "dag_ingest_fotmob": True,
         "dag_transform_fotmob_silver": True,
     }
@@ -1177,9 +1753,12 @@ s.close()
         != expected_pause_states
     ):
         raise DeploymentError(
-            "shared orchestration must have master/ingest/Silver paused and "
-            "SofaScore pipeline unpaused"
+            "shared orchestration must keep master/SofaScore/ingest/Silver paused"
         )
+    sofascore_schedule_boundary = validate_schedule_boundary(
+        orchestration.get("sofascore_schedule_boundary"),
+        label=f"shared {SHARED_CONSUMER_DAG_ID}",
+    )
     active_rows = orchestration.get("active_runs")
     if not isinstance(active_rows, list) or any(
         not isinstance(row, Mapping) for row in active_rows
@@ -1242,6 +1821,7 @@ s.close()
         "serialized_sofascore": serialized_sofa,
         "serialized_xref": serialized_xref,
         "serialized_downstream": dict(fenced_downstream),
+        "next_scheduled_interval": sofascore_schedule_boundary,
         "orchestration_state": {
             "pause_states": dict(pause_states),
             "expected_pause_states": expected_pause_states,
@@ -1264,6 +1844,8 @@ def validate_stable_shared_handoff(
         != final.get("shared_scheduler_container")
         or initial.get("shared_admission_mount") != final.get("shared_admission_mount")
         or initial.get("runtime_code_sha256") != final.get("runtime_code_sha256")
+        or initial.get("next_scheduled_interval")
+        != final.get("next_scheduled_interval")
     ):
         raise DeploymentError("shared handoff identity changed during admission")
 
@@ -1292,9 +1874,470 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Admit the release but keep every DAG paused (required for rollback)",
     )
+    parser.add_argument(
+        "--resume-pending",
+        action="store_true",
+        help="Idempotently finish an admitted pending_consumer activation",
+    )
     parser.add_argument("--timeout-seconds", type=int, default=300)
     parser.add_argument("--report", type=Path)
     return parser
+
+
+def _pending_report_error(
+    report_path: Path,
+    pending: Mapping[str, Any],
+    exc: Exception,
+) -> PendingConsumerError:
+    failed_pending = {
+        **pending,
+        "generated_at": _now(),
+        "activation_state": "pending_consumer",
+        "scheduled_activation": {
+            **dict(pending.get("scheduled_activation") or {}),
+            "status": "pending",
+            "resume_required": True,
+            "last_error": f"{type(exc).__name__}: {exc}",
+        },
+    }
+    try:
+        _atomic_json(report_path, failed_pending)
+    except Exception:
+        pass
+    return PendingConsumerError(failed_pending, exc)
+
+
+def _validate_report_identity(
+    args: argparse.Namespace,
+    payload: Mapping[str, Any],
+    *,
+    run: Callable[..., subprocess.CompletedProcess[str]],
+) -> tuple[Path, str, str]:
+    report_path = (args.report or args.evidence_dir / "deployment.json").resolve()
+    release_root = args.release_root.resolve()
+    evidence_dir = args.evidence_dir.resolve()
+    try:
+        report_relative_path = report_path.relative_to(evidence_dir)
+    except ValueError as exc:
+        raise DeploymentError(
+            "pending report is outside its admitted evidence directory"
+        ) from exc
+    if not report_relative_path.parts or ".." in report_relative_path.parts:
+        raise DeploymentError("pending report has an invalid evidence-relative path")
+    expected_container_report = str(CONTAINER_EVIDENCE_ROOT / report_relative_path)
+    expected_shared_report = str(SHARED_CONTAINER_EVIDENCE_ROOT / report_relative_path)
+    if (
+        payload.get("container_report_path") != expected_container_report
+        or payload.get("shared_container_report_path") != expected_shared_report
+    ):
+        raise DeploymentError(
+            "pending host report path differs from its admitted container paths"
+        )
+    expected_shared_mount = {
+        "type": "bind",
+        "source": str(evidence_dir),
+        "destination": str(SHARED_CONTAINER_EVIDENCE_ROOT),
+        "read_only": True,
+        "report_path": expected_shared_report,
+    }
+    for name in ("shared_handoff_initial", "shared_handoff_final"):
+        handoff = payload.get(name)
+        mount = (
+            handoff.get("shared_admission_mount")
+            if isinstance(handoff, Mapping)
+            else None
+        )
+        if mount != expected_shared_mount:
+            raise DeploymentError(
+                f"pending {name} report mount differs from its admitted path"
+            )
+    expected = {
+        "project": args.project,
+        "compose_file": str(args.compose_file.resolve()),
+        "release_root": str(release_root),
+        "evidence_dir": str(evidence_dir),
+        "image": args.image,
+        "postgres_image": args.postgres_image,
+        "git_sha": release_sha(release_root, run),
+    }
+    if any(str(payload.get(key)) != value for key, value in expected.items()):
+        raise DeploymentError("pending activation arguments differ from its admission")
+    isolated_container = str(payload.get("scheduler_container_id") or "")
+    final_handoff = payload.get("shared_handoff_final")
+    shared_container = (
+        str(final_handoff.get("shared_scheduler_container") or "")
+        if isinstance(final_handoff, Mapping)
+        else ""
+    )
+    for label, container in (
+        ("isolated", isolated_container),
+        ("shared", shared_container),
+    ):
+        if re.fullmatch(r"[0-9a-f]{64}", container) is None:
+            raise DeploymentError(f"pending activation has no exact {label} container")
+    return report_path, isolated_container, shared_container
+
+
+def _validate_resume_identity(
+    args: argparse.Namespace,
+    payload: Mapping[str, Any],
+    *,
+    run: Callable[..., subprocess.CompletedProcess[str]],
+) -> tuple[Path, str, str]:
+    report_path, isolated_container, shared_container = _validate_report_identity(
+        args, payload, run=run
+    )
+    for label, container in (
+        ("isolated", isolated_container),
+        ("shared", shared_container),
+    ):
+        observed = run(
+            ("docker", "inspect", "--format", "{{.Id}}", container),
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        if observed != container:
+            raise DeploymentError(f"pending {label} scheduler container was replaced")
+    return report_path, isolated_container, shared_container
+
+
+def _validated_commit_boundary(payload: Mapping[str, Any]) -> dict[str, str]:
+    """Re-derive every immutable boundary before resuming a durable cut."""
+
+    proof = payload.get("schedule_boundary")
+    if (
+        not isinstance(proof, Mapping)
+        or set(proof) != PENDING_PROOF_FIELDS
+        or proof.get("shared_dag_id") != SHARED_CONSUMER_DAG_ID
+        or proof.get("isolated_dag_id") != ISOLATED_DAILY_DAG_ID
+        or proof.get("exact_match") is not True
+    ):
+        raise DeploymentError("activation report has no commit-edge schedule proof")
+    validated = validate_matching_schedule_boundaries(
+        shared_initial=proof.get("shared_initial"),
+        shared_final=proof.get("shared_final"),
+        isolated_initial=proof.get("isolated_initial"),
+        isolated_final=proof.get("isolated_final"),
+        shared_commit=proof.get("shared_commit"),
+        isolated_commit=proof.get("isolated_commit"),
+    )
+    return dict(validated["isolated_commit"])
+
+
+def _validate_active_scheduled_proof(
+    payload: Mapping[str, Any], boundary: Mapping[str, str]
+) -> dict[str, dict[str, str]]:
+    activation = payload.get("scheduled_activation")
+    if (
+        not isinstance(activation, Mapping)
+        or set(activation) != {"status", "producer", "consumer", "exact_identity_match"}
+        or activation.get("status") != "proved"
+        or activation.get("exact_identity_match") is not True
+    ):
+        raise DeploymentError("active report has no exact scheduled handoff proof")
+    expected_run_id = _scheduled_run_id(boundary["logical_date"])
+    expected_dags = {
+        "producer": ISOLATED_DAILY_DAG_ID,
+        "consumer": SHARED_CONSUMER_DAG_ID,
+    }
+    normalized: dict[str, dict[str, str]] = {}
+    row_fields = {
+        "dag_id",
+        "run_id",
+        "run_type",
+        "logical_date",
+        "data_interval_start",
+        "data_interval_end",
+        "state",
+    }
+    for role, dag_id in expected_dags.items():
+        row = activation.get(role)
+        if not isinstance(row, Mapping) or set(row) != row_fields:
+            raise DeploymentError(f"active {role} scheduled proof is incomplete")
+        observed = validate_schedule_boundary(
+            {
+                "logical_date": row.get("logical_date"),
+                "data_interval_start": row.get("data_interval_start"),
+                "data_interval_end": row.get("data_interval_end"),
+                "run_after": row.get("data_interval_end"),
+            },
+            label=f"active {role}",
+        )
+        if (
+            row.get("dag_id") != dag_id
+            or row.get("run_id") != expected_run_id
+            or row.get("run_type") != "scheduled"
+            or str(row.get("state") or "").casefold() not in EXACT_SCHEDULED_RUN_STATES
+            or observed != dict(boundary)
+        ):
+            raise DeploymentError(f"active {role} differs from admitted schedule")
+        normalized[role] = {
+            "dag_id": dag_id,
+            "run_id": expected_run_id,
+            "run_type": "scheduled",
+            "logical_date": observed["logical_date"],
+            "data_interval_start": observed["data_interval_start"],
+            "data_interval_end": observed["data_interval_end"],
+            "state": str(row["state"]).casefold(),
+        }
+    identity_fields = (
+        "run_id",
+        "run_type",
+        "logical_date",
+        "data_interval_start",
+        "data_interval_end",
+    )
+    if any(
+        normalized["producer"][field] != normalized["consumer"][field]
+        for field in identity_fields
+    ):
+        raise DeploymentError("active producer/consumer scheduled identities differ")
+    return normalized
+
+
+def _validate_pending_report(payload: Mapping[str, Any]) -> dict[str, str]:
+    activation = payload.get("scheduled_activation")
+    activation_fields = set(activation) if isinstance(activation, Mapping) else set()
+    allowed_activation_fields = {
+        PENDING_ACTIVATION_FIELDS,
+        PENDING_ACTIVATION_FIELDS | {"last_error"},
+    }
+    if (
+        payload.get("kept_paused") is not False
+        or payload.get("paused") != [ISOLATED_DAILY_DAG_ID]
+        or payload.get("unpaused") != sorted(EXPECTED_DAGS - {ISOLATED_DAILY_DAG_ID})
+        or not isinstance(activation, Mapping)
+        or frozenset(activation_fields) not in allowed_activation_fields
+        or activation.get("status") != "pending"
+        or activation.get("producer_dag_id") != ISOLATED_DAILY_DAG_ID
+        or activation.get("consumer_dag_id") != SHARED_CONSUMER_DAG_ID
+        or activation.get("resume_required") is not True
+        or (
+            "last_error" in activation
+            and (
+                not isinstance(activation.get("last_error"), str)
+                or not activation["last_error"].strip()
+            )
+        )
+    ):
+        raise DeploymentError("pending consumer report is not an exact durable cut")
+    safety = payload.get("activation_safety_window")
+    if (
+        not isinstance(safety, Mapping)
+        or set(safety) != PENDING_SAFETY_FIELDS
+        or safety.get("passed") is not True
+        or type(safety.get("timeout_seconds")) is not int
+        or type(safety.get("required_seconds")) is not int
+        or type(safety.get("remaining_seconds")) is not int
+        or safety["timeout_seconds"] < 1
+        or safety["required_seconds"]
+        < max(
+            MIN_ACTIVATION_SAFETY_SECONDS,
+            safety["timeout_seconds"] + ACTIVATION_TIMEOUT_MARGIN_SECONDS,
+        )
+        or safety["remaining_seconds"] < safety["required_seconds"]
+    ):
+        raise DeploymentError("pending consumer report has no valid safety proof")
+    try:
+        checked_at = datetime.fromisoformat(
+            str(safety.get("checked_at")).strip().replace("Z", "+00:00")
+        )
+        next_boundary = datetime.fromisoformat(
+            str(safety.get("next_boundary")).strip().replace("Z", "+00:00")
+        )
+    except ValueError as exc:
+        raise DeploymentError(
+            "pending consumer report has invalid safety timestamps"
+        ) from exc
+    if (
+        not isinstance(safety.get("checked_at"), str)
+        or not isinstance(safety.get("next_boundary"), str)
+        or checked_at.tzinfo is None
+        or checked_at.utcoffset() is None
+        or next_boundary.tzinfo is None
+        or next_boundary.utcoffset() is None
+        or next_boundary <= checked_at
+    ):
+        raise DeploymentError("pending consumer report has invalid safety timestamps")
+    return _validated_commit_boundary(payload)
+
+
+def resume_pending_activation(
+    args: argparse.Namespace,
+    *,
+    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    sleeper: Callable[[float], None] = time.sleep,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    if args.keep_paused:
+        raise DeploymentError("--resume-pending cannot be combined with --keep-paused")
+    report_path = (args.report or args.evidence_dir / "deployment.json").resolve()
+    try:
+        payload = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise DeploymentError(f"cannot read pending deployment report: {exc}") from exc
+    if not isinstance(payload, Mapping) or payload.get("schema_version") != (
+        "fotmob-deploy-v2"
+    ):
+        raise DeploymentError("resume requires a fotmob-deploy-v2 report")
+    state = payload.get("activation_state")
+    if state == "active":
+        if (
+            payload.get("passed") is not True
+            or payload.get("kept_paused") is not False
+            or payload.get("paused") != []
+            or set(payload.get("unpaused") or ()) != EXPECTED_DAGS
+        ):
+            raise DeploymentError("active report has no exact scheduled handoff proof")
+        expected = _validated_commit_boundary(payload)
+        reported = _validate_active_scheduled_proof(payload, expected)
+        _report_path, isolated_container, shared_container = _validate_resume_identity(
+            args, payload, run=run
+        )
+        live = {
+            "producer": read_exact_scheduled_run(
+                isolated_container, ISOLATED_DAILY_DAG_ID, expected, run=run
+            ),
+            "consumer": read_exact_scheduled_run(
+                shared_container, SHARED_CONSUMER_DAG_ID, expected, run=run
+            ),
+        }
+        identity_fields = (
+            "dag_id",
+            "run_id",
+            "run_type",
+            "logical_date",
+            "data_interval_start",
+            "data_interval_end",
+        )
+        if any(
+            live[role] is None
+            or any(
+                live[role].get(field) != reported[role][field]
+                for field in identity_fields
+            )
+            for role in ("producer", "consumer")
+        ):
+            raise DeploymentError(
+                "active report differs from live exact scheduled handoff rows"
+            )
+        return dict(payload)
+    if state != "pending_consumer" or payload.get("passed") is not True:
+        raise DeploymentError("resume requires a green pending_consumer report")
+    try:
+        report_path, isolated_container, shared_container = _validate_resume_identity(
+            args, payload, run=run
+        )
+        expected = _validate_pending_report(payload)
+        producer = read_exact_scheduled_run(
+            isolated_container, ISOLATED_DAILY_DAG_ID, expected, run=run
+        )
+        consumer = read_exact_scheduled_run(
+            shared_container, SHARED_CONSUMER_DAG_ID, expected, run=run
+        )
+        if producer is None:
+            current = read_schedule_boundary(
+                isolated_container,
+                ISOLATED_DAILY_DAG_ID,
+                run=run,
+                require_paused=False,
+            )
+            if current != expected:
+                raise DeploymentError("pending producer next interval advanced")
+        if consumer is None:
+            current = read_schedule_boundary(
+                shared_container,
+                SHARED_CONSUMER_DAG_ID,
+                run=run,
+                require_paused=False,
+            )
+            if current != expected:
+                raise DeploymentError("pending consumer next interval advanced")
+        if producer is None or consumer is None:
+            validate_activation_safety_window(
+                expected, timeout_seconds=args.timeout_seconds, now=now
+            )
+        return _continue_pending_consumer_activation(
+            report_path,
+            payload,
+            isolated_container=isolated_container,
+            shared_container=shared_container,
+            timeout_seconds=args.timeout_seconds,
+            run=run,
+            sleeper=sleeper,
+        )
+    except PendingConsumerError:
+        raise
+    except Exception as exc:
+        raise _pending_report_error(report_path, payload, exc) from exc
+
+
+def _guard_existing_pending_activation(report_path: Path) -> None:
+    """Never let an ordinary deploy destroy a resumable producer admission."""
+
+    try:
+        payload = json.loads(report_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise DeploymentError(
+            "cannot safely read the existing deployment report; leave it unchanged"
+        ) from exc
+    except json.JSONDecodeError as exc:
+        raise DeploymentError(
+            "existing deployment report is invalid JSON; leave it unchanged for incident recovery"
+        ) from exc
+    if (
+        not isinstance(payload, Mapping)
+        or payload.get("schema_version") != "fotmob-deploy-v2"
+        or payload.get("passed") is not True
+        or payload.get("activation_state") != "pending_consumer"
+    ):
+        return
+    try:
+        _validate_pending_report(payload)
+    except DeploymentError as exc:
+        raise PendingConsumerError(
+            payload,
+            DeploymentError(f"existing pending proof is invalid: {exc}"),
+            operator_action=(
+                "leave producer and reports unchanged; follow the pending-consumer "
+                "incident runbook and recovery issue #997"
+            ),
+        ) from exc
+    raise PendingConsumerError(
+        payload,
+        DeploymentError("a green pending_consumer deployment already exists"),
+    )
+
+
+def _existing_report_before_upgrade(report_path: Path) -> dict[str, Any] | None:
+    """Record that any report exists so pre-mutation errors cannot replace it."""
+
+    try:
+        report_path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return {"activation_state": None}
+    try:
+        payload = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"activation_state": None}
+    return {
+        "activation_state": (
+            payload.get("activation_state") if isinstance(payload, Mapping) else None
+        )
+    }
+
+
+def _mark_runtime_mutation_started(args: argparse.Namespace) -> None:
+    setattr(args, _RUNTIME_MUTATION_STARTED_ATTR, True)
+
+
+def _runtime_mutation_started(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, _RUNTIME_MUTATION_STARTED_ATTR, False))
 
 
 def deploy(
@@ -1303,17 +2346,19 @@ def deploy(
     run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
     sleeper: Callable[[float], None] = time.sleep,
 ) -> dict[str, Any]:
-    validate_image_reference(args.image, label="FOTMOB_AIRFLOW_IMAGE")
-    validate_image_reference(args.postgres_image, label="FOTMOB_POSTGRES_IMAGE")
-    release_root = args.release_root.resolve()
+    setattr(args, _RUNTIME_MUTATION_STARTED_ATTR, False)
     evidence_dir = args.evidence_dir.resolve()
-    compose_file = args.compose_file.resolve()
     configured_report = getattr(args, "report", None)
     report_path = (
         configured_report.resolve()
         if configured_report is not None
         else evidence_dir / "deployment.json"
     )
+    _guard_existing_pending_activation(report_path)
+    validate_image_reference(args.image, label="FOTMOB_AIRFLOW_IMAGE")
+    validate_image_reference(args.postgres_image, label="FOTMOB_POSTGRES_IMAGE")
+    release_root = args.release_root.resolve()
+    compose_file = args.compose_file.resolve()
     try:
         report_relative_path = report_path.relative_to(evidence_dir)
     except ValueError as exc:
@@ -1441,6 +2486,7 @@ def deploy(
             raise DeploymentError(
                 f"isolated scheduler has active runs; redeploy aborted: {existing_active!r}"
             )
+        _mark_runtime_mutation_started(args)
         for dag_id in sorted(EXPECTED_DAGS):
             airflow("dags", "pause", dag_id)
         assert_paused(set(EXPECTED_DAGS))
@@ -1459,6 +2505,7 @@ def deploy(
         # Mark the attempt before invoking Compose so the exception path always
         # quiesces any partially-created scheduler.
         launch_attempted = True
+        _mark_runtime_mutation_started(args)
         command("up", "-d", "airflow-metadb", "airflow-init", "airflow-scheduler")
         deadline = time.monotonic() + max(1, args.timeout_seconds)
         health_error: str | None = "scheduler health check not attempted"
@@ -1552,6 +2599,19 @@ def deploy(
             container_id, control_db_uri, run=run
         )
         delivery_credentials = validate_delivery_runtime(container_id, run=run)
+        isolated_schedule_initial = read_schedule_boundary(
+            container_id,
+            ISOLATED_DAILY_DAG_ID,
+            run=run,
+        )
+        # Both paused schedulers must already agree before any isolated DAG is
+        # unpaused.  The final check below repeats this at the commit boundary.
+        validate_matching_schedule_boundaries(
+            shared_initial=initial_handoff.get("next_scheduled_interval"),
+            shared_final=initial_handoff.get("next_scheduled_interval"),
+            isolated_initial=isolated_schedule_initial,
+            isolated_final=isolated_schedule_initial,
+        )
         marker_create_sql = f"""CREATE TABLE IF NOT EXISTS {RUNTIME_MARKER_TABLE} (
             deployment_id VARCHAR,
             git_sha VARCHAR,
@@ -1602,7 +2662,6 @@ def deploy(
             "scheduler_container_id": container_id,
             "scheduler_image_id": image_id,
         }
-        final_handoff = initial_handoff
         if not args.keep_paused:
             for dag_id in (
                 "dag_ingest_fotmob",
@@ -1614,30 +2673,37 @@ def deploy(
                 raise DeploymentError(
                     "isolated stack gained an active run before schedule admission"
                 )
-            # Re-prove both ownership and live bind bytes at the final schedule
-            # boundary. No fallible admission work remains after trigger
-            # unpause apart from the exact pause-state assertion.
-            final_handoff = validate_shared_handoff(
-                release_root,
-                args.shared_scheduler_container,
-                control_db_uri,
-                evidence_dir=evidence_dir,
-                report_relative_path=report_relative_path,
-                run=run,
-            )
-            validate_stable_shared_handoff(initial_handoff, final_handoff)
-            if release_sha(release_root, run) != sha:
-                raise DeploymentError(
-                    "release Git SHA changed before schedule admission"
-                )
-            if prepare_dagbag(release_root, evidence_dir, sha) != dagbag_root:
-                raise DeploymentError(
-                    "DagBag projection changed before schedule admission"
-                )
         isolated_runtime_hashes = validate_isolated_runtime_manifest(
             container_id,
             expected_isolated_runtime_manifest(release_root, dagbag_root),
             run=run,
+        )
+        isolated_schedule_final = read_schedule_boundary(
+            container_id,
+            ISOLATED_DAILY_DAG_ID,
+            run=run,
+        )
+        # The second shared snapshot is the final handoff edge, not a copied
+        # preflight result.  Take it only after the durable marker and exact
+        # isolated runtime/schedule checks have completed.
+        final_handoff = validate_shared_handoff(
+            release_root,
+            args.shared_scheduler_container,
+            control_db_uri,
+            evidence_dir=evidence_dir,
+            report_relative_path=report_relative_path,
+            run=run,
+        )
+        validate_stable_shared_handoff(initial_handoff, final_handoff)
+        if release_sha(release_root, run) != sha:
+            raise DeploymentError("release Git SHA changed before final admission")
+        if prepare_dagbag(release_root, evidence_dir, sha) != dagbag_root:
+            raise DeploymentError("DagBag projection changed before final admission")
+        schedule_boundary = validate_matching_schedule_boundaries(
+            shared_initial=initial_handoff.get("next_scheduled_interval"),
+            shared_final=final_handoff.get("next_scheduled_interval"),
+            isolated_initial=isolated_schedule_initial,
+            isolated_final=isolated_schedule_final,
         )
         report = {
             "schema_version": "fotmob-deploy-v2",
@@ -1673,6 +2739,7 @@ def deploy(
             "import_errors": 0,
             "shared_handoff_initial": initial_handoff,
             "shared_handoff_final": final_handoff,
+            "schedule_boundary": schedule_boundary,
         }
         if args.keep_paused:
             kept_paused = {
@@ -1687,9 +2754,17 @@ def deploy(
         return _commit_trigger_activation(
             report_path,
             report,
-            airflow=airflow,
-            assert_paused=assert_paused,
+            isolated_container=container_id,
+            shared_container=str(final_handoff["shared_scheduler_container"]),
+            timeout_seconds=args.timeout_seconds,
+            run=run,
+            sleeper=sleeper,
         )
+    except PendingConsumerError:
+        # The producer may already own/write its exact generation.  Pausing or
+        # stopping it here would turn a retryable consumer handoff into an
+        # ambiguous writer failure.  Resume owns this state.
+        raise
     except Exception as exc:
         if launch_attempted:
             for dag_id in sorted(EXPECTED_DAGS):
@@ -1732,12 +2807,60 @@ def deploy(
         raise
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+def _main_locked(args: argparse.Namespace) -> int:
     report_path = args.report or args.evidence_dir / "deployment.json"
+    setattr(args, _RUNTIME_MUTATION_STARTED_ATTR, False)
+    previous_report = (
+        None if args.resume_pending else _existing_report_before_upgrade(report_path)
+    )
     try:
-        report = deploy(args)
+        if not args.resume_pending:
+            _guard_existing_pending_activation(report_path)
+        report = (
+            resume_pending_activation(args) if args.resume_pending else deploy(args)
+        )
+    except PendingConsumerError as exc:
+        # The durable pending report is intentionally preserved verbatim.  A
+        # generic red report or scheduler stop would destroy resumability.
+        output = {
+            **exc.report,
+            "operator_action": exc.operator_action,
+        }
+        print(json.dumps(output, ensure_ascii=False, sort_keys=True))
+        return 1
     except Exception as exc:
+        if args.resume_pending:
+            print(
+                json.dumps(
+                    {
+                        "schema_version": "fotmob-deploy-v2",
+                        "generated_at": _now(),
+                        "passed": False,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            return 1
+        if previous_report is not None and not _runtime_mutation_started(args):
+            print(
+                json.dumps(
+                    {
+                        "schema_version": "fotmob-deploy-v2",
+                        "generated_at": _now(),
+                        "passed": False,
+                        "existing_report_preserved": True,
+                        "previous_activation_state": previous_report.get(
+                            "activation_state"
+                        ),
+                        "error": f"{type(exc).__name__}: {exc}",
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            return 1
         report = {
             "schema_version": "fotmob-deploy-v2",
             "generated_at": _now(),
@@ -1747,6 +2870,28 @@ def main(argv: Sequence[str] | None = None) -> int:
     _atomic_json(report_path, report)
     print(json.dumps(report, ensure_ascii=False, sort_keys=True))
     return 0 if report.get("passed") is True else 1
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        with _deployment_invocation_lock(args.evidence_dir):
+            return _main_locked(args)
+    except DeploymentError as exc:
+        print(
+            json.dumps(
+                {
+                    "schema_version": "fotmob-deploy-v2",
+                    "generated_at": _now(),
+                    "passed": False,
+                    "existing_report_preserved": True,
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        return 1
 
 
 if __name__ == "__main__":

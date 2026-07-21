@@ -115,9 +115,7 @@ def _daily_report(mod):
                 "scope_sha256": mod.FOTMOB_DAILY_SCOPE_SHA256,
                 "scope_count": mod.FOTMOB_DAILY_SCOPE_COUNT,
                 "competition_ids": list(mod.FOTMOB_DAILY_COMPETITION_IDS),
-                "competition_ids_sha256": (
-                    mod.FOTMOB_DAILY_COMPETITION_IDS_SHA256
-                ),
+                "competition_ids_sha256": (mod.FOTMOB_DAILY_COMPETITION_IDS_SHA256),
                 "competition_count": mod.FOTMOB_DAILY_COMPETITION_COUNT,
             },
             "entities": sorted(mod.FOTMOB_DAILY_ENTITIES),
@@ -131,6 +129,103 @@ def _daily_report(mod):
                 mod.FOTMOB_DAILY_COMPETITION_IDS
             ),
             "requests_per_minute": mod.FOTMOB_DAILY_REQUESTS_PER_MINUTE,
+        },
+    }
+
+
+def _source_refresh_report(mod):
+    contract = mod._source_refresh_contract()
+    outcomes = [
+        {
+            **target,
+            "status": "not_available" if index == 0 else "success",
+        }
+        for index, target in enumerate(contract["targets"])
+    ]
+    return {
+        "run_id": "source-refresh-run",
+        "mode": "backfill",
+        "status": "success",
+        "complete": True,
+        "operations": [
+            {
+                "entity": "player_snapshots",
+                "status": "success",
+                "attempted": 7,
+                "succeeded": 6,
+                "skipped": 0,
+                "not_available": 1,
+                "errors": [],
+                "retryable": [],
+                "terminal": [],
+            },
+            {
+                "entity": "player_source_refresh_contract",
+                "status": "success",
+                "attempted": 7,
+                "succeeded": 7,
+                "errors": [],
+                "retryable": [],
+                "terminal": [],
+                "counts": {"terminal_targets": 7},
+                "metadata": {
+                    "profile": contract["profile"],
+                    "targets_sha256": contract["sha256"],
+                    "target_outcomes": outcomes,
+                },
+            },
+            {
+                "entity": "commit_flush",
+                "status": "success",
+                "errors": [],
+                "retryable": [],
+                "terminal": [],
+            },
+            {
+                "entity": "current_views",
+                "status": "success",
+                "errors": [],
+                "retryable": [],
+                "terminal": [],
+            },
+        ],
+        "transport": {"attempts": 8, "direct_bytes": 1024, "proxy_bytes": 0},
+        "budget": {
+            "requests": 8,
+            "max_requests": mod.PLAYER_SOURCE_REFRESH_MAX_REQUESTS,
+            "direct_bytes": 1024,
+            "max_direct_bytes": (
+                mod.PLAYER_SOURCE_REFRESH_MAX_DIRECT_MIB * 1024 * 1024
+            ),
+            "proxy_bytes": 0,
+            "max_proxy_bytes": 0,
+        },
+        "errors": [],
+        "rows": {},
+        "tables": [],
+        "selection": {
+            "profile": contract["profile"],
+            "entities": ["players"],
+            "explicit_scopes": [],
+            "competition_limit": 0,
+            "season_limit": 0,
+            "scope_plan_signature": contract["plan_signature"],
+            "planned_scopes": [],
+            "completed_scopes": [],
+            "completed_transfer_competition_ids": [],
+            "requests_per_minute": 30,
+            "source_refresh": {
+                key: contract[key]
+                for key in (
+                    "profile",
+                    "artifact",
+                    "sha256",
+                    "target_count",
+                    "targets",
+                    "plan_signature",
+                )
+            },
+            "target_outcomes": outcomes,
         },
     }
 
@@ -213,6 +308,9 @@ class TestFotmobNativeParams:
         assert params["daily_contract"].default == ""
         assert params["competition_scope_file"].default == ""
         assert params["requests_per_minute"].default == 30
+        assert params["source_refresh_profile"].default == ""
+        assert params["source_refresh_targets_sha256"].default == ""
+        assert params["source_refresh_target_count"].default == 0
         assert "season" not in params
 
     @pytest.mark.unit
@@ -233,7 +331,15 @@ class TestFotmobNativeParams:
             task.bash_command
         )
         assert "--requests-per-minute 30" not in task.bash_command
-        assert "--max-proxy-mib 0" in task.bash_command
+        assert '--max-proxy-mib "{{ params.max_proxy_mib }}"' in task.bash_command
+        assert '--source-refresh-profile "{{ params.source_refresh_profile }}"' in (
+            task.bash_command
+        )
+        assert (
+            "--source-refresh-targets-sha256 "
+            '"{{ params.source_refresh_targets_sha256 }}"'
+        ) in task.bash_command
+        assert '--next-build-id ""' in task.bash_command
         assert "--season " not in task.bash_command
         assert "--leagues " not in task.bash_command
 
@@ -287,6 +393,82 @@ class TestDynamicDiscoveryDag:
 
 class TestNativeValidation:
     @pytest.mark.unit
+    def test_source_refresh_accepts_exact_seven_terminal_targets_without_catalog(
+        self, tmp_path
+    ):
+        import json
+
+        mod = _reload_dag_module()
+        report = tmp_path / "source-refresh.json"
+        report.write_text(json.dumps(_source_refresh_report(mod)), encoding="utf-8")
+
+        summary = mod.validate_data(str(report))
+
+        assert summary["selection"]["profile"] == (mod.PLAYER_SOURCE_REFRESH_PROFILE)
+        assert len(summary["selection"]["target_outcomes"]) == 7
+        assert summary["selection"]["explicit_scope_count"] == 0
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        ("mutation", "message"),
+        [
+            (
+                lambda payload: payload["selection"].__setitem__(
+                    "profile", "unreviewed-profile"
+                ),
+                "profile mismatch",
+            ),
+            (
+                lambda payload: payload["selection"]["source_refresh"].__setitem__(
+                    "sha256", "0" * 64
+                ),
+                "artifact binding mismatch",
+            ),
+            (
+                lambda payload: payload["selection"]["source_refresh"].__setitem__(
+                    "target_count", 8
+                ),
+                "artifact binding mismatch",
+            ),
+            (
+                lambda payload: payload["selection"]["target_outcomes"][0].__setitem__(
+                    "player_id", 999999
+                ),
+                "exactly seven targets",
+            ),
+            (
+                lambda payload: payload["operations"][0].__setitem__("skipped", 1),
+                "seven terminal player outcomes",
+            ),
+            (
+                lambda payload: payload["budget"].__setitem__("max_requests", 63),
+                "transport budget mismatch",
+            ),
+            (
+                lambda payload: payload["selection"].__setitem__(
+                    "planned_scopes", ["47=2026/2027"]
+                ),
+                "planner surface is not empty",
+            ),
+        ],
+    )
+    def test_source_refresh_rejects_any_widening_or_missing_terminal_proof(
+        self, tmp_path, mutation, message
+    ):
+        import json
+
+        from airflow.exceptions import AirflowException
+
+        mod = _reload_dag_module()
+        payload = _source_refresh_report(mod)
+        mutation(payload)
+        report = tmp_path / "source-refresh-mutated.json"
+        report.write_text(json.dumps(payload), encoding="utf-8")
+
+        with pytest.raises(AirflowException, match=message):
+            mod.validate_data(str(report))
+
+    @pytest.mark.unit
     def test_daily_requires_exact_cohort_and_complete_scope_and_transfer_sets(
         self, tmp_path
     ):
@@ -300,12 +482,11 @@ class TestNativeValidation:
         summary = mod.validate_data(str(report))
 
         assert summary["selection"]["daily_contract"] == "fotmob-daily-v1"
-        assert summary["selection"]["competition_scope"][
-            "competition_count"
-        ] == 21
-        assert summary["selection"]["completed_scopes"] == summary[
-            "selection"
-        ]["planned_scopes"]
+        assert summary["selection"]["competition_scope"]["competition_count"] == 21
+        assert (
+            summary["selection"]["completed_scopes"]
+            == summary["selection"]["planned_scopes"]
+        )
 
     @pytest.mark.unit
     @pytest.mark.parametrize(
@@ -318,9 +499,7 @@ class TestNativeValidation:
                 "competition scope mismatch",
             ),
             (
-                lambda payload: payload["selection"][
-                    "completed_scopes"
-                ].pop(),
+                lambda payload: payload["selection"]["completed_scopes"].pop(),
                 "completed scopes differ",
             ),
             (
@@ -334,15 +513,11 @@ class TestNativeValidation:
                 "entity set mismatch",
             ),
             (
-                lambda payload: payload["budget"].__setitem__(
-                    "max_requests", 2_000
-                ),
+                lambda payload: payload["budget"].__setitem__("max_requests", 2_000),
                 "transport budget mismatch",
             ),
             (
-                lambda payload: payload["budget"].__setitem__(
-                    "proxy_bytes", 1
-                ),
+                lambda payload: payload["budget"].__setitem__("proxy_bytes", 1),
                 "direct-only invariant",
             ),
         ],
@@ -463,9 +638,7 @@ class TestNativeValidation:
         assert validation["selection"] == {
             "entities": ["leaderboards", "season"],
             "explicit_scope_count": 1,
-            "explicit_scope_sha256": hashlib.sha256(
-                b"47=2025/2026\n"
-            ).hexdigest(),
+            "explicit_scope_sha256": hashlib.sha256(b"47=2025/2026\n").hexdigest(),
             "scope_plan_signature": "fmplan1-" + "a" * 64,
             "competition_limit": 0,
             "season_limit": 0,
@@ -527,7 +700,5 @@ class TestSilverDependency:
         assert mod.trigger_silver._init_kwargs["logical_date"] == (
             "{{ logical_date.isoformat() }}"
         )
-        assert mod.seal_publication.upstream_task_ids == {
-            "trigger_silver_transform"
-        }
+        assert mod.seal_publication.upstream_task_ids == {"trigger_silver_transform"}
         assert mod.finalize_publication._init_kwargs["trigger_rule"] == "all_done"

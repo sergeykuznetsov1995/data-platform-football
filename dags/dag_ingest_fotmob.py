@@ -13,6 +13,7 @@ lock and therefore fails before touching Bronze.
 import hashlib
 import re
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any, Dict
 
 from airflow import DAG
@@ -40,6 +41,15 @@ from utils.fotmob_publication import (
     seal_fotmob_publication,
     validate_fotmob_writer_fence,
 )
+from scrapers.fotmob.source_refresh import (
+    PLAYER_SOURCE_REFRESH_ARTIFACT,
+    PLAYER_SOURCE_REFRESH_MAX_DIRECT_MIB,
+    PLAYER_SOURCE_REFRESH_MAX_REQUESTS,
+    PLAYER_SOURCE_REFRESH_PROFILE,
+    PLAYER_SOURCE_REFRESH_SHA256,
+    PLAYER_SOURCE_REFRESH_TARGET_COUNT,
+    load_player_source_refresh_contract,
+)
 
 
 RESULT_PATH = "/tmp/fotmob_result_{{ ts_nodash }}_{{ ti.try_number }}.json"
@@ -52,16 +62,13 @@ PUBLICATION_BINDING_TEMPLATE = {
     "source": "{{ dag_run.conf['fotmob_publication']['binding']['source'] }}",
     "owner": "{{ dag_run.conf['fotmob_publication']['binding']['owner'] }}",
     "data_interval_start": (
-        "{{ dag_run.conf['fotmob_publication']['binding']"
-        "['data_interval_start'] }}"
+        "{{ dag_run.conf['fotmob_publication']['binding']['data_interval_start'] }}"
     ),
     "data_interval_end": (
-        "{{ dag_run.conf['fotmob_publication']['binding']"
-        "['data_interval_end'] }}"
+        "{{ dag_run.conf['fotmob_publication']['binding']['data_interval_end'] }}"
     ),
     "runtime_fingerprint": (
-        "{{ dag_run.conf['fotmob_publication']['binding']"
-        "['runtime_fingerprint'] }}"
+        "{{ dag_run.conf['fotmob_publication']['binding']['runtime_fingerprint'] }}"
     ),
 }
 
@@ -90,9 +97,7 @@ def _validate_daily_selection(
     competition_scope = selection.get("competition_scope")
     planned_scopes = selection.get("planned_scopes")
     completed_scopes = selection.get("completed_scopes")
-    completed_transfer_ids = selection.get(
-        "completed_transfer_competition_ids"
-    )
+    completed_transfer_ids = selection.get("completed_transfer_competition_ids")
 
     if selection.get("daily_contract") != FOTMOB_DAILY_CONTRACT_SCHEMA:
         violations.append("daily contract schema mismatch")
@@ -102,20 +107,13 @@ def _validate_daily_selection(
         violations.append("daily exact season scope must be empty")
     if entities != sorted(FOTMOB_DAILY_ENTITIES):
         violations.append("daily entity set mismatch")
-    if (
-        selection.get("competition_limit") != 0
-        or selection.get("season_limit") != 0
-    ):
+    if selection.get("competition_limit") != 0 or selection.get("season_limit") != 0:
         violations.append("daily planner limits must be zero")
-    if (
-        selection.get("requests_per_minute")
-        != FOTMOB_DAILY_REQUESTS_PER_MINUTE
-    ):
+    if selection.get("requests_per_minute") != FOTMOB_DAILY_REQUESTS_PER_MINUTE:
         violations.append("daily request rate mismatch")
     if (
         budget.get("max_requests") != FOTMOB_DAILY_MAX_REQUESTS
-        or budget.get("max_direct_bytes")
-        != FOTMOB_DAILY_MAX_DIRECT_MIB * 1024 * 1024
+        or budget.get("max_direct_bytes") != FOTMOB_DAILY_MAX_DIRECT_MIB * 1024 * 1024
         or budget.get("max_proxy_bytes") != 0
     ):
         violations.append("daily transport budget mismatch")
@@ -136,18 +134,15 @@ def _validate_daily_selection(
             planned_pairs.append((int(match.group(1)), match.group(2)))
         if len(planned_pairs) != len(set(planned_pairs)):
             violations.append("duplicate daily planned scopes")
-        if {
-            competition_id for competition_id, _season in planned_pairs
-        } != set(expected_ids):
+        if {competition_id for competition_id, _season in planned_pairs} != set(
+            expected_ids
+        ):
             violations.append("daily planned scopes do not cover exact cohort")
     if completed_scopes != planned_scopes:
         violations.append("daily completed scopes differ from exact plan")
-    valid_transfer_ids = (
-        isinstance(completed_transfer_ids, list)
-        and all(
-            isinstance(value, int) and not isinstance(value, bool)
-            for value in completed_transfer_ids
-        )
+    valid_transfer_ids = isinstance(completed_transfer_ids, list) and all(
+        isinstance(value, int) and not isinstance(value, bool)
+        for value in completed_transfer_ids
     )
     if not valid_transfer_ids or (
         len(completed_transfer_ids) != len(set(completed_transfer_ids))
@@ -184,6 +179,157 @@ def _validate_daily_selection(
         "planned_scopes": planned_scopes,
         "completed_scopes": completed_scopes,
         "completed_transfer_competition_ids": completed_transfer_ids,
+        "requests_per_minute": selection.get("requests_per_minute"),
+    }
+
+
+def _source_refresh_contract() -> Dict[str, Any]:
+    return load_player_source_refresh_contract(
+        Path(__file__).resolve().parents[1] / PLAYER_SOURCE_REFRESH_ARTIFACT
+    )
+
+
+def _validate_source_refresh_selection(
+    *,
+    result: Dict[str, Any],
+    selection: Dict[str, Any],
+    entities: list[str],
+    raw_scopes: list[str],
+    budget: Dict[str, Any],
+) -> tuple[list[str], Dict[str, Any]]:
+    """Validate the one seven-player network exception byte for byte."""
+
+    violations: list[str] = []
+    contract = _source_refresh_contract()
+    expected_source = {
+        key: contract[key]
+        for key in (
+            "profile",
+            "artifact",
+            "sha256",
+            "target_count",
+            "targets",
+            "plan_signature",
+        )
+    }
+    outcomes = selection.get("target_outcomes")
+    valid_outcomes = (
+        isinstance(outcomes, list)
+        and len(outcomes) == PLAYER_SOURCE_REFRESH_TARGET_COUNT
+        and all(
+            isinstance(item, dict)
+            and set(item)
+            == {
+                "competition_id",
+                "source_season_key",
+                "team_id",
+                "player_id",
+                "status",
+            }
+            and item.get("status") in {"success", "not_available"}
+            for item in outcomes
+        )
+    )
+    if valid_outcomes:
+        observed_targets = [
+            {key: item[key] for key in contract["targets"][0]} for item in outcomes
+        ]
+        valid_outcomes = observed_targets == contract["targets"]
+
+    operations = result.get("operations") or []
+    operation_entities = [
+        item.get("entity") for item in operations if isinstance(item, dict)
+    ]
+    expected_operation_entities = {
+        "player_snapshots",
+        "player_source_refresh_contract",
+        "commit_flush",
+        "current_views",
+    }
+    if (
+        len(operation_entities) != len(expected_operation_entities)
+        or set(operation_entities) != expected_operation_entities
+    ):
+        violations.append("source refresh performed work outside seven players")
+
+    player_operations = [
+        item for item in operations if item.get("entity") == "player_snapshots"
+    ]
+    contract_operations = [
+        item
+        for item in operations
+        if item.get("entity") == "player_source_refresh_contract"
+    ]
+    if len(player_operations) != 1:
+        violations.append("missing exact source-refresh player operation")
+    else:
+        operation = player_operations[0]
+        unavailable = sum(
+            isinstance(item, dict) and item.get("status") == "not_available"
+            for item in outcomes or []
+        )
+        if (
+            operation.get("status") != "success"
+            or operation.get("attempted") != PLAYER_SOURCE_REFRESH_TARGET_COUNT
+            or operation.get("skipped") != 0
+            or operation.get("not_available") != unavailable
+            or int(operation.get("succeeded") or 0) + unavailable
+            != PLAYER_SOURCE_REFRESH_TARGET_COUNT
+        ):
+            violations.append("source refresh lacks seven terminal player outcomes")
+    if len(contract_operations) != 1:
+        violations.append("missing source-refresh contract operation")
+    else:
+        operation = contract_operations[0]
+        metadata = operation.get("metadata") or {}
+        if (
+            operation.get("status") != "success"
+            or operation.get("attempted") != PLAYER_SOURCE_REFRESH_TARGET_COUNT
+            or operation.get("succeeded") != PLAYER_SOURCE_REFRESH_TARGET_COUNT
+            or (operation.get("counts") or {}).get("terminal_targets")
+            != PLAYER_SOURCE_REFRESH_TARGET_COUNT
+            or metadata.get("profile") != PLAYER_SOURCE_REFRESH_PROFILE
+            or metadata.get("targets_sha256") != PLAYER_SOURCE_REFRESH_SHA256
+            or metadata.get("target_outcomes") != outcomes
+        ):
+            violations.append("source-refresh contract operation differs")
+
+    if selection.get("profile") != PLAYER_SOURCE_REFRESH_PROFILE:
+        violations.append("source-refresh profile mismatch")
+    if selection.get("source_refresh") != expected_source:
+        violations.append("source-refresh artifact binding mismatch")
+    if not valid_outcomes:
+        violations.append("source refresh did not prove exactly seven targets")
+    if raw_scopes:
+        violations.append("source refresh must not execute catalog scopes")
+    if entities != ["players"]:
+        violations.append("source refresh entities must be exactly players")
+    if (
+        selection.get("competition_limit") != 0
+        or selection.get("season_limit") != 0
+        or selection.get("planned_scopes") != []
+        or selection.get("completed_scopes") != []
+        or selection.get("completed_transfer_competition_ids") != []
+    ):
+        violations.append("source refresh planner surface is not empty")
+    if selection.get("requests_per_minute") != 30:
+        violations.append("source refresh request rate mismatch")
+    if selection.get("scope_plan_signature") != contract["plan_signature"]:
+        violations.append("source refresh plan signature mismatch")
+    if (
+        budget.get("max_requests") != PLAYER_SOURCE_REFRESH_MAX_REQUESTS
+        or budget.get("max_direct_bytes")
+        != PLAYER_SOURCE_REFRESH_MAX_DIRECT_MIB * 1024 * 1024
+        or budget.get("max_proxy_bytes") != 0
+    ):
+        violations.append("source refresh transport budget mismatch")
+
+    return violations, {
+        "profile": selection.get("profile"),
+        "source_refresh": selection.get("source_refresh"),
+        "target_outcomes": outcomes,
+        "planned_scopes": selection.get("planned_scopes"),
+        "completed_scopes": selection.get("completed_scopes"),
         "requests_per_minute": selection.get("requests_per_minute"),
     }
 
@@ -282,14 +428,20 @@ def validate_data(
             violations.append("proxy-byte budget exceeded")
         if not result.get("operations"):
             violations.append("no native operations recorded")
-        catalog_counts = [
-            int((operation.get("counts") or {}).get("competitions") or 0)
-            for operation in result.get("operations") or []
-            if operation.get("entity") == "competition_catalog"
-        ]
-        if not catalog_counts or max(catalog_counts) <= 0:
-            violations.append("complete competition catalog was not recorded")
         selection = result.get("selection")
+        selection_profile = (
+            str(selection.get("profile") or "").strip()
+            if isinstance(selection, dict)
+            else ""
+        )
+        if not selection_profile:
+            catalog_counts = [
+                int((operation.get("counts") or {}).get("competitions") or 0)
+                for operation in result.get("operations") or []
+                if operation.get("entity") == "competition_catalog"
+            ]
+            if not catalog_counts or max(catalog_counts) <= 0:
+                violations.append("complete competition catalog was not recorded")
         selection_summary = None
         if mode != "discover":
             if not isinstance(selection, dict):
@@ -310,7 +462,9 @@ def validate_data(
                     violations.append("invalid exact scope selection evidence")
                 elif (
                     not isinstance(entities, list)
-                    or any(not isinstance(entity, str) or not entity for entity in entities)
+                    or any(
+                        not isinstance(entity, str) or not entity for entity in entities
+                    )
                     or entities != sorted(set(entities))
                 ):
                     violations.append("invalid native entity selection evidence")
@@ -332,15 +486,29 @@ def validate_data(
                         "competition_limit": selection.get("competition_limit"),
                         "season_limit": selection.get("season_limit"),
                     }
-                    if mode == "daily":
-                        daily_violations, daily_summary = (
-                            _validate_daily_selection(
+                    if selection_profile:
+                        source_violations, source_summary = (
+                            _validate_source_refresh_selection(
                                 result=result,
                                 selection=selection,
                                 entities=entities,
                                 raw_scopes=raw_scopes,
                                 budget=budget,
                             )
+                        )
+                        if mode != "backfill":
+                            source_violations.append(
+                                "source refresh mode must be backfill"
+                            )
+                        violations.extend(source_violations)
+                        selection_summary.update(source_summary)
+                    elif mode == "daily":
+                        daily_violations, daily_summary = _validate_daily_selection(
+                            result=result,
+                            selection=selection,
+                            entities=entities,
+                            raw_scopes=raw_scopes,
+                            budget=budget,
                         )
                         violations.extend(daily_violations)
                         selection_summary.update(daily_summary)
@@ -394,6 +562,17 @@ with DAG(
         "competition_scope_file": Param(default="", type="string"),
         "competition_scope_sha256": Param(default="", type="string"),
         "competition_ids_sha256": Param(default="", type="string"),
+        "source_refresh_profile": Param(
+            default="", type="string", enum=["", PLAYER_SOURCE_REFRESH_PROFILE]
+        ),
+        "source_refresh_targets_sha256": Param(
+            default="", type="string", enum=["", PLAYER_SOURCE_REFRESH_SHA256]
+        ),
+        "source_refresh_target_count": Param(
+            default=0,
+            type="integer",
+            enum=[0, PLAYER_SOURCE_REFRESH_TARGET_COUNT],
+        ),
         "entities": Param(
             default="season,leaderboards,matches,teams,players,transfers",
             type="string",
@@ -407,6 +586,11 @@ with DAG(
         "max_direct_mib": Param(default=256, type="integer", minimum=1),
         "competition_limit": Param(default=0, type="integer", minimum=0),
         "season_limit": Param(default=0, type="integer", minimum=0),
+        "match_limit": Param(default=0, type="integer", minimum=0),
+        "team_limit": Param(default=0, type="integer", minimum=0),
+        "player_limit": Param(default=0, type="integer", minimum=0),
+        "max_proxy_mib": Param(default=0, type="integer", minimum=0, maximum=0),
+        "max_attempts": Param(default=4, type="integer", enum=[4]),
         "requests_per_minute": Param(
             default=30,
             type="integer",
@@ -445,24 +629,31 @@ with DAG(
 cd /opt/airflow && \\
 python dags/scripts/run_fotmob_scraper.py \\
     --publication-generation-id "{PUBLICATION_GENERATION_TEMPLATE}" \\
-    --publication-schema "{PUBLICATION_BINDING_TEMPLATE['schema']}" \\
-    --publication-source "{PUBLICATION_BINDING_TEMPLATE['source']}" \\
-    --publication-owner "{PUBLICATION_BINDING_TEMPLATE['owner']}" \\
-    --publication-data-interval-start "{PUBLICATION_BINDING_TEMPLATE['data_interval_start']}" \\
-    --publication-data-interval-end "{PUBLICATION_BINDING_TEMPLATE['data_interval_end']}" \\
-    --publication-runtime-fingerprint "{PUBLICATION_BINDING_TEMPLATE['runtime_fingerprint']}" \\
+    --publication-schema "{PUBLICATION_BINDING_TEMPLATE["schema"]}" \\
+    --publication-source "{PUBLICATION_BINDING_TEMPLATE["source"]}" \\
+    --publication-owner "{PUBLICATION_BINDING_TEMPLATE["owner"]}" \\
+    --publication-data-interval-start "{PUBLICATION_BINDING_TEMPLATE["data_interval_start"]}" \\
+    --publication-data-interval-end "{PUBLICATION_BINDING_TEMPLATE["data_interval_end"]}" \\
+    --publication-runtime-fingerprint "{PUBLICATION_BINDING_TEMPLATE["runtime_fingerprint"]}" \\
     --mode "{{{{ params.mode }}}}" \\
     --scope "{{{{ params.scope }}}}" \\
     --daily-contract "{{{{ params.daily_contract }}}}" \\
     --competition-scope-file "{{{{ params.competition_scope_file }}}}" \\
     --competition-scope-sha256 "{{{{ params.competition_scope_sha256 }}}}" \\
     --competition-ids-sha256 "{{{{ params.competition_ids_sha256 }}}}" \\
+    --source-refresh-profile "{{{{ params.source_refresh_profile }}}}" \\
+    --source-refresh-targets-sha256 "{{{{ params.source_refresh_targets_sha256 }}}}" \\
     --entities "{{{{ params.entities }}}}" \\
     --max-requests "{{{{ params.max_requests }}}}" \\
     --max-direct-mib "{{{{ params.max_direct_mib }}}}" \\
-    --max-proxy-mib 0 \\
+    --max-proxy-mib "{{{{ params.max_proxy_mib }}}}" \\
     --competition-limit "{{{{ params.competition_limit }}}}" \\
     --season-limit "{{{{ params.season_limit }}}}" \\
+    --match-limit "{{{{ params.match_limit }}}}" \\
+    --team-limit "{{{{ params.team_limit }}}}" \\
+    --player-limit "{{{{ params.player_limit }}}}" \\
+    --max-attempts "{{{{ params.max_attempts }}}}" \\
+    --next-build-id "" \\
     --requests-per-minute "{{{{ params.requests_per_minute }}}}" \\
     --workers 4 \\
     --output "{RESULT_PATH}"
@@ -493,10 +684,7 @@ python dags/scripts/run_fotmob_scraper.py \\
     trigger_silver = TriggerDagRunOperator(
         task_id="trigger_silver_transform",
         trigger_dag_id="dag_transform_fotmob_silver",
-        trigger_run_id=(
-            "fotmob_silver__"
-            + PUBLICATION_GENERATION_TEMPLATE
-        ),
+        trigger_run_id=("fotmob_silver__" + PUBLICATION_GENERATION_TEMPLATE),
         logical_date="{{ logical_date.isoformat() }}",
         conf={
             "fotmob_publication": {

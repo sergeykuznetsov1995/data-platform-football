@@ -77,6 +77,28 @@ def _daily_cli(monkeypatch):
     ]
 
 
+def _source_refresh_cli():
+    from scrapers.fotmob.source_refresh import (
+        PLAYER_SOURCE_REFRESH_MAX_DIRECT_MIB,
+        PLAYER_SOURCE_REFRESH_MAX_REQUESTS,
+        PLAYER_SOURCE_REFRESH_PROFILE,
+        PLAYER_SOURCE_REFRESH_SHA256,
+    )
+
+    return [
+        "--source-refresh-profile",
+        PLAYER_SOURCE_REFRESH_PROFILE,
+        "--source-refresh-targets-sha256",
+        PLAYER_SOURCE_REFRESH_SHA256,
+        "--entities",
+        "players",
+        "--max-requests",
+        str(PLAYER_SOURCE_REFRESH_MAX_REQUESTS),
+        "--max-direct-mib",
+        str(PLAYER_SOURCE_REFRESH_MAX_DIRECT_MIB),
+    ]
+
+
 def _run_native_admitted(mod, args, **kwargs):
     """Exercise native planning under an explicit test-only active identity."""
 
@@ -230,6 +252,95 @@ class TestFotmobNativeRunner:
 
         writer.assert_not_called()
         service.assert_not_called()
+
+    @pytest.mark.unit
+    def test_source_refresh_cli_rejects_profile_or_scope_widening(self, monkeypatch):
+        mod = self._module()
+        publication_args, publication = _publication_cli(monkeypatch)
+        parser = mod._argument_parser()
+        args = parser.parse_args(
+            ["--mode", "backfill", *_source_refresh_cli(), *publication_args]
+        )
+
+        assert mod._validate_args(parser, args) == publication
+        assert args.source_refresh_contract["target_count"] == 7
+        assert args.source_refresh_contract["player_ids"] == [
+            302783,
+            798654,
+            863822,
+            1025603,
+            1074750,
+            1292100,
+            1334842,
+        ]
+
+        rejected = (
+            ["--source-refresh-profile", "$(touch /tmp/not-allowed)"],
+            ["--scope", "47=2026/2027"],
+            ["--entities", "players,teams"],
+            ["--player-limit", "7"],
+            ["--max-requests", "63"],
+            ["--next-build-id", "operator-build"],
+        )
+        base = _source_refresh_cli()
+        for replacement in rejected:
+            option = replacement[0]
+            mutated = list(base)
+            if option in mutated:
+                mutated[mutated.index(option) + 1] = replacement[1]
+            else:
+                mutated.extend(replacement)
+            with pytest.raises(SystemExit):
+                candidate = parser.parse_args(
+                    ["--mode", "backfill", *mutated, *publication_args]
+                )
+                mod._validate_args(parser, candidate)
+
+    @pytest.mark.unit
+    def test_source_refresh_runs_only_fixed_players_and_forces_retry_observation(
+        self, monkeypatch
+    ):
+        from scrapers.fotmob.planner import RunMode
+        from scrapers.fotmob.service import OperationResult
+        from tests.unit.scrapers.test_fotmob_service import _service
+
+        mod = self._module()
+        publication_args, _publication = _publication_cli(monkeypatch)
+        parser = mod._argument_parser()
+        args = parser.parse_args(
+            ["--mode", "backfill", *_source_refresh_cli(), *publication_args]
+        )
+        mod._validate_args(parser, args)
+        service, _transport, repository = _service({}, mode=RunMode.BACKFILL)
+        repository.ensure_current_views = MagicMock(return_value=[])
+        service.discover_catalog = MagicMock(
+            side_effect=AssertionError("source refresh must not discover catalog")
+        )
+        outcomes = [
+            {"player_id": player_id, "status": "success"}
+            for player_id in args.source_refresh_contract["player_ids"]
+        ]
+        service.sync_player_snapshots = MagicMock(
+            return_value=OperationResult(
+                "player_snapshots",
+                attempted=7,
+                succeeded=7,
+                metadata={"terminal_outcomes": outcomes},
+            )
+        )
+
+        rc, report = _run_native_admitted(mod, args, service=service)
+
+        assert rc == 0, report["errors"]
+        assert report["selection"]["entities"] == ["players"]
+        assert report["selection"]["explicit_scopes"] == []
+        assert len(report["selection"]["target_outcomes"]) == 7
+        service.sync_player_snapshots.assert_called_once_with(
+            args.source_refresh_contract["player_ids"],
+            force_refresh=True,
+            capture_terminal_outcomes=True,
+        )
+        service.discover_catalog.assert_not_called()
 
     @pytest.mark.unit
     @pytest.mark.parametrize("inject_service", [False, True])

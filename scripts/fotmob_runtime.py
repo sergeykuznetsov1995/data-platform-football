@@ -43,6 +43,17 @@ EXPECTED_DAGS = {
     "dag_transform_fotmob_silver",
     "dag_trigger_fotmob_daily",
 }
+SCHEDULE_BOUNDARY_FIELDS = (
+    "logical_date",
+    "data_interval_start",
+    "data_interval_end",
+    "run_after",
+)
+# Identity/ownership proof only: ``failed`` still means that the exact admitted
+# scheduled interval exists and cannot be treated as safe to recreate.
+EXACT_SCHEDULED_RUN_STATES = frozenset({"queued", "running", "success", "failed"})
+SHARED_CONSUMER_DAG_ID = "dag_sofascore_pipeline"
+ISOLATED_DAILY_DAG_ID = "dag_trigger_fotmob_daily"
 SHARED_RUNTIME_ROOTS = {
     "dags": "/opt/airflow/dags",
     "scrapers": "/opt/airflow/scrapers",
@@ -75,6 +86,7 @@ ISOLATED_DAG_PREFIXES = (
 ISOLATED_AIRFLOWIGNORE_PATH = "dags/.airflowignore"
 SHARED_REQUIRED_RUNTIME_PATHS = {
     "configs/fotmob/competitions.json",
+    "configs/fotmob/issue-930-player-source-refresh.json",
     "configs/fotmob/issue-930-scopes.txt",
     "dags/.airflowignore",
     "dags/dag_ingest_fotmob.py",
@@ -103,12 +115,17 @@ SHARED_REQUIRED_RUNTIME_PATHS = {
     "scrapers/fotmob/raw_store.py",
     "scrapers/fotmob/repository.py",
     "scrapers/fotmob/service.py",
+    "scrapers/fotmob/source_refresh.py",
     "scrapers/fotmob/transport.py",
 }
 MASTER_RUNTIME_PATH = "dags/dag_master_pipeline.py"
 APPROVED_SCOPE_PATH = "configs/fotmob/issue-930-scopes.txt"
 APPROVED_SCOPE_SHA256 = (
     "f1d95f916c78ed80e5784e2cd5bda7263cece37d9fde6d52fb2a1a4d9e97cb58"
+)
+PLAYER_SOURCE_REFRESH_PATH = "configs/fotmob/issue-930-player-source-refresh.json"
+PLAYER_SOURCE_REFRESH_SHA256 = (
+    "f6cb854c6d60463c899fd9077b61a71d8d0f817741c3a9d6423925b32949045b"
 )
 SHARED_STATE_DAGS = {
     "dag_master_pipeline",
@@ -123,7 +140,7 @@ SHARED_STATE_DAGS = {
 }
 EXPECTED_SHARED_PAUSE_STATES = {
     "dag_master_pipeline": True,
-    "dag_sofascore_pipeline": False,
+    "dag_sofascore_pipeline": True,
     "dag_ingest_fotmob": True,
     "dag_transform_fotmob_silver": True,
 }
@@ -169,6 +186,10 @@ def shared_runtime_manifest(release_root: Path) -> dict[str, str]:
     if manifest[APPROVED_SCOPE_PATH] != APPROVED_SCOPE_SHA256:
         raise RuntimeBindingError(
             "issue-930 scope artifact differs from approved SHA-256"
+        )
+    if manifest[PLAYER_SOURCE_REFRESH_PATH] != PLAYER_SOURCE_REFRESH_SHA256:
+        raise RuntimeBindingError(
+            "issue-930 player source-refresh artifact differs from approved SHA-256"
         )
     return manifest
 
@@ -242,6 +263,127 @@ def _validate_fenced_downstream_proof(
         )
 
 
+def _normalize_schedule_boundary(raw: Any, *, label: str) -> dict[str, str]:
+    if not isinstance(raw, Mapping) or set(raw) != set(SCHEDULE_BOUNDARY_FIELDS):
+        raise RuntimeBindingError(f"{label} next scheduled interval is incomplete")
+    parsed: dict[str, datetime] = {}
+    for field in SCHEDULE_BOUNDARY_FIELDS:
+        value = raw.get(field)
+        if not isinstance(value, str) or not value.strip():
+            raise RuntimeBindingError(f"{label} {field} is missing")
+        try:
+            instant = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise RuntimeBindingError(
+                f"{label} {field} is not an ISO-8601 instant"
+            ) from exc
+        if instant.tzinfo is None or instant.utcoffset() is None:
+            raise RuntimeBindingError(f"{label} {field} has no timezone")
+        parsed[field] = instant.astimezone(timezone.utc)
+    if parsed["logical_date"] != parsed["data_interval_start"]:
+        raise RuntimeBindingError(f"{label} logical date differs from interval start")
+    if parsed["data_interval_start"] >= parsed["data_interval_end"]:
+        raise RuntimeBindingError(f"{label} next scheduled interval is invalid")
+    if parsed["run_after"] != parsed["data_interval_end"]:
+        raise RuntimeBindingError(f"{label} run-after differs from interval end")
+    return {
+        field: parsed[field].isoformat(timespec="microseconds")
+        for field in SCHEDULE_BOUNDARY_FIELDS
+    }
+
+
+def _scheduled_run_id(logical_date: Any) -> str:
+    """Mirror Airflow 2.11 ``DagRunType.SCHEDULED.generate_run_id`` exactly."""
+
+    # Airflow formats the timezone-aware logical datetime with default
+    # ``datetime.isoformat()``: zero microseconds are omitted, non-zero values
+    # are retained.  The admitted boundary is normalized to UTC first.
+    return f"scheduled__{_timestamp(logical_date).isoformat()}"
+
+
+def _validate_active_schedule_proof(
+    payload: Mapping[str, Any], expected_boundary: Mapping[str, str]
+) -> None:
+    safety = payload.get("activation_safety_window")
+    if (
+        not isinstance(safety, Mapping)
+        or safety.get("passed") is not True
+        or not isinstance(safety.get("timeout_seconds"), int)
+        or not isinstance(safety.get("required_seconds"), int)
+        or not isinstance(safety.get("remaining_seconds"), int)
+        or safety["required_seconds"] < max(15 * 60, safety["timeout_seconds"] + 5 * 60)
+        or safety["remaining_seconds"] < safety["required_seconds"]
+    ):
+        raise RuntimeBindingError("active report has no valid schedule safety window")
+    checked_at = _timestamp(safety.get("checked_at"))
+    next_boundary = _timestamp(safety.get("next_boundary"))
+    if next_boundary <= checked_at:
+        raise RuntimeBindingError("active schedule safety window is inverted")
+
+    activation = payload.get("scheduled_activation")
+    if (
+        not isinstance(activation, Mapping)
+        or set(activation) != {"status", "producer", "consumer", "exact_identity_match"}
+        or activation.get("status") != "proved"
+        or activation.get("exact_identity_match") is not True
+    ):
+        raise RuntimeBindingError("active report has no exact scheduled handoff proof")
+    normalized_runs: dict[str, dict[str, str]] = {}
+    expected_dags = {
+        "producer": ISOLATED_DAILY_DAG_ID,
+        "consumer": SHARED_CONSUMER_DAG_ID,
+    }
+    expected_run_id = _scheduled_run_id(expected_boundary.get("logical_date"))
+    for role, dag_id in expected_dags.items():
+        row = activation.get(role)
+        if not isinstance(row, Mapping) or set(row) != {
+            "dag_id",
+            "run_id",
+            "run_type",
+            "logical_date",
+            "data_interval_start",
+            "data_interval_end",
+            "state",
+        }:
+            raise RuntimeBindingError(f"active {role} scheduled proof is incomplete")
+        boundary = _normalize_schedule_boundary(
+            {
+                "logical_date": row.get("logical_date"),
+                "data_interval_start": row.get("data_interval_start"),
+                "data_interval_end": row.get("data_interval_end"),
+                "run_after": row.get("data_interval_end"),
+            },
+            label=f"active {role}",
+        )
+        if (
+            row.get("dag_id") != dag_id
+            or row.get("run_type") != "scheduled"
+            or row.get("run_id") != expected_run_id
+            or str(row.get("state") or "").casefold() not in EXACT_SCHEDULED_RUN_STATES
+            or boundary != dict(expected_boundary)
+        ):
+            raise RuntimeBindingError(f"active {role} does not match admitted interval")
+        normalized_runs[role] = {
+            "run_id": str(row["run_id"]),
+            "run_type": str(row["run_type"]),
+            **boundary,
+        }
+    identity_fields = (
+        "run_id",
+        "run_type",
+        "logical_date",
+        "data_interval_start",
+        "data_interval_end",
+    )
+    if any(
+        normalized_runs["producer"][field] != normalized_runs["consumer"][field]
+        for field in identity_fields
+    ):
+        raise RuntimeBindingError(
+            "active producer/consumer scheduled identities differ"
+        )
+
+
 def _validate_shared_handoff_report(
     handoff: Any,
     *,
@@ -262,6 +404,11 @@ def _validate_shared_handoff_report(
         or handoff.get("control_database") != control_database
     ):
         raise RuntimeBindingError("deployment report has no valid shared runtime proof")
+
+    _normalize_schedule_boundary(
+        handoff.get("next_scheduled_interval"),
+        label=f"shared {SHARED_CONSUMER_DAG_ID}",
+    )
 
     admission_mount = handoff.get("shared_admission_mount")
     if not isinstance(admission_mount, Mapping) or dict(admission_mount) != dict(
@@ -445,9 +592,9 @@ def load_deployment_context(
     if payload.get("schema_version") != "fotmob-deploy-v2":
         raise RuntimeBindingError("unsupported deployment report schema")
     activation_state = payload.get("activation_state")
-    if activation_state == "committed_pending_trigger":
+    if activation_state in {"committed_pending_trigger", "pending_consumer"}:
         raise RuntimeBindingError(
-            "deployment trigger activation is incomplete; rerun deploy"
+            "deployment consumer activation is incomplete; resume deploy"
         )
     if activation_state not in {"active", "kept_paused"}:
         raise RuntimeBindingError("deployment report has no completed activation state")
@@ -490,6 +637,7 @@ def load_deployment_context(
         "control_database",
         "shared_handoff_initial",
         "shared_handoff_final",
+        "schedule_boundary",
         "generated_at",
     )
     missing = [key for key in required if not str(payload.get(key, "")).strip()]
@@ -608,6 +756,61 @@ def load_deployment_context(
         expected_runtime_manifest=expected_runtime_manifest,
         expected_admission_mount=expected_admission_mount,
     )
+    schedule_boundary = payload.get("schedule_boundary")
+    expected_boundary_keys = {
+        "shared_dag_id",
+        "isolated_dag_id",
+        "shared_initial",
+        "shared_final",
+        "isolated_initial",
+        "isolated_final",
+        "exact_match",
+    }
+    if activation_state == "active":
+        expected_boundary_keys.update({"shared_commit", "isolated_commit"})
+    if (
+        not isinstance(schedule_boundary, Mapping)
+        or set(schedule_boundary) != expected_boundary_keys
+        or schedule_boundary.get("shared_dag_id") != SHARED_CONSUMER_DAG_ID
+        or schedule_boundary.get("isolated_dag_id") != ISOLATED_DAILY_DAG_ID
+        or schedule_boundary.get("exact_match") is not True
+    ):
+        raise RuntimeBindingError(
+            "deployment report has no exact producer/consumer schedule proof"
+        )
+    boundary_names = [
+        "shared_initial",
+        "shared_final",
+        "isolated_initial",
+        "isolated_final",
+    ]
+    if activation_state == "active":
+        boundary_names.extend(["shared_commit", "isolated_commit"])
+    normalized_boundaries = {
+        key: _normalize_schedule_boundary(
+            schedule_boundary.get(key), label=f"deployment {key}"
+        )
+        for key in boundary_names
+    }
+    expected_boundary = normalized_boundaries["shared_initial"]
+    if (
+        any(value != expected_boundary for value in normalized_boundaries.values())
+        or _normalize_schedule_boundary(
+            initial_handoff.get("next_scheduled_interval"),
+            label="initial shared handoff",
+        )
+        != expected_boundary
+        or _normalize_schedule_boundary(
+            final_handoff.get("next_scheduled_interval"),
+            label="final shared handoff",
+        )
+        != expected_boundary
+    ):
+        raise RuntimeBindingError(
+            "deployment producer/consumer next scheduled intervals differ"
+        )
+    if activation_state == "active":
+        _validate_active_schedule_proof(payload, expected_boundary)
     if (
         initial_handoff["shared_scheduler_container"]
         != final_handoff["shared_scheduler_container"]

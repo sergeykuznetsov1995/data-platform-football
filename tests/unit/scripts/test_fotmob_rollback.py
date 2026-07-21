@@ -7,6 +7,7 @@ from scripts import fotmob_rollback as mod
 from tests.unit.scripts.fotmob_runtime_fixture import (
     isolated_runtime_proof,
     materialize_shared_runtime,
+    schedule_boundary_proof,
     shared_handoff_proof,
 )
 
@@ -81,6 +82,7 @@ def args(tmp_path, **overrides):
                 "shared_handoff_final": shared_handoff_proof(
                     shared_control, release_root=tmp_path
                 ),
+                "schedule_boundary": schedule_boundary_proof(),
                 "kept_paused": True,
                 "paused": [
                     "dag_ingest_fotmob",
