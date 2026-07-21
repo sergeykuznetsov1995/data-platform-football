@@ -9,7 +9,7 @@ from scrapers.fotmob.repository import (
     MemoryFotMobRepository,
     TargetCommit,
 )
-from scrapers.fotmob.service import FotMobIngestService
+from scrapers.fotmob.service import FotMobIngestService, OperationResult
 from scrapers.fotmob.transport import (
     FetchOutcome,
     FetchResult,
@@ -581,6 +581,39 @@ def test_match_payload_uses_one_request_and_second_call_skips_success():
     )
 
 
+def test_match_payload_data_not_found_body_is_intentional_not_available():
+    bundle = parse_season_bundle(_league_payload(), ScopeRef(47, "2025/2026"))
+    match_url = canonicalize_target("matchDetails", {"matchId": "100"}).canonical_url
+    payload = {"error": True, "message": "Data not found", "matchId": "100"}
+    service, transport, repository = _service({match_url: payload})
+
+    result = service.sync_match_payloads(bundle)
+
+    assert result.ok
+    assert result.not_available == 1
+    assert result.metadata["intentional_not_available"] == 1
+    assert not result.errors
+    assert "fotmob_match_payloads" not in repository.tables
+    commit = next(c for c in repository.commits if c.target_type == "match")
+    assert commit.status == ManifestStatus.NOT_AVAILABLE
+    assert commit.error_code == "source_data_not_found"
+
+
+def test_match_payload_unfamiliar_error_body_stays_schema_drift():
+    bundle = parse_season_bundle(_league_payload(), ScopeRef(47, "2025/2026"))
+    match_url = canonicalize_target("matchDetails", {"matchId": "100"}).canonical_url
+    payload = {"error": True, "message": "Internal error", "matchId": "100"}
+    service, transport, repository = _service({match_url: payload})
+
+    result = service.sync_match_payloads(bundle)
+
+    assert result.not_available == 0
+    assert "intentional_not_available" not in result.metadata
+    assert any("incomplete" in error for error in result.errors)
+    commit = next(c for c in repository.commits if c.target_type == "match")
+    assert commit.status == ManifestStatus.SCHEMA_DRIFT
+
+
 def test_team_snapshots_are_global_observations_not_historical_season_rows():
     bundle = parse_season_bundle(_league_payload(), ScopeRef(47, "2025/2026"))
     team1 = canonicalize_target("teams", {"id": "1"}).canonical_url
@@ -638,6 +671,87 @@ def test_player_next_snapshot_is_global_and_fresh_entity_is_skipped():
     assert row["primary_team_id"] == 1
     assert "source_season_key" not in row
     assert row["snapshot_date"] == "2026-07-11"
+
+
+def _absent_team_fetch(outcome):
+    target = canonicalize_target("teams", {"id": "2222"})
+    return FetchResult(
+        outcome=outcome,
+        target_key=target.target_key,
+        url=target.canonical_url,
+        http_status=200,
+        json_data=None,
+        body=b"null",
+        attempts=1,
+        retries=0,
+        cache_hit=False,
+        stale=False,
+        terminal=False,
+        etag=None,
+        last_modified=None,
+        raw_uri=None,
+        content_hash=None,
+        fetched_at=None,
+        encoded_bytes=4,
+        decoded_bytes=4,
+        direct_bytes=4,
+        proxy_bytes=0,
+    )
+
+
+def test_record_failure_marks_transport_not_available_as_intentional_absence():
+    # Delisted deep-history teams return HTTP 200 with a `null` body, which the
+    # transport reports as NOT_AVAILABLE. That must close the scope, not stall it.
+    result = OperationResult("team_snapshots")
+    FotMobIngestService._record_failure(
+        result, "2222", _absent_team_fetch(FetchOutcome.NOT_AVAILABLE)
+    )
+    assert result.not_available == 1
+    assert result.metadata["intentional_not_available"] == 1
+
+
+def test_record_failure_leaves_retryable_failure_open_and_not_intentional():
+    result = OperationResult("team_snapshots")
+    FotMobIngestService._record_failure(
+        result, "3333", _absent_team_fetch(FetchOutcome.RETRYABLE_FAILURE)
+    )
+    assert result.not_available == 0
+    assert "intentional_not_available" not in result.metadata
+    assert result.retryable == ["3333"]
+
+
+def test_player_null_pageprops_data_is_intentional_not_available():
+    player_url = "https://www.fotmob.com/_next/data/build-1/players/2090857.json"
+    payload = {
+        "pageProps": {"data": None, "fallback": {}, "translations": {}},
+        "__N_SSP": True,
+    }
+    service, _, repository = _service({player_url: payload})
+
+    result = service.sync_player_snapshots([2090857], build_id="build-1")
+
+    assert result.ok
+    assert result.not_available == 1
+    assert result.metadata["intentional_not_available"] == 1
+    assert not result.errors
+    assert "fotmob_player_snapshots" not in repository.tables
+    commit = next(c for c in repository.commits if c.target_type == "player")
+    assert commit.status == ManifestStatus.NOT_AVAILABLE
+    assert commit.error_code == "source_player_no_data"
+
+
+def test_player_payload_without_pageprops_container_stays_parse_failure():
+    player_url = "https://www.fotmob.com/_next/data/build-1/players/10.json"
+    payload = {"unexpected": True}
+    service, _, repository = _service({player_url: payload})
+
+    result = service.sync_player_snapshots([10], build_id="build-1")
+
+    assert result.not_available == 0
+    assert "intentional_not_available" not in result.metadata
+    assert any("parse" in error for error in result.errors)
+    commit = next(c for c in repository.commits if c.target_type == "player")
+    assert commit.status != ManifestStatus.NOT_AVAILABLE
 
 
 def test_player_limit_applies_after_freshness_filter_without_prefix_starvation():

@@ -164,6 +164,42 @@ def _event_year(value: Any, fallback: int) -> int:
     return int(match.group(0)) if match else fallback
 
 
+def _is_source_missing_match_payload(data: Any) -> bool:
+    """FotMob answers HTTP 200 with this exact error body when a match has no
+    stored details (deep history, abandoned fixtures). Anything looser — extra
+    keys, another message — must keep falling through to schema drift."""
+
+    return (
+        isinstance(data, Mapping)
+        and data.get("error") is True
+        and str(data.get("message", "")).strip().lower() == "data not found"
+        and set(data) <= {"error", "matchId", "message"}
+    )
+
+
+def _is_source_missing_player(data: Any) -> bool:
+    """FotMob serves a well-formed Next.js payload whose ``pageProps.data`` is
+    ``null`` for players with no stored profile (deep-history / delisted players).
+    The legacy scraper skips these; the native path must treat them as an
+    intentional absence, not schema drift. Fail closed: only an explicit
+    ``data is None`` inside a real pageProps container counts — a payload missing
+    that container is malformed and stays a hard parse failure."""
+
+    if not isinstance(data, Mapping):
+        return False
+    props = data.get("props")
+    containers = (
+        data.get("pageProps"),
+        props.get("pageProps") if isinstance(props, Mapping) else None,
+    )
+    return any(
+        isinstance(container, Mapping)
+        and "data" in container
+        and container.get("data") is None
+        for container in containers
+    )
+
+
 def _fetch_manifest_status(fetch: FetchResult) -> ManifestStatus:
     if fetch.outcome in {FetchOutcome.SUCCESS, FetchOutcome.STALE_REPLAY}:
         return ManifestStatus.SUCCESS
@@ -451,7 +487,16 @@ class FotMobIngestService:
     @staticmethod
     def _record_failure(result: OperationResult, key: str, fetch: FetchResult) -> None:
         if fetch.outcome == FetchOutcome.NOT_AVAILABLE:
+            # A transport NOT_AVAILABLE is terminal by construction (204/404 or a
+            # 200 ``null`` body — distinct from the retryable class), so the
+            # target is definitively absent at source (e.g. delisted deep-history
+            # teams whose /api/data/teams?id=… returns ``null``). Count it as an
+            # intentional absence so its scope can close instead of re-requesting
+            # the same empty target every iteration and stalling the plan.
             result.not_available += 1
+            result.metadata["intentional_not_available"] = (
+                int(result.metadata.get("intentional_not_available", 0)) + 1
+            )
         elif fetch.outcome == FetchOutcome.RETRYABLE_FAILURE:
             result.retryable.append(key)
         else:
@@ -476,7 +521,11 @@ class FotMobIngestService:
             rows.extend(
                 {
                     "target_type": target_type,
-                    "competition_id": competition_id,
+                    # str() keeps the column object-typed: an int column with
+                    # NaN gaps floats to '53.0' spellings on write.
+                    "competition_id": (
+                        None if competition_id is None else str(competition_id)
+                    ),
                     "source_season_key": source_season_key,
                     "json_path": path,
                     "disposition": disposition,
@@ -1502,6 +1551,22 @@ class FotMobIngestService:
                 )
                 self._record_failure(result, key, fetch)
                 continue
+            if _is_source_missing_match_payload(fetch.data):
+                self._commit_for_fetch(
+                    fetch,
+                    target_type="match",
+                    status=ManifestStatus.NOT_AVAILABLE,
+                    competition_id=bundle.scope.competition_id,
+                    source_season_key=bundle.scope.source_season_key,
+                    entity_id=key,
+                    error_code="source_data_not_found",
+                    error=f"matchDetails error payload: {fetch.data.get('message')}",
+                )
+                result.not_available += 1
+                result.metadata["intentional_not_available"] = (
+                    int(result.metadata.get("intentional_not_available", 0)) + 1
+                )
+                continue
             try:
                 row, coverage = self._match_payload_row(match, fetch.data)
                 paths = inventory_json_paths(fetch.data)
@@ -1952,6 +2017,20 @@ class FotMobIngestService:
             if not fetch.ok:
                 self._commit_for_fetch(fetch, target_type="player", entity_id=key)
                 self._record_failure(result, key, fetch)
+                continue
+            if _is_source_missing_player(fetch.data):
+                self._commit_for_fetch(
+                    fetch,
+                    target_type="player",
+                    status=ManifestStatus.NOT_AVAILABLE,
+                    entity_id=key,
+                    error_code="source_player_no_data",
+                    error="player Next payload has null pageProps.data",
+                )
+                result.not_available += 1
+                result.metadata["intentional_not_available"] = (
+                    int(result.metadata.get("intentional_not_available", 0)) + 1
+                )
                 continue
             try:
                 observed = _aware_datetime(fetch.fetched_at) or utc_now()
