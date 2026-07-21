@@ -713,6 +713,15 @@ def run_sofascore_dq(**context) -> Dict[str, Any]:
                         f"{league} {phase} cannot be skipped in production"
                     )
                 continue
+            if phase == "match" and _capture_noop(result):
+                # #842/#951: a clean incremental no-op (every resolved match is
+                # already terminal in bronze) never runs the capture engine, so
+                # it cannot stamp endpoint_completeness — the same reason
+                # validate_data exempts noop captures above. Without this
+                # exemption every quiet-day/replay run fails the DQ barrier
+                # with a false "completeness" alarm.
+                checked.append(f"{league}:{phase}:noop")
+                continue
             if (
                 result.get("fallback")
                 or result.get("errors")
