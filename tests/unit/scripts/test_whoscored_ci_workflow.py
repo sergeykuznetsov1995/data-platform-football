@@ -246,6 +246,8 @@ def test_ci_uses_test_runtime_and_smokes_immutable_flaresolverr():
     assert "/opt/hostedtoolcache/Python" in contract_job
     assert "x64/bin/python3.11" in contract_job
     assert "/usr/bin/sudo /bin/chmod go-w /opt" in contract_job
+    assert "/usr/bin/sudo /bin/chmod go-w /usr/share" in contract_job
+    assert "/usr/bin/sudo /bin/chmod -R go-w /usr/share/zoneinfo" in contract_job
     assert "/usr/bin/sudo /bin/chown -R root:root /opt/hostedtoolcache/Python" in (
         contract_job
     )
@@ -268,6 +270,9 @@ def test_ci_uses_test_runtime_and_smokes_immutable_flaresolverr():
     assert "BUILDX_CONFIG=$docker_config/buildx" in text
     assert "BUILDX_HOST BUILDX_CONFIG" in text
     assert "--buildkitd-config \"$buildkit_config\"" in text
+    assert text.count("--driver-opt provenance-add-gha=false") == 1
+    assert "test ! -e /etc/buildkit/provenance.d/github_actions_context.json" in text
+    assert "PS4='+ whoscored-contract:${LINENO}: '" in text
     assert "{{.HostConfig.NetworkMode}}" in text
     assert (
         "image=moby/buildkit:v0.31.2@sha256:"

@@ -38,6 +38,10 @@ jobs:
           source_prefix="$(dirname "$(dirname "$source_python")")"
           [[ "$source_prefix" =~ ^/opt/hostedtoolcache/Python/3\.11\.[0-9]+/x64$ ]]
           /usr/bin/sudo /bin/chmod go-w /opt
+          /usr/bin/sudo /bin/chown root:root /usr/share
+          /usr/bin/sudo /bin/chmod go-w /usr/share
+          /usr/bin/sudo /bin/chown -R root:root /usr/share/zoneinfo
+          /usr/bin/sudo /bin/chmod -R go-w /usr/share/zoneinfo
           /usr/bin/sudo /bin/chown root:root /opt/hostedtoolcache
           /usr/bin/sudo /bin/chmod go-w /opt/hostedtoolcache
           /usr/bin/sudo /bin/chown -R root:root /opt/hostedtoolcache/Python
@@ -46,7 +50,8 @@ jobs:
           python_bin="$source_python"
           python_version_dir="$(dirname "$protected_prefix")"
           for trusted_dir in \
-            /opt /opt/hostedtoolcache /opt/hostedtoolcache/Python \
+            /opt /usr /usr/share /usr/share/zoneinfo \
+            /opt/hostedtoolcache /opt/hostedtoolcache/Python \
             "$python_version_dir" "$protected_prefix" \
             "$protected_prefix/bin" "$protected_prefix/lib"
           do
@@ -176,6 +181,7 @@ jobs:
             --driver docker-container \
             --driver-opt image=moby/buildkit:v0.31.2@sha256:2f5adac4ecd194d9f8c10b7b5d7bceb5186853db1b26e5abd3a657af0b7e26ec \
             --driver-opt network=host \
+            --driver-opt provenance-add-gha=false \
             --buildkitd-config "$buildkit_config" \
             --use --bootstrap \
             unix:///var/run/docker.sock
@@ -184,6 +190,8 @@ jobs:
             "moby/buildkit:v0.31.2@sha256:2f5adac4ecd194d9f8c10b7b5d7bceb5186853db1b26e5abd3a657af0b7e26ec"
           test "$(/usr/bin/docker inspect --format '{{.State.Running}}' "$builder_container")" = true
           test "$(/usr/bin/docker inspect --format '{{.HostConfig.NetworkMode}}' "$builder_container")" = host
+          /usr/bin/docker exec "$builder_container" \
+            test ! -e /etc/buildkit/provenance.d/github_actions_context.json
           "$buildx_exec" inspect --builder "$builder_name" --bootstrap
           {
             echo "DOCKER_CONFIG=$docker_config"
@@ -593,6 +601,8 @@ jobs:
           WHOSCORED_SCHEDULER_BUILD_METADATA: /tmp/whoscored-build-metadata/airflow-scheduler.json
           WHOSCORED_SCHEDULER_PAYLOAD_IMAGE: data-platform-airflow-scheduler-payload:provenance-ci
         run: |
+          PS4='+ whoscored-contract:${LINENO}: '
+          set -x
           test "$WHOSCORED_CI_TEST_VENV" = "$(command -v python | sed 's,/bin/python$,,')"
           [[ "$WHOSCORED_CI_TEST_VENV" =~ ^/tmp/whoscored-ci-test-venv\.[A-Za-z0-9]{8}$ ]]
           test "$WHOSCORED_CI_PYTHON_PREFIX" = \
@@ -732,6 +742,7 @@ jobs:
             "$WHOSCORED_CI_TEST_VENV/bin/python" -I -c \
             'from zoneinfo import ZoneInfo; assert ZoneInfo("Europe/Berlin").key == "Europe/Berlin"'
           docker exec "$test_container" node --version
+          set +x
 
           mapfile -t whoscored_tests < <(
             find tests -type f -name 'test_*whoscored*.py' -print | sort
