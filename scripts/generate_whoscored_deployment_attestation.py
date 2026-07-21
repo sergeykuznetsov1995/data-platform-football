@@ -869,10 +869,33 @@ def _validate_build_provenance_value(
     }
     if expected_args:
         expected_parameters["args"] = expected_args
+    context_localdir, dockerfile_localdir = IMAGE_GROUP_CONTEXT_SPECS[group]
+    invocation_source = ""
+    for candidate_source in EXPECTED_VCS_SOURCES:
+        request_args = {
+            **expected_args,
+            "vcs:localdir:context": context_localdir,
+            "vcs:localdir:dockerfile": dockerfile_localdir,
+            "vcs:revision": expected_revision,
+            "vcs:source": candidate_source,
+        }
+        candidate_parameters = {
+            **expected_parameters,
+            "root": {
+                "configSource": {"path": entrypoint},
+                "request": {"args": request_args},
+            },
+            "compatibilityVersion": 30,
+        }
+        if parameters == candidate_parameters:
+            invocation_source = candidate_source
+            break
     if (
-        config_source != {"entryPoint": entrypoint}
-        or parameters != expected_parameters
-        or environment != {"platform": "linux/amd64"}
+        set(invocation) != {"configSource", "environment", "parameters"}
+        or config_source != {"entryPoint": entrypoint}
+        or not invocation_source
+        or environment
+        != {"dockerfileVersion": "1.25.0", "platform": "linux/amd64"}
     ):
         raise DeploymentAttestationError(
             f"BuildKit invocation is not the exact production build for group {group}"
@@ -906,7 +929,6 @@ def _validate_build_provenance_value(
     vcs = _require_mapping(
         buildkit_metadata.get("vcs"), label=f"BuildKit VCS for group {group}"
     )
-    context_localdir, dockerfile_localdir = IMAGE_GROUP_CONTEXT_SPECS[group]
     if (
         completeness
         != {"environment": True, "materials": False, "parameters": True}
@@ -918,6 +940,7 @@ def _validate_build_provenance_value(
         or vcs["revision"] != expected_revision
         or not isinstance(vcs["source"], str)
         or vcs["source"] not in EXPECTED_VCS_SOURCES
+        or vcs["source"] != invocation_source
     ):
         raise DeploymentAttestationError(
             f"BuildKit provenance is incomplete or dirty for group {group}"

@@ -35,6 +35,22 @@ jobs:
           cache: pip
 
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        with:
+          driver-opts: |
+            image=moby/buildkit:v0.31.2@sha256:2f5adac4ecd194d9f8c10b7b5d7bceb5186853db1b26e5abd3a657af0b7e26ec
+            network=host
+            provenance-add-gha=false
+          buildkitd-config-inline: |
+            [registry."127.0.0.1:5000"]
+              http = true
+              insecure = true
+
+      - name: Start pinned loopback OCI registry
+        run: |
+          docker run --detach --restart always \
+            --name whoscored-ci-registry \
+            --publish 127.0.0.1:5000:5000 \
+            registry:2.8.3@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
 
       - name: Validate declared WhoScored build-provenance state
         run: |
@@ -347,6 +363,8 @@ jobs:
             --load \
             -t data-platform-airflow-scheduler-payload:provenance-ci \
             docker/images/airflow
+          scheduler_tag=127.0.0.1:5000/data-platform-airflow-scheduler:provenance-ci
+          proxy_tag=127.0.0.1:5000/data-platform-airflow-whoscored-proxy:provenance-ci
           BUILDX_GIT_CHECK_DIRTY=1 BUILDX_METADATA_PROVENANCE=max \
           docker buildx build \
             --target airflow-scheduler \
@@ -354,8 +372,8 @@ jobs:
             --provenance=mode=max,version=v1 \
             --metadata-file /tmp/whoscored-build-metadata/airflow-scheduler.json \
             --cache-from type=gha,scope=whoscored-airflow \
-            --load \
-            -t data-platform-airflow-scheduler:provenance-ci \
+            --push \
+            --tag "$scheduler_tag" \
             docker/images/airflow
           BUILDX_GIT_CHECK_DIRTY=1 BUILDX_METADATA_PROVENANCE=max \
           docker buildx build \
@@ -364,9 +382,22 @@ jobs:
             --provenance=mode=max,version=v1 \
             --metadata-file /tmp/whoscored-build-metadata/airflow-whoscored-proxy.json \
             --cache-from type=gha,scope=whoscored-airflow \
-            --load \
-            -t data-platform-airflow-whoscored-proxy:provenance-ci \
+            --push \
+            --tag "$proxy_tag" \
             docker/images/airflow
+
+          scheduler_digest="$(python -I -S -c \
+            'import json, sys; print(json.load(open(sys.argv[1]))["containerimage.digest"])' \
+            /tmp/whoscored-build-metadata/airflow-scheduler.json)"
+          proxy_digest="$(python -I -S -c \
+            'import json, sys; print(json.load(open(sys.argv[1]))["containerimage.digest"])' \
+            /tmp/whoscored-build-metadata/airflow-whoscored-proxy.json)"
+          scheduler="$scheduler_tag@$scheduler_digest"
+          proxy="$proxy_tag@$proxy_digest"
+          docker pull "$scheduler"
+          docker pull "$proxy"
+          docker tag "$scheduler" "$scheduler_tag"
+          docker tag "$proxy" "$proxy_tag"
 
           sentinel="$(mktemp -d)"
           trap 'rm -rf "$sentinel"' EXIT
@@ -388,8 +419,6 @@ jobs:
             test -e "$sentinel/$label"
           }
 
-          scheduler=data-platform-airflow-scheduler:provenance-ci
-          proxy=data-platform-airflow-whoscored-proxy:provenance-ci
           provenance_status="$(python -I -S -c \
             'import json; print(json.load(open("docker/images/airflow/whoscored-build-provenance-attestation.json"))["status"])')"
           case "$provenance_status" in
@@ -509,7 +538,7 @@ jobs:
           PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
           WHOSCORED_REAL_DOCKER_TEST: "1"
           WHOSCORED_SCHEDULER_BUILD_METADATA: /tmp/whoscored-build-metadata/airflow-scheduler.json
-          WHOSCORED_SCHEDULER_IMAGE: data-platform-airflow-scheduler:provenance-ci
+          WHOSCORED_SCHEDULER_IMAGE: 127.0.0.1:5000/data-platform-airflow-scheduler:provenance-ci
           WHOSCORED_SCHEDULER_PAYLOAD_IMAGE: data-platform-airflow-scheduler-payload:provenance-ci
         run: |
           pytest -q \
