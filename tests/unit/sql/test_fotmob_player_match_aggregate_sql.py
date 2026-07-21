@@ -22,6 +22,8 @@ from pathlib import Path
 
 import pytest
 
+from scrapers.fotmob.constants import render_fotmob_sql
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 SQL_PATH = (
@@ -35,7 +37,7 @@ pytestmark = pytest.mark.unit
 
 
 def _read(p: Path) -> str:
-    return p.read_text(encoding="utf-8")
+    return render_fotmob_sql(p.read_text(encoding="utf-8"))
 
 
 def _strip_comments(sql: str) -> str:
@@ -63,12 +65,13 @@ class TestFotmobPlayerMatchAggregateSql:
 
     def test_league_reconstructed_via_league_map(self):
         """Native has no `league` string — it is rebuilt from competition_id
-        via the static league_map CTE; the INNER JOIN scopes output to the
+        via the registry-rendered league_map CTE; the INNER JOIN scopes output to the
         same 14 legacy leagues. payloads.competition_id is varchar vs
         matches.competition_id bigint → explicit CAST required."""
         sql = _strip_comments(_read(SQL_PATH))
         assert re.search(r"league_map\s*\(\s*competition_id\s*,\s*league\s*\)", sql), (
-            "expected static league_map CTE (competition_id → legacy league string)"
+            "expected registry-rendered league_map CTE "
+            "(competition_id → legacy league string)"
         )
         assert "'ENG-Premier League'" in sql
         assert re.search(

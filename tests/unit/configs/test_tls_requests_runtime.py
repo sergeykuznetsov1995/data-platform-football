@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+pytest.importorskip("tls_requests", reason="native TLS runtime is tested in the scheduler image smoke")
+
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DOCKERFILE = REPO_ROOT / "docker/images/airflow/Dockerfile"

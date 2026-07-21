@@ -1892,7 +1892,7 @@ def test_fbref_acceptance_image_is_built_from_one_exact_git_archive():
     assert "sha256sum -c -" in dockerfile
     assert "rm -rf /opt/airflow/dags /opt/airflow/scrapers" in dockerfile
     assert "verify_fbref_acceptance_image.py" in dockerfile
-    assert "filter_proxy.py --help" not in dockerfile
+    assert "filter_proxy.py --help" in dockerfile
     assert "org.opencontainers.image.revision" in dockerfile
     assert "COPY dags" not in dockerfile
     assert "git -C \"$repo_root\" archive --format=tar \"$git_sha\"" in builder
@@ -4686,6 +4686,14 @@ class _ClientConnectReader:
         return chunk
 
 
+class _YieldingClientConnectReader(_ClientConnectReader):
+    """Model a client read that yields while the provider pump starts."""
+
+    async def read(self, size):
+        await asyncio.sleep(0)
+        return await super().read(size)
+
+
 class _ClientWriter:
     def __init__(self):
         self.payload = bytearray()
@@ -5746,7 +5754,7 @@ def test_lease_connect_failover_repins_immediate_eof_and_tunnels(mod, monkeypatc
     asyncio.run(
         asyncio.wait_for(
             mod.handle(
-                _ClientConnectReader(_connect_header_lines(lease)),
+                _YieldingClientConnectReader(_connect_header_lines(lease)),
                 client_writer,
                 mgr,
                 require_lease=True,
@@ -5772,6 +5780,25 @@ def test_lease_connect_failover_repins_immediate_eof_and_tunnels(mod, monkeypatc
     assert lease.active_tunnels == 0
     # M1: no failed attempt may leave its writer behind in tunnel_writers.
     assert lease.tunnel_writers == set()
+
+
+def test_reservation_waiter_wakes_when_peer_accounting_becomes_uncertain(mod):
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+    lease = _make_sofascore_lease(mod, mgr)
+
+    async def exercise():
+        reservation = mod._reserve_lease_bytes(lease, lease.max_bytes)
+        assert reservation > 0
+        waiter = asyncio.create_task(mod._wait_for_reservation_turnover(lease))
+        await asyncio.sleep(0)
+        assert waiter.done() is False
+        mod._latch_lease_accounting_uncertainty(lease)
+        assert await asyncio.wait_for(waiter, 0.1) is None
+        assert mod._RESERVATION_TURNOVER_WAITERS == set()
+        assert lease.reserved_bytes == reservation
+        assert lease.accounting_uncertain is True
+
+    asyncio.run(exercise())
 
 
 def test_fbref_never_repins_after_paid_connect_upload(mod, monkeypatch):

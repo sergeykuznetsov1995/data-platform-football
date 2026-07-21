@@ -25,7 +25,9 @@ class TestIcebergWriterInit:
         with patch.dict(
             "sys.modules", {"trino": MagicMock(), "trino.dbapi": MagicMock()}
         ):
-            with patch.dict("os.environ", {}, clear=False):
+            # The default contract must not depend on credentials exported by
+            # the developer or CI runner executing this test.
+            with patch.dict("os.environ", {}, clear=True):
                 from scrapers.base.iceberg_writer import IcebergWriter
 
                 writer = IcebergWriter()
@@ -161,6 +163,20 @@ class TestIcebergWriterTrinoManager:
 
             assert result is True
             mock_trino.table_exists.assert_called_once_with("bronze", "test_table")
+
+    @pytest.mark.parametrize("method", ["namespace_exists", "table_exists"])
+    def test_metadata_failures_propagate_instead_of_reporting_absence(self, method):
+        from scrapers.base.iceberg_writer import IcebergWriter
+
+        writer = IcebergWriter()
+        mock_trino = MagicMock()
+        mock_trino.schema_exists.side_effect = RuntimeError("catalog unavailable")
+        mock_trino.table_exists.side_effect = RuntimeError("catalog unavailable")
+        writer._trino_manager = mock_trino
+
+        args = ("bronze",) if method == "namespace_exists" else ("bronze", "table")
+        with pytest.raises(RuntimeError, match="catalog unavailable"):
+            getattr(writer, method)(*args)
 
 
 class TestIcebergWriterWriteDataFrame:

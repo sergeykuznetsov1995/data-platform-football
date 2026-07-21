@@ -799,6 +799,63 @@ def test_release_build_rejects_local_tool_caches() -> None:
         assert f"-name {cache_name}" in promotion
 
 
+def test_ready_promotion_uses_the_ci_pinned_buildkit_builder() -> None:
+    runbook = (ROOT / "docs" / "operations" / "whoscored-production.md").read_text(
+        encoding="utf-8"
+    )
+    workflow = (ROOT / ".github" / "workflows" / "whoscored-ci.yml").read_text(
+        encoding="utf-8"
+    )
+    promotion = runbook.split("#### Future ready-v1 promotion", 1)[1].split(
+        "Deploy that exact reviewed promotion SHA", 1
+    )[0]
+    pinned = re.search(
+        r"image=(moby/buildkit:v0\.31\.2@sha256:[0-9a-f]{64})", workflow
+    )
+    pinned_registry = re.search(
+        r"(registry:2\.8\.3@sha256:[0-9a-f]{64})", workflow
+    )
+    payload_builds = promotion.split("AIRFLOW_BASE_STAGING_TAG=", 1)[1].split(
+        "AIRFLOW_BASE_ID=", 1
+    )[0]
+
+    assert pinned is not None
+    assert pinned_registry is not None
+    assert f"BUILDKIT_IMAGE={pinned.group(1)}" in promotion
+    assert f"LOOPBACK_REGISTRY_IMAGE={pinned_registry.group(1)}" in promotion
+    assert "--publish 127.0.0.1:5000:5000" in promotion
+    assert '"http://$LOOPBACK_REGISTRY/v2/"' in promotion
+    assert '--driver-opt "image=$BUILDKIT_IMAGE"' in promotion
+    assert "--driver-opt network=host" in promotion
+    assert "--driver-opt provenance-add-gha=false" in promotion
+    assert '[registry."127.0.0.1:5000"]' in promotion
+    assert "  http = true" in promotion
+    assert "  insecure = true" in promotion
+    assert '--buildkitd-config "$BUILDKITD_CONFIG"' in promotion
+    assert 'BUILDX_BUILD=("${BUILDX_CMD[@]}" --builder "$BUILDER" build)' in promotion
+    assert promotion.count('"${BUILDX_BUILD[@]}" --platform linux/amd64') == 8
+    assert '"${BUILDX_CMD[@]}" build --platform linux/amd64' not in promotion
+    assert "--load" not in promotion
+    assert payload_builds.count("--provenance=mode=max,version=v1 --push") == 6
+    assert payload_builds.count("--metadata-file") == 6
+    assert payload_builds.count('"${DOCKER_CMD[@]}" image tag') == 6
+    for group in (
+        "AIRFLOW_BASE",
+        "SCHEDULER_PAYLOAD",
+        "PROXY_PAYLOAD",
+        "FLARESOLVERR",
+        "JUPYTERHUB",
+        "SUPERSET",
+    ):
+        assert f'--tag "${group}_STAGING_TAG"' in payload_builds
+        assert f'--tag "${group}_TAG"' not in payload_builds
+    assert '"${DOCKER_CMD[@]}" image push' not in promotion
+    assert promotion.count('skopeo copy --all --preserve-digests') == 4
+    assert promotion.index('test "$("${CLEAN_GIT[@]}" rev-parse HEAD^)"') < (
+        promotion.index('skopeo copy --all --preserve-digests')
+    )
+
+
 def test_targeted_rollout_creates_and_starts_only_one_admitted_service() -> None:
     runbook = (ROOT / "docs" / "operations" / "whoscored-production.md").read_text(
         encoding="utf-8"

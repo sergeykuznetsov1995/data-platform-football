@@ -6,16 +6,14 @@
 --   * FBref         — iceberg.bronze.fbref_match_managers (scorebox parser,
 --                     scrapers/fbref/parsers/finders.py::parse_match_managers).
 --                     Spine; has only a manager NAME (no stable id).
---   * FotMob        — native iceberg.bronze.fotmob_player_snapshots_current
---                     WHERE is_coach (#930 cutover; ex legacy
---                     fotmob_player_details). The snapshot is GLOBAL (no
---                     league/season) — scope is reconstructed through the
---                     shared cutover-framework `coach_scope` CTE
---                     (squad_snapshots member_type='coach' × season_teams of
---                     the current season; same "roster now" depth the legacy
---                     snapshot had). Carries a STABLE coachId (player_id) kept
---                     verbatim in source_id, plus the coach name for
---                     cross-source gluing.
+--   * FotMob        — native iceberg.bronze.fotmob_squad_snapshots_current
+--                     WHERE member_type='coach' (#930 cutover). The live squad
+--                     row is the identity driver: member_id is the STABLE
+--                     coachId kept verbatim in source_id and member_name is the
+--                     cross-source glue. The global player snapshot is only a
+--                     LEFT name fallback because some valid squad coachIds have
+--                     no player-snapshot row. League/season scope comes from
+--                     `coach_scope` (current squad × season_teams).
 --   * Transfermarkt — native iceberg.bronze.transfermarkt_coach_stints plus
 --                     transfermarkt_coach_profiles. Carries a STABLE coach_id
 --                     (source_id); league/season scope comes from the native
@@ -93,27 +91,15 @@ WITH
 -- ============================================================================
 -- [CUTOVER-FRAMEWORK #930] Сезонный скоуп для глобальных native-снапшотов.
 -- Синхронизируемая копия: НЕ менять имена CTE и выражение season-слага.
--- Источник истины: /root/fotmob-runtime/cutover-framework.md
+-- League-map source of truth: configs/fotmob/competitions.json.
+-- Season-scope contract: docs/architecture/fotmob-native-silver.md
 -- ============================================================================
 
 -- 1) Обратная карта competition_id -> legacy league. INNER JOIN к ней — это
 --    ОДНОВРЕМЕННО скоуп-фильтр 14 лиг (native-каталог шире; см. пределы).
 league_map (competition_id, league) AS (
     VALUES
-        (47,  'ENG-Premier League'),
-        (48,  'ENG-Championship'),
-        (87,  'ESP-La Liga'),
-        (54,  'GER-Bundesliga'),
-        (55,  'ITA-Serie A'),
-        (53,  'FRA-Ligue 1'),
-        (57,  'NED-Eredivisie'),
-        (61,  'POR-Primeira Liga'),
-        (42,  'UEFA-Champions League'),
-        (73,  'UEFA-Europa League'),
-        (77,  'INT-World Cup'),
-        (50,  'INT-European Championship'),
-        (289, 'INT-Africa Cup of Nations'),
-        (44,  'INT-Copa America')
+        {{ fotmob_league_map_values_sql }}
 ),
 
 -- 2) Ось сезонов: (competition_id, source_season_key) -> (league, season)
@@ -166,8 +152,8 @@ team_scope AS (
 -- 4) ТЕКУЩИЙ сезон: членство из живого ростера. squad_snapshots — глобальный
 --    снапшот «сейчас» (field_map: observed roster, never historical), поэтому
 --    клеится ТОЛЬКО к is_current_season — иначе сегодняшний состав налипнет
---    на прошлые сезоны (легаси-баг seasonless_source_snapshot_replicated_as_
---    _historical, который migrate_fotmob_native.py карантинит).
+--    на прошлые сезоны (класс бага seasonless_source_snapshot_replicated_as_
+--    _historical из замороженного legacy-контура).
 squad_scope AS (
     SELECT DISTINCT
         ts.league,
@@ -330,29 +316,36 @@ fbref_initial_keys AS (
 ),
 
 fotmob_coach AS (
-    -- One coach row per (player_id, league, season). The native snapshot is
-    -- one-row-per-player_id and GLOBAL — (league, season) is projected through
-    -- the framework's coach_scope (framework §3.5). ROW_NUMBER collapses a
-    -- coach serving two clubs of one (league, season) to a single row so
-    -- source_id=player_id stays unique for the (source, source_id, league,
-    -- season) PK; the legacy `ORDER BY name` is replaced by the deterministic
-    -- lineage ORDER.
+    -- One coach row per (member_id, league, season), driven by the current
+    -- squad. ROW_NUMBER collapses a coach serving two clubs in one season.
+    -- player_snapshots is deliberately LEFT-only: a missing profile must not
+    -- erase a valid squad coach (the production zero-manager regression).
     SELECT player_id, name, league, season
     FROM (
         SELECT
-            ps.player_id,                       -- уже varchar, CAST не нужен
-            ps.name,
+            sq.member_id AS player_id,
+            COALESCE(
+                NULLIF(TRIM(sq.member_name), ''),
+                NULLIF(TRIM(ps.name), '')
+            ) AS name,
             cs.league,
             cs.season,
             ROW_NUMBER() OVER (
-                PARTITION BY ps.player_id, cs.league, cs.season
-                ORDER BY ps._observed_at DESC, ps._target_batch_id DESC
+                PARTITION BY sq.member_id, cs.league, cs.season
+                ORDER BY sq._observed_at DESC, sq._target_batch_id DESC
             ) AS rn
         FROM coach_scope cs
-        JOIN iceberg.bronze.fotmob_player_snapshots_current ps
-          ON ps.player_id = cs.coach_id
-        WHERE ps.is_coach
-          AND ps.name IS NOT NULL AND ps.name <> ''
+        JOIN iceberg.bronze.fotmob_squad_snapshots_current sq
+          ON  sq.member_id = cs.coach_id
+          AND CAST(sq.team_id AS bigint) = cs.team_id
+          AND sq.member_type = 'coach'
+        LEFT JOIN iceberg.bronze.fotmob_player_snapshots_current ps
+          ON  ps.player_id = sq.member_id
+          AND ps.is_coach
+        WHERE COALESCE(
+            NULLIF(TRIM(sq.member_name), ''),
+            NULLIF(TRIM(ps.name), '')
+        ) IS NOT NULL
     )
     WHERE rn = 1
 ),

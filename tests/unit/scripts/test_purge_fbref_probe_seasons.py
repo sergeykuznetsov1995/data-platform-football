@@ -1,7 +1,7 @@
 """
 Unit tests for scripts/purge_fbref_probe_seasons.py — EPL 2010/2015 purge (#892).
 
-Same host-loadable-script pattern as ``test_drop_fotmob_dead_columns.py``:
+Host-loadable-script pattern:
 ``purge_table`` runs against a ``FakeCursor``, no Trino, no network.
 
 What we cover
