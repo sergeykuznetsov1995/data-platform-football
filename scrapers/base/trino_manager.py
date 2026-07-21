@@ -11,6 +11,8 @@ Storage Pipeline:
 
 import logging
 import os
+import random
+import threading
 import time
 import uuid
 from datetime import date, datetime
@@ -23,6 +25,25 @@ import pyarrow as pa
 from scrapers.base.sql_validator import validate_identifier, validate_catalog_qualified_name
 
 logger = logging.getLogger(__name__)
+
+# Serialize idempotent MERGE commits within this process: capture_many fans
+# out up to SOFASCORE_MAX_CONCURRENCY publisher threads whose MERGEs hit the
+# same Iceberg partition and lose the snapshot race to each other faster than
+# a bounded retry can absorb (#951 — EPL manifest burst exhausted 5 retries).
+# All contenders live in this process (cross-task writers are serialized by
+# the Airflow pool), so one process-wide lock removes the conflict entirely;
+# the retry in _execute_committing stays as a guard for external writers.
+_COMMIT_LOCK = threading.Lock()
+
+# Scalar Trino types whose literals _format_sql_value renders with an exact
+# target-type CAST — the eligibility set for the single-row MERGE fast path
+# (#951). Complex/exotic types (array, map, row, varbinary, json, uuid, time)
+# force the staged path. Note 'time' is deliberately absent: 'time(3)' must
+# not match, and 'time(3)'.startswith('timestamp') is False.
+_FAST_MERGE_TYPE_PREFIXES = (
+    'varchar', 'char', 'integer', 'bigint', 'smallint', 'tinyint',
+    'double', 'real', 'boolean', 'date', 'decimal', 'timestamp',
+)
 
 # Trino's `query.max-length` defaults to 1,000,000 bytes.  The Python client
 # may wrap a statement in EXECUTE IMMEDIATE and escape embedded quotes, so the
@@ -125,6 +146,20 @@ class TrinoTableManager:
             self.port = port or int(os.environ.get('TRINO_PORT', 8080))
             logger.info("TRINO_PASSWORD not set, connecting via HTTP (no auth)")
         self._conn = None
+        # The Trino DBAPI connection is NOT thread-safe: one cursor's result
+        # frames interleave with another's on the shared socket. capture_many
+        # fans this manager out across SOFASCORE_MAX_CONCURRENCY publisher
+        # threads (reads via get(), stage inserts, MERGE commits all on this one
+        # connection), which corrupts the client protocol and surfaces as
+        # ICEBERG_CATALOG_ERROR "Failed to load table ..." on unrelated
+        # statements (#951). Serialize every statement on this connection; the
+        # network fetch upstream is already single-session, so this costs no
+        # real throughput. Reentrant so a future nested _execute cannot deadlock.
+        self._conn_lock = threading.RLock()
+        # (schema, table) -> {lower_col: trino_type}; used only by the
+        # single-row MERGE fast path (#951). Invalidated on fast-path failure
+        # so schema evolution reroutes through the staged path's fresh DESCRIBE.
+        self._merge_type_cache: Dict[tuple, Dict[str, str]] = {}
         # Metadata round-trips dominate a write-heavy run: every write asked
         # SHOW TABLES twice, DESCRIBE once and CREATE SCHEMA once. Only facts
         # this process cannot invalidate behind its own back are cached — a
@@ -236,6 +271,17 @@ class TrinoTableManager:
     _CONNECTION_ERRORS = ('Connection refused', 'Connection reset',
                           'Connection aborted', 'authenticators were not loaded')
 
+    # Optimistic-concurrency retry for idempotent MERGE commits. Concurrent
+    # MERGEs into the same Iceberg partition (e.g. capture_many publishing many
+    # manifest endpoints from one task, up to SOFASCORE_MAX_CONCURRENCY threads)
+    # lose the snapshot race with ICEBERG_COMMIT_ERROR "Found conflicting
+    # files" (#951). The conflict is metadata-only and resolves in ms — retry
+    # with jitter (in-process contenders retry in lockstep without it), much
+    # shorter than the container-restart _CONNECT_BACKOFF window.
+    _COMMIT_RETRIES = 5
+    _COMMIT_BASE = 0.5
+    _COMMIT_CAP = 8.0
+
     def _execute(self, sql: str, fetch: bool = False,
                  params: Optional[tuple] = None) -> Optional[List[Any]]:
         """Execute SQL statement.
@@ -253,39 +299,69 @@ class TrinoTableManager:
         ``params`` binds ``?`` placeholders in ``sql`` (Trino prepared
         statement) — prefer it over interpolating values into the string.
         """
-        for attempt in range(2):
-            cursor = self.connection.cursor()
+        # Serialize the whole cursor lifecycle: concurrent publisher threads
+        # sharing this connection would otherwise interleave frames on the wire.
+        with self._conn_lock:
+            for attempt in range(2):
+                cursor = self.connection.cursor()
+                try:
+                    logger.debug(f"Executing SQL: {sql[:200]}...")
+                    if params:
+                        cursor.execute(sql, params)
+                    else:
+                        cursor.execute(sql)
+
+                    if fetch:
+                        return cursor.fetchall()
+
+                    # Consume results even for DDL/DML to ensure query completes
+                    cursor.fetchall()
+                    return None
+
+                except Exception as e:
+                    error_str = str(e)
+                    is_conn_error = any(msg in error_str for msg in self._CONNECTION_ERRORS)
+
+                    if is_conn_error and attempt == 0:
+                        logger.warning(
+                            f"Connection error during SQL execution: {e}. "
+                            f"Resetting connection and retrying..."
+                        )
+                        self._reset_connection()
+                        continue
+
+                    logger.error(f"SQL execution error: {e}\nSQL (truncated): {sql[:500]}")
+                    raise TrinoError(f"SQL execution failed: {e}") from e
+
+                finally:
+                    cursor.close()
+
+    def _execute_committing(self, sql: str) -> None:
+        """Execute an idempotent MERGE, retrying Iceberg commit conflicts.
+
+        Only safe for statements whose re-execution converges to the same
+        final state (natural-key MERGE upsert, tombstone replace-MERGE): Trino
+        re-plans against the latest committed snapshot on each run. The
+        legacy DELETE+INSERT path must NOT go through here — after the DELETE
+        commits it is no longer idempotent as a unit.
+        """
+        for attempt in range(self._COMMIT_RETRIES):
             try:
-                logger.debug(f"Executing SQL: {sql[:200]}...")
-                if params:
-                    cursor.execute(sql, params)
-                else:
-                    cursor.execute(sql)
-
-                if fetch:
-                    return cursor.fetchall()
-
-                # Consume results even for DDL/DML to ensure query completes
-                cursor.fetchall()
-                return None
-
-            except Exception as e:
-                error_str = str(e)
-                is_conn_error = any(msg in error_str for msg in self._CONNECTION_ERRORS)
-
-                if is_conn_error and attempt == 0:
+                with _COMMIT_LOCK:
+                    self._execute(sql)
+                return
+            except TrinoError as e:
+                if (attempt < self._COMMIT_RETRIES - 1
+                        and _is_iceberg_commit_conflict(e)):
+                    delay = min(self._COMMIT_CAP, self._COMMIT_BASE * (2 ** attempt))
+                    delay += random.uniform(0, self._COMMIT_BASE)
                     logger.warning(
-                        f"Connection error during SQL execution: {e}. "
-                        f"Resetting connection and retrying..."
+                        f"Iceberg commit conflict (attempt {attempt + 1}/"
+                        f"{self._COMMIT_RETRIES}), retrying in {delay:.1f}s"
                     )
-                    self._reset_connection()
+                    time.sleep(delay)
                     continue
-
-                logger.error(f"SQL execution error: {e}\nSQL (truncated): {sql[:500]}")
-                raise TrinoError(f"SQL execution failed: {e}") from e
-
-            finally:
-                cursor.close()
+                raise
 
     def create_schema(self, schema: str) -> None:
         """
@@ -794,6 +870,8 @@ WITH (
         if keys and df.duplicated(subset=list(keys)).any():
             raise ValueError(f"duplicate rows for merge keys {list(keys)!r}")
 
+        qualified_target = validate_catalog_qualified_name(self.catalog, schema, table)
+
         # Fast path: a plain append that fits in ONE ``INSERT ... VALUES``
         # already produces exactly one snapshot, which is the entire reason the
         # stage exists (#269). Staging it anyway would add a CREATE TABLE and a
@@ -812,6 +890,42 @@ WITH (
                 )
                 return single
 
+        # --- Single-row fast path (#951): one idempotent MERGE, no stage. The
+        # staged cycle costs 6 statements per call (CREATE stage, DESCRIBE,
+        # INSERT, count verify, MERGE, DROP); the manifest store issues 10-26k
+        # single-row upserts per backfill, so those extra round-trips dominate
+        # wall-clock. A one-statement MERGE ... USING (SELECT <literals>) is
+        # semantically identical (same ON/UPDATE SET/INSERT clauses) and leaves
+        # nothing behind on failure — no stg orphans. Guarded to scalar target
+        # types; anything unexpected falls back to the staged path below.
+        # ``staging_id`` implies retry-stable stage cleanup semantics a caller
+        # may rely on, so its presence keeps the staged path.
+        if keys and len(df) == 1 and staging_id is None:
+            column_types = self._fast_merge_column_types(
+                schema, table, df.columns, target_column_types
+            )
+            if column_types is not None:
+                merge_sql = self._build_single_row_merge_sql(
+                    qualified_target, df, keys, column_types
+                )
+                try:
+                    self._execute_committing(merge_sql)
+                    logger.info(
+                        f"Merged 1 row into {qualified_target} "
+                        f"(single-row fast path, 1 statement)"
+                    )
+                    return 1
+                except TrinoError as e:
+                    if _is_iceberg_commit_conflict(e):
+                        # The staged MERGE would face the same external-writer
+                        # contention after 6 extra statements — propagate.
+                        raise
+                    self._merge_type_cache.pop((schema, table), None)
+                    logger.warning(
+                        f"Single-row MERGE fast path failed for "
+                        f"{qualified_target}: {e}; falling back to staged path"
+                    )
+
         # Parallel ingestion shards must never share a predictable staging
         # table. Distributed callers pass a run/task/map/try/UUID-qualified
         # token; everyone else gets a random suffix — a deterministic
@@ -822,7 +936,6 @@ WITH (
             stage = f"{table}__stg_{staging_id}"
         else:
             stage = f"{table}__stg_{uuid.uuid4().hex[:12]}"
-        qualified_target = validate_catalog_qualified_name(self.catalog, schema, table)
         qualified_stage = validate_catalog_qualified_name(self.catalog, schema, stage)
 
         replace_op = "__dpf_replace_op"
@@ -839,19 +952,29 @@ WITH (
         # Empty copy of the target schema (column names/types incl. metadata).
         # Single-statement replacements carry an operation marker used by the
         # final MERGE; ordinary append/upsert stages remain schema-identical.
+        # ``CREATE TABLE stg AS SELECT * FROM target WHERE false`` READS the
+        # target's metadata to copy its schema. Under capture_many's thread pool
+        # this read races a sibling thread's in-flight MERGE commit on the same
+        # target and aborts with ICEBERG_CATALOG_ERROR "Failed to load table
+        # <target> in ops namespace" (#951). The MERGE already holds _COMMIT_LOCK
+        # (via _execute_committing); serialize the schema-copy read under the same
+        # lock so it never observes the target mid-commit. The slow phase-1 data
+        # insert below stays OUTSIDE the lock — only the fast metadata op is gated.
         if single_statement_replace:
-            self._execute(
-                f"CREATE TABLE {qualified_stage} AS SELECT *, "
-                f"CAST(NULL AS VARCHAR) AS \"{replace_op}\" "
-                f"FROM {qualified_target} WHERE false"
-            )
+            with _COMMIT_LOCK:
+                self._execute(
+                    f"CREATE TABLE {qualified_stage} AS SELECT *, "
+                    f"CAST(NULL AS VARCHAR) AS \"{replace_op}\" "
+                    f"FROM {qualified_target} WHERE false"
+                )
             staged_frame = df.copy()
             staged_frame[replace_op] = "insert"
         else:
-            self._execute(
-                f"CREATE TABLE {qualified_stage} AS SELECT * "
-                f"FROM {qualified_target} WHERE false"
-            )
+            with _COMMIT_LOCK:
+                self._execute(
+                    f"CREATE TABLE {qualified_stage} AS SELECT * "
+                    f"FROM {qualified_target} WHERE false"
+                )
             staged_frame = df
 
         # --- Phase 1: stage every row (all the slow, flaky network I/O). The
@@ -917,7 +1040,7 @@ WITH (
                     )
                     update_clause = f"WHEN MATCHED THEN UPDATE SET {assignments} "
                 values = ", ".join(f's."{column}"' for column in df.columns)
-                self._execute(
+                self._execute_committing(
                     f"MERGE INTO {qualified_target} t USING {qualified_stage} s "
                     f"ON {on_clause} {update_clause}"
                     f"WHEN NOT MATCHED THEN INSERT ({cols}) VALUES ({values})"
@@ -940,7 +1063,7 @@ WITH (
                 values = ", ".join(
                     f's.\"{column}\"' for column in df.columns
                 )
-                self._execute(
+                self._execute_committing(
                     f"MERGE INTO {qualified_target} t USING {qualified_stage} s "
                     f"ON s.\"{replace_op}\" = 'delete' AND ({equality}) "
                     f"WHEN MATCHED THEN DELETE "
@@ -968,7 +1091,11 @@ WITH (
             raise
 
         # Swap succeeded — discard the throwaway stage and its snapshot churn.
-        self.drop_table(schema, stage, if_exists=True)
+        # Serialized under the same lock: a concurrent DROP mutates the ops
+        # namespace listing that a sibling thread's target load walks, so an
+        # un-gated drop reintroduces the same ICEBERG_CATALOG_ERROR (#951).
+        with _COMMIT_LOCK:
+            self.drop_table(schema, stage, if_exists=True)
 
         operation = "Merged" if keys else "Inserted"
         logger.info(
@@ -976,6 +1103,84 @@ WITH (
             f"(via unique stage, 1 snapshot)"
         )
         return inserted
+
+    def _fast_merge_column_types(
+        self,
+        schema: str,
+        table: str,
+        columns: Sequence[str],
+        provided: Optional[Mapping[str, str]],
+    ) -> Optional[Dict[str, str]]:
+        """Target column types for the single-row MERGE fast path (#951).
+
+        Returns None (→ staged path) when the types cannot be fetched or any
+        frame column has a non-scalar/unknown type. The DESCRIBE result is
+        cached per (schema, table): the manifest store holds one long-lived
+        manager, so thousands of upserts amortize to a single metadata read.
+        """
+        if provided is not None:
+            types = {str(k).lower(): str(v) for k, v in provided.items()}
+        else:
+            types = self._merge_type_cache.get((schema, table))
+            if types is None:
+                try:
+                    types = {
+                        k.lower(): v
+                        for k, v in self.get_table_columns(schema, table).items()
+                    }
+                except Exception as e:
+                    logger.debug(f"Could not fetch table column types: {e}")
+                    return None
+                self._merge_type_cache[(schema, table)] = types
+        for column in columns:
+            column_type = types.get(str(column).lower(), '').strip().lower()
+            if not column_type.startswith(_FAST_MERGE_TYPE_PREFIXES):
+                return None
+        return types
+
+    def _build_single_row_merge_sql(
+        self,
+        qualified_target: str,
+        df: pd.DataFrame,
+        keys: Sequence[str],
+        column_types: Mapping[str, str],
+    ) -> str:
+        """One-statement MERGE upsert for a single-row frame (#951).
+
+        Clause shape is identical to the staged MERGE (ON key equality,
+        unqualified UPDATE SET targets — Trino forbids ``SET t."col"``,
+        INSERT list in frame column order); only USING differs: an inline
+        SELECT of typed literals replaces the staging table. Literals are
+        rendered by the same _format_sql_value the staged INSERT uses, so a
+        value can never render differently from what lands in a stage today.
+        """
+        (row_values,) = df.itertuples(index=False, name=None)
+        select_items = []
+        for column, value in zip(df.columns, row_values):
+            target_type = column_types[str(column).lower()]
+            literal = self._format_sql_value(value, target_type)
+            if literal == 'NULL':
+                # Typed NULL keeps every s-column's type exactly equal to the
+                # target column type, like the staging table did.
+                literal = f'CAST(NULL AS {target_type})'
+            select_items.append(f'{literal} AS "{column}"')
+        source = 'SELECT ' + ', '.join(select_items)
+
+        on_clause = ' AND '.join(f't."{key}" = s."{key}"' for key in keys)
+        update_columns = [c for c in df.columns if c not in keys]
+        update_clause = ''
+        if update_columns:
+            assignments = ', '.join(
+                f'"{column}" = s."{column}"' for column in update_columns
+            )
+            update_clause = f'WHEN MATCHED THEN UPDATE SET {assignments} '
+        cols = ', '.join(f'"{c}"' for c in df.columns)
+        values = ', '.join(f's."{c}"' for c in df.columns)
+        return (
+            f'MERGE INTO {qualified_target} t USING ({source}) s '
+            f'ON {on_clause} {update_clause}'
+            f'WHEN NOT MATCHED THEN INSERT ({cols}) VALUES ({values})'
+        )
 
     def drop_table(self, schema: str, table: str, if_exists: bool = True) -> None:
         """
@@ -1229,6 +1434,28 @@ def _is_iceberg_invalid_metadata(error: Exception) -> bool:
     cause = error
     while cause is not None:
         if getattr(cause, 'error_name', None) in _ICEBERG_METADATA_ERRORS:
+            return True
+        cause = getattr(cause, '__cause__', None)
+    return False
+
+
+def _is_iceberg_commit_conflict(error: Exception) -> bool:
+    """
+    Check if error is an Iceberg optimistic-concurrency commit conflict.
+
+    Matches ICEBERG_COMMIT_ERROR by error_name, with a message fallback
+    ("conflicting files" / "Failed to commit the transaction") because
+    _execute() wraps the original TrinoExternalError via 'raise ... from e'
+    and str() flattening can lose the name. Walks the __cause__ chain like
+    _is_iceberg_invalid_metadata.
+    """
+    cause: Optional[BaseException] = error
+    while cause is not None:
+        if getattr(cause, 'error_name', None) == 'ICEBERG_COMMIT_ERROR':
+            return True
+        message = str(cause)
+        if ('conflicting files' in message
+                or 'Failed to commit the transaction' in message):
             return True
         cause = getattr(cause, '__cause__', None)
     return False
