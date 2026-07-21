@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+import json
 import re
+import sqlite3
+import tracemalloc
 from unittest.mock import MagicMock
 
 import pandas as pd
@@ -10,20 +13,93 @@ import pyarrow as pa
 import pytest
 
 from scrapers.whoscored.domain import SeasonFormat, WhoScoredScope
-from scrapers.whoscored.parsers import PARSER_VERSION as CORE_PARSER_VERSION
+from scrapers.whoscored.parsers import (
+    MATCH_AVAILABILITY_VERSION,
+    PARSER_VERSION as CORE_PARSER_VERSION,
+)
+from scrapers.whoscored.profile_policy import daily_profile_candidate_hard_cap
 from scrapers.whoscored.repository import (
     PARSER_VERSION,
     BatchConflict,
     ManifestFailure,
     MatchCommit,
+    ProfileCandidateCapacityExceeded,
     ProfileCommit,
     PreviewCommit,
     PreviewFailure,
     WHOSCORED_BUSINESS_COLUMN_CONTRACTS,
     WHOSCORED_BUSINESS_TABLES,
+    WhoScoredScopeRowSpool,
     WhoScoredRepository,
     _clean_unicode,
+    canonical_catalog_rows,
+    catalog_payload_sha256,
+    catalog_raw_provenance_sha256,
+    profile_candidate_payload_sha256,
+    scope_write_chunk_rows_from_env,
 )
+
+
+@pytest.mark.parametrize("value", ["", "0", "3001", "3.0", "+3", "03000"])
+def test_daily_profile_hard_cap_rejects_noncanonical_values(value):
+    with pytest.raises(ValueError, match="WHOSCORED_DAILY_PROFILE_MAX_LIMIT"):
+        daily_profile_candidate_hard_cap({"WHOSCORED_DAILY_PROFILE_MAX_LIMIT": value})
+
+
+@pytest.mark.parametrize("value", ["1", "500", "3000"])
+def test_daily_profile_hard_cap_accepts_bounded_values(value):
+    assert daily_profile_candidate_hard_cap(
+        {"WHOSCORED_DAILY_PROFILE_MAX_LIMIT": value}
+    ) == int(value)
+
+
+@pytest.mark.parametrize("value", ["", "0", "100001", "1.5", "+20000", "020000"])
+def test_scope_write_chunk_rows_rejects_noncanonical_or_out_of_range_values(value):
+    with pytest.raises(ValueError, match="WHOSCORED_SCOPE_WRITE_CHUNK_ROWS"):
+        scope_write_chunk_rows_from_env({"WHOSCORED_SCOPE_WRITE_CHUNK_ROWS": value})
+
+
+@pytest.mark.parametrize("value", ["1", "20000", "100000"])
+def test_scope_write_chunk_rows_accepts_bounded_canonical_values(value):
+    assert scope_write_chunk_rows_from_env(
+        {"WHOSCORED_SCOPE_WRITE_CHUNK_ROWS": value}
+    ) == int(value)
+
+
+def test_scope_spool_creates_an_explicit_missing_root(tmp_path):
+    root = tmp_path / "missing" / "spools"
+
+    with WhoScoredScopeRowSpool(
+        table="whoscored_player_stage_stats",
+        league="INT-World Cup",
+        season="2026",
+        directory=str(root),
+    ) as spool:
+        assert root.is_dir()
+        assert spool.path.parent.parent == root
+
+
+def _catalog_raw_identity(
+    batch_id: str, *, as_of: date = date(2026, 7, 16)
+) -> tuple[str, str]:
+    inputs = [
+        {
+            "target_id": f"whoscored:catalog:test:{batch_id}",
+            "url": "https://www.whoscored.com/",
+            "raw_uri": f"s3://raw/{batch_id}.html.gz",
+            "sha256": "d" * 64,
+            "as_of_date": as_of.isoformat(),
+        }
+    ]
+    return (
+        json.dumps(
+            inputs,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        catalog_raw_provenance_sha256(inputs),
+    )
 
 
 class _CleanSchemaTrino:
@@ -152,6 +228,469 @@ def test_clean_schema_creates_all_business_tables_from_exact_contracts():
     assert not [
         item for item in trino.added if item[0] in WHOSCORED_BUSINESS_COLUMN_CONTRACTS
     ]
+    assert (
+        "whoscored_catalog_manifest",
+        "discovery_mode",
+        "VARCHAR",
+    ) in trino.added
+    assert {
+        ("whoscored_catalog_manifest", "raw_provenance_sha256", "VARCHAR"),
+        ("whoscored_catalog_manifest", "as_of_date", "DATE"),
+        ("whoscored_catalog_manifest", "parent_catalog_batch_id", "VARCHAR"),
+        (
+            "whoscored_catalog_manifest",
+            "parent_catalog_payload_sha256",
+            "VARCHAR",
+        ),
+        (
+            "whoscored_catalog_manifest",
+            "parent_catalog_raw_provenance_sha256",
+            "VARCHAR",
+        ),
+    } <= set(trino.added)
+
+
+@pytest.mark.unit
+def test_latest_catalog_generation_exposes_manifest_discovery_mode():
+    raw_inputs_json, raw_provenance_sha256 = _catalog_raw_identity("wsc2-generation")
+    trino = MagicMock()
+    trino.table_exists.return_value = True
+    trino.execute_query.return_value = [
+        (
+            "wsc2-generation",
+            "a" * 64,
+            PARSER_VERSION,
+            "s3://raw/catalog.json.gz",
+            raw_inputs_json,
+            datetime(2026, 7, 14),
+            "full_history",
+            raw_provenance_sha256,
+            date(2026, 7, 16),
+            None,
+            None,
+            None,
+            1,
+        )
+    ]
+    repository = WhoScoredRepository(writer=MagicMock(), trino=trino)
+
+    generation = repository.latest_catalog_generation()
+    exact = repository.catalog_generation(batch_id="wsc2-generation")
+
+    assert generation["catalog_discovery_mode"] == "full_history"
+    assert generation["catalog_batch_id"] == "wsc2-generation"
+    assert generation["catalog_raw_provenance_sha256"] == raw_provenance_sha256
+    assert generation["catalog_as_of_date"] == "2026-07-16"
+    assert exact == generation
+    assert "AND batch_id = 'wsc2-generation'" in trino.execute_query.call_args.args[0]
+
+
+@pytest.mark.unit
+def test_load_discovered_catalog_rejects_same_count_payload_corruption():
+    batch_id = "wsc2-catalog-integrity"
+    rows = canonical_catalog_rows(
+        {
+            "competitions": (
+                {
+                    "competition_id": "INT-World Cup",
+                    "region_id": 247,
+                    "region_name": "International",
+                    "region_code": "INT",
+                    "tournament_id": 36,
+                    "tournament_name": "World Cup",
+                    "source_sex": 1,
+                    "eligibility": "included",
+                    "classification_reason": "source_sex_male_no_youth_marker",
+                },
+            ),
+            "seasons": (
+                {
+                    "competition_id": "INT-World Cup",
+                    "region_id": 247,
+                    "tournament_id": 36,
+                    "source_season_id": 9001,
+                    "season_id": "2026",
+                    "season_format": "single_year",
+                    "source_label": "2026",
+                    "source_url": "/Regions/247/Tournaments/36/Seasons/9001",
+                    "is_active": True,
+                    "eligibility": "included",
+                    "classification_reason": ("parent:source_sex_male_no_youth_marker"),
+                },
+            ),
+            "stages": (
+                {
+                    "competition_id": "INT-World Cup",
+                    "season": "2026",
+                    "season_id": "2026",
+                    "season_format": "single_year",
+                    "region_id": 247,
+                    "tournament_id": 36,
+                    "source_season_id": 9001,
+                    "stage_id": 700,
+                    "stage": "Finals",
+                    "stage_name": "Finals",
+                    "source_url": (
+                        "/Regions/247/Tournaments/36/Seasons/9001/Stages/700"
+                    ),
+                    "eligibility": "included",
+                    "classification_reason": ("parent:source_sex_male_no_youth_marker"),
+                },
+            ),
+        }
+    )
+    fingerprint = catalog_payload_sha256(rows)
+    raw_inputs_json, raw_provenance_sha256 = _catalog_raw_identity(batch_id)
+
+    class CatalogTrino:
+        @staticmethod
+        def table_exists(_schema, _table):
+            return True
+
+        @staticmethod
+        def execute_query(sql):
+            if "SELECT batch_id FROM" in sql:
+                return [(batch_id,)]
+            for kind in ("competitions", "seasons", "stages"):
+                if f"whoscored_{kind}" in sql and "SELECT payload_json" in sql:
+                    return [(json.dumps(row),) for row in rows[kind]]
+            if "SELECT competitions_count" in sql:
+                return [
+                    (
+                        1,
+                        1,
+                        1,
+                        fingerprint,
+                        PARSER_VERSION,
+                        fingerprint,
+                        raw_inputs_json,
+                        raw_provenance_sha256,
+                        "full_history",
+                        date(2026, 7, 16),
+                        None,
+                        None,
+                        None,
+                        1,
+                    )
+                ]
+            raise AssertionError(sql)
+
+    repository = WhoScoredRepository(writer=MagicMock(), trino=CatalogTrino())
+    assert (
+        len(repository.load_discovered_catalog(batch_id=batch_id).to_rows()["stages"])
+        == 1
+    )
+
+    rows["stages"][0]["stage_name"] = "same-count corruption"
+    with pytest.raises(BatchConflict, match="manifest identity mismatch"):
+        repository.load_discovered_catalog(batch_id=batch_id)
+
+
+def _lineage_catalog_repository(
+    *, cycle: bool = False, parent_hash_mismatch: bool = False
+):
+    catalog_rows = canonical_catalog_rows(
+        {
+            "competitions": (
+                {
+                    "competition_id": "INT-World Cup",
+                    "region_id": 247,
+                    "tournament_id": 36,
+                    "tournament_name": "World Cup",
+                    "source_sex": 1,
+                    "eligibility": "included",
+                    "classification_reason": "source_sex_male_no_youth_marker",
+                },
+            ),
+            "seasons": (),
+            "stages": (),
+        }
+    )
+    payload_sha256 = catalog_payload_sha256(catalog_rows)
+    records = []
+    for index in range(50):
+        batch_id = f"wsc2-lineage-{index:02d}"
+        raw_inputs_json, raw_sha256 = _catalog_raw_identity(
+            batch_id, as_of=date(2026, 1, 1) + timedelta(days=index)
+        )
+        parent = records[index - 1] if index else None
+        records.append(
+            {
+                "batch_id": batch_id,
+                "payload_sha256": payload_sha256,
+                "parser_version": PARSER_VERSION,
+                "raw_inputs_json": raw_inputs_json,
+                "raw_provenance_sha256": raw_sha256,
+                "discovery_mode": "incremental" if parent else "full_history",
+                "as_of_date": date(2026, 1, 1) + timedelta(days=index),
+                "parent_catalog_batch_id": parent["batch_id"] if parent else None,
+                "parent_catalog_payload_sha256": (
+                    parent["payload_sha256"] if parent else None
+                ),
+                "parent_catalog_raw_provenance_sha256": (
+                    parent["raw_provenance_sha256"] if parent else None
+                ),
+            }
+        )
+    if cycle:
+        records[0].update(
+            {
+                "discovery_mode": "incremental",
+                "parent_catalog_batch_id": records[-1]["batch_id"],
+                "parent_catalog_payload_sha256": records[-1]["payload_sha256"],
+                "parent_catalog_raw_provenance_sha256": records[-1][
+                    "raw_provenance_sha256"
+                ],
+            }
+        )
+    if parent_hash_mismatch:
+        records[-1]["parent_catalog_raw_provenance_sha256"] = "e" * 64
+    current = records[-1]
+
+    class LineageTrino:
+        lineage_queries = 0
+
+        @staticmethod
+        def table_exists(_schema, _table):
+            return True
+
+        @classmethod
+        def execute_query(cls, sql):
+            if "SELECT batch_id FROM" in sql:
+                return [(current["batch_id"],)]
+            if "SELECT payload_json" in sql and "whoscored_competitions" in sql:
+                return [(json.dumps(catalog_rows["competitions"][0]),)]
+            if "SELECT payload_json" in sql and (
+                "whoscored_seasons" in sql or "whoscored_stages" in sql
+            ):
+                return []
+            if "SELECT competitions_count" in sql:
+                return [
+                    (
+                        1,
+                        0,
+                        0,
+                        current["payload_sha256"],
+                        current["parser_version"],
+                        current["payload_sha256"],
+                        current["raw_inputs_json"],
+                        current["raw_provenance_sha256"],
+                        current["discovery_mode"],
+                        current["as_of_date"],
+                        current["parent_catalog_batch_id"],
+                        current["parent_catalog_payload_sha256"],
+                        current["parent_catalog_raw_provenance_sha256"],
+                        1,
+                    )
+                ]
+            if "PARTITION BY batch_id" in sql:
+                cls.lineage_queries += 1
+                return [
+                    (
+                        row["batch_id"],
+                        row["payload_sha256"],
+                        row["parser_version"],
+                        row["raw_inputs_json"],
+                        row["raw_provenance_sha256"],
+                        row["discovery_mode"],
+                        row["as_of_date"],
+                        row["parent_catalog_batch_id"],
+                        row["parent_catalog_payload_sha256"],
+                        row["parent_catalog_raw_provenance_sha256"],
+                        1,
+                    )
+                    for row in records
+                ]
+            raise AssertionError(sql)
+
+    return (
+        WhoScoredRepository(writer=MagicMock(), trino=LineageTrino()),
+        LineageTrino,
+        current["batch_id"],
+    )
+
+
+@pytest.mark.unit
+def test_load_catalog_validates_long_parent_chain_with_one_lineage_query():
+    repository, trino, batch_id = _lineage_catalog_repository()
+
+    catalog = repository.load_discovered_catalog(batch_id=batch_id)
+
+    assert len(catalog.competitions) == 1
+    assert trino.lineage_queries == 1
+
+
+@pytest.mark.unit
+def test_load_catalog_rejects_recursive_parent_cycle_fail_closed():
+    repository, trino, batch_id = _lineage_catalog_repository(cycle=True)
+
+    with pytest.raises(BatchConflict, match="lineage cycle"):
+        repository.load_discovered_catalog(batch_id=batch_id)
+
+    assert trino.lineage_queries == 1
+
+
+@pytest.mark.unit
+def test_load_catalog_rejects_parent_raw_provenance_hash_mismatch():
+    repository, trino, batch_id = _lineage_catalog_repository(parent_hash_mismatch=True)
+
+    with pytest.raises(BatchConflict, match="parent raw provenance hash"):
+        repository.load_discovered_catalog(batch_id=batch_id)
+
+    assert trino.lineage_queries == 1
+
+
+@pytest.mark.unit
+def test_explicit_full_history_bootstrap_can_read_one_valid_v7_catalog():
+    """The v8 migration may compare against v7 without weakening normal reads."""
+
+    batch_id = "wsc2-v7-bootstrap"
+    rows = canonical_catalog_rows(
+        {
+            "competitions": (
+                {
+                    "competition_id": "INT-World Cup",
+                    "region_id": 247,
+                    "tournament_id": 36,
+                    "tournament_name": "World Cup",
+                    "source_sex": 1,
+                    "eligibility": "included",
+                    "classification_reason": "source_sex_male_no_youth_marker",
+                },
+            ),
+            "seasons": (),
+            "stages": (),
+        }
+    )
+    legacy_fingerprint = "7" * 64
+
+    class LegacyCatalogTrino:
+        @staticmethod
+        def table_exists(_schema, _table):
+            return True
+
+        @staticmethod
+        def execute_query(sql):
+            if "SELECT batch_id FROM" in sql:
+                return [(batch_id,)]
+            for kind in ("competitions", "seasons", "stages"):
+                if f"whoscored_{kind}" in sql and "SELECT payload_json" in sql:
+                    return [(json.dumps(row),) for row in rows[kind]]
+            if "SELECT competitions_count" in sql:
+                return [
+                    (
+                        1,
+                        0,
+                        0,
+                        legacy_fingerprint,
+                        "whoscored-parser-v7",
+                        legacy_fingerprint,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        1,
+                    )
+                ]
+            raise AssertionError(sql)
+
+    repository = WhoScoredRepository(writer=MagicMock(), trino=LegacyCatalogTrino())
+    with pytest.raises(BatchConflict, match="manifest identity mismatch"):
+        repository.load_discovered_catalog(batch_id=batch_id)
+
+    catalog = repository.load_discovered_catalog(
+        batch_id=batch_id,
+        allow_legacy_parser_for_full_history=True,
+    )
+    assert len(catalog.competitions) == 1
+
+
+@pytest.mark.unit
+def test_pre_lineage_manifest_is_only_readable_for_full_history_bootstrap():
+    batch_id = "wsc2-pre-lineage-bootstrap"
+    rows = canonical_catalog_rows(
+        {
+            "competitions": (
+                {
+                    "competition_id": "INT-World Cup",
+                    "region_id": 247,
+                    "tournament_id": 36,
+                    "tournament_name": "World Cup",
+                    "source_sex": 1,
+                    "eligibility": "included",
+                    "classification_reason": "source_sex_male_no_youth_marker",
+                },
+            ),
+            "seasons": (),
+            "stages": (),
+        }
+    )
+    fingerprint = catalog_payload_sha256(rows)
+
+    class PreLineageTrino:
+        @staticmethod
+        def table_exists(_schema, _table):
+            return True
+
+        @staticmethod
+        def execute_query(sql):
+            if "SELECT batch_id, payload_sha256" in sql:
+                return [
+                    (
+                        batch_id,
+                        fingerprint,
+                        PARSER_VERSION,
+                        "s3://raw/pre-lineage.json.gz",
+                        "[]",
+                        datetime(2026, 7, 15),
+                        "full_history",
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        1,
+                    )
+                ]
+            if "SELECT batch_id FROM" in sql:
+                return [(batch_id,)]
+            for kind in ("competitions", "seasons", "stages"):
+                if f"whoscored_{kind}" in sql and "SELECT payload_json" in sql:
+                    return [(json.dumps(row),) for row in rows[kind]]
+            if "SELECT competitions_count" in sql:
+                return [
+                    (
+                        1,
+                        0,
+                        0,
+                        fingerprint,
+                        PARSER_VERSION,
+                        fingerprint,
+                        "[]",
+                        None,
+                        "full_history",
+                        None,
+                        None,
+                        None,
+                        None,
+                        1,
+                    )
+                ]
+            raise AssertionError(sql)
+
+    repository = WhoScoredRepository(writer=MagicMock(), trino=PreLineageTrino())
+    with pytest.raises(BatchConflict, match="invalid as_of_date"):
+        repository.load_discovered_catalog(batch_id=batch_id)
+
+    generation, catalog = repository.load_catalog_generation_snapshot(
+        batch_id=batch_id,
+        allow_legacy_parser_for_full_history=True,
+    )
+    assert generation["catalog_as_of_date"] is None
+    assert len(catalog.competitions) == 1
 
 
 @pytest.mark.unit
@@ -428,18 +967,167 @@ def test_commit_matches_rejects_lineup_availability_contradictions_before_io():
 
 
 @pytest.mark.unit
-def test_commit_matches_rejects_cross_scope_batch_id_collision_before_io():
+def test_match_batch_v3_identity_is_bound_to_league_and_season():
+    first = _commit()
+    other_league = replace(first, league="OTHER")
+    other_season = replace(first, season="2027")
+
+    assert first.batch_id == (
+        "ws2-v3-d9a8d63566c01112c8c68524d589b26a343fd000088ea9ab8f27a71d0372bea3"
+    )
+    assert re.fullmatch(r"ws2-v3-[0-9a-f]{64}", first.batch_id)
+    assert len({first.batch_id, other_league.batch_id, other_season.batch_id}) == 3
+
+
+@pytest.mark.unit
+def test_preview_batch_v3_identity_is_bound_to_league_and_season():
+    first = _preview_commit()
+    other_league = replace(first, league="OTHER")
+    other_season = replace(first, season="2027")
+
+    assert first.batch_id == (
+        "wsp2-v3-90a2d1e58cb289b8fcc08ab60075daccd64d9cee5e3264e98b954a49bf37e21e"
+    )
+    assert re.fullmatch(r"wsp2-v3-[0-9a-f]{64}", first.batch_id)
+    assert len({first.batch_id, other_league.batch_id, other_season.batch_id}) == 3
+
+
+@pytest.mark.unit
+def test_v3_batch_identity_is_not_ambiguous_when_components_contain_delimiters():
+    first_match = replace(_commit(), league="A\0B", season="C")
+    second_match = replace(_commit(), league="A", season="B\0C")
+    first_preview = replace(_preview_commit(), league="A\0B", season="C")
+    second_preview = replace(_preview_commit(), league="A", season="B\0C")
+
+    assert first_match.batch_id != second_match.batch_id
+    assert first_preview.batch_id != second_preview.batch_id
+
+
+@pytest.mark.unit
+def test_sequential_cross_scope_match_commit_writes_a_distinct_physical_batch(
+    monkeypatch,
+):
     trino = MagicMock()
     writer = MagicMock()
     repository = WhoScoredRepository(writer=writer, trino=trino)
     first = _commit()
     second = replace(first, league="OTHER", season="2027")
+    manifests: dict[str, dict[str, int]] = {}
+    physical: dict[str, dict[str, int]] = {}
+    physical_writes: list[str] = []
 
-    with pytest.raises(BatchConflict, match="match batch id collision"):
-        repository.commit_matches((first, second))
+    monkeypatch.setattr(repository, "_current_dataset_counts", lambda _commits: {})
 
-    trino.execute_query.assert_not_called()
-    writer.write_dataframe.assert_not_called()
+    def physical_counts(table, batch_ids):
+        stored = physical.get(table, {})
+        return {
+            batch_id: stored[batch_id] for batch_id in batch_ids if batch_id in stored
+        }
+
+    monkeypatch.setattr(repository, "_match_physical_counts", physical_counts)
+
+    def execute_query(sql):
+        if "GROUP BY batch_id, events_count, lineups_count" not in sql:
+            return []
+        return [
+            (
+                batch_id,
+                counts["events"],
+                counts["lineups"],
+                json.dumps(counts, sort_keys=True, separators=(",", ":")),
+                1,
+            )
+            for batch_id, counts in manifests.items()
+            if batch_id in sql
+        ]
+
+    trino.execute_query.side_effect = execute_query
+
+    def write_dataframe(frame, *, table, **_kwargs):
+        if table == "whoscored_match_ingest_manifest":
+            for row in frame.to_dict("records"):
+                manifests[str(row["batch_id"])] = json.loads(
+                    str(row["entity_counts_json"])
+                )
+            return
+        if "_game_batch_id" not in frame.columns:
+            return
+        counts = frame.groupby("_game_batch_id").size().to_dict()
+        physical.setdefault(table, {}).update(
+            {str(batch_id): int(count) for batch_id, count in counts.items()}
+        )
+        physical_writes.extend(str(batch_id) for batch_id in counts)
+
+    writer.write_dataframe.side_effect = write_dataframe
+
+    assert repository.commit_matches((first,)) == (first.batch_id,)
+    assert repository.commit_matches((second,)) == (second.batch_id,)
+
+    assert first.batch_id != second.batch_id
+    assert physical_writes == [first.batch_id, second.batch_id]
+    assert set(manifests) == {first.batch_id, second.batch_id}
+
+
+@pytest.mark.unit
+def test_sequential_cross_scope_preview_commit_writes_a_distinct_physical_batch(
+    monkeypatch,
+):
+    trino = MagicMock()
+    writer = MagicMock()
+    repository = WhoScoredRepository(writer=writer, trino=trino)
+    first = _preview_commit(rows=({"team": "Home", "player_id": 10},))
+    second = replace(first, league="OTHER", season="2027")
+    manifests: dict[str, dict[str, int]] = {}
+    physical: dict[str, dict[str, int]] = {}
+    physical_writes: list[str] = []
+
+    def physical_counts(table, batch_ids):
+        stored = physical.get(table, {})
+        return {
+            batch_id: stored[batch_id] for batch_id in batch_ids if batch_id in stored
+        }
+
+    monkeypatch.setattr(repository, "_preview_physical_counts", physical_counts)
+
+    def execute_query(sql):
+        if "GROUP BY batch_id, missing_players_count" not in sql:
+            return []
+        return [
+            (
+                batch_id,
+                counts["missing_players"],
+                json.dumps(counts, sort_keys=True, separators=(",", ":")),
+                1,
+            )
+            for batch_id, counts in manifests.items()
+            if batch_id in sql
+        ]
+
+    trino.execute_query.side_effect = execute_query
+
+    def write_dataframe(frame, *, table, **_kwargs):
+        if table == "whoscored_preview_ingest_manifest":
+            for row in frame.to_dict("records"):
+                manifests[str(row["batch_id"])] = json.loads(
+                    str(row["entity_counts_json"])
+                )
+            return
+        if "_preview_batch_id" not in frame.columns:
+            return
+        counts = frame.groupby("_preview_batch_id").size().to_dict()
+        physical.setdefault(table, {}).update(
+            {str(batch_id): int(count) for batch_id, count in counts.items()}
+        )
+        physical_writes.extend(str(batch_id) for batch_id in counts)
+
+    writer.write_dataframe.side_effect = write_dataframe
+
+    assert repository.commit_previews((first,)) == (first.batch_id,)
+    assert repository.commit_previews((second,)) == (second.batch_id,)
+
+    assert first.batch_id != second.batch_id
+    assert physical_writes == [first.batch_id, second.batch_id]
+    assert set(manifests) == {first.batch_id, second.batch_id}
 
 
 @pytest.mark.unit
@@ -594,7 +1282,7 @@ def test_idempotent_match_commit_verifies_manifest_and_physical_counts():
 def test_unchanged_match_refresh_advances_only_a_due_or_failed_manifest(
     latest_state, latest_age, expect_heartbeat
 ):
-    commit = _commit()
+    commit = replace(_commit(), attempt_no=3)
     now = datetime.now()
     trino = MagicMock()
     trino.table_exists.return_value = True
@@ -635,16 +1323,26 @@ def test_unchanged_match_refresh_advances_only_a_due_or_failed_manifest(
         row = call.args[0].iloc[0]
         assert row["state"] == "success"
         assert row["batch_id"] == commit.batch_id
+        assert row["attempt_no"] == 3
     else:
         writer.write_dataframe.assert_not_called()
 
 
 @pytest.mark.unit
 def test_profile_manifest_cannot_hide_a_missing_physical_version():
+    commit = ProfileCommit(
+        player_id=99,
+        profile={"name": "Player"},
+        payload_sha256="b" * 64,
+        raw_uri="s3://raw/profile.html.gz",
+        transport_mode="direct_http",
+    )
     trino = MagicMock()
     trino.execute_query.side_effect = [
         [],  # no physical profile version
-        [(99, "b" * 64, PARSER_VERSION, 0)],  # successful manifest exists
+        [
+            (commit.batch_id, 99, "b" * 64, PARSER_VERSION, 0)
+        ],  # successful exact manifest exists
         [],  # no physical participation rows
     ]
     trino.table_exists.return_value = True
@@ -652,17 +1350,7 @@ def test_profile_manifest_cannot_hide_a_missing_physical_version():
     repository = WhoScoredRepository(writer=writer, trino=trino)
 
     with pytest.raises(BatchConflict, match="committed but has 0 physical"):
-        repository.commit_profiles(
-            [
-                ProfileCommit(
-                    player_id=99,
-                    profile={"name": "Player"},
-                    payload_sha256="b" * 64,
-                    raw_uri="s3://raw/profile.html.gz",
-                    transport_mode="direct_http",
-                )
-            ]
-        )
+        repository.commit_profiles([commit])
 
     writer.write_dataframe.assert_not_called()
 
@@ -716,9 +1404,13 @@ def test_unchanged_profile_refresh_advances_only_a_due_or_failed_manifest(
     trino = MagicMock()
     trino.table_exists.return_value = False
     trino.execute_query.side_effect = [
-        [(99, digest, PARSER_VERSION, 1)],  # physical content version
-        [(99, digest, PARSER_VERSION, 0)],  # any historical success
-        [(99, digest, PARSER_VERSION, 1)],  # verified physical version
+        [
+            (commit.batch_id, 99, digest, PARSER_VERSION, 1)
+        ],  # exact physical content version
+        [(commit.batch_id, 99, digest, PARSER_VERSION, 0)],  # exact historical success
+        [
+            (commit.batch_id, 99, digest, PARSER_VERSION, 1)
+        ],  # verified exact physical version
         [
             (
                 99,
@@ -747,6 +1439,110 @@ def test_unchanged_profile_refresh_advances_only_a_due_or_failed_manifest(
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("participation_count", [0, 1], ids=["empty", "one-row"])
+def test_legacy_profile_cannot_suppress_exact_v3_materialisation_and_rerun(
+    participation_count,
+):
+    digest = "c" * 64
+    participations = (
+        (
+            {
+                "record_type": "stage",
+                "tournament_id": 7,
+                "stage_id": 11,
+                "team_id": 13,
+            },
+        )
+        if participation_count
+        else ()
+    )
+    commit = ProfileCommit(
+        player_id=99,
+        profile={"player_id": 99, "name": "Player"},
+        payload_sha256=digest,
+        raw_uri="s3://raw/profile.html.gz",
+        transport_mode="raw_cache",
+        participations=participations,
+        participations_status="available" if participations else "empty",
+    )
+    legacy_batch_id = "wspr2-" + "d" * 64
+    now = datetime.now()
+    exact_physical = (commit.batch_id, 99, digest, PARSER_VERSION, 1)
+    exact_success = (
+        commit.batch_id,
+        99,
+        digest,
+        PARSER_VERSION,
+        participation_count,
+    )
+    exact_participations = (
+        [(commit.batch_id, participation_count)] if participation_count else []
+    )
+    legacy_latest = (
+        99,
+        digest,
+        PARSER_VERSION,
+        "success",
+        legacy_batch_id,
+        now,
+    )
+    exact_latest = (
+        99,
+        digest,
+        PARSER_VERSION,
+        "success",
+        commit.batch_id,
+        now,
+    )
+    trino = MagicMock()
+    trino.table_exists.return_value = True
+    trino.execute_query.side_effect = [
+        [],  # legacy physical row is not the exact v3 physical row
+        [],  # legacy success is not the exact v3 success
+        [],  # no exact v3 participation rows
+        [exact_physical],
+        exact_participations,
+        [legacy_latest],
+        [exact_physical],
+        [exact_success],
+        exact_participations,
+        [exact_physical],
+        exact_participations,
+        [exact_latest],
+    ]
+    writer = MagicMock()
+    repository = WhoScoredRepository(writer=writer, trino=trino)
+
+    assert repository.commit_profiles([commit]) == (commit.batch_id,)
+    first_publish_calls = list(writer.write_dataframe.call_args_list)
+    assert repository.commit_profiles([commit]) == (commit.batch_id,)
+
+    assert writer.write_dataframe.call_args_list == first_publish_calls
+    published_tables = [call.kwargs["table"] for call in first_publish_calls]
+    expected_tables = ["whoscored_player_profile_versions"]
+    if participation_count:
+        expected_tables.append("whoscored_player_stage_participations")
+    expected_tables.append("whoscored_profile_ingest_manifest")
+    assert published_tables == expected_tables
+    for call in first_publish_calls:
+        frame = call.args[0]
+        if "_profile_batch_id" in frame:
+            assert set(frame["_profile_batch_id"]) == {commit.batch_id}
+
+    queries = [call.args[0] for call in trino.execute_query.call_args_list]
+    exact_physical_queries = [
+        sql for sql in queries if "whoscored_player_profile_versions" in sql
+    ]
+    exact_success_queries = [
+        sql for sql in queries if "MAX(COALESCE(participations_count, 0))" in sql
+    ]
+    assert len(exact_physical_queries) == 4
+    assert len(exact_success_queries) == 2
+    for sql in [*exact_physical_queries, *exact_success_queries]:
+        assert f"_profile_batch_id IN ('{commit.batch_id}')" in sql
+
+
+@pytest.mark.unit
 def test_profile_candidates_are_scope_bounded_and_do_not_refetch_success():
     trino = MagicMock()
     trino.execute_query.return_value = [(7,), (11,)]
@@ -762,7 +1558,7 @@ def test_profile_candidates_are_scope_bounded_and_do_not_refetch_success():
     sql = trino.execute_query.call_args.args[0]
     assert "league = 'ENG-Premier League' AND season = '2526'" in sql
     assert "league = 'INT-World Cup' AND season = '2026'" in sql
-    assert "SELECT DISTINCT player_id" in sql
+    assert "SELECT DISTINCT CAST(player_id AS BIGINT) AS player_id" in sql
     assert "m.state = 'success'" in sql
     assert "m._profile_batch_id NOT LIKE 'wspr2-%'" in sql
     assert "m.state = 'retryable'" in sql
@@ -770,10 +1566,50 @@ def test_profile_candidates_are_scope_bounded_and_do_not_refetch_success():
     assert "<= CAST(CURRENT_TIMESTAMP AS TIMESTAMP)" in sql
     assert "m.state = 'parse_failed'" in sql
     assert "m.parser_version IS DISTINCT FROM" in sql
+    assert "m.state = 'not_available'" in sql
+    assert "m.failure_code IS NULL" in sql
+    assert "COALESCE(m.http_status, 0) NOT IN (404, 410)" in sql
     assert "m.state = 'terminal'" not in sql
     assert "WHEN m.player_id IS NULL THEN 0" in sql
     assert "m._profile_batch_id NOT LIKE 'wspr2-%' THEN 1" in sql
     assert "LIMIT 2" in sql
+
+
+@pytest.mark.unit
+def test_profile_candidate_snapshot_returns_the_complete_exact_due_identity():
+    trino = MagicMock()
+    trino.execute_query.return_value = [(11, 2), (7, 2)]
+    repository = WhoScoredRepository(writer=MagicMock(), trino=trino)
+    scopes = [
+        WhoScoredScope("INT-World Cup", "2026", SeasonFormat.SINGLE_YEAR),
+    ]
+
+    snapshot = repository.profile_candidate_snapshot(scopes=scopes, hard_cap=3_000)
+
+    assert snapshot.player_ids == (7, 11)
+    assert snapshot.count == 2
+    assert snapshot.payload_sha256 == profile_candidate_payload_sha256((11, 7))
+    sql = trino.execute_query.call_args.args[0]
+    assert "COUNT(*) OVER () AS exact_candidate_count" in sql
+    assert "LIMIT 3001" in sql
+    assert "m.state = 'retryable'" in sql
+    assert "m.state = 'parse_failed'" in sql
+
+
+@pytest.mark.unit
+def test_profile_candidate_snapshot_fails_with_the_exact_backlog_above_cap():
+    trino = MagicMock()
+    trino.execute_query.return_value = [(7, 3_001)]
+    repository = WhoScoredRepository(writer=MagicMock(), trino=trino)
+    scopes = [
+        WhoScoredScope("INT-World Cup", "2026", SeasonFormat.SINGLE_YEAR),
+    ]
+
+    with pytest.raises(ProfileCandidateCapacityExceeded) as raised:
+        repository.profile_candidate_snapshot(scopes=scopes, hard_cap=3_000)
+
+    assert raised.value.count == 3_001
+    assert raised.value.hard_cap == 3_000
 
 
 @pytest.mark.unit
@@ -795,7 +1631,7 @@ def test_profile_candidates_require_a_nonempty_scope_and_honor_zero_limit():
 
 
 @pytest.mark.unit
-def test_match_candidates_replay_parser_failures_only_after_parser_change():
+def test_match_candidates_replay_failures_after_parser_or_availability_change():
     trino = MagicMock()
     trino.execute_query.return_value = []
     repository = WhoScoredRepository(writer=MagicMock(), trino=trino)
@@ -806,10 +1642,55 @@ def test_match_candidates_replay_parser_failures_only_after_parser_change():
     assert "m.state = 'retryable'" in sql
     assert "m.state = 'parse_failed'" in sql
     assert "m.parser_version IS DISTINCT FROM" in sql
+    assert "m.availability_version IS DISTINCT FROM" in sql
+    assert MATCH_AVAILABILITY_VERSION in sql
     assert "m.state = 'terminal'" not in sql
     assert "m.state = 'success'" in sql
     assert "m.batch_id NOT LIKE 'ws2-%'" in sql
     assert sql.count("m.parser_version IS DISTINCT FROM") >= 2
+
+
+@pytest.mark.unit
+def test_match_candidates_increment_latest_retry_and_reset_after_success():
+    trino = MagicMock()
+    trino.execute_query.side_effect = [
+        [
+            (
+                123,
+                "INT-World Cup",
+                "2026",
+                "Home-Away",
+                datetime(2026, 7, 11),
+                6,
+                True,
+                4,
+            )
+        ],
+        [
+            (
+                124,
+                "INT-World Cup",
+                "2026",
+                "Other-Away",
+                datetime(2026, 7, 12),
+                6,
+                True,
+                1,
+            )
+        ],
+    ]
+    repository = WhoScoredRepository(writer=MagicMock(), trino=trino)
+
+    retry = repository.list_match_candidates("INT-World Cup", "2026")
+    success_refresh = repository.list_match_candidates("INT-World Cup", "2026")
+
+    assert retry[0].attempt_no == 4
+    assert success_refresh[0].attempt_no == 1
+    sql = trino.execute_query.call_args_list[0].args[0]
+    assert "whoscored_match_ingest_latest" in sql
+    assert "WHEN m.state = 'retryable'" in sql
+    assert "THEN COALESCE(m.attempt_no, 0) + 1" in sql
+    assert "ELSE 1" in sql
 
 
 @pytest.mark.unit
@@ -825,6 +1706,68 @@ def test_backfill_match_candidates_explicitly_include_failed_manifest_states():
 
     sql = trino.execute_query.call_args.args[0]
     assert "m.state IN ('terminal', 'parse_failed')" in sql
+
+
+@pytest.mark.unit
+def test_match_candidates_expose_exact_backlog_count_when_requested():
+    trino = MagicMock()
+    # Both returned rows carry the exact pre-LIMIT backlog (5) on every row.
+    trino.execute_query.return_value = [
+        (123, "INT-World Cup", "2026", "A-B", datetime(2026, 7, 11), 6, True, 1, 5),
+        (124, "INT-World Cup", "2026", "C-D", datetime(2026, 7, 12), 6, True, 1, 5),
+    ]
+    repository = WhoScoredRepository(writer=MagicMock(), trino=trino)
+
+    candidates = repository.list_match_candidates(
+        "INT-World Cup", "2026", limit=2, include_exact_count=True
+    )
+
+    sql = trino.execute_query.call_args.args[0]
+    assert "COUNT(*) OVER () AS exact_candidate_count" in sql
+    assert [candidate.game_id for candidate in candidates] == [123, 124]
+    assert [candidate.exact_candidate_count for candidate in candidates] == [5, 5]
+
+
+@pytest.mark.unit
+def test_match_candidates_omit_the_exact_count_projection_by_default():
+    trino = MagicMock()
+    trino.execute_query.return_value = []
+    repository = WhoScoredRepository(writer=MagicMock(), trino=trino)
+
+    candidates = repository.list_match_candidates("INT-World Cup", "2026")
+
+    sql = trino.execute_query.call_args.args[0]
+    assert "exact_candidate_count" not in sql
+    assert candidates == []
+
+
+@pytest.mark.unit
+def test_backfill_freeze_includes_every_completed_match_regardless_manifest():
+    trino = MagicMock()
+    trino.execute_query.return_value = []
+    repository = WhoScoredRepository(writer=MagicMock(), trino=trino)
+
+    assert repository.list_completed_match_candidates("INT-World Cup", "2026") == []
+
+    sql = trino.execute_query.call_args.args[0]
+    assert "AND (TRUE)" in sql
+    assert "retry_after" not in sql
+    assert "parser_version IS DISTINCT FROM" not in sql
+
+
+@pytest.mark.unit
+def test_backfill_profile_freeze_ignores_mutable_manifest_state():
+    trino = MagicMock()
+    trino.execute_query.return_value = [(7,), (11,)]
+    repository = WhoScoredRepository(writer=MagicMock(), trino=trino)
+    scope = WhoScoredScope("INT-World Cup", "2026", SeasonFormat.SINGLE_YEAR)
+
+    assert repository.list_roster_player_ids(scopes=[scope]) == [7, 11]
+
+    sql = trino.execute_query.call_args.args[0]
+    assert "SELECT DISTINCT CAST(player_id AS BIGINT)" in sql
+    assert "league = 'INT-World Cup' AND season = '2026'" in sql
+    assert "profile_ingest_manifest" not in sql
 
 
 @pytest.mark.unit
@@ -1138,6 +2081,7 @@ def test_record_profile_failure_writes_current_manifest_shape(
         "payload_sha256",
         "raw_uri",
         "parser_version",
+        "availability_version",
         "state",
         "http_status",
         "failure_code",
@@ -1150,6 +2094,7 @@ def test_record_profile_failure_writes_current_manifest_shape(
         "paid_bytes",
         "fetched_at",
         "completed_at",
+        "_profile_batch_id",
         "_entity_type",
     }
     assert row["player_id"] == 99
@@ -1160,6 +2105,7 @@ def test_record_profile_failure_writes_current_manifest_shape(
     )
     assert (row["completed_at"] is not None) is completed
     assert row["_entity_type"] == "profile_manifest"
+    assert row["_profile_batch_id"] is None
 
 
 @pytest.mark.unit
@@ -1219,6 +2165,7 @@ def test_match_parse_failure_manifest_keeps_raw_identity_for_offline_replay():
     assert row["payload_sha256"] == "a" * 64
     assert row["raw_uri"] == "s3://raw/match.html.gz"
     assert row["parser_version"] == PARSER_VERSION
+    assert row["availability_version"] == MATCH_AVAILABILITY_VERSION
 
 
 @pytest.mark.unit
@@ -1226,7 +2173,7 @@ def test_match_not_available_manifest_is_a_terminal_source_state():
     writer = MagicMock()
     repository = WhoScoredRepository(writer=writer, trino=MagicMock())
 
-    repository.record_failure(
+    outcome_batch_id = repository.record_failure(
         ManifestFailure(
             game_id=123,
             league="WS-100-208",
@@ -1236,6 +2183,7 @@ def test_match_not_available_manifest_is_a_terminal_source_state():
             error="non-Opta match has no matchCentreData",
             retry_after=None,
             attempt_no=1,
+            http_status=404,
         )
     )
 
@@ -1243,6 +2191,32 @@ def test_match_not_available_manifest_is_a_terminal_source_state():
     assert row["state"] == "not_available"
     assert bool(row["is_final"]) is True
     assert row["retry_after"] is None
+    assert row["batch_id"] == outcome_batch_id
+    assert str(outcome_batch_id).startswith("wsna2-v3-")
+
+
+@pytest.mark.unit
+def test_profile_v3_batch_identity_is_not_ambiguous_under_nul_inputs():
+    left = ProfileCommit(
+        player_id=99,
+        profile={"player_id": 99},
+        payload_sha256="a\0b",
+        parser_version="c",
+        raw_uri="s3://raw/left",
+        transport_mode="raw_cache",
+    )
+    right = ProfileCommit(
+        player_id=99,
+        profile={"player_id": 99},
+        payload_sha256="a",
+        parser_version="b\0c",
+        raw_uri="s3://raw/right",
+        transport_mode="raw_cache",
+    )
+
+    assert left.batch_id != right.batch_id
+    assert left.batch_id.startswith("wspr2-v3-")
+    assert right.batch_id.startswith("wspr2-v3-")
 
 
 @pytest.mark.unit
@@ -1450,3 +2424,253 @@ def test_scope_bundle_fails_closed_when_stored_feed_states_disagree():
         )
 
     writer.write_dataframe.assert_not_called()
+
+
+@pytest.mark.unit
+def test_scope_row_spool_large_payload_is_reiterable_and_memory_bounded(tmp_path):
+    spool = WhoScoredScopeRowSpool(
+        table="whoscored_team_stage_stats",
+        league="INT-World Cup",
+        season="2026",
+        directory=str(tmp_path),
+    )
+    row_count = 10_000
+    payload_size = 4_096
+
+    def rows():
+        for index in range(row_count):
+            yield {
+                "league": "INT-World Cup",
+                "season": "2026",
+                "stage_id": 23752,
+                "row_index": index,
+                "source_raw_json": ("x" * (payload_size - 8)) + f"{index:08d}",
+            }
+
+    tracemalloc.start()
+    try:
+        spool.begin_stage()
+        spool.append_entity_rows(rows())
+        spool.commit_stage()
+        _current, peak = tracemalloc.get_traced_memory()
+        first = sum(1 for _ in spool)
+        second = sum(1 for _ in spool)
+
+        assert len(spool) == first == second == row_count
+        assert spool.on_disk_bytes >= row_count * payload_size
+        # The logical payload exceeds 39 MiB. The Python heap stays bounded by
+        # the 256-row SQLite/iterator batches instead of tracking cardinality.
+        assert peak < 12 * 1024 * 1024
+        assert spool.content_fingerprint() == spool.content_fingerprint()
+    finally:
+        tracemalloc.stop()
+        spool.close()
+
+
+@pytest.mark.unit
+def test_scope_row_spool_rolls_back_a_partial_stage_atomically(tmp_path):
+    spool = WhoScoredScopeRowSpool(
+        table="whoscored_team_stage_stats",
+        league="INT-World Cup",
+        season="2026",
+        directory=str(tmp_path),
+    )
+    try:
+        spool.begin_stage()
+        spool.append_entity_rows(
+            [
+                {
+                    "league": "INT-World Cup",
+                    "season": "2026",
+                    "stage_id": 23752,
+                    "row_index": 1,
+                }
+            ]
+        )
+        spool.commit_stage()
+        committed_fingerprint = spool.content_fingerprint()
+
+        spool.begin_stage()
+        spool.append_entity_rows(
+            [
+                {
+                    "league": "INT-World Cup",
+                    "season": "2026",
+                    "stage_id": 23753,
+                    "row_index": 2,
+                    "partial_only_column": "must disappear",
+                }
+            ]
+        )
+        spool.rollback_stage()
+
+        assert len(spool) == 1
+        assert [row["stage_id"] for row in spool] == [23752]
+        assert "partial_only_column" not in spool.columns
+        assert spool.content_fingerprint() == committed_fingerprint
+    finally:
+        spool.close()
+
+
+@pytest.mark.unit
+def test_scope_row_spool_preserves_sqlite_full_error_after_auto_rollback(tmp_path):
+    spool = WhoScoredScopeRowSpool(
+        table="whoscored_team_stage_stats",
+        league="INT-World Cup",
+        season="2026",
+        directory=str(tmp_path),
+    )
+    try:
+        page_size = int(spool._connection.execute("PRAGMA page_size").fetchone()[0])
+        configured_max = int(
+            spool._connection.execute("PRAGMA max_page_count").fetchone()[0]
+        )
+        assert page_size * configured_max == 2 * 1024**3
+        page_count = int(spool._connection.execute("PRAGMA page_count").fetchone()[0])
+        spool._connection.execute(f"PRAGMA max_page_count={page_count}")
+        spool.begin_stage()
+
+        with pytest.raises(sqlite3.OperationalError, match="database or disk is full"):
+            try:
+                spool.append_entity_rows(
+                    [
+                        {
+                            "league": "INT-World Cup",
+                            "season": "2026",
+                            "stage_id": 23752,
+                            "large_value": "x" * (1024 * 1024),
+                        }
+                    ]
+                )
+            except sqlite3.OperationalError:
+                assert spool._connection.in_transaction is False
+                spool.rollback_stage()
+                raise
+
+        assert len(spool) == 0
+        assert spool.columns == frozenset()
+        assert spool._stage_snapshot is None
+    finally:
+        spool.close()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("table", "expected_max_bytes"),
+    [
+        ("whoscored_team_stage_stats", 2 * 1024**3),
+        ("whoscored_player_stage_stats", 4 * 1024**3),
+        ("whoscored_referee_stage_stats", 1024**3),
+        ("whoscored_schedule", 1024**3),
+    ],
+)
+def test_scope_row_spool_applies_bounded_table_ceiling(
+    tmp_path, table, expected_max_bytes
+):
+    spool = WhoScoredScopeRowSpool(
+        table=table,
+        league="INT-World Cup",
+        season="2026",
+        directory=str(tmp_path),
+    )
+    try:
+        page_size = int(spool._connection.execute("PRAGMA page_size").fetchone()[0])
+        configured_max = int(
+            spool._connection.execute("PRAGMA max_page_count").fetchone()[0]
+        )
+        assert page_size * configured_max == expected_max_bytes
+    finally:
+        spool.close()
+
+
+@pytest.mark.unit
+def test_scope_bundle_writes_reiterable_rows_in_bounded_chunks(monkeypatch):
+    monkeypatch.setenv("WHOSCORED_SCOPE_WRITE_CHUNK_ROWS", "2")
+    trino = MagicMock()
+    trino.execute_query.side_effect = [[], []]
+    writer = MagicMock()
+    repository = WhoScoredRepository(writer=writer, trino=trino)
+    repository._scope_batch_count = MagicMock(side_effect=[0, 5])
+    rows = [
+        {
+            "league": "INT-World Cup",
+            "season": "2026",
+            "game_id": game_id,
+        }
+        for game_id in range(1, 6)
+    ]
+
+    repository.commit_scope_bundle(
+        league="INT-World Cup",
+        season="2026",
+        entity_group="season",
+        datasets={"whoscored_schedule": rows},
+        distinct_keys={"whoscored_schedule": "game_id"},
+        payload_sha256="a" * 64,
+        raw_uris=["s3://raw/schedule.json.gz"],
+    )
+
+    calls = writer.write_dataframe.call_args_list
+    payload_calls = [
+        call for call in calls if call.kwargs["table"] == "whoscored_schedule"
+    ]
+    assert [len(call.args[0]) for call in payload_calls] == [2, 2, 1]
+    assert [
+        int(value)
+        for call in payload_calls
+        for value in call.args[0]["game_id"].tolist()
+    ] == [1, 2, 3, 4, 5]
+    assert calls[-1].kwargs["table"] == "whoscored_scope_ingest_manifest"
+
+
+@pytest.mark.unit
+def test_scope_bundle_recovers_only_its_unpublished_partial_batch(monkeypatch):
+    monkeypatch.setenv("WHOSCORED_SCOPE_WRITE_CHUNK_ROWS", "2")
+    trino = MagicMock()
+    trino.execute_query.side_effect = [[], []]
+    writer = MagicMock()
+    repository = WhoScoredRepository(writer=writer, trino=trino)
+    repository._scope_batch_count = MagicMock(side_effect=[1, 0, 3])
+
+    repository.commit_scope_bundle(
+        league="INT-World Cup",
+        season="2026",
+        entity_group="season",
+        datasets={
+            "whoscored_schedule": [
+                {"game_id": 1},
+                {"game_id": 2},
+                {"game_id": 3},
+            ]
+        },
+        distinct_keys={"whoscored_schedule": "game_id"},
+        payload_sha256="b" * 64,
+        raw_uris=["s3://raw/schedule.json.gz"],
+    )
+
+    delete_sql = trino._execute.call_args_list[0].args[0]
+    assert "DELETE FROM iceberg.bronze.whoscored_schedule" in delete_sql
+    assert "_scope_batch_id = 'wss2-" in delete_sql
+    assert len(writer.write_dataframe.call_args_list) == 3
+
+
+@pytest.mark.unit
+def test_match_candidates_keep_retryable_under_cap_past_the_kickoff_window():
+    from scrapers.whoscored.repository import DAILY_RETRYABLE_MAX_ATTEMPTS
+
+    trino = MagicMock()
+    trino.execute_query.return_value = []
+    repository = WhoScoredRepository(writer=MagicMock(), trino=trino)
+
+    repository.list_match_candidates(
+        "ENG-Premier League",
+        "2526",
+        limit=100,
+        kickoff_from=datetime(2026, 7, 13, 10, 0, 0, tzinfo=timezone.utc),
+    )
+
+    sql = trino.execute_query.call_args.args[0]
+    # The kickoff lower bound never sheds a still-retryable match under the cap.
+    assert "s.date >= TIMESTAMP" in sql
+    assert "m.state = 'retryable'" in sql
+    assert f"COALESCE(m.attempt_no, 0) < {DAILY_RETRYABLE_MAX_ATTEMPTS}" in sql

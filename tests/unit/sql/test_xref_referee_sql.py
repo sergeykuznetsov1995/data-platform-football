@@ -42,9 +42,10 @@ def _read_template() -> str:
 
 
 def _aliases_cte(sql: str) -> str:
-    """Slice the ``aliases`` CTE source (from ``WITH aliases AS`` up to the
-    next CTE ``raw_refs AS``) for #465 guard assertions."""
-    start = sql.index("WITH aliases AS")
+    """Slice the ``aliases`` CTE source (from ``aliases AS`` up to the next
+    CTE ``raw_refs AS``) for #465 guard assertions. Since the #930 cutover
+    the first CTE is ``league_map`` — ``aliases`` is no longer WITH-adjacent."""
+    start = sql.index("\naliases AS")
     end = sql.index("raw_refs AS")
     return sql[start:end]
 
@@ -66,11 +67,34 @@ class TestXrefRefereeTemplateStructure:
         assert "'fbref'" in sql and "'matchhistory'" in sql and "'fotmob'" in sql
 
     def test_fotmob_source_branch(self):
-        """FotMob (issue #270): 'fotmob' AS source reading match_facts_json."""
+        """FotMob (issue #270; #930 cutover): 'fotmob' AS source reading
+        match_facts_json from the native fotmob_match_payloads_current view."""
         sql = _read_template().lower()
         assert re.search(r"'fotmob'\s+as\s+source", sql)
-        assert "iceberg.bronze.fotmob_match_details" in sql
+        assert "iceberg.bronze.fotmob_match_payloads_current" in sql
+        assert "iceberg.bronze.fotmob_match_details" not in sql, (
+            "legacy bronze.fotmob_match_details must be gone after the #930 "
+            "native cutover"
+        )
         assert "$.infobox.referee.text" in sql
+
+    def test_fotmob_league_map_and_season_key(self):
+        """#930: native payloads carry competition_id/source_season_key, not
+        league/season — the branch must reconstruct league via the league_map
+        CTE (varchar competition_id → CAST bigint) and the season slug from
+        the source_season_key year-start."""
+        sql = _read_template().lower()
+        assert re.search(r"league_map\s*\(\s*competition_id\s*,\s*league\s*\)\s+as", sql), (
+            "league_map CTE (reverse FotMobScraper.LEAGUE_IDS map) must exist"
+        )
+        assert re.search(
+            r"cast\s*\(\s*p\.competition_id\s+as\s+bigint\s*\)", sql
+        ), "payloads competition_id is varchar — JOIN to league_map needs CAST"
+        assert "source_season_key" in sql
+        assert re.search(r"substr\s*\(\s*p\.source_season_key\s*,\s*1\s*,\s*4\s*\)", sql), (
+            "season year must come from the first 4 chars of source_season_key "
+            "(cutover map §2.2 — never from the key's shape)"
+        )
 
     def test_no_other_sources(self):
         sql = _read_template().lower()
@@ -181,3 +205,4 @@ class TestXrefRefereeRender:
         rendered = self._render()
         assert "iceberg.bronze.fbref_schedule" in rendered
         assert "iceberg.bronze.matchhistory_results" in rendered
+        assert "iceberg.bronze.fotmob_match_payloads_current" in rendered

@@ -161,8 +161,12 @@ def test_master_owns_one_fail_closed_xref_and_one_final_gold_launch():
 @pytest.mark.unit
 def test_master_waits_for_exact_scheduled_fbref_run_fail_closed():
     calls = _operator_calls("dag_master_pipeline.py", "ExternalTaskSensor")
-    assert len(calls) == 1
-    sensor = calls[0]
+    assert len(calls) == 2
+    sensor = next(
+        call
+        for call in calls
+        if _literal(call["external_dag_id"]) == "dag_ingest_fbref"
+    )
 
     assert _literal(sensor["task_id"]) == "wait_for_scheduled_fbref"
     assert _literal(sensor["external_dag_id"]) == "dag_ingest_fbref"
@@ -181,6 +185,25 @@ def test_master_waits_for_exact_scheduled_fbref_run_fail_closed():
 
 
 @pytest.mark.unit
+def test_master_waits_for_exact_scheduled_whoscored_run_fail_closed():
+    calls = _operator_calls("dag_master_pipeline.py", "ExternalTaskSensor")
+    sensor = next(
+        call
+        for call in calls
+        if _literal(call["external_dag_id"]) == "dag_ingest_whoscored"
+    )
+    assert _literal(sensor["task_id"]) == "wait_for_scheduled_whoscored"
+    assert _literal(sensor["allowed_states"]) == ["success"]
+    assert _literal(sensor["failed_states"]) == ["failed"]
+    assert _literal(sensor["mode"]) == "reschedule"
+    assert _literal(sensor["check_existence"]) is True
+    delta = sensor["execution_delta"]
+    assert {
+        kw.arg: _literal(kw.value) for kw in delta.keywords
+    } == {"hours": 4}
+
+
+@pytest.mark.unit
 def test_master_senses_scheduled_fbref_then_runs_direct_gold_prerequisites():
     from airflow.operators.python import PythonOperator
 
@@ -190,11 +213,17 @@ def test_master_senses_scheduled_fbref_then_runs_direct_gold_prerequisites():
     module = importlib.import_module("dag_master_pipeline")
 
     assert "dag_ingest_fbref" not in module.TRIGGERED_INGESTION_DAGS
-    assert module.SCHEDULED_INGESTION_DAGS == ["dag_ingest_fbref"]
+    assert module.SCHEDULED_INGESTION_DAGS == [
+        "dag_ingest_fbref",
+        "dag_ingest_whoscored",
+    ]
     assert "dag_ingest_fbref" in module.INGESTION_DAGS
+    assert "dag_ingest_whoscored" not in module.TRIGGERED_INGESTION_DAGS
     tasks = {task.task_id: task for task in PythonOperator._instances}
 
     assert "ingestion_triggers.trigger_fbref" not in tasks
+    assert "ingestion_triggers.trigger_whoscored" not in tasks
+    whoscored_sensor = tasks["wait_for_scheduled_whoscored"]
     fbref_sensor = tasks["wait_for_scheduled_fbref"]
     scope = tasks["resolve_fbref_publication_scope"]
     xref = tasks["trigger_xref_transforms"]
@@ -203,6 +232,7 @@ def test_master_senses_scheduled_fbref_then_runs_direct_gold_prerequisites():
     gold = tasks["trigger_fbref_gold"]
     check = tasks["check_pipeline_success"]
 
+    assert whoscored_sensor.task_id in tasks["validate_required_sources"].upstream_task_ids
     assert scope.task_id in fbref_sensor.downstream_task_ids
     assert xref.task_id in scope.downstream_task_ids
     assert e3.task_id in xref.downstream_task_ids

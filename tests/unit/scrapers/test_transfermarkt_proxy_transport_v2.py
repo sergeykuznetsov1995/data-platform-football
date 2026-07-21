@@ -615,19 +615,18 @@ def test_checkpoint_migrates_valid_empty_and_rejects_hash_tampering():
 
 
 @pytest.mark.unit
-def test_the_control_secret_is_shared_by_every_source_the_filter_guards(
+def test_transfermarkt_refuses_another_sources_control_secret(
     monkeypatch,
 ):
-    # One filter, one control secret; it is deployed under the name of the
-    # source that first needed it.
+    # A common bearer must not let an arbitrary worker impersonate an
+    # allowlisted Transfermarkt DAG.
     monkeypatch.delenv("TM_PROXY_CONTROL_TOKEN", raising=False)
     monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", CONTROL_TOKEN)
 
-    provider = ProxyFilterLeaseProvider(
-        "http://proxy_filter:8899", control_client=_ControlClient([]),
-    )
-
-    assert provider._control_token == CONTROL_TOKEN
+    with pytest.raises(ProxyRequiredError, match="TM_PROXY_CONTROL_TOKEN"):
+        ProxyFilterLeaseProvider(
+            "http://proxy_filter:8899", control_client=_ControlClient([]),
+        )
 
 
 @pytest.mark.unit

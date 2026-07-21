@@ -38,7 +38,7 @@ scouting-radar, referee-dashboard, event-heatmap — удалены в epic #478
    ```bash
    make superset-init     # полный bootstrap
    # либо вручную внутри контейнера:
-   docker compose exec superset python /app/pythonpath/dashboards/import_dashboards.py
+   ./scripts/compose.sh exec superset python /app/pythonpath/dashboards/import_dashboards.py
    ```
 
 ### Шаблон скрипта дашборда

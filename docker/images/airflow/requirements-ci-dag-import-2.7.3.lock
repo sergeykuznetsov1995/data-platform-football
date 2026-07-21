@@ -1,0 +1,4 @@
+# Airflow 2.7.3 DAG-import CI immutable wheel delta
+# The pinned Apache Airflow base image supplies the remaining closure.
+trino==0.327.0 --hash=sha256:56d253a814bd5da545cc68e1bc8c28c0b80f07df6411aa0424197c025c78998e
+tzlocal==5.2 --hash=sha256:49816ef2fe65ea8ac19d19aa7a1ae0551c834303d5014c6d5a62e4cbda8047b8

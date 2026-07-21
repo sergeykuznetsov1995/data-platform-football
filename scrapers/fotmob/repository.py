@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -27,6 +28,8 @@ import pandas as pd
 
 from scrapers.base.iceberg_writer import IcebergWriter
 
+
+logger = logging.getLogger(__name__)
 
 PARSER_VERSION = "fotmob-native-v1"
 MANIFEST_TABLE = "fotmob_ingest_manifest"
@@ -123,6 +126,48 @@ def _scalar(value: Any) -> Any:
     if isinstance(value, datetime) and value.tzinfo is not None:
         return value.astimezone(timezone.utc).replace(tzinfo=None)
     return value
+
+
+# Field-inventory rows carry no target identity: every match of a season emits
+# the same ~600 (target_type, competition, season, json_path, disposition) rows.
+# Fifty buffered targets therefore staged ~30k rows of which ~600 were distinct,
+# and that single table accounted for most of the run's Trino statements (#930).
+DEDUP_KEYS: dict[str, tuple[str, ...]] = {
+    "fotmob_field_inventory": (
+        "target_type",
+        "competition_id",
+        "source_season_key",
+        "json_path",
+        "disposition",
+    ),
+}
+
+# Player inventory keys carry no scope columns, so one preload would pull the
+# whole ~3.8M-key population for rows the run-level dedup already collapses.
+INVENTORY_PRELOAD_SKIP: frozenset[str] = frozenset({"player"})
+
+
+def _dedup_key_value(value: Any) -> Optional[str]:
+    """Normalize a dedup key value to its canonical string spelling.
+
+    Live rows carry ints while the table column is VARCHAR holding both '53'
+    and '53.0' spellings (pandas floats int columns in frames that mix scoped
+    and scope-less rows); comparing un-normalized values would silently never
+    match across that boundary.
+    """
+
+    if value is None:
+        return None
+    text = str(value)
+    if text.endswith(".0") and text[:-2].isdigit():
+        text = text[:-2]
+    return text
+
+
+def _completed_at_key(view: Mapping[str, Any]) -> str:
+    """Order manifest views by completion time without assuming a dtype."""
+
+    return str(view.get("completed_at") or "")
 
 
 def normalize_rows(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
@@ -398,16 +443,61 @@ REPLACE_TARGET_MANIFEST_IDENTITIES: dict[str, tuple[str, ...]] = {
 class FotMobRepository:
     """Append-only physical writes plus manifest-backed logical commits."""
 
+    # Manifest columns the incremental planner reads back. Buffered commits
+    # must answer those reads from memory, otherwise batching would hide a
+    # target that this very run already committed.
+    _READ_COLUMNS = (
+        "target_key",
+        "batch_id",
+        "content_hash",
+        "raw_uri",
+        "parser_version",
+        "status",
+        "fetched_at",
+        "completed_at",
+        "actual_counts_json",
+        "capabilities_json",
+    )
+
     def __init__(
         self,
         *,
         writer: Optional[RepositoryWriter] = None,
         catalog: str = "iceberg",
         schema: str = "bronze",
+        batch_size: int = 1,
+        max_buffered_rows: int = 20_000,
     ) -> None:
         self.writer = writer or IcebergWriter(catalog=catalog)
         self.catalog = catalog
         self.schema = schema
+        # One Iceberg commit per target makes the manifest table grow one
+        # single-row data file per target; commit cost then scales with the
+        # file count (production: 4.3k files -> 9.5 s per one-row insert).
+        # Buffering N targets into one commit per table keeps that cost flat.
+        self.batch_size = max(1, int(batch_size))
+        self.max_buffered_rows = max(1, int(max_buffered_rows))
+        self._pending: dict[
+            tuple[str, str, Optional[tuple[str, ...]]], list[dict[str, Any]]
+        ] = {}
+        self._pending_manifest: list[dict[str, Any]] = []
+        # Dedup keys deliberately outlive flush(): inventory rows carry no
+        # target identity, so a key seen once needs no second row this run —
+        # matches of one season share almost every json_path, and re-emitting
+        # them each flush wrote ~2.4M rows per iteration where ~200k were new.
+        self._seen_keys: dict[str, set[tuple[Any, ...]]] = {}
+        self._seeded_scopes: set[tuple[Any, ...]] = set()
+        self._pending_targets: dict[str, dict[str, Any]] = {}
+        self._pending_entities: dict[tuple[str, str], dict[str, Any]] = {}
+        self._pending_rows = 0
+        # Incremental planning asks "did we already ingest this target?" once
+        # per target. As a Trino round-trip that was the single most expensive
+        # thing the backfill did (678 of ~1900 queries per 40 min, ~7 queries
+        # and ~13 s per target). Preloading the answer once makes those reads
+        # free; commits keep the index current so read-your-writes still holds.
+        self._manifest_index: dict[str, dict[str, Any]] = {}
+        self._entity_index: dict[tuple[str, str], dict[str, Any]] = {}
+        self._preloaded = False
 
     def _write(
         self,
@@ -491,38 +581,262 @@ class FotMobRepository:
             values["actual_counts"] = derived_counts
             commit = TargetCommit(**values)
 
-        table_paths: list[str] = []
+        prepared: list[
+            tuple[str, str, Optional[tuple[str, ...]], list[dict[str, Any]]]
+        ] = []
         for dataset in datasets:
             rows = normalize_rows(dataset.rows)
+            if not rows:
+                continue
             for row in rows:
                 row.setdefault("_target_batch_id", commit.batch_id)
                 row.setdefault("_payload_sha256", commit.content_hash)
                 row.setdefault("_parser_version", commit.parser_version)
                 row.setdefault("_raw_uri", commit.raw_uri)
                 row.setdefault("_observed_at", commit.fetched_at or utc_now())
+            prepared.append(
+                (
+                    dataset.table,
+                    dataset.entity_type,
+                    tuple(dataset.partition_cols) if dataset.partition_cols else None,
+                    rows,
+                )
+            )
+        manifest_row = commit.manifest_row()
+
+        if self.batch_size <= 1:
+            table_paths: list[str] = []
+            for table, entity_type, partition_cols, rows in prepared:
+                path = self._write(
+                    table,
+                    rows,
+                    entity_type=entity_type,
+                    partition_cols=partition_cols,
+                )
+                if path:
+                    table_paths.append(path)
+            manifest_path = self._write(
+                MANIFEST_TABLE, [manifest_row], entity_type="ingest_manifest"
+            )
+            if manifest_path:
+                table_paths.append(manifest_path)
+            self._index_committed(manifest_row)
+            return table_paths
+
+        for table, entity_type, partition_cols, rows in prepared:
+            rows = self._deduplicate(table, rows)
+            if not rows:
+                continue
+            self._pending.setdefault((table, entity_type, partition_cols), []).extend(
+                rows
+            )
+            self._pending_rows += len(rows)
+        self._pending_manifest.append(manifest_row)
+        self._index_pending(manifest_row)
+        if (
+            len(self._pending_manifest) >= self.batch_size
+            or self._pending_rows >= self.max_buffered_rows
+        ):
+            return self.flush()
+        return []
+
+    def _deduplicate(
+        self, table: str, rows: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Drop rows this run already emitted under the same logical key.
+
+        Only tables whose rows carry no target identity are deduplicated (see
+        ``DEDUP_KEYS``); the surviving row keeps a batch id that this run has
+        already committed (or commits in the same flush), so manifest gating
+        is unaffected.  The seen-set survives flush() on purpose: a failed
+        flush keeps both the buffer and the keys, so a retry re-appends the
+        very same rows.  Note that manifest ``actual_counts`` for these tables
+        mean "observed by the parser", not "physically written" — counts are
+        derived before deduplication.
+        """
+
+        key_columns = DEDUP_KEYS.get(table)
+        if not key_columns:
+            return rows
+        seen = self._seen_keys.setdefault(table, set())
+        output: list[dict[str, Any]] = []
+        for row in rows:
+            key = tuple(_dedup_key_value(row.get(column)) for column in key_columns)
+            self._seed_scope_keys(table, key_columns, key)
+            if key in seen:
+                continue
+            seen.add(key)
+            output.append(row)
+        return output
+
+    def _seed_scope_keys(
+        self,
+        table: str,
+        key_columns: tuple[str, ...],
+        key: tuple[Optional[str], ...],
+    ) -> None:
+        """Lazily fold a scope's already-written dedup keys into the seen-set.
+
+        Iterations resume mid-scope, so the json paths a season's matches
+        share were usually written by an earlier run already — re-learning
+        them re-writes ~150k inventory rows per scope.  One ``SELECT
+        DISTINCT`` per (target_type, competition, season) replaces that.  Any
+        failure degrades to run-local dedup and never blocks the write path.
+        """
+
+        scope = (table,) + key[:3]
+        if key[0] in INVENTORY_PRELOAD_SKIP or scope in self._seeded_scopes:
+            return
+        # Mark first: a failing query must not retry once per row.
+        self._seeded_scopes.add(scope)
+        manager_getter = getattr(self.writer, "_get_trino_manager", None)
+        if manager_getter is None:
+            return
+        try:
+            trino = manager_getter()
+            if not trino.table_exists(self.schema, table):
+                return
+            conditions = []
+            for column, value in zip(key_columns[:3], key[:3]):
+                if value is None:
+                    conditions.append(f"{column} IS NULL")
+                    continue
+                safe = value.replace("'", "''")
+                variants = {safe}
+                if safe.isdigit():
+                    variants.add(f"{safe}.0")  # historical pandas spelling
+                in_list = ", ".join(f"'{v}'" for v in sorted(variants))
+                conditions.append(f"{column} IN ({in_list})")
+            tail_columns = ", ".join(key_columns[3:])
+            rows = trino.execute_query(
+                f"""
+                SELECT DISTINCT {tail_columns}
+                FROM {self.catalog}.{self.schema}.{table}
+                WHERE {" AND ".join(conditions)}
+                """
+            )
+        except Exception as exc:
+            logger.warning("Inventory key preload failed for %s: %s", scope, exc)
+            return
+        seen = self._seen_keys.setdefault(table, set())
+        for row in rows:
+            seen.add(key[:3] + tuple(_dedup_key_value(value) for value in row))
+
+    def _index_pending(self, manifest_row: Mapping[str, Any]) -> None:
+        """Make a buffered commit visible to this run's incremental reads."""
+
+        if manifest_row.get("status") not in SUCCESS_STATES:
+            return
+        view = {column: manifest_row.get(column) for column in self._READ_COLUMNS}
+        self._pending_targets[str(manifest_row.get("target_key"))] = view
+        entity_id = manifest_row.get("entity_id")
+        if entity_id is not None:
+            key = (str(manifest_row.get("target_type")), str(entity_id))
+            self._pending_entities[key] = view
+
+    def _index_committed(self, manifest_row: Mapping[str, Any]) -> None:
+        """Fold a durable commit into the preloaded index."""
+
+        if not self._preloaded or manifest_row.get("status") not in SUCCESS_STATES:
+            return
+        view = {column: manifest_row.get(column) for column in self._READ_COLUMNS}
+        self._manifest_index[str(manifest_row.get("target_key"))] = view
+        entity_id = manifest_row.get("entity_id")
+        if entity_id is not None:
+            key = (str(manifest_row.get("target_type")), str(entity_id))
+            self._entity_index[key] = view
+
+    def preload_manifest_index(self) -> int:
+        """Load every committed target once so per-target reads never query.
+
+        The index is authoritative afterwards: a key that is absent was never
+        committed, so a miss answers ``None`` without a Trino round-trip.
+        Commits update it, which keeps replay/dedup decisions correct.
+        """
+
+        manager_getter = getattr(self.writer, "_get_trino_manager", None)
+        if manager_getter is None:
+            return 0
+        trino = manager_getter()
+        if not trino.table_exists(self.schema, MANIFEST_TABLE):
+            self._preloaded = True
+            return 0
+        columns = ", ".join(self._READ_COLUMNS)
+        rows = trino.execute_query(
+            f"""
+            SELECT {columns}, target_type, entity_id
+            FROM (
+                SELECT {columns}, target_type, entity_id,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY target_key ORDER BY completed_at DESC
+                       ) AS rn
+                FROM {self.catalog}.{self.schema}.{MANIFEST_TABLE}
+                WHERE status IN ('success', 'not_modified')
+            )
+            WHERE rn = 1
+            """
+        )
+        width = len(self._READ_COLUMNS)
+        for row in rows:
+            view = dict(zip(self._READ_COLUMNS, row[:width]))
+            target_type, entity_id = row[width], row[width + 1]
+            self._manifest_index[str(view["target_key"])] = view
+            if entity_id is not None:
+                key = (str(target_type), str(entity_id))
+                previous = self._entity_index.get(key)
+                # A rotating Next.js build id gives one entity several target
+                # keys; freshness is keyed by identity, so keep the newest.
+                if previous is None or _completed_at_key(view) >= _completed_at_key(
+                    previous
+                ):
+                    self._entity_index[key] = view
+        self._preloaded = True
+        return len(self._manifest_index)
+
+    def flush(self) -> list[str]:
+        """Write every buffered target as one Iceberg commit per table.
+
+        Physical rows go first and the manifest last, exactly as in the
+        unbuffered path: a crash between the two can only lose visibility of
+        rows (``*_current`` views are manifest-gated), never claim rows that
+        were never written.  The buffer is cleared only after the manifest
+        lands, so a failed flush stays retryable; a retry re-appends rows under
+        the same deterministic ``_target_batch_id``, which the views collapse.
+        """
+
+        if not self._pending and not self._pending_manifest:
+            return []
+        paths: list[str] = []
+        for (table, entity_type, partition_cols), rows in self._pending.items():
             path = self._write(
-                dataset.table,
+                table,
                 rows,
-                entity_type=dataset.entity_type,
-                partition_cols=(dataset.partition_cols or None),
+                entity_type=entity_type,
+                partition_cols=partition_cols,
             )
             if path:
-                table_paths.append(path)
-
+                paths.append(path)
         manifest_path = self._write(
-            MANIFEST_TABLE,
-            [commit.manifest_row()],
-            entity_type="ingest_manifest",
+            MANIFEST_TABLE, self._pending_manifest, entity_type="ingest_manifest"
         )
         if manifest_path:
-            table_paths.append(manifest_path)
-        return table_paths
+            paths.append(manifest_path)
+        # Fold the flushed commits into the durable index: clearing the pending
+        # buffer must not make a target this run already ingested look absent.
+        for manifest_row in self._pending_manifest:
+            self._index_committed(manifest_row)
+        self._pending = {}
+        self._pending_manifest = []
+        self._pending_targets = {}
+        self._pending_entities = {}
+        self._pending_rows = 0
+        return paths
 
     def record(self, commit: TargetCommit) -> str:
         """Append a target state that carries no physical rows."""
 
         paths = self.commit(commit)
-        return paths[-1]
+        return paths[-1] if paths else ""
 
     def ensure_schema(self) -> None:
         """Create the stable manifest and current logical views.
@@ -678,6 +992,11 @@ class FotMobRepository:
     def latest_success(self, target_key: str) -> Optional[dict[str, Any]]:
         """Return the newest successful manifest for incremental planning."""
 
+        buffered = self._pending_targets.get(str(target_key))
+        if buffered is not None:
+            return buffered
+        if self._preloaded:
+            return self._manifest_index.get(str(target_key))
         manager_getter = getattr(self.writer, "_get_trino_manager", None)
         if manager_getter is None:
             return None
@@ -721,6 +1040,12 @@ class FotMobRepository:
         freshness by ``(target_type, entity_id)`` rather than URL hash.
         """
 
+        key = (str(target_type), str(entity_id))
+        buffered = self._pending_entities.get(key)
+        if buffered is not None:
+            return buffered
+        if self._preloaded:
+            return self._entity_index.get(key)
         manager_getter = getattr(self.writer, "_get_trino_manager", None)
         if manager_getter is None:
             return None
@@ -932,16 +1257,36 @@ class FotMobRepository:
                 continue
         return output
 
+    def _buffered_squad_player_ids(self, team_id: str | int) -> set[int]:
+        """Player IDs of a squad this run committed but has not flushed yet."""
+
+        wanted = str(team_id)
+        output: set[int] = set()
+        for (table, _, _), rows in self._pending.items():
+            if table != "fotmob_squad_snapshots":
+                continue
+            for row in rows:
+                if str(row.get("team_id")) != wanted:
+                    continue
+                if row.get("member_type") != "player":
+                    continue
+                try:
+                    output.add(int(row.get("member_id")))
+                except (TypeError, ValueError):
+                    continue
+        return output
+
     def current_squad_player_ids(self, team_id: str | int) -> set[int]:
         """Load player IDs from the latest committed snapshot of one team."""
 
+        buffered = self._buffered_squad_player_ids(team_id)
         manager_getter = getattr(self.writer, "_get_trino_manager", None)
         if manager_getter is None:
-            return set()
+            return buffered
         trino = manager_getter()
         table = "fotmob_squad_snapshots_current"
         if not trino.table_exists(self.schema, table):
-            return set()
+            return buffered
         safe_id = str(team_id).replace("'", "''")
         rows = trino.execute_query(
             f"""
@@ -952,7 +1297,7 @@ class FotMobRepository:
               AND member_id IS NOT NULL
             """
         )
-        output: set[int] = set()
+        output: set[int] = set(buffered)
         for row in rows:
             member_id = row[0] if isinstance(row, (tuple, list)) else row
             try:
@@ -1065,6 +1410,9 @@ class MemoryFotMobRepository:
         return None
 
     def ensure_current_views(self) -> list[str]:
+        return []
+
+    def flush(self) -> list[str]:
         return []
 
     def commit(

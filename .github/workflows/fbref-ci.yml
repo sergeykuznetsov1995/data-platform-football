@@ -3,12 +3,18 @@ name: FBref production CI
 on:
   pull_request:
     paths:
+      - ".env.example"
       - ".github/workflows/fbref-ci.yml"
+      - "compose.yaml"
       - "configs/fbref/**"
       - "dags/**/*fbref*"
       - "dags/dag_iceberg_maintenance_daily.py"
       - "dags/utils/maintenance_tasks.py"
+      - "deploy/fbref/**"
+      - "docker/images/airflow/Dockerfile"
+      - "docker/images/airflow/Dockerfile.fbref-acceptance"
       - "docker/images/airflow/requirements*.txt"
+      - "docs/operations/fbref-paid-transport.md"
       - "docs/operations/sql/fbref_production_acceptance.sql"
       - "docs/operations/sql/fbref_control_dataset_acceptance.sql"
       - "scrapers/fbref/**"
@@ -58,16 +64,19 @@ jobs:
             scrapers/fbref \
             scrapers/utils/proxy_manager.py \
             dags/scripts/*fbref*.py \
-            dags/utils/fbref_current_dag_factory.py \
-            dags/utils/fbref_pipeline_tasks.py \
+            dags/utils/*fbref*.py \
             dags/utils/maintenance_tasks.py \
             dags/dag_*fbref.py \
             dags/dag_iceberg_maintenance_daily.py \
             scripts/proxy_filter/filter_proxy.py \
-            scripts/audit_fbref_production.py
+            scripts/*fbref*.py
           python -m compileall -q \
             scrapers/fbref scrapers/utils/proxy_manager.py \
-            dags/scripts dags/utils scripts/audit_fbref_production.py
+            dags/scripts dags/utils scripts/*fbref*.py
+          bash -n \
+            scripts/build_fbref_acceptance_image.sh \
+            scripts/fbref_acceptance_entrypoint.sh \
+            scripts/claim_fbref_acceptance_attempt.sh
           git diff --check "$BASE_SHA"...HEAD
       - name: Complete offline FBref suite
         env:
@@ -124,6 +133,14 @@ jobs:
               ),
               "dag_backfill_fbref": (root / "dags/dag_backfill_fbref.py", 16),
               "dag_replay_fbref": (root / "dags/dag_replay_fbref.py", 17),
+              "dag_accept_fbref_bronze": (
+                  root / "dags/dag_accept_fbref_bronze.py",
+                  9,
+              ),
+              "dag_replay_fbref_bronze": (
+                  root / "dags/dag_replay_fbref_bronze.py",
+                  8,
+              ),
           }
           errors = {}
           counts = {}

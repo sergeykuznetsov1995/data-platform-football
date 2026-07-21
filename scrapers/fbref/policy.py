@@ -33,3 +33,12 @@ OTHER_PUBLICATION_CRITICAL_PAGE_KINDS = (
     "season_stats",
     "standings",
 )
+
+# Parser/document version stamps, centralized in this import-light module so the
+# control plane (control/store.py) can read them without pulling the heavy parser
+# stack (pandas/pyarrow/bs4 via page_document/typed_bronze/discovery) into its
+# import closure.  page_document / typed_bronze / discovery re-export these names;
+# see those modules for the per-version rationale.
+PAGE_DOCUMENT_VERSION = "fbref-page-document-v4"
+TYPED_BRONZE_PARSER_VERSION = "fbref-typed-bronze-v4"
+DISCOVERY_PARSER_VERSION = "fbref-discovery-parser-v6"

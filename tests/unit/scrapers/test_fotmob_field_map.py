@@ -42,6 +42,61 @@ def test_intentional_exclusions_are_exported_with_reasons():
     assert any(item["path"] == "fixtures.*" for item in INTENTIONAL_EXCLUSIONS)
 
 
+def test_production_page_chrome_paths_are_classified_not_drift():
+    # Observed live during the #930 canary backfill (2026-07-12): page chrome
+    # around the data payloads must classify as raw_only, not schema drift.
+    cases = {
+        "leaderboard": ["LeagueName"],
+        "transfers": [
+            # Appeared live 2026-07-17 (acceptance run in the isolated
+            # contour): top-level fee-filter bound of the page's slider.
+            "maxFee",
+        ],
+        "match": [
+            "seo.eventJSONLD.homeTeam.name",
+            "seo.breadcrumbJSONLD[].itemListElement[].item",
+            "nav[]",
+            "hasPendingVAR",
+            "ongoing",
+            "content.liveticker.teams[]",
+            "content.superlive.showSuperLive",
+            "content.table",
+            "content.hasPlayoff",
+            "content.attackingZones.expected",
+            "content.heatmapUrl",
+            "content.weather.condition",
+            # Appeared mid-canary on 2026-07-13 (44 matches): FotMob started
+            # shipping a video-highlights widget inside the match payload.
+            "content.highlightStories",
+            "content.highlightStories.stories[].provider",
+            "content.highlightStories.stories[].content[].restriction.blocked[]",
+        ],
+        "team": [
+            "QAData[].question",
+            "allAvailableSeasons[]",
+            "seostr",
+            "stats.players[].fetchAllUrl",
+            "stats.tournamentSeasons[].season",
+            "table[].data.annualTable",
+            "tabs[]",
+            "transfers.type",
+        ],
+        "player": [
+            "context.properties.locale",
+            "toggles[].variant.enabled",
+            "translations.Advanced",
+            "url",
+        ],
+    }
+    for target_type, paths in cases.items():
+        coverage = classify_paths(target_type, paths)
+        assert not coverage.unknown, (target_type, coverage.unknown)
+        assert set(paths) == set(coverage.raw_only), (
+            target_type,
+            coverage,
+        )
+
+
 def test_entity_map_is_serializable_and_has_all_dispositions():
     mapping = entity_map()
     assert {"all_leagues", "league_season", "leaderboard", "transfers", "match", "team", "player"} <= set(mapping)

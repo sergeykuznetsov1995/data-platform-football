@@ -183,7 +183,7 @@ with DAG(
         # {{ }} as {{{{ }}}} so the literal Jinja tag survives into the command.
         bash_command=f"""
 cd /opt/airflow && \\
-python dags/scripts/run_espn_scraper.py \\
+/opt/legacy-scraper-venv/bin/python dags/scripts/run_espn_scraper.py \\
     --leagues "{leagues_str}" \\
     --season {{{{ params.season }}}} \\
     --output /tmp/espn_result.json

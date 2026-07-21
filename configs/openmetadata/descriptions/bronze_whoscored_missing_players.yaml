@@ -4,7 +4,7 @@
 table:
   fullyQualifiedName: trino_iceberg.iceberg.bronze.whoscored_missing_players
   description: |
-    Append-only предматчевые сводки parser v7: один row на (game, team, player)
+    Append-only предматчевые сводки parser v8: один row на (game, team, player)
     для травм, дисквалификаций и вызовов в сборную. Raw HTML фиксируется до
     разбора, а downstream читает whoscored_missing_players_current — batch из
     последнего успешного preview manifest. Успешный zero-row commit скрывает

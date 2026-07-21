@@ -1796,3 +1796,22 @@ class TestCalendarLeagueSeason:
         # Both projections know every coach the source named — the parity gate
         # compares them key for key.
         assert set(bundle['legacy_coaches']['coach_id']) == set(profiles.index)
+
+
+class TestWithMetadataDatetimeUnit:
+    def test_ingested_at_is_stamped_in_nanoseconds(self):
+        """A scalar datetime assignment gets a microsecond unit on pandas>=2.1
+        while bronze reads infer nanoseconds; concatenating the two units
+        crashed the cache merge of a partially reused scope (#982), so the
+        unit is pinned at the source."""
+        from scrapers.transfermarkt.scraper import (
+            COACH_PROFILE_COLUMNS, _with_metadata,
+        )
+
+        frame = _with_metadata(
+            [{'coach_id': '1', 'coach_slug': 'one', 'name': 'One'}],
+            COACH_PROFILE_COLUMNS,
+            entity_type='coach_profiles', batch_id='batch-982',
+        )
+
+        assert str(frame['_ingested_at'].dtype) == 'datetime64[ns]'

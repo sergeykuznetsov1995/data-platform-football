@@ -37,7 +37,7 @@
       "camoufox": "0.4.11",
       "playwright": "1.59.0"
     },
-    "digest": "9924da2012313b8f8e89016025dee7f70dea5607ac177e85b56bba1b5765b001",
+    "digest": "8220b5b8db2986cb2335a9248e1172fc11257e7343d0b5079710b7fba86d84d4",
     "files": [
       "configs/medallion/competitions.yaml",
       "configs/proxy_filter/blocklist.txt",
@@ -50,6 +50,9 @@
       "dags/utils/sofascore_dq.py",
       "docker/images/airflow/Dockerfile",
       "docker/images/airflow/requirements-airflow.txt",
+      "docker/images/airflow/requirements-build-tools.txt",
+      "docker/images/airflow/requirements-scheduler.txt",
+      "docker/images/airflow/requirements-scraper-runner.txt",
       "docker/images/airflow/requirements-scraping.txt",
       "docker/images/airflow/requirements.txt",
       "scrapers/sofascore/__init__.py",

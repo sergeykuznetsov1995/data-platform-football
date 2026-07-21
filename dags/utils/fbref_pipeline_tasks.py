@@ -35,6 +35,8 @@ from scrapers.fbref.settings import (
 
 logger = logging.getLogger(__name__)
 
+LEGACY_SCRAPER_PYTHON_ENV = "LEGACY_SCRAPER_PYTHON"
+DEFAULT_LEGACY_SCRAPER_PYTHON = "/opt/legacy-scraper-venv/bin/python"
 LIVE_WAVES_RUNNER = "/opt/airflow/dags/scripts/run_fbref_live_waves.py"
 LIVE_WAVES_RESULT_PREFIX = "FBREF_LIVE_WAVES_RESULT:"
 LIVE_WAVES_TIMEOUT_SECONDS = 110 * 60
@@ -120,6 +122,29 @@ FBREF_LIVE_BUDGET_PROFILES = {
     ),
     (FBREF_CANARY_REQUEST_LIMIT, FBREF_CANARY_BYTE_LIMIT_MB): "canary",
 }
+
+
+def _legacy_scraper_python() -> str:
+    """Return the explicit isolated browser runner or fail before claiming work."""
+
+    raw = os.environ.get(
+        LEGACY_SCRAPER_PYTHON_ENV,
+        DEFAULT_LEGACY_SCRAPER_PYTHON,
+    )
+    path = Path(str(raw))
+    if not path.is_absolute():
+        raise RuntimeError(f"{LEGACY_SCRAPER_PYTHON_ENV} must be an absolute path")
+    try:
+        metadata = path.stat()
+    except OSError as exc:
+        raise RuntimeError("isolated FBref browser interpreter is unavailable") from exc
+    if not path.is_file() or not os.access(path, os.X_OK):
+        raise RuntimeError("isolated FBref browser interpreter is not executable")
+    if metadata.st_size <= 0:
+        raise RuntimeError("isolated FBref browser interpreter is empty")
+    # A venv's bin/python is normally a symlink. Resolving it would bypass the
+    # venv and execute the system interpreter, so preserve the configured path.
+    return str(path)
 
 # Current-scope source SLAs.  ControlStore.get_run_summary owns the target
 # selection and reports the measured state; this Airflow layer owns the policy
@@ -1321,7 +1346,10 @@ def initialize_fbref_run(
 
 
 def acquire_fbref_publication_lock(
-    *, airflow_run_id: str, dag_id: str
+    *,
+    airflow_run_id: str,
+    dag_id: str,
+    ttl_seconds=FBREF_PUBLICATION_LOCK_TTL_SECONDS,
 ) -> dict:
     """Fence every FBref Bronze/Silver writer until publication is terminal."""
 
@@ -1331,7 +1359,7 @@ def acquire_fbref_publication_lock(
     result = _control_store().acquire_publication_lock(
         run_id,
         dag_id=dag_id,
-        ttl_seconds=FBREF_PUBLICATION_LOCK_TTL_SECONDS,
+        ttl_seconds=int(ttl_seconds),
     )
     logger.info(
         "FBref publication lock acquired: owner=%s idempotent=%s",
@@ -1741,7 +1769,7 @@ def run_fbref_live_waves(
             f"max_batches must be between 1 and {FBREF_MAX_LIVE_BATCHES}"
         )
     command = [
-        sys.executable,
+        _legacy_scraper_python(),
         LIVE_WAVES_RUNNER,
         "--control-run-id",
         _control_run_id(airflow_run_id=airflow_run_id, dag_id=dag_id),
@@ -1938,6 +1966,7 @@ def parse_fbref_wave(
     byte_limit_mb=DEFAULT_BYTE_LIMIT // MIB,
     shard_size=DEFAULT_SHARD_SIZE,
     reservation_mb=DEFAULT_REQUEST_RESERVATION_BYTES // MIB,
+    acceptance_replay=False,
 ) -> dict:
     settings = _settings(
         run_type=run_type,
@@ -1954,11 +1983,15 @@ def parse_fbref_wave(
     )
     if settings.run_type == "replay" and normalized_source_run_id is None:
         raise ValueError("Replay requires source_control_run_id")
+    normalized_acceptance_replay = _boolean_parameter(
+        acceptance_replay, name="acceptance_replay"
+    )
     result = _pipeline().parse_wave(
         _control_run_id(airflow_run_id=airflow_run_id, dag_id=dag_id),
         page_kinds=list(page_kinds),
         settings=settings,
         source_run_id=normalized_source_run_id,
+        acceptance_replay=normalized_acceptance_replay,
     ).as_dict()
     logger.info("FBref offline parse wave: %s", json.dumps(result, sort_keys=True))
     return result

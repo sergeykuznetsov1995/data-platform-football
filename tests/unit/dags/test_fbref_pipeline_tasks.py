@@ -13,6 +13,14 @@ import pytest
 from dags.utils import fbref_pipeline_tasks
 
 
+@pytest.fixture(autouse=True)
+def _select_test_browser_interpreter(monkeypatch):
+    monkeypatch.setenv(
+        fbref_pipeline_tasks.LEGACY_SCRAPER_PYTHON_ENV,
+        sys.executable,
+    )
+
+
 def _freshness_summary(*, stale_kind: str | None = None) -> dict:
     by_kind = {}
     for kind in fbref_pipeline_tasks.FBREF_REQUIRED_CURRENT_PAGE_KINDS:
@@ -1714,7 +1722,11 @@ def test_live_waves_use_one_process_group_for_all_batches(monkeypatch):
     assert result == {"batches": 3, "frontier_closed": True}
     assert captured["kwargs"]["start_new_session"] is True
     command = captured["command"]
+    assert command[0] == sys.executable
     assert command[1] == fbref_pipeline_tasks.LIVE_WAVES_RUNNER
+    assert "--page-kinds" in command
+    assert command[command.index("--page-kinds") + 1] == "competition,season"
+    assert command[command.index("--request-limit") + 1] == "200"
     assert command[command.index("--parent-pid") + 1] == str(
         fbref_pipeline_tasks.os.getpid()
     )

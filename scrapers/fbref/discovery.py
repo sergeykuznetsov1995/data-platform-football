@@ -26,7 +26,7 @@ from scrapers.fbref.raw_store import (
 )
 
 
-DISCOVERY_PARSER_VERSION = "fbref-discovery-parser-v6"
+from scrapers.fbref.policy import DISCOVERY_PARSER_VERSION  # canonical definition
 
 _PAGE_SOURCE_ID_KEYS = {
     "competition": ("competition_id",),
@@ -70,12 +70,20 @@ _SEASON_STAT_ROUTES = {
     "misc",
     "keepers",
 }
+# FBref serves per-player *standard* season stats under the on-page URL segment
+# ``stats`` (e.g. /en/comps/9/stats/Premier-League-Stats), while its display
+# label is "standard".  Map the segment to the canonical stat_route so the page
+# is minted as season_stats/standard instead of being mistaken for an opaque
+# season id — which quarantined it and left player standard stats uncollected
+# (see #949).
+_STAT_ROUTE_URL_SEGMENTS = {"stats": "standard"}
 _COMPETITION_ID_RE = re.compile(r"^\d+$")
 # Route segments FBref places directly under a competition; a segment in this
 # position is therefore a sub-page, never a season id.
 _COMP_SUBPAGE_ROUTES = (
     {"history", "schedule", "standings"}
     | _SEASON_STAT_ROUTES
+    | set(_STAT_ROUTE_URL_SEGMENTS)
     | set(UNAVAILABLE_SEASON_STAT_ROUTES)
 )
 
@@ -1396,6 +1404,12 @@ def discover_page_links(
                         sub_route = route[2]
                     source_ids["season_id"] = season_id
                     sub_route = (sub_route or "").casefold()
+                    # FBref's on-page segment for standard stats is ``stats``;
+                    # normalise it to the canonical stat_route label so the
+                    # page mints as season_stats/standard.
+                    stat_route = _STAT_ROUTE_URL_SEGMENTS.get(
+                        sub_route, sub_route
+                    )
                     if sub_route == "schedule":
                         page_kind = "schedule"
                     elif sub_route == "standings":
@@ -1407,13 +1421,13 @@ def discover_page_links(
                         # avoids a paid request and, importantly, prevents the
                         # route from falling through as a season overview.
                         continue
-                    elif sub_route in _SEASON_STAT_ROUTES:
+                    elif stat_route in _SEASON_STAT_ROUTES:
                         # Stats subpages share a competition/season identity
                         # but are distinct canonical pages.  Keeping the route
                         # discriminator prevents them from colliding with the
                         # season overview in the durable frontier.
                         page_kind = "season_stats"
-                        source_ids["stat_route"] = sub_route
+                        source_ids["stat_route"] = stat_route
                     else:
                         page_kind = "season"
             if page_kind is None:

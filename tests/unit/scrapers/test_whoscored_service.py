@@ -18,7 +18,12 @@ from scrapers.whoscored.catalog import (
     WhoScoredCatalog,
 )
 from scrapers.whoscored.detailed_feeds import DETAILED_FEED_OPTIONS
-from scrapers.whoscored.parsers import CalendarMonth, DatasetStatus, ParsedDataset
+from scrapers.whoscored.parsers import (
+    CalendarMonth,
+    DatasetStatus,
+    ParsedDataset,
+    PlayerStageStatisticsPage,
+)
 from scrapers.whoscored.raw_store import (
     RawTarget,
     WhoScoredRawStore,
@@ -27,12 +32,19 @@ from scrapers.whoscored.raw_store import (
     profile_page_target,
     schedule_month_target,
 )
-from scrapers.whoscored.repository import MatchCandidate
+from scrapers.whoscored.repository import (
+    MatchCandidate,
+    catalog_payload_sha256,
+    deterministic_match_not_available_batch_id,
+    deterministic_preview_not_available_batch_id,
+    deterministic_profile_not_available_batch_id,
+)
 from scrapers.whoscored.service import (
     ACTIVE_SCHEDULE_CACHE_TTL,
     CATALOG_REQUEST_BURST_SIZE,
     DEFAULT_CATALOG_REQUESTS_PER_MINUTE,
     DEFAULT_STRUCTURED_REQUESTS_PER_MINUTE,
+    STRUCTURED_PARSE_BATCH_SIZE,
     STRUCTURED_REQUEST_BURST_SIZE,
     WhoScoredIngestService,
     _ParsedFetchSpec,
@@ -42,6 +54,7 @@ from scrapers.whoscored.service import (
 )
 from scrapers.whoscored.transport import (
     CachedPayload,
+    CloudflareChallenge,
     FailureKind,
     TransportBudgets,
     TransportResponse,
@@ -377,6 +390,19 @@ class _Repository:
 
     def record_failure(self, failure):
         self.failures.append(failure)
+        if failure.state != "not_available":
+            return None
+        return deterministic_match_not_available_batch_id(
+            failure.game_id,
+            league=failure.league,
+            season=failure.season,
+            failure_code=failure.failure_code,
+            http_status=failure.http_status,
+            payload_sha256=failure.payload_sha256,
+            raw_uri=failure.raw_uri,
+            parser_version=failure.parser_version,
+            availability_version=failure.availability_version,
+        )
 
     def list_profile_candidates(self, *, scopes, limit):
         self.profile_candidate_scope_requests.append(tuple(scopes))
@@ -388,6 +414,15 @@ class _Repository:
 
     def record_profile_failure(self, **failure):
         self.profile_failures.append(failure)
+        if failure["state"] != "not_available":
+            return None
+        return deterministic_profile_not_available_batch_id(
+            failure["player_id"],
+            failure_code=failure["failure_code"],
+            http_status=failure.get("http_status"),
+            payload_sha256=failure.get("payload_sha256"),
+            raw_uri=failure.get("raw_uri"),
+        )
 
     def list_preview_candidates(self, *args, **kwargs):
         return self.preview_candidates[: kwargs.get("limit")]
@@ -399,22 +434,48 @@ class _Repository:
 
     def record_preview_failure(self, failure):
         self.preview_failures.append(failure)
+        if failure.state != "not_available":
+            return None
+        return deterministic_preview_not_available_batch_id(
+            failure.game_id,
+            league=failure.league,
+            season=failure.season,
+            failure_code=failure.failure_code,
+            http_status=failure.http_status,
+            payload_sha256=failure.payload_sha256,
+            raw_uri=failure.raw_uri,
+            parser_version=failure.parser_version,
+            availability_version=failure.availability_version,
+        )
 
     def commit_scope_bundle(self, **snapshot):
         self.scope_snapshots.append(snapshot)
-        return "wss2-test"
+        return "wss2-" + "a" * 64
 
     def latest_source_season_id(self, *_args, **_kwargs):
         return None
 
 
 class _CatalogRepository:
-    def __init__(self, previous=None):
+    def __init__(self, previous=None, previous_generation=None):
         self.previous = previous
+        self.previous_generation = previous_generation
         self.persisted = []
+        self.load_options = []
 
-    def load_discovered_catalog(self):
-        return self.previous
+    def load_catalog_generation_snapshot(
+        self, *, allow_legacy_parser_for_full_history=False
+    ):
+        self.load_options.append(bool(allow_legacy_parser_for_full_history))
+        if self.previous is None:
+            raise LookupError("no catalog")
+        generation = self.previous_generation or {
+            "catalog_batch_id": "wsc2-parent",
+            "catalog_payload_sha256": catalog_payload_sha256(self.previous.to_rows()),
+            "catalog_raw_provenance_sha256": "b" * 64,
+            "catalog_as_of_date": "2026-07-15",
+        }
+        return generation, self.previous
 
     def persist_discovered_catalog(self, catalog, **metadata):
         self.persisted.append((catalog, metadata))
@@ -426,6 +487,67 @@ class _CatalogTransport:
 
     def close(self):
         return None
+
+
+def test_default_transports_receive_only_the_paid_gateway_endpoint(monkeypatch):
+    calls = []
+
+    class CapturingTransport(_CatalogTransport):
+        def __init__(self, **kwargs):
+            calls.append(kwargs)
+
+    monkeypatch.setattr(
+        "scrapers.whoscored.service.WhoScoredTransport", CapturingTransport
+    )
+    monkeypatch.setenv("WHOSCORED_PAID_GATEWAY_URL", "http://paid-gateway:8898")
+    monkeypatch.setenv("WHOSCORED_PAID_PROXY_URL", "http://raw-proxy:8900")
+    monkeypatch.setenv("WHOSCORED_PROXY_CONTROL_URL", "http://raw-control:8899")
+    catalog = _catalog()
+
+    WhoScoredIngestService(
+        catalog.resolve_scope("INT-World Cup", "2026"),
+        catalog=catalog,
+        repository=_Repository(),
+        raw_store=object(),
+    )
+    WhoScoredIngestService.discover_catalog(
+        as_of_date=date(2026, 7, 16),
+        repository=_CatalogRepository(),
+        raw_store=object(),
+    )
+
+    assert len(calls) == 2
+    for kwargs in calls:
+        assert kwargs["paid_gateway_url"] == "http://paid-gateway:8898"
+        assert "paid_proxy_url" not in kwargs
+        assert "proxy_control_url" not in kwargs
+
+
+def test_discover_catalog_requires_an_exact_date_before_runtime_setup():
+    with pytest.raises(ValueError, match="exact date"):
+        WhoScoredIngestService.discover_catalog(
+            as_of_date=datetime(2026, 7, 16),
+            repository=_CatalogRepository(),
+            transport=_CatalogTransport(),
+            raw_store=object(),
+        )
+
+
+def test_full_history_service_requests_the_narrow_legacy_catalog_migration_path():
+    repository = _CatalogRepository(previous=None)
+
+    # A source failure after bootstrap is sufficient here: the regression is
+    # that the explicit full-history boundary requested the legacy-safe read.
+    result = WhoScoredIngestService.discover_catalog(
+        as_of_date=date(2026, 7, 16),
+        repository=repository,
+        transport=_CatalogTransport(),
+        raw_store=object(),
+        full_history=True,
+    )
+
+    assert repository.load_options == [True]
+    assert result.errors
 
 
 def _discovery_competition_row(
@@ -733,16 +855,36 @@ def test_service_refuses_invalid_structured_rate_limit_before_network(
         _service(tmp_path)
 
 
+def test_schedule_refuses_invalid_write_chunk_before_source_resolution(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("WHOSCORED_SCOPE_WRITE_CHUNK_ROWS", "0")
+    service, _, _ = _service(tmp_path)
+    service._source_season_id = lambda: pytest.fail(
+        "source resolution must not run for invalid memory configuration"
+    )
+
+    result = service.sync_schedule()
+
+    assert result.succeeded == 0
+    assert len(result.errors) == 1
+    assert "WHOSCORED_SCOPE_WRITE_CHUNK_ROWS" in result.errors[0]
+
+
 def test_structured_rate_limit_is_wired_into_example_and_airflow_environment():
     root = Path(__file__).resolve().parents[3]
     env_example = (root / ".env.example").read_text(encoding="utf-8")
     compose = (root / "compose.yaml").read_text(encoding="utf-8")
 
     assert "WHOSCORED_STRUCTURED_REQUESTS_PER_MINUTE=60" in env_example
+    assert "WHOSCORED_SCOPE_WRITE_CHUNK_ROWS=20000" in env_example
     assert "WHOSCORED_CATALOG_REQUESTS_PER_MINUTE=60" in env_example
     assert (
         "WHOSCORED_STRUCTURED_REQUESTS_PER_MINUTE: "
         "${WHOSCORED_STRUCTURED_REQUESTS_PER_MINUTE:-60}"
+    ) in compose
+    assert (
+        "WHOSCORED_SCOPE_WRITE_CHUNK_ROWS: ${WHOSCORED_SCOPE_WRITE_CHUNK_ROWS:-20000}"
     ) in compose
     assert (
         "WHOSCORED_CATALOG_REQUESTS_PER_MINUTE: "
@@ -761,6 +903,7 @@ def test_discover_catalog_rejects_implausibly_small_initial_all_regions(
     )
 
     result = WhoScoredIngestService.discover_catalog(
+        as_of_date=date(2026, 7, 16),
         repository=repository,
         transport=_CatalogTransport(),
         raw_store=object(),
@@ -796,6 +939,7 @@ def test_discover_catalog_automatically_bootstraps_full_history_before_initial_p
     raw_store = WhoScoredRawStore(fs.LocalFileSystem(), str(tmp_path / "raw"))
 
     result = WhoScoredIngestService.discover_catalog(
+        as_of_date=date(2026, 7, 16),
         repository=repository,
         transport=_CatalogTransport(),
         raw_store=raw_store,
@@ -805,8 +949,18 @@ def test_discover_catalog_automatically_bootstraps_full_history_before_initial_p
     assert result.counts["full_history"] == 1
     assert len(repository.persisted) == 1
     metadata = repository.persisted[0][1]
-    assert len(metadata["raw_inputs"]) == 1
-    descriptor = metadata["raw_inputs"][0]
+    assert metadata["discovery_mode"] == "full_history"
+    assert len(metadata["raw_inputs"]) == 2
+    descriptor = next(
+        item
+        for item in metadata["raw_inputs"]
+        if item["target_id"].startswith("whoscored:catalog-provenance:")
+    )
+    audit_descriptor = next(
+        item
+        for item in metadata["raw_inputs"]
+        if item["target_id"].startswith("whoscored:catalog-technical-audit:")
+    )
     assert descriptor["input_count"] > 1
     target = RawTarget(
         source="whoscored",
@@ -822,6 +976,194 @@ def test_discover_catalog_automatically_bootstraps_full_history_before_initial_p
     assert len(json.loads(payload)) == descriptor["input_count"]
     assert record.content_hash == descriptor["payload_sha256"]
     assert metadata["raw_uri"] == raw_store.object_uri(record.blob_key)
+    audit_target = RawTarget(
+        source="whoscored",
+        page_kind="catalog_technical_audit",
+        target_id=audit_descriptor["target_id"],
+        canonical_url=(
+            "https://www.whoscored.com/catalog/technical-audit/"
+            f"{metadata['discovery_batch_id']}"
+        ),
+        source_ids={"discovery_batch_id": metadata["discovery_batch_id"]},
+    )
+    audit_payload, audit_record = raw_store.load_bytes(audit_target)
+    audit = json.loads(audit_payload)
+    assert audit["source_snapshot_sha256"] == audit_descriptor["source_snapshot_sha256"]
+    assert audit["candidate_count"] == 0
+    assert audit["unresolved_candidate_count"] == 0
+    assert audit_record.content_hash == audit_descriptor["payload_sha256"]
+    assert (
+        result.metadata["technical_exclusion_audit_uri"] == audit_descriptor["raw_uri"]
+    )
+
+
+def test_explicit_full_history_rebuilds_from_pre_lineage_v8_without_a_parent(
+    tmp_path, monkeypatch
+):
+    competition = _discovery_competition_row()
+    competition.update(
+        {
+            "source_sex": 1,
+            "eligibility": "included",
+            "classification_reason": "source_sex_male_no_youth_marker",
+        }
+    )
+    season = _discovery_season_row()
+    season.update(
+        {
+            "is_active": True,
+            "eligibility": "included",
+            "classification_reason": "parent:source_sex_male_no_youth_marker",
+        }
+    )
+    stage = _discovery_stage_row()
+    stage.update(
+        {
+            "eligibility": "included",
+            "classification_reason": "parent:source_sex_male_no_youth_marker",
+        }
+    )
+    previous = WhoScoredCatalog.from_rows(
+        {
+            "competitions": (competition,),
+            "seasons": (season,),
+            "stages": (stage,),
+        }
+    )
+    pre_lineage_generation = {
+        "catalog_batch_id": "wsc2-pre-lineage-v8",
+        "catalog_payload_sha256": catalog_payload_sha256(previous.to_rows()),
+        "catalog_raw_provenance_sha256": "",
+        "catalog_as_of_date": None,
+    }
+    schedule = {
+        "date": datetime(2026, 7, 11, 19),
+        "region_id": 247,
+        "tournament_id": 36,
+        "source_sex": 1,
+    }
+    _patch_catalog_discovery(
+        monkeypatch,
+        competition_rows=(competition,),
+        season_rows=(season,),
+        stage_rows=(stage,),
+        schedule_rows=(schedule,),
+        minimum=1,
+    )
+
+    full_repository = _CatalogRepository(
+        previous=previous, previous_generation=pre_lineage_generation
+    )
+    full = WhoScoredIngestService.discover_catalog(
+        as_of_date=date(2026, 7, 16),
+        repository=full_repository,
+        transport=_CatalogTransport(),
+        raw_store=object(),
+        full_history=True,
+    )
+
+    assert full.status == "success", full.as_dict()
+    full_metadata = full_repository.persisted[0][1]
+    assert full_metadata["discovery_mode"] == "full_history"
+    assert full_metadata["parent_catalog_batch_id"] is None
+    assert full_metadata["parent_catalog_payload_sha256"] is None
+    assert full_metadata["parent_catalog_raw_provenance_sha256"] is None
+
+    incremental_repository = _CatalogRepository(
+        previous=previous, previous_generation=pre_lineage_generation
+    )
+    incremental = WhoScoredIngestService.discover_catalog(
+        as_of_date=date(2026, 7, 16),
+        repository=incremental_repository,
+        transport=_CatalogTransport(),
+        raw_store=object(),
+    )
+    assert incremental.status == "failed"
+    assert any(
+        "parent generation is incomplete" in error for error in incremental.errors
+    )
+    assert incremental_repository.persisted == []
+
+
+def test_discovery_persists_unresolved_technical_audit_and_blocks_publication(
+    tmp_path, monkeypatch
+):
+    repository = _CatalogRepository()
+    competition = _discovery_competition_row()
+    season = _discovery_season_row()
+    stage = _discovery_stage_row()
+    schedule = {
+        "date": datetime.combine(date.today(), datetime.min.time()),
+        "region_id": 247,
+        "tournament_id": 36,
+        "source_sex": 1,
+    }
+    _patch_catalog_discovery(
+        monkeypatch,
+        competition_rows=(competition,),
+        season_rows=(season,),
+        stage_rows=(stage,),
+        schedule_rows=(schedule,),
+        minimum=1,
+    )
+
+    def unresolved_audit(_rows, *, source_snapshot_sha256):
+        return {
+            "schema_version": 1,
+            "audit_type": "whoscored_technical_exclusion_audit",
+            "source_snapshot_sha256": source_snapshot_sha256,
+            "classifier_version": "senior-men-v3",
+            "technical_override_registry": [],
+            "candidate_count": 1,
+            "unresolved_candidate_count": 1,
+            "candidates": [
+                {
+                    "candidate_type": "normalized_name_within_region",
+                    "candidate_key": "247:world cup",
+                    "source_tournament_ids": [36, 999],
+                    "competition_ids": ["INT-World Cup", "WS-247-999"],
+                    "technical_override_ids": [],
+                    "canonical_tournament_ids": [36, 999],
+                    "review_disposition": "requires_versioned_source_id_review",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(
+        "scrapers.whoscored.service.build_technical_exclusion_audit",
+        unresolved_audit,
+    )
+    raw_store = WhoScoredRawStore(fs.LocalFileSystem(), str(tmp_path / "raw"))
+
+    result = WhoScoredIngestService.discover_catalog(
+        as_of_date=date(2026, 7, 16),
+        repository=repository,
+        transport=_CatalogTransport(),
+        raw_store=raw_store,
+        full_history=True,
+    )
+
+    assert result.status == "failed"
+    assert repository.persisted == []
+    assert result.counts["unresolved_technical_duplicate_candidates"] == 1
+    assert any(
+        "unreviewed technical duplicate candidates" in error for error in result.errors
+    )
+    batch_id = result.metadata["catalog_batch_id"]
+    target = RawTarget(
+        source="whoscored",
+        page_kind="catalog_technical_audit",
+        target_id=f"whoscored:catalog-technical-audit:{batch_id}",
+        canonical_url=(f"https://www.whoscored.com/catalog/technical-audit/{batch_id}"),
+        source_ids={"discovery_batch_id": batch_id},
+    )
+    payload, record = raw_store.load_bytes(target)
+    assert json.loads(payload)["unresolved_candidate_count"] == 1
+    assert record.content_hash == result.metadata["technical_exclusion_audit_sha256"]
+    assert (
+        raw_store.object_uri(record.blob_key)
+        == result.metadata["technical_exclusion_audit_uri"]
+    )
 
 
 def test_discovery_batch_identity_includes_normalized_raw_provenance(
@@ -831,7 +1173,7 @@ def test_discovery_batch_identity_includes_normalized_raw_provenance(
     season = _discovery_season_row()
     stage = _discovery_stage_row()
     schedule = {
-        "date": datetime.combine(date.today(), datetime.min.time()),
+        "date": datetime(2026, 7, 11, 19),
         "region_id": 247,
         "tournament_id": 36,
         "source_sex": 1,
@@ -862,7 +1204,24 @@ def test_discovery_batch_identity_includes_normalized_raw_provenance(
     monkeypatch.setattr(WhoScoredIngestService, "_fetch", fake_fetch)
     first_repository = _CatalogRepository()
     first = WhoScoredIngestService.discover_catalog(
+        as_of_date=date(2026, 7, 16),
         repository=first_repository,
+        transport=_CatalogTransport(),
+        raw_store=object(),
+        full_history=True,
+    )
+    stable_repository = _CatalogRepository()
+    stable = WhoScoredIngestService.discover_catalog(
+        as_of_date=date(2026, 7, 16),
+        repository=stable_repository,
+        transport=_CatalogTransport(),
+        raw_store=object(),
+        full_history=True,
+    )
+    next_day_repository = _CatalogRepository()
+    next_day = WhoScoredIngestService.discover_catalog(
+        as_of_date=date(2026, 7, 17),
+        repository=next_day_repository,
         transport=_CatalogTransport(),
         raw_store=object(),
         full_history=True,
@@ -870,15 +1229,33 @@ def test_discovery_batch_identity_includes_normalized_raw_provenance(
     source_revision[0] = b"source-revision-two"
     second_repository = _CatalogRepository()
     second = WhoScoredIngestService.discover_catalog(
+        as_of_date=date(2026, 7, 16),
         repository=second_repository,
         transport=_CatalogTransport(),
         raw_store=object(),
         full_history=True,
     )
 
-    assert first.status == second.status == "success"
+    assert (
+        first.status == stable.status == next_day.status == second.status == "success"
+    )
     first_metadata = first_repository.persisted[0][1]
+    stable_metadata = stable_repository.persisted[0][1]
+    next_day_metadata = next_day_repository.persisted[0][1]
     second_metadata = second_repository.persisted[0][1]
+    assert first_metadata["discovery_batch_id"] == stable_metadata["discovery_batch_id"]
+    assert (
+        first_metadata["discovery_batch_id"] != next_day_metadata["discovery_batch_id"]
+    )
+    assert first_metadata["payload_sha256"] == next_day_metadata["payload_sha256"]
+    assert (
+        first_metadata["raw_provenance_sha256"]
+        != next_day_metadata["raw_provenance_sha256"]
+    )
+    assert next_day.metadata["catalog_as_of_date"] == "2026-07-17"
+    assert all(
+        item["as_of_date"] == "2026-07-17" for item in next_day_metadata["raw_inputs"]
+    )
     assert first_metadata["payload_sha256"] == second_metadata["payload_sha256"]
     assert first_metadata["discovery_batch_id"] != second_metadata["discovery_batch_id"]
     assert first_metadata["raw_inputs"] == sorted(
@@ -902,6 +1279,7 @@ def test_discover_catalog_rejects_loss_of_previously_published_tournament(
     )
 
     result = WhoScoredIngestService.discover_catalog(
+        as_of_date=date(2026, 7, 16),
         repository=repository,
         transport=_CatalogTransport(),
         raw_store=object(),
@@ -960,6 +1338,7 @@ def test_discover_catalog_rejects_loss_of_previously_published_season(
     )
 
     result = WhoScoredIngestService.discover_catalog(
+        as_of_date=date(2026, 7, 16),
         repository=repository,
         transport=_CatalogTransport(),
         raw_store=object(),
@@ -1020,6 +1399,7 @@ def test_full_history_discovery_rejects_loss_of_previously_published_stage(
     )
 
     result = WhoScoredIngestService.discover_catalog(
+        as_of_date=date(2026, 7, 16),
         repository=repository,
         transport=_CatalogTransport(),
         raw_store=object(),
@@ -1063,6 +1443,7 @@ def test_discover_catalog_quarantines_active_candidate_without_fixture_date(
     monkeypatch.setattr(WhoScoredCatalog, "from_rows", classmethod(capture_rows))
 
     result = WhoScoredIngestService.discover_catalog(
+        as_of_date=date(2026, 7, 16),
         repository=repository,
         transport=_CatalogTransport(),
         raw_store=object(),
@@ -1133,6 +1514,7 @@ def test_discover_catalog_marks_structurally_empty_calendars_source_unavailable(
     )
 
     result = WhoScoredIngestService.discover_catalog(
+        as_of_date=date(2026, 7, 16),
         repository=repository,
         transport=_CatalogTransport(),
         raw_store=object(),
@@ -1227,6 +1609,7 @@ def test_discover_catalog_falls_back_from_unavailable_future_season(
     monkeypatch.setattr(WhoScoredIngestService, "_fetch", fake_fetch)
 
     result = WhoScoredIngestService.discover_catalog(
+        as_of_date=date(2026, 7, 16),
         repository=repository,
         transport=_CatalogTransport(),
         raw_store=object(),
@@ -1244,6 +1627,63 @@ def test_discover_catalog_falls_back_from_unavailable_future_season(
     assert by_source[9001]["is_active"] is True
     assert by_source[100]["is_active"] is False
     assert visited_source_seasons[:2] == [9002, 9001]
+
+
+@pytest.mark.parametrize("blocked_page_kind", ["season_stages", "stage_calendar"])
+def test_discover_catalog_never_treats_cloudflare_403_as_source_unavailable(
+    blocked_page_kind, monkeypatch
+):
+    repository = _CatalogRepository()
+    _patch_catalog_discovery(
+        monkeypatch,
+        competition_rows=(_discovery_competition_row(),),
+        season_rows=(_discovery_season_row(),),
+        stage_rows=(_discovery_stage_row(),),
+        schedule_rows=(
+            {
+                "date": datetime(2026, 7, 11, 19),
+                "region_id": 247,
+                "tournament_id": 36,
+                "source_sex": 1,
+            },
+        ),
+    )
+
+    def fake_fetch(self, target, **kwargs):
+        if target.page_kind == blocked_page_kind:
+            raise CloudflareChallenge(
+                "Cloudflare challenge HTTP 403",
+                url=target.canonical_url,
+                route=TransportRoute.DIRECT_HTTP,
+                status_code=403,
+                source_wide=True,
+            )
+        content = b"{}"
+        response = TransportResponse(
+            url=target.canonical_url,
+            content=content,
+            status_code=200,
+            headers={},
+            route=TransportRoute.DIRECT_HTTP,
+            wire_bytes=len(content),
+            sha256=hashlib.sha256(content).hexdigest(),
+        )
+        assert kwargs["validator"](response) is True
+        return response, f"s3://raw/{target.target_id}"
+
+    monkeypatch.setattr(WhoScoredIngestService, "_fetch", fake_fetch)
+
+    result = WhoScoredIngestService.discover_catalog(
+        as_of_date=date(2026, 7, 16),
+        repository=repository,
+        transport=_CatalogTransport(),
+        raw_store=object(),
+        full_history=True,
+    )
+
+    assert result.status == "failed"
+    assert any("CloudflareChallenge" in error for error in result.errors)
+    assert repository.persisted == []
 
 
 def test_discover_catalog_uses_fixture_interval_for_long_qualification(
@@ -1312,6 +1752,7 @@ def test_discover_catalog_uses_fixture_interval_for_long_qualification(
     monkeypatch.setattr(WhoScoredIngestService, "_fetch", fake_fetch)
 
     result = WhoScoredIngestService.discover_catalog(
+        as_of_date=date(2026, 7, 16),
         repository=repository,
         transport=_CatalogTransport(),
         raw_store=object(),
@@ -1400,6 +1841,7 @@ def test_discover_catalog_skips_distant_future_fixtures_for_current_edition(
     monkeypatch.setattr(WhoScoredIngestService, "_fetch", fake_fetch)
 
     result = WhoScoredIngestService.discover_catalog(
+        as_of_date=date(2026, 7, 16),
         repository=repository,
         transport=_CatalogTransport(),
         raw_store=object(),
@@ -1449,14 +1891,31 @@ def test_daily_discovery_preserves_unvisited_source_unavailable_season(
             "classification_reason": "parent:source_sex_male_no_youth_marker",
         }
     )
+    historical_stage = _discovery_stage_row(source_season_id=8000, stage_id=600)
+    historical_stage.update(
+        {
+            "season": "2022",
+            "season_id": "2022",
+            "eligibility": "source_unavailable",
+            "classification_reason": "season:season_stage_page_http_404",
+        }
+    )
     previous = WhoScoredCatalog.from_rows(
         {
             "competitions": (competition,),
             "seasons": (current, historical),
-            "stages": (stage,),
+            "stages": (stage, historical_stage),
         }
     )
-    repository = _CatalogRepository(previous=previous)
+    parent_generation = {
+        "catalog_batch_id": "wsc2-exact-parent",
+        "catalog_payload_sha256": catalog_payload_sha256(previous.to_rows()),
+        "catalog_raw_provenance_sha256": "b" * 64,
+        "catalog_as_of_date": "2026-07-15",
+    }
+    repository = _CatalogRepository(
+        previous=previous, previous_generation=parent_generation
+    )
     schedule = {
         "date": datetime(2026, 7, 11, 19),
         "region_id": 247,
@@ -1484,6 +1943,7 @@ def test_daily_discovery_preserves_unvisited_source_unavailable_season(
     )
 
     result = WhoScoredIngestService.discover_catalog(
+        as_of_date=date(2026, 7, 16),
         repository=repository,
         transport=_CatalogTransport(),
         raw_store=object(),
@@ -1495,6 +1955,37 @@ def test_daily_discovery_preserves_unvisited_source_unavailable_season(
     assert retained.eligibility.value == "source_unavailable"
     assert retained.start == date(2022, 11, 20)
     assert retained.end == date(2022, 12, 18)
+    carried = next(
+        row for row in persisted.to_rows()["stages"] if row.get("stage_id") == 600
+    )
+    assert carried["source_season_id"] == 8000
+    metadata = repository.persisted[0][1]
+    assert metadata["parent_catalog_batch_id"] == "wsc2-exact-parent"
+    assert (
+        metadata["parent_catalog_payload_sha256"]
+        == parent_generation["catalog_payload_sha256"]
+    )
+    assert (
+        metadata["parent_catalog_raw_provenance_sha256"]
+        == parent_generation["catalog_raw_provenance_sha256"]
+    )
+
+    alternate_parent = dict(parent_generation)
+    alternate_parent["catalog_batch_id"] = "wsc2-alternate-parent"
+    alternate_repository = _CatalogRepository(
+        previous=previous, previous_generation=alternate_parent
+    )
+    alternate = WhoScoredIngestService.discover_catalog(
+        as_of_date=date(2026, 7, 16),
+        repository=alternate_repository,
+        transport=_CatalogTransport(),
+        raw_store=object(),
+    )
+    assert alternate.status == "success", alternate.as_dict()
+    assert (
+        metadata["discovery_batch_id"]
+        != alternate_repository.persisted[0][1]["discovery_batch_id"]
+    )
 
 
 def test_ttl_cache_replays_same_day_then_refreshes_once_after_expiry(tmp_path):
@@ -1525,6 +2016,15 @@ def test_ttl_cache_replays_same_day_then_refreshes_once_after_expiry(tmp_path):
     assert transport.network_calls == 1
     assert rate_limit_calls == ["acquired"]
 
+    # Append-only raw history intentionally refuses to let an older delayed
+    # writer replace the current receipt. Explicitly invalidate the current
+    # test fixture before installing an expired version.
+    _, current_record = raw_store.load_bytes(target)
+    raw_store.quarantine(
+        target,
+        reason="expire TTL cache test fixture",
+        record=current_record,
+    )
     raw_store.store_bytes(
         target,
         transport.content,
@@ -1766,21 +2266,36 @@ def test_schedule_cache_policy_ttls_only_mutable_active_targets(tmp_path, monkey
         return response, f"s3://raw/{target.target_id}"
 
     service._fetch = fake_fetch
-    service._fetch_parsed_many = lambda specs: [
-        service._fetch_parsed(
-            spec.target,
-            parser=spec.parser,
-            content_type=spec.content_type,
-            allow_cache=spec.allow_cache,
-            cache_ttl=spec.cache_ttl,
-            browser_bootstrap_url=spec.browser_bootstrap_url,
-        )
-        for spec in specs
-    ]
+    structured_batch_sizes = []
+
+    def fetch_parsed_many(specs):
+        specs = tuple(specs)
+        structured_batch_sizes.append(len(specs))
+        return [
+            service._fetch_parsed(
+                spec.target,
+                parser=spec.parser,
+                content_type=spec.content_type,
+                allow_cache=spec.allow_cache,
+                cache_ttl=spec.cache_ttl,
+                browser_bootstrap_url=spec.browser_bootstrap_url,
+            )
+            for spec in specs
+        ]
+
+    service._fetch_parsed_many = fetch_parsed_many
 
     result = service.sync_schedule()
 
     assert result.status == "success", result.as_dict()
+    assert result.committed_batches == {"scope": ["wss2-" + "a" * 64]}
+    assert result.as_dict()["committed_batches"] == result.committed_batches
+    assert result.metadata == {
+        "source_stage_ids": [700],
+        "source_stage_count": 1,
+    }
+    assert sum(structured_batch_sizes) == 17 + 2 * len(DETAILED_FEED_OPTIONS)
+    assert max(structured_batch_sizes) == STRUCTURED_PARSE_BATCH_SIZE
     assert result.counts == {
         "schedule": 2,
         "match_incidents": 0,
@@ -1921,6 +2436,141 @@ def test_schedule_cache_policy_ttls_only_mutable_active_targets(tmp_path, monkey
     assert all(kwargs.get("cache_ttl") is None for _, _, kwargs in calls)
 
 
+def test_player_stage_statistics_fetches_every_declared_page(tmp_path):
+    service, _, _ = _service(tmp_path)
+    spec = service._player_stage_statistics_spec(
+        stage_id=700,
+        source_season_id=9001,
+        active=True,
+        category="summary",
+        subcategory="all",
+        cache_ttl=timedelta(hours=1),
+        browser_bootstrap_url=(
+            "https://www.whoscored.com/Regions/247/Tournaments/36/Seasons/9001/"
+            "Stages/700/TeamStatistics"
+        ),
+    )
+
+    def response_for(current_page, player_id, url):
+        content = json.dumps(
+            {
+                "playerTableStats": [
+                    {"playerId": player_id, "teamId": 26, "apps": current_page}
+                ],
+                "paging": {
+                    "currentPage": current_page,
+                    "pageIndex": current_page - 1,
+                    "totalPages": 2,
+                    "totalResults": 2,
+                    "resultsPerPage": 1,
+                    "firstRecordIndex": current_page - 1,
+                    "lastRecordIndex": current_page - 1,
+                },
+            }
+        ).encode()
+        return TransportResponse(
+            url=url,
+            content=content,
+            status_code=200,
+            headers={},
+            route=TransportRoute.DIRECT_HTTP,
+            wire_bytes=len(content),
+            sha256=hashlib.sha256(content).hexdigest(),
+        )
+
+    first_response = response_for(1, 11, spec.target.canonical_url)
+    first_result = (first_response, "s3://raw/page-1", spec.parser(first_response))
+    requested = []
+
+    def fetch_next(specs):
+        requested.extend(specs)
+        next_spec = specs[0]
+        next_response = response_for(2, 12, next_spec.target.canonical_url)
+        return [(next_response, "s3://raw/page-2", next_spec.parser(next_response))]
+
+    service._fetch_parsed_many = fetch_next
+    completed, additional_raw = service._complete_player_statistics_pages(
+        [spec], [first_result]
+    )
+
+    assert len(requested) == 1
+    params = parse_qs(urlparse(requested[0].target.canonical_url).query)
+    assert params["page"] == ["2"]
+    assert requested[0].target.target_id.endswith(":page:2")
+    parsed = completed[0][2]
+    assert isinstance(parsed, ParsedDataset)
+    assert {row["player_id"] for row in parsed.rows} == {11, 12}
+    assert len(additional_raw) == 1
+    assert additional_raw[0][1] == "s3://raw/page-2"
+
+
+def test_player_stage_pagination_fetches_in_bounded_batches(tmp_path):
+    service, _, _ = _service(tmp_path)
+    spec = service._player_stage_statistics_spec(
+        stage_id=700,
+        source_season_id=9001,
+        active=True,
+        category="summary",
+        subcategory="all",
+        cache_ttl=None,
+        browser_bootstrap_url=(
+            "https://www.whoscored.com/Regions/247/Tournaments/36/Seasons/9001/"
+            "Stages/700/TeamStatistics"
+        ),
+    )
+
+    def page(number):
+        return PlayerStageStatisticsPage(
+            page_number=number,
+            page_index=None,
+            total_pages=10,
+            total_results=10,
+            results_per_page=1,
+            first_record_index=number - 1,
+            last_record_index=number - 1,
+            index_base=0,
+            records=({"playerId": number, "teamId": 26, "apps": 1},),
+        )
+
+    first_response = TransportResponse(
+        url=spec.target.canonical_url,
+        content=b"page-1",
+        status_code=200,
+        headers={},
+        route=TransportRoute.DIRECT_HTTP,
+        wire_bytes=6,
+        sha256=hashlib.sha256(b"page-1").hexdigest(),
+    )
+    batch_sizes = []
+
+    def fetch_next(specs):
+        batch_sizes.append(len(specs))
+        results = []
+        for next_spec in specs:
+            number = int(next_spec.target.source_ids["page"])
+            content = f"page-{number}".encode()
+            response = TransportResponse(
+                url=next_spec.target.canonical_url,
+                content=content,
+                status_code=200,
+                headers={},
+                route=TransportRoute.DIRECT_HTTP,
+                wire_bytes=len(content),
+                sha256=hashlib.sha256(content).hexdigest(),
+            )
+            results.append((response, f"s3://raw/page-{number}", page(number)))
+        return results
+
+    service._fetch_parsed_many = fetch_next
+    completed, additional_raw = service._complete_player_statistics_pages(
+        [spec], [(first_response, "s3://raw/page-1", page(1))]
+    )
+
+    assert batch_sizes == [8, 1]
+    assert len(additional_raw) == 9
+    assert {row["player_id"] for row in completed[0][2].rows} == set(range(1, 11))
+
+
 def test_source_season_discovery_uses_ttl_only_for_active_scope(tmp_path, monkeypatch):
     class _FixedDate(date):
         @classmethod
@@ -1965,6 +2615,10 @@ def test_match_sync_commits_source_id_and_raw_before_manifest(tmp_path):
     result = service.sync_matches()
 
     assert result.status == "success", result.as_dict()
+    assert result.committed_batches == {
+        "match": [repository.commits[0].batch_id],
+        "match_not_available": [],
+    }
     assert result.counts == {
         "matches": 1,
         "events": 1,
@@ -1981,6 +2635,24 @@ def test_match_sync_commits_source_id_and_raw_before_manifest(tmp_path):
     assert commit.lineups_available is True
     assert commit.paid_bytes == 0
     assert raw_store.has(match_page_target(123))
+
+
+def test_historical_match_replay_uses_stale_raw_without_network(tmp_path, monkeypatch):
+    service, repository, raw_store = _service(tmp_path)
+    raw_store.store_bytes(
+        match_page_target(123),
+        _match_html().encode(),
+        content_type="text/html",
+    )
+    monkeypatch.setattr(raw_store, "is_fresh", lambda *_args, **_kwargs: False)
+    transport = _RawCacheAwareTransport(b"must not reach the network")
+    service.transport = transport
+
+    result = service.sync_matches(force_replay=True, historical_replay=True)
+
+    assert result.status == "success", result.as_dict()
+    assert transport.network_calls == 0
+    assert repository.commits[0].transport_mode == "raw_cache"
 
 
 def test_parser_drift_is_fatal_and_manifested_without_commit(tmp_path):
@@ -2019,7 +2691,17 @@ def test_non_opta_match_without_matchcentre_is_explicitly_unavailable(tmp_path):
         )
     ]
     service.transport = _RawPersistingContentFailureTransport(
-        b"<html><body>source has no match payload</body></html>"
+        b"""
+        <html><head><title>Home 1-0 Away - League 2026 Live</title></head>
+        <body>
+        <script>require.config.params['matchheader'] = {
+          input: [1, 2, 'Home', 'Away'], matchId: 123
+        };</script>
+        <script>require.config.params[\"args\"] = {
+          matchId: 123, initialMatchDataForScrappers: [[[1, 2]]]
+        };</script>
+        </body></html>
+        """
     )
 
     result = service.sync_matches()
@@ -2029,13 +2711,151 @@ def test_non_opta_match_without_matchcentre_is_explicitly_unavailable(tmp_path):
     assert result.errors == []
     assert result.retryable == []
     assert result.terminal == []
+    assert result.succeeded == 1
+    assert len(result.committed_batches["match_not_available"]) == 1
+    assert result.attempted_snapshots["match"]["count"] == 1
     assert len(repository.failures) == 1
     assert repository.failures[0].state == "not_available"
+    assert repository.failures[0].failure_code == "source_not_available"
+    assert raw_store.has(match_page_target(123))
+
+
+def test_sync_matches_reports_the_unfetched_daily_backlog(tmp_path):
+    service, repository, raw_store = _service(tmp_path)
+    # One returned candidate out of an exact backlog of 5 -> 4 left un-fetched.
+    repository.list_match_candidates = lambda *_args, **_kwargs: [
+        MatchCandidate(
+            game_id=123,
+            league="INT-World Cup",
+            season="2026",
+            game="Home-Away",
+            kickoff=datetime(2026, 6, 12),
+            status=6,
+            match_is_opta=False,
+            exact_candidate_count=5,
+        )
+    ]
+    service.transport = _RawPersistingContentFailureTransport(
+        b"""
+        <html><head><title>Home 1-0 Away - League 2026 Live</title></head>
+        <body>
+        <script>require.config.params['matchheader'] = {
+          input: [1, 2, 'Home', 'Away'], matchId: 123
+        };</script>
+        <script>require.config.params[\"args\"] = {
+          matchId: 123, initialMatchDataForScrappers: [[[1, 2]]]
+        };</script>
+        </body></html>
+        """
+    )
+
+    result = service.sync_matches()
+
+    assert result.attempted_snapshots["match"]["count"] == 1
+    assert result.metadata["match_candidates"] == {
+        "schema_version": 1,
+        "count": 5,
+        "attempted": 1,
+        "remaining": 4,
+    }
+
+
+def test_sync_matches_reports_zero_backlog_when_no_matches_are_due(tmp_path):
+    service, repository, _ = _service(tmp_path)
+    # The common steady-state case: a scope with no due matches.
+    repository.list_match_candidates = lambda *_args, **_kwargs: []
+
+    result = service.sync_matches()
+
+    assert result.status == "success"
+    assert result.attempted == 0
+    assert result.metadata["match_candidates"] == {
+        "schema_version": 1,
+        "count": 0,
+        "attempted": 0,
+        "remaining": 0,
+    }
+
+
+def test_match_not_available_rejects_a_foreign_valid_outcome_id(tmp_path):
+    service, repository, _ = _service(tmp_path)
+    repository.list_match_candidates = lambda *_args, **_kwargs: [
+        MatchCandidate(
+            game_id=123,
+            league="INT-World Cup",
+            season="2026",
+            game="Home-Away",
+            kickoff=datetime(2026, 6, 12),
+            status=6,
+            match_is_opta=False,
+        )
+    ]
+    service.transport = _RawPersistingContentFailureTransport(
+        b"""
+        <title>Home 1-0 Away - League 2026 Live</title>
+        <script>require.config.params['matchheader'] = {
+          input: [1, 2, 'Home', 'Away'], matchId: 123
+        };</script>
+        <script>require.config.params["args"] = {
+          matchId: 123, initialMatchDataForScrappers: [[[1, 2]]]
+        };</script>
+        """
+    )
+    original = repository.record_failure
+
+    def foreign(failure):
+        original(failure)
+        return "wsna2-v3-" + "f" * 64
+
+    repository.record_failure = foreign
+
+    result = service.sync_matches()
+
+    assert result.status == "failed"
+    assert result.succeeded == 0
+    assert result.committed_batches["match_not_available"] == []
+
+
+def test_present_but_unsupported_matchcentre_is_parse_failed(tmp_path):
+    service, repository, raw_store = _service(tmp_path)
+    repository.list_match_candidates = lambda *_args, **_kwargs: [
+        MatchCandidate(
+            game_id=123,
+            league="INT-World Cup",
+            season="2026",
+            game="Home-Away",
+            kickoff=datetime(2026, 6, 12),
+            status=6,
+            match_is_opta=False,
+        )
+    ]
+    service.transport = _RawPersistingContentFailureTransport(
+        b"""
+        <script>require.config.params['matchheader'] = {
+          input: [1, 2, 'Home', 'Away'], matchId: 123
+        };</script>
+        <script>require.config.params["args"] = {
+          matchId: 123,
+          matchCentreData: JSON.parse('{"events":[]}'),
+          initialMatchDataForScrappers: [[[1, 2]]]
+        };</script>
+        """
+    )
+
+    result = service.sync_matches()
+
+    assert result.status == "failed"
+    assert repository.commits == []
+    assert len(repository.failures) == 1
+    assert repository.failures[0].state == "parse_failed"
+    assert repository.failures[0].failure_code == "content"
     assert raw_store.has(match_page_target(123))
 
 
 def test_semantically_truncated_match_is_manifested_as_parse_failed(tmp_path):
     service, repository, raw_store = _service(tmp_path)
+    candidate = replace(repository.list_match_candidates()[0], attempt_no=3)
+    repository.list_match_candidates = lambda *_args, **_kwargs: [candidate]
 
     def reject(_commit):
         raise ValueError("game 123 has incomplete final Opta events")
@@ -2049,6 +2869,8 @@ def test_semantically_truncated_match_is_manifested_as_parse_failed(tmp_path):
     assert len(repository.failures) == 1
     failure = repository.failures[0]
     assert failure.state == "parse_failed"
+    assert failure.attempt_no == 3
+    assert failure.retry_after is None
     assert "incomplete final Opta events" in failure.error
     assert failure.raw_uri
     assert raw_store.has(match_page_target(123))
@@ -2073,6 +2895,70 @@ def test_match_task_budget_is_backed_off_not_permanently_blacklisted(tmp_path):
     assert result.terminal == []
     assert repository.failures[0].state == "retryable"
     assert repository.failures[0].failure_code == "budget"
+
+
+@pytest.mark.parametrize(
+    ("attempt_no", "delay_hours"),
+    [(1, 6), (2, 12), (3, 24), (4, 48), (7, 48)],
+)
+def test_match_retry_backoff_increases_and_caps(tmp_path, attempt_no, delay_hours):
+    service, repository, _ = _service(tmp_path)
+    candidate = replace(repository.list_match_candidates()[0], attempt_no=attempt_no)
+    repository.list_match_candidates = lambda *_args, **_kwargs: [candidate]
+    service.transport = _FailingTransport(
+        WhoScoredTransportError(
+            "origin timed out",
+            kind=FailureKind.TIMEOUT,
+            url="https://www.whoscored.com/Matches/123/Live",
+            route=TransportRoute.DIRECT_HTTP,
+            retryable=True,
+        )
+    )
+
+    before = datetime.utcnow()
+    result = service.sync_matches()
+
+    assert result.status == "retryable"
+    failure = repository.failures[0]
+    assert failure.attempt_no == attempt_no
+    assert before + timedelta(hours=delay_hours) <= failure.retry_after
+    assert failure.retry_after <= before + timedelta(hours=delay_hours, seconds=2)
+
+
+def test_match_success_after_retry_carries_attempt_into_manifest_commit(tmp_path):
+    service, repository, _ = _service(tmp_path)
+    candidate = replace(repository.list_match_candidates()[0], attempt_no=3)
+    repository.list_match_candidates = lambda *_args, **_kwargs: [candidate]
+
+    result = service.sync_matches()
+
+    assert result.status == "success", result.as_dict()
+    assert repository.commits[0].attempt_no == 3
+
+
+def test_match_terminal_failure_keeps_attempt_and_has_no_retry_deadline(tmp_path):
+    service, repository, _ = _service(tmp_path)
+    candidate = replace(repository.list_match_candidates()[0], attempt_no=4)
+    repository.list_match_candidates = lambda *_args, **_kwargs: [candidate]
+    service.transport = _FailingTransport(
+        WhoScoredTransportError(
+            "origin rejected request",
+            kind=FailureKind.HTTP_STATUS,
+            url="https://www.whoscored.com/Matches/123/Live",
+            route=TransportRoute.DIRECT_HTTP,
+            status_code=403,
+            retryable=False,
+        )
+    )
+
+    result = service.sync_matches()
+
+    assert result.status == "success"
+    assert result.terminal == ["123"]
+    failure = repository.failures[0]
+    assert failure.state == "terminal"
+    assert failure.attempt_no == 4
+    assert failure.retry_after is None
 
 
 def test_match_failure_manifest_error_is_visible_without_aborting_result(tmp_path):
@@ -2117,6 +3003,10 @@ def test_preview_sync_commits_raw_first_batch_and_bounds_paid_urls(tmp_path):
     result = service.sync_previews(limit=10)
 
     assert result.status == "success", result.as_dict()
+    assert result.committed_batches == {
+        "preview": [repository.preview_commits[0].batch_id],
+        "preview_not_available": [],
+    }
     assert result.counts == {
         "missing_players": 1,
         "preview_lineups": 0,
@@ -2218,6 +3108,80 @@ def test_preview_transport_failure_is_backed_off_and_manifested(tmp_path):
     assert service.transport.budgets.max_paid_urls == 3
 
 
+def test_preview_404_is_proven_not_available(tmp_path):
+    service, repository, _ = _service(tmp_path)
+    repository.preview_candidates = [
+        {
+            "game_id": 404,
+            "game": "Home-Away",
+            "date": datetime(2026, 7, 11, 12),
+            "home_team": "Home",
+            "away_team": "Away",
+            "attempt_no": 1,
+            "force_refresh": False,
+        }
+    ]
+    service.transport = _FailingTransport(
+        WhoScoredTransportError(
+            "HTTP 404",
+            kind=FailureKind.HTTP_STATUS,
+            url="https://www.whoscored.com/Matches/404/Preview",
+            route=TransportRoute.DIRECT_HTTP,
+            status_code=404,
+            retryable=False,
+        )
+    )
+
+    result = service.sync_previews()
+
+    assert result.status == "success"
+    assert result.succeeded == 1
+    assert result.counts["not_available"] == 1
+    assert result.retryable == []
+    assert result.terminal == []
+    assert repository.preview_failures[0].state == "not_available"
+    assert len(result.committed_batches["preview_not_available"]) == 1
+    assert result.attempted_snapshots["preview"]["count"] == 1
+
+
+def test_preview_not_available_rejects_a_foreign_valid_outcome_id(tmp_path):
+    service, repository, _ = _service(tmp_path)
+    repository.preview_candidates = [
+        {
+            "game_id": 404,
+            "game": "Home-Away",
+            "date": datetime(2026, 7, 11, 12),
+            "home_team": "Home",
+            "away_team": "Away",
+            "attempt_no": 1,
+            "force_refresh": False,
+        }
+    ]
+    service.transport = _FailingTransport(
+        WhoScoredTransportError(
+            "HTTP 404",
+            kind=FailureKind.HTTP_STATUS,
+            url="https://www.whoscored.com/Matches/404/Preview",
+            route=TransportRoute.DIRECT_HTTP,
+            status_code=404,
+            retryable=False,
+        )
+    )
+    original = repository.record_preview_failure
+
+    def foreign(failure):
+        original(failure)
+        return "wspna2-v3-" + "f" * 64
+
+    repository.record_preview_failure = foreign
+
+    result = service.sync_previews()
+
+    assert result.status == "failed"
+    assert result.succeeded == 0
+    assert result.committed_batches["preview_not_available"] == []
+
+
 def test_preview_retry_replays_persisted_raw_without_a_second_network_call(
     tmp_path,
 ):
@@ -2268,6 +3232,8 @@ def test_profile_retryable_transport_failure_is_manifested_with_backoff(tmp_path
     assert result.retryable == ["42"]
     assert result.terminal == []
     assert result.errors == []
+    assert result.committed_batches["profile_not_available"] == []
+    assert result.attempted_snapshots["profile"]["count"] == 1
     assert repository.profile_commits == []
     failure = repository.profile_failures[0]
     assert failure["state"] == "retryable"
@@ -2342,6 +3308,10 @@ def test_sparse_but_identifiable_profile_is_published(tmp_path):
     result = service.sync_profiles(limit=1)
 
     assert result.status == "success"
+    assert result.committed_batches == {
+        "profile": [repository.profile_commits[0].batch_id],
+        "profile_not_available": [],
+    }
     assert result.succeeded == 1
     assert repository.profile_failures == []
     assert repository.profile_commits[0].profile["player_id"] == 621946
@@ -2369,7 +3339,33 @@ def test_profile_candidates_use_one_deduplicated_union_scope_query(tmp_path):
     ]
 
 
-def test_profile_terminal_404_is_manifested_and_not_reported_retryable(tmp_path):
+def test_explicit_profile_ids_bypass_mutable_candidate_selection(tmp_path):
+    service, repository, _ = _service(tmp_path)
+    repository.profile_candidates = [999999]
+    service.transport = _Transport(
+        """
+        <div><span class="info-label">Name: </span>Frozen Player</div>
+        <div><span class="info-label">Current Team: </span>
+          <a href="/Teams/1219/Show/Test">Test</a>
+        </div>
+        <div><span class="info-label">Positions: </span>Defender</div>
+        <script>var currentParticipations = [{
+          tournamentId:1,seasonId:2,stageId:3,teamId:1219,
+          teamName:'Test',position:{displayName:'DC'}
+        }];</script>
+        """
+    )
+    candidate_queries = len(repository.profile_candidate_scope_requests)
+
+    result = service.sync_profiles(limit=200, player_ids=[621946])
+
+    assert result.status == "success"
+    assert result.attempted == result.succeeded == 1
+    assert repository.profile_commits[0].player_id == 621946
+    assert len(repository.profile_candidate_scope_requests) == candidate_queries
+
+
+def test_profile_404_is_proven_not_available_and_not_retried(tmp_path):
     service, repository, _ = _service(tmp_path)
     repository.profile_candidates = [404]
     service.transport = _FailingTransport(
@@ -2387,13 +3383,45 @@ def test_profile_terminal_404_is_manifested_and_not_reported_retryable(tmp_path)
 
     assert result.status == "success"
     assert result.retryable == []
-    assert result.terminal == ["404"]
+    assert result.terminal == []
+    assert result.succeeded == 1
+    assert result.counts["not_available"] == 1
     assert result.errors == []
+    assert len(result.committed_batches["profile_not_available"]) == 1
+    assert result.attempted_snapshots["profile"]["count"] == 1
     failure = repository.profile_failures[0]
-    assert failure["state"] == "terminal"
+    assert failure["state"] == "not_available"
     assert failure["retry_after"] is None
     assert failure["http_status"] == 404
     assert failure["failure_code"] == "http_status"
+
+
+def test_profile_not_available_rejects_a_foreign_valid_outcome_id(tmp_path):
+    service, repository, _ = _service(tmp_path)
+    repository.profile_candidates = [404]
+    service.transport = _FailingTransport(
+        WhoScoredTransportError(
+            "HTTP 404",
+            kind=FailureKind.HTTP_STATUS,
+            url="https://www.whoscored.com/Players/404/Show",
+            route=TransportRoute.DIRECT_HTTP,
+            status_code=404,
+            retryable=False,
+        )
+    )
+    original = repository.record_profile_failure
+
+    def foreign(**failure):
+        original(**failure)
+        return "wsprna2-" + "f" * 64
+
+    repository.record_profile_failure = foreign
+
+    result = service.sync_profiles(limit=1)
+
+    assert result.status == "failed"
+    assert result.succeeded == 0
+    assert result.committed_batches["profile_not_available"] == []
 
 
 def test_profile_task_budget_is_backed_off_not_permanently_blacklisted(tmp_path):

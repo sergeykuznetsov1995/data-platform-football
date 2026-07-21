@@ -36,13 +36,6 @@ DEFAULT_ARGS: Dict[str, Any] = {
 SCRAPER_ARGS: Dict[str, Any] = {
     **DEFAULT_ARGS,
     'pool': INGEST_SCRAPER_POOL,
-    # #951 bronze backfill: match-capture materializes the whole league in one
-    # end-of-task pass (many serialized single-row manifest MERGEs). On a lean
-    # manifest table each MERGE is ~0.8s, but the pass re-bloats the table within
-    # a run, so a big league can exceed the 2h default. Widen to 6h for the
-    # isolated backfill stack; the between-run manifest maintenance keeps commits
-    # fast so tasks normally finish in well under an hour.
-    'execution_timeout': timedelta(hours=6),
 }
 
 # Extended arguments for Selenium-based scrapers

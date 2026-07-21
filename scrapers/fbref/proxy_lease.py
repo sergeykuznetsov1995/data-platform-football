@@ -20,6 +20,7 @@ FBREF_DAG_IDS = frozenset(
         "dag_ingest_fbref",
         "dag_bootstrap_fbref",
         "dag_backfill_fbref",
+        "dag_accept_fbref_bronze",
     }
 )
 DEFAULT_CONTROL_TIMEOUT_SECONDS = 5.0
@@ -60,15 +61,10 @@ class FBrefLeaseStats:
 
 
 def _control_token_from_environment() -> str:
-    for name in (
-        "FBREF_PROXY_CONTROL_TOKEN",
-        "PROXY_FILTER_CONTROL_TOKEN",
-        "SOFASCORE_PROXY_CONTROL_TOKEN",
-    ):
-        value = str(os.environ.get(name, "")).strip()
-        if value:
-            return value
-    return ""
+    # FBref has a distinct paid pool and control plane. Falling back to the
+    # shared/SofaScore secret silently couples their lifecycles and can point
+    # an acceptance run at the wrong meter.
+    return str(os.environ.get("FBREF_PROXY_CONTROL_TOKEN", "")).strip()
 
 
 def _safe_error(value: object) -> str:

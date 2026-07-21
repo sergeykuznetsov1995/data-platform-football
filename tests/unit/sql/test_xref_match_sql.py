@@ -18,6 +18,10 @@ Documented invariants we exercise (Phase B / Task 2.1):
   * Orphan rows carry source-prefixed canonical_id ('ws_'/'us_'/...).
   * MatchHistory has NO native match_id and emits a deterministic
     'mh_<xxhash64>' synthetic id.
+  * FotMob reads NATIVE bronze (fotmob_matches_current, #930 cutover), not
+    legacy fotmob_schedule: match_id BIGINT → varchar, utc_time date slice,
+    league via fotmob_league_map (14-league scope guard), season slug from
+    source_season_key year-start.
 """
 
 from __future__ import annotations
@@ -221,6 +225,104 @@ class TestCascadeBridge:
         assert sql.count("fb.match_date") >= 6
         assert sql.count("fb.home_canonical_id") >= 6
         assert sql.count("fb.away_canonical_id") >= 6
+
+
+# ---------------------------------------------------------------------------
+# FotMob native cutover (#930) — fm_resolved reads fotmob_matches_current
+# ---------------------------------------------------------------------------
+
+class TestFotmobNativeSource:
+    """#930 cutover: the fotmob branch reads native `fotmob_matches_current`,
+    not legacy `bronze.fotmob_schedule`. source_id / date / team-name strings
+    must stay byte-identical to legacy so canonical ids and the xref_team
+    JOIN keep resolving."""
+
+    def test_reads_native_current_view(self):
+        non_comment = _strip_comments(_read_sql())
+        assert "iceberg.bronze.fotmob_matches_current" in non_comment, (
+            "fotmob branch must read the native fotmob_matches_current view"
+        )
+
+    def test_legacy_fotmob_schedule_gone(self):
+        non_comment = _strip_comments(_read_sql()).lower()
+        assert "bronze.fotmob_schedule" not in non_comment, (
+            "legacy bronze.fotmob_schedule must no longer be referenced (#930)"
+        )
+
+    def test_fm_native_cte_present(self):
+        sql = _read_sql()
+        assert re.search(r"\bfm_native\s+AS\b", sql), (
+            "expected fm_native CTE (native head-CTE feeding fm_resolved)"
+        )
+
+    def test_match_id_cast_to_varchar(self):
+        """Native match_id is BIGINT (legacy was varchar) — source_id must be
+        CAST back to varchar so it stays the exact same string."""
+        non_comment = _strip_comments(_read_sql())
+        assert re.search(
+            r"CAST\(\s*match_id\s+AS\s+varchar\s*\)", non_comment, re.IGNORECASE,
+        ), "expected CAST(match_id AS varchar) for the fotmob source_id"
+
+    def test_match_date_from_utc_time(self):
+        """Legacy `date` → native `utc_time` (same ISO-8601 string); the
+        10-char slice before TRY_CAST must be preserved."""
+        non_comment = _strip_comments(_read_sql())
+        assert re.search(
+            r"SUBSTR\(\s*utc_time\s*,\s*1\s*,\s*10\s*\)", non_comment, re.IGNORECASE,
+        ), "expected SUBSTR(utc_time, 1, 10) date derivation"
+
+    def test_team_names_from_native_columns(self):
+        """Legacy home_team/away_team → native home_team_name/away_team_name
+        (same source `home.name` strings, so xref_team source_id JOIN holds)."""
+        non_comment = _strip_comments(_read_sql())
+        assert "home_team_name" in non_comment
+        assert "away_team_name" in non_comment
+
+    def test_league_map_cte_joined_on_competition_id(self):
+        """`league` is reconstructed from native competition_id via an INNER
+        JOIN to fotmob_league_map — the join doubles as the legacy 14-league
+        scope guard (native bronze covers the full FotMob catalogue)."""
+        sql = _read_sql()
+        assert re.search(
+            r"fotmob_league_map\s*\(competition_id,\s*league\)\s+AS\s*\(", sql,
+        ), "expected fotmob_league_map(competition_id, league) CTE"
+        non_comment = _strip_comments(sql)
+        assert re.search(
+            r"JOIN\s+fotmob_league_map\s+lm\s+ON\s+lm\.competition_id\s*=\s*m\.competition_id",
+            non_comment, re.IGNORECASE,
+        ), "fm_native must INNER JOIN the league map on competition_id"
+
+    @pytest.mark.parametrize("league", [
+        "ENG-Premier League", "ENG-Championship", "ESP-La Liga",
+        "GER-Bundesliga", "ITA-Serie A", "FRA-Ligue 1", "NED-Eredivisie",
+        "POR-Primeira Liga", "UEFA-Champions League", "UEFA-Europa League",
+        "INT-World Cup", "INT-European Championship",
+        "INT-Africa Cup of Nations", "INT-Copa America",
+    ])
+    def test_league_map_covers_legacy_scope(self, league):
+        """The map must reproduce all 14 legacy FotMobScraper.LEAGUE_IDS
+        strings — a missing entry silently drops that league from silver."""
+        block = re.search(
+            r"fotmob_league_map\s*\(competition_id,\s*league\)\s+AS\s*\(.*?\n\),",
+            _read_sql(), re.DOTALL,
+        )
+        assert block, "expected fotmob_league_map CTE block"
+        assert f"'{league}'" in block.group(0), (
+            f"league map must carry {league!r} (legacy 14-league scope)"
+        )
+
+    def test_season_slug_from_source_season_key(self):
+        """Season year-start = substr(source_season_key, 1, 4) — never derived
+        from the key shape (AFCON single-year keys must still slug '2526'
+        via the shared legacy CASE, bit-compatible with xref_team)."""
+        non_comment = _strip_comments(_read_sql())
+        assert re.search(
+            r"TRY_CAST\(\s*SUBSTR\(\s*m\.source_season_key\s*,\s*1\s*,\s*4\s*\)\s+AS\s+integer\s*\)",
+            non_comment, re.IGNORECASE,
+        ), (
+            "expected TRY_CAST(SUBSTR(m.source_season_key, 1, 4) AS integer) "
+            "year-start derivation"
+        )
 
 
 # ---------------------------------------------------------------------------
