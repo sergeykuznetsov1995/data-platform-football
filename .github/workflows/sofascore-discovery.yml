@@ -29,7 +29,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: sofascore-registry-discovery
+  group: sofascore-registry-discovery-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || 'trusted' }}
   cancel-in-progress: false
 
 jobs:

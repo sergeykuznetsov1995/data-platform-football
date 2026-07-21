@@ -920,6 +920,9 @@ def test_scheduled_discovery_poison_proxy_and_bot_pr_contract():
     )
     assert 'cron: "17 4 * * 1-6"' in workflow
     assert 'cron: "17 4 * * 0"' in workflow
+    assert "sofascore-registry-discovery-${{" in workflow
+    assert "format('pr-{0}', github.event.pull_request.number)" in workflow
+    assert "|| 'trusted'" in workflow
     assert "HTTP_PROXY: http://127.0.0.1:9" in workflow
     assert "--scope \"$scope\"" in workflow
     assert 'traffic["paid_proxy_bytes"] == 0' in workflow
