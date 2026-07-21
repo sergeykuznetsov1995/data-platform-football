@@ -515,7 +515,9 @@ def _write_registry_policy(tmp_path: Path, **overrides) -> tuple[Path, str]:
         },
         "allowed_write_tables": [
             "iceberg.bronze.transfermarkt_competition_editions",
+            "iceberg.bronze.transfermarkt_competition_participants",
             "iceberg.bronze.transfermarkt_competitions",
+            "iceberg.bronze.transfermarkt_raw_responses",
             "iceberg.ops.transfermarkt_registry_state_v2",
             "iceberg.silver.transfermarkt_competition_editions_v2",
             "iceberg.silver.transfermarkt_competitions_v2",
@@ -1017,7 +1019,9 @@ class TestStandingRegistryPublication:
             dag_module, monkeypatch, tmp_path,
             allowed_write_tables=[
                 "iceberg.bronze.transfermarkt_competition_editions",
+                "iceberg.bronze.transfermarkt_competition_participants",
                 "iceberg.bronze.transfermarkt_competitions",
+                "iceberg.bronze.transfermarkt_raw_responses",
             ],
         )
         planned = registry_publish.publish_registry(
