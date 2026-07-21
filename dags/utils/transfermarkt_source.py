@@ -49,6 +49,9 @@ SOURCE_ENTITIES = tuple(SOURCE_ENTITY_TABLES)
 SUPPORTED_ENDPOINTS = frozenset({
     'competition_registry',
     'competition_listing',
+    'competition_regulation',
+    'competition_participants',
+    'competition_participant_entities',
     'squad',
     'market_value_points',
     'transfer_events',

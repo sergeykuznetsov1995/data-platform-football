@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -60,6 +61,7 @@ from scrapers.transfermarkt.registry import (
     deterministic_scope_id,
     reconcile_registry_pages,
 )
+from dags.utils.transfermarkt_source import SUPPORTED_ENDPOINTS
 
 
 ENTITY = "competition_registry"
@@ -113,6 +115,7 @@ COMPETITION_COLUMNS = (
     "classification_evidence",
     "registry_snapshot_id",
     "source_body_hash",
+    "raw_capture_id",
     "parser_revision",
     "schema_revision",
     "fetched_at",
@@ -140,6 +143,7 @@ EDITION_COLUMNS = (
     "discovered_at",
     "registry_snapshot_id",
     "source_body_hash",
+    "raw_capture_id",
     "parser_revision",
     "schema_revision",
     "fetched_at",
@@ -160,6 +164,7 @@ PARTICIPANT_COLUMNS = (
     "discovered_at",
     "registry_snapshot_id",
     "source_body_hash",
+    "raw_capture_id",
     "parser_revision",
     "schema_revision",
     "fetched_at",
@@ -852,7 +857,7 @@ def _flatten_raw_captures(
             capture["source"] != "transfermarkt"
             or capture["cycle_id"] != cycle_id
             or capture["scope_id"] != cycle_id
-            or capture["endpoint"] != ENTITY
+            or capture["endpoint"] not in SUPPORTED_ENDPOINTS
             or capture["hash_algorithm"] != "sha256"
             or capture["compression"] != "gzip"
         ):
@@ -1380,14 +1385,54 @@ def _execute_once(
             raise DiscoveryRunnerError("successful response payload hash mismatch")
         return outcome
 
+    def _validate_json(value: Any) -> str | None:
+        if type(value) is not dict:
+            return "JSON response must be an object"
+        if value.get("success") is not True or "data" not in value:
+            return "JSON response is not an authoritative Transfermarkt payload"
+        return None
+
+    def fetch_json(
+        url: str, endpoint: str
+    ) -> FetchOutcome[Mapping[str, Any]]:
+        if endpoint not in SUPPORTED_ENDPOINTS:
+            raise DiscoveryRunnerError(f"unsupported discovery endpoint: {endpoint}")
+        paid_authorization.require()
+        retries_used = int(client.get_traffic_stats().get("retries", 0))
+        remaining_retries = max(0, args.retry_limit - retries_used)
+        outcome = client.fetch(
+            url,
+            as_json=True,
+            max_attempts=min(MAX_ATTEMPTS, remaining_retries + 1),
+            label=endpoint,
+            context={"cycle_id": cycle_id, "scope_id": cycle_id, "scope": cycle_id},
+            validator=_validate_json,
+            cache_key=hashlib.sha256(url.encode("utf-8")).hexdigest(),
+            cache_ttl_seconds=args.cache_ttl_seconds,
+        )
+        if outcome.status is not FetchStatus.OK or outcome.status_code != 200:
+            return outcome
+        if type(outcome.value) is not dict or not outcome.payload_hash:
+            raise DiscoveryRunnerError("successful JSON response has no payload hash")
+        if outcome.payload_hash != stable_payload_hash(outcome.value):
+            raise DiscoveryRunnerError("successful JSON payload hash mismatch")
+        return outcome
+
     try:
         source_started = True
-        pages = discovery_fn(
-            fetch=fetch,
-            checkpoint=checkpoint,
-            traffic_ledger=ledger,
-            clock=utcnow,
-        )
+        discovery_kwargs = {
+            "fetch": fetch,
+            "checkpoint": checkpoint,
+            "traffic_ledger": ledger,
+            "clock": utcnow,
+        }
+        parameters = inspect.signature(discovery_fn).parameters
+        if "fetch_json" in parameters or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        ):
+            discovery_kwargs["fetch_json"] = fetch_json
+        pages = discovery_fn(**discovery_kwargs)
         snapshot = reconcile_registry_pages(pages)
         fetched_at = utcnow()
         if fetched_at.tzinfo is None or fetched_at.utcoffset() is None:

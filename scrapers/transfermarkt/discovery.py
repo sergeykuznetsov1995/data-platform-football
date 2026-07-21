@@ -1957,6 +1957,9 @@ class TransfermarktCompetitionDiscovery:
         edition_documents: dict[
             tuple[str, str], _Document | _JsonDocument
         ] = {}
+        participant_documents: dict[
+            tuple[str, str], _Document | _JsonDocument
+        ] = {}
         participants_by_edition: dict[
             tuple[str, str], tuple[_ParticipantCandidate, ...]
         ] = {}
@@ -1998,16 +2001,20 @@ class TransfermarktCompetitionDiscovery:
                 edition_source_url = _edition_url(candidate.profile_url, edition_id)
                 if self._fetch_json is not None:
                     edition_document = api_regulation_documents[competition_id]
+                    participant_document = self._get_json(
+                        _participants_url(competition_id, edition_id),
+                        endpoint="competition_participants",
+                    )
                     exact_ids = _api_participant_ids(
-                        self._get_json(
-                            _participants_url(competition_id, edition_id),
-                            endpoint="competition_participants",
-                        ),
+                        participant_document,
                         competition_id=competition_id,
                         edition_id=edition_id,
                         limit=self._limits.participants_per_edition,
                     )
                     participant_ids_by_edition[(competition_id, edition_id)] = exact_ids
+                    participant_documents[(competition_id, edition_id)] = (
+                        participant_document
+                    )
                     participant_count += len(exact_ids)
                 else:
                     if current:
@@ -2161,8 +2168,16 @@ class TransfermarktCompetitionDiscovery:
                         source_url=item.source_url,
                         discovered_at=discovered_at,
                         registry_snapshot_id=snapshot_id,
-                        source_body_hash=edition_document.source_body_hash,
-                        raw_capture_id=edition_document.raw_capture_id,
+                        source_body_hash=(
+                            participant_documents[(competition_id, edition_id)].source_body_hash
+                            if self._fetch_json is not None
+                            else edition_document.source_body_hash
+                        ),
+                        raw_capture_id=(
+                            participant_documents[(competition_id, edition_id)].raw_capture_id
+                            if self._fetch_json is not None
+                            else edition_document.raw_capture_id
+                        ),
                         parser_revision=PARSER_REVISION,
                         schema_revision=SCHEMA_REVISION,
                     )

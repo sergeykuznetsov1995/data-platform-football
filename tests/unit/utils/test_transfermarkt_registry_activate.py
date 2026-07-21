@@ -78,6 +78,7 @@ class _Cursor:
                 'blocked_competition_count': 0,
                 'orphan_edition_count': 0,
                 'orphan_participant_count': 0,
+                'participant_count_mismatch_count': 0,
                 'raw_lineage_violation_count': 0,
             }
             self.description = tuple((name,) for name in values)

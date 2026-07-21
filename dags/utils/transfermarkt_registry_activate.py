@@ -147,6 +147,10 @@ def _dq_sql(state: ActiveRegistry) -> str:
 ), participants AS (
     SELECT * FROM {PARTICIPANTS_TABLE}
     WHERE registry_snapshot_id = {snapshot}
+), participant_counts AS (
+    SELECT competition_id, edition_id, count(*) AS actual_count
+    FROM participants
+    GROUP BY competition_id, edition_id
 ), raw_hashes AS (
     SELECT DISTINCT content_hash FROM {RAW_RESPONSES_TABLE}
     WHERE outcome IN ('ok', 'authoritative_empty')
@@ -175,6 +179,12 @@ SELECT
          WHERE e.competition_id = p.competition_id
            AND e.edition_id = p.edition_id
      )) AS orphan_participant_count,
+    (SELECT count(*) FROM editions e
+     LEFT JOIN participant_counts pc
+       ON pc.competition_id = e.competition_id
+      AND pc.edition_id = e.edition_id
+     WHERE coalesce(pc.actual_count, 0) <> coalesce(e.participant_count, 0)
+    ) AS participant_count_mismatch_count,
     (SELECT count(*) FROM competitions c
      WHERE NOT EXISTS (
          SELECT 1 FROM raw_hashes r WHERE r.content_hash = c.source_body_hash
@@ -300,6 +310,7 @@ def apply_activation(plan: RegistryActivationPlan, connection: Any) -> ActiveReg
             'blocked_competition_count': 0,
             'orphan_edition_count': 0,
             'orphan_participant_count': 0,
+            'participant_count_mismatch_count': 0,
             'raw_lineage_violation_count': 0,
         }
         if {key: int(dq.get(key, -1)) for key in expected} != expected:
