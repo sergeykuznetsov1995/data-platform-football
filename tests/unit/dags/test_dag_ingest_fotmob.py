@@ -175,6 +175,22 @@ class TestDynamicDiscoveryDag:
 
 class TestNativeValidation:
     @pytest.mark.unit
+    def test_legacy_or_missing_mode_is_rejected(self, tmp_path):
+        import json
+
+        from airflow.exceptions import AirflowException
+
+        mod = _reload_dag_module()
+        report = tmp_path / "report.json"
+        report.write_text(
+            json.dumps({"status": "success", "rows": {"schedule": 1}}),
+            encoding="utf-8",
+        )
+
+        with pytest.raises(AirflowException, match="native mode is required"):
+            mod.validate_data(str(report))
+
+    @pytest.mark.unit
     def test_incomplete_native_report_fails(self, tmp_path):
         import json
 
@@ -248,3 +264,12 @@ class TestNativeValidation:
 
         assert validation["status"] == "success"
         assert validation["transport"]["proxy_bytes"] == 0
+
+
+class TestSilverDependency:
+    @pytest.mark.unit
+    def test_ingest_waits_for_silver_before_master_can_start_xref(self):
+        mod = _reload_dag_module()
+
+        assert mod.trigger_silver._init_kwargs["wait_for_completion"] is True
+        assert mod.trigger_silver._init_kwargs["poke_interval"] == 30

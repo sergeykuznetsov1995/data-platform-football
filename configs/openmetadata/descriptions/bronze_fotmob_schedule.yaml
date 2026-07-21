@@ -4,6 +4,9 @@
 table:
   fullyQualifiedName: trino_iceberg.iceberg.bronze.fotmob_schedule
   description: |
+    ЗАМОРОЖЕННЫЙ LEGACY-АРХИВ: запись остановлена 2026-07-21 после #930;
+    рабочая замена — fotmob_matches_current. Таблица сохранена только как
+    rollback-опора и не является выходом текущего dag_ingest_fotmob.
     Сырое расписание матчей из FotMob (endpoint /api/data/leagues через
     scrapers/fotmob + dag_ingest_fotmob). Grain — один row на матч, включая
     несыгранные. Несёт команды с FotMob team_id, счёт, тур и флаг завершённости.

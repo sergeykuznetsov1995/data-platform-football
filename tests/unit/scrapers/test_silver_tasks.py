@@ -245,6 +245,30 @@ class TestRunSilverTransform:
         assert "partitioning = ARRAY['league', 'season']" in ctas_sql
         assert "SELECT 1 AS league, 2 AS season" in ctas_sql
 
+    def test_renders_canonical_fotmob_league_map(self, tmp_path):
+        sql_file = tmp_path / "fotmob.sql"
+        sql_file.write_text(
+            "WITH league_map(competition_id, league) AS (\n"
+            "  VALUES\n"
+            "    {{ fotmob_league_map_values_sql }}\n"
+            ") SELECT * FROM league_map"
+        )
+        mock_conn, mock_cursor = self._make_conn(
+            fetchall_side_effect=[[], [], [[14]]]
+        )
+
+        self._run_transform(
+            mock_conn,
+            sql_file,
+            table_name="fotmob_map",
+            trino_host="localhost",
+        )
+
+        ctas_sql = mock_cursor.execute.call_args_list[1][0][0]
+        assert "(47, 'ENG-Premier League')" in ctas_sql
+        assert "(44, 'INT-Copa America')" in ctas_sql
+        assert "{{ fotmob_league_map_values_sql }}" not in ctas_sql
+
     def test_empty_sql_raises(self, tmp_path):
         sql_file = tmp_path / "empty.sql"
         sql_file.write_text("")

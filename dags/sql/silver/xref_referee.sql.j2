@@ -60,14 +60,12 @@
 
 WITH league_map(competition_id, league) AS (
     -- #930 cutover: native fotmob_* tables carry competition_id, not the
-    -- legacy `league` string. Reverse map of FotMobScraper.LEAGUE_IDS; the
+    -- legacy `league` string. The reverse map is generated from
+    -- configs/fotmob/competitions.json; the
     -- INNER JOIN in the fotmob branch below doubles as the scope guard that
     -- keeps the Silver surface at the same 14 leagues legacy bronze carried.
-    VALUES (47,'ENG-Premier League'),(48,'ENG-Championship'),(87,'ESP-La Liga'),
-           (54,'GER-Bundesliga'),(55,'ITA-Serie A'),(53,'FRA-Ligue 1'),
-           (57,'NED-Eredivisie'),(61,'POR-Primeira Liga'),(42,'UEFA-Champions League'),
-           (73,'UEFA-Europa League'),(77,'INT-World Cup'),(50,'INT-European Championship'),
-           (289,'INT-Africa Cup of Nations'),(44,'INT-Copa America')
+    VALUES
+        {{ fotmob_league_map_values_sql }}
 ),
 
 aliases AS (

@@ -1088,36 +1088,39 @@ def _fetch_fotmob_players(
     seasons. primary_team = the team with the most appearances that season
     (max_by) so a mid-season transfer maps to its dominant club.
 
-    The minutes-played signal still comes from ``bronze.fotmob_player_stats``
-    (participant_id == fotmob player id, so the join matches the lineup
-    player_id historically too). Used for the senior-appearance signal<=0
-    filter (#563) and the _dedup_canonical_per_season tiebreaker (#70).
+    The minutes-played signal comes from the native-backed
+    ``silver.fotmob_player_season_profile`` (outfield) plus its
+    ``silver.fotmob_keeper_profile`` sibling. It is used for the
+    senior-appearance signal<=0 filter (#563) and the
+    _dedup_canonical_per_season tiebreaker (#70). Reading the Silver contract
+    avoids freezing the resolver on the stopped legacy FotMob feed; the Silver
+    profile itself does not consume xref_player, so this adds no dependency
+    cycle.
 
-    fotmob_lineup.season is already a slug ('2526'); convert the incoming
-    FBref-style year list to slugs for the filter. player_stats season is a
-    bigint year-of-start → fold to a slug in-query so the minutes join aligns.
+    Both FotMob Silver tables already expose season slugs ('2526'); convert the
+    incoming FBref-style year list once for both filters.
     """
     season_slugs = [_fbref_year_to_slug(y, league=league) for y in fbref_seasons]
     sql = f"""
-        WITH stats_slug AS (
-            SELECT
-                CAST(participant_id AS VARCHAR) AS player_id,
-                league,
-                -- #913 Phase 2: single_year (WC stores full year in bronze)
-                CASE WHEN league = 'INT-World Cup'
-                     THEN LPAD(CAST(season AS varchar), 4, '0')
-                     ELSE LPAD(CAST(MOD(season, 100) AS varchar), 2, '0')
-                          || LPAD(CAST(MOD(season + 1, 100) AS varchar), 2, '0')
-                END AS season,
-                minutes_played
-            FROM iceberg.bronze.fotmob_player_stats
+        WITH mins_source AS (
+            SELECT CAST(player_id AS varchar) AS player_id, league, season,
+                   minutes_played
+            FROM iceberg.silver.fotmob_player_season_profile
             WHERE league = '{_sql_escape(league)}'
-              AND season IN ({_seasons_in_clause(fbref_seasons)})
+              AND season IN ({_seasons_in_clause(season_slugs)})
+
+            UNION ALL
+
+            SELECT CAST(player_id AS varchar) AS player_id, league, season,
+                   minutes_played
+            FROM iceberg.silver.fotmob_keeper_profile
+            WHERE league = '{_sql_escape(league)}'
+              AND season IN ({_seasons_in_clause(season_slugs)})
         ),
         mins AS (
             SELECT player_id, league, season,
                    MAX(minutes_played) AS minutes_played
-            FROM stats_slug
+            FROM mins_source
             GROUP BY player_id, league, season
         ),
         per_team AS (
@@ -1527,14 +1530,15 @@ def _fetch_espn_players(
 
 
 # ---------------------------------------------------------------------------
-# Bronze DOB readers (cross-source corroboration, tier name_team_dob)
+# Source DOB readers (cross-source corroboration, tier name_team_dob)
 # ---------------------------------------------------------------------------
 # DOB is a time-invariant attribute → each map is keyed by source_id only
-# (no season), taking the freshest Bronze value via max_by(..., _ingested_at).
+# (no season), taking the freshest stable-source value via max_by(..., lineage).
 # Every reader degrades to an empty map on ANY error (missing table, absent
 # column) — the DOB feature is strictly additive and must never fail a run.
-# Bronze only: silver profile tables JOIN xref_player themselves, so reading
-# them here would create a wrong-link feedback loop (see module docstring).
+# FotMob is the exception to the raw-reader pattern: its native-backed Silver
+# player profile does not JOIN xref_player, so it is safe and avoids the frozen
+# legacy squad feed. Other readers remain source-native/canonical as noted.
 
 
 def _fetch_dob_map(conn, sql: str, source: str) -> Dict[str, Any]:
@@ -1562,13 +1566,14 @@ def _fetch_dob_maps(
     lg = _sql_escape(league)
     seasons = _seasons_in_clause(source_seasons)
     queries = {
-        # date_of_birth is a varchar passthrough (ISO) — TRY_CAST like
-        # gold/dim_player.sql.j2 does.
+        # date_of_birth is a varchar passthrough (ISO). The Silver profile is
+        # native-backed and independent of xref_player (no dependency cycle).
         'fotmob': f"""
             SELECT CAST(player_id AS varchar),
-                   max_by(TRY_CAST(date_of_birth AS DATE), _ingested_at)
-            FROM iceberg.bronze.fotmob_team_squad
-            WHERE league = '{lg}' AND player_id IS NOT NULL
+                   max_by(TRY_CAST(date_of_birth AS DATE), _bronze_ingested_at)
+            FROM iceberg.silver.fotmob_player_profile
+            WHERE league = '{lg}' AND season IN ({seasons})
+              AND player_id IS NOT NULL AND date_of_birth IS NOT NULL
             GROUP BY CAST(player_id AS varchar)
         """,
         'sofascore': """
@@ -2614,9 +2619,9 @@ def run_resolver(
         es = _fetch_espn_players(conn, league, source_seasons)
         logger.info("  %d ESPN players", len(es))
 
-        # DOB corroboration input — annotate candidates with their Bronze
+        # DOB corroboration input — annotate candidates with their source
         # date-of-birth (in-memory field like bronze_signal; never written).
-        logger.info("Reading Bronze DOB maps ...")
+        logger.info("Reading source DOB maps ...")
         dob_maps = _fetch_dob_maps(conn, league, source_seasons)
         candidates_with_dob = 0
         for src_rows, src in (

@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "competitions": [
+    {"league": "ENG-Premier League", "competition_id": 47},
+    {"league": "ENG-Championship", "competition_id": 48},
+    {"league": "ESP-La Liga", "competition_id": 87},
+    {"league": "GER-Bundesliga", "competition_id": 54},
+    {"league": "ITA-Serie A", "competition_id": 55},
+    {"league": "FRA-Ligue 1", "competition_id": 53},
+    {"league": "NED-Eredivisie", "competition_id": 57},
+    {"league": "POR-Primeira Liga", "competition_id": 61},
+    {"league": "UEFA-Champions League", "competition_id": 42},
+    {"league": "UEFA-Europa League", "competition_id": 73},
+    {"league": "INT-World Cup", "competition_id": 77},
+    {"league": "INT-European Championship", "competition_id": 50},
+    {"league": "INT-Africa Cup of Nations", "competition_id": 289},
+    {"league": "INT-Copa America", "competition_id": 44}
+  ]
+}

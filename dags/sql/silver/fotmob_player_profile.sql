@@ -4,7 +4,8 @@
 --
 -- Time-invariant snapshot per (player_id, league, season). Хранит атрибуты
 -- игрока, которые не меняются в течение сезона: рост, дата рождения,
--- национальность, ведущая нога, номер на футболке.
+-- национальность, ведущая нога, номер на футболке. `is_current_season`
+-- отличает живой roster scope от исторической leaderboard-реконструкции.
 --
 -- Zerno: (player_id, league, season). Симметрично с silver.fotmob_player_season_profile
 -- и silver.fotmob_keeper_profile. Для одного игрока в одном сезоне — один row;
@@ -56,27 +57,15 @@ WITH
 -- ============================================================================
 -- [CUTOVER-FRAMEWORK #930] Сезонный скоуп для глобальных native-снапшотов.
 -- Синхронизируемая копия: НЕ менять имена CTE и выражение season-слага.
--- Источник истины: /root/fotmob-runtime/cutover-framework.md
+-- League-map source of truth: configs/fotmob/competitions.json.
+-- Season-scope framework reference: /root/fotmob-runtime/cutover-framework.md
 -- ============================================================================
 
 -- 1) Обратная карта competition_id -> legacy league. INNER JOIN к ней — это
 --    ОДНОВРЕМЕННО скоуп-фильтр 14 лиг (native-каталог шире; см. пределы).
 league_map (competition_id, league) AS (
     VALUES
-        (47,  'ENG-Premier League'),
-        (48,  'ENG-Championship'),
-        (87,  'ESP-La Liga'),
-        (54,  'GER-Bundesliga'),
-        (55,  'ITA-Serie A'),
-        (53,  'FRA-Ligue 1'),
-        (57,  'NED-Eredivisie'),
-        (61,  'POR-Primeira Liga'),
-        (42,  'UEFA-Champions League'),
-        (73,  'UEFA-Europa League'),
-        (77,  'INT-World Cup'),
-        (50,  'INT-European Championship'),
-        (289, 'INT-Africa Cup of Nations'),
-        (44,  'INT-Copa America')
+        {{ fotmob_league_map_values_sql }}
 ),
 
 -- 2) Ось сезонов: (competition_id, source_season_key) -> (league, season)
@@ -137,6 +126,7 @@ squad_scope AS (
         ts.season,
         ts.competition_id,
         ts.source_season_key,
+        ts.is_current_season,
         ts.team_id,                        -- bigint
         sq.member_id,                      -- varchar (= legacy player_id в varchar)
         sq.member_type                     -- 'player' | 'coach' (live: только эти два)
@@ -155,6 +145,7 @@ lb_player_scope AS (
         sa.season,
         sa.competition_id,
         sa.source_season_key,
+        sa.is_current_season,
         lb.team_id,                            -- bigint: клуб игрока в сезоне
         CAST(lb.participant_id AS varchar)     AS member_id
     FROM iceberg.bronze.fotmob_leaderboards_current lb
@@ -169,14 +160,16 @@ lb_player_scope AS (
 --    выносится (между ветками может отличаться при переходе внутри сезона) —
 --    клуб потребители берут из своей ветки (squad_scope / lb_player_scope).
 player_scope AS (
-    SELECT DISTINCT league, season, competition_id, source_season_key, player_id
+    SELECT DISTINCT league, season, competition_id, source_season_key,
+                    is_current_season, player_id
     FROM (
         SELECT league, season, competition_id, source_season_key,
-               member_id AS player_id
+               is_current_season, member_id AS player_id
         FROM squad_scope
         WHERE member_type = 'player'
         UNION ALL
-        SELECT league, season, competition_id, source_season_key, member_id
+        SELECT league, season, competition_id, source_season_key,
+               is_current_season, member_id
         FROM lb_player_scope
     )
 ),
@@ -219,7 +212,8 @@ coach_scope AS (
 -- ============================================================================
 
 details_dedup AS (
-    SELECT sc.league AS league, sc.season AS season, ps.*,
+    SELECT sc.league AS league, sc.season AS season,
+           sc.is_current_season AS scope_is_current_season, ps.*,
            ROW_NUMBER() OVER (
                PARTITION BY ps.player_id, sc.league, sc.season
                ORDER BY ps._observed_at DESC, ps._target_batch_id DESC
@@ -329,6 +323,11 @@ SELECT
     )                                                AS foot,
 
     CAST(s.shirt_number AS INTEGER)                  AS shirt_number,
+
+    -- TRUE only for the selected/latest native season. Historical rows are
+    -- leaderboard-scoped and cannot honestly inherit live-roster attributes
+    -- such as height; DQ coverage uses this flag to measure like with like.
+    d.scope_is_current_season                        AS is_current_season,
 
     -- ========= Lineage =========
     -- Native lineage: _observed_at (в native `_ingested_at`-семантику несёт

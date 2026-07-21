@@ -1,0 +1,44 @@
+# =============================================================================
+# OpenMetadata description: iceberg.silver.fotmob_manager_profile
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.fotmob_manager_profile
+  description: |
+    Текущий сезонный профиль тренеров FotMob — один row на
+    (player_id, league, season), где player_id является stable coachId.
+    Обязательный driver — manifest-backed
+    bronze.fotmob_squad_snapshots_current с member_type='coach': member_id,
+    member_name, date_of_birth и country из member_json $.cname. Глобальный
+    player_snapshots_current подключается только LEFT-fallback для пустых
+    name/birth_date; отсутствие player snapshot не удаляет тренера. League и
+    season реконструируются через competition_seasons_current и
+    season_teams_current только для selected/latest сезона. Профиль не читает
+    xref_manager/xref_player и безопасен как upstream identity/DOB source.
+  tags:
+    - Tier.Silver
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: player_id
+    description: FotMob squad member_id / stable coachId; совпадает с silver.xref_manager.source_id для source='fotmob'.
+  - name: name
+    description: Имя тренера из squad member_name; optional player snapshot fallback.
+    tags:
+      - PII.Low
+  - name: date_of_birth
+    description: Дата рождения varchar ISO из squad; optional player snapshot birth_date fallback.
+    tags:
+      - PII.Low
+  - name: nationality
+    description: Страна из squad member_json $.cname.
+    tags:
+      - PII.Low
+  - name: _bronze_ingested_at
+    description: Native squad _observed_at; lineage timestamp обязательного driver row.
+  - name: league
+    description: Лига текущего roster scope.
+  - name: season
+    description: Нормализованный season slug из native season axis.
+  - name: _silver_created_at
+    description: Технический timestamp создания строки, добавляемый Silver CTAS runner.
+relationships: []

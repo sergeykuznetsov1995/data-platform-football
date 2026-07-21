@@ -44,7 +44,11 @@ def validate_data(
             f"Invalid FotMob report JSON at {result_path}: {exc}"
         ) from exc
 
-    mode = str(result.get("mode") or "legacy")
+    mode = str(result.get("mode") or "")
+    if mode not in NATIVE_MODES:
+        raise AirflowException(
+            f"Unsupported FotMob report mode {mode!r}; native mode is required"
+        )
     if mode in NATIVE_MODES:
         operation_failures = []
         for operation in result.get("operations") or []:
@@ -127,21 +131,6 @@ def validate_data(
         }
         logger.info("FotMob native validation complete: %s", summary)
         return summary
-
-    # Additive compatibility for manually invoked legacy runner reports.
-    rows = result.get("rows") or {}
-    errors = list(result.get("errors") or [])
-    total_rows = sum(int(value or 0) for value in rows.values())
-    if errors or total_rows == 0:
-        raise AirflowException(
-            f"Incomplete legacy FotMob ingest: rows={total_rows}, errors={errors!r}"
-        )
-    return {
-        "status": "success",
-        "mode": "legacy",
-        "rows": rows,
-        "tables": result.get("tables") or [],
-    }
 
 
 def _should_transform(mode: str) -> bool:
@@ -243,7 +232,8 @@ python dags/scripts/run_fotmob_scraper.py \\
     trigger_silver = TriggerDagRunOperator(
         task_id="trigger_silver_transform",
         trigger_dag_id="dag_transform_fotmob_silver",
-        wait_for_completion=False,
+        wait_for_completion=True,
+        poke_interval=30,
         reset_dag_run=True,
     )
 

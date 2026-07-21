@@ -65,15 +65,16 @@ SILVER_TRANSFORMS = [
         'dags/sql/silver/fotmob_keeper_profile.sql',
         'fotmob_keeper_profile',
     ),
-    # issue #434: тренеры (WHERE is_coach) — nationality/dob для gold.dim_manager.
-    # Зеркало player_profile; coachId (player_id) совпадает с xref_manager.source_id.
+    # issue #434/#930: current squad coach rows — nationality/dob для
+    # gold.dim_manager. coachId (member_id) совпадает с xref_manager.source_id;
+    # player snapshot is only an optional attribute fallback.
     (
         'manager_profile',
         'dags/sql/silver/fotmob_manager_profile.sql',
         'fotmob_manager_profile',
     ),
-    # issue #11: timeline market_value из bronze.fotmob_player_details
-    # .market_values_json (UNNEST). Питает gold.fct_player_market_value.
+    # issue #11/#930: timeline market_value из native
+    # player_snapshots_current.market_values_json (UNNEST).
     (
         'player_market_value_history',
         'dags/sql/silver/fotmob_player_market_value_history.sql',
@@ -279,7 +280,7 @@ def _validate_silver_quality(**context) -> Dict[str, Any]:
         # --- player_profile (time-invariant атрибуты: рост/dob/нация/foot) ---
         CHECK.no_nulls(
             'silver.fotmob_player_profile',
-            cols=['player_id', 'league', 'season'],
+            cols=['player_id', 'league', 'season', 'is_current_season'],
         ),
         CHECK.no_duplicates(
             'silver.fotmob_player_profile',
@@ -305,12 +306,14 @@ def _validate_silver_quality(**context) -> Dict[str, Any]:
         CHECK.coverage(
             'silver.fotmob_player_profile',
             column='height_cm',
+            where='is_current_season',
             warn_threshold=0.80,
             error_threshold=0.50,
         ),
         CHECK.coverage(
             'silver.fotmob_player_profile',
             column='foot',
+            where='is_current_season',
             warn_threshold=0.90,
             error_threshold=0.60,
         ),
@@ -353,6 +356,29 @@ def _validate_silver_quality(**context) -> Dict[str, Any]:
             'fotmob_rating',
             min_val=0,
             max_val=10,
+            severity='WARNING',
+        ),
+
+        # --- manager_profile (current squad coaches) ---
+        # The row-count gate intentionally duplicates SILVER_MIN_ROWS here:
+        # zero rows means the optional player-snapshot fallback accidentally
+        # became an INNER requirement again (#930 regression).
+        CHECK.no_nulls(
+            'silver.fotmob_manager_profile',
+            cols=['player_id', 'name', 'league', 'season'],
+        ),
+        CHECK.no_duplicates(
+            'silver.fotmob_manager_profile',
+            pk=['player_id', 'league', 'season'],
+        ),
+        CHECK.row_count(
+            'silver.fotmob_manager_profile',
+            min_rows=15,
+        ),
+        CHECK.freshness(
+            'silver.fotmob_manager_profile',
+            ts_col='_bronze_ingested_at',
+            max_age_hours=FRESH_HOURS,
             severity='WARNING',
         ),
 
@@ -699,23 +725,24 @@ with DAG(
 
     | Table | Description | Sources |
     |-------|-------------|---------|
-    | `fotmob_player_season_profile` | Полевые игроки per-season (без GK, без тренеров) | fotmob_player_details + fotmob_player_stats (PIVOTED) |
-    | `fotmob_player_profile` | Time-invariant snapshot: height_cm/dob/nationality/foot | fotmob_team_squad + fotmob_player_details (foot из JSON) |
-    | `fotmob_keeper_profile` | Вратари per-season с GK-stats | fotmob_player_details + fotmob_player_stats (PIVOTED) |
-    | `fotmob_team_match` | Per (match, team_id) team-level stats + xG/xA | fotmob_match_details.stats_json + .player_stats_json (SUM xA) — issue #97 Phase A |
-    | `fotmob_player_match_aggregate` | Per (match, player_id) stats (parity с SofaScore) | fotmob_match_details.player_stats_json — issue #691 |
-    | `fotmob_match_referee` | Per-match судья + страна (FotMob-only) | fotmob_match_details.match_facts_json ($.infoBox.Referee) — issue #290 |
-    | `fotmob_team_profile` | Профиль команды per-season (страна, стадион, позиция) | fotmob_team_profile — issue #600 |
-    | `fotmob_team_standings` | Турнирная таблица per-season (place/W/D/L/GF/GA/pts) | fotmob_team_stats — issue #600 |
-    | `fotmob_team_leaderboards` | Long-form командные лидерборды (rank + value per stat) | fotmob_team_leaderboards — issue #600 |
+    | `fotmob_player_season_profile` | Полевые игроки per-season (без GK, без тренеров) | player_snapshots_current + leaderboards_current (PIVOTED) |
+    | `fotmob_player_profile` | Time-invariant snapshot + is_current_season | squad_snapshots_current + player_snapshots_current (identity/foot) |
+    | `fotmob_keeper_profile` | Вратари per-season с GK-stats | player_snapshots_current + leaderboards_current (PIVOTED) |
+    | `fotmob_manager_profile` | Тренеры текущих составов: name/dob/nationality | squad_snapshots_current; optional player snapshot fallback |
+    | `fotmob_team_match` | Per (match, team_id) team-level stats + xG/xA | match_payloads_current.stats_json + .player_stats_json (SUM xA) — issue #97 Phase A |
+    | `fotmob_player_match_aggregate` | Per (match, player_id) stats (parity с SofaScore) | match_payloads_current.player_stats_json — issue #691 |
+    | `fotmob_match_referee` | Per-match судья + страна (FotMob-only) | match_payloads_current.match_facts_json ($.infoBox.Referee) — issue #290 |
+    | `fotmob_team_profile` | Профиль команды per-season (страна, стадион, позиция) | team_snapshots_current — issue #600 |
+    | `fotmob_team_standings` | Турнирная таблица per-season (place/W/D/L/GF/GA/pts) | standings_current — issue #600 |
+    | `fotmob_team_leaderboards` | Long-form командные лидерборды (rank + value per stat) | leaderboards_current — issue #600 |
     | `fotmob_transfers` | Трансферные события (player, clubs, fee, loan) | fotmob_transfers — issue #600 |
 
     ### Transformations
-    - **Dedup** на (player_id, league, season) через ROW_NUMBER + ORDER BY _ingested_at DESC
+    - **Dedup** на (player_id, league, season) через ROW_NUMBER + native lineage.
     - **PIVOT** stats из long в wide (~37 stat-колонок: Top Stat / Attacking / Defending / Discipline / Goalkeeping)
     - Только **per-season атрибуты** в identity-блоке (player_name, primary_position, primary_team_*).
       Time-invariant поля (birth_date/height/foot/country) и pass-through JSON не хранятся
-      здесь — уйдут в snapshot-таблицу `silver.fotmob_player_profile` (T4 backlog).
+      здесь — живут в snapshot-таблице `silver.fotmob_player_profile`.
 
     ### DQ Gates
     - PK uniqueness (player_id, league, season) — ERROR

@@ -128,35 +128,25 @@ EXPECTED_NULL: dict[str, set[str]] = {
         # auto-flatten always-empty `statisticsType` key (100% NULL, 533 rows).
         "statistics_type",
     },
-    # --- FotMob (#281) -------------------------------------------------------
-    # Originally 14 columns were 100% NULL live (verified 2026-06-04) in two
-    # classes: (a) upstream-missing — scraper emits the field but FotMob returns
-    # None for every in-scope row; (b) dead-legacy drift — the current scraper no
-    # longer emits the column, it survived only as an Iceberg schema remnant.
-    # The 10 dead-legacy columns were physically dropped via CTAS-rebuild (#304,
-    # scripts/drop_fotmob_dead_columns.py), so only the (a) upstream-missing
-    # entries remain allowlisted below.
+    # --- FotMob frozen legacy archive (#281, #930) ---------------------------
+    # These four tables stopped receiving writes on 2026-07-21. Their last-known
+    # physical shapes remain audited because they are rollback evidence (and
+    # fotmob_transfers is an intentional Silver history bridge), but they are
+    # not contracts for the source-native ``fotmob_*_current`` pipeline.
     "fotmob_team_stats": {
-        # (a) upstream-missing: read_team_season_stats writes team.get('form'),
-        # but FotMob's league table omits `form` for in-scope leagues.
+        # Last-known legacy source shape: league tables omitted `form`.
         "form",
     },
     "fotmob_team_leaderboards": {
-        # (a) upstream-shape: read_team_leaderboards maps item.get('TeamName')
-        # (scraper.py:716), but team-leaderboard items carry the team name in
-        # `ParticipantName` (-> participant_name) instead, so team_name is NULL.
+        # Last-known legacy source shape used participant_name, not team_name.
         "team_name",
     },
     "fotmob_transfers": {
-        # (a) upstream-missing: read_transfers derives fee_text from
-        # fee.fallback/fee.text (scraper.py:775); FotMob supplies only the
-        # numeric `fee_value` for in-scope transfers, so fee_text is NULL.
+        # Last-known legacy source shape supplied only numeric fee_value.
         "fee_text",
     },
     "fotmob_player_details": {
-        # (a) upstream-missing: read_player_details maps d.get('nextMatch')
-        # (scraper.py:988); the player __NEXT_DATA__ payload omits `nextMatch`
-        # for every squad player, so the column is 100% NULL.
+        # Last-known legacy player payload omitted nextMatch for squad players.
         "next_match_json",
     },
     # NB: no 'capology_player_salaries' entry — #320 allowlisted adjusted_total_*
