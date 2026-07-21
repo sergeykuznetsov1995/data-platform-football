@@ -63,7 +63,7 @@ _CANONICAL_SECTION = "startseite"
 # whenever parsing or classification changes — otherwise a restated catalogue
 # cannot be published over the snapshot id it would otherwise reuse.
 PARSER_REVISION = "tm-html-discovery-v3"
-SCHEMA_REVISION = "2"
+SCHEMA_REVISION = "3"
 # The catalogue states a competition's taxonomy at three levels: a broad section
 # heading, a group separator inside the tables, and the "National Team
 # Competitions" section, which names the entrants themselves — a table group can
@@ -972,8 +972,12 @@ def _selector_options(
     values: dict[str, tuple[str, bool, Mapping[str, Any]]] = {}
     for option in soup.select('select[name*="saison"] option[value]'):
         edition_id = _normalise_text(option.get("value"))
-        if re.fullmatch(r"\d{4}", edition_id) is None:
+        if not edition_id:
             continue
+        if re.fullmatch(r"\d{4}", edition_id) is None:
+            raise DiscoverySchemaError(
+                f"unrecognised edition selector value {edition_id!r}: {profile_url}"
+            )
         label = _normalise_text(option.get_text(" ", strip=True))
         selected = option.has_attr("selected")
         attrs = dict(option.attrs)
@@ -997,15 +1001,26 @@ def _selector_options(
                 if path_match
                 else query.get("saison_id", "")
             )
-            if re.fullmatch(r"\d{4}", edition_id) is None:
+            if not edition_id:
                 continue
+            if re.fullmatch(r"\d{4}", edition_id) is None:
+                raise DiscoverySchemaError(
+                    f"unrecognised edition selector value {edition_id!r}: "
+                    f"{profile_url}"
+                )
             label = _normalise_text(anchor.get_text(" ", strip=True))
-            if not edition_id or not label:
+            if not label:
                 continue
             selected = "active" in set(anchor.get("class", ())) or str(
                 anchor.get("aria-current", "")
             ).casefold() in {"true", "page"}
-            values[edition_id] = (label, selected, dict(anchor.attrs))
+            previous = values.get(edition_id)
+            current = (label, selected, dict(anchor.attrs))
+            if previous is not None and previous[:2] != current[:2]:
+                raise DiscoverySchemaError(
+                    f"conflicting edition selector {edition_id}: {profile_url}"
+                )
+            values[edition_id] = current
 
     if not values:
         values = _title_edition(soup, profile_url)

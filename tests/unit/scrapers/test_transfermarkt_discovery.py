@@ -301,6 +301,34 @@ def test_discovery_keeps_the_format_of_each_edition_when_it_changed() -> None:
     assert editions["1977"].season_format is SeasonFormat.SINGLE_YEAR
 
 
+def test_discovery_rejects_unknown_nonempty_edition_selector_values() -> None:
+    profile_url = BASE_URL + "/premier-league/startseite/wettbewerb/GB1"
+    profile = (
+        '<!doctype html><html lang="en"><body data-participants-empty="true">'
+        '<h1 data-competition-id="GB1">Premier League</h1>'
+        '<select name="saison_id"><option value="2025" selected>25/26</option>'
+        '<option value="all">All seasons</option></select></body></html>'
+    )
+
+    with pytest.raises(DiscoverySchemaError, match="selector value 'all'"):
+        _discover(fetch=FixtureFetch({profile_url: profile}))
+
+
+def test_discovery_rejects_conflicting_duplicate_link_selector_entries() -> None:
+    profile_url = BASE_URL + "/premier-league/startseite/wettbewerb/GB1"
+    profile = (
+        '<!doctype html><html lang="en"><body data-participants-empty="true">'
+        '<h1 data-competition-id="GB1">Premier League</h1>'
+        '<a class="active" href="/premier-league/startseite/wettbewerb/GB1/'
+        'saison_id/2025">25/26</a>'
+        '<a href="/premier-league/startseite/wettbewerb/GB1/saison_id/2025">'
+        '2025/26</a></body></html>'
+    )
+
+    with pytest.raises(DiscoverySchemaError, match="conflicting edition selector 2025"):
+        _discover(fetch=FixtureFetch({profile_url: profile}))
+
+
 def test_discovery_reads_a_cups_only_edition_from_its_title() -> None:
     cup = (
         '<!doctype html><html lang="en"><head>'

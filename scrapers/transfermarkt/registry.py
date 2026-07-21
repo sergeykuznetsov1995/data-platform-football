@@ -138,6 +138,15 @@ def _required_text(name: str, value: Any) -> str:
     return text
 
 
+def _optional_sha256(name: str, value: Any) -> Optional[str]:
+    if value in (None, ""):
+        return None
+    digest = str(value).strip()
+    if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        raise RegistryError(f"{name} must be a lowercase SHA-256 digest")
+    return digest
+
+
 def _compact_json(value: Any) -> str:
     return json.dumps(
         value,
@@ -357,6 +366,7 @@ class CompetitionRecord:
     evidence: tuple[ClassificationEvidence, ...] = field(default_factory=tuple)
     registry_snapshot_id: str = ""
     source_body_hash: str = ""
+    raw_capture_id: Optional[str] = None
     parser_revision: str = "registry-v1"
     schema_revision: str = "1"
     aliases: tuple[str, ...] = field(default_factory=tuple)
@@ -375,6 +385,11 @@ class CompetitionRecord:
             object.__setattr__(self, name, _enum_value(enum_type, getattr(self, name)))
         object.__setattr__(self, "active", bool(self.active))
         object.__setattr__(self, "discovered_at", _aware_datetime(self.discovered_at))
+        object.__setattr__(
+            self,
+            "raw_capture_id",
+            _optional_sha256("raw_capture_id", self.raw_capture_id),
+        )
         evidence = tuple(self.evidence)
         if not all(isinstance(item, ClassificationEvidence) for item in evidence):
             raise RegistryError("evidence must contain ClassificationEvidence")
@@ -437,6 +452,7 @@ class CompetitionRecord:
                 if source_body_hash is not None
                 else value.get("source_body_hash", "")
             ),
+            raw_capture_id=value.get("raw_capture_id"),
             parser_revision=value.get("parser_revision", "registry-v1"),
             schema_revision=value.get("schema_revision", "1"),
             aliases=tuple(value.get("aliases", ())),
@@ -596,6 +612,7 @@ class EditionRecord:
     discovered_at: datetime
     registry_snapshot_id: str = ""
     source_body_hash: str = ""
+    raw_capture_id: Optional[str] = None
     parser_revision: str = "registry-v1"
     schema_revision: str = "1"
 
@@ -633,6 +650,11 @@ class EditionRecord:
         object.__setattr__(self, "active", bool(self.active))
         object.__setattr__(self, "current", bool(self.current))
         object.__setattr__(self, "discovered_at", _aware_datetime(self.discovered_at))
+        object.__setattr__(
+            self,
+            "raw_capture_id",
+            _optional_sha256("raw_capture_id", self.raw_capture_id),
+        )
 
     @classmethod
     def from_mapping(
@@ -674,6 +696,7 @@ class EditionRecord:
                 if source_body_hash is not None
                 else value.get("source_body_hash", "")
             ),
+            raw_capture_id=value.get("raw_capture_id"),
             parser_revision=value.get("parser_revision", "registry-v1"),
             schema_revision=value.get("schema_revision", "1"),
         )
@@ -714,6 +737,7 @@ class CompetitionParticipant:
     discovered_at: datetime
     registry_snapshot_id: str = ""
     source_body_hash: str = ""
+    raw_capture_id: Optional[str] = None
     parser_revision: str = "registry-v1"
     schema_revision: str = "1"
 
@@ -727,6 +751,11 @@ class CompetitionParticipant:
         ):
             object.__setattr__(self, name, _required_text(name, getattr(self, name)))
         object.__setattr__(self, "discovered_at", _aware_datetime(self.discovered_at))
+        object.__setattr__(
+            self,
+            "raw_capture_id",
+            _optional_sha256("raw_capture_id", self.raw_capture_id),
+        )
 
     @classmethod
     def from_mapping(
@@ -753,6 +782,7 @@ class CompetitionParticipant:
                 if source_body_hash is not None
                 else value.get("source_body_hash", "")
             ),
+            raw_capture_id=value.get("raw_capture_id"),
             parser_revision=value.get("parser_revision", "registry-v1"),
             schema_revision=value.get("schema_revision", "1"),
         )
@@ -777,19 +807,15 @@ class CompetitionParticipant:
 def participant_list_hash(
     participants: Iterable[CompetitionParticipant],
 ) -> str:
-    """Hash an exact, order-independent participant list."""
+    """Hash edition membership by stable, order-independent team identity.
 
-    material = sorted(
-        (
-            {
-                "source_url": item.source_url,
-                "team_id": item.team_id,
-                "team_name": item.team_name,
-            }
-            for item in participants
-        ),
-        key=lambda item: (item["team_id"], item["team_name"], item["source_url"]),
-    )
+    Display names, slugs and profile tabs are mutable source presentation and
+    must not turn unchanged membership into a new edition aggregate.  Schema
+    revision 3 deliberately does not accept hashes produced by the former
+    name/URL-sensitive contract; snapshots using it must be regenerated.
+    """
+
+    material = sorted(item.team_id for item in participants)
     return hashlib.sha256(_compact_json(material).encode("utf-8")).hexdigest()
 
 
@@ -897,6 +923,13 @@ class RegistryPage:
         body_hash = _required_text(
             "source_body_hash", value.get("source_body_hash", "")
         )
+
+        def row_body_hash(item: Mapping[str, Any]) -> str:
+            row_hash = item.get("source_body_hash")
+            if row_hash is None or not str(row_hash).strip():
+                return body_hash
+            return str(row_hash)
+
         return cls(
             snapshot_id=snapshot_id,
             page_number=int(value.get("page_number", 0)),
@@ -907,7 +940,7 @@ class RegistryPage:
                 CompetitionRecord.from_mapping(
                     item,
                     registry_snapshot_id=snapshot_id,
-                    source_body_hash=body_hash,
+                    source_body_hash=row_body_hash(item),
                 )
                 for item in value.get("competitions", ())
             ),
@@ -915,7 +948,7 @@ class RegistryPage:
                 EditionRecord.from_mapping(
                     item,
                     registry_snapshot_id=snapshot_id,
-                    source_body_hash=body_hash,
+                    source_body_hash=row_body_hash(item),
                 )
                 for item in value.get("editions", ())
             ),
@@ -923,7 +956,7 @@ class RegistryPage:
                 CompetitionParticipant.from_mapping(
                     item,
                     registry_snapshot_id=snapshot_id,
-                    source_body_hash=body_hash,
+                    source_body_hash=row_body_hash(item),
                 )
                 for item in value.get("participants", ())
             ),
@@ -1088,11 +1121,10 @@ def reconcile_registry_pages(
         exact = participants_by_edition.get(
             (edition.competition_id, edition.edition_id), []
         )
-        # Serialized snapshots from before this table contract have aggregate
-        # fields but no participant rows. Keep them readable; whenever exact
-        # rows are present, their aggregate must agree.
-        if not exact:
-            continue
+        # Exact typed rows are authoritative, including an exact empty list.
+        # Aggregate-only snapshots predate this contract and are intentionally
+        # rejected: accepting them would make missing rows indistinguishable
+        # from a source edition with no participants. Regenerate them instead.
         if edition.participant_count != len(exact):
             raise RegistryConflictError(
                 "participant count mismatch for "
