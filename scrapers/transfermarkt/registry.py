@@ -86,6 +86,14 @@ class ClassificationStatus(str, Enum):
     CONFLICT = "conflict"
 
 
+class RegistryRowType(str, Enum):
+    """The source row contract represented by a reconciliation tombstone."""
+
+    COMPETITION = "competition"
+    EDITION = "edition"
+    PARTICIPANT = "participant"
+
+
 EnumT = TypeVar("EnumT", bound=Enum)
 
 
@@ -95,9 +103,7 @@ def _enum_value(enum_type: Type[EnumT], value: Any) -> EnumT:
     try:
         return enum_type(str(value).strip().lower())
     except (TypeError, ValueError) as exc:
-        raise RegistryError(
-            f"invalid {enum_type.__name__}: {value!r}"
-        ) from exc
+        raise RegistryError(f"invalid {enum_type.__name__}: {value!r}") from exc
 
 
 def _aware_datetime(value: Any) -> datetime:
@@ -165,9 +171,7 @@ def _split_year_bounds(raw: str) -> tuple[int, int]:
         else:
             end_year = int(end_text)
         if end_year != start_year + 1:
-            raise RegistryError(
-                f"split-year edition must span one year: {raw!r}"
-            )
+            raise RegistryError(f"split-year edition must span one year: {raw!r}")
         return start_year, end_year
 
     if re.fullmatch(r"(19|20|21)\d{2}", raw):
@@ -329,11 +333,7 @@ def narrowest_signals(
     if not stated:
         return set()
     narrowest = max(item.precedence for item in stated)
-    return {
-        getattr(item, dimension)
-        for item in stated
-        if item.precedence == narrowest
-    }
+    return {getattr(item, dimension) for item in stated if item.precedence == narrowest}
 
 
 @dataclass(frozen=True)
@@ -410,7 +410,9 @@ class CompetitionRecord:
             name=value.get("name", ""),
             country=value.get("country", ""),
             confederation=value.get("confederation", ""),
-            competition_type=value.get("competition_type", CompetitionType.UNKNOWN.value),
+            competition_type=value.get(
+                "competition_type", CompetitionType.UNKNOWN.value
+            ),
             gender=value.get("gender", Gender.UNKNOWN.value),
             team_type=value.get("team_type", TeamType.UNKNOWN.value),
             age_category=value.get("age_category", AgeCategory.UNKNOWN.value),
@@ -446,9 +448,7 @@ class CompetitionRecord:
         # nowhere else, which is why the U17 World Cup sits in the very section
         # that certifies its entrants as national teams. A name may therefore
         # exclude a competition from the crawl — it can never admit one.
-        named = [
-            item for item in self.evidence if item.origin is EvidenceOrigin.NAME
-        ]
+        named = [item for item in self.evidence if item.origin is EvidenceOrigin.NAME]
         name_exclusions = [
             f"{dimension}={getattr(item, dimension).value} (name)"
             for item in named
@@ -515,8 +515,7 @@ class CompetitionRecord:
         if missing:
             return (
                 ClassificationStatus.UNKNOWN,
-                "missing non-name source evidence: "
-                + ", ".join(sorted(set(missing))),
+                "missing non-name source evidence: " + ", ".join(sorted(set(missing))),
             )
 
         if self.gender is not Gender.MEN or self.age_category is not AgeCategory.SENIOR:
@@ -527,7 +526,10 @@ class CompetitionRecord:
             self.competition_type is CompetitionType.NATIONAL_TEAM_TOURNAMENT
             and self.team_type is not TeamType.NATIONAL_TEAM
         ):
-            return ClassificationStatus.CONFLICT, "national tournament has non-national teams"
+            return (
+                ClassificationStatus.CONFLICT,
+                "national tournament has non-national teams",
+            )
         return ClassificationStatus.ELIGIBLE, None
 
     @property
@@ -542,7 +544,9 @@ class CompetitionRecord:
 
     @property
     def crawl_eligible(self) -> bool:
-        return self.active and self.classification_status is ClassificationStatus.ELIGIBLE
+        return (
+            self.active and self.classification_status is ClassificationStatus.ELIGIBLE
+        )
 
     def as_dict(self) -> dict[str, Any]:
         """Return the exact Bronze registry row contract."""
@@ -641,7 +645,9 @@ class EditionRecord:
         season_format = _enum_value(
             SeasonFormat, value.get("season_format", SeasonFormat.UNKNOWN.value)
         )
-        label = value.get("edition_label", value.get("label", value.get("edition_id", "")))
+        label = value.get(
+            "edition_label", value.get("label", value.get("edition_id", ""))
+        )
         computed = canonical_season(label, season_format)
         supplied = value.get("canonical_season", computed)
         return cls(
@@ -694,6 +700,97 @@ class EditionRecord:
             "parser_revision": self.parser_revision,
             "schema_revision": self.schema_revision,
         }
+
+
+@dataclass(frozen=True)
+class CompetitionParticipant:
+    """One exact team membership in a discovered competition edition."""
+
+    competition_id: str
+    edition_id: str
+    team_id: str
+    team_name: str
+    source_url: str
+    discovered_at: datetime
+    registry_snapshot_id: str = ""
+    source_body_hash: str = ""
+    parser_revision: str = "registry-v1"
+    schema_revision: str = "1"
+
+    def __post_init__(self) -> None:
+        for name in (
+            "competition_id",
+            "edition_id",
+            "team_id",
+            "team_name",
+            "source_url",
+        ):
+            object.__setattr__(self, name, _required_text(name, getattr(self, name)))
+        object.__setattr__(self, "discovered_at", _aware_datetime(self.discovered_at))
+
+    @classmethod
+    def from_mapping(
+        cls,
+        value: Mapping[str, Any],
+        *,
+        registry_snapshot_id: Optional[str] = None,
+        source_body_hash: Optional[str] = None,
+    ) -> "CompetitionParticipant":
+        return cls(
+            competition_id=value.get("competition_id", ""),
+            edition_id=str(value.get("edition_id", "")),
+            team_id=str(value.get("team_id", "")),
+            team_name=value.get("team_name", value.get("name", "")),
+            source_url=value.get("source_url", ""),
+            discovered_at=value.get("discovered_at", ""),
+            registry_snapshot_id=(
+                registry_snapshot_id
+                if registry_snapshot_id is not None
+                else value.get("registry_snapshot_id", "")
+            ),
+            source_body_hash=(
+                source_body_hash
+                if source_body_hash is not None
+                else value.get("source_body_hash", "")
+            ),
+            parser_revision=value.get("parser_revision", "registry-v1"),
+            schema_revision=value.get("schema_revision", "1"),
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return the exact Bronze participant row contract."""
+
+        return {
+            "competition_id": self.competition_id,
+            "edition_id": self.edition_id,
+            "team_id": self.team_id,
+            "team_name": self.team_name,
+            "source_url": self.source_url,
+            "discovered_at": self.discovered_at.isoformat(),
+            "registry_snapshot_id": self.registry_snapshot_id,
+            "source_body_hash": self.source_body_hash,
+            "parser_revision": self.parser_revision,
+            "schema_revision": self.schema_revision,
+        }
+
+
+def participant_list_hash(
+    participants: Iterable[CompetitionParticipant],
+) -> str:
+    """Hash an exact, order-independent participant list."""
+
+    material = sorted(
+        (
+            {
+                "source_url": item.source_url,
+                "team_id": item.team_id,
+                "team_name": item.team_name,
+            }
+            for item in participants
+        ),
+        key=lambda item: (item["team_id"], item["team_name"], item["source_url"]),
+    )
+    return hashlib.sha256(_compact_json(material).encode("utf-8")).hexdigest()
 
 
 def deterministic_scope_id(competition_id: str, edition_id: str) -> str:
@@ -777,10 +874,15 @@ class RegistryPage:
     source_body_hash: str
     competitions: tuple[CompetitionRecord, ...]
     editions: tuple[EditionRecord, ...]
+    participants: tuple[CompetitionParticipant, ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "snapshot_id", _required_text("snapshot_id", self.snapshot_id))
-        object.__setattr__(self, "source_url", _required_text("source_url", self.source_url))
+        object.__setattr__(
+            self, "snapshot_id", _required_text("snapshot_id", self.snapshot_id)
+        )
+        object.__setattr__(
+            self, "source_url", _required_text("source_url", self.source_url)
+        )
         object.__setattr__(
             self,
             "source_body_hash",
@@ -817,6 +919,14 @@ class RegistryPage:
                 )
                 for item in value.get("editions", ())
             ),
+            participants=tuple(
+                CompetitionParticipant.from_mapping(
+                    item,
+                    registry_snapshot_id=snapshot_id,
+                    source_body_hash=body_hash,
+                )
+                for item in value.get("participants", ())
+            ),
         )
 
 
@@ -828,6 +938,7 @@ class RegistrySnapshot:
     competitions: tuple[CompetitionRecord, ...]
     editions: tuple[EditionRecord, ...]
     snapshot_hash: str
+    participants: tuple[CompetitionParticipant, ...] = field(default_factory=tuple)
 
     @property
     def blocked_competition_ids(self) -> tuple[str, ...]:
@@ -859,7 +970,9 @@ class RegistrySnapshot:
             for item in self.editions
             if item.active and item.competition_id in competitions
         ]
-        return tuple(sorted(scopes, key=lambda item: (item.competition_id, item.edition_id)))
+        return tuple(
+            sorted(scopes, key=lambda item: (item.competition_id, item.edition_id))
+        )
 
 
 def _insert_unique(
@@ -911,18 +1024,24 @@ def reconcile_registry_pages(
 
     competitions: dict[str, CompetitionRecord] = {}
     editions: dict[tuple[str, str], EditionRecord] = {}
+    participants: dict[tuple[str, str, str], CompetitionParticipant] = {}
     for page_number in sorted(by_page):
         page = by_page[page_number]
         for record in page.competitions:
-            _insert_unique(
-                competitions, record.competition_id, record, "competition"
-            )
+            _insert_unique(competitions, record.competition_id, record, "competition")
         for record in page.editions:
             _insert_unique(
                 editions,
                 (record.competition_id, record.edition_id),
                 record,
                 "edition",
+            )
+        for record in page.participants:
+            _insert_unique(
+                participants,
+                (record.competition_id, record.edition_id, record.team_id),
+                record,
+                "participant",
             )
 
     missing_parents = sorted(
@@ -933,8 +1052,22 @@ def reconcile_registry_pages(
             "editions reference undiscovered competitions: "
             + ", ".join(missing_parents)
         )
+    missing_participant_parents = sorted(
+        {(record.competition_id, record.edition_id) for record in participants.values()}
+        - set(editions)
+    )
+    if missing_participant_parents:
+        raise RegistryConflictError(
+            "participants reference undiscovered editions: "
+            + ", ".join(
+                f"{competition_id}/{edition_id}"
+                for competition_id, edition_id in missing_participant_parents
+            )
+        )
     if expected_competition_ids is not None:
-        expected_ids = {_required_text("competition_id", item) for item in expected_competition_ids}
+        expected_ids = {
+            _required_text("competition_id", item) for item in expected_competition_ids
+        }
         actual_ids = set(competitions)
         if actual_ids != expected_ids:
             raise IncompleteSnapshotError(
@@ -945,10 +1078,37 @@ def reconcile_registry_pages(
 
     competition_rows = tuple(competitions[key] for key in sorted(competitions))
     edition_rows = tuple(editions[key] for key in sorted(editions))
+    participant_rows = tuple(participants[key] for key in sorted(participants))
+    participants_by_edition: dict[tuple[str, str], list[CompetitionParticipant]] = {}
+    for participant in participant_rows:
+        participants_by_edition.setdefault(
+            (participant.competition_id, participant.edition_id), []
+        ).append(participant)
+    for edition in edition_rows:
+        exact = participants_by_edition.get(
+            (edition.competition_id, edition.edition_id), []
+        )
+        # Serialized snapshots from before this table contract have aggregate
+        # fields but no participant rows. Keep them readable; whenever exact
+        # rows are present, their aggregate must agree.
+        if not exact:
+            continue
+        if edition.participant_count != len(exact):
+            raise RegistryConflictError(
+                "participant count mismatch for "
+                f"{edition.competition_id}/{edition.edition_id}: "
+                f"edition={edition.participant_count}, rows={len(exact)}"
+            )
+        if edition.participant_hash != participant_list_hash(exact):
+            raise RegistryConflictError(
+                "participant hash mismatch for "
+                f"{edition.competition_id}/{edition.edition_id}"
+            )
     page_hashes = tuple(by_page[number].source_body_hash for number in sorted(by_page))
     digest_payload = {
         "competitions": [item.as_dict() for item in competition_rows],
         "editions": [item.as_dict() for item in edition_rows],
+        "participants": [item.as_dict() for item in participant_rows],
         "page_hashes": page_hashes,
         "snapshot_id": next(iter(snapshot_ids)),
     }
@@ -962,6 +1122,133 @@ def reconcile_registry_pages(
         competitions=competition_rows,
         editions=edition_rows,
         snapshot_hash=snapshot_hash,
+        participants=participant_rows,
+    )
+
+
+@dataclass(frozen=True)
+class RegistryTombstone:
+    """A row present in one complete snapshot and absent from the next."""
+
+    row_type: RegistryRowType
+    competition_id: str
+    edition_id: Optional[str]
+    team_id: Optional[str]
+    last_seen_snapshot_id: str
+    missing_from_snapshot_id: str
+    reconciled_at: datetime
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "row_type", _enum_value(RegistryRowType, self.row_type)
+        )
+        object.__setattr__(
+            self,
+            "competition_id",
+            _required_text("competition_id", self.competition_id),
+        )
+        if self.edition_id is not None:
+            object.__setattr__(
+                self, "edition_id", _required_text("edition_id", self.edition_id)
+            )
+        if self.team_id is not None:
+            object.__setattr__(self, "team_id", _required_text("team_id", self.team_id))
+        object.__setattr__(
+            self,
+            "last_seen_snapshot_id",
+            _required_text("last_seen_snapshot_id", self.last_seen_snapshot_id),
+        )
+        object.__setattr__(
+            self,
+            "missing_from_snapshot_id",
+            _required_text("missing_from_snapshot_id", self.missing_from_snapshot_id),
+        )
+        object.__setattr__(self, "reconciled_at", _aware_datetime(self.reconciled_at))
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "row_type": self.row_type.value,
+            "competition_id": self.competition_id,
+            "edition_id": self.edition_id,
+            "team_id": self.team_id,
+            "last_seen_snapshot_id": self.last_seen_snapshot_id,
+            "missing_from_snapshot_id": self.missing_from_snapshot_id,
+            "reconciled_at": self.reconciled_at.isoformat(),
+        }
+
+
+def reconcile_registry_tombstones(
+    previous: RegistrySnapshot,
+    current: RegistrySnapshot,
+    *,
+    reconciled_at: datetime,
+) -> tuple[RegistryTombstone, ...]:
+    """Return deterministic tombstones between two complete snapshots.
+
+    Applying the result to a database remains an explicit consumer concern.
+    """
+
+    if previous.snapshot_id == current.snapshot_id:
+        if previous.snapshot_hash != current.snapshot_hash:
+            raise RegistryConflictError(
+                "the same snapshot ID cannot have different snapshot hashes"
+            )
+        return ()
+    observed_at = _aware_datetime(reconciled_at)
+    previous_keys = {
+        (RegistryRowType.COMPETITION, item.competition_id, None, None)
+        for item in previous.competitions
+    }
+    previous_keys.update(
+        (RegistryRowType.EDITION, item.competition_id, item.edition_id, None)
+        for item in previous.editions
+    )
+    previous_keys.update(
+        (
+            RegistryRowType.PARTICIPANT,
+            item.competition_id,
+            item.edition_id,
+            item.team_id,
+        )
+        for item in previous.participants
+    )
+    current_keys = {
+        (RegistryRowType.COMPETITION, item.competition_id, None, None)
+        for item in current.competitions
+    }
+    current_keys.update(
+        (RegistryRowType.EDITION, item.competition_id, item.edition_id, None)
+        for item in current.editions
+    )
+    current_keys.update(
+        (
+            RegistryRowType.PARTICIPANT,
+            item.competition_id,
+            item.edition_id,
+            item.team_id,
+        )
+        for item in current.participants
+    )
+    row_order = {
+        RegistryRowType.COMPETITION: 0,
+        RegistryRowType.EDITION: 1,
+        RegistryRowType.PARTICIPANT: 2,
+    }
+    missing = sorted(
+        previous_keys - current_keys,
+        key=lambda item: (row_order[item[0]], item[1], item[2] or "", item[3] or ""),
+    )
+    return tuple(
+        RegistryTombstone(
+            row_type=row_type,
+            competition_id=competition_id,
+            edition_id=edition_id,
+            team_id=team_id,
+            last_seen_snapshot_id=previous.snapshot_id,
+            missing_from_snapshot_id=current.snapshot_id,
+            reconciled_at=observed_at,
+        )
+        for row_type, competition_id, edition_id, team_id in missing
     )
 
 
@@ -1216,6 +1503,7 @@ __all__ = [
     "BOOTSTRAP_COMPETITIONS",
     "ClassificationEvidence",
     "ClassificationStatus",
+    "CompetitionParticipant",
     "CompetitionRecord",
     "CompetitionType",
     "CrawlScope",
@@ -1226,13 +1514,17 @@ __all__ = [
     "RegistryConflictError",
     "RegistryError",
     "RegistryPage",
+    "RegistryRowType",
     "RegistrySnapshot",
+    "RegistryTombstone",
     "SeasonFormat",
     "TeamType",
     "UnknownCompetitionError",
     "UnsafeCrawlError",
     "canonical_season",
     "deterministic_scope_id",
+    "participant_list_hash",
     "reconcile_registry_pages",
+    "reconcile_registry_tombstones",
     "resolve_competition",
 ]
