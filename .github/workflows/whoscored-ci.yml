@@ -392,8 +392,10 @@ jobs:
             --load \
             -t data-platform-airflow-scheduler-payload:provenance-ci \
             docker/images/airflow
-          scheduler_tag=127.0.0.1:5000/data-platform-airflow-scheduler:provenance-ci
-          proxy_tag=127.0.0.1:5000/data-platform-airflow-whoscored-proxy:provenance-ci
+          scheduler_repository=127.0.0.1:5000/data-platform-airflow-scheduler
+          proxy_repository=127.0.0.1:5000/data-platform-airflow-whoscored-proxy
+          scheduler_tag="$scheduler_repository:provenance-ci"
+          proxy_tag="$proxy_repository:provenance-ci"
           BUILDX_GIT_CHECK_DIRTY=1 BUILDX_METADATA_PROVENANCE=max \
           buildx_build \
             --builder "$WHOSCORED_CI_BUILDER" \
@@ -419,16 +421,13 @@ jobs:
             /tmp/whoscored-build-metadata/airflow-scheduler.json)"
           proxy_digest="$(jq -er '."containerimage.digest"' \
             /tmp/whoscored-build-metadata/airflow-whoscored-proxy.json)"
-          scheduler="$scheduler_tag@$scheduler_digest"
-          proxy="$proxy_tag@$proxy_digest"
+          scheduler="$scheduler_repository@$scheduler_digest"
+          proxy="$proxy_repository@$proxy_digest"
           docker pull "$scheduler"
           docker pull "$proxy"
           {
-            # Real-Docker unit tests derive a sibling tag with rsplit(':', 1),
-            # so publish the pulled tag while this gate continues to run the
-            # exact immutable refs above.
-            echo "WHOSCORED_SCHEDULER_IMAGE=$scheduler_tag"
-            echo "WHOSCORED_PROXY_IMAGE=$proxy_tag"
+            echo "WHOSCORED_SCHEDULER_IMAGE=$scheduler"
+            echo "WHOSCORED_PROXY_IMAGE=$proxy"
           } >> "$GITHUB_ENV"
 
           sentinel="$(mktemp -d)"
@@ -608,8 +607,13 @@ jobs:
           test "$WHOSCORED_CI_PYTHON_PREFIX" = \
             "$(python -I -S -c 'import sys; print(sys.base_prefix)')"
 
+          set -o pipefail
           test_container=
+          node_donor=
           cleanup_contract_runtime() {
+            if test -n "$node_donor"; then
+              docker rm -f "$node_donor" >/dev/null 2>&1 || true
+            fi
             if test -n "$test_container"; then
               docker rm -f "$test_container" >/dev/null 2>&1 || true
             fi
@@ -672,7 +676,7 @@ jobs:
             "$test_container:/usr/libexec/docker/cli-plugins/docker-compose"
           test "$(. /etc/os-release; printf '%s' "$ID:$VERSION_ID")" = ubuntu:24.04
           for runtime_path in \
-            /usr/lib/x86_64-linux-gnu /usr/share/zoneinfo /usr/bin/node
+            /usr/lib/x86_64-linux-gnu /usr/share/zoneinfo
           do
             test "$(stat -Lc '%u:%g' "$runtime_path")" = 0:0
             test $((8#$(stat -Lc '%a' "$runtime_path") & 8#022)) = 0
@@ -691,7 +695,37 @@ jobs:
           tar -C /usr/share/zoneinfo -cf - . \
             | docker exec -i "$test_container" \
                 tar --no-same-owner -C /usr/share/zoneinfo -xf -
-          docker cp /usr/bin/node "$test_container:/usr/bin/node"
+          node_image='node:22.23.1-bookworm-slim@sha256:8607a9064d4a571140998ae9e52a3b3fcf9cff361d04642d5971e6cd76d39e27'
+          node_donor="$(docker create \
+            --platform linux/amd64 \
+            --network none \
+            --user 0:0 \
+            --cap-drop ALL \
+            --entrypoint /bin/true \
+            "$node_image")"
+          test "$(docker inspect --format '{{.State.Status}}' "$node_donor")" = created
+          test "$(docker inspect --format '{{.Config.Image}}' "$node_donor")" = \
+            "$node_image"
+          test "$(docker inspect --format '{{.Config.User}}' "$node_donor")" = 0:0
+          test "$(docker inspect --format '{{json .Config.Entrypoint}}' "$node_donor")" = \
+            '["/bin/true"]'
+          test "$(docker inspect --format '{{.HostConfig.NetworkMode}}' "$node_donor")" = none
+          test "$(docker inspect --format '{{json .HostConfig.Binds}}' "$node_donor")" = null
+          test "$(docker inspect --format '{{json .HostConfig.Mounts}}' "$node_donor")" = null
+          test "$(docker inspect --format '{{json .Mounts}}' "$node_donor")" = '[]'
+          test "$(docker inspect --format '{{json .HostConfig.CapDrop}}' "$node_donor")" = \
+            '["ALL"]'
+          test "$(docker inspect --format '{{json .HostConfig.CapAdd}}' "$node_donor")" = null
+          test "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$node_image")" = \
+            linux/amd64
+          docker cp "$node_donor:/usr/local/bin/node" - \
+            | docker cp - "$test_container:/usr/local/bin/"
+          docker rm "$node_donor" >/dev/null
+          node_donor=
+          docker exec "$test_container" test -f /usr/local/bin/node
+          docker exec "$test_container" test ! -L /usr/local/bin/node
+          test "$(docker exec "$test_container" stat -c '%u:%g:%h:%a:%s' /usr/local/bin/node)" = \
+            0:0:1:755:124835376
 
           docker exec "$test_container" cp \
             /root/data-platform-football/.env.example \
@@ -741,7 +775,9 @@ jobs:
           docker exec "$test_container" \
             "$WHOSCORED_CI_TEST_VENV/bin/python" -I -c \
             'from zoneinfo import ZoneInfo; assert ZoneInfo("Europe/Berlin").key == "Europe/Berlin"'
-          docker exec "$test_container" node --version
+          docker exec "$test_container" sh -c \
+            'echo "93956de2e59480474a7b46571da1651180b1a050cdf32641ebec4ce6e478e068  /usr/local/bin/node" | sha256sum --check --strict'
+          test "$(docker exec "$test_container" node --version)" = v22.23.1
           set +x
 
           mapfile -t whoscored_tests < <(

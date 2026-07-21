@@ -112,7 +112,21 @@ def test_ci_isolates_root_only_contracts_from_the_host_runner():
     assert "ldd " not in unit_step
     assert "tar -C /usr/lib/x86_64-linux-gnu -cf - ." in unit_step
     assert "tar -C /usr/share/zoneinfo -cf - ." in unit_step
-    assert 'docker cp /usr/bin/node "$test_container:/usr/bin/node"' in unit_step
+    assert "node:22.23.1-bookworm-slim@sha256:" in unit_step
+    assert "8607a9064d4a571140998ae9e52a3b3fcf9cff361d04642d5971e6cd76d39e27" in (
+        unit_step
+    )
+    assert 'docker cp "$node_donor:/usr/local/bin/node" -' in unit_step
+    assert 'docker cp - "$test_container:/usr/local/bin/"' in unit_step
+    assert "/usr/bin/node" not in unit_step
+    assert "/opt/hostedtoolcache/node" not in unit_step
+    assert "actions/setup-node" not in unit_step
+    assert 'docker start "$node_donor"' not in unit_step
+    assert "set -o pipefail" in unit_step
+    assert "node_donor=" in unit_step
+    assert unit_step.count(
+        "93956de2e59480474a7b46571da1651180b1a050cdf32641ebec4ce6e478e068"
+    ) == 1
     assert "unexpected_runtime_path" in unit_step
     assert "! -user root -o -writable" in unit_step
     assert "! -user root -o ! -group root" in unit_step
@@ -338,8 +352,15 @@ def test_production_provenance_is_pushed_and_smoked_by_digest() -> None:
     )
     assert 'docker pull "$scheduler"' in production
     assert 'docker pull "$proxy"' in production
-    assert 'scheduler="$scheduler_tag@$scheduler_digest"' in production
-    assert 'proxy="$proxy_tag@$proxy_digest"' in production
+    assert "docker tag " not in production
+    assert (
+        'scheduler="$scheduler_repository@$scheduler_digest"' in production
+    )
+    assert 'proxy="$proxy_repository@$proxy_digest"' in production
+    assert 'echo "WHOSCORED_SCHEDULER_IMAGE=$scheduler"' in production
+    assert 'echo "WHOSCORED_PROXY_IMAGE=$proxy"' in production
+    assert 'echo "WHOSCORED_SCHEDULER_IMAGE=$scheduler_tag"' not in production
+    assert 'echo "WHOSCORED_PROXY_IMAGE=$proxy_tag"' not in production
 
 
 def test_ci_exercises_every_runner_moved_to_the_legacy_venv():
