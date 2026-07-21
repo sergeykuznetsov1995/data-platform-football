@@ -38,6 +38,7 @@ logger = logging.getLogger(__name__)
 LEGACY_SCRAPER_PYTHON_ENV = "LEGACY_SCRAPER_PYTHON"
 DEFAULT_LEGACY_SCRAPER_PYTHON = "/opt/legacy-scraper-venv/bin/python"
 LIVE_WAVES_RUNNER = "/opt/airflow/dags/scripts/run_fbref_live_waves.py"
+LIVE_WAVES_PYTHONPATH = "/opt/airflow"
 LIVE_WAVES_RESULT_PREFIX = "FBREF_LIVE_WAVES_RESULT:"
 LIVE_WAVES_TIMEOUT_SECONDS = 110 * 60
 LIVE_WAVES_TERMINATION_GRACE_SECONDS = 10
@@ -145,6 +146,18 @@ def _legacy_scraper_python() -> str:
     # A venv's bin/python is normally a symlink. Resolving it would bypass the
     # venv and execute the system interpreter, so preserve the configured path.
     return str(path)
+
+
+def _live_runner_environment() -> dict[str, str]:
+    """Return inherited runtime settings with one fixed child import root."""
+
+    environment = dict(os.environ)
+    # The isolated legacy venv does not inherit the scheduler interpreter's
+    # attested sys.path. Give only this child the read-only application root;
+    # never trust a host/container PYTHONPATH or weaken safe-path handling.
+    environment["PYTHONPATH"] = LIVE_WAVES_PYTHONPATH
+    environment["PYTHONSAFEPATH"] = "1"
+    return environment
 
 # Current-scope source SLAs.  ControlStore.get_run_summary owns the target
 # selection and reports the measured state; this Airflow layer owns the policy
@@ -1724,6 +1737,7 @@ def _spawn_live_runner(
         raise _LiveRunnerTermination(pending_signum)
     lifecycle.process = subprocess.Popen(
         command,
+        env=_live_runner_environment(),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
