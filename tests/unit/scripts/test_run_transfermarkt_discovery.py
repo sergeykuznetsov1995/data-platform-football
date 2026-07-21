@@ -128,8 +128,10 @@ def _page(*, page_number: int = 1, page_count: int = 1) -> RegistryPage:
             end_date="2026-05-31",
             active=True,
             current=True,
-            participant_count=20,
-            participant_hash=body_hash,
+            participant_count=0,
+            participant_hash=(
+                "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+            ),
             source_url=f"https://www.transfermarkt.com/{competition_id}/saison_id/2025",
             discovered_at=NOW,
             registry_snapshot_id=SNAPSHOT_ID,

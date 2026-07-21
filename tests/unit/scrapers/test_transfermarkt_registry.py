@@ -395,8 +395,9 @@ def test_participant_table_contract_and_exact_edition_aggregate(pages) -> None:
         discovered_at=datetime(2026, 7, 11, tzinfo=timezone.utc),
         registry_snapshot_id=pages[0].snapshot_id,
         source_body_hash="a" * 64,
-        parser_revision="fixture-v2",
-        schema_revision="2",
+        raw_capture_id="b" * 64,
+        parser_revision="fixture-v3",
+        schema_revision="3",
     )
     exact_edition = replace(
         edition,
@@ -426,6 +427,164 @@ def test_participant_table_contract_and_exact_edition_aggregate(pages) -> None:
         "parser_revision",
         "schema_revision",
     )
+
+
+def test_participant_membership_hash_uses_only_stable_sorted_team_ids() -> None:
+    discovered_at = datetime(2026, 7, 11, tzinfo=timezone.utc)
+    arsenal = CompetitionParticipant(
+        competition_id="GB1",
+        edition_id="2025",
+        team_id="11",
+        team_name="Arsenal FC",
+        source_url="https://www.transfermarkt.com/arsenal/startseite/verein/11",
+        discovered_at=discovered_at,
+    )
+    chelsea = replace(
+        arsenal,
+        team_id="22",
+        team_name="Chelsea FC",
+        source_url="https://www.transfermarkt.com/chelsea/startseite/verein/22",
+    )
+    renamed = replace(
+        arsenal,
+        team_name="Arsenal",
+        source_url="https://www.transfermarkt.com/new-slug/kader/verein/11",
+    )
+
+    expected = "aec44629820b55835bc0a5f3090d1de160c428fd23cc4b72a0e6ce4eebd12a0e"
+    assert participant_list_hash((arsenal, chelsea)) == expected
+    assert participant_list_hash((chelsea, arsenal)) == expected
+    assert participant_list_hash((renamed, chelsea)) == expected
+
+
+def test_empty_participant_rows_are_still_reconciled_against_aggregate(pages) -> None:
+    edition = next(item for item in pages[0].editions if item.competition_id == "GB1")
+    aggregate_only = replace(
+        edition,
+        participant_count=20,
+        participant_hash="f" * 64,
+    )
+    page_one = replace(
+        pages[0],
+        editions=tuple(
+            aggregate_only if item is edition else item for item in pages[0].editions
+        ),
+        participants=(),
+    )
+
+    with pytest.raises(RegistryConflictError, match="participant count mismatch"):
+        reconcile_registry_pages((page_one, pages[1]))
+
+
+def test_exact_empty_participant_rows_require_the_empty_membership_hash(pages) -> None:
+    edition = next(item for item in pages[0].editions if item.competition_id == "GB1")
+    wrong_hash = replace(edition, participant_count=0, participant_hash="f" * 64)
+    page_one = replace(
+        pages[0],
+        editions=tuple(
+            wrong_hash if item is edition else item for item in pages[0].editions
+        ),
+        participants=(),
+    )
+
+    with pytest.raises(RegistryConflictError, match="participant hash mismatch"):
+        reconcile_registry_pages((page_one, pages[1]))
+
+
+def test_legacy_name_url_sensitive_participant_hash_is_rejected(pages) -> None:
+    edition = next(item for item in pages[0].editions if item.competition_id == "GB1")
+    participant = CompetitionParticipant(
+        competition_id="GB1",
+        edition_id=edition.edition_id,
+        team_id="11",
+        team_name="Arsenal FC",
+        source_url="https://www.transfermarkt.com/arsenal/startseite/verein/11",
+        discovered_at=datetime(2026, 7, 11, tzinfo=timezone.utc),
+        registry_snapshot_id=pages[0].snapshot_id,
+        source_body_hash="a" * 64,
+    )
+    # Digest emitted by the former name/URL-sensitive participant hash.
+    legacy_hash = "f50894a8190fd917bba4fcae4249ad097479780dce541e9d107a53f3a0b89a5c"
+    legacy_edition = replace(
+        edition,
+        participant_count=1,
+        participant_hash=legacy_hash,
+    )
+    page_one = replace(
+        pages[0],
+        editions=tuple(
+            legacy_edition if item is edition else item
+            for item in pages[0].editions
+        ),
+        participants=(participant,),
+    )
+
+    with pytest.raises(RegistryConflictError, match="participant hash mismatch"):
+        reconcile_registry_pages((page_one, pages[1]))
+
+
+def test_registry_page_preserves_row_provenance_and_uses_page_hash_as_fallback(
+    pages,
+) -> None:
+    source_page = pages[0]
+    competition = source_page.competitions[0]
+    edition = next(
+        item
+        for item in source_page.editions
+        if item.competition_id == competition.competition_id
+    )
+    participant = CompetitionParticipant(
+        competition_id=competition.competition_id,
+        edition_id=edition.edition_id,
+        team_id="11",
+        team_name="Arsenal FC",
+        source_url="https://www.transfermarkt.com/arsenal/startseite/verein/11",
+        discovered_at=datetime(2026, 7, 11, tzinfo=timezone.utc),
+    )
+    row_hashes = ("a" * 64, "b" * 64, "c" * 64)
+    capture_ids = ("d" * 64, "e" * 64, "f" * 64)
+    row_mappings = []
+    for row, body_hash, capture_id in zip(
+        (competition, edition, participant), row_hashes, capture_ids, strict=True
+    ):
+        mapping = row.as_dict()
+        mapping["source_body_hash"] = body_hash
+        mapping["raw_capture_id"] = capture_id
+        row_mappings.append(mapping)
+    mapping = {
+        "snapshot_id": source_page.snapshot_id,
+        "page_number": 1,
+        "page_count": 1,
+        "source_url": source_page.source_url,
+        "source_body_hash": source_page.source_body_hash,
+        "competitions": [row_mappings[0]],
+        "editions": [row_mappings[1]],
+        "participants": [row_mappings[2]],
+    }
+
+    restored = RegistryPage.from_mapping(mapping)
+
+    restored_rows = (
+        restored.competitions[0],
+        restored.editions[0],
+        restored.participants[0],
+    )
+    assert tuple(item.source_body_hash for item in restored_rows) == row_hashes
+    assert tuple(item.raw_capture_id for item in restored_rows) == capture_ids
+
+    for row_mapping in row_mappings:
+        row_mapping.pop("source_body_hash")
+        row_mapping.pop("raw_capture_id")
+    legacy = RegistryPage.from_mapping(mapping)
+    legacy_rows = (
+        legacy.competitions[0],
+        legacy.editions[0],
+        legacy.participants[0],
+    )
+    assert all(
+        item.source_body_hash == source_page.source_body_hash for item in legacy_rows
+    )
+    assert all(item.raw_capture_id is None for item in legacy_rows)
 
 
 def test_complete_snapshot_reconciliation_emits_explicit_tombstones(snapshot) -> None:

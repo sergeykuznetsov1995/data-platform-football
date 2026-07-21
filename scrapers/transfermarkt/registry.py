@@ -810,19 +810,15 @@ class CompetitionParticipant:
 def participant_list_hash(
     participants: Iterable[CompetitionParticipant],
 ) -> str:
-    """Hash an exact, order-independent participant list."""
+    """Hash edition membership by stable, order-independent team identity.
 
-    material = sorted(
-        (
-            {
-                "source_url": item.source_url,
-                "team_id": item.team_id,
-                "team_name": item.team_name,
-            }
-            for item in participants
-        ),
-        key=lambda item: (item["team_id"], item["team_name"], item["source_url"]),
-    )
+    Display names, slugs and profile tabs are mutable source presentation and
+    must not turn unchanged membership into a new edition aggregate.  Schema
+    revision 3 deliberately does not accept hashes produced by the former
+    name/URL-sensitive contract; snapshots using it must be regenerated.
+    """
+
+    material = sorted(item.team_id for item in participants)
     return hashlib.sha256(_compact_json(material).encode("utf-8")).hexdigest()
 
 
@@ -930,6 +926,13 @@ class RegistryPage:
         body_hash = _required_text(
             "source_body_hash", value.get("source_body_hash", "")
         )
+
+        def row_body_hash(item: Mapping[str, Any]) -> str:
+            row_hash = item.get("source_body_hash")
+            if row_hash is None or not str(row_hash).strip():
+                return body_hash
+            return str(row_hash)
+
         return cls(
             snapshot_id=snapshot_id,
             page_number=int(value.get("page_number", 0)),
@@ -940,7 +943,7 @@ class RegistryPage:
                 CompetitionRecord.from_mapping(
                     item,
                     registry_snapshot_id=snapshot_id,
-                    source_body_hash=body_hash,
+                    source_body_hash=row_body_hash(item),
                 )
                 for item in value.get("competitions", ())
             ),
@@ -948,7 +951,7 @@ class RegistryPage:
                 EditionRecord.from_mapping(
                     item,
                     registry_snapshot_id=snapshot_id,
-                    source_body_hash=body_hash,
+                    source_body_hash=row_body_hash(item),
                 )
                 for item in value.get("editions", ())
             ),
@@ -956,7 +959,7 @@ class RegistryPage:
                 CompetitionParticipant.from_mapping(
                     item,
                     registry_snapshot_id=snapshot_id,
-                    source_body_hash=body_hash,
+                    source_body_hash=row_body_hash(item),
                 )
                 for item in value.get("participants", ())
             ),
@@ -1121,11 +1124,10 @@ def reconcile_registry_pages(
         exact = participants_by_edition.get(
             (edition.competition_id, edition.edition_id), []
         )
-        # Serialized snapshots from before this table contract have aggregate
-        # fields but no participant rows. Keep them readable; whenever exact
-        # rows are present, their aggregate must agree.
-        if not exact:
-            continue
+        # Exact typed rows are authoritative, including an exact empty list.
+        # Aggregate-only snapshots predate this contract and are intentionally
+        # rejected: accepting them would make missing rows indistinguishable
+        # from a source edition with no participants. Regenerate them instead.
         if edition.participant_count != len(exact):
             raise RegistryConflictError(
                 "participant count mismatch for "

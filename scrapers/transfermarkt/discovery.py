@@ -1161,8 +1161,12 @@ def _selector_options(
     values: dict[str, tuple[str, bool, Mapping[str, Any]]] = {}
     for option in soup.select('select[name*="saison"] option[value]'):
         edition_id = _normalise_text(option.get("value"))
-        if re.fullmatch(r"\d{4}", edition_id) is None:
+        if not edition_id:
             continue
+        if re.fullmatch(r"\d{4}", edition_id) is None:
+            raise DiscoverySchemaError(
+                f"unrecognised edition selector value {edition_id!r}: {profile_url}"
+            )
         label = _normalise_text(option.get_text(" ", strip=True))
         selected = option.has_attr("selected")
         attrs = dict(option.attrs)
@@ -1186,15 +1190,26 @@ def _selector_options(
                 if path_match
                 else query.get("saison_id", "")
             )
-            if re.fullmatch(r"\d{4}", edition_id) is None:
+            if not edition_id:
                 continue
+            if re.fullmatch(r"\d{4}", edition_id) is None:
+                raise DiscoverySchemaError(
+                    f"unrecognised edition selector value {edition_id!r}: "
+                    f"{profile_url}"
+                )
             label = _normalise_text(anchor.get_text(" ", strip=True))
-            if not edition_id or not label:
+            if not label:
                 continue
             selected = "active" in set(anchor.get("class", ())) or str(
                 anchor.get("aria-current", "")
             ).casefold() in {"true", "page"}
-            values[edition_id] = (label, selected, dict(anchor.attrs))
+            previous = values.get(edition_id)
+            current = (label, selected, dict(anchor.attrs))
+            if previous is not None and previous[:2] != current[:2]:
+                raise DiscoverySchemaError(
+                    f"conflicting edition selector {edition_id}: {profile_url}"
+                )
+            values[edition_id] = current
 
     if not values:
         values = _title_edition(soup, profile_url)
