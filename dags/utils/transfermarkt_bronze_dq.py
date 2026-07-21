@@ -41,8 +41,9 @@ Pinned vs live reads
 --------------------
 Time-travel pins apply to the native and legacy Bronze relations and the
 promoted-registry Silver relations.  The ops relations
-(``REGISTRY_STATE_TABLE``, ``SCOPE_MANIFEST_TABLE``) are deliberately read
-live: the state row is a verifiable pointer (re-checked here for
+(``REGISTRY_STATE_TABLE``, ``SCOPE_MANIFEST_TABLE`` and the append-only
+``SCOPE_PLAYER_CAPTURE_TABLE``) are deliberately read live: the state row is
+a verifiable pointer (re-checked here for
 ``promoted`` + ``unknown_active_count = 0``) and scope manifests are
 digest-verified upstream by the DAG preflight before this gate runs.
 
@@ -67,6 +68,10 @@ observability-only and must never gate.
   tables) the metric only reads scoped rows: pre-native NULL-scope cohort
   rows have no contract identity (their season lives outside the PK) and
   are already counted by ``tm_bronze_legacy_cohort[*]``.
+- Player observation/career parents are resolved against the immutable
+  same-cycle ``ops.transfermarkt_scope_player_capture_v1`` evidence.  The
+  replace-guarded latest roster is checked separately as WARNING-only drift,
+  so roster A -> B does not invalidate facts captured with roster A.
 - ``tm_bronze_membership_orphans[coach_stints]`` is WARNING (not ERROR):
   coach stints are scraped from a club's full coach-history page while
   coach profiles are only fetched for current/recent coaches, so a stint
@@ -90,6 +95,9 @@ from utils.transfermarkt_scope_state import (
     REGISTRY_STATE_TABLE,
     SCOPE_COMPLETION_STATUS,
     SCOPE_MANIFEST_TABLE,
+    SCOPE_PLAYER_CAPTURE_GRAIN,
+    SCOPE_PLAYER_CAPTURE_TABLE,
+    scope_player_capture_evidence,
 )
 
 # Non-slotted promoted-registry relations (values mirror
@@ -260,7 +268,8 @@ LEGACY_PAYLOAD_COLUMNS = {
 _SNAPSHOT_KEYED_TABLES = (COMPETITIONS_BRONZE_TABLE, EDITIONS_BRONZE_TABLE)
 
 # Scoped observation relations whose (scope, club/team, player) identity must
-# exist in same-scope squad memberships: own column -> memberships column.
+# exist in the immutable capture from the same cycle.  Current memberships are
+# a guarded replace and therefore cannot be the temporal parent of old facts.
 _MEMBERSHIP_CLUB_COLUMNS = {
     'iceberg.bronze.transfermarkt_player_attribute_observations': (
         'club_id', 'club_id',
@@ -631,12 +640,61 @@ def build_membership_orphans_sql(
     pins: Mapping[str, Any] | None = None,
     scope_pairs: Sequence[Sequence[str]] | None = None,
 ) -> str:
-    """Scoped entity rows without their same-scope membership/profile parent."""
+    """Scoped entity rows without same-cycle immutable player evidence.
+
+    Coach stints retain their profile-parent contract.  Player entities use the
+    append-only scope-player capture: an accepted later roster replacement can
+    therefore produce an observational drift warning, but never retroactively
+    turn a previously valid fact into an ERROR.
+    """
+
+    comp, ed = _entity_scope_columns(table)
+    if scope_pairs is not None:
+        # The IN-predicate implies both scope columns are non-NULL.
+        scoped = _scope_pairs_predicate(table, scope_pairs, alias='b')
+    else:
+        scoped = f'b.{comp} IS NOT NULL\n  AND b.{ed} IS NOT NULL'
+    if table in _MEMBERSHIP_CLUB_COLUMNS:
+        own_club, evidence_club = _MEMBERSHIP_CLUB_COLUMNS[table]
+        exists = f"""SELECT 1
+      FROM {SCOPE_PLAYER_CAPTURE_TABLE} e
+      WHERE e.cycle_id = b.cycle_id
+        AND e.scope_id = b.scope_id
+        AND e.competition_id = b.{comp}
+        AND e.edition_id = b.{ed}
+        AND e.{evidence_club} = b.{own_club}
+        AND e.player_id = b.player_id"""
+    elif table in _MEMBERSHIP_PLAYER_TABLES:
+        exists = f"""SELECT 1
+      FROM {SCOPE_PLAYER_CAPTURE_TABLE} e
+      WHERE e.cycle_id = b.cycle_id
+        AND e.scope_id = b.scope_id
+        AND e.player_id = b.player_id"""
+    elif table == COACH_STINTS_BRONZE_TABLE:
+        exists = f"""SELECT 1
+      FROM {_pinned(COACH_PROFILES_BRONZE_TABLE, pins)} p
+      WHERE p.coach_id = b.coach_id"""
+    else:
+        raise ValueError(f'{table}: no membership-orphan contract')
+    return f"""SELECT COUNT(*)
+FROM {_pinned(table, pins)} b
+WHERE {scoped}
+  AND NOT EXISTS (
+      {exists}
+  )"""
+
+
+def build_current_roster_drift_sql(
+    table: str,
+    *,
+    pins: Mapping[str, Any] | None = None,
+    scope_pairs: Sequence[Sequence[str]] | None = None,
+) -> str:
+    """Historical facts no longer represented in the latest guarded roster."""
 
     memberships = _pinned(MEMBERSHIPS_BRONZE_TABLE, pins)
     comp, ed = _entity_scope_columns(table)
     if scope_pairs is not None:
-        # The IN-predicate implies both scope columns are non-NULL.
         scoped = _scope_pairs_predicate(table, scope_pairs, alias='b')
     else:
         scoped = f'b.{comp} IS NOT NULL\n  AND b.{ed} IS NOT NULL'
@@ -654,18 +712,34 @@ def build_membership_orphans_sql(
       WHERE m.competition_id = b.{comp}
         AND m.edition_id = b.{ed}
         AND m.player_id = b.player_id"""
-    elif table == COACH_STINTS_BRONZE_TABLE:
-        exists = f"""SELECT 1
-      FROM {_pinned(COACH_PROFILES_BRONZE_TABLE, pins)} p
-      WHERE p.coach_id = b.coach_id"""
     else:
-        raise ValueError(f'{table}: no membership-orphan contract')
+        raise ValueError(f'{table}: no current-roster drift contract')
     return f"""SELECT COUNT(*)
 FROM {_pinned(table, pins)} b
 WHERE {scoped}
   AND NOT EXISTS (
       {exists}
   )"""
+
+
+def build_scope_player_capture_rows_sql(
+    identities: Sequence[Sequence[str]],
+) -> str:
+    """Read exact append-only evidence partitions for manifest re-hashing."""
+
+    if not identities:
+        raise ValueError('scope-player capture query requires an identity')
+    values = ', '.join(
+        f'({_sql_literal(item[0])}, {_sql_literal(item[1])})'
+        for item in identities
+    )
+    columns = ', '.join(f'e.{column}' for column in SCOPE_PLAYER_CAPTURE_GRAIN)
+    return f"""SELECT {columns}
+FROM {SCOPE_PLAYER_CAPTURE_TABLE} e
+JOIN (VALUES {values}) requested(cycle_id, scope_id)
+  ON requested.cycle_id = e.cycle_id
+ AND requested.scope_id = e.scope_id
+ORDER BY {columns}"""
 
 
 def build_scope_pair_counts_sql(
@@ -1014,6 +1088,76 @@ def run_bronze_dq(
 
     entity_tables = tuple(ENTITY_BRONZE_TABLES.values())
 
+    # -- ERROR: v3 manifests bind the immutable temporal parent by count/hash.
+    capture_manifests = [
+        item for item in (manifests or ())
+        if str(getattr(item, 'capture_revision', '')) == 'v3'
+    ]
+    if capture_manifests:
+        def capture_manifest_match():
+            expected: dict[tuple[str, str], Mapping[str, Any]] = {}
+            for manifest in capture_manifests:
+                identity = (
+                    str(manifest.parent_cycle_id), str(manifest.scope_id),
+                )
+                if identity in expected:
+                    raise ValueError(
+                        f'duplicate scope-player capture manifest: {identity}'
+                    )
+                evidence = manifest.dq_evidence.get('scope_player_capture')
+                if not isinstance(evidence, Mapping):
+                    raise ValueError(
+                        f'{identity}: scope-player capture evidence is absent'
+                    )
+                expected[identity] = evidence
+
+            captured: dict[tuple[str, str], list[dict[str, str]]] = {
+                identity: [] for identity in expected
+            }
+            for chunk in _chunked(
+                tuple(expected), SCOPE_PREDICATE_CHUNK_SIZE,
+            ):
+                cur.execute(build_scope_player_capture_rows_sql(chunk))
+                for raw in cur.fetchall():
+                    if len(raw) != len(SCOPE_PLAYER_CAPTURE_GRAIN):
+                        raise ValueError(
+                            'scope-player capture query returned a malformed row'
+                        )
+                    row = {
+                        column: str(value or '')
+                        for column, value in zip(SCOPE_PLAYER_CAPTURE_GRAIN, raw)
+                    }
+                    identity = (row['cycle_id'], row['scope_id'])
+                    if identity not in captured:
+                        raise ValueError(
+                            f'unrequested scope-player capture row: {identity}'
+                        )
+                    captured[identity].append(row)
+
+            violations: list[str] = []
+            for identity, stated in expected.items():
+                rows = captured[identity]
+                actual = scope_player_capture_evidence(rows)
+                if len(rows) != actual['row_count']:
+                    violations.append(f'{identity}: duplicate physical grain')
+                if dict(stated) != actual:
+                    violations.append(
+                        f'{identity}: manifest={dict(stated)} actual={actual}'
+                    )
+            return (
+                not violations,
+                _clip(violations) if violations else (
+                    f'{len(expected)} capture manifests match'
+                ),
+                len(violations),
+            )
+
+        run(
+            'tm_scope_player_capture_manifest',
+            'scope_player_capture_manifest', 'ERROR',
+            capture_manifest_match,
+        )
+
     # -- ERROR: promoted registry snapshot is fully present in Bronze --
     def snapshot_presence(kind: str, index: int):
         def check():
@@ -1092,6 +1236,18 @@ def run_bronze_dq(
             'bronze_membership_orphans', severity,
             summed_zero_violations(
                 entity_sqls(build_membership_orphans_sql, table)
+            ),
+        )
+
+    # -- WARNING: historical facts may legitimately leave the latest roster.
+    # Keep this observable without using a mutable replace table as the ERROR
+    # parent of immutable history.
+    for table in (*_MEMBERSHIP_CLUB_COLUMNS, *_MEMBERSHIP_PLAYER_TABLES):
+        run(
+            f'tm_bronze_current_roster_drift[{_display(table)}]',
+            'bronze_current_roster_drift', 'WARNING',
+            summed_zero_violations(
+                entity_sqls(build_current_roster_drift_sql, table)
             ),
         )
 

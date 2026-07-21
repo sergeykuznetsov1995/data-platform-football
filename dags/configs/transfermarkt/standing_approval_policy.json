@@ -1,5 +1,5 @@
 {
-  "policy_version": 2,
+  "policy_version": 3,
   "dag_id": "dag_ingest_transfermarkt",
   "approved_by": "sergeykuznetsov1995",
   "approved_at": "2026-07-14T00:00:00Z",
@@ -33,6 +33,7 @@
     "iceberg.ops.transfermarkt_fetch_state",
     "iceberg.ops.transfermarkt_native_write_manifest_v2",
     "iceberg.ops.transfermarkt_proxy_ledger_v2",
+    "iceberg.ops.transfermarkt_scope_player_capture_v1",
     "iceberg.ops.transfermarkt_scope_manifest_v2"
   ]
 }

@@ -29,9 +29,9 @@ def test_committed_policy_parses_into_a_standing_policy():
     assert policy.dag_id == STANDING_POLICY_DAG_ID
     assert policy.dag_id == 'dag_ingest_transfermarkt'
     assert len(policy.policy_hash) == 64
-    # v2 = the daily-throughput caps (24 MiB / 1610 / 800 per scope); the
+    # v3 = v2 daily-throughput caps plus immutable scope-player evidence; the
     # standing-authorization records key on standing-policy-v{version}.
-    assert policy.policy_version == 2
+    assert policy.policy_version == 3
 
 
 def test_committed_policy_caps_equal_the_child_wrapper_constants():

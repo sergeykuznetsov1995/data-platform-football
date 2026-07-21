@@ -111,6 +111,66 @@ def _manifest(
     )
 
 
+def test_scope_player_capture_evidence_is_stable_sorted_and_deduplicated():
+    rows = [
+        {
+            'cycle_id': 'cycle-1', 'scope_id': 'GB1:2025',
+            'competition_id': 'GB1', 'edition_id': '2025',
+            'club_id': '20', 'player_id': '2',
+        },
+        {
+            'cycle_id': 'cycle-1', 'scope_id': 'GB1:2025',
+            'competition_id': 'GB1', 'edition_id': '2025',
+            'club_id': '10', 'player_id': '1',
+        },
+    ]
+    repeated_reversed = [rows[1], rows[0], rows[0]]
+
+    assert state.scope_player_capture_rows(rows) == (
+        ('cycle-1', 'GB1:2025', 'GB1', '2025', '10', '1'),
+        ('cycle-1', 'GB1:2025', 'GB1', '2025', '20', '2'),
+    )
+    assert state.scope_player_capture_evidence(rows) == (
+        state.scope_player_capture_evidence(repeated_reversed)
+    )
+    assert state.scope_player_capture_evidence(rows)['row_count'] == 2
+
+
+def test_scope_player_capture_rejects_incomplete_grain():
+    with pytest.raises(state.ScopeManifestError, match='NULL/empty'):
+        state.scope_player_capture_evidence([{
+            'cycle_id': 'cycle-1', 'scope_id': 'GB1:2025',
+            'competition_id': 'GB1', 'edition_id': '2025',
+            'club_id': '10', 'player_id': None,
+        }])
+
+
+def test_v3_manifest_binds_scope_player_capture_count_and_hash():
+    manifest = _manifest('GB1:2025')
+    v3 = dataclasses.replace(
+        manifest,
+        capture_revision='v3',
+        dq_evidence={
+            **manifest.dq_evidence,
+            'scope_player_capture': {
+                'row_count': 2,
+                'key_hash': 'c' * 64,
+            },
+        },
+    )
+    v3.validate(EXPECTED)
+
+    missing = dataclasses.replace(
+        v3,
+        dq_evidence={
+            key: value for key, value in v3.dq_evidence.items()
+            if key != 'scope_player_capture'
+        },
+    )
+    with pytest.raises(state.ScopeManifestError, match='lacks scope-player'):
+        missing.validate(EXPECTED)
+
+
 def test_scope_set_is_order_independent_and_accepts_older_child_revision():
     one = _manifest(
         'GB1:2025', parent_cycle_id='batch-1', reader_revision=5,

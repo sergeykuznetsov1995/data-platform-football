@@ -793,6 +793,10 @@ def _write_manifest_and_ledger(module, tmp_path: Path, *, bad_digest=False):
                 team_type='club',
             ),
             'authoritative_empty_evidence': {},
+            'scope_player_capture': {
+                'row_count': 2,
+                'key_hash': 'c' * 64,
+            },
             'roster_coverage': {},
             'career_fetches_pending': 0,
             'participant_contract': {

@@ -19,8 +19,13 @@ from typing import Any, Iterable, Mapping, Sequence
 REGISTRY_STATE_TABLE = 'iceberg.ops.transfermarkt_registry_state_v2'
 SCOPE_MANIFEST_TABLE = 'iceberg.ops.transfermarkt_scope_manifest_v2'
 SCOPE_SET_MANIFEST_TABLE = 'iceberg.ops.transfermarkt_scope_set_manifest_v2'
+SCOPE_PLAYER_CAPTURE_TABLE = 'iceberg.ops.transfermarkt_scope_player_capture_v1'
 PROXY_LEDGER_TABLE = 'iceberg.ops.transfermarkt_proxy_ledger_v2'
 SCOPE_COMPLETION_STATUS = 'complete'
+SCOPE_PLAYER_CAPTURE_GRAIN = (
+    'cycle_id', 'scope_id', 'competition_id', 'edition_id', 'club_id',
+    'player_id',
+)
 # One inactive slot is assembled cumulatively from many bounded paid batches:
 # the promoted registry target is ~9.7k senior-men scopes and a single crawl
 # batch buys at most eight of them.  The cap therefore bounds the manifest, not
@@ -30,7 +35,7 @@ MAX_SCOPE_SET_SIZE = 16_384
 # marker, not batch content: manifests captured under the same contract may be
 # accumulated into one scope set across parent cycles.  Bump it whenever the
 # capture payload (scope_capture, entity evidence) changes shape.
-CAPTURE_REVISION = 'v2'
+CAPTURE_REVISION = 'v3'
 
 
 class ScopeManifestError(RuntimeError):
@@ -43,6 +48,46 @@ def _stable_json(value: Any) -> str:
 
 def stable_hash(value: Any) -> str:
     return hashlib.sha256(_stable_json(value).encode('utf-8')).hexdigest()
+
+
+def scope_player_capture_rows(value: Any) -> tuple[tuple[str, ...], ...]:
+    """Return the canonical immutable scope-player evidence projection.
+
+    ``value`` may be an iterable of mappings or a pandas DataFrame.  Only the
+    declared grain participates in the digest: scrape timestamps and Iceberg
+    metadata are deliberately excluded so an idempotent replay has the same
+    identity.  Duplicate membership rows collapse before hashing, while NULL
+    or empty keys fail closed.
+    """
+
+    if hasattr(value, 'to_dict'):
+        raw_rows = value.to_dict(orient='records')
+    else:
+        raw_rows = value
+    if isinstance(raw_rows, Mapping) or not isinstance(raw_rows, Iterable):
+        raise ScopeManifestError('scope-player capture rows must be iterable')
+
+    rows: set[tuple[str, ...]] = set()
+    for raw in raw_rows:
+        if not isinstance(raw, Mapping):
+            raise ScopeManifestError('scope-player capture row must be a mapping')
+        row = tuple(str(raw.get(column) or '').strip() for column in (
+            SCOPE_PLAYER_CAPTURE_GRAIN
+        ))
+        if any(not item for item in row):
+            raise ScopeManifestError('scope-player capture grain contains NULL/empty')
+        rows.add(row)
+    return tuple(sorted(rows))
+
+
+def scope_player_capture_evidence(value: Any) -> dict[str, Any]:
+    """Stable count/hash bound into the exact scope manifest."""
+
+    rows = scope_player_capture_rows(value)
+    return {
+        'row_count': len(rows),
+        'key_hash': stable_hash([list(row) for row in rows]),
+    }
 
 
 @dataclass(frozen=True)
@@ -281,7 +326,8 @@ class ScopeManifest:
         # the policy is the only remaining authorization trace.  One-shot runs
         # keep their journal and simply omit the key.
         provenance = {'standing_policy_hash'}
-        optional = coverage | provenance
+        temporal_evidence = {'scope_player_capture'}
+        optional = coverage | provenance | temporal_evidence
         if not isinstance(value, Mapping):
             raise ScopeManifestError('scope DQ evidence has an unbound field set')
         present = set(value)
@@ -300,6 +346,29 @@ class ScopeManifest:
             raise ScopeManifestError(
                 'standing policy hash is not a lowercase sha256 digest'
             )
+        capture_evidence = value.get('scope_player_capture')
+        if self.capture_revision == 'v3' and capture_evidence is None:
+            raise ScopeManifestError('v3 scope manifest lacks scope-player capture')
+        if capture_evidence is not None:
+            if not isinstance(capture_evidence, Mapping) or set(
+                capture_evidence
+            ) != {'row_count', 'key_hash'}:
+                raise ScopeManifestError('scope-player capture evidence is invalid')
+            row_count = capture_evidence['row_count']
+            if (
+                isinstance(row_count, bool)
+                or not isinstance(row_count, int)
+                or row_count <= 0
+            ):
+                raise ScopeManifestError(
+                    'scope-player capture row count must be positive'
+                )
+            if not re.fullmatch(
+                r'[0-9a-f]{64}', str(capture_evidence['key_hash'] or ''),
+            ):
+                raise ScopeManifestError(
+                    'scope-player capture hash is not a lowercase sha256 digest'
+                )
         if value['status'] != 'passed':
             raise ScopeManifestError('scope DQ evidence is not green')
         if not isinstance(value['edition_current'], bool):

@@ -31,6 +31,12 @@ from dags.utils.transfermarkt_dq_contracts import (
     input_from_capture,
     validate_scope_capture,
 )
+from dags.utils.transfermarkt_scope_state import (
+    SCOPE_PLAYER_CAPTURE_GRAIN,
+    SCOPE_PLAYER_CAPTURE_TABLE,
+    scope_player_capture_evidence,
+    scope_player_capture_rows,
+)
 # The budget canon is stdlib-only and safe at module import time; the heavy
 # scraper modules stay lazy inside _run_entity.
 from scrapers.transfermarkt.models import (
@@ -1907,6 +1913,73 @@ def _query_dataframe(conn, sql: str, params: Sequence[Any]):
             pass
 
 
+def _load_scope_player_capture(scraper, cycle_id: str, scope_id: str):
+    """Read one immutable evidence partition, or an empty frame before first use."""
+
+    import pandas as pd
+
+    table_name = SCOPE_PLAYER_CAPTURE_TABLE.rsplit('.', 1)[-1]
+    writer = scraper._iceberg_writer
+    if not writer.table_exists('ops', table_name):
+        return pd.DataFrame(columns=SCOPE_PLAYER_CAPTURE_GRAIN)
+    return _query_dataframe(
+        scraper._bronze_connection(),
+        f"SELECT {', '.join(SCOPE_PLAYER_CAPTURE_GRAIN)} "
+        f"FROM {SCOPE_PLAYER_CAPTURE_TABLE} "
+        "WHERE cycle_id = ? AND scope_id = ?",
+        (cycle_id, scope_id),
+    )
+
+
+def _persist_scope_player_capture(scraper, memberships) -> Dict[str, Any]:
+    """Append one exact roster capture and reject any attempted mutation.
+
+    The current membership table intentionally remains a guarded replace.  This
+    separate relation is the temporal parent used by Bronze DQ, so an accepted
+    later roster change cannot invalidate older attribute/career facts.
+    """
+
+    import pandas as pd
+
+    rows = scope_player_capture_rows(memberships)
+    if not rows:
+        raise RuntimeError('scope-player capture cannot be empty')
+    identities = {(row[0], row[1]) for row in rows}
+    if len(identities) != 1:
+        raise RuntimeError('scope-player capture spans multiple cycle/scope identities')
+    cycle_id, scope_id = next(iter(identities))
+    expected = scope_player_capture_evidence(memberships)
+    existing = _load_scope_player_capture(scraper, cycle_id, scope_id)
+    if not existing.empty:
+        actual = scope_player_capture_evidence(existing)
+        if len(existing) != actual['row_count'] or actual != expected:
+            raise RuntimeError(
+                'immutable scope-player capture differs from the committed evidence'
+            )
+        return {
+            **expected,
+            'table': SCOPE_PLAYER_CAPTURE_TABLE,
+            'reused': True,
+        }
+
+    frame = pd.DataFrame(rows, columns=SCOPE_PLAYER_CAPTURE_GRAIN)
+    scraper.save_to_iceberg(
+        df=frame,
+        table_name=SCOPE_PLAYER_CAPTURE_TABLE.rsplit('.', 1)[-1],
+        partition_cols=['cycle_id'],
+        database='ops',
+    )
+    committed = _load_scope_player_capture(scraper, cycle_id, scope_id)
+    actual = scope_player_capture_evidence(committed)
+    if len(committed) != expected['row_count'] or actual != expected:
+        raise RuntimeError('scope-player capture post-write verification failed')
+    return {
+        **expected,
+        'table': SCOPE_PLAYER_CAPTURE_TABLE,
+        'reused': False,
+    }
+
+
 _CAREER_CACHE_COLUMNS = {
     ENTITY_MV_HISTORY: (
         'market_value_points',
@@ -3743,6 +3816,9 @@ def _run_entity(
                     outputs=results['outputs'],
                     current=current_raw == 'true',
                 )
+                results['scope_player_capture_evidence'] = (
+                    scope_player_capture_evidence(frames['memberships'])
+                )
 
             if dry_run:
                 results['dry_run'] = True
@@ -3759,6 +3835,18 @@ def _run_entity(
             _save_frames(
                 scraper, write_spec, frames, force_replace, results,
             )
+            if spec.name == ENTITY_PLAYERS and scope_dq_required:
+                expected_capture = results['scope_player_capture_evidence']
+                persisted_capture = _persist_scope_player_capture(
+                    scraper, frames['memberships'],
+                )
+                if {
+                    key: persisted_capture[key] for key in ('row_count', 'key_hash')
+                } != expected_capture:
+                    raise RuntimeError(
+                        'scope-player capture evidence changed during persistence'
+                    )
+                results['scope_player_capture_evidence'] = persisted_capture
             if valid_empty:
                 _delete_valid_empty_rows(
                     scraper, write_spec, valid_empty, league, season,
