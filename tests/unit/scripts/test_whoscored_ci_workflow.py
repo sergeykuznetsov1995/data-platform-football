@@ -245,6 +245,7 @@ def test_ci_uses_test_runtime_and_smokes_immutable_flaresolverr():
     assert "WHOSCORED_CI_SETUP_PYTHON=$python_bin" in contract_job
     assert "/opt/hostedtoolcache/Python" in contract_job
     assert "x64/bin/python3.11" in contract_job
+    assert "/usr/bin/sudo /bin/chmod go-w /opt" in contract_job
     assert "/usr/bin/sudo /bin/chown -R root:root /opt/hostedtoolcache/Python" in (
         contract_job
     )

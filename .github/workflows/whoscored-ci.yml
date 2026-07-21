@@ -37,6 +37,7 @@ jobs:
           source_python="$(readlink -f "${python_candidates[0]}")"
           source_prefix="$(dirname "$(dirname "$source_python")")"
           [[ "$source_prefix" =~ ^/opt/hostedtoolcache/Python/3\.11\.[0-9]+/x64$ ]]
+          /usr/bin/sudo /bin/chmod go-w /opt
           /usr/bin/sudo /bin/chown root:root /opt/hostedtoolcache
           /usr/bin/sudo /bin/chmod go-w /opt/hostedtoolcache
           /usr/bin/sudo /bin/chown -R root:root /opt/hostedtoolcache/Python
