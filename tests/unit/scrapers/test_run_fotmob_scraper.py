@@ -1,216 +1,115 @@
-"""
-Unit tests for the completeness-guard wiring in
-``dags/scripts/run_fotmob_scraper.py`` (#583).
-
-The guard arithmetic lives in ``BaseScraper.save_to_iceberg`` (covered by
-``test_base_scraper.py``); here we cover the runner's *handling* — arm the guard
-on the normal path, map ``ReplaceGuardError`` to exit 3, and let
-``--force-replace`` disarm it. We restrict the run to a single entity
-(``--entities schedule``) so exactly one save is exercised.
-
-The runner does ``from scrapers.fotmob import FotMobScraper`` lazily inside
-``main()``; we install a stub via ``patch.dict('sys.modules', ...)`` (mirrors
-``test_run_espn_scraper.py``).
-"""
+"""Unit tests for the source-native FotMob runner."""
 
 from __future__ import annotations
 
 import importlib
 import json
-import os
 import sys
-import tempfile
+from contextlib import contextmanager, nullcontext
 from datetime import datetime
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-import pandas as pd
 import pytest
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-def _build_guard_scraper(*, guard_blocks: bool = False):
-    """Stub FotMobScraper whose ``read_schedule`` returns a non-empty frame so the
-    runner reaches ``save_to_iceberg``. With ``guard_blocks=True`` the
-    BaseScraper-level completeness guard is simulated by raising
-    ``ReplaceGuardError`` — the runner must catch it and exit 3 (#583).
-    """
-    from scrapers.base.base_scraper import ReplaceGuardError
+PUBLICATION_SHA = "a" * 40
 
-    df = pd.DataFrame(
-        {
-            "league": ["ENG-Premier League"] * 10,
-            "season": [2025] * 10,
-            "match_id": [str(i) for i in range(10)],
-        }
+
+def _publication_cli(monkeypatch):
+    from utils import fotmob_publication as publication
+
+    monkeypatch.setenv(publication.FOTMOB_RUNTIME_FINGERPRINT_ENV, PUBLICATION_SHA)
+    binding = publication.make_publication_binding(
+        owner="isolated",
+        data_interval_start="2026-07-20T14:00:00+00:00",
+        data_interval_end="2026-07-21T14:00:00+00:00",
+        fingerprint=PUBLICATION_SHA,
     )
-    scraper = MagicMock()
-    scraper.read_schedule.return_value = df
-    if guard_blocks:
-        scraper.save_to_iceberg.side_effect = ReplaceGuardError(
-            "new=3 rows < 90% of existing=380 for bronze.fotmob_schedule "
-            "— refusing replace_partitions save (would shrink the partition)"
-        )
-    else:
-        scraper.save_to_iceberg.return_value = "iceberg.bronze.fotmob_schedule"
-    scraper.__enter__ = MagicMock(return_value=scraper)
-    scraper.__exit__ = MagicMock(return_value=False)
-    return scraper
-
-
-def _run_main(args: list, scraper_cls) -> int:
-    """Execute ``run_fotmob_scraper.main()`` with a stubbed scraper."""
-    stub_pkg = MagicMock()
-    stub_pkg.FotMobScraper = scraper_cls
-
-    sys.argv = ["run_fotmob_scraper.py"] + args
-
-    with patch.dict(
-        sys.modules,
-        {"scrapers.fotmob": stub_pkg},
+    generation_id = publication.make_generation_id(binding)
+    arguments = ["--publication-generation-id", generation_id]
+    for field, option in (
+        ("schema", "--publication-schema"),
+        ("source", "--publication-source"),
+        ("owner", "--publication-owner"),
+        ("data_interval_start", "--publication-data-interval-start"),
+        ("data_interval_end", "--publication-data-interval-end"),
+        ("runtime_fingerprint", "--publication-runtime-fingerprint"),
     ):
-        sys.modules.pop("dags.scripts.run_fotmob_scraper", None)
-        mod = importlib.import_module("dags.scripts.run_fotmob_scraper")
-        importlib.reload(mod)
-        return mod.main()
+        arguments.extend((option, binding[field]))
+    return arguments, {"generation_id": generation_id, "binding": binding}
 
 
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
-class TestFotmobReplaceGuard:
-    """#583: completeness-guard wiring in the FotMob runner (single entity)."""
+def _daily_cli(monkeypatch):
+    """Point the exact container contract at the same repo bytes in host tests."""
 
-    @pytest.fixture
-    def temp_output(self):
-        fd, path = tempfile.mkstemp(suffix=".json", prefix="fotmob_")
-        os.close(fd)
-        yield path
-        if os.path.exists(path):
-            os.unlink(path)
+    from utils import fotmob_publication as publication
 
-    @pytest.mark.unit
-    def test_guard_refusal_exits_3(self, temp_output):
-        """save_to_iceberg raises ReplaceGuardError → exit 3 +
-        FOTMOB_REPLACE_GUARD marker (distinct from a hard failure)."""
-        scraper = _build_guard_scraper(guard_blocks=True)
+    scope_file = (
+        Path(__file__).resolve().parents[3]
+        / "configs"
+        / "fotmob"
+        / "issue-930-scopes.txt"
+    )
+    monkeypatch.setattr(
+        publication,
+        "FOTMOB_DAILY_SCOPE_FILE",
+        str(scope_file),
+    )
+    return [
+        "--daily-contract",
+        publication.FOTMOB_DAILY_CONTRACT_SCHEMA,
+        "--competition-scope-file",
+        str(scope_file),
+        "--competition-scope-sha256",
+        publication.FOTMOB_DAILY_SCOPE_SHA256,
+        "--competition-ids-sha256",
+        publication.FOTMOB_DAILY_COMPETITION_IDS_SHA256,
+        "--entities",
+        ",".join(publication.FOTMOB_DAILY_ENTITIES),
+        "--max-requests",
+        str(publication.FOTMOB_DAILY_MAX_REQUESTS),
+        "--max-direct-mib",
+        str(publication.FOTMOB_DAILY_MAX_DIRECT_MIB),
+        "--requests-per-minute",
+        str(publication.FOTMOB_DAILY_REQUESTS_PER_MINUTE),
+    ]
 
-        rc = _run_main(
-            [
-                "--leagues",
-                "ENG-Premier League",
-                "--season",
-                "2025",
-                "--entities",
-                "schedule",
-                "--output",
-                temp_output,
-            ],
-            MagicMock(return_value=scraper),
-        )
 
-        assert rc == 3
-        scraper.save_to_iceberg.assert_called_once()
-        with open(temp_output) as f:
-            payload = json.load(f)
-        assert any("FOTMOB_REPLACE_GUARD" in e for e in payload["errors"])
+def _source_refresh_cli():
+    from scrapers.fotmob.source_refresh import (
+        PLAYER_SOURCE_REFRESH_MAX_DIRECT_MIB,
+        PLAYER_SOURCE_REFRESH_MAX_REQUESTS,
+        PLAYER_SOURCE_REFRESH_PROFILE,
+        PLAYER_SOURCE_REFRESH_SHA256,
+    )
 
-    @pytest.mark.unit
-    def test_normal_path_arms_guard_exits_0(self, temp_output):
-        """Non-force run passes min_replace_ratio=0.9 (raw COUNT(*), no key)."""
-        scraper = _build_guard_scraper()
+    return [
+        "--source-refresh-profile",
+        PLAYER_SOURCE_REFRESH_PROFILE,
+        "--source-refresh-targets-sha256",
+        PLAYER_SOURCE_REFRESH_SHA256,
+        "--entities",
+        "players",
+        "--max-requests",
+        str(PLAYER_SOURCE_REFRESH_MAX_REQUESTS),
+        "--max-direct-mib",
+        str(PLAYER_SOURCE_REFRESH_MAX_DIRECT_MIB),
+    ]
 
-        rc = _run_main(
-            [
-                "--leagues",
-                "ENG-Premier League",
-                "--season",
-                "2025",
-                "--entities",
-                "schedule",
-                "--output",
-                temp_output,
-            ],
-            MagicMock(return_value=scraper),
-        )
 
-        assert rc == 0
-        kwargs = scraper.save_to_iceberg.call_args.kwargs
-        assert kwargs["min_replace_ratio"] == 0.9
-        assert kwargs["replace_partitions"] == ["league", "season"]
-        # one row per match → raw COUNT(*), no replace_guard_key
-        assert "replace_guard_key" not in kwargs
+def _run_native_admitted(mod, args, **kwargs):
+    """Exercise native planning under an explicit test-only active identity."""
 
-    @pytest.mark.unit
-    def test_full_players_flag_passed_to_scraper(self, temp_output):
-        """--full-players → FotMobScraper(full_players=True); default False."""
-        scraper = _build_guard_scraper()
-        cls = MagicMock(return_value=scraper)
-
-        rc = _run_main(
-            [
-                "--leagues",
-                "ENG-Premier League",
-                "--season",
-                "2025",
-                "--entities",
-                "schedule",
-                "--full-players",
-                "--output",
-                temp_output,
-            ],
-            cls,
-        )
-
-        assert rc == 0
-        assert cls.call_args.kwargs["full_players"] is True
-
-    @pytest.mark.unit
-    def test_full_players_defaults_false(self, temp_output):
-        scraper = _build_guard_scraper()
-        cls = MagicMock(return_value=scraper)
-
-        rc = _run_main(
-            [
-                "--leagues",
-                "ENG-Premier League",
-                "--season",
-                "2025",
-                "--entities",
-                "schedule",
-                "--output",
-                temp_output,
-            ],
-            cls,
-        )
-
-        assert rc == 0
-        assert cls.call_args.kwargs["full_players"] is False
-
-    @pytest.mark.unit
-    def test_force_replace_disarms_guard(self, temp_output):
-        """--force-replace must pass min_replace_ratio=None to the save."""
-        scraper = _build_guard_scraper()
-
-        rc = _run_main(
-            [
-                "--leagues",
-                "ENG-Premier League",
-                "--season",
-                "2025",
-                "--entities",
-                "schedule",
-                "--force-replace",
-                "--output",
-                temp_output,
-            ],
-            MagicMock(return_value=scraper),
-        )
-
-        assert rc == 0
-        kwargs = scraper.save_to_iceberg.call_args.kwargs
-        assert kwargs["min_replace_ratio"] is None
+    generation_id = "11111111-1111-4111-8111-111111111111"
+    assert mod._ACTIVE_PUBLICATION_GENERATION is None
+    args.publication_generation_id = generation_id
+    mod._ACTIVE_PUBLICATION_GENERATION = generation_id
+    try:
+        return mod._run_native(args, **kwargs)
+    finally:
+        mod._ACTIVE_PUBLICATION_GENERATION = None
 
 
 class TestFotmobNativeRunner:
@@ -220,6 +119,14 @@ class TestFotmobNativeRunner:
     def _module():
         sys.modules.pop("dags.scripts.run_fotmob_scraper", None)
         return importlib.import_module("dags.scripts.run_fotmob_scraper")
+
+    @pytest.mark.unit
+    def test_retired_legacy_scraper_is_not_a_package_export(self):
+        import scrapers
+        import scrapers.fotmob
+
+        assert "FotMobScraper" not in scrapers.__all__
+        assert not hasattr(scrapers.fotmob, "FotMobScraper")
 
     @pytest.mark.unit
     def test_scope_parser_requires_numeric_id_and_preserves_exact_season(self):
@@ -235,6 +142,16 @@ class TestFotmobNativeRunner:
             mod._parse_scopes(["47="])
 
     @pytest.mark.unit
+    def test_historical_scope_detection_handles_old_selected_competitions(self):
+        mod = self._module()
+
+        assert mod._scope_is_historical("2025", reference_year=2026)
+        assert mod._scope_is_historical("2024/2025", reference_year=2026)
+        assert not mod._scope_is_historical("2025/2026", reference_year=2026)
+        assert not mod._scope_is_historical("2026/2027", reference_year=2026)
+        assert not mod._scope_is_historical("current", reference_year=2026)
+
+    @pytest.mark.unit
     def test_max_buffered_rows_defaults_high_and_rejects_non_positive(self):
         # The repository's 20k default flushed every ~4 matches once
         # field-inventory rows piled up, defeating --commit-batch-size (#930).
@@ -247,6 +164,429 @@ class TestFotmobNativeRunner:
                 parser,
                 parser.parse_args(["--mode", "daily", "--max-buffered-rows", "0"]),
             )
+        with pytest.raises(SystemExit):
+            mod._validate_args(
+                parser,
+                parser.parse_args(["--mode", "daily", "--commit-batch-size", "0"]),
+            )
+
+    @pytest.mark.unit
+    def test_cli_requires_native_mode_and_rejects_removed_legacy_flags(self):
+        mod = self._module()
+        parser = mod._argument_parser()
+
+        with pytest.raises(SystemExit):
+            parser.parse_args([])
+        for flag, value in (
+            ("--leagues", "ENG-Premier League"),
+            ("--season", "2025"),
+            ("--force-replace", None),
+            ("--full-players", None),
+        ):
+            argv = ["--mode", "daily", flag]
+            if value is not None:
+                argv.append(value)
+            with pytest.raises(SystemExit):
+                parser.parse_args(argv)
+
+    @pytest.mark.unit
+    def test_direct_cli_requires_exact_publication_and_matching_run_id(
+        self, monkeypatch
+    ):
+        mod = self._module()
+        parser = mod._argument_parser()
+
+        with pytest.raises(SystemExit):
+            mod._validate_args(parser, parser.parse_args(["--mode", "daily"]))
+
+        publication_args, publication = _publication_cli(monkeypatch)
+        daily_args = _daily_cli(monkeypatch)
+        args = parser.parse_args(["--mode", "daily", *daily_args, *publication_args])
+        assert mod._validate_args(parser, args) == publication
+
+        args = parser.parse_args(
+            [
+                "--mode",
+                "daily",
+                *daily_args,
+                *publication_args,
+                "--run-id",
+                "11111111-1111-4111-8111-111111111111",
+            ]
+        )
+        with pytest.raises(SystemExit):
+            mod._validate_args(parser, args)
+
+    @pytest.mark.unit
+    def test_daily_contract_path_drift_fails_before_writer_or_service(
+        self, monkeypatch, tmp_path
+    ):
+        mod = self._module()
+        publication_args, _publication = _publication_cli(monkeypatch)
+        daily_args = _daily_cli(monkeypatch)
+        alternate = tmp_path / "same-bytes.txt"
+        alternate.write_bytes(
+            Path(
+                daily_args[daily_args.index("--competition-scope-file") + 1]
+            ).read_bytes()
+        )
+        daily_args[daily_args.index("--competition-scope-file") + 1] = str(alternate)
+        writer = MagicMock()
+        service = MagicMock()
+        monkeypatch.setattr(mod, "_native_writer_fence", writer)
+        monkeypatch.setattr(mod, "_build_native_service", service)
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "run_fotmob_scraper.py",
+                "--mode",
+                "daily",
+                *daily_args,
+                *publication_args,
+            ],
+        )
+
+        with pytest.raises(SystemExit):
+            mod.main()
+
+        writer.assert_not_called()
+        service.assert_not_called()
+
+    @pytest.mark.unit
+    def test_source_refresh_cli_rejects_profile_or_scope_widening(self, monkeypatch):
+        mod = self._module()
+        publication_args, publication = _publication_cli(monkeypatch)
+        parser = mod._argument_parser()
+        args = parser.parse_args(
+            ["--mode", "backfill", *_source_refresh_cli(), *publication_args]
+        )
+
+        assert mod._validate_args(parser, args) == publication
+        assert args.source_refresh_contract["target_count"] == 7
+        assert args.source_refresh_contract["player_ids"] == [
+            302783,
+            798654,
+            863822,
+            1025603,
+            1074750,
+            1292100,
+            1334842,
+        ]
+
+        rejected = (
+            ["--source-refresh-profile", "$(touch /tmp/not-allowed)"],
+            ["--scope", "47=2026/2027"],
+            ["--entities", "players,teams"],
+            ["--player-limit", "7"],
+            ["--max-requests", "63"],
+            ["--next-build-id", "operator-build"],
+        )
+        base = _source_refresh_cli()
+        for replacement in rejected:
+            option = replacement[0]
+            mutated = list(base)
+            if option in mutated:
+                mutated[mutated.index(option) + 1] = replacement[1]
+            else:
+                mutated.extend(replacement)
+            with pytest.raises(SystemExit):
+                candidate = parser.parse_args(
+                    ["--mode", "backfill", *mutated, *publication_args]
+                )
+                mod._validate_args(parser, candidate)
+
+    @pytest.mark.unit
+    def test_source_refresh_runs_only_fixed_players_and_forces_retry_observation(
+        self, monkeypatch
+    ):
+        from scrapers.fotmob.planner import RunMode
+        from scrapers.fotmob.service import OperationResult
+        from tests.unit.scrapers.test_fotmob_service import _service
+
+        mod = self._module()
+        publication_args, _publication = _publication_cli(monkeypatch)
+        parser = mod._argument_parser()
+        args = parser.parse_args(
+            ["--mode", "backfill", *_source_refresh_cli(), *publication_args]
+        )
+        mod._validate_args(parser, args)
+        service, _transport, repository = _service({}, mode=RunMode.BACKFILL)
+        repository.ensure_current_views = MagicMock(return_value=[])
+        service.discover_catalog = MagicMock(
+            side_effect=AssertionError("source refresh must not discover catalog")
+        )
+        outcomes = [
+            {"player_id": player_id, "status": "success"}
+            for player_id in args.source_refresh_contract["player_ids"]
+        ]
+        service.sync_player_snapshots = MagicMock(
+            return_value=OperationResult(
+                "player_snapshots",
+                attempted=7,
+                succeeded=7,
+                metadata={"terminal_outcomes": outcomes},
+            )
+        )
+
+        rc, report = _run_native_admitted(mod, args, service=service)
+
+        assert rc == 0, report["errors"]
+        assert report["selection"]["entities"] == ["players"]
+        assert report["selection"]["explicit_scopes"] == []
+        assert len(report["selection"]["target_outcomes"]) == 7
+        service.sync_player_snapshots.assert_called_once_with(
+            args.source_refresh_contract["player_ids"],
+            force_refresh=True,
+            capture_terminal_outcomes=True,
+        )
+        service.discover_catalog.assert_not_called()
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("inject_service", [False, True])
+    def test_native_service_cannot_run_outside_writer_guard(
+        self, monkeypatch, inject_service
+    ):
+        mod = self._module()
+        publication_args, publication = _publication_cli(monkeypatch)
+        daily_args = _daily_cli(monkeypatch)
+        args = mod._argument_parser().parse_args(
+            ["--mode", "daily", *daily_args, *publication_args]
+        )
+        args.publication_generation_id = publication["generation_id"]
+        build = MagicMock()
+        service = MagicMock() if inject_service else None
+        monkeypatch.setattr(mod, "_build_native_service", build)
+
+        with pytest.raises(RuntimeError, match="exact active publication"):
+            mod._run_native(args, service=service)
+
+        build.assert_not_called()
+        if service is not None:
+            assert service.mock_calls == []
+
+    @pytest.mark.unit
+    def test_native_writer_guard_verifies_exact_active_control_state(self, monkeypatch):
+        mod = self._module()
+        publication_args, publication = _publication_cli(monkeypatch)
+        daily_args = _daily_cli(monkeypatch)
+        args = mod._argument_parser().parse_args(
+            ["--mode", "daily", *daily_args, *publication_args]
+        )
+        assert mod._validate_args(mod._argument_parser(), args) == publication
+        events = []
+
+        @contextmanager
+        def guard(run_id, *, source):
+            events.append(("enter", run_id, source))
+            yield {
+                "generation_id": publication["generation_id"],
+                "source": "fotmob",
+                "binding": publication["binding"],
+                "status": "running",
+                "phase": "writing",
+                "active": True,
+            }
+            events.append(("exit", run_id, source))
+
+        from scrapers.fbref.control import ControlStore
+
+        monkeypatch.setattr(
+            ControlStore,
+            "from_env",
+            lambda: SimpleNamespace(guard_publication_writer=guard),
+        )
+
+        with mod._native_writer_fence(publication):
+            assert mod._ACTIVE_PUBLICATION_GENERATION == publication["generation_id"]
+            events.append(("write",))
+
+        assert mod._ACTIVE_PUBLICATION_GENERATION is None
+        assert events == [
+            ("enter", publication["generation_id"], "fotmob"),
+            ("write",),
+            ("exit", publication["generation_id"], "fotmob"),
+        ]
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        ("violation", "message"),
+        [
+            ("source", "source mismatch"),
+            ("runtime", "binding mismatch"),
+            ("inactive", "publication lock is inactive"),
+        ],
+    )
+    def test_native_writer_guard_rejects_wrong_control_state(
+        self, monkeypatch, violation, message
+    ):
+        mod = self._module()
+        _publication_args, publication = _publication_cli(monkeypatch)
+        state = {
+            "generation_id": publication["generation_id"],
+            "source": "fotmob",
+            "binding": publication["binding"],
+            "status": "running",
+            "phase": "writing",
+            "active": True,
+        }
+        if violation == "source":
+            state["source"] = "fbref"
+        elif violation == "runtime":
+            state["binding"] = {
+                **publication["binding"],
+                "runtime_fingerprint": "b" * 40,
+            }
+        else:
+            state["active"] = False
+
+        @contextmanager
+        def guard(_run_id, *, source):
+            assert source == "fotmob"
+            yield state
+
+        from scrapers.fbref.control import ControlStore
+
+        monkeypatch.setattr(
+            ControlStore,
+            "from_env",
+            lambda: SimpleNamespace(guard_publication_writer=guard),
+        )
+
+        with pytest.raises(RuntimeError, match=message):
+            with mod._native_writer_fence(publication):
+                pytest.fail("mismatched publication reached native writer")
+
+    @pytest.mark.unit
+    def test_salvage_flush_stays_inside_writer_guard(self, monkeypatch):
+        mod = self._module()
+        _publication_args, publication = _publication_cli(monkeypatch)
+        events = []
+
+        @contextmanager
+        def fence(_publication):
+            events.append("guard_enter")
+            yield {}
+            events.append("guard_exit")
+
+        def fail(_args):
+            events.append("native_write")
+            raise RuntimeError("write failed")
+
+        monkeypatch.setattr(mod, "_native_writer_fence", fence)
+        monkeypatch.setattr(
+            mod,
+            "_attest_native_runtime",
+            lambda *_args: events.append("runtime_attestation"),
+        )
+        monkeypatch.setattr(mod, "_run_native", fail)
+        monkeypatch.setattr(mod, "_salvage_flush", lambda: events.append("salvage"))
+
+        rc, payload = mod._run_native_under_fence(
+            SimpleNamespace(run_id=publication["generation_id"], mode="daily"),
+            publication,
+        )
+
+        assert rc == 1
+        assert payload["complete"] is False
+        assert events == [
+            "runtime_attestation",
+            "guard_enter",
+            "native_write",
+            "salvage",
+            "runtime_attestation",
+            "guard_exit",
+        ]
+
+    @pytest.mark.unit
+    def test_shared_owner_attests_runtime_before_writer_guard(self, monkeypatch):
+        mod = self._module()
+        from utils import fotmob_publication
+
+        evidence = {"deployment_id": "e" * 32, "owner": "shared"}
+        attest = MagicMock(return_value=evidence)
+        monkeypatch.setattr(
+            fotmob_publication,
+            "attest_fotmob_shared_runtime",
+            attest,
+        )
+
+        assert (
+            mod._attest_native_runtime(
+                SimpleNamespace(),
+                {"binding": {"owner": "shared"}},
+            )
+            == evidence
+        )
+        attest.assert_called_once_with(require_scheduled_owner=False)
+
+    @pytest.mark.unit
+    def test_post_operation_runtime_drift_fails_before_guard_release(self, monkeypatch):
+        mod = self._module()
+        _publication_args, publication = _publication_cli(monkeypatch)
+        events = []
+
+        @contextmanager
+        def fence(_publication):
+            events.append("guard_enter")
+            try:
+                yield {}
+            finally:
+                events.append("guard_exit")
+
+        def attest(*_args):
+            events.append("runtime_attestation")
+            if events.count("runtime_attestation") == 2:
+                raise RuntimeError("post-operation runtime drift")
+            return {}
+
+        def run(_args):
+            events.append("native_write")
+            return 0, {"status": "success", "complete": True}
+
+        monkeypatch.setattr(mod, "_native_writer_fence", fence)
+        monkeypatch.setattr(mod, "_attest_native_runtime", attest)
+        monkeypatch.setattr(mod, "_run_native", run)
+
+        with pytest.raises(RuntimeError, match="post-operation runtime drift"):
+            mod._run_native_under_fence(
+                SimpleNamespace(run_id=publication["generation_id"], mode="daily"),
+                publication,
+            )
+
+        assert events == [
+            "runtime_attestation",
+            "guard_enter",
+            "native_write",
+            "runtime_attestation",
+            "guard_exit",
+        ]
+
+    @pytest.mark.unit
+    def test_rejected_writer_guard_never_runs_or_salvages(self, monkeypatch):
+        mod = self._module()
+        _publication_args, publication = _publication_cli(monkeypatch)
+
+        @contextmanager
+        def rejected(_publication):
+            raise RuntimeError("rejected before write")
+            yield  # pragma: no cover
+
+        run = MagicMock()
+        salvage = MagicMock()
+        monkeypatch.setattr(mod, "_native_writer_fence", rejected)
+        monkeypatch.setattr(mod, "_attest_native_runtime", lambda *_args: {})
+        monkeypatch.setattr(mod, "_run_native", run)
+        monkeypatch.setattr(mod, "_salvage_flush", salvage)
+
+        with pytest.raises(RuntimeError, match="rejected before write"):
+            mod._run_native_under_fence(
+                SimpleNamespace(run_id=publication["generation_id"], mode="daily"),
+                publication,
+            )
+
+        run.assert_not_called()
+        salvage.assert_not_called()
 
     @pytest.mark.unit
     def test_players_entity_automatically_includes_team_squad_discovery(self):
@@ -272,17 +612,32 @@ class TestFotmobNativeRunner:
 
     @pytest.mark.unit
     def test_native_startup_failure_writes_incomplete_report_and_exits_nonzero(
-        self, tmp_path
+        self, monkeypatch, tmp_path
     ):
         mod = self._module()
         output = tmp_path / "native-report.json"
+        publication_args, publication = _publication_cli(monkeypatch)
+        daily_args = _daily_cli(monkeypatch)
         sys.argv = [
             "run_fotmob_scraper.py",
             "--mode",
             "daily",
+            *daily_args,
             "--output",
             str(output),
+            *publication_args,
         ]
+
+        @contextmanager
+        def admitted(_publication):
+            mod._ACTIVE_PUBLICATION_GENERATION = publication["generation_id"]
+            try:
+                yield {}
+            finally:
+                mod._ACTIVE_PUBLICATION_GENERATION = None
+
+        monkeypatch.setattr(mod, "_native_writer_fence", admitted)
+        monkeypatch.setattr(mod, "_attest_native_runtime", lambda *_args: {})
 
         with patch.object(
             mod,
@@ -346,11 +701,12 @@ class TestFotmobNativeRunner:
             ]
         )
 
-        rc, report = mod._run_native(args, service=service)
+        rc, report = _run_native_admitted(mod, args, service=service)
 
         assert rc == 0
         assert report["status"] == "success"
         assert report["complete"] is True
+        assert mod._ACTIVE_NATIVE_SERVICE is None
         assert report["selection"]["explicit_scopes"] == ["47=2025/2026"]
         assert report["transport"]["proxy_bytes"] == 0
         # The no-season discovery response selected this exact scope, so the
@@ -361,7 +717,7 @@ class TestFotmobNativeRunner:
         repository.ensure_current_views.assert_called_once_with()
 
     @pytest.mark.unit
-    def test_backfill_skips_only_fully_completed_scope_plan(self):
+    def test_backfill_skips_only_scope_completed_by_current_publication_run(self):
         from scrapers.fotmob.transport import canonicalize_target
         from tests.unit.scrapers.test_fotmob_service import (
             _league_payload,
@@ -381,14 +737,137 @@ class TestFotmobNativeRunner:
             ["--mode", "backfill", "--scope", "47=2025/2026"]
         )
 
-        rc, report = mod._run_native(args, service=service)
+        rc, report = _run_native_admitted(mod, args, service=service)
 
         assert rc == 0
         assert report["status"] == "success"
         repository.completed_scope_keys.assert_called_once_with(
-            report["selection"]["scope_plan_signature"]
+            report["selection"]["scope_plan_signature"],
+            run_id=service.run_id,
         )
         assert not any("season=2025%2F2026" in url for url, _ in transport.calls)
+
+    @pytest.mark.unit
+    def test_new_backfill_generation_reprocesses_prior_generation_completion(self):
+        from scrapers.fotmob.planner import (
+            RunMode,
+            deterministic_plan_signature,
+        )
+        from scrapers.fotmob.repository import ManifestStatus, TargetCommit
+        from scrapers.fotmob.transport import canonicalize_target
+        from tests.unit.scrapers.test_fotmob_service import (
+            _league_payload,
+            _service,
+        )
+
+        mod = self._module()
+        responses = {
+            canonicalize_target("allLeagues").canonical_url: {
+                "countries": [{"leagues": [{"id": 47, "name": "Premier League"}]}]
+            },
+            canonicalize_target("leagues", {"id": 47}).canonical_url: (
+                _league_payload()
+            ),
+            canonicalize_target(
+                "leagues", {"id": 47, "season": "2025/2026"}
+            ).canonical_url: _league_payload(),
+        }
+        service, transport, repository = _service(responses, mode=RunMode.BACKFILL)
+        signature = deterministic_plan_signature(
+            {"season"},
+            policy={
+                "match_policy": "finished_only",
+                "leaderboard_policy": "all_advertised",
+                "team_policy": "global_observed_snapshot",
+                "player_policy": "global_observed_snapshot",
+            },
+        )
+        repository.record(
+            TargetCommit(
+                run_id="prior-generation",
+                target_type="scope_completion",
+                target_key="a" * 64,
+                status=ManifestStatus.SUCCESS,
+                competition_id="47",
+                source_season_key="2025/2026",
+                entity_id=signature,
+                content_hash="b" * 64,
+            )
+        )
+        args = mod._argument_parser().parse_args(
+            [
+                "--mode",
+                "backfill",
+                "--scope",
+                "47=2025/2026",
+                "--entities",
+                "season",
+            ]
+        )
+
+        rc, report = _run_native_admitted(mod, args, service=service)
+
+        assert rc == 0, report["errors"]
+        assert report["selection"]["completed_scopes"] == ["47=2025/2026"]
+        assert repository.completed_scope_keys(signature, run_id=service.run_id) == {
+            (47, "2025/2026")
+        }
+        assert any("leagues?id=47" in url for url, _ in transport.calls)
+
+    @pytest.mark.unit
+    def test_transfer_competition_limit_applies_after_completion_filter(self):
+        from scrapers.fotmob.transport import canonicalize_target
+        from tests.unit.scrapers.test_fotmob_service import _league_payload, _service
+
+        mod = self._module()
+        responses = {
+            canonicalize_target("allLeagues").canonical_url: {
+                "countries": [
+                    {
+                        "leagues": [
+                            {"id": 47, "name": "Premier League"},
+                            {"id": 48, "name": "Competition 48"},
+                        ]
+                    }
+                ]
+            },
+            canonicalize_target("leagues", {"id": 47}).canonical_url: _league_payload(),
+            canonicalize_target(
+                "transfers", {"leagueIds": "48", "page": 1}
+            ).canonical_url: {"hits": 0, "page": 1, "transfers": []},
+        }
+        service, transport, repository = _service(responses, mode="backfill")
+        repository.completed_scope_keys = MagicMock(
+            return_value={(47, "2025/2026"), (47, "2024/2025")}
+        )
+        repository.completed_competition_ids = MagicMock(return_value={47})
+        repository.ensure_current_views = MagicMock(return_value=[])
+        args = mod._argument_parser().parse_args(
+            [
+                "--mode",
+                "backfill",
+                "--entities",
+                "transfers",
+                "--competition-limit",
+                "1",
+            ]
+        )
+
+        rc, report = _run_native_admitted(mod, args, service=service)
+
+        assert rc == 0, report["errors"]
+        transfer_calls = [url for url, _ in transport.calls if "/transfers?" in url]
+        assert transfer_calls == [
+            canonicalize_target(
+                "transfers", {"leagueIds": "48", "page": 1}
+            ).canonical_url
+        ]
+        assert repository.completed_scope_keys.call_args.kwargs == {
+            "run_id": service.run_id
+        }
+        assert repository.completed_competition_ids.call_args.kwargs == {
+            "run_id": service.run_id
+        }
 
     @pytest.mark.unit
     def test_players_receive_deduplicated_ids_from_team_snapshots(self):
@@ -429,12 +908,77 @@ class TestFotmobNativeRunner:
             ]
         )
 
-        rc, report = mod._run_native(args, service=service)
+        rc, report = _run_native_admitted(mod, args, service=service)
 
         assert rc == 0
         assert report["selection"]["entities"] == ["players", "teams"]
         service.sync_player_snapshots.assert_called_once_with(
             {10, 11}, build_id="build-1", limit=2
+        )
+
+    @pytest.mark.unit
+    def test_replay_player_batch_is_not_truncated_by_network_request_budget(self):
+        from scrapers.fotmob.planner import BudgetLedger, RunMode, TransportBudget
+        from scrapers.fotmob.service import OperationResult
+        from scrapers.fotmob.transport import canonicalize_target
+        from tests.unit.scrapers.test_fotmob_service import (
+            _league_payload,
+            _service,
+        )
+
+        mod = self._module()
+        responses = {
+            canonicalize_target("allLeagues").canonical_url: {
+                "countries": [{"leagues": [{"id": 47, "name": "Premier League"}]}]
+            },
+            canonicalize_target("leagues", {"id": 47}).canonical_url: (
+                _league_payload()
+            ),
+            canonicalize_target(
+                "leagues", {"id": 47, "season": "2025/2026"}
+            ).canonical_url: _league_payload(),
+        }
+        service, _, _ = _service(responses, mode=RunMode.REPLAY)
+        service.ledger = BudgetLedger(
+            TransportBudget(max_requests=1, max_direct_bytes=10_000_000)
+        )
+        player_ids = set(range(10_000, 10_250))
+        service.sync_team_snapshots = MagicMock(
+            return_value=(
+                OperationResult("team_snapshots", attempted=1, succeeded=1),
+                player_ids,
+            )
+        )
+        service.sync_player_snapshots = MagicMock(
+            return_value=OperationResult(
+                "player_snapshots",
+                attempted=len(player_ids),
+                succeeded=len(player_ids),
+            )
+        )
+        args = mod._argument_parser().parse_args(
+            [
+                "--mode",
+                "replay",
+                "--scope",
+                "47=2025/2026",
+                "--entities",
+                "players",
+                "--max-requests",
+                "1",
+            ]
+        )
+        raw_store = SimpleNamespace(has_target=MagicMock(return_value=True))
+
+        rc, report = _run_native_admitted(
+            mod, args, service=service, raw_store=raw_store
+        )
+
+        assert rc == 0, report["errors"]
+        service.sync_player_snapshots.assert_called_once_with(
+            player_ids,
+            build_id=None,
+            limit=len(player_ids),
         )
 
     @pytest.mark.unit
@@ -492,7 +1036,7 @@ class TestFotmobNativeRunner:
         )
         first_service, _ = make_service(3, "backfill-1")
 
-        first_rc, first_report = mod._run_native(args, service=first_service)
+        first_rc, first_report = _run_native_admitted(mod, args, service=first_service)
 
         assert first_rc == 1
         assert first_report["complete"] is False
@@ -500,7 +1044,9 @@ class TestFotmobNativeRunner:
         assert repository.completed_scope_keys(signature) == set()
 
         second_service, second_transport = make_service(3, "backfill-2")
-        second_rc, second_report = mod._run_native(args, service=second_service)
+        second_rc, second_report = _run_native_admitted(
+            mod, args, service=second_service
+        )
 
         assert second_rc == 0
         assert second_report["complete"] is True
@@ -559,13 +1105,209 @@ class TestFotmobNativeRunner:
             ]
         )
 
-        rc, report = mod._run_native(args, service=service)
+        rc, report = _run_native_admitted(mod, args, service=service)
 
         assert rc == 0 and report["complete"] is True
         assert [call.args[0] for call in service.sync_season.call_args_list] == [
             48,
             47,
         ]
+
+    @pytest.mark.unit
+    def test_daily_contract_filters_to_dynamic_current_issue_930_cohort(self):
+        from scrapers.fotmob.domain import (
+            CompetitionRef,
+            ScopeClassification,
+            ScopeDecision,
+            ScopeRef,
+            SeasonBundle,
+            SeasonRef,
+        )
+        from scrapers.fotmob.planner import (
+            MANDATORY_COMPETITION_IDS,
+            BudgetLedger,
+            RunMode,
+            TransportBudget,
+            plan_seasons,
+        )
+        from scrapers.fotmob.service import (
+            CatalogResult,
+            CompetitionDiscoveryResult,
+            OperationResult,
+            RunReport,
+        )
+        from utils import fotmob_publication as publication
+
+        mod = self._module()
+        cohort = publication.FOTMOB_DAILY_COMPETITION_IDS
+        competitions = [
+            CompetitionRef(value, f"Competition {value}") for value in (*cohort, 999999)
+        ]
+        classifications = tuple(
+            ScopeClassification(
+                competition=item,
+                decision=ScopeDecision.INCLUDED,
+                reason="test",
+                policy_rule="test",
+            )
+            for item in competitions
+        )
+        seasons = {
+            item.competition_id: SeasonRef(
+                item.competition_id,
+                f"dynamic-{item.competition_id}",
+                is_selected=True,
+                is_latest=True,
+            )
+            for item in competitions
+        }
+        repository = SimpleNamespace(
+            scope_completion_times=MagicMock(return_value={}),
+            competition_completion_times=MagicMock(return_value={}),
+            flush=MagicMock(return_value=[]),
+            ensure_current_views=MagicMock(return_value=[]),
+        )
+        service = SimpleNamespace(
+            transport=SimpleNamespace(max_attempts=1),
+            repository=repository,
+            ledger=BudgetLedger(
+                TransportBudget(
+                    max_requests=publication.FOTMOB_DAILY_MAX_REQUESTS,
+                    max_direct_bytes=(
+                        publication.FOTMOB_DAILY_MAX_DIRECT_MIB * 1024 * 1024
+                    ),
+                )
+            ),
+            discover_catalog=MagicMock(
+                return_value=CatalogResult(
+                    OperationResult(
+                        "competition_catalog",
+                        attempted=1,
+                        succeeded=len(competitions),
+                        counts={"competitions": len(competitions)},
+                    ),
+                    discovery=object(),
+                    classifications=classifications,
+                )
+            ),
+        )
+        discovered_ids = []
+
+        def discover_competitions(candidates):
+            discovered_ids.extend(
+                item.competition.competition_id for item in candidates
+            )
+            return [
+                CompetitionDiscoveryResult(
+                    item.competition,
+                    item,
+                    OperationResult("competition_seasons", attempted=1, succeeded=1),
+                    seasons=(seasons[item.competition.competition_id],),
+                )
+                for item in candidates
+            ]
+
+        def sync_season(competition_id, source_season_key, **_kwargs):
+            return OperationResult("season_bundle", attempted=1, succeeded=1), (
+                SeasonBundle(
+                    scope=ScopeRef(competition_id, source_season_key),
+                    details={},
+                    capabilities={},
+                )
+            )
+
+        service.discover_competitions = MagicMock(side_effect=discover_competitions)
+        service.sync_season = MagicMock(side_effect=sync_season)
+        service.sync_leaderboards = MagicMock(
+            side_effect=lambda _bundle: OperationResult("leaderboards")
+        )
+        service.sync_match_payloads = MagicMock(
+            side_effect=lambda _bundle, **_kwargs: OperationResult("match_payloads")
+        )
+        service.sync_team_snapshots = MagicMock(
+            side_effect=lambda _bundle, **_kwargs: (
+                OperationResult("team_snapshots"),
+                set(),
+            )
+        )
+        service.sync_player_snapshots = MagicMock(
+            side_effect=lambda _ids, **_kwargs: OperationResult("player_snapshots")
+        )
+        service.record_scope_completion = MagicMock(return_value=[])
+        service.sync_transfers = MagicMock(
+            side_effect=lambda competition_id, **_kwargs: OperationResult(
+                "transfer_events",
+                attempted=1,
+                succeeded=1,
+                counts={"events": 0},
+                metadata={"competition_id": competition_id, "source_hits": 0},
+            )
+        )
+        service.record_competition_completion = MagicMock(return_value=[])
+        service.report = MagicMock(
+            side_effect=lambda operations, started_at: RunReport(
+                run_id="daily-generation",
+                mode="daily",
+                started_at=started_at,
+                completed_at=started_at,
+                operations=list(operations),
+                budget=service.ledger.as_dict(),
+                transport={
+                    "attempts": 0,
+                    "direct_bytes": 0,
+                    "proxy_bytes": 0,
+                },
+            )
+        )
+        args = mod._argument_parser().parse_args(
+            [
+                "--mode",
+                "daily",
+                "--entities",
+                ",".join(publication.FOTMOB_DAILY_ENTITIES),
+                "--max-requests",
+                str(publication.FOTMOB_DAILY_MAX_REQUESTS),
+                "--max-direct-mib",
+                str(publication.FOTMOB_DAILY_MAX_DIRECT_MIB),
+                "--requests-per-minute",
+                str(publication.FOTMOB_DAILY_REQUESTS_PER_MINUTE),
+            ]
+        )
+        args.daily_competition_ids = cohort
+        args.daily_competition_contract = {
+            "schema": publication.FOTMOB_DAILY_CONTRACT_SCHEMA,
+            "competition_ids": list(cohort),
+        }
+
+        rc, report = _run_native_admitted(mod, args, service=service)
+
+        assert rc == 0, report["errors"]
+        expected_discovery_order = sorted(
+            cohort,
+            key=lambda value: (
+                value not in MANDATORY_COMPETITION_IDS,
+                value,
+            ),
+        )
+        assert discovered_ids == expected_discovery_order
+        expected_scope_order = [
+            item.competition_id
+            for item in plan_seasons(
+                classifications,
+                seasons.values(),
+                mode=RunMode.DAILY,
+            )
+            if item.competition_id in cohort
+        ]
+        assert report["selection"]["planned_scopes"] == [
+            f"{value}=dynamic-{value}" for value in expected_scope_order
+        ]
+        assert (
+            report["selection"]["completed_scopes"]
+            == report["selection"]["planned_scopes"]
+        )
+        assert report["selection"]["completed_transfer_competition_ids"] == list(cohort)
+        assert 999999 not in discovered_ids
 
     @pytest.mark.unit
     def test_unadvertised_exact_scope_is_incomplete(self):
@@ -587,7 +1329,7 @@ class TestFotmobNativeRunner:
             ["--mode", "backfill", "--scope", "47=1900/1901"]
         )
 
-        rc, report = mod._run_native(args, service=service)
+        rc, report = _run_native_admitted(mod, args, service=service)
 
         assert rc == 1
         assert report["status"] == "incomplete"
@@ -621,7 +1363,7 @@ class TestFotmobNativeRunner:
             ["--mode", "daily", "--scope", "47=2025/2026", "--entities", "season"]
         )
 
-        rc, report = mod._run_native(args, service=service)
+        rc, report = _run_native_admitted(mod, args, service=service)
 
         assert rc == 0
         repository.flush.assert_called_once_with()
@@ -651,7 +1393,7 @@ class TestFotmobNativeRunner:
             ["--mode", "daily", "--scope", "47=2025/2026", "--entities", "season"]
         )
 
-        rc, report = mod._run_native(args, service=service)
+        rc, report = _run_native_admitted(mod, args, service=service)
 
         assert rc == 1
         assert any("commit flush" in error for error in report["errors"])
@@ -673,17 +1415,34 @@ class TestFotmobNativeRunner:
             raise RuntimeError("mid-scope Trino failure")
 
         monkeypatch.setattr(mod, "_run_native", fake_run_native)
+        publication_args, _publication = _publication_cli(monkeypatch)
+        daily_args = _daily_cli(monkeypatch)
+        monkeypatch.setattr(
+            mod,
+            "_native_writer_fence",
+            lambda _publication: nullcontext({}),
+        )
+        monkeypatch.setattr(mod, "_attest_native_runtime", lambda *_args: {})
         out = tmp_path / "report.json"
         monkeypatch.setattr(
             sys,
             "argv",
-            ["run_fotmob_scraper.py", "--mode", "daily", "--output", str(out)],
+            [
+                "run_fotmob_scraper.py",
+                "--mode",
+                "daily",
+                *daily_args,
+                "--output",
+                str(out),
+                *publication_args,
+            ],
         )
 
         rc = mod.main()
 
         assert rc == 1
         service.repository.flush.assert_called_once_with()
+        assert mod._ACTIVE_NATIVE_SERVICE is None
         assert json.loads(out.read_text())["complete"] is False
 
     @pytest.mark.unit
@@ -703,11 +1462,27 @@ class TestFotmobNativeRunner:
             handler(signal_module.SIGTERM, None)
 
         monkeypatch.setattr(mod, "_run_native", fake_run_native)
+        publication_args, _publication = _publication_cli(monkeypatch)
+        daily_args = _daily_cli(monkeypatch)
+        monkeypatch.setattr(
+            mod,
+            "_native_writer_fence",
+            lambda _publication: nullcontext({}),
+        )
+        monkeypatch.setattr(mod, "_attest_native_runtime", lambda *_args: {})
         out = tmp_path / "report.json"
         monkeypatch.setattr(
             sys,
             "argv",
-            ["run_fotmob_scraper.py", "--mode", "daily", "--output", str(out)],
+            [
+                "run_fotmob_scraper.py",
+                "--mode",
+                "daily",
+                *daily_args,
+                "--output",
+                str(out),
+                *publication_args,
+            ],
         )
 
         try:
@@ -716,6 +1491,8 @@ class TestFotmobNativeRunner:
             signal_module.signal(signal_module.SIGTERM, signal_module.SIG_DFL)
 
         assert rc == 1
+        service.cancel.assert_called_once_with()
         service.repository.flush.assert_called_once_with()
+        assert mod._ACTIVE_NATIVE_SERVICE is None
         payload = json.loads(out.read_text())
         assert any("terminated by signal" in e for e in payload["errors"])

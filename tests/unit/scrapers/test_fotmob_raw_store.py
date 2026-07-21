@@ -48,6 +48,7 @@ def test_round_trip_is_content_addressed_and_deterministic(tmp_path):
     assert record.decoded_bytes == len(body)
     assert record.validated_at == record.fetched_at
     assert gzip.decompress(store._read_bytes(record.blob_key)) == body
+    assert store.load_target_key(target.target_key) == (body, record)
 
 
 def test_equivalent_query_order_uses_one_target_manifest(tmp_path):
@@ -66,9 +67,7 @@ def test_equivalent_query_order_uses_one_target_manifest(tmp_path):
 def test_validated_selected_season_blob_can_be_durably_aliased(tmp_path):
     store = _store(tmp_path)
     selected = canonicalize_target("leagues", {"id": 47})
-    exact = canonicalize_target(
-        "leagues", {"id": 47, "season": "2025/2026"}
-    )
+    exact = canonicalize_target("leagues", {"id": 47, "season": "2025/2026"})
     body = b'{"details":{"selectedSeason":"2025/2026"}}'
     source_record = store.store(selected, body, etag='"selected-v1"')
 
@@ -107,6 +106,33 @@ def test_missing_corrupt_and_mismatched_targets_fail_closed(tmp_path):
     store._write_bytes(manifest_key, json.dumps(manifest).encode())
     with pytest.raises(RawTargetCorrupt):
         store.load(target)
+    with pytest.raises(RawTargetCorrupt):
+        store.load_target_key(target.target_key)
+
+
+def test_target_key_load_rejects_manifest_blob_path_substitution(tmp_path):
+    store = FotMobRawStore.from_uri(tmp_path.as_uri())
+    target = canonicalize_target("leagues", {"id": 47})
+    store.store(target, b'{"ok":true}')
+    manifest_key = store._manifest_key(target.target_key)
+    manifest = json.loads(store._read_bytes(manifest_key))
+    manifest["blob_key"] = "../../outside.json.gz"
+    store._write_bytes(manifest_key, json.dumps(manifest).encode())
+
+    with pytest.raises(RawTargetCorrupt, match="Target mismatch"):
+        store.load_target_key(target.target_key)
+
+    manifest["blob_key"] = store._blob_key(manifest["content_hash"])
+    manifest["raw_uri"] = "file:///unrelated/object.json.gz"
+    store._write_bytes(manifest_key, json.dumps(manifest).encode())
+    with pytest.raises(RawTargetCorrupt, match="Target mismatch"):
+        store.load_target_key(target.target_key)
+
+    manifest["raw_uri"] = store._uri(manifest["blob_key"])
+    manifest["canonical_url"] = None
+    store._write_bytes(manifest_key, json.dumps(manifest).encode())
+    with pytest.raises(RawTargetCorrupt, match="Target mismatch"):
+        store.load_target_key(target.target_key)
 
 
 def test_store_rejects_invalid_target_keys_and_non_bytes(tmp_path):

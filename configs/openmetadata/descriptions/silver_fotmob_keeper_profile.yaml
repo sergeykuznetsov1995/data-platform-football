@@ -6,10 +6,12 @@ table:
   description: |
     Широкий профиль вратаря за сезон из FotMob — один row на
     (player_id, league, season). Симметрична silver.fbref_keeper_profile, но из
-    FotMob Bronze. Источники: bronze.fotmob_player_details (identity/команда) +
-    bronze.fotmob_player_stats (сезонные статы в LONG-формате, развёрнуты в
-    wide через MAX(CASE WHEN stat_name=...) PIVOT). Дедупликация details —
-    ROW_NUMBER PARTITION BY (player_id, league, season) ORDER BY _ingested_at DESC.
+    source-native FotMob Bronze. Сезонный scope строится из
+    bronze.fotmob_competition_seasons_current, season_teams_current и
+    squad_snapshots_current; identity берётся из player_snapshots_current, а
+    LONG-статы из leaderboards_current разворачиваются через
+    MAX(CASE WHEN stat_name=...) PIVOT. Native current views уже выбирают
+    последний успешный manifest batch.
     Фильтр: NOT is_coach AND LOWER(position_description)='keeper' (только вратари).
     Время-инвариантные атрибуты (дата рождения, рост, нога, страна) живут в
     silver.fotmob_player_profile, не здесь. Идентификаторы сырые FotMob —

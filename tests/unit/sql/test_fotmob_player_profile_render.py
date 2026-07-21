@@ -21,6 +21,11 @@ import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 SQL_PATH = PROJECT_ROOT / "dags" / "sql" / "silver" / "fotmob_player_profile.sql"
+DAG_PATH = PROJECT_ROOT / "dags" / "dag_transform_fotmob_silver.py"
+METADATA_PATH = (
+    PROJECT_ROOT / "configs" / "openmetadata" / "descriptions"
+    / "silver_fotmob_player_profile.yaml"
+)
 
 
 def _read_sql() -> str:
@@ -90,6 +95,11 @@ class TestFotmobPlayerProfileSql:
             "season slug must be computed ONLY inside season_axis "
             "(exactly the 3 LPAD calls of the framework block)"
         )
+
+    def test_uses_canonical_league_map_placeholder(self):
+        sql = _read_sql()
+        assert sql.count("{{ fotmob_league_map_values_sql }}") == 1
+        assert "(47,  'ENG-Premier League')" not in sql
 
     def test_filters_out_coaches(self):
         sql = _strip_comments(_read_sql())
@@ -170,6 +180,7 @@ class TestFotmobPlayerProfileSql:
             "nationality",
             "country_code",
             "foot",
+            "is_current_season",
             "_bronze_ingested_at",
             "league",
             "season",
@@ -177,6 +188,40 @@ class TestFotmobPlayerProfileSql:
             assert re.search(rf"\b{col}\b", sql), (
                 f"fotmob_player_profile.sql must project `{col}`"
             )
+
+    def test_current_season_flag_follows_both_scope_branches(self):
+        """Roster and leaderboard rows retain season-axis truth in the output."""
+        sql = _strip_comments(_read_sql())
+        assert re.search(
+            r"player_scope\s+AS\s*\(.*?is_current_season.*?UNION\s+ALL"
+            r".*?is_current_season",
+            sql, re.IGNORECASE | re.DOTALL,
+        )
+        assert re.search(
+            r"d\.scope_is_current_season\s+AS\s+is_current_season",
+            sql, re.IGNORECASE,
+        )
+
+    @pytest.mark.parametrize("column", ["height_cm", "foot"])
+    def test_attribute_coverage_is_current_roster_scoped(self, column):
+        """Historical leaderboard rows have no historical squad attributes."""
+        dag_source = DAG_PATH.read_text(encoding="utf-8")
+        match = re.search(
+            rf"CHECK\.coverage\(\s*'silver\.fotmob_player_profile'\s*,"
+            rf"\s*column='{column}'\s*,(?P<body>.*?)\)",
+            dag_source, re.DOTALL,
+        )
+        assert match, f"missing {column} coverage check"
+        assert "where='is_current_season'" in match.group("body"), (
+            f"{column} coverage must exclude historical leaderboard rows"
+        )
+
+    def test_openmetadata_declares_current_season_boolean(self):
+        metadata = METADATA_PATH.read_text(encoding="utf-8")
+        assert re.search(
+            r"^\s*-\s+name:\s+is_current_season\s*$", metadata, re.MULTILINE
+        )
+        assert "current" in metadata.lower()
 
     def test_pure_select_no_create_table(self):
         sql = _strip_comments(_read_sql())

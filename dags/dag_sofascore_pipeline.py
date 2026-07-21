@@ -20,15 +20,21 @@ the exact master patterns:
   lock.  This DAG therefore runs in the master's own 14:00 UTC slot so the
   ``logical_date - 8h`` math resolves the same source run.
 - E3/E4 run strictly after xref (fresh ``silver.xref_*`` identities).
+- The exact isolated FotMob interval/release generation must be ``ready`` and
+  is atomically claimed before xref.  The claim is held through E4 and is
+  published/released only after E4 succeeds.
 
 The FBref publication lock is NOT released here: with the master paused the
 lock is re-acquired by every scheduled FBref run (idempotent acquire,
 TTL 8 days) — the same steady state production has been in since the pause.
+The separate FotMob lock *is* completed here because this DAG is the active
+consumer while master is paused; any failed xref/E3/E4 path retains it.
 
 Mutual exclusion contract: ``dag_ingest_sofascore`` was removed from the
-master's ``TRIGGERED_INGESTION_DAGS`` (#951) — if the master is ever
-unpaused, pause THIS DAG in the same change; running both would double the
-xref/e3/e4 publication triggers in the same daily slot.
+master's ``TRIGGERED_INGESTION_DAGS`` (#951). Operationally this DAG must still
+be paused when master is unpaused. If that invariant is misconfigured, both
+orchestrators contend for the same exact FotMob consumer claim and the second
+fails before xref instead of racing shared tables.
 
 One source = one DAG (#782) stays intact: this file adds no scraping tasks,
 it only sequences existing DAGs.
@@ -40,9 +46,15 @@ from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 from airflow.sensors.external_task import ExternalTaskSensor
+from airflow.sensors.python import PythonSensor
 
 from utils.config import SCHEDULES
 from utils.default_args import DEFAULT_ARGS
+from utils.fotmob_publication import (
+    finalize_fotmob_publication_consumer,
+    fotmob_consumer_trigger_conf,
+    wait_and_claim_fotmob_publication,
+)
 
 
 def resolve_fbref_publication_scope(**context):
@@ -59,6 +71,27 @@ def resolve_fbref_publication_scope(**context):
     from dag_master_pipeline import resolve_scheduled_fbref_control_run
 
     return resolve_scheduled_fbref_control_run(**context)
+
+
+def wait_for_exact_fotmob_publication(**context):
+    """Claim this 14:00 slot's isolated FotMob generation before xref."""
+
+    return wait_and_claim_fotmob_publication(
+        publication_owner='isolated',
+        **context,
+    )
+
+
+def finalize_exact_fotmob_publication(**context):
+    """Publish only after E4; every failed consumer path retains the lock."""
+
+    return finalize_fotmob_publication_consumer(
+        publication_owner='isolated',
+        report_task_id='trigger_e4_transforms',
+        sensor_task_id='wait_for_fotmob_publication',
+        release_unclaimed_ready_on_failure=False,
+        **context,
+    )
 
 PIPELINE_ARGS = {
     **DEFAULT_ARGS,
@@ -115,6 +148,16 @@ with DAG(
         check_existence=True,
     )
 
+    wait_for_fotmob_publication = PythonSensor(
+        task_id='wait_for_fotmob_publication',
+        python_callable=wait_for_exact_fotmob_publication,
+        mode='reschedule',
+        poke_interval=60,
+        timeout=timedelta(hours=16).total_seconds(),
+        execution_timeout=timedelta(minutes=5),
+        retries=0,
+    )
+
     resolve_fbref_scope = PythonOperator(
         task_id='resolve_fbref_publication_scope',
         python_callable=resolve_fbref_publication_scope,
@@ -128,8 +171,7 @@ with DAG(
         trigger_run_id='sofascore_xref__{{ dag.dag_id }}__{{ run_id }}',
         logical_date='{{ ti.start_date }}',
         conf={
-            'publication_owner': 'dag_sofascore_pipeline',
-            'master_run_id': '{{ run_id }}',
+            **fotmob_consumer_trigger_conf('dag_sofascore_pipeline'),
             'fbref_source_dag_id': 'dag_ingest_fbref',
             'fbref_control_run_id': (
                 "{{ ti.xcom_pull(task_ids="
@@ -157,6 +199,7 @@ with DAG(
         failed_states=['failed'],
         reset_dag_run=True,
         execution_date='{{ ds }}',
+        conf=fotmob_consumer_trigger_conf('dag_sofascore_pipeline'),
         execution_timeout=timedelta(hours=12),
         retries=0,
         trigger_rule='all_success',
@@ -171,13 +214,25 @@ with DAG(
         failed_states=['failed'],
         reset_dag_run=True,
         execution_date='{{ ds }}',
+        conf=fotmob_consumer_trigger_conf('dag_sofascore_pipeline'),
         execution_timeout=timedelta(hours=12),
         retries=0,
         trigger_rule='all_success',
     )
 
+    finalize_fotmob_publication = PythonOperator(
+        task_id='finalize_fotmob_publication',
+        python_callable=finalize_exact_fotmob_publication,
+        trigger_rule='all_done',
+        execution_timeout=timedelta(minutes=5),
+        retries=0,
+    )
+
     wait_for_scheduled_fbref >> resolve_fbref_scope
     trigger_sofascore_ingest >> trigger_xref_transforms
     resolve_fbref_scope >> trigger_xref_transforms
+    wait_for_fotmob_publication >> trigger_xref_transforms
     trigger_xref_transforms >> trigger_e3_transforms
     trigger_e3_transforms >> trigger_e4_transforms
+    [wait_for_fotmob_publication, trigger_e4_transforms] \
+        >> finalize_fotmob_publication

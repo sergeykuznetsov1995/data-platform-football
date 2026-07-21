@@ -14,6 +14,7 @@ import json
 import os
 import threading
 import uuid
+import zlib
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import PurePosixPath
@@ -307,15 +308,20 @@ class FotMobRawStore:
             self._write_bytes(target_manifest_key, manifest)
         return record
 
-    def load(
-        self,
-        target: CanonicalTargetLike,
-    ) -> tuple[bytes, RawJsonRecord]:
-        manifest_key = self._manifest_key(target.target_key)
+    def load_target_key(self, target_key: str) -> tuple[bytes, RawJsonRecord]:
+        """Load a committed target by its durable manifest identity.
+
+        Next.js build ids are part of player URLs and may rotate between the
+        original fetch and an offline parser replay.  The ingest manifest keeps
+        the exact target key, so replay can recover the canonical URL from the
+        raw manifest without guessing one historical build id for every
+        player.  The URL-to-key digest is re-derived before any bytes are
+        returned; a caller still validates the URL allowlist at transport level.
+        """
+
+        manifest_key = self._manifest_key(target_key)
         if not self._exists(manifest_key):
-            raise RawTargetNotFound(
-                f"No raw FotMob manifest for {target.canonical_url}"
-            )
+            raise RawTargetNotFound(f"No raw FotMob manifest for target {target_key}")
         try:
             payload = json.loads(self._read_bytes(manifest_key).decode("utf-8"))
             record = RawJsonRecord(**payload)
@@ -326,8 +332,19 @@ class FotMobRawStore:
 
         if (
             record.manifest_version != RAW_MANIFEST_VERSION
-            or record.target_key != target.target_key
-            or record.canonical_url != target.canonical_url
+            or record.source != "fotmob"
+            or record.target_key != target_key
+            or not isinstance(record.canonical_url, str)
+            or not record.canonical_url
+            or not isinstance(record.content_hash, str)
+            or len(record.content_hash) != 64
+            or any(
+                character not in "0123456789abcdef" for character in record.content_hash
+            )
+            or record.blob_key != self._blob_key(record.content_hash)
+            or record.raw_uri != self._uri(record.blob_key)
+            or hashlib.sha256(record.canonical_url.encode("utf-8")).hexdigest()
+            != target_key
         ):
             raise RawTargetCorrupt(
                 f"Target mismatch in raw FotMob manifest: {manifest_key}"
@@ -335,7 +352,7 @@ class FotMobRawStore:
         try:
             compressed = self._read_bytes(record.blob_key)
             body = gzip.decompress(compressed)
-        except (gzip.BadGzipFile, EOFError) as exc:
+        except (gzip.BadGzipFile, EOFError, zlib.error) as exc:
             with self._write_lock:
                 self._verified_blobs.discard(record.blob_key)
             raise RawTargetCorrupt(f"Invalid gzip blob: {record.blob_key}") from exc
@@ -349,18 +366,21 @@ class FotMobRawStore:
             with self._write_lock:
                 self._verified_blobs.discard(record.blob_key)
             raise RawTargetCorrupt(
-                f"Content mismatch for {target.canonical_url}: "
+                f"Content mismatch for {record.canonical_url}: "
                 f"expected={record.content_hash}, actual={actual_hash}"
             )
         with self._write_lock:
             self._verified_blobs.add(record.blob_key)
         return body, record
 
-    def load_metadata(self, target: CanonicalTargetLike) -> RawJsonRecord:
-        """Return validated metadata (and validate the blob) for simplicity."""
-        _, record = self.load(target)
-        return record
-
-
-# Short alias for call sites that prefer the generic name.
-RawStore = FotMobRawStore
+    def load(
+        self,
+        target: CanonicalTargetLike,
+    ) -> tuple[bytes, RawJsonRecord]:
+        body, record = self.load_target_key(target.target_key)
+        if record.canonical_url != target.canonical_url:
+            raise RawTargetCorrupt(
+                "Target URL mismatch in raw FotMob manifest: "
+                f"{self._manifest_key(target.target_key)}"
+            )
+        return body, record

@@ -545,6 +545,7 @@ class Lease:
     finalized_at: float = 0.0
     hosts: dict[str, dict[str, int]] = field(default_factory=dict)
     tunnel_writers: set[Any] = field(default_factory=set, repr=False)
+    reservation_waiters: set[Any] = field(default_factory=set, repr=False)
 
     @property
     def total_bytes(self) -> int:
@@ -2922,6 +2923,12 @@ def _reserve_lease_bytes(lease: Lease, wanted: int) -> int:
     return count
 
 
+def _wake_reservation_waiters(lease: Lease) -> None:
+    for waiter in tuple(lease.reservation_waiters):
+        if not waiter.done():
+            waiter.set_result(None)
+
+
 def _release_lease_reservation(lease: Lease, count: int) -> None:
     global _daily_reserved_bytes
     lease.reserved_bytes = max(0, lease.reserved_bytes - count)
@@ -2950,6 +2957,7 @@ def _release_lease_reservation(lease: Lease, count: int) -> None:
         _campaign_allocation_reserved_bytes[allocation_key] = max(
             0, _campaign_allocation_reserved_bytes[allocation_key] - count
         )
+    _wake_reservation_waiters(lease)
 
 
 def _pending_whoscored_provider_bytes(lease: Lease) -> int:
@@ -3045,6 +3053,7 @@ def _latch_lease_accounting_uncertainty(lease: Lease) -> None:
     lease.accounting_uncertain = True
     lease.closed = True
     lease.budget_exceeded = True
+    _wake_reservation_waiters(lease)
     for tunnel_writer in tuple(lease.tunnel_writers):
         try:
             tunnel_writer.close()
@@ -3247,6 +3256,32 @@ def _lease_operation_timeout(
     if remaining <= 0:
         raise asyncio.TimeoutError("paid lease expired before provider operation")
     return remaining
+
+
+async def _reserve_pump_bytes(lease: Lease, wanted: int) -> int:
+    """Wait when the peer pump temporarily owns the remaining allowance."""
+
+    while lease.usable:
+        waiter = asyncio.get_running_loop().create_future()
+        lease.reservation_waiters.add(waiter)
+        try:
+            reservation = _reserve_lease_bytes(lease, wanted)
+            if reservation > 0:
+                return reservation
+            if lease.reserved_bytes <= 0:
+                return 0
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(waiter),
+                    timeout=_lease_operation_timeout(lease),
+                )
+            except (asyncio.TimeoutError, TimeoutError):
+                return 0
+        finally:
+            lease.reservation_waiters.discard(waiter)
+            if not waiter.done():
+                waiter.cancel()
+    return 0
 
 
 def _normalise_client_hello_hostname(value: bytes | str) -> str:
@@ -3466,7 +3501,7 @@ async def _pump(
             reservation = 0
             precharged = False
             if lease is not None:
-                reservation = _reserve_lease_bytes(lease, read_size)
+                reservation = await _reserve_pump_bytes(lease, read_size)
                 if reservation <= 0:
                     lease.budget_exceeded = True
                     break

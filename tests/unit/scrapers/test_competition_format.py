@@ -120,14 +120,6 @@ class TestIsSingleYearCompetition:
 class TestSeasonFormatConsumers:
     """Configured consumers must follow competition season semantics."""
 
-    def test_fotmob_format_season_single_year(self, reload_medallion):
-        reload_medallion(env=None)
-        from scrapers.fotmob.scraper import FotMobScraper
-        s = FotMobScraper.__new__(FotMobScraper)   # no network in __init__ path
-        assert s._format_season(2026, 'INT-World Cup') == '2026'
-        assert s._format_season(2024, 'ENG-Premier League') == '2024/2025'
-        assert s._format_season(2024) == '2024/2025'
-
     def test_onboarded_tournaments_get_single_year_form(self, reload_medallion):
         # The Phase-3 acceptance case: Euro 2028 must NOT get the club
         # '2028-2029' page (the exact silent wrong-edition failure that

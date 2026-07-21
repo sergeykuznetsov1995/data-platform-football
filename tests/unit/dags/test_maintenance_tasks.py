@@ -86,11 +86,16 @@ class TestHighChurnBronzeAllowlist:
         assert DEFAULT_RETENTION == "30d"
         assert set(NON_WHOSCORED_HIGH_CHURN).isdisjoint(WHOSCORED_HIGH_CHURN)
 
-    def test_daily_fotmob_sofascore_espn_writers_listed(self):
-        """#266: these daily writers bloated to multi-GB metadata
-        (fotmob_match_details hit 7.2 GB / 154 MB data) because they were
-        never on the allow-list. They must stay listed."""
-        from utils.maintenance_tasks import HIGH_CHURN_BRONZE
+    def test_native_fotmob_contract_and_legacy_drain_tables_are_listed(self):
+        """#930: maintain every native writer and the bounded legacy drain."""
+        from scrapers.fotmob.repository import TABLE_PARTITIONS
+        from utils.maintenance_tasks import (
+            FOTMOB_NATIVE_HIGH_CHURN,
+            HIGH_CHURN_BRONZE,
+        )
+
+        assert set(FOTMOB_NATIVE_HIGH_CHURN) == set(TABLE_PARTITIONS)
+        assert set(FOTMOB_NATIVE_HIGH_CHURN) <= set(HIGH_CHURN_BRONZE)
 
         for table in (
             "fotmob_match_details",
@@ -101,7 +106,7 @@ class TestHighChurnBronzeAllowlist:
             "espn_matchsheet",
         ):
             assert table in HIGH_CHURN_BRONZE, (
-                f"{table!r} must be in HIGH_CHURN_BRONZE (#266)."
+                f"{table!r} must remain until the explicit legacy drain."
             )
 
 

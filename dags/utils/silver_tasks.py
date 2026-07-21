@@ -301,6 +301,11 @@ def run_silver_transform(
     if not select_sql:
         raise ValueError(f"SQL file is empty: {sql_path}")
 
+    if "{{ fotmob_league_map_values_sql }}" in select_sql:
+        from scrapers.fotmob.constants import render_fotmob_sql
+
+        select_sql = render_fotmob_sql(select_sql)
+
     # Remove trailing semicolon if present (Trino CTAS doesn't need it)
     if select_sql.endswith(';'):
         select_sql = select_sql[:-1].rstrip()

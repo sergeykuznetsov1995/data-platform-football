@@ -20,6 +20,9 @@ Topology
     start_marker
         |
         v
+    validate_fotmob_publication_consumer
+        |
+        v
     TaskGroup: silver_e3
         |-- whoscored_events_spadl   (partition-staged Silver transform)
         |-- espn_lineup              (run_silver_transform)
@@ -47,12 +50,13 @@ used by ``dag_transform_xref`` and the FBref Silver/Gold DAGs).
 
 Trigger model
 -------------
-``schedule=None`` -- the DAG is triggered by ``dag_master_pipeline`` after
-``dag_transform_xref`` has produced the Silver xref spine that all three
-Gold facts depend on (E3.10 will wire the ``TriggerDagRunOperator``).
+``schedule=None`` -- the DAG is triggered only by ``dag_master_pipeline`` or
+``dag_sofascore_pipeline`` after ``dag_transform_xref`` has produced the
+Silver xref spine. Direct/manual runs have no exact active FotMob consumer
+binding and fail before the first transform.
 
-Re-running E3 standalone is safe: normal transforms use atomic
-``CREATE OR REPLACE``. The 28M-row SPADL transform first materialises bounded
+Normal transforms use atomic ``CREATE OR REPLACE``. The 28M-row SPADL
+transform first materialises bounded
 league/season scopes in a retry-cleaned staging table, proves the ordered
 manifest commit set and exact Bronze parity stayed unchanged, then atomically
 replaces the live table with a window-free stage scan.
@@ -117,6 +121,7 @@ from airflow.operators.python import PythonOperator
 from airflow.utils.task_group import TaskGroup
 
 from utils.default_args import SILVER_ARGS
+from utils.fotmob_publication import validate_fotmob_consumer_fence
 
 logger = logging.getLogger(__name__)
 
@@ -629,6 +634,12 @@ with DAG(
 
     start = EmptyOperator(task_id='start_marker')
 
+    publication_preflight = PythonOperator(
+        task_id='validate_fotmob_publication_consumer',
+        python_callable=validate_fotmob_consumer_fence,
+        retries=0,
+    )
+
     # =========================================================================
     # TaskGroup: silver_e3 (sequential pure-SQL CTAS, max_active_tasks=1)
     # =========================================================================
@@ -692,6 +703,7 @@ with DAG(
     # =========================================================================
     (
         start
+        >> publication_preflight
         >> silver_group
         >> gold_group
         >> sofascore_committed_dq_task

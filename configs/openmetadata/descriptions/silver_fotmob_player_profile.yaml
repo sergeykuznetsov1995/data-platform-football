@@ -7,15 +7,15 @@ table:
     Время-инвариантный снимок атрибутов игрока из FotMob — один row на
     (player_id, league, season). Хранит то, что не меняется внутри сезона: рост,
     дату рождения, национальность, ведущую ногу, номер на футболке, действующий
-    контракт и последнюю рыночную стоимость. Источники (все bronze):
-    fotmob_team_squad (s) — рост / дата рождения / страна / код страны / номер;
-    fotmob_player_details (d) — `foot` (Preferred foot из player_information_json,
-    единственный источник) и `contract_end`. Дедупликация обеих сторон через
-    ROW_NUMBER PARTITION BY (player_id, league, season) ORDER BY _ingested_at DESC,
-    JOIN-ключ CAST(team_squad.player_id AS varchar)=details.player_id. Фильтр
-    NOT is_coach. current_market_value_eur — последняя точка timeline из
-    market_values_json (полная история — в gold.fct_player_market_value, issue #11).
-    Идентификаторы сырые FotMob — canonical-резолюция в Gold.
+    контракт и последнюю рыночную стоимость. Источники — manifest-backed native
+    views: fotmob_squad_snapshots_current (рост / дата рождения / страна / код /
+    номер для текущего ростера), fotmob_player_snapshots_current (`foot`, contract,
+    market value) и fotmob_leaderboards_current (историческое сезонное членство).
+    Глобальные снапшоты получают (league, season) через competition seasons и
+    season teams. `is_current_season` помечает selected/latest сезон; исторические
+    leaderboard-строки честно имеют NULL squad-only атрибуты и исключены из DQ
+    coverage роста/ноги. Фильтр NOT is_coach. Идентификаторы сырые FotMob —
+    canonical-резолюция в Gold.
   tags:
     - Tier.Silver
     - Domain.Football
@@ -28,11 +28,11 @@ columns:
     tags:
       - PII.Low
   - name: date_of_birth
-    description: Дата рождения игрока (varchar ISO YYYY-MM-DD из fotmob_team_squad, ~100% покрытие).
+    description: Дата рождения игрока (varchar ISO YYYY-MM-DD из текущего squad snapshot; для исторических leaderboard-only строк может быть NULL).
     tags:
       - PII.Low
   - name: height_cm
-    description: Рост игрока в сантиметрах (CAST→INTEGER; ~93% покрытие).
+    description: Рост игрока в сантиметрах (CAST→INTEGER; coverage измеряется только где is_current_season=true).
     tags:
       - PII.Low
   - name: nationality
@@ -60,9 +60,11 @@ columns:
     tags:
       - PII.Low
   - name: shirt_number
-    description: Игровой номер на футболке (CAST→INTEGER; источник fotmob_team_squad).
+    description: Игровой номер на футболке (CAST→INTEGER; источник fotmob_squad_snapshots_current).
+  - name: is_current_season
+    description: Boolean из native season axis (is_selected OR is_latest). TRUE означает живой roster scope; FALSE — историческое членство из leaderboards.
   - name: _bronze_ingested_at
-    description: Технический timestamp ingest'а Bronze (lineage; GREATEST по details/squad).
+    description: Технический timestamp native Bronze lineage (GREATEST по player/squad snapshots).
   - name: league
     description: Лига (partition key).
   - name: season

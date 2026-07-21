@@ -2,6 +2,8 @@
 Unit tests for TrinoTableManager.
 """
 
+from decimal import Decimal
+
 import pytest
 from unittest.mock import MagicMock, call, patch
 import pandas as pd
@@ -137,7 +139,7 @@ class TestTrinoTableManagerTableExists:
             assert result is False
 
     def test_table_exists_error(self):
-        """Test table_exists returns False on error."""
+        """A failed metadata query is not authoritative table absence."""
         with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
             from scrapers.base.trino_manager import TrinoTableManager
 
@@ -149,9 +151,8 @@ class TestTrinoTableManagerTableExists:
             mock_conn.cursor.return_value = mock_cursor
             manager._conn = mock_conn
 
-            result = manager.table_exists('bronze', 'test')
-
-            assert result is False
+            with pytest.raises(Exception, match="Query failed"):
+                manager.table_exists('bronze', 'test')
 
 
 class TestTrinoTableManagerCreateExternalTable:
@@ -1709,10 +1710,42 @@ class TestFormatSqlValueHardening:
         assert m._format_sql_value(True, "BOOLEAN") == "TRUE"
         assert m._format_sql_value(False, "BOOLEAN") == "FALSE"
 
-    def test_boolean_unrecognized_string_is_null(self):
-        """Unrecognized values must not be silently coerced to a boolean."""
+    def test_boolean_unrecognized_string_fails(self):
+        """An incompatible non-null value must never become SQL NULL."""
         m = self._manager()
-        assert m._format_sql_value("maybe", "BOOLEAN") == "NULL"
+        with pytest.raises(ValueError, match="incompatible with BOOLEAN"):
+            m._format_sql_value("maybe", "BOOLEAN")
+
+    @pytest.mark.parametrize(
+        ("value", "target_type"),
+        [
+            ("not-an-id", "BIGINT"),
+            (1.5, "INTEGER"),
+            (Decimal("1.5"), "BIGINT"),
+            (True, "DOUBLE"),
+            ("nan", "DOUBLE"),
+            (float("inf"), ""),
+        ],
+    )
+    def test_incompatible_non_null_numeric_values_fail(self, value, target_type):
+        m = self._manager()
+        with pytest.raises(ValueError, match="incompatible"):
+            m._format_sql_value(value, target_type)
+
+    def test_decimal_is_parsed_and_rendered_as_a_canonical_numeric_literal(self):
+        m = self._manager()
+        assert m._format_sql_value("1.2300", "DECIMAL(10, 4)") == (
+            "CAST(1.23 AS DECIMAL(10, 4))"
+        )
+
+    @pytest.mark.parametrize(
+        "value",
+        ["0); DROP TABLE bronze.matches; --", "NaN", Decimal("Infinity")],
+    )
+    def test_invalid_or_non_finite_decimal_never_reaches_sql(self, value):
+        m = self._manager()
+        with pytest.raises(ValueError, match="incompatible with DECIMAL"):
+            m._format_sql_value(value, "DECIMAL(10, 2)")
 
     def test_date_string_with_quote_is_escaped(self):
         """A stray single quote in a DATE value must be doubled, not break SQL."""
