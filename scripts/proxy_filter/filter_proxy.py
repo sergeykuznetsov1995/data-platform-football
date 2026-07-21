@@ -4769,6 +4769,35 @@ def _reap_expired_leases() -> int:
                     tunnel_writer.close()
                 except Exception:  # noqa: BLE001 - lease is already revoked
                     pass
+            if (
+                lease.source not in {"sofascore", "whoscored"}
+                and lease.active_tunnels == 0
+                and lease.reserved_bytes > 0
+            ):
+                # The retained reservation is the in-process upper bound of
+                # unproven provider spend.  Charge it durably as spent, then
+                # release the reservation so the concurrency slot frees
+                # without understating spend.  The uncertainty latch itself
+                # stays permanent forensic state.
+                retained = lease.reserved_bytes
+                try:
+                    _account_lease_bytes(
+                        lease, "uncertain-read-ahead", "down", retained
+                    )
+                except Exception:  # noqa: BLE001 - keep retained, retry next sweep
+                    log.exception(
+                        "could not durably settle retained reservation for "
+                        "uncertain lease %s",
+                        lease.lease_id,
+                    )
+                else:
+                    _release_lease_reservation(lease, retained)
+                    log.warning(
+                        "uncertain lease %s: charged %d unproven provider "
+                        "bytes conservatively; concurrency slot released",
+                        lease.lease_id,
+                        retained,
+                    )
             continue
         if not lease.expired:
             continue

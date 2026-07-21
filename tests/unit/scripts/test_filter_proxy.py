@@ -7572,6 +7572,45 @@ def _make_fbref_lease(mod, mgr, *, max_bytes=1000):
     )
 
 
+def test_uncertain_fbref_lease_settles_conservatively_and_frees_slot(mod):
+    mod.MAX_ACTIVE_LEASES = 1
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+    lease = _make_fbref_lease(mod, mgr)
+    assert mod._reserve_lease_bytes(lease, 64) == 64
+    mod._latch_lease_accounting_uncertainty(lease)
+    assert lease.accounting_uncertain is True
+    assert lease.closed is True
+    assert lease.reserved_bytes == 64
+
+    daily_before = mod._daily_total_bytes()
+    mod._reap_expired_leases()
+
+    # The unproven reservation is charged durably, never refunded.
+    assert lease.reserved_bytes == 0
+    assert lease.down_bytes == 64
+    assert mod._daily_total_bytes() == daily_before + 64
+    assert lease.accounting_uncertain is True  # forensic latch is permanent
+    events = [
+        json.loads(line)
+        for line in Path(mod.LEDGER_PATH).read_text().splitlines()
+    ]
+    assert any(
+        event.get("event_type") == "bytes"
+        and event.get("lease_id") == lease.lease_id
+        and event.get("bytes") == 64
+        for event in events
+    )
+    # The single concurrency slot is free again.
+    second = mod._create_lease(
+        mgr,
+        max_bytes=100,
+        ttl_seconds=30,
+        metadata=_fbref_context(),
+        require_context=True,
+    )
+    assert second.lease_id != lease.lease_id
+
+
 def test_fbref_absolute_http_replaces_browser_lease_auth_with_provider_auth(
     mod, monkeypatch
 ):
