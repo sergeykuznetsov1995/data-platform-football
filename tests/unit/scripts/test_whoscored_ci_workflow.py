@@ -81,9 +81,11 @@ def test_production_admission_tests_run_from_a_root_owned_protected_release():
         "- name: WhoScored unit, DAG and storage contract", 1
     )[1]
 
-    assert "protected_root=/opt/whoscored-ci-admission" in protected
+    assert "protected_root=/root/whoscored-ci-admission" in protected
     assert "sudo install -d -o root -g root -m 0755" in protected
     assert "sudo install -o root -g root -m 0444" in protected
+    assert "sudo /usr/bin/env -i" in protected
+    assert '"$test_python" -' in protected
     assert "scripts/whoscored_production_admission.py" in protected
     assert "scripts/validate_whoscored_build_provenance.py" in protected
     assert 'PYTHONPATH="$protected_root:${GITHUB_WORKSPACE}"' in protected

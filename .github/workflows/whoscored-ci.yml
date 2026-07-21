@@ -537,7 +537,9 @@ jobs:
         env:
           PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
         run: |
-          protected_root=/opt/whoscored-ci-admission
+          protected_root=/root/whoscored-ci-admission
+          test_python="$(command -v python)"
+          test "${test_python#/}" != "$test_python"
           test ! -e "$protected_root"
           sudo install -d -o root -g root -m 0755 \
             "$protected_root/scripts"
@@ -551,9 +553,18 @@ jobs:
             = "0:0:444:1"
           (
             cd /tmp
-            WHOSCORED_CI_PROTECTED_ROOT="$protected_root" \
+            sudo /usr/bin/env -i \
+              HOME=/root \
+              PATH=/usr/bin:/bin \
+              LANG=C.UTF-8 \
+              LC_ALL=C.UTF-8 \
+              PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+              PYTHONDONTWRITEBYTECODE=1 \
+              PYTHONPYCACHEPREFIX=/tmp/whoscored-ci-protected-pycache \
+              GITHUB_WORKSPACE="$GITHUB_WORKSPACE" \
+              WHOSCORED_CI_PROTECTED_ROOT="$protected_root" \
               PYTHONPATH="$protected_root:${GITHUB_WORKSPACE}" \
-              python - <<'PY'
+              "$test_python" - <<'PY'
           import os
           from pathlib import Path
 
