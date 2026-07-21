@@ -16,8 +16,11 @@ concurrency:
 jobs:
   contract:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
     env:
+      BASH_ENV: /dev/null
+      ENV: /dev/null
+      LD_PRELOAD: ""
       PYTHONPYCACHEPREFIX: /tmp/whoscored-ci-pycache
       PYTHONDONTWRITEBYTECODE: "1"
     steps:
@@ -26,11 +29,32 @@ jobs:
           # ready-v1 validates the exact PR-head promotion child while the
           # worktree remains GitHub's synthetic merge result.
           fetch-depth: 0
+          persist-credentials: false
 
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.11"
           cache: pip
+
+      - name: Verify the immutable system Buildx binary
+        run: |
+          buildx_bin=/usr/libexec/docker/cli-plugins/docker-buildx
+          test -f "$buildx_bin"
+          test "$(stat -Lc '%u:%g:%h' "$buildx_bin")" = 0:0:1
+          test $((8#$(stat -Lc '%a' "$buildx_bin") & 8#022)) = 0
+          for trusted_dir in \
+            /usr /usr/libexec /usr/libexec/docker \
+            /usr/libexec/docker/cli-plugins
+          do
+            test "$(stat -Lc '%u:%g' "$trusted_dir")" = 0:0
+            test $((8#$(stat -Lc '%a' "$trusted_dir") & 8#022)) = 0
+          done
+          echo \
+            "d41ece72044243b4f58b343441ae37446d9c29a7d6b5e11c61847bbcf8f7dfda  $buildx_bin" \
+            | sha256sum --check --strict
+          test "$("$buildx_bin" version)" = \
+            "github.com/docker/buildx v0.35.0 a319e5b15052cf6557ceb666eb8ff6e32380b782"
+          test ! -e "$HOME/.docker/cli-plugins/docker-buildx"
 
       - name: Start pinned loopback OCI registry
         run: |
@@ -39,202 +63,87 @@ jobs:
             --publish 127.0.0.1:5000:5000 \
             registry:2.8.3@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
 
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-        with:
-          driver-opts: network=host
-          buildkitd-config-inline: |
-            [registry."127.0.0.1:5000"]
-              http = true
-              insecure = true
-
-      - name: Validate declared WhoScored build-provenance state
+      - name: Create an isolated immutable builder before repository code runs
         run: |
-          python -I -S scripts/generate_whoscored_runtime_evidence.py \
-            --root . --check
-          provenance_status="$(python -I -S -c \
-            'import json; print(json.load(open("docker/images/airflow/whoscored-build-provenance-attestation.json"))["status"])')"
-          case "$provenance_status" in
-            blocked-v1) provenance_mode=(--expect-blocked) ;;
-            ready-v1)
-              provenance_mode=(
-                --expect-ready-build
-                --release-revision "${{ github.event.pull_request.head.sha }}"
-              )
-              ;;
-            *) echo "unsupported provenance state: $provenance_status" >&2; exit 78 ;;
-          esac
-          python -I -S scripts/validate_whoscored_build_provenance.py \
-            --root . "${provenance_mode[@]}" \
-            --report /tmp/whoscored-build-closure.json
-
-      - name: Install test runtime
-        run: |
-          python -m pip install \
-            --disable-pip-version-check --no-deps \
-            --require-hashes --only-binary=:all: \
-            -r .github/workflows/whoscored-test.lock
-
-      - name: Static and import checks
-        run: |
-          mapfile -t whoscored_static_paths < <(
-            find scripts tests -type f \
-              \( -name '*whoscored*.py' \
-                 -o -name '*test_proxy_traffic*.py' \
-                 -o -name '*test_filter_proxy*.py' \) \
-              -print | sort
-          )
-          test "${#whoscored_static_paths[@]}" -gt 0
-          ruff check \
-            scrapers/whoscored \
-            scrapers/base/iceberg_writer.py \
-            dags/dag_ingest_whoscored.py \
-            dags/dag_backfill_whoscored.py \
-            dags/dag_canary_whoscored_proxy.py \
-            dags/dag_backup_whoscored_storage.py \
-            dags/dag_ingest_matchhistory.py \
-            dags/dag_iceberg_maintenance.py \
-            dags/dag_iceberg_maintenance_daily.py \
-            dags/dag_master_pipeline.py \
-            dags/scripts/run_whoscored_scraper.py \
-            dags/scripts/run_whoscored_backfill_item.py \
-            dags/scripts/whoscored_ops_store.py \
-            dags/scripts/whoscored_frozen_dq.py \
-            dags/scripts/whoscored_identity.py \
-            dags/scripts/whoscored_proxy_runtime.py \
-            dags/utils/maintenance_tasks.py \
-            dags/utils/fbref_pipeline_tasks.py \
-            docker/images/airflow/whoscored_capacity_worker_bootstrap.py \
-            scripts/init_seaweedfs_bucket.py \
-            scripts/audit_seaweedfs_control_network.py \
-            scripts/audit_seaweedfs_runtime_container.py \
-            scripts/flaresolverr_extended.py \
-            scripts/proxy_filter/filter_proxy.py \
-            scripts/transition_seaweedfs_recovery_state.py \
-            scripts/validate_seaweedfs_s3_identity_config.py \
-            scripts/generate_whoscored_deployment_attestation.py \
-            scripts/generate_whoscored_runtime_evidence.py \
-            scripts/validate_whoscored_build_provenance.py \
-            scripts/whoscored_production_admission.py \
-            scripts/whoscored_proxy_campaign.py \
-            scripts/research/bench_whoscored_workflow.py \
-            scripts/research/whoscored_capacity_container_runtime.py \
-            "${whoscored_static_paths[@]}"
-          python -m compileall -q \
-            scrapers/whoscored \
-            scrapers/base/iceberg_writer.py \
-            dags/dag_ingest_whoscored.py \
-            dags/dag_backfill_whoscored.py \
-            dags/dag_canary_whoscored_proxy.py \
-            dags/dag_backup_whoscored_storage.py \
-            dags/dag_ingest_matchhistory.py \
-            dags/dag_master_pipeline.py \
-            dags/scripts/run_whoscored_scraper.py \
-            dags/scripts/run_whoscored_backfill_item.py \
-            dags/scripts/whoscored_ops_store.py \
-            dags/scripts/whoscored_frozen_dq.py \
-            dags/scripts/whoscored_identity.py \
-            dags/scripts/whoscored_proxy_runtime.py \
-            dags/utils/fbref_pipeline_tasks.py \
-            docker/images/airflow/whoscored_capacity_worker_bootstrap.py \
-            scripts/init_seaweedfs_bucket.py \
-            scripts/audit_seaweedfs_control_network.py \
-            scripts/audit_seaweedfs_runtime_container.py \
-            scripts/flaresolverr_extended.py \
-            scripts/proxy_filter/filter_proxy.py \
-            scripts/transition_seaweedfs_recovery_state.py \
-            scripts/validate_seaweedfs_s3_identity_config.py \
-            scripts/generate_whoscored_deployment_attestation.py \
-            scripts/generate_whoscored_runtime_evidence.py \
-            scripts/validate_whoscored_build_provenance.py \
-            scripts/whoscored_production_admission.py \
-            scripts/whoscored_proxy_campaign.py \
-            scripts/research/bench_whoscored_workflow.py \
-            scripts/research/bench_whoscored_capacity.py \
-            scripts/research/whoscored_capacity_container_runtime.py \
-            scripts/research/whoscored_capacity_worker_exec.py
-          bash -n scripts/cutover_seaweedfs_topology.sh
-          bash -n scripts/compose.sh
-          bash -n scripts/seaweedfs_legacy_entrypoint.sh
-          bash -n scripts/seaweedfs_lifecycle_lock.sh
-          bash -n scripts/seaweedfs_plane_entrypoint.sh
-          bash -n scripts/research/run_fbref_canary_guarded.sh
-
-      - name: Render production compose
-        env:
-          OIDC_ISSUER: https://ci.invalid
-          PUBLIC_IP: 127.0.0.1
-          KC_PUBLIC_URL: https://auth.ci.invalid
-          TRINO_PUBLIC_HOST: trino.ci.invalid
-          JUPYTER_PUBLIC_HOST: jupyter.ci.invalid
-          LAKEKEEPER_DB_PASSWORD: ci-not-a-secret
-          LAKEKEEPER_PG_ENCRYPTION_KEY: 00000000000000000000000000000000
-          SEAWEEDFS_VOLUME_SIZE_LIMIT_MB: "1024"
-        run: |
-          minimum=2.24.4
-          actual="$(docker compose version --short)"
-          test "$(printf '%s\n%s\n' "$minimum" "$actual" | sort -V | head -n1)" = "$minimum"
-          docker compose --env-file .env.example config --quiet
-          docker compose --env-file .env.example \
-            -f compose.yaml -f compose.seaweedfs-supervised.yaml \
-            config --quiet
-          docker compose --project-name whoscored-gw \
-            --project-directory . --env-file .env.example \
-            --file deploy/whoscored/gateway.compose.yaml \
-            config --quiet
-          docker compose --env-file .env.example \
-            -f compose.yaml -f compose.seaweedfs-supervised.yaml \
-            config --format json > /tmp/supervised-compose.json
-          python - <<'PY'
-          import json
-
-          services = json.load(open("/tmp/supervised-compose.json"))["services"]
-          assert services["seaweedfs"]["command"][0] == "s3"
-          assert all(
-              mount.get("target") != "/data"
-              for mount in services["seaweedfs"]["volumes"]
-          )
-          for name in ("seaweedfs-master", "seaweedfs-volume", "seaweedfs-filer"):
-              assert any(
-                  mount.get("target") == "/data"
-                  for mount in services[name]["volumes"]
-              )
-          PY
-
-      - name: Prove checked-in evidence and closure report agree
-        run: |
-          python - <<'PY'
-          import json
-
-          attestation = json.load(open(
-              "docker/images/airflow/whoscored-build-provenance-attestation.json"
-          ))
-          report = json.load(open("/tmp/whoscored-build-closure.json"))
-          assert attestation["status"] in {"blocked-v1", "ready-v1"}
-          assert report["status"] == attestation["status"]
-          assert bool(report["issues"]) == (report["status"] == "blocked-v1")
-          PY
+          export PATH=/usr/bin:/bin
+          buildx_bin=/usr/libexec/docker/cli-plugins/docker-buildx
+          test -f "$buildx_bin"
+          test "$(/usr/bin/stat -Lc '%u:%g:%h' "$buildx_bin")" = 0:0:1
+          exec 9< "$buildx_bin"
+          buildx_exec=/proc/self/fd/9
+          echo \
+            "d41ece72044243b4f58b343441ae37446d9c29a7d6b5e11c61847bbcf8f7dfda  $buildx_exec" \
+            | /usr/bin/sha256sum --check --strict
+          test "$("$buildx_exec" version)" = \
+            "github.com/docker/buildx v0.35.0 a319e5b15052cf6557ceb666eb8ff6e32380b782"
+          test ! -e "$HOME/.docker/cli-plugins/docker-buildx"
+          [[ "$GITHUB_RUN_ID" =~ ^[0-9]+$ ]]
+          [[ "$GITHUB_RUN_ATTEMPT" =~ ^[0-9]+$ ]]
+          builder_name="whoscored-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          docker_config="$(/usr/bin/mktemp -d /tmp/whoscored-ci-docker.XXXXXXXX)"
+          buildkit_config="$(/usr/bin/mktemp /tmp/whoscored-ci-buildkit.XXXXXXXX)"
+          /usr/bin/chmod 0700 "$docker_config"
+          /usr/bin/chmod 0600 "$buildkit_config"
+          printf '%s\n' \
+            '[registry."127.0.0.1:5000"]' \
+            '  http = true' \
+            '  insecure = true' \
+            > "$buildkit_config"
+          unset DOCKER_CONTEXT DOCKER_CERT_PATH DOCKER_TLS_VERIFY BUILDX_HOST BUILDX_CONFIG
+          export DOCKER_CONFIG="$docker_config"
+          export DOCKER_HOST=unix:///var/run/docker.sock
+          export BUILDX_CONFIG="$docker_config/buildx"
+          builder_container="buildx_buildkit_${builder_name}0"
+          ! /usr/bin/docker inspect "$builder_container" >/dev/null 2>&1
+          "$buildx_exec" create \
+            --name "$builder_name" \
+            --driver docker-container \
+            --driver-opt image=moby/buildkit:v0.31.2@sha256:2f5adac4ecd194d9f8c10b7b5d7bceb5186853db1b26e5abd3a657af0b7e26ec \
+            --driver-opt network=host \
+            --buildkitd-config "$buildkit_config" \
+            --use --bootstrap \
+            unix:///var/run/docker.sock
+          /usr/bin/rm -f -- "$buildkit_config"
+          test "$(/usr/bin/docker inspect --format '{{.Config.Image}}' "$builder_container")" = \
+            "moby/buildkit:v0.31.2@sha256:2f5adac4ecd194d9f8c10b7b5d7bceb5186853db1b26e5abd3a657af0b7e26ec"
+          test "$(/usr/bin/docker inspect --format '{{.State.Running}}' "$builder_container")" = true
+          test "$(/usr/bin/docker inspect --format '{{.HostConfig.NetworkMode}}' "$builder_container")" = host
+          "$buildx_exec" inspect --builder "$builder_name" --bootstrap
+          {
+            echo "DOCKER_CONFIG=$docker_config"
+            echo "DOCKER_HOST=unix:///var/run/docker.sock"
+            echo "BUILDX_CONFIG=$docker_config/buildx"
+            echo "WHOSCORED_CI_BUILDER=$builder_name"
+          } >> "$GITHUB_ENV"
 
       - name: Build immutable Superset and JupyterHub runtimes
         run: |
-          docker buildx build \
-            --cache-from type=gha,scope=whoscored-superset \
-            --cache-to type=gha,mode=max,scope=whoscored-superset \
+          export PATH=/usr/bin:/bin
+          exec 9< /usr/libexec/docker/cli-plugins/docker-buildx
+          buildx_exec=/proc/self/fd/9
+          echo "d41ece72044243b4f58b343441ae37446d9c29a7d6b5e11c61847bbcf8f7dfda  $buildx_exec" \
+            | /usr/bin/sha256sum --check --strict
+          "$buildx_exec" build \
+            --builder "$WHOSCORED_CI_BUILDER" \
             --load \
             -t data-platform-superset:ci \
             docker/images/superset
-          docker buildx build \
-            --cache-from type=gha,scope=whoscored-jupyterhub \
-            --cache-to type=gha,mode=max,scope=whoscored-jupyterhub \
+          "$buildx_exec" build \
+            --builder "$WHOSCORED_CI_BUILDER" \
             --load \
             -t data-platform-jupyterhub:ci \
             docker/images/jupyterhub
 
       - name: Build and smoke the hardened scheduler test image
         run: |
-          docker buildx build \
+          export PATH=/usr/bin:/bin
+          exec 9< /usr/libexec/docker/cli-plugins/docker-buildx
+          buildx_exec=/proc/self/fd/9
+          echo "d41ece72044243b4f58b343441ae37446d9c29a7d6b5e11c61847bbcf8f7dfda  $buildx_exec" \
+            | /usr/bin/sha256sum --check --strict
+          "$buildx_exec" build \
+            --builder "$WHOSCORED_CI_BUILDER" \
             --target airflow-scheduler-test \
-            --cache-from type=gha,scope=whoscored-airflow \
-            --cache-to type=gha,mode=max,scope=whoscored-airflow \
             --load \
             -t data-platform-airflow-scheduler:ci \
             docker/images/airflow
@@ -360,35 +269,40 @@ jobs:
           GIT_CONFIG_KEY_8: core.worktree
           GIT_CONFIG_VALUE_8: ${{ github.workspace }}
         run: |
+          export PATH=/usr/bin:/bin
+          exec 9< /usr/libexec/docker/cli-plugins/docker-buildx
+          buildx_exec=/proc/self/fd/9
+          echo "d41ece72044243b4f58b343441ae37446d9c29a7d6b5e11c61847bbcf8f7dfda  $buildx_exec" \
+            | /usr/bin/sha256sum --check --strict
           umask 077
           install -d -m 0700 /tmp/whoscored-build-metadata
           BUILDX_GIT_CHECK_DIRTY=1 \
-          docker buildx build \
+          "$buildx_exec" build \
+            --builder "$WHOSCORED_CI_BUILDER" \
             --target airflow-scheduler-payload \
             --platform linux/amd64 \
-            --cache-from type=gha,scope=whoscored-airflow \
             --load \
             -t data-platform-airflow-scheduler-payload:provenance-ci \
             docker/images/airflow
           scheduler_tag=127.0.0.1:5000/data-platform-airflow-scheduler:provenance-ci
           proxy_tag=127.0.0.1:5000/data-platform-airflow-whoscored-proxy:provenance-ci
           BUILDX_GIT_CHECK_DIRTY=1 BUILDX_METADATA_PROVENANCE=max \
-          docker buildx build \
+          "$buildx_exec" build \
+            --builder "$WHOSCORED_CI_BUILDER" \
             --target airflow-scheduler \
             --platform linux/amd64 \
             --provenance=mode=max,version=v1 \
             --metadata-file /tmp/whoscored-build-metadata/airflow-scheduler.json \
-            --cache-from type=gha,scope=whoscored-airflow \
             --push \
             --tag "$scheduler_tag" \
             docker/images/airflow
           BUILDX_GIT_CHECK_DIRTY=1 BUILDX_METADATA_PROVENANCE=max \
-          docker buildx build \
+          "$buildx_exec" build \
+            --builder "$WHOSCORED_CI_BUILDER" \
             --target airflow-whoscored-proxy \
             --platform linux/amd64 \
             --provenance=mode=max,version=v1 \
             --metadata-file /tmp/whoscored-build-metadata/airflow-whoscored-proxy.json \
-            --cache-from type=gha,scope=whoscored-airflow \
             --push \
             --tag "$proxy_tag" \
             docker/images/airflow
@@ -429,7 +343,7 @@ jobs:
             test -e "$sentinel/$label"
           }
 
-          provenance_status="$(python -I -S -c \
+          provenance_status="$(/usr/bin/python3 -I -S -c \
             'import json; print(json.load(open("docker/images/airflow/whoscored-build-provenance-attestation.json"))["status"])')"
           case "$provenance_status" in
             blocked-v1)
@@ -487,7 +401,13 @@ jobs:
 
       - name: Build and smoke the immutable WhoScored FlareSolverr image
         run: |
-          docker buildx build \
+          export PATH=/usr/bin:/bin
+          exec 9< /usr/libexec/docker/cli-plugins/docker-buildx
+          buildx_exec=/proc/self/fd/9
+          echo "d41ece72044243b4f58b343441ae37446d9c29a7d6b5e11c61847bbcf8f7dfda  $buildx_exec" \
+            | /usr/bin/sha256sum --check --strict
+          "$buildx_exec" build \
+            --builder "$WHOSCORED_CI_BUILDER" \
             --file docker/images/flaresolverr-whoscored/Dockerfile \
             --load \
             -t data-platform-flaresolverr-whoscored:ci \
@@ -528,7 +448,7 @@ jobs:
             -d '{"cmd":"sessions.list"}' \
             http://127.0.0.1:8191/v1 \
             > /tmp/whoscored-flaresolverr-v1.json
-          python - <<'PY'
+          /usr/bin/python3 -I -S - <<'PY'
           import json
           import re
 
@@ -543,18 +463,182 @@ jobs:
           assert response["sessions"] == []
           PY
 
+      - name: Install test runtime
+        run: |
+          test_venv="$(mktemp -d /tmp/whoscored-ci-test-venv.XXXXXXXX)"
+          setup_python_prefix="$(python -I -S -c 'import sys; print(sys.base_prefix)')"
+          python -m venv --copies "$test_venv"
+          "$test_venv/bin/python" -m pip install \
+            --disable-pip-version-check --no-deps \
+            --require-hashes --only-binary=:all: \
+            -r .github/workflows/whoscored-test.lock
+          {
+            echo "WHOSCORED_CI_TEST_VENV=$test_venv"
+            echo "WHOSCORED_CI_PYTHON_PREFIX=$setup_python_prefix"
+          } >> "$GITHUB_ENV"
+          echo "$test_venv/bin" >> "$GITHUB_PATH"
+
       - name: WhoScored unit, DAG and storage contract
         env:
           PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
-          WHOSCORED_REAL_DOCKER_TEST: "1"
           WHOSCORED_SCHEDULER_BUILD_METADATA: /tmp/whoscored-build-metadata/airflow-scheduler.json
           WHOSCORED_SCHEDULER_PAYLOAD_IMAGE: data-platform-airflow-scheduler-payload:provenance-ci
         run: |
+          test "$WHOSCORED_CI_TEST_VENV" = "$(command -v python | sed 's,/bin/python$,,')"
+          [[ "$WHOSCORED_CI_TEST_VENV" =~ ^/tmp/whoscored-ci-test-venv\.[A-Za-z0-9]{8}$ ]]
+          test "$WHOSCORED_CI_PYTHON_PREFIX" = \
+            "$(python -I -S -c 'import sys; print(sys.base_prefix)')"
+
+          test_container=
+          cleanup_contract_runtime() {
+            if test -n "$test_container"; then
+              docker rm -f "$test_container" >/dev/null 2>&1 || true
+            fi
+          }
+          trap cleanup_contract_runtime EXIT
+
+          test_container="$(docker create \
+            --platform linux/amd64 \
+            --network none \
+            --user 0:0 \
+            --cap-drop ALL \
+            --cap-add CHOWN \
+            --cap-add DAC_OVERRIDE \
+            --cap-add FOWNER \
+            --cap-add SYS_ADMIN \
+            --security-opt no-new-privileges:true \
+            --security-opt apparmor=docker-default \
+            --security-opt seccomp=builtin \
+            --tmpfs /tmp:rw,exec,nosuid,nodev,size=2g,mode=1777 \
+            --entrypoint /usr/bin/sleep \
+            ubuntu:24.04@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90 \
+            infinity)"
+          docker start "$test_container" >/dev/null
+          test "$(docker inspect --format '{{.HostConfig.NetworkMode}}' "$test_container")" = none
+          test "$(docker inspect --format '{{json .HostConfig.Binds}}' "$test_container")" = null
+          test "$(docker inspect --format '{{json .HostConfig.Mounts}}' "$test_container")" = null
+          test "$(docker inspect --format '{{json .Mounts}}' "$test_container")" = '[]'
+          test "$(docker inspect --format '{{json .HostConfig.CapDrop}}' "$test_container")" = '["ALL"]'
+          test "$(docker inspect --format '{{json .HostConfig.CapAdd}}' "$test_container")" = \
+            '["CAP_CHOWN","CAP_DAC_OVERRIDE","CAP_FOWNER","CAP_SYS_ADMIN"]'
+          test "$(docker inspect --format '{{json .HostConfig.SecurityOpt}}' "$test_container")" = \
+            '["no-new-privileges:true","apparmor=docker-default","seccomp=builtin"]'
+
+          docker exec "$test_container" mkdir -p \
+            "$WHOSCORED_CI_PYTHON_PREFIX" \
+            "$WHOSCORED_CI_TEST_VENV" \
+            /usr/lib/git-core \
+            /usr/libexec/docker/cli-plugins \
+            /usr/share/zoneinfo \
+            /root/data-platform-football \
+            /root/.secrets
+          tar -C "$WHOSCORED_CI_PYTHON_PREFIX" -cf - . \
+            | docker exec -i "$test_container" \
+                tar --no-same-owner -C "$WHOSCORED_CI_PYTHON_PREFIX" -xf -
+          tar -C "$WHOSCORED_CI_TEST_VENV" -cf - . \
+            | docker exec -i "$test_container" \
+                tar --no-same-owner -C "$WHOSCORED_CI_TEST_VENV" -xf -
+          tar -C "$GITHUB_WORKSPACE" -cf - . \
+            | docker exec -i "$test_container" \
+                tar --no-same-owner -C /root/data-platform-football -xf -
+          docker cp /usr/bin/docker "$test_container:/usr/bin/docker"
+          docker cp /usr/bin/git "$test_container:/usr/bin/git"
+          docker cp /usr/lib/git-core/. "$test_container:/usr/lib/git-core/"
+          docker cp /usr/libexec/docker/cli-plugins/docker-buildx \
+            "$test_container:/usr/libexec/docker/cli-plugins/docker-buildx"
+          compose_bin=/usr/libexec/docker/cli-plugins/docker-compose
+          test "$(stat -Lc '%u:%g' "$compose_bin")" = 0:0
+          test $((8#$(stat -Lc '%a' "$compose_bin") & 8#022)) = 0
+          docker cp "$compose_bin" \
+            "$test_container:/usr/libexec/docker/cli-plugins/docker-compose"
+          test "$(. /etc/os-release; printf '%s' "$ID:$VERSION_ID")" = ubuntu:24.04
+          for runtime_path in \
+            /usr/lib/x86_64-linux-gnu /usr/share/zoneinfo /usr/bin/node
+          do
+            test "$(stat -Lc '%u:%g' "$runtime_path")" = 0:0
+            test $((8#$(stat -Lc '%a' "$runtime_path") & 8#022)) = 0
+          done
+          if ! unexpected_runtime_path="$(find \
+              /usr/lib/x86_64-linux-gnu /usr/share/zoneinfo \
+              -xdev \( -type f -o -type d \) \
+              \( ! -user root -o -writable \) -print -quit)"; then
+            echo "trusted runtime scan failed" >&2
+            exit 1
+          fi
+          test -z "$unexpected_runtime_path"
+          tar -C /usr/lib/x86_64-linux-gnu -cf - . \
+            | docker exec -i "$test_container" \
+                tar --no-same-owner -C /usr/lib/x86_64-linux-gnu -xf -
+          tar -C /usr/share/zoneinfo -cf - . \
+            | docker exec -i "$test_container" \
+                tar --no-same-owner -C /usr/share/zoneinfo -xf -
+          docker cp /usr/bin/node "$test_container:/usr/bin/node"
+
+          docker exec "$test_container" cp \
+            /root/data-platform-football/.env.example \
+            /root/data-platform-football/.env
+          docker exec "$test_container" cp \
+            /root/data-platform-football/.env.example \
+            /root/.secrets/whoscored-runtime-v2.env
+          docker exec "$test_container" cp \
+            /root/data-platform-football/.env.example \
+            /root/.secrets/whoscored-proxy-v2.env
+          docker exec "$test_container" chmod 0600 \
+            /root/data-platform-football/.env \
+            /root/.secrets/whoscored-runtime-v2.env \
+            /root/.secrets/whoscored-proxy-v2.env
+          docker exec "$test_container" \
+            "$WHOSCORED_CI_TEST_VENV/bin/python" -I -c \
+            'import os, socket; path="/run/docker.sock"; endpoint=socket.socket(socket.AF_UNIX); endpoint.bind(path); endpoint.close(); os.chmod(path, 0o660)'
+          docker exec "$test_container" \
+            "$WHOSCORED_CI_TEST_VENV/bin/python" -I -c \
+            'from pathlib import Path; path=Path("/usr/local/bin/docker"); path.write_text("#!/bin/sh\nif [ \"$1\" = ps ]; then\n  exit 0\nfi\nexec /usr/bin/docker \"$@\"\n", encoding="utf-8"); path.chmod(0o755)'
+
+          if ! unexpected_ownership="$(docker exec "$test_container" find \
+              /root/data-platform-football /root/.secrets \
+              "$WHOSCORED_CI_PYTHON_PREFIX" "$WHOSCORED_CI_TEST_VENV" \
+              -xdev \( ! -user root -o ! -group root \) -print -quit)"; then
+            echo "isolated ownership scan failed" >&2
+            exit 1
+          fi
+          test -z "$unexpected_ownership"
+          docker exec "$test_container" test -S /run/docker.sock
+          docker exec "$test_container" \
+            "$WHOSCORED_CI_TEST_VENV/bin/python" -I -c \
+            'import socket; endpoint=socket.socket(socket.AF_UNIX); endpoint.settimeout(0.1); expected=False
+          try: endpoint.connect("/run/docker.sock")
+          except (ConnectionRefusedError, socket.timeout): expected=True
+          finally: endpoint.close()
+          assert expected'
+          docker exec "$test_container" sh -c \
+            'test "$(id -u):$(id -g)" = 0:0'
+          docker exec "$test_container" sh -c \
+            'test "$(unshare --version)" = "unshare from util-linux 2.39.3"'
+          docker exec "$test_container" sh -c \
+            'echo "51bcc77ba5db162c80028f861f0a2770d728c1de80773816d863f28d7a817adb  /usr/bin/unshare" | sha256sum --check --strict'
+          docker exec "$test_container" \
+            "$WHOSCORED_CI_TEST_VENV/bin/python" -I -c \
+            'import importlib.metadata as m; assert m.version("curl-cffi") == "0.15.0"'
+          docker exec "$test_container" \
+            "$WHOSCORED_CI_TEST_VENV/bin/python" -I -c \
+            'from zoneinfo import ZoneInfo; assert ZoneInfo("Europe/Berlin").key == "Europe/Berlin"'
+          docker exec "$test_container" node --version
+
           mapfile -t whoscored_tests < <(
             find tests -type f -name 'test_*whoscored*.py' -print | sort
           )
           test "${#whoscored_tests[@]}" -gt 0
-          pytest -q \
+          set +e
+          docker exec \
+            --env GITHUB_WORKSPACE=/root/data-platform-football \
+            --env GIT_CONFIG_GLOBAL=/dev/null \
+            --env GIT_CONFIG_NOSYSTEM=1 \
+            --env PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+            --env PYTHONDONTWRITEBYTECODE=1 \
+            --env PYTHONPYCACHEPREFIX=/tmp/whoscored-ci-pycache-root \
+            --workdir /root/data-platform-football \
+            "$test_container" \
+            "$WHOSCORED_CI_TEST_VENV/bin/python" -m pytest -q \
             "${whoscored_tests[@]}" \
             tests/unit/scrapers/test_iceberg_writer.py \
             tests/unit/dags/test_proxy_traffic.py \
@@ -588,6 +672,195 @@ jobs:
             tests/unit/scrapers/test_run_sofifa_scraper.py \
             tests/unit/scrapers/test_run_understat_scraper.py \
             tests/unit/scripts/test_inventory_bronze_orphans.py
+          isolated_status="$?"
+          set -e
+
+          cleanup_contract_runtime
+          trap - EXIT
+          test "$isolated_status" = 0
+
+      - name: Static and import checks
+        if: ${{ !cancelled() }}
+        run: |
+          mapfile -t whoscored_static_paths < <(
+            find scripts tests -type f \
+              \( -name '*whoscored*.py' \
+                 -o -name '*test_proxy_traffic*.py' \
+                 -o -name '*test_filter_proxy*.py' \) \
+              -print | sort
+          )
+          test "${#whoscored_static_paths[@]}" -gt 0
+          ruff check \
+            scrapers/whoscored \
+            scrapers/base/iceberg_writer.py \
+            dags/dag_ingest_whoscored.py \
+            dags/dag_backfill_whoscored.py \
+            dags/dag_canary_whoscored_proxy.py \
+            dags/dag_backup_whoscored_storage.py \
+            dags/dag_ingest_matchhistory.py \
+            dags/dag_iceberg_maintenance.py \
+            dags/dag_iceberg_maintenance_daily.py \
+            dags/dag_master_pipeline.py \
+            dags/scripts/run_whoscored_scraper.py \
+            dags/scripts/run_whoscored_backfill_item.py \
+            dags/scripts/whoscored_ops_store.py \
+            dags/scripts/whoscored_frozen_dq.py \
+            dags/scripts/whoscored_identity.py \
+            dags/scripts/whoscored_proxy_runtime.py \
+            dags/utils/maintenance_tasks.py \
+            dags/utils/fbref_pipeline_tasks.py \
+            docker/images/airflow/whoscored_capacity_worker_bootstrap.py \
+            scripts/init_seaweedfs_bucket.py \
+            scripts/audit_seaweedfs_control_network.py \
+            scripts/audit_seaweedfs_runtime_container.py \
+            scripts/flaresolverr_extended.py \
+            scripts/proxy_filter/filter_proxy.py \
+            scripts/transition_seaweedfs_recovery_state.py \
+            scripts/validate_seaweedfs_s3_identity_config.py \
+            scripts/generate_whoscored_deployment_attestation.py \
+            scripts/generate_whoscored_runtime_evidence.py \
+            scripts/validate_whoscored_build_provenance.py \
+            scripts/whoscored_production_admission.py \
+            scripts/whoscored_proxy_campaign.py \
+            scripts/research/bench_whoscored_workflow.py \
+            scripts/research/whoscored_capacity_container_runtime.py \
+            "${whoscored_static_paths[@]}"
+          python -m compileall -q \
+            scrapers/whoscored \
+            scrapers/base/iceberg_writer.py \
+            dags/dag_ingest_whoscored.py \
+            dags/dag_backfill_whoscored.py \
+            dags/dag_canary_whoscored_proxy.py \
+            dags/dag_backup_whoscored_storage.py \
+            dags/dag_ingest_matchhistory.py \
+            dags/dag_master_pipeline.py \
+            dags/scripts/run_whoscored_scraper.py \
+            dags/scripts/run_whoscored_backfill_item.py \
+            dags/scripts/whoscored_ops_store.py \
+            dags/scripts/whoscored_frozen_dq.py \
+            dags/scripts/whoscored_identity.py \
+            dags/scripts/whoscored_proxy_runtime.py \
+            dags/utils/fbref_pipeline_tasks.py \
+            docker/images/airflow/whoscored_capacity_worker_bootstrap.py \
+            scripts/init_seaweedfs_bucket.py \
+            scripts/audit_seaweedfs_control_network.py \
+            scripts/audit_seaweedfs_runtime_container.py \
+            scripts/flaresolverr_extended.py \
+            scripts/proxy_filter/filter_proxy.py \
+            scripts/transition_seaweedfs_recovery_state.py \
+            scripts/validate_seaweedfs_s3_identity_config.py \
+            scripts/generate_whoscored_deployment_attestation.py \
+            scripts/generate_whoscored_runtime_evidence.py \
+            scripts/validate_whoscored_build_provenance.py \
+            scripts/whoscored_production_admission.py \
+            scripts/whoscored_proxy_campaign.py \
+            scripts/research/bench_whoscored_workflow.py \
+            scripts/research/bench_whoscored_capacity.py \
+            scripts/research/whoscored_capacity_container_runtime.py \
+            scripts/research/whoscored_capacity_worker_exec.py
+          bash -n scripts/cutover_seaweedfs_topology.sh
+          bash -n scripts/compose.sh
+          bash -n scripts/seaweedfs_legacy_entrypoint.sh
+          bash -n scripts/seaweedfs_lifecycle_lock.sh
+          bash -n scripts/seaweedfs_plane_entrypoint.sh
+          bash -n scripts/research/run_fbref_canary_guarded.sh
+
+      - name: Render production compose
+        if: ${{ !cancelled() }}
+        env:
+          OIDC_ISSUER: https://ci.invalid
+          PUBLIC_IP: 127.0.0.1
+          KC_PUBLIC_URL: https://auth.ci.invalid
+          TRINO_PUBLIC_HOST: trino.ci.invalid
+          JUPYTER_PUBLIC_HOST: jupyter.ci.invalid
+          LAKEKEEPER_DB_PASSWORD: ci-not-a-secret
+          LAKEKEEPER_PG_ENCRYPTION_KEY: 00000000000000000000000000000000
+          SEAWEEDFS_VOLUME_SIZE_LIMIT_MB: "1024"
+        run: |
+          minimum=2.24.4
+          actual="$(docker compose version --short)"
+          test "$(printf '%s\n%s\n' "$minimum" "$actual" | sort -V | head -n1)" = "$minimum"
+          docker compose --env-file .env.example config --quiet
+          docker compose --env-file .env.example \
+            -f compose.yaml -f compose.seaweedfs-supervised.yaml \
+            config --quiet
+          docker compose --project-name whoscored-gw \
+            --project-directory . --env-file .env.example \
+            --file deploy/whoscored/gateway.compose.yaml \
+            config --quiet
+          docker compose --env-file .env.example \
+            -f compose.yaml -f compose.seaweedfs-supervised.yaml \
+            config --format json > /tmp/supervised-compose.json
+          python -I -S - <<'PY'
+          import json
+
+          services = json.load(open("/tmp/supervised-compose.json"))["services"]
+          assert services["seaweedfs"]["command"][0] == "s3"
+          assert all(
+              mount.get("target") != "/data"
+              for mount in services["seaweedfs"]["volumes"]
+          )
+          for name in ("seaweedfs-master", "seaweedfs-volume", "seaweedfs-filer"):
+              assert any(
+                  mount.get("target") == "/data"
+                  for mount in services[name]["volumes"]
+              )
+          PY
+
+      - name: Validate declared WhoScored build-provenance state
+        if: ${{ !cancelled() }}
+        run: |
+          python -I -S scripts/generate_whoscored_runtime_evidence.py \
+            --root . --check
+          provenance_status="$(python -I -S -c \
+            'import json; print(json.load(open("docker/images/airflow/whoscored-build-provenance-attestation.json"))["status"])')"
+          case "$provenance_status" in
+            blocked-v1) provenance_mode=(--expect-blocked) ;;
+            ready-v1)
+              provenance_mode=(
+                --expect-ready-build
+                --release-revision "${{ github.event.pull_request.head.sha }}"
+              )
+              ;;
+            *) echo "unsupported provenance state: $provenance_status" >&2; exit 78 ;;
+          esac
+          python -I -S scripts/validate_whoscored_build_provenance.py \
+            --root . "${provenance_mode[@]}" \
+            --report /tmp/whoscored-build-closure.json
+
+      - name: Prove checked-in evidence and closure report agree
+        if: ${{ !cancelled() }}
+        run: |
+          python -I -S - <<'PY'
+          import json
+
+          attestation = json.load(open(
+              "docker/images/airflow/whoscored-build-provenance-attestation.json"
+          ))
+          report = json.load(open("/tmp/whoscored-build-closure.json"))
+          assert attestation["status"] in {"blocked-v1", "ready-v1"}
+          assert report["status"] == attestation["status"]
+          assert bool(report["issues"]) == (report["status"] == "blocked-v1")
+          PY
+
+      - name: Prove real Buildx metadata and Docker digest last
+        if: ${{ !cancelled() }}
+        env:
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+          WHOSCORED_SCHEDULER_BUILD_METADATA: /tmp/whoscored-build-metadata/airflow-scheduler.json
+          WHOSCORED_SCHEDULER_PAYLOAD_IMAGE: data-platform-airflow-scheduler-payload:provenance-ci
+        run: |
+          WHOSCORED_REAL_DOCKER_TEST=1 \
+          python -m pytest -q \
+            tests/unit/scripts/test_generate_whoscored_deployment_attestation.py::test_real_buildx_metadata_and_docker_digest_path_when_ci_provides_it
+
+      - name: Cleanup test runtime
+        if: ${{ always() }}
+        run: |
+          if test -n "${WHOSCORED_CI_TEST_VENV:-}"; then
+            [[ "$WHOSCORED_CI_TEST_VENV" =~ ^/tmp/whoscored-ci-test-venv\.[A-Za-z0-9]{8}$ ]]
+            rm -rf -- "$WHOSCORED_CI_TEST_VENV"
+          fi
 
   real-airflow-dag-import:
     runs-on: ubuntu-latest
@@ -600,6 +873,8 @@ jobs:
         airflow-version: ["2.7.3", "2.11.2"]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
 
       - name: Build the immutable Airflow parser runtime
         run: |
