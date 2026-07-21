@@ -55,6 +55,15 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_SCHEMAS: Tuple[str, ...] = ("bronze", "silver", "gold")
 DEFAULT_RETENTION = "30d"
+SOFASCORE_CAPTURE_MANIFEST_RETENTION = "7d"
+SOFASCORE_CAPTURE_MANIFEST_SQL = 'iceberg."ops"."sofascore_capture_manifest"'
+SOFASCORE_CAPTURE_MANIFEST_SNAPSHOTS_SQL = (
+    'iceberg."ops"."sofascore_capture_manifest$snapshots"'
+)
+SOFASCORE_CAPTURE_MANIFEST_FILES_SQL = (
+    'iceberg."ops"."sofascore_capture_manifest$files"'
+)
+_RETENTION_THRESHOLD_RE = re.compile(r"^[1-9][0-9]*(?:ms|s|m|h|d)$")
 
 # Per-session floor for the expire/orphan retention guards. Set well below any
 # `retention_threshold` this module uses (down to '3d' for daily high-churn) so
@@ -841,6 +850,93 @@ def _quote_identifier(value: str) -> str:
     if not token or "\x00" in token:
         raise RuntimeError("Iceberg maintenance received an invalid identifier")
     return '"' + token.replace('"', '""') + '"'
+
+
+def _sofascore_capture_manifest_stats(conn) -> dict[str, int]:
+    """Return fail-closed live/snapshot metrics for the static ops manifest."""
+
+    row_count = _fetch_scalar(
+        conn,
+        f"SELECT count(*) FROM {SOFASCORE_CAPTURE_MANIFEST_SQL}",
+    )
+    snapshot_count = _fetch_scalar(
+        conn,
+        f"SELECT count(*) FROM {SOFASCORE_CAPTURE_MANIFEST_SNAPSHOTS_SQL}",
+    )
+
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "SELECT count_if(content = 0), "
+            "coalesce(sum(IF(content = 0, file_size_in_bytes, 0)), 0) "
+            f"FROM {SOFASCORE_CAPTURE_MANIFEST_FILES_SQL}"
+        )
+        file_rows = cursor.fetchall()
+    finally:
+        cursor.close()
+
+    if row_count is None or snapshot_count is None:
+        raise RuntimeError("SofaScore capture manifest stats query returned no row")
+    if len(file_rows) != 1 or len(file_rows[0]) != 2:
+        raise RuntimeError("SofaScore capture manifest file stats are malformed")
+
+    stats = {
+        "row_count": int(row_count),
+        "snapshot_count": int(snapshot_count),
+        "live_data_file_count": int(file_rows[0][0] or 0),
+        "live_data_file_bytes": int(file_rows[0][1] or 0),
+    }
+    if any(value < 0 for value in stats.values()):
+        raise RuntimeError("SofaScore capture manifest stats cannot be negative")
+    return stats
+
+
+def maintain_sofascore_capture_manifest(
+    retention_threshold: str = SOFASCORE_CAPTURE_MANIFEST_RETENTION,
+) -> dict[str, Any]:
+    """Fully compact and expire the SofaScore ops manifest, fail closed.
+
+    This dedicated lifecycle intentionally never invokes
+    ``remove_orphan_files``: concurrent SofaScore writers may still own files
+    that are not yet referenced by committed Iceberg metadata.
+    """
+
+    if (
+        not isinstance(retention_threshold, str)
+        or not _RETENTION_THRESHOLD_RE.fullmatch(retention_threshold)
+    ):
+        raise ValueError("retention_threshold must be a positive Trino duration")
+
+    # The default 7d retention satisfies Trino's global floor, so this task
+    # owns a plain connection and never changes the orphan cleanup session.
+    conn = _get_trino_connection()
+    try:
+        before = _sofascore_capture_manifest_stats(conn)
+        logger.info("SofaScore capture manifest before lifecycle: %s", before)
+        optimize = _exec_alter(
+            conn,
+            f"ALTER TABLE {SOFASCORE_CAPTURE_MANIFEST_SQL} EXECUTE optimize",
+        )
+        expire = _exec_alter(
+            conn,
+            f"ALTER TABLE {SOFASCORE_CAPTURE_MANIFEST_SQL} "
+            "EXECUTE expire_snapshots("
+            f"retention_threshold => '{retention_threshold}')",
+        )
+        after = _sofascore_capture_manifest_stats(conn)
+        logger.info("SofaScore capture manifest after lifecycle: %s", after)
+        result = {
+            "table": "iceberg.ops.sofascore_capture_manifest",
+            "retention_threshold": retention_threshold,
+            "before": before,
+            "optimize": optimize,
+            "expire_snapshots": expire,
+            "after": after,
+        }
+        logger.info("SofaScore capture manifest lifecycle: %s", result)
+        return result
+    finally:
+        conn.close()
 
 
 def _path_sql_literal(value: object) -> str:

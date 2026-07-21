@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import hmac
 import os
+import re
 import sys
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -37,6 +39,7 @@ from scrapers.sofascore.season_pipeline import (
 )
 from scrapers.sofascore.workload_plan import (
     SeasonWorkload,
+    WorkloadPolicyUnavailable,
     load_verified_workload_policy,
     production_season_shape,
     team_count_band,
@@ -51,6 +54,9 @@ from scrapers.sofascore.workload_runtime import (
 
 
 VALID_PHASES = frozenset({"season", "targets", "players"})
+SOFASCORE_BUDGET_ARTIFACT_ID_ENV = "SOFASCORE_PROXY_BUDGET_ARTIFACT_ID"
+_LOWERCASE_SHA256 = re.compile(r"[0-9a-f]{64}")
+_ZERO_SHA256 = "0" * 64
 # #946 4d: the weekly player capture is the single most expensive phase, so the
 # club leagues are spread over ``modulus`` Saturdays instead of all running on
 # every one.  Both defaults are env-tunable because turning the rotation on/off
@@ -59,6 +65,27 @@ VALID_PHASES = frozenset({"season", "targets", "players"})
 # today's two-league cadence therefore stays byte-for-byte unchanged.
 PLAYER_ROTATION_MODULUS_DEFAULT = 4
 PLAYER_ROTATION_MIN_LEAGUES_DEFAULT = 10
+
+
+def _load_pinned_workload_policy(artifact_path: os.PathLike[str] | str):
+    required_artifact_id = os.environ.get(SOFASCORE_BUDGET_ARTIFACT_ID_ENV, "")
+    if _LOWERCASE_SHA256.fullmatch(required_artifact_id) is None:
+        raise WorkloadPolicyUnavailable(
+            f"{SOFASCORE_BUDGET_ARTIFACT_ID_ENV} must be exactly 64 lowercase "
+            "hexadecimal characters"
+        )
+    if required_artifact_id == _ZERO_SHA256:
+        raise WorkloadPolicyUnavailable(
+            f"{SOFASCORE_BUDGET_ARTIFACT_ID_ENV} cannot use the CI/render-only "
+            "zero placeholder"
+        )
+    policy = load_verified_workload_policy(artifact_path)
+    if not hmac.compare_digest(policy.artifact_id, required_artifact_id):
+        raise WorkloadPolicyUnavailable(
+            "verified SofaScore workload policy does not match the required "
+            "artifact pin"
+        )
+    return policy
 
 
 @dataclass(frozen=True)
@@ -325,7 +352,7 @@ def prepare_workload_plan(
         "match": match_freshness,
         "player": player_freshness,
     }
-    policy = load_verified_workload_policy(artifact_path)
+    policy = _load_pinned_workload_policy(artifact_path)
     destination = (
         Path(output_path) if output_path else plan_path_for_run(dag_id, phase_run_id)
     )

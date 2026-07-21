@@ -117,6 +117,7 @@ def _rendered_environment(service: str) -> dict[str, str]:
         environment.update(
             {
                 "FBREF_PROXY_CONTROL_TOKEN": "b" * 64,
+                "SOFASCORE_PROXY_BUDGET_ARTIFACT_ID": "d" * 64,
                 "TM_NATIVE_V2_ENABLED": "false",
                 "TM_STANDING_POLICY_ENABLED": "false",
                 "TM_REQUIRE_METERED_PROXY": "false",
@@ -857,6 +858,9 @@ def _materialize_bind_sources(rendered: Mapping[str, object], tmp_path: Path) ->
     proxy_file = host / "proxys.txt"
     proxy_file.write_text("127.0.0.1:8080\n", encoding="utf-8")
     proxy_file.chmod(0o600)
+    sofascore_budget_artifact = host / "sofascore-budget.json"
+    sofascore_budget_artifact.write_text("{}\n", encoding="utf-8")
+    sofascore_budget_artifact.chmod(0o640)
     assignments = {
         (
             "airflow-scheduler",
@@ -864,6 +868,10 @@ def _materialize_bind_sources(rendered: Mapping[str, object], tmp_path: Path) ->
         ): fotmob_admission,
         ("airflow-scheduler", "/opt/airflow/logs"): writable["logs"],
         ("airflow-scheduler", "/opt/airflow/proxys.txt"): proxy_file,
+        (
+            "airflow-scheduler",
+            "/opt/airflow/runtime/sofascore/proxy_budget_canary.json",
+        ): sofascore_budget_artifact,
         (
             "airflow-scheduler",
             "/opt/airflow/secure/whoscored-approvals",
@@ -939,6 +947,48 @@ def test_bind_source_policy_requires_preexisting_separate_protected_paths(
     )["source"] = str(nested_admission)
     projections = admission.verify_rendered_compose(rendered, BINDINGS)
     with pytest.raises(admission.AdmissionError, match="unsafe|alias or nest"):
+        admission._validate_bind_source_policy(projections, root=root)
+
+
+@pytest.mark.parametrize("relation", ("root", "descendant"))
+def test_bind_source_policy_rejects_artifact_inside_release_checkout(
+    tmp_path: Path, relation: str
+) -> None:
+    rendered = _rendered()
+    root = _materialize_bind_sources(rendered, tmp_path)
+    artifact = root
+    if relation == "descendant":
+        artifact = root / "runtime" / "sofascore-budget.json"
+        artifact.parent.mkdir()
+        artifact.write_text("{}\n", encoding="utf-8")
+        artifact.chmod(0o640)
+    _bind_volume(
+        rendered,
+        service="airflow-scheduler",
+        target="/opt/airflow/runtime/sofascore/proxy_budget_canary.json",
+    )["source"] = str(artifact)
+
+    projections = admission.verify_rendered_compose(rendered, BINDINGS)
+    with pytest.raises(admission.AdmissionError, match="outside the release checkout"):
+        admission._validate_bind_source_policy(projections, root=root)
+
+
+def test_bind_source_policy_requires_scheduler_readable_artifact(
+    tmp_path: Path,
+) -> None:
+    rendered = _rendered()
+    root = _materialize_bind_sources(rendered, tmp_path)
+    artifact = Path(
+        _bind_volume(
+            rendered,
+            service="airflow-scheduler",
+            target="/opt/airflow/runtime/sofascore/proxy_budget_canary.json",
+        )["source"]
+    )
+    artifact.chmod(0o600)
+    projections = admission.verify_rendered_compose(rendered, BINDINGS)
+
+    with pytest.raises(admission.AdmissionError, match="UID 50000/GID 0"):
         admission._validate_bind_source_policy(projections, root=root)
 
 
@@ -1202,6 +1252,31 @@ def test_rendered_compose_rejects_unmodeled_execution_controls(
         assert isinstance(environment, dict)
         environment["PROXY_FILTER_ALLOW_FILE_FALLBACK"] = "true"
     with pytest.raises(admission.AdmissionError, match=message):
+        admission.verify_rendered_compose(rendered, BINDINGS)
+
+
+def test_scheduler_rejects_legacy_nested_sofascore_artifact_path() -> None:
+    rendered = _rendered()
+    environment = rendered["services"]["airflow-scheduler"]["environment"]
+    environment["SOFASCORE_PROXY_BUDGET_ARTIFACT"] = (
+        "/opt/airflow/configs/sofascore/proxy_budget_canary.json"
+    )
+
+    with pytest.raises(admission.AdmissionError, match="security environment"):
+        admission.verify_rendered_compose(rendered, BINDINGS)
+
+
+@pytest.mark.parametrize(
+    "artifact_id", ("", "not-a-digest", "A" * 64, "0" * 64)
+)
+def test_scheduler_rejects_invalid_expected_sofascore_artifact_id(
+    artifact_id: str,
+) -> None:
+    rendered = _rendered()
+    environment = rendered["services"]["airflow-scheduler"]["environment"]
+    environment["SOFASCORE_PROXY_BUDGET_ARTIFACT_ID"] = artifact_id
+
+    with pytest.raises(admission.AdmissionError, match="artifact ID"):
         admission.verify_rendered_compose(rendered, BINDINGS)
 
 
@@ -1532,6 +1607,7 @@ def test_checked_in_compose_model_matches_admission_policy(tmp_path: Path) -> No
         "SEAWEEDFS_DATA_VOLUME_NAME": "seaweedfs_data",
         "SEAWEEDFS_VOLUME_SIZE_LIMIT_MB": "1024",
         "FBREF_PROXY_CONTROL_TOKEN": "b" * 64,
+        "SOFASCORE_PROXY_BUDGET_ARTIFACT_ID": "d" * 64,
         "SOFASCORE_PROXY_CONTROL_TOKEN": "b" * 64,
         "TRINO_PUBLIC_HOST": "trino.ci.invalid",
         "WHOSCORED_PROXY_APPROVAL_HOST_DIR": (

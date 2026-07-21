@@ -235,6 +235,7 @@ _NETWORK_PROJECT = {
     "whoscored-paid-provider-egress": GATEWAY_PROJECT,
 }
 _DIGEST = re.compile(r"\A[0-9a-f]{64}\Z")
+_ZERO_DIGEST = "0" * 64
 _COMMIT = re.compile(r"\A[0-9a-f]{40}\Z")
 _PINNED_IMAGE = re.compile(r"\A[^\s@]+@sha256:[0-9a-f]{64}\Z")
 _IMAGE_ID = re.compile(r"\Asha256:[0-9a-f]{64}\Z")
@@ -413,12 +414,17 @@ _ALLOWED_VOLUME_TARGETS = {
         "/home/airflow/soccerdata": ("volume", False),
         "/opt/airflow/configs/fotmob": ("bind", True),
         "/opt/airflow/configs/medallion": ("bind", True),
+        "/opt/airflow/configs/proxy_filter": ("bind", True),
         "/opt/airflow/configs/soccerdata": ("bind", True),
         "/opt/airflow/configs/sofascore": ("bind", True),
         "/opt/airflow/dags": ("bind", True),
         "/opt/airflow/fotmob-admission": ("bind", True),
         "/opt/airflow/logs": ("bind", False),
         "/opt/airflow/proxys.txt": ("bind", True),
+        "/opt/airflow/runtime/sofascore/proxy_budget_canary.json": (
+            "bind",
+            True,
+        ),
         "/opt/airflow/scrapers": ("bind", True),
         "/opt/airflow/scripts": ("bind", True),
         "/opt/airflow/secure/whoscored-approvals": ("bind", True),
@@ -450,6 +456,7 @@ _RELEASE_BIND_TARGETS = {
     "airflow-scheduler": {
         "/opt/airflow/configs/fotmob": "configs/fotmob",
         "/opt/airflow/configs/medallion": "configs/medallion",
+        "/opt/airflow/configs/proxy_filter": "configs/proxy_filter",
         "/opt/airflow/configs/soccerdata": "configs/soccerdata",
         "/opt/airflow/configs/sofascore": "configs/sofascore",
         "/opt/airflow/dags": "dags",
@@ -481,6 +488,10 @@ _RUNTIME_HOST_BIND_TARGETS = {
     ): "protected-directory",
     ("airflow-scheduler", "/opt/airflow/logs"): "writable-directory",
     ("airflow-scheduler", "/opt/airflow/proxys.txt"): "protected-file",
+    (
+        "airflow-scheduler",
+        "/opt/airflow/runtime/sofascore/proxy_budget_canary.json",
+    ): "scheduler-readable-protected-file",
     (
         "airflow-scheduler",
         "/opt/airflow/secure/whoscored-approvals",
@@ -949,7 +960,8 @@ _SCHEDULER_ENVIRONMENT_NAMES = frozenset(
     SEAWEEDFS_CUTOVER_REHEARSAL_INVENTORY
     SEAWEEDFS_CUTOVER_REHEARSAL_MAX_AGE_HOURS
     SEAWEEDFS_CUTOVER_VERIFY_MIBPS SOFASCORE_MANIFEST_BACKEND
-    SOFASCORE_PROXY_BUDGET_ARTIFACT SOFASCORE_PROXY_BUDGET_LEDGER
+    SOFASCORE_PROXY_BUDGET_ARTIFACT SOFASCORE_PROXY_BUDGET_ARTIFACT_ID
+    SOFASCORE_PROXY_BUDGET_LEDGER
     SOFASCORE_PROXY_CONTROL_TOKEN SOFASCORE_PROXY_CONTROL_URL
     SOFASCORE_PROXY_LEASE_TTL_SECONDS SOFASCORE_RAW_STORE_URI
     SOFASCORE_REGISTRY_PATH SOFASCORE_PLAYER_ROTATION_MIN_LEAGUES
@@ -1055,6 +1067,9 @@ _FIXED_ENVIRONMENT = {
             "/opt/airflow/state/whoscored-proxy-filter/paid_requests.jsonl"
         ),
         "PROXY_FILTER_URL": "",
+        "SOFASCORE_PROXY_BUDGET_ARTIFACT": (
+            "/opt/airflow/runtime/sofascore/proxy_budget_canary.json"
+        ),
         "WHOSCORED_BACKFILL_POOL": "whoscored_direct_pool",
         "WHOSCORED_DIRECT_POOL": "whoscored_direct_pool",
         "WHOSCORED_DQ_POOL": "whoscored_dq_pool",
@@ -1795,6 +1810,14 @@ def _validate_rendered_environment(
     ) not in {"0", "1"}:
         raise AdmissionError("rendered WhoScored paid-batch control differs")
     if service == "airflow-scheduler":
+        expected_sofascore_artifact_id = environment.get(
+            "SOFASCORE_PROXY_BUDGET_ARTIFACT_ID", ""
+        )
+        if (
+            _DIGEST.fullmatch(expected_sofascore_artifact_id) is None
+            or expected_sofascore_artifact_id == _ZERO_DIGEST
+        ):
+            raise AdmissionError("rendered SofaScore artifact ID is invalid")
         approval_path = environment.get("WHOSCORED_PROXY_APPROVAL_PATH", "")
         if (
             legacy_scheduler
@@ -3735,6 +3758,25 @@ def _assert_airflow_authority_directory(
     return before
 
 
+def _assert_scheduler_readable_regular_file(
+    path: Path, *, label: str
+) -> os.stat_result:
+    """Require a protected file whose mode is readable by UID 50000/GID 0."""
+
+    metadata = _assert_protected_regular_file(path, label=label)
+    if metadata.st_uid == 50_000:
+        readable = bool(metadata.st_mode & stat.S_IRUSR)
+    elif metadata.st_gid == 0:
+        readable = bool(metadata.st_mode & stat.S_IRGRP)
+    else:
+        readable = bool(metadata.st_mode & stat.S_IROTH)
+    if not readable:
+        raise AdmissionError(
+            f"{label} is not readable by scheduler UID 50000/GID 0: {path}"
+        )
+    return metadata
+
+
 def _provider_receipt_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -4139,6 +4181,18 @@ def _validate_bind_source_policy(
         expected.discard(pointer_identity)
     if set(sources) != expected:
         raise AdmissionError("rendered bind-source policy differs")
+    release_root = _canonical_existing_path(root, label="release checkout")
+    artifact_identity = (
+        "airflow-scheduler",
+        "/opt/airflow/runtime/sofascore/proxy_budget_canary.json",
+    )
+    artifact_source = _canonical_existing_path(
+        sources[artifact_identity], label="SofaScore budget artifact"
+    )
+    if artifact_source == release_root or release_root in artifact_source.parents:
+        raise AdmissionError(
+            "SofaScore budget artifact must be outside the release checkout"
+        )
     for service, targets in _RELEASE_BIND_TARGETS.items():
         for target, relative in targets.items():
             source = sources[(service, target)]
@@ -4175,6 +4229,11 @@ def _validate_bind_source_policy(
             _assert_protected_directory(
                 source, label=f"authority directory for {identity[0]} {identity[1]}"
             )
+        elif policy == "scheduler-readable-protected-file":
+            _assert_scheduler_readable_regular_file(
+                source,
+                label=f"scheduler runtime input for {identity[0]} {identity[1]}",
+            )
         else:
             _assert_protected_regular_file(
                 source, label=f"protected input for {identity[0]} {identity[1]}"
@@ -4194,6 +4253,12 @@ def _validate_bind_source_policy(
             ("airflow-scheduler", "/opt/airflow/fotmob-admission")
         ],
         "scheduler-logs": sources[("airflow-scheduler", "/opt/airflow/logs")],
+        "sofascore-budget-artifact": sources[
+            (
+                "airflow-scheduler",
+                "/opt/airflow/runtime/sofascore/proxy_budget_canary.json",
+            )
+        ],
         "gateway-state": sources[
             (
                 "whoscored_paid_gateway",

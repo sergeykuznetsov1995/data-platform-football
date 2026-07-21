@@ -124,6 +124,72 @@ endpoint captures are complete.
 
 ## Paid-proxy canary
 
+The verified budget policy is deployed separately from the release checkout.
+Both the shared scheduler and the dedicated gateway receive the same immutable
+host file at
+`/opt/airflow/runtime/sofascore/proxy_budget_canary.json`; the in-container
+`SOFASCORE_PROXY_BUDGET_ARTIFACT` contract always points to that exact path.
+Set `SOFASCORE_PROXY_BUDGET_ARTIFACT_HOST` to the pre-existing host file.  Do
+not place it below `configs/sofascore`, because that directory has its own
+release-scoped bind and would hide or replace the artifact during a cutover.
+Set the required `SOFASCORE_PROXY_BUDGET_ARTIFACT_ID` to the reviewed 64-hex
+artifact ID. The all-zero value in `.env.example` exists only so CI can render
+Compose and must be replaced before deployment. Readiness derives the ID from
+the verified file and requires exact agreement with this independent pin in
+both the scheduler and gateway.
+
+The gateway's counters and accounting files survive container and checkout
+replacement under the pre-created `SOFASCORE_GATEWAY_STATE_HOST_DIR`.  It is
+mounted narrowly at `/opt/airflow/logs/sofascore_proxy_filter`; `bytes.json`,
+`paid_requests.jsonl`, the allocation ledger, and its WAL must all remain below
+that directory, together with the parent-envelope ledger that fences all phases
+of one run.  Make the host directory writable by UID 50000/group 0 before
+starting the gateway.  Compose uses `create_host_path: false` for both durable
+binds and therefore fails closed when either source is missing.
+
+Before creating either container, run the UID-aware host preflight against the
+exact deployment paths:
+
+```bash
+python scripts/sofascore_runtime_preflight.py preflight \
+  --release-root /root/dpf-release-immutable \
+  --artifact /durable/path/sofascore/proxy_budget_canary.json \
+  --state-dir /durable/path/sofascore/gateway-state \
+  --expected-artifact-id <reviewed-64-hex-artifact-id>
+```
+
+`--release-root` is mandatory and must name the canonical, root-owned protected
+checkout. Both durable sources must be canonical and outside that root. Install
+the artifact as `root:0` mode `0640` below a root-owned parent chain that is not
+group/world writable. It must be a regular non-symlink file readable by UID
+50000/GID 0. The state directory must be protected, durable, and writable and
+traversable by that identity; its parent chain follows the same protected-host
+rule. The preflight holds the artifact through an `O_NOFOLLOW` file descriptor,
+rejects inode/size/mtime changes, and loads the production policy verifier
+through that stable descriptor, including `verified=true` and current
+runtime-fingerprint validation. It never prints proxy credentials or response
+bodies.
+
+Gateway container health is stricter than host preflight. It runs a real
+write/unlink probe in its narrow state mount, reloads the verified policy, and
+requires `/health` to report `sofascore_paid_enabled=true`, a positive budget,
+and the exact pinned artifact ID. Internal health HTTP explicitly bypasses all
+proxy environment variables. A merely live HTTP endpoint is therefore not
+sufficient to make the gateway healthy.
+
+The shared scheduler healthcheck intentionally remains SchedulerJob-only so an
+independently managed source gateway cannot make all Airflow workloads appear
+unhealthy. During cutover, run the stronger scheduler check explicitly inside
+the admitted scheduler container (it also checks the live gateway and pinned
+artifact before SchedulerJob):
+
+```bash
+docker compose exec -T airflow-scheduler \
+  python /opt/airflow/scripts/sofascore_runtime_preflight.py scheduler-health \
+  --artifact /opt/airflow/runtime/sofascore/proxy_budget_canary.json \
+  --health-url http://sofascore_proxy_filter:8899/health
+```
+
 `dag_canary_sofascore_proxy` is paused and manual-only. Trigger it with an
 explicit positive `experimental_cap_bytes` matching proxy-filter's isolated
 `sofascore_canary` cap. It resumes each v2 workload class toward at least 20
