@@ -69,7 +69,12 @@ def test_ci_runs_public_writer_and_capacity_contracts():
     assert "bench_whoscored_capacity.py" in text
     assert "whoscored_capacity_container_runtime.py" in text
     assert "docker/images/airflow/whoscored_capacity_worker_bootstrap.py" in text
-    assert "rg --files tests" in text
+    assert "mapfile -t whoscored_tests" in text
+    assert "find tests -type f -name 'test_*whoscored*.py'" in text
+    assert '"${whoscored_tests[@]}"' in text
+    assert "mapfile -t whoscored_static_paths" in text
+    assert '"${whoscored_static_paths[@]}"' in text
+    assert "rg --files tests" not in text
 
 
 def test_ci_uses_test_runtime_and_smokes_immutable_flaresolverr():

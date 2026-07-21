@@ -76,6 +76,14 @@ jobs:
 
       - name: Static and import checks
         run: |
+          mapfile -t whoscored_static_paths < <(
+            find scripts tests -type f \
+              \( -name '*whoscored*.py' \
+                 -o -name '*test_proxy_traffic*.py' \
+                 -o -name '*test_filter_proxy*.py' \) \
+              -print | sort
+          )
+          test "${#whoscored_static_paths[@]}" -gt 0
           ruff check \
             scrapers/whoscored \
             scrapers/base/iceberg_writer.py \
@@ -110,7 +118,7 @@ jobs:
             scripts/whoscored_proxy_campaign.py \
             scripts/research/bench_whoscored_workflow.py \
             scripts/research/whoscored_capacity_container_runtime.py \
-            $(rg --files scripts tests | rg '(whoscored|test_proxy_traffic|test_filter_proxy).*\.py$')
+            "${whoscored_static_paths[@]}"
           python -m compileall -q \
             scrapers/whoscored \
             scrapers/base/iceberg_writer.py \
@@ -542,8 +550,12 @@ jobs:
           WHOSCORED_SCHEDULER_BUILD_METADATA: /tmp/whoscored-build-metadata/airflow-scheduler.json
           WHOSCORED_SCHEDULER_PAYLOAD_IMAGE: data-platform-airflow-scheduler-payload:provenance-ci
         run: |
+          mapfile -t whoscored_tests < <(
+            find tests -type f -name 'test_*whoscored*.py' -print | sort
+          )
+          test "${#whoscored_tests[@]}" -gt 0
           pytest -q \
-            $(rg --files tests | rg '/test_.*whoscored.*\.py$|/test_whoscored.*\.py$') \
+            "${whoscored_tests[@]}" \
             tests/unit/scrapers/test_iceberg_writer.py \
             tests/unit/dags/test_proxy_traffic.py \
             tests/unit/scrapers/test_flaresolverr_client.py \
