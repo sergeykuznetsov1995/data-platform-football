@@ -155,6 +155,39 @@ directory during an FBref deploy. The durable scheduler build is the
 `airflow-scheduler` target in `docker/images/airflow/Dockerfile`, and
 `compose.yaml` points the scheduler at that target.
 
+Camoufox locale resolution additionally requires one external GeoLite database.
+It is production data, not an executable image layer: do not commit the 66 MB
+file and do not fetch a mutable/deletable `latest` GitHub release during build
+or deploy. Obtain the reviewed bytes through the operator's protected offline
+artifact channel, then install them at a canonical root-owned path:
+
+```bash
+set -Eeuo pipefail
+umask 077
+REVIEWED_GEOLITE_SOURCE=/absolute/protected/operator-input/GeoLite2-City.mmdb
+FBREF_GEOIP_DIR=/root/fbref-949-runtime/fbref-geoip
+FBREF_CAMOUFOX_GEOIP_DATABASE_HOST_PATH="$FBREF_GEOIP_DIR/GeoLite2-City.mmdb"
+
+test "$REVIEWED_GEOLITE_SOURCE" = "$(realpath -e -- "$REVIEWED_GEOLITE_SOURCE")"
+install -d -o root -g root -m 0700 "$FBREF_GEOIP_DIR"
+test ! -e "$FBREF_CAMOUFOX_GEOIP_DATABASE_HOST_PATH"
+install -o root -g root -m 0444 "$REVIEWED_GEOLITE_SOURCE" \
+  "$FBREF_CAMOUFOX_GEOIP_DATABASE_HOST_PATH"
+test "$(stat -c '%u:%g:%a:%s:%h' \
+  "$FBREF_CAMOUFOX_GEOIP_DATABASE_HOST_PATH")" = \
+  '0:0:444:66164133:1'
+test "$(sha256sum "$FBREF_CAMOUFOX_GEOIP_DATABASE_HOST_PATH" | cut -d' ' -f1)" = \
+  0772278c513e6ab3c65e9ae53d6861f137ab696f91eec763a2e6fe76befd83b2
+export FBREF_CAMOUFOX_GEOIP_DATABASE_HOST_PATH
+```
+
+Production Compose mounts that exact file read-only at
+`/opt/airflow/secure/fbref-geoip/GeoLite2-City.mmdb`, outside the image and
+legacy-venv trust roots. WhoScored production admission repeats the protected
+host-file, size and SHA-256 proof. Each live FBref runner then re-hashes the
+mounted file through a no-symlink file descriptor before assigning
+`camoufox.locale.MMDB_FILE`, and does so before acquiring a paid lease.
+
 For a release, build the pinned unified target and label it with the merge SHA:
 
 ```bash

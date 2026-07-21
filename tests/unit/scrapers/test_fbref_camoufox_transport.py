@@ -1,14 +1,17 @@
 """Network-free tests for the single FBref Camoufox clearance transport."""
 
 import base64
+import hashlib
 import os
-from pathlib import Path
+import sys
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call as mock_call
 
 import pytest
 
+from scrapers.fbref import camoufox_fetch as camoufox_runtime
 from scrapers.fbref.camoufox_fetch import (
     BROWSER_REQUEST_FIXED_OVERHEAD_BYTES,
     BROWSER_UNDECLARED_BODY_RESERVATION_BYTES,
@@ -20,6 +23,7 @@ from scrapers.fbref.camoufox_fetch import (
     UNEXPECTED_BROWSER_NETWORK_RESERVATION_BYTES,
     _navigation_error_type,
     is_cloudflare_blocked,
+    require_camoufox_geoip_database,
     resolve_geoip_without_redirects,
     should_block_request,
 )
@@ -1607,6 +1611,141 @@ def test_geoip_resolver_is_one_bounded_attempt_without_redirects(monkeypatch):
     assert session.trust_env is False
     assert session.mount.call_count == 2
     session.close.assert_called_once_with()
+
+
+def _install_pinned_geoip_database(monkeypatch, tmp_path, raw=b"pinned-geolite"):
+    path = tmp_path / "GeoLite2-City.mmdb"
+    path.write_bytes(raw)
+    path.chmod(0o444)
+    monkeypatch.setattr(
+        camoufox_runtime, "FBREF_CAMOUFOX_GEOIP_DATABASE_PATH", path
+    )
+    monkeypatch.setattr(
+        camoufox_runtime, "FBREF_CAMOUFOX_GEOIP_DATABASE_SIZE", len(raw)
+    )
+    monkeypatch.setattr(
+        camoufox_runtime,
+        "FBREF_CAMOUFOX_GEOIP_DATABASE_SHA256",
+        hashlib.sha256(raw).hexdigest(),
+    )
+    monkeypatch.setattr(
+        camoufox_runtime, "FBREF_CAMOUFOX_GEOIP_DATABASE_UID", path.stat().st_uid
+    )
+    monkeypatch.setattr(
+        camoufox_runtime, "FBREF_CAMOUFOX_GEOIP_DATABASE_GID", path.stat().st_gid
+    )
+    monkeypatch.setenv(
+        camoufox_runtime.FBREF_CAMOUFOX_GEOIP_DATABASE_ENV, str(path)
+    )
+    locale = SimpleNamespace(
+        MMDB_FILE=Path("/untrusted/package-default.mmdb"),
+        download_mmdb=MagicMock(),
+    )
+    monkeypatch.setitem(sys.modules, "camoufox.locale", locale)
+    return path, locale
+
+
+def test_geoip_database_is_attested_before_camoufox_path_is_selected(
+    monkeypatch, tmp_path
+):
+    path, locale = _install_pinned_geoip_database(monkeypatch, tmp_path)
+    upstream_download = locale.download_mmdb
+
+    require_camoufox_geoip_database()
+
+    assert locale.MMDB_FILE == path
+    with pytest.raises(RuntimeError, match="runtime GeoLite download is disabled"):
+        locale.download_mmdb()
+    upstream_download.assert_not_called()
+
+
+def test_geoip_database_rejects_changed_path_entry_after_fd_read(
+    monkeypatch, tmp_path
+):
+    path, locale = _install_pinned_geoip_database(monkeypatch, tmp_path)
+    replacement = tmp_path / "replacement.mmdb"
+    replacement.write_bytes(path.read_bytes())
+    replacement.chmod(0o444)
+    real_stat = os.stat
+
+    def changed_entry(candidate, *args, **kwargs):
+        if Path(candidate) == path and kwargs.get("follow_symlinks") is False:
+            return real_stat(replacement, *args, **kwargs)
+        return real_stat(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(camoufox_runtime.os, "stat", changed_entry)
+
+    with pytest.raises(RuntimeError, match="production GeoLite database"):
+        require_camoufox_geoip_database()
+
+    assert locale.MMDB_FILE == Path("/untrusted/package-default.mmdb")
+
+
+@pytest.mark.parametrize(
+    "mutation", ["env", "digest", "size", "mode", "hardlink", "symlink"]
+)
+def test_geoip_database_rejects_unreviewed_runtime_input_before_assignment(
+    monkeypatch, tmp_path, mutation
+):
+    path, locale = _install_pinned_geoip_database(monkeypatch, tmp_path)
+    if mutation == "env":
+        monkeypatch.setenv(
+            camoufox_runtime.FBREF_CAMOUFOX_GEOIP_DATABASE_ENV,
+            str(path.with_name("other.mmdb")),
+        )
+    elif mutation == "digest":
+        path.chmod(0o644)
+        path.write_bytes(b"x" * path.stat().st_size)
+        path.chmod(0o444)
+    elif mutation == "size":
+        path.chmod(0o644)
+        path.write_bytes(path.read_bytes() + b"x")
+        path.chmod(0o444)
+    elif mutation == "mode":
+        path.chmod(0o644)
+    elif mutation == "hardlink":
+        path.with_suffix(".linked").hardlink_to(path)
+    else:
+        target = path.with_suffix(".real")
+        path.rename(target)
+        path.symlink_to(target)
+
+    with pytest.raises(RuntimeError, match="production GeoLite database"):
+        require_camoufox_geoip_database()
+
+    assert locale.MMDB_FILE == Path("/untrusted/package-default.mmdb")
+
+
+def test_geoip_database_production_identity_is_immutable() -> None:
+    assert str(camoufox_runtime.FBREF_CAMOUFOX_GEOIP_DATABASE_PATH) == (
+        "/opt/airflow/secure/fbref-geoip/GeoLite2-City.mmdb"
+    )
+    assert camoufox_runtime.FBREF_CAMOUFOX_GEOIP_DATABASE_SIZE == 66_164_133
+    assert camoufox_runtime.FBREF_CAMOUFOX_GEOIP_DATABASE_SHA256 == (
+        "0772278c513e6ab3c65e9ae53d6861f137ab696f91eec763a2e6fe76befd83b2"
+    )
+    assert camoufox_runtime.FBREF_CAMOUFOX_GEOIP_DATABASE_MODE == 0o444
+    assert camoufox_runtime.FBREF_CAMOUFOX_GEOIP_DATABASE_UID == 0
+    assert camoufox_runtime.FBREF_CAMOUFOX_GEOIP_DATABASE_GID == 0
+
+
+def test_geoip_database_failure_prevents_paid_lease_acquisition() -> None:
+    database_check = MagicMock(side_effect=RuntimeError("unreviewed database"))
+    proxy_provider = MagicMock(return_value={"server": "http://paid-proxy:8900"})
+    resolver = MagicMock(return_value="203.0.113.9")
+    transport = CamoufoxFbrefTransport(
+        proxy_provider=proxy_provider,
+        geoip_database_check=database_check,
+        geoip_resolver=resolver,
+    )
+
+    with pytest.raises(RuntimeError, match="unreviewed database"):
+        transport._start()
+
+    database_check.assert_called_once_with()
+    proxy_provider.assert_not_called()
+    resolver.assert_not_called()
+    assert transport.traffic_stats()["real_requests_count"] == 0
 
 
 @pytest.mark.parametrize(

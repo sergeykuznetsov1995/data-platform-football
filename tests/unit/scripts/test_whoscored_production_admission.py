@@ -677,6 +677,9 @@ def _materialize_bind_sources(rendered: Mapping[str, object], tmp_path: Path) ->
     proxy_file = host / "proxys.txt"
     proxy_file.write_text("127.0.0.1:8080\n", encoding="utf-8")
     proxy_file.chmod(0o600)
+    geoip_database = host / "GeoLite2-City.mmdb"
+    geoip_database.write_bytes(b"unit-test-geolite-database")
+    geoip_database.chmod(0o444)
     assignments = {
         (
             "airflow-scheduler",
@@ -684,6 +687,10 @@ def _materialize_bind_sources(rendered: Mapping[str, object], tmp_path: Path) ->
         ): fotmob_admission,
         ("airflow-scheduler", "/opt/airflow/logs"): writable["logs"],
         ("airflow-scheduler", "/opt/airflow/proxys.txt"): proxy_file,
+        (
+            "airflow-scheduler",
+            admission.FBREF_CAMOUFOX_GEOIP_DATABASE_CONTAINER_PATH,
+        ): geoip_database,
         (
             "airflow-scheduler",
             "/opt/airflow/secure/whoscored-approvals",
@@ -710,11 +717,33 @@ def _materialize_bind_sources(rendered: Mapping[str, object], tmp_path: Path) ->
     return root
 
 
+def _use_test_geoip_identity(
+    monkeypatch: pytest.MonkeyPatch, rendered: Mapping[str, object]
+) -> Path:
+    source = Path(
+        _bind_volume(
+            rendered,
+            service="airflow-scheduler",
+            target=admission.FBREF_CAMOUFOX_GEOIP_DATABASE_CONTAINER_PATH,
+        )["source"]
+    )
+    raw = source.read_bytes()
+    monkeypatch.setattr(admission, "FBREF_CAMOUFOX_GEOIP_DATABASE_SIZE", len(raw))
+    monkeypatch.setattr(
+        admission,
+        "FBREF_CAMOUFOX_GEOIP_DATABASE_SHA256",
+        hashlib.sha256(raw).hexdigest(),
+    )
+    return source
+
+
 def test_bind_source_policy_requires_preexisting_separate_protected_paths(
+    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     rendered = _rendered()
     root = _materialize_bind_sources(rendered, tmp_path)
+    _use_test_geoip_identity(monkeypatch, rendered)
     projections = admission.verify_rendered_compose(rendered, BINDINGS)
 
     admission._validate_bind_source_policy(projections, root=root)
@@ -737,6 +766,7 @@ def test_bind_source_policy_requires_preexisting_separate_protected_paths(
     nested_case = tmp_path / "nested-case"
     nested_case.mkdir()
     root = _materialize_bind_sources(rendered, nested_case)
+    _use_test_geoip_identity(monkeypatch, rendered)
     scheduler_logs = Path(
         _bind_volume(
             rendered,
@@ -758,10 +788,12 @@ def test_bind_source_policy_requires_preexisting_separate_protected_paths(
 
 
 def test_bind_source_policy_rejects_auto_create_and_writable_release_code(
+    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     rendered = _rendered()
     root = _materialize_bind_sources(rendered, tmp_path)
+    _use_test_geoip_identity(monkeypatch, rendered)
     dags = _bind_volume(
         rendered, service="airflow-scheduler", target="/opt/airflow/dags"
     )
@@ -774,6 +806,55 @@ def test_bind_source_policy_rejects_auto_create_and_writable_release_code(
     projections = admission.verify_rendered_compose(rendered, BINDINGS)
     with pytest.raises(admission.AdmissionError, match="protected directory"):
         admission._validate_bind_source_policy(projections, root=root)
+
+
+@pytest.mark.parametrize(
+    "mutation", ["digest", "size", "mode", "hardlink", "symlink"]
+)
+def test_bind_source_policy_rejects_unreviewed_geoip_database(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    rendered = _rendered()
+    root = _materialize_bind_sources(rendered, tmp_path)
+    source = _use_test_geoip_identity(monkeypatch, rendered)
+    if mutation == "digest":
+        source.chmod(0o644)
+        source.write_bytes(b"x" * source.stat().st_size)
+        source.chmod(0o444)
+    elif mutation == "size":
+        source.chmod(0o644)
+        source.write_bytes(source.read_bytes() + b"x")
+        source.chmod(0o444)
+    elif mutation == "mode":
+        source.chmod(0o644)
+    elif mutation == "hardlink":
+        source.with_suffix(".linked").hardlink_to(source)
+    else:
+        target = source.with_suffix(".real")
+        source.rename(target)
+        source.symlink_to(target)
+    projections = admission.verify_rendered_compose(rendered, BINDINGS)
+
+    with pytest.raises(admission.AdmissionError, match="GeoLite|canonical"):
+        admission._validate_bind_source_policy(projections, root=root)
+
+
+def test_geoip_mount_is_outside_every_image_trust_path() -> None:
+    assert admission.FBREF_CAMOUFOX_GEOIP_DATABASE_SIZE == 66_164_133
+    assert admission.FBREF_CAMOUFOX_GEOIP_DATABASE_SHA256 == (
+        "0772278c513e6ab3c65e9ae53d6861f137ab696f91eec763a2e6fe76befd83b2"
+    )
+    assert not admission._mount_shadows_image_path(
+        "airflow-scheduler",
+        admission.FBREF_CAMOUFOX_GEOIP_DATABASE_CONTAINER_PATH,
+    )
+    assert admission._mount_shadows_image_path(
+        "airflow-scheduler",
+        "/opt/legacy-scraper-venv/lib/python3.11/site-packages/"
+        "camoufox/GeoLite2-City.mmdb",
+    )
 
 
 def test_rendered_compose_binds_all_protected_services(
