@@ -46,7 +46,7 @@
     "scrapers/base/flaresolverr_client.py": "f29bdab466e9af273ac193b345fa8e74831ec22c01388ef5a59ef6b46eb30c78",
     "scrapers/base/iceberg_writer.py": "5e55c8167f6019d930585a240d82f4047d0dfd04b3aaf999abd91bda5fea5299",
     "scrapers/base/sql_validator.py": "b73a94b1c9bcf449e3233aacb9801cd860d9196c73c2ad4af3c4a264bace3925",
-    "scrapers/base/trino_manager.py": "b25b287b8d42d4ddae10e389eba58f5169125a0438cba5be5148e6f6b8b8ee5e",
+    "scrapers/base/trino_manager.py": "5c6a1eba2a32241ac90141b21242f7b05ada4a42d11c80289bd138f7be9a11e5",
     "scrapers/fbref/__init__.py": "40dab016d1cb145508ab0f55f6c04560c4d7e4a4163cca2bda3a91d2cdf0fa10",
     "scrapers/fbref/control/__init__.py": "6294141868355f808cb375d33769cddae6de5ac81e8745fda02fbda44938c341",
     "scrapers/fbref/control/migrations.py": "42ad79c2566a13fd7306c63acba90ce1d5ac4033b5750c01fc29644d2c0baa6f",
