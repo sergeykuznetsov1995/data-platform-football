@@ -1189,6 +1189,12 @@ def _yaml_anchor_definitions(line: str) -> list[str]:
     )
 
 
+def _yaml_ignored_line(line: str) -> bool:
+    """Return whether YAML indentation must ignore this blank/comment line."""
+
+    return not line.strip() or line.lstrip().startswith("#")
+
+
 def _parse_compose_services(
     root: Path,
     discovery: Discovery,
@@ -1211,6 +1217,7 @@ def _parse_compose_services(
             anchor_definitions.add(anchor)
 
     anchors: dict[str, dict[str, str | None]] = {}
+    anchor_definition_lines: dict[str, int] = {}
     anchor_execution_overrides: set[str] = set()
     anchor_unmodelled_inputs: set[str] = set()
     index = 0
@@ -1226,7 +1233,7 @@ def _parse_compose_services(
             raise ProvenanceError(f"duplicate {description} anchor: {anchor}")
         end = index + 1
         while end < len(lines) and (
-            not lines[end].strip() or lines[end].startswith(" ")
+            _yaml_ignored_line(lines[end]) or lines[end].startswith(" ")
         ):
             end += 1
         anchor_block = lines[index + 1 : end]
@@ -1234,6 +1241,7 @@ def _parse_compose_services(
             anchor_block, 2, description=f"{description} anchor {anchor}"
         )
         anchors[anchor] = _yaml_build_fields(anchor_block, base_indent=2)
+        anchor_definition_lines[anchor] = index
         if anchor_keys & {"entrypoint", "command"}:
             anchor_execution_overrides.add(anchor)
         if anchor_keys & {"<<", "extends"}:
@@ -1242,18 +1250,18 @@ def _parse_compose_services(
 
     try:
         services_start = next(
-            i for i, line in enumerate(lines) if line.strip() == "services:"
+            i for i, line in enumerate(lines) if line == "services:"
         )
     except StopIteration as exc:
         raise ProvenanceError(f"{description} has no services mapping") from exc
     services: dict[str, dict[str, str | None]] = {}
     index = services_start + 1
     while index < len(lines):
-        if lines[index].strip() and not lines[index].startswith(" "):
-            break
-        if not lines[index].strip() or lines[index].lstrip().startswith("#"):
+        if _yaml_ignored_line(lines[index]):
             index += 1
             continue
+        if lines[index].strip() and not lines[index].startswith(" "):
+            break
         match = re.match(r"^  ([A-Za-z0-9_.-]+):\s*$", lines[index])
         if not match:
             if (
@@ -1271,7 +1279,8 @@ def _parse_compose_services(
             raise ProvenanceError(f"duplicate {description} service: {name}")
         end = index + 1
         while end < len(lines) and (
-            not lines[end].strip() or len(lines[end]) - len(lines[end].lstrip(" ")) > 2
+            _yaml_ignored_line(lines[end])
+            or len(lines[end]) - len(lines[end].lstrip(" ")) > 2
         ):
             end += 1
         block = lines[index + 1 : end]
@@ -1280,19 +1289,25 @@ def _parse_compose_services(
         )
         fields: dict[str, str | None] = {}
         merged_anchors: set[str] = set()
-        for line in block:
+        for line_number, line in enumerate(block, start=index + 1):
             if re.match(r"^    <<:", line) and not re.match(
                 r"^    <<:\s*\*([A-Za-z0-9_.-]+)\s*$", line
             ):
                 raise ProvenanceError(f"unsupported Compose service merge: {name}")
             merged = re.match(r"^    <<:\s*\*([A-Za-z0-9_.-]+)\s*$", line)
             if merged:
-                if merged.group(1) not in anchors:
+                merged_anchor = merged.group(1)
+                if merged_anchor not in anchors:
                     raise ProvenanceError(
-                        f"unsupported Compose service merge: {name}:{merged.group(1)}"
+                        f"unsupported Compose service merge: {name}:{merged_anchor}"
                     )
-                merged_anchors.add(merged.group(1))
-                fields.update(anchors[merged.group(1)])
+                if anchor_definition_lines[merged_anchor] >= line_number:
+                    raise ProvenanceError(
+                        "Compose service merge references a forward anchor: "
+                        f"{name}:{merged_anchor}"
+                    )
+                merged_anchors.add(merged_anchor)
+                fields.update(anchors[merged_anchor])
         if merged_anchors & anchor_unmodelled_inputs:
             raise ProvenanceError(f"Compose service merges an unsafe anchor: {name}")
         if "extends" in service_keys:
@@ -1551,7 +1566,9 @@ def _service_command(block: Sequence[str]) -> tuple[str, ...] | None:
             return (_clean_yaml_scalar(scalar),)
         values: list[str] = []
         for nested in block[index + 1 :]:
-            if nested.strip() and len(nested) - len(nested.lstrip(" ")) <= 4:
+            if _yaml_ignored_line(nested):
+                continue
+            if len(nested) - len(nested.lstrip(" ")) <= 4:
                 break
             item = re.match(r"^      -\s+(.*?)\s*$", nested)
             if item:
@@ -1576,7 +1593,7 @@ def _apply_production_overlay(
     _validate_compose_top_level(lines, description="production Compose overlay")
     try:
         start = next(
-            index for index, line in enumerate(lines) if line.strip() == "services:"
+            index for index, line in enumerate(lines) if line == "services:"
         )
     except StopIteration as exc:
         raise ProvenanceError(
@@ -1584,11 +1601,11 @@ def _apply_production_overlay(
         ) from exc
     index = start + 1
     while index < len(lines):
-        if lines[index].strip() and not lines[index].startswith(" "):
-            break
-        if not lines[index].strip() or lines[index].lstrip().startswith("#"):
+        if _yaml_ignored_line(lines[index]):
             index += 1
             continue
+        if lines[index].strip() and not lines[index].startswith(" "):
+            break
         match = re.match(r"^  ([A-Za-z0-9_.-]+):\s*(.*?)\s*$", lines[index])
         if not match:
             if lines[index].strip():
@@ -1600,7 +1617,8 @@ def _apply_production_overlay(
         name, declaration = match.groups()
         end = index + 1
         while end < len(lines) and (
-            not lines[end].strip() or len(lines[end]) - len(lines[end].lstrip(" ")) > 2
+            _yaml_ignored_line(lines[end])
+            or len(lines[end]) - len(lines[end].lstrip(" ")) > 2
         ):
             end += 1
         block = lines[index + 1 : end]

@@ -1483,6 +1483,224 @@ def test_duplicate_service_across_compose_projects_is_rejected(
         provenance.discover_repository(root)
 
 
+def test_nested_services_key_cannot_replace_top_level_services(
+    tmp_path: Path,
+) -> None:
+    root, _, _, _ = _ready_repository(tmp_path)
+    _write(
+        root / "deploy/whoscored/gateway.compose.yaml",
+        f"""x-decoy:
+  services:
+    hidden:
+      image: postgres:16@sha256:{SHA_A}
+services:
+  visible:
+    image: postgres:16@sha256:{SHA_B}
+""",
+    )
+    discovery = provenance.Discovery(root=root, revision="a" * 40)
+
+    services = provenance._parse_compose_services(
+        root,
+        discovery,
+        Path("deploy/whoscored/gateway.compose.yaml"),
+    )
+
+    assert set(services) == {"visible"}
+
+
+def test_column_zero_comment_does_not_hide_trailing_service(
+    tmp_path: Path,
+) -> None:
+    root, _, _, _ = _ready_repository(tmp_path)
+    _write(
+        root / "deploy/whoscored/gateway.compose.yaml",
+        f"""services:
+  before-comment:
+    image: postgres:16@sha256:{SHA_A}
+# YAML comments do not change mapping indentation.
+  after-comment:
+    image: postgres:16@sha256:{SHA_B}
+""",
+    )
+    discovery = provenance.Discovery(root=root, revision="a" * 40)
+
+    services = provenance._parse_compose_services(
+        root,
+        discovery,
+        Path("deploy/whoscored/gateway.compose.yaml"),
+    )
+
+    assert set(services) == {"before-comment", "after-comment"}
+
+
+def test_column_zero_comment_cannot_hide_protected_anchor_entrypoint(
+    tmp_path: Path,
+) -> None:
+    root, _, _, _ = _ready_repository(tmp_path)
+    _write(
+        root / "deploy/whoscored/gateway.compose.yaml",
+        f"""x-gateway: &gateway
+  image: ${{WHOSCORED_GATEWAY_IMAGE:-data-platform-airflow-whoscored-proxy:2.11.2-whoscored}}
+  build:
+    context: ./docker/images/airflow
+    dockerfile: Dockerfile
+    target: airflow-whoscored-proxy
+# YAML comments do not end the x-gateway mapping.
+  entrypoint: ["/bin/sh"]
+services:
+  whoscored_paid_gateway:
+    <<: *gateway
+{_protected_command('whoscored_paid_gateway')}""",
+    )
+    discovery = provenance.Discovery(root=root, revision="a" * 40)
+
+    with pytest.raises(
+        provenance.ProvenanceError,
+        match="protected service overrides its image entrypoint",
+    ):
+        provenance._parse_compose_services(
+            root,
+            discovery,
+            Path("deploy/whoscored/gateway.compose.yaml"),
+        )
+
+
+def test_column_zero_comment_cannot_hide_protected_service_entrypoint(
+    tmp_path: Path,
+) -> None:
+    root, _, _, _ = _ready_repository(tmp_path)
+    _write(
+        root / "deploy/whoscored/gateway.compose.yaml",
+        f"""services:
+  whoscored_paid_gateway:
+    image: ${{WHOSCORED_GATEWAY_IMAGE:-data-platform-airflow-whoscored-proxy:2.11.2-whoscored}}
+    build:
+      context: ./docker/images/airflow
+      dockerfile: Dockerfile
+      target: airflow-whoscored-proxy
+{_protected_command('whoscored_paid_gateway')}# YAML comments do not end the service mapping.
+    entrypoint: ["/bin/sh"]
+""",
+    )
+    discovery = provenance.Discovery(root=root, revision="a" * 40)
+
+    with pytest.raises(
+        provenance.ProvenanceError,
+        match="protected service overrides its image entrypoint",
+    ):
+        provenance._parse_compose_services(
+            root,
+            discovery,
+            Path("deploy/whoscored/gateway.compose.yaml"),
+        )
+
+
+def test_column_zero_comment_cannot_hide_protected_command_item(
+    tmp_path: Path,
+) -> None:
+    root, _, _, _ = _ready_repository(tmp_path)
+    _write(
+        root / "deploy/whoscored/gateway.compose.yaml",
+        f"""services:
+  whoscored_paid_gateway:
+    image: ${{WHOSCORED_GATEWAY_IMAGE:-data-platform-airflow-whoscored-proxy:2.11.2-whoscored}}
+    build:
+      context: ./docker/images/airflow
+      dockerfile: Dockerfile
+      target: airflow-whoscored-proxy
+{_protected_command('whoscored_paid_gateway')}# YAML comments do not end the command sequence.
+      - --unexpected-option
+""",
+    )
+    discovery = provenance.Discovery(root=root, revision="a" * 40)
+
+    with pytest.raises(
+        provenance.ProvenanceError,
+        match="paid gateway Compose command differs",
+    ):
+        provenance._parse_compose_services(
+            root,
+            discovery,
+            Path("deploy/whoscored/gateway.compose.yaml"),
+        )
+
+
+def test_column_zero_comment_cannot_hide_production_overlay_override(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repository"
+    _write(
+        root / "compose.seaweedfs-supervised.yaml",
+        """services:
+  scheduler:
+# YAML comments do not end the overlay service mapping.
+    image: attacker.invalid/scheduler:latest
+""",
+    )
+    discovery = provenance.Discovery(root=root, revision="a" * 40)
+    services = {"scheduler": {"image": "local/scheduler:test"}}
+
+    with pytest.raises(
+        provenance.ProvenanceError,
+        match="production overlay overrides attested image/build surface",
+    ):
+        provenance._apply_production_overlay(root, discovery, services)
+
+
+def test_nested_services_key_cannot_replace_top_level_overlay_services(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repository"
+    _write(
+        root / "compose.seaweedfs-supervised.yaml",
+        """x-decoy:
+  services:
+    scheduler:
+      profiles: ["ignored"]
+services:
+  scheduler:
+    image: attacker.invalid/scheduler:latest
+""",
+    )
+    discovery = provenance.Discovery(root=root, revision="a" * 40)
+    services = {"scheduler": {"image": "local/scheduler:test"}}
+
+    with pytest.raises(
+        provenance.ProvenanceError,
+        match="production overlay overrides attested image/build surface",
+    ):
+        provenance._apply_production_overlay(root, discovery, services)
+
+
+def test_service_merge_cannot_reference_a_forward_anchor(tmp_path: Path) -> None:
+    root, _, _, _ = _ready_repository(tmp_path)
+    _write(
+        root / "deploy/whoscored/gateway.compose.yaml",
+        f"""services:
+  whoscored_paid_gateway:
+    <<: *gateway
+{_protected_command('whoscored_paid_gateway')}x-gateway: &gateway
+  image: ${{WHOSCORED_GATEWAY_IMAGE:-data-platform-airflow-whoscored-proxy:2.11.2-whoscored}}
+  build:
+    context: ./docker/images/airflow
+    dockerfile: Dockerfile
+    target: airflow-whoscored-proxy
+""",
+    )
+    discovery = provenance.Discovery(root=root, revision="a" * 40)
+
+    with pytest.raises(
+        provenance.ProvenanceError,
+        match="Compose service merge references a forward anchor",
+    ):
+        provenance._parse_compose_services(
+            root,
+            discovery,
+            Path("deploy/whoscored/gateway.compose.yaml"),
+        )
+
+
 @pytest.mark.parametrize(
     "attacker_anchor",
     [
