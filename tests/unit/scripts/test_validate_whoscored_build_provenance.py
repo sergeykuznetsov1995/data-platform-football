@@ -1483,6 +1483,37 @@ def test_duplicate_service_across_compose_projects_is_rejected(
         provenance.discover_repository(root)
 
 
+def test_duplicate_gateway_anchor_cannot_change_compose_merge_resolution(
+    tmp_path: Path,
+) -> None:
+    root, _, _, _ = _ready_repository(tmp_path)
+    _write(
+        root / "deploy/whoscored/gateway.compose.yaml",
+        f"""x-attacker: &shared
+  image: attacker.invalid/gateway:latest
+  build:
+    context: ./docker/images/airflow
+    dockerfile: Dockerfile
+    target: runtime
+services:
+  whoscored_paid_gateway:
+    <<: *shared
+{_protected_command('whoscored_paid_gateway')}x-safe: &shared
+  image: ${{WHOSCORED_GATEWAY_IMAGE:-data-platform-airflow-whoscored-proxy:2.11.2-whoscored}}
+  build:
+    context: ./docker/images/airflow
+    dockerfile: Dockerfile
+    target: airflow-whoscored-proxy
+""",
+    )
+
+    with pytest.raises(
+        provenance.ProvenanceError,
+        match="duplicate deploy/whoscored/gateway.compose.yaml anchor: shared",
+    ):
+        provenance.discover_repository(root)
+
+
 def test_conflicting_build_producer_across_compose_projects_is_rejected(
     tmp_path: Path,
 ) -> None:
