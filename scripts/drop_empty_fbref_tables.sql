@@ -17,9 +17,10 @@
 --     fbref_team_defense          — 820   rows / 0 non-empty
 --     fbref_team_possession       — 800   rows / 0 non-empty
 --
---   These stat_types were removed from PLAYER_STAT_TYPES / TEAM_STAT_TYPES /
---   PLAYER_MATCH_STAT_TYPES in scrapers/fbref/constants.py. The DAG no longer
---   creates these tasks.
+--   These stat_types were removed from PLAYER_STAT_TYPES / TEAM_STAT_TYPES in
+--   scrapers/fbref/constants.py (the per-match PLAYER_MATCH_STAT_TYPES
+--   constant has since been removed as dead code). The DAG no longer creates
+--   these tasks.
 --
 -- Execution (manual; not auto-applied):
 --   docker compose exec trino bash -c '\

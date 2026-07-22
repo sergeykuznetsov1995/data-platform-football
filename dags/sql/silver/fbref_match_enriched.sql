@@ -228,7 +228,6 @@ SELECT
     -- columns must never be relabelled as official (#902).
     --   * a shoot-out renders as '(4) 1–1 (5)' — strip the penalty counts first, else the
     --     leading '(5)' of '(5) 0–3 (6)' is read as the home score (Düsseldorf 5–0 Bochum).
-    -- Same normalisation as scripts/crossvalidate_fbref_scores.py.
     TRY_CAST(TRIM(SPLIT_PART(REGEXP_REPLACE(sch.score, '\(\d+\)\s*', ''), CHR(8211), 1)) AS INTEGER) AS home_score,
     TRY_CAST(TRIM(SPLIT_PART(REGEXP_REPLACE(sch.score, '\(\d+\)\s*', ''), CHR(8211), 2)) AS INTEGER) AS away_score,
     sch.score AS source_score_raw,

@@ -44,16 +44,6 @@ PLAYER_STAT_TYPES = [
     'misc',            # Miscellaneous
 ]
 
-# Goalkeeper-specific stat types
-#
-# Removed (Jun 2026, #606) 'keeper_adv' — a SEPARATE expensive CF-bypass scrape
-# (/keepersadv/) whose 23 advanced GK cols (PSxG etc.) are all-NULL since the
-# FBref Feb-2026 restriction and whose core cols duplicate the (consumed)
-# fbref_keeper_keeper. Re-add if FBref restores advanced GK stats.
-KEEPER_STAT_TYPES = [
-    'keeper',          # Goalkeeper basic stats
-]
-
 # Source-advertised season routes that are intentionally not fetched.  Live
 # audits found that these pages still exist but their statistical cells are
 # restricted/empty, so following every nav link would spend one paid request
@@ -68,14 +58,6 @@ UNAVAILABLE_SEASON_STAT_ROUTES = frozenset({
     'keepersadv',
 })
 
-# Player match-level stat types (per-game statistics)
-#
-# Removed (Apr 2026) for the same reason as PLAYER_STAT_TYPES — the underlying
-# season-aggregated stats are gone, so per-match versions are also empty.
-PLAYER_MATCH_STAT_TYPES = [
-    'summary',         # Basic match summary
-]
-
 # Available stat types for teams (squads)
 #
 # Removed (Apr 2026) — same restriction as players: tables exist with
@@ -85,16 +67,6 @@ TEAM_STAT_TYPES = [
     'shooting',        # Shooting stats
     'playingtime',     # Playing time
     'misc',            # Miscellaneous
-]
-
-# Match data types
-MATCH_DATA_TYPES = [
-    'schedule',            # Match schedule
-    'shot_events',         # Shot-level events
-    'match_events',        # Match events (goals, cards, subs)
-    'lineups',             # Match lineups
-    'match_team_stats',    # Per-match team stats (team_stats + team_stats_extra)
-    'match_player_stats',  # Per-match player stats (summary/passing/defense/...)
 ]
 
 # Default rate limit (requests per minute)

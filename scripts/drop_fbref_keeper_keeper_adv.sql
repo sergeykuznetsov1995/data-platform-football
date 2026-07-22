@@ -7,9 +7,10 @@
 --   Cloudflare bypass, ~9.67s) whose 23 advanced GK columns (PSxG etc.) are all
 --   NULL since the FBref Feb-2026 restriction, and whose core columns merely
 --   duplicate the (consumed) fbref_keeper_keeper. The table was write-only — no
---   Silver/Gold SQL reads it (audit #476). 'keeper_adv' was removed from
---   KEEPER_STAT_TYPES (scrapers/fbref/constants.py), so the DAG no longer
---   creates the keeper_keeper_adv task.
+--   Silver/Gold SQL reads it (audit #476). 'keeper_adv' was removed from the
+--   scraper's keeper stat routes (scrapers/fbref/constants.py; the whole
+--   KEEPER_STAT_TYPES constant has since been removed as dead code), so the
+--   DAG no longer creates the keeper_keeper_adv task.
 --
 -- Execution (manual; not auto-applied):
 --   docker compose exec trino bash -c '\
@@ -20,8 +21,9 @@
 -- Or run the statement via `make shell-trino`.
 --
 -- WARNING: DROP TABLE removes both the metastore entry and HDFS data
--- (Iceberg-managed). There is no undo without rescraping. Re-add 'keeper_adv'
--- to KEEPER_STAT_TYPES if FBref ever restores advanced GK stats.
+-- (Iceberg-managed). There is no undo without rescraping. Re-introduce a
+-- 'keeper_adv' scrape route in scrapers/fbref/ if FBref ever restores
+-- advanced GK stats.
 -- =============================================================================
 
 DROP TABLE IF EXISTS iceberg.bronze.fbref_keeper_keeper_adv;
