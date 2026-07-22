@@ -86,7 +86,7 @@
     "scripts/research/bench_whoscored_workflow.py": "71b77bbe5541a213579732954b52f044b9ac31bf8b3568576f9b9254107cb746",
     "scripts/research/whoscored_capacity_container_runtime.py": "c434c5ba31de8fa49f651dcc9c36d03773d40631c60925d067e0c01c85401b22",
     "scripts/research/whoscored_capacity_worker_exec.py": "56e1e498c8773ef7b422912e1acb8e498552ce42d547727dd2b5a58595868273",
-    "scripts/validate_whoscored_build_provenance.py": "88dad1c18b2bc2892599847c91384974de60041ccb6efc97f9671bb02964d336",
+    "scripts/validate_whoscored_build_provenance.py": "7c99561ec78a9164cdfb12f63bbe03f97e760ff13a97ee2830c97f25c4debf9e",
     "scripts/whoscored_paid_gateway.py": "958adc66caaac5d1d44c891a894410b2e37956f2025b607532410b254fbfd3ee",
     "scripts/whoscored_production_admission.py": "999f243773f9fcc647505496f7b55a74d1239bbe62d71505a4c2d51116263c57",
     "scripts/whoscored_proxy_campaign.py": "cb5e037431057bfcf8cf6400caf10b1fef03fc6d92d2929ca25d5b8707a80a49",
