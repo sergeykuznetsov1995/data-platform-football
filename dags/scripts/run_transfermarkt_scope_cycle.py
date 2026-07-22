@@ -47,6 +47,7 @@ from dags.utils.transfermarkt_scope_state import (
     stable_hash,
 )
 from scrapers.transfermarkt.models import (
+    CAREER_ENTITY_TIMEOUT_SECONDS,  # noqa: F401 - public compatibility export
     DEFAULT_ENTITY_TIMEOUT_SECONDS,
     ENTITY_TIMEOUT_SECONDS,
     MAX_ROSTER_WINDOW,
