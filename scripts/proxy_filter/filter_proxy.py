@@ -6934,6 +6934,7 @@ async def main() -> None:
         )
     if SOURCE_MODE == "whoscored-only" and (
         transfermarkt_budget_bytes != 0
+        or transfermarkt_backfill_budget_bytes != 0
         or sofascore_canary_hard_cap_bytes != 0
         or sofascore_discovery_budget_bytes != 0
         or sofascore_artifact

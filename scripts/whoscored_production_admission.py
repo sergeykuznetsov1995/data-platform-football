@@ -309,7 +309,7 @@ _EXPECTED_WORKING_DIR = {
     "whoscored_proxy_filter": "/opt/airflow",
 }
 _EXPECTED_COMMANDS = {
-    "airflow-scheduler": provenance.AIRFLOW_SCHEDULER_RECONCILE_COMMAND,
+    "airflow-scheduler": ("scheduler",),
     "flaresolverr": ("/usr/local/bin/whoscored-flaresolverr-entrypoint",),
     "flaresolverr_whoscored_paid": (
         "/usr/local/bin/whoscored-flaresolverr-entrypoint",
@@ -966,10 +966,9 @@ _SCHEDULER_ENVIRONMENT_NAMES = frozenset(
     SOFASCORE_PROXY_LEASE_TTL_SECONDS SOFASCORE_RAW_STORE_URI
     SOFASCORE_REGISTRY_PATH SOFASCORE_PLAYER_ROTATION_MIN_LEAGUES
     SOFASCORE_PLAYER_ROTATION_MODULUS SOFASCORE_WORKLOAD_PLAN_DIR TELEGRAM_BOT_TOKEN
-    TELEGRAM_CHAT_ID TM_BACKFILL_PROXY_CONTROL_TOKEN
-    TM_BACKFILL_PROXY_CONTROL_URL TM_NATIVE_V2_ENABLED
-    TM_STANDING_POLICY_ENABLED TM_PROXY_CONTROL_TOKEN TM_PROXY_CONTROL_URL
-    TM_PROXY_LEASE_TTL_SECONDS
+    TELEGRAM_CHAT_ID TM_NATIVE_V2_ENABLED TM_STANDING_POLICY_ENABLED
+    TM_BACKFILL_PROXY_CONTROL_TOKEN TM_BACKFILL_PROXY_CONTROL_URL
+    TM_PROXY_CONTROL_TOKEN TM_PROXY_CONTROL_URL TM_PROXY_LEASE_TTL_SECONDS
     TM_REQUIRE_METERED_PROXY TRINO_HOST
     TRINO_PASSWORD TRINO_PORT WHOSCORED_BACKFILL_ASSUMED_REQUEST_UNITS_PER_DAY
     WHOSCORED_BACKFILL_MAX_NO_PROGRESS_RUNS WHOSCORED_BACKFILL_POOL
@@ -1853,15 +1852,12 @@ def _validate_rendered_environment(
         ).strip()
         if backfill_token and (
             len(backfill_token) < 32
-            or any(
-                hmac.compare_digest(backfill_token, environment.get(name, "").strip())
-                for name in (
-                    "PROXY_FILTER_CONTROL_TOKEN",
-                    "SOFASCORE_PROXY_CONTROL_TOKEN",
-                    "TM_PROXY_CONTROL_TOKEN",
-                )
-                if environment.get(name, "").strip()
-            )
+            or backfill_token
+            in {
+                environment.get("PROXY_FILTER_CONTROL_TOKEN", "").strip(),
+                environment.get("SOFASCORE_PROXY_CONTROL_TOKEN", "").strip(),
+                environment.get("TM_PROXY_CONTROL_TOKEN", "").strip(),
+            }
         ):
             raise AdmissionError(
                 "rendered Transfermarkt backfill controls are not fail-closed"

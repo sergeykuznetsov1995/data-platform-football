@@ -735,17 +735,7 @@ services:
       target: airflow-scheduler
     image: data-platform-airflow-scheduler:2.11.2-whoscored
     container_name: airflow-scheduler
-    # Reconcile the two backfill pools on every scheduler start as well as on
-    # first-time init.  `pools set` is idempotent, so an existing Airflow DB
-    # receives the rollout before any newly parsed backfill task is scheduled.
-    command:
-      - bash
-      - -c
-      - |
-        set -euo pipefail
-        airflow pools set 'transfermarkt_backfill_proxy' 1 'Transfermarkt historical backfill only; bounded dedicated proxy slot'
-        airflow pools set 'transfermarkt_backfill_control' 1 'Transfermarkt historical planning and DQ only; isolated from daily ingest'
-        exec airflow scheduler
+    command: scheduler
     environment:
       <<: *airflow-common-env
       # LocalExecutor runs backup/restore tasks in this process. Keep the

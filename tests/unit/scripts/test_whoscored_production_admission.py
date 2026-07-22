@@ -1397,9 +1397,9 @@ def test_scheduler_admission_preserves_metered_transfermarkt_controls():
     )
 
 
-def test_scheduler_admission_preserves_isolated_transfermarkt_backfill_controls():
+def test_scheduler_admission_preserves_distinct_transfermarkt_backfill_controls():
     environment = _rendered_environment("airflow-scheduler")
-    environment["TM_BACKFILL_PROXY_CONTROL_TOKEN"] = "u" * 64
+    environment["TM_BACKFILL_PROXY_CONTROL_TOKEN"] = "b" * 64
 
     admission._validate_rendered_environment(
         environment,
