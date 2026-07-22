@@ -814,6 +814,7 @@ def _rendered_environment(service: str) -> dict[str, str]:
                 "TM_NATIVE_V2_ENABLED": "false",
                 "TM_STANDING_POLICY_ENABLED": "false",
                 "TM_REQUIRE_METERED_PROXY": "false",
+                "TRANSFERMARKT_RAW_STORE_URI": "s3://football/raw/transfermarkt",
                 "WHOSCORED_OPS_STORE_URI": "s3://football/ops/whoscored",
                 "WHOSCORED_RAW_STORE_URI": "s3://football/raw/whoscored",
             }
@@ -2220,7 +2221,7 @@ def test_scheduler_admission_requires_gateway_token_and_forbids_raw_origins():
             )
 
 
-def test_scheduler_admission_derives_whoscored_stores_from_warehouse_bucket():
+def test_scheduler_admission_derives_source_stores_from_warehouse_bucket():
     environment = _rendered_environment("airflow-scheduler")
 
     admission._validate_rendered_environment(
@@ -2228,6 +2229,9 @@ def test_scheduler_admission_derives_whoscored_stores_from_warehouse_bucket():
         service="airflow-scheduler",
     )
     assert environment["ICEBERG_WAREHOUSE"] == "football"
+    assert environment["TRANSFERMARKT_RAW_STORE_URI"] == (
+        "s3://football/raw/transfermarkt"
+    )
     assert environment["WHOSCORED_RAW_STORE_URI"] == ("s3://football/raw/whoscored")
     assert environment["WHOSCORED_OPS_STORE_URI"] == ("s3://football/ops/whoscored")
 
@@ -2235,13 +2239,14 @@ def test_scheduler_admission_derives_whoscored_stores_from_warehouse_bucket():
 @pytest.mark.parametrize(
     ("name", "value"),
     (
+        ("TRANSFERMARKT_RAW_STORE_URI", "s3://warehouse/raw/transfermarkt"),
         ("WHOSCORED_RAW_STORE_URI", "s3://warehouse/raw/whoscored"),
         ("WHOSCORED_RAW_STORE_URI", "s3://football/raw/whoscored/"),
         ("WHOSCORED_OPS_STORE_URI", "s3://warehouse/ops/whoscored"),
         ("WHOSCORED_OPS_STORE_URI", "s3://football/raw/whoscored"),
     ),
 )
-def test_scheduler_admission_rejects_whoscored_store_bucket_or_prefix_drift(
+def test_scheduler_admission_rejects_source_store_bucket_or_prefix_drift(
     name: str,
     value: str,
 ):

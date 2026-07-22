@@ -1146,7 +1146,6 @@ _FIXED_ENVIRONMENT = {
         ),
         "PROXY_FILTER_URL": "",
         "TM_BACKFILL_PROXY_CONTROL_URL": "http://proxy_filter:8899",
-        "TRANSFERMARKT_RAW_STORE_URI": "s3://warehouse/raw/transfermarkt",
         "WHOSCORED_BACKFILL_POOL": "whoscored_direct_pool",
         "WHOSCORED_BACKUP_RESTORE_DRILL_EVIDENCE_PATH": (
             "/opt/airflow/logs/whoscored_backup/restore-drill-evidence.json"
@@ -1894,6 +1893,20 @@ def _validate_whoscored_store_uris(environment: Mapping[str, str]) -> None:
         )
 
 
+def _validate_scheduler_store_uris(environment: Mapping[str, str]) -> None:
+    """Bind every protected scheduler source store to its warehouse prefix."""
+
+    _validate_whoscored_store_uris(environment)
+    bucket = environment["ICEBERG_WAREHOUSE"]
+    if not hmac.compare_digest(
+        environment.get("TRANSFERMARKT_RAW_STORE_URI", ""),
+        f"s3://{bucket}/raw/transfermarkt",
+    ):
+        raise AdmissionError(
+            "rendered source raw/ops stores differ from admitted ICEBERG_WAREHOUSE"
+        )
+
+
 def _validate_rendered_environment(
     environment: Mapping[str, str], *, service: str
 ) -> None:
@@ -1930,7 +1943,7 @@ def _validate_rendered_environment(
     ) not in {"0", "1"}:
         raise AdmissionError("rendered WhoScored paid-batch control differs")
     if service == "airflow-scheduler":
-        _validate_whoscored_store_uris(environment)
+        _validate_scheduler_store_uris(environment)
         approval_path = environment.get("WHOSCORED_PROXY_APPROVAL_PATH", "")
         if (
             legacy_scheduler
