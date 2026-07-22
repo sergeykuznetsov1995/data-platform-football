@@ -793,6 +793,14 @@ Python startup, symlinked or writable release ancestors, and Docker/Compose
 control variables inherited from the shell. All three environment files, the
 deployment attestation and the admission directory must likewise be root-owned
 and have only root-owned, non-writable ancestors.
+The scheduler's `FBREF_CAMOUFOX_GEOIP_DATABASE_HOST_PATH` is also a mandatory
+protected input. Provision it exactly as documented in
+[`fbref-paid-transport.md`](fbref-paid-transport.md#isolated-browser-runtime):
+the canonical host file must be `root:root`, mode `0444`, one hard link,
+66,164,133 bytes and SHA-256
+`0772278c513e6ab3c65e9ae53d6861f137ab696f91eec763a2e6fe76befd83b2`.
+Admission rejects a missing path, symlink, different byte identity, writable
+mode, or a mount into the image-owned legacy virtualenv.
 Create a new evidence directory and validate ready mode before any service
 lifecycle command:
 
@@ -945,39 +953,698 @@ failure or different output blocks admission.
 
 ##### One-time split-project cutover
 
-The paid trio used to belong to `data-platform`. A gateway `up` cannot adopt
-those containers or their same-named networks. In one quiet window, first
-resolve the exact legacy containers by both project and service label. Stop and
-remove only those three containers plus the scheduler that still holds the old
-paid API network; never run shared-project `down` or `--remove-orphans`:
+The paid trio used to be an opt-in profile of `data-platform`, so production
+contains the scheduler and the existing common FlareSolverr plus either all
+three legacy paid services or no paid service. The common FlareSolverr may
+come from a different protected Compose invocation than the scheduler. A
+gateway `up` cannot
+adopt those containers or their same-named networks. This is a shared-scheduler
+deployment window, not only a WhoScored window. Before entering it, disable
+every UI/API/manual trigger principal and every external timer that can create
+an Airflow DagRun. Keep them disabled until the exact prior DagModel pause
+flags have been restored. Use the same root shell for every command below: it
+must retain the nonblocking deployment-flock file descriptor through success,
+or through cleanup, rollback and pause restoration after failure.
+Immediately after acquiring that flock, the controller installs root-shell
+`ERR` and `EXIT` backstops. Once its protected marker exists it ignores
+`HUP`, `INT` and `TERM` until exact success or rollback finalization; a worker
+subshell performs rollback while the parent keeps the original flock
+reference. Any failed rollback enters an indefinite marker-held quarantine.
+
+First snapshot every DagModel pause flag, pause exactly the previously
+unpaused DAGs, and prove that the set did not change and is now entirely
+paused. The read-only database gate joins TaskInstances to DagRuns, rejects the
+full active TaskInstance set under an active DagRun, independently rejects every
+`queued`, `restarting` or `running` TaskInstance even when its DagRun is
+terminal or absent, rejects fresh non-scheduler Airflow jobs, and also rejects
+every pending/running `fbref_control.crawl_run` and unreleased publication lock. Two
+zero snapshots at least 60 seconds apart are mandatory. Thus an active FBref,
+FotMob, Transfermarkt, SofaScore, WhoScored, or other shared-Airflow run blocks
+the cutover even when every WhoScored DAG is paused:
 
 ```bash
-declare -A LEGACY_IDS
-for service in airflow-scheduler flaresolverr_whoscored_paid \
-  whoscored_paid_gateway whoscored_proxy_filter; do
-  mapfile -t ids < <("${DOCKER[@]}" container ls --all --no-trunc \
-    --filter label=com.docker.compose.project=data-platform \
-    --filter "label=com.docker.compose.service=$service" --format '{{.ID}}')
-  test "${#ids[@]}" = 1
-  test "$("${DOCKER[@]}" inspect --format \
-    '{{index .Config.Labels "com.docker.compose.service"}}' "${ids[0]}")" = \
-    "$service"
-  LEGACY_IDS["$service"]="${ids[0]}"
+wait_cutover_container_healthy() {
+  local container_id=$1
+  local service=$2
+  local project=$3
+  local attempt container_json
+  [[ "$container_id" =~ ^[0-9a-f]{64}$ ]]
+  [[ "$service" =~ ^(airflow-scheduler|flaresolverr|flaresolverr_whoscored_paid|whoscored_paid_gateway|whoscored_proxy_filter)$ ]]
+  [[ "$project" =~ ^(data-platform|whoscored-gw)$ ]]
+  for attempt in $(/usr/bin/seq 1 60); do
+    if container_json=$("${DOCKER[@]}" container inspect \
+        "$container_id" 2>/dev/null) &&
+      /usr/bin/jq -e \
+        --arg id "$container_id" --arg service "$service" --arg project "$project" '
+          type == "array" and length == 1 and .[0].Id == $id and
+          .[0].Name == ("/" + $service) and
+          .[0].Config.Labels["com.docker.compose.project"] == $project and
+          .[0].Config.Labels["com.docker.compose.service"] == $service and
+          .[0].State.Status == "running" and
+          .[0].State.Running == true and .[0].State.Paused == false and
+          .[0].State.Restarting == false and .[0].State.Dead == false and
+          .[0].State.OOMKilled == false and
+          .[0].State.Health.Status == "healthy"
+        ' <<< "$container_json" >/dev/null; then
+      return 0
+    fi
+    if (( attempt == 60 )); then
+      /usr/bin/printf 'Container did not become healthy: %s (%s)\n' \
+        "$service" "$container_id" >&2
+      return 1
+    fi
+    /usr/bin/sleep 2
+  done
+  return 1
+}
+
+restore_cutover_dag_pauses() {
+  local scheduler_id=$1
+  local phase=$2
+  local current="$WHOSCORED_ADMISSION_DIR/dag-pauses-before-$phase.json"
+  local restored="$WHOSCORED_ADMISSION_DIR/dag-pauses-restored-$phase.json"
+  local record_text record dag_id is_paused
+  local -a records
+  test ! -e "$current"
+  test ! -e "$restored"
+  wait_cutover_container_healthy \
+    "$scheduler_id" airflow-scheduler data-platform
+  "${ADMISSION_PYTHON[@]}" \
+    "$RELEASE/scripts/whoscored_production_admission.py" \
+    snapshot-cutover-dag-pauses \
+    --root "$RELEASE" \
+    --deployment-attestation "$WHOSCORED_DEPLOYMENT_ATTESTATION" \
+    --output "$current" \
+    > "$WHOSCORED_ADMISSION_DIR/dag-pauses-before-$phase-receipt.json"
+  record_text=$(/usr/bin/jq -r \
+    '[.dag_pause_states[] | select(.is_paused == false) | @json] | join("\n")' \
+    "$current")
+  mapfile -t records <<< "$record_text"
+  for record in "${records[@]}"; do
+    test -n "$record" || continue
+    dag_id=$(/usr/bin/jq -er '.dag_id' <<< "$record")
+    "${DOCKER[@]}" container exec "$scheduler_id" airflow dags pause "$dag_id"
+  done
+  record_text=$(/usr/bin/jq -r \
+    '[.dag_pause_states[] | @json] | join("\n")' \
+    "$WHOSCORED_DAG_PAUSE_SNAPSHOT")
+  mapfile -t records <<< "$record_text"
+  for record in "${records[@]}"; do
+    test -n "$record" || continue
+    dag_id=$(/usr/bin/jq -er '.dag_id' <<< "$record")
+    is_paused=$(/usr/bin/jq -er '.is_paused | tostring' <<< "$record")
+    if test "$is_paused" = false; then
+      "${DOCKER[@]}" container exec "$scheduler_id" \
+        airflow dags unpause "$dag_id"
+    fi
+  done
+  "${ADMISSION_PYTHON[@]}" \
+    "$RELEASE/scripts/whoscored_production_admission.py" \
+    snapshot-cutover-dag-pauses \
+    --root "$RELEASE" \
+    --deployment-attestation "$WHOSCORED_DEPLOYMENT_ATTESTATION" \
+    --output "$restored" \
+    > "$WHOSCORED_ADMISSION_DIR/dag-pauses-restored-$phase-receipt.json"
+  /usr/bin/jq -se '.[0].dag_pause_states == .[1].dag_pause_states' \
+    "$WHOSCORED_DAG_PAUSE_SNAPSHOT" "$restored" >/dev/null
+}
+
+cutover_quarantine() {
+  local quarantine_rc=${1:-1}
+  CUTOVER_FAILURE_ACTIVE=1
+  trap - ERR EXIT
+  trap '' HUP INT TERM
+  set +Ee
+  while :; do
+    /usr/bin/printf \
+      'Cutover quarantined (rc=%s); protected marker remains and manual root intervention is required\n' \
+      "$quarantine_rc" >&2
+    /usr/bin/sleep 300 || :
+  done
+}
+
+cutover_finalize() {
+  local phase=$1
+  local finalize_rc
+  trap - ERR EXIT
+  trap '' HUP INT TERM
+  set +Ee
+  /usr/bin/flock --unlock "$WHOSCORED_CUTOVER_LOCK_FD"
+  finalize_rc=$?
+  (( finalize_rc == 0 )) || cutover_quarantine "$finalize_rc"
+  exec {WHOSCORED_CUTOVER_LOCK_FD}>&-
+  finalize_rc=$?
+  (( finalize_rc == 0 )) || cutover_quarantine "$finalize_rc"
+  if (( CUTOVER_MARKER_CREATED == 1 )); then
+    /usr/bin/rm -- "$WHOSCORED_SHARED_SCHEDULER_CUTOVER_MARKER"
+    finalize_rc=$?
+    if (( finalize_rc != 0 )); then
+      CUTOVER_TERMINAL=1
+      /usr/bin/printf \
+        'Cutover %s completed but marker removal failed (rc=%s); lock is released and the fail-closed marker requires manual root removal\n' \
+        "$phase" "$finalize_rc" >&2
+      trap - HUP INT TERM
+      return "$finalize_rc"
+    fi
+    CUTOVER_MARKER_CREATED=0
+  fi
+  CUTOVER_TERMINAL=1
+  trap - HUP INT TERM
+  return 0
+}
+
+cutover_on_failure() {
+  local cause=${1:-1}
+  local worker_rc finalize_rc
+  (( cause != 0 )) || cause=1
+  if (( BASH_SUBSHELL != 0 )); then
+    trap - ERR EXIT
+    exit "$cause"
+  fi
+  (( CUTOVER_FAILURE_ACTIVE == 0 )) || cutover_quarantine "$cause"
+  CUTOVER_FAILURE_ACTIVE=1
+  trap '' HUP INT TERM
+  trap - ERR EXIT
+  set +Ee
+  worker_rc=0
+  if (( CUTOVER_DESTRUCTIVE_STARTED == 1 )); then
+    (
+      trap - ERR EXIT
+      trap '' HUP INT TERM
+      set -euo pipefail
+      shopt -s inherit_errexit
+      rollback_split_cutover "$cause"
+    )
+    worker_rc=$?
+  elif (( CUTOVER_DAGS_MUTATED == 1 )); then
+    (
+      trap - ERR EXIT
+      trap '' HUP INT TERM
+      set -euo pipefail
+      shopt -s inherit_errexit
+      restore_cutover_dag_pauses "$LEGACY_SCHEDULER_ID" early-failure
+    )
+    worker_rc=$?
+  fi
+  (( worker_rc == 0 )) || cutover_quarantine "$worker_rc"
+  cutover_finalize failure
+  finalize_rc=$?
+  if (( finalize_rc != 0 )); then
+    exit "$finalize_rc"
+  fi
+  /usr/bin/printf 'Cutover failure handled exactly; exiting rc=%s\n' "$cause" >&2
+  exit "$cause"
+}
+
+cutover_on_exit() {
+  local cause=$1
+  if ((
+    BASH_SUBSHELL != 0 || CUTOVER_TERMINAL == 1 || CUTOVER_FAILURE_ACTIVE == 1
+  )); then
+    return 0
+  fi
+  cutover_on_failure "$cause"
+}
+
+: "${WHOSCORED_SHARED_SCHEDULER_DEPLOY_LOCK:?set a pre-provisioned protected lock file}"
+test "$WHOSCORED_SHARED_SCHEDULER_DEPLOY_LOCK" = \
+  "$(/usr/bin/realpath -e -- "$WHOSCORED_SHARED_SCHEDULER_DEPLOY_LOCK")"
+test ! -L "$WHOSCORED_SHARED_SCHEDULER_DEPLOY_LOCK"
+test "$(/usr/bin/stat -c '%u:%g:%a:%h' -- \
+  "$WHOSCORED_SHARED_SCHEDULER_DEPLOY_LOCK")" = '0:0:600:1'
+exec {WHOSCORED_CUTOVER_LOCK_FD}<>"$WHOSCORED_SHARED_SCHEDULER_DEPLOY_LOCK"
+/usr/bin/flock --exclusive --nonblock "$WHOSCORED_CUTOVER_LOCK_FD"
+set +E
+CUTOVER_TERMINAL=0
+CUTOVER_FAILURE_ACTIVE=0
+CUTOVER_DESTRUCTIVE_STARTED=0
+CUTOVER_DAGS_MUTATED=0
+CUTOVER_MARKER_CREATED=0
+CUTOVER_CAPTURE_PATHS=()
+trap 'cutover_on_failure "$?"' ERR
+trap 'cutover_on_failure 129' HUP
+trap 'cutover_on_failure 130' INT
+trap 'cutover_on_failure 143' TERM
+trap 'cutover_on_exit "$?"' EXIT
+: "${WHOSCORED_SHARED_SCHEDULER_CUTOVER_MARKER:?set a global protected marker path}"
+CUTOVER_MARKER_PARENT=$(/usr/bin/dirname -- \
+  "$WHOSCORED_SHARED_SCHEDULER_CUTOVER_MARKER")
+test "$CUTOVER_MARKER_PARENT" = \
+  "$(/usr/bin/realpath -e -- "$CUTOVER_MARKER_PARENT")"
+test "$(/usr/bin/stat -c '%u:%g' -- "$CUTOVER_MARKER_PARENT")" = '0:0'
+CUTOVER_MARKER_PARENT_MODE=$(/usr/bin/stat -c '%a' -- "$CUTOVER_MARKER_PARENT")
+[[ "$CUTOVER_MARKER_PARENT_MODE" =~ ^[0-7]{3,4}$ ]]
+test "$((8#$CUTOVER_MARKER_PARENT_MODE & 8#022))" = 0
+test ! -e "$WHOSCORED_SHARED_SCHEDULER_CUTOVER_MARKER"
+create_cutover_marker() {
+  set -o noclobber
+  /usr/bin/printf '%s\n' \
+    '{"schema_version":1,"status":"shared-scheduler-cutover-in-progress-v1"}' \
+    > "$WHOSCORED_SHARED_SCHEDULER_CUTOVER_MARKER"
+  CUTOVER_MARKER_CREATED=1
+  set +o noclobber
+}
+create_cutover_marker
+# A marker-held deployment is intentionally non-interruptible. Operational
+# aborts must use a separate root shell and the documented quarantine path.
+trap '' HUP INT TERM
+test "$(/usr/bin/stat -c '%u:%g:%a:%h' -- \
+  "$WHOSCORED_SHARED_SCHEDULER_CUTOVER_MARKER")" = '0:0:600:1'
+
+export WHOSCORED_DAG_PAUSE_SNAPSHOT="$WHOSCORED_ADMISSION_DIR/dag-pauses-before.json"
+export WHOSCORED_DAG_PAUSED_PROOF="$WHOSCORED_ADMISSION_DIR/dag-pauses-all-paused.json"
+test ! -e "$WHOSCORED_DAG_PAUSE_SNAPSHOT"
+test ! -e "$WHOSCORED_DAG_PAUSED_PROOF"
+"${ADMISSION_PYTHON[@]}" \
+  "$RELEASE/scripts/whoscored_production_admission.py" \
+  snapshot-cutover-dag-pauses \
+  --root "$RELEASE" \
+  --deployment-attestation "$WHOSCORED_DEPLOYMENT_ATTESTATION" \
+  --output "$WHOSCORED_DAG_PAUSE_SNAPSHOT" \
+  > "$WHOSCORED_ADMISSION_DIR/dag-pauses-before-receipt.json"
+
+SCHEDULER_NAME_IDS=$("${DOCKER[@]}" container ls --all --no-trunc \
+  --filter 'name=^/airflow-scheduler$' --format '{{.ID}}')
+SCHEDULER_LABEL_IDS=$("${DOCKER[@]}" container ls --all --no-trunc \
+  --filter label=com.docker.compose.project=data-platform \
+  --filter label=com.docker.compose.service=airflow-scheduler \
+  --format '{{.ID}}')
+[[ "$SCHEDULER_NAME_IDS" =~ ^[0-9a-f]{64}$ ]]
+test "$SCHEDULER_LABEL_IDS" = "$SCHEDULER_NAME_IDS"
+LEGACY_SCHEDULER_ID=$SCHEDULER_NAME_IDS
+wait_cutover_container_healthy \
+  "$LEGACY_SCHEDULER_ID" airflow-scheduler data-platform
+
+UNPAUSED_DAG_RECORD_TEXT=$(/usr/bin/jq -r \
+  '[.dag_pause_states[] | select(.is_paused == false) | @json] | join("\n")' \
+  "$WHOSCORED_DAG_PAUSE_SNAPSHOT")
+mapfile -t UNPAUSED_DAG_RECORDS <<< "$UNPAUSED_DAG_RECORD_TEXT"
+CUTOVER_DAGS_MUTATED=1
+for record in "${UNPAUSED_DAG_RECORDS[@]}"; do
+  test -n "$record" || continue
+  dag_id=$(/usr/bin/jq -er \
+    'select(keys == ["dag_id", "is_paused"] and .is_paused == false) | .dag_id' \
+    <<< "$record")
+  test -n "$dag_id"
+  "${DOCKER[@]}" container exec "$LEGACY_SCHEDULER_ID" \
+    airflow dags pause "$dag_id"
 done
-for service in airflow-scheduler flaresolverr_whoscored_paid \
-  whoscored_paid_gateway whoscored_proxy_filter; do
-  id="${LEGACY_IDS[$service]}"
-  if test "$("${DOCKER[@]}" inspect --format '{{.State.Running}}' "$id")" = true; then
+
+"${ADMISSION_PYTHON[@]}" \
+  "$RELEASE/scripts/whoscored_production_admission.py" \
+  snapshot-cutover-dag-pauses \
+  --root "$RELEASE" \
+  --deployment-attestation "$WHOSCORED_DEPLOYMENT_ATTESTATION" \
+  --output "$WHOSCORED_DAG_PAUSED_PROOF" \
+  > "$WHOSCORED_ADMISSION_DIR/dag-pauses-all-paused-receipt.json"
+/usr/bin/jq -se '
+  ([.[0].dag_pause_states[].dag_id] | sort) ==
+    ([.[1].dag_pause_states[].dag_id] | sort) and
+  all(.[1].dag_pause_states[]; .is_paused == true)
+' "$WHOSCORED_DAG_PAUSE_SNAPSHOT" "$WHOSCORED_DAG_PAUSED_PROOF" >/dev/null
+
+for ordinal in 1 2; do
+  quiescence="$WHOSCORED_ADMISSION_DIR/cutover-quiescence-$ordinal.json"
+  test ! -e "$quiescence"
+  "${ADMISSION_PYTHON[@]}" \
+    "$RELEASE/scripts/whoscored_production_admission.py" \
+    verify-cutover-quiescence \
+    --root "$RELEASE" \
+    --deployment-attestation "$WHOSCORED_DEPLOYMENT_ATTESTATION" \
+    --output "$quiescence" \
+    > "$WHOSCORED_ADMISSION_DIR/cutover-quiescence-$ordinal-receipt.json"
+  /usr/bin/jq -e '
+    .status == "cutover-quiescent-v1" and
+    .active_dag_runs == [] and .active_task_instances == [] and
+    .active_non_scheduler_jobs == [] and
+    .active_fbref_crawl_runs == [] and
+    .active_fbref_publication_locks == []
+  ' "$quiescence" >/dev/null
+  test "$ordinal" = 2 || /usr/bin/sleep 60
+done
+```
+
+Only now publish the protected read-only inventory. The helper admits only
+the exact `full-legacy-v1` shape (scheduler, common FlareSolverr, complete trio
+and all four networks) or the exact `scheduler-only-v1` shape (scheduler,
+common FlareSolverr and paid API network only). A partial trio, extra/missing network, unexpected endpoint,
+wrong Compose project or pre-existing `whoscored-gw` object fails before the
+first lifecycle command. It also binds every protected endpoint to the exact
+Docker network ID and records the retained backend, frontend and storage IDs.
+Every running legacy container must have exact `running` status, all Docker
+failure flags clear and health `healthy`; a stopped container must have
+`created` or `exited` status with `Running`, `Paused`, `Restarting`, `Dead` and
+`OOMKilled` all false. Stopped containers do not need a health result.
+It captures the old digest-qualified images,
+Compose hashes, project directory, profiles, config/env path order and
+root-protected path/stat/SHA evidence without storing environment values. The
+repeatable rollback gate rereads and rerenders that bundle immediately before
+the first stop:
+
+```bash
+export WHOSCORED_CUTOVER_INVENTORY="$WHOSCORED_ADMISSION_DIR/legacy-cutover-inventory.json"
+test ! -e "$WHOSCORED_CUTOVER_INVENTORY"
+"${ADMISSION_PYTHON[@]}" \
+  "$RELEASE/scripts/whoscored_production_admission.py" \
+  verify-cutover-inventory \
+  --root "$RELEASE" \
+  --deployment-attestation "$WHOSCORED_DEPLOYMENT_ATTESTATION" \
+  --output "$WHOSCORED_CUTOVER_INVENTORY" \
+  > "$WHOSCORED_ADMISSION_DIR/cutover-inventory-receipt.json"
+
+export WHOSCORED_ROLLBACK_BUNDLE_PROOF="$WHOSCORED_ADMISSION_DIR/rollback-bundle-proof.json"
+test ! -e "$WHOSCORED_ROLLBACK_BUNDLE_PROOF"
+"${ADMISSION_PYTHON[@]}" \
+  "$RELEASE/scripts/whoscored_production_admission.py" \
+  verify-rollback-bundle \
+  --root "$RELEASE" \
+  --deployment-attestation "$WHOSCORED_DEPLOYMENT_ATTESTATION" \
+  --inventory "$WHOSCORED_CUTOVER_INVENTORY" \
+  --output "$WHOSCORED_ROLLBACK_BUNDLE_PROOF" \
+  > "$WHOSCORED_ADMISSION_DIR/rollback-bundle-proof-receipt.json"
+/usr/bin/jq -e '.status == "rollback-bundle-admitted-v1"' \
+  "$WHOSCORED_ROLLBACK_BUNDLE_PROOF" >/dev/null
+
+/usr/bin/jq -e '
+  .schema_version == 1 and
+  .status == "cutover-inventory-admitted-v1" and
+  (.mode == "scheduler-only-v1" or .mode == "full-legacy-v1") and
+  ([.containers[].container_id] | length) >= 1 and
+  ([.networks[].id] | length) >= 1 and
+  [.retained_networks[].logical_name] == ["backend", "frontend", "storage"]
+' "$WHOSCORED_CUTOVER_INVENTORY" >/dev/null
+LEGACY_CONTAINER_RECORD_TEXT=$(/usr/bin/jq -er \
+  '[.containers[] | [.container_id, .service, (.running | tostring)] | @tsv] | join("\n")' \
+  "$WHOSCORED_CUTOVER_INVENTORY")
+LEGACY_NETWORK_RECORD_TEXT=$(/usr/bin/jq -er \
+  '[.networks[] | @json] | join("\n")' \
+  "$WHOSCORED_CUTOVER_INVENTORY")
+mapfile -t LEGACY_CONTAINER_RECORDS <<< "$LEGACY_CONTAINER_RECORD_TEXT"
+mapfile -t LEGACY_NETWORK_RECORDS <<< "$LEGACY_NETWORK_RECORD_TEXT"
+
+rollback_split_cutover() {
+  local cause=$1
+  local capture record_text record id service project running network_json
+  local name expected_name name_ids label_ids container_json config_hash image image_id
+  local restored_id desired_running restored_inventory bundle_recheck
+  local compose_project compose_working_directory path_text path path_record profile index
+  local -a records path_records old_compose
+  local -A rollback_network_names=()
+  local -A restored_service_ids=()
+  /usr/bin/printf 'Split-project cutover failed; starting exact-ID rollback\n' >&2
+
+  # New containers first, in reverse capture order. Every selection is bound
+  # to an already protected created-object receipt.
+  for ((index=${#CUTOVER_CAPTURE_PATHS[@]}-1; index>=0; index--)); do
+    capture=${CUTOVER_CAPTURE_PATHS[index]}
+    id=$(/usr/bin/jq -er '
+      if .container_id == null then ""
+      else .container_id | select(test("^[0-9a-f]{64}$"))
+      end
+    ' "$capture")
+    service=$(/usr/bin/jq -er '.service' "$capture")
+    project=$(/usr/bin/jq -er '.project' "$capture")
+    if test -n "$id"; then
+      container_json=$("${DOCKER[@]}" container inspect "$id")
+      running=$(/usr/bin/jq -er \
+        --arg id "$id" --arg service "$service" --arg project "$project" '
+          select(type == "array" and length == 1) | .[0] |
+          select(.Id == $id and .Name == ("/" + $service) and
+            .Config.Labels["com.docker.compose.project"] == $project and
+            .Config.Labels["com.docker.compose.service"] == $service and
+            (.State.Running | type == "boolean")) |
+          if .State.Running then "true" else "false" end
+        ' <<< "$container_json")
+      if test "$running" = true; then
+        "${DOCKER[@]}" stop --time 30 "$id"
+      fi
+      "${DOCKER[@]}" rm "$id"
+    fi
+    record_text=$(/usr/bin/jq -r \
+      '[.networks[] | @json] | join("\n")' "$capture")
+    mapfile -t records <<< "$record_text"
+    for record in "${records[@]}"; do
+      test -n "$record" || continue
+      id=$(/usr/bin/jq -er '.id | select(test("^[0-9a-f]{64}$"))' <<< "$record")
+      name=$(/usr/bin/jq -er '.name' <<< "$record")
+      rollback_network_names["$id"]=$name
+    done
+  done
+  for id in "${!rollback_network_names[@]}"; do
+    expected_name=${rollback_network_names[$id]}
+    network_json=$("${DOCKER[@]}" network inspect "$id")
+    /usr/bin/jq -e --arg id "$id" --arg name "$expected_name" '
+      type == "array" and length == 1 and .[0].Id == $id and
+      .[0].Name == $name and
+      .[0].Labels["com.docker.compose.project"] == "whoscored-gw" and
+      .[0].Containers == {}
+    ' <<< "$network_json" >/dev/null
+    "${DOCKER[@]}" network rm "$id"
+  done
+
+  # Revalidate protected old bytes, hashes and local digest images once more,
+  # after cleanup and immediately before the old Compose recreate.
+  bundle_recheck="$WHOSCORED_ADMISSION_DIR/rollback-bundle-recheck.json"
+  test ! -e "$bundle_recheck"
+  "${ADMISSION_PYTHON[@]}" \
+    "$RELEASE/scripts/whoscored_production_admission.py" \
+    verify-rollback-bundle \
+    --root "$RELEASE" \
+    --deployment-attestation "$WHOSCORED_DEPLOYMENT_ATTESTATION" \
+    --inventory "$WHOSCORED_CUTOVER_INVENTORY" \
+    --post-cleanup \
+    --output "$bundle_recheck" \
+    > "$WHOSCORED_ADMISSION_DIR/rollback-bundle-recheck-receipt.json"
+
+  record_text=$(/usr/bin/jq -r \
+    '[.rollback.services[] | @json] | join("\n")' \
+    "$WHOSCORED_CUTOVER_INVENTORY")
+  mapfile -t records <<< "$record_text"
+  for record in "${records[@]}"; do
+    service=$(/usr/bin/jq -er '.service' <<< "$record")
+    config_hash=$(/usr/bin/jq -er '.config_hash' <<< "$record")
+    image=$(/usr/bin/jq -er '.image' <<< "$record")
+    image_id=$(/usr/bin/jq -er '.image_id' <<< "$record")
+    desired_running=$(/usr/bin/jq -er '.running | tostring' <<< "$record")
+    compose_project=$(/usr/bin/jq -er \
+      '.compose.project | select(. == "data-platform")' <<< "$record")
+    compose_working_directory=$(/usr/bin/jq -er \
+      '.compose.working_directory | select(type == "string" and startswith("/"))' \
+      <<< "$record")
+    old_compose=(
+      /usr/bin/env -i
+      HOME=/nonexistent PATH=/usr/bin:/bin
+      LANG=C.UTF-8 LC_ALL=C.UTF-8
+      DOCKER_HOST=unix:///run/docker.sock
+      /usr/bin/docker compose --project-name "$compose_project"
+      --project-directory "$compose_working_directory"
+    )
+    test "$(/usr/bin/jq -er '.compose.environment_files | length' \
+      <<< "$record")" -gt 0
+    path_text=$(/usr/bin/jq -r \
+      '[.compose.environment_files[] | @json] | join("\n")' <<< "$record")
+    mapfile -t path_records <<< "$path_text"
+    for path_record in "${path_records[@]}"; do
+      test -n "$path_record" || continue
+      path=$(/usr/bin/jq -er \
+        'select(type == "string" and startswith("/"))' <<< "$path_record")
+      old_compose+=(--env-file "$path")
+    done
+    path_text=$(/usr/bin/jq -r \
+      '[.compose.profiles[] | @json] | join("\n")' <<< "$record")
+    mapfile -t path_records <<< "$path_text"
+    for path_record in "${path_records[@]}"; do
+      test -n "$path_record" || continue
+      profile=$(/usr/bin/jq -er 'select(. == "whoscored-paid")' \
+        <<< "$path_record")
+      old_compose+=(--profile "$profile")
+    done
+    test "$(/usr/bin/jq -er '.compose.config_files | length' \
+      <<< "$record")" -gt 0
+    path_text=$(/usr/bin/jq -r \
+      '[.compose.config_files[] | @json] | join("\n")' <<< "$record")
+    mapfile -t path_records <<< "$path_text"
+    for path_record in "${path_records[@]}"; do
+      test -n "$path_record" || continue
+      path=$(/usr/bin/jq -er \
+        'select(type == "string" and startswith("/"))' <<< "$path_record")
+      old_compose+=(--file "$path")
+    done
+    name_ids=$("${DOCKER[@]}" container ls --all --no-trunc \
+      --filter "name=^/$service$" --format '{{.ID}}')
+    label_ids=$("${DOCKER[@]}" container ls --all --no-trunc \
+      --filter label=com.docker.compose.project=data-platform \
+      --filter "label=com.docker.compose.service=$service" --format '{{.ID}}')
+    if test -z "$name_ids" && test -z "$label_ids"; then
+      "${old_compose[@]}" up --no-start --no-deps --no-build --pull never \
+        "$service"
+      name_ids=$("${DOCKER[@]}" container ls --all --no-trunc \
+        --filter "name=^/$service$" --format '{{.ID}}')
+      label_ids=$("${DOCKER[@]}" container ls --all --no-trunc \
+        --filter label=com.docker.compose.project=data-platform \
+        --filter "label=com.docker.compose.service=$service" --format '{{.ID}}')
+    fi
+    [[ "$name_ids" =~ ^[0-9a-f]{64}$ ]]
+    test "$label_ids" = "$name_ids"
+    restored_id=$name_ids
+    container_json=$("${DOCKER[@]}" container inspect "$restored_id")
+    running=$(/usr/bin/jq -er \
+      --arg id "$restored_id" --arg service "$service" \
+      --arg hash "$config_hash" --arg image "$image" --arg image_id "$image_id" '
+        select(type == "array" and length == 1) | .[0] |
+        select(.Id == $id and .Name == ("/" + $service) and
+          .Config.Labels["com.docker.compose.project"] == "data-platform" and
+          .Config.Labels["com.docker.compose.service"] == $service and
+          .Config.Labels["com.docker.compose.config-hash"] == $hash and
+          .Config.Image == $image and .Image == $image_id and
+          (.State.Running | type == "boolean")) |
+        if .State.Running then "true" else "false" end
+      ' <<< "$container_json")
+    if test "$running" = true; then
+      "${DOCKER[@]}" stop --time 30 "$restored_id"
+    fi
+    restored_service_ids["$service"]=$restored_id
+  done
+
+  # No old service starts until every exact old container has been recreated,
+  # hash/image-validated, and forced into a stopped state.
+  for record in "${records[@]}"; do
+    service=$(/usr/bin/jq -er '.service' <<< "$record")
+    desired_running=$(/usr/bin/jq -er '.running | tostring' <<< "$record")
+    restored_id=${restored_service_ids[$service]}
+    [[ "$restored_id" =~ ^[0-9a-f]{64}$ ]]
+    if test "$desired_running" = true; then
+      "${DOCKER[@]}" start "$restored_id"
+    fi
+  done
+
+  # Every old service that was running before cutover must return healthy on
+  # its exact recreated ID before strict inventory or any DAG pause mutation.
+  for record in "${records[@]}"; do
+    service=$(/usr/bin/jq -er '.service' <<< "$record")
+    desired_running=$(/usr/bin/jq -er '.running | tostring' <<< "$record")
+    restored_id=${restored_service_ids[$service]}
+    [[ "$restored_id" =~ ^[0-9a-f]{64}$ ]]
+    if test "$desired_running" = true; then
+      wait_cutover_container_healthy \
+        "$restored_id" "$service" data-platform
+    fi
+  done
+
+  restored_inventory="$WHOSCORED_ADMISSION_DIR/rollback-restored-inventory.json"
+  test ! -e "$restored_inventory"
+  "${ADMISSION_PYTHON[@]}" \
+    "$RELEASE/scripts/whoscored_production_admission.py" \
+    verify-cutover-inventory \
+    --root "$RELEASE" \
+    --deployment-attestation "$WHOSCORED_DEPLOYMENT_ATTESTATION" \
+    --output "$restored_inventory" \
+    > "$WHOSCORED_ADMISSION_DIR/rollback-restored-inventory-receipt.json"
+  /usr/bin/jq -se '
+    .[0].mode == .[1].mode and
+    .[0].rollback == .[1].rollback and
+    .[0].retained_networks == .[1].retained_networks and
+    ([.[0].containers[] | {running, service}] ==
+      [.[1].containers[] | {running, service}]) and
+    ([.[0].networks[] | {logical_name, name}] ==
+      [.[1].networks[] | {logical_name, name}])
+  ' "$WHOSCORED_CUTOVER_INVENTORY" "$restored_inventory" >/dev/null
+  restored_id=$("${DOCKER[@]}" container ls --all --no-trunc \
+    --filter 'name=^/airflow-scheduler$' \
+    --filter label=com.docker.compose.project=data-platform \
+    --filter label=com.docker.compose.service=airflow-scheduler \
+    --format '{{.ID}}')
+  [[ "$restored_id" =~ ^[0-9a-f]{64}$ ]]
+  restore_cutover_dag_pauses "$restored_id" rollback
+  /usr/bin/printf 'Legacy split-project topology restored exactly\n' >&2
+  return 0
+}
+
+CUTOVER_DESTRUCTIVE_STARTED=1
+
+# Remove only immutable IDs captured by admission. Never run shared-project
+# `down` or `--remove-orphans`.
+for record in "${LEGACY_CONTAINER_RECORDS[@]}"; do
+  IFS=$'\t' read -r id service expected_running extra <<< "$record"
+  [[ "$id" =~ ^[0-9a-f]{64}$ ]]
+  [[ "$service" =~ ^(airflow-scheduler|flaresolverr|flaresolverr_whoscored_paid|whoscored_paid_gateway|whoscored_proxy_filter)$ ]]
+  [[ "$expected_running" =~ ^(true|false)$ ]]
+  test -z "$extra"
+  container_json=$("${DOCKER[@]}" container inspect "$id")
+  running=$(/usr/bin/jq -er --arg id "$id" --arg service "$service" '
+    select(type == "array" and length == 1) | .[0] |
+    select(
+      .Id == $id and
+      .Name == ("/" + $service) and
+      .Config.Labels["com.docker.compose.project"] == "data-platform" and
+      .Config.Labels["com.docker.compose.service"] == $service and
+      (.State.Running | type == "boolean")
+    ) |
+    if .State.Running then "true" else "false" end
+  ' <<< "$container_json")
+  case "$running" in
+    true|false) ;;
+    *) echo "Invalid admitted container running state: $service" >&2; cutover_on_failure 1 ;;
+  esac
+  test "$running" = "$expected_running"
+  if test "$running" = true; then
     "${DOCKER[@]}" stop --time 30 "$id"
   fi
   "${DOCKER[@]}" rm "$id"
 done
+for record in "${LEGACY_NETWORK_RECORDS[@]}"; do
+  id=$(/usr/bin/jq -er '.id | select(test("^[0-9a-f]{64}$"))' <<< "$record")
+  name=$(/usr/bin/jq -er '.name | select(startswith("dp-whoscored-paid-"))' \
+    <<< "$record")
+  logical_name=$(/usr/bin/jq -er \
+    '.logical_name | select(startswith("whoscored-paid-"))' <<< "$record")
+  subnet=$(/usr/bin/jq -er '.subnet | select(type == "string")' <<< "$record")
+  [[ "$id" =~ ^[0-9a-f]{64}$ ]]
+  network_json=$("${DOCKER[@]}" network inspect "$id")
+  /usr/bin/jq -e \
+    --arg id "$id" --arg name "$name" --arg logical "$logical_name" \
+    --arg subnet "$subnet" '
+      type == "array" and length == 1 and .[0].Id == $id and
+      .[0].Name == $name and
+      .[0].Labels["com.docker.compose.project"] == "data-platform" and
+      .[0].Labels["com.docker.compose.network"] == $logical and
+      .[0].Containers == {} and
+      ([.[0].IPAM.Config[].Subnet] | index($subnet)) != null
+    ' <<< "$network_json" >/dev/null
+  "${DOCKER[@]}" network rm "$id"
+done
+
+# An authoritative successful enumeration, not a failed per-object inspect,
+# proves that Compose cannot adopt a stale same-named object.
+ALL_CONTAINER_NAMES=$("${DOCKER[@]}" container ls --all --no-trunc \
+  --format '{{.Names}}')
+ALL_NETWORK_NAMES=$("${DOCKER[@]}" network ls --no-trunc --format '{{.Name}}')
+for service in airflow-scheduler flaresolverr flaresolverr_whoscored_paid \
+  whoscored_paid_gateway whoscored_proxy_filter; do
+  if /usr/bin/printf '%s\n' "$ALL_CONTAINER_NAMES" | \
+    /usr/bin/grep -Fx -- "$service" >/dev/null; then
+    echo "Cutover target container survived exact-ID removal: $service" >&2
+    cutover_on_failure 1
+  fi
+  remaining_ids=$("${DOCKER[@]}" container ls --all --no-trunc \
+    --filter label=com.docker.compose.project=data-platform \
+    --filter "label=com.docker.compose.service=$service" --format '{{.ID}}')
+  test -z "$remaining_ids"
+done
 for network in dp-whoscored-paid-api dp-whoscored-paid-browser \
   dp-whoscored-paid-direct-egress dp-whoscored-paid-provider-egress; do
-  test "$("${DOCKER[@]}" network inspect --format \
-    '{{index .Labels "com.docker.compose.project"}}' "$network")" = data-platform
-  "${DOCKER[@]}" network rm "$network"
+  if /usr/bin/printf '%s\n' "$ALL_NETWORK_NAMES" | \
+    /usr/bin/grep -Fx -- "$network" >/dev/null; then
+    echo "Cutover target network survived exact-ID removal: $network" >&2
+    cutover_on_failure 1
+  fi
 done
+remaining_gateway_containers=$("${DOCKER[@]}" container ls --all --no-trunc \
+  --filter label=com.docker.compose.project=whoscored-gw --format '{{.ID}}')
+remaining_gateway_networks=$("${DOCKER[@]}" network ls --no-trunc \
+  --filter label=com.docker.compose.project=whoscored-gw --format '{{.ID}}')
+test -z "$remaining_gateway_containers"
+test -z "$remaining_gateway_networks"
 ```
 
 Bootstrap only the stopped gateway container next. This creates the paid API
@@ -986,8 +1653,49 @@ it does not spend traffic and must not be started until the filter and paid
 browser are healthy:
 
 ```bash
-"${GATEWAY_COMPOSE[@]}" up --no-start --no-deps --no-build --pull always \
-  whoscored_paid_gateway
+PAID_GATEWAY_VACANCY="$WHOSCORED_ADMISSION_DIR/vacancy-whoscored_paid_gateway.json"
+PAID_GATEWAY_CAPTURE="$WHOSCORED_ADMISSION_DIR/created-whoscored_paid_gateway.json"
+test ! -e "$PAID_GATEWAY_VACANCY"
+test ! -e "$PAID_GATEWAY_CAPTURE"
+"${ADMISSION_PYTHON[@]}" \
+  "$RELEASE/scripts/whoscored_production_admission.py" \
+  verify-create-vacancy \
+  --root "$RELEASE" \
+  --deployment-attestation "$WHOSCORED_DEPLOYMENT_ATTESTATION" \
+  --service whoscored_paid_gateway \
+  --output "$PAID_GATEWAY_VACANCY" \
+  > "$WHOSCORED_ADMISSION_DIR/vacancy-whoscored_paid_gateway-receipt.json"
+if "${GATEWAY_COMPOSE[@]}" up --no-start --no-deps --no-build --pull always \
+  whoscored_paid_gateway; then
+  create_rc=0
+else
+  create_rc=$?
+fi
+capture_command=(
+  "${ADMISSION_PYTHON[@]}"
+  "$RELEASE/scripts/whoscored_production_admission.py"
+  capture-created-object
+  --root "$RELEASE"
+  --deployment-attestation "$WHOSCORED_DEPLOYMENT_ATTESTATION"
+  --vacancy-receipt "$PAID_GATEWAY_VACANCY"
+)
+if (( create_rc != 0 )); then
+  capture_command+=(--allow-partial)
+fi
+capture_command+=(--output "$PAID_GATEWAY_CAPTURE")
+if "${capture_command[@]}" \
+  > "$WHOSCORED_ADMISSION_DIR/created-whoscored_paid_gateway-receipt.json"; then
+  capture_rc=0
+else
+  capture_rc=$?
+fi
+(( capture_rc == 0 )) || cutover_quarantine "$capture_rc"
+CUTOVER_CAPTURE_PATHS+=("$PAID_GATEWAY_CAPTURE")
+if (( create_rc != 0 )); then
+  cutover_on_failure "$create_rc"
+fi
+PAID_GATEWAY_CAPTURED_ID=$(/usr/bin/jq -er \
+  '.container_id | select(test("^[0-9a-f]{64}$"))' "$PAID_GATEWAY_CAPTURE")
 "${ADMISSION_PYTHON[@]}" \
   "$RELEASE/scripts/whoscored_production_admission.py" post-create \
   --root "$RELEASE" \
@@ -1006,15 +1714,20 @@ PAID_GATEWAY_CONTAINER_ID=$(/usr/bin/jq -er '
   [.images[] | select(.service == "whoscored_paid_gateway") | .container_id] |
   select(length == 1) | .[0]
 ' "$WHOSCORED_ADMISSION_DIR/post-create-paid-gateway-receipt.json")
+test "$PAID_GATEWAY_CONTAINER_ID" = "$PAID_GATEWAY_CAPTURED_ID"
 ```
 
-If any cutover gate fails, leave the new state namespace untouched, remove only
-container IDs recorded in the new receipts, and remove only networks whose
-Compose project label is `whoscored-gw`. Re-run admission from the previous
-immutable release and its previous digest override, then recreate the four
-recorded legacy services with that release. Never delete either filter-state
-directory, any ledger, approval, pointer, SeaweedFS volume or another shared
-container during rollback.
+The vacancy receipt exists before each `up`; the create runs in a status-aware
+conditional and the created-object receipt is attempted immediately after it,
+before the create status is propagated or post-create admission begins. A
+failed create uses partial mode to capture its exact optional container and
+exact cumulative subset of owned networks. If capture is ambiguous, the
+controller quarantines without guessing; otherwise the receipt is appended
+before rollback begins. If post-create fails, that capture—not a mutable
+name—is cleanup authority. Do not start or remove an object that capture could
+not identify exactly. The executable rollback below
+uses only these captured new IDs and the legacy receipt; it never selects an
+object merely because its project label resembles `whoscored-gw`.
 
 Only after those commands succeed may an approved operator capture the storage
 identity and create the scheduler without starting it. The fingerprint binds
@@ -1046,8 +1759,49 @@ SEAWEED_BEFORE=$(/usr/bin/docker inspect seaweedfs | /usr/bin/jq -c '.[0] | {
     {name: .Name, source: .Source, destination: .Destination}]
 }' | /usr/bin/sha256sum | /usr/bin/cut -d" " -f1)
 
-"${COMPOSE[@]}" up --no-start --no-deps --no-build --pull always \
-  airflow-scheduler
+SCHEDULER_VACANCY="$WHOSCORED_ADMISSION_DIR/vacancy-airflow-scheduler.json"
+SCHEDULER_CAPTURE="$WHOSCORED_ADMISSION_DIR/created-airflow-scheduler.json"
+test ! -e "$SCHEDULER_VACANCY"
+test ! -e "$SCHEDULER_CAPTURE"
+"${ADMISSION_PYTHON[@]}" \
+  "$RELEASE/scripts/whoscored_production_admission.py" \
+  verify-create-vacancy \
+  --root "$RELEASE" \
+  --deployment-attestation "$WHOSCORED_DEPLOYMENT_ATTESTATION" \
+  --service airflow-scheduler \
+  --output "$SCHEDULER_VACANCY" \
+  > "$WHOSCORED_ADMISSION_DIR/vacancy-airflow-scheduler-receipt.json"
+if "${COMPOSE[@]}" up --no-start --no-deps --no-build --pull always \
+  airflow-scheduler; then
+  create_rc=0
+else
+  create_rc=$?
+fi
+capture_command=(
+  "${ADMISSION_PYTHON[@]}"
+  "$RELEASE/scripts/whoscored_production_admission.py"
+  capture-created-object
+  --root "$RELEASE"
+  --deployment-attestation "$WHOSCORED_DEPLOYMENT_ATTESTATION"
+  --vacancy-receipt "$SCHEDULER_VACANCY"
+)
+if (( create_rc != 0 )); then
+  capture_command+=(--allow-partial)
+fi
+capture_command+=(--output "$SCHEDULER_CAPTURE")
+if "${capture_command[@]}" \
+  > "$WHOSCORED_ADMISSION_DIR/created-airflow-scheduler-receipt.json"; then
+  capture_rc=0
+else
+  capture_rc=$?
+fi
+(( capture_rc == 0 )) || cutover_quarantine "$capture_rc"
+CUTOVER_CAPTURE_PATHS+=("$SCHEDULER_CAPTURE")
+if (( create_rc != 0 )); then
+  cutover_on_failure "$create_rc"
+fi
+SCHEDULER_CAPTURED_ID=$(/usr/bin/jq -er \
+  '.container_id | select(test("^[0-9a-f]{64}$"))' "$SCHEDULER_CAPTURE")
 
 "${ADMISSION_PYTHON[@]}" \
   "$RELEASE/scripts/whoscored_production_admission.py" post-create \
@@ -1070,9 +1824,12 @@ SCHEDULER_CONTAINER_ID=$(/usr/bin/jq -er '
   select(length == 1) | .[0] |
   select(type == "string" and test("^[0-9a-f]{64}$"))
 ' "$WHOSCORED_ADMISSION_DIR/post-create-scheduler-receipt.json")
+test "$SCHEDULER_CONTAINER_ID" = "$SCHEDULER_CAPTURED_ID"
 test "$("${DOCKER[@]}" inspect --format '{{.Id}}' \
   "$SCHEDULER_CONTAINER_ID")" = "$SCHEDULER_CONTAINER_ID"
 "${DOCKER[@]}" start "$SCHEDULER_CONTAINER_ID"
+wait_cutover_container_healthy \
+  "$SCHEDULER_CONTAINER_ID" airflow-scheduler data-platform
 
 SEAWEED_AFTER=$(/usr/bin/docker inspect seaweedfs | /usr/bin/jq -c '.[0] | {
   id: .Id, command: .Config.Cmd,
@@ -1093,8 +1850,49 @@ SEAWEED_BEFORE=$(/usr/bin/docker inspect seaweedfs | /usr/bin/jq -c '.[0] | {
     {name: .Name, source: .Source, destination: .Destination}]
 }' | /usr/bin/sha256sum | /usr/bin/cut -d" " -f1)
 
-"${COMPOSE[@]}" up --no-start --no-deps --no-build --pull always \
-  flaresolverr
+FLARESOLVERR_VACANCY="$WHOSCORED_ADMISSION_DIR/vacancy-flaresolverr.json"
+FLARESOLVERR_CAPTURE="$WHOSCORED_ADMISSION_DIR/created-flaresolverr.json"
+test ! -e "$FLARESOLVERR_VACANCY"
+test ! -e "$FLARESOLVERR_CAPTURE"
+"${ADMISSION_PYTHON[@]}" \
+  "$RELEASE/scripts/whoscored_production_admission.py" \
+  verify-create-vacancy \
+  --root "$RELEASE" \
+  --deployment-attestation "$WHOSCORED_DEPLOYMENT_ATTESTATION" \
+  --service flaresolverr \
+  --output "$FLARESOLVERR_VACANCY" \
+  > "$WHOSCORED_ADMISSION_DIR/vacancy-flaresolverr-receipt.json"
+if "${COMPOSE[@]}" up --no-start --no-deps --no-build --pull always \
+  flaresolverr; then
+  create_rc=0
+else
+  create_rc=$?
+fi
+capture_command=(
+  "${ADMISSION_PYTHON[@]}"
+  "$RELEASE/scripts/whoscored_production_admission.py"
+  capture-created-object
+  --root "$RELEASE"
+  --deployment-attestation "$WHOSCORED_DEPLOYMENT_ATTESTATION"
+  --vacancy-receipt "$FLARESOLVERR_VACANCY"
+)
+if (( create_rc != 0 )); then
+  capture_command+=(--allow-partial)
+fi
+capture_command+=(--output "$FLARESOLVERR_CAPTURE")
+if "${capture_command[@]}" \
+  > "$WHOSCORED_ADMISSION_DIR/created-flaresolverr-receipt.json"; then
+  capture_rc=0
+else
+  capture_rc=$?
+fi
+(( capture_rc == 0 )) || cutover_quarantine "$capture_rc"
+CUTOVER_CAPTURE_PATHS+=("$FLARESOLVERR_CAPTURE")
+if (( create_rc != 0 )); then
+  cutover_on_failure "$create_rc"
+fi
+FLARESOLVERR_CAPTURED_ID=$(/usr/bin/jq -er \
+  '.container_id | select(test("^[0-9a-f]{64}$"))' "$FLARESOLVERR_CAPTURE")
 
 "${ADMISSION_PYTHON[@]}" \
   "$RELEASE/scripts/whoscored_production_admission.py" post-create \
@@ -1117,9 +1915,12 @@ FLARESOLVERR_CONTAINER_ID=$(/usr/bin/jq -er '
   select(length == 1) | .[0] |
   select(type == "string" and test("^[0-9a-f]{64}$"))
 ' "$WHOSCORED_ADMISSION_DIR/post-create-flaresolverr-receipt.json")
+test "$FLARESOLVERR_CONTAINER_ID" = "$FLARESOLVERR_CAPTURED_ID"
 test "$("${DOCKER[@]}" inspect --format '{{.Id}}' \
   "$FLARESOLVERR_CONTAINER_ID")" = "$FLARESOLVERR_CONTAINER_ID"
 "${DOCKER[@]}" start "$FLARESOLVERR_CONTAINER_ID"
+wait_cutover_container_healthy \
+  "$FLARESOLVERR_CONTAINER_ID" flaresolverr data-platform
 
 SEAWEED_AFTER=$(/usr/bin/docker inspect seaweedfs | /usr/bin/jq -c '.[0] | {
   id: .Id, command: .Config.Cmd,
@@ -1146,7 +1947,7 @@ state path and the three filter secrets from the approved secret manager; their
 values must not appear in command arguments:
 
 ```bash
-set -Eeuo pipefail
+set -euo pipefail
 test "$(/usr/bin/id -u)" = 0
 : "${WHOSCORED_PROXY_FILTER_STATE_HOST_DIR:?export the admitted filter-state path}"
 : "${WHOSCORED_PROXY_FILTER_CONTROL_TOKEN:?inject the filter control token}"
@@ -1178,7 +1979,7 @@ test "$FILTER_IMAGE" = "$(/usr/bin/jq -er \
   "$WHOSCORED_RENDERED_COMPOSE")"
 case "$FILTER_IMAGE" in
   *@sha256:????????????????????????????????????????????????????????????????) ;;
-  *) echo 'filter image is not digest-qualified' >&2; exit 2 ;;
+  *) echo 'filter image is not digest-qualified' >&2; cutover_on_failure 2 ;;
 esac
 /usr/bin/docker pull "$FILTER_IMAGE"
 /usr/bin/docker image inspect "$FILTER_IMAGE" >/dev/null
@@ -1263,13 +2064,57 @@ provider evidence, new empty state namespace and reviewed exact-origin release
 have all passed. The gateway container was already created and admitted during
 network cutover, but remains stopped. Create, attest and start the filter and
 paid browser as separate waves, waiting for each exact container ID to become
-healthy:
+healthy. Before any DAG pause flag is restored, wait for all five exact IDs and
+run one `verify-running` admission against both protected project models and the
+deploy-time `rendered-receipt.json`; its create-once receipt is the success
+boundary. Any timeout or admission failure enters the root ERR rollback path:
 
 ```bash
 for service in whoscored_proxy_filter flaresolverr_whoscored_paid; do
   receipt="$WHOSCORED_ADMISSION_DIR/post-create-$service-receipt.json"
-  "${GATEWAY_COMPOSE[@]}" up --no-start --no-deps --no-build --pull always \
-    "$service"
+  vacancy="$WHOSCORED_ADMISSION_DIR/vacancy-$service.json"
+  capture="$WHOSCORED_ADMISSION_DIR/created-$service.json"
+  test ! -e "$vacancy"
+  test ! -e "$capture"
+  "${ADMISSION_PYTHON[@]}" \
+    "$RELEASE/scripts/whoscored_production_admission.py" \
+    verify-create-vacancy \
+    --root "$RELEASE" \
+    --deployment-attestation "$WHOSCORED_DEPLOYMENT_ATTESTATION" \
+    --service "$service" \
+    --output "$vacancy" \
+    > "$WHOSCORED_ADMISSION_DIR/vacancy-$service-receipt.json"
+  if "${GATEWAY_COMPOSE[@]}" up --no-start --no-deps --no-build --pull always \
+    "$service"; then
+    create_rc=0
+  else
+    create_rc=$?
+  fi
+  capture_command=(
+    "${ADMISSION_PYTHON[@]}"
+    "$RELEASE/scripts/whoscored_production_admission.py"
+    capture-created-object
+    --root "$RELEASE"
+    --deployment-attestation "$WHOSCORED_DEPLOYMENT_ATTESTATION"
+    --vacancy-receipt "$vacancy"
+  )
+  if (( create_rc != 0 )); then
+    capture_command+=(--allow-partial)
+  fi
+  capture_command+=(--output "$capture")
+  if "${capture_command[@]}" \
+    > "$WHOSCORED_ADMISSION_DIR/created-$service-receipt.json"; then
+    capture_rc=0
+  else
+    capture_rc=$?
+  fi
+  (( capture_rc == 0 )) || cutover_quarantine "$capture_rc"
+  CUTOVER_CAPTURE_PATHS+=("$capture")
+  if (( create_rc != 0 )); then
+    cutover_on_failure "$create_rc"
+  fi
+  captured_id=$(/usr/bin/jq -er \
+    '.container_id | select(test("^[0-9a-f]{64}$"))' "$capture")
   "${ADMISSION_PYTHON[@]}" \
     "$RELEASE/scripts/whoscored_production_admission.py" post-create \
     --root "$RELEASE" \
@@ -1289,24 +2134,54 @@ for service in whoscored_proxy_filter flaresolverr_whoscored_paid; do
     select(length == 1) | .[0] |
     select(type == "string" and test("^[0-9a-f]{64}$"))
   ' "$receipt")
+  test "$container_id" = "$captured_id"
   "${DOCKER[@]}" start "$container_id"
-  for attempt in $(/usr/bin/seq 1 60); do
-    test "$("${DOCKER[@]}" inspect --format '{{.State.Health.Status}}' \
-      "$container_id")" = healthy && break
-    test "$attempt" != 60
-    /usr/bin/sleep 2
-  done
+  wait_cutover_container_healthy "$container_id" "$service" whoscored-gw
 done
 
 test "$("${DOCKER[@]}" inspect --format '{{.State.Status}}' \
   "$PAID_GATEWAY_CONTAINER_ID")" = created
 "${DOCKER[@]}" start "$PAID_GATEWAY_CONTAINER_ID"
-for attempt in $(/usr/bin/seq 1 60); do
-  test "$("${DOCKER[@]}" inspect --format '{{.State.Health.Status}}' \
-    "$PAID_GATEWAY_CONTAINER_ID")" = healthy && break
-  test "$attempt" != 60
-  /usr/bin/sleep 2
-done
+wait_cutover_container_healthy \
+  "$PAID_GATEWAY_CONTAINER_ID" whoscored_paid_gateway whoscored-gw
+
+WHOSCORED_RUNNING_ADMISSION_RECEIPT="$WHOSCORED_ADMISSION_DIR/running-admission-receipt.json"
+test ! -e "$WHOSCORED_RUNNING_ADMISSION_RECEIPT"
+"${ADMISSION_PYTHON[@]}" \
+  "$RELEASE/scripts/whoscored_production_admission.py" verify-running \
+  --root "$RELEASE" \
+  --deployment-attestation "$WHOSCORED_DEPLOYMENT_ATTESTATION" \
+  --common-override "$WHOSCORED_COMMON_DIGEST_OVERRIDE" \
+  --gateway-override "$WHOSCORED_GATEWAY_DIGEST_OVERRIDE" \
+  --env-file "$COMPOSE_ENV_FILE" \
+  --env-file "$WHOSCORED_ENV_FILE" \
+  --env-file "$PROXY_POOL_ENV_FILE" \
+  --provider-policy "$WHOSCORED_PROVIDER_POLICY" \
+  --owner-secret-file "$WHOSCORED_OWNER_SECRET" \
+  --deployment-admission-receipt \
+  "$WHOSCORED_ADMISSION_DIR/rendered-receipt.json" \
+  --service airflow-scheduler \
+  --service flaresolverr \
+  --service flaresolverr_whoscored_paid \
+  --service whoscored_paid_gateway \
+  --service whoscored_proxy_filter \
+  > "$WHOSCORED_RUNNING_ADMISSION_RECEIPT"
+/usr/bin/jq -e '
+  .schema_version == 2 and .status == "admitted-running-v1" and
+  ([.images[].service] | sort) == [
+    "airflow-scheduler", "flaresolverr", "flaresolverr_whoscored_paid",
+    "whoscored_paid_gateway", "whoscored_proxy_filter"
+  ]
+' "$WHOSCORED_RUNNING_ADMISSION_RECEIPT" >/dev/null
+restore_cutover_dag_pauses "$SCHEDULER_CONTAINER_ID" success
+cutover_finalize success
+finalize_rc=$?
+set -Eeuo pipefail
+shopt -s inherit_errexit
+if (( finalize_rc != 0 )); then
+  exit "$finalize_rc"
+fi
+/usr/bin/printf 'Split-project cutover completed exactly\n' >&2
 ```
 
 The paid browser has no host port/direct egress, the filter has only provider

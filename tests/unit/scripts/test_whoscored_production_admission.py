@@ -88,6 +88,23 @@ def test_verify_running_cli_requires_split_provenance_inputs() -> None:
     assert args.command == "verify-running"
     assert args.common_override == Path("/evidence/common.yaml")
     assert args.gateway_override == Path("/evidence/gateway.yaml")
+
+
+def test_cutover_inventory_cli_requires_a_new_protected_output() -> None:
+    args = admission._parser().parse_args(
+        [
+            "verify-cutover-inventory",
+            "--deployment-attestation",
+            "/evidence/deployment.json",
+            "--output",
+            "/evidence/cutover-inventory.json",
+        ]
+    )
+
+    assert args.command == "verify-cutover-inventory"
+    assert args.output == Path("/evidence/cutover-inventory.json")
+
+
 PROXY_COMMAND = tuple(
     {
         "${WHOSCORED_PROXY_FILTER_DAILY_BUDGET_BYTES:?set exact provider-policy daily cap in decimal bytes}": "300000000",
@@ -857,6 +874,9 @@ def _materialize_bind_sources(rendered: Mapping[str, object], tmp_path: Path) ->
     proxy_file = host / "proxys.txt"
     proxy_file.write_text("127.0.0.1:8080\n", encoding="utf-8")
     proxy_file.chmod(0o600)
+    geoip_database = host / "GeoLite2-City.mmdb"
+    geoip_database.write_bytes(b"unit-test-geolite-database")
+    geoip_database.chmod(0o444)
     assignments = {
         (
             "airflow-scheduler",
@@ -864,6 +884,10 @@ def _materialize_bind_sources(rendered: Mapping[str, object], tmp_path: Path) ->
         ): fotmob_admission,
         ("airflow-scheduler", "/opt/airflow/logs"): writable["logs"],
         ("airflow-scheduler", "/opt/airflow/proxys.txt"): proxy_file,
+        (
+            "airflow-scheduler",
+            admission.FBREF_CAMOUFOX_GEOIP_DATABASE_CONTAINER_PATH,
+        ): geoip_database,
         (
             "airflow-scheduler",
             "/opt/airflow/secure/whoscored-approvals",
@@ -894,12 +918,33 @@ def _materialize_bind_sources(rendered: Mapping[str, object], tmp_path: Path) ->
     return root
 
 
+def _use_test_geoip_identity(
+    monkeypatch: pytest.MonkeyPatch, rendered: Mapping[str, object]
+) -> Path:
+    source = Path(
+        _bind_volume(
+            rendered,
+            service="airflow-scheduler",
+            target=admission.FBREF_CAMOUFOX_GEOIP_DATABASE_CONTAINER_PATH,
+        )["source"]
+    )
+    raw = source.read_bytes()
+    monkeypatch.setattr(admission, "FBREF_CAMOUFOX_GEOIP_DATABASE_SIZE", len(raw))
+    monkeypatch.setattr(
+        admission,
+        "FBREF_CAMOUFOX_GEOIP_DATABASE_SHA256",
+        hashlib.sha256(raw).hexdigest(),
+    )
+    return source
+
+
 def test_bind_source_policy_requires_preexisting_separate_protected_paths(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(admission, "_AIRFLOW_RUNTIME_UID", os.geteuid())
     rendered = _rendered()
     root = _materialize_bind_sources(rendered, tmp_path)
+    _use_test_geoip_identity(monkeypatch, rendered)
     projections = admission.verify_rendered_compose(rendered, BINDINGS)
 
     admission._validate_bind_source_policy(projections, root=root)
@@ -922,6 +967,7 @@ def test_bind_source_policy_requires_preexisting_separate_protected_paths(
     nested_case = tmp_path / "nested-case"
     nested_case.mkdir()
     root = _materialize_bind_sources(rendered, nested_case)
+    _use_test_geoip_identity(monkeypatch, rendered)
     scheduler_logs = Path(
         _bind_volume(
             rendered,
@@ -948,6 +994,7 @@ def test_bind_source_policy_rejects_auto_create_and_writable_release_code(
     monkeypatch.setattr(admission, "_AIRFLOW_RUNTIME_UID", os.geteuid())
     rendered = _rendered()
     root = _materialize_bind_sources(rendered, tmp_path)
+    _use_test_geoip_identity(monkeypatch, rendered)
     dags = _bind_volume(
         rendered, service="airflow-scheduler", target="/opt/airflow/dags"
     )
@@ -970,6 +1017,7 @@ def test_bind_source_policy_rejects_wrong_airflow_authority_identity(
     monkeypatch.setattr(admission, "_AIRFLOW_RUNTIME_UID", test_uid)
     rendered = _rendered()
     root = _materialize_bind_sources(rendered, tmp_path)
+    _use_test_geoip_identity(monkeypatch, rendered)
     approvals = Path(
         str(
             _bind_volume(
@@ -989,6 +1037,55 @@ def test_bind_source_policy_rejects_wrong_airflow_authority_identity(
     approvals.chmod(0o770)
     with pytest.raises(admission.AdmissionError, match="mode 0700 or 0750"):
         admission._validate_bind_source_policy(projections, root=root)
+
+
+@pytest.mark.parametrize(
+    "mutation", ["digest", "size", "mode", "hardlink", "symlink"]
+)
+def test_bind_source_policy_rejects_unreviewed_geoip_database(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    rendered = _rendered()
+    root = _materialize_bind_sources(rendered, tmp_path)
+    source = _use_test_geoip_identity(monkeypatch, rendered)
+    if mutation == "digest":
+        source.chmod(0o644)
+        source.write_bytes(b"x" * source.stat().st_size)
+        source.chmod(0o444)
+    elif mutation == "size":
+        source.chmod(0o644)
+        source.write_bytes(source.read_bytes() + b"x")
+        source.chmod(0o444)
+    elif mutation == "mode":
+        source.chmod(0o644)
+    elif mutation == "hardlink":
+        source.with_suffix(".linked").hardlink_to(source)
+    else:
+        target = source.with_suffix(".real")
+        source.rename(target)
+        source.symlink_to(target)
+    projections = admission.verify_rendered_compose(rendered, BINDINGS)
+
+    with pytest.raises(admission.AdmissionError, match="GeoLite|canonical"):
+        admission._validate_bind_source_policy(projections, root=root)
+
+
+def test_geoip_mount_is_outside_every_image_trust_path() -> None:
+    assert admission.FBREF_CAMOUFOX_GEOIP_DATABASE_SIZE == 66_164_133
+    assert admission.FBREF_CAMOUFOX_GEOIP_DATABASE_SHA256 == (
+        "0772278c513e6ab3c65e9ae53d6861f137ab696f91eec763a2e6fe76befd83b2"
+    )
+    assert not admission._mount_shadows_image_path(
+        "airflow-scheduler",
+        admission.FBREF_CAMOUFOX_GEOIP_DATABASE_CONTAINER_PATH,
+    )
+    assert admission._mount_shadows_image_path(
+        "airflow-scheduler",
+        "/opt/legacy-scraper-venv/lib/python3.11/site-packages/"
+        "camoufox/GeoLite2-City.mmdb",
+    )
 
 
 def test_rendered_compose_binds_all_protected_services(
@@ -2025,6 +2122,1281 @@ def _docker_runner(
         raise AssertionError(args)
 
     return runner
+
+
+def _cutover_inventory_runner(
+    mode: str,
+    mutation: Callable[[dict[str, dict[str, Any]], dict[str, dict[str, Any]]], None]
+    | None = None,
+    compose_network_mutation: Callable[[dict[str, dict[str, Any]]], None]
+    | None = None,
+) -> admission.DockerRunner:
+    if mode not in {"scheduler-only-v1", "full-legacy-v1"}:
+        raise AssertionError(mode)
+    service_ids = {
+        service: format(index + 40, "064x")
+        for index, service in enumerate(admission._LEGACY_CUTOVER_SERVICES)
+    }
+    network_ids = {
+        logical_name: format(index + 50, "064x")
+        for index, logical_name in enumerate(admission._LEGACY_CUTOVER_ALL_NETWORKS)
+    }
+    members = (
+        {"whoscored-paid-api": ("airflow-scheduler",)}
+        if mode == "scheduler-only-v1"
+        else admission._LEGACY_CUTOVER_FULL_MEMBERS
+    )
+    present_services = {
+        service for services in members.values() for service in services
+    }
+    present_services.add("flaresolverr")
+    attached = {
+        service: {
+            admission._EXPECTED_NETWORK_DEFINITIONS[logical_name]["name"]
+            for logical_name, services in members.items()
+            if service in services
+        }
+        for service in present_services
+    }
+    attached["airflow-scheduler"].update({"dp-backend", "dp-frontend", "dp-storage"})
+    attached["flaresolverr"] = {"dp-backend"}
+    containers = {
+        service_ids[service]: {
+            "Config": {
+                "Image": BINDINGS[service],
+                "Labels": {
+                    "com.docker.compose.config-hash": CONFIG_HASHES[service],
+                    "com.docker.compose.container-number": "1",
+                    "com.docker.compose.oneoff": "False",
+                    "com.docker.compose.project": admission.COMMON_PROJECT,
+                    "com.docker.compose.project.config_files": ",".join(
+                        str(path)
+                        for path in (
+                            (
+                                Path("/engine29/compose.yaml"),
+                                Path("/engine29/compose.seaweedfs-supervised.yaml"),
+                                Path("/evidence/engine29-digest-only.yaml"),
+                            )
+                            if service == "flaresolverr"
+                            else CONFIG_FILES
+                        )
+                    ),
+                    "com.docker.compose.project.environment_file": ",".join(
+                        str(path) for path in ENV_FILES
+                    ),
+                    "com.docker.compose.project.working_dir": (
+                        "/engine29" if service == "flaresolverr" else "/release"
+                    ),
+                    "com.docker.compose.service": service,
+                    "com.docker.compose.version": "2.40.3",
+                }
+            },
+            "Id": service_ids[service],
+            "Image": PAYLOADS[service],
+            "Name": f"/{service}",
+            "NetworkSettings": {
+                "Networks": {
+                    name: {
+                        "NetworkID": network_ids[
+                            next(
+                                logical_name
+                                for logical_name in admission._LEGACY_CUTOVER_ALL_NETWORKS
+                                if admission._EXPECTED_NETWORK_DEFINITIONS[logical_name][
+                                    "name"
+                                ]
+                                == name
+                            )
+                        ]
+                    }
+                    for name in sorted(attached[service])
+                }
+            },
+            "State": {
+                "Dead": False,
+                "Paused": False,
+                "Restarting": False,
+                "Running": service in {"airflow-scheduler", "flaresolverr"},
+                "OOMKilled": False,
+                "Status": (
+                    "running"
+                    if service in {"airflow-scheduler", "flaresolverr"}
+                    else "created"
+                ),
+                **(
+                    {"Health": {"Status": "healthy"}}
+                    if service in {"airflow-scheduler", "flaresolverr"}
+                    else {}
+                ),
+            },
+        }
+        for service in present_services
+    }
+    network_subnets = {
+        "backend": ("172.18.0.0/16", "172.18.0.1"),
+        "frontend": ("172.19.0.0/16", "172.19.0.1"),
+        "storage": ("172.20.0.0/16", "172.20.0.1"),
+        "whoscored-paid-api": ("172.21.0.0/16", "172.21.0.1"),
+        "whoscored-paid-browser": ("172.22.0.0/16", "172.22.0.1"),
+        "whoscored-paid-direct-egress": ("172.23.0.0/16", "172.23.0.1"),
+        "whoscored-paid-provider-egress": ("172.24.0.0/16", "172.24.0.1"),
+    }
+    network_members = {
+        "backend": ("airflow-scheduler", "flaresolverr"),
+        "frontend": ("airflow-scheduler",),
+        "storage": ("airflow-scheduler",),
+        **members,
+    }
+    networks: dict[str, dict[str, Any]] = {}
+    for logical_name, services in network_members.items():
+        definition = admission._EXPECTED_NETWORK_DEFINITIONS[logical_name]
+        subnet, gateway = network_subnets[logical_name]
+        networks[logical_name] = {
+            "Attachable": False,
+            "Containers": {
+                service_ids[service]: {"Name": service}
+                for service in services
+                if containers[service_ids[service]]["State"]["Running"]
+            },
+            "Driver": "bridge",
+            "EnableIPv4": True,
+            "EnableIPv6": False,
+            "IPAM": {
+                "Config": [{"Gateway": gateway, "IPRange": "", "Subnet": subnet}],
+                "Driver": "default",
+                "Options": None,
+            },
+            "Id": network_ids[logical_name],
+            "Ingress": False,
+            "Internal": bool(definition.get("internal", False)),
+            "Labels": {
+                "com.docker.compose.config-hash": SHA_D,
+                "com.docker.compose.network": logical_name,
+                "com.docker.compose.project": admission.COMMON_PROJECT,
+                "com.docker.compose.version": "2.40.3",
+            },
+            "Name": definition["name"],
+            "Options": {},
+            "Scope": "local",
+        }
+    if mutation is not None:
+        mutation(containers, networks)
+
+    def selected_container_ids(filters: list[str]) -> list[str]:
+        selected: list[str] = []
+        for container_id, container in containers.items():
+            labels = container["Config"]["Labels"]
+            name = container["Name"]
+            if all(
+                (
+                    value == f"name=^{name}$"
+                    or value.startswith("label=com.docker.compose.project=")
+                    and labels.get("com.docker.compose.project")
+                    == value.rsplit("=", 1)[1]
+                    or value.startswith("label=com.docker.compose.service=")
+                    and labels.get("com.docker.compose.service")
+                    == value.rsplit("=", 1)[1]
+                    or value.startswith("network=")
+                    and value.removeprefix("network=")
+                    in container["NetworkSettings"]["Networks"]
+                )
+                for value in filters
+            ):
+                selected.append(container_id)
+        return sorted(selected)
+
+    def runner(arguments: Sequence[str]) -> bytes:
+        args = list(arguments)
+        if args[:1] == ["compose"]:
+            project_directory = args[args.index("--project-directory") + 1]
+            if project_directory == "/engine29":
+                assert "--profile" not in args
+                assert "/engine29/compose.yaml" in args
+            else:
+                assert project_directory == "/release"
+            if args[-3:] == ["config", "--format", "json"]:
+                rendered_networks = {
+                    logical: json.loads(
+                        json.dumps(admission._EXPECTED_NETWORK_DEFINITIONS[logical])
+                    )
+                    for logical in admission._LEGACY_CUTOVER_ALL_NETWORKS
+                }
+                if compose_network_mutation is not None:
+                    compose_network_mutation(rendered_networks)
+                return json.dumps(
+                    {
+                        "name": admission.COMMON_PROJECT,
+                        "networks": rendered_networks,
+                        "services": {
+                            service: {
+                                "environment": {
+                                    "TEST_SECRET": "cutover-secret-sentinel"
+                                }
+                            }
+                            for service in present_services
+                        },
+                    }
+                ).encode()
+            if args[-3:-1] == ["config", "--hash"]:
+                service = args[-1]
+                assert ("--profile" in args) is (
+                    service in admission.GATEWAY_PROTECTED_SERVICES
+                )
+                return f"{service} {CONFIG_HASHES[service]}\n".encode()
+            raise AssertionError(args)
+        if args[:2] == ["container", "ls"]:
+            filters = [
+                args[index + 1]
+                for index, value in enumerate(args)
+                if value == "--filter"
+            ]
+            ids = selected_container_ids(filters)
+            return ("\n".join(ids) + ("\n" if ids else "")).encode()
+        if args[:2] == ["container", "inspect"]:
+            return json.dumps([containers[args[2]]]).encode()
+        if args[:2] == ["network", "ls"]:
+            filters = [
+                args[index + 1]
+                for index, value in enumerate(args)
+                if value == "--filter"
+            ]
+            selected = [
+                network
+                for network in networks.values()
+                if all(
+                    value.startswith("label=com.docker.compose.project=")
+                    and network["Labels"].get("com.docker.compose.project")
+                    == value.rsplit("=", 1)[1]
+                    or value.startswith("label=com.docker.compose.network=")
+                    and network["Labels"].get("com.docker.compose.network")
+                    == value.rsplit("=", 1)[1]
+                    for value in filters
+                )
+            ]
+            if args[-1] == "{{.ID}}":
+                ids = sorted(network["Id"] for network in selected)
+                return ("\n".join(ids) + ("\n" if ids else "")).encode()
+            lines = sorted(
+                f"{network['Id']}\t{network['Name']}" for network in selected
+            )
+            return ("\n".join(lines) + ("\n" if lines else "")).encode()
+        if args[:2] == ["network", "inspect"]:
+            network = next(
+                value for value in networks.values() if value["Name"] == args[2]
+            )
+            return json.dumps([network]).encode()
+        if args[:2] == ["image", "inspect"]:
+            service = next(
+                service
+                for service in present_services
+                if BINDINGS[service] == args[2]
+                and PAYLOADS[service]
+                == next(
+                    container["Image"]
+                    for container in containers.values()
+                    if container["Config"]["Labels"][
+                        "com.docker.compose.service"
+                    ]
+                    == service
+                )
+            )
+            return json.dumps(
+                [
+                    {
+                        "Id": PAYLOADS[service],
+                        "RepoDigests": [BINDINGS[service]],
+                    }
+                ]
+            ).encode()
+        raise AssertionError(args)
+
+    return runner
+
+
+def _cutover_input_reader(path: Path) -> dict[str, Any]:
+    return {
+        "changed_ns": 1,
+        "device": 1,
+        "gid": 0,
+        "inode": int(hashlib.sha256(str(path).encode()).hexdigest()[:12], 16),
+        "link_count": 1,
+        "mode": 0o600,
+        "modified_ns": 1,
+        "path": str(path),
+        "sha256": hashlib.sha256(str(path).encode()).hexdigest(),
+        "size": len(str(path)),
+        "uid": 0,
+    }
+
+
+def _cutover_directory_reader(path: Path) -> dict[str, Any]:
+    return {
+        "changed_ns": 1,
+        "device": 1,
+        "gid": 0,
+        "inode": int(hashlib.sha256(str(path).encode()).hexdigest()[:12], 16),
+        "mode": 0o700,
+        "modified_ns": 1,
+        "path": str(path),
+        "uid": 0,
+    }
+
+
+@pytest.mark.parametrize(
+    ("mode", "services", "networks"),
+    [
+        (
+            "scheduler-only-v1",
+            ["airflow-scheduler", "flaresolverr"],
+            ["dp-whoscored-paid-api"],
+        ),
+        (
+            "full-legacy-v1",
+            list(admission._LEGACY_CUTOVER_SERVICES),
+            [
+                admission._EXPECTED_NETWORK_DEFINITIONS[name]["name"]
+                for name in admission._LEGACY_CUTOVER_NETWORKS
+            ],
+        ),
+    ],
+)
+def test_cutover_inventory_admits_only_complete_supported_modes(
+    mode: str, services: list[str], networks: list[str]
+) -> None:
+    report = admission.verify_cutover_inventory(
+        runner=_cutover_inventory_runner(mode),
+        input_reader=_cutover_input_reader,
+        directory_reader=_cutover_directory_reader,
+    )
+
+    assert report["status"] == "cutover-inventory-admitted-v1"
+    assert report["mode"] == mode
+    assert [record["service"] for record in report["containers"]] == services
+    assert [record["name"] for record in report["networks"]] == networks
+    assert [record["logical_name"] for record in report["retained_networks"]] == [
+        "backend",
+        "frontend",
+        "storage",
+    ]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing-health",
+        "health-starting",
+        "health-unhealthy",
+        "not-running-status",
+        "paused",
+        "restarting",
+        "dead",
+        "oom-killed",
+    ],
+)
+def test_cutover_inventory_rejects_unhealthy_running_baseline(
+    mutation: str,
+) -> None:
+    def mutate(
+        containers: dict[str, dict[str, Any]],
+        _networks: dict[str, dict[str, Any]],
+    ) -> None:
+        state = next(
+            container["State"]
+            for container in containers.values()
+            if container["Config"]["Labels"]["com.docker.compose.service"]
+            == "airflow-scheduler"
+        )
+        if mutation == "missing-health":
+            state.pop("Health")
+        elif mutation.startswith("health-"):
+            state["Health"]["Status"] = mutation.removeprefix("health-")
+        elif mutation == "not-running-status":
+            state["Status"] = "exited"
+        else:
+            state[
+                {
+                    "paused": "Paused",
+                    "restarting": "Restarting",
+                    "dead": "Dead",
+                    "oom-killed": "OOMKilled",
+                }[mutation]
+            ] = True
+
+    with pytest.raises(
+        admission.AdmissionError, match="not healthy and running: airflow-scheduler"
+    ):
+        admission.verify_cutover_inventory(
+            runner=_cutover_inventory_runner("full-legacy-v1", mutate),
+            input_reader=_cutover_input_reader,
+            directory_reader=_cutover_directory_reader,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("Status", "paused"),
+        ("Paused", True),
+        ("Restarting", True),
+        ("Dead", True),
+        ("OOMKilled", True),
+    ],
+)
+def test_cutover_inventory_rejects_insane_stopped_baseline(
+    field: str, value: str | bool
+) -> None:
+    def mutate(
+        containers: dict[str, dict[str, Any]],
+        _networks: dict[str, dict[str, Any]],
+    ) -> None:
+        state = next(
+            container["State"]
+            for container in containers.values()
+            if container["Config"]["Labels"]["com.docker.compose.service"]
+            == "whoscored_paid_gateway"
+        )
+        state[field] = value
+
+    with pytest.raises(
+        admission.AdmissionError,
+        match="stopped container is not sane: whoscored_paid_gateway",
+    ):
+        admission.verify_cutover_inventory(
+            runner=_cutover_inventory_runner("full-legacy-v1", mutate),
+            input_reader=_cutover_input_reader,
+            directory_reader=_cutover_directory_reader,
+        )
+
+
+def test_cutover_inventory_accepts_stopped_exited_without_health() -> None:
+    def mutate(
+        containers: dict[str, dict[str, Any]],
+        _networks: dict[str, dict[str, Any]],
+    ) -> None:
+        state = next(
+            container["State"]
+            for container in containers.values()
+            if container["Config"]["Labels"]["com.docker.compose.service"]
+            == "whoscored_paid_gateway"
+        )
+        state["Status"] = "exited"
+        assert "Health" not in state
+
+    report = admission.verify_cutover_inventory(
+        runner=_cutover_inventory_runner("full-legacy-v1", mutate),
+        input_reader=_cutover_input_reader,
+        directory_reader=_cutover_directory_reader,
+    )
+
+    assert report["status"] == "cutover-inventory-admitted-v1"
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("partial-trio", "paid trio inventory is partial"),
+        (
+            "missing-flaresolverr",
+            "requires exactly one shared scheduler and FlareSolverr",
+        ),
+        ("wrong-network-project", "network identity is ambiguous"),
+        ("unexpected-endpoint", "network container inventory differs"),
+        ("gateway-project-object", "whoscored-gw already has containers"),
+        ("renamed-target", "container identity is ambiguous"),
+        ("extra-paid-attachment", "paid-network attachment differs"),
+        ("unexpected-stopped-member", "configured Docker network membership differs"),
+    ],
+)
+def test_cutover_inventory_rejects_partial_or_ambiguous_live_state(
+    mutation: str, message: str
+) -> None:
+    def mutate(
+        containers: dict[str, dict[str, Any]],
+        networks: dict[str, dict[str, Any]],
+    ) -> None:
+        if mutation == "partial-trio":
+            for container_id, container in tuple(containers.items()):
+                if container["Config"]["Labels"]["com.docker.compose.service"] in {
+                    "whoscored_paid_gateway",
+                    "whoscored_proxy_filter",
+                }:
+                    containers.pop(container_id)
+        elif mutation == "missing-flaresolverr":
+            for container_id, container in tuple(containers.items()):
+                if (
+                    container["Config"]["Labels"]["com.docker.compose.service"]
+                    == "flaresolverr"
+                ):
+                    containers.pop(container_id)
+        elif mutation == "wrong-network-project":
+            networks["whoscored-paid-api"]["Labels"]["com.docker.compose.project"] = (
+                "unexpected-project"
+            )
+        elif mutation == "unexpected-endpoint":
+            networks["whoscored-paid-api"]["Containers"]["f" * 64] = {
+                "Name": "unexpected"
+            }
+        elif mutation == "gateway-project-object":
+            container_id = "e" * 64
+            containers[container_id] = {
+                "Config": {
+                    "Labels": {
+                        "com.docker.compose.project": admission.GATEWAY_PROJECT,
+                        "com.docker.compose.service": "unexpected",
+                    }
+                },
+                "Id": container_id,
+                "Name": "/unexpected",
+                "NetworkSettings": {"Networks": {}},
+                "State": {"Running": False},
+            }
+        elif mutation == "renamed-target":
+            scheduler = next(
+                container
+                for container in containers.values()
+                if container["Config"]["Labels"]["com.docker.compose.service"]
+                == "airflow-scheduler"
+            )
+            scheduler["Name"] = "/renamed-scheduler"
+        elif mutation == "extra-paid-attachment":
+            scheduler = next(
+                container
+                for container in containers.values()
+                if container["Config"]["Labels"]["com.docker.compose.service"]
+                == "airflow-scheduler"
+            )
+            scheduler["NetworkSettings"]["Networks"][
+                "dp-whoscored-paid-browser"
+            ] = {}
+        else:
+            container_id = "c" * 64
+            containers[container_id] = {
+                "Config": {
+                    "Labels": {
+                        "com.docker.compose.container-number": "1",
+                        "com.docker.compose.oneoff": "False",
+                        "com.docker.compose.project": "unexpected-project",
+                        "com.docker.compose.service": "unexpected",
+                    }
+                },
+                "Id": container_id,
+                "Name": "/unexpected-stopped-member",
+                "NetworkSettings": {
+                    "Networks": {"dp-whoscored-paid-api": {}}
+                },
+                "State": {"Running": False},
+            }
+
+    with pytest.raises(admission.AdmissionError, match=message):
+        admission.verify_cutover_inventory(
+            runner=_cutover_inventory_runner("full-legacy-v1", mutate),
+            input_reader=_cutover_input_reader,
+            directory_reader=_cutover_directory_reader,
+        )
+
+
+def test_cutover_inventory_docker_error_is_not_treated_as_absence() -> None:
+    base = _cutover_inventory_runner("scheduler-only-v1")
+
+    def failing_runner(arguments: Sequence[str]) -> bytes:
+        if "label=com.docker.compose.service=whoscored_paid_gateway" in arguments:
+            raise admission.AdmissionError("authoritative Docker enumeration failed")
+        return base(arguments)
+
+    with pytest.raises(
+        admission.AdmissionError, match="authoritative Docker enumeration failed"
+    ):
+        admission.verify_cutover_inventory(
+            runner=failing_runner,
+            input_reader=_cutover_input_reader,
+            directory_reader=_cutover_directory_reader,
+        )
+
+
+def test_cutover_inventory_ignores_same_service_in_isolated_project() -> None:
+    def add_isolated_scheduler(
+        containers: dict[str, dict[str, Any]],
+        _networks: dict[str, dict[str, Any]],
+    ) -> None:
+        container_id = "d" * 64
+        containers[container_id] = {
+            "Config": {
+                "Labels": {
+                    "com.docker.compose.container-number": "1",
+                    "com.docker.compose.oneoff": "False",
+                    "com.docker.compose.project": "fotmob-airflow",
+                    "com.docker.compose.service": "airflow-scheduler",
+                }
+            },
+            "Id": container_id,
+            "Name": "/fotmob-airflow-scheduler",
+            "NetworkSettings": {"Networks": {"fotmob-airflow-default": {}}},
+            "State": {"Running": True},
+        }
+
+    report = admission.verify_cutover_inventory(
+        runner=_cutover_inventory_runner(
+            "scheduler-only-v1", add_isolated_scheduler
+        ),
+        input_reader=_cutover_input_reader,
+        directory_reader=_cutover_directory_reader,
+    )
+
+    assert report["mode"] == "scheduler-only-v1"
+    assert [record["service"] for record in report["containers"]] == [
+        "airflow-scheduler",
+        "flaresolverr",
+    ]
+
+
+def test_cutover_inventory_receipt_is_canonical_and_never_overwritten(
+    tmp_path: Path,
+) -> None:
+    inventory = admission.verify_cutover_inventory(
+        runner=_cutover_inventory_runner("scheduler-only-v1"),
+        input_reader=_cutover_input_reader,
+        directory_reader=_cutover_directory_reader,
+    )
+    output = tmp_path / "cutover-inventory.json"
+    expected = admission._canonical_bytes(inventory)
+
+    admission.write_new_regular_file(output, expected)
+
+    assert output.read_bytes() == expected
+    assert output.stat().st_mode & 0o777 == 0o600
+    with pytest.raises(admission.AdmissionError, match="will not be overwritten"):
+        admission.write_new_regular_file(output, b"replacement\n")
+
+
+def test_cutover_network_inventory_rejects_malformed_unrelated_rows() -> None:
+    with pytest.raises(admission.AdmissionError, match="malformed"):
+        admission._listed_cutover_networks(
+            b"not-an-id\tbridge\n" + ("5" * 64).encode() + b"\tdp-whoscored-paid-api\n"
+        )
+
+
+def test_cutover_inventory_rejects_renamed_compose_labeled_network() -> None:
+    def rename_network(
+        _containers: dict[str, dict[str, Any]],
+        networks: dict[str, dict[str, Any]],
+    ) -> None:
+        networks["whoscored-paid-api"]["Name"] = "renamed-paid-api"
+
+    with pytest.raises(admission.AdmissionError, match="network inventory differs"):
+        admission.verify_cutover_inventory(
+            runner=_cutover_inventory_runner("scheduler-only-v1", rename_network),
+            input_reader=_cutover_input_reader,
+            directory_reader=_cutover_directory_reader,
+        )
+
+
+def test_cutover_inventory_rejects_extra_core_network_attachment() -> None:
+    def attach_unexpected_core(
+        containers: dict[str, dict[str, Any]],
+        _networks: dict[str, dict[str, Any]],
+    ) -> None:
+        flaresolverr = next(
+            container
+            for container in containers.values()
+            if container["Config"]["Labels"]["com.docker.compose.service"]
+            == "flaresolverr"
+        )
+        flaresolverr["NetworkSettings"]["Networks"]["dp-frontend"] = {}
+
+    with pytest.raises(admission.AdmissionError, match="unexpected network"):
+        admission.verify_cutover_inventory(
+            runner=_cutover_inventory_runner(
+                "scheduler-only-v1", attach_unexpected_core
+            ),
+            input_reader=_cutover_input_reader,
+            directory_reader=_cutover_directory_reader,
+        )
+
+
+def test_cutover_inventory_rejects_mismatched_endpoint_network_id() -> None:
+    def mismatch_endpoint(
+        containers: dict[str, dict[str, Any]],
+        _networks: dict[str, dict[str, Any]],
+    ) -> None:
+        scheduler = next(
+            container
+            for container in containers.values()
+            if container["Config"]["Labels"]["com.docker.compose.service"]
+            == "airflow-scheduler"
+        )
+        scheduler["NetworkSettings"]["Networks"]["dp-backend"]["NetworkID"] = (
+            "f" * 64
+        )
+
+    with pytest.raises(admission.AdmissionError, match="endpoint identity differs"):
+        admission.verify_cutover_inventory(
+            runner=_cutover_inventory_runner(
+                "scheduler-only-v1", mismatch_endpoint
+            ),
+            input_reader=_cutover_input_reader,
+            directory_reader=_cutover_directory_reader,
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("missing-running", "required container differs"),
+        ("stopped-listed", "contains stopped protected container"),
+        ("malformed-unrelated", "container identity differs"),
+    ],
+)
+def test_cutover_inventory_cross_checks_retained_network_endpoints(
+    mutation: str, message: str
+) -> None:
+    def mutate(
+        containers: dict[str, dict[str, Any]],
+        networks: dict[str, dict[str, Any]],
+    ) -> None:
+        scheduler_id, scheduler = next(
+            (container_id, container)
+            for container_id, container in containers.items()
+            if container["Config"]["Labels"]["com.docker.compose.service"]
+            == "airflow-scheduler"
+        )
+        if mutation == "missing-running":
+            networks["backend"]["Containers"].pop(scheduler_id)
+        elif mutation == "stopped-listed":
+            scheduler["State"].update({"Running": False, "Status": "exited"})
+            scheduler["State"].pop("Health")
+        else:
+            networks["backend"]["Containers"]["not-an-id"] = {
+                "Name": "unrelated"
+            }
+
+    with pytest.raises(admission.AdmissionError, match=message):
+        admission.verify_cutover_inventory(
+            runner=_cutover_inventory_runner("scheduler-only-v1", mutate),
+            input_reader=_cutover_input_reader,
+            directory_reader=_cutover_directory_reader,
+        )
+
+
+def _cutover_postgres_runner(snapshot: Mapping[str, Any]) -> admission.DockerRunner:
+    container_id = "9" * 64
+
+    def runner(arguments: Sequence[str]) -> bytes:
+        args = list(arguments)
+        if args[:2] == ["container", "ls"]:
+            return f"{container_id}\n".encode()
+        if args[:2] == ["container", "inspect"]:
+            return json.dumps(
+                [
+                    {
+                        "Config": {
+                            "Labels": {
+                                "com.docker.compose.container-number": "1",
+                                "com.docker.compose.oneoff": "False",
+                                "com.docker.compose.project": admission.COMMON_PROJECT,
+                                "com.docker.compose.service": "postgres",
+                            }
+                        },
+                        "Id": container_id,
+                        "Name": "/postgres",
+                        "State": {
+                            "Dead": False,
+                            "Health": {"Status": "healthy"},
+                            "Paused": False,
+                            "Restarting": False,
+                            "Running": True,
+                            "Status": "running",
+                        },
+                    }
+                ]
+            ).encode()
+        if args[:2] == ["container", "exec"]:
+            sql = args[-1]
+            assert "READ ONLY" in sql
+            assert "ON_ERROR_STOP" in args[-3]
+            return (json.dumps(snapshot) + "\n").encode()
+        raise AssertionError(args)
+
+    return runner
+
+
+def _empty_quiescence_snapshot() -> dict[str, Any]:
+    return {
+        "active_dag_runs": [],
+        "active_fbref_crawl_runs": [],
+        "active_fbref_publication_locks": [],
+        "active_non_scheduler_jobs": [],
+        "active_task_instances": [],
+        "observed_at": "2026-07-22T10:00:00.000000Z",
+    }
+
+
+def test_cutover_quiescence_is_cross_source_and_ignores_only_stale_jobs() -> None:
+    assert "LEFT JOIN dag_run AS dr" in admission._CUTOVER_QUIESCENCE_SQL
+    assert "dr.state IN ('queued', 'restarting', 'running')" in (
+        admission._CUTOVER_QUIESCENCE_SQL
+    )
+    assert (
+        ") OR ti.state IN ('queued', 'restarting', 'running')"
+        in admission._CUTOVER_QUIESCENCE_SQL
+    )
+    assert (
+        "AND ti.state IN ('deferred', 'queued', 'restarting', 'running', "
+        "'scheduled', 'sensing', 'up_for_reschedule', 'up_for_retry')"
+        in admission._CUTOVER_QUIESCENCE_SQL
+    )
+    assert "latest_heartbeat >= transaction_timestamp() - interval '5 minutes'" in (
+        admission._CUTOVER_QUIESCENCE_SQL
+    )
+    assert "fbref_control.crawl_run" in admission._CUTOVER_QUIESCENCE_SQL
+    assert "fbref_control.publication_lock" in admission._CUTOVER_QUIESCENCE_SQL
+
+    report = admission.verify_cutover_quiescence(
+        runner=_cutover_postgres_runner(_empty_quiescence_snapshot())
+    )
+
+    assert report["status"] == "cutover-quiescent-v1"
+
+    fresh = _empty_quiescence_snapshot()
+    fresh["active_non_scheduler_jobs"] = [
+        {
+            "hostname": "worker",
+            "id": 42,
+            "job_type": "LocalTaskJob",
+            "latest_heartbeat": "2026-07-22T09:59:58Z",
+            "state": "running",
+        }
+    ]
+    with pytest.raises(admission.AdmissionError, match="not quiescent"):
+        admission.verify_cutover_quiescence(
+            runner=_cutover_postgres_runner(fresh)
+        )
+
+
+def test_cutover_quiescence_blocks_current_fbref_work() -> None:
+    snapshot = _empty_quiescence_snapshot()
+    snapshot["active_dag_runs"] = [
+        {
+            "dag_id": "dag_bootstrap_fbref",
+            "run_id": "manual__2026-07-22T14:40:00+00:00",
+            "state": "running",
+        }
+    ]
+    snapshot["active_fbref_crawl_runs"] = [
+        {"run_id": "1", "run_type": "bootstrap", "status": "running"}
+    ]
+
+    with pytest.raises(
+        admission.AdmissionError,
+        match="active_dag_runs=1, active_fbref_crawl_runs=1",
+    ):
+        admission.verify_cutover_quiescence(
+            runner=_cutover_postgres_runner(snapshot)
+        )
+
+
+def test_cutover_dag_pause_snapshot_preserves_every_boolean() -> None:
+    report = admission.snapshot_cutover_dag_pauses(
+        runner=_cutover_postgres_runner(
+            {
+                "dag_pause_states": [
+                    {"dag_id": "a", "is_paused": False},
+                    {"dag_id": "b", "is_paused": True},
+                ],
+                "observed_at": "2026-07-22T10:00:00.000000Z",
+            }
+        )
+    )
+
+    assert report["status"] == "dag-pauses-snapshotted-v1"
+    assert report["dag_pause_states"] == [
+        {"dag_id": "a", "is_paused": False},
+        {"dag_id": "b", "is_paused": True},
+    ]
+
+
+def test_create_vacancy_then_capture_binds_created_id_and_gateway_networks() -> None:
+    service = "whoscored_paid_gateway"
+    container_id = "8" * 64
+    network_ids = {
+        admission._EXPECTED_NETWORK_DEFINITIONS[logical]["name"]: format(
+            index + 70, "064x"
+        )
+        for index, logical in enumerate(
+            admission._CREATE_CAPTURE_GATEWAY_NETWORKS[service]
+        )
+    }
+    def vacancy_runner(_arguments: Sequence[str]) -> bytes:
+        return b""
+
+    vacancy = admission.verify_create_vacancy(
+        service,
+        runner=vacancy_runner,
+        now=lambda: datetime(2026, 7, 22, 10, 0, tzinfo=timezone.utc),
+    )
+
+    def capture_runner(arguments: Sequence[str]) -> bytes:
+        args = list(arguments)
+        if args[:2] == ["container", "ls"]:
+            return f"{container_id}\n".encode()
+        if args[:2] == ["container", "inspect"]:
+            return json.dumps(
+                [
+                    {
+                        "Config": {
+                            "Labels": {
+                                "com.docker.compose.container-number": "1",
+                                "com.docker.compose.oneoff": "False",
+                                "com.docker.compose.project": admission.GATEWAY_PROJECT,
+                                "com.docker.compose.service": service,
+                            }
+                        },
+                        "Created": "2026-07-22T10:00:01.000000Z",
+                        "Id": container_id,
+                        "Name": f"/{service}",
+                        "State": {"Running": False, "Status": "created"},
+                    }
+                ]
+            ).encode()
+        if args[:2] == ["network", "ls"]:
+            return ("\n".join(network_ids.values()) + "\n").encode()
+        if args[:2] == ["network", "inspect"]:
+            network_id = args[2]
+            network_name = next(
+                name for name, value in network_ids.items() if value == network_id
+            )
+            return json.dumps(
+                [
+                    {
+                        "Id": network_id,
+                        "Labels": {
+                            "com.docker.compose.network": next(
+                                logical
+                                for logical in admission._LEGACY_CUTOVER_NETWORKS
+                                if admission._EXPECTED_NETWORK_DEFINITIONS[logical][
+                                    "name"
+                                ]
+                                == network_name
+                            ),
+                            "com.docker.compose.project": admission.GATEWAY_PROJECT,
+                        },
+                        "Name": network_name,
+                    }
+                ]
+            ).encode()
+        raise AssertionError(args)
+
+    capture = admission.capture_created_object(vacancy, runner=capture_runner)
+
+    assert capture["container_id"] == container_id
+    assert capture["networks"] == [
+        {"id": network_ids[name], "name": name} for name in sorted(network_ids)
+    ]
+
+
+def test_failed_create_capture_allows_exact_partial_networks_without_container() -> None:
+    service = "whoscored_paid_gateway"
+    network_id = "7" * 64
+    network_name = "dp-whoscored-paid-api"
+    vacancy = admission.verify_create_vacancy(
+        service,
+        runner=lambda _arguments: b"",
+        now=lambda: datetime(2026, 7, 22, 10, 0, tzinfo=timezone.utc),
+    )
+
+    def runner(arguments: Sequence[str]) -> bytes:
+        args = list(arguments)
+        if args[:2] == ["container", "ls"]:
+            return b""
+        if args[:2] == ["network", "ls"]:
+            return f"{network_id}\n".encode()
+        if args[:2] == ["network", "inspect"]:
+            return json.dumps(
+                [
+                    {
+                        "Id": network_id,
+                        "Labels": {
+                            "com.docker.compose.network": "whoscored-paid-api",
+                            "com.docker.compose.project": admission.GATEWAY_PROJECT,
+                        },
+                        "Name": network_name,
+                    }
+                ]
+            ).encode()
+        raise AssertionError(args)
+
+    capture = admission.capture_created_object(
+        vacancy,
+        runner=runner,
+        allow_partial=True,
+    )
+
+    assert capture["container_id"] is None
+    assert capture["created_at"] is None
+    assert capture["networks"] == [{"id": network_id, "name": network_name}]
+    with pytest.raises(admission.AdmissionError, match="identity is ambiguous"):
+        admission.capture_created_object(vacancy, runner=runner)
+
+
+def test_rollback_bundle_is_repeatable_and_contains_no_secret_values() -> None:
+    runner = _cutover_inventory_runner("scheduler-only-v1")
+    inventory = admission.verify_cutover_inventory(
+        runner=runner,
+        input_reader=_cutover_input_reader,
+        directory_reader=_cutover_directory_reader,
+    )
+
+    report = admission.verify_rollback_bundle(
+        inventory,
+        runner=runner,
+        input_reader=_cutover_input_reader,
+        directory_reader=_cutover_directory_reader,
+    )
+
+    assert report["status"] == "rollback-bundle-admitted-v1"
+    scheduler = next(
+        record
+        for record in inventory["rollback"]["services"]
+        if record["service"] == "airflow-scheduler"
+    )
+    assert scheduler["compose"]["profiles"] == []
+    assert scheduler["compose"]["config_files"][-1] == (
+        "/evidence/digest-only.yaml"
+    )
+    flaresolverr = next(
+        record
+        for record in inventory["rollback"]["services"]
+        if record["service"] == "flaresolverr"
+    )
+    assert flaresolverr["compose"]["working_directory"] == "/engine29"
+    assert flaresolverr["compose"]["profiles"] == []
+    assert flaresolverr["running"] is True
+    assert all(
+        "sha256" in item and "value" not in item
+        for record in inventory["rollback"]["services"]
+        for item in record["inputs"]
+    )
+    assert "cutover-secret-sentinel" not in json.dumps(inventory)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("attachable", True),
+        ("enable_ipv6", True),
+        ("driver_opts", {"com.docker.network.bridge.enable_icc": "true"}),
+        ("ipam", {"config": [{"subnet": "172.31.0.0/16"}]}),
+    ],
+)
+def test_cutover_inventory_rejects_rollback_network_policy_drift(
+    field: str, value: Any
+) -> None:
+    def mutate(networks: dict[str, dict[str, Any]]) -> None:
+        networks["whoscored-paid-api"][field] = value
+
+    with pytest.raises(admission.AdmissionError, match="rollback network model differs"):
+        admission.verify_cutover_inventory(
+            runner=_cutover_inventory_runner(
+                "scheduler-only-v1",
+                compose_network_mutation=mutate,
+            ),
+            input_reader=_cutover_input_reader,
+            directory_reader=_cutover_directory_reader,
+        )
+
+
+def test_rollback_bundle_rejects_changed_engine29_input() -> None:
+    runner = _cutover_inventory_runner("scheduler-only-v1")
+    inventory = admission.verify_cutover_inventory(
+        runner=runner,
+        input_reader=_cutover_input_reader,
+        directory_reader=_cutover_directory_reader,
+    )
+
+    def changed_input_reader(path: Path) -> dict[str, Any]:
+        record = _cutover_input_reader(path)
+        if path == Path("/engine29/compose.yaml"):
+            record["sha256"] = "f" * 64
+        return record
+
+    with pytest.raises(admission.AdmissionError, match="changed after cutover admission"):
+        admission.verify_rollback_bundle(
+            inventory,
+            runner=runner,
+            input_reader=changed_input_reader,
+            directory_reader=_cutover_directory_reader,
+        )
+
+
+def test_rollback_bundle_rejects_changed_retained_network_id() -> None:
+    runner = _cutover_inventory_runner("scheduler-only-v1")
+    inventory = admission.verify_cutover_inventory(
+        runner=runner,
+        input_reader=_cutover_input_reader,
+        directory_reader=_cutover_directory_reader,
+    )
+
+    def changed_runner(arguments: Sequence[str]) -> bytes:
+        raw = runner(arguments)
+        if list(arguments[:3]) == ["network", "inspect", "dp-backend"]:
+            inspected = json.loads(raw)
+            inspected[0]["Id"] = "f" * 64
+            return json.dumps(inspected).encode()
+        return raw
+
+    with pytest.raises(
+        admission.AdmissionError,
+        match="retained Docker network changed after cutover admission",
+    ):
+        admission.verify_rollback_bundle(
+            inventory,
+            runner=changed_runner,
+            input_reader=_cutover_input_reader,
+            directory_reader=_cutover_directory_reader,
+        )
+
+
+def test_rollback_bundle_post_cleanup_accepts_exact_present_or_absent_core_ids() -> None:
+    runner = _cutover_inventory_runner("scheduler-only-v1")
+    inventory = admission.verify_cutover_inventory(
+        runner=runner,
+        input_reader=_cutover_input_reader,
+        directory_reader=_cutover_directory_reader,
+    )
+
+    def post_cleanup_runner(arguments: Sequence[str]) -> bytes:
+        raw = runner(arguments)
+        if (
+            list(arguments[:2]) == ["network", "inspect"]
+            and arguments[2] in {"dp-backend", "dp-frontend", "dp-storage"}
+        ):
+            inspected = json.loads(raw)
+            inspected[0]["Containers"] = {}
+            return json.dumps(inspected).encode()
+        return raw
+
+    before_first_removal = admission.verify_rollback_bundle(
+        inventory,
+        runner=runner,
+        input_reader=_cutover_input_reader,
+        directory_reader=_cutover_directory_reader,
+        post_cleanup=True,
+    )
+    after_all_removals = admission.verify_rollback_bundle(
+        inventory,
+        runner=post_cleanup_runner,
+        input_reader=_cutover_input_reader,
+        directory_reader=_cutover_directory_reader,
+        post_cleanup=True,
+    )
+
+    def scheduler_removed_runner(arguments: Sequence[str]) -> bytes:
+        raw = runner(arguments)
+        if (
+            list(arguments[:2]) == ["network", "inspect"]
+            and arguments[2] in {"dp-backend", "dp-frontend", "dp-storage"}
+        ):
+            inspected = json.loads(raw)
+            inspected[0]["Containers"] = {
+                container_id: endpoint
+                for container_id, endpoint in inspected[0]["Containers"].items()
+                if endpoint["Name"] != "airflow-scheduler"
+            }
+            return json.dumps(inspected).encode()
+        return raw
+
+    after_scheduler_removal = admission.verify_rollback_bundle(
+        inventory,
+        runner=scheduler_removed_runner,
+        input_reader=_cutover_input_reader,
+        directory_reader=_cutover_directory_reader,
+        post_cleanup=True,
+    )
+
+    assert {
+        before_first_removal["status"],
+        after_scheduler_removal["status"],
+        after_all_removals["status"],
+    } == {"rollback-bundle-admitted-v1"}
+    with pytest.raises(admission.AdmissionError, match="required container differs"):
+        admission.verify_rollback_bundle(
+            inventory,
+            runner=post_cleanup_runner,
+            input_reader=_cutover_input_reader,
+            directory_reader=_cutover_directory_reader,
+        )
+
+    def wrong_id_runner(arguments: Sequence[str]) -> bytes:
+        raw = runner(arguments)
+        if list(arguments[:3]) == ["network", "inspect", "dp-backend"]:
+            inspected = json.loads(raw)
+            flaresolverr_id = next(
+                container_id
+                for container_id, endpoint in inspected[0]["Containers"].items()
+                if endpoint["Name"] == "flaresolverr"
+            )
+            endpoint = inspected[0]["Containers"].pop(flaresolverr_id)
+            inspected[0]["Containers"]["e" * 64] = endpoint
+            return json.dumps(inspected).encode()
+        return raw
+
+    with pytest.raises(
+        admission.AdmissionError,
+        match="optional container differs",
+    ):
+        admission.verify_rollback_bundle(
+            inventory,
+            runner=wrong_id_runner,
+            input_reader=_cutover_input_reader,
+            directory_reader=_cutover_directory_reader,
+            post_cleanup=True,
+        )
+
+    def renamed_id_runner(arguments: Sequence[str]) -> bytes:
+        raw = runner(arguments)
+        if list(arguments[:3]) == ["network", "inspect", "dp-backend"]:
+            inspected = json.loads(raw)
+            endpoint = next(
+                endpoint
+                for endpoint in inspected[0]["Containers"].values()
+                if endpoint["Name"] == "flaresolverr"
+            )
+            endpoint["Name"] = "renamed-flaresolverr"
+            return json.dumps(inspected).encode()
+        return raw
+
+    with pytest.raises(
+        admission.AdmissionError,
+        match="optional container differs",
+    ):
+        admission.verify_rollback_bundle(
+            inventory,
+            runner=renamed_id_runner,
+            input_reader=_cutover_input_reader,
+            directory_reader=_cutover_directory_reader,
+            post_cleanup=True,
+        )
+
+
+def test_cutover_inventory_rejects_control_characters_in_rollback_paths() -> None:
+    def add_newline(
+        containers: dict[str, dict[str, Any]],
+        _networks: dict[str, dict[str, Any]],
+    ) -> None:
+        scheduler = next(
+            container
+            for container in containers.values()
+            if container["Config"]["Labels"]["com.docker.compose.service"]
+            == "airflow-scheduler"
+        )
+        scheduler["Config"]["Labels"][
+            "com.docker.compose.project.config_files"
+        ] += "\n/tmp/override.yaml"
+
+    with pytest.raises(admission.AdmissionError, match="config-file list is invalid"):
+        admission.verify_cutover_inventory(
+            runner=_cutover_inventory_runner("scheduler-only-v1", add_newline),
+            input_reader=_cutover_input_reader,
+            directory_reader=_cutover_directory_reader,
+        )
 
 
 def test_post_create_verifies_container_and_digest_selected_image_identity() -> None:

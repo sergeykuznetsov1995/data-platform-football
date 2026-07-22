@@ -551,6 +551,48 @@ def test_paid_approval_and_pointer_roots_are_scheduler_read_only() -> None:
     assert "WHOSCORED_PAID_ALERT_BINDING_PATH=" not in example
 
 
+def test_fbref_geoip_database_is_a_scheduler_only_protected_input() -> None:
+    compose = _compose()
+    common = compose["x-airflow-common"]
+    services = compose["services"]
+    scheduler = services["airflow-scheduler"]
+    expected_target = "/opt/airflow/secure/fbref-geoip/GeoLite2-City.mmdb"
+
+    assert "PYTHONPATH" not in common["environment"]
+    assert "PYTHONPATH" not in scheduler["environment"]
+    assert scheduler["environment"]["FBREF_CAMOUFOX_GEOIP_DATABASE_PATH"] == (
+        expected_target
+    )
+    mount = _volume_for_target(scheduler, expected_target)
+    assert isinstance(mount, dict)
+    assert mount == {
+        "type": "bind",
+        "source": (
+            "${FBREF_CAMOUFOX_GEOIP_DATABASE_HOST_PATH:?set the protected "
+            "pinned GeoLite database}"
+        ),
+        "target": expected_target,
+        "read_only": True,
+        "bind": {"create_host_path": False},
+    }
+    for service_name, service in services.items():
+        if service_name == "airflow-scheduler":
+            continue
+        environment = service.get("environment") or {}
+        volumes = service.get("volumes") or []
+        assert "FBREF_CAMOUFOX_GEOIP_DATABASE_PATH" not in environment
+        assert all(
+            not isinstance(item, dict) or item.get("target") != expected_target
+            for item in volumes
+        )
+
+    example = (ROOT / ".env.example").read_text(encoding="utf-8")
+    assert (
+        "FBREF_CAMOUFOX_GEOIP_DATABASE_HOST_PATH="
+        "/protected/path/fbref-geoip/GeoLite2-City.mmdb"
+    ) in example
+
+
 def test_proxy_control_plane_is_lease_only_and_secrets_are_not_hardcoded() -> None:
     raw = (ROOT / "compose.yaml").read_text(encoding="utf-8")
     compose = _compose()
@@ -871,12 +913,279 @@ def test_targeted_rollout_creates_and_starts_only_one_admitted_service() -> None
         start = f'"${{DOCKER[@]}}" start "${container_id_variable}"'
 
         assert create in rollout
-        assert rollout.index(create) < rollout.index(admission)
-        assert rollout.index(admission) < rollout.index(receipt_id)
-        assert rollout.index(receipt_id) < rollout.index(start)
+        create_index = rollout.index(create)
+        vacancy_index = rollout.index(f"vacancy-{service}.json")
+        capture_index = rollout.index("capture-created-object", create_index)
+        post_create_index = rollout.index("post-create \\\n", create_index)
+        admission_index = rollout.index(admission, post_create_index)
+        receipt_index = rollout.index(receipt_id, admission_index)
+        assert vacancy_index < create_index
+        assert create_index < capture_index
+        assert capture_index < post_create_index
+        assert post_create_index < admission_index
+        assert admission_index < receipt_index
+        assert receipt_index < rollout.index(start, receipt_index)
 
     assert '"${COMPOSE[@]}" create' not in rollout
     assert '"${COMPOSE[@]}" start' not in rollout
+
+
+def test_split_cutover_inventory_gate_precedes_exact_id_lifecycle() -> None:
+    runbook = (ROOT / "docs" / "operations" / "whoscored-production.md").read_text(
+        encoding="utf-8"
+    )
+    rollout = runbook.split("##### One-time split-project cutover", 1)[1].split(
+        "##### Initialize the paid-filter state exactly once", 1
+    )[0]
+    ceremony = rollout.split("Bootstrap only the stopped gateway container", 1)[0]
+    bash = "\n".join(re.findall(r"```bash\n(.*?)```", ceremony, re.DOTALL))
+    commands = "\n".join(
+        line for line in bash.splitlines() if not line.lstrip().startswith("#")
+    )
+
+    verify = "verify-cutover-inventory"
+    inspect_assignment = 'container_json=$("${DOCKER[@]}" container inspect "$id")'
+    running_assignment = "running=$(/usr/bin/jq"
+    running_if = 'if test "$running" = true; then'
+    first_stop = '"${DOCKER[@]}" stop --time 30 "$id"'
+    container_remove = '"${DOCKER[@]}" rm "$id"'
+    network_remove = '"${DOCKER[@]}" network rm "$id"'
+    vacancy = "ALL_CONTAINER_NAMES="
+    gateway_create = '"${GATEWAY_COMPOSE[@]}" up --no-start --no-deps'
+    flock_index = commands.index("flock --exclusive --nonblock")
+    pause_snapshot_index = commands.index("snapshot-cutover-dag-pauses", flock_index)
+
+    assert flock_index < pause_snapshot_index
+    assert "set -o noclobber" in commands
+    assert "shared-scheduler-cutover-in-progress-v1" in commands
+    assert pause_snapshot_index < commands.index(
+        "verify-cutover-quiescence"
+    )
+    assert commands.index("verify-cutover-quiescence") < commands.index(verify)
+    assert "/usr/bin/sleep 60" in commands
+    assert commands.index(verify) < commands.index("verify-rollback-bundle")
+    lifecycle = commands.split(
+        'for record in "${LEGACY_CONTAINER_RECORDS[@]}"; do', 1
+    )[1]
+    assert commands.index(verify) < commands.index(lifecycle)
+    assert commands.index("CUTOVER_DESTRUCTIVE_STARTED=1") < commands.index(lifecycle)
+    assert lifecycle.index(inspect_assignment) < lifecycle.index(running_assignment)
+    assert lifecycle.index(running_assignment) < lifecycle.index(running_if)
+    assert lifecycle.index(running_if) < lifecycle.index(first_stop)
+    assert lifecycle.index('test "$running" = "$expected_running"') < lifecycle.index(
+        first_stop
+    )
+    assert lifecycle.index(first_stop) < lifecycle.index(container_remove)
+    assert lifecycle.index(container_remove) < lifecycle.index(network_remove)
+    assert lifecycle.index(network_remove) < lifecycle.index(vacancy)
+    assert rollout.index(vacancy) < rollout.index(gateway_create)
+    assert '"${DOCKER[@]}" rm "$service"' not in commands
+    assert '"${DOCKER[@]}" network rm "$network"' not in commands
+    assert '"${COMPOSE[@]}" down' not in commands
+    assert "--remove-orphans" not in commands
+    assert 'if test "$("${DOCKER[@]}"' not in commands
+    assert '.Id == $id' in commands
+    assert '.Name == ("/" + $service)' in commands
+    assert '.Config.Labels["com.docker.compose.project"] == "data-platform"' in commands
+    assert '.Config.Labels["com.docker.compose.service"] == $service' in commands
+    assert '(.State.Running | type == "boolean")' in commands
+    assert 'network_json=$("${DOCKER[@]}" network inspect "$id")' in commands
+    assert '.Containers == {}' in commands
+    assert '[.rollback.services[] | @json]' in commands
+    assert ".compose.environment_files[]" in commands
+    assert '"${old_compose[@]}" up --no-start --no-deps --no-build --pull never' in commands
+    assert (
+        "--filter label=com.docker.compose.project=data-platform \\\n"
+        '    --filter "label=com.docker.compose.service=$service"'
+    ) in commands
+    assert "scheduler-only-v1" in ceremony
+    assert "full-legacy-v1" in ceremony
+    assert "rollback_split_cutover" in ceremony
+    assert "restore_cutover_dag_pauses" in ceremony
+    assert "CUTOVER_CAPTURE_PATHS" in rollout
+    assert "trap '' HUP INT TERM" in commands
+    assert "while :; do" in commands
+    assert "/usr/bin/sleep 300 || :" in commands
+    assert "flaresolverr|flaresolverr_whoscored_paid" in commands
+    assert '"${old_compose[@]}"' in commands
+
+
+def test_split_cutover_failure_controller_is_root_only_and_capture_complete() -> None:
+    runbook = (ROOT / "docs" / "operations" / "whoscored-production.md").read_text(
+        encoding="utf-8"
+    )
+    rollout = runbook.split("##### One-time split-project cutover", 1)[1].split(
+        "##### Install the bounded daily issuer", 1
+    )[0]
+    bash = "\n".join(re.findall(r"```bash\n(.*?)```", rollout, re.DOTALL))
+    commands = "\n".join(
+        line for line in bash.splitlines() if not line.lstrip().startswith("#")
+    )
+
+    flock_index = commands.index("flock --exclusive --nonblock")
+    marker_index = commands.index("create_cutover_marker", flock_index)
+    err_trap_index = commands.index("trap 'cutover_on_failure", flock_index)
+    exit_trap_index = commands.index("trap 'cutover_on_exit", flock_index)
+    assert flock_index < err_trap_index < marker_index
+    assert flock_index < exit_trap_index < marker_index
+    assert commands.index("set +E", flock_index) < err_trap_index
+    assert "BASH_SUBSHELL != 0" in commands
+    assert "CUTOVER_FAILURE_ACTIVE" in commands
+    assert "CUTOVER_DAGS_MUTATED=1" in commands
+    assert "CUTOVER_DESTRUCTIVE_STARTED=1" in commands
+    assert "trap - ERR EXIT" in commands
+    assert "shopt -s inherit_errexit" in commands
+
+    rollback = commands.split("rollback_split_cutover() {", 1)[1].split(
+        "CUTOVER_DESTRUCTIVE_STARTED=1", 1
+    )[0]
+    assert "flock --unlock" not in rollback
+    assert "WHOSCORED_SHARED_SCHEDULER_CUTOVER_MARKER" not in rollback
+    assert ".retained_networks == .[1].retained_networks" in rollback
+    assert "--post-cleanup" in rollback
+    rollback_start = rollback.index('"${DOCKER[@]}" start "$restored_id"')
+    rollback_wait = rollback.index(
+        'wait_cutover_container_healthy \\\n        "$restored_id" "$service" data-platform',
+        rollback_start,
+    )
+    rollback_inventory = rollback.index("verify-cutover-inventory", rollback_wait)
+    rollback_pause_restore = rollback.index(
+        'restore_cutover_dag_pauses "$restored_id" rollback', rollback_inventory
+    )
+    assert rollback_start < rollback_wait < rollback_inventory
+    assert rollback_inventory < rollback_pause_restore
+
+    create_positions = [
+        match.start()
+        for match in re.finditer(
+            r'if "\$\{(?:GATEWAY_)?COMPOSE\[@\]\}" up --no-start', commands
+        )
+    ]
+    assert len(create_positions) == 4
+    for index, create_index in enumerate(create_positions):
+        next_create = (
+            create_positions[index + 1]
+            if index + 1 < len(create_positions)
+            else len(commands)
+        )
+        wave = commands[create_index:next_create]
+        assert "capture-created-object" in wave
+        assert "capture_command+=(--allow-partial)" in wave
+        assert "CUTOVER_CAPTURE_PATHS+=(" in wave
+        assert 'cutover_on_failure "$create_rc"' in wave
+        assert wave.index("capture-created-object") < wave.index(
+            "CUTOVER_CAPTURE_PATHS+=("
+        )
+        assert wave.index("CUTOVER_CAPTURE_PATHS+=(") < wave.index(
+            'cutover_on_failure "$create_rc"'
+        )
+
+    finalize = commands.split("cutover_finalize() {", 1)[1].split(
+        "cutover_on_failure() {", 1
+    )[0]
+    assert finalize.index("flock --unlock") < finalize.index(
+        "exec {WHOSCORED_CUTOVER_LOCK_FD}>&-"
+    )
+    assert finalize.index("exec {WHOSCORED_CUTOVER_LOCK_FD}>&-") < finalize.index(
+        '/usr/bin/rm -- "$WHOSCORED_SHARED_SCHEDULER_CUTOVER_MARKER"'
+    )
+    success_tail = commands.split(
+        'restore_cutover_dag_pauses "$SCHEDULER_CONTAINER_ID" success', 1
+    )[1]
+    assert success_tail.index("cutover_finalize success") < success_tail.index(
+        "set -Eeuo pipefail"
+    )
+    assert "shopt -s inherit_errexit" in success_tail
+
+
+def test_split_cutover_requires_all_five_running_admission_before_finalize() -> None:
+    runbook = (ROOT / "docs" / "operations" / "whoscored-production.md").read_text(
+        encoding="utf-8"
+    )
+    rollout = runbook.split("##### One-time split-project cutover", 1)[1].split(
+        "##### Install the bounded daily issuer", 1
+    )[0]
+    bash = "\n".join(re.findall(r"```bash\n(.*?)```", rollout, re.DOTALL))
+    commands = "\n".join(
+        line for line in bash.splitlines() if not line.lstrip().startswith("#")
+    )
+
+    wait_helper = commands.split("wait_cutover_container_healthy() {", 1)[1].split(
+        "restore_cutover_dag_pauses() {", 1
+    )[0]
+    for required in (
+        '.Id == $id',
+        '.Name == ("/" + $service)',
+        '.Config.Labels["com.docker.compose.project"] == $project',
+        '.Config.Labels["com.docker.compose.service"] == $service',
+        '.State.Status == "running"',
+        ".State.Running == true",
+        ".State.Paused == false",
+        ".State.Restarting == false",
+        ".State.Dead == false",
+        ".State.OOMKilled == false",
+        '.State.Health.Status == "healthy"',
+        "if (( attempt == 60 )); then",
+        "return 1",
+    ):
+        assert required in wait_helper
+
+    err_trap = commands.index("trap 'cutover_on_failure")
+    scheduler_wait = commands.index(
+        'wait_cutover_container_healthy \\\n  "$SCHEDULER_CONTAINER_ID" airflow-scheduler data-platform'
+    )
+    common_flaresolverr_wait = commands.index(
+        'wait_cutover_container_healthy \\\n  "$FLARESOLVERR_CONTAINER_ID" flaresolverr data-platform'
+    )
+    paid_loop = commands.index(
+        "for service in whoscored_proxy_filter flaresolverr_whoscored_paid; do"
+    )
+    paid_loop_wait = commands.index(
+        'wait_cutover_container_healthy "$container_id" "$service" whoscored-gw',
+        paid_loop,
+    )
+    gateway_wait = commands.index(
+        'wait_cutover_container_healthy \\\n  "$PAID_GATEWAY_CONTAINER_ID" whoscored_paid_gateway whoscored-gw'
+    )
+    verify_running = commands.index("verify-running", gateway_wait)
+    restore = commands.index(
+        'restore_cutover_dag_pauses "$SCHEDULER_CONTAINER_ID" success',
+        verify_running,
+    )
+    finalize = commands.index("cutover_finalize success", restore)
+
+    assert err_trap < scheduler_wait < common_flaresolverr_wait
+    assert common_flaresolverr_wait < paid_loop < paid_loop_wait < gateway_wait
+    assert gateway_wait < verify_running < restore < finalize
+
+    running_admission = commands[verify_running:restore]
+    assert 'test ! -e "$WHOSCORED_RUNNING_ADMISSION_RECEIPT"' in commands
+    assert (
+        '--deployment-admission-receipt \\\n  "$WHOSCORED_ADMISSION_DIR/rendered-receipt.json"'
+        in running_admission
+    )
+    assert running_admission.count("--service ") == 5
+    for service in (
+        "airflow-scheduler",
+        "flaresolverr",
+        "flaresolverr_whoscored_paid",
+        "whoscored_paid_gateway",
+        "whoscored_proxy_filter",
+    ):
+        assert f"--service {service}" in running_admission
+    assert '> "$WHOSCORED_RUNNING_ADMISSION_RECEIPT"' in running_admission
+    assert '.status == "admitted-running-v1"' in running_admission
+
+
+def test_gateway_header_forbids_direct_production_bootstrap() -> None:
+    source = (ROOT / "deploy" / "whoscored" / "gateway.compose.yaml").read_text(
+        encoding="utf-8"
+    )
+    header = source.split("name: whoscored-gw", 1)[0]
+
+    assert "прямой `up -d` запрещён" in header
+    assert "docs/operations/whoscored-production.md" in header
+    assert "docker compose -p whoscored-gw" not in header
 
 
 def test_transfermarkt_backfill_proxy_contract_is_isolated_and_fail_closed() -> None:
