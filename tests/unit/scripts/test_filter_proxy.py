@@ -7237,16 +7237,23 @@ def test_whoscored_only_requires_exact_decimal_byte_caps_before_state(
         asyncio.run(mod.main())
 
 
-def test_whoscored_only_rejects_cross_source_budget_before_state(mod, monkeypatch):
+@pytest.mark.parametrize(
+    ("backfill_budget", "artifact"),
+    [(1, None), (0, "/cross-source-policy.json")],
+)
+def test_whoscored_only_rejects_cross_source_budget_before_state(
+    mod, monkeypatch, backfill_budget, artifact
+):
     args = SimpleNamespace(
         source_mode="whoscored-only",
         allow_legacy_noauth=False,
         daily_budget_bytes=300_000_000,
         max_lease_bytes=2_000_000,
         transfermarkt_dagrun_budget_bytes=0,
+        transfermarkt_backfill_dagrun_budget_bytes=backfill_budget,
         sofascore_canary_hard_cap_bytes=0,
         sofascore_discovery_dagrun_budget_bytes=0,
-        sofascore_budget_artifact="/cross-source-policy.json",
+        sofascore_budget_artifact=artifact,
     )
     monkeypatch.setattr(mod.argparse.ArgumentParser, "parse_args", lambda self: args)
     monkeypatch.setattr(
