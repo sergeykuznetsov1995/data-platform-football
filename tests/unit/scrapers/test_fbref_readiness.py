@@ -67,6 +67,31 @@ def test_camoufox_runtime_requires_the_reviewed_exact_stack(tmp_path):
     }
 
 
+def test_camoufox_runtime_falls_back_to_scraper_runner_venv(tmp_path, monkeypatch):
+    import importlib.metadata
+
+    from scrapers.fbref import readiness
+
+    def _missing(_name):
+        raise importlib.metadata.PackageNotFoundError("camoufox")
+
+    monkeypatch.setattr(importlib.metadata, "version", _missing)
+    venv_python = tmp_path / "venv-python"
+    venv_python.write_text(
+        "#!/bin/sh\nprintf '0.4.11\\n1.59.0\\n0.15.0\\n'\n",
+        encoding="utf-8",
+    )
+    venv_python.chmod(0o755)
+    monkeypatch.setattr(readiness, "_SCRAPER_RUNNER_PYTHON", venv_python)
+
+    result = validate_camoufox_runtime(install_dir=_camoufox_install(tmp_path))
+
+    assert result["status"] == "passed"
+    assert result["camoufox_package"] == "0.4.11"
+    assert result["playwright"] == "1.59.0"
+    assert result["curl_cffi"] == "0.15.0"
+
+
 @pytest.mark.parametrize(
     ("package", "playwright", "curl_cffi", "browser", "release"),
     [

@@ -893,6 +893,9 @@ def test_transfermarkt_backfill_proxy_contract_is_isolated_and_fail_closed() -> 
     assert common["TM_BACKFILL_PROXY_CONTROL_TOKEN"] == (
         "${TM_BACKFILL_PROXY_CONTROL_TOKEN:-}"
     )
+    assert common["TRANSFERMARKT_RAW_STORE_URI"] == (
+        "s3://${ICEBERG_WAREHOUSE}/raw/transfermarkt"
+    )
     assert proxy["environment"]["TM_BACKFILL_PROXY_CONTROL_TOKEN"] == (
         "${TM_BACKFILL_PROXY_CONTROL_TOKEN:-}"
     )
