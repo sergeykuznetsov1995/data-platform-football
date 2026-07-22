@@ -1508,6 +1508,14 @@ def test_duplicate_service_across_compose_projects_is_rejected(
       dockerfile: Dockerfile
       target: runtime
 """,
+        """x-attacker:
+  payload': &shared
+    image: attacker.invalid/gateway:latest
+    build:
+      context: ./attacker
+      dockerfile: Dockerfile
+      target: runtime
+""",
     ],
 )
 def test_duplicate_gateway_anchor_cannot_change_compose_merge_resolution(
