@@ -47,7 +47,7 @@ from dags.utils.transfermarkt_scope_state import (
     stable_hash,
 )
 from scrapers.transfermarkt.models import (
-    CAREER_ENTITY_TIMEOUT_SECONDS,
+    CAREER_ENTITY_TIMEOUT_SECONDS,  # noqa: F401 - public compatibility export
     DEFAULT_ENTITY_TIMEOUT_SECONDS,
     ENTITY_TIMEOUT_SECONDS,
     MAX_ROSTER_WINDOW,
@@ -68,6 +68,7 @@ from scrapers.transfermarkt.registry import (
     deterministic_scope_id,
     resolve_competition,
 )
+from scrapers.transfermarkt.raw_store import RawResponseStore
 
 
 MIB = 1024 * 1024
@@ -158,6 +159,7 @@ class ScopeCycleError(RuntimeError):
 @dataclass(frozen=True)
 class ScopeIdentity:
     parent_cycle_id: str
+    resume_cycle_id: str
     child_cycle_id: str
     competition_id: str
     edition_id: str
@@ -282,6 +284,10 @@ def _scope_identity(args: argparse.Namespace) -> ScopeIdentity:
     parent_cycle_id = _required(
         _coalesce_exact(payload, 'parent_cycle_id', args.parent_cycle_id),
         'parent_cycle_id',
+    )
+    resume_cycle_id = _required(
+        payload.get('resume_cycle_id') or parent_cycle_id,
+        'resume_cycle_id',
     )
     child_cycle_id = _required(
         _coalesce_exact(payload, 'child_cycle_id', args.child_cycle_id),
@@ -420,6 +426,7 @@ def _scope_identity(args: argparse.Namespace) -> ScopeIdentity:
     competition_payload['registry_snapshot_id'] = registry_snapshot_id
     return ScopeIdentity(
         parent_cycle_id=parent_cycle_id,
+        resume_cycle_id=resume_cycle_id,
         child_cycle_id=child_cycle_id,
         competition_id=competition_id,
         edition_id=edition_id,
@@ -577,12 +584,15 @@ def validate_standing_policy_for_scope_cycle(
     cycle_budget_bytes: int,
     request_limit: int,
     retry_limit: int,
+    expected_dag_id: str = STANDING_POLICY_DAG_ID,
 ) -> None:
     """Check one standing policy against this wrapper's exact pinned limits."""
 
-    if policy.dag_id != STANDING_POLICY_DAG_ID:
+    expected_dag = _required(expected_dag_id, 'expected standing-policy dag_id')
+    if policy.dag_id != expected_dag:
         raise ScopeCycleError(
-            f'standing policy dag_id mismatch: {policy.dag_id!r}'
+            'standing policy dag_id mismatch: '
+            f'expected={expected_dag!r}, actual={policy.dag_id!r}'
         )
     policy.assert_not_expired(datetime.now(timezone.utc))
     paid = policy.paid_proxy
@@ -640,6 +650,10 @@ def _enforce_standing_policy(
         cycle_budget_bytes=int(args.cycle_budget_bytes),
         request_limit=int(args.request_limit),
         retry_limit=int(args.retry_limit),
+        expected_dag_id=(
+            os.environ.get('TM_DAG_ID', '').strip()
+            or STANDING_POLICY_DAG_ID
+        ),
     )
     grant = PolicyGrant(
         packet_id=f'standing-policy-v{policy.policy_version}',
@@ -1306,6 +1320,12 @@ def _build_scope_manifest(
         )
     dq_evidence = {
         'status': 'passed',
+        # This value is part of ScopeManifest.digest.  The top-level display
+        # projection below must agree with it, and the backfill finalizer reads
+        # this hashed field before accepting any Native-Bronze capture.
+        'silver_trigger_allowed': (
+            identity.resume_cycle_id == identity.parent_cycle_id
+        ),
         'registry_participant_count': identity.edition_participant_count,
         'edition_current': bool(identity.edition_current),
         'scope_capture': dict(scope_capture),
@@ -1349,7 +1369,12 @@ def _build_scope_manifest(
             'expected_entities': list(EXPECTED_ENTITIES),
             'missing_entities': [],
             'participant_contract': dict(participant_dq),
-            'silver_trigger_allowed': True,
+            # A campaign capture is Bronze-only even when it is complete.
+            # Its separate batch finalizer owns lineage/completeness DQ and
+            # never authorizes a downstream transform.
+            'silver_trigger_allowed': (
+                dq_evidence['silver_trigger_allowed']
+            ),
         },
         'candidate_slot': args.candidate_slot,
         'write_mode': args.write_mode,
@@ -1869,8 +1894,16 @@ def _checkpoint_identity(
     args: argparse.Namespace,
     entity_limits: Mapping[str, Mapping[str, int]],
 ) -> str:
+    identity_fields = asdict(identity)
+    if identity.resume_cycle_id != identity.parent_cycle_id:
+        # Historical campaigns deliberately span Airflow DagRuns.  Their
+        # child/result identity is campaign-stable while the parent ledger is
+        # batch-local, so neither batch field may invalidate paid-for entity
+        # checkpoints.  All source/schema/budget fields remain pinned below.
+        identity_fields.pop('parent_cycle_id', None)
+        identity_fields.pop('parent_ledger_path', None)
     return stable_hash({
-        **asdict(identity),
+        **identity_fields,
         'reader_revision': int(args.reader_revision),
         'candidate_slot': args.candidate_slot,
         'write_mode': args.write_mode,
@@ -1928,6 +1961,86 @@ def _resume_runs(
         _validate_run_contract(run, identity, args)
         runs.append(run)
     return runs
+
+
+def _verify_adopted_raw_attempts(
+    result: Mapping[str, Any],
+    identity: ScopeIdentity,
+) -> None:
+    """Prove that paid traffic in an orphaned final result is raw-backed."""
+
+    if os.environ.get('TM_DAG_ID', '').strip() != 'dag_backfill_transfermarkt':
+        return
+    values = result.get('raw_attempts') or []
+    if not isinstance(values, list):
+        raise ScopeCycleError('adopted entity raw_attempts are invalid')
+    network_fetches = int(result.get('network_fetches', -1))
+    if network_fetches < 0 or (network_fetches > 0 and not values):
+        raise ScopeCycleError('adopted entity lacks raw attempt evidence')
+    if not values:
+        return
+    store = RawResponseStore.from_env()
+    assert store is not None
+    for value in values:
+        if not isinstance(value, Mapping):
+            raise ScopeCycleError('adopted raw attempt entry is invalid')
+        envelope_id = str(value.get('envelope_id') or '').strip()
+        try:
+            envelope = store.verify_attempt_envelope(envelope_id)
+        except Exception as exc:  # storage adapter boundary
+            raise ScopeCycleError('adopted raw attempt cannot be verified') from exc
+        if (
+            envelope.scope_id != identity.scope_id
+            or envelope.cycle_id != identity.child_cycle_id
+        ):
+            raise ScopeCycleError('adopted raw attempt identity mismatch')
+
+
+def _adopt_uncheckpointed_run(
+    identity: ScopeIdentity,
+    args: argparse.Namespace,
+    *,
+    parser_entity: str,
+    final_path: Path,
+    intent_path: Path,
+    checkpoint_identity: str,
+    operation_hash: str,
+) -> tuple[EntityRun, str, str]:
+    """Adopt the fsynced/renamed result left by a crash before checkpoint CAS."""
+
+    if not intent_path.is_file():
+        raise ScopeCycleError(
+            f'uncheckpointed immutable entity result exists: {final_path}'
+        )
+    intent = _load_json_file(intent_path)
+    if (
+        int(intent.get('version', -1)) != 1
+        or intent.get('status') != 'validated'
+        or intent.get('parser_entity') != parser_entity
+        or intent.get('identity_hash') != checkpoint_identity
+        or intent.get('operation_hash') != operation_hash
+        or intent.get('result_path') != str(final_path)
+    ):
+        raise ScopeCycleError('uncheckpointed entity intent identity mismatch')
+    digest = _sha256_file(final_path)
+    if digest != intent.get('result_sha256'):
+        raise ScopeCycleError('uncheckpointed entity result hash mismatch')
+    result = _load_json_file(final_path)
+    run = EntityRun(
+        parser_entity=parser_entity,
+        result_path=str(final_path),
+        result_sha256=digest,
+        result=result,
+        wall_clock_duration_ms=int(intent.get('wall_clock_duration_ms', -1)),
+        resumed=True,
+    )
+    if run.wall_clock_duration_ms < 0:
+        raise ScopeCycleError('uncheckpointed entity duration is invalid')
+    _validate_run_contract(run, identity, args)
+    _verify_adopted_raw_attempts(result, identity)
+    attempt_id = _required(intent.get('attempt_id'), 'attempt_id')
+    command_sha256 = _required(intent.get('command_sha256'), 'command_sha256')
+    return run, attempt_id, command_sha256
 
 
 def _record_standing_policy_authorization(
@@ -2029,6 +2142,43 @@ def run_scope_cycle(
             _record_standing_policy_authorization(identity, manifest, grant)
         return manifest
 
+    campaign_id = os.environ.get('TM_BACKFILL_CAMPAIGN_ID', '').strip()
+    batch_id = os.environ.get('TM_BACKFILL_BATCH_ID', '').strip()
+    generation_text = os.environ.get(
+        'TM_BACKFILL_CLAIM_GENERATION', '',
+    ).strip()
+    sequence_text = os.environ.get(
+        'TM_BACKFILL_ATTEMPT_SEQUENCE', '',
+    ).strip()
+    if campaign_id or batch_id or generation_text or sequence_text:
+        if not (
+            campaign_id
+            and batch_id
+            and generation_text.isdigit()
+            and int(generation_text) > 0
+            and sequence_text.isdigit()
+            and int(sequence_text) > 0
+        ):
+            raise ScopeCycleError('backfill attempt context is incomplete')
+        from utils.transfermarkt_backfill_attempts import (
+            has_matching_scope_attempt_result,
+        )
+
+        if has_matching_scope_attempt_result(
+            result_base_dir=identity.result_base_dir,
+            entity_dir=identity.entity_dir,
+            campaign_id=campaign_id,
+            child_cycle_id=identity.child_cycle_id,
+            scope_id=identity.scope_id,
+            batch_id=batch_id,
+            claim_generation=int(generation_text),
+            attempt_sequence=int(sequence_text),
+        ):
+            raise ScopeCycleError(
+                'exact backfill attempt already has a durable result; '
+                'finalize it instead of replaying source I/O'
+            )
+
     packets: Mapping[str, Any] = {}
     if len(runs) < len(ENTITY_ORDER):
         committed_preflight = _parent_committed_totals(
@@ -2108,18 +2258,57 @@ def run_scope_cycle(
                 request_limit=int(args.parent_request_limit),
                 retry_limit=int(args.parent_retry_limit),
             )
+
+    def _checkpoint_entity_run(
+        run: EntityRun,
+        *,
+        attempt_id: str,
+        command_sha256: str,
+        attempt_totals: Mapping[str, int],
+    ) -> None:
+        nonlocal current_requests, current_retries
+        runs.append(run)
+        run_metrics = _traffic_metrics(
+            run,
+            hard_cap=int(args.cycle_budget_bytes),
+        )
+        current_requests += run_metrics['requests']
+        current_retries += run_metrics['retries']
+        if current_requests > int(args.request_limit):
+            raise ScopeCycleError('scope request limit exceeded')
+        if current_retries > int(args.retry_limit):
+            raise ScopeCycleError('scope retry limit exceeded')
+        if (
+            int(parent_totals['requests']) + current_requests
+            > int(args.parent_request_limit)
+        ):
+            raise ScopeCycleError('parent request limit exceeded')
+        if (
+            int(parent_totals['retries']) + current_retries
+            > int(args.parent_retry_limit)
+        ):
+            raise ScopeCycleError('parent retry limit exceeded')
+        if attempt_totals['requests'] > int(args.parent_request_limit):
+            raise ScopeCycleError('parent attempt request limit exceeded')
+        if attempt_totals['retries'] > int(args.parent_retry_limit):
+            raise ScopeCycleError('parent attempt retry limit exceeded')
+        entity_checkpoint[run.parser_entity] = {
+            'status': 'success',
+            'result_path': run.result_path,
+            'result_sha256': run.result_sha256,
+            'wall_clock_duration_ms': int(run.wall_clock_duration_ms),
+            'command_sha256': command_sha256,
+            'attempt_id': attempt_id,
+        }
+        _atomic_json(checkpoint_path, {
+            'version': 1,
+            'identity_hash': checkpoint_identity,
+            'entities': entity_checkpoint,
+            'status': 'in_progress',
+        }, immutable=False)
+
     for parser_entity in ENTITY_ORDER[len(runs):]:
         final_path = Path(identity.entity_dir) / f'{parser_entity}.json'
-        if final_path.exists():
-            raise ScopeCycleError(
-                f'uncheckpointed immutable entity result exists: {final_path}'
-            )
-        final_path.parent.mkdir(parents=True, exist_ok=True)
-        descriptor, temporary = tempfile.mkstemp(
-            prefix=f'.{parser_entity}.', suffix='.tmp', dir=final_path.parent,
-        )
-        os.close(descriptor)
-        temporary_path = Path(temporary)
         guard_totals = _attempt_guard_totals(
             identity,
             request_limit=int(args.parent_request_limit),
@@ -2154,6 +2343,52 @@ def run_scope_cycle(
             remaining_requests,
             scope_remaining_requests,
         )
+        operation_hash = stable_hash({
+            'identity_hash': checkpoint_identity,
+            'parser_entity': parser_entity,
+            'process_limits': process_limits,
+            'child_retry_budget': child_retry_budget,
+        })
+        intent_path = Path(identity.entity_dir) / (
+            f'.{parser_entity}-attempt-intent.json'
+        )
+        if final_path.exists():
+            adopted, adopted_attempt_id, adopted_command_sha256 = (
+                _adopt_uncheckpointed_run(
+                    identity,
+                    args,
+                    parser_entity=parser_entity,
+                    final_path=final_path,
+                    intent_path=intent_path,
+                    checkpoint_identity=checkpoint_identity,
+                    operation_hash=operation_hash,
+                )
+            )
+            adopted_metrics = _traffic_metrics(
+                adopted,
+                hard_cap=int(args.cycle_budget_bytes),
+            )
+            adopted_totals = _record_attempt_guard(
+                identity,
+                attempt_id=adopted_attempt_id,
+                requests=adopted_metrics['requests'],
+                retries=adopted_metrics['retries'],
+                request_limit=int(args.parent_request_limit),
+                retry_limit=int(args.parent_retry_limit),
+            )
+            _checkpoint_entity_run(
+                adopted,
+                attempt_id=adopted_attempt_id,
+                command_sha256=adopted_command_sha256,
+                attempt_totals=adopted_totals,
+            )
+            continue
+        final_path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary = tempfile.mkstemp(
+            prefix=f'.{parser_entity}.', suffix='.tmp', dir=final_path.parent,
+        )
+        os.close(descriptor)
+        temporary_path = Path(temporary)
         command = _runner_argv(
             identity, args, parser_entity, temporary, process_limits,
             child_retry_budget,
@@ -2170,6 +2405,32 @@ def run_scope_cycle(
             # traffic would trip the attempt-guard evidence-drift check.
             attempt_seed['attempt_nonce'] = uuid.uuid4().hex
         attempt_id = stable_hash(attempt_seed)
+        failure_path: Path | None = None
+        if campaign_id:
+            generation = int(generation_text)
+            sequence = int(sequence_text)
+            failure_path = Path(identity.entity_dir) / (
+                f'{parser_entity}-failed-{generation}-{sequence}.json'
+            )
+            source_intent_path = Path(identity.entity_dir) / (
+                f'.source-attempt-{generation}-{sequence}-'
+                f'{parser_entity}.json'
+            )
+            _atomic_json(source_intent_path, {
+                'contract_version': 1,
+                'status': 'entered',
+                'campaign_id': campaign_id,
+                'batch_id': batch_id,
+                'claim_generation': generation,
+                'attempt_sequence': sequence,
+                'child_cycle_id': identity.child_cycle_id,
+                'scope_id': identity.scope_id,
+                'parser_entity': parser_entity,
+                'failure_path': str(failure_path),
+                'checkpoint_identity': checkpoint_identity,
+                'operation_hash': operation_hash,
+                'command_sha256': stable_hash(command),
+            }, immutable=True)
         started = monotonic_ns()
         try:
             completed = subprocess_runner(
@@ -2197,6 +2458,7 @@ def run_scope_cycle(
             ) from exc
         duration_ms = max(0, (monotonic_ns() - started) // 1_000_000)
         if int(completed.returncode) != 0:
+            failed_result: Mapping[str, Any] | None = None
             try:
                 failed_result = _load_json_file(temporary_path)
                 failed_requests = int(
@@ -2208,6 +2470,18 @@ def run_scope_cycle(
             except (ScopeCycleError, TypeError, ValueError):
                 failed_requests = process_limits['requests']
                 failed_retries = child_retry_budget
+            if failed_result is not None:
+                # The raw-attempt IDs in this result may be the only durable
+                # explanation of a source failure. Preserve them next to the
+                # campaign-stable checkpoint before raising to the CLI layer.
+                target_failure_path = failure_path or (
+                    Path(identity.entity_dir) / f'{parser_entity}-failed.json'
+                )
+                _atomic_json(
+                    target_failure_path,
+                    failed_result,
+                    immutable=failure_path is not None,
+                )
             _record_attempt_guard(
                 identity,
                 attempt_id=attempt_id,
@@ -2268,46 +2542,27 @@ def run_scope_cycle(
         _validate_run_contract(run, identity, args)
         with temporary_path.open('rb') as handle:
             os.fsync(handle.fileno())
-        os.replace(temporary_path, final_path)
-        runs.append(run)
-        run_metrics = _traffic_metrics(
-            run,
-            hard_cap=int(args.cycle_budget_bytes),
-        )
-        current_requests += run_metrics['requests']
-        current_retries += run_metrics['retries']
-        if current_requests > int(args.request_limit):
-            raise ScopeCycleError('scope request limit exceeded')
-        if current_retries > int(args.retry_limit):
-            raise ScopeCycleError('scope retry limit exceeded')
-        if (
-            int(parent_totals['requests']) + current_requests
-            > int(args.parent_request_limit)
-        ):
-            raise ScopeCycleError('parent request limit exceeded')
-        if (
-            int(parent_totals['retries']) + current_retries
-            > int(args.parent_retry_limit)
-        ):
-            raise ScopeCycleError('parent retry limit exceeded')
-        if attempt_totals['requests'] > int(args.parent_request_limit):
-            raise ScopeCycleError('parent attempt request limit exceeded')
-        if attempt_totals['retries'] > int(args.parent_retry_limit):
-            raise ScopeCycleError('parent attempt retry limit exceeded')
-        entity_checkpoint[parser_entity] = {
-            'status': 'success',
+        command_sha256 = stable_hash(command)
+        _verify_adopted_raw_attempts(result, identity)
+        _atomic_json(intent_path, {
+            'version': 1,
+            'status': 'validated',
+            'parser_entity': parser_entity,
+            'identity_hash': checkpoint_identity,
+            'operation_hash': operation_hash,
             'result_path': str(final_path),
             'result_sha256': digest,
             'wall_clock_duration_ms': int(duration_ms),
-            'command_sha256': stable_hash(command),
+            'command_sha256': command_sha256,
             'attempt_id': attempt_id,
-        }
-        _atomic_json(checkpoint_path, {
-            'version': 1,
-            'identity_hash': checkpoint_identity,
-            'entities': entity_checkpoint,
-            'status': 'in_progress',
         }, immutable=False)
+        os.replace(temporary_path, final_path)
+        _checkpoint_entity_run(
+            run,
+            attempt_id=attempt_id,
+            command_sha256=command_sha256,
+            attempt_totals=attempt_totals,
+        )
         try:
             temporary_path.unlink()
         except FileNotFoundError:
@@ -2469,12 +2724,33 @@ def main(argv: Sequence[str] | None = None) -> int:
         _validate_args(args)
         operation_argv = approved_operation_argv(raw_argv)
         manifest = run_scope_cycle(args, operation_argv=operation_argv)
-        print(_stable_json({
+        success = {
             'status': 'complete',
+            'parent_cycle_id': manifest['parent_cycle_id'],
+            'child_cycle_id': manifest['child_cycle_id'],
             'scope_id': manifest['scope_id'],
             'manifest_digest': manifest['manifest_digest'],
             'scope_manifest': _scope_identity(args).scope_manifest_path,
-        }))
+            'backfill_campaign_id': os.environ.get(
+                'TM_BACKFILL_CAMPAIGN_ID', '',
+            ).strip() or None,
+            'backfill_batch_id': os.environ.get(
+                'TM_BACKFILL_BATCH_ID', '',
+            ).strip() or None,
+            'backfill_claim_generation': os.environ.get(
+                'TM_BACKFILL_CLAIM_GENERATION', '',
+            ).strip() or None,
+            'backfill_attempt_sequence': os.environ.get(
+                'TM_BACKFILL_ATTEMPT_SEQUENCE', '',
+            ).strip() or None,
+        }
+        identity = _scope_identity(args)
+        _atomic_json(
+            Path(identity.result_base_dir) / 'scope-status.json',
+            success,
+            immutable=False,
+        )
+        print(_stable_json(success))
         return 0
     except Exception as exc:  # noqa: BLE001 - CLI must fail closed
         failure = {
@@ -2489,6 +2765,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                 'parent_cycle_id': identity.parent_cycle_id,
                 'child_cycle_id': identity.child_cycle_id,
                 'scope_id': identity.scope_id,
+                'backfill_campaign_id': os.environ.get(
+                    'TM_BACKFILL_CAMPAIGN_ID', '',
+                ).strip() or None,
+                'backfill_batch_id': os.environ.get(
+                    'TM_BACKFILL_BATCH_ID', '',
+                ).strip() or None,
+                'backfill_claim_generation': os.environ.get(
+                    'TM_BACKFILL_CLAIM_GENERATION', '',
+                ).strip() or None,
+                'backfill_attempt_sequence': os.environ.get(
+                    'TM_BACKFILL_ATTEMPT_SEQUENCE', '',
+                ).strip() or None,
             })
             _atomic_json(
                 Path(identity.result_base_dir) / 'scope-status.json',
