@@ -3198,10 +3198,11 @@ def record_readback_sql(record: Any) -> str:
             f"WHERE campaign_id = '{record.campaign_id}'"
         )
     if isinstance(record, BackfillScopeState):
+        scope_id = record.target.scope_id.replace("'", "''")
         return (
             f"SELECT record_sha256, revision FROM {SCOPE_TABLE} "
             f"WHERE campaign_id = '{record.campaign_id}' "
-            f"AND scope_id = '{record.target.scope_id.replace("'", "''")}'"
+            f"AND scope_id = '{scope_id}'"
         )
     if isinstance(record, BackfillAttempt):
         return (
