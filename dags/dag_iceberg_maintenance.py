@@ -4,6 +4,8 @@ Iceberg Maintenance DAG
 
 Weekly bounded small-file compaction plus `expire_snapshots` and
 `remove_orphan_files` over every table in `iceberg.{bronze,silver,gold}`.
+The high-churn `iceberg.ops.sofascore_capture_manifest` runs as an independent
+full-compaction + snapshot-expiry task and never performs orphan cleanup.
 
 Why
 ---
@@ -59,10 +61,20 @@ def _maintain(**_ctx) -> Dict[str, Any]:
     return result
 
 
+def _maintain_sofascore_capture_manifest(**_ctx) -> Dict[str, Any]:
+    # The ops manifest is outside the generic bronze/silver/gold sweep and has
+    # a dedicated no-orphan lifecycle contract while SofaScore writers run.
+    from utils.maintenance_tasks import maintain_sofascore_capture_manifest
+
+    return maintain_sofascore_capture_manifest()
+
+
 with DAG(
     dag_id="dag_iceberg_maintenance",
     default_args=SILVER_ARGS,
-    description="Weekly expire_snapshots + remove_orphan_files for all Iceberg tables",
+    description=(
+        "Weekly generic Iceberg cleanup plus dedicated SofaScore manifest lifecycle"
+    ),
     schedule="0 5 * * 0",  # Sunday 05:00 UTC — outside serve_predictions window
     start_date=datetime(2026, 5, 1),
     catchup=False,
@@ -73,4 +85,8 @@ with DAG(
     PythonOperator(
         task_id="maintain_iceberg_tables",
         python_callable=_maintain,
+    )
+    PythonOperator(
+        task_id="maintain_sofascore_capture_manifest",
+        python_callable=_maintain_sofascore_capture_manifest,
     )

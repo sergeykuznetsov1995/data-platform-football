@@ -26,6 +26,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
 from scrapers.transfermarkt.client import (
     TRANSFERMARKT_REQUEST_PERMIT_MAX_WAIT_SECONDS,
@@ -1795,6 +1796,8 @@ def test_sofascore_has_a_dedicated_production_metered_proxy_service():
     # The gateway lives in its OWN compose project (#951, инцидент 2026-07-17):
     # a foreign `docker compose up` on the shared project must not recreate it.
     gateway = _SOFASCORE_GATEWAY_COMPOSE_PATH.read_text()
+    document = yaml.safe_load(gateway)
+    model = document["services"]["sofascore_proxy_filter"]
     service = gateway.split("  sofascore_proxy_filter:\n", 1)[1].split(
         "\nnetworks:\n", 1
     )[0]
@@ -1808,18 +1811,125 @@ def test_sofascore_has_a_dedicated_production_metered_proxy_service():
     assert '\n      - --sofascore-canary-hard-cap-bytes\n      - "0"' in service
     # One active SofaScore lease at a time.
     assert '\n      - --max-active-leases\n      - "1"' in service
-    # Ledger/WAL on the persistent log root, isolated from the shared gateway.
-    assert "/logs/sofascore_proxy_filter/sofascore_allocation_claims.jsonl" in service
+    # Ledger/WAL on the narrow persistent state root, isolated from the shared
+    # gateway and from the release checkout.
+    assert (
+        "/logs/sofascore_proxy_filter/sofascore_allocation_claims.jsonl"
+        in service
+    )
     # Isolation contract: joins the shared dp-backend network as EXTERNAL (own
     # project) and is ABSENT from the shared compose.yaml, so foreign deploys
     # can't sweep it.
     assert "external: true" in gateway
     assert "name: dp-backend" in gateway
     assert "\n  sofascore_proxy_filter:\n" not in _COMPOSE_PATH.read_text()
-    assert (
-        "SOFASCORE_PROXY_BUDGET_ARTIFACT:"
-        "-/opt/airflow/configs/sofascore/proxy_budget_canary.json"
-    ) in service
+    artifact_target = "/opt/airflow/runtime/sofascore/proxy_budget_canary.json"
+    state_target = "/opt/airflow/logs/sofascore_proxy_filter"
+    assert model["environment"]["SOFASCORE_PROXY_BUDGET_ARTIFACT"] == (
+        artifact_target
+    )
+    assert model["environment"]["SOFASCORE_PROXY_BUDGET_ARTIFACT_ID"] == (
+        "${SOFASCORE_PROXY_BUDGET_ARTIFACT_ID:?set the exact verified "
+        "SofaScore artifact SHA-256}"
+    )
+    artifact_flag = model["command"].index("--sofascore-budget-artifact")
+    assert model["command"][artifact_flag + 1] == artifact_target
+
+    volumes = model["volumes"]
+    long_volumes = {
+        volume["target"]: volume
+        for volume in volumes
+        if isinstance(volume, dict)
+    }
+    targets = [
+        volume["target"] if isinstance(volume, dict) else volume.split(":")[1]
+        for volume in volumes
+    ]
+    assert len(targets) == len(set(targets))
+    artifact_mount = long_volumes[artifact_target]
+    assert artifact_mount["source"].startswith(
+        "${SOFASCORE_PROXY_BUDGET_ARTIFACT_HOST:?"
+    )
+    assert artifact_mount["read_only"] is True
+    assert artifact_mount["bind"]["create_host_path"] is False
+    assert not artifact_target.startswith("/opt/airflow/configs/sofascore/")
+    assert not any(
+        target != artifact_target and artifact_target.startswith(f"{target}/")
+        for target in targets
+    )
+
+    state_mount = long_volumes[state_target]
+    assert state_mount["source"].startswith("${SOFASCORE_GATEWAY_STATE_HOST_DIR:?")
+    assert state_mount.get("read_only", False) is False
+    assert state_mount["bind"]["create_host_path"] is False
+    assert "/opt/airflow/logs" not in targets
+    for flag in (
+        "--out",
+        "--ledger",
+        "--sofascore-allocation-ledger",
+        "--sofascore-allocation-wal",
+        "--sofascore-parent-envelope",
+    ):
+        index = model["command"].index(flag)
+        assert model["command"][index + 1].startswith(f"{state_target}/")
+    assert model["healthcheck"]["test"] == [
+        "CMD",
+        "python",
+        "/opt/airflow/scripts/sofascore_runtime_preflight.py",
+        "gateway-health",
+        "--artifact",
+        artifact_target,
+        "--state-dir",
+        state_target,
+        "--health-url",
+        "http://localhost:8899/health",
+    ]
+
+
+def test_sofascore_scheduler_mounts_exact_artifact_and_fingerprint_config():
+    document = yaml.safe_load(_COMPOSE_PATH.read_text())
+    scheduler = document["services"]["airflow-scheduler"]
+    artifact_target = "/opt/airflow/runtime/sofascore/proxy_budget_canary.json"
+    volumes = scheduler["volumes"]
+    targets = [
+        volume["target"] if isinstance(volume, dict) else volume.split(":")[1]
+        for volume in volumes
+    ]
+
+    assert len(targets) == len(set(targets))
+    assert "/opt/airflow/configs/proxy_filter" in targets
+    artifact_mount = next(
+        volume
+        for volume in volumes
+        if isinstance(volume, dict) and volume.get("target") == artifact_target
+    )
+    assert artifact_mount["source"].startswith(
+        "${SOFASCORE_PROXY_BUDGET_ARTIFACT_HOST:?"
+    )
+    assert artifact_mount["read_only"] is True
+    assert artifact_mount["bind"]["create_host_path"] is False
+    assert scheduler["environment"]["SOFASCORE_PROXY_BUDGET_ARTIFACT"] == (
+        artifact_target
+    )
+    assert scheduler["environment"]["SOFASCORE_PROXY_BUDGET_ARTIFACT_ID"].startswith(
+        "${SOFASCORE_PROXY_BUDGET_ARTIFACT_ID:?"
+    )
+    assert scheduler["healthcheck"]["test"] == [
+        "CMD-SHELL",
+        'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"',
+    ]
+    assert not any(
+        target != artifact_target and artifact_target.startswith(f"{target}/")
+        for target in targets
+    )
+
+
+def test_sofascore_durable_mount_variables_are_documented():
+    example = _ENV_EXAMPLE_PATH.read_text()
+
+    assert "\nSOFASCORE_PROXY_BUDGET_ARTIFACT_HOST=" in example
+    assert "\nSOFASCORE_PROXY_BUDGET_ARTIFACT_ID=" in example
+    assert "\nSOFASCORE_GATEWAY_STATE_HOST_DIR=" in example
 
 
 def test_fbref_has_an_isolated_metered_proxy_service():
@@ -2134,6 +2244,92 @@ def test_whoscored_only_main_requires_production_class_before_runtime_io(
         asyncio.run(mod.main())
 
     assert validation_called is False
+
+
+@pytest.mark.parametrize(
+    "configured_pin",
+    [None, "", "a" * 63, "A" * 64, "g" * 64, "a" * 64 + " "],
+)
+def test_sofascore_policy_admission_rejects_noncanonical_pin_before_policy_load(
+    mod, monkeypatch, configured_pin
+):
+    if configured_pin is None:
+        monkeypatch.delenv("SOFASCORE_PROXY_BUDGET_ARTIFACT_ID", raising=False)
+    else:
+        monkeypatch.setenv("SOFASCORE_PROXY_BUDGET_ARTIFACT_ID", configured_pin)
+    policy_loads = []
+    monkeypatch.setattr(
+        mod,
+        "load_verified_workload_policy",
+        lambda _path: policy_loads.append(True),
+    )
+
+    with pytest.raises(SystemExit, match="64 lowercase hexadecimal") as exc_info:
+        mod._load_pinned_sofascore_workload_policy("/verified-policy.json")
+
+    assert policy_loads == []
+    if configured_pin:
+        assert configured_pin not in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    ("required_artifact_id", "expected_error", "expected_policy_loads"),
+    (
+        ("a" * 64, "required artifact pin", 1),
+        ("0" * 64, "zero placeholder", 0),
+    ),
+)
+def test_sofascore_policy_pin_rejection_stops_main_before_pool_or_listener(
+    mod,
+    monkeypatch,
+    caplog,
+    required_artifact_id,
+    expected_error,
+    expected_policy_loads,
+):
+    loaded_artifact_id = "b" * 64
+    args = SimpleNamespace(
+        source_mode="shared-no-whoscored",
+        sofascore_budget_artifact="/verified-policy.json",
+    )
+    monkeypatch.setattr(mod.argparse.ArgumentParser, "parse_args", lambda self: args)
+    monkeypatch.setattr(
+        mod._WHOSCORED_RUNTIME_CONTRACT,
+        "validate_runtime_contract",
+        lambda **_kwargs: {"code_tree_sha256": "c" * 64},
+    )
+    policy_loads = []
+
+    def load_policy(_path):
+        policy_loads.append(True)
+        return SimpleNamespace(artifact_id=loaded_artifact_id)
+
+    monkeypatch.setattr(mod, "load_verified_workload_policy", load_policy)
+    pool_calls = []
+    monkeypatch.setattr(
+        mod,
+        "_residential_manager",
+        lambda **_kwargs: pool_calls.append(True),
+    )
+    monkeypatch.setattr(
+        mod.asyncio,
+        "start_server",
+        lambda *_args, **_kwargs: pytest.fail("listener must not start"),
+    )
+    monkeypatch.setenv("PROXY_FILTER_CONTROL_TOKEN", "c" * 32)
+    monkeypatch.setenv(
+        "SOFASCORE_PROXY_BUDGET_ARTIFACT_ID", required_artifact_id
+    )
+
+    with pytest.raises(SystemExit, match=expected_error) as exc_info:
+        asyncio.run(mod.main())
+
+    assert pool_calls == []
+    assert len(policy_loads) == expected_policy_loads
+    assert required_artifact_id not in str(exc_info.value)
+    assert loaded_artifact_id not in str(exc_info.value)
+    assert required_artifact_id not in caplog.text
+    assert loaded_artifact_id not in caplog.text
 
 
 def _initialize_real_metered_guard(mod, monkeypatch, tmp_path):

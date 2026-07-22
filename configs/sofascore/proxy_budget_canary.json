@@ -37,7 +37,7 @@
       "camoufox": "0.4.11",
       "playwright": "1.59.0"
     },
-    "digest": "fc34ad657ed36038af82d3e0d203ba6ab70828de67d7e352693eda86d90f1c72",
+    "digest": "704817ccd0f8d591aa69f4b9be5c8603734d4994e3cfd72e80f5426c2c4e5a49",
     "files": [
       "configs/medallion/competitions.yaml",
       "configs/proxy_filter/blocklist.txt",
