@@ -884,7 +884,7 @@ def test_transfermarkt_backfill_proxy_contract_is_isolated_and_fail_closed() -> 
     proxy = compose["services"]["proxy_filter"]
     common = compose["x-airflow-common"]["environment"]
     init_command = compose["services"]["airflow-init"]["command"][1]
-    scheduler_command = compose["services"]["airflow-scheduler"]["command"][2]
+    scheduler_command = compose["services"]["airflow-scheduler"]["command"]
     command = proxy["command"]
 
     assert common["TM_BACKFILL_PROXY_CONTROL_URL"] == (
@@ -911,13 +911,9 @@ def test_transfermarkt_backfill_proxy_contract_is_isolated_and_fail_closed() -> 
     assert init_command.count("airflow pools set 'transfermarkt_proxy' 1") == 1
     assert init_command.count("airflow pools set 'transfermarkt_backfill_proxy' 1") == 1
     assert init_command.count("airflow pools set 'transfermarkt_backfill_control' 1") == 1
-    assert scheduler_command.count(
-        "airflow pools set 'transfermarkt_backfill_proxy' 1"
-    ) == 1
-    assert scheduler_command.count(
-        "airflow pools set 'transfermarkt_backfill_control' 1"
-    ) == 1
-    assert scheduler_command.rstrip().endswith("exec airflow scheduler")
+    # Pool rollout belongs to the explicit init step.  The protected scheduler
+    # command must stay immutable for WhoScored runtime admission.
+    assert scheduler_command == "scheduler"
 
     example = (ROOT / ".env.example").read_text(encoding="utf-8")
     assert "PROXY_FILTER_TRANSFERMARKT_BACKFILL_DAGRUN_BUDGET_BYTES=0" in example
