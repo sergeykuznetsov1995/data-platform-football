@@ -142,6 +142,10 @@ FLARESOLVERR_CONTEXT_FILES = frozenset(
         "scripts/flaresolverr_extended.py",
     }
 )
+CANONICAL_COMPOSE_RELATIVES = (
+    Path("compose.yaml"),
+    Path("deploy/whoscored/gateway.compose.yaml"),
+)
 PRODUCTION_OVERLAY_RELATIVE = Path("compose.seaweedfs-supervised.yaml")
 PROTECTED_PRODUCTION_SERVICES = frozenset(
     {
@@ -189,8 +193,13 @@ PROTECTED_SERVICE_BUILDS = {
         "data-platform-airflow-whoscored-proxy:2.11.2-whoscored",
     ),
 }
+PROTECTED_SERVICE_IMAGE_ENV = {
+    "flaresolverr_whoscored_paid": "WHOSCORED_PAID_FLARESOLVERR_IMAGE",
+    "whoscored_paid_gateway": "WHOSCORED_GATEWAY_IMAGE",
+    "whoscored_proxy_filter": "WHOSCORED_PROXY_IMAGE",
+}
 PROTECTED_STAGE_RECIPE_SHA256 = {
-    "airflow-scheduler": "0ae3d95119fa6aa41ebda5a547dec95c76471c65db16d6d00a33cfa68d1269be",
+    "airflow-scheduler": "f784ae95f5ac83d33cd52866e81a406a23cdb65fbdad3912168cd3ed85cabe6d",
     "flaresolverr": "e4e28b69572d38f4f877154e6bc7a6f8fae0906edb624b62860fff53d0bcab20",
     "flaresolverr_whoscored_paid": "e4e28b69572d38f4f877154e6bc7a6f8fae0906edb624b62860fff53d0bcab20",
     "whoscored_paid_gateway": "0cb2bdeed26cb9fe7cb33da3f50c1f29124ffcc07d31f9d09f69dc67f1b290b8",
@@ -991,6 +1000,7 @@ class BuildConfig:
     dockerfile: str
     target: str
     image: str | None
+    compose_file: str = "compose.yaml"
 
 
 @dataclass
@@ -1165,18 +1175,49 @@ def _validate_compose_top_level(lines: Sequence[str], *, description: str) -> No
         raise ProvenanceError(f"{description} has no services mapping")
 
 
-def _parse_compose(
-    root: Path, discovery: Discovery
-) -> tuple[list[BuildConfig], list[tuple[Path, Path]]]:
-    compose_path = root / "compose.yaml"
+def _yaml_anchor_definitions(line: str) -> list[str]:
+    """Return every structurally separated potential YAML anchor token.
+
+    This is deliberately conservative: quoted or commented lookalikes may be
+    counted. Failing closed on a duplicate is safer than letting YAML lexical
+    decoration hide the definition that Compose binds to a merge alias.
+    """
+
+    return re.findall(
+        r"(?:^|[\s:\[\]{},?\-])&([A-Za-z0-9_.-]+)(?![A-Za-z0-9_.-])",
+        line,
+    )
+
+
+def _yaml_ignored_line(line: str) -> bool:
+    """Return whether YAML indentation must ignore this blank/comment line."""
+
+    return not line.strip() or line.lstrip().startswith("#")
+
+
+def _parse_compose_services(
+    root: Path,
+    discovery: Discovery,
+    relative: Path,
+) -> dict[str, dict[str, str | None]]:
+    description = relative.as_posix()
+    compose_path = root / relative
     try:
         lines = compose_path.read_text(encoding="utf-8").splitlines()
     except OSError as exc:
-        raise ProvenanceError("compose.yaml is unavailable") from exc
+        raise ProvenanceError(f"{description} is unavailable") from exc
     discovery.material_paths.add(compose_path)
-    _validate_compose_top_level(lines, description="compose.yaml")
+    _validate_compose_top_level(lines, description=description)
+
+    anchor_definitions: set[str] = set()
+    for line in lines:
+        for anchor in _yaml_anchor_definitions(line):
+            if anchor in anchor_definitions:
+                raise ProvenanceError(f"duplicate {description} anchor: {anchor}")
+            anchor_definitions.add(anchor)
 
     anchors: dict[str, dict[str, str | None]] = {}
+    anchor_definition_lines: dict[str, int] = {}
     anchor_execution_overrides: set[str] = set()
     anchor_unmodelled_inputs: set[str] = set()
     index = 0
@@ -1188,16 +1229,19 @@ def _parse_compose(
             index += 1
             continue
         anchor = match.group(2)
+        if anchor in anchors:
+            raise ProvenanceError(f"duplicate {description} anchor: {anchor}")
         end = index + 1
         while end < len(lines) and (
-            not lines[end].strip() or lines[end].startswith(" ")
+            _yaml_ignored_line(lines[end]) or lines[end].startswith(" ")
         ):
             end += 1
         anchor_block = lines[index + 1 : end]
         anchor_keys = _canonical_mapping_keys(
-            anchor_block, 2, description=f"Compose anchor {anchor}"
+            anchor_block, 2, description=f"{description} anchor {anchor}"
         )
         anchors[anchor] = _yaml_build_fields(anchor_block, base_indent=2)
+        anchor_definition_lines[anchor] = index
         if anchor_keys & {"entrypoint", "command"}:
             anchor_execution_overrides.add(anchor)
         if anchor_keys & {"<<", "extends"}:
@@ -1206,18 +1250,18 @@ def _parse_compose(
 
     try:
         services_start = next(
-            i for i, line in enumerate(lines) if line.strip() == "services:"
+            i for i, line in enumerate(lines) if line == "services:"
         )
     except StopIteration as exc:
-        raise ProvenanceError("compose.yaml has no services mapping") from exc
+        raise ProvenanceError(f"{description} has no services mapping") from exc
     services: dict[str, dict[str, str | None]] = {}
     index = services_start + 1
     while index < len(lines):
-        if lines[index].strip() and not lines[index].startswith(" "):
-            break
-        if not lines[index].strip() or lines[index].lstrip().startswith("#"):
+        if _yaml_ignored_line(lines[index]):
             index += 1
             continue
+        if lines[index].strip() and not lines[index].startswith(" "):
+            break
         match = re.match(r"^  ([A-Za-z0-9_.-]+):\s*$", lines[index])
         if not match:
             if (
@@ -1225,37 +1269,45 @@ def _parse_compose(
                 and len(lines[index]) - len(lines[index].lstrip(" ")) == 2
             ):
                 raise ProvenanceError(
-                    f"unsupported compose service declaration: {lines[index].strip()}"
+                    f"unsupported {description} service declaration: "
+                    f"{lines[index].strip()}"
                 )
             index += 1
             continue
         name = match.group(1)
         if name in services:
-            raise ProvenanceError(f"duplicate compose service: {name}")
+            raise ProvenanceError(f"duplicate {description} service: {name}")
         end = index + 1
         while end < len(lines) and (
-            not lines[end].strip() or len(lines[end]) - len(lines[end].lstrip(" ")) > 2
+            _yaml_ignored_line(lines[end])
+            or len(lines[end]) - len(lines[end].lstrip(" ")) > 2
         ):
             end += 1
         block = lines[index + 1 : end]
         service_keys = _canonical_mapping_keys(
-            block, 4, description=f"Compose service {name}"
+            block, 4, description=f"{description} service {name}"
         )
         fields: dict[str, str | None] = {}
         merged_anchors: set[str] = set()
-        for line in block:
+        for line_number, line in enumerate(block, start=index + 1):
             if re.match(r"^    <<:", line) and not re.match(
                 r"^    <<:\s*\*([A-Za-z0-9_.-]+)\s*$", line
             ):
                 raise ProvenanceError(f"unsupported Compose service merge: {name}")
             merged = re.match(r"^    <<:\s*\*([A-Za-z0-9_.-]+)\s*$", line)
             if merged:
-                if merged.group(1) not in anchors:
+                merged_anchor = merged.group(1)
+                if merged_anchor not in anchors:
                     raise ProvenanceError(
-                        f"unsupported Compose service merge: {name}:{merged.group(1)}"
+                        f"unsupported Compose service merge: {name}:{merged_anchor}"
                     )
-                merged_anchors.add(merged.group(1))
-                fields.update(anchors[merged.group(1)])
+                if anchor_definition_lines[merged_anchor] >= line_number:
+                    raise ProvenanceError(
+                        "Compose service merge references a forward anchor: "
+                        f"{name}:{merged_anchor}"
+                    )
+                merged_anchors.add(merged_anchor)
+                fields.update(anchors[merged_anchor])
         if merged_anchors & anchor_unmodelled_inputs:
             raise ProvenanceError(f"Compose service merges an unsafe anchor: {name}")
         if "extends" in service_keys:
@@ -1295,17 +1347,44 @@ def _parse_compose(
             raise ProvenanceError(
                 "WhoScored paid gateway Compose command differs from production policy"
             )
+        explicit_fields = _yaml_build_fields(block, 4)
+        if "build" in service_keys:
+            # YAML merge keys operate at this mapping level. An explicit
+            # service build replaces the inherited build mapping wholesale;
+            # its nested context/dockerfile/target fields are not deep-merged.
+            for key in ("context", "dockerfile", "target"):
+                fields.pop(key, None)
         fields.update(
-            {
-                key: value
-                for key, value in _yaml_build_fields(block, 4).items()
-                if value is not None
-            }
+            {key: value for key, value in explicit_fields.items() if value is not None}
         )
         services[name] = fields
         index = end
 
+    return services
+
+
+def _parse_compose(
+    root: Path, discovery: Discovery
+) -> tuple[list[BuildConfig], list[tuple[Path, Path]]]:
+    services: dict[str, dict[str, str | None]] = {}
+    service_sources: dict[str, str] = {}
+    for relative in CANONICAL_COMPOSE_RELATIVES:
+        parsed = _parse_compose_services(root, discovery, relative)
+        duplicates = sorted(set(services) & set(parsed))
+        if duplicates:
+            duplicate = duplicates[0]
+            raise ProvenanceError(
+                "duplicate Compose service across canonical projects: "
+                f"{duplicate} ({service_sources[duplicate]}, {relative.as_posix()})"
+            )
+        services.update(parsed)
+        service_sources.update(
+            {service: relative.as_posix() for service in parsed}
+        )
+
     _apply_production_overlay(root, discovery, services)
+    for service in services:
+        service_sources.setdefault(service, PRODUCTION_OVERLAY_RELATIVE.as_posix())
 
     direct_builds: dict[str, BuildConfig] = {}
     image_to_build: dict[str, BuildConfig] = {}
@@ -1335,12 +1414,7 @@ def _parse_compose(
             raise ProvenanceError(
                 f"Compose service exposes a payload stage without its final gate: {service}"
             )
-        image_value = fields.get("image")
-        image_text = _clean_yaml_scalar(str(image_value)) if image_value else None
-        if image_text and "$" in image_text:
-            raise ProvenanceError(
-                f"local build image tag uses unresolved Compose interpolation: {service}"
-            )
+        image_text = _resolve_compose_image(service, fields.get("image"))
         context_path = _safe_repository_path(root, context_text)
         dockerfile_path = _safe_repository_path(
             context_path, dockerfile_name, root=root
@@ -1351,6 +1425,7 @@ def _parse_compose(
             dockerfile=_relative(root, dockerfile_path),
             target=target,
             image=image_text,
+            compose_file=service_sources[service],
         )
         _validate_protected_build(config)
         direct_builds[service] = config
@@ -1370,8 +1445,7 @@ def _parse_compose(
     local_builds: list[BuildConfig] = []
     for service, fields in services.items():
         config = direct_builds.get(service)
-        image_value = fields.get("image")
-        image_text = _clean_yaml_scalar(str(image_value)) if image_value else None
+        image_text = _resolve_compose_image(service, fields.get("image"))
         normalized_image = (
             _normalized_image_tag(image_text)
             if image_text is not None and "@" not in image_text
@@ -1385,6 +1459,7 @@ def _parse_compose(
                 dockerfile=producer.dockerfile,
                 target=producer.target,
                 image=image_text,
+                compose_file=service_sources[service],
             )
         if config is not None:
             _validate_resolved_service_target(service, config.target)
@@ -1393,7 +1468,7 @@ def _parse_compose(
         if not image_text:
             discovery.issue(
                 "compose_image_without_digest",
-                f"compose.yaml:{service}",
+                f"{service_sources[service]}:{service}",
                 "service has no statically resolved image or build closure",
             )
             continue
@@ -1404,7 +1479,7 @@ def _parse_compose(
         else:
             discovery.issue(
                 "compose_image_without_digest",
-                f"compose.yaml:{service}",
+                f"{service_sources[service]}:{service}",
                 f"third-party image is not pinned by @sha256: {image_text}",
             )
     build_graphs = sorted(
@@ -1494,7 +1569,9 @@ def _service_command(block: Sequence[str]) -> tuple[str, ...] | None:
             return (_clean_yaml_scalar(scalar),)
         values: list[str] = []
         for nested in block[index + 1 :]:
-            if nested.strip() and len(nested) - len(nested.lstrip(" ")) <= 4:
+            if _yaml_ignored_line(nested):
+                continue
+            if len(nested) - len(nested.lstrip(" ")) <= 4:
                 break
             item = re.match(r"^      -\s+(.*?)\s*$", nested)
             if item:
@@ -1519,7 +1596,7 @@ def _apply_production_overlay(
     _validate_compose_top_level(lines, description="production Compose overlay")
     try:
         start = next(
-            index for index, line in enumerate(lines) if line.strip() == "services:"
+            index for index, line in enumerate(lines) if line == "services:"
         )
     except StopIteration as exc:
         raise ProvenanceError(
@@ -1527,11 +1604,11 @@ def _apply_production_overlay(
         ) from exc
     index = start + 1
     while index < len(lines):
-        if lines[index].strip() and not lines[index].startswith(" "):
-            break
-        if not lines[index].strip() or lines[index].lstrip().startswith("#"):
+        if _yaml_ignored_line(lines[index]):
             index += 1
             continue
+        if lines[index].strip() and not lines[index].startswith(" "):
+            break
         match = re.match(r"^  ([A-Za-z0-9_.-]+):\s*(.*?)\s*$", lines[index])
         if not match:
             if lines[index].strip():
@@ -1543,7 +1620,8 @@ def _apply_production_overlay(
         name, declaration = match.groups()
         end = index + 1
         while end < len(lines) and (
-            not lines[end].strip() or len(lines[end]) - len(lines[end].lstrip(" ")) > 2
+            _yaml_ignored_line(lines[end])
+            or len(lines[end]) - len(lines[end].lstrip(" ")) > 2
         ):
             end += 1
         block = lines[index + 1 : end]
@@ -1595,6 +1673,8 @@ def _yaml_build_fields(lines: Sequence[str], base_indent: int) -> dict[str, str 
     prefix = " " * base_indent
     fields: dict[str, str | None] = {}
     in_build = False
+    build_form: str | None = None
+    build_mapping_fields = 0
     unsupported_service_fields = {"platform", "pull_policy"}
     supported_build_fields = {"context", "dockerfile", "target"}
     for line in lines:
@@ -1616,11 +1696,17 @@ def _yaml_build_fields(lines: Sequence[str], base_indent: int) -> dict[str, str 
                     fields["image"] = value
                     in_build = False
                 elif value:
+                    if _unsupported_yaml_build_scalar(value):
+                        raise ProvenanceError(
+                            "unsupported structured or null Compose build value"
+                        )
+                    build_form = "scalar"
                     if "context" in fields:
                         raise ProvenanceError("duplicate Compose build field")
                     fields["context"] = value
                     in_build = False
                 else:
+                    build_form = "mapping"
                     in_build = True
                 continue
             in_build = False
@@ -1635,8 +1721,53 @@ def _yaml_build_fields(lines: Sequence[str], base_indent: int) -> dict[str, str 
                 raise ProvenanceError(
                     f"duplicate Compose build field: {match.group(1)}"
                 )
-            fields[match.group(1)] = match.group(2)
+            value = match.group(2)
+            if _unsupported_yaml_build_scalar(value):
+                raise ProvenanceError(
+                    f"unsupported structured or null Compose build field: {match.group(1)}"
+                )
+            fields[match.group(1)] = value
+            build_mapping_fields += 1
+    if build_form == "mapping" and build_mapping_fields == 0:
+        raise ProvenanceError("Compose build mapping is empty or null")
+    if build_form == "mapping":
+        # Compose long-form build defaults context to the project directory.
+        # Canonical commands set --project-directory to the repository root.
+        fields.setdefault("context", ".")
     return fields
+
+
+def _yaml_null_scalar(value: str) -> bool:
+    return value == "" or value == "~" or value.lower() == "null"
+
+
+def _unsupported_yaml_build_scalar(value: str) -> bool:
+    if "$" in value:
+        # The caller emits the dedicated unresolved-interpolation failure.
+        return False
+    if _yaml_null_scalar(value):
+        return True
+    if re.fullmatch(r"[A-Za-z0-9_./-]+", value) is None:
+        return True
+    lowered = value.lower()
+    if lowered in {
+        "true",
+        "false",
+        "yes",
+        "no",
+        "on",
+        "off",
+        "y",
+        "n",
+    } or re.fullmatch(r"[-+]?(?:\.inf|\.nan)", lowered):
+        return True
+    if re.fullmatch(
+        r"[-+]?(?:(?:0x[0-9a-f_]+|0o[0-7_]+|0b[01_]+)|"
+        r"(?:[0-9][0-9_]*(?:\.[0-9_]*)?|\.[0-9_]+)(?:e[-+]?[0-9]+)?)",
+        lowered,
+    ):
+        return True
+    return re.fullmatch(r"[0-9]{4}-[0-9]{1,2}-[0-9]{1,2}", value) is not None
 
 
 def _clean_yaml_scalar(value: str) -> str:
@@ -1644,6 +1775,23 @@ def _clean_yaml_scalar(value: str) -> str:
     if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
         return value[1:-1]
     return value
+
+
+def _resolve_compose_image(service: str, value: str | None) -> str | None:
+    if value is None:
+        return None
+    image = _clean_yaml_scalar(str(value))
+    variable = PROTECTED_SERVICE_IMAGE_ENV.get(service)
+    protected_build = PROTECTED_SERVICE_BUILDS.get(service)
+    if variable is not None and protected_build is not None:
+        expected = protected_build[3]
+        if image == f"${{{variable}:-{expected}}}":
+            return expected
+    if "$" in image:
+        raise ProvenanceError(
+            f"local build image tag uses unresolved Compose interpolation: {service}"
+        )
+    return image
 
 
 def _safe_repository_path(base: Path, value: str, *, root: Path | None = None) -> Path:
@@ -3411,7 +3559,7 @@ def discover_repository(
                 missing.append("payload-stage image ID")
             discovery.issue(
                 "local_image_provenance_absent",
-                f"compose.yaml:{config.service}",
+                f"{config.compose_file}:{config.service}",
                 f"local build lacks {', '.join(missing)}",
             )
         discovery.records["local_images"].append(

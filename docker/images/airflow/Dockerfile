@@ -423,7 +423,10 @@ RUN --network=none chown -R root:root \
         /home/airflow/.local \
         /home/airflow/.cache/camoufox \
         /opt/legacy-scraper-venv
-RUN --network=none test "$(stat -c '%u:%g:%a' /usr/local/share/whoscored/build-hooks)" = "0:0:755" \
+RUN --network=none chown root:root /opt/airflow \
+    && chmod 0755 /opt/airflow \
+    && test "$(stat -c '%u:%g:%a' /opt/airflow)" = "0:0:755" \
+    && test "$(stat -c '%u:%g:%a' /usr/local/share/whoscored/build-hooks)" = "0:0:755" \
     && test "$(stat -c '%u:%g:%a:%h' /usr/local/share/whoscored/build-hooks/bootstrap)" = "0:0:444:1" \
     && test "$(stat -c '%u:%g:%a:%h' /usr/local/share/whoscored/build-hooks/finalize)" = "0:0:444:1" \
     && rm -rf /__whoscored_runtime_bytecode_disabled__ \
@@ -550,7 +553,10 @@ RUN --network=none cp --dereference /opt/legacy-scraper-venv/bin/python3.11 \
         /usr/local/bin/whoscored-production-python /usr/local/bin/python3.11 \
     && rm -f /usr/local/bin/python /usr/local/bin/python3 \
     && ln -s python3.11 /usr/local/bin/python3 \
-    && ln -s python3 /usr/local/bin/python
+    && ln -s python3 /usr/local/bin/python \
+    && chown root:root /opt/airflow \
+    && chmod 0755 /opt/airflow \
+    && test "$(stat -c '%u:%g:%a' /opt/airflow)" = "0:0:755"
 USER 50000:0
 WORKDIR /opt/airflow
 ENTRYPOINT ["/usr/bin/dumb-init", "--", "/usr/local/bin/whoscored-production-entrypoint", "/entrypoint"]

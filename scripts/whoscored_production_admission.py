@@ -162,6 +162,13 @@ EXIT_CONFIG = 78
 MAX_JSON_BYTES = 16 * 1024 * 1024
 MAX_PROVIDER_QUOTA_RECEIPT_BYTES = 32 * 1024
 MAX_PROVIDER_QUOTA_RECEIPT_AGE = timedelta(hours=24)
+FBREF_CAMOUFOX_GEOIP_DATABASE_CONTAINER_PATH = (
+    "/opt/airflow/secure/fbref-geoip/GeoLite2-City.mmdb"
+)
+FBREF_CAMOUFOX_GEOIP_DATABASE_SHA256 = (
+    "0772278c513e6ab3c65e9ae53d6861f137ab696f91eec763a2e6fe76befd83b2"
+)
+FBREF_CAMOUFOX_GEOIP_DATABASE_SIZE = 66_164_133
 _PROVIDER_QUOTA_RECEIPT_FIELDS = frozenset(
     {
         "schema_version",
@@ -218,6 +225,134 @@ _SERVICE_PROJECT = {
     **{service: COMMON_PROJECT for service in COMMON_PROTECTED_SERVICES},
     **{service: GATEWAY_PROJECT for service in GATEWAY_PROTECTED_SERVICES},
 }
+_LEGACY_CUTOVER_SERVICES = (
+    "airflow-scheduler",
+    "flaresolverr",
+    *GATEWAY_PROTECTED_SERVICES,
+)
+_LEGACY_CUTOVER_NETWORKS = (
+    "whoscored-paid-api",
+    "whoscored-paid-browser",
+    "whoscored-paid-direct-egress",
+    "whoscored-paid-provider-egress",
+)
+_LEGACY_CUTOVER_RETAINED_NETWORKS = ("backend", "frontend", "storage")
+_LEGACY_CUTOVER_RETAINED_MEMBERS = {
+    "backend": ("airflow-scheduler", "flaresolverr"),
+    "frontend": ("airflow-scheduler",),
+    "storage": ("airflow-scheduler",),
+}
+_LEGACY_CUTOVER_ALL_NETWORKS = (
+    *_LEGACY_CUTOVER_RETAINED_NETWORKS,
+    *_LEGACY_CUTOVER_NETWORKS,
+)
+_LEGACY_CUTOVER_FULL_MEMBERS = {
+    "whoscored-paid-api": (
+        "airflow-scheduler",
+        "whoscored_paid_gateway",
+    ),
+    "whoscored-paid-browser": (
+        "flaresolverr_whoscored_paid",
+        "whoscored_paid_gateway",
+        "whoscored_proxy_filter",
+    ),
+    "whoscored-paid-direct-egress": ("whoscored_paid_gateway",),
+    "whoscored-paid-provider-egress": ("whoscored_proxy_filter",),
+}
+_CREATE_CAPTURE_GATEWAY_NETWORKS = {
+    "whoscored_paid_gateway": (
+        "whoscored-paid-api",
+        "whoscored-paid-browser",
+        "whoscored-paid-direct-egress",
+    ),
+    "whoscored_proxy_filter": _LEGACY_CUTOVER_NETWORKS,
+    "flaresolverr_whoscored_paid": _LEGACY_CUTOVER_NETWORKS,
+}
+_CUTOVER_ACTIVE_DAGRUN_STATES = ("queued", "restarting", "running")
+_CUTOVER_ACTIVE_TASK_STATES = (
+    "deferred",
+    "queued",
+    "restarting",
+    "running",
+    "scheduled",
+    "sensing",
+    "up_for_reschedule",
+    "up_for_retry",
+)
+_CUTOVER_INDEPENDENT_TASK_STATES = ("queued", "restarting", "running")
+_CUTOVER_QUIESCENCE_SQL = f"""
+BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY;
+SET LOCAL statement_timeout = '30s';
+SELECT jsonb_build_object(
+  'active_dag_runs', (
+    SELECT COALESCE(jsonb_agg(jsonb_build_object(
+      'dag_id', dag_id, 'run_id', run_id, 'state', state
+    ) ORDER BY dag_id, run_id), '[]'::jsonb)
+    FROM dag_run
+    WHERE state IN ({', '.join(repr(state) for state in _CUTOVER_ACTIVE_DAGRUN_STATES)})
+  ),
+  'active_task_instances', (
+    SELECT COALESCE(jsonb_agg(jsonb_build_object(
+      'dag_id', ti.dag_id, 'map_index', ti.map_index, 'run_id', ti.run_id,
+      'state', ti.state, 'task_id', ti.task_id
+    ) ORDER BY ti.dag_id, ti.run_id, ti.task_id, ti.map_index), '[]'::jsonb)
+    FROM task_instance AS ti
+    LEFT JOIN dag_run AS dr
+      ON dr.dag_id = ti.dag_id AND dr.run_id = ti.run_id
+    WHERE (
+      dr.state IN ({', '.join(repr(state) for state in _CUTOVER_ACTIVE_DAGRUN_STATES)})
+      AND ti.state IN ({', '.join(repr(state) for state in _CUTOVER_ACTIVE_TASK_STATES)})
+    ) OR ti.state IN ({', '.join(repr(state) for state in _CUTOVER_INDEPENDENT_TASK_STATES)})
+  ),
+  'active_non_scheduler_jobs', (
+    SELECT COALESCE(jsonb_agg(jsonb_build_object(
+      'hostname', hostname, 'id', id, 'job_type', job_type,
+      'latest_heartbeat', latest_heartbeat, 'state', state
+    ) ORDER BY id), '[]'::jsonb)
+    FROM job
+    WHERE state = 'running'
+      AND job_type <> 'SchedulerJob'
+      AND latest_heartbeat >= transaction_timestamp() - interval '5 minutes'
+  ),
+  'active_fbref_crawl_runs', (
+    SELECT COALESCE(jsonb_agg(jsonb_build_object(
+      'run_id', run_id, 'run_type', run_type, 'status', status
+    ) ORDER BY created_at, run_id), '[]'::jsonb)
+    FROM fbref_control.crawl_run
+    WHERE status IN ('pending', 'running')
+  ),
+  'active_fbref_publication_locks', (
+    SELECT COALESCE(jsonb_agg(jsonb_build_object(
+      'expires_at', expires_at, 'owner_dag_id', owner_dag_id,
+      'owner_run_id', owner_run_id, 'source', source
+    ) ORDER BY source), '[]'::jsonb)
+    FROM fbref_control.publication_lock
+    WHERE released_at IS NULL
+  ),
+  'observed_at', to_char(
+    transaction_timestamp() AT TIME ZONE 'UTC',
+    'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+  )
+)::text;
+COMMIT;
+""".strip()
+_CUTOVER_DAG_PAUSE_SQL = """
+BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY;
+SET LOCAL statement_timeout = '30s';
+SELECT jsonb_build_object(
+  'dag_pause_states', (
+    SELECT COALESCE(jsonb_agg(jsonb_build_object(
+      'dag_id', dag_id, 'is_paused', is_paused
+    ) ORDER BY dag_id), '[]'::jsonb)
+    FROM dag
+  ),
+  'observed_at', to_char(
+    transaction_timestamp() AT TIME ZONE 'UTC',
+    'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+  )
+)::text;
+COMMIT;
+""".strip()
 _COMMON_EXTERNAL_NETWORKS = {
     "whoscored-paid-api": {
         "external": True,
@@ -355,6 +490,7 @@ _CRITICAL_IMAGE_PATHS = {
         "/lib",
         "/lib64",
         "/opt/airflow/runtime-contract",
+        "/opt/legacy-scraper-venv",
         "/usr/bin/dumb-init",
         "/usr/local/bin/whoscored-production-entrypoint",
         "/usr/local/bin/whoscored-production-gate",
@@ -427,6 +563,7 @@ _ALLOWED_VOLUME_TARGETS = {
         ),
         "/opt/airflow/scrapers": ("bind", True),
         "/opt/airflow/scripts": ("bind", True),
+        FBREF_CAMOUFOX_GEOIP_DATABASE_CONTAINER_PATH: ("bind", True),
         "/opt/airflow/secure/whoscored-approvals": ("bind", True),
         "/opt/airflow/secure/whoscored-scheduled-pointers": ("bind", True),
         "/opt/airflow/state/whoscored-proxy-filter": ("bind", True),
@@ -486,6 +623,10 @@ _RUNTIME_HOST_BIND_TARGETS = {
         "airflow-scheduler",
         "/opt/airflow/fotmob-admission",
     ): "protected-directory",
+    (
+        "airflow-scheduler",
+        FBREF_CAMOUFOX_GEOIP_DATABASE_CONTAINER_PATH,
+    ): "fbref-geoip-database",
     ("airflow-scheduler", "/opt/airflow/logs"): "writable-directory",
     ("airflow-scheduler", "/opt/airflow/proxys.txt"): "protected-file",
     (
@@ -945,7 +1086,7 @@ _SCHEDULER_ENVIRONMENT_NAMES = frozenset(
     AIRFLOW__CORE__FERNET_KEY AIRFLOW__CORE__LOAD_EXAMPLES
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN AIRFLOW__WEBSERVER__EXPOSE_CONFIG
     AIRFLOW__WEBSERVER__SECRET_KEY ALERT_ENV FBREF_PROXY_CONTROL_TOKEN
-    FBREF_CONTROL_DB_URI FOTMOB_DEPLOY_GIT_SHA
+    FBREF_CAMOUFOX_GEOIP_DATABASE_PATH FBREF_CONTROL_DB_URI FOTMOB_DEPLOY_GIT_SHA
     FOTMOB_SHARED_DEPLOYMENT_REPORT_PATH
     FBREF_PROXY_CONTROL_URL FBREF_PROXY_LEASE_TTL_SECONDS FBREF_RAW_S3_ENDPOINT
     FBREF_RAW_S3_SCHEME FBREF_RAW_STORE_URI FBREF_STAGE_JANITOR_MODE
@@ -1063,6 +1204,9 @@ _FIXED_ENVIRONMENT = {
         "FBREF_PROXY_CONTROL_URL": "http://fbref_proxy_filter:8899",
         "FBREF_PROXY_LEASE_TTL_SECONDS": "7200",
         "FBREF_STAGE_JANITOR_MODE": "apply",
+        "FBREF_CAMOUFOX_GEOIP_DATABASE_PATH": (
+            FBREF_CAMOUFOX_GEOIP_DATABASE_CONTAINER_PATH
+        ),
         "LEGACY_SCRAPER_PYTHON": "/opt/legacy-scraper-venv/bin/python",
         "PROXY_FILTER_LEDGER_PATH": (
             "/opt/airflow/state/whoscored-proxy-filter/paid_requests.jsonl"
@@ -2953,7 +3097,14 @@ def _port_bindings(
 
 
 def _verify_docker_network(
-    *, logical_name: str, project: str, runner: DockerRunner
+    *,
+    logical_name: str,
+    project: str,
+    runner: DockerRunner,
+    expected_containers: Mapping[str, str] | None = None,
+    required_containers: Mapping[str, str] | None = None,
+    optional_containers: Mapping[str, str] | None = None,
+    forbidden_container_ids: frozenset[str] = frozenset(),
 ) -> dict[str, str]:
     definition = _EXPECTED_NETWORK_DEFINITIONS[logical_name]
     expected_name = definition["name"]
@@ -3036,11 +3187,1509 @@ def _verify_docker_network(
         or not selected_range.subnet_of(subnet)
     ):
         raise AdmissionError(f"Docker network subnet differs: {expected_name}")
+    containers = network.get("Containers")
+    inspect_containers = (
+        expected_containers is not None
+        or required_containers is not None
+        or optional_containers is not None
+        or bool(forbidden_container_ids)
+    )
+    if inspect_containers:
+        if not isinstance(containers, dict):
+            raise AdmissionError(
+                f"Docker network container inventory differs: {expected_name}"
+            )
+        endpoint_names: set[str] = set()
+        for container_id, endpoint in containers.items():
+            endpoint_name = (
+                endpoint.get("Name") if isinstance(endpoint, dict) else None
+            )
+            if (
+                not isinstance(container_id, str)
+                or _CONTAINER_ID.fullmatch(container_id) is None
+                or not isinstance(endpoint_name, str)
+                or not endpoint_name
+                or endpoint_name in endpoint_names
+            ):
+                raise AdmissionError(
+                    f"Docker network container identity differs: {expected_name}"
+                )
+            endpoint_names.add(endpoint_name)
+    if expected_containers is not None:
+        assert isinstance(containers, dict)
+        if set(containers) != set(expected_containers):
+            raise AdmissionError(
+                f"Docker network container inventory differs: {expected_name}"
+            )
+        for container_id, service in expected_containers.items():
+            endpoint = containers.get(container_id)
+            if (
+                _CONTAINER_ID.fullmatch(container_id) is None
+                or not isinstance(endpoint, dict)
+                or endpoint.get("Name") != service
+            ):
+                raise AdmissionError(
+                    f"Docker network container identity differs: {expected_name}"
+                )
+    if required_containers is not None:
+        assert isinstance(containers, dict)
+        for container_id, service in required_containers.items():
+            endpoint = containers.get(container_id)
+            if not isinstance(endpoint, dict) or endpoint.get("Name") != service:
+                raise AdmissionError(
+                    f"Docker network required container differs: {expected_name}"
+                )
+    if optional_containers is not None:
+        assert isinstance(containers, dict)
+        for container_id, service in optional_containers.items():
+            admitted_endpoint = containers.get(container_id)
+            observed_ids = {
+                observed_id
+                for observed_id, endpoint in containers.items()
+                if endpoint.get("Name") == service
+            }
+            if (
+                admitted_endpoint is not None
+                and admitted_endpoint.get("Name") != service
+                or observed_ids not in (set(), {container_id})
+            ):
+                raise AdmissionError(
+                    f"Docker network optional container differs: {expected_name}"
+                )
+    if forbidden_container_ids and (
+        not isinstance(containers, dict)
+        or set(containers) & set(forbidden_container_ids)
+    ):
+        raise AdmissionError(
+            f"Docker network contains stopped protected container: {expected_name}"
+        )
     return {
         "id": network_id,
         "logical_name": logical_name,
         "name": expected_name,
         "subnet": str(subnet),
+    }
+
+
+def _docker_id_lines(raw: bytes, *, label: str) -> tuple[str, ...]:
+    try:
+        ids = tuple(raw.decode("ascii").splitlines())
+    except UnicodeDecodeError as exc:
+        raise AdmissionError(f"{label} returned non-ASCII Docker IDs") from exc
+    if len(ids) != len(set(ids)) or any(
+        _CONTAINER_ID.fullmatch(container_id) is None for container_id in ids
+    ):
+        raise AdmissionError(f"{label} returned duplicate or invalid Docker IDs")
+    return ids
+
+
+def _listed_cutover_networks(
+    raw: bytes,
+) -> dict[str, str]:
+    try:
+        lines = raw.decode("ascii").splitlines()
+    except UnicodeDecodeError as exc:
+        raise AdmissionError("cutover network inventory is not ASCII") from exc
+    expected_names = {
+        _EXPECTED_NETWORK_DEFINITIONS[logical_name]["name"]: logical_name
+        for logical_name in _LEGACY_CUTOVER_ALL_NETWORKS
+    }
+    result: dict[str, str] = {}
+    seen_ids: set[str] = set()
+    seen_names: set[str] = set()
+    for line in lines:
+        network_id, separator, name = line.partition("\t")
+        if (
+            not separator
+            or not network_id
+            or not name
+            or "\t" in name
+            or _CONTAINER_ID.fullmatch(network_id) is None
+            or network_id in seen_ids
+            or name in seen_names
+        ):
+            raise AdmissionError("cutover network inventory is malformed")
+        seen_ids.add(network_id)
+        seen_names.add(name)
+        logical_name = expected_names.get(name)
+        if logical_name is None:
+            continue
+        if logical_name in result:
+            raise AdmissionError("cutover network inventory is duplicated or invalid")
+        result[logical_name] = network_id
+    return result
+
+
+def _cutover_input_evidence(path: Path) -> dict[str, Any]:
+    """Capture one root-protected rollback input without exposing its bytes."""
+
+    try:
+        raw, identity = provenance.read_protected_regular_file_snapshot(
+            path, label="legacy rollback Compose input"
+        )
+    except provenance.ProvenanceError as exc:
+        raise AdmissionError(str(exc)) from exc
+    (
+        device,
+        inode,
+        mode,
+        uid,
+        gid,
+        link_count,
+        size,
+        modified_ns,
+        changed_ns,
+    ) = identity
+    return {
+        "changed_ns": changed_ns,
+        "device": device,
+        "gid": gid,
+        "inode": inode,
+        "link_count": link_count,
+        "mode": stat.S_IMODE(mode),
+        "modified_ns": modified_ns,
+        "path": str(path),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "size": size,
+        "uid": uid,
+    }
+
+
+CutoverInputReader = Callable[[Path], dict[str, Any]]
+
+
+def _has_control_characters(value: str) -> bool:
+    return any(ord(character) < 32 or ord(character) == 127 for character in value)
+
+
+def _cutover_path_list(value: object, *, label: str) -> tuple[Path, ...]:
+    if not isinstance(value, str) or not value:
+        raise AdmissionError(f"legacy rollback {label} is missing")
+    if _has_control_characters(value):
+        raise AdmissionError(f"legacy rollback {label} is invalid")
+    paths = tuple(Path(item) for item in value.split(","))
+    if (
+        not paths
+        or len(paths) != len(set(paths))
+        or any(not path.is_absolute() or "," in str(path) for path in paths)
+    ):
+        raise AdmissionError(f"legacy rollback {label} is invalid")
+    return paths
+
+
+def _cutover_directory_evidence(path: Path) -> dict[str, Any]:
+    descriptor = -1
+    parent = -1
+    try:
+        parent, name = provenance.open_protected_parent(
+            path, label="legacy rollback working directory"
+        )
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=parent,
+        )
+        before = os.fstat(descriptor)
+        entry = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    except (OSError, provenance.ProvenanceError) as exc:
+        raise AdmissionError(
+            f"legacy rollback working directory is not protected: {path}"
+        ) from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if parent >= 0:
+            os.close(parent)
+    fields = (
+        "st_dev",
+        "st_ino",
+        "st_mode",
+        "st_uid",
+        "st_gid",
+        "st_mtime_ns",
+        "st_ctime_ns",
+    )
+    if (
+        before.st_uid != 0
+        or before.st_mode & 0o022
+        or any(getattr(before, field) != getattr(entry, field) for field in fields)
+    ):
+        raise AdmissionError(
+            f"legacy rollback working directory is not protected: {path}"
+        )
+    return {
+        "changed_ns": before.st_ctime_ns,
+        "device": before.st_dev,
+        "gid": before.st_gid,
+        "inode": before.st_ino,
+        "mode": stat.S_IMODE(before.st_mode),
+        "modified_ns": before.st_mtime_ns,
+        "path": str(path),
+        "uid": before.st_uid,
+    }
+
+
+CutoverDirectoryReader = Callable[[Path], dict[str, Any]]
+
+
+def _cutover_compose_prefix(
+    *,
+    config_files: Sequence[Path],
+    environment_files: Sequence[Path],
+    profiles: Sequence[str],
+    working_directory: Path,
+) -> tuple[str, ...]:
+    arguments = [
+        "compose",
+        "--project-name",
+        COMMON_PROJECT,
+        "--project-directory",
+        str(working_directory),
+    ]
+    for path in environment_files:
+        arguments.extend(("--env-file", str(path)))
+    for profile in profiles:
+        arguments.extend(("--profile", profile))
+    for path in config_files:
+        arguments.extend(("--file", str(path)))
+    return tuple(arguments)
+
+
+def _parse_cutover_timestamp(value: object, *, label: str) -> datetime:
+    if not isinstance(value, str) or not value.endswith("Z"):
+        raise AdmissionError(f"{label} is not a UTC timestamp")
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError as exc:
+        raise AdmissionError(f"{label} is not a UTC timestamp") from exc
+    if parsed.utcoffset() != timedelta(0):
+        raise AdmissionError(f"{label} is not a UTC timestamp")
+    return parsed.astimezone(timezone.utc)
+
+
+def _cutover_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _verified_cutover_postgres(*, runner: DockerRunner) -> str:
+    name_ids = _docker_id_lines(
+        runner(
+            (
+                "container",
+                "ls",
+                "--all",
+                "--no-trunc",
+                "--filter",
+                "name=^/postgres$",
+                "--format",
+                "{{.ID}}",
+            )
+        ),
+        label="exact-name PostgreSQL inventory",
+    )
+    service_ids = _docker_id_lines(
+        runner(
+            (
+                "container",
+                "ls",
+                "--all",
+                "--no-trunc",
+                "--filter",
+                f"label=com.docker.compose.project={COMMON_PROJECT}",
+                "--filter",
+                "label=com.docker.compose.service=postgres",
+                "--format",
+                "{{.ID}}",
+            )
+        ),
+        label="Compose PostgreSQL inventory",
+    )
+    if name_ids != service_ids or len(name_ids) != 1:
+        raise AdmissionError("shared PostgreSQL container identity is ambiguous")
+    container_id = name_ids[0]
+    container = _docker_object(
+        runner(("container", "inspect", container_id)),
+        label="shared PostgreSQL inspect",
+    )
+    config = container.get("Config")
+    labels = config.get("Labels") if isinstance(config, dict) else None
+    state = container.get("State")
+    health = state.get("Health") if isinstance(state, dict) else None
+    if (
+        container.get("Id") != container_id
+        or container.get("Name") != "/postgres"
+        or not isinstance(labels, dict)
+        or labels.get("com.docker.compose.project") != COMMON_PROJECT
+        or labels.get("com.docker.compose.service") != "postgres"
+        or labels.get("com.docker.compose.container-number") != "1"
+        or labels.get("com.docker.compose.oneoff") != "False"
+        or not isinstance(state, dict)
+        or state.get("Status") != "running"
+        or state.get("Running") is not True
+        or any(
+            state.get(field) is not False
+            for field in ("Dead", "Paused", "Restarting")
+        )
+        or not isinstance(health, dict)
+        or health.get("Status") != "healthy"
+    ):
+        raise AdmissionError("shared PostgreSQL container is not healthy and exact")
+    return container_id
+
+
+def _cutover_psql_json(
+    sql: str,
+    *,
+    container_id: str,
+    label: str,
+    runner: DockerRunner,
+) -> Any:
+    raw = runner(
+        (
+            "container",
+            "exec",
+            container_id,
+            "/bin/sh",
+            "-ceu",
+            'exec /usr/local/bin/psql -X --quiet --tuples-only --no-align '
+            '--set=ON_ERROR_STOP=1 --username "$POSTGRES_USER" '
+            '--dbname airflow --command "$1"',
+            "whoscored-cutover-read-only",
+            sql,
+        )
+    )
+    try:
+        lines = [line for line in raw.decode("utf-8").splitlines() if line]
+        result = json.loads(lines[0], object_pairs_hook=_unique_object)
+    except (
+        _DuplicateKey,
+        IndexError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+    ) as exc:
+        raise AdmissionError(f"{label} returned invalid JSON") from exc
+    if len(lines) != 1:
+        raise AdmissionError(f"{label} returned multiple values")
+    return result
+
+
+def snapshot_cutover_dag_pauses(
+    *, runner: DockerRunner = _run_docker
+) -> dict[str, Any]:
+    """Capture every DagModel pause flag before all trigger paths are frozen."""
+
+    container_id = _verified_cutover_postgres(runner=runner)
+    snapshot = _cutover_psql_json(
+        _CUTOVER_DAG_PAUSE_SQL,
+        container_id=container_id,
+        label="DagModel pause snapshot",
+        runner=runner,
+    )
+    states = snapshot.get("dag_pause_states") if isinstance(snapshot, dict) else None
+    if (
+        not isinstance(snapshot, dict)
+        or set(snapshot) != {"dag_pause_states", "observed_at"}
+        or not isinstance(states, list)
+        or any(
+            not isinstance(item, dict)
+            or set(item) != {"dag_id", "is_paused"}
+            or not isinstance(item.get("dag_id"), str)
+            or not item["dag_id"]
+            or type(item.get("is_paused")) is not bool
+            for item in states
+        )
+        or len({item["dag_id"] for item in states}) != len(states)
+    ):
+        raise AdmissionError("DagModel pause snapshot schema differs")
+    _parse_cutover_timestamp(snapshot.get("observed_at"), label="DB observation time")
+    return {
+        **snapshot,
+        "postgres_container_id": container_id,
+        "schema_version": 1,
+        "status": "dag-pauses-snapshotted-v1",
+    }
+
+
+def verify_cutover_quiescence(
+    *, runner: DockerRunner = _run_docker
+) -> dict[str, Any]:
+    """Prove one cross-source, read-only metadata snapshot has no active work."""
+
+    container_id = _verified_cutover_postgres(runner=runner)
+    snapshot = _cutover_psql_json(
+        _CUTOVER_QUIESCENCE_SQL,
+        container_id=container_id,
+        label="cutover quiescence query",
+        runner=runner,
+    )
+    active_fields = (
+        "active_dag_runs",
+        "active_task_instances",
+        "active_non_scheduler_jobs",
+        "active_fbref_crawl_runs",
+        "active_fbref_publication_locks",
+    )
+    if (
+        not isinstance(snapshot, dict)
+        or set(snapshot) != {*active_fields, "observed_at"}
+        or any(not isinstance(snapshot.get(field), list) for field in active_fields)
+    ):
+        raise AdmissionError("cutover quiescence snapshot schema differs")
+    _parse_cutover_timestamp(snapshot.get("observed_at"), label="DB observation time")
+    blockers = {
+        field: snapshot[field] for field in active_fields if snapshot[field]
+    }
+    if blockers:
+        raise AdmissionError(
+            "shared scheduler cutover is not quiescent: "
+            + ", ".join(
+                f"{field}={len(records)}" for field, records in blockers.items()
+            )
+        )
+    return {
+        **snapshot,
+        "postgres_container_id": container_id,
+        "schema_version": 1,
+        "status": "cutover-quiescent-v1",
+    }
+
+
+def verify_create_vacancy(
+    service: str,
+    *,
+    runner: DockerRunner = _run_docker,
+    now: Callable[[], datetime] = _cutover_now,
+) -> dict[str, Any]:
+    """Publish the empty identity boundary required before one Compose create."""
+
+    if service not in _PROTECTED_SERVICE_SET:
+        raise AdmissionError("create-vacancy service is not protected")
+    project = _SERVICE_PROJECT[service]
+    name_ids = _docker_id_lines(
+        runner(
+            (
+                "container",
+                "ls",
+                "--all",
+                "--no-trunc",
+                "--filter",
+                f"name=^/{service}$",
+                "--format",
+                "{{.ID}}",
+            )
+        ),
+        label=f"create-vacancy exact-name inventory for {service}",
+    )
+    service_ids = _docker_id_lines(
+        runner(
+            (
+                "container",
+                "ls",
+                "--all",
+                "--no-trunc",
+                "--filter",
+                f"label=com.docker.compose.project={project}",
+                "--filter",
+                f"label=com.docker.compose.service={service}",
+                "--format",
+                "{{.ID}}",
+            )
+        ),
+        label=f"create-vacancy Compose inventory for {service}",
+    )
+    if name_ids or service_ids:
+        raise AdmissionError(f"protected create target is not vacant: {service}")
+    observed_at = now().astimezone(timezone.utc)
+    return {
+        "observed_at": observed_at.isoformat(timespec="microseconds").replace(
+            "+00:00", "Z"
+        ),
+        "project": project,
+        "schema_version": 1,
+        "service": service,
+        "status": "create-vacancy-admitted-v1",
+    }
+
+
+def capture_created_object(
+    vacancy: Mapping[str, Any],
+    *,
+    runner: DockerRunner = _run_docker,
+    allow_partial: bool = False,
+) -> dict[str, Any]:
+    """Capture exact IDs immediately after one Compose create attempt."""
+
+    if set(vacancy) != {
+        "observed_at",
+        "project",
+        "schema_version",
+        "service",
+        "status",
+    }:
+        raise AdmissionError("create-vacancy receipt schema differs")
+    service = vacancy.get("service")
+    if (
+        vacancy.get("schema_version") != 1
+        or vacancy.get("status") != "create-vacancy-admitted-v1"
+        or not isinstance(service, str)
+        or service not in _PROTECTED_SERVICE_SET
+        or vacancy.get("project") != _SERVICE_PROJECT[service]
+    ):
+        raise AdmissionError("create-vacancy receipt identity differs")
+    project = _SERVICE_PROJECT[service]
+    not_before = _parse_cutover_timestamp(
+        vacancy.get("observed_at"), label="create-vacancy observation time"
+    )
+    name_ids = _docker_id_lines(
+        runner(
+            (
+                "container",
+                "ls",
+                "--all",
+                "--no-trunc",
+                "--filter",
+                f"name=^/{service}$",
+                "--format",
+                "{{.ID}}",
+            )
+        ),
+        label=f"created exact-name inventory for {service}",
+    )
+    service_ids = _docker_id_lines(
+        runner(
+            (
+                "container",
+                "ls",
+                "--all",
+                "--no-trunc",
+                "--filter",
+                f"label=com.docker.compose.project={project}",
+                "--filter",
+                f"label=com.docker.compose.service={service}",
+                "--format",
+                "{{.ID}}",
+            )
+        ),
+        label=f"created Compose inventory for {service}",
+    )
+    if name_ids != service_ids or len(name_ids) > 1:
+        raise AdmissionError(f"created container identity is ambiguous: {service}")
+    if not name_ids and not allow_partial:
+        raise AdmissionError(f"created container identity is ambiguous: {service}")
+    container_id: str | None = None
+    created_value: str | None = None
+    if name_ids:
+        container_id = name_ids[0]
+        container = _docker_object(
+            runner(("container", "inspect", container_id)),
+            label=f"created container inspect for {service}",
+        )
+        config = container.get("Config")
+        labels = config.get("Labels") if isinstance(config, dict) else None
+        state = container.get("State")
+        created_at = _parse_cutover_timestamp(
+            container.get("Created"), label=f"container Created for {service}"
+        )
+        if (
+            created_at < not_before
+            or container.get("Id") != container_id
+            or container.get("Name") != f"/{service}"
+            or not isinstance(labels, dict)
+            or labels.get("com.docker.compose.project") != project
+            or labels.get("com.docker.compose.service") != service
+            or labels.get("com.docker.compose.container-number") != "1"
+            or labels.get("com.docker.compose.oneoff") != "False"
+            or not isinstance(state, dict)
+            or type(state.get("Running")) is not bool
+            or not isinstance(state.get("Status"), str)
+            or not state["Status"]
+            or not allow_partial
+            and (state.get("Status") != "created" or state.get("Running") is not False)
+        ):
+            raise AdmissionError(
+                f"new container is not an exact created object: {service}"
+            )
+        created_value = str(container["Created"])
+    networks: list[dict[str, str]] = []
+    if project == GATEWAY_PROJECT:
+        network_ids = _docker_id_lines(
+            runner(
+                (
+                    "network",
+                    "ls",
+                    "--no-trunc",
+                    "--filter",
+                    f"label=com.docker.compose.project={project}",
+                    "--format",
+                    "{{.ID}}",
+                )
+            ),
+            label="created gateway-project network inventory",
+        )
+        expected_logical_networks = _CREATE_CAPTURE_GATEWAY_NETWORKS[service]
+        expected_names = {
+            _EXPECTED_NETWORK_DEFINITIONS[name]["name"]
+            for name in expected_logical_networks
+        }
+        expected_logical_names = {
+            _EXPECTED_NETWORK_DEFINITIONS[name]["name"]: name
+            for name in expected_logical_networks
+        }
+        for network_id in network_ids:
+            network = _docker_object(
+                runner(("network", "inspect", network_id)),
+                label="created gateway-project network inspect",
+            )
+            labels = network.get("Labels")
+            if (
+                network.get("Id") != network_id
+                or network.get("Name") not in expected_names
+                or not isinstance(labels, dict)
+                or labels.get("com.docker.compose.project") != project
+                or labels.get("com.docker.compose.network")
+                != expected_logical_names.get(str(network.get("Name")))
+            ):
+                raise AdmissionError("created gateway network identity differs")
+            networks.append({"id": network_id, "name": str(network["Name"])})
+        observed_names = {record["name"] for record in networks}
+        if len(observed_names) != len(networks) or (
+            observed_names != expected_names
+            if not allow_partial
+            else not observed_names.issubset(expected_names)
+        ):
+            raise AdmissionError("gateway create did not publish exact owned networks")
+    return {
+        "container_id": container_id,
+        "created_at": created_value,
+        "networks": sorted(networks, key=lambda item: item["name"]),
+        "project": project,
+        "schema_version": 1,
+        "service": service,
+        "status": "created-object-captured-v1",
+    }
+
+
+def _validated_cutover_input_evidence(
+    path: Path, *, reader: CutoverInputReader
+) -> dict[str, Any]:
+    evidence = reader(path)
+    integer_fields = {
+        "changed_ns",
+        "device",
+        "gid",
+        "inode",
+        "link_count",
+        "mode",
+        "modified_ns",
+        "size",
+        "uid",
+    }
+    if (
+        not isinstance(evidence, dict)
+        or set(evidence) != {*integer_fields, "path", "sha256"}
+        or evidence.get("path") != str(path)
+        or not isinstance(evidence.get("sha256"), str)
+        or _DIGEST.fullmatch(evidence["sha256"]) is None
+        or any(
+            isinstance(evidence.get(field), bool)
+            or not isinstance(evidence.get(field), int)
+            or evidence[field] < 0
+            for field in integer_fields
+        )
+        or evidence["uid"] != 0
+        or evidence["link_count"] != 1
+        or evidence["mode"] & 0o022
+    ):
+        raise AdmissionError(f"legacy rollback input evidence is invalid: {path}")
+    return evidence
+
+
+def _validated_cutover_directory_evidence(
+    path: Path, *, reader: CutoverDirectoryReader
+) -> dict[str, Any]:
+    evidence = reader(path)
+    integer_fields = {
+        "changed_ns",
+        "device",
+        "gid",
+        "inode",
+        "mode",
+        "modified_ns",
+        "uid",
+    }
+    if (
+        not isinstance(evidence, dict)
+        or set(evidence) != {*integer_fields, "path"}
+        or evidence.get("path") != str(path)
+        or any(
+            isinstance(evidence.get(field), bool)
+            or not isinstance(evidence.get(field), int)
+            or evidence[field] < 0
+            for field in integer_fields
+        )
+        or evidence["uid"] != 0
+        or evidence["mode"] & 0o022
+    ):
+        raise AdmissionError("legacy rollback working-directory evidence is invalid")
+    return evidence
+
+
+def _verify_legacy_rollback_model(
+    containers: Mapping[str, Mapping[str, Any]],
+    *,
+    runner: DockerRunner,
+    input_reader: CutoverInputReader,
+    directory_reader: CutoverDirectoryReader,
+) -> dict[str, Any]:
+    """Bind rollback to protected old Compose bytes and locally present images."""
+
+    rollback_services: list[dict[str, Any]] = []
+    for service in _LEGACY_CUTOVER_SERVICES:
+        if service not in containers:
+            continue
+        record = containers[service]
+        config_files = tuple(record["config_files"])
+        environment_files = tuple(record["environment_files"])
+        working_directory = record["working_directory"]
+        profiles = (
+            ("whoscored-paid",)
+            if service in GATEWAY_PROTECTED_SERVICES
+            else ()
+        )
+        input_paths = (*config_files, *environment_files)
+        before = {
+            path: _validated_cutover_input_evidence(path, reader=input_reader)
+            for path in input_paths
+        }
+        working_directory_before = _validated_cutover_directory_evidence(
+            working_directory, reader=directory_reader
+        )
+        prefix = _cutover_compose_prefix(
+            config_files=config_files,
+            environment_files=environment_files,
+            profiles=profiles,
+            working_directory=working_directory,
+        )
+        try:
+            rendered = json.loads(
+                runner((*prefix, "config", "--format", "json")).decode("utf-8"),
+                object_pairs_hook=_unique_object,
+            )
+        except (
+            _DuplicateKey,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+        ) as exc:
+            raise AdmissionError(
+                f"legacy rollback Compose model is invalid JSON: {service}"
+            ) from exc
+        services = rendered.get("services") if isinstance(rendered, dict) else None
+        networks = rendered.get("networks") if isinstance(rendered, dict) else None
+        if (
+            not isinstance(rendered, dict)
+            or rendered.get("name") != COMMON_PROJECT
+            or not isinstance(services, dict)
+            or service not in services
+            or not isinstance(networks, dict)
+        ):
+            raise AdmissionError(f"legacy rollback Compose model differs: {service}")
+        required_networks = (
+            (*_LEGACY_CUTOVER_RETAINED_NETWORKS, "whoscored-paid-api")
+            if service == "airflow-scheduler"
+            else _LEGACY_CUTOVER_NETWORKS
+            if service in GATEWAY_PROTECTED_SERVICES
+            else ("backend",)
+            if service == "flaresolverr"
+            else ()
+        )
+        for logical_name in required_networks:
+            network = networks.get(logical_name)
+            definition = _EXPECTED_NETWORK_DEFINITIONS[logical_name]
+            if network != definition:
+                raise AdmissionError(
+                    f"legacy rollback network model differs: {service} {logical_name}"
+                )
+        try:
+            raw_hash = runner((*prefix, "config", "--hash", service)).decode(
+                "ascii"
+            )
+        except UnicodeDecodeError as exc:
+            raise AdmissionError(
+                f"legacy rollback Compose hash is not ASCII: {service}"
+            ) from exc
+        fields = raw_hash.strip().split()
+        if fields != [service, record["config_hash"]]:
+            raise AdmissionError(
+                f"legacy rollback Compose hash differs: {service}"
+            )
+        image = _docker_object(
+            runner(("image", "inspect", str(record["image"]))),
+            label=f"legacy rollback image inspect for {service}",
+        )
+        repo_digests = image.get("RepoDigests")
+        if (
+            image.get("Id") != record["image_id"]
+            or not isinstance(repo_digests, list)
+            or record["image"] not in repo_digests
+        ):
+            raise AdmissionError(
+                f"legacy rollback image is not locally digest-bound: {service}"
+            )
+        after = {
+            path: _validated_cutover_input_evidence(path, reader=input_reader)
+            for path in input_paths
+        }
+        working_directory_after = _validated_cutover_directory_evidence(
+            working_directory, reader=directory_reader
+        )
+        if before != after or working_directory_before != working_directory_after:
+            raise AdmissionError(
+                f"legacy rollback Compose inputs changed during preflight: {service}"
+            )
+        rollback_services.append(
+            {
+                "compose": {
+                    "config_files": [str(path) for path in config_files],
+                    "environment_files": [str(path) for path in environment_files],
+                    "profiles": list(profiles),
+                    "project": COMMON_PROJECT,
+                    "working_directory": str(working_directory),
+                    "working_directory_evidence": working_directory_before,
+                },
+                "config_hash": str(record["config_hash"]),
+                "image": str(record["image"]),
+                "image_id": str(record["image_id"]),
+                "inputs": [before[path] for path in input_paths],
+                "running": bool(record["running"]),
+                "service": service,
+            }
+        )
+    return {"services": rollback_services}
+
+
+def verify_rollback_bundle(
+    inventory: Mapping[str, Any],
+    *,
+    runner: DockerRunner = _run_docker,
+    input_reader: CutoverInputReader = _cutover_input_evidence,
+    directory_reader: CutoverDirectoryReader = _cutover_directory_evidence,
+    post_cleanup: bool = False,
+) -> dict[str, Any]:
+    """Repeat every immutable rollback check immediately before recreation."""
+
+    if (
+        not isinstance(inventory, dict)
+        or set(inventory)
+        != {
+            "containers",
+            "mode",
+            "networks",
+            "retained_networks",
+            "rollback",
+            "schema_version",
+            "status",
+        }
+        or inventory.get("schema_version") != 1
+        or inventory.get("status") != "cutover-inventory-admitted-v1"
+        or inventory.get("mode") not in {"scheduler-only-v1", "full-legacy-v1"}
+    ):
+        raise AdmissionError("legacy rollback inventory schema differs")
+    rollback = inventory.get("rollback")
+    services = rollback.get("services") if isinstance(rollback, dict) else None
+    if (
+        not isinstance(rollback, dict)
+        or set(rollback) != {"services"}
+        or not isinstance(services, list)
+    ):
+        raise AdmissionError("legacy rollback bundle schema differs")
+    inventory_containers = inventory.get("containers")
+    if not isinstance(inventory_containers, list) or any(
+        not isinstance(record, dict)
+        or set(record) != {"container_id", "running", "service"}
+        or not isinstance(record.get("container_id"), str)
+        or _CONTAINER_ID.fullmatch(record["container_id"]) is None
+        or type(record.get("running")) is not bool
+        or record.get("service") not in _LEGACY_CUTOVER_SERVICES
+        for record in inventory_containers
+    ):
+        raise AdmissionError("legacy rollback container inventory differs")
+    inventory_states = {
+        str(record["service"]): bool(record["running"])
+        for record in inventory_containers
+    }
+    inventory_ids = {
+        str(record["service"]): str(record["container_id"])
+        for record in inventory_containers
+    }
+    expected_services = (
+        {"airflow-scheduler", "flaresolverr"}
+        if inventory["mode"] == "scheduler-only-v1"
+        else set(_LEGACY_CUTOVER_SERVICES)
+    )
+    if set(inventory_states) != expected_services or len(inventory_states) != len(
+        inventory_containers
+    ):
+        raise AdmissionError("legacy rollback service set differs from cutover mode")
+    expected_paid_networks = (
+        ("whoscored-paid-api",)
+        if inventory["mode"] == "scheduler-only-v1"
+        else _LEGACY_CUTOVER_NETWORKS
+    )
+    network_ids: set[str] = set()
+    for field, expected_logical_names in (
+        ("retained_networks", _LEGACY_CUTOVER_RETAINED_NETWORKS),
+        ("networks", expected_paid_networks),
+    ):
+        network_records = inventory.get(field)
+        if (
+            not isinstance(network_records, list)
+            or len(network_records) != len(expected_logical_names)
+            or [
+                record.get("logical_name")
+                for record in network_records
+                if isinstance(record, dict)
+            ]
+            != list(expected_logical_names)
+        ):
+            raise AdmissionError("legacy rollback network inventory differs")
+        for record in network_records:
+            logical_name = record.get("logical_name")
+            try:
+                subnet = ipaddress.ip_network(record.get("subnet"), strict=True)
+            except (TypeError, ValueError) as exc:
+                raise AdmissionError(
+                    "legacy rollback network inventory differs"
+                ) from exc
+            if (
+                set(record) != {"id", "logical_name", "name", "subnet"}
+                or logical_name not in expected_logical_names
+                or record.get("name")
+                != _EXPECTED_NETWORK_DEFINITIONS[str(logical_name)]["name"]
+                or not isinstance(record.get("id"), str)
+                or _CONTAINER_ID.fullmatch(record["id"]) is None
+                or record["id"] in network_ids
+                or subnet.version != 4
+                or not subnet.is_private
+            ):
+                raise AdmissionError("legacy rollback network inventory differs")
+            network_ids.add(record["id"])
+            if field == "retained_networks":
+                member_services = _LEGACY_CUTOVER_RETAINED_MEMBERS[
+                    str(logical_name)
+                ]
+                current_network = _verify_docker_network(
+                    logical_name=str(logical_name),
+                    project=COMMON_PROJECT,
+                    runner=runner,
+                    required_containers={
+                        inventory_ids[service]: service
+                        for service in member_services
+                        if not post_cleanup and inventory_states[service]
+                    },
+                    optional_containers={
+                        inventory_ids[service]: service
+                        for service in member_services
+                        if post_cleanup and inventory_states[service]
+                    },
+                    forbidden_container_ids=frozenset(
+                        inventory_ids[service]
+                        for service in member_services
+                        if not inventory_states[service]
+                    ),
+                )
+                if current_network != record:
+                    raise AdmissionError(
+                        "retained Docker network changed after cutover admission"
+                    )
+    pseudo_containers: dict[str, dict[str, Any]] = {}
+    for record in services:
+        compose = record.get("compose") if isinstance(record, dict) else None
+        inputs = record.get("inputs") if isinstance(record, dict) else None
+        service = record.get("service") if isinstance(record, dict) else None
+        expected_profiles = (
+            ["whoscored-paid"]
+            if service in GATEWAY_PROTECTED_SERVICES
+            else []
+        )
+        if (
+            not isinstance(record, dict)
+            or set(record)
+            != {
+                "compose",
+                "config_hash",
+                "image",
+                "image_id",
+                "inputs",
+                "running",
+                "service",
+            }
+            or service not in expected_services
+            or not isinstance(compose, dict)
+            or set(compose)
+            != {
+                "config_files",
+                "environment_files",
+                "profiles",
+                "project",
+                "working_directory",
+                "working_directory_evidence",
+            }
+            or compose.get("project") != COMMON_PROJECT
+            or compose.get("profiles") != expected_profiles
+            or not isinstance(compose.get("config_files"), list)
+            or not isinstance(compose.get("environment_files"), list)
+            or any(
+                not isinstance(path, str)
+                for path in (
+                    *compose.get("config_files", []),
+                    *compose.get("environment_files", []),
+                )
+            )
+            or not isinstance(compose.get("working_directory"), str)
+            or not isinstance(inputs, list)
+            or not isinstance(record.get("config_hash"), str)
+            or _CONFIG_HASH.fullmatch(record["config_hash"]) is None
+            or not isinstance(record.get("image"), str)
+            or _PINNED_IMAGE.fullmatch(record["image"]) is None
+            or not isinstance(record.get("image_id"), str)
+            or _IMAGE_ID.fullmatch(record["image_id"]) is None
+            or type(record.get("running")) is not bool
+            or record["running"] is not inventory_states[str(record["service"])]
+        ):
+            raise AdmissionError("legacy rollback service evidence differs")
+        config_files = _cutover_path_list(
+            ",".join(compose["config_files"]), label="config-file list"
+        )
+        environment_files = _cutover_path_list(
+            ",".join(compose["environment_files"]), label="environment-file list"
+        )
+        working_directory_raw = compose["working_directory"]
+        working_directory = Path(working_directory_raw)
+        if (
+            not working_directory.is_absolute()
+            or "," in working_directory_raw
+            or _has_control_characters(working_directory_raw)
+            or set(config_files) & set(environment_files)
+        ):
+            raise AdmissionError("legacy rollback Compose paths differ")
+        service = str(service)
+        if service in pseudo_containers:
+            raise AdmissionError("legacy rollback service evidence is duplicated")
+        pseudo_containers[service] = {
+            **record,
+            "config_files": config_files,
+            "environment_files": environment_files,
+            "working_directory": working_directory,
+        }
+    if set(pseudo_containers) != expected_services:
+        raise AdmissionError("legacy rollback service evidence is incomplete")
+    current = _verify_legacy_rollback_model(
+        pseudo_containers,
+        runner=runner,
+        input_reader=input_reader,
+        directory_reader=directory_reader,
+    )
+    if current != rollback:
+        raise AdmissionError("legacy rollback bundle changed after cutover admission")
+    return {
+        "inventory_sha256": hashlib.sha256(_canonical_bytes(inventory)).hexdigest(),
+        "schema_version": 1,
+        "services": [record["service"] for record in services],
+        "status": "rollback-bundle-admitted-v1",
+    }
+
+
+def _legacy_cutover_container_running_state(
+    state: Any, *, service: str
+) -> bool:
+    """Return the admitted legacy running flag only for a sane Docker state."""
+
+    unhealthy_flags = ("Paused", "Restarting", "Dead", "OOMKilled")
+    if (
+        not isinstance(state, dict)
+        or type(state.get("Running")) is not bool
+        or any(type(state.get(field)) is not bool for field in unhealthy_flags)
+    ):
+        raise AdmissionError(f"legacy cutover container state differs: {service}")
+    if state["Running"]:
+        health = state.get("Health")
+        if (
+            state.get("Status") != "running"
+            or any(state[field] for field in unhealthy_flags)
+            or not isinstance(health, dict)
+            or health.get("Status") != "healthy"
+        ):
+            raise AdmissionError(
+                f"legacy cutover container is not healthy and running: {service}"
+            )
+        return True
+    if (
+        state.get("Status") not in {"created", "exited"}
+        or any(state[field] for field in unhealthy_flags)
+    ):
+        raise AdmissionError(f"legacy cutover stopped container is not sane: {service}")
+    return False
+
+
+def verify_cutover_inventory(
+    *,
+    runner: DockerRunner = _run_docker,
+    input_reader: CutoverInputReader = _cutover_input_evidence,
+    directory_reader: CutoverDirectoryReader = _cutover_directory_evidence,
+) -> dict[str, Any]:
+    """Admit only an exact legacy split-project migration inventory."""
+
+    gateway_project_ids = _docker_id_lines(
+        runner(
+            (
+                "container",
+                "ls",
+                "--all",
+                "--no-trunc",
+                "--filter",
+                f"label=com.docker.compose.project={GATEWAY_PROJECT}",
+                "--format",
+                "{{.ID}}",
+            )
+        ),
+        label="gateway-project container inventory",
+    )
+    if gateway_project_ids:
+        raise AdmissionError("whoscored-gw already has containers before cutover")
+
+    containers: dict[str, dict[str, Any]] = {}
+    for service in _LEGACY_CUTOVER_SERVICES:
+        name_ids = _docker_id_lines(
+            runner(
+                (
+                    "container",
+                    "ls",
+                    "--all",
+                    "--no-trunc",
+                    "--filter",
+                    f"name=^/{service}$",
+                    "--format",
+                    "{{.ID}}",
+                )
+            ),
+            label=f"exact-name container inventory for {service}",
+        )
+        service_ids = _docker_id_lines(
+            runner(
+                (
+                    "container",
+                    "ls",
+                    "--all",
+                    "--no-trunc",
+                    "--filter",
+                    f"label=com.docker.compose.project={COMMON_PROJECT}",
+                    "--filter",
+                    f"label=com.docker.compose.service={service}",
+                    "--format",
+                    "{{.ID}}",
+                )
+            ),
+            label=f"service-label container inventory for {service}",
+        )
+        if name_ids != service_ids or len(name_ids) > 1:
+            raise AdmissionError(
+                f"legacy cutover container identity is ambiguous: {service}"
+            )
+        if not name_ids:
+            continue
+        container_id = name_ids[0]
+        container = _docker_object(
+            runner(("container", "inspect", container_id)),
+            label=f"legacy container inspect for {service}",
+        )
+        config = container.get("Config")
+        state = container.get("State")
+        network_settings = container.get("NetworkSettings")
+        labels = config.get("Labels") if isinstance(config, dict) else None
+        attached_networks = (
+            network_settings.get("Networks")
+            if isinstance(network_settings, dict)
+            else None
+        )
+        config_files = _cutover_path_list(
+            labels.get("com.docker.compose.project.config_files")
+            if isinstance(labels, dict)
+            else None,
+            label="config-file list",
+        )
+        environment_files = _cutover_path_list(
+            labels.get("com.docker.compose.project.environment_file")
+            if isinstance(labels, dict)
+            else None,
+            label="environment-file list",
+        )
+        working_directory_raw = (
+            labels.get("com.docker.compose.project.working_dir")
+            if isinstance(labels, dict)
+            else None
+        )
+        config_hash = (
+            labels.get("com.docker.compose.config-hash")
+            if isinstance(labels, dict)
+            else None
+        )
+        compose_version = (
+            labels.get("com.docker.compose.version")
+            if isinstance(labels, dict)
+            else None
+        )
+        image = config.get("Image") if isinstance(config, dict) else None
+        image_id = container.get("Image")
+        version_match = (
+            _COMPOSE_VERSION.fullmatch(compose_version)
+            if isinstance(compose_version, str)
+            else None
+        )
+        working_directory = (
+            Path(working_directory_raw)
+            if isinstance(working_directory_raw, str)
+            else Path()
+        )
+        running = _legacy_cutover_container_running_state(state, service=service)
+        if (
+            container.get("Id") != container_id
+            or container.get("Name") != f"/{service}"
+            or not isinstance(labels, dict)
+            or labels.get("com.docker.compose.project") != COMMON_PROJECT
+            or labels.get("com.docker.compose.service") != service
+            or labels.get("com.docker.compose.container-number") != "1"
+            or labels.get("com.docker.compose.oneoff") != "False"
+            or not isinstance(attached_networks, dict)
+            or not isinstance(config_hash, str)
+            or _CONFIG_HASH.fullmatch(config_hash) is None
+            or version_match is None
+            or tuple(int(version_match.group(index)) for index in (1, 2, 3))
+            < (2, 24, 4)
+            or not isinstance(working_directory_raw, str)
+            or not working_directory.is_absolute()
+            or "," in working_directory_raw
+            or _has_control_characters(working_directory_raw)
+            or set(config_files) & set(environment_files)
+            or not isinstance(image, str)
+            or _PINNED_IMAGE.fullmatch(image) is None
+            or not isinstance(image_id, str)
+            or _IMAGE_ID.fullmatch(image_id) is None
+        ):
+            raise AdmissionError(
+                f"legacy cutover container metadata differs: {service}"
+            )
+        containers[service] = {
+            "attached_networks": dict(attached_networks),
+            "container_id": container_id,
+            "config_files": config_files,
+            "config_hash": config_hash,
+            "environment_files": environment_files,
+            "image": image,
+            "image_id": image_id,
+            "running": running,
+            "working_directory": working_directory,
+        }
+
+    if not {"airflow-scheduler", "flaresolverr"}.issubset(containers):
+        raise AdmissionError(
+            "legacy cutover requires exactly one shared scheduler and FlareSolverr"
+        )
+    trio = tuple(
+        service for service in GATEWAY_PROTECTED_SERVICES if service in containers
+    )
+    if not trio:
+        mode = "scheduler-only-v1"
+        expected_network_members = {
+            "whoscored-paid-api": ("airflow-scheduler",),
+        }
+    elif trio == GATEWAY_PROTECTED_SERVICES:
+        mode = "full-legacy-v1"
+        expected_network_members = _LEGACY_CUTOVER_FULL_MEMBERS
+    else:
+        raise AdmissionError("legacy paid trio inventory is partial")
+
+    paid_network_names = {
+        _EXPECTED_NETWORK_DEFINITIONS[name]["name"] for name in _LEGACY_CUTOVER_NETWORKS
+    }
+    for service, record in containers.items():
+        attached = record["attached_networks"]
+        expected = {
+            _EXPECTED_NETWORK_DEFINITIONS[logical_name]["name"]
+            for logical_name, members in expected_network_members.items()
+            if service in members
+        }
+        observed = set(attached) & paid_network_names
+        if observed != expected:
+            raise AdmissionError(f"legacy paid-network attachment differs: {service}")
+        expected_all = (
+            expected | {"dp-backend", "dp-frontend", "dp-storage"}
+            if service == "airflow-scheduler"
+            else {"dp-backend"}
+            if service == "flaresolverr"
+            else expected
+        )
+        if set(attached) != expected_all:
+            raise AdmissionError(
+                f"legacy cutover service has an unexpected network: {service}"
+            )
+
+    gateway_network_ids = _docker_id_lines(
+        runner(
+            (
+                "network",
+                "ls",
+                "--no-trunc",
+                "--filter",
+                f"label=com.docker.compose.project={GATEWAY_PROJECT}",
+                "--format",
+                "{{.ID}}",
+            )
+        ),
+        label="gateway-project network inventory",
+    )
+    if gateway_network_ids:
+        raise AdmissionError("whoscored-gw already has networks before cutover")
+    listed_networks = _listed_cutover_networks(
+        runner(
+            (
+                "network",
+                "ls",
+                "--no-trunc",
+                "--format",
+                "{{.ID}}\t{{.Name}}",
+            )
+        )
+    )
+    expected_network_inventory = {
+        *_LEGACY_CUTOVER_RETAINED_NETWORKS,
+        *expected_network_members,
+    }
+    if set(listed_networks) != expected_network_inventory:
+        raise AdmissionError("legacy paid network inventory differs from cutover mode")
+    for logical_name in _LEGACY_CUTOVER_ALL_NETWORKS:
+        labeled_ids = _docker_id_lines(
+            runner(
+                (
+                    "network",
+                    "ls",
+                    "--no-trunc",
+                    "--filter",
+                    f"label=com.docker.compose.project={COMMON_PROJECT}",
+                    "--filter",
+                    f"label=com.docker.compose.network={logical_name}",
+                    "--format",
+                    "{{.ID}}",
+                )
+            ),
+            label=f"Compose-label network inventory for {logical_name}",
+        )
+        expected_id = listed_networks.get(logical_name)
+        if labeled_ids != ((expected_id,) if expected_id is not None else ()):
+            raise AdmissionError(
+                f"legacy cutover network identity is ambiguous: {logical_name}"
+            )
+
+    retained_networks: list[dict[str, str]] = []
+    for logical_name in _LEGACY_CUTOVER_RETAINED_NETWORKS:
+        member_services = _LEGACY_CUTOVER_RETAINED_MEMBERS[logical_name]
+        network = _verify_docker_network(
+            logical_name=logical_name,
+            project=COMMON_PROJECT,
+            runner=runner,
+            required_containers={
+                str(containers[service]["container_id"]): service
+                for service in member_services
+                if bool(containers[service]["running"])
+            },
+            forbidden_container_ids=frozenset(
+                str(containers[service]["container_id"])
+                for service in member_services
+                if not bool(containers[service]["running"])
+            ),
+        )
+        if network["id"] != listed_networks[logical_name]:
+            raise AdmissionError(
+                f"cutover network changed during inspection: {logical_name}"
+            )
+        retained_networks.append(network)
+
+    verified_networks: list[dict[str, str]] = []
+    for logical_name, services in expected_network_members.items():
+        expected_member_ids = {
+            str(containers[service]["container_id"]): service for service in services
+        }
+        configured_member_ids = _docker_id_lines(
+            runner(
+                (
+                    "container",
+                    "ls",
+                    "--all",
+                    "--no-trunc",
+                    "--filter",
+                    f"network={_EXPECTED_NETWORK_DEFINITIONS[logical_name]['name']}",
+                    "--format",
+                    "{{.ID}}",
+                )
+            ),
+            label=f"configured network membership for {logical_name}",
+        )
+        if set(configured_member_ids) != set(expected_member_ids):
+            raise AdmissionError(
+                f"configured Docker network membership differs: {logical_name}"
+            )
+        running_members = {
+            container_id: service
+            for container_id, service in expected_member_ids.items()
+            if bool(containers[service]["running"])
+        }
+        network = _verify_docker_network(
+            logical_name=logical_name,
+            project=COMMON_PROJECT,
+            runner=runner,
+            expected_containers=running_members,
+        )
+        if network["id"] != listed_networks[logical_name]:
+            raise AdmissionError(
+                f"cutover network changed during inspection: {logical_name}"
+            )
+        verified_networks.append(network)
+
+    network_ids_by_name = {
+        record["name"]: record["id"]
+        for record in (*retained_networks, *verified_networks)
+    }
+    for service, record in containers.items():
+        for network_name, endpoint in record["attached_networks"].items():
+            if (
+                not isinstance(endpoint, dict)
+                or endpoint.get("NetworkID") != network_ids_by_name.get(network_name)
+            ):
+                raise AdmissionError(
+                    f"legacy cutover network endpoint identity differs: {service}"
+                )
+
+    rollback = _verify_legacy_rollback_model(
+        containers,
+        runner=runner,
+        input_reader=input_reader,
+        directory_reader=directory_reader,
+    )
+    return {
+        "containers": [
+            {
+                "container_id": str(containers[service]["container_id"]),
+                "running": bool(containers[service]["running"]),
+                "service": service,
+            }
+            for service in _LEGACY_CUTOVER_SERVICES
+            if service in containers
+        ],
+        "mode": mode,
+        "networks": verified_networks,
+        "retained_networks": retained_networks,
+        "rollback": rollback,
+        "schema_version": 1,
+        "status": "cutover-inventory-admitted-v1",
     }
 
 
@@ -3795,6 +5444,46 @@ def _assert_scheduler_readable_regular_file(
     return metadata
 
 
+def _assert_fbref_geoip_database(path: Path) -> None:
+    """Require the one reviewed external GeoLite byte identity."""
+
+    try:
+        raw, identity = provenance.read_protected_regular_file_snapshot(
+            path, label="FBref Camoufox GeoLite database"
+        )
+    except provenance.ProvenanceError as exc:
+        raise AdmissionError(
+            "FBref Camoufox GeoLite database is missing or unprotected"
+        ) from exc
+    (
+        _device,
+        _inode,
+        mode,
+        uid,
+        gid,
+        link_count,
+        size,
+        _modified_ns,
+        _changed_ns,
+    ) = identity
+    if (
+        not stat.S_ISREG(mode)
+        or uid != 0
+        or gid != 0
+        or link_count != 1
+        or stat.S_IMODE(mode) != 0o444
+        or size != FBREF_CAMOUFOX_GEOIP_DATABASE_SIZE
+        or len(raw) != FBREF_CAMOUFOX_GEOIP_DATABASE_SIZE
+        or not hmac.compare_digest(
+            hashlib.sha256(raw).hexdigest(),
+            FBREF_CAMOUFOX_GEOIP_DATABASE_SHA256,
+        )
+    ):
+        raise AdmissionError(
+            "FBref Camoufox GeoLite database differs from the reviewed bytes"
+        )
+
+
 def _provider_receipt_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -4252,6 +5941,8 @@ def _validate_bind_source_policy(
                 source,
                 label=f"scheduler runtime input for {identity[0]} {identity[1]}",
             )
+        elif policy == "fbref-geoip-database":
+            _assert_fbref_geoip_database(source)
         else:
             _assert_protected_regular_file(
                 source, label=f"protected input for {identity[0]} {identity[1]}"
@@ -4269,6 +5960,12 @@ def _validate_bind_source_policy(
     protected_mounts = {
         "fotmob-admission": sources[
             ("airflow-scheduler", "/opt/airflow/fotmob-admission")
+        ],
+        "fbref-geoip-database": sources[
+            (
+                "airflow-scheduler",
+                FBREF_CAMOUFOX_GEOIP_DATABASE_CONTAINER_PATH,
+            )
         ],
         "scheduler-logs": sources[("airflow-scheduler", "/opt/airflow/logs")],
         "sofascore-budget-artifact": sources[
@@ -4304,6 +6001,23 @@ def _validate_bind_source_policy(
     _assert_separate_mounts(protected_mounts, label="protected runtime")
 
 
+def _read_protected_canonical_object(path: Path, *, label: str) -> dict[str, Any]:
+    _canonical_existing_path(path, label=label)
+    try:
+        raw = provenance.read_protected_regular_file(path, label=label)
+        value = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_object)
+    except (
+        _DuplicateKey,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        provenance.ProvenanceError,
+    ) as exc:
+        raise AdmissionError(f"{label} is not protected strict JSON") from exc
+    if not isinstance(value, dict) or raw != _canonical_bytes(value):
+        raise AdmissionError(f"{label} is not canonical JSON")
+    return value
+
+
 def _common_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--root", type=Path, default=Path.cwd())
@@ -4320,6 +6034,27 @@ def _parser() -> argparse.ArgumentParser:
     generate = commands.add_parser("generate-override", parents=[common])
     generate.add_argument("--common-output", type=Path, required=True)
     generate.add_argument("--gateway-output", type=Path, required=True)
+    pause_snapshot = commands.add_parser(
+        "snapshot-cutover-dag-pauses", parents=[common]
+    )
+    pause_snapshot.add_argument("--output", type=Path, required=True)
+    quiescence = commands.add_parser(
+        "verify-cutover-quiescence", parents=[common]
+    )
+    quiescence.add_argument("--output", type=Path, required=True)
+    cutover = commands.add_parser("verify-cutover-inventory", parents=[common])
+    cutover.add_argument("--output", type=Path, required=True)
+    rollback = commands.add_parser("verify-rollback-bundle", parents=[common])
+    rollback.add_argument("--inventory", type=Path, required=True)
+    rollback.add_argument("--post-cleanup", action="store_true")
+    rollback.add_argument("--output", type=Path, required=True)
+    vacancy = commands.add_parser("verify-create-vacancy", parents=[common])
+    vacancy.add_argument("--service", choices=PROTECTED_SERVICES, required=True)
+    vacancy.add_argument("--output", type=Path, required=True)
+    capture = commands.add_parser("capture-created-object", parents=[common])
+    capture.add_argument("--vacancy-receipt", type=Path, required=True)
+    capture.add_argument("--allow-partial", action="store_true")
+    capture.add_argument("--output", type=Path, required=True)
     rendered = commands.add_parser("verify-rendered", parents=[common])
     rendered.add_argument("--common-override", type=Path, required=True)
     rendered.add_argument("--gateway-override", type=Path, required=True)
@@ -4408,6 +6143,57 @@ def main(argv: Sequence[str] | None = None) -> int:
                 },
                 "schema_version": 2,
                 "status": "overrides-created-v2",
+            }
+        elif args.command in {
+            "snapshot-cutover-dag-pauses",
+            "verify-cutover-quiescence",
+            "verify-create-vacancy",
+            "capture-created-object",
+            "verify-cutover-inventory",
+            "verify-rollback-bundle",
+        }:
+            output = _absolute(args.output)
+            if args.command == "snapshot-cutover-dag-pauses":
+                evidence = snapshot_cutover_dag_pauses()
+            elif args.command == "verify-cutover-quiescence":
+                evidence = verify_cutover_quiescence()
+            elif args.command == "verify-create-vacancy":
+                evidence = verify_create_vacancy(args.service)
+            elif args.command == "capture-created-object":
+                evidence = capture_created_object(
+                    _read_protected_canonical_object(
+                        _absolute(args.vacancy_receipt),
+                        label="create-vacancy receipt",
+                    ),
+                    allow_partial=args.allow_partial,
+                )
+            elif args.command == "verify-rollback-bundle":
+                evidence = verify_rollback_bundle(
+                    _read_protected_canonical_object(
+                        _absolute(args.inventory),
+                        label="legacy cutover inventory",
+                    ),
+                    post_cleanup=args.post_cleanup,
+                )
+            else:
+                evidence = verify_cutover_inventory()
+            write_new_regular_file(output, _canonical_bytes(evidence))
+            report = {
+                (
+                    "inventory"
+                    if args.command == "verify-cutover-inventory"
+                    else "evidence"
+                ): evidence,
+                "output": str(output),
+                "output_sha256": hashlib.sha256(
+                    _canonical_bytes(evidence)
+                ).hexdigest(),
+                "schema_version": 1,
+                "status": (
+                    "cutover-inventory-recorded-v1"
+                    if args.command == "verify-cutover-inventory"
+                    else f"{args.command}-recorded-v1"
+                ),
             }
         else:
             provider_policy = validate_provider_policy(

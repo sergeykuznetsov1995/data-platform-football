@@ -13,11 +13,11 @@
 # байт-метричный фильтр-прокси) и все четыре принадлежащие ему сети. Общий
 # проект подключает только scheduler к external dp-whoscored-paid-api.
 #
-# Запуск (из корня стабильного чекаута, поднимает ТОЛЬКО этот шлюз):
-#   docker compose -p whoscored-gw \
-#     -f deploy/whoscored/gateway.compose.yaml \
-#     --project-directory . \
-#     --env-file /root/data-platform-football/.env up -d
+# Production: прямой `up -d` запрещён. Первый запуск выполняется только через
+# exact-ID split-project ceremony и post-create admission из
+# docs/operations/whoscored-production.md. Это важно и для хоста, где legacy
+# paid-profile никогда не создавался: там до cutover существуют общий scheduler,
+# общий FlareSolverr и принадлежащая `data-platform` сеть dp-whoscored-paid-api.
 #
 # Обязательные переменные окружения (в общий .env / стабильные пути, переживают
 # пересоздания; сервисы fail-closed при пустых секретах):
@@ -39,7 +39,10 @@
 #      whoscored_proxy_filter / whoscored_paid_gateway (они переехали сюда).
 #   2) Оставить у airflow-scheduler только внешнюю привязку к dp-whoscored-paid-api
 #      и WHOSCORED_PAID_GATEWAY_URL=http://whoscored_paid_gateway:8898.
-#   3) Поднять этот проект (`-p whoscored-gw up -d`), затем — общий scheduler.
+#   3) Выполнить one-time inventory/cutover ceremony из production runbook. Она
+#      допускает только common scheduler+FlareSolverr с полным legacy trio или
+#      без trio (scheduler-only-v1),
+#      создаёт сервисы остановленными и проверяет их до первого старта.
 name: whoscored-gw
 
 services:
