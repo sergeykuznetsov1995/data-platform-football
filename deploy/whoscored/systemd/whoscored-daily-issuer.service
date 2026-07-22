@@ -1,5 +1,5 @@
 [Unit]
-Description=Freeze and sign one bounded WhoScored daily approval
+Description=Freeze and sign one bounded WhoScored rollout-wave approval
 Requires=docker.service
 After=docker.service
 

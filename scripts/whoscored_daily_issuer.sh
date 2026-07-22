@@ -11,8 +11,6 @@ readonly DATE=/usr/bin/date
 readonly SHA256SUM=/usr/bin/sha256sum
 readonly FLOCK=/usr/bin/flock
 readonly PLANNER_NETWORK=dp-backend
-readonly MAX_SCOPES=3
-readonly TOTAL_BYTES=135000000
 readonly WINDOW_START=0900
 readonly WINDOW_END=0930
 
@@ -112,7 +110,7 @@ for variable in \
   WHOSCORED_RUNTIME_ENV_FILE \
   WHOSCORED_PROXY_POOL_ENV_FILE \
   WHOSCORED_PLANNER_ENV_FILE \
-  WHOSCORED_COHORT_FILE \
+  WHOSCORED_ROLLOUT_FILE \
   WHOSCORED_PROVIDER_POLICY_FILE \
   WHOSCORED_DEPLOYMENT_ADMISSION_RECEIPT_FILE \
   WHOSCORED_CHARTER_FILE \
@@ -149,7 +147,7 @@ for path in \
   "$WHOSCORED_RUNTIME_ENV_FILE" \
   "$WHOSCORED_PROXY_POOL_ENV_FILE" \
   "$WHOSCORED_PLANNER_ENV_FILE" \
-  "$WHOSCORED_COHORT_FILE" \
+  "$WHOSCORED_ROLLOUT_FILE" \
   "$WHOSCORED_PROVIDER_POLICY_FILE" \
   "$WHOSCORED_DEPLOYMENT_ADMISSION_RECEIPT_FILE" \
   "$WHOSCORED_CHARTER_FILE"
@@ -183,6 +181,16 @@ if ((10#$utc_hhmm < 10#$WINDOW_START || 10#$utc_hhmm > 10#$WINDOW_END)); then
   fail "issuer may run only from 09:00 through 09:30 UTC"
 fi
 
+issuance_rollout_id="$("$JQ" -er '
+  if type == "object" and .schema_version == 3 and
+    (.rollout_id | type == "string" and
+      test("^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"))
+  then .rollout_id
+  else error("invalid issuance rollout id")
+  end
+' "$WHOSCORED_ROLLOUT_FILE")" || fail "cannot resolve exact issuance rollout id"
+readonly issuance_rollout_id
+
 readonly running_admission_receipt="$RUNTIME_DIRECTORY/running-admission.json"
 test ! -e "$running_admission_receipt" || fail "running admission receipt already exists"
 admission_clean=(
@@ -204,6 +212,7 @@ admission_clean=(
   --env-file "$WHOSCORED_PROXY_POOL_ENV_FILE" \
   --provider-policy "$WHOSCORED_PROVIDER_POLICY_FILE" \
   --owner-secret-file "$CREDENTIALS_DIRECTORY/owner-hmac" \
+  --issuance-rollout-id "$issuance_rollout_id" \
   --deployment-admission-receipt "$WHOSCORED_DEPLOYMENT_ADMISSION_RECEIPT_FILE" \
   --service airflow-scheduler \
   --service flaresolverr \
@@ -213,8 +222,14 @@ admission_clean=(
   >"$running_admission_receipt"
 require_root_private_file "$running_admission_receipt"
 "$JQ" -e \
+  --slurpfile rollout "$WHOSCORED_ROLLOUT_FILE" \
+  --slurpfile charter "$WHOSCORED_CHARTER_FILE" \
   --arg planner "$WHOSCORED_PLANNER_IMAGE" \
-  --arg signer "$WHOSCORED_SIGNER_IMAGE" '
+  --arg signer "$WHOSCORED_SIGNER_IMAGE" \
+  --arg rollout_id "$issuance_rollout_id" '
+    $rollout[0] as $r |
+    $charter[0] as $c |
+    .issuance_rollout as $live |
     .schema_version == 2 and
     .status == "admitted-running-v1" and
     ([.images[] | select(.service == "airflow-scheduler") | .final_image]
@@ -229,7 +244,61 @@ require_root_private_file "$running_admission_receipt"
       "whoscored_proxy_filter"
     ]) and
     (.provider_policy.document_sha256
-      | type == "string" and test("^[0-9a-f]{64}$"))
+      | type == "string" and test("^[0-9a-f]{64}$")) and
+    ($live | type == "object" and keys == [
+      "authority",
+      "authority_binding",
+      "charter_sha256",
+      "promotion_acceptance_sha256",
+      "promotion_terminal_receipt_sha256",
+      "rollout_id",
+      "rollout_manifest_sha256",
+      "schema_version",
+      "status",
+      "wave_id"
+    ]) and
+    $live.schema_version == 1 and
+    $live.status == "live-authority-verified" and
+    $live.authority_binding == "current-signed-rollout" and
+    $live.rollout_id == $rollout_id and
+    $live.rollout_id == $r.rollout_id and
+    $live.rollout_id == $c.rollout_id and
+    $live.wave_id == $r.wave_id and
+    $live.wave_id == $c.wave_id and
+    $live.charter_sha256 == $c.document_sha256 and
+    $live.rollout_manifest_sha256 == $c.cohort_sha256 and
+    $live.promotion_acceptance_sha256 == $r.promotion_acceptance_sha256 and
+    $live.promotion_acceptance_sha256 == $c.promotion_acceptance_sha256 and
+    $live.promotion_terminal_receipt_sha256 ==
+      $r.promotion_terminal_receipt_sha256 and
+    $live.promotion_terminal_receipt_sha256 ==
+      $c.promotion_terminal_receipt_sha256 and
+    $live.authority == {
+      "rollout_id": $r.rollout_id,
+      "wave_id": $r.wave_id,
+      "max_scopes": $r.max_scopes,
+      "require_full_active": $r.require_full_active,
+      "cohort_sha256": $c.cohort_sha256,
+      "ranked_scope_ids_sha256": $r.ranked_scope_ids_sha256,
+      "runtime_sha256": $r.runtime_sha256,
+      "classifier_sha256": $r.classifier_sha256,
+      "promotion_acceptance_sha256": $r.promotion_acceptance_sha256,
+      "promotion_terminal_receipt_sha256":
+        $r.promotion_terminal_receipt_sha256
+    } and
+    $live.authority == {
+      "rollout_id": $c.rollout_id,
+      "wave_id": $c.wave_id,
+      "max_scopes": $c.max_scopes,
+      "require_full_active": $c.require_full_active,
+      "cohort_sha256": $c.cohort_sha256,
+      "ranked_scope_ids_sha256": $c.ranked_scope_ids_sha256,
+      "runtime_sha256": $c.runtime_sha256,
+      "classifier_sha256": $c.classifier_sha256,
+      "promotion_acceptance_sha256": $c.promotion_acceptance_sha256,
+      "promotion_terminal_receipt_sha256":
+        $c.promotion_terminal_receipt_sha256
+    }
   ' "$running_admission_receipt" >/dev/null || fail "fresh running admission is invalid"
 
 readonly logical_date="$($DATE -u --date='yesterday 10:00:00' '+%Y-%m-%dT10:00:00+00:00')"
@@ -245,7 +314,7 @@ planner_output_path="$planner_output_dir/${run_hash}.json"
 frozen_plan_host_path="$authority_stage/daily-plan.json"
 require_root_private_directory "$authority_stage"
 cleanup() {
-  rm -f -- "$authority_stage/cohort.json" \
+  rm -f -- "$authority_stage/rollout.json" \
     "$authority_stage/provider-policy.json" \
     "$authority_stage/charter.json" \
     "$planner_output_path" \
@@ -260,7 +329,7 @@ cleanup() {
 trap cleanup EXIT
 install -d -o 50000 -g 0 -m 0700 "$planner_output_dir"
 for mapping in \
-  "$WHOSCORED_COHORT_FILE:cohort.json" \
+  "$WHOSCORED_ROLLOUT_FILE:rollout.json" \
   "$WHOSCORED_PROVIDER_POLICY_FILE:provider-policy.json" \
   "$WHOSCORED_CHARTER_FILE:charter.json"
 do
@@ -278,6 +347,107 @@ test "$staged_policy_document_sha256" = "$admitted_policy_sha256" || \
 test "$("$SHA256SUM" "$WHOSCORED_PROVIDER_POLICY_FILE" | cut -d' ' -f1)" = \
   "$("$SHA256SUM" "$authority_stage/provider-policy.json" | cut -d' ' -f1)" || \
   fail "provider policy changed while it was staged"
+"$JQ" -e \
+  --arg runtime "$WHOSCORED_RUNTIME_SHA256" \
+  --arg classifier "$WHOSCORED_CLASSIFIER_SHA256" '
+    .schema_version == 3 and
+    .runtime_sha256 == $runtime and
+    .classifier_sha256 == $classifier and
+    (.promotion_acceptance_sha256 | type == "string" and
+      test("^[0-9a-f]{64}$")) and
+    (.promotion_terminal_receipt_sha256 | type == "string" and
+      test("^[0-9a-f]{64}$"))
+  ' "$authority_stage/rollout.json" >/dev/null || \
+  fail "rollout manifest differs from the pinned issuer release"
+"$JQ" -e \
+  --slurpfile rollout "$authority_stage/rollout.json" \
+  --arg runtime "$WHOSCORED_RUNTIME_SHA256" \
+  --arg classifier "$WHOSCORED_CLASSIFIER_SHA256" '
+    . as $charter |
+    $rollout[0] as $r |
+    .schema_version == 4 and
+    .runtime_sha256 == $runtime and
+    .classifier_sha256 == $classifier and
+    (["cohort_id", "rollout_id", "wave_id", "max_scopes",
+      "require_full_active", "ranked_scope_ids_sha256", "runtime_sha256",
+      "classifier_sha256", "promotion_acceptance_sha256",
+      "promotion_terminal_receipt_sha256"] |
+      all(. as $field | $r[$field] == $charter[$field]))
+  ' "$authority_stage/charter.json" >/dev/null || \
+  fail "charter differs from the staged rollout/release"
+staged_rollout_manifest_sha256="$(
+  "$JQ" -cS -j . "$authority_stage/rollout.json" |
+    "$SHA256SUM" | cut -d' ' -f1
+)" || fail "cannot hash the exact staged rollout manifest"
+[[ "$staged_rollout_manifest_sha256" =~ ^[0-9a-f]{64}$ ]] || \
+  fail "staged rollout manifest digest is invalid"
+readonly staged_rollout_manifest_sha256
+"$JQ" -e \
+  --slurpfile admission "$running_admission_receipt" \
+  --slurpfile rollout "$authority_stage/rollout.json" \
+  --arg rollout_id "$issuance_rollout_id" \
+  --arg staged_rollout_sha256 "$staged_rollout_manifest_sha256" '
+    $admission[0].issuance_rollout as $live |
+    $rollout[0] as $r |
+    . as $c |
+    ($live | type == "object" and keys == [
+      "authority",
+      "authority_binding",
+      "charter_sha256",
+      "promotion_acceptance_sha256",
+      "promotion_terminal_receipt_sha256",
+      "rollout_id",
+      "rollout_manifest_sha256",
+      "schema_version",
+      "status",
+      "wave_id"
+    ]) and
+    $live.schema_version == 1 and
+    $live.status == "live-authority-verified" and
+    $live.authority_binding == "current-signed-rollout" and
+    $live.rollout_id == $rollout_id and
+    $live.rollout_id == $r.rollout_id and
+    $live.rollout_id == $c.rollout_id and
+    $live.wave_id == $r.wave_id and
+    $live.wave_id == $c.wave_id and
+    $live.charter_sha256 == $c.document_sha256 and
+    $live.rollout_manifest_sha256 == $staged_rollout_sha256 and
+    $live.rollout_manifest_sha256 == $c.cohort_sha256 and
+    $live.rollout_manifest_sha256 == $live.authority.cohort_sha256 and
+    $live.promotion_acceptance_sha256 == $r.promotion_acceptance_sha256 and
+    $live.promotion_acceptance_sha256 == $c.promotion_acceptance_sha256 and
+    $live.promotion_terminal_receipt_sha256 ==
+      $r.promotion_terminal_receipt_sha256 and
+    $live.promotion_terminal_receipt_sha256 ==
+      $c.promotion_terminal_receipt_sha256 and
+    $live.authority == {
+      "rollout_id": $r.rollout_id,
+      "wave_id": $r.wave_id,
+      "max_scopes": $r.max_scopes,
+      "require_full_active": $r.require_full_active,
+      "cohort_sha256": $c.cohort_sha256,
+      "ranked_scope_ids_sha256": $r.ranked_scope_ids_sha256,
+      "runtime_sha256": $r.runtime_sha256,
+      "classifier_sha256": $r.classifier_sha256,
+      "promotion_acceptance_sha256": $r.promotion_acceptance_sha256,
+      "promotion_terminal_receipt_sha256":
+        $r.promotion_terminal_receipt_sha256
+    } and
+    $live.authority == {
+      "rollout_id": $c.rollout_id,
+      "wave_id": $c.wave_id,
+      "max_scopes": $c.max_scopes,
+      "require_full_active": $c.require_full_active,
+      "cohort_sha256": $c.cohort_sha256,
+      "ranked_scope_ids_sha256": $c.ranked_scope_ids_sha256,
+      "runtime_sha256": $c.runtime_sha256,
+      "classifier_sha256": $c.classifier_sha256,
+      "promotion_acceptance_sha256": $c.promotion_acceptance_sha256,
+      "promotion_terminal_receipt_sha256":
+        $c.promotion_terminal_receipt_sha256
+    }
+  ' "$authority_stage/charter.json" >/dev/null || \
+  fail "staged rollout authority differs from fresh running admission"
 install -d -o 50000 -g 0 -m 0700 "$authority_stage/credentials"
 for name in approval-hmac owner-hmac issuance-ledger-hmac; do
   install -o 50000 -g 0 -m 0400 \
@@ -321,13 +491,12 @@ container_hardening=(
   --env-file "$WHOSCORED_PLANNER_ENV_FILE" \
   "${container_hardening[@]}" \
   "${common_mounts[@]}" \
-  --mount "type=bind,src=$authority_stage/cohort.json,dst=/authority/cohort.json,readonly" \
+  --mount "type=bind,src=$authority_stage/rollout.json,dst=/authority/rollout.json,readonly" \
   --mount "type=bind,src=$planner_output_dir,dst=/var/lib/whoscored/plans" \
   "$WHOSCORED_PLANNER_IMAGE" \
   python /opt/airflow/scripts/whoscored_proxy_campaign.py \
     plan-daily-ingest \
-    --cohort-file /authority/cohort.json \
-    --max-scopes "$MAX_SCOPES" \
+    --rollout-file /authority/rollout.json \
     --output "$planner_plan_container_path"
 require_container_private_file "$planner_output_path"
 install -o root -g root -m 0440 "$planner_output_path" "$frozen_plan_host_path"
@@ -337,10 +506,24 @@ test "$("$SHA256SUM" "$planner_output_path" | cut -d' ' -f1)" = \
   fail "daily plan changed while it was frozen"
 rm -f -- "$planner_output_path"
 rmdir -- "$planner_output_dir"
-"$JQ" -e --argjson max_scopes "$MAX_SCOPES" '
-  .schema_version == 2 and
-  .max_scopes == $max_scopes and
-  (.scope_workloads | type == "array" and length >= 1 and length <= $max_scopes)
+"$JQ" -e '
+  .max_scopes as $max_scopes |
+  .catalog_active_scope_count as $active_count |
+  .schema_version == 3 and
+  ((.wave_id == "wave-20" and .max_scopes == 20 and
+      .require_full_active == false) or
+   (.wave_id == "wave-70" and .max_scopes == 70 and
+      .require_full_active == false) or
+   (.wave_id == "wave-all" and .max_scopes == 2000 and
+      .require_full_active == true)) and
+  ($active_count | type == "number" and
+    . >= 1 and . <= 2000) and
+  (.ranked_scope_ids_sha256 | type == "string" and
+    test("^[0-9a-f]{64}$")) and
+  (.scope_workloads | type == "array" and length >= 1 and
+    length == ([$max_scopes, $active_count] | min)) and
+  (.ranked_scope_workloads | type == "array" and
+    length == $active_count)
 ' "$frozen_plan_host_path" >/dev/null || fail "daily plan exceeds the exact scope bound"
 
 "${docker_clean[@]}" run --rm --pull never \
@@ -349,7 +532,7 @@ rmdir -- "$planner_output_dir"
   "${container_hardening[@]}" \
   "${common_mounts[@]}" \
   --mount "type=bind,src=$frozen_plan_host_path,dst=$signer_plan_container_path,readonly" \
-  --mount "type=bind,src=$authority_stage/cohort.json,dst=/authority/cohort.json,readonly" \
+  --mount "type=bind,src=$authority_stage/rollout.json,dst=/authority/rollout.json,readonly" \
   --mount "type=bind,src=$authority_stage/provider-policy.json,dst=/authority/provider-policy.json,readonly" \
   --mount "type=bind,src=$authority_stage/charter.json,dst=/authority/charter.json,readonly" \
   --mount "type=bind,src=$authority_stage/credentials,dst=/run/credentials,readonly" \
@@ -361,13 +544,11 @@ rmdir -- "$planner_output_dir"
     issue-daily-ingest \
     --run-id "$run_id" \
     --plan-file "$signer_plan_container_path" \
-    --cohort-file /authority/cohort.json \
-    --max-scopes "$MAX_SCOPES" \
+    --rollout-file /authority/rollout.json \
     --provider-policy /authority/provider-policy.json \
     --charter /authority/charter.json \
     --runtime-sha256 "$WHOSCORED_RUNTIME_SHA256" \
     --classifier-sha256 "$WHOSCORED_CLASSIFIER_SHA256" \
-    --total-bytes "$TOTAL_BYTES" \
     --approval-root /authority/approvals \
     --pointer-root /authority/pointers \
     --issuance-ledger /authority/ledger/issuance-ledger.json \

@@ -47,6 +47,8 @@ _WHOSCORED_APPROVAL_PATH_RE = re.compile(
     r"/opt/airflow/secure/whoscored-approvals/"
     r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\.json"
 )
+
+
 def _trusted_source_uids(*, require_protected: bool) -> frozenset[int]:
     """Return owners accepted for the exact sibling source load."""
 
@@ -55,9 +57,7 @@ def _trusted_source_uids(*, require_protected: bool) -> frozenset[int]:
     return frozenset({0, os.geteuid()})
 
 
-def _load_exact_provenance_validator(
-    *, require_protected: bool
-) -> types.ModuleType:
+def _load_exact_provenance_validator(*, require_protected: bool) -> types.ModuleType:
     """Execute the exact sibling validator without consulting import paths."""
 
     module_name = "_whoscored_exact_build_provenance_validator"
@@ -67,9 +67,7 @@ def _load_exact_provenance_validator(
     components = path.absolute().parts[1:]
     directory_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
     file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
-    trusted_source_uids = _trusted_source_uids(
-        require_protected=require_protected
-    )
+    trusted_source_uids = _trusted_source_uids(require_protected=require_protected)
     parent_descriptor = os.open("/", directory_flags)
     descriptor = -1
     try:
@@ -149,9 +147,7 @@ def _load_exact_provenance_validator(
 # owner-protected checkout for offline validation, tests, and ``--help``;
 # ``main`` rejects real admission unless it proves the privileged release.
 try:
-    provenance = _load_exact_provenance_validator(
-        require_protected=os.geteuid() == 0
-    )
+    provenance = _load_exact_provenance_validator(require_protected=os.geteuid() == 0)
 except BaseException:
     if __name__ == "__main__":
         _bootstrap_sys.modules["posix"]._exit(78)
@@ -162,6 +158,21 @@ EXIT_CONFIG = 78
 MAX_JSON_BYTES = 16 * 1024 * 1024
 MAX_PROVIDER_QUOTA_RECEIPT_BYTES = 32 * 1024
 MAX_PROVIDER_QUOTA_RECEIPT_AGE = timedelta(hours=24)
+MAX_ROLLOUT_ACCEPTANCE_AGE = timedelta(hours=36)
+ROLLOUT_ACCEPTANCE_TIMEOUT_SECONDS = 10 * 3600
+MAX_CHARTER_HORIZON = timedelta(days=62)
+_CURRENT_ROLLOUT_PATH = Path("/var/lib/data-platform/whoscored-authority/rollout.json")
+_CURRENT_CHARTER_PATH = Path("/var/lib/data-platform/whoscored-authority/charter.json")
+_ROLLOUT_MANIFEST_SCHEMA_VERSION = 3
+_CHARTER_SCHEMA_VERSION = 4
+_ROLLOUT_GENESIS_PROOF_SHA256 = hashlib.sha256(
+    b"whoscored-rollout-promotion-genesis-v1"
+).hexdigest()
+_ROLLOUT_WAVE_CONTRACTS = {
+    "wave-20": (20, False),
+    "wave-70": (70, False),
+    "wave-all": (2_000, True),
+}
 FBREF_CAMOUFOX_GEOIP_DATABASE_CONTAINER_PATH = (
     "/opt/airflow/secure/fbref-geoip/GeoLite2-City.mmdb"
 )
@@ -205,6 +216,80 @@ _PROVIDER_POLICY_FIELDS = _PROVIDER_POLICY_UNSIGNED_FIELDS | {
     "document_sha256",
     "signature",
 }
+_ROLLOUT_MANIFEST_FIELDS = frozenset(
+    {
+        "schema_version",
+        "cohort_id",
+        "rollout_id",
+        "wave_id",
+        "max_scopes",
+        "require_full_active",
+        "ranked_scope_ids",
+        "ranked_scope_ids_sha256",
+        "ranking_basis_workload_sha256",
+        "ranking_basis_scope_workloads",
+        "runtime_sha256",
+        "classifier_sha256",
+        "promotion_acceptance_sha256",
+        "promotion_terminal_receipt_sha256",
+    }
+)
+_CHARTER_UNSIGNED_FIELDS = frozenset(
+    {
+        "schema_version",
+        "source",
+        "provider_policy_sha256",
+        "order_id",
+        "billing_month",
+        "cohort_id",
+        "cohort_sha256",
+        "rollout_id",
+        "wave_id",
+        "max_scopes",
+        "require_full_active",
+        "ranked_scope_ids_sha256",
+        "runtime_sha256",
+        "classifier_sha256",
+        "promotion_acceptance_sha256",
+        "promotion_terminal_receipt_sha256",
+        "valid_from",
+        "valid_until",
+        "daily_cap_bytes",
+        "monthly_cap_bytes",
+        "order_cap_bytes",
+        "max_issuances",
+        "signature_algorithm",
+    }
+)
+_CHARTER_FIELDS = _CHARTER_UNSIGNED_FIELDS | {
+    "document_sha256",
+    "signature",
+}
+_ROLLOUT_ACCEPTANCE_AUTHORITY_FIELDS = frozenset(
+    {
+        "rollout_id",
+        "wave_id",
+        "max_scopes",
+        "require_full_active",
+        "cohort_sha256",
+        "ranked_scope_ids_sha256",
+        "runtime_sha256",
+        "classifier_sha256",
+        "promotion_acceptance_sha256",
+        "promotion_terminal_receipt_sha256",
+    }
+)
+_ROLLOUT_AUTHORITY_REPORT_FIELDS = frozenset(
+    {
+        "authority",
+        "authority_binding",
+        "catalog_active_scope_count",
+        "catalog_active_scopes_sha256",
+        "charter_sha256",
+        "cohort_id",
+        "rollout_manifest_sha256",
+    }
+)
 PROTECTED_SERVICES = (
     "airflow-scheduler",
     "flaresolverr",
@@ -378,6 +463,7 @@ _CONTAINER_ID = re.compile(r"\A[0-9a-f]{64}\Z")
 _MAC_ADDRESS = re.compile(r"\A(?:[0-9a-f]{2}:){5}[0-9a-f]{2}\Z")
 _PROJECT_NAME = re.compile(r"\A[a-z0-9][a-z0-9_-]*\Z")
 _CONFIG_HASH = re.compile(r"\A[0-9a-f]{64}\Z")
+_ROLLOUT_ID = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _COMPOSE_VERSION = re.compile(
     r"\A([0-9]+)\.([0-9]+)\.([0-9]+)(?:[-+][0-9A-Za-z.-]+)?\Z"
 )
@@ -1120,14 +1206,17 @@ _SCHEDULER_ENVIRONMENT_NAMES = frozenset(
     WHOSCORED_BACKUP_DESTINATION_S3_REGION
     WHOSCORED_BACKUP_DESTINATION_S3_SCHEME
     WHOSCORED_BACKUP_DESTINATION_S3_SECRET_KEY
-    WHOSCORED_BACKUP_DESTINATION_SITE_ID WHOSCORED_BACKUP_DESTINATION_URI
+    WHOSCORED_BACKUP_DESTINATION_URI
     WHOSCORED_BACKUP_LOCAL_RETENTION_DAYS
+    WHOSCORED_BACKUP_RESTORE_DRILL_EVIDENCE_PATH
+    WHOSCORED_BACKUP_RESTORE_DRILL_MAX_AGE_HOURS
     WHOSCORED_BACKUP_RESTORE_S3_ACCESS_KEY
     WHOSCORED_BACKUP_RESTORE_S3_ENDPOINT WHOSCORED_BACKUP_RESTORE_S3_REGION
     WHOSCORED_BACKUP_RESTORE_S3_SCHEME WHOSCORED_BACKUP_RESTORE_S3_SECRET_KEY
     WHOSCORED_BACKUP_SOURCE_S3_ACCESS_KEY WHOSCORED_BACKUP_SOURCE_S3_ENDPOINT
     WHOSCORED_BACKUP_SOURCE_S3_REGION WHOSCORED_BACKUP_SOURCE_S3_SCHEME
-    WHOSCORED_BACKUP_SOURCE_S3_SECRET_KEY WHOSCORED_BACKUP_SOURCE_SITE_ID
+    WHOSCORED_BACKUP_SOURCE_S3_SECRET_KEY
+    WHOSCORED_BACKUP_RPO_HOURS WHOSCORED_BACKUP_RTO_HOURS
     WHOSCORED_BACKUP_WORKERS WHOSCORED_CATALOG_REQUESTS_PER_MINUTE
     WHOSCORED_DAILY_P95_LIMIT_HOURS WHOSCORED_DAILY_PROFILE_MAX_LIMIT
     WHOSCORED_DAILY_SLO_MIN_SAMPLES WHOSCORED_DAILY_SLO_WINDOW
@@ -1216,12 +1305,16 @@ _FIXED_ENVIRONMENT = {
             "/opt/airflow/runtime/sofascore/proxy_budget_canary.json"
         ),
         "TM_BACKFILL_PROXY_CONTROL_URL": "http://proxy_filter:8899",
-        "TRANSFERMARKT_RAW_STORE_URI": "s3://warehouse/raw/transfermarkt",
         "WHOSCORED_BACKFILL_POOL": "whoscored_direct_pool",
+        "WHOSCORED_BACKUP_RESTORE_DRILL_EVIDENCE_PATH": (
+            "/opt/airflow/logs/whoscored_backup/restore-drill-evidence.json"
+        ),
+        "WHOSCORED_BACKUP_RESTORE_DRILL_MAX_AGE_HOURS": "24",
+        "WHOSCORED_BACKUP_RPO_HOURS": "24",
+        "WHOSCORED_BACKUP_RTO_HOURS": "24",
         "WHOSCORED_DIRECT_POOL": "whoscored_direct_pool",
         "WHOSCORED_DQ_POOL": "whoscored_dq_pool",
         "WHOSCORED_LOCK_DIR": "/opt/airflow/logs/whoscored/commit_locks",
-        "WHOSCORED_OPS_STORE_URI": "s3://warehouse/ops/whoscored",
         "WHOSCORED_PAID_GATEWAY_URL": "http://whoscored_paid_gateway:8898",
         "WHOSCORED_PROXY_APPROVAL_ROOT": ("/opt/airflow/secure/whoscored-approvals"),
         "WHOSCORED_SCHEDULED_PAID_POINTER_ROOT": (
@@ -1234,7 +1327,6 @@ _FIXED_ENVIRONMENT = {
         "WHOSCORED_RAW_LOCK_DIR": "/opt/airflow/logs/whoscored/raw_locks",
         "WHOSCORED_RAW_S3_ENDPOINT": "seaweedfs:8333",
         "WHOSCORED_RAW_S3_SCHEME": "http",
-        "WHOSCORED_RAW_STORE_URI": "s3://warehouse/raw/whoscored",
         "WHOSCORED_REQUEST_LEDGER_PATH": (
             "/opt/airflow/logs/whoscored/request_ledger.jsonl"
         ),
@@ -1383,6 +1475,21 @@ def _canonical_bytes(value: object) -> bytes:
         json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
         + "\n"
     ).encode("utf-8")
+
+
+def _authority_canonical_bytes(value: object) -> bytes:
+    """Mirror the no-newline canonical encoding used by the offline signer."""
+
+    try:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise AdmissionError("owner authority contains non-canonical JSON") from exc
 
 
 def _stat_identity(value: os.stat_result) -> tuple[int, ...]:
@@ -1920,6 +2027,45 @@ def _forbidden_environment_names(
     }
 
 
+def _validate_whoscored_store_uris(environment: Mapping[str, str]) -> None:
+    """Bind both WhoScored stores to the one admitted physical S3 bucket."""
+
+    bucket = environment.get("ICEBERG_WAREHOUSE", "")
+    if (
+        re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", bucket) is None
+        or ".." in bucket
+        or ".-" in bucket
+        or "-." in bucket
+        or re.fullmatch(r"[0-9]+(?:\.[0-9]+){3}", bucket) is not None
+    ):
+        raise AdmissionError("rendered ICEBERG_WAREHOUSE bucket is invalid")
+    expected = {
+        "WHOSCORED_RAW_STORE_URI": f"s3://{bucket}/raw/whoscored",
+        "WHOSCORED_OPS_STORE_URI": f"s3://{bucket}/ops/whoscored",
+    }
+    if any(
+        not hmac.compare_digest(environment.get(name, ""), value)
+        for name, value in expected.items()
+    ):
+        raise AdmissionError(
+            "rendered WhoScored raw/ops stores differ from admitted ICEBERG_WAREHOUSE"
+        )
+
+
+def _validate_scheduler_store_uris(environment: Mapping[str, str]) -> None:
+    """Bind every protected scheduler source store to its warehouse prefix."""
+
+    _validate_whoscored_store_uris(environment)
+    bucket = environment["ICEBERG_WAREHOUSE"]
+    if not hmac.compare_digest(
+        environment.get("TRANSFERMARKT_RAW_STORE_URI", ""),
+        f"s3://{bucket}/raw/transfermarkt",
+    ):
+        raise AdmissionError(
+            "rendered source raw/ops stores differ from admitted ICEBERG_WAREHOUSE"
+        )
+
+
 def _validate_rendered_environment(
     environment: Mapping[str, str], *, service: str
 ) -> None:
@@ -1932,8 +2078,7 @@ def _validate_rendered_environment(
         }
     ) | {"WHOSCORED_PROXY_APPROVAL_PATH"}
     legacy_scheduler = (
-        service == "airflow-scheduler"
-        and set(environment) == legacy_scheduler_names
+        service == "airflow-scheduler" and set(environment) == legacy_scheduler_names
     )
     if set(environment) != expected_names and not legacy_scheduler:
         raise AdmissionError(f"rendered environment names differ: {service}")
@@ -1957,6 +2102,7 @@ def _validate_rendered_environment(
     ) not in {"0", "1"}:
         raise AdmissionError("rendered WhoScored paid-batch control differs")
     if service == "airflow-scheduler":
+        _validate_scheduler_store_uris(environment)
         expected_sofascore_artifact_id = environment.get(
             "SOFASCORE_PROXY_BUDGET_ARTIFACT_ID", ""
         )
@@ -1992,9 +2138,7 @@ def _validate_rendered_environment(
             raise AdmissionError(
                 "rendered Transfermarkt paid controls are not fail-closed"
             )
-        backfill_token = environment.get(
-            "TM_BACKFILL_PROXY_CONTROL_TOKEN", ""
-        ).strip()
+        backfill_token = environment.get("TM_BACKFILL_PROXY_CONTROL_TOKEN", "").strip()
         if backfill_token and (
             len(backfill_token) < 32
             or backfill_token
@@ -2321,16 +2465,12 @@ def verify_rendered_compose(
         modeled_keys = set(model)
         if model.get("profiles") == ["whoscored-paid"]:
             modeled_keys.discard("profiles")
-        if (
-            service == "whoscored_proxy_filter"
-            and model.get("depends_on")
-            == {
-                "airflow-log-init": {
-                    "condition": "service_completed_successfully",
-                    "required": True,
-                }
+        if service == "whoscored_proxy_filter" and model.get("depends_on") == {
+            "airflow-log-init": {
+                "condition": "service_completed_successfully",
+                "required": True,
             }
-        ):
+        }:
             modeled_keys.discard("depends_on")
         if modeled_keys != _ALLOWED_RENDERED_KEYS[service]:
             raise AdmissionError(
@@ -2455,7 +2595,10 @@ def verify_rendered_compose(
             legacy_volume_policy.pop(
                 "/opt/airflow/secure/whoscored-scheduled-pointers", None
             )
-        if volume_policy != expected_volume_policy and volume_policy != legacy_volume_policy:
+        if (
+            volume_policy != expected_volume_policy
+            and volume_policy != legacy_volume_policy
+        ):
             raise AdmissionError(f"rendered mount-target policy differs: {service}")
         if tmpfs != _ALLOWED_TMPFS[service]:
             raise AdmissionError(f"rendered tmpfs policy differs: {service}")
@@ -2526,6 +2669,288 @@ def verify_rendered_compose(
 
 DockerRunner = Callable[[Sequence[str]], bytes]
 
+_ROLLOUT_ACCEPTANCE_PROBE = """\
+import json
+import sys
+from datetime import timezone
+
+from airflow.models.dagrun import DagRun
+from airflow.models.taskinstance import TaskInstance
+from airflow.models.xcom import XCom
+from airflow.utils.session import create_session
+from airflow.utils.xcom import XCOM_RETURN_KEY
+from dags.dag_backup_whoscored_storage import (
+    validate_whoscored_backup_recovery_contract,
+)
+from dags.scripts.whoscored_ops_store import WhoScoredOpsStore
+from dags.scripts.whoscored_rollout_acceptance import (
+    idempotency_evidence,
+    is_countable_scheduled_run,
+    mapped_scope_dq_evidence,
+    receipts_prefix,
+    rollout_acceptance_status,
+    run_evidence_sha256,
+    scope_plan_sha256,
+    terminal_task_states_evidence,
+)
+from scrapers.whoscored.runtime_contract import validate_runtime_contract
+
+
+def utc_iso(value):
+    if value is None or value.tzinfo is None:
+        raise RuntimeError("WhoScored accepted DagRun logical date is invalid")
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+rollout_id = sys.argv[1]
+runtime = validate_runtime_contract(report_schema_version=3)
+runtime_release = {
+    "parser_version": runtime["parser_version"],
+    "manifest_sha256": runtime["manifest_sha256"],
+    "code_tree_sha256": runtime["code_tree_sha256"],
+}
+backup_recovery = validate_whoscored_backup_recovery_contract(
+    full_revalidation=True
+)
+if backup_recovery.get("runtime_release") != runtime_release:
+    raise RuntimeError("WhoScored restore drill release differs from runtime")
+ops_store = WhoScoredOpsStore.from_env(optional=False)
+if ops_store is None:
+    raise RuntimeError("WhoScored operational store is required")
+records = list(
+    ops_store.iter_content_addressed_json(receipts_prefix(rollout_id))
+)
+acceptance = rollout_acceptance_status(records, rollout_id=rollout_id)
+accepted_release = acceptance.get("release")
+if acceptance.get("status") != "accepted":
+    raise RuntimeError("WhoScored rollout acceptance is incomplete")
+if accepted_release != runtime_release:
+    raise RuntimeError("WhoScored accepted rollout release differs from runtime")
+terminal_runs = acceptance.get("terminal_runs")
+if not isinstance(terminal_runs, list) or len(terminal_runs) != 6:
+    raise RuntimeError("WhoScored rollout acceptance lacks six terminal DagRuns")
+run_ids = [run.get("run_id") for run in terminal_runs if isinstance(run, dict)]
+if len(run_ids) != 6 or len(run_ids) != len(set(run_ids)):
+    raise RuntimeError("WhoScored rollout acceptance DagRun identities are invalid")
+verified_terminal_runs = []
+with create_session() as session:
+    dag_runs = (
+        session.query(DagRun)
+        .filter(
+            DagRun.dag_id == "dag_ingest_whoscored",
+            DagRun.run_id.in_(run_ids),
+        )
+        .all()
+    )
+    if len(dag_runs) != len(run_ids):
+        raise RuntimeError("WhoScored accepted DagRun is missing from metadata DB")
+    dag_run_by_id = {dag_run.run_id: dag_run for dag_run in dag_runs}
+    if len(dag_run_by_id) != len(run_ids):
+        raise RuntimeError("WhoScored metadata DB returned duplicate DagRuns")
+    latest_scheduled = (
+        session.query(DagRun)
+        .filter(
+            DagRun.dag_id == "dag_ingest_whoscored",
+            DagRun.run_id.like("scheduled__%"),
+            DagRun.run_type == "scheduled",
+            DagRun.external_trigger.is_(False),
+        )
+        .order_by(DagRun.execution_date.desc(), DagRun.run_id.desc())
+        .first()
+    )
+    if (
+        latest_scheduled is None
+        or latest_scheduled.run_id != terminal_runs[-1].get("run_id")
+        or utc_iso(latest_scheduled.execution_date)
+        != terminal_runs[-1].get("logical_date")
+        or str(latest_scheduled.state or "").lower().split(".")[-1] != "success"
+        or latest_scheduled.end_date is None
+        or not is_countable_scheduled_run(
+            run_id=latest_scheduled.run_id,
+            run_type=latest_scheduled.run_type,
+            external_trigger=latest_scheduled.external_trigger,
+            conf=latest_scheduled.conf,
+        )
+    ):
+        raise RuntimeError(
+            "WhoScored latest scheduler-created DagRun is not accepted"
+        )
+    latest_scheduled_run = {
+        "completed_at": utc_iso(latest_scheduled.end_date),
+        "logical_date": utc_iso(latest_scheduled.execution_date),
+        "run_id": latest_scheduled.run_id,
+        "state": "success",
+    }
+    for witness in terminal_runs:
+        run_id = witness["run_id"]
+        dag_run = dag_run_by_id.get(run_id)
+        if (
+            dag_run is None
+            or str(dag_run.state or "").lower().split(".")[-1] != "success"
+            or utc_iso(dag_run.execution_date) != witness.get("logical_date")
+            or dag_run.end_date is None
+            or dag_run.end_date < dag_run.execution_date
+            or not is_countable_scheduled_run(
+                run_id=dag_run.run_id,
+                run_type=dag_run.run_type,
+                external_trigger=dag_run.external_trigger,
+                conf=dag_run.conf,
+            )
+        ):
+            raise RuntimeError("WhoScored accepted DagRun is no longer terminal green")
+        task_rows = (
+            session.query(
+                TaskInstance.task_id,
+                TaskInstance.map_index,
+                TaskInstance.state,
+            )
+            .filter(
+                TaskInstance.dag_id == "dag_ingest_whoscored",
+                TaskInstance.run_id == run_id,
+            )
+            .all()
+        )
+        task_state_values = [
+            {
+                "task_id": row.task_id,
+                "map_index": row.map_index,
+                "state": str(row.state or "").lower().split(".")[-1],
+            }
+            for row in task_rows
+        ]
+        task_states = terminal_task_states_evidence(task_state_values)
+        if task_states != witness.get("task_states"):
+            raise RuntimeError("WhoScored accepted TaskInstance states have drifted")
+        xcom_rows = (
+            session.query(XCom.map_index, XCom.value)
+            .filter(
+                XCom.dag_id == "dag_ingest_whoscored",
+                XCom.run_id == run_id,
+                XCom.task_id == "validate_active_scope",
+                XCom.key == XCOM_RETURN_KEY,
+            )
+            .order_by(XCom.map_index.asc())
+            .all()
+        )
+        expected_scope_dq = witness.get("scope_dq")
+        expected_count = (
+            expected_scope_dq.get("count")
+            if isinstance(expected_scope_dq, dict)
+            else None
+        )
+        if (
+            isinstance(expected_count, bool)
+            or not isinstance(expected_count, int)
+            or [row.map_index for row in xcom_rows] != list(range(expected_count))
+        ):
+            raise RuntimeError("WhoScored accepted mapped DQ XCom set is not exact")
+        scope_dq_values = [XCom.deserialize_value(row) for row in xcom_rows]
+        scope_dq = mapped_scope_dq_evidence(scope_dq_values)
+        if scope_dq != expected_scope_dq:
+            raise RuntimeError("WhoScored accepted mapped DQ evidence has drifted")
+        singleton_task_ids = {
+            "alert_preflight": "validate_whoscored_paid_alert_delivery",
+            "catalog_dq": "validate_whoscored_catalog",
+            "daily_slo": "validate_whoscored_daily_slo",
+            "profile_dq": "validate_profile_refresh",
+            "runtime_preflight": "validate_whoscored_runtime",
+            "scope_plan": "freeze_daily_scope_plan",
+            "traffic_dq": "report_whoscored_traffic",
+        }
+        singleton_rows = (
+            session.query(XCom)
+            .filter(
+                XCom.dag_id == "dag_ingest_whoscored",
+                XCom.run_id == run_id,
+                XCom.task_id.in_(tuple(singleton_task_ids.values())),
+                XCom.key == XCOM_RETURN_KEY,
+            )
+            .all()
+        )
+        by_task_id = {}
+        for row in singleton_rows:
+            if row.map_index != -1 or row.task_id in by_task_id:
+                raise RuntimeError(
+                    "WhoScored accepted singleton XCom set is not exact"
+                )
+            by_task_id[row.task_id] = XCom.deserialize_value(row)
+        if set(by_task_id) != set(singleton_task_ids.values()):
+            raise RuntimeError("WhoScored accepted singleton XCom set is not exact")
+        singleton_values = {
+            name: by_task_id[task_id]
+            for name, task_id in singleton_task_ids.items()
+        }
+        observed_idempotency = idempotency_evidence(
+            scope_dq=scope_dq_values,
+            profile_dq=singleton_values["profile_dq"],
+        )
+        if observed_idempotency != witness.get("idempotency"):
+            raise RuntimeError("WhoScored accepted idempotency evidence has drifted")
+        observed_scope_plan_sha256 = scope_plan_sha256(
+            singleton_values["scope_plan"]
+        )
+        if observed_scope_plan_sha256 != witness.get("scope_plan_sha256"):
+            raise RuntimeError("WhoScored accepted scope-plan XCom has drifted")
+        observed_evidence_sha256 = run_evidence_sha256(
+            scope_plan=singleton_values["scope_plan"],
+            runtime_preflight=singleton_values["runtime_preflight"],
+            catalog_dq=singleton_values["catalog_dq"],
+            profile_dq=singleton_values["profile_dq"],
+            traffic_dq=singleton_values["traffic_dq"],
+            daily_slo=singleton_values["daily_slo"],
+            alert_preflight=singleton_values["alert_preflight"],
+            scope_dq=scope_dq_values,
+            terminal_task_states=task_state_values,
+        )
+        if observed_evidence_sha256 != witness.get("evidence_sha256"):
+            raise RuntimeError("WhoScored accepted green XCom evidence has drifted")
+        verified_terminal_runs.append(
+            {
+                "completed_at": utc_iso(dag_run.end_date),
+                "evidence_sha256": observed_evidence_sha256,
+                "idempotency": observed_idempotency,
+                "logical_date": witness["logical_date"],
+                "run_id": run_id,
+                "scope_dq": scope_dq,
+                "scope_plan_sha256": observed_scope_plan_sha256,
+                "task_states": task_states,
+            }
+        )
+report = {
+    "accepted_release": accepted_release,
+    "accepted_waves": acceptance.get("accepted_waves"),
+    "authority": acceptance.get("authority"),
+    "authority_binding": "explicit-rollout-id",
+    "backup_recovery": backup_recovery,
+    "catalog": acceptance.get("catalog"),
+    "final_wave_receipt_sha256": acceptance.get("final_wave_receipt_sha256"),
+    "latest_scheduled_run": latest_scheduled_run,
+    "missing_waves": acceptance.get("missing_waves"),
+    "rollout_id": rollout_id,
+    "runtime_release": runtime_release,
+    "schema_version": 1,
+    "status": "accepted",
+    "terminal_runs": verified_terminal_runs,
+}
+print(json.dumps(report, ensure_ascii=False, separators=(",", ":"), sort_keys=True))
+"""
+
+_ROLLOUT_ISSUANCE_PROBE = """\
+import json
+import sys
+
+from dags.scripts.whoscored_production_issuance import (
+    verify_daily_issuance_rollout,
+)
+
+
+report = verify_daily_issuance_rollout(
+    rollout_id=sys.argv[1],
+    expected_scope_authority=json.loads(sys.argv[2]),
+)
+print(json.dumps(report, ensure_ascii=False, separators=(",", ":"), sort_keys=True))
+"""
+
 
 def _assert_clean_control_environment() -> None:
     supplied = sorted(
@@ -2570,7 +2995,9 @@ def _trusted_docker_environment() -> dict[str, str]:
     }
 
 
-def _run_docker(arguments: Sequence[str]) -> bytes:
+def _run_docker_with_timeout(
+    arguments: Sequence[str], *, timeout_seconds: int
+) -> bytes:
     environment = _trusted_docker_environment()
     try:
         result = subprocess.run(
@@ -2580,7 +3007,7 @@ def _run_docker(arguments: Sequence[str]) -> bytes:
             stderr=subprocess.PIPE,
             check=False,
             env=environment,
-            timeout=30,
+            timeout=timeout_seconds,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise AdmissionError(
@@ -2594,6 +3021,968 @@ def _run_docker(arguments: Sequence[str]) -> bytes:
     if len(result.stdout) > MAX_JSON_BYTES:
         raise AdmissionError("Docker inspection output is unreasonably large")
     return result.stdout
+
+
+def _run_docker(arguments: Sequence[str]) -> bytes:
+    return _run_docker_with_timeout(arguments, timeout_seconds=30)
+
+
+def _run_rollout_acceptance_docker(arguments: Sequence[str]) -> bytes:
+    """Allow bounded full backup reads without weakening normal inspection."""
+
+    return _run_docker_with_timeout(
+        arguments,
+        timeout_seconds=ROLLOUT_ACCEPTANCE_TIMEOUT_SECONDS,
+    )
+
+
+def _rollout_acceptance_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _validate_idempotency_witness(value: object, *, scope_count: int) -> None:
+    scope_fields = {
+        "scope_count",
+        "exact_manifest_pair_count",
+        "duplicate_counter_count",
+        "physical_current_pair_count",
+        "zero_mismatch_counter_count",
+        "violation_count",
+        "evidence_sha256",
+    }
+    profile_fields = scope_fields - {"scope_count"}
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"schema_version", "status", "scope", "profile"}
+        or value.get("schema_version") != 1
+        or value.get("status") != "green"
+        or not isinstance(value.get("scope"), dict)
+        or not isinstance(value.get("profile"), dict)
+        or set(value["scope"]) != scope_fields
+        or set(value["profile"]) != profile_fields
+    ):
+        raise AdmissionError("WhoScored idempotency witness schema is invalid")
+    expected_scope = {
+        "scope_count": scope_count,
+        "exact_manifest_pair_count": scope_count * 5,
+        "duplicate_counter_count": scope_count * 4,
+        "physical_current_pair_count": scope_count * 11,
+        "zero_mismatch_counter_count": scope_count * 6,
+        "violation_count": 0,
+    }
+    expected_profile = {
+        "exact_manifest_pair_count": 2,
+        "duplicate_counter_count": 1,
+        "physical_current_pair_count": 2,
+        "zero_mismatch_counter_count": 5,
+        "violation_count": 0,
+    }
+    if any(
+        value["scope"].get(field) != expected
+        for field, expected in expected_scope.items()
+    ) or any(
+        value["profile"].get(field) != expected
+        for field, expected in expected_profile.items()
+    ):
+        raise AdmissionError("WhoScored idempotency witness is not exact and green")
+    for witness in (value["scope"], value["profile"]):
+        digest = witness.get("evidence_sha256")
+        if not isinstance(digest, str) or _DIGEST.fullmatch(digest) is None:
+            raise AdmissionError("WhoScored idempotency witness digest is invalid")
+
+
+def _validate_verified_rollout_runs(
+    value: object,
+    *,
+    catalog_active_scope_count: int,
+    expected_scope_counts: Sequence[int] | None = None,
+    require_fresh_completion: bool = True,
+) -> None:
+    """Validate the compact metadata-DB witnesses returned by the fixed probe."""
+
+    final_acceptance = expected_scope_counts is None
+    if expected_scope_counts is None:
+        expected_scope_counts = (
+            min(20, catalog_active_scope_count),
+            min(20, catalog_active_scope_count),
+            min(70, catalog_active_scope_count),
+            min(70, catalog_active_scope_count),
+            catalog_active_scope_count,
+            catalog_active_scope_count,
+        )
+    expected_scope_counts = tuple(expected_scope_counts)
+    if not isinstance(value, list) or len(value) != len(expected_scope_counts):
+        raise AdmissionError(
+            "WhoScored rollout acceptance lacks six verified terminal DagRuns"
+            if final_acceptance
+            else "WhoScored rollout acceptance lacks its verified terminal DagRuns"
+        )
+    if not value:
+        return
+    seen_run_ids: set[str] = set()
+    logical_dates: list[datetime] = []
+    completed_dates: list[datetime] = []
+    for position, item in enumerate(value):
+        if not isinstance(item, dict) or set(item) != {
+            "completed_at",
+            "evidence_sha256",
+            "idempotency",
+            "logical_date",
+            "run_id",
+            "scope_dq",
+            "scope_plan_sha256",
+            "task_states",
+        }:
+            raise AdmissionError(
+                "WhoScored verified terminal DagRun witness is invalid"
+            )
+        run_id = item.get("run_id")
+        logical_raw = item.get("logical_date")
+        completed_raw = item.get("completed_at")
+        if (
+            not isinstance(run_id, str)
+            or not run_id.startswith("scheduled__")
+            or len(run_id) > 250
+            or run_id in seen_run_ids
+            or not isinstance(logical_raw, str)
+            or not isinstance(completed_raw, str)
+        ):
+            raise AdmissionError(
+                "WhoScored verified terminal DagRun identity is invalid"
+            )
+        try:
+            logical_date = datetime.fromisoformat(logical_raw.replace("Z", "+00:00"))
+            completed_at = datetime.fromisoformat(completed_raw.replace("Z", "+00:00"))
+            run_logical_date = datetime.fromisoformat(
+                run_id.removeprefix("scheduled__").replace("Z", "+00:00")
+            )
+        except ValueError as exc:
+            raise AdmissionError(
+                "WhoScored verified terminal DagRun logical date is invalid"
+            ) from exc
+        canonical_logical = (
+            logical_date.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+            if logical_date.tzinfo is not None
+            else ""
+        )
+        canonical_completed = (
+            completed_at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+            if completed_at.tzinfo is not None
+            else ""
+        )
+        if (
+            canonical_logical != logical_raw
+            or canonical_completed != completed_raw
+            or completed_at < logical_date
+            or run_logical_date.tzinfo is None
+            or run_logical_date.astimezone(timezone.utc) != logical_date
+            or (
+                logical_date.hour,
+                logical_date.minute,
+                logical_date.second,
+                logical_date.microsecond,
+            )
+            != (10, 0, 0, 0)
+        ):
+            raise AdmissionError(
+                "WhoScored verified terminal DagRun logical date is invalid"
+            )
+        seen_run_ids.add(run_id)
+        logical_dates.append(logical_date)
+        completed_dates.append(completed_at)
+        scope_dq = item.get("scope_dq")
+        if (
+            not isinstance(scope_dq, dict)
+            or set(scope_dq) != {"count", "sha256", "scopes_sha256"}
+            or isinstance(scope_dq.get("count"), bool)
+            or scope_dq.get("count") != expected_scope_counts[position]
+            or not isinstance(scope_dq.get("sha256"), str)
+            or _DIGEST.fullmatch(scope_dq["sha256"]) is None
+            or not isinstance(scope_dq.get("scopes_sha256"), str)
+            or _DIGEST.fullmatch(scope_dq["scopes_sha256"]) is None
+        ):
+            raise AdmissionError(
+                "WhoScored verified mapped scope DQ witness is invalid"
+            )
+        _validate_idempotency_witness(
+            item.get("idempotency"), scope_count=scope_dq["count"]
+        )
+        task_states = item.get("task_states")
+        if (
+            not isinstance(task_states, dict)
+            or set(task_states) != {"count", "sha256"}
+            or isinstance(task_states.get("count"), bool)
+            or not isinstance(task_states.get("count"), int)
+            or task_states["count"] < scope_dq["count"] + 1
+            or not isinstance(task_states.get("sha256"), str)
+            or _DIGEST.fullmatch(task_states["sha256"]) is None
+        ):
+            raise AdmissionError(
+                "WhoScored verified TaskInstance-state witness is invalid"
+            )
+        if any(
+            not isinstance(item.get(field), str)
+            or _DIGEST.fullmatch(item[field]) is None
+            for field in ("scope_plan_sha256", "evidence_sha256")
+        ):
+            raise AdmissionError("WhoScored verified persisted-XCom witness is invalid")
+    if (
+        logical_dates != sorted(logical_dates)
+        or len(set(logical_dates)) != len(expected_scope_counts)
+        or any(
+            logical_dates[position + 1] - logical_dates[position] != timedelta(days=1)
+            for position in range(0, len(expected_scope_counts), 2)
+        )
+    ):
+        raise AdmissionError(
+            "WhoScored verified terminal DagRuns lack consecutive within-wave pairs"
+        )
+    if completed_dates != sorted(completed_dates):
+        raise AdmissionError(
+            "WhoScored verified terminal DagRun completions are not chronological"
+        )
+    age = _rollout_acceptance_now() - completed_dates[-1].astimezone(timezone.utc)
+    if require_fresh_completion and (
+        age < -timedelta(minutes=5) or age > MAX_ROLLOUT_ACCEPTANCE_AGE
+    ):
+        raise AdmissionError(
+            "WhoScored final accepted scheduled DagRun is stale or future-dated"
+        )
+
+
+def _validate_current_rollout_projection(
+    value: Mapping[str, Any], *, rollout_id: str
+) -> dict[str, Any]:
+    if (
+        frozenset(value) != _ROLLOUT_AUTHORITY_REPORT_FIELDS
+        or value.get("authority_binding") != "current-signed-rollout"
+        or not isinstance(value.get("cohort_id"), str)
+        or _ROLLOUT_ID.fullmatch(value["cohort_id"]) is None
+    ):
+        raise AdmissionError("current signed rollout authority is invalid")
+    authority = value.get("authority")
+    catalog_count = value.get("catalog_active_scope_count")
+    if (
+        not isinstance(authority, Mapping)
+        or frozenset(authority) != _ROLLOUT_ACCEPTANCE_AUTHORITY_FIELDS
+        or authority.get("rollout_id") != rollout_id
+        or authority.get("wave_id") != "wave-all"
+        or authority.get("max_scopes") != 2_000
+        or authority.get("require_full_active") is not True
+        or isinstance(catalog_count, bool)
+        or not isinstance(catalog_count, int)
+        or not 1 <= catalog_count <= 2_000
+        or value.get("rollout_manifest_sha256") != authority.get("cohort_sha256")
+    ):
+        raise AdmissionError("current signed rollout authority is invalid")
+    for field in (
+        "cohort_sha256",
+        "ranked_scope_ids_sha256",
+        "runtime_sha256",
+        "classifier_sha256",
+        "promotion_acceptance_sha256",
+        "promotion_terminal_receipt_sha256",
+    ):
+        if (
+            not isinstance(authority.get(field), str)
+            or _DIGEST.fullmatch(authority[field]) is None
+        ):
+            raise AdmissionError("current signed rollout authority is invalid")
+    for field in (
+        "catalog_active_scopes_sha256",
+        "charter_sha256",
+        "rollout_manifest_sha256",
+    ):
+        if (
+            not isinstance(value.get(field), str)
+            or _DIGEST.fullmatch(value[field]) is None
+        ):
+            raise AdmissionError("current signed rollout authority is invalid")
+    return dict(value)
+
+
+def _validate_current_issuance_projection(
+    value: Mapping[str, Any], *, rollout_id: str
+) -> dict[str, Any]:
+    """Validate any exact active wave without weakening final production GO."""
+
+    if (
+        frozenset(value) != _ROLLOUT_AUTHORITY_REPORT_FIELDS
+        or value.get("authority_binding") != "current-signed-rollout"
+        or not isinstance(value.get("cohort_id"), str)
+        or _ROLLOUT_ID.fullmatch(value["cohort_id"]) is None
+    ):
+        raise AdmissionError("current signed issuance authority is invalid")
+    authority = value.get("authority")
+    catalog_count = value.get("catalog_active_scope_count")
+    if not isinstance(authority, Mapping):
+        raise AdmissionError("current signed issuance authority is invalid")
+    wave_id = authority.get("wave_id")
+    wave_contract = _ROLLOUT_WAVE_CONTRACTS.get(str(wave_id))
+    if (
+        frozenset(authority) != _ROLLOUT_ACCEPTANCE_AUTHORITY_FIELDS
+        or authority.get("rollout_id") != rollout_id
+        or wave_contract is None
+        or (authority.get("max_scopes"), authority.get("require_full_active"))
+        != wave_contract
+        or isinstance(catalog_count, bool)
+        or not isinstance(catalog_count, int)
+        or not 1 <= catalog_count <= 2_000
+        or value.get("rollout_manifest_sha256") != authority.get("cohort_sha256")
+    ):
+        raise AdmissionError("current signed issuance authority is invalid")
+    for field in (
+        "cohort_sha256",
+        "ranked_scope_ids_sha256",
+        "runtime_sha256",
+        "classifier_sha256",
+        "promotion_acceptance_sha256",
+        "promotion_terminal_receipt_sha256",
+    ):
+        if (
+            not isinstance(authority.get(field), str)
+            or _DIGEST.fullmatch(authority[field]) is None
+        ):
+            raise AdmissionError("current signed issuance authority is invalid")
+    for field in (
+        "catalog_active_scopes_sha256",
+        "charter_sha256",
+        "rollout_manifest_sha256",
+    ):
+        if (
+            not isinstance(value.get(field), str)
+            or _DIGEST.fullmatch(value[field]) is None
+        ):
+            raise AdmissionError("current signed issuance authority is invalid")
+    promotion_proofs = (
+        authority["promotion_acceptance_sha256"],
+        authority["promotion_terminal_receipt_sha256"],
+    )
+    if (
+        wave_id == "wave-20"
+        and promotion_proofs
+        != (
+            _ROLLOUT_GENESIS_PROOF_SHA256,
+            _ROLLOUT_GENESIS_PROOF_SHA256,
+        )
+    ) or (
+        wave_id != "wave-20"
+        and any(proof == _ROLLOUT_GENESIS_PROOF_SHA256 for proof in promotion_proofs)
+    ):
+        raise AdmissionError("current signed issuance promotion proof is invalid")
+    return dict(value)
+
+
+def _validate_live_backup_revalidation(
+    value: object,
+    *,
+    source_uris: Sequence[str],
+    receipt_key: str,
+    receipt_sha256: str,
+) -> None:
+    fields = {
+        "capability",
+        "checked_at",
+        "expected_retained_objects",
+        "inventories",
+        "receipt_key",
+        "receipt_sha256",
+        "status",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != fields
+        or value.get("status") != "passed"
+        or value.get("receipt_key") != receipt_key
+        or value.get("receipt_sha256") != receipt_sha256
+    ):
+        raise AdmissionError("WhoScored live backup revalidation is invalid")
+    checked_raw = value.get("checked_at")
+    if not isinstance(checked_raw, str):
+        raise AdmissionError("WhoScored live backup revalidation time is invalid")
+    try:
+        checked_at = datetime.strptime(checked_raw, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc
+        )
+    except ValueError as exc:
+        raise AdmissionError(
+            "WhoScored live backup revalidation time is invalid"
+        ) from exc
+    live_age = _rollout_acceptance_now() - checked_at
+    if live_age < -timedelta(minutes=5) or live_age > timedelta(minutes=5):
+        raise AdmissionError("WhoScored live backup revalidation is stale")
+    inventories = value.get("inventories")
+    inventory_fields = {
+        "checked_bytes",
+        "checked_content_objects",
+        "expected_content_bytes",
+        "expected_content_objects",
+        "inventory_key",
+        "inventory_sha256",
+        "marker_valid",
+        "object_count",
+        "objects_sha256",
+        "source_uri",
+        "total_bytes",
+    }
+    if (
+        not isinstance(inventories, list)
+        or len(inventories) != 2
+        or [item.get("source_uri") for item in inventories if isinstance(item, dict)]
+        != sorted(source_uris)
+    ):
+        raise AdmissionError("WhoScored live backup inventories are invalid")
+    for item in inventories:
+        if (
+            not isinstance(item, dict)
+            or set(item) != inventory_fields
+            or item.get("marker_valid") is not True
+            or not isinstance(item.get("inventory_key"), str)
+            or re.fullmatch(
+                r"backup-inventories/[0-9]{8}T[0-9]{12}Z-[0-9a-f]{16}-[0-9a-f]{64}\.json",
+                item["inventory_key"],
+            )
+            is None
+            or any(
+                not isinstance(item.get(field), str)
+                or _DIGEST.fullmatch(item[field]) is None
+                for field in ("inventory_sha256", "objects_sha256")
+            )
+        ):
+            raise AdmissionError("WhoScored live backup inventory is invalid")
+        for field in (
+            "checked_bytes",
+            "checked_content_objects",
+            "expected_content_bytes",
+            "expected_content_objects",
+            "object_count",
+            "total_bytes",
+        ):
+            count = item.get(field)
+            if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+                raise AdmissionError("WhoScored live backup inventory is invalid")
+        if (
+            item["checked_content_objects"] != item["expected_content_objects"]
+            or item["checked_bytes"] != item["expected_content_bytes"]
+            or item["expected_content_objects"] > item["object_count"]
+            or item["expected_content_bytes"] > item["total_bytes"]
+        ):
+            raise AdmissionError("WhoScored live backup inventory is invalid")
+    capability = value.get("capability")
+    expected_retained_objects = value.get("expected_retained_objects")
+    capability_fields = {
+        "bucket",
+        "checked_object_count",
+        "default_retention_days",
+        "default_retention_mode",
+        "earliest_retain_until",
+        "minimum_remaining_hours",
+        "object_lock_enabled",
+        "status",
+        "versioning_status",
+    }
+    if (
+        not isinstance(capability, dict)
+        or set(capability) != capability_fields
+        or capability.get("status") != "passed"
+        or capability.get("versioning_status") != "Enabled"
+        or capability.get("object_lock_enabled") != "Enabled"
+        or capability.get("default_retention_mode") != "COMPLIANCE"
+        or capability.get("minimum_remaining_hours") != 24
+        or isinstance(expected_retained_objects, bool)
+        or not isinstance(expected_retained_objects, int)
+        or expected_retained_objects < 3
+        or capability.get("checked_object_count") != expected_retained_objects
+        or not isinstance(capability.get("bucket"), str)
+        or re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", capability["bucket"])
+        is None
+    ):
+        raise AdmissionError("WhoScored live Object Lock capability is invalid")
+    for field in ("checked_object_count", "default_retention_days"):
+        count = capability.get(field)
+        if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+            raise AdmissionError("WhoScored live Object Lock capability is invalid")
+    if capability["checked_object_count"] < 3:
+        raise AdmissionError("WhoScored live Object Lock object set is incomplete")
+    retain_raw = capability.get("earliest_retain_until")
+    try:
+        retain_until = datetime.strptime(str(retain_raw), "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc
+        )
+    except ValueError as exc:
+        raise AdmissionError(
+            "WhoScored live Object Lock retention time is invalid"
+        ) from exc
+    if retain_until < checked_at + timedelta(hours=24):
+        raise AdmissionError("WhoScored live Object Lock retention is too short")
+
+
+def _validated_rollout_runtime_release(value: object) -> dict[str, str]:
+    fields = {"parser_version", "manifest_sha256", "code_tree_sha256"}
+    if (
+        not isinstance(value, dict)
+        or set(value) != fields
+        or value.get("parser_version") != "whoscored-parser-v8"
+        or any(
+            not isinstance(value.get(field), str)
+            or _DIGEST.fullmatch(value[field]) is None
+            for field in ("manifest_sha256", "code_tree_sha256")
+        )
+    ):
+        raise AdmissionError("WhoScored admitted runtime release is invalid")
+    return dict(value)
+
+
+def _validate_backup_recovery_report(
+    value: object, *, runtime_release: Mapping[str, str]
+) -> None:
+    recovery_fields = {
+        "status",
+        "rpo_hours",
+        "rto_hours",
+        "duration_seconds",
+        "evidence_age_seconds",
+        "runtime_release",
+        "source_uris",
+        "off_host_receipt_key",
+        "off_host_receipt_sha256",
+        "live_backup",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != recovery_fields
+        or value.get("status") != "passed"
+        or value.get("rpo_hours") != 24
+        or value.get("rto_hours") != 24
+        or value.get("runtime_release") != runtime_release
+    ):
+        raise AdmissionError("WhoScored raw+ops recovery evidence is not accepted")
+    for field in ("duration_seconds", "evidence_age_seconds"):
+        item = value.get(field)
+        minimum = 1 if field == "duration_seconds" else 0
+        if (
+            isinstance(item, bool)
+            or not isinstance(item, int)
+            or not minimum <= item <= 24 * 3600
+        ):
+            raise AdmissionError("WhoScored raw+ops recovery timing is invalid")
+    source_uris = value.get("source_uris")
+    receipt_key = value.get("off_host_receipt_key")
+    receipt_sha256 = value.get("off_host_receipt_sha256")
+    receipt_match = (
+        re.fullmatch(
+            r"restore-drill-receipts/v2/[0-9]{8}T[0-9]{6}Z-([0-9a-f]{64})\.json",
+            receipt_key,
+        )
+        if isinstance(receipt_key, str)
+        else None
+    )
+    if (
+        receipt_match is None
+        or not isinstance(receipt_sha256, str)
+        or _DIGEST.fullmatch(receipt_sha256) is None
+        or receipt_match.group(1) != receipt_sha256
+    ):
+        raise AdmissionError("WhoScored off-host restore receipt is invalid")
+    if (
+        not isinstance(source_uris, list)
+        or any(not isinstance(uri, str) for uri in source_uris)
+        or source_uris != sorted(source_uris)
+        or len(source_uris) != 2
+        or len(set(source_uris)) != 2
+    ):
+        raise AdmissionError("WhoScored raw+ops recovery sources are invalid")
+    _validate_live_backup_revalidation(
+        value.get("live_backup"),
+        source_uris=source_uris,
+        receipt_key=receipt_key,
+        receipt_sha256=receipt_sha256,
+    )
+    raw_sources = [uri for uri in source_uris if uri.endswith("/raw/whoscored")]
+    ops_sources = [uri for uri in source_uris if uri.endswith("/ops/whoscored")]
+    if len(raw_sources) != 1 or len(ops_sources) != 1:
+        raise AdmissionError("WhoScored raw+ops recovery sources are invalid")
+    raw_bucket = raw_sources[0].removeprefix("s3://").split("/", 1)[0]
+    _validate_whoscored_store_uris(
+        {
+            "ICEBERG_WAREHOUSE": raw_bucket,
+            "WHOSCORED_RAW_STORE_URI": raw_sources[0],
+            "WHOSCORED_OPS_STORE_URI": ops_sources[0],
+        }
+    )
+
+
+def verify_rollout_acceptance(
+    rollout_id: str,
+    *,
+    rollout_authority: Mapping[str, Any],
+    scheduler_container_id: str,
+    runner: DockerRunner = _run_rollout_acceptance_docker,
+) -> dict[str, Any]:
+    """Replay the active signed rollout ledger inside the admitted scheduler."""
+
+    if _ROLLOUT_ID.fullmatch(rollout_id) is None:
+        raise AdmissionError("WhoScored rollout id is invalid")
+    if _CONTAINER_ID.fullmatch(scheduler_container_id) is None:
+        raise AdmissionError("admitted scheduler container id is invalid")
+    rollout_authority = _validate_current_rollout_projection(
+        rollout_authority, rollout_id=rollout_id
+    )
+    raw = runner(
+        (
+            "exec",
+            "--workdir=/opt/airflow",
+            scheduler_container_id,
+            "/usr/local/bin/whoscored-production-python",
+            "-c",
+            _ROLLOUT_ACCEPTANCE_PROBE,
+            rollout_id,
+        )
+    )
+    if not raw or len(raw) > 64 * 1024:
+        raise AdmissionError("WhoScored rollout acceptance output is invalid")
+    try:
+        report = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_object)
+    except (_DuplicateKey, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AdmissionError(
+            "WhoScored rollout acceptance output is not strict JSON"
+        ) from exc
+    expected_fields = {
+        "accepted_release",
+        "accepted_waves",
+        "authority",
+        "authority_binding",
+        "backup_recovery",
+        "catalog",
+        "final_wave_receipt_sha256",
+        "latest_scheduled_run",
+        "missing_waves",
+        "rollout_id",
+        "runtime_release",
+        "schema_version",
+        "status",
+        "terminal_runs",
+    }
+    if (
+        not isinstance(report, dict)
+        or set(report) != expected_fields
+        or raw != _canonical_bytes(report)
+        or report.get("schema_version") != 1
+        or report.get("status") != "accepted"
+        or report.get("rollout_id") != rollout_id
+        or report.get("accepted_waves") != ["wave-20", "wave-70", "wave-all"]
+        or report.get("missing_waves") != []
+        or report.get("authority_binding") != "explicit-rollout-id"
+    ):
+        raise AdmissionError("WhoScored rollout acceptance output is not accepted")
+    accepted_release = report.get("accepted_release")
+    runtime_release = report.get("runtime_release")
+    release_fields = {"parser_version", "manifest_sha256", "code_tree_sha256"}
+    if (
+        not isinstance(accepted_release, dict)
+        or set(accepted_release) != release_fields
+        or accepted_release != runtime_release
+        or accepted_release.get("parser_version") != "whoscored-parser-v8"
+        or any(
+            not isinstance(accepted_release.get(field), str)
+            or _DIGEST.fullmatch(accepted_release[field]) is None
+            for field in ("manifest_sha256", "code_tree_sha256")
+        )
+    ):
+        raise AdmissionError(
+            "WhoScored accepted rollout release differs from admitted runtime"
+        )
+    backup_recovery = report.get("backup_recovery")
+    recovery_fields = {
+        "status",
+        "rpo_hours",
+        "rto_hours",
+        "duration_seconds",
+        "evidence_age_seconds",
+        "runtime_release",
+        "source_uris",
+        "off_host_receipt_key",
+        "off_host_receipt_sha256",
+        "live_backup",
+    }
+    if (
+        not isinstance(backup_recovery, dict)
+        or set(backup_recovery) != recovery_fields
+        or backup_recovery.get("status") != "passed"
+        or backup_recovery.get("rpo_hours") != 24
+        or backup_recovery.get("rto_hours") != 24
+        or backup_recovery.get("runtime_release") != runtime_release
+    ):
+        raise AdmissionError("WhoScored raw+ops recovery evidence is not accepted")
+    for field in ("duration_seconds", "evidence_age_seconds"):
+        item = backup_recovery.get(field)
+        minimum = 1 if field == "duration_seconds" else 0
+        if (
+            isinstance(item, bool)
+            or not isinstance(item, int)
+            or not minimum <= item <= 24 * 3600
+        ):
+            raise AdmissionError("WhoScored raw+ops recovery timing is invalid")
+    source_uris = backup_recovery.get("source_uris")
+    receipt_key = backup_recovery.get("off_host_receipt_key")
+    receipt_sha256 = backup_recovery.get("off_host_receipt_sha256")
+    receipt_match = (
+        re.fullmatch(
+            r"restore-drill-receipts/v2/[0-9]{8}T[0-9]{6}Z-([0-9a-f]{64})\.json",
+            receipt_key,
+        )
+        if isinstance(receipt_key, str)
+        else None
+    )
+    if (
+        receipt_match is None
+        or not isinstance(receipt_sha256, str)
+        or _DIGEST.fullmatch(receipt_sha256) is None
+        or receipt_match.group(1) != receipt_sha256
+    ):
+        raise AdmissionError("WhoScored off-host restore receipt is invalid")
+    if (
+        not isinstance(source_uris, list)
+        or any(not isinstance(uri, str) for uri in source_uris)
+        or source_uris != sorted(source_uris)
+        or len(source_uris) != 2
+        or len(set(source_uris)) != 2
+    ):
+        raise AdmissionError("WhoScored raw+ops recovery sources are invalid")
+    _validate_live_backup_revalidation(
+        backup_recovery.get("live_backup"),
+        source_uris=source_uris,
+        receipt_key=receipt_key,
+        receipt_sha256=receipt_sha256,
+    )
+    raw_sources = [uri for uri in source_uris if uri.endswith("/raw/whoscored")]
+    ops_sources = [uri for uri in source_uris if uri.endswith("/ops/whoscored")]
+    if len(raw_sources) != 1 or len(ops_sources) != 1:
+        raise AdmissionError("WhoScored raw+ops recovery sources are invalid")
+    raw_bucket = raw_sources[0].removeprefix("s3://").split("/", 1)[0]
+    _validate_whoscored_store_uris(
+        {
+            "ICEBERG_WAREHOUSE": raw_bucket,
+            "WHOSCORED_RAW_STORE_URI": raw_sources[0],
+            "WHOSCORED_OPS_STORE_URI": ops_sources[0],
+        }
+    )
+    catalog = report.get("catalog")
+    if (
+        not isinstance(catalog, dict)
+        or set(catalog) != {"active_scope_count", "active_scopes_sha256"}
+        or isinstance(catalog.get("active_scope_count"), bool)
+        or not isinstance(catalog.get("active_scope_count"), int)
+        or catalog["active_scope_count"] < 1
+        or not isinstance(catalog.get("active_scopes_sha256"), str)
+        or _DIGEST.fullmatch(catalog["active_scopes_sha256"]) is None
+        or not isinstance(report.get("final_wave_receipt_sha256"), str)
+        or _DIGEST.fullmatch(report["final_wave_receipt_sha256"]) is None
+    ):
+        raise AdmissionError("WhoScored accepted rollout catalog evidence is invalid")
+    expected_authority = rollout_authority.get("authority")
+    if (
+        not isinstance(expected_authority, Mapping)
+        or frozenset(expected_authority) != _ROLLOUT_ACCEPTANCE_AUTHORITY_FIELDS
+        or expected_authority.get("rollout_id") != rollout_id
+        or report.get("authority") != dict(expected_authority)
+        or catalog["active_scope_count"]
+        != rollout_authority.get("catalog_active_scope_count")
+        or catalog["active_scopes_sha256"]
+        != rollout_authority.get("catalog_active_scopes_sha256")
+        or accepted_release.get("code_tree_sha256")
+        != expected_authority.get("runtime_sha256")
+    ):
+        raise AdmissionError(
+            "WhoScored accepted rollout differs from current signed authority"
+        )
+    _validate_verified_rollout_runs(
+        report.get("terminal_runs"),
+        catalog_active_scope_count=catalog["active_scope_count"],
+    )
+    terminal_runs = report["terminal_runs"]
+    latest_scheduled_run = report.get("latest_scheduled_run")
+    if (
+        not isinstance(latest_scheduled_run, dict)
+        or set(latest_scheduled_run)
+        != {"completed_at", "logical_date", "run_id", "state"}
+        or latest_scheduled_run.get("state") != "success"
+        or any(
+            latest_scheduled_run.get(field) != terminal_runs[-1].get(field)
+            for field in ("completed_at", "logical_date", "run_id")
+        )
+    ):
+        raise AdmissionError(
+            "WhoScored latest scheduler-created DagRun is not accepted"
+        )
+    report["authority_binding"] = "current-signed-rollout"
+    report["rollout_authority"] = dict(rollout_authority)
+    return report
+
+
+def verify_issuance_rollout(
+    rollout_id: str,
+    *,
+    rollout_authority: Mapping[str, Any],
+    scheduler_container_id: str,
+    runner: DockerRunner = _run_rollout_acceptance_docker,
+) -> dict[str, Any]:
+    """Replay the active wave's exact live predecessor proof before issuance."""
+
+    if _ROLLOUT_ID.fullmatch(rollout_id) is None:
+        raise AdmissionError("WhoScored issuance rollout id is invalid")
+    if _CONTAINER_ID.fullmatch(scheduler_container_id) is None:
+        raise AdmissionError("admitted scheduler container id is invalid")
+    rollout_authority = _validate_current_issuance_projection(
+        rollout_authority, rollout_id=rollout_id
+    )
+    expected_authority = rollout_authority["authority"]
+    wave_id = expected_authority["wave_id"]
+    expected_scope_authority = {
+        **expected_authority,
+        "catalog_active_scope_count": rollout_authority["catalog_active_scope_count"],
+        "catalog_active_scopes_sha256": rollout_authority[
+            "catalog_active_scopes_sha256"
+        ],
+    }
+    raw = runner(
+        (
+            "exec",
+            "--workdir=/opt/airflow",
+            scheduler_container_id,
+            "/usr/local/bin/whoscored-production-python",
+            "-c",
+            _ROLLOUT_ISSUANCE_PROBE,
+            rollout_id,
+            _authority_canonical_bytes(expected_scope_authority).decode("utf-8"),
+        )
+    )
+    if not raw or len(raw) > 64 * 1024:
+        raise AdmissionError("WhoScored issuance replay output is invalid")
+    try:
+        report = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_object)
+    except (_DuplicateKey, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AdmissionError(
+            "WhoScored issuance replay output is not strict JSON"
+        ) from exc
+    if (
+        not isinstance(report, dict)
+        or set(report)
+        != {
+            "promotion",
+            "rollout_id",
+            "runtime_release",
+            "schema_version",
+            "status",
+            "terminal_runs",
+            "wave_id",
+        }
+        or raw != _canonical_bytes(report)
+        or report.get("schema_version") != 1
+        or report.get("status") != "live-authority-verified"
+        or report.get("rollout_id") != rollout_id
+        or report.get("wave_id") != wave_id
+    ):
+        raise AdmissionError("WhoScored issuance replay output is not accepted")
+
+    runtime_release = _validated_rollout_runtime_release(report.get("runtime_release"))
+    if runtime_release["code_tree_sha256"] != expected_authority["runtime_sha256"]:
+        raise AdmissionError(
+            "WhoScored issuance runtime differs from current signed authority"
+        )
+    promotion = report.get("promotion")
+    promotion_fields = {
+        "classifier_sha256",
+        "promotion_acceptance_sha256",
+        "receipt_sha256s",
+        "release",
+        "runtime_sha256",
+        "schema_version",
+        "source_cohort_sha256",
+        "source_wave_id",
+        "terminal_receipt_sha256",
+    }
+    if (
+        not isinstance(promotion, dict)
+        or set(promotion) != promotion_fields
+        or promotion.get("schema_version") != 1
+        or promotion.get("promotion_acceptance_sha256")
+        != expected_authority["promotion_acceptance_sha256"]
+        or promotion.get("terminal_receipt_sha256")
+        != expected_authority["promotion_terminal_receipt_sha256"]
+        or promotion.get("runtime_sha256") != expected_authority["runtime_sha256"]
+        or promotion.get("classifier_sha256") != expected_authority["classifier_sha256"]
+        or promotion.get("release") != runtime_release
+    ):
+        raise AdmissionError(
+            "WhoScored live promotion proof differs from current signed authority"
+        )
+    receipt_sha256s = promotion.get("receipt_sha256s")
+    expected_run_count = {"wave-20": 0, "wave-70": 2, "wave-all": 4}[wave_id]
+    expected_source_wave = {
+        "wave-20": None,
+        "wave-70": "wave-20",
+        "wave-all": "wave-70",
+    }[wave_id]
+    source_cohort_sha256 = promotion.get("source_cohort_sha256")
+    if (
+        promotion.get("source_wave_id") != expected_source_wave
+        or not isinstance(receipt_sha256s, list)
+        or len(receipt_sha256s) != expected_run_count
+        or len(receipt_sha256s) != len(set(receipt_sha256s))
+        or any(
+            not isinstance(digest, str) or _DIGEST.fullmatch(digest) is None
+            for digest in receipt_sha256s
+        )
+        or (expected_run_count == 0 and source_cohort_sha256 is not None)
+        or (
+            expected_run_count > 0
+            and (
+                not isinstance(source_cohort_sha256, str)
+                or _DIGEST.fullmatch(source_cohort_sha256) is None
+                or receipt_sha256s[-1]
+                != expected_authority["promotion_terminal_receipt_sha256"]
+            )
+        )
+    ):
+        raise AdmissionError("WhoScored live promotion receipt chain is invalid")
+
+    catalog_count = rollout_authority["catalog_active_scope_count"]
+    expected_scope_counts = {
+        "wave-20": (),
+        "wave-70": (
+            min(20, catalog_count),
+            min(20, catalog_count),
+        ),
+        "wave-all": (
+            min(20, catalog_count),
+            min(20, catalog_count),
+            min(70, catalog_count),
+            min(70, catalog_count),
+        ),
+    }[wave_id]
+    _validate_verified_rollout_runs(
+        report.get("terminal_runs"),
+        catalog_active_scope_count=catalog_count,
+        expected_scope_counts=expected_scope_counts,
+        require_fresh_completion=False,
+    )
+    return {
+        "authority": dict(expected_authority),
+        "authority_binding": "current-signed-rollout",
+        "charter_sha256": rollout_authority["charter_sha256"],
+        "promotion_acceptance_sha256": expected_authority[
+            "promotion_acceptance_sha256"
+        ],
+        "promotion_terminal_receipt_sha256": expected_authority[
+            "promotion_terminal_receipt_sha256"
+        ],
+        "rollout_id": rollout_id,
+        "rollout_manifest_sha256": rollout_authority["rollout_manifest_sha256"],
+        "schema_version": 1,
+        "status": "live-authority-verified",
+        "wave_id": wave_id,
+    }
 
 
 def _compose_arguments(
@@ -2803,7 +4192,9 @@ def render_attested_projects(
                 f"Docker Compose returned ambiguous rendered JSON: {project}"
             ) from exc
         if not isinstance(rendered, dict) or rendered.get("name") != project:
-            raise AdmissionError(f"rendered Compose project identity differs: {project}")
+            raise AdmissionError(
+                f"rendered Compose project identity differs: {project}"
+            )
         rendered_projects[project] = rendered
         for service in services:
             raw_hash = runner((*prefix, "config", "--hash", service))
@@ -2871,7 +4262,8 @@ def render_attested_projects(
     scheduler_environment = scheduler_model.get("environment")
     if (
         not isinstance(scheduler_environment, dict)
-        or set(scheduler_environment) != _EXPECTED_ENVIRONMENT_NAMES["airflow-scheduler"]
+        or set(scheduler_environment)
+        != _EXPECTED_ENVIRONMENT_NAMES["airflow-scheduler"]
         or scheduler_environment.get("WHOSCORED_SCHEDULED_PAID_MODE") != "required"
         or "WHOSCORED_PROXY_APPROVAL_PATH" in scheduler_environment
     ):
@@ -2879,8 +4271,7 @@ def render_attested_projects(
     scheduler_volumes = scheduler_model.get("volumes")
     if not isinstance(scheduler_volumes, list) or not any(
         isinstance(volume, dict)
-        and volume.get("target")
-        == "/opt/airflow/secure/whoscored-scheduled-pointers"
+        and volume.get("target") == "/opt/airflow/secure/whoscored-scheduled-pointers"
         and volume.get("read_only") is True
         for volume in scheduler_volumes
     ):
@@ -2889,9 +4280,10 @@ def render_attested_projects(
     gateway_networks = gateway.get("networks")
     if not isinstance(common_networks, dict) or not isinstance(gateway_networks, dict):
         raise AdmissionError("rendered split Compose network models differ")
-    if common_networks.get("whoscored-paid-api") != _COMMON_EXTERNAL_NETWORKS[
-        "whoscored-paid-api"
-    ]:
+    if (
+        common_networks.get("whoscored-paid-api")
+        != _COMMON_EXTERNAL_NETWORKS["whoscored-paid-api"]
+    ):
         raise AdmissionError("common project does not use external paid API network")
     if set(gateway_networks) != {
         "whoscored-paid-api",
@@ -5272,7 +6664,10 @@ def verify_created_containers(
         "images": verified,
         "networks": list(verified_networks.values()),
         "projects": (
-            {COMMON_PROJECT: list(COMMON_PROTECTED_SERVICES), GATEWAY_PROJECT: list(GATEWAY_PROTECTED_SERVICES)}
+            {
+                COMMON_PROJECT: list(COMMON_PROTECTED_SERVICES),
+                GATEWAY_PROJECT: list(GATEWAY_PROTECTED_SERVICES),
+            }
             if split_projects
             else {str(project): list(selected)}
         ),
@@ -5376,9 +6771,7 @@ def _assert_protected_regular_file(path: Path, *, label: str) -> os.stat_result:
     return metadata
 
 
-def _assert_airflow_authority_directory(
-    path: Path, *, label: str
-) -> os.stat_result:
+def _assert_airflow_authority_directory(path: Path, *, label: str) -> os.stat_result:
     """Require one UID-50000 directory writable only by its container owner."""
 
     if not path.is_absolute() or not path.name:
@@ -5520,7 +6913,9 @@ def validate_provider_policy(
         json.JSONDecodeError,
         provenance.ProvenanceError,
     ) as exc:
-        raise AdmissionError("provider policy/key is not protected strict data") from exc
+        raise AdmissionError(
+            "provider policy/key is not protected strict data"
+        ) from exc
     if len(secret.encode("utf-8")) < 32:
         raise AdmissionError("provider-policy owner key is too short")
     if (
@@ -5530,10 +6925,12 @@ def validate_provider_policy(
     ):
         raise AdmissionError("provider policy is not canonical provider-policy-v1")
     unsigned = {field: value[field] for field in _PROVIDER_POLICY_UNSIGNED_FIELDS}
-    digest = hashlib.sha256(_canonical_bytes(unsigned)).hexdigest()
+    digest = hashlib.sha256(_authority_canonical_bytes(unsigned)).hexdigest()
     signed_body = {**unsigned, "document_sha256": digest}
     signature = hmac.new(
-        secret.encode("utf-8"), _canonical_bytes(signed_body), hashlib.sha256
+        secret.encode("utf-8"),
+        _authority_canonical_bytes(signed_body),
+        hashlib.sha256,
     ).hexdigest()
     if (
         value.get("schema_version") != 1
@@ -5547,7 +6944,10 @@ def validate_provider_policy(
         raise AdmissionError("provider policy digest/signature is invalid")
     token = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
     for field in ("provider_id", "order_id", "plan_id"):
-        if not isinstance(value.get(field), str) or token.fullmatch(str(value[field])) is None:
+        if (
+            not isinstance(value.get(field), str)
+            or token.fullmatch(str(value[field])) is None
+        ):
             raise AdmissionError(f"provider policy {field} is invalid")
     valid_from = _provider_policy_utc(value.get("valid_from"), field="valid_from")
     valid_until = _provider_policy_utc(value.get("valid_until"), field="valid_until")
@@ -5583,7 +6983,375 @@ def validate_provider_policy(
         "provider_quota_bytes": int(value["provider_quota_bytes"]),
         "receipt_sha256": receipt_sha256,
         "safety_cap_bytes": int(value["safety_cap_bytes"]),
+        "valid_from": str(value["valid_from"]),
+        "valid_until": str(value["valid_until"]),
     }
+
+
+def _read_protected_authority(path: Path, *, label: str) -> dict[str, Any]:
+    _canonical_existing_path(path, label=label)
+    try:
+        raw = provenance.read_protected_regular_file(path, label=label)
+        value = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_object)
+    except (
+        _DuplicateKey,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        provenance.ProvenanceError,
+    ) as exc:
+        raise AdmissionError(f"{label} is not protected strict data") from exc
+    if (
+        not 0 < len(raw) <= 4 * 1024 * 1024
+        or not isinstance(value, dict)
+        or raw != _canonical_bytes(value)
+    ):
+        raise AdmissionError(f"{label} is not canonical JSON")
+    return value
+
+
+def _read_owner_secret(path: Path) -> str:
+    _canonical_existing_path(path, label="owner HMAC key")
+    try:
+        secret = (
+            provenance.read_protected_regular_file(path, label="owner HMAC key")
+            .decode("utf-8")
+            .strip()
+        )
+    except (UnicodeDecodeError, provenance.ProvenanceError) as exc:
+        raise AdmissionError("owner HMAC key is not protected UTF-8") from exc
+    if len(secret.encode("utf-8")) < 32:
+        raise AdmissionError("owner HMAC key is too short")
+    return secret
+
+
+def _authority_token(value: object, *, field: str) -> str:
+    if not isinstance(value, str) or _ROLLOUT_ID.fullmatch(value) is None:
+        raise AdmissionError(f"current rollout {field} is invalid")
+    return value
+
+
+def _authority_digest(value: object, *, field: str) -> str:
+    if not isinstance(value, str) or _DIGEST.fullmatch(value) is None:
+        raise AdmissionError(f"current rollout {field} is invalid")
+    return value
+
+
+def _scope_specs_sha256(scopes: Sequence[str]) -> str:
+    return hashlib.sha256(
+        ("\n".join(scopes) + ("\n" if scopes else "")).encode("utf-8")
+    ).hexdigest()
+
+
+def _validate_rollout_workloads(
+    value: object, *, ranked_scope_ids: Sequence[str]
+) -> list[dict[str, Any]]:
+    fields = {
+        "scope",
+        "work_item_id",
+        "schedule_target_limit",
+        "schedule_targets_sha256",
+        "player_pagination_target_limit",
+        "match_target_count",
+        "match_targets_sha256",
+        "preview_target_count",
+        "preview_targets_sha256",
+        "paid_target_count",
+    }
+    if not isinstance(value, list) or len(value) != len(ranked_scope_ids):
+        raise AdmissionError("current rollout ranking basis is incomplete")
+    normalized: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict) or set(item) != fields:
+            raise AdmissionError("current rollout ranking-basis fields are invalid")
+        scope = item.get("scope")
+        paid = item.get("paid_target_count")
+        schedule = item.get("schedule_target_limit")
+        pagination = item.get("player_pagination_target_limit")
+        matches = item.get("match_target_count")
+        previews = item.get("preview_target_count")
+        if (
+            not isinstance(scope, str)
+            or not scope
+            or scope != scope.strip()
+            or len(scope) > 512
+            or item.get("work_item_id")
+            != "scope-" + hashlib.sha256(scope.encode("utf-8")).hexdigest()
+            or isinstance(paid, bool)
+            or not isinstance(paid, int)
+            or not 1 <= paid <= 5_000
+            or isinstance(schedule, bool)
+            or not isinstance(schedule, int)
+            or schedule <= 0
+            or isinstance(pagination, bool)
+            or not isinstance(pagination, int)
+            or pagination < 0
+            or isinstance(matches, bool)
+            or not isinstance(matches, int)
+            or not 0 <= matches <= 100
+            or isinstance(previews, bool)
+            or not isinstance(previews, int)
+            or not 0 <= previews <= 256
+            or paid != schedule + pagination + matches + previews
+            or any(
+                not isinstance(item.get(field), str)
+                or _DIGEST.fullmatch(item[field]) is None
+                for field in (
+                    "schedule_targets_sha256",
+                    "match_targets_sha256",
+                    "preview_targets_sha256",
+                )
+            )
+        ):
+            raise AdmissionError("current rollout ranking-basis item is invalid")
+        normalized.append(dict(item))
+    if [item["scope"] for item in normalized] != list(
+        ranked_scope_ids
+    ) or normalized != sorted(
+        normalized,
+        key=lambda workload: (
+            -int(workload["paid_target_count"]),
+            str(workload["scope"]),
+        ),
+    ):
+        raise AdmissionError("current rollout ranking basis is not heavy-first")
+    return normalized
+
+
+def _verify_owner_authority_signature(
+    value: Mapping[str, Any],
+    *,
+    unsigned_fields: frozenset[str],
+    secret: str,
+    label: str,
+) -> str:
+    if frozenset(value) != unsigned_fields | {"document_sha256", "signature"}:
+        raise AdmissionError(f"{label} fields are invalid")
+    unsigned = {field: value[field] for field in unsigned_fields}
+    digest = hashlib.sha256(_authority_canonical_bytes(unsigned)).hexdigest()
+    signed_body = {**unsigned, "document_sha256": digest}
+    signature = hmac.new(
+        secret.encode("utf-8"),
+        _authority_canonical_bytes(signed_body),
+        hashlib.sha256,
+    ).hexdigest()
+    if (
+        not isinstance(value.get("document_sha256"), str)
+        or not hmac.compare_digest(str(value["document_sha256"]), digest)
+        or not isinstance(value.get("signature"), str)
+        or not hmac.compare_digest(str(value["signature"]), signature)
+    ):
+        raise AdmissionError(f"{label} digest/signature is invalid")
+    return digest
+
+
+def _validate_current_active_rollout_authority(
+    rollout_id: str,
+    *,
+    owner_secret_path: Path,
+    provider_policy: Mapping[str, str | int],
+    required_wave_id: str | None,
+) -> dict[str, Any]:
+    """Bind one exact active wave to its root-owned manifest and charter."""
+
+    if _ROLLOUT_ID.fullmatch(rollout_id) is None:
+        raise AdmissionError("WhoScored rollout id is invalid")
+    rollout = _read_protected_authority(
+        _CURRENT_ROLLOUT_PATH, label="current rollout manifest"
+    )
+    wave_id = rollout.get("wave_id")
+    wave_contract = _ROLLOUT_WAVE_CONTRACTS.get(str(wave_id))
+    if (
+        frozenset(rollout) != _ROLLOUT_MANIFEST_FIELDS
+        or rollout.get("schema_version") != _ROLLOUT_MANIFEST_SCHEMA_VERSION
+        or rollout.get("rollout_id") != rollout_id
+        or wave_contract is None
+        or (rollout.get("max_scopes"), rollout.get("require_full_active"))
+        != wave_contract
+        or (required_wave_id is not None and wave_id != required_wave_id)
+    ):
+        raise AdmissionError(
+            "current rollout is not the requested final wave-all authority"
+            if required_wave_id == "wave-all"
+            else "current rollout is not the requested active wave authority"
+        )
+    _authority_token(rollout.get("cohort_id"), field="cohort_id")
+    _authority_token(rollout.get("rollout_id"), field="rollout_id")
+    for field in (
+        "ranked_scope_ids_sha256",
+        "ranking_basis_workload_sha256",
+        "runtime_sha256",
+        "classifier_sha256",
+        "promotion_acceptance_sha256",
+        "promotion_terminal_receipt_sha256",
+    ):
+        _authority_digest(rollout.get(field), field=field)
+    promotion_proofs = (
+        rollout["promotion_acceptance_sha256"],
+        rollout["promotion_terminal_receipt_sha256"],
+    )
+    if (
+        wave_id == "wave-20"
+        and promotion_proofs
+        != (
+            _ROLLOUT_GENESIS_PROOF_SHA256,
+            _ROLLOUT_GENESIS_PROOF_SHA256,
+        )
+    ) or (
+        wave_id != "wave-20"
+        and any(proof == _ROLLOUT_GENESIS_PROOF_SHA256 for proof in promotion_proofs)
+    ):
+        raise AdmissionError("current rollout promotion proof differs from its wave")
+    ranked_scope_ids = rollout.get("ranked_scope_ids")
+    if (
+        not isinstance(ranked_scope_ids, list)
+        or not ranked_scope_ids
+        or len(ranked_scope_ids) > 2_000
+        or any(
+            not isinstance(scope, str)
+            or not scope
+            or scope != scope.strip()
+            or len(scope) > 512
+            for scope in ranked_scope_ids
+        )
+        or len(ranked_scope_ids) != len(set(ranked_scope_ids))
+        or rollout["ranked_scope_ids_sha256"] != _scope_specs_sha256(ranked_scope_ids)
+    ):
+        raise AdmissionError("current rollout ranked scope identity is invalid")
+    workloads = _validate_rollout_workloads(
+        rollout.get("ranking_basis_scope_workloads"),
+        ranked_scope_ids=ranked_scope_ids,
+    )
+    if (
+        rollout["ranking_basis_workload_sha256"]
+        != hashlib.sha256(_authority_canonical_bytes(workloads)).hexdigest()
+    ):
+        raise AdmissionError("current rollout ranking-basis digest is invalid")
+    cohort_sha256 = hashlib.sha256(_authority_canonical_bytes(rollout)).hexdigest()
+
+    charter = _read_protected_authority(
+        _CURRENT_CHARTER_PATH, label="current rollout charter"
+    )
+    secret = _read_owner_secret(owner_secret_path)
+    charter_sha256 = _verify_owner_authority_signature(
+        charter,
+        unsigned_fields=_CHARTER_UNSIGNED_FIELDS,
+        secret=secret,
+        label="current rollout charter",
+    )
+    rollout_charter_fields = (
+        "rollout_id",
+        "wave_id",
+        "max_scopes",
+        "require_full_active",
+        "ranked_scope_ids_sha256",
+        "runtime_sha256",
+        "classifier_sha256",
+        "promotion_acceptance_sha256",
+        "promotion_terminal_receipt_sha256",
+    )
+    if (
+        frozenset(charter) != _CHARTER_FIELDS
+        or charter.get("schema_version") != _CHARTER_SCHEMA_VERSION
+        or charter.get("source") != "whoscored"
+        or charter.get("signature_algorithm") != "hmac-sha256"
+        or charter.get("provider_policy_sha256")
+        != provider_policy.get("document_sha256")
+        or charter.get("order_id") != provider_policy.get("order_id")
+        or charter.get("cohort_id") != rollout.get("cohort_id")
+        or charter.get("cohort_sha256") != cohort_sha256
+        or any(
+            charter.get(field) != rollout.get(field) for field in rollout_charter_fields
+        )
+    ):
+        raise AdmissionError(
+            "current charter does not bind the active policy and rollout"
+        )
+    now = _provider_receipt_now()
+    valid_from = _provider_policy_utc(
+        charter.get("valid_from"), field="charter.valid_from"
+    )
+    valid_until = _provider_policy_utc(
+        charter.get("valid_until"), field="charter.valid_until"
+    )
+    policy_valid_from = _provider_policy_utc(
+        provider_policy.get("valid_from"), field="valid_from"
+    )
+    policy_valid_until = _provider_policy_utc(
+        provider_policy.get("valid_until"), field="valid_until"
+    )
+    if (
+        not valid_from <= now < valid_until
+        or valid_until - now > MAX_CHARTER_HORIZON
+        or valid_from < policy_valid_from
+        or valid_until > policy_valid_until
+        or charter.get("billing_month") != now.strftime("%Y-%m")
+    ):
+        raise AdmissionError("current rollout charter is not active")
+    charter_caps: list[int] = []
+    for field in ("daily_cap_bytes", "monthly_cap_bytes", "order_cap_bytes"):
+        item = charter.get(field)
+        if isinstance(item, bool) or not isinstance(item, int) or item <= 0:
+            raise AdmissionError(f"current rollout charter {field} is invalid")
+        charter_caps.append(item)
+    max_issuances = charter.get("max_issuances")
+    if (
+        charter_caps != sorted(charter_caps)
+        or any(
+            charter_caps[index] > int(provider_policy[field])
+            for index, field in enumerate(
+                ("daily_cap_bytes", "monthly_cap_bytes", "order_cap_bytes")
+            )
+        )
+        or isinstance(max_issuances, bool)
+        or not isinstance(max_issuances, int)
+        or max_issuances <= 0
+    ):
+        raise AdmissionError("current rollout charter caps are invalid")
+    authority = {
+        field: (cohort_sha256 if field == "cohort_sha256" else rollout[field])
+        for field in _ROLLOUT_ACCEPTANCE_AUTHORITY_FIELDS
+    }
+    return {
+        "authority": authority,
+        "authority_binding": "current-signed-rollout",
+        "catalog_active_scope_count": len(ranked_scope_ids),
+        "catalog_active_scopes_sha256": _scope_specs_sha256(sorted(ranked_scope_ids)),
+        "charter_sha256": charter_sha256,
+        "cohort_id": rollout["cohort_id"],
+        "rollout_manifest_sha256": cohort_sha256,
+    }
+
+
+def validate_current_rollout_authority(
+    rollout_id: str,
+    *,
+    owner_secret_path: Path,
+    provider_policy: Mapping[str, str | int],
+) -> dict[str, Any]:
+    """Bind final GO to the one active root-owned wave-all authority."""
+
+    return _validate_current_active_rollout_authority(
+        rollout_id,
+        owner_secret_path=owner_secret_path,
+        provider_policy=provider_policy,
+        required_wave_id="wave-all",
+    )
+
+
+def validate_current_issuance_authority(
+    rollout_id: str,
+    *,
+    owner_secret_path: Path,
+    provider_policy: Mapping[str, str | int],
+) -> dict[str, Any]:
+    """Bind daily issuance to whichever exact rollout wave is active now."""
+
+    return _validate_current_active_rollout_authority(
+        rollout_id,
+        owner_secret_path=owner_secret_path,
+        provider_policy=provider_policy,
+        required_wave_id=None,
+    )
 
 
 def _decimal_gigabytes_to_bytes(value: object, *, field: str) -> int:
@@ -5777,8 +7545,7 @@ def validate_deployment_admission_receipt(
             "sha256": hashlib.sha256(deployment_raw).hexdigest(),
         }
         or not isinstance(quota, dict)
-        or quota.get("provider_policy_sha256")
-        != provider_policy.get("document_sha256")
+        or quota.get("provider_policy_sha256") != provider_policy.get("document_sha256")
         or quota.get("receipt_sha256") != provider_policy.get("receipt_sha256")
         or quota.get("order_id") != provider_policy.get("order_id")
         or quota.get("daily_cap_bytes") != provider_policy.get("daily_cap_bytes")
@@ -6027,6 +7794,22 @@ def _common_parser() -> argparse.ArgumentParser:
     return common
 
 
+def _canonical_rollout_services(
+    selected_services: Sequence[str],
+) -> tuple[str, ...]:
+    """Require the complete paid boundary before declaring rollout GO."""
+
+    selected = tuple(selected_services)
+    if (
+        len(selected) != len(PROTECTED_SERVICES)
+        or frozenset(selected) != _PROTECTED_SERVICE_SET
+    ):
+        raise AdmissionError(
+            "rollout production admission requires every protected service exactly once"
+        )
+    return PROTECTED_SERVICES
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     common = _common_parser()
@@ -6077,8 +7860,22 @@ def _parser() -> argparse.ArgumentParser:
     running.add_argument("--env-file", type=Path, action="append", required=True)
     running.add_argument("--provider-policy", type=Path, required=True)
     running.add_argument("--owner-secret-file", type=Path, required=True)
-    running.add_argument(
-        "--deployment-admission-receipt", type=Path, required=True
+    running.add_argument("--deployment-admission-receipt", type=Path, required=True)
+    rollout_mode = running.add_mutually_exclusive_group()
+    rollout_mode.add_argument(
+        "--rollout-id",
+        help=(
+            "explicit staged-rollout identity; when supplied, verify-running "
+            "also requires its immutable ops ledger to be fully accepted"
+        ),
+    )
+    rollout_mode.add_argument(
+        "--issuance-rollout-id",
+        help=(
+            "current signed rollout identity; when supplied, verify-running "
+            "replays its exact live predecessor promotion evidence before "
+            "daily paid-pointer issuance"
+        ),
     )
     running.add_argument("--service", action="append", required=True)
     return parser
@@ -6108,6 +7905,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     manifest = _absolute(args.manifest or canonical_manifest)
     deployment = _absolute(args.deployment_attestation)
     try:
+        selected_services = (
+            _canonical_rollout_services(args.service)
+            if args.command == "verify-running"
+            and (args.rollout_id is not None or args.issuance_rollout_id is not None)
+            else getattr(args, "service", ())
+        )
         _assert_canonical_release(root)
         if attestation != canonical_attestation or manifest != canonical_manifest:
             raise AdmissionError(
@@ -6207,12 +8010,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             provider_quota_receipt: dict[str, str | int] | None = None
             deployment_admission_receipt: dict[str, str] | None = None
             if args.command == "verify-running":
-                deployment_admission_receipt = (
-                    validate_deployment_admission_receipt(
-                        _absolute(args.deployment_admission_receipt),
-                        deployment_attestation_path=deployment,
-                        provider_policy=provider_policy,
-                    )
+                deployment_admission_receipt = validate_deployment_admission_receipt(
+                    _absolute(args.deployment_admission_receipt),
+                    deployment_attestation_path=deployment,
+                    provider_policy=provider_policy,
                 )
             else:
                 provider_quota_receipt = validate_provider_quota_receipt(
@@ -6274,7 +8075,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 report = verify_created_containers(
                     bindings,
                     project=_SERVICE_PROJECT,
-                    selected_services=args.service,
+                    selected_services=selected_services,
                     projections=projections,
                     config_hashes=config_hashes,
                     config_files=config_files,
@@ -6289,6 +8090,46 @@ def main(argv: Sequence[str] | None = None) -> int:
                         deployment_admission_receipt
                     )
                     report["provider_policy"] = provider_policy
+                    rollout_id = args.rollout_id or args.issuance_rollout_id
+                    if rollout_id is not None:
+                        rollout_authority = (
+                            validate_current_rollout_authority(
+                                rollout_id,
+                                owner_secret_path=_absolute(args.owner_secret_file),
+                                provider_policy=provider_policy,
+                            )
+                            if args.rollout_id is not None
+                            else validate_current_issuance_authority(
+                                rollout_id,
+                                owner_secret_path=_absolute(args.owner_secret_file),
+                                provider_policy=provider_policy,
+                            )
+                        )
+                        scheduler_records = [
+                            record
+                            for record in report.get("images", [])
+                            if record.get("service") == "airflow-scheduler"
+                        ]
+                        if len(scheduler_records) != 1:
+                            raise AdmissionError(
+                                "rollout replay lacks admitted scheduler identity"
+                            )
+                        if args.rollout_id is not None:
+                            report["rollout_acceptance"] = verify_rollout_acceptance(
+                                rollout_id,
+                                rollout_authority=rollout_authority,
+                                scheduler_container_id=scheduler_records[0][
+                                    "container_id"
+                                ],
+                            )
+                        else:
+                            report["issuance_rollout"] = verify_issuance_rollout(
+                                rollout_id,
+                                rollout_authority=rollout_authority,
+                                scheduler_container_id=scheduler_records[0][
+                                    "container_id"
+                                ],
+                            )
                 else:
                     assert provider_quota_receipt is not None
                     report["provider_quota_receipt"] = provider_quota_receipt

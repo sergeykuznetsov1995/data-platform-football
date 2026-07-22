@@ -1,5 +1,5 @@
 [Unit]
-Description=Issue the next bounded WhoScored scheduled paid approval
+Description=Issue the next bounded WhoScored scheduled rollout-wave approval
 
 [Timer]
 OnCalendar=*-*-* 09:15:00 UTC

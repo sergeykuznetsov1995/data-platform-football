@@ -3,19 +3,22 @@
 from __future__ import annotations
 
 import json
+import stat
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
 from scrapers.whoscored.raw_store import RawStoreError, WhoScoredRawStore
 from scripts.whoscored_raw_backup import (
+    backup_inventory_object_descriptors,
     backup_object_key,
     backup_inventory,
     build_inventory,
     estimate_cutover_capacity,
+    execute_restore_drill,
     fetch_backup_inventory,
     inventory_marker_key,
     list_backup_inventories,
@@ -23,11 +26,14 @@ from scripts.whoscored_raw_backup import (
     main,
     measure_store_metadata,
     open_store,
+    revalidate_restore_drill_backup,
     restore_inventory,
+    restore_drill_receipt_key,
     validate_backup_configuration,
     validate_inventory,
     validate_distinct_store_roots,
     verify_backup_store,
+    verify_s3_compliance_retention,
     verify_store,
     write_inventory,
 )
@@ -57,6 +63,56 @@ class _ConcurrencyProbe:
                 self.active -= 1
 
 
+class _S3Control:
+    def __init__(
+        self,
+        sizes: dict[str, int],
+        *,
+        versioning: str = "Enabled",
+        lock_enabled: str = "Enabled",
+        mode: str = "COMPLIANCE",
+        retain_until: datetime | None = None,
+    ) -> None:
+        self.sizes = sizes
+        self.versioning = versioning
+        self.lock_enabled = lock_enabled
+        self.mode = mode
+        self.retain_until = retain_until or (
+            datetime.now(timezone.utc) + timedelta(days=2)
+        )
+        self.head_keys: list[str] = []
+
+    def get_bucket_versioning(self, *, Bucket: str):
+        assert Bucket
+        return {"Status": self.versioning}
+
+    def get_object_lock_configuration(self, *, Bucket: str):
+        assert Bucket
+        return {
+            "ObjectLockConfiguration": {
+                "ObjectLockEnabled": self.lock_enabled,
+                "Rule": {
+                    "DefaultRetention": {
+                        "Mode": self.mode,
+                        "Days": 30,
+                    }
+                },
+            }
+        }
+
+    def head_object(self, *, Bucket: str, Key: str):
+        assert Bucket
+        self.head_keys.append(Key)
+        if Key not in self.sizes:
+            raise RuntimeError("NoSuchKey")
+        return {
+            "ContentLength": self.sizes[Key],
+            "VersionId": "version-1",
+            "ObjectLockMode": self.mode,
+            "ObjectLockRetainUntilDate": self.retain_until,
+        }
+
+
 def _add_unique_objects(store: WhoScoredRawStore, count: int) -> None:
     for index in range(count):
         store._write_immutable_bytes(
@@ -65,25 +121,33 @@ def _add_unique_objects(store: WhoScoredRawStore, count: int) -> None:
         )
 
 
-def test_versioned_recovery_reference_uses_real_cli_but_backup_stays_paused():
+def test_versioned_recovery_reference_gates_backup_enablement():
     runbook = (ROOT / "docs" / "operations" / "whoscored-production.md").read_text(
         encoding="utf-8"
     )
 
-    assert "whoscored_raw_backup.py restore" in runbook
+    assert "whoscored_raw_backup.py restore-drill" in runbook
     assert "whoscored_raw_backup.py list-inventories" in runbook
-    assert "whoscored_raw_backup.py fetch-inventory" in runbook
-    restore_block = runbook.split("whoscored_raw_backup.py restore", 1)[1].split(
-        "whoscored_raw_backup.py verify-restore", 1
+    assert "authenticates both exact inventory markers" in runbook
+    assert "airflow pools set whoscored_storage_pool 1" in runbook
+    restore_block = runbook.split("whoscored_raw_backup.py restore-drill", 1)[1].split(
+        "The command authenticates", 1
     )[0]
     assert '--backup-uri "$WHOSCORED_BACKUP_DESTINATION_URI"' in restore_block
     assert "--store-uri" not in restore_block
+    assert '--raw-source-uri "$WHOSCORED_RAW_STORE_URI"' in restore_block
+    assert '--ops-source-uri "$WHOSCORED_OPS_STORE_URI"' in restore_block
+    assert "--evidence-output" in restore_block
+    assert "--apply --create-buckets" in restore_block
     assert "--entrypoint bash" in runbook
     assert "airflow-scheduler -euc" in runbook
-    assert '--inventory-key "$RECOVERY_INVENTORY_KEY"' in runbook
-    assert '--inventory "$RECOVERY_INVENTORY"' in runbook
-    assert "airflow dags pause dag_backup_whoscored_storage" in runbook
-    assert "airflow dags unpause dag_backup_whoscored_storage" not in runbook
+    assert '--raw-inventory-key "$RAW_RECOVERY_INVENTORY_KEY"' in runbook
+    assert '--ops-inventory-key "$OPS_RECOVERY_INVENTORY_KEY"' in runbook
+    assert "WHOSCORED_BACKUP_RPO_HOURS" in runbook
+    assert "WHOSCORED_BACKUP_RTO_HOURS" in runbook
+    assert "WHOSCORED_BACKUP_RESTORE_DRILL_EVIDENCE_PATH" in runbook
+    assert "WHOSCORED_OPS_STORE_URI" in runbook
+    assert "airflow dags unpause dag_backup_whoscored_storage" in runbook
     assert "airflow dags unpause dag_ingest_whoscored" in runbook
 
 
@@ -207,9 +271,7 @@ def test_inventory_backup_and_restore_verification_round_trip(tmp_path):
 
 
 @pytest.mark.unit
-def test_off_host_inventory_is_listable_fetchable_and_cli_idempotent(
-    tmp_path, capsys
-):
+def test_off_host_inventory_is_listable_fetchable_and_cli_idempotent(tmp_path, capsys):
     source = _source_store(tmp_path)
     source_uri = (tmp_path / "source").as_uri()
     backup_uri = (tmp_path / "backup").as_uri()
@@ -265,9 +327,10 @@ def test_off_host_inventory_is_listable_fetchable_and_cli_idempotent(
     )
     assert json.loads(capsys.readouterr().out)["inventory_count"] == 1
     assert main(fetch_args) == 0
-    assert json.loads(capsys.readouterr().out)["inventory_sha256"] == inventory[
-        "inventory_sha256"
-    ]
+    assert (
+        json.loads(capsys.readouterr().out)["inventory_sha256"]
+        == inventory["inventory_sha256"]
+    )
     assert main(fetch_args) == 0
     capsys.readouterr()
     assert load_inventory(output) == inventory
@@ -298,16 +361,22 @@ def test_missing_ops_prefix_has_a_valid_empty_backup_contract(tmp_path):
     assert inventory["object_count"] == 0
     assert inventory["total_bytes"] == 0
     assert applied["copied_objects"] == 0
-    assert verify_backup_store(
-        destination,
-        inventory,
-        require_marker=True,
-        workers=1,
-    )["passed"] is True
-    assert list_backup_inventories(
-        destination,
-        expected_source_uri=source_uri,
-    )["inventory_count"] == 1
+    assert (
+        verify_backup_store(
+            destination,
+            inventory,
+            require_marker=True,
+            workers=1,
+        )["passed"]
+        is True
+    )
+    assert (
+        list_backup_inventories(
+            destination,
+            expected_source_uri=source_uri,
+        )["inventory_count"]
+        == 1
+    )
 
 
 @pytest.mark.unit
@@ -333,6 +402,201 @@ def test_restore_rejects_nonempty_unrelated_destination(tmp_path):
 
     with pytest.raises(RawStoreError, match="outside the inventory"):
         restore_inventory(backup, restored, inventory, apply=True)
+
+
+@pytest.mark.unit
+def test_restore_drill_generates_private_off_host_bound_raw_and_ops_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts import whoscored_raw_backup as raw_backup
+
+    raw_source_uri = "s3://football/raw/whoscored"
+    ops_source_uri = "s3://football/ops/whoscored"
+    backup_uri = "s3://remote-backup/whoscored"
+    raw_restore_uri = "s3://recovery-raw/whoscored"
+    ops_restore_uri = "s3://recovery-ops/whoscored"
+    raw_source = WhoScoredRawStore.from_uri((tmp_path / "raw-source").as_uri())
+    ops_source = WhoScoredRawStore.from_uri((tmp_path / "ops-source").as_uri())
+    raw_source._write_immutable_bytes("raw/a", b"raw-a")
+    raw_source._write_immutable_bytes("raw/b", b"raw-b")
+    ops_source._write_immutable_bytes("ops/a", b"ops-a")
+    backup = WhoScoredRawStore.from_uri((tmp_path / "backup").as_uri())
+    raw_restore = WhoScoredRawStore.from_uri((tmp_path / "raw-restore").as_uri())
+    ops_restore = WhoScoredRawStore.from_uri((tmp_path / "ops-restore").as_uri())
+    raw_inventory = build_inventory(raw_source, source_uri=raw_source_uri)
+    ops_inventory = build_inventory(ops_source, source_uri=ops_source_uri)
+    raw_backup_result = backup_inventory(raw_source, backup, raw_inventory, apply=True)
+    ops_backup_result = backup_inventory(ops_source, backup, ops_inventory, apply=True)
+    stores = {
+        backup_uri: backup,
+        raw_restore_uri: raw_restore,
+        ops_restore_uri: ops_restore,
+    }
+
+    def opener(uri: str, **_kwargs):
+        return stores[uri]
+
+    for name, value in {
+        "WHOSCORED_BACKUP_SOURCE_S3_ENDPOINT": "primary.internal:8333",
+        "WHOSCORED_BACKUP_DESTINATION_S3_ENDPOINT": "backup.example:443",
+        "WHOSCORED_BACKUP_RESTORE_S3_ENDPOINT": "recovery.example:443",
+        "WHOSCORED_BACKUP_SOURCE_SITE_ID": "primary-site",
+        "WHOSCORED_BACKUP_DESTINATION_SITE_ID": "backup-site",
+        "WHOSCORED_BACKUP_DESTINATION_RETENTION_MODE": "object-lock",
+    }.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv("WHOSCORED_BACKUP_RESTORE_DRILL_EVIDENCE_PATH", raising=False)
+    release = {
+        "parser_version": "whoscored-parser-v8",
+        "manifest_sha256": "a" * 64,
+        "code_tree_sha256": "b" * 64,
+    }
+    monkeypatch.setattr(
+        raw_backup._WHOSCORED_RUNTIME_CONTRACT,
+        "validate_runtime_contract",
+        lambda **_kwargs: release,
+    )
+    clock_start = datetime.now(timezone.utc).replace(microsecond=0) + timedelta(
+        seconds=1
+    )
+    clock = iter((clock_start, clock_start + timedelta(minutes=1)))
+    monkeypatch.setattr(raw_backup, "_restore_drill_utc_now", lambda: next(clock))
+    monkeypatch.setattr(
+        raw_backup,
+        "revalidate_restore_drill_backup",
+        lambda **_kwargs: {"status": "passed"},
+    )
+    evidence_path = (tmp_path / "restore-drill-evidence.json").absolute()
+
+    result = execute_restore_drill(
+        backup_uri=backup_uri,
+        raw_source_uri=raw_source_uri,
+        raw_inventory_key=raw_backup_result["inventory_key"],
+        raw_restore_uri=raw_restore_uri,
+        ops_source_uri=ops_source_uri,
+        ops_inventory_key=ops_backup_result["inventory_key"],
+        ops_restore_uri=ops_restore_uri,
+        evidence_output=evidence_path,
+        apply=True,
+        workers=2,
+        store_opener=opener,
+    )
+
+    evidence = json.loads(evidence_path.read_text(encoding="ascii"))
+    proof = {
+        name: value for name, value in evidence.items() if name != "off_host_receipt"
+    }
+    expected_key, expected_sha256 = restore_drill_receipt_key(proof)
+    assert result["passed"] is True
+    assert evidence["schema_version"] == 2
+    assert evidence["off_host_receipt"] == {
+        "key": expected_key,
+        "sha256": expected_sha256,
+    }
+    assert backup._read_json(expected_key) == proof
+    assert stat.S_IMODE(evidence_path.stat().st_mode) == 0o600
+    assert evidence_path.read_bytes() == json.dumps(
+        evidence,
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    assert all(source["already_present_objects"] == 0 for source in evidence["sources"])
+    assert all(source["exact_tree_match"] is True for source in evidence["sources"])
+
+    exact_descriptors = [
+        *backup_inventory_object_descriptors(raw_inventory),
+        *backup_inventory_object_descriptors(ops_inventory),
+        {
+            "key": expected_key,
+            "bytes": len(WhoScoredRawStore._render_json(proof)),
+        },
+    ]
+    sizes = {
+        f"whoscored/{item['key']}": int(item["bytes"]) for item in exact_descriptors
+    }
+    client = _S3Control(
+        sizes,
+        retain_until=clock_start + timedelta(hours=25),
+    )
+    live = revalidate_restore_drill_backup(
+        backup_uri=backup_uri,
+        evidence=evidence,
+        backup_store=backup,
+        s3_control_client=client,
+        now=clock_start,
+        workers=2,
+    )
+    assert live["status"] == "passed"
+    assert live["capability"]["checked_object_count"] == len(sizes)
+    assert live["expected_retained_objects"] == len(sizes)
+    assert len(live["inventories"]) == 2
+    assert all(
+        item["checked_content_objects"] == item["expected_content_objects"]
+        and item["checked_bytes"] == item["expected_content_bytes"]
+        for item in live["inventories"]
+    )
+
+    deleted_key = backup_object_key(raw_inventory["objects"][0]["sha256"])
+    backup.filesystem.delete_file(backup._path(deleted_key))
+    with pytest.raises(RawStoreError, match="live off-host backup object verification"):
+        revalidate_restore_drill_backup(
+            backup_uri=backup_uri,
+            evidence=evidence,
+            backup_store=backup,
+            s3_control_client=client,
+            now=clock_start,
+            workers=2,
+        )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("raw_restore_uri", "ops_restore_uri"),
+    (
+        ("s3://football/ops/whoscored/drill", "s3://recovery-ops/whoscored"),
+        ("s3://recovery-raw/whoscored", "s3://football/raw/whoscored/drill"),
+    ),
+)
+def test_restore_drill_rejects_cross_plane_target_before_open_or_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    raw_restore_uri: str,
+    ops_restore_uri: str,
+) -> None:
+    for name, value in {
+        "WHOSCORED_BACKUP_SOURCE_S3_ENDPOINT": "primary.internal:8333",
+        "WHOSCORED_BACKUP_DESTINATION_S3_ENDPOINT": "backup.example:443",
+        "WHOSCORED_BACKUP_RESTORE_S3_ENDPOINT": "recovery.example:443",
+        "WHOSCORED_BACKUP_SOURCE_SITE_ID": "primary-site",
+        "WHOSCORED_BACKUP_DESTINATION_SITE_ID": "backup-site",
+        "WHOSCORED_BACKUP_DESTINATION_RETENTION_MODE": "object-lock",
+    }.items():
+        monkeypatch.setenv(name, value)
+    opened = False
+
+    def opener(*_args, **_kwargs):
+        nonlocal opened
+        opened = True
+        raise AssertionError("unsafe restore preflight opened a store")
+
+    with pytest.raises(ValueError, match="must not overlap either source"):
+        execute_restore_drill(
+            backup_uri="s3://remote-backup/whoscored",
+            raw_source_uri="s3://football/raw/whoscored",
+            raw_inventory_key="backup-inventories/not-reached.json",
+            raw_restore_uri=raw_restore_uri,
+            ops_source_uri="s3://football/ops/whoscored",
+            ops_inventory_key="backup-inventories/not-reached.json",
+            ops_restore_uri=ops_restore_uri,
+            evidence_output=(tmp_path / "evidence.json").absolute(),
+            apply=True,
+            store_opener=opener,
+        )
+
+    assert opened is False
 
 
 @pytest.mark.unit
@@ -458,14 +722,14 @@ def test_backup_rejects_equal_or_nested_store_roots(tmp_path):
 
 
 @pytest.mark.unit
-def test_production_backup_requires_distinct_endpoint_and_site(monkeypatch):
+def test_production_backup_requires_distinct_endpoint_bucket_and_object_lock(
+    monkeypatch,
+):
     monkeypatch.setenv("WHOSCORED_BACKUP_SOURCE_S3_ENDPOINT", "seaweedfs:8333")
     monkeypatch.setenv("WHOSCORED_BACKUP_DESTINATION_S3_ENDPOINT", "seaweedfs:8333")
-    monkeypatch.setenv("WHOSCORED_BACKUP_SOURCE_SITE_ID", "local")
-    monkeypatch.setenv("WHOSCORED_BACKUP_DESTINATION_SITE_ID", "local")
     monkeypatch.setenv("WHOSCORED_BACKUP_DESTINATION_RETENTION_MODE", "object-lock")
 
-    with pytest.raises(ValueError, match="distinct off-host"):
+    with pytest.raises(ValueError, match="distinct S3 endpoint and bucket"):
         validate_distinct_store_roots(
             "s3://warehouse/raw",
             "s3://other-bucket/backup",
@@ -473,12 +737,84 @@ def test_production_backup_requires_distinct_endpoint_and_site(monkeypatch):
         )
 
     monkeypatch.setenv("WHOSCORED_BACKUP_DESTINATION_S3_ENDPOINT", "backup.example:443")
-    monkeypatch.setenv("WHOSCORED_BACKUP_DESTINATION_SITE_ID", "remote-dc")
     validate_distinct_store_roots(
         "s3://warehouse/raw",
         "s3://other-bucket/backup",
         require_off_host=True,
     )
+    with pytest.raises(ValueError, match="distinct S3 endpoint and bucket"):
+        validate_distinct_store_roots(
+            "s3://warehouse/raw",
+            "s3://warehouse/backup",
+            require_off_host=True,
+        )
+    monkeypatch.setenv("WHOSCORED_BACKUP_DESTINATION_RETENTION_MODE", "versioned-worm")
+    with pytest.raises(ValueError, match="provider-verified object-lock"):
+        validate_distinct_store_roots(
+            "s3://warehouse/raw",
+            "s3://other-bucket/backup",
+            require_off_host=True,
+        )
+
+
+@pytest.mark.unit
+def test_s3_compliance_retention_checks_every_exact_object(monkeypatch):
+    monkeypatch.setenv("WHOSCORED_BACKUP_DESTINATION_RETENTION_MODE", "object-lock")
+    now = datetime(2026, 7, 22, 10, 0, tzinfo=timezone.utc)
+    client = _S3Control(
+        {"whoscored/a.raw": 3, "whoscored/marker.json": 7},
+        retain_until=now + timedelta(hours=25),
+    )
+
+    report = verify_s3_compliance_retention(
+        "s3://off-host-backup/whoscored",
+        ({"key": "a.raw", "bytes": 3}, {"key": "marker.json", "bytes": 7}),
+        client=client,
+        now=now,
+        workers=2,
+    )
+
+    assert report["status"] == "passed"
+    assert report["checked_object_count"] == 2
+    assert client.head_keys == ["whoscored/a.raw", "whoscored/marker.json"]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ("versioning", "versioning and COMPLIANCE"),
+        ("lock", "versioning and COMPLIANCE"),
+        ("governance", "versioning and COMPLIANCE"),
+        ("short", "exact versioned COMPLIANCE"),
+        ("missing", "unavailable"),
+    ),
+)
+def test_s3_compliance_retention_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, mutation: str, message: str
+) -> None:
+    monkeypatch.setenv("WHOSCORED_BACKUP_DESTINATION_RETENTION_MODE", "object-lock")
+    now = datetime(2026, 7, 22, 10, 0, tzinfo=timezone.utc)
+    sizes = {} if mutation == "missing" else {"whoscored/a.raw": 3}
+    client = _S3Control(
+        sizes,
+        versioning="Suspended" if mutation == "versioning" else "Enabled",
+        lock_enabled="Disabled" if mutation == "lock" else "Enabled",
+        mode="GOVERNANCE" if mutation == "governance" else "COMPLIANCE",
+        retain_until=(
+            now + timedelta(hours=23)
+            if mutation == "short"
+            else now + timedelta(hours=25)
+        ),
+    )
+
+    with pytest.raises(RawStoreError, match=message):
+        verify_s3_compliance_retention(
+            "s3://off-host-backup/whoscored",
+            ({"key": "a.raw", "bytes": 3},),
+            client=client,
+            now=now,
+        )
 
 
 @pytest.mark.unit
@@ -675,6 +1011,8 @@ def test_backup_verification_reads_unique_content_with_bounded_workers(
     assert report["expected_content_objects"] == len(
         {item["sha256"] for item in inventory["objects"]}
     )
+    assert report["checked_content_objects"] == report["expected_content_objects"]
+    assert report["checked_bytes"] == report["expected_content_bytes"]
 
 
 @pytest.mark.unit
@@ -865,9 +1203,7 @@ def test_capacity_check_scales_for_current_object_and_byte_drift(tmp_path):
     source = _source_store(tmp_path)
     source_uri = (tmp_path / "source").as_uri()
     inventory = build_inventory(source, source_uri=source_uri, workers=1)
-    checked_at = datetime.fromisoformat(
-        inventory["created_at"].replace("Z", "+00:00")
-    )
+    checked_at = datetime.fromisoformat(inventory["created_at"].replace("Z", "+00:00"))
     args = {
         "expected_source_uri": source_uri,
         "max_inventory_age_hours": 24,

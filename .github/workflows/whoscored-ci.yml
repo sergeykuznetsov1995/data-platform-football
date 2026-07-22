@@ -709,6 +709,11 @@ jobs:
                 tar --no-same-owner -C /root/data-platform-football -xf -
           docker cp /usr/bin/docker "$test_container:/usr/bin/docker"
           docker cp /usr/bin/git "$test_container:/usr/bin/git"
+          # The isolated Ubuntu test root has no package manager/network. Shell
+          # issuer tests execute the same pinned jq path as production, so copy
+          # the runner's root-owned binary after the shared libraries above.
+          docker cp /usr/bin/jq "$test_container:/usr/bin/jq"
+          docker exec "$test_container" test -x /usr/bin/jq
           docker cp /usr/lib/git-core/. "$test_container:/usr/lib/git-core/"
           docker cp /usr/libexec/docker/cli-plugins/docker-buildx \
             "$test_container:/usr/libexec/docker/cli-plugins/docker-buildx"
@@ -944,6 +949,8 @@ jobs:
             dags/scripts/whoscored_frozen_dq.py \
             dags/scripts/whoscored_identity.py \
             dags/scripts/whoscored_proxy_runtime.py \
+            dags/scripts/whoscored_production_issuance.py \
+            dags/scripts/whoscored_rollout_acceptance.py \
             dags/utils/maintenance_tasks.py \
             dags/utils/fbref_pipeline_tasks.py \
             docker/images/airflow/whoscored_capacity_worker_bootstrap.py \
@@ -977,6 +984,8 @@ jobs:
             dags/scripts/whoscored_frozen_dq.py \
             dags/scripts/whoscored_identity.py \
             dags/scripts/whoscored_proxy_runtime.py \
+            dags/scripts/whoscored_production_issuance.py \
+            dags/scripts/whoscored_rollout_acceptance.py \
             dags/utils/fbref_pipeline_tasks.py \
             docker/images/airflow/whoscored_capacity_worker_bootstrap.py \
             scripts/init_seaweedfs_bucket.py \
