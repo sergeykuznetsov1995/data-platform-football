@@ -24,7 +24,7 @@
     "dags/utils/default_args.py": "a9fe403b9529e9562e58b012467bff51bfeb6ceb9388214182ddebd393e2b9c8",
     "dags/utils/maintenance_tasks.py": "b0e9cd423f0cee3cf893a721d7f90ee345be8417a814a8b65825db7f5f0d92dc",
     "dags/utils/silver_tasks.py": "07ac23eba081b14944dd0e81090c7f832c21e6ee69b22ebb0d02fbc059af8720",
-    "docker/images/airflow/Dockerfile": "90ce54e76af1e13cdbfdaffbe8c16eb665c01a3c14a4262e127cfd92213af108",
+    "docker/images/airflow/Dockerfile": "55152a935252746159f415bd993ead2ed77da2984a6eaed7fff1524af3e69aa4",
     "docker/images/airflow/requirements-airflow.txt": "06bb175fef7d52bfc5ffb5a1b4bf027b32ffbd6fde86690db6bf3766b8398841",
     "docker/images/airflow/requirements-build-tools.txt": "f6620046a197e8a05ad44dc55902ffd71c6e3b7e7003e5c2c2063fd4c945c2fc",
     "docker/images/airflow/requirements-scheduler.txt": "a12c76e79f74d096223a2e798fd9088975ed7d36cd38a43d560b4f8939bceffb",
